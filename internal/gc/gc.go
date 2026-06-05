@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -117,6 +116,7 @@ const (
 	gcAutoRetryFailedItemLimit   = 100
 	gcSnapshotDriftCheckEvery    = 10
 	gcActiveOrgRecoveryEvery     = 10
+	gcMinSnapshotRecalcInterval  = time.Minute
 )
 
 var ErrNotLeader = errors.New("gc leadership required")
@@ -385,9 +385,9 @@ func (s *Service) loadStatString(key string) string {
 	return val
 }
 
-// RefreshFailedItemSnapshot repairs stale failed-item counters derived from
-// gc_org_stats/gc_stats. This is needed because gc_failed_items rows expire via
-// TTL and those expirations do not mark orgs dirty on their own.
+// RefreshFailedItemSnapshot forces an exact refresh of failed-item-related
+// queue snapshots before admin/status views read them. This is intentionally
+// heavier than GetOrgQueueStats and should stay off the mutation hot path.
 func (s *Service) RefreshFailedItemSnapshot() {
 	s.reconcileMu.Lock()
 	defer s.reconcileMu.Unlock()
@@ -501,7 +501,7 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 	}
 	s.persistStats()
 
-	s.reconcileDirtyQueueStats(s.reconcileLimit())
+	s.reconcileDirtyQueueStats(s.reconcileLimit(), s.queueSnapshotRecalcMinInterval())
 
 	queueAfter := s.loadStatInt(gcStatKeyTotalQueue)
 	metrics.GCQueueSize.Set(float64(queueAfter))
@@ -513,8 +513,17 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 }
 
 func (s *Service) shouldRecoverMissingActiveQueueOrgs(queueBefore int) (string, bool) {
+	dirtyHint := false
 	if queueBefore <= 0 {
-		return "", false
+		dirtyOrgs, err := s.store.ListDirtyOrgs(1)
+		if err != nil {
+			log.Printf("[GC] Failed to list dirty orgs for recovery trigger: %v", err)
+			return "", false
+		}
+		if len(dirtyOrgs) == 0 {
+			return "", false
+		}
+		dirtyHint = true
 	}
 
 	activeOrgs, err := s.store.ListOrgsWithQueuedItems()
@@ -523,8 +532,12 @@ func (s *Service) shouldRecoverMissingActiveQueueOrgs(queueBefore int) (string, 
 		return "", false
 	}
 	if len(activeOrgs) == 0 {
-		metrics.GCActiveOrgRecoveryTriggersTotal.WithLabelValues("no_active_orgs").Inc()
-		return "no_active_orgs", true
+		reason := "no_active_orgs"
+		if dirtyHint {
+			reason = "dirty_orgs"
+		}
+		metrics.GCActiveOrgRecoveryTriggersTotal.WithLabelValues(reason).Inc()
+		return reason, true
 	}
 	if s.workerPasses%gcActiveOrgRecoveryEvery == 0 {
 		metrics.GCActiveOrgRecoveryTriggersTotal.WithLabelValues("periodic").Inc()
@@ -539,7 +552,12 @@ func (s *Service) recoverMissingActiveQueueOrgs(reason string) {
 		log.Printf("[GC] Failed to list queued snapshots for active-set recovery: %v", err)
 		return
 	}
-	if len(snapshotOrgs) == 0 {
+	dirtyOrgs, err := s.store.ListDirtyOrgs(0)
+	if err != nil {
+		log.Printf("[GC] Failed to list dirty orgs for active-set recovery: %v", err)
+		return
+	}
+	if len(snapshotOrgs) == 0 && len(dirtyOrgs) == 0 {
 		return
 	}
 
@@ -552,15 +570,30 @@ func (s *Service) recoverMissingActiveQueueOrgs(reason string) {
 	for _, orgID := range activeOrgs {
 		activeSet[orgID] = struct{}{}
 	}
+	candidateSet := make(map[uuid.UUID]struct{}, len(snapshotOrgs)+len(dirtyOrgs))
+	for _, orgID := range snapshotOrgs {
+		candidateSet[orgID] = struct{}{}
+	}
+	for _, dirtyOrg := range dirtyOrgs {
+		candidateSet[dirtyOrg.OrgID] = struct{}{}
+	}
 
 	now := time.Now().UTC()
 	recovered := 0
-	for _, orgID := range snapshotOrgs {
+	for orgID := range candidateSet {
 		if _, ok := activeSet[orgID]; ok {
 			continue
 		}
+		oldestQueuedAt, oldestErr := s.store.GetOldestQueuedAt(orgID)
+		if oldestErr != nil {
+			log.Printf("[GC] Failed to probe queued rows for active-set recovery org %s: %v", orgID, oldestErr)
+			continue
+		}
+		if oldestQueuedAt == nil {
+			continue
+		}
 		if err := s.store.MarkOrgActive(orgID, now); err != nil {
-			log.Printf("[GC] Failed to re-mark org %s active from queued snapshot: %v", orgID, err)
+			log.Printf("[GC] Failed to re-mark org %s active during recovery: %v", orgID, err)
 			continue
 		}
 		if err := s.store.MarkOrgDirty(orgID, now); err != nil {
@@ -570,7 +603,7 @@ func (s *Service) recoverMissingActiveQueueOrgs(reason string) {
 	}
 	if recovered > 0 {
 		metrics.GCActiveOrgRecoveriesTotal.WithLabelValues(reason).Add(float64(recovered))
-		log.Printf("[GC] Recovered %d queued org(s) into active set from gc_org_stats (reason=%s)", recovered, reason)
+		log.Printf("[GC] Recovered %d queued org(s) into active set from GC snapshots/dirty markers (reason=%s)", recovered, reason)
 	}
 }
 
@@ -612,7 +645,7 @@ func (s *Service) runScannerOnce(ctx context.Context) {
 		log.Printf("[GC Scanner] Auto-requeued %d recoverable failed items", retried)
 		s.TriggerWorker()
 	}
-	s.reconcileDirtyQueueStats(s.reconcileLimit())
+	s.reconcileDirtyQueueStats(s.reconcileLimit(), s.queueSnapshotRecalcMinInterval())
 	metrics.GCScannerDuration.Observe(time.Since(start).Seconds())
 	metrics.GCLastScannerRun.Set(float64(time.Now().Unix()))
 }
@@ -724,101 +757,71 @@ func (s *Service) saveStatInt(key string, value int) {
 	}
 }
 
-func (s *Service) reconcileDirtyQueueStats(limit int) {
-	s.reconcileMu.Lock()
-	defer s.reconcileMu.Unlock()
+type gcSnapshotCandidate struct {
+	OrgID          uuid.UUID
+	DirtyBefore    time.Time
+	HasDirtyMarker bool
+	ForceRefresh   bool
+}
 
+func (s *Service) queueSnapshotRecalcMinInterval() time.Duration {
+	interval := 2 * s.config.WorkerInterval
+	if interval < gcMinSnapshotRecalcInterval {
+		return gcMinSnapshotRecalcInterval
+	}
+	return interval
+}
+
+func (s *Service) reconcileSnapshotCandidatesLocked(candidates []gcSnapshotCandidate, minInterval time.Duration) {
 	start := time.Now()
 	defer func() {
 		metrics.GCReconcileDuration.Observe(time.Since(start).Seconds())
 	}()
 
-	dirtyOrgs, err := s.store.ListDirtyOrgs(limit)
-	if err != nil {
-		log.Printf("[GC] Failed to list dirty orgs: %v", err)
-		return
-	}
-	metrics.GCDirtyOrgsTotal.Set(float64(len(dirtyOrgs)))
-
 	totalQueue := s.loadStatInt(gcStatKeyTotalQueue)
 	totalFailed := s.loadStatInt(gcStatKeyTotalFailed)
-	remainingDirtyCount := len(dirtyOrgs)
 
-	if len(dirtyOrgs) > 0 {
-		for _, dirtyOrg := range dirtyOrgs {
-			snapshotAt := time.Now().UTC()
-			prevStats, err := s.store.GetOrgQueueStats(dirtyOrg.OrgID)
-			if err != nil {
-				log.Printf("[GC] Failed to load org queue stats for %s: %v", dirtyOrg.OrgID, err)
-				continue
+	for _, candidate := range candidates {
+		prevStats, err := s.store.GetOrgQueueStats(candidate.OrgID)
+		if err != nil {
+			log.Printf("[GC] Failed to load org queue stats for %s: %v", candidate.OrgID, err)
+			continue
+		}
+		if candidate.HasDirtyMarker && !candidate.ForceRefresh && !prevStats.RecalculatedAt.IsZero() && !prevStats.RecalculatedAt.Before(candidate.DirtyBefore) {
+			if err := s.store.ClearDirtyOrg(candidate.OrgID, candidate.DirtyBefore); err != nil {
+				log.Printf("[GC] Failed to clear already-refreshed dirty org %s: %v", candidate.OrgID, err)
 			}
-			queueDepth, err := s.store.ReadOrgQueueDepth(dirtyOrg.OrgID)
-			if err != nil {
-				log.Printf("[GC] Failed to read queue depth counters for %s: %v", dirtyOrg.OrgID, err)
-				continue
-			}
-			failedDepth, err := s.store.ReadOrgFailedDepth(dirtyOrg.OrgID)
-			if err != nil {
-				log.Printf("[GC] Failed to read failed depth counters for %s: %v", dirtyOrg.OrgID, err)
-				continue
-			}
-			oldestQueuedAt := prevStats.OldestQueuedAt
-			if queueDepth == 0 {
-				liveOldestQueuedAt, err := s.store.GetOldestQueuedAt(dirtyOrg.OrgID)
-				if err != nil {
-					log.Printf("[GC] Failed to probe live queue rows for %s before drain decision: %v", dirtyOrg.OrgID, err)
-					continue
-				}
-				if liveOldestQueuedAt != nil {
-					log.Printf("[GC] Queue counter false-zero detected for %s; preserving active state and requesting repair", dirtyOrg.OrgID)
-					if err := s.store.RequestQueueCounterReconciliation(dirtyOrg.OrgID, "reconcile_false_zero"); err != nil {
-						log.Printf("[GC] Failed to request queue counter repair for %s after false-zero: %v", dirtyOrg.OrgID, err)
-					}
-					if err := s.store.MarkOrgActive(dirtyOrg.OrgID, snapshotAt); err != nil {
-						log.Printf("[GC] Failed to preserve active org %s after false-zero: %v", dirtyOrg.OrgID, err)
-					}
-					if err := s.store.MarkOrgDirty(dirtyOrg.OrgID, snapshotAt); err != nil {
-						log.Printf("[GC] Failed to keep org %s dirty after false-zero: %v", dirtyOrg.OrgID, err)
-					}
-					continue
-				}
-				oldestQueuedAt = nil
-			}
+			continue
+		}
+		if !candidate.ForceRefresh && minInterval > 0 && !prevStats.RecalculatedAt.IsZero() && time.Since(prevStats.RecalculatedAt) < minInterval {
+			continue
+		}
 
-			nextStats := GCOrgStats{
-				OrgID:          dirtyOrg.OrgID,
-				QueueDepth:     queueDepth,
-				FailedDepth:    failedDepth,
-				OldestQueuedAt: oldestQueuedAt,
-				UpdatedAt:      snapshotAt,
-			}
-			if err := s.store.SaveOrgQueueStats(nextStats); err != nil {
-				log.Printf("[GC] Failed to save org queue stats for %s: %v", dirtyOrg.OrgID, err)
-				continue
-			}
+		nextStats, err := s.store.RecalculateOrgQueueStats(candidate.OrgID)
+		if err != nil {
+			log.Printf("[GC] Failed to recalculate org queue stats for %s: %v", candidate.OrgID, err)
+			continue
+		}
 
-			totalQueue += queueDepth - prevStats.QueueDepth
-			if totalQueue < 0 {
-				totalQueue = 0
-			}
-			totalFailed += failedDepth - prevStats.FailedDepth
-			if totalFailed < 0 {
-				totalFailed = 0
-			}
+		totalQueue += nextStats.QueueDepth - prevStats.QueueDepth
+		if totalQueue < 0 {
+			totalQueue = 0
+		}
+		totalFailed += nextStats.FailedDepth - prevStats.FailedDepth
+		if totalFailed < 0 {
+			totalFailed = 0
+		}
 
-			if err := s.store.ClearDirtyOrg(dirtyOrg.OrgID, dirtyOrg.MarkedAt); err != nil {
-				log.Printf("[GC] Failed to clear dirty org %s: %v", dirtyOrg.OrgID, err)
-			}
-			if queueDepth == 0 {
-				if err := s.store.RemoveOrgFromActiveSet(dirtyOrg.OrgID, snapshotAt); err != nil {
-					log.Printf("[GC] Failed to remove drained org %s from active set: %v", dirtyOrg.OrgID, err)
-				}
+		if nextStats.QueueDepth > 0 {
+			if err := s.store.MarkOrgActive(candidate.OrgID, nextStats.RecalculatedAt); err != nil {
+				log.Printf("[GC] Failed to preserve active org %s after snapshot refresh: %v", candidate.OrgID, err)
 			}
 		}
-	}
-
-	if err := s.refreshFailedItemSnapshotLocked(); err != nil {
-		log.Printf("[GC] Failed to repair stale failed-item snapshot: %v", err)
+		if candidate.HasDirtyMarker {
+			if err := s.store.ClearDirtyOrg(candidate.OrgID, candidate.DirtyBefore); err != nil {
+				log.Printf("[GC] Failed to clear dirty org %s: %v", candidate.OrgID, err)
+			}
+		}
 	}
 
 	s.reconcilePasses++
@@ -834,10 +837,13 @@ func (s *Service) reconcileDirtyQueueStats(limit int) {
 		}
 	}
 
-	lastRun := time.Now().UTC()
+	remainingDirtyCount := 0
 	if remainingDirty, err := s.store.ListDirtyOrgs(0); err == nil {
 		remainingDirtyCount = len(remainingDirty)
+	} else {
+		log.Printf("[GC] Failed to list dirty orgs after snapshot refresh: %v", err)
 	}
+	lastRun := time.Now().UTC()
 	s.saveStatInt(gcStatKeyTotalQueue, totalQueue)
 	s.saveStatInt(gcStatKeyTotalFailed, totalFailed)
 	s.saveStatInt(gcStatKeyTotalDirtyOrgs, remainingDirtyCount)
@@ -850,57 +856,58 @@ func (s *Service) reconcileDirtyQueueStats(limit int) {
 	metrics.GCSnapshotAgeSeconds.Set(0)
 }
 
+func (s *Service) reconcileDirtyQueueStats(limit int, minInterval time.Duration) {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+
+	dirtyOrgs, err := s.store.ListDirtyOrgs(limit)
+	if err != nil {
+		log.Printf("[GC] Failed to list dirty orgs: %v", err)
+		return
+	}
+	candidates := make([]gcSnapshotCandidate, 0, len(dirtyOrgs))
+	for _, dirtyOrg := range dirtyOrgs {
+		candidates = append(candidates, gcSnapshotCandidate{
+			OrgID:          dirtyOrg.OrgID,
+			DirtyBefore:    dirtyOrg.MarkedAt,
+			HasDirtyMarker: true,
+		})
+	}
+	s.reconcileSnapshotCandidatesLocked(candidates, minInterval)
+}
+
 func (s *Service) refreshFailedItemSnapshotLocked() error {
 	snapshotOrgs, err := s.store.ListOrgsWithFailedItems(0)
 	if err != nil {
 		return err
 	}
 
-	if len(snapshotOrgs) == 0 {
-		if s.loadStatInt(gcStatKeyTotalFailed) != 0 {
-			s.saveStatInt(gcStatKeyTotalFailed, 0)
-			metrics.GCFailedItemsTotal.Set(0)
-		}
-		return nil
-	}
-
-	repaired := 0
-	now := time.Now().UTC()
-	for _, org := range snapshotOrgs {
-		failedDepth, err := s.store.ReadOrgFailedDepth(org.OrgID)
-		if err != nil {
-			log.Printf("[GC] Failed to read stale failed depth counters for %s: %v", org.OrgID, err)
-			continue
-		}
-		if failedDepth == org.FailedItemsTotal {
-			continue
-		}
-
-		stats, err := s.store.GetOrgQueueStats(org.OrgID)
-		if err != nil {
-			log.Printf("[GC] Failed to load stale failed stats for %s: %v", org.OrgID, err)
-			continue
-		}
-		stats.FailedDepth = failedDepth
-		stats.UpdatedAt = now
-		if err := s.store.SaveOrgQueueStats(stats); err != nil {
-			log.Printf("[GC] Failed to save repaired failed stats for %s: %v", org.OrgID, err)
-			continue
-		}
-		repaired++
-	}
-
-	if repaired == 0 {
-		return nil
-	}
-
-	_, summedFailed, err := s.store.SumOrgQueueStats()
+	dirtyOrgs, err := s.store.ListDirtyOrgs(0)
 	if err != nil {
 		return err
 	}
-	s.saveStatInt(gcStatKeyTotalFailed, summedFailed)
-	metrics.GCFailedItemsTotal.Set(float64(summedFailed))
-	log.Printf("[GC] Repaired stale failed-item snapshot for %d org(s); total_failed=%d", repaired, summedFailed)
+
+	candidateByOrg := make(map[uuid.UUID]gcSnapshotCandidate, len(snapshotOrgs)+len(dirtyOrgs))
+	for _, org := range snapshotOrgs {
+		candidateByOrg[org.OrgID] = gcSnapshotCandidate{OrgID: org.OrgID}
+	}
+	for _, dirtyOrg := range dirtyOrgs {
+		candidateByOrg[dirtyOrg.OrgID] = gcSnapshotCandidate{
+			OrgID:          dirtyOrg.OrgID,
+			DirtyBefore:    dirtyOrg.MarkedAt,
+			HasDirtyMarker: true,
+		}
+	}
+	if len(candidateByOrg) == 0 {
+		s.reconcileSnapshotCandidatesLocked(nil, 0)
+		return nil
+	}
+
+	candidates := make([]gcSnapshotCandidate, 0, len(candidateByOrg))
+	for _, candidate := range candidateByOrg {
+		candidates = append(candidates, candidate)
+	}
+	s.reconcileSnapshotCandidatesLocked(candidates, 0)
 	return nil
 }
 
@@ -929,67 +936,28 @@ func (s *Service) ListFailedItemOrgs(limit int) ([]GCFailedItemOrgInfo, error) {
 	if limit <= 0 {
 		limit = gcDefaultFailedOrgPageSize
 	}
-	snapshotOrgs, err := s.store.ListOrgsWithFailedItems(0)
-	if err != nil {
-		return nil, err
-	}
+	return s.store.ListOrgsWithFailedItems(limit)
+}
+
+func (s *Service) refreshOrgQueueStatsNow(orgID uuid.UUID) error {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+
+	candidate := gcSnapshotCandidate{OrgID: orgID, ForceRefresh: true}
 	dirtyOrgs, err := s.store.ListDirtyOrgs(0)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	candidateOrgIDs := make(map[uuid.UUID]struct{}, len(snapshotOrgs)+len(dirtyOrgs))
-	for _, org := range snapshotOrgs {
-		candidateOrgIDs[org.OrgID] = struct{}{}
-	}
-	for _, org := range dirtyOrgs {
-		candidateOrgIDs[org.OrgID] = struct{}{}
-	}
-
-	orgs := make([]GCFailedItemOrgInfo, 0, len(candidateOrgIDs))
-	for orgID := range candidateOrgIDs {
-		failedDepth, err := s.store.ReadOrgFailedDepth(orgID)
-		if err != nil {
-			return nil, err
-		}
-		if failedDepth <= 0 {
+	for _, dirtyOrg := range dirtyOrgs {
+		if dirtyOrg.OrgID != orgID {
 			continue
 		}
-
-		latestItems, err := s.store.ListFailedItems(orgID, 1)
-		if err != nil {
-			return nil, err
-		}
-		if len(latestItems) == 0 {
-			continue
-		}
-
-		orgName, err := s.store.GetOrgName(orgID)
-		if err != nil {
-			orgName = ""
-		}
-
-		orgs = append(orgs, GCFailedItemOrgInfo{
-			OrgID:            orgID,
-			OrgName:          orgName,
-			FailedItemsTotal: failedDepth,
-			UpdatedAt:        latestItems[0].FailedAt,
-		})
+		candidate.DirtyBefore = dirtyOrg.MarkedAt
+		candidate.HasDirtyMarker = true
+		break
 	}
-
-	sort.Slice(orgs, func(i, j int) bool {
-		if orgs[i].FailedItemsTotal != orgs[j].FailedItemsTotal {
-			return orgs[i].FailedItemsTotal > orgs[j].FailedItemsTotal
-		}
-		if !orgs[i].UpdatedAt.Equal(orgs[j].UpdatedAt) {
-			return orgs[i].UpdatedAt.After(orgs[j].UpdatedAt)
-		}
-		return orgs[i].OrgID.String() < orgs[j].OrgID.String()
-	})
-	if len(orgs) > limit {
-		orgs = orgs[:limit]
-	}
-	return orgs, nil
+	s.reconcileSnapshotCandidatesLocked([]gcSnapshotCandidate{candidate}, 0)
+	return nil
 }
 
 func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
@@ -1002,7 +970,9 @@ func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType
 	if err != nil {
 		return err
 	}
-	s.reconcileDirtyQueueStats(s.reconcileLimit())
+	if err := s.refreshOrgQueueStatsNow(orgID); err != nil {
+		log.Printf("[GC] WARNING: failed to refresh GC snapshot after admin delete for org %s: %v", orgID, err)
+	}
 	return nil
 }
 
@@ -1022,7 +992,9 @@ func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemTyp
 	if err != nil {
 		return err
 	}
-	s.reconcileDirtyQueueStats(s.reconcileLimit())
+	if err := s.refreshOrgQueueStatsNow(orgID); err != nil {
+		log.Printf("[GC] WARNING: failed to refresh GC snapshot after admin requeue for org %s: %v", orgID, err)
+	}
 	return nil
 }
 

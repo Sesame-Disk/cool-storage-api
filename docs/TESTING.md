@@ -99,7 +99,7 @@ cross-process races by default.
 Keep background GC isolated to the primary `sesamefs` service in that profile.
 `sesamefs-node-2` and `sesamefs-node-3` must keep `GC_ENABLED=false`, or GC-
 sensitive integration tests become nondeterministic because secondary nodes can
-reconcile queue counters, requeue failed items, or purge expired share links in
+refresh dirty GC snapshots, requeue failed items, or purge expired share links in
 parallel.
 
 ### Current Multi-Instance Coverage Gaps

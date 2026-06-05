@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
-	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -233,96 +232,44 @@ func (s *CassandraStore) loadGCStatInt(key string) (int, bool, error) {
 	return parsed, true, nil
 }
 
-func (s *CassandraStore) recordQueueCounterDelta(orgID uuid.UUID, bucket int, queueDelta, failedDelta int) {
-	if queueDelta == 0 && failedDelta == 0 {
-		return
-	}
-	if err := s.adjustQueueCounter(orgID, bucket, queueDelta, failedDelta); err != nil {
-		counter := "queue"
-		if queueDelta != 0 && failedDelta != 0 {
-			counter = "queue_failed"
-		} else if failedDelta != 0 {
-			counter = "failed"
-		}
-		metrics.GCQueueCounterUpdateFailuresTotal.WithLabelValues(counter).Inc()
-		log.Printf("[GC] WARNING: failed to update queue-depth counter org=%s bucket=%d queue_delta=%d failed_delta=%d: %v", orgID, bucket, queueDelta, failedDelta, err)
-		if repairErr := s.RequestQueueCounterReconciliation(orgID, "counter_update_failed"); repairErr != nil {
-			log.Printf("[GC] WARNING: failed to request queue counter repair org=%s: %v", orgID, repairErr)
-		}
-		if markErr := s.MarkOrgDirty(orgID, time.Now().UTC()); markErr != nil {
-			log.Printf("[GC] WARNING: failed to mark org dirty after counter update failure org=%s: %v", orgID, markErr)
-		}
-	}
-}
+func (s *CassandraStore) scanOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error) {
+	stats := GCOrgStats{OrgID: orgID}
+	var oldestQueuedAt *time.Time
 
-func (s *CassandraStore) adjustQueueCounter(orgID uuid.UUID, bucket int, queueDelta, failedDelta int) error {
-	switch {
-	case queueDelta != 0 && failedDelta != 0:
-		return s.db.Session().Query(`
-			UPDATE gc_org_queue_counters
-			SET queue_depth = queue_depth + ?, failed_depth = failed_depth + ?
-			WHERE org_id = ? AND bucket = ?
-		`, int64(queueDelta), int64(failedDelta), orgID.String(), bucket).Exec()
-	case queueDelta != 0:
-		return s.db.Session().Query(`
-			UPDATE gc_org_queue_counters
-			SET queue_depth = queue_depth + ?
-			WHERE org_id = ? AND bucket = ?
-		`, int64(queueDelta), orgID.String(), bucket).Exec()
-	case failedDelta != 0:
-		return s.db.Session().Query(`
-			UPDATE gc_org_queue_counters
-			SET failed_depth = failed_depth + ?
-			WHERE org_id = ? AND bucket = ?
-		`, int64(failedDelta), orgID.String(), bucket).Exec()
-	default:
-		return nil
-	}
-}
-
-func (s *CassandraStore) loadOrgQueueCounterTotals(orgID uuid.UUID) (int, int, error) {
-	var totalQueue, totalFailed int64
 	for bucket := 0; bucket < gcDefaultQueueBucketCount; bucket++ {
-		var queueDepth, failedDepth int64
-		err := s.db.Session().Query(`
-			SELECT queue_depth, failed_depth
-			FROM gc_org_queue_counters
+		iter := s.db.Session().Query(`
+			SELECT queued_at
+			FROM gc_queue
 			WHERE org_id = ? AND bucket = ?
-		`, orgID.String(), bucket).Scan(&queueDepth, &failedDepth)
-		if err != nil {
-			if errors.Is(err, gocql.ErrNotFound) {
-				continue
+		`, orgID.String(), bucket).Iter()
+		var queuedAt time.Time
+		for iter.Scan(&queuedAt) {
+			stats.QueueDepth++
+			queuedAtCopy := queuedAt.UTC()
+			if oldestQueuedAt == nil || queuedAtCopy.Before(*oldestQueuedAt) {
+				oldestQueuedAt = &queuedAtCopy
 			}
-			return 0, 0, fmt.Errorf("load gc queue counters for %s bucket %d: %w", orgID, bucket, err)
 		}
-		totalQueue += queueDepth
-		totalFailed += failedDepth
+		if err := iter.Close(); err != nil {
+			return GCOrgStats{}, fmt.Errorf("scan queue depth org=%s bucket=%d: %w", orgID, bucket, err)
+		}
 	}
-	if totalQueue < 0 {
-		totalQueue = 0
+
+	iter := s.db.Session().Query(`
+		SELECT failed_at
+		FROM gc_failed_items
+		WHERE org_id = ?
+	`, orgID.String()).Iter()
+	var failedAt time.Time
+	for iter.Scan(&failedAt) {
+		stats.FailedDepth++
 	}
-	if totalFailed < 0 {
-		totalFailed = 0
+	if err := iter.Close(); err != nil {
+		return GCOrgStats{}, fmt.Errorf("scan failed depth org=%s: %w", orgID, err)
 	}
-	return int(totalQueue), int(totalFailed), nil
-}
 
-func addQueueCounterReconciliationBatchQuery(batch *gocql.Batch, orgID uuid.UUID, requestedAt time.Time, reason string) {
-	batch.Query(`
-		INSERT INTO gc_queue_counter_reconciliation (bucket, org_id, requested_at, reason)
-		VALUES (?, ?, ?, ?)
-	`, gcOrgBucket(orgID), orgID.String(), requestedAt.UTC(), reason)
-}
-
-func (s *CassandraStore) requestQueueCounterReconciliation(orgID uuid.UUID, reason string) error {
-	return s.db.Session().Query(`
-		INSERT INTO gc_queue_counter_reconciliation (bucket, org_id, requested_at, reason)
-		VALUES (?, ?, ?, ?)
-	`, gcOrgBucket(orgID), orgID.String(), time.Now().UTC(), reason).Exec()
-}
-
-func (s *CassandraStore) RequestQueueCounterReconciliation(orgID uuid.UUID, reason string) error {
-	return s.requestQueueCounterReconciliation(orgID, reason)
+	stats.OldestQueuedAt = oldestQueuedAt
+	return stats, nil
 }
 
 // --- Queue operations ---
@@ -344,12 +291,7 @@ func (s *CassandraStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemTy
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
 	`, gcOrgBucket(orgID), orgID.String(), now)
-	addQueueCounterReconciliationBatchQuery(batch, orgID, now, "queue_mutation")
-	if err := batch.Exec(); err != nil {
-		return err
-	}
-	s.recordQueueCounterDelta(orgID, queueBucket, 1, 0)
-	return nil
+	return batch.Exec()
 }
 
 func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
@@ -367,11 +309,6 @@ func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
 
 		batch := s.db.Session().Batch(gocql.LoggedBatch)
 		activeAtByOrg := make(map[string]time.Time)
-		queueDeltas := make(map[string]struct {
-			orgID  uuid.UUID
-			bucket int
-			delta  int
-		})
 		for _, item := range chunk {
 			identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
 			queueBucket := gcQueueBucket(item.OrgID, item.ItemType, item.ItemID)
@@ -381,30 +318,19 @@ func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
 			`, item.OrgID.String(), queueBucket, item.QueuedAt, identityAt, item.RequiresLibraryDeletedCheck, string(item.ItemType), item.ItemID, item.LibraryID.String(), item.StorageClass, item.RetryCount)
 			addPendingItemBatchQuery(batch, item.OrgID, item.LibraryID, item.ItemType, item.ItemID, identityAt)
 			activeAtByOrg[item.OrgID.String()] = time.Now().UTC()
-			deltaKey := fmt.Sprintf("%s:%d", item.OrgID, queueBucket)
-			delta := queueDeltas[deltaKey]
-			delta.orgID = item.OrgID
-			delta.bucket = queueBucket
-			delta.delta++
-			queueDeltas[deltaKey] = delta
 		}
 		for orgIDStr, activeAt := range activeAtByOrg {
-			orgID := parseUUID(orgIDStr)
 			batch.Query(`
 				INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)
 				VALUES (?, ?, ?)
-			`, gcOrgBucket(orgID), orgIDStr, activeAt)
+			`, gcOrgBucket(parseUUID(orgIDStr)), orgIDStr, activeAt)
 			batch.Query(`
 				INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 				VALUES (?, ?, ?)
-			`, gcOrgBucket(orgID), orgIDStr, activeAt)
-			addQueueCounterReconciliationBatchQuery(batch, orgID, activeAt, "queue_batch_mutation")
+			`, gcOrgBucket(parseUUID(orgIDStr)), orgIDStr, activeAt)
 		}
 		if err := batch.Exec(); err != nil {
 			return fmt.Errorf("failed to enqueue batch chunk at offset %d: %w", i, err)
-		}
-		for _, delta := range queueDeltas {
-			s.recordQueueCounterDelta(delta.orgID, delta.bucket, delta.delta, 0)
 		}
 	}
 	return nil
@@ -567,12 +493,11 @@ func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemT
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
 	`, gcOrgBucket(orgID), orgID.String(), now)
-	addQueueCounterReconciliationBatchQuery(batch, orgID, now, "queue_complete")
 	if err := batch.Exec(); err != nil {
 		return err
 	}
-	if hadQueueRow {
-		s.recordQueueCounterDelta(orgID, gcQueueBucket(orgID, itemType, itemID), -1, 0)
+	if !hadQueueRow {
+		return nil
 	}
 	return nil
 }
@@ -603,7 +528,6 @@ func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt t
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
 	`, gcOrgBucket(orgID), orgID.String(), now)
-	addQueueCounterReconciliationBatchQuery(batch, orgID, now, "queue_requeue")
 
 	return batch.Exec()
 }
@@ -638,20 +562,15 @@ func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError,
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
 	`, gcOrgBucket(item.OrgID), item.OrgID.String(), now)
-	addQueueCounterReconciliationBatchQuery(batch, item.OrgID, now, "queue_fail")
-	if err := batch.Exec(); err != nil {
-		return err
-	}
-	s.recordQueueCounterDelta(item.OrgID, queueBucket, -1, 1)
-	return nil
+	return batch.Exec()
 }
 
 func (s *CassandraStore) GetQueueSize(orgID uuid.UUID) (int, error) {
-	queueDepth, _, err := s.loadOrgQueueCounterTotals(orgID)
+	stats, err := s.GetOrgQueueStats(orgID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get queue size for %s: %w", orgID, err)
 	}
-	return queueDepth, nil
+	return stats.QueueDepth, nil
 }
 
 func (s *CassandraStore) GetTotalQueueSize() (int, error) {
@@ -823,12 +742,7 @@ func (s *CassandraStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, i
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
 	`, gcOrgBucket(orgID), orgID.String(), now)
-	addQueueCounterReconciliationBatchQuery(batch, orgID, now, "failed_delete")
-	if err := batch.Exec(); err != nil {
-		return err
-	}
-	s.recordQueueCounterDelta(orgID, gcQueueBucket(orgID, itemType, itemID), 0, -1)
-	return nil
+	return batch.Exec()
 }
 
 func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now time.Time) (bool, error) {
@@ -839,9 +753,6 @@ func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, 
 			WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
 		`, db.GCProjectionUTCDate(expiry.ExpiresAt), db.GCDiscoveryBucket(expiry.OrgID.String(), string(expiry.ItemType), expiry.ItemID, expiry.FailedAt.UTC().Format(time.RFC3339Nano)), expiry.ExpiresAt.UTC(), expiry.OrgID.String(), expiry.FailedAt.UTC(), string(expiry.ItemType), expiry.ItemID).Exec(); err != nil {
 			return false, fmt.Errorf("delete orphaned failed-item expiry projection org=%s item=%s: %w", expiry.OrgID, expiry.ItemID, err)
-		}
-		if repairErr := s.RequestQueueCounterReconciliation(expiry.OrgID, "failed_expiry_projection_orphaned"); repairErr != nil {
-			log.Printf("[GC] WARNING: failed to request queue counter repair for orphaned failed-item expiry org=%s item=%s: %v", expiry.OrgID, expiry.ItemID, repairErr)
 		}
 		if markErr := s.MarkOrgDirty(expiry.OrgID, time.Now().UTC()); markErr != nil {
 			log.Printf("[GC] WARNING: failed to mark org dirty for orphaned failed-item expiry org=%s item=%s: %v", expiry.OrgID, expiry.ItemID, markErr)
@@ -860,9 +771,6 @@ func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, 
 			WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
 		`, db.GCProjectionUTCDate(expiry.ExpiresAt), db.GCDiscoveryBucket(expiry.OrgID.String(), string(expiry.ItemType), expiry.ItemID, expiry.FailedAt.UTC().Format(time.RFC3339Nano)), expiry.ExpiresAt.UTC(), expiry.OrgID.String(), expiry.FailedAt.UTC(), string(expiry.ItemType), expiry.ItemID).Exec(); err != nil {
 			return false, fmt.Errorf("delete stale failed-item expiry projection org=%s item=%s: %w", expiry.OrgID, expiry.ItemID, err)
-		}
-		if repairErr := s.RequestQueueCounterReconciliation(expiry.OrgID, "failed_expiry_projection_stale"); repairErr != nil {
-			log.Printf("[GC] WARNING: failed to request queue counter repair for stale failed-item expiry org=%s item=%s: %v", expiry.OrgID, expiry.ItemID, repairErr)
 		}
 		if markErr := s.MarkOrgDirty(expiry.OrgID, time.Now().UTC()); markErr != nil {
 			log.Printf("[GC] WARNING: failed to mark org dirty for stale failed-item expiry org=%s item=%s: %v", expiry.OrgID, expiry.ItemID, markErr)
@@ -885,11 +793,9 @@ func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, 
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
 	`, gcOrgBucket(expiry.OrgID), expiry.OrgID.String(), mutationAt)
-	addQueueCounterReconciliationBatchQuery(batch, expiry.OrgID, mutationAt, "failed_expire")
 	if err := batch.Exec(); err != nil {
 		return false, err
 	}
-	s.recordQueueCounterDelta(expiry.OrgID, gcQueueBucket(expiry.OrgID, expiry.ItemType, expiry.ItemID), 0, -1)
 	return true, nil
 }
 
@@ -929,170 +835,7 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
 	`, gcOrgBucket(orgID), orgID.String(), queuedAt)
-	addQueueCounterReconciliationBatchQuery(batch, orgID, queuedAt, "failed_requeue")
-	if err := batch.Exec(); err != nil {
-		return err
-	}
-	s.recordQueueCounterDelta(orgID, gcQueueBucket(orgID, itemType, itemID), 1, -1)
-	return nil
-}
-
-type queueCounterRepairRequest struct {
-	OrgID       uuid.UUID
-	Bucket      int
-	RequestedAt time.Time
-	Reason      string
-}
-
-func (s *CassandraStore) listQueueCounterRepairRequests(limit int) ([]queueCounterRepairRequest, error) {
-	requests := make([]queueCounterRepairRequest, 0)
-	for bucket := 0; bucket < gcDefaultOrgBucketCount; bucket++ {
-		iter := s.db.Session().Query(`
-			SELECT org_id, requested_at, reason
-			FROM gc_queue_counter_reconciliation
-			WHERE bucket = ?
-		`, bucket).Iter()
-		var (
-			orgIDStr    string
-			requestedAt time.Time
-			reason      string
-		)
-		for iter.Scan(&orgIDStr, &requestedAt, &reason) {
-			requests = append(requests, queueCounterRepairRequest{
-				OrgID:       parseUUID(orgIDStr),
-				Bucket:      bucket,
-				RequestedAt: requestedAt,
-				Reason:      reason,
-			})
-			if limit > 0 && len(requests) >= limit {
-				break
-			}
-		}
-		if err := iter.Close(); err != nil {
-			return nil, fmt.Errorf("list queue counter repair requests bucket=%d: %w", bucket, err)
-		}
-		if limit > 0 && len(requests) >= limit {
-			break
-		}
-	}
-	return requests, nil
-}
-
-func (s *CassandraStore) recomputeOrgQueueCounterDepths(orgID uuid.UUID) ([]int64, []int64, error) {
-	queueDepths := make([]int64, gcDefaultQueueBucketCount)
-	failedDepths := make([]int64, gcDefaultQueueBucketCount)
-
-	for bucket := 0; bucket < gcDefaultQueueBucketCount; bucket++ {
-		iter := s.db.Session().Query(`
-			SELECT queued_at
-			FROM gc_queue
-			WHERE org_id = ? AND bucket = ?
-		`, orgID.String(), bucket).Iter()
-		var queuedAt time.Time
-		for iter.Scan(&queuedAt) {
-			queueDepths[bucket]++
-		}
-		if err := iter.Close(); err != nil {
-			return nil, nil, fmt.Errorf("recompute queue depth org=%s bucket=%d: %w", orgID, bucket, err)
-		}
-	}
-
-	iter := s.db.Session().Query(`
-		SELECT item_type, item_id
-		FROM gc_failed_items
-		WHERE org_id = ?
-	`, orgID.String()).Iter()
-	var itemType, itemID string
-	for iter.Scan(&itemType, &itemID) {
-		bucket := gcQueueBucket(orgID, ItemType(itemType), itemID)
-		failedDepths[bucket]++
-	}
-	if err := iter.Close(); err != nil {
-		return nil, nil, fmt.Errorf("recompute failed depth org=%s: %w", orgID, err)
-	}
-	return queueDepths, failedDepths, nil
-}
-
-func (s *CassandraStore) loadOrgQueueCounterBucket(orgID uuid.UUID, bucket int) (int64, int64, error) {
-	var queueDepth, failedDepth int64
-	err := s.db.Session().Query(`
-		SELECT queue_depth, failed_depth
-		FROM gc_org_queue_counters
-		WHERE org_id = ? AND bucket = ?
-	`, orgID.String(), bucket).Scan(&queueDepth, &failedDepth)
-	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return 0, 0, nil
-		}
-		return 0, 0, err
-	}
-	return queueDepth, failedDepth, nil
-}
-
-func (s *CassandraStore) reconcileQueueCounterRequest(request queueCounterRepairRequest) error {
-	queueDepths, failedDepths, err := s.recomputeOrgQueueCounterDepths(request.OrgID)
-	if err != nil {
-		return err
-	}
-
-	var totalQueue int64
-
-	for bucket := 0; bucket < gcDefaultQueueBucketCount; bucket++ {
-		totalQueue += queueDepths[bucket]
-		currentQueue, currentFailed, err := s.loadOrgQueueCounterBucket(request.OrgID, bucket)
-		if err != nil {
-			return fmt.Errorf("load queue counter org=%s bucket=%d: %w", request.OrgID, bucket, err)
-		}
-		queueDelta := queueDepths[bucket] - currentQueue
-		failedDelta := failedDepths[bucket] - currentFailed
-		if queueDelta == 0 && failedDelta == 0 {
-			continue
-		}
-		if err := s.adjustQueueCounter(request.OrgID, bucket, int(queueDelta), int(failedDelta)); err != nil {
-			metrics.GCQueueCounterUpdateFailuresTotal.WithLabelValues("repair").Inc()
-			return fmt.Errorf("repair queue counter org=%s bucket=%d queue_delta=%d failed_delta=%d: %w", request.OrgID, bucket, queueDelta, failedDelta, err)
-		}
-	}
-
-	if err := s.MarkOrgDirty(request.OrgID, time.Now().UTC()); err != nil {
-		return fmt.Errorf("mark org dirty after queue counter repair org=%s: %w", request.OrgID, err)
-	}
-	if totalQueue > 0 {
-		if err := s.MarkOrgActive(request.OrgID, time.Now().UTC()); err != nil {
-			return fmt.Errorf("mark org active after queue counter repair org=%s: %w", request.OrgID, err)
-		}
-	}
-	if err := s.db.Session().Query(`
-		DELETE FROM gc_queue_counter_reconciliation
-		WHERE bucket = ? AND org_id = ?
-	`, request.Bucket, request.OrgID.String()).Exec(); err != nil {
-		return fmt.Errorf("delete queue counter repair request org=%s: %w", request.OrgID, err)
-	}
-	return nil
-}
-
-func (s *CassandraStore) ReconcilePendingQueueCounters(limit int) (int, error) {
-	requests, err := s.listQueueCounterRepairRequests(limit)
-	if err != nil {
-		return 0, err
-	}
-	if len(requests) == 0 {
-		return 0, nil
-	}
-
-	reconciled := 0
-	var firstErr error
-	for _, request := range requests {
-		if err := s.reconcileQueueCounterRequest(request); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			log.Printf("[GC] WARNING: queue counter repair failed org=%s reason=%s requested_at=%s: %v", request.OrgID, request.Reason, request.RequestedAt.Format(time.RFC3339Nano), err)
-			continue
-		}
-		reconciled++
-	}
-	return reconciled, firstErr
+	return batch.Exec()
 }
 
 func (s *CassandraStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
@@ -1212,9 +955,9 @@ func (s *CassandraStore) GetOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error) {
 	stats := GCOrgStats{OrgID: orgID}
 	var oldestQueuedAt *time.Time
 	err := s.db.Session().Query(`
-		SELECT queue_depth, failed_depth, oldest_queued_at, updated_at
+		SELECT queue_depth, failed_depth, oldest_queued_at, updated_at, recalculated_at
 		FROM gc_org_stats WHERE org_id = ?
-	`, orgID.String()).Scan(&stats.QueueDepth, &stats.FailedDepth, &oldestQueuedAt, &stats.UpdatedAt)
+	`, orgID.String()).Scan(&stats.QueueDepth, &stats.FailedDepth, &oldestQueuedAt, &stats.UpdatedAt, &stats.RecalculatedAt)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return stats, nil
@@ -1227,25 +970,23 @@ func (s *CassandraStore) GetOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error) {
 
 func (s *CassandraStore) SaveOrgQueueStats(stats GCOrgStats) error {
 	return s.db.Session().Query(`
-		INSERT INTO gc_org_stats (org_id, queue_depth, failed_depth, oldest_queued_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, stats.OrgID.String(), stats.QueueDepth, stats.FailedDepth, stats.OldestQueuedAt, stats.UpdatedAt).Exec()
+		INSERT INTO gc_org_stats (org_id, queue_depth, failed_depth, oldest_queued_at, updated_at, recalculated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, stats.OrgID.String(), stats.QueueDepth, stats.FailedDepth, stats.OldestQueuedAt, stats.UpdatedAt, stats.RecalculatedAt).Exec()
 }
 
-func (s *CassandraStore) ReadOrgQueueDepth(orgID uuid.UUID) (int, error) {
-	queueDepth, _, err := s.loadOrgQueueCounterTotals(orgID)
+func (s *CassandraStore) RecalculateOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error) {
+	stats, err := s.scanOrgQueueStats(orgID)
 	if err != nil {
-		return 0, fmt.Errorf("load queue depth counters for %s: %w", orgID, err)
+		return GCOrgStats{}, err
 	}
-	return queueDepth, nil
-}
-
-func (s *CassandraStore) ReadOrgFailedDepth(orgID uuid.UUID) (int, error) {
-	_, failedDepth, err := s.loadOrgQueueCounterTotals(orgID)
-	if err != nil {
-		return 0, fmt.Errorf("load failed depth counters for %s: %w", orgID, err)
+	now := time.Now().UTC()
+	stats.UpdatedAt = now
+	stats.RecalculatedAt = now
+	if err := s.SaveOrgQueueStats(stats); err != nil {
+		return GCOrgStats{}, fmt.Errorf("save recalculated org queue stats for %s: %w", orgID, err)
 	}
-	return failedDepth, nil
+	return stats, nil
 }
 
 func (s *CassandraStore) GetOldestQueuedAt(orgID uuid.UUID) (*time.Time, error) {

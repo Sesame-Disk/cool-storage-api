@@ -1113,31 +1113,8 @@ CREATE TABLE IF NOT EXISTS gc_org_stats (
     queue_depth      INT,
     failed_depth     INT,
     oldest_queued_at TIMESTAMP,
-    updated_at       TIMESTAMP
-);
-
--- Approximate queue-depth counters maintained on the GC write path. These keep
--- admin/status snapshots off expensive COUNT(*) reads over tombstone-heavy
--- gc_queue/gc_failed_items partitions. Queue correctness still lives in
--- gc_queue, gc_failed_items, and gc_pending_items.
-CREATE TABLE IF NOT EXISTS gc_org_queue_counters (
-    org_id       UUID,
-    bucket       INT,
-    queue_depth  COUNTER,
-    failed_depth COUNTER,
-    PRIMARY KEY ((org_id, bucket))
-);
-
--- Durable repair queue for best-effort GC counters. Queue/DLQ mutations add a
--- per-org marker in the same logged batch, then the scanner periodically
--- recomputes exact queue/failed depths from canonical rows and applies counter
--- deltas. This closes the crash window between row mutation and counter write.
-CREATE TABLE IF NOT EXISTS gc_queue_counter_reconciliation (
-    bucket       INT,
-    org_id       UUID,
-    requested_at TIMESTAMP,
-    reason       TEXT,
-    PRIMARY KEY ((bucket), org_id)
+    updated_at       TIMESTAMP,
+    recalculated_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS gc_failed_items (
