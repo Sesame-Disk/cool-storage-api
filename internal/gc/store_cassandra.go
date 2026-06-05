@@ -1530,12 +1530,14 @@ func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bo
 
 func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
 	info := BlockInfo{BlockID: blockID}
+	var createdAt *time.Time
 	err := s.db.Session().Query(`
-		SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&info.StorageClass)
+		SELECT storage_class, created_at FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&info.StorageClass, &createdAt)
 	if err != nil {
 		return BlockInfo{}, err
 	}
+	info.CreatedAt = createdAt
 	return info, nil
 }
 

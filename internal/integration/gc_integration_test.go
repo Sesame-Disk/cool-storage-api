@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -944,6 +945,71 @@ func TestGC_DeleteBlockGCCandidate_RemovesDiscoveryRowWithoutCanonical(t *testin
 	}
 }
 
+func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	queue := gcpkg.NewQueue(store)
+	worker := gcpkg.NewWorker(store, nil, queue, 100, 0, false, &gcpkg.Stats{})
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	blockID := fmt.Sprintf("cand-missing-%d", time.Now().UnixNano())
+	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	candidateAt := ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", queuedAt)
+	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", queuedAt)
+	t.Cleanup(func() {
+		cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
+		if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+			t.Fatalf("failed to delete blocks row for %s/%s: %v", orgID, blockID, err)
+		}
+	})
+
+	if blockExistsInDB(t, orgID, blockID) {
+		t.Fatal("expected no canonical block row before worker")
+	}
+	if !gcCandidateExists(t, orgID, blockID) {
+		t.Fatal("expected canonical gc_block_candidates row before worker")
+	}
+	if !gcCandidateProjectionExists(t, orgID, blockID, candidateAt) {
+		t.Fatal("expected gc_block_candidates_by_day row before worker")
+	}
+	if !gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) {
+		t.Fatal("expected gc_queue row before worker")
+	}
+
+	for attempt := 0; attempt < 8; attempt++ {
+		if !gcCandidateExists(t, orgID, blockID) &&
+			!gcCandidateProjectionExists(t, orgID, blockID, candidateAt) &&
+			!gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) &&
+			!failedQueueItemExists(t, orgID, "block", blockID) &&
+			!blockExistsInDB(t, orgID, blockID) {
+			return
+		}
+		processed, err := worker.ProcessOnce(context.Background())
+		if err != nil {
+			t.Fatalf("ProcessOnce attempt %d failed: %v", attempt+1, err)
+		}
+		if processed == 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	if gcCandidateExists(t, orgID, blockID) ||
+		gcCandidateProjectionExists(t, orgID, blockID, candidateAt) ||
+		gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) ||
+		failedQueueItemExists(t, orgID, "block", blockID) ||
+		blockExistsInDB(t, orgID, blockID) {
+		t.Fatalf("stale candidate without canonical row was not fully skipped: block_exists=%v candidate=%v projection=%v queue=%v failed=%v",
+			blockExistsInDB(t, orgID, blockID),
+			gcCandidateExists(t, orgID, blockID),
+			gcCandidateProjectionExists(t, orgID, blockID, candidateAt),
+			gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)),
+			failedQueueItemExists(t, orgID, "block", blockID),
+		)
+	}
+}
+
 func TestGC_EnsureBlockGCCandidate_RepairsDiscoveryRowWhenCanonicalExists(t *testing.T) {
 	requireCassandra(t)
 
@@ -952,6 +1018,7 @@ func TestGC_EnsureBlockGCCandidate_RepairsDiscoveryRowWhenCanonicalExists(t *tes
 	orgID := uuid.New()
 	blockID := fmt.Sprintf("cand-repair-%d", time.Now().UnixNano())
 	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
+	seedSyntheticZeroRefBlockForTest(t, orgID, blockID, "hot")
 
 	effectiveCandidateAt, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", candidateAt)
 	if err != nil {
@@ -998,6 +1065,11 @@ func TestGC_RecordS3Orphan_RepairsDiscoveryRowWhenCanonicalExists(t *testing.T) 
 	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
 	}
+	t.Cleanup(func() {
+		if err := store.DeleteS3Orphan(orgID, blockID, effectiveFirstSeenAt); err != nil {
+			t.Fatalf("cleanup DeleteS3Orphan(%s): %v", blockID, err)
+		}
+	})
 	if err := database.Session().Query(`
 		DELETE FROM gc_s3_orphans_by_day
 		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?

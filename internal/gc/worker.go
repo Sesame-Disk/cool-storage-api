@@ -367,6 +367,19 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
+	exists, err := w.store.BlockExists(item.OrgID, item.ItemID)
+	if err != nil {
+		return fmt.Errorf("failed to check canonical block row for %s: %w", item.ItemID, err)
+	}
+	if !exists {
+		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
+			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
+		}
+		log.Printf("[GC Worker] Block %s missing canonical row, skipping deletion", item.ItemID)
+		metrics.GCItemsSkippedTotal.Inc()
+		return nil
+	}
+
 	// 1. Claim the block (gc_state='deleting') via LWT. claimID is stable for one
 	// logical candidate so retries of the same item remain the owner, but a
 	// different attempt cannot release or finalize another attempt's claim.
@@ -411,6 +424,20 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	}
 	storageClass := strings.TrimSpace(blockInfo.StorageClass)
 	if storageClass == "" {
+		if blockInfo.CreatedAt == nil {
+			if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, claimID); err != nil {
+				return fmt.Errorf("failed to remove stub block row for %s: %w", item.ItemID, err)
+			}
+			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
+				return fmt.Errorf("failed to clear block GC candidate after stub cleanup: %w", err)
+			}
+			log.Printf("[GC Worker] Block %s missing canonical metadata after claim; removed stub row and skipped deletion", item.ItemID)
+			metrics.GCItemsSkippedTotal.Inc()
+			return nil
+		}
+		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			return fmt.Errorf("failed to release claim on malformed block %s: %w", item.ItemID, relErr)
+		}
 		return fmt.Errorf("block %s has empty canonical storage class", item.ItemID)
 	}
 	if item.StorageClass != "" && item.StorageClass != storageClass {

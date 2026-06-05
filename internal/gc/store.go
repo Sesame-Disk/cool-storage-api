@@ -291,6 +291,7 @@ type CommitInfo struct {
 type BlockInfo struct {
 	BlockID      string
 	StorageClass string
+	CreatedAt    *time.Time
 }
 
 type BlockGCCandidateInfo struct {
