@@ -195,6 +195,7 @@ type mockBlock struct {
 	OrgID        uuid.UUID
 	BlockID      string
 	StorageClass string
+	CreatedAt    *time.Time
 	GCState      string
 	GCClaimID    string
 }
@@ -507,10 +508,12 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	createdAt := time.Now().UTC()
 	m.blocks[key] = &mockBlock{
 		OrgID:        orgID,
 		BlockID:      blockID,
 		StorageClass: storageClass,
+		CreatedAt:    &createdAt,
 	}
 	// Model the legacy refCount as that many distinct reference rows so existing
 	// tests keep their "block is alive with N refs" intent under the row model.
@@ -520,6 +523,19 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 			refs[fmt.Sprintf("synthetic:%d", i)] = struct{}{}
 		}
 		m.blockReferences[key] = refs
+	}
+}
+
+// AddStubBlockForTest seeds the kind of metadata-free row Cassandra can surface
+// after a claim races with a missing canonical block.
+func (m *MockStore) AddStubBlockForTest(orgID uuid.UUID, blockID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	m.blocks[key] = &mockBlock{
+		OrgID:     orgID,
+		BlockID:   blockID,
+		CreatedAt: nil,
 	}
 }
 
@@ -964,7 +980,7 @@ func (m *MockStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, er
 	if block == nil {
 		return BlockInfo{}, gocql.ErrNotFound
 	}
-	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass}, nil
+	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, CreatedAt: block.CreatedAt}, nil
 }
 
 // BlockReferenceCount returns how many reference rows a block currently has.
@@ -1872,6 +1888,15 @@ func (m *MockStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID st
 }
 
 func (m *MockStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := fmt.Sprintf("%s:%s", orgID, externalID)
+	delete(m.mappings, key)
+	return nil
+}
+
+func (m *MockStore) DeleteBlockMappingResolved(orgID uuid.UUID, externalID, internalID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

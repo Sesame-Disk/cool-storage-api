@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -177,6 +178,26 @@ func gcCandidateProjectionExists(t *testing.T, orgID, blockID string, candidateA
 		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
 	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID).Scan(&storedBlockID)
 	return err == nil && storedBlockID == blockID
+}
+
+func blockIDMappingExists(t *testing.T, orgID, externalID string) bool {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	var internalID string
+	err := session.Query(`
+		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
+	`, orgID, externalID).Scan(&internalID)
+	return err == nil && internalID != ""
+}
+
+func reverseBlockIDMappingExists(t *testing.T, orgID, internalID, externalID string) bool {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	var storedExternalID string
+	err := session.Query(`
+		SELECT external_id FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?
+	`, orgID, internalID, externalID).Scan(&storedExternalID)
+	return err == nil && storedExternalID == externalID
 }
 
 func gcS3OrphanProjectionExists(t *testing.T, orgID, blockID string, firstSeenAt time.Time) bool {
@@ -944,6 +965,182 @@ func TestGC_DeleteBlockGCCandidate_RemovesDiscoveryRowWithoutCanonical(t *testin
 	}
 }
 
+func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	queue := gcpkg.NewQueue(store)
+	worker := gcpkg.NewWorker(store, nil, queue, 100, 0, false, &gcpkg.Stats{})
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	blockID := fmt.Sprintf("cand-missing-%d", time.Now().UnixNano())
+	externalBlockID := fmt.Sprintf("%040x", time.Now().UnixNano())
+	reverseOnlyExternalBlockID := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
+	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	candidateAt := ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", queuedAt)
+	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", queuedAt)
+	if err := database.WriteBlockIDMapping(orgID, externalBlockID, blockID, time.Now().UTC()); err != nil {
+		t.Fatalf("failed to seed block mapping for %s/%s: %v", orgID, blockID, err)
+	}
+	if err := database.Session().Query(`
+		INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at)
+		VALUES (?, ?, ?, ?)
+	`, orgID, blockID, reverseOnlyExternalBlockID, time.Now().UTC()).Exec(); err != nil {
+		t.Fatalf("failed to seed reverse-only block mapping for %s/%s: %v", orgID, blockID, err)
+	}
+	t.Cleanup(func() {
+		cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
+		_ = database.Session().Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, externalBlockID).Exec()
+		_ = database.Session().Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`, orgID, blockID, externalBlockID).Exec()
+		_ = database.Session().Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`, orgID, blockID, reverseOnlyExternalBlockID).Exec()
+		if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+			t.Fatalf("failed to delete blocks row for %s/%s: %v", orgID, blockID, err)
+		}
+	})
+
+	if blockExistsInDB(t, orgID, blockID) {
+		t.Fatal("expected no canonical block row before worker")
+	}
+	if !gcCandidateExists(t, orgID, blockID) {
+		t.Fatal("expected canonical gc_block_candidates row before worker")
+	}
+	if !gcCandidateProjectionExists(t, orgID, blockID, candidateAt) {
+		t.Fatal("expected gc_block_candidates_by_day row before worker")
+	}
+	if !gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) {
+		t.Fatal("expected gc_queue row before worker")
+	}
+	if !blockIDMappingExists(t, orgID, externalBlockID) || !reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID) {
+		t.Fatal("expected block_id_mappings rows before worker")
+	}
+	if !reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID) {
+		t.Fatal("expected reverse-only block_id_mappings_by_internal row before worker")
+	}
+
+	for attempt := 0; attempt < 8; attempt++ {
+		if !gcCandidateExists(t, orgID, blockID) &&
+			!gcCandidateProjectionExists(t, orgID, blockID, candidateAt) &&
+			!gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) &&
+			!failedQueueItemExists(t, orgID, "block", blockID) &&
+			!blockIDMappingExists(t, orgID, externalBlockID) &&
+			!reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID) &&
+			!reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID) &&
+			!blockExistsInDB(t, orgID, blockID) {
+			return
+		}
+		// Scope processing to the synthetic org. A bare ProcessOnce would fan out
+		// across every active org and, with this nil-storage worker, could dequeue
+		// other orgs' real block items and route their S3 deletes down the slow
+		// recovery path. ProcessOrgOnce touches only the org under test.
+		processed, err := worker.ProcessOrgOnce(context.Background(), orgUUID)
+		if err != nil {
+			t.Fatalf("ProcessOrgOnce attempt %d failed: %v", attempt+1, err)
+		}
+		if processed == 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	if gcCandidateExists(t, orgID, blockID) ||
+		gcCandidateProjectionExists(t, orgID, blockID, candidateAt) ||
+		gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) ||
+		failedQueueItemExists(t, orgID, "block", blockID) ||
+		blockIDMappingExists(t, orgID, externalBlockID) ||
+		reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID) ||
+		reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID) ||
+		blockExistsInDB(t, orgID, blockID) {
+		t.Fatalf("stale candidate without canonical row was not fully skipped: block_exists=%v candidate=%v projection=%v queue=%v failed=%v mapping=%v reverse_mapping=%v reverse_only_mapping=%v",
+			blockExistsInDB(t, orgID, blockID),
+			gcCandidateExists(t, orgID, blockID),
+			gcCandidateProjectionExists(t, orgID, blockID, candidateAt),
+			gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)),
+			failedQueueItemExists(t, orgID, "block", blockID),
+			blockIDMappingExists(t, orgID, externalBlockID),
+			reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID),
+			reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID),
+		)
+	}
+}
+
+// TestGC_ClaimBlockDelete_StubRowMaterializationIsCleaned pins the real
+// Cassandra/Scylla LWT behavior that motivates the stub-cleanup branch in
+// processBlock: an `UPDATE ... IF gc_state != 'deleting'` against a missing
+// canonical row may (engine-dependent) materialize a metadata-free "stub" row.
+//
+// processBlock's own pre-claim BlockExists guard short-circuits before the claim
+// when the row is missing, so the post-claim stub branch is unreachable through
+// processBlock except via a narrow TOCTOU. This test therefore drives the store
+// primitives directly to (a) empirically pin what the deployed engine does on a
+// conditional UPDATE over a missing row, and (b) confirm GetBlockInfo's created_at
+// discriminator + FinalizeBlockDelete actually clean the stub end-to-end. If the
+// engine does NOT materialize a stub, the defensive branch is confirmed
+// unreachable here and the test records that rather than failing.
+func TestGC_ClaimBlockDelete_StubRowMaterializationIsCleaned(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	blockID := fmt.Sprintf("stub-claim-%d", time.Now().UnixNano())
+	candidateAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	claimID := candidateAt.Format(time.RFC3339Nano)
+	t.Cleanup(func() {
+		if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+			t.Fatalf("cleanup blocks row for %s/%s: %v", orgID, blockID, err)
+		}
+	})
+
+	if exists, err := store.BlockExists(orgUUID, blockID); err != nil {
+		t.Fatalf("BlockExists(before claim): %v", err)
+	} else if exists {
+		t.Fatal("expected no canonical block row before claim")
+	}
+
+	// Claim against the missing row — the exact LWT processBlock would issue if
+	// the canonical row vanished between its pre-claim check and the claim.
+	applied, err := store.ClaimBlockDelete(orgUUID, blockID, claimID)
+	if err != nil {
+		t.Fatalf("ClaimBlockDelete: %v", err)
+	}
+
+	exists, err := store.BlockExists(orgUUID, blockID)
+	if err != nil {
+		t.Fatalf("BlockExists(after claim): %v", err)
+	}
+	if !exists {
+		// Engine did not materialize a stub; the defensive branch is unreachable
+		// on this engine. Nothing to clean — pin the observation and finish.
+		t.Logf("engine did not materialize a stub row on conditional UPDATE over a missing row (claim applied=%v); processBlock stub branch is unreachable here", applied)
+		return
+	}
+
+	// Engine materialized a stub: assert it is exactly the metadata-free shape the
+	// worker keys off (empty storage_class, nil created_at).
+	info, err := store.GetBlockInfo(orgUUID, blockID)
+	if err != nil {
+		t.Fatalf("GetBlockInfo(stub): %v", err)
+	}
+	if strings.TrimSpace(info.StorageClass) != "" {
+		t.Fatalf("materialized stub should have empty storage_class, got %q", info.StorageClass)
+	}
+	if info.CreatedAt != nil {
+		t.Fatalf("materialized stub should have nil created_at, got %v", info.CreatedAt)
+	}
+
+	// FinalizeBlockDelete (the worker's stub-cleanup primitive) must remove the
+	// stub we claimed, with the same claimID.
+	if err := store.FinalizeBlockDelete(orgUUID, blockID, claimID); err != nil {
+		t.Fatalf("FinalizeBlockDelete(stub): %v", err)
+	}
+	if exists, err := store.BlockExists(orgUUID, blockID); err != nil {
+		t.Fatalf("BlockExists(after finalize): %v", err)
+	} else if exists {
+		t.Fatal("stub row still present after FinalizeBlockDelete")
+	}
+}
+
 func TestGC_EnsureBlockGCCandidate_RepairsDiscoveryRowWhenCanonicalExists(t *testing.T) {
 	requireCassandra(t)
 
@@ -952,6 +1149,7 @@ func TestGC_EnsureBlockGCCandidate_RepairsDiscoveryRowWhenCanonicalExists(t *tes
 	orgID := uuid.New()
 	blockID := fmt.Sprintf("cand-repair-%d", time.Now().UnixNano())
 	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
+	seedSyntheticZeroRefBlockForTest(t, orgID, blockID, "hot")
 
 	effectiveCandidateAt, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", candidateAt)
 	if err != nil {
@@ -998,6 +1196,11 @@ func TestGC_RecordS3Orphan_RepairsDiscoveryRowWhenCanonicalExists(t *testing.T) 
 	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
 	}
+	t.Cleanup(func() {
+		if err := store.DeleteS3Orphan(orgID, blockID, effectiveFirstSeenAt); err != nil {
+			t.Fatalf("cleanup DeleteS3Orphan(%s): %v", blockID, err)
+		}
+	})
 	if err := database.Session().Query(`
 		DELETE FROM gc_s3_orphans_by_day
 		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?

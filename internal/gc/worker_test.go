@@ -275,6 +275,81 @@ func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testi
 	}
 }
 
+func TestWorker_ProcessBlock_MissingCanonicalRowSkipsWithoutClaimOrDLQ(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddBlockMapping(orgID, "sha1-missing", "block-missing")
+	if _, err := store.EnsureBlockGCCandidate(orgID, "block-missing", "hot", candidateAt); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
+	}
+	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-missing", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem failed: %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed skip, got %d", n)
+	}
+	if store.GetBlock(orgID, "block-missing") != nil {
+		t.Fatal("missing block candidate should not materialize a canonical row")
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 0 {
+		t.Fatalf("expected block candidate cleanup, got %d rows", got)
+	}
+	if mappings, _ := store.ListBlockMappingsByInternalID(orgID, "block-missing"); len(mappings) != 0 {
+		t.Fatalf("expected missing-row cleanup to remove mappings, got %d rows", len(mappings))
+	}
+	if got := len(store.FailedItems(orgID)); got != 0 {
+		t.Fatalf("expected no DLQ entries, got %d", got)
+	}
+}
+
+func TestWorker_ProcessBlock_StubRowAfterClaimIsCleanedWithoutDLQ(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddStubBlockForTest(orgID, "block-stub")
+	store.AddBlockMapping(orgID, "sha1-stub", "block-stub")
+	if _, err := store.EnsureBlockGCCandidate(orgID, "block-stub", "hot", candidateAt); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
+	}
+	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-stub", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem failed: %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed skip, got %d", n)
+	}
+	if store.GetBlock(orgID, "block-stub") != nil {
+		t.Fatal("stub block row should be removed after cleanup")
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 0 {
+		t.Fatalf("expected block candidate cleanup, got %d rows", got)
+	}
+	if mappings, _ := store.ListBlockMappingsByInternalID(orgID, "block-stub"); len(mappings) != 0 {
+		t.Fatalf("expected stub cleanup to remove mappings, got %d rows", len(mappings))
+	}
+	if got := len(store.FailedItems(orgID)); got != 0 {
+		t.Fatalf("expected no DLQ entries, got %d", got)
+	}
+}
+
 func TestWorker_ProcessBlock_LiveFSObjectReferenceViaMappedIDSkipsDelete(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}

@@ -194,6 +194,30 @@ func (w *Worker) ProcessOnce(ctx context.Context) (int, error) {
 	return totalProcessed, nil
 }
 
+// ProcessOrgOnce processes a single org's queued items in one pass. It is the
+// scoped counterpart to ProcessOnce (which fans out across every active org) so
+// callers — notably integration tests that enqueue work under a synthetic org —
+// can drive GC for exactly that org without dequeuing unrelated orgs' items. A
+// worker wired with a nil or partial storage provider must never touch another
+// org's real blocks (it would route their S3 deletes down the slow recovery
+// path), and this is the entry point that guarantees that scoping.
+func (w *Worker) ProcessOrgOnce(ctx context.Context, orgID uuid.UUID) (int, error) {
+	return w.processOrg(ctx, orgID)
+}
+
+func (w *Worker) cleanupBlockMappings(orgID uuid.UUID, internalBlockID string) error {
+	mappings, err := w.store.ListBlockMappingsByInternalID(orgID, internalBlockID)
+	if err != nil {
+		return fmt.Errorf("failed to list block mappings for %s: %w", internalBlockID, err)
+	}
+	for _, mapping := range mappings {
+		if err := w.store.DeleteBlockMappingResolved(orgID, mapping.ExternalID, mapping.InternalID); err != nil {
+			return fmt.Errorf("failed to delete block mapping %s for %s: %w", mapping.ExternalID, internalBlockID, err)
+		}
+	}
+	return nil
+}
+
 func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 	activeBefore := w.clock()
 	items, err := w.queue.DequeueBatch(orgID, w.batchSize, w.gracePeriod)
@@ -367,6 +391,22 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
+	exists, err := w.store.BlockExists(item.OrgID, item.ItemID)
+	if err != nil {
+		return fmt.Errorf("failed to check canonical block row for %s: %w", item.ItemID, err)
+	}
+	if !exists {
+		if err := w.cleanupBlockMappings(item.OrgID, item.ItemID); err != nil {
+			return err
+		}
+		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
+			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
+		}
+		log.Printf("[GC Worker] Block %s missing canonical row, skipping deletion", item.ItemID)
+		metrics.GCItemsSkippedTotal.Inc()
+		return nil
+	}
+
 	// 1. Claim the block (gc_state='deleting') via LWT. claimID is stable for one
 	// logical candidate so retries of the same item remain the owner, but a
 	// different attempt cannot release or finalize another attempt's claim.
@@ -411,6 +451,23 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	}
 	storageClass := strings.TrimSpace(blockInfo.StorageClass)
 	if storageClass == "" {
+		if blockInfo.CreatedAt == nil {
+			if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, claimID); err != nil {
+				return fmt.Errorf("failed to remove stub block row for %s: %w", item.ItemID, err)
+			}
+			if err := w.cleanupBlockMappings(item.OrgID, item.ItemID); err != nil {
+				return err
+			}
+			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
+				return fmt.Errorf("failed to clear block GC candidate after stub cleanup: %w", err)
+			}
+			log.Printf("[GC Worker] Block %s missing canonical metadata after claim; removed stub row and skipped deletion", item.ItemID)
+			metrics.GCItemsSkippedTotal.Inc()
+			return nil
+		}
+		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			return fmt.Errorf("failed to release claim on malformed block %s: %w", item.ItemID, relErr)
+		}
 		return fmt.Errorf("block %s has empty canonical storage class", item.ItemID)
 	}
 	if item.StorageClass != "" && item.StorageClass != storageClass {
@@ -421,7 +478,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return fmt.Errorf("failed to record pending S3 delete for block %s: %w", item.ItemID, err)
 	}
 
-	// 4. Now remove the claimed DB row. If this fails, the row stays at -999 and
+	// 4. Now remove the claimed DB row. If this fails, the row stays claimed and
 	// the queue item will retry; the pending S3 row already preserves recovery state.
 	if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, claimID); err != nil {
 		return fmt.Errorf("failed to finalize claimed block delete for %s: %w", item.ItemID, err)
@@ -440,18 +497,18 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			}
 			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_s3_orphaned").Inc()
 			// Do NOT return error — the block is recorded for recovery.
-			// Continue to mapping/candidate cleanup so the queue item completes.
+			// Continue to post-delete cleanup so the queue item completes.
 		} else if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID, orphanFirstSeenAt); err != nil {
 			log.Printf("[GC Worker] WARNING: S3 delete for block %s succeeded but failed to clear recovery row: %v", item.ItemID, err)
 		}
 	}
 
-	// 5. Clean up related mappings
-	mappings, err := w.store.ListBlockMappingsByInternalID(item.OrgID, item.ItemID)
-	if err == nil {
-		for _, mapping := range mappings {
-			w.store.DeleteBlockMapping(item.OrgID, mapping.ExternalID)
-		}
+	// 5. Clean up related mappings after the canonical row is gone. If the
+	// worker crashes after FinalizeBlockDelete but before this cleanup, the retry
+	// lands in the missing-row/stub cleanup paths above and re-runs the same
+	// mapping cleanup without leaving the delete fence stuck active.
+	if err := w.cleanupBlockMappings(item.OrgID, item.ItemID); err != nil {
+		return err
 	}
 
 	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {

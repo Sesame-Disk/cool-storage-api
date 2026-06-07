@@ -79,6 +79,7 @@ type GCStore interface {
 	// owns the row.
 	FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
+	DeleteBlockMappingResolved(orgID uuid.UUID, externalID, internalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error
 	// ListBlockGCCandidatesByDay enumerates candidates whose `candidate_at`
@@ -291,6 +292,7 @@ type CommitInfo struct {
 type BlockInfo struct {
 	BlockID      string
 	StorageClass string
+	CreatedAt    *time.Time
 }
 
 type BlockGCCandidateInfo struct {
