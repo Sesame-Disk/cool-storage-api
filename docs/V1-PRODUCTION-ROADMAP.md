@@ -191,7 +191,7 @@ bootstrap, and CLI tooling.
 
 ```
 internal/db/migrations/
-  001_initial_schema.cql   ← full current schema (all 50 tables, all columns)
+  001_initial_schema.cql   ← full current clean-boot schema (all current tables and columns)
   NNN_description.cql      ← future migrations go here
 
 internal/db/migrator.go    ← migration runner (go:embed, checksum validation)

@@ -1234,9 +1234,9 @@ The implementation is internally consistent for the current tests, but the produ
   - GC auto-delete decisions are based on commit age and reachability, not directly on file `mtime`.
   - Result: UI can show a file expiry timestamp that does not correspond to actual deletion behavior.
 
-- **Bootstrap script drift**
-  - `scripts/bootstrap.sh` and `scripts/bootstrap-multiregion.sh` still contain older ad hoc `libraries` DDL without `auto_delete_days` or the GC policy projection table.
-  - Migrations are authoritative, but manual/bootstrap environments can be misleading if these snippets are used as schema reference.
+- **Bootstrap wrapper alignment**
+  - Resolved in the current tree: `scripts/bootstrap.sh` and `scripts/bootstrap-multiregion.sh` now delegate to compose `cassandra-bootstrap` plus app-run migrations instead of carrying ad hoc schema DDL.
+  - Keep these wrappers as convenience entry points only; `internal/db/migrations/001_initial_schema.cql` remains the clean-boot schema source of truth.
 
 ### Decision Needed
 
@@ -1260,7 +1260,7 @@ These are different products. Treating them as one setting is how the current am
    - publishes a normal delete commit instead of deleting fs_objects behind HEAD
    - handles locks, encryption, concurrent HEAD changes, permissions, audit logs, and quota/storage counter updates
 6. If product wants only old-history-object cleanup, rename the UI away from "Automatically delete files..." and remove or relabel `expires_at`.
-7. Update bootstrap scripts or remove schema-like DDL snippets so they cannot drift from migrations.
+7. Keep bootstrap wrappers free of schema-like DDL snippets so they cannot drift from migrations.
 
 ### Tests To Add
 

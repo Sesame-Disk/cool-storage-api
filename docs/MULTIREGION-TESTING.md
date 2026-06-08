@@ -55,6 +55,10 @@ MinIO state without nginx-based regional routing.
 
 **Recommended: Use the unified bootstrap script**
 
+The wrapper waits for Cassandra, runs the compose `cassandra-bootstrap`
+one-shot service, and then lets the SesameFS servers apply the embedded schema
+migrations on startup. It no longer carries manual table DDL.
+
 ```bash
 # Development mode (single instance, minimal resources)
 ./scripts/bootstrap.sh dev
@@ -72,8 +76,14 @@ MinIO state without nginx-based regional routing.
 ### Alternative: Manual Start
 
 ```bash
-# Build and start all services
-docker-compose -f docker-compose-multiregion.yaml up -d --build
+# Build images and start infrastructure
+docker-compose -f docker-compose-multiregion.yaml up -d --build cassandra minio
+
+# Run the one-shot Cassandra bootstrap and wait for it to finish
+docker-compose -f docker-compose-multiregion.yaml up cassandra-bootstrap
+
+# Start the remaining services
+docker-compose -f docker-compose-multiregion.yaml up -d minio-init sesamefs-usa sesamefs-eu nginx
 
 # Watch logs
 docker-compose -f docker-compose-multiregion.yaml logs -f
@@ -260,7 +270,7 @@ Current limitations of this slice:
 
 | Script | Purpose |
 |--------|---------|
-| `bootstrap.sh` | **Recommended** - Unified bootstrap for dev and multi-region modes |
+| `bootstrap.sh` | **Recommended** - Convenience wrapper around compose `cassandra-bootstrap` + app migrations |
 | `run-tests.sh` | Runs tests in container (no /etc/hosts needed) |
 | `test-multiregion.sh` | Basic connectivity, upload, routing tests (host-based) |
 | `test-failover.sh` | Large file upload (1GB), failover during operations (host-based) |

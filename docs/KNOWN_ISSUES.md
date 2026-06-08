@@ -2816,7 +2816,7 @@ The client also sends `replace=1` in both cases, so the form parameter doesn't h
 - `internal/api/v2/files.go`
 - `internal/api/v2/file_routes.go`
 - `internal/db/tokens.go`
-- `internal/db/migrations/004_access_tokens_replace_existing.cql`
+- `internal/db/migrations/001_initial_schema.cql`
 - `internal/integration/upload_download_test.go`
 - `internal/integration/quotas_test.go`
 

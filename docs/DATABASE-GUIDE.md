@@ -14,9 +14,9 @@ Migrations are managed by `internal/db/migrator.go` using versioned `.cql` files
 
 ```
 internal/db/migrations/
-  001_initial_schema.cql   ← complete baseline schema (50 tables)
-    002_api_keys.cql         ← user API keys + API-key-derived session provenance
-    NNN_description.cql      ← future incremental changes
+  001_initial_schema.cql     ← complete clean-boot baseline (all current tables)
+  002_password_rate_limit.cql ← encrypted library password failure tracking
+  NNN_description.cql        ← future incremental changes
 ```
 
 ### Tracking table
@@ -67,7 +67,7 @@ sesamefs migrate --check       # exit non-zero if any migration is pending (CI)
 
 ## API Keys and Derived Sessions
 
-`002_api_keys.cql` currently owns both the API key tables and the session provenance needed for strong revocation semantics.
+`001_initial_schema.cql` currently owns both the API key tables and the session provenance needed for strong revocation semantics, because the clean-boot baseline folds those schema elements directly into version 001.
 
 | Schema element | Purpose |
 |------|---------|
@@ -76,7 +76,7 @@ sesamefs migrate --check       # exit non-zero if any migration is pending (CI)
 | `sessions.source_api_key_hash` | Records which API key minted a long-lived session |
 | `sessions_by_api_key` | Reverse index used to invalidate all sessions derived from a revoked key |
 
-Operational note: because migrations are checksum-validated, any future change to this schema must go into a new migration file. Do not edit `002_api_keys.cql` after it has been applied in any environment.
+Operational note: `001_initial_schema.cql` is the source of truth for fresh clean boots, but once version 001 has been applied in a live environment, any further schema change for that environment must go into a new numbered migration file. Do not modify an already-applied migration in place.
 
 ---
 
@@ -277,7 +277,7 @@ admin@sesamefs.local   | 00000000-0000-0000-0000-000000000001 | 00000000-0000-00
 
 ---
 
-## Current Tables (50 in schema — see `internal/db/migrations/001_initial_schema.cql`)
+## Current Tables (see `internal/db/migrations/001_initial_schema.cql`)
 
 ### 1. `organizations`
 **Purpose:** Multi-tenant organization/company records

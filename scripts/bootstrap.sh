@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bootstrap script for SesameFS Development Environment
+# Bootstrap script for SesameFS development and multi-region test environments.
 #
 # This script sets up the SesameFS environment with two modes:
 #
@@ -35,6 +35,11 @@
 #   ./scripts/bootstrap.sh dev --clean      # Clean start dev mode
 #   ./scripts/bootstrap.sh multiregion      # Start multi-region mode
 #   ./scripts/bootstrap.sh --down           # Stop current mode
+#
+# Schema/bootstrap contract:
+#   - `cassandra-bootstrap` converges Cassandra auth/keyspace/replication.
+#   - SesameFS applies the embedded CQL migrations on startup.
+#   - This wrapper intentionally does not carry ad hoc table DDL.
 
 set -e
 
@@ -123,13 +128,15 @@ check_multiregion_hosts() {
 }
 
 wait_for_cassandra() {
+    local compose_file="$1"
+
     log_info "Waiting for Cassandra to be healthy..."
 
     local retries=60
     local count=0
 
     while [ $count -lt $retries ]; do
-        if docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "DESCRIBE KEYSPACES" &> /dev/null; then
+        if $DOCKER_COMPOSE -f "$compose_file" exec -T cassandra /bin/sh -ec 'cqlsh -u cassandra -p "${CASSANDRA_SUPERUSER_PASSWORD:-cassandra}" -e "describe keyspaces" >/dev/null 2>&1 || cqlsh -u cassandra -p cassandra -e "describe keyspaces" >/dev/null 2>&1'; then
             log_success "Cassandra is ready"
             return 0
         fi
@@ -143,49 +150,26 @@ wait_for_cassandra() {
     return 1
 }
 
-init_cassandra_schema() {
-    log_info "Initializing Cassandra schema..."
+run_cassandra_bootstrap() {
+    local compose_file="$1"
 
-    local container="cool-storage-api-cassandra-1"
-
-    # Legacy test-stack bootstrap: hardcoded to a single 'datacenter1' DC.
-    # Real dev/prod use docker-compose*.yml, which honors CASSANDRA_REPLICATION_*
-    # env vars and applies NetworkTopologyStrategy declaratively.
-    docker exec $container cqlsh localhost -e "CREATE KEYSPACE IF NOT EXISTS sesamefs WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 1};"
-    log_success "Keyspace created"
-
-    # Core tables
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.organizations (org_id UUID PRIMARY KEY, name TEXT, settings MAP<TEXT, TEXT>, storage_quota BIGINT, storage_used BIGINT, chunking_polynomial BIGINT, storage_config MAP<TEXT, TEXT>, created_at TIMESTAMP);"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.users (org_id UUID, user_id UUID, email TEXT, name TEXT, role TEXT, oidc_sub TEXT, quota_bytes BIGINT, used_bytes BIGINT, created_at TIMESTAMP, PRIMARY KEY ((org_id), user_id));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.users_by_email (email TEXT PRIMARY KEY, user_id UUID, org_id UUID);"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.users_by_oidc (oidc_issuer TEXT, oidc_sub TEXT, user_id UUID, org_id UUID, PRIMARY KEY ((oidc_issuer), oidc_sub));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.libraries (org_id UUID, library_id UUID, owner_id UUID, name TEXT, description TEXT, encrypted BOOLEAN, enc_version INT, magic TEXT, random_key TEXT, root_commit_id TEXT, head_commit_id TEXT, storage_class TEXT, size_bytes BIGINT, file_count BIGINT, version_ttl_days INT, created_at TIMESTAMP, updated_at TIMESTAMP, PRIMARY KEY ((org_id), library_id));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.commits (library_id UUID, commit_id TEXT, parent_id TEXT, root_fs_id TEXT, creator_id UUID, description TEXT, created_at TIMESTAMP, PRIMARY KEY ((library_id), commit_id));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.fs_objects (library_id UUID, fs_id TEXT, obj_type TEXT, obj_name TEXT, dir_entries TEXT, block_ids LIST<TEXT>, size_bytes BIGINT, mtime BIGINT, PRIMARY KEY ((library_id), fs_id));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.blocks (org_id UUID, block_id TEXT, size_bytes INT, storage_class TEXT, storage_key TEXT, gc_state TEXT, gc_claimed_at TIMESTAMP, created_at TIMESTAMP, last_accessed TIMESTAMP, PRIMARY KEY ((org_id, block_id)));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.block_references (org_id UUID, block_id TEXT, referrer TEXT, library_id UUID, created_at TIMESTAMP, PRIMARY KEY ((org_id, block_id), referrer));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.block_id_mappings (org_id UUID, external_id TEXT, internal_id TEXT, created_at TIMESTAMP, PRIMARY KEY ((org_id), external_id));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.share_links (share_token TEXT PRIMARY KEY, org_id UUID, library_id UUID, file_path TEXT, created_by UUID, permission TEXT, password_hash TEXT, expires_at TIMESTAMP, download_count INT, max_downloads INT, created_at TIMESTAMP);"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.share_links_by_creator (org_id UUID, created_by UUID, share_token TEXT, library_id UUID, file_path TEXT, permission TEXT, expires_at TIMESTAMP, download_count INT, max_downloads INT, created_at TIMESTAMP, PRIMARY KEY ((org_id, created_by), share_token));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.shares (library_id UUID, share_id UUID, shared_by UUID, shared_to UUID, shared_to_type TEXT, permission TEXT, created_at TIMESTAMP, expires_at TIMESTAMP, PRIMARY KEY ((library_id), share_id));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.restore_jobs (org_id UUID, job_id UUID, library_id UUID, block_ids LIST<TEXT>, glacier_job_id TEXT, status TEXT, requested_at TIMESTAMP, completed_at TIMESTAMP, expires_at TIMESTAMP, PRIMARY KEY ((org_id), job_id));"
-    docker exec $container cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.hostname_mappings (hostname TEXT PRIMARY KEY, org_id UUID, settings MAP<TEXT, TEXT>, created_at TIMESTAMP, updated_at TIMESTAMP);"
-
-    # Handle access_tokens separately due to reserved keyword
-    docker exec $container cqlsh localhost -e 'CREATE TABLE IF NOT EXISTS sesamefs.access_tokens ("token" TEXT PRIMARY KEY, token_type TEXT, org_id UUID, repo_id UUID, file_path TEXT, user_id UUID, created_at TIMESTAMP);'
-
-    log_success "All tables created"
+    log_info "Running canonical Cassandra bootstrap..."
+    $DOCKER_COMPOSE -f "$compose_file" up --no-deps cassandra-bootstrap
+    log_success "Cassandra bootstrap completed"
 }
 
-wait_for_sesamefs() {
-    log_info "Waiting for SesameFS to be ready..."
+wait_for_http_endpoint() {
+    local url="$1"
+    local label="$2"
+
+    log_info "Waiting for $label to be ready..."
 
     local retries=30
     local count=0
 
     while [ $count -lt $retries ]; do
-        if curl -s http://localhost:8082/ping > /dev/null 2>&1; then
-            log_success "SesameFS is responding"
+        if curl -fsS "$url" > /dev/null 2>&1; then
+            log_success "$label is responding"
             return 0
         fi
         count=$((count + 1))
@@ -194,7 +178,7 @@ wait_for_sesamefs() {
     done
 
     echo ""
-    log_warning "Services may still be starting. Check logs with: $DOCKER_COMPOSE logs -f"
+    log_warning "$label may still be starting. Check logs with: $DOCKER_COMPOSE logs -f"
 }
 
 # ==========================================================================
@@ -214,10 +198,9 @@ start_dev() {
     $DOCKER_COMPOSE -f "$compose_file" up -d cassandra minio
 
     # Wait for Cassandra
-    wait_for_cassandra
+    wait_for_cassandra "$compose_file"
 
-    # Initialize schema
-    init_cassandra_schema
+    run_cassandra_bootstrap "$compose_file"
 
     log_info "Initializing MinIO buckets..."
     $DOCKER_COMPOSE -f "$compose_file" up -d minio-init
@@ -226,7 +209,7 @@ start_dev() {
     log_info "Starting SesameFS..."
     $DOCKER_COMPOSE -f "$compose_file" up -d sesamefs
 
-    wait_for_sesamefs
+    wait_for_http_endpoint "http://localhost:${SESAMEFS_HOST_PORT:-8080}/ping" "SesameFS"
     show_dev_status
 }
 
@@ -244,15 +227,17 @@ show_dev_status() {
     echo "Endpoints"
     echo "========================================="
 
-    echo -n "SesameFS API (localhost:8082): "
-    if curl -s http://localhost:8082/ping > /dev/null 2>&1; then
+    local sesamefs_host_port="${SESAMEFS_HOST_PORT:-8080}"
+
+    echo -n "SesameFS API (localhost:${sesamefs_host_port}): "
+    if curl -fsS "http://localhost:${sesamefs_host_port}/ping" > /dev/null 2>&1; then
         echo -e "${GREEN}OK${NC}"
     else
         echo -e "${RED}FAIL${NC}"
     fi
 
     echo -n "MinIO Console (localhost:9001): "
-    if curl -s http://localhost:9001 > /dev/null 2>&1; then
+    if curl -fsS http://localhost:9001 > /dev/null 2>&1; then
         echo -e "${GREEN}OK${NC}"
     else
         echo -e "${YELLOW}STARTING${NC}"
@@ -262,8 +247,8 @@ show_dev_status() {
     echo "========================================="
     echo "Quick Start"
     echo "========================================="
-    echo "  Test API:      curl http://localhost:8082/ping"
-    echo "  Auth test:     curl http://localhost:8082/api2/account/info/ -H 'Authorization: Token dev-token-123'"
+    echo "  Test API:      curl http://localhost:${sesamefs_host_port}/ping"
+    echo "  Auth test:     curl http://localhost:${sesamefs_host_port}/api2/account/info/ -H 'Authorization: Token dev-token-123'"
     echo "  View logs:     $DOCKER_COMPOSE logs -f sesamefs"
     echo "  MinIO Console: http://localhost:9001 (minioadmin/minioadmin)"
     echo ""
@@ -305,10 +290,9 @@ start_multiregion() {
     $DOCKER_COMPOSE -f "$compose_file" up -d cassandra minio
 
     # Wait for Cassandra
-    wait_for_cassandra
+    wait_for_cassandra "$compose_file"
 
-    # Initialize schema
-    init_cassandra_schema
+    run_cassandra_bootstrap "$compose_file"
 
     log_info "Initializing MinIO buckets..."
     $DOCKER_COMPOSE -f "$compose_file" up -d minio-init
@@ -321,7 +305,7 @@ start_multiregion() {
     log_info "Starting nginx load balancer..."
     $DOCKER_COMPOSE -f "$compose_file" up -d nginx
 
-    wait_for_sesamefs
+    wait_for_http_endpoint "http://localhost:8080/ping" "Load Balancer"
     show_multiregion_status
 }
 
@@ -339,22 +323,22 @@ show_multiregion_status() {
     echo "Endpoints"
     echo "========================================="
 
-    echo -n "Load Balancer (localhost:8082): "
-    if curl -s http://localhost:8082/ping > /dev/null 2>&1; then
+    echo -n "Load Balancer (localhost:8080): "
+    if curl -fsS http://localhost:8080/ping > /dev/null 2>&1; then
         echo -e "${GREEN}OK${NC}"
     else
         echo -e "${RED}FAIL${NC}"
     fi
 
     echo -n "USA Endpoint (us.sesamefs.local:8080): "
-    if curl -s http://us.sesamefs.local:8080/ping > /dev/null 2>&1; then
+    if curl -fsS http://us.sesamefs.local:8080/ping > /dev/null 2>&1; then
         echo -e "${GREEN}OK${NC}"
     else
         echo -e "${YELLOW}FAIL (check /etc/hosts)${NC}"
     fi
 
     echo -n "EU Endpoint (eu.sesamefs.local:8080): "
-    if curl -s http://eu.sesamefs.local:8080/ping > /dev/null 2>&1; then
+    if curl -fsS http://eu.sesamefs.local:8080/ping > /dev/null 2>&1; then
         echo -e "${GREEN}OK${NC}"
     else
         echo -e "${YELLOW}FAIL (check /etc/hosts)${NC}"
