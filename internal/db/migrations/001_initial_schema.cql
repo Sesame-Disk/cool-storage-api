@@ -1092,21 +1092,34 @@ CREATE TABLE IF NOT EXISTS gc_queue (
     retry_count   INT,
     PRIMARY KEY ((org_id, bucket), queued_at, item_type, item_id)
 ) WITH default_time_to_live = 0
-  AND CLUSTERING ORDER BY (queued_at ASC);
+  AND CLUSTERING ORDER BY (queued_at ASC)
+  AND compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+  };
 
 CREATE TABLE IF NOT EXISTS gc_active_orgs (
     bucket           INT,
     org_id           UUID,
     last_enqueued_at TIMESTAMP,
     PRIMARY KEY ((bucket), org_id)
-);
+) WITH compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+  };
 
 CREATE TABLE IF NOT EXISTS gc_dirty_orgs (
     bucket    INT,
     org_id    UUID,
     marked_at TIMESTAMP,
     PRIMARY KEY ((bucket), org_id)
-);
+) WITH compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+  };
 
 CREATE TABLE IF NOT EXISTS gc_org_stats (
     org_id           UUID PRIMARY KEY,
@@ -1135,7 +1148,12 @@ CREATE TABLE IF NOT EXISTS gc_failed_items (
     resolved_at       TIMESTAMP,
     PRIMARY KEY ((org_id), failed_at, item_type, item_id)
 ) WITH CLUSTERING ORDER BY (failed_at DESC, item_type ASC, item_id ASC)
-  AND default_time_to_live = 0;
+  AND default_time_to_live = 0
+  AND compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+  };
 -- ^ No table TTL on purpose. DLQ cleanup is the scanner-driven explicit expiry
 -- below: it deletes at failed_at + 30d, removes the projection and pending
 -- marker in the same batch, and marks the org dirty so the snapshot reconciler
@@ -1173,7 +1191,12 @@ CREATE TABLE IF NOT EXISTS gc_pending_items (
     item_id     TEXT,
     identity_at TIMESTAMP,
     PRIMARY KEY ((org_id, bucket), item_type, library_id, item_id, identity_at)
-) WITH default_time_to_live = 0;
+) WITH default_time_to_live = 0
+  AND compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+  };
 
 -- Metadata/checkpoint table for GC snapshots, scanner cursors, and projection
 -- rebuild state. The runtime may persist last successful scan days and the

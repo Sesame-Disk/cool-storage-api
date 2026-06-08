@@ -2677,13 +2677,15 @@ Tracked in `docs/TECHNICAL-DEBT.md` § 9, Gap B.
 
 ### ISSUE-GC-QUEUE-RECOUNT-01: Exact `gc_queue` Recounts Still Hit Cassandra Tombstone Paths
 
-**Status**: Substantially resolved (2026-06-05). Hot `COUNT(*)` and the
+**Status**: Resolved in the current branch (2026-06-08). Hot `COUNT(*)` and the
 counter/repair machinery were both removed in favour of a single-writer dirty
 snapshot + throttled exact recalc (`gc_org_stats.recalculated_at`). See
 [GC-QUEUE-DEPTH-MODEL.md](GC-QUEUE-DEPTH-MODEL.md). Remaining tombstone-warning
-source is the recompute/`DequeueBatch` partition reads themselves — addressed by
-the compaction follow-up in [SCHEMA-BOTTLENECK-AUDIT.md](SCHEMA-BOTTLENECK-AUDIT.md)
-item I (`gc_queue-lcs-compaction`), not by more depth-tracking changes.
+source was the recompute/`DequeueBatch` partition reads themselves; the current
+branch addresses that schema-level follow-up by moving the queue/marker tables
+to `LeveledCompactionStrategy` with proactive tombstone purge in the clean-boot
+baseline schema. Re-measurement is still warranted before considering any
+`gc_grace_seconds` reduction.
 **Discovered**: 2026-04-28
 **Severity**: High operational risk — not a confirmed data-loss bug, but still a real source of Cassandra warnings and expensive partition reads in a GC-critical path
 
@@ -2722,7 +2724,7 @@ The worker behavior in `internal/gc/worker.go` that removes an org from `gc_acti
 That change addresses a different problem: stale active-org entries causing repeated empty dequeues. It does **not** introduce the `COUNT(*)` issue and remains safe because removal is guarded by the `last_enqueued_at` timestamp semantics.
 
 **Current recommendation:**
-- Treat the hot-path `COUNT(*)` removal and explicit DLQ expiry as implemented, then validate dirty-org backlog drain and snapshot staleness under multi-instance/multinode load
+- Treat the hot-path `COUNT(*)` removal, explicit DLQ expiry, and queue/marker compaction tuning as implemented, then validate dirty-org backlog drain and snapshot staleness under multi-instance/multinode load
 - Do not revert the current worker short-batch active-set removal
 - Do not add new hot-path exact recounts over `gc_queue`
 

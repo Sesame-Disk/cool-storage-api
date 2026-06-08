@@ -226,7 +226,7 @@ more expensive partition walks in GC and quota/permission-adjacent paths.
 
 ## I. `gc_queue` / DLQ tombstone purge needs compaction tuning
 
-**Status**: open, medium-priority (introduced 2026-06-05)
+**Status**: resolved in the current branch (2026-06-08)
 
 **Tables**: `gc_queue`, `gc_pending_items`, `gc_active_orgs`, `gc_dirty_orgs`,
 `gc_failed_items`, `gc_queue_counter_reconciliation` is gone — but the
@@ -247,9 +247,9 @@ recompute and dequeue paths emit `tombstone_warn_threshold` warnings
 (`minInterval ≈ 60s`) reduces the recompute frequency but does not eliminate the
 scan; the dequeue scan runs every worker tick regardless.
 
-**Direction**: dedicated branch `gc_queue-lcs-compaction`. Apply
-`LeveledCompactionStrategy` with proactive tombstone purge to the queue/marker
-tables, e.g.:
+**Implemented in this branch**: `gc_queue-lcs-compaction` now bakes
+`LeveledCompactionStrategy` with proactive tombstone purge into the clean-boot
+baseline schema for the queue/marker tables:
 
 ```cql
 WITH compaction = {
@@ -259,12 +259,11 @@ WITH compaction = {
 }
 ```
 
-Leave `gc_grace_seconds` at the default first (LCS + the tombstone knobs do the
-heavy lifting and avoid the multi-node resurrection trade-offs of a low grace).
-Re-measure the warnings before deciding whether a lower `gc_grace_seconds` on
-these idempotent, leader-only-drained queue tables is also warranted. This is
-the load-bearing follow-up that actually silences the tombstone warnings the
-counter-removal work only relocated.
+`gc_grace_seconds` intentionally stays at the default for now. LCS + the
+tombstone knobs do the heavy lifting without taking on the multi-node
+resurrection trade-offs of a low grace. The remaining follow-up is operational:
+re-measure the warnings before deciding whether a lower `gc_grace_seconds` on
+these idempotent, leader-only-drained queue tables is also warranted.
 
 ---
 
