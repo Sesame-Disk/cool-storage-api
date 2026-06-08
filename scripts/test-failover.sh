@@ -30,7 +30,14 @@ NC='\033[0m'
 
 # Configuration (use environment variables if set, otherwise defaults for host)
 TOKEN="${TOKEN:-dev-token-123}"
-BASE_URL="${BASE_URL:-http://localhost:8082}"
+BASE_URL="${BASE_URL:-http://localhost:8080}"
+LEGACY_BASE_URL="http://localhost:8082"
+if [ "$BASE_URL" = "$LEGACY_BASE_URL" ]; then
+    BASE_URL="http://localhost:8080"
+    BASE_URL_COMPAT_REWRITE=true
+else
+    BASE_URL_COMPAT_REWRITE=false
+fi
 TEST_DIR="/tmp/sesamefs-failover-test"
 CHUNK_SIZE_MB=8
 NUM_CHUNKS=128  # 1GB total
@@ -59,6 +66,9 @@ log_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
 check_services() {
     log_info "Checking services..."
+    if [ "$BASE_URL_COMPAT_REWRITE" = "true" ]; then
+        log_warning "BASE_URL=http://localhost:8082 is legacy; using http://localhost:8080"
+    fi
     if ! curl -s "$BASE_URL/ping" > /dev/null 2>&1; then
         log_error "Services not running. Start with: ./scripts/bootstrap.sh multiregion"
         exit 1

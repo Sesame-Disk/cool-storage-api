@@ -136,7 +136,7 @@ wait_for_cassandra() {
     local count=0
 
     while [ $count -lt $retries ]; do
-        if $DOCKER_COMPOSE -f "$compose_file" exec -T cassandra cqlsh localhost -e "DESCRIBE KEYSPACES" &> /dev/null; then
+        if $DOCKER_COMPOSE -f "$compose_file" exec -T cassandra /bin/sh -ec 'cqlsh -u cassandra -p "${CASSANDRA_SUPERUSER_PASSWORD:-cassandra}" -e "describe keyspaces" >/dev/null 2>&1 || cqlsh -u cassandra -p cassandra -e "describe keyspaces" >/dev/null 2>&1'; then
             log_success "Cassandra is ready"
             return 0
         fi
