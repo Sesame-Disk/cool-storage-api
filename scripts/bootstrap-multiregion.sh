@@ -1,8 +1,8 @@
 #!/bin/bash
-# Bootstrap script for SesameFS Multi-Region Test Environment
+# Bootstrap script for SesameFS multi-region test environment.
 #
 # This script sets up the complete multi-region environment including:
-# - Cassandra database with schema
+# - Cassandra keyspace/auth bootstrap via `cassandra-bootstrap`
 # - MinIO S3-compatible storage with regional buckets
 # - Two SesameFS servers (USA and EU regions)
 # - nginx load balancer
@@ -103,7 +103,7 @@ wait_for_cassandra() {
     local count=0
 
     while [ $count -lt $retries ]; do
-        if docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "DESCRIBE KEYSPACES" &> /dev/null; then
+        if $DOCKER_COMPOSE -f "$COMPOSE_FILE" exec -T cassandra cqlsh localhost -e "DESCRIBE KEYSPACES" &> /dev/null; then
             log_success "Cassandra is ready"
             return 0
         fi
@@ -117,37 +117,10 @@ wait_for_cassandra() {
     return 1
 }
 
-init_cassandra_schema() {
-    log_info "Initializing Cassandra schema..."
-
-    # Legacy test-stack bootstrap: hardcoded to a single 'datacenter1' DC.
-    # Real multi-DC deployments use docker-compose.prod.yml, which honors
-    # CASSANDRA_REPLICATION_* env vars and applies NetworkTopologyStrategy
-    # across every declared DC.
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE KEYSPACE IF NOT EXISTS sesamefs WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 1};"
-    log_success "Keyspace created"
-
-    # Create tables
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.organizations (org_id UUID PRIMARY KEY, name TEXT, settings MAP<TEXT, TEXT>, storage_quota BIGINT, storage_used BIGINT, chunking_polynomial BIGINT, storage_config MAP<TEXT, TEXT>, created_at TIMESTAMP);"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.users (org_id UUID, user_id UUID, email TEXT, name TEXT, role TEXT, oidc_sub TEXT, quota_bytes BIGINT, used_bytes BIGINT, created_at TIMESTAMP, PRIMARY KEY ((org_id), user_id));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.users_by_email (email TEXT PRIMARY KEY, user_id UUID, org_id UUID);"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.users_by_oidc (oidc_issuer TEXT, oidc_sub TEXT, user_id UUID, org_id UUID, PRIMARY KEY ((oidc_issuer), oidc_sub));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.libraries (org_id UUID, library_id UUID, owner_id UUID, name TEXT, description TEXT, encrypted BOOLEAN, enc_version INT, magic TEXT, random_key TEXT, root_commit_id TEXT, head_commit_id TEXT, storage_class TEXT, size_bytes BIGINT, file_count BIGINT, version_ttl_days INT, created_at TIMESTAMP, updated_at TIMESTAMP, PRIMARY KEY ((org_id), library_id));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.commits (library_id UUID, commit_id TEXT, parent_id TEXT, root_fs_id TEXT, creator_id UUID, description TEXT, created_at TIMESTAMP, PRIMARY KEY ((library_id), commit_id));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.fs_objects (library_id UUID, fs_id TEXT, obj_type TEXT, obj_name TEXT, dir_entries TEXT, block_ids LIST<TEXT>, size_bytes BIGINT, mtime BIGINT, PRIMARY KEY ((library_id), fs_id));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.blocks (org_id UUID, block_id TEXT, size_bytes INT, storage_class TEXT, storage_key TEXT, gc_state TEXT, gc_claimed_at TIMESTAMP, created_at TIMESTAMP, last_accessed TIMESTAMP, PRIMARY KEY ((org_id, block_id)));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.block_references (org_id UUID, block_id TEXT, referrer TEXT, library_id UUID, created_at TIMESTAMP, PRIMARY KEY ((org_id, block_id), referrer));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.block_id_mappings (org_id UUID, external_id TEXT, internal_id TEXT, created_at TIMESTAMP, PRIMARY KEY ((org_id), external_id));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.share_links (share_token TEXT PRIMARY KEY, org_id UUID, library_id UUID, file_path TEXT, created_by UUID, permission TEXT, password_hash TEXT, expires_at TIMESTAMP, download_count INT, max_downloads INT, created_at TIMESTAMP);"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.share_links_by_creator (org_id UUID, created_by UUID, share_token TEXT, library_id UUID, file_path TEXT, permission TEXT, expires_at TIMESTAMP, download_count INT, max_downloads INT, created_at TIMESTAMP, PRIMARY KEY ((org_id, created_by), share_token));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.shares (library_id UUID, share_id UUID, shared_by UUID, shared_to UUID, shared_to_type TEXT, permission TEXT, created_at TIMESTAMP, expires_at TIMESTAMP, PRIMARY KEY ((library_id), share_id));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.restore_jobs (org_id UUID, job_id UUID, library_id UUID, block_ids LIST<TEXT>, glacier_job_id TEXT, status TEXT, requested_at TIMESTAMP, completed_at TIMESTAMP, expires_at TIMESTAMP, PRIMARY KEY ((org_id), job_id));"
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e "CREATE TABLE IF NOT EXISTS sesamefs.hostname_mappings (hostname TEXT PRIMARY KEY, org_id UUID, settings MAP<TEXT, TEXT>, created_at TIMESTAMP, updated_at TIMESTAMP);"
-
-    # Handle access_tokens separately due to reserved keyword
-    docker exec cool-storage-api-cassandra-1 cqlsh localhost -e 'CREATE TABLE IF NOT EXISTS sesamefs.access_tokens ("token" TEXT PRIMARY KEY, token_type TEXT, org_id UUID, repo_id UUID, file_path TEXT, user_id UUID, created_at TIMESTAMP);'
-
-    log_success "All tables created"
+run_cassandra_bootstrap() {
+    log_info "Running canonical Cassandra bootstrap..."
+    $DOCKER_COMPOSE -f "$COMPOSE_FILE" up --no-deps cassandra-bootstrap
+    log_success "Cassandra bootstrap completed"
 }
 
 wait_for_services() {
@@ -221,8 +194,9 @@ start_infrastructure() {
     log_info "Starting infrastructure (Cassandra, MinIO)..."
     $DOCKER_COMPOSE -f "$COMPOSE_FILE" up -d cassandra minio
 
-    log_info "Bootstrapping Cassandra keyspace..."
-    $DOCKER_COMPOSE -f "$COMPOSE_FILE" up -d cassandra-bootstrap
+    wait_for_cassandra
+
+    run_cassandra_bootstrap
 
     log_info "Starting MinIO initialization..."
     $DOCKER_COMPOSE -f "$COMPOSE_FILE" up -d minio-init

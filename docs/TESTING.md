@@ -393,7 +393,8 @@ client.
 
 ### 6. Multi-Region Tests (`multiregion`)
 
-Requires: Multi-region stack (`./scripts/bootstrap.sh multiregion`)
+Requires: Multi-region stack (`./scripts/bootstrap.sh multiregion`, which runs
+compose `cassandra-bootstrap` before the app servers start)
 
 ```bash
 # Start multi-region stack
@@ -481,8 +482,12 @@ npm test -- --coverage           # With coverage
 ```
 
 **Services:**
-- SesameFS: http://localhost:8082
+- SesameFS: http://localhost:8080
 - MinIO Console: http://localhost:9001 (minioadmin/minioadmin)
+
+`bootstrap.sh` is a convenience wrapper only: it waits for Cassandra, runs the
+compose `cassandra-bootstrap` service, and then starts SesameFS so the embedded
+migration runner can apply the current schema baseline.
 
 ### Multi-Region Mode
 
@@ -497,7 +502,7 @@ npm test -- --coverage           # With coverage
 ```
 
 **Services:**
-- Load Balancer: http://localhost:8082
+- Load Balancer: http://localhost:8080
 - USA Endpoint: http://us.sesamefs.local:8080
 - EU Endpoint: http://eu.sesamefs.local:8080
 - MinIO Console: http://localhost:9001
@@ -524,8 +529,8 @@ npm test -- --coverage           # With coverage
 | `test-multiregion.sh` | Multi-region tests | varies | Multi-region stack |
 | `test-failover.sh` | Failover scenarios | varies | Multi-region + host docker |
 | `run-tests.sh` | Container-based runner | — | Multi-region stack |
-| `bootstrap.sh` | Environment setup | — | Docker |
-| `bootstrap-multiregion.sh` | Legacy multi-region setup | — | Docker |
+| `bootstrap.sh` | Environment setup wrapper around compose `cassandra-bootstrap` + app migrations | — | Docker |
+| `bootstrap-multiregion.sh` | Legacy dedicated multi-region wrapper using the same canonical bootstrap path | — | Docker |
 
 | Go integration tests | `internal/integration/*_test.go` | Backend regression and end-to-end invariants | Backend |
 
@@ -694,19 +699,19 @@ After deploying, verify GC via the admin API:
 ```bash
 # Check GC status
 curl -H "Authorization: Token dev-token-admin" \
-  http://localhost:8082/api/v2.1/admin/gc/status
+  http://localhost:8080/api/v2.1/admin/gc/status
 
 # Trigger worker run
 curl -X POST -H "Authorization: Token dev-token-admin" \
   -H "Content-Type: application/json" \
   -d '{"type":"worker"}' \
-  http://localhost:8082/api/v2.1/admin/gc/run
+  http://localhost:8080/api/v2.1/admin/gc/run
 
 # Trigger scanner run (dry run)
 curl -X POST -H "Authorization: Token dev-token-admin" \
   -H "Content-Type: application/json" \
   -d '{"type":"scanner","dry_run":true}' \
-  http://localhost:8082/api/v2.1/admin/gc/run
+  http://localhost:8080/api/v2.1/admin/gc/run
 ```
 
 ### End-to-End GC Test Scenario
@@ -793,7 +798,7 @@ Also wired into `./scripts/test.sh api` as the "Garbage Collection Admin API" su
 - Added 8 `parseIDToken` direct tests to `oidc_test.go` — valid/expired/issuer/nonce/format/custom claims
 - Fixed pre-existing compile errors in `fileview_test.go` — `h.fileViewAuthMiddleware()` → `fileViewAuthWrapper()`
 - Fixed `TestRegisterFileViewRoutes` — passed real auth middleware instead of nil
-- Fixed all test scripts to use port 8082 (host-mapped port)
+- Fixed all test scripts to use the then-current host-mapped backend port
 - Fixed `test.sh` nested folders invocation (script name vs args split)
 - Removed legacy `test-all.sh` (replaced by unified `test.sh`)
 

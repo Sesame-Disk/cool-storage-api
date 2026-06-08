@@ -22,8 +22,8 @@ The Seafile-compatible upload contract now matches the client intent again:
   honors an explicit multipart `replace` override when present
 
 To keep this safe in the real multi-node deployment, the token's default
-overwrite policy is now persisted in Cassandra `access_tokens` via a new schema
-migration instead of relying on in-memory state.
+overwrite policy is now persisted in Cassandra `access_tokens` via the current
+schema baseline instead of relying on in-memory state.
 
 ### Tests / Docs
 
@@ -39,7 +39,7 @@ migration instead of relying on in-memory state.
 - `internal/api/v2/files.go`
 - `internal/api/v2/file_routes.go`
 - `internal/db/tokens.go`
-- `internal/db/migrations/004_access_tokens_replace_existing.cql`
+- `internal/db/migrations/001_initial_schema.cql`
 - `internal/integration/upload_download_test.go`
 - `internal/integration/quotas_test.go`
 - `docs/KNOWN_ISSUES.md`

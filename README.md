@@ -195,15 +195,24 @@ docker compose down
 ### Local Development (Run Go outside Docker)
 
 ```bash
-# 1. Start the infrastructure and run Cassandra bootstrap once
-docker compose up cassandra minio minio-init cassandra-bootstrap -d
+# 1. Start the infrastructure
+docker compose up -d cassandra minio
 
-# 2. Run SesameFS locally against it
+# 2. Run the one-shot Cassandra bootstrap and wait for it to finish
+docker compose up cassandra-bootstrap
+
+# 3. Start MinIO bucket initialization
+docker compose up -d minio-init
+
+# 4. Run SesameFS locally against it
 go run ./cmd/sesamefs serve
 
-# 3. Run tests
+# 5. Run tests
 go test ./...
 ```
+
+The bootstrap step prepares Cassandra auth/keyspace/replication only. The
+application applies the embedded schema migrations when `go run` starts.
 
 ### Production Deployment
 
@@ -226,7 +235,8 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for the full production guide (DNS, SSL, fi
 ### Multi-Region Testing
 
 ```bash
-# Bootstrap multi-region environment
+# Bootstrap multi-region environment (wrapper around
+# `docker-compose-multiregion.yaml` + `cassandra-bootstrap`)
 ./scripts/bootstrap.sh multiregion
 
 # Run tests in container
