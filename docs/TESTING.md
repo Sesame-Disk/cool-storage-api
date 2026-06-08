@@ -530,7 +530,7 @@ migration runner can apply the current schema baseline.
 | `test-failover.sh` | Failover scenarios | varies | Multi-region + host docker |
 | `run-tests.sh` | Container-based runner | — | Multi-region stack |
 | `bootstrap.sh` | Environment setup wrapper around compose `cassandra-bootstrap` + app migrations | — | Docker |
-| `bootstrap-multiregion.sh` | Legacy dedicated multi-region wrapper using the same canonical bootstrap path | — | Docker |
+| `bootstrap-multiregion.sh` | Legacy compatibility alias for `bootstrap.sh multiregion` | — | Docker |
 
 | Go integration tests | `internal/integration/*_test.go` | Backend regression and end-to-end invariants | Backend |
 

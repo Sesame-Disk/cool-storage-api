@@ -70,7 +70,7 @@ esac
 # Check if services are running
 log_info "Checking if services are running..."
 if ! curl -s http://localhost:8080/ping > /dev/null 2>&1; then
-    log_error "Services not running. Start with: ./scripts/bootstrap-multiregion.sh"
+    log_error "Services not running. Start with: ./scripts/bootstrap.sh multiregion"
     exit 1
 fi
 log_success "Services are running"

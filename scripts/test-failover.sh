@@ -60,7 +60,7 @@ log_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 check_services() {
     log_info "Checking services..."
     if ! curl -s "$BASE_URL/ping" > /dev/null 2>&1; then
-        log_error "Services not running. Start with: ./scripts/bootstrap-multiregion.sh"
+        log_error "Services not running. Start with: ./scripts/bootstrap.sh multiregion"
         exit 1
     fi
     log_success "Services are running"
