@@ -104,7 +104,7 @@ func TestValidateAppliedMigrationChecksums(t *testing.T) {
 	assert.Contains(t, err.Error(), "Do not edit migration files after application")
 }
 
-func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
+func TestInitialSchemaContainsLookupNameAndStarredProjection(t *testing.T) {
 	raw, err := migrationsFS.ReadFile("migrations/001_initial_schema.cql")
 	require.NoError(t, err)
 	content := string(raw)

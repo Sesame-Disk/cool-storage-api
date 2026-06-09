@@ -2660,37 +2660,35 @@ func (s *CassandraStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error 
 	iter := s.db.Session().Query(`
 		SELECT user_id, path FROM starred_files_by_repo WHERE repo_id = ?
 	`, libraryIDStr).Iter()
-
-	type starEntry struct {
-		userID string
-		path   string
-	}
-	var entries []starEntry
 	var userID, path string
+	batch := s.db.Session().Batch(gocql.UnloggedBatch)
+	pendingDeletes := 0
+	flushDeletes := func() error {
+		if pendingDeletes == 0 {
+			return nil
+		}
+		if err := batch.Exec(); err != nil {
+			return err
+		}
+		batch = s.db.Session().Batch(gocql.UnloggedBatch)
+		pendingDeletes = 0
+		return nil
+	}
 	for iter.Scan(&userID, &path) {
-		entries = append(entries, starEntry{userID: userID, path: path})
+		batch.Query(`DELETE FROM starred_files WHERE user_id = ? AND repo_id = ? AND path = ?`,
+			userID, libraryIDStr, path)
+		pendingDeletes++
+		if pendingDeletes >= maxBatchSize {
+			if err := flushDeletes(); err != nil {
+				return fmt.Errorf("delete starred_files canonicals for library %s: %w", libraryID, err)
+			}
+		}
 	}
 	if err := iter.Close(); err != nil {
 		return fmt.Errorf("scan starred_files_by_repo for library %s: %w", libraryID, err)
 	}
-
-	// Delete the canonical user-partitioned rows per (user, path). Do not drop
-	// the repo-partitioned projection until every canonical delete batch
-	// succeeds; otherwise a partial failure would strand canonical rows with no
-	// reverse lookup left for retry-based cleanup.
-	for i := 0; i < len(entries); i += maxBatchSize {
-		end := i + maxBatchSize
-		if end > len(entries) {
-			end = len(entries)
-		}
-		batch := s.db.Session().Batch(gocql.UnloggedBatch)
-		for _, e := range entries[i:end] {
-			batch.Query(`DELETE FROM starred_files WHERE user_id = ? AND repo_id = ? AND path = ?`,
-				e.userID, libraryIDStr, e.path)
-		}
-		if err := batch.Exec(); err != nil {
-			return fmt.Errorf("delete starred_files canonicals for library %s: %w", libraryID, err)
-		}
+	if err := flushDeletes(); err != nil {
+		return fmt.Errorf("delete starred_files canonicals for library %s: %w", libraryID, err)
 	}
 
 	// Drop the whole projection partition for this repo in one shot only after
@@ -3141,33 +3139,35 @@ func (s *CassandraStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
 	iter := s.db.Session().Query(`
 		SELECT repo_id, path FROM starred_files WHERE user_id = ?
 	`, userIDStr).Iter()
-
-	type starEntry struct {
-		repoID string
-		path   string
-	}
-	var entries []starEntry
 	var repoID, path string
+	batch := s.db.Session().Batch(gocql.UnloggedBatch)
+	pendingDeletes := 0
+	flushDeletes := func() error {
+		if pendingDeletes == 0 {
+			return nil
+		}
+		if err := batch.Exec(); err != nil {
+			return err
+		}
+		batch = s.db.Session().Batch(gocql.UnloggedBatch)
+		pendingDeletes = 0
+		return nil
+	}
 	for iter.Scan(&repoID, &path) {
-		entries = append(entries, starEntry{repoID: repoID, path: path})
+		batch.Query(`DELETE FROM starred_files_by_repo WHERE repo_id = ? AND user_id = ? AND path = ?`,
+			repoID, userIDStr, path)
+		pendingDeletes++
+		if pendingDeletes >= maxBatchSize {
+			if err := flushDeletes(); err != nil {
+				return fmt.Errorf("delete starred_files_by_repo rows for user %s: %w", userID, err)
+			}
+		}
 	}
 	if err := iter.Close(); err != nil {
 		return fmt.Errorf("scan starred_files for user %s: %w", userID, err)
 	}
-
-	for i := 0; i < len(entries); i += maxBatchSize {
-		end := i + maxBatchSize
-		if end > len(entries) {
-			end = len(entries)
-		}
-		batch := s.db.Session().Batch(gocql.UnloggedBatch)
-		for _, e := range entries[i:end] {
-			batch.Query(`DELETE FROM starred_files_by_repo WHERE repo_id = ? AND user_id = ? AND path = ?`,
-				e.repoID, userIDStr, e.path)
-		}
-		if err := batch.Exec(); err != nil {
-			return fmt.Errorf("delete starred_files_by_repo rows for user %s: %w", userID, err)
-		}
+	if err := flushDeletes(); err != nil {
+		return fmt.Errorf("delete starred_files_by_repo rows for user %s: %w", userID, err)
 	}
 
 	return s.db.Session().Query(`
