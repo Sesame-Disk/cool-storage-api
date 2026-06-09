@@ -109,6 +109,34 @@ func addAdminLibraryReadModelRefreshQueries(batch *gocql.Batch, row dbpkg.AdminL
 	dbpkg.AddRefreshAdminLibraryReadModelQueries(batch, row, previous)
 }
 
+func buildNewLibraryProjectionRow(session *gocql.Session, orgID, libraryID, ownerID, name string, encrypted bool, storageClass string, sizeBytes, fileCount int64, createdAt, updatedAt time.Time) dbpkg.AdminLibraryProjectionRow {
+	ownerEmail, ownerName := dbpkg.ResolveAdminLibraryOwnerFields(session, orgID, ownerID)
+	return dbpkg.AdminLibraryProjectionRow{
+		OrgID:        orgID,
+		LibraryID:    libraryID,
+		OwnerID:      ownerID,
+		OwnerEmail:   ownerEmail,
+		OwnerName:    ownerName,
+		Name:         name,
+		Encrypted:    encrypted,
+		StorageClass: storageClass,
+		SizeBytes:    sizeBytes,
+		FileCount:    fileCount,
+		CreatedAt:    createdAt,
+		UpdatedAt:    updatedAt,
+	}
+}
+
+// addNewLibraryProjectionQueries enqueues the admin read-model projection writes
+// (libraries_by_org_updated / libraries_by_owner / global) for a freshly created
+// library into batch and returns the exact projection row so rollback can tear
+// down the same keys without re-reading Cassandra.
+func addNewLibraryProjectionQueries(session *gocql.Session, batch *gocql.Batch, orgID, libraryID, ownerID, name string, encrypted bool, storageClass string, sizeBytes, fileCount int64, createdAt, updatedAt time.Time) dbpkg.AdminLibraryProjectionRow {
+	projectionRow := buildNewLibraryProjectionRow(session, orgID, libraryID, ownerID, name, encrypted, storageClass, sizeBytes, fileCount, createdAt, updatedAt)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, nil)
+	return projectionRow
+}
+
 func buildShareReadModelRow(
 	db interface{ Session() *gocql.Session },
 	libraryID, shareID, sharedBy, sharedTo, sharedToType, permission string,
@@ -838,22 +866,27 @@ func incrementShareLinkCounterDualWrite(db interface{ Session() *gocql.Session }
 	return batch.Exec()
 }
 
-func rollbackNewLibrary(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {
+func rollbackNewLibrary(db interface{ Session() *gocql.Session }, projectionRow dbpkg.AdminLibraryProjectionRow) error {
 	batch := db.Session().Batch(gocql.LoggedBatch)
-	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyVersionTTL, orgID, libraryID)
-	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyAutoDelete, orgID, libraryID)
+	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyVersionTTL, projectionRow.OrgID, projectionRow.LibraryID)
+	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyAutoDelete, projectionRow.OrgID, projectionRow.LibraryID)
+	// Tear down the same projection keys written during creation. Using the
+	// original row avoids a fresh Cassandra read during rollback, so a transient
+	// lookup failure cannot leave phantom admin/global projections behind while
+	// still deleting the canonical library row.
+	dbpkg.AddDeleteAdminLibraryReadModelQuery(batch, projectionRow)
 	batch.Query(`
 		DELETE FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, libraryID)
+	`, projectionRow.OrgID, projectionRow.LibraryID)
 	batch.Query(`
 		DELETE FROM libraries_by_id WHERE library_id = ?
-	`, libraryID)
+	`, projectionRow.LibraryID)
 	batch.Query(`
 		DELETE FROM fs_objects WHERE library_id = ?
-	`, libraryID)
+	`, projectionRow.LibraryID)
 	batch.Query(`
 		DELETE FROM commits WHERE library_id = ?
-	`, libraryID)
+	`, projectionRow.LibraryID)
 	return batch.Exec()
 }
 
@@ -1223,17 +1256,32 @@ func removeFileTag(sess *gocql.Session, repoID gocql.UUID, fileTagID int) error 
 	return nil
 }
 
-// starFile adds a file to the user's starred files list.
+// starFile adds a file to the user's starred files list. The canonical row
+// (partitioned by user_id) and the starred_files_by_repo projection (partitioned
+// by repo_id, used by GC library cleanup) are written in one batch so the
+// reverse lookup stays consistent without a secondary index.
 func starFile(sess *gocql.Session, userID, repoID, path string, starredAt time.Time) error {
-	return sess.Query(`
+	batch := sess.Batch(gocql.LoggedBatch)
+	batch.Query(`
 		INSERT INTO starred_files (user_id, repo_id, path, starred_at)
 		VALUES (?, ?, ?, ?)
-	`, userID, repoID, path, starredAt).Exec()
+	`, userID, repoID, path, starredAt)
+	batch.Query(`
+		INSERT INTO starred_files_by_repo (repo_id, user_id, path, starred_at)
+		VALUES (?, ?, ?, ?)
+	`, repoID, userID, path, starredAt)
+	return batch.Exec()
 }
 
-// unstarFile removes a file from the user's starred files list.
+// unstarFile removes a file from the user's starred files list, tearing down the
+// canonical row and the starred_files_by_repo projection together.
 func unstarFile(sess *gocql.Session, userID, repoID, path string) error {
-	return sess.Query(`
+	batch := sess.Batch(gocql.LoggedBatch)
+	batch.Query(`
 		DELETE FROM starred_files WHERE user_id = ? AND repo_id = ? AND path = ?
-	`, userID, repoID, path).Exec()
+	`, userID, repoID, path)
+	batch.Query(`
+		DELETE FROM starred_files_by_repo WHERE repo_id = ? AND user_id = ? AND path = ?
+	`, repoID, userID, path)
+	return batch.Exec()
 }

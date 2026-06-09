@@ -3,6 +3,7 @@ package v2
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -951,6 +952,7 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 		INSERT INTO libraries_by_id (library_id, org_id, owner_id, name, encrypted)
 		VALUES (?, ?, ?, ?, ?)
 	`, newLibID, orgID, userID, repoName, false)
+	projectionRow := addNewLibraryProjectionQueries(h.db.Session(), batch, orgID, newLibID, userID, repoName, false, resolvedStorageClass, 0, 0, now, now)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
 		return
@@ -959,7 +961,9 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 	// Initialize filesystem (root dir + initial commit)
 	fsHelper := NewFSHelper(h.db)
 	if err := fsHelper.InitializeLibraryFS(orgID, newLibID, userID, repoName); err != nil {
-		_ = rollbackNewLibrary(h.db, orgID, newLibID)
+		if rollbackErr := rollbackNewLibrary(h.db, projectionRow); rollbackErr != nil {
+			log.Printf("[CreateGroupOwnedLibrary] rollback failed for %s/%s after fs init error: %v", orgID, newLibID, rollbackErr)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize library filesystem"})
 		return
 	}
@@ -967,7 +971,9 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 	// Share the library with the group
 	shareID := uuid.New().String()
 	if err := createLibraryShare(h.db, newLibID, shareID, userID, groupUUID.String(), "group", "rw", now, nil); err != nil {
-		_ = rollbackNewLibrary(h.db, orgID, newLibID)
+		if rollbackErr := rollbackNewLibrary(h.db, projectionRow); rollbackErr != nil {
+			log.Printf("[CreateGroupOwnedLibrary] rollback failed for %s/%s after share error: %v", orgID, newLibID, rollbackErr)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to share library with group"})
 		return
 	}

@@ -1,11 +1,14 @@
 -- Migration 001: Initial schema
 -- Canonical baseline for all SesameFS tables.
 -- In design mode this file is the single source of truth for the full schema:
--- all known columns, reverse indexes, and read models required for a clean boot
--- are baked in here directly instead of being layered through historical ALTERs.
+-- all known columns, reverse-lookup projections, and read models required for a
+-- clean boot are baked in here directly instead of being layered through
+-- historical ALTERs. Reverse lookups use purpose-built projection tables rather
+-- than secondary indexes (which force scatter-gather reads and degrade in
+-- multi-region clusters).
 --
 -- Existing deployments that intentionally reuse this baseline will re-run the
--- CREATE TABLE / CREATE INDEX statements safely where the schema already exists.
+-- CREATE TABLE statements safely where the schema already exists.
 -- Fresh installs: this file creates the complete schema in one pass.
 
 -- ─── Core / Identity ─────────────────────────────────────────────────────────
@@ -969,10 +972,21 @@ CREATE TABLE IF NOT EXISTS starred_files (
     PRIMARY KEY ((user_id), repo_id, path)
 );
 
--- Secondary index required by GC cleanup: DELETE FROM starred_files WHERE repo_id = ?
--- (store_cassandra.go DeleteStarredFilesByLibrary). Without this index that query
--- requires ALLOW FILTERING and will fail on any non-trivial dataset.
-CREATE INDEX IF NOT EXISTS starred_files_by_repo ON starred_files (repo_id);
+-- Reverse-lookup projection: stars for a given repo, used by GC library-deletion
+-- cleanup (store_cassandra.go DeleteStarredFilesByLibrary). Replaces a secondary
+-- index on starred_files(repo_id): secondary indexes are node-local and force a
+-- scatter-gather across the whole cluster, which degrades at scale and is an
+-- anti-pattern in multi-region. A purpose-built projection partitioned by repo_id
+-- serves the same query as a single-partition read. Kept in sync by dual-write on
+-- star/unstar (write_helpers.go), torn down per-row on user cascade, and removed
+-- after canonical deletes succeed on library cascade.
+CREATE TABLE IF NOT EXISTS starred_files_by_repo (
+    repo_id    UUID,
+    user_id    UUID,
+    path       TEXT,
+    starred_at TIMESTAMP,
+    PRIMARY KEY ((repo_id), user_id, path)
+);
 
 CREATE TABLE IF NOT EXISTS locked_files (
     repo_id   UUID,
