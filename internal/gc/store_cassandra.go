@@ -2680,6 +2680,7 @@ func (s *CassandraStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error 
 		pendingDeletes++
 		if pendingDeletes >= maxBatchSize {
 			if err := flushDeletes(); err != nil {
+				_ = iter.Close()
 				return fmt.Errorf("delete starred_files canonicals for library %s: %w", libraryID, err)
 			}
 		}
@@ -3159,6 +3160,7 @@ func (s *CassandraStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
 		pendingDeletes++
 		if pendingDeletes >= maxBatchSize {
 			if err := flushDeletes(); err != nil {
+				_ = iter.Close()
 				return fmt.Errorf("delete starred_files_by_repo rows for user %s: %w", userID, err)
 			}
 		}
