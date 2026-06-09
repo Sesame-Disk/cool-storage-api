@@ -305,15 +305,12 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 	}
 
 	// Get library info
-	var libOrgID string
-	var encrypted bool
-	err = h.db.Session().Query(`
-		SELECT org_id, encrypted FROM libraries_by_id WHERE library_id = ?
-	`, repoUUID.String()).Scan(&libOrgID, &encrypted)
+	libraryState, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoUUID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
+	libOrgID := libraryState.OrgID
 
 	// PERMISSION CHECK: User must have admin or owner access to share a library
 	if h.permMiddleware != nil {
@@ -533,11 +530,12 @@ func (h *FileShareHandler) UpdateSharePermission(c *gin.Context) {
 		return
 	}
 
-	// Resolve org_id for this library (needed for email fallback lookup)
-	var updateLibOrgID string
-	h.db.Session().Query(`
-		SELECT org_id FROM libraries_by_id WHERE library_id = ?
-	`, repoUUID.String()).Scan(&updateLibOrgID)
+	libraryState, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoUUID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+	updateLibOrgID := libraryState.OrgID
 
 	// PERMISSION CHECK: User must have admin or owner access to manage shares
 	userID := c.GetString("user_id")
@@ -646,11 +644,12 @@ func (h *FileShareHandler) DeleteShare(c *gin.Context) {
 		return
 	}
 
-	// Resolve org_id for this library (needed for email fallback lookup)
-	var deleteLibOrgID string
-	h.db.Session().Query(`
-		SELECT org_id FROM libraries_by_id WHERE library_id = ?
-	`, repoUUID.String()).Scan(&deleteLibOrgID)
+	libraryState, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoUUID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+	deleteLibOrgID := libraryState.OrgID
 
 	// PERMISSION CHECK: User must have admin or owner access to manage shares
 	deleteUserID := c.GetString("user_id")

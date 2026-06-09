@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -15,6 +16,12 @@ import (
 func isNotFound(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "not found")
 }
+
+func isLibraryUnavailable(err error) bool {
+	return isNotFound(err) || errors.Is(err, db.ErrLibraryDeleted)
+}
+
+var readLiveLibraryStateFn = db.ReadLiveLibraryState
 
 // PermissionMiddleware handles permission checking
 type PermissionMiddleware struct {
@@ -135,6 +142,19 @@ func (m *PermissionMiddleware) RequireLibraryPermission(paramName string, requir
 			return
 		}
 
+		if m != nil && m.db != nil {
+			if _, err := readLiveLibraryStateFn(m.db.Session(), orgID, repoID); err != nil {
+				if isLibraryUnavailable(err) {
+					c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+					c.Abort()
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check library state"})
+				c.Abort()
+				return
+			}
+		}
+
 		// Check if this is a repo API token (scoped to a specific library)
 		if isRepoToken, _ := c.Get("repo_api_token"); isRepoToken == true {
 			tokenRepoID := c.GetString("repo_api_token_repo_id")
@@ -199,6 +219,19 @@ func (m *PermissionMiddleware) RequireLibraryOwner(paramName string) gin.Handler
 			c.JSON(http.StatusBadRequest, gin.H{"error": "library_id required"})
 			c.Abort()
 			return
+		}
+
+		if m != nil && m.db != nil {
+			if _, err := readLiveLibraryStateFn(m.db.Session(), orgID, repoID); err != nil {
+				if isLibraryUnavailable(err) {
+					c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+					c.Abort()
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check library state"})
+				c.Abort()
+				return
+			}
 		}
 
 		isOwner, err := m.IsLibraryOwner(orgID, userID, repoID)
@@ -352,6 +385,14 @@ func (m *PermissionMiddleware) GetLibraryPermission(orgID, userID, repoID string
 // and the granular PermissionFlags for the user's access to a library.
 // When the user has multiple shares (direct + group), flags are merged (OR).
 func (m *PermissionMiddleware) GetLibraryPermissionWithFlags(orgID, userID, repoID string) (LibraryPermission, *PermissionFlags, error) {
+	libraryState, err := readLiveLibraryStateFn(m.db.Session(), orgID, repoID)
+	if err != nil {
+		if isLibraryUnavailable(err) {
+			return PermissionNone, &PermissionFlags{}, nil
+		}
+		return PermissionNone, nil, err
+	}
+
 	// Check if user is admin/superadmin - they have full access to all libraries
 	role, err := m.GetUserOrgRole(orgID, userID)
 	if err == nil && (role == RoleSuperAdmin || role == RoleOwner || role == RoleAdmin) {
@@ -359,19 +400,7 @@ func (m *PermissionMiddleware) GetLibraryPermissionWithFlags(orgID, userID, repo
 	}
 
 	// Check if user is the owner
-	var ownerIDStr string
-	err = m.db.Session().Query(`
-		SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&ownerIDStr)
-
-	if err != nil {
-		if isNotFound(err) {
-			return PermissionNone, nil, nil
-		}
-		return PermissionNone, nil, err
-	}
-
-	if ownerIDStr == userID {
+	if libraryState.OwnerID == userID {
 		return PermissionOwner, allPermFlags(), nil
 	}
 
@@ -449,6 +478,14 @@ func (m *PermissionMiddleware) GetLibraryPermissionWithFlags(orgID, userID, repo
 // For custom permissions it returns "custom-{uuid}" which the frontend uses
 // to fetch the full permission object via getCustomPermission().
 func (m *PermissionMiddleware) GetLibraryPermissionRaw(orgID, userID, repoID string) (string, error) {
+	libraryState, err := readLiveLibraryStateFn(m.db.Session(), orgID, repoID)
+	if err != nil {
+		if isLibraryUnavailable(err) {
+			return "", nil
+		}
+		return "", err
+	}
+
 	// Check if user is admin/superadmin - they have full access
 	role, err := m.GetUserOrgRole(orgID, userID)
 	if err == nil && (role == RoleSuperAdmin || role == RoleOwner || role == RoleAdmin) {
@@ -456,17 +493,7 @@ func (m *PermissionMiddleware) GetLibraryPermissionRaw(orgID, userID, repoID str
 	}
 
 	// Check if user is the owner
-	var ownerIDStr string
-	err = m.db.Session().Query(`
-		SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&ownerIDStr)
-	if err != nil {
-		if isNotFound(err) {
-			return "", nil
-		}
-		return "", err
-	}
-	if ownerIDStr == userID {
+	if libraryState.OwnerID == userID {
 		return "rw", nil
 	}
 
@@ -560,19 +587,15 @@ func (m *PermissionMiddleware) IsLibraryOwner(orgID, userID, repoID string) (boo
 		return false, fmt.Errorf("database not available")
 	}
 
-	var ownerIDStr string
-	err := m.db.Session().Query(`
-		SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&ownerIDStr)
-
+	libraryState, err := readLiveLibraryStateFn(m.db.Session(), orgID, repoID)
 	if err != nil {
-		if isNotFound(err) {
-			return false, nil // Library doesn't exist
+		if isLibraryUnavailable(err) {
+			return false, nil
 		}
 		return false, err
 	}
 
-	return ownerIDStr == userID, nil
+	return libraryState.OwnerID == userID, nil
 }
 
 // GetGroupRole retrieves user's role in a group
@@ -809,6 +832,15 @@ func (m *PermissionMiddleware) HasLibraryAccessCtx(c interface {
 	}
 
 	if isRepoToken, _ := c.Get("repo_api_token"); isRepoToken == true {
+		if m != nil && m.db != nil {
+			if _, err := readLiveLibraryStateFn(m.db.Session(), orgID, repoID); err != nil {
+				if isLibraryUnavailable(err) {
+					return false, nil
+				}
+				return false, err
+			}
+		}
+
 		tokenRepoID := c.GetString("repo_api_token_repo_id")
 		tokenPerm := c.GetString("repo_api_token_permission")
 

@@ -491,6 +491,12 @@ func (h *ShareLinkHandler) CreateShareLink(c *gin.Context) {
 		return
 	}
 
+	libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, req.RepoID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+
 	// PERMISSION CHECK: User must have at least read access to the library
 	if h.permMiddleware != nil {
 		hasAccess, err := h.permMiddleware.HasLibraryAccess(orgID, userID, req.RepoID, middleware.PermissionR)
@@ -588,11 +594,9 @@ func (h *ShareLinkHandler) CreateShareLink(c *gin.Context) {
 	}
 
 	// Build response
-	var repoName string
 	orgUUID, _ := gocql.ParseUUID(orgID)
 	userUUID, _ := gocql.ParseUUID(userID)
-	libUUID, _ := gocql.ParseUUID(req.RepoID)
-	h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgUUID, libUUID).Scan(&repoName)
+	repoName := libraryState.Name
 	if repoName == "" {
 		repoName = "Unknown Library"
 	}
@@ -707,6 +711,11 @@ func (h *ShareLinkHandler) UpdateShareLink(c *gin.Context) {
 
 	if createdBy != userID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to update this share link"})
+		return
+	}
+
+	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, libID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
 
@@ -914,6 +923,12 @@ func (h *ShareLinkHandler) BatchCreateShareLinks(c *gin.Context) {
 		return
 	}
 
+	libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, req.RepoID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+
 	if h.permMiddleware != nil {
 		hasAccess, err := h.permMiddleware.HasLibraryAccess(orgID, userID, req.RepoID, middleware.PermissionR)
 		if err != nil || !hasAccess {
@@ -957,12 +972,9 @@ func (h *ShareLinkHandler) BatchCreateShareLinks(c *gin.Context) {
 		}
 	}
 
-	// Get library name
-	var repoName string
 	orgUUID, _ := gocql.ParseUUID(orgID)
 	userUUID, _ := gocql.ParseUUID(userID)
-	libUUID, _ := gocql.ParseUUID(req.RepoID)
-	h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgUUID, libUUID).Scan(&repoName)
+	repoName := libraryState.Name
 	if repoName == "" {
 		repoName = "Unknown Library"
 	}

@@ -244,6 +244,18 @@ func (h *UploadLinkHandler) CreateUploadLink(c *gin.Context) {
 		req.Path = "/"
 	}
 
+	// Validate repo exists
+	if _, err := uuid.Parse(req.RepoID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+		return
+	}
+
+	libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, req.RepoID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+
 	// PERMISSION CHECK: User must have write access to the library
 	if h.permMiddleware != nil {
 		hasAccess, err := h.permMiddleware.HasLibraryAccess(orgID, userID, req.RepoID, middleware.PermissionRW)
@@ -260,12 +272,6 @@ func (h *UploadLinkHandler) CreateUploadLink(c *gin.Context) {
 	// CUSTOM PERMISSION CHECK: upload flag
 	if h.permMiddleware != nil && !h.permMiddleware.RequirePermFlagForRepo(c, req.RepoID, "upload") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "upload is not allowed by your permission"})
-		return
-	}
-
-	// Validate repo exists
-	if _, err := uuid.Parse(req.RepoID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 		return
 	}
 
@@ -346,10 +352,8 @@ func (h *UploadLinkHandler) CreateUploadLink(c *gin.Context) {
 	// Build response
 	orgUUID, _ := gocql.ParseUUID(orgID)
 	userUUID, _ := gocql.ParseUUID(userID)
-	libUUID, _ := gocql.ParseUUID(req.RepoID)
 
-	var repoName string
-	h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgUUID, libUUID).Scan(&repoName)
+	repoName := libraryState.Name
 	if repoName == "" {
 		repoName = "Unknown Library"
 	}
@@ -440,6 +444,11 @@ func (h *UploadLinkHandler) UpdateUploadLink(c *gin.Context) {
 
 	if createdBy != userID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized"})
+		return
+	}
+
+	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, libID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
 

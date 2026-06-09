@@ -64,12 +64,7 @@ func (h *MonitoredRepoHandler) MonitorRepo(c *gin.Context) {
 		return
 	}
 
-	// Verify library exists
-	var libName string
-	err := h.db.Session().Query(`
-		SELECT name FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, req.RepoID).Scan(&libName)
-	if err != nil {
+	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, req.RepoID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
@@ -85,8 +80,7 @@ func (h *MonitoredRepoHandler) MonitorRepo(c *gin.Context) {
 		INSERT INTO monitored_repos_by_repo (repo_id, user_id, monitored_at)
 		VALUES (?, ?, ?)
 	`, req.RepoID, userID, now)
-	err = batch.Exec()
-	if err != nil {
+	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to monitor repo"})
 		return
 	}
@@ -115,6 +109,7 @@ func (h *MonitoredRepoHandler) MonitorRepo(c *gin.Context) {
 // DELETE /api/v2.1/monitored-repos/:repo_id/
 func (h *MonitoredRepoHandler) UnmonitorRepo(c *gin.Context) {
 	userID := c.GetString("user_id")
+	orgID := c.GetString("org_id")
 	repoID := c.Param("repo_id")
 
 	if userID == "" {
@@ -124,6 +119,11 @@ func (h *MonitoredRepoHandler) UnmonitorRepo(c *gin.Context) {
 
 	if _, err := uuid.Parse(repoID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+		return
+	}
+
+	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
 

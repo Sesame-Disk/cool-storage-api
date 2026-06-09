@@ -708,28 +708,14 @@ func (h *OnlyOfficeHandler) GetEditorConfig(c *gin.Context) {
 }
 
 // getFileID retrieves the file ID from fs_objects by traversing the path
-func (h *OnlyOfficeHandler) getFileID(repoID, orgID, filePath string) (string, error) {
+func (h *OnlyOfficeHandler) getFileID(repoID, _ string, filePath string) (string, error) {
 	if h == nil || h.db == nil {
 		return "", fmt.Errorf("database not available")
 	}
 
-	// Resolve the org partition through libraries_by_id, then read the canonical
-	// head_commit_id from libraries so transient lag in libraries_by_id never
-	// drives OnlyOffice off a stale HEAD.
-	var resolvedOrgID string
-	err := h.db.Session().Query(`
-		SELECT org_id FROM libraries_by_id
-		WHERE library_id = ?
-	`, repoID).Scan(&resolvedOrgID)
-	if err != nil {
-		return "", fmt.Errorf("library not found: %w", err)
-	}
-
-	var headCommitID string
-	err = h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries
-		WHERE org_id = ? AND library_id = ?
-	`, resolvedOrgID, repoID).Scan(&headCommitID)
+	// Resolve the canonical live library row first so soft-deleted libraries are
+	// fenced before OnlyOffice traverses the tree.
+	libraryState, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoID)
 	if err != nil {
 		return "", fmt.Errorf("library not found: %w", err)
 	}
@@ -739,7 +725,7 @@ func (h *OnlyOfficeHandler) getFileID(repoID, orgID, filePath string) (string, e
 	err = h.db.Session().Query(`
 		SELECT root_fs_id FROM commits
 		WHERE library_id = ? AND commit_id = ?
-	`, repoID, headCommitID).Scan(&rootFSID)
+	`, repoID, libraryState.HeadCommitID).Scan(&rootFSID)
 	if err != nil {
 		return "", fmt.Errorf("commit not found: %w", err)
 	}

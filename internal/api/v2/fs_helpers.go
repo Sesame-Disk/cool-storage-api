@@ -188,21 +188,12 @@ func (h *FSHelper) GetRootFSID(repoID string) (string, string, error) {
 }
 
 func (h *FSHelper) getCanonicalHeadCommit(repoID string) (string, string, error) {
-	var orgID string
-	if err := h.db.Session().Query(`
-		SELECT org_id FROM libraries_by_id WHERE library_id = ?
-	`, repoID).Scan(&orgID); err != nil {
+	libraryState, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoID)
+	if err != nil {
 		return "", "", fmt.Errorf("library not found: %w", err)
 	}
 
-	var headCommitID string
-	if err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&headCommitID); err != nil {
-		return "", "", fmt.Errorf("library not found: %w", err)
-	}
-
-	return orgID, headCommitID, nil
+	return libraryState.OrgID, libraryState.HeadCommitID, nil
 }
 
 // GetLibraryHeadSnapshot resolves the canonical HEAD once and returns the root

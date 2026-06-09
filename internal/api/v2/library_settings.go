@@ -95,6 +95,17 @@ func (h *LibrarySettingsHandler) requireOwner(c *gin.Context) (string, string, s
 		return "", "", "", false
 	}
 
+	if h.db != nil {
+		if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
+			if isLibraryUnavailableErr(err) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+				return "", "", "", false
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check library state"})
+			return "", "", "", false
+		}
+	}
+
 	isOwner, err := h.permMiddleware.IsLibraryOwner(orgID, userID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check ownership"})
