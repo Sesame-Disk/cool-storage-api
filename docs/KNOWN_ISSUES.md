@@ -2677,13 +2677,22 @@ Tracked in `docs/TECHNICAL-DEBT.md` § 9, Gap B.
 
 ### ISSUE-GC-QUEUE-RECOUNT-01: Exact `gc_queue` Recounts Still Hit Cassandra Tombstone Paths
 
-**Status**: Substantially resolved (2026-06-05). Hot `COUNT(*)` and the
-counter/repair machinery were both removed in favour of a single-writer dirty
-snapshot + throttled exact recalc (`gc_org_stats.recalculated_at`). See
-[GC-QUEUE-DEPTH-MODEL.md](GC-QUEUE-DEPTH-MODEL.md). Remaining tombstone-warning
-source is the recompute/`DequeueBatch` partition reads themselves — addressed by
-the compaction follow-up in [SCHEMA-BOTTLENECK-AUDIT.md](SCHEMA-BOTTLENECK-AUDIT.md)
-item I (`gc_queue-lcs-compaction`), not by more depth-tracking changes.
+**Status**: Mitigated structurally in the current branch (2026-06-08); exact
+re-measurement still pending. Hot `COUNT(*)` and the counter/repair machinery
+were both removed in favour of a single-writer dirty snapshot + throttled exact
+recalc (`gc_org_stats.recalculated_at`). See
+[GC-QUEUE-DEPTH-MODEL.md](GC-QUEUE-DEPTH-MODEL.md). The remaining
+tombstone-warning source — the recompute/`DequeueBatch` partition reads
+themselves — is addressed at the schema level by migration
+`003_gc_queue_lcs_compaction.cql`, which `ALTER`s the queue/marker/DLQ tables to
+`LeveledCompactionStrategy` (the `001` baseline is unchanged from `main`). LCS
+reduces read amplification at the queue head immediately. Note that the accompanying
+`tombstone_threshold`/`tombstone_compaction_interval` knobs only act on
+tombstones already past `gc_grace_seconds` (kept at the 10-day default), so
+sub-grace churn tombstones on a hot org may still surface warnings until
+`gc_grace_seconds` is lowered. That reduction is intentionally deferred and
+gated on re-measuring the warnings under multi-node load — do not treat the
+warning class as fully closed until then.
 **Discovered**: 2026-04-28
 **Severity**: High operational risk — not a confirmed data-loss bug, but still a real source of Cassandra warnings and expensive partition reads in a GC-critical path
 
@@ -2722,7 +2731,7 @@ The worker behavior in `internal/gc/worker.go` that removes an org from `gc_acti
 That change addresses a different problem: stale active-org entries causing repeated empty dequeues. It does **not** introduce the `COUNT(*)` issue and remains safe because removal is guarded by the `last_enqueued_at` timestamp semantics.
 
 **Current recommendation:**
-- Treat the hot-path `COUNT(*)` removal and explicit DLQ expiry as implemented, then validate dirty-org backlog drain and snapshot staleness under multi-instance/multinode load
+- Treat the hot-path `COUNT(*)` removal, explicit DLQ expiry, and queue/marker compaction tuning as implemented, then validate dirty-org backlog drain, snapshot staleness, and residual tombstone warnings under multi-instance/multinode load before deciding whether a lower `gc_grace_seconds` on the queue/marker tables is also warranted
 - Do not revert the current worker short-batch active-set removal
 - Do not add new hot-path exact recounts over `gc_queue`
 
