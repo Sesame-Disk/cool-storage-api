@@ -109,15 +109,9 @@ func addAdminLibraryReadModelRefreshQueries(batch *gocql.Batch, row dbpkg.AdminL
 	dbpkg.AddRefreshAdminLibraryReadModelQueries(batch, row, previous)
 }
 
-// addNewLibraryProjectionQueries enqueues the admin read-model projection writes
-// (libraries_by_org_updated / libraries_by_owner / global) for a freshly created
-// library into batch, resolving the owner's display fields. Group-library
-// creation paths must call this so org-wide library listings and projection-based
-// enforcement (e.g. active-library quota counts) see the library; otherwise the
-// canonical row exists but the projections silently omit it.
-func addNewLibraryProjectionQueries(session *gocql.Session, batch *gocql.Batch, orgID, libraryID, ownerID, name string, encrypted bool, storageClass string, sizeBytes, fileCount int64, createdAt, updatedAt time.Time) {
+func buildNewLibraryProjectionRow(session *gocql.Session, orgID, libraryID, ownerID, name string, encrypted bool, storageClass string, sizeBytes, fileCount int64, createdAt, updatedAt time.Time) dbpkg.AdminLibraryProjectionRow {
 	ownerEmail, ownerName := dbpkg.ResolveAdminLibraryOwnerFields(session, orgID, ownerID)
-	addAdminLibraryReadModelRefreshQueries(batch, dbpkg.AdminLibraryProjectionRow{
+	return dbpkg.AdminLibraryProjectionRow{
 		OrgID:        orgID,
 		LibraryID:    libraryID,
 		OwnerID:      ownerID,
@@ -130,7 +124,17 @@ func addNewLibraryProjectionQueries(session *gocql.Session, batch *gocql.Batch, 
 		FileCount:    fileCount,
 		CreatedAt:    createdAt,
 		UpdatedAt:    updatedAt,
-	}, nil)
+	}
+}
+
+// addNewLibraryProjectionQueries enqueues the admin read-model projection writes
+// (libraries_by_org_updated / libraries_by_owner / global) for a freshly created
+// library into batch and returns the exact projection row so rollback can tear
+// down the same keys without re-reading Cassandra.
+func addNewLibraryProjectionQueries(session *gocql.Session, batch *gocql.Batch, orgID, libraryID, ownerID, name string, encrypted bool, storageClass string, sizeBytes, fileCount int64, createdAt, updatedAt time.Time) dbpkg.AdminLibraryProjectionRow {
+	projectionRow := buildNewLibraryProjectionRow(session, orgID, libraryID, ownerID, name, encrypted, storageClass, sizeBytes, fileCount, createdAt, updatedAt)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, nil)
+	return projectionRow
 }
 
 func buildShareReadModelRow(
@@ -862,31 +866,27 @@ func incrementShareLinkCounterDualWrite(db interface{ Session() *gocql.Session }
 	return batch.Exec()
 }
 
-func rollbackNewLibrary(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {
+func rollbackNewLibrary(db interface{ Session() *gocql.Session }, projectionRow dbpkg.AdminLibraryProjectionRow) error {
 	batch := db.Session().Batch(gocql.LoggedBatch)
-	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyVersionTTL, orgID, libraryID)
-	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyAutoDelete, orgID, libraryID)
-	// Tear down the admin read-model projections written during creation
-	// (libraries_by_owner / libraries_by_org_updated / global). The canonical
-	// row still exists at this point, so the helper can resolve the projection
-	// keys; deleting it in the same batch keeps canonical and projections
-	// consistent and avoids leaving a phantom library in org-wide listings or
-	// projection-based enforcement after a failed FS-init rollback.
-	if err := dbpkg.AddDeleteAdminLibraryReadModelQueries(db.Session(), batch, orgID, libraryID); err != nil {
-		log.Printf("[rollbackNewLibrary] warning: could not enqueue projection cleanup for %s/%s: %v", orgID, libraryID, err)
-	}
+	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyVersionTTL, projectionRow.OrgID, projectionRow.LibraryID)
+	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyAutoDelete, projectionRow.OrgID, projectionRow.LibraryID)
+	// Tear down the same projection keys written during creation. Using the
+	// original row avoids a fresh Cassandra read during rollback, so a transient
+	// lookup failure cannot leave phantom admin/global projections behind while
+	// still deleting the canonical library row.
+	dbpkg.AddDeleteAdminLibraryReadModelQuery(batch, projectionRow)
 	batch.Query(`
 		DELETE FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, libraryID)
+	`, projectionRow.OrgID, projectionRow.LibraryID)
 	batch.Query(`
 		DELETE FROM libraries_by_id WHERE library_id = ?
-	`, libraryID)
+	`, projectionRow.LibraryID)
 	batch.Query(`
 		DELETE FROM fs_objects WHERE library_id = ?
-	`, libraryID)
+	`, projectionRow.LibraryID)
 	batch.Query(`
 		DELETE FROM commits WHERE library_id = ?
-	`, libraryID)
+	`, projectionRow.LibraryID)
 	return batch.Exec()
 }
 

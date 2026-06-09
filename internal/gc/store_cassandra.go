@@ -2656,9 +2656,10 @@ func (s *CassandraStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) (
 func (s *CassandraStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error {
 	// Read the per-repo projection (single-partition read) instead of a
 	// secondary-index scan over starred_files.
+	libraryIDStr := libraryID.String()
 	iter := s.db.Session().Query(`
 		SELECT user_id, path FROM starred_files_by_repo WHERE repo_id = ?
-	`, libraryID.String()).Iter()
+	`, libraryIDStr).Iter()
 
 	type starEntry struct {
 		userID string
@@ -2669,9 +2670,14 @@ func (s *CassandraStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error 
 	for iter.Scan(&userID, &path) {
 		entries = append(entries, starEntry{userID: userID, path: path})
 	}
-	iter.Close()
+	if err := iter.Close(); err != nil {
+		return fmt.Errorf("scan starred_files_by_repo for library %s: %w", libraryID, err)
+	}
 
-	// Delete the canonical user-partitioned rows per (user, path).
+	// Delete the canonical user-partitioned rows per (user, path). Do not drop
+	// the repo-partitioned projection until every canonical delete batch
+	// succeeds; otherwise a partial failure would strand canonical rows with no
+	// reverse lookup left for retry-based cleanup.
 	for i := 0; i < len(entries); i += maxBatchSize {
 		end := i + maxBatchSize
 		if end > len(entries) {
@@ -2680,18 +2686,19 @@ func (s *CassandraStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error 
 		batch := s.db.Session().Batch(gocql.UnloggedBatch)
 		for _, e := range entries[i:end] {
 			batch.Query(`DELETE FROM starred_files WHERE user_id = ? AND repo_id = ? AND path = ?`,
-				e.userID, libraryID.String(), e.path)
+				e.userID, libraryIDStr, e.path)
 		}
 		if err := batch.Exec(); err != nil {
-			log.Printf("[GC Store] Warning: failed to batch delete starred files for library %s: %v", libraryID, err)
+			return fmt.Errorf("delete starred_files canonicals for library %s: %w", libraryID, err)
 		}
 	}
 
-	// Drop the whole projection partition for this repo in one shot.
+	// Drop the whole projection partition for this repo in one shot only after
+	// the canonical rows are gone.
 	if err := s.db.Session().Query(`
 		DELETE FROM starred_files_by_repo WHERE repo_id = ?
-	`, libraryID.String()).Exec(); err != nil {
-		log.Printf("[GC Store] Warning: failed to delete starred_files_by_repo partition for library %s: %v", libraryID, err)
+	`, libraryIDStr).Exec(); err != nil {
+		return fmt.Errorf("delete starred_files_by_repo partition for library %s: %w", libraryID, err)
 	}
 	return nil
 }
@@ -3127,10 +3134,13 @@ func (s *CassandraStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
 	// The starred_files_by_repo projection is partitioned by repo_id, so the
 	// user's rows are scattered across repo partitions and cannot be removed by
 	// the single canonical partition delete. Enumerate the user's stars first
-	// and tear down each projection row before dropping the canonical partition.
+	// and tear down each projection row before dropping the canonical partition;
+	// if any projection delete fails, keep the canonical partition intact so a
+	// retry can still enumerate and finish cleanup.
+	userIDStr := userID.String()
 	iter := s.db.Session().Query(`
 		SELECT repo_id, path FROM starred_files WHERE user_id = ?
-	`, userID.String()).Iter()
+	`, userIDStr).Iter()
 
 	type starEntry struct {
 		repoID string
@@ -3142,7 +3152,7 @@ func (s *CassandraStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
 		entries = append(entries, starEntry{repoID: repoID, path: path})
 	}
 	if err := iter.Close(); err != nil {
-		return err
+		return fmt.Errorf("scan starred_files for user %s: %w", userID, err)
 	}
 
 	for i := 0; i < len(entries); i += maxBatchSize {
@@ -3153,16 +3163,16 @@ func (s *CassandraStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
 		batch := s.db.Session().Batch(gocql.UnloggedBatch)
 		for _, e := range entries[i:end] {
 			batch.Query(`DELETE FROM starred_files_by_repo WHERE repo_id = ? AND user_id = ? AND path = ?`,
-				e.repoID, userID.String(), e.path)
+				e.repoID, userIDStr, e.path)
 		}
 		if err := batch.Exec(); err != nil {
-			log.Printf("[GC Store] Warning: failed to delete starred_files_by_repo rows for user %s: %v", userID, err)
+			return fmt.Errorf("delete starred_files_by_repo rows for user %s: %w", userID, err)
 		}
 	}
 
 	return s.db.Session().Query(`
 		DELETE FROM starred_files WHERE user_id = ?
-	`, userID.String()).Exec()
+	`, userIDStr).Exec()
 }
 
 func (s *CassandraStore) DeleteMonitoredReposByUser(userID uuid.UUID) error {

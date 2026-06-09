@@ -978,7 +978,8 @@ CREATE TABLE IF NOT EXISTS starred_files (
 -- scatter-gather across the whole cluster, which degrades at scale and is an
 -- anti-pattern in multi-region. A purpose-built projection partitioned by repo_id
 -- serves the same query as a single-partition read. Kept in sync by dual-write on
--- star/unstar (write_helpers.go) and torn down per-row on user/library cascade.
+-- star/unstar (write_helpers.go), torn down per-row on user cascade, and removed
+-- after canonical deletes succeed on library cascade.
 CREATE TABLE IF NOT EXISTS starred_files_by_repo (
     repo_id    UUID,
     user_id    UUID,

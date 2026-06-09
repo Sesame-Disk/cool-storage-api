@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -663,7 +664,7 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 		INSERT INTO libraries_by_id (library_id, org_id, owner_id, name, encrypted)
 		VALUES (?, ?, ?, ?, ?)
 	`, newLibID, targetOrgID, callerUserID, repoName, false)
-	addNewLibraryProjectionQueries(h.db.Session(), batch, targetOrgID, newLibID, callerUserID, repoName, false, resolvedStorageClass, 0, 0, now, now)
+	projectionRow := addNewLibraryProjectionQueries(h.db.Session(), batch, targetOrgID, newLibID, callerUserID, repoName, false, resolvedStorageClass, 0, 0, now, now)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
 		return
@@ -672,7 +673,9 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	// Initialize filesystem (root dir + initial commit)
 	fsHelper := NewFSHelper(h.db)
 	if err := fsHelper.InitializeLibraryFS(targetOrgID, newLibID, callerUserID, repoName); err != nil {
-		_ = rollbackNewLibrary(h.db, targetOrgID, newLibID)
+		if rollbackErr := rollbackNewLibrary(h.db, projectionRow); rollbackErr != nil {
+			log.Printf("[AddOrgGroupOwnedLibrary] rollback failed for %s/%s after fs init error: %v", targetOrgID, newLibID, rollbackErr)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize library filesystem"})
 		return
 	}
@@ -680,7 +683,9 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	// Share to group with rw permission
 	shareID := uuid.New().String()
 	if err := createLibraryShare(h.db, newLibID, shareID, callerUserID, groupID, "group", "rw", now, nil); err != nil {
-		_ = rollbackNewLibrary(h.db, targetOrgID, newLibID)
+		if rollbackErr := rollbackNewLibrary(h.db, projectionRow); rollbackErr != nil {
+			log.Printf("[AddOrgGroupOwnedLibrary] rollback failed for %s/%s after share error: %v", targetOrgID, newLibID, rollbackErr)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to share library with group"})
 		return
 	}
