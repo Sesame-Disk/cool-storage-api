@@ -673,6 +673,7 @@ func (h *AdminHandler) AdminAddGroupOwnedLibrary(c *gin.Context) {
 		INSERT INTO libraries_by_id (library_id, org_id, owner_id, name, encrypted)
 		VALUES (?, ?, ?, ?, ?)
 	`, newLibID, callerOrgID, callerUserID, repoName, false)
+	addNewLibraryProjectionQueries(h.db.Session(), batch, callerOrgID, newLibID, callerUserID, repoName, false, resolvedStorageClass, 0, 0, now, now)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
 		return

@@ -109,6 +109,30 @@ func addAdminLibraryReadModelRefreshQueries(batch *gocql.Batch, row dbpkg.AdminL
 	dbpkg.AddRefreshAdminLibraryReadModelQueries(batch, row, previous)
 }
 
+// addNewLibraryProjectionQueries enqueues the admin read-model projection writes
+// (libraries_by_org_updated / libraries_by_owner / global) for a freshly created
+// library into batch, resolving the owner's display fields. Group-library
+// creation paths must call this so org-wide library listings and projection-based
+// enforcement (e.g. active-library quota counts) see the library; otherwise the
+// canonical row exists but the projections silently omit it.
+func addNewLibraryProjectionQueries(session *gocql.Session, batch *gocql.Batch, orgID, libraryID, ownerID, name string, encrypted bool, storageClass string, sizeBytes, fileCount int64, createdAt, updatedAt time.Time) {
+	ownerEmail, ownerName := dbpkg.ResolveAdminLibraryOwnerFields(session, orgID, ownerID)
+	addAdminLibraryReadModelRefreshQueries(batch, dbpkg.AdminLibraryProjectionRow{
+		OrgID:        orgID,
+		LibraryID:    libraryID,
+		OwnerID:      ownerID,
+		OwnerEmail:   ownerEmail,
+		OwnerName:    ownerName,
+		Name:         name,
+		Encrypted:    encrypted,
+		StorageClass: storageClass,
+		SizeBytes:    sizeBytes,
+		FileCount:    fileCount,
+		CreatedAt:    createdAt,
+		UpdatedAt:    updatedAt,
+	}, nil)
+}
+
 func buildShareReadModelRow(
 	db interface{ Session() *gocql.Session },
 	libraryID, shareID, sharedBy, sharedTo, sharedToType, permission string,
@@ -842,6 +866,15 @@ func rollbackNewLibrary(db interface{ Session() *gocql.Session }, orgID, library
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyVersionTTL, orgID, libraryID)
 	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyAutoDelete, orgID, libraryID)
+	// Tear down the admin read-model projections written during creation
+	// (libraries_by_owner / libraries_by_org_updated / global). The canonical
+	// row still exists at this point, so the helper can resolve the projection
+	// keys; deleting it in the same batch keeps canonical and projections
+	// consistent and avoids leaving a phantom library in org-wide listings or
+	// projection-based enforcement after a failed FS-init rollback.
+	if err := dbpkg.AddDeleteAdminLibraryReadModelQueries(db.Session(), batch, orgID, libraryID); err != nil {
+		log.Printf("[rollbackNewLibrary] warning: could not enqueue projection cleanup for %s/%s: %v", orgID, libraryID, err)
+	}
 	batch.Query(`
 		DELETE FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, libraryID)
@@ -1223,17 +1256,32 @@ func removeFileTag(sess *gocql.Session, repoID gocql.UUID, fileTagID int) error 
 	return nil
 }
 
-// starFile adds a file to the user's starred files list.
+// starFile adds a file to the user's starred files list. The canonical row
+// (partitioned by user_id) and the starred_files_by_repo projection (partitioned
+// by repo_id, used by GC library cleanup) are written in one batch so the
+// reverse lookup stays consistent without a secondary index.
 func starFile(sess *gocql.Session, userID, repoID, path string, starredAt time.Time) error {
-	return sess.Query(`
+	batch := sess.Batch(gocql.LoggedBatch)
+	batch.Query(`
 		INSERT INTO starred_files (user_id, repo_id, path, starred_at)
 		VALUES (?, ?, ?, ?)
-	`, userID, repoID, path, starredAt).Exec()
+	`, userID, repoID, path, starredAt)
+	batch.Query(`
+		INSERT INTO starred_files_by_repo (repo_id, user_id, path, starred_at)
+		VALUES (?, ?, ?, ?)
+	`, repoID, userID, path, starredAt)
+	return batch.Exec()
 }
 
-// unstarFile removes a file from the user's starred files list.
+// unstarFile removes a file from the user's starred files list, tearing down the
+// canonical row and the starred_files_by_repo projection together.
 func unstarFile(sess *gocql.Session, userID, repoID, path string) error {
-	return sess.Query(`
+	batch := sess.Batch(gocql.LoggedBatch)
+	batch.Query(`
 		DELETE FROM starred_files WHERE user_id = ? AND repo_id = ? AND path = ?
-	`, userID, repoID, path).Exec()
+	`, userID, repoID, path)
+	batch.Query(`
+		DELETE FROM starred_files_by_repo WHERE repo_id = ? AND user_id = ? AND path = ?
+	`, repoID, userID, path)
+	return batch.Exec()
 }

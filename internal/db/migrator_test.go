@@ -113,7 +113,11 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "name              TEXT,")
 	assert.Contains(t, content, "source_api_key_hash TEXT,")
 	assert.Contains(t, content, "api_key_scope       TEXT")
-	assert.Contains(t, content, "CREATE INDEX IF NOT EXISTS starred_files_by_repo ON starred_files (repo_id);")
+	// starred_files reverse lookup is a projection table, not a secondary index.
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS starred_files_by_repo")
+	assert.NotContains(t, content, "CREATE INDEX IF NOT EXISTS starred_files_by_repo ON starred_files (repo_id);")
+	// No secondary indexes in the baseline schema (scatter-gather anti-pattern).
+	assert.NotContains(t, content, "CREATE INDEX IF NOT EXISTS")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_links_by_created")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_links_by_org_created")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_link_buckets")

@@ -1,6 +1,6 @@
 # Schema Bottleneck Audit
 
-**Updated**: 2026-05-26
+**Updated**: 2026-06-09
 
 This document is the rolling backlog of Cassandra schema shapes that look like
 operational bottlenecks (hot partitions, `ALLOW FILTERING`, full-table scans,
@@ -283,6 +283,99 @@ multi-node resurrection trade-offs of a low grace. The real lever for silencing
 the residual warnings is a lower `gc_grace_seconds` on these idempotent,
 leader-only-drained queue tables — that is the deferred operational follow-up,
 gated on re-measuring the warnings under multi-node load before changing it.
+
+---
+
+## J. `starred_files` secondary index → reverse-lookup projection
+
+**Status**: resolved in branch `feat/schema-multiregion-hotpath-hardening`
+(2026-06-09)
+
+**Tables**: `starred_files`, new `starred_files_by_repo`
+
+**Shape**: the baseline had the schema's only secondary index,
+`CREATE INDEX starred_files_by_repo ON starred_files (repo_id)`, used by exactly
+one query — GC library-deletion cleanup (`DeleteStarredFilesByLibrary`,
+`SELECT ... WHERE repo_id = ?`). Secondary indexes are node-local, so that read
+fans out to every node (scatter-gather) and degrades as the cluster grows; it is
+a recognised anti-pattern in multi-region.
+
+**Resolved**: replaced with a purpose-built projection table
+`starred_files_by_repo ((repo_id), user_id, path)` that serves the same query as
+a single-partition read. Kept in sync by dual-write on star/unstar
+(`write_helpers.go`) inside a `LoggedBatch`, torn down per-repo on library
+cascade and per-row on user cascade (`store_cassandra.go`). No secondary indexes
+remain in the baseline schema (asserted by `migrator_test.go`).
+
+---
+
+## K. Group-library creation paths skipped the admin library projections (latent bug)
+
+**Status**: resolved in branch `feat/schema-multiregion-hotpath-hardening`
+(2026-06-09)
+
+**Tables**: `libraries_by_org_updated`, `libraries_by_owner`,
+`libraries_admin_global_by_updated`
+
+**Shape**: three group-library creation paths
+(`groups.go`, `org_admin_groups.go`, `admin_extra.go`) wrote the canonical
+`libraries` row and `libraries_by_id` but **not** the admin read-model
+projections, unlike the primary create path (`libraries.go`) and the admin
+create path (`admin_libraries.go`). Group-created libraries were therefore
+silently absent from org-wide library listings and from any projection-based
+enforcement (e.g. active-library quota counts), i.e. a quota-undercount /
+missing-row bug independent of any partition-key change.
+
+**Resolved**: all three paths now call the shared
+`addNewLibraryProjectionQueries` helper (resolves owner display fields and
+enqueues the projection upserts in the same `LoggedBatch` as the canonical
+write). This also unblocks any future move of org-wide canonical `libraries`
+scans (item H) onto the projections, since the projections are now complete.
+
+---
+
+## L. (Evaluated, not pursued) `libraries` canonical PK → per-library partition
+
+**Status**: evaluated and deferred (2026-06-09)
+
+**Idea**: change `libraries` PK from `((org_id), library_id)` to
+`((org_id, library_id))` so the head-commit CAS
+(`UPDATE libraries ... IF head_commit_id = ?`) contends per-library instead of
+per-org Paxos partition, and to push org-wide reads onto projections.
+
+**Why deferred**: the deployment runs `serial_consistency = SERIAL` for global
+linearizability. Under SERIAL every head CAS already pays a global cross-DC
+Paxos round-trip, which **dominates** latency; per-org ballot contention is only
+a secondary effect that bites under concurrent commits to different libraries of
+the *same* org. The marginal win does not justify restructuring the most
+correctness-critical table (the commit-publish path) and re-pointing six
+org-wide readers. If same-org high-concurrency commit bursts ever become a
+measured problem, the lower-risk option is a dedicated `library_heads
+((org_id, library_id))` CAS table rather than changing the canonical PK. Item H
+(org-wide canonical scans / tombstones) remains the tracked follow-up.
+
+---
+
+## M. (Evaluated, not pursued) Shard the per-day admin global projections
+
+**Status**: evaluated and deferred (2026-06-09)
+
+**Tables**: `organizations_admin_by_created`, `users_admin_global_by_created`,
+`groups_admin_global_by_created`, `libraries_admin_global_by_updated` and the
+`_by_status_created` variants (all keyed by `(bucket_day)` or
+`(status, bucket_day)`).
+
+**Idea**: add a `shard` to the partition key so platform-wide creates on a given
+day do not all land on today's partition.
+
+**Why deferred**: these projections are written on org/user/group/library
+*lifecycle* events, not on a data-path workload. Even at high signup rates a
+single per-day partition stays well under Cassandra's soft limits (100 MB /
+100k rows). The hotspot only materialises during an extreme one-off (mass import
+of millions of accounts), and sharding imposes a permanent read-side
+scatter-gather + merge cost. Preferred direction if ever needed: keep the bucket
+granularity tunable and shard only when a per-day partition is measured
+approaching the soft limit (same playbook as item G).
 
 ---
 
