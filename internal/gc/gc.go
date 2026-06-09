@@ -476,7 +476,7 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 
 	queueBefore := s.loadStatInt(gcStatKeyTotalQueue)
 	if reason, ok := s.shouldRecoverMissingActiveQueueOrgs(queueBefore); ok {
-		s.recoverMissingActiveQueueOrgs(reason)
+		s.recoverMissingActiveQueueOrgs(reason, s.queueSnapshotRecalcMinInterval())
 	}
 	s.workerPasses++
 
@@ -546,7 +546,7 @@ func (s *Service) shouldRecoverMissingActiveQueueOrgs(queueBefore int) (string, 
 	return "", false
 }
 
-func (s *Service) recoverMissingActiveQueueOrgs(reason string) {
+func (s *Service) recoverMissingActiveQueueOrgs(reason string, staleSnapshotAfter time.Duration) {
 	snapshotOrgs, err := s.store.ListOrgsWithQueuedSnapshots(0)
 	if err != nil {
 		log.Printf("[GC] Failed to list queued snapshots for active-set recovery: %v", err)
@@ -570,17 +570,22 @@ func (s *Service) recoverMissingActiveQueueOrgs(reason string) {
 	for _, orgID := range activeOrgs {
 		activeSet[orgID] = struct{}{}
 	}
-	candidateSet := make(map[uuid.UUID]struct{}, len(snapshotOrgs)+len(dirtyOrgs))
+	candidateByOrg := make(map[uuid.UUID]gcSnapshotCandidate, len(snapshotOrgs)+len(dirtyOrgs))
 	for _, orgID := range snapshotOrgs {
-		candidateSet[orgID] = struct{}{}
+		candidateByOrg[orgID] = gcSnapshotCandidate{OrgID: orgID}
 	}
 	for _, dirtyOrg := range dirtyOrgs {
-		candidateSet[dirtyOrg.OrgID] = struct{}{}
+		candidate := candidateByOrg[dirtyOrg.OrgID]
+		candidate.OrgID = dirtyOrg.OrgID
+		candidate.DirtyBefore = dirtyOrg.MarkedAt
+		candidate.HasDirtyMarker = true
+		candidateByOrg[dirtyOrg.OrgID] = candidate
 	}
 
 	now := time.Now().UTC()
 	recovered := 0
-	for orgID := range candidateSet {
+	staleSnapshotsQueuedForRefresh := 0
+	for orgID, candidate := range candidateByOrg {
 		if _, ok := activeSet[orgID]; ok {
 			continue
 		}
@@ -590,6 +595,29 @@ func (s *Service) recoverMissingActiveQueueOrgs(reason string) {
 			continue
 		}
 		if oldestQueuedAt == nil {
+			if candidate.HasDirtyMarker {
+				continue
+			}
+			prevStats, err := s.store.GetOrgQueueStats(orgID)
+			if err != nil {
+				log.Printf("[GC] Failed to load org queue stats during stale snapshot recovery for org %s: %v", orgID, err)
+				continue
+			}
+			if prevStats.QueueDepth <= 0 {
+				continue
+			}
+			lastExactRefresh := prevStats.RecalculatedAt
+			if lastExactRefresh.IsZero() {
+				lastExactRefresh = prevStats.UpdatedAt
+			}
+			if !lastExactRefresh.IsZero() && staleSnapshotAfter > 0 && time.Since(lastExactRefresh) < staleSnapshotAfter {
+				continue
+			}
+			if err := s.store.MarkOrgDirty(orgID, now); err != nil {
+				log.Printf("[GC] Failed to mark org %s dirty during stale snapshot recovery: %v", orgID, err)
+				continue
+			}
+			staleSnapshotsQueuedForRefresh++
 			continue
 		}
 		if err := s.store.MarkOrgActive(orgID, now); err != nil {
@@ -604,6 +632,9 @@ func (s *Service) recoverMissingActiveQueueOrgs(reason string) {
 	if recovered > 0 {
 		metrics.GCActiveOrgRecoveriesTotal.WithLabelValues(reason).Add(float64(recovered))
 		log.Printf("[GC] Recovered %d queued org(s) into active set from GC snapshots/dirty markers (reason=%s)", recovered, reason)
+	}
+	if staleSnapshotsQueuedForRefresh > 0 {
+		log.Printf("[GC] Queued %d stale queued snapshot(s) for exact refresh after active-set recovery found no live gc_queue rows", staleSnapshotsQueuedForRefresh)
 	}
 }
 

@@ -644,6 +644,38 @@ func TestService_RunWorkerOnce_RecoversQueuedOrgsFromSnapshotWhenActiveSetIsMiss
 	}
 }
 
+func TestService_RunWorkerOnce_RefreshesStaleQueuedSnapshotWhenActiveSetIsMissingAndQueueIsEmpty(t *testing.T) {
+	store := NewMockStore()
+	store.useActiveQueueOrgsForListing = true
+	orgID := uuid.New()
+	staleAt := time.Now().UTC().Add(-2 * time.Minute)
+	store.orgQueueStats[orgID] = GCOrgStats{
+		OrgID:          orgID,
+		QueueDepth:     1,
+		UpdatedAt:      staleAt,
+		RecalculatedAt: staleAt,
+	}
+	store.gcStats[gcStatKeyTotalQueue] = "1"
+
+	svc := NewService(store, nil, config.GCConfig{Enabled: true, BatchSize: 100}, nil)
+	svc.workerPasses = 1
+	svc.runWorkerOnce(context.Background())
+
+	stats := store.orgQueueStats[orgID]
+	if stats.QueueDepth != 0 {
+		t.Fatalf("org snapshot queue_depth = %d, want 0 after stale snapshot refresh", stats.QueueDepth)
+	}
+	if stats.RecalculatedAt.Before(staleAt) || stats.RecalculatedAt.Equal(staleAt) {
+		t.Fatalf("org snapshot recalculated_at = %v, want newer than stale timestamp %v", stats.RecalculatedAt, staleAt)
+	}
+	if _, ok := store.dirtyQueueOrgs[orgID]; ok {
+		t.Fatal("expected dirty marker to be cleared after stale snapshot refresh")
+	}
+	if status := svc.Status(); status.QueueSize != 0 {
+		t.Fatalf("status.QueueSize = %d, want 0 after stale snapshot auto-recovery", status.QueueSize)
+	}
+}
+
 // TestService_Status_SnapshotAgeSentinelWhenNeverReconciled verifies the
 // reporter distinguishes "no reconcile yet" (-1) from "reconciled 0s ago" (0).
 // Without the sentinel, dashboards would show fresh data on a cold deploy.
