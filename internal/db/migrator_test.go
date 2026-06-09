@@ -178,3 +178,40 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, normalizedContent, ") WITH CLUSTERING ORDER BY (created_at ASC, repo_id ASC, fs_id ASC, owner_id ASC)\n    AND default_time_to_live = 3024000;")
 	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
 }
+
+// Migration 003 moves the GC queue/marker/DLQ tables to
+// LeveledCompactionStrategy. These five tables are the only GC tables that
+// combine a long-lived hot partition with continuous scans at the coordinates
+// where insert+delete churn accumulates tombstones; the date-bucketed discovery
+// projections are intentionally left on the default strategy. See
+// docs/SCHEMA-BOTTLENECK-AUDIT.md item I.
+func TestMigration003AppliesLCSToGCQueueTables(t *testing.T) {
+	raw, err := migrationsFS.ReadFile("migrations/003_gc_queue_lcs_compaction.cql")
+	require.NoError(t, err)
+	content := string(raw)
+
+	for _, table := range []string{
+		"gc_queue",
+		"gc_pending_items",
+		"gc_active_orgs",
+		"gc_dirty_orgs",
+		"gc_failed_items",
+	} {
+		assert.Contains(t, content, "ALTER TABLE "+table+" WITH compaction =",
+			"migration 003 must apply LCS to %s", table)
+	}
+
+	assert.Equal(t, 5, strings.Count(content, "'class': 'LeveledCompactionStrategy'"),
+		"exactly the five queue/marker/DLQ tables should switch to LCS")
+	assert.Contains(t, content, "'tombstone_threshold': '0.1'")
+	assert.Contains(t, content, "'tombstone_compaction_interval': '600'")
+
+	// The date-bucketed discovery projections must NOT be altered: their aged
+	// partitions fall out of the read window, so they do not need LCS.
+	assert.NotContains(t, content, "ALTER TABLE gc_failed_items_by_expiry")
+	assert.NotContains(t, content, "ALTER TABLE gc_block_candidates_by_day")
+	assert.NotContains(t, content, "ALTER TABLE gc_s3_orphans_by_day")
+
+	// Parser sanity: the five ALTERs split into exactly five executable statements.
+	assert.Len(t, parseCQLStatements(content), 5)
+}

@@ -226,7 +226,8 @@ more expensive partition walks in GC and quota/permission-adjacent paths.
 
 ## I. `gc_queue` / DLQ tombstone purge needs compaction tuning
 
-**Status**: resolved in the current branch (2026-06-08)
+**Status**: mitigated structurally in the current branch (2026-06-08);
+re-measurement pending
 
 **Tables**: `gc_queue`, `gc_pending_items`, `gc_active_orgs`, `gc_dirty_orgs`,
 `gc_failed_items`, `gc_queue_counter_reconciliation` is gone — but the
@@ -247,9 +248,11 @@ recompute and dequeue paths emit `tombstone_warn_threshold` warnings
 (`minInterval ≈ 60s`) reduces the recompute frequency but does not eliminate the
 scan; the dequeue scan runs every worker tick regardless.
 
-**Implemented in this branch**: `gc_queue-lcs-compaction` now bakes
-`LeveledCompactionStrategy` with proactive tombstone purge into the clean-boot
-baseline schema for the queue/marker tables:
+**Implemented in this branch**: migration
+`003_gc_queue_lcs_compaction.cql` `ALTER`s the queue/marker/DLQ tables to
+`LeveledCompactionStrategy`. The baseline schema (`001`) is left untouched and
+identical to `main`; the `ALTER` runs against the empty, freshly created tables
+during clean boot, so the strategy switch is instant and recompacts nothing:
 
 ```cql
 WITH compaction = {
@@ -259,11 +262,27 @@ WITH compaction = {
 }
 ```
 
-`gc_grace_seconds` intentionally stays at the default for now. LCS + the
-tombstone knobs do the heavy lifting without taking on the multi-node
-resurrection trade-offs of a low grace. The remaining follow-up is operational:
-re-measure the warnings before deciding whether a lower `gc_grace_seconds` on
-these idempotent, leader-only-drained queue tables is also warranted.
+What this actually buys, and what it does not:
+
+- **LCS does the load-bearing work.** These are long-lived hot partitions
+  (`gc_queue`/`gc_pending_items` keyed by `(org_id, bucket)`, `gc_active_orgs`/
+  `gc_dirty_orgs` keyed by `(bucket)`) that are re-scanned at the same
+  coordinates where completed-item tombstones accumulate. LCS reduces read
+  amplification there immediately and consolidates the tombstone with the row it
+  shadows as it chases the data down the levels.
+- **The tombstone knobs are anticipatory, not immediately load-bearing.**
+  `tombstone_threshold` only counts *droppable* tombstones — those already past
+  `gc_grace_seconds`. With `gc_grace_seconds` kept at the 10-day default, a queue
+  item that completes within seconds leaves a tombstone that is non-droppable for
+  10 days, so `0.1`/`600s` cannot purge it during that window and a hot org may
+  still emit read-path tombstone warnings. The knobs only accelerate purge once
+  the tombstone ages past grace (from up to a day down to ~10 minutes).
+
+`gc_grace_seconds` intentionally stays at the default for now to avoid the
+multi-node resurrection trade-offs of a low grace. The real lever for silencing
+the residual warnings is a lower `gc_grace_seconds` on these idempotent,
+leader-only-drained queue tables — that is the deferred operational follow-up,
+gated on re-measuring the warnings under multi-node load before changing it.
 
 ---
 
