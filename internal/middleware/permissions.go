@@ -587,15 +587,19 @@ func (m *PermissionMiddleware) IsLibraryOwner(orgID, userID, repoID string) (boo
 		return false, fmt.Errorf("database not available")
 	}
 
-	libraryState, err := readLiveLibraryStateFn(m.db.Session(), orgID, repoID)
+	var ownerIDStr string
+	err := m.db.Session().Query(`
+		SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&ownerIDStr)
+
 	if err != nil {
-		if isLibraryUnavailable(err) {
-			return false, nil
+		if isNotFound(err) {
+			return false, nil // Library doesn't exist
 		}
 		return false, err
 	}
 
-	return libraryState.OwnerID == userID, nil
+	return ownerIDStr == userID, nil
 }
 
 // GetGroupRole retrieves user's role in a group
