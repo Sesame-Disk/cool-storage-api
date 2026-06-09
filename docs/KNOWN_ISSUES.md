@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-05-27
+**Last Updated**: 2026-06-09
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -46,6 +46,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, and repeated storage prechecks no longer walk HEAD on every chunk, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
 | **Block Refcount Idempotence After Ambiguous CAS** | 🟡 Accepted hotfix debt | Upload/sync block registration now fails closed when Cassandra cannot attribute an LWT outcome, but client retries can still inflate `blocks.ref_count` because block registration has no durable idempotency key yet. See ISSUE-BLOCK-REFCOUNT-IDEMPOTENCE-01 below. |
 | **`blocks` Hot Partition by `org_id`** | ✅ Fixed (2026-05-26) | `blocks`, `gc_block_candidates`, `gc_s3_orphans`, and the block-id mapping tables now use per-block partitioning so no single org concentrates LWT traffic into one Cassandra partition. The GC scan and S3 orphan recovery paths walk per-day discovery projections instead of partition-scanning by org. See ISSUE-BLOCKS-HOT-PARTITION-01 below. |
+| **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -2928,6 +2929,60 @@ There is still ordinary async-cleanup risk if the enqueue or GC worker path is u
 - OnlyOffice rollback path: `internal/api/v2/onlyoffice.go` calls `DecrementBlockRefCountsOnce` and `enqueueZeroRefBlocks` after metadata publish failure.
 - GC worker block deletion: `internal/gc/worker.go` calls `ListBlockMappingsByInternalID` for the deleted internal block and then `DeleteBlockMapping` for each external mapping.
 - Cassandra store cleanup: `DeleteBlockMapping` deletes both `block_id_mappings` and `block_id_mappings_by_internal`.
+
+---
+
+### ISSUE-LIB-DELETED-FENCE-01: Soft-deleted libraries still accept star mutations
+
+**Status**: 🟡 Pending
+**Severity**: Medium-High - lifecycle correctness gap with data-drift risk during GC cascade
+**Affected**: `POST /api/v2.1/starred-items/`, `POST /api2/starredfiles`, and any repo-scoped mutating path that only checks canonical existence
+
+#### Problem
+
+Library soft-delete is a two-phase lifecycle:
+
+1. The API marks `libraries.deleted_at` and inserts a `deleted_libraries` marker.
+2. Later, GC acquires the hard-delete lock, cleans auxiliary tables, and permanently removes the library.
+
+That fencing is respected by the delete handlers themselves, but `StarFile` still
+accepts the library as long as the canonical row exists:
+
+- `softDeleteLibrary` sets `deleted_at` without removing the live row yet.
+- `StarFile` queries `SELECT name, encrypted FROM libraries ...` and does not reject `deleted_at != null`.
+- `starFile` then dual-writes `starred_files` and `starred_files_by_repo`.
+
+So a client that still knows `repo_id` can create new starred-file rows after a
+library has already been soft-deleted.
+
+#### Why It Matters
+
+This is not just a UX oddity. It reopens a cleanup race during library cascade:
+
+- `DeleteStarredFilesByLibrary` scans `starred_files_by_repo`
+- deletes canonical `starred_files` rows
+- then deletes the repo projection partition
+
+If a new star lands after the scan but before the cascade finishes, GC can miss
+that row and still remove the reverse-lookup partition, leaving a stranded
+canonical `starred_files` row with no `starred_files_by_repo` entry.
+
+The recent starred-files hardening fixed partial-failure behavior inside GC, but
+it cannot prevent post-scan writes from handlers that still treat soft-deleted
+libraries as writable.
+
+#### Suggested Fix
+
+- Add a shared "library is live" guard for repo-scoped mutating handlers.
+- Start by fencing `StarFile` and `UnstarFile` on `deleted_at`.
+- Prefer a reusable helper so the same rule can be applied consistently to other
+  repo-scoped write paths over time.
+
+#### Evidence
+
+- `internal/api/v2/write_helpers.go`: `softDeleteLibrary` sets `deleted_at`
+- `internal/api/v2/starred.go`: `StarFile` checks existence but not lifecycle state
+- `internal/gc/store_cassandra.go`: `DeleteStarredFilesByLibrary` cleans by scan-then-delete
 
 ---
 

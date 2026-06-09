@@ -379,6 +379,35 @@ approaching the soft limit (same playbook as item G).
 
 ---
 
+## N. Soft-deleted libraries still accept star/unstar mutations
+
+**Status**: pending follow-up (2026-06-09)
+
+**Tables**: `libraries`, `deleted_libraries`, `starred_files`,
+`starred_files_by_repo`
+
+**Shape**: library soft-delete keeps the canonical `libraries` row alive with
+`deleted_at != null` until GC permanently deletes it. The delete handlers
+correctly fence on `deleted_at`, but `StarFile` still only checks that the
+library row exists and then dual-writes `starred_files` /
+`starred_files_by_repo`. That leaves a real lifecycle window where a client that
+still knows the `repo_id` can star a soft-deleted library after the GC cleanup
+scan starts.
+
+**Why it matters**: the recent starred-files hardening made GC fail safe on
+partial cleanup failure, but it does not close a concurrent post-scan write. A
+new star inserted after `DeleteStarredFilesByLibrary` scans
+`starred_files_by_repo` can survive long enough to strand a canonical
+`starred_files` row without its reverse-lookup projection once the library
+cascade finishes. More broadly, repo-scoped mutating endpoints should treat
+soft-deleted libraries as non-writable.
+
+**Follow-up**: add a shared "library is live" guard for repo-scoped mutating
+handlers, starting with `StarFile` / `UnstarFile`, so requests fail closed when
+`deleted_at` is set instead of relying on the later GC window.
+
+---
+
 ## Closing The Loop
 
 When working any of the items above, add the associated `ISSUE-...-01` ID to
