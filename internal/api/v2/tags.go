@@ -667,7 +667,9 @@ func MoveFileTagsByPath(database *db.DB, repoID, oldPath, newPath string) {
 
 		// Note: counters don't change — same tag, same count, just different path
 	}
-	iter.Close()
+	if err := iter.Close(); err != nil {
+		log.Printf("[MoveFileTagsByPath] failed to read tags for repo %s old_path %q: %v", repoID, oldPath, err)
+	}
 	log.Printf("[MoveFileTagsByPath] Moved tags from %q to %q in repo %s", oldPath, newPath, repoID)
 }
 
@@ -699,7 +701,9 @@ func MoveFileTagsByPrefix(database *db.DB, repoID, oldPrefix, newPrefix string) 
 			pathsToMove = append(pathsToMove, fp)
 		}
 	}
-	iter.Close()
+	if err := iter.Close(); err != nil {
+		log.Printf("[MoveFileTagsByPrefix] failed to scan file_tags for repo %s prefix %q: %v", repoID, oldPrefix, err)
+	}
 
 	// Move each child path
 	for _, oldChildPath := range pathsToMove {

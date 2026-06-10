@@ -387,7 +387,7 @@ approaching the soft limit (same playbook as item G).
 
 ## N. Soft-deleted libraries still accept star/unstar mutations
 
-**Status**: pending follow-up (2026-06-09)
+**Status**: resolved in branch `feat/library-live-write-fencing` (PR #73, 2026-06-09)
 
 **Tables**: `libraries`, `deleted_libraries`, `starred_files`,
 `starred_files_by_repo`
@@ -408,9 +408,53 @@ new star inserted after `DeleteStarredFilesByLibrary` scans
 cascade finishes. More broadly, repo-scoped mutating endpoints should treat
 soft-deleted libraries as non-writable.
 
-**Follow-up**: add a shared "library is live" guard for repo-scoped mutating
-handlers, starting with `StarFile` / `UnstarFile`, so requests fail closed when
-`deleted_at` is set instead of relying on the later GC window.
+**Resolved**: a shared "library is live" guard (`ReadLiveLibraryState` /
+`ErrLibraryDeleted`) now fences repo-scoped *create/add* mutations (StarFile,
+MonitorRepo, share/upload link create+update, file-share create) and the
+permission resolvers, returning 404/PermissionNone for soft-deleted libraries.
+Pure *removal* paths (UnstarFile, UnmonitorRepo) intentionally stay unfenced so
+clients can still clean up entries pointing at a soft-deleted library.
+
+---
+
+## O. `MoveFileTagsByPath` / `MoveFileTagsByPrefix` are best-effort (no error propagation)
+
+**Status**: open, low-priority (introduced 2026-06-10)
+
+**Tables**: `file_tags`, `file_tags_by_id`, `file_tags_by_tag`
+
+**Shape**: both functions are `void`. On a per-tag batch failure they log and
+continue; the file/directory rename that triggered them has already committed in
+the FS, so a failed tag move leaves the tag stranded at the old path. Each tag's
+move is a single atomic `LoggedBatch`, so the inconsistency is bounded to "some
+tags not moved", never a half-moved tag. Stale old-path tags are filtered by
+`ListTaggedFiles` (HEAD existence check) and cleaned by the `deleteRepoTag`
+canonical fallback / library cascade.
+
+**Direction**: have `MoveFileTagsByPath` return `error`. The caller must NOT fail
+the rename (the FS mutation is already durable) — instead log at request level
+and/or enqueue a reconciliation so the move is retried out of band. This is an
+observability/reconcile hook, not a request-failure path.
+
+---
+
+## P. `MoveFileTagsByPrefix` scans the whole `file_tags` repo partition
+
+**Status**: open, low-priority (introduced 2026-06-10)
+
+**Tables**: `file_tags`
+
+**Shape**: directory rename lists every path in the repo's `file_tags`
+partition (`SELECT file_path FROM file_tags WHERE repo_id = ?`) and filters by
+prefix in memory. Cost scales with the repo's total tagged files, not the moved
+subtree. It is a single-partition read on an infrequent operation (directory
+rename), not a hot path.
+
+**Direction**: no new table needed — `file_tags` is clustered by
+`file_path` first (`PRIMARY KEY ((repo_id), file_path, tag_id)`), so a clustering
+range slice (`WHERE repo_id = ? AND file_path >= ? AND file_path < ?`, upper
+bound = prefix + a high sentinel) reads only the subtree. Apply when a repo with
+very many tagged files makes directory renames measurably slow.
 
 ---
 
