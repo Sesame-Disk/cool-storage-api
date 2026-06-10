@@ -22,8 +22,6 @@ func NewStarredHandler(database *db.DB) *StarredHandler {
 
 // StarredFile represents a starred file in API response format
 // Format matches Seafile's /api/v2.1/starred-items/ response
-var unstarFileFn = unstarFile
-
 type StarredFile struct {
 	RepoID           string `json:"repo_id"`
 	RepoName         string `json:"repo_name"`
@@ -37,6 +35,8 @@ type StarredFile struct {
 	UserName         string `json:"user_name"`
 	UserContactEmail string `json:"user_contact_email"`
 }
+
+var unstarFileFn = unstarFile
 
 // StarredItemsResponse wraps the starred items list
 type StarredItemsResponse struct {
