@@ -717,6 +717,11 @@ func MoveFileTagsByPrefix(database *db.DB, repoID, oldPrefix, newPrefix string) 
 	}
 }
 
+// fileTagsByTagCleanupChunkSize bounds how many per-tag file_tags_by_tag
+// partition deletes are grouped into one unlogged batch during library teardown,
+// keeping batches well under Cassandra's size/partition warning thresholds.
+const fileTagsByTagCleanupChunkSize = 50
+
 var collectLibraryTagIDsForCleanupFn = collectLibraryTagIDsForCleanup
 
 func collectLibraryTagIDsForCleanup(database *db.DB, repoUUID gocql.UUID) ([]int, error) {
@@ -768,6 +773,29 @@ func CleanupAllLibraryTags(database *db.DB, repoID string) error {
 		return fmt.Errorf("failed to collect tag ids for library %s cleanup: %w", repoID, err)
 	}
 
+	// file_tags_by_tag is partitioned per (repo_id, tag_id), so wiping it means one
+	// delete per tag. Do these in chunked unlogged batches FIRST, before the
+	// repo-scoped deletes drop repo_tags/file_tags (the tag-id source): that way a
+	// mid-cleanup failure can't strand projection shards — a retry re-derives the
+	// same tag ids and the partition deletes are idempotent. A single logged batch
+	// with one delete per tag risks "batch too large" on libraries with many tags.
+	for start := 0; start < len(tagIDs); start += fileTagsByTagCleanupChunkSize {
+		end := start + fileTagsByTagCleanupChunkSize
+		if end > len(tagIDs) {
+			end = len(tagIDs)
+		}
+		projBatch := database.Session().Batch(gocql.UnloggedBatch)
+		for _, id := range tagIDs[start:end] {
+			projBatch.Query(`DELETE FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ?`, repoUUID, id)
+		}
+		if err := projBatch.Exec(); err != nil {
+			return fmt.Errorf("failed to delete file_tags_by_tag partitions for library %s: %w", repoID, err)
+		}
+	}
+
+	// Repo-scoped partition deletes are a small fixed set; keep them in one logged
+	// batch and run them last so the tag-id source survives a projection-delete
+	// failure above.
 	batch := database.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM file_tags WHERE repo_id = ?`, repoUUID)
 	batch.Query(`DELETE FROM file_tags_by_id WHERE repo_id = ?`, repoUUID)
@@ -775,9 +803,6 @@ func CleanupAllLibraryTags(database *db.DB, repoID string) error {
 	batch.Query(`DELETE FROM repo_tag_file_counts WHERE repo_id = ?`, repoUUID)
 	batch.Query(`DELETE FROM repo_tag_counters WHERE repo_id = ?`, repoUUID)
 	batch.Query(`DELETE FROM file_tag_counters WHERE repo_id = ?`, repoUUID)
-	for _, id := range tagIDs {
-		batch.Query(`DELETE FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ?`, repoUUID, id)
-	}
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("failed to delete tag data for library %s: %w", repoID, err)
 	}

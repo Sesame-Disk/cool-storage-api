@@ -1184,7 +1184,6 @@ type fileTagDeleteEntry struct {
 
 func collectFileTagDeleteEntries(sess *gocql.Session, repoID gocql.UUID, tagID int) ([]fileTagDeleteEntry, error) {
 	entriesByPath := make(map[string]fileTagDeleteEntry)
-	projectedPaths := make(map[string]struct{})
 
 	iter := sess.Query(`
 		SELECT file_path, file_tag_id FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ?
@@ -1194,14 +1193,28 @@ func collectFileTagDeleteEntries(sess *gocql.Session, repoID gocql.UUID, tagID i
 	var fileTagID int
 	for iter.Scan(&filePath, &fileTagID) {
 		entriesByPath[filePath] = fileTagDeleteEntry{filePath: filePath, fileTagID: fileTagID}
-		projectedPaths[filePath] = struct{}{}
 	}
 	if err := iter.Close(); err != nil {
 		return nil, fmt.Errorf("failed to read file_tags_by_tag projection for repo %s tag %d: %w", repoID.String(), tagID, err)
 	}
 
-	// Destructive/admin path safety net: scan the repo's canonical rows so tag
-	// deletion still cleans up if the reverse-lookup projection drifted.
+	// Fast path: if the maintained per-tag file counter agrees with the number of
+	// projection rows, the reverse-lookup is complete and we can avoid the
+	// full-partition canonical scan — keeping DeleteRepoTag O(files-for-tag), the
+	// whole point of the file_tags_by_tag projection. Only fall back to the
+	// canonical scan when the counter is missing, unreadable, or disagrees (i.e.
+	// the projection may have drifted), since dropping a tag must never strand
+	// canonical rows.
+	var fileCount int64
+	counterErr := sess.Query(`
+		SELECT file_count FROM repo_tag_file_counts WHERE repo_id = ? AND tag_id = ?
+	`, repoID, tagID).Scan(&fileCount)
+	if counterErr == nil && fileCount == int64(len(entriesByPath)) {
+		return fileTagDeleteEntriesSlice(entriesByPath), nil
+	}
+
+	// Safety net: scan the repo's canonical rows so tag deletion still cleans up
+	// if the reverse-lookup projection drifted.
 	canonicalIter := sess.Query(`
 		SELECT file_path, tag_id, file_tag_id FROM file_tags WHERE repo_id = ?
 	`, repoID).Iter()
@@ -1213,9 +1226,7 @@ func collectFileTagDeleteEntries(sess *gocql.Session, repoID gocql.UUID, tagID i
 			continue
 		}
 		if _, seen := entriesByPath[filePath]; !seen {
-			if _, projected := projectedPaths[filePath]; !projected {
-				driftCount++
-			}
+			driftCount++
 		}
 		entriesByPath[filePath] = fileTagDeleteEntry{filePath: filePath, fileTagID: fileTagID}
 	}
@@ -1228,11 +1239,15 @@ func collectFileTagDeleteEntries(sess *gocql.Session, repoID gocql.UUID, tagID i
 			driftCount, repoID.String(), tagID)
 	}
 
+	return fileTagDeleteEntriesSlice(entriesByPath), nil
+}
+
+func fileTagDeleteEntriesSlice(entriesByPath map[string]fileTagDeleteEntry) []fileTagDeleteEntry {
 	entries := make([]fileTagDeleteEntry, 0, len(entriesByPath))
 	for _, entry := range entriesByPath {
 		entries = append(entries, entry)
 	}
-	return entries, nil
+	return entries
 }
 
 // deleteRepoTag deletes a repository tag and all its file_tags associations, cleaning counters.
