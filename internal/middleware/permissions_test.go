@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -258,6 +260,31 @@ func TestHasLibraryAccess_Owner(t *testing.T) {
 	}
 	if pm.hasRequiredLibraryPermission(PermissionNone, PermissionR) {
 		t.Error("None permission should not satisfy R requirement")
+	}
+}
+
+func TestGetLibraryPermissionWithFlags_DeletedLibraryReturnsNone(t *testing.T) {
+	original := readLiveLibraryStateFn
+	readLiveLibraryStateFn = func(_ *gocql.Session, _, _ string) (dbpkg.LibraryState, error) {
+		return dbpkg.LibraryState{}, dbpkg.ErrLibraryDeleted
+	}
+	defer func() {
+		readLiveLibraryStateFn = original
+	}()
+
+	pm := NewPermissionMiddleware(&dbpkg.DB{})
+	perm, flags, err := pm.GetLibraryPermissionWithFlags("org-1", "user-1", "repo-1")
+	if err != nil {
+		t.Fatalf("GetLibraryPermissionWithFlags() error = %v", err)
+	}
+	if perm != PermissionNone {
+		t.Fatalf("permission = %q, want %q", perm, PermissionNone)
+	}
+	if flags == nil {
+		t.Fatal("flags should not be nil")
+	}
+	if flags.Upload || flags.Download || flags.Create || flags.Modify || flags.Copy || flags.Delete || flags.Preview || flags.DownloadExternalLink {
+		t.Fatal("deleted libraries should not expose any permission flags")
 	}
 }
 
@@ -619,7 +646,15 @@ func TestRequireLibraryPermission_MissingRepoID(t *testing.T) {
 }
 
 func TestRequireLibraryPermission_RepoApiToken_Matching(t *testing.T) {
-	pm := NewPermissionMiddleware(nil)
+	original := readLiveLibraryStateFn
+	readLiveLibraryStateFn = func(_ *gocql.Session, _, _ string) (dbpkg.LibraryState, error) {
+		return dbpkg.LibraryState{OrgID: "org-1", LibraryID: "test-repo"}, nil
+	}
+	defer func() {
+		readLiveLibraryStateFn = original
+	}()
+
+	pm := NewPermissionMiddleware(&dbpkg.DB{})
 	mw := pm.RequireLibraryPermission("repo_id", PermissionR)
 
 	r := gin.New()
@@ -644,7 +679,15 @@ func TestRequireLibraryPermission_RepoApiToken_Matching(t *testing.T) {
 }
 
 func TestRequireLibraryPermission_RepoApiToken_WrongRepo(t *testing.T) {
-	pm := NewPermissionMiddleware(nil)
+	original := readLiveLibraryStateFn
+	readLiveLibraryStateFn = func(_ *gocql.Session, _, _ string) (dbpkg.LibraryState, error) {
+		return dbpkg.LibraryState{OrgID: "org-1", LibraryID: "test-repo"}, nil
+	}
+	defer func() {
+		readLiveLibraryStateFn = original
+	}()
+
+	pm := NewPermissionMiddleware(&dbpkg.DB{})
 	mw := pm.RequireLibraryPermission("repo_id", PermissionR)
 
 	r := gin.New()
@@ -669,7 +712,15 @@ func TestRequireLibraryPermission_RepoApiToken_WrongRepo(t *testing.T) {
 }
 
 func TestRequireLibraryPermission_RepoApiToken_InsufficientPerm(t *testing.T) {
-	pm := NewPermissionMiddleware(nil)
+	original := readLiveLibraryStateFn
+	readLiveLibraryStateFn = func(_ *gocql.Session, _, _ string) (dbpkg.LibraryState, error) {
+		return dbpkg.LibraryState{OrgID: "org-1", LibraryID: "test-repo"}, nil
+	}
+	defer func() {
+		readLiveLibraryStateFn = original
+	}()
+
+	pm := NewPermissionMiddleware(&dbpkg.DB{})
 	mw := pm.RequireLibraryPermission("repo_id", PermissionRW)
 
 	r := gin.New()
@@ -743,7 +794,15 @@ func TestRequireGroupRole_MissingGroupID(t *testing.T) {
 // --- HasLibraryAccessCtx tests (repo API token path) ---
 
 func TestHasLibraryAccessCtx_RepoApiToken_Matching(t *testing.T) {
-	pm := NewPermissionMiddleware(nil)
+	original := readLiveLibraryStateFn
+	readLiveLibraryStateFn = func(_ *gocql.Session, _, _ string) (dbpkg.LibraryState, error) {
+		return dbpkg.LibraryState{OrgID: "org-1", LibraryID: "repo-1"}, nil
+	}
+	defer func() {
+		readLiveLibraryStateFn = original
+	}()
+
+	pm := NewPermissionMiddleware(&dbpkg.DB{})
 
 	r := gin.New()
 	var hasAccess bool
@@ -770,7 +829,15 @@ func TestHasLibraryAccessCtx_RepoApiToken_Matching(t *testing.T) {
 }
 
 func TestHasLibraryAccessCtx_RepoApiToken_WrongRepo(t *testing.T) {
-	pm := NewPermissionMiddleware(nil)
+	original := readLiveLibraryStateFn
+	readLiveLibraryStateFn = func(_ *gocql.Session, _, _ string) (dbpkg.LibraryState, error) {
+		return dbpkg.LibraryState{OrgID: "org-1", LibraryID: "repo-2"}, nil
+	}
+	defer func() {
+		readLiveLibraryStateFn = original
+	}()
+
+	pm := NewPermissionMiddleware(&dbpkg.DB{})
 
 	r := gin.New()
 	var hasAccess bool
@@ -793,6 +860,41 @@ func TestHasLibraryAccessCtx_RepoApiToken_WrongRepo(t *testing.T) {
 
 	if hasAccess {
 		t.Error("expected access to be denied for wrong repo")
+	}
+}
+
+func TestHasLibraryAccessCtx_RepoApiToken_DeletedLibraryDenied(t *testing.T) {
+	original := readLiveLibraryStateFn
+	readLiveLibraryStateFn = func(_ *gocql.Session, _, _ string) (dbpkg.LibraryState, error) {
+		return dbpkg.LibraryState{}, dbpkg.ErrLibraryDeleted
+	}
+	defer func() {
+		readLiveLibraryStateFn = original
+	}()
+
+	pm := NewPermissionMiddleware(&dbpkg.DB{})
+
+	r := gin.New()
+	var hasAccess bool
+	r.GET("/test", func(c *gin.Context) {
+		c.Set("repo_api_token", true)
+		c.Set("repo_api_token_repo_id", "repo-1")
+		c.Set("repo_api_token_permission", "rw")
+
+		result, err := pm.HasLibraryAccessCtx(c, "org-1", "user-1", "repo-1", PermissionRW)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		hasAccess = result
+		c.Status(200)
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/test", nil)
+	r.ServeHTTP(w, req)
+
+	if hasAccess {
+		t.Error("expected deleted library repo token access to be denied")
 	}
 }
 

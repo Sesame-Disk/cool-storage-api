@@ -122,6 +122,11 @@ func (h *ShareHandler) CreateShareLink(c *gin.Context) {
 	}
 	userUUID, _ := uuid.Parse(userID)
 
+	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, req.RepoID); err != nil {
+		writeLiveLibraryStateError(c, err)
+		return
+	}
+
 	// Normalize permission to JSON
 	permissionJSON := normalizePermissionInput(req.Permission)
 

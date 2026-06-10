@@ -36,6 +36,8 @@ type StarredFile struct {
 	UserContactEmail string `json:"user_contact_email"`
 }
 
+var unstarFileFn = unstarFile
+
 // StarredItemsResponse wraps the starred items list
 type StarredItemsResponse struct {
 	StarredItemList []StarredFile `json:"starred_item_list"`
@@ -97,14 +99,9 @@ func (h *StarredHandler) ListStarredFiles(c *gin.Context) {
 	var starredAt time.Time
 
 	for iter.Scan(&repoID, &filePath, &starredAt) {
-		// Get library info
-		var libName string
-		var encrypted bool
-		err := h.db.Session().Query(`
-			SELECT name, encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-		`, orgID, repoID).Scan(&libName, &encrypted)
+		libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID)
 		if err != nil {
-			// Library may have been deleted, skip
+			// Library may have been deleted or become unavailable, skip it.
 			continue
 		}
 
@@ -140,8 +137,8 @@ func (h *StarredHandler) ListStarredFiles(c *gin.Context) {
 
 		starredFiles = append(starredFiles, StarredFile{
 			RepoID:           repoID,
-			RepoName:         libName,
-			RepoEncrypted:    encrypted,
+			RepoName:         libraryState.Name,
+			RepoEncrypted:    libraryState.Encrypted,
 			IsDir:            isDir,
 			Path:             filePath,
 			ObjName:          fileName,
@@ -212,14 +209,9 @@ func (h *StarredHandler) StarFile(c *gin.Context) {
 		filePath = "/" + filePath
 	}
 
-	// Get library info
-	var libName string
-	var encrypted bool
-	err := h.db.Session().Query(`
-		SELECT name, encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, req.RepoID).Scan(&libName, &encrypted)
+	libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, req.RepoID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 
@@ -248,7 +240,7 @@ func (h *StarredHandler) StarFile(c *gin.Context) {
 
 	// For root directory, use library name
 	if filePath == "/" {
-		fileName = libName
+		fileName = libraryState.Name
 		isDir = true
 	}
 
@@ -261,8 +253,8 @@ func (h *StarredHandler) StarFile(c *gin.Context) {
 	// Return the starred item (Seafile format)
 	c.JSON(http.StatusOK, StarredFile{
 		RepoID:           req.RepoID,
-		RepoName:         libName,
-		RepoEncrypted:    encrypted,
+		RepoName:         libraryState.Name,
+		RepoEncrypted:    libraryState.Encrypted,
 		IsDir:            isDir,
 		Path:             filePath,
 		ObjName:          fileName,
@@ -308,7 +300,7 @@ func (h *StarredHandler) UnstarFile(c *gin.Context) {
 	}
 
 	// Delete starred file
-	err := unstarFile(h.db.Session(), userID, repoID, filePath)
+	err := unstarFileFn(h.db.Session(), userID, repoID, filePath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to unstar file"})
 		return

@@ -83,6 +83,7 @@ TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
 declare -a FAILED_TEST_NAMES
+CLEANUP_DONE=0
 
 # =============================================================================
 # Helpers
@@ -150,6 +151,14 @@ run_test_not_contains() {
         FAILED_TESTS=$((FAILED_TESTS + 1))
         FAILED_TEST_NAMES+=("$test_name")
     fi
+}
+
+record_cleanup_failure() {
+    local message="$1"
+    log_fail "$message"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    FAILED_TESTS=$((FAILED_TESTS + 1))
+    FAILED_TEST_NAMES+=("$message")
 }
 
 # Returns HTTP status code only
@@ -383,16 +392,22 @@ async_batch_move_with_policy() {
 # Delete a library
 delete_library() {
     local repo_id="$1"
-    local attempt
+    local attempt delete_status="" status=""
     for attempt in 1 2 3; do
-        api_status "DELETE" "/api/v2.1/repos/${repo_id}/" "$ADMIN_TOKEN" "" > /dev/null || true
-        local status
-        status=$(api_status "GET" "/api/v2.1/repos/${repo_id}/" "$ADMIN_TOKEN" "")
-        if [ "$status" = "404" ]; then
+        delete_status=$(api_status "DELETE" "/api/v2.1/repos/${repo_id}/" "$ADMIN_TOKEN" "" || true)
+        status=$(api_status "GET" "/api/v2.1/repos/${repo_id}/" "$ADMIN_TOKEN" "" || true)
+        if [ "$delete_status" = "404" ] || [ "$status" = "404" ]; then
+            return 0
+        fi
+        if [ "$delete_status" = "200" ] && [ "$status" = "403" ]; then
+            # Deleted libraries fail closed on the permission-gated GET endpoint.
+            # A successful owner delete followed by 403 means the library is no
+            # longer accessible, which is the expected post-soft-delete state.
             return 0
         fi
         sleep 1
     done
+    log_info "Cleanup delete status for ${repo_id}: DELETE=${delete_status:-unknown} GET=${status:-unknown}"
     return 1
 }
 
@@ -1281,12 +1296,17 @@ test_copy_nested_to_root_conflict() {
 # =============================================================================
 
 cleanup() {
+    if [ "${CLEANUP_DONE:-0}" = "1" ]; then
+        return 0
+    fi
+    CLEANUP_DONE=1
+
     log_section "Cleanup"
     if [ -n "$REPO_ID" ]; then
         if delete_library "$REPO_ID"; then
             log_info "Deleted test library: $REPO_ID"
         else
-            log_fail "Failed to delete test library: $REPO_ID"
+            record_cleanup_failure "Failed to delete test library: $REPO_ID"
         fi
         REPO_ID=""
     fi
@@ -1294,10 +1314,12 @@ cleanup() {
         if delete_library "$REPO_ID2"; then
             log_info "Deleted second test library: $REPO_ID2"
         else
-            log_fail "Failed to delete second test library: $REPO_ID2"
+            record_cleanup_failure "Failed to delete second test library: $REPO_ID2"
         fi
         REPO_ID2=""
     fi
+
+    return 0
 }
 
 trap cleanup EXIT
@@ -1400,6 +1422,8 @@ main() {
         log_info "Quick mode still performs cleanup on exit"
     fi
 
+    cleanup
+    trap - EXIT
     print_summary
 
     [ $FAILED_TESTS -eq 0 ]
