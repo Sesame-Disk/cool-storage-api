@@ -2536,9 +2536,16 @@ func (s *CassandraStore) ListFileTagsByLibrary(libraryID uuid.UUID) ([]FileTagIn
 }
 
 func (s *CassandraStore) DeleteFileTag(libraryID uuid.UUID, filePath string, tagID int) error {
-	return s.db.Session().Query(`
+	// Tear down the canonical row and the file_tags_by_tag reverse-lookup
+	// projection together so library-cascade cleanup leaves no orphan rows.
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?
-	`, libraryID.String(), filePath, tagID).Exec()
+	`, libraryID.String(), filePath, tagID)
+	batch.Query(`
+		DELETE FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ? AND file_path = ?
+	`, libraryID.String(), tagID, filePath)
+	return batch.Exec()
 }
 
 func (s *CassandraStore) DeleteFileTagByID(libraryID uuid.UUID, fileTagID int) error {

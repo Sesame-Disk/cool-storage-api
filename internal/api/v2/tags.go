@@ -2,8 +2,10 @@ package v2
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -120,6 +122,15 @@ type CreateRepoTagRequest struct {
 	Color string `json:"color" form:"color"`
 }
 
+func (h *TagHandler) ensureLiveLibraryByID(c *gin.Context, repoID string) bool {
+	if _, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoID); err != nil {
+		writeLiveLibraryStateError(c, err)
+		return false
+	}
+
+	return true
+}
+
 // CreateRepoTag creates a new tag for a repository
 // POST /api/v2.1/repos/:repo_id/repo-tags/
 func (h *TagHandler) CreateRepoTag(c *gin.Context) {
@@ -145,6 +156,9 @@ func (h *TagHandler) CreateRepoTag(c *gin.Context) {
 		repoUUID, err := gocql.ParseUUID(repoID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+			return
+		}
+		if !h.ensureLiveLibraryByID(c, repoUUID.String()) {
 			return
 		}
 
@@ -189,6 +203,9 @@ func (h *TagHandler) UpdateRepoTag(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 			return
 		}
+		if !h.ensureLiveLibraryByID(c, repoUUID.String()) {
+			return
+		}
 
 		err = updateRepoTag(h.db.Session(), repoUUID, tagID, req.Name, req.Color)
 
@@ -224,6 +241,9 @@ func (h *TagHandler) DeleteRepoTag(c *gin.Context) {
 		repoUUID, err := gocql.ParseUUID(repoID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+			return
+		}
+		if !h.ensureLiveLibraryByID(c, repoUUID.String()) {
 			return
 		}
 
@@ -379,6 +399,9 @@ func (h *TagHandler) AddFileTag(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 			return
 		}
+		if !h.ensureLiveLibraryByID(c, repoUUID.String()) {
+			return
+		}
 
 		// Get tag info
 		err = h.db.Session().Query(`
@@ -435,6 +458,9 @@ func (h *TagHandler) RemoveFileTag(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 			return
 		}
+		if !h.ensureLiveLibraryByID(c, repoUUID.String()) {
+			return
+		}
 
 		if err := removeFileTag(h.db.Session(), repoUUID, fileTagID); err != nil {
 			if errors.Is(err, errFileTagNotFound) {
@@ -484,12 +510,11 @@ func (h *TagHandler) ListTaggedFiles(c *gin.Context) {
 		// Create FSHelper to verify file existence in current HEAD commit tree
 		fsHelper := NewFSHelper(h.db)
 
-		// Query file_tags table to find all files with this tag
-		// Note: Need to use ALLOW FILTERING since tag_id is not part of partition key
+		// List all files with this tag via the reverse-lookup projection
+		// (single-partition read; replaces a file_tags ALLOW FILTERING scan).
 		iter := h.db.Session().Query(`
-			SELECT file_path, file_tag_id FROM file_tags
+			SELECT file_path, file_tag_id FROM file_tags_by_tag
 			WHERE repo_id = ? AND tag_id = ?
-			ALLOW FILTERING
 		`, repoUUID, tagID).Iter()
 
 		var filePath string
@@ -567,6 +592,7 @@ func CleanupFileTagsByPath(database *db.DB, repoID, filePath string) {
 			repoUUID, filePath, tagID)
 		batch.Query(`DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?`,
 			repoUUID, fileTagID)
+		addFileTagsByTagDeleteQuery(batch, repoUUID, filePath, tagID)
 		if err := batch.Exec(); err != nil {
 			log.Printf("[CleanupFileTagsByPath] failed to delete file tags for repo %s path %q tag %d: %v", repoID, filePath, tagID, err)
 			continue
@@ -645,37 +671,29 @@ func MoveFileTagsByPath(database *db.DB, repoID, oldPath, newPath string) {
 	var tagID, fileTagID int
 	var createdAt time.Time
 	for iter.Scan(&tagID, &fileTagID, &createdAt) {
-		// Insert with new path
-		if err := database.Session().Query(`
+		batch := database.Session().Batch(gocql.LoggedBatch)
+		batch.Query(`
 			INSERT INTO file_tags (repo_id, file_path, tag_id, file_tag_id, created_at)
 			VALUES (?, ?, ?, ?, ?)
-		`, repoUUID, newPath, tagID, fileTagID, createdAt).Exec(); err != nil {
-			log.Printf("[MoveFileTagsByPath] failed to insert file_tags for repo %s old_path %q new_path %q tag %d: %v", repoID, oldPath, newPath, tagID, err)
-			continue
-		}
-
-		// Update lookup table
-		if err := database.Session().Query(`
+		`, repoUUID, newPath, tagID, fileTagID, createdAt)
+		batch.Query(`
 			INSERT INTO file_tags_by_id (repo_id, file_tag_id, file_path, tag_id, created_at)
 			VALUES (?, ?, ?, ?, ?)
-		`, repoUUID, fileTagID, newPath, tagID, createdAt).Exec(); err != nil {
-			log.Printf("[MoveFileTagsByPath] failed to insert file_tags_by_id for repo %s old_path %q new_path %q tag %d: %v", repoID, oldPath, newPath, tagID, err)
-			continue
-		}
-
-		// Delete old path row. file_tags_by_id is keyed by file_tag_id, so the
-		// INSERT above updates that lookup in place; deleting it here would erase
-		// the moved tag's remove-by-id path.
-		batch := database.Session().Batch(gocql.LoggedBatch)
+		`, repoUUID, fileTagID, newPath, tagID, createdAt)
+		addFileTagsByTagInsertQuery(batch, repoUUID, newPath, tagID, fileTagID, createdAt)
 		batch.Query(`DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?`,
 			repoUUID, oldPath, tagID)
+		addFileTagsByTagDeleteQuery(batch, repoUUID, oldPath, tagID)
 		if err := batch.Exec(); err != nil {
-			log.Printf("[MoveFileTagsByPath] failed to delete old tag rows for repo %s old_path %q tag %d: %v", repoID, oldPath, tagID, err)
+			log.Printf("[MoveFileTagsByPath] failed to move tag rows for repo %s old_path %q new_path %q tag %d: %v",
+				repoID, oldPath, newPath, tagID, err)
 		}
 
 		// Note: counters don't change — same tag, same count, just different path
 	}
-	iter.Close()
+	if err := iter.Close(); err != nil {
+		log.Printf("[MoveFileTagsByPath] failed to read tags for repo %s old_path %q: %v", repoID, oldPath, err)
+	}
 	log.Printf("[MoveFileTagsByPath] Moved tags from %q to %q in repo %s", oldPath, newPath, repoID)
 }
 
@@ -707,7 +725,9 @@ func MoveFileTagsByPrefix(database *db.DB, repoID, oldPrefix, newPrefix string) 
 			pathsToMove = append(pathsToMove, fp)
 		}
 	}
-	iter.Close()
+	if err := iter.Close(); err != nil {
+		log.Printf("[MoveFileTagsByPrefix] failed to scan file_tags for repo %s prefix %q: %v", repoID, oldPrefix, err)
+	}
 
 	// Move each child path
 	for _, oldChildPath := range pathsToMove {
@@ -721,18 +741,85 @@ func MoveFileTagsByPrefix(database *db.DB, repoID, oldPrefix, newPrefix string) 
 	}
 }
 
+// fileTagsByTagCleanupChunkSize bounds how many per-tag file_tags_by_tag
+// partition deletes are grouped into one unlogged batch during library teardown,
+// keeping batches well under Cassandra's size/partition warning thresholds.
+const fileTagsByTagCleanupChunkSize = 50
+
+var collectLibraryTagIDsForCleanupFn = collectLibraryTagIDsForCleanup
+
+func collectLibraryTagIDsForCleanup(database *db.DB, repoUUID gocql.UUID) ([]int, error) {
+	tagIDs := make(map[int]struct{})
+
+	repoTagIter := database.Session().Query(`SELECT tag_id FROM repo_tags WHERE repo_id = ?`, repoUUID).Iter()
+	var tagID int
+	for repoTagIter.Scan(&tagID) {
+		tagIDs[tagID] = struct{}{}
+	}
+	if err := repoTagIter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list repo_tags: %w", err)
+	}
+
+	fileTagIter := database.Session().Query(`SELECT tag_id FROM file_tags WHERE repo_id = ?`, repoUUID).Iter()
+	for fileTagIter.Scan(&tagID) {
+		tagIDs[tagID] = struct{}{}
+	}
+	if err := fileTagIter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list file_tags tag ids: %w", err)
+	}
+
+	ids := make([]int, 0, len(tagIDs))
+	for id := range tagIDs {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids, nil
+}
+
 // CleanupAllLibraryTags removes ALL tag data for a library.
 // Used when a library is permanently deleted.
-func CleanupAllLibraryTags(database *db.DB, repoID string) {
+func CleanupAllLibraryTags(database *db.DB, repoID string) error {
 	if database == nil {
-		return
+		return nil
 	}
 
 	repoUUID, err := gocql.ParseUUID(repoID)
 	if err != nil {
-		return
+		return fmt.Errorf("invalid repo id %q: %w", repoID, err)
 	}
 
+	// The file_tags_by_tag projection is partitioned by (repo_id, tag_id), so it
+	// cannot be wiped with a single repo-scoped delete. Collect tag ids from both
+	// repo_tags and canonical file_tags first, and fail closed if discovery is
+	// incomplete so we never delete canonicals while leaving projection shards.
+	tagIDs, err := collectLibraryTagIDsForCleanupFn(database, repoUUID)
+	if err != nil {
+		return fmt.Errorf("failed to collect tag ids for library %s cleanup: %w", repoID, err)
+	}
+
+	// file_tags_by_tag is partitioned per (repo_id, tag_id), so wiping it means one
+	// delete per tag. Do these in chunked unlogged batches FIRST, before the
+	// repo-scoped deletes drop repo_tags/file_tags (the tag-id source): that way a
+	// mid-cleanup failure can't strand projection shards — a retry re-derives the
+	// same tag ids and the partition deletes are idempotent. A single logged batch
+	// with one delete per tag risks "batch too large" on libraries with many tags.
+	for start := 0; start < len(tagIDs); start += fileTagsByTagCleanupChunkSize {
+		end := start + fileTagsByTagCleanupChunkSize
+		if end > len(tagIDs) {
+			end = len(tagIDs)
+		}
+		projBatch := database.Session().Batch(gocql.UnloggedBatch)
+		for _, id := range tagIDs[start:end] {
+			projBatch.Query(`DELETE FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ?`, repoUUID, id)
+		}
+		if err := projBatch.Exec(); err != nil {
+			return fmt.Errorf("failed to delete file_tags_by_tag partitions for library %s: %w", repoID, err)
+		}
+	}
+
+	// Repo-scoped partition deletes are a small fixed set; keep them in one logged
+	// batch and run them last so the tag-id source survives a projection-delete
+	// failure above.
 	batch := database.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM file_tags WHERE repo_id = ?`, repoUUID)
 	batch.Query(`DELETE FROM file_tags_by_id WHERE repo_id = ?`, repoUUID)
@@ -741,9 +828,9 @@ func CleanupAllLibraryTags(database *db.DB, repoID string) {
 	batch.Query(`DELETE FROM repo_tag_counters WHERE repo_id = ?`, repoUUID)
 	batch.Query(`DELETE FROM file_tag_counters WHERE repo_id = ?`, repoUUID)
 	if err := batch.Exec(); err != nil {
-		log.Printf("[CleanupAllLibraryTags] failed to delete tag data for library %s: %v", repoID, err)
-		return
+		return fmt.Errorf("failed to delete tag data for library %s: %w", repoID, err)
 	}
 
 	log.Printf("[CleanupAllLibraryTags] Cleaned all tag data for library %s", repoID)
+	return nil
 }

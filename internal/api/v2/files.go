@@ -4863,6 +4863,7 @@ func (h *FileHandler) cleanupFileTagsForPrefix(repoID, dirPath string) {
 				repoUUID, fp, tagID2)
 			batch.Query(`DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?`,
 				repoUUID, fileTagID2)
+			addFileTagsByTagDeleteQuery(batch, repoUUID, fp, tagID2)
 			if err := batch.Exec(); err != nil {
 				log.Printf("[cleanupFileTagsForPrefix] failed to delete tag rows for repo %s path %q tag %d: %v", repoID, fp, tagID2, err)
 				continue

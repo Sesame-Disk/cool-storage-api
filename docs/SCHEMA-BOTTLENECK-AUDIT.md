@@ -41,27 +41,35 @@ fallback to a hard failure instead of an ALLOW FILTERING scan.
 
 ## B. `file_tags` queries by `tag_id` need ALLOW FILTERING
 
-**Status**: open, medium-priority
+**Status**: resolved in branch `feat/file-tags-by-tag-projection` (2026-06-10)
 
-**Tables**: `file_tags`
+**Tables**: `file_tags`, new `file_tags_by_tag`
 
-**Shape**:
+**Shape (was)**:
 ```sql
 SELECT file_path, file_tag_id FROM file_tags
 WHERE repo_id = ? AND tag_id = ?
 ALLOW FILTERING
 ```
-([internal/api/v2/write_helpers.go](../internal/api/v2/write_helpers.go),
-[internal/api/v2/tags.go](../internal/api/v2/tags.go)).
+The canonical PK is `((repo_id), file_path, tag_id)`, so filtering by `tag_id`
+without `file_path` was a partition-scan with a filter, in `deleteRepoTag`
+([write_helpers.go](../internal/api/v2/write_helpers.go)) and the
+list-files-by-tag flow ([tags.go](../internal/api/v2/tags.go)).
 
-The current PK is `((repo_id), file_path, tag_id)`. Filtering by `tag_id`
-without `file_path` is a partition-scan with a filter.
-
-**Risk**: a repo with many tagged files makes "list files for this tag" slow.
-
-**Direction**: add a `file_tags_by_tag (PRIMARY KEY ((repo_id, tag_id), file_path, file_tag_id))`
-projection, dual-write on tag changes, and read from the new projection. The
-canonical `file_tags` stays for the "list tags on this file" query shape.
+**Resolved**: added projection
+`file_tags_by_tag (PRIMARY KEY ((repo_id, tag_id), file_path))` — `file_path`
+alone is unique within `(repo_id, tag_id)`, so `file_tag_id`/`created_at` stay
+payload columns and deletes only need `repo_id+tag_id+file_path` for the
+projection row. The user-facing list-files-by-tag path now hits the projection
+as a single-partition lookup (no `ALLOW FILTERING`). The projection is kept in
+sync by dual-write on every `file_tags` mutation: `addFileTag`/`removeFileTag`
+and the projection partition delete in `deleteRepoTag` (write_helpers.go),
+`CleanupFileTagsByPath`/`MoveFileTagsByPath`/`CleanupAllLibraryTags` (tags.go),
+the prefix cleanup in files.go, and the GC library-cascade `DeleteFileTag`
+(store_cassandra.go). For safety, `deleteRepoTag` still derives the exact row
+set to delete from canonical `file_tags`; only the reverse-lookup partition
+drop uses `file_tags_by_tag` directly. That keeps the merge safe while avoiding
+the prior `ALLOW FILTERING` read in the main list-files-by-tag flow.
 
 ---
 
@@ -381,7 +389,7 @@ approaching the soft limit (same playbook as item G).
 
 ## N. Soft-deleted libraries still accept star/unstar mutations
 
-**Status**: pending follow-up (2026-06-09)
+**Status**: resolved in branch `feat/library-live-write-fencing` (PR #73, 2026-06-09)
 
 **Tables**: `libraries`, `deleted_libraries`, `starred_files`,
 `starred_files_by_repo`
@@ -402,9 +410,74 @@ new star inserted after `DeleteStarredFilesByLibrary` scans
 cascade finishes. More broadly, repo-scoped mutating endpoints should treat
 soft-deleted libraries as non-writable.
 
-**Follow-up**: add a shared "library is live" guard for repo-scoped mutating
-handlers, starting with `StarFile` / `UnstarFile`, so requests fail closed when
-`deleted_at` is set instead of relying on the later GC window.
+**Resolved**: a shared "library is live" guard (`ReadLiveLibraryState` /
+`ErrLibraryDeleted`) now fences repo-scoped *create/add* mutations (StarFile,
+MonitorRepo, share/upload link create+update, file-share create) and the
+permission resolvers, returning 404/PermissionNone for soft-deleted libraries.
+Pure *removal* paths (UnstarFile, UnmonitorRepo) intentionally stay unfenced so
+clients can still clean up entries pointing at a soft-deleted library.
+
+---
+
+## O. `MoveFileTagsByPath` / `MoveFileTagsByPrefix` are best-effort (no error propagation)
+
+**Status**: open, low-priority (introduced 2026-06-10)
+
+**Tables**: `file_tags`, `file_tags_by_id`, `file_tags_by_tag`
+
+**Shape**: both functions are `void`. On a per-tag batch failure they log and
+continue; the file/directory rename that triggered them has already committed in
+the FS, so a failed tag move leaves the tag stranded at the old path. Each tag's
+move is a single atomic `LoggedBatch`, so the inconsistency is bounded to "some
+tags not moved", never a half-moved tag. Stale old-path tags are filtered by
+`ListTaggedFiles` (HEAD existence check) and cleaned by the `deleteRepoTag`
+canonical fallback / library cascade.
+
+**Direction**: have `MoveFileTagsByPath` return `error`. The caller must NOT fail
+the rename (the FS mutation is already durable) — instead log at request level
+and/or enqueue a reconciliation so the move is retried out of band. This is an
+observability/reconcile hook, not a request-failure path.
+
+---
+
+## P. `DeleteRepoTag` fast path cannot prove projection completeness from cardinality alone
+
+**Status**: open, low-priority (2026-06-10)
+
+**Tables**: `file_tags`, `file_tags_by_tag`, `repo_tag_file_counts`
+
+**Shape**: a per-tag counter matching the number of `file_tags_by_tag` rows is
+not enough to prove the reverse lookup is complete. A best-effort file rename
+can leave a stale old-path projection row while missing the new-path row, so
+the count still matches even though the exact set drifted.
+
+**Risk**: using that equality as a fast-path proof can strand canonical
+`file_tags` / `file_tags_by_id` rows when deleting a repo tag.
+
+**Direction**: keep `deleteRepoTag` on the canonical exact-set scan until there
+is a stronger proof source for projection completeness (e.g. deterministic
+reconciliation on failed moves, or a separate exact-set checksum/versioning
+scheme). Do not reintroduce the counter-only shortcut.
+
+---
+
+## Q. `MoveFileTagsByPrefix` scans the whole `file_tags` repo partition
+
+**Status**: open, low-priority (introduced 2026-06-10)
+
+**Tables**: `file_tags`
+
+**Shape**: directory rename lists every path in the repo's `file_tags`
+partition (`SELECT file_path FROM file_tags WHERE repo_id = ?`) and filters by
+prefix in memory. Cost scales with the repo's total tagged files, not the moved
+subtree. It is a single-partition read on an infrequent operation (directory
+rename), not a hot path.
+
+**Direction**: no new table needed — `file_tags` is clustered by
+`file_path` first (`PRIMARY KEY ((repo_id), file_path, tag_id)`), so a clustering
+range slice (`WHERE repo_id = ? AND file_path >= ? AND file_path < ?`, upper
+bound = prefix + a high sentinel) reads only the subtree. Apply when a repo with
+very many tagged files makes directory renames measurably slow.
 
 ---
 

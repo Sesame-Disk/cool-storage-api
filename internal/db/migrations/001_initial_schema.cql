@@ -1089,6 +1089,23 @@ CREATE TABLE IF NOT EXISTS repo_tag_file_counts (
     PRIMARY KEY ((repo_id), tag_id)
 );
 
+-- Reverse-lookup projection: files carrying a given tag. The canonical file_tags
+-- is partitioned by (repo_id) and clustered by (file_path, tag_id), so "list all
+-- files with tag T" previously required `WHERE repo_id = ? AND tag_id = ?
+-- ALLOW FILTERING` (a partition scan + filter). This projection answers that as a
+-- single-partition read. Kept in sync by dual-write on every file_tags mutation
+-- (add/remove tag, file rename/move, path/prefix cleanup, repo/library teardown).
+-- file_path alone is unique within (repo_id, tag_id), so file_tag_id stays a
+-- payload column (deletes only need repo_id+tag_id+file_path).
+CREATE TABLE IF NOT EXISTS file_tags_by_tag (
+    repo_id     UUID,
+    tag_id      INT,
+    file_path   TEXT,
+    file_tag_id INT,
+    created_at  TIMESTAMP,
+    PRIMARY KEY ((repo_id, tag_id), file_path)
+);
+
 -- ─── GC ──────────────────────────────────────────────────────────────────────
 
 -- Durable queue: items are removed only by explicit completion, requeue, or
