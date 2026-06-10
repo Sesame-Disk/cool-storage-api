@@ -243,6 +243,9 @@ func (h *TagHandler) DeleteRepoTag(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 			return
 		}
+		if !h.ensureLiveLibraryByID(c, repoUUID.String()) {
+			return
+		}
 
 		if err := deleteRepoTag(h.db.Session(), repoUUID, tagID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete tag"})
@@ -453,6 +456,9 @@ func (h *TagHandler) RemoveFileTag(c *gin.Context) {
 		repoUUID, err := gocql.ParseUUID(repoID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+			return
+		}
+		if !h.ensureLiveLibraryByID(c, repoUUID.String()) {
 			return
 		}
 

@@ -465,6 +465,42 @@ func TestUpdateRepoTag_LibraryStateErrorReturnsInternalServerError(t *testing.T)
 	})
 }
 
+func TestDeleteRepoTag_DeletedLibraryReturnsNotFound(t *testing.T) {
+	withDeletedLibraryByIDStub(t, func() {
+		r := gin.New()
+		handler := NewTagHandler(&dbpkg.DB{})
+		r.DELETE("/repos/:repo_id/repo-tags/:tag_id", handler.DeleteRepoTag)
+
+		req := httptest.NewRequest("DELETE", "/repos/11111111-1111-1111-1111-111111111111/repo-tags/5", nil)
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+		}
+		assertJSONError(t, w.Body, "library not found")
+	})
+}
+
+func TestDeleteRepoTag_LibraryStateErrorReturnsInternalServerError(t *testing.T) {
+	withLibraryByIDErrorStub(t, errors.New("cassandra unavailable"), func() {
+		r := gin.New()
+		handler := NewTagHandler(&dbpkg.DB{})
+		r.DELETE("/repos/:repo_id/repo-tags/:tag_id", handler.DeleteRepoTag)
+
+		req := httptest.NewRequest("DELETE", "/repos/11111111-1111-1111-1111-111111111111/repo-tags/5", nil)
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+		}
+		assertJSONError(t, w.Body, "failed to check library state")
+	})
+}
+
 func TestAddFileTag_DeletedLibraryReturnsNotFound(t *testing.T) {
 	withDeletedLibraryByIDStub(t, func() {
 		r := gin.New()
@@ -492,6 +528,42 @@ func TestAddFileTag_LibraryStateErrorReturnsInternalServerError(t *testing.T) {
 
 		req := httptest.NewRequest("POST", "/repos/11111111-1111-1111-1111-111111111111/file-tags", strings.NewReader(`{"file_path":"/doc.txt","repo_tag_id":5}`))
 		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+		}
+		assertJSONError(t, w.Body, "failed to check library state")
+	})
+}
+
+func TestRemoveFileTag_DeletedLibraryReturnsNotFound(t *testing.T) {
+	withDeletedLibraryByIDStub(t, func() {
+		r := gin.New()
+		handler := NewTagHandler(&dbpkg.DB{})
+		r.DELETE("/repos/:repo_id/file-tags/:file_tag_id", handler.RemoveFileTag)
+
+		req := httptest.NewRequest("DELETE", "/repos/11111111-1111-1111-1111-111111111111/file-tags/5", nil)
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+		}
+		assertJSONError(t, w.Body, "library not found")
+	})
+}
+
+func TestRemoveFileTag_LibraryStateErrorReturnsInternalServerError(t *testing.T) {
+	withLibraryByIDErrorStub(t, errors.New("cassandra unavailable"), func() {
+		r := gin.New()
+		handler := NewTagHandler(&dbpkg.DB{})
+		r.DELETE("/repos/:repo_id/file-tags/:file_tag_id", handler.RemoveFileTag)
+
+		req := httptest.NewRequest("DELETE", "/repos/11111111-1111-1111-1111-111111111111/file-tags/5", nil)
 		w := httptest.NewRecorder()
 
 		r.ServeHTTP(w, req)
