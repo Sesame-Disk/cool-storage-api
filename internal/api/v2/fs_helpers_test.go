@@ -4,12 +4,32 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
+
+func TestGetCanonicalHeadCommit_LibraryStateErrorIsNotMaskedAsNotFound(t *testing.T) {
+	helper := &FSHelper{db: &db.DB{}}
+	original := resolveLiveLibraryStateByIDFn
+	resolveLiveLibraryStateByIDFn = func(_ *gocql.Session, _ string) (db.LibraryState, error) {
+		return db.LibraryState{}, errors.New("cassandra unavailable")
+	}
+	t.Cleanup(func() {
+		resolveLiveLibraryStateByIDFn = original
+	})
+
+	_, _, err := helper.getCanonicalHeadCommit("11111111-1111-1111-1111-111111111111")
+	if err == nil {
+		t.Fatal("getCanonicalHeadCommit() error = nil, want internal error")
+	}
+	if !strings.Contains(err.Error(), "failed to check library state") {
+		t.Fatalf("getCanonicalHeadCommit() error = %v, want failed-to-check-library-state prefix", err)
+	}
+}
 
 // TestRegisterFSObjectBlockReferences_ResolutionFailureAborts verifies the
 // row-per-reference registration is fail-closed: if block ID resolution fails, no

@@ -307,7 +307,7 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 	// Get library info
 	libraryState, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoUUID.String())
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 	libOrgID := libraryState.OrgID
@@ -532,7 +532,7 @@ func (h *FileShareHandler) UpdateSharePermission(c *gin.Context) {
 
 	libraryState, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoUUID.String())
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 	updateLibOrgID := libraryState.OrgID
@@ -646,7 +646,7 @@ func (h *FileShareHandler) DeleteShare(c *gin.Context) {
 
 	libraryState, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoUUID.String())
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 	deleteLibOrgID := libraryState.OrgID

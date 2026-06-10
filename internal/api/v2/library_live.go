@@ -2,6 +2,7 @@ package v2
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -24,4 +25,12 @@ func writeLiveLibraryStateError(c *gin.Context, err error) {
 	}
 
 	c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check library state"})
+}
+
+func wrapLiveLibraryStateError(err error) error {
+	if isLibraryUnavailableErr(err) {
+		return fmt.Errorf("library not found: %w", err)
+	}
+
+	return fmt.Errorf("failed to check library state: %w", err)
 }

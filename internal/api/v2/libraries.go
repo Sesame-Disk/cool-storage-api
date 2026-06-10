@@ -909,6 +909,12 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 		return
 	}
 
+	libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID)
+	if err != nil {
+		writeLiveLibraryStateError(c, err)
+		return
+	}
+
 	now := time.Now()
 	updates = append(updates, "updated_at = ?")
 	values = append(values, now)
@@ -926,15 +932,8 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(query, values...)
 	if req.VersionTTLDays != nil {
-		var headCommitID string
-		if err := h.db.Session().Query(`
-			SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-		`, orgID, repoID).Scan(&headCommitID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library head for GC policy projection"})
-			return
-		}
 		if *req.VersionTTLDays > 0 {
-			db.AddUpsertLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID, repoID, *req.VersionTTLDays, headCommitID, now)
+			db.AddUpsertLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID, repoID, *req.VersionTTLDays, libraryState.HeadCommitID, now)
 		} else {
 			db.AddDeleteLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID, repoID)
 		}
@@ -982,6 +981,11 @@ func (h *LibraryHandler) DeleteLibrary(c *gin.Context) {
 		return
 	}
 
+	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
+		writeLiveLibraryStateError(c, err)
+		return
+	}
+
 	// ========================================================================
 	// PERMISSION CHECK: Require library ownership to delete
 	// ========================================================================
@@ -998,16 +1002,6 @@ func (h *LibraryHandler) DeleteLibrary(c *gin.Context) {
 		return
 	}
 	log.Printf("[DeleteLibrary] Permission granted: user %q is owner of library %q", userID, repoID)
-
-	// Verify library exists and get storage class before deleting
-	var libID, storageClass string
-	err = h.db.Session().Query(`
-		SELECT library_id, storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&libID, &storageClass)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
 
 	// Soft-delete: set deleted_at + adjust storage counters.
 	// ownerID = userID here because the permission check above ensures only the
@@ -1052,6 +1046,11 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 
 	if req.RepoName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "repo_name is required"})
+		return
+	}
+
+	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 
@@ -1102,6 +1101,11 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 	// Validate storage class
 	if !h.isKnownStorageClass(req.StorageClass) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid storage class"})
+		return
+	}
+
+	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 

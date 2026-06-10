@@ -717,7 +717,7 @@ func (h *OnlyOfficeHandler) getFileID(repoID, _ string, filePath string) (string
 	// fenced before OnlyOffice traverses the tree.
 	libraryState, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoID)
 	if err != nil {
-		return "", fmt.Errorf("library not found: %w", err)
+		return "", wrapLiveLibraryStateError(err)
 	}
 
 	// Get root_fs_id from the head commit

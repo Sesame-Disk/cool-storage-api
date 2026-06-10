@@ -190,7 +190,7 @@ func (h *FSHelper) GetRootFSID(repoID string) (string, string, error) {
 func (h *FSHelper) getCanonicalHeadCommit(repoID string) (string, string, error) {
 	libraryState, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoID)
 	if err != nil {
-		return "", "", fmt.Errorf("library not found: %w", err)
+		return "", "", wrapLiveLibraryStateError(err)
 	}
 
 	return libraryState.OrgID, libraryState.HeadCommitID, nil

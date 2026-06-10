@@ -89,6 +89,25 @@ func TestGenerateDocKey(t *testing.T) {
 	}
 }
 
+func TestOnlyOfficeGetFileID_LibraryStateErrorIsNotMaskedAsNotFound(t *testing.T) {
+	original := resolveLiveLibraryStateByIDFn
+	resolveLiveLibraryStateByIDFn = func(_ *gocql.Session, _ string) (db.LibraryState, error) {
+		return db.LibraryState{}, errors.New("cassandra unavailable")
+	}
+	t.Cleanup(func() {
+		resolveLiveLibraryStateByIDFn = original
+	})
+
+	h := &OnlyOfficeHandler{db: &db.DB{}}
+	_, err := h.getFileID("11111111-1111-1111-1111-111111111111", "", "/doc.docx")
+	if err == nil {
+		t.Fatal("getFileID() error = nil, want internal error")
+	}
+	if !strings.Contains(err.Error(), "failed to check library state") {
+		t.Fatalf("getFileID() error = %v, want failed-to-check-library-state prefix", err)
+	}
+}
+
 func TestOnlyOfficeResolveLibraryBlockStoreUsesLocalRegion(t *testing.T) {
 	manager := storage.NewManager()
 	manager.SetDefaultClass("hot-s3-usa")
