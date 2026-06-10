@@ -1160,10 +1160,29 @@ func updateRepoTag(sess *gocql.Session, repoID gocql.UUID, tagID int, name, colo
 	`, name, color, repoID, tagID).Exec()
 }
 
+// addFileTagsByTagInsertQuery / addFileTagsByTagDeleteQuery keep the
+// file_tags_by_tag reverse-lookup projection in sync with the canonical
+// file_tags table. Every file_tags mutation must enqueue the matching
+// projection write so "list files with tag T" stays a single-partition read.
+func addFileTagsByTagInsertQuery(batch *gocql.Batch, repoID gocql.UUID, filePath string, tagID, fileTagID int, createdAt time.Time) {
+	batch.Query(`
+		INSERT INTO file_tags_by_tag (repo_id, tag_id, file_path, file_tag_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, repoID, tagID, filePath, fileTagID, createdAt)
+}
+
+func addFileTagsByTagDeleteQuery(batch *gocql.Batch, repoID gocql.UUID, filePath string, tagID int) {
+	batch.Query(`
+		DELETE FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ? AND file_path = ?
+	`, repoID, tagID, filePath)
+}
+
 // deleteRepoTag deletes a repository tag and all its file_tags associations, cleaning counters.
 func deleteRepoTag(sess *gocql.Session, repoID gocql.UUID, tagID int) error {
+	// Read the per-tag projection (single-partition) instead of an
+	// ALLOW FILTERING scan over file_tags by tag_id.
 	iter := sess.Query(`
-		SELECT file_path, file_tag_id FROM file_tags WHERE repo_id = ? AND tag_id = ? ALLOW FILTERING
+		SELECT file_path, file_tag_id FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ?
 	`, repoID, tagID).Iter()
 
 	var filePath string
@@ -1183,6 +1202,11 @@ func deleteRepoTag(sess *gocql.Session, repoID gocql.UUID, tagID int) error {
 		`, repoID, fileTagID)
 	}
 	iter.Close()
+
+	// Drop the whole reverse-lookup partition for this tag in one shot.
+	batch.Query(`
+		DELETE FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ?
+	`, repoID, tagID)
 
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("failed to delete tag: %w", err)
@@ -1208,6 +1232,7 @@ func addFileTag(sess *gocql.Session, repoID gocql.UUID, filePath string, repoTag
 		INSERT INTO file_tags_by_id (repo_id, file_tag_id, file_path, tag_id, created_at)
 		VALUES (?, ?, ?, ?, ?)
 	`, repoID, fileTagID, filePath, repoTagID, createdAt)
+	addFileTagsByTagInsertQuery(batch, repoID, filePath, repoTagID, fileTagID, createdAt)
 
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("failed to add file tag: %w", err)
@@ -1242,6 +1267,7 @@ func removeFileTag(sess *gocql.Session, repoID gocql.UUID, fileTagID int) error 
 	batch.Query(`
 		DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
 	`, repoID, fileTagID)
+	addFileTagsByTagDeleteQuery(batch, repoID, filePath, tagID)
 
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("failed to remove file tag: %w", err)

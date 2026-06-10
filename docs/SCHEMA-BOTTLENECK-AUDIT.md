@@ -41,27 +41,33 @@ fallback to a hard failure instead of an ALLOW FILTERING scan.
 
 ## B. `file_tags` queries by `tag_id` need ALLOW FILTERING
 
-**Status**: open, medium-priority
+**Status**: resolved in branch `feat/file-tags-by-tag-projection` (2026-06-10)
 
-**Tables**: `file_tags`
+**Tables**: `file_tags`, new `file_tags_by_tag`
 
-**Shape**:
+**Shape (was)**:
 ```sql
 SELECT file_path, file_tag_id FROM file_tags
 WHERE repo_id = ? AND tag_id = ?
 ALLOW FILTERING
 ```
-([internal/api/v2/write_helpers.go](../internal/api/v2/write_helpers.go),
-[internal/api/v2/tags.go](../internal/api/v2/tags.go)).
+The canonical PK is `((repo_id), file_path, tag_id)`, so filtering by `tag_id`
+without `file_path` was a partition-scan with a filter, in `deleteRepoTag`
+([write_helpers.go](../internal/api/v2/write_helpers.go)) and the
+list-files-by-tag flow ([tags.go](../internal/api/v2/tags.go)).
 
-The current PK is `((repo_id), file_path, tag_id)`. Filtering by `tag_id`
-without `file_path` is a partition-scan with a filter.
-
-**Risk**: a repo with many tagged files makes "list files for this tag" slow.
-
-**Direction**: add a `file_tags_by_tag (PRIMARY KEY ((repo_id, tag_id), file_path, file_tag_id))`
-projection, dual-write on tag changes, and read from the new projection. The
-canonical `file_tags` stays for the "list tags on this file" query shape.
+**Resolved**: added projection
+`file_tags_by_tag (PRIMARY KEY ((repo_id, tag_id), file_path))` — `file_path`
+alone is unique within `(repo_id, tag_id)`, so `file_tag_id`/`created_at` stay
+payload columns and deletes only need `repo_id+tag_id+file_path`. Both
+`tag_id` reads now hit the projection as a single-partition lookup (no
+`ALLOW FILTERING`). The projection is kept in sync by dual-write on every
+`file_tags` mutation: `addFileTag`/`removeFileTag`/`deleteRepoTag`
+(write_helpers.go), `CleanupFileTagsByPath`/`MoveFileTagsByPath`/
+`CleanupAllLibraryTags` (tags.go), the prefix cleanup in files.go, and the GC
+library-cascade `DeleteFileTag` (store_cassandra.go). `deleteRepoTag` and
+`CleanupAllLibraryTags` drop whole projection partitions per tag; the canonical
+`file_tags` table stays as the source for the "list tags on this file" shape.
 
 ---
 
