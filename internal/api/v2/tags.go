@@ -2,8 +2,10 @@ package v2
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -730,30 +732,55 @@ func MoveFileTagsByPrefix(database *db.DB, repoID, oldPrefix, newPrefix string) 
 	}
 }
 
+var collectLibraryTagIDsForCleanupFn = collectLibraryTagIDsForCleanup
+
+func collectLibraryTagIDsForCleanup(database *db.DB, repoUUID gocql.UUID) ([]int, error) {
+	tagIDs := make(map[int]struct{})
+
+	repoTagIter := database.Session().Query(`SELECT tag_id FROM repo_tags WHERE repo_id = ?`, repoUUID).Iter()
+	var tagID int
+	for repoTagIter.Scan(&tagID) {
+		tagIDs[tagID] = struct{}{}
+	}
+	if err := repoTagIter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list repo_tags: %w", err)
+	}
+
+	fileTagIter := database.Session().Query(`SELECT tag_id FROM file_tags WHERE repo_id = ?`, repoUUID).Iter()
+	for fileTagIter.Scan(&tagID) {
+		tagIDs[tagID] = struct{}{}
+	}
+	if err := fileTagIter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list file_tags tag ids: %w", err)
+	}
+
+	ids := make([]int, 0, len(tagIDs))
+	for id := range tagIDs {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids, nil
+}
+
 // CleanupAllLibraryTags removes ALL tag data for a library.
 // Used when a library is permanently deleted.
-func CleanupAllLibraryTags(database *db.DB, repoID string) {
+func CleanupAllLibraryTags(database *db.DB, repoID string) error {
 	if database == nil {
-		return
+		return nil
 	}
 
 	repoUUID, err := gocql.ParseUUID(repoID)
 	if err != nil {
-		return
+		return fmt.Errorf("invalid repo id %q: %w", repoID, err)
 	}
 
 	// The file_tags_by_tag projection is partitioned by (repo_id, tag_id), so it
-	// cannot be wiped with a single repo-scoped delete. Collect the repo's tag
-	// ids first (read before the batch deletes repo_tags) and drop one projection
-	// partition per tag.
-	tagIDs := make([]int, 0)
-	tagIter := database.Session().Query(`SELECT tag_id FROM repo_tags WHERE repo_id = ?`, repoUUID).Iter()
-	var tagID int
-	for tagIter.Scan(&tagID) {
-		tagIDs = append(tagIDs, tagID)
-	}
-	if err := tagIter.Close(); err != nil {
-		log.Printf("[CleanupAllLibraryTags] failed to list repo tags for library %s: %v", repoID, err)
+	// cannot be wiped with a single repo-scoped delete. Collect tag ids from both
+	// repo_tags and canonical file_tags first, and fail closed if discovery is
+	// incomplete so we never delete canonicals while leaving projection shards.
+	tagIDs, err := collectLibraryTagIDsForCleanupFn(database, repoUUID)
+	if err != nil {
+		return fmt.Errorf("failed to collect tag ids for library %s cleanup: %w", repoID, err)
 	}
 
 	batch := database.Session().Batch(gocql.LoggedBatch)
@@ -767,9 +794,9 @@ func CleanupAllLibraryTags(database *db.DB, repoID string) {
 		batch.Query(`DELETE FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ?`, repoUUID, id)
 	}
 	if err := batch.Exec(); err != nil {
-		log.Printf("[CleanupAllLibraryTags] failed to delete tag data for library %s: %v", repoID, err)
-		return
+		return fmt.Errorf("failed to delete tag data for library %s: %w", repoID, err)
 	}
 
 	log.Printf("[CleanupAllLibraryTags] Cleaned all tag data for library %s", repoID)
+	return nil
 }

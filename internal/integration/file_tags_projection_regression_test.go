@@ -76,6 +76,33 @@ func TestFileTagsProjectionRegression_DeleteRepoTagDropsProjection(t *testing.T)
 	})
 }
 
+func TestFileTagsProjectionRegression_DeleteRepoTagFallsBackToCanonicalOnProjectionDrift(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-filetags-drift-%d", time.Now().UnixNano()))
+	session := shareProjectionDBForTest(t).Session()
+
+	tagID := createRepoTagForProjectionTest(t, adminClient, repoID, "projection-drift")
+	oldPath := "/drift-old.txt"
+	newPath := "/drift-new.txt"
+	fileTagID := 9101
+	now := time.Now().UTC()
+
+	seedMovedFileTagProjectionDriftForTest(t, session, repoID, oldPath, newPath, tagID, fileTagID, now)
+	t.Cleanup(func() {
+		deleteFileTagRowForProjectionTest(t, session, repoID, oldPath, tagID)
+		deleteFileTagRowForProjectionTest(t, session, repoID, newPath, tagID)
+		deleteFileTagByIDRowForProjectionTest(t, session, repoID, fileTagID)
+	})
+
+	deleteRepoTagForProjectionTest(t, adminClient, repoID, tagID)
+
+	waitForIntegrationCondition(t, "delete repo tag clears drifted canonical rows even if projection missed moved path", func() bool {
+		return !fileTagCanonicalExistsForTest(t, session, repoID, oldPath, tagID) &&
+			!fileTagCanonicalExistsForTest(t, session, repoID, newPath, tagID) &&
+			!fileTagProjectionExistsForTest(t, session, repoID, tagID, oldPath) &&
+			!fileTagByIDExistsForProjectionTest(t, session, repoID, fileTagID)
+	})
+}
+
 func TestFileTagsProjectionRegression_GCDeleteFileTag(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-filetags-gc-%d", time.Now().UnixNano()))
 	database := shareProjectionDBForTest(t)
@@ -204,6 +231,26 @@ func insertFileTagRowForProjectionTest(t *testing.T, session *gocql.Session, rep
 	}
 }
 
+func seedMovedFileTagProjectionDriftForTest(t *testing.T, session *gocql.Session, repoID, oldPath, newPath string, tagID, fileTagID int, createdAt time.Time) {
+	t.Helper()
+
+	insertFileTagRowForProjectionTest(t, session, repoID, oldPath, tagID, fileTagID, createdAt)
+
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Query(`
+		INSERT INTO file_tags (repo_id, file_path, tag_id, file_tag_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, repoID, newPath, tagID, fileTagID, createdAt)
+	batch.Query(`
+		INSERT INTO file_tags_by_id (repo_id, file_tag_id, file_path, tag_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, repoID, fileTagID, newPath, tagID, createdAt)
+	if err := session.ExecuteBatch(batch); err != nil {
+		t.Fatalf("failed to seed moved file tag drift for repo %s old_path %s new_path %s tag %d: %v",
+			repoID, oldPath, newPath, tagID, err)
+	}
+}
+
 func deleteFileTagRowForProjectionTest(t *testing.T, session *gocql.Session, repoID, filePath string, tagID int) {
 	t.Helper()
 
@@ -212,6 +259,14 @@ func deleteFileTagRowForProjectionTest(t *testing.T, session *gocql.Session, rep
 	batch.Query(`DELETE FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ? AND file_path = ?`, repoID, tagID, filePath)
 	if err := session.ExecuteBatch(batch); err != nil {
 		t.Errorf("cleanup file tag rows for repo %s path %s tag %d failed: %v", repoID, filePath, tagID, err)
+	}
+}
+
+func deleteFileTagByIDRowForProjectionTest(t *testing.T, session *gocql.Session, repoID string, fileTagID int) {
+	t.Helper()
+
+	if err := session.Query(`DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?`, repoID, fileTagID).Exec(); err != nil {
+		t.Errorf("cleanup file_tags_by_id row for repo %s file_tag_id %d failed: %v", repoID, fileTagID, err)
 	}
 }
 
@@ -246,5 +301,22 @@ func fileTagProjectionExistsForTest(t *testing.T, session *gocql.Session, repoID
 		return false
 	}
 	t.Fatalf("query file_tags_by_tag for repo %s tag %d path %s failed: %v", repoID, tagID, filePath, err)
+	return false
+}
+
+func fileTagByIDExistsForProjectionTest(t *testing.T, session *gocql.Session, repoID string, fileTagID int) bool {
+	t.Helper()
+
+	var filePath string
+	err := session.Query(`
+		SELECT file_path FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
+	`, repoID, fileTagID).Scan(&filePath)
+	if err == nil {
+		return true
+	}
+	if err == gocql.ErrNotFound {
+		return false
+	}
+	t.Fatalf("query file_tags_by_id for repo %s file_tag_id %d failed: %v", repoID, fileTagID, err)
 	return false
 }

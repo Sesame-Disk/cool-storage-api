@@ -1264,7 +1264,11 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			}
 
 			// 2. Remove all tag metadata for this library
-			go CleanupAllLibraryTags(h.db, lib.libID)
+			go func(libraryID string) {
+				if err := CleanupAllLibraryTags(h.db, libraryID); err != nil {
+					log.Printf("[AdminCleanTrashLibraries] failed to clean tag metadata for library %s: %v", libraryID, err)
+				}
+			}(lib.libID)
 
 			// 3. Hard-delete library rows (same batch approach as PermanentDeleteRepo)
 			batch := h.db.Session().Batch(gocql.LoggedBatch)

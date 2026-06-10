@@ -2,11 +2,14 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
 
@@ -429,4 +432,20 @@ func TestCleanupFileTagsByPath_NilDB(t *testing.T) {
 func TestCleanupFileTagsByPath_InvalidRepoID(t *testing.T) {
 	// Should not panic with invalid repo ID (nil db means early return anyway)
 	CleanupFileTagsByPath(nil, "not-a-uuid", "/test/file.txt")
+}
+
+func TestCleanupAllLibraryTags_CollectErrorFailsClosed(t *testing.T) {
+	sentinel := errors.New("boom")
+	previous := collectLibraryTagIDsForCleanupFn
+	collectLibraryTagIDsForCleanupFn = func(database *db.DB, repoUUID gocql.UUID) ([]int, error) {
+		return nil, sentinel
+	}
+	t.Cleanup(func() {
+		collectLibraryTagIDsForCleanupFn = previous
+	})
+
+	err := CleanupAllLibraryTags(&db.DB{}, "11111111-1111-1111-1111-111111111111")
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("CleanupAllLibraryTags error = %v, want sentinel %v", err, sentinel)
+	}
 }

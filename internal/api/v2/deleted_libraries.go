@@ -305,7 +305,11 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 	}
 
 	// Tag cleanup is secondary metadata and can remain asynchronous.
-	go CleanupAllLibraryTags(h.db, repoID)
+	go func(libraryID string) {
+		if err := CleanupAllLibraryTags(h.db, libraryID); err != nil {
+			log.Printf("failed to clean tag metadata for permanently deleted library %s: %v", libraryID, err)
+		}
+	}(repoID)
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

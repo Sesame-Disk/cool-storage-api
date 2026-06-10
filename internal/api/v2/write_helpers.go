@@ -1177,31 +1177,83 @@ func addFileTagsByTagDeleteQuery(batch *gocql.Batch, repoID gocql.UUID, filePath
 	`, repoID, tagID, filePath)
 }
 
-// deleteRepoTag deletes a repository tag and all its file_tags associations, cleaning counters.
-func deleteRepoTag(sess *gocql.Session, repoID gocql.UUID, tagID int) error {
-	// Read the per-tag projection (single-partition) instead of an
-	// ALLOW FILTERING scan over file_tags by tag_id.
+type fileTagDeleteEntry struct {
+	filePath  string
+	fileTagID int
+}
+
+func collectFileTagDeleteEntries(sess *gocql.Session, repoID gocql.UUID, tagID int) ([]fileTagDeleteEntry, error) {
+	entriesByPath := make(map[string]fileTagDeleteEntry)
+	projectedPaths := make(map[string]struct{})
+
 	iter := sess.Query(`
 		SELECT file_path, file_tag_id FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ?
 	`, repoID, tagID).Iter()
 
 	var filePath string
 	var fileTagID int
+	for iter.Scan(&filePath, &fileTagID) {
+		entriesByPath[filePath] = fileTagDeleteEntry{filePath: filePath, fileTagID: fileTagID}
+		projectedPaths[filePath] = struct{}{}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to read file_tags_by_tag projection for repo %s tag %d: %w", repoID.String(), tagID, err)
+	}
+
+	canonicalIter := sess.Query(`
+		SELECT file_path, tag_id, file_tag_id FROM file_tags WHERE repo_id = ?
+	`, repoID).Iter()
+
+	var canonicalTagID int
+	driftCount := 0
+	for canonicalIter.Scan(&filePath, &canonicalTagID, &fileTagID) {
+		if canonicalTagID != tagID {
+			continue
+		}
+		if _, seen := entriesByPath[filePath]; !seen {
+			if _, projected := projectedPaths[filePath]; !projected {
+				driftCount++
+			}
+		}
+		entriesByPath[filePath] = fileTagDeleteEntry{filePath: filePath, fileTagID: fileTagID}
+	}
+	if err := canonicalIter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to read canonical file_tags rows for repo %s tag %d: %w", repoID.String(), tagID, err)
+	}
+
+	if driftCount > 0 {
+		log.Printf("[DeleteRepoTag] detected %d file_tags rows missing from file_tags_by_tag for repo %s tag %d; cleaning via canonical fallback",
+			driftCount, repoID.String(), tagID)
+	}
+
+	entries := make([]fileTagDeleteEntry, 0, len(entriesByPath))
+	for _, entry := range entriesByPath {
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// deleteRepoTag deletes a repository tag and all its file_tags associations, cleaning counters.
+func deleteRepoTag(sess *gocql.Session, repoID gocql.UUID, tagID int) error {
+	entries, err := collectFileTagDeleteEntries(sess, repoID, tagID)
+	if err != nil {
+		return err
+	}
+
 	batch := sess.Batch(gocql.LoggedBatch)
 
 	batch.Query(`
 		DELETE FROM repo_tags WHERE repo_id = ? AND tag_id = ?
 	`, repoID, tagID)
 
-	for iter.Scan(&filePath, &fileTagID) {
+	for _, entry := range entries {
 		batch.Query(`
 			DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?
-		`, repoID, filePath, tagID)
+		`, repoID, entry.filePath, tagID)
 		batch.Query(`
 			DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
-		`, repoID, fileTagID)
+		`, repoID, entry.fileTagID)
 	}
-	iter.Close()
 
 	// Drop the whole reverse-lookup partition for this tag in one shot.
 	batch.Query(`
