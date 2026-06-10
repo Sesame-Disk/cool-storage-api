@@ -122,6 +122,15 @@ type CreateRepoTagRequest struct {
 	Color string `json:"color" form:"color"`
 }
 
+func (h *TagHandler) ensureLiveLibraryByID(c *gin.Context, repoID string) bool {
+	if _, err := resolveLiveLibraryStateByIDFn(h.db.Session(), repoID); err != nil {
+		writeLiveLibraryStateError(c, err)
+		return false
+	}
+
+	return true
+}
+
 // CreateRepoTag creates a new tag for a repository
 // POST /api/v2.1/repos/:repo_id/repo-tags/
 func (h *TagHandler) CreateRepoTag(c *gin.Context) {
@@ -147,6 +156,9 @@ func (h *TagHandler) CreateRepoTag(c *gin.Context) {
 		repoUUID, err := gocql.ParseUUID(repoID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+			return
+		}
+		if !h.ensureLiveLibraryByID(c, repoUUID.String()) {
 			return
 		}
 
@@ -189,6 +201,9 @@ func (h *TagHandler) UpdateRepoTag(c *gin.Context) {
 		repoUUID, err := gocql.ParseUUID(repoID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+			return
+		}
+		if !h.ensureLiveLibraryByID(c, repoUUID.String()) {
 			return
 		}
 
@@ -379,6 +394,9 @@ func (h *TagHandler) AddFileTag(c *gin.Context) {
 		repoUUID, err := gocql.ParseUUID(repoID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+			return
+		}
+		if !h.ensureLiveLibraryByID(c, repoUUID.String()) {
 			return
 		}
 

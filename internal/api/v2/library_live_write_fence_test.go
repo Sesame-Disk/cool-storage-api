@@ -389,6 +389,120 @@ func TestCreateShare_LibraryStateErrorReturnsInternalServerError(t *testing.T) {
 	})
 }
 
+func TestCreateRepoTag_DeletedLibraryReturnsNotFound(t *testing.T) {
+	withDeletedLibraryByIDStub(t, func() {
+		r := gin.New()
+		handler := NewTagHandler(&dbpkg.DB{})
+		r.POST("/repos/:repo_id/repo-tags", handler.CreateRepoTag)
+
+		req := httptest.NewRequest("POST", "/repos/11111111-1111-1111-1111-111111111111/repo-tags", strings.NewReader(`{"name":"review","color":"#ff8000"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+		}
+		assertJSONError(t, w.Body, "library not found")
+	})
+}
+
+func TestCreateRepoTag_LibraryStateErrorReturnsInternalServerError(t *testing.T) {
+	withLibraryByIDErrorStub(t, errors.New("cassandra unavailable"), func() {
+		r := gin.New()
+		handler := NewTagHandler(&dbpkg.DB{})
+		r.POST("/repos/:repo_id/repo-tags", handler.CreateRepoTag)
+
+		req := httptest.NewRequest("POST", "/repos/11111111-1111-1111-1111-111111111111/repo-tags", strings.NewReader(`{"name":"review","color":"#ff8000"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+		}
+		assertJSONError(t, w.Body, "failed to check library state")
+	})
+}
+
+func TestUpdateRepoTag_DeletedLibraryReturnsNotFound(t *testing.T) {
+	withDeletedLibraryByIDStub(t, func() {
+		r := gin.New()
+		handler := NewTagHandler(&dbpkg.DB{})
+		r.PUT("/repos/:repo_id/repo-tags/:tag_id", handler.UpdateRepoTag)
+
+		req := httptest.NewRequest("PUT", "/repos/11111111-1111-1111-1111-111111111111/repo-tags/5", strings.NewReader(`{"name":"review","color":"#ff8000"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+		}
+		assertJSONError(t, w.Body, "library not found")
+	})
+}
+
+func TestUpdateRepoTag_LibraryStateErrorReturnsInternalServerError(t *testing.T) {
+	withLibraryByIDErrorStub(t, errors.New("cassandra unavailable"), func() {
+		r := gin.New()
+		handler := NewTagHandler(&dbpkg.DB{})
+		r.PUT("/repos/:repo_id/repo-tags/:tag_id", handler.UpdateRepoTag)
+
+		req := httptest.NewRequest("PUT", "/repos/11111111-1111-1111-1111-111111111111/repo-tags/5", strings.NewReader(`{"name":"review","color":"#ff8000"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+		}
+		assertJSONError(t, w.Body, "failed to check library state")
+	})
+}
+
+func TestAddFileTag_DeletedLibraryReturnsNotFound(t *testing.T) {
+	withDeletedLibraryByIDStub(t, func() {
+		r := gin.New()
+		handler := NewTagHandler(&dbpkg.DB{})
+		r.POST("/repos/:repo_id/file-tags", handler.AddFileTag)
+
+		req := httptest.NewRequest("POST", "/repos/11111111-1111-1111-1111-111111111111/file-tags", strings.NewReader(`{"file_path":"/doc.txt","repo_tag_id":5}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+		}
+		assertJSONError(t, w.Body, "library not found")
+	})
+}
+
+func TestAddFileTag_LibraryStateErrorReturnsInternalServerError(t *testing.T) {
+	withLibraryByIDErrorStub(t, errors.New("cassandra unavailable"), func() {
+		r := gin.New()
+		handler := NewTagHandler(&dbpkg.DB{})
+		r.POST("/repos/:repo_id/file-tags", handler.AddFileTag)
+
+		req := httptest.NewRequest("POST", "/repos/11111111-1111-1111-1111-111111111111/file-tags", strings.NewReader(`{"file_path":"/doc.txt","repo_tag_id":5}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+		}
+		assertJSONError(t, w.Body, "failed to check library state")
+	})
+}
+
 func TestUpdateSharePermission_LibraryStateErrorReturnsInternalServerError(t *testing.T) {
 	withLibraryByIDErrorStub(t, errors.New("cassandra unavailable"), func() {
 		r := gin.New()

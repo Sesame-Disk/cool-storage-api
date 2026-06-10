@@ -59,15 +59,17 @@ list-files-by-tag flow ([tags.go](../internal/api/v2/tags.go)).
 **Resolved**: added projection
 `file_tags_by_tag (PRIMARY KEY ((repo_id, tag_id), file_path))` — `file_path`
 alone is unique within `(repo_id, tag_id)`, so `file_tag_id`/`created_at` stay
-payload columns and deletes only need `repo_id+tag_id+file_path`. Both
-`tag_id` reads now hit the projection as a single-partition lookup (no
-`ALLOW FILTERING`). The projection is kept in sync by dual-write on every
-`file_tags` mutation: `addFileTag`/`removeFileTag`/`deleteRepoTag`
-(write_helpers.go), `CleanupFileTagsByPath`/`MoveFileTagsByPath`/
-`CleanupAllLibraryTags` (tags.go), the prefix cleanup in files.go, and the GC
-library-cascade `DeleteFileTag` (store_cassandra.go). `deleteRepoTag` and
-`CleanupAllLibraryTags` drop whole projection partitions per tag; the canonical
-`file_tags` table stays as the source for the "list tags on this file" shape.
+payload columns and deletes only need `repo_id+tag_id+file_path` for the
+projection row. The user-facing list-files-by-tag path now hits the projection
+as a single-partition lookup (no `ALLOW FILTERING`). The projection is kept in
+sync by dual-write on every `file_tags` mutation: `addFileTag`/`removeFileTag`
+and the projection partition delete in `deleteRepoTag` (write_helpers.go),
+`CleanupFileTagsByPath`/`MoveFileTagsByPath`/`CleanupAllLibraryTags` (tags.go),
+the prefix cleanup in files.go, and the GC library-cascade `DeleteFileTag`
+(store_cassandra.go). For safety, `deleteRepoTag` still derives the exact row
+set to delete from canonical `file_tags`; only the reverse-lookup partition
+drop uses `file_tags_by_tag` directly. That keeps the merge safe while avoiding
+the prior `ALLOW FILTERING` read in the main list-files-by-tag flow.
 
 ---
 
@@ -438,7 +440,28 @@ observability/reconcile hook, not a request-failure path.
 
 ---
 
-## P. `MoveFileTagsByPrefix` scans the whole `file_tags` repo partition
+## P. `DeleteRepoTag` fast path cannot prove projection completeness from cardinality alone
+
+**Status**: open, low-priority (2026-06-10)
+
+**Tables**: `file_tags`, `file_tags_by_tag`, `repo_tag_file_counts`
+
+**Shape**: a per-tag counter matching the number of `file_tags_by_tag` rows is
+not enough to prove the reverse lookup is complete. A best-effort file rename
+can leave a stale old-path projection row while missing the new-path row, so
+the count still matches even though the exact set drifted.
+
+**Risk**: using that equality as a fast-path proof can strand canonical
+`file_tags` / `file_tags_by_id` rows when deleting a repo tag.
+
+**Direction**: keep `deleteRepoTag` on the canonical exact-set scan until there
+is a stronger proof source for projection completeness (e.g. deterministic
+reconciliation on failed moves, or a separate exact-set checksum/versioning
+scheme). Do not reintroduce the counter-only shortcut.
+
+---
+
+## Q. `MoveFileTagsByPrefix` scans the whole `file_tags` repo partition
 
 **Status**: open, low-priority (introduced 2026-06-10)
 

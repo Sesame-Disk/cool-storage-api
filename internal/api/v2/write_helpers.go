@@ -1185,58 +1185,25 @@ type fileTagDeleteEntry struct {
 func collectFileTagDeleteEntries(sess *gocql.Session, repoID gocql.UUID, tagID int) ([]fileTagDeleteEntry, error) {
 	entriesByPath := make(map[string]fileTagDeleteEntry)
 
-	iter := sess.Query(`
-		SELECT file_path, file_tag_id FROM file_tags_by_tag WHERE repo_id = ? AND tag_id = ?
-	`, repoID, tagID).Iter()
-
-	var filePath string
-	var fileTagID int
-	for iter.Scan(&filePath, &fileTagID) {
-		entriesByPath[filePath] = fileTagDeleteEntry{filePath: filePath, fileTagID: fileTagID}
-	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to read file_tags_by_tag projection for repo %s tag %d: %w", repoID.String(), tagID, err)
-	}
-
-	// Fast path: if the maintained per-tag file counter agrees with the number of
-	// projection rows, the reverse-lookup is complete and we can avoid the
-	// full-partition canonical scan — keeping DeleteRepoTag O(files-for-tag), the
-	// whole point of the file_tags_by_tag projection. Only fall back to the
-	// canonical scan when the counter is missing, unreadable, or disagrees (i.e.
-	// the projection may have drifted), since dropping a tag must never strand
-	// canonical rows.
-	var fileCount int64
-	counterErr := sess.Query(`
-		SELECT file_count FROM repo_tag_file_counts WHERE repo_id = ? AND tag_id = ?
-	`, repoID, tagID).Scan(&fileCount)
-	if counterErr == nil && fileCount == int64(len(entriesByPath)) {
-		return fileTagDeleteEntriesSlice(entriesByPath), nil
-	}
-
-	// Safety net: scan the repo's canonical rows so tag deletion still cleans up
-	// if the reverse-lookup projection drifted.
+	// Safety first: derive the exact delete set from the canonical rows. A
+	// matching per-tag counter is not enough to prove the reverse-lookup
+	// projection is complete, because best-effort path moves can leave a stale
+	// old-path row and miss the new-path row while preserving cardinality.
 	canonicalIter := sess.Query(`
 		SELECT file_path, tag_id, file_tag_id FROM file_tags WHERE repo_id = ?
 	`, repoID).Iter()
 
+	var filePath string
+	var fileTagID int
 	var canonicalTagID int
-	driftCount := 0
 	for canonicalIter.Scan(&filePath, &canonicalTagID, &fileTagID) {
 		if canonicalTagID != tagID {
 			continue
-		}
-		if _, seen := entriesByPath[filePath]; !seen {
-			driftCount++
 		}
 		entriesByPath[filePath] = fileTagDeleteEntry{filePath: filePath, fileTagID: fileTagID}
 	}
 	if err := canonicalIter.Close(); err != nil {
 		return nil, fmt.Errorf("failed to read canonical file_tags rows for repo %s tag %d: %w", repoID.String(), tagID, err)
-	}
-
-	if driftCount > 0 {
-		log.Printf("[DeleteRepoTag] detected %d file_tags rows missing from file_tags_by_tag for repo %s tag %d; cleaning via canonical fallback",
-			driftCount, repoID.String(), tagID)
 	}
 
 	return fileTagDeleteEntriesSlice(entriesByPath), nil
