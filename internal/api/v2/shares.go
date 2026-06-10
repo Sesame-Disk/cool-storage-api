@@ -123,7 +123,7 @@ func (h *ShareHandler) CreateShareLink(c *gin.Context) {
 	userUUID, _ := uuid.Parse(userID)
 
 	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, req.RepoID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 

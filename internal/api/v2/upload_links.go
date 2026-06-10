@@ -252,7 +252,7 @@ func (h *UploadLinkHandler) CreateUploadLink(c *gin.Context) {
 
 	libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, req.RepoID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 
@@ -448,7 +448,7 @@ func (h *UploadLinkHandler) UpdateUploadLink(c *gin.Context) {
 	}
 
 	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, libID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 

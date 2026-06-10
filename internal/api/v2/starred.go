@@ -22,6 +22,8 @@ func NewStarredHandler(database *db.DB) *StarredHandler {
 
 // StarredFile represents a starred file in API response format
 // Format matches Seafile's /api/v2.1/starred-items/ response
+var unstarFileFn = unstarFile
+
 type StarredFile struct {
 	RepoID           string `json:"repo_id"`
 	RepoName         string `json:"repo_name"`
@@ -209,7 +211,7 @@ func (h *StarredHandler) StarFile(c *gin.Context) {
 
 	libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, req.RepoID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 
@@ -269,7 +271,6 @@ func (h *StarredHandler) StarFile(c *gin.Context) {
 // Also supports: DELETE /api/v2.1/starred-items/?repo_id=xxx&path=/path
 func (h *StarredHandler) UnstarFile(c *gin.Context) {
 	userID := c.GetString("user_id")
-	orgID := c.GetString("org_id")
 
 	if userID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
@@ -298,13 +299,8 @@ func (h *StarredHandler) UnstarFile(c *gin.Context) {
 		filePath = "/" + filePath
 	}
 
-	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
 	// Delete starred file
-	err := unstarFile(h.db.Session(), userID, repoID, filePath)
+	err := unstarFileFn(h.db.Session(), userID, repoID, filePath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to unstar file"})
 		return

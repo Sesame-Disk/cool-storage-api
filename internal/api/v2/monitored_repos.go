@@ -15,6 +15,8 @@ type MonitoredRepoHandler struct {
 	db *db.DB
 }
 
+var deleteMonitoredRepoFn = deleteMonitoredRepo
+
 // NewMonitoredRepoHandler creates a new MonitoredRepoHandler
 func NewMonitoredRepoHandler(database *db.DB) *MonitoredRepoHandler {
 	return &MonitoredRepoHandler{db: database}
@@ -65,7 +67,7 @@ func (h *MonitoredRepoHandler) MonitorRepo(c *gin.Context) {
 	}
 
 	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, req.RepoID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		writeLiveLibraryStateError(c, err)
 		return
 	}
 
@@ -109,7 +111,6 @@ func (h *MonitoredRepoHandler) MonitorRepo(c *gin.Context) {
 // DELETE /api/v2.1/monitored-repos/:repo_id/
 func (h *MonitoredRepoHandler) UnmonitorRepo(c *gin.Context) {
 	userID := c.GetString("user_id")
-	orgID := c.GetString("org_id")
 	repoID := c.Param("repo_id")
 
 	if userID == "" {
@@ -122,19 +123,18 @@ func (h *MonitoredRepoHandler) UnmonitorRepo(c *gin.Context) {
 		return
 	}
 
-	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM monitored_repos WHERE user_id = ? AND repo_id = ?`, userID, repoID)
-	batch.Query(`DELETE FROM monitored_repos_by_repo WHERE repo_id = ? AND user_id = ?`, repoID, userID)
-	err := batch.Exec()
+	err := deleteMonitoredRepoFn(h.db.Session(), userID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to unmonitor repo"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func deleteMonitoredRepo(session *gocql.Session, userID, repoID string) error {
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM monitored_repos WHERE user_id = ? AND repo_id = ?`, userID, repoID)
+	batch.Query(`DELETE FROM monitored_repos_by_repo WHERE repo_id = ? AND user_id = ?`, repoID, userID)
+	return batch.Exec()
 }
