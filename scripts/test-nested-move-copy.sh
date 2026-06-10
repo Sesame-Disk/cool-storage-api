@@ -156,6 +156,7 @@ run_test_not_contains() {
 record_cleanup_failure() {
     local message="$1"
     log_fail "$message"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
     FAILED_TESTS=$((FAILED_TESTS + 1))
     FAILED_TEST_NAMES+=("$message")
 }
@@ -395,7 +396,13 @@ delete_library() {
     for attempt in 1 2 3; do
         delete_status=$(api_status "DELETE" "/api/v2.1/repos/${repo_id}/" "$ADMIN_TOKEN" "" || true)
         status=$(api_status "GET" "/api/v2.1/repos/${repo_id}/" "$ADMIN_TOKEN" "" || true)
-        if [ "$delete_status" = "404" ] || [ "$status" = "404" ] || [ "$status" = "403" ]; then
+        if [ "$delete_status" = "404" ] || [ "$status" = "404" ]; then
+            return 0
+        fi
+        if [ "$delete_status" = "200" ] && [ "$status" = "403" ]; then
+            # Deleted libraries fail closed on the permission-gated GET endpoint.
+            # A successful owner delete followed by 403 means the library is no
+            # longer accessible, which is the expected post-soft-delete state.
             return 0
         fi
         sleep 1
