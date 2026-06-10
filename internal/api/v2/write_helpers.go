@@ -1200,6 +1200,8 @@ func collectFileTagDeleteEntries(sess *gocql.Session, repoID gocql.UUID, tagID i
 		return nil, fmt.Errorf("failed to read file_tags_by_tag projection for repo %s tag %d: %w", repoID.String(), tagID, err)
 	}
 
+	// Destructive/admin path safety net: scan the repo's canonical rows so tag
+	// deletion still cleans up if the reverse-lookup projection drifted.
 	canonicalIter := sess.Query(`
 		SELECT file_path, tag_id, file_tag_id FROM file_tags WHERE repo_id = ?
 	`, repoID).Iter()

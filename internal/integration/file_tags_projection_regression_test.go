@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	v2pkg "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
@@ -39,6 +40,34 @@ func TestFileTagsProjectionRegression_AddAndRemoveDualWrite(t *testing.T) {
 	})
 
 	t.Cleanup(func() { deleteRepoTagForProjectionTest(t, adminClient, repoID, tagID) })
+}
+
+func TestFileTagsProjectionRegression_MoveFileTagPathKeepsCanonicalProjectionAndByIDInSync(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-filetags-move-%d", time.Now().UnixNano()))
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+
+	tagID := createRepoTagForProjectionTest(t, adminClient, repoID, "projection-move")
+	oldPath := "/projection-move-old.txt"
+	newPath := "/projection-move-new.txt"
+	fileTagID := addFileTagForProjectionTest(t, adminClient, repoID, oldPath, tagID)
+	t.Cleanup(func() { deleteRepoTagForProjectionTest(t, adminClient, repoID, tagID) })
+
+	waitForIntegrationCondition(t, "file tag seeded before move", func() bool {
+		return fileTagCanonicalExistsForTest(t, session, repoID, oldPath, tagID) &&
+			fileTagProjectionExistsForTest(t, session, repoID, tagID, oldPath) &&
+			fileTagByIDMatchesPathForProjectionTest(t, session, repoID, fileTagID, oldPath)
+	})
+
+	v2pkg.MoveFileTagsByPath(database, repoID, oldPath, newPath)
+
+	waitForIntegrationCondition(t, "move file tag path keeps canonical, projection, and by-id in sync", func() bool {
+		return !fileTagCanonicalExistsForTest(t, session, repoID, oldPath, tagID) &&
+			fileTagCanonicalExistsForTest(t, session, repoID, newPath, tagID) &&
+			!fileTagProjectionExistsForTest(t, session, repoID, tagID, oldPath) &&
+			fileTagProjectionExistsForTest(t, session, repoID, tagID, newPath) &&
+			fileTagByIDMatchesPathForProjectionTest(t, session, repoID, fileTagID, newPath)
+	})
 }
 
 func TestFileTagsProjectionRegression_DeleteRepoTagDropsProjection(t *testing.T) {
@@ -313,6 +342,23 @@ func fileTagByIDExistsForProjectionTest(t *testing.T, session *gocql.Session, re
 	`, repoID, fileTagID).Scan(&filePath)
 	if err == nil {
 		return true
+	}
+	if err == gocql.ErrNotFound {
+		return false
+	}
+	t.Fatalf("query file_tags_by_id for repo %s file_tag_id %d failed: %v", repoID, fileTagID, err)
+	return false
+}
+
+func fileTagByIDMatchesPathForProjectionTest(t *testing.T, session *gocql.Session, repoID string, fileTagID int, wantPath string) bool {
+	t.Helper()
+
+	var filePath string
+	err := session.Query(`
+		SELECT file_path FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
+	`, repoID, fileTagID).Scan(&filePath)
+	if err == nil {
+		return filePath == wantPath
 	}
 	if err == gocql.ErrNotFound {
 		return false

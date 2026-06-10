@@ -647,41 +647,22 @@ func MoveFileTagsByPath(database *db.DB, repoID, oldPath, newPath string) {
 	var tagID, fileTagID int
 	var createdAt time.Time
 	for iter.Scan(&tagID, &fileTagID, &createdAt) {
-		// Insert with new path
-		if err := database.Session().Query(`
+		batch := database.Session().Batch(gocql.LoggedBatch)
+		batch.Query(`
 			INSERT INTO file_tags (repo_id, file_path, tag_id, file_tag_id, created_at)
 			VALUES (?, ?, ?, ?, ?)
-		`, repoUUID, newPath, tagID, fileTagID, createdAt).Exec(); err != nil {
-			log.Printf("[MoveFileTagsByPath] failed to insert file_tags for repo %s old_path %q new_path %q tag %d: %v", repoID, oldPath, newPath, tagID, err)
-			continue
-		}
-
-		// Update lookup table
-		if err := database.Session().Query(`
+		`, repoUUID, newPath, tagID, fileTagID, createdAt)
+		batch.Query(`
 			INSERT INTO file_tags_by_id (repo_id, file_tag_id, file_path, tag_id, created_at)
 			VALUES (?, ?, ?, ?, ?)
-		`, repoUUID, fileTagID, newPath, tagID, createdAt).Exec(); err != nil {
-			log.Printf("[MoveFileTagsByPath] failed to insert file_tags_by_id for repo %s old_path %q new_path %q tag %d: %v", repoID, oldPath, newPath, tagID, err)
-			continue
-		}
-
-		// Move the reverse-lookup projection to the new path (new row + drop old).
-		insertProjection := database.Session().Batch(gocql.LoggedBatch)
-		addFileTagsByTagInsertQuery(insertProjection, repoUUID, newPath, tagID, fileTagID, createdAt)
-		if err := insertProjection.Exec(); err != nil {
-			log.Printf("[MoveFileTagsByPath] failed to insert file_tags_by_tag for repo %s new_path %q tag %d: %v", repoID, newPath, tagID, err)
-			continue
-		}
-
-		// Delete old path row. file_tags_by_id is keyed by file_tag_id, so the
-		// INSERT above updates that lookup in place; deleting it here would erase
-		// the moved tag's remove-by-id path.
-		batch := database.Session().Batch(gocql.LoggedBatch)
+		`, repoUUID, fileTagID, newPath, tagID, createdAt)
+		addFileTagsByTagInsertQuery(batch, repoUUID, newPath, tagID, fileTagID, createdAt)
 		batch.Query(`DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?`,
 			repoUUID, oldPath, tagID)
 		addFileTagsByTagDeleteQuery(batch, repoUUID, oldPath, tagID)
 		if err := batch.Exec(); err != nil {
-			log.Printf("[MoveFileTagsByPath] failed to delete old tag rows for repo %s old_path %q tag %d: %v", repoID, oldPath, tagID, err)
+			log.Printf("[MoveFileTagsByPath] failed to move tag rows for repo %s old_path %q new_path %q tag %d: %v",
+				repoID, oldPath, newPath, tagID, err)
 		}
 
 		// Note: counters don't change — same tag, same count, just different path
