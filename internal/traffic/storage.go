@@ -421,6 +421,7 @@ func AddAggregateStorageReconciliationQueries(batch *gocql.Batch, orgID, ownerID
 }
 
 var readStorageSnapshotAtShardErrFn = readStorageSnapshotAtShardErr
+var storageUpdateErrFn = storageUpdateErr
 
 // ReconcileStorageScope corrects a scope to the expected running total.
 // The delta is derived from the current live total, so repeated runs converge.
@@ -440,10 +441,10 @@ func ReconcileStorageScope(db DBSession, scope string, expected StorageSnapshot)
 
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	session := db.Session()
-	if err := storageUpdateErr(session, scope, counterShardZero, storageTotalDay, deltaBytes, deltaFiles); err != nil {
+	if err := storageUpdateErrFn(session, scope, counterShardZero, storageTotalDay, deltaBytes, deltaFiles); err != nil {
 		return err
 	}
-	if err := storageUpdateErr(session, scope, counterShardZero, today, deltaBytes, deltaFiles); err != nil {
+	if err := storageUpdateErrFn(session, scope, counterShardZero, today, deltaBytes, deltaFiles); err != nil {
 		return err
 	}
 	return nil
@@ -456,31 +457,41 @@ func ReconcileStorageScopeSharded(db DBSession, scope string, expectedByShard ma
 		return fmt.Errorf("sharded reconciliation only supports platform scope")
 	}
 
+	currentByShard := make(map[int]StorageSnapshot, CounterShardCount)
+	var firstErr error
+	ForEachCounterShard(func(shard int) {
+		if firstErr != nil {
+			return
+		}
+		current, err := readStorageSnapshotAtShardErrFn(db, scope, shard, storageTotalDay)
+		if err != nil {
+			firstErr = fmt.Errorf("read current storage scope %s shard %d: %w", scope, shard, err)
+			return
+		}
+		currentByShard[shard] = current
+	})
+	if firstErr != nil {
+		return firstErr
+	}
+
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	session := db.Session()
-	var firstErr error
 
 	ForEachCounterShard(func(shard int) {
 		expected := expectedByShard[shard]
-		current, err := readStorageSnapshotAtShardErrFn(db, scope, shard, storageTotalDay)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("read current storage scope %s shard %d: %w", scope, shard, err)
-			}
-			return
-		}
+		current := currentByShard[shard]
 		deltaBytes := expected.BytesUsed - current.BytesUsed
 		deltaFiles := expected.FileCount - current.FileCount
 		if deltaBytes == 0 && deltaFiles == 0 {
 			return
 		}
-		if err := storageUpdateErr(session, scope, shard, storageTotalDay, deltaBytes, deltaFiles); err != nil {
+		if err := storageUpdateErrFn(session, scope, shard, storageTotalDay, deltaBytes, deltaFiles); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			return
 		}
-		if err := storageUpdateErr(session, scope, shard, today, deltaBytes, deltaFiles); err != nil && firstErr == nil {
+		if err := storageUpdateErrFn(session, scope, shard, today, deltaBytes, deltaFiles); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	})

@@ -141,3 +141,36 @@ func TestReconcileStorageScopeShardedReturnsReadError(t *testing.T) {
 		t.Fatalf("ReconcileStorageScopeSharded error = %v, want wrapped shard read failure", err)
 	}
 }
+
+func TestReconcileStorageScopeShardedDoesNotWriteBeforeReadPassSucceeds(t *testing.T) {
+	prevRead := readStorageSnapshotAtShardErrFn
+	prevWrite := storageUpdateErrFn
+	t.Cleanup(func() {
+		readStorageSnapshotAtShardErrFn = prevRead
+		storageUpdateErrFn = prevWrite
+	})
+
+	readStorageSnapshotAtShardErrFn = func(db DBSession, scope string, shard int, day time.Time) (StorageSnapshot, error) {
+		if shard == 7 {
+			return StorageSnapshot{}, errors.New("shard read failed")
+		}
+		return StorageSnapshot{}, nil
+	}
+
+	writeCalls := 0
+	storageUpdateErrFn = func(session *gocql.Session, scope string, shard int, day time.Time, deltaBytes, deltaFiles int64) error {
+		writeCalls++
+		return nil
+	}
+
+	err := ReconcileStorageScopeSharded(nilDBSession{}, PlatformStorageScope(), map[int]StorageSnapshot{
+		0: {BytesUsed: 123, FileCount: 1},
+		9: {BytesUsed: 456, FileCount: 2},
+	})
+	if err == nil || !strings.Contains(err.Error(), "shard read failed") {
+		t.Fatalf("ReconcileStorageScopeSharded error = %v, want wrapped shard read failure", err)
+	}
+	if writeCalls != 0 {
+		t.Fatalf("ReconcileStorageScopeSharded performed %d write(s) before read pass completed, want 0", writeCalls)
+	}
+}
