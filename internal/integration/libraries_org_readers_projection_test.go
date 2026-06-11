@@ -92,26 +92,28 @@ func TestLibrariesOrgReaders_SoftDeleteRemovedFromActiveCount(t *testing.T) {
 }
 
 func TestLibrariesOrgReaders_DuplicateNameRejectedViaProjection(t *testing.T) {
-	name := fmt.Sprintf("inttest-orgreaders-dup-%d", time.Now().UnixNano())
-	createTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+	perm := middleware.NewPermissionMiddleware(database)
 
-	// ownerHasActiveLibraryNamed reads libraries_by_owner; the first create wrote
-	// the projection in the same batch, so the duplicate must be rejected.
-	waitForIntegrationCondition(t, "duplicate library name rejected with 409 via projection", func() bool {
-		resp := adminClient.PostJSON(t, "/api/v2.1/repos/", map[string]string{"repo_name": name})
-		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusConflict {
-			return true
-		}
-		// A library created by the duplicate attempt must be cleaned up so retries
-		// (and the suite) stay deterministic.
-		if resp.StatusCode == http.StatusOK {
-			if repoID := repoIDFromCreateResponse(t, resp); repoID != "" {
-				adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID)).Body.Close()
-			}
-		}
-		return false
+	adminUserID, ok := lookupUserIDByEmail(t, defaultAdminEmail)
+	if !ok {
+		t.Fatalf("expected user_id for %s", defaultAdminEmail)
+	}
+
+	name := fmt.Sprintf("inttest-orgreaders-dup-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+
+	// Wait for the projection-backed owned-library reader to observe the first
+	// library before issuing a single duplicate create request.
+	waitForIntegrationCondition(t, "GetUserLibraries sees the original library via projection", func() bool {
+		return userOwnsLibraryForTest(t, perm, defaultOrgID, adminUserID, repoID)
 	})
+
+	resp := adminClient.PostJSON(t, "/api/v2.1/repos/", map[string]string{"repo_name": name})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate create expected status=%d, got status=%d body=%s", http.StatusConflict, resp.StatusCode, responseBody(t, resp))
+	}
+	resp.Body.Close()
 }
 
 func TestLibrariesOrgReaders_OrgAdminOwnedReposIncludesLibrary(t *testing.T) {

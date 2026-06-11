@@ -934,7 +934,13 @@ func (m *PermissionMiddleware) GetUserLibraries(orgID, userID string) ([]Library
 
 	var libIDStr string
 	for iter.Scan(&libIDStr) {
-		libID, _ := uuid.Parse(libIDStr)
+		libID, err := uuid.Parse(libIDStr)
+		if err != nil {
+			if closeErr := iter.Close(); closeErr != nil {
+				return nil, closeErr
+			}
+			return nil, fmt.Errorf("parse owned library id %q: %w", libIDStr, err)
+		}
 		librariesMap[libID] = PermissionOwner
 	}
 	if err := iter.Close(); err != nil {

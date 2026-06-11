@@ -186,8 +186,7 @@ ever measure single-day partitions approaching the soft limit.
 ## H. Org-scoped `libraries` scans still walk tombstone-heavy partitions
 
 **Status**: partially resolved (2026-06-10, branch
-`feat/libraries-org-readers-projection`); owner/enforcement reads moved, list
-+ GC scans still open
+`feat/libraries-org-readers-projection`); owner/enforcement reads moved, list GC scans still open
 
 **Tables**: `libraries`, `libraries_by_owner`, `libraries_deleted_by_org`
 
