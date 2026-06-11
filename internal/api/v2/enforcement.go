@@ -54,11 +54,13 @@ func CountUploadLinks(database *db.DB, orgID string) int {
 }
 
 // CountActiveLibraries counts non-deleted libraries for an org from the
-// canonical libraries table. Callers must treat read errors as enforcement
-// failures rather than silently allowing writes.
+// libraries_by_org_updated projection (single org partition, kept in sync with
+// the canonical libraries table on every mutation) instead of scanning the
+// tombstone-heavy canonical org partition. Callers must treat read errors as
+// enforcement failures rather than silently allowing writes.
 func CountActiveLibraries(database *db.DB, orgID string) (int, error) {
 	iter := database.Session().Query(
-		`SELECT deleted_at FROM libraries WHERE org_id = ?`, orgID,
+		`SELECT deleted_at FROM libraries_by_org_updated WHERE org_id = ?`, orgID,
 	).Iter()
 
 	var deletedAt time.Time

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/gin-gonic/gin"
@@ -925,20 +926,29 @@ func (m *PermissionMiddleware) addRecipientSharedLibraries(librariesMap map[uuid
 func (m *PermissionMiddleware) GetUserLibraries(orgID, userID string) ([]LibraryWithPermission, error) {
 	librariesMap := make(map[uuid.UUID]LibraryPermission)
 
-	// 1. Get all libraries for the org and filter by owner in application code
-	// Note: We query all libraries for the org (indexed by org_id), then filter in Go
-	// This avoids ALLOW FILTERING and is acceptable since we're already querying by partition key
+	// 1. Get the user's owned libraries from the libraries_by_owner projection,
+	// a single (org_id, owner_id) partition, instead of scanning the whole org
+	// partition of the canonical libraries table and filtering owner in Go.
 	iter := m.db.Session().Query(`
-		SELECT library_id, owner_id FROM libraries WHERE org_id = ?
-	`, orgID).Iter()
+		SELECT library_id, deleted_at FROM libraries_by_owner WHERE org_id = ? AND owner_id = ?
+	`, orgID, userID).Iter()
 
-	var libIDStr, ownerIDStr string
-	for iter.Scan(&libIDStr, &ownerIDStr) {
-		// Filter by owner_id in application code
-		if ownerIDStr == userID {
-			libID, _ := uuid.Parse(libIDStr)
-			librariesMap[libID] = PermissionOwner
+	var libIDStr string
+	var deletedAt time.Time
+	for iter.Scan(&libIDStr, &deletedAt) {
+		if !deletedAt.IsZero() {
+			deletedAt = time.Time{}
+			continue
 		}
+		libID, err := uuid.Parse(libIDStr)
+		if err != nil {
+			if closeErr := iter.Close(); closeErr != nil {
+				return nil, closeErr
+			}
+			return nil, fmt.Errorf("parse owned library id %q: %w", libIDStr, err)
+		}
+		librariesMap[libID] = PermissionOwner
+		deletedAt = time.Time{}
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err

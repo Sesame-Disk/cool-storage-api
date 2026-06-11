@@ -456,10 +456,11 @@ func (h *OrgAdminHandler) GetOrgUserOwnedRepos(c *gin.Context) {
 		return
 	}
 
+	// Read from the libraries_by_owner projection (single (org_id, owner_id)
+	// partition) instead of an ALLOW FILTERING scan over the canonical table.
 	iter := h.db.Session().Query(`
-		SELECT library_id, name, encrypted, size_bytes, updated_at
-		FROM libraries WHERE org_id = ? AND owner_id = ?
-		ALLOW FILTERING
+		SELECT library_id, name, encrypted, size_bytes, updated_at, deleted_at
+		FROM libraries_by_owner WHERE org_id = ? AND owner_id = ?
 	`, targetOrgID, userID).Iter()
 
 	type repoItem struct {
@@ -475,9 +476,13 @@ func (h *OrgAdminHandler) GetOrgUserOwnedRepos(c *gin.Context) {
 	var libID, libName string
 	var encrypted bool
 	var size int64
-	var updatedAt time.Time
+	var updatedAt, deletedAt time.Time
 
-	for iter.Scan(&libID, &libName, &encrypted, &size, &updatedAt) {
+	for iter.Scan(&libID, &libName, &encrypted, &size, &updatedAt, &deletedAt) {
+		if !deletedAt.IsZero() {
+			deletedAt = time.Time{}
+			continue
+		}
 		repos = append(repos, repoItem{
 			RepoID:       libID,
 			RepoName:     libName,
@@ -486,6 +491,7 @@ func (h *OrgAdminHandler) GetOrgUserOwnedRepos(c *gin.Context) {
 			Owner:        email,
 			LastModified: updatedAt.Format(time.RFC3339),
 		})
+		deletedAt = time.Time{}
 	}
 	if err := iter.Close(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list repos"})

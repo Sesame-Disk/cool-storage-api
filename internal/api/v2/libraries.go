@@ -70,18 +70,21 @@ func (h *LibraryHandler) resolveOwnerEmail(orgID, userID string) string {
 }
 
 func (h *LibraryHandler) ownerHasActiveLibraryNamed(orgID, ownerID, libraryName string) (bool, error) {
+	// Read the owner's libraries from the libraries_by_owner projection (single
+	// (org_id, owner_id) partition) instead of scanning the whole org partition
+	// of the canonical libraries table.
 	iter := h.db.Session().Query(`
-		SELECT owner_id, name, deleted_at FROM libraries WHERE org_id = ?
-	`, orgID).Iter()
+		SELECT name, deleted_at FROM libraries_by_owner WHERE org_id = ? AND owner_id = ?
+	`, orgID, ownerID).Iter()
 
-	var existingOwnerID, existingName string
+	var existingName string
 	var existingDeletedAt time.Time
-	for iter.Scan(&existingOwnerID, &existingName, &existingDeletedAt) {
+	for iter.Scan(&existingName, &existingDeletedAt) {
 		if !existingDeletedAt.IsZero() {
 			existingDeletedAt = time.Time{}
 			continue
 		}
-		if existingOwnerID == ownerID && existingName == libraryName {
+		if existingName == libraryName {
 			if err := iter.Close(); err != nil {
 				return false, err
 			}
@@ -518,8 +521,8 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		}
 	}
 
-	// Check if a library with this name already exists for this user using the
-	// canonical libraries rows as the source of truth.
+	// Check if a library with this name already exists for this user via the
+	// libraries_by_owner projection (the owner's single partition).
 	hasDuplicate, err := h.ownerHasActiveLibraryNamed(orgID, userID, req.Name)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check existing libraries"})
