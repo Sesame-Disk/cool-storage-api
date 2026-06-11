@@ -26,28 +26,38 @@ type userTrafficMeta struct {
 	Name  string
 }
 
+func forEachTrafficCounterShard(orgID gocql.UUID, fn func(int)) {
+	if orgID == (gocql.UUID{}) {
+		traffic.ForEachCounterShard(fn)
+		return
+	}
+	fn(0)
+}
+
 func readPlatformTrafficUsage(session *gocql.Session, months []string) traffic.MonthlyTransferUsage {
 	usage := traffic.MonthlyTransferUsage{}
 	for _, month := range months {
-		iter := session.Query(
-			`SELECT user_id, traffic_type, bytes_transferred FROM traffic_counters WHERE org_id = ? AND month = ?`,
-			gocql.UUID{}, month,
-		).Iter()
-		var userUUID gocql.UUID
-		var trafficType string
-		var bytes int64
-		for iter.Scan(&userUUID, &trafficType, &bytes) {
-			if userUUID != (gocql.UUID{}) {
-				continue
+		forEachTrafficCounterShard(gocql.UUID{}, func(shard int) {
+			iter := session.Query(
+				`SELECT user_id, traffic_type, bytes_transferred FROM traffic_counters WHERE org_id = ? AND month = ? AND shard = ?`,
+				gocql.UUID{}, month, shard,
+			).Iter()
+			var userUUID gocql.UUID
+			var trafficType string
+			var bytes int64
+			for iter.Scan(&userUUID, &trafficType, &bytes) {
+				if userUUID != (gocql.UUID{}) {
+					continue
+				}
+				usage.Combined += bytes
+				if strings.HasSuffix(trafficType, "-upload") {
+					usage.Upload += bytes
+				} else if strings.HasSuffix(trafficType, "-download") {
+					usage.Download += bytes
+				}
 			}
-			usage.Combined += bytes
-			if strings.HasSuffix(trafficType, "-upload") {
-				usage.Upload += bytes
-			} else if strings.HasSuffix(trafficType, "-download") {
-				usage.Download += bytes
-			}
-		}
-		_ = iter.Close()
+			_ = iter.Close()
+		})
 	}
 	return usage
 }
@@ -161,35 +171,37 @@ func loadUserTrafficMetaForOrg(session *gocql.Session, orgID gocql.UUID, userMap
 }
 
 func accumulateTrafficPartition(session *gocql.Session, orgID gocql.UUID, month string, userMap map[string]userTrafficMeta, entries map[string]gin.H, perUserTotals map[string]int64, aggregateTotals map[string]int64) {
-	iter := session.Query(
-		`SELECT user_id, traffic_type, bytes_transferred FROM traffic_counters WHERE org_id = ? AND month = ?`,
-		orgID, month,
-	).Iter()
-	var userUUID gocql.UUID
-	var trafficType string
-	var bytes int64
-	for iter.Scan(&userUUID, &trafficType, &bytes) {
-		if userUUID == (gocql.UUID{}) {
-			if aggregateTotals != nil {
-				aggregateTotals[trafficType] += bytes
+	forEachTrafficCounterShard(orgID, func(shard int) {
+		iter := session.Query(
+			`SELECT user_id, traffic_type, bytes_transferred FROM traffic_counters WHERE org_id = ? AND month = ? AND shard = ?`,
+			orgID, month, shard,
+		).Iter()
+		var userUUID gocql.UUID
+		var trafficType string
+		var bytes int64
+		for iter.Scan(&userUUID, &trafficType, &bytes) {
+			if userUUID == (gocql.UUID{}) {
+				if aggregateTotals != nil {
+					aggregateTotals[trafficType] += bytes
+				}
+				continue
 			}
-			continue
+			if perUserTotals != nil {
+				perUserTotals[trafficType] += bytes
+			}
+			meta, ok := userMap[userUUID.String()]
+			if !ok || meta.Email == "" {
+				continue
+			}
+			entry, exists := entries[meta.Email]
+			if !exists {
+				entry = newUserTrafficRow(meta)
+			}
+			addTrafficBytes(entry, trafficType, bytes)
+			entries[meta.Email] = entry
 		}
-		if perUserTotals != nil {
-			perUserTotals[trafficType] += bytes
-		}
-		meta, ok := userMap[userUUID.String()]
-		if !ok || meta.Email == "" {
-			continue
-		}
-		entry, exists := entries[meta.Email]
-		if !exists {
-			entry = newUserTrafficRow(meta)
-		}
-		addTrafficBytes(entry, trafficType, bytes)
-		entries[meta.Email] = entry
-	}
-	_ = iter.Close()
+		_ = iter.Close()
+	})
 }
 
 func platformUserTrafficComplete(platformTotals map[string]int64, perUserTotals map[string]int64) bool {
@@ -245,28 +257,30 @@ func queryTrafficStats(session *gocql.Session, orgID gocql.UUID, c *gin.Context)
 
 	agg := map[string]map[string]int64{}
 	for month := range monthsNeeded {
-		iter := session.Query(
-			`SELECT day, user_id, traffic_type, bytes_transferred FROM traffic_counters
-			 WHERE org_id = ? AND month = ?`,
-			orgID, month,
-		).Iter()
-		var day time.Time
-		var userID gocql.UUID
-		var trafficType string
-		var bytes int64
-		for iter.Scan(&day, &userID, &trafficType, &bytes) {
-			if orgID == (gocql.UUID{}) && userID != (gocql.UUID{}) {
-				continue
+		forEachTrafficCounterShard(orgID, func(shard int) {
+			iter := session.Query(
+				`SELECT day, user_id, traffic_type, bytes_transferred FROM traffic_counters
+				 WHERE org_id = ? AND month = ? AND shard = ?`,
+				orgID, month, shard,
+			).Iter()
+			var day time.Time
+			var userID gocql.UUID
+			var trafficType string
+			var bytes int64
+			for iter.Scan(&day, &userID, &trafficType, &bytes) {
+				if orgID == (gocql.UUID{}) && userID != (gocql.UUID{}) {
+					continue
+				}
+				dk := day.UTC().Format("2006-01-02")
+				if agg[dk] == nil {
+					agg[dk] = map[string]int64{}
+				}
+				agg[dk][trafficType] += bytes
 			}
-			dk := day.UTC().Format("2006-01-02")
-			if agg[dk] == nil {
-				agg[dk] = map[string]int64{}
+			if err := iter.Close(); err != nil {
+				log.Printf("[traffic] queryTrafficStats iter error: %v", err)
 			}
-			agg[dk][trafficType] += bytes
-		}
-		if err := iter.Close(); err != nil {
-			log.Printf("[traffic] queryTrafficStats iter error: %v", err)
-		}
+		})
 	}
 
 	result := make([]gin.H, 0, len(dates))
@@ -327,7 +341,7 @@ func (h *AdminHandler) AdminStatisticStorage(c *gin.Context) {
 	}
 
 	start, end := parseDateRangeParams(c)
-	history := traffic.ReconstructStorageHistory(h.db, "platform", start, end)
+	history := traffic.ReconstructStorageHistory(h.db, traffic.PlatformStorageScope(), start, end)
 
 	stats := h.generateDateRange(c)
 	result := make([]gin.H, len(stats))
@@ -464,25 +478,27 @@ func queryActiveUserStats(session *gocql.Session, orgID gocql.UUID, c *gin.Conte
 
 	dailyUsers := map[string]map[gocql.UUID]struct{}{}
 	for month := range monthsNeeded {
-		iter := session.Query(
-			`SELECT day, user_id FROM traffic_counters WHERE org_id = ? AND month = ?`,
-			orgID, month,
-		).Iter()
-		var day time.Time
-		var userID gocql.UUID
-		for iter.Scan(&day, &userID) {
-			if userID == (gocql.UUID{}) {
-				continue
+		forEachTrafficCounterShard(orgID, func(shard int) {
+			iter := session.Query(
+				`SELECT day, user_id FROM traffic_counters WHERE org_id = ? AND month = ? AND shard = ?`,
+				orgID, month, shard,
+			).Iter()
+			var day time.Time
+			var userID gocql.UUID
+			for iter.Scan(&day, &userID) {
+				if userID == (gocql.UUID{}) {
+					continue
+				}
+				dayKey := day.UTC().Format("2006-01-02")
+				if dailyUsers[dayKey] == nil {
+					dailyUsers[dayKey] = map[gocql.UUID]struct{}{}
+				}
+				dailyUsers[dayKey][userID] = struct{}{}
 			}
-			dayKey := day.UTC().Format("2006-01-02")
-			if dailyUsers[dayKey] == nil {
-				dailyUsers[dayKey] = map[gocql.UUID]struct{}{}
+			if err := iter.Close(); err != nil {
+				log.Printf("[active-users] queryActiveUserStats iter error: %v", err)
 			}
-			dailyUsers[dayKey][userID] = struct{}{}
-		}
-		if err := iter.Close(); err != nil {
-			log.Printf("[active-users] queryActiveUserStats iter error: %v", err)
-		}
+		})
 	}
 
 	result := make([]gin.H, 0, len(dates))

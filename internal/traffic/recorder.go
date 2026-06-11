@@ -109,12 +109,13 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodH
 	} else {
 		periodStartedAt = r.loadCurrentPeriodStart(orgUUID, now)
 	}
+	platformShard := CounterShard(orgID)
 
 	// 1. Daily per-user/type detail — used for org-level statistics breakdowns.
 	if err := r.session.Query(
 		`UPDATE traffic_counters SET bytes_transferred = bytes_transferred + ?
-		 WHERE org_id = ? AND month = ? AND day = ? AND user_id = ? AND traffic_type = ?`,
-		bytes, orgUUID, month, day, userUUID, trafficType,
+		 WHERE org_id = ? AND month = ? AND shard = ? AND day = ? AND user_id = ? AND traffic_type = ?`,
+		bytes, orgUUID, month, counterShardZero, day, userUUID, trafficType,
 	).Exec(); err != nil {
 		return fmt.Errorf("traffic_counters: %w", err)
 	}
@@ -123,8 +124,8 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodH
 	//    sysadmin traffic charts can be served with a single partition read.
 	if err := r.session.Query(
 		`UPDATE traffic_counters SET bytes_transferred = bytes_transferred + ?
-		 WHERE org_id = ? AND month = ? AND day = ? AND user_id = ? AND traffic_type = ?`,
-		bytes, gocql.UUID{}, month, day, gocql.UUID{}, trafficType,
+		 WHERE org_id = ? AND month = ? AND shard = ? AND day = ? AND user_id = ? AND traffic_type = ?`,
+		bytes, gocql.UUID{}, month, platformShard, day, gocql.UUID{}, trafficType,
 	).Exec(); err != nil {
 		log.Printf("[traffic] platform aggregate error type=%s: %v", trafficType, err)
 	}
@@ -133,8 +134,8 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodH
 	//    global user-traffic reports can avoid reading every org partition.
 	if err := r.session.Query(
 		`UPDATE traffic_counters SET bytes_transferred = bytes_transferred + ?
-		 WHERE org_id = ? AND month = ? AND day = ? AND user_id = ? AND traffic_type = ?`,
-		bytes, gocql.UUID{}, month, day, userUUID, trafficType,
+		 WHERE org_id = ? AND month = ? AND shard = ? AND day = ? AND user_id = ? AND traffic_type = ?`,
+		bytes, gocql.UUID{}, month, platformShard, day, userUUID, trafficType,
 	).Exec(); err != nil {
 		log.Printf("[traffic] platform per-user aggregate error user=%s type=%s: %v", userID, trafficType, err)
 	}

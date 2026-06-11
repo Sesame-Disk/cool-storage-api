@@ -155,6 +155,7 @@ func TestLibraryProjectionRegression_ReconcilePendingStorageCountersAfterSoftDel
 		return platformNow == baselinePlatform && orgNow == baselineOrg && userNow == baselineUser && libNow == uploadedLibSnapshot
 	})
 	expectedAfterReconcile := expectedAggregateStorageSnapshotsForScopes(t, database, platformScope, orgScope, userScope)
+	expectedPlatformAfterReconcileByShard := expectedPlatformStorageSnapshotsByShardForTest(t, database)
 
 	const driftBytes int64 = 777
 	const driftFiles int64 = 3
@@ -176,6 +177,7 @@ func TestLibraryProjectionRegression_ReconcilePendingStorageCountersAfterSoftDel
 	if got := traffic.ReadStorageSnapshot(database, platformScope); got != expectedAfterReconcile[platformScope] {
 		t.Fatalf("platform snapshot after reconciliation = %+v, want %+v", got, expectedAfterReconcile[platformScope])
 	}
+	assertPlatformStorageShardsForTest(t, session, expectedPlatformAfterReconcileByShard)
 	if got := traffic.ReadStorageSnapshot(database, orgScope); got != expectedAfterReconcile[orgScope] {
 		t.Fatalf("org snapshot after reconciliation = %+v, want %+v", got, expectedAfterReconcile[orgScope])
 	}
@@ -218,6 +220,7 @@ func TestLibraryProjectionRegression_ReconcilePendingStorageCountersUsesCanonica
 	})
 
 	expected := expectedAggregateStorageSnapshotsForScopes(t, database, platformScope, orgScope, userScope)
+	expectedPlatformByShard := expectedPlatformStorageSnapshotsByShardForTest(t, database)
 
 	const driftBytes int64 = 999
 	const driftFiles int64 = 7
@@ -237,6 +240,7 @@ func TestLibraryProjectionRegression_ReconcilePendingStorageCountersUsesCanonica
 	if got := traffic.ReadStorageSnapshot(database, platformScope); got != expected[platformScope] {
 		t.Fatalf("platform snapshot after canonical reconciliation = %+v, want %+v", got, expected[platformScope])
 	}
+	assertPlatformStorageShardsForTest(t, session, expectedPlatformByShard)
 	if got := traffic.ReadStorageSnapshot(database, orgScope); got != expected[orgScope] {
 		t.Fatalf("org snapshot after canonical reconciliation = %+v, want %+v", got, expected[orgScope])
 	}
@@ -1642,16 +1646,82 @@ func expectedAggregateStorageSnapshotsForScopes(t *testing.T, database *dbpkg.DB
 	return expected
 }
 
+func expectedPlatformStorageSnapshotsByShardForTest(t *testing.T, database *dbpkg.DB) map[int]traffic.StorageSnapshot {
+	t.Helper()
+
+	expected := make(map[int]traffic.StorageSnapshot, traffic.CounterShardCount)
+	iter := database.Session().Query(`
+		SELECT org_id, size_bytes, file_count, deleted_at FROM libraries
+	`).Iter()
+
+	var orgID string
+	var sizeBytes, fileCount int64
+	var deletedAt *time.Time
+	for iter.Scan(&orgID, &sizeBytes, &fileCount, &deletedAt) {
+		if deletedAt != nil && !deletedAt.IsZero() {
+			continue
+		}
+		if sizeBytes == 0 && fileCount == 0 {
+			continue
+		}
+		shard := traffic.CounterShard(orgID)
+		snap := expected[shard]
+		snap.BytesUsed += sizeBytes
+		snap.FileCount += fileCount
+		expected[shard] = snap
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("failed to scan libraries for expected sharded platform snapshots: %v", err)
+	}
+
+	return expected
+}
+
+func readStorageSnapshotByShardForTest(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, scope string, shard int) traffic.StorageSnapshot {
+	t.Helper()
+
+	var bytesUsed, fileCount int64
+	if err := session.Query(`
+		SELECT bytes_used, file_count FROM storage_counters
+		WHERE scope = ? AND shard = ? AND day = ?
+	`, scope, shard, storageCounterTotalDayForTest).Scan(&bytesUsed, &fileCount); err != nil {
+		if err == gocql.ErrNotFound {
+			return traffic.StorageSnapshot{}
+		}
+		t.Fatalf("failed to read storage snapshot for scope %s shard %d: %v", scope, shard, err)
+	}
+
+	return traffic.StorageSnapshot{
+		BytesUsed: max(bytesUsed, 0),
+		FileCount: max(fileCount, 0),
+	}
+}
+
+func assertPlatformStorageShardsForTest(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, expected map[int]traffic.StorageSnapshot) {
+	t.Helper()
+
+	traffic.ForEachCounterShard(func(shard int) {
+		if got := readStorageSnapshotByShardForTest(t, session, traffic.PlatformStorageScope(), shard); got != expected[shard] {
+			t.Fatalf("platform shard %d snapshot = %+v, want %+v", shard, got, expected[shard])
+		}
+	})
+}
+
 func addStorageCounterDriftForTest(t *testing.T, session interface {
 	Query(stmt string, values ...interface{}) *gocql.Query
 }, scope string, deltaBytes, deltaFiles int64) {
 	t.Helper()
 	today := time.Now().UTC().Truncate(24 * time.Hour)
+	shard := 0
 	for _, day := range []time.Time{storageCounterTotalDayForTest, today} {
 		if err := session.Query(`
 			UPDATE storage_counters SET bytes_used = bytes_used + ?, file_count = file_count + ?
-			WHERE scope = ? AND day = ?
-		`, deltaBytes, deltaFiles, scope, day).Exec(); err != nil {
+			WHERE scope = ? AND shard = ? AND day = ?
+		`, deltaBytes, deltaFiles, scope, shard, day).Exec(); err != nil {
 			t.Fatalf("failed to add storage drift for scope %s on %s: %v", scope, day.Format(time.RFC3339), err)
 		}
 	}

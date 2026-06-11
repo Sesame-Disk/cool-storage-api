@@ -2056,6 +2056,7 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 	}
 
 	expected := make(map[string]traffic.StorageSnapshot, len(requests))
+	expectedPlatformByShard := make(map[int]traffic.StorageSnapshot, traffic.CounterShardCount)
 	libIter := s.db.Session().Query(`
 		SELECT org_id, owner_id, size_bytes, file_count, deleted_at FROM libraries
 	`).Iter()
@@ -2074,10 +2075,11 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 		}
 
 		if _, ok := requests[traffic.PlatformStorageScope()]; ok {
-			snap := expected[traffic.PlatformStorageScope()]
+			shard := traffic.CounterShard(libOrgIDStr)
+			snap := expectedPlatformByShard[shard]
 			snap.BytesUsed += libSnapshot.BytesUsed
 			snap.FileCount += libSnapshot.FileCount
-			expected[traffic.PlatformStorageScope()] = snap
+			expectedPlatformByShard[shard] = snap
 		}
 
 		orgScope := traffic.OrganizationStorageScope(libOrgIDStr)
@@ -2103,7 +2105,13 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 	reconciled := 0
 	var firstErr error
 	for _, request := range requests {
-		if err := traffic.ReconcileStorageScope(s.db, request.Scope, expected[request.Scope]); err != nil {
+		var err error
+		if request.Scope == traffic.PlatformStorageScope() {
+			err = traffic.ReconcileStorageScopeSharded(s.db, request.Scope, expectedPlatformByShard)
+		} else {
+			err = traffic.ReconcileStorageScope(s.db, request.Scope, expected[request.Scope])
+		}
+		if err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("failed to reconcile storage scope %s: %w", request.Scope, err)
 			}

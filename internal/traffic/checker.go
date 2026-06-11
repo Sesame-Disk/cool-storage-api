@@ -294,8 +294,8 @@ func (c *Checker) readTrafficPeriod(orgID string, periodStartedAt time.Time, sco
 func (c *Checker) readStorageCounter(scope string) (int64, error) {
 	var bytes int64
 	err := c.session.Query(`
-		SELECT bytes_used FROM storage_counters WHERE scope = ? AND day = ?`,
-		scope, storageTotalDay,
+		SELECT bytes_used FROM storage_counters WHERE scope = ? AND shard = ? AND day = ?`,
+		scope, counterShardZero, storageTotalDay,
 	).Scan(&bytes)
 	if err != nil {
 		return 0, err

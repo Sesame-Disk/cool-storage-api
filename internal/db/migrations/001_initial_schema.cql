@@ -1331,11 +1331,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE TABLE IF NOT EXISTS traffic_counters (
     org_id            UUID,
     month             TEXT,
+    shard             INT,
     day               DATE,
     user_id           UUID,
     traffic_type      TEXT,
     bytes_transferred COUNTER,
-    PRIMARY KEY ((org_id, month), day, user_id, traffic_type)
+    PRIMARY KEY ((org_id, month, shard), day, user_id, traffic_type)
 );
 
 -- Monthly aggregates — single partition read for fast quota enforcement.
@@ -1361,8 +1362,9 @@ CREATE TABLE IF NOT EXISTS traffic_period_usage (
 -- Ordered DESC so the running-total row (epoch date) sorts last, daily deltas first.
 CREATE TABLE IF NOT EXISTS storage_counters (
     scope      TEXT,
+    shard      INT,
     day        DATE,
     bytes_used COUNTER,
     file_count COUNTER,
-    PRIMARY KEY ((scope), day)
+    PRIMARY KEY ((scope, shard), day)
 ) WITH CLUSTERING ORDER BY (day DESC);
