@@ -3021,12 +3021,14 @@ the baseline.
 - `storage_counters` now uses `PRIMARY KEY ((scope, shard), day)`.
 - Only the global platform aggregates are sharded.
 - Org/user/library scopes stay pinned to `shard = 0`.
-- Platform writes route deterministically by `CounterShard(org_id)` so each org's inc/dec path stays balanced on the same shard.
+- Platform writes route deterministically by a canonical UUID hash (`CounterShard` / `CounterShardUUID`), so each org's inc/dec path stays balanced on the same shard even if callers vary letter case in UUID strings.
+- The initial shard width is `32`, matching the repo's other modest fan-out bucket choices and giving more write-dispersion headroom for multiregion global aggregates.
 
 **Why this shape is safe**:
 - The hot quota paths still read single-partition org/user/library counters.
 - Only cold sysadmin/global readers fan out across shards.
 - Reconciliation also buckets platform expected totals by the same deterministic shard.
+- Counter writes remain non-idempotent Cassandra operations: do not mark them idempotent, do not mix them into non-counter batches, and do not rely on automatic retries to replay them safely.
 
 ---
 

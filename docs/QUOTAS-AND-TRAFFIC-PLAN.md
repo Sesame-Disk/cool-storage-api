@@ -157,17 +157,20 @@ For quota enforcement, 3 checks are evaluated (most restrictive wins):
 
 ### 1.1 Table `traffic_counters` (counter table)
 
-Daily tracking per org/user/type. Partitioned by `(org_id, month)` for natural monthly scoping.
+Daily tracking per org/user/type. The clean init schema now shards only the
+global platform aggregate by adding `shard` to the partition key; tenant/org
+rows stay on `shard = 0`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS traffic_counters (
     org_id UUID,
     month TEXT,           -- '202603'
+    shard INT,            -- 0 for tenant/org rows, deterministic shard for global platform aggregate
     day DATE,
     user_id UUID,
     traffic_type TEXT,    -- 'sync-file-upload', etc.
     bytes_transferred COUNTER,
-    PRIMARY KEY ((org_id, month), day, user_id, traffic_type)
+    PRIMARY KEY ((org_id, month, shard), day, user_id, traffic_type)
 )
 ```
 
@@ -224,9 +227,11 @@ Atomic storage counters for concurrent increment/decrement.
 ```sql
 CREATE TABLE IF NOT EXISTS storage_counters (
     scope TEXT,           -- 'org:<uuid>', 'user:<org_uuid>:<user_uuid>', 'lib:<org_uuid>:<lib_uuid>'
+    shard INT,            -- 0 for org/user/lib scopes, deterministic shard for the platform aggregate
+    day DATE,
     bytes_used COUNTER,
     file_count COUNTER,
-    PRIMARY KEY ((scope))
+    PRIMARY KEY ((scope, shard), day)
 )
 ```
 
@@ -297,7 +302,7 @@ func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64)
 
 Internal logic:
 1. Compute `month := time.Now().Format("200601")` and `day := time.Now().Truncate(24h)`
-2. Increment `traffic_counters` with (org_id, month, day, user_id, traffic_type)
+2. Increment `traffic_counters` with `(org_id, month, shard, day, user_id, traffic_type)`
 3. Determine direction: if trafficType contains "upload" → direction="upload"; if "download" → direction="download"
 4. Increment `traffic_monthly` with 3 scopes for natural-month reporting:
     - `"org:<direction>"` (e.g., `"org:upload"`) — monthly directional totals
@@ -597,8 +602,8 @@ Share link downloads/uploads: traffic counts against the link creator's org. If 
 
 **`AdminStatisticTraffic`** (admin_extra.go:152):
 1. Reuse existing `generateDateRange(c)` to parse start/end/group_by
-2. For each date: query `traffic_counters` partition `(platform_org_id, month)` filtering by `day`
-3. For superadmin: iterate all organizations, or use a special "platform" partition that accumulates cross-organization traffic
+2. For each date: query the sharded platform `traffic_counters` partitions `(platform_org_id, month, shard)` filtering by `day`
+3. For superadmin: sum across all platform shards instead of iterating every org partition
 4. Sum by traffic_type, return existing format:
 ```json
 [{"datetime": "2026-03-24T00:00:00+00:00", "sync-file-upload": 12345, "sync-file-download": 67890, "web-file-upload": 11111, "web-file-download": 22222, "link-file-upload": 3333, "link-file-download": 4444}]
@@ -817,14 +822,19 @@ Phase 2 (TrafficRecorder core)
 - Counters are eventually consistent — acceptable for quotas (temporary drift is ok)
 
 ### Partitioning
-- `traffic_counters`: partition `(org_id, month)` — one partition per org per month (~6 types * ~30 days * N users rows)
+- `traffic_counters`: partition `(org_id, month, shard)` — tenant/org rows stay on shard `0`; only the platform aggregate fans out across shards
 - `traffic_monthly`: partition `(org_id, month)` — few rows per partition (2 org scopes + 2 per user)
-- `storage_counters`: partition `(scope)` — one row per entity (org, user, library)
+- `storage_counters`: partition `(scope, shard)` — org/user/library scopes stay on shard `0`; only the platform aggregate fans out across shards
 
 ### Hot Partitions
-- Organizations with massive traffic could create hot partitions in `traffic_counters`
-- Mitigation: partitioning by `(org_id, month)` limits the size. If needed, shard by week
-- Premature optimization — evaluate after real data
+- The original global platform aggregates were hot partitions.
+- Fixed in the clean init schema by sharding only the platform/global aggregates with deterministic `32`-way fan-out.
+- Org/user/library hot paths remain single-partition reads.
+
+### Counter Guardrails
+- Counter writes are not idempotent: do not mark them idempotent in the driver.
+- Do not mix counter writes with non-counter statements in the same batch.
+- Do not rely on automatic retries to replay counter updates safely.
 
 ---
 

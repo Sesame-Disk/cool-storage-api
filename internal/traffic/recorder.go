@@ -109,7 +109,7 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodH
 	} else {
 		periodStartedAt = r.loadCurrentPeriodStart(orgUUID, now)
 	}
-	platformShard := CounterShard(orgID)
+	platformShard := CounterShardUUID(orgUUID)
 
 	// 1. Daily per-user/type detail — used for org-level statistics breakdowns.
 	if err := r.session.Query(

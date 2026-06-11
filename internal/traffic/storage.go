@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"strings"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -34,9 +35,10 @@ type StorageSnapshot struct {
 	FileCount int64
 }
 
-// CounterShardCount splits the two global hot counter aggregates into a small
-// number of deterministic shards. Reads only fan out on cold admin paths.
-const CounterShardCount = 8
+// CounterShardCount splits the two global hot counter aggregates into a modest
+// number of deterministic shards. Reads only fan out on cold admin paths, so
+// we can afford a wider spread here to reduce multiregion write concentration.
+const CounterShardCount = 32
 
 // storageTotalDay is the sentinel date used for the running-total row.
 // All real daily deltas use actual dates (2026-03-26, etc.) which are always
@@ -66,9 +68,20 @@ func LibraryStorageScope(orgID, libraryID string) string {
 	return fmt.Sprintf("lib:%s:%s", orgID, libraryID)
 }
 
-func CounterShard(orgID string) int {
+// CounterShardUUID returns the deterministic shard for a canonical org UUID.
+func CounterShardUUID(orgID gocql.UUID) int {
 	hasher := fnv.New32a()
-	_, _ = hasher.Write([]byte(orgID))
+	_, _ = hasher.Write(orgID.Bytes())
+	return int(hasher.Sum32() % CounterShardCount)
+}
+
+func CounterShard(orgID string) int {
+	normalized := strings.TrimSpace(orgID)
+	if parsed, err := gocql.ParseUUID(normalized); err == nil {
+		return CounterShardUUID(parsed)
+	}
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(strings.ToLower(normalized)))
 	return int(hasher.Sum32() % CounterShardCount)
 }
 
@@ -296,7 +309,9 @@ func ReadStorageDailyDeltas(db DBSession, scope string, start, end time.Time) ma
 			key := day.UTC().Format("2006-01-02")
 			deltas[key] += delta
 		}
-		_ = iter.Close()
+		if err := iter.Close(); err != nil {
+			log.Printf("[traffic] ReadStorageDailyDeltas scope=%s shard=%d iter error: %v", scope, shard, err)
+		}
 	})
 	return deltas
 }

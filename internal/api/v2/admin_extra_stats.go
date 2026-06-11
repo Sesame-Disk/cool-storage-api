@@ -56,7 +56,9 @@ func readPlatformTrafficUsage(session *gocql.Session, months []string) traffic.M
 					usage.Download += bytes
 				}
 			}
-			_ = iter.Close()
+			if err := iter.Close(); err != nil {
+				log.Printf("[traffic] readPlatformTrafficUsage shard=%d month=%s iter error: %v", shard, month, err)
+			}
 		})
 	}
 	return usage
@@ -167,7 +169,9 @@ func loadUserTrafficMetaForOrg(session *gocql.Session, orgID gocql.UUID, userMap
 	for iter.Scan(&uid, &email, &name) {
 		userMap[uid.String()] = userTrafficMeta{ID: uid.String(), Email: email, Name: name}
 	}
-	_ = iter.Close()
+	if err := iter.Close(); err != nil {
+		log.Printf("[traffic] loadUserTrafficMetaForOrg org=%s iter error: %v", orgID, err)
+	}
 }
 
 func accumulateTrafficPartition(session *gocql.Session, orgID gocql.UUID, month string, userMap map[string]userTrafficMeta, entries map[string]gin.H, perUserTotals map[string]int64, aggregateTotals map[string]int64) {
@@ -200,7 +204,9 @@ func accumulateTrafficPartition(session *gocql.Session, orgID gocql.UUID, month 
 			addTrafficBytes(entry, trafficType, bytes)
 			entries[meta.Email] = entry
 		}
-		_ = iter.Close()
+		if err := iter.Close(); err != nil {
+			log.Printf("[traffic] accumulateTrafficPartition org=%s shard=%d month=%s iter error: %v", orgID, shard, month, err)
+		}
 	})
 }
 
@@ -563,7 +569,9 @@ func (h *AdminHandler) AdminListOrgTraffic(c *gin.Context) {
 	for iter.Scan(&oid, &oname) {
 		allOrgs = append(allOrgs, orgMeta{ID: oid, Name: oname})
 	}
-	_ = iter.Close()
+	if err := iter.Close(); err != nil {
+		log.Printf("[traffic] admin traffic organizations iter error: %v", err)
+	}
 
 	list := make([]gin.H, 0, len(allOrgs))
 	for _, org := range allOrgs {
@@ -633,7 +641,9 @@ func (h *AdminHandler) AdminListUserTraffic(c *gin.Context) {
 		for iter.Scan(&orgID) {
 			orgIDs = append(orgIDs, orgID)
 		}
-		_ = iter.Close()
+		if err := iter.Close(); err != nil {
+			log.Printf("[traffic] admin active-user org list iter error: %v", err)
+		}
 	}
 
 	for _, orgID := range orgIDs {

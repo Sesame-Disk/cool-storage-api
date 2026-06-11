@@ -2,7 +2,10 @@ package traffic
 
 import (
 	"fmt"
+	"strings"
 	"testing"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 func TestCounterShardDeterministicAndInRange(t *testing.T) {
@@ -18,11 +21,32 @@ func TestCounterShardDeterministicAndInRange(t *testing.T) {
 	}
 
 	seen := map[int]struct{}{}
-	for i := 0; i < 32; i++ {
+	for i := 0; i < 256; i++ {
 		seen[CounterShard(fmt.Sprintf("00000000-0000-0000-0000-%012d", i))] = struct{}{}
 	}
-	if len(seen) <= 1 {
-		t.Fatalf("CounterShard collapsed sample org IDs into %d shard(s), want > 1", len(seen))
+	if len(seen) < 8 {
+		t.Fatalf("CounterShard used only %d shard(s) across sample org IDs, want at least 8", len(seen))
+	}
+}
+
+func TestCounterShardCanonicalizesUUIDRepresentations(t *testing.T) {
+	const canonical = "00000000-0000-0000-0000-00000000abcd"
+
+	parsed, err := gocql.ParseUUID(canonical)
+	if err != nil {
+		t.Fatalf("ParseUUID(%q) failed: %v", canonical, err)
+	}
+
+	want := CounterShardUUID(parsed)
+	variants := []string{
+		canonical,
+		strings.ToUpper(canonical),
+		"  " + canonical + "  ",
+	}
+	for _, variant := range variants {
+		if got := CounterShard(variant); got != want {
+			t.Fatalf("CounterShard(%q) = %d, want canonical shard %d", variant, got, want)
+		}
 	}
 }
 

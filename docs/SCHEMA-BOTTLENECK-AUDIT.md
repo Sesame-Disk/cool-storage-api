@@ -96,9 +96,10 @@ relies on the existing recount workflow.
 **Resolved**: only the genuinely shared/global hot counter partitions were
 sharded in the clean init schema. `traffic_counters` now uses
 `PRIMARY KEY ((org_id, month, shard), day, user_id, traffic_type)` and the
-platform aggregate rows are routed by deterministic `CounterShard(org_id)`.
+platform aggregate rows are routed by canonical UUID-based `CounterShard(org_id)`.
 Tenant/org readers stay on `shard = 0`, so the hot quota paths keep
-single-partition reads while only the cold global admin reads fan out.
+single-partition reads while only the cold global admin reads fan out. Current
+shard width is `32`.
 
 ---
 
@@ -147,7 +148,7 @@ concentrates a high-throughput workload.
 **Resolved**: `storage_counters` now uses `PRIMARY KEY ((scope, shard), day)`,
 but only the platform scope uses a hashed shard. Org/user/library scopes stay
 pinned to `shard = 0`, so quota reads remain single-partition and only the
-global admin readers fan out across shards.
+global admin readers fan out across shards. Current shard width is `32`.
 
 ---
 
