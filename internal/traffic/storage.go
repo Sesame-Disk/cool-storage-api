@@ -14,6 +14,7 @@
 package traffic
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -264,16 +265,31 @@ func clampNegativeStorageDelta(session *gocql.Session, scope string, shard int, 
 	return deltaBytes, deltaFiles
 }
 
-func readStorageSnapshotAtShard(db DBSession, scope string, shard int, day time.Time) StorageSnapshot {
+func readStorageSnapshotAtShardErr(db DBSession, scope string, shard int, day time.Time) (StorageSnapshot, error) {
 	var bytesUsed, fileCount int64
-	_ = db.Session().Query(
+	err := db.Session().Query(
 		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND shard = ? AND day = ?`,
 		scope, shard, day,
 	).Scan(&bytesUsed, &fileCount)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return StorageSnapshot{}, nil
+		}
+		return StorageSnapshot{}, err
+	}
 	return StorageSnapshot{
 		BytesUsed: max(bytesUsed, 0),
 		FileCount: max(fileCount, 0),
+	}, nil
+}
+
+func readStorageSnapshotAtShard(db DBSession, scope string, shard int, day time.Time) StorageSnapshot {
+	snapshot, err := readStorageSnapshotAtShardErr(db, scope, shard, day)
+	if err != nil {
+		log.Printf("[storage] read snapshot error scope=%s shard=%d day=%s: %v", scope, shard, day.Format("2006-01-02"), err)
+		return StorageSnapshot{}
 	}
+	return snapshot
 }
 
 // ReadStorageUsed returns the live bytes_used from the running-total row
@@ -283,7 +299,8 @@ func ReadStorageUsed(db DBSession, scope string) int64 {
 }
 
 // ReadStorageSnapshot returns the running-total bytes_used and file_count for
-// the given scope. Missing rows are treated as zero.
+// the given scope. Missing rows are treated as zero, and read errors are
+// logged then treated as zero on these best-effort read paths.
 func ReadStorageSnapshot(db DBSession, scope string) StorageSnapshot {
 	var snapshot StorageSnapshot
 	forEachStorageReadShard(scope, func(shard int) {
@@ -403,13 +420,18 @@ func AddAggregateStorageReconciliationQueries(batch *gocql.Batch, orgID, ownerID
 	}
 }
 
+var readStorageSnapshotAtShardErrFn = readStorageSnapshotAtShardErr
+
 // ReconcileStorageScope corrects a scope to the expected running total.
 // The delta is derived from the current live total, so repeated runs converge.
 func ReconcileStorageScope(db DBSession, scope string, expected StorageSnapshot) error {
 	if scope == PlatformStorageScope() {
 		return fmt.Errorf("platform scope requires ReconcileStorageScopeSharded")
 	}
-	current := ReadStorageSnapshot(db, scope)
+	current, err := readStorageSnapshotAtShardErrFn(db, scope, counterShardZero, storageTotalDay)
+	if err != nil {
+		return fmt.Errorf("read current storage scope %s: %w", scope, err)
+	}
 	deltaBytes := expected.BytesUsed - current.BytesUsed
 	deltaFiles := expected.FileCount - current.FileCount
 	if deltaBytes == 0 && deltaFiles == 0 {
@@ -440,7 +462,13 @@ func ReconcileStorageScopeSharded(db DBSession, scope string, expectedByShard ma
 
 	ForEachCounterShard(func(shard int) {
 		expected := expectedByShard[shard]
-		current := readStorageSnapshotAtShard(db, scope, shard, storageTotalDay)
+		current, err := readStorageSnapshotAtShardErrFn(db, scope, shard, storageTotalDay)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("read current storage scope %s shard %d: %w", scope, shard, err)
+			}
+			return
+		}
 		deltaBytes := expected.BytesUsed - current.BytesUsed
 		deltaFiles := expected.FileCount - current.FileCount
 		if deltaBytes == 0 && deltaFiles == 0 {

@@ -11,7 +11,7 @@ import (
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
-// Traffic type constants — match Seafile's category names for API compatibility.
+// Traffic type constants match Seafile's category names for API compatibility.
 const (
 	SyncUpload   = "sync-file-upload"
 	SyncDownload = "sync-file-download"
@@ -41,14 +41,14 @@ func NewRecorder(session *gocql.Session) *Recorder {
 }
 
 // Record increments the traffic counters for a single transfer. It runs
-// completely asynchronously — the caller is never blocked and errors are
+// completely asynchronously - the caller is never blocked and errors are
 // logged but not returned.
 //
 // orgID and userID must be valid UUID strings. trafficType must be one of the
-// package-level constants (SyncUpload, WebDownload, …).
+// package-level constants (SyncUpload, WebDownload, etc.).
 //
 // Callers that have already run a CheckTrafficQuota pre-check should use
-// RecordWithPeriod instead — it reuses the already-resolved period and saves
+// RecordWithPeriod instead - it reuses the already-resolved period and saves
 // an extra SELECT per event.
 func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64) {
 	r.recordAsync(orgID, userID, trafficType, bytes, time.Time{})
@@ -61,7 +61,7 @@ func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64) {
 //
 // periodStartedAt must be the PeriodStartedAt value from the QuotaStatus
 // returned by CheckTrafficQuota. If zero, falls back to the DB lookup (same
-// behaviour as Record).
+// behavior as Record).
 func (r *Recorder) RecordWithPeriod(orgID, userID, trafficType string, bytes int64, periodStartedAt time.Time) {
 	r.recordAsync(orgID, userID, trafficType, bytes, periodStartedAt)
 }
@@ -71,22 +71,22 @@ func (r *Recorder) recordAsync(orgID, userID, trafficType string, bytes int64, p
 		return
 	}
 	// Capture time values before entering the goroutine so that a slow
-	// scheduler cannot shift the timestamp into the next day/month.
+	// scheduler cannot shift the timestamp into the next day or month.
 	now := time.Now().UTC()
 	month := now.Format("200601")
 	day := now.Truncate(24 * time.Hour)
 	direction := directionOf(trafficType)
 
 	select {
-	case r.sem <- struct{}{}: // acquire slot (non-blocking)
+	case r.sem <- struct{}{}:
 		go func() {
-			defer func() { <-r.sem }() // release slot
+			defer func() { <-r.sem }()
 			if err := r.recordCounters(orgID, userID, month, day, now, periodHint, trafficType, direction, bytes); err != nil {
 				log.Printf("[traffic] record error org=%s user=%s type=%s: %v", orgID, userID, trafficType, err)
 			}
 		}()
 	default:
-		// Inflight limit reached — drop without spawning a goroutine.
+		// Inflight limit reached - drop without spawning a goroutine.
 		return
 	}
 }
@@ -101,6 +101,7 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodH
 	if err != nil {
 		return fmt.Errorf("invalid user UUID %q: %w", userID, err)
 	}
+
 	// Use the hint when provided (from a preceding quota check) to avoid an
 	// extra SELECT. Fall back to DB lookup only when the hint is absent.
 	var periodStartedAt time.Time
@@ -111,7 +112,7 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodH
 	}
 	platformShard := CounterShardUUID(orgUUID)
 
-	// 1. Daily per-user/type detail — used for org-level statistics breakdowns.
+	// 1. Daily per-user/type detail used for org-level statistics breakdowns.
 	if err := r.session.Query(
 		`UPDATE traffic_counters SET bytes_transferred = bytes_transferred + ?
 		 WHERE org_id = ? AND month = ? AND shard = ? AND day = ? AND user_id = ? AND traffic_type = ?`,
@@ -120,8 +121,9 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodH
 		return fmt.Errorf("traffic_counters: %w", err)
 	}
 
-	// 2. Platform-wide aggregate — stored in the zero-UUID partition so that
-	//    sysadmin traffic charts can be served with a single partition read.
+	// 2. Platform-wide aggregate lives under the zero-UUID org namespace, but
+	// is spread across deterministic shards so sysadmin charts fan out only
+	// over bounded platform partitions instead of every tenant org.
 	if err := r.session.Query(
 		`UPDATE traffic_counters SET bytes_transferred = bytes_transferred + ?
 		 WHERE org_id = ? AND month = ? AND shard = ? AND day = ? AND user_id = ? AND traffic_type = ?`,
@@ -130,8 +132,8 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodH
 		log.Printf("[traffic] platform aggregate error type=%s: %v", trafficType, err)
 	}
 
-	// 3. Platform-wide per-user detail — kept in the same zero-UUID partition so
-	//    global user-traffic reports can avoid reading every org partition.
+	// 3. Platform-wide per-user detail reuses the same zero-UUID namespace and
+	// shard so global user-traffic reports follow the same bounded fan-out.
 	if err := r.session.Query(
 		`UPDATE traffic_counters SET bytes_transferred = bytes_transferred + ?
 		 WHERE org_id = ? AND month = ? AND shard = ? AND day = ? AND user_id = ? AND traffic_type = ?`,
@@ -140,7 +142,7 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodH
 		log.Printf("[traffic] platform per-user aggregate error user=%s type=%s: %v", userID, trafficType, err)
 	}
 
-	// 4–6. Aggregate counters for two different read models:
+	// 4-6. Aggregate counters for two different read models:
 	//   - traffic_monthly for natural-month reporting and dashboards
 	//   - traffic_period_usage for quota enforcement and current-period payloads
 	scopes := []string{
@@ -187,10 +189,9 @@ func directionOf(trafficType string) string {
 	return "download"
 }
 
-// ── Global singleton ──────────────────────────────────────────────────────────
+// Global singleton.
 // Pattern mirrors SetGCHooks in gc_hooks.go: a package-level accessor
-// initialised once during server startup and used by all handlers.
-
+// initialized once during server startup and used by all handlers.
 var global struct {
 	mu sync.RWMutex
 	r  *Recorder

@@ -1,12 +1,18 @@
 package traffic
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
+
+type nilDBSession struct{}
+
+func (nilDBSession) Session() *gocql.Session { return nil }
 
 func TestCounterShardDeterministicAndInRange(t *testing.T) {
 	const orgID = "00000000-0000-0000-0000-000000000123"
@@ -102,5 +108,36 @@ func TestForEachStorageReadShardPlatformFansOutButTenantScopesStayLocal(t *testi
 	})
 	if len(orgShards) != 1 || orgShards[0] != counterShardZero {
 		t.Fatalf("org scope read fan-out = %v, want [0]", orgShards)
+	}
+}
+
+func TestReconcileStorageScopeReturnsReadError(t *testing.T) {
+	prev := readStorageSnapshotAtShardErrFn
+	t.Cleanup(func() { readStorageSnapshotAtShardErrFn = prev })
+
+	readStorageSnapshotAtShardErrFn = func(db DBSession, scope string, shard int, day time.Time) (StorageSnapshot, error) {
+		return StorageSnapshot{}, errors.New("read failed")
+	}
+
+	err := ReconcileStorageScope(nilDBSession{}, OrganizationStorageScope("00000000-0000-0000-0000-000000000123"), StorageSnapshot{})
+	if err == nil || !strings.Contains(err.Error(), "read failed") {
+		t.Fatalf("ReconcileStorageScope error = %v, want wrapped read failure", err)
+	}
+}
+
+func TestReconcileStorageScopeShardedReturnsReadError(t *testing.T) {
+	prev := readStorageSnapshotAtShardErrFn
+	t.Cleanup(func() { readStorageSnapshotAtShardErrFn = prev })
+
+	readStorageSnapshotAtShardErrFn = func(db DBSession, scope string, shard int, day time.Time) (StorageSnapshot, error) {
+		if shard == 7 {
+			return StorageSnapshot{}, errors.New("shard read failed")
+		}
+		return StorageSnapshot{}, nil
+	}
+
+	err := ReconcileStorageScopeSharded(nilDBSession{}, PlatformStorageScope(), map[int]StorageSnapshot{})
+	if err == nil || !strings.Contains(err.Error(), "shard read failed") {
+		t.Fatalf("ReconcileStorageScopeSharded error = %v, want wrapped shard read failure", err)
 	}
 }
