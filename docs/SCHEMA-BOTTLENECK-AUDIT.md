@@ -185,7 +185,9 @@ ever measure single-day partitions approaching the soft limit.
 
 ## H. Org-scoped `libraries` scans still walk tombstone-heavy partitions
 
-**Status**: open, medium-priority (introduced 2026-05-27)
+**Status**: partially resolved (2026-06-10, branch
+`feat/libraries-org-readers-projection`); owner/enforcement reads moved, list
++ GC scans still open
 
 **Tables**: `libraries`, `libraries_by_owner`, `libraries_deleted_by_org`
 
@@ -229,6 +231,28 @@ more expensive partition walks in GC and quota/permission-adjacent paths.
 4. Audit any remaining org-wide canonical library scan and either replace it
 	with a read model that matches the access pattern or document why the scan is
 	still acceptable.
+
+**Done so far** (`feat/libraries-org-readers-projection`): the owner-centric and
+enforcement reads were moved off the canonical org-partition scan to the
+existing projections (no schema change; projection completeness verified across
+create / soft-delete / restore / owner-transfer / hard-delete / head-update):
+
+- `enforcement.go CountActiveLibraries` → `libraries_by_org_updated`
+- `libraries.go ownerHasActiveLibraryNamed` → `libraries_by_owner`
+- `org_admin_users.go GetOrgUserOwnedRepos` → `libraries_by_owner` (also drops an
+  `ALLOW FILTERING`)
+- `middleware GetUserLibraries` owned-library discovery → `libraries_by_owner`
+
+**Still open** (need a different shape, deferred to a follow-up branch):
+
+- `libraries.go ListLibraries` (api2) and the v2.1 list still scan the org
+  partition to fetch full canonical rows (incl. `description`, encryption fields,
+  `head_commit_id` not carried by the projections). Right fix: point-read each
+  accessible library by id (the handlers already compute the accessible set) so
+  the read is bounded to the caller's libraries instead of the whole org.
+- `internal/gc/store_cassandra.go` storage-reconcile reads `FROM libraries` with
+  no `WHERE` (full table scan) — separate maintenance-path concern.
+- `internal/api/v2/search.go` org-scoped library search prefilter.
 
 ---
 

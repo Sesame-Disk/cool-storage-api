@@ -456,10 +456,11 @@ func (h *OrgAdminHandler) GetOrgUserOwnedRepos(c *gin.Context) {
 		return
 	}
 
+	// Read from the libraries_by_owner projection (single (org_id, owner_id)
+	// partition) instead of an ALLOW FILTERING scan over the canonical table.
 	iter := h.db.Session().Query(`
 		SELECT library_id, name, encrypted, size_bytes, updated_at
-		FROM libraries WHERE org_id = ? AND owner_id = ?
-		ALLOW FILTERING
+		FROM libraries_by_owner WHERE org_id = ? AND owner_id = ?
 	`, targetOrgID, userID).Iter()
 
 	type repoItem struct {
