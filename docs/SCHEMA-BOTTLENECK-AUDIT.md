@@ -1,6 +1,6 @@
 # Schema Bottleneck Audit
 
-**Updated**: 2026-06-09
+**Updated**: 2026-06-11
 
 This document is the rolling backlog of Cassandra schema shapes that look like
 operational bottlenecks (hot partitions, `ALLOW FILTERING`, full-table scans,
@@ -20,6 +20,8 @@ their date.
 ## A. `users_by_email` ALLOW FILTERING fallback
 
 **Status**: open, low-priority
+
+**Tracked issue**: [ISSUE-USERS-BY-EMAIL-FALLBACK-01](KNOWN_ISSUES.md#issue-users-by-email-fallback-01)
 
 **Tables**: `users_by_email` (canonical), `users` (fallback)
 
@@ -75,7 +77,9 @@ the prior `ALLOW FILTERING` read in the main list-files-by-tag flow.
 
 ## C. COUNTER tables without bucketing
 
-**Status**: open, medium-priority
+**Status**: resolved in branch `feat/shard-global-counters-safe` (2026-06-11)
+
+**Tracked issue**: [ISSUE-COUNTER-HOT-PARTITION-01](KNOWN_ISSUES.md#issue-counter-hot-partition-01)
 
 **Tables**: `admin_link_counts_by_org`, `repo_tag_file_counts`, `traffic_counters`,
 `traffic_monthly`, `traffic_period_usage`, `storage_counters`.
@@ -89,16 +93,21 @@ even though they look like ordinary writes from the client side.
 climbs and counters can drift if rare counter-replica issues happen. Recovery
 relies on the existing recount workflow.
 
-**Direction**: shard hot counter partitions, e.g.
-`((org_id, link_type, shard), ...)` with a small `shard = rand() % N`, and
-sum across shards at read time. The platform-aggregate row is the most
-visible candidate (see also `docs/TECHNICAL-DEBT.md` §12b).
+**Resolved**: only the genuinely shared/global hot counter partitions were
+sharded in the clean init schema. `traffic_counters` now uses
+`PRIMARY KEY ((org_id, month, shard), day, user_id, traffic_type)` and the
+platform aggregate rows are routed by canonical UUID-based `CounterShard(org_id)`.
+Tenant/org readers stay on `shard = 0`, so the hot quota paths keep
+single-partition reads while only the cold global admin reads fan out. Current
+shard width is `32`.
 
 ---
 
 ## D. `gc_queue` with `default_time_to_live = 0`
 
 **Status**: open, medium-priority
+
+**Tracked issue**: [ISSUE-GC-QUEUE-TTL-01](KNOWN_ISSUES.md#issue-gc-queue-ttl-01)
 
 **Tables**: `gc_queue`
 
@@ -120,7 +129,9 @@ before the TTL helps mask the symptom.
 
 ## E. `storage_counters` partitioned by `scope`
 
-**Status**: open, low-priority
+**Status**: resolved in branch `feat/shard-global-counters-safe` (2026-06-11)
+
+**Tracked issue**: [ISSUE-COUNTER-HOT-PARTITION-01](KNOWN_ISSUES.md#issue-counter-hot-partition-01)
 
 **Tables**: `storage_counters`
 
@@ -134,15 +145,18 @@ the magnitude is fine, but it is the same anti-pattern that
 `ISSUE-BLOCKS-HOT-PARTITION-01` had: low-cardinality partition key that
 concentrates a high-throughput workload.
 
-**Direction**: same playbook as the COUNTER tables — shard the platform scope
-into `((scope, shard), ...)` and sum on read. Org / user / library scopes are
-already naturally distributed and probably do not need sharding.
+**Resolved**: `storage_counters` now uses `PRIMARY KEY ((scope, shard), day)`,
+but only the platform scope uses a hashed shard. Org/user/library scopes stay
+pinned to `shard = 0`, so quota reads remain single-partition and only the
+global admin readers fan out across shards. Current shard width is `32`.
 
 ---
 
 ## F. `gc_block_candidates_by_day` and `gc_s3_orphans_by_day` growth observability
 
 **Status**: open, low-priority (introduced 2026-05-26)
+
+**Tracked issue**: [ISSUE-GC-DISCOVERY-CURSOR-OBS-01](KNOWN_ISSUES.md#issue-gc-discovery-cursor-obs-01)
 
 **Tables**: `gc_block_candidates_by_day`, `gc_s3_orphans_by_day`
 
@@ -166,6 +180,8 @@ infrastructure for this already exists alongside
 
 **Status**: open, low-priority (introduced 2026-05-26)
 
+**Tracked issue**: [ISSUE-GC-DISCOVERY-HOTSPOT-01](KNOWN_ISSUES.md#issue-gc-discovery-hotspot-01)
+
 **Tables**: any `gc_*_by_day` projection (newly: block candidates and S3
 orphans; previously: share links and shares).
 
@@ -187,6 +203,8 @@ ever measure single-day partitions approaching the soft limit.
 
 **Status**: partially resolved (2026-06-10, branch
 `feat/libraries-org-readers-projection`); owner/enforcement reads moved, list + GC scans still open
+
+**Tracked issue**: [ISSUE-LIBRARIES-ORG-SCAN-01](KNOWN_ISSUES.md#issue-libraries-org-scan-01)
 
 **Tables**: `libraries`, `libraries_by_owner`, `libraries_deleted_by_org`
 
@@ -448,6 +466,8 @@ clients can still clean up entries pointing at a soft-deleted library.
 
 **Status**: open, low-priority (introduced 2026-06-10)
 
+**Tracked issue**: [ISSUE-FILE-TAG-MOVE-BESTEFFORT-01](KNOWN_ISSUES.md#issue-file-tag-move-besteffort-01)
+
 **Tables**: `file_tags`, `file_tags_by_id`, `file_tags_by_tag`
 
 **Shape**: both functions are `void`. On a per-tag batch failure they log and
@@ -469,6 +489,8 @@ observability/reconcile hook, not a request-failure path.
 
 **Status**: open, low-priority (2026-06-10)
 
+**Tracked issue**: [ISSUE-DELETE-REPO-TAG-PROOF-01](KNOWN_ISSUES.md#issue-delete-repo-tag-proof-01)
+
 **Tables**: `file_tags`, `file_tags_by_tag`, `repo_tag_file_counts`
 
 **Shape**: a per-tag counter matching the number of `file_tags_by_tag` rows is
@@ -489,6 +511,8 @@ scheme). Do not reintroduce the counter-only shortcut.
 ## Q. `MoveFileTagsByPrefix` scans the whole `file_tags` repo partition
 
 **Status**: open, low-priority (introduced 2026-06-10)
+
+**Tracked issue**: [ISSUE-FILE-TAG-PREFIX-SCAN-01](KNOWN_ISSUES.md#issue-file-tag-prefix-scan-01)
 
 **Tables**: `file_tags`
 

@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-06-09
+**Last Updated**: 2026-06-11
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -2983,6 +2983,180 @@ libraries as writable.
 - `internal/api/v2/write_helpers.go`: `softDeleteLibrary` sets `deleted_at`
 - `internal/api/v2/starred.go`: `StarFile` checks existence but not lifecycle state
 - `internal/gc/store_cassandra.go`: `DeleteStarredFilesByLibrary` cleans by scan-then-delete
+
+---
+
+### ISSUE-USERS-BY-EMAIL-FALLBACK-01: `users_by_email` Misses Still Fall Back To Global `users` Scan
+
+**Status**: Pending
+**Severity**: Low-Medium - rare today, but unbounded `ALLOW FILTERING` fallback remains in auth/admin identity lookup paths
+**Affected**: `internal/auth/oidc.go`, `internal/api/v2/admin.go`, any path that treats `users_by_email` miss as recoverable via `users WHERE email = ? ALLOW FILTERING`
+
+When the `users_by_email` lookup misses, the code still falls back to scanning
+the canonical `users` table by email. The current dual-write makes this rare,
+but the fallback remains an unbounded read shape that will age poorly as the
+tenant/user dataset grows.
+
+**Fix direction**:
+- Audit every writer that creates a `users` row and guarantee `users_by_email` dual-write.
+- Backfill any remaining legacy gaps.
+- Promote the fallback to a hard failure once the index contract is complete.
+
+---
+
+### ISSUE-COUNTER-HOT-PARTITION-01: Global `traffic_counters` / `storage_counters` Aggregates Were Single Hot Partitions
+
+**Status**: ✅ Fixed (2026-06-11)
+**Severity (when active)**: High pre-deploy schema risk - every global traffic/storage mutation concentrated on one counter partition
+**Affected**: `traffic_counters` zero-UUID platform aggregate, `storage_counters` `platform` scope, sysadmin traffic/storage dashboards, multiregion write throughput
+
+The clean init schema originally concentrated all platform-wide traffic writes
+into `traffic_counters ((org_id, month), ...)` with `org_id = 0000...0000` and
+all platform-wide storage writes into `storage_counters ((scope), ...)` with
+`scope = "platform"`. Those were the two truly shared hot counter partitions in
+the baseline.
+
+**What changed**:
+- `traffic_counters` now uses `PRIMARY KEY ((org_id, month, shard), day, user_id, traffic_type)`.
+- `storage_counters` now uses `PRIMARY KEY ((scope, shard), day)`.
+- Only the global platform aggregates are sharded.
+- Org/user/library scopes stay pinned to `shard = 0`.
+- Platform writes route deterministically by a canonical UUID hash (`CounterShard` / `CounterShardUUID`), so each org's inc/dec path stays balanced on the same shard even if callers vary letter case in UUID strings.
+- The initial shard width is `32`, matching the repo's other modest fan-out bucket choices and giving more write-dispersion headroom for multiregion global aggregates.
+
+**Why this shape is safe**:
+- The hot quota paths still read single-partition org/user/library counters.
+- Only cold sysadmin/global readers fan out across shards.
+- Reconciliation also buckets platform expected totals by the same deterministic shard.
+- Counter writes remain non-idempotent Cassandra operations: do not mark them idempotent, do not mix them into non-counter batches, and do not rely on automatic retries to replay them safely.
+
+---
+
+### ISSUE-GC-QUEUE-TTL-01: `gc_queue` Still Has No Data-Lifetime Bound
+
+**Status**: Pending
+**Severity**: Medium - queue items can live forever if the worker stalls in a way that never completes or DLQs them
+**Affected**: `gc_queue`, worker recovery semantics, operator observability
+
+`gc_queue` still uses `default_time_to_live = 0`. The queue/marker compaction
+work reduced tombstone pain, but it does not put any lifetime bound on abandoned
+rows. A stalled or partially broken worker can therefore leave successful-looking
+queue items behind indefinitely.
+
+**Fix direction**:
+- Decide on a long but finite TTL window (for example 90-180 days).
+- Pair that with explicit alerts so operators detect backlog/worker failure before TTL expiry hides the symptom.
+- Keep orphan recovery aligned with the chosen expiry window.
+
+---
+
+### ISSUE-GC-DISCOVERY-CURSOR-OBS-01: Discovery Cursor Lag Is Not Observable Enough
+
+**Status**: Pending
+**Severity**: Low-Medium - scanner lookback safety depends on the cursor advancing often enough, but lag is not surfaced clearly
+**Affected**: `gc_block_candidates_by_day`, `gc_s3_orphans_by_day`, scanner ops/alerting
+
+The per-day discovery projections are bounded by cursor progression. If the
+scanner does not run within the configured lookback window on a cold start, old
+candidate days can fall behind the scan horizon. Today the safety depends on the
+cursor existing and moving, but that lag is not exposed as a first-class signal.
+
+**Fix direction**:
+- Emit an explicit metric for the current discovery cursor day.
+- Alert when the cursor lags N days behind `today`.
+- Keep the alert separate from generic scanner liveness so it catches "running but behind".
+
+---
+
+### ISSUE-GC-DISCOVERY-HOTSPOT-01: Per-Day Discovery Partitions Can Still Spike On Bursty Workloads
+
+**Status**: Pending
+**Severity**: Low today, potentially Medium under bulk churn - a single `(day, bucket)` discovery partition can still grow too large
+**Affected**: `gc_block_candidates_by_day`, `gc_s3_orphans_by_day`, other `gc_*_by_day` projections
+
+The discovery projections are bucketed, but still keyed by `(day, bucket)`. A
+large burst of refcount-zero or orphan events concentrated in one day can make
+one bucket's partition much larger than Cassandra's soft guidance for partition
+size/row count.
+
+**Fix direction**:
+- Keep bucket count tunable.
+- If real workloads approach the soft limit, move the hottest projections to a finer grain such as `(day, hour, bucket)`.
+- Do not pay the extra read complexity until that growth is measured.
+
+---
+
+### ISSUE-LIBRARIES-ORG-SCAN-01: Some Org-Scoped `libraries` Reads Still Walk Tombstone-Heavy Partitions
+
+**Status**: Pending follow-up after partial mitigation (2026-06-10)
+**Severity**: Medium operational risk - repeated org-wide reads can still traverse churn-heavy canonical partitions
+**Affected**: `internal/api/v2/libraries.go`, `internal/api/v2/search.go`, `internal/gc/store_cassandra.go`, canonical `libraries` reads by org
+
+The recent projection branch moved several owner/enforcement reads off the
+canonical `libraries` org partition, but a few important callers still scan the
+canonical partition or even the whole table:
+
+- library list endpoints still fetch full canonical rows by org
+- GC storage reconciliation still scans `FROM libraries`
+- search prefilter still does org-scoped canonical enumeration
+
+**Fix direction**:
+- Bound library list reads to the caller's accessible library IDs and point-read canonical rows by id.
+- Revisit the full-table maintenance scan separately from hot-path readers.
+- Replace the search prefilter with a shape that matches the access pattern.
+
+---
+
+### ISSUE-FILE-TAG-MOVE-BESTEFFORT-01: Tag Move Helpers Still Log-And-Continue On Failure
+
+**Status**: Pending
+**Severity**: Low-Medium - file/directory rename succeeds, but tag metadata can stay stranded at old paths until later cleanup
+**Affected**: `MoveFileTagsByPath`, `MoveFileTagsByPrefix`, tag move observability/retry
+
+Tag move helpers still do best-effort logging when a per-tag batch fails. The
+FS rename is already durable by that point, so callers cannot fail the request
+cleanly, but the metadata drift remains mostly invisible outside logs.
+
+**Fix direction**:
+- Return `error` from the move helpers.
+- Keep the caller response successful for the already-committed FS mutation.
+- Log at request level and/or enqueue a retry/reconciliation path.
+
+---
+
+### ISSUE-DELETE-REPO-TAG-PROOF-01: `DeleteRepoTag` Has No Cheap Proof That Projection Rows Are Complete
+
+**Status**: Pending
+**Severity**: Low - current code is safe, but the tempting fast path is unsound
+**Affected**: `deleteRepoTag`, `file_tags`, `file_tags_by_tag`, `repo_tag_file_counts`
+
+The current delete path correctly derives the exact delete set from canonical
+`file_tags`. What remains as debt is architectural: cardinality equality alone
+cannot prove `file_tags_by_tag` completeness, because best-effort rename drift
+can leave a stale old-path row while missing the new path.
+
+**Current rule**:
+- Do not reintroduce a projection-only fast path based only on row count equality.
+
+**Future direction**:
+- Keep canonical exact-set scan unless a stronger proof source exists, such as deterministic retry/reconcile or exact-set versioning/checksum.
+
+---
+
+### ISSUE-FILE-TAG-PREFIX-SCAN-01: `MoveFileTagsByPrefix` Still Scans The Whole Repo Tag Partition
+
+**Status**: Pending
+**Severity**: Low - not a hot path, but rename cost scales with all tagged files in the repo
+**Affected**: directory rename flows that call `MoveFileTagsByPrefix`
+
+`MoveFileTagsByPrefix` currently lists every tagged path in the repo and filters
+the moved subtree in memory. That is a single-partition read and only happens on
+directory rename, so it is acceptable for now, but the cost grows with the
+repo's total tagged files rather than the subtree size.
+
+**Fix direction**:
+- Use a clustering slice on `file_tags` because the canonical clustering already starts with `file_path`.
+- Read only the `[prefix, prefixUpperBound)` subtree instead of the whole repo partition.
 
 ---
 

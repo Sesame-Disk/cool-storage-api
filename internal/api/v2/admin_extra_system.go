@@ -52,7 +52,7 @@ func (h *AdminHandler) AdminGetSysInfo(c *gin.Context) {
 	}
 	_ = iter.Close()
 
-	platformStorage := traffic.ReadStorageSnapshot(h.db, "platform")
+	platformStorage := traffic.ReadStorageSnapshot(h.db, traffic.PlatformStorageScope())
 	now := time.Now().UTC()
 	monthUsage := readPlatformTrafficUsage(h.db.Session(), []string{traffic.CurrentMonth()})
 	yearUsage := readPlatformTrafficUsage(h.db.Session(), yearToDateMonthKeys(now))

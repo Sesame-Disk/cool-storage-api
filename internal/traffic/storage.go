@@ -3,7 +3,9 @@
 // These functions manage the storage_counters table which tracks bytes_used
 // and file_count across four scopes: platform, org, user, and library.
 //
-// The table uses (scope, day) as the PRIMARY KEY:
+// The table uses ((scope, shard), day) as the PRIMARY KEY:
+//   - shard = CounterShard(orgID) for the global platform scope
+//   - shard = 0 for org/user/library scopes
 //   - day = storageTotalDay (1970-01-01) → running total for fast quota checks
 //   - day = <real date>                  → daily delta for time-series graphs
 //
@@ -12,8 +14,11 @@
 package traffic
 
 import (
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
+	"strings"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -31,10 +36,22 @@ type StorageSnapshot struct {
 	FileCount int64
 }
 
+// CounterShardCount splits the two global hot counter aggregates into a modest
+// number of deterministic shards. Reads only fan out on cold admin paths, so
+// we can afford a wider spread here to reduce multiregion write concentration.
+const CounterShardCount = 32
+
 // storageTotalDay is the sentinel date used for the running-total row.
 // All real daily deltas use actual dates (2026-03-26, etc.) which are always
 // after this sentinel, so range queries for graphs never include it.
 var storageTotalDay = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
+const counterShardZero = 0
+
+type storageScopeRoute struct {
+	scope string
+	shard int
+}
 
 func PlatformStorageScope() string {
 	return "platform"
@@ -52,18 +69,69 @@ func LibraryStorageScope(orgID, libraryID string) string {
 	return fmt.Sprintf("lib:%s:%s", orgID, libraryID)
 }
 
-func storageUpdateErr(session *gocql.Session, scope string, day time.Time, deltaBytes, deltaFiles int64) error {
+// CounterShardUUID returns the deterministic shard for a canonical org UUID.
+func CounterShardUUID(orgID gocql.UUID) int {
+	hasher := fnv.New32a()
+	_, _ = hasher.Write(orgID.Bytes())
+	return int(hasher.Sum32() % CounterShardCount)
+}
+
+func CounterShard(orgID string) int {
+	normalized := strings.TrimSpace(orgID)
+	if parsed, err := gocql.ParseUUID(normalized); err == nil {
+		return CounterShardUUID(parsed)
+	}
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(strings.ToLower(normalized)))
+	return int(hasher.Sum32() % CounterShardCount)
+}
+
+func ForEachCounterShard(fn func(int)) {
+	for shard := 0; shard < CounterShardCount; shard++ {
+		fn(shard)
+	}
+}
+
+func storageMutationRoutes(orgID, userID, libraryID string) []storageScopeRoute {
+	routes := []storageScopeRoute{
+		{scope: PlatformStorageScope(), shard: CounterShard(orgID)},
+		{scope: OrganizationStorageScope(orgID), shard: counterShardZero},
+	}
+	if userID != "" {
+		routes = append(routes, storageScopeRoute{
+			scope: UserStorageScope(orgID, userID),
+			shard: counterShardZero,
+		})
+	}
+	if libraryID != "" {
+		routes = append(routes, storageScopeRoute{
+			scope: LibraryStorageScope(orgID, libraryID),
+			shard: counterShardZero,
+		})
+	}
+	return routes
+}
+
+func forEachStorageReadShard(scope string, fn func(int)) {
+	if scope == PlatformStorageScope() {
+		ForEachCounterShard(fn)
+		return
+	}
+	fn(counterShardZero)
+}
+
+func storageUpdateErr(session *gocql.Session, scope string, shard int, day time.Time, deltaBytes, deltaFiles int64) error {
 	return session.Query(
 		`UPDATE storage_counters SET bytes_used = bytes_used + ?, file_count = file_count + ?
-		 WHERE scope = ? AND day = ?`,
-		deltaBytes, deltaFiles, scope, day,
+		 WHERE scope = ? AND shard = ? AND day = ?`,
+		deltaBytes, deltaFiles, scope, shard, day,
 	).Exec()
 }
 
 // storageUpdate writes a single counter update for the given scope and day.
-func storageUpdate(session *gocql.Session, scope string, day time.Time, deltaBytes, deltaFiles int64) {
-	if err := storageUpdateErr(session, scope, day, deltaBytes, deltaFiles); err != nil {
-		log.Printf("[storage] update error scope=%s day=%s: %v", scope, day.Format("2006-01-02"), err)
+func storageUpdate(session *gocql.Session, scope string, shard int, day time.Time, deltaBytes, deltaFiles int64) {
+	if err := storageUpdateErr(session, scope, shard, day, deltaBytes, deltaFiles); err != nil {
+		log.Printf("[storage] update error scope=%s shard=%d day=%s: %v", scope, shard, day.Format("2006-01-02"), err)
 	}
 }
 
@@ -83,12 +151,12 @@ func IncrementStorageCounters(db DBSession, orgID, userID, libraryID string, del
 func IncrementStorageCountersSync(db DBSession, orgID, userID, libraryID string, deltaBytes int64, deltaFiles int64) error {
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	session := db.Session()
-	scopes := storageScopes(orgID, userID, libraryID)
-	for _, scope := range scopes {
-		if err := storageUpdateErr(session, scope, storageTotalDay, deltaBytes, deltaFiles); err != nil {
+	routes := storageMutationRoutes(orgID, userID, libraryID)
+	for _, route := range routes {
+		if err := storageUpdateErr(session, route.scope, route.shard, storageTotalDay, deltaBytes, deltaFiles); err != nil {
 			return err
 		}
-		if err := storageUpdateErr(session, scope, today, deltaBytes, deltaFiles); err != nil {
+		if err := storageUpdateErr(session, route.scope, route.shard, today, deltaBytes, deltaFiles); err != nil {
 			return err
 		}
 	}
@@ -117,11 +185,11 @@ func DecrementStorageCountersSync(db DBSession, orgID, userID, libraryID string,
 	}
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	session := db.Session()
-	for _, scope := range storageScopes(orgID, userID, libraryID) {
+	for _, route := range storageMutationRoutes(orgID, userID, libraryID) {
 		var curBytes, curFiles int64
 		_ = session.Query(
-			`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND day = ?`,
-			scope, storageTotalDay,
+			`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND shard = ? AND day = ?`,
+			route.scope, route.shard, storageTotalDay,
 		).Scan(&curBytes, &curFiles)
 
 		actBytes := min(deltaBytes, max(curBytes, 0))
@@ -130,10 +198,10 @@ func DecrementStorageCountersSync(db DBSession, orgID, userID, libraryID string,
 			continue
 		}
 
-		if err := storageUpdateErr(session, scope, storageTotalDay, -actBytes, -actFiles); err != nil {
+		if err := storageUpdateErr(session, route.scope, route.shard, storageTotalDay, -actBytes, -actFiles); err != nil {
 			return err
 		}
-		if err := storageUpdateErr(session, scope, today, -actBytes, -actFiles); err != nil {
+		if err := storageUpdateErr(session, route.scope, route.shard, today, -actBytes, -actFiles); err != nil {
 			return err
 		}
 	}
@@ -162,44 +230,30 @@ func AdjustStorageCountersByDeltaSync(db DBSession, orgID, userID, libraryID str
 	}
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	session := db.Session()
-	for _, scope := range storageScopes(orgID, userID, libraryID) {
-		bytesDelta, filesDelta := clampNegativeStorageDelta(session, scope, deltaBytes, deltaFiles)
+	for _, route := range storageMutationRoutes(orgID, userID, libraryID) {
+		bytesDelta, filesDelta := clampNegativeStorageDelta(session, route.scope, route.shard, deltaBytes, deltaFiles)
 		if bytesDelta == 0 && filesDelta == 0 {
 			continue
 		}
-		if err := storageUpdateErr(session, scope, storageTotalDay, bytesDelta, filesDelta); err != nil {
+		if err := storageUpdateErr(session, route.scope, route.shard, storageTotalDay, bytesDelta, filesDelta); err != nil {
 			return err
 		}
-		if err := storageUpdateErr(session, scope, today, bytesDelta, filesDelta); err != nil {
+		if err := storageUpdateErr(session, route.scope, route.shard, today, bytesDelta, filesDelta); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func storageScopes(orgID, userID, libraryID string) []string {
-	scopes := []string{
-		PlatformStorageScope(),
-		OrganizationStorageScope(orgID),
-	}
-	if userID != "" {
-		scopes = append(scopes, UserStorageScope(orgID, userID))
-	}
-	if libraryID != "" {
-		scopes = append(scopes, LibraryStorageScope(orgID, libraryID))
-	}
-	return scopes
-}
-
-func clampNegativeStorageDelta(session *gocql.Session, scope string, deltaBytes, deltaFiles int64) (int64, int64) {
+func clampNegativeStorageDelta(session *gocql.Session, scope string, shard int, deltaBytes, deltaFiles int64) (int64, int64) {
 	if deltaBytes >= 0 && deltaFiles >= 0 {
 		return deltaBytes, deltaFiles
 	}
 
 	var curBytes, curFiles int64
 	_ = session.Query(
-		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND day = ?`,
-		scope, storageTotalDay,
+		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND shard = ? AND day = ?`,
+		scope, shard, storageTotalDay,
 	).Scan(&curBytes, &curFiles)
 
 	if deltaBytes < 0 {
@@ -211,45 +265,71 @@ func clampNegativeStorageDelta(session *gocql.Session, scope string, deltaBytes,
 	return deltaBytes, deltaFiles
 }
 
-// ReadStorageUsed returns the live bytes_used from the running-total row
-// for the given scope. Returns 0 if the row does not exist or on any error.
-func ReadStorageUsed(db DBSession, scope string) int64 {
-	var v int64
-	_ = db.Session().Query(
-		`SELECT bytes_used FROM storage_counters WHERE scope = ? AND day = ?`,
-		scope, storageTotalDay,
-	).Scan(&v)
-	return max(v, 0)
-}
-
-// ReadStorageSnapshot returns the running-total bytes_used and file_count for
-// the given scope. Missing rows are treated as zero.
-func ReadStorageSnapshot(db DBSession, scope string) StorageSnapshot {
+func readStorageSnapshotAtShardErr(db DBSession, scope string, shard int, day time.Time) (StorageSnapshot, error) {
 	var bytesUsed, fileCount int64
-	_ = db.Session().Query(
-		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND day = ?`,
-		scope, storageTotalDay,
+	err := db.Session().Query(
+		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND shard = ? AND day = ?`,
+		scope, shard, day,
 	).Scan(&bytesUsed, &fileCount)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return StorageSnapshot{}, nil
+		}
+		return StorageSnapshot{}, err
+	}
 	return StorageSnapshot{
 		BytesUsed: max(bytesUsed, 0),
 		FileCount: max(fileCount, 0),
+	}, nil
+}
+
+func readStorageSnapshotAtShard(db DBSession, scope string, shard int, day time.Time) StorageSnapshot {
+	snapshot, err := readStorageSnapshotAtShardErr(db, scope, shard, day)
+	if err != nil {
+		log.Printf("[storage] read snapshot error scope=%s shard=%d day=%s: %v", scope, shard, day.Format("2006-01-02"), err)
+		return StorageSnapshot{}
 	}
+	return snapshot
+}
+
+// ReadStorageUsed returns the live bytes_used from the running-total row
+// for the given scope. Returns 0 if the row does not exist or on any error.
+func ReadStorageUsed(db DBSession, scope string) int64 {
+	return ReadStorageSnapshot(db, scope).BytesUsed
+}
+
+// ReadStorageSnapshot returns the running-total bytes_used and file_count for
+// the given scope. Missing rows are treated as zero, and read errors are
+// logged then treated as zero on these best-effort read paths.
+func ReadStorageSnapshot(db DBSession, scope string) StorageSnapshot {
+	var snapshot StorageSnapshot
+	forEachStorageReadShard(scope, func(shard int) {
+		shardSnapshot := readStorageSnapshotAtShard(db, scope, shard, storageTotalDay)
+		snapshot.BytesUsed += shardSnapshot.BytesUsed
+		snapshot.FileCount += shardSnapshot.FileCount
+	})
+	return snapshot
 }
 
 // ReadStorageDailyDeltas returns storage deltas for each day in [start, end].
 // The sentinel total row is never included because storageTotalDay < any real date.
 func ReadStorageDailyDeltas(db DBSession, scope string, start, end time.Time) map[string]int64 {
 	deltas := map[string]int64{}
-	iter := db.Session().Query(
-		`SELECT day, bytes_used FROM storage_counters WHERE scope = ? AND day >= ? AND day <= ?`,
-		scope, start, end,
-	).Iter()
-	var day time.Time
-	var delta int64
-	for iter.Scan(&day, &delta) {
-		deltas[day.UTC().Format("2006-01-02")] = delta
-	}
-	_ = iter.Close()
+	forEachStorageReadShard(scope, func(shard int) {
+		iter := db.Session().Query(
+			`SELECT day, bytes_used FROM storage_counters WHERE scope = ? AND shard = ? AND day >= ? AND day <= ?`,
+			scope, shard, start, end,
+		).Iter()
+		var day time.Time
+		var delta int64
+		for iter.Scan(&day, &delta) {
+			key := day.UTC().Format("2006-01-02")
+			deltas[key] += delta
+		}
+		if err := iter.Close(); err != nil {
+			log.Printf("[traffic] ReadStorageDailyDeltas scope=%s shard=%d iter error: %v", scope, shard, err)
+		}
+	})
 	return deltas
 }
 
@@ -281,8 +361,8 @@ func AdjustAggregateStorageCounters(db DBSession, orgID, ownerID, libraryID stri
 	libScope := LibraryStorageScope(orgID, libraryID)
 	var bytesUsed, fileCount int64
 	_ = db.Session().Query(
-		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND day = ?`,
-		libScope, storageTotalDay,
+		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND shard = ? AND day = ?`,
+		libScope, counterShardZero, storageTotalDay,
 	).Scan(&bytesUsed, &fileCount)
 
 	if bytesUsed <= 0 && fileCount <= 0 {
@@ -291,23 +371,23 @@ func AdjustAggregateStorageCounters(db DBSession, orgID, ownerID, libraryID stri
 
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	session := db.Session()
-	scopes := []string{
-		PlatformStorageScope(),
-		OrganizationStorageScope(orgID),
-		UserStorageScope(orgID, ownerID),
+	routes := []storageScopeRoute{
+		{scope: PlatformStorageScope(), shard: CounterShard(orgID)},
+		{scope: OrganizationStorageScope(orgID), shard: counterShardZero},
+		{scope: UserStorageScope(orgID, ownerID), shard: counterShardZero},
 	}
 
 	if increment {
-		for _, scope := range scopes {
-			storageUpdate(session, scope, storageTotalDay, bytesUsed, fileCount)
-			storageUpdate(session, scope, today, bytesUsed, fileCount)
+		for _, route := range routes {
+			storageUpdate(session, route.scope, route.shard, storageTotalDay, bytesUsed, fileCount)
+			storageUpdate(session, route.scope, route.shard, today, bytesUsed, fileCount)
 		}
 	} else {
-		for _, scope := range scopes {
+		for _, route := range routes {
 			var curBytes, curFiles int64
 			_ = session.Query(
-				`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND day = ?`,
-				scope, storageTotalDay,
+				`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND shard = ? AND day = ?`,
+				route.scope, route.shard, storageTotalDay,
 			).Scan(&curBytes, &curFiles)
 
 			actBytes := min(bytesUsed, max(curBytes, 0))
@@ -315,8 +395,8 @@ func AdjustAggregateStorageCounters(db DBSession, orgID, ownerID, libraryID stri
 			if actBytes <= 0 && actFiles <= 0 {
 				continue
 			}
-			storageUpdate(session, scope, storageTotalDay, -actBytes, -actFiles)
-			storageUpdate(session, scope, today, -actBytes, -actFiles)
+			storageUpdate(session, route.scope, route.shard, storageTotalDay, -actBytes, -actFiles)
+			storageUpdate(session, route.scope, route.shard, today, -actBytes, -actFiles)
 		}
 	}
 }
@@ -340,10 +420,19 @@ func AddAggregateStorageReconciliationQueries(batch *gocql.Batch, orgID, ownerID
 	}
 }
 
+var readStorageSnapshotAtShardErrFn = readStorageSnapshotAtShardErr
+var storageUpdateErrFn = storageUpdateErr
+
 // ReconcileStorageScope corrects a scope to the expected running total.
 // The delta is derived from the current live total, so repeated runs converge.
 func ReconcileStorageScope(db DBSession, scope string, expected StorageSnapshot) error {
-	current := ReadStorageSnapshot(db, scope)
+	if scope == PlatformStorageScope() {
+		return fmt.Errorf("platform scope requires ReconcileStorageScopeSharded")
+	}
+	current, err := readStorageSnapshotAtShardErrFn(db, scope, counterShardZero, storageTotalDay)
+	if err != nil {
+		return fmt.Errorf("read current storage scope %s: %w", scope, err)
+	}
 	deltaBytes := expected.BytesUsed - current.BytesUsed
 	deltaFiles := expected.FileCount - current.FileCount
 	if deltaBytes == 0 && deltaFiles == 0 {
@@ -352,18 +441,67 @@ func ReconcileStorageScope(db DBSession, scope string, expected StorageSnapshot)
 
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	session := db.Session()
-	if err := storageUpdateErr(session, scope, storageTotalDay, deltaBytes, deltaFiles); err != nil {
+	if err := storageUpdateErrFn(session, scope, counterShardZero, storageTotalDay, deltaBytes, deltaFiles); err != nil {
 		return err
 	}
-	if err := storageUpdateErr(session, scope, today, deltaBytes, deltaFiles); err != nil {
+	if err := storageUpdateErrFn(session, scope, counterShardZero, today, deltaBytes, deltaFiles); err != nil {
 		return err
 	}
 	return nil
+}
+
+// ReconcileStorageScopeSharded corrects the platform scope shard-by-shard so
+// retries converge even when the global aggregate is distributed.
+func ReconcileStorageScopeSharded(db DBSession, scope string, expectedByShard map[int]StorageSnapshot) error {
+	if scope != PlatformStorageScope() {
+		return fmt.Errorf("sharded reconciliation only supports platform scope")
+	}
+
+	currentByShard := make(map[int]StorageSnapshot, CounterShardCount)
+	var firstErr error
+	ForEachCounterShard(func(shard int) {
+		if firstErr != nil {
+			return
+		}
+		current, err := readStorageSnapshotAtShardErrFn(db, scope, shard, storageTotalDay)
+		if err != nil {
+			firstErr = fmt.Errorf("read current storage scope %s shard %d: %w", scope, shard, err)
+			return
+		}
+		currentByShard[shard] = current
+	})
+	if firstErr != nil {
+		return firstErr
+	}
+
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	session := db.Session()
+
+	ForEachCounterShard(func(shard int) {
+		expected := expectedByShard[shard]
+		current := currentByShard[shard]
+		deltaBytes := expected.BytesUsed - current.BytesUsed
+		deltaFiles := expected.FileCount - current.FileCount
+		if deltaBytes == 0 && deltaFiles == 0 {
+			return
+		}
+		if err := storageUpdateErrFn(session, scope, shard, storageTotalDay, deltaBytes, deltaFiles); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return
+		}
+		if err := storageUpdateErrFn(session, scope, shard, today, deltaBytes, deltaFiles); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	})
+
+	return firstErr
 }
 
 // DeleteLibraryStorageCounter removes all rows for the lib-scope after permanent
 // deletion. Aggregate scopes were already adjusted by a prior soft-delete.
 func DeleteLibraryStorageCounter(db DBSession, orgID, libraryID string) error {
 	scope := LibraryStorageScope(orgID, libraryID)
-	return db.Session().Query(`DELETE FROM storage_counters WHERE scope = ?`, scope).Exec()
+	return db.Session().Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, scope, counterShardZero).Exec()
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -20,6 +21,10 @@ var (
 	guestClient      *testClient
 	superadminClient *testClient
 )
+
+// liveRepoIDs tracks repos created during the current test run that must not
+// be deleted by the stale-library cleanup path.
+var liveRepoIDs sync.Map
 
 var ephemeralLibraryPrefixes = []string{
 	"inttest-",
@@ -160,8 +165,10 @@ func createLibraryForTest(t *testing.T, c *testClient, name string, body interfa
 	for attempt := 0; attempt < 2; attempt++ {
 		repoID, limitReached := tryCreateLibrary(t, c, name, body)
 		if repoID != "" {
+			liveRepoIDs.Store(repoID, struct{}{})
 			if cleanup {
 				t.Cleanup(func() {
+					liveRepoIDs.Delete(repoID)
 					resp := c.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
 					if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
 						resp.Body.Close()
@@ -170,6 +177,10 @@ func createLibraryForTest(t *testing.T, c *testClient, name string, body interfa
 					body := responseBody(t, resp)
 					t.Errorf("cleanup delete library %s failed: status=%d body=%s", repoID, resp.StatusCode, body)
 				})
+			} else {
+				// Remove from live set when test ends so stale-cleanup can find it
+				// if it was never deleted by the test itself.
+				t.Cleanup(func() { liveRepoIDs.Delete(repoID) })
 			}
 			return repoID
 		}
@@ -305,6 +316,9 @@ func cleanupOwnedEphemeralLibrariesWithoutTesting(c *testClient) int {
 		if repoID == "" || !isEphemeralLibraryName(repoName) {
 			continue
 		}
+		if _, live := liveRepoIDs.Load(repoID); live {
+			continue
+		}
 
 		if deleteEphemeralLibrary(c, repoID, repoName) {
 			deleted++
@@ -369,6 +383,9 @@ func cleanupOwnedEphemeralLibraries(t *testing.T, c *testClient) int {
 			repoName, _ = repo["name"].(string)
 		}
 		if repoID == "" || !isEphemeralLibraryName(repoName) {
+			continue
+		}
+		if _, live := liveRepoIDs.Load(repoID); live {
 			continue
 		}
 

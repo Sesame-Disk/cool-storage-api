@@ -83,6 +83,9 @@ type MockStore struct {
 
 	// storage snapshots keyed by storage scope.
 	storageSnapshots map[string]traffic.StorageSnapshot
+	// shard-local storage snapshots keyed by scope then shard. Only the platform
+	// scope uses multiple shards in the mock today.
+	storageShardSnapshots map[string]map[int]traffic.StorageSnapshot
 
 	// pending aggregate storage reconciliation keyed by scope.
 	storageCounterReconciliations map[string]*mockStorageCounterReconciliation
@@ -391,6 +394,7 @@ func NewMockStore() *MockStore {
 		groupsByMember:                       make(map[string]bool),
 		deletedLibraries:                     make(map[uuid.UUID]*mockDeletedLibrary),
 		storageSnapshots:                     make(map[string]traffic.StorageSnapshot),
+		storageShardSnapshots:                make(map[string]map[int]traffic.StorageSnapshot),
 		storageCounterReconciliations:        make(map[string]*mockStorageCounterReconciliation),
 		orgHardDeleteLocks:                   make(map[uuid.UUID]mockHardDeleteLock),
 		userHardDeleteLocks:                  make(map[uuid.UUID]mockHardDeleteLock),
@@ -609,12 +613,26 @@ func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID stri
 func (m *MockStore) AddStorageSnapshot(scope string, bytesUsed, fileCount int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if scope == traffic.PlatformStorageScope() {
+		m.storageShardSnapshots[scope] = map[int]traffic.StorageSnapshot{
+			0: {BytesUsed: bytesUsed, FileCount: fileCount},
+		}
+		return
+	}
 	m.storageSnapshots[scope] = traffic.StorageSnapshot{BytesUsed: bytesUsed, FileCount: fileCount}
 }
 
 func (m *MockStore) StorageSnapshot(scope string) traffic.StorageSnapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if scope == traffic.PlatformStorageScope() {
+		var sum traffic.StorageSnapshot
+		for _, snapshot := range m.storageShardSnapshots[scope] {
+			sum.BytesUsed += snapshot.BytesUsed
+			sum.FileCount += snapshot.FileCount
+		}
+		return sum
+	}
 	return m.storageSnapshots[scope]
 }
 
@@ -2143,6 +2161,7 @@ func (m *MockStore) ReconcilePendingStorageCounters() (int, error) {
 	}
 
 	expected := make(map[string]traffic.StorageSnapshot, len(m.storageCounterReconciliations))
+	expectedPlatformByShard := make(map[int]traffic.StorageSnapshot, traffic.CounterShardCount)
 	for _, lib := range m.libraries {
 		if !lib.DeletedAt.IsZero() {
 			continue
@@ -2156,10 +2175,11 @@ func (m *MockStore) ReconcilePendingStorageCounters() (int, error) {
 		}
 
 		if _, ok := m.storageCounterReconciliations[traffic.PlatformStorageScope()]; ok {
-			snap := expected[traffic.PlatformStorageScope()]
+			shard := traffic.CounterShard(lib.OrgID.String())
+			snap := expectedPlatformByShard[shard]
 			snap.BytesUsed += libSnapshot.BytesUsed
 			snap.FileCount += libSnapshot.FileCount
-			expected[traffic.PlatformStorageScope()] = snap
+			expectedPlatformByShard[shard] = snap
 		}
 
 		orgScope := traffic.OrganizationStorageScope(lib.OrgID.String())
@@ -2181,7 +2201,15 @@ func (m *MockStore) ReconcilePendingStorageCounters() (int, error) {
 
 	reconciled := 0
 	for scope := range m.storageCounterReconciliations {
-		m.storageSnapshots[scope] = expected[scope]
+		if scope == traffic.PlatformStorageScope() {
+			shards := make(map[int]traffic.StorageSnapshot, traffic.CounterShardCount)
+			traffic.ForEachCounterShard(func(shard int) {
+				shards[shard] = expectedPlatformByShard[shard]
+			})
+			m.storageShardSnapshots[scope] = shards
+		} else {
+			m.storageSnapshots[scope] = expected[scope]
+		}
 		delete(m.storageCounterReconciliations, scope)
 		reconciled++
 	}

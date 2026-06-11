@@ -117,6 +117,8 @@ func TestInitialSchemaContainsLookupNameAndStarredProjection(t *testing.T) {
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS starred_files_by_repo")
 	// file_tags reverse lookup by tag is a projection table, not ALLOW FILTERING.
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS file_tags_by_tag")
+	assert.Contains(t, content, "PRIMARY KEY ((org_id, month, shard), day, user_id, traffic_type)")
+	assert.Contains(t, content, "PRIMARY KEY ((scope, shard), day)")
 	assert.NotContains(t, content, "CREATE INDEX IF NOT EXISTS starred_files_by_repo ON starred_files (repo_id);")
 	// No secondary indexes in the baseline schema (scatter-gather anti-pattern).
 	assert.NotContains(t, content, "CREATE INDEX IF NOT EXISTS")
