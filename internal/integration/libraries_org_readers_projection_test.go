@@ -91,6 +91,45 @@ func TestLibrariesOrgReaders_SoftDeleteRemovedFromActiveCount(t *testing.T) {
 	})
 }
 
+func TestLibrariesOrgReaders_RestoreReappearsInOwnedReaders(t *testing.T) {
+	database := shareProjectionDBForTest(t)
+	perm := middleware.NewPermissionMiddleware(database)
+
+	adminUserID, ok := lookupUserIDByEmail(t, defaultAdminEmail)
+	if !ok {
+		t.Fatalf("expected user_id for %s", defaultAdminEmail)
+	}
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-orgreaders-restore-%d", time.Now().UnixNano()))
+
+	waitForIntegrationCondition(t, "owned readers see the original library via projection", func() bool {
+		return userOwnsLibraryForTest(t, perm, defaultOrgID, adminUserID, repoID) &&
+			orgAdminOwnedReposContainsRepoForTest(t, defaultAdminEmail, repoID)
+	})
+
+	deleteResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+	if deleteResp.StatusCode != http.StatusOK && deleteResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("soft-delete library %s failed: status=%d body=%s", repoID, deleteResp.StatusCode, responseBody(t, deleteResp))
+	}
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "soft-deleted library leaves owned readers", func() bool {
+		return !userOwnsLibraryForTest(t, perm, defaultOrgID, adminUserID, repoID) &&
+			!orgAdminOwnedReposContainsRepoForTest(t, defaultAdminEmail, repoID)
+	})
+
+	restoreResp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", repoID), nil)
+	if restoreResp.StatusCode != http.StatusOK {
+		t.Fatalf("restore library %s failed: status=%d body=%s", repoID, restoreResp.StatusCode, responseBody(t, restoreResp))
+	}
+	restoreResp.Body.Close()
+
+	waitForIntegrationCondition(t, "restored library reappears in owned readers", func() bool {
+		return userOwnsLibraryForTest(t, perm, defaultOrgID, adminUserID, repoID) &&
+			orgAdminOwnedReposContainsRepoForTest(t, defaultAdminEmail, repoID)
+	})
+}
+
 func TestLibrariesOrgReaders_DuplicateNameRejectedViaProjection(t *testing.T) {
 	database := shareProjectionDBForTest(t)
 	perm := middleware.NewPermissionMiddleware(database)
@@ -116,16 +155,73 @@ func TestLibrariesOrgReaders_DuplicateNameRejectedViaProjection(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestLibrariesOrgReaders_OwnerTransferMovesOwnedReadersAndDuplicateGuard(t *testing.T) {
+	database := shareProjectionDBForTest(t)
+	perm := middleware.NewPermissionMiddleware(database)
+
+	adminUserID, ok := lookupUserIDByEmail(t, defaultAdminEmail)
+	if !ok {
+		t.Fatalf("expected user_id for %s", defaultAdminEmail)
+	}
+	userUserID, ok := lookupUserIDByEmail(t, defaultUserEmail)
+	if !ok {
+		t.Fatalf("expected user_id for %s", defaultUserEmail)
+	}
+
+	name := fmt.Sprintf("inttest-orgreaders-transfer-%d", time.Now().UnixNano())
+	repoID := createDisposableTestLibrary(t, adminClient, name)
+	t.Cleanup(func() {
+		resp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/org/%s/admin/repos/%s/", defaultOrgID, repoID))
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return
+		}
+		body := responseBody(t, resp)
+		t.Errorf("cleanup delete transferred library %s failed: status=%d body=%s", repoID, resp.StatusCode, body)
+	})
+
+	waitForIntegrationCondition(t, "owned readers see the original owner via projection", func() bool {
+		return userOwnsLibraryForTest(t, perm, defaultOrgID, adminUserID, repoID) &&
+			orgAdminOwnedReposContainsRepoForTest(t, defaultAdminEmail, repoID)
+	})
+
+	transferResp := adminClient.PutJSON(t, fmt.Sprintf("/api/v2.1/org/%s/admin/repos/%s/", defaultOrgID, repoID), map[string]string{"email": defaultUserEmail})
+	if transferResp.StatusCode != http.StatusOK {
+		t.Fatalf("transfer library %s failed: status=%d body=%s", repoID, transferResp.StatusCode, responseBody(t, transferResp))
+	}
+	transferResp.Body.Close()
+
+	waitForIntegrationCondition(t, "owned readers move to the new owner via projection", func() bool {
+		return !userOwnsLibraryForTest(t, perm, defaultOrgID, adminUserID, repoID) &&
+			userOwnsLibraryForTest(t, perm, defaultOrgID, userUserID, repoID) &&
+			!orgAdminOwnedReposContainsRepoForTest(t, defaultAdminEmail, repoID) &&
+			orgAdminOwnedReposContainsRepoForTest(t, defaultUserEmail, repoID)
+	})
+
+	duplicateResp := adminClient.PostJSON(t, "/api/v2.1/repos/", map[string]string{"repo_name": name})
+	if duplicateResp.StatusCode != http.StatusOK {
+		t.Fatalf("post-transfer duplicate create expected status=%d, got status=%d body=%s", http.StatusOK, duplicateResp.StatusCode, responseBody(t, duplicateResp))
+	}
+	duplicateRepoID := repoIDFromCreateResponse(t, duplicateResp)
+	if duplicateRepoID == "" {
+		t.Fatalf("post-transfer duplicate create response missing repo_id")
+	}
+	t.Cleanup(func() {
+		resp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", duplicateRepoID))
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return
+		}
+		body := responseBody(t, resp)
+		t.Errorf("cleanup delete duplicate library %s failed: status=%d body=%s", duplicateRepoID, resp.StatusCode, body)
+	})
+}
+
 func TestLibrariesOrgReaders_OrgAdminOwnedReposIncludesLibrary(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-orgreaders-orgadmin-%d", time.Now().UnixNano()))
 
 	waitForIntegrationCondition(t, "org-admin owned-repos lists the library via libraries_by_owner", func() bool {
-		resp := superadminClient.Get(t, fmt.Sprintf("/api/v2.1/org/%s/admin/users/%s/repos", defaultOrgID, defaultAdminEmail))
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return false
-		}
-		return responseListContainsRepoID(t, resp, repoID)
+		return orgAdminOwnedReposContainsRepoForTest(t, defaultAdminEmail, repoID)
 	})
 }
 
@@ -195,4 +291,15 @@ func responseListContainsRepoID(t *testing.T, resp *http.Response, repoID string
 		}
 	}
 	return false
+}
+
+func orgAdminOwnedReposContainsRepoForTest(t *testing.T, email, repoID string) bool {
+	t.Helper()
+
+	resp := superadminClient.Get(t, fmt.Sprintf("/api/v2.1/org/%s/admin/users/%s/repos", defaultOrgID, email))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	return responseListContainsRepoID(t, resp, repoID)
 }

@@ -186,7 +186,7 @@ ever measure single-day partitions approaching the soft limit.
 ## H. Org-scoped `libraries` scans still walk tombstone-heavy partitions
 
 **Status**: partially resolved (2026-06-10, branch
-`feat/libraries-org-readers-projection`); owner/enforcement reads moved, list GC scans still open
+`feat/libraries-org-readers-projection`); owner/enforcement reads moved, list + GC scans still open
 
 **Tables**: `libraries`, `libraries_by_owner`, `libraries_deleted_by_org`
 
@@ -233,8 +233,10 @@ more expensive partition walks in GC and quota/permission-adjacent paths.
 
 **Done so far** (`feat/libraries-org-readers-projection`): the owner-centric and
 enforcement reads were moved off the canonical org-partition scan to the
-existing projections (no schema change; projection completeness verified across
-create / soft-delete / restore / owner-transfer / hard-delete / head-update):
+existing projections (no schema change; projection completeness covered by the
+existing projection regression suite plus the owner-reader integration tests
+across create / soft-delete / restore / owner-transfer / hard-delete /
+head-update):
 
 - `enforcement.go CountActiveLibraries` → `libraries_by_org_updated`
 - `libraries.go ownerHasActiveLibraryNamed` → `libraries_by_owner`

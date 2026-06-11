@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/gin-gonic/gin"
@@ -929,11 +930,16 @@ func (m *PermissionMiddleware) GetUserLibraries(orgID, userID string) ([]Library
 	// a single (org_id, owner_id) partition, instead of scanning the whole org
 	// partition of the canonical libraries table and filtering owner in Go.
 	iter := m.db.Session().Query(`
-		SELECT library_id FROM libraries_by_owner WHERE org_id = ? AND owner_id = ?
+		SELECT library_id, deleted_at FROM libraries_by_owner WHERE org_id = ? AND owner_id = ?
 	`, orgID, userID).Iter()
 
 	var libIDStr string
-	for iter.Scan(&libIDStr) {
+	var deletedAt time.Time
+	for iter.Scan(&libIDStr, &deletedAt) {
+		if !deletedAt.IsZero() {
+			deletedAt = time.Time{}
+			continue
+		}
 		libID, err := uuid.Parse(libIDStr)
 		if err != nil {
 			if closeErr := iter.Close(); closeErr != nil {
@@ -942,6 +948,7 @@ func (m *PermissionMiddleware) GetUserLibraries(orgID, userID string) ([]Library
 			return nil, fmt.Errorf("parse owned library id %q: %w", libIDStr, err)
 		}
 		librariesMap[libID] = PermissionOwner
+		deletedAt = time.Time{}
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
