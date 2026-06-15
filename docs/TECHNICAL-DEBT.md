@@ -258,8 +258,48 @@ fence check run in parallel across all 8 workers. Regression test:
 `TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put`. See
 `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`.
 
+**P-2 — Double S3 round-trip per block (Exists + PUT)** ✅ Fixed (2026-06-15,
+branch `perf/p2-cassandra-first-hot-reuse`)
+
+The pre-PUT S3 HEAD is replaced by `DB.ProbeBlockReuse(orgID, blockID)`
+(`internal/db/block_references.go`), which reads `blocks` metadata,
+`block_references`, and the `gc_s3_orphans` fence and returns
+reusable / needs-put / blocked-by-GC / unknown-error. Needs-put blocks use
+`PutBlockAutoDirect` (no HEAD); reusable blocks run `EnsureReusableBlockPresent`
+(verify the canonical object via HEAD on the declared key, repair via direct PUT
+only if missing); blocked-by-GC returns `ErrBlockDeleteInProgress` to retry;
+unknown-error falls open to the legacy Exists+PUT. Wired into all five upload paths
+(`seafhttp.go` ×2, `sync.go`, `files.go` ×2, `onlyoffice.go`). Per-block cost: a
+new block now pays ≤2 Cassandra reads (~1 ms each) + 1 direct PUT and no HEAD;
+dedup hits keep one canonical-verify HEAD. Safety is unchanged — it rests on the
+reference-first/fence-check protocol in `RegisterUploadedBlock`, not on the PUT
+(see KNOWN_ISSUES ISSUE-UPLOAD-S3-DOUBLE-RTT-01). The materialize retry loop now
+also retries `ErrBlockDeleteInProgress` from the `store` phase.
+
+**Scope (not global):** this fixes the server-side hot upload paths only. The
+`BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData` still do
+`Exists` + `PutAuto` and remain in use as the probe-error fallback and by
+unmigrated callers (e.g. `v2/blocks.go` `UploadBlock`). The HEAD was not removed
+from `BlockStore` globally.
+
+Tests: `ProbeBlockReuse` decision matrix (`block_references_test.go`),
+reusable/needs-put `finalizeUploadStreaming` paths (`seafhttp_test.go`),
+`EnsureReusableBlockPresent` exists/repair paths and shared retry helper
+(`upload_reuse_test.go`).
+
 ### Remaining Debt
 
+- **Block reads ignore `storage_key`** (pre-existing, surfaced by P-2). Every read
+  in `internal/storage/blocks.go` (`GetBlock`, `GetBlockReader`, `GetBlockSize`,
+  `BlockExists`, …) derives the S3 key from the content hash via `hashToKey(hash)`
+  and never consults the canonical `storage_key` column; GC deletes the same way.
+  Only `EnsureReusableBlockPresent` (P-2) honors `storage_key`. Harmless today
+  because `storage_key` is either empty (4 of 5 upload paths write `""`) or equal to
+  the hash-derived key (OnlyOffice), so the hash-derived key is always correct. The
+  risk surfaces only if a future write persists a `storage_key` that differs from
+  `hashToKey(hash)` — reads/GC would then target a different object than verify/
+  repair. Fix: make `storage_key` the primary locator for reads + deletes, hash-
+  derived key as fallback. See KNOWN_ISSUES ISSUE-BLOCK-STORAGE-KEY-READS-01.
 - Pending-owner and publish-repair sweepers need explicit per-run limits and
   metrics for skipped, repaired, released, and failed rows.
 - The upload-finalize `gc_leases` role should include `orgID` for extra isolation.
@@ -269,18 +309,6 @@ fence check run in parallel across all 8 workers. Regression test:
   `block_ids` update, `pub:<attempt>` refs can survive until TTL. This is a known
   leak window, not data loss; close it later with chunked block-id metadata or a
   repair source that can reconstruct staged IDs.
-
-**P-2 — Double S3 round-trip per block (Exists + PUT)** (pending)
-
-`PutBlockAuto` / `PutBlock` / `PutBlockData` in `internal/storage/blocks.go`
-all call `s3.Exists(ctx, key)` before `s3.PutAuto`. On real S3 (~50 ms RTT)
-this is ~100 ms per new block; 128 blocks total ~12.8 s aggregate RTT (~1.6 s
-wall-clock with 8 workers). Fix: remove the `Exists` check and use a direct PUT —
-S3 accepts re-PUT of the same key idempotently. Caveat: `AccountBlockOnce`
-(`seafhttp.go:1988–1995`) deduplicates by block *position* (index), not SHA-256;
-same-content blocks at different positions still produce separate PUTs, so the
-`Exists` check is the only cross-position dedup guard today. Alternative: check
-existence in Cassandra (`block_references`) instead of S3 (~1 ms vs 50 ms).
 
 **S-1 — Chunk state is node-local** (pending)
 

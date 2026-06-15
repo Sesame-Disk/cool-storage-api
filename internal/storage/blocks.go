@@ -118,6 +118,42 @@ func (bs *BlockStore) PutBlockAuto(ctx context.Context, hash string, data []byte
 	return key, nil
 }
 
+// PutBlockAutoDirect stores a block using PutAuto without a prior Exists/HEAD.
+// Callers must only use this when another source of truth has already decided
+// the block is not safely reusable as-is.
+func (bs *BlockStore) PutBlockAutoDirect(ctx context.Context, hash string, data []byte) (string, error) {
+	key := bs.hashToKey(hash)
+
+	reader := &bytesReader{data: data}
+	_, err := bs.s3.PutAuto(ctx, key, reader, int64(len(data)))
+	if err != nil {
+		return "", fmt.Errorf("failed to store block: %w", err)
+	}
+
+	return key, nil
+}
+
+// PutObjectAutoDirect stores raw bytes at an explicit storage key without a prior Exists/HEAD.
+func (bs *BlockStore) PutObjectAutoDirect(ctx context.Context, storageKey string, data []byte) (string, error) {
+	reader := &bytesReader{data: data}
+	_, err := bs.s3.PutAuto(ctx, storageKey, reader, int64(len(data)))
+	if err != nil {
+		return "", fmt.Errorf("failed to store block: %w", err)
+	}
+
+	return storageKey, nil
+}
+
+// ObjectExists checks whether an explicit storage key exists.
+func (bs *BlockStore) ObjectExists(ctx context.Context, storageKey string) (bool, error) {
+	return bs.s3.Exists(ctx, storageKey)
+}
+
+// StorageKeyForHash exposes the deterministic storage key for a content hash.
+func (bs *BlockStore) StorageKeyForHash(hash string) string {
+	return bs.hashToKey(hash)
+}
+
 // GetBlock retrieves a block by its hash
 func (bs *BlockStore) GetBlock(ctx context.Context, hash string) ([]byte, error) {
 	key := bs.hashToKey(hash)
@@ -190,7 +226,7 @@ func (bs *BlockStore) CheckBlocksParallel(ctx context.Context, hashes []string, 
 
 	for _, hash := range hashes {
 		go func(h string) {
-			sem <- struct{}{} // Acquire
+			sem <- struct{}{}        // Acquire
 			defer func() { <-sem }() // Release
 
 			exists, _ := bs.BlockExists(ctx, h)
@@ -260,8 +296,8 @@ func (r *bytesReader) Read(p []byte) (n int, err error) {
 
 // BlockStats contains statistics about block storage
 type BlockStats struct {
-	TotalBlocks     int64 `json:"total_blocks"`
-	TotalSize       int64 `json:"total_size"`
-	UniqueBlocks    int64 `json:"unique_blocks"`
+	TotalBlocks     int64   `json:"total_blocks"`
+	TotalSize       int64   `json:"total_size"`
+	UniqueBlocks    int64   `json:"unique_blocks"`
 	DeduplicatedPct float64 `json:"deduplicated_pct"`
 }

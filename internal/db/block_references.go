@@ -42,6 +42,29 @@ const (
 	BlockGCStateDeleting = "deleting"
 )
 
+type BlockReuseDecision int
+
+const (
+	BlockReuseUnknownError BlockReuseDecision = iota
+	BlockReuseReusable
+	BlockReuseNeedsPut
+	BlockReuseBlockedByGC
+)
+
+type BlockReuseProbe struct {
+	Decision     BlockReuseDecision
+	SizeBytes    int
+	StorageClass string
+	StorageKey   string
+}
+
+type blockReuseMetadataRow struct {
+	SizeBytes    int
+	StorageClass string
+	StorageKey   string
+	GCState      string
+}
+
 // BlockReferrerForFSObject builds the permanent referrer for a block referenced
 // by an fs_object: "fs:<library_id>:<fs_id>". Because fs_id is content-addressed,
 // the same file content always yields the same referrer, so registering the
@@ -306,6 +329,91 @@ func (db *DB) UpsertBlockMetadata(orgID, blockID string, sizeBytes int, storageC
 		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, created_at, last_accessed)
 		VALUES (?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
 	`, orgID, blockID, sizeBytes, storageClass, storageKey, now, now).Exec()
+}
+
+var probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+	var row blockReuseMetadataRow
+	err := database.Session().Query(`
+		SELECT size_bytes, storage_class, storage_key, gc_state
+		FROM blocks
+		WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).Scan(&row.SizeBytes, &row.StorageClass, &row.StorageKey, &row.GCState)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return blockReuseMetadataRow{}, false, nil
+		}
+		return blockReuseMetadataRow{}, false, err
+	}
+	return row, true, nil
+}
+
+var probeBlockReuseHasReferencesFn = func(database *DB, orgID, blockID string) (bool, error) {
+	return database.BlockHasReferences(orgID, blockID)
+}
+
+var probeBlockReuseHasS3OrphanFn = func(database *DB, orgID, blockID string) (bool, error) {
+	var existingBlockID string
+	err := database.Session().Query(`
+		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
+	`, orgID, blockID).Scan(&existingBlockID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return existingBlockID != "", nil
+}
+
+// ProbeBlockReuse classifies whether an uploaded block can safely skip S3 PUT,
+// needs a direct PUT, or must back off because GC still owns the object.
+func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
+	metadata, found, err := probeBlockReuseMetadataFn(db, orgID, blockID)
+	if err != nil {
+		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("read block metadata for %s: %w", blockID, err)
+	}
+	if !found {
+		hasOrphan, orphanErr := probeBlockReuseHasS3OrphanFn(db, orgID, blockID)
+		if orphanErr != nil {
+			return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("read S3 orphan fence for %s: %w", blockID, orphanErr)
+		}
+		if hasOrphan {
+			return BlockReuseProbe{Decision: BlockReuseBlockedByGC}, nil
+		}
+		return BlockReuseProbe{Decision: BlockReuseNeedsPut}, nil
+	}
+
+	probe := BlockReuseProbe{
+		SizeBytes:    metadata.SizeBytes,
+		StorageClass: strings.TrimSpace(metadata.StorageClass),
+		StorageKey:   strings.TrimSpace(metadata.StorageKey),
+	}
+	if probe.StorageClass == "" {
+		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("block %s has empty canonical storage class", blockID)
+	}
+	if metadata.GCState == BlockGCStateDeleting {
+		probe.Decision = BlockReuseBlockedByGC
+		return probe, nil
+	}
+
+	hasReferences, refErr := probeBlockReuseHasReferencesFn(db, orgID, blockID)
+	if refErr != nil {
+		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("read block references for %s: %w", blockID, refErr)
+	}
+	hasOrphan, orphanErr := probeBlockReuseHasS3OrphanFn(db, orgID, blockID)
+	if orphanErr != nil {
+		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("read S3 orphan fence for %s: %w", blockID, orphanErr)
+	}
+	if hasOrphan {
+		probe.Decision = BlockReuseBlockedByGC
+		return probe, nil
+	}
+	if hasReferences {
+		probe.Decision = BlockReuseReusable
+		return probe, nil
+	}
+	probe.Decision = BlockReuseNeedsPut
+	return probe, nil
 }
 
 // AddBlockReference registers a reference to a block. Idempotent: re-adding the
