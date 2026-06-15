@@ -4,7 +4,7 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, resetUploadConflictAutoRetry, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus } from '../../utils/upload-finalization';
+import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadProgressDialog from './upload-progress-dialog';
@@ -345,15 +345,44 @@ class FileUploader extends React.Component {
     Utils.registerGlobalVariable('uploader', 'totalProgress', progress);
   };
 
+  markUploadSaved = (resumableFile, newFileName) => {
+    let uploadFileList = this.state.uploadFileList.map(item => {
+      if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+        clearFileUploadRuntimeState(item);
+        item.newFileName = newFileName;
+        item.isSaved = true;
+      }
+      return item;
+    });
+    this.setState({ uploadFileList: uploadFileList });
+    this.restoreConcurrencyIfIdle();
+  };
+
   onFileUploadSuccess = (resumableFile, message) => {
     let formData = resumableFile.formData;
     let currentTime = new Date().getTime() / 1000;
-    message = formData.replace ? message : JSON.parse(message)[0];
+
+    // resumable.js hands fileSuccess the body of whichever chunk's XHR finished
+    // last. With more than one chunk of this file in flight (simultaneous
+    // uploads, or the temporary finalize slot) that body can be an intermediate
+    // ack ({"success":true}) instead of the finalize response. Resolve against
+    // the metadata captured from whichever chunk actually carried it so we never
+    // dereference an undefined entry — which used to throw inside fileSuccess,
+    // stall the whole upload queue, and freeze files on "Saving..." forever.
+    let resolved = resolveUploadSuccessResult(resumableFile, message, formData.replace);
+    if (!resolved) {
+      // eslint-disable-next-line no-console
+      console.error('Upload finalize metadata missing for', resumableFile.fileName, 'message:', message);
+      this.markUploadSaved(resumableFile, resumableFile.fileName);
+      return;
+    }
+
     if (formData.relative_path) { // upload folder
+      let entry = resolved.entry;
       let relative_path = formData.relative_path;
       let dir_name = relative_path.slice(0, relative_path.indexOf('/'));
       let dirent = {
-        id: message.id,
+        id: entry.id,
         name: dir_name,
         type: 'dir',
         mtime: currentTime,
@@ -366,64 +395,36 @@ class FileUploader extends React.Component {
         this.props.onFileUploadSuccess(dirent);
       }
 
-      // update uploadFileList
-      let uploadFileList = this.state.uploadFileList.map(item => {
-        if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
-          clearFileUploadRuntimeState(item);
-          item.newFileName = relative_path + message.name;
-          item.isSaved = true;
-        }
-        return item;
-      });
-      this.setState({ uploadFileList: uploadFileList });
-      this.restoreConcurrencyIfIdle();
-
+      this.markUploadSaved(resumableFile, relative_path + entry.name);
       return;
     }
 
     if (formData.replace) { // upload file -- replace exist file
       let fileName = resumableFile.fileName;
       let dirent = {
-        id: message,
+        id: resolved.id,
         name: fileName,
         type: 'file',
         mtime: currentTime
       };
       this.props.onFileUploadSuccess(dirent); // this contance: just one file
 
-      let uploadFileList = this.state.uploadFileList.map(item => {
-        if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
-          item.newFileName = fileName;
-          item.isSaved = true;
-        }
-        return item;
-      });
-      this.setState({ uploadFileList: uploadFileList });
-      this.restoreConcurrencyIfIdle();
-
+      this.markUploadSaved(resumableFile, fileName);
       return;
     }
 
     // upload file -- add files
+    let entry = resolved.entry;
     let dirent = {
-      id: message.id,
+      id: entry.id,
       type: 'file',
-      name: message.name,
-      size: message.size,
+      name: entry.name,
+      size: entry.size,
       mtime: currentTime,
     };
     this.props.onFileUploadSuccess(dirent); // this contance:  no repetition file
 
-    let uploadFileList = this.state.uploadFileList.map(item => {
-      if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
-        clearFileUploadRuntimeState(item);
-        item.newFileName = message.name;
-        item.isSaved = true;
-      }
-      return item;
-    });
-    this.setState({ uploadFileList: uploadFileList });
-    this.restoreConcurrencyIfIdle();
+    this.markUploadSaved(resumableFile, entry.name);
   };
 
   getFileServerErrorMessage = (key) => {

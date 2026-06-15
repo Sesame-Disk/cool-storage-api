@@ -6,7 +6,7 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, resetUploadConflictAutoRetry, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus } from '../../utils/upload-finalization';
+import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadProgressDialog from './upload-progress-dialog';
@@ -338,7 +338,31 @@ class FileUploader extends React.Component {
   onFileUploadSuccess = (resumableFile, message) => {
     let formData = resumableFile.formData;
     let currentTime = new Date().getTime() / 1000;
-    message = formData.replace ? message : JSON.parse(message)[0];
+
+    // resumable.js hands fileSuccess the body of whichever chunk's XHR finished
+    // last. With more than one chunk of this file in flight (simultaneous
+    // uploads, or the temporary finalize slot) that body can be an intermediate
+    // ack ({"success":true}) instead of the finalize response. Resolve against
+    // the metadata captured from whichever chunk actually carried it so we never
+    // dereference an undefined entry — which used to throw inside fileSuccess,
+    // stall the whole upload queue, and freeze files on "Saving..." forever.
+    let resolved = resolveUploadSuccessResult(resumableFile, message, formData.replace);
+    if (!resolved || !resolved.entry) {
+      // eslint-disable-next-line no-console
+      console.error('Upload finalize metadata missing for', resumableFile.fileName, 'message:', message);
+      let uploadFileList = this.state.uploadFileList.map(item => {
+        if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+          clearFileUploadRuntimeState(item);
+          item.newFileName = resumableFile.fileName;
+          item.isSaved = true;
+        }
+        return item;
+      });
+      this.setState({ uploadFileList: uploadFileList });
+      this.restoreConcurrencyIfIdle();
+      return;
+    }
+    let entry = resolved.entry;
     if (formData.relative_path) { // upload folder
       // 'upload folder' is not supported
       /*
@@ -399,10 +423,10 @@ class FileUploader extends React.Component {
 
     // upload file -- add files
     let dirent = {
-      id: message.id,
+      id: entry.id,
       type: 'file',
-      name: message.name,
-      size: message.size,
+      name: entry.name,
+      size: entry.size,
       mtime: currentTime,
     };
     this.props.onFileUploadSuccess(dirent); // this contance:  no repetition file
@@ -410,7 +434,7 @@ class FileUploader extends React.Component {
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
         clearFileUploadRuntimeState(item);
-        item.newFileName = message.name;
+        item.newFileName = entry.name;
         item.isSaved = true;
       }
       return item;
