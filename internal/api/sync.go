@@ -965,6 +965,16 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		if isLegacySHA1 {
 			externalMappingID = externalID
 		}
+		// IMPORTANT: this store callback can be re-invoked by
+		// RetryUploadedBlockMaterialization (the retry path fires when store or
+		// materialize returns ErrBlockDeleteInProgress). It is therefore only
+		// safe to write a gin response (c.JSON) here because every branch that
+		// writes one returns a NON-retryable sentinel (errSyncStorageQuotaExceeded,
+		// errSyncBlockExistenceCheck, errSyncStoreBackend) — those short-circuit
+		// the retry loop, so the callback runs exactly once and never double-writes.
+		// The only retryable return (ErrBlockDeleteInProgress) writes no response.
+		// If you add a new response-writing branch, it MUST return a non-retryable
+		// error or the response will be written twice on retry.
 		if err := v2.RetryUploadedBlockMaterialization("PutBlock", internalID, func() error {
 			probe, probeErr := syncProbeUploadedBlockReuseFn(h.db, orgID, internalID)
 			if probeErr == nil {

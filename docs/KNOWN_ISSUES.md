@@ -48,7 +48,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **`blocks` Hot Partition by `org_id`** | ✅ Fixed (2026-05-26) | `blocks`, `gc_block_candidates`, `gc_s3_orphans`, and the block-id mapping tables now use per-block partitioning so no single org concentrates LWT traffic into one Cassandra partition. The GC scan and S3 orphan recovery paths walk per-day discovery projections instead of partition-scanning by org. See ISSUE-BLOCKS-HOT-PARTITION-01 below. |
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
-| **Double S3 RTT Per Block (Exists + PUT)** | 🟡 Pending | `PutBlockAuto`/`PutBlock`/`PutBlockData` in `internal/storage/blocks.go` issue an S3 HEAD before every PUT. On real S3 this doubles per-block latency (~100 ms per block). See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below. |
+| **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` that decides reuse / direct-PUT / GC-fence before any S3 call. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
@@ -740,29 +740,54 @@ callback completes while the metadata permit is externally held.
 
 ### ISSUE-UPLOAD-S3-DOUBLE-RTT-01: Double S3 Round-Trip Per Block
 
-**Status**: 🟡 Pending
-**Severity**: Medium — doubles per-block S3 latency (~100 ms per block on real S3)
-**Affected**: `PutBlockAuto`, `PutBlock`, `PutBlockData` in `internal/storage/blocks.go`
+**Status**: ✅ Fixed (2026-06-15, branch `perf/p2-cassandra-first-hot-reuse`)
+**Severity**: Medium — doubled per-block S3 latency (~100 ms per block on real S3)
+**Affected**: upload paths in `seafhttp.go`, `sync.go`, `files.go`, `onlyoffice.go`
 
 #### Problem
 
-All three functions call `bs.s3.Exists(ctx, key)` before `bs.s3.PutAuto(...)`.
-For new blocks this costs 2 S3 round-trips. On real S3 (~50 ms RTT each), a 1 GB
-file (128 × 8 MB blocks) totals ~12.8 s of aggregate RTT work if serialized; with
-8 ideal parallel workers the wall-clock RTT floor is ~1.6 s, plus transfer and
-queuing. While P-1 was active, both RTTs were serialized process-wide on top of this.
+`PutBlockAuto` / `PutBlock` / `PutBlockData` in `internal/storage/blocks.go` each
+call `bs.s3.Exists(ctx, key)` before `bs.s3.PutAuto(...)`. For new blocks this cost
+2 S3 round-trips. On real S3 (~50 ms RTT each), a 1 GB file (128 × 8 MB blocks)
+totals ~12.8 s of aggregate RTT work if serialized; with 8 ideal parallel workers
+the wall-clock RTT floor is ~1.6 s, plus transfer and queuing. While P-1 was active,
+both RTTs were serialized process-wide on top of this.
 
-#### Proposed Fix
+#### Fix (Cassandra-first probe, "Option B")
 
-Remove the `Exists` check from all three functions and issue a direct PUT. S3
-accepts idempotent re-PUT of the same content-addressed key. Note:
-`upload.AccountBlockOnce` (`seafhttp.go:1988–1995`) deduplicates by *block position*
-(index), not by SHA-256, so same-content blocks at different positions still produce
-separate PUTs. The `Exists` check is the only cross-position dedup guard today;
-removing it trades that guard for lower latency.
+The S3 HEAD is replaced by `DB.ProbeBlockReuse(orgID, blockID)` in
+`internal/db/block_references.go`, which reads `blocks` metadata, `block_references`,
+and the `gc_s3_orphans` fence to return one of:
 
-Alternative: verify block existence via Cassandra (`block_references`) before
-touching S3 — ~1 ms vs 50 ms.
+- `BlockReuseReusable` → skip S3 entirely
+- `BlockReuseNeedsPut` → `PutBlockAutoDirect` (direct PUT, no HEAD)
+- `BlockReuseBlockedByGC` → `ErrBlockDeleteInProgress` (retry/back-off)
+- `BlockReuseUnknownError` → fall open to the legacy Exists+PUT path
+
+Wired into all five upload paths. New blocks now pay ≤2 Cassandra reads (~1 ms each)
+instead of an S3 HEAD; dedup hits pay 3 Cassandra reads and no S3.
+
+#### Why skipping the PUT is safe
+
+GC-race safety derives from the *reference-first, then fence-check* protocol in
+`FSHelper.RegisterUploadedBlock` (`fs_helpers.go:1006–1034`) versus GC's
+*claim-then-verify-references* in `worker.go:processBlock` (L410–443) — a
+Dekker-style mutual flagging — not from the S3 PUT. The `gc_s3_orphans` fence is
+written before the S3 `DeleteObject` and cleared only after it, so any in-flight
+delete is always visible to both the probe and the materialize step. The probe is
+an optimization that fails safe in every non-reusable direction.
+
+The materialization retry loop (`retrySeafHTTPBlockMaterialization` and
+`v2.RetryUploadedBlockMaterialization`) now also retries when the `store` phase
+returns `ErrBlockDeleteInProgress`, since a probe can reject a block before any S3
+work begins.
+
+#### Caveat
+
+`AccountBlockOnce` still deduplicates by block position (index), not SHA-256, so
+same-content blocks at different positions within one upload produce separate
+probes/PUTs. The Cassandra probe provides cross-upload dedup, matching what the
+old S3 HEAD did — no dedup regression.
 
 #### Related
 

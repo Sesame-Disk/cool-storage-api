@@ -329,3 +329,104 @@ func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageClass(t *testing.T) {
 		t.Fatalf("decision = %v, want BlockReuseUnknownError", probe.Decision)
 	}
 }
+
+// TestProbeBlockReuseNeedsPutWhenMetadataPresentButNoReferences covers the
+// branch where a canonical block row exists (with a distinct, non-default
+// storage class) but has no live references and is not GC-fenced. The block is
+// an unreferenced GC candidate, so a fresh upload must re-materialize it with a
+// direct PUT rather than trust a potentially-collectible object. The canonical
+// storage class and size still flow through the probe for the materialize step.
+func TestProbeBlockReuseNeedsPutWhenMetadataPresentButNoReferences(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldRefs := probeBlockReuseHasReferencesFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasReferencesFn = oldRefs
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+
+	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{SizeBytes: 4096, StorageClass: "cold-archive", StorageKey: "blocks/ab/cd", GCState: ""}, true, nil
+	}
+	probeBlockReuseHasReferencesFn = func(database *DB, orgID, blockID string) (bool, error) {
+		return false, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(database *DB, orgID, blockID string) (bool, error) {
+		return false, nil
+	}
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
+	}
+	if probe.Decision != BlockReuseNeedsPut {
+		t.Fatalf("decision = %v, want BlockReuseNeedsPut", probe.Decision)
+	}
+	if probe.StorageClass != "cold-archive" {
+		t.Fatalf("storage class = %q, want cold-archive", probe.StorageClass)
+	}
+	if probe.SizeBytes != 4096 {
+		t.Fatalf("size = %d, want 4096", probe.SizeBytes)
+	}
+}
+
+// TestProbeBlockReuseBlockedByGCWhenGCStateDeleting verifies the in-row claim
+// (gc_state='deleting') is an immediate fence that short-circuits before the
+// reference read, so a concurrent re-upload backs off even while references
+// momentarily exist.
+func TestProbeBlockReuseBlockedByGCWhenGCStateDeleting(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldRefs := probeBlockReuseHasReferencesFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasReferencesFn = oldRefs
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+
+	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{SizeBytes: 10, StorageClass: "hot", GCState: BlockGCStateDeleting}, true, nil
+	}
+	refsCalled := false
+	probeBlockReuseHasReferencesFn = func(database *DB, orgID, blockID string) (bool, error) {
+		refsCalled = true
+		return true, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(database *DB, orgID, blockID string) (bool, error) {
+		return false, nil
+	}
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
+	}
+	if probe.Decision != BlockReuseBlockedByGC {
+		t.Fatalf("decision = %v, want BlockReuseBlockedByGC", probe.Decision)
+	}
+	if refsCalled {
+		t.Fatal("references were read even though gc_state=deleting must short-circuit")
+	}
+}
+
+// TestProbeBlockReuseReturnsUnknownErrorWhenMetadataReadFails verifies a
+// Cassandra read failure surfaces as UnknownError with the underlying error
+// wrapped, so callers fall open to the legacy Exists+PUT path instead of
+// silently skipping the PUT.
+func TestProbeBlockReuseReturnsUnknownErrorWhenMetadataReadFails(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	t.Cleanup(func() { probeBlockReuseMetadataFn = oldMetadata })
+
+	wantErr := errors.New("cassandra unavailable")
+	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{}, false, wantErr
+	}
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("ProbeBlockReuse() error = %v, want wrapped %v", err, wantErr)
+	}
+	if probe.Decision != BlockReuseUnknownError {
+		t.Fatalf("decision = %v, want BlockReuseUnknownError", probe.Decision)
+	}
+}

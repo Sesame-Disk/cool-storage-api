@@ -2588,6 +2588,142 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	}
 }
 
+// finalizeUploadStreamingReuseFixture wires the common mocks for the
+// Cassandra-first reuse tests below and returns call counters. The legacy
+// Exists+PUT path (putUploadedBlockAutoFn) is the only one that issues an S3
+// HEAD, so a zero count there proves no HEAD was performed.
+func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReuseProbe) (legacyPuts, directPuts, registerCalls *atomic.Int32, run func() (string, error)) {
+	t.Helper()
+
+	cm, _ := newTestChunkManager(t)
+	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 5)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	t.Cleanup(func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token1", "test.bin")
+	})
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk failed: %v", err)
+	}
+
+	originalProbe := probeUploadedBlockReuseForUploadFn
+	originalLegacyPut := putUploadedBlockAutoFn
+	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
+	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
+	originalEncrypted := lookupLibraryEncryptedForUploadFn
+	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
+	t.Cleanup(func() {
+		probeUploadedBlockReuseForUploadFn = originalProbe
+		putUploadedBlockAutoFn = originalLegacyPut
+		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
+		registerUploadedBlockAndMappingForUploadFn = originalRegister
+		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
+		lookupLibraryEncryptedForUploadFn = originalEncrypted
+		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
+	})
+
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+		return false, nil
+	}
+	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
+		return decision, nil
+	}
+
+	legacyPuts = &atomic.Int32{}
+	directPuts = &atomic.Int32{}
+	registerCalls = &atomic.Int32{}
+
+	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
+		legacyPuts.Add(1)
+		return hash, nil
+	}
+	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
+		directPuts.Add(1)
+		return hash, nil
+	}
+	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+		registerCalls.Add(1)
+		return nil
+	}
+	commitSeafHTTPUploadedFileMultiBlockFn = func(h *SeafHTTPHandler, ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+		return "commit-1", filename, 0, 0, nil
+	}
+
+	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, nil, nil, nil)
+	token := &AccessToken{OrgID: "org1", RepoID: "repo1", UserID: "user1", Token: "token1"}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/token1", nil)
+
+	run = func() (string, error) {
+		fileID, _, _, _, err := handler.finalizeUploadStreaming(c, token, upload, "/", "test.bin", "", 5, false)
+		return fileID, err
+	}
+	return legacyPuts, directPuts, registerCalls, run
+}
+
+// TestFinalizeUploadStreamingReusableSkipsHeadAndPut verifies that when the
+// Cassandra probe reports a block reusable, finalization performs neither an S3
+// HEAD nor an S3 PUT, yet still registers the block reference + mapping.
+func TestFinalizeUploadStreamingReusableSkipsHeadAndPut(t *testing.T) {
+	legacyPuts, directPuts, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
+		db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot"})
+
+	expectedSHA1 := sha1.Sum([]byte("hello"))
+	expectedBlockID := hex.EncodeToString(expectedSHA1[:])
+
+	fileID, err := run()
+	if err != nil {
+		t.Fatalf("finalizeUploadStreaming error = %v, want nil", err)
+	}
+	if fileID != expectedBlockID {
+		t.Fatalf("fileID = %s, want %s", fileID, expectedBlockID)
+	}
+	if got := legacyPuts.Load(); got != 0 {
+		t.Errorf("legacy Exists+PUT (HEAD) calls = %d, want 0 for a reusable block", got)
+	}
+	if got := directPuts.Load(); got != 0 {
+		t.Errorf("direct PUT calls = %d, want 0 for a reusable block", got)
+	}
+	if got := registerCalls.Load(); got != 1 {
+		t.Errorf("register ref/mapping calls = %d, want 1", got)
+	}
+}
+
+// TestFinalizeUploadStreamingNeedsPutUsesDirectPut verifies that when the probe
+// reports the block needs storing, finalization performs exactly one direct PUT
+// (no S3 HEAD via the legacy path) and registers the block reference + mapping.
+func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
+	legacyPuts, directPuts, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
+		db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"})
+
+	expectedSHA1 := sha1.Sum([]byte("hello"))
+	expectedBlockID := hex.EncodeToString(expectedSHA1[:])
+
+	fileID, err := run()
+	if err != nil {
+		t.Fatalf("finalizeUploadStreaming error = %v, want nil", err)
+	}
+	if fileID != expectedBlockID {
+		t.Fatalf("fileID = %s, want %s", fileID, expectedBlockID)
+	}
+	if got := legacyPuts.Load(); got != 0 {
+		t.Errorf("legacy Exists+PUT (HEAD) calls = %d, want 0 (needs_put must use the direct PUT)", got)
+	}
+	if got := directPuts.Load(); got != 1 {
+		t.Errorf("direct PUT calls = %d, want 1", got)
+	}
+	if got := registerCalls.Load(); got != 1 {
+		t.Errorf("register ref/mapping calls = %d, want 1", got)
+	}
+}
+
 // TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put guards the lower-level
 // materialization helper against accidentally re-wrapping the S3 PUT inside the
 // metadata permit.
