@@ -49,7 +49,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on the five server-side upload paths. NOT global: legacy `BlockStore` Exists+PUT methods remain for fallback + unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
-| **Read Paths Ignore `storage_key`** | 🟡 Pending | All block reads derive the S3 key from the content hash (`hashToKey`) and never consult the canonical `storage_key` column; only the new reuse verify/repair honors it. Harmless today (always equal) but blocks any non-hash-derived key layout. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
+| **Read Paths Ignore `storage_key`** | 🟡 Pending | All block reads derive the S3 key from the content hash (`hashToKey`) and never consult the canonical `storage_key` column; only the new reuse verify/repair honors it. Harmless today (`storage_key` is empty or equal to the hash-derived key) but blocks any non-hash-derived key layout. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
@@ -809,6 +809,8 @@ work begins.
   `ErrBlockDeleteInProgress`, so it is not retried). Reusable blocks previously
   touched no S3 and could not fail there. Refusing to publish an unverifiable
   reference is the safer behavior, but it is a behavioral change for incident triage.
+  Follow-up: if real S3 shows transient HEAD errors, add a small retry/backoff
+  around `ObjectExists` in `EnsureReusableBlockPresent` so a flaky HEAD self-heals.
 
 #### Related
 
@@ -839,17 +841,21 @@ when it is empty).
 
 #### Why it is not a live bug (yet)
 
-`storage_key` is always written equal to `hashToKey(hash)` at upload time, so the
-column and the derived key never diverge. Reads and the verify/repair path therefore
-resolve to the same object.
+`storage_key` is **either empty or equal to `hashToKey(hash)`** today: 4 of the 5
+upload paths register the block with `storage_key=""` (`seafhttp.go` ×2, `sync.go`,
+`files.go`/`UploadFile`); only OnlyOffice persists a non-empty value, and that value
+is the hash-derived key. So `hashToKey(hash)` is always a correct locator, and
+`EnsureReusableBlockPresent` falls back to `StorageKeyForHash(blockID)` whenever the
+column is empty. Reads, GC, and the verify/repair path therefore resolve to the same
+object in every case that exists today.
 
 #### The latent risk
 
-The system cannot safely relocate a block to a key that differs from
+The system cannot safely relocate a block to a key that *differs* from
 `hashToKey(hash)` (e.g. per-tenant prefixes, re-sharding, migration to a different
-layout). If it did, the verify/repair path (respects `storage_key`) and the read +
-GC paths (ignore it) would target different objects — reads would 404 and GC could
-delete the wrong (or no) object.
+layout). The moment any write persists such a `storage_key`, the verify/repair path
+(respects `storage_key`) and the read + GC paths (ignore it) would target different
+objects — reads would 404 and GC could delete the wrong (or no) object.
 
 #### Proposed Fix
 

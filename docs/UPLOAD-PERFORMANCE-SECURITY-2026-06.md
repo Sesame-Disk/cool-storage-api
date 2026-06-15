@@ -131,13 +131,17 @@ reused), which the old S3 HEAD also did — so no dedup regression.
 Every *read* path in `internal/storage/blocks.go` — `GetBlock`, `GetBlockReader`,
 `GetBlockSize`, etc. — still derives the object key purely from the content hash
 via `hashToKey(hash)` and never consults `storage_key`. GC deletes the same way.
-Today this is harmless because `storage_key` is always written equal to the
-hash-derived key, so the two never diverge. But it means the system is not yet
-free to relocate a block to a non-hash-derived key: doing so would make the verify/
-repair path (which respects `storage_key`) and the read path (which ignores it)
-disagree. Full adoption of `storage_key` as the primary read locator is a separate,
-pre-existing tech-debt item — see `docs/KNOWN_ISSUES.md`
-(ISSUE-BLOCK-STORAGE-KEY-READS-01) and `docs/TECHNICAL-DEBT.md`.
+Today this is harmless because **`storage_key` is either empty or equal to the
+hash-derived key**: 4 of the 5 upload paths register the block with `storage_key=""`
+(only OnlyOffice persists a non-empty key, and it is the hash-derived one), so
+`hashToKey(hash)` is always a correct locator — and `EnsureReusableBlockPresent`'s
+fallback to `StorageKeyForHash(blockID)` when the column is empty is exactly what
+keeps the reuse path correct. The risk surfaces only if some future write persists a
+`storage_key` that *differs* from `hashToKey(hash)`: the read/GC paths (which ignore
+the column) and the verify/repair path (which honors it) would then disagree. Full
+adoption of `storage_key` as the primary read locator is a separate, pre-existing
+tech-debt item — see `docs/KNOWN_ISSUES.md` (ISSUE-BLOCK-STORAGE-KEY-READS-01) and
+`docs/TECHNICAL-DEBT.md`.
 
 **Caveat 3 (minor — new failure surface on reuse):** because the `Reusable` path now
 issues a canonical-verify HEAD, a transient S3 error on that HEAD now fails the
@@ -145,6 +149,9 @@ upload (it is not an `ErrBlockDeleteInProgress`, so it is not retried by the
 materialization loop). Previously a reusable block touched no S3 and could not fail
 there. This is acceptable — refusing to publish a reference we cannot verify is the
 safer behavior — but it is a behavioral change worth knowing during incident triage.
+Follow-up if real S3 shows transient HEAD errors: add a small retry/backoff
+specifically around `ObjectExists` in `EnsureReusableBlockPresent` so a flaky HEAD
+self-heals instead of failing the upload.
 
 ---
 
