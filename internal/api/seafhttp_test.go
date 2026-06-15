@@ -2362,6 +2362,50 @@ func TestAcquireFinalizeUploadBlockMetadataPermitSerializesCallers(t *testing.T)
 	releaseSecond()
 }
 
+func TestFinalizeUploadStreamingFailsClosedWhenEncryptionStatusLookupFails(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 5)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token1", "test.bin")
+	}()
+
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk failed: %v", err)
+	}
+
+	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
+	originalEncrypted := lookupLibraryEncryptedForUploadFn
+	t.Cleanup(func() {
+		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
+		lookupLibraryEncryptedForUploadFn = originalEncrypted
+	})
+
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+
+	lookupErr := errors.New("lookup failed")
+	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+		return false, lookupErr
+	}
+
+	handler := NewSeafHTTPHandler(nil, nil, nil, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/token1", nil)
+	token := &AccessToken{OrgID: "org1", RepoID: "repo1", UserID: "user1", Token: "token1"}
+
+	_, _, _, _, err = handler.finalizeUploadStreaming(c, token, upload, "/", "test.bin", "", 5, false)
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("finalizeUploadStreaming error = %v, want wrapped lookup error %v", err, lookupErr)
+	}
+}
+
 func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	cm, _ := newTestChunkManager(t)
 
@@ -2556,8 +2600,13 @@ func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
 	// Release the pre-held permit so the goroutine's LWT can proceed.
 	// Single explicit release — no defer to avoid double-release deadlock.
 	releaseHeld()
-	if err := <-done; err != nil {
-		t.Fatalf("retrySeafHTTPBlockMaterialization returned unexpected error: %v", err)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("retrySeafHTTPBlockMaterialization returned unexpected error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("retrySeafHTTPBlockMaterialization did not complete after the permit was released")
 	}
 }
 
@@ -2623,8 +2672,13 @@ func TestFinalizeUploadS3PutPrecedesPermitRelease(t *testing.T) {
 
 	// Allow materialize to proceed and record its permit-release sequence number.
 	releaseHeld()
-	if err := <-done; err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("retrySeafHTTPBlockMaterialization did not complete after permit release")
 	}
 
 	if putSeq >= permitReleaseSeq {

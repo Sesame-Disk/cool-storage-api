@@ -60,6 +60,42 @@ func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 	}
 }
 
+func TestSeafHTTPHandleUploadFailsClosedWhenEncryptionStatusLookupFails(t *testing.T) {
+	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
+	oldEncrypted := lookupLibraryEncryptedForUploadFn
+	t.Cleanup(func() {
+		checkUploadStorageQuotaForCurrentHeadFn = oldQuota
+		lookupLibraryEncryptedForUploadFn = oldEncrypted
+	})
+
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+		return false, fmt.Errorf("lookup failed")
+	}
+
+	tokenStore := NewMockTokenStore()
+	if _, err := tokenStore.CreateUploadToken("org1", "repo1", "/", "user1"); err != nil {
+		t.Fatalf("CreateUploadToken() error = %v", err)
+	}
+
+	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, tokenStore, nil, nil)
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	req := newMultipartUploadRequest(t, "/seafhttp/upload-api/mock-upload-token", "test.txt", []byte("hello"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+	if got := decodeJSONObject(t, w.Body)["error"]; got != "failed to check encryption status" {
+		t.Fatalf("error = %v, want failed to check encryption status", got)
+	}
+}
+
 func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	oldExists := syncBlockExistsFn
 	oldPut := syncPutBlockDataFn

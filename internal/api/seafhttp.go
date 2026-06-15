@@ -1511,6 +1511,8 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	var storedContent = chunkData
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to check encryption status: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check encryption status"})
+		return
 	}
 
 	if encrypted {
@@ -1908,7 +1910,7 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 	// Check encryption
 	encrypted, err := lookupLibraryEncryptedForUploadFn(h, token.OrgID, token.RepoID)
 	if err != nil {
-		encrypted = false
+		return "", "", 0, 0, fmt.Errorf("failed to check encryption status: %w", err)
 	}
 	var fileKey, fileIV []byte
 	if encrypted {
