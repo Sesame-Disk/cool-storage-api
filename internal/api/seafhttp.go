@@ -300,7 +300,36 @@ type ChunkUpload struct {
 	quotaPrecheck          chunkQuotaPrecheck
 	updatedAt              time.Time
 	mu                     sync.Mutex
+
+	// Finalization fan-in: the single request that wins ClaimFinalization runs
+	// the actual finalize and publishes its outcome here; any other request that
+	// arrives once all bytes are present (e.g. a resumable retry of the final
+	// chunk after the original finalize response was lost) waits on finalizeDone
+	// and returns the same result instead of a bare {"success":true} ack the
+	// client cannot turn into a dirent.
+	finalizeDone   chan struct{}
+	finalizeResult *finalizeOutcome
 }
+
+// finalizeOutcome is the shared result of a chunked-upload finalization, read by
+// waiters once finalizeDone is closed. Exactly one of (fileID/...) or err is set.
+type finalizeOutcome struct {
+	fileID         string
+	actualFilename string
+	totalSize      int64
+	err            error
+}
+
+type finalizeClaim int
+
+const (
+	// finalizeClaimIncomplete: not all bytes are present yet — return an ack.
+	finalizeClaimIncomplete finalizeClaim = iota
+	// finalizeClaimWinner: this request must run finalization and publish it.
+	finalizeClaimWinner
+	// finalizeClaimWaiter: another request is finalizing — wait for its result.
+	finalizeClaimWaiter
+)
 
 type byteRange struct {
 	Start int64
@@ -554,27 +583,83 @@ func (cu *ChunkUpload) IsComplete() bool {
 	return cu.isCompleteLocked()
 }
 
-func (cu *ChunkUpload) TryStartFinalization() bool {
+// ClaimFinalization decides this request's role in finalizing the upload.
+// Exactly one concurrent caller becomes the winner and must run finalization
+// then publish the outcome via PublishFinalize{Success,Failure}. Callers that
+// arrive once all bytes are present but finalization is already underway become
+// waiters and must block on the returned channel, then read FinalizeOutcome.
+// Callers whose bytes are not all present yet are incomplete.
+func (cu *ChunkUpload) ClaimFinalization() (finalizeClaim, <-chan struct{}) {
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
-	if cu.Finalizing {
+	if cu.Finalizing || cu.finalizeDone != nil {
 		metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("already_finalizing").Inc()
-		return false
+		return finalizeClaimWaiter, cu.finalizeDone
 	}
 	if !cu.isCompleteLocked() {
 		metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("not_complete").Inc()
-		return false
+		return finalizeClaimIncomplete, nil
 	}
 	cu.Finalizing = true
 	cu.finalizationStarted = true
+	cu.finalizeDone = make(chan struct{})
 	metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("started").Inc()
-	return true
+	return finalizeClaimWinner, cu.finalizeDone
+}
+
+// TryStartFinalization reports whether this caller won the right to finalize.
+// Retained for callers/tests that only need winner detection.
+func (cu *ChunkUpload) TryStartFinalization() bool {
+	claim, _ := cu.ClaimFinalization()
+	return claim == finalizeClaimWinner
+}
+
+func (cu *ChunkUpload) publishFinalizeOutcomeLocked(outcome *finalizeOutcome) {
+	if cu.finalizeDone == nil {
+		// Ownership was reset/dropped; there is no current waiter set to notify.
+		return
+	}
+	select {
+	case <-cu.finalizeDone:
+		// Already published once — do not overwrite or double-close.
+		return
+	default:
+	}
+	cu.finalizeResult = outcome
+	close(cu.finalizeDone)
+	cu.updatedAt = time.Now()
+}
+
+// PublishFinalizeSuccess records the finalize result and wakes any waiters.
+func (cu *ChunkUpload) PublishFinalizeSuccess(fileID, actualFilename string, totalSize int64) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	cu.publishFinalizeOutcomeLocked(&finalizeOutcome{fileID: fileID, actualFilename: actualFilename, totalSize: totalSize})
+}
+
+// PublishFinalizeFailure records a finalize failure and wakes any waiters so
+// they surface a retryable error instead of a false success.
+func (cu *ChunkUpload) PublishFinalizeFailure(err error) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	cu.publishFinalizeOutcomeLocked(&finalizeOutcome{err: err})
+}
+
+// FinalizeOutcome returns the published finalize result, if any.
+func (cu *ChunkUpload) FinalizeOutcome() (*finalizeOutcome, bool) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	return cu.finalizeResult, cu.finalizeResult != nil
 }
 
 func (cu *ChunkUpload) ResetFinalization() {
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
 	cu.Finalizing = false
+	// Drop the done channel so the next claimant becomes a fresh winner. Any
+	// waiters already holding the previous (closed) channel keep their captured
+	// reference; finalizeResult is left intact for them to read.
+	cu.finalizeDone = nil
 	cu.updatedAt = time.Now()
 }
 
@@ -1438,22 +1523,71 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			return
 		}
 
-		if !upload.TryStartFinalization() {
+		writeFinalizeSuccess := func(id, name string, size int64) {
+			if retJSON {
+				c.JSON(http.StatusOK, []gin.H{{"name": name, "id": id, "size": strconv.FormatInt(size, 10)}})
+			} else {
+				c.String(http.StatusOK, id)
+			}
+		}
+
+		claim, finalizeDone := upload.ClaimFinalization()
+		if claim == finalizeClaimIncomplete {
 			log.Printf("[HandleUpload] Chunk received, waiting for more: %d/%d", end+1, total)
 			c.JSON(http.StatusOK, gin.H{"success": true})
 			return
 		}
 
-		// All chunks received — finalize by streaming from temp file
+		if claim == finalizeClaimWaiter {
+			// Another in-flight request owns finalization for this exact upload —
+			// typically a resumable retry of the final chunk after the original
+			// finalize response was lost on the wire. Block on the shared result
+			// and return it, so the client gets real file metadata instead of a
+			// bare ack it cannot turn into a dirent (which silently dropped big
+			// files from the listing even though the bytes were committed).
+			log.Printf("[HandleUpload] Finalization already in progress for %s; waiting for shared result", filename)
+			select {
+			case <-finalizeDone:
+			case <-c.Request.Context().Done():
+				return
+			}
+			outcome, ok := upload.FinalizeOutcome()
+			if !ok || outcome == nil {
+				c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
+				return
+			}
+			if outcome.err != nil {
+				writeSeafHTTPUploadError(c, outcome.err, "failed to finalize upload")
+				return
+			}
+			writeFinalizeSuccess(outcome.fileID, outcome.actualFilename, outcome.totalSize)
+			return
+		}
+
+		// claim == finalizeClaimWinner — this request owns finalization.
 		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming)")
 		upload.Touch()
+		// Safety net: never leave waiters blocked. If finalization panics before
+		// publishing, release them with a retryable error.
+		finalizePublished := false
+		defer func() {
+			if !finalizePublished {
+				upload.PublishFinalizeFailure(fmt.Errorf("upload finalization aborted"))
+			}
+		}()
 		fileID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeUploadStreaming(c, token, upload, parentDir, filename, storageKey, total, replaceFile)
 		if err != nil {
+			upload.PublishFinalizeFailure(err)
+			finalizePublished = true
 			h.handleChunkedFinalizeError(token, tokenStr, filename, upload, err)
 			log.Printf("[HandleUpload] Finalization failed: %v", err)
 			writeSeafHTTPUploadError(c, err, "failed to finalize upload")
 			return
 		}
+		// Publish the result before cleanup so any waiter holding this tracker
+		// wakes with the real file id even after the tracker leaves the map.
+		upload.PublishFinalizeSuccess(fileID, actualFilename, total)
+		finalizePublished = true
 		chunkManager.CleanupUpload(tokenStr, filename)
 
 		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, total, fileID[:16])
@@ -1474,11 +1608,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			}
 		}
 
-		if retJSON {
-			c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(total, 10)}})
-		} else {
-			c.String(http.StatusOK, fileID)
-		}
+		writeFinalizeSuccess(fileID, actualFilename, total)
 		return
 	}
 

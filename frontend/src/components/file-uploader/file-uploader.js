@@ -358,6 +358,19 @@ class FileUploader extends React.Component {
     this.restoreConcurrencyIfIdle();
   };
 
+  markUploadUnconfirmed = (resumableFile, message) => {
+    // The finalize response never reached us (e.g. it was lost on a retried
+    // request and the server returned a bare ack). We cannot confirm the file
+    // landed, so surface it as retryable instead of silently reporting success
+    // — a false "Uploaded" leaves big files missing from the listing.
+    // eslint-disable-next-line no-console
+    console.error('Upload finalize metadata missing for', resumableFile.fileName, 'message:', message);
+    const error = gettext('Upload could not be confirmed. Please retry.');
+    const { retryFileList, uploadFileList } = moveUploadToRetryState(this.state.uploadFileList, this.state.retryFileList, resumableFile, error);
+    this.setState({ retryFileList: retryFileList, uploadFileList: uploadFileList });
+    this.restoreConcurrencyIfIdle();
+  };
+
   onFileUploadSuccess = (resumableFile, message) => {
     let formData = resumableFile.formData;
     let currentTime = new Date().getTime() / 1000;
@@ -371,9 +384,7 @@ class FileUploader extends React.Component {
     // stall the whole upload queue, and freeze files on "Saving..." forever.
     let resolved = resolveUploadSuccessResult(resumableFile, message, formData.replace);
     if (!resolved) {
-      // eslint-disable-next-line no-console
-      console.error('Upload finalize metadata missing for', resumableFile.fileName, 'message:', message);
-      this.markUploadSaved(resumableFile, resumableFile.fileName);
+      this.markUploadUnconfirmed(resumableFile, message);
       return;
     }
 

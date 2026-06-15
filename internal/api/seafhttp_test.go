@@ -2326,6 +2326,112 @@ func TestChunkUploadWriteDuringFinalizationIsIdempotentOnly(t *testing.T) {
 	}
 }
 
+// A second complete chunk request that arrives while finalization is already in
+// flight (e.g. a resumable retry of the final chunk after the original finalize
+// response was lost) must become a waiter and receive the same result the winner
+// publishes — not a bare {"success":true} ack the client cannot turn into a
+// dirent. This is the server-side root cause of big files reporting "Uploaded"
+// while never appearing in the listing.
+func TestChunkUploadClaimFinalizationWaiterReceivesWinnerResult(t *testing.T) {
+	cm := NewChunkManager()
+	upload, err := cm.GetOrCreateUpload("token-waiter", "big.zip", "/", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token-waiter", "big.zip")
+	}()
+
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk first chunk failed: %v", err)
+	}
+	if err := upload.WriteChunk([]byte("world"), 5, 9); err != nil {
+		t.Fatalf("WriteChunk second chunk failed: %v", err)
+	}
+
+	claim, _ := upload.ClaimFinalization()
+	if claim != finalizeClaimWinner {
+		t.Fatalf("first claim = %v, want winner", claim)
+	}
+
+	waiterClaim, waiterDone := upload.ClaimFinalization()
+	if waiterClaim != finalizeClaimWaiter {
+		t.Fatalf("second claim = %v, want waiter", waiterClaim)
+	}
+	if waiterDone == nil {
+		t.Fatal("waiter must receive a non-nil done channel")
+	}
+
+	select {
+	case <-waiterDone:
+		t.Fatal("waiter woke before the winner published a result")
+	default:
+	}
+
+	upload.PublishFinalizeSuccess("file-id-123", "big.zip", 10)
+
+	select {
+	case <-waiterDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter was not released after the winner published")
+	}
+
+	outcome, ok := upload.FinalizeOutcome()
+	if !ok || outcome == nil {
+		t.Fatal("waiter could not read the published finalize outcome")
+	}
+	if outcome.err != nil {
+		t.Fatalf("outcome.err = %v, want nil", outcome.err)
+	}
+	if outcome.fileID != "file-id-123" || outcome.actualFilename != "big.zip" || outcome.totalSize != 10 {
+		t.Fatalf("outcome = %+v, want fileID=file-id-123 name=big.zip size=10", outcome)
+	}
+}
+
+// A finalization failure must wake waiters with the error so they surface a
+// retryable response instead of a false success.
+func TestChunkUploadClaimFinalizationWaiterReceivesFailure(t *testing.T) {
+	cm := NewChunkManager()
+	upload, err := cm.GetOrCreateUpload("token-waiter-fail", "big.zip", "/", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token-waiter-fail", "big.zip")
+	}()
+
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk first chunk failed: %v", err)
+	}
+	if err := upload.WriteChunk([]byte("world"), 5, 9); err != nil {
+		t.Fatalf("WriteChunk second chunk failed: %v", err)
+	}
+
+	if claim, _ := upload.ClaimFinalization(); claim != finalizeClaimWinner {
+		t.Fatalf("first claim = %v, want winner", claim)
+	}
+	_, waiterDone := upload.ClaimFinalization()
+
+	finalizeErr := fmt.Errorf("block store unavailable")
+	upload.PublishFinalizeFailure(finalizeErr)
+
+	select {
+	case <-waiterDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter was not released after the winner published a failure")
+	}
+
+	outcome, ok := upload.FinalizeOutcome()
+	if !ok || outcome == nil || outcome.err == nil {
+		t.Fatalf("waiter outcome = %+v, want a non-nil error", outcome)
+	}
+	if !errors.Is(outcome.err, finalizeErr) {
+		t.Fatalf("outcome.err = %v, want %v", outcome.err, finalizeErr)
+	}
+}
+
 func TestChunkUploadAccountBlockOnceSurvivesFinalizeRetry(t *testing.T) {
 	cm := NewChunkManager()
 
