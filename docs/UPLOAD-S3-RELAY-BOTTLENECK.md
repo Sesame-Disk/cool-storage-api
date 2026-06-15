@@ -65,3 +65,18 @@ Treat upload performance and upload correctness as separate concerns:
 
 That separation is why the current main-based branch kept the canonical HEAD
 publication fixes and deferred broader performance work.
+
+## 2026-06 Update: Permit Bottleneck Identified And Fixed
+
+A 2026-06 audit (`docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`) identified that
+the finalization concurrency permit (`finalizeUploadBlockMetadataConcurrency = 1`)
+was acquired before `retrySeafHTTPBlockMaterialization`, serializing not just the
+Cassandra LWT but also the S3 Exists+PUT for every block across the entire process.
+The 8-worker pool had no effect.
+
+Fixed in branch `fix/upload-permit-unwrap-s3-put` (2026-06-15): permit now wraps
+only the Cassandra LWT; S3 operations run in parallel across all 8 workers.
+
+The remaining relay cost is the double S3 round-trip per block (Exists + PUT) in
+`internal/storage/blocks.go`. That is the next performance target (P-2 in the
+audit doc).

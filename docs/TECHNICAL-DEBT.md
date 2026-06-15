@@ -234,7 +234,7 @@ block look dead while retained metadata still points at it.
 
 ---
 
-## 25. SeafHTTP Finalize Operational Hardening (DEFERRED)
+## 25. SeafHTTP Finalize Operational Hardening
 
 ### Current State
 Correctness blockers for merge have been handled in the writer path:
@@ -245,9 +245,21 @@ Correctness blockers for merge have been handled in the writer path:
   discovery batch, avoiding Cassandra "Batch too large" failures during large
   finalization.
 
+### Resolved
+
+**P-1 — Metadata permit serialized the S3 PUT** ✅ Fixed (2026-06-15,
+branch `fix/upload-permit-unwrap-s3-put`)
+
+`finalizeUploadBlockMetadataConcurrency = 1` was acquired before
+`retrySeafHTTPBlockMaterialization`, accidentally serializing the S3 PUT
+alongside the Cassandra LWT. The permit now wraps only
+`registerUploadedBlockAndMappingForUploadFn` (the LWT); S3 Exists+PUT and the
+fence check run in parallel across all 8 workers. Regression test:
+`TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put`. See
+`docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`.
+
 ### Remaining Debt
-- `finalizeUploadStreaming()` still uses local concurrency permits in addition to
-  the distributed finalize lease; tune this under production load.
+
 - Pending-owner and publish-repair sweepers need explicit per-run limits and
   metrics for skipped, repaired, released, and failed rows.
 - The upload-finalize `gc_leases` role should include `orgID` for extra isolation.
@@ -257,6 +269,49 @@ Correctness blockers for merge have been handled in the writer path:
   `block_ids` update, `pub:<attempt>` refs can survive until TTL. This is a known
   leak window, not data loss; close it later with chunked block-id metadata or a
   repair source that can reconstruct staged IDs.
+
+**P-2 — Double S3 round-trip per block (Exists + PUT)** (pending)
+
+`PutBlockAuto` / `PutBlock` / `PutBlockData` in `internal/storage/blocks.go`
+all call `s3.Exists(ctx, key)` before `s3.PutAuto`. On real S3 (~50 ms RTT)
+this is ~100 ms per new block; 128 blocks total ~12.8 s aggregate RTT (~1.6 s
+wall-clock with 8 workers). Fix: remove the `Exists` check and use a direct PUT —
+S3 accepts re-PUT of the same key idempotently. Caveat: `AccountBlockOnce`
+(`seafhttp.go:1988–1995`) deduplicates by block *position* (index), not SHA-256;
+same-content blocks at different positions still produce separate PUTs, so the
+`Exists` check is the only cross-position dedup guard today. Alternative: check
+existence in Cassandra (`block_references`) instead of S3 (~1 ms vs 50 ms).
+
+**S-1 — Chunk state is node-local** (pending)
+
+Upload tokens in production are Cassandra-backed (`server.go:190–192`,
+`NewCassandraTokenAdapter`) and multi-node safe. The actual multi-node blocker
+is `chunkManager` (`seafhttp.go:375`): a process-global `map[string]*ChunkUpload`
+plus temp files under `os.TempDir()`. If a load balancer routes chunks from
+the same upload to different nodes, node B creates an empty tracker and
+finalization fails. Immediate mitigation: sticky sessions at the LB keyed on
+the upload token (already in Cassandra, no server changes needed). Permanent
+fix: distributed chunk state (Redis) or on-the-fly block materialization as
+chunks arrive, eliminating node-local staging.
+
+**S-2 — `server.max_upload_mb` not enforced on chunked uploads** (pending)
+
+Defined in `internal/config/config.go`; not referenced in `seafhttp.go` for
+the chunked path. Single-shot uploads have a hardcoded 1 GiB limit
+(`seafhttp.go:1480`). Without an org storage quota, a user can upload files of
+arbitrary size via chunked uploads. Fix: check `cfg.SeafHTTP.MaxUploadMB` in
+`GetOrCreateUpload` before `Truncate(totalSize)` and reject with 413.
+
+**S-3 — Full /tmp staging with no disk admission limit** (pending)
+
+Each chunked upload creates a file in `os.TempDir()` sized to the declared
+total via `Truncate(totalSize)` (`seafhttp.go:396`). On Linux with ext4/xfs
+this is a sparse file (no immediate physical allocation), but disk pressure
+grows as chunks arrive. No per-node, per-org, or per-token staging limit
+exists; the janitor cleans orphans after 2 h (`chunkDiskTTL`). Under concurrent
+large uploads without conservative storage quotas `/tmp` can be exhausted. Fix:
+configurable max staging bytes per node; reject `GetOrCreateUpload` if the
+limit would be exceeded.
 
 ---
 
