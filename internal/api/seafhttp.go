@@ -1058,6 +1058,10 @@ var chunkedUploadLibraryFinalizePermits sync.Map
 var putUploadedBlockAutoFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 	return blockStore.PutBlockAuto(ctx, hash, data)
 }
+var putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+	return blockStore.PutBlockAutoDirect(ctx, hash, data)
+}
+var probeUploadedBlockReuseForUploadFn = v2.ProbeUploadedBlockReuse
 var registerUploadedBlockAndMappingForUploadFn = v2.RegisterUploadedBlockAndMapping
 var resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID string, blockIDs []string) ([]string, error) {
 	return fsHelper.ResolveStoredBlockIDs(orgID, blockIDs)
@@ -1550,9 +1554,28 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 	} else {
 		storeUploadedBlock = func() error {
+			probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
+			if probeErr == nil {
+				switch probe.Decision {
+				case db.BlockReuseReusable:
+					log.Printf("[HandleUpload] Reused block %s (SHA-256: %s) from Cassandra metadata", fileID[:16], sha256ID[:16])
+					return nil
+				case db.BlockReuseNeedsPut:
+					_, putErr := putUploadedBlockAutoDirectForUploadFn(ctx, blockStore, sha256ID, storedContent)
+					if putErr == nil {
+						log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via direct PUT", fileID[:16], sha256ID[:16])
+					}
+					return putErr
+				case db.BlockReuseBlockedByGC:
+					return v2.ErrBlockDeleteInProgress
+				}
+			} else {
+				log.Printf("[HandleUpload] Block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v", sha256ID[:16], probeErr)
+			}
+
 			_, putErr := putUploadedBlockAutoFn(ctx, blockStore, sha256ID, storedContent)
 			if putErr == nil {
-				log.Printf("[HandleUpload] Stored block %s (SHA-256: %s)", fileID[:16], sha256ID[:16])
+				log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via legacy Exists+PUT fallback", fileID[:16], sha256ID[:16])
 			}
 			return putErr
 		}
@@ -1735,27 +1758,35 @@ func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error
 		attempts = 1
 	}
 
+	retryBlocked := func(attempt int) {
+		if resolveFence != nil {
+			resolved, resolveErr := resolveFence()
+			if resolveErr != nil {
+				log.Printf("[%s] failed to inspect S3 orphan fence for block %s: %v", label, blockID, resolveErr)
+			} else if resolved {
+				return
+			}
+		}
+		sleepFor := seafHTTPBlockMaterializationRetryBackoffFn(attempt)
+		log.Printf("[%s] block %s is fenced by GC delete during materialization; retrying (%d/%d) after %s", label, blockID, attempt, attempts, sleepFor)
+		if sleepFor > 0 {
+			seafHTTPBlockMaterializationSleepFn(sleepFor)
+		}
+	}
+
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := store(); err != nil {
-			return err
+			if !errors.Is(err, v2.ErrBlockDeleteInProgress) || attempt == attempts {
+				return err
+			}
+			retryBlocked(attempt)
+			continue
 		}
 		if err := materialize(); err != nil {
 			if !errors.Is(err, v2.ErrBlockDeleteInProgress) || attempt == attempts {
 				return err
 			}
-			if resolveFence != nil {
-				resolved, resolveErr := resolveFence()
-				if resolveErr != nil {
-					log.Printf("[%s] failed to inspect S3 orphan fence for block %s: %v", label, blockID, resolveErr)
-				} else if resolved {
-					continue
-				}
-			}
-			sleepFor := seafHTTPBlockMaterializationRetryBackoffFn(attempt)
-			log.Printf("[%s] block %s is fenced by GC delete during materialization; retrying (%d/%d) after %s", label, blockID, attempt, attempts, sleepFor)
-			if sleepFor > 0 {
-				seafHTTPBlockMaterializationSleepFn(sleepFor)
-			}
+			retryBlocked(attempt)
 			continue
 		}
 		return nil
@@ -2004,7 +2035,24 @@ readLoop:
 			uploadOperationID := upload.UploadOperationID()
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
 				return retrySeafHTTPBlockMaterialization("finalizeUploadStreaming", sha256ID, func() error {
-					// S3 Exists + PUT: runs in parallel across all 8 workers.
+					probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
+					if probeErr == nil {
+						switch probe.Decision {
+						case db.BlockReuseReusable:
+							return nil
+						case db.BlockReuseNeedsPut:
+							_, putErr := putUploadedBlockAutoDirectForUploadFn(egCtx, blockStore, sha256ID, storedBlock)
+							if putErr != nil {
+								return fmt.Errorf("failed to store block: %w", putErr)
+							}
+							return nil
+						case db.BlockReuseBlockedByGC:
+							return v2.ErrBlockDeleteInProgress
+						}
+					} else {
+						log.Printf("[finalizeUploadStreaming] Block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v", sha256ID[:16], probeErr)
+					}
+
 					_, putErr := putUploadedBlockAutoFn(egCtx, blockStore, sha256ID, storedBlock)
 					if putErr != nil {
 						return fmt.Errorf("failed to store block: %w", putErr)

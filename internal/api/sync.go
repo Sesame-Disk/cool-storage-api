@@ -268,6 +268,10 @@ var syncBlockExistsFn = func(ctx context.Context, blockStore *storage.BlockStore
 var syncPutBlockDataFn = func(ctx context.Context, blockStore *storage.BlockStore, block *storage.BlockData) (string, error) {
 	return blockStore.PutBlockData(ctx, block)
 }
+var syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+	return blockStore.PutBlockAutoDirect(ctx, hash, data)
+}
+var syncProbeUploadedBlockReuseFn = v2.ProbeUploadedBlockReuse
 var registerUploadedBlockAndMappingForSyncFn = v2.RegisterUploadedBlockAndMapping
 
 // formatRelativeTimeHTML delegates to httputil.FormatRelativeTimeHTML.
@@ -942,35 +946,14 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	log.Printf("PutBlock: storing block external=%s internal=%s in storage class %s\n",
 		externalID, internalID, storageClass)
 
-	exists, err := syncBlockExistsFn(c.Request.Context(), blockStore, internalID)
-	if err != nil {
-		log.Printf("PutBlock: failed to check block existence: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
-		return
-	}
-	if !exists {
-		if checker := getAPIQuotaChecker(); checker != nil {
-			if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
-				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-				return
-			}
-		}
-	}
-
 	// Store block using internal SHA-256 ID
 	blockData := &storage.BlockData{
 		Data: data,
 		Hash: internalID, // Always use SHA-256 for storage
 	}
-
-	if !exists {
-		_, err = syncPutBlockDataFn(c.Request.Context(), blockStore, blockData)
-		if err != nil {
-			log.Printf("PutBlock: failed to store in backend: %v\n", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
-			return
-		}
-	}
+	errSyncStorageQuotaExceeded := errors.New("sync storage quota exceeded")
+	errSyncBlockExistenceCheck := errors.New("sync block existence check failed")
+	errSyncStoreBackend := errors.New("sync store backend failed")
 
 	// Store block metadata and mapping (if DB available)
 	if h.db != nil {
@@ -982,7 +965,49 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		if isLegacySHA1 {
 			externalMappingID = externalID
 		}
-		if err := registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), storageClass, "", externalMappingID); err != nil {
+		if err := v2.RetryUploadedBlockMaterialization("PutBlock", internalID, func() error {
+			probe, probeErr := syncProbeUploadedBlockReuseFn(h.db, orgID, internalID)
+			if probeErr == nil {
+				switch probe.Decision {
+				case db.BlockReuseReusable:
+					return nil
+				case db.BlockReuseNeedsPut:
+					if checker := getAPIQuotaChecker(); checker != nil {
+						if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
+							c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+							return errSyncStorageQuotaExceeded
+						}
+					}
+					if _, putErr := syncPutBlockAutoDirectFn(c.Request.Context(), blockStore, internalID, data); putErr != nil {
+						return fmt.Errorf("%w: %v", errSyncStoreBackend, putErr)
+					}
+					return nil
+				case db.BlockReuseBlockedByGC:
+					return v2.ErrBlockDeleteInProgress
+				}
+			} else {
+				log.Printf("PutBlock: block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v\n", internalID, probeErr)
+			}
+
+			exists, existsErr := syncBlockExistsFn(c.Request.Context(), blockStore, internalID)
+			if existsErr != nil {
+				return fmt.Errorf("%w: %v", errSyncBlockExistenceCheck, existsErr)
+			}
+			if !exists {
+				if checker := getAPIQuotaChecker(); checker != nil {
+					if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
+						c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+						return errSyncStorageQuotaExceeded
+					}
+				}
+				if _, putErr := syncPutBlockDataFn(c.Request.Context(), blockStore, blockData); putErr != nil {
+					return fmt.Errorf("%w: %v", errSyncStoreBackend, putErr)
+				}
+			}
+			return nil
+		}, func() error {
+			return registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), storageClass, "", externalMappingID)
+		}, nil, nil); err != nil {
 			if errors.Is(err, v2.ErrBlockMappingWriteFailed) {
 				log.Printf("PutBlock: failed to store block mapping org=%s ext=%s int=%s: %v", orgID, externalID, internalID, err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
@@ -991,6 +1016,12 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			log.Printf("PutBlock: failed to store block metadata org=%s block=%s: %v", orgID, internalID, err)
 			if errors.Is(err, v2.ErrBlockDeleteInProgress) {
 				c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
+			} else if errors.Is(err, errSyncStorageQuotaExceeded) {
+				return
+			} else if errors.Is(err, errSyncBlockExistenceCheck) {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
+			} else if errors.Is(err, errSyncStoreBackend) {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
 			} else {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
 			}
@@ -1000,6 +1031,27 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		// If legacy SHA-1 client, store mapping external→internal (dual-write: forward + reverse)
 		if isLegacySHA1 {
 			log.Printf("PutBlock: stored mapping %s → %s\n", externalID, internalID)
+		}
+	} else {
+		exists, err := syncBlockExistsFn(c.Request.Context(), blockStore, internalID)
+		if err != nil {
+			log.Printf("PutBlock: failed to check block existence: %v\n", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
+			return
+		}
+		if !exists {
+			if checker := getAPIQuotaChecker(); checker != nil {
+				if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
+					c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+					return
+				}
+			}
+			_, err = syncPutBlockDataFn(c.Request.Context(), blockStore, blockData)
+			if err != nil {
+				log.Printf("PutBlock: failed to store in backend: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
+				return
+			}
 		}
 	}
 

@@ -575,6 +575,48 @@ func TestRetrySeafHTTPBlockMaterialization_ClearsFenceWithoutSleeping(t *testing
 	}
 }
 
+func TestRetrySeafHTTPBlockMaterialization_RetriesStoreFence(t *testing.T) {
+	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
+	oldSleep := seafHTTPBlockMaterializationSleepFn
+	t.Cleanup(func() {
+		seafHTTPBlockMaterializationRetryBackoffFn = oldBackoff
+		seafHTTPBlockMaterializationSleepFn = oldSleep
+	})
+
+	seafHTTPBlockMaterializationRetryBackoffFn = func(attempt int) time.Duration {
+		return time.Duration(attempt) * time.Millisecond
+	}
+	var slept []time.Duration
+	seafHTTPBlockMaterializationSleepFn = func(delay time.Duration) {
+		slept = append(slept, delay)
+	}
+
+	storeCalls := 0
+	materializeCalls := 0
+	err := retrySeafHTTPBlockMaterialization("HandleUpload", "block-1", func() error {
+		storeCalls++
+		if storeCalls == 1 {
+			return v2.ErrBlockDeleteInProgress
+		}
+		return nil
+	}, func() error {
+		materializeCalls++
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("retrySeafHTTPBlockMaterialization() error = %v, want nil", err)
+	}
+	if storeCalls != 2 {
+		t.Fatalf("storeCalls = %d, want 2", storeCalls)
+	}
+	if materializeCalls != 1 {
+		t.Fatalf("materializeCalls = %d, want 1", materializeCalls)
+	}
+	if !reflect.DeepEqual(slept, []time.Duration{time.Millisecond}) {
+		t.Fatalf("slept = %#v, want [1ms]", slept)
+	}
+}
+
 func TestRetrySeafHTTPBlockMaterialization_StopsOnNonRetryableError(t *testing.T) {
 	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
 	oldSleep := seafHTTPBlockMaterializationSleepFn

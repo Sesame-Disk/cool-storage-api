@@ -1208,22 +1208,43 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return fmt.Errorf("failed to persist pending OnlyOffice block cleanup: %w", err)
 	}
 
-	storageKey, err := blockStore.PutBlockData(ctx, &storage.BlockData{
-		Hash: internalBlockID,
-		Data: content,
-		Size: int64(len(content)),
-	})
-	if err != nil {
-		if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
-			log.Printf("OnlyOffice: failed to clear pending block cleanup %s after PUT failure: %v", rollbackID, deleteErr)
+	var storageKey string
+	if err := RetryUploadedBlockMaterialization("OnlyOffice", internalBlockID, func() error {
+		probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, internalBlockID)
+		if probeErr == nil {
+			switch probe.Decision {
+			case db.BlockReuseReusable:
+				storageKey = probe.StorageKey
+				return nil
+			case db.BlockReuseNeedsPut:
+				var putErr error
+				storageKey, putErr = putUploadedBlockAutoDirectFn(ctx, blockStore, internalBlockID, content)
+				if putErr != nil {
+					return fmt.Errorf("failed to store block: %w", putErr)
+				}
+				return nil
+			case db.BlockReuseBlockedByGC:
+				return ErrBlockDeleteInProgress
+			}
+		} else {
+			log.Printf("OnlyOffice: block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v", internalBlockID[:16], probeErr)
 		}
-		return fmt.Errorf("failed to store block: %w", err)
-	}
-
-	// Materialize block metadata/provisional ref first and then the sync mapping.
-	// Keep the pending-cleanup row on mapping failure so the reconciler can finish
-	// cleanup even if the immediate rollback path was only partially successful.
-	if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, internalBlockID, rollbackID, len(content), storageClass, storageKey, externalBlockID); err != nil {
+		blockKey, putErr := blockStore.PutBlockData(ctx, &storage.BlockData{
+			Hash: internalBlockID,
+			Data: content,
+			Size: int64(len(content)),
+		})
+		if putErr != nil {
+			return fmt.Errorf("failed to store block: %w", putErr)
+		}
+		storageKey = blockKey
+		return nil
+	}, func() error {
+		// Materialize block metadata/provisional ref first and then the sync mapping.
+		// Keep the pending-cleanup row on mapping failure so the reconciler can finish
+		// cleanup even if the immediate rollback path was only partially successful.
+		return RegisterUploadedBlockAndMapping(h.db, orgID, repoID, internalBlockID, rollbackID, len(content), storageClass, storageKey, externalBlockID)
+	}, nil, nil); err != nil {
 		if errors.Is(err, ErrBlockMappingWriteFailed) {
 			log.Printf("OnlyOffice: CRITICAL - failed to create block mapping org=%s ext=%s int=%s: %v", orgID, externalBlockID[:16], internalBlockID[:16], err)
 			return fmt.Errorf("failed to create block mapping: %w", err)

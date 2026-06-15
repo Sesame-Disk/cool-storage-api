@@ -232,3 +232,100 @@ func TestStagePublishAttemptReferences_JoinsRollbackFailure(t *testing.T) {
 		t.Fatalf("error = %v, want rollback error %v", err, wantRollbackErr)
 	}
 }
+
+func TestProbeBlockReuseReusable(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldRefs := probeBlockReuseHasReferencesFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasReferencesFn = oldRefs
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+
+	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{SizeBytes: 123, StorageClass: "hot-s3", StorageKey: "", GCState: ""}, true, nil
+	}
+	probeBlockReuseHasReferencesFn = func(database *DB, orgID, blockID string) (bool, error) {
+		return true, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(database *DB, orgID, blockID string) (bool, error) {
+		return false, nil
+	}
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
+	}
+	if probe.Decision != BlockReuseReusable {
+		t.Fatalf("decision = %v, want BlockReuseReusable", probe.Decision)
+	}
+	if probe.StorageClass != "hot-s3" {
+		t.Fatalf("storage class = %q, want hot-s3", probe.StorageClass)
+	}
+}
+
+func TestProbeBlockReuseNeedsPutWithoutMetadata(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+
+	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{}, false, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(database *DB, orgID, blockID string) (bool, error) {
+		return false, nil
+	}
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
+	}
+	if probe.Decision != BlockReuseNeedsPut {
+		t.Fatalf("decision = %v, want BlockReuseNeedsPut", probe.Decision)
+	}
+}
+
+func TestProbeBlockReuseBlockedByGC(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+
+	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{}, false, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(database *DB, orgID, blockID string) (bool, error) {
+		return true, nil
+	}
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
+	}
+	if probe.Decision != BlockReuseBlockedByGC {
+		t.Fatalf("decision = %v, want BlockReuseBlockedByGC", probe.Decision)
+	}
+}
+
+func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageClass(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	t.Cleanup(func() { probeBlockReuseMetadataFn = oldMetadata })
+
+	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{SizeBytes: 123, StorageClass: "   ", StorageKey: "", GCState: ""}, true, nil
+	}
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err == nil {
+		t.Fatal("ProbeBlockReuse() error = nil, want error")
+	}
+	if probe.Decision != BlockReuseUnknownError {
+		t.Fatalf("decision = %v, want BlockReuseUnknownError", probe.Decision)
+	}
+}
