@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2360,9 +2362,149 @@ func TestAcquireFinalizeUploadBlockMetadataPermitSerializesCallers(t *testing.T)
 	releaseSecond()
 }
 
-// TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put guards against
-// accidentally re-wrapping the S3 PUT inside the metadata permit. The permit
-// must only guard the Cassandra LWT (materialize callback), not the store callback.
+func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 5)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token1", "test.bin")
+	}()
+
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk failed: %v", err)
+	}
+
+	releaseHeld, err := acquireFinalizeUploadBlockMetadataPermit(context.Background())
+	if err != nil {
+		t.Fatalf("failed to pre-acquire metadata permit: %v", err)
+	}
+	releasedHeld := false
+	defer func() {
+		if !releasedHeld {
+			releaseHeld()
+		}
+	}()
+
+	originalPut := putUploadedBlockAutoFn
+	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
+	originalEncrypted := lookupLibraryEncryptedForUploadFn
+	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
+	t.Cleanup(func() {
+		putUploadedBlockAutoFn = originalPut
+		registerUploadedBlockAndMappingForUploadFn = originalRegister
+		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
+		lookupLibraryEncryptedForUploadFn = originalEncrypted
+		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
+	})
+
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+		return false, nil
+	}
+
+	putStarted := make(chan struct{})
+	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
+		close(putStarted)
+		return hash, nil
+	}
+
+	registerCalled := make(chan struct{}, 1)
+	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+		registerCalled <- struct{}{}
+		return nil
+	}
+
+	expectedSHA1 := sha1.Sum([]byte("hello"))
+	expectedBlockID := hex.EncodeToString(expectedSHA1[:])
+	commitSeafHTTPUploadedFileMultiBlockFn = func(h *SeafHTTPHandler, ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+		if orgID != "org1" || repoID != "repo1" || userID != "user1" {
+			return "", "", 0, 0, fmt.Errorf("unexpected commit identity %s/%s/%s", orgID, repoID, userID)
+		}
+		if parentDir != "/" || filename != "test.bin" || replace {
+			return "", "", 0, 0, fmt.Errorf("unexpected commit target dir=%s filename=%s replace=%v", parentDir, filename, replace)
+		}
+		if fileID != expectedBlockID {
+			return "", "", 0, 0, fmt.Errorf("commit fileID = %s, want %s", fileID, expectedBlockID)
+		}
+		if !reflect.DeepEqual(blockIDs, []string{expectedBlockID}) {
+			return "", "", 0, 0, fmt.Errorf("commit blockIDs = %v, want [%s]", blockIDs, expectedBlockID)
+		}
+		if fileSize != 5 {
+			return "", "", 0, 0, fmt.Errorf("commit fileSize = %d, want 5", fileSize)
+		}
+		return "commit-1", filename, 0, 0, nil
+	}
+
+	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, nil, nil, nil)
+	token := &AccessToken{OrgID: "org1", RepoID: "repo1", UserID: "user1", Token: "token1"}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/token1", nil)
+
+	type finalizeResult struct {
+		fileID         string
+		actualFilename string
+		err            error
+	}
+	done := make(chan finalizeResult, 1)
+	go func() {
+		fileID, actualFilename, _, _, err := handler.finalizeUploadStreaming(c, token, upload, "/", "test.bin", "", 5, false)
+		done <- finalizeResult{fileID: fileID, actualFilename: actualFilename, err: err}
+	}()
+
+	select {
+	case <-putStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("S3 PUT did not start while metadata permit was pre-held")
+	}
+
+	select {
+	case <-registerCalled:
+		t.Fatal("metadata registration started before the permit was released")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	select {
+	case res := <-done:
+		t.Fatalf("finalizeUploadStreaming returned before metadata permit release: %+v", res)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	releaseHeld()
+	releasedHeld = true
+
+	select {
+	case <-registerCalled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("metadata registration did not run after the permit was released")
+	}
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("finalizeUploadStreaming returned unexpected error: %v", res.err)
+		}
+		if res.fileID != expectedBlockID {
+			t.Fatalf("finalizeUploadStreaming fileID = %s, want %s", res.fileID, expectedBlockID)
+		}
+		if res.actualFilename != "test.bin" {
+			t.Fatalf("finalizeUploadStreaming actualFilename = %s, want test.bin", res.actualFilename)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("finalizeUploadStreaming did not complete after the permit was released")
+	}
+}
+
+// TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put guards the lower-level
+// materialization helper against accidentally re-wrapping the S3 PUT inside the
+// metadata permit.
 func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
 	// Hold the single metadata permit up front — no defer, released explicitly below.
 	releaseHeld, err := acquireFinalizeUploadBlockMetadataPermit(context.Background())
@@ -2419,11 +2561,9 @@ func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
 	}
 }
 
-// TestFinalizeUploadS3PutPrecedesPermitRelease verifies the sequencing invariant:
-// the S3 PUT (store callback) is invoked before the metadata permit is released
-// (end of materialize callback). It uses an atomic counter to record call order
-// without relying on goroutine timing, and pre-holds the permit to confirm the
-// store callback does not require it.
+// TestFinalizeUploadS3PutPrecedesPermitRelease verifies the lower-level helper
+// sequencing invariant: the S3 PUT (store callback) is invoked before the
+// metadata permit is released (end of materialize callback).
 func TestFinalizeUploadS3PutPrecedesPermitRelease(t *testing.T) {
 	var seq atomic.Int64
 	var putSeq, permitReleaseSeq int64

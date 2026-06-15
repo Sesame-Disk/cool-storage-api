@@ -1038,10 +1038,12 @@ const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
 // typical S3 latency.
 const finalizeUploadConcurrency = 8
 
-// finalizeUploadBlockMetadataConcurrency caps concurrent blocks-table LWTs
-// across chunked upload finalizations in this process. Block PUTs run in
-// parallel (up to finalizeUploadConcurrency); the permit guards only the
-// Cassandra IncrementOrCreateBlock LWT to limit Paxos pressure.
+// finalizeUploadBlockMetadataConcurrency caps concurrent Cassandra
+// materialization callbacks across chunked upload finalizations in this
+// process. Block PUTs still run in parallel (up to
+// finalizeUploadConcurrency); the permit starts only after S3 Exists+PUT and
+// covers the provisional-ref + metadata/mapping path so Paxos-heavy writes do
+// not stampede Cassandra.
 const finalizeUploadBlockMetadataConcurrency = 1
 
 const (
@@ -1082,6 +1084,9 @@ var lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID s
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).Scan(&encrypted)
 	return encrypted, err
+}
+var commitSeafHTTPUploadedFileMultiBlockFn = func(h *SeafHTTPHandler, ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+	return h.commitUploadedFileMultiBlock(ctx, orgID, repoID, userID, parentDir, filename, fileID, blockIDs, fileSize, replace)
 }
 
 func newSeafHTTPUploadOperationID(token string) string {
@@ -1890,7 +1895,7 @@ func entrySize(entry map[string]interface{}) int64 {
 func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessToken, upload *ChunkUpload, parentDir, filename, storageKey string, totalSize int64, replace bool) (string, string, int64, int64, error) {
 	ctx := context.Background()
 
-	if _, _, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, totalSize, replace); err != nil {
+	if _, _, err := checkUploadStorageQuotaForCurrentHeadFn(h, token.OrgID, token.RepoID, token.UserID, parentDir, filename, totalSize, replace); err != nil {
 		return "", "", 0, 0, err
 	}
 
@@ -1901,11 +1906,11 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 	}
 
 	// Check encryption
-	var encrypted bool
+	encrypted, err := lookupLibraryEncryptedForUploadFn(h, token.OrgID, token.RepoID)
+	if err != nil {
+		encrypted = false
+	}
 	var fileKey, fileIV []byte
-	h.db.Session().Query(`
-		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, token.OrgID, token.RepoID).Scan(&encrypted)
 	if encrypted {
 		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
@@ -2004,7 +2009,9 @@ readLoop:
 					}
 					return nil
 				}, func() error {
-					// Cassandra LWT: serialized process-wide to limit Paxos pressure.
+					// Cassandra materialization: serialized process-wide after the
+					// S3 PUT so provisional refs + metadata/mapping writes do not
+					// stampede Cassandra.
 					releaseMetadataPermit, permitErr := acquireFinalizeUploadBlockMetadataPermit(egCtx)
 					if permitErr != nil {
 						return permitErr
@@ -2048,7 +2055,7 @@ readLoop:
 	}
 	defer releaseFinalizePermit()
 
-	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileMultiBlock(leaseCtx, token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
+	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := commitSeafHTTPUploadedFileMultiBlockFn(h, leaseCtx, token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update filesystem metadata: %w", err)
 	}
