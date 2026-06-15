@@ -2359,6 +2359,65 @@ func TestAcquireFinalizeUploadBlockMetadataPermitSerializesCallers(t *testing.T)
 	releaseSecond()
 }
 
+// TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put guards against
+// accidentally re-wrapping the S3 PUT inside the metadata permit. The permit
+// must only guard the Cassandra LWT (materialize callback), not the store callback.
+func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
+	// Hold the single metadata permit up front — no defer, released explicitly below.
+	releaseHeld, err := acquireFinalizeUploadBlockMetadataPermit(context.Background())
+	if err != nil {
+		t.Fatalf("failed to pre-acquire metadata permit: %v", err)
+	}
+
+	originalPut := putUploadedBlockAutoFn
+	putStarted := make(chan struct{})
+	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, _ string, _ []byte) (string, error) {
+		close(putStarted)
+		return "key", nil
+	}
+	t.Cleanup(func() { putUploadedBlockAutoFn = originalPut })
+
+	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+		return nil
+	}
+	t.Cleanup(func() { registerUploadedBlockAndMappingForUploadFn = originalRegister })
+
+	done := make(chan error, 1)
+	go func() {
+		done <- retrySeafHTTPBlockMaterialization("test", "sha256-block",
+			func() error {
+				_, putErr := putUploadedBlockAutoFn(context.Background(), nil, "sha256-block", []byte("data"))
+				return putErr
+			},
+			func() error {
+				rel, permitErr := acquireFinalizeUploadBlockMetadataPermit(context.Background())
+				if permitErr != nil {
+					return permitErr
+				}
+				defer rel()
+				return registerUploadedBlockAndMappingForUploadFn(nil, "", "", "", "", 0, "", "", "")
+			},
+			nil,
+		)
+	}()
+
+	// S3 PUT must complete while the permit is held externally.
+	select {
+	case <-putStarted:
+	case <-time.After(500 * time.Millisecond):
+		releaseHeld() // release before Fatal so other tests can acquire the permit
+		t.Fatal("S3 PUT blocked while metadata permit was held; permit must only guard Cassandra write")
+	}
+
+	// Release the pre-held permit so the goroutine's LWT can proceed.
+	// Single explicit release — no defer to avoid double-release deadlock.
+	releaseHeld()
+	if err := <-done; err != nil {
+		t.Fatalf("retrySeafHTTPBlockMaterialization returned unexpected error: %v", err)
+	}
+}
+
 func TestChunkUploadQuotaPrecheckCacheMatchesMetadata(t *testing.T) {
 	cm, _ := newTestChunkManager(t)
 

@@ -1039,9 +1039,9 @@ const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
 const finalizeUploadConcurrency = 8
 
 // finalizeUploadBlockMetadataConcurrency caps concurrent blocks-table LWTs
-// across chunked upload finalizations in this process. Keep block PUTs
-// parallel, but serialize IncrementOrCreateBlock so a burst of large-file
-// finalizations does not fan out Paxos pressure on the blocks table.
+// across chunked upload finalizations in this process. Block PUTs run in
+// parallel (up to finalizeUploadConcurrency); the permit guards only the
+// Cassandra IncrementOrCreateBlock LWT to limit Paxos pressure.
 const finalizeUploadBlockMetadataConcurrency = 1
 
 const (
@@ -1994,21 +1994,22 @@ readLoop:
 				return nil
 			}
 
-			releaseMetadataPermit, permitErr := acquireFinalizeUploadBlockMetadataPermit(egCtx)
-			if permitErr != nil {
-				return permitErr
-			}
-			defer releaseMetadataPermit()
-
 			uploadOperationID := upload.UploadOperationID()
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
 				return retrySeafHTTPBlockMaterialization("finalizeUploadStreaming", sha256ID, func() error {
+					// S3 Exists + PUT: runs in parallel across all 8 workers.
 					_, putErr := putUploadedBlockAutoFn(egCtx, blockStore, sha256ID, storedBlock)
 					if putErr != nil {
 						return fmt.Errorf("failed to store block: %w", putErr)
 					}
 					return nil
 				}, func() error {
+					// Cassandra LWT: serialized process-wide to limit Paxos pressure.
+					releaseMetadataPermit, permitErr := acquireFinalizeUploadBlockMetadataPermit(egCtx)
+					if permitErr != nil {
+						return permitErr
+					}
+					defer releaseMetadataPermit()
 					return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedBlock), actualStorageClass, "", blockSHA1IDLocal)
 				}, func() (bool, error) {
 					return clearSeafHTTPS3OrphanFenceFn(egCtx, h.db, h.storageManager, "finalizeUploadStreaming", token.OrgID, sha256ID)
