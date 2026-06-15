@@ -47,6 +47,9 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Block Refcount Idempotence After Ambiguous CAS** | 🟡 Accepted hotfix debt | Upload/sync block registration now fails closed when Cassandra cannot attribute an LWT outcome, but client retries can still inflate `blocks.ref_count` because block registration has no durable idempotency key yet. See ISSUE-BLOCK-REFCOUNT-IDEMPOTENCE-01 below. |
 | **`blocks` Hot Partition by `org_id`** | ✅ Fixed (2026-05-26) | `blocks`, `gc_block_candidates`, `gc_s3_orphans`, and the block-id mapping tables now use per-block partitioning so no single org concentrates LWT traffic into one Cassandra partition. The GC scan and S3 orphan recovery paths walk per-day discovery projections instead of partition-scanning by org. See ISSUE-BLOCKS-HOT-PARTITION-01 below. |
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
+| **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
+| **Double S3 RTT Per Block (Exists + PUT)** | 🟡 Pending | `PutBlockAuto`/`PutBlock`/`PutBlockData` in `internal/storage/blocks.go` issue an S3 HEAD before every PUT. On real S3 this doubles per-block latency (~100 ms per block). See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below. |
+| **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -699,6 +702,101 @@ Only for **SHA-1 blocks** (Seafile desktop client uploads, which need mapping re
 #### Resolution
 
 Deferred to the `ref_count` counter→per-block-row redesign. That change replaces the LWT-counter model entirely, at which point resolution and decrement semantics are reworked end-to-end rather than patched here.
+
+---
+
+### ISSUE-UPLOAD-S3-PERMIT-01: Upload Finalization Permit Serialized S3 PUT
+
+**Status**: ✅ Fixed (2026-06-15, branch `fix/upload-permit-unwrap-s3-put`)
+**Severity**: Critical — process-wide serialization of all block PUTs to S3
+**Affected**: `finalizeUploadStreaming` in `internal/api/seafhttp.go`
+
+#### Problem
+
+`finalizeUploadBlockMetadataConcurrency = 1` creates a single-slot semaphore.
+The permit was acquired before `retrySeafHTTPBlockMaterialization`, which enclosed
+inside the critical section: S3 Exists, S3 PUT, Cassandra LWT, and Cassandra fence
+check. The 8-worker pool (`finalizeUploadConcurrency`) had no effect — all workers
+blocked on the single slot. Every block in every upload for the entire process was
+serialized.
+
+#### Fix
+
+Permit moved inside the `materialize` callback so it guards only the Cassandra
+LWT (`registerUploadedBlockAndMappingForUploadFn`). S3 Exists+PUT and the fence
+check now run in parallel across all 8 workers.
+
+#### Regression Test
+
+`TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put` verifies that the S3 PUT
+callback completes while the metadata permit is externally held.
+
+#### Related
+
+- `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md` — full audit
+- `docs/TECHNICAL-DEBT.md` §25 — updated
+
+---
+
+### ISSUE-UPLOAD-S3-DOUBLE-RTT-01: Double S3 Round-Trip Per Block
+
+**Status**: 🟡 Pending
+**Severity**: Medium — doubles per-block S3 latency (~100 ms per block on real S3)
+**Affected**: `PutBlockAuto`, `PutBlock`, `PutBlockData` in `internal/storage/blocks.go`
+
+#### Problem
+
+All three functions call `bs.s3.Exists(ctx, key)` before `bs.s3.PutAuto(...)`.
+For new blocks this costs 2 S3 round-trips. On real S3 (~50 ms RTT each) a 1 GB
+file (128 × 8 MB blocks) accumulates ~12 s of pure latency even with 8 parallel
+workers. While P-1 was active, both RTTs were also serialized process-wide.
+
+#### Proposed Fix
+
+Remove the `Exists` check from all three functions and issue a direct PUT. S3
+accepts idempotent re-PUT of the same content-addressed key. Intra-upload
+deduplication via `upload.BlockAlreadyAccounted()` (`seafhttp.go:1988–1995`)
+already prevents redundant PUTs within a single upload session.
+
+Alternative: verify block existence via Cassandra (`block_references`) before
+touching S3 — ~1 ms vs 50 ms.
+
+#### Related
+
+- `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md` — P-2
+- `docs/TECHNICAL-DEBT.md` §25
+
+---
+
+### ISSUE-UPLOAD-CHUNK-MULTINODE-01: Chunked Upload Chunk State Is Node-Local
+
+**Status**: 🟡 Pending — multi-node deployment blocker
+**Severity**: High for multi-node topologies; no impact on single-node
+**Affected**: `chunkManager` global in `internal/api/seafhttp.go`
+
+#### Problem
+
+`chunkManager` (seafhttp.go:375) is a process-global variable backed by
+`map[string]*ChunkUpload` plus temp files in `os.TempDir()`. Upload state
+is entirely node-local. If a load balancer routes chunks from the same upload
+to different nodes, node B creates an empty tracker and finalization fails.
+
+Note: upload *tokens* are Cassandra-backed and multi-node safe
+(`server.go:190–192`, `db.NewTokenStore` via `NewCassandraTokenAdapter`).
+The problem is chunk state only.
+
+#### Mitigations
+
+- **Immediate (zero server changes):** sticky sessions at the LB keyed on the
+  upload token. The token is already available in Cassandra; the LB can use it
+  as a consistent hash key.
+- **Permanent:** distribute chunk state (Redis / Cassandra) or materialize blocks
+  directly to S3 as chunks arrive, eliminating node-local staging entirely.
+
+#### Related
+
+- `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md` — S-1
+- `docs/TECHNICAL-DEBT.md` §25
 
 ---
 

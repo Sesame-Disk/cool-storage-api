@@ -1,153 +1,190 @@
 # Upload Performance & Security Audit — 2026-06
 
-Auditoría completa del path de upload chunked. Cada hallazgo incluye veredicto
-verificado contra código fuente, severidad, y rama de fix recomendada.
+Audit of the chunked upload path. Each finding includes a verdict verified
+against source code, severity, and the recommended fix branch.
 
-## P-1 — Permit serializa el S3 PUT (RESUELTO en esta rama)
+## P-1 — Metadata permit serialized the S3 PUT (RESOLVED — fix/upload-permit-unwrap-s3-put)
 
-**Severidad: CRÍTICA**  
-**Rama: fix/upload-permit-unwrap-s3-put**
+**Severity: CRITICAL**
 
-`finalizeUploadBlockMetadataConcurrency = 1` crea un semáforo de 1 slot
-(`seafhttp.go`). El código anterior adquiría ese permit _antes_ de
-`retrySeafHTTPBlockMaterialization`, lo que incluía dentro del semáforo:
+`finalizeUploadBlockMetadataConcurrency = 1` creates a single-slot semaphore
+(`seafhttp.go`). The previous code acquired that permit *before*
+`retrySeafHTTPBlockMaterialization`, which enclosed inside the critical section:
 
 1. `putUploadedBlockAutoFn` → S3 Exists + S3 PUT
 2. `registerUploadedBlockAndMappingForUploadFn` → Cassandra LWT
 3. `clearSeafHTTPS3OrphanFenceFn` → Cassandra fence check
 
-El comment del código describía la intención correcta ("Keep block PUTs parallel,
-but serialize IncrementOrCreateBlock"), pero la implementación la violaba. Los 8
-workers de `finalizeUploadConcurrency` quedaban sin efecto: todos bloqueaban en
-el único slot.
+The code comment correctly described the intent ("Keep block PUTs parallel, but
+serialize IncrementOrCreateBlock") but the implementation violated it. The 8
+workers of `finalizeUploadConcurrency` had no effect; all contended on the single
+slot.
 
-**Fix aplicado:** permit movido al interior del callback `materialize`
-(el LWT de Cassandra). S3 Exists + S3 PUT ahora corren en paralelo en los 8
-workers. Fence check no necesita el permit.
+**Fix applied:** permit moved inside the `materialize` callback (the Cassandra
+LWT). S3 Exists + S3 PUT now run in parallel across all 8 workers. The fence
+check does not need the permit.
 
-**Impacto esperado:** 5–8× throughput local (MinIO); mayor en S3 real por RTT.
+**Expected impact:** 5–8× throughput on local MinIO; more significant on real
+S3 due to per-block RTT.
+
+**Regression test added:** `TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put`
+verifies that the S3 PUT callback completes while the permit is externally held.
 
 ---
 
-## P-2 — 2 S3 round-trips por bloque (Exists/HEAD + PUT)
+## P-2 — Double S3 round-trip per block (Exists/HEAD + PUT)
 
-**Severidad: ALTA mientras P-1 esté activo; MEDIA después**  
-**Rama pendiente**
+**Severity: HIGH while P-1 is active; MEDIUM after**
+**Branch: pending**
 
-`PutBlockAuto` en `internal/storage/blocks.go:100–119` hace:
+`PutBlockAuto` in `internal/storage/blocks.go:100–119`:
 ```go
 exists, err := bs.s3.Exists(ctx, key)   // HEAD — round-trip 1
-// si no existe:
+// if not present:
 _, err = bs.s3.PutAuto(ctx, key, reader, size)  // PUT — round-trip 2
 ```
 
-Mismo patrón en `PutBlock` y `PutBlockData`. Con P-1 activo, ambos RTTs iban
-serializados. Con P-1 resuelto, corren en paralelo en los 8 workers, pero siguen
-siendo 2 RTTs por bloque nuevo.
+Same pattern in `PutBlock` (L75–96) and `PutBlockData` (L50–71). With P-1 active,
+both RTTs were serialized process-wide. With P-1 resolved, they run in parallel
+across 8 workers, but each block still costs 2 RTTs for new blocks (~50 ms per RTT
+on real S3 → ~100 ms per block → ~12 s for a 1 GB file at 128 blocks).
 
-**Fix propuesto:** eliminar el Exists/HEAD de `PutBlockAuto` y usar PUT directo.
-La dedup intra-upload vía `upload.BlockAlreadyAccounted()` ya evita PUTs
-redundantes dentro del mismo upload. S3 acepta re-PUT idempotente.
-Alternativa: verificar existencia en Cassandra (≪1 ms) en lugar de S3 HEAD
-(10–80 ms en prod).
+**Proposed fix:** remove the `Exists` check from `PutBlockAuto`/`PutBlock` and use a
+direct PUT. S3 accepts re-PUT of the same key idempotently. Intra-upload
+deduplication via `upload.BlockAlreadyAccounted()` (`seafhttp.go:1988–1995`)
+already prevents redundant PUTs within the same upload session.
 
----
-
-## S-1 — Multi-nodo: chunk state node-local
-
-**Severidad: ALTA para topología multi-nodo**  
-**Rama pendiente**
-
-**Tokens:** En producción (database != nil), `server.go:190-192` usa
-`NewCassandraTokenAdapter` — los tokens son Cassandra-backed y multi-nodo
-seguros. El `TokenManager` in-memory es solo el fallback sin DB.
-
-**Chunk state (problema real):** `chunkManager` global del proceso
-(`seafhttp.go:375`) usa `map[string]*ChunkUpload` + temp files en `os.TempDir()`
-— completamente node-local. Si el LB distribuye chunks del mismo upload entre
-nodos, el nodo B crea un tracker vacío y la finalización falla.
-
-**Fix inmediato:** sticky sessions en el LB usando el token como hash key
-(token ya en Cassandra, sin cambios de servidor).  
-**Fix definitivo:** chunk state distribuido (Redis) o materialización directa
-a S3 sin staging local.
+Alternative: check block existence in Cassandra (`block_references`) before hitting
+S3 — one Cassandra read (<1 ms) instead of an S3 HEAD (10–80 ms).
 
 ---
 
-## S-2 — `server.max_upload_mb` no aplicado a chunked uploads
+## P-3 — Benchmark: ~44–48 MB/s flat, no concurrency scaling
 
-**Severidad: MEDIA**  
-**Rama pendiente**
+**Severity: N/A (measurement, not a code defect)**
 
-Definido en `internal/config/config.go`. No referenciado en seafhttp.go para el
-path chunked. Solo aplica un límite hardcoded de 1 GiB para single-shot uploads.
-Sin quota configurada en el org, un usuario puede subir archivos de tamaño
-arbitrario.
-
-**Fix:** leer `cfg.SeafHTTP.MaxUploadMB` en `GetOrCreateUpload` antes de
-`Truncate(totalSize)` y rechazar con 413 si `totalSize > max`.
+Numbers are consistent with P-1 serialization plus two S3 RTTs per block.
+`scripts/upload-benchmark.mjs` does not exist in the repository; benchmarks are
+external.
 
 ---
 
-## S-3 — Staging completo en /tmp (disk exhaustion vector)
+## S-1 — Chunk state is node-local (multi-node blocker)
 
-**Severidad: MEDIA**  
-**Rama pendiente**
+**Severity: HIGH for multi-node topologies**
+**Branch: pending**
+
+**Upload tokens (clarification):** In production (`database != nil`),
+`server.go:190–192` uses `NewCassandraTokenAdapter` — tokens are Cassandra-backed
+and multi-node safe. The `TokenManager` in-memory fallback only activates without a
+database connection.
+
+**Chunk state (the actual problem):** `chunkManager` is a process-global variable
+(`seafhttp.go:375`) backed by `map[string]*ChunkUpload` and temp files under
+`os.TempDir()` — entirely node-local. If a load balancer routes chunks from the
+same upload to different nodes, node B creates an empty tracker and the upload
+fails at finalization.
+
+**Immediate mitigation:** sticky sessions at the LB keyed on the upload token
+(already available in Cassandra — no server-side changes required).
+
+**Permanent fix:** distribute chunk state (Redis or Cassandra) and/or stream
+blocks directly to S3 as chunks arrive, eliminating node-local staging.
+
+---
+
+## S-2 — `server.max_upload_mb` is not enforced on chunked uploads
+
+**Severity: MEDIUM**
+**Branch: pending**
+
+Defined in `internal/config/config.go`. Not referenced in `seafhttp.go` for
+chunked uploads. Single-shot uploads have a hardcoded 1 GiB limit (`seafhttp.go:1480`).
+Without a storage quota configured for an org, a user can upload files of arbitrary
+size over chunked paths.
+
+**Fix:** read `cfg.SeafHTTP.MaxUploadMB` in `GetOrCreateUpload` before
+`Truncate(totalSize)` and reject with 413 if `totalSize > max`.
+
+---
+
+## S-3 — Full /tmp staging before any byte reaches S3
+
+**Severity: MEDIUM**
+**Branch: pending**
 
 `os.TempDir()` (`seafhttp.go:346`) + `Truncate(totalSize)` (`seafhttp.go:396`).
-En Linux con ext4/xfs, `Truncate` crea un archivo sparse (sin alocación física
-inmediata), pero la presión de disco crece a medida que llegan chunks. No hay
-límite por nodo, por org, ni por token. Janitor limpia huérfanos a las 2h
-(`chunkDiskTTL`).
+On Linux with ext4/xfs, `Truncate` creates a sparse file (no physical block
+allocation until chunks are written), but disk pressure grows as chunks arrive.
+There is no per-node, per-org, or per-token staging limit. The janitor cleans
+orphans after 2 hours (`chunkDiskTTL`).
 
-Con uploads grandes concurrentes y sin quotas conservadoras, /tmp puede agotarse.
+Under concurrent large uploads without conservative storage quotas, `/tmp` can
+be exhausted.
 
-**Fix:** límite configurable de bytes en staging por nodo; rechazar
-`GetOrCreateUpload` si se superaría.
-
----
-
-## S-4 — TOCTOU en quota check bajo finalizaciones concurrentes al mismo org
-
-**Severidad: MEDIA**  
-**Rama pendiente**
-
-El permit de finalización (`acquireSeafHTTPUploadFinalizePermit`) es por repo,
-no por org. Dos uploads a repos distintos del mismo org corren en paralelo. Ambos
-pasan el quota check antes de que ninguno actualice los counters de storage. La
-ventana de carrera no es de milisegundos: con P-1 activo cada finalización tarda
-segundos; incluso después de resolverlo, la ventana cubre toda la materialización.
-
-**Fix:** reserva atómica de bytes al inicio del upload (pending reservation en
-Cassandra) confirmada/liberada al finalizar.
+**Fix:** a configurable maximum staging bytes per node; reject `GetOrCreateUpload`
+if the limit would be exceeded.
 
 ---
 
-## S-5 — Filename controlado por cliente; content-type ignorado
+## S-4 — TOCTOU quota check under concurrent same-org uploads
 
-**Severidad: BAJA**
+**Severity: MEDIUM**
+**Branch: pending** (see ISSUE-QUOTA-RESERVATION-01 in `docs/KNOWN_ISSUES.md`)
 
-`filename := header.Filename` (`seafhttp.go:1359`) — sin validación adicional
-más allá de `filepath.Join` (que neutraliza path traversal). Content-type del
-cliente se ignora; el servidor siempre retorna `application/octet-stream` en
-descargas.
+The finalization permit (`acquireSeafHTTPUploadFinalizePermit`) is per-repo, not
+per-org. Two uploads to different repos in the same org run concurrently. Both can
+pass the quota check before either has committed storage counters. The race window
+is not milliseconds — it spans the entire finalization (potentially seconds per
+upload, amplified by P-1 while active).
 
-No es un vector de explotación activo. El filename controlado por cliente es
-comportamiento esperado en protocolos file-sharing.
+With P-1 resolved the window shrinks but does not disappear, because concurrent
+same-org finalizations to different repos can still overlap.
+
+**Fix:** atomic byte reservation at upload start (pending reservation in Cassandra),
+confirmed or released at finalization. See ISSUE-QUOTA-RESERVATION-01 for the
+previous investigation and known caveats in that approach.
 
 ---
 
-## Tabla resumen
+## S-5 — Client-controlled filename; content-type ignored
 
-| ID  | Hallazgo                              | Veredicto       | Severidad | Estado         |
-|-----|---------------------------------------|-----------------|-----------|----------------|
-| P-1 | Permit serializa S3 PUT               | ✅ Confirmado   | CRÍTICA   | **RESUELTO**   |
-| P-2 | 2 S3 RTTs por bloque (Exists + PUT)   | ✅ Confirmado   | ALTA→MEDIA| Pendiente      |
-| S-1 | Chunk state node-local (multi-nodo)   | ✅ Confirmado   | ALTA      | Pendiente      |
-| S-2 | max_upload_mb no enforced (chunked)   | ✅ Confirmado   | MEDIA     | Pendiente      |
-| S-3 | Staging /tmp sin límite de disco      | ✅ Confirmado   | MEDIA     | Pendiente      |
-| S-4 | TOCTOU quota check cross-repo         | ✅ Confirmado   | MEDIA     | Pendiente      |
-| S-5 | Filename cliente, content-type ignore | ✅ Confirmado   | BAJA      | Pendiente      |
+**Severity: LOW**
 
-Nota: tokens de upload en producción son Cassandra-backed (multi-nodo seguros).
-El in-memory `TokenManager` es solo el fallback sin DB.
+`filename := header.Filename` (`seafhttp.go:1359`) — taken directly from the
+multipart form, no additional validation beyond `filepath.Join` (which neutralizes
+path traversal in the final DB path). `sanitizeFilename()` (`seafhttp.go:821–824`)
+only protects the temp file name. The server always returns `application/octet-stream`
+on download regardless of what the client sent.
+
+No active exploit vector. Client-controlled filename is expected behaviour in
+file-sharing protocols.
+
+---
+
+## Summary table
+
+| ID  | Finding                                        | Verdict        | Severity   | Status       |
+|-----|------------------------------------------------|----------------|------------|--------------|
+| P-1 | Permit serialized S3 PUT                       | ✅ Confirmed   | CRITICAL   | **RESOLVED** |
+| P-2 | Double S3 RTT per block (Exists + PUT)         | ✅ Confirmed   | HIGH→MEDIUM| Pending      |
+| P-3 | Benchmarks 44–48 MB/s, no scaling              | ❓ Plausible   | —          | External     |
+| S-1 | Chunk state node-local (multi-node blocker)    | ✅ Confirmed   | HIGH       | Pending      |
+| S-2 | max_upload_mb not enforced on chunked uploads  | ✅ Confirmed   | MEDIUM     | Pending      |
+| S-3 | Full /tmp staging, no disk admission limit     | ✅ Confirmed   | MEDIUM     | Pending      |
+| S-4 | TOCTOU quota check across concurrent uploads   | ✅ Confirmed   | MEDIUM     | Pending      |
+| S-5 | Client filename, content-type ignored          | ✅ Confirmed   | LOW        | Pending      |
+
+Note: upload tokens in production are Cassandra-backed and multi-node safe
+(`server.go:190–192`). The in-memory `TokenManager` fallback only activates
+without a database connection.
+
+## Recommended branch order
+
+| Order | ID | Change | Rationale |
+|---|---|---|---|
+| 1 | P-1 | Unwrap S3 PUT from metadata permit | Max impact, minimal change — **done** |
+| 2 | P-2 | Remove `Exists` check from `PutBlockAuto` | Eliminates half the S3 RTTs per block |
+| 3 | S-1 | Sticky sessions at LB (immediate) or distributed chunk state (complete) | Required for multi-node topology |
+| 4 | S-2/S-3 | Apply `max_upload_mb` + disk admission limit | Operational hardening |
+| 5 | S-4 | Atomic quota reservation at upload start | Closes the concurrent over-quota window |
