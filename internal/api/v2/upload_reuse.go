@@ -16,6 +16,13 @@ var probeUploadedBlockReuseFn = ProbeUploadedBlockReuse
 var putUploadedBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 	return blockStore.PutBlockAutoDirect(ctx, hash, data)
 }
+var resolveCanonicalBlockStoreFn = ResolveCanonicalBlockStore
+var reusableCanonicalObjectExistsFn = func(ctx context.Context, blockStore *storage.BlockStore, storageKey string) (bool, error) {
+	return blockStore.ObjectExists(ctx, storageKey)
+}
+var repairCanonicalBlockDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, storageKey string, data []byte) (string, error) {
+	return blockStore.PutObjectAutoDirect(ctx, storageKey, data)
+}
 
 // ProbeUploadedBlockReuse wraps the DB probe so callers can fail open to legacy
 // storage behavior when no Cassandra session is available.
@@ -24,6 +31,57 @@ func ProbeUploadedBlockReuse(database *db.DB, orgID, blockID string) (db.BlockRe
 		return db.BlockReuseProbe{Decision: db.BlockReuseUnknownError}, fmt.Errorf("block reuse probe unavailable for %s: database session is nil", blockID)
 	}
 	return database.ProbeBlockReuse(orgID, blockID)
+}
+
+// ResolveCanonicalBlockStore resolves the exact canonical backend for a block.
+// It does not apply health failover because the caller is verifying or repairing
+// the physical location that Cassandra has already declared canonical.
+func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, canonicalClass string) (*storage.BlockStore, error) {
+	canonicalClass = strings.TrimSpace(canonicalClass)
+	if canonicalClass == "" {
+		return nil, errors.New("canonical storage class is empty")
+	}
+	if storageManager != nil {
+		return storageManager.GetBlockStore(canonicalClass)
+	}
+	if fallbackStore != nil {
+		fallbackClass = strings.TrimSpace(fallbackClass)
+		if fallbackClass == "" || strings.EqualFold(fallbackClass, canonicalClass) {
+			return fallbackStore, nil
+		}
+	}
+	return nil, fmt.Errorf("canonical storage class %s is not available", canonicalClass)
+}
+
+// EnsureReusableBlockPresent verifies that the canonical physical copy exists for
+// a Cassandra-reusable block and repairs it in place when it is missing.
+func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass string) (string, error) {
+	if probe.Decision != db.BlockReuseReusable {
+		return "", fmt.Errorf("block %s is not reusable", blockID)
+	}
+
+	canonicalStore, err := resolveCanonicalBlockStoreFn(storageManager, fallbackStore, fallbackClass, probe.StorageClass)
+	if err != nil {
+		return "", fmt.Errorf("resolve canonical block store for %s: %w", blockID, err)
+	}
+
+	storageKey := strings.TrimSpace(probe.StorageKey)
+	if storageKey == "" {
+		storageKey = canonicalStore.StorageKeyForHash(blockID)
+	}
+
+	exists, err := reusableCanonicalObjectExistsFn(ctx, canonicalStore, storageKey)
+	if err != nil {
+		return storageKey, fmt.Errorf("verify canonical block %s in %s: %w", blockID, probe.StorageClass, err)
+	}
+	if exists {
+		return storageKey, nil
+	}
+
+	if _, err := repairCanonicalBlockDirectFn(ctx, canonicalStore, storageKey, data); err != nil {
+		return storageKey, fmt.Errorf("repair canonical block %s in %s: %w", blockID, probe.StorageClass, err)
+	}
+	return storageKey, nil
 }
 
 // RetryUploadedBlockMaterialization retries the full store->materialize cycle

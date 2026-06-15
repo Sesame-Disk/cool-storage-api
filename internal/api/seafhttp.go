@@ -1062,6 +1062,7 @@ var putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore
 	return blockStore.PutBlockAutoDirect(ctx, hash, data)
 }
 var probeUploadedBlockReuseForUploadFn = v2.ProbeUploadedBlockReuse
+var ensureReusableBlockPresentForUploadFn = v2.EnsureReusableBlockPresent
 var registerUploadedBlockAndMappingForUploadFn = v2.RegisterUploadedBlockAndMapping
 var resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID string, blockIDs []string) ([]string, error) {
 	return fsHelper.ResolveStoredBlockIDs(orgID, blockIDs)
@@ -1558,7 +1559,10 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			if probeErr == nil {
 				switch probe.Decision {
 				case db.BlockReuseReusable:
-					log.Printf("[HandleUpload] Reused block %s (SHA-256: %s) from Cassandra metadata", fileID[:16], sha256ID[:16])
+					if _, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass); ensureErr != nil {
+						return ensureErr
+					}
+					log.Printf("[HandleUpload] Reused canonical block %s (SHA-256: %s) after physical verification", fileID[:16], sha256ID[:16])
 					return nil
 				case db.BlockReuseNeedsPut:
 					_, putErr := putUploadedBlockAutoDirectForUploadFn(ctx, blockStore, sha256ID, storedContent)
@@ -2039,7 +2043,8 @@ readLoop:
 					if probeErr == nil {
 						switch probe.Decision {
 						case db.BlockReuseReusable:
-							return nil
+							_, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass)
+							return ensureErr
 						case db.BlockReuseNeedsPut:
 							_, putErr := putUploadedBlockAutoDirectForUploadFn(egCtx, blockStore, sha256ID, storedBlock)
 							if putErr != nil {

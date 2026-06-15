@@ -2590,9 +2590,10 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 
 // finalizeUploadStreamingReuseFixture wires the common mocks for the
 // Cassandra-first reuse tests below and returns call counters. The legacy
-// Exists+PUT path (putUploadedBlockAutoFn) is the only one that issues an S3
-// HEAD, so a zero count there proves no HEAD was performed.
-func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReuseProbe) (legacyPuts, directPuts, registerCalls *atomic.Int32, run func() (string, error)) {
+// Exists+PUT path (putUploadedBlockAutoFn) is the only one that issues the
+// old upload-backend HEAD, so a zero count there proves the reusable/needs-put
+// logic stayed off that legacy path.
+func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReuseProbe) (legacyPuts, directPuts, reusableChecks, registerCalls *atomic.Int32, run func() (string, error)) {
 	t.Helper()
 
 	cm, _ := newTestChunkManager(t)
@@ -2611,6 +2612,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	originalProbe := probeUploadedBlockReuseForUploadFn
 	originalLegacyPut := putUploadedBlockAutoFn
 	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
+	originalEnsureReusable := ensureReusableBlockPresentForUploadFn
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
 	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
@@ -2619,6 +2621,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		probeUploadedBlockReuseForUploadFn = originalProbe
 		putUploadedBlockAutoFn = originalLegacyPut
 		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
+		ensureReusableBlockPresentForUploadFn = originalEnsureReusable
 		registerUploadedBlockAndMappingForUploadFn = originalRegister
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
@@ -2637,6 +2640,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 
 	legacyPuts = &atomic.Int32{}
 	directPuts = &atomic.Int32{}
+	reusableChecks = &atomic.Int32{}
 	registerCalls = &atomic.Int32{}
 
 	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
@@ -2646,6 +2650,10 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
 		directPuts.Add(1)
 		return hash, nil
+	}
+	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string) (string, error) {
+		reusableChecks.Add(1)
+		return "", nil
 	}
 	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
 		registerCalls.Add(1)
@@ -2665,14 +2673,18 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		fileID, _, _, _, err := handler.finalizeUploadStreaming(c, token, upload, "/", "test.bin", "", 5, false)
 		return fileID, err
 	}
-	return legacyPuts, directPuts, registerCalls, run
+	return legacyPuts, directPuts, reusableChecks, registerCalls, run
 }
 
-// TestFinalizeUploadStreamingReusableSkipsHeadAndPut verifies that when the
-// Cassandra probe reports a block reusable, finalization performs neither an S3
-// HEAD nor an S3 PUT, yet still registers the block reference + mapping.
-func TestFinalizeUploadStreamingReusableSkipsHeadAndPut(t *testing.T) {
-	legacyPuts, directPuts, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
+// TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut verifies that
+// when the Cassandra probe reports a block reusable, finalization routes through
+// the canonical verify/repair step (EnsureReusableBlockPresent) exactly once and
+// never touches the legacy Exists+PUT path or the direct PUT, yet still registers
+// the block reference + mapping. The canonical verify itself (an S3 HEAD on the
+// declared canonical key, with repair-on-miss) is exercised by the unit tests in
+// internal/api/v2/upload_reuse_test.go.
+func TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut(t *testing.T) {
+	legacyPuts, directPuts, reusableChecks, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
 		db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot"})
 
 	expectedSHA1 := sha1.Sum([]byte("hello"))
@@ -2691,6 +2703,9 @@ func TestFinalizeUploadStreamingReusableSkipsHeadAndPut(t *testing.T) {
 	if got := directPuts.Load(); got != 0 {
 		t.Errorf("direct PUT calls = %d, want 0 for a reusable block", got)
 	}
+	if got := reusableChecks.Load(); got != 1 {
+		t.Errorf("reusable canonical checks = %d, want 1", got)
+	}
 	if got := registerCalls.Load(); got != 1 {
 		t.Errorf("register ref/mapping calls = %d, want 1", got)
 	}
@@ -2700,7 +2715,7 @@ func TestFinalizeUploadStreamingReusableSkipsHeadAndPut(t *testing.T) {
 // reports the block needs storing, finalization performs exactly one direct PUT
 // (no S3 HEAD via the legacy path) and registers the block reference + mapping.
 func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
-	legacyPuts, directPuts, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
+	legacyPuts, directPuts, reusableChecks, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
 		db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"})
 
 	expectedSHA1 := sha1.Sum([]byte("hello"))
@@ -2718,6 +2733,9 @@ func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
 	}
 	if got := directPuts.Load(); got != 1 {
 		t.Errorf("direct PUT calls = %d, want 1", got)
+	}
+	if got := reusableChecks.Load(); got != 0 {
+		t.Errorf("reusable canonical checks = %d, want 0", got)
 	}
 	if got := registerCalls.Load(); got != 1 {
 		t.Errorf("register ref/mapping calls = %d, want 1", got)

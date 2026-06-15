@@ -56,7 +56,7 @@ Cassandra probe — `DB.ProbeBlockReuse(orgID, blockID)` in
 
 | Decision             | Meaning                                              | Action in upload path        |
 |----------------------|------------------------------------------------------|------------------------------|
-| `BlockReuseReusable` | canonical metadata + live references, no GC fence    | skip S3 entirely             |
+| `BlockReuseReusable` | canonical metadata + live references, no GC fence    | `EnsureReusableBlockPresent`: verify the canonical object (HEAD on the declared key) and repair (direct PUT) only if missing |
 | `BlockReuseNeedsPut` | no metadata, or metadata with no live references     | `PutBlockAutoDirect` (no HEAD)|
 | `BlockReuseBlockedByGC` | `gc_state='deleting'` or a `gc_s3_orphans` fence  | return `ErrBlockDeleteInProgress` → retry/back-off |
 | `BlockReuseUnknownError` | Cassandra read failed / corrupt metadata         | fall open to legacy Exists+PUT |
@@ -67,9 +67,26 @@ without the prior HEAD. The probe is wired into all five upload paths:
 (`sync.go`), `FileHandler.CreateFile` template + `UploadFile` (`files.go`), and
 `OnlyOffice.saveEditedDocument` (`onlyoffice.go`).
 
+**Scope of the fix — read carefully:** this is fixed for the *server-side hot
+upload paths* listed above. It is **not** a global removal of the S3 HEAD:
+- The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
+  (`internal/storage/blocks.go`) still perform `Exists` + `PutAuto`. They remain
+  in use as the probe-error fallback inside the migrated paths and by unmigrated
+  callers such as the `v2/blocks.go` `UploadBlock` handler (which still does its
+  own HEAD + `PutBlockData`).
+- The `Reusable` path no longer skips S3 entirely. To avoid trusting Cassandra
+  metadata for a physical object that could be missing (partial GC, external
+  deletion, eventual consistency, bugs), `EnsureReusableBlockPresent` does a
+  targeted HEAD on the canonical key and repairs in place if the object is gone.
+  This is a deliberate safety/perf trade: the HEAD is back on dedup hits, but the
+  upload can never publish a reference to a missing object.
+
 **Per-block cost change:**
-- New block (common case): was `1 S3 HEAD + 1 S3 PUT`; now `≤2 Cassandra reads (~1 ms each) + 1 direct PUT`.
-- Dedup hit (reusable): was `1 S3 HEAD`; now `3 Cassandra reads (~1 ms each)`, no S3.
+- New block (common case): was `1 S3 HEAD + 1 S3 PUT`; now `≤2 Cassandra reads (~1 ms each) + 1 direct PUT`, **no HEAD**.
+- Dedup hit (reusable): was `1 S3 HEAD`; now `3 Cassandra reads + 1 canonical-verify HEAD` (+ 1 repair PUT only if the object is missing).
+
+Net effect: the main win is for *new* content (the dominant case), which loses the
+HEAD entirely. Dedup hits keep a HEAD but gain self-healing.
 
 **Correctness — why skipping the PUT is safe:** the GC-race safety never relied on
 the PUT. It derives from the *reference-first, then fence-check* protocol in
@@ -92,17 +109,42 @@ a Cassandra-first probe can reject the block before any S3 work starts.
   (reusable, needs-put without metadata, needs-put with metadata + no refs + distinct
   storage class, blocked by orphan fence, blocked by `gc_state='deleting'` short-circuit,
   empty-storage-class error, metadata read-error propagation).
-- `internal/api/seafhttp_test.go` — `finalizeUploadStreaming` reusable path (0 HEAD,
-  0 PUT, ref/mapping registered) and needs-put path (0 HEAD, 1 direct PUT, ref/mapping
-  registered); plus `store`-phase fence retry.
+- `internal/api/seafhttp_test.go` — `finalizeUploadStreaming` reusable path (routes
+  through the canonical verify once, no legacy/direct PUT) and needs-put path (no
+  legacy HEAD, 1 direct PUT, ref/mapping registered); plus `store`-phase fence retry.
+- `internal/api/v2/upload_reuse_test.go` — `EnsureReusableBlockPresent` exists-skip
+  (honors `probe.StorageKey`) and missing-repair (derives the key from the hash when
+  `storage_key` is empty) paths.
 - `internal/api/v2/upload_reuse_test.go` — shared retry helper + fail-open probe.
-- `internal/api/handler_mapping_failure_test.go` — sync reusable skips legacy Exists+PUT.
+- `internal/api/handler_mapping_failure_test.go` — sync needs-put uses direct PUT,
+  not the legacy Exists+PUT.
 
-**Caveat (minor):** `AccountBlockOnce` (`seafhttp.go:1988–1995`) still deduplicates
-by *block position* (index), not by SHA-256, so same-content blocks at different
-positions in one upload produce separate probes/PUTs. The Cassandra probe now
-provides cross-upload dedup (a previously-stored block is reused), which the old
-S3 HEAD also did — so no dedup regression.
+**Caveat 1 (minor — dedup granularity):** `AccountBlockOnce` (`seafhttp.go:1988–1995`)
+still deduplicates by *block position* (index), not by SHA-256, so same-content
+blocks at different positions in one upload produce separate probes/PUTs. The
+Cassandra probe now provides cross-upload dedup (a previously-stored block is
+reused), which the old S3 HEAD also did — so no dedup regression.
+
+**Caveat 2 (separate debt — `storage_key` not adopted for reads):**
+`EnsureReusableBlockPresent` is the first code path that honors the canonical
+`storage_key` column (falling back to the hash-derived key only when it is empty).
+Every *read* path in `internal/storage/blocks.go` — `GetBlock`, `GetBlockReader`,
+`GetBlockSize`, etc. — still derives the object key purely from the content hash
+via `hashToKey(hash)` and never consults `storage_key`. GC deletes the same way.
+Today this is harmless because `storage_key` is always written equal to the
+hash-derived key, so the two never diverge. But it means the system is not yet
+free to relocate a block to a non-hash-derived key: doing so would make the verify/
+repair path (which respects `storage_key`) and the read path (which ignores it)
+disagree. Full adoption of `storage_key` as the primary read locator is a separate,
+pre-existing tech-debt item — see `docs/KNOWN_ISSUES.md`
+(ISSUE-BLOCK-STORAGE-KEY-READS-01) and `docs/TECHNICAL-DEBT.md`.
+
+**Caveat 3 (minor — new failure surface on reuse):** because the `Reusable` path now
+issues a canonical-verify HEAD, a transient S3 error on that HEAD now fails the
+upload (it is not an `ErrBlockDeleteInProgress`, so it is not retried by the
+materialization loop). Previously a reusable block touched no S3 and could not fail
+there. This is acceptable — refusing to publish a reference we cannot verify is the
+safer behavior — but it is a behavioral change worth knowing during incident triage.
 
 ---
 

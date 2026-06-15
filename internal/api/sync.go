@@ -980,7 +980,8 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			if probeErr == nil {
 				switch probe.Decision {
 				case db.BlockReuseReusable:
-					return nil
+					_, ensureErr := v2.EnsureReusableBlockPresent(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass)
+					return ensureErr
 				case db.BlockReuseNeedsPut:
 					if checker := getAPIQuotaChecker(); checker != nil {
 						if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {

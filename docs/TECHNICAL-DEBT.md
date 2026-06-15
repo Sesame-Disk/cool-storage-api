@@ -264,21 +264,41 @@ branch `perf/p2-cassandra-first-hot-reuse`)
 The pre-PUT S3 HEAD is replaced by `DB.ProbeBlockReuse(orgID, blockID)`
 (`internal/db/block_references.go`), which reads `blocks` metadata,
 `block_references`, and the `gc_s3_orphans` fence and returns
-reusable / needs-put / blocked-by-GC / unknown-error. Reusable blocks skip S3
-entirely; needs-put blocks use `PutBlockAutoDirect` (no HEAD); blocked-by-GC
-returns `ErrBlockDeleteInProgress` to retry; unknown-error falls open to the
-legacy Exists+PUT. Wired into all five upload paths (`seafhttp.go` ×2, `sync.go`,
-`files.go` ×2, `onlyoffice.go`). Per-block cost: a new block now pays ≤2 Cassandra
-reads (~1 ms each) instead of an S3 HEAD. Safety is unchanged — it rests on the
+reusable / needs-put / blocked-by-GC / unknown-error. Needs-put blocks use
+`PutBlockAutoDirect` (no HEAD); reusable blocks run `EnsureReusableBlockPresent`
+(verify the canonical object via HEAD on the declared key, repair via direct PUT
+only if missing); blocked-by-GC returns `ErrBlockDeleteInProgress` to retry;
+unknown-error falls open to the legacy Exists+PUT. Wired into all five upload paths
+(`seafhttp.go` ×2, `sync.go`, `files.go` ×2, `onlyoffice.go`). Per-block cost: a
+new block now pays ≤2 Cassandra reads (~1 ms each) + 1 direct PUT and no HEAD;
+dedup hits keep one canonical-verify HEAD. Safety is unchanged — it rests on the
 reference-first/fence-check protocol in `RegisterUploadedBlock`, not on the PUT
 (see KNOWN_ISSUES ISSUE-UPLOAD-S3-DOUBLE-RTT-01). The materialize retry loop now
-also retries `ErrBlockDeleteInProgress` from the `store` phase. Tests:
-`ProbeBlockReuse` decision matrix (`block_references_test.go`), reusable/needs-put
-`finalizeUploadStreaming` paths (`seafhttp_test.go`), shared retry helper
+also retries `ErrBlockDeleteInProgress` from the `store` phase.
+
+**Scope (not global):** this fixes the server-side hot upload paths only. The
+`BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData` still do
+`Exists` + `PutAuto` and remain in use as the probe-error fallback and by
+unmigrated callers (e.g. `v2/blocks.go` `UploadBlock`). The HEAD was not removed
+from `BlockStore` globally.
+
+Tests: `ProbeBlockReuse` decision matrix (`block_references_test.go`),
+reusable/needs-put `finalizeUploadStreaming` paths (`seafhttp_test.go`),
+`EnsureReusableBlockPresent` exists/repair paths and shared retry helper
 (`upload_reuse_test.go`).
 
 ### Remaining Debt
 
+- **Block reads ignore `storage_key`** (pre-existing, surfaced by P-2). Every read
+  in `internal/storage/blocks.go` (`GetBlock`, `GetBlockReader`, `GetBlockSize`,
+  `BlockExists`, …) derives the S3 key from the content hash via `hashToKey(hash)`
+  and never consults the canonical `storage_key` column; GC deletes the same way.
+  Only `EnsureReusableBlockPresent` (P-2) honors `storage_key`. Harmless today
+  because `storage_key` is always written equal to the hash-derived key, but it
+  prevents relocating a block to any non-hash-derived layout (reads/GC would target
+  a different object than verify/repair). Fix: make `storage_key` the primary
+  locator for reads + deletes, hash-derived key as fallback. See KNOWN_ISSUES
+  ISSUE-BLOCK-STORAGE-KEY-READS-01.
 - Pending-owner and publish-repair sweepers need explicit per-run limits and
   metrics for skipped, repaired, released, and failed rows.
 - The upload-finalize `gc_leases` role should include `orgID` for extra isolation.

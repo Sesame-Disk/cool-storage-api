@@ -1214,8 +1214,9 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		if probeErr == nil {
 			switch probe.Decision {
 			case db.BlockReuseReusable:
-				storageKey = probe.StorageKey
-				return nil
+				var ensureErr error
+				storageKey, ensureErr = EnsureReusableBlockPresent(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass)
+				return ensureErr
 			case db.BlockReuseNeedsPut:
 				var putErr error
 				storageKey, putErr = putUploadedBlockAutoDirectFn(ctx, blockStore, internalBlockID, content)

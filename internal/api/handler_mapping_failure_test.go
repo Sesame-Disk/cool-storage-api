@@ -140,30 +140,37 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	}
 }
 
-func TestSyncPutBlockReusableSkipsLegacyExistsAndStore(t *testing.T) {
+func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 	oldExists := syncBlockExistsFn
 	oldPut := syncPutBlockDataFn
+	oldPutDirect := syncPutBlockAutoDirectFn
 	oldProbe := syncProbeUploadedBlockReuseFn
 	oldRegister := registerUploadedBlockAndMappingForSyncFn
 	oldLookupClass := lookupLibraryStorageClassForSyncFn
 	t.Cleanup(func() {
 		syncBlockExistsFn = oldExists
 		syncPutBlockDataFn = oldPut
+		syncPutBlockAutoDirectFn = oldPutDirect
 		syncProbeUploadedBlockReuseFn = oldProbe
 		registerUploadedBlockAndMappingForSyncFn = oldRegister
 		lookupLibraryStorageClassForSyncFn = oldLookupClass
 	})
 
 	syncBlockExistsFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string) (bool, error) {
-		t.Fatal("legacy BlockExists path should not run when Cassandra marks the block reusable")
+		t.Fatal("legacy BlockExists path should not run when Cassandra marks the block needs-put")
 		return false, nil
 	}
 	syncPutBlockDataFn = func(ctx context.Context, blockStore *storage.BlockStore, block *storage.BlockData) (string, error) {
-		t.Fatal("legacy PutBlockData path should not run when Cassandra marks the block reusable")
+		t.Fatal("legacy PutBlockData path should not run when Cassandra marks the block needs-put")
 		return "", nil
 	}
+	directPutCalls := 0
+	syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		directPutCalls++
+		return hash, nil
+	}
 	syncProbeUploadedBlockReuseFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
-		return db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot"}, nil
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
 	}
 	registerCalls := 0
 	registerUploadedBlockAndMappingForSyncFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
@@ -185,6 +192,9 @@ func TestSyncPutBlockReusableSkipsLegacyExistsAndStore(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if directPutCalls != 1 {
+		t.Fatalf("directPutCalls = %d, want 1", directPutCalls)
 	}
 	if registerCalls != 1 {
 		t.Fatalf("registerCalls = %d, want 1", registerCalls)

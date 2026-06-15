@@ -133,6 +133,27 @@ func (bs *BlockStore) PutBlockAutoDirect(ctx context.Context, hash string, data 
 	return key, nil
 }
 
+// PutObjectAutoDirect stores raw bytes at an explicit storage key without a prior Exists/HEAD.
+func (bs *BlockStore) PutObjectAutoDirect(ctx context.Context, storageKey string, data []byte) (string, error) {
+	reader := &bytesReader{data: data}
+	_, err := bs.s3.PutAuto(ctx, storageKey, reader, int64(len(data)))
+	if err != nil {
+		return "", fmt.Errorf("failed to store block: %w", err)
+	}
+
+	return storageKey, nil
+}
+
+// ObjectExists checks whether an explicit storage key exists.
+func (bs *BlockStore) ObjectExists(ctx context.Context, storageKey string) (bool, error) {
+	return bs.s3.Exists(ctx, storageKey)
+}
+
+// StorageKeyForHash exposes the deterministic storage key for a content hash.
+func (bs *BlockStore) StorageKeyForHash(hash string) string {
+	return bs.hashToKey(hash)
+}
+
 // GetBlock retrieves a block by its hash
 func (bs *BlockStore) GetBlock(ctx context.Context, hash string) ([]byte, error) {
 	key := bs.hashToKey(hash)

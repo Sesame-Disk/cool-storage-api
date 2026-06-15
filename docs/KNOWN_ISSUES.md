@@ -48,7 +48,8 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **`blocks` Hot Partition by `org_id`** | ✅ Fixed (2026-05-26) | `blocks`, `gc_block_candidates`, `gc_s3_orphans`, and the block-id mapping tables now use per-block partitioning so no single org concentrates LWT traffic into one Cassandra partition. The GC scan and S3 orphan recovery paths walk per-day discovery projections instead of partition-scanning by org. See ISSUE-BLOCKS-HOT-PARTITION-01 below. |
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
-| **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` that decides reuse / direct-PUT / GC-fence before any S3 call. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
+| **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on the five server-side upload paths. NOT global: legacy `BlockStore` Exists+PUT methods remain for fallback + unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
+| **Read Paths Ignore `storage_key`** | 🟡 Pending | All block reads derive the S3 key from the content hash (`hashToKey`) and never consult the canonical `storage_key` column; only the new reuse verify/repair honors it. Harmless today (always equal) but blocks any non-hash-derived key layout. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
@@ -759,15 +760,30 @@ The S3 HEAD is replaced by `DB.ProbeBlockReuse(orgID, blockID)` in
 `internal/db/block_references.go`, which reads `blocks` metadata, `block_references`,
 and the `gc_s3_orphans` fence to return one of:
 
-- `BlockReuseReusable` → skip S3 entirely
+- `BlockReuseReusable` → `EnsureReusableBlockPresent`: verify the canonical object
+  exists (HEAD on the declared key) and repair it (direct PUT) only if missing
 - `BlockReuseNeedsPut` → `PutBlockAutoDirect` (direct PUT, no HEAD)
 - `BlockReuseBlockedByGC` → `ErrBlockDeleteInProgress` (retry/back-off)
 - `BlockReuseUnknownError` → fall open to the legacy Exists+PUT path
 
 Wired into all five upload paths. New blocks now pay ≤2 Cassandra reads (~1 ms each)
-instead of an S3 HEAD; dedup hits pay 3 Cassandra reads and no S3.
++ 1 direct PUT, **no HEAD**; dedup hits pay 3 Cassandra reads + 1 canonical-verify
+HEAD (+ a repair PUT only when the object is actually missing).
 
-#### Why skipping the PUT is safe
+#### Scope — NOT a global removal of the HEAD
+
+This is fixed for the *server-side hot upload paths*, not across the whole repo:
+
+- The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
+  (`internal/storage/blocks.go`) still do `Exists` + `PutAuto`. They remain in use
+  as the probe-error fallback inside the migrated paths and by unmigrated callers
+  such as the `v2/blocks.go` `UploadBlock` handler (its own HEAD + `PutBlockData`).
+- The `Reusable` path does not skip S3: `EnsureReusableBlockPresent` adds a targeted
+  HEAD on the canonical key (with repair-on-miss) so the upload never publishes a
+  reference to a physically-missing object. This is a deliberate safety/perf trade —
+  the HEAD is back on dedup hits, but reuse is now self-healing.
+
+#### Why skipping the legacy PUT is safe
 
 GC-race safety derives from the *reference-first, then fence-check* protocol in
 `FSHelper.RegisterUploadedBlock` (`fs_helpers.go:1006–1034`) versus GC's
@@ -775,23 +791,75 @@ GC-race safety derives from the *reference-first, then fence-check* protocol in
 Dekker-style mutual flagging — not from the S3 PUT. The `gc_s3_orphans` fence is
 written before the S3 `DeleteObject` and cleared only after it, so any in-flight
 delete is always visible to both the probe and the materialize step. The probe is
-an optimization that fails safe in every non-reusable direction.
+an optimization that fails safe in every non-reusable direction. The canonical
+verify/repair on the reuse path is an extra physical guarantee on top of this.
 
 The materialization retry loop (`retrySeafHTTPBlockMaterialization` and
 `v2.RetryUploadedBlockMaterialization`) now also retries when the `store` phase
 returns `ErrBlockDeleteInProgress`, since a probe can reject a block before any S3
 work begins.
 
-#### Caveat
+#### Caveats
 
-`AccountBlockOnce` still deduplicates by block position (index), not SHA-256, so
-same-content blocks at different positions within one upload produce separate
-probes/PUTs. The Cassandra probe provides cross-upload dedup, matching what the
-old S3 HEAD did — no dedup regression.
+- `AccountBlockOnce` still deduplicates by block position (index), not SHA-256, so
+  same-content blocks at different positions within one upload produce separate
+  probes/PUTs. The Cassandra probe provides cross-upload dedup, matching what the
+  old S3 HEAD did — no dedup regression.
+- A transient S3 error on the reuse-path verify HEAD now fails the upload (it is not
+  `ErrBlockDeleteInProgress`, so it is not retried). Reusable blocks previously
+  touched no S3 and could not fail there. Refusing to publish an unverifiable
+  reference is the safer behavior, but it is a behavioral change for incident triage.
 
 #### Related
 
 - `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md` — P-2
+- `docs/TECHNICAL-DEBT.md` §25
+- ISSUE-BLOCK-STORAGE-KEY-READS-01 below — read paths still ignore `storage_key`
+
+---
+
+### ISSUE-BLOCK-STORAGE-KEY-READS-01: Read Paths Ignore `storage_key` (key derived from hash)
+
+**Status**: 🟡 Pending — latent inconsistency, no live bug today
+**Severity**: Low (becomes High the moment any block is stored at a non-hash-derived key)
+**Affected**: `internal/storage/blocks.go` read methods; GC delete path
+
+#### Problem
+
+The `blocks` table has a `storage_key` column recording where a block's object
+lives. Every read path derives the S3 key purely from the content hash instead:
+`GetBlock`, `GetBlockReader`, `GetBlockSize`, `BlockExists`, etc. all call
+`hashToKey(hash)` and never consult `storage_key`. GC's `DeleteBlock` deletes the
+hash-derived key too.
+
+As of `perf/p2-cassandra-first-hot-reuse`, `EnsureReusableBlockPresent`
+(`internal/api/v2/upload_reuse.go`) is the **first and only** code path that honors
+`storage_key` as the canonical locator (falling back to the hash-derived key only
+when it is empty).
+
+#### Why it is not a live bug (yet)
+
+`storage_key` is always written equal to `hashToKey(hash)` at upload time, so the
+column and the derived key never diverge. Reads and the verify/repair path therefore
+resolve to the same object.
+
+#### The latent risk
+
+The system cannot safely relocate a block to a key that differs from
+`hashToKey(hash)` (e.g. per-tenant prefixes, re-sharding, migration to a different
+layout). If it did, the verify/repair path (respects `storage_key`) and the read +
+GC paths (ignore it) would target different objects — reads would 404 and GC could
+delete the wrong (or no) object.
+
+#### Proposed Fix
+
+Make `storage_key` the primary locator for reads and deletes, with `hashToKey(hash)`
+as the fallback only when the column is empty (mirroring `EnsureReusableBlockPresent`).
+This is a pre-existing, cross-cutting change; track it independently of P-2.
+
+#### Related
+
+- `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md` — P-2 caveat 2
 - `docs/TECHNICAL-DEBT.md` §25
 
 ---

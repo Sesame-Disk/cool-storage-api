@@ -1207,6 +1207,9 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				if probeErr == nil {
 					switch probe.Decision {
 					case db.BlockReuseReusable:
+						if _, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass); ensureErr != nil {
+							return fmt.Errorf("failed to verify reusable template block: %w", ensureErr)
+						}
 						templateBlockStored = true
 						return nil
 					case db.BlockReuseNeedsPut:
@@ -2899,7 +2902,8 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		if probeErr == nil {
 			switch probe.Decision {
 			case db.BlockReuseReusable:
-				return nil
+				_, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass)
+				return ensureErr
 			case db.BlockReuseNeedsPut:
 				if _, putErr := putUploadedBlockAutoDirectFn(c.Request.Context(), blockStore, sha256ID, storedContent); putErr != nil {
 					return fmt.Errorf("failed to store block: %w", putErr)
