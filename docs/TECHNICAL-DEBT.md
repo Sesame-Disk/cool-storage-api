@@ -274,11 +274,13 @@ fence check run in parallel across all 8 workers. Regression test:
 
 `PutBlockAuto` / `PutBlock` / `PutBlockData` in `internal/storage/blocks.go`
 all call `s3.Exists(ctx, key)` before `s3.PutAuto`. On real S3 (~50 ms RTT)
-this is ~100 ms per new block across 8 parallel workers. Fix: remove the `Exists`
-check and use a direct PUT — S3 accepts re-PUT of the same key idempotently;
-intra-upload dedup via `upload.BlockAlreadyAccounted()` (`seafhttp.go:1988–1995`)
-already prevents redundant PUTs within one session. Alternative: check existence
-in Cassandra (`block_references`) instead of S3.
+this is ~100 ms per new block; 128 blocks total ~12.8 s aggregate RTT (~1.6 s
+wall-clock with 8 workers). Fix: remove the `Exists` check and use a direct PUT —
+S3 accepts re-PUT of the same key idempotently. Caveat: `AccountBlockOnce`
+(`seafhttp.go:1988–1995`) deduplicates by block *position* (index), not SHA-256;
+same-content blocks at different positions still produce separate PUTs, so the
+`Exists` check is the only cross-position dedup guard today. Alternative: check
+existence in Cassandra (`block_references`) instead of S3 (~1 ms vs 50 ms).
 
 **S-1 — Chunk state is node-local** (pending)
 

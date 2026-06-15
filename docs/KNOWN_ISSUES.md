@@ -747,16 +747,19 @@ callback completes while the metadata permit is externally held.
 #### Problem
 
 All three functions call `bs.s3.Exists(ctx, key)` before `bs.s3.PutAuto(...)`.
-For new blocks this costs 2 S3 round-trips. On real S3 (~50 ms RTT each) a 1 GB
-file (128 × 8 MB blocks) accumulates ~12 s of pure latency even with 8 parallel
-workers. While P-1 was active, both RTTs were also serialized process-wide.
+For new blocks this costs 2 S3 round-trips. On real S3 (~50 ms RTT each), a 1 GB
+file (128 × 8 MB blocks) totals ~12.8 s of aggregate RTT work if serialized; with
+8 ideal parallel workers the wall-clock RTT floor is ~1.6 s, plus transfer and
+queuing. While P-1 was active, both RTTs were serialized process-wide on top of this.
 
 #### Proposed Fix
 
 Remove the `Exists` check from all three functions and issue a direct PUT. S3
-accepts idempotent re-PUT of the same content-addressed key. Intra-upload
-deduplication via `upload.BlockAlreadyAccounted()` (`seafhttp.go:1988–1995`)
-already prevents redundant PUTs within a single upload session.
+accepts idempotent re-PUT of the same content-addressed key. Note:
+`upload.AccountBlockOnce` (`seafhttp.go:1988–1995`) deduplicates by *block position*
+(index), not by SHA-256, so same-content blocks at different positions still produce
+separate PUTs. The `Exists` check is the only cross-position dedup guard today;
+removing it trades that guard for lower latency.
 
 Alternative: verify block existence via Cassandra (`block_references`) before
 touching S3 — ~1 ms vs 50 ms.

@@ -47,12 +47,16 @@ _, err = bs.s3.PutAuto(ctx, key, reader, size)  // PUT — round-trip 2
 Same pattern in `PutBlock` (L75–96) and `PutBlockData` (L50–71). With P-1 active,
 both RTTs were serialized process-wide. With P-1 resolved, they run in parallel
 across 8 workers, but each block still costs 2 RTTs for new blocks (~50 ms per RTT
-on real S3 → ~100 ms per block → ~12 s for a 1 GB file at 128 blocks).
+on real S3 → ~100 ms per block). For a 1 GB file (128 × 8 MB blocks), that is
+~12.8 s of aggregate RTT work if serialized; with 8 ideal parallel workers the
+wall-clock RTT floor drops to ~1.6 s, plus transfer time and S3/client queuing.
 
 **Proposed fix:** remove the `Exists` check from `PutBlockAuto`/`PutBlock` and use a
-direct PUT. S3 accepts re-PUT of the same key idempotently. Intra-upload
-deduplication via `upload.BlockAlreadyAccounted()` (`seafhttp.go:1988–1995`)
-already prevents redundant PUTs within the same upload session.
+direct PUT. S3 accepts re-PUT of the same key idempotently. Note:
+`upload.AccountBlockOnce` (`seafhttp.go:1988–1995`) deduplicates by *block position*
+(index), not by content SHA-256, so same-content blocks at different positions still
+produce separate PUTs. The `Exists` check is the only cross-position dedup guard
+today; removing it trades that guard for lower latency.
 
 Alternative: check block existence in Cassandra (`block_references`) before hitting
 S3 — one Cassandra read (<1 ms) instead of an S3 HEAD (10–80 ms).

@@ -13,6 +13,7 @@ import (
 	"os"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2415,6 +2416,79 @@ func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
 	releaseHeld()
 	if err := <-done; err != nil {
 		t.Fatalf("retrySeafHTTPBlockMaterialization returned unexpected error: %v", err)
+	}
+}
+
+// TestFinalizeUploadS3PutPrecedesPermitRelease verifies the sequencing invariant:
+// the S3 PUT (store callback) is invoked before the metadata permit is released
+// (end of materialize callback). It uses an atomic counter to record call order
+// without relying on goroutine timing, and pre-holds the permit to confirm the
+// store callback does not require it.
+func TestFinalizeUploadS3PutPrecedesPermitRelease(t *testing.T) {
+	var seq atomic.Int64
+	var putSeq, permitReleaseSeq int64
+
+	originalPut := putUploadedBlockAutoFn
+	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, _ string, _ []byte) (string, error) {
+		putSeq = seq.Add(1)
+		return "key", nil
+	}
+	t.Cleanup(func() { putUploadedBlockAutoFn = originalPut })
+
+	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+		return nil
+	}
+	t.Cleanup(func() { registerUploadedBlockAndMappingForUploadFn = originalRegister })
+
+	// Pre-hold the single permit: the goroutine's materialize callback must block
+	// until we release it, proving the store callback does not need the permit.
+	releaseHeld, err := acquireFinalizeUploadBlockMetadataPermit(context.Background())
+	if err != nil {
+		t.Fatalf("pre-acquire failed: %v", err)
+	}
+
+	putInvoked := make(chan struct{})
+	done := make(chan error, 1)
+
+	go func() {
+		done <- retrySeafHTTPBlockMaterialization("test", "sha256-block",
+			func() error {
+				_, putErr := putUploadedBlockAutoFn(context.Background(), nil, "sha256-block", []byte("data"))
+				close(putInvoked)
+				return putErr
+			},
+			func() error {
+				rel, permitErr := acquireFinalizeUploadBlockMetadataPermit(context.Background())
+				if permitErr != nil {
+					return permitErr
+				}
+				defer func() {
+					permitReleaseSeq = seq.Add(1)
+					rel()
+				}()
+				return registerUploadedBlockAndMappingForUploadFn(nil, "", "", "", "", 0, "", "", "")
+			},
+			nil,
+		)
+	}()
+
+	// PUT must run while the permit is still held externally.
+	select {
+	case <-putInvoked:
+	case <-time.After(500 * time.Millisecond):
+		releaseHeld()
+		t.Fatal("S3 PUT was not invoked while metadata permit was pre-held")
+	}
+
+	// Allow materialize to proceed and record its permit-release sequence number.
+	releaseHeld()
+	if err := <-done; err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if putSeq >= permitReleaseSeq {
+		t.Errorf("S3 PUT (seq=%d) must precede permit release (seq=%d)", putSeq, permitReleaseSeq)
 	}
 }
 
