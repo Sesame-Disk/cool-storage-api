@@ -98,6 +98,11 @@ func uploadChunkThroughLinkStatusConcurrent(c *testClient, uploadURL, fileName, 
 	if err := writer.WriteField("parent_dir", parentDir); err != nil {
 		return 0, "", err
 	}
+	// Stable per-upload identifier (see uploadChunkThroughLinkStatus): lets the
+	// server treat both concurrent final chunks as retries of the same upload.
+	if err := writer.WriteField("resumableIdentifier", fileName+"|"+parentDir); err != nil {
+		return 0, "", err
+	}
 	if err := writer.Close(); err != nil {
 		return 0, "", err
 	}
@@ -554,6 +559,137 @@ func TestChunkedUploadRaceReturnsAutorenameInResponse(t *testing.T) {
 	if !containsEntry(entries, "name", autoRenamed) {
 		t.Fatalf("autorename target %q not found after chunked autorename race", autoRenamed)
 	}
+}
+
+// A retry of the final chunk that arrives AFTER the upload already finalized
+// (winner published and the tracker was cleaned up) must still receive the real
+// finalize result from the outcome cache — not a bare {"success":true} ack that
+// the client cannot turn into a dirent. This is the server side of big files
+// reporting "Uploaded" / "could not be confirmed" while missing from the listing.
+func TestChunkedUploadLateFinalChunkRetryReturnsCachedResult(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-chunked-late-retry-%d", time.Now().UnixNano()))
+	uploadURL := getUploadLink(t, adminClient, repoID, "/")
+	retJSONUploadURL := uploadURL + "?ret-json=1"
+
+	fileName := "late-retry.txt"
+	content := []byte("abcdefghij") // 10 bytes → two 5-byte chunks
+
+	status, body := uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, "/", content[:5], "bytes 0-4/10")
+	if status != http.StatusOK {
+		t.Fatalf("first chunk status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+
+	// Final chunk finalizes and returns the file array.
+	status, body = uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, "/", content[5:], "bytes 5-9/10")
+	if status != http.StatusOK {
+		t.Fatalf("final chunk status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	var firstPayload []map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &firstPayload); err != nil || len(firstPayload) != 1 {
+		t.Fatalf("final chunk body not a finalize array: %v body=%s", err, body)
+	}
+	firstID, _ := firstPayload[0]["id"].(string)
+	if firstID == "" {
+		t.Fatalf("final chunk returned empty file id; body=%s", body)
+	}
+
+	// Late retry of the same final chunk (tracker already cleaned up): must return
+	// the SAME finalize array from the cache, with ret-json=1.
+	status, body = uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, "/", content[5:], "bytes 5-9/10")
+	if status != http.StatusOK {
+		t.Fatalf("late retry status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	var retryPayload []map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &retryPayload); err != nil {
+		t.Fatalf("late retry body is not a finalize array (regression — got a bare ack?): %v body=%s", err, body)
+	}
+	if len(retryPayload) != 1 {
+		t.Fatalf("late retry payload length = %d, want 1; body=%s", len(retryPayload), body)
+	}
+	if got, _ := retryPayload[0]["id"].(string); got != firstID {
+		t.Fatalf("late retry id = %q, want same as first finalize %q; body=%s", got, firstID, body)
+	}
+
+	// Late retry without ret-json must return the raw file id (cache honours mode).
+	status, body = uploadChunkThroughLinkStatus(t, adminClient, uploadURL, fileName, "/", content[5:], "bytes 5-9/10")
+	if status != http.StatusOK {
+		t.Fatalf("late retry (raw) status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	if strings.TrimSpace(body) != firstID {
+		t.Fatalf("late retry (raw) body = %q, want raw file id %q", strings.TrimSpace(body), firstID)
+	}
+
+	// The file must exist exactly once — no duplicate from the retries.
+	expectEntriesPresent(t, repoID, "/", []string{fileName})
+	expectEntriesAbsent(t, repoID, "/", []string{"late-retry (1).txt"})
+}
+
+// Two copies of the final chunk sent concurrently (the resumable retry racing
+// the original) must both resolve to the same finalized file — one as the
+// finalize winner, the other as a waiter (or via the cache) — and never to a
+// bare ack. The file must land exactly once.
+func TestChunkedUploadConcurrentFinalChunksResolveToSameFile(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-chunked-concurrent-final-%d", time.Now().UnixNano()))
+	uploadURL := getUploadLink(t, adminClient, repoID, "/")
+	retJSONUploadURL := uploadURL + "?ret-json=1"
+
+	fileName := "concurrent-final.txt"
+	content := []byte(strings.Repeat("x", 16)) // 16 bytes → two 8-byte chunks
+
+	status, body := uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, "/", content[:8], "bytes 0-7/16")
+	if status != http.StatusOK {
+		t.Fatalf("first chunk status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+
+	type finalResult struct {
+		status int
+		body   string
+		err    error
+	}
+	const racers = 2
+	results := make(chan finalResult, racers)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			s, b, err := uploadChunkThroughLinkStatusConcurrent(adminClient, retJSONUploadURL, fileName, "/", content[8:], "bytes 8-15/16")
+			results <- finalResult{status: s, body: b, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	ids := make(map[string]struct{})
+	for r := range results {
+		if r.err != nil {
+			t.Fatalf("concurrent final chunk error: %v", r.err)
+		}
+		if r.status != http.StatusOK {
+			t.Fatalf("concurrent final chunk status = %d, want %d; body=%s", r.status, http.StatusOK, r.body)
+		}
+		var payload []map[string]interface{}
+		if err := json.Unmarshal([]byte(r.body), &payload); err != nil {
+			t.Fatalf("concurrent final chunk body not a finalize array (regression — got a bare ack?): %v body=%s", err, r.body)
+		}
+		if len(payload) != 1 {
+			t.Fatalf("concurrent final chunk payload length = %d, want 1; body=%s", len(payload), r.body)
+		}
+		id, _ := payload[0]["id"].(string)
+		if id == "" {
+			t.Fatalf("concurrent final chunk returned empty id; body=%s", r.body)
+		}
+		ids[id] = struct{}{}
+	}
+	if len(ids) != 1 {
+		t.Fatalf("concurrent final chunks returned differing file ids: %v", ids)
+	}
+
+	expectEntriesPresent(t, repoID, "/", []string{fileName})
+	expectEntriesAbsent(t, repoID, "/", []string{"concurrent-final (1).txt"})
 }
 
 func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.T) {

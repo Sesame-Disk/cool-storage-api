@@ -345,10 +345,12 @@ func newTestChunkManager(t *testing.T) (*ChunkManager, string) {
 	dir := t.TempDir()
 	cm := &ChunkManager{
 		uploads:         make(map[string]*ChunkUpload),
+		outcomes:        make(map[string]cachedFinalizeOutcome),
 		tempDir:         dir,
 		janitorInterval: time.Hour, // irrelevant — goroutine not started
 		trackerTTL:      1 * time.Hour,
 		diskTTL:         2 * time.Hour,
+		outcomeTTL:      chunkFinalizeOutcomeTTL,
 		now:             time.Now,
 		stopCh:          make(chan struct{}),
 	}
@@ -2429,6 +2431,67 @@ func TestChunkUploadClaimFinalizationWaiterReceivesFailure(t *testing.T) {
 	}
 	if !errors.Is(outcome.err, finalizeErr) {
 		t.Fatalf("outcome.err = %v, want %v", outcome.err, finalizeErr)
+	}
+}
+
+// The finalize-outcome cache lets a final-chunk retry that lands after the
+// winner already finalized AND cleaned up its tracker still receive the real
+// file id, instead of a bare ack the client cannot confirm. This is the
+// residual window behind big files reporting failure when retried late amid
+// other concurrent uploads.
+func TestChunkManagerFinalizeOutcomeCache(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+	base := time.Now()
+	cm.now = func() time.Time { return base }
+	cm.outcomeTTL = 5 * time.Minute
+
+	const id = "ident-A"
+	cm.CacheFinalizeOutcome("tok", id, "/", "big.zip", "file-id-123", "big.zip", 100)
+
+	got, ok := cm.LookupFinalizeOutcome("tok", id, "/", "big.zip", 100)
+	if !ok {
+		t.Fatal("expected cached finalize outcome to be found")
+	}
+	if got.fileID != "file-id-123" || got.actualFilename != "big.zip" || got.totalSize != 100 {
+		t.Fatalf("cached outcome = %+v, want fileID=file-id-123 name=big.zip size=100", got)
+	}
+
+	// A different total size must NOT match (cheap extra guard).
+	if _, ok := cm.LookupFinalizeOutcome("tok", id, "/", "big.zip", 999); ok {
+		t.Fatal("size mismatch must miss the cache")
+	}
+	// A different token must not collide.
+	if _, ok := cm.LookupFinalizeOutcome("other-tok", id, "/", "big.zip", 100); ok {
+		t.Fatal("different token must miss the cache")
+	}
+	// Same basename + same size but a DIFFERENT parent dir (folder upload through
+	// the same token) must not read the other file's id.
+	if _, ok := cm.LookupFinalizeOutcome("tok", id, "/sub", "big.zip", 100); ok {
+		t.Fatal("different parent dir must miss the cache")
+	}
+	// A DIFFERENT upload identifier (a new upload of the same name/size/path,
+	// possibly different content) must miss, never reading the stale id.
+	if _, ok := cm.LookupFinalizeOutcome("tok", "ident-B", "/", "big.zip", 100); ok {
+		t.Fatal("different upload identifier must miss the cache")
+	}
+	// An empty identifier must never be cached nor served, so a client that does
+	// not send one can never read another upload's id.
+	cm.CacheFinalizeOutcome("tok", "", "/", "no-ident.zip", "leaked-id", "no-ident.zip", 100)
+	if _, ok := cm.LookupFinalizeOutcome("tok", "", "/", "no-ident.zip", 100); ok {
+		t.Fatal("empty identifier must never hit the cache")
+	}
+
+	// After the TTL the entry must miss and be swept.
+	cm.now = func() time.Time { return base.Add(6 * time.Minute) }
+	if _, ok := cm.LookupFinalizeOutcome("tok", id, "/", "big.zip", 100); ok {
+		t.Fatal("expired entry must miss the cache")
+	}
+	cm.sweepOnce()
+	cm.mu.RLock()
+	remaining := len(cm.outcomes)
+	cm.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("expired entries must be swept from the cache, %d remain", remaining)
 	}
 }
 

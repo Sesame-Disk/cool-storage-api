@@ -706,6 +706,13 @@ func uploadChunkThroughLinkStatus(t *testing.T, c *testClient, uploadURL, fileNa
 	if err := writer.WriteField("parent_dir", parentDir); err != nil {
 		t.Fatalf("WriteField failed: %v", err)
 	}
+	// Mirror resumable.js: send a stable per-upload identifier so the server can
+	// distinguish a retry of this upload from a different one. Derived from
+	// name+dir only (not the URL) so retries via the ret-json and raw URLs share
+	// the same identity.
+	if err := writer.WriteField("resumableIdentifier", fileName+"|"+parentDir); err != nil {
+		t.Fatalf("WriteField resumableIdentifier failed: %v", err)
+	}
 	if err := writer.Close(); err != nil {
 		t.Fatalf("closing multipart writer failed: %v", err)
 	}

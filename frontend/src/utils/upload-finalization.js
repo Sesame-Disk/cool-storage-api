@@ -280,12 +280,18 @@ export const clearFileUploadRuntimeState = (resumableFile, options = {}) => {
 };
 
 export const trackUploadResponseStatus = (resumableFile, resumableChunk) => {
-    if (!resumableFile || !resumableChunk || !resumableChunk.xhr || resumableChunk._sesamefsResponseTrackerAttached) {
+    if (!resumableFile || !resumableChunk || !resumableChunk.xhr) {
         return;
     }
 
     const xhr = resumableChunk.xhr;
-    resumableChunk._sesamefsResponseTrackerAttached = true;
+    // Guard per-XHR, not per-chunk: resumable.js reuses the same chunk object
+    // with a fresh XHR on retry, so a per-chunk flag would leave the retry's XHR
+    // untracked (no status/finalize capture). Re-attach whenever the XHR changes.
+    if (resumableChunk._sesamefsTrackedXhr === xhr) {
+        return;
+    }
+    resumableChunk._sesamefsTrackedXhr = xhr;
     xhr.addEventListener('readystatechange', () => {
         if (xhr.readyState !== 4) {
             return;

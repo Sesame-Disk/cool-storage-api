@@ -162,6 +162,25 @@ describe('upload finalize result resolution', () => {
         expect(resolveUploadSuccessResult({}, JSON.stringify({ success: true }), true)).toBeNull();
     });
 
+    test('re-tracks a reused chunk when resumable.js swaps in a fresh XHR on retry', () => {
+        // resumable.js keeps the same chunk object across retries but assigns a
+        // new XHR. A per-chunk guard would leave the retry XHR untracked; the
+        // per-XHR guard must re-attach so the retry response is still captured.
+        const resumableFile = {};
+        const chunk = { xhr: new FakeXhr(0, '') };
+
+        trackUploadResponseStatus(resumableFile, chunk);
+        chunk.xhr.complete(); // first attempt failed (status 0, no body)
+        expect(resumableFile.finalizeResult).toBeUndefined();
+
+        // Retry: same chunk object, brand-new XHR carrying the finalize array.
+        chunk.xhr = new FakeXhr(200, JSON.stringify([finalizeEntry]));
+        trackUploadResponseStatus(resumableFile, chunk);
+        chunk.xhr.complete();
+
+        expect(resumableFile.finalizeResult).toEqual(finalizeEntry);
+    });
+
     test('clearing runtime state drops captured finalize metadata so retries start clean', () => {
         const resumableFile = { finalizeResult: finalizeEntry, finalizeResultRaw: 'deadbeefcafe' };
         clearFileUploadRuntimeState(resumableFile);

@@ -350,18 +350,39 @@ const (
 	chunkJanitorInterval = 10 * time.Minute
 	chunkTrackerTTL      = 1 * time.Hour
 	chunkDiskTTL         = 2 * time.Hour
+	// chunkFinalizeOutcomeTTL bounds how long a finalized upload's result is kept
+	// after its tracker is removed, so a late final-chunk retry can still read the
+	// real file id. Long enough to cover client retry/backoff on huge uploads.
+	// Safe to keep generous because the cache key includes the per-upload resumable
+	// identifier, so it can only ever match a retry of that same upload.
+	chunkFinalizeOutcomeTTL = 15 * time.Minute
 )
+
+// cachedFinalizeOutcome retains a finalized upload's result after its tracker is
+// cleaned up, so a final-chunk retry that arrives in the residual window (winner
+// already published and cleaned up the tracker) still receives the real file id
+// instead of falling back to a "could not be confirmed" client error.
+type cachedFinalizeOutcome struct {
+	fileID         string
+	actualFilename string
+	totalSize      int64
+	expiresAt      time.Time
+}
 
 // ChunkManager manages chunked uploads
 type ChunkManager struct {
 	uploads map[string]*ChunkUpload
-	mu      sync.RWMutex
-	tempDir string
+	// outcomes caches successful finalize results by upload key for a short TTL
+	// after the tracker is removed. Guarded by mu alongside uploads.
+	outcomes map[string]cachedFinalizeOutcome
+	mu       sync.RWMutex
+	tempDir  string
 
 	// Janitor config — overridable in tests.
 	janitorInterval time.Duration
 	trackerTTL      time.Duration
 	diskTTL         time.Duration
+	outcomeTTL      time.Duration
 	now             func() time.Time
 
 	janitorOnce sync.Once
@@ -372,15 +393,65 @@ type ChunkManager struct {
 func NewChunkManager() *ChunkManager {
 	cm := &ChunkManager{
 		uploads:         make(map[string]*ChunkUpload),
+		outcomes:        make(map[string]cachedFinalizeOutcome),
 		tempDir:         os.TempDir(),
 		janitorInterval: chunkJanitorInterval,
 		trackerTTL:      chunkTrackerTTL,
 		diskTTL:         chunkDiskTTL,
+		outcomeTTL:      chunkFinalizeOutcomeTTL,
 		now:             time.Now,
 		stopCh:          make(chan struct{}),
 	}
 	cm.StartJanitor()
 	return cm
+}
+
+// chunkFinalizeOutcomeKey identifies a specific upload for the finalize-outcome
+// cache. It is keyed by the resumable upload identifier (unique per file per
+// upload session — it encodes the relative path, so two folder files sharing a
+// basename never collide, and a brand-new upload of the same name/path always
+// gets a fresh identifier). parentDir + filename are folded in for defense.
+// Callers must only use the cache when identifier is non-empty; an empty
+// identifier cannot distinguish a retry from a different upload, so it must NOT
+// be cached or served (it would risk returning a stale id for new content).
+func chunkFinalizeOutcomeKey(token, identifier, parentDir, filename string) string {
+	return token + "\x00" + identifier + "\x00" + parentDir + "\x00" + filename
+}
+
+// CacheFinalizeOutcome records a successful finalize result so a late final-chunk
+// retry (after CleanupUpload removed the tracker) can still be answered with the
+// real file id. No-op when identifier is empty. totalSize is matched on lookup
+// as a cheap extra guard.
+func (cm *ChunkManager) CacheFinalizeOutcome(token, identifier, parentDir, filename, fileID, actualFilename string, totalSize int64) {
+	if identifier == "" {
+		return
+	}
+	key := chunkFinalizeOutcomeKey(token, identifier, parentDir, filename)
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.outcomes[key] = cachedFinalizeOutcome{
+		fileID:         fileID,
+		actualFilename: actualFilename,
+		totalSize:      totalSize,
+		expiresAt:      cm.now().Add(cm.outcomeTTL),
+	}
+}
+
+// LookupFinalizeOutcome returns a cached finalize result if present, unexpired,
+// and matching the requested totalSize. Always misses for an empty identifier so
+// a distinct upload can never read another upload's id.
+func (cm *ChunkManager) LookupFinalizeOutcome(token, identifier, parentDir, filename string, totalSize int64) (cachedFinalizeOutcome, bool) {
+	if identifier == "" {
+		return cachedFinalizeOutcome{}, false
+	}
+	key := chunkFinalizeOutcomeKey(token, identifier, parentDir, filename)
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	cached, ok := cm.outcomes[key]
+	if !ok || cached.totalSize != totalSize || !cm.now().Before(cached.expiresAt) {
+		return cachedFinalizeOutcome{}, false
+	}
+	return cached, true
 }
 
 // StartJanitor launches the background sweeper exactly once per manager.
@@ -491,6 +562,12 @@ func (cm *ChunkManager) sweepOnce() {
 	}
 	for _, key := range staleKeys {
 		delete(cm.uploads, key)
+	}
+	// Drop expired finalize-outcome cache entries in the same pass.
+	for key, cached := range cm.outcomes {
+		if !now.Before(cached.expiresAt) {
+			delete(cm.outcomes, key)
+		}
 	}
 	aliveTempPaths := make(map[string]struct{}, len(cm.uploads))
 	for _, upload := range cm.uploads {
@@ -1450,6 +1527,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 	}
 	retJSON := c.Query("ret-json") == "1" || c.PostForm("ret-json") == "1"
+	// resumable.js sends a stable per-file-per-session identifier on every chunk.
+	// It uniquely distinguishes this upload (it encodes the relative path and a
+	// session timestamp), so it is the only safe key for the finalize-outcome
+	// cache: a retry carries the same identifier, a different upload never does.
+	uploadIdentifier := c.PostForm("resumableIdentifier")
 
 	filename := header.Filename
 
@@ -1494,6 +1576,21 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		tokenStr, filename, contentRange, isChunked)
 
 	if isChunked {
+		// A finalize result cached for this upload means it already completed —
+		// this is a late retry of the final chunk (the winner published and the
+		// tracker was already cleaned up). Answer with the real file id so the
+		// client builds the dirent instead of failing with "could not be
+		// confirmed".
+		if cached, ok := chunkManager.LookupFinalizeOutcome(tokenStr, uploadIdentifier, parentDir, filename, total); ok {
+			log.Printf("[HandleUpload] Returning cached finalize result for late retry: %s", filename)
+			if retJSON {
+				c.JSON(http.StatusOK, []gin.H{{"name": cached.actualFilename, "id": cached.fileID, "size": strconv.FormatInt(cached.totalSize, 10)}})
+			} else {
+				c.String(http.StatusOK, cached.fileID)
+			}
+			return
+		}
+
 		existingUpload := chunkManager.GetUpload(tokenStr, filename)
 		if existingUpload == nil || !existingUpload.HasQuotaPrecheck(parentDir, total, replaceFile) {
 			if _, _, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, total, replaceFile); err != nil {
@@ -1588,6 +1685,9 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		// wakes with the real file id even after the tracker leaves the map.
 		upload.PublishFinalizeSuccess(fileID, actualFilename, total)
 		finalizePublished = true
+		// Cache the outcome before removing the tracker so a final-chunk retry
+		// arriving in the residual window (after cleanup) still gets the file id.
+		chunkManager.CacheFinalizeOutcome(tokenStr, uploadIdentifier, parentDir, filename, fileID, actualFilename, total)
 		chunkManager.CleanupUpload(tokenStr, filename)
 
 		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, total, fileID[:16])
