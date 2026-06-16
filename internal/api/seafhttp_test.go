@@ -2128,11 +2128,11 @@ func TestChunkManagerGetOrCreateUpload(t *testing.T) {
 func TestChunkManagerTracksSameBasenameSeparatelyByIdentityAndPath(t *testing.T) {
 	cm, _ := newTestChunkManager(t)
 
-	uploadA, err := cm.GetOrCreateUploadByIdentity("token1", "ident-a", "file.txt", "/a", 10)
+	uploadA, err := cm.GetOrCreateUploadByIdentity("token1", "ident-a", "/a", "file.txt", 10)
 	if err != nil {
 		t.Fatalf("GetOrCreateUploadByIdentity(uploadA) failed: %v", err)
 	}
-	uploadAAgain, err := cm.GetOrCreateUploadByIdentity("token1", "ident-a", "file.txt", "/a", 10)
+	uploadAAgain, err := cm.GetOrCreateUploadByIdentity("token1", "ident-a", "/a", "file.txt", 10)
 	if err != nil {
 		t.Fatalf("GetOrCreateUploadByIdentity(uploadA again) failed: %v", err)
 	}
@@ -2140,7 +2140,7 @@ func TestChunkManagerTracksSameBasenameSeparatelyByIdentityAndPath(t *testing.T)
 		t.Fatal("same upload identity should reuse the tracked upload")
 	}
 
-	uploadB, err := cm.GetOrCreateUploadByIdentity("token1", "ident-b", "file.txt", "/b", 10)
+	uploadB, err := cm.GetOrCreateUploadByIdentity("token1", "ident-b", "/b", "file.txt", 10)
 	if err != nil {
 		t.Fatalf("GetOrCreateUploadByIdentity(uploadB) failed: %v", err)
 	}

@@ -433,16 +433,22 @@ func chunkUploadTrackerKey(token, identifier, parentDir, filename string, totalS
 	return token + "\x00" + parentDir + "\x00" + filename + "\x00" + strconv.FormatInt(totalSize, 10)
 }
 
-func chunkUploadTempPath(tempDir, trackerKey, token, filename string) string {
+// chunkUploadTempName length budget: the sha1 hash already makes the name
+// unique, so the human-readable filename hint is capped to keep the whole temp
+// filename well under the filesystem's 255-byte per-component limit even for
+// very long upload names.
+const chunkUploadTempNameHintMax = 40
+
+func chunkUploadTempPath(tempDir, trackerKey, filename string) string {
 	hash := sha1.Sum([]byte(trackerKey))
+	// sanitizeFilename yields pure ASCII, so a byte slice is rune-safe.
+	hint := sanitizeFilename(filename)
+	if len(hint) > chunkUploadTempNameHintMax {
+		hint = hint[:chunkUploadTempNameHintMax]
+	}
 	return filepath.Join(
 		tempDir,
-		fmt.Sprintf(
-			"sesamefs_upload_%s_%s_%s",
-			sanitizeFilename(token),
-			sanitizeFilename(filename),
-			hex.EncodeToString(hash[:]),
-		),
+		fmt.Sprintf("sesamefs_upload_%s_%s", hex.EncodeToString(hash[:]), hint),
 	)
 }
 
@@ -503,8 +509,9 @@ func (cm *ChunkManager) Stop() {
 var chunkManager = NewChunkManager()
 
 // GetOrCreateUploadByIdentity gets or creates a chunk upload tracker for the
-// specific upload identity carried on this request.
-func (cm *ChunkManager) GetOrCreateUploadByIdentity(token, identifier, filename, parentDir string, totalSize int64) (*ChunkUpload, error) {
+// specific upload identity carried on this request. Argument order matches
+// GetUploadByIdentity / chunkUploadTrackerKey (parentDir before filename).
+func (cm *ChunkManager) GetOrCreateUploadByIdentity(token, identifier, parentDir, filename string, totalSize int64) (*ChunkUpload, error) {
 	key := chunkUploadTrackerKey(token, identifier, parentDir, filename, totalSize)
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -514,7 +521,7 @@ func (cm *ChunkManager) GetOrCreateUploadByIdentity(token, identifier, filename,
 	}
 
 	// Create temp file
-	tempPath := chunkUploadTempPath(cm.tempDir, key, token, filename)
+	tempPath := chunkUploadTempPath(cm.tempDir, key, filename)
 	tempFile, err := os.OpenFile(tempPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
@@ -543,14 +550,14 @@ func (cm *ChunkManager) GetOrCreateUploadByIdentity(token, identifier, filename,
 		updatedAt:   cm.now(),
 	}
 	cm.uploads[key] = upload
-	log.Printf("[ChunkManager] Created upload tracker: %s, totalSize=%d", key, totalSize)
+	log.Printf("[ChunkManager] Created upload tracker: op=%s file=%s dir=%s totalSize=%d", upload.OperationID, filename, parentDir, totalSize)
 	return upload, nil
 }
 
 // GetOrCreateUpload is the legacy helper used by tests and callers that do not
 // carry a resumable identifier.
 func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, totalSize int64) (*ChunkUpload, error) {
-	return cm.GetOrCreateUploadByIdentity(token, "", filename, parentDir, totalSize)
+	return cm.GetOrCreateUploadByIdentity(token, "", parentDir, filename, totalSize)
 }
 
 func (cm *ChunkManager) GetUploadByIdentity(token, identifier, parentDir, filename string, totalSize int64) *ChunkUpload {
@@ -1021,7 +1028,7 @@ func (cm *ChunkManager) cleanupUploadByKey(key string) {
 	if upload, exists := cm.uploads[key]; exists {
 		upload.Cleanup()
 		delete(cm.uploads, key)
-		log.Printf("[ChunkManager] Cleaned up upload: %s", key)
+		log.Printf("[ChunkManager] Cleaned up upload: op=%s file=%s", upload.OperationID, upload.Filename)
 	}
 }
 
@@ -1054,7 +1061,7 @@ func (cm *ChunkManager) CleanupUpload(token, filename string) {
 		}
 		upload.Cleanup()
 		delete(cm.uploads, key)
-		log.Printf("[ChunkManager] Cleaned up upload: %s", key)
+		log.Printf("[ChunkManager] Cleaned up upload: op=%s file=%s", upload.OperationID, upload.Filename)
 	}
 }
 
@@ -1659,8 +1666,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		// this is a late retry of the final chunk (the winner published and the
 		// tracker was already cleaned up). Answer with the real file id so the
 		// client builds the dirent instead of failing with "could not be
-		// confirmed".
-		if cached, ok := chunkManager.LookupFinalizeOutcome(tokenStr, uploadIdentifier, parentDir, filename, total); ok {
+		// confirmed". Only short-circuit for the final chunk (end == total-1):
+		// the only chunk a client retries after finalize is the one that carried
+		// the finalize, so we never hand out metadata to an earlier-chunk request.
+		isFinalChunk := total > 0 && end == total-1
+		if cached, ok := chunkManager.LookupFinalizeOutcome(tokenStr, uploadIdentifier, parentDir, filename, total); ok && isFinalChunk {
 			log.Printf("[HandleUpload] Returning cached finalize result for late retry: %s", filename)
 			if retJSON {
 				c.JSON(http.StatusOK, []gin.H{{"name": cached.actualFilename, "id": cached.fileID, "size": strconv.FormatInt(cached.totalSize, 10)}})
@@ -1684,7 +1694,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 
 		// Chunked upload: stream chunk data directly to temp file (no io.ReadAll)
-		upload, err := chunkManager.GetOrCreateUploadByIdentity(tokenStr, uploadIdentifier, filename, parentDir, total)
+		upload, err := chunkManager.GetOrCreateUploadByIdentity(tokenStr, uploadIdentifier, parentDir, filename, total)
 		if err != nil {
 			log.Printf("[HandleUpload] Failed to create upload tracker: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize upload"})
