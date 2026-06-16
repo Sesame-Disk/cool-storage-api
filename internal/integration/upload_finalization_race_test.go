@@ -692,6 +692,62 @@ func TestChunkedUploadConcurrentFinalChunksResolveToSameFile(t *testing.T) {
 	expectEntriesAbsent(t, repoID, "/", []string{"concurrent-final (1).txt"})
 }
 
+// Two active chunked uploads under the SAME token may legitimately share a
+// basename when they target different directories (folder uploads, or explicit
+// parent_dir overrides). Their trackers and temp files must stay isolated so
+// each finalizes into its own directory instead of one upload consuming the
+// other's first chunk and leaving the sibling missing.
+func TestChunkedUploadSameBasenameDifferentDirsStayIsolated(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-same-basename-different-dirs-%d", time.Now().UnixNano()))
+	for _, dirPath := range []string{"/a", "/b"} {
+		resp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=%s", repoID, url.QueryEscape(dirPath)), map[string]string{})
+		expectStatus(t, resp, http.StatusCreated)
+		resp.Body.Close()
+	}
+
+	uploadURL := getUploadLink(t, adminClient, repoID, "/")
+	retJSONUploadURL := uploadURL + "?ret-json=1"
+
+	fileName := "same.txt"
+	contentA := []byte("AAAAAaaaaa")
+	contentB := []byte("BBBBBbbbbb")
+
+	for _, tc := range []struct {
+		parentDir    string
+		content      []byte
+		contentRange string
+	}{
+		{parentDir: "/a", content: contentA[:5], contentRange: "bytes 0-4/10"},
+		{parentDir: "/b", content: contentB[:5], contentRange: "bytes 0-4/10"},
+	} {
+		status, body := uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, tc.parentDir, tc.content, tc.contentRange)
+		if status != http.StatusOK {
+			t.Fatalf("first chunk for %s status = %d, want %d; body=%s", tc.parentDir, status, http.StatusOK, body)
+		}
+	}
+
+	for _, tc := range []struct {
+		parentDir    string
+		content      []byte
+		contentRange string
+	}{
+		{parentDir: "/a", content: contentA[5:], contentRange: "bytes 5-9/10"},
+		{parentDir: "/b", content: contentB[5:], contentRange: "bytes 5-9/10"},
+	} {
+		status, body := uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, tc.parentDir, tc.content, tc.contentRange)
+		if status != http.StatusOK {
+			t.Fatalf("final chunk for %s status = %d, want %d; body=%s", tc.parentDir, status, http.StatusOK, body)
+		}
+		var payload []map[string]interface{}
+		if err := json.Unmarshal([]byte(body), &payload); err != nil || len(payload) != 1 {
+			t.Fatalf("final chunk for %s did not return a finalize array: %v body=%s", tc.parentDir, err, body)
+		}
+	}
+
+	expectEntriesPresent(t, repoID, "/a", []string{fileName})
+	expectEntriesPresent(t, repoID, "/b", []string{fileName})
+}
+
 func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.T) {
 	requireGCEnabled(t)
 	requireCassandra(t)

@@ -855,7 +855,7 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	var rollbackCalled bool
 	var gotOrgID, gotRepoID string
 	var gotBlockIDs []string
-	var cleanedToken, cleanedFilename string
+	var cleanedUpload *ChunkUpload
 	var gotOperationID string
 	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
@@ -864,14 +864,15 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
-	cleanupChunkUploadFn = func(token, filename string) {
-		cleanedToken = token
-		cleanedFilename = filename
+	cleanupChunkUploadFn = func(upload *ChunkUpload) {
+		cleanedUpload = upload
 	}
 
 	h := &SeafHTTPHandler{}
 	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 	upload := &ChunkUpload{
+		Token:       "upload-token",
+		Filename:    "file.bin",
 		Finalizing:  true,
 		OperationID: "chunk-op-conflict",
 		accountedBlockPosition: map[int]string{
@@ -895,8 +896,8 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b", "block-a"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b", "block-a"})
 	}
-	if cleanedToken != "upload-token" || cleanedFilename != "file.bin" {
-		t.Fatalf("cleanup target = %s/%s, want upload-token/file.bin", cleanedToken, cleanedFilename)
+	if cleanedUpload != upload {
+		t.Fatal("cleanup should target the tracked upload instance")
 	}
 	if !upload.Finalizing {
 		t.Fatal("conflict cleanup should not reset tracker state before cleanup")
@@ -923,7 +924,7 @@ func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing
 		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
-	cleanupChunkUploadFn = func(token, filename string) {
+	cleanupChunkUploadFn = func(upload *ChunkUpload) {
 		cleanupCalled = true
 	}
 
@@ -970,7 +971,7 @@ func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
 	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 	}
-	cleanupChunkUploadFn = func(token, filename string) {
+	cleanupChunkUploadFn = func(upload *ChunkUpload) {
 		cleanupCalled = true
 	}
 
@@ -1008,7 +1009,7 @@ func TestHandleChunkedFinalizeError_CleansUpUnknownBlockMutationOutcome(t *testi
 		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
-	cleanupChunkUploadFn = func(token, filename string) {
+	cleanupChunkUploadFn = func(upload *ChunkUpload) {
 		cleanupCalled = true
 	}
 
@@ -2124,6 +2125,72 @@ func TestChunkManagerGetOrCreateUpload(t *testing.T) {
 	cm.CleanupUpload("token2", "file.txt")
 }
 
+func TestChunkManagerTracksSameBasenameSeparatelyByIdentityAndPath(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	uploadA, err := cm.GetOrCreateUploadByIdentity("token1", "ident-a", "file.txt", "/a", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadByIdentity(uploadA) failed: %v", err)
+	}
+	uploadAAgain, err := cm.GetOrCreateUploadByIdentity("token1", "ident-a", "file.txt", "/a", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadByIdentity(uploadA again) failed: %v", err)
+	}
+	if uploadAAgain != uploadA {
+		t.Fatal("same upload identity should reuse the tracked upload")
+	}
+
+	uploadB, err := cm.GetOrCreateUploadByIdentity("token1", "ident-b", "file.txt", "/b", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadByIdentity(uploadB) failed: %v", err)
+	}
+	defer cm.CleanupTrackedUpload(uploadB)
+
+	if uploadA == uploadB {
+		t.Fatal("different upload identities/paths must not share a tracker")
+	}
+	if uploadA.TempPath == uploadB.TempPath {
+		t.Fatalf("different tracked uploads must not share a temp path: %s", uploadA.TempPath)
+	}
+	if got := cm.GetUploadByIdentity("token1", "ident-a", "/a", "file.txt", 10); got != uploadA {
+		t.Fatal("GetUploadByIdentity should return uploadA")
+	}
+	if got := cm.GetUploadByIdentity("token1", "ident-b", "/b", "file.txt", 10); got != uploadB {
+		t.Fatal("GetUploadByIdentity should return uploadB")
+	}
+
+	cm.CleanupTrackedUpload(uploadA)
+	if got := cm.GetUploadByIdentity("token1", "ident-a", "/a", "file.txt", 10); got != nil {
+		t.Fatal("cleanup of uploadA should remove only uploadA")
+	}
+	if got := cm.GetUploadByIdentity("token1", "ident-b", "/b", "file.txt", 10); got != uploadB {
+		t.Fatal("cleanup of uploadA must not remove uploadB")
+	}
+}
+
+func TestChunkManagerFallbackTrackerKeySeparatesRepeatedBasenamesAcrossParentDirs(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	uploadA, err := cm.GetOrCreateUpload("token1", "same.txt", "/a", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload(uploadA) failed: %v", err)
+	}
+	defer cm.CleanupTrackedUpload(uploadA)
+
+	uploadB, err := cm.GetOrCreateUpload("token1", "same.txt", "/b", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload(uploadB) failed: %v", err)
+	}
+	defer cm.CleanupTrackedUpload(uploadB)
+
+	if uploadA == uploadB {
+		t.Fatal("different parent dirs must not share a fallback tracker")
+	}
+	if uploadA.TempPath == uploadB.TempPath {
+		t.Fatalf("different fallback trackers must not share a temp path: %s", uploadA.TempPath)
+	}
+}
+
 func TestChunkUploadWriteAndRead(t *testing.T) {
 	cm := NewChunkManager()
 
@@ -3083,6 +3150,9 @@ func TestChunkUploadQuotaPrecheckCacheMatchesMetadata(t *testing.T) {
 	}
 	if got := cm.GetUpload("token1", "test.bin"); got != upload {
 		t.Fatal("GetUpload should return the tracked upload instance")
+	}
+	if got := cm.GetUploadByIdentity("token1", "", "/docs", "test.bin", 10); got != upload {
+		t.Fatal("GetUploadByIdentity should return the tracked upload instance")
 	}
 	if got := cm.GetUpload("token1", "missing.bin"); got != nil {
 		t.Fatal("GetUpload should return nil for unknown uploads")

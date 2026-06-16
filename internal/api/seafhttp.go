@@ -285,9 +285,11 @@ var _ TokenStore = (*TokenManager)(nil)
 // ChunkUpload tracks an ongoing chunked upload
 type ChunkUpload struct {
 	Token       string
+	Identifier  string
 	Filename    string
 	ParentDir   string
 	TotalSize   int64
+	TrackerKey  string
 	OperationID string
 	TempFile    *os.File
 	TempPath    string
@@ -418,6 +420,32 @@ func chunkFinalizeOutcomeKey(token, identifier, parentDir, filename string) stri
 	return token + "\x00" + identifier + "\x00" + parentDir + "\x00" + filename
 }
 
+// chunkUploadTrackerKey identifies the active in-memory/temp-file tracker for a
+// chunked upload. Prefer the per-upload resumable identifier when present; it
+// uniquely distinguishes retries of the same upload from a brand-new upload of
+// the same path. When no identifier is available, fall back to parentDir +
+// filename + totalSize so folder uploads with repeated basenames still isolate
+// their temp files and progress trackers.
+func chunkUploadTrackerKey(token, identifier, parentDir, filename string, totalSize int64) string {
+	if identifier != "" {
+		return token + "\x00" + identifier + "\x00" + parentDir + "\x00" + filename + "\x00" + strconv.FormatInt(totalSize, 10)
+	}
+	return token + "\x00" + parentDir + "\x00" + filename + "\x00" + strconv.FormatInt(totalSize, 10)
+}
+
+func chunkUploadTempPath(tempDir, trackerKey, token, filename string) string {
+	hash := sha1.Sum([]byte(trackerKey))
+	return filepath.Join(
+		tempDir,
+		fmt.Sprintf(
+			"sesamefs_upload_%s_%s_%s",
+			sanitizeFilename(token),
+			sanitizeFilename(filename),
+			hex.EncodeToString(hash[:]),
+		),
+	)
+}
+
 // CacheFinalizeOutcome records a successful finalize result so a late final-chunk
 // retry (after CleanupUpload removed the tracker) can still be answered with the
 // real file id. No-op when identifier is empty. totalSize is matched on lookup
@@ -474,9 +502,10 @@ func (cm *ChunkManager) Stop() {
 // Global chunk manager instance
 var chunkManager = NewChunkManager()
 
-// GetOrCreateUpload gets or creates a chunk upload tracker
-func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, totalSize int64) (*ChunkUpload, error) {
-	key := token + ":" + filename
+// GetOrCreateUploadByIdentity gets or creates a chunk upload tracker for the
+// specific upload identity carried on this request.
+func (cm *ChunkManager) GetOrCreateUploadByIdentity(token, identifier, filename, parentDir string, totalSize int64) (*ChunkUpload, error) {
+	key := chunkUploadTrackerKey(token, identifier, parentDir, filename, totalSize)
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -485,7 +514,7 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 	}
 
 	// Create temp file
-	tempPath := filepath.Join(cm.tempDir, fmt.Sprintf("sesamefs_upload_%s_%s", token, sanitizeFilename(filename)))
+	tempPath := chunkUploadTempPath(cm.tempDir, key, token, filename)
 	tempFile, err := os.OpenFile(tempPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
@@ -502,9 +531,11 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 
 	upload := &ChunkUpload{
 		Token:       token,
+		Identifier:  identifier,
 		Filename:    filename,
 		ParentDir:   parentDir,
 		TotalSize:   totalSize,
+		TrackerKey:  key,
 		OperationID: newSeafHTTPUploadOperationID(token),
 		TempFile:    tempFile,
 		TempPath:    tempPath,
@@ -516,11 +547,28 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 	return upload, nil
 }
 
-func (cm *ChunkManager) GetUpload(token, filename string) *ChunkUpload {
-	key := token + ":" + filename
+// GetOrCreateUpload is the legacy helper used by tests and callers that do not
+// carry a resumable identifier.
+func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, totalSize int64) (*ChunkUpload, error) {
+	return cm.GetOrCreateUploadByIdentity(token, "", filename, parentDir, totalSize)
+}
+
+func (cm *ChunkManager) GetUploadByIdentity(token, identifier, parentDir, filename string, totalSize int64) *ChunkUpload {
+	key := chunkUploadTrackerKey(token, identifier, parentDir, filename, totalSize)
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 	return cm.uploads[key]
+}
+
+func (cm *ChunkManager) GetUpload(token, filename string) *ChunkUpload {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	for _, upload := range cm.uploads {
+		if upload.Token == token && upload.Filename == filename {
+			return upload
+		}
+	}
+	return nil
 }
 
 // janitorLoop periodically reaps stale chunk uploads from memory and disk.
@@ -966,13 +1014,44 @@ func (cu *ChunkUpload) Cleanup() error {
 	return os.Remove(cu.TempPath)
 }
 
-// CleanupUpload removes an upload from tracking
-func (cm *ChunkManager) CleanupUpload(token, filename string) {
-	key := token + ":" + filename
+func (cm *ChunkManager) cleanupUploadByKey(key string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
 	if upload, exists := cm.uploads[key]; exists {
+		upload.Cleanup()
+		delete(cm.uploads, key)
+		log.Printf("[ChunkManager] Cleaned up upload: %s", key)
+	}
+}
+
+func (cm *ChunkManager) CleanupUploadByIdentity(token, identifier, parentDir, filename string, totalSize int64) {
+	cm.cleanupUploadByKey(chunkUploadTrackerKey(token, identifier, parentDir, filename, totalSize))
+}
+
+func (cm *ChunkManager) CleanupTrackedUpload(upload *ChunkUpload) {
+	if upload == nil {
+		return
+	}
+	if upload.TrackerKey != "" {
+		cm.cleanupUploadByKey(upload.TrackerKey)
+		return
+	}
+	cm.CleanupUpload(upload.Token, upload.Filename)
+}
+
+// CleanupUpload removes tracked uploads matching the legacy token/filename
+// lookup. Production chunked uploads should prefer CleanupTrackedUpload or
+// CleanupUploadByIdentity so same-basename uploads in different paths stay
+// isolated.
+func (cm *ChunkManager) CleanupUpload(token, filename string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	for key, upload := range cm.uploads {
+		if upload.Token != token || upload.Filename != filename {
+			continue
+		}
 		upload.Cleanup()
 		delete(cm.uploads, key)
 		log.Printf("[ChunkManager] Cleaned up upload: %s", key)
@@ -1591,7 +1670,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			return
 		}
 
-		existingUpload := chunkManager.GetUpload(tokenStr, filename)
+		existingUpload := chunkManager.GetUploadByIdentity(tokenStr, uploadIdentifier, parentDir, filename, total)
 		if existingUpload == nil || !existingUpload.HasQuotaPrecheck(parentDir, total, replaceFile) {
 			if _, _, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, total, replaceFile); err != nil {
 				log.Printf("[HandleUpload] Chunked upload storage quota check failed: %v", err)
@@ -1605,7 +1684,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 
 		// Chunked upload: stream chunk data directly to temp file (no io.ReadAll)
-		upload, err := chunkManager.GetOrCreateUpload(tokenStr, filename, parentDir, total)
+		upload, err := chunkManager.GetOrCreateUploadByIdentity(tokenStr, uploadIdentifier, filename, parentDir, total)
 		if err != nil {
 			log.Printf("[HandleUpload] Failed to create upload tracker: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize upload"})
@@ -1688,7 +1767,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		// Cache the outcome before removing the tracker so a final-chunk retry
 		// arriving in the residual window (after cleanup) still gets the file id.
 		chunkManager.CacheFinalizeOutcome(tokenStr, uploadIdentifier, parentDir, filename, fileID, actualFilename, total)
-		chunkManager.CleanupUpload(tokenStr, filename)
+		chunkManager.CleanupTrackedUpload(upload)
 
 		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, total, fileID[:16])
 
@@ -1890,8 +1969,8 @@ var releaseUploadedBlockRefsFn = v2.ReleaseUploadedBlockRefs
 
 var zipBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDs
 
-var cleanupChunkUploadFn = func(token, filename string) {
-	chunkManager.CleanupUpload(token, filename)
+var cleanupChunkUploadFn = func(upload *ChunkUpload) {
+	chunkManager.CleanupTrackedUpload(upload)
 }
 
 func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenStr, filename string, upload *ChunkUpload, err error) {
@@ -1927,7 +2006,7 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 				accountedBlockIDs,
 			)
 		}
-		cleanupChunkUploadFn(tokenStr, filename)
+		cleanupChunkUploadFn(upload)
 		return
 	}
 	upload.ResetFinalization()
