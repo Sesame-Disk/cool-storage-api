@@ -826,8 +826,11 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-chunked-conflict-reupload-%d", time.Now().UnixNano()))
 	orgID := resolveOrgID(t, repoID)
 	session := shareProjectionDBForTest(t).Session()
-	setHeadCommit := func(head string) error {
-		if err := session.Query(`UPDATE libraries SET head_commit_id = ? WHERE org_id = ? AND library_id = ?`, head, orgID, repoID).Exec(); err != nil {
+	setCanonicalHeadCommit := func(head string) error {
+		return session.Query(`UPDATE libraries SET head_commit_id = ? WHERE org_id = ? AND library_id = ?`, head, orgID, repoID).Exec()
+	}
+	restoreHeadCommit := func(head string) error {
+		if err := setCanonicalHeadCommit(head); err != nil {
 			return err
 		}
 		return session.Query(`UPDATE libraries_by_id SET head_commit_id = ? WHERE library_id = ?`, head, repoID).Exec()
@@ -849,16 +852,18 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 	// test. Cassandra volumes outlive the docker-compose test runner, so
 	// leaving thousands of rows behind would inflate counter-sensitive tests
 	// like the GC queue snapshot reconciliation suite on subsequent runs.
-	var churnTrackerMu sync.Mutex
-	churnedCommits := make([]string, 0, 4096)
+	const churnCommitBudget = 8192
+	churnedCommits := make([]string, 0, churnCommitBudget)
 	t.Cleanup(func() {
-		churnTrackerMu.Lock()
-		commitsToDelete := append([]string(nil), churnedCommits...)
-		churnTrackerMu.Unlock()
-		for _, head := range commitsToDelete {
+		for _, head := range churnedCommits {
 			if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, head).Exec(); err != nil {
 				t.Logf("cleanup: delete churn commit %s failed: %v", head, err)
 			}
+		}
+	})
+	t.Cleanup(func() {
+		if err := restoreHeadCommit(currentHead); err != nil {
+			t.Logf("cleanup: restore stable head %s failed: %v", currentHead, err)
 		}
 	})
 	uploadURL := getUploadLink(t, adminClient, repoID, "/")
@@ -886,12 +891,24 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 		t.Fatalf("first chunk status = %d, want 200/201; body=%s", status, body)
 	}
 
-	// Churn the canonical HEAD continuously by generating a fresh commit on
-	// every iteration. Each value is unique, so the server's snapshot is
-	// guaranteed stale before it reaches CAS, and the churn keeps running
-	// until we stop it — covering the full ~9s upload-finalize retry budget
-	// without any chance of accidental alignment with the snapshot value.
+	// Pre-create a large pool of unique commit IDs, then churn only the
+	// canonical libraries row during finalize. This removes the previous
+	// INSERT + sleep gaps that occasionally let an upload retry align with the
+	// current HEAD and succeed after several seconds of conflicts.
 	seedBase := time.Now().UnixNano()
+	churnHeads := make([]string, 0, churnCommitBudget)
+	for i := 0; i < churnCommitBudget; i++ {
+		head := fmt.Sprintf("%040x", seedBase+int64(i)+1)
+		if err := session.Query(`
+			INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, repoID, head, currentHead, rootFSID, defaultOrgID, fmt.Sprintf("synthetic churn %d", i+1), time.Now()).Exec(); err != nil {
+			t.Fatalf("failed to precreate churn commit %s: %v", head, err)
+		}
+		churnHeads = append(churnHeads, head)
+		churnedCommits = append(churnedCommits, head)
+	}
+
 	stop := make(chan struct{})
 	errCh := make(chan error, 1)
 	churnStarted := make(chan struct{}, 1)
@@ -899,42 +916,21 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		var churnIndex int64
-		for {
+		for idx := 0; ; idx++ {
 			select {
 			case <-stop:
 				return
 			default:
 			}
-			churnIndex++
-			head := fmt.Sprintf("%040x", seedBase+churnIndex)
-			// creator_id is a UUID column; the existing
-			// insertSyntheticCommitForTest helper uses defaultOrgID for the
-			// same reason. Any valid UUID works — the value is only inspected
-			// when resolving the original commit author, which churn rows
-			// never participate in.
-			if err := session.Query(`
-				INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?)
-			`, repoID, head, currentHead, rootFSID, defaultOrgID, fmt.Sprintf("synthetic churn %d", churnIndex), time.Now()).Exec(); err == nil {
-				churnTrackerMu.Lock()
-				churnedCommits = append(churnedCommits, head)
-				churnTrackerMu.Unlock()
-			} else {
-				select {
-				case errCh <- fmt.Errorf("insert churn commit %s: %w", head, err):
-				default:
-				}
-				return
-			}
-			if err := setHeadCommit(head); err != nil {
+			head := churnHeads[idx%len(churnHeads)]
+			if err := setCanonicalHeadCommit(head); err != nil {
 				select {
 				case errCh <- fmt.Errorf("advance head %s: %w", head, err):
 				default:
 				}
 				return
 			}
-			if churnIndex == 32 {
+			if idx == 31 {
 				select {
 				case churnStarted <- struct{}{}:
 				default:
@@ -954,12 +950,11 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 		wg.Wait()
 		t.Fatalf("head churn did not start within 10s; current head=%s", readHeadCommit())
 	}
-	time.Sleep(100 * time.Millisecond)
 
 	status, body = uploadChunkThroughLinkStatus(t, adminClient, uploadURL, fileName, "/", fileContent[len(fileContent)/2:], fmt.Sprintf("bytes %d-%d/%d", len(fileContent)/2, len(fileContent)-1, len(fileContent)))
 	close(stop)
 	wg.Wait()
-	if err := setHeadCommit(currentHead); err != nil {
+	if err := restoreHeadCommit(currentHead); err != nil {
 		t.Fatalf("failed to restore stable head %s after churn: %v", currentHead, err)
 	}
 	select {

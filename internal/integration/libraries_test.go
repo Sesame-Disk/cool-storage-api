@@ -53,14 +53,19 @@ func TestRenameLibrary(t *testing.T) {
 	expectStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
-	// Verify name changed
-	getResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
-	expectStatus(t, getResp, http.StatusOK)
-
-	result := responseJSON(t, getResp)
-	if result["repo_name"] != newName {
-		t.Errorf("expected repo_name %q, got %v", newName, result["repo_name"])
-	}
+	// Rename writes through /api2 but this assertion reads the projection-backed
+	// v2.1 library detail surface. Poll until the read model converges instead of
+	// assuming immediate read-after-write visibility from the shared integration
+	// stack.
+	waitForIntegrationCondition(t, "renamed library to appear in library detail", func() bool {
+		getResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+		if getResp.StatusCode != http.StatusOK {
+			getResp.Body.Close()
+			return false
+		}
+		result := responseJSON(t, getResp)
+		return result["repo_name"] == newName
+	})
 }
 
 func TestDeleteLibrary(t *testing.T) {

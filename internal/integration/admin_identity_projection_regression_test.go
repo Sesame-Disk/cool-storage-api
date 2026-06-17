@@ -196,7 +196,7 @@ func TestAdminIdentityProjectionRegression_HardDeleteUser(t *testing.T) {
 		t.Fatalf("hard delete user failed: %v", err)
 	}
 
-	waitForIntegrationCondition(t, "hard-deleted user to disappear from canonical and admin projections", func() bool {
+	waitForIntegrationCondition(t, "hard-deleted user to disappear from canonical rows and admin projections", func() bool {
 		if canonicalUserExists(t, orgID, userID, userEmail) {
 			return false
 		}
@@ -207,6 +207,10 @@ func TestAdminIdentityProjectionRegression_HardDeleteUser(t *testing.T) {
 		if !ok || orgRow.UsersCount != 1 || orgRow.OwnerEmail != ownerEmail {
 			return false
 		}
+		return true
+	})
+
+	waitForIntegrationCondition(t, "hard-deleted user to disappear from admin user search", func() bool {
 		return !adminUserPresentInSearch(t, userEmail, "user")
 	})
 }

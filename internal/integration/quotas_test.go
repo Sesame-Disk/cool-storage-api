@@ -63,7 +63,8 @@ func TestQuotaFieldsAppearInUserResponses(t *testing.T) {
 
 func TestInvalidUserQuotaUpdatesAreRejected(t *testing.T) {
 	original := getAdminOrganizationInfo(t, defaultOrgID)
-	restoreOrgQuotasOnCleanup(t, original)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, original, originalUser)
 
 	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
 		"storage_quota":          testStorageQuota,
@@ -71,6 +72,7 @@ func TestInvalidUserQuotaUpdatesAreRejected(t *testing.T) {
 		"traffic_upload_quota":   0,
 		"traffic_download_quota": 0,
 	})
+	setDefaultUserQuota(t, testStorageQuota)
 
 	body := map[string]interface{}{
 		"traffic_upload_quota":   invalidTrafficUpload,
@@ -149,8 +151,12 @@ func TestDeduplicatedBlockUploadSkipsStorageQuota(t *testing.T) {
 		"quota_policy":  "hard",
 	})
 
+	baselineUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
 	updateResp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
-		"quota_total": int64(len(blockContent) + 16),
+		// These integration tests share the default user, so quota_usage may
+		// already be non-zero from earlier tests even when cleanup is working.
+		// Budget relative to the live baseline instead of assuming an empty user.
+		"quota_total": baselineUsage + int64(len(blockContent)) + 16,
 	})
 	expectStatus(t, updateResp, http.StatusOK)
 	updateResp.Body.Close()
@@ -196,8 +202,12 @@ func TestDeduplicatedSyncBlockUploadSkipsStorageQuota(t *testing.T) {
 		"quota_policy":  "hard",
 	})
 
+	baselineUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
 	updateResp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
-		"quota_total": int64(len(blockContent) + 16),
+		// These integration tests share the default user, so quota_usage may
+		// already be non-zero from earlier tests even when cleanup is working.
+		// Budget relative to the live baseline instead of assuming an empty user.
+		"quota_total": baselineUsage + int64(len(blockContent)) + 16,
 	})
 	expectStatus(t, updateResp, http.StatusOK)
 	updateResp.Body.Close()
@@ -492,22 +502,56 @@ func updateAdminOrganizationQuotas(t *testing.T, orgID string, body map[string]i
 func restoreDefaultOrgAndUserQuotasOnCleanup(t *testing.T, originalOrg, originalUser map[string]interface{}) {
 	t.Helper()
 	t.Cleanup(func() {
+		maxInt64 := func(a, b int64) int64 {
+			if b > a {
+				return b
+			}
+			return a
+		}
+
 		originalUserQuota := jsonInt64(originalUser, "quota_total")
 		originalOrgStorageQuota := jsonInt64(originalOrg, "storage_quota")
 		restoreStorageQuota := originalOrgStorageQuota
 		if originalUserQuota > restoreStorageQuota {
 			restoreStorageQuota = originalUserQuota
 		}
-		if restoreStorageQuota > 0 {
-			// These tests mutate the shared default org/user quota and must run
-			// serially for defaultOrgID; do not add t.Parallel() around them.
-			updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
-				"storage_quota": restoreStorageQuota,
-			})
+
+		originalUserUploadQuota := jsonInt64(originalUser, "traffic_upload_quota")
+		originalUserDownloadQuota := jsonInt64(originalUser, "traffic_download_quota")
+		restoreTrafficQuota := jsonInt64(originalOrg, "traffic_quota")
+		if restoreTrafficQuota > 0 {
+			restoreTrafficQuota = maxInt64(restoreTrafficQuota, originalUserUploadQuota)
+			restoreTrafficQuota = maxInt64(restoreTrafficQuota, originalUserDownloadQuota)
+			if originalUserUploadQuota > 0 && originalUserDownloadQuota > 0 {
+				restoreTrafficQuota = maxInt64(restoreTrafficQuota, originalUserUploadQuota+originalUserDownloadQuota)
+			}
+		}
+		restoreTrafficUploadQuota := jsonInt64(originalOrg, "traffic_upload_quota")
+		if restoreTrafficUploadQuota > 0 {
+			restoreTrafficUploadQuota = maxInt64(restoreTrafficUploadQuota, originalUserUploadQuota)
+		}
+		restoreTrafficDownloadQuota := jsonInt64(originalOrg, "traffic_download_quota")
+		if restoreTrafficDownloadQuota > 0 {
+			restoreTrafficDownloadQuota = maxInt64(restoreTrafficDownloadQuota, originalUserDownloadQuota)
 		}
 
+		// These tests mutate the shared default org/user quota and must run
+		// serially for defaultOrgID; do not add t.Parallel() around them.
+		tempOrgBody := map[string]interface{}{
+			"storage_quota":          restoreStorageQuota,
+			"traffic_quota":          restoreTrafficQuota,
+			"traffic_upload_quota":   restoreTrafficUploadQuota,
+			"traffic_download_quota": restoreTrafficDownloadQuota,
+		}
+		if quotaPolicy := jsonString(originalOrg, "quota_policy"); quotaPolicy != "" {
+			tempOrgBody["quota_policy"] = quotaPolicy
+		}
+		updateAdminOrganizationQuotas(t, defaultOrgID, tempOrgBody)
+
 		restoreResp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
-			"quota_total": originalUserQuota,
+			"quota_total":            originalUserQuota,
+			"traffic_upload_quota":   originalUserUploadQuota,
+			"traffic_download_quota": originalUserDownloadQuota,
 		})
 		if restoreResp.StatusCode != http.StatusOK {
 			t.Logf("restore default user quota returned status %d body=%s", restoreResp.StatusCode, responseBody(t, restoreResp))

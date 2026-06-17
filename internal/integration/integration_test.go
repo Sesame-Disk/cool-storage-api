@@ -162,7 +162,8 @@ func createLibraryWithBody(t *testing.T, c *testClient, name string, body interf
 func createLibraryForTest(t *testing.T, c *testClient, name string, body interface{}, cleanup bool) string {
 	t.Helper()
 
-	for attempt := 0; attempt < 2; attempt++ {
+	const maxAttempts = 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		repoID, limitReached := tryCreateLibrary(t, c, name, body)
 		if repoID != "" {
 			liveRepoIDs.Store(repoID, struct{}{})
@@ -190,10 +191,20 @@ func createLibraryForTest(t *testing.T, c *testClient, name string, body interfa
 		}
 
 		deleted := cleanupTestLibrariesAcrossKnownUsers(t)
-		if deleted == 0 {
+		if deleted > 0 {
+			t.Logf("cleaned up %d stale test libraries after hitting the library limit while creating %q", deleted, name)
+		} else if attempt == maxAttempts-1 {
 			t.Fatalf("failed to create library %q: library limit reached and no stale test libraries were available for cleanup", name)
+		} else {
+			t.Logf("library limit reached while creating %q but no stale test libraries were available; waiting for active-library projections to converge before retrying", name)
 		}
-		t.Logf("cleaned up %d stale test libraries after hitting the library limit while creating %q", deleted, name)
+
+		// Library creation enforcement reads the projection-backed active-library
+		// count. After a previous test cleanup, that projection can lag briefly
+		// behind the delete that already made the library disappear from the owned
+		// repo list, so an immediate retry can still see the stale count. Give the
+		// shared integration environment a short convergence window before retrying.
+		time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
 	}
 
 	t.Fatalf("failed to create library %q after retrying", name)

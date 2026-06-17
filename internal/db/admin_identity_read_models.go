@@ -355,6 +355,12 @@ func ReadAdminUserProjectionState(session *gocql.Session, userID string) (AdminU
 	return state, nil
 }
 
+func adminUserProjectionStateMatchesEntry(state AdminUserProjectionState, orgID string, createdAt time.Time, status string) bool {
+	return state.OrgID == orgID &&
+		state.CreatedAt.Equal(createdAt) &&
+		state.Status == normalizeAdminProjectionStatus(status)
+}
+
 func addDeleteAdminUserProjectionEntryQuery(batch *gocql.Batch, orgID, userID, status string, createdAt time.Time) {
 	status = normalizeAdminProjectionStatus(status)
 	bucketDay := AdminUserBucketDay(createdAt)
@@ -515,11 +521,11 @@ func ListAdminUserRows(session *gocql.Session, statusFilter string) ([]AdminUser
 					_ = iter.Close()
 					return nil, stateErr
 				}
-				if state.Status != statusFilter || state.OrgID != row.OrgID || !state.CreatedAt.Equal(row.CreatedAt) {
+				if !adminUserProjectionStateMatchesEntry(state, row.OrgID, row.CreatedAt, statusFilter) {
 					row = AdminUserProjectionRow{}
 					continue
 				}
-				row.Status = normalizeAdminProjectionStatus(statusFilter)
+				row.Status = state.Status
 				row.LastLoginAt = lastLoginAt
 				rows = append(rows, row)
 				row = AdminUserProjectionRow{}
@@ -533,7 +539,20 @@ func ListAdminUserRows(session *gocql.Session, statusFilter string) ([]AdminUser
 			var row AdminUserProjectionRow
 			var lastLoginAt *time.Time
 			for iter.Scan(&row.CreatedAt, &row.OrgID, &row.UserID, &row.Email, &row.Name, &row.Role, &row.Status, &row.QuotaBytes, &row.QuotaUsage, &lastLoginAt) {
-				row.Status = normalizeAdminProjectionStatus(row.Status)
+				state, stateErr := ReadAdminUserProjectionState(session, row.UserID)
+				if stateErr == gocql.ErrNotFound {
+					row = AdminUserProjectionRow{}
+					continue
+				}
+				if stateErr != nil {
+					_ = iter.Close()
+					return nil, stateErr
+				}
+				if !adminUserProjectionStateMatchesEntry(state, row.OrgID, row.CreatedAt, row.Status) {
+					row = AdminUserProjectionRow{}
+					continue
+				}
+				row.Status = state.Status
 				row.LastLoginAt = lastLoginAt
 				rows = append(rows, row)
 				row = AdminUserProjectionRow{}
