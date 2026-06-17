@@ -86,3 +86,21 @@ S3 zero times; new blocks pay one direct PUT and no HEAD.
 The remaining relay concern is the store-and-forward staging itself (full `/tmp`
 buffering before blocks reach S3) and node-local chunk state — see S-1/S-3 in the
 audit doc.
+
+## 2026-06 Update: Generic multipart uploads no longer serialize parts
+
+`internal/storage/s3.go` `PutLarge` now uploads multipart parts through a bounded
+worker pool instead of sending each part in a strict read/upload loop. This is a
+real improvement for any caller that reaches the generic `PutAuto()` multipart
+path above the 100 MB threshold.
+
+Important limit: this does not remove the dominant relay cost for the default
+SeafHTTP web-upload path. Web finalization still splits uploads into 8 MB blocks
+and stages the complete upload under `/tmp` before those blocks are materialized,
+so the generic multipart path is usually not involved there.
+
+So the practical reading is:
+
+- generic large-object multipart uploads are better than before
+- the main web-upload finalize bottlenecks are still the node-local chunk state
+  and the full temp-file staging model

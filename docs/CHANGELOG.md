@@ -8,6 +8,45 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-06-17 - Generic S3 multipart uploads now send parts concurrently
+
+### Improved
+
+`internal/storage/S3Store.PutLarge` no longer loops over multipart parts
+serially. Large objects that go through `PutAuto()` above the 100 MB multipart
+threshold now upload parts through a bounded worker pool and still complete in
+deterministic part-number order.
+
+This is intentionally a narrow, low-to-medium-risk improvement:
+
+- reads from the source reader stay sequential
+- only `UploadPart` requests run in parallel
+- `CompleteMultipartUpload` still receives the canonical ordered part list
+- failures still abort the multipart upload before returning
+
+### Scope / Limits
+
+This does **not** materially change the default SeafHTTP web-upload finalize
+path. That flow still splits data into 8 MB blocks during finalization, so the
+generic S3 multipart threshold is usually not hit there. The dominant web-upload
+limits remain node-local chunk state and full `/tmp` staging before object-store
+materialization.
+
+### Tests / Docs
+
+- Added multipart unit coverage for concurrent part uploads
+- Added multipart failure coverage to assert best-effort abort on part error
+- Updated the upload performance / technical-debt docs with the new scope note
+
+### Files
+
+- `internal/storage/s3.go`
+- `internal/storage/s3_test.go`
+- `docs/TECHNICAL-DEBT.md`
+- `docs/UPLOAD-S3-RELAY-BOTTLENECK.md`
+
+---
+
 ## 2026-05-22 - Upload-link vs update-link semantics fixed
 
 ### Fixed

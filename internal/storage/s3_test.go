@@ -1,11 +1,17 @@
 package storage
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -23,6 +29,173 @@ func TestMultipartConstants(t *testing.T) {
 	}
 	if MultipartPartSize != 16*1024*1024 {
 		t.Errorf("MultipartPartSize = %d, want 16 MB", MultipartPartSize)
+	}
+	if MultipartUploadConcurrency != 4 {
+		t.Errorf("MultipartUploadConcurrency = %d, want 4", MultipartUploadConcurrency)
+	}
+}
+
+type fakeMultipartUploadClient struct {
+	mu              sync.Mutex
+	createCalls     int
+	completeCalls   int
+	abortCalls      int
+	maxConcurrent   int
+	inFlight        int
+	failPartNumber  int32
+	completedParts  []types.CompletedPart
+	uploadedPartIDs []int32
+	startedCh       chan int32
+	releaseCh       chan struct{}
+}
+
+func (f *fakeMultipartUploadClient) CreateMultipartUpload(_ context.Context, _ *s3.CreateMultipartUploadInput, _ ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createCalls++
+	return &s3.CreateMultipartUploadOutput{UploadId: aws.String("upload-1")}, nil
+}
+
+func (f *fakeMultipartUploadClient) UploadPart(_ context.Context, input *s3.UploadPartInput, _ ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
+	partNumber := aws.ToInt32(input.PartNumber)
+	if _, err := io.ReadAll(input.Body); err != nil {
+		return nil, err
+	}
+
+	f.mu.Lock()
+	f.inFlight++
+	if f.inFlight > f.maxConcurrent {
+		f.maxConcurrent = f.inFlight
+	}
+	f.uploadedPartIDs = append(f.uploadedPartIDs, partNumber)
+	f.mu.Unlock()
+
+	defer func() {
+		f.mu.Lock()
+		f.inFlight--
+		f.mu.Unlock()
+	}()
+
+	if f.startedCh != nil {
+		f.startedCh <- partNumber
+	}
+	if f.releaseCh != nil {
+		select {
+		case <-f.releaseCh:
+		case <-time.After(2 * time.Second):
+			return nil, fmt.Errorf("timed out waiting to release part %d", partNumber)
+		}
+	}
+	if f.failPartNumber != 0 && partNumber == f.failPartNumber {
+		return nil, fmt.Errorf("boom on part %d", partNumber)
+	}
+
+	return &s3.UploadPartOutput{
+		ETag: aws.String(fmt.Sprintf("etag-%d", partNumber)),
+	}, nil
+}
+
+func (f *fakeMultipartUploadClient) CompleteMultipartUpload(_ context.Context, input *s3.CompleteMultipartUploadInput, _ ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.completeCalls++
+	if input.MultipartUpload != nil {
+		f.completedParts = append([]types.CompletedPart(nil), input.MultipartUpload.Parts...)
+	}
+	return &s3.CompleteMultipartUploadOutput{}, nil
+}
+
+func (f *fakeMultipartUploadClient) AbortMultipartUpload(_ context.Context, _ *s3.AbortMultipartUploadInput, _ ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.abortCalls++
+	return &s3.AbortMultipartUploadOutput{}, nil
+}
+
+func TestPutLargeUploadsPartsConcurrently(t *testing.T) {
+	store := &S3Store{bucket: "test-bucket"}
+	client := &fakeMultipartUploadClient{
+		startedCh: make(chan int32, 4),
+		releaseCh: make(chan struct{}),
+	}
+	size := int64(MultipartPartSize + 1)
+	reader := bytes.NewReader(make([]byte, int(size)))
+
+	type result struct {
+		key string
+		err error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		key, err := store.putLargeWithClient(context.Background(), client, "block-123", reader, size)
+		resultCh <- result{key: key, err: err}
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-client.startedCh:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for multipart upload part %d to start", i+1)
+		}
+	}
+	close(client.releaseCh)
+
+	res := <-resultCh
+	key, err := res.key, res.err
+	if err != nil {
+		t.Fatalf("putLargeWithClient() error = %v", err)
+	}
+	if key != "block-123" {
+		t.Fatalf("key = %q, want %q", key, "block-123")
+	}
+	if client.createCalls != 1 {
+		t.Fatalf("CreateMultipartUpload calls = %d, want 1", client.createCalls)
+	}
+	if client.completeCalls != 1 {
+		t.Fatalf("CompleteMultipartUpload calls = %d, want 1", client.completeCalls)
+	}
+	if client.abortCalls != 0 {
+		t.Fatalf("AbortMultipartUpload calls = %d, want 0", client.abortCalls)
+	}
+	if client.maxConcurrent < 2 {
+		t.Fatalf("max concurrent part uploads = %d, want at least 2", client.maxConcurrent)
+	}
+	if len(client.completedParts) != 2 {
+		t.Fatalf("completed parts = %d, want 2", len(client.completedParts))
+	}
+	for i, part := range client.completedParts {
+		wantPartNumber := int32(i + 1)
+		if aws.ToInt32(part.PartNumber) != wantPartNumber {
+			t.Fatalf("completed part[%d] number = %d, want %d", i, aws.ToInt32(part.PartNumber), wantPartNumber)
+		}
+		wantETag := fmt.Sprintf("etag-%d", wantPartNumber)
+		if aws.ToString(part.ETag) != wantETag {
+			t.Fatalf("completed part[%d] etag = %q, want %q", i, aws.ToString(part.ETag), wantETag)
+		}
+	}
+}
+
+func TestPutLargeAbortsMultipartUploadOnPartFailure(t *testing.T) {
+	store := &S3Store{bucket: "test-bucket"}
+	client := &fakeMultipartUploadClient{failPartNumber: 2}
+	size := int64(MultipartPartSize + 1)
+	reader := bytes.NewReader(make([]byte, int(size)))
+
+	_, err := store.putLargeWithClient(context.Background(), client, "block-err", reader, size)
+	if err == nil {
+		t.Fatal("putLargeWithClient() error = nil, want failure")
+	}
+	if !strings.Contains(err.Error(), "failed to upload part 2") {
+		t.Fatalf("error = %v, want upload part 2 failure", err)
+	}
+	if client.createCalls != 1 {
+		t.Fatalf("CreateMultipartUpload calls = %d, want 1", client.createCalls)
+	}
+	if client.completeCalls != 0 {
+		t.Fatalf("CompleteMultipartUpload calls = %d, want 0", client.completeCalls)
+	}
+	if client.abortCalls != 1 {
+		t.Fatalf("AbortMultipartUpload calls = %d, want 1", client.abortCalls)
 	}
 }
 

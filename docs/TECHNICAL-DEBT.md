@@ -287,6 +287,24 @@ reusable/needs-put `finalizeUploadStreaming` paths (`seafhttp_test.go`),
 `EnsureReusableBlockPresent` exists/repair paths and shared retry helper
 (`upload_reuse_test.go`).
 
+**P-2b - Generic S3 multipart uploads still sent parts serially** - Fixed
+(2026-06-17, branch `perf/s3-multipart-parallel-parts`)
+
+`internal/storage/s3.go` `PutLarge` now reads the source stream sequentially but
+submits `UploadPart` requests through a bounded worker pool
+(`MultipartUploadConcurrency = 4`) and preserves deterministic part ordering for
+`CompleteMultipartUpload`. This closes the mismatch where the code comment said
+"supports parallel uploads" while the implementation still did a simple
+read/upload/read/upload loop.
+
+Scope note: this helps callers that reach `S3Store.PutAuto()` above the
+100 MB multipart threshold. It does not materially change the default
+SeafHTTP web finalize path because that flow still splits uploads into 8 MB
+blocks before storing them, so those block PUTs normally stay below the generic
+multipart threshold. The main web-upload relay limits therefore remain S-1/S-3
+below plus the broader store-and-forward finalize shape documented in
+`docs/UPLOAD-S3-RELAY-BOTTLENECK.md`.
+
 ### Remaining Debt
 
 - **Block reads ignore `storage_key`** (pre-existing, surfaced by P-2). Every read

@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"golang.org/x/sync/errgroup"
 )
 
 // S3Store implements the Store interface for S3-compatible storage
@@ -225,6 +226,22 @@ const MultipartThreshold = 100 * 1024 * 1024 // 100 MB
 // MultipartPartSize is the size of each part in multipart upload
 const MultipartPartSize = 16 * 1024 * 1024 // 16 MB per part
 
+// MultipartUploadConcurrency bounds concurrent UploadPart requests for large objects.
+// Reads stay sequential; only the network-bound part uploads run in parallel.
+const MultipartUploadConcurrency = 4
+
+type multipartUploadClient interface {
+	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
+	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
+}
+
+type multipartUploadPart struct {
+	partNumber int32
+	data       []byte
+}
+
 // PutAuto automatically chooses between regular and multipart upload based on size
 func (s *S3Store) PutAuto(ctx context.Context, blockID string, data io.Reader, size int64) (string, error) {
 	if size > MultipartThreshold {
@@ -236,6 +253,10 @@ func (s *S3Store) PutAuto(ctx context.Context, blockID string, data io.Reader, s
 // PutLarge stores a large block using multipart upload
 // This is more reliable for large files and supports parallel uploads
 func (s *S3Store) PutLarge(ctx context.Context, blockID string, data io.Reader, size int64) (string, error) {
+	return s.putLargeWithClient(ctx, s.client, blockID, data, size)
+}
+
+func (s *S3Store) putLargeWithClient(ctx context.Context, client multipartUploadClient, blockID string, data io.Reader, size int64) (string, error) {
 	key := s.key(blockID)
 
 	// Initiate multipart upload
@@ -244,74 +265,29 @@ func (s *S3Store) PutLarge(ctx context.Context, blockID string, data io.Reader, 
 		Key:    aws.String(key),
 	}
 	s.applySSEToCreateMultipartUploadInput(createInput)
-	createResp, err := s.client.CreateMultipartUpload(ctx, createInput)
+	createResp, err := client.CreateMultipartUpload(ctx, createInput)
 	if err != nil {
 		return "", fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
 
 	uploadID := createResp.UploadId
+	abortInput := &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(s.bucket),
+		Key:      aws.String(key),
+		UploadId: uploadID,
+	}
+	abortMultipartUpload := func() {
+		_, _ = client.AbortMultipartUpload(ctx, abortInput)
+	}
 
-	// Upload parts
-	var completedParts []types.CompletedPart
-	partNumber := int32(1)
-	var uploaded int64
-
-	for uploaded < size {
-		// Calculate part size
-		remaining := size - uploaded
-		partSize := int64(MultipartPartSize)
-		if remaining < partSize {
-			partSize = remaining
-		}
-
-		// Read part data into buffer (needed for Content-Length and potential retry)
-		partBuf := make([]byte, partSize)
-		n, err := io.ReadFull(data, partBuf)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			// Abort the multipart upload on error
-			s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-				Bucket:   aws.String(s.bucket),
-				Key:      aws.String(key),
-				UploadId: uploadID,
-			})
-			return "", fmt.Errorf("failed to read part %d: %w", partNumber, err)
-		}
-
-		// Handle short read at end of file
-		if n < len(partBuf) {
-			partBuf = partBuf[:n]
-		}
-
-		// Upload part
-		partResp, err := s.client.UploadPart(ctx, &s3.UploadPartInput{
-			Bucket:        aws.String(s.bucket),
-			Key:           aws.String(key),
-			UploadId:      uploadID,
-			PartNumber:    aws.Int32(partNumber),
-			Body:          &bytesReadSeeker{data: partBuf},
-			ContentLength: aws.Int64(int64(len(partBuf))),
-		})
-		if err != nil {
-			// Abort the multipart upload on error
-			s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-				Bucket:   aws.String(s.bucket),
-				Key:      aws.String(key),
-				UploadId: uploadID,
-			})
-			return "", fmt.Errorf("failed to upload part %d: %w", partNumber, err)
-		}
-
-		completedParts = append(completedParts, types.CompletedPart{
-			ETag:       partResp.ETag,
-			PartNumber: aws.Int32(partNumber),
-		})
-
-		uploaded += int64(len(partBuf))
-		partNumber++
+	completedParts, err := uploadMultipartParts(ctx, client, s.bucket, key, uploadID, data, size)
+	if err != nil {
+		abortMultipartUpload()
+		return "", err
 	}
 
 	// Complete multipart upload
-	_, err = s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:   aws.String(s.bucket),
 		Key:      aws.String(key),
 		UploadId: uploadID,
@@ -321,15 +297,98 @@ func (s *S3Store) PutLarge(ctx context.Context, blockID string, data io.Reader, 
 	})
 	if err != nil {
 		// Abort the multipart upload on error
-		s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-			Bucket:   aws.String(s.bucket),
-			Key:      aws.String(key),
-			UploadId: uploadID,
-		})
+		abortMultipartUpload()
 		return "", fmt.Errorf("failed to complete multipart upload: %w", err)
 	}
 
 	return key, nil
+}
+
+func uploadMultipartParts(ctx context.Context, client multipartUploadClient, bucket, key string, uploadID *string, data io.Reader, size int64) ([]types.CompletedPart, error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("multipart upload requires positive size")
+	}
+
+	partCount := int((size + MultipartPartSize - 1) / MultipartPartSize)
+	workerCount := MultipartUploadConcurrency
+	if partCount < workerCount {
+		workerCount = partCount
+	}
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+
+	completedParts := make([]types.CompletedPart, partCount)
+	jobs := make(chan multipartUploadPart, workerCount)
+	g, gctx := errgroup.WithContext(ctx)
+
+	for i := 0; i < workerCount; i++ {
+		g.Go(func() error {
+			for part := range jobs {
+				partResp, err := client.UploadPart(gctx, &s3.UploadPartInput{
+					Bucket:        aws.String(bucket),
+					Key:           aws.String(key),
+					UploadId:      uploadID,
+					PartNumber:    aws.Int32(part.partNumber),
+					Body:          &bytesReadSeeker{data: part.data},
+					ContentLength: aws.Int64(int64(len(part.data))),
+				})
+				if err != nil {
+					return fmt.Errorf("failed to upload part %d: %w", part.partNumber, err)
+				}
+
+				completedParts[part.partNumber-1] = types.CompletedPart{
+					ETag:       partResp.ETag,
+					PartNumber: aws.Int32(part.partNumber),
+				}
+			}
+			return nil
+		})
+	}
+
+	g.Go(func() error {
+		defer close(jobs)
+
+		partNumber := int32(1)
+		var uploaded int64
+
+		for uploaded < size {
+			remaining := size - uploaded
+			partSize := int64(MultipartPartSize)
+			if remaining < partSize {
+				partSize = remaining
+			}
+
+			partBuf := make([]byte, partSize)
+			n, err := io.ReadFull(data, partBuf)
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				return fmt.Errorf("failed to read part %d: %w", partNumber, err)
+			}
+			if n <= 0 {
+				return fmt.Errorf("failed to read part %d: empty part", partNumber)
+			}
+			if n < len(partBuf) {
+				partBuf = partBuf[:n]
+			}
+
+			select {
+			case jobs <- multipartUploadPart{partNumber: partNumber, data: partBuf}:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+
+			uploaded += int64(len(partBuf))
+			partNumber++
+		}
+
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return completedParts, nil
 }
 
 // bytesReadSeeker wraps a byte slice as io.ReadSeeker
