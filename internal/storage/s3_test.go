@@ -56,7 +56,7 @@ func (f *fakeMultipartUploadClient) CreateMultipartUpload(_ context.Context, _ *
 	return &s3.CreateMultipartUploadOutput{UploadId: aws.String("upload-1")}, nil
 }
 
-func (f *fakeMultipartUploadClient) UploadPart(_ context.Context, input *s3.UploadPartInput, _ ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
+func (f *fakeMultipartUploadClient) UploadPart(ctx context.Context, input *s3.UploadPartInput, _ ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
 	partNumber := aws.ToInt32(input.PartNumber)
 	if _, err := io.ReadAll(input.Body); err != nil {
 		return nil, err
@@ -82,6 +82,8 @@ func (f *fakeMultipartUploadClient) UploadPart(_ context.Context, input *s3.Uplo
 	if f.releaseCh != nil {
 		select {
 		case <-f.releaseCh:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-time.After(2 * time.Second):
 			return nil, fmt.Errorf("timed out waiting to release part %d", partNumber)
 		}
@@ -196,6 +198,121 @@ func TestPutLargeAbortsMultipartUploadOnPartFailure(t *testing.T) {
 	}
 	if client.abortCalls != 1 {
 		t.Fatalf("AbortMultipartUpload calls = %d, want 1", client.abortCalls)
+	}
+}
+
+func TestPutLargeAbortsWhenSourceShorterThanSize(t *testing.T) {
+	store := &S3Store{bucket: "test-bucket"}
+	client := &fakeMultipartUploadClient{}
+	// Declare two parts' worth of size but only feed one part of data.
+	size := int64(MultipartPartSize + 100)
+	reader := bytes.NewReader(make([]byte, MultipartPartSize))
+
+	_, err := store.putLargeWithClient(context.Background(), client, "block-short", reader, size)
+	if err == nil {
+		t.Fatal("putLargeWithClient() error = nil, want failure for short source")
+	}
+	if !strings.Contains(err.Error(), "empty part") {
+		t.Fatalf("error = %v, want empty part failure", err)
+	}
+	if client.completeCalls != 0 {
+		t.Fatalf("CompleteMultipartUpload calls = %d, want 0", client.completeCalls)
+	}
+	if client.abortCalls != 1 {
+		t.Fatalf("AbortMultipartUpload calls = %d, want 1", client.abortCalls)
+	}
+}
+
+func TestPutLargeRejectsNonPositiveSize(t *testing.T) {
+	store := &S3Store{bucket: "test-bucket"}
+	client := &fakeMultipartUploadClient{}
+
+	_, err := store.putLargeWithClient(context.Background(), client, "block-zero", bytes.NewReader(nil), 0)
+	if err == nil {
+		t.Fatal("putLargeWithClient() error = nil, want failure for size 0")
+	}
+	if !strings.Contains(err.Error(), "positive size") {
+		t.Fatalf("error = %v, want positive size failure", err)
+	}
+	if client.createCalls != 1 {
+		t.Fatalf("CreateMultipartUpload calls = %d, want 1", client.createCalls)
+	}
+	if client.completeCalls != 0 {
+		t.Fatalf("CompleteMultipartUpload calls = %d, want 0", client.completeCalls)
+	}
+	if client.abortCalls != 1 {
+		t.Fatalf("AbortMultipartUpload calls = %d, want 1", client.abortCalls)
+	}
+}
+
+// fatalOnReadReader fails the test if it is ever read; used to prove the part-count
+// guard short-circuits before consuming the (enormous) source stream.
+type fatalOnReadReader struct{ t *testing.T }
+
+func (r fatalOnReadReader) Read(_ []byte) (int, error) {
+	r.t.Fatal("source must not be read when part count exceeds the S3 limit")
+	return 0, io.EOF
+}
+
+func TestPutLargeRejectsTooManyParts(t *testing.T) {
+	store := &S3Store{bucket: "test-bucket"}
+	client := &fakeMultipartUploadClient{}
+	// One part beyond the S3 limit, so the guard must reject before any read.
+	size := int64(MaxMultipartParts+1) * int64(MultipartPartSize)
+
+	_, err := store.putLargeWithClient(context.Background(), client, "block-huge", fatalOnReadReader{t: t}, size)
+	if err == nil {
+		t.Fatal("putLargeWithClient() error = nil, want failure for too many parts")
+	}
+	if !strings.Contains(err.Error(), "exceeding the S3 limit") {
+		t.Fatalf("error = %v, want S3 part-limit failure", err)
+	}
+	if client.completeCalls != 0 {
+		t.Fatalf("CompleteMultipartUpload calls = %d, want 0", client.completeCalls)
+	}
+	if client.abortCalls != 1 {
+		t.Fatalf("AbortMultipartUpload calls = %d, want 1", client.abortCalls)
+	}
+}
+
+func TestPutLargeAbortsOnContextCancellation(t *testing.T) {
+	store := &S3Store{bucket: "test-bucket"}
+	client := &fakeMultipartUploadClient{
+		startedCh: make(chan int32, 4),
+		releaseCh: make(chan struct{}), // never closed: parts block until ctx is cancelled
+	}
+	size := int64(MultipartPartSize + 1)
+	reader := bytes.NewReader(make([]byte, int(size)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := store.putLargeWithClient(ctx, client, "block-cancel", reader, size)
+		errCh <- err
+	}()
+
+	// Wait until at least one part is in flight, then cancel mid-upload.
+	select {
+	case <-client.startedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a part upload to start")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("putLargeWithClient() error = nil, want cancellation failure")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for putLargeWithClient to return after cancel")
+	}
+
+	if client.completeCalls != 0 {
+		t.Fatalf("CompleteMultipartUpload calls = %d, want 0", client.completeCalls)
+	}
+	if client.abortCalls != 1 {
+		t.Fatalf("AbortMultipartUpload calls = %d, want 1 (abort must run on a fresh context)", client.abortCalls)
 	}
 }
 

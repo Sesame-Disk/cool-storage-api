@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -230,6 +231,11 @@ const MultipartPartSize = 16 * 1024 * 1024 // 16 MB per part
 // Reads stay sequential; only the network-bound part uploads run in parallel.
 const MultipartUploadConcurrency = 4
 
+// MaxMultipartParts is the hard limit S3 places on the number of parts in a
+// single multipart upload (valid part numbers are 1..10000). With a fixed
+// MultipartPartSize this caps the largest object we can upload via this path.
+const MaxMultipartParts = 10000
+
 type multipartUploadClient interface {
 	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
 	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
@@ -277,7 +283,15 @@ func (s *S3Store) putLargeWithClient(ctx context.Context, client multipartUpload
 		UploadId: uploadID,
 	}
 	abortMultipartUpload := func() {
-		_, _ = client.AbortMultipartUpload(ctx, abortInput)
+		// Use a fresh, bounded context: the original ctx may already be cancelled
+		// or timed out (often the very reason we're aborting). S3 retains the
+		// already-uploaded parts until the upload is completed or aborted, so a
+		// best-effort abort still needs a live context.
+		abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := client.AbortMultipartUpload(abortCtx, abortInput); err != nil {
+			log.Printf("Warning: failed to abort multipart upload for key %s: %v", key, err)
+		}
 	}
 
 	completedParts, err := uploadMultipartParts(ctx, client, s.bucket, key, uploadID, data, size)
@@ -310,6 +324,9 @@ func uploadMultipartParts(ctx context.Context, client multipartUploadClient, buc
 	}
 
 	partCount := int((size + MultipartPartSize - 1) / MultipartPartSize)
+	if partCount > MaxMultipartParts {
+		return nil, fmt.Errorf("object of %d bytes needs %d parts of %d bytes, exceeding the S3 limit of %d parts", size, partCount, MultipartPartSize, MaxMultipartParts)
+	}
 	workerCount := MultipartUploadConcurrency
 	if partCount < workerCount {
 		workerCount = partCount
