@@ -171,3 +171,70 @@ go test -bench=. -benchtime=10s ./internal/chunker/...
 | Rate limiting on check-blocks | **No** |
 | Cross-method dedup | **No** (different chunking → different hashes) |
 | Adaptive sizing tested in real network | **No** |
+
+---
+
+## RESOLVED (2026-06-17): Chunked upload "tracker split" — file never finalizes
+
+### Symptom
+
+With **multiple files** uploading at once (especially via upload links / share
+links), a large file would report `{"success":true}` on its final chunk yet never
+appear in the library. The browser surfaced **"Upload could not be confirmed.
+Please retry."** A single file uploaded alone always worked. Not a timeout — the
+finalize duration is identical when the file uploads alone.
+
+### Root cause
+
+The server keys each in-flight chunk tracker by
+`(token, resumableIdentifier, parentDir, filename, totalSize)` — see
+`chunkUploadTrackerKey` in [internal/api/seafhttp.go](../internal/api/seafhttp.go).
+The browser sends **one upload token for the whole session**, reused across every
+chunk of every file.
+
+The bug was entirely on the **frontend**: `this.resumable.opts.target` (which
+carries the upload token in its URL) is a **single value shared by all files**.
+Several code paths re-fetched a *fresh* upload link mid-session and reassigned the
+global target. `seafileAPI.{getFileServerUploadLink,sharedLinkGetFileUploadUrl,
+sharedUploadLinkGetFileUploadUrl}` mints a **brand-new token** on each call. So a
+file still uploading had its *remaining* chunks routed to a different token →
+**different server-side tracker**. The bytes split across two trackers, neither
+reached contiguity (`isCompleteLocked`), neither finalized, and the file silently
+never committed.
+
+Two trigger paths (both fixed):
+
+1. **`onFileAdded` single-file branch was unguarded.** Adding the big file alone
+   first fetched token A but never set `isUploadLinkLoaded`; adding more files
+   later then minted token B and overwrote the target under the in-flight big
+   file. ("Add big file first, then add the rest" was a 100% repro; "select all at
+   once" worked because the first add took the guarded multi-file branch.)
+2. **Retry / replace paths** (`retryUploadWithFreshLink`, `onUploadRetryAll`,
+   `replaceRepetitionFile`, `uploadFile`) each re-fetched and reassigned the global
+   target. The 409 auto-retry (`shouldAutoRetryUploadConflict`, fired when a
+   concurrent commit returns "library was modified concurrently") swapped the token
+   out from under other in-flight files — which is why the bug needed concurrency.
+
+### Invariant (do not regress)
+
+**The session upload token is fetched ONCE and the shared `resumable.opts.target`
+must never be reassigned while any file is in flight.**
+
+- Fetch the upload link once, guarded by `isUploadLinkLoaded`; files added later are
+  picked up automatically by the running queue (no re-fetch, no re-`upload()`).
+- A 409 / conflict retry reuses the **existing** session token — re-fetching is
+  unnecessary (the token is path-scoped and multi-use) and harmful.
+- When one file genuinely needs a different endpoint (replace via update-link, or
+  "upload anyway"), set the URL on the **file**, not the resumable instance:
+  `resumableFile.opts.target = …`. `resumable.getOpt` resolves
+  chunk → file → resumable, so a per-file target overrides the global for that file
+  only and leaves every other in-flight upload untouched.
+
+### Diagnostic left in place
+
+`HandleUpload` logs `FINAL_CHUNK_BUT_INCOMPLETE … first_gap=A-B ranges=N
+received=R/total` (via `ChunkUpload.DebugCompletenessSnapshot`) whenever the
+final-offset chunk arrives but the tracker is still non-contiguous. A clean,
+chunk-aligned gap at offset 0 with the tail present is the fingerprint of a tracker
+split; grep the backend log for two `Created upload tracker … file=<name>` lines
+with **different** `op=seafhttp:<token>:…` to confirm.

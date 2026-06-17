@@ -35,6 +35,125 @@ const getFileChunks = (resumableFile) => {
     return resumableFile.chunks;
 };
 
+// A finalize entry is the {name, id, size} object the server returns once a file
+// is fully written. An intermediate-chunk ack ({"success":true}) has neither a
+// name nor an id, so it is rejected here. `id` may legitimately be "" for an
+// empty-directory marker, so we only require the field to be present.
+const isFinalizeEntry = (entry) => {
+    return Boolean(entry)
+        && typeof entry === 'object'
+        && !Array.isArray(entry)
+        && 'id' in entry
+        && typeof entry.name === 'string';
+};
+
+// Replace-mode finalize returns the raw file id as plain text (not JSON). An
+// intermediate ack ({"success":true}) is valid JSON, so JSON.parse succeeding
+// means the body is structured and therefore NOT a raw id.
+const extractRawFinalizeId = (responseText) => {
+    if (typeof responseText !== 'string') {
+        return '';
+    }
+    const trimmed = responseText.trim();
+    if (!trimmed) {
+        return '';
+    }
+    try {
+        JSON.parse(trimmed);
+        return '';
+    } catch (error) {
+        void error;
+        return trimmed;
+    }
+};
+
+// Pull the finalize entry out of a chunk response body. Returns null for an
+// intermediate ack or any body that does not carry file metadata.
+export const parseUploadSuccessEntry = (message) => {
+    if (message && typeof message === 'object') {
+        if (Array.isArray(message)) {
+            return isFinalizeEntry(message[0]) ? message[0] : null;
+        }
+        return isFinalizeEntry(message) ? message : null;
+    }
+
+    if (typeof message !== 'string' || message === '') {
+        return null;
+    }
+
+    let parsed;
+    try {
+        parsed = JSON.parse(message);
+    } catch (error) {
+        void error;
+        return null;
+    }
+
+    if (Array.isArray(parsed)) {
+        return isFinalizeEntry(parsed[0]) ? parsed[0] : null;
+    }
+
+    return null;
+};
+
+const captureFinalizeResponse = (resumableFile, xhr) => {
+    if (!resumableFile || !xhr) {
+        return;
+    }
+
+    const status = normalizeUploadResponseStatus(xhr.status);
+    if (status !== 200 && status !== 201) {
+        return;
+    }
+
+    const responseText = typeof xhr.responseText === 'string' ? xhr.responseText : '';
+    if (!responseText) {
+        return;
+    }
+
+    const entry = parseUploadSuccessEntry(responseText);
+    if (entry) {
+        resumableFile.finalizeResult = entry;
+        return;
+    }
+
+    const rawId = extractRawFinalizeId(responseText);
+    if (rawId) {
+        resumableFile.finalizeResultRaw = rawId;
+    }
+};
+
+// Resolve the authoritative finalize result for a file, regardless of which
+// chunk's body resumable.js happened to hand to fileSuccess. Prefers the
+// directly-delivered message, then falls back to the metadata captured from
+// whichever chunk actually carried it. Returns { entry } for normal/folder
+// uploads, { id } for replace uploads, or null when no finalize metadata is
+// available anywhere.
+export const resolveUploadSuccessResult = (resumableFile, message, isReplace) => {
+    if (isReplace) {
+        const rawId = extractRawFinalizeId(typeof message === 'string' ? message : '');
+        if (rawId) {
+            return { id: rawId };
+        }
+        if (resumableFile && resumableFile.finalizeResultRaw) {
+            return { id: resumableFile.finalizeResultRaw };
+        }
+        if (resumableFile && resumableFile.finalizeResult && resumableFile.finalizeResult.id) {
+            return { id: resumableFile.finalizeResult.id };
+        }
+        return null;
+    }
+
+    const entry = parseUploadSuccessEntry(message);
+    if (entry) {
+        return { entry };
+    }
+    if (resumableFile && resumableFile.finalizeResult) {
+        return { entry: resumableFile.finalizeResult };
+    }
+    return null;
+};
+
 const getChunkStatus = (chunk) => {
     if (!chunk || typeof chunk.status !== 'function') {
         return '';
@@ -153,24 +272,37 @@ export const clearFileUploadRuntimeState = (resumableFile, options = {}) => {
     resumableFile.isFinalizing = false;
     resumableFile.lastUploadResponseStatus = null;
     resumableFile.suppressNextUploadErrorToast = false;
+    resumableFile.finalizeResult = null;
+    resumableFile.finalizeResultRaw = null;
     if (options.resetRemainingTime) {
         resumableFile.remainingTime = DEFAULT_PREPARING_TIME;
     }
 };
 
 export const trackUploadResponseStatus = (resumableFile, resumableChunk) => {
-    if (!resumableFile || !resumableChunk || !resumableChunk.xhr || resumableChunk._sesamefsResponseTrackerAttached) {
+    if (!resumableFile || !resumableChunk || !resumableChunk.xhr) {
         return;
     }
 
     const xhr = resumableChunk.xhr;
-    resumableChunk._sesamefsResponseTrackerAttached = true;
+    // Guard per-XHR, not per-chunk: resumable.js reuses the same chunk object
+    // with a fresh XHR on retry, so a per-chunk flag would leave the retry's XHR
+    // untracked (no status/finalize capture). Re-attach whenever the XHR changes.
+    if (resumableChunk._sesamefsTrackedXhr === xhr) {
+        return;
+    }
+    resumableChunk._sesamefsTrackedXhr = xhr;
     xhr.addEventListener('readystatechange', () => {
         if (xhr.readyState !== 4) {
             return;
         }
 
         resumableFile.lastUploadResponseStatus = normalizeUploadResponseStatus(xhr.status);
+        // Capture finalize metadata from whichever chunk carried it. resumable.js
+        // only hands fileSuccess the body of the last-finishing chunk, which may
+        // be an intermediate ack; this lets onFileUploadSuccess recover the real
+        // {name, id, size} (or raw id) no matter which chunk responded last.
+        captureFinalizeResponse(resumableFile, xhr);
     });
 };
 

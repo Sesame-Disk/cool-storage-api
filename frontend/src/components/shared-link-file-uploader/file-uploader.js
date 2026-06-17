@@ -6,7 +6,7 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, resetUploadConflictAutoRetry, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus } from '../../utils/upload-finalization';
+import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadProgressDialog from './upload-progress-dialog';
@@ -183,48 +183,35 @@ class FileUploader extends React.Component {
 
   onFileAdded = (resumableFile, files) => {
     let isFile = resumableFile.fileName === resumableFile.relativePath;
-    // uploading is file and only upload one file
-    if (isFile && files.length === 1) {
-      let hasRepetition = false;
-      /*
-      let direntList = this.props.direntList;
-      for (let i = 0; i < direntList.length; i++) {
-        if (direntList[i].type === 'file' && direntList[i].name === resumableFile.fileName) {
-          hasRepetition = true;
-          break;
-        }
-      }
-      */
-      if (hasRepetition) {
-        this.setState({
-          isUploadRemindDialogShow: true,
-          currentResumableFile: resumableFile,
-        });
-      } else {
-        this.setUploadFileList(this.resumable.files);
-        let { token, relativePath } = this.props;
-        seafileAPI.sharedLinkGetFileUploadUrl(token, relativePath).then(res => {
-          this.resumable.opts.target = res.data.upload_link + '?ret-json=1';
-          this.resumableUpload(resumableFile);
-        }).catch(error => {
-          let errMessage = Utils.getErrorMsg(error);
-          toaster.danger(errMessage);
-        });
-      }
-    } else {
-      this.setUploadFileList(this.resumable.files);
-      if (!this.isUploadLinkLoaded) {
-        this.isUploadLinkLoaded = true;
-        let { token, relativePath } = this.props;
-        seafileAPI.sharedLinkGetFileUploadUrl(token, relativePath).then(res => {
-          this.resumable.opts.target = res.data.upload_link + '?ret-json=1';
-          this.resumable.upload();
-        }).catch(error => {
-          let errMessage = Utils.getErrorMsg(error);
-          toaster.danger(errMessage);
-        });
-      }
+    this.setUploadFileList(this.resumable.files);
+
+    // Fetch the session upload link EXACTLY ONCE and reuse it for every file,
+    // including files added after the upload has already started. Re-fetching
+    // mints a brand-new upload token and overwrites the shared
+    // this.resumable.opts.target; any file still in flight then has its remaining
+    // chunks rerouted to a different server-side tracker (the tracker is keyed by
+    // token), splitting the upload across two trackers so neither ever reaches
+    // contiguity and the file never finalizes. This is the "add the big file
+    // first, then add more files" failure: the previously-unguarded single-file
+    // branch re-minted a token under the in-flight big file. Files added later
+    // are picked up automatically by the already-running upload queue.
+    if (this.isUploadLinkLoaded) {
+      return;
     }
+    this.isUploadLinkLoaded = true;
+    let { token, relativePath } = this.props;
+    seafileAPI.sharedLinkGetFileUploadUrl(token, relativePath).then(res => {
+      this.resumable.opts.target = res.data.upload_link + '?ret-json=1';
+      if (isFile && files.length === 1) {
+        this.resumableUpload(resumableFile);
+      } else {
+        this.resumable.upload();
+      }
+    }).catch(error => {
+      this.isUploadLinkLoaded = false;
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
   };
 
   resumableUpload = (resumableFile) => {
@@ -338,7 +325,29 @@ class FileUploader extends React.Component {
   onFileUploadSuccess = (resumableFile, message) => {
     let formData = resumableFile.formData;
     let currentTime = new Date().getTime() / 1000;
-    message = formData.replace ? message : JSON.parse(message)[0];
+
+    // resumable.js hands fileSuccess the body of whichever chunk's XHR finished
+    // last. With more than one chunk of this file in flight (simultaneous
+    // uploads, or the temporary finalize slot) that body can be an intermediate
+    // ack ({"success":true}) instead of the finalize response. Resolve against
+    // the metadata captured from whichever chunk actually carried it so we never
+    // dereference an undefined entry — which used to throw inside fileSuccess,
+    // stall the whole upload queue, and freeze files on "Saving..." forever.
+    let resolved = resolveUploadSuccessResult(resumableFile, message, formData.replace);
+    if (!resolved || !resolved.entry) {
+      // The finalize response never reached us (e.g. it was lost on a retried
+      // request and the server returned a bare ack). We cannot confirm the file
+      // landed, so surface it as retryable instead of silently reporting success
+      // — a false "Uploaded" leaves big files missing from the listing.
+      // eslint-disable-next-line no-console
+      console.error('Upload finalize metadata missing for', resumableFile.fileName, 'message:', message);
+      const error = gettext('Upload could not be confirmed. Please retry.');
+      const { retryFileList, uploadFileList } = moveUploadToRetryState(this.state.uploadFileList, this.state.retryFileList, resumableFile, error);
+      this.setState({ retryFileList: retryFileList, uploadFileList: uploadFileList });
+      this.restoreConcurrencyIfIdle();
+      return;
+    }
+    let entry = resolved.entry;
     if (formData.relative_path) { // upload folder
       // 'upload folder' is not supported
       /*
@@ -399,10 +408,10 @@ class FileUploader extends React.Component {
 
     // upload file -- add files
     let dirent = {
-      id: message.id,
+      id: entry.id,
       type: 'file',
-      name: message.name,
-      size: message.size,
+      name: entry.name,
+      size: entry.size,
       mtime: currentTime,
     };
     this.props.onFileUploadSuccess(dirent); // this contance:  no repetition file
@@ -410,7 +419,7 @@ class FileUploader extends React.Component {
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
         clearFileUploadRuntimeState(item);
-        item.newFileName = message.name;
+        item.newFileName = entry.name;
         item.isSaved = true;
       }
       return item;
@@ -454,44 +463,39 @@ class FileUploader extends React.Component {
 
   retryUploadWithFreshLink = (resumableFile, options = {}) => {
     const { resetAutoRetry = true } = options;
-    let { token, relativePath } = this.props;
 
-    seafileAPI.sharedLinkGetFileUploadUrl(token, relativePath).then(res => {
-      this.resumable.opts.target = res.data.upload_link + '?ret-json=1';
-
-      let retryFileList = this.state.retryFileList.filter(item => {
-        return item.uniqueIdentifier !== resumableFile.uniqueIdentifier;
-      });
-      let uploadFileList = this.state.uploadFileList.map(item => {
-        if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
-          clearFileUploadRuntimeState(item, { resetRemainingTime: true });
-          item.error = null;
-          if (resetAutoRetry) {
-            resetUploadConflictAutoRetry(item);
-          }
-          this.retryUploadFile(item);
-        }
-        return item;
-      });
-
-      this.setState({
-        retryFileList: retryFileList,
-        uploadFileList: uploadFileList
-      });
-      this.restoreConcurrencyIfIdle();
-    }).catch(error => {
-      let errMessage = Utils.getErrorMsg(error);
-      if (!resetAutoRetry) {
-        const { retryFileList, uploadFileList } = moveUploadToRetryState(this.state.uploadFileList, this.state.retryFileList, resumableFile, errMessage, { resetAutoRetry: true });
-        this.loaded = 0;
-        this.setState({
-          retryFileList: retryFileList,
-          uploadFileList: uploadFileList
-        });
-        this.restoreConcurrencyIfIdle();
-      }
-      toaster.danger(errMessage);
+    // Reuse the session's existing upload link — do NOT mint a fresh one.
+    // sharedLinkGetFileUploadUrl returns a brand-new upload TOKEN on each call,
+    // and assigning it to the shared this.resumable.opts.target reroutes EVERY
+    // other in-flight file onto a different server-side tracker mid-upload. The
+    // server keys its chunk tracker by token, so a large concurrent upload gets
+    // split across two trackers (token A then token B): neither ever reaches
+    // contiguity, neither finalizes, and the file silently never lands — which
+    // surfaces on the client as "Upload could not be confirmed". This happens
+    // when one file hits a 409 ("library modified concurrently") and its
+    // auto-retry swaps the token out from under a big file still uploading.
+    // The session token is multi-use and valid for the whole session (it already
+    // serves every chunk of every file), so retrying on it is correct.
+    let retryFileList = this.state.retryFileList.filter(item => {
+      return item.uniqueIdentifier !== resumableFile.uniqueIdentifier;
     });
+    let uploadFileList = this.state.uploadFileList.map(item => {
+      if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+        clearFileUploadRuntimeState(item, { resetRemainingTime: true });
+        item.error = null;
+        if (resetAutoRetry) {
+          resetUploadConflictAutoRetry(item);
+        }
+        this.retryUploadFile(item);
+      }
+      return item;
+    });
+
+    this.setState({
+      retryFileList: retryFileList,
+      uploadFileList: uploadFileList
+    });
+    this.restoreConcurrencyIfIdle();
   };
 
   onComplete = () => {
@@ -505,8 +509,13 @@ class FileUploader extends React.Component {
   };
 
   onError = (message) => {
-    // reset upload link loaded
-    this.isUploadLinkLoaded = false;
+    // A file-level error can fan out to the global error event before every
+    // other chunk/file in the queue has stopped. Keep reusing the session link
+    // until the queue is actually idle so a later file add cannot mint a new
+    // token and split an in-flight upload across trackers.
+    if (!this.resumable || !this.resumable.isUploading()) {
+      this.isUploadLinkLoaded = false;
+    }
     // After the error, the user can switch windows
     Utils.registerGlobalVariable('uploader', 'totalProgress', 100);
   };
@@ -633,28 +642,24 @@ class FileUploader extends React.Component {
   };
 
   onUploadRetryAll = () => {
-
-    let { token, relativePath } = this.props;
-    seafileAPI.sharedLinkGetFileUploadUrl(token, relativePath).then(res => {
-      this.resumable.opts.target = res.data.upload_link + '?ret-json=1';
-      this.state.retryFileList.forEach(item => {
-        clearFileUploadRuntimeState(item, { resetRemainingTime: true });
-        resetUploadConflictAutoRetry(item);
-        item.error = false;
-        this.retryUploadFile(item);
-      });
-
-      let uploadFileList = this.state.uploadFileList.slice(0);
-      this.setState({
-        retryFileList: [],
-        uploadFileList: uploadFileList
-      });
-      this.restoreConcurrencyIfIdle();
-
-    }).catch(error => {
-      let errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
+    // Reuse the session's existing upload link instead of fetching a fresh one.
+    // Re-fetching mints a new upload token and overwrites the shared
+    // this.resumable.opts.target, which would reroute any still-in-flight file
+    // onto a different server-side tracker mid-upload and split it across two
+    // trackers (see retryUploadWithFreshLink). The session token stays valid.
+    this.state.retryFileList.forEach(item => {
+      clearFileUploadRuntimeState(item, { resetRemainingTime: true });
+      resetUploadConflictAutoRetry(item);
+      item.error = false;
+      this.retryUploadFile(item);
     });
+
+    let uploadFileList = this.state.uploadFileList.slice(0);
+    this.setState({
+      retryFileList: [],
+      uploadFileList: uploadFileList
+    });
+    this.restoreConcurrencyIfIdle();
   };
 
   retryUploadFile = (resumableFile) => {
@@ -684,7 +689,11 @@ class FileUploader extends React.Component {
 
     let { token, relativePath } = this.props;
     seafileAPI.sharedLinkGetFileUploadUrl(token, relativePath).then(res => {
-      this.resumable.opts.target = res.data.upload_link + '?ret-json=1';
+      // Per-file target (file.opts wins over the shared resumable.opts in
+      // getOpt) so accepting the "upload anyway" dialog for one file never
+      // overwrites the global target and reroutes other in-flight uploads.
+      resumableFile.opts = resumableFile.opts || {};
+      resumableFile.opts.target = res.data.upload_link + '?ret-json=1';
       this.setState({
         isUploadRemindDialogShow: false,
         isUploadProgressDialogShow: true,

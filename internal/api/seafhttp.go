@@ -285,9 +285,11 @@ var _ TokenStore = (*TokenManager)(nil)
 // ChunkUpload tracks an ongoing chunked upload
 type ChunkUpload struct {
 	Token       string
+	Identifier  string
 	Filename    string
 	ParentDir   string
 	TotalSize   int64
+	TrackerKey  string
 	OperationID string
 	TempFile    *os.File
 	TempPath    string
@@ -300,7 +302,36 @@ type ChunkUpload struct {
 	quotaPrecheck          chunkQuotaPrecheck
 	updatedAt              time.Time
 	mu                     sync.Mutex
+
+	// Finalization fan-in: the single request that wins ClaimFinalization runs
+	// the actual finalize and publishes its outcome here; any other request that
+	// arrives once all bytes are present (e.g. a resumable retry of the final
+	// chunk after the original finalize response was lost) waits on finalizeDone
+	// and returns the same result instead of a bare {"success":true} ack the
+	// client cannot turn into a dirent.
+	finalizeDone   chan struct{}
+	finalizeResult *finalizeOutcome
 }
+
+// finalizeOutcome is the shared result of a chunked-upload finalization, read by
+// waiters once finalizeDone is closed. Exactly one of (fileID/...) or err is set.
+type finalizeOutcome struct {
+	fileID         string
+	actualFilename string
+	totalSize      int64
+	err            error
+}
+
+type finalizeClaim int
+
+const (
+	// finalizeClaimIncomplete: not all bytes are present yet — return an ack.
+	finalizeClaimIncomplete finalizeClaim = iota
+	// finalizeClaimWinner: this request must run finalization and publish it.
+	finalizeClaimWinner
+	// finalizeClaimWaiter: another request is finalizing — wait for its result.
+	finalizeClaimWaiter
+)
 
 type byteRange struct {
 	Start int64
@@ -321,18 +352,45 @@ const (
 	chunkJanitorInterval = 10 * time.Minute
 	chunkTrackerTTL      = 1 * time.Hour
 	chunkDiskTTL         = 2 * time.Hour
+	// chunkFinalizeOutcomeTTL bounds how long a finalized upload's result is kept
+	// after its tracker is removed, so a late final-chunk retry can still read the
+	// real file id. Long enough to cover client retry/backoff on huge uploads.
+	// Safe to keep generous because the cache key includes the per-upload resumable
+	// identifier, so it can only ever match a retry of that same upload.
+	chunkFinalizeOutcomeTTL = 15 * time.Minute
+	// chunkFinalizeOutcomeLimit is a hard safety fuse for the residual finalize-
+	// outcome cache. 64k entries still covers dozens of finalized uploads/sec
+	// across the 15-minute TTL window, while preventing sustained upload traffic
+	// from growing the cache without bound between janitor sweeps.
+	chunkFinalizeOutcomeLimit = 64 * 1024
 )
+
+// cachedFinalizeOutcome retains a finalized upload's result after its tracker is
+// cleaned up, so a final-chunk retry that arrives in the residual window (winner
+// already published and cleaned up the tracker) still receives the real file id
+// instead of falling back to a "could not be confirmed" client error.
+type cachedFinalizeOutcome struct {
+	fileID         string
+	actualFilename string
+	totalSize      int64
+	expiresAt      time.Time
+}
 
 // ChunkManager manages chunked uploads
 type ChunkManager struct {
 	uploads map[string]*ChunkUpload
-	mu      sync.RWMutex
-	tempDir string
+	// outcomes caches successful finalize results by upload key for a short TTL
+	// after the tracker is removed. Guarded by mu alongside uploads.
+	outcomes map[string]cachedFinalizeOutcome
+	mu       sync.RWMutex
+	tempDir  string
 
-	// Janitor config — overridable in tests.
+	// Janitor/cache config — overridable in tests.
 	janitorInterval time.Duration
 	trackerTTL      time.Duration
 	diskTTL         time.Duration
+	outcomeTTL      time.Duration
+	outcomeLimit    int
 	now             func() time.Time
 
 	janitorOnce sync.Once
@@ -343,10 +401,13 @@ type ChunkManager struct {
 func NewChunkManager() *ChunkManager {
 	cm := &ChunkManager{
 		uploads:         make(map[string]*ChunkUpload),
+		outcomes:        make(map[string]cachedFinalizeOutcome),
 		tempDir:         os.TempDir(),
 		janitorInterval: chunkJanitorInterval,
 		trackerTTL:      chunkTrackerTTL,
 		diskTTL:         chunkDiskTTL,
+		outcomeTTL:      chunkFinalizeOutcomeTTL,
+		outcomeLimit:    chunkFinalizeOutcomeLimit,
 		now:             time.Now,
 		stopCh:          make(chan struct{}),
 	}
@@ -354,11 +415,131 @@ func NewChunkManager() *ChunkManager {
 	return cm
 }
 
+// chunkFinalizeOutcomeKey identifies a specific upload for the finalize-outcome
+// cache. It is keyed by the resumable upload identifier (unique per file per
+// upload session — it encodes the relative path, so two folder files sharing a
+// basename never collide, and a brand-new upload of the same name/path always
+// gets a fresh identifier). parentDir + filename are folded in for defense.
+// Callers must only use the cache when identifier is non-empty; an empty
+// identifier cannot distinguish a retry from a different upload, so it must NOT
+// be cached or served (it would risk returning a stale id for new content).
+func chunkFinalizeOutcomeKey(token, identifier, parentDir, filename string) string {
+	return token + "\x00" + identifier + "\x00" + parentDir + "\x00" + filename
+}
+
+// chunkUploadTrackerKey identifies the active in-memory/temp-file tracker for a
+// chunked upload. Prefer the per-upload resumable identifier when present; it
+// uniquely distinguishes retries of the same upload from a brand-new upload of
+// the same path. When no identifier is available, fall back to parentDir +
+// filename + totalSize so folder uploads with repeated basenames still isolate
+// their temp files and progress trackers.
+func chunkUploadTrackerKey(token, identifier, parentDir, filename string, totalSize int64) string {
+	if identifier != "" {
+		return token + "\x00" + identifier + "\x00" + parentDir + "\x00" + filename + "\x00" + strconv.FormatInt(totalSize, 10)
+	}
+	return token + "\x00" + parentDir + "\x00" + filename + "\x00" + strconv.FormatInt(totalSize, 10)
+}
+
+// chunkUploadTempName length budget: the sha1 hash already makes the name
+// unique, so the human-readable filename hint is capped to keep the whole temp
+// filename well under the filesystem's 255-byte per-component limit even for
+// very long upload names.
+const chunkUploadTempNameHintMax = 40
+
+func chunkUploadTempPath(tempDir, trackerKey, filename string) string {
+	hash := sha1.Sum([]byte(trackerKey))
+	// sanitizeFilename yields pure ASCII, so a byte slice is rune-safe.
+	hint := sanitizeFilename(filename)
+	if len(hint) > chunkUploadTempNameHintMax {
+		hint = hint[:chunkUploadTempNameHintMax]
+	}
+	return filepath.Join(
+		tempDir,
+		fmt.Sprintf("sesamefs_upload_%s_%s", hex.EncodeToString(hash[:]), hint),
+	)
+}
+
+// CacheFinalizeOutcome records a successful finalize result so a late final-chunk
+// retry (after CleanupUpload removed the tracker) can still be answered with the
+// real file id. No-op when identifier is empty. totalSize is matched on lookup
+// as a cheap extra guard.
+func (cm *ChunkManager) CacheFinalizeOutcome(token, identifier, parentDir, filename, fileID, actualFilename string, totalSize int64) {
+	if identifier == "" {
+		return
+	}
+	key := chunkFinalizeOutcomeKey(token, identifier, parentDir, filename)
+	now := cm.now()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.outcomes[key] = cachedFinalizeOutcome{
+		fileID:         fileID,
+		actualFilename: actualFilename,
+		totalSize:      totalSize,
+		expiresAt:      now.Add(cm.outcomeTTL),
+	}
+	cm.pruneFinalizeOutcomesLocked(now)
+}
+
+// LookupFinalizeOutcome returns a cached finalize result if present, unexpired,
+// and matching the requested totalSize. Always misses for an empty identifier so
+// a distinct upload can never read another upload's id.
+func (cm *ChunkManager) LookupFinalizeOutcome(token, identifier, parentDir, filename string, totalSize int64) (cachedFinalizeOutcome, bool) {
+	if identifier == "" {
+		return cachedFinalizeOutcome{}, false
+	}
+	key := chunkFinalizeOutcomeKey(token, identifier, parentDir, filename)
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	cached, ok := cm.outcomes[key]
+	if !ok || cached.totalSize != totalSize || !cm.now().Before(cached.expiresAt) {
+		return cachedFinalizeOutcome{}, false
+	}
+	return cached, true
+}
+
 // StartJanitor launches the background sweeper exactly once per manager.
 func (cm *ChunkManager) StartJanitor() {
 	cm.janitorOnce.Do(func() {
 		go cm.janitorLoop()
 	})
+}
+
+func (cm *ChunkManager) pruneFinalizeOutcomesLocked(now time.Time) {
+	for key, cached := range cm.outcomes {
+		if !now.Before(cached.expiresAt) {
+			delete(cm.outcomes, key)
+			metrics.ChunkUploadFinalizeOutcomeCacheEvictionsTotal.WithLabelValues("expired").Inc()
+		}
+	}
+
+	if cm.outcomeLimit > 0 && len(cm.outcomes) > cm.outcomeLimit {
+		type evictionCandidate struct {
+			key       string
+			expiresAt time.Time
+		}
+
+		candidates := make([]evictionCandidate, 0, len(cm.outcomes))
+		for key, cached := range cm.outcomes {
+			candidates = append(candidates, evictionCandidate{
+				key:       key,
+				expiresAt: cached.expiresAt,
+			})
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].expiresAt.Equal(candidates[j].expiresAt) {
+				return candidates[i].key < candidates[j].key
+			}
+			return candidates[i].expiresAt.Before(candidates[j].expiresAt)
+		})
+
+		overflow := len(cm.outcomes) - cm.outcomeLimit
+		for i := 0; i < overflow; i++ {
+			delete(cm.outcomes, candidates[i].key)
+			metrics.ChunkUploadFinalizeOutcomeCacheEvictionsTotal.WithLabelValues("capacity").Inc()
+		}
+	}
+
+	metrics.ChunkUploadFinalizeOutcomeCacheEntries.Set(float64(len(cm.outcomes)))
 }
 
 // Stop halts the janitor goroutine. Intended for tests.
@@ -374,9 +555,11 @@ func (cm *ChunkManager) Stop() {
 // Global chunk manager instance
 var chunkManager = NewChunkManager()
 
-// GetOrCreateUpload gets or creates a chunk upload tracker
-func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, totalSize int64) (*ChunkUpload, error) {
-	key := token + ":" + filename
+// GetOrCreateUploadByIdentity gets or creates a chunk upload tracker for the
+// specific upload identity carried on this request. Argument order matches
+// GetUploadByIdentity / chunkUploadTrackerKey (parentDir before filename).
+func (cm *ChunkManager) GetOrCreateUploadByIdentity(token, identifier, parentDir, filename string, totalSize int64) (*ChunkUpload, error) {
+	key := chunkUploadTrackerKey(token, identifier, parentDir, filename, totalSize)
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -385,7 +568,7 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 	}
 
 	// Create temp file
-	tempPath := filepath.Join(cm.tempDir, fmt.Sprintf("sesamefs_upload_%s_%s", token, sanitizeFilename(filename)))
+	tempPath := chunkUploadTempPath(cm.tempDir, key, filename)
 	tempFile, err := os.OpenFile(tempPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
@@ -402,9 +585,11 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 
 	upload := &ChunkUpload{
 		Token:       token,
+		Identifier:  identifier,
 		Filename:    filename,
 		ParentDir:   parentDir,
 		TotalSize:   totalSize,
+		TrackerKey:  key,
 		OperationID: newSeafHTTPUploadOperationID(token),
 		TempFile:    tempFile,
 		TempPath:    tempPath,
@@ -412,15 +597,32 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 		updatedAt:   cm.now(),
 	}
 	cm.uploads[key] = upload
-	log.Printf("[ChunkManager] Created upload tracker: %s, totalSize=%d", key, totalSize)
+	log.Printf("[ChunkManager] Created upload tracker: op=%s file=%s dir=%s totalSize=%d", upload.OperationID, filename, parentDir, totalSize)
 	return upload, nil
 }
 
-func (cm *ChunkManager) GetUpload(token, filename string) *ChunkUpload {
-	key := token + ":" + filename
+// GetOrCreateUpload is the legacy helper used by tests and callers that do not
+// carry a resumable identifier.
+func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, totalSize int64) (*ChunkUpload, error) {
+	return cm.GetOrCreateUploadByIdentity(token, "", parentDir, filename, totalSize)
+}
+
+func (cm *ChunkManager) GetUploadByIdentity(token, identifier, parentDir, filename string, totalSize int64) *ChunkUpload {
+	key := chunkUploadTrackerKey(token, identifier, parentDir, filename, totalSize)
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 	return cm.uploads[key]
+}
+
+func (cm *ChunkManager) GetUpload(token, filename string) *ChunkUpload {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	for _, upload := range cm.uploads {
+		if upload.Token == token && upload.Filename == filename {
+			return upload
+		}
+	}
+	return nil
 }
 
 // janitorLoop periodically reaps stale chunk uploads from memory and disk.
@@ -463,6 +665,9 @@ func (cm *ChunkManager) sweepOnce() {
 	for _, key := range staleKeys {
 		delete(cm.uploads, key)
 	}
+	// Sweep cached finalize outcomes in the same pass so both expiration and the
+	// hard-cap safety fuse stay enforced even when writes go quiet.
+	cm.pruneFinalizeOutcomesLocked(now)
 	aliveTempPaths := make(map[string]struct{}, len(cm.uploads))
 	for _, upload := range cm.uploads {
 		aliveTempPaths[upload.TempPath] = struct{}{}
@@ -554,27 +759,83 @@ func (cu *ChunkUpload) IsComplete() bool {
 	return cu.isCompleteLocked()
 }
 
-func (cu *ChunkUpload) TryStartFinalization() bool {
+// ClaimFinalization decides this request's role in finalizing the upload.
+// Exactly one concurrent caller becomes the winner and must run finalization
+// then publish the outcome via PublishFinalize{Success,Failure}. Callers that
+// arrive once all bytes are present but finalization is already underway become
+// waiters and must block on the returned channel, then read FinalizeOutcome.
+// Callers whose bytes are not all present yet are incomplete.
+func (cu *ChunkUpload) ClaimFinalization() (finalizeClaim, <-chan struct{}) {
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
-	if cu.Finalizing {
+	if cu.Finalizing || cu.finalizeDone != nil {
 		metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("already_finalizing").Inc()
-		return false
+		return finalizeClaimWaiter, cu.finalizeDone
 	}
 	if !cu.isCompleteLocked() {
 		metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("not_complete").Inc()
-		return false
+		return finalizeClaimIncomplete, nil
 	}
 	cu.Finalizing = true
 	cu.finalizationStarted = true
+	cu.finalizeDone = make(chan struct{})
 	metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("started").Inc()
-	return true
+	return finalizeClaimWinner, cu.finalizeDone
+}
+
+// TryStartFinalization reports whether this caller won the right to finalize.
+// Retained for callers/tests that only need winner detection.
+func (cu *ChunkUpload) TryStartFinalization() bool {
+	claim, _ := cu.ClaimFinalization()
+	return claim == finalizeClaimWinner
+}
+
+func (cu *ChunkUpload) publishFinalizeOutcomeLocked(outcome *finalizeOutcome) {
+	if cu.finalizeDone == nil {
+		// Ownership was reset/dropped; there is no current waiter set to notify.
+		return
+	}
+	select {
+	case <-cu.finalizeDone:
+		// Already published once — do not overwrite or double-close.
+		return
+	default:
+	}
+	cu.finalizeResult = outcome
+	close(cu.finalizeDone)
+	cu.updatedAt = time.Now()
+}
+
+// PublishFinalizeSuccess records the finalize result and wakes any waiters.
+func (cu *ChunkUpload) PublishFinalizeSuccess(fileID, actualFilename string, totalSize int64) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	cu.publishFinalizeOutcomeLocked(&finalizeOutcome{fileID: fileID, actualFilename: actualFilename, totalSize: totalSize})
+}
+
+// PublishFinalizeFailure records a finalize failure and wakes any waiters so
+// they surface a retryable error instead of a false success.
+func (cu *ChunkUpload) PublishFinalizeFailure(err error) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	cu.publishFinalizeOutcomeLocked(&finalizeOutcome{err: err})
+}
+
+// FinalizeOutcome returns the published finalize result, if any.
+func (cu *ChunkUpload) FinalizeOutcome() (*finalizeOutcome, bool) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	return cu.finalizeResult, cu.finalizeResult != nil
 }
 
 func (cu *ChunkUpload) ResetFinalization() {
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
 	cu.Finalizing = false
+	// Drop the done channel so the next claimant becomes a fresh winner. Any
+	// waiters already holding the previous (closed) channel keep their captured
+	// reference; finalizeResult is left intact for them to read.
+	cu.finalizeDone = nil
 	cu.updatedAt = time.Now()
 }
 
@@ -660,6 +921,39 @@ func (cu *ChunkUpload) isCompleteLocked() bool {
 		len(cu.Ranges) == 1 &&
 		cu.Ranges[0].Start == 0 &&
 		cu.Ranges[0].End >= cu.TotalSize-1
+}
+
+// DebugCompletenessSnapshot returns the tracker's completeness state for
+// diagnostics: whether it is complete, the first missing byte range (gap), the
+// number of merged ranges, and the total received bytes. Used to pinpoint why a
+// chunked upload never finalizes despite the final-offset chunk having arrived.
+func (cu *ChunkUpload) DebugCompletenessSnapshot() (complete bool, firstGapStart, firstGapEnd int64, rangeCount int, receivedBytes int64) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	complete = cu.isCompleteLocked()
+	rangeCount = len(cu.Ranges)
+	firstGapStart, firstGapEnd = -1, -1
+	for _, r := range cu.Ranges {
+		receivedBytes += r.End - r.Start + 1
+	}
+	if complete {
+		return complete, firstGapStart, firstGapEnd, rangeCount, receivedBytes
+	}
+	// Ranges are kept sorted+merged by markRangeReceivedLocked, so the first gap
+	// is either before the first range, between two ranges, or after the last.
+	cursor := int64(0)
+	for _, r := range cu.Ranges {
+		if r.Start > cursor {
+			return complete, cursor, r.Start - 1, rangeCount, receivedBytes
+		}
+		if r.End+1 > cursor {
+			cursor = r.End + 1
+		}
+	}
+	if cursor < cu.TotalSize {
+		firstGapStart, firstGapEnd = cursor, cu.TotalSize-1
+	}
+	return complete, firstGapStart, firstGapEnd, rangeCount, receivedBytes
 }
 
 func (cu *ChunkUpload) hasRangeLocked(start, end int64) bool {
@@ -804,16 +1098,47 @@ func (cu *ChunkUpload) Cleanup() error {
 	return os.Remove(cu.TempPath)
 }
 
-// CleanupUpload removes an upload from tracking
-func (cm *ChunkManager) CleanupUpload(token, filename string) {
-	key := token + ":" + filename
+func (cm *ChunkManager) cleanupUploadByKey(key string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
 	if upload, exists := cm.uploads[key]; exists {
 		upload.Cleanup()
 		delete(cm.uploads, key)
-		log.Printf("[ChunkManager] Cleaned up upload: %s", key)
+		log.Printf("[ChunkManager] Cleaned up upload: op=%s file=%s", upload.OperationID, upload.Filename)
+	}
+}
+
+func (cm *ChunkManager) CleanupUploadByIdentity(token, identifier, parentDir, filename string, totalSize int64) {
+	cm.cleanupUploadByKey(chunkUploadTrackerKey(token, identifier, parentDir, filename, totalSize))
+}
+
+func (cm *ChunkManager) CleanupTrackedUpload(upload *ChunkUpload) {
+	if upload == nil {
+		return
+	}
+	if upload.TrackerKey != "" {
+		cm.cleanupUploadByKey(upload.TrackerKey)
+		return
+	}
+	cm.CleanupUpload(upload.Token, upload.Filename)
+}
+
+// CleanupUpload removes tracked uploads matching the legacy token/filename
+// lookup. Production chunked uploads should prefer CleanupTrackedUpload or
+// CleanupUploadByIdentity so same-basename uploads in different paths stay
+// isolated.
+func (cm *ChunkManager) CleanupUpload(token, filename string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	for key, upload := range cm.uploads {
+		if upload.Token != token || upload.Filename != filename {
+			continue
+		}
+		upload.Cleanup()
+		delete(cm.uploads, key)
+		log.Printf("[ChunkManager] Cleaned up upload: op=%s file=%s", upload.OperationID, upload.Filename)
 	}
 }
 
@@ -1365,6 +1690,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 	}
 	retJSON := c.Query("ret-json") == "1" || c.PostForm("ret-json") == "1"
+	// resumable.js sends a stable per-file-per-session identifier on every chunk.
+	// It uniquely distinguishes this upload (it encodes the relative path and a
+	// session timestamp), so it is the only safe key for the finalize-outcome
+	// cache: a retry carries the same identifier, a different upload never does.
+	uploadIdentifier := c.PostForm("resumableIdentifier")
 
 	filename := header.Filename
 
@@ -1409,7 +1739,29 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		tokenStr, filename, contentRange, isChunked)
 
 	if isChunked {
-		existingUpload := chunkManager.GetUpload(tokenStr, filename)
+		// A finalize result cached for this upload means it already completed —
+		// this is a late retry of whichever chunk carried the finalize (the
+		// winner published and the tracker was already cleaned up). Answer with
+		// the real file id so the client builds the dirent instead of failing
+		// with "could not be confirmed".
+		//
+		// We must NOT gate this on end == total-1: with simultaneous_uploads > 1
+		// chunks arrive out of order, so the chunk that completes contiguity (and
+		// runs finalization) is arbitrary — frequently NOT the final-offset chunk.
+		// Gating on the final offset re-broke exactly this case. The cache key is
+		// the per-upload resumable identifier, so any matching request is by
+		// definition a retry of this already-finalized upload and safe to answer.
+		if cached, ok := chunkManager.LookupFinalizeOutcome(tokenStr, uploadIdentifier, parentDir, filename, total); ok {
+			log.Printf("[HandleUpload] Returning cached finalize result for late retry: %s", filename)
+			if retJSON {
+				c.JSON(http.StatusOK, []gin.H{{"name": cached.actualFilename, "id": cached.fileID, "size": strconv.FormatInt(cached.totalSize, 10)}})
+			} else {
+				c.String(http.StatusOK, cached.fileID)
+			}
+			return
+		}
+
+		existingUpload := chunkManager.GetUploadByIdentity(tokenStr, uploadIdentifier, parentDir, filename, total)
 		if existingUpload == nil || !existingUpload.HasQuotaPrecheck(parentDir, total, replaceFile) {
 			if _, _, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, total, replaceFile); err != nil {
 				log.Printf("[HandleUpload] Chunked upload storage quota check failed: %v", err)
@@ -1423,7 +1775,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 
 		// Chunked upload: stream chunk data directly to temp file (no io.ReadAll)
-		upload, err := chunkManager.GetOrCreateUpload(tokenStr, filename, parentDir, total)
+		upload, err := chunkManager.GetOrCreateUploadByIdentity(tokenStr, uploadIdentifier, parentDir, filename, total)
 		if err != nil {
 			log.Printf("[HandleUpload] Failed to create upload tracker: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize upload"})
@@ -1438,25 +1790,98 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			return
 		}
 
-		if !upload.TryStartFinalization() {
+		writeFinalizeSuccess := func(id, name string, size int64) {
+			if retJSON {
+				c.JSON(http.StatusOK, []gin.H{{"name": name, "id": id, "size": strconv.FormatInt(size, 10)}})
+			} else {
+				c.String(http.StatusOK, id)
+			}
+		}
+
+		claim, finalizeDone := upload.ClaimFinalization()
+		if claim == finalizeClaimIncomplete {
+			// Out-of-order chunks routinely arrive while the upload is still
+			// incomplete — normal under concurrency, and it must stay a 200 ack so
+			// the client keeps sending the remaining chunks. The healthy case has
+			// its gap near the END (a middle/late chunk still in flight). But a gap
+			// that starts at byte 0 — the prefix is still missing even though the
+			// final byte has arrived — is the suspicious shape we saw when chunks
+			// were split across trackers after a token change. It can still be
+			// transient under reordering, so keep the log explicitly diagnostic-only.
+			if end >= total-1 {
+				_, gapStart, gapEnd, ranges, received := upload.DebugCompletenessSnapshot()
+				if gapStart == 0 {
+					log.Printf("[HandleUpload] FINAL_CHUNK_BUT_INCOMPLETE (prefix missing; possible tracker split or earlier chunks still in flight) op=%s file=%q first_gap=%d-%d ranges=%d received=%d/%d identifier=%q",
+						upload.OperationID, filename, gapStart, gapEnd, ranges, received, total, uploadIdentifier)
+				}
+			}
 			log.Printf("[HandleUpload] Chunk received, waiting for more: %d/%d", end+1, total)
 			c.JSON(http.StatusOK, gin.H{"success": true})
 			return
 		}
 
-		// All chunks received — finalize by streaming from temp file
-		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming)")
+		if claim == finalizeClaimWaiter {
+			// Another in-flight request owns finalization for this exact upload —
+			// typically a resumable retry of the final chunk after the original
+			// finalize response was lost on the wire. Block on the shared result
+			// and return it, so the client gets real file metadata instead of a
+			// bare ack it cannot turn into a dirent (which silently dropped big
+			// files from the listing even though the bytes were committed).
+			log.Printf("[HandleUpload] Finalization already in progress for %s; waiting for shared result", filename)
+			select {
+			case <-finalizeDone:
+			case <-c.Request.Context().Done():
+				return
+			}
+			outcome, ok := upload.FinalizeOutcome()
+			if !ok || outcome == nil {
+				c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
+				return
+			}
+			if outcome.err != nil {
+				writeSeafHTTPUploadError(c, outcome.err, "failed to finalize upload")
+				return
+			}
+			writeFinalizeSuccess(outcome.fileID, outcome.actualFilename, outcome.totalSize)
+			return
+		}
+
+		// claim == finalizeClaimWinner — this request owns finalization.
+		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming): file=%s identifier=%q", filename, uploadIdentifier)
+		if uploadIdentifier == "" {
+			// Without an identifier the finalize-outcome cache is disabled, so a
+			// final-chunk retry that lands after cleanup cannot be answered and the
+			// client will report "could not be confirmed". Surface it loudly.
+			log.Printf("[HandleUpload] WARNING: chunked finalize has no resumableIdentifier; late-retry outcome cache is DISABLED for file=%s", filename)
+		}
 		upload.Touch()
+		// Safety net: never leave waiters blocked. If finalization panics before
+		// publishing, release them with a retryable error.
+		finalizePublished := false
+		defer func() {
+			if !finalizePublished {
+				upload.PublishFinalizeFailure(fmt.Errorf("upload finalization aborted"))
+			}
+		}()
 		fileID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeUploadStreaming(c, token, upload, parentDir, filename, storageKey, total, replaceFile)
 		if err != nil {
+			upload.PublishFinalizeFailure(err)
+			finalizePublished = true
 			h.handleChunkedFinalizeError(token, tokenStr, filename, upload, err)
 			log.Printf("[HandleUpload] Finalization failed: %v", err)
 			writeSeafHTTPUploadError(c, err, "failed to finalize upload")
 			return
 		}
-		chunkManager.CleanupUpload(tokenStr, filename)
+		// Publish the result before cleanup so any waiter holding this tracker
+		// wakes with the real file id even after the tracker leaves the map.
+		upload.PublishFinalizeSuccess(fileID, actualFilename, total)
+		finalizePublished = true
+		// Cache the outcome before removing the tracker so a final-chunk retry
+		// arriving in the residual window (after cleanup) still gets the file id.
+		chunkManager.CacheFinalizeOutcome(tokenStr, uploadIdentifier, parentDir, filename, fileID, actualFilename, total)
+		chunkManager.CleanupTrackedUpload(upload)
 
-		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, total, fileID[:16])
+		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s, cached=%t", actualFilename, total, fileID[:16], uploadIdentifier != "")
 
 		// Record traffic and storage — fire-and-forget, never blocks the response.
 		if rec := traffic.Get(); rec != nil {
@@ -1474,11 +1899,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			}
 		}
 
-		if retJSON {
-			c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(total, 10)}})
-		} else {
-			c.String(http.StatusOK, fileID)
-		}
+		writeFinalizeSuccess(fileID, actualFilename, total)
 		return
 	}
 
@@ -1660,8 +2081,8 @@ var releaseUploadedBlockRefsFn = v2.ReleaseUploadedBlockRefs
 
 var zipBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDs
 
-var cleanupChunkUploadFn = func(token, filename string) {
-	chunkManager.CleanupUpload(token, filename)
+var cleanupChunkUploadFn = func(upload *ChunkUpload) {
+	chunkManager.CleanupTrackedUpload(upload)
 }
 
 func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenStr, filename string, upload *ChunkUpload, err error) {
@@ -1697,7 +2118,7 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 				accountedBlockIDs,
 			)
 		}
-		cleanupChunkUploadFn(tokenStr, filename)
+		cleanupChunkUploadFn(upload)
 		return
 	}
 	upload.ResetFinalization()

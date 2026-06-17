@@ -345,10 +345,13 @@ func newTestChunkManager(t *testing.T) (*ChunkManager, string) {
 	dir := t.TempDir()
 	cm := &ChunkManager{
 		uploads:         make(map[string]*ChunkUpload),
+		outcomes:        make(map[string]cachedFinalizeOutcome),
 		tempDir:         dir,
 		janitorInterval: time.Hour, // irrelevant — goroutine not started
 		trackerTTL:      1 * time.Hour,
 		diskTTL:         2 * time.Hour,
+		outcomeTTL:      chunkFinalizeOutcomeTTL,
+		outcomeLimit:    chunkFinalizeOutcomeLimit,
 		now:             time.Now,
 		stopCh:          make(chan struct{}),
 	}
@@ -853,7 +856,7 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	var rollbackCalled bool
 	var gotOrgID, gotRepoID string
 	var gotBlockIDs []string
-	var cleanedToken, cleanedFilename string
+	var cleanedUpload *ChunkUpload
 	var gotOperationID string
 	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
@@ -862,14 +865,15 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
-	cleanupChunkUploadFn = func(token, filename string) {
-		cleanedToken = token
-		cleanedFilename = filename
+	cleanupChunkUploadFn = func(upload *ChunkUpload) {
+		cleanedUpload = upload
 	}
 
 	h := &SeafHTTPHandler{}
 	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 	upload := &ChunkUpload{
+		Token:       "upload-token",
+		Filename:    "file.bin",
 		Finalizing:  true,
 		OperationID: "chunk-op-conflict",
 		accountedBlockPosition: map[int]string{
@@ -893,8 +897,8 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b", "block-a"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b", "block-a"})
 	}
-	if cleanedToken != "upload-token" || cleanedFilename != "file.bin" {
-		t.Fatalf("cleanup target = %s/%s, want upload-token/file.bin", cleanedToken, cleanedFilename)
+	if cleanedUpload != upload {
+		t.Fatal("cleanup should target the tracked upload instance")
 	}
 	if !upload.Finalizing {
 		t.Fatal("conflict cleanup should not reset tracker state before cleanup")
@@ -921,7 +925,7 @@ func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing
 		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
-	cleanupChunkUploadFn = func(token, filename string) {
+	cleanupChunkUploadFn = func(upload *ChunkUpload) {
 		cleanupCalled = true
 	}
 
@@ -968,7 +972,7 @@ func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
 	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 	}
-	cleanupChunkUploadFn = func(token, filename string) {
+	cleanupChunkUploadFn = func(upload *ChunkUpload) {
 		cleanupCalled = true
 	}
 
@@ -1006,7 +1010,7 @@ func TestHandleChunkedFinalizeError_CleansUpUnknownBlockMutationOutcome(t *testi
 		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
-	cleanupChunkUploadFn = func(token, filename string) {
+	cleanupChunkUploadFn = func(upload *ChunkUpload) {
 		cleanupCalled = true
 	}
 
@@ -2122,6 +2126,72 @@ func TestChunkManagerGetOrCreateUpload(t *testing.T) {
 	cm.CleanupUpload("token2", "file.txt")
 }
 
+func TestChunkManagerTracksSameBasenameSeparatelyByIdentityAndPath(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	uploadA, err := cm.GetOrCreateUploadByIdentity("token1", "ident-a", "/a", "file.txt", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadByIdentity(uploadA) failed: %v", err)
+	}
+	uploadAAgain, err := cm.GetOrCreateUploadByIdentity("token1", "ident-a", "/a", "file.txt", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadByIdentity(uploadA again) failed: %v", err)
+	}
+	if uploadAAgain != uploadA {
+		t.Fatal("same upload identity should reuse the tracked upload")
+	}
+
+	uploadB, err := cm.GetOrCreateUploadByIdentity("token1", "ident-b", "/b", "file.txt", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadByIdentity(uploadB) failed: %v", err)
+	}
+	defer cm.CleanupTrackedUpload(uploadB)
+
+	if uploadA == uploadB {
+		t.Fatal("different upload identities/paths must not share a tracker")
+	}
+	if uploadA.TempPath == uploadB.TempPath {
+		t.Fatalf("different tracked uploads must not share a temp path: %s", uploadA.TempPath)
+	}
+	if got := cm.GetUploadByIdentity("token1", "ident-a", "/a", "file.txt", 10); got != uploadA {
+		t.Fatal("GetUploadByIdentity should return uploadA")
+	}
+	if got := cm.GetUploadByIdentity("token1", "ident-b", "/b", "file.txt", 10); got != uploadB {
+		t.Fatal("GetUploadByIdentity should return uploadB")
+	}
+
+	cm.CleanupTrackedUpload(uploadA)
+	if got := cm.GetUploadByIdentity("token1", "ident-a", "/a", "file.txt", 10); got != nil {
+		t.Fatal("cleanup of uploadA should remove only uploadA")
+	}
+	if got := cm.GetUploadByIdentity("token1", "ident-b", "/b", "file.txt", 10); got != uploadB {
+		t.Fatal("cleanup of uploadA must not remove uploadB")
+	}
+}
+
+func TestChunkManagerFallbackTrackerKeySeparatesRepeatedBasenamesAcrossParentDirs(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	uploadA, err := cm.GetOrCreateUpload("token1", "same.txt", "/a", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload(uploadA) failed: %v", err)
+	}
+	defer cm.CleanupTrackedUpload(uploadA)
+
+	uploadB, err := cm.GetOrCreateUpload("token1", "same.txt", "/b", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload(uploadB) failed: %v", err)
+	}
+	defer cm.CleanupTrackedUpload(uploadB)
+
+	if uploadA == uploadB {
+		t.Fatal("different parent dirs must not share a fallback tracker")
+	}
+	if uploadA.TempPath == uploadB.TempPath {
+		t.Fatalf("different fallback trackers must not share a temp path: %s", uploadA.TempPath)
+	}
+}
+
 func TestChunkUploadWriteAndRead(t *testing.T) {
 	cm := NewChunkManager()
 
@@ -2323,6 +2393,214 @@ func TestChunkUploadWriteDuringFinalizationIsIdempotentOnly(t *testing.T) {
 	}
 	if string(content) != "helloworld" {
 		t.Fatalf("post-reset duplicate write mutated temp file: got %q", string(content))
+	}
+}
+
+// A second complete chunk request that arrives while finalization is already in
+// flight (e.g. a resumable retry of the final chunk after the original finalize
+// response was lost) must become a waiter and receive the same result the winner
+// publishes — not a bare {"success":true} ack the client cannot turn into a
+// dirent. This is the server-side root cause of big files reporting "Uploaded"
+// while never appearing in the listing.
+func TestChunkUploadClaimFinalizationWaiterReceivesWinnerResult(t *testing.T) {
+	cm := NewChunkManager()
+	upload, err := cm.GetOrCreateUpload("token-waiter", "big.zip", "/", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token-waiter", "big.zip")
+	}()
+
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk first chunk failed: %v", err)
+	}
+	if err := upload.WriteChunk([]byte("world"), 5, 9); err != nil {
+		t.Fatalf("WriteChunk second chunk failed: %v", err)
+	}
+
+	claim, _ := upload.ClaimFinalization()
+	if claim != finalizeClaimWinner {
+		t.Fatalf("first claim = %v, want winner", claim)
+	}
+
+	waiterClaim, waiterDone := upload.ClaimFinalization()
+	if waiterClaim != finalizeClaimWaiter {
+		t.Fatalf("second claim = %v, want waiter", waiterClaim)
+	}
+	if waiterDone == nil {
+		t.Fatal("waiter must receive a non-nil done channel")
+	}
+
+	select {
+	case <-waiterDone:
+		t.Fatal("waiter woke before the winner published a result")
+	default:
+	}
+
+	upload.PublishFinalizeSuccess("file-id-123", "big.zip", 10)
+
+	select {
+	case <-waiterDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter was not released after the winner published")
+	}
+
+	outcome, ok := upload.FinalizeOutcome()
+	if !ok || outcome == nil {
+		t.Fatal("waiter could not read the published finalize outcome")
+	}
+	if outcome.err != nil {
+		t.Fatalf("outcome.err = %v, want nil", outcome.err)
+	}
+	if outcome.fileID != "file-id-123" || outcome.actualFilename != "big.zip" || outcome.totalSize != 10 {
+		t.Fatalf("outcome = %+v, want fileID=file-id-123 name=big.zip size=10", outcome)
+	}
+}
+
+// A finalization failure must wake waiters with the error so they surface a
+// retryable response instead of a false success.
+func TestChunkUploadClaimFinalizationWaiterReceivesFailure(t *testing.T) {
+	cm := NewChunkManager()
+	upload, err := cm.GetOrCreateUpload("token-waiter-fail", "big.zip", "/", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token-waiter-fail", "big.zip")
+	}()
+
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk first chunk failed: %v", err)
+	}
+	if err := upload.WriteChunk([]byte("world"), 5, 9); err != nil {
+		t.Fatalf("WriteChunk second chunk failed: %v", err)
+	}
+
+	if claim, _ := upload.ClaimFinalization(); claim != finalizeClaimWinner {
+		t.Fatalf("first claim = %v, want winner", claim)
+	}
+	_, waiterDone := upload.ClaimFinalization()
+
+	finalizeErr := fmt.Errorf("block store unavailable")
+	upload.PublishFinalizeFailure(finalizeErr)
+
+	select {
+	case <-waiterDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter was not released after the winner published a failure")
+	}
+
+	outcome, ok := upload.FinalizeOutcome()
+	if !ok || outcome == nil || outcome.err == nil {
+		t.Fatalf("waiter outcome = %+v, want a non-nil error", outcome)
+	}
+	if !errors.Is(outcome.err, finalizeErr) {
+		t.Fatalf("outcome.err = %v, want %v", outcome.err, finalizeErr)
+	}
+}
+
+// The finalize-outcome cache lets a final-chunk retry that lands after the
+// winner already finalized AND cleaned up its tracker still receive the real
+// file id, instead of a bare ack the client cannot confirm. This is the
+// residual window behind big files reporting failure when retried late amid
+// other concurrent uploads.
+func TestChunkManagerFinalizeOutcomeCache(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+	base := time.Now()
+	cm.now = func() time.Time { return base }
+	cm.outcomeTTL = 5 * time.Minute
+
+	const id = "ident-A"
+	cm.CacheFinalizeOutcome("tok", id, "/", "big.zip", "file-id-123", "big.zip", 100)
+
+	got, ok := cm.LookupFinalizeOutcome("tok", id, "/", "big.zip", 100)
+	if !ok {
+		t.Fatal("expected cached finalize outcome to be found")
+	}
+	if got.fileID != "file-id-123" || got.actualFilename != "big.zip" || got.totalSize != 100 {
+		t.Fatalf("cached outcome = %+v, want fileID=file-id-123 name=big.zip size=100", got)
+	}
+
+	// A different total size must NOT match (cheap extra guard).
+	if _, ok := cm.LookupFinalizeOutcome("tok", id, "/", "big.zip", 999); ok {
+		t.Fatal("size mismatch must miss the cache")
+	}
+	// A different token must not collide.
+	if _, ok := cm.LookupFinalizeOutcome("other-tok", id, "/", "big.zip", 100); ok {
+		t.Fatal("different token must miss the cache")
+	}
+	// Same basename + same size but a DIFFERENT parent dir (folder upload through
+	// the same token) must not read the other file's id.
+	if _, ok := cm.LookupFinalizeOutcome("tok", id, "/sub", "big.zip", 100); ok {
+		t.Fatal("different parent dir must miss the cache")
+	}
+	// A DIFFERENT upload identifier (a new upload of the same name/size/path,
+	// possibly different content) must miss, never reading the stale id.
+	if _, ok := cm.LookupFinalizeOutcome("tok", "ident-B", "/", "big.zip", 100); ok {
+		t.Fatal("different upload identifier must miss the cache")
+	}
+	// An empty identifier must never be cached nor served, so a client that does
+	// not send one can never read another upload's id.
+	cm.CacheFinalizeOutcome("tok", "", "/", "no-ident.zip", "leaked-id", "no-ident.zip", 100)
+	if _, ok := cm.LookupFinalizeOutcome("tok", "", "/", "no-ident.zip", 100); ok {
+		t.Fatal("empty identifier must never hit the cache")
+	}
+
+	// After the TTL the entry must miss and be swept.
+	cm.now = func() time.Time { return base.Add(6 * time.Minute) }
+	if _, ok := cm.LookupFinalizeOutcome("tok", id, "/", "big.zip", 100); ok {
+		t.Fatal("expired entry must miss the cache")
+	}
+	cm.sweepOnce()
+	cm.mu.RLock()
+	remaining := len(cm.outcomes)
+	cm.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("expired entries must be swept from the cache, %d remain", remaining)
+	}
+}
+
+func TestChunkManagerFinalizeOutcomeCacheCapacityEvictsOldest(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+	base := time.Now()
+	current := base
+	cm.now = func() time.Time { return current }
+	cm.outcomeTTL = time.Hour
+	cm.outcomeLimit = 2
+
+	beforeCapacityEvictions := testutil.ToFloat64(metrics.ChunkUploadFinalizeOutcomeCacheEvictionsTotal.WithLabelValues("capacity"))
+
+	cm.CacheFinalizeOutcome("tok", "ident-A", "/", "a.bin", "file-a", "a.bin", 10)
+	current = base.Add(1 * time.Second)
+	cm.CacheFinalizeOutcome("tok", "ident-B", "/", "b.bin", "file-b", "b.bin", 20)
+	current = base.Add(2 * time.Second)
+	cm.CacheFinalizeOutcome("tok", "ident-C", "/", "c.bin", "file-c", "c.bin", 30)
+
+	cm.mu.RLock()
+	size := len(cm.outcomes)
+	cm.mu.RUnlock()
+	if size != 2 {
+		t.Fatalf("outcome cache size = %d, want 2 after capacity pruning", size)
+	}
+
+	if _, ok := cm.LookupFinalizeOutcome("tok", "ident-A", "/", "a.bin", 10); ok {
+		t.Fatal("oldest cached outcome should be evicted once the hard cap is exceeded")
+	}
+	if _, ok := cm.LookupFinalizeOutcome("tok", "ident-B", "/", "b.bin", 20); !ok {
+		t.Fatal("second cached outcome should remain after capacity pruning")
+	}
+	if _, ok := cm.LookupFinalizeOutcome("tok", "ident-C", "/", "c.bin", 30); !ok {
+		t.Fatal("newest cached outcome should remain after capacity pruning")
+	}
+
+	if got := testutil.ToFloat64(metrics.ChunkUploadFinalizeOutcomeCacheEntries); got != 2 {
+		t.Fatalf("outcome cache size gauge = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(metrics.ChunkUploadFinalizeOutcomeCacheEvictionsTotal.WithLabelValues("capacity")); got != beforeCapacityEvictions+1 {
+		t.Fatalf("capacity eviction counter = %v, want %v", got, beforeCapacityEvictions+1)
 	}
 }
 
@@ -2914,6 +3192,9 @@ func TestChunkUploadQuotaPrecheckCacheMatchesMetadata(t *testing.T) {
 	}
 	if got := cm.GetUpload("token1", "test.bin"); got != upload {
 		t.Fatal("GetUpload should return the tracked upload instance")
+	}
+	if got := cm.GetUploadByIdentity("token1", "", "/docs", "test.bin", 10); got != upload {
+		t.Fatal("GetUploadByIdentity should return the tracked upload instance")
 	}
 	if got := cm.GetUpload("token1", "missing.bin"); got != nil {
 		t.Fatal("GetUpload should return nil for unknown uploads")

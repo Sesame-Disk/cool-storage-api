@@ -3,9 +3,33 @@ import {
     consumeSuppressedUploadErrorToast,
     markUploadConflictAutoRetry,
     moveUploadToRetryState,
+    parseUploadSuccessEntry,
     resetUploadConflictAutoRetry,
+    resolveUploadSuccessResult,
     shouldAutoRetryUploadConflict,
+    trackUploadResponseStatus,
 } from '../upload-finalization';
+
+// Minimal XMLHttpRequest stand-in: records 'readystatechange' listeners and
+// replays them once the response is "received" so we can drive the same code
+// path the browser does after a chunk completes.
+class FakeXhr {
+    constructor(status, responseText) {
+        this.readyState = 0;
+        this.status = status;
+        this.responseText = responseText;
+        this._listeners = {};
+    }
+
+    addEventListener(type, callback) {
+        (this._listeners[type] = this._listeners[type] || []).push(callback);
+    }
+
+    complete() {
+        this.readyState = 4;
+        (this._listeners.readystatechange || []).forEach(callback => callback());
+    }
+}
 
 describe('upload finalization helpers', () => {
     test('auto-retries the finalize conflict only once per file until reset', () => {
@@ -64,5 +88,103 @@ describe('upload finalization helpers', () => {
         expect(nextState.uploadFileList[0].lastUploadResponseStatus).toBeNull();
         expect(nextState.uploadFileList[0].finalizeConflictAutoRetried).toBe(false);
         expect(nextState.uploadFileList[0].suppressNextUploadErrorToast).toBe(false);
+    });
+});
+
+describe('upload finalize result resolution', () => {
+    const finalizeEntry = { name: 'big.zip', id: 'abc123', size: '2684354560' };
+
+    test('parses a finalize array into its entry and rejects intermediate acks', () => {
+        expect(parseUploadSuccessEntry(JSON.stringify([finalizeEntry]))).toEqual(finalizeEntry);
+        expect(parseUploadSuccessEntry(JSON.stringify({ success: true }))).toBeNull();
+        expect(parseUploadSuccessEntry('[]')).toBeNull();
+        expect(parseUploadSuccessEntry('not-json')).toBeNull();
+        expect(parseUploadSuccessEntry('')).toBeNull();
+        expect(parseUploadSuccessEntry(null)).toBeNull();
+    });
+
+    test('resolves directly from a finalize-array message', () => {
+        expect(resolveUploadSuccessResult({}, JSON.stringify([finalizeEntry]), false)).toEqual({ entry: finalizeEntry });
+    });
+
+    test('falls back to captured metadata when fileSuccess receives an intermediate ack', () => {
+        // Reproduces production: the finalize chunk and an intermediate chunk are
+        // both in flight. The finalize chunk responds first with the file array;
+        // the intermediate ack ({"success":true}) responds last, so resumable.js
+        // hands THAT body to fileSuccess. Before the fix this crashed on .id.
+        const resumableFile = {};
+        const finalizeChunk = { xhr: new FakeXhr(200, JSON.stringify([finalizeEntry])) };
+        const ackChunk = { xhr: new FakeXhr(200, JSON.stringify({ success: true })) };
+
+        trackUploadResponseStatus(resumableFile, finalizeChunk);
+        trackUploadResponseStatus(resumableFile, ackChunk);
+
+        finalizeChunk.xhr.complete();
+        ackChunk.xhr.complete();
+
+        expect(resumableFile.finalizeResult).toEqual(finalizeEntry);
+        expect(resolveUploadSuccessResult(resumableFile, ackChunk.xhr.responseText, false)).toEqual({ entry: finalizeEntry });
+    });
+
+    test('a late intermediate ack does not clobber already-captured finalize metadata', () => {
+        const resumableFile = {};
+        const finalizeChunk = { xhr: new FakeXhr(200, JSON.stringify([finalizeEntry])) };
+        const ackChunk = { xhr: new FakeXhr(200, JSON.stringify({ success: true })) };
+
+        trackUploadResponseStatus(resumableFile, finalizeChunk);
+        trackUploadResponseStatus(resumableFile, ackChunk);
+
+        finalizeChunk.xhr.complete();
+        ackChunk.xhr.complete();
+
+        expect(resumableFile.finalizeResult).toEqual(finalizeEntry);
+    });
+
+    test('replace mode resolves the raw file id and falls back to captured raw id', () => {
+        expect(resolveUploadSuccessResult({}, 'deadbeefcafe', true)).toEqual({ id: 'deadbeefcafe' });
+
+        const resumableFile = {};
+        const finalizeChunk = { xhr: new FakeXhr(200, 'deadbeefcafe') };
+        const ackChunk = { xhr: new FakeXhr(200, JSON.stringify({ success: true })) };
+
+        trackUploadResponseStatus(resumableFile, finalizeChunk);
+        trackUploadResponseStatus(resumableFile, ackChunk);
+
+        finalizeChunk.xhr.complete();
+        ackChunk.xhr.complete();
+
+        expect(resumableFile.finalizeResultRaw).toBe('deadbeefcafe');
+        expect(resolveUploadSuccessResult(resumableFile, JSON.stringify({ success: true }), true)).toEqual({ id: 'deadbeefcafe' });
+    });
+
+    test('returns null when no finalize metadata is available anywhere', () => {
+        expect(resolveUploadSuccessResult({}, JSON.stringify({ success: true }), false)).toBeNull();
+        expect(resolveUploadSuccessResult({}, JSON.stringify({ success: true }), true)).toBeNull();
+    });
+
+    test('re-tracks a reused chunk when resumable.js swaps in a fresh XHR on retry', () => {
+        // resumable.js keeps the same chunk object across retries but assigns a
+        // new XHR. A per-chunk guard would leave the retry XHR untracked; the
+        // per-XHR guard must re-attach so the retry response is still captured.
+        const resumableFile = {};
+        const chunk = { xhr: new FakeXhr(0, '') };
+
+        trackUploadResponseStatus(resumableFile, chunk);
+        chunk.xhr.complete(); // first attempt failed (status 0, no body)
+        expect(resumableFile.finalizeResult).toBeUndefined();
+
+        // Retry: same chunk object, brand-new XHR carrying the finalize array.
+        chunk.xhr = new FakeXhr(200, JSON.stringify([finalizeEntry]));
+        trackUploadResponseStatus(resumableFile, chunk);
+        chunk.xhr.complete();
+
+        expect(resumableFile.finalizeResult).toEqual(finalizeEntry);
+    });
+
+    test('clearing runtime state drops captured finalize metadata so retries start clean', () => {
+        const resumableFile = { finalizeResult: finalizeEntry, finalizeResultRaw: 'deadbeefcafe' };
+        clearFileUploadRuntimeState(resumableFile);
+        expect(resumableFile.finalizeResult).toBeNull();
+        expect(resumableFile.finalizeResultRaw).toBeNull();
     });
 });
