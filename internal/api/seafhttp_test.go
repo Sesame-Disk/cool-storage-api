@@ -351,6 +351,7 @@ func newTestChunkManager(t *testing.T) (*ChunkManager, string) {
 		trackerTTL:      1 * time.Hour,
 		diskTTL:         2 * time.Hour,
 		outcomeTTL:      chunkFinalizeOutcomeTTL,
+		outcomeLimit:    chunkFinalizeOutcomeLimit,
 		now:             time.Now,
 		stopCh:          make(chan struct{}),
 	}
@@ -2559,6 +2560,47 @@ func TestChunkManagerFinalizeOutcomeCache(t *testing.T) {
 	cm.mu.RUnlock()
 	if remaining != 0 {
 		t.Fatalf("expired entries must be swept from the cache, %d remain", remaining)
+	}
+}
+
+func TestChunkManagerFinalizeOutcomeCacheCapacityEvictsOldest(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+	base := time.Now()
+	current := base
+	cm.now = func() time.Time { return current }
+	cm.outcomeTTL = time.Hour
+	cm.outcomeLimit = 2
+
+	beforeCapacityEvictions := testutil.ToFloat64(metrics.ChunkUploadFinalizeOutcomeCacheEvictionsTotal.WithLabelValues("capacity"))
+
+	cm.CacheFinalizeOutcome("tok", "ident-A", "/", "a.bin", "file-a", "a.bin", 10)
+	current = base.Add(1 * time.Second)
+	cm.CacheFinalizeOutcome("tok", "ident-B", "/", "b.bin", "file-b", "b.bin", 20)
+	current = base.Add(2 * time.Second)
+	cm.CacheFinalizeOutcome("tok", "ident-C", "/", "c.bin", "file-c", "c.bin", 30)
+
+	cm.mu.RLock()
+	size := len(cm.outcomes)
+	cm.mu.RUnlock()
+	if size != 2 {
+		t.Fatalf("outcome cache size = %d, want 2 after capacity pruning", size)
+	}
+
+	if _, ok := cm.LookupFinalizeOutcome("tok", "ident-A", "/", "a.bin", 10); ok {
+		t.Fatal("oldest cached outcome should be evicted once the hard cap is exceeded")
+	}
+	if _, ok := cm.LookupFinalizeOutcome("tok", "ident-B", "/", "b.bin", 20); !ok {
+		t.Fatal("second cached outcome should remain after capacity pruning")
+	}
+	if _, ok := cm.LookupFinalizeOutcome("tok", "ident-C", "/", "c.bin", 30); !ok {
+		t.Fatal("newest cached outcome should remain after capacity pruning")
+	}
+
+	if got := testutil.ToFloat64(metrics.ChunkUploadFinalizeOutcomeCacheEntries); got != 2 {
+		t.Fatalf("outcome cache size gauge = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(metrics.ChunkUploadFinalizeOutcomeCacheEvictionsTotal.WithLabelValues("capacity")); got != beforeCapacityEvictions+1 {
+		t.Fatalf("capacity eviction counter = %v, want %v", got, beforeCapacityEvictions+1)
 	}
 }
 

@@ -358,6 +358,11 @@ const (
 	// Safe to keep generous because the cache key includes the per-upload resumable
 	// identifier, so it can only ever match a retry of that same upload.
 	chunkFinalizeOutcomeTTL = 15 * time.Minute
+	// chunkFinalizeOutcomeLimit is a hard safety fuse for the residual finalize-
+	// outcome cache. 64k entries still covers dozens of finalized uploads/sec
+	// across the 15-minute TTL window, while preventing sustained upload traffic
+	// from growing the cache without bound between janitor sweeps.
+	chunkFinalizeOutcomeLimit = 64 * 1024
 )
 
 // cachedFinalizeOutcome retains a finalized upload's result after its tracker is
@@ -380,11 +385,12 @@ type ChunkManager struct {
 	mu       sync.RWMutex
 	tempDir  string
 
-	// Janitor config — overridable in tests.
+	// Janitor/cache config — overridable in tests.
 	janitorInterval time.Duration
 	trackerTTL      time.Duration
 	diskTTL         time.Duration
 	outcomeTTL      time.Duration
+	outcomeLimit    int
 	now             func() time.Time
 
 	janitorOnce sync.Once
@@ -401,6 +407,7 @@ func NewChunkManager() *ChunkManager {
 		trackerTTL:      chunkTrackerTTL,
 		diskTTL:         chunkDiskTTL,
 		outcomeTTL:      chunkFinalizeOutcomeTTL,
+		outcomeLimit:    chunkFinalizeOutcomeLimit,
 		now:             time.Now,
 		stopCh:          make(chan struct{}),
 	}
@@ -461,14 +468,16 @@ func (cm *ChunkManager) CacheFinalizeOutcome(token, identifier, parentDir, filen
 		return
 	}
 	key := chunkFinalizeOutcomeKey(token, identifier, parentDir, filename)
+	now := cm.now()
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.outcomes[key] = cachedFinalizeOutcome{
 		fileID:         fileID,
 		actualFilename: actualFilename,
 		totalSize:      totalSize,
-		expiresAt:      cm.now().Add(cm.outcomeTTL),
+		expiresAt:      now.Add(cm.outcomeTTL),
 	}
+	cm.pruneFinalizeOutcomesLocked(now)
 }
 
 // LookupFinalizeOutcome returns a cached finalize result if present, unexpired,
@@ -493,6 +502,44 @@ func (cm *ChunkManager) StartJanitor() {
 	cm.janitorOnce.Do(func() {
 		go cm.janitorLoop()
 	})
+}
+
+func (cm *ChunkManager) pruneFinalizeOutcomesLocked(now time.Time) {
+	for key, cached := range cm.outcomes {
+		if !now.Before(cached.expiresAt) {
+			delete(cm.outcomes, key)
+			metrics.ChunkUploadFinalizeOutcomeCacheEvictionsTotal.WithLabelValues("expired").Inc()
+		}
+	}
+
+	if cm.outcomeLimit > 0 && len(cm.outcomes) > cm.outcomeLimit {
+		type evictionCandidate struct {
+			key       string
+			expiresAt time.Time
+		}
+
+		candidates := make([]evictionCandidate, 0, len(cm.outcomes))
+		for key, cached := range cm.outcomes {
+			candidates = append(candidates, evictionCandidate{
+				key:       key,
+				expiresAt: cached.expiresAt,
+			})
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].expiresAt.Equal(candidates[j].expiresAt) {
+				return candidates[i].key < candidates[j].key
+			}
+			return candidates[i].expiresAt.Before(candidates[j].expiresAt)
+		})
+
+		overflow := len(cm.outcomes) - cm.outcomeLimit
+		for i := 0; i < overflow; i++ {
+			delete(cm.outcomes, candidates[i].key)
+			metrics.ChunkUploadFinalizeOutcomeCacheEvictionsTotal.WithLabelValues("capacity").Inc()
+		}
+	}
+
+	metrics.ChunkUploadFinalizeOutcomeCacheEntries.Set(float64(len(cm.outcomes)))
 }
 
 // Stop halts the janitor goroutine. Intended for tests.
@@ -618,12 +665,9 @@ func (cm *ChunkManager) sweepOnce() {
 	for _, key := range staleKeys {
 		delete(cm.uploads, key)
 	}
-	// Drop expired finalize-outcome cache entries in the same pass.
-	for key, cached := range cm.outcomes {
-		if !now.Before(cached.expiresAt) {
-			delete(cm.outcomes, key)
-		}
-	}
+	// Sweep cached finalize outcomes in the same pass so both expiration and the
+	// hard-cap safety fuse stay enforced even when writes go quiet.
+	cm.pruneFinalizeOutcomesLocked(now)
 	aliveTempPaths := make(map[string]struct{}, len(cm.uploads))
 	for _, upload := range cm.uploads {
 		aliveTempPaths[upload.TempPath] = struct{}{}

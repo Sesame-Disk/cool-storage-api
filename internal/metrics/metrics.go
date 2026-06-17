@@ -276,6 +276,25 @@ var (
 		[]string{"result"}, // "started", "not_complete", or "already_finalizing"
 	)
 
+	// ChunkUploadFinalizeOutcomeCacheEntries reports the current number of
+	// residual finalized-upload outcomes kept for late final-chunk retries.
+	ChunkUploadFinalizeOutcomeCacheEntries = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "chunk_upload_finalize_outcome_cache_entries",
+			Help: "Current number of cached finalized chunk-upload outcomes retained for late retries.",
+		},
+	)
+
+	// ChunkUploadFinalizeOutcomeCacheEvictionsTotal counts removals from the
+	// residual finalize-outcome cache, whether by TTL expiry or hard-cap pressure.
+	ChunkUploadFinalizeOutcomeCacheEvictionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "chunk_upload_finalize_outcome_cache_evictions_total",
+			Help: "Total number of cached finalized chunk-upload outcomes evicted from the residual retry cache.",
+		},
+		[]string{"reason"}, // "expired" or "capacity"
+	)
+
 	// UploadFinalizeHeadConflictsTotal counts metadata publish conflicts that
 	// force an upload finalize retry.
 	UploadFinalizeHeadConflictsTotal = prometheus.NewCounterVec(
@@ -354,6 +373,8 @@ func Register() {
 		GCAuditEventsTotal,
 		ChunkUploadTempOrphansCleaned,
 		ChunkUploadFinalizationAttemptsTotal,
+		ChunkUploadFinalizeOutcomeCacheEntries,
+		ChunkUploadFinalizeOutcomeCacheEvictionsTotal,
 		UploadFinalizeHeadConflictsTotal,
 		UploadFinalizeRetryExhaustedTotal,
 		UploadFinalizeAttempts,
