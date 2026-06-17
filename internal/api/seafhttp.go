@@ -879,6 +879,39 @@ func (cu *ChunkUpload) isCompleteLocked() bool {
 		cu.Ranges[0].End >= cu.TotalSize-1
 }
 
+// DebugCompletenessSnapshot returns the tracker's completeness state for
+// diagnostics: whether it is complete, the first missing byte range (gap), the
+// number of merged ranges, and the total received bytes. Used to pinpoint why a
+// chunked upload never finalizes despite the final-offset chunk having arrived.
+func (cu *ChunkUpload) DebugCompletenessSnapshot() (complete bool, firstGapStart, firstGapEnd int64, rangeCount int, receivedBytes int64) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	complete = cu.isCompleteLocked()
+	rangeCount = len(cu.Ranges)
+	firstGapStart, firstGapEnd = -1, -1
+	for _, r := range cu.Ranges {
+		receivedBytes += r.End - r.Start + 1
+	}
+	if complete {
+		return complete, firstGapStart, firstGapEnd, rangeCount, receivedBytes
+	}
+	// Ranges are kept sorted+merged by markRangeReceivedLocked, so the first gap
+	// is either before the first range, between two ranges, or after the last.
+	cursor := int64(0)
+	for _, r := range cu.Ranges {
+		if r.Start > cursor {
+			return complete, cursor, r.Start - 1, rangeCount, receivedBytes
+		}
+		if r.End+1 > cursor {
+			cursor = r.End + 1
+		}
+	}
+	if cursor < cu.TotalSize {
+		firstGapStart, firstGapEnd = cursor, cu.TotalSize-1
+	}
+	return complete, firstGapStart, firstGapEnd, rangeCount, receivedBytes
+}
+
 func (cu *ChunkUpload) hasRangeLocked(start, end int64) bool {
 	for _, r := range cu.Ranges {
 		if start >= r.Start && end <= r.End {
@@ -1663,14 +1696,18 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	if isChunked {
 		// A finalize result cached for this upload means it already completed —
-		// this is a late retry of the final chunk (the winner published and the
-		// tracker was already cleaned up). Answer with the real file id so the
-		// client builds the dirent instead of failing with "could not be
-		// confirmed". Only short-circuit for the final chunk (end == total-1):
-		// the only chunk a client retries after finalize is the one that carried
-		// the finalize, so we never hand out metadata to an earlier-chunk request.
-		isFinalChunk := total > 0 && end == total-1
-		if cached, ok := chunkManager.LookupFinalizeOutcome(tokenStr, uploadIdentifier, parentDir, filename, total); ok && isFinalChunk {
+		// this is a late retry of whichever chunk carried the finalize (the
+		// winner published and the tracker was already cleaned up). Answer with
+		// the real file id so the client builds the dirent instead of failing
+		// with "could not be confirmed".
+		//
+		// We must NOT gate this on end == total-1: with simultaneous_uploads > 1
+		// chunks arrive out of order, so the chunk that completes contiguity (and
+		// runs finalization) is arbitrary — frequently NOT the final-offset chunk.
+		// Gating on the final offset re-broke exactly this case. The cache key is
+		// the per-upload resumable identifier, so any matching request is by
+		// definition a retry of this already-finalized upload and safe to answer.
+		if cached, ok := chunkManager.LookupFinalizeOutcome(tokenStr, uploadIdentifier, parentDir, filename, total); ok {
 			log.Printf("[HandleUpload] Returning cached finalize result for late retry: %s", filename)
 			if retJSON {
 				c.JSON(http.StatusOK, []gin.H{{"name": cached.actualFilename, "id": cached.fileID, "size": strconv.FormatInt(cached.totalSize, 10)}})
@@ -1719,6 +1756,21 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 		claim, finalizeDone := upload.ClaimFinalization()
 		if claim == finalizeClaimIncomplete {
+			// Out-of-order chunks routinely arrive while the upload is still
+			// incomplete — normal under concurrency, and it must stay a 200 ack so
+			// the client keeps sending the remaining chunks. The healthy case has
+			// its gap near the END (a middle/late chunk still in flight). But a gap
+			// that starts at byte 0 — the prefix is missing even though the final
+			// byte has arrived — is never normal: it means chunks were split across
+			// trackers (e.g. the upload token changed mid-flight) so this tracker
+			// will never reach contiguity. Log only that anomaly to avoid noise.
+			if end >= total-1 {
+				_, gapStart, gapEnd, ranges, received := upload.DebugCompletenessSnapshot()
+				if gapStart == 0 {
+					log.Printf("[HandleUpload] FINAL_CHUNK_BUT_INCOMPLETE (prefix missing — tracker split?) op=%s file=%q first_gap=%d-%d ranges=%d received=%d/%d identifier=%q",
+						upload.OperationID, filename, gapStart, gapEnd, ranges, received, total, uploadIdentifier)
+				}
+			}
 			log.Printf("[HandleUpload] Chunk received, waiting for more: %d/%d", end+1, total)
 			c.JSON(http.StatusOK, gin.H{"success": true})
 			return
@@ -1751,7 +1803,13 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 
 		// claim == finalizeClaimWinner — this request owns finalization.
-		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming)")
+		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming): file=%s identifier=%q", filename, uploadIdentifier)
+		if uploadIdentifier == "" {
+			// Without an identifier the finalize-outcome cache is disabled, so a
+			// final-chunk retry that lands after cleanup cannot be answered and the
+			// client will report "could not be confirmed". Surface it loudly.
+			log.Printf("[HandleUpload] WARNING: chunked finalize has no resumableIdentifier; late-retry outcome cache is DISABLED for file=%s", filename)
+		}
 		upload.Touch()
 		// Safety net: never leave waiters blocked. If finalization panics before
 		// publishing, release them with a retryable error.
@@ -1779,7 +1837,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		chunkManager.CacheFinalizeOutcome(tokenStr, uploadIdentifier, parentDir, filename, fileID, actualFilename, total)
 		chunkManager.CleanupTrackedUpload(upload)
 
-		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, total, fileID[:16])
+		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s, cached=%t", actualFilename, total, fileID[:16], uploadIdentifier != "")
 
 		// Record traffic and storage — fire-and-forget, never blocks the response.
 		if rec := traffic.Get(); rec != nil {

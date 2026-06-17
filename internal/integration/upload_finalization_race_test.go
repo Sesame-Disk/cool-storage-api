@@ -748,6 +748,77 @@ func TestChunkedUploadSameBasenameDifferentDirsStayIsolated(t *testing.T) {
 	expectEntriesPresent(t, repoID, "/b", []string{fileName})
 }
 
+// With simultaneous_uploads > 1 the browser sends chunks out of order, so the
+// chunk that completes contiguity and runs finalization is frequently NOT the
+// final-offset chunk (end == total-1). When that winner chunk's long-held
+// request is cut by a proxy and retried after finalization already cleaned up
+// the tracker, the retry must still receive the real finalize result from the
+// cache — not a bare {"success":true} ack that the client turns into
+// "Upload could not be confirmed". This reproduces the 12 GB out-of-order
+// failure and guards against re-gating the cache on the final offset.
+func TestChunkedUploadOutOfOrderWinnerRetryReturnsCachedResult(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-out-of-order-winner-%d", time.Now().UnixNano()))
+	uploadURL := getUploadLink(t, adminClient, repoID, "/")
+	retJSONUploadURL := uploadURL + "?ret-json=1"
+
+	fileName := "out-of-order.bin"
+	content := []byte("0123456789abcdefghijklmn") // 24 bytes → three 8-byte chunks
+	const total = 24
+
+	// Chunk 0 [0-7]: not complete yet.
+	status, body := uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, "/", content[0:8], "bytes 0-7/24")
+	if status != http.StatusOK {
+		t.Fatalf("chunk[0-7] status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+
+	// FINAL-offset chunk [16-23] (end == total-1) arrives BEFORE the middle chunk,
+	// so a gap remains and it must NOT finalize — it gets an intermediate ack.
+	status, body = uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, "/", content[16:24], "bytes 16-23/24")
+	if status != http.StatusOK {
+		t.Fatalf("chunk[16-23] status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	var ackProbe []map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &ackProbe); err == nil && len(ackProbe) == 1 {
+		t.Fatalf("final-offset chunk finalized despite a gap; body=%s", body)
+	}
+
+	// MIDDLE chunk [8-15] (end != total-1) closes the gap → it is the finalize
+	// winner and returns the file array.
+	status, body = uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, "/", content[8:16], "bytes 8-15/24")
+	if status != http.StatusOK {
+		t.Fatalf("winner chunk[8-15] status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	var winnerPayload []map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &winnerPayload); err != nil || len(winnerPayload) != 1 {
+		t.Fatalf("winner chunk[8-15] did not return a finalize array: %v body=%s", err, body)
+	}
+	winnerID, _ := winnerPayload[0]["id"].(string)
+	if winnerID == "" {
+		t.Fatalf("winner chunk returned empty file id; body=%s", body)
+	}
+
+	// Residual retry of the WINNER chunk [8-15] (end != total-1) after the tracker
+	// was cleaned up: must be answered from the cache with the same finalize
+	// array, regardless of its offset.
+	status, body = uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, "/", content[8:16], "bytes 8-15/24")
+	if status != http.StatusOK {
+		t.Fatalf("residual retry status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	var retryPayload []map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &retryPayload); err != nil {
+		t.Fatalf("residual retry of non-final winner chunk returned a bare ack instead of the finalize array (regression): %v body=%s", err, body)
+	}
+	if len(retryPayload) != 1 {
+		t.Fatalf("residual retry payload length = %d, want 1; body=%s", len(retryPayload), body)
+	}
+	if got, _ := retryPayload[0]["id"].(string); got != winnerID {
+		t.Fatalf("residual retry id = %q, want same as winner %q; body=%s", got, winnerID, body)
+	}
+
+	expectEntriesPresent(t, repoID, "/", []string{fileName})
+	expectEntriesAbsent(t, repoID, "/", []string{"out-of-order (1).bin"})
+}
+
 func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.T) {
 	requireGCEnabled(t)
 	requireCassandra(t)
