@@ -1760,14 +1760,14 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			// incomplete — normal under concurrency, and it must stay a 200 ack so
 			// the client keeps sending the remaining chunks. The healthy case has
 			// its gap near the END (a middle/late chunk still in flight). But a gap
-			// that starts at byte 0 — the prefix is missing even though the final
-			// byte has arrived — is never normal: it means chunks were split across
-			// trackers (e.g. the upload token changed mid-flight) so this tracker
-			// will never reach contiguity. Log only that anomaly to avoid noise.
+			// that starts at byte 0 — the prefix is still missing even though the
+			// final byte has arrived — is the suspicious shape we saw when chunks
+			// were split across trackers after a token change. It can still be
+			// transient under reordering, so keep the log explicitly diagnostic-only.
 			if end >= total-1 {
 				_, gapStart, gapEnd, ranges, received := upload.DebugCompletenessSnapshot()
 				if gapStart == 0 {
-					log.Printf("[HandleUpload] FINAL_CHUNK_BUT_INCOMPLETE (prefix missing — tracker split?) op=%s file=%q first_gap=%d-%d ranges=%d received=%d/%d identifier=%q",
+					log.Printf("[HandleUpload] FINAL_CHUNK_BUT_INCOMPLETE (prefix missing; possible tracker split or earlier chunks still in flight) op=%s file=%q first_gap=%d-%d ranges=%d received=%d/%d identifier=%q",
 						upload.OperationID, filename, gapStart, gapEnd, ranges, received, total, uploadIdentifier)
 				}
 			}

@@ -509,8 +509,13 @@ class FileUploader extends React.Component {
   };
 
   onError = (message) => {
-    // reset upload link loaded
-    this.isUploadLinkLoaded = false;
+    // A file-level error can fan out to the global error event before every
+    // other chunk/file in the queue has stopped. Keep reusing the session link
+    // until the queue is actually idle so a later file add cannot mint a new
+    // token and split an in-flight upload across trackers.
+    if (!this.resumable || !this.resumable.isUploading()) {
+      this.isUploadLinkLoaded = false;
+    }
     // After the error, the user can switch windows
     Utils.registerGlobalVariable('uploader', 'totalProgress', 100);
   };
@@ -687,6 +692,7 @@ class FileUploader extends React.Component {
       // Per-file target (file.opts wins over the shared resumable.opts in
       // getOpt) so accepting the "upload anyway" dialog for one file never
       // overwrites the global target and reroutes other in-flight uploads.
+      resumableFile.opts = resumableFile.opts || {};
       resumableFile.opts.target = res.data.upload_link + '?ret-json=1';
       this.setState({
         isUploadRemindDialogShow: false,
