@@ -2141,6 +2141,23 @@ func TestChunkManagerGetOrCreateUploadRejectsConfiguredMaxUploadBytes(t *testing
 	}
 }
 
+func TestChunkManagerGetOrCreateUploadRejectsNonPositiveTotalSize(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	for _, total := range []int64{0, -1} {
+		upload, err := cm.GetOrCreateUploadWithLimits("token1", "bad-total.bin", "/", total, 0, 0)
+		if upload != nil {
+			t.Fatalf("total=%d: upload should be nil for non-positive total size", total)
+		}
+		if !errors.Is(err, errChunkedUploadInvalidTotalSize) {
+			t.Fatalf("total=%d: error = %v, want errChunkedUploadInvalidTotalSize", total, err)
+		}
+		if got := cm.GetUpload("token1", "bad-total.bin"); got != nil {
+			t.Fatalf("total=%d: rejected upload must not stay tracked", total)
+		}
+	}
+}
+
 func TestChunkManagerGetOrCreateUploadRejectsWhenStagingBudgetWouldBeExceeded(t *testing.T) {
 	cm, _ := newTestChunkManager(t)
 

@@ -558,6 +558,7 @@ var chunkManager = NewChunkManager()
 var (
 	errChunkedUploadTooLarge             = errors.New("chunked upload exceeds configured max upload size")
 	errChunkedUploadStagingLimitExceeded = errors.New("chunked upload staging capacity exceeded")
+	errChunkedUploadInvalidTotalSize     = errors.New("chunked upload requires a positive total size")
 	errInvalidChunkRange                 = errors.New("invalid chunk range")
 )
 
@@ -580,13 +581,20 @@ func (cm *ChunkManager) reservedStagingBytesLocked() int64 {
 }
 
 func (cm *ChunkManager) validateUploadByKeyLocked(key string, totalSize, maxUploadBytes, maxStagingBytes int64) error {
+	// Defense in depth: a non-positive declared total disables every size-derived
+	// guard below (and validateChunkRange's upper bound downstream). The public HTTP
+	// path already rejects it earlier, but guard here too so any direct caller in the
+	// package cannot bypass the limits with total <= 0.
+	if totalSize <= 0 {
+		return fmt.Errorf("%w: declared size %d bytes", errChunkedUploadInvalidTotalSize, totalSize)
+	}
 	if _, exists := cm.uploads[key]; exists {
 		return nil
 	}
 	if maxUploadBytes > 0 && totalSize > maxUploadBytes {
 		return fmt.Errorf("%w: declared size %d bytes exceeds limit %d bytes", errChunkedUploadTooLarge, totalSize, maxUploadBytes)
 	}
-	if maxStagingBytes > 0 && totalSize > 0 {
+	if maxStagingBytes > 0 {
 		reserved := cm.reservedStagingBytesLocked()
 		if reserved > maxStagingBytes-totalSize {
 			return fmt.Errorf("%w: reserved=%d requested=%d limit=%d", errChunkedUploadStagingLimitExceeded, reserved, totalSize, maxStagingBytes)
@@ -1342,6 +1350,8 @@ func writeChunkedUploadInitializationError(c *gin.Context, err error) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "chunked upload exceeds configured max upload size"})
 	case errors.Is(err, errChunkedUploadStagingLimitExceeded):
 		c.JSON(http.StatusInsufficientStorage, gin.H{"error": "chunked upload staging capacity exceeded on this node"})
+	case errors.Is(err, errChunkedUploadInvalidTotalSize):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "chunked upload requires a positive total size in Content-Range"})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize upload"})
 	}
@@ -1742,6 +1752,14 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			writeInvalidChunkRangeError(c, err)
 			return
 		}
+	} else if contentRange != "" {
+		// A present-but-unparseable Content-Range must fail closed rather than
+		// silently fall through to the single-shot path: the client clearly meant
+		// a chunked transfer, so honoring it as a whole-file upload would bypass
+		// the chunked range/size handling entirely.
+		log.Printf("[HandleUpload] Rejecting malformed Content-Range header: %q", contentRange)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "malformed Content-Range header"})
+		return
 	}
 
 	// Traffic quota pre-check — evaluated before reading the body so we can
@@ -1839,17 +1857,8 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		tokenStr, filename, contentRange, isChunked)
 
 	if isChunked {
-		// A non-positive declared total disables every size-derived guard
-		// downstream (max_upload_mb, the staging budget, validateChunkRange's
-		// upper bound, and the storage/traffic prechecks all gate on total > 0),
-		// so a client could stream arbitrary bytes by declaring total <= 0.
-		// Reject it up front — resumable clients always send the real file size.
-		if total <= 0 {
-			log.Printf("[HandleUpload] Rejecting chunked upload with non-positive declared total=%d file=%q", total, filename)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "chunked upload requires a positive total size in Content-Range"})
-			return
-		}
-
+		// total <= 0 and invalid chunk ranges were already rejected right after
+		// parseContentRange, before any tracker or temp file could be created.
 		chunkedMaxUploadBytes := configuredChunkedMaxUploadBytes(h.config)
 		chunkedStagingMaxBytes := configuredChunkedStagingMaxBytes(h.config)
 

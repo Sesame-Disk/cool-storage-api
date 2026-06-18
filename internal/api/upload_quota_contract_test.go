@@ -218,6 +218,12 @@ func TestHandleUploadChunkedInvalidContentRangeRejectedWith400(t *testing.T) {
 			wantError:     "invalid chunk range: end=100 total=100",
 			wantTempFiles: 0,
 		},
+		{
+			name:          "malformed header",
+			contentRange:  "bytes not-a-range",
+			wantError:     "malformed Content-Range header",
+			wantTempFiles: 0,
+		},
 	}
 
 	for _, tc := range tests {
