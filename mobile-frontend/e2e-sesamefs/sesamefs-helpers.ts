@@ -45,6 +45,8 @@ export const SUITE_PREFIX = {
   sharing: 'pw-e2e-share-',
   concurrency: 'pw-e2e-conc-',
   multiregion: 'pw-e2e-mr-',
+  collab: 'pw-e2e-collab-',
+  perf: 'pw-e2e-perf-',
 } as const;
 
 export function uniqueName(tag: string, prefix: string = TEST_REPO_PREFIX): string {
@@ -264,9 +266,10 @@ export async function setLock(
 
 /**
  * Download a file's bytes via the Seafile-style two-step flow:
- *   1. GET /api/v2.1/repos/:id/file/download-link/?p=<path> -> a JSON string URL
- *      of the form {server}/seafhttp/files/{token}/{name} (token minted locally
- *      by whichever region serves this request).
+ *   1. GET /api2/repos/:id/file/?p=<path> -> a JSON string URL of the form
+ *      {server}/seafhttp/files/{token}/{name} (token minted locally by whichever
+ *      region serves this request). (The /api/v2.1/.../file/download-link route
+ *      is not wired; this api2 endpoint is what the web UI actually uses.)
  *   2. GET that link -> the raw file bytes (streamed from that region's S3/MinIO).
  *
  * The link is fetched against the SAME request context, and we keep only its
@@ -282,7 +285,7 @@ export async function downloadFileContent(
   path: string,
 ): Promise<{ status: number; body: string }> {
   const linkRes = await request.get(
-    `/api/v2.1/repos/${encodeURIComponent(repoId)}/file/download-link/?p=${encodeURIComponent(path)}`,
+    `/api2/repos/${encodeURIComponent(repoId)}/file/?p=${encodeURIComponent(path)}`,
     { headers: authHeaders(token) },
   );
   if (!linkRes.ok()) return { status: linkRes.status(), body: '' };

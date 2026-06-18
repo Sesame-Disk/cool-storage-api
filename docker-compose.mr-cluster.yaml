@@ -21,7 +21,7 @@
 # daemon cannot bind-mount workspace files at runtime), exactly like .mr.yaml.
 #
 # Driven by scripts/run-mr-cluster.sh. FE/API use the approved free host ports
-# (frontend 5173, LB 8080, USA 8088, EU 8081); the databases and MinIO use the
+# (frontend 5173, LB 8000, USA 8088, EU 8081); the databases and MinIO use the
 # 9xxx range (Cassandra 9142/9143, MinIO 9100-9103). Because the FE/API ports are
 # the same canonical ports docker-compose.mr.yaml uses, the single-node stack
 # must be DOWN before this one comes up (the run script tears it down for you).
@@ -245,6 +245,10 @@ services:
       - CASSANDRA_LOCAL_DC=usa
       - CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
       - CASSANDRA_REPLICATION_DCS=usa:1,eu:1
+      # LOCAL_SERIAL: HEAD-promotion LWTs serialize within the local DC instead of
+      # global Paxos across both DCs — the standard multi-DC setting (avoids slow,
+      # contention-prone cross-DC Paxos on every concurrent write).
+      - CASSANDRA_SERIAL_CONSISTENCY=LOCAL_SERIAL
       - AUTH_DEV_MODE=true
       - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-minioadmin}
       - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-minioadmin}
@@ -281,6 +285,10 @@ services:
       - CASSANDRA_LOCAL_DC=eu
       - CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
       - CASSANDRA_REPLICATION_DCS=usa:1,eu:1
+      # LOCAL_SERIAL: HEAD-promotion LWTs serialize within the local DC instead of
+      # global Paxos across both DCs — the standard multi-DC setting (avoids slow,
+      # contention-prone cross-DC Paxos on every concurrent write).
+      - CASSANDRA_SERIAL_CONSISTENCY=LOCAL_SERIAL
       - AUTH_DEV_MODE=true
       - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-minioadmin}
       - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-minioadmin}
@@ -295,6 +303,14 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    networks:
+      # Stays on the main network (LB, Cassandra gossip, replication setup) and
+      # also carries the alias `sesamefs` on the EU-only network so frontend-eu's
+      # baked `http://sesamefs:8080` upstream resolves to THIS region.
+      default: {}
+      eu_internal:
+        aliases:
+          - sesamefs
     restart: unless-stopped
 
   # ==========================================================================
@@ -305,7 +321,7 @@ services:
       context: .
       dockerfile: docker/multiregion/Dockerfile.nginx
     ports:
-      - "${LB_HOST_PORT:-8080}:80"
+      - "${LB_HOST_PORT:-8000}:80"
     depends_on:
       - sesamefs-usa
       - sesamefs-eu
@@ -330,6 +346,21 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Same React SPA image, but joined ONLY to the EU-only network where the
+  # `sesamefs` alias points at sesamefs-eu — so this UI drives the EU region.
+  frontend-eu:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "${FRONTEND_EU_HOST_PORT:-5174}:80"
+    depends_on:
+      sesamefs-eu:
+        condition: service_healthy
+    networks:
+      eu_internal: {}
+    restart: unless-stopped
+
   # ==========================================================================
   # Playwright runner — runs the whole e2e-sesamefs suite, including the
   # cross-region replication spec (MR_USA_URL / MR_EU_URL hit the regions
@@ -344,10 +375,19 @@ services:
       - DESKTOP_BASE_URL=${DESKTOP_BASE_URL:-http://frontend}
       - MR_USA_URL=http://sesamefs-usa:8080
       - MR_EU_URL=http://sesamefs-eu:8080
+      # Browser-facing frontend origins (real UI automation drives these).
+      - MR_USA_FRONTEND=http://frontend
+      - MR_EU_FRONTEND=http://frontend-eu
       - MR_REPLICATION_TIMEOUT_MS=${MR_REPLICATION_TIMEOUT_MS:-30000}
       - PW_RETRIES=${PW_RETRIES:-0}
     depends_on:
       - frontend
+      - frontend-eu
+    # On both networks so the browser can reach frontend (default) AND
+    # frontend-eu (eu_internal).
+    networks:
+      default: {}
+      eu_internal: {}
     command:
       - bash
       - -lc
@@ -364,3 +404,7 @@ volumes:
 networks:
   default:
     name: sesamefs-mr-cluster
+  # EU-only network: carries the `sesamefs` alias for sesamefs-eu so the second
+  # frontend (frontend-eu) talks to the EU region without a rebuilt image.
+  eu_internal:
+    name: sesamefs-mr-cluster-eu

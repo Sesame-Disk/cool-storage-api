@@ -24,7 +24,7 @@ database:
     - cassandra-usa:9042
   keyspace: sesamefs
   consistency: LOCAL_QUORUM
-  serial_consistency: SERIAL
+  serial_consistency: LOCAL_SERIAL   # local-DC LWT serialization (multi-DC standard); see compose CASSANDRA_SERIAL_CONSISTENCY
   proto_version: 4              # Pin CQL protocol to 4; avoids Cassandra's "Keyspace is set via query options" warning
   timeout: 10s
   local_dc: usa

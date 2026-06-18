@@ -19,7 +19,8 @@
 #   ./scripts/run-mr-cluster.sh down            # tear down (keeps volumes)
 #   ./scripts/run-mr-cluster.sh down -v         # tear down + delete volumes
 #
-# FE/API host ports (approved free list): 5173 web UI | 8080 LB | 8088 USA | 8081 EU
+# FE/API host ports (approved free list): 5173 web UI | 8000 LB | 8088 USA | 8081 EU
+# (8080 is held by a host process on this box, so the LB uses 8000.)
 # DB/MinIO host ports (9xxx):  9142 cassandra-usa | 9143 cassandra-eu
 #                              9100/9101 minio-usa API/console | 9102/9103 minio-eu API/console
 set -euo pipefail
@@ -40,10 +41,11 @@ if [ -z "${DOCKER_HOST:-}" ] && [ ! -S /var/run/docker.sock ] && [ -S /run/docke
 fi
 
 # --- FE/API ports (approved free list) --------------------------------------
-export LB_HOST_PORT="${LB_HOST_PORT:-8080}"
+export LB_HOST_PORT="${LB_HOST_PORT:-8000}"
 export SESAMEFS_USA_HOST_PORT="${SESAMEFS_USA_HOST_PORT:-8088}"
 export SESAMEFS_EU_HOST_PORT="${SESAMEFS_EU_HOST_PORT:-8081}"
 export FRONTEND_HOST_PORT="${FRONTEND_HOST_PORT:-5173}"
+export FRONTEND_EU_HOST_PORT="${FRONTEND_EU_HOST_PORT:-5174}"
 # --- DB / MinIO ports (9xxx) -------------------------------------------------
 export CASSANDRA_USA_HOST_PORT="${CASSANDRA_USA_HOST_PORT:-9142}"
 export CASSANDRA_EU_HOST_PORT="${CASSANDRA_EU_HOST_PORT:-9143}"
@@ -71,7 +73,8 @@ wait_http() { # url, name, max_seconds
 
 print_urls() {
   cat <<EOF
-  Web UI (React SPA, talks to USA region) : http://localhost:${FRONTEND_HOST_PORT}
+  Web UI — USA region                     : http://localhost:${FRONTEND_HOST_PORT}
+  Web UI — EU region                      : http://localhost:${FRONTEND_EU_HOST_PORT}
   Load balancer (USA primary, EU backup)  : http://localhost:${LB_HOST_PORT}
   USA region (direct, DC=usa)             : http://localhost:${SESAMEFS_USA_HOST_PORT}
   EU region (direct, DC=eu)               : http://localhost:${SESAMEFS_EU_HOST_PORT}
@@ -92,11 +95,12 @@ cmd_up() {
   fi
   log_info "Building + starting the multi-region CLUSTER (project: $PROJECT) ..."
   log_info "First boot forms a 2-DC Cassandra cluster — allow a few minutes."
-  "${COMPOSE[@]}" up -d --build nginx sesamefs-usa sesamefs-eu frontend
+  "${COMPOSE[@]}" up -d --build nginx sesamefs-usa sesamefs-eu frontend frontend-eu
   wait_http "http://localhost:${LB_HOST_PORT}/health" "nginx LB" 360
   wait_http "http://localhost:${SESAMEFS_USA_HOST_PORT}/ping" "USA region" 360
   wait_http "http://localhost:${SESAMEFS_EU_HOST_PORT}/ping" "EU region" 360
-  wait_http "http://localhost:${FRONTEND_HOST_PORT}/" "web UI" 180
+  wait_http "http://localhost:${FRONTEND_HOST_PORT}/" "USA web UI" 180
+  wait_http "http://localhost:${FRONTEND_EU_HOST_PORT}/" "EU web UI" 180
   log_success "Cluster is up."
   echo; cluster_topology; echo
   print_urls
@@ -124,7 +128,7 @@ cmd_replication_test() {
   fi
 
   echo; log_info "[2/2] MinIO: an object written to minio-usa must mirror to minio-eu"
-  if docker run --rm --network "$NET" minio/mc:latest sh -ec '
+  if docker run --rm --network "$NET" --entrypoint sh minio/mc:latest -ec '
       mc alias set usa http://minio-usa:9000 minioadmin minioadmin >/dev/null
       mc alias set eu  http://minio-eu:9000  minioadmin minioadmin >/dev/null
       obj="repltest-$(date +%s)-$$.txt"
