@@ -1,0 +1,4 @@
+# Multi-region nginx LB with its config baked in (this environment's Docker
+# daemon cannot bind-mount workspace files at runtime). Build context = repo root.
+FROM nginx:alpine
+COPY configs/nginx-multiregion.conf /etc/nginx/nginx.conf

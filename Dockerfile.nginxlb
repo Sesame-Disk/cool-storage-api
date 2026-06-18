@@ -1,0 +1,6 @@
+# Multi-region nginx load balancer.
+#
+# This host's Docker daemon does not share the workspace filesystem, so the LB
+# config cannot be bind-mounted — it is baked in via the build context instead.
+FROM nginx:alpine
+COPY configs/nginx-multiregion.conf /etc/nginx/nginx.conf

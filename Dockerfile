@@ -38,8 +38,10 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /build/sesamefs .
 
-# Copy config files for development
-COPY --from=builder /build/configs/config.docker.yaml ./config.yaml
+# Copy config file for development. Override CONFIG_FILE at build time to bake a
+# different config (e.g. configs/config-usa.yaml for the multi-region USA node).
+ARG CONFIG_FILE=configs/config.docker.yaml
+COPY --from=builder /build/${CONFIG_FILE} ./config.yaml
 
 # Use non-root user
 USER sesamefs
