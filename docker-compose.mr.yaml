@@ -220,7 +220,7 @@ services:
     command:
       - bash
       - -lc
-      - npx playwright test --config=playwright.sesamefs.config.ts
+      - npx playwright test --config=playwright.sesamefs.config.ts --grep-invert @bug
     profiles:
       - test
 

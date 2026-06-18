@@ -130,7 +130,7 @@ test.describe('SesameFS sharing', () => {
   // This test encodes the CORRECT expectation; test.fail() keeps the suite green while
   // the bug exists. When the backend is fixed it will pass, and Playwright will report an
   // unexpected pass so we know to drop the marker (and the bug doc).
-  test("file/detail reports the real author, not the requester (known gap)", async ({ request }) => {
+  test("file/detail reports the real author, not the requester (known gap)", { tag: '@bug' }, async ({ request }) => {
     test.fail(); // expected-to-fail until the attribution bug is fixed
     const repo = await createRepo(request, OWNER, name('detail-attr'));
     if ('skipReason' in repo) {

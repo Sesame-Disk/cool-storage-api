@@ -153,7 +153,7 @@ test.describe('SesameFS concurrency', () => {
   // the *safe* expectation; test.fail() keeps the suite green while documenting it.
   // If the backend starts enforcing ownership, Playwright will report this as an
   // unexpected pass so the marker can be removed.
-  test('rw user must not be able to steal another user\'s file lock (known gap)', async ({ request }) => {
+  test('rw user must not be able to steal another user\'s file lock (known gap)', { tag: '@bug' }, async ({ request }) => {
       test.fail(); // expected-to-fail: documents the lock-ownership gap described above
       const repo = await createRepo(request, ADMIN, name('lock-steal'));
       if ('skipReason' in repo) {

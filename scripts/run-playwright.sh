@@ -84,16 +84,26 @@ cmd_test() {
     log_warn "Frontend not reachable on :${FRONTEND_HOST_PORT} — bringing the stack up first."
     cmd_up
   fi
+  # Normal run excludes @bug-tagged tests; `test --bugs` runs only those.
+  local grep_arg="--grep-invert @bug"
+  local label="suite (excludes @bug)"
+  local bugs=0
+  if [ "${1:-}" = "--bugs" ]; then
+    grep_arg="--grep @bug"; label="@bug suite (proofs + fix-targets — failures expected)"; bugs=1
+  fi
   log_info "Building Playwright runner image ..."
   "${COMPOSE[@]}" --profile test build playwright >/dev/null
-  log_info "Running Playwright suite (mobile-frontend/e2e-sesamefs/*.spec.ts) ..."
+  log_info "Running Playwright ${label} ..."
   echo
   set +e
-  "${COMPOSE[@]}" --profile test run --rm playwright
+  "${COMPOSE[@]}" --profile test run --rm playwright \
+    bash -lc "npx playwright test --config=playwright.sesamefs.config.ts ${grep_arg}"
   local code=$?
   set -e
   echo
-  if [ "$code" -eq 0 ]; then
+  if [ "$bugs" -eq 1 ]; then
+    log_warn "@bug run complete (exit $code). Failures here are EXPECTED until the fixes land."
+  elif [ "$code" -eq 0 ]; then
     log_success "Playwright suite PASSED"
   else
     log_error "Playwright suite FAILED (exit $code)"
@@ -108,7 +118,7 @@ cmd_status() {
 
 case "${1:-test}" in
   up)     cmd_up ;;
-  test|"") cmd_test ;;
+  test|"") shift || true; cmd_test "$@" ;;
   status) cmd_status ;;
   logs)   shift; "${COMPOSE[@]}" logs -f --tail=100 "$@" ;;
   down)   shift; "${COMPOSE[@]}" --profile test down "$@"; log_success "Stack down." ;;

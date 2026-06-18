@@ -252,6 +252,10 @@ replication, both region servers, an nginx LB, and a web UI **per region**.
 # replication, multi-user collaboration, and upload/download performance
 ./scripts/run-mr-cluster.sh test
 
+# Bug tests only — proofs that known bugs exist + fix-targets that should pass
+# once those bugs are fixed (failures here are EXPECTED until then)
+./scripts/run-mr-cluster.sh test --bugs
+
 ./scripts/run-mr-cluster.sh status        # service status + topology + URLs
 ./scripts/run-mr-cluster.sh logs [svc]    # tail logs
 ./scripts/run-mr-cluster.sh down          # stop (add -v to wipe volumes)
@@ -353,6 +357,7 @@ This is intentional for cloud-native deployments — frontend and backend can be
 | [docs/TESTING.md](docs/TESTING.md) | Test coverage, benchmarks, running tests |
 | [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) | Multi-region testing guide |
 | [docs/BUG-FILE-DETAIL-MODIFIER-20260618.md](docs/BUG-FILE-DETAIL-MODIFIER-20260618.md) | Known bug: `file/detail` last-modifier attribution |
+| [docs/FILE-LOCKING-DESIGN.md](docs/FILE-LOCKING-DESIGN.md) | How file locking should work (exclusive locks + OnlyOffice co-editing) |
 | [docs/FRONTEND.md](docs/FRONTEND.md) | Web UI setup, patterns, Docker, troubleshooting |
 | [docs/OIDC.md](docs/OIDC.md) | OIDC authentication configuration |
 | [docs/TECHNICAL-DEBT.md](docs/TECHNICAL-DEBT.md) | Known issues, migration plans, incremental fixes |

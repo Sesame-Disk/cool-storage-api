@@ -47,6 +47,8 @@ export const SUITE_PREFIX = {
   multiregion: 'pw-e2e-mr-',
   collab: 'pw-e2e-collab-',
   perf: 'pw-e2e-perf-',
+  locks: 'pw-e2e-locks-',
+  bugs: 'pw-e2e-bugs-',
 } as const;
 
 export function uniqueName(tag: string, prefix: string = TEST_REPO_PREFIX): string {
@@ -219,6 +221,7 @@ export async function uploadFile(
   parentDir: string,
   fileName: string,
   content: string,
+  replace = false, // overwrite an existing file instead of auto-renaming on collision
 ): Promise<number> {
   const res = await request.post(
     `/api/v2.1/repos/${encodeURIComponent(repoId)}/upload/?p=${encodeURIComponent(parentDir)}`,
@@ -227,6 +230,7 @@ export async function uploadFile(
       multipart: {
         parent_dir: parentDir,
         'ret-json': '1',
+        ...(replace ? { replace: '1' } : {}),
         file: { name: fileName, mimeType: 'text/plain', buffer: Buffer.from(content) },
       },
     },

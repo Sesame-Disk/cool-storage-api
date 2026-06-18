@@ -13,7 +13,8 @@
 #   ./scripts/run-mr-cluster.sh                 # up (if needed) + run the full suite
 #   ./scripts/run-mr-cluster.sh up              # boot the cluster + frontend
 #   ./scripts/run-mr-cluster.sh replication-test# fast infra-level replication proof (Cassandra + MinIO)
-#   ./scripts/run-mr-cluster.sh test            # run the Playwright suite (incl. cross-region spec)
+#   ./scripts/run-mr-cluster.sh test            # run the Playwright suite (excludes @bug tests)
+#   ./scripts/run-mr-cluster.sh test --bugs     # run ONLY @bug tests (bug proofs + fix-targets; failures expected)
 #   ./scripts/run-mr-cluster.sh status          # service status + cluster topology + URLs
 #   ./scripts/run-mr-cluster.sh logs [svc]      # tail logs
 #   ./scripts/run-mr-cluster.sh down            # tear down (keeps volumes)
@@ -159,16 +160,34 @@ cmd_replication_test() {
 
 cmd_test() {
   ensure_up
+  # Normal run excludes @bug-tagged tests (bug proofs + fix-targets). `test --bugs`
+  # runs ONLY those: test.fail() proofs that the bug exists today, plus fix-target
+  # tests that fail until the fix lands. See docs/FILE-LOCKING-DESIGN.md etc.
+  local grep_arg="--grep-invert @bug"
+  local label="normal suite (excludes @bug)"
+  local bugs=0
+  if [ "${1:-}" = "--bugs" ]; then
+    grep_arg="--grep @bug"
+    label="@bug suite (bug proofs + fix-targets — failures are EXPECTED until fixed)"
+    bugs=1
+  fi
   log_info "Building Playwright runner image ..."
   "${COMPOSE[@]}" --profile test build playwright >/dev/null
-  log_info "Running Playwright suite (incl. cross-region replication spec) ..."
+  log_info "Running Playwright ${label} ..."
   echo
   set +e
-  "${COMPOSE[@]}" --profile test run --rm playwright
+  "${COMPOSE[@]}" --profile test run --rm playwright \
+    bash -lc "npx playwright test --config=playwright.sesamefs.config.ts ${grep_arg}"
   local code=$?
   set -e
   echo
-  if [ "$code" -eq 0 ]; then log_success "Playwright suite PASSED"; else log_error "Playwright suite FAILED (exit $code)"; fi
+  if [ "$bugs" -eq 1 ]; then
+    log_warn "@bug run complete (exit $code). Failures here are EXPECTED until the fixes land."
+  elif [ "$code" -eq 0 ]; then
+    log_success "Playwright suite PASSED"
+  else
+    log_error "Playwright suite FAILED (exit $code)"
+  fi
   return "$code"
 }
 
@@ -180,7 +199,7 @@ cmd_status() {
 
 case "${1:-test}" in
   up)                 cmd_up ;;
-  test|"")            cmd_test ;;
+  test|"")            shift || true; cmd_test "$@" ;;
   replication-test|repl) cmd_replication_test ;;
   status)             cmd_status ;;
   logs)               shift; "${COMPOSE[@]}" logs -f --tail=100 "$@" ;;
