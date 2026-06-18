@@ -20,10 +20,11 @@
 #   ./scripts/run-mr-cluster.sh down            # tear down (keeps volumes)
 #   ./scripts/run-mr-cluster.sh down -v         # tear down + delete volumes
 #
-# FE/API host ports (approved free list): 5173 web UI | 8000 LB | 8088 USA | 8081 EU
-# (8080 is held by a host process on this box, so the LB uses 8000.)
-# DB/MinIO host ports (9xxx):  9142 cassandra-usa | 9143 cassandra-eu
-#                              9100/9101 minio-usa API/console | 9102/9103 minio-eu API/console
+# Default host ports (every one is overridable via the matching *_HOST_PORT env var,
+# e.g. LB_HOST_PORT=18080 ./scripts/run-mr-cluster.sh up — override any that clash on
+# your host): 5173 web UI USA | 5174 web UI EU | 8000 LB | 8088 USA API | 8081 EU API
+#             9142 cassandra-usa | 9143 cassandra-eu
+#             9100/9101 minio-usa API/console | 9102/9103 minio-eu API/console
 set -euo pipefail
 
 # Colors
@@ -41,7 +42,7 @@ if [ -z "${DOCKER_HOST:-}" ] && [ ! -S /var/run/docker.sock ] && [ -S /run/docke
   export DOCKER_HOST=unix:///run/docker/docker.sock
 fi
 
-# --- FE/API ports (approved free list) --------------------------------------
+# --- FE/API ports (defaults; override any via env if it clashes on your host) ---
 export LB_HOST_PORT="${LB_HOST_PORT:-8000}"
 export SESAMEFS_USA_HOST_PORT="${SESAMEFS_USA_HOST_PORT:-8088}"
 export SESAMEFS_EU_HOST_PORT="${SESAMEFS_EU_HOST_PORT:-8081}"

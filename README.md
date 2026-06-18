@@ -234,8 +234,12 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for the full production guide (DNS, SSL, fi
 
 ### Multi-Region Testing
 
-Two stacks are available; both are driven by a single wrapper script (it auto-detects
-this host's Docker socket, so no extra setup):
+Requires Docker + Docker Compose v2 and a few GB of free RAM (the cluster runs two
+Cassandra nodes); the first `up` builds the images and the web UI, so it takes a few
+minutes. Works on any host with the standard Docker socket — if your daemon uses a
+non-standard socket path the wrapper auto-detects it, otherwise export `DOCKER_HOST`.
+
+Two stacks are available, both driven by a single wrapper script:
 
 **True cluster (recommended)** — `docker-compose.mr-cluster.yaml`: a real 2-DC
 Cassandra cluster (`usa` + `eu`), one MinIO per region with active-active bucket
@@ -261,9 +265,10 @@ replication, both region servers, an nginx LB, and a web UI **per region**.
 ./scripts/run-mr-cluster.sh down          # stop (add -v to wipe volumes)
 ```
 
-Default URLs: USA UI http://localhost:5173 · EU UI http://localhost:5174 ·
-LB http://localhost:8000 · USA API :8088 · EU API :8081 · MinIO consoles :9101/:9103.
-(8080 is reserved by a host process here, so the LB uses 8000.)
+Default host ports — USA UI 5173 · EU UI 5174 · LB 8000 · USA API 8088 · EU API 8081 ·
+Cassandra 9142/9143 · MinIO 9100–9103. **All are overridable** via env vars if one is
+already in use on your machine, e.g. `LB_HOST_PORT=18080 ./scripts/run-mr-cluster.sh up`
+(the full list of `*_HOST_PORT` vars is at the top of `scripts/run-mr-cluster.sh`).
 
 **Single-node (lighter)** — `docker-compose.mr.yaml`: one shared Cassandra + one
 shared MinIO. Same verbs via `./scripts/run-playwright.sh up | test | down`.
