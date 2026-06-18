@@ -1,0 +1,407 @@
+# SesameFS Configuration - USA Region Server (multi-region CLUSTER variant)
+#
+# Used by docker-compose.mr-cluster.yaml. Differs from config-usa.yaml in that
+# this node talks to its OWN Cassandra DC ("usa") and its OWN MinIO (minio-usa);
+# the keyspace is replicated across both DCs ({usa:1, eu:1}). Cassandra hosts/DC
+# are also injected via env (CASSANDRA_HOSTS / CASSANDRA_LOCAL_DC /
+# CASSANDRA_REPLICATION_DCS) — the values below are kept in sync for clarity.
+# Secrets and credentials must come from env vars.
+
+server:
+  port: ":8080"
+  read_timeout: 0s
+  read_header_timeout: 10s
+  write_timeout: 0s
+  max_upload_mb: 10240
+  trusted_proxies: []
+  url: ""
+  desktop_custom_brand: ""
+  desktop_custom_logo: ""
+  mobile_frontend_path: "./mobile-frontend/dist"
+
+database:
+  hosts:
+    - cassandra-usa:9042
+  keyspace: sesamefs
+  consistency: LOCAL_QUORUM
+  serial_consistency: SERIAL
+  proto_version: 4              # Pin CQL protocol to 4; avoids Cassandra's "Keyspace is set via query options" warning
+  timeout: 10s
+  local_dc: usa
+  replication_class: NetworkTopologyStrategy
+  replication_dcs:
+    usa: 1
+    eu: 1
+  # replication env overrides: CASSANDRA_REPLICATION_CLASS, CASSANDRA_REPLICATION_DCS
+  # legacy-only fallback: CASSANDRA_REPLICATION_FACTOR when using SimpleStrategy
+
+storage:
+  default_class: hot-s3-usa
+
+  classes:
+    hot-s3-usa:
+      label: USA
+      type: s3
+      tier: hot
+      endpoint: "http://minio-usa:9000"
+      bucket: sesamefs-usa
+      region: us-east-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
+      use_path_style: true
+      failover_class: hot-s3-eu
+      # credentials → provide via S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY env vars
+
+    hot-s3-eu:
+      label: EU
+      type: s3
+      tier: hot
+      endpoint: "http://minio-usa:9000"
+      bucket: sesamefs-eu
+      region: eu-west-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
+      use_path_style: true
+      failover_class: hot-s3-usa
+      # credentials → provide via S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY env vars
+
+    cold-glacier-usa:
+      label: USA Archive
+      type: s3
+      tier: cold
+      endpoint: "http://minio-usa:9000"
+      bucket: sesamefs-archive
+      region: us-east-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
+      use_path_style: true
+      # credentials → provide via S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY env vars
+
+  endpoint_regions:
+    "us.sesamefs.local": "usa"
+    "eu.sesamefs.local": "eu"
+    "sesamefs.local": "usa"
+    "localhost": "usa"
+    "*": "usa"
+
+  region_classes:
+    usa:
+      hot: hot-s3-usa
+      cold: cold-glacier-usa
+    eu:
+      hot: hot-s3-eu
+      cold: cold-glacier-usa
+
+billing:
+  url: ""
+
+accounts:
+  delete_account_url: ""
+  org_user_management_url: ""
+  disable_org_user_writes: true
+
+organizations:
+  default_template: free
+  templates:
+    free:
+      plan: free
+      quota_policy: hard
+      billing_cycle: monthly
+      storage_quota: 2000000000
+      traffic_quota: 10000000000
+      traffic_upload_quota: -1
+      traffic_download_quota: -1
+      max_users: 1
+      chunking_polynomial: 17592186044415
+      settings:
+        theme: default
+        features: all
+      storage_config:
+        default_backend: hot-s3-usa
+
+auth:
+  dev_mode: true
+  dev_tokens:
+    - token: "dev-token-123"
+      user_id: "00000000-0000-0000-0000-000000000001"
+      org_id: "00000000-0000-0000-0000-000000000001"
+      email: "admin@sesamefs.local"
+      role: "admin"
+    - token: "dev-token-superadmin"
+      user_id: "00000000-0000-0000-0000-000000000099"
+      org_id: "00000000-0000-0000-0000-000000000000"
+      email: "superadmin@sesamefs.local"
+      role: "superadmin"
+    - token: "dev-token-admin"
+      user_id: "00000000-0000-0000-0000-000000000001"
+      org_id: "00000000-0000-0000-0000-000000000001"
+      email: "admin@sesamefs.local"
+      role: "admin"
+    - token: "dev-token-user"
+      user_id: "00000000-0000-0000-0000-000000000002"
+      org_id: "00000000-0000-0000-0000-000000000001"
+      email: "user@sesamefs.local"
+      role: "user"
+    - token: "dev-token-readonly"
+      user_id: "00000000-0000-0000-0000-000000000003"
+      org_id: "00000000-0000-0000-0000-000000000001"
+      email: "readonly@sesamefs.local"
+      role: "readonly"
+    - token: "dev-token-guest"
+      user_id: "00000000-0000-0000-0000-000000000004"
+      org_id: "00000000-0000-0000-0000-000000000001"
+      email: "guest@sesamefs.local"
+      role: "guest"
+  first_superadmin_email: ""
+  share_link_hmac_key: ""
+  oidc:
+    enabled: false
+    issuer: https://accounts.sesamedisk.com
+    client_id: ""
+    client_secret: ""
+    redirect_uris: []
+    scopes:
+      - openid
+      - profile
+      - email
+    org_claim: ""
+    roles_claim: ""
+    auto_provision: false
+    default_role: user
+    default_org_id: ""
+    default_org_name: ""
+    allowed_org_claims: ""
+    platform_org_id: "00000000-0000-0000-0000-000000000000"
+    platform_org_claim_value: ""
+    session_ttl: 24h
+    api_token_ttl: 4320h
+    refresh_token_ttl: 168h
+    jwt_signing_key: ""
+    allow_offline_token: false
+    groups_claim: ""
+    departments_claim: ""
+    sync_groups_on_login: false
+    sync_departments_on_login: false
+    full_sync_groups: false
+    full_sync_departments: false
+    require_pkce: true
+    validate_audience: true
+    allowed_clock_skew: 2m
+
+chunking:
+  algorithm: fastcdc
+  hash_algorithm: sha256
+  adaptive:
+    enabled: true
+    absolute_min: 524288
+    absolute_max: 8388608
+    initial_size: 2097152
+    target_seconds: 8
+  probe:
+    size: 1048576
+    timeout: 30s
+  retry:
+    chunk_timeout: 60s
+    max_retries: 5
+    reduce_on_timeout: 0.5
+    reduce_on_failure: 0.5
+    backoff_base: 1s
+    backoff_max_jitter: 500ms
+
+versioning:
+  default_ttl_days: 90
+  min_ttl_days: 7
+  gc_interval: 24h
+
+gc:
+  enabled: false
+  worker_interval: 30s
+  scan_interval: 24h
+  batch_size: 100
+  reconcile_batch_size: 256
+  failed_items_page_size: 100
+  grace_period: 1h
+  dry_run: false
+  user_grace_days: 7
+  org_grace_days: 30
+  trash_retention_days: 30
+  audit_retention_days: 365
+
+web_uploads:
+  enable_upload_folder: true
+  enable_resumable_file_upload: true
+  resumable_chunk_size_mb: 8
+  max_file_size_mb: 0
+  max_files_per_batch: 1000
+  simultaneous_uploads: 1
+
+seafhttp:
+  token_ttl: 24h
+  zip_max_entries: 100000
+  zip_max_depth: 64
+  zip_max_bytes: 10737418240
+
+cors:
+  allowed_origins:
+    - "*"
+
+elasticsearch:
+  enabled: false
+  urls:
+    - "http://elasticsearch:9200"
+  index: sesamefs-files
+
+monitoring:
+  metrics_enabled: true
+  metrics_path: /metrics
+  health_timeout: 3s
+
+fileview:
+  max_preview_bytes: 1073741824
+  max_video_bytes: 10737418240
+  max_text_bytes: 52428800
+  max_iwork_preview_bytes: 52428800
+  preview_extensions:
+    - pdf
+    - png
+    - jpg
+    - jpeg
+    - gif
+    - bmp
+    - webp
+    - svg
+    - ico
+    - tiff
+    - tif
+    - mp4
+    - webm
+    - ogg
+    - mov
+    - mp3
+    - wav
+    - flac
+    - aac
+    - txt
+    - md
+    - markdown
+    - json
+    - yaml
+    - yml
+    - xml
+    - csv
+    - html
+    - htm
+    - css
+    - js
+    - ts
+    - jsx
+    - tsx
+    - py
+    - go
+    - rs
+    - java
+    - c
+    - cpp
+    - h
+    - hpp
+    - sh
+    - bash
+    - zsh
+    - fish
+    - toml
+    - ini
+    - cfg
+    - conf
+    - env
+    - sql
+    - graphql
+    - proto
+    - dockerfile
+    - makefile
+    - rb
+    - php
+    - swift
+    - kt
+    - scala
+    - r
+    - lua
+    - pl
+    - log
+    - diff
+    - patch
+
+onlyoffice:
+  enabled: false
+  api_js_url: ""
+  jwt_secret: ""
+  jwt_ttl_seconds: 3600
+  max_document_bytes: 524288000
+  verify_certificate: false
+  force_save: true
+  # Optional explicit SesameFS URL for OnlyOffice document fetches.
+  # Leave empty to derive it from the current request host.
+  server_url: ""
+  # Optional explicit OnlyOffice URL for callback downloads.
+  # Leave empty to reuse the host from api_js_url.
+  internal_url: ""
+  view_extensions:
+    - doc
+    - docx
+    - ppt
+    - pptx
+    - xls
+    - xlsx
+    - odt
+    - fodt
+    - odp
+    - fodp
+    - ods
+    - fods
+    - pdf
+  edit_extensions:
+    - docx
+    - pptx
+    - xlsx
+
+enforcement_profiles:
+  hard:
+    features:
+      can_add_repo: true
+      can_share_repo: true
+      can_add_group: false
+      can_generate_share_link: true
+      can_generate_upload_link: true
+      can_send_share_link_mail: false
+      can_publish_repo: false
+      can_use_global_address_book: false
+      can_connect_with_desktop_clients: true
+      can_connect_with_android_clients: true
+      can_connect_with_ios_clients: true
+      can_export_files_via_mobile_client: true
+    limits:
+      max_libraries: 3
+      max_share_links: 3
+      max_upload_links: 1
+      share_link_expire_days_max: 3
+      upload_link_expire_days_max: 3
+
+  soft:
+    features:
+      can_add_repo: true
+      can_share_repo: true
+      can_add_group: true
+      can_generate_share_link: true
+      can_generate_upload_link: true
+      can_send_share_link_mail: true
+      can_publish_repo: true
+      can_use_global_address_book: true
+      can_connect_with_desktop_clients: true
+      can_connect_with_android_clients: true
+      can_connect_with_ios_clients: true
+      can_export_files_via_mobile_client: true
+    limits:
+      max_libraries: -1
+      max_share_links: -1
+      max_upload_links: -1
+      share_link_expire_days_max: 0
+      upload_link_expire_days_max: 0

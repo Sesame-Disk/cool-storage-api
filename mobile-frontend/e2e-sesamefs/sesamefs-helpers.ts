@@ -44,6 +44,7 @@ export const SUITE_PREFIX = {
   features: 'pw-e2e-feat-',
   sharing: 'pw-e2e-share-',
   concurrency: 'pw-e2e-conc-',
+  multiregion: 'pw-e2e-mr-',
 } as const;
 
 export function uniqueName(tag: string, prefix: string = TEST_REPO_PREFIX): string {
@@ -259,6 +260,42 @@ export async function setLock(
     { headers: jsonHeaders(token), data: { operation } },
   );
   return { status: res.status(), payload: await readJSON(res) };
+}
+
+/**
+ * Download a file's bytes via the Seafile-style two-step flow:
+ *   1. GET /api/v2.1/repos/:id/file/download-link/?p=<path> -> a JSON string URL
+ *      of the form {server}/seafhttp/files/{token}/{name} (token minted locally
+ *      by whichever region serves this request).
+ *   2. GET that link -> the raw file bytes (streamed from that region's S3/MinIO).
+ *
+ * The link is fetched against the SAME request context, and we keep only its
+ * path+query, so the whole download stays on the region under test — which is
+ * exactly what lets us prove a file written in one region is fully retrievable
+ * from another (its blocks must have replicated into the second region's MinIO).
+ * Returns { status, body }; body is '' when the link or download is not 200.
+ */
+export async function downloadFileContent(
+  request: APIRequestContext,
+  token: string,
+  repoId: string,
+  path: string,
+): Promise<{ status: number; body: string }> {
+  const linkRes = await request.get(
+    `/api/v2.1/repos/${encodeURIComponent(repoId)}/file/download-link/?p=${encodeURIComponent(path)}`,
+    { headers: authHeaders(token) },
+  );
+  if (!linkRes.ok()) return { status: linkRes.status(), body: '' };
+  let url = await readJSON(linkRes);
+  if (typeof url !== 'string' || !url) return { status: 502, body: '' };
+  try {
+    const u = new URL(url);
+    url = u.pathname + u.search; // hit the current baseURL/region, not the host the link names
+  } catch {
+    /* already a relative path — use as-is */
+  }
+  const fileRes = await request.get(url, { headers: authHeaders(token) });
+  return { status: fileRes.status(), body: fileRes.ok() ? await fileRes.text() : '' };
 }
 
 /** POST /api/v2.1/repos/:id/file/copy/ */

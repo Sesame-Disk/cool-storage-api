@@ -1,0 +1,366 @@
+# True multi-region stack — REAL Cassandra cluster + per-region MinIO + replication.
+#
+# Unlike docker-compose.mr.yaml (single shared Cassandra, single shared MinIO),
+# this stack stands up genuinely independent regional infrastructure and proves
+# cross-region replication actually works:
+#
+#   - Cassandra 2-DC CLUSTER: cassandra-usa (DC "usa") + cassandra-eu (DC "eu"),
+#     one logical cluster gossiping over the network. The `sesamefs` keyspace is
+#     replicated across BOTH DCs ({usa:1, eu:1}) so metadata written through one
+#     region becomes readable through the other (async cross-DC replication).
+#   - MinIO PER REGION: minio-usa + minio-eu, each with its own volume. The data
+#     buckets are configured for ACTIVE-ACTIVE bucket replication so file blocks
+#     written in one region are mirrored into the other region's MinIO.
+#   - Region servers each talk ONLY to their own DC + their own MinIO:
+#        sesamefs-usa -> cassandra-usa + minio-usa  (local_dc=usa)
+#        sesamefs-eu  -> cassandra-eu  + minio-eu   (local_dc=eu)
+#   - nginx LB (USA primary, EU backup) + React frontend + a Playwright runner
+#     whose suite includes a cross-region replication spec.
+#
+# Configs are baked into the region images at build time (this host's Docker
+# daemon cannot bind-mount workspace files at runtime), exactly like .mr.yaml.
+#
+# Driven by scripts/run-mr-cluster.sh. FE/API use the approved free host ports
+# (frontend 5173, LB 8080, USA 8088, EU 8081); the databases and MinIO use the
+# 9xxx range (Cassandra 9142/9143, MinIO 9100-9103). Because the FE/API ports are
+# the same canonical ports docker-compose.mr.yaml uses, the single-node stack
+# must be DOWN before this one comes up (the run script tears it down for you).
+services:
+  # ==========================================================================
+  # Cassandra — REAL 2-DC cluster (one node per region/DC)
+  # ==========================================================================
+  cassandra-usa:
+    image: cassandra:5.0
+    ports:
+      - "${CASSANDRA_USA_HOST_PORT:-9142}:9042"
+    environment:
+      - CASSANDRA_CLUSTER_NAME=${CASSANDRA_CLUSTER_NAME:-sesamefs-cluster}
+      - CASSANDRA_DC=usa
+      - CASSANDRA_RACK=rack1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      # cassandra-usa is the cluster seed; cassandra-eu joins through it.
+      - CASSANDRA_SEEDS=cassandra-usa
+      - MAX_HEAP_SIZE=${CASSANDRA_MAX_HEAP_SIZE:-768M}
+      - HEAP_NEWSIZE=${CASSANDRA_HEAP_NEWSIZE:-128M}
+    volumes:
+      - cassandra_usa_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status | grep -q '^UN' && cqlsh -e 'describe keyspaces'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    restart: unless-stopped
+
+  cassandra-eu:
+    image: cassandra:5.0
+    ports:
+      - "${CASSANDRA_EU_HOST_PORT:-9143}:9042"
+    environment:
+      - CASSANDRA_CLUSTER_NAME=${CASSANDRA_CLUSTER_NAME:-sesamefs-cluster}
+      - CASSANDRA_DC=eu
+      - CASSANDRA_RACK=rack1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      - CASSANDRA_SEEDS=cassandra-usa
+      - MAX_HEAP_SIZE=${CASSANDRA_MAX_HEAP_SIZE:-768M}
+      - HEAP_NEWSIZE=${CASSANDRA_HEAP_NEWSIZE:-128M}
+    volumes:
+      - cassandra_eu_data:/var/lib/cassandra
+    # Join only after the seed (usa) is fully up — clean 2-DC formation.
+    depends_on:
+      cassandra-usa:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status | grep -q '^UN' && cqlsh -e 'describe keyspaces'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    restart: unless-stopped
+
+  # Create the multi-DC keyspace AFTER both DCs have joined the cluster.
+  cassandra-bootstrap:
+    image: cassandra:5.0
+    depends_on:
+      cassandra-usa:
+        condition: service_healthy
+      cassandra-eu:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -ec
+    command:
+      - |
+        set -euo pipefail
+        keyspace="$${CASSANDRA_KEYSPACE:-sesamefs}"
+        case "$${keyspace}" in
+          [A-Za-z][A-Za-z0-9_]*) ;;
+          *) echo "Invalid keyspace: $${keyspace}" >&2; exit 1 ;;
+        esac
+
+        # Wait until the seed node actually sees the EU datacenter in gossip,
+        # otherwise CREATE KEYSPACE referencing dc 'eu' would be rejected.
+        echo "Waiting for both datacenters (usa + eu) to register in the cluster ..."
+        for i in $$(seq 1 60); do
+          dcs="$$(cqlsh cassandra-usa -e "SELECT data_center FROM system.local; SELECT data_center FROM system.peers;" 2>/dev/null || true)"
+          if echo "$$dcs" | grep -q usa && echo "$$dcs" | grep -q eu; then
+            echo "Both datacenters present."; break
+          fi
+          echo "  ... not yet (attempt $$i); seen: $$(echo $$dcs | tr -s ' ')"
+          sleep 5
+        done
+
+        replication="{'class': 'NetworkTopologyStrategy', 'usa': 1, 'eu': 1}"
+        cqlsh cassandra-usa -e "CREATE KEYSPACE IF NOT EXISTS $${keyspace} WITH replication = $${replication};"
+        cqlsh cassandra-usa -e "ALTER KEYSPACE $${keyspace} WITH replication = $${replication};"
+        echo "Keyspace $${keyspace} ready with replication $${replication}"
+        cqlsh cassandra-usa -e "DESCRIBE KEYSPACE $${keyspace};" | head -5 || true
+    environment:
+      - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
+    restart: "no"
+
+  # ==========================================================================
+  # MinIO — one independent instance PER REGION
+  # ==========================================================================
+  minio-usa:
+    image: minio/minio:latest
+    ports:
+      - "${MINIO_USA_API_HOST_PORT:-9100}:9000"
+      - "${MINIO_USA_CONSOLE_HOST_PORT:-9101}:9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_usa_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio-eu:
+    image: minio/minio:latest
+    ports:
+      - "${MINIO_EU_API_HOST_PORT:-9102}:9000"
+      - "${MINIO_EU_CONSOLE_HOST_PORT:-9103}:9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_eu_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Create the regional buckets on BOTH instances and enable versioning
+  # (versioning is mandatory for bucket replication).
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio-usa:
+        condition: service_healthy
+      minio-eu:
+        condition: service_healthy
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        mc alias set usa http://minio-usa:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}
+        mc alias set eu  http://minio-eu:9000  $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}
+        for site in usa eu; do
+          for bucket in sesamefs-usa sesamefs-eu sesamefs-blocks sesamefs-archive; do
+            mc mb $${site}/$${bucket} --ignore-existing
+            mc version enable $${site}/$${bucket}
+          done
+          mc anonymous set download $${site}/sesamefs-usa
+          mc anonymous set download $${site}/sesamefs-eu
+          mc anonymous set download $${site}/sesamefs-blocks
+        done
+        echo "Buckets + versioning ready on both regions."
+        mc ls usa; mc ls eu
+    restart: "no"
+
+  # Configure ACTIVE-ACTIVE bucket replication between the two MinIO instances.
+  minio-replication:
+    image: minio/mc:latest
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        U=$${MINIO_ROOT_USER}; P=$${MINIO_ROOT_PASSWORD}
+        mc alias set usa http://minio-usa:9000 $$U $$P
+        mc alias set eu  http://minio-eu:9000  $$U $$P
+        add_rule () {  # add_rule <src-alias> <dst-host> <bucket>
+          src=$$1; dsthost=$$2; bucket=$$3
+          if mc replicate ls $$src/$$bucket 2>/dev/null | grep -q "$$bucket"; then
+            echo "  replication already configured: $$src/$$bucket"; return 0
+          fi
+          mc replicate add $$src/$$bucket \
+            --remote-bucket "http://$$U:$$P@$$dsthost:9000/$$bucket" \
+            --replicate "delete,delete-marker,existing-objects" \
+            || echo "  WARN: failed to add rule $$src/$$bucket -> $$dsthost"
+        }
+        for bucket in sesamefs-usa sesamefs-eu sesamefs-blocks sesamefs-archive; do
+          add_rule usa minio-eu  $$bucket   # usa -> eu
+          add_rule eu  minio-usa $$bucket   # eu  -> usa  (active-active)
+        done
+        echo "=== replication rules (usa) ==="; for b in sesamefs-usa sesamefs-eu; do mc replicate ls usa/$$b || true; done
+        echo "=== replication rules (eu)  ==="; for b in sesamefs-usa sesamefs-eu; do mc replicate ls eu/$$b  || true; done
+        echo "Active-active replication configured."
+    restart: "no"
+
+  # ==========================================================================
+  # Region servers — each pinned to its own Cassandra DC + its own MinIO
+  # ==========================================================================
+  sesamefs-usa:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONFIG_FILE: configs/config-usa.cluster.yaml
+    ports:
+      - "${SESAMEFS_USA_HOST_PORT:-8088}:8080"
+    environment:
+      - PORT=8080
+      - SERVER_REGION=usa
+      - CASSANDRA_HOSTS=cassandra-usa:9042
+      - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
+      - CASSANDRA_LOCAL_DC=usa
+      - CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
+      - CASSANDRA_REPLICATION_DCS=usa:1,eu:1
+      - AUTH_DEV_MODE=true
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-minioadmin}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-minioadmin}
+    depends_on:
+      cassandra-bootstrap:
+        condition: service_completed_successfully
+      minio-replication:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      default:
+        aliases:
+          - sesamefs   # the prebuilt frontend image proxies to host `sesamefs:8080`
+    restart: unless-stopped
+
+  sesamefs-eu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONFIG_FILE: configs/config-eu.cluster.yaml
+    ports:
+      - "${SESAMEFS_EU_HOST_PORT:-8081}:8080"
+    environment:
+      - PORT=8080
+      - SERVER_REGION=eu
+      - CASSANDRA_HOSTS=cassandra-eu:9042
+      - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
+      - CASSANDRA_LOCAL_DC=eu
+      - CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
+      - CASSANDRA_REPLICATION_DCS=usa:1,eu:1
+      - AUTH_DEV_MODE=true
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-minioadmin}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-minioadmin}
+    depends_on:
+      cassandra-bootstrap:
+        condition: service_completed_successfully
+      minio-replication:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ==========================================================================
+  # nginx load balancer — config baked in (reused from the .mr.yaml stack)
+  # ==========================================================================
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/multiregion/Dockerfile.nginx
+    ports:
+      - "${LB_HOST_PORT:-8080}:80"
+    depends_on:
+      - sesamefs-usa
+      - sesamefs-eu
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Web UI (React SPA) — proxies to the USA region (aliased as `sesamefs`)
+  # ==========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "${FRONTEND_HOST_PORT:-5173}:80"
+    depends_on:
+      sesamefs-usa:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Playwright runner — runs the whole e2e-sesamefs suite, including the
+  # cross-region replication spec (MR_USA_URL / MR_EU_URL hit the regions
+  # directly so it can write via USA and read via EU). Profile: test.
+  # ==========================================================================
+  playwright:
+    build:
+      context: .
+      dockerfile: Dockerfile.mobiletest
+    environment:
+      - CI=true
+      - DESKTOP_BASE_URL=${DESKTOP_BASE_URL:-http://frontend}
+      - MR_USA_URL=http://sesamefs-usa:8080
+      - MR_EU_URL=http://sesamefs-eu:8080
+      - MR_REPLICATION_TIMEOUT_MS=${MR_REPLICATION_TIMEOUT_MS:-30000}
+      - PW_RETRIES=${PW_RETRIES:-0}
+    depends_on:
+      - frontend
+    command:
+      - bash
+      - -lc
+      - npx playwright test --config=playwright.sesamefs.config.ts
+    profiles:
+      - test
+
+volumes:
+  cassandra_usa_data:
+  cassandra_eu_data:
+  minio_usa_data:
+  minio_eu_data:
+
+networks:
+  default:
+    name: sesamefs-mr-cluster
