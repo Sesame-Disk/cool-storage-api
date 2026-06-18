@@ -18,6 +18,7 @@ import {
   cleanupTestArtifacts,
   createRepo,
   createShareLink,
+  fileDetail,
   listDirNames,
   listRepos,
   shareWithUser,
@@ -28,6 +29,9 @@ import {
 const OWNER = DEV_TOKENS.admin;
 const RECIPIENT = DEV_TOKENS.user;
 const RECIPIENT_EMAIL = DEV_EMAILS.user;
+// The backend reports a modifier as "<user_id>@sesamefs.local"; the standard dev
+// user (RECIPIENT) is user_id ...0002.
+const RECIPIENT_MODIFIER = '00000000-0000-0000-0000-000000000002@sesamefs.local';
 const SHARE_LINK_PASSWORD = 'pw-e2e-secret';
 const PREFIX = SUITE_PREFIX.sharing;
 const name = (tag: string) => uniqueName(tag, PREFIX);
@@ -118,5 +122,32 @@ test.describe('SesameFS sharing', () => {
     expect(unlocked.status).toBe(200);
     expect(unlocked.count).toBeGreaterThan(0);
     expect(unlocked.raw).toContain('public.txt');
+  });
+
+  // KNOWN GAP (flagged 2026-06-18): GET .../file/detail/ reports the REQUESTING user
+  // as last_modifier_email instead of the file's real author — see
+  // internal/api/v2/files.go:1694,1721-1722 and docs/BUG-FILE-DETAIL-MODIFIER-20260618.md.
+  // This test encodes the CORRECT expectation; test.fail() keeps the suite green while
+  // the bug exists. When the backend is fixed it will pass, and Playwright will report an
+  // unexpected pass so we know to drop the marker (and the bug doc).
+  test("file/detail reports the real author, not the requester (known gap)", async ({ request }) => {
+    test.fail(); // expected-to-fail until the attribution bug is fixed
+    const repo = await createRepo(request, OWNER, name('detail-attr'));
+    if ('skipReason' in repo) {
+      test.skip(true, repo.skipReason);
+      return;
+    }
+    const id = repo.repoId;
+    // Owner authors the file, then shares the library rw with the recipient.
+    await uploadFile(request, OWNER, id, '/', 'authored.txt', 'written by the owner');
+    const share = await shareWithUser(request, OWNER, id, RECIPIENT_EMAIL, 'rw');
+    expect(share.ok).toBe(true);
+
+    // The RECIPIENT asks for the file's details. The modifier is the OWNER, so it must
+    // NOT come back as the recipient's own identity, and it must not be empty.
+    const detail = await fileDetail(request, RECIPIENT, id, '/authored.txt');
+    expect(detail.status).toBe(200);
+    expect(detail.payload.last_modifier_email).toBeTruthy();
+    expect(detail.payload.last_modifier_email).not.toBe(RECIPIENT_MODIFIER); // FAILS today
   });
 });

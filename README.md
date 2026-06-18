@@ -234,19 +234,44 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for the full production guide (DNS, SSL, fi
 
 ### Multi-Region Testing
 
+Two stacks are available; both are driven by a single wrapper script (it auto-detects
+this host's Docker socket, so no extra setup):
+
+**True cluster (recommended)** — `docker-compose.mr-cluster.yaml`: a real 2-DC
+Cassandra cluster (`usa` + `eu`), one MinIO per region with active-active bucket
+replication, both region servers, an nginx LB, and a web UI **per region**.
+
 ```bash
-# Bootstrap multi-region environment (wrapper around
-# `docker-compose-multiregion.yaml` + `cassandra-bootstrap`)
-./scripts/bootstrap.sh multiregion
+# Build + start the cluster (regions, LB, USA + EU web UIs)
+./scripts/run-mr-cluster.sh up
 
-# Run tests in container
-./scripts/run-tests.sh multiregion all
+# Fast infra proof: Cassandra 2-DC up + MinIO mirrors an object across regions
+./scripts/run-mr-cluster.sh replication-test
 
-# Stop the environment
-./scripts/bootstrap.sh multiregion --down
+# Full Playwright E2E suite: features, sharing, concurrency, cross-region
+# replication, multi-user collaboration, and upload/download performance
+./scripts/run-mr-cluster.sh test
+
+./scripts/run-mr-cluster.sh status        # service status + topology + URLs
+./scripts/run-mr-cluster.sh logs [svc]    # tail logs
+./scripts/run-mr-cluster.sh down          # stop (add -v to wipe volumes)
 ```
 
-See [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) for detailed testing scenarios.
+Default URLs: USA UI http://localhost:5173 · EU UI http://localhost:5174 ·
+LB http://localhost:8000 · USA API :8088 · EU API :8081 · MinIO consoles :9101/:9103.
+(8080 is reserved by a host process here, so the LB uses 8000.)
+
+**Single-node (lighter)** — `docker-compose.mr.yaml`: one shared Cassandra + one
+shared MinIO. Same verbs via `./scripts/run-playwright.sh up | test | down`.
+
+> **Logging into a web UI:** the login page is SSO-only (password login disabled in
+> dev). Seed the dev cookie in the browser console, then reload:
+> `document.cookie = "sesamefs_auth=admin@sesamefs.local@dev-token-admin; path=/"; location.href="/dashboard/"`
+> Swap `admin`/`dev-token-admin` for `user`/`dev-token-user`, etc.
+
+See [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) for detailed scenarios,
+and [docs/BUG-FILE-DETAIL-MODIFIER-20260618.md](docs/BUG-FILE-DETAIL-MODIFIER-20260618.md)
+for a known file-attribution bug surfaced by these tests.
 
 ---
 
@@ -327,6 +352,7 @@ This is intentional for cloud-native deployments — frontend and backend can be
 | [docs/API-REFERENCE.md](docs/API-REFERENCE.md) | API endpoints, implementation status, compatibility |
 | [docs/TESTING.md](docs/TESTING.md) | Test coverage, benchmarks, running tests |
 | [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) | Multi-region testing guide |
+| [docs/BUG-FILE-DETAIL-MODIFIER-20260618.md](docs/BUG-FILE-DETAIL-MODIFIER-20260618.md) | Known bug: `file/detail` last-modifier attribution |
 | [docs/FRONTEND.md](docs/FRONTEND.md) | Web UI setup, patterns, Docker, troubleshooting |
 | [docs/OIDC.md](docs/OIDC.md) | OIDC authentication configuration |
 | [docs/TECHNICAL-DEBT.md](docs/TECHNICAL-DEBT.md) | Known issues, migration plans, incremental fixes |

@@ -301,6 +301,20 @@ export async function downloadFileContent(
   return { status: fileRes.status(), body: fileRes.ok() ? await fileRes.text() : '' };
 }
 
+/** GET /api/v2.1/repos/:id/file/detail/?p=<path> — file properties (incl. last_modifier_email). */
+export async function fileDetail(
+  request: APIRequestContext,
+  token: string,
+  repoId: string,
+  path: string,
+): Promise<{ status: number; payload: any }> {
+  const res = await request.get(
+    `/api/v2.1/repos/${encodeURIComponent(repoId)}/file/detail/?p=${encodeURIComponent(path)}`,
+    { headers: authHeaders(token) },
+  );
+  return { status: res.status(), payload: await readJSON(res) };
+}
+
 /** POST /api/v2.1/repos/:id/file/copy/ */
 export async function copyFile(
   request: APIRequestContext,
