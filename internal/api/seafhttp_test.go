@@ -2126,6 +2126,59 @@ func TestChunkManagerGetOrCreateUpload(t *testing.T) {
 	cm.CleanupUpload("token2", "file.txt")
 }
 
+func TestChunkManagerGetOrCreateUploadRejectsConfiguredMaxUploadBytes(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	upload, err := cm.GetOrCreateUploadWithLimits("token1", "too-big.bin", "/", 11, 10, 0)
+	if upload != nil {
+		t.Fatal("upload should be nil when the max upload size is exceeded")
+	}
+	if !errors.Is(err, errChunkedUploadTooLarge) {
+		t.Fatalf("error = %v, want errChunkedUploadTooLarge", err)
+	}
+	if got := cm.GetUpload("token1", "too-big.bin"); got != nil {
+		t.Fatal("rejected upload must not stay tracked")
+	}
+}
+
+func TestChunkManagerGetOrCreateUploadRejectsNonPositiveTotalSize(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	for _, total := range []int64{0, -1} {
+		upload, err := cm.GetOrCreateUploadWithLimits("token1", "bad-total.bin", "/", total, 0, 0)
+		if upload != nil {
+			t.Fatalf("total=%d: upload should be nil for non-positive total size", total)
+		}
+		if !errors.Is(err, errChunkedUploadInvalidTotalSize) {
+			t.Fatalf("total=%d: error = %v, want errChunkedUploadInvalidTotalSize", total, err)
+		}
+		if got := cm.GetUpload("token1", "bad-total.bin"); got != nil {
+			t.Fatalf("total=%d: rejected upload must not stay tracked", total)
+		}
+	}
+}
+
+func TestChunkManagerGetOrCreateUploadRejectsWhenStagingBudgetWouldBeExceeded(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	uploadA, err := cm.GetOrCreateUploadWithLimits("token1", "a.bin", "/", 7, 0, 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadWithLimits(uploadA) failed: %v", err)
+	}
+	defer cm.CleanupTrackedUpload(uploadA)
+
+	uploadB, err := cm.GetOrCreateUploadWithLimits("token2", "b.bin", "/", 4, 0, 10)
+	if uploadB != nil {
+		t.Fatal("upload should be nil when staging budget would be exceeded")
+	}
+	if !errors.Is(err, errChunkedUploadStagingLimitExceeded) {
+		t.Fatalf("error = %v, want errChunkedUploadStagingLimitExceeded", err)
+	}
+	if got := cm.GetUpload("token2", "b.bin"); got != nil {
+		t.Fatal("rejected upload must not stay tracked")
+	}
+}
+
 func TestChunkManagerTracksSameBasenameSeparatelyByIdentityAndPath(t *testing.T) {
 	cm, _ := newTestChunkManager(t)
 

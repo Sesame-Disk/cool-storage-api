@@ -240,6 +240,7 @@ seafhttp:
   zip_max_entries: 100000
   zip_max_depth: 64
   zip_max_bytes: 10737418240
+  chunked_staging_max_bytes: 0 # 0 = unlimited; per-node budget — set to each node's local /tmp capacity to cap active chunked temp-file staging
 
 cors:
   allowed_origins:

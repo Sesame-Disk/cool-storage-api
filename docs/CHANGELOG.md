@@ -8,6 +8,51 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-06-18 - Chunked web uploads now fail earlier on size and staging limits
+
+### Fixed
+
+The SeafHTTP chunked upload path now rejects two classes of avoidable local-node
+overcommit before it creates or truncates the temp-file tracker:
+
+- `server.max_upload_mb` is now enforced on chunked uploads, not just on the
+  browser/front-door contract
+- a new optional `seafhttp.chunked_staging_max_bytes` budget can reject new
+  chunked uploads when the node is already reserving too much temp-file staging
+
+### Scope / Limits
+
+This is hardening, not a redesign of the upload pipeline:
+
+- the upload still stages through a temp file before block materialization
+- the chunk state is still node-local
+- `chunked_staging_max_bytes` defaults to `0` (disabled) so existing deployments
+  do not change behavior until operators choose a real budget
+
+### Tests / Docs
+
+- Added chunk-manager coverage for max-upload and staging-budget rejections
+- Added handler contract coverage for the new HTTP `413` / `507` responses
+- Updated config validation for the new `seafhttp.chunked_staging_max_bytes` field
+- Updated the technical-debt and upload hardening docs to reflect the new guard
+
+### Files
+
+- `internal/api/seafhttp.go`
+- `internal/api/seafhttp_test.go`
+- `internal/api/upload_quota_contract_test.go`
+- `internal/config/config.go`
+- `internal/config/config_test.go`
+- `configs/config.example.yaml`
+- `configs/config.docker.yaml`
+- `configs/config.prod.yaml`
+- `configs/config-eu.yaml`
+- `configs/config-usa.yaml`
+- `docs/TECHNICAL-DEBT.md`
+- `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`
+
+---
+
 ## 2026-06-17 - Generic S3 multipart uploads now send parts concurrently
 
 ### Improved

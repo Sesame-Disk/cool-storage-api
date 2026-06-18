@@ -424,10 +424,11 @@ type CORSConfig struct {
 
 // SeafHTTPConfig holds Seafile-compatible file transfer settings
 type SeafHTTPConfig struct {
-	TokenTTL      time.Duration `yaml:"token_ttl"`       // How long upload/download tokens are valid
-	ZipMaxEntries int           `yaml:"zip_max_entries"` // Maximum files allowed in a streamed ZIP download
-	ZipMaxDepth   int           `yaml:"zip_max_depth"`   // Maximum directory nesting allowed in a streamed ZIP download
-	ZipMaxBytes   int64         `yaml:"zip_max_bytes"`   // Maximum total uncompressed bytes allowed in a streamed ZIP download
+	TokenTTL               time.Duration `yaml:"token_ttl"`                 // How long upload/download tokens are valid
+	ZipMaxEntries          int           `yaml:"zip_max_entries"`           // Maximum files allowed in a streamed ZIP download
+	ZipMaxDepth            int           `yaml:"zip_max_depth"`             // Maximum directory nesting allowed in a streamed ZIP download
+	ZipMaxBytes            int64         `yaml:"zip_max_bytes"`             // Maximum total uncompressed bytes allowed in a streamed ZIP download
+	ChunkedStagingMaxBytes int64         `yaml:"chunked_staging_max_bytes"` // Maximum declared bytes reserved across active chunked uploads on this node; 0 disables the guard
 }
 
 // ServerConfig holds HTTP server settings
@@ -778,10 +779,11 @@ func DefaultConfig() *Config {
 			AuditRetentionDays:  365,
 		},
 		SeafHTTP: SeafHTTPConfig{
-			TokenTTL:      1 * time.Hour,
-			ZipMaxEntries: 100000,
-			ZipMaxDepth:   64,
-			ZipMaxBytes:   10 * 1024 * 1024 * 1024,
+			TokenTTL:               1 * time.Hour,
+			ZipMaxEntries:          100000,
+			ZipMaxDepth:            64,
+			ZipMaxBytes:            10 * 1024 * 1024 * 1024,
+			ChunkedStagingMaxBytes: 0,
 		},
 		OnlyOffice: OnlyOfficeConfig{
 			Enabled:           false,
@@ -1483,6 +1485,9 @@ func (c *Config) Validate() error {
 	}
 	if c.SeafHTTP.ZipMaxBytes > 100*1024*1024*1024 {
 		return fmt.Errorf("seafhttp.zip_max_bytes must be less than or equal to 107374182400")
+	}
+	if c.SeafHTTP.ChunkedStagingMaxBytes < 0 {
+		return fmt.Errorf("seafhttp.chunked_staging_max_bytes must be greater than or equal to zero")
 	}
 	normalizedPreviewExtensions, err := normalizeFileViewPreviewExtensions(c.FileView.PreviewExtensions)
 	if err != nil {

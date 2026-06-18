@@ -144,6 +144,7 @@ seafhttp:
   zip_max_entries: 100000
   zip_max_depth: 64
   zip_max_bytes: 10737418240
+  chunked_staging_max_bytes: 0  # 0 = unlimited; set this to a node-local byte budget to reject new chunked uploads before /tmp staging can overcommit the node
 
 auth:
   dev_mode: false                       # Dev only — never enable in production

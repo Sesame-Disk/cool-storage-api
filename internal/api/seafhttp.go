@@ -555,14 +555,75 @@ func (cm *ChunkManager) Stop() {
 // Global chunk manager instance
 var chunkManager = NewChunkManager()
 
+var (
+	errChunkedUploadTooLarge             = errors.New("chunked upload exceeds configured max upload size")
+	errChunkedUploadStagingLimitExceeded = errors.New("chunked upload staging capacity exceeded")
+	errChunkedUploadInvalidTotalSize     = errors.New("chunked upload requires a positive total size")
+	errInvalidChunkRange                 = errors.New("invalid chunk range")
+)
+
 // GetOrCreateUploadByIdentity gets or creates a chunk upload tracker for the
 // specific upload identity carried on this request. Argument order matches
 // GetUploadByIdentity / chunkUploadTrackerKey (parentDir before filename).
 func (cm *ChunkManager) GetOrCreateUploadByIdentity(token, identifier, parentDir, filename string, totalSize int64) (*ChunkUpload, error) {
+	return cm.GetOrCreateUploadByIdentityWithLimits(token, identifier, parentDir, filename, totalSize, 0, 0)
+}
+
+func (cm *ChunkManager) reservedStagingBytesLocked() int64 {
+	var total int64
+	for _, upload := range cm.uploads {
+		if upload == nil || upload.TotalSize <= 0 {
+			continue
+		}
+		total += upload.TotalSize
+	}
+	return total
+}
+
+func (cm *ChunkManager) validateUploadByKeyLocked(key string, totalSize, maxUploadBytes, maxStagingBytes int64) error {
+	// Defense in depth: a non-positive declared total disables every size-derived
+	// guard below (and validateChunkRange's upper bound downstream). The public HTTP
+	// path already rejects it earlier, but guard here too so any direct caller in the
+	// package cannot bypass the limits with total <= 0.
+	if totalSize <= 0 {
+		return fmt.Errorf("%w: declared size %d bytes", errChunkedUploadInvalidTotalSize, totalSize)
+	}
+	if _, exists := cm.uploads[key]; exists {
+		return nil
+	}
+	if maxUploadBytes > 0 && totalSize > maxUploadBytes {
+		return fmt.Errorf("%w: declared size %d bytes exceeds limit %d bytes", errChunkedUploadTooLarge, totalSize, maxUploadBytes)
+	}
+	if maxStagingBytes > 0 {
+		reserved := cm.reservedStagingBytesLocked()
+		if reserved > maxStagingBytes-totalSize {
+			return fmt.Errorf("%w: reserved=%d requested=%d limit=%d", errChunkedUploadStagingLimitExceeded, reserved, totalSize, maxStagingBytes)
+		}
+	}
+	return nil
+}
+
+func (cm *ChunkManager) ValidateUploadByIdentityWithLimits(token, identifier, parentDir, filename string, totalSize, maxUploadBytes, maxStagingBytes int64) error {
+	key := chunkUploadTrackerKey(token, identifier, parentDir, filename, totalSize)
+	// Read-only admission pre-check on the per-chunk hot path: validateUploadByKeyLocked
+	// only reads cm.uploads and immutable TotalSize fields, so a shared lock is enough
+	// and avoids serializing concurrent chunk requests. Tracker creation re-validates
+	// under the exclusive lock, so this is purely a fail-fast.
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.validateUploadByKeyLocked(key, totalSize, maxUploadBytes, maxStagingBytes)
+}
+
+// GetOrCreateUploadByIdentityWithLimits gets or creates a chunk upload tracker
+// while enforcing server-side hard limits for chunked uploads.
+func (cm *ChunkManager) GetOrCreateUploadByIdentityWithLimits(token, identifier, parentDir, filename string, totalSize, maxUploadBytes, maxStagingBytes int64) (*ChunkUpload, error) {
 	key := chunkUploadTrackerKey(token, identifier, parentDir, filename, totalSize)
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
+	if err := cm.validateUploadByKeyLocked(key, totalSize, maxUploadBytes, maxStagingBytes); err != nil {
+		return nil, err
+	}
 	if upload, exists := cm.uploads[key]; exists {
 		return upload, nil
 	}
@@ -605,6 +666,10 @@ func (cm *ChunkManager) GetOrCreateUploadByIdentity(token, identifier, parentDir
 // carry a resumable identifier.
 func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, totalSize int64) (*ChunkUpload, error) {
 	return cm.GetOrCreateUploadByIdentity(token, "", parentDir, filename, totalSize)
+}
+
+func (cm *ChunkManager) GetOrCreateUploadWithLimits(token, filename, parentDir string, totalSize, maxUploadBytes, maxStagingBytes int64) (*ChunkUpload, error) {
+	return cm.GetOrCreateUploadByIdentityWithLimits(token, "", parentDir, filename, totalSize, maxUploadBytes, maxStagingBytes)
 }
 
 func (cm *ChunkManager) GetUploadByIdentity(token, identifier, parentDir, filename string, totalSize int64) *ChunkUpload {
@@ -880,14 +945,14 @@ func (cu *ChunkUpload) WriteChunkFromReader(r io.Reader, start, end int64) error
 
 func validateChunkRange(start, end, totalSize, written int64) error {
 	if start < 0 || end < start {
-		return fmt.Errorf("invalid chunk range: start=%d end=%d", start, end)
+		return fmt.Errorf("%w: start=%d end=%d", errInvalidChunkRange, start, end)
 	}
 	if totalSize > 0 && end >= totalSize {
-		return fmt.Errorf("chunk range exceeds total size: end=%d total=%d", end, totalSize)
+		return fmt.Errorf("%w: end=%d total=%d", errInvalidChunkRange, end, totalSize)
 	}
 	expected := end - start + 1
 	if written >= 0 && written != expected {
-		return fmt.Errorf("chunk size mismatch: range=%d written=%d", expected, written)
+		return fmt.Errorf("%w: chunk size mismatch range=%d written=%d", errInvalidChunkRange, expected, written)
 	}
 	return nil
 }
@@ -1261,6 +1326,39 @@ func (h *SeafHTTPHandler) SetZipLimits(maxEntries, maxDepth int, maxBytes int64)
 	if maxBytes > 0 {
 		h.zipMaxBytes = maxBytes
 	}
+}
+
+const bytesPerMiB = 1024 * 1024
+
+func configuredChunkedMaxUploadBytes(cfg *config.Config) int64 {
+	if cfg == nil || cfg.Server.MaxUploadMB <= 0 {
+		return 0
+	}
+	return cfg.Server.MaxUploadMB * bytesPerMiB
+}
+
+func configuredChunkedStagingMaxBytes(cfg *config.Config) int64 {
+	if cfg == nil || cfg.SeafHTTP.ChunkedStagingMaxBytes <= 0 {
+		return 0
+	}
+	return cfg.SeafHTTP.ChunkedStagingMaxBytes
+}
+
+func writeChunkedUploadInitializationError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, errChunkedUploadTooLarge):
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "chunked upload exceeds configured max upload size"})
+	case errors.Is(err, errChunkedUploadStagingLimitExceeded):
+		c.JSON(http.StatusInsufficientStorage, gin.H{"error": "chunked upload staging capacity exceeded on this node"})
+	case errors.Is(err, errChunkedUploadInvalidTotalSize):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "chunked upload requires a positive total size in Content-Range"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize upload"})
+	}
+}
+
+func writeInvalidChunkRangeError(c *gin.Context, err error) {
+	c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 }
 
 func (h *SeafHTTPHandler) configuredServerURL() string {
@@ -1643,6 +1741,26 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	contentRange := c.GetHeader("Content-Range")
 	start, end, total, isChunked := parseContentRange(contentRange)
+	if isChunked {
+		if total <= 0 {
+			log.Printf("[HandleUpload] Rejecting chunked upload with non-positive declared total=%d", total)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "chunked upload requires a positive total size in Content-Range"})
+			return
+		}
+		if err := validateChunkRange(start, end, total, -1); err != nil {
+			log.Printf("[HandleUpload] Rejecting chunked upload with invalid range start=%d end=%d total=%d: %v", start, end, total, err)
+			writeInvalidChunkRangeError(c, err)
+			return
+		}
+	} else if contentRange != "" {
+		// A present-but-unparseable Content-Range must fail closed rather than
+		// silently fall through to the single-shot path: the client clearly meant
+		// a chunked transfer, so honoring it as a whole-file upload would bypass
+		// the chunked range/size handling entirely.
+		log.Printf("[HandleUpload] Rejecting malformed Content-Range header: %q", contentRange)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "malformed Content-Range header"})
+		return
+	}
 
 	// Traffic quota pre-check — evaluated before reading the body so we can
 	// fail fast. For chunked uploads, use the declared total from Content-Range
@@ -1739,6 +1857,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		tokenStr, filename, contentRange, isChunked)
 
 	if isChunked {
+		// total <= 0 and invalid chunk ranges were already rejected right after
+		// parseContentRange, before any tracker or temp file could be created.
+		chunkedMaxUploadBytes := configuredChunkedMaxUploadBytes(h.config)
+		chunkedStagingMaxBytes := configuredChunkedStagingMaxBytes(h.config)
+
 		// A finalize result cached for this upload means it already completed —
 		// this is a late retry of whichever chunk carried the finalize (the
 		// winner published and the tracker was already cleaned up). Answer with
@@ -1760,6 +1883,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			}
 			return
 		}
+		if err := chunkManager.ValidateUploadByIdentityWithLimits(tokenStr, uploadIdentifier, parentDir, filename, total, chunkedMaxUploadBytes, chunkedStagingMaxBytes); err != nil {
+			log.Printf("[HandleUpload] Chunked upload rejected before quota precheck: %v", err)
+			writeChunkedUploadInitializationError(c, err)
+			return
+		}
 
 		existingUpload := chunkManager.GetUploadByIdentity(tokenStr, uploadIdentifier, parentDir, filename, total)
 		if existingUpload == nil || !existingUpload.HasQuotaPrecheck(parentDir, total, replaceFile) {
@@ -1775,10 +1903,18 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 
 		// Chunked upload: stream chunk data directly to temp file (no io.ReadAll)
-		upload, err := chunkManager.GetOrCreateUploadByIdentity(tokenStr, uploadIdentifier, parentDir, filename, total)
+		upload, err := chunkManager.GetOrCreateUploadByIdentityWithLimits(
+			tokenStr,
+			uploadIdentifier,
+			parentDir,
+			filename,
+			total,
+			chunkedMaxUploadBytes,
+			chunkedStagingMaxBytes,
+		)
 		if err != nil {
 			log.Printf("[HandleUpload] Failed to create upload tracker: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize upload"})
+			writeChunkedUploadInitializationError(c, err)
 			return
 		}
 		upload.MarkQuotaPrecheck(parentDir, total, replaceFile)
@@ -1786,7 +1922,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		// Stream chunk directly to temp file at the correct offset
 		if err := upload.WriteChunkFromReader(file, start, end); err != nil {
 			log.Printf("[HandleUpload] Failed to write chunk: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to write chunk"})
+			if errors.Is(err, errInvalidChunkRange) {
+				writeInvalidChunkRangeError(c, err)
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to write chunk"})
+			}
 			return
 		}
 

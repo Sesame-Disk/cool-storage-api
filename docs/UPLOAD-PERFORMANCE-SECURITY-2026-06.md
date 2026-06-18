@@ -192,34 +192,27 @@ blocks directly to S3 as chunks arrive, eliminating node-local staging.
 ## S-2 — `server.max_upload_mb` is not enforced on chunked uploads
 
 **Severity: MEDIUM**
-**Branch: pending**
+**Branch: fixed in `upload/chunked-hardening-limits`**
 
-Defined in `internal/config/config.go`. Not referenced in `seafhttp.go` for
-chunked uploads. Single-shot uploads have a hardcoded 1 GiB limit (`seafhttp.go:1480`).
-Without a storage quota configured for an org, a user can upload files of arbitrary
-size over chunked paths.
-
-**Fix:** read `cfg.SeafHTTP.MaxUploadMB` in `GetOrCreateUpload` before
-`Truncate(totalSize)` and reject with 413 if `totalSize > max`.
+Chunked uploads now enforce `server.max_upload_mb` before a new tracker creates
+or truncates its temp file. Requests above the configured cap fail closed with
+HTTP 413 instead of consuming local staging first.
 
 ---
 
 ## S-3 — Full /tmp staging before any byte reaches S3
 
 **Severity: MEDIUM**
-**Branch: pending**
+**Branch: mitigated in `upload/chunked-hardening-limits`**
 
-`os.TempDir()` (`seafhttp.go:346`) + `Truncate(totalSize)` (`seafhttp.go:396`).
-On Linux with ext4/xfs, `Truncate` creates a sparse file (no physical block
-allocation until chunks are written), but disk pressure grows as chunks arrive.
-There is no per-node, per-org, or per-token staging limit. The janitor cleans
-orphans after 2 hours (`chunkDiskTTL`).
+The `/tmp` staging model still exists, but the node can now enforce
+`seafhttp.chunked_staging_max_bytes` as a reservation budget across active
+chunked uploads. If the sum of tracked upload sizes plus a new upload would
+exceed that limit, tracker creation fails with HTTP 507 before local staging is
+extended.
 
-Under concurrent large uploads without conservative storage quotas, `/tmp` can
-be exhausted.
-
-**Fix:** a configurable maximum staging bytes per node; reject `GetOrCreateUpload`
-if the limit would be exceeded.
+Important limit: the default stays `0` (disabled) for backwards compatibility,
+so operators still need to choose and roll out a real node-local budget.
 
 ---
 
@@ -266,8 +259,8 @@ file-sharing protocols.
 | P-2 | Double S3 RTT per block (Exists + PUT)         | ✅ Confirmed   | HIGH→MEDIUM| **RESOLVED** |
 | P-3 | Benchmarks 44–48 MB/s, no scaling              | ❓ Plausible   | —          | External     |
 | S-1 | Chunk state node-local (multi-node blocker)    | ✅ Confirmed   | HIGH       | Pending      |
-| S-2 | max_upload_mb not enforced on chunked uploads  | ✅ Confirmed   | MEDIUM     | Pending      |
-| S-3 | Full /tmp staging, no disk admission limit     | ✅ Confirmed   | MEDIUM     | Pending      |
+| S-2 | max_upload_mb not enforced on chunked uploads  | ✅ Fixed       | MEDIUM     | Complete     |
+| S-3 | Full /tmp staging, no disk admission limit     | ✅ Mitigated   | MEDIUM     | Guard added; config still required |
 | S-4 | TOCTOU quota check across concurrent uploads   | ✅ Confirmed   | MEDIUM     | Pending      |
 | S-5 | Client filename, content-type ignored          | ✅ Confirmed   | LOW        | Pending      |
 
@@ -282,5 +275,5 @@ without a database connection.
 | 1 | P-1 | Unwrap S3 PUT from metadata permit | Max impact, minimal change — **done** |
 | 2 | P-2 | Cassandra-first probe; direct PUT, no HEAD | Eliminates the S3 HEAD per block — **done** (`perf/p2-cassandra-first-hot-reuse`) |
 | 3 | S-1 | Sticky sessions at LB (immediate) or distributed chunk state (complete) | Required for multi-node topology |
-| 4 | S-2/S-3 | Apply `max_upload_mb` + disk admission limit | Operational hardening |
+| 4 | S-2/S-3 | Roll out a real `chunked_staging_max_bytes` value per node | Operational hardening follow-through |
 | 5 | S-4 | Atomic quota reservation at upload start | Closes the concurrent over-quota window |

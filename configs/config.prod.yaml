@@ -250,6 +250,7 @@ seafhttp:
   zip_max_entries: 100000
   zip_max_depth: 64
   zip_max_bytes: 10737418240
+  chunked_staging_max_bytes: 0 # 0 = unlimited; set a deployment-specific byte budget per node to cap active chunked temp-file staging
 
 # =============================================================================
 # Chunking
