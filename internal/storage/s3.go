@@ -263,6 +263,11 @@ func (s *S3Store) PutLarge(ctx context.Context, blockID string, data io.Reader, 
 }
 
 func (s *S3Store) putLargeWithClient(ctx context.Context, client multipartUploadClient, blockID string, data io.Reader, size int64) (string, error) {
+	partCount, err := validateMultipartUploadSize(size)
+	if err != nil {
+		return "", err
+	}
+
 	key := s.key(blockID)
 
 	// Initiate multipart upload
@@ -294,7 +299,7 @@ func (s *S3Store) putLargeWithClient(ctx context.Context, client multipartUpload
 		}
 	}
 
-	completedParts, err := uploadMultipartParts(ctx, client, s.bucket, key, uploadID, data, size)
+	completedParts, err := uploadMultipartParts(ctx, client, s.bucket, key, uploadID, data, size, partCount)
 	if err != nil {
 		abortMultipartUpload()
 		return "", err
@@ -318,15 +323,21 @@ func (s *S3Store) putLargeWithClient(ctx context.Context, client multipartUpload
 	return key, nil
 }
 
-func uploadMultipartParts(ctx context.Context, client multipartUploadClient, bucket, key string, uploadID *string, data io.Reader, size int64) ([]types.CompletedPart, error) {
+func validateMultipartUploadSize(size int64) (int, error) {
 	if size <= 0 {
-		return nil, fmt.Errorf("multipart upload requires positive size")
+		return 0, fmt.Errorf("multipart upload requires positive size")
 	}
 
-	partCount := int((size + MultipartPartSize - 1) / MultipartPartSize)
-	if partCount > MaxMultipartParts {
-		return nil, fmt.Errorf("object of %d bytes needs %d parts of %d bytes, exceeding the S3 limit of %d parts", size, partCount, MultipartPartSize, MaxMultipartParts)
+	partSize := int64(MultipartPartSize)
+	partCount64 := (size-1)/partSize + 1
+	if partCount64 > MaxMultipartParts {
+		return 0, fmt.Errorf("object of %d bytes needs %d parts of %d bytes, exceeding the S3 limit of %d parts", size, partCount64, MultipartPartSize, MaxMultipartParts)
 	}
+
+	return int(partCount64), nil
+}
+
+func uploadMultipartParts(ctx context.Context, client multipartUploadClient, bucket, key string, uploadID *string, data io.Reader, size int64, partCount int) ([]types.CompletedPart, error) {
 	workerCount := MultipartUploadConcurrency
 	if partCount < workerCount {
 		workerCount = partCount

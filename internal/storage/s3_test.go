@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -32,6 +33,9 @@ func TestMultipartConstants(t *testing.T) {
 	}
 	if MultipartUploadConcurrency != 4 {
 		t.Errorf("MultipartUploadConcurrency = %d, want 4", MultipartUploadConcurrency)
+	}
+	if MaxMultipartParts != 10000 {
+		t.Errorf("MaxMultipartParts = %d, want 10000", MaxMultipartParts)
 	}
 }
 
@@ -234,14 +238,14 @@ func TestPutLargeRejectsNonPositiveSize(t *testing.T) {
 	if !strings.Contains(err.Error(), "positive size") {
 		t.Fatalf("error = %v, want positive size failure", err)
 	}
-	if client.createCalls != 1 {
-		t.Fatalf("CreateMultipartUpload calls = %d, want 1", client.createCalls)
+	if client.createCalls != 0 {
+		t.Fatalf("CreateMultipartUpload calls = %d, want 0", client.createCalls)
 	}
 	if client.completeCalls != 0 {
 		t.Fatalf("CompleteMultipartUpload calls = %d, want 0", client.completeCalls)
 	}
-	if client.abortCalls != 1 {
-		t.Fatalf("AbortMultipartUpload calls = %d, want 1", client.abortCalls)
+	if client.abortCalls != 0 {
+		t.Fatalf("AbortMultipartUpload calls = %d, want 0", client.abortCalls)
 	}
 }
 
@@ -267,11 +271,14 @@ func TestPutLargeRejectsTooManyParts(t *testing.T) {
 	if !strings.Contains(err.Error(), "exceeding the S3 limit") {
 		t.Fatalf("error = %v, want S3 part-limit failure", err)
 	}
+	if client.createCalls != 0 {
+		t.Fatalf("CreateMultipartUpload calls = %d, want 0", client.createCalls)
+	}
 	if client.completeCalls != 0 {
 		t.Fatalf("CompleteMultipartUpload calls = %d, want 0", client.completeCalls)
 	}
-	if client.abortCalls != 1 {
-		t.Fatalf("AbortMultipartUpload calls = %d, want 1", client.abortCalls)
+	if client.abortCalls != 0 {
+		t.Fatalf("AbortMultipartUpload calls = %d, want 0", client.abortCalls)
 	}
 }
 
@@ -313,6 +320,45 @@ func TestPutLargeAbortsOnContextCancellation(t *testing.T) {
 	}
 	if client.abortCalls != 1 {
 		t.Fatalf("AbortMultipartUpload calls = %d, want 1 (abort must run on a fresh context)", client.abortCalls)
+	}
+}
+
+func TestValidateMultipartUploadSize(t *testing.T) {
+	tests := []struct {
+		name      string
+		size      int64
+		wantParts int
+		wantErr   string
+	}{
+		{name: "one byte", size: 1, wantParts: 1},
+		{name: "exactly one part", size: MultipartPartSize, wantParts: 1},
+		{name: "round up", size: MultipartPartSize + 1, wantParts: 2},
+		{name: "max valid parts", size: int64(MaxMultipartParts) * int64(MultipartPartSize), wantParts: MaxMultipartParts},
+		{name: "zero", size: 0, wantErr: "positive size"},
+		{name: "negative", size: -1, wantErr: "positive size"},
+		{name: "too many parts", size: int64(MaxMultipartParts)*int64(MultipartPartSize) + 1, wantErr: "exceeding the S3 limit"},
+		{name: "near int64 max does not overflow", size: math.MaxInt64, wantErr: "exceeding the S3 limit"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := validateMultipartUploadSize(tt.size)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("validateMultipartUploadSize(%d) error = nil, want %q", tt.size, tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("validateMultipartUploadSize(%d) error = %v, want substring %q", tt.size, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateMultipartUploadSize(%d) error = %v", tt.size, err)
+			}
+			if got != tt.wantParts {
+				t.Fatalf("validateMultipartUploadSize(%d) = %d, want %d", tt.size, got, tt.wantParts)
+			}
+		})
 	}
 }
 
