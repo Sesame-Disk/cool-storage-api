@@ -347,24 +347,23 @@ the upload token (already in Cassandra, no server changes needed). Permanent
 fix: distributed chunk state (Redis) or on-the-fly block materialization as
 chunks arrive, eliminating node-local staging.
 
-**S-2 — `server.max_upload_mb` not enforced on chunked uploads** (pending)
+**S-2 — `server.max_upload_mb` not enforced on chunked uploads** - Fixed
+(2026-06-18, branch `upload/chunked-hardening-limits`)
 
-Defined in `internal/config/config.go`; not referenced in `seafhttp.go` for
-the chunked path. Single-shot uploads have a hardcoded 1 GiB limit
-(`seafhttp.go:1480`). Without an org storage quota, a user can upload files of
-arbitrary size via chunked uploads. Fix: check `cfg.SeafHTTP.MaxUploadMB` in
-`GetOrCreateUpload` before `Truncate(totalSize)` and reject with 413.
+Chunked uploads now enforce `server.max_upload_mb` before a new tracker creates
+or truncates its temp file. The guard lives in the chunk-manager create path, so
+chunked requests above the configured limit fail closed with HTTP 413 instead of
+allocating local staging first.
 
-**S-3 — Full /tmp staging with no disk admission limit** (pending)
+**S-3 — Full /tmp staging with no disk admission limit** - Mitigated
+(2026-06-18, branch `upload/chunked-hardening-limits`)
 
-Each chunked upload creates a file in `os.TempDir()` sized to the declared
-total via `Truncate(totalSize)` (`seafhttp.go:396`). On Linux with ext4/xfs
-this is a sparse file (no immediate physical allocation), but disk pressure
-grows as chunks arrive. No per-node, per-org, or per-token staging limit
-exists; the janitor cleans orphans after 2 h (`chunkDiskTTL`). Under concurrent
-large uploads without conservative storage quotas `/tmp` can be exhausted. Fix:
-configurable max staging bytes per node; reject `GetOrCreateUpload` if the
-limit would be exceeded.
+The full temp-file staging model still exists, but the node can now expose an
+explicit reservation budget through `seafhttp.chunked_staging_max_bytes`. New
+chunked uploads are rejected before tracker creation if their declared size
+would push the sum of active staged uploads above that budget. The default
+remains `0` (disabled) to preserve existing deployments until operators choose a
+node-local value that matches real disk capacity.
 
 ---
 

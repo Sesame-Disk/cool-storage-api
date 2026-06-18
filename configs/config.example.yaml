@@ -255,6 +255,7 @@ seafhttp:
   zip_max_entries: 100000            # max files included in a streamed ZIP download
   zip_max_depth: 64                  # max directory nesting when traversing a ZIP download
   zip_max_bytes: 10737418240         # 10 GiB max total uncompressed bytes in a ZIP download
+  chunked_staging_max_bytes: 0       # 0 = unlimited; set a node-local byte budget (for example 214748364800 for 200 GiB) to cap active chunked temp-file staging
 
 gc:
   enabled: false                   # Safe default; enable explicitly with GC_ENABLED=true on the designated GC replica

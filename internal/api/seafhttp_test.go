@@ -2126,6 +2126,42 @@ func TestChunkManagerGetOrCreateUpload(t *testing.T) {
 	cm.CleanupUpload("token2", "file.txt")
 }
 
+func TestChunkManagerGetOrCreateUploadRejectsConfiguredMaxUploadBytes(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	upload, err := cm.GetOrCreateUploadWithLimits("token1", "too-big.bin", "/", 11, 10, 0)
+	if upload != nil {
+		t.Fatal("upload should be nil when the max upload size is exceeded")
+	}
+	if !errors.Is(err, errChunkedUploadTooLarge) {
+		t.Fatalf("error = %v, want errChunkedUploadTooLarge", err)
+	}
+	if got := cm.GetUpload("token1", "too-big.bin"); got != nil {
+		t.Fatal("rejected upload must not stay tracked")
+	}
+}
+
+func TestChunkManagerGetOrCreateUploadRejectsWhenStagingBudgetWouldBeExceeded(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	uploadA, err := cm.GetOrCreateUploadWithLimits("token1", "a.bin", "/", 7, 0, 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadWithLimits(uploadA) failed: %v", err)
+	}
+	defer cm.CleanupTrackedUpload(uploadA)
+
+	uploadB, err := cm.GetOrCreateUploadWithLimits("token2", "b.bin", "/", 4, 0, 10)
+	if uploadB != nil {
+		t.Fatal("upload should be nil when staging budget would be exceeded")
+	}
+	if !errors.Is(err, errChunkedUploadStagingLimitExceeded) {
+		t.Fatalf("error = %v, want errChunkedUploadStagingLimitExceeded", err)
+	}
+	if got := cm.GetUpload("token2", "b.bin"); got != nil {
+		t.Fatal("rejected upload must not stay tracked")
+	}
+}
+
 func TestChunkManagerTracksSameBasenameSeparatelyByIdentityAndPath(t *testing.T) {
 	cm, _ := newTestChunkManager(t)
 

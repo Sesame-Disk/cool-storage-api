@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
@@ -182,6 +183,97 @@ func TestHandleUploadQuotaContract_ChunkedPrecheckUsesDeclaredTotal(t *testing.T
 	}
 	if len(checker.trafficBytes) != 1 || checker.trafficBytes[0] != 5 {
 		t.Fatalf("traffic precheck bytes = %v, want [5]", checker.trafficBytes)
+	}
+}
+
+func TestHandleUploadChunkedMaxUploadMBRejectedWith413(t *testing.T) {
+	setAPIQuotaChecker(t, &fakeAPIQuotaChecker{
+		storageStatus: traffic.QuotaStatus{Allowed: true},
+		trafficStatus: traffic.QuotaStatus{Allowed: true},
+	})
+	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	t.Cleanup(func() {
+		checkUploadStorageQuotaForCurrentHeadFn = oldQuota
+	})
+
+	tokenStore := NewMockTokenStore()
+	if _, err := tokenStore.CreateUploadToken("org1", "repo1", "/", "user1"); err != nil {
+		t.Fatalf("CreateUploadToken() error = %v", err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.Server.MaxUploadMB = 1
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tokenStore, cfg, nil)
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	req := newMultipartUploadRequest(t, "/seafhttp/upload-api/mock-upload-token", "test.txt", []byte("abc"))
+	req.Header.Set("Content-Range", "bytes 0-2/1048577")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusRequestEntityTooLarge)
+	}
+	payload := decodeJSONObject(t, w.Body)
+	if payload["error"] != "chunked upload exceeds configured max upload size" {
+		t.Fatalf("error = %v, want chunked upload exceeds configured max upload size", payload["error"])
+	}
+}
+
+func TestHandleUploadChunkedStagingBudgetRejectedWith507(t *testing.T) {
+	setAPIQuotaChecker(t, &fakeAPIQuotaChecker{
+		storageStatus: traffic.QuotaStatus{Allowed: true},
+		trafficStatus: traffic.QuotaStatus{Allowed: true},
+	})
+	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	t.Cleanup(func() {
+		checkUploadStorageQuotaForCurrentHeadFn = oldQuota
+	})
+
+	oldChunkManager := chunkManager
+	testChunkManager, _ := newTestChunkManager(t)
+	chunkManager = testChunkManager
+	t.Cleanup(func() {
+		chunkManager = oldChunkManager
+	})
+
+	seedUpload, err := chunkManager.GetOrCreateUploadByIdentityWithLimits("seed-token", "seed-ident", "/", "existing.bin", 8, 0, 10)
+	if err != nil {
+		t.Fatalf("seed upload error = %v", err)
+	}
+	t.Cleanup(func() {
+		chunkManager.CleanupTrackedUpload(seedUpload)
+	})
+
+	tokenStore := NewMockTokenStore()
+	if _, err := tokenStore.CreateUploadToken("org1", "repo1", "/", "user1"); err != nil {
+		t.Fatalf("CreateUploadToken() error = %v", err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.SeafHTTP.ChunkedStagingMaxBytes = 10
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tokenStore, cfg, nil)
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	req := newMultipartUploadRequest(t, "/seafhttp/upload-api/mock-upload-token", "test.txt", []byte("abc"))
+	req.Header.Set("Content-Range", "bytes 0-2/3")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusInsufficientStorage)
+	}
+	payload := decodeJSONObject(t, w.Body)
+	if payload["error"] != "chunked upload staging capacity exceeded on this node" {
+		t.Fatalf("error = %v, want chunked upload staging capacity exceeded on this node", payload["error"])
 	}
 }
 

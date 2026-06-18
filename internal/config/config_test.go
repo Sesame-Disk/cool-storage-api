@@ -416,6 +416,14 @@ func TestConfigValidate(t *testing.T) {
 			wantErrContain: "seafhttp.zip_max_bytes",
 		},
 		{
+			name: "chunked staging max bytes must be non-negative",
+			modify: func(c *Config) {
+				c.SeafHTTP.ChunkedStagingMaxBytes = -1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.chunked_staging_max_bytes",
+		},
+		{
 			name: "storage backend rejects unsupported sse mode",
 			modify: func(c *Config) {
 				hot := c.Storage.Backends["hot"]
