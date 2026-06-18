@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"strings"
 	"sync"
@@ -47,10 +48,14 @@ type fakeMultipartUploadClient struct {
 	maxConcurrent   int
 	inFlight        int
 	failPartNumber  int32
+	completeErr     error
+	abortErr        error
 	completedParts  []types.CompletedPart
 	uploadedPartIDs []int32
 	startedCh       chan int32
 	releaseCh       chan struct{}
+	abortCtxErr     error
+	abortHasDeadline bool
 }
 
 func (f *fakeMultipartUploadClient) CreateMultipartUpload(_ context.Context, _ *s3.CreateMultipartUploadInput, _ ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error) {
@@ -108,13 +113,21 @@ func (f *fakeMultipartUploadClient) CompleteMultipartUpload(_ context.Context, i
 	if input.MultipartUpload != nil {
 		f.completedParts = append([]types.CompletedPart(nil), input.MultipartUpload.Parts...)
 	}
+	if f.completeErr != nil {
+		return nil, f.completeErr
+	}
 	return &s3.CompleteMultipartUploadOutput{}, nil
 }
 
-func (f *fakeMultipartUploadClient) AbortMultipartUpload(_ context.Context, _ *s3.AbortMultipartUploadInput, _ ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error) {
+func (f *fakeMultipartUploadClient) AbortMultipartUpload(ctx context.Context, _ *s3.AbortMultipartUploadInput, _ ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.abortCalls++
+	f.abortCtxErr = ctx.Err()
+	_, f.abortHasDeadline = ctx.Deadline()
+	if f.abortErr != nil {
+		return nil, f.abortErr
+	}
 	return &s3.AbortMultipartUploadOutput{}, nil
 }
 
@@ -320,6 +333,92 @@ func TestPutLargeAbortsOnContextCancellation(t *testing.T) {
 	}
 	if client.abortCalls != 1 {
 		t.Fatalf("AbortMultipartUpload calls = %d, want 1 (abort must run on a fresh context)", client.abortCalls)
+	}
+	if client.abortCtxErr != nil {
+		t.Fatalf("AbortMultipartUpload ctx err = %v, want nil fresh context", client.abortCtxErr)
+	}
+	if !client.abortHasDeadline {
+		t.Fatal("AbortMultipartUpload context missing deadline; want bounded fresh context")
+	}
+}
+
+func TestPutLargeAbortsMultipartUploadOnCompleteFailure(t *testing.T) {
+	store := &S3Store{bucket: "test-bucket"}
+	client := &fakeMultipartUploadClient{completeErr: errors.New("complete exploded")}
+	size := int64(MultipartPartSize + 1)
+	reader := bytes.NewReader(make([]byte, int(size)))
+
+	_, err := store.putLargeWithClient(context.Background(), client, "block-complete-err", reader, size)
+	if err == nil {
+		t.Fatal("putLargeWithClient() error = nil, want completion failure")
+	}
+	if !strings.Contains(err.Error(), "failed to complete multipart upload") {
+		t.Fatalf("error = %v, want completion failure wrapper", err)
+	}
+	if !strings.Contains(err.Error(), "complete exploded") {
+		t.Fatalf("error = %v, want underlying completion failure", err)
+	}
+	if client.createCalls != 1 {
+		t.Fatalf("CreateMultipartUpload calls = %d, want 1", client.createCalls)
+	}
+	if client.completeCalls != 1 {
+		t.Fatalf("CompleteMultipartUpload calls = %d, want 1", client.completeCalls)
+	}
+	if client.abortCalls != 1 {
+		t.Fatalf("AbortMultipartUpload calls = %d, want 1", client.abortCalls)
+	}
+	if client.abortCtxErr != nil {
+		t.Fatalf("AbortMultipartUpload ctx err = %v, want nil fresh context", client.abortCtxErr)
+	}
+	if !client.abortHasDeadline {
+		t.Fatal("AbortMultipartUpload context missing deadline; want bounded fresh context")
+	}
+	if len(client.completedParts) != 2 {
+		t.Fatalf("completed parts = %d, want 2 parts submitted to completion", len(client.completedParts))
+	}
+}
+
+func TestPutLargePreservesOriginalErrorWhenAbortFails(t *testing.T) {
+	store := &S3Store{bucket: "test-bucket"}
+	client := &fakeMultipartUploadClient{
+		failPartNumber: 2,
+		abortErr:       errors.New("abort exploded"),
+	}
+	size := int64(MultipartPartSize + 1)
+	reader := bytes.NewReader(make([]byte, int(size)))
+
+	var logBuf bytes.Buffer
+	originalWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() {
+		log.SetOutput(originalWriter)
+		log.SetFlags(log.LstdFlags)
+	})
+
+	_, err := store.putLargeWithClient(context.Background(), client, "block-abort-err", reader, size)
+	if err == nil {
+		t.Fatal("putLargeWithClient() error = nil, want upload failure")
+	}
+	if !strings.Contains(err.Error(), "failed to upload part 2") {
+		t.Fatalf("error = %v, want original part upload failure", err)
+	}
+	if strings.Contains(err.Error(), "abort exploded") {
+		t.Fatalf("error = %v, abort failure must not replace original cause", err)
+	}
+	if client.abortCalls != 1 {
+		t.Fatalf("AbortMultipartUpload calls = %d, want 1", client.abortCalls)
+	}
+	if client.abortCtxErr != nil {
+		t.Fatalf("AbortMultipartUpload ctx err = %v, want nil fresh context", client.abortCtxErr)
+	}
+	if !client.abortHasDeadline {
+		t.Fatal("AbortMultipartUpload context missing deadline; want bounded fresh context")
+	}
+	if !strings.Contains(logBuf.String(), "failed to abort multipart upload") {
+		t.Fatalf("log output = %q, want abort warning", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), "abort exploded") {
+		t.Fatalf("log output = %q, want underlying abort error", logBuf.String())
 	}
 }
 
