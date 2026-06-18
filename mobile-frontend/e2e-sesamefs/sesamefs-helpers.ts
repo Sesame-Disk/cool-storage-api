@@ -49,6 +49,7 @@ export const SUITE_PREFIX = {
   perf: 'pw-e2e-perf-',
   locks: 'pw-e2e-locks-',
   bugs: 'pw-e2e-bugs-',
+  sharelinks: 'pw-e2e-slink-',
 } as const;
 
 export function uniqueName(tag: string, prefix: string = TEST_REPO_PREFIX): string {

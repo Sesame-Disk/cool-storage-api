@@ -363,6 +363,8 @@ This is intentional for cloud-native deployments — frontend and backend can be
 | [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) | Multi-region testing guide |
 | [docs/BUG-FILE-DETAIL-MODIFIER-20260618.md](docs/BUG-FILE-DETAIL-MODIFIER-20260618.md) | Known bug: `file/detail` last-modifier attribution |
 | [docs/FILE-LOCKING-DESIGN.md](docs/FILE-LOCKING-DESIGN.md) | How file locking should work (exclusive locks + OnlyOffice co-editing) |
+| [docs/BUG-LANGUAGE-LIST-ENGLISH-ONLY-20260618.md](docs/BUG-LANGUAGE-LIST-ENGLISH-ONLY-20260618.md) | Known bug: profile language selector only offers English |
+| [docs/BUG-SHARE-LINK-NO-INTERNAL-SCOPE-20260618.md](docs/BUG-SHARE-LINK-NO-INTERNAL-SCOPE-20260618.md) | Known gap: share links have no internal/org-only scope |
 | [docs/FRONTEND.md](docs/FRONTEND.md) | Web UI setup, patterns, Docker, troubleshooting |
 | [docs/OIDC.md](docs/OIDC.md) | OIDC authentication configuration |
 | [docs/TECHNICAL-DEBT.md](docs/TECHNICAL-DEBT.md) | Known issues, migration plans, incremental fixes |

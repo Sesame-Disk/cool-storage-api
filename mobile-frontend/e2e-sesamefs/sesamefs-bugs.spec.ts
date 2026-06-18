@@ -19,6 +19,7 @@ import {
   DEV_EMAILS,
   DEV_TOKENS,
   SUITE_PREFIX,
+  authHeaders,
   cleanupTestArtifacts,
   createRepo,
   downloadFileContent,
@@ -109,5 +110,47 @@ test.describe('SesameFS bug fix-targets (@bug — fail until fixed)', () => {
     const dl = await downloadFileContent(request, OWNER, id, '/doc.txt');
     expect(dl.status).toBe(200);
     expect(dl.body).toBe('OWNER-ORIGINAL');
+  });
+
+  // FIX TARGET for docs/BUG-LANGUAGE-LIST-ENGLISH-ONLY-20260618.md
+  // The bootstrap langList must offer the translated locales, not just English.
+  test('profile language list offers more than English (translations exist)', { tag: '@bug' }, async ({ request }) => {
+    const res = await request.get('/api/v2.1/bootstrap/', { headers: authHeaders(OWNER) });
+    expect(res.status()).toBe(200);
+    const data = await res.json().catch(() => ({}));
+    const langList = (data?.app_page_options?.langList ?? []) as Array<{ langCode?: string }>;
+    expect(Array.isArray(langList)).toBe(true);
+    // Translations exist for en, zh-CN, fr, de, cs, es, es-AR, es-MX, ru — see the bug doc.
+    expect(langList.length, 'language list should offer the translated locales, not only English').toBeGreaterThan(1);
+  });
+
+  // FIX TARGET for docs/BUG-SHARE-LINK-NO-INTERNAL-SCOPE-20260618.md
+  // A share link requested as internal/org-only must not be openable anonymously.
+  // Today share links are public token-only, so the scope is ignored.
+  test('an internal/org-scoped share link is not accessible anonymously', { tag: '@bug' }, async ({ request }) => {
+    const repo = await createRepo(request, OWNER, name('slink-internal'));
+    test.skip('skipReason' in repo, 'skipReason' in repo ? (repo as any).skipReason : '');
+    if ('skipReason' in repo) return;
+    const id = repo.repoId;
+    await uploadFile(request, OWNER, id, '/', 'secret.txt', 'internal only');
+
+    // Request an INTERNAL / org-scoped link (the scope hint is ignored today).
+    const createRes = await request.post('/api/v2.1/share-links/', {
+      headers: { ...authHeaders(OWNER), 'Content-Type': 'application/json' },
+      data: {
+        repo_id: id,
+        path: '/',
+        scope: 'internal',
+        link_type: 'internal',
+        permissions: JSON.stringify({ can_edit: false, can_download: true }),
+      },
+    });
+    test.skip(!createRes.ok(), `share link creation unavailable: ${createRes.status()}`);
+    const token = (await createRes.json())?.token as string;
+    expect(typeof token).toBe('string');
+
+    // Anonymous access to an internal link must be refused. FAILS today (public token).
+    const anon = await request.get(`/api/v2.1/share-links/${encodeURIComponent(token)}/dirents/?p=/`);
+    expect(anon.status(), 'an internal/org-scoped link must reject anonymous access').not.toBe(200);
   });
 });
