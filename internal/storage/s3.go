@@ -338,6 +338,12 @@ func validateMultipartUploadSize(size int64) (int, error) {
 }
 
 func uploadMultipartParts(ctx context.Context, client multipartUploadClient, bucket, key string, uploadID *string, data io.Reader, size int64, partCount int) ([]types.CompletedPart, error) {
+	// Defense in depth: the sole caller validates size via validateMultipartUploadSize,
+	// but never trust an unvalidated part count here.
+	if partCount <= 0 {
+		return nil, fmt.Errorf("invalid multipart part count %d", partCount)
+	}
+
 	workerCount := MultipartUploadConcurrency
 	if partCount < workerCount {
 		workerCount = partCount
