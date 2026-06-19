@@ -90,6 +90,39 @@ This document defines core engineering principles that guide development decisio
 
 ---
 
+## 🔢 API Status Code Conventions
+
+**Established**: 2026-06-19
+
+### Library access: 404 for missing, 403 for forbidden
+
+> For **authenticated** library/repo endpoints, a request for a library that does
+> not exist (or is soft-deleted) returns **404 Not Found**. A request for a
+> library that *exists* but the caller cannot access returns **403 Forbidden**.
+
+This is the established contract across the API: the `RequireLibraryPermission`
+middleware and the read-model handlers (tags, starred, monitored, share/upload
+links) all resolve existence first and return 404 before any permission check.
+Handlers that perform an inline permission check must do the same — when access
+is denied, call `respondIfLibraryMissing()` (see `internal/api/v2/library_live.go`)
+to surface a missing library as 404 instead of a misleading 403.
+
+**Why not hide existence behind a uniform 403?**
+- Repo IDs are high-entropy UUIDv4 (~122 bits); 404-vs-403 is not a practical
+  enumeration oracle on an authenticated, UUID-keyed lookup.
+- The codebase's anti-enumeration policy targets **unauthenticated** oracles only
+  (share-link tokens → uniform 404, avatar email enum, OIDC config — see
+  `docs/SECURITY-ASSESSMENT-2026-04-v4.md`, findings H-5/M-4). Authenticated repo
+  lookups are explicitly out of that scope.
+- A misleading 403 ("Permission denied / Leave Share") on a typo'd or deleted URL
+  is a worse UX than an honest "not found", with no real confidentiality gain.
+
+This convention would only change if product policy became "never reveal the
+existence of a private repo under any circumstance" — which is **not** the
+current policy.
+
+---
+
 ## 📋 Decision Framework
 
 When facing a technical decision, ask:

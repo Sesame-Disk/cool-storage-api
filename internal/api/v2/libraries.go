@@ -739,6 +739,13 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 
 // GetLibrary returns a single library by ID
 // This endpoint uses the api2 format expected by Seafile desktop client
+// getLibraryPermissionFn is a seam over PermissionMiddleware.GetLibraryPermission
+// so the GetLibrary/GetLibraryV21 handlers can be unit-tested without a live DB
+// (the underlying lookup hits Cassandra). Mirrors the other *Fn seams in this package.
+var getLibraryPermissionFn = func(pm *middleware.PermissionMiddleware, orgID, userID, repoID string) (middleware.LibraryPermission, error) {
+	return pm.GetLibraryPermission(orgID, userID, repoID)
+}
+
 func (h *LibraryHandler) GetLibrary(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	orgID := c.GetString("org_id")
@@ -769,7 +776,7 @@ func (h *LibraryHandler) GetLibrary(c *gin.Context) {
 		}
 	} else {
 		var err error
-		userPermission, err = h.permMiddleware.GetLibraryPermission(orgID, userID, repoID)
+		userPermission, err = getLibraryPermissionFn(h.permMiddleware, orgID, userID, repoID)
 		if err != nil {
 			log.Printf("[GetLibrary] Failed to check permissions: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
@@ -1381,7 +1388,7 @@ func (h *LibraryHandler) GetLibraryV21(c *gin.Context) {
 		}
 	} else {
 		var err error
-		userPermission, err = h.permMiddleware.GetLibraryPermission(orgID, userID, repoID)
+		userPermission, err = getLibraryPermissionFn(h.permMiddleware, orgID, userID, repoID)
 		if err != nil {
 			log.Printf("[GetLibraryV21] Failed to check permissions: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
