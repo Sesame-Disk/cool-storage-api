@@ -199,6 +199,49 @@ describe('adaptive upload concurrency helpers', () => {
         cleanup();
     });
 
+    test('small-file-only queues still back off to one slot on 429 and stay there during cooldown', () => {
+        const { resumable } = createFakeResumable({
+            configuredUploads: 3,
+            files: [
+                { id: 'small-1', pendingChunks: 2, size: eightMiB },
+                { id: 'small-2', pendingChunks: 2, size: eightMiB },
+                { id: 'small-3', pendingChunks: 2, size: eightMiB },
+            ],
+        });
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+
+        const completeAllUploading = () => {
+            resumable.files.forEach(file => file.chunks.forEach(chunk => {
+                if (chunk._status === 'uploading') {
+                    chunk._status = 'success';
+                }
+            }));
+        };
+
+        resumable.uploadNextChunk();
+        expect(resumable.opts.simultaneousUploads).toBe(3);
+        expect(countUploadingChunks(resumable)).toBe(3);
+
+        // Server backpressure must lower the target even though the queue has no
+        // adaptive-eligible (large) file to drive the ramp logic.
+        noteAdaptiveUploadFailure(resumable, { lastUploadResponseStatus: 429 }, 'rate limited');
+        expect(resumable.opts.simultaneousUploads).toBe(1);
+
+        // During the cooldown window the queue must not refill back up to 3.
+        completeAllUploading();
+        resumable.uploadNextChunk();
+        expect(resumable.opts.simultaneousUploads).toBe(1);
+        expect(countUploadingChunks(resumable)).toBe(1);
+
+        // Once the cooldown expires, small-file batches recover to the ceiling.
+        resumable._sesamefsAdaptiveUpload.cooldownUntil = 0;
+        completeAllUploading();
+        resumable.uploadNextChunk();
+        expect(resumable.opts.simultaneousUploads).toBe(3);
+
+        cleanup();
+    });
+
     test('ramps up toward the configured ceiling on stable high-throughput uploads', () => {
         const { resumable, files } = createFakeResumable();
         const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);

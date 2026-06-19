@@ -8,6 +8,44 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-06-18 - Adaptive upload ceiling: small-file parallelism + backpressure fixes
+
+### Fixed
+
+Two follow-up issues in the adaptive upload concurrency scheduler:
+
+- **Small-file-only queues were stuck at one slot.** Files smaller than the
+  adaptive-eligibility threshold (under ~3 chunks) never drive the ramp logic,
+  so a batch of only small files would upload fully serialized. They now default
+  to the configured ceiling immediately when no large file is present.
+- **Backoff was neutralized for small-file queues.** Because small-file queues
+  used the ceiling unconditionally, a retry / `429` / `5xx` / network drop that
+  lowered the adaptive target was ignored on the very next chunk. The ceiling
+  shortcut is now suppressed during the post-failure cooldown window, so the
+  backoff actually holds; small-file batches recover to the ceiling only after
+  the cooldown expires.
+
+### Improved
+
+- Concurrency target is now computed once per `uploadNextChunk` poke and threaded
+  through the start/fill calls instead of being recomputed for every slot, and
+  the eligibility scan uses plain loops (no intermediate arrays/closures) to keep
+  the hot path cheap on large queues.
+- The temporary finalize slot is now capped at the configured ceiling instead of
+  being allowed to exceed it by one.
+
+### Tests
+
+- Added coverage for small-file-only parallelism, small-file `429` backoff during
+  cooldown + recovery, and the finalize slot respecting the ceiling.
+
+### Files
+
+- `frontend/src/utils/upload-finalization.js`
+- `frontend/src/utils/__tests__/upload-finalization.test.js`
+
+---
+
 ## 2026-06-18 - Web uploads now treat simultaneous_uploads as an adaptive ceiling
 
 ### Improved

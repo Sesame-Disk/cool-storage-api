@@ -376,6 +376,10 @@ The current web uploader now has two safe improvements in place:
 - `web_uploads.simultaneous_uploads` is now treated as a client-side ceiling:
   each upload session starts at `1`, ramps up only on stable high-throughput
   links, and drops back to `1` on retries or network/server trouble.
+  - Queues made up of only small files (which never drive the ramp logic) use
+    the configured ceiling directly, except during the post-failure cooldown
+    window, where they too honor the `429`/retry/`5xx`/network backoff before
+    recovering back to the ceiling.
 
 The backend upload hot path also now avoids one repeated cost: successful chunked
 storage pre-checks are cached on the in-memory upload tracker, so later chunk requests

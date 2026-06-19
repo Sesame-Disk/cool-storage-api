@@ -248,16 +248,15 @@ const hasAdaptiveEligibleWork = (resumable) => {
         }
 
         const chunks = getFileChunks(file);
-        if (chunks.length === 0) {
+        if (chunks.length === 0 || !isAdaptiveEligibleFile(file, resumable)) {
             continue;
         }
 
-        const hasActiveOrPendingChunk = chunks.some(chunk => {
+        for (const chunk of chunks) {
             const status = getChunkStatus(chunk);
-            return status === 'pending' || status === 'uploading';
-        });
-        if (hasActiveOrPendingChunk && isAdaptiveEligibleFile(file, resumable)) {
-            return true;
+            if (status === 'pending' || status === 'uploading') {
+                return true;
+            }
         }
     }
 
@@ -271,7 +270,15 @@ const desiredUploadConcurrency = (resumable, options = {}) => {
     }
 
     let desired = state.effective;
-    if (!hasAdaptiveEligibleWork(resumable)) {
+
+    // Small-file-only queues never ramp (their files are not adaptive-eligible),
+    // so they default to the full configured ceiling for parallelism. But a
+    // recent retry/429/5xx/network drop sets a cooldown and lowers `effective`;
+    // honor that backoff window instead of jumping back to `max` on the next
+    // chunk, otherwise backpressure would be neutralized for small-file batches.
+    const now = options.now ?? Date.now();
+    const isCoolingDown = state.cooldownUntil > now;
+    if (!isCoolingDown && !hasAdaptiveEligibleWork(resumable)) {
         desired = state.max;
     }
 
@@ -373,7 +380,7 @@ const startNextUploadChunk = (resumable, options = {}) => {
         return false;
     }
 
-    const allowedSlots = desiredUploadConcurrency(resumable, options);
+    const allowedSlots = options.target ?? desiredUploadConcurrency(resumable, options);
     if (countUploadingChunks(resumable) >= allowedSlots) {
         return false;
     }
@@ -381,15 +388,15 @@ const startNextUploadChunk = (resumable, options = {}) => {
     return Boolean(originalUploadNextChunk.call(resumable));
 };
 
-const fillUploadConcurrencySlots = (resumable) => {
-    const targetSlots = desiredUploadConcurrency(resumable);
+const fillUploadConcurrencySlots = (resumable, precomputedTarget) => {
+    const targetSlots = precomputedTarget ?? desiredUploadConcurrency(resumable);
     let started = false;
 
     for (let attempts = 0; attempts < targetSlots; attempts++) {
         if (countUploadingChunks(resumable) >= targetSlots) {
             break;
         }
-        if (!startNextUploadChunk(resumable)) {
+        if (!startNextUploadChunk(resumable, { target: targetSlots })) {
             break;
         }
         started = true;
@@ -445,7 +452,12 @@ const degradeAdaptiveUploadConcurrency = (resumable, reason, options = {}) => {
     state.lastRampBitrate = 0;
     state.cooldownUntil = now + ADAPTIVE_UPLOAD_COOLDOWN_MS;
     void reason;
-    return setEffectiveUploadConcurrency(resumable, ADAPTIVE_UPLOAD_MIN_CONCURRENCY);
+    const changed = setEffectiveUploadConcurrency(resumable, ADAPTIVE_UPLOAD_MIN_CONCURRENCY);
+    // For small-file-only queues `effective` is already 1, so setEffective
+    // early-returns without syncing; force the now-cooling target into opts so
+    // the backoff actually takes hold instead of staying at the ceiling.
+    syncResumableSimultaneousUploads(resumable);
+    return changed;
 };
 
 const extractAdaptivePenaltyStatus = (resumableFile, message) => {
@@ -512,10 +524,16 @@ export const initializeAdaptiveUploadConcurrency = (resumable, configuredUploads
         resumable.opts.simultaneousUploads = ADAPTIVE_UPLOAD_MIN_CONCURRENCY;
     }
     resumable.uploadNextChunk = function () {
-        syncResumableSimultaneousUploads(resumable);
-        const started = startNextUploadChunk(resumable);
+        // Compute the concurrency target once per poke and thread it through the
+        // start/fill calls so this hot path does a single files×chunks scan
+        // instead of recomputing it for every slot it tries to fill.
+        const target = desiredUploadConcurrency(resumable);
+        if (resumable.opts) {
+            resumable.opts.simultaneousUploads = target;
+        }
+        const started = startNextUploadChunk(resumable, { target });
         if (started) {
-            fillUploadConcurrencySlots(resumable);
+            fillUploadConcurrencySlots(resumable, target);
         }
         return started;
     };
