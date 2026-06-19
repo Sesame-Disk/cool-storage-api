@@ -103,3 +103,66 @@ describe('UploadProgressDialog auto-scroll gating', () => {
     expect(dialog.scrollActiveUploadIntoView).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('UploadProgressDialog scrollActiveUploadIntoView geometry', () => {
+  const buildDialog = ({ container, row, isMinimized = false }) => {
+    const dialog = new UploadProgressDialog({ uploadFileList: [] });
+    dialog.state = { isMinimized };
+    dialog.contentRef = { current: container };
+    dialog.activeUploadRowRef = { current: row };
+    return dialog;
+  };
+
+  // The scroll container box sits 100px down the page and is 200px tall.
+  const makeContainer = (scrollTop) => ({
+    scrollTop,
+    clientHeight: 200,
+    getBoundingClientRect: () => ({ top: 100, height: 200 }),
+  });
+
+  const makeRow = (viewportTop, height = 50) => ({
+    getBoundingClientRect: () => ({ top: viewportTop, height }),
+  });
+
+  test('scrolls down to reveal an active row below the viewport', () => {
+    // Regression: the old offsetTop math collapsed to scrollTop = 0 here, so a
+    // row near the bottom of a long list (e.g. file 18/18) never came into view.
+    const container = makeContainer(0);
+    // Row 600px below the container's content top => well past the 200px viewport.
+    const dialog = buildDialog({ container, row: makeRow(700) });
+
+    dialog.scrollActiveUploadIntoView();
+
+    // rowBottom (650) - clientHeight (200) + 8 = 458
+    expect(container.scrollTop).toBe(458);
+  });
+
+  test('scrolls up to reveal an active row above the viewport', () => {
+    const container = makeContainer(500);
+    // Row 40px above the container's content top while scrolled down 500px.
+    const dialog = buildDialog({ container, row: makeRow(60) });
+
+    dialog.scrollActiveUploadIntoView();
+
+    // rowTop = (60 - 100) + 500 = 460 => scrollTop = max(0, 460 - 8) = 452
+    expect(container.scrollTop).toBe(452);
+  });
+
+  test('leaves scrollTop untouched when the active row is already visible', () => {
+    const container = makeContainer(0);
+    const dialog = buildDialog({ container, row: makeRow(150) });
+
+    dialog.scrollActiveUploadIntoView();
+
+    expect(container.scrollTop).toBe(0);
+  });
+
+  test('does nothing while minimized', () => {
+    const container = makeContainer(0);
+    const dialog = buildDialog({ container, row: makeRow(700), isMinimized: true });
+
+    dialog.scrollActiveUploadIntoView();
+
+    expect(container.scrollTop).toBe(0);
+  });
+});
