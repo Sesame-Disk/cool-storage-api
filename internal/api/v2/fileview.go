@@ -502,6 +502,9 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 			return
 		}
 		if !hasAccess {
+			if respondIfLibraryMissing(c, h.db.Session(), orgID, repoID) {
+				return
+			}
 			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have access to this library"})
 			return
 		}

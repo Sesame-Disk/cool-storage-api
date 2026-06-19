@@ -931,7 +931,11 @@ func (h *ShareLinkHandler) BatchCreateShareLinks(c *gin.Context) {
 
 	if h.permMiddleware != nil {
 		hasAccess, err := h.permMiddleware.HasLibraryAccess(orgID, userID, req.RepoID, middleware.PermissionR)
-		if err != nil || !hasAccess {
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
+			return
+		}
+		if !hasAccess {
 			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have access to this library"})
 			return
 		}
