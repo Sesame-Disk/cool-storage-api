@@ -6,7 +6,7 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus } from '../../utils/upload-finalization';
+import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadProgressDialog from './upload-progress-dialog';
@@ -56,10 +56,12 @@ class FileUploader extends React.Component {
     this.bitrateInterval = 500; // Interval in milliseconds to calculate the bitrate
     window.onbeforeunload = this.onbeforeunload;
     this.isUploadLinkLoaded = false;
+    this.adaptiveUploadCleanup = null;
   }
 
   componentDidMount() {
-    const simultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
+    const configuredSimultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
+    const simultaneousUploads = getInitialSimultaneousUploads(configuredSimultaneousUploads);
     this.resumable = new Resumablejs({
       target: '',
       query: this.setQuery || {},
@@ -88,12 +90,16 @@ class FileUploader extends React.Component {
 
     this.bindCallbackHandler();
     this.bindEventHandler();
+    this.adaptiveUploadCleanup = initializeAdaptiveUploadConcurrency(this.resumable, configuredSimultaneousUploads);
   }
 
   componentWillUnmount = () => {
     window.onbeforeunload = null;
     if (this.props.dragAndDrop === true) {
       this.resumable.disableDropOnDocument();
+    }
+    if (typeof this.adaptiveUploadCleanup === 'function') {
+      this.adaptiveUploadCleanup();
     }
   };
 
@@ -243,6 +249,7 @@ class FileUploader extends React.Component {
   onFileProgress = (resumableFile) => {
     const simultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
     let uploadBitrate = this.getBitrate();
+    updateAdaptiveUploadConcurrency(this.resumable, resumableFile, uploadBitrate);
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
         if (uploadBitrate) {
@@ -434,6 +441,7 @@ class FileUploader extends React.Component {
       this.retryUploadWithFreshLink(resumableFile, { resetAutoRetry: false });
       return;
     }
+    noteAdaptiveUploadFailure(this.resumable, resumableFile, message);
 
     let error = '';
     if (!message) {
@@ -502,6 +510,7 @@ class FileUploader extends React.Component {
     this.notifiedFolders = [];
     // reset upload link loaded
     this.isUploadLinkLoaded = false;
+    resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
   };
 
   onPause = () => {
@@ -521,7 +530,7 @@ class FileUploader extends React.Component {
   };
 
   onFileRetry = () => {
-    // todo, cancel upload file, uploded again;
+    noteAdaptiveUploadRetry(this.resumable);
   };
 
   onBeforeCancel = () => {
@@ -587,6 +596,7 @@ class FileUploader extends React.Component {
   onCloseUploadDialog = () => {
     this.loaded = 0;
     this.resumable.files = [];
+    resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
     // reset upload link loaded
     this.isUploadLinkLoaded = false;
@@ -632,6 +642,7 @@ class FileUploader extends React.Component {
       totalProgress: 100,
       uploadFileList: uploadFileList
     });
+    resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
     // reset upload link loaded
     this.isUploadLinkLoaded = false;
@@ -663,15 +674,6 @@ class FileUploader extends React.Component {
   };
 
   retryUploadFile = (resumableFile) => {
-    let { repoID, path } = this.props;
-    let fileName = resumableFile.fileName;
-    let isFile = resumableFile.fileName === resumableFile.relativePath;
-    if (!isFile) {
-      let relative_path = resumableFile.formData.relative_path;
-      let prefix = path === '/' ? (path + relative_path) : (path + '/' + relative_path);
-      fileName = prefix + fileName;
-    }
-
     resumableFile.bootstrap();
     var firedRetry = false;
     resumableFile.resumableObj.on('chunkingComplete', () => {

@@ -1,13 +1,19 @@
 import {
     clearFileUploadRuntimeState,
     consumeSuppressedUploadErrorToast,
+    getInitialSimultaneousUploads,
+    initializeAdaptiveUploadConcurrency,
     markUploadConflictAutoRetry,
+    maybeStartPendingUploadDuringFinalize,
     moveUploadToRetryState,
+    noteAdaptiveUploadRetry,
     parseUploadSuccessEntry,
+    resetAdaptiveUploadConcurrency,
     resetUploadConflictAutoRetry,
     resolveUploadSuccessResult,
     shouldAutoRetryUploadConflict,
     trackUploadResponseStatus,
+    updateAdaptiveUploadConcurrency,
 } from '../upload-finalization';
 
 // Minimal XMLHttpRequest stand-in: records 'readystatechange' listeners and
@@ -30,6 +36,74 @@ class FakeXhr {
         (this._listeners.readystatechange || []).forEach(callback => callback());
     }
 }
+
+const eightMiB = 8 * 1024 * 1024;
+
+const makeChunk = (status) => ({
+    _status: status,
+    loaded: status === 'uploading' ? eightMiB : 0,
+    startByte: 0,
+    endByte: eightMiB,
+    status() {
+        return this._status;
+    },
+    progress() {
+        return this._status === 'uploading' ? 0.5 : 1;
+    },
+});
+
+const createFakeFile = ({ id, pendingChunks = 0, uploadingChunks = 0, size = eightMiB * 6, isFinalizing = false }) => ({
+    uniqueIdentifier: id,
+    size,
+    isFinalizing,
+    isSaved: false,
+    error: null,
+    chunks: [
+        ...Array.from({ length: uploadingChunks }, () => makeChunk('uploading')),
+        ...Array.from({ length: pendingChunks }, () => makeChunk('pending')),
+    ],
+});
+
+const createFakeResumable = ({ configuredUploads = 3, files = [{ id: 'file-1', pendingChunks: 6 }] } = {}) => {
+    const queueFiles = files.map(file => createFakeFile(file));
+    const resumable = {
+        files: queueFiles,
+        opts: {
+            simultaneousUploads: configuredUploads,
+            chunkSize: eightMiB,
+        },
+        getOpt(optionName) {
+            return this.opts[optionName];
+        },
+        uploadNextChunk() {
+            for (const file of this.files) {
+                const nextChunk = file.chunks.find(chunk => chunk._status === 'pending');
+                if (!nextChunk) {
+                    continue;
+                }
+                nextChunk._status = 'uploading';
+                nextChunk.loaded = eightMiB;
+                return true;
+            }
+            return false;
+        },
+    };
+
+    return { resumable, files: queueFiles };
+};
+
+const countUploadingChunks = (resumable) => {
+    return resumable.files.reduce((count, file) => {
+        return count + file.chunks.filter(chunk => chunk._status === 'uploading').length;
+    }, 0);
+};
+
+const completeOneUploadingChunk = (file) => {
+    const chunk = file.chunks.find(candidate => candidate._status === 'uploading');
+    if (chunk) {
+        chunk._status = 'success';
+    }
+};
 
 describe('upload finalization helpers', () => {
     test('auto-retries the finalize conflict only once per file until reset', () => {
@@ -88,6 +162,99 @@ describe('upload finalization helpers', () => {
         expect(nextState.uploadFileList[0].lastUploadResponseStatus).toBeNull();
         expect(nextState.uploadFileList[0].finalizeConflictAutoRetried).toBe(false);
         expect(nextState.uploadFileList[0].suppressNextUploadErrorToast).toBe(false);
+    });
+});
+
+describe('adaptive upload concurrency helpers', () => {
+    test('starts every upload session at one slot even when the configured max is higher', () => {
+        expect(getInitialSimultaneousUploads(3)).toBe(1);
+
+        const { resumable } = createFakeResumable();
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+
+        expect(resumable.uploadNextChunk()).toBe(true);
+        expect(resumable.uploadNextChunk()).toBe(false);
+        expect(countUploadingChunks(resumable)).toBe(1);
+        expect(resumable.opts.simultaneousUploads).toBe(1);
+
+        cleanup();
+    });
+
+    test('ramps up toward the configured ceiling on stable high-throughput uploads', () => {
+        const { resumable, files } = createFakeResumable();
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+        const resumableFile = files[0];
+
+        resumable.uploadNextChunk();
+
+        for (let sample = 0; sample < 3; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, resumableFile, 20 * 1024 * 1024);
+        }
+        expect(resumable.opts.simultaneousUploads).toBe(2);
+        expect(countUploadingChunks(resumable)).toBe(2);
+
+        for (let sample = 0; sample < 5; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, resumableFile, 30 * 1024 * 1024);
+        }
+        expect(resumable.opts.simultaneousUploads).toBe(3);
+        expect(countUploadingChunks(resumable)).toBe(3);
+
+        cleanup();
+    });
+
+    test('drops back to one slot on retry and lets in-flight extras drain without aborting them', () => {
+        const { resumable, files } = createFakeResumable();
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+        const resumableFile = files[0];
+
+        resumable.uploadNextChunk();
+        for (let sample = 0; sample < 3; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, resumableFile, 20 * 1024 * 1024);
+        }
+        expect(countUploadingChunks(resumable)).toBe(2);
+
+        noteAdaptiveUploadRetry(resumable);
+        expect(resumable.opts.simultaneousUploads).toBe(1);
+
+        completeOneUploadingChunk(resumableFile);
+        expect(resumable.uploadNextChunk()).toBe(false);
+        expect(countUploadingChunks(resumable)).toBe(1);
+
+        cleanup();
+    });
+
+    test('network changes reset the adaptive target back to one slot', () => {
+        const { resumable, files } = createFakeResumable();
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+        const resumableFile = files[0];
+
+        resumable.uploadNextChunk();
+        for (let sample = 0; sample < 3; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, resumableFile, 20 * 1024 * 1024);
+        }
+        expect(resumable.opts.simultaneousUploads).toBe(2);
+
+        window.dispatchEvent(new Event('offline'));
+        expect(resumable.opts.simultaneousUploads).toBe(1);
+
+        cleanup();
+    });
+
+    test('finalizing files can still grant one temporary extra slot above the adaptive target', () => {
+        const { resumable } = createFakeResumable({
+            files: [
+                { id: 'saving-file', uploadingChunks: 1, pendingChunks: 0, isFinalizing: true, size: eightMiB * 6 },
+                { id: 'queued-file', pendingChunks: 2, uploadingChunks: 0, size: eightMiB * 6 },
+            ],
+        });
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+
+        expect(countUploadingChunks(resumable)).toBe(1);
+        expect(maybeStartPendingUploadDuringFinalize(resumable)).toBe(true);
+        expect(countUploadingChunks(resumable)).toBe(2);
+
+        resetAdaptiveUploadConcurrency(resumable, 3);
+        cleanup();
     });
 });
 
