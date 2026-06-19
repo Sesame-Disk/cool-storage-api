@@ -237,14 +237,23 @@ const getAdaptiveUploadState = (resumable) => {
     return resumable ? resumable._sesamefsAdaptiveUpload || null : null;
 };
 
+// Hot path: called from updateAdaptiveUploadConcurrency on every fileProgress
+// event, so iterate with plain loops to avoid per-call intermediate arrays.
 const countUploadingChunks = (resumable) => {
     if (!resumable || !Array.isArray(resumable.files)) {
         return 0;
     }
 
-    return resumable.files.reduce((count, file) => {
-        return count + getFileChunks(file).filter(chunk => getChunkStatus(chunk) === 'uploading').length;
-    }, 0);
+    let count = 0;
+    for (const file of resumable.files) {
+        const chunks = getFileChunks(file);
+        for (const chunk of chunks) {
+            if (getChunkStatus(chunk) === 'uploading') {
+                count++;
+            }
+        }
+    }
+    return count;
 };
 
 const hasPendingChunks = (resumable) => {
@@ -252,7 +261,15 @@ const hasPendingChunks = (resumable) => {
         return false;
     }
 
-    return resumable.files.some(file => getFileChunks(file).some(chunk => getChunkStatus(chunk) === 'pending'));
+    for (const file of resumable.files) {
+        const chunks = getFileChunks(file);
+        for (const chunk of chunks) {
+            if (getChunkStatus(chunk) === 'pending') {
+                return true;
+            }
+        }
+    }
+    return false;
 };
 
 const chunkSizeBitsForResumable = (resumable) => {
@@ -373,7 +390,7 @@ const degradeAdaptiveUploadConcurrency = (resumable, reason, options = {}) => {
         return false;
     }
 
-    const now = options.now || Date.now();
+    const now = options.now ?? Date.now();
     state.stableSamples = 0;
     state.smoothedBitrate = 0;
     state.lastBitrate = 0;
@@ -467,6 +484,7 @@ export const initializeAdaptiveUploadConcurrency = (resumable, configuredUploads
         if (resumable._sesamefsOriginalUploadNextChunk) {
             resumable.uploadNextChunk = resumable._sesamefsOriginalUploadNextChunk;
         }
+        delete resumable._sesamefsOriginalUploadNextChunk;
         delete resumable._sesamefsAdaptiveCleanup;
         delete resumable._sesamefsAdaptiveUpload;
     };
