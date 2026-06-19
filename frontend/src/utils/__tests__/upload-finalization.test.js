@@ -340,31 +340,136 @@ describe('adaptive upload concurrency helpers', () => {
         resetAdaptiveUploadConcurrency(resumable, 3);
         cleanup();
     });
+    test('a finalizing file keeps one replacement slot open across later chunk completions', () => {
+        const { resumable, files } = createFakeResumable({
+            files: [
+                { id: 'saving-file', uploadingChunks: 1, pendingChunks: 0, isFinalizing: true, size: eightMiB * 6 },
+                { id: 'queued-file', pendingChunks: 2, uploadingChunks: 0, size: eightMiB * 6 },
+            ],
+        });
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+        const queuedFile = files[1];
+
+        expect(maybeStartPendingUploadDuringFinalize(resumable)).toBe(true);
+        expect(countUploadingChunks(resumable)).toBe(2);
+
+        completeOneUploadingChunk(queuedFile);
+        expect(countUploadingChunks(resumable)).toBe(1);
+
+        expect(resumable.uploadNextChunk()).toBe(true);
+        expect(countUploadingChunks(resumable)).toBe(2);
+
+        cleanup();
+    });
+
+    test('files awaiting server finalize can free a replacement slot even before the UI flag is set', () => {
+        const { resumable } = createFakeResumable({
+            files: [
+                { id: 'saving-file', uploadingChunks: 1, pendingChunks: 0, isFinalizing: false, size: eightMiB * 6 },
+                { id: 'queued-file', pendingChunks: 1, uploadingChunks: 0, size: eightMiB * 6 },
+            ],
+        });
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+
+        expect(countUploadingChunks(resumable)).toBe(1);
+        expect(maybeStartPendingUploadDuringFinalize(resumable)).toBe(true);
+        expect(countUploadingChunks(resumable)).toBe(2);
+
+        cleanup();
+    });
 
     test('finalizing files do not open an extra slot once the configured ceiling is already full', () => {
         const { resumable, files } = createFakeResumable({
             configuredUploads: 3,
             files: [
-                { id: 'saving-file', uploadingChunks: 1, pendingChunks: 5, isFinalizing: true, size: eightMiB * 6 },
-                { id: 'queued-file', pendingChunks: 5, uploadingChunks: 0, size: eightMiB * 6 },
+                { id: 'active-file', pendingChunks: 6, size: eightMiB * 6 },
+                { id: 'queued-file', pendingChunks: 6, size: eightMiB * 6 },
             ],
         });
         const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
-        const resumableFile = files[0];
+        const activeFile = files[0];
+        const finalizingFile = files[1];
 
         resumable.uploadNextChunk();
 
         for (let sample = 0; sample < 3; sample++) {
-            updateAdaptiveUploadConcurrency(resumable, resumableFile, 20 * 1024 * 1024);
+            updateAdaptiveUploadConcurrency(resumable, activeFile, 20 * 1024 * 1024);
         }
         for (let sample = 0; sample < 5; sample++) {
-            updateAdaptiveUploadConcurrency(resumable, resumableFile, 30 * 1024 * 1024);
+            updateAdaptiveUploadConcurrency(resumable, activeFile, 30 * 1024 * 1024);
         }
 
         expect(resumable.opts.simultaneousUploads).toBe(3);
         expect(countUploadingChunks(resumable)).toBe(3);
+
+        finalizingFile.isFinalizing = true;
+
         expect(maybeStartPendingUploadDuringFinalize(resumable)).toBe(false);
         expect(countUploadingChunks(resumable)).toBe(3);
+
+        cleanup();
+    });
+    test('server-side finalize waits do not degrade adaptive concurrency on bitrate drops', () => {
+        const { resumable, files } = createFakeResumable({
+            configuredUploads: 3,
+            files: [
+                { id: 'active-file', pendingChunks: 6, size: eightMiB * 6 },
+                { id: 'queued-file', pendingChunks: 6, size: eightMiB * 6 },
+            ],
+        });
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+        const activeFile = files[0];
+        const finalizingFile = files[1];
+
+        resumable.uploadNextChunk();
+        for (let sample = 0; sample < 3; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, activeFile, 20 * 1024 * 1024);
+        }
+        for (let sample = 0; sample < 5; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, activeFile, 30 * 1024 * 1024);
+        }
+
+        const state = resumable._sesamefsAdaptiveUpload;
+        expect(state.effective).toBe(3);
+        expect(state.cooldownUntil).toBe(0);
+
+        finalizingFile.isFinalizing = false;
+        finalizingFile.chunks = [makeChunk('uploading')];
+
+        expect(updateAdaptiveUploadConcurrency(resumable, activeFile, 5 * 1024 * 1024)).toBe(false);
+        expect(state.effective).toBe(3);
+        expect(state.cooldownUntil).toBe(0);
+
+        cleanup();
+    });
+
+    test('server backpressure still lowers adaptive concurrency even while a file is awaiting finalize', () => {
+        const { resumable, files } = createFakeResumable({
+            configuredUploads: 3,
+            files: [
+                { id: 'active-file', pendingChunks: 6, size: eightMiB * 6 },
+                { id: 'queued-file', pendingChunks: 6, size: eightMiB * 6 },
+            ],
+        });
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+        const activeFile = files[0];
+        const finalizingFile = files[1];
+
+        resumable.uploadNextChunk();
+        for (let sample = 0; sample < 3; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, activeFile, 20 * 1024 * 1024);
+        }
+        for (let sample = 0; sample < 5; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, activeFile, 30 * 1024 * 1024);
+        }
+
+        const state = resumable._sesamefsAdaptiveUpload;
+        finalizingFile.isFinalizing = false;
+        finalizingFile.chunks = [makeChunk('uploading')];
+
+        expect(noteAdaptiveUploadFailure(resumable, { lastUploadResponseStatus: 429 }, 'rate limited')).toBe(true);
+        expect(state.effective).toBe(1);
+        expect(state.cooldownUntil).toBeGreaterThan(0);
 
         cleanup();
     });
