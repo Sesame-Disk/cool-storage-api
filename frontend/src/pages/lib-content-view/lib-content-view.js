@@ -187,18 +187,21 @@ class LibContentView extends React.Component {
         } else if (error.response.status === 404) {
           this.setState({
             isDirentListLoading: false,
-            errorMsg: gettext('Library does not exist.')
+            errorMsg: gettext('Library does not exist.'),
+            canLeaveShare: false
           });
         } else {
           this.setState({
             isDirentListLoading: false,
-            errorMsg: gettext('Error')
+            errorMsg: gettext('Error'),
+            canLeaveShare: false
           });
         }
       } else {
         this.setState({
           isDirentListLoading: false,
-          errorMsg: gettext('Please check the network.')
+          errorMsg: gettext('Please check the network.'),
+          canLeaveShare: false
         });
       }
     }
