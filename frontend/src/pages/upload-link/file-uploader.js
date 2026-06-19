@@ -55,11 +55,14 @@ class FileUploader extends React.Component {
     this.bitrateInterval = 500; // Interval in milliseconds to calculate the bitrate
     this.isUploadLinkLoaded = false;
     this.adaptiveUploadCleanup = null;
+    this.allowNavigationWithoutPrompt = false;
+    this.navigationPromptResetTimer = null;
 
     window.onbeforeunload = this.onbeforeunload;
   }
 
   componentDidMount() {
+    document.addEventListener('click', this.onDocumentNavigationAttempt, true);
     const configuredSimultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
     const simultaneousUploads = getInitialSimultaneousUploads(configuredSimultaneousUploads);
     this.resumable = new Resumablejs({
@@ -93,6 +96,9 @@ class FileUploader extends React.Component {
 
   componentWillUnmount = () => {
     window.onbeforeunload = null;
+    document.removeEventListener('click', this.onDocumentNavigationAttempt, true);
+    window.clearTimeout(this.navigationPromptResetTimer);
+    this.allowNavigationWithoutPrompt = false;
     if (this.props.dragAndDrop === true) {
       this.resumable.disableDropOnDocument();
     }
@@ -101,10 +107,78 @@ class FileUploader extends React.Component {
     }
   };
 
+  hasActiveUploadWork = () => {
+    return this.state.isUploadProgressDialogShow
+      && this.state.uploadFileList.some(file => file && !file.isSaved && !file.error);
+  };
+
+  shouldPromptForNavigation = () => {
+    return this.hasActiveUploadWork() && !this.allowNavigationWithoutPrompt;
+  };
+
+  confirmNavigationIfUploading = () => {
+    if (!this.shouldPromptForNavigation()) {
+      return true;
+    }
+
+    const confirmed = window.confirm(gettext('A file is being uploaded. Are you sure you want to leave this page?'));
+    if (!confirmed) {
+      return false;
+    }
+
+    this.allowNavigationWithoutPrompt = true;
+    window.clearTimeout(this.navigationPromptResetTimer);
+    this.navigationPromptResetTimer = window.setTimeout(() => {
+      this.allowNavigationWithoutPrompt = false;
+      this.navigationPromptResetTimer = null;
+    }, 1000);
+    return true;
+  };
+
+  onDocumentNavigationAttempt = (event) => {
+    if (!this.shouldPromptForNavigation() || event.defaultPrevented) {
+      return;
+    }
+
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return;
+    }
+
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+
+    const anchor = target.closest('a[href]');
+    if (!anchor) {
+      return;
+    }
+
+    const href = anchor.getAttribute('href');
+    if (!href || href === '#' || /^\s*javascript:/i.test(href)) {
+      return;
+    }
+
+    if (anchor.hasAttribute('download') || anchor.target === '_blank') {
+      return;
+    }
+
+    const destination = new URL(anchor.href, window.location.href);
+    const current = new URL(window.location.href);
+    if (destination.origin === current.origin
+      && destination.pathname === current.pathname
+      && destination.search === current.search) {
+      return;
+    }
+
+    if (!this.confirmNavigationIfUploading()) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  };
+
   onbeforeunload = () => {
-    if (window.uploader &&
-      window.uploader.isUploadProgressDialogShow &&
-      window.uploader.totalProgress !== 100) {
+    if (this.shouldPromptForNavigation()) {
       return '';
     }
   };
@@ -133,6 +207,7 @@ class FileUploader extends React.Component {
   bindEventHandler = () => {
     this.resumable.on('chunkingComplete', this.onChunkingComplete.bind(this));
     this.resumable.on('fileAdded', this.onFileAdded.bind(this));
+    this.resumable.on('filesAddedComplete', this.filesAddedComplete.bind(this));
     this.resumable.on('fileProgress', this.onFileProgress.bind(this));
     this.resumable.on('fileSuccess', this.onFileUploadSuccess.bind(this));
     this.resumable.on('fileError', this.onFileError.bind(this));
@@ -234,7 +309,6 @@ class FileUploader extends React.Component {
       uploadFileList: uploadFileList,
       isUploadProgressDialogShow: true,
     });
-    Utils.registerGlobalVariable('uploader', 'isUploadProgressDialogShow', true);
   };
 
   onFileProgress = (resumableFile) => {
@@ -325,7 +399,6 @@ class FileUploader extends React.Component {
   onProgress = () => {
     let progress = Math.round(this.resumable.progress() * 100);
     this.setState({ totalProgress: progress });
-    Utils.registerGlobalVariable('uploader', 'totalProgress', progress);
   };
 
   markUploadSaved = (resumableFile, newFileName) => {
@@ -529,7 +602,6 @@ class FileUploader extends React.Component {
       this.isUploadLinkLoaded = false;
     }
     // After the error, the user can switch windows
-    Utils.registerGlobalVariable('uploader', 'totalProgress', 100);
   };
 
   setHeaders = (resumableFile, resumable) => {
@@ -591,7 +663,6 @@ class FileUploader extends React.Component {
     // reset upload link loaded
     this.isUploadLinkLoaded = false;
     this.setState({ isUploadProgressDialogShow: false, uploadFileList: [], forbidUploadFileList: [] });
-    Utils.registerGlobalVariable('uploader', 'isUploadProgressDialogShow', false);
   };
 
   onUploadCancel = (uploadingItem) => {
@@ -640,6 +711,22 @@ class FileUploader extends React.Component {
 
   onUploadRetry = (resumableFile) => {
     this.retryUploadWithFreshLink(resumableFile);
+  };
+
+  onUploadRetryAll = () => {
+    this.state.retryFileList.forEach(item => {
+      clearFileUploadRuntimeState(item, { resetRemainingTime: true });
+      resetUploadConflictAutoRetry(item);
+      item.error = false;
+      this.retryUploadFile(item);
+    });
+
+    let uploadFileList = this.state.uploadFileList.slice(0);
+    this.setState({
+      retryFileList: [],
+      uploadFileList: uploadFileList
+    });
+    this.restoreConcurrencyIfIdle();
   };
 
   onFileRetry = () => {
@@ -693,20 +780,33 @@ class FileUploader extends React.Component {
             <input className="upload-input" type="file" ref={this.uploadInput} onClick={this.onClick} aria-label={gettext('Upload')} />
           </div>
         </div>
-        <UploadProgressDialog
-          retryFileList={this.state.retryFileList}
-          uploadFileList={this.state.uploadFileList}
-          forbidUploadFileList={this.state.forbidUploadFileList}
-          totalProgress={this.state.totalProgress}
-          uploadBitrate={this.state.uploadBitrate}
-          onCloseUploadDialog={this.onCloseUploadDialog}
-          onCancelAllUploading={this.onCancelAllUploading}
-          onUploadCancel={this.onUploadCancel}
-          onUploadRetry={this.onUploadRetry}
-          onFileUpload={this.onFileUpload}
-          onFolderUpload={this.onFolderUpload}
-          isUploading={this.resumable ? this.resumable.isUploading() : false}
-        />
+        <div className="upload-link-actions text-center">
+          <button type="button" className="btn btn-primary" onClick={this.onFileUpload}>{gettext('Upload Files')}</button>
+          <button type="button" className="btn btn-primary" onClick={this.onFolderUpload}>{gettext('Upload Folder')}</button>
+          <button
+            type="button"
+            className="btn btn-outline-primary"
+            onClick={this.onCancelAllUploading}
+            disabled={!this.resumable || !this.resumable.isUploading()}
+          >
+            {gettext('Cancel All')}
+          </button>
+        </div>
+        {this.state.isUploadProgressDialogShow &&
+          <UploadProgressDialog
+            retryFileList={this.state.retryFileList}
+            uploadFileList={this.state.uploadFileList}
+            forbidUploadFileList={this.state.forbidUploadFileList}
+            totalProgress={this.state.totalProgress}
+            uploadBitrate={this.state.uploadBitrate}
+            onCloseUploadDialog={this.onCloseUploadDialog}
+            onCancelAllUploading={this.onCancelAllUploading}
+            onUploadCancel={this.onUploadCancel}
+            onUploadRetry={this.onUploadRetry}
+            onUploadRetryAll={this.onUploadRetryAll}
+            isUploading={this.resumable ? this.resumable.isUploading() : false}
+          />
+        }
       </Fragment>
     );
   }

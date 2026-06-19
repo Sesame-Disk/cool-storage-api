@@ -39,3 +39,15 @@ body {
 .mh-2 {
   min-height: 2rem;
 }
+
+.upload-link-actions {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.upload-link-actions .btn {
+  min-width: 9rem;
+}
+

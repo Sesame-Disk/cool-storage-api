@@ -2,8 +2,30 @@ import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { gettext } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
+import { isFileSaving } from '../../utils/upload-finalization';
 import UploadListItem from './upload-list-item';
 import ForbidUploadListItem from './forbid-upload-list-item';
+
+// The "active upload" the highlight and auto-scroll follow must be the file
+// actually transferring bytes, not merely the first not-yet-saved file. A file
+// in "Saving..." (server-side finalize) keeps isUploading() true while its last
+// chunk awaits the server, so it has to be excluded or the scroll would stay
+// pinned to it while a later file uploads visibly.
+const isTransferringBytes = (file) => {
+  return Boolean(file)
+    && !file.isSaved
+    && !file.error
+    && typeof file.isUploading === 'function'
+    && file.isUploading()
+    && !isFileSaving(file);
+};
+
+export const findActiveUploadFile = (uploadFileList) => {
+  const list = uploadFileList || [];
+  return list.find(isTransferringBytes)
+    || list.find(file => file && !file.isSaved && !file.error)
+    || null;
+};
 
 const propTypes = {
   uploadBitrate: PropTypes.number.isRequired,
@@ -26,8 +48,34 @@ class UploadProgressDialog extends React.Component {
     this.state = {
       isMinimized: false
     };
+    this.contentRef = React.createRef();
+    this.activeUploadRowRef = React.createRef();
+    this.lastActiveUploadId = this.getActiveUploadId(props.uploadFileList);
   }
 
+  componentDidMount() {
+    this.scrollActiveUploadIntoView();
+  }
+
+  componentDidUpdate(_prevProps, prevState) {
+    // FileUploader mutates the file objects in-place before building the next
+    // array, so prevProps.uploadFileList is not a reliable snapshot: by the time
+    // we reach componentDidUpdate it can already reflect the NEW active file.
+    // Track the previously highlighted id on the instance instead so advancing
+    // from file N to file N+1 still triggers the scroll.
+    const currentActiveUploadId = this.getActiveUploadId(this.props.uploadFileList);
+    const activeIdChanged = this.lastActiveUploadId !== currentActiveUploadId;
+    const restoredFromMinimized = prevState.isMinimized && !this.state.isMinimized;
+    if (activeIdChanged || restoredFromMinimized) {
+      this.scrollActiveUploadIntoView();
+    }
+    this.lastActiveUploadId = currentActiveUploadId;
+  }
+
+  getActiveUploadId = (uploadFileList) => {
+    const activeFile = findActiveUploadFile(uploadFileList);
+    return activeFile ? activeFile.uniqueIdentifier : null;
+  };
   onCancelAllUploading = () => {
     this.props.onCancelAllUploading();
   };
@@ -42,8 +90,40 @@ class UploadProgressDialog extends React.Component {
     this.props.onCloseUploadDialog();
   };
 
+  scrollActiveUploadIntoView = () => {
+    if (this.state.isMinimized) {
+      return;
+    }
+
+    const container = this.contentRef.current;
+    const row = this.activeUploadRowRef.current;
+    if (!container || !row) {
+      return;
+    }
+
+    // Measure with getBoundingClientRect instead of offsetTop: the active row is
+    // a <tr> whose offsetParent is the <table>, not this scroll container, so
+    // row.offsetTop - container.offsetTop mixes coordinate frames and collapses
+    // to a negative value (forcing scrollTop to 0 and pinning the list at the
+    // top). Rects are viewport-relative, so the difference plus the current
+    // scrollTop gives the row's true position within the scrolled content.
+    const containerRect = container.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    const rowTop = (rowRect.top - containerRect.top) + container.scrollTop;
+    const rowBottom = rowTop + rowRect.height;
+    const visibleTop = container.scrollTop;
+    const visibleBottom = visibleTop + container.clientHeight;
+
+    if (rowTop < visibleTop) {
+      container.scrollTop = Math.max(0, rowTop - 8);
+    } else if (rowBottom > visibleBottom) {
+      container.scrollTop = rowBottom - container.clientHeight + 8;
+    }
+  };
+
   render() {
     const { totalProgress, retryFileList, uploadBitrate, uploadFileList, forbidUploadFileList, isUploading } = this.props;
+    const activeUploadFile = findActiveUploadFile(uploadFileList);
 
     const filesUploadedMsg = gettext('{uploaded_files_num}/{all_files_num} Files')
       .replace('{uploaded_files_num}', uploadFileList.filter(file => file.isSaved).length)
@@ -84,7 +164,7 @@ class UploadProgressDialog extends React.Component {
             {!isUploading && <span className="sf2-icon-x1 upload-dialog-op" onClick={this.onCloseUpload}></span>}
           </div>
         </div>
-        <div className="uploader-list-content">
+        <div className="uploader-list-content" ref={this.contentRef}>
           <div className="d-flex justify-content-between align-items-center border-bottom">
             {uploadFileList.length > 0 && <span>{filesUploadedMsg}</span>}
             <div className="ml-auto">
@@ -121,12 +201,15 @@ class UploadProgressDialog extends React.Component {
               }
               {
                 this.props.uploadFileList.map((resumableFile, index) => {
+                  const isCurrentUpload = activeUploadFile && activeUploadFile.uniqueIdentifier === resumableFile.uniqueIdentifier;
                   return (
                     <UploadListItem
                       key={index}
                       resumableFile={resumableFile}
                       onUploadCancel={this.props.onUploadCancel}
                       onUploadRetry={this.props.onUploadRetry}
+                      isCurrentUpload={isCurrentUpload}
+                      rowRef={isCurrentUpload ? this.activeUploadRowRef : null}
                     />
                   );
                 })
