@@ -1,8 +1,8 @@
-import React, { Fragment } from 'react';
+import React from 'react';
 import PropTypes from 'prop-types';
 import { gettext } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
-import { findActiveUploadFile } from '../../utils/upload-active-file';
+import { findActiveUploadFile, getActiveUploadId } from '../../utils/upload-active-file';
 import { scrollRowIntoView } from '../../utils/upload-scroll';
 import UploadListItem from './upload-list-item';
 import ForbidUploadListItem from './forbid-upload-list-item';
@@ -30,7 +30,7 @@ class UploadProgressDialog extends React.Component {
     };
     this.contentRef = React.createRef();
     this.activeUploadRowRef = React.createRef();
-    this.lastActiveUploadId = this.getActiveUploadId(props.uploadFileList);
+    this.lastActiveUploadId = getActiveUploadId(props.uploadFileList);
   }
 
   componentDidMount() {
@@ -43,7 +43,7 @@ class UploadProgressDialog extends React.Component {
     // we reach componentDidUpdate it can already reflect the NEW active file.
     // Track the previously highlighted id on the instance instead so advancing
     // from file N to file N+1 still triggers the scroll.
-    const currentActiveUploadId = this.getActiveUploadId(this.props.uploadFileList);
+    const currentActiveUploadId = getActiveUploadId(this.props.uploadFileList);
     const activeIdChanged = this.lastActiveUploadId !== currentActiveUploadId;
     const restoredFromMinimized = prevState.isMinimized && !this.state.isMinimized;
     if (activeIdChanged || restoredFromMinimized) {
@@ -52,10 +52,6 @@ class UploadProgressDialog extends React.Component {
     this.lastActiveUploadId = currentActiveUploadId;
   }
 
-  getActiveUploadId = (uploadFileList) => {
-    const activeFile = findActiveUploadFile(uploadFileList);
-    return activeFile ? activeFile.uniqueIdentifier : null;
-  };
   onCancelAllUploading = () => {
     this.props.onCancelAllUploading();
   };
@@ -157,11 +153,11 @@ class UploadProgressDialog extends React.Component {
                 })
               }
               {
-                this.props.uploadFileList.map((resumableFile, index) => {
+                this.props.uploadFileList.map((resumableFile) => {
                   const isCurrentUpload = activeUploadFile && activeUploadFile.uniqueIdentifier === resumableFile.uniqueIdentifier;
                   return (
                     <UploadListItem
-                      key={index}
+                      key={resumableFile.uniqueIdentifier}
                       resumableFile={resumableFile}
                       onUploadCancel={this.props.onUploadCancel}
                       onUploadRetry={this.props.onUploadRetry}
