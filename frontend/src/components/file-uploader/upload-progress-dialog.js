@@ -26,8 +26,19 @@ class UploadProgressDialog extends React.Component {
     this.state = {
       isMinimized: false
     };
+    this.contentRef = React.createRef();
+    this.activeUploadRowRef = React.createRef();
   }
 
+  componentDidMount() {
+    this.scrollActiveUploadIntoView();
+  }
+
+  componentDidUpdate(prevProps, prevState) {
+    if (prevProps.uploadFileList !== this.props.uploadFileList || prevState.isMinimized !== this.state.isMinimized) {
+      this.scrollActiveUploadIntoView();
+    }
+  }
   onCancelAllUploading = () => {
     this.props.onCancelAllUploading();
   };
@@ -42,8 +53,30 @@ class UploadProgressDialog extends React.Component {
     this.props.onCloseUploadDialog();
   };
 
+  scrollActiveUploadIntoView = () => {
+    if (this.state.isMinimized) {
+      return;
+    }
+
+    const container = this.contentRef.current;
+    const row = this.activeUploadRowRef.current;
+    if (!container || !row) {
+      return;
+    }
+
+    const rowTop = row.offsetTop - container.offsetTop;
+    const rowBottom = rowTop + row.offsetHeight;
+    const visibleTop = container.scrollTop;
+    const visibleBottom = visibleTop + container.clientHeight;
+
+    if (rowTop < visibleTop || rowBottom > visibleBottom) {
+      container.scrollTop = Math.max(0, rowTop - 8);
+    }
+  };
+
   render() {
     const { totalProgress, retryFileList, uploadBitrate, uploadFileList, forbidUploadFileList, isUploading } = this.props;
+    const activeUploadFile = uploadFileList.find(file => file && !file.isSaved && !file.error) || null;
 
     const filesUploadedMsg = gettext('{uploaded_files_num}/{all_files_num} Files')
       .replace('{uploaded_files_num}', uploadFileList.filter(file => file.isSaved).length)
@@ -84,7 +117,7 @@ class UploadProgressDialog extends React.Component {
             {!isUploading && <span className="sf2-icon-x1 upload-dialog-op" onClick={this.onCloseUpload}></span>}
           </div>
         </div>
-        <div className="uploader-list-content">
+        <div className="uploader-list-content" ref={this.contentRef}>
           <div className="d-flex justify-content-between align-items-center border-bottom">
             {uploadFileList.length > 0 && <span>{filesUploadedMsg}</span>}
             <div className="ml-auto">
@@ -121,12 +154,15 @@ class UploadProgressDialog extends React.Component {
               }
               {
                 this.props.uploadFileList.map((resumableFile, index) => {
+                  const isCurrentUpload = activeUploadFile && activeUploadFile.uniqueIdentifier === resumableFile.uniqueIdentifier;
                   return (
                     <UploadListItem
                       key={index}
                       resumableFile={resumableFile}
                       onUploadCancel={this.props.onUploadCancel}
                       onUploadRetry={this.props.onUploadRetry}
+                      isCurrentUpload={isCurrentUpload}
+                      rowRef={isCurrentUpload ? this.activeUploadRowRef : null}
                     />
                   );
                 })
@@ -142,3 +178,4 @@ class UploadProgressDialog extends React.Component {
 UploadProgressDialog.propTypes = propTypes;
 
 export default UploadProgressDialog;
+

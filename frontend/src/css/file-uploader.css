@@ -57,6 +57,12 @@
   padding: 0 1rem 1.25rem;
   background-color: #fff;
   overflow: auto;
+  min-height: 0;
+}
+
+.uploader-list-content .table-thead-hidden {
+  width: 100%;
+  table-layout: fixed;
 }
 
 .file-upload-item {
@@ -126,4 +132,21 @@
 
 .file-upload-item .upload-failure-msg {
   color: #ec4c47;
+}
+
+.file-upload-item .upload-name {
+  width: 40%;
+  max-width: 0;
+}
+
+.file-upload-item .upload-name .ellipsis {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-upload-item.current-upload-item {
+  scroll-margin-top: 0.5rem;
 }

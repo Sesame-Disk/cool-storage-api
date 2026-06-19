@@ -23,6 +23,11 @@ jest.mock('../../toast', () => ({
 
 const flushPromises = () => new Promise(resolve => setTimeout(resolve, 0));
 
+beforeEach(() => {
+  jest.clearAllMocks();
+  window.confirm = jest.fn(() => true);
+});
+
 const defaultProps = {
   repoID: 'repo-1',
   direntList: [],
@@ -67,10 +72,6 @@ const createUploader = (props = {}) => {
 };
 
 describe('FileUploader upload link reuse regression', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
-
   test('fetches the session upload link only once when files are added later', async () => {
     seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/token-a' });
 
@@ -150,5 +151,72 @@ describe('FileUploader upload link reuse regression', () => {
     expect(resumableFile.formData.replace).toBe(1);
     expect(resumableFile.formData.target_file).toBe('/existing.txt');
     expect(uploader.resumable.upload).toHaveBeenCalled();
+  });
+});
+
+
+describe('FileUploader navigation guard', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.runOnlyPendingTimers();
+    jest.useRealTimers();
+  });
+
+  test('blocks link navigation while an upload is still active and the user cancels', () => {
+    const uploader = createUploader();
+    const activeFile = createResumableFile('big.iso', { isSaved: false, error: null });
+    uploader.state.isUploadProgressDialogShow = true;
+    uploader.state.uploadFileList = [activeFile];
+    window.confirm.mockReturnValue(false);
+
+    const anchor = document.createElement('a');
+    anchor.href = '/libraries/next/';
+    const target = document.createElement('span');
+    anchor.appendChild(target);
+
+    const event = {
+      target,
+      defaultPrevented: false,
+      button: 0,
+      metaKey: false,
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      preventDefault: jest.fn(),
+      stopPropagation: jest.fn(),
+    };
+
+    uploader.onDocumentNavigationAttempt(event);
+
+    expect(window.confirm).toHaveBeenCalled();
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(event.stopPropagation).toHaveBeenCalled();
+  });
+
+  test('allows one confirmed navigation attempt without a second beforeunload prompt', () => {
+    const uploader = createUploader();
+    const activeFile = createResumableFile('big.iso', { isSaved: false, error: null });
+    uploader.state.isUploadProgressDialogShow = true;
+    uploader.state.uploadFileList = [activeFile];
+
+    expect(uploader.confirmNavigationIfUploading()).toBe(true);
+    expect(uploader.onbeforeunload()).toBeUndefined();
+
+    jest.advanceTimersByTime(1000);
+
+    expect(uploader.onbeforeunload()).toBe('');
+  });
+
+  test('does not prompt when only failed uploads remain', () => {
+    const uploader = createUploader();
+    uploader.state.isUploadProgressDialogShow = true;
+    uploader.state.uploadFileList = [createResumableFile('failed.iso', { isSaved: false, error: 'boom' })];
+
+    expect(uploader.onbeforeunload()).toBeUndefined();
+    expect(uploader.confirmNavigationIfUploading()).toBe(true);
+    expect(window.confirm).not.toHaveBeenCalled();
   });
 });
