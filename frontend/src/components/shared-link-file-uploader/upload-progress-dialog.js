@@ -2,30 +2,10 @@ import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { gettext } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
-import { isFileSaving } from '../../utils/upload-finalization';
+import { findActiveUploadFile } from '../../utils/upload-active-file';
+import { scrollRowIntoView } from '../../utils/upload-scroll';
 import UploadListItem from './upload-list-item';
 import ForbidUploadListItem from './forbid-upload-list-item';
-
-// The "active upload" the highlight and auto-scroll follow must be the file
-// actually transferring bytes, not merely the first not-yet-saved file. A file
-// in "Saving..." (server-side finalize) keeps isUploading() true while its last
-// chunk awaits the server, so it has to be excluded or the scroll would stay
-// pinned to it while a later file uploads visibly.
-const isTransferringBytes = (file) => {
-  return Boolean(file)
-    && !file.isSaved
-    && !file.error
-    && typeof file.isUploading === 'function'
-    && file.isUploading()
-    && !isFileSaving(file);
-};
-
-export const findActiveUploadFile = (uploadFileList) => {
-  const list = uploadFileList || [];
-  return list.find(isTransferringBytes)
-    || list.find(file => file && !file.isSaved && !file.error)
-    || null;
-};
 
 const propTypes = {
   uploadBitrate: PropTypes.number.isRequired,
@@ -95,30 +75,7 @@ class UploadProgressDialog extends React.Component {
       return;
     }
 
-    const container = this.contentRef.current;
-    const row = this.activeUploadRowRef.current;
-    if (!container || !row) {
-      return;
-    }
-
-    // Measure with getBoundingClientRect instead of offsetTop: the active row is
-    // a <tr> whose offsetParent is the <table>, not this scroll container, so
-    // row.offsetTop - container.offsetTop mixes coordinate frames and collapses
-    // to a negative value (forcing scrollTop to 0 and pinning the list at the
-    // top). Rects are viewport-relative, so the difference plus the current
-    // scrollTop gives the row's true position within the scrolled content.
-    const containerRect = container.getBoundingClientRect();
-    const rowRect = row.getBoundingClientRect();
-    const rowTop = (rowRect.top - containerRect.top) + container.scrollTop;
-    const rowBottom = rowTop + rowRect.height;
-    const visibleTop = container.scrollTop;
-    const visibleBottom = visibleTop + container.clientHeight;
-
-    if (rowTop < visibleTop) {
-      container.scrollTop = Math.max(0, rowTop - 8);
-    } else if (rowBottom > visibleBottom) {
-      container.scrollTop = rowBottom - container.clientHeight + 8;
-    }
+    scrollRowIntoView(this.contentRef.current, this.activeUploadRowRef.current);
   };
 
   render() {

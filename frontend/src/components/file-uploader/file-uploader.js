@@ -7,6 +7,7 @@ import { seafileAPI } from '../../utils/seafile-api';
 import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
+import UploadNavigationGuard from '../../utils/upload-navigation-guard';
 import UploadProgressDialog from './upload-progress-dialog';
 import UploadRemindDialog from '../dialog/upload-remind-dialog';
 import toaster from '../toast';
@@ -59,12 +60,11 @@ class FileUploader extends React.Component {
     window.onbeforeunload = this.onbeforeunload;
     this.isUploadLinkLoaded = false;
     this.adaptiveUploadCleanup = null;
-    this.allowNavigationWithoutPrompt = false;
-    this.navigationPromptResetTimer = null;
+    this.navigationGuard = new UploadNavigationGuard(this.hasActiveUploadWork);
   }
 
   componentDidMount() {
-    document.addEventListener('click', this.onDocumentNavigationAttempt, true);
+    this.navigationGuard.attach();
     const configuredSimultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
     const simultaneousUploads = getInitialSimultaneousUploads(configuredSimultaneousUploads);
     this.resumable = new Resumablejs({
@@ -100,9 +100,7 @@ class FileUploader extends React.Component {
 
   componentWillUnmount = () => {
     window.onbeforeunload = null;
-    document.removeEventListener('click', this.onDocumentNavigationAttempt, true);
-    window.clearTimeout(this.navigationPromptResetTimer);
-    this.allowNavigationWithoutPrompt = false;
+    this.navigationGuard.detach();
     if (this.props.dragAndDrop === true) {
       this.resumable.disableDropOnDocument();
     }
@@ -116,76 +114,13 @@ class FileUploader extends React.Component {
       && this.state.uploadFileList.some(file => file && !file.isSaved && !file.error);
   };
 
-  shouldPromptForNavigation = () => {
-    return this.hasActiveUploadWork() && !this.allowNavigationWithoutPrompt;
-  };
+  // Thin delegators onto the shared guard; kept as instance methods so callers
+  // (and tests) keep a stable component API.
+  confirmNavigationIfUploading = () => this.navigationGuard.confirmIfUploading();
 
-  confirmNavigationIfUploading = () => {
-    if (!this.shouldPromptForNavigation()) {
-      return true;
-    }
+  onDocumentNavigationAttempt = (event) => this.navigationGuard.onDocumentClick(event);
 
-    const confirmed = window.confirm(gettext('A file is being uploaded. Are you sure you want to leave this page?'));
-    if (!confirmed) {
-      return false;
-    }
-
-    this.allowNavigationWithoutPrompt = true;
-    window.clearTimeout(this.navigationPromptResetTimer);
-    this.navigationPromptResetTimer = window.setTimeout(() => {
-      this.allowNavigationWithoutPrompt = false;
-      this.navigationPromptResetTimer = null;
-    }, 1000);
-    return true;
-  };
-
-  onDocumentNavigationAttempt = (event) => {
-    if (!this.shouldPromptForNavigation() || event.defaultPrevented) {
-      return;
-    }
-
-    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
-      return;
-    }
-
-    const target = event.target;
-    if (!(target instanceof Element)) {
-      return;
-    }
-
-    const anchor = target.closest('a[href]');
-    if (!anchor) {
-      return;
-    }
-
-    const href = anchor.getAttribute('href');
-    if (!href || href === '#' || /^\s*javascript:/i.test(href)) {
-      return;
-    }
-
-    if (anchor.hasAttribute('download') || anchor.target === '_blank') {
-      return;
-    }
-
-    const destination = new URL(anchor.href, window.location.href);
-    const current = new URL(window.location.href);
-    if (destination.origin === current.origin
-      && destination.pathname === current.pathname
-      && destination.search === current.search) {
-      return;
-    }
-
-    if (!this.confirmNavigationIfUploading()) {
-      event.preventDefault();
-      event.stopPropagation();
-    }
-  };
-
-  onbeforeunload = () => {
-    if (this.shouldPromptForNavigation()) {
-      return '';
-    }
-  };
+  onbeforeunload = () => this.navigationGuard.onbeforeunload();
 
   bindCallbackHandler = () => {
     let { minFileSizeErrorCallback, fileTypeErrorCallback } = this.props;
