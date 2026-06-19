@@ -103,7 +103,6 @@ class FileUploader extends React.Component {
     document.removeEventListener('click', this.onDocumentNavigationAttempt, true);
     window.clearTimeout(this.navigationPromptResetTimer);
     this.allowNavigationWithoutPrompt = false;
-    Utils.registerGlobalVariable('uploader', 'isUploadProgressDialogShow', false);
     if (this.props.dragAndDrop === true) {
       this.resumable.disableDropOnDocument();
     }
@@ -160,7 +159,7 @@ class FileUploader extends React.Component {
     }
 
     const href = anchor.getAttribute('href');
-    if (!href || href === '#' || /^\\s*javascript:/i.test(href)) {
+    if (!href || href === '#' || /^\s*javascript:/i.test(href)) {
       return;
     }
 
@@ -344,7 +343,6 @@ class FileUploader extends React.Component {
       uploadFileList: uploadFileList,
       isUploadProgressDialogShow: true,
     });
-    Utils.registerGlobalVariable('uploader', 'isUploadProgressDialogShow', true);
   };
 
   onFileProgress = (resumableFile) => {
@@ -427,7 +425,6 @@ class FileUploader extends React.Component {
   onProgress = () => {
     let progress = Math.round(this.resumable.progress() * 100);
     this.setState({ totalProgress: progress });
-    Utils.registerGlobalVariable('uploader', 'totalProgress', progress);
   };
 
   markUploadSaved = (resumableFile, newFileName) => {
@@ -651,8 +648,6 @@ class FileUploader extends React.Component {
     if (!this.resumable || !this.resumable.isUploading()) {
       this.isUploadLinkLoaded = false;
     }
-    // After the error, the user can switch windows
-    Utils.registerGlobalVariable('uploader', 'totalProgress', 100);
   };
 
   onFileRetry = () => {
@@ -727,7 +722,6 @@ class FileUploader extends React.Component {
     // reset upload link loaded
     this.isUploadLinkLoaded = false;
     this.setState({ isUploadProgressDialogShow: false, uploadFileList: [], forbidUploadFileList: [] });
-    Utils.registerGlobalVariable('uploader', 'isUploadProgressDialogShow', false);
   };
 
   onUploadCancel = (uploadingItem) => {
@@ -870,8 +864,6 @@ class FileUploader extends React.Component {
       }, () => {
         this.resumable.upload();
       });
-      Utils.registerGlobalVariable('uploader', 'isUploadProgressDialogShow', true);
-
     }).catch(error => {
       let errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);

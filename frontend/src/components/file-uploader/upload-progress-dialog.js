@@ -35,10 +35,21 @@ class UploadProgressDialog extends React.Component {
   }
 
   componentDidUpdate(prevProps, prevState) {
-    if (prevProps.uploadFileList !== this.props.uploadFileList || prevState.isMinimized !== this.state.isMinimized) {
+    // Only auto-scroll when the file actually being uploaded changes or when the
+    // dialog is restored from minimized. onFileProgress rebuilds uploadFileList
+    // on every chunk tick, so reacting to the array reference here would re-pin
+    // the scroll to the active row continuously and fight the user's own scroll.
+    const activeIdChanged = this.getActiveUploadId(prevProps.uploadFileList) !== this.getActiveUploadId(this.props.uploadFileList);
+    const restoredFromMinimized = prevState.isMinimized && !this.state.isMinimized;
+    if (activeIdChanged || restoredFromMinimized) {
       this.scrollActiveUploadIntoView();
     }
   }
+
+  getActiveUploadId = (uploadFileList) => {
+    const activeFile = (uploadFileList || []).find(file => file && !file.isSaved && !file.error);
+    return activeFile ? activeFile.uniqueIdentifier : null;
+  };
   onCancelAllUploading = () => {
     this.props.onCancelAllUploading();
   };

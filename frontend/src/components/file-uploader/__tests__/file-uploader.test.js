@@ -1,6 +1,5 @@
 import FileUploader from '../file-uploader';
 import { seafileAPI } from '../../../utils/seafile-api';
-import { Utils } from '../../../utils/utils';
 
 jest.mock('../../../utils/seafile-api', () => ({
   seafileAPI: {
@@ -133,7 +132,6 @@ describe('FileUploader upload link reuse regression', () => {
     uploader.onError('Error');
 
     expect(uploader.isUploadLinkLoaded).toBe(false);
-    expect(Utils.registerGlobalVariable).toHaveBeenCalledWith('uploader', 'totalProgress', 100);
   });
 
   test('initializes per-file opts before scoping a replace upload target', async () => {
@@ -218,5 +216,34 @@ describe('FileUploader navigation guard', () => {
     expect(uploader.onbeforeunload()).toBeUndefined();
     expect(uploader.confirmNavigationIfUploading()).toBe(true);
     expect(window.confirm).not.toHaveBeenCalled();
+  });
+
+  test('ignores javascript:void(0) pseudo-links and does not prompt', () => {
+    const uploader = createUploader();
+    const activeFile = createResumableFile('big.iso', { isSaved: false, error: null });
+    uploader.state.isUploadProgressDialogShow = true;
+    uploader.state.uploadFileList = [activeFile];
+
+    const anchor = document.createElement('a');
+    anchor.setAttribute('href', 'javascript:void(0)'); // eslint-disable-line no-script-url
+    const target = document.createElement('span');
+    anchor.appendChild(target);
+
+    const event = {
+      target,
+      defaultPrevented: false,
+      button: 0,
+      metaKey: false,
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      preventDefault: jest.fn(),
+      stopPropagation: jest.fn(),
+    };
+
+    uploader.onDocumentNavigationAttempt(event);
+
+    expect(window.confirm).not.toHaveBeenCalled();
+    expect(event.preventDefault).not.toHaveBeenCalled();
   });
 });
