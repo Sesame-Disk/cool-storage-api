@@ -240,7 +240,7 @@ web_uploads:
   resumable_chunk_size_mb: 8
   max_file_size_mb: 0                # 0 = use server.max_upload_mb
   max_files_per_batch: 1000
-  simultaneous_uploads: 1
+  simultaneous_uploads: 3  # Max parallel browser upload slots; the adaptive client starts at 1 and only ramps up to this ceiling on stable networks
 
 # =============================================================================
 # Seafile HTTP (sync protocol token TTL)

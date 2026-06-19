@@ -373,6 +373,13 @@ node-local value that matches real disk capacity.
 The current web uploader now has two safe improvements in place:
 - UI switches to `Saving...` when the last chunk is waiting on server-side finalization.
 - The next queued file can start while the previous file is still finalizing its last chunk.
+- `web_uploads.simultaneous_uploads` is now treated as a client-side ceiling:
+  each upload session starts at `1`, ramps up only on stable high-throughput
+  links, and drops back to `1` on retries or network/server trouble.
+  - Queues made up of only small files (which never drive the ramp logic) use
+    the configured ceiling directly, except during the post-failure cooldown
+    window, where they too honor the `429`/retry/`5xx`/network backoff before
+    recovering back to the ceiling.
 
 The backend upload hot path also now avoids one repeated cost: successful chunked
 storage pre-checks are cached on the in-memory upload tracker, so later chunk requests
@@ -381,6 +388,11 @@ for the same upload stop re-walking the current HEAD just to reach the same answ
 so this optimization does not change the canonical HEAD / CAS safety model.
 
 Backend finalization is also partially improved: `finalizeUploadStreaming()` now parallelizes block PUTs and metadata writes instead of doing them fully serially.
+
+Important current limit:
+- lowering the adaptive target does not cancel chunks already in flight; it only
+  stops refilling additional chunk requests above the new target, which keeps
+  the downgrade safe but not literally instantaneous.
 
 ### Still Pending
 

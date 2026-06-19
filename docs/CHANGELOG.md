@@ -8,6 +8,94 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-06-18 - Adaptive upload ceiling: small-file parallelism + backpressure fixes
+
+### Fixed
+
+Two follow-up issues in the adaptive upload concurrency scheduler:
+
+- **Small-file-only queues were stuck at one slot.** Files smaller than the
+  adaptive-eligibility threshold (under ~3 chunks) never drive the ramp logic,
+  so a batch of only small files would upload fully serialized. They now default
+  to the configured ceiling immediately when no large file is present.
+- **Backoff was neutralized for small-file queues.** Because small-file queues
+  used the ceiling unconditionally, a retry / `429` / `5xx` / network drop that
+  lowered the adaptive target was ignored on the very next chunk. The ceiling
+  shortcut is now suppressed during the post-failure cooldown window, so the
+  backoff actually holds; small-file batches recover to the ceiling only after
+  the cooldown expires.
+
+### Improved
+
+- Concurrency target is now computed once per `uploadNextChunk` poke and threaded
+  through the start/fill calls instead of being recomputed for every slot, and
+  the eligibility scan uses plain loops (no intermediate arrays/closures) to keep
+  the hot path cheap on large queues.
+- The temporary finalize slot is now capped at the configured ceiling instead of
+  being allowed to exceed it by one.
+
+### Tests
+
+- Added coverage for small-file-only parallelism, small-file `429` backoff during
+  cooldown + recovery, and the finalize slot respecting the ceiling.
+
+### Files
+
+- `frontend/src/utils/upload-finalization.js`
+- `frontend/src/utils/__tests__/upload-finalization.test.js`
+
+---
+
+## 2026-06-18 - Web uploads now treat simultaneous_uploads as an adaptive ceiling
+
+### Improved
+
+The browser uploader now interprets `web_uploads.simultaneous_uploads` as the
+maximum allowed parallelism, not a fixed number of always-open chunk slots.
+
+The client now:
+
+- always starts each upload session at `1`
+- ramps up gradually only when a large upload stays stable and throughput is
+  high enough to justify more parallel chunk requests
+- drops back to `1` on retries, network-change events, and server/network
+  failures that make extra concurrency more likely to hurt than help
+
+### Scope / Limits
+
+This is intentionally a frontend-only scheduling change:
+
+- the backend upload protocol does not change
+- the backend still relies on node-local chunk state and temp-file staging
+- lowering concurrency does not abort chunks already in flight; it prevents the
+  next replacements from refilling above the new target
+
+### Tests / Docs
+
+- Added shared-helper coverage for adaptive ramp-up, downgrade, and temporary
+  finalization-slot behavior
+- Updated upload config comments to describe `simultaneous_uploads` as a
+  ceiling rather than a fixed slot count
+- Updated technical-debt notes with the new scope and current limit
+
+### Files
+
+- `frontend/src/utils/upload-finalization.js`
+- `frontend/src/utils/__tests__/upload-finalization.test.js`
+- `frontend/src/components/file-uploader/file-uploader.js`
+- `frontend/src/pages/upload-link/file-uploader.js`
+- `frontend/src/components/shared-link-file-uploader/file-uploader.js`
+- `configs/config.example.yaml`
+- `configs/config.docker.yaml`
+- `configs/config.prod.yaml`
+- `configs/config-eu.yaml`
+- `configs/config-usa.yaml`
+- `configs/config-eu.cluster.yaml`
+- `configs/config-usa.cluster.yaml`
+- `docs/TECHNICAL-DEBT.md`
+
+---
+
 ## 2026-06-18 - Chunked web uploads now fail earlier on size and staging limits
 
 ### Fixed
