@@ -380,6 +380,11 @@ The current web uploader now has two safe improvements in place:
     the configured ceiling directly, except during the post-failure cooldown
     window, where they too honor the `429`/retry/`5xx`/network backoff before
     recovering back to the ceiling.
+- A file waiting on server-side finalize (browser bytes sent, last chunk still
+  in flight) no longer stalls the queue: the scheduler keeps one replacement slot
+  open (clamped to the ceiling) and ignores the finalize-time bitrate dip instead
+  of misreading it as network degradation. Explicit `429`/`413`/`5xx`/retry
+  signals still degrade concurrency during that window.
 
 The backend upload hot path also now avoids one repeated cost: successful chunked
 storage pre-checks are cached on the in-memory upload tracker, so later chunk requests
@@ -393,6 +398,29 @@ Important current limit:
 - lowering the adaptive target does not cancel chunks already in flight; it only
   stops refilling additional chunk requests above the new target, which keeps
   the downgrade safe but not literally instantaneous.
+- the finalize-aware bitrate mask is queue-global: while any file is finalizing,
+  every bitrate sample is ignored, including samples from a file that is still
+  actively uploading. Genuine network degradation during that window is only
+  caught by the explicit `429`/`5xx`/retry signals, not by the bitrate heuristic.
+  Each `fileProgress` event also re-runs a `files×chunks` scan
+  (`hasFinalizingFiles` / `countUploadingChunks`) to recompute the target.
+
+### Future improvement: `upload/adaptive-per-file-bitrate`
+
+The cleanest fix for the finalize-vs-degradation coupling above is to make the
+adaptive scheduler reason about bitrate per active file instead of masking the
+whole queue. Target design:
+
+- measure bitrate only from chunks that are actively uploading and **not** in a
+  finalize wait, so a stalled finalize on one file never contaminates the signal
+  for files that are still transferring;
+- ignore finalize latency only for the contaminated sample (the file actually
+  awaiting the server), not for the entire queue;
+- keep `429` / `5xx` / retry as global backpressure — those remain authoritative
+  and should still degrade concurrency regardless of finalize state;
+- avoid the per-`fileProgress` `files×chunks` rescan by tracking finalize/active
+  counts as derived/cached state updated on chunk-state transitions, instead of
+  recomputing them on every progress event.
 
 ### Still Pending
 

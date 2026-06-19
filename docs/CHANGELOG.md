@@ -8,6 +8,51 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-06-19 - Adaptive uploads: keep the queue flowing during server-side finalize
+
+### Fixed
+
+A file whose browser bytes are fully sent but whose last chunk is still waiting
+on the server-side finalize used to hurt the adaptive scheduler in two ways:
+
+- **The stuck slot was never replaced.** That finalizing chunk kept counting as
+  an active upload slot, so later chunk completions could not refill the queue
+  while the finalize was outstanding. The scheduler now keeps **one** replacement
+  slot open while any file is finalizing (or awaiting the server finalize),
+  threaded through `uploadNextChunk` / `startNextUploadChunk` /
+  `fillUploadConcurrencySlots`. The extra slot is still clamped to the configured
+  ceiling, so total parallelism never exceeds `simultaneous_uploads`.
+- **Finalize latency was misread as network degradation.** The throughput dip
+  while waiting on the server produced a low bitrate sample that tripped the
+  bitrate-drop downgrade and collapsed concurrency to `1`. `updateAdaptiveUploadConcurrency`
+  now bails out early (without degrading or polluting the smoothed bitrate) while
+  a file is finalizing, and refills the replacement slot instead. Explicit
+  server backpressure (`429` / `413` / `5xx`) and retry/network events still
+  degrade as before — only the bitrate heuristic is suppressed during finalize.
+
+### Scope / Limits
+
+- The finalize mask is queue-global: while any file is finalizing, **all** bitrate
+  samples are ignored, including those of a file that is still actively uploading.
+  Real network degradation during that window is only caught by the explicit
+  `429`/`5xx`/retry signals, not by the bitrate heuristic. See the
+  `upload/adaptive-per-file-bitrate` follow-up in TECHNICAL-DEBT §5 for the
+  cleaner per-file design.
+
+### Tests
+
+- Added coverage for the replacement slot staying open across later chunk
+  completions, freeing a slot before the UI `isFinalizing` flag is set, finalize
+  not degrading concurrency on bitrate drops, and `429` still degrading while a
+  file is awaiting finalize.
+
+### Files
+
+- `frontend/src/utils/upload-finalization.js`
+- `frontend/src/utils/__tests__/upload-finalization.test.js`
+
+---
+
 ## 2026-06-18 - Adaptive upload ceiling: small-file parallelism + backpressure fixes
 
 ### Fixed
