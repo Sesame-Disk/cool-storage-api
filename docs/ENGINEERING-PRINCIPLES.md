@@ -102,10 +102,17 @@ This document defines core engineering principles that guide development decisio
 
 This is the established contract across the API: the `RequireLibraryPermission`
 middleware and the read-model handlers (tags, starred, monitored, share/upload
-links) all resolve existence first and return 404 before any permission check.
-Handlers that perform an inline permission check must do the same — when access
-is denied, call `respondIfLibraryMissing()` (see `internal/api/v2/library_live.go`)
-to surface a missing library as 404 instead of a misleading 403.
+links) resolve library existence and return 404 *before the library-level
+permission check* (ownership / share lookup). Handlers that perform an inline
+permission check must do the same — when access is denied, call
+`respondIfLibraryMissing()` (see `internal/api/v2/library_live.go`) to surface a
+missing library as 404 instead of a misleading 403.
+
+One coarse gate runs ahead of the existence check: `RequireLibraryPermission`
+rejects a request whose **API-key scope** is insufficient with `403 insufficient
+api key scope` before it looks up the library. That is intentional — an API key
+that lacks the scope is denied regardless of which repo it targets, so it reveals
+nothing about a specific repo's existence.
 
 **Why not hide existence behind a uniform 403?**
 - Repo IDs are high-entropy UUIDv4 (~122 bits); 404-vs-403 is not a practical

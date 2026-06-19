@@ -737,8 +737,6 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-// GetLibrary returns a single library by ID
-// This endpoint uses the api2 format expected by Seafile desktop client
 // getLibraryPermissionFn is a seam over PermissionMiddleware.GetLibraryPermission
 // so the GetLibrary/GetLibraryV21 handlers can be unit-tested without a live DB
 // (the underlying lookup hits Cassandra). Mirrors the other *Fn seams in this package.
@@ -746,6 +744,8 @@ var getLibraryPermissionFn = func(pm *middleware.PermissionMiddleware, orgID, us
 	return pm.GetLibraryPermission(orgID, userID, repoID)
 }
 
+// GetLibrary returns a single library by ID
+// This endpoint uses the api2 format expected by Seafile desktop client
 func (h *LibraryHandler) GetLibrary(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	orgID := c.GetString("org_id")
