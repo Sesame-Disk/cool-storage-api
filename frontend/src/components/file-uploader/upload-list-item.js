@@ -8,6 +8,8 @@ const propTypes = {
   resumableFile: PropTypes.object.isRequired,
   onUploadCancel: PropTypes.func.isRequired,
   onUploadRetry: PropTypes.func.isRequired,
+  isCurrentUpload: PropTypes.bool,
+  rowRef: PropTypes.oneOfType([PropTypes.func, PropTypes.shape({ current: PropTypes.any })]),
 };
 
 const UPLOAD_UPLOADING = 'uploading';
@@ -77,11 +79,12 @@ class UploadListItem extends React.Component {
     let { resumableFile } = this.props;
     let progress = Math.round(resumableFile.progress() * 100);
     let error = resumableFile.error;
+    const displayName = resumableFile.newFileName || resumableFile.fileName || '';
 
     return (
-      <tr className="file-upload-item">
+      <tr className={`file-upload-item${this.props.isCurrentUpload ? ' current-upload-item' : ''}`} ref={this.props.rowRef}>
         <td className="upload-name">
-          <div className="ellipsis">{resumableFile.newFileName}</div>
+          <div className="ellipsis" title={displayName}>{displayName}</div>
         </td>
         <td>
           <span className="file-size">{this.formatFileSize(resumableFile.size)}</span>

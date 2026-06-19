@@ -9,6 +9,7 @@ import { seafileAPI } from '../../utils/seafile-api';
 import { clearFileUploadRuntimeState, consumeSuppressedUploadErrorToast, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
+import UploadNavigationGuard from '../../utils/upload-navigation-guard';
 import UploadProgressDialog from './upload-progress-dialog';
 import toaster from '../../components/toast';
 
@@ -55,11 +56,13 @@ class FileUploader extends React.Component {
     this.bitrateInterval = 500; // Interval in milliseconds to calculate the bitrate
     this.isUploadLinkLoaded = false;
     this.adaptiveUploadCleanup = null;
+    this.navigationGuard = new UploadNavigationGuard(this.hasActiveUploadWork);
 
     window.onbeforeunload = this.onbeforeunload;
   }
 
   componentDidMount() {
+    this.navigationGuard.attach();
     const configuredSimultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
     const simultaneousUploads = getInitialSimultaneousUploads(configuredSimultaneousUploads);
     this.resumable = new Resumablejs({
@@ -93,6 +96,7 @@ class FileUploader extends React.Component {
 
   componentWillUnmount = () => {
     window.onbeforeunload = null;
+    this.navigationGuard.detach();
     if (this.props.dragAndDrop === true) {
       this.resumable.disableDropOnDocument();
     }
@@ -101,13 +105,18 @@ class FileUploader extends React.Component {
     }
   };
 
-  onbeforeunload = () => {
-    if (window.uploader &&
-      window.uploader.isUploadProgressDialogShow &&
-      window.uploader.totalProgress !== 100) {
-      return '';
-    }
+  hasActiveUploadWork = () => {
+    return this.state.isUploadProgressDialogShow
+      && this.state.uploadFileList.some(file => file && !file.isSaved && !file.error);
   };
+
+  // Thin delegators onto the shared guard; kept as instance methods so callers
+  // (and tests) keep a stable component API.
+  confirmNavigationIfUploading = () => this.navigationGuard.confirmIfUploading();
+
+  onDocumentNavigationAttempt = (event) => this.navigationGuard.onDocumentClick(event);
+
+  onbeforeunload = () => this.navigationGuard.onbeforeunload();
 
   bindCallbackHandler = () => {
     let { minFileSizeErrorCallback, fileTypeErrorCallback } = this.props;
@@ -133,6 +142,7 @@ class FileUploader extends React.Component {
   bindEventHandler = () => {
     this.resumable.on('chunkingComplete', this.onChunkingComplete.bind(this));
     this.resumable.on('fileAdded', this.onFileAdded.bind(this));
+    this.resumable.on('filesAddedComplete', this.filesAddedComplete.bind(this));
     this.resumable.on('fileProgress', this.onFileProgress.bind(this));
     this.resumable.on('fileSuccess', this.onFileUploadSuccess.bind(this));
     this.resumable.on('fileError', this.onFileError.bind(this));
@@ -234,7 +244,6 @@ class FileUploader extends React.Component {
       uploadFileList: uploadFileList,
       isUploadProgressDialogShow: true,
     });
-    Utils.registerGlobalVariable('uploader', 'isUploadProgressDialogShow', true);
   };
 
   onFileProgress = (resumableFile) => {
@@ -325,7 +334,6 @@ class FileUploader extends React.Component {
   onProgress = () => {
     let progress = Math.round(this.resumable.progress() * 100);
     this.setState({ totalProgress: progress });
-    Utils.registerGlobalVariable('uploader', 'totalProgress', progress);
   };
 
   markUploadSaved = (resumableFile, newFileName) => {
@@ -529,7 +537,6 @@ class FileUploader extends React.Component {
       this.isUploadLinkLoaded = false;
     }
     // After the error, the user can switch windows
-    Utils.registerGlobalVariable('uploader', 'totalProgress', 100);
   };
 
   setHeaders = (resumableFile, resumable) => {
@@ -590,8 +597,7 @@ class FileUploader extends React.Component {
     this.restoreConcurrencyIfIdle();
     // reset upload link loaded
     this.isUploadLinkLoaded = false;
-    this.setState({ isUploadProgressDialogShow: false, uploadFileList: [], forbidUploadFileList: [] });
-    Utils.registerGlobalVariable('uploader', 'isUploadProgressDialogShow', false);
+    this.setState({ isUploadProgressDialogShow: false, uploadFileList: [], forbidUploadFileList: [], retryFileList: [], totalProgress: 0, uploadBitrate: 0 });
   };
 
   onUploadCancel = (uploadingItem) => {
@@ -640,6 +646,22 @@ class FileUploader extends React.Component {
 
   onUploadRetry = (resumableFile) => {
     this.retryUploadWithFreshLink(resumableFile);
+  };
+
+  onUploadRetryAll = () => {
+    this.state.retryFileList.forEach(item => {
+      clearFileUploadRuntimeState(item, { resetRemainingTime: true });
+      resetUploadConflictAutoRetry(item);
+      item.error = false;
+      this.retryUploadFile(item);
+    });
+
+    let uploadFileList = this.state.uploadFileList.slice(0);
+    this.setState({
+      retryFileList: [],
+      uploadFileList: uploadFileList
+    });
+    this.restoreConcurrencyIfIdle();
   };
 
   onFileRetry = () => {
@@ -693,20 +715,33 @@ class FileUploader extends React.Component {
             <input className="upload-input" type="file" ref={this.uploadInput} onClick={this.onClick} aria-label={gettext('Upload')} />
           </div>
         </div>
-        <UploadProgressDialog
-          retryFileList={this.state.retryFileList}
-          uploadFileList={this.state.uploadFileList}
-          forbidUploadFileList={this.state.forbidUploadFileList}
-          totalProgress={this.state.totalProgress}
-          uploadBitrate={this.state.uploadBitrate}
-          onCloseUploadDialog={this.onCloseUploadDialog}
-          onCancelAllUploading={this.onCancelAllUploading}
-          onUploadCancel={this.onUploadCancel}
-          onUploadRetry={this.onUploadRetry}
-          onFileUpload={this.onFileUpload}
-          onFolderUpload={this.onFolderUpload}
-          isUploading={this.resumable ? this.resumable.isUploading() : false}
-        />
+        <div className="upload-link-actions text-center">
+          <button type="button" className="btn btn-primary" onClick={this.onFileUpload}>{gettext('Upload Files')}</button>
+          <button type="button" className="btn btn-primary" onClick={this.onFolderUpload}>{gettext('Upload Folder')}</button>
+          <button
+            type="button"
+            className="btn btn-outline-primary"
+            onClick={this.onCancelAllUploading}
+            disabled={!this.resumable || !this.resumable.isUploading()}
+          >
+            {gettext('Cancel All')}
+          </button>
+        </div>
+        {this.state.isUploadProgressDialogShow &&
+          <UploadProgressDialog
+            retryFileList={this.state.retryFileList}
+            uploadFileList={this.state.uploadFileList}
+            forbidUploadFileList={this.state.forbidUploadFileList}
+            totalProgress={this.state.totalProgress}
+            uploadBitrate={this.state.uploadBitrate}
+            onCloseUploadDialog={this.onCloseUploadDialog}
+            onCancelAllUploading={this.onCancelAllUploading}
+            onUploadCancel={this.onUploadCancel}
+            onUploadRetry={this.onUploadRetry}
+            onUploadRetryAll={this.onUploadRetryAll}
+            isUploading={this.resumable ? this.resumable.isUploading() : false}
+          />
+        }
       </Fragment>
     );
   }
