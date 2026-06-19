@@ -217,12 +217,22 @@ const isAwaitingServerFinalize = (resumableFile) => {
     return uploadingChunks.every(chunk => chunkBytesLoaded(chunk) || chunkProgressLooksComplete(chunk));
 };
 
+const isTrackedFinalizingFile = (resumableFile) => {
+    return Boolean(resumableFile)
+        && !resumableFile.isSaved
+        && !resumableFile.error
+        && (
+            Boolean(resumableFile.isFinalizing) ||
+            isAwaitingServerFinalize(resumableFile)
+        );
+};
+
 const hasFinalizingFiles = (resumable) => {
     if (!resumable || !Array.isArray(resumable.files)) {
         return false;
     }
 
-    return resumable.files.some(file => file.isFinalizing && !file.isSaved && !file.error);
+    return resumable.files.some(isTrackedFinalizingFile);
 };
 
 const getFinalizingFiles = (resumable) => {
@@ -230,7 +240,7 @@ const getFinalizingFiles = (resumable) => {
         return [];
     }
 
-    return resumable.files.filter(file => file.isFinalizing && !file.isSaved && !file.error);
+    return resumable.files.filter(isTrackedFinalizingFile);
 };
 
 const getAdaptiveUploadState = (resumable) => {
@@ -282,7 +292,12 @@ const desiredUploadConcurrency = (resumable, options = {}) => {
         desired = state.max;
     }
 
-    if (options.allowExtraSlot) {
+    // A file whose browser bytes are fully sent but whose last chunk is still
+    // waiting on the server finalize should not permanently consume one of the
+    // active upload slots. Keep one replacement slot available while that
+    // finalize is outstanding so later chunk completions can keep refilling the
+    // queue until the file is truly done.
+    if (options.allowExtraSlot || (options.includeFinalizeReplacement && hasFinalizingFiles(resumable))) {
         desired++;
     }
 
@@ -380,7 +395,7 @@ const startNextUploadChunk = (resumable, options = {}) => {
         return false;
     }
 
-    const allowedSlots = options.target ?? desiredUploadConcurrency(resumable, options);
+    const allowedSlots = options.target ?? desiredUploadConcurrency(resumable, { ...options, includeFinalizeReplacement: true });
     if (countUploadingChunks(resumable) >= allowedSlots) {
         return false;
     }
@@ -389,7 +404,7 @@ const startNextUploadChunk = (resumable, options = {}) => {
 };
 
 const fillUploadConcurrencySlots = (resumable, precomputedTarget) => {
-    const targetSlots = precomputedTarget ?? desiredUploadConcurrency(resumable);
+    const targetSlots = precomputedTarget ?? desiredUploadConcurrency(resumable, { includeFinalizeReplacement: true });
     let started = false;
 
     for (let attempts = 0; attempts < targetSlots; attempts++) {
@@ -527,7 +542,7 @@ export const initializeAdaptiveUploadConcurrency = (resumable, configuredUploads
         // Compute the concurrency target once per poke and thread it through the
         // start/fill calls so this hot path does a single files×chunks scan
         // instead of recomputing it for every slot it tries to fill.
-        const target = desiredUploadConcurrency(resumable);
+        const target = desiredUploadConcurrency(resumable, { includeFinalizeReplacement: true });
         if (resumable.opts) {
             resumable.opts.simultaneousUploads = target;
         }

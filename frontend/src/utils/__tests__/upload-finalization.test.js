@@ -340,6 +340,43 @@ describe('adaptive upload concurrency helpers', () => {
         resetAdaptiveUploadConcurrency(resumable, 3);
         cleanup();
     });
+    test('a finalizing file keeps one replacement slot open across later chunk completions', () => {
+        const { resumable, files } = createFakeResumable({
+            files: [
+                { id: 'saving-file', uploadingChunks: 1, pendingChunks: 0, isFinalizing: true, size: eightMiB * 6 },
+                { id: 'queued-file', pendingChunks: 2, uploadingChunks: 0, size: eightMiB * 6 },
+            ],
+        });
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+        const queuedFile = files[1];
+
+        expect(maybeStartPendingUploadDuringFinalize(resumable)).toBe(true);
+        expect(countUploadingChunks(resumable)).toBe(2);
+
+        completeOneUploadingChunk(queuedFile);
+        expect(countUploadingChunks(resumable)).toBe(1);
+
+        expect(resumable.uploadNextChunk()).toBe(true);
+        expect(countUploadingChunks(resumable)).toBe(2);
+
+        cleanup();
+    });
+
+    test('files awaiting server finalize can free a replacement slot even before the UI flag is set', () => {
+        const { resumable } = createFakeResumable({
+            files: [
+                { id: 'saving-file', uploadingChunks: 1, pendingChunks: 0, isFinalizing: false, size: eightMiB * 6 },
+                { id: 'queued-file', pendingChunks: 1, uploadingChunks: 0, size: eightMiB * 6 },
+            ],
+        });
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+
+        expect(countUploadingChunks(resumable)).toBe(1);
+        expect(maybeStartPendingUploadDuringFinalize(resumable)).toBe(true);
+        expect(countUploadingChunks(resumable)).toBe(2);
+
+        cleanup();
+    });
 
     test('finalizing files do not open an extra slot once the configured ceiling is already full', () => {
         const { resumable, files } = createFakeResumable({
