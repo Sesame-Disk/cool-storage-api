@@ -606,8 +606,10 @@ export const updateAdaptiveUploadConcurrency = (resumable, resumableFile, upload
     }
     // Finalize latency is a server-side wait after the browser already sent all
     // bytes. Do not treat that pause as network degradation or lower adaptive
-    // concurrency because of it.
-    if (hasFinalizingFiles(resumable) || isAwaitingServerFinalize(resumableFile)) {
+    // concurrency because of it. Check the current file first: it's a single-file
+    // scan that short-circuits the OR in the common case (the file emitting this
+    // progress event is the one awaiting finalize) before the full-queue scan.
+    if (isAwaitingServerFinalize(resumableFile) || hasFinalizingFiles(resumable)) {
         fillUploadConcurrencySlots(resumable);
         return false;
     }
