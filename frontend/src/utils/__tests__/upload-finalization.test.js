@@ -6,6 +6,7 @@ import {
     markUploadConflictAutoRetry,
     maybeStartPendingUploadDuringFinalize,
     moveUploadToRetryState,
+    noteAdaptiveUploadFailure,
     noteAdaptiveUploadRetry,
     parseUploadSuccessEntry,
     resetAdaptiveUploadConcurrency,
@@ -219,6 +220,28 @@ describe('adaptive upload concurrency helpers', () => {
         completeOneUploadingChunk(resumableFile);
         expect(resumable.uploadNextChunk()).toBe(false);
         expect(countUploadingChunks(resumable)).toBe(1);
+
+        cleanup();
+    });
+
+    test('server backpressure (429) and 5xx lower the adaptive target, client 4xx does not', () => {
+        const { resumable, files } = createFakeResumable();
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+        const resumableFile = files[0];
+
+        resumable.uploadNextChunk();
+        for (let sample = 0; sample < 3; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, resumableFile, 20 * 1024 * 1024);
+        }
+        expect(resumable.opts.simultaneousUploads).toBe(2);
+
+        // A plain client error (e.g. 409 conflict) is not a concurrency signal.
+        expect(noteAdaptiveUploadFailure(resumable, { lastUploadResponseStatus: 409 }, 'conflict')).toBe(false);
+        expect(resumable.opts.simultaneousUploads).toBe(2);
+
+        // 429 is the server explicitly asking for less parallelism.
+        expect(noteAdaptiveUploadFailure(resumable, { lastUploadResponseStatus: 429 }, 'slow down')).toBe(true);
+        expect(resumable.opts.simultaneousUploads).toBe(1);
 
         cleanup();
     });

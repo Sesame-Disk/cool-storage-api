@@ -550,7 +550,10 @@ export const noteAdaptiveUploadRetry = (resumable) => {
 
 export const noteAdaptiveUploadFailure = (resumable, resumableFile, message) => {
     const status = extractAdaptivePenaltyStatus(resumableFile, message);
-    if (!message || status === 0 || status === 413 || status === 507 || status >= 500) {
+    // Back off on transport-level trouble (unknown/no status, payload-too-large,
+    // rate limiting, and any 5xx). 429 in particular is the server explicitly
+    // asking for less concurrency, so it must lower the adaptive target too.
+    if (!message || status === 0 || status === 413 || status === 429 || status >= 500) {
         return degradeAdaptiveUploadConcurrency(resumable, 'failure');
     }
     return false;
