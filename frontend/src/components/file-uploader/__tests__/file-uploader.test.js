@@ -150,6 +150,29 @@ describe('FileUploader upload link reuse regression', () => {
     expect(resumableFile.formData.target_file).toBe('/existing.txt');
     expect(uploader.resumable.upload).toHaveBeenCalled();
   });
+
+  test('clears retry files when the upload dialog is closed', () => {
+    const uploader = createUploader();
+    const failedFile = createResumableFile('failed.txt', { error: 'boom' });
+
+    uploader.state.isUploadProgressDialogShow = true;
+    uploader.state.uploadFileList = [failedFile];
+    uploader.state.forbidUploadFileList = [createResumableFile('blocked.txt')];
+    uploader.state.retryFileList = [failedFile];
+    uploader.state.totalProgress = 100;
+    uploader.state.uploadBitrate = 5000;
+    uploader.isUploadLinkLoaded = true;
+
+    uploader.onCloseUploadDialog();
+
+    expect(uploader.state.isUploadProgressDialogShow).toBe(false);
+    expect(uploader.state.uploadFileList).toEqual([]);
+    expect(uploader.state.forbidUploadFileList).toEqual([]);
+    expect(uploader.state.retryFileList).toEqual([]);
+    expect(uploader.state.totalProgress).toBe(0);
+    expect(uploader.state.uploadBitrate).toBe(0);
+    expect(uploader.isUploadLinkLoaded).toBe(false);
+  });
 });
 
 
