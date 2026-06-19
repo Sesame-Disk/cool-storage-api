@@ -237,6 +237,59 @@ const getAdaptiveUploadState = (resumable) => {
     return resumable ? resumable._sesamefsAdaptiveUpload || null : null;
 };
 
+const hasAdaptiveEligibleWork = (resumable) => {
+    if (!resumable || !Array.isArray(resumable.files) || resumable.files.length === 0) {
+        return false;
+    }
+
+    for (const file of resumable.files) {
+        if (!file || file.isSaved || file.error) {
+            continue;
+        }
+
+        const chunks = getFileChunks(file);
+        if (chunks.length === 0) {
+            continue;
+        }
+
+        const hasActiveOrPendingChunk = chunks.some(chunk => {
+            const status = getChunkStatus(chunk);
+            return status === 'pending' || status === 'uploading';
+        });
+        if (hasActiveOrPendingChunk && isAdaptiveEligibleFile(file, resumable)) {
+            return true;
+        }
+    }
+
+    return false;
+};
+
+const desiredUploadConcurrency = (resumable, options = {}) => {
+    const state = getAdaptiveUploadState(resumable);
+    if (!state) {
+        return ADAPTIVE_UPLOAD_MIN_CONCURRENCY;
+    }
+
+    let desired = state.effective;
+    if (!hasAdaptiveEligibleWork(resumable)) {
+        desired = state.max;
+    }
+
+    if (options.allowExtraSlot) {
+        desired++;
+    }
+
+    return Math.max(ADAPTIVE_UPLOAD_MIN_CONCURRENCY, Math.min(state.max, desired));
+};
+
+const syncResumableSimultaneousUploads = (resumable) => {
+    if (!resumable || !resumable.opts) {
+        return;
+    }
+
+    resumable.opts.simultaneousUploads = desiredUploadConcurrency(resumable);
+};
+
 // Hot path: called from updateAdaptiveUploadConcurrency on every fileProgress
 // event, so iterate with plain loops to avoid per-call intermediate arrays.
 const countUploadingChunks = (resumable) => {
@@ -320,9 +373,7 @@ const startNextUploadChunk = (resumable, options = {}) => {
         return false;
     }
 
-    const state = getAdaptiveUploadState(resumable);
-    const effectiveSlots = state ? state.effective : ADAPTIVE_UPLOAD_MIN_CONCURRENCY;
-    const allowedSlots = effectiveSlots + (options.allowExtraSlot ? 1 : 0);
+    const allowedSlots = desiredUploadConcurrency(resumable, options);
     if (countUploadingChunks(resumable) >= allowedSlots) {
         return false;
     }
@@ -331,8 +382,7 @@ const startNextUploadChunk = (resumable, options = {}) => {
 };
 
 const fillUploadConcurrencySlots = (resumable) => {
-    const state = getAdaptiveUploadState(resumable);
-    const targetSlots = state ? state.effective : ADAPTIVE_UPLOAD_MIN_CONCURRENCY;
+    const targetSlots = desiredUploadConcurrency(resumable);
     let started = false;
 
     for (let attempts = 0; attempts < targetSlots; attempts++) {
@@ -375,9 +425,7 @@ const setEffectiveUploadConcurrency = (resumable, nextEffectiveSlots, options = 
     }
 
     state.effective = clampedSlots;
-    if (resumable.opts) {
-        resumable.opts.simultaneousUploads = clampedSlots;
-    }
+    syncResumableSimultaneousUploads(resumable);
     if (options.refill) {
         fillUploadConcurrencySlots(resumable);
     }
@@ -451,7 +499,7 @@ export const getInitialSimultaneousUploads = (configuredUploads) => {
 
 export const initializeAdaptiveUploadConcurrency = (resumable, configuredUploads) => {
     if (!resumable || typeof resumable.uploadNextChunk !== 'function') {
-        return () => {};
+        return () => { };
     }
 
     if (typeof resumable._sesamefsAdaptiveCleanup === 'function') {
@@ -463,8 +511,13 @@ export const initializeAdaptiveUploadConcurrency = (resumable, configuredUploads
     if (resumable.opts) {
         resumable.opts.simultaneousUploads = ADAPTIVE_UPLOAD_MIN_CONCURRENCY;
     }
-    resumable.uploadNextChunk = function() {
-        return startNextUploadChunk(resumable);
+    resumable.uploadNextChunk = function () {
+        syncResumableSimultaneousUploads(resumable);
+        const started = startNextUploadChunk(resumable);
+        if (started) {
+            fillUploadConcurrencySlots(resumable);
+        }
+        return started;
     };
 
     const handleNetworkChange = () => {
@@ -507,7 +560,9 @@ export const resetAdaptiveUploadConcurrency = (resumable, configuredUploads) => 
     state.max = getBaselineSimultaneousUploads(configuredUploads || state.max);
     resetAdaptiveMetrics(state);
     resumable._finalizeSlotOwner = null;
-    return setEffectiveUploadConcurrency(resumable, ADAPTIVE_UPLOAD_MIN_CONCURRENCY);
+    const changed = setEffectiveUploadConcurrency(resumable, ADAPTIVE_UPLOAD_MIN_CONCURRENCY);
+    syncResumableSimultaneousUploads(resumable);
+    return changed;
 };
 
 export const updateAdaptiveUploadConcurrency = (resumable, resumableFile, uploadBitrate) => {

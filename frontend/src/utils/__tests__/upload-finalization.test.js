@@ -181,6 +181,24 @@ describe('adaptive upload concurrency helpers', () => {
         cleanup();
     });
 
+    test('small-file-only queues keep the configured parallelism instead of staying serialized', () => {
+        const { resumable } = createFakeResumable({
+            configuredUploads: 3,
+            files: [
+                { id: 'small-1', pendingChunks: 1, size: eightMiB },
+                { id: 'small-2', pendingChunks: 1, size: eightMiB },
+                { id: 'small-3', pendingChunks: 1, size: eightMiB },
+            ],
+        });
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+
+        expect(resumable.uploadNextChunk()).toBe(true);
+        expect(resumable.opts.simultaneousUploads).toBe(3);
+        expect(countUploadingChunks(resumable)).toBe(3);
+
+        cleanup();
+    });
+
     test('ramps up toward the configured ceiling on stable high-throughput uploads', () => {
         const { resumable, files } = createFakeResumable();
         const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
@@ -263,7 +281,7 @@ describe('adaptive upload concurrency helpers', () => {
         cleanup();
     });
 
-    test('finalizing files can still grant one temporary extra slot above the adaptive target', () => {
+    test('finalizing files can still use spare configured capacity without exceeding the ceiling', () => {
         const { resumable } = createFakeResumable({
             files: [
                 { id: 'saving-file', uploadingChunks: 1, pendingChunks: 0, isFinalizing: true, size: eightMiB * 6 },
@@ -277,6 +295,34 @@ describe('adaptive upload concurrency helpers', () => {
         expect(countUploadingChunks(resumable)).toBe(2);
 
         resetAdaptiveUploadConcurrency(resumable, 3);
+        cleanup();
+    });
+
+    test('finalizing files do not open an extra slot once the configured ceiling is already full', () => {
+        const { resumable, files } = createFakeResumable({
+            configuredUploads: 3,
+            files: [
+                { id: 'saving-file', uploadingChunks: 1, pendingChunks: 5, isFinalizing: true, size: eightMiB * 6 },
+                { id: 'queued-file', pendingChunks: 5, uploadingChunks: 0, size: eightMiB * 6 },
+            ],
+        });
+        const cleanup = initializeAdaptiveUploadConcurrency(resumable, 3);
+        const resumableFile = files[0];
+
+        resumable.uploadNextChunk();
+
+        for (let sample = 0; sample < 3; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, resumableFile, 20 * 1024 * 1024);
+        }
+        for (let sample = 0; sample < 5; sample++) {
+            updateAdaptiveUploadConcurrency(resumable, resumableFile, 30 * 1024 * 1024);
+        }
+
+        expect(resumable.opts.simultaneousUploads).toBe(3);
+        expect(countUploadingChunks(resumable)).toBe(3);
+        expect(maybeStartPendingUploadDuringFinalize(resumable)).toBe(false);
+        expect(countUploadingChunks(resumable)).toBe(3);
+
         cleanup();
     });
 });
