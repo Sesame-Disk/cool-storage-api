@@ -358,6 +358,9 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 		}
 
 		if !hasAccess {
+			if respondIfLibraryMissing(c, h.db.Session(), orgID, repoID) {
+				return
+			}
 			log.Printf("[ListDirectory] Permission denied: user %q does not have access to library %q", userID, repoID)
 			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have access to this library"})
 			return
@@ -1523,6 +1526,9 @@ func (h *FileHandler) GetFileInfo(c *gin.Context) {
 			return
 		}
 		if !hasAccess {
+			if respondIfLibraryMissing(c, h.db.Session(), orgID, repoID) {
+				return
+			}
 			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have access to this library"})
 			return
 		}
@@ -1647,6 +1653,9 @@ func (h *FileHandler) GetFileDetail(c *gin.Context) {
 			return
 		}
 		if !hasAccess {
+			if respondIfLibraryMissing(c, h.db.Session(), orgID, repoID) {
+				return
+			}
 			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have access to this library"})
 			return
 		}
@@ -1750,6 +1759,9 @@ func (h *FileHandler) GetDirDetail(c *gin.Context) {
 			return
 		}
 		if !hasAccess {
+			if respondIfLibraryMissing(c, h.db.Session(), orgID, repoID) {
+				return
+			}
 			c.JSON(http.StatusForbidden, gin.H{"error_msg": "you do not have access to this library"})
 			return
 		}
@@ -3414,6 +3426,9 @@ func (h *FileHandler) ListDirectoryV21(c *gin.Context) {
 		}
 
 		if !hasAccess {
+			if respondIfLibraryMissing(c, h.db.Session(), orgID, repoID) {
+				return
+			}
 			log.Printf("[ListDirectoryV21] Permission denied: user %q does not have access to library %q", userID, repoID)
 			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have access to this library"})
 			return

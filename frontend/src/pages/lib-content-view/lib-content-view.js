@@ -69,6 +69,7 @@ class LibContentView extends React.Component {
       isAllDirentSelected: false,
       dirID: '',  // for update dir list
       errorMsg: '',
+      canLeaveShare: false, // only a 403 on a shared library is leave-able; a 404 means the library doesn't exist
       isDirentDetailShow: false,
       direntDetailPanelTab: '',
       updateDetail: false,
@@ -177,7 +178,8 @@ class LibContentView extends React.Component {
         if (error.response.status === 403) {
           this.setState({
             isDirentListLoading: false,
-            errorMsg: gettext('Permission denied')
+            errorMsg: gettext('Permission denied'),
+            canLeaveShare: true
           });
 
           let errorMsg = gettext('Permission denied');
@@ -185,7 +187,7 @@ class LibContentView extends React.Component {
         } else if (error.response.status === 404) {
           this.setState({
             isDirentListLoading: false,
-            errorMsg: gettext('Library share permission not found.')
+            errorMsg: gettext('Library does not exist.')
           });
         } else {
           this.setState({
@@ -2127,7 +2129,9 @@ class LibContentView extends React.Component {
       return (
         <Fragment>
           <p className="error mt-6 text-center">{this.state.errorMsg}</p>
-          <button type="submit" className="btn btn-primary submit" onClick={this.handleSubmit}>{gettext('Leave Share')}</button>
+          {this.state.canLeaveShare &&
+            <button type="submit" className="btn btn-primary submit" onClick={this.handleSubmit}>{gettext('Leave Share')}</button>
+          }
         </Fragment>
       );
     }

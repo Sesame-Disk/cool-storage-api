@@ -34,3 +34,18 @@ func wrapLiveLibraryStateError(err error) error {
 
 	return fmt.Errorf("failed to check library state: %w", err)
 }
+
+// respondIfLibraryMissing disambiguates a denied library access. Permission
+// lookups collapse "library does not exist" and "caller lacks access" into the
+// same negative result; calling this in the access-denied branch lets a missing
+// or soft-deleted library surface as 404 (or 500 on lookup error) instead of a
+// misleading 403. It returns true when it has written a response and the caller
+// should return; false when the library is live and the caller should emit its
+// own 403. Cost is paid only on the (rare) denied path, never on the happy path.
+func respondIfLibraryMissing(c *gin.Context, session *gocql.Session, orgID, repoID string) bool {
+	if _, err := readLiveLibraryStateFn(session, orgID, repoID); err != nil {
+		writeLiveLibraryStateError(c, err)
+		return true
+	}
+	return false
+}

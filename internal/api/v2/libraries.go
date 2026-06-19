@@ -778,6 +778,12 @@ func (h *LibraryHandler) GetLibrary(c *gin.Context) {
 	}
 
 	if userPermission == middleware.PermissionNone {
+		// GetLibraryPermission returns PermissionNone for both "library missing" and
+		// "no access"; a missing/soft-deleted library must surface as 404, otherwise
+		// the frontend renders a misleading "Permission denied / Leave Share" screen.
+		if respondIfLibraryMissing(c, h.db.Session(), orgID, repoID) {
+			return
+		}
 		log.Printf("[GetLibrary] Permission denied: user %q does not have access to library %q", userID, repoID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have access to this library"})
 		return
@@ -1384,6 +1390,12 @@ func (h *LibraryHandler) GetLibraryV21(c *gin.Context) {
 	}
 
 	if userPermission == middleware.PermissionNone {
+		// GetLibraryPermission returns PermissionNone for both "library missing" and
+		// "no access"; a missing/soft-deleted library must surface as 404, otherwise
+		// the frontend renders a misleading "Permission denied / Leave Share" screen.
+		if respondIfLibraryMissing(c, h.db.Session(), orgID, repoID) {
+			return
+		}
 		log.Printf("[GetLibraryV21] Permission denied: user %q does not have access to library %q", userID, repoID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have access to this library"})
 		return
