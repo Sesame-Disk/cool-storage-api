@@ -50,22 +50,26 @@ class UploadProgressDialog extends React.Component {
     };
     this.contentRef = React.createRef();
     this.activeUploadRowRef = React.createRef();
+    this.lastActiveUploadId = this.getActiveUploadId(props.uploadFileList);
   }
 
   componentDidMount() {
     this.scrollActiveUploadIntoView();
   }
 
-  componentDidUpdate(prevProps, prevState) {
-    // Only auto-scroll when the file actually being uploaded changes or when the
-    // dialog is restored from minimized. onFileProgress rebuilds uploadFileList
-    // on every chunk tick, so reacting to the array reference here would re-pin
-    // the scroll to the active row continuously and fight the user's own scroll.
-    const activeIdChanged = this.getActiveUploadId(prevProps.uploadFileList) !== this.getActiveUploadId(this.props.uploadFileList);
+  componentDidUpdate(_prevProps, prevState) {
+    // FileUploader mutates the file objects in-place before building the next
+    // array, so prevProps.uploadFileList is not a reliable snapshot: by the time
+    // we reach componentDidUpdate it can already reflect the NEW active file.
+    // Track the previously highlighted id on the instance instead so advancing
+    // from file N to file N+1 still triggers the scroll.
+    const currentActiveUploadId = this.getActiveUploadId(this.props.uploadFileList);
+    const activeIdChanged = this.lastActiveUploadId !== currentActiveUploadId;
     const restoredFromMinimized = prevState.isMinimized && !this.state.isMinimized;
     if (activeIdChanged || restoredFromMinimized) {
       this.scrollActiveUploadIntoView();
     }
+    this.lastActiveUploadId = currentActiveUploadId;
   }
 
   getActiveUploadId = (uploadFileList) => {
@@ -221,4 +225,3 @@ class UploadProgressDialog extends React.Component {
 UploadProgressDialog.propTypes = propTypes;
 
 export default UploadProgressDialog;
-

@@ -58,6 +58,7 @@ describe('UploadProgressDialog auto-scroll gating', () => {
 
   test('does not auto-scroll when the active file is unchanged across a list rebuild', () => {
     const dialog = buildDialog();
+    dialog.lastActiveUploadId = 'f1';
     const prevList = [transferring('f1'), waiting('f2')];
     // onFileProgress rebuilds the array on every chunk tick with fresh refs but
     // the same active file id.
@@ -78,6 +79,28 @@ describe('UploadProgressDialog auto-scroll gating', () => {
     const prevList = [transferring('f1'), waiting('f2')];
     // f1 moved into "Saving..." and f2 started transferring bytes.
     const nextList = [saving('f1'), transferring('f2')];
+
+    runUpdate(dialog, {
+      nextList,
+      nextState: { isMinimized: false },
+      prevList,
+      prevState: { isMinimized: false },
+    });
+
+    expect(dialog.scrollActiveUploadIntoView).toHaveBeenCalledTimes(1);
+  });
+
+  test('auto-scrolls when FileUploader reuses the same mutated file objects', () => {
+    const dialog = buildDialog();
+    dialog.lastActiveUploadId = 'f1';
+    const f1 = transferring('f1');
+    const f2 = waiting('f2');
+    const prevList = [f1, f2];
+
+    f1.isFinalizing = true;
+    f2.isUploading = () => true;
+    f2.remainingTime = 5;
+    const nextList = [f1, f2];
 
     runUpdate(dialog, {
       nextList,
