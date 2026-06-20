@@ -57,9 +57,11 @@ type supportedLocale struct {
 	Name string
 }
 
-// supportedLocales is the single source of truth for the bootstrap language list and
-// the current-language label. Keep it in sync with the frontend i18n whitelist
-// (['en','zh-CN','fr','de','cs','es','es-AR','es-MX','ru']).
+// supportedLocales drives the bootstrap language list and the current-language
+// label. The canonical source is shared with the frontend in
+// frontend/src/utils/supported-locales.json; this slice mirrors it and the mirror
+// is drift-guarded by TestSupportedLocalesMatchCanonicalJSON. Update the JSON and
+// this slice together (the test fails otherwise).
 var supportedLocales = []supportedLocale{
 	{Code: "en", Name: "English"},
 	{Code: "zh-CN", Name: "中文"},

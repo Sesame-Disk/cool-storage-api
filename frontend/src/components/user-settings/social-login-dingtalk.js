@@ -1,5 +1,6 @@
 import React from 'react';
 import { gettext } from '../../utils/constants';
+import { isChineseLocale } from '../../utils/locale-utils';
 import ModalPortal from '../modal-portal';
 import ConfirmDisconnectDingtalk from '../dialog/confirm-disconnect-dingtalk';
 import { getSettingsPageOptions, getSettingsRoute } from './page-options';
@@ -41,7 +42,7 @@ class SocialLoginDintalk extends React.Component {
       <React.Fragment>
         <div className="setting-item" id="social-auth">
           <h3 className="setting-item-heading">{gettext('Social Login')}</h3>
-          <p className="mb-2">{langCode === 'zh-cn' ? '钉钉' : 'Dingtalk'}</p>
+          <p className="mb-2">{isChineseLocale(langCode) ? '\u9489\u9489' : 'Dingtalk'}</p>
           {socialConnectedDingtalk ?
             <button className="btn btn-outline-primary" onClick={this.confirmDisconnect}>{gettext('Disconnect')}</button> :
             <a href={connectUrl} className="btn btn-outline-primary">{gettext('Connect')}</a>

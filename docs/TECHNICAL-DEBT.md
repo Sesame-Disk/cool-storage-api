@@ -1823,4 +1823,40 @@ same future GC pass over abandoned owners could reconcile these earlier.
 
 ---
 
-*Last updated: 2026-06-01*
+## 20. UI Translation: `window.gettext` Is an Identity Stub (2026-06-20)
+
+### Status
+🔴 Known gap. The `fix/language-selector-locales` branch wires the language selector
+end-to-end (cookie persistence, `/i18n/` backend handler, `currentLang`/`langCode`
+resolution, i18next + `moment` locale switching) and consolidates the locale set into a
+single source of truth (`frontend/src/utils/supported-locales.json`, drift-guarded by
+`TestSupportedLocalesMatchCanonicalJSON`). **Full UI translation is intentionally NOT in
+this branch** to keep it small.
+
+### Problem
+The SPA's primary i18n is `window.gettext(...)`, used by ~387 source files. After the
+frontend/backend separation, the Django `jsi18n` catalog that populated it was dropped and
+replaced by an identity stub (`window.gettext = (message) => message` in
+`runtime-bootstrap.js`). No translation catalog exists in the repo and no backend endpoint
+serves one, so `gettext()` returns the English source string unchanged. i18next — what the
+selector actually drives — is used by 0 application files directly (only the bundled editors).
+
+Result: switching language localizes the embedded editors and date/calendar formatting plus a
+few hard-coded labels; the rest of the UI stays English.
+
+### Plan
+1. Extract `gettext()`/`ngettext()` strings into a `.po` template, one catalog per locale in
+   `supported-locales.json`.
+2. Produce the translations (missing data).
+3. Serve catalogs (endpoint `GET /api/v2.1/i18n/catalog/?lang=<code>` or static per-locale JSON),
+   keyed off the existing `lang` cookie.
+4. Have `loadBootstrap` install a real `window.gettext`/`ngettext` from the active catalog before
+   the app bundle renders (mirrors how `config.lang` is already set pre-render).
+
+Phasing: loader-only (steps 3–4 with placeholder catalogs) first, translation data (steps 1–2)
+later. Full design: `docs/I18N-UI-TRANSLATION-GAP-20260620.md`. Tracked as ISSUE-I18N-UI-01 in
+`docs/KNOWN_ISSUES.md`.
+
+---
+
+*Last updated: 2026-06-20*

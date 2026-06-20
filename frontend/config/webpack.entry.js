@@ -28,7 +28,6 @@ const entryFiles = {
   sharedFileViewSpreadsheet: '/shared-file-view-spreadsheet-entry.js',
   sharedFileViewSdoc: '/shared-file-view-sdoc-entry.js',
   sharedFileViewUnknown: '/shared-file-view-unknown-entry.js',
-  settings: '/settings.js',
   orgAdmin: '/pages/org-admin/bootstrap-entry.js',
   sysAdmin: '/pages/sys-admin/bootstrap-entry.js',
   search: '/pages/search',

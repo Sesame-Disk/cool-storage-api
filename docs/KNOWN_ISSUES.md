@@ -36,6 +36,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Desktop SSO Browser UX** | ✅ Fixed (2026-03-04) | After browser SSO login for desktop client, now shows confirmation page with auto-close. See ISSUE-SSO-01 below. |
 | **Desktop Sync Active-Active Conflict Recovery** | 🟡 Follow-up coverage debt | `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation, CAS, ancestry-gated auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. The real desktop-client harness now proves both the non-overlapping auto-merge race and the same-path unsafe-conflict `503` preservation path. The remaining gap is broader end-to-end scenario coverage. See ISSUE-SYNC-HEAD-RECOVERY-01 below. |
 | **Upload "Don't Replace" (Desktop Client)** | ✅ Fixed (2026-05-22) | `upload-link` now defaults to autorename/no-replace, `update-link` defaults to overwrite, and the token policy is persisted in Cassandra for multi-node safety. See ISSUE-UPLOAD-REPLACE-01 below. |
+| **UI Translation (`window.gettext`)** | 🔴 Known gap | The language selector is wired end-to-end (cookie, `/i18n/`, i18next + dates switch), but `window.gettext` is an identity stub and there is no translation catalog, so the ~387 files that translate via `gettext()` stay English. Switching language only localizes the embedded editors and date formatting. See ISSUE-I18N-UI-01 below and `docs/I18N-UI-TRANSLATION-GAP-20260620.md`. |
 | **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
 | **File Statistics Pages Are Still Stubbed** | 🟡 Pending | `/sys/statistics/file/` currently returns all-zero series and `/org/statistics-admin/file/` is still unimplemented. Real data depends on new `file_update_logs` and `file_access_logs` tables, not on `login_logs`. See ISSUE-FILE-STATS-01 below. |
@@ -136,6 +137,45 @@ The page is now trustworthy for the main operational KPIs, but it still exposes 
 
 - `docs/DASHBOARD-REDESIGN-PLAN.md`
 - `docs/ADMIN-DASHBOARD-WIREFRAMES.md`
+
+---
+
+### ISSUE-I18N-UI-01: `window.gettext` Is an Identity Stub — Main UI Does Not Translate
+
+**Status**: 🔴 Known gap (2026-06-20) — intentionally not fixed in `fix/language-selector-locales`
+**Severity**: High for non-English deployments — selector works, but most of the UI stays English
+**Affected**: The entire `gettext()`-based SPA chrome, dialogs, settings, admin/org-admin panels
+
+#### Problem
+
+The frontend has two translation systems and only the minor one is wired:
+
+- **`window.gettext(...)`** is the primary mechanism (387 source files import it). After the
+  frontend/backend separation, the Django `jsi18n` catalog that used to populate it was dropped
+  and replaced by an identity stub in `runtime-bootstrap.js`
+  (`window.gettext = (message) => message`). There is no translation catalog in the repo and no
+  backend endpoint that serves one, so every `gettext('X')` returns `'X'` (English) unchanged.
+- **i18next** (`t()`/`useTranslation`) is used by 0 application files directly — only internally by
+  the bundled `@seafile/seafile-editor` / sdoc-editor components. This is what the language
+  selector, `locale-utils`, and the i18n whitelist actually drive.
+
+Net effect: switching language localizes the embedded editors and date/calendar formatting, plus a
+few hard-coded labels, but the bulk of the application UI remains in English.
+
+#### Working
+
+- Language selector end-to-end (cookie persistence, `/i18n/` handler, `currentLang`/`langCode`).
+- Editor (markdown/sdoc) and `moment`/calendar localization.
+- Single source of truth for the locale set (`frontend/src/utils/supported-locales.json`,
+  drift-guarded against the Go backend).
+
+#### Remaining Work
+
+Real UI translation needs new infrastructure **and** translation data that does not exist yet:
+string extraction → per-locale catalogs → translation content → a catalog endpoint/asset → a real
+`window.gettext`/`ngettext` installed by bootstrap before render. See
+`docs/I18N-UI-TRANSLATION-GAP-20260620.md` for the full design and suggested phasing
+(loader-only first, data later). Tracked as tech debt in TECHNICAL-DEBT.md §20.
 
 ---
 

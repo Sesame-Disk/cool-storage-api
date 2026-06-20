@@ -80,6 +80,23 @@ Language selection now works front to back:
    i18n init picks it up.
 5. **nginx** — `frontend/nginx.conf` proxies `/i18n/` to the backend (not the SPA).
 
+### Single source of truth for the locale set
+
+`frontend/src/utils/supported-locales.json` is the canonical list (code + display name).
+`locale-utils.js` derives `SUPPORTED_UI_LOCALES` and the alias map from it; the Go backend
+mirrors it in `internal/api/bootstrap.go` (`supportedLocales`) and the mirror is drift-guarded
+by `TestSupportedLocalesMatchCanonicalJSON` (fails if codes/names/order diverge). Add a language
+in the JSON + the Go slice together.
+
+### 🔴 IMPORTANT — most of the UI still does NOT translate
+
+This branch makes the selector and locale plumbing work, but **switching language only localizes
+the embedded editors and date/calendar formatting**, not the bulk of the SPA. The primary UI i18n
+is `window.gettext(...)` (~387 files), which is currently an **identity stub** with no translation
+catalog behind it. This is a separate, larger gap tracked as **ISSUE-I18N-UI-01** — see
+`docs/I18N-UI-TRANSLATION-GAP-20260620.md` and TECHNICAL-DEBT.md §20. Do not read "language
+switching fixed" as "UI is translated".
+
 ### ⚠️ Persistence: cookie only — NOT stored in the DB per user
 
 The selected language is persisted **exclusively in the `lang` browser cookie**. There is

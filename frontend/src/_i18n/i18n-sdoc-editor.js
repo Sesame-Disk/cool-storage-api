@@ -3,8 +3,9 @@ import Backend from 'i18next-http-backend';
 import LanguageDetector from 'i18next-browser-languagedetector';
 import { initReactI18next } from 'react-i18next';
 import { mediaUrl } from '../utils/constants';
+import { ensureSupportedLocale, firstValue, resolveSdocEditorLocaleAsset, SUPPORTED_UI_LOCALES } from '../utils/locale-utils';
 
-const { lang = 'en' } = window.app.config;
+const lang = ensureSupportedLocale(window.app?.config?.lang);
 
 i18n
   .use(Backend)
@@ -16,19 +17,21 @@ i18n
     ns: ['sdoc-editor'],
     defaultNS: 'sdoc-editor',
 
-    whitelist: ['en', 'zh-CN', 'fr', 'de', 'cs', 'es', 'es-AR', 'es-MX', 'ru'],
+    whitelist: SUPPORTED_UI_LOCALES,
 
     backend: {
-      loadPath: mediaUrl + 'sdoc-editor/locales/{{ lng }}/{{ ns }}.json',
-      // loadPath: '/media/locales/{{lng}}/{{ns}}.json',
+      loadPath: (languages, namespaces) => {
+        const locale = resolveSdocEditorLocaleAsset(firstValue(languages));
+        const namespace = firstValue(namespaces);
+        return mediaUrl + 'sdoc-editor/locales/' + locale + '/' + namespace + '.json';
+      },
     },
 
-    debug: false, // console log if debug: true
+    debug: false,
 
     interpolation: {
-      escapeValue: false, // not needed for react!!
+      escapeValue: false,
     },
-
 
     load: 'currentOnly',
 

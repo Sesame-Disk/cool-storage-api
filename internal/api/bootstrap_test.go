@@ -1,14 +1,45 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/gin-gonic/gin"
 )
+
+// TestSupportedLocalesMatchCanonicalJSON guards the single source of truth shared
+// with the frontend: internal/api supportedLocales must mirror
+// frontend/src/utils/supported-locales.json exactly (codes, names and order). If
+// they drift, the selector and the i18n whitelist disagree about what can load.
+func TestSupportedLocalesMatchCanonicalJSON(t *testing.T) {
+	path := filepath.Join("..", "..", "frontend", "src", "utils", "supported-locales.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("canonical locale file not available (%v); skipping drift guard", err)
+	}
+
+	var canonical []supportedLocale
+	if err := json.Unmarshal(raw, &canonical); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+
+	if len(canonical) != len(supportedLocales) {
+		t.Fatalf("canonical JSON has %d locales, backend has %d — they must match", len(canonical), len(supportedLocales))
+	}
+	for i, want := range canonical {
+		got := supportedLocales[i]
+		if got.Code != want.Code || got.Name != want.Name {
+			t.Fatalf("locale[%d] = {%q,%q}, canonical JSON has {%q,%q} — sync internal/api/bootstrap.go with supported-locales.json",
+				i, got.Code, got.Name, want.Code, want.Name)
+		}
+	}
+}
 
 func TestBuildAppBootstrapPageOptionsIncludesSettingsBasics(t *testing.T) {
 	s := createTestServer()

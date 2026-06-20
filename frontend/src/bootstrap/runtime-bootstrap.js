@@ -1,5 +1,6 @@
 import React from 'react';
 import { getLoginURL } from '../utils/auth-state';
+import { ensureSupportedLocale } from '../utils/locale-utils';
 import { syncSesameAiWidget } from './sesame-ai-widget';
 
 function getDefaultAppConfig() {
@@ -237,6 +238,7 @@ function ensureBootstrapGlobals(scope) {
         ...(window.app.config || {}),
         ...(typeof window.SESAMEFS_CONFIG === 'object' ? window.SESAMEFS_CONFIG : {}),
     };
+    window.app.config.lang = ensureSupportedLocale(window.app.config.lang);
     window.app.pageOptions = { ...getAppPageOptionDefaults(scope), ...(window.app.pageOptions || {}) };
     window.org = window.org || {};
     window.org.pageOptions = { ...ORG_PAGE_OPTION_DEFAULTS, ...(window.org.pageOptions || {}) };
@@ -271,7 +273,7 @@ export async function loadBootstrap(scope = 'app') {
             // (which snapshots config.lang), so this assignment is observed by i18n init.
             const langCode = data.app_page_options.langCode;
             if (langCode) {
-                window.app.config.lang = langCode;
+                window.app.config.lang = ensureSupportedLocale(langCode);
             }
         }
 
