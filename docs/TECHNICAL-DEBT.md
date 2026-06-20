@@ -1859,4 +1859,49 @@ later. Full design: `docs/I18N-UI-TRANSLATION-GAP-20260620.md`. Tracked as ISSUE
 
 ---
 
+## 21. Cookie `Secure` Flag Dropped Behind TLS-Terminating Proxy (2026-06-20)
+
+### Status
+🟡 Security debt, cross-cutting. Surfaced while reviewing the `lang` cookie added in
+`fix/language-selector-locales`, but it affects all server-set cookies — including the
+higher-stakes `sesamefs_auth` session cookie.
+
+### Problem
+Cookie-setting handlers compute the `Secure` attribute from `c.Request.TLS != nil`:
+
+- `handleLanguageChange` — `lang` cookie (`internal/api/bootstrap.go`)
+- session login — `sesamefs_auth` (`internal/api/server.go`, ~L2162)
+- logout clear — `sesamefs_auth` (`internal/api/server.go`, ~L2197)
+
+In production nginx terminates TLS and proxies to Go over plain HTTP, so `c.Request.TLS` is
+`nil` and **no cookie ever receives the `Secure` attribute**, even though the browser↔nginx leg
+is HTTPS. The cookies can then be sent over a plain-HTTP request (downgrade exposure). This is
+most significant for `sesamefs_auth`; the `lang` cookie is a non-sensitive UI preference.
+
+The code is also internally inconsistent: scheme detection elsewhere already trusts the proxy's
+forwarded header (`server.go` uses `c.GetHeader("X-Forwarded-Proto")`), but the cookie code does
+not.
+
+### Fix
+Add a shared helper and use it at every `SetCookie` call site:
+
+```go
+func cookieIsSecure(c *gin.Context) bool {
+    if c.Request.TLS != nil {
+        return true
+    }
+    return strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+}
+```
+
+`X-Forwarded-Proto` is already set by the frontend nginx (`proxy_set_header X-Forwarded-Proto
+$proxy_x_forwarded_proto`), so this is correct for the real deployment. Keep dev/HTTP and
+localhost working (helper returns false there, matching today's behavior). Trusting the header is
+safe only because the app sits behind a trusted proxy that overwrites it — document that
+assumption alongside the helper.
+
+Cross-referenced from `docs/BUG-LANGUAGE-LIST-ENGLISH-ONLY-20260618.md` (Known limitations §2).
+
+---
+
 *Last updated: 2026-06-20*
