@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -37,6 +38,14 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
+
+var checkSeafHTTPFileLockedByOther = func(h *SeafHTTPHandler, repoID, filePath, userID string) (bool, string, error) {
+	if h == nil || h.db == nil {
+		return false, "", nil
+	}
+	normalizedPath := path.Clean("/" + strings.TrimPrefix(filePath, "/"))
+	return db.FileLockedByOther(h.db.Session(), repoID, normalizedPath, userID)
+}
 
 // TokenType represents the type of access token
 type TokenType string
@@ -325,11 +334,11 @@ type finalizeOutcome struct {
 type finalizeClaim int
 
 const (
-	// finalizeClaimIncomplete: not all bytes are present yet — return an ack.
+	// finalizeClaimIncomplete: not all bytes are present yet â€” return an ack.
 	finalizeClaimIncomplete finalizeClaim = iota
 	// finalizeClaimWinner: this request must run finalization and publish it.
 	finalizeClaimWinner
-	// finalizeClaimWaiter: another request is finalizing — wait for its result.
+	// finalizeClaimWaiter: another request is finalizing â€” wait for its result.
 	finalizeClaimWaiter
 )
 
@@ -385,7 +394,7 @@ type ChunkManager struct {
 	mu       sync.RWMutex
 	tempDir  string
 
-	// Janitor/cache config — overridable in tests.
+	// Janitor/cache config â€” overridable in tests.
 	janitorInterval time.Duration
 	trackerTTL      time.Duration
 	diskTTL         time.Duration
@@ -417,7 +426,7 @@ func NewChunkManager() *ChunkManager {
 
 // chunkFinalizeOutcomeKey identifies a specific upload for the finalize-outcome
 // cache. It is keyed by the resumable upload identifier (unique per file per
-// upload session — it encodes the relative path, so two folder files sharing a
+// upload session â€” it encodes the relative path, so two folder files sharing a
 // basename never collide, and a brand-new upload of the same name/path always
 // gets a fresh identifier). parentDir + filename are folded in for defense.
 // Callers must only use the cache when identifier is non-empty; an empty
@@ -692,7 +701,7 @@ func (cm *ChunkManager) GetUpload(token, filename string) *ChunkUpload {
 
 // janitorLoop periodically reaps stale chunk uploads from memory and disk.
 func (cm *ChunkManager) janitorLoop() {
-	// First sweep runs one interval in — avoids a burst at process start
+	// First sweep runs one interval in â€” avoids a burst at process start
 	// when stats aren't warmed up yet.
 	ticker := time.NewTicker(cm.janitorInterval)
 	defer ticker.Stop()
@@ -713,7 +722,7 @@ func (cm *ChunkManager) sweepOnce() {
 	trackerCutoff := now.Add(-cm.trackerTTL)
 	diskCutoff := now.Add(-cm.diskTTL)
 
-	// (1) In-memory sweep — collect, release lock, then Cleanup() outside the
+	// (1) In-memory sweep â€” collect, release lock, then Cleanup() outside the
 	// write lock to avoid holding cm.mu during file I/O.
 	cm.mu.Lock()
 	var stale []*ChunkUpload
@@ -747,7 +756,7 @@ func (cm *ChunkManager) sweepOnce() {
 		metrics.ChunkUploadTempOrphansCleaned.WithLabelValues("tracker").Inc()
 	}
 
-	// (2) Disk sweep — files that were never (or are no longer) in the map.
+	// (2) Disk sweep â€” files that were never (or are no longer) in the map.
 	entries, err := os.ReadDir(cm.tempDir)
 	if err != nil {
 		log.Printf("[ChunkManager] Janitor: failed to read tempDir %s: %v", cm.tempDir, err)
@@ -862,7 +871,7 @@ func (cu *ChunkUpload) publishFinalizeOutcomeLocked(outcome *finalizeOutcome) {
 	}
 	select {
 	case <-cu.finalizeDone:
-		// Already published once — do not overwrite or double-close.
+		// Already published once â€” do not overwrite or double-close.
 		return
 	default:
 	}
@@ -1457,7 +1466,7 @@ const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
 // during finalization of a chunked upload. The reader is sequential (one block
 // at a time from the temp file); only the per-block work (encrypt + S3 PUT +
 // Cassandra writes) runs concurrently. 8 keeps memory bounded
-// (≤ 8 × uploadBlockSize ≈ 64 MB extra) while cutting wall-clock by ~6–8× on
+// (â‰¤ 8 Ã— uploadBlockSize â‰ˆ 64 MB extra) while cutting wall-clock by ~6â€“8Ã— on
 // typical S3 latency.
 const finalizeUploadConcurrency = 8
 
@@ -1700,7 +1709,7 @@ func checkSeafHTTPUploadFinalizeContext(ctx context.Context, repoID, phase strin
 
 // HandleUpload handles file uploads via the upload token.
 // Supports both single-shot uploads and chunked/resumable uploads (via Content-Range header).
-// Large files are split into blocks and streamed to S3 — never fully loaded into RAM.
+// Large files are split into blocks and streamed to S3 â€” never fully loaded into RAM.
 func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	tokenStr := c.Param("token")
 
@@ -1762,7 +1771,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 
-	// Traffic quota pre-check — evaluated before reading the body so we can
+	// Traffic quota pre-check â€” evaluated before reading the body so we can
 	// fail fast. For chunked uploads, use the declared total from Content-Range
 	// so the pre-check matches the eventual upload size. Storage quota is checked
 	// later with the visible tree delta, after filename/replace/chunk-total are known.
@@ -1820,7 +1829,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	if relativePath != "" {
 		if strings.HasSuffix(relativePath, "/") {
 			dirName := strings.TrimSuffix(relativePath, "/")
-			dirBaseName := filepath.Base(dirName)
+			dirBaseName := path.Base(dirName)
 
 			if filename == dirBaseName || filename == relativePath || filename == "" {
 				log.Printf("[HandleUpload] Skipping directory marker: %s (filename=%s)", relativePath, filename)
@@ -1833,25 +1842,41 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			}
 
 			log.Printf("[HandleUpload] File in directory: relativePath=%s, filename=%s", relativePath, filename)
-			parentDir = filepath.Join(parentDir, dirName)
+			parentDir = path.Join(parentDir, dirName)
 		} else {
-			relDir := filepath.Dir(relativePath)
+			relDir := path.Dir(relativePath)
 			if relDir != "." && relDir != "" {
-				parentDir = filepath.Join(parentDir, relDir)
+				parentDir = path.Join(parentDir, relDir)
 			}
-			filename = filepath.Base(relativePath)
+			filename = path.Base(relativePath)
 		}
 	}
 
 	if !strings.HasPrefix(parentDir, "/") {
 		parentDir = "/" + parentDir
 	}
-	parentDir = filepath.Clean(parentDir)
+	parentDir = path.Clean(parentDir)
 
 	log.Printf("[HandleUpload] relativePath=%s, parentDir=%s, filename=%s", relativePath, parentDir, filename)
 
-	filePath := filepath.Join(parentDir, filename)
+	filePath := path.Join(parentDir, filename)
 	storageKey := fmt.Sprintf("%s/%s%s", token.OrgID, token.RepoID, filePath)
+
+	// LOCK ENFORCEMENT: overwriting a file locked by another user is forbidden.
+	// Only the overwrite path can clobber the locked file; an autorename upload
+	// creates a new name and leaves the locked file untouched.
+	if replaceFile {
+		blocked, ownerID, err := checkSeafHTTPFileLockedByOther(h, token.RepoID, filePath, token.UserID)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to verify file lock"})
+			return
+		}
+		if blocked {
+			log.Printf("[HandleUpload] Rejecting overwrite of file %q locked by %s (uploader %s)", filePath, ownerID, token.UserID)
+			c.JSON(http.StatusForbidden, gin.H{"error": "file is locked by another user", "lock_owner": ownerID})
+			return
+		}
+	}
 
 	log.Printf("[HandleUpload] Token=%s, File=%s, ContentRange=%s, isChunked=%v",
 		tokenStr, filename, contentRange, isChunked)
@@ -1862,7 +1887,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		chunkedMaxUploadBytes := configuredChunkedMaxUploadBytes(h.config)
 		chunkedStagingMaxBytes := configuredChunkedStagingMaxBytes(h.config)
 
-		// A finalize result cached for this upload means it already completed —
+		// A finalize result cached for this upload means it already completed â€”
 		// this is a late retry of whichever chunk carried the finalize (the
 		// winner published and the tracker was already cleaned up). Answer with
 		// the real file id so the client builds the dirent instead of failing
@@ -1870,7 +1895,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		//
 		// We must NOT gate this on end == total-1: with simultaneous_uploads > 1
 		// chunks arrive out of order, so the chunk that completes contiguity (and
-		// runs finalization) is arbitrary — frequently NOT the final-offset chunk.
+		// runs finalization) is arbitrary â€” frequently NOT the final-offset chunk.
 		// Gating on the final offset re-broke exactly this case. The cache key is
 		// the per-upload resumable identifier, so any matching request is by
 		// definition a retry of this already-finalized upload and safe to answer.
@@ -1941,11 +1966,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		claim, finalizeDone := upload.ClaimFinalization()
 		if claim == finalizeClaimIncomplete {
 			// Out-of-order chunks routinely arrive while the upload is still
-			// incomplete — normal under concurrency, and it must stay a 200 ack so
+			// incomplete â€” normal under concurrency, and it must stay a 200 ack so
 			// the client keeps sending the remaining chunks. The healthy case has
 			// its gap near the END (a middle/late chunk still in flight). But a gap
-			// that starts at byte 0 — the prefix is still missing even though the
-			// final byte has arrived — is the suspicious shape we saw when chunks
+			// that starts at byte 0 â€” the prefix is still missing even though the
+			// final byte has arrived â€” is the suspicious shape we saw when chunks
 			// were split across trackers after a token change. It can still be
 			// transient under reordering, so keep the log explicitly diagnostic-only.
 			if end >= total-1 {
@@ -1961,7 +1986,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 
 		if claim == finalizeClaimWaiter {
-			// Another in-flight request owns finalization for this exact upload —
+			// Another in-flight request owns finalization for this exact upload â€”
 			// typically a resumable retry of the final chunk after the original
 			// finalize response was lost on the wire. Block on the shared result
 			// and return it, so the client gets real file metadata instead of a
@@ -1986,7 +2011,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			return
 		}
 
-		// claim == finalizeClaimWinner — this request owns finalization.
+		// claim == finalizeClaimWinner â€” this request owns finalization.
 		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming): file=%s identifier=%q", filename, uploadIdentifier)
 		if uploadIdentifier == "" {
 			// Without an identifier the finalize-outcome cache is disabled, so a
@@ -2023,7 +2048,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s, cached=%t", actualFilename, total, fileID[:16], uploadIdentifier != "")
 
-		// Record traffic and storage — fire-and-forget, never blocks the response.
+		// Record traffic and storage â€” fire-and-forget, never blocks the response.
 		if rec := traffic.Get(); rec != nil {
 			tt := traffic.WebUpload
 			if token.Source == "link" {
@@ -2190,7 +2215,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, finalSize, fileID[:16])
 
-	// Record traffic and storage — fire-and-forget, never blocks the response.
+	// Record traffic and storage â€” fire-and-forget, never blocks the response.
 	if rec := traffic.Get(); rec != nil {
 		tt := traffic.WebUpload
 		if token.Source == "link" {
@@ -2489,7 +2514,7 @@ func entrySize(entry map[string]interface{}) int64 {
 }
 
 // finalizeUploadStreaming processes a completed chunked upload by streaming from the temp file.
-// It reads the file in blocks, hashes and stores each block individually — O(blockSize) RAM.
+// It reads the file in blocks, hashes and stores each block individually â€” O(blockSize) RAM.
 func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessToken, upload *ChunkUpload, parentDir, filename, storageKey string, totalSize int64, replace bool) (string, string, int64, int64, error) {
 	ctx := context.Background()
 
@@ -2530,7 +2555,7 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 	eg, egCtx := errgroup.WithContext(ctx)
 	sem := make(chan struct{}, finalizeUploadConcurrency)
 
-	var blockSHA1IDs []string // SHA-1 block IDs for fs_object (Seafile compat) — populated in order
+	var blockSHA1IDs []string // SHA-1 block IDs for fs_object (Seafile compat) â€” populated in order
 
 readLoop:
 	for {
@@ -3405,7 +3430,7 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	}
 	defer reader.Close()
 
-	// Stream directly to response — never load full file into RAM
+	// Stream directly to response â€” never load full file into RAM
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Content-Type", "application/octet-stream")
 	c.Status(http.StatusOK)
@@ -3463,7 +3488,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		}
 	}
 
-	// Get head commit → root FS
+	// Get head commit â†’ root FS
 	var headCommit string
 	err = h.db.Session().Query(`
 		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
@@ -3523,7 +3548,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 
 // streamFileFromBlocks streams a file's blocks directly to the HTTP response.
 // Uses prefetching (overlap S3 fetch with HTTP write) and 4MB io.CopyBuffer
-// for maximum throughput. Only O(2 × block_size) RAM.
+// for maximum throughput. Only O(2 Ã— block_size) RAM.
 func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToken, filename string, periodStartedAt time.Time) error {
 	blockIDs, fileSize, fileKey, fileIV, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
 	if err != nil {
@@ -3553,12 +3578,12 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 		return fmt.Errorf("resolve block IDs: %w", err)
 	}
 
-	// Set headers before streaming — Content-Length lets clients show progress
+	// Set headers before streaming â€” Content-Length lets clients show progress
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Content-Type", "application/octet-stream")
 	if fileSize > 0 {
-		// fs_objects.size_bytes is always the plaintext byte count — even for
-		// encrypted libraries — so the emitted stream length equals fileSize
+		// fs_objects.size_bytes is always the plaintext byte count â€” even for
+		// encrypted libraries â€” so the emitted stream length equals fileSize
 		// after decryption. Exposing this header lets clients show progress.
 		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
 	}
@@ -3569,7 +3594,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 
 	log.Printf("[streamFileFromBlocks] Streaming complete: %d blocks", len(blockIDs))
 
-	// Record traffic — fire-and-forget, never blocks the response.
+	// Record traffic â€” fire-and-forget, never blocks the response.
 	if rec := traffic.Get(); rec != nil {
 		tt := traffic.WebDownload
 		if token.Source == "link" {
@@ -3734,7 +3759,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		return
 	}
 
-	// Quota pre-check — reject early if traffic quota is already exhausted.
+	// Quota pre-check â€” reject early if traffic quota is already exhausted.
 	zipTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
 		zipTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "download", 0)
@@ -3974,7 +3999,7 @@ func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, zw *zip.Writer, block
 }
 
 // addFileToZip streams a preflighted file's blocks into a ZIP archive entry.
-// Uses zip.Store (no compression) for maximum throughput — the data is already
+// Uses zip.Store (no compression) for maximum throughput â€” the data is already
 // compressed by S3/MinIO or is binary data where deflate adds CPU cost for minimal gain.
 // For encrypted files, one block at a time is loaded, decrypted, and written.
 func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, zw *zip.Writer, blockStore *storage.BlockStore, file zipPreparedFile, fileKey []byte, fileIV []byte) error {

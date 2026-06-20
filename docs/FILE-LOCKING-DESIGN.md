@@ -40,6 +40,26 @@ Extend `locked_files` (or add columns): `lock_type TEXT` (`manual` | `online_off
 Use `libraries.owner_id` to recognise the library owner (and any future admin role) as the principal allowed to **force-unlock** either lock type. The current `rw`/`r` split is not enough.
 
 ## Minimal implementation order
-1. Enforce lock ownership in `LockFile` (acquire-conflict + unlock-owner check). Flips the concurrency known-gap test.
-2. Enforce `manual` locks on the write paths (shared helper used by upload/update/move/rename/delete + seafhttp commit). Flips the `sesamefs-locks.spec.ts` known-gap test.
-3. Add `lock_type` + expiry; wire OnlyOffice open→lock and callback→unlock; allow co-editors; block sync writes. Requires an OnlyOffice document server to test end-to-end (the `sesamefs-locks.spec.ts` OnlyOffice case skips until one is configured).
+1. ✅ **DONE (2026-06-19).** Enforce lock ownership in `LockFile`, **atomically via LWT** (no check-then-write race): acquire is `INSERT … IF NOT EXISTS` (`db.AcquireFileLock`) — a different user gets `409`, the owner gets a refresh; unlock is `DELETE … IF locked_by = ?` (`db.ReleaseFileLock`) — a non-owner gets `403`, a missing lock is an idempotent `200`. This closes the multi-region race where two requests could both pass a read check and then upsert. Covered by `TestLockFile_ConflictReturns409`.
+2. ✅ **DONE (2026-06-19).** Enforce `manual` locks on the write paths via shared `db` helpers and injectable seams:
+   - `db.FileLockedByOther` (exact path) and `db.SubtreeLockedByOther` (path + descendants), both fail-closed (`ErrFileLockStatusUnavailable` → `503`) so an unverifiable lock never silently allows a write.
+   - **Exact-path** enforcement: single-shot upload overwrite (`UploadFile`), chunked/seafhttp overwrite (`HandleUpload`, gated on `replace`).
+   - **Subtree** enforcement (blocks acting on a folder that contains a file locked by another user): `RenameFile`, `DeleteFile`, `MoveFile`, `BatchDeleteItems`.
+   - **Batch move/copy via the `sync-/async-batch-*` endpoints and `/file/move`** is enforced in `BatchOperationHandler.processSingleItem`: a `move` checks the **source subtree**; a `replace` conflict policy checks the **destination** path.
+   - **The `/file/copy/` path does NOT go through `processSingleItem`** — `CopyFile` and `copyBatchFiles` call `copyItemWithinRepoWithRetry`, which enforces the **`replace` destination lock** directly (autorename/skip are exempt since they never overwrite).
+   - All of the above map to `403` (`ErrBatchItemLocked`) / `503` (`ErrBatchLockStatusUnavailable`). Covered by `TestProcessSingleItem_*`, `TestCopyItemWithinRepo_*`, and the `file_lock_enforcement_test.go` handler tests.
+2b. ✅ **DONE (2026-06-19).** Keep lock rows consistent when the **owner** restructures a locked path (the subtree pre-check guarantees any lock under the path is the operator's own):
+   - **Rename** → `db.RelocateLocksUnder` rewrites the operator's locks from the old path/prefix to the new one (`rewriteLockedPath`, unit-tested).
+   - **Delete / batch-delete** → `db.ClearLocksUnder` drops the operator's now-orphaned locks under the deleted path.
+   - **Move** (same-repo, via `processSingleItem`/`processSameRepoMove`) → clears the source locks (the destination name is autorename-dependent, so we clear rather than guess; the owner re-locks at the destination).
+   - All run **after** the FS commit succeeds and only touch `locked_files`; failures are logged, never failing the structural op.
+
+3. ⏳ **PENDING.** Add `lock_type` + expiry; wire OnlyOffice open→lock and callback→unlock; allow co-editors; block sync writes. Requires an OnlyOffice document server to test end-to-end (the `sesamefs-locks.spec.ts` OnlyOffice case skips until one is configured).
+
+## Known remaining debt (not blockers, tracked for follow-up)
+
+- **Move relocation across repos / autorename name** — same-repo move clears source locks rather than relocating to the exact (possibly autorenamed) destination; cross-repo move lock maintenance is not wired. Acceptable: no stale/phantom rows result, only a dropped own-lock.
+- **`SubtreeLockedByOther` / lock maintenance scan the whole per-repo lock partition** — fine while locks-per-repo stays low; revisit (secondary index or bounded scan) if a repo can accumulate many simultaneous locks, as folder rename/move/delete pay one scan each.
+- **Lock TTL/expiry** — locks are still permanent (no `expires_at`), so a crashed client can hold one until an owner/admin unlocks. Auto-expiry + `refresh-lock` are part of step 3.
+- **Public upload/update-link actor semantics** — a link upload acts as the token's owner, so it would pass an owner lock check. Decide whether link uploads should be treated as an external actor (subject to locks) before relying on locks against link writes.
+- **`RevertFile` / `RevertDirectory`** — these replace/restore content and are not yet lock-checked; review whether they need enforcement.

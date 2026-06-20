@@ -46,6 +46,73 @@ var formatSizeSeafile = httputil.FormatSizeSeafile
 // formatRelativeTimeHTML delegates to httputil.FormatRelativeTimeHTML.
 var formatRelativeTimeHTML = httputil.FormatRelativeTimeHTML
 
+var checkFileLockedByOther = func(h *FileHandler, repoID, filePath, userID string) (bool, string, error) {
+	if h == nil || h.db == nil {
+		return false, "", nil
+	}
+	return db.FileLockedByOther(h.db.Session(), repoID, normalizePath(filePath), userID)
+}
+
+// checkSubtreeLockedByOther reports whether the target path OR any descendant under it
+// is locked by another user. Used by directory-capable operations (rename/move/delete)
+// so a folder action cannot bypass a lock on a file inside it.
+var checkSubtreeLockedByOther = func(h *FileHandler, repoID, targetPath, userID string) (bool, string, error) {
+	if h == nil || h.db == nil {
+		return false, "", nil
+	}
+	return db.SubtreeLockedByOther(h.db.Session(), repoID, normalizePath(targetPath), userID)
+}
+
+// checkCopyReplaceDestLocked reports whether a "replace" copy's destination path or
+// any descendant beneath it is locked by another user. This blocks folder-replace
+// copies from clobbering a locked file inside the destination subtree. Injectable for tests.
+var checkCopyReplaceDestLocked = func(fsHelper *FSHelper, repoID, dstPath, userID string) (bool, string, error) {
+	if fsHelper == nil || fsHelper.db == nil {
+		return false, "", nil
+	}
+	return db.SubtreeLockedByOther(fsHelper.db.Session(), repoID, normalizePath(dstPath), userID)
+}
+
+// acquireFileLock atomically takes/refreshes a manual lock (LWT). Injectable for tests.
+var acquireFileLock = func(h *FileHandler, repoID, filePath, userID string, lockedAt time.Time) (db.LockAcquireResult, string, error) {
+	if h == nil || h.db == nil {
+		return db.LockAcquired, userID, nil
+	}
+	return db.AcquireFileLock(h.db.Session(), repoID, normalizePath(filePath), userID, lockedAt)
+}
+
+// releaseFileLock atomically releases a lock only if the requester holds it (LWT).
+// Injectable for tests.
+var releaseFileLock = func(h *FileHandler, repoID, filePath, userID string) (bool, string, error) {
+	if h == nil || h.db == nil {
+		return true, "", nil
+	}
+	return db.ReleaseFileLock(h.db.Session(), repoID, normalizePath(filePath), userID)
+}
+
+// clearLocksAfterDelete drops the operator's own locks left under a just-deleted path.
+// Best-effort: it runs after the delete already committed and only touches the separate
+// locked_files table, so a failure is logged but never fails the delete.
+var clearLocksAfterDelete = func(h *FileHandler, repoID, deletedPath, userID string) {
+	if h == nil || h.db == nil {
+		return
+	}
+	if err := db.ClearLocksUnder(h.db.Session(), repoID, normalizePath(deletedPath), userID); err != nil {
+		log.Printf("[locks] failed to clear locks under deleted path %s: %v", deletedPath, err)
+	}
+}
+
+// relocateLocksAfterMove rewrites the operator's own locks from oldPath to newPath after
+// a rename/move. Best-effort for the same reason as clearLocksAfterDelete.
+var relocateLocksAfterMove = func(h *FileHandler, repoID, oldPath, newPath, userID string) {
+	if h == nil || h.db == nil {
+		return
+	}
+	if err := db.RelocateLocksUnder(h.db.Session(), repoID, normalizePath(oldPath), normalizePath(newPath), userID); err != nil {
+		log.Printf("[locks] failed to relocate locks %s -> %s: %v", oldPath, newPath, err)
+	}
+}
+
 var errUploadStorageQuotaExceeded = errors.New("storage quota exceeded")
 var errLibraryNotFound = errors.New("library not found")
 var errParentDirectoryNotFound = errors.New("parent directory not found")
@@ -978,6 +1045,12 @@ func (h *FileHandler) RenameFile(c *gin.Context) {
 		return
 	}
 
+	// LOCK ENFORCEMENT: a file locked by another user cannot be renamed — and a
+	// folder cannot be renamed if it contains a file locked by another user.
+	if !h.requireSubtreeNotLockedByOther(c, repoID, filePath, userID) {
+		return
+	}
+
 	fsHelper := NewFSHelper(h.db)
 	oldName := path.Base(filePath)
 	errFileNotFound := errors.New("file not found")
@@ -1049,6 +1122,10 @@ func (h *FileHandler) RenameFile(c *gin.Context) {
 	// Move file tags from old path to new path (async, preserves tags on rename)
 	newFilePath := path.Join(path.Dir(filePath), newName)
 	go MoveFileTagsByPath(h.db, repoID, filePath, newFilePath)
+
+	// Carry the operator's own locks to the new path so they don't dangle at the old
+	// one (any other user's lock here would have blocked the rename upstream).
+	relocateLocksAfterMove(h, repoID, filePath, newFilePath, userID)
 
 	// Get file info for response
 	parentDir := path.Dir(filePath)
@@ -2184,7 +2261,7 @@ func (h *FileHandler) GetSmartLink(c *gin.Context) {
 	}
 	iter.Close()
 
-	// No existing link — create a new one
+	// No existing link â€” create a new one
 	token, err := generateSecureShareToken(16)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to generate token"})
@@ -2209,7 +2286,7 @@ func (h *FileHandler) GetSmartLink(c *gin.Context) {
 }
 
 // ResolveSmartLink resolves an internal (smart) link token and redirects to the frontend file/folder view.
-// Internal links always require authentication — the user must belong to the same org as the link.
+// Internal links always require authentication â€” the user must belong to the same org as the link.
 // GET /api/v2.1/smart-link/:token
 func (h *FileHandler) ResolveSmartLink(c *gin.Context) {
 	token := c.Param("token")
@@ -2363,6 +2440,12 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 		return
 	}
 
+	// LOCK ENFORCEMENT: a file locked by another user cannot be deleted — and a
+	// folder cannot be deleted if it contains a file locked by another user.
+	if !h.requireSubtreeNotLockedByOther(c, repoID, filePath, userID) {
+		return
+	}
+
 	// ========================================================================
 	// ENCRYPTION CHECK: Encrypted libraries require active decrypt session
 	// ========================================================================
@@ -2434,6 +2517,10 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 
 	// Clean up file tags for the deleted file (async, non-blocking)
 	go h.cleanupFileTagsForPath(repoID, filePath)
+
+	// Drop the operator's own locks under the just-deleted path so they don't linger
+	// as orphans (any other user's lock here would have blocked the delete upstream).
+	clearLocksAfterDelete(h, repoID, filePath, userID)
 
 	// Decrement storage counters for the deleted file — fire-and-forget.
 	if fileSize := result.TargetEntry.Size; fileSize > 0 {
@@ -2559,6 +2646,26 @@ func (h *FileHandler) MoveFile(c *gin.Context) {
 		return
 	}
 
+	for i := range srcPaths {
+		srcPaths[i] = normalizePath(srcPaths[i])
+	}
+	dstDir = normalizePath(dstDir)
+
+	// Cross-repo move not yet implemented
+	if srcRepoID != dstRepoID {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "cross-repo move not yet implemented"})
+		return
+	}
+
+	for _, srcPath := range srcPaths {
+		// Subtree-aware: also blocks moving a folder that contains a file locked
+		// by another user. The destination "replace" lock is enforced downstream
+		// in processSingleItem.
+		if !h.requireSubtreeNotLockedByOther(c, srcRepoID, srcPath, userID) {
+			return
+		}
+	}
+
 	// For batch operations (multiple files), handle differently
 	if len(srcPaths) > 1 {
 		h.moveBatchFiles(c, srcPaths, srcRepoID, dstRepoID, dstDir, orgID, userID)
@@ -2567,15 +2674,6 @@ func (h *FileHandler) MoveFile(c *gin.Context) {
 
 	// Single file move continues with existing logic
 	srcPath := srcPaths[0]
-
-	srcPath = normalizePath(srcPath)
-	dstDir = normalizePath(dstDir)
-
-	// Cross-repo move not yet implemented
-	if srcRepoID != dstRepoID {
-		c.JSON(http.StatusNotImplemented, gin.H{"error": "cross-repo move not yet implemented"})
-		return
-	}
 
 	// Check if database is available
 	if h.db == nil {
@@ -2638,6 +2736,10 @@ func writeMoveFileError(c *gin.Context, err error, srcPath string) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "source file not found"})
 	case errors.Is(err, ErrBatchDestinationNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "destination directory not found"})
+	case errors.Is(err, ErrBatchItemLocked):
+		c.JSON(http.StatusForbidden, gin.H{"error": "file is locked by another user"})
+	case errors.Is(err, ErrBatchLockStatusUnavailable):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to verify file lock"})
 	case errors.Is(err, ErrStorageQuotaExceeded):
 		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 	default:
@@ -2707,6 +2809,21 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 	srcPath = normalizePath(srcPath)
 	dstDir = normalizePath(dstDir)
 	originalItemName := path.Base(srcPath)
+
+	// LOCK ENFORCEMENT: a "replace" copy overwrites the destination, so that target
+	// must not be locked by another user. autorename/skip never clobber it, so they
+	// are exempt. The copy path does not funnel through processSingleItem, hence the
+	// dedicated check here.
+	if conflictPolicy == "replace" {
+		dstPath := path.Join(dstDir, originalItemName)
+		blocked, _, lerr := checkCopyReplaceDestLocked(fsHelper, repoID, dstPath, userID)
+		if lerr != nil {
+			return nil, fmt.Errorf("%w: %v", ErrBatchLockStatusUnavailable, lerr)
+		}
+		if blocked {
+			return nil, fmt.Errorf("%w: destination %s", ErrBatchItemLocked, dstPath)
+		}
+	}
 
 	err := retryLibraryHeadMutation(label, func() error {
 		snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
@@ -2964,6 +3081,10 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "source file not found"})
 		case errors.Is(err, ErrBatchDestinationNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "destination directory not found"})
+		case errors.Is(err, ErrBatchItemLocked):
+			c.JSON(http.StatusForbidden, gin.H{"error": "file is locked by another user"})
+		case errors.Is(err, ErrBatchLockStatusUnavailable):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to verify file lock"})
 		case errors.Is(err, ErrStorageQuotaExceeded):
 			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 		case errors.Is(err, ErrLibraryHeadConflict):
@@ -3100,7 +3221,7 @@ func (h *FileHandler) getUploadLinkWithCreator(c *gin.Context, createToken func(
 
 	// Return as JSON-encoded string (with double quotes).
 	// Seafile clients strip the first and last character (the quotes) to extract the URL.
-	// Without quotes, the client strips 'h' from 'https' → "ttps://" → "Protocol ttps is unknown".
+	// Without quotes, the client strips 'h' from 'https' â†’ "ttps://" â†’ "Protocol ttps is unknown".
 	c.JSON(http.StatusOK, uploadURL)
 }
 
@@ -3134,7 +3255,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Traffic quota pre-check — before reading the body to fail fast. Storage
+	// Traffic quota pre-check â€” before reading the body to fail fast. Storage
 	// quota is checked below using the visible tree delta for this path.
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
@@ -3172,6 +3293,13 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	fileSize := int64(len(content))
 	filename := header.Filename
 
+	// LOCK ENFORCEMENT: overwriting a file locked by another user is forbidden.
+	// Only the overwrite path can clobber the locked file; an autorename upload
+	// creates a new name and leaves the locked file untouched.
+	if replace && !h.requireFileNotLockedByOther(c, repoID, parentDir+"/"+filename, userID) {
+		return
+	}
+
 	fsHelper := NewFSHelper(h.db)
 	uploadOperationID := uuid.NewString()
 
@@ -3198,7 +3326,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		}
 	}
 
-	// SHA-1 of plaintext → fileID (Seafile protocol: block ID used in fs_object's block_ids)
+	// SHA-1 of plaintext â†’ fileID (Seafile protocol: block ID used in fs_object's block_ids)
 	sha1Hash := sha1.Sum(content)
 	fileID := hex.EncodeToString(sha1Hash[:])
 
@@ -3566,6 +3694,12 @@ func (h *FileHandler) copyBatchFiles(c *gin.Context, srcPaths []string, srcRepoI
 				return
 			case errors.Is(err, ErrBatchDestinationNotFound):
 				c.JSON(http.StatusNotFound, gin.H{"error": "destination directory not found"})
+				return
+			case errors.Is(err, ErrBatchItemLocked):
+				c.JSON(http.StatusForbidden, gin.H{"error": "file is locked by another user"})
+				return
+			case errors.Is(err, ErrBatchLockStatusUnavailable):
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to verify file lock"})
 				return
 			case errors.Is(err, ErrStorageQuotaExceeded):
 				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
@@ -4519,41 +4653,29 @@ func (h *FileHandler) LockFile(c *gin.Context) {
 
 	log.Printf("LockFile: operation=%s", req.Operation)
 
-	// Parse repo UUID
-	repoUUID, err := gocql.ParseUUID(repoID)
-	if err != nil {
-		log.Printf("LockFile: failed to parse repo UUID: %v", err)
+	// Validate repo id up front so an obviously malformed id is a 400, not a 503.
+	if _, err := gocql.ParseUUID(repoID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 		return
 	}
 
-	// Parse user UUID (use a default if not set)
-	var userUUID gocql.UUID
-	if userID != "" {
-		userUUID, err = gocql.ParseUUID(userID)
-		if err != nil {
-			log.Printf("LockFile: failed to parse user UUID %s: %v, using default", userID, err)
-			userUUID, _ = gocql.ParseUUID("00000000-0000-0000-0000-000000000001")
-		}
-	} else {
-		userUUID, _ = gocql.ParseUUID("00000000-0000-0000-0000-000000000001")
-	}
-
 	switch req.Operation {
 	case "lock":
-		// Store lock in database
+		// Atomic acquire/refresh via LWT (INSERT ... IF NOT EXISTS). A file already
+		// locked by another user cannot be stolen; the owner may re-issue "lock" to
+		// refresh. CAS makes this race-safe across regions (no check-then-write).
 		lockTime := time.Now()
-		log.Printf("LockFile: inserting lock for repoUUID=%s, path=%s, userUUID=%s", repoUUID.String(), filePath, userUUID.String())
-		if err := h.db.Session().Query(`
-			INSERT INTO locked_files (repo_id, path, locked_by, locked_at)
-			VALUES (?, ?, ?, ?)
-		`, repoUUID, filePath, userUUID, lockTime).Exec(); err != nil {
-			log.Printf("LockFile: failed to insert lock: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to lock file"})
+		res, ownerID, err := acquireFileLock(h, repoID, filePath, userID, lockTime)
+		if err != nil {
+			log.Printf("LockFile: failed to acquire lock on path=%s: %v", filePath, err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to acquire file lock"})
 			return
 		}
-
-		log.Printf("LockFile: lock successful")
+		if res == db.LockConflict {
+			log.Printf("LockFile: lock conflict on path=%s held by %s, requested by %s", filePath, ownerID, userID)
+			c.JSON(http.StatusConflict, gin.H{"error": "file is locked by another user", "lock_owner": ownerID})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"success":    true,
 			"repo_id":    repoID,
@@ -4563,17 +4685,20 @@ func (h *FileHandler) LockFile(c *gin.Context) {
 			"lock_owner": userID,
 		})
 	case "unlock":
-		// Remove lock from database
-		log.Printf("LockFile: deleting lock for repoUUID=%s, path=%s", repoUUID.String(), filePath)
-		if err := h.db.Session().Query(`
-			DELETE FROM locked_files WHERE repo_id = ? AND path = ?
-		`, repoUUID, filePath).Exec(); err != nil {
-			log.Printf("LockFile: failed to delete lock: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to unlock file"})
+		// Atomic owner-only release via LWT (DELETE ... IF locked_by = ?): a non-owner
+		// cannot strip the lock, and the delete cannot race an ownership change that
+		// slipped in between a separate check and write.
+		released, ownerID, err := releaseFileLock(h, repoID, filePath, userID)
+		if err != nil {
+			log.Printf("LockFile: failed to release lock on path=%s: %v", filePath, err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to release file lock"})
 			return
 		}
-
-		log.Printf("LockFile: unlock successful")
+		if !released {
+			log.Printf("LockFile: unlock refused on path=%s held by %s, requested by %s", filePath, ownerID, userID)
+			c.JSON(http.StatusForbidden, gin.H{"error": "file is locked by another user", "lock_owner": ownerID})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"success":   true,
 			"repo_id":   repoID,
@@ -4584,6 +4709,41 @@ func (h *FileHandler) LockFile(c *gin.Context) {
 		log.Printf("LockFile: unknown operation: %s", req.Operation)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "operation must be 'lock' or 'unlock'"})
 	}
+}
+
+// requireFileNotLockedByOther rejects the request with 403 when the target file is
+// locked by a user other than userID. It returns true when the caller may proceed
+// (unlocked, or locked by the caller themselves). If the lock state cannot be
+// verified, the request fails closed with 503.
+func (h *FileHandler) requireFileNotLockedByOther(c *gin.Context, repoID, filePath, userID string) bool {
+	blocked, ownerID, err := checkFileLockedByOther(h, repoID, filePath, userID)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to verify file lock"})
+		return false
+	}
+	if blocked {
+		c.JSON(http.StatusForbidden, gin.H{"error": "file is locked by another user", "lock_owner": ownerID})
+		return false
+	}
+	return true
+}
+
+// requireSubtreeNotLockedByOther is the directory-aware counterpart of
+// requireFileNotLockedByOther: it rejects the request with 403 when the target path
+// OR any descendant under it is locked by another user, and 503 when the lock state
+// cannot be verified. Use it for operations that can act on a folder (rename, move,
+// delete) so a folder action cannot strip or relocate a file locked inside it.
+func (h *FileHandler) requireSubtreeNotLockedByOther(c *gin.Context, repoID, targetPath, userID string) bool {
+	blocked, ownerID, err := checkSubtreeLockedByOther(h, repoID, targetPath, userID)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to verify file lock"})
+		return false
+	}
+	if blocked {
+		c.JSON(http.StatusForbidden, gin.H{"error": "a file in this path is locked by another user", "lock_owner": ownerID})
+		return false
+	}
+	return true
 }
 
 // FileRevision represents a file revision in API response
@@ -5083,6 +5243,13 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 	if parentDir == "" {
 		parentDir = "/"
 	}
+	for _, name := range req.Dirents {
+		// Subtree-aware: deleting a folder is blocked when it contains a file
+		// locked by another user, not just when a top-level item is locked.
+		if !h.requireSubtreeNotLockedByOther(c, req.RepoID, path.Join(parentDir, name), userID) {
+			return
+		}
+	}
 
 	fsHelper := NewFSHelper(h.db)
 
@@ -5193,6 +5360,10 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 	go func() {
 		for _, entry := range deletedEntries {
 			deletedPath := path.Join(parentDir, entry.Name)
+
+			// Drop the operator's own locks under each deleted item (other users'
+			// locks here would have blocked the delete upstream).
+			clearLocksAfterDelete(h, req.RepoID, deletedPath, userID)
 
 			// Clean up tags
 			if entry.Mode == ModeDir || entry.Mode&0170000 == 040000 {

@@ -58,6 +58,46 @@ var ErrBatchSourceNotFound = errors.New("batch source item not found")
 
 var ErrBatchDestinationNotFound = errors.New("batch destination not found")
 
+// ErrBatchItemLocked indicates the source (or one of its descendants) or the replace
+// destination is locked by another user, so the operation must be refused.
+var ErrBatchItemLocked = errors.New("batch item locked by another user")
+
+// ErrBatchLockStatusUnavailable indicates the lock table could not be queried, so the
+// operation fails closed instead of silently bypassing lock enforcement.
+var ErrBatchLockStatusUnavailable = errors.New("batch lock status unavailable")
+
+// checkBatchSubtreeLocked reports whether targetPath or any descendant is locked by
+// another user. Injectable for tests.
+var checkBatchSubtreeLocked = func(h *BatchOperationHandler, repoID, targetPath, userID string) (bool, string, error) {
+	if h == nil || h.db == nil {
+		return false, "", nil
+	}
+	return db.SubtreeLockedByOther(h.db.Session(), repoID, normalizePath(targetPath), userID)
+}
+
+// checkBatchPathLocked reports whether the replace target path or any descendant
+// beneath it is locked by another user. This prevents replacing a folder that
+// contains a locked child. Injectable for tests.
+var checkBatchPathLocked = func(h *BatchOperationHandler, repoID, targetPath, userID string) (bool, string, error) {
+	if h == nil || h.db == nil {
+		return false, "", nil
+	}
+	return db.SubtreeLockedByOther(h.db.Session(), repoID, normalizePath(targetPath), userID)
+}
+
+// clearMovedSourceLocks drops the operator's own locks under a just-moved source path.
+// A move's destination is autorename-dependent, so rather than guess the final name we
+// clear the source locks (the owner can re-lock at the destination). Best-effort: it
+// runs after the move committed and only touches locked_files, so failures are logged.
+var clearMovedSourceLocks = func(h *BatchOperationHandler, repoID, srcPath, userID string) {
+	if h == nil || h.db == nil {
+		return
+	}
+	if err := db.ClearLocksUnder(h.db.Session(), repoID, normalizePath(srcPath), userID); err != nil {
+		log.Printf("[locks] failed to clear locks under moved source %s: %v", srcPath, err)
+	}
+}
+
 func isSameLocationMove(opType, srcRepoID, dstRepoID, srcParentPath, dstDir string) bool {
 	return opType == "move" && srcRepoID == dstRepoID && normalizePath(srcParentPath) == normalizePath(dstDir)
 }
@@ -184,6 +224,12 @@ func batchOperationErrorResponse(err error, opType, itemName string) (int, gin.H
 	case errors.Is(err, ErrBatchDestinationNotFound):
 		msg := "destination directory not found"
 		return http.StatusNotFound, gin.H{"error": msg}, msg
+	case errors.Is(err, ErrBatchItemLocked):
+		msg := "item is locked by another user"
+		return http.StatusForbidden, gin.H{"error": msg}, msg
+	case errors.Is(err, ErrBatchLockStatusUnavailable):
+		msg := "failed to verify file lock"
+		return http.StatusServiceUnavailable, gin.H{"error": msg}, msg
 	case errors.Is(err, ErrStorageQuotaExceeded):
 		msg := "storage quota exceeded"
 		return http.StatusForbidden, gin.H{"error": msg}, msg
@@ -485,6 +531,31 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	if srcParentPath == "." {
 		srcParentPath = "/"
 	}
+
+	// LOCK ENFORCEMENT (centralized for every move/copy entry point, including the
+	// batch endpoints): a move must not relocate a source item — or any descendant
+	// when it is a folder — that another user has locked, and a "replace" conflict
+	// policy must not clobber a destination locked by another user.
+	if opType == "move" {
+		blocked, _, lerr := checkBatchSubtreeLocked(h, srcRepoID, srcPath, userID)
+		if lerr != nil {
+			return fmt.Errorf("%w: %v", ErrBatchLockStatusUnavailable, lerr)
+		}
+		if blocked {
+			return fmt.Errorf("%w: source %s", ErrBatchItemLocked, srcPath)
+		}
+	}
+	if strings.EqualFold(policy, "replace") {
+		dstPath := path.Join(dstDir, itemName)
+		blocked, _, lerr := checkBatchPathLocked(h, dstRepoID, dstPath, userID)
+		if lerr != nil {
+			return fmt.Errorf("%w: %v", ErrBatchLockStatusUnavailable, lerr)
+		}
+		if blocked {
+			return fmt.Errorf("%w: destination %s", ErrBatchItemLocked, dstPath)
+		}
+	}
+
 	if isSameLocationMove(opType, srcRepoID, dstRepoID, srcParentPath, dstDir) {
 		srcSnapshot, err := fsHelper.GetLibraryHeadSnapshot(srcRepoID)
 		if err != nil {
@@ -503,7 +574,13 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		return nil
 	}
 	if opType == "move" && srcRepoID == dstRepoID {
-		return h.processSameRepoMove(orgID, userID, srcRepoID, srcPath, dstDir, fsHelper, policy)
+		err := h.processSameRepoMove(orgID, userID, srcRepoID, srcPath, dstDir, fsHelper, policy)
+		if err == nil {
+			// The source no longer exists at srcPath; drop the operator's own locks
+			// there so they don't dangle (other users' locks blocked the move above).
+			clearMovedSourceLocks(h, srcRepoID, srcPath, userID)
+		}
+		return err
 	}
 	var srcSize int64
 	var srcFiles int64
