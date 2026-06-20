@@ -1,3 +1,5 @@
+import { ensureSupportedLocale } from './locale-utils';
+
 export const defaultContentForSDoc = {
   version: 0,
   children: [{ id: 'aaaa', type: 'paragraph', children: [{ text: '' }] }]
@@ -30,7 +32,7 @@ export const logoHeight = appConfig.logoHeight || '';
 export const isPro = appConfig.isPro === 'True';
 export const isDBSqlite3 = appConfig.isDBSqlite3 || false;
 export const isDocs = appConfig.isDocs === 'True';
-export const lang = appConfig.lang || 'en';
+export const lang = ensureSupportedLocale(appConfig.lang);
 export const fileServerRoot = appConfig.fileServerRoot || '';
 export const useGoFileserver = appConfig.useGoFileserver || false;
 export const seafileVersion = appConfig.seafileVersion || '';

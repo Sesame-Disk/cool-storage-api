@@ -892,7 +892,7 @@ module.exports = function (webpackEnv) {
       //   resourceRegExp: /^\.\/locale$/,
       //   contextRegExp: /moment$/,
       // }),
-      new webpack.ContextReplacementPlugin(/moment[\/\\]locale$/, /zh-cn|zh-tw|en|cs|nl_NL|fi|fr|de|hu|it|ko|lv|pl|ru|es|es_MX|sv/),
+      new webpack.ContextReplacementPlugin(/moment[\/\\]locale$/, /zh-cn|zh-tw|en|cs|nl_NL|fi|fr|de|hu|it|ko|lv|pl|ru|es|es-mx|sv/),
       // Generate a service worker script that will precache, and keep up to date,
       // the HTML & assets that are part of the webpack build.
       // isEnvProduction &&

@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,6 +49,133 @@ type bootstrapOrgData struct {
 	CurrentPeriodEndsAt    *time.Time
 }
 
+// supportedLocale is a UI language the SPA ships translation catalogs for. The set
+// mirrors the i18n whitelist in frontend/src/_i18n/* so the profile language selector
+// offers exactly the locales that can actually be loaded at runtime.
+type supportedLocale struct {
+	Code string
+	Name string
+}
+
+// supportedLocales drives the bootstrap language list and the current-language
+// label. The canonical source is shared with the frontend in
+// frontend/src/utils/supported-locales.json; this slice mirrors it and the mirror
+// is drift-guarded by TestSupportedLocalesMatchCanonicalJSON. Update the JSON and
+// this slice together (the test fails otherwise).
+var supportedLocales = []supportedLocale{
+	{Code: "en", Name: "English"},
+	{Code: "zh-CN", Name: "中文"},
+	{Code: "fr", Name: "Français"},
+	{Code: "de", Name: "Deutsch"},
+	{Code: "cs", Name: "Čeština"},
+	{Code: "es", Name: "Español"},
+	{Code: "es-AR", Name: "Español (Argentina)"},
+	{Code: "es-MX", Name: "Español (México)"},
+	{Code: "ru", Name: "Русский"},
+}
+
+// bootstrapLangList renders supportedLocales as the bootstrap payload's langList.
+func bootstrapLangList() []gin.H {
+	list := make([]gin.H, 0, len(supportedLocales))
+	for _, l := range supportedLocales {
+		list = append(list, gin.H{"langCode": l.Code, "langName": l.Name})
+	}
+	return list
+}
+
+// localeDisplayName returns the human-readable name for a language code, falling
+// back to the code itself for an unknown locale.
+func localeDisplayName(code string) string {
+	for _, l := range supportedLocales {
+		if l.Code == code {
+			return l.Name
+		}
+	}
+	return code
+}
+
+// localeCookieName is the cookie that persists the user's chosen UI language. It
+// is read by the bootstrap endpoint to populate currentLang/langCode and written
+// by handleLanguageChange. The frontend mirrors it into window.app.config.lang so
+// i18next loads the matching catalog.
+const localeCookieName = "lang"
+
+// isSupportedLocale reports whether code is one of the locales the SPA ships
+// catalogs for. It is the validation gate for the language cookie so an arbitrary
+// query value can never end up driving the selector or catalog loading.
+func isSupportedLocale(code string) bool {
+	for _, l := range supportedLocales {
+		if l.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveBootstrapLocale returns the active UI locale for the request, read from
+// the language cookie. Unknown or absent values fall back to English so the
+// selector always has a valid current value.
+func resolveBootstrapLocale(c *gin.Context) string {
+	if c == nil {
+		return "en"
+	}
+	if code, err := c.Cookie(localeCookieName); err == nil && isSupportedLocale(code) {
+		return code
+	}
+	return "en"
+}
+
+// handleLanguageChange persists the user's chosen UI language in a cookie and
+// redirects back to where they were. This is the backend for the selector's
+// languageChange route ("i18n/?lang={langCode}"). Unsupported codes are ignored
+// (no cookie written) but the redirect still happens so a stale/garbage value
+// can't strand the user on a blank page.
+//
+// Persistence is COOKIE-ONLY: the choice is per browser/device and is NOT stored
+// in the DB or on the user/account record. A different browser or a cleared
+// cookie falls back to the default locale. Per-user persistence (a profile
+// `language` field) is a future enhancement, intentionally out of scope.
+//
+// GET /i18n/?lang=<code>
+func (s *Server) handleLanguageChange(c *gin.Context) {
+	if lang := c.Query("lang"); isSupportedLocale(lang) {
+		isSecure := c.Request.TLS != nil
+		// 1 year; path "/" so it applies to the whole SPA. Not HttpOnly so the
+		// frontend can read it if needed, mirroring the auth cookie convention.
+		c.SetCookie(localeCookieName, lang, int((365 * 24 * time.Hour).Seconds()), "/", "", isSecure, false)
+	}
+	c.Redirect(http.StatusFound, sameOriginRedirectTarget(c))
+}
+
+// sameOriginRedirectTarget returns the Referer's path+query when it points at the
+// current host, falling back to "/". This keeps the post-language-change redirect
+// on the page the user came from without enabling open-redirects.
+func sameOriginRedirectTarget(c *gin.Context) string {
+	referer := c.Request.Referer()
+	if referer == "" {
+		return "/"
+	}
+	ref, err := url.Parse(referer)
+	if err != nil {
+		return "/"
+	}
+	if ref.Host != "" && ref.Host != c.Request.Host {
+		return "/"
+	}
+	target := ref.EscapedPath()
+	// Reject protocol-relative paths ("//host/...") — a same-origin Referer like
+	// "https://app.example.com//evil.com/path" parses with Host "app.example.com"
+	// (passing the check above) but a path that browsers treat as a scheme-relative
+	// external redirect. Fall back to "/" so /i18n/ can't be an open redirect.
+	if target == "" || strings.HasPrefix(target, "//") {
+		target = "/"
+	}
+	if ref.RawQuery != "" {
+		target += "?" + ref.RawQuery
+	}
+	return target
+}
+
 func buildBootstrapBackendRoutes() gin.H {
 	return gin.H{
 		"languageChange":        "i18n/?lang={langCode}",
@@ -84,7 +212,7 @@ func (s *Server) handleBootstrap(c *gin.Context) {
 		identity.Role = userData.Role
 	}
 	orgData := s.loadBootstrapOrgData(identity.OrgID)
-	appPageOptions := s.buildAppBootstrapPageOptions(identity, userData, orgData)
+	appPageOptions := s.buildAppBootstrapPageOptions(identity, userData, orgData, resolveBootstrapLocale(c))
 	appPageOptions["storages"] = s.buildBootstrapStorageOptions(httputil.GetRoutingHostname(c, s.config.Server.URL))
 	orgPageOptions := s.buildOrgBootstrapPageOptions(identity.OrgID, orgData)
 	canAccessOrgAdmin := middleware.IsOrgStaff(identity.Role)
@@ -374,7 +502,10 @@ func extractEmailFromAuthCookie(c *gin.Context) string {
 	return ""
 }
 
-func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userData bootstrapUserData, orgData bootstrapOrgData) gin.H {
+func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userData bootstrapUserData, orgData bootstrapOrgData, locale string) gin.H {
+	if !isSupportedLocale(locale) {
+		locale = "en"
+	}
 	role := identity.Role
 	if userData.Role != "" {
 		role = userData.Role
@@ -411,19 +542,14 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"maxUploadFileSize":             s.config.ResolvedMaxFileSizeMB(),
 		"maxNumberOfFilesForFileupload": s.config.WebUploads.MaxFilesPerBatch,
 		"resumableSimultaneousUploads":  s.config.WebUploads.SimultaneousUploads,
-		"langCode":                      "en",
+		"langCode":                      locale,
 		"currentLang": gin.H{
-			"langCode": "en",
-			"langName": "en",
+			"langCode": locale,
+			"langName": localeDisplayName(locale),
 		},
 		"backendRoutes":           buildBootstrapBackendRoutes(),
 		"inlinePreviewExtensions": append([]string(nil), s.config.FileView.PreviewExtensions...),
-		"langList": []gin.H{
-			{
-				"langCode": "en",
-				"langName": "en",
-			},
-		},
+		"langList":                bootstrapLangList(),
 		"userRole":                role,
 		"orgID":                   identity.OrgID,
 		"canAddRepo":              false,

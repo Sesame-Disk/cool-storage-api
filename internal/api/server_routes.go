@@ -87,6 +87,11 @@ func (s *Server) registerCoreRoutes() {
 	s.router.GET("/accounts/logout", s.handleLogout)
 	s.router.GET("/accounts/logout/", s.handleLogout)
 
+	// Language selector endpoint - persists the chosen UI locale in a cookie
+	// and redirects back. Backs the bootstrap "languageChange" route.
+	s.router.GET("/i18n", s.handleLanguageChange)
+	s.router.GET("/i18n/", s.handleLanguageChange)
+
 	// Auto-login endpoint for desktop client "View on Cloud" feature.
 	s.router.GET("/client-login", s.handleAutoLogin)
 	s.router.GET("/client-login/", s.handleAutoLogin)
