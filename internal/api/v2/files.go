@@ -1631,9 +1631,10 @@ func (h *FileHandler) getFileDownloadURL(c *gin.Context, orgID, userID, repoID, 
 }
 
 // fileLastModifierWalkCap bounds the commit-blame walk in resolveFileLastModifier so
-// a single file/detail request can never traverse an unbounded history. A file that
-// has not changed for more than this many commits is attributed to the oldest commit
-// examined (an acceptable approximation for this metadata-only field).
+// a single file/detail request can never traverse an unbounded history. If the commit
+// that introduced the current fs_id is not reached within this many commits, the
+// modifier is reported as unresolved ("") rather than misattributed to whoever happened
+// to author the oldest commit examined -- a wrong-but-subtle answer is worse than none.
 const fileLastModifierWalkCap = 64
 
 // resolveFileLastModifier returns the user id of the author who last changed the file
@@ -1659,32 +1660,83 @@ func (h *FileHandler) resolveFileLastModifier(repoID, filePath, currentFSID stri
 		return res.TargetEntry.ID
 	}
 
-	// Walk newest->oldest. The oldest contiguous commit (starting at HEAD) whose tree
-	// still has currentFSID at this path is where the current version was introduced;
-	// its creator is the last modifier.
-	commitID := headCommitID
-	introducer := ""
-	for i := 0; i < fileLastModifierWalkCap && commitID != ""; i++ {
-		var rootFSID, parentID string
+	loadCommit := func(commitID string) (commitWalkNode, bool) {
+		var node commitWalkNode
 		var creatorUUID gocql.UUID
 		if err := h.db.Session().Query(
 			`SELECT root_fs_id, parent_id, creator_id FROM commits WHERE library_id = ? AND commit_id = ?`,
 			repoID, commitID,
-		).Scan(&rootFSID, &parentID, &creatorUUID); err != nil {
+		).Scan(&node.rootFSID, &node.parentID, &creatorUUID); err != nil {
+			return commitWalkNode{}, false
+		}
+		node.creator = creatorUUID.String()
+		return node, true
+	}
+
+	return resolveLastModifierFromWalk(headCommitID, currentFSID, fileLastModifierWalkCap, loadCommit, fileFSIDAt)
+}
+
+// commitWalkNode is the slice of a commit row the blame walk needs.
+type commitWalkNode struct {
+	rootFSID string
+	parentID string
+	creator  string
+}
+
+// resolveLastModifierFromWalk implements the blame decision over injectable loaders so
+// the cap/contiguity logic is testable without a database. It walks newest->oldest from
+// headCommitID. The oldest contiguous commit whose tree still has currentFSID at the
+// path is where the current version was introduced; its creator is the last modifier.
+// The answer is only trusted if the walk actually reaches that boundary (the commit
+// where the fs_id changes, or the creating root commit) within walkCap -- otherwise the
+// accumulated introducer is a partial, wrong result and "" is returned so the caller
+// leaves the field empty instead of misattributing it to an unrelated old commit.
+func resolveLastModifierFromWalk(
+	headCommitID, currentFSID string,
+	walkCap int,
+	loadCommit func(commitID string) (commitWalkNode, bool),
+	fileFSIDAt func(rootFSID string) string,
+) string {
+	commitID := headCommitID
+	introducer := ""
+	resolved := false
+	for i := 0; i < walkCap && commitID != ""; i++ {
+		node, ok := loadCommit(commitID)
+		if !ok {
 			break
 		}
-		if fileFSIDAt(rootFSID) != currentFSID {
+		if fileFSIDAt(node.rootFSID) != currentFSID {
 			// The file did not yet have its current version here; the previously
-			// examined (newer) commit is the introducer.
+			// examined (newer) commit is the introducer -- if there was one.
+			resolved = introducer != ""
 			break
 		}
-		introducer = creatorUUID.String()
-		if parentID == "" {
-			break // reached the creating commit
+		introducer = node.creator
+		if node.parentID == "" {
+			resolved = true // reached the creating commit; introducer is definitive
+			break
 		}
-		commitID = parentID
+		commitID = node.parentID
+	}
+	if !resolved {
+		return ""
 	}
 	return introducer
+}
+
+// composeLastModifier picks the file's real last-modifier identity for file/detail.
+// It prefers the modifier persisted on the fs entry, then a blame-resolved user id
+// (formatted into a synthetic email). It NEVER falls back to the requesting user: an
+// unresolved modifier stays empty, which the API surfaces as blank rather than wrong.
+func composeLastModifier(entryModifier, blameUID string) (email, name string) {
+	email = entryModifier
+	if email == "" && blameUID != "" {
+		email = blameUID + "@sesamefs.local"
+	}
+	if email != "" {
+		name = strings.Split(email, "@")[0]
+	}
+	return email, name
 }
 
 // GetFileDetail returns detailed information about a file
@@ -1758,18 +1810,13 @@ func (h *FileHandler) GetFileDetail(c *gin.Context) {
 
 	// Resolve the file's REAL last modifier -- never the requesting user. Prefer the
 	// modifier persisted on the fs entry (set by OnlyOffice saves); otherwise blame
-	// the commit history. If it cannot be resolved, the field is left empty rather
-	// than misattributed to the caller.
-	modifier := entry.Modifier
-	if modifier == "" {
-		if uid := h.resolveFileLastModifier(repoID, filePath, entry.ID); uid != "" {
-			modifier = uid + "@sesamefs.local"
-		}
+	// the commit history (only walked when the entry carries no modifier). If it cannot
+	// be resolved, the field is left empty rather than misattributed to the caller.
+	blameUID := ""
+	if entry.Modifier == "" {
+		blameUID = h.resolveFileLastModifier(repoID, filePath, entry.ID)
 	}
-	modifierName := ""
-	if modifier != "" {
-		modifierName = strings.Split(modifier, "@")[0]
-	}
+	modifier, modifierName := composeLastModifier(entry.Modifier, blameUID)
 
 	// Resolve actual permission for the user
 	perm := ""
