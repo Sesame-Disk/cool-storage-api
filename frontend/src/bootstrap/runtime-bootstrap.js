@@ -266,6 +266,13 @@ export async function loadBootstrap(scope = 'app') {
         const data = await response.json();
         if (data?.app_page_options) {
             Object.assign(window.app.pageOptions, data.app_page_options);
+            // Mirror the resolved locale into config.lang so i18next/moment load the
+            // matching catalog. Bootstrap runs before app bundles import constants.js
+            // (which snapshots config.lang), so this assignment is observed by i18n init.
+            const langCode = data.app_page_options.langCode;
+            if (langCode) {
+                window.app.config.lang = langCode;
+            }
         }
 
         const orgPageOptions = data?.org_page_options || data?.page_options;

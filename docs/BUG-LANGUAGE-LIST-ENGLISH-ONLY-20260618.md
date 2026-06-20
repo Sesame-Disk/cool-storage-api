@@ -60,10 +60,53 @@ Note: there is currently **no persisted per-user language field** in the profile
 source `supportedLocales`) instead of a single English entry, so the **selector offers all
 9 languages** — the reported bug is resolved.
 
-**Remaining follow-up (open, not backend-only):** `currentLang.langCode` is still hard-coded
-to `"en"`, so the selector won't reflect the user's *active* choice after switching, and the
-`languageChange` URL (`i18n/?lang=…`) has **no backend handler** — language switching is not
-wired end-to-end. Completing it needs: (1) an `/i18n/` endpoint (or a persisted per-user
-`language` field), and (2) `buildAppBootstrapPageOptions` resolving `currentLang` from that
-cookie/preference (`localeDisplayName` already maps the code → name). Treat the current change
-as "expose supported locales", not "complete language handling".
+## Status (2026-06-20): fixed — language switching wired end-to-end
+
+Language selection now works front to back:
+
+1. **Selector lists all locales** — `buildAppBootstrapPageOptions` emits the full
+   `supportedLocales` set (single source of truth) via `bootstrapLangList()`.
+2. **`/i18n/` backend handler** (`handleLanguageChange` in `internal/api/bootstrap.go`,
+   registered in `server_routes.go`) validates `?lang=<code>` against `supportedLocales`,
+   persists it in the `lang` cookie (1y, path `/`), and redirects back to the originating
+   page (`sameOriginRedirectTarget` — Referer if same-origin, else `/`; no open-redirect).
+   Unsupported codes write no cookie but still redirect, so a garbage value can't strand
+   the user.
+3. **`currentLang`/`langCode` reflect the cookie** — `handleBootstrap` calls
+   `resolveBootstrapLocale(c)` and passes it into `buildAppBootstrapPageOptions`, so after a
+   reload the selector shows the user's active choice (label via `localeDisplayName`).
+4. **i18next/moment load the chosen catalog** — `loadBootstrap` mirrors the resolved
+   `langCode` into `window.app.config.lang` before app bundles import `constants.js`, so the
+   i18n init picks it up.
+5. **nginx** — `frontend/nginx.conf` proxies `/i18n/` to the backend (not the SPA).
+
+### ⚠️ Persistence: cookie only — NOT stored in the DB per user
+
+The selected language is persisted **exclusively in the `lang` browser cookie**. There is
+**no per-user `language` column in ScyllaDB and no profile/account field** that records the
+choice. Concrete implications:
+
+- The preference is **per browser/device**, not per account. The same user on a different
+  browser, an incognito window, or after clearing cookies starts again from the default
+  (`en`).
+- Nothing in the user record, the `users` table, or the Accounts identity reflects the
+  language — `resolveBootstrapLocale` reads the cookie and nothing else.
+- Server-side rendered/functional pages (share links, file viewer, etc.) do **not** know the
+  user's language unless they also carry the cookie.
+
+This is an intentional, low-risk scope choice — it makes the selector fully functional
+without schema changes or Accounts integration. Adding true per-user persistence (a
+`language` field on the profile/account, applied on login) remains a **possible future
+enhancement**; it is explicitly out of scope here.
+
+Guard tests in `internal/api/bootstrap_test.go`: `TestBootstrapLangListOffersAllSupportedLocales`
+(pins the original >1-locale regression), `TestBuildAppBootstrapPageOptionsReflectsLocale`,
+`TestResolveBootstrapLocale`, `TestHandleLanguageChange` (cookie + redirect + cross-origin).
+
+---
+
+### Original triage notes (2026-06-19)
+
+`buildAppBootstrapPageOptions` was emitting a single hard-coded English `langList` entry, and
+`currentLang.langCode` was hard-coded to `"en"`; the `i18n/?lang=…` URL had no backend handler.
+All three are addressed above.
