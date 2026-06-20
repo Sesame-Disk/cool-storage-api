@@ -1630,6 +1630,63 @@ func (h *FileHandler) getFileDownloadURL(c *gin.Context, orgID, userID, repoID, 
 	c.JSON(http.StatusOK, downloadURL)
 }
 
+// fileLastModifierWalkCap bounds the commit-blame walk in resolveFileLastModifier so
+// a single file/detail request can never traverse an unbounded history. A file that
+// has not changed for more than this many commits is attributed to the oldest commit
+// examined (an acceptable approximation for this metadata-only field).
+const fileLastModifierWalkCap = 64
+
+// resolveFileLastModifier returns the user id of the author who last changed the file
+// at filePath -- the creator of the commit that introduced its current fs_id -- by
+// walking the commit parent chain from HEAD. It returns "" when it cannot be
+// resolved, in which case the caller must NOT fall back to the requesting user.
+func (h *FileHandler) resolveFileLastModifier(repoID, filePath, currentFSID string) string {
+	if h.db == nil || currentFSID == "" {
+		return ""
+	}
+	fsHelper := NewFSHelper(h.db)
+
+	_, headCommitID, err := fsHelper.GetRootFSID(repoID)
+	if err != nil || headCommitID == "" {
+		return ""
+	}
+
+	fileFSIDAt := func(rootFSID string) string {
+		res, err := fsHelper.TraverseToPathFromRoot(repoID, rootFSID, filePath)
+		if err != nil || res == nil || res.TargetEntry == nil {
+			return ""
+		}
+		return res.TargetEntry.ID
+	}
+
+	// Walk newest->oldest. The oldest contiguous commit (starting at HEAD) whose tree
+	// still has currentFSID at this path is where the current version was introduced;
+	// its creator is the last modifier.
+	commitID := headCommitID
+	introducer := ""
+	for i := 0; i < fileLastModifierWalkCap && commitID != ""; i++ {
+		var rootFSID, parentID string
+		var creatorUUID gocql.UUID
+		if err := h.db.Session().Query(
+			`SELECT root_fs_id, parent_id, creator_id FROM commits WHERE library_id = ? AND commit_id = ?`,
+			repoID, commitID,
+		).Scan(&rootFSID, &parentID, &creatorUUID); err != nil {
+			break
+		}
+		if fileFSIDAt(rootFSID) != currentFSID {
+			// The file did not yet have its current version here; the previously
+			// examined (newer) commit is the introducer.
+			break
+		}
+		introducer = creatorUUID.String()
+		if parentID == "" {
+			break // reached the creating commit
+		}
+		commitID = parentID
+	}
+	return introducer
+}
+
 // GetFileDetail returns detailed information about a file
 // Implements: GET /api2/repos/:repo_id/file/detail/?p=/path
 func (h *FileHandler) GetFileDetail(c *gin.Context) {
@@ -1699,8 +1756,20 @@ func (h *FileHandler) GetFileDetail(c *gin.Context) {
 	starredHandler := NewStarredHandler(h.db)
 	starred = starredHandler.IsFileStarred(userID, repoID, filePath)
 
-	// Build user email
-	userEmail := userID + "@sesamefs.local"
+	// Resolve the file's REAL last modifier -- never the requesting user. Prefer the
+	// modifier persisted on the fs entry (set by OnlyOffice saves); otherwise blame
+	// the commit history. If it cannot be resolved, the field is left empty rather
+	// than misattributed to the caller.
+	modifier := entry.Modifier
+	if modifier == "" {
+		if uid := h.resolveFileLastModifier(repoID, filePath, entry.ID); uid != "" {
+			modifier = uid + "@sesamefs.local"
+		}
+	}
+	modifierName := ""
+	if modifier != "" {
+		modifierName = strings.Split(modifier, "@")[0]
+	}
 
 	// Resolve actual permission for the user
 	perm := ""
@@ -1727,9 +1796,9 @@ func (h *FileHandler) GetFileDetail(c *gin.Context) {
 		"repo_id":                     repoID,
 		"repo_name":                   repoName,
 		"parent_dir":                  result.ParentPath,
-		"last_modifier_email":         userEmail,
-		"last_modifier_name":          strings.Split(userEmail, "@")[0],
-		"last_modifier_contact_email": userEmail,
+		"last_modifier_email":         modifier,
+		"last_modifier_name":          modifierName,
+		"last_modifier_contact_email": modifier,
 		"can_preview":                 true,
 		"can_edit":                    canEdit,
 		"encoded_thumbnail_src":       "",
