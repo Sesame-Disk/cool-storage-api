@@ -78,7 +78,14 @@ Language selection now works front to back:
 4. **i18next/moment load the chosen catalog** — `loadBootstrap` mirrors the resolved
    `langCode` into `window.app.config.lang` before app bundles import `constants.js`, so the
    i18n init picks it up.
-5. **nginx** — `frontend/nginx.conf` proxies `/i18n/` to the backend (not the SPA).
+5. **Public surfaces (share/upload-link viewers) honor the cookie too** — these pages have no
+   server-side bootstrap that resolves the locale, so `ensureAppGlobals` in
+   `share-runtime-bootstrap.js` reads the `lang` cookie client-side and applies it to
+   `window.app.config.lang` before the viewer bundle (and its i18next init) is dynamically
+   imported. A visitor who selected fr/es and then opens a share/sdoc link in the same browser
+   gets that locale; an anonymous visitor with no cookie correctly stays on the default (`en`).
+   Guarded by `frontend/src/bootstrap/__tests__/share-runtime-bootstrap.test.js`.
+6. **nginx** — `frontend/nginx.conf` proxies `/i18n` and `/i18n/` to the backend (not the SPA).
 
 ### Single source of truth for the locale set
 

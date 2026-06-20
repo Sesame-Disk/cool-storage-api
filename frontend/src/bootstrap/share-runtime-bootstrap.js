@@ -1,4 +1,23 @@
+import { ensureSupportedLocale, normalizeLocaleCode } from '../utils/locale-utils';
 import { syncSesameAiWidget } from './sesame-ai-widget';
+
+// readLangCookie returns the value of the `lang` cookie set by the /i18n/ handler.
+// Public surfaces have no server-side bootstrap that resolves the locale, so they
+// read the same cookie the main app's backend reads (resolveBootstrapLocale).
+function readLangCookie() {
+  const match = (typeof document !== 'undefined' ? document.cookie : '').match(/(?:^|;\s*)lang=([^;]+)/);
+  if (!match) {
+    return '';
+  }
+  // A malformed percent-encoding (e.g. "lang=%") makes decodeURIComponent throw,
+  // which would abort ensureAppGlobals() and break the whole public page. Tolerate
+  // it like the backend does: treat an undecodable cookie as absent (→ default 'en').
+  try {
+    return decodeURIComponent(match[1]);
+  } catch (error) {
+    return '';
+  }
+}
 
 function escapeHtml(value) {
   return String(value || '')
@@ -54,6 +73,11 @@ export function ensureAppGlobals() {
     ...(window.app.config || {}),
     ...(typeof window.SESAMEFS_CONFIG === 'object' ? window.SESAMEFS_CONFIG : {}),
   };
+  // Apply the user's chosen locale (cookie) so public viewers (sdoc/markdown/...)
+  // initialize i18next in the selected language instead of the frozen 'en' default.
+  // The cookie wins when valid; otherwise fall back to whatever config carried.
+  // Anonymous visitors with no cookie correctly stay on the default locale.
+  window.app.config.lang = ensureSupportedLocale(normalizeLocaleCode(readLangCookie()) || window.app.config.lang);
   window.app.pageOptions = {
     name: '',
     username: '',
