@@ -1261,11 +1261,12 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		pendingFiles := []*pendingPublishedFile{pendingFile}
 
 		newEntry := FSEntry{
-			Name:  fileName,
-			ID:    pendingFile.fsID,
-			Mode:  ModeFile,
-			MTime: time.Now().Unix(),
-			Size:  fileSize,
+			Name:     fileName,
+			ID:       pendingFile.fsID,
+			Mode:     ModeFile,
+			MTime:    time.Now().Unix(),
+			Size:     fileSize,
+			Modifier: userID + sesamefsLocalDomain,
 		}
 		newEntries := AddEntryToList(parentEntries, newEntry)
 
@@ -1724,18 +1725,57 @@ func resolveLastModifierFromWalk(
 	return introducer
 }
 
-// composeLastModifier picks the file's real last-modifier identity for file/detail.
-// It prefers the modifier persisted on the fs entry, then a blame-resolved user id
-// (formatted into a synthetic email). It NEVER falls back to the requesting user: an
-// unresolved modifier stays empty, which the API surfaces as blank rather than wrong.
-func composeLastModifier(entryModifier, blameUID string) (email, name string) {
-	email = entryModifier
-	if email == "" && blameUID != "" {
-		email = blameUID + "@sesamefs.local"
+// sesamefsLocalDomain is the synthetic email domain we attach to a bare user id when an
+// account's real address is unavailable. Its presence marks a modifier value as a
+// user-id reference (web/OnlyOffice) rather than a real address (Seafile desktop client).
+const sesamefsLocalDomain = "@sesamefs.local"
+
+// composeLastModifierIdentity resolves the file's real last-modifier identity for
+// file/detail. It NEVER falls back to the requesting user: an unresolved modifier stays
+// empty, which the API surfaces as blank rather than wrong.
+//
+// Sources, in order of preference:
+//   - entryModifier holding a real address (Seafile desktop client) -> used as-is.
+//   - a user id, taken from the local-part of a synthetic <uid>@sesamefs.local
+//     (web/OnlyOffice) or from blameUID (commit history). The id is resolved to the
+//     account's real email/name via lookup; if the account is unknown, the synthetic
+//     <uid>@sesamefs.local address is used so the field is still populated.
+func composeLastModifierIdentity(entryModifier, blameUID string, lookup func(uid string) (email, name string)) (email, name string) {
+	// A persisted real address (no synthetic domain) is already the answer.
+	if entryModifier != "" && !strings.HasSuffix(entryModifier, sesamefsLocalDomain) {
+		return entryModifier, strings.Split(entryModifier, "@")[0]
 	}
-	if email != "" {
-		name = strings.Split(email, "@")[0]
+
+	uid := blameUID
+	if entryModifier != "" {
+		uid = strings.TrimSuffix(entryModifier, sesamefsLocalDomain)
 	}
+	if uid == "" {
+		return "", ""
+	}
+
+	if lookup != nil {
+		if realEmail, realName := lookup(uid); realEmail != "" {
+			if realName == "" {
+				realName = strings.Split(realEmail, "@")[0]
+			}
+			return realEmail, realName
+		}
+	}
+	return uid + sesamefsLocalDomain, uid
+}
+
+// lookupUserIdentity resolves a user id to its real email and name within an org. It
+// returns empty strings when the id is not a known account (e.g. a deleted user), so
+// callers can fall back to a synthetic address.
+func (h *FileHandler) lookupUserIdentity(orgID, userID string) (email, name string) {
+	if h.db == nil || orgID == "" || userID == "" {
+		return "", ""
+	}
+	_ = h.db.Session().Query(
+		`SELECT email, name FROM users WHERE org_id = ? AND user_id = ?`,
+		orgID, userID,
+	).Scan(&email, &name)
 	return email, name
 }
 
@@ -1816,7 +1856,9 @@ func (h *FileHandler) GetFileDetail(c *gin.Context) {
 	if entry.Modifier == "" {
 		blameUID = h.resolveFileLastModifier(repoID, filePath, entry.ID)
 	}
-	modifier, modifierName := composeLastModifier(entry.Modifier, blameUID)
+	modifier, modifierName := composeLastModifierIdentity(entry.Modifier, blameUID, func(uid string) (string, string) {
+		return h.lookupUserIdentity(orgID, uid)
+	})
 
 	// Resolve actual permission for the user
 	perm := ""
@@ -3228,11 +3270,12 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 	fileFSID := pendingFile.fsID
 
 	newEntry := FSEntry{
-		ID:    fileFSID,
-		Name:  actualFilename,
-		Mode:  ModeFile,
-		MTime: time.Now().Unix(),
-		Size:  fileSize,
+		ID:       fileFSID,
+		Name:     actualFilename,
+		Mode:     ModeFile,
+		MTime:    time.Now().Unix(),
+		Size:     fileSize,
+		Modifier: userID + sesamefsLocalDomain,
 	}
 	newDirEntries := AddEntryToList(dirEntries, newEntry)
 	newDirFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newDirEntries)

@@ -2,11 +2,24 @@ package v2
 
 import "testing"
 
-// composeLastModifier is the identity-selection logic behind file/detail's
-// last_modifier_* fields. The original bug was attributing the file to whoever made
-// the request; these tests pin that it never does, and that an unresolved modifier
-// stays empty rather than guessed.
-func TestComposeLastModifier(t *testing.T) {
+// composeLastModifierIdentity is the identity-selection logic behind file/detail's
+// last_modifier_* fields. The original bug was attributing the file to whoever made the
+// request; these tests pin that it never does, that an unresolved modifier stays empty
+// rather than guessed, and that a known user id resolves to the real account.
+func TestComposeLastModifierIdentity(t *testing.T) {
+	// knownUsers stands in for the users table. Only these ids resolve to a real
+	// account; anything else looks up empty (deleted/unknown user).
+	knownUsers := map[string][2]string{
+		"11111111-1111-1111-1111-111111111111": {"real@example.com", "Real Person"},
+		"22222222-2222-2222-2222-222222222222": {"noname@example.com", ""},
+	}
+	lookup := func(uid string) (string, string) {
+		if u, ok := knownUsers[uid]; ok {
+			return u[0], u[1]
+		}
+		return "", ""
+	}
+
 	tests := []struct {
 		name          string
 		entryModifier string
@@ -15,18 +28,45 @@ func TestComposeLastModifier(t *testing.T) {
 		wantName      string
 	}{
 		{
-			name:          "entry modifier wins and ignores blame",
+			// Seafile desktop client stores a real address directly; use it as-is.
+			name:          "real address on entry wins and ignores blame",
 			entryModifier: "alice@example.com",
-			blameUID:      "bob-uid",
+			blameUID:      "11111111-1111-1111-1111-111111111111",
 			wantEmail:     "alice@example.com",
 			wantName:      "alice",
 		},
 		{
-			name:          "blame uid used when entry has no modifier",
+			// Synthetic <uid>@sesamefs.local resolves to the real account.
+			name:          "synthetic entry modifier resolves to real account",
+			entryModifier: "11111111-1111-1111-1111-111111111111@sesamefs.local",
+			blameUID:      "",
+			wantEmail:     "real@example.com",
+			wantName:      "Real Person",
+		},
+		{
+			// Blame uid resolves to the real account when the entry has no modifier.
+			name:          "blame uid resolves to real account",
 			entryModifier: "",
 			blameUID:      "11111111-1111-1111-1111-111111111111",
-			wantEmail:     "11111111-1111-1111-1111-111111111111@sesamefs.local",
-			wantName:      "11111111-1111-1111-1111-111111111111",
+			wantEmail:     "real@example.com",
+			wantName:      "Real Person",
+		},
+		{
+			// Account exists but has no display name: derive name from the email.
+			name:          "known account without name derives name from email",
+			entryModifier: "",
+			blameUID:      "22222222-2222-2222-2222-222222222222",
+			wantEmail:     "noname@example.com",
+			wantName:      "noname",
+		},
+		{
+			// Unknown id (deleted user) falls back to the synthetic address, never
+			// to the requester.
+			name:          "unknown id falls back to synthetic address",
+			entryModifier: "",
+			blameUID:      "99999999-9999-9999-9999-999999999999",
+			wantEmail:     "99999999-9999-9999-9999-999999999999@sesamefs.local",
+			wantName:      "99999999-9999-9999-9999-999999999999",
 		},
 		{
 			// Regression guard for the original bug: with nothing resolvable the
@@ -41,7 +81,7 @@ func TestComposeLastModifier(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			email, name := composeLastModifier(tt.entryModifier, tt.blameUID)
+			email, name := composeLastModifierIdentity(tt.entryModifier, tt.blameUID, lookup)
 			if email != tt.wantEmail {
 				t.Errorf("email = %q, want %q", email, tt.wantEmail)
 			}
