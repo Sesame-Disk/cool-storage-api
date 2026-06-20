@@ -203,6 +203,23 @@ func TestHandleLanguageChange(t *testing.T) {
 			t.Fatalf("Location = %q, want %q (cross-origin referer must not be honored)", loc, "/")
 		}
 	})
+
+	t.Run("protocol-relative same-origin referer is rejected", func(t *testing.T) {
+		// "https://example.com//evil.example/phish" parses with Host "example.com"
+		// (same origin) but a path of "//evil.example/phish" — returning that as
+		// Location would be a scheme-relative open redirect.
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/i18n/?lang=es", nil)
+		c.Request.Host = "example.com"
+		c.Request.Header.Set("Referer", "https://example.com//evil.example/phish")
+
+		s.handleLanguageChange(c)
+
+		if loc := w.Header().Get("Location"); loc != "/" {
+			t.Fatalf("Location = %q, want %q (protocol-relative path must not be honored)", loc, "/")
+		}
+	})
 }
 
 // TestResolveBootstrapLocale verifies the cookie drives the resolved locale and

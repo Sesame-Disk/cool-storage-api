@@ -163,7 +163,11 @@ func sameOriginRedirectTarget(c *gin.Context) string {
 		return "/"
 	}
 	target := ref.EscapedPath()
-	if target == "" {
+	// Reject protocol-relative paths ("//host/...") — a same-origin Referer like
+	// "https://app.example.com//evil.com/path" parses with Host "app.example.com"
+	// (passing the check above) but a path that browsers treat as a scheme-relative
+	// external redirect. Fall back to "/" so /i18n/ can't be an open redirect.
+	if target == "" || strings.HasPrefix(target, "//") {
 		target = "/"
 	}
 	if ref.RawQuery != "" {
