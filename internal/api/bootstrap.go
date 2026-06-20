@@ -48,6 +48,49 @@ type bootstrapOrgData struct {
 	CurrentPeriodEndsAt    *time.Time
 }
 
+// supportedLocale is a UI language the SPA ships translation catalogs for. The set
+// mirrors the i18n whitelist in frontend/src/_i18n/* so the profile language selector
+// offers exactly the locales that can actually be loaded at runtime.
+type supportedLocale struct {
+	Code string
+	Name string
+}
+
+// supportedLocales is the single source of truth for the bootstrap language list and
+// the current-language label. Keep it in sync with the frontend i18n whitelist
+// (['en','zh-CN','fr','de','cs','es','es-AR','es-MX','ru']).
+var supportedLocales = []supportedLocale{
+	{Code: "en", Name: "English"},
+	{Code: "zh-CN", Name: "中文"},
+	{Code: "fr", Name: "Français"},
+	{Code: "de", Name: "Deutsch"},
+	{Code: "cs", Name: "Čeština"},
+	{Code: "es", Name: "Español"},
+	{Code: "es-AR", Name: "Español (Argentina)"},
+	{Code: "es-MX", Name: "Español (México)"},
+	{Code: "ru", Name: "Русский"},
+}
+
+// bootstrapLangList renders supportedLocales as the bootstrap payload's langList.
+func bootstrapLangList() []gin.H {
+	list := make([]gin.H, 0, len(supportedLocales))
+	for _, l := range supportedLocales {
+		list = append(list, gin.H{"langCode": l.Code, "langName": l.Name})
+	}
+	return list
+}
+
+// localeDisplayName returns the human-readable name for a language code, falling
+// back to the code itself for an unknown locale.
+func localeDisplayName(code string) string {
+	for _, l := range supportedLocales {
+		if l.Code == code {
+			return l.Name
+		}
+	}
+	return code
+}
+
 func buildBootstrapBackendRoutes() gin.H {
 	return gin.H{
 		"languageChange":        "i18n/?lang={langCode}",
@@ -414,16 +457,11 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"langCode":                      "en",
 		"currentLang": gin.H{
 			"langCode": "en",
-			"langName": "en",
+			"langName": localeDisplayName("en"),
 		},
 		"backendRoutes":           buildBootstrapBackendRoutes(),
 		"inlinePreviewExtensions": append([]string(nil), s.config.FileView.PreviewExtensions...),
-		"langList": []gin.H{
-			{
-				"langCode": "en",
-				"langName": "en",
-			},
-		},
+		"langList":                bootstrapLangList(),
 		"userRole":                role,
 		"orgID":                   identity.OrgID,
 		"canAddRepo":              false,

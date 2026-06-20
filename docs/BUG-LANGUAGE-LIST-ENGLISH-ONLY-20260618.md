@@ -53,3 +53,17 @@ Populate `langList` from the supported locales instead of the single hard-coded 
 Better: derive the list from a single source of truth (a config key or the same locale set the i18n whitelist uses) so the selector and the loadable catalogs can't drift. Also fix the current-language label (`currentLang.langName` is `"en"` rather than `"English"`).
 
 Note: there is currently **no persisted per-user language field** in the profile API — language is applied via an `i18n/?lang=<code>` redirect that sets a cookie. If language should persist per user, add a `language` field to the account/profile and have the SPA apply it on load. The guard test only checks that the selector offers more than English; persistence is a separate enhancement.
+
+## Status (2026-06-19): partially fixed — selector now lists all locales
+
+`buildAppBootstrapPageOptions` now emits the full locale set (`bootstrapLangList`, single
+source `supportedLocales`) instead of a single English entry, so the **selector offers all
+9 languages** — the reported bug is resolved.
+
+**Remaining follow-up (open, not backend-only):** `currentLang.langCode` is still hard-coded
+to `"en"`, so the selector won't reflect the user's *active* choice after switching, and the
+`languageChange` URL (`i18n/?lang=…`) has **no backend handler** — language switching is not
+wired end-to-end. Completing it needs: (1) an `/i18n/` endpoint (or a persisted per-user
+`language` field), and (2) `buildAppBootstrapPageOptions` resolving `currentLang` from that
+cookie/preference (`localeDisplayName` already maps the code → name). Treat the current change
+as "expose supported locales", not "complete language handling".
