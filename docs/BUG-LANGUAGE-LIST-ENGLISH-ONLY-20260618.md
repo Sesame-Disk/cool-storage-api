@@ -127,6 +127,31 @@ Guard tests in `internal/api/bootstrap_test.go`: `TestBootstrapLangListOffersAll
 (pins the original >1-locale regression), `TestBuildAppBootstrapPageOptionsReflectsLocale`,
 `TestResolveBootstrapLocale`, `TestHandleLanguageChange` (cookie + redirect + cross-origin).
 
+### Known limitations / follow-ups (2026-06-20)
+
+Two further gaps were identified during review. Both are real but neither is an appropriate
+quick fix in this branch, so they are documented here as follow-ups.
+
+**1. Cross-domain locale sync — 🟡 enhancement.** The `lang` cookie is host-only
+(`SetCookie(..., "/", "", ...)` with an empty domain). In the standard single-domain deployment
+(nginx path-routes share links `/d/` on the same host) the preference crosses the whole app fine.
+But in a **multi-domain** deployment it does not: a user who selects a language on
+`us.sesamefs.com` and then opens a share link on `eu.sesamefs.com` (multi-region, see
+TECHNICAL-DEBT.md §1) — or on a custom share domain — will not carry the preference, because a
+host-only cookie is not sent to a different host. A parent-domain cookie (`.sesamefs.com`) would
+only help subdomains of one registrable domain, not truly separate domains; real cross-domain
+sync needs a token/redirect handoff or a per-user persisted `language` field. Out of scope here.
+
+**2. Cookie `Secure` flag is dropped behind a TLS-terminating proxy — 🟡 security debt
+(cross-cutting).** `handleLanguageChange` sets `isSecure := c.Request.TLS != nil`. In production
+nginx terminates TLS and proxies to Go over plain HTTP, so `c.Request.TLS` is `nil` and the
+`lang` cookie never gets the `Secure` attribute even on HTTPS. **The same pattern applies to the
+`sesamefs_auth` cookie** (`server.go` set + logout clear), which is the higher-stakes case. The
+codebase already trusts `X-Forwarded-Proto` elsewhere (`server.go` scheme detection), so the
+cookie code is inconsistent. The correct fix is a shared `cookieIsSecure(c)` helper (TLS OR
+`X-Forwarded-Proto == https`) applied to all cookie call sites — a repo-wide change, not a
+lang-only patch. Tracked in TECHNICAL-DEBT.md §21.
+
 ---
 
 ### Original triage notes (2026-06-19)
