@@ -1332,6 +1332,12 @@ func (h *FSHelper) copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, fsID st
 			Mode:  entry.Mode,
 			MTime: entry.MTime,
 			Size:  entry.Size,
+			// Carry the source modifier across the cross-library copy so each copied
+			// child keeps its real last-modifier identity instead of losing it. A child
+			// with an empty Modifier (only entries predating modifier stamping) stays
+			// empty and falls back to destination blame -- see the note in
+			// processSingleItem; not saneable here as this walk has no per-child path.
+			Modifier: entry.Modifier,
 		}
 	}
 

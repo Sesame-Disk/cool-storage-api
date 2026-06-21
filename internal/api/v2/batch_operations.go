@@ -623,6 +623,18 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			Mode:  srcResult.TargetEntry.Mode,
 			MTime: time.Now().Unix(),
 			Size:  srcResult.TargetEntry.Size,
+			// Preserve the source's last modifier across a cross-library copy/move --
+			// the content (and so who last changed it) is unchanged. Same-repo copy
+			// keeps it implicitly via the struct copy; mirror that here so file/detail
+			// reads the field straight off the entry instead of falling back to blame.
+			//
+			// Caveat: an entry whose Modifier is empty (only entries created before
+			// modifier stamping) stays empty here, so file/detail will blame the
+			// destination history and credit the user who did the copy/move rather than
+			// the original editor. Resolving the true editor would need a blame walk in
+			// the source library at copy time -- not done: such entries do not exist in
+			// production data (server is pre-deploy, no legacy-data compat is kept).
+			Modifier: srcResult.TargetEntry.Modifier,
 		}
 		newDstEntries := AddEntryToList(dstEntries, newEntry)
 

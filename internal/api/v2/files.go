@@ -1636,6 +1636,12 @@ func (h *FileHandler) getFileDownloadURL(c *gin.Context, orgID, userID, repoID, 
 // that introduced the current fs_id is not reached within this many commits, the
 // modifier is reported as unresolved ("") rather than misattributed to whoever happened
 // to author the oldest commit examined -- a wrong-but-subtle answer is worse than none.
+//
+// This blame walk is the fallback path only. Files written through upload, OnlyOffice,
+// copy/move and the desktop client carry a Modifier on the fs entry, so file/detail
+// reads it directly and never walks. The walk (bounded at cap * path-depth fs reads)
+// is reached mainly for older entries created before modifier stamping, where its cost
+// is capped and its result acceptable-or-empty.
 const fileLastModifierWalkCap = 64
 
 // resolveFileLastModifier returns the user id of the author who last changed the file
@@ -1648,7 +1654,7 @@ func (h *FileHandler) resolveFileLastModifier(repoID, filePath, currentFSID stri
 	}
 	fsHelper := NewFSHelper(h.db)
 
-	_, headCommitID, err := fsHelper.GetRootFSID(repoID)
+	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
 	if err != nil || headCommitID == "" {
 		return ""
 	}
@@ -1849,9 +1855,14 @@ func (h *FileHandler) GetFileDetail(c *gin.Context) {
 	starred = starredHandler.IsFileStarred(userID, repoID, filePath)
 
 	// Resolve the file's REAL last modifier -- never the requesting user. Prefer the
-	// modifier persisted on the fs entry (set by OnlyOffice saves); otherwise blame
-	// the commit history (only walked when the entry carries no modifier). If it cannot
-	// be resolved, the field is left empty rather than misattributed to the caller.
+	// modifier persisted on the fs entry (set by uploads and OnlyOffice saves); otherwise
+	// blame the commit history (only walked when the entry carries no modifier). If it
+	// cannot be resolved, the field is left empty rather than misattributed to the caller.
+	//
+	// Note: files written through a public upload/update link are attributed to the link
+	// creator, not the anonymous visitor -- the upload token carries the creator's user
+	// id (seafhttp sets user_id = token.UserID), so that id is what gets stamped/blamed.
+	// An anonymous visitor has no account identity to attribute, so this is intentional.
 	blameUID := ""
 	if entry.Modifier == "" {
 		blameUID = h.resolveFileLastModifier(repoID, filePath, entry.ID)
