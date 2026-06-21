@@ -1332,6 +1332,9 @@ func (h *FSHelper) copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, fsID st
 			Mode:  entry.Mode,
 			MTime: entry.MTime,
 			Size:  entry.Size,
+			// Carry the source modifier across the cross-library copy so each copied
+			// child keeps its real last-modifier identity instead of losing it.
+			Modifier: entry.Modifier,
 		}
 	}
 

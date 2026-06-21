@@ -623,6 +623,11 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			Mode:  srcResult.TargetEntry.Mode,
 			MTime: time.Now().Unix(),
 			Size:  srcResult.TargetEntry.Size,
+			// Preserve the source's last modifier across a cross-library copy/move --
+			// the content (and so who last changed it) is unchanged. Same-repo copy
+			// keeps it implicitly via the struct copy; mirror that here so file/detail
+			// reads the field straight off the entry instead of falling back to blame.
+			Modifier: srcResult.TargetEntry.Modifier,
 		}
 		newDstEntries := AddEntryToList(dstEntries, newEntry)
 
