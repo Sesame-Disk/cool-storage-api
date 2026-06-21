@@ -617,25 +617,11 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			entryFSID = newFSID
 		}
 
-		newEntry := FSEntry{
-			Name:  currentItemName,
-			ID:    entryFSID,
-			Mode:  srcResult.TargetEntry.Mode,
-			MTime: time.Now().Unix(),
-			Size:  srcResult.TargetEntry.Size,
-			// Preserve the source's last modifier across a cross-library copy/move --
-			// the content (and so who last changed it) is unchanged. Same-repo copy
-			// keeps it implicitly via the struct copy; mirror that here so file/detail
-			// reads the field straight off the entry instead of falling back to blame.
-			//
-			// Caveat: an entry whose Modifier is empty (only entries created before
-			// modifier stamping) stays empty here, so file/detail will blame the
-			// destination history and credit the user who did the copy/move rather than
-			// the original editor. Resolving the true editor would need a blame walk in
-			// the source library at copy time -- not done: such entries do not exist in
-			// production data (server is pre-deploy, no legacy-data compat is kept).
-			Modifier: srcResult.TargetEntry.Modifier,
-		}
+		// Preserve content identity/timestamps across the cross-library copy/move
+		// (see copiedFileEntry): MTime and Modifier describe the file's content, which
+		// the copy does not change, so file/detail stays consistent and does not fall
+		// back to blaming the destination history with the copier's name.
+		newEntry := copiedFileEntry(*srcResult.TargetEntry, entryFSID, currentItemName)
 		newDstEntries := AddEntryToList(dstEntries, newEntry)
 
 		newDstDirFSID, err := fsHelper.CreateDirectoryFSObject(dstRepoID, newDstEntries)
