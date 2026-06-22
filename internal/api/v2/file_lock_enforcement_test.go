@@ -143,6 +143,133 @@ func TestBatchDeleteItems_RejectsLockedFile(t *testing.T) {
 	}
 }
 
+func TestRevertFile_ReplaceRejectsLockedFile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withCheckFileLockedByOtherStub(t, func(_ *FileHandler, repoID, filePath, userID string) (bool, string, error) {
+		if repoID == "repo-1" && filePath == "/locked.txt" && userID == "test-user" {
+			return true, "owner-321", nil
+		}
+		return false, "", nil
+	})
+
+	r := gin.New()
+	handler := &FileHandler{}
+	r.POST("/repos/:repo_id/file/revert", func(c *gin.Context) {
+		c.Set("org_id", "test-org")
+		c.Set("user_id", "test-user")
+		handler.RevertFile(c)
+	})
+
+	body, _ := json.Marshal(map[string]interface{}{"commit_id": "deadbeef", "conflict_policy": "replace"})
+	req := httptest.NewRequest("POST", "/repos/repo-1/file/revert?p=/locked.txt", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	resp := decodeJSONMap(t, w.Body)
+	if got := resp["lock_owner"]; got != "owner-321" {
+		t.Fatalf("lock_owner = %v, want %q", got, "owner-321")
+	}
+}
+
+func TestRevertFile_LockLookupFailureReturns503(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withCheckFileLockedByOtherStub(t, func(_ *FileHandler, _, _, _ string) (bool, string, error) {
+		return false, "", errors.New("lookup failed")
+	})
+
+	r := gin.New()
+	handler := &FileHandler{}
+	r.POST("/repos/:repo_id/file/revert", func(c *gin.Context) {
+		c.Set("org_id", "test-org")
+		c.Set("user_id", "test-user")
+		handler.RevertFile(c)
+	})
+
+	body, _ := json.Marshal(map[string]interface{}{"commit_id": "deadbeef", "conflict_policy": "replace"})
+	req := httptest.NewRequest("POST", "/repos/repo-1/file/revert?p=/locked.txt", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// A non-replace revert restores under a new name (or skips) and never overwrites the
+// locked file, so the lock check must not even be consulted — guarding against a future
+// change that would make enforcement unconditional and break autorename reverts.
+func TestRevertFile_AutorenameSkipsLockCheck(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	called := false
+	withCheckFileLockedByOtherStub(t, func(_ *FileHandler, _, _, _ string) (bool, string, error) {
+		called = true
+		return true, "owner-321", nil
+	})
+
+	r := gin.New()
+	r.Use(gin.Recovery()) // RevertFile reaches the nil DB after the (skipped) lock guard
+	handler := &FileHandler{}
+	r.POST("/repos/:repo_id/file/revert", func(c *gin.Context) {
+		c.Set("org_id", "test-org")
+		c.Set("user_id", "test-user")
+		handler.RevertFile(c)
+	})
+
+	body, _ := json.Marshal(map[string]interface{}{"commit_id": "deadbeef", "conflict_policy": "autorename"})
+	req := httptest.NewRequest("POST", "/repos/repo-1/file/revert?p=/locked.txt", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if called {
+		t.Fatalf("lock check was consulted for a non-replace revert; want it skipped")
+	}
+	if w.Code == http.StatusForbidden {
+		t.Fatalf("status = %d, want non-403 for autorename revert", w.Code)
+	}
+}
+
+func TestRevertDirectory_ReplaceRejectsLockedSubtree(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withCheckSubtreeLockedByOtherStub(t, func(_ *FileHandler, repoID, dirPath, userID string) (bool, string, error) {
+		if repoID == "repo-1" && dirPath == "/locked-dir" && userID == "test-user" {
+			return true, "owner-654", nil
+		}
+		return false, "", nil
+	})
+
+	r := gin.New()
+	handler := &FileHandler{}
+	r.POST("/repos/:repo_id/dir/revert", func(c *gin.Context) {
+		c.Set("org_id", "test-org")
+		c.Set("user_id", "test-user")
+		handler.RevertDirectory(c)
+	})
+
+	body, _ := json.Marshal(map[string]interface{}{"commit_id": "deadbeef", "conflict_policy": "replace"})
+	req := httptest.NewRequest("POST", "/repos/repo-1/dir/revert?p=/locked-dir", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	resp := decodeJSONMap(t, w.Body)
+	if got := resp["lock_owner"]; got != "owner-654" {
+		t.Fatalf("lock_owner = %v, want %q", got, "owner-654")
+	}
+}
+
 func TestLockFile_ConflictReturns409(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	oldAcquire := acquireFileLock

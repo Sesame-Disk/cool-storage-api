@@ -4250,6 +4250,14 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 		return
 	}
 
+	// LOCK ENFORCEMENT: a replace-revert overwrites the file at this path, so reject it
+	// when the file is locked by another user. Non-replace policies never overwrite the
+	// existing file (autorename/keep_both restore under a new name, skip/conflict do
+	// nothing), so they are exempt — matching the copy path's replace-only enforcement.
+	if conflictPolicy == "replace" && !h.requireFileNotLockedByOther(c, repoID, filePath, userID) {
+		return
+	}
+
 	fsHelper := NewFSHelper(h.db)
 
 	// Get the root_fs_id from the target commit
@@ -4445,6 +4453,14 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 	// CUSTOM PERMISSION CHECK: modify flag
 	if h.permMiddleware != nil && !h.permMiddleware.RequirePermFlag(c, "modify") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "modify is not allowed by your permission"})
+		return
+	}
+
+	// LOCK ENFORCEMENT: a replace-revert overwrites the directory subtree at this path,
+	// which would clobber a file locked by another user inside it. Reject when the path
+	// or any descendant is locked by someone else. Non-replace policies restore under a
+	// new name (or skip), so they never touch the locked file and are exempt.
+	if conflictPolicy == "replace" && !h.requireSubtreeNotLockedByOther(c, repoID, dirPath, userID) {
 		return
 	}
 
