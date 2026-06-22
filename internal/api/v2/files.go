@@ -1266,7 +1266,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			Mode:     ModeFile,
 			MTime:    time.Now().Unix(),
 			Size:     fileSize,
-			Modifier: userID + sesamefsLocalDomain,
+			Modifier: modifierIdentityForUser(userID),
 		}
 		newEntries := AddEntryToList(parentEntries, newEntry)
 
@@ -1736,6 +1736,21 @@ func resolveLastModifierFromWalk(
 // user-id reference (web/OnlyOffice) rather than a real address (Seafile desktop client).
 const sesamefsLocalDomain = "@sesamefs.local"
 
+func modifierIdentityForUser(userID string) string {
+	return userID + sesamefsLocalDomain
+}
+
+// contentModifiedFileEntry stamps a real content mutation on an existing file entry.
+// Operations like revert reintroduce historical content, but they are still a new edit
+// performed by the current user, so the operation refreshes mtime and last-modifier
+// while preserving the file's fs_id/size/mode for the chosen content version.
+func contentModifiedFileEntry(src FSEntry, newName, userID string, modifiedAt int64) FSEntry {
+	src.Name = newName
+	src.MTime = modifiedAt
+	src.Modifier = modifierIdentityForUser(userID)
+	return src
+}
+
 // composeLastModifierIdentity resolves the file's real last-modifier identity for
 // file/detail. It NEVER falls back to the requesting user: an unresolved modifier stays
 // empty, which the API surfaces as blank rather than wrong.
@@ -1768,7 +1783,7 @@ func composeLastModifierIdentity(entryModifier, blameUID string, lookup func(uid
 			return realEmail, realName
 		}
 	}
-	return uid + sesamefsLocalDomain, uid
+	return modifierIdentityForUser(uid), uid
 }
 
 // lookupUserIdentity resolves a user id to its real email and name within an org. It
@@ -2603,9 +2618,9 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 			}
 		}
 
-		copiedEntry := *srcResult.TargetEntry
-		copiedEntry.Name = currentItemName
-		copiedEntry.MTime = time.Now().Unix()
+		// Same-repo copy keeps the same content fs_id, so the copied dirent should
+		// preserve content mtime/modifier exactly like the batch-operation path.
+		copiedEntry := copiedFileEntry(*srcResult.TargetEntry, srcResult.TargetEntry.ID, currentItemName)
 
 		deltaBytes, deltaFiles, err := fsEntryDelta(fsHelper, repoID, copiedEntry, replacedEntry)
 		if err != nil {
@@ -3286,7 +3301,7 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		Mode:     ModeFile,
 		MTime:    time.Now().Unix(),
 		Size:     fileSize,
-		Modifier: userID + sesamefsLocalDomain,
+		Modifier: modifierIdentityForUser(userID),
 	}
 	newDirEntries := AddEntryToList(dirEntries, newEntry)
 	newDirFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newDirEntries)
@@ -4043,9 +4058,10 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 			replacedEntry = &ent
 		}
 
-		revertedEntry := oldEntry
-		revertedEntry.Name = currentFileName
-		revertedEntry.MTime = time.Now().Unix()
+		// Reverting to historical content is still a new content mutation authored by
+		// the current user, so the restored entry must be re-stamped instead of
+		// carrying the historical modifier forward.
+		revertedEntry := contentModifiedFileEntry(oldEntry, currentFileName, userID, time.Now().Unix())
 
 		currentDeltaBytes, currentDeltaFiles, err := fsEntryDelta(fsHelper, repoID, revertedEntry, replacedEntry)
 		if err != nil {

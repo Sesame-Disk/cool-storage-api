@@ -92,6 +92,38 @@ func TestComposeLastModifierIdentity(t *testing.T) {
 	}
 }
 
+func TestContentModifiedFileEntry(t *testing.T) {
+	src := FSEntry{
+		Name:     "draft.docx",
+		ID:       "historic-fsid",
+		Mode:     ModeFile,
+		MTime:    100,
+		Size:     4096,
+		Modifier: "original-author@sesamefs.local",
+	}
+
+	got := contentModifiedFileEntry(src, "restored.docx", "reverter-uid", 200)
+
+	if got.Name != "restored.docx" {
+		t.Errorf("Name = %q, want %q", got.Name, "restored.docx")
+	}
+	if got.ID != src.ID {
+		t.Errorf("ID = %q, want %q", got.ID, src.ID)
+	}
+	if got.Mode != src.Mode {
+		t.Errorf("Mode = %d, want %d", got.Mode, src.Mode)
+	}
+	if got.Size != src.Size {
+		t.Errorf("Size = %d, want %d", got.Size, src.Size)
+	}
+	if got.MTime != 200 {
+		t.Errorf("MTime = %d, want %d", got.MTime, 200)
+	}
+	if got.Modifier != "reverter-uid@sesamefs.local" {
+		t.Errorf("Modifier = %q, want %q", got.Modifier, "reverter-uid@sesamefs.local")
+	}
+}
+
 // walkFixture builds the loadCommit / fileFSIDAt closures from an in-memory commit
 // graph so the blame walk can be exercised without a database.
 type walkCommit struct {

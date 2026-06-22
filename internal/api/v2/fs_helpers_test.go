@@ -1063,6 +1063,19 @@ func TestCopiedFileEntry(t *testing.T) {
 		t.Errorf("Size = %d, want %d", got.Size, src.Size)
 	}
 
+	// Same-repo copy keeps the source fs_id but must still preserve mtime/modifier
+	// rather than treating the copy operation as a content edit.
+	sameRepo := copiedFileEntry(src, src.ID, "report copy.docx")
+	if sameRepo.ID != src.ID {
+		t.Errorf("same-repo ID = %q, want %q", sameRepo.ID, src.ID)
+	}
+	if sameRepo.MTime != src.MTime {
+		t.Errorf("same-repo MTime = %d, want %d", sameRepo.MTime, src.MTime)
+	}
+	if sameRepo.Modifier != src.Modifier {
+		t.Errorf("same-repo Modifier = %q, want %q", sameRepo.Modifier, src.Modifier)
+	}
+
 	// An entry with no stamped modifier copies as empty (it will fall back to blame at
 	// read time); the copy itself must not invent an identity.
 	legacy := FSEntry{Name: "old.txt", ID: "x", Mode: ModeFile, MTime: 5, Size: 1}
