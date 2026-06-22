@@ -40,6 +40,12 @@ func decodeJSONMap(t *testing.T, body *bytes.Buffer) map[string]interface{} {
 	return resp
 }
 
+func newTestGinContext() (*gin.Context, *httptest.ResponseRecorder) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	return ctx, recorder
+}
+
 func TestMoveFile_BatchRejectsLockedFile(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	withCheckSubtreeLockedByOtherStub(t, func(_ *FileHandler, repoID, filePath, userID string) (bool, string, error) {
@@ -203,9 +209,9 @@ func TestRevertFile_LockLookupFailureReturns503(t *testing.T) {
 }
 
 // A non-replace revert restores under a new name (or skips) and never overwrites the
-// locked file, so the lock check must not even be consulted — guarding against a future
+// locked file, so the lock check must not even be consulted - guarding against a future
 // change that would make enforcement unconditional and break autorename reverts.
-func TestRevertFile_AutorenameSkipsLockCheck(t *testing.T) {
+func TestRequireReplaceRevertFileNotLockedByOther_AutorenameSkipsLockCheck(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	called := false
 	withCheckFileLockedByOtherStub(t, func(_ *FileHandler, _, _, _ string) (bool, string, error) {
@@ -213,27 +219,20 @@ func TestRevertFile_AutorenameSkipsLockCheck(t *testing.T) {
 		return true, "owner-321", nil
 	})
 
-	r := gin.New()
-	r.Use(gin.Recovery()) // RevertFile reaches the nil DB after the (skipped) lock guard
+	ctx, recorder := newTestGinContext()
 	handler := &FileHandler{}
-	r.POST("/repos/:repo_id/file/revert", func(c *gin.Context) {
-		c.Set("org_id", "test-org")
-		c.Set("user_id", "test-user")
-		handler.RevertFile(c)
-	})
 
-	body, _ := json.Marshal(map[string]interface{}{"commit_id": "deadbeef", "conflict_policy": "autorename"})
-	req := httptest.NewRequest("POST", "/repos/repo-1/file/revert?p=/locked.txt", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-
-	r.ServeHTTP(w, req)
-
+	if !handler.requireReplaceRevertFileNotLockedByOther(ctx, "repo-1", "/locked.txt", "test-user", "autorename") {
+		t.Fatal("guard returned false for autorename; want true without consulting the lock check")
+	}
 	if called {
 		t.Fatalf("lock check was consulted for a non-replace revert; want it skipped")
 	}
-	if w.Code == http.StatusForbidden {
-		t.Fatalf("status = %d, want non-403 for autorename revert", w.Code)
+	if ctx.IsAborted() {
+		t.Fatal("context was aborted, want it left untouched")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("response body = %q, want empty", recorder.Body.String())
 	}
 }
 
@@ -267,6 +266,59 @@ func TestRevertDirectory_ReplaceRejectsLockedSubtree(t *testing.T) {
 	resp := decodeJSONMap(t, w.Body)
 	if got := resp["lock_owner"]; got != "owner-654" {
 		t.Fatalf("lock_owner = %v, want %q", got, "owner-654")
+	}
+}
+
+func TestRevertDirectory_LockLookupFailureReturns503(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withCheckSubtreeLockedByOtherStub(t, func(_ *FileHandler, _, _, _ string) (bool, string, error) {
+		return false, "", errors.New("lookup failed")
+	})
+
+	r := gin.New()
+	handler := &FileHandler{}
+	r.POST("/repos/:repo_id/dir/revert", func(c *gin.Context) {
+		c.Set("org_id", "test-org")
+		c.Set("user_id", "test-user")
+		handler.RevertDirectory(c)
+	})
+
+	body, _ := json.Marshal(map[string]interface{}{"commit_id": "deadbeef", "conflict_policy": "replace"})
+	req := httptest.NewRequest("POST", "/repos/repo-1/dir/revert?p=/locked-dir", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// A non-replace directory revert restores under a new name (or skips), so it never
+// clobbers a file locked inside the subtree and must not consult the lock check.
+func TestRequireReplaceRevertDirectoryNotLockedByOther_KeepBothSkipsLockCheck(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	called := false
+	withCheckSubtreeLockedByOtherStub(t, func(_ *FileHandler, _, _, _ string) (bool, string, error) {
+		called = true
+		return true, "owner-654", nil
+	})
+
+	ctx, recorder := newTestGinContext()
+	handler := &FileHandler{}
+
+	if !handler.requireReplaceRevertDirectoryNotLockedByOther(ctx, "repo-1", "/locked-dir", "test-user", "keep_both") {
+		t.Fatal("guard returned false for keep_both; want true without consulting the lock check")
+	}
+	if called {
+		t.Fatalf("subtree lock check was consulted for a non-replace revert; want it skipped")
+	}
+	if ctx.IsAborted() {
+		t.Fatal("context was aborted, want it left untouched")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("response body = %q, want empty", recorder.Body.String())
 	}
 }
 

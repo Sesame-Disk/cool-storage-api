@@ -79,6 +79,25 @@ type fileLockRow struct {
 	lockedAt time.Time
 }
 
+var listLocksUnderFn = listLocksUnder
+
+var relocateLockRowCASFn = func(session *gocql.Session, repoUUID gocql.UUID, oldPath, newPath string, lockedBy gocql.UUID, lockedAt time.Time, userUUID gocql.UUID) (bool, error) {
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Query(
+		`INSERT INTO locked_files (repo_id, path, locked_by, locked_at) VALUES (?, ?, ?, ?) IF NOT EXISTS`,
+		repoUUID, newPath, lockedBy, lockedAt,
+	)
+	batch.Query(
+		`DELETE FROM locked_files WHERE repo_id = ? AND path = ? IF locked_by = ?`,
+		repoUUID, oldPath, userUUID,
+	)
+	applied, iter, err := session.MapExecuteBatchCAS(batch, map[string]interface{}{})
+	if iter != nil {
+		_ = iter.Close()
+	}
+	return applied, err
+}
+
 // listLocksUnder returns every lock at exactly root or beneath root+"/". Paths are
 // expected pre-normalized by the caller (package db cannot reuse the v2 normalizer).
 func listLocksUnder(session *gocql.Session, repoUUID gocql.UUID, root string) ([]fileLockRow, error) {
@@ -117,7 +136,7 @@ func ClearLocksUnder(session *gocql.Session, repoID, root, userID string) error 
 	if err != nil {
 		return nil
 	}
-	rows, err := listLocksUnder(session, repoUUID, root)
+	rows, err := listLocksUnderFn(session, repoUUID, root)
 	if err != nil {
 		return err
 	}
@@ -158,10 +177,11 @@ func RelocateLocksUnder(session *gocql.Session, repoID, oldRoot, newRoot, userID
 	if err != nil {
 		return nil
 	}
-	rows, err := listLocksUnder(session, repoUUID, oldRoot)
+	rows, err := listLocksUnderFn(session, repoUUID, oldRoot)
 	if err != nil {
 		return err
 	}
+	var notApplied []string
 	for _, r := range rows {
 		if r.lockedBy != userUUID {
 			continue
@@ -174,24 +194,24 @@ func RelocateLocksUnder(session *gocql.Session, repoID, oldRoot, newRoot, userID
 		// single conditional batch on the same partition (repo_id). Either both apply
 		// or neither does, so a failure can never leave the lock at BOTH paths. The
 		// conditions keep it safe: insert only if the new path is free, delete only if
-		// we still hold the old one. When not applied, nothing changed and the source
-		// lock is left intact (no phantom row).
-		batch := session.Batch(gocql.LoggedBatch)
-		batch.Query(
-			`INSERT INTO locked_files (repo_id, path, locked_by, locked_at) VALUES (?, ?, ?, ?) IF NOT EXISTS`,
-			repoUUID, newPath, r.lockedBy, r.lockedAt,
-		)
-		batch.Query(
-			`DELETE FROM locked_files WHERE repo_id = ? AND path = ? IF locked_by = ?`,
-			repoUUID, r.path, userUUID,
-		)
-		_, iter, berr := session.MapExecuteBatchCAS(batch, map[string]interface{}{})
-		if iter != nil {
-			_ = iter.Close()
-		}
+		// we still hold the old one.
+		applied, berr := relocateLockRowCASFn(session, repoUUID, r.path, newPath, r.lockedBy, r.lockedAt, userUUID)
 		if berr != nil {
 			return fmt.Errorf("%w: %v", ErrFileLockStatusUnavailable, berr)
 		}
+		if !applied {
+			// The conditional batch did not apply: the destination path was already
+			// locked, or we no longer held the source lock. Because the batch is atomic,
+			// nothing changed — so the source row may now be a stale lock on a path that
+			// the rename/move already vacated, with the destination left unlocked. Do
+			// NOT report success for this row; surface it so the caller logs it. Keep
+			// relocating the remaining rows rather than abandoning them mid-subtree.
+			notApplied = append(notApplied, r.path)
+		}
+	}
+	if len(notApplied) > 0 {
+		return fmt.Errorf("%w: conditional lock relocation not applied for %d path(s): %v",
+			ErrFileLockStatusUnavailable, len(notApplied), notApplied)
 	}
 	return nil
 }

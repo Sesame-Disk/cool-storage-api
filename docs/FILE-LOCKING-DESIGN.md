@@ -54,12 +54,30 @@ Use `libraries.owner_id` to recognise the library owner (and any future admin ro
    - **Move** (same-repo, via `processSingleItem`/`processSameRepoMove`) → clears the source locks (the destination name is autorename-dependent, so we clear rather than guess; the owner re-locks at the destination).
    - All run **after** the FS commit succeeds and only touch `locked_files`; failures are logged, never failing the structural op.
 
-3. ⏳ **PENDING.** Add `lock_type` + expiry; wire OnlyOffice open→lock and callback→unlock; allow co-editors; block sync writes. Requires an OnlyOffice document server to test end-to-end (the `sesamefs-locks.spec.ts` OnlyOffice case skips until one is configured).
+3. ⏳ **PENDING.** Add `lock_type` + expiry; wire OnlyOffice open→lock and callback→unlock; allow co-editors; block sync writes. Requires an OnlyOffice document server to test end-to-end (the `sesamefs-locks.spec.ts` OnlyOffice case skips until one is configured). See [Future dedicated branches](#future-dedicated-branches-large-scoped-work) below.
+
+## Future dedicated branches (large, scoped work)
+
+These are too big to ride along on an enforcement branch and each wants its own branch + design pass. They are NOT blockers for the current `manual`-lock enforcement, which is complete and shippable on its own.
+
+### A. `lock_type` + expiry + OnlyOffice co-editing (step 3 above)
+- **Schema:** add `lock_type TEXT` (`manual` | `online_office`) and `expires_at TIMESTAMP` (nullable) to `locked_files`. Pre-deploy, edit `001_initial_schema.cql` directly (per project schema policy) — no incremental migration.
+- **`manual` TTL:** acquire/refresh sets `expires_at = now + TTL`; reads treat an expired row as unlocked (lazy expiry on read, plus optional GC sweep). Add a `refresh-lock` operation to `LockFile` so a live client keeps its lock. This removes the "crashed client holds a lock forever" debt.
+- **`online_office` (shared, NOT exclusive):** `GetEditorConfig` sets an `online_office` lock for the path if none exists. It must **not** block other users joining the same OnlyOffice session (OnlyOffice merges edits), but it **does** block `manual` acquisition and all sync/direct writes (→ `423 Locked` / `403`). The save callback `EditorCallback` is the **only** authorized writer past the lock (status `2`/`6` publish); on "no editors left" (status `4`, doc-key mapping torn down) it **releases** the `online_office` lock. Never auto-promote to exclusive.
+- **Enforcement seam:** the existing `FileLockedByOther` / `SubtreeLockedByOther` helpers must learn to distinguish lock types (an `online_office` lock blocks sync writers but admits the OnlyOffice callback). Keep them fail-closed.
+- **Testing:** needs a real OnlyOffice document server; `sesamefs-locks.spec.ts` OnlyOffice case stays skipped until one is configured in the cluster (currently `enabled: false`).
+
+### B. Cross-repo / autorename-aware lock relocation
+- Same-repo move currently **clears** source locks (it can't predict the autorenamed destination name), and cross-repo move does no lock maintenance at all. Result today is safe-but-lossy: the operator's own lock is dropped, never a stale/phantom row.
+- A dedicated branch should thread the **actual committed destination name** (post-autorename) out of the move/copy FS commit and feed it to `RelocateLocksUnder` so the lock follows the file exactly, across repos too. Until then, `RelocateLocksUnder` correctly refuses to fake success when its conditional batch does not apply (see "Known remaining debt").
+
+### C. Role-based force-unlock
+- Recognising `libraries.owner_id` (and a future admin role) as the principal allowed to **force-unlock** either lock type. The current `rw`/`r` split is not enough — there is no one today who can clear a lock they don't own. Pairs naturally with the TTL work in (A).
 
 ## Known remaining debt (not blockers, tracked for follow-up)
 
-- **Move relocation across repos / autorename name** — same-repo move clears source locks rather than relocating to the exact (possibly autorenamed) destination; cross-repo move lock maintenance is not wired. Acceptable: no stale/phantom rows result, only a dropped own-lock.
+- **Move relocation across repos / autorename name** — same-repo move clears source locks rather than relocating to the exact (possibly autorenamed) destination; cross-repo move lock maintenance is not wired. Acceptable: no stale/phantom rows result, only a dropped own-lock. Tracked as [future branch B](#future-dedicated-branches-large-scoped-work). `RelocateLocksUnder` now honours the LWT `applied` flag: a conditional batch that does not apply is reported as `ErrFileLockStatusUnavailable` (caller logs it) instead of being treated as success, so a not-applied relocation can no longer silently leave a stale source lock + unlocked destination.
 - **`SubtreeLockedByOther` / lock maintenance scan the whole per-repo lock partition** — fine while locks-per-repo stays low; revisit (secondary index or bounded scan) if a repo can accumulate many simultaneous locks, as folder rename/move/delete pay one scan each.
 - **Lock TTL/expiry** — locks are still permanent (no `expires_at`), so a crashed client can hold one until an owner/admin unlocks. Auto-expiry + `refresh-lock` are part of step 3.
 - **Public upload/update-link actor semantics** — a link upload acts as the token's owner, so it would pass an owner lock check. Decide whether link uploads should be treated as an external actor (subject to locks) before relying on locks against link writes.
-- ✅ **DONE (2026-06-22). `RevertFile` / `RevertDirectory`** — a `replace`-policy revert overwrites the target, so it is now lock-checked: `RevertFile` enforces the **exact-path** lock, `RevertDirectory` the **subtree** lock, both only when `conflict_policy == "replace"` (autorename/keep_both restore under a new name and skip does nothing, so they never overwrite a locked file — exempt, mirroring the copy path). Maps to `403` (`lock_owner` in body) / `503` on unverifiable lock. Covered by `TestRevertFile_*` and `TestRevertDirectory_ReplaceRejectsLockedSubtree`.
+- ✅ **DONE (2026-06-22). `RevertFile` / `RevertDirectory`** — a `replace`-policy revert overwrites the target, so it is now lock-checked: `RevertFile` enforces the **exact-path** lock, `RevertDirectory` the **subtree** lock, both only when `conflict_policy == "replace"` (autorename/keep_both restore under a new name and skip does nothing, so they never overwrite a locked file — exempt, mirroring the copy path). Maps to `403` (`lock_owner` in body) / `503` on unverifiable lock. Covered by `TestRevertFile_*` and `TestRevertDirectory_*` (403 rejection, 503 fail-closed, and a non-replace revert never consulting the lock check).

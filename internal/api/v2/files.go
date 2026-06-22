@@ -2261,7 +2261,7 @@ func (h *FileHandler) GetSmartLink(c *gin.Context) {
 	}
 	iter.Close()
 
-	// No existing link â€” create a new one
+	// No existing link — create a new one
 	token, err := generateSecureShareToken(16)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to generate token"})
@@ -2286,7 +2286,7 @@ func (h *FileHandler) GetSmartLink(c *gin.Context) {
 }
 
 // ResolveSmartLink resolves an internal (smart) link token and redirects to the frontend file/folder view.
-// Internal links always require authentication â€” the user must belong to the same org as the link.
+// Internal links always require authentication — the user must belong to the same org as the link.
 // GET /api/v2.1/smart-link/:token
 func (h *FileHandler) ResolveSmartLink(c *gin.Context) {
 	token := c.Param("token")
@@ -3221,7 +3221,7 @@ func (h *FileHandler) getUploadLinkWithCreator(c *gin.Context, createToken func(
 
 	// Return as JSON-encoded string (with double quotes).
 	// Seafile clients strip the first and last character (the quotes) to extract the URL.
-	// Without quotes, the client strips 'h' from 'https' â†’ "ttps://" â†’ "Protocol ttps is unknown".
+	// Without quotes, the client strips 'h' from 'https' → "ttps://" → "Protocol ttps is unknown".
 	c.JSON(http.StatusOK, uploadURL)
 }
 
@@ -3255,7 +3255,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Traffic quota pre-check â€” before reading the body to fail fast. Storage
+	// Traffic quota pre-check — before reading the body to fail fast. Storage
 	// quota is checked below using the visible tree delta for this path.
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
@@ -3326,7 +3326,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		}
 	}
 
-	// SHA-1 of plaintext â†’ fileID (Seafile protocol: block ID used in fs_object's block_ids)
+	// SHA-1 of plaintext → fileID (Seafile protocol: block ID used in fs_object's block_ids)
 	sha1Hash := sha1.Sum(content)
 	fileID := hex.EncodeToString(sha1Hash[:])
 
@@ -4216,6 +4216,20 @@ type FileLockRequest struct {
 	Operation string `json:"operation" form:"operation"` // lock or unlock
 }
 
+func (h *FileHandler) requireReplaceRevertFileNotLockedByOther(c *gin.Context, repoID, filePath, userID, conflictPolicy string) bool {
+	if conflictPolicy != "replace" {
+		return true
+	}
+	return h.requireFileNotLockedByOther(c, repoID, filePath, userID)
+}
+
+func (h *FileHandler) requireReplaceRevertDirectoryNotLockedByOther(c *gin.Context, repoID, dirPath, userID, conflictPolicy string) bool {
+	if conflictPolicy != "replace" {
+		return true
+	}
+	return h.requireSubtreeNotLockedByOther(c, repoID, dirPath, userID)
+}
+
 // RevertFile restores a file to a previous version from commit history
 // POST /api/v2.1/repos/:repo_id/file/?p=/path with operation=revert&commit_id=xxx
 // Optional: conflict_policy=replace|skip to handle existing files
@@ -4254,7 +4268,7 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 	// when the file is locked by another user. Non-replace policies never overwrite the
 	// existing file (autorename/keep_both restore under a new name, skip/conflict do
 	// nothing), so they are exempt — matching the copy path's replace-only enforcement.
-	if conflictPolicy == "replace" && !h.requireFileNotLockedByOther(c, repoID, filePath, userID) {
+	if !h.requireReplaceRevertFileNotLockedByOther(c, repoID, filePath, userID, conflictPolicy) {
 		return
 	}
 
@@ -4460,7 +4474,7 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 	// which would clobber a file locked by another user inside it. Reject when the path
 	// or any descendant is locked by someone else. Non-replace policies restore under a
 	// new name (or skip), so they never touch the locked file and are exempt.
-	if conflictPolicy == "replace" && !h.requireSubtreeNotLockedByOther(c, repoID, dirPath, userID) {
+	if !h.requireReplaceRevertDirectoryNotLockedByOther(c, repoID, dirPath, userID, conflictPolicy) {
 		return
 	}
 
