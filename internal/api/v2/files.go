@@ -1850,6 +1850,14 @@ func (h *FileHandler) lookupUserNameByEmail(orgID, email string) string {
 	if h.db == nil || orgID == "" || email == "" {
 		return ""
 	}
+	// A synthetic <uuid>@sesamefs.local marker is never a real users_by_email row, so this
+	// lookup would always miss. Skip it: composeLastModifierIdentity resolves these by user
+	// id instead. This drops a wasted query on every web/OnlyOffice-stamped modifier -- the
+	// common case -- which compounds on directory listings that resolve one modifier per
+	// entry (see newPersistedModifierResolver).
+	if _, ok := syntheticModifierUserID(email); ok {
+		return ""
+	}
 	var userID gocql.UUID
 	if err := h.db.Session().Query(
 		`SELECT user_id FROM users_by_email WHERE email = ?`, email,
@@ -1892,6 +1900,20 @@ func (h *FileHandler) resolveModifierIdentity(orgID, entryModifier, blameUID str
 	return publicModifierIdentity(email, name)
 }
 
+// newPersistedModifierResolver returns a request-scoped resolver that maps a persisted
+// fs-entry modifier to its public (email, name), memoizing by raw modifier string so each
+// distinct modifier is resolved at most once per request.
+//
+// PERFORMANCE NOTE (registered risk): directory listings (ListDirectory / ListDirectoryV21)
+// are NOT paginated -- they resolve a modifier for every entry returned. The per-request
+// cache bounds the cost to the number of DISTINCT modifiers in the directory, and each
+// distinct modifier costs one users lookup (the synthetic-marker case is short-circuited
+// in lookupUserNameByEmail to avoid a wasted users_by_email query). So:
+//   - typical directories (few distinct uploaders): negligible, a handful of queries.
+//   - pathological directory (thousands of files each by a different user): up to one
+//     query per distinct user, issued serially on a hot listing path -> latency regression.
+// If large multi-uploader directories become common, batch-resolve the distinct modifiers
+// (single IN/multi-key fetch) or paginate the listing before optimizing elsewhere.
 func (h *FileHandler) newPersistedModifierResolver(orgID string) func(entryModifier string) (email, name string) {
 	cache := make(map[string][2]string)
 	return func(entryModifier string) (email, name string) {
