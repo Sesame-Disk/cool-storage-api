@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -37,6 +38,14 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
+
+var checkSeafHTTPFileLockedByOther = func(h *SeafHTTPHandler, repoID, filePath, userID string) (bool, string, error) {
+	if h == nil || h.db == nil {
+		return false, "", nil
+	}
+	normalizedPath := path.Clean("/" + strings.TrimPrefix(filePath, "/"))
+	return db.FileLockedByOther(h.db.Session(), repoID, normalizedPath, userID)
+}
 
 // TokenType represents the type of access token
 type TokenType string
@@ -1820,7 +1829,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	if relativePath != "" {
 		if strings.HasSuffix(relativePath, "/") {
 			dirName := strings.TrimSuffix(relativePath, "/")
-			dirBaseName := filepath.Base(dirName)
+			dirBaseName := path.Base(dirName)
 
 			if filename == dirBaseName || filename == relativePath || filename == "" {
 				log.Printf("[HandleUpload] Skipping directory marker: %s (filename=%s)", relativePath, filename)
@@ -1833,25 +1842,41 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			}
 
 			log.Printf("[HandleUpload] File in directory: relativePath=%s, filename=%s", relativePath, filename)
-			parentDir = filepath.Join(parentDir, dirName)
+			parentDir = path.Join(parentDir, dirName)
 		} else {
-			relDir := filepath.Dir(relativePath)
+			relDir := path.Dir(relativePath)
 			if relDir != "." && relDir != "" {
-				parentDir = filepath.Join(parentDir, relDir)
+				parentDir = path.Join(parentDir, relDir)
 			}
-			filename = filepath.Base(relativePath)
+			filename = path.Base(relativePath)
 		}
 	}
 
 	if !strings.HasPrefix(parentDir, "/") {
 		parentDir = "/" + parentDir
 	}
-	parentDir = filepath.Clean(parentDir)
+	parentDir = path.Clean(parentDir)
 
 	log.Printf("[HandleUpload] relativePath=%s, parentDir=%s, filename=%s", relativePath, parentDir, filename)
 
-	filePath := filepath.Join(parentDir, filename)
+	filePath := path.Join(parentDir, filename)
 	storageKey := fmt.Sprintf("%s/%s%s", token.OrgID, token.RepoID, filePath)
+
+	// LOCK ENFORCEMENT: overwriting a file locked by another user is forbidden.
+	// Only the overwrite path can clobber the locked file; an autorename upload
+	// creates a new name and leaves the locked file untouched.
+	if replaceFile {
+		blocked, ownerID, err := checkSeafHTTPFileLockedByOther(h, token.RepoID, filePath, token.UserID)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to verify file lock"})
+			return
+		}
+		if blocked {
+			log.Printf("[HandleUpload] Rejecting overwrite of file %q locked by %s (uploader %s)", filePath, ownerID, token.UserID)
+			c.JSON(http.StatusForbidden, gin.H{"error": "file is locked by another user", "lock_owner": ownerID})
+			return
+		}
+	}
 
 	log.Printf("[HandleUpload] Token=%s, File=%s, ContentRange=%s, isChunked=%v",
 		tokenStr, filename, contentRange, isChunked)

@@ -5,6 +5,42 @@
 **Area:** `internal/api/v2/share_links.go` (create), `internal/api/v2/sharelink_view.go` (access)
 **Guard test:** `sesamefs-bugs.spec.ts` → "an internal/org-scoped share link is not accessible anonymously" (`@bug`).
 
+## RESOLUTION (2026-06-19): not a bug — internal/org-only links already exist as smart-links
+
+This was re-examined and is **WONTFIX as framed.** SesameFS already has a first-class
+org-only link: the **smart-link**. It is created via `GetSmartLink`
+(`GET /api/v2.1/smart-link/?repo_id=…&path=…`), persisted in `share_links` with
+`link_type='internal'`, and its access path **already enforces exactly the intended
+audience**:
+
+- `ResolveSmartLink` ([`internal/api/v2/files.go`](../internal/api/v2/files.go)) runs
+  behind `smartLinkAuthMiddleware` ([`internal/api/server.go`](../internal/api/server.go)),
+  which **redirects unauthenticated visitors to login** — so anonymous access is denied.
+- It then requires `link_type == "internal"` (else 404) **and** `org_id == userOrgID`
+  (else `403 "access denied"`) — so a member of a *different* org is denied too.
+
+So the two link audiences are, by design:
+
+- **`share` / `upload` links — public by token** (anyone with the link). This is intended
+  and must not change.
+- **smart-links (`link_type='internal'`) — authenticated, same-org only.** This is the
+  "internal / intra-org" link the finding asked for, and it is already enforced.
+
+The original finding mis-modeled "internal" as a missing *scope on public share links*.
+It is instead a *separate link type* that already exists and is already access-controlled.
+
+**Action taken:** none in the backend. The `@bug` guard test
+("an internal/org-scoped share link is not accessible anonymously") targets the **wrong
+path** — it creates the link via `POST /api/v2.1/share-links/` (the public link endpoint)
+and probes `/share-links/:token/dirents/` (the public access path). The real internal
+link is created with `GetSmartLink` and accessed via `/smart-link/:token`. The test
+should be **retargeted to the smart-link flow** (or removed), not used to drive a
+redundant scope column onto public share links.
+
+---
+
+## Original finding (kept for context — superseded by the resolution above)
+
 ## What happens
 
 A SesameFS **share link** is purely **token-scoped and public**: anyone who has the token — a different organization, or an anonymous visitor — can open it (subject only to an optional password, expiry, and download cap). There is **no way to create a link that is restricted to the owner's organization** (an "internal / intra-org" link) so that non-members are denied. The only access-controlled sharing is the **library user/group share** (which *is* org-scoped and correctly denies non-recipients — see the cross-region test in `sesamefs-mr-sharelinks.spec.ts`).
