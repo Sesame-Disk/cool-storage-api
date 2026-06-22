@@ -1333,7 +1333,7 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 				entry.ID = pendingFile.fsID
 				entry.Size = originalFileSize
 				entry.MTime = now.Unix()
-				entry.Modifier = userID + "@sesamefs.local"
+				entry.Modifier = modifierIdentityForUser(userID)
 				fileUpdated = true
 			}
 			updatedEntries = append(updatedEntries, entry)
@@ -1346,7 +1346,7 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 				Mode:     ModeFile,
 				MTime:    now.Unix(),
 				Size:     originalFileSize,
-				Modifier: userID + "@sesamefs.local",
+				Modifier: modifierIdentityForUser(userID),
 			})
 		}
 

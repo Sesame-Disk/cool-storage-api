@@ -51,3 +51,24 @@ A regression guard already exists: `sesamefs-sharing.spec.ts` has a `test.fail()
 
 - The desktop SPA does not currently render this field, so user-facing impact today is near zero — but any API client or a future "Modified by" column would show wrong attribution.
 - Worth confirming `entry.Modifier` is populated for all write paths (upload, update/replace, copy/move) so the fix is consistent across operations.
+
+## Resolution (fix/file-detail-modifier)
+
+Implemented in `internal/api/v2/files.go`. Both parts of the proposed fix landed plus identity normalization:
+
+1. **Persist the writer as the modifier** on every write path — `modifierIdentityForUser(userID)` (`<uid>@sesamefs.local`) is stamped on `CreateFile`, stored-upload finalize, OnlyOffice save, and revert; copy/move preserve the source's modifier (content didn't change). Desktop-client commits already carry a real-address modifier via the Seafile dirent.
+2. **Read the real modifier, never the requester.** `GetFileDetail` resolves identity via `resolveModifierIdentity` → `composeLastModifierIdentity`:
+   - real address (desktop client) → resolved to the account display name, else local-part;
+   - synthetic `<uuid>@sesamefs.local` (web/OnlyOffice) → resolved to the real account by user id;
+   - blame fallback (commit-history walk, bounded at `fileLastModifierWalkCap=64`) **only** for legacy entries with no stamped modifier, and **skipped for directories**;
+   - unresolved → **empty**, never the caller. The synthetic `<uid>@sesamefs.local` fallback is blanked by `publicModifierIdentity` so the internal marker never leaks to clients.
+3. **Directory listings normalized too** — `ListDirectory` / `ListDirectoryV21` run the same resolution via `newPersistedModifierResolver`, so they surface the real identity instead of the raw `<uuid>@sesamefs.local` marker (the old gap noted above).
+
+### Registered performance risk — unpaginated listing × per-entry modifier resolution
+
+`ListDirectory` / `ListDirectoryV21` are **not paginated**: they return every entry and now resolve a modifier per entry. Mitigations in place: a **request-scoped cache** keyed by raw modifier (each distinct modifier resolved once), and a short-circuit in `lookupUserNameByEmail` that skips the always-missing `users_by_email` query for synthetic `<uuid>@sesamefs.local` markers (one `users` lookup per distinct modifier, common case).
+
+- **Typical** (a directory with few distinct uploaders): negligible — a handful of queries.
+- **Pathological** (thousands of files each by a different user): up to one `users` query per distinct user, issued **serially** on a hot listing path → possible latency regression.
+
+If large multi-uploader directories become common, the fix is to **batch-resolve distinct modifiers** (single multi-key fetch) or **paginate the listing**, rather than micro-optimizing the per-entry path. See `newPersistedModifierResolver` in `internal/api/v2/files.go` for the in-code note.

@@ -1028,6 +1028,62 @@ func TestUpdateEntryInList(t *testing.T) {
 	}
 }
 
+// copiedFileEntry must carry the source's content identity across copy/move: the new
+// fs_id and name change, but Mode/Size/MTime/Modifier are preserved so file/detail stays
+// consistent and never falls back to crediting the copier. This is the regression guard
+// for the cross-library copy that previously dropped Modifier and reset MTime to now.
+func TestCopiedFileEntry(t *testing.T) {
+	src := FSEntry{
+		Name:     "report.docx",
+		ID:       "src-fsid",
+		Mode:     ModeFile,
+		MTime:    1000,
+		Size:     2048,
+		Modifier: "alice-uid@sesamefs.local",
+	}
+
+	got := copiedFileEntry(src, "new-fsid", "report (1).docx")
+
+	if got.ID != "new-fsid" {
+		t.Errorf("ID = %q, want %q (must take the new fs_id)", got.ID, "new-fsid")
+	}
+	if got.Name != "report (1).docx" {
+		t.Errorf("Name = %q, want %q (must take the new name)", got.Name, "report (1).docx")
+	}
+	if got.Modifier != src.Modifier {
+		t.Errorf("Modifier = %q, want %q (must preserve source modifier)", got.Modifier, src.Modifier)
+	}
+	if got.MTime != src.MTime {
+		t.Errorf("MTime = %d, want %d (must preserve source mtime, not reset to now)", got.MTime, src.MTime)
+	}
+	if got.Mode != src.Mode {
+		t.Errorf("Mode = %d, want %d", got.Mode, src.Mode)
+	}
+	if got.Size != src.Size {
+		t.Errorf("Size = %d, want %d", got.Size, src.Size)
+	}
+
+	// Same-repo copy keeps the source fs_id but must still preserve mtime/modifier
+	// rather than treating the copy operation as a content edit.
+	sameRepo := copiedFileEntry(src, src.ID, "report copy.docx")
+	if sameRepo.ID != src.ID {
+		t.Errorf("same-repo ID = %q, want %q", sameRepo.ID, src.ID)
+	}
+	if sameRepo.MTime != src.MTime {
+		t.Errorf("same-repo MTime = %d, want %d", sameRepo.MTime, src.MTime)
+	}
+	if sameRepo.Modifier != src.Modifier {
+		t.Errorf("same-repo Modifier = %q, want %q", sameRepo.Modifier, src.Modifier)
+	}
+
+	// An entry with no stamped modifier copies as empty (it will fall back to blame at
+	// read time); the copy itself must not invent an identity.
+	legacy := FSEntry{Name: "old.txt", ID: "x", Mode: ModeFile, MTime: 5, Size: 1}
+	if e := copiedFileEntry(legacy, "y", "old.txt"); e.Modifier != "" {
+		t.Errorf("Modifier = %q, want empty for an unstamped source", e.Modifier)
+	}
+}
+
 // Test AddEntryToList function
 func TestAddEntryToList(t *testing.T) {
 	entries := []FSEntry{

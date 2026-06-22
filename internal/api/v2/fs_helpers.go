@@ -882,6 +882,29 @@ func AddEntryToList(entries []FSEntry, entry FSEntry) []FSEntry {
 	return append(entries, entry)
 }
 
+// copiedFileEntry builds the destination dirent for a copy/move of src, assigning a new
+// fs_id (and possibly a new name) while preserving the fields that describe the file's
+// content and its history: Mode, Size, MTime and Modifier. Copy/move does not change the
+// content, so its "last modified" time and modifier identity are carried over instead of
+// reset to now/the operator. This keeps file/detail consistent across same-repo copy,
+// cross-library copy and the per-child recursive copy, and avoids the same file getting a
+// different MTime depending on whether it was copied alone or inside its folder.
+//
+// A src whose Modifier is empty (only entries created before modifier stamping) yields an
+// empty Modifier, so file/detail falls back to destination blame and credits the copier.
+// Acceptable: such entries do not exist in production data (server is pre-deploy, no
+// legacy-data compat is kept).
+func copiedFileEntry(src FSEntry, newFSID, newName string) FSEntry {
+	return FSEntry{
+		Name:     newName,
+		ID:       newFSID,
+		Mode:     src.Mode,
+		MTime:    src.MTime,
+		Size:     src.Size,
+		Modifier: src.Modifier,
+	}
+}
+
 // GenerateUniqueName generates a unique name by appending " (1)", " (2)", etc.
 // Pattern: "report.pdf" → "report (1).pdf" → "report (2).pdf"
 func GenerateUniqueName(entries []FSEntry, baseName string) string {
@@ -1326,13 +1349,7 @@ func (h *FSHelper) copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, fsID st
 		if err != nil {
 			return "", pendingFiles, fmt.Errorf("failed to copy child %q: %w", entry.Name, err)
 		}
-		newEntries[i] = FSEntry{
-			Name:  entry.Name,
-			ID:    newChildFSID,
-			Mode:  entry.Mode,
-			MTime: entry.MTime,
-			Size:  entry.Size,
-		}
+		newEntries[i] = copiedFileEntry(entry, newChildFSID, entry.Name)
 	}
 
 	newDirFSID, err := h.CreateDirectoryFSObject(dstRepoID, newEntries)

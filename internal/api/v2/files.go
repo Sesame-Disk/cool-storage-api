@@ -528,6 +528,7 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 	}
 
 	// Convert FSEntry to Dirent for API response
+	resolvePersistedModifier := h.newPersistedModifierResolver(orgID)
 	direntList := make([]Dirent, 0, len(entries))
 	for _, entry := range entries {
 		// Determine type from mode
@@ -555,10 +556,10 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 			Starred:    starredPaths[fullPath],
 		}
 
-		// Add modifier if available
-		if entry.Modifier != "" {
-			dirent.ModifierEmail = entry.Modifier
-		}
+		// Normalize the persisted modifier so API clients see the real identity when it
+		// can be resolved, regardless of whether the entry stored an email or a user id.
+		modifierEmail, modifierName := resolvePersistedModifier(entry.Modifier)
+		applyResolvedModifierToDirent(&dirent, modifierEmail, modifierName)
 
 		direntList = append(direntList, dirent)
 	}
@@ -1261,11 +1262,12 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		pendingFiles := []*pendingPublishedFile{pendingFile}
 
 		newEntry := FSEntry{
-			Name:  fileName,
-			ID:    pendingFile.fsID,
-			Mode:  ModeFile,
-			MTime: time.Now().Unix(),
-			Size:  fileSize,
+			Name:     fileName,
+			ID:       pendingFile.fsID,
+			Mode:     ModeFile,
+			MTime:    time.Now().Unix(),
+			Size:     fileSize,
+			Modifier: modifierIdentityForUser(userID),
 		}
 		newEntries := AddEntryToList(parentEntries, newEntry)
 
@@ -1630,6 +1632,312 @@ func (h *FileHandler) getFileDownloadURL(c *gin.Context, orgID, userID, repoID, 
 	c.JSON(http.StatusOK, downloadURL)
 }
 
+// fileLastModifierWalkCap bounds the commit-blame walk in resolveFileLastModifier so
+// a single file/detail request can never traverse an unbounded history. If the commit
+// that introduced the current fs_id is not reached within this many commits, the
+// modifier is reported as unresolved ("") rather than misattributed to whoever happened
+// to author the oldest commit examined -- a wrong-but-subtle answer is worse than none.
+//
+// This blame walk is the fallback path only. Files written through upload, OnlyOffice,
+// copy/move and the desktop client carry a Modifier on the fs entry, so file/detail
+// reads it directly and never walks. The walk (bounded at cap * path-depth fs reads)
+// is reached mainly for older entries created before modifier stamping, where its cost
+// is capped and its result acceptable-or-empty.
+const fileLastModifierWalkCap = 64
+
+// resolveFileLastModifier returns the user id of the author who last changed the file
+// at filePath -- the creator of the commit that introduced its current fs_id -- by
+// walking the commit parent chain from HEAD. It returns "" when it cannot be
+// resolved, in which case the caller must NOT fall back to the requesting user.
+func (h *FileHandler) resolveFileLastModifier(repoID, filePath, currentFSID string) string {
+	if h.db == nil || currentFSID == "" {
+		return ""
+	}
+	fsHelper := NewFSHelper(h.db)
+
+	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
+	if err != nil || headCommitID == "" {
+		return ""
+	}
+
+	fileFSIDAt := func(rootFSID string) string {
+		res, err := fsHelper.TraverseToPathFromRoot(repoID, rootFSID, filePath)
+		if err != nil || res == nil || res.TargetEntry == nil {
+			return ""
+		}
+		return res.TargetEntry.ID
+	}
+
+	loadCommit := func(commitID string) (commitWalkNode, bool) {
+		var node commitWalkNode
+		var creatorUUID gocql.UUID
+		if err := h.db.Session().Query(
+			`SELECT root_fs_id, parent_id, creator_id FROM commits WHERE library_id = ? AND commit_id = ?`,
+			repoID, commitID,
+		).Scan(&node.rootFSID, &node.parentID, &creatorUUID); err != nil {
+			return commitWalkNode{}, false
+		}
+		node.creator = creatorUUID.String()
+		return node, true
+	}
+
+	return resolveLastModifierFromWalk(headCommitID, currentFSID, fileLastModifierWalkCap, loadCommit, fileFSIDAt)
+}
+
+// commitWalkNode is the slice of a commit row the blame walk needs.
+type commitWalkNode struct {
+	rootFSID string
+	parentID string
+	creator  string
+}
+
+// resolveLastModifierFromWalk implements the blame decision over injectable loaders so
+// the cap/contiguity logic is testable without a database. It walks newest->oldest from
+// headCommitID. The oldest contiguous commit whose tree still has currentFSID at the
+// path is where the current version was introduced; its creator is the last modifier.
+// The answer is only trusted if the walk actually reaches that boundary (the commit
+// where the fs_id changes, or the creating root commit) within walkCap -- otherwise the
+// accumulated introducer is a partial, wrong result and "" is returned so the caller
+// leaves the field empty instead of misattributing it to an unrelated old commit.
+//
+// The walk matches by path, so a pure rename (a move preserves the content fs_id) is
+// counted as introducing the version and credits the renamer rather than the content
+// author. This only affects entries with no stamped Modifier -- the rare fallback path,
+// since copy/move/upload/OnlyOffice all preserve or set a Modifier. On the common path
+// the renamed entry carries the original Modifier, so file/detail still credits the
+// content author; the divergence is confined to pre-stamping entries (none in prod).
+func resolveLastModifierFromWalk(
+	headCommitID, currentFSID string,
+	walkCap int,
+	loadCommit func(commitID string) (commitWalkNode, bool),
+	fileFSIDAt func(rootFSID string) string,
+) string {
+	commitID := headCommitID
+	introducer := ""
+	resolved := false
+	for i := 0; i < walkCap && commitID != ""; i++ {
+		node, ok := loadCommit(commitID)
+		if !ok {
+			break
+		}
+		if fileFSIDAt(node.rootFSID) != currentFSID {
+			// The file did not yet have its current version here; the previously
+			// examined (newer) commit is the introducer -- if there was one.
+			resolved = introducer != ""
+			break
+		}
+		introducer = node.creator
+		if node.parentID == "" {
+			resolved = true // reached the creating commit; introducer is definitive
+			break
+		}
+		commitID = node.parentID
+	}
+	if !resolved {
+		return ""
+	}
+	return introducer
+}
+
+// sesamefsLocalDomain is the synthetic email domain we attach to a bare user id when an
+// account's real address is unavailable. Its presence marks a modifier value as a
+// user-id reference (web/OnlyOffice) rather than a real address (Seafile desktop client).
+const sesamefsLocalDomain = "@sesamefs.local"
+
+func modifierIdentityForUser(userID string) string {
+	return userID + sesamefsLocalDomain
+}
+
+// contentModifiedFileEntry stamps a real content mutation on an existing file entry.
+// Operations like revert reintroduce historical content, but they are still a new edit
+// performed by the current user, so the operation refreshes mtime and last-modifier
+// while preserving the file's fs_id/size/mode for the chosen content version.
+func contentModifiedFileEntry(src FSEntry, newName, userID string, modifiedAt int64) FSEntry {
+	src.Name = newName
+	src.MTime = modifiedAt
+	src.Modifier = modifierIdentityForUser(userID)
+	return src
+}
+
+func syntheticModifierUserID(modifier string) (string, bool) {
+	if !strings.HasSuffix(modifier, sesamefsLocalDomain) {
+		return "", false
+	}
+	uid := strings.TrimSuffix(modifier, sesamefsLocalDomain)
+	if uid == "" {
+		return "", false
+	}
+	if _, err := gocql.ParseUUID(uid); err != nil {
+		return "", false
+	}
+	return uid, true
+}
+
+// composeLastModifierIdentity resolves the file's real last-modifier identity for
+// file/detail. It NEVER falls back to the requesting user: an unresolved modifier stays
+// empty, which the API surfaces as blank rather than wrong.
+//
+// Sources, in order of preference:
+//   - entryModifier holding a real address (Seafile desktop client) -> used as the email;
+//     its display name is resolved via nameForEmail so the same user shows the same name
+//     whether the file was last touched from the desktop client or the web. Falls back to
+//     the address local-part when the account name is unavailable.
+//   - a user id, taken from the local-part of a synthetic <uid>@sesamefs.local
+//     (web/OnlyOffice) or from blameUID (commit history). The id is resolved to the
+//     account's real email/name via lookup; if the account is unknown, the synthetic
+//     <uid>@sesamefs.local address is used so the field is still populated.
+func composeLastModifierIdentity(
+	entryModifier, blameUID string,
+	lookup func(uid string) (email, name string),
+	nameForEmail func(email string) string,
+) (email, name string) {
+	// A persisted real address is already the email; resolve its display name so it
+	// matches the id-based paths instead of showing the local-part. We first let
+	// nameForEmail prove that the address is a real account, even if it happens to end
+	// with @sesamefs.local. Only an unresolved reserved <uuid>@sesamefs.local pattern is
+	// treated as an embedded user id.
+	uid := blameUID
+	if entryModifier != "" {
+		resolvedName := ""
+		if nameForEmail != nil {
+			resolvedName = nameForEmail(entryModifier)
+		}
+		if resolvedName != "" {
+			return entryModifier, resolvedName
+		}
+		if syntheticUID, ok := syntheticModifierUserID(entryModifier); ok {
+			uid = syntheticUID
+		} else {
+			return entryModifier, strings.Split(entryModifier, "@")[0]
+		}
+	}
+	if uid == "" {
+		return "", ""
+	}
+
+	if lookup != nil {
+		if realEmail, realName := lookup(uid); realEmail != "" {
+			if realName == "" {
+				realName = strings.Split(realEmail, "@")[0]
+			}
+			return realEmail, realName
+		}
+	}
+	return modifierIdentityForUser(uid), uid
+}
+
+// lookupUserIdentity resolves a user id to its real email and name within an org. It
+// returns empty strings when the id is not a known account (e.g. a deleted user), so
+// callers can fall back to a synthetic address.
+func (h *FileHandler) lookupUserIdentity(orgID, userID string) (email, name string) {
+	if h.db == nil || orgID == "" || userID == "" {
+		return "", ""
+	}
+	_ = h.db.Session().Query(
+		`SELECT email, name FROM users WHERE org_id = ? AND user_id = ?`,
+		orgID, userID,
+	).Scan(&email, &name)
+	return email, name
+}
+
+// lookupUserNameByEmail resolves a real email address to its account display name within
+// an org, so file/detail reports the same name regardless of whether the modifier was
+// stored as an address (Seafile desktop client) or a user id (web/OnlyOffice/blame). It
+// returns "" when the address is not a known account; if the account exists but has no
+// explicit display name, it returns the email local-part so callers can still tell the
+// address is real rather than a synthetic uid marker.
+func (h *FileHandler) lookupUserNameByEmail(orgID, email string) string {
+	if h.db == nil || orgID == "" || email == "" {
+		return ""
+	}
+	// A synthetic <uuid>@sesamefs.local marker is never a real users_by_email row, so this
+	// lookup would always miss. Skip it: composeLastModifierIdentity resolves these by user
+	// id instead. This drops a wasted query on every web/OnlyOffice-stamped modifier -- the
+	// common case -- which compounds on directory listings that resolve one modifier per
+	// entry (see newPersistedModifierResolver).
+	if _, ok := syntheticModifierUserID(email); ok {
+		return ""
+	}
+	var userID gocql.UUID
+	if err := h.db.Session().Query(
+		`SELECT user_id FROM users_by_email WHERE email = ?`, email,
+	).Scan(&userID); err != nil {
+		return ""
+	}
+	var name string
+	_ = h.db.Session().Query(
+		`SELECT name FROM users WHERE org_id = ? AND user_id = ?`,
+		orgID, userID,
+	).Scan(&name)
+	if name == "" {
+		return strings.Split(email, "@")[0]
+	}
+	return name
+}
+
+func publicModifierIdentity(email, name string) (string, string) {
+	if email == "" {
+		return "", ""
+	}
+	if uid, ok := syntheticModifierUserID(email); ok && name == uid {
+		return "", ""
+	}
+	return email, name
+}
+
+// resolveModifierIdentity turns the persisted modifier/blame inputs into the public
+// identity the API should expose. File/detail can pass a blame uid for legacy unstamped
+// entries; directory listings pass an empty blame uid and resolve only persisted data.
+// Any synthetic uid@sesamefs.local fallback stays internal and is blanked before the
+// response is serialized.
+func (h *FileHandler) resolveModifierIdentity(orgID, entryModifier, blameUID string) (email, name string) {
+	email, name = composeLastModifierIdentity(
+		entryModifier,
+		blameUID,
+		func(uid string) (string, string) { return h.lookupUserIdentity(orgID, uid) },
+		func(email string) string { return h.lookupUserNameByEmail(orgID, email) },
+	)
+	return publicModifierIdentity(email, name)
+}
+
+// newPersistedModifierResolver returns a request-scoped resolver that maps a persisted
+// fs-entry modifier to its public (email, name), memoizing by raw modifier string so each
+// distinct modifier is resolved at most once per request.
+//
+// PERFORMANCE NOTE (registered risk): directory listings (ListDirectory / ListDirectoryV21)
+// are NOT paginated -- they resolve a modifier for every entry returned. The per-request
+// cache bounds the cost to the number of DISTINCT modifiers in the directory, and each
+// distinct modifier costs one users lookup (the synthetic-marker case is short-circuited
+// in lookupUserNameByEmail to avoid a wasted users_by_email query). So:
+//   - typical directories (few distinct uploaders): negligible, a handful of queries.
+//   - pathological directory (thousands of files each by a different user): up to one
+//     query per distinct user, issued serially on a hot listing path -> latency regression.
+// If large multi-uploader directories become common, batch-resolve the distinct modifiers
+// (single IN/multi-key fetch) or paginate the listing before optimizing elsewhere.
+func (h *FileHandler) newPersistedModifierResolver(orgID string) func(entryModifier string) (email, name string) {
+	cache := make(map[string][2]string)
+	return func(entryModifier string) (email, name string) {
+		if entryModifier == "" {
+			return "", ""
+		}
+		if cached, ok := cache[entryModifier]; ok {
+			return cached[0], cached[1]
+		}
+		email, name = h.resolveModifierIdentity(orgID, entryModifier, "")
+		cache[entryModifier] = [2]string{email, name}
+		return email, name
+	}
+}
+
+func applyResolvedModifierToDirent(dirent *Dirent, email, name string) {
+	if dirent == nil || email == "" {
+		return
+	}
+	dirent.ModifierEmail = email
+	dirent.ModifierContactEmail = email
+	dirent.ModifierName = name
+}
+
 // GetFileDetail returns detailed information about a file
 // Implements: GET /api2/repos/:repo_id/file/detail/?p=/path
 func (h *FileHandler) GetFileDetail(c *gin.Context) {
@@ -1699,8 +2007,24 @@ func (h *FileHandler) GetFileDetail(c *gin.Context) {
 	starredHandler := NewStarredHandler(h.db)
 	starred = starredHandler.IsFileStarred(userID, repoID, filePath)
 
-	// Build user email
-	userEmail := userID + "@sesamefs.local"
+	// Resolve the file's REAL last modifier -- never the requesting user. Prefer the
+	// modifier persisted on the fs entry (set by uploads and OnlyOffice saves); otherwise
+	// blame the commit history (only walked when the entry carries no modifier). If it
+	// cannot be resolved, the field is left empty rather than misattributed to the caller.
+	//
+	// Note: files written through a public upload/update link are attributed to the link
+	// creator, not the anonymous visitor -- the upload token carries the creator's user
+	// id (seafhttp sets user_id = token.UserID), so that id is what gets stamped/blamed.
+	// An anonymous visitor has no account identity to attribute, so this is intentional.
+	//
+	// The blame walk is skipped for directories: a folder carries no modifier and its
+	// fs_id changes on every descendant edit, so "last modifier" is not meaningful and
+	// the walk would run on every dir detail. Directories report an empty modifier.
+	blameUID := ""
+	if entry.Modifier == "" && !isDir {
+		blameUID = h.resolveFileLastModifier(repoID, filePath, entry.ID)
+	}
+	modifier, modifierName := h.resolveModifierIdentity(orgID, entry.Modifier, blameUID)
 
 	// Resolve actual permission for the user
 	perm := ""
@@ -1727,9 +2051,9 @@ func (h *FileHandler) GetFileDetail(c *gin.Context) {
 		"repo_id":                     repoID,
 		"repo_name":                   repoName,
 		"parent_dir":                  result.ParentPath,
-		"last_modifier_email":         userEmail,
-		"last_modifier_name":          strings.Split(userEmail, "@")[0],
-		"last_modifier_contact_email": userEmail,
+		"last_modifier_email":         modifier,
+		"last_modifier_name":          modifierName,
+		"last_modifier_contact_email": modifier,
 		"can_preview":                 true,
 		"can_edit":                    canEdit,
 		"encoded_thumbnail_src":       "",
@@ -2434,9 +2758,9 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 			}
 		}
 
-		copiedEntry := *srcResult.TargetEntry
-		copiedEntry.Name = currentItemName
-		copiedEntry.MTime = time.Now().Unix()
+		// Same-repo copy keeps the same content fs_id, so the copied dirent should
+		// preserve content mtime/modifier exactly like the batch-operation path.
+		copiedEntry := copiedFileEntry(*srcResult.TargetEntry, srcResult.TargetEntry.ID, currentItemName)
 
 		deltaBytes, deltaFiles, err := fsEntryDelta(fsHelper, repoID, copiedEntry, replacedEntry)
 		if err != nil {
@@ -3112,11 +3436,12 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 	fileFSID := pendingFile.fsID
 
 	newEntry := FSEntry{
-		ID:    fileFSID,
-		Name:  actualFilename,
-		Mode:  ModeFile,
-		MTime: time.Now().Unix(),
-		Size:  fileSize,
+		ID:       fileFSID,
+		Name:     actualFilename,
+		Mode:     ModeFile,
+		MTime:    time.Now().Unix(),
+		Size:     fileSize,
+		Modifier: modifierIdentityForUser(userID),
 	}
 	newDirEntries := AddEntryToList(dirEntries, newEntry)
 	newDirFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newDirEntries)
@@ -3661,6 +3986,7 @@ func (h *FileHandler) ListDirectoryV21(c *gin.Context) {
 	log.Printf("ListDirectoryV21: repoID=%s, dirPath=%s, lockedFiles count=%d", repoID, dirPath, len(lockedFiles))
 
 	// Convert FSEntry to Dirent for API response (v2.1 format)
+	resolvePersistedModifier := h.newPersistedModifierResolver(orgID)
 	direntList := make([]Dirent, 0, len(entries))
 	for _, entry := range entries {
 		// Determine type from mode
@@ -3702,12 +4028,10 @@ func (h *FileHandler) ListDirectoryV21(c *gin.Context) {
 			Starred:    isStarred,
 		}
 
-		// Add modifier if available
-		if entry.Modifier != "" {
-			dirent.ModifierEmail = entry.Modifier
-			dirent.ModifierName = strings.Split(entry.Modifier, "@")[0]
-			dirent.ModifierContactEmail = entry.Modifier
-		}
+		// Normalize the persisted modifier so v2.1 surfaces the same real identity as
+		// file/detail instead of leaking the internal uid@sesamefs.local marker.
+		modifierEmail, modifierName := resolvePersistedModifier(entry.Modifier)
+		applyResolvedModifierToDirent(&dirent, modifierEmail, modifierName)
 
 		// Add file expiry countdown if library has auto_delete_days set
 		if fileType == "file" && autoDeleteDays > 0 && entry.MTime > 0 {
@@ -3873,9 +4197,10 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 			replacedEntry = &ent
 		}
 
-		revertedEntry := oldEntry
-		revertedEntry.Name = currentFileName
-		revertedEntry.MTime = time.Now().Unix()
+		// Reverting to historical content is still a new content mutation authored by
+		// the current user, so the restored entry must be re-stamped instead of
+		// carrying the historical modifier forward.
+		revertedEntry := contentModifiedFileEntry(oldEntry, currentFileName, userID, time.Now().Unix())
 
 		currentDeltaBytes, currentDeltaFiles, err := fsEntryDelta(fsHelper, repoID, revertedEntry, replacedEntry)
 		if err != nil {
