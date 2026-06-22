@@ -885,8 +885,10 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 			}
 		}
 
+		// A move does not change the file's content, so its content timestamp and
+		// modifier are preserved (the struct copy keeps both). Matches copy semantics
+		// via copiedFileEntry -- MTime/Modifier describe the content, not the operation.
 		movedEntry := *srcResult.TargetEntry
-		movedEntry.MTime = time.Now().Unix()
 
 		rootAfterRemoval, err := updateDirectoryAtPathFromRoot(fsHelper, repoID, snapshot.RootFSID, srcParentPath, func(entries []FSEntry) ([]FSEntry, error) {
 			if FindEntryInList(entries, originalItemName) == nil {
