@@ -85,6 +85,13 @@ var checkBatchPathLocked = func(h *BatchOperationHandler, repoID, targetPath, us
 	return db.SubtreeLockedByOther(h.db.Session(), repoID, normalizePath(targetPath), userID)
 }
 
+// processSameRepoMoveFn is the seam through which processSingleItem executes a same-repo
+// move. It reports moved=true only when the source was actually relocated, so the caller
+// can gate source-lock cleanup on it. Injectable for tests.
+var processSameRepoMoveFn = func(h *BatchOperationHandler, orgID, userID, repoID, srcPath, dstDir string, fsHelper *FSHelper, policy string) (bool, error) {
+	return h.processSameRepoMove(orgID, userID, repoID, srcPath, dstDir, fsHelper, policy)
+}
+
 // clearMovedSourceLocks drops the operator's own locks under a just-moved source path.
 // A move's destination is autorename-dependent, so rather than guess the final name we
 // clear the source locks (the owner can re-lock at the destination). Best-effort: it
@@ -574,10 +581,11 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		return nil
 	}
 	if opType == "move" && srcRepoID == dstRepoID {
-		err := h.processSameRepoMove(orgID, userID, srcRepoID, srcPath, dstDir, fsHelper, policy)
-		if err == nil {
-			// The source no longer exists at srcPath; drop the operator's own locks
-			// there so they don't dangle (other users' locks blocked the move above).
+		moved, err := processSameRepoMoveFn(h, orgID, userID, srcRepoID, srcPath, dstDir, fsHelper, policy)
+		if moved {
+			// The source was actually relocated and no longer exists at srcPath; drop the
+			// operator's own locks there so they don't dangle (other users' locks blocked
+			// the move above). A "skip" no-op reports moved=false and is left untouched.
 			clearMovedSourceLocks(h, srcRepoID, srcPath, userID)
 		}
 		return err
@@ -916,7 +924,11 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	return nil
 }
 
-func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPath, dstDir string, fsHelper *FSHelper, policy string) error {
+// processSameRepoMove performs a move within a single repo. It returns moved=true only
+// when the source was actually relocated; a "skip" conflict policy that finds the
+// destination already present is a no-op and returns moved=false so the caller does NOT
+// drop the operator's source locks for a move that never happened.
+func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPath, dstDir string, fsHelper *FSHelper, policy string) (moved bool, err error) {
 	originalItemName := path.Base(srcPath)
 	srcParentPath := path.Dir(srcPath)
 	if srcParentPath == "." {
@@ -933,7 +945,7 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 	var replacedFiles int64
 	skipped := false
 
-	err := retryLibraryHeadMutation("BatchOperationSameRepoMove", func() error {
+	err = retryLibraryHeadMutation("BatchOperationSameRepoMove", func() error {
 		currentItemName := originalItemName
 		replacedTagCleanupPath = ""
 		replacedTagCleanupByPrefix = false
@@ -1031,10 +1043,13 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 		return nil
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if skipped {
-		return nil
+		// Destination already existed and policy was "skip": nothing moved, so the
+		// source (and any lock on it) stays put. Report moved=false so the caller does
+		// not clear the operator's own source locks for a move that never happened.
+		return false, nil
 	}
 	go runSameRepoMoveTagMutation(h.db, repoID, movedTagOldPath, movedTagNewPath, movedTagByPrefix, replacedTagCleanupPath, replacedTagCleanupByPrefix)
 	if replacedSize != 0 || replacedFiles != 0 {
@@ -1043,7 +1058,7 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 		}
 	}
 	log.Printf("[processSameRepoMove] moved %s to %s as %s", srcPath, dstDir, itemName)
-	return nil
+	return true, nil
 }
 
 func updateDirectoryAtPathFromRoot(fsHelper *FSHelper, repoID, rootFSID, dirPath string, update func([]FSEntry) ([]FSEntry, error)) (string, error) {

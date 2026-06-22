@@ -468,3 +468,105 @@ func TestLockFile_ConflictReturns409(t *testing.T) {
 		t.Fatalf("lock_owner = %v, want %q", got, "owner-789")
 	}
 }
+
+// LockFile must refuse to create a lock on a path the FS tree does not back: a phantom
+// lock row would make SubtreeLockedByOther block legitimate operations on the real
+// parent (e.g. locking /empty-dir/ghost.txt blocks rename/delete of /empty-dir, and
+// /foo.txt/ghost blocks the real file /foo.txt).
+
+func withLockTargetStateStub(t *testing.T, stub func(*FileHandler, string, string) (bool, bool, error)) {
+	t.Helper()
+	old := lockTargetState
+	lockTargetState = stub
+	t.Cleanup(func() { lockTargetState = old })
+}
+
+func newLockRequest(repoID, p string) (*http.Request, *httptest.ResponseRecorder) {
+	req := httptest.NewRequest("PUT", "/repos/"+repoID+"/file?p="+p+"&operation=lock", nil)
+	return req, httptest.NewRecorder()
+}
+
+func lockRouter(handler *FileHandler) *gin.Engine {
+	r := gin.New()
+	r.PUT("/repos/:repo_id/file", func(c *gin.Context) {
+		c.Set("org_id", "test-org")
+		c.Set("user_id", "00000000-0000-0000-0000-000000000002")
+		handler.LockFile(c)
+	})
+	return r
+}
+
+func TestLockFile_RejectsNonexistentPathWith404(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	acquireCalled := false
+	oldAcquire := acquireFileLock
+	acquireFileLock = func(_ *FileHandler, _, _, _ string, _ time.Time) (db.LockAcquireResult, string, error) {
+		acquireCalled = true
+		return db.LockAcquired, "", nil
+	}
+	t.Cleanup(func() { acquireFileLock = oldAcquire })
+	// Parent exists but the leaf does not → exists=false, no error.
+	withLockTargetStateStub(t, func(_ *FileHandler, _, _ string) (bool, bool, error) {
+		return false, false, nil
+	})
+
+	req, w := newLockRequest("00000000-0000-0000-0000-000000000001", "/empty-dir/ghost.txt")
+	lockRouter(&FileHandler{}).ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+	if acquireCalled {
+		t.Fatal("acquireFileLock was called for a nonexistent path; want it skipped")
+	}
+}
+
+func TestLockFile_RejectsDirectoryWith400(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	acquireCalled := false
+	oldAcquire := acquireFileLock
+	acquireFileLock = func(_ *FileHandler, _, _, _ string, _ time.Time) (db.LockAcquireResult, string, error) {
+		acquireCalled = true
+		return db.LockAcquired, "", nil
+	}
+	t.Cleanup(func() { acquireFileLock = oldAcquire })
+	withLockTargetStateStub(t, func(_ *FileHandler, _, _ string) (bool, bool, error) {
+		return true, true, nil // exists, isDir
+	})
+
+	req, w := newLockRequest("00000000-0000-0000-0000-000000000001", "/some-dir")
+	lockRouter(&FileHandler{}).ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	if acquireCalled {
+		t.Fatal("acquireFileLock was called for a directory; want it skipped")
+	}
+}
+
+// A traversal that cannot resolve the path (e.g. descending into a file like
+// /foo.txt/ghost, or a DB error) fails closed: 503 and no lock created.
+func TestLockFile_TargetLookupFailureFailsClosedWith503(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	acquireCalled := false
+	oldAcquire := acquireFileLock
+	acquireFileLock = func(_ *FileHandler, _, _, _ string, _ time.Time) (db.LockAcquireResult, string, error) {
+		acquireCalled = true
+		return db.LockAcquired, "", nil
+	}
+	t.Cleanup(func() { acquireFileLock = oldAcquire })
+	withLockTargetStateStub(t, func(_ *FileHandler, _, _ string) (bool, bool, error) {
+		return false, false, errors.New("cannot descend into file")
+	})
+
+	req, w := newLockRequest("00000000-0000-0000-0000-000000000001", "/foo.txt/ghost")
+	lockRouter(&FileHandler{}).ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+	if acquireCalled {
+		t.Fatal("acquireFileLock was called despite an unverifiable target; want it skipped")
+	}
+}

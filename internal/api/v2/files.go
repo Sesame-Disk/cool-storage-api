@@ -73,6 +73,29 @@ var checkCopyReplaceDestLocked = func(fsHelper *FSHelper, repoID, dstPath, userI
 	return db.SubtreeLockedByOther(fsHelper.db.Session(), repoID, normalizePath(dstPath), userID)
 }
 
+// lockTargetState reports whether filePath resolves to an existing entry in repoID's
+// HEAD tree and, if so, whether that entry is a directory. LockFile uses it to refuse a
+// manual lock on a path the tree never contained: a "phantom" lock row (e.g.
+// /empty-dir/ghost.txt or /foo.txt/ghost) would otherwise make SubtreeLockedByOther
+// block legitimate rename/move/delete on the real parent. Fail-closed: a traversal that
+// cannot resolve the path (intermediate component missing or not a directory) surfaces
+// the error so the caller refuses the lock with 503 rather than creating a phantom.
+// Injectable for tests; a nil db skips the check (returns exists=true).
+var lockTargetState = func(h *FileHandler, repoID, filePath string) (exists, isDir bool, err error) {
+	if h == nil || h.db == nil {
+		return true, false, nil
+	}
+	res, terr := NewFSHelper(h.db).TraverseToPath(repoID, normalizePath(filePath))
+	if terr != nil {
+		return false, false, terr
+	}
+	if res == nil || res.TargetEntry == nil {
+		return false, false, nil
+	}
+	isDir = res.TargetEntry.Mode == ModeDir || res.TargetEntry.Mode&0170000 == 040000
+	return true, isDir, nil
+}
+
 // acquireFileLock atomically takes/refreshes a manual lock (LWT). Injectable for tests.
 var acquireFileLock = func(h *FileHandler, repoID, filePath, userID string, lockedAt time.Time) (db.LockAcquireResult, string, error) {
 	if h == nil || h.db == nil {
@@ -4721,6 +4744,26 @@ func (h *FileHandler) LockFile(c *gin.Context) {
 
 	switch req.Operation {
 	case "lock":
+		// Guard against phantom locks: only an existing file may be locked. Locking a
+		// nonexistent path or a directory would plant a lock row the FS tree never backs,
+		// which SubtreeLockedByOther would then honour to block legitimate operations on
+		// the real parent. Verified for "lock" only — "unlock" stays lenient so a stale
+		// lock on an already-deleted path can still be cleared.
+		exists, isDir, terr := lockTargetState(h, repoID, filePath)
+		if terr != nil {
+			log.Printf("LockFile: failed to verify lock target path=%s: %v", filePath, terr)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to verify lock target"})
+			return
+		}
+		if !exists {
+			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+			return
+		}
+		if isDir {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "cannot lock a directory"})
+			return
+		}
+
 		// Atomic acquire/refresh via LWT (INSERT ... IF NOT EXISTS). A file already
 		// locked by another user cannot be stolen; the owner may re-issue "lock" to
 		// refresh. CAS makes this race-safe across regions (no check-then-write).

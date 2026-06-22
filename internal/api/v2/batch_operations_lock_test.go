@@ -138,3 +138,64 @@ func TestCopyItemWithinRepo_ReplaceLockLookupFailureFailsClosed(t *testing.T) {
 		t.Fatalf("copy replace lock lookup failure: err = %v, want ErrBatchLockStatusUnavailable", err)
 	}
 }
+
+// A same-repo move whose conflict policy is "skip" and whose destination already exists
+// is a no-op: nothing moves, so the operator's source lock must survive. The bug was
+// that processSingleItem cleared source locks on any nil error, including a skip no-op.
+// These drive the move execution via the processSameRepoMoveFn seam.
+
+func withSameRepoMoveStub(t *testing.T, stub func(*BatchOperationHandler, string, string, string, string, string, *FSHelper, string) (bool, error)) {
+	t.Helper()
+	old := processSameRepoMoveFn
+	processSameRepoMoveFn = stub
+	t.Cleanup(func() { processSameRepoMoveFn = old })
+}
+
+func withClearMovedSourceLocksSpy(t *testing.T, spy func(*BatchOperationHandler, string, string, string)) {
+	t.Helper()
+	old := clearMovedSourceLocks
+	clearMovedSourceLocks = spy
+	t.Cleanup(func() { clearMovedSourceLocks = old })
+}
+
+func TestProcessSingleItem_SkippedMoveDoesNotClearSourceLocks(t *testing.T) {
+	withBatchSubtreeStub(t, func(_ *BatchOperationHandler, _, _, _ string) (bool, string, error) {
+		return false, "", nil
+	})
+	// Destination exists + policy "skip" → nothing moved.
+	withSameRepoMoveStub(t, func(_ *BatchOperationHandler, _, _, _, _, _ string, _ *FSHelper, _ string) (bool, error) {
+		return false, nil
+	})
+	cleared := false
+	withClearMovedSourceLocksSpy(t, func(_ *BatchOperationHandler, _, _, _ string) { cleared = true })
+
+	h := &BatchOperationHandler{}
+	err := h.processSingleItem("org", "user", "repo-1", "repo-1", "/src/file.txt", "/dst", "move", nil, "skip")
+	if err != nil {
+		t.Fatalf("skipped move: err = %v, want nil", err)
+	}
+	if cleared {
+		t.Fatal("source locks were cleared for a skipped (no-op) move; want them preserved")
+	}
+}
+
+func TestProcessSingleItem_RealMoveClearsSourceLocks(t *testing.T) {
+	withBatchSubtreeStub(t, func(_ *BatchOperationHandler, _, _, _ string) (bool, string, error) {
+		return false, "", nil
+	})
+	// Source actually relocated.
+	withSameRepoMoveStub(t, func(_ *BatchOperationHandler, _, _, _, _, _ string, _ *FSHelper, _ string) (bool, error) {
+		return true, nil
+	})
+	cleared := false
+	withClearMovedSourceLocksSpy(t, func(_ *BatchOperationHandler, _, _, _ string) { cleared = true })
+
+	h := &BatchOperationHandler{}
+	err := h.processSingleItem("org", "user", "repo-1", "repo-1", "/src/file.txt", "/dst", "move", nil)
+	if err != nil {
+		t.Fatalf("real move: err = %v, want nil", err)
+	}
+	if !cleared {
+		t.Fatal("source locks were not cleared after a real move; want them dropped")
+	}
+}
