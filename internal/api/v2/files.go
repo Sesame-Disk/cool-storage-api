@@ -854,6 +854,12 @@ func (h *FileHandler) RenameDirectory(c *gin.Context) {
 		return
 	}
 
+	// LOCK ENFORCEMENT: a folder cannot be renamed if it contains a file locked by
+	// another user (renaming the folder relocates every descendant path).
+	if !h.requireSubtreeNotLockedByOther(c, repoID, dirPath, userID) {
+		return
+	}
+
 	// ENCRYPTION CHECK: Encrypted libraries require active decrypt session
 	if !h.requireDecryptSession(c, orgID, userID, repoID) {
 		return
@@ -928,6 +934,11 @@ func (h *FileHandler) RenameDirectory(c *gin.Context) {
 	// Move directory tags from old path to new path (async, preserves tags on rename)
 	newDirPath := path.Join(path.Dir(dirPath), newName)
 	go MoveFileTagsByPrefix(h.db, repoID, dirPath, newDirPath)
+
+	// Carry the operator's own locks under the renamed folder to the new prefix so they
+	// don't dangle at the old path (any other user's lock here would have blocked the
+	// rename upstream).
+	relocateLocksAfterMove(h, repoID, dirPath, newDirPath, userID)
 
 	// Get directory info for response
 	parentDir := path.Dir(dirPath)
@@ -1494,6 +1505,12 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 		return
 	}
 
+	// LOCK ENFORCEMENT: a folder cannot be deleted if it contains a file locked by
+	// another user (deleting the folder would strip that lock's file).
+	if !h.requireSubtreeNotLockedByOther(c, repoID, dirPath, userID) {
+		return
+	}
+
 	// ENCRYPTION CHECK: Encrypted libraries require active decrypt session
 	if !h.requireDecryptSession(c, orgID, userID, repoID) {
 		return
@@ -1570,6 +1587,10 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 
 	// Clean up file tags for the deleted directory and its contents (async, non-blocking)
 	go h.cleanupFileTagsForPrefix(repoID, dirPath)
+
+	// Drop the operator's own locks under the just-deleted directory so they don't linger
+	// as orphans (any other user's lock here would have blocked the delete upstream).
+	clearLocksAfterDelete(h, repoID, dirPath, userID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success":   true,

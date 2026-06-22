@@ -44,13 +44,13 @@ Use `libraries.owner_id` to recognise the library owner (and any future admin ro
 2. ✅ **DONE (2026-06-19).** Enforce `manual` locks on the write paths via shared `db` helpers and injectable seams:
    - `db.FileLockedByOther` (exact path) and `db.SubtreeLockedByOther` (path + descendants), both fail-closed (`ErrFileLockStatusUnavailable` → `503`) so an unverifiable lock never silently allows a write.
    - **Exact-path** enforcement: single-shot upload overwrite (`UploadFile`), chunked/seafhttp overwrite (`HandleUpload`, gated on `replace`).
-   - **Subtree** enforcement (blocks acting on a folder that contains a file locked by another user): `RenameFile`, `DeleteFile`, `MoveFile`, `BatchDeleteItems`.
+   - **Subtree** enforcement (blocks acting on a folder that contains a file locked by another user): `RenameFile`, `DeleteFile`, `MoveFile`, `BatchDeleteItems`, **and the directory-level endpoints `RenameDirectory` / `DeleteDirectory`** (a folder rename/delete relocates or strips every descendant path).
    - **Batch move/copy via the `sync-/async-batch-*` endpoints and `/file/move`** is enforced in `BatchOperationHandler.processSingleItem`: a `move` checks the **source subtree**; a `replace` conflict policy checks the **destination** path.
    - **The `/file/copy/` path does NOT go through `processSingleItem`** — `CopyFile` and `copyBatchFiles` call `copyItemWithinRepoWithRetry`, which enforces the **`replace` destination lock** directly (autorename/skip are exempt since they never overwrite).
    - All of the above map to `403` (`ErrBatchItemLocked`) / `503` (`ErrBatchLockStatusUnavailable`). Covered by `TestProcessSingleItem_*`, `TestCopyItemWithinRepo_*`, and the `file_lock_enforcement_test.go` handler tests.
 2b. ✅ **DONE (2026-06-19).** Keep lock rows consistent when the **owner** restructures a locked path (the subtree pre-check guarantees any lock under the path is the operator's own):
-   - **Rename** → `db.RelocateLocksUnder` rewrites the operator's locks from the old path/prefix to the new one (`rewriteLockedPath`, unit-tested).
-   - **Delete / batch-delete** → `db.ClearLocksUnder` drops the operator's now-orphaned locks under the deleted path.
+   - **Rename** (file and directory) → `db.RelocateLocksUnder` rewrites the operator's locks from the old path/prefix to the new one (`rewriteLockedPath`, unit-tested).
+   - **Delete / batch-delete** (file and directory) → `db.ClearLocksUnder` drops the operator's now-orphaned locks under the deleted path.
    - **Move** (same-repo, via `processSingleItem`/`processSameRepoMove`) → clears the source locks (the destination name is autorename-dependent, so we clear rather than guess; the owner re-locks at the destination).
    - All run **after** the FS commit succeeds and only touch `locked_files`; failures are logged, never failing the structural op.
 

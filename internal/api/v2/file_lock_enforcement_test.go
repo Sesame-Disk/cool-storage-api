@@ -322,6 +322,70 @@ func TestRequireReplaceRevertDirectoryNotLockedByOther_KeepBothSkipsLockCheck(t 
 	}
 }
 
+func TestRenameDirectory_RejectsLockedSubtree(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withCheckSubtreeLockedByOtherStub(t, func(_ *FileHandler, repoID, dirPath, userID string) (bool, string, error) {
+		if repoID == "repo-1" && dirPath == "/locked-dir" && userID == "test-user" {
+			return true, "owner-111", nil
+		}
+		return false, "", nil
+	})
+
+	r := gin.New()
+	handler := &FileHandler{}
+	r.POST("/repos/:repo_id/dir", func(c *gin.Context) {
+		c.Set("org_id", "test-org")
+		c.Set("user_id", "test-user")
+		handler.RenameDirectory(c)
+	})
+
+	body, _ := json.Marshal(map[string]interface{}{"newname": "renamed"})
+	req := httptest.NewRequest("POST", "/repos/repo-1/dir?p=/locked-dir", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	resp := decodeJSONMap(t, w.Body)
+	if got := resp["lock_owner"]; got != "owner-111" {
+		t.Fatalf("lock_owner = %v, want %q", got, "owner-111")
+	}
+}
+
+func TestDeleteDirectory_RejectsLockedSubtree(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withCheckSubtreeLockedByOtherStub(t, func(_ *FileHandler, repoID, dirPath, userID string) (bool, string, error) {
+		if repoID == "repo-1" && dirPath == "/locked-dir" && userID == "test-user" {
+			return true, "owner-222", nil
+		}
+		return false, "", nil
+	})
+
+	r := gin.New()
+	handler := &FileHandler{}
+	r.DELETE("/repos/:repo_id/dir", func(c *gin.Context) {
+		c.Set("org_id", "test-org")
+		c.Set("user_id", "test-user")
+		handler.DeleteDirectory(c)
+	})
+
+	req := httptest.NewRequest("DELETE", "/repos/repo-1/dir?p=/locked-dir", nil)
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	resp := decodeJSONMap(t, w.Body)
+	if got := resp["lock_owner"]; got != "owner-222" {
+		t.Fatalf("lock_owner = %v, want %q", got, "owner-222")
+	}
+}
+
 func TestLockFile_ConflictReturns409(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	oldAcquire := acquireFileLock
