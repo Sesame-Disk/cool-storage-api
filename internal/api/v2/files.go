@@ -854,14 +854,17 @@ func (h *FileHandler) RenameDirectory(c *gin.Context) {
 		return
 	}
 
-	// LOCK ENFORCEMENT: a folder cannot be renamed if it contains a file locked by
-	// another user (renaming the folder relocates every descendant path).
-	if !h.requireSubtreeNotLockedByOther(c, repoID, dirPath, userID) {
+	// ENCRYPTION CHECK: Encrypted libraries require active decrypt session. This runs
+	// BEFORE lock enforcement so an encrypted library stays completely inaccessible
+	// without an active decrypt session — otherwise a 403 "locked" with lock_owner would
+	// leak lock metadata of an encrypted library before the decrypt gate.
+	if !h.requireDecryptSession(c, orgID, userID, repoID) {
 		return
 	}
 
-	// ENCRYPTION CHECK: Encrypted libraries require active decrypt session
-	if !h.requireDecryptSession(c, orgID, userID, repoID) {
+	// LOCK ENFORCEMENT: a folder cannot be renamed if it contains a file locked by
+	// another user (renaming the folder relocates every descendant path).
+	if !h.requireSubtreeNotLockedByOther(c, repoID, dirPath, userID) {
 		return
 	}
 
@@ -1505,14 +1508,17 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 		return
 	}
 
-	// LOCK ENFORCEMENT: a folder cannot be deleted if it contains a file locked by
-	// another user (deleting the folder would strip that lock's file).
-	if !h.requireSubtreeNotLockedByOther(c, repoID, dirPath, userID) {
+	// ENCRYPTION CHECK: Encrypted libraries require active decrypt session. This runs
+	// BEFORE lock enforcement so an encrypted library stays completely inaccessible
+	// without an active decrypt session — otherwise a 403 "locked" with lock_owner would
+	// leak lock metadata of an encrypted library before the decrypt gate.
+	if !h.requireDecryptSession(c, orgID, userID, repoID) {
 		return
 	}
 
-	// ENCRYPTION CHECK: Encrypted libraries require active decrypt session
-	if !h.requireDecryptSession(c, orgID, userID, repoID) {
+	// LOCK ENFORCEMENT: a folder cannot be deleted if it contains a file locked by
+	// another user (deleting the folder would strip that lock's file).
+	if !h.requireSubtreeNotLockedByOther(c, repoID, dirPath, userID) {
 		return
 	}
 
@@ -2461,16 +2467,19 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 		return
 	}
 
-	// LOCK ENFORCEMENT: a file locked by another user cannot be deleted — and a
-	// folder cannot be deleted if it contains a file locked by another user.
-	if !h.requireSubtreeNotLockedByOther(c, repoID, filePath, userID) {
+	// ========================================================================
+	// ENCRYPTION CHECK: Encrypted libraries require active decrypt session. This runs
+	// BEFORE lock enforcement so an encrypted library stays completely inaccessible
+	// without an active decrypt session — otherwise a 403 "locked" with lock_owner would
+	// leak lock metadata of an encrypted library before the decrypt gate.
+	// ========================================================================
+	if !h.requireDecryptSession(c, orgID, userID, repoID) {
 		return
 	}
 
-	// ========================================================================
-	// ENCRYPTION CHECK: Encrypted libraries require active decrypt session
-	// ========================================================================
-	if !h.requireDecryptSession(c, orgID, userID, repoID) {
+	// LOCK ENFORCEMENT: a file locked by another user cannot be deleted — and a
+	// folder cannot be deleted if it contains a file locked by another user.
+	if !h.requireSubtreeNotLockedByOther(c, repoID, filePath, userID) {
 		return
 	}
 
