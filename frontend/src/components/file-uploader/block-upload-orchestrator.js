@@ -12,6 +12,9 @@ import { enableBlockUpload, blockUploadThresholdMB } from '../../utils/constants
 
 export const BLOCK_SIZE = 8 * 1024 * 1024; // must match backend WebUploadBlockSize
 
+// Max hashes per /blocks/check request — must stay under the server cap (10000).
+const CHECK_BATCH_SIZE = 5000;
+
 function createAbortError() {
   if (typeof DOMException === 'function') {
     return new DOMException('Upload aborted', 'AbortError');
@@ -244,13 +247,22 @@ export async function uploadFileViaBlocks(file, {
     return file.slice(start, end).arrayBuffer();
   };
 
-  // 3. Which blocks are missing (de-duplicated hash set).
+  // 3. Which blocks are missing (de-duplicated hash set). Batched to stay within
+  //    the server's per-request hash cap (CHECK_BATCH_SIZE < 10000).
   const uniqueHashes = Array.from(new Set(blocks.map((b) => b.sha256)));
-  throwIfAborted(signal);
-  const checkResp = signal
-    ? await api.checkBlocks(uniqueHashes, session, { signal })
-    : await api.checkBlocks(uniqueHashes, session);
-  const missing = checkResp.data.missing || [];
+  const missing = [];
+  for (let i = 0; i < uniqueHashes.length; i += CHECK_BATCH_SIZE) {
+    throwIfAborted(signal);
+    const batch = uniqueHashes.slice(i, i + CHECK_BATCH_SIZE);
+    // eslint-disable-next-line no-await-in-loop
+    const checkResp = signal
+      ? await api.checkBlocks(batch, session, { signal })
+      : await api.checkBlocks(batch, session);
+    const batchMissing = (checkResp.data && checkResp.data.missing) || [];
+    for (let j = 0; j < batchMissing.length; j += 1) {
+      missing.push(batchMissing[j]);
+    }
+  }
 
   // 4. Upload missing blocks.
   await uploadMissingBlocks(session, missing, blockIndexByHash, getBlockData, {

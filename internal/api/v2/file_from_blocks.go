@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -8,12 +9,23 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/sync/errgroup"
 )
+
+// Per-block commit-readiness classification.
+const (
+	blockStatusReady = iota
+	blockStatusNeedsUpload
+	blockStatusSizeMismatch
+)
+
+const blockVerifyConcurrency = 20
 
 // waitForBlockUploadResult polls for the result of a concurrent winner's commit
 // on the same session, so a losing/retried request returns the same file
@@ -136,6 +148,10 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
 
+	if h.config == nil || !h.config.WebUploads.EnableWebBlockUpload {
+		c.JSON(http.StatusNotFound, gin.H{"error": "web block upload is not enabled"})
+		return
+	}
 	if !h.requireWritePermission(c, orgID, userID) {
 		return
 	}
@@ -174,6 +190,12 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	}
 	if session.OrgID != orgID || session.UserID != userID || session.RepoID != repoID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "session does not belong to this request"})
+		return
+	}
+	// The session captures the commit intent: it must target the parent_dir it was
+	// minted for (defends the session as an intent token, not just an auth scope).
+	if normalizePath(session.ParentDir) != req.ParentDir {
+		c.JSON(http.StatusConflict, gin.H{"error": "session parent_dir does not match this commit"})
 		return
 	}
 
@@ -223,61 +245,40 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		return
 	}
 	uniqueHashes := make([]string, 0, len(req.Blocks))
-	seen := make(map[string]struct{}, len(req.Blocks))
+	sizeByHash := make(map[string]int64, len(req.Blocks))
 	for _, b := range req.Blocks {
-		if _, ok := seen[b.SHA256]; !ok {
-			seen[b.SHA256] = struct{}{}
+		if _, ok := sizeByHash[b.SHA256]; !ok {
 			uniqueHashes = append(uniqueHashes, b.SHA256)
 		}
+		sizeByHash[b.SHA256] = b.Size
 	}
-	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, 20)
+	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, blockVerifyConcurrency)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify block presence"})
 		return
 	}
 
-	// R1/R8/R11: per block, never trust S3 existence alone. Each block must be
-	// live (ProbeBlockReuse == Reusable), physically present, owned by this session
-	// or permanently referenced, and at the declared size. Blocks that are not
-	// commit-ready are returned as needs_upload so the client (re)uploads them
-	// under the session, which materializes metadata + a session-owned ref.
+	// R1/R8/R11: per block, never trust S3 existence alone — checked in parallel
+	// (bounded concurrency) since a large manifest is thousands of blocks.
 	referrer := db.BlockReferrerForUpload(session.SessionID)
+	statuses, err := h.verifyManifestBlocks(c.Request.Context(), orgID, referrer, uniqueHashes, sizeByHash, existsMap)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify blocks"})
+		return
+	}
+
 	blockIDs := make([]string, len(req.Blocks))
 	var needsUpload []string
+	needsSeen := make(map[string]struct{})
 	for i, b := range req.Blocks {
 		blockIDs[i] = b.SHA256
-		probe, perr := h.db.ProbeBlockReuse(orgID, b.SHA256)
-		if perr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify block"})
+		switch statuses[b.SHA256] {
+		case blockStatusSizeMismatch:
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "block size mismatch", "sha256": b.SHA256})
 			return
-		}
-		if probe.Decision != db.BlockReuseReusable || !existsMap[b.SHA256] {
-			needsUpload = append(needsUpload, b.SHA256)
-			continue
-		}
-		if int64(probe.SizeBytes) != b.Size {
-			c.JSON(http.StatusUnprocessableEntity, gin.H{
-				"error":  "block size mismatch",
-				"sha256": b.SHA256,
-			})
-			return
-		}
-		// R8: a block is publishable if it is owned by this session's provisional
-		// reference OR already permanently referenced by a committed file (dedup
-		// hit the client legitimately skipped). The publish-attempt staging in
-		// finalize then pins every block under this commit before the HEAD CAS,
-		// so a concurrent rollback of someone else's provisional ref cannot drop
-		// liveness for this file.
-		if owned, oerr := h.db.BlockHasReferrer(orgID, b.SHA256, referrer); oerr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify block ownership"})
-			return
-		} else if !owned {
-			permanent, derr := blockHasPermanentReference(h.db, orgID, b.SHA256)
-			if derr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify block ownership"})
-				return
-			}
-			if !permanent {
+		case blockStatusNeedsUpload:
+			if _, ok := needsSeen[b.SHA256]; !ok {
+				needsSeen[b.SHA256] = struct{}{}
 				needsUpload = append(needsUpload, b.SHA256)
 			}
 		}
@@ -326,18 +327,11 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		return
 	}
 
-	// Release the session's provisional refs now that permanent fs: refs exist.
-	ReleaseUploadedBlockRefs(h.db, orgID, repoID, session.SessionID, blockIDs)
-
-	// R5: traffic was already charged per block at /blocks/upload; only the
-	// logical storage delta is accounted here.
-	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, storageDeltaBytes, storageDeltaFiles); err != nil {
-		log.Printf("[CreateFileFromBlocks] failed to update storage counters: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage counters"})
-		return
-	}
-
-	// R7: record the committed result for idempotent replay.
+	// R7: the file is published — record the idempotent result IMMEDIATELY, before
+	// any further best-effort work. If we waited until after the counter update and
+	// that failed, the session would be left committed=true with no ResultFilename,
+	// and every retry would hang on "commit still in progress" even though the file
+	// exists. Persisting first makes a retry return the same file deterministically.
 	resultPath := req.ParentDir
 	if resultPath == "/" {
 		resultPath = "/" + actualFilename
@@ -346,6 +340,17 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	}
 	if markErr := h.db.MarkBlockUploadSessionCommitted(session, digest, resultPath, actualFilename, ""); markErr != nil {
 		log.Printf("[CreateFileFromBlocks] WARNING: commit succeeded but failed to record session idempotency: %v", markErr)
+	}
+
+	// Release the session's provisional refs now that permanent fs: refs exist.
+	ReleaseUploadedBlockRefs(h.db, orgID, repoID, session.SessionID, blockIDs)
+
+	// R5: traffic was already charged per block at /blocks/upload; only the
+	// logical storage delta is accounted here. Best-effort: the file is already
+	// published, so a counter failure must NOT fail the request (it would falsely
+	// tell the client the upload failed). Counters are reconcilable out of band.
+	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, storageDeltaBytes, storageDeltaFiles); err != nil {
+		log.Printf("[CreateFileFromBlocks] WARNING: file committed but failed to update storage counters: %v", err)
 	}
 
 	c.JSON(http.StatusOK, fileFromBlocksResponse(&req, actualFilename))
@@ -367,17 +372,85 @@ func fileFromBlocksResponse(req *fileFromBlocksRequest, actualFilename string) [
 	}}
 }
 
-// blockHasPermanentReference reports whether a block is kept alive by a
-// non-provisional reference (a committed fs_object "fs:" ref or a publish
-// attempt "pub:" ref) rather than only a provisional upload ("up:") ref. Used
-// to allow committing legitimate cross-file dedup hits the client skipped.
+// verifyManifestBlocks classifies every distinct manifest block for commit
+// readiness with bounded concurrency (a large manifest is thousands of blocks,
+// so a sequential probe-per-block would be thousands of serial round-trips).
+// Returns a hard error only on infrastructure failure (caller should 500).
+func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer string, uniqueHashes []string, sizeByHash map[string]int64, existsMap map[string]bool) (map[string]int, error) {
+	result := make(map[string]int, len(uniqueHashes))
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, blockVerifyConcurrency)
+	for _, hash := range uniqueHashes {
+		hash := hash
+		g.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+			defer func() { <-sem }()
+			status, err := h.classifyBlockForCommit(orgID, referrer, hash, sizeByHash[hash], existsMap[hash])
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			result[hash] = status
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// classifyBlockForCommit decides whether one block is commit-ready (R1/R8/R11):
+// live (ProbeBlockReuse == Reusable), physically present, at the declared size,
+// and owned by this session OR kept alive by a committed file ("fs:") reference.
+func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, declaredSize int64, exists bool) (int, error) {
+	probe, err := h.db.ProbeBlockReuse(orgID, hash)
+	if err != nil {
+		return 0, err
+	}
+	if probe.Decision != db.BlockReuseReusable || !exists {
+		return blockStatusNeedsUpload, nil
+	}
+	if int64(probe.SizeBytes) != declaredSize {
+		return blockStatusSizeMismatch, nil
+	}
+	owned, err := h.db.BlockHasReferrer(orgID, hash, referrer)
+	if err != nil {
+		return 0, err
+	}
+	if owned {
+		return blockStatusReady, nil
+	}
+	permanent, err := blockHasPermanentReference(h.db, orgID, hash)
+	if err != nil {
+		return 0, err
+	}
+	if permanent {
+		return blockStatusReady, nil
+	}
+	return blockStatusNeedsUpload, nil
+}
+
+// blockHasPermanentReference reports whether a block is kept alive by a DURABLE
+// committed-file reference ("fs:<library>:<fs_id>"). It deliberately does NOT
+// count a publish-attempt ref ("pub:<attempt>") as permanent: that ref is
+// transient and disappears if the foreign attempt loses its HEAD CAS and cleans
+// up, which would leave this commit pointing at a block that can be GC'd. A
+// block alive only via a foreign pub: ref is therefore treated as needs_upload,
+// so the client re-uploads it and we materialize our own session-owned ref.
 func blockHasPermanentReference(database *db.DB, orgID, blockID string) (bool, error) {
 	referrers, err := database.ListBlockReferrers(orgID, blockID)
 	if err != nil {
 		return false, err
 	}
 	for _, r := range referrers {
-		if !strings.HasPrefix(r, "up:") {
+		if strings.HasPrefix(r, "fs:") {
 			return true, nil
 		}
 	}

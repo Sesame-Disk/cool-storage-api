@@ -407,6 +407,47 @@ func TestWebBlockUploadConcurrentDoubleCommit(t *testing.T) {
 	}
 }
 
+// TestWebBlockUploadForeignPubRefNotPermanent verifies a block kept alive only
+// by a FOREIGN publish-attempt ref ("pub:") — not a committed file ("fs:") and
+// not this session — is treated as needs_upload, never published. A pub: ref is
+// transient (it vanishes if the foreign attempt loses its CAS), so trusting it
+// could leave the new file pointing at a GC-able block.
+func TestWebBlockUploadForeignPubRefNotPermanent(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-pub-%d", time.Now().UnixNano()))
+	orgID := resolveOrgID(t, repoID)
+	content := []byte("foreign pub ref block " + fmt.Sprint(time.Now().UnixNano()))
+	hash := sha256hex(content)
+
+	// Upload under session A → materializes metadata + S3 object + up:<A> ref.
+	sessionA := webCreateBlockSession(t, adminClient, repoID, "/")
+	resp := webUploadBlock(t, adminClient, sessionA, content)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Rewrite liveness so the ONLY ref is a foreign pub: attempt (no fs:, no up:B).
+	dbSession := shareProjectionDBForTest(t).Session()
+	if err := dbSession.Query(`DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		orgID, hash, "up:"+sessionA).Exec(); err != nil {
+		t.Fatalf("remove up ref: %v", err)
+	}
+	if err := dbSession.Query(`INSERT INTO block_references (org_id, block_id, referrer, library_id, created_at) VALUES (?, ?, ?, ?, ?)`,
+		orgID, hash, fmt.Sprintf("pub:foreign-%d", time.Now().UnixNano()), repoID, time.Now()).Exec(); err != nil {
+		t.Fatalf("add pub ref: %v", err)
+	}
+
+	// Commit under a fresh session B without uploading → must refuse the block.
+	sessionB := webCreateBlockSession(t, adminClient, repoID, "/")
+	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
+		"session": sessionB, "parent_dir": "/", "filename": "pubonly.txt",
+		"replace": false, "size": len(content),
+		"blocks": []map[string]interface{}{{"sha256": hash, "size": len(content)}},
+	})
+	expectStatus(t, commit, http.StatusConflict)
+	commit.Body.Close()
+}
+
 func TestWebBlockUploadCompatibilityOps(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-compat-%d", time.Now().UnixNano()))
 	content := []byte("compat ops content " + fmt.Sprint(time.Now().UnixNano()))

@@ -42,6 +42,10 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
 
+	if h.config == nil || !h.config.WebUploads.EnableWebBlockUpload {
+		c.JSON(http.StatusNotFound, gin.H{"error": "web block upload is not enabled"})
+		return
+	}
 	if !h.requireWritePermission(c, orgID, userID) {
 		return
 	}

@@ -40,6 +40,11 @@ type Config struct {
 type WebUploadsConfig struct {
 	EnableUploadFolder        bool  `yaml:"enable_upload_folder"`
 	EnableResumableFileUpload bool  `yaml:"enable_resumable_file_upload"`
+	// EnableWebBlockUpload server-side-gates the web content-addressed (block)
+	// upload flow: block-upload-session, file-from-blocks, and the session mode
+	// of /blocks/check and /blocks/upload. Default false so the backend surface
+	// stays closed even though the routes are always registered.
+	EnableWebBlockUpload      bool  `yaml:"enable_web_block_upload"`
 	ResumableChunkSizeMB      int64 `yaml:"resumable_chunk_size_mb"`
 	MaxFileSizeMB             int64 `yaml:"max_file_size_mb"`
 	MaxFilesPerBatch          int   `yaml:"max_files_per_batch"`
@@ -990,6 +995,9 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("WEB_UPLOADS_ENABLE_RESUMABLE_FILE_UPLOAD"); v != "" {
 		c.WebUploads.EnableResumableFileUpload = v == "true" || v == "1"
+	}
+	if v := os.Getenv("WEB_UPLOADS_ENABLE_BLOCK_UPLOAD"); v != "" {
+		c.WebUploads.EnableWebBlockUpload = v == "true" || v == "1"
 	}
 	if v := os.Getenv("WEB_UPLOADS_RESUMABLE_CHUNK_SIZE_MB"); v != "" {
 		if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {

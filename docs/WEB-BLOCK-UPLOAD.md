@@ -1,9 +1,43 @@
 # Web content-addressed (block) upload flow
 
 **Date:** 2026-06-22
-**Status:** Phase 1 implemented (backend + frontend core). Feature-flagged OFF by
-default (`enableBlockUpload`). Encrypted libraries and public share/upload links
+**Status:** Phase 1 implemented (backend + frontend) + post-review hardening.
+Gated OFF by default by a **server-side** flag (`web_uploads.enable_web_block_upload`
+/ `WEB_UPLOADS_ENABLE_BLOCK_UPLOAD`); the frontend flag (`enableBlockUpload`) is
+driven from it via bootstrap. Encrypted libraries and public share/upload links
 are out of scope for phase 1.
+
+### Feature flag (server-authoritative)
+
+- Config: `web_uploads.enable_web_block_upload` (default `false`) in all
+  `configs/*.yaml`; env override `WEB_UPLOADS_ENABLE_BLOCK_UPLOAD=true`.
+- When off, `block-upload-session` and `file-from-blocks` return 404 and the
+  `?session=` mode of `/blocks/check` + `/blocks/upload` is rejected — the routes
+  are always registered, so this flag is the real gate (defense in depth: the UI
+  flag alone would not stop a direct API call).
+- `bootstrap` emits `enableBlockUpload` (real boolean) so the UI matches the server.
+
+### Post-review hardening (2026-06-22)
+
+- **Idempotency vs counters:** the idempotent result is persisted immediately
+  after the file is published, *before* the (best-effort) storage-counter update —
+  a counter failure no longer leaves a `committed` session without a result, and
+  never returns 500 after the file already exists.
+- **Storage-class correctness:** `/blocks/upload?session=` resolves the block
+  store by the session repo's storage class (not generic hostname/"hot"), so a
+  block lands in the same backend `file-from-blocks` later verifies.
+- **Parallel verification:** session-mode `/blocks/check` and the commit's
+  per-block checks run `ProbeBlockReuse` with bounded concurrency (20), not
+  serially — large manifests no longer mean thousands of serial round-trips.
+- **`pub:` is not permanent:** a block alive only via a foreign publish-attempt
+  ref (`pub:`) is treated as `needs_upload`; only a committed-file ref (`fs:`) or
+  this session's own `up:` ref qualifies (covered by an integration test).
+- **parent_dir is part of the intent:** commit requires
+  `session.parent_dir == req.parent_dir`.
+- **Folder uploads** stay on resumable.js in phase 1 (block flow is single-file
+  only) to avoid flattening directory structure.
+- **Batched check:** the client batches `/blocks/check` (≤5000 hashes/request) to
+  stay under the server's 10000 cap for very large files.
 
 This is the implementation of **Option B** from
 [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md): the web

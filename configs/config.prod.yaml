@@ -237,6 +237,7 @@ organizations:
 web_uploads:
   enable_upload_folder: true
   enable_resumable_file_upload: true
+  enable_web_block_upload: false  # content-addressed (block) web upload flow; off until phase-1 rollout
   resumable_chunk_size_mb: 8
   max_file_size_mb: 0                # 0 = use server.max_upload_mb
   max_files_per_batch: 1000

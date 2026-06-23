@@ -1,11 +1,13 @@
 package v2
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -14,8 +16,45 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 )
+
+// blockProbeConcurrency bounds parallel ProbeBlockReuse calls for session-mode
+// /blocks/check so a large hash list does not become serial Cassandra round-trips.
+const blockProbeConcurrency = 20
+
+// probeBlocksReusableParallel returns, per hash, whether the block is commit-ready
+// (ProbeBlockReuse == Reusable), computed with bounded concurrency.
+func probeBlocksReusableParallel(ctx context.Context, database *db.DB, orgID string, hashes []string, concurrency int) (map[string]bool, error) {
+	result := make(map[string]bool, len(hashes))
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, concurrency)
+	for _, hash := range hashes {
+		hash := hash
+		g.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+			defer func() { <-sem }()
+			probe, err := database.ProbeBlockReuse(orgID, hash)
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			result[hash] = probe.Decision == db.BlockReuseReusable
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
 
 // BlockHandler handles block-level API operations
 type BlockHandler struct {
@@ -78,16 +117,56 @@ func (h *BlockHandler) getBlockStore(c *gin.Context) (*storage.BlockStore, strin
 	return blockStore, actualClass
 }
 
+// lookupLibraryStorageClass reads the storage class a library's blocks live in.
+func (h *BlockHandler) lookupLibraryStorageClass(orgID, repoID string) string {
+	if h.db == nil || orgID == "" || repoID == "" {
+		return ""
+	}
+	var storageClass string
+	if err := h.db.Session().Query(`
+		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&storageClass); err != nil {
+		return ""
+	}
+	return storageClass
+}
+
+// getBlockStoreForRepo resolves the BlockStore for a specific library, honoring
+// its storage class. The session upload path MUST use this (not the generic
+// hostname/"hot" getBlockStore), or it could store/materialize a block in a
+// different backend than the one file-from-blocks later verifies for that repo —
+// which would make the commit report the block missing even though it was sent.
+func (h *BlockHandler) getBlockStoreForRepo(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string) {
+	if h.storageManager == nil {
+		return h.blockStore, "legacy"
+	}
+	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
+	preferred := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
+	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(preferred)
+	if err != nil {
+		log.Printf("v2/blocks: failed to get healthy backend for repo %s (%s): %v\n", repoID, preferred, err)
+		return nil, preferred
+	}
+	return blockStore, actualClass
+}
+
+// blockUploadFlowEnabled reports whether the web block-upload flow is enabled
+// server-side. The routes are always registered, so this flag is the real gate.
+func (h *BlockHandler) blockUploadFlowEnabled() bool {
+	return h.config != nil && h.config.WebUploads.EnableWebBlockUpload
+}
+
 // resolveUploadSession reads an optional ?session= query parameter for the web
 // content-addressed upload flow. Returns (session, present, ok): present=false
 // means no session was supplied (legacy desktop/mobile behavior); ok=false means
-// a session was supplied but is invalid/expired or does not belong to the caller.
+// a session was supplied but the flow is disabled, or it is invalid/expired or
+// does not belong to the caller.
 func (h *BlockHandler) resolveUploadSession(c *gin.Context) (db.BlockUploadSession, bool, bool) {
 	sessionID := c.Query("session")
 	if sessionID == "" {
 		return db.BlockUploadSession{}, false, true
 	}
-	if h.db == nil {
+	if h.db == nil || !h.blockUploadFlowEnabled() {
 		return db.BlockUploadSession{}, true, false
 	}
 	session, found, err := h.db.GetBlockUploadSession(sessionID)
@@ -156,20 +235,21 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 	// "S3 exists but unmaterialized → commit says NeedsPut" trap of the raw
 	// physical oracle.
 	if present {
+		_ = session
+		orgID := c.GetString("org_id")
+		reusable, perr := probeBlocksReusableParallel(c.Request.Context(), h.db, orgID, req.Hashes, blockProbeConcurrency)
+		if perr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
+			return
+		}
 		var existing, missing []string
 		for _, hash := range req.Hashes {
-			probe, perr := h.db.ProbeBlockReuse(c.GetString("org_id"), hash)
-			if perr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
-				return
-			}
-			if probe.Decision == db.BlockReuseReusable {
+			if reusable[hash] {
 				existing = append(existing, hash)
 			} else {
 				missing = append(missing, hash)
 			}
 		}
-		_ = session
 		c.JSON(http.StatusOK, CheckBlocksResponse{Existing: existing, Missing: missing})
 		return
 	}
@@ -291,8 +371,16 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
-	// Get appropriate BlockStore based on hostname routing
-	blockStore, storageClass := h.getBlockStore(c)
+	// Resolve the BlockStore. With a session, use the session repo's storage
+	// class so the block lands in the SAME backend file-from-blocks will verify
+	// for that repo (HIGH-2); otherwise use hostname/default routing.
+	var blockStore *storage.BlockStore
+	var storageClass string
+	if sessionPresent {
+		blockStore, storageClass = h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
+	} else {
+		blockStore, storageClass = h.getBlockStore(c)
+	}
 	if blockStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return

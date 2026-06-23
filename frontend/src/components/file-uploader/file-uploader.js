@@ -250,6 +250,13 @@ class FileUploader extends React.Component {
   // Returns true if it took ownership of the file (caller must stop).
   maybeBlockUpload = (resumableFile) => {
     const file = resumableFile.file;
+    // Phase 1: single files only. Folder uploads carry a relativePath and need
+    // directory creation/relative_path plumbing the block flow does not yet do;
+    // routing them here would flatten the folder structure. Let them fall through
+    // to the resumable.js path.
+    if (resumableFile.fileName !== resumableFile.relativePath) {
+      return false;
+    }
     if (!file || !shouldUseBlockUpload(file, { encrypted: this.props.repoEncrypted })) {
       return false;
     }
