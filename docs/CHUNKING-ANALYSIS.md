@@ -51,6 +51,27 @@ the trade-off and documenting it.
 
 **Tested:** No. No test verifies or measures the cross-method dedup gap.
 
+> **Reconfirmed 2026-06-22** while implementing the web content-addressed upload
+> flow ([WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md)). The web block flow uses
+> fixed 8 MB blocks with **SHA-256 external IDs**, while desktop uses FastCDC with
+> **SHA-1 external IDs**, so web↔desktop blocks are not reusable even for
+> identical content. Closing this needs FastCDC in the browser/worker + SHA-1
+> aliasing — explicitly deferred out of phase 1.
+
+---
+
+### Debts recorded from the web block-upload work (2026-06-22)
+
+- **Legacy `/blocks/upload` without a session does not materialize Cassandra
+  metadata/refs** — only `PutBlockData` (S3). Any *new* (non-sync) caller that
+  uploads without a session leaves an ungoverned S3 object that GC cannot see.
+  The web flow always passes a `session` (provisional ref + TTL). See R2/R9 in
+  [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md).
+- **Encrypted libraries** are rejected by the block flow (SHA-256 over plaintext
+  vs server-side block encryption). Deferred.
+- **Public share/upload links** cannot mint a session (no authenticated token)
+  and keep restarting from zero. Deferred — would need a signed-session variant.
+
 ---
 
 ### MEDIUM: Block integrity not verified on download

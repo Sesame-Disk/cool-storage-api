@@ -129,7 +129,7 @@ func (s *Server) registerAPIV2Routes(serverURL string) {
 	v2.RegisterLibraryRoutesWithToken(protected, s.db, s.config, s.tokenStore)
 	v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL)
 	if s.blockStore != nil || s.storageManager != nil {
-		v2.RegisterBlockRoutes(protected, s.blockStore, s.storageManager, s.config)
+		v2.RegisterBlockRoutes(protected, s.db, s.blockStore, s.storageManager, s.config)
 	}
 	v2.RegisterShareRoutes(protected, s.db, s.config)
 	v2.RegisterRestoreRoutes(protected, s.db, s.config)

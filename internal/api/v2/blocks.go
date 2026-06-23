@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
@@ -21,15 +22,17 @@ type BlockHandler struct {
 	blockStore     *storage.BlockStore // Legacy single store (fallback)
 	storageManager *storage.Manager    // Multi-backend storage manager
 	config         *config.Config
+	db             *db.DB // Optional: enables session-scoped materialization for the web flow
 }
 
 // RegisterBlockRoutes registers the block API routes
 // Supports both legacy single BlockStore and multi-region StorageManager
-func RegisterBlockRoutes(rg *gin.RouterGroup, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config) {
+func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config) {
 	h := &BlockHandler{
 		blockStore:     blockStore,
 		storageManager: storageManager,
 		config:         cfg,
+		db:             database,
 	}
 
 	// Per-IP rate limit for the block existence oracle.
@@ -75,6 +78,37 @@ func (h *BlockHandler) getBlockStore(c *gin.Context) (*storage.BlockStore, strin
 	return blockStore, actualClass
 }
 
+// resolveUploadSession reads an optional ?session= query parameter for the web
+// content-addressed upload flow. Returns (session, present, ok): present=false
+// means no session was supplied (legacy desktop/mobile behavior); ok=false means
+// a session was supplied but is invalid/expired or does not belong to the caller.
+func (h *BlockHandler) resolveUploadSession(c *gin.Context) (db.BlockUploadSession, bool, bool) {
+	sessionID := c.Query("session")
+	if sessionID == "" {
+		return db.BlockUploadSession{}, false, true
+	}
+	if h.db == nil {
+		return db.BlockUploadSession{}, true, false
+	}
+	session, found, err := h.db.GetBlockUploadSession(sessionID)
+	if err != nil || !found {
+		return db.BlockUploadSession{}, true, false
+	}
+	if session.OrgID != c.GetString("org_id") || session.UserID != c.GetString("user_id") {
+		return db.BlockUploadSession{}, true, false
+	}
+	return session, true, true
+}
+
+// materializeUploadedBlock records block metadata plus a provisional reference
+// owned by the session ("up:<session_id>") so the block is GC-governed and
+// commit-ready (R9). No SHA-1 mapping is written: the web flow uses SHA-256 as
+// the external block ID, so external == internal and a mapping would be a no-op
+// identity row that pollutes block_id_mappings (R10) — hence externalBlockID "".
+func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, hash string, size int, storageClass string) error {
+	return RegisterUploadedBlockAndMapping(h.db, session.OrgID, session.RepoID, hash, session.SessionID, size, storageClass, "", "")
+}
+
 // CheckBlocksRequest is the request body for checking blocks
 type CheckBlocksRequest struct {
 	Hashes []string `json:"hashes" binding:"required"`
@@ -109,6 +143,37 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 		return
 	}
 
+	session, present, ok := h.resolveUploadSession(c)
+	if present && !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired upload session"})
+		return
+	}
+
+	// Session mode (web flow, R3): a block counts as "existing" only when it is
+	// commit-ready (ProbeBlockReuse == Reusable). A block that exists physically
+	// in S3 but has no live metadata/reference is reported as missing so the
+	// client (re)uploads it under the session and materializes it — avoiding the
+	// "S3 exists but unmaterialized → commit says NeedsPut" trap of the raw
+	// physical oracle.
+	if present {
+		var existing, missing []string
+		for _, hash := range req.Hashes {
+			probe, perr := h.db.ProbeBlockReuse(c.GetString("org_id"), hash)
+			if perr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
+				return
+			}
+			if probe.Decision == db.BlockReuseReusable {
+				existing = append(existing, hash)
+			} else {
+				missing = append(missing, hash)
+			}
+		}
+		_ = session
+		c.JSON(http.StatusOK, CheckBlocksResponse{Existing: existing, Missing: missing})
+		return
+	}
+
 	// Get appropriate BlockStore based on hostname routing
 	blockStore, _ := h.getBlockStore(c)
 	if blockStore == nil {
@@ -116,7 +181,7 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 		return
 	}
 
-	// Check blocks in parallel for better performance
+	// Legacy physical-existence oracle (desktop/mobile sync, no session).
 	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), req.Hashes, 20)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
@@ -151,6 +216,15 @@ type UploadBlockResponse struct {
 // The block content is sent in the request body
 // The hash is computed server-side and verified
 func (h *BlockHandler) UploadBlock(c *gin.Context) {
+	// Optional web-flow session: when present, the block is materialized
+	// (metadata + provisional ref owned by the session) after storage, so an
+	// abandoned upload self-expires and a later commit can publish it (R9).
+	session, sessionPresent, sessionOK := h.resolveUploadSession(c)
+	if sessionPresent && !sessionOK {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired upload session"})
+		return
+	}
+
 	// Check content length
 	if c.Request.ContentLength <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "content length required"})
@@ -238,6 +312,15 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		if rec := traffic.Get(); rec != nil {
 			traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
 		}
+		// R9: materialize even when S3 already has the object — the goal is to
+		// GOVERN the block (metadata + provisional ref) so the session can commit
+		// it and GC can reclaim it, not merely to store bytes.
+		if sessionPresent {
+			if err := h.materializeUploadedBlock(session, hash, len(data), storageClass); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register block"})
+				return
+			}
+		}
 		c.JSON(http.StatusOK, UploadBlockResponse{
 			Hash: hash,
 			Size: int64(len(data)),
@@ -269,6 +352,14 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// Record traffic for newly stored block.
 	if rec := traffic.Get(); rec != nil {
 		traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
+	}
+
+	// R9: govern the freshly stored block under the session.
+	if sessionPresent {
+		if err := h.materializeUploadedBlock(session, hash, len(data), storageClass); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register block"})
+			return
+		}
 	}
 
 	c.JSON(http.StatusCreated, UploadBlockResponse{

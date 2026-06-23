@@ -4,6 +4,12 @@
 **Area:** `internal/api/v2/files.go` (`GetFileUploadedBytes`), `internal/api/seafhttp.go` (`ChunkManager` / `HandleUpload`), `frontend/src/components/file-uploader/file-uploader.js`
 **Status:** The endpoint is a safe stub today (`uploadedBytes: 0`). Real resume is **not** wired up. This doc records why, what the safe path is, and what the prerequisites are — so the next person does not "just return a number" and ship silent corruption.
 
+> **UPDATE (2026-06-22):** Option B (the block-check API) is now implemented for
+> the authenticated web uploader (phase 1, non-encrypted libraries), feature-
+> flagged off by default. Resume and network dedup are provided by
+> `/blocks/check` + commit-from-manifest, not by `file-uploaded-bytes` (which
+> stays a safe `0`). See [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md).
+
 ---
 
 ## TL;DR
