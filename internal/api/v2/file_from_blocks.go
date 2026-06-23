@@ -338,8 +338,21 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	} else {
 		resultPath = req.ParentDir + "/" + actualFilename
 	}
-	if markErr := h.db.MarkBlockUploadSessionCommitted(session, digest, resultPath, actualFilename, ""); markErr != nil {
-		log.Printf("[CreateFileFromBlocks] WARNING: commit succeeded but failed to record session idempotency: %v", markErr)
+	// Persist with bounded retries. If this row is never written the session stays
+	// committed=true (from the LWT claim) WITHOUT a result, so every retry would get
+	// "commit still in progress" until the TTL even though the file already exists.
+	// The write is an idempotent single-row INSERT, so retrying is safe; this closes
+	// all but a pathological sustained-Cassandra-outage window (documented in
+	// docs/WEB-BLOCK-UPLOAD.md as a deferred edge).
+	var markErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if markErr = h.db.MarkBlockUploadSessionCommitted(session, digest, resultPath, actualFilename, ""); markErr == nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	if markErr != nil {
+		log.Printf("[CreateFileFromBlocks] WARNING: commit succeeded but failed to record session idempotency after retries: %v", markErr)
 	}
 
 	// Release the session's provisional refs now that permanent fs: refs exist.

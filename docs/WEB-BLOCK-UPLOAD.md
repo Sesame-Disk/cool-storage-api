@@ -220,9 +220,53 @@ These are acceptable for a flag-gated rollout and are the polish items for a
 follow-up. **Still pending: browser end-to-end validation** (`docker compose up`
 + `npm start`, enable `enableBlockUpload`).
 
+## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
+
+None of these block merging the branch: the flow ships **disabled** in every prod
+config (`enable_web_block_upload: false`); they are the checklist to clear before
+flipping the flag on in production. Severity is the operator-facing risk *if the
+flag were on*.
+
+1. **[Med/high] No staging-bytes cap.** Session staging skips the logical storage
+   quota (R5) and nothing caps *uncommitted* staged bytes, so an authenticated
+   user can `PutBlockData` many new blocks and never commit. Bounded by the upload
+   **traffic quota** (per-block, hard-blocks free/hard tier) and the **48h
+   provisional-ref TTL + GC**; the gap is real only for **soft-tier or disabled
+   traffic quota** (≤48h of transient backend bytes). Fix before prod: a dedicated
+   per-user/org/session counter of materialized-but-uncommitted bytes, decremented
+   at commit/expiry, checked at `/blocks/upload` — a *separate* limit from the
+   final logical quota so it cannot reintroduce the same-size-overwrite rejection.
+   (Subsumes the "abandoned staged blocks live until TTL" observation.)
+2. **[Med, mitigated] Idempotency result can still be lost on a sustained
+   Cassandra outage.** After publish, `MarkBlockUploadSessionCommitted` is now
+   retried (3× bounded backoff). If *all* retries fail the session is left
+   `committed=true` without a result, so retries get `409 "commit still in
+   progress"` until the TTL — the file is published, **no duplicate, no
+   corruption** (the LWT prevents re-finalize). The residual is a pathological
+   outage window. Full fix (deferred): reconstruct the result by re-reading the
+   published path on a committed-but-resultless session, instead of waiting for TTL.
+3. **[Low/med] `/blocks/check?session=` is optimistic vs the commit.** Check marks
+   a block `existing` from `ProbeBlockReuse` (DB liveness) only; the commit
+   additionally verifies physical S3 presence (`CheckBlocksParallel`) and
+   ownership/permanence (`classifyBlockForCommit`). So check can say `existing`
+   while the commit returns `needs_upload` (e.g. metadata present but the S3 object
+   was deleted). **Not a correctness bug** — the commit is the authority and the
+   client re-uploads — just a possible extra round-trip. Optional follow-up: align
+   `check?session=` with the commit's classifier.
+4. **[Med] No real browser E2E yet.** Backend is covered live; still missing
+   in-browser validation of: large files, real retry, cancellation, resume,
+   progress accuracy, fallback, legacy folder upload, and local-vs-downloaded hash
+   comparison. Run with `docker compose up` + `npm start`, `enableBlockUpload` on.
+5. **[Med] No cross-method dedup (web ↔ desktop).** Web uses fixed 8 MB SHA-256
+   blocks; desktop/sync uses FastCDC variable blocks (SHA-1 external IDs) — same
+   file hashes differently, so it is stored twice. Out of phase 1; closing it needs
+   FastCDC + SHA-1 aliasing in the browser. See
+   [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md) and the limitations section above.
+
 ## Remaining work
 
-- Browser E2E of the wired flow (above).
+- Clear the prod-readiness checklist above (items 1, 2, 4 in particular) before
+  enabling `enable_web_block_upload` in production.
 - **"metadata present but S3 object deleted"** is handled (commit verifies physical
   presence via `CheckBlocksParallel` → `needs_upload`); an automated test for it
   needs direct MinIO object deletion and is not yet added.
