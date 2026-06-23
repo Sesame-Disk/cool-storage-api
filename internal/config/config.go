@@ -996,7 +996,7 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("WEB_UPLOADS_ENABLE_RESUMABLE_FILE_UPLOAD"); v != "" {
 		c.WebUploads.EnableResumableFileUpload = v == "true" || v == "1"
 	}
-	if v := os.Getenv("WEB_UPLOADS_ENABLE_BLOCK_UPLOAD"); v != "" {
+	if v := os.Getenv("WEB_UPLOADS_ENABLE_WEB_BLOCK_UPLOAD"); v != "" {
 		c.WebUploads.EnableWebBlockUpload = v == "true" || v == "1"
 	}
 	if v := os.Getenv("WEB_UPLOADS_RESUMABLE_CHUNK_SIZE_MB"); v != "" {

@@ -208,6 +208,52 @@ function buildManifest(blocks) {
   return blocks.map((b) => ({ sha256: b.sha256, size: b.size }));
 }
 
+// isCommitInProgress detects the backend's transient "winner still finalizing"
+// response: a 409 whose body is NOT a needs_upload conflict and whose message says
+// the commit is still in progress. Newer backends tag it with
+// code=commit_in_progress; older backends only return the exact retryable message.
+// Because the commit is idempotent (R7), the correct client behavior is to back
+// off and re-ask until the result is returned, rather than treating it as a
+// failure. Permanent 409s (different file, parent_dir mismatch, encrypted) are
+// left to propagate.
+function isCommitInProgress(err) {
+  const resp = err && err.response;
+  if (!resp || resp.status !== 409) return false;
+  const data = resp.data || {};
+  if (Array.isArray(data.needs_upload)) return false;
+  if (String(data.code || '').toLowerCase() === 'commit_in_progress') return true;
+  return String(data.error || '').trim().toLowerCase() === 'commit still in progress; retry';
+}
+
+// commitFromManifest posts the commit, retrying ONLY the transient "commit still
+// in progress" 409 with bounded exponential backoff. Every other outcome (success,
+// needs_upload conflict, permanent 409, abort, other errors) is returned/thrown to
+// the caller unchanged so the existing needs_upload path and fallbacks still work.
+async function commitFromManifest(api, repoID, manifest, { signal, attempts, baseMs }) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i += 1) {
+    throwIfAborted(signal);
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const resp = signal
+        ? await api.createFileFromBlocks(repoID, manifest, { signal })
+        : await api.createFileFromBlocks(repoID, manifest);
+      return resp.data;
+    } catch (err) {
+      lastErr = err;
+      if (isAbortError(err) || (signal && signal.aborted)) throw err;
+      if (isCommitInProgress(err) && i < attempts) {
+        // eslint-disable-next-line no-await-in-loop
+        await waitWithAbort(Math.min(baseMs * 2 ** (i - 1), 5000), signal);
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
 // uploadFileViaBlocks runs the full flow and resolves to the commit response
 // (array with { name, id, size }). Throws on unrecoverable errors so the caller
 // can fall back to the legacy uploader.
@@ -221,6 +267,8 @@ export async function uploadFileViaBlocks(file, {
   blockSize = BLOCK_SIZE,
   concurrency = 3,
   retries = 3,
+  commitRetries = 6,
+  commitRetryBaseMs = 500,
   onHashProgress,
   onUploadProgress,
   signal,
@@ -280,23 +328,22 @@ export async function uploadFileViaBlocks(file, {
     blocks: buildManifest(blocks),
   };
 
+  const commitOpts = { signal, attempts: commitRetries, baseMs: commitRetryBaseMs };
   try {
     throwIfAborted(signal);
-    const resp = signal
-      ? await api.createFileFromBlocks(repoID, manifest, { signal })
-      : await api.createFileFromBlocks(repoID, manifest);
-    return resp.data;
+    return await commitFromManifest(api, repoID, manifest, commitOpts);
   } catch (err) {
+    // The winner of a concurrent commit finishes the file; "commit still in
+    // progress" is already retried inside commitFromManifest. Here we only handle
+    // the other recoverable case: the server says some blocks are not commit-ready
+    // (race / orphan) — re-upload exactly those once and retry the commit.
     const needs = err && err.response && err.response.data && err.response.data.needs_upload;
     if (Array.isArray(needs) && needs.length > 0) {
       await uploadMissingBlocks(session, needs, blockIndexByHash, getBlockData, {
         api, concurrency, retries, onBlockUploaded: onUploadProgress, signal,
       });
       throwIfAborted(signal);
-      const resp = signal
-        ? await api.createFileFromBlocks(repoID, manifest, { signal })
-        : await api.createFileFromBlocks(repoID, manifest);
-      return resp.data;
+      return await commitFromManifest(api, repoID, manifest, commitOpts);
     }
     throw err;
   }

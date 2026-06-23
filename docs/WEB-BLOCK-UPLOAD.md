@@ -3,14 +3,14 @@
 **Date:** 2026-06-22
 **Status:** Phase 1 implemented (backend + frontend) + post-review hardening.
 Gated OFF by default by a **server-side** flag (`web_uploads.enable_web_block_upload`
-/ `WEB_UPLOADS_ENABLE_BLOCK_UPLOAD`); the frontend flag (`enableBlockUpload`) is
+/ `WEB_UPLOADS_ENABLE_WEB_BLOCK_UPLOAD`); the frontend flag (`enableBlockUpload`) is
 driven from it via bootstrap. Encrypted libraries and public share/upload links
 are out of scope for phase 1.
 
 ### Feature flag (server-authoritative)
 
 - Config: `web_uploads.enable_web_block_upload` (default `false`) in all
-  `configs/*.yaml`; env override `WEB_UPLOADS_ENABLE_BLOCK_UPLOAD=true`.
+  `configs/*.yaml`; env override `WEB_UPLOADS_ENABLE_WEB_BLOCK_UPLOAD=true`.
 - When off, `block-upload-session` and `file-from-blocks` return 404 and the
   `?session=` mode of `/blocks/check` + `/blocks/upload` is rejected — the routes
   are always registered, so this flag is the real gate (defense in depth: the UI
@@ -330,13 +330,20 @@ flag were on*.
    surfaces `Saving…` early and without its own progress, has no dedup
    observability, and is not fully integrated with the global aggregator. Full
    detail in *Frontend UX gaps* above — the main polish cluster before flag-on.
-7. **[Med] Concurrent-loser wait is bounded to ~10s.** The LWT still guarantees
-   a single winner, but losing/retried commits poll for only ~10s waiting for
-   the winner's `ResultFilename`. If the winning commit is still finalizing
-   after that window, losers get `409 "commit still in progress; retry"` even
-   though the same session may later complete successfully. This is acceptable
-   with robust client retry, but it is worth documenting for browser behavior
-   and support/debugging before flag-on.
+7. **[Resolved] Concurrent-loser `409 "commit still in progress"` retry.** The LWT
+   guarantees a single winner; losing/retried commits poll only ~10s for the
+   winner's `ResultFilename`, after which the server returns
+   `409 "commit still in progress; retry"`. The frontend now handles this:
+   `commitFromManifest` in
+   [block-upload-orchestrator.js](../frontend/src/components/file-uploader/block-upload-orchestrator.js)
+   retries `createFileFromBlocks` with bounded exponential backoff (default 6
+   attempts) only for the explicit retryable conflict
+   (`code: "commit_in_progress"`, with exact-message fallback for older servers),
+   until the idempotent result is returned. Permanent 409s (different file,
+   parent_dir mismatch, encrypted) are not retried; the backend now emits a
+   distinct permanent code for the "different file" case, so the old ambiguous
+   `"different file or commit is still in progress"` branch is gone (covered by
+   Go + Jest tests). The `needs_upload` re-upload path is unchanged.
 8. **[Med] Commit latency/observability at large block counts.** `file-from-blocks`
    is not a cheap metadata flip: on large files it verifies every distinct block,
    checks logical quota, does the HEAD CAS, promotes provisional→permanent refs,

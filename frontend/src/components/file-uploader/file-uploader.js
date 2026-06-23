@@ -127,15 +127,27 @@ class FileUploader extends React.Component {
   };
 
   calculateTotalProgress = (uploadFileList = this.state.uploadFileList) => {
-    let sum = 0;
+    // Byte-weighted so a 10 GB file dominates the bar over a 1 KB file (an equal
+    // per-file average badly misrepresents overall progress when sizes differ).
+    // Falls back to an equal average only when no file sizes are known.
+    let weightedDone = 0;
+    let totalBytes = 0;
+    let fractionSum = 0;
     let count = 0;
     uploadFileList.forEach(item => {
       if (item && typeof item.progress === 'function') {
-        sum += item.progress();
+        const fraction = item.progress();
+        const size = typeof item.size === 'number' && item.size > 0 ? item.size : 0;
+        weightedDone += fraction * size;
+        totalBytes += size;
+        fractionSum += fraction;
         count += 1;
       }
     });
-    return count ? Math.round((sum / count) * 100) : 0;
+    if (totalBytes > 0) {
+      return Math.round((weightedDone / totalBytes) * 100);
+    }
+    return count ? Math.round((fractionSum / count) * 100) : 0;
   };
 
   isUploading = () => {

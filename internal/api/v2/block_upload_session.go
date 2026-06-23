@@ -1,6 +1,8 @@
 package v2
 
 import (
+	"errors"
+	"io"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -36,7 +38,7 @@ func (h *FileHandler) libraryEncrypted(orgID, repoID string) (bool, error) {
 // subsequent /blocks/upload calls and the final file-from-blocks commit to this
 // (org, user, repo), and doubles as the provisional block reference owner.
 //
-// POST /api/v2.1/repos/:repo_id/block-upload-session/
+// POST /api/v2/repos/:repo_id/block-upload-session/ (also mounted under /api2/)
 func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	orgID := c.GetString("org_id")
@@ -68,10 +70,16 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 		return
 	}
 
+	// The body is optional (defaults parent_dir to "/"), but a non-empty body that
+	// is malformed JSON should be a clear 400 rather than a silent default — only
+	// an empty body (io.EOF) is treated as "no parent_dir given".
 	var req struct {
 		ParentDir string `json:"parent_dir"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
 	parentDir := normalizePath(req.ParentDir)
 	if parentDir == "" {
 		parentDir = "/"

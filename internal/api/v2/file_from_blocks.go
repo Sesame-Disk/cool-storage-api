@@ -27,6 +27,23 @@ const (
 
 const blockVerifyConcurrency = 20
 
+const (
+	blockUploadCommitInProgressCode               = "commit_in_progress"
+	blockUploadCommittedDifferentFileConflictCode = "session_committed_different_file"
+)
+
+func classifyBlockUploadCommitConflict(session db.BlockUploadSession, found bool, digest string) (resultName, errorCode, errorMessage string) {
+	if found {
+		if session.ResultFilename != "" && session.ManifestDigest == digest {
+			return session.ResultFilename, "", ""
+		}
+		if session.ManifestDigest != "" && session.ManifestDigest != digest {
+			return "", blockUploadCommittedDifferentFileConflictCode, "session already committed a different file"
+		}
+	}
+	return "", blockUploadCommitInProgressCode, "commit still in progress; retry"
+}
+
 // waitForBlockUploadResult polls for the result of a concurrent winner's commit
 // on the same session, so a losing/retried request returns the same file
 // (idempotency, R7) instead of duplicating it. Bounded (~10s); returns ok=false
@@ -153,7 +170,7 @@ func validateManifest(req *fileFromBlocksRequest) error {
 // verifies each block is live+present+owned at the declared size (R8/R11), uses
 // the logical storage delta for quota (R5), and is idempotent per session (R7).
 //
-// POST /api/v2.1/repos/:repo_id/file-from-blocks/
+// POST /api/v2/repos/:repo_id/file-from-blocks/ (also mounted under /api2/)
 func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	orgID := c.GetString("org_id")
@@ -216,7 +233,10 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// original result instead of auto-renaming a duplicate.
 	if session.Committed {
 		if session.ManifestDigest != digest {
-			c.JSON(http.StatusConflict, gin.H{"error": "session already committed a different file"})
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "session already committed a different file",
+				"code":  blockUploadCommittedDifferentFileConflictCode,
+			})
 			return
 		}
 		if session.ResultFilename != "" {
@@ -228,7 +248,10 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, name))
 			return
 		}
-		c.JSON(http.StatusConflict, gin.H{"error": "commit still in progress; retry"})
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "commit still in progress; retry",
+			"code":  blockUploadCommitInProgressCode,
+		})
 		return
 	}
 
@@ -319,7 +342,23 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, resultName))
 			return
 		}
-		c.JSON(http.StatusConflict, gin.H{"error": "session already committed a different file or commit is still in progress"})
+		current, found, readErr := h.db.GetBlockUploadSession(session.SessionID)
+		if readErr == nil {
+			if resultName, code, message := classifyBlockUploadCommitConflict(current, found, digest); resultName != "" {
+				c.JSON(http.StatusOK, fileFromBlocksResponse(&req, resultName))
+				return
+			} else {
+				c.JSON(http.StatusConflict, gin.H{
+					"error": message,
+					"code":  code,
+				})
+				return
+			}
+		}
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "commit still in progress; retry",
+			"code":  blockUploadCommitInProgressCode,
+		})
 		return
 	}
 
@@ -388,7 +427,13 @@ func fileFromBlocksResponse(req *fileFromBlocksRequest, actualFilename string) [
 	for i, b := range req.Blocks {
 		blockIDs[i] = b.SHA256
 	}
-	fileID, _ := buildFileFSObjectID(blockIDs, req.Size)
+	fileID, err := buildFileFSObjectID(blockIDs, req.Size)
+	if err != nil {
+		// The file is already committed; the response id is derived, not load-bearing
+		// for storage. Log so a (rare) marshaling/input failure is debuggable instead
+		// of silently returning an empty id.
+		log.Printf("[CreateFileFromBlocks] WARNING: failed to derive fs_object id for response (filename=%q size=%d): %v", actualFilename, req.Size, err)
+	}
 	return []gin.H{{
 		"name": actualFilename,
 		"id":   fileID,

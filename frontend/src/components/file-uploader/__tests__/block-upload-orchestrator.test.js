@@ -87,6 +87,72 @@ describe('uploadFileViaBlocks', () => {
     expect(res[0].name).toBe('f');
   });
 
+  test('retries the commit on "commit still in progress" with backoff until the idempotent result', async () => {
+    let commitCalls = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: [] } }),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockImplementation(() => {
+        commitCalls += 1;
+        if (commitCalls < 3) {
+          const err = new Error('in progress');
+          err.response = { status: 409, data: { code: 'commit_in_progress', error: 'commit still in progress; retry' } };
+          return Promise.reject(err);
+        }
+        return Promise.resolve({ data: [{ name: 'f', id: 'i', size: '10' }] });
+      }),
+    };
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
+
+    const res = await uploadFileViaBlocks(makeFile(10), {
+      repoID: 'r', api, hashFn, blockSize: 50, commitRetryBaseMs: 1,
+    });
+
+    // The two "in progress" responses are retried; the third returns the result.
+    expect(commitCalls).toBe(3);
+    expect(res[0].name).toBe('f');
+  });
+
+  test('does not retry a permanent 409 (different file) as "in progress"', async () => {
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: [] } }),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockRejectedValue(
+        Object.assign(new Error('different'), {
+          response: { status: 409, data: { code: 'session_committed_different_file', error: 'session already committed a different file' } },
+        }),
+      ),
+    };
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
+
+    await expect(
+      uploadFileViaBlocks(makeFile(10), { repoID: 'r', api, hashFn, blockSize: 50, commitRetryBaseMs: 1 }),
+    ).rejects.toThrow('different');
+    // A permanent 409 is thrown on the first attempt, never retried as in-progress.
+    expect(api.createFileFromBlocks).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not retry the old ambiguous 409 message without an explicit retryable code', async () => {
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: [] } }),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockRejectedValue(
+        Object.assign(new Error('ambiguous'), {
+          response: { status: 409, data: { error: 'session already committed a different file or commit is still in progress' } },
+        }),
+      ),
+    };
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
+
+    await expect(
+      uploadFileViaBlocks(makeFile(10), { repoID: 'r', api, hashFn, blockSize: 50, commitRetryBaseMs: 1 }),
+    ).rejects.toThrow('ambiguous');
+    expect(api.createFileFromBlocks).toHaveBeenCalledTimes(1);
+  });
+
   test('propagates a non-recoverable commit error', async () => {
     const api = {
       createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
