@@ -38,6 +38,13 @@ are out of scope for phase 1.
   only) to avoid flattening directory structure.
 - **Batched check:** the client batches `/blocks/check` (≤5000 hashes/request) to
   stay under the server's 10000 cap for very large files.
+- **Staging does not pay logical storage quota (R5):** `/blocks/upload?session=`
+  no longer applies the user's *logical* storage quota per block. That quota is a
+  property of the final file delta and is decided once at `file-from-blocks`;
+  charging it per staged block wrongly rejected valid cases like a same-size
+  overwrite (delta ≈ 0). Traffic is still charged per block, and the legacy
+  no-session path keeps its per-block admission check (covered by an integration
+  test).
 
 This is the implementation of **Option B** from
 [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md): the web
@@ -99,9 +106,13 @@ re-reading this section.
   `existing` only when `ProbeBlockReuse == Reusable`, not merely present in S3 —
   avoiding the "exists in S3 but unmaterialized → commit says NeedsPut" trap.
 - **R5 — Quota in three planes.** Traffic is charged per block at
-  `/blocks/upload`; a per-block physical admission check guards storage; the
-  **logical** repo/user storage quota is decided once at commit from the file
-  delta (`currentUploadStorageDelta`), never per block. No double counting.
+  `/blocks/upload`; the **logical** repo/user storage quota is decided once at
+  commit from the file delta (`currentUploadStorageDelta`), never per block — the
+  session staging path does NOT apply it (a staged block is transient, governed
+  by a provisional ref + TTL, and the final delta may be ≈ 0 for an overwrite).
+  The legacy no-session path still runs the same *logical* `CheckStorageQuota`
+  per block (it predates this flow; it is not a separate physical/staging cap).
+  No double counting. See the staging-cap limitation below.
 - **R6 — Manifest validation.** Fixed 8 MB blocks except the last (`0 < last ≤ 8 MB`),
   `sum(sizes) == size`, 64-hex hashes, bounded block count/total size, repeated
   blocks allowed.
@@ -155,6 +166,19 @@ re-reading this section.
 - **`GetFileUploadedBytes` remains a safe stub returning 0.** Real resume is now
   provided by `/blocks/check`; the old endpoint is kept only for the legacy
   frontend path.
+- **No staging-bytes cap (uncommitted backend consumption).** Because session
+  staging skips the logical storage quota (R5), and there is no separate cap on
+  *uncommitted* staged bytes, an authenticated user can `PutBlockData` many new
+  blocks under sessions and never commit. This is bounded — not unbounded — by:
+  (a) the upload **traffic quota**, charged per block at `/blocks/upload`, which
+  hard-blocks free/hard-tier users once their monthly upload allowance is spent;
+  and (b) the **48h provisional-ref TTL** + GC sweeper, which reclaims abandoned
+  blocks. The gap is real for **soft-tier or disabled traffic quota**, where the
+  brake is only (b): up to 48h of transient backend bytes. The proper fix is a
+  dedicated staging-bytes cap (a per-user/org counter of materialized-but-
+  uncommitted bytes, decremented at commit/expiry, checked at `/blocks/upload`) —
+  a separate limit from the final logical quota, so it would NOT reintroduce the
+  same-size-overwrite rejection. It is a follow-up feature, not yet implemented.
 
 ---
 

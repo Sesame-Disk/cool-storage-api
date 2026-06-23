@@ -417,10 +417,25 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
-	if checker := traffic.GetChecker(); checker != nil {
-		if st, _ := checker.CheckStorageQuota(c.GetString("org_id"), c.GetString("user_id"), int64(len(data))); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-			return
+	// Logical storage quota is NOT applied per block in the session (web) flow.
+	// R5: the user's repo/storage quota is a property of the FINAL file delta and
+	// is decided exactly once at file-from-blocks (finalizeStoredUploadMetadata) —
+	// a staged block is transient, governed by a provisional ref + TTL. Charging
+	// it here would wrongly reject e.g. a same-size overwrite (logical delta ≈ 0)
+	// at the first new block. Traffic is still charged per block (above).
+	//
+	// NOTE: this is NOT a staging-bytes cap. CheckStorageQuota is a LOGICAL quota
+	// (it reads storage_used/quota counters, not physical staging). The legacy
+	// no-session path below keeps running it per block only because it predates
+	// this flow. Neither path bounds total uncommitted staged bytes; for the web
+	// flow that is bounded instead by the upload traffic quota (charged above) and
+	// the 48h provisional-ref TTL + GC. See docs/WEB-BLOCK-UPLOAD.md.
+	if !sessionPresent {
+		if checker := traffic.GetChecker(); checker != nil {
+			if st, _ := checker.CheckStorageQuota(c.GetString("org_id"), c.GetString("user_id"), int64(len(data))); !st.Allowed {
+				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+				return
+			}
 		}
 	}
 

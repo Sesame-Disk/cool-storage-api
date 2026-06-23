@@ -448,6 +448,110 @@ func TestWebBlockUploadForeignPubRefNotPermanent(t *testing.T) {
 	commit.Body.Close()
 }
 
+// TestWebBlockUploadSessionStagingSkipsLogicalStorageQuota verifies R5: a block
+// staged under a session does NOT pay the user's logical storage quota per block.
+// The logical quota is a property of the FINAL file delta, decided once at
+// file-from-blocks. Charging it during staging would wrongly reject valid cases
+// like a same-size overwrite (delta ≈ 0) at the first new block. We pin the user
+// quota to 1 byte and upload a genuinely NEW block (so it hits the store path,
+// not the dedup path): under a session it must succeed; the legacy no-session
+// path on the same content is still rejected by the per-block admission check.
+func TestWebBlockUploadSessionStagingSkipsLogicalStorageQuota(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+	setDefaultUserQuota(t, int64(1))
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-wbu-quota-%d", time.Now().UnixNano()))
+
+	// Legacy (no-session) upload of fresh content is still gated by the per-block
+	// physical admission check → 403 with the user pinned to 1 byte.
+	legacyContent := []byte("legacy block under tiny quota " + fmt.Sprint(time.Now().UnixNano()))
+	legacy := webUploadBlockLegacy(t, userClient, legacyContent)
+	if legacy.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(legacy.Body)
+		legacy.Body.Close()
+		t.Fatalf("legacy block upload status = %d, want 403 under 1-byte quota; body=%s", legacy.StatusCode, body)
+	}
+	legacy.Body.Close()
+
+	// Session staging of fresh content must succeed despite the same 1-byte quota.
+	sessionContent := []byte("session block under tiny quota " + fmt.Sprint(time.Now().UnixNano()))
+	session := webCreateBlockSession(t, userClient, repoID, "/")
+	resp := webUploadBlock(t, userClient, session, sessionContent)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("session block upload status = %d, want 200/201 (staging skips logical quota); body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+}
+
+// TestWebBlockUploadCommitEnforcesLogicalDelta is the other half of the staging
+// invariant: staging skips the logical storage quota, so file-from-blocks MUST be
+// the place that enforces it by the FINAL file delta (R5, files.go). It proves
+// both directions with the user pinned at exactly their limit (zero headroom):
+//   - a same-size overwrite (delta ≈ 0) commits successfully end-to-end, and
+//   - a brand-new file (positive delta) is rejected at commit with 403,
+//     even though its block staged fine.
+// If the commit-side check ever regresses, the staging-skip would become a real
+// quota bypass — this test is the guard.
+func TestWebBlockUploadCommitEnforcesLogicalDelta(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-wbu-commitquota-%d", time.Now().UnixNano()))
+
+	const fileSize = 200
+	initial := []byte(strings.Repeat("a", fileSize))
+
+	baseline := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
+	setDefaultUserQuota(t, baseline+int64(fileSize)+50)
+
+	resp := uploadFileViaBlocksFlow(t, userClient, repoID, "/", "delta.bin", [][]byte{initial}, false)
+	expectStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+	afterInitial := waitForUserQuotaUsage(t, baseline+int64(fileSize))
+
+	// Pin quota with NO headroom: used == limit.
+	setDefaultUserQuota(t, afterInitial)
+
+	// Same-size overwrite (logical delta ≈ 0) must succeed: the new block stages
+	// at-limit (staging skips logical quota) and the commit delta is 0.
+	overwrite := []byte(strings.Repeat("b", fileSize))
+	ow := uploadFileViaBlocksFlow(t, userClient, repoID, "/", "delta.bin", [][]byte{overwrite}, true)
+	if ow.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(ow.Body)
+		ow.Body.Close()
+		t.Fatalf("same-size overwrite commit status = %d, want 200; body=%s", ow.StatusCode, body)
+	}
+	ow.Body.Close()
+
+	// A NEW file is a positive delta with no headroom → commit MUST be rejected by
+	// file-from-blocks even though its block staged fine.
+	newFile := []byte("new file positive delta " + fmt.Sprint(time.Now().UnixNano()))
+	nf := uploadFileViaBlocksFlow(t, userClient, repoID, "/", "newdelta.bin", [][]byte{newFile}, false)
+	body, _ := io.ReadAll(nf.Body)
+	nf.Body.Close()
+	if nf.StatusCode != http.StatusForbidden {
+		t.Fatalf("new-file commit status = %d, want 403 (logical delta enforced); body=%s", nf.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "storage quota exceeded") {
+		t.Fatalf("new-file commit body = %q, want storage quota exceeded", body)
+	}
+}
+
 func TestWebBlockUploadCompatibilityOps(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-compat-%d", time.Now().UnixNano()))
 	content := []byte("compat ops content " + fmt.Sprint(time.Now().UnixNano()))
