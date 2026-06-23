@@ -114,8 +114,10 @@ re-reading this section.
   per block (it predates this flow; it is not a separate physical/staging cap).
   No double counting. See the staging-cap limitation below.
 - **R6 — Manifest validation.** Fixed 8 MB blocks except the last (`0 < last ≤ 8 MB`),
-  `sum(sizes) == size`, 64-hex hashes, bounded block count/total size, repeated
-  blocks allowed.
+  `sum(sizes) == size`, 64-hex hashes, bounded block count/total size. Repeated
+  blocks are allowed **only when every occurrence of a SHA-256 declares the same
+  size** — the same content cannot have two sizes, and rejecting it stops a lie
+  from surviving the last-wins size dedup and corrupting the file's size/offsets.
 - **R7 — Server-issued, idempotent sessions.** `session_id` is a random 256-bit
   server-minted token bound to `(org, user, repo)` with a TTL.
   `file-from-blocks` is idempotent per `session + manifest_digest`: a retried
@@ -124,12 +126,18 @@ re-reading this section.
   (`ClaimBlockUploadSessionForCommit`), so exactly one of N concurrent commits
   runs finalize and the rest wait for and return the same result. A failed
   finalize releases the claim so the client can retry.
-- **R8 — Commit accepts permanent-reusable OR session-owned blocks.** Ownership
-  is encoded in the provisional referrer `up:<session_id>`; the commit also
-  accepts blocks kept alive by a permanent `fs:`/`pub:` reference (legitimate
-  cross-file dedup hits the client skipped). The publish-attempt staging pins
-  every block under the commit *before* the HEAD CAS, so a concurrent rollback
-  of another session's provisional ref cannot drop liveness for this file.
+- **R8 — Commit accepts permanent-reusable OR session-owned blocks.** A block is
+  committable only if it is kept alive by **(a)** this session's own provisional
+  referrer `up:<session_id>`, or **(b)** a permanent committed-file referrer
+  `fs:*` (a legitimate cross-file dedup hit the client skipped uploading). A
+  `pub:*` referrer does **NOT** count as permanent: it is a transient
+  publish-attempt pin that vanishes if that attempt loses its HEAD CAS, so
+  trusting a *foreign* `pub:` could leave this file pointing at a GC-able block
+  (`blockHasPermanentReference` only matches `fs:`; covered by
+  `TestWebBlockUploadForeignPubRefNotPermanent`). This commit's own
+  publish-attempt staging still pins every block under the commit *before* its
+  HEAD CAS, so a concurrent rollback of another session's provisional ref cannot
+  drop liveness for this file.
 - **R9 — `/blocks/upload?session=` always materializes**, even when
   `PutBlockData` was a no-op because the object already existed in S3. The point
   is to *govern* the block, not just store bytes.
@@ -184,14 +192,15 @@ re-reading this section.
 
 ## Validation status
 
-**Backend: validated live** (`internal/integration/web_block_upload_test.go`,
-9/9 passing against real Cassandra + MinIO via `docker compose`):
+**Backend: validated live** (`internal/integration/web_block_upload_test.go`, all
+passing against real Cassandra + MinIO via `docker compose`):
 
 - round-trip upload + download; dedup (re-check reports existing)
 - multi-block ordering + download (8 MB block + tail)
 - R1: manifest block never uploaded → `needs_upload`
 - R1/R3: S3-only block (legacy upload, no metadata) → reported missing + commit refuses
 - R6: manifest sum/size mismatch → 400
+- R6: same SHA-256 declared with conflicting sizes → 400
 - R11: block size disagrees with stored metadata → 422
 - GC fence (`blocks.gc_state='deleting'`) → commit refuses
 - R7: idempotent sequential replay → no duplicate file
@@ -207,7 +216,7 @@ in `onFileAdded` → `maybeBlockUpload` → `runBlockUpload(uploadFileViaBlocks)
 rendering a resumable-file-shaped adapter in the existing progress dialog
 (hashing = first half of the bar, uploading = second half). Anything ineligible
 falls through to the unchanged resumable.js path. Validated via Jest (component +
-orchestrator, 17 tests) + eslint + production build.
+orchestrator) + eslint + production build.
 
 **v1 limitations (behind flag, documented):**
 - The "replace existing file" dialog is bypassed for block-flow files; they
@@ -215,6 +224,50 @@ orchestrator, 17 tests) + eslint + production build.
 - Upload bitrate remains approximate for block-flow files because they do not
   contribute bytes to `this.resumable.files`; total progress/cancel/retry are
   now wired through the existing dialog.
+
+**Frontend UX gaps (verified, deferred — polish before flag-on):** the block flow
+is mapped onto the *legacy* resumable.js progress UI, which only understands
+"uploading bytes" and "saving". The mapping is lossy:
+- **No per-phase state.** The four real phases (hashing → checking existing blocks
+  → uploading missing blocks → committing/finalizing) collapse into one bar:
+  hashing is `0→50%`, upload is `50→100%`
+  ([file-uploader.js](../frontend/src/components/file-uploader/file-uploader.js)
+  `onHashProgress`/`onUploadProgress`). `check` is not represented (bar sits at
+  50%) and `commit` is not represented (bar sits at ~100%), so both read as a
+  stall. The UI should show explicit `Hashing… / Checking… / Uploading… /
+  Committing… / Finalizing… / Uploaded` states.
+- **Progress ≠ bytes uploaded.** Because the first half of the bar is local
+  hashing, the percentage does not represent bytes actually sent; for a heavily
+  deduplicated file the "upload" half completes almost instantly while the bar
+  already spent half on hashing. Progress weighting needs an explicit per-phase
+  definition.
+- **Speed shows `0.00 B/s`.** A block entry sets `remainingTime = 0` and feeds no
+  bytes into `this.resumable.files`, so the legacy `getBitrate()` sees no activity
+  and reports `0.00 B/s` even while blocks are uploading. No real throughput/ETA
+  is surfaced for block-flow files.
+- **`Saving…` appears early and can last a while.** Once the bar reaches ~100% the
+  file reads as "saving" while the commit is still running. The commit is **not**
+  zero-cost: for a multi-GB file (e.g. 12.3 GB ≈ 1,500+ blocks) it verifies every
+  block (presence + metadata + refs + size), takes the file lock, checks logical
+  quota, does the HEAD CAS, promotes provisional→permanent refs and cleans up — so
+  on large files the `Saving…` phase is genuinely visible and currently has no
+  progress of its own.
+- **Global vs per-file inconsistency.** The aggregate row can read
+  `File Uploading… 58% (0.00 B/s)` while one file shows `Uploaded` and another
+  shows `Saving…` — the block flow is not fully integrated with the legacy global
+  progress/bitrate aggregator.
+- **No dedup/throughput observability.** The UI does not surface bytes already
+  existing vs actually uploaded vs pending, nor the deduplicated percentage, so a
+  fast repeat upload or an oddly-moving bar is unexplained to the user.
+- **Aggregated concurrency of multiple large files is unbounded across files.**
+  Each large file spawns its own orchestrator with internal block concurrency, so
+  `N` large files in one batch run `N × M` concurrent block operations
+  (hashing/network/backend). There is no cross-file ceiling yet.
+- **Cancel during `Saving…`/commit is undefined.** Cancel aborts the in-flight
+  client requests, but its effect once the commit has started is not specified
+  (whether the commit is interrupted, whether provisional refs linger until TTL,
+  whether the same session can be retried). With a long `Saving…` phase this is no
+  longer a rare case.
 
 These are acceptable for a flag-gated rollout and are the polish items for a
 follow-up. **Still pending: browser end-to-end validation** (`docker compose up`
@@ -262,6 +315,22 @@ flag were on*.
    file hashes differently, so it is stored twice. Out of phase 1; closing it needs
    FastCDC + SHA-1 aliasing in the browser. See
    [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md) and the limitations section above.
+6. **[Med] Frontend phase/progress/throughput UX.** The block flow is mapped onto
+   the legacy resumable.js dialog, which loses per-phase state, shows `0.00 B/s`,
+   surfaces `Saving…` early and without its own progress, has no dedup
+   observability, and is not fully integrated with the global aggregator. Full
+   detail in *Frontend UX gaps* above — the main polish cluster before flag-on.
+7. **[Low/med] `session` travels in the query string.** `/blocks/check?session=`
+   and `/blocks/upload?session=` carry the session id as a query parameter, which
+   can land in access logs. It is not a strong secret leak (the request is already
+   authenticated and scoped to the caller), but a request header
+   (`X-Block-Upload-Session: <id>`) would keep it out of logs. Cheap follow-up.
+8. **[Low/med] No local manifest persistence (resume survives the server, not a
+   reload).** Real resume lives server-side via `/blocks/check`, but the client
+   does not cache the computed manifest (e.g. in IndexedDB). After a page reload
+   the browser must re-hash the whole file before it can ask `/blocks/check` which
+   blocks are still missing. The network resume is preserved; the local hashing
+   work is not.
 
 ## Remaining work
 

@@ -115,10 +115,21 @@ func validateManifest(req *fileFromBlocksRequest) error {
 
 	var total int64
 	lastIdx := len(req.Blocks) - 1
+	// R6: repeated blocks are allowed (a file may reference the same content
+	// several times), but only when every occurrence of a SHA-256 declares the
+	// SAME size. Content determines size, so an honest client always does; a
+	// manifest that declares one hash with two sizes is rejected here so a lie
+	// cannot survive the later last-wins dedup in sizeByHash and corrupt the
+	// committed file's size/offsets.
+	sizeSeen := make(map[string]int64, len(req.Blocks))
 	for i, b := range req.Blocks {
 		if !isHex64(b.SHA256) {
 			return fmt.Errorf("block %d: invalid sha256", i)
 		}
+		if prev, ok := sizeSeen[b.SHA256]; ok && prev != b.Size {
+			return fmt.Errorf("block %d: sha256 %s declared with conflicting sizes (%d and %d)", i, b.SHA256, prev, b.Size)
+		}
+		sizeSeen[b.SHA256] = b.Size
 		if i < lastIdx {
 			if b.Size != WebUploadBlockSize {
 				return fmt.Errorf("block %d: non-final blocks must be exactly %d bytes", i, WebUploadBlockSize)

@@ -270,6 +270,29 @@ func TestWebBlockUploadManifestValidation(t *testing.T) {
 	resp.Body.Close()
 }
 
+// TestWebBlockUploadManifestRejectsConflictingBlockSizes covers R6: the same
+// SHA-256 may repeat in a manifest, but every occurrence must declare the same
+// size. A manifest that declares one hash with two different sizes is rejected so
+// the last-wins size dedup cannot mask a lie and corrupt the file's size/offsets.
+func TestWebBlockUploadManifestRejectsConflictingBlockSizes(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-dupsize-%d", time.Now().UnixNano()))
+	session := webCreateBlockSession(t, adminClient, repoID, "/")
+	const blockSize = 8 * 1024 * 1024
+	hash := sha256hex([]byte("conflicting size block " + fmt.Sprint(time.Now().UnixNano())))
+
+	// Same hash declared as an 8 MB non-final block AND a 4-byte final block.
+	resp := webCommit(t, adminClient, repoID, map[string]interface{}{
+		"session": session, "parent_dir": "/", "filename": "dup.bin",
+		"replace": false, "size": blockSize + 4,
+		"blocks": []map[string]interface{}{
+			{"sha256": hash, "size": blockSize},
+			{"sha256": hash, "size": 4},
+		},
+	})
+	expectStatus(t, resp, http.StatusBadRequest)
+	resp.Body.Close()
+}
+
 func TestWebBlockUploadSizeMismatch(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-r11-%d", time.Now().UnixNano()))
 	session := webCreateBlockSession(t, adminClient, repoID, "/")
