@@ -1430,6 +1430,55 @@ seafileAPI.shareLinksUploadDone = function (token) {
 };
 
 // ============================================================================
+// Web content-addressed (block) upload flow
+//   1. createBlockUploadSession → server-issued session id
+//   2. checkBlocks(session)     → which SHA-256 blocks must be uploaded
+//   3. uploadBlock(session)     → upload a missing block (server verifies hash)
+//   4. createFileFromBlocks     → commit the file from the ordered manifest
+// ============================================================================
+
+// Mint a server-issued upload session bound to (org, user, repo).
+seafileAPI.createBlockUploadSession = function (repoID, parentDir, config) {
+  let url = this.server + '/api/v2/repos/' + repoID + '/block-upload-session/';
+  return this.req.post(url, { parent_dir: parentDir }, config);
+};
+
+// Ask which of the given SHA-256 block hashes still need to be uploaded.
+// In session mode the server reports a block as "existing" only when it is
+// commit-ready (live + present), not merely present in object storage.
+seafileAPI.checkBlocks = function (hashes, session, config) {
+  let url = this.server + '/api/v2/blocks/check';
+  if (session) {
+    url += '?session=' + encodeURIComponent(session);
+  }
+  return this.req.post(url, { hashes: hashes }, config);
+};
+
+// Upload a single block. The body is the raw block bytes; the server recomputes
+// and verifies the SHA-256. Under a session the block is also materialized.
+seafileAPI.uploadBlock = function (session, hash, data, config) {
+  let url = this.server + '/api/v2/blocks/upload';
+  if (session) {
+    url += '?session=' + encodeURIComponent(session);
+  }
+  const requestConfig = config || {};
+  const options = Object.assign({}, requestConfig, {
+    headers: Object.assign({}, requestConfig.headers || {}, {
+      'Content-Type': 'application/octet-stream',
+      'X-Block-Hash': hash,
+    }),
+  });
+  return this.req.post(url, data, options);
+};
+
+// Commit a file from an ordered manifest of already-uploaded blocks.
+// manifest = { session, parent_dir, filename, replace, size, blocks:[{sha256,size}] }
+seafileAPI.createFileFromBlocks = function (repoID, manifest, config) {
+  let url = this.server + '/api/v2/repos/' + repoID + '/file-from-blocks/';
+  return this.req.post(url, manifest, config);
+};
+
+// ============================================================================
 // Share Link ZIP Task API methods
 // ============================================================================
 

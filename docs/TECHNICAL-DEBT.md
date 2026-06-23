@@ -1142,6 +1142,12 @@ Core hardening landed. Direct API key auth and sessions minted from API keys now
 
 Known behavior gap. The transport path is mostly unified, but token lifecycle and resumability semantics are not clearly defined across authenticated uploads, share-link uploads, and public upload links.
 
+> **Deep dive:** see [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md)
+> for the full analysis of `file-uploaded-bytes`, why it must stay a safe `0` today,
+> the four blockers (multi-node in-memory trackers, thin endpoint contract, unstable
+> resumable identifier, corruption risk of a half-fix), and the in-session-resume vs
+> block-check-API options.
+
 ### Important Clarification
 
 Normal authenticated uploads and upload-link uploads both end up using the same SeafHTTP endpoint:
@@ -1158,8 +1164,11 @@ The main difference is resumability and recovery, not the underlying upload pipe
 
 Authenticated uploader flow:
 - calls `getFileServerUploadLink(...)` to mint the SeafHTTP upload URL
-- can also call `getFileUploadedBytes(...)`
-- resumes from the already-uploaded offset when retrying a file
+- calls `getFileUploadedBytes(...)` before/at retry to learn the resumable offset
+- **but that endpoint is a stub that always returns `0`** (`GetFileUploadedBytes` in
+  `internal/api/v2/files.go`), so today the authenticated flow also restarts from byte 0.
+  Real resume is not wired up — see
+  [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md)
 
 Public/upload-link uploader flow:
 - calls `sharedUploadLinkGetFileUploadUrl(...)` or `sharedLinkGetFileUploadUrl(...)` to mint the SeafHTTP upload URL
@@ -1201,7 +1210,7 @@ That means the public/upload-link path is usually perceived as slower or more fr
 
 ### Operational Note
 
-If users report that “normal uploads are faster than upload-token uploads”, the likely explanation is not the tokenized SeafHTTP path itself. The more likely cause is that authenticated uploads can resume from server-known progress while public/upload-link uploads restart from zero after interruption.
+If users report that “normal uploads are faster than upload-token uploads”, the likely explanation is not the tokenized SeafHTTP path itself. Note that **neither** flow currently resumes from server-known progress: `file-uploaded-bytes` is a stub returning `0`, so authenticated retries also restart from byte 0 today (the public/upload-link path additionally cannot even call the probe). See [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md).
 
 ---
 

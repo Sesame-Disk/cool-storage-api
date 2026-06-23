@@ -94,6 +94,12 @@ export const enableShowContactEmailWhenSearchUser = appPageOptions.enableShowCon
 export const enableShowLoginIDWhenSearchUser = appPageOptions.enableShowLoginIDWhenSearchUser || false;
 export const maxUploadFileSize = appPageOptions.maxUploadFileSize || 0;
 export const maxNumberOfFilesForFileupload = appPageOptions.maxNumberOfFilesForFileupload || 0;
+
+// Web content-addressed (block) upload flow. Off by default; when on, large
+// non-encrypted uploads use chunk+hash+check+commit (resume/dedup), falling
+// back to the resumable.js path otherwise. Threshold in MB.
+export const enableBlockUpload = appPageOptions.enableBlockUpload || false;
+export const blockUploadThresholdMB = appPageOptions.blockUploadThresholdMB || 64;
 export const enableOCM = appPageOptions.enableOCM || false;
 export const ocmRemoteServers = appPageOptions.ocmRemoteServers || [];
 export const enableOCMViaWebdav = appPageOptions.enableOCMViaWebdav || false;

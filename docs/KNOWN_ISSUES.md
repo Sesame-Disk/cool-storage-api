@@ -460,6 +460,10 @@ Traffic recording is still tied to successful logical upload completion:
 
 This means the current web chunked traffic counters represent completed logical uploads, not exact wire bytes received in every failure/abort case.
 
+> **Related:** the *resumability* side of chunked uploads (`file-uploaded-bytes`, why
+> it returns `0` today, and the prerequisites for real resume) is analyzed separately in
+> [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md).
+
 #### Remaining Debt
 
 If product later decides that upload traffic quota must equal raw network usage rather than successful logical uploads, the current model is not enough. Future work would need to:

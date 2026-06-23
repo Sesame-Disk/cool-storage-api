@@ -3453,7 +3453,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return
 	}
 
-	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)
+	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, []string{fileID}, fileSize, replace)
 	if err != nil {
 		handleStoredUploadMetadataError(h.db, orgID, repoID, uploadOperationID, []string{sha256ID}, err)
 		writeUploadFileError(c, err)
@@ -3526,7 +3526,7 @@ func currentUploadStorageDelta(fsHelper *FSHelper, repoID, parentDir, filename s
 	return storageDeltaBytes, storageDeltaFiles, nil
 }
 
-func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID string, fileSize int64, replace bool) (string, int64, int64, error) {
+func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename string, blockIDs []string, fileSize int64, replace bool) (string, int64, int64, error) {
 	fsHelper := NewFSHelper(h.db)
 	startedAt := time.Now()
 	attemptsUsed := 0
@@ -3540,7 +3540,7 @@ func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parent
 
 	for attempt := 1; attempt <= uploadMetadataRetryAttempts; attempt++ {
 		attemptsUsed = attempt
-		actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadataOnce(fsHelper, orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)
+		actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadataOnce(fsHelper, orgID, userID, repoID, parentDir, filename, blockIDs, fileSize, replace)
 		if err == nil {
 			result = "success"
 			return actualFilename, storageDeltaBytes, storageDeltaFiles, nil
@@ -3567,7 +3567,7 @@ func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parent
 	return "", 0, 0, fmt.Errorf("%w: failed to finalize upload metadata after %d attempts", ErrLibraryHeadConflict, uploadMetadataRetryAttempts)
 }
 
-func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID, userID, repoID, parentDir, filename, fileID string, fileSize int64, replace bool) (string, int64, int64, error) {
+func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID, userID, repoID, parentDir, filename string, blockIDs []string, fileSize int64, replace bool) (string, int64, int64, error) {
 	// Capture HEAD and root FS ID in one consistent snapshot so the CAS
 	// compare at publish time uses the exact same HEAD the tree was built from.
 	parentResult, snapshot, err := fsHelper.TraverseToPathAtHead(repoID, parentDir)
@@ -3609,7 +3609,6 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		}
 	}
 
-	blockIDs := []string{fileID}
 	pendingFile, err := newPendingPublishedFile(actualFilename, blockIDs, fileSize)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("failed to create file metadata: %w", err)

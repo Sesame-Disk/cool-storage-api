@@ -538,6 +538,9 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"enableDeleteAccount":           authenticated && hasDeleteAccount,
 		"enableUploadFolder":            boolString(s.config.WebUploads.EnableUploadFolder),
 		"enableResumableFileUpload":     boolString(s.config.WebUploads.EnableResumableFileUpload),
+		// Real boolean (not boolString) so the frontend `enableBlockUpload || false`
+		// reads false correctly — a "false" string would be truthy.
+		"enableBlockUpload":             s.config.WebUploads.EnableWebBlockUpload,
 		"resumableUploadFileBlockSize":  s.config.WebUploads.ResumableChunkSizeMB,
 		"maxUploadFileSize":             s.config.ResolvedMaxFileSizeMB(),
 		"maxNumberOfFilesForFileupload": s.config.WebUploads.MaxFilesPerBatch,

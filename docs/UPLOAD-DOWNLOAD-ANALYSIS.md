@@ -7,23 +7,6 @@
 
 ## Current findings
 
-### HIGH: `upload-link` vs `update-link` still collapses replace semantics
-
-**Files:** `internal/api/v2/files.go`, `internal/api/seafhttp.go`
-
-The desktop client and the web UI both distinguish “replace” vs “don't replace” at
-the UX layer, but both flows still collapse into the same upload-token semantics on
-the backend. `upload-link` and `update-link` still produce equivalent tokens, and the
-upload handler defaults to overwrite behavior.
-
-**Impact:** A user can explicitly choose not to replace an existing file and still end up
-overwriting it. This is a correctness bug, not just missing UX polish.
-
-**Fix:** Split token semantics so `update-link` carries `Replace=true` and `upload-link`
-defaults to auto-rename / no-replace, then plumb that flag through `HandleUpload`.
-
----
-
 ### MEDIUM: Permission not rechecked during chunked upload streaming
 
 **File:** `internal/api/seafhttp.go` (`HandleUpload`)
@@ -50,7 +33,9 @@ desktop sync protocol can.
 **Impact:** Re-uploads of large files waste user bandwidth and time.
 
 **Fix:** A future browser-side block API flow (`check-blocks` + upload missing blocks +
-commit manifest) is the real solution. This is larger than a small backend patch.
+commit manifest) is the real solution. This is larger than a small backend patch. It
+also subsumes resumable uploads — see
+[UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md).
 
 ---
 
@@ -100,6 +85,29 @@ download paths.
 ---
 
 ## Recently closed findings
+
+### CLOSED: `upload-link` vs `update-link` replace semantics are now split end-to-end
+
+The earlier HIGH finding ("both flows collapse into the same upload-token semantics")
+is stale. Replace intent is now carried by the token itself and persisted:
+
+- `upload-link` → `CreateUploadToken` (`Replace=false`, auto-rename);
+  `update-link` → `CreateUpdateToken` (`Replace=true`, overwrite). See
+  `internal/db/tokens.go` (`CreateUploadToken`/`CreateUpdateToken`) and the in-memory
+  `TokenManager` equivalents in `internal/api/seafhttp.go`.
+- The flag is persisted in the `access_tokens.replace_existing` column and re-read on
+  `GetToken`, with `resolveReplaceDefault` preserving legacy (pre-column) overwrite
+  behavior for old upload tokens.
+- `HandleUpload` uses `replaceFile := token.Replace`. A multipart `replace=0` may only
+  **downgrade** an update-link to auto-rename; an upload-link can never be **elevated**
+  to overwrite via form fields.
+- `!replace` finalize paths call `autoRenameIfExists` at both the root and nested dirs.
+
+Covered by four integration tests in `internal/integration/upload_download_test.go`:
+`TestUploadOverwrite`, `TestUploadLinkAutoRenamesWithoutReplaceOverride`,
+`TestUploadLinkIgnoresForcedReplaceOverride`, `TestUpdateLinkAllowsExplicitAutorenameOverride`.
+
+---
 
 ### CLOSED: Abandoned chunk temp files are already cleaned by the janitor
 

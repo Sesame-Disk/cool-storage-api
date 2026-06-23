@@ -43,6 +43,10 @@ func registerRepoFileRoutes(repos *gin.RouterGroup, h *FileHandler) {
 	registerPostWithSlashVariants(repos, "/upload", h.UploadFile)
 	registerGetWithSlashVariants(repos, "/download-info", h.GetDownloadInfo)
 	registerGetWithSlashVariants(repos, "/file-uploaded-bytes", h.GetFileUploadedBytes)
+
+	// Web content-addressed (block) upload flow.
+	registerPostWithSlashVariants(repos, "/block-upload-session", h.CreateBlockUploadSession)
+	registerPostWithSlashVariants(repos, "/file-from-blocks", h.CreateFileFromBlocks)
 }
 
 func registerFileRevisionRoutes(repo *gin.RouterGroup, h *FileHandler) {

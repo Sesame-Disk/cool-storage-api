@@ -134,6 +134,7 @@ storage:
 web_uploads:
   enable_upload_folder: true
   enable_resumable_file_upload: true
+  enable_web_block_upload: true  # content-addressed (block) web upload flow; dev/test
   resumable_chunk_size_mb: 8
   max_file_size_mb: 0
   max_files_per_batch: 1000

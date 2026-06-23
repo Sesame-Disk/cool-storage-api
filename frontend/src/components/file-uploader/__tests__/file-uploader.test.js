@@ -270,3 +270,90 @@ describe('FileUploader navigation guard', () => {
     expect(event.preventDefault).not.toHaveBeenCalled();
   });
 });
+
+describe('FileUploader block upload integration', () => {
+  test('treats active block uploads as uploading work even when resumable is idle', () => {
+    const uploader = createUploader();
+    uploader.state.isUploadProgressDialogShow = true;
+    uploader.state.uploadFileList = [{
+      uniqueIdentifier: 'block-1',
+      isSaved: false,
+      error: null,
+      progress: () => 0.25,
+      isUploading: () => true,
+    }];
+
+    expect(uploader.isUploading()).toBe(true);
+    expect(uploader.hasActiveUploadWork()).toBe(true);
+  });
+
+  test('retries failed block uploads through the block flow instead of resumable bootstrap', () => {
+    const uploader = createUploader();
+    const blockEntry = {
+      uniqueIdentifier: 'block-1',
+      isBlockUpload: true,
+      file: { name: 'big.bin', size: 10 },
+      isSaved: false,
+      error: 'boom',
+      progress: () => 0.4,
+      isUploading: () => false,
+    };
+    uploader.state.retryFileList = [blockEntry];
+    uploader.state.uploadFileList = [blockEntry];
+    uploader.runBlockUpload = jest.fn();
+
+    uploader.onUploadRetry(blockEntry);
+
+    expect(uploader.runBlockUpload).toHaveBeenCalledWith(blockEntry, blockEntry.file);
+    expect(uploader.retryUploadFile).not.toHaveBeenCalled();
+    expect(uploader.state.retryFileList).toEqual([]);
+    expect(blockEntry.error).toBeNull();
+  });
+
+  test('keeps total progress below 100 when cancelling one block upload but another is still active', () => {
+    const uploader = createUploader();
+    const cancelled = {
+      uniqueIdentifier: 'block-1',
+      isSaved: false,
+      error: null,
+      progress: () => 0.1,
+      isUploading: () => true,
+      cancel: jest.fn(),
+    };
+    const active = {
+      uniqueIdentifier: 'block-2',
+      isSaved: false,
+      error: null,
+      progress: () => 0.4,
+      isUploading: () => true,
+      cancel: jest.fn(),
+    };
+    uploader.state.uploadFileList = [cancelled, active];
+
+    uploader.onUploadCancel(cancelled);
+
+    expect(cancelled.cancel).toHaveBeenCalled();
+    expect(uploader.state.uploadFileList).toEqual([active]);
+    expect(uploader.state.totalProgress).toBe(40);
+  });
+
+  test('cancels active block uploads when the dialog closes', () => {
+    const uploader = createUploader();
+    const active = {
+      uniqueIdentifier: 'block-1',
+      isSaved: false,
+      error: null,
+      progress: () => 0.2,
+      isUploading: () => true,
+      cancel: jest.fn(),
+    };
+    uploader.state.isUploadProgressDialogShow = true;
+    uploader.state.uploadFileList = [active];
+
+    uploader.onCloseUploadDialog();
+
+    expect(active.cancel).toHaveBeenCalled();
+    expect(uploader.state.isUploadProgressDialogShow).toBe(false);
+    expect(uploader.state.uploadFileList).toEqual([]);
+  });
+});

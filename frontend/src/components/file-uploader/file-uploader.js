@@ -11,10 +11,12 @@ import UploadNavigationGuard from '../../utils/upload-navigation-guard';
 import UploadProgressDialog from './upload-progress-dialog';
 import UploadRemindDialog from '../dialog/upload-remind-dialog';
 import toaster from '../toast';
+import { isAbortError, shouldUseBlockUpload, uploadFileViaBlocks } from './block-upload-orchestrator';
 import '../../css/file-uploader.css';
 
 const propTypes = {
   repoID: PropTypes.string.isRequired,
+  repoEncrypted: PropTypes.bool,
   direntList: PropTypes.array.isRequired,
   filetypes: PropTypes.array,
   chunkSize: PropTypes.number,
@@ -114,6 +116,64 @@ class FileUploader extends React.Component {
       && this.state.uploadFileList.some(file => file && !file.isSaved && !file.error);
   };
 
+  hasUploadingEntries = (uploadFileList = this.state.uploadFileList) => {
+    return uploadFileList.some(file => (
+      file
+      && !file.isSaved
+      && !file.error
+      && typeof file.isUploading === 'function'
+      && file.isUploading()
+    ));
+  };
+
+  calculateTotalProgress = (uploadFileList = this.state.uploadFileList) => {
+    // Byte-weighted so a 10 GB file dominates the bar over a 1 KB file (an equal
+    // per-file average badly misrepresents overall progress when sizes differ).
+    // Falls back to an equal average only when no file sizes are known.
+    let weightedDone = 0;
+    let totalBytes = 0;
+    let fractionSum = 0;
+    let count = 0;
+    uploadFileList.forEach(item => {
+      if (item && typeof item.progress === 'function') {
+        const fraction = item.progress();
+        const size = typeof item.size === 'number' && item.size > 0 ? item.size : 0;
+        weightedDone += fraction * size;
+        totalBytes += size;
+        fractionSum += fraction;
+        count += 1;
+      }
+    });
+    if (totalBytes > 0) {
+      return Math.round((weightedDone / totalBytes) * 100);
+    }
+    return count ? Math.round((fractionSum / count) * 100) : 0;
+  };
+
+  isUploading = () => {
+    return Boolean(this.resumable && this.resumable.isUploading && this.resumable.isUploading())
+      || this.hasUploadingEntries();
+  };
+
+  cancelActiveUploads = (uploadFileList = this.state.uploadFileList) => {
+    uploadFileList.forEach(item => {
+      if (item && !item.isSaved && !item.error && typeof item.cancel === 'function') {
+        item.cancel();
+      }
+    });
+  };
+
+  prepareBlockUploadRetry = (entry) => {
+    clearFileUploadRuntimeState(entry, { resetRemainingTime: true });
+    resetUploadConflictAutoRetry(entry);
+    entry.error = null;
+    entry.isSaved = false;
+    entry._progress = 0;
+    entry._uploading = false;
+    entry._cancelled = false;
+    entry._abortController = null;
+  };
+
   // Thin delegators onto the shared guard; kept as instance methods so callers
   // (and tests) keep a stable component API.
   confirmNavigationIfUploading = () => this.navigationGuard.confirmIfUploading();
@@ -198,7 +258,131 @@ class FileUploader extends React.Component {
     maybeStartPendingUploadDuringFinalize(this.resumable);
   };
 
+  // maybeBlockUpload diverts an eligible file to the content-addressed flow.
+  // Returns true if it took ownership of the file (caller must stop).
+  maybeBlockUpload = (resumableFile) => {
+    const file = resumableFile.file;
+    // Phase 1: single files only. Folder uploads carry a relativePath and need
+    // directory creation/relative_path plumbing the block flow does not yet do;
+    // routing them here would flatten the folder structure. Let them fall through
+    // to the resumable.js path.
+    if (resumableFile.fileName !== resumableFile.relativePath) {
+      return false;
+    }
+    if (!file || !shouldUseBlockUpload(file, { encrypted: this.props.repoEncrypted })) {
+      return false;
+    }
+    // Take the file out of resumable.js — we drive it ourselves.
+    this.resumable.removeFile(resumableFile);
+
+    const entry = this.createBlockUploadEntry(resumableFile);
+    this.setState(prev => ({
+      uploadFileList: [...prev.uploadFileList, entry],
+      isUploadProgressDialogShow: true,
+    }));
+    this.runBlockUpload(entry, file);
+    return true;
+  };
+
+  // createBlockUploadEntry builds a resumable-file-shaped adapter so the existing
+  // upload progress dialog renders a block-flow upload like any other.
+  createBlockUploadEntry = (resumableFile) => {
+    const file = resumableFile.file;
+    const entry = {
+      uniqueIdentifier: resumableFile.uniqueIdentifier,
+      fileName: resumableFile.fileName,
+      relativePath: resumableFile.relativePath,
+      size: file.size,
+      newFileName: null,
+      isSaved: false,
+      error: null,
+      remainingTime: -1,
+      formData: {},
+      file,
+      isBlockUpload: true,
+      _abortController: null,
+      _cancelled: false,
+      _progress: 0,
+      _uploading: true,
+    };
+    entry.progress = () => entry._progress;
+    entry.isUploading = () => entry._uploading;
+    entry.cancel = () => {
+      entry._cancelled = true;
+      entry._uploading = false;
+      if (entry._abortController) {
+        entry._abortController.abort();
+      }
+    };
+    return entry;
+  };
+
+  updateBlockUploadProgress = (entry, fraction) => {
+    entry._progress = Math.max(0, Math.min(1, fraction));
+    entry.remainingTime = 0;
+    this.setState(prev => {
+      const uploadFileList = prev.uploadFileList.map(item => (
+        item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
+      ));
+      return {
+        uploadFileList,
+        totalProgress: this.calculateTotalProgress(uploadFileList),
+      };
+    });
+  };
+
+  runBlockUpload = (entry, file) => {
+    const { repoID, path } = this.props;
+    const abortController = typeof AbortController === 'function' ? new AbortController() : null;
+    entry._abortController = abortController;
+    entry._cancelled = false;
+    entry._uploading = true;
+    entry.error = null;
+    entry.isSaved = false;
+    entry.remainingTime = -1;
+
+    // Hashing is the first half of the bar, uploading the second half.
+    uploadFileViaBlocks(file, {
+      repoID,
+      parentDir: path,
+      filename: file.name,
+      replace: false,
+      signal: abortController ? abortController.signal : undefined,
+      onHashProgress: (hashed, total) => this.updateBlockUploadProgress(entry, (total ? hashed / total : 0) * 0.5),
+      onUploadProgress: (done, total) => this.updateBlockUploadProgress(entry, 0.5 + (total ? done / total : 1) * 0.5),
+    }).then(result => {
+      entry._abortController = null;
+      entry._progress = 1;
+      entry._uploading = false;
+      const r = Array.isArray(result) ? result[0] : result;
+      const name = (r && r.name) || file.name;
+      const dirent = { id: (r && r.id) || '', type: 'file', name, size: file.size, mtime: new Date().getTime() / 1000 };
+      this.props.onFileUploadSuccess(dirent);
+      this.markUploadSaved(entry, name);
+    }).catch(error => {
+      entry._abortController = null;
+      entry._uploading = false;
+      if (entry._cancelled || isAbortError(error)) {
+        this.setState({ totalProgress: this.calculateTotalProgress() });
+        this.restoreConcurrencyIfIdle();
+        return;
+      }
+      const message = this.getAxiosErrorMessage(error) || gettext('Network error');
+      const { retryFileList, uploadFileList } = moveUploadToRetryState(this.state.uploadFileList, this.state.retryFileList, entry, message);
+      this.setState({ retryFileList, uploadFileList, totalProgress: this.calculateTotalProgress(uploadFileList) });
+      this.restoreConcurrencyIfIdle();
+    });
+  };
+
   onFileAdded = (resumableFile, files) => {
+    // Web content-addressed (block) upload flow, behind enableBlockUpload. Large
+    // non-encrypted files are diverted out of resumable.js and uploaded via
+    // chunk+hash+check+commit (resume/dedup). Anything ineligible (flag off,
+    // small, encrypted, unsupported browser) falls through to resumable.js.
+    if (this.maybeBlockUpload(resumableFile)) {
+      return;
+    }
+
     const { isCustomPermission } = this.props;
     let isFile = resumableFile.fileName === resumableFile.relativePath;
     // uploading is file and only upload one file
@@ -277,6 +461,7 @@ class FileUploader extends React.Component {
     this.setState({
       uploadFileList: uploadFileList,
       isUploadProgressDialogShow: true,
+      totalProgress: this.calculateTotalProgress(uploadFileList),
     });
   };
 
@@ -358,8 +543,7 @@ class FileUploader extends React.Component {
   };
 
   onProgress = () => {
-    let progress = Math.round(this.resumable.progress() * 100);
-    this.setState({ totalProgress: progress });
+    this.setState({ totalProgress: this.calculateTotalProgress(this.state.uploadFileList) });
   };
 
   markUploadSaved = (resumableFile, newFileName) => {
@@ -371,7 +555,10 @@ class FileUploader extends React.Component {
       }
       return item;
     });
-    this.setState({ uploadFileList: uploadFileList });
+    this.setState({
+      uploadFileList: uploadFileList,
+      totalProgress: this.calculateTotalProgress(uploadFileList),
+    });
     this.restoreConcurrencyIfIdle();
   };
 
@@ -650,6 +837,7 @@ class FileUploader extends React.Component {
   };
 
   onCloseUploadDialog = () => {
+    this.cancelActiveUploads();
     this.loaded = 0;
     this.resumable.files = [];
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
@@ -670,14 +858,17 @@ class FileUploader extends React.Component {
       return true;
     });
 
-    if (!this.resumable.isUploading()) {
-      this.setState({
-        totalProgress: 100,
-      });
+    const hasActiveUploads = Boolean(this.resumable && this.resumable.isUploading && this.resumable.isUploading())
+      || this.hasUploadingEntries(uploadFileList);
+
+    if (!hasActiveUploads) {
       this.loaded = 0;
     }
 
-    this.setState({ uploadFileList: uploadFileList });
+    this.setState({
+      uploadFileList: uploadFileList,
+      totalProgress: hasActiveUploads ? this.calculateTotalProgress(uploadFileList) : 100,
+    });
     this.restoreConcurrencyIfIdle();
   };
 
@@ -704,6 +895,10 @@ class FileUploader extends React.Component {
   };
 
   onUploadRetry = (resumableFile) => {
+    if (resumableFile.isBlockUpload) {
+      this.retryBlockUpload(resumableFile);
+      return;
+    }
     this.retryUploadWithFreshLink(resumableFile);
   };
 
@@ -713,17 +908,44 @@ class FileUploader extends React.Component {
     // this.resumable.opts.target, which would reroute any still-in-flight file
     // onto a different server-side tracker mid-upload and split it across two
     // trackers (see retryUploadWithFreshLink). The session token stays valid.
+    const blockRetryList = [];
     this.state.retryFileList.forEach(item => {
+      if (item.isBlockUpload) {
+        this.prepareBlockUploadRetry(item);
+        blockRetryList.push(item);
+        return;
+      }
       clearFileUploadRuntimeState(item, { resetRemainingTime: true });
       resetUploadConflictAutoRetry(item);
-      item.error = false;
+      item.error = null;
       this.retryUploadFile(item);
     });
 
     let uploadFileList = this.state.uploadFileList.slice(0);
     this.setState({
       retryFileList: [],
-      uploadFileList: uploadFileList
+      uploadFileList: uploadFileList,
+      totalProgress: this.calculateTotalProgress(uploadFileList),
+    }, () => {
+      blockRetryList.forEach(item => {
+        this.runBlockUpload(item, item.file);
+      });
+    });
+    this.restoreConcurrencyIfIdle();
+  };
+
+  retryBlockUpload = (entry) => {
+    this.prepareBlockUploadRetry(entry);
+    let retryFileList = this.state.retryFileList.filter(item => {
+      return item.uniqueIdentifier !== entry.uniqueIdentifier;
+    });
+    let uploadFileList = this.state.uploadFileList.slice(0);
+    this.setState({
+      retryFileList: retryFileList,
+      uploadFileList: uploadFileList,
+      totalProgress: this.calculateTotalProgress(uploadFileList),
+    }, () => {
+      this.runBlockUpload(entry, entry.file);
     });
     this.restoreConcurrencyIfIdle();
   };
@@ -838,7 +1060,7 @@ class FileUploader extends React.Component {
             onUploadCancel={this.onUploadCancel}
             onUploadRetry={this.onUploadRetry}
             onUploadRetryAll={this.onUploadRetryAll}
-            isUploading={this.resumable.isUploading()}
+            isUploading={this.isUploading()}
           />
         }
       </Fragment>

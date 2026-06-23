@@ -347,7 +347,7 @@ func TestUploadBlockResponse_JSONFormat(t *testing.T) {
 func TestRegisterBlockRoutes(t *testing.T) {
 	r := gin.New()
 	rg := r.Group("/api/v2")
-	RegisterBlockRoutes(rg, nil, nil, nil)
+	RegisterBlockRoutes(rg, nil, nil, nil, nil)
 
 	routes := []struct {
 		method string
