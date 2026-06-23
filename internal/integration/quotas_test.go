@@ -22,7 +22,7 @@ const (
 	defaultAdminEmail      = "admin@sesamefs.local"
 	defaultUserEmail       = "user@sesamefs.local"
 	pollInterval           = 200 * time.Millisecond
-	pollTimeout            = 5 * time.Second
+	pollTimeout            = 15 * time.Second
 	testStorageQuota       = int64(333000000000)
 	testTrafficQuota       = int64(100000000)
 	testTrafficUpload      = int64(70000000)

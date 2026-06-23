@@ -159,13 +159,25 @@ func createLibraryWithBody(t *testing.T, c *testClient, name string, body interf
 	return createLibraryForTest(t, c, name, body, cleanup)
 }
 
+type createLibraryAttemptResult struct {
+	repoID       string
+	limitReached bool
+	limit        int
+	current      int
+}
+
 func createLibraryForTest(t *testing.T, c *testClient, name string, body interface{}, cleanup bool) string {
 	t.Helper()
 
-	const maxAttempts = 5
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		repoID, limitReached := tryCreateLibrary(t, c, name, body)
-		if repoID != "" {
+	const maxWait = 30 * time.Second
+	deadline := time.Now().Add(maxWait)
+	attempt := 0
+	var lastLimit createLibraryAttemptResult
+	for {
+		attempt++
+		result := tryCreateLibrary(t, c, name, body)
+		if result.repoID != "" {
+			repoID := result.repoID
 			liveRepoIDs.Store(repoID, struct{}{})
 			if cleanup {
 				t.Cleanup(func() {
@@ -186,32 +198,53 @@ func createLibraryForTest(t *testing.T, c *testClient, name string, body interfa
 			return repoID
 		}
 
-		if !limitReached {
+		if !result.limitReached {
 			break
 		}
+		lastLimit = result
 
 		deleted := cleanupTestLibrariesAcrossKnownUsers(t)
 		if deleted > 0 {
 			t.Logf("cleaned up %d stale test libraries after hitting the library limit while creating %q", deleted, name)
-		} else if attempt == maxAttempts-1 {
-			t.Fatalf("failed to create library %q: library limit reached and no stale test libraries were available for cleanup", name)
+		} else if result.limit > 0 {
+			t.Logf("library limit reached while creating %q (current=%d limit=%d) but no stale test libraries were available; waiting for active-library projections to converge before retrying", name, result.current, result.limit)
 		} else {
 			t.Logf("library limit reached while creating %q but no stale test libraries were available; waiting for active-library projections to converge before retrying", name)
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
 		}
 
 		// Library creation enforcement reads the projection-backed active-library
 		// count. After a previous test cleanup, that projection can lag briefly
 		// behind the delete that already made the library disappear from the owned
 		// repo list, so an immediate retry can still see the stale count. Give the
-		// shared integration environment a short convergence window before retrying.
-		time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
+		// shared integration environment a longer convergence window before
+		// failing the test.
+		sleep := time.Duration(attempt) * 500 * time.Millisecond
+		if sleep > 3*time.Second {
+			sleep = 3 * time.Second
+		}
+		if sleep > remaining {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+	}
+
+	if lastLimit.limitReached {
+		if lastLimit.limit > 0 {
+			t.Fatalf("failed to create library %q after waiting up to %s for active-library projections to converge (last current=%d limit=%d)", name, maxWait, lastLimit.current, lastLimit.limit)
+		}
+		t.Fatalf("failed to create library %q after waiting up to %s for active-library projections to converge", name, maxWait)
 	}
 
 	t.Fatalf("failed to create library %q after retrying", name)
 	return ""
 }
 
-func tryCreateLibrary(t *testing.T, c *testClient, name string, body interface{}) (string, bool) {
+func tryCreateLibrary(t *testing.T, c *testClient, name string, body interface{}) createLibraryAttemptResult {
 	t.Helper()
 
 	resp := c.PostJSON(t, "/api/v2.1/repos/", body)
@@ -220,7 +253,11 @@ func tryCreateLibrary(t *testing.T, c *testClient, name string, body interface{}
 
 	if resp.StatusCode != http.StatusOK {
 		if isLibraryLimitResponse(resp.StatusCode, result) {
-			return "", true
+			return createLibraryAttemptResult{
+				limitReached: true,
+				limit:        jsonIntField(result["limit"]),
+				current:      jsonIntField(result["current"]),
+			}
 		}
 		t.Fatalf("create library %q failed: status=%d body=%v", name, resp.StatusCode, result)
 	}
@@ -230,7 +267,7 @@ func tryCreateLibrary(t *testing.T, c *testClient, name string, body interface{}
 		t.Fatalf("failed to get repo_id from create library response for %q: %v", name, result)
 	}
 
-	return repoID, false
+	return createLibraryAttemptResult{repoID: repoID}
 }
 
 func isLibraryLimitResponse(statusCode int, body map[string]interface{}) bool {
@@ -239,6 +276,27 @@ func isLibraryLimitResponse(statusCode int, body map[string]interface{}) bool {
 	}
 	errMsg, _ := body["error"].(string)
 	return errMsg == "Library limit reached"
+}
+
+func jsonIntField(value interface{}) int {
+	switch v := value.(type) {
+	case float64:
+		return int(v)
+	case float32:
+		return int(v)
+	case int:
+		return v
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case json.Number:
+		n, err := v.Int64()
+		if err == nil {
+			return int(n)
+		}
+	}
+	return 0
 }
 
 func cleanupTestLibrariesAcrossKnownUsers(t *testing.T) int {

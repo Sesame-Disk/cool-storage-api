@@ -329,6 +329,70 @@ func TestRegisterUploadedBlock_ReleasesStaleDeleteClaimWithEmptyStorageClass(t *
 	}
 }
 
+func TestReleaseUploadReferences_RetriesTransientRemoveFailure(t *testing.T) {
+	helper := &FSHelper{}
+	oldRemove := releaseUploadReferenceRemoveFn
+	oldDeleteExpiry := releaseUploadReferenceDeleteExpiryFn
+	oldHasReferences := releaseUploadReferenceHasReferencesFn
+	oldAttempts := releaseUploadReferenceRetryAttemptsFn
+	oldBackoff := releaseUploadReferenceRetryBackoffFn
+	oldSleep := releaseUploadReferenceSleepFn
+	t.Cleanup(func() {
+		releaseUploadReferenceRemoveFn = oldRemove
+		releaseUploadReferenceDeleteExpiryFn = oldDeleteExpiry
+		releaseUploadReferenceHasReferencesFn = oldHasReferences
+		releaseUploadReferenceRetryAttemptsFn = oldAttempts
+		releaseUploadReferenceRetryBackoffFn = oldBackoff
+		releaseUploadReferenceSleepFn = oldSleep
+	})
+
+	removeCalls := 0
+	var sleepCalls []time.Duration
+	releaseUploadReferenceRemoveFn = func(h *FSHelper, orgID, blockID, referrer string) error {
+		removeCalls++
+		if orgID != "org-1" || blockID != "block-1" || referrer != db.BlockReferrerForUpload("op-1") {
+			t.Fatalf("remove args = %s/%s/%s", orgID, blockID, referrer)
+		}
+		if removeCalls == 1 {
+			return errors.New("transient remove failure")
+		}
+		return nil
+	}
+	releaseUploadReferenceDeleteExpiryFn = func(h *FSHelper, orgID, blockID, referrer string) error {
+		if orgID != "org-1" || blockID != "block-1" || referrer != db.BlockReferrerForUpload("op-1") {
+			t.Fatalf("delete expiry args = %s/%s/%s", orgID, blockID, referrer)
+		}
+		return nil
+	}
+	releaseUploadReferenceHasReferencesFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		if orgID != "org-1" || blockID != "block-1" {
+			t.Fatalf("hasRefs args = %s/%s", orgID, blockID)
+		}
+		return false, nil
+	}
+	releaseUploadReferenceRetryAttemptsFn = func() int { return 3 }
+	releaseUploadReferenceRetryBackoffFn = func(attempt int) time.Duration {
+		if attempt != 1 {
+			t.Fatalf("retry backoff called with attempt=%d, want 1", attempt)
+		}
+		return 25 * time.Millisecond
+	}
+	releaseUploadReferenceSleepFn = func(delay time.Duration) {
+		sleepCalls = append(sleepCalls, delay)
+	}
+
+	zeroRefBlocks := helper.ReleaseUploadReferences("org-1", "lib-1", "op-1", []string{"block-1"})
+	if removeCalls != 2 {
+		t.Fatalf("removeCalls = %d, want 2", removeCalls)
+	}
+	if len(sleepCalls) != 1 || sleepCalls[0] != 25*time.Millisecond {
+		t.Fatalf("sleepCalls = %v, want [25ms]", sleepCalls)
+	}
+	if len(zeroRefBlocks) != 1 || zeroRefBlocks[0] != "block-1" {
+		t.Fatalf("zeroRefBlocks = %v, want [block-1]", zeroRefBlocks)
+	}
+}
+
 func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	helper := &FSHelper{}
 	oldAdd := registerUploadedBlockAddReferenceFn

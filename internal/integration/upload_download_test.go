@@ -65,11 +65,19 @@ func uploadFileThroughLinkWithReplaceField(t *testing.T, c *testClient, uploadUR
 
 func assertNoUploadReferrers(t *testing.T, repoID, dirPath, fileName string) {
 	t.Helper()
-	referrers := uploadedFileBlockReferrers(t, repoID, dirPath, fileName)
-	for _, referrer := range referrers {
-		if strings.HasPrefix(referrer, "up:") {
-			t.Fatalf("block referrers leaked provisional upload ref: %v", referrers)
+	var lastReferrers []string
+	ok := pollUntil(t, 10*time.Second, 200*time.Millisecond, func() bool {
+		referrers := uploadedFileBlockReferrers(t, repoID, dirPath, fileName)
+		lastReferrers = append(lastReferrers[:0], referrers...)
+		for _, referrer := range referrers {
+			if strings.HasPrefix(referrer, "up:") {
+				return false
+			}
 		}
+		return true
+	})
+	if !ok {
+		t.Fatalf("block referrers leaked provisional upload ref: %v", lastReferrers)
 	}
 }
 

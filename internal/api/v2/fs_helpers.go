@@ -109,6 +109,20 @@ var releaseUploadReferenceDeleteExpiryFn = func(h *FSHelper, orgID, blockID, ref
 	return h.db.DeleteProvisionalBlockReferenceExpiry(orgID, blockID, referrer, time.Time{})
 }
 
+var releaseUploadReferenceRemoveFn = func(h *FSHelper, orgID, blockID, referrer string) error {
+	return h.db.RemoveBlockReference(orgID, blockID, referrer)
+}
+
+var releaseUploadReferenceHasReferencesFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+	return h.db.BlockHasReferences(orgID, blockID)
+}
+
+var releaseUploadReferenceRetryAttemptsFn = RetryAttempts
+
+var releaseUploadReferenceRetryBackoffFn = RetryBackoff
+
+var releaseUploadReferenceSleepFn = time.Sleep
+
 var registerUploadedBlockRetryAttemptsFn = RetryAttempts
 
 var registerUploadedBlockRetryBackoffFn = RetryBackoff
@@ -1120,16 +1134,32 @@ func (h *FSHelper) fsObjectExists(repoID, fsID string) (bool, error) {
 // removing a missing reference is a no-op, so a retried rollback is safe.
 func (h *FSHelper) ReleaseUploadReferences(orgID, libraryID, operationID string, blockIDs []string) []string {
 	referrer := db.BlockReferrerForUpload(operationID)
+	attempts := releaseUploadReferenceRetryAttemptsFn()
+	if attempts < 1 {
+		attempts = 1
+	}
 	var zeroRefBlocks []string
 	for _, blockID := range blockIDs {
-		if err := h.db.RemoveBlockReference(orgID, blockID, referrer); err != nil {
-			log.Printf("[ReleaseUploadReferences] WARNING: failed to remove provisional reference for block %s: %v", blockID, err)
+		var removeErr error
+		removed := false
+		for attempt := 1; attempt <= attempts; attempt++ {
+			removeErr = releaseUploadReferenceRemoveFn(h, orgID, blockID, referrer)
+			if removeErr == nil {
+				removed = true
+				break
+			}
+			if attempt < attempts {
+				releaseUploadReferenceSleepFn(releaseUploadReferenceRetryBackoffFn(attempt))
+			}
+		}
+		if !removed {
+			log.Printf("[ReleaseUploadReferences] WARNING: failed to remove provisional reference for block %s after %d attempts: %v", blockID, attempts, removeErr)
 			continue
 		}
 		if err := releaseUploadReferenceDeleteExpiryFn(h, orgID, blockID, referrer); err != nil {
 			log.Printf("[ReleaseUploadReferences] WARNING: failed to delete provisional expiry tracker for block %s: %v", blockID, err)
 		}
-		hasRefs, err := h.db.BlockHasReferences(orgID, blockID)
+		hasRefs, err := releaseUploadReferenceHasReferencesFn(h, orgID, blockID)
 		if err != nil {
 			log.Printf("[ReleaseUploadReferences] WARNING: failed to check references for block %s: %v", blockID, err)
 			continue
