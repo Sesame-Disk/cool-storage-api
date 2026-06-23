@@ -124,8 +124,10 @@ re-reading this section.
   commit returns the original result instead of auto-renaming a duplicate.
   **Concurrency-safe:** the commit is claimed via a Cassandra LWT
   (`ClaimBlockUploadSessionForCommit`), so exactly one of N concurrent commits
-  runs finalize and the rest wait for and return the same result. A failed
-  finalize releases the claim so the client can retry.
+  runs finalize and the rest wait briefly for the winner's persisted result. If
+  the winner takes longer than the bounded poll window (~10s), losers return
+  `409 "commit still in progress; retry"` and a later retry returns the same
+  result. A failed finalize releases the claim so the client can retry.
 - **R8 — Commit accepts permanent-reusable OR session-owned blocks.** A block is
   committable only if it is kept alive by **(a)** this session's own provisional
   referrer `up:<session_id>`, or **(b)** a permanent committed-file referrer
@@ -187,6 +189,14 @@ re-reading this section.
   uncommitted bytes, decremented at commit/expiry, checked at `/blocks/upload`) —
   a separate limit from the final logical quota, so it would NOT reintroduce the
   same-size-overwrite rejection. It is a follow-up feature, not yet implemented.
+- **Session TTL is fixed from mint time (not sliding).** `block_upload_sessions`
+  is created with a 48h TTL when the session is minted, and each provisional
+  `up:<session_id>` block ref gets its own 48h TTL when that block is uploaded.
+  Uploading more blocks does **not** refresh the session row, so a very long-
+  lived tab can reach a state where some later blocks still have live provisional
+  refs but the original `session_id` has expired. Resume beyond ~48h should be
+  treated as "new session + re-check/re-upload", not as a guaranteed seamless
+  continuation of the old session.
 
 ---
 
@@ -320,17 +330,30 @@ flag were on*.
    surfaces `Saving…` early and without its own progress, has no dedup
    observability, and is not fully integrated with the global aggregator. Full
    detail in *Frontend UX gaps* above — the main polish cluster before flag-on.
-7. **[Low/med] `session` travels in the query string.** `/blocks/check?session=`
+7. **[Med] Concurrent-loser wait is bounded to ~10s.** The LWT still guarantees
+   a single winner, but losing/retried commits poll for only ~10s waiting for
+   the winner's `ResultFilename`. If the winning commit is still finalizing
+   after that window, losers get `409 "commit still in progress; retry"` even
+   though the same session may later complete successfully. This is acceptable
+   with robust client retry, but it is worth documenting for browser behavior
+   and support/debugging before flag-on.
+8. **[Med] Commit latency/observability at large block counts.** `file-from-blocks`
+   is not a cheap metadata flip: on large files it verifies every distinct block,
+   checks logical quota, does the HEAD CAS, promotes provisional→permanent refs,
+   and cleans up staging. The UX doc already notes the visible `Saving…` phase;
+   before prod flag-on we still need operator-facing observability for this path
+   (commit latency, retries, and timeout/error rates at high block counts).
+9. **[Low/med] `session` travels in the query string.** `/blocks/check?session=`
    and `/blocks/upload?session=` carry the session id as a query parameter, which
    can land in access logs. It is not a strong secret leak (the request is already
    authenticated and scoped to the caller), but a request header
    (`X-Block-Upload-Session: <id>`) would keep it out of logs. Cheap follow-up.
-8. **[Low/med] No local manifest persistence (resume survives the server, not a
-   reload).** Real resume lives server-side via `/blocks/check`, but the client
-   does not cache the computed manifest (e.g. in IndexedDB). After a page reload
-   the browser must re-hash the whole file before it can ask `/blocks/check` which
-   blocks are still missing. The network resume is preserved; the local hashing
-   work is not.
+10. **[Low/med] No local manifest persistence (resume survives the server, not a
+    reload).** Real resume lives server-side via `/blocks/check`, but the client
+    does not cache the computed manifest (e.g. in IndexedDB). After a page reload
+    the browser must re-hash the whole file before it can ask `/blocks/check` which
+    blocks are still missing. The network resume is preserved; the local hashing
+    work is not.
 
 ## Remaining work
 
