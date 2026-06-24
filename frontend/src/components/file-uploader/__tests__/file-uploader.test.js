@@ -62,7 +62,8 @@ const createUploader = (props = {}) => {
     upload: jest.fn(),
     isUploading: jest.fn(() => false),
   };
-  uploader.setUploadFileList = jest.fn();
+  const realSetUploadFileList = uploader.setUploadFileList;
+  uploader.setUploadFileList = jest.fn((...args) => realSetUploadFileList(...args));
   uploader.resumableUpload = jest.fn();
   uploader.retryUploadFile = jest.fn();
   uploader.restoreConcurrencyIfIdle = jest.fn();
@@ -355,5 +356,94 @@ describe('FileUploader block upload integration', () => {
     expect(active.cancel).toHaveBeenCalled();
     expect(uploader.state.isUploadProgressDialogShow).toBe(false);
     expect(uploader.state.uploadFileList).toEqual([]);
+  });
+
+  test('preserves block entries when a legacy upload is added later', () => {
+    const uploader = createUploader();
+    const blockEntry = {
+      uniqueIdentifier: 'block-1',
+      isBlockUpload: true,
+      isSaved: false,
+      error: null,
+      progress: () => 0.5,
+      isUploading: () => true,
+    };
+    const legacyFile = createResumableFile('small.txt', {
+      size: 10,
+      progress: () => 0,
+      isUploading: () => false,
+    });
+    uploader.state.uploadFileList = [blockEntry];
+    uploader.resumable.files = [legacyFile];
+
+    uploader.setUploadFileList();
+
+    expect(uploader.state.uploadFileList).toEqual([blockEntry, legacyFile]);
+  });
+
+  test('cancel all still aborts a block upload that is already in saving at 100%', () => {
+    const uploader = createUploader();
+    const saving = {
+      uniqueIdentifier: 'block-1',
+      isSaved: false,
+      error: null,
+      _phase: 'saving',
+      progress: () => 1,
+      isUploading: () => true,
+      cancel: jest.fn(),
+    };
+    const done = {
+      uniqueIdentifier: 'done-1',
+      isSaved: true,
+      error: null,
+      progress: () => 1,
+      isUploading: () => false,
+      cancel: jest.fn(),
+    };
+    uploader.state.uploadFileList = [saving, done];
+
+    uploader.onCancelAllUploading();
+
+    expect(saving.cancel).toHaveBeenCalled();
+    expect(done.cancel).not.toHaveBeenCalled();
+    expect(uploader.state.uploadFileList).toEqual([done]);
+  });
+
+  test('does not fake block bitrate from logical progress and sums block + legacy bitrate', () => {
+    const uploader = createUploader();
+    const blockEntry = {
+      uniqueIdentifier: 'block-1',
+      isBlockUpload: true,
+      isSaved: false,
+      error: null,
+      size: 1000,
+      _phase: 'uploading',
+      _uploading: true,
+      _progress: 0,
+      progress: () => blockEntry._progress,
+      isUploading: () => true,
+    };
+    uploader.state.uploadFileList = [blockEntry];
+
+    uploader.updateBlockUploadProgress(blockEntry, 0.5);
+    expect(uploader.state.uploadBitrate).toBe(0);
+
+    blockEntry._bitrate = 3000;
+    const legacyFile = createResumableFile('small.txt', {
+      size: 1000,
+      progress: () => 0.5,
+      isUploading: () => true,
+      remainingTime: -1,
+    });
+    uploader.state.uploadFileList = [blockEntry, legacyFile];
+    uploader.resumable.files = [legacyFile];
+    uploader.getBitrate = jest.fn(() => {
+      uploader.legacyUploadBitrate = 2000;
+      return 2000;
+    });
+
+    uploader.onFileProgress(legacyFile);
+
+    expect(uploader.state.uploadBitrate).toBe(5000);
   });
 });

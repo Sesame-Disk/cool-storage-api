@@ -705,14 +705,15 @@ export const isFileSaving = (resumableFile) => {
 
 export const BLOCK_BITRATE_SAMPLE_MS = 500;
 
-// sampleBlockUploadBitrate updates the entry's sampling state from its current
-// progress and returns the latest bits/s. Sampling is throttled so frequent
-// progress ticks do not divide by a near-zero interval and spike the reading.
-export const sampleBlockUploadBitrate = (entry, now = Date.now()) => {
+// sampleBlockUploadBitrate updates the entry's sampling state from the real
+// bytes transferred over the network and returns the latest bits/s. Sampling is
+// throttled so frequent progress ticks do not divide by a near-zero interval and
+// spike the reading.
+export const sampleBlockUploadBitrate = (entry, transferredBytes = entry && entry._uploadedNetworkBytes, now = Date.now()) => {
     if (!entry) {
         return 0;
     }
-    const bytes = Math.max(0, (Number(entry._progress) || 0) * (Number(entry.size) || 0));
+    const bytes = Math.max(0, Number(transferredBytes) || 0);
     if (typeof entry._bitrateTs !== 'number') {
         entry._bitrateTs = now;
         entry._bitrateBytes = bytes;
@@ -736,6 +737,7 @@ export const resetBlockUploadBitrate = (entry, now = Date.now()) => {
     }
     entry._bitrate = 0;
     entry._bitrateBytes = 0;
+    entry._uploadedNetworkBytes = 0;
     entry._bitrateTs = now;
 };
 
@@ -746,7 +748,12 @@ export const aggregateBlockUploadBitrate = (uploadFileList) => {
         return 0;
     }
     return uploadFileList.reduce((sum, item) => (
-        item && item.isBlockUpload && item._uploading && !item.isSaved && typeof item._bitrate === 'number'
+        item
+            && item.isBlockUpload
+            && item._uploading
+            && item._phase === 'uploading'
+            && !item.isSaved
+            && typeof item._bitrate === 'number'
             ? sum + item._bitrate
             : sum
     ), 0);

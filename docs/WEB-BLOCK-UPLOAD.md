@@ -357,14 +357,13 @@ orchestrator) + eslint + production build.
 **Frontend UX gaps (verified, deferred — polish before flag-on):** the block flow
 is mapped onto the *legacy* resumable.js progress UI, which only understands
 "uploading bytes" and "saving". The mapping is lossy:
-- **No per-phase state.** The four real phases (hashing → checking existing blocks
-  → uploading missing blocks → committing/finalizing) collapse into one bar:
-  hashing is `0→50%`, upload is `50→100%`
-  ([file-uploader.js](../frontend/src/components/file-uploader/file-uploader.js)
-  `onHashProgress`/`onUploadProgress`). `check` is not represented (bar sits at
-  50%) and `commit` is not represented (bar sits at ~100%), so both read as a
-  stall. The UI should show explicit `Hashing… / Checking… / Uploading… /
-  Committing… / Finalizing… / Uploaded` states.
+- **No explicit per-phase labels (partially addressed).** The orchestrator now
+  emits a coarse `_phase` (`hashing → uploading → saving → done`) via `onPhase`,
+  and the row renders `Uploading… X%` vs `Saving…` correctly from it (see the
+  FIXED items below). What is still deferred is *finer* labelling: the bar is one
+  track (hashing `0→50%`, upload `50→100%`) and `check` is not shown separately, so
+  the UI does not surface explicit `Hashing… / Checking… / Committing… /
+  Finalizing…` text — only `Uploading…`/`Saving…`.
 - **Progress ≠ bytes uploaded.** Because the first half of the bar is local
   hashing, the percentage does not represent bytes actually sent; for a heavily
   deduplicated file the "upload" half completes almost instantly while the bar
@@ -384,17 +383,40 @@ is mapped onto the *legacy* resumable.js progress UI, which only understands
 - **~~Silent infinite hang on a dropped connection~~ — FIXED (same branch).** The
   block API calls set no axios `timeout` (default `0` = wait forever), so a
   half-open socket mid-`uploadBlock` hung the whole upload with no error and no
-  retry (stuck on the old false `Saving...`). Now: control-plane calls
-  (session/check/commit) carry a bounded `timeout`, and `uploadBlock` is guarded
-  by an **inactivity watchdog** — if no bytes move for `BLOCK_STALL_TIMEOUT_MS`
-  the request is aborted and rejected as a retryable `StallTimeoutError` (distinct
-  from a user `AbortError`), so the existing retry loop recovers and, on
-  exhaustion, the row becomes a normal retryable error instead of hanging.
+  retry (stuck on the old false `Saving...`). Now `uploadBlock` is guarded by a
+  **two-phase watchdog**: while bytes are still being sent it aborts if none move
+  for `BLOCK_STALL_TIMEOUT_MS` (30 s); once the body is fully sent it switches to a
+  longer `BLOCK_RESPONSE_TIMEOUT_MS` (120 s) window so a slow backend/S3 ack is not
+  mistaken for a stall. Either timeout aborts and rejects with a retryable
+  `StallTimeoutError` / `BlockResponseTimeoutError` (distinct from a user
+  `AbortError`), so the retry loop recovers and, on exhaustion, the row becomes a
+  normal retryable error instead of hanging. Control-plane calls also carry bounded
+  timeouts (`CONTROL_PLANE_TIMEOUT_MS` for session/check, a larger
+  `COMMIT_TIMEOUT_MS` for the commit), and a commit that times out is retried
+  (idempotent, keyed by `manifestDigest`).
 - **~~Speed shows `0.00 B/s`~~ — FIXED (same branch).** Block entries are absent
   from `this.resumable.files`, so the legacy `getBitrate()` reported `0.00 B/s`
-  for them. A per-entry sampler (`sampleBlockUploadBitrate`) now derives real
-  bits/s from successive progress samples and `aggregateBlockUploadBitrate` feeds
-  the dialog header. (ETA/`Remaining` is still not computed for block files.)
+  for them. The watchdog's `onUploadProgress` now feeds **real bytes transferred
+  over the wire** (`onTransferProgress` → `_uploadedNetworkBytes`) into a per-entry
+  sampler (`sampleBlockUploadBitrate`), and `aggregateBlockUploadBitrate` (summed
+  only over entries in the `uploading` phase) plus the isolated legacy bitrate are
+  combined in `calculateUploadBitrate` for the dialog header. The block bitrate is
+  no longer faked from the logical progress fraction (which conflated hashing with
+  upload), and the legacy adaptive-concurrency calc reads its own
+  `legacyUploadBitrate`, not the combined figure. (ETA/`Remaining` is still not
+  computed for block files; the header reads `0 B/s` during the pure-hashing phase,
+  which is correct — no bytes are on the wire yet.)
+- **~~`setUploadFileList` dropped in-flight block entries~~ — FIXED (same branch).**
+  Adding a legacy file after a block upload had started rebuilt the list from
+  `this.resumable.files` only (block entries live outside resumable), erasing the
+  block rows from the dialog. `mergeUploadFileList` now preserves block entries and
+  unions them with the resumable files (deduped by `uniqueIdentifier`).
+- **Cancel All semantics changed (intentional).** `onCancelAllUploading` now
+  cancels every **unsaved** entry (`!item.isSaved`) rather than only those with
+  `progress() !== 1`. This correctly cancels a block upload sitting at 100% inside
+  the `saving` (commit) phase, and as a side effect also cancels a *legacy* file in
+  its server-side finalize. No data loss — an already-issued commit/finalize may
+  still land server-side — the row is just removed from the dialog.
 - **No dedup/throughput observability.** The UI does not surface bytes already
   existing vs actually uploaded vs pending, nor the deduplicated percentage, so a
   fast repeat upload or an oddly-moving bar is unexplained to the user.
