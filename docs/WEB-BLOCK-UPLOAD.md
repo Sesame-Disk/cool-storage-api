@@ -334,7 +334,8 @@ passing against real Cassandra + MinIO via `docker compose`):
 - R7: idempotent sequential replay → no duplicate file
 - R7: **concurrent double commit → single file** (this caught a real read-then-act
   race, fixed with the LWT claim)
-- R4: rename + re-download + history over a SHA-256-`block_ids` file
+- R4: rename + re-download + history over a web-block-upload file (SHA-1 `block_ids`
+  fs_object resolving to SHA-256 storage)
 
 ## Frontend wiring (implemented, behind flag)
 

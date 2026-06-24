@@ -1,16 +1,19 @@
 import { hashBlockBytes, toHex } from '../block-hash';
 
 // Use Node's Web Crypto (same API surface as the worker's crypto.subtle) so the
-// exact production hashing code runs under test, independent of jsdom's crypto.
+// exact production hashing code runs under test, independent of jsdom's crypto. If
+// crypto.webcrypto is absent (very old Node), skip rather than throw at import time,
+// which would otherwise fail the whole frontend suite.
 const nodeCrypto = require('crypto');
-const subtle = nodeCrypto.webcrypto.subtle;
+const subtle = (nodeCrypto.webcrypto && nodeCrypto.webcrypto.subtle) || null;
+const describeIfCrypto = subtle ? describe : describe.skip;
 
 function bufOf(str) {
   const b = Buffer.from(str);
   return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
 }
 
-describe('block-hash dual hashing', () => {
+describeIfCrypto('block-hash dual hashing', () => {
   test('returns the correct SHA-1 (40 hex) and SHA-256 (64 hex) per block', async () => {
     const data = Buffer.from('abc');
     const { sha1, sha256, size } = await hashBlockBytes(bufOf('abc'), subtle);

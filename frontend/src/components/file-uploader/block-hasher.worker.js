@@ -7,8 +7,8 @@
 // Why two hashes: SHA-256 is the internal/storage identity (check/upload, S3 key,
 // refs, GC, dedup); SHA-1 is the EXTERNAL Seafile block ID the backend writes into
 // the file fs_object so the desktop/mobile sync client (which requires 40-hex
-// SHA-1 block IDs) can parse and download the file. Both are computed from the
-// same block bytes in one pass.
+// SHA-1 block IDs) can parse and download the file. Both digests run over the same
+// in-memory block buffer (one slice/read of the file, two separate digests).
 //
 // BLOCK_SIZE MUST match the backend (api.uploadBlockSize / v2.WebUploadBlockSize
 // = 8 MB) so the blocks line up with what the rest of the system expects.

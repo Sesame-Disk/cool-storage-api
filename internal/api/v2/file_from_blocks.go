@@ -375,18 +375,24 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// forward one. The server never trusts the client's SHA-1 blindly, but it also
 	// never invents one: a client SHA-1 is accepted only if the forward mapping
 	// proves it resolves to the declared SHA-256.
+	//
+	// The lookups run in bounded parallel (like the block-presence/liveness checks
+	// above), since a large manifest is thousands of blocks; the decisions below are
+	// then applied in manifest order so the needs_upload list and the first 400 are
+	// deterministic.
 	//   - forward missing        -> needs_upload (re-upload writes the verified row)
 	//   - forward != declared    -> 400 (SHA-1 does not belong to this content)
 	//   - forward == declared    -> accept the manifest SHA-1 for the fs_object
+	forwardMappings, err := h.resolveManifestForwardMappings(c.Request.Context(), orgID, uniqueHashes, sha1ByHash, statuses)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block id mapping"})
+		return
+	}
 	for _, sha256ID := range uniqueHashes {
 		if statuses[sha256ID] != blockStatusReady {
 			continue
 		}
-		internal, found, lookupErr := h.db.GetBlockIDMapping(orgID, sha1ByHash[sha256ID])
-		if lookupErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block id mapping"})
-			return
-		}
+		internal, found := forwardMappings[sha256ID]
 		if !found {
 			addNeedsUpload(sha256ID)
 			continue
@@ -559,6 +565,51 @@ func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer 
 			}
 			mu.Lock()
 			result[hash] = status
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// resolveManifestForwardMappings looks up, in bounded parallel, the FORWARD
+// SHA-1 -> SHA-256 mapping row for each ready block's claimed SHA-1. Only blocks
+// whose status is blockStatusReady are queried (a needs_upload block is re-uploaded
+// regardless, which rewrites the verified mapping). The returned map is keyed by
+// SHA-256; a key being ABSENT means "no forward mapping row" (caller treats it as
+// needs_upload), while a present value is the internal SHA-256 the SHA-1 resolves
+// to (caller compares it against the declared SHA-256). Concurrency matches the
+// block-presence checks so a multi-thousand-block manifest does not serialize a
+// point read per block.
+func (h *FileHandler) resolveManifestForwardMappings(ctx context.Context, orgID string, uniqueHashes []string, sha1ByHash map[string]string, statuses map[string]int) (map[string]string, error) {
+	result := make(map[string]string, len(uniqueHashes))
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, blockVerifyConcurrency)
+	for _, sha256ID := range uniqueHashes {
+		if statuses[sha256ID] != blockStatusReady {
+			continue
+		}
+		sha256ID := sha256ID
+		g.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+			defer func() { <-sem }()
+			internal, found, err := h.db.GetBlockIDMapping(orgID, sha1ByHash[sha256ID])
+			if err != nil {
+				return err
+			}
+			if !found {
+				return nil
+			}
+			mu.Lock()
+			result[sha256ID] = internal
 			mu.Unlock()
 			return nil
 		})

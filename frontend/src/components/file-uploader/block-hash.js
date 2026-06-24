@@ -17,9 +17,10 @@ export function toHex(buffer) {
   return out;
 }
 
-// hashBlockBytes computes the SHA-1 and SHA-256 of one block's bytes in a single
-// pass and returns { sha1, sha256, size }. `subtle` is injectable for tests; it
-// defaults to the ambient crypto.subtle (worker/browser).
+// hashBlockBytes computes the SHA-1 and SHA-256 of one block's already-read bytes
+// (two separate digests over the same in-memory buffer, run concurrently) and
+// returns { sha1, sha256, size }. `subtle` is injectable for tests; it defaults to
+// the ambient crypto.subtle (worker/browser).
 export async function hashBlockBytes(buf, subtle) {
   const crypt = subtle || (typeof crypto !== 'undefined' ? crypto.subtle : undefined);
   const [sha256Digest, sha1Digest] = await Promise.all([
