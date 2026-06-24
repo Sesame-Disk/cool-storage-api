@@ -417,6 +417,23 @@ is mapped onto the *legacy* resumable.js progress UI, which only understands
   the `saving` (commit) phase, and as a side effect also cancels a *legacy* file in
   its server-side finalize. No data loss — an already-issued commit/finalize may
   still land server-side — the row is just removed from the dialog.
+- **~~Duplicate-name "Replace?" prompt skipped for large/batch uploads~~ — FIXED
+  (branch `fix/web-block-upload-frontend-state-and-stall`).** The replace dialog
+  only fired for a lone legacy file (`files.length === 1`), and `maybeBlockUpload`
+  diverted large files *before* that check — so a same-named large file, or any
+  duplicate inside a multi-file batch, was never offered "Replace?" and silently
+  committed as `name (1).ext` (backend `GenerateUniqueName`, **not** an error). Now
+  `onFileAdded` runs duplicate detection for **every** file, BEFORE the block
+  diversion: a match is held out of the resumable queue (`removeFile`) and queued
+  for a prompt. The decision routes to the correct flow with the right semantics —
+  block flow with `replace: true/false` (persisted on the entry so Retry keeps it),
+  or legacy with the per-file update-link + `replace` flag — and held legacy files
+  are pushed back into the queue only after their per-file target is armed (never
+  the shared/global target). Multiple duplicates prompt sequentially with an
+  **"Apply to all duplicate files"** checkbox that drains the rest with one choice.
+  The dialog's `zIndex` was also raised above the upload progress panel
+  (`.uploader-list-view`, 1050), which renders later in the DOM and otherwise
+  overlapped the modal.
 - **No dedup/throughput observability.** The UI does not surface bytes already
   existing vs actually uploaded vs pending, nor the deduplicated percentage, so a
   fast repeat upload or an oddly-moving bar is unexplained to the user.

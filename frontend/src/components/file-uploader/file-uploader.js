@@ -50,6 +50,9 @@ class FileUploader extends React.Component {
       isUploadRemindDialogShow: false,
       currentResumableFile: null,
       uploadBitrate: 0,
+      // True while the current duplicate prompt is part of a multi-file batch, so
+      // the dialog offers an "apply to all" choice.
+      duplicateBatchActive: false,
     };
 
     this.uploadInput = React.createRef();
@@ -62,6 +65,12 @@ class FileUploader extends React.Component {
     this.bitrateInterval = 500; // Interval in milliseconds to calculate the bitrate
     window.onbeforeunload = this.onbeforeunload;
     this.isUploadLinkLoaded = false;
+    // Files whose name already exists in the folder, held OUT of the resumable
+    // queue (via removeFile) until the user decides replace / keep / cancel. They
+    // are prompted one at a time; `duplicateBulkAction` short-circuits the prompt
+    // once the user picks "apply to all".
+    this.pendingDuplicates = [];
+    this.duplicateBulkAction = null;
     this.adaptiveUploadCleanup = null;
     this.navigationGuard = new UploadNavigationGuard(this.hasActiveUploadWork);
   }
@@ -410,7 +419,7 @@ class FileUploader extends React.Component {
     });
   };
 
-  runBlockUpload = (entry, file) => {
+  runBlockUpload = (entry, file, { replace = entry._replace || false } = {}) => {
     const { repoID, path } = this.props;
     const abortController = typeof AbortController === 'function' ? new AbortController() : null;
     entry._abortController = abortController;
@@ -420,6 +429,9 @@ class FileUploader extends React.Component {
     entry.isSaved = false;
     entry.remainingTime = -1;
     entry._phase = 'hashing';
+    // Persist the replace decision so a Retry / Retry All re-runs with the same
+    // semantics the user originally chose in the duplicate dialog.
+    entry._replace = replace;
     resetBlockUploadBitrate(entry);
 
     // Hashing is the first half of the bar, uploading the second half.
@@ -427,7 +439,7 @@ class FileUploader extends React.Component {
       repoID,
       parentDir: path,
       filename: file.name,
-      replace: false,
+      replace,
       signal: abortController ? abortController.signal : undefined,
       onPhase: (phase) => this.setBlockUploadPhase(entry, phase),
       onHashProgress: (hashed, total) => this.updateBlockUploadProgress(entry, (total ? hashed / total : 0) * 0.5),
@@ -468,31 +480,148 @@ class FileUploader extends React.Component {
     });
   };
 
+  // fileNameExistsInDir reports whether a file with this exact name already lives
+  // in the current folder (so the upload would replace or auto-rename it).
+  fileNameExistsInDir = (fileName) => {
+    const direntList = this.props.direntList || [];
+    return direntList.some(d => d && d.type === 'file' && d.name === fileName);
+  };
+
+  // handleDuplicateFile pulls the file OUT of the resumable queue (so the running
+  // uploader cannot start it with the wrong target before the user decides), then
+  // either applies an already-chosen bulk action or queues it for a prompt.
+  handleDuplicateFile = (resumableFile, files) => {
+    this.resumable.removeFile(resumableFile);
+    if (this.duplicateBulkAction) {
+      this.applyDuplicateDecision(resumableFile, this.duplicateBulkAction);
+      return;
+    }
+    this.pendingDuplicates.push(resumableFile);
+    const inBatch = (Array.isArray(files) && files.length > 1) || this.pendingDuplicates.length > 1;
+    if (!this.state.isUploadRemindDialogShow) {
+      this.showNextDuplicatePrompt(inBatch);
+    } else if (inBatch && !this.state.duplicateBatchActive) {
+      this.setState({ duplicateBatchActive: true });
+    }
+  };
+
+  // showNextDuplicatePrompt advances the queue: it surfaces the next held
+  // duplicate in the replace dialog, or closes the dialog when the queue is empty.
+  showNextDuplicatePrompt = (inBatch = false) => {
+    const next = this.pendingDuplicates.shift();
+    if (!next) {
+      // Queue drained — the bulk choice was scoped to this run of prompts.
+      this.duplicateBulkAction = null;
+      this.setState({ isUploadRemindDialogShow: false, currentResumableFile: null, duplicateBatchActive: false });
+      return;
+    }
+    this.setState({
+      isUploadProgressDialogShow: true,
+      isUploadRemindDialogShow: true,
+      currentResumableFile: next,
+      duplicateBatchActive: inBatch || this.state.duplicateBatchActive || this.pendingDuplicates.length > 0,
+    });
+  };
+
+  // applyDuplicateDecision routes one resolved file to its real upload flow with
+  // the chosen replace semantics: block flow for large eligible files, legacy
+  // resumable otherwise. 'cancel' simply drops the held file (already removed).
+  applyDuplicateDecision = (resumableFile, action) => {
+    if (!resumableFile || action === 'cancel') {
+      return;
+    }
+    const replace = action === 'replace';
+    const file = resumableFile.file;
+    if (file && shouldUseBlockUpload(file, { encrypted: this.props.repoEncrypted })) {
+      const entry = this.createBlockUploadEntry(resumableFile);
+      this.setState(prev => ({
+        uploadFileList: [...prev.uploadFileList, entry],
+        isUploadProgressDialogShow: true,
+      }));
+      this.runBlockUpload(entry, file, { replace });
+      return;
+    }
+    this.startLegacyDuplicateUpload(resumableFile, replace);
+  };
+
+  // startLegacyDuplicateUpload re-arms a held legacy file with a PER-FILE target
+  // (replace → update link + replace flag; keep → upload link, backend
+  // auto-renames) and only then pushes it back into the resumable queue, so the
+  // running uploader never touches it with the shared/global target.
+  startLegacyDuplicateUpload = (resumableFile, replace) => {
+    const { repoID, path } = this.props;
+    const linkPromise = replace
+      ? seafileAPI.getUpdateLink(repoID, path)
+      : seafileAPI.getFileServerUploadLink(repoID, path);
+    linkPromise.then(res => {
+      resumableFile.opts = resumableFile.opts || {};
+      resumableFile.formData = resumableFile.formData || {};
+      if (replace) {
+        resumableFile.opts.target = res.data;
+        resumableFile.formData['replace'] = 1;
+        resumableFile.formData['target_file'] = (resumableFile.formData.parent_dir || this.props.path) + resumableFile.fileName;
+      } else {
+        resumableFile.opts.target = res.data + '?ret-json=1';
+        resumableFile.formData['replace'] = 0;
+      }
+      if (this.resumable.files.indexOf(resumableFile) === -1) {
+        this.resumable.files.push(resumableFile);
+      }
+      const uploadFileList = this.mergeUploadFileList(this.resumable.files);
+      this.setState({
+        isUploadProgressDialogShow: true,
+        uploadFileList,
+        totalProgress: this.calculateTotalProgress(uploadFileList),
+        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+      });
+      this.resumable.upload();
+    }).catch(error => {
+      const errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
+  // resolveDuplicate is invoked by the replace dialog. It applies the action to the
+  // current file and, when "apply to all" is checked, drains every remaining held
+  // duplicate with the same action; otherwise it advances to the next prompt.
+  resolveDuplicate = (action, applyToAll) => {
+    const file = this.state.currentResumableFile;
+    this.setState({ isUploadRemindDialogShow: false, currentResumableFile: null });
+    if (applyToAll) {
+      this.duplicateBulkAction = action;
+    }
+    this.applyDuplicateDecision(file, action);
+    if (applyToAll) {
+      const rest = this.pendingDuplicates.splice(0);
+      rest.forEach(f => this.applyDuplicateDecision(f, action));
+      this.setState({ duplicateBatchActive: false });
+    } else {
+      this.showNextDuplicatePrompt();
+    }
+  };
+
   onFileAdded = (resumableFile, files) => {
+    const { isCustomPermission } = this.props;
+    const isFile = resumableFile.fileName === resumableFile.relativePath;
+
+    // Duplicate-name detection runs for EVERY file (single OR batch, small OR
+    // large) and BEFORE the block-flow diversion below. Previously it only ran for
+    // a lone legacy file (`files.length === 1`), so a duplicate inside a batch — or
+    // any large file routed to the block flow — was never offered the replace
+    // dialog and silently landed as "name (1).ext". The matched file is held out
+    // of the upload queue until the user decides; the decision is then routed to
+    // whichever flow (block or legacy) the file qualifies for.
+    if (isFile && !isCustomPermission && this.fileNameExistsInDir(resumableFile.fileName)) {
+      this.handleDuplicateFile(resumableFile, files);
+      return;
+    }
+
     // Web content-addressed (block) upload flow, behind enableBlockUpload. Large
     // non-encrypted files are diverted out of resumable.js and uploaded via
     // chunk+hash+check+commit (resume/dedup). Anything ineligible (flag off,
     // small, encrypted, unsupported browser) falls through to resumable.js.
     if (this.maybeBlockUpload(resumableFile)) {
       return;
-    }
-
-    const { isCustomPermission } = this.props;
-    let isFile = resumableFile.fileName === resumableFile.relativePath;
-    // uploading is file and only upload one file
-    // A lone file whose name already exists offers the replace dialog; the
-    // replace flow manages its own upload target, so bail out here.
-    if (isFile && files.length === 1 && !isCustomPermission) {
-      let direntList = this.props.direntList;
-      for (let i = 0; i < direntList.length; i++) {
-        if (direntList[i].type === 'file' && direntList[i].name === resumableFile.fileName) {
-          this.setState({
-            isUploadRemindDialogShow: true,
-            currentResumableFile: resumableFile,
-          });
-          return;
-        }
-      }
     }
 
     this.setUploadFileList(this.resumable.files);
@@ -948,7 +1077,10 @@ class FileUploader extends React.Component {
     this.restoreConcurrencyIfIdle();
     // reset upload link loaded
     this.isUploadLinkLoaded = false;
-    this.setState({ isUploadProgressDialogShow: false, uploadFileList: [], forbidUploadFileList: [], retryFileList: [], totalProgress: 0, uploadBitrate: 0 });
+    // Drop any undecided duplicates and the bulk choice so the next session starts clean.
+    this.pendingDuplicates = [];
+    this.duplicateBulkAction = null;
+    this.setState({ isUploadProgressDialogShow: false, uploadFileList: [], forbidUploadFileList: [], retryFileList: [], totalProgress: 0, uploadBitrate: 0, isUploadRemindDialogShow: false, currentResumableFile: null, duplicateBatchActive: false });
   };
 
   onUploadCancel = (uploadingItem) => {
@@ -1095,57 +1227,21 @@ class FileUploader extends React.Component {
 
   };
 
-  replaceRepetitionFile = () => {
-    let { repoID, path } = this.props;
-    seafileAPI.getUpdateLink(repoID, path).then(res => {
-      let resumableFile = this.resumable.files[this.resumable.files.length - 1];
-      // Scope the update (replace) endpoint to THIS file only via per-file opts.
-      // resumable.getOpt resolves file.opts before the shared resumable.opts, so
-      // setting it here avoids overwriting the global target and rerouting any
-      // OTHER in-flight upload onto the update endpoint mid-flight (which would
-      // split it across two server-side trackers; see onFileAdded).
-      resumableFile.opts = resumableFile.opts || {};
-      resumableFile.opts.target = res.data;
-      resumableFile.formData['replace'] = 1;
-      resumableFile.formData['target_file'] = resumableFile.formData.parent_dir + resumableFile.fileName;
-      this.setState({ isUploadRemindDialogShow: false });
-      this.setUploadFileList(this.resumable.files);
-      this.resumable.upload();
-    }).catch(error => {
-      let errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
-    });
+  // Replace dialog actions. Each resolves the currently-prompted duplicate and, if
+  // "apply to all" was checked, the rest of the held queue with the same choice.
+  //   Replace      → overwrite the existing file (update link + replace flag / block replace:true)
+  //   Don't replace → upload anyway (backend auto-renames to "name (1).ext")
+  //   Cancel       → skip this duplicate (drop the held file)
+  replaceRepetitionFile = (applyToAll = false) => {
+    this.resolveDuplicate('replace', applyToAll);
   };
 
-  uploadFile = () => {
-    let resumableFile = this.resumable.files[this.resumable.files.length - 1];
-    resumableFile.formData['replace'] = 0;
-    let { repoID, path } = this.props;
-    seafileAPI.getFileServerUploadLink(repoID, path).then((res) => {  // get upload link
-      // Per-file target (file.opts wins over the shared resumable.opts in
-      // getOpt) so accepting the "upload anyway" dialog for one file never
-      // overwrites the global target and reroutes other in-flight uploads.
-      resumableFile.opts = resumableFile.opts || {};
-      resumableFile.opts.target = res.data + '?ret-json=1';
-      const uploadFileList = this.mergeUploadFileList(this.resumable.files);
-      this.setState({
-        isUploadRemindDialogShow: false,
-        isUploadProgressDialogShow: true,
-        uploadFileList,
-        totalProgress: this.calculateTotalProgress(uploadFileList),
-        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
-      }, () => {
-        this.resumable.upload();
-      });
-    }).catch(error => {
-      let errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
-    });
+  uploadFile = (applyToAll = false) => {
+    this.resolveDuplicate('keep', applyToAll);
   };
 
-  cancelFileUpload = () => {
-    this.resumable.files.pop(); //delete latest file；
-    this.setState({ isUploadRemindDialogShow: false });
+  cancelFileUpload = (applyToAll = false) => {
+    this.resolveDuplicate('cancel', applyToAll);
   };
 
   render() {
@@ -1162,6 +1258,7 @@ class FileUploader extends React.Component {
             replaceRepetitionFile={this.replaceRepetitionFile}
             uploadFile={this.uploadFile}
             cancelFileUpload={this.cancelFileUpload}
+            showApplyToAll={this.state.duplicateBatchActive}
           />
         }
         {this.state.isUploadProgressDialogShow &&

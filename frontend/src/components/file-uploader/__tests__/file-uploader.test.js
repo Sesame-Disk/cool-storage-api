@@ -1,5 +1,6 @@
 import FileUploader from '../file-uploader';
 import { seafileAPI } from '../../../utils/seafile-api';
+import { shouldUseBlockUpload } from '../block-upload-orchestrator';
 
 jest.mock('../../../utils/seafile-api', () => ({
   seafileAPI: {
@@ -20,10 +21,18 @@ jest.mock('../../toast', () => ({
   success: jest.fn(),
 }));
 
+// Keep the real orchestrator (uploadFileViaBlocks etc.) but make the block-vs-legacy
+// eligibility check controllable so duplicate-decision routing is testable.
+jest.mock('../block-upload-orchestrator', () => {
+  const actual = jest.requireActual('../block-upload-orchestrator');
+  return { ...actual, shouldUseBlockUpload: jest.fn(() => false) };
+});
+
 const flushPromises = () => new Promise(resolve => setTimeout(resolve, 0));
 
 beforeEach(() => {
   jest.clearAllMocks();
+  shouldUseBlockUpload.mockReturnValue(false);
   window.confirm = jest.fn(() => true);
 });
 
@@ -61,6 +70,9 @@ const createUploader = (props = {}) => {
     opts: {},
     upload: jest.fn(),
     isUploading: jest.fn(() => false),
+    removeFile: jest.fn(function (file) {
+      this.files = this.files.filter(f => f !== file);
+    }),
   };
   const realSetUploadFileList = uploader.setUploadFileList;
   uploader.setUploadFileList = jest.fn((...args) => realSetUploadFileList(...args));
@@ -141,7 +153,10 @@ describe('FileUploader upload link reuse regression', () => {
     const uploader = createUploader();
     const resumableFile = createResumableFile('existing.txt', { opts: undefined });
 
-    uploader.resumable.files = [resumableFile];
+    // New flow: the held duplicate is the one currently prompted; replace resolves
+    // it, re-arms its per-file target, and pushes it back into the queue.
+    uploader.resumable.files = [];
+    uploader.state.currentResumableFile = resumableFile;
 
     uploader.replaceRepetitionFile();
     await flushPromises();
@@ -149,6 +164,7 @@ describe('FileUploader upload link reuse regression', () => {
     expect(resumableFile.opts).toEqual({ target: '/update/token-a' });
     expect(resumableFile.formData.replace).toBe(1);
     expect(resumableFile.formData.target_file).toBe('/existing.txt');
+    expect(uploader.resumable.files).toContain(resumableFile);
     expect(uploader.resumable.upload).toHaveBeenCalled();
   });
 
@@ -445,5 +461,119 @@ describe('FileUploader block upload integration', () => {
     uploader.onFileProgress(legacyFile);
 
     expect(uploader.state.uploadBitrate).toBe(5000);
+  });
+});
+
+describe('FileUploader duplicate-name prompting', () => {
+  const dupProps = (names) => ({ direntList: names.map(name => ({ type: 'file', name })) });
+
+  test('prompts (and holds out of the queue) for a duplicate even in a single upload', () => {
+    const uploader = createUploader(dupProps(['dup.txt']));
+    const f = createResumableFile('dup.txt', { file: { name: 'dup.txt', size: 10 } });
+    uploader.resumable.files = [f];
+
+    uploader.onFileAdded(f, [f]);
+
+    expect(uploader.resumable.removeFile).toHaveBeenCalledWith(f);
+    expect(uploader.state.isUploadRemindDialogShow).toBe(true);
+    expect(uploader.state.currentResumableFile).toBe(f);
+    // Held: it must NOT have started uploading on its own.
+    expect(uploader.resumable.upload).not.toHaveBeenCalled();
+  });
+
+  test('prompts for a duplicate inside a multi-file batch and offers apply-to-all', () => {
+    seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/tok' });
+    const uploader = createUploader(dupProps(['a.txt']));
+    const a = createResumableFile('a.txt', { file: { name: 'a.txt', size: 10 } });
+    const b = createResumableFile('b.txt', { file: { name: 'b.txt', size: 10 } });
+    uploader.resumable.files = [a, b];
+
+    // The duplicate is the second file added in a 2-file batch.
+    uploader.onFileAdded(b, [a, b]); // not a duplicate → normal flow
+    uploader.onFileAdded(a, [a, b]); // duplicate → prompt
+
+    expect(uploader.state.currentResumableFile).toBe(a);
+    expect(uploader.state.duplicateBatchActive).toBe(true); // drives the "apply to all" checkbox
+  });
+
+  test('a large (block-eligible) duplicate also prompts and replace routes to the block flow', () => {
+    shouldUseBlockUpload.mockReturnValue(true);
+    const uploader = createUploader(dupProps(['big.bin']));
+    uploader.runBlockUpload = jest.fn();
+    const f = createResumableFile('big.bin', { file: { name: 'big.bin', size: 999 } });
+    uploader.resumable.files = [f];
+
+    uploader.onFileAdded(f, [f]);
+    expect(uploader.state.isUploadRemindDialogShow).toBe(true); // not silently auto-renamed
+
+    uploader.replaceRepetitionFile(false); // Replace
+    const call = uploader.runBlockUpload.mock.calls[0];
+    expect(call[0].isBlockUpload).toBe(true);
+    expect(call[1]).toBe(f.file);
+    expect(call[2]).toEqual({ replace: true });
+  });
+
+  test('"Don\'t replace" uploads a legacy duplicate as-is (replace flag 0, backend auto-renames)', async () => {
+    seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/tok' });
+    const uploader = createUploader(dupProps(['k.txt']));
+    const f = createResumableFile('k.txt', { file: { name: 'k.txt', size: 10 } });
+    uploader.state.currentResumableFile = f;
+
+    uploader.uploadFile(false); // Don't replace
+    await flushPromises();
+
+    expect(f.formData.replace).toBe(0);
+    expect(f.opts.target).toBe('/upload/tok?ret-json=1');
+    expect(uploader.resumable.files).toContain(f);
+    expect(uploader.resumable.upload).toHaveBeenCalled();
+  });
+
+  test('apply-to-all resolves every held duplicate with the same action without re-prompting', () => {
+    const uploader = createUploader(dupProps(['a.txt', 'b.txt']));
+    const a = createResumableFile('a.txt', { file: { name: 'a.txt', size: 10 } });
+    const b = createResumableFile('b.txt', { file: { name: 'b.txt', size: 10 } });
+    uploader.resumable.files = [a, b];
+
+    uploader.onFileAdded(a, [a, b]); // prompt a
+    uploader.onFileAdded(b, [a, b]); // queue b
+
+    uploader.applyDuplicateDecision = jest.fn();
+    uploader.replaceRepetitionFile(true); // Replace + apply to all
+
+    expect(uploader.duplicateBulkAction).toBe('replace');
+    expect(uploader.applyDuplicateDecision).toHaveBeenCalledWith(a, 'replace');
+    expect(uploader.applyDuplicateDecision).toHaveBeenCalledWith(b, 'replace');
+    expect(uploader.pendingDuplicates).toEqual([]);
+    expect(uploader.state.isUploadRemindDialogShow).toBe(false);
+  });
+
+  test('a later duplicate auto-applies the chosen bulk action without prompting', () => {
+    const uploader = createUploader(dupProps(['a.txt', 'c.txt']));
+    uploader.applyDuplicateDecision = jest.fn();
+    uploader.duplicateBulkAction = 'keep';
+    const c = createResumableFile('c.txt', { file: { name: 'c.txt', size: 10 } });
+    uploader.resumable.files = [c];
+
+    uploader.onFileAdded(c, [c]);
+
+    expect(uploader.resumable.removeFile).toHaveBeenCalledWith(c);
+    expect(uploader.applyDuplicateDecision).toHaveBeenCalledWith(c, 'keep');
+    expect(uploader.state.isUploadRemindDialogShow).toBe(false); // no prompt
+  });
+
+  test('Cancel drops the held duplicate: it is neither uploaded nor re-queued', () => {
+    const uploader = createUploader(dupProps(['c.txt']));
+    uploader.runBlockUpload = jest.fn();
+    uploader.startLegacyDuplicateUpload = jest.fn();
+    const f = createResumableFile('c.txt', { file: { name: 'c.txt', size: 10 } });
+    uploader.resumable.files = [f];
+
+    uploader.onFileAdded(f, [f]); // prompt
+    uploader.cancelFileUpload(false); // Cancel
+
+    expect(uploader.state.isUploadRemindDialogShow).toBe(false);
+    expect(uploader.resumable.files).not.toContain(f);
+    expect(uploader.runBlockUpload).not.toHaveBeenCalled();
+    expect(uploader.startLegacyDuplicateUpload).not.toHaveBeenCalled();
   });
 });
