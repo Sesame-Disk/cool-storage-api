@@ -27,6 +27,13 @@ const (
 
 const blockVerifyConcurrency = 20
 
+// getBlockIDMappingFn resolves one external SHA-1 to its internal SHA-256 forward
+// mapping. Injected as a package var so resolveManifestForwardMappings can be unit
+// tested (forward missing / mismatch / match) without a live Cassandra.
+var getBlockIDMappingFn = func(database *db.DB, orgID, externalID string) (string, bool, error) {
+	return database.GetBlockIDMapping(orgID, externalID)
+}
+
 const (
 	blockUploadCommitInProgressCode               = "commit_in_progress"
 	blockUploadCommittedDifferentFileConflictCode = "session_committed_different_file"
@@ -601,7 +608,7 @@ func (h *FileHandler) resolveManifestForwardMappings(ctx context.Context, orgID 
 				return gctx.Err()
 			}
 			defer func() { <-sem }()
-			internal, found, err := h.db.GetBlockIDMapping(orgID, sha1ByHash[sha256ID])
+			internal, found, err := getBlockIDMappingFn(h.db, orgID, sha1ByHash[sha256ID])
 			if err != nil {
 				return err
 			}

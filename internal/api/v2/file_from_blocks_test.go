@@ -1,8 +1,11 @@
 package v2
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -104,6 +107,112 @@ func TestValidateManifest_AllowsRepeatedIdenticalDualBlocks(t *testing.T) {
 	}
 	if err := validateManifest(req); err != nil {
 		t.Fatalf("repeated identical dual block rejected: %v", err)
+	}
+}
+
+// TestResolveManifestForwardMappings_MissingMismatchMatch covers the commit-path
+// forward-mapping resolution (the bounded-parallel replacement for the old
+// per-block sequential read). The resolved map drives the three commit decisions:
+//   - key present, value == declared SHA-256  → accept the manifest SHA-1
+//   - key present, value != declared SHA-256  → 400 (sha1 belongs to other content)
+//   - key absent                              → needs_upload (re-upload heals it)
+func TestResolveManifestForwardMappings_MissingMismatchMatch(t *testing.T) {
+	matchSHA256 := hex64(1)
+	mismatchSHA256 := hex64(2)
+	missingSHA256 := hex64(3)
+	otherSHA256 := hex64(99)
+
+	sha1ByHash := map[string]string{
+		matchSHA256:    hex40(1),
+		mismatchSHA256: hex40(2),
+		missingSHA256:  hex40(3),
+	}
+	statuses := map[string]int{
+		matchSHA256:    blockStatusReady,
+		mismatchSHA256: blockStatusReady,
+		missingSHA256:  blockStatusReady,
+	}
+
+	prev := getBlockIDMappingFn
+	defer func() { getBlockIDMappingFn = prev }()
+	getBlockIDMappingFn = func(_ *db.DB, _ string, externalID string) (string, bool, error) {
+		switch externalID {
+		case hex40(1):
+			return matchSHA256, true, nil // forward == declared
+		case hex40(2):
+			return otherSHA256, true, nil // forward resolves to DIFFERENT content
+		default:
+			return "", false, nil // no forward mapping row
+		}
+	}
+
+	h := &FileHandler{}
+	got, err := h.resolveManifestForwardMappings(context.Background(), "org-1",
+		[]string{matchSHA256, mismatchSHA256, missingSHA256}, sha1ByHash, statuses)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if v, ok := got[matchSHA256]; !ok || v != matchSHA256 {
+		t.Fatalf("match block: got (%q,%v), want (%q,true) → commit must accept", v, ok, matchSHA256)
+	}
+	if v, ok := got[mismatchSHA256]; !ok || v == mismatchSHA256 {
+		t.Fatalf("mismatch block: got (%q,%v), want present and != %q → commit must 400", v, ok, mismatchSHA256)
+	}
+	if v, ok := got[missingSHA256]; ok {
+		t.Fatalf("missing block: got (%q,true), want absent → commit must needs_upload", v)
+	}
+}
+
+// TestResolveManifestForwardMappings_SkipsNonReadyBlocks proves a block already
+// flagged needs_upload is never queried (it is re-uploaded regardless), so the
+// commit does not pay a mapping read for blocks it will reject anyway.
+func TestResolveManifestForwardMappings_SkipsNonReadyBlocks(t *testing.T) {
+	readySHA256 := hex64(1)
+	needsUploadSHA256 := hex64(2)
+	sha1ByHash := map[string]string{readySHA256: hex40(1), needsUploadSHA256: hex40(2)}
+	statuses := map[string]int{readySHA256: blockStatusReady, needsUploadSHA256: blockStatusNeedsUpload}
+
+	prev := getBlockIDMappingFn
+	defer func() { getBlockIDMappingFn = prev }()
+	var mu sync.Mutex
+	var queried []string
+	getBlockIDMappingFn = func(_ *db.DB, _ string, externalID string) (string, bool, error) {
+		mu.Lock()
+		queried = append(queried, externalID)
+		mu.Unlock()
+		return readySHA256, true, nil
+	}
+
+	h := &FileHandler{}
+	got, err := h.resolveManifestForwardMappings(context.Background(), "org-1",
+		[]string{readySHA256, needsUploadSHA256}, sha1ByHash, statuses)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(queried) != 1 || queried[0] != hex40(1) {
+		t.Fatalf("expected only the ready block queried, got %v", queried)
+	}
+	if _, ok := got[needsUploadSHA256]; ok {
+		t.Fatal("non-ready block must not appear in the resolved map")
+	}
+}
+
+// TestResolveManifestForwardMappings_PropagatesLookupError proves a real lookup
+// failure (e.g. Cassandra timeout) aborts the commit instead of being silently
+// treated as "missing" and accepted.
+func TestResolveManifestForwardMappings_PropagatesLookupError(t *testing.T) {
+	readySHA256 := hex64(1)
+	prev := getBlockIDMappingFn
+	defer func() { getBlockIDMappingFn = prev }()
+	getBlockIDMappingFn = func(_ *db.DB, _ string, _ string) (string, bool, error) {
+		return "", false, errors.New("cassandra timeout")
+	}
+	h := &FileHandler{}
+	if _, err := h.resolveManifestForwardMappings(context.Background(), "org-1",
+		[]string{readySHA256}, map[string]string{readySHA256: hex40(1)},
+		map[string]int{readySHA256: blockStatusReady}); err == nil {
+		t.Fatal("expected lookup error to propagate (commit must fail closed, not accept)")
 	}
 }
 
