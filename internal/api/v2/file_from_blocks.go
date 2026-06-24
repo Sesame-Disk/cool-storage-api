@@ -78,8 +78,9 @@ const (
 //   - SHA256: the internal/storage identity (S3 key, blocks row, refs, GC, dedup).
 //   - SHA1:   the EXTERNAL Seafile block ID written into the file fs_object so the
 //     desktop/mobile sync client (which requires 40-hex SHA-1 block IDs) can parse
-//     and download the file. The commit writes a SHA-1→SHA-256 mapping so the
-//     external ID resolves back to the storage identity on download.
+//     and download the file. UploadBlock writes the verified SHA-1->SHA-256
+//     mapping, and the commit validates that forward mapping before using the
+//     manifest SHA-1 in the fs_object.
 //
 // Both hashes derive from the same bytes, so for any honest client a given SHA256
 // always pairs with the same SHA1 (enforced in validateManifest).

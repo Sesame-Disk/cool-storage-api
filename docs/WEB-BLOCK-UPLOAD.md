@@ -191,6 +191,11 @@ re-reading this section.
   behavior change**. The two writers diverge only in the conflict guard, which is
   needed solely on the new web flow where the server, not a trusted desktop client,
   mints the SHA-1.
+
+Although the reverse row is non-authoritative, the web-only writer still fails
+the upload if rewriting `block_id_mappings_by_internal` fails after the forward
+row is in place. That is deliberate fail-closed behavior: a client retry can
+heal the auxiliary GC/repair projection instead of silently leaving it behind.
 - **R11 — Sizes validated against real metadata.** The commit checks
   `manifest.size == ProbeBlockReuse.SizeBytes` per block; a manifest cannot
   declare a size that disagrees with the stored block.
@@ -232,6 +237,31 @@ decision:
 | `block_id_mappings` (forward, source of truth) | SHA-1 → SHA-256 (written at upload, from verified bytes, non-Paxos) |
 | `block_id_mappings_by_internal` (reverse) | SHA-256 → SHA-1 (best-effort GC/repair projection only) |
 
+
+**Validated end-to-end (2026-06-24) against a real Seafile desktop client** on
+this implementation, including the file types that originally failed:
+
+1. Uploaded files through the web block flow with the feature flag enabled in dev
+   (a ZIP and a MOV — the cases that previously broke — plus a large binary).
+2. Confirmed in the database that every committed `fs_objects.block_ids` entry is
+   a 40-hex SHA-1, and that its `sha1 → sha256` forward mapping resolves to the
+   real SHA-256 storage identity (`blocks` / `block_references` stay 64-hex).
+3. Synced the library from the desktop client: checkout **succeeds**, with no
+   `File <fs_id> does not exist` / `Failed to checkout file ...` errors.
+4. Compared the local/downloaded file hash against the source bytes — identical.
+5. Re-verified the web download path (server-side SHA-1 → SHA-256 resolution)
+   serves the same bytes.
+
+**Result: desktop/mobile sync and web download both work** for files uploaded via
+the web block flow. The regression introduced by merge #91 (SHA-256 block IDs in
+the file object) is fixed and verified, with the internal SHA-256 model unchanged.
+
+
+This branch prevents new SHA-256 `fs_objects.block_ids`, but it does not repair
+files already committed by the broken merge that stored SHA-256 block IDs in the
+file object. Repairing those files is a separate migration/rewrite problem
+because changing the block IDs changes the file `fs_id`; in dev/local the safe
+answer is delete and re-upload.
 Regression guards (`internal/integration/web_block_upload_test.go`):
 `TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat`,
 `TestWebBlockUploadForwardMappingIsSourceOfTruth`,
@@ -339,6 +369,16 @@ is mapped onto the *legacy* resumable.js progress UI, which only understands
   deduplicated file the "upload" half completes almost instantly while the bar
   already spent half on hashing. Progress weighting needs an explicit per-phase
   definition.
+- **Header/row mismatch after a successful commit is still possible.** The
+  dialog header is driven by the global `isUploading()` check, while each row
+  renders its own legacy resumable-style state from `isUploading()`, `isSaved`,
+  `progress()`, and `isFileSaving()`. A block-flow entry that has stopped
+  reporting `isUploading()` but has not yet been marked `isSaved` can therefore
+  transiently render as `Waiting...` or `Saving...` while the header already
+  says `All files uploaded`. If a page refresh shows the file in the listing,
+  that confirms the backend commit already succeeded; the mismatch is local UI
+  state, not data loss. This branch treats it as a frontend polish gap, not a
+  backend integrity issue.
 - **Speed shows `0.00 B/s`.** A block entry sets `remainingTime = 0` and feeds no
   bytes into `this.resumable.files`, so the legacy `getBitrate()` sees no activity
   and reports `0.00 B/s` even while blocks are uploading. No real throughput/ETA
@@ -404,10 +444,12 @@ flag were on*.
    was deleted). **Not a correctness bug** — the commit is the authority and the
    client re-uploads — just a possible extra round-trip. Optional follow-up: align
    `check?session=` with the commit's classifier.
-4. **[Med] No real browser E2E yet.** Backend is covered live; still missing
-   in-browser validation of: large files, real retry, cancellation, resume,
-   progress accuracy, fallback, legacy folder upload, and local-vs-downloaded hash
-   comparison. Run with `docker compose up` + `npm start`, `enableBlockUpload` on.
+4. **[Med] No broader real browser E2E yet.** Backend is covered
+   live; still missing in-browser validation of: large files, real retry,
+   cancellation, resume, progress accuracy, fallback, legacy folder upload, and
+   local-vs-downloaded hash comparison. The Seafile desktop-client regression is
+   already validated end-to-end on this branch; what remains here is broader
+   browser-side coverage and UX verification.
 5. **[Med] No cross-method dedup (web ↔ desktop).** Web uses fixed 8 MB SHA-256
    blocks; desktop/sync uses FastCDC variable blocks (SHA-1 external IDs) — same
    file hashes differently, so it is stored twice. Out of phase 1; closing it needs

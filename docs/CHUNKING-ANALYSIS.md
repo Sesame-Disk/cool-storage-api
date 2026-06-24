@@ -51,12 +51,19 @@ the trade-off and documenting it.
 
 **Tested:** No. No test verifies or measures the cross-method dedup gap.
 
-> **Reconfirmed 2026-06-22** while implementing the web content-addressed upload
+> **Reconfirmed 2026-06-22, corrected 2026-06-24** while implementing — and then
+> fixing the desktop/mobile compatibility of — the web content-addressed upload
 > flow ([WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md)). The web block flow uses
-> fixed 8 MB blocks with **SHA-256 external IDs**, while desktop uses FastCDC with
-> **SHA-1 external IDs**, so web↔desktop blocks are not reusable even for
-> identical content. Closing this needs FastCDC in the browser/worker + SHA-1
-> aliasing — explicitly deferred out of phase 1.
+> fixed 8 MB blocks; desktop uses FastCDC variable blocks. **Both now use SHA-1 as
+> the external block ID** (the web flow's dual-hash fix writes a 40-hex SHA-1 into
+> the file fs_object and keeps SHA-256 as the internal storage identity via a
+> forward `sha1 → sha256` mapping), so the external-ID *hash algorithm* is no
+> longer the differentiator it was originally recorded to be. The residual gap is
+> purely the **block boundaries**: identical content still chunks differently
+> (8 MB fixed vs FastCDC), so the blocks — and therefore both their SHA-1 and
+> SHA-256 — don't line up and aren't reusable across methods. Closing this needs
+> FastCDC in the browser/worker (matching the desktop boundaries); SHA-1 aliasing
+> is no longer the missing piece. Deferred out of phase 1.
 
 ---
 
