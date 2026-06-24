@@ -1,8 +1,10 @@
 import {
+    aggregateBlockUploadBitrate,
     clearFileUploadRuntimeState,
     consumeSuppressedUploadErrorToast,
     getInitialSimultaneousUploads,
     initializeAdaptiveUploadConcurrency,
+    isFileSaving,
     markUploadConflictAutoRetry,
     maybeStartPendingUploadDuringFinalize,
     moveUploadToRetryState,
@@ -10,8 +12,10 @@ import {
     noteAdaptiveUploadRetry,
     parseUploadSuccessEntry,
     resetAdaptiveUploadConcurrency,
+    resetBlockUploadBitrate,
     resetUploadConflictAutoRetry,
     resolveUploadSuccessResult,
+    sampleBlockUploadBitrate,
     shouldAutoRetryUploadConflict,
     trackUploadResponseStatus,
     updateAdaptiveUploadConcurrency,
@@ -570,5 +574,69 @@ describe('upload finalize result resolution', () => {
         clearFileUploadRuntimeState(resumableFile);
         expect(resumableFile.finalizeResult).toBeNull();
         expect(resumableFile.finalizeResultRaw).toBeNull();
+    });
+});
+
+describe('block-upload entry state (isFileSaving)', () => {
+    // Regression: a block entry parked remainingTime at 0, which made the legacy
+    // resumable heuristic report "Saving..." for the entire upload (the 3% bug).
+    test('a block entry mid-upload is NOT saving even with remainingTime 0', () => {
+        const entry = { isBlockUpload: true, _phase: 'uploading', remainingTime: 0, isSaved: false };
+        expect(isFileSaving(entry)).toBe(false);
+    });
+
+    test('a block entry is saving ONLY during the commit phase', () => {
+        expect(isFileSaving({ isBlockUpload: true, _phase: 'hashing' })).toBe(false);
+        expect(isFileSaving({ isBlockUpload: true, _phase: 'uploading' })).toBe(false);
+        expect(isFileSaving({ isBlockUpload: true, _phase: 'saving' })).toBe(true);
+    });
+
+    test('a saved block entry is never saving', () => {
+        expect(isFileSaving({ isBlockUpload: true, _phase: 'saving', isSaved: true })).toBe(false);
+    });
+
+    test('non-block resumable files keep the legacy remainingTime heuristic', () => {
+        expect(isFileSaving({ remainingTime: 0, isSaved: false })).toBe(true);
+        expect(isFileSaving({ remainingTime: 5, isSaved: false })).toBe(false);
+    });
+});
+
+describe('block-upload throughput', () => {
+    test('reports 0 on the first sample and a real bits/s on the next', () => {
+        const entry = { isBlockUpload: true, _uploading: true, size: 1000, _progress: 0 };
+        expect(sampleBlockUploadBitrate(entry, 0)).toBe(0);
+        // 500 bytes over 1000 ms = 500 B/s = 4000 bits/s.
+        entry._progress = 0.5;
+        expect(sampleBlockUploadBitrate(entry, 1000)).toBe(4000);
+    });
+
+    test('throttles: a sample inside the window returns the previous reading', () => {
+        const entry = { isBlockUpload: true, _uploading: true, size: 1000, _progress: 0 };
+        sampleBlockUploadBitrate(entry, 0);
+        entry._progress = 1;
+        sampleBlockUploadBitrate(entry, 1000); // establishes a reading
+        const prior = entry._bitrate;
+        entry._progress = 1;
+        // 100 ms later (< 500 ms window): no recompute.
+        expect(sampleBlockUploadBitrate(entry, 1100)).toBe(prior);
+    });
+
+    test('aggregate sums only active, unsaved block entries', () => {
+        const list = [
+            { isBlockUpload: true, _uploading: true, isSaved: false, _bitrate: 1000 },
+            { isBlockUpload: true, _uploading: true, isSaved: false, _bitrate: 2000 },
+            { isBlockUpload: true, _uploading: false, isSaved: false, _bitrate: 9999 }, // finished
+            { isBlockUpload: true, _uploading: true, isSaved: true, _bitrate: 9999 },  // saved
+            { isBlockUpload: false, _uploading: true, _bitrate: 9999 },                // resumable
+        ];
+        expect(aggregateBlockUploadBitrate(list)).toBe(3000);
+    });
+
+    test('reset clears the sampling state so a retry starts from zero', () => {
+        const entry = { _bitrate: 5000, _bitrateBytes: 123, _bitrateTs: 1 };
+        resetBlockUploadBitrate(entry, 42);
+        expect(entry._bitrate).toBe(0);
+        expect(entry._bitrateBytes).toBe(0);
+        expect(entry._bitrateTs).toBe(42);
     });
 });

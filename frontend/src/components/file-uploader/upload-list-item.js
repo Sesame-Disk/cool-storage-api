@@ -99,9 +99,20 @@ class UploadListItem extends React.Component {
                       <div className="progress">
                         <div className="progress-bar" role="progressbar" style={{ width: `${progress}%` }} aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100"></div>
                       </div>
-                      {(resumableFile.remainingTime === -1) && <div className="progress-text">{gettext('Preparing to upload...')}</div>}
-                      {(!isFileSaving(resumableFile) && resumableFile.remainingTime > 0) && <div className="progress-text">{gettext('Remaining')}{' '}{Utils.formatTime(resumableFile.remainingTime)}</div>}
-                      {isFileSaving(resumableFile) && <div className="progress-text">{gettext('Saving...')}</div>}
+                      {resumableFile.isBlockUpload ? (
+                        // Block uploads have no chunk ETA; show real progress (or
+                        // "Saving..." once the server-side commit is in flight)
+                        // instead of a perpetual "Preparing to upload...".
+                        isFileSaving(resumableFile)
+                          ? <div className="progress-text">{gettext('Saving...')}</div>
+                          : <div className="progress-text">{progress === 0 ? gettext('Waiting...') : `${gettext('Uploading...')} ${progress}%`}</div>
+                      ) : (
+                        <Fragment>
+                          {(resumableFile.remainingTime === -1) && <div className="progress-text">{gettext('Preparing to upload...')}</div>}
+                          {(!isFileSaving(resumableFile) && resumableFile.remainingTime > 0) && <div className="progress-text">{gettext('Remaining')}{' '}{Utils.formatTime(resumableFile.remainingTime)}</div>}
+                          {isFileSaving(resumableFile) && <div className="progress-text">{gettext('Saving...')}</div>}
+                        </Fragment>
+                      )}
                     </div>
                   )}
                   {!resumableFile.isUploading() && (

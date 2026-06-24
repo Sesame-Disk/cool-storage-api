@@ -370,31 +370,31 @@ is mapped onto the *legacy* resumable.js progress UI, which only understands
   deduplicated file the "upload" half completes almost instantly while the bar
   already spent half on hashing. Progress weighting needs an explicit per-phase
   definition.
-- **Header/row mismatch after a successful commit is still possible.** The
-  dialog header is driven by the global `isUploading()` check, while each row
-  renders its own legacy resumable-style state from `isUploading()`, `isSaved`,
-  `progress()`, and `isFileSaving()`. A block-flow entry that has stopped
-  reporting `isUploading()` but has not yet been marked `isSaved` can therefore
-  transiently render as `Waiting...` or `Saving...` while the header already
-  says `All files uploaded`. If a page refresh shows the file in the listing,
-  that confirms the backend commit already succeeded; the mismatch is local UI
-  state, not data loss. This branch treats it as a frontend polish gap, not a
-  backend integrity issue.
-- **Speed shows `0.00 B/s`.** A block entry sets `remainingTime = 0` and feeds no
-  bytes into `this.resumable.files`, so the legacy `getBitrate()` sees no activity
-  and reports `0.00 B/s` even while blocks are uploading. No real throughput/ETA
-  is surfaced for block-flow files.
-- **`Saving…` appears early and can last a while.** Once the bar reaches ~100% the
-  file reads as "saving" while the commit is still running. The commit is **not**
-  zero-cost: for a multi-GB file (e.g. 12.3 GB ≈ 1,500+ blocks) it verifies every
-  block (presence + metadata + refs + size), takes the file lock, checks logical
-  quota, does the HEAD CAS, promotes provisional→permanent refs and cleans up — so
-  on large files the `Saving…` phase is genuinely visible and currently has no
-  progress of its own.
-- **Global vs per-file inconsistency.** The aggregate row can read
-  `File Uploading… 58% (0.00 B/s)` while one file shows `Uploaded` and another
-  shows `Saving…` — the block flow is not fully integrated with the legacy global
-  progress/bitrate aggregator.
+- **~~Header/row mismatch / false `Saving…` at 3% / no per-row Cancel~~ — FIXED
+  (branch `fix/web-block-upload-frontend-state-and-stall`, 2026-06-24).** A block
+  entry used to set `remainingTime = 0`, which made `isFileSaving()` (a resumable
+  chunk/`remainingTime` heuristic that does not apply to a block entry) return
+  `true` for the *entire* upload — so a file at 3% rendered as `Saving...` and,
+  because the row's `isSaving` state shows neither Cancel nor Retry, lost its
+  per-row Cancel button. Block entries now carry an explicit `_phase`
+  (`hashing → uploading → saving → done`) driven by the orchestrator's `onPhase`
+  callback; `isFileSaving()` special-cases `isBlockUpload` and is `true` only
+  during the `saving` (server commit) phase. This also removes the header/row
+  mismatch and makes `Saving…` mean exactly "the commit is in flight".
+- **~~Silent infinite hang on a dropped connection~~ — FIXED (same branch).** The
+  block API calls set no axios `timeout` (default `0` = wait forever), so a
+  half-open socket mid-`uploadBlock` hung the whole upload with no error and no
+  retry (stuck on the old false `Saving...`). Now: control-plane calls
+  (session/check/commit) carry a bounded `timeout`, and `uploadBlock` is guarded
+  by an **inactivity watchdog** — if no bytes move for `BLOCK_STALL_TIMEOUT_MS`
+  the request is aborted and rejected as a retryable `StallTimeoutError` (distinct
+  from a user `AbortError`), so the existing retry loop recovers and, on
+  exhaustion, the row becomes a normal retryable error instead of hanging.
+- **~~Speed shows `0.00 B/s`~~ — FIXED (same branch).** Block entries are absent
+  from `this.resumable.files`, so the legacy `getBitrate()` reported `0.00 B/s`
+  for them. A per-entry sampler (`sampleBlockUploadBitrate`) now derives real
+  bits/s from successive progress samples and `aggregateBlockUploadBitrate` feeds
+  the dialog header. (ETA/`Remaining` is still not computed for block files.)
 - **No dedup/throughput observability.** The UI does not surface bytes already
   existing vs actually uploaded vs pending, nor the deduplicated percentage, so a
   fast repeat upload or an oddly-moving bar is unexplained to the user.

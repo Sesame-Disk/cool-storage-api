@@ -4,7 +4,7 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
+import { aggregateBlockUploadBitrate, clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetBlockUploadBitrate, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, sampleBlockUploadBitrate, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
@@ -172,6 +172,7 @@ class FileUploader extends React.Component {
     entry._uploading = false;
     entry._cancelled = false;
     entry._abortController = null;
+    entry._phase = 'hashing';
   };
 
   // Thin delegators onto the shared guard; kept as instance methods so callers
@@ -300,6 +301,11 @@ class FileUploader extends React.Component {
       formData: {},
       file,
       isBlockUpload: true,
+      // Explicit flow phase, the single source of truth for how this entry
+      // renders: 'hashing' | 'uploading' | 'saving' | 'done' | 'error'. It is
+      // driven by the orchestrator's onPhase callback, NOT inferred from
+      // resumable.js chunk/remainingTime state (which a block entry does not have).
+      _phase: 'hashing',
       _abortController: null,
       _cancelled: false,
       _progress: 0,
@@ -319,7 +325,11 @@ class FileUploader extends React.Component {
 
   updateBlockUploadProgress = (entry, fraction) => {
     entry._progress = Math.max(0, Math.min(1, fraction));
-    entry.remainingTime = 0;
+    // Deliberately do NOT touch remainingTime here. Parking it at 0 used to make
+    // isFileSaving() true for the whole upload, rendering the row as "Saving..."
+    // at 3% and hiding the per-row Cancel button. The block flow has no ETA, so
+    // the entry stays at the "Preparing"-style sentinel until phase 'saving'.
+    sampleBlockUploadBitrate(entry);
     this.setState(prev => {
       const uploadFileList = prev.uploadFileList.map(item => (
         item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
@@ -327,8 +337,23 @@ class FileUploader extends React.Component {
       return {
         uploadFileList,
         totalProgress: this.calculateTotalProgress(uploadFileList),
+        // Block uploads are absent from resumable.files, so getBitrate() reports
+        // 0.00 B/s for them; surface their real aggregate throughput instead.
+        uploadBitrate: aggregateBlockUploadBitrate(uploadFileList),
       };
     });
+  };
+
+  setBlockUploadPhase = (entry, phase) => {
+    if (entry._phase === phase) {
+      return;
+    }
+    entry._phase = phase;
+    this.setState(prev => ({
+      uploadFileList: prev.uploadFileList.map(item => (
+        item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
+      )),
+    }));
   };
 
   runBlockUpload = (entry, file) => {
@@ -340,6 +365,8 @@ class FileUploader extends React.Component {
     entry.error = null;
     entry.isSaved = false;
     entry.remainingTime = -1;
+    entry._phase = 'hashing';
+    resetBlockUploadBitrate(entry);
 
     // Hashing is the first half of the bar, uploading the second half.
     uploadFileViaBlocks(file, {
@@ -348,12 +375,14 @@ class FileUploader extends React.Component {
       filename: file.name,
       replace: false,
       signal: abortController ? abortController.signal : undefined,
+      onPhase: (phase) => this.setBlockUploadPhase(entry, phase),
       onHashProgress: (hashed, total) => this.updateBlockUploadProgress(entry, (total ? hashed / total : 0) * 0.5),
       onUploadProgress: (done, total) => this.updateBlockUploadProgress(entry, 0.5 + (total ? done / total : 1) * 0.5),
     }).then(result => {
       entry._abortController = null;
       entry._progress = 1;
       entry._uploading = false;
+      entry._phase = 'done';
       const r = Array.isArray(result) ? result[0] : result;
       const name = (r && r.name) || file.name;
       const dirent = { id: (r && r.id) || '', type: 'file', name, size: file.size, mtime: new Date().getTime() / 1000 };
@@ -363,10 +392,12 @@ class FileUploader extends React.Component {
       entry._abortController = null;
       entry._uploading = false;
       if (entry._cancelled || isAbortError(error)) {
+        entry._phase = 'hashing';
         this.setState({ totalProgress: this.calculateTotalProgress() });
         this.restoreConcurrencyIfIdle();
         return;
       }
+      entry._phase = 'error';
       const message = this.getAxiosErrorMessage(error) || gettext('Network error');
       const { retryFileList, uploadFileList } = moveUploadToRetryState(this.state.uploadFileList, this.state.retryFileList, entry, message);
       this.setState({ retryFileList, uploadFileList, totalProgress: this.calculateTotalProgress(uploadFileList) });
@@ -874,7 +905,10 @@ class FileUploader extends React.Component {
 
   onCancelAllUploading = () => {
     let uploadFileList = this.state.uploadFileList.filter(item => {
-      if (Math.round(item.progress() !== 1)) {
+      // Cancel everything not yet fully done; keep finished (progress === 1) rows.
+      // (The old `Math.round(item.progress() !== 1)` rounded a boolean — it worked
+      // only by accident; compare the progress directly.)
+      if (item.progress() !== 1) {
         clearFileUploadRuntimeState(item, { resetRemainingTime: true });
         item.cancel();
         return false;
