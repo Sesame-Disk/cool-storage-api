@@ -430,7 +430,12 @@ is mapped onto the *legacy* resumable.js progress UI, which only understands
   or legacy with the per-file update-link + `replace` flag — and held legacy files
   are pushed back into the queue only after their per-file target is armed (never
   the shared/global target). Multiple duplicates prompt sequentially with an
-  **"Apply to all duplicate files"** checkbox that drains the rest with one choice.
+  **"Apply to all duplicate files"** checkbox that drains the rest with one choice;
+  that bulk choice is scoped to the current add batch (keyed on resumable's per-batch
+  `files` array) so it never silently auto-resolves a duplicate added in a later
+  batch. A held legacy file whose update/upload-link fetch fails is re-queued instead
+  of dropped, and `target_file` is built from a slash-terminated parent dir so a
+  subfolder replace resolves to `/folder/name` (not a malformed `/foldername`).
   The dialog's `zIndex` was also raised above the upload progress panel
   (`.uploader-list-view`, 1050), which renders later in the DOM and otherwise
   overlapped the modal.

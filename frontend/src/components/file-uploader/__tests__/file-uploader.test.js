@@ -547,18 +547,36 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(uploader.state.isUploadRemindDialogShow).toBe(false);
   });
 
-  test('a later duplicate auto-applies the chosen bulk action without prompting', () => {
+  test('a later duplicate in the SAME batch auto-applies the bulk action without re-prompting', () => {
     const uploader = createUploader(dupProps(['a.txt', 'c.txt']));
-    uploader.applyDuplicateDecision = jest.fn();
-    uploader.duplicateBulkAction = 'keep';
+    uploader.startLegacyDuplicateUpload = jest.fn();
+    const a = createResumableFile('a.txt', { file: { name: 'a.txt', size: 10 } });
     const c = createResumableFile('c.txt', { file: { name: 'c.txt', size: 10 } });
-    uploader.resumable.files = [c];
+    const batch = [a, c]; // resumable hands the SAME array to every fileAdded in a batch
+    uploader.resumable.files = [a, c];
 
-    uploader.onFileAdded(c, [c]);
+    uploader.onFileAdded(a, batch); // prompt a
+    uploader.uploadFile(true); // "Don't replace" + apply to all → bulk = 'keep'
+    uploader.onFileAdded(c, batch); // later duplicate, SAME batch → auto-applied
 
     expect(uploader.resumable.removeFile).toHaveBeenCalledWith(c);
-    expect(uploader.applyDuplicateDecision).toHaveBeenCalledWith(c, 'keep');
+    expect(uploader.startLegacyDuplicateUpload).toHaveBeenCalledWith(c, false); // 'keep' → no replace
     expect(uploader.state.isUploadRemindDialogShow).toBe(false); // no prompt
+  });
+
+  test('a duplicate in a NEW batch re-prompts — the bulk choice does not carry across batches', () => {
+    const uploader = createUploader(dupProps(['a.txt', 'c.txt']));
+    uploader.startLegacyDuplicateUpload = jest.fn();
+    const a = createResumableFile('a.txt', { file: { name: 'a.txt', size: 10 } });
+    const c = createResumableFile('c.txt', { file: { name: 'c.txt', size: 10 } });
+
+    uploader.onFileAdded(a, [a]); // batch 1
+    uploader.uploadFile(true); // keep + apply to all → bulk = 'keep'
+    uploader.onFileAdded(c, [c]); // batch 2 (different array) → must re-prompt
+
+    expect(uploader.duplicateBulkAction).toBe(null);
+    expect(uploader.state.isUploadRemindDialogShow).toBe(true);
+    expect(uploader.state.currentResumableFile).toBe(c);
   });
 
   test('Cancel drops the held duplicate: it is neither uploaded nor re-queued', () => {
@@ -575,5 +593,34 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(uploader.resumable.files).not.toContain(f);
     expect(uploader.runBlockUpload).not.toHaveBeenCalled();
     expect(uploader.startLegacyDuplicateUpload).not.toHaveBeenCalled();
+  });
+
+  test('legacy replace duplicate in a subfolder builds target_file with a slash', async () => {
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/token-a' });
+    const uploader = createUploader({ path: '/docs', direntList: [{ type: 'file', name: 'existing.txt' }] });
+    // Held files can be pulled from the queue before formData.parent_dir is set, so
+    // simulate the empty-formData case the fallback must handle.
+    const f = createResumableFile('existing.txt', { file: { name: 'existing.txt', size: 10 }, formData: {} });
+    uploader.state.currentResumableFile = f;
+
+    uploader.replaceRepetitionFile(false);
+    await flushPromises();
+
+    expect(f.formData.parent_dir).toBe('/docs/');
+    expect(f.formData.target_file).toBe('/docs/existing.txt'); // not the malformed "/docsexisting.txt"
+  });
+
+  test('a link-fetch failure re-queues the held duplicate instead of dropping it', async () => {
+    seafileAPI.getUpdateLink.mockRejectedValue(new Error('network'));
+    const uploader = createUploader(dupProps(['x.txt']));
+    const f = createResumableFile('x.txt', { file: { name: 'x.txt', size: 10 }, formData: {} });
+    uploader.state.currentResumableFile = f;
+
+    uploader.replaceRepetitionFile(false); // → startLegacyDuplicateUpload → getUpdateLink rejects
+    await flushPromises();
+
+    // Not silently lost: it is re-queued and surfaced again for a decision/retry.
+    expect(uploader.state.isUploadRemindDialogShow).toBe(true);
+    expect(uploader.state.currentResumableFile).toBe(f);
   });
 });

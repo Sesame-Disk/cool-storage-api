@@ -71,6 +71,10 @@ class FileUploader extends React.Component {
     // once the user picks "apply to all".
     this.pendingDuplicates = [];
     this.duplicateBulkAction = null;
+    // Identity of the current add batch (resumable passes the same `files` array to
+    // every fileAdded within one drag/selection). Used to scope "apply to all" to
+    // its batch instead of every later upload in the session.
+    this._currentBatchRef = null;
     this.adaptiveUploadCleanup = null;
     this.navigationGuard = new UploadNavigationGuard(this.hasActiveUploadWork);
   }
@@ -510,8 +514,6 @@ class FileUploader extends React.Component {
   showNextDuplicatePrompt = (inBatch = false) => {
     const next = this.pendingDuplicates.shift();
     if (!next) {
-      // Queue drained — the bulk choice was scoped to this run of prompts.
-      this.duplicateBulkAction = null;
       this.setState({ isUploadRemindDialogShow: false, currentResumableFile: null, duplicateBatchActive: false });
       return;
     }
@@ -519,7 +521,8 @@ class FileUploader extends React.Component {
       isUploadProgressDialogShow: true,
       isUploadRemindDialogShow: true,
       currentResumableFile: next,
-      duplicateBatchActive: inBatch || this.state.duplicateBatchActive || this.pendingDuplicates.length > 0,
+      // Offer "apply to all" while there is more than one duplicate in play.
+      duplicateBatchActive: inBatch || this.pendingDuplicates.length > 0,
     });
   };
 
@@ -544,22 +547,32 @@ class FileUploader extends React.Component {
     this.startLegacyDuplicateUpload(resumableFile, replace);
   };
 
+  // getCurrentParentDir returns the folder path WITH a trailing slash, matching the
+  // shape onChunkingComplete writes into formData.parent_dir. Used as the fallback
+  // when a held duplicate's formData has no parent_dir yet, so target_file is always
+  // "/folder/name", never the malformed "/foldername".
+  getCurrentParentDir = () => (this.props.path === '/' ? '/' : `${this.props.path}/`);
+
   // startLegacyDuplicateUpload re-arms a held legacy file with a PER-FILE target
   // (replace → update link + replace flag; keep → upload link, backend
   // auto-renames) and only then pushes it back into the resumable queue, so the
   // running uploader never touches it with the shared/global target.
   startLegacyDuplicateUpload = (resumableFile, replace) => {
     const { repoID, path } = this.props;
+    const parentDir = (resumableFile.formData && resumableFile.formData.parent_dir) || this.getCurrentParentDir();
     const linkPromise = replace
       ? seafileAPI.getUpdateLink(repoID, path)
       : seafileAPI.getFileServerUploadLink(repoID, path);
     linkPromise.then(res => {
       resumableFile.opts = resumableFile.opts || {};
       resumableFile.formData = resumableFile.formData || {};
+      // Pin parent_dir (slash-terminated) so target_file is well-formed even when
+      // the held file was pulled from the queue before formData was populated.
+      resumableFile.formData['parent_dir'] = parentDir;
       if (replace) {
         resumableFile.opts.target = res.data;
         resumableFile.formData['replace'] = 1;
-        resumableFile.formData['target_file'] = (resumableFile.formData.parent_dir || this.props.path) + resumableFile.fileName;
+        resumableFile.formData['target_file'] = `${parentDir}${resumableFile.fileName}`;
       } else {
         resumableFile.opts.target = res.data + '?ret-json=1';
         resumableFile.formData['replace'] = 0;
@@ -576,8 +589,14 @@ class FileUploader extends React.Component {
       });
       this.resumable.upload();
     }).catch(error => {
-      const errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
+      toaster.danger(Utils.getErrorMsg(error));
+      // The file was pulled from the resumable queue before the link fetch; a
+      // transient failure must NOT silently drop it. Re-queue it so it is offered
+      // again instead of vanishing from the dialog and retry list.
+      this.pendingDuplicates.push(resumableFile);
+      if (!this.state.isUploadRemindDialogShow) {
+        this.showNextDuplicatePrompt();
+      }
     });
   };
 
@@ -603,6 +622,14 @@ class FileUploader extends React.Component {
   onFileAdded = (resumableFile, files) => {
     const { isCustomPermission } = this.props;
     const isFile = resumableFile.fileName === resumableFile.relativePath;
+
+    // A fresh drag/selection is a new batch (resumable hands the same `files` array
+    // to every fileAdded within one batch). An "apply to all" choice is scoped to
+    // its batch and must NOT silently auto-resolve a duplicate the user adds later.
+    if (files !== this._currentBatchRef) {
+      this._currentBatchRef = files;
+      this.duplicateBulkAction = null;
+    }
 
     // Duplicate-name detection runs for EVERY file (single OR batch, small OR
     // large) and BEFORE the block-flow diversion below. Previously it only ran for
