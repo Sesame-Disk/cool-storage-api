@@ -9,6 +9,15 @@
 > flagged off by default. Resume and network dedup are provided by
 > `/blocks/check` + commit-from-manifest, not by `file-uploaded-bytes` (which
 > stays a safe `0`). See [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md).
+>
+> **UPDATE (2026-06-24):** A follow-up hotfix made the web block flow's committed
+> files compatible with the Seafile desktop/mobile sync client. The file object
+> now stores 40-hex **SHA-1** block IDs (with a server-verified `sha1 → sha256`
+> forward mapping), instead of the 64-hex SHA-256 IDs the first cut wrote — which
+> the desktop parser rejected with `File <fs_id> does not exist`. Internal storage,
+> refs, GC and dedup stay on SHA-256; legacy/seafhttp mapping is untouched. Verified
+> end-to-end (desktop sync + web download, incl. the ZIP/MOV cases that originally
+> failed). See [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md).
 
 ---
 

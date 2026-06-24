@@ -2,8 +2,10 @@ package v2
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -181,11 +183,16 @@ func (h *BlockHandler) resolveUploadSession(c *gin.Context) (db.BlockUploadSessi
 
 // materializeUploadedBlock records block metadata plus a provisional reference
 // owned by the session ("up:<session_id>") so the block is GC-governed and
-// commit-ready (R9). No SHA-1 mapping is written: the web flow uses SHA-256 as
-// the external block ID, so external == internal and a mapping would be a no-op
-// identity row that pollutes block_id_mappings (R10) — hence externalBlockID "".
-func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, hash string, size int, storageClass string) error {
-	return RegisterUploadedBlockAndMapping(h.db, session.OrgID, session.RepoID, hash, session.SessionID, size, storageClass, "", "")
+// commit-ready (R9). It ALSO writes the authoritative SHA-1 → SHA-256 mapping
+// (R10, dual-hash) via the WEB-only verified writer: sha1ID is computed by the
+// server from the block's real bytes in UploadBlock, so this mapping is verified
+// content — not client-asserted — and a conflicting external→different-internal
+// remap fails closed (db.ErrBlockIDMappingConflict). The commit (file-from-blocks)
+// only ever READS this mapping; it never mints one from the manifest, which is why
+// a forged manifest SHA-1 cannot poison resolution. The shared legacy/seafhttp
+// mapping path (WriteBlockIDMapping) is left untouched.
+func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, sha256ID, sha1ID string, size int, storageClass string) error {
+	return RegisterWebUploadedBlockAndMapping(h.db, session.OrgID, session.RepoID, sha256ID, session.SessionID, size, storageClass, "", sha1ID)
 }
 
 // CheckBlocksRequest is the request body for checking blocks
@@ -359,14 +366,27 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// Compute hash
 	hashBytes := sha256.Sum256(data)
 	hash := hex.EncodeToString(hashBytes[:])
+	sha1Bytes := sha1.Sum(data)
+	sha1Hash := hex.EncodeToString(sha1Bytes[:])
 
-	// Optional: Verify client-provided hash if present
+	// Optional: verify client-provided hashes if present.
 	clientHash := c.GetHeader("X-Block-Hash")
 	if clientHash != "" && clientHash != hash {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":         "hash mismatch",
+			"algorithm":     "sha256",
 			"expected_hash": clientHash,
 			"actual_hash":   hash,
+		})
+		return
+	}
+	clientSHA1 := c.GetHeader("X-Block-Hash-SHA1")
+	if clientSHA1 != "" && clientSHA1 != sha1Hash {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":         "hash mismatch",
+			"algorithm":     "sha1",
+			"expected_hash": clientSHA1,
+			"actual_hash":   sha1Hash,
 		})
 		return
 	}
@@ -404,7 +424,11 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		// GOVERN the block (metadata + provisional ref) so the session can commit
 		// it and GC can reclaim it, not merely to store bytes.
 		if sessionPresent {
-			if err := h.materializeUploadedBlock(session, hash, len(data), storageClass); err != nil {
+			if err := h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass); err != nil {
+				if errors.Is(err, db.ErrBlockIDMappingConflict) {
+					c.JSON(http.StatusConflict, gin.H{"error": "block id mapping conflict"})
+					return
+				}
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register block"})
 				return
 			}
@@ -459,7 +483,11 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 
 	// R9: govern the freshly stored block under the session.
 	if sessionPresent {
-		if err := h.materializeUploadedBlock(session, hash, len(data), storageClass); err != nil {
+		if err := h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass); err != nil {
+			if errors.Is(err, db.ErrBlockIDMappingConflict) {
+				c.JSON(http.StatusConflict, gin.H{"error": "block id mapping conflict"})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register block"})
 			return
 		}

@@ -30,8 +30,8 @@ describe('uploadFileViaBlocks', () => {
     };
     const hashFn = jest.fn().mockResolvedValue({
       blocks: [
-        { index: 0, sha256: 'h0', size: 50 },
-        { index: 1, sha256: 'h1', size: 50 },
+        { index: 0, sha1: 's0', sha256: 'h0', size: 50 },
+        { index: 1, sha1: 's1', sha256: 'h1', size: 50 },
       ],
       size: 100,
     });
@@ -45,11 +45,12 @@ describe('uploadFileViaBlocks', () => {
     // Only the block reported missing is uploaded (dedup/resume).
     expect(uploaded).toEqual(['h1']);
     expect(api.uploadBlock).toHaveBeenCalledTimes(1);
-    // Commit carries the full ordered manifest.
+    // Commit carries the full ordered dual-hash manifest (sha256 = storage id,
+    // sha1 = external Seafile block id for desktop/mobile download compat).
     const manifest = api.createFileFromBlocks.mock.calls[0][1];
     expect(manifest.blocks).toEqual([
-      { sha256: 'h0', size: 50 },
-      { sha256: 'h1', size: 50 },
+      { sha1: 's0', sha256: 'h0', size: 50 },
+      { sha1: 's1', sha256: 'h1', size: 50 },
     ]);
     expect(manifest.session).toBe('sess1');
     expect(res).toEqual([{ name: 'big.bin', id: 'fid', size: '100' }]);
@@ -76,7 +77,7 @@ describe('uploadFileViaBlocks', () => {
       }),
     };
     const hashFn = jest.fn().mockResolvedValue({
-      blocks: [{ index: 0, sha256: 'h0', size: 50 }],
+      blocks: [{ index: 0, sha1: 's0', sha256: 'h0', size: 50 }],
       size: 50,
     });
 
@@ -85,6 +86,10 @@ describe('uploadFileViaBlocks', () => {
     expect(uploaded).toEqual(['h0']); // re-uploaded the block the commit demanded
     expect(commitCalls).toBe(2);
     expect(res[0].name).toBe('f');
+    // Both commit attempts carry the dual-hash manifest (no sha1: undefined on retry).
+    api.createFileFromBlocks.mock.calls.forEach(([, manifest]) => {
+      expect(manifest.blocks).toEqual([{ sha1: 's0', sha256: 'h0', size: 50 }]);
+    });
   });
 
   test('retries the commit on "commit still in progress" with backoff until the idempotent result', async () => {
@@ -103,7 +108,7 @@ describe('uploadFileViaBlocks', () => {
         return Promise.resolve({ data: [{ name: 'f', id: 'i', size: '10' }] });
       }),
     };
-    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha1: 's0', sha256: 'h0', size: 10 }], size: 10 });
 
     const res = await uploadFileViaBlocks(makeFile(10), {
       repoID: 'r', api, hashFn, blockSize: 50, commitRetryBaseMs: 1,
@@ -125,7 +130,7 @@ describe('uploadFileViaBlocks', () => {
         }),
       ),
     };
-    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha1: 's0', sha256: 'h0', size: 10 }], size: 10 });
 
     await expect(
       uploadFileViaBlocks(makeFile(10), { repoID: 'r', api, hashFn, blockSize: 50, commitRetryBaseMs: 1 }),
@@ -145,7 +150,7 @@ describe('uploadFileViaBlocks', () => {
         }),
       ),
     };
-    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha1: 's0', sha256: 'h0', size: 10 }], size: 10 });
 
     await expect(
       uploadFileViaBlocks(makeFile(10), { repoID: 'r', api, hashFn, blockSize: 50, commitRetryBaseMs: 1 }),
@@ -162,7 +167,7 @@ describe('uploadFileViaBlocks', () => {
         Object.assign(new Error('quota'), { response: { status: 403, data: { error: 'storage quota exceeded' } } }),
       ),
     };
-    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha1: 's0', sha256: 'h0', size: 10 }], size: 10 });
 
     await expect(
       uploadFileViaBlocks(makeFile(10), { repoID: 'r', api, hashFn, blockSize: 50 }),

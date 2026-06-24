@@ -42,6 +42,12 @@ const (
 	BlockGCStateDeleting = "deleting"
 )
 
+// ErrBlockIDMappingConflict indicates an external SHA-1 already maps to a
+// DIFFERENT internal SHA-256. The web block-upload flow refuses to overwrite it
+// (a crafted SHA-1 collision could otherwise corrupt downloads of already
+// committed files); see WriteVerifiedWebBlockMapping.
+var ErrBlockIDMappingConflict = errors.New("block id mapping conflict")
+
 type BlockReuseDecision int
 
 const (
@@ -212,6 +218,81 @@ func (db *DB) WriteBlockIDMapping(orgID, externalID, internalID string, createdA
 			`, orgID, internalID, externalID, ts).Exec()
 		},
 	)
+}
+
+// GetBlockIDMapping resolves one external SHA-1 block ID to its internal SHA-256
+// storage identity using the FORWARD (client-visible, authoritative) row. ok ==
+// false means no mapping row exists. This is the only mapping read the web commit
+// (file-from-blocks) trusts; the reverse projection is never consulted there.
+func (db *DB) GetBlockIDMapping(orgID, externalID string) (internalID string, ok bool, err error) {
+	if db == nil {
+		return "", false, nil
+	}
+	externalID = strings.TrimSpace(externalID)
+	if externalID == "" {
+		return "", false, nil
+	}
+	err = db.Session().Query(`
+		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
+	`, orgID, externalID).Scan(&internalID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return internalID, true, nil
+}
+
+// WriteVerifiedWebBlockMapping writes the forward external SHA-1 -> internal
+// SHA-256 mapping for the WEB block-upload (session) flow ONLY. Both hashes are
+// computed server-side from the block's real bytes in UploadBlock, so the mapping
+// is verified content, never client-asserted.
+//
+// Unlike WriteBlockIDMapping (the shared legacy/seafhttp hot path, which does a
+// plain idempotent INSERT and is intentionally left untouched), this guards
+// against silently remapping an existing external SHA-1 to a DIFFERENT internal
+// SHA-256 — which a crafted SHA-1 collision could exploit to corrupt downloads of
+// already-committed files. The guard is a plain read-before-write, NOT a
+// Cassandra LWT/Paxos: per-block Paxos on the upload hot path causes latency,
+// contention, and timeouts in multi-DC deployments, and the commit-side
+// forward-mapping check (file-from-blocks) remains the integrity authority
+// regardless. The only residual gap versus LWT is two *colliding* blocks (same
+// SHA-1, different content) racing the tiny read->write window — astronomically
+// unlikely.
+//
+// The reverse row is a best-effort GC/repair projection and is NEVER the source
+// of truth for a commit.
+func (db *DB) WriteVerifiedWebBlockMapping(orgID, externalID, internalID string, createdAt time.Time) error {
+	if db == nil {
+		return nil
+	}
+	externalID = strings.TrimSpace(externalID)
+	internalID = strings.TrimSpace(internalID)
+	ts := createdAt.UTC()
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	}
+	existing, found, err := db.GetBlockIDMapping(orgID, externalID)
+	if err != nil {
+		return fmt.Errorf("read existing block mapping %s: %w", externalID, err)
+	}
+	if found {
+		if strings.TrimSpace(existing) != internalID {
+			return fmt.Errorf("%w: external %s already maps to %s (got %s)", ErrBlockIDMappingConflict, externalID, existing, internalID)
+		}
+	} else {
+		if err := db.Session().Query(`
+			INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?)
+		`, orgID, externalID, internalID, ts).Exec(); err != nil {
+			return err
+		}
+	}
+	// Reverse projection (GC/repair only; never authoritative for a commit). It is
+	// rewritten idempotently and fails closed so a retry can heal it.
+	return db.Session().Query(`
+		INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, ?)
+	`, orgID, internalID, externalID, ts).Exec()
 }
 
 // AddPublishAttemptReferences stages temporary pub:<attempt> references for an

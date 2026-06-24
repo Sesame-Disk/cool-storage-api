@@ -4,8 +4,10 @@ package integration
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +21,11 @@ import (
 
 func sha256hex(b []byte) string {
 	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func sha1hex(b []byte) string {
+	sum := sha1.Sum(b)
 	return hex.EncodeToString(sum[:])
 }
 
@@ -91,11 +98,12 @@ func webCommit(t *testing.T, c *testClient, repoID string, manifest map[string]i
 	return c.PostJSON(t, fmt.Sprintf("/api/v2/repos/%s/file-from-blocks/", repoID), manifest)
 }
 
-// blocksManifest builds the ordered manifest entries from raw block byte slices.
+// blocksManifest builds the ordered dual-hash manifest entries from raw block
+// byte slices (sha256 = storage identity, sha1 = external Seafile block ID).
 func blocksManifest(blocks [][]byte) []map[string]interface{} {
 	out := make([]map[string]interface{}, len(blocks))
 	for i, b := range blocks {
-		out[i] = map[string]interface{}{"sha256": sha256hex(b), "size": len(b)}
+		out[i] = map[string]interface{}{"sha1": sha1hex(b), "sha256": sha256hex(b), "size": len(b)}
 	}
 	return out
 }
@@ -191,6 +199,218 @@ func TestWebBlockUploadRoundTripAndDedup(t *testing.T) {
 	}
 }
 
+// TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat is the regression guard for
+// the desktop/mobile sync download bug: a file committed via the web block flow
+// must store SHA-1 (40-hex) block IDs in its fs_object (the Seafile sync client
+// cannot parse 64-hex SHA-256 block IDs), backed by SHA-1→SHA-256 mappings so the
+// blocks still resolve to their SHA-256 storage identity on download. pack-fs
+// serves the fs_object's block_ids column verbatim, so SHA-1 there is exactly what
+// the desktop client receives.
+func TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-sha1-%d", time.Now().UnixNano()))
+	first := bytes.Repeat([]byte("Z"), 8*1024*1024) // one full 8 MB block
+	last := []byte("desktop-compat-tail-" + fmt.Sprint(time.Now().UnixNano()))
+	blocks := [][]byte{first, last}
+
+	resp := uploadFileViaBlocksFlow(t, adminClient, repoID, "/", "compat.bin", blocks, false)
+	expectStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	orgID := resolveOrgID(t, repoID)
+	session := shareProjectionDBForTest(t).Session()
+
+	var headCommit string
+	if err := session.Query(`SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, repoID).Scan(&headCommit); err != nil {
+		t.Fatalf("read head commit: %v", err)
+	}
+	var rootFSID string
+	if err := session.Query(`SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, headCommit).Scan(&rootFSID); err != nil {
+		t.Fatalf("read root fs: %v", err)
+	}
+	var dirEntriesJSON string
+	if err := session.Query(`SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, rootFSID).Scan(&dirEntriesJSON); err != nil {
+		t.Fatalf("read root dir entries: %v", err)
+	}
+	var dirEntries []map[string]interface{}
+	if err := json.Unmarshal([]byte(dirEntriesJSON), &dirEntries); err != nil {
+		t.Fatalf("decode dir entries: %v", err)
+	}
+	var fileFSID string
+	for _, e := range dirEntries {
+		if name, _ := e["name"].(string); name == "compat.bin" {
+			fileFSID, _ = e["id"].(string)
+			break
+		}
+	}
+	if fileFSID == "" {
+		t.Fatalf("committed file not found in root dir entries: %s", dirEntriesJSON)
+	}
+
+	var blockIDs []string
+	if err := session.Query(`SELECT block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fileFSID).Scan(&blockIDs); err != nil {
+		t.Fatalf("read block ids: %v", err)
+	}
+	if len(blockIDs) != len(blocks) {
+		t.Fatalf("expected %d block ids, got %d", len(blocks), len(blockIDs))
+	}
+
+	// Each fs_object block ID must be the SHA-1 (40-hex) of the block, and its
+	// SHA-1→SHA-256 mapping must resolve to the actual SHA-256 storage identity.
+	for i, ext := range blockIDs {
+		if len(ext) != 40 {
+			t.Fatalf("block %d id %q is not a 40-hex SHA-1 (desktop sync would reject it)", i, ext)
+		}
+		if want := sha1hex(blocks[i]); ext != want {
+			t.Fatalf("block %d sha1 = %s, want %s", i, ext, want)
+		}
+		var internal string
+		if err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, ext).Scan(&internal); err != nil {
+			t.Fatalf("block %d: no SHA-1→SHA-256 mapping for %s: %v", i, ext, err)
+		}
+		if want := sha256hex(blocks[i]); internal != want {
+			t.Fatalf("block %d mapping internal_id = %s, want sha256 %s", i, internal, want)
+		}
+	}
+
+	// Download must still reassemble correctly (SHA-1 ids resolve to SHA-256).
+	got := downloadRepoFile(t, adminClient, repoID, "/compat.bin")
+	want := append(append([]byte{}, first...), last...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("download mismatch: got %d bytes want %d bytes", len(got), len(want))
+	}
+}
+
+// TestWebBlockUploadRejectsForgedSHA1 covers the mapping-integrity fix: the
+// server computes SHA-1 from the real bytes at upload and owns the mapping; the
+// commit must NOT trust a client-supplied SHA-1. A manifest that pairs a real
+// SHA-256 with a SHA-1 that resolves to different content is rejected (400), and
+// an unknown SHA-1 forces a re-upload (needs_upload) — the commit validates the
+// FORWARD mapping (sha1 -> sha256) written from verified bytes, never trusting the
+// client's SHA-1 and never minting a mapping from the manifest.
+func TestWebBlockUploadForwardMappingIsSourceOfTruth(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-forge-%d", time.Now().UnixNano()))
+	orgID := resolveOrgID(t, repoID)
+
+	t.Run("manifest sha1 belongs to different content -> 400", func(t *testing.T) {
+		session := webCreateBlockSession(t, adminClient, repoID, "/")
+		blockA := []byte("forward-truth block A " + fmt.Sprint(time.Now().UnixNano()))
+		blockB := []byte("forward-truth block B " + fmt.Sprint(time.Now().UnixNano()))
+		for _, b := range [][]byte{blockA, blockB} {
+			resp := webUploadBlock(t, adminClient, session, b)
+			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+				t.Fatalf("upload status %d", resp.StatusCode)
+			}
+			resp.Body.Close()
+		}
+		// Commit a 1-block file claiming A's SHA-1 paired with B's SHA-256. The
+		// forward mapping proves sha1(A) -> sha256(A) != sha256(B) → integrity 400.
+		commit := webCommit(t, adminClient, repoID, map[string]interface{}{
+			"session": session, "parent_dir": "/", "filename": "crosspair.bin",
+			"replace": false, "size": len(blockB),
+			"blocks": []map[string]interface{}{{"sha1": sha1hex(blockA), "sha256": sha256hex(blockB), "size": len(blockB)}},
+		})
+		expectStatus(t, commit, http.StatusBadRequest)
+		commit.Body.Close()
+	})
+
+	t.Run("unknown manifest sha1 -> needs_upload, no mapping poisoning", func(t *testing.T) {
+		session := webCreateBlockSession(t, adminClient, repoID, "/")
+		content := []byte("unknown sha1 block " + fmt.Sprint(time.Now().UnixNano()))
+		resp := webUploadBlock(t, adminClient, session, content)
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+			t.Fatalf("upload status %d", resp.StatusCode)
+		}
+		resp.Body.Close()
+
+		forgedSHA1 := strings.Repeat("a", 40) // valid 40-hex, never uploaded
+		if forgedSHA1 == sha1hex(content) {
+			t.Skip("astronomical: forged sha1 equals real sha1")
+		}
+		commit := webCommit(t, adminClient, repoID, map[string]interface{}{
+			"session": session, "parent_dir": "/", "filename": "unknown.bin",
+			"replace": false, "size": len(content),
+			"blocks": []map[string]interface{}{{"sha1": forgedSHA1, "sha256": sha256hex(content), "size": len(content)}},
+		})
+		// Unknown forward mapping → the server asks the client to (re)upload it.
+		expectStatus(t, commit, http.StatusConflict)
+		commit.Body.Close()
+
+		// The forged SHA-1 must not have been persisted as a mapping (no poisoning).
+		dbSession := shareProjectionDBForTest(t).Session()
+		var internal string
+		if err := dbSession.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, forgedSHA1).Scan(&internal); err == nil {
+			t.Fatalf("forged sha1 was persisted as a mapping → %s (poisoning not prevented)", internal)
+		}
+	})
+}
+
+// TestWebBlockUploadCommitIndependentOfReverseMapping proves the commit relies on
+// the FORWARD mapping only: deleting the reverse projection row (which is
+// best-effort and may lag) must NOT block a commit whose forward row is intact.
+func TestWebBlockUploadCommitIndependentOfReverseMapping(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-rev-%d", time.Now().UnixNano()))
+	orgID := resolveOrgID(t, repoID)
+	session := webCreateBlockSession(t, adminClient, repoID, "/")
+	content := []byte("reverse-independent block " + fmt.Sprint(time.Now().UnixNano()))
+
+	resp := webUploadBlock(t, adminClient, session, content)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Remove the reverse projection row; the forward row stays intact.
+	dbSession := shareProjectionDBForTest(t).Session()
+	if err := dbSession.Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ?`, orgID, sha256hex(content)).Exec(); err != nil {
+		t.Fatalf("delete reverse mapping: %v", err)
+	}
+
+	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
+		"session": session, "parent_dir": "/", "filename": "revindep.bin",
+		"replace": false, "size": len(content),
+		"blocks": []map[string]interface{}{{"sha1": sha1hex(content), "sha256": sha256hex(content), "size": len(content)}},
+	})
+	expectStatus(t, commit, http.StatusOK)
+	commit.Body.Close()
+
+	got := downloadRepoFile(t, adminClient, repoID, "/revindep.bin")
+	if !bytes.Equal(got, content) {
+		t.Fatalf("download mismatch after reverse-mapping deletion")
+	}
+}
+
+// TestWebBlockUploadReplayDifferentSHA1IsDifferentFile covers the idempotency
+// fix: SHA-1 is part of manifestDigest, so replaying a committed session with the
+// same SHA-256 but a different SHA-1 is treated as a different file (409), never
+// an OK replay returning an id that does not match the persisted object.
+func TestWebBlockUploadReplayDifferentSHA1IsDifferentFile(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-replay-%d", time.Now().UnixNano()))
+	session := webCreateBlockSession(t, adminClient, repoID, "/")
+	content := []byte("replay different sha1 " + fmt.Sprint(time.Now().UnixNano()))
+
+	resp := webUploadBlock(t, adminClient, session, content)
+	resp.Body.Close()
+
+	honest := map[string]interface{}{
+		"session": session, "parent_dir": "/", "filename": "replay.bin",
+		"replace": false, "size": len(content),
+		"blocks": []map[string]interface{}{{"sha1": sha1hex(content), "sha256": sha256hex(content), "size": len(content)}},
+	}
+	first := webCommit(t, adminClient, repoID, honest)
+	expectStatus(t, first, http.StatusOK)
+	first.Body.Close()
+
+	// Same session + same sha256 but a different (forged) sha1 → different digest.
+	forged := map[string]interface{}{
+		"session": session, "parent_dir": "/", "filename": "replay.bin",
+		"replace": false, "size": len(content),
+		"blocks": []map[string]interface{}{{"sha1": strings.Repeat("b", 40), "sha256": sha256hex(content), "size": len(content)}},
+	}
+	second := webCommit(t, adminClient, repoID, forged)
+	expectStatus(t, second, http.StatusConflict)
+	second.Body.Close()
+}
+
 func TestWebBlockUploadMultiBlockOrdering(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-multi-%d", time.Now().UnixNano()))
 	first := bytes.Repeat([]byte("A"), 8*1024*1024) // exactly one 8 MB block
@@ -217,7 +437,7 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 		resp := webCommit(t, adminClient, repoID, map[string]interface{}{
 			"session": session, "parent_dir": "/", "filename": "ghost.txt",
 			"replace": false, "size": len(content),
-			"blocks": []map[string]interface{}{{"sha256": sha256hex(content), "size": len(content)}},
+			"blocks": []map[string]interface{}{{"sha1": sha1hex(content), "sha256": sha256hex(content), "size": len(content)}},
 		})
 		expectStatus(t, resp, http.StatusConflict)
 		var out map[string]interface{}
@@ -248,7 +468,7 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 		resp := webCommit(t, adminClient, repoID, map[string]interface{}{
 			"session": session, "parent_dir": "/", "filename": "s3only.txt",
 			"replace": false, "size": len(content),
-			"blocks": []map[string]interface{}{{"sha256": sha256hex(content), "size": len(content)}},
+			"blocks": []map[string]interface{}{{"sha1": sha1hex(content), "sha256": sha256hex(content), "size": len(content)}},
 		})
 		expectStatus(t, resp, http.StatusConflict)
 		resp.Body.Close()
@@ -264,7 +484,7 @@ func TestWebBlockUploadManifestValidation(t *testing.T) {
 	resp := webCommit(t, adminClient, repoID, map[string]interface{}{
 		"session": session, "parent_dir": "/", "filename": "bad.txt",
 		"replace": false, "size": len(content) + 100,
-		"blocks": []map[string]interface{}{{"sha256": sha256hex(content), "size": len(content)}},
+		"blocks": []map[string]interface{}{{"sha1": sha1hex(content), "sha256": sha256hex(content), "size": len(content)}},
 	})
 	expectStatus(t, resp, http.StatusBadRequest)
 	resp.Body.Close()
@@ -278,15 +498,19 @@ func TestWebBlockUploadManifestRejectsConflictingBlockSizes(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-dupsize-%d", time.Now().UnixNano()))
 	session := webCreateBlockSession(t, adminClient, repoID, "/")
 	const blockSize = 8 * 1024 * 1024
-	hash := sha256hex([]byte("conflicting size block " + fmt.Sprint(time.Now().UnixNano())))
+	raw := []byte("conflicting size block " + fmt.Sprint(time.Now().UnixNano()))
+	hash := sha256hex(raw)
+	hash1 := sha1hex(raw)
 
-	// Same hash declared as an 8 MB non-final block AND a 4-byte final block.
+	// Same hash declared as an 8 MB non-final block AND a 4-byte final block. The
+	// SHA-1 is identical (same content) so the rejection is for the conflicting
+	// size, not a conflicting hash pairing.
 	resp := webCommit(t, adminClient, repoID, map[string]interface{}{
 		"session": session, "parent_dir": "/", "filename": "dup.bin",
 		"replace": false, "size": blockSize + 4,
 		"blocks": []map[string]interface{}{
-			{"sha256": hash, "size": blockSize},
-			{"sha256": hash, "size": 4},
+			{"sha1": hash1, "sha256": hash, "size": blockSize},
+			{"sha1": hash1, "sha256": hash, "size": 4},
 		},
 	})
 	expectStatus(t, resp, http.StatusBadRequest)
@@ -307,7 +531,7 @@ func TestWebBlockUploadSizeMismatch(t *testing.T) {
 	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
 		"session": session, "parent_dir": "/", "filename": "lie.txt",
 		"replace": false, "size": 20,
-		"blocks": []map[string]interface{}{{"sha256": sha256hex(content), "size": 20}},
+		"blocks": []map[string]interface{}{{"sha1": sha1hex(content), "sha256": sha256hex(content), "size": 20}},
 	})
 	expectStatus(t, commit, http.StatusUnprocessableEntity)
 	commit.Body.Close()
@@ -319,6 +543,7 @@ func TestWebBlockUploadGCFenceRejected(t *testing.T) {
 	session := webCreateBlockSession(t, adminClient, repoID, "/")
 	content := []byte("gc fenced block " + fmt.Sprint(time.Now().UnixNano()))
 	hash := sha256hex(content)
+	hash1 := sha1hex(content)
 
 	resp := webUploadBlock(t, adminClient, session, content)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
@@ -336,7 +561,7 @@ func TestWebBlockUploadGCFenceRejected(t *testing.T) {
 	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
 		"session": session, "parent_dir": "/", "filename": "fenced.txt",
 		"replace": false, "size": len(content),
-		"blocks": []map[string]interface{}{{"sha256": hash, "size": len(content)}},
+		"blocks": []map[string]interface{}{{"sha1": hash1, "sha256": hash, "size": len(content)}},
 	})
 	expectStatus(t, commit, http.StatusConflict)
 	commit.Body.Close()
@@ -352,7 +577,7 @@ func TestWebBlockUploadIdempotentCommit(t *testing.T) {
 	manifest := map[string]interface{}{
 		"session": session, "parent_dir": "/", "filename": "idem.txt",
 		"replace": false, "size": len(content),
-		"blocks": []map[string]interface{}{{"sha256": sha256hex(content), "size": len(content)}},
+		"blocks": []map[string]interface{}{{"sha1": sha1hex(content), "sha256": sha256hex(content), "size": len(content)}},
 	}
 
 	first := webCommit(t, adminClient, repoID, manifest)
@@ -392,7 +617,7 @@ func TestWebBlockUploadConcurrentDoubleCommit(t *testing.T) {
 	manifest := map[string]interface{}{
 		"session": session, "parent_dir": "/", "filename": "conc.txt",
 		"replace": false, "size": len(content),
-		"blocks": []map[string]interface{}{{"sha256": sha256hex(content), "size": len(content)}},
+		"blocks": []map[string]interface{}{{"sha1": sha1hex(content), "sha256": sha256hex(content), "size": len(content)}},
 	}
 
 	var wg sync.WaitGroup
@@ -440,6 +665,7 @@ func TestWebBlockUploadForeignPubRefNotPermanent(t *testing.T) {
 	orgID := resolveOrgID(t, repoID)
 	content := []byte("foreign pub ref block " + fmt.Sprint(time.Now().UnixNano()))
 	hash := sha256hex(content)
+	hash1 := sha1hex(content)
 
 	// Upload under session A → materializes metadata + S3 object + up:<A> ref.
 	sessionA := webCreateBlockSession(t, adminClient, repoID, "/")
@@ -465,7 +691,7 @@ func TestWebBlockUploadForeignPubRefNotPermanent(t *testing.T) {
 	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
 		"session": sessionB, "parent_dir": "/", "filename": "pubonly.txt",
 		"replace": false, "size": len(content),
-		"blocks": []map[string]interface{}{{"sha256": hash, "size": len(content)}},
+		"blocks": []map[string]interface{}{{"sha1": hash1, "sha256": hash, "size": len(content)}},
 	})
 	expectStatus(t, commit, http.StatusConflict)
 	commit.Body.Close()
@@ -522,6 +748,7 @@ func TestWebBlockUploadSessionStagingSkipsLogicalStorageQuota(t *testing.T) {
 //   - a same-size overwrite (delta ≈ 0) commits successfully end-to-end, and
 //   - a brand-new file (positive delta) is rejected at commit with 403,
 //     even though its block staged fine.
+//
 // If the commit-side check ever regresses, the staging-skip would become a real
 // quota bypass — this test is the guard.
 func TestWebBlockUploadCommitEnforcesLogicalDelta(t *testing.T) {

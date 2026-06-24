@@ -59,10 +59,10 @@ tracker.
 
 ```
 1. POST /api/v2/repos/:repo_id/block-upload-session/   → server-issued session_id
-2. client splits file into fixed 8 MB blocks, SHA-256 each (Web Worker)
-3. POST /api/v2/blocks/check?session=...               → { existing, missing }
-4. POST /api/v2/blocks/upload?session=... (per missing) → store + materialize
-5. POST /api/v2/repos/:repo_id/file-from-blocks/        → commit from manifest
+2. client splits file into fixed 8 MB blocks, SHA-256 + SHA-1 each (Web Worker)
+3. POST /api/v2/blocks/check?session=...               → { existing, missing } (by SHA-256)
+4. POST /api/v2/blocks/upload?session=... (per missing) → store + materialize (SHA-256)
+5. POST /api/v2/repos/:repo_id/file-from-blocks/        → commit from dual-hash manifest
 ```
 
 The resume state is the `missing` set recomputed by step 3 from shared storage —
@@ -143,14 +143,130 @@ re-reading this section.
 - **R9 — `/blocks/upload?session=` always materializes**, even when
   `PutBlockData` was a no-op because the object already existed in S3. The point
   is to *govern* the block, not just store bytes.
-- **R10 — No SHA-1 mapping for pure SHA-256.** The web flow uses SHA-256 as the
-  external block ID (`external == internal`), so `RegisterUploadedBlockAndMapping`
-  is called with `externalBlockID == ""` and writes **no** `block_id_mappings`
-  row. `streaming.BatchResolveBlockIDs` leaves 64-char IDs untouched, so download
-  resolves them directly. SHA-1 stays only at the Seafile (desktop) edge.
+- **R10 — Dual-hash: SHA-1 is the external Seafile block ID, SHA-256 is the
+  storage identity.** A file's `fs_object.block_ids` MUST be SHA-1 (40-hex): the
+  Seafile desktop/mobile sync client parses block IDs as 20-byte SHA-1 and cannot
+  read a file whose block IDs are 64-hex SHA-256 (it fails the fs-object load with
+  "File <id> does not exist" at checkout — see
+  [the desktop-compat regression note](#desktop-and-mobile-sync-compatibility-dual-hash)).
+  So the client hashes each 8 MB block with **both** SHA-256 (storage/internal ID:
+  S3 key, `blocks`, `block_references`, GC, dedup, `/blocks/check`+`/blocks/upload`)
+  and SHA-1 (external ID), and the commit manifest carries both
+  (`{sha1, sha256, size}`).
+
+  **The mapping is server-authoritative, never client-asserted, and the FORWARD
+  table is the only source of truth.** `UploadBlock` computes the SHA-1 from the
+  block's REAL bytes (alongside the SHA-256 it already verifies) and writes the
+  `block_id_mappings` row (SHA-1 → SHA-256). `file-from-blocks` **never mints a
+  mapping**: it validates the manifest's SHA-1 against the forward mapping
+  (`GetBlockIDMapping(sha1)`):
+  - forward **missing** → `needs_upload` (the client re-uploads, which writes the
+    verified row);
+  - forward **resolves to a different SHA-256** → 400 (`manifest sha1 does not
+    match the block content`);
+  - forward **resolves to the declared SHA-256** → the manifest SHA-1 is accepted
+    and written into the fs_object.
+
+  The forward table is used (not the reverse `block_id_mappings_by_internal`)
+  because the reverse schema allows several SHA-1 aliases per SHA-256 and is a
+  best-effort GC/repair projection that can lag the forward row — depending on it
+  would risk picking a stale alias or rejecting a valid commit. Download resolution
+  (`streaming.BatchResolveBlockIDs`) also uses the forward table, so both the web/v2
+  path and the desktop seafhttp path serve the same bytes. SHA-1 is folded into
+  `manifestDigest`, so an idempotent replay with the same SHA-256s but a different
+  SHA-1 is a different file (409), not a silent id/object mismatch.
+
+  **No Paxos on the hot path, and legacy is untouched.** The forward mapping for
+  the web flow is written by a **web-only** helper, `WriteVerifiedWebBlockMapping`
+  (via `RegisterWebUploadedBlockAndMapping`), which guards against remapping an
+  existing SHA-1 to different content (a crafted SHA-1 collision could otherwise
+  corrupt downloads of committed files) with a plain read-before-write, **not** a
+  Cassandra LWT. Per-block Paxos would cause latency/contention/timeouts in
+  multi-DC/multi-node deployments; the only residual gap is two *colliding* blocks
+  written concurrently in the tiny read→write window (astronomically unlikely), and
+  the commit-side forward check is the integrity authority regardless.
+
+  The shared legacy/seafhttp path keeps using the original `WriteBlockIDMapping`
+  (plain idempotent dual-write) unchanged — **it pays no extra read and sees no
+  behavior change**. The two writers diverge only in the conflict guard, which is
+  needed solely on the new web flow where the server, not a trusted desktop client,
+  mints the SHA-1.
+
+Although the reverse row is non-authoritative, the web-only writer still fails
+the upload if rewriting `block_id_mappings_by_internal` fails after the forward
+row is in place. That is deliberate fail-closed behavior: a client retry can
+heal the auxiliary GC/repair projection instead of silently leaving it behind.
 - **R11 — Sizes validated against real metadata.** The commit checks
   `manifest.size == ProbeBlockReuse.SizeBytes` per block; a manifest cannot
   declare a size that disagrees with the stored block.
+
+---
+
+## Desktop and mobile sync compatibility (dual-hash)
+
+**Symptom (the bug this design fixes).** A file uploaded via the web block flow
+synced through the `check → commit → fs → data` phases on the desktop client but
+then failed checkout with `File <40-hex> does not exist` / `Failed to checkout
+file ...`, for every web-block file, in fresh libraries. The fs_object existed,
+hashed correctly, and pack-fs served it fine; the dir entry was correct. The only
+anomaly was the **block IDs inside the file fs_object were 64-hex SHA-256**.
+
+**Root cause.** The stock Seafile sync client parses a file (seafile) object's
+`block_ids` as 20-byte (40-hex) SHA-1. A 64-hex ID makes the fs-object parse fail,
+so `seaf_fs_manager_get_seafile` returns NULL and checkout reports the file as
+non-existent — *before* any block is even requested. The limitation is in the
+**client parser**, not in the server's block resolution, which is why the web/v2
+download path (which resolves 64-hex IDs directly) worked while desktop sync did
+not. The original R10 ("no SHA-1 mapping for pure SHA-256; SHA-1 stays only at the
+Seafile edge") was the wrong assumption — there was no SHA-1 edge for these files.
+
+**Fix.** Dual-hash (see R10 above): the client computes SHA-1 alongside SHA-256
+per block and the manifest carries both. The server computes SHA-1 from the real
+bytes at upload and owns the `block_id_mappings` (forward) row; the commit
+validates the manifest's SHA-1 against that forward mapping and writes the
+verified SHA-1 into the fs_object (never trusting the client's SHA-1, never minting
+a mapping, never using the reverse table as truth). End state per the design
+decision:
+
+| Field | Value |
+|---|---|
+| `fs_objects.block_ids` | **SHA-1** (desktop/mobile Seafile compat) |
+| `blocks.block_id` | SHA-256 |
+| `block_references.block_id` | SHA-256 |
+| S3 object key | SHA-256 |
+| `block_id_mappings` (forward, source of truth) | SHA-1 → SHA-256 (written at upload, from verified bytes, non-Paxos) |
+| `block_id_mappings_by_internal` (reverse) | SHA-256 → SHA-1 (best-effort GC/repair projection only) |
+
+
+**Validated end-to-end (2026-06-24) against a real Seafile desktop client** on
+this implementation, including the file types that originally failed:
+
+1. Uploaded files through the web block flow with the feature flag enabled in dev
+   (a ZIP and a MOV — the cases that previously broke — plus a large binary).
+2. Confirmed in the database that every committed `fs_objects.block_ids` entry is
+   a 40-hex SHA-1, and that its `sha1 → sha256` forward mapping resolves to the
+   real SHA-256 storage identity (`blocks` / `block_references` stay 64-hex).
+3. Synced the library from the desktop client: checkout **succeeds**, with no
+   `File <fs_id> does not exist` / `Failed to checkout file ...` errors.
+4. Compared the local/downloaded file hash against the source bytes — identical.
+5. Re-verified the web download path (server-side SHA-1 → SHA-256 resolution)
+   serves the same bytes.
+
+**Result: desktop/mobile sync and web download both work** for files uploaded via
+the web block flow. The regression introduced by merge #91 (SHA-256 block IDs in
+the file object) is fixed and verified, with the internal SHA-256 model unchanged.
+
+
+This branch prevents new SHA-256 `fs_objects.block_ids`, but it does not repair
+files already committed by the broken merge that stored SHA-256 block IDs in the
+file object. Repairing those files is a separate migration/rewrite problem
+because changing the block IDs changes the file `fs_id`; in dev/local the safe
+answer is delete and re-upload.
+Regression guards (`internal/integration/web_block_upload_test.go`):
+`TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat`,
+`TestWebBlockUploadForwardMappingIsSourceOfTruth`,
+`TestWebBlockUploadCommitIndependentOfReverseMapping`,
+`TestWebBlockUploadReplayDifferentSHA1IsDifferentFile`.
 
 ---
 
@@ -161,11 +277,13 @@ re-reading this section.
   uploading without a session leaves an ungoverned S3 object. The web flow always
   passes a session. If another non-sync caller is added, it must either use a
   session or its own materialization + cleanup.
-- **No cross-method dedup (web ↔ desktop).** Web uses fixed 8 MB blocks
-  (SHA-256 external IDs); desktop uses FastCDC variable blocks (SHA-1 external
-  IDs). Same file → different boundaries → different hashes → stored twice. See
+- **No cross-method dedup (web ↔ desktop) — upload side only.** Download compat is
+  solved (web files now carry SHA-1 block IDs, see the dual-hash section above).
+  What remains unsolved is *dedup at upload*: web uses fixed 8 MB blocks while
+  desktop uses FastCDC variable blocks, so the same file uploaded by each method
+  has different block boundaries → different hashes → stored twice. See
   [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md). Closing this would require
-  FastCDC in the browser/worker plus SHA-1 aliasing — a separate phase.
+  FastCDC in the browser/worker — a separate phase.
 - **Encrypted libraries are rejected** by the block flow: SHA-256 is computed
   over plaintext on the client, incompatible with server-side Seafile block
   encryption. Encrypted repos keep using the legacy uploader. A future phase
@@ -216,7 +334,8 @@ passing against real Cassandra + MinIO via `docker compose`):
 - R7: idempotent sequential replay → no duplicate file
 - R7: **concurrent double commit → single file** (this caught a real read-then-act
   race, fixed with the LWT claim)
-- R4: rename + re-download + history over a SHA-256-`block_ids` file
+- R4: rename + re-download + history over a web-block-upload file (SHA-1 `block_ids`
+  fs_object resolving to SHA-256 storage)
 
 ## Frontend wiring (implemented, behind flag)
 
@@ -251,6 +370,16 @@ is mapped onto the *legacy* resumable.js progress UI, which only understands
   deduplicated file the "upload" half completes almost instantly while the bar
   already spent half on hashing. Progress weighting needs an explicit per-phase
   definition.
+- **Header/row mismatch after a successful commit is still possible.** The
+  dialog header is driven by the global `isUploading()` check, while each row
+  renders its own legacy resumable-style state from `isUploading()`, `isSaved`,
+  `progress()`, and `isFileSaving()`. A block-flow entry that has stopped
+  reporting `isUploading()` but has not yet been marked `isSaved` can therefore
+  transiently render as `Waiting...` or `Saving...` while the header already
+  says `All files uploaded`. If a page refresh shows the file in the listing,
+  that confirms the backend commit already succeeded; the mismatch is local UI
+  state, not data loss. This branch treats it as a frontend polish gap, not a
+  backend integrity issue.
 - **Speed shows `0.00 B/s`.** A block entry sets `remainingTime = 0` and feeds no
   bytes into `this.resumable.files`, so the legacy `getBitrate()` sees no activity
   and reports `0.00 B/s` even while blocks are uploading. No real throughput/ETA
@@ -316,10 +445,12 @@ flag were on*.
    was deleted). **Not a correctness bug** — the commit is the authority and the
    client re-uploads — just a possible extra round-trip. Optional follow-up: align
    `check?session=` with the commit's classifier.
-4. **[Med] No real browser E2E yet.** Backend is covered live; still missing
-   in-browser validation of: large files, real retry, cancellation, resume,
-   progress accuracy, fallback, legacy folder upload, and local-vs-downloaded hash
-   comparison. Run with `docker compose up` + `npm start`, `enableBlockUpload` on.
+4. **[Med] No broader real browser E2E yet.** Backend is covered
+   live; still missing in-browser validation of: large files, real retry,
+   cancellation, resume, progress accuracy, fallback, legacy folder upload, and
+   local-vs-downloaded hash comparison. The Seafile desktop-client regression is
+   already validated end-to-end on this branch; what remains here is broader
+   browser-side coverage and UX verification.
 5. **[Med] No cross-method dedup (web ↔ desktop).** Web uses fixed 8 MB SHA-256
    blocks; desktop/sync uses FastCDC variable blocks (SHA-1 external IDs) — same
    file hashes differently, so it is stored twice. Out of phase 1; closing it needs
