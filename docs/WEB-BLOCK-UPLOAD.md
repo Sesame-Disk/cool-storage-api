@@ -436,6 +436,14 @@ is mapped onto the *legacy* resumable.js progress UI, which only understands
   batch. A held legacy file whose update/upload-link fetch fails is re-queued instead
   of dropped, and `target_file` is built from a slash-terminated parent dir so a
   subfolder replace resolves to `/folder/name` (not a malformed `/foldername`).
+  Both the normal add flow and the duplicate-resolution flow now await one shared
+  `ensureUploadTargetReady()` (the session upload link, fetched once per batch)
+  before calling `resumable.upload()`; otherwise a resolved duplicate could kick
+  the queue before the shared target was set and non-duplicate siblings POSTed to
+  the empty default target — `POST <page-url>` → **405**. The "keep" choice uploads
+  through that shared target (no per-file target); only "replace" needs a per-file
+  update-link target. The replace dialog is also keyed by file so a checked "apply
+  to all" never leaks into the next prompt.
   The dialog's `zIndex` was also raised above the upload progress panel
   (`.uploader-list-view`, 1050), which renders later in the DOM and otherwise
   overlapped the modal.

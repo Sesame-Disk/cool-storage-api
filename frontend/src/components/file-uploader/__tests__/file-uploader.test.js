@@ -149,6 +149,7 @@ describe('FileUploader upload link reuse regression', () => {
 
   test('initializes per-file opts before scoping a replace upload target', async () => {
     seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/token-a' });
+    seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/token-a' }); // shared target
 
     const uploader = createUploader();
     const resumableFile = createResumableFile('existing.txt', { opts: undefined });
@@ -513,7 +514,7 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(call[2]).toEqual({ replace: true });
   });
 
-  test('"Don\'t replace" uploads a legacy duplicate as-is (replace flag 0, backend auto-renames)', async () => {
+  test('"Don\'t replace" uploads a legacy duplicate as-is (replace flag 0, shared target, backend auto-renames)', async () => {
     seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/tok' });
     const uploader = createUploader(dupProps(['k.txt']));
     const f = createResumableFile('k.txt', { file: { name: 'k.txt', size: 10 } });
@@ -523,7 +524,8 @@ describe('FileUploader duplicate-name prompting', () => {
     await flushPromises();
 
     expect(f.formData.replace).toBe(0);
-    expect(f.opts.target).toBe('/upload/tok?ret-json=1');
+    // Keep uploads through the SHARED target (no per-file target needed).
+    expect(uploader.resumable.opts.target).toBe('/upload/tok?ret-json=1');
     expect(uploader.resumable.files).toContain(f);
     expect(uploader.resumable.upload).toHaveBeenCalled();
   });
@@ -597,6 +599,7 @@ describe('FileUploader duplicate-name prompting', () => {
 
   test('legacy replace duplicate in a subfolder builds target_file with a slash', async () => {
     seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/token-a' });
+    seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/token-a' }); // shared target
     const uploader = createUploader({ path: '/docs', direntList: [{ type: 'file', name: 'existing.txt' }] });
     // Held files can be pulled from the queue before formData.parent_dir is set, so
     // simulate the empty-formData case the fallback must handle.
@@ -608,6 +611,25 @@ describe('FileUploader duplicate-name prompting', () => {
 
     expect(f.formData.parent_dir).toBe('/docs/');
     expect(f.formData.target_file).toBe('/docs/existing.txt'); // not the malformed "/docsexisting.txt"
+  });
+
+  test('a resolved legacy duplicate does not start the queue until the shared target is set', async () => {
+    // Regression: starting resumable.upload() before the shared target is set made
+    // non-duplicate siblings POST to the empty default target (page URL → 405).
+    let resolveLink;
+    seafileAPI.getFileServerUploadLink.mockReturnValue(new Promise(r => { resolveLink = r; }));
+    const uploader = createUploader(dupProps(['k.txt']));
+    const f = createResumableFile('k.txt', { file: { name: 'k.txt', size: 10 } });
+    uploader.state.currentResumableFile = f;
+
+    uploader.uploadFile(false); // keep
+    await flushPromises();
+    expect(uploader.resumable.upload).not.toHaveBeenCalled(); // target not ready yet
+
+    resolveLink({ data: '/upload/tok' });
+    await flushPromises();
+    expect(uploader.resumable.opts.target).toBe('/upload/tok?ret-json=1');
+    expect(uploader.resumable.upload).toHaveBeenCalled();
   });
 
   test('a link-fetch failure re-queues the held duplicate instead of dropping it', async () => {

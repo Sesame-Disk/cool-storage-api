@@ -23,19 +23,24 @@ class UploadRemindDialog extends React.Component {
     };
   }
 
+  // "apply to all" only counts when the checkbox is actually offered AND checked.
+  // The parent also remounts this dialog per file (key), so the box never carries
+  // a stale check into the next prompt; this guard is the belt to that suspenders.
+  getApplyToAll = () => this.props.showApplyToAll && this.state.applyToAll;
+
   toggle = (e) => {
     e.nativeEvent.stopImmediatePropagation();
-    this.props.cancelFileUpload(this.state.applyToAll);
+    this.props.cancelFileUpload(this.getApplyToAll());
   };
 
   replaceRepetitionFile = (e) => {
     e.nativeEvent.stopImmediatePropagation();
-    this.props.replaceRepetitionFile(this.state.applyToAll);
+    this.props.replaceRepetitionFile(this.getApplyToAll());
   };
 
   uploadFile = (e) => {
     e.nativeEvent.stopImmediatePropagation();
-    this.props.uploadFile(this.state.applyToAll);
+    this.props.uploadFile(this.getApplyToAll());
   };
 
   onApplyToAllChange = (e) => {

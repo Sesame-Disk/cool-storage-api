@@ -65,6 +65,11 @@ class FileUploader extends React.Component {
     this.bitrateInterval = 500; // Interval in milliseconds to calculate the bitrate
     window.onbeforeunload = this.onbeforeunload;
     this.isUploadLinkLoaded = false;
+    // Cached promise of the shared resumable upload target for the current batch.
+    // Both the normal add flow and the duplicate-resolution flow await it before
+    // calling resumable.upload(), so a file is never POSTed to the empty default
+    // target (which resolves to the page URL → 405). Cleared with isUploadLinkLoaded.
+    this._uploadTargetPromise = null;
     // Files whose name already exists in the folder, held OUT of the resumable
     // queue (via removeFile) until the user decides replace / keep / cancel. They
     // are prompted one at a time; `duplicateBulkAction` short-circuits the prompt
@@ -553,30 +558,20 @@ class FileUploader extends React.Component {
   // "/folder/name", never the malformed "/foldername".
   getCurrentParentDir = () => (this.props.path === '/' ? '/' : `${this.props.path}/`);
 
-  // startLegacyDuplicateUpload re-arms a held legacy file with a PER-FILE target
-  // (replace → update link + replace flag; keep → upload link, backend
-  // auto-renames) and only then pushes it back into the resumable queue, so the
-  // running uploader never touches it with the shared/global target.
+  // startLegacyDuplicateUpload re-drives a held legacy file:
+  //   - "keep"    → upload via the SHARED target (backend auto-renames to "name (1).ext"),
+  //   - "replace" → a PER-FILE update-link target + replace flag (file.opts wins in
+  //                 resumable.getOpt, so it never reroutes other in-flight uploads).
+  // In BOTH cases the queue is only kicked AFTER ensureUploadTargetReady resolves,
+  // so non-duplicate siblings already in the queue don't POST to the empty target.
   startLegacyDuplicateUpload = (resumableFile, replace) => {
-    const { repoID, path } = this.props;
-    const parentDir = (resumableFile.formData && resumableFile.formData.parent_dir) || this.getCurrentParentDir();
-    const linkPromise = replace
-      ? seafileAPI.getUpdateLink(repoID, path)
-      : seafileAPI.getFileServerUploadLink(repoID, path);
-    linkPromise.then(res => {
-      resumableFile.opts = resumableFile.opts || {};
-      resumableFile.formData = resumableFile.formData || {};
-      // Pin parent_dir (slash-terminated) so target_file is well-formed even when
-      // the held file was pulled from the queue before formData was populated.
-      resumableFile.formData['parent_dir'] = parentDir;
-      if (replace) {
-        resumableFile.opts.target = res.data;
-        resumableFile.formData['replace'] = 1;
-        resumableFile.formData['target_file'] = `${parentDir}${resumableFile.fileName}`;
-      } else {
-        resumableFile.opts.target = res.data + '?ret-json=1';
-        resumableFile.formData['replace'] = 0;
-      }
+    resumableFile.formData = resumableFile.formData || {};
+    // Pin parent_dir (slash-terminated) so target_file is well-formed even when the
+    // held file was pulled from the queue before onChunkingComplete populated it.
+    const parentDir = resumableFile.formData.parent_dir || this.getCurrentParentDir();
+    resumableFile.formData['parent_dir'] = parentDir;
+
+    const pushAndStart = () => {
       if (this.resumable.files.indexOf(resumableFile) === -1) {
         this.resumable.files.push(resumableFile);
       }
@@ -587,7 +582,27 @@ class FileUploader extends React.Component {
         totalProgress: this.calculateTotalProgress(uploadFileList),
         uploadBitrate: this.calculateUploadBitrate(uploadFileList),
       });
-      this.resumable.upload();
+      // Start only once the shared target is set (replace files carry their own
+      // per-file target and upload regardless).
+      this.ensureUploadTargetReady()
+        .then(() => this.resumable.upload())
+        .catch(() => this.resumable.upload());
+    };
+
+    if (!replace) {
+      // Keep: behaves like a normal upload through the shared target.
+      resumableFile.formData['replace'] = 0;
+      pushAndStart();
+      return;
+    }
+
+    const { repoID, path } = this.props;
+    seafileAPI.getUpdateLink(repoID, path).then(res => {
+      resumableFile.opts = resumableFile.opts || {};
+      resumableFile.opts.target = res.data;
+      resumableFile.formData['replace'] = 1;
+      resumableFile.formData['target_file'] = `${parentDir}${resumableFile.fileName}`;
+      pushAndStart();
     }).catch(error => {
       toaster.danger(Utils.getErrorMsg(error));
       // The file was pulled from the resumable queue before the link fetch; a
@@ -653,33 +668,47 @@ class FileUploader extends React.Component {
 
     this.setUploadFileList(this.resumable.files);
 
-    // Fetch the session upload link EXACTLY ONCE and reuse it for every file,
-    // including files added after the upload has already started. Re-fetching
-    // mints a brand-new upload token and overwrites the shared
-    // this.resumable.opts.target; any file still in flight then has its remaining
-    // chunks rerouted to a different server-side tracker (the tracker is keyed by
-    // token), splitting the upload across two trackers so neither ever reaches
-    // contiguity and the file never finalizes. This is the "add the big file
-    // first, then add more files" failure: the previously-unguarded single-file
-    // branch re-minted a token under the in-flight big file. Files added later
-    // are picked up automatically by the already-running upload queue.
-    if (this.isUploadLinkLoaded) {
-      return;
-    }
-    this.isUploadLinkLoaded = true;
-    let { repoID, path } = this.props;
-    seafileAPI.getFileServerUploadLink(repoID, path).then(res => {
-      this.resumable.opts.target = res.data + '?ret-json=1';
-      if (isFile && files.length === 1) {
+    // Kick the queue only AFTER the shared upload target is set (see
+    // ensureUploadTargetReady). A single file resumes from its uploaded-bytes
+    // offset; a batch just starts the queue and later files are picked up by it.
+    const isSingleFile = isFile && files.length === 1;
+    this.ensureUploadTargetReady().then(() => {
+      if (isSingleFile) {
         this.resumableUpload(resumableFile);
       } else {
         this.resumable.upload();
       }
     }).catch(error => {
-      this.isUploadLinkLoaded = false;
-      let errMessage = this.getAxiosErrorMessage(error);
-      toaster.danger(errMessage);
+      toaster.danger(this.getAxiosErrorMessage(error));
     });
+  };
+
+  // ensureUploadTargetReady fetches the session upload link EXACTLY ONCE per batch
+  // and sets the shared this.resumable.opts.target, returning a cached promise that
+  // resolves when the target is set. Fetching once matters: re-minting a token and
+  // overwriting the shared target reroutes any in-flight file onto a different
+  // server-side tracker (keyed by token), splitting it across two trackers so it
+  // never finalizes. Both onFileAdded and the duplicate-resolution flow await this
+  // so no file is ever POSTed to the empty default target (→ 405 on the page URL).
+  ensureUploadTargetReady = () => {
+    if (this._uploadTargetPromise) {
+      return this._uploadTargetPromise;
+    }
+    this.isUploadLinkLoaded = true;
+    const { repoID, path } = this.props;
+    this._uploadTargetPromise = seafileAPI.getFileServerUploadLink(repoID, path).then(res => {
+      // Set once; never overwrite an existing target (would reroute in-flight uploads).
+      if (!this.resumable.opts.target) {
+        this.resumable.opts.target = res.data + '?ret-json=1';
+      }
+      return this.resumable.opts.target;
+    }).catch(error => {
+      // Allow a later add/retry to try again.
+      this.isUploadLinkLoaded = false;
+      this._uploadTargetPromise = null;
+      throw error;
+    });
+    return this._uploadTargetPromise;
   };
 
   resumableUpload = (resumableFile) => {
@@ -1013,8 +1042,9 @@ class FileUploader extends React.Component {
 
   onComplete = () => {
     this.notifiedFolders = [];
-    // reset upload link loaded
+    // reset upload link loaded + cached target promise so the next batch re-fetches
     this.isUploadLinkLoaded = false;
+    this._uploadTargetPromise = null;
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
   };
 
@@ -1028,6 +1058,7 @@ class FileUploader extends React.Component {
     // token and split an in-flight upload across trackers.
     if (!this.resumable || !this.resumable.isUploading()) {
       this.isUploadLinkLoaded = false;
+      this._uploadTargetPromise = null;
     }
   };
 
@@ -1102,8 +1133,9 @@ class FileUploader extends React.Component {
     this.resumable.files = [];
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
-    // reset upload link loaded
+    // reset upload link loaded + cached target promise so the next batch re-fetches
     this.isUploadLinkLoaded = false;
+    this._uploadTargetPromise = null;
     // Drop any undecided duplicates and the bulk choice so the next session starts clean.
     this.pendingDuplicates = [];
     this.duplicateBulkAction = null;
@@ -1160,8 +1192,9 @@ class FileUploader extends React.Component {
     });
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
-    // reset upload link loaded
+    // reset upload link loaded + cached target promise so the next batch re-fetches
     this.isUploadLinkLoaded = false;
+    this._uploadTargetPromise = null;
   };
 
   onUploadRetry = (resumableFile) => {
@@ -1281,6 +1314,9 @@ class FileUploader extends React.Component {
         </div>
         {this.state.isUploadRemindDialogShow &&
           <UploadRemindDialog
+            // key by file so the dialog remounts per duplicate — a checked
+            // "apply to all" never leaks into the next prompt.
+            key={this.state.currentResumableFile && this.state.currentResumableFile.uniqueIdentifier}
             currentResumableFile={this.state.currentResumableFile}
             replaceRepetitionFile={this.replaceRepetitionFile}
             uploadFile={this.uploadFile}
