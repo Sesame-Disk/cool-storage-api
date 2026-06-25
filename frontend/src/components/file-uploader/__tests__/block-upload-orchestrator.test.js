@@ -1,4 +1,4 @@
-import { uploadFileViaBlocks } from '../block-upload-orchestrator';
+import { isStallError, uploadFileViaBlocks } from '../block-upload-orchestrator';
 
 jest.mock('../../../utils/seafile-api', () => ({ seafileAPI: {} }));
 jest.mock('../../../utils/constants', () => ({ enableBlockUpload: true, blockUploadThresholdMB: 64 }));
@@ -40,8 +40,10 @@ describe('uploadFileViaBlocks', () => {
       repoID: 'r1', parentDir: '/', api, hashFn, concurrency: 2, blockSize: 50,
     });
 
-    expect(api.createBlockUploadSession).toHaveBeenCalledWith('r1', '/');
-    expect(api.checkBlocks).toHaveBeenCalledWith(['h0', 'h1'], 'sess1');
+    // Control-plane calls now carry a bounded timeout so a half-open socket can't
+    // hang the flow forever.
+    expect(api.createBlockUploadSession).toHaveBeenCalledWith('r1', '/', expect.objectContaining({ timeout: expect.any(Number) }));
+    expect(api.checkBlocks).toHaveBeenCalledWith(['h0', 'h1'], 'sess1', expect.objectContaining({ timeout: expect.any(Number) }));
     // Only the block reported missing is uploaded (dedup/resume).
     expect(uploaded).toEqual(['h1']);
     expect(api.uploadBlock).toHaveBeenCalledTimes(1);
@@ -190,5 +192,67 @@ test('aborts before starting when the caller signal is already cancelled', async
   ).rejects.toHaveProperty('name', 'AbortError');
 
   expect(api.createBlockUploadSession).not.toHaveBeenCalled();
+});
+
+describe('phase reporting (onPhase)', () => {
+  test('emits hashing -> uploading -> saving in order', async () => {
+    const phases = [];
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: ['h0'] } }),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '10' }] }),
+    };
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha1: 's0', sha256: 'h0', size: 10 }], size: 10 });
+
+    await uploadFileViaBlocks(makeFile(10), {
+      repoID: 'r', api, hashFn, blockSize: 50, onPhase: (p) => phases.push(p),
+    });
+
+    expect(phases).toEqual(['hashing', 'uploading', 'saving']);
+  });
+});
+
+describe('stall watchdog', () => {
+  test('a stalled block upload is retried (not treated as a user cancel) and then succeeds', async () => {
+    let attempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: ['h0'] } }),
+      // First attempt never resolves until the watchdog aborts its signal; the
+      // retry resolves normally. This is the "connection dropped mid-block" case.
+      uploadBlock: jest.fn().mockImplementation((session, hash, data, config) => {
+        attempt += 1;
+        if (attempt === 1) {
+          return new Promise((_resolve, reject) => {
+            config.signal.addEventListener('abort', () => {
+              const err = new Error('canceled');
+              err.name = 'AbortError';
+              reject(err);
+            });
+          });
+        }
+        return Promise.resolve({ data: {} });
+      }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '10' }] }),
+    };
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha1: 's0', sha256: 'h0', size: 10 }], size: 10 });
+
+    const res = await uploadFileViaBlocks(makeFile(10), {
+      repoID: 'r', api, hashFn, blockSize: 50, retries: 3,
+      blockStallTimeoutMs: 20, // tiny so the first attempt's stall fires fast
+    });
+
+    expect(attempt).toBe(2); // stalled once, retried once, succeeded
+    expect(res[0].name).toBe('f');
+  });
+
+  test('isStallError distinguishes a stall from an abort', () => {
+    const stall = new Error('x'); stall.name = 'StallTimeoutError';
+    const abort = new Error('y'); abort.name = 'AbortError';
+    expect(isStallError(stall)).toBe(true);
+    expect(isStallError(abort)).toBe(false);
+    expect(isStallError(null)).toBe(false);
+  });
 });
 

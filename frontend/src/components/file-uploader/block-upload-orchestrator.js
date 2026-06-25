@@ -15,6 +15,26 @@ export const BLOCK_SIZE = 8 * 1024 * 1024; // must match backend WebUploadBlockS
 // Max hashes per /blocks/check request — must stay under the server cap (10000).
 const CHECK_BATCH_SIZE = 5000;
 
+// axios defaults to timeout:0 (wait forever). A control-plane call (session,
+// check, commit) transfers little data and should never hang a multi-GB upload
+// indefinitely on a half-open socket, so cap it.
+export const CONTROL_PLANE_TIMEOUT_MS = 120000;
+
+// Commits can legitimately run much longer than session/check because the server
+// may need to verify a large manifest, promote refs and serialize metadata.
+export const COMMIT_TIMEOUT_MS = 300000;
+
+// A single block upload has no hard time bound (8 MB over a slow link can be
+// slow but healthy), so instead of a fixed timeout it is guarded by an
+// inactivity watchdog: if NO bytes move for this long the request is aborted and
+// retried. This is what turns a silently dropped connection ("Saving..." forever)
+// into a bounded retry instead of an infinite hang.
+export const BLOCK_STALL_TIMEOUT_MS = 30000;
+
+// Once the browser has finished sending a block, give the backend/S3 path extra
+// time to acknowledge it before treating the request as a retryable timeout.
+const BLOCK_RESPONSE_TIMEOUT_MS = 120000;
+
 function createAbortError() {
   if (typeof DOMException === 'function') {
     return new DOMException('Upload aborted', 'AbortError');
@@ -30,6 +50,123 @@ export function isAbortError(error) {
     || error.code === 'ERR_CANCELED'
     || error.code === 'ABORT_ERR'
   );
+}
+
+// A stall is NOT a user abort: it must be retried, not treated as a cancellation.
+// We give it its own error name so withRetry retries it and runBlockUpload does
+// not mistake it for a deliberate cancel.
+export function isStallError(error) {
+  return Boolean(error) && error.name === 'StallTimeoutError';
+}
+
+function createStallError() {
+  const error = new Error('Upload stalled: no progress');
+  error.name = 'StallTimeoutError';
+  return error;
+}
+
+function createBlockResponseTimeoutError() {
+  const error = new Error('Block upload timed out waiting for server response');
+  error.name = 'BlockResponseTimeoutError';
+  return error;
+}
+
+function isRequestTimeoutError(error) {
+  if (!error) {
+    return false;
+  }
+  if (error.code === 'ECONNABORTED') {
+    return true;
+  }
+  return String(error.message || '').toLowerCase().includes('timeout');
+}
+
+// uploadBlockWithStallGuard uploads one block and aborts+rejects it if no bytes
+// move for `stallMs`. axios will not time out a half-open socket on its own
+// (timeout:0), so without this a dropped connection mid-block hangs the whole
+// file forever with no error and no retry. On a stall it rejects with a
+// StallTimeoutError (NOT an AbortError) so the caller's retry loop kicks in; a
+// real user cancel still propagates through the chained outer signal.
+function uploadBlockWithStallGuard(api, session, hash, data, {
+  signal,
+  stallMs,
+  responseTimeoutMs,
+  onTransferProgress,
+}) {
+  const canAbort = typeof AbortController === 'function';
+  if (!stallMs || stallMs <= 0 || !canAbort) {
+    return signal ? api.uploadBlock(session, hash, data, { signal }) : api.uploadBlock(session, hash, data);
+  }
+
+  const controller = new AbortController();
+  let onOuterAbort;
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      onOuterAbort = () => controller.abort();
+      signal.addEventListener('abort', onOuterAbort, { once: true });
+    }
+  }
+
+  let timeoutError = null;
+  let timer;
+  const blockBytes = (
+    data && typeof data.byteLength === 'number'
+      ? data.byteLength
+      : (data && typeof data.size === 'number' ? data.size : 0)
+  );
+  let lastLoaded = 0;
+  const armTimer = (timeoutMs, errorFactory) => {
+    window.clearTimeout(timer);
+    if (!timeoutMs || timeoutMs <= 0) {
+      return;
+    }
+    timer = window.setTimeout(() => {
+      timeoutError = errorFactory();
+      controller.abort();
+    }, timeoutMs);
+  };
+  armTimer(stallMs, createStallError);
+
+  const config = {
+    signal: controller.signal,
+    // Every progress event = bytes are still moving → reset the watchdog.
+    onUploadProgress: (event) => {
+      const loaded = Math.max(lastLoaded, Number(event && event.loaded) || 0);
+      const delta = Math.max(0, loaded - lastLoaded);
+      if (delta > 0 && onTransferProgress) {
+        onTransferProgress(delta);
+      }
+      lastLoaded = loaded;
+
+      const totalBytes = Math.max(blockBytes, Number(event && event.total) || 0);
+      if (totalBytes > 0 && loaded >= totalBytes) {
+        armTimer(responseTimeoutMs, createBlockResponseTimeoutError);
+        return;
+      }
+
+      armTimer(stallMs, createStallError);
+    },
+  };
+
+  return api.uploadBlock(session, hash, data, config)
+    .then((res) => res)
+    .catch((err) => {
+      // The abort we triggered for a timeout surfaces as a cancel; rethrow it as
+      // a retryable transport timeout instead so it is not swallowed as a user
+      // cancellation.
+      if (timeoutError && !(signal && signal.aborted)) {
+        throw timeoutError;
+      }
+      throw err;
+    })
+    .finally(() => {
+      window.clearTimeout(timer);
+      if (signal && onOuterAbort) {
+        signal.removeEventListener('abort', onOuterAbort);
+      }
+    });
 }
 
 function throwIfAborted(signal) {
@@ -172,7 +309,7 @@ async function withRetry(fn, attempts, { signal } = {}) {
 // using a fixed pool of workers that pull from a shared cursor.
 // `getBlockData(index)` returns a Promise of the raw bytes for that block.
 async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockData, {
-  api, concurrency, retries, onBlockUploaded, signal,
+  api, concurrency, retries, onBlockUploaded, onTransferProgress, signal, stallMs, responseTimeoutMs,
 }) {
   let cursor = 0;
   let uploadedCount = 0;
@@ -190,7 +327,12 @@ async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockD
         throwIfAborted(signal);
         const data = await getBlockData(index);
         throwIfAborted(signal);
-        return signal ? api.uploadBlock(session, hash, data, { signal }) : api.uploadBlock(session, hash, data);
+        return uploadBlockWithStallGuard(api, session, hash, data, {
+          signal,
+          stallMs,
+          responseTimeoutMs,
+          onTransferProgress,
+        });
       }, retries, { signal });
       uploadedCount += 1;
       if (onBlockUploaded) onBlockUploaded(uploadedCount, missing.length);
@@ -233,20 +375,18 @@ function isCommitInProgress(err) {
 // in progress" 409 with bounded exponential backoff. Every other outcome (success,
 // needs_upload conflict, permanent 409, abort, other errors) is returned/thrown to
 // the caller unchanged so the existing needs_upload path and fallbacks still work.
-async function commitFromManifest(api, repoID, manifest, { signal, attempts, baseMs }) {
+async function commitFromManifest(api, repoID, manifest, { signal, attempts, baseMs, timeout }) {
   let lastErr;
   for (let i = 1; i <= attempts; i += 1) {
     throwIfAborted(signal);
     try {
       // eslint-disable-next-line no-await-in-loop
-      const resp = signal
-        ? await api.createFileFromBlocks(repoID, manifest, { signal })
-        : await api.createFileFromBlocks(repoID, manifest);
+      const resp = await api.createFileFromBlocks(repoID, manifest, { signal, timeout });
       return resp.data;
     } catch (err) {
       lastErr = err;
       if (isAbortError(err) || (signal && signal.aborted)) throw err;
-      if (isCommitInProgress(err) && i < attempts) {
+      if ((isCommitInProgress(err) || isRequestTimeoutError(err)) && i < attempts) {
         // eslint-disable-next-line no-await-in-loop
         await waitWithAbort(Math.min(baseMs * 2 ** (i - 1), 5000), signal);
         // eslint-disable-next-line no-continue
@@ -273,22 +413,36 @@ export async function uploadFileViaBlocks(file, {
   retries = 3,
   commitRetries = 6,
   commitRetryBaseMs = 500,
+  blockStallTimeoutMs = BLOCK_STALL_TIMEOUT_MS,
+  blockResponseTimeoutMs = BLOCK_RESPONSE_TIMEOUT_MS,
+  controlPlaneTimeoutMs = CONTROL_PLANE_TIMEOUT_MS,
+  commitTimeoutMs = COMMIT_TIMEOUT_MS,
   onHashProgress,
   onUploadProgress,
+  onTransferProgress,
+  onPhase,
   signal,
 } = {}) {
   if (!repoID) throw new Error('repoID is required');
   const name = filename || file.name;
+  // Control-plane (session/check/commit) config: bound the wait so a half-open
+  // socket cannot hang the flow forever. signal may be undefined (axios ignores it).
+  const ctrlConfig = { signal, timeout: controlPlaneTimeoutMs };
+
+  // emitPhase reports the coarse flow phase ('hashing' | 'uploading' | 'saving')
+  // so the UI can render an accurate state instead of inferring it from the
+  // legacy resumable.js chunk/remainingTime heuristics (which do not apply to a
+  // block-upload entry and otherwise read as "Saving..." the whole time).
+  const emitPhase = (phase) => { if (onPhase) onPhase(phase); };
 
   throwIfAborted(signal);
 
   // 1. Server-issued session.
-  const sessionResp = signal
-    ? await api.createBlockUploadSession(repoID, parentDir, { signal })
-    : await api.createBlockUploadSession(repoID, parentDir);
+  const sessionResp = await api.createBlockUploadSession(repoID, parentDir, ctrlConfig);
   const session = sessionResp.data.session_id;
 
   // 2. Hash blocks off the main thread.
+  emitPhase('hashing');
   const { blocks, size } = await hashFn(file, { blockSize, onProgress: onHashProgress, signal });
   const blockIndexByHash = {};
   blocks.forEach((b) => { blockIndexByHash[b.sha256] = b.index; });
@@ -307,9 +461,7 @@ export async function uploadFileViaBlocks(file, {
     throwIfAborted(signal);
     const batch = uniqueHashes.slice(i, i + CHECK_BATCH_SIZE);
     // eslint-disable-next-line no-await-in-loop
-    const checkResp = signal
-      ? await api.checkBlocks(batch, session, { signal })
-      : await api.checkBlocks(batch, session);
+    const checkResp = await api.checkBlocks(batch, session, ctrlConfig);
     const batchMissing = (checkResp.data && checkResp.data.missing) || [];
     for (let j = 0; j < batchMissing.length; j += 1) {
       missing.push(batchMissing[j]);
@@ -317,8 +469,16 @@ export async function uploadFileViaBlocks(file, {
   }
 
   // 4. Upload missing blocks.
+  emitPhase('uploading');
   await uploadMissingBlocks(session, missing, blockIndexByHash, getBlockData, {
-    api, concurrency, retries, onBlockUploaded: onUploadProgress, signal,
+    api,
+    concurrency,
+    retries,
+    onBlockUploaded: onUploadProgress,
+    onTransferProgress,
+    signal,
+    stallMs: blockStallTimeoutMs,
+    responseTimeoutMs: blockResponseTimeoutMs,
   });
 
   // 5. Commit from the ordered manifest. If the server reports some blocks are
@@ -332,9 +492,10 @@ export async function uploadFileViaBlocks(file, {
     blocks: buildManifest(blocks),
   };
 
-  const commitOpts = { signal, attempts: commitRetries, baseMs: commitRetryBaseMs };
+  const commitOpts = { signal, attempts: commitRetries, baseMs: commitRetryBaseMs, timeout: commitTimeoutMs };
   try {
     throwIfAborted(signal);
+    emitPhase('saving');
     return await commitFromManifest(api, repoID, manifest, commitOpts);
   } catch (err) {
     // The winner of a concurrent commit finishes the file; "commit still in
@@ -343,10 +504,19 @@ export async function uploadFileViaBlocks(file, {
     // (race / orphan) — re-upload exactly those once and retry the commit.
     const needs = err && err.response && err.response.data && err.response.data.needs_upload;
     if (Array.isArray(needs) && needs.length > 0) {
+      emitPhase('uploading');
       await uploadMissingBlocks(session, needs, blockIndexByHash, getBlockData, {
-        api, concurrency, retries, onBlockUploaded: onUploadProgress, signal,
+        api,
+        concurrency,
+        retries,
+        onBlockUploaded: onUploadProgress,
+        onTransferProgress,
+        signal,
+        stallMs: blockStallTimeoutMs,
+        responseTimeoutMs: blockResponseTimeoutMs,
       });
       throwIfAborted(signal);
+      emitPhase('saving');
       return await commitFromManifest(api, repoID, manifest, commitOpts);
     }
     throw err;

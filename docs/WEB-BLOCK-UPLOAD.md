@@ -412,6 +412,48 @@ These are acceptable for a flag-gated rollout and are the polish items for a
 follow-up. **Still pending: browser end-to-end validation** (`docker compose up`
 + `npm start`, enable `enableBlockUpload`).
 
+## Frontend re-implementation from main (small auditable PRs)
+
+An earlier branch `fix/web-block-upload-frontend-state-and-stall` fixed several of the
+gaps above but over-refactored `file-uploader.js` and introduced regressions (per-file
+block concurrency, duplicate/stale dialog rows, mixed sources of truth). It is kept only
+as **reference**; the fixes are being re-applied cleanly from `main` in small PRs, each
+leaving `npm test` + lint + build green and the legacy resumable path untouched.
+
+**Finding — "legacy retry can start without a shared upload target" does NOT exist on
+`main`; it was self-inflicted by the reference branch.** On `main`,
+`this.resumable.opts.target` is only ever *written* (unconditionally on a new batch when
+`isUploadLinkLoaded` is false, in `onFileAdded`) or read — it is **never cleared to
+`''`**. So a legacy retry always reuses the last valid token. The reference branch added
+`resetSharedUploadTarget({ clearTarget: true })` (clearing the target in
+`onError`/`onComplete`/etc.), which *created* the empty-target window that
+`withSharedTargetForLegacyRetry` then had to guard. The genuine fix from those commits
+(single-fetch session-link reuse; never re-mint a token under an in-flight upload) is
+**already in `main`** via the `isUploadLinkLoaded` guard in `onFileAdded`. So the
+retry-target machinery is **not** ported, and the upcoming duplicate/single-source work
+must **not** reintroduce any target clearing.
+
+**PR1 — block phase / bitrate / watchdog (done; behind flag).**
+- Closed: false `Saving…` at 3% / missing per-row Cancel — block entries now carry an
+  explicit `_phase` (`hashing→uploading→saving→done`); `isFileSaving` is true only in
+  `saving`. Tests: `upload-finalization.test.js` "block-upload entry state (isFileSaving)".
+- Closed: silent infinite hang on a dropped connection — two-phase watchdog in the
+  orchestrator (`BLOCK_STALL_TIMEOUT_MS` 30s / `BLOCK_RESPONSE_TIMEOUT_MS` 120s /
+  `CONTROL_PLANE_TIMEOUT_MS` / `COMMIT_TIMEOUT_MS`, retryable `StallTimeoutError`).
+  Tests: `block-upload-orchestrator.test.js` "stall watchdog" + "phase reporting".
+- Closed: `0.00 B/s` for block files — real wire bytes via `onTransferProgress` →
+  `sampleBlockUploadBitrate` / `aggregateBlockUploadBitrate`, summed with the isolated
+  `legacyUploadBitrate` in `calculateUploadBitrate`. Tests: `upload-finalization.test.js`
+  "block-upload throughput" + `file-uploader.test.js` "does not fake block bitrate…".
+- Closed: `setUploadFileList` dropped in-flight block entries — `mergeUploadFileList`
+  unions resumable files with block entries (deduped by `uniqueIdentifier`). Test:
+  "preserves block entries when a legacy upload is added later".
+- Cancel-All now cancels every `!isSaved` entry (incl. a block at 100% in commit). Test:
+  "cancel all still aborts a block upload that is already in saving at 100%".
+- Pending (next PRs): global adaptive block concurrency (static ceiling from
+  `simultaneous_uploads` first, then adaptive ramp); single-source upload list +
+  duplicate-name prompt for batch/large; broader browser E2E with the flag on.
+
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
 None of these block merging the branch: the flow ships **disabled** in every prod
