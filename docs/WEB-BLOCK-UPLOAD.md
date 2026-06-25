@@ -522,12 +522,24 @@ must **not** reintroduce any target clearing.
   now `enqueueBlockUpload(entry, file)` instead of calling `runBlockUpload` directly;
   `drainBlockUploadQueue` starts the next file only when none is active. `runBlockUpload`
   returns its settled promise so the queue advances on success, handled error, or cancel
-  (it never rejects). Cancelling a queued file removes it (`removeQueuedBlockUpload`, it
-  never started); cancelling the active file aborts it via `entry.cancel()` and the queue
-  advances; dialog close / cancel-all `clearBlockUploadQueue()` (queue + active marker).
+  (it never rejects); `drainBlockUploadQueue` also guards a synchronous throw so a future
+  bug cannot strand `activeBlockUpload` and wedge the queue.
+- `enqueueBlockUpload` is **idempotent per entry (object identity)** — a double Retry /
+  Retry-All cannot enqueue the same file twice and open two CAS sessions.
+  `removeQueuedBlockUpload` also matches by identity (not `uniqueIdentifier`), so
+  re-uploading the same filename in a later batch is never removed by accident.
+- Cancellation: cancelling a queued file removes it (it never started); cancelling the
+  active file aborts it via `entry.cancel()` and the queue advances when its promise
+  settles. **Dialog close / cancel-all `clearBlockUploadQueue()` drops only the PENDING
+  queue — it does NOT null `activeBlockUpload`.** The active file is being torn down
+  (aborted) but its promise may not have reached the `finally` yet; nulling the marker
+  early would let a freshly-added file start mid-teardown and break the
+  one-active-at-a-time guarantee. The marker is released solely by the active job's own
+  `finally`.
 - Tests: `file-uploader.test.js` "block upload file-level queue (serialization)" — one
-  active at a time + advance on settle; cancelling a queued file removes it; close clears
-  queue + active.
+  active at a time + advance on settle; cancelling a queued file removes it; close keeps
+  the active marker until the cancelled job settles; a new file added during the abort
+  window waits; idempotent enqueue.
 - Pending (next PR): PR4 single-source upload list + duplicate-name prompt for
   batch/large; broader browser E2E with the flag on.
 

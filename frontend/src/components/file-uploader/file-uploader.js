@@ -327,9 +327,22 @@ class FileUploader extends React.Component {
   // enqueueBlockUpload / drainBlockUploadQueue serialize block (CAS) uploads to ONE
   // active file at a time. The block-level limiter still bounds concurrency WITHIN the
   // active file; this only governs how many block FILES run at once (exactly one).
+  // Idempotent per entry (by object identity): a double Retry / Retry-All, or events
+  // firing before React removes the item from retryFileList, must not enqueue the same
+  // entry twice and open two CAS sessions for one file.
   enqueueBlockUpload = (entry, file) => {
+    if (!entry) {
+      return false;
+    }
+    if (this.activeBlockUpload && this.activeBlockUpload.entry === entry) {
+      return false; // already running
+    }
+    if (this.blockUploadQueue.some(job => job.entry === entry)) {
+      return false; // already waiting
+    }
     this.blockUploadQueue.push({ entry, file });
     this.drainBlockUploadQueue();
+    return true;
   };
 
   drainBlockUploadQueue = () => {
@@ -342,8 +355,15 @@ class FileUploader extends React.Component {
     }
     this.activeBlockUpload = job;
     // runBlockUpload resolves on success, handled error, or cancel (it never rejects),
-    // so the queue always advances. Promise.resolve guards the mocked-in-tests case.
-    Promise.resolve(this.runBlockUpload(job.entry, job.file)).finally(() => {
+    // so the queue always advances. Guard a synchronous throw before the promise is
+    // returned so a future bug cannot strand activeBlockUpload and wedge the queue.
+    let promise;
+    try {
+      promise = this.runBlockUpload(job.entry, job.file);
+    } catch (error) {
+      promise = Promise.reject(error);
+    }
+    Promise.resolve(promise).finally(() => {
       if (this.activeBlockUpload === job) {
         this.activeBlockUpload = null;
       }
@@ -352,18 +372,21 @@ class FileUploader extends React.Component {
   };
 
   // removeQueuedBlockUpload drops a not-yet-started block file from the queue (it never
-  // ran, so there is nothing to abort). The active file is cancelled via entry.cancel().
+  // ran, so there is nothing to abort). Matched by object identity so re-uploading the
+  // same filename in a later batch (a different entry) is not removed by accident. The
+  // active file is cancelled via entry.cancel().
   removeQueuedBlockUpload = (item) => {
-    this.blockUploadQueue = this.blockUploadQueue.filter(
-      job => job.entry.uniqueIdentifier !== item.uniqueIdentifier
-    );
+    this.blockUploadQueue = this.blockUploadQueue.filter(job => job.entry !== item);
   };
 
-  // clearBlockUploadQueue wipes the file-level queue and the active marker (dialog
-  // close / cancel-all). In-flight requests are aborted by the entries' own cancel().
+  // clearBlockUploadQueue drops every PENDING block file (dialog close / cancel-all).
+  // It deliberately does NOT clear activeBlockUpload: the active file is being aborted
+  // via entry.cancel() but its promise may not have reached the finally yet, so nulling
+  // the marker here would let a freshly-added file start while the old one is still
+  // tearing down — breaking the one-active-at-a-time guarantee. The marker is released
+  // only by the active job's own finally.
   clearBlockUploadQueue = () => {
     this.blockUploadQueue = [];
-    this.activeBlockUpload = null;
   };
 
   // createBlockUploadEntry builds a resumable-file-shaped adapter so the existing

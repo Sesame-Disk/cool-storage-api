@@ -574,7 +574,7 @@ describe('FileUploader block upload file-level queue (serialization)', () => {
     expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(a, a.file);
   });
 
-  test('closing the dialog clears the queue and the active marker', async () => {
+  test('closing the dialog clears queued jobs but keeps the active marker until it settles', async () => {
     const uploader = createUploader();
     const deferreds = withDeferredRunBlockUpload(uploader);
     const a = makeQueueEntry('a');
@@ -587,11 +587,50 @@ describe('FileUploader block upload file-level queue (serialization)', () => {
     expect(uploader.blockUploadQueue.length).toBe(1);
 
     uploader.onCloseUploadDialog();
+    // Pending jobs are dropped, but the active (now-cancelled) job still owns the slot
+    // until its promise settles, so nothing new can start mid-teardown.
     expect(uploader.blockUploadQueue.length).toBe(0);
-    expect(uploader.activeBlockUpload).toBe(null);
+    expect(uploader.activeBlockUpload).not.toBe(null);
 
-    deferreds[0].resolve(); // a settling must not resurrect b
+    deferreds[0].resolve(); // active settles → marker released, queue empty
     await settle();
+    expect(uploader.activeBlockUpload).toBe(null);
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1); // b (removed) never ran
+  });
+
+  test('cancel-all/close does not start a new block file until the cancelled active one settles', async () => {
+    const uploader = createUploader();
+    const deferreds = withDeferredRunBlockUpload(uploader);
+    const a = makeQueueEntry('a');
+    const b = makeQueueEntry('b');
+    uploader.state.uploadFileList = [a];
+
+    uploader.enqueueBlockUpload(a, a.file); // active
     expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1);
+
+    uploader.onCancelAllUploading(); // clears pending queue; a is aborted but still settling
+    // A new upload arrives during the abort window.
+    uploader.enqueueBlockUpload(b, b.file);
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1); // b waits, NOT started
+
+    deferreds[0].resolve(); // old active finally settles → release slot
+    await settle();
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(b, b.file);
+  });
+
+  test('enqueueBlockUpload is idempotent for the same entry (no double CAS session)', () => {
+    const uploader = createUploader();
+    withDeferredRunBlockUpload(uploader);
+    const a = makeQueueEntry('a');
+    const b = makeQueueEntry('b');
+
+    expect(uploader.enqueueBlockUpload(a, a.file)).toBe(true); // becomes active
+    expect(uploader.enqueueBlockUpload(a, a.file)).toBe(false); // already active → skipped
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1);
+
+    expect(uploader.enqueueBlockUpload(b, b.file)).toBe(true); // queued
+    expect(uploader.enqueueBlockUpload(b, b.file)).toBe(false); // already queued → skipped
+    expect(uploader.blockUploadQueue.length).toBe(1);
   });
 });
