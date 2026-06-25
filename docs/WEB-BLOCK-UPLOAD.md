@@ -490,7 +490,12 @@ must **not** reintroduce any target clearing.
   hashing) are ignored.
 - Signals: `noteBitrate(aggregateBlockUploadBitrate)` fed from `file-uploader`'s
   `updateBlockUploadTransferredBytes` (real wire bytes, block-only — not the combined
-  legacy+block figure); `noteFailure()` called by the orchestrator when a block upload
+  legacy+block figure). It is fed **only on a fresh throttled sample**, not on every
+  progress tick: `updateBlockUploadTransferredBytes` checks whether
+  `sampleBlockUploadBitrate` actually advanced `entry._bitrateTs` (it produces at most
+  one reading per `BLOCK_BITRATE_SAMPLE_MS` = 500 ms) before calling `noteBitrate`, so a
+  burst of rapid progress events cannot count as many healthy samples and ramp the
+  ceiling up almost instantly. `noteFailure()` called by the orchestrator when a block upload
   attempt errors (stall/timeout/transport, not a user abort) — a strong "link
   unhealthy" signal that drops to 1. `reset()` returns to the conservative start (1).
 - Lowering the ceiling never aborts in-flight blocks (we cannot un-send a block); it
