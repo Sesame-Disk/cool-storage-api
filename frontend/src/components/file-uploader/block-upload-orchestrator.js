@@ -305,14 +305,38 @@ async function withRetry(fn, attempts, { signal } = {}) {
   throw lastErr;
 }
 
-// uploadMissingBlocks uploads the given block hashes with bounded concurrency
-// using a fixed pool of workers that pull from a shared cursor.
-// `getBlockData(index)` returns a Promise of the raw bytes for that block.
+// uploadMissingBlocks uploads the given block hashes, gating EACH block on a slot
+// from the shared global `limiter` so the total number of blocks on the wire across
+// ALL files never exceeds the configured ceiling. `getBlockData(index)` returns a
+// Promise of the raw bytes for that block.
+//
+// Anti-starvation: this file spawns at most `limiter.getMaxConcurrency()` workers
+// (NOT one waiter per block), and each worker re-acquires a slot AFTER finishing a
+// block — so it re-queues at the back of the limiter's FIFO and multiple files
+// interleave fairly instead of the first file holding every slot until it is done.
+// `getBlockData` (local byte read) runs OUTSIDE the slot; only the network upload
+// holds it. When no limiter is injected (unit tests) it falls back to a plain pool
+// of `concurrency` workers with no global gating.
 async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockData, {
-  api, concurrency, retries, onBlockUploaded, onTransferProgress, signal, stallMs, responseTimeoutMs,
+  api, concurrency, retries, onBlockUploaded, onTransferProgress, signal, stallMs, responseTimeoutMs, limiter,
 }) {
   let cursor = 0;
   let uploadedCount = 0;
+
+  const uploadOne = (hash, index) => withRetry(async () => {
+    throwIfAborted(signal);
+    const data = await getBlockData(index);
+    throwIfAborted(signal);
+    if (!limiter) {
+      return uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
+    }
+    const release = await limiter.acquire({ signal });
+    try {
+      return await uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
+    } finally {
+      release();
+    }
+  }, retries, { signal });
 
   const worker = async () => {
     for (;;) {
@@ -321,25 +345,17 @@ async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockD
       cursor += 1;
       if (i >= missing.length) return;
       const hash = missing[i];
-      const index = blockIndexByHash[hash];
       // eslint-disable-next-line no-await-in-loop
-      await withRetry(async () => {
-        throwIfAborted(signal);
-        const data = await getBlockData(index);
-        throwIfAborted(signal);
-        return uploadBlockWithStallGuard(api, session, hash, data, {
-          signal,
-          stallMs,
-          responseTimeoutMs,
-          onTransferProgress,
-        });
-      }, retries, { signal });
+      await uploadOne(hash, blockIndexByHash[hash]);
       uploadedCount += 1;
       if (onBlockUploaded) onBlockUploaded(uploadedCount, missing.length);
     }
   };
 
-  const poolSize = Math.min(concurrency, missing.length) || 0;
+  // Cap workers at the global ceiling (a single file may use every slot) without
+  // exceeding the number of blocks. No limiter → fall back to `concurrency`.
+  const cap = limiter ? limiter.getMaxConcurrency() : concurrency;
+  const poolSize = Math.min(cap || 1, missing.length) || 0;
   const workers = [];
   for (let w = 0; w < poolSize; w += 1) {
     workers.push(worker());
@@ -409,7 +425,12 @@ export async function uploadFileViaBlocks(file, {
   api = seafileAPI,
   hashFn = hashFileWithWorker,
   blockSize = BLOCK_SIZE,
-  concurrency = 3,
+  // Global per-component concurrency limiter shared across all block uploads; it
+  // bounds the TOTAL blocks on the wire to the configured ceiling. `concurrency` is
+  // only the fallback pool size when no limiter is injected (unit tests). No more
+  // hardcoded per-file "3" — production always injects `limiter`.
+  limiter = null,
+  concurrency = 1,
   retries = 3,
   commitRetries = 6,
   commitRetryBaseMs = 500,
@@ -473,6 +494,7 @@ export async function uploadFileViaBlocks(file, {
   await uploadMissingBlocks(session, missing, blockIndexByHash, getBlockData, {
     api,
     concurrency,
+    limiter,
     retries,
     onBlockUploaded: onUploadProgress,
     onTransferProgress,
@@ -508,6 +530,7 @@ export async function uploadFileViaBlocks(file, {
       await uploadMissingBlocks(session, needs, blockIndexByHash, getBlockData, {
         api,
         concurrency,
+        limiter,
         retries,
         onBlockUploaded: onUploadProgress,
         onTransferProgress,

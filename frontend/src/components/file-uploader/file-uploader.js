@@ -8,6 +8,7 @@ import { aggregateBlockUploadBitrate, clearFileUploadRuntimeState, getBaselineSi
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
+import { createBlockLimiter } from '../../utils/block-upload-limiter';
 import UploadProgressDialog from './upload-progress-dialog';
 import UploadRemindDialog from '../dialog/upload-remind-dialog';
 import toaster from '../toast';
@@ -70,6 +71,10 @@ class FileUploader extends React.Component {
     this.navigationGuard.attach();
     const configuredSimultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
     const simultaneousUploads = getInitialSimultaneousUploads(configuredSimultaneousUploads);
+    // Single GLOBAL block-upload limiter shared by every block (CAS) upload, so the
+    // total blocks on the wire across all files never exceed the configured ceiling
+    // (`simultaneous_uploads`). Static here; the adaptive ramp lands in a later PR.
+    this.blockLimiter = createBlockLimiter({ maxConcurrency: configuredSimultaneousUploads });
     this.resumable = new Resumablejs({
       target: '',
       query: this.setQuery || {},
@@ -426,6 +431,8 @@ class FileUploader extends React.Component {
       parentDir: path,
       filename: file.name,
       replace: false,
+      // Shared global ceiling: every block upload competes for the same slots.
+      limiter: this.blockLimiter,
       signal: abortController ? abortController.signal : undefined,
       onPhase: (phase) => this.setBlockUploadPhase(entry, phase),
       onHashProgress: (hashed, total) => this.updateBlockUploadProgress(entry, (total ? hashed / total : 0) * 0.5),
@@ -955,6 +962,9 @@ class FileUploader extends React.Component {
 
   onCloseUploadDialog = () => {
     this.cancelActiveUploads();
+    if (this.blockLimiter) {
+      this.blockLimiter.reset();
+    }
     this.loaded = 0;
     this.legacyUploadBitrate = 0;
     this.resumable.files = [];
@@ -1007,6 +1017,9 @@ class FileUploader extends React.Component {
 
     this.loaded = 0;
     this.legacyUploadBitrate = 0;
+    if (this.blockLimiter) {
+      this.blockLimiter.reset();
+    }
 
     this.setState({
       totalProgress: 100,
