@@ -333,6 +333,13 @@ async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockD
     const release = await limiter.acquire({ signal });
     try {
       return await uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
+    } catch (err) {
+      // A real upload failure (stall/timeout/transport) signals a degraded link, so
+      // tell the limiter to back off. A user abort is NOT a link problem.
+      if (limiter.noteFailure && !isAbortError(err) && !(signal && signal.aborted)) {
+        limiter.noteFailure();
+      }
+      throw err;
     } finally {
       release();
     }

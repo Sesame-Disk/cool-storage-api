@@ -381,6 +381,13 @@ class FileUploader extends React.Component {
     }
     entry._uploadedNetworkBytes = (Number(entry._uploadedNetworkBytes) || 0) + deltaBytes;
     sampleBlockUploadBitrate(entry, entry._uploadedNetworkBytes);
+    // Feed the GLOBAL block aggregate throughput into the adaptive limiter so it ramps
+    // the shared ceiling up while the link is healthy and backs off when it degrades.
+    // Block-only signal (not the combined legacy+block figure). Entries are mutated in
+    // place, so the current list already reflects the new per-entry bitrate.
+    if (this.blockLimiter) {
+      this.blockLimiter.noteBitrate(aggregateBlockUploadBitrate(this.state.uploadFileList));
+    }
     this.setState(prev => {
       const uploadFileList = prev.uploadFileList.map(item => (
         item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item

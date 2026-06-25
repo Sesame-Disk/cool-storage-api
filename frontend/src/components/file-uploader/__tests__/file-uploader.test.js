@@ -451,4 +451,28 @@ describe('FileUploader block upload integration', () => {
 
     expect(uploader.state.uploadBitrate).toBe(5000);
   });
+
+  test('feeds the global block aggregate into the adaptive limiter on transfer progress', () => {
+    const uploader = createUploader();
+    uploader.blockLimiter = { noteBitrate: jest.fn() };
+    const entry = {
+      uniqueIdentifier: 'block-1',
+      isBlockUpload: true,
+      isSaved: false,
+      error: null,
+      _phase: 'uploading',
+      _uploading: true,
+      _progress: 0.5,
+      progress: () => 0.5,
+      isUploading: () => true,
+    };
+    uploader.state.uploadFileList = [entry];
+
+    uploader.updateBlockUploadTransferredBytes(entry, 4096);
+
+    // The adaptive limiter is fed the block-only aggregate throughput (a number),
+    // so it can ramp the shared ceiling up/down based on real wire bytes.
+    expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(1);
+    expect(typeof uploader.blockLimiter.noteBitrate.mock.calls[0][0]).toBe('number');
+  });
 });

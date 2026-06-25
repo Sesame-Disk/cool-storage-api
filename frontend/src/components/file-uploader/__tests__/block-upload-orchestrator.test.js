@@ -265,6 +265,14 @@ describe('global concurrency limiter (shared across files)', () => {
     size: n,
   });
 
+  // The limiter starts adaptive at 1; feed healthy samples so it reaches `target`
+  // before the upload, to exercise the ceiling at >1 deterministically.
+  const rampTo = (limiter, target) => {
+    for (let i = 0; i < 100 && limiter.getEffective() < target; i += 1) {
+      limiter.noteBitrate(1000000);
+    }
+  };
+
   test('never exceeds the shared ceiling across multiple files (no N×max)', async () => {
     const track = { active: 0, peak: 0 };
     const api = {
@@ -278,6 +286,7 @@ describe('global concurrency limiter (shared across files)', () => {
       createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
     };
     const limiter = createBlockLimiter({ maxConcurrency: 2 });
+    rampTo(limiter, 2);
 
     await Promise.all([
       uploadFileViaBlocks(makeFile(4), { repoID: 'r', api, hashFn: hashOf('A', 4), blockSize: 1, limiter }),
@@ -285,10 +294,10 @@ describe('global concurrency limiter (shared across files)', () => {
       uploadFileViaBlocks(makeFile(4), { repoID: 'r', api, hashFn: hashOf('C', 4), blockSize: 1, limiter }),
     ]);
 
-    // 3 files × 4 blocks were uploaded, but never more than 2 at once globally.
+    // 3 files × 4 blocks were uploaded, concurrency reaches the ceiling but never
+    // exceeds it (proves the shared cap, not N×max).
     expect(api.uploadBlock).toHaveBeenCalledTimes(12);
-    expect(track.peak).toBeLessThanOrEqual(2);
-    expect(track.peak).toBeGreaterThan(0);
+    expect(track.peak).toBe(2);
     expect(limiter.getInFlight()).toBe(0);
   });
 
@@ -304,6 +313,7 @@ describe('global concurrency limiter (shared across files)', () => {
       createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
     };
     const limiter = createBlockLimiter({ maxConcurrency: 2 });
+    rampTo(limiter, 2);
 
     await Promise.all([
       uploadFileViaBlocks(makeFile(6), { repoID: 'r', api, hashFn: hashOf('A', 6), blockSize: 1, limiter }),
@@ -353,6 +363,33 @@ describe('global concurrency limiter (shared across files)', () => {
     await pA;
     expect(calls).toEqual(['A0']); // still only A even after the slot freed
     expect(limiter.getInFlight()).toBe(0);
+  });
+
+  test('a failed block upload tells the limiter to back off (noteFailure)', async () => {
+    let attempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn(() => {
+        attempt += 1;
+        if (attempt === 1) {
+          return Promise.reject(new Error('network'));
+        }
+        return Promise.resolve({ data: {} });
+      }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+    const limiter = {
+      acquire: jest.fn().mockResolvedValue(() => {}),
+      noteFailure: jest.fn(),
+      getMaxConcurrency: () => 1,
+    };
+
+    await uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 3 });
+
+    // The first attempt failed (non-abort) → limiter backs off; the retry succeeds.
+    expect(limiter.noteFailure).toHaveBeenCalledTimes(1);
+    expect(attempt).toBe(2);
   });
 });
 
