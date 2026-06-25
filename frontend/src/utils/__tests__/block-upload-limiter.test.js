@@ -2,9 +2,18 @@ import { createBlockLimiter } from '../block-upload-limiter';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-describe('createBlockLimiter (static global ceiling)', () => {
-  test('never lets more than max acquire at once; release wakes the next waiter FIFO', async () => {
+// Feed healthy throughput samples until the adaptive ceiling reaches `target`.
+const rampTo = (limiter, target) => {
+  for (let i = 0; i < 100 && limiter.getEffective() < target; i += 1) {
+    limiter.noteBitrate(1000000);
+  }
+};
+
+describe('createBlockLimiter (adaptive global ceiling)', () => {
+  test('never lets more than the live ceiling acquire at once; release wakes the next waiter FIFO', async () => {
     const limiter = createBlockLimiter({ maxConcurrency: 2 });
+    rampTo(limiter, 2); // climb from the conservative start (1) to the ceiling
+    expect(limiter.getEffective()).toBe(2);
     const r1 = await limiter.acquire({});
     const r2 = await limiter.acquire({});
     expect(limiter.getInFlight()).toBe(2);
@@ -79,16 +88,77 @@ describe('createBlockLimiter (static global ceiling)', () => {
     expect(createBlockLimiter({}).getMaxConcurrency()).toBe(1);
   });
 
-  test('reset rejects queued waiters and restores the ceiling', async () => {
-    const limiter = createBlockLimiter({ maxConcurrency: 1 });
-    const held = await limiter.acquire({});
-    const p = limiter.acquire({});
+  test('reset rejects queued waiters and returns to the conservative start (1)', async () => {
+    const limiter = createBlockLimiter({ maxConcurrency: 2 });
+    rampTo(limiter, 2);
+    expect(limiter.getEffective()).toBe(2);
+    const held1 = await limiter.acquire({}); // fill both slots
+    const held2 = await limiter.acquire({});
+    const p = limiter.acquire({}); // queues behind the 2 held slots
     await flush();
     expect(limiter.getWaiterCount()).toBe(1);
 
     limiter.reset();
     await expect(p).rejects.toHaveProperty('name', 'AbortError');
     expect(limiter.getWaiterCount()).toBe(0);
-    held();
+    expect(limiter.getEffective()).toBe(1); // back to the conservative start
+    held1();
+    held2();
+  });
+});
+
+describe('createBlockLimiter adaptive ramp', () => {
+  test('starts at 1 and climbs one step per run of healthy samples up to max', () => {
+    const limiter = createBlockLimiter({ maxConcurrency: 3 });
+    expect(limiter.getEffective()).toBe(1);
+
+    // 3 healthy samples ⇒ one ramp step (1→2).
+    limiter.noteBitrate(1000000);
+    limiter.noteBitrate(1000000);
+    expect(limiter.getEffective()).toBe(1);
+    limiter.noteBitrate(1000000);
+    expect(limiter.getEffective()).toBe(2);
+
+    // Another run ⇒ 2→3, then it caps at max.
+    limiter.noteBitrate(1000000);
+    limiter.noteBitrate(1000000);
+    limiter.noteBitrate(1000000);
+    expect(limiter.getEffective()).toBe(3);
+    rampTo(limiter, 4);
+    expect(limiter.getEffective()).toBe(3); // never above the configured ceiling
+  });
+
+  test('drops to 1 on a sustained bitrate collapse', () => {
+    const limiter = createBlockLimiter({ maxConcurrency: 3 });
+    rampTo(limiter, 3);
+    expect(limiter.getEffective()).toBe(3);
+
+    // A single dip is tolerated (jitter); a sustained collapse drops to 1.
+    limiter.noteBitrate(100000); // < 60% of the ~1e6 baseline
+    expect(limiter.getEffective()).toBe(3);
+    limiter.noteBitrate(100000);
+    expect(limiter.getEffective()).toBe(1);
+  });
+
+  test('noteFailure and noteRetry drop to 1 immediately', () => {
+    const a = createBlockLimiter({ maxConcurrency: 3 });
+    rampTo(a, 3);
+    a.noteFailure();
+    expect(a.getEffective()).toBe(1);
+
+    const b = createBlockLimiter({ maxConcurrency: 3 });
+    rampTo(b, 3);
+    b.noteRetry();
+    expect(b.getEffective()).toBe(1);
+  });
+
+  test('ignores zero/idle samples (pure-hashing phase neither ramps nor degrades)', () => {
+    const limiter = createBlockLimiter({ maxConcurrency: 3 });
+    rampTo(limiter, 2);
+    expect(limiter.getEffective()).toBe(2);
+    limiter.noteBitrate(0);
+    limiter.noteBitrate(0);
+    limiter.noteBitrate(0);
+    expect(limiter.getEffective()).toBe(2); // unchanged
   });
 });

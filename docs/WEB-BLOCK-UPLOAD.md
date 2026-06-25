@@ -475,12 +475,39 @@ must **not** reintroduce any target clearing.
   block) and each worker re-acquires at the back of the FIFO after every block, so
   files interleave instead of the first one monopolising the queue. Test: orchestrator
   "does not starve later files…".
-- STATIC ceiling here (`effective === max`); `setMax`/the adaptive ramp land in PR3.
+- STATIC ceiling here (`effective === max`); the adaptive ramp lands in PR3.
   The limiter is `reset()` on dialog close / cancel-all. Legacy resumable concurrency
   (`upload-finalization.js` adaptive engine) is untouched — block-only.
-- Pending (next PRs): PR3 adaptive ramp (1→max by bandwidth, →1 on degrade); PR4
-  single-source upload list + duplicate-name prompt for batch/large; broader browser
-  E2E with the flag on.
+
+**PR3 — adaptive ramp for the block limiter (done; behind flag).**
+- The limiter's live ceiling `effective` now starts at **1** and climbs one step per
+  run of healthy throughput samples up to `max`, and drops back to **1** on a
+  sustained bitrate collapse or a block failure/retry — matching the config intent
+  ("the adaptive client starts at 1 and can ramp up to this ceiling"). Sample-based
+  and deterministic (a "sample" is one `noteBitrate` call, throttled upstream to
+  ~one/500 ms): `RAMP_MIN_SAMPLES=3` healthy samples per +1 step, `DEGRADE_MIN_SAMPLES=2`
+  low samples (`< 0.6 × smoothed`) before dropping to 1; idle/zero samples (pure
+  hashing) are ignored.
+- Signals: `noteBitrate(aggregateBlockUploadBitrate)` fed from `file-uploader`'s
+  `updateBlockUploadTransferredBytes` (real wire bytes, block-only — not the combined
+  legacy+block figure). It is fed **only on a fresh throttled sample**, not on every
+  progress tick: `updateBlockUploadTransferredBytes` checks whether
+  `sampleBlockUploadBitrate` actually advanced `entry._bitrateTs` (it produces at most
+  one reading per `BLOCK_BITRATE_SAMPLE_MS` = 500 ms) before calling `noteBitrate`, so a
+  burst of rapid progress events cannot count as many healthy samples and ramp the
+  ceiling up almost instantly. `noteFailure()` called by the orchestrator when a block upload
+  attempt errors (stall/timeout/transport, not a user abort) — a strong "link
+  unhealthy" signal that drops to 1. `reset()` returns to the conservative start (1).
+- Lowering the ceiling never aborts in-flight blocks (we cannot un-send a block); it
+  just stops NEW acquires until `inFlight` falls below the new ceiling. Legacy
+  resumable adaptive concurrency remains untouched.
+- Tests: `block-upload-limiter.test.js` adaptive-ramp suite (climb 1→max, drop on
+  sustained collapse, `noteFailure`/`noteRetry` drop to 1, ignore idle); orchestrator
+  "a failed block upload tells the limiter to back off"; `file-uploader.test.js`
+  "feeds the global block aggregate into the adaptive limiter on transfer progress".
+- Pending (next PR): PR4 single-source upload list + duplicate-name prompt for
+  batch/large; broader browser E2E with the flag on (verify the ceiling ramps 1→`max`
+  on a healthy link and backs off on a throttled one).
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 

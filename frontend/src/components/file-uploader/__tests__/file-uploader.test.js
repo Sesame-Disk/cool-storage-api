@@ -451,4 +451,43 @@ describe('FileUploader block upload integration', () => {
 
     expect(uploader.state.uploadBitrate).toBe(5000);
   });
+
+  test('feeds the block limiter only on fresh bitrate samples, not every progress tick', () => {
+    jest.useFakeTimers();
+    try {
+      jest.setSystemTime(1000);
+      const uploader = createUploader();
+      uploader.blockLimiter = { noteBitrate: jest.fn() };
+      const entry = {
+        uniqueIdentifier: 'block-1',
+        isBlockUpload: true,
+        isSaved: false,
+        error: null,
+        _phase: 'uploading',
+        _uploading: true,
+        _progress: 0.5,
+        progress: () => 0.5,
+        isUploading: () => true,
+      };
+      uploader.state.uploadFileList = [entry];
+
+      // First call seeds the sampler (not a real sample): no limiter feed.
+      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
+
+      // Rapid progress ticks inside the 500ms throttle window reuse the same reading
+      // and must NOT count as new healthy samples (this is what made the ramp shoot up).
+      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
+
+      // After the window elapses, exactly one fresh sample is fed.
+      jest.setSystemTime(1600);
+      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(1);
+      expect(typeof uploader.blockLimiter.noteBitrate.mock.calls[0][0]).toBe('number');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
 });

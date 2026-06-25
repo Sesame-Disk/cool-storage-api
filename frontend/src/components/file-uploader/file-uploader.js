@@ -73,7 +73,8 @@ class FileUploader extends React.Component {
     const simultaneousUploads = getInitialSimultaneousUploads(configuredSimultaneousUploads);
     // Single GLOBAL block-upload limiter shared by every block (CAS) upload, so the
     // total blocks on the wire across all files never exceed the configured ceiling
-    // (`simultaneous_uploads`). Static here; the adaptive ramp lands in a later PR.
+    // (`simultaneous_uploads`). Adaptive: it starts at 1 and ramps up to that ceiling
+    // while the link stays healthy (fed by noteBitrate/noteFailure).
     this.blockLimiter = createBlockLimiter({ maxConcurrency: configuredSimultaneousUploads });
     this.resumable = new Resumablejs({
       target: '',
@@ -380,7 +381,20 @@ class FileUploader extends React.Component {
       return;
     }
     entry._uploadedNetworkBytes = (Number(entry._uploadedNetworkBytes) || 0) + deltaBytes;
+    // sampleBlockUploadBitrate is throttled to one fresh reading per
+    // BLOCK_BITRATE_SAMPLE_MS and only advances entry._bitrateTs when it actually
+    // produced a new sample. Feed the adaptive limiter ONLY on a fresh sample — not on
+    // every progress tick — otherwise a burst of rapid progress events would count as
+    // many "healthy samples" and ramp the shared ceiling up almost instantly, defeating
+    // the gradual 1→max climb. The first (seed) call has no prior timestamp, so it is
+    // not a real sample either. Block-only signal (not the combined legacy+block figure).
+    const bitrateTsBefore = entry._bitrateTs;
     sampleBlockUploadBitrate(entry, entry._uploadedNetworkBytes);
+    const freshBitrateSample = typeof bitrateTsBefore === 'number' && entry._bitrateTs !== bitrateTsBefore;
+    if (freshBitrateSample && this.blockLimiter) {
+      // Entries are mutated in place, so the current list already reflects the new bitrate.
+      this.blockLimiter.noteBitrate(aggregateBlockUploadBitrate(this.state.uploadFileList));
+    }
     this.setState(prev => {
       const uploadFileList = prev.uploadFileList.map(item => (
         item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
