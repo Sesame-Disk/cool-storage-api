@@ -505,9 +505,31 @@ must **not** reintroduce any target clearing.
   sustained collapse, `noteFailure`/`noteRetry` drop to 1, ignore idle); orchestrator
   "a failed block upload tells the limiter to back off"; `file-uploader.test.js`
   "feeds the global block aggregate into the adaptive limiter on transfer progress".
+- Pending (next PRs): PR3.5 file-level serialization; PR4 single-source upload list +
+  duplicate-name prompt for batch/large; broader browser E2E with the flag on (verify
+  the ceiling ramps 1→`max` on a healthy link and backs off on a throttled one).
+
+**PR3.5 — serialize block uploads to one active file at a time (done; behind flag).**
+- The block (CAS) flow now runs **one file at a time**: a file-level FIFO
+  (`this.blockUploadQueue` + `this.activeBlockUpload`) sits on top of the block-level
+  limiter. A single large file gets the full adaptive block-concurrency ceiling while
+  the others wait ("Waiting...", they render at progress 0), instead of several large
+  files crawling in parallel. Rationale: clearer UX, fewer simultaneous CAS sessions,
+  and fewer odd list states while the single-source `uploadEntries` map (PR4) is not in
+  yet. The block-level limiter (PR2/PR3) is unchanged — it still bounds concurrency
+  WITHIN the active file. Legacy resumable uploads are NOT serialized (untouched).
+- `maybeBlockUpload` and the block retry paths (`retryBlockUpload`, `onUploadRetryAll`)
+  now `enqueueBlockUpload(entry, file)` instead of calling `runBlockUpload` directly;
+  `drainBlockUploadQueue` starts the next file only when none is active. `runBlockUpload`
+  returns its settled promise so the queue advances on success, handled error, or cancel
+  (it never rejects). Cancelling a queued file removes it (`removeQueuedBlockUpload`, it
+  never started); cancelling the active file aborts it via `entry.cancel()` and the queue
+  advances; dialog close / cancel-all `clearBlockUploadQueue()` (queue + active marker).
+- Tests: `file-uploader.test.js` "block upload file-level queue (serialization)" — one
+  active at a time + advance on settle; cancelling a queued file removes it; close clears
+  queue + active.
 - Pending (next PR): PR4 single-source upload list + duplicate-name prompt for
-  batch/large; broader browser E2E with the flag on (verify the ceiling ramps 1→`max`
-  on a healthy link and backs off on a throttled one).
+  batch/large; broader browser E2E with the flag on.
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 

@@ -491,3 +491,107 @@ describe('FileUploader block upload integration', () => {
     }
   });
 });
+
+describe('FileUploader block upload file-level queue (serialization)', () => {
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  const makeQueueEntry = (id) => ({
+    uniqueIdentifier: id,
+    file: { name: id, size: 10 },
+    isBlockUpload: true,
+    isSaved: false,
+    error: null,
+    _progress: 0,
+    progress: () => 0,
+    isUploading: () => true,
+    cancel: jest.fn(),
+  });
+
+  // Replace runBlockUpload with a deferred so the test controls when the active file
+  // settles and the queue advances.
+  const withDeferredRunBlockUpload = (uploader) => {
+    const deferreds = [];
+    uploader.runBlockUpload = jest.fn(() => {
+      let resolve;
+      const promise = new Promise((r) => { resolve = r; });
+      deferreds.push({ resolve });
+      return promise;
+    });
+    return deferreds;
+  };
+
+  test('runs only one block file at a time; the next starts when the active one settles', async () => {
+    const uploader = createUploader();
+    const deferreds = withDeferredRunBlockUpload(uploader);
+    const a = makeQueueEntry('a');
+    const b = makeQueueEntry('b');
+    const c = makeQueueEntry('c');
+
+    uploader.enqueueBlockUpload(a, a.file);
+    uploader.enqueueBlockUpload(b, b.file);
+    uploader.enqueueBlockUpload(c, c.file);
+
+    // Only the first file is active; the other two wait.
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(a, a.file);
+    expect(uploader.blockUploadQueue.length).toBe(2);
+
+    deferreds[0].resolve();
+    await settle();
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(b, b.file);
+
+    deferreds[1].resolve();
+    await settle();
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(3);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(c, c.file);
+
+    deferreds[2].resolve();
+    await settle();
+    expect(uploader.activeBlockUpload).toBe(null);
+    expect(uploader.blockUploadQueue.length).toBe(0);
+  });
+
+  test('cancelling a queued (waiting) block file removes it so it never starts', async () => {
+    const uploader = createUploader();
+    const deferreds = withDeferredRunBlockUpload(uploader);
+    const a = makeQueueEntry('a');
+    const b = makeQueueEntry('b');
+    uploader.state.uploadFileList = [a, b];
+
+    uploader.enqueueBlockUpload(a, a.file); // active
+    uploader.enqueueBlockUpload(b, b.file); // waiting
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1);
+    expect(uploader.blockUploadQueue.length).toBe(1);
+
+    uploader.onUploadCancel(b); // cancel the waiting file
+    expect(uploader.blockUploadQueue.length).toBe(0);
+    expect(b.cancel).toHaveBeenCalled();
+
+    deferreds[0].resolve(); // active finishes → drain finds an empty queue
+    await settle();
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1); // b never ran
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(a, a.file);
+  });
+
+  test('closing the dialog clears the queue and the active marker', async () => {
+    const uploader = createUploader();
+    const deferreds = withDeferredRunBlockUpload(uploader);
+    const a = makeQueueEntry('a');
+    const b = makeQueueEntry('b');
+    uploader.state.uploadFileList = [a, b];
+
+    uploader.enqueueBlockUpload(a, a.file);
+    uploader.enqueueBlockUpload(b, b.file);
+    expect(uploader.activeBlockUpload).not.toBe(null);
+    expect(uploader.blockUploadQueue.length).toBe(1);
+
+    uploader.onCloseUploadDialog();
+    expect(uploader.blockUploadQueue.length).toBe(0);
+    expect(uploader.activeBlockUpload).toBe(null);
+
+    deferreds[0].resolve(); // a settling must not resurrect b
+    await settle();
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1);
+  });
+});
