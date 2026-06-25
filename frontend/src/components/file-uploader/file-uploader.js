@@ -584,11 +584,23 @@ class FileUploader extends React.Component {
     });
   };
 
-  // fileNameExistsInDir reports whether a file with this exact name already lives
-  // in the current folder (so the upload would replace or auto-rename it).
+  // fileNameExistsInDir reports whether a file with this exact name already lives in
+  // the current folder OR was already uploaded / is uploading in THIS session (so the
+  // upload would replace or auto-rename it). The session check matters because the
+  // server-provided direntList prop may not have refreshed after a just-finished
+  // upload — without it, re-dropping the same file silently produced a SECOND row
+  // ("Waiting..." next to "Uploaded") instead of offering the Replace? prompt.
   fileNameExistsInDir = (fileName) => {
     const direntList = this.props.direntList || [];
-    return direntList.some(d => d && d.type === 'file' && d.name === fileName);
+    if (direntList.some(d => d && d.type === 'file' && d.name === fileName)) {
+      return true;
+    }
+    return (this.state.uploadFileList || []).some(item => (
+      item
+      && !item.error
+      && item.fileName === fileName
+      && (item.isSaved || (typeof item.isUploading === 'function' && item.isUploading()))
+    ));
   };
 
   // handleDuplicateFile pulls the file OUT of the resumable queue (so the running
@@ -615,7 +627,16 @@ class FileUploader extends React.Component {
   showNextDuplicatePrompt = (inBatch = false) => {
     const next = this.pendingDuplicates.shift();
     if (!next) {
-      this.setState({ isUploadRemindDialogShow: false, currentResumableFile: null, duplicateBatchActive: false });
+      // No more decisions pending. If the only thing that opened the panel was a
+      // duplicate prompt the user then cancelled (nothing actually uploading or
+      // uploaded), don't leave an empty progress dialog behind.
+      const hasVisibleUploads = (this.state.uploadFileList || []).length > 0;
+      this.setState({
+        isUploadRemindDialogShow: false,
+        currentResumableFile: null,
+        duplicateBatchActive: false,
+        isUploadProgressDialogShow: hasVisibleUploads,
+      });
       return;
     }
     this.setState({
@@ -658,14 +679,20 @@ class FileUploader extends React.Component {
   //   - "keep"    → upload via the SHARED target (backend auto-renames to "name (1).ext"),
   //   - "replace" → a PER-FILE update-link target + replace flag (file.opts wins in
   //                 resumable.getOpt, so it never reroutes other in-flight uploads).
-  // In BOTH cases the queue is only kicked AFTER the shared target is ready, so
-  // non-duplicate siblings already in the queue don't POST to the empty target.
   startLegacyDuplicateUpload = (resumableFile, replace) => {
     resumableFile.formData = resumableFile.formData || {};
+    resumableFile.opts = resumableFile.opts || {};
+    // Clear any routing left by a PREVIOUS decision on this SAME held object (e.g. a
+    // Replace attempt that got re-queued after a failure). Otherwise a later "Don't
+    // replace" would inherit the stale update-link target + target_file and overwrite
+    // the existing file against the user's explicit choice.
+    delete resumableFile.opts.target;
+    delete resumableFile.formData.target_file;
+
     const parentDir = resumableFile.formData.parent_dir || this.getCurrentParentDir();
     resumableFile.formData['parent_dir'] = parentDir;
 
-    const pushAndStart = () => {
+    const pushFile = () => {
       if (this.resumable.files.indexOf(resumableFile) === -1) {
         this.resumable.files.push(resumableFile);
       }
@@ -676,51 +703,56 @@ class FileUploader extends React.Component {
         totalProgress: this.calculateTotalProgress(uploadFileList),
         uploadBitrate: this.calculateUploadBitrate(uploadFileList),
       });
-      // Start only once the shared target is set. If the link fetch fails we must NOT
-      // kick the queue: a "keep" file has no per-file target and depends on the shared
-      // one, so starting now would POST to the empty target (→ 405). Re-offer it
-      // instead of dropping it; because it was never in the rendered list there is no
-      // stale "Waiting..." row to clean up.
-      this.ensureSharedUploadTarget()
-        .then(() => this.resumable.upload())
-        .catch(error => {
-          toaster.danger(this.getAxiosErrorMessage(error));
-          this.resumable.removeFile(resumableFile);
-          const remaining = this.mergeUploadFileList(this.resumable.files);
-          this.setState({
-            uploadFileList: remaining,
-            totalProgress: this.calculateTotalProgress(remaining),
-            uploadBitrate: this.calculateUploadBitrate(remaining),
-          });
-          this.pendingDuplicates.unshift(resumableFile);
-          if (!this.state.isUploadRemindDialogShow) {
-            this.showNextDuplicatePrompt();
-          }
-        });
     };
 
-    if (!replace) {
-      resumableFile.formData['replace'] = 0;
-      pushAndStart();
-      return;
-    }
-
-    const { repoID, path } = this.props;
-    seafileAPI.getUpdateLink(repoID, path).then(res => {
-      resumableFile.opts = resumableFile.opts || {};
-      resumableFile.opts.target = res.data;
-      resumableFile.formData['replace'] = 1;
-      resumableFile.formData['target_file'] = `${parentDir}${resumableFile.fileName}`;
-      pushAndStart();
-    }).catch(error => {
-      toaster.danger(Utils.getErrorMsg(error));
-      // Pulled from the queue before the link fetch; a transient failure must NOT
-      // silently drop it. Re-queue so it is offered again.
-      this.pendingDuplicates.push(resumableFile);
+    // reofferHeldFile re-queues a file that was already pushed into the queue/list (so
+    // it must be pulled back out, leaving no stale "Waiting..." row) and re-prompts.
+    const reofferHeldFile = (error) => {
+      toaster.danger(this.getAxiosErrorMessage(error));
+      this.resumable.removeFile(resumableFile);
+      const remaining = this.mergeUploadFileList(this.resumable.files);
+      this.setState({
+        uploadFileList: remaining,
+        totalProgress: this.calculateTotalProgress(remaining),
+        uploadBitrate: this.calculateUploadBitrate(remaining),
+      });
+      this.pendingDuplicates.unshift(resumableFile);
       if (!this.state.isUploadRemindDialogShow) {
         this.showNextDuplicatePrompt();
       }
-    });
+    };
+
+    if (replace) {
+      // Replace carries its OWN per-file update-link target, so it does NOT depend on
+      // the shared session target — gating it on ensureSharedUploadTarget would let a
+      // shared-link failure block a perfectly valid replace. Fetch the update link,
+      // arm the per-file target, and start.
+      const { repoID, path } = this.props;
+      seafileAPI.getUpdateLink(repoID, path).then(res => {
+        resumableFile.opts.target = res.data;
+        resumableFile.formData['replace'] = 1;
+        resumableFile.formData['target_file'] = `${parentDir}${resumableFile.fileName}`;
+        pushFile();
+        this.resumable.upload();
+      }).catch(error => {
+        toaster.danger(Utils.getErrorMsg(error));
+        // Pulled from the queue before the link fetch (never in the list); re-queue.
+        this.pendingDuplicates.push(resumableFile);
+        if (!this.state.isUploadRemindDialogShow) {
+          this.showNextDuplicatePrompt();
+        }
+      });
+      return;
+    }
+
+    // Keep: no per-file target → it uploads through the SHARED session target, so wait
+    // for that to be set. If the fetch fails, DON'T kick the queue (it would POST to the
+    // empty target → 405) — re-offer the file instead.
+    resumableFile.formData['replace'] = 0;
+    pushFile();
+    this.ensureSharedUploadTarget()
+      .then(() => this.resumable.upload())
+      .catch(reofferHeldFile);
   };
 
   // resolveDuplicate is invoked by the replace dialog. It applies the action to the

@@ -571,11 +571,37 @@ must **not** reintroduce any target clearing.
   queue before the shared target is set (the `POST <page-url>` → 405 race). The target is
   **overwritten** with a fresh token per batch but **never cleared**, so a legacy retry
   still reuses the last token (the self-inflicted retry-405 is not reintroduced).
-- Tests: `file-uploader.test.js` "duplicate-name prompting" (13) — single/batch/large
+- Tests: `file-uploader.test.js` "duplicate-name prompting" — single/batch/large
   prompt, held-out-of-list, block-vs-legacy routing with `_replace`, keep via shared
   target, apply-to-all + batch scoping + reset, cancel drops the held file, subfolder
   `target_file`, the 405 "wait for shared target" regression, link-failure re-queue with
   no stale row, and a **flag-OFF** legacy path check.
+
+**PR4 review hotfix (same branch).** Five issues found in review/testing:
+- **Re-dropping a same-named file already uploaded/uploading in THIS session was not
+  detected** (the server `direntList` prop had not refreshed), so it produced a second
+  silent row ("Waiting..." next to "Uploaded") — the screenshot bug. `fileNameExistsInDir`
+  now also matches a non-error `uploadFileList` entry (saved or uploading), so the re-drop
+  is offered the Replace? prompt instead of silently duplicating. Test: "re-dropping a
+  file already uploaded in THIS session prompts instead of silently duplicating".
+- **[P1] "Don't replace" could inherit a stale update-link** from a previous Replace
+  attempt on the same re-queued object and overwrite the file against the user's choice.
+  `startLegacyDuplicateUpload` now `delete`s `opts.target` + `formData.target_file` at the
+  start, before applying the new decision. Test: "a re-queued replace attempt does not leak
+  its update-link into a later keep decision".
+- **Replace no longer depends on the shared-target fetch.** A Replace carries its own
+  per-file update-link target; gating it on `ensureSharedUploadTarget` meant a shared-link
+  failure blocked a valid replace. Replace now starts directly after `getUpdateLink`; only
+  "keep" awaits the shared target. Test: "a replace decision proceeds even when the
+  shared-target fetch fails".
+- **Cancelling the only held duplicate left an empty progress panel open.**
+  `showNextDuplicatePrompt` now closes `isUploadProgressDialogShow` when the queue drains
+  and nothing is uploading/uploaded. Test: "cancelling the only held duplicate closes the
+  otherwise-empty progress dialog".
+- **`showApplyToAll` wiring locked with tests:** the parent passes
+  `showApplyToAll={duplicateBatchActive}` to the dialog, and the dialog renders the
+  checkbox / `getApplyToAll` only when offered. Tests: `file-uploader.test.js` "the parent
+  passes showApplyToAll…" + new `upload-remind-dialog.test.js`.
 - **Manual verification with the flag OFF still required before merge** (legacy:
   small files, folders, replace/keep/cancel, cancel-all/retry-all → identical behavior,
   no duplicate/stale rows, no 405), then flag-ON browser E2E.

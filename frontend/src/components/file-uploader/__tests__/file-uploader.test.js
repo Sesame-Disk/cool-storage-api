@@ -1,6 +1,26 @@
 import FileUploader from '../file-uploader';
 import { seafileAPI } from '../../../utils/seafile-api';
 import { shouldUseBlockUpload } from '../block-upload-orchestrator';
+import UploadRemindDialog from '../../dialog/upload-remind-dialog';
+
+// Recursively find the first rendered element of a given component type.
+const findRenderedByType = (node, type) => {
+  if (!node || typeof node !== 'object') {
+    return null;
+  }
+  if (node.type === type) {
+    return node;
+  }
+  const children = node.props && node.props.children;
+  const arr = Array.isArray(children) ? children : [children];
+  for (let i = 0; i < arr.length; i += 1) {
+    const found = findRenderedByType(arr[i], type);
+    if (found) {
+      return found;
+    }
+  }
+  return null;
+};
 
 jest.mock('../../../utils/seafile-api', () => ({
   seafileAPI: {
@@ -858,5 +878,83 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(uploader.state.isUploadRemindDialogShow).toBe(false); // no duplicate prompt
     expect(uploader.resumable.opts.target).toBe('/upload/tok?ret-json=1'); // shared target, not page URL
     expect(uploader.resumableUpload).toHaveBeenCalledWith(f);
+  });
+
+  test('a re-queued replace attempt does not leak its update-link into a later keep decision', async () => {
+    seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/tok' });
+    const uploader = createUploader(dupProps(['x.txt']));
+    // Same held object that a previous Replace attempt already armed (per-file update
+    // link + replace flag) before being re-queued.
+    const f = createResumableFile('x.txt', {
+      file: { name: 'x.txt', size: 10 },
+      opts: { target: '/update/stale' },
+      formData: { parent_dir: '/', replace: 1, target_file: '/x.txt' },
+    });
+
+    // User now picks "Don't replace" on it.
+    uploader.startLegacyDuplicateUpload(f, false);
+    await flushPromises();
+
+    expect(f.formData.replace).toBe(0);
+    expect(f.opts.target).toBeUndefined(); // stale update-link cleared → no accidental replace
+    expect(f.formData.target_file).toBeUndefined();
+  });
+
+  test('a replace decision proceeds even when the shared-target fetch fails (uses its own update link)', async () => {
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
+    seafileAPI.getFileServerUploadLink.mockRejectedValue(new Error('shared link down'));
+    const uploader = createUploader(dupProps(['x.txt']));
+    const f = createResumableFile('x.txt', { file: { name: 'x.txt', size: 10 } });
+    uploader.state.currentResumableFile = f;
+
+    uploader.replaceRepetitionFile(false);
+    await flushPromises();
+
+    expect(f.opts.target).toBe('/update/tok');
+    expect(f.formData.replace).toBe(1);
+    expect(f.formData.target_file).toBe('/x.txt');
+    expect(uploader.resumable.files).toContain(f);
+    expect(uploader.resumable.upload).toHaveBeenCalled(); // not blocked by the shared-link failure
+  });
+
+  test('cancelling the only held duplicate closes the otherwise-empty progress dialog', () => {
+    const uploader = createUploader(dupProps(['c.txt']));
+    const f = createResumableFile('c.txt', { file: { name: 'c.txt', size: 10 } });
+    uploader.resumable.files = [f];
+
+    uploader.onFileAdded(f, [f]); // prompt → opens the progress panel + remind dialog
+    expect(uploader.state.isUploadProgressDialogShow).toBe(true);
+
+    uploader.cancelFileUpload(false); // Cancel the only duplicate
+
+    expect(uploader.state.isUploadRemindDialogShow).toBe(false);
+    expect(uploader.state.isUploadProgressDialogShow).toBe(false); // no empty panel left behind
+  });
+
+  test('re-dropping a file already uploaded in THIS session prompts instead of silently duplicating', () => {
+    const uploader = createUploader(); // empty server direntList
+    // A completed upload of the same name is still shown in the dialog.
+    uploader.state.uploadFileList = [{
+      uniqueIdentifier: 'done', fileName: 'all-databases.sql', isSaved: true, error: null, isUploading: () => false,
+    }];
+    const f = createResumableFile('all-databases.sql', { file: { name: 'all-databases.sql', size: 10 } });
+    uploader.resumable.files = [f];
+
+    uploader.onFileAdded(f, [f]);
+
+    expect(uploader.resumable.removeFile).toHaveBeenCalledWith(f);
+    expect(uploader.state.isUploadRemindDialogShow).toBe(true); // prompted, not a silent 2nd row
+    expect(uploader.state.currentResumableFile).toBe(f);
+  });
+
+  test('the parent passes showApplyToAll (duplicateBatchActive) to the remind dialog', () => {
+    const uploader = createUploader();
+    uploader.state.isUploadRemindDialogShow = true;
+    uploader.state.currentResumableFile = { uniqueIdentifier: 'x', fileName: 'x' };
+    uploader.state.duplicateBatchActive = true;
+
+    const dialog = findRenderedByType(uploader.render(), UploadRemindDialog);
+    expect(dialog).not.toBeNull();
+    expect(dialog.props.showApplyToAll).toBe(true);
   });
 });
