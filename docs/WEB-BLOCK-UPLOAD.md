@@ -540,8 +540,45 @@ must **not** reintroduce any target clearing.
   active at a time + advance on settle; cancelling a queued file removes it; close keeps
   the active marker until the cancelled job settles; a new file added during the abort
   window waits; idempotent enqueue.
-- Pending (next PR): PR4 single-source upload list + duplicate-name prompt for
-  batch/large; broader browser E2E with the flag on.
+- Pending (next PR): PR4 duplicate-name prompt for batch/large; broader browser E2E
+  with the flag on.
+
+**PR4 — duplicate-name prompt for batch/large + apply-to-all (done; touches legacy).**
+- The "Replace?" dialog now fires for **every** file (single / batch / large), BEFORE
+  the block diversion, instead of only a lone legacy file. A same-named file inside a
+  multi-file batch — or a large file routed to the block flow — used to silently land as
+  `name (1).ext`; now it is offered Replace / Don't replace / Cancel.
+- **Held duplicates are kept OUT of the rendered list** (`pendingDuplicates`), not just
+  out of the resumable queue: `handleDuplicateFile` `removeFile`s the match and does NOT
+  add it to `uploadFileList` until the user decides. So a held/undecided duplicate never
+  shows as a stale "Waiting..." row, and a link-fetch failure that re-queues it leaves no
+  orphan row (closes the duplicate-row / stale-Waiting bug and the resumable.files ↔
+  block-entry mixing — held files touch neither representation until resolved).
+- Decision routing (`applyDuplicateDecision`): a block-eligible file → a block entry with
+  `_replace` persisted, run through the PR3.5 file-level queue (`enqueueBlockUpload`); a
+  legacy file → `startLegacyDuplicateUpload` (replace = per-file update-link target +
+  `target_file`; keep = the shared session target). `target_file` is built from a
+  slash-terminated parent dir so a subfolder replace resolves to `/folder/name`.
+- Multiple duplicates prompt **sequentially** with an **"Apply to all duplicate files"**
+  checkbox (`duplicateBatchActive`) that drains the rest with one choice; the bulk choice
+  is scoped to the current add batch (keyed on resumable's per-batch `files` array) so it
+  never auto-resolves a duplicate added in a later batch. The dialog is keyed by file so a
+  checked "apply to all" never leaks into the next prompt, and `getApplyToAll` only counts
+  when the box is both shown and checked.
+- **No target clearing reintroduced (Bug #4 stays fixed).** Both the normal add flow and
+  the keep flow await one cached `ensureSharedUploadTarget()` (fetched once per batch,
+  reset on idle) before `resumable.upload()` — so a resolved duplicate cannot kick the
+  queue before the shared target is set (the `POST <page-url>` → 405 race). The target is
+  **overwritten** with a fresh token per batch but **never cleared**, so a legacy retry
+  still reuses the last token (the self-inflicted retry-405 is not reintroduced).
+- Tests: `file-uploader.test.js` "duplicate-name prompting" (13) — single/batch/large
+  prompt, held-out-of-list, block-vs-legacy routing with `_replace`, keep via shared
+  target, apply-to-all + batch scoping + reset, cancel drops the held file, subfolder
+  `target_file`, the 405 "wait for shared target" regression, link-failure re-queue with
+  no stale row, and a **flag-OFF** legacy path check.
+- **Manual verification with the flag OFF still required before merge** (legacy:
+  small files, folders, replace/keep/cancel, cancel-all/retry-all → identical behavior,
+  no duplicate/stale rows, no 405), then flag-ON browser E2E.
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
