@@ -675,11 +675,88 @@ export const noteAdaptiveUploadFailure = (resumable, resumableFile, message) => 
 };
 
 export const isFileSaving = (resumableFile) => {
-    return !resumableFile.isSaved && (
+    if (!resumableFile || resumableFile.isSaved) {
+        return false;
+    }
+    // Block-upload entries drive an explicit phase ('hashing' -> 'uploading' ->
+    // 'saving'). They must NOT inherit the resumable.js chunk/remainingTime
+    // heuristics: a block entry has no chunks and previously parked
+    // remainingTime at 0, which made this return true for the entire upload and
+    // rendered every block file as "Saving..." at 3%. "Saving" for a block
+    // upload means exactly one thing: the server-side commit is in flight.
+    if (resumableFile.isBlockUpload) {
+        return resumableFile._phase === 'saving';
+    }
+    return (
         Boolean(resumableFile.isFinalizing) ||
         isAwaitingServerFinalize(resumableFile) ||
         resumableFile.remainingTime === 0
     );
+};
+
+// ---------------------------------------------------------------------------
+// Block-upload throughput
+//
+// Block uploads run outside resumable.js, so the legacy getBitrate() (which only
+// sums resumable.files) always reports 0.00 B/s for them. These helpers derive a
+// real bits/s figure from successive progress samples taken on the block entry
+// itself, so the dialog header shows an actual speed.
+// ---------------------------------------------------------------------------
+
+export const BLOCK_BITRATE_SAMPLE_MS = 500;
+
+// sampleBlockUploadBitrate updates the entry's sampling state from the real
+// bytes transferred over the network and returns the latest bits/s. Sampling is
+// throttled so frequent progress ticks do not divide by a near-zero interval and
+// spike the reading.
+export const sampleBlockUploadBitrate = (entry, transferredBytes = entry && entry._uploadedNetworkBytes, now = Date.now()) => {
+    if (!entry) {
+        return 0;
+    }
+    const bytes = Math.max(0, Number(transferredBytes) || 0);
+    if (typeof entry._bitrateTs !== 'number') {
+        entry._bitrateTs = now;
+        entry._bitrateBytes = bytes;
+        entry._bitrate = 0;
+        return 0;
+    }
+    const elapsed = now - entry._bitrateTs;
+    if (elapsed < BLOCK_BITRATE_SAMPLE_MS) {
+        return Number(entry._bitrate) || 0;
+    }
+    const deltaBytes = bytes - (Number(entry._bitrateBytes) || 0);
+    entry._bitrate = elapsed > 0 ? Math.max(0, (deltaBytes / elapsed) * 1000 * 8) : 0;
+    entry._bitrateBytes = bytes;
+    entry._bitrateTs = now;
+    return entry._bitrate;
+};
+
+export const resetBlockUploadBitrate = (entry, now = Date.now()) => {
+    if (!entry) {
+        return;
+    }
+    entry._bitrate = 0;
+    entry._bitrateBytes = 0;
+    entry._uploadedNetworkBytes = 0;
+    entry._bitrateTs = now;
+};
+
+// aggregateBlockUploadBitrate sums the throughput of the still-active block
+// entries (finished/saved ones are excluded so their last reading does not linger).
+export const aggregateBlockUploadBitrate = (uploadFileList) => {
+    if (!Array.isArray(uploadFileList)) {
+        return 0;
+    }
+    return uploadFileList.reduce((sum, item) => (
+        item
+            && item.isBlockUpload
+            && item._uploading
+            && item._phase === 'uploading'
+            && !item.isSaved
+            && typeof item._bitrate === 'number'
+            ? sum + item._bitrate
+            : sum
+    ), 0);
 };
 
 export const maybeStartPendingUploadDuringFinalize = (resumable) => {

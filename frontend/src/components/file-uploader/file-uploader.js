@@ -4,7 +4,7 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
+import { aggregateBlockUploadBitrate, clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetBlockUploadBitrate, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, sampleBlockUploadBitrate, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
@@ -58,6 +58,7 @@ class FileUploader extends React.Component {
 
     this.timestamp = null;
     this.loaded = 0;
+    this.legacyUploadBitrate = 0;
     this.bitrateInterval = 500; // Interval in milliseconds to calculate the bitrate
     window.onbeforeunload = this.onbeforeunload;
     this.isUploadLinkLoaded = false;
@@ -126,6 +127,30 @@ class FileUploader extends React.Component {
     ));
   };
 
+  hasActiveLegacyUploads = (uploadFileList = this.state.uploadFileList) => {
+    return uploadFileList.some(file => (
+      file
+      && !file.isBlockUpload
+      && !file.isSaved
+      && !file.error
+      && typeof file.isUploading === 'function'
+      && file.isUploading()
+    ));
+  };
+
+  // calculateUploadBitrate combines the isolated legacy resumable bitrate with the
+  // summed block-upload bitrate. The legacy figure is held in this.legacyUploadBitrate
+  // (computed in getBitrate); it is zeroed when no legacy upload is active so a stale
+  // reading does not linger after the resumable queue drains while block uploads run.
+  calculateUploadBitrate = (uploadFileList = this.state.uploadFileList) => {
+    const hasActiveLegacyUploads = this.hasActiveLegacyUploads(uploadFileList);
+    if (!hasActiveLegacyUploads) {
+      this.legacyUploadBitrate = 0;
+    }
+    const legacyUploadBitrate = hasActiveLegacyUploads ? this.legacyUploadBitrate : 0;
+    return legacyUploadBitrate + aggregateBlockUploadBitrate(uploadFileList);
+  };
+
   calculateTotalProgress = (uploadFileList = this.state.uploadFileList) => {
     // Byte-weighted so a 10 GB file dominates the bar over a 1 KB file (an equal
     // per-file average badly misrepresents overall progress when sizes differ).
@@ -172,6 +197,7 @@ class FileUploader extends React.Component {
     entry._uploading = false;
     entry._cancelled = false;
     entry._abortController = null;
+    entry._phase = 'hashing';
   };
 
   // Thin delegators onto the shared guard; kept as instance methods so callers
@@ -300,6 +326,11 @@ class FileUploader extends React.Component {
       formData: {},
       file,
       isBlockUpload: true,
+      // Explicit flow phase, the single source of truth for how this entry
+      // renders: 'hashing' | 'uploading' | 'saving' | 'done' | 'error'. It is
+      // driven by the orchestrator's onPhase callback, NOT inferred from
+      // resumable.js chunk/remainingTime state (which a block entry does not have).
+      _phase: 'hashing',
       _abortController: null,
       _cancelled: false,
       _progress: 0,
@@ -319,7 +350,10 @@ class FileUploader extends React.Component {
 
   updateBlockUploadProgress = (entry, fraction) => {
     entry._progress = Math.max(0, Math.min(1, fraction));
-    entry.remainingTime = 0;
+    // Deliberately do NOT touch remainingTime here. Parking it at 0 used to make
+    // isFileSaving() true for the whole upload, rendering the row as "Saving..."
+    // at 3% and hiding the per-row Cancel button. The block flow has no ETA, so
+    // the entry stays at the "Preparing"-style sentinel until phase 'saving'.
     this.setState(prev => {
       const uploadFileList = prev.uploadFileList.map(item => (
         item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
@@ -327,6 +361,47 @@ class FileUploader extends React.Component {
       return {
         uploadFileList,
         totalProgress: this.calculateTotalProgress(uploadFileList),
+        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+      };
+    });
+  };
+
+  // updateBlockUploadTransferredBytes accumulates real bytes moved over the wire
+  // (from the orchestrator's onTransferProgress) and samples a bits/s figure on the
+  // entry, so the dialog header shows an actual block-upload speed instead of the
+  // legacy 0.00 B/s (block entries are not in this.resumable.files).
+  updateBlockUploadTransferredBytes = (entry, deltaBytes) => {
+    if (!deltaBytes || deltaBytes <= 0) {
+      return;
+    }
+    entry._uploadedNetworkBytes = (Number(entry._uploadedNetworkBytes) || 0) + deltaBytes;
+    sampleBlockUploadBitrate(entry, entry._uploadedNetworkBytes);
+    this.setState(prev => {
+      const uploadFileList = prev.uploadFileList.map(item => (
+        item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
+      ));
+      return {
+        uploadFileList,
+        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+      };
+    });
+  };
+
+  setBlockUploadPhase = (entry, phase) => {
+    if (entry._phase === phase) {
+      return;
+    }
+    if (phase === 'uploading') {
+      resetBlockUploadBitrate(entry);
+    }
+    entry._phase = phase;
+    this.setState(prev => {
+      const uploadFileList = prev.uploadFileList.map(item => (
+        item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
+      ));
+      return {
+        uploadFileList,
+        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
       };
     });
   };
@@ -340,20 +415,27 @@ class FileUploader extends React.Component {
     entry.error = null;
     entry.isSaved = false;
     entry.remainingTime = -1;
+    entry._phase = 'hashing';
+    resetBlockUploadBitrate(entry);
 
-    // Hashing is the first half of the bar, uploading the second half.
+    // Hashing is the first half of the bar, uploading the second half. onPhase
+    // drives the explicit entry._phase so the row renders Uploading…/Saving…
+    // correctly; onTransferProgress feeds real wire bytes for the speed readout.
     uploadFileViaBlocks(file, {
       repoID,
       parentDir: path,
       filename: file.name,
       replace: false,
       signal: abortController ? abortController.signal : undefined,
+      onPhase: (phase) => this.setBlockUploadPhase(entry, phase),
       onHashProgress: (hashed, total) => this.updateBlockUploadProgress(entry, (total ? hashed / total : 0) * 0.5),
       onUploadProgress: (done, total) => this.updateBlockUploadProgress(entry, 0.5 + (total ? done / total : 1) * 0.5),
+      onTransferProgress: (deltaBytes) => this.updateBlockUploadTransferredBytes(entry, deltaBytes),
     }).then(result => {
       entry._abortController = null;
       entry._progress = 1;
       entry._uploading = false;
+      entry._phase = 'done';
       const r = Array.isArray(result) ? result[0] : result;
       const name = (r && r.name) || file.name;
       const dirent = { id: (r && r.id) || '', type: 'file', name, size: file.size, mtime: new Date().getTime() / 1000 };
@@ -363,13 +445,23 @@ class FileUploader extends React.Component {
       entry._abortController = null;
       entry._uploading = false;
       if (entry._cancelled || isAbortError(error)) {
-        this.setState({ totalProgress: this.calculateTotalProgress() });
+        entry._phase = 'hashing';
+        this.setState({
+          totalProgress: this.calculateTotalProgress(),
+          uploadBitrate: this.calculateUploadBitrate(),
+        });
         this.restoreConcurrencyIfIdle();
         return;
       }
+      entry._phase = 'error';
       const message = this.getAxiosErrorMessage(error) || gettext('Network error');
       const { retryFileList, uploadFileList } = moveUploadToRetryState(this.state.uploadFileList, this.state.retryFileList, entry, message);
-      this.setState({ retryFileList, uploadFileList, totalProgress: this.calculateTotalProgress(uploadFileList) });
+      this.setState({
+        retryFileList,
+        uploadFileList,
+        totalProgress: this.calculateTotalProgress(uploadFileList),
+        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+      });
       this.restoreConcurrencyIfIdle();
     });
   };
@@ -456,24 +548,41 @@ class FileUploader extends React.Component {
     }
   };
 
-  setUploadFileList = () => {
-    let uploadFileList = this.resumable.files;
+  // mergeUploadFileList unions the resumable.js files with the in-flight block
+  // entries (which live outside this.resumable.files), deduped by uniqueIdentifier.
+  // Rebuilding the list from this.resumable.files alone erased block rows from the
+  // dialog the moment a legacy file was added after a block upload had started.
+  mergeUploadFileList = (resumableFiles = this.resumable ? this.resumable.files : [], uploadFileList = this.state.uploadFileList) => {
+    const merged = uploadFileList.filter(item => item && item.isBlockUpload);
+    const seen = new Set(merged.map(item => item.uniqueIdentifier));
+    (resumableFiles || []).forEach(file => {
+      if (!seen.has(file.uniqueIdentifier)) {
+        merged.push(file);
+        seen.add(file.uniqueIdentifier);
+      }
+    });
+    return merged;
+  };
+
+  setUploadFileList = (resumableFiles = this.resumable.files) => {
+    const uploadFileList = this.mergeUploadFileList(resumableFiles);
     this.setState({
-      uploadFileList: uploadFileList,
+      uploadFileList,
       isUploadProgressDialogShow: true,
       totalProgress: this.calculateTotalProgress(uploadFileList),
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
     });
   };
 
   onFileProgress = (resumableFile) => {
     const simultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
-    let uploadBitrate = this.getBitrate();
-    updateAdaptiveUploadConcurrency(this.resumable, resumableFile, uploadBitrate);
+    let legacyUploadBitrate = this.getBitrate();
+    updateAdaptiveUploadConcurrency(this.resumable, resumableFile, legacyUploadBitrate);
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
-        if (uploadBitrate) {
+        if (legacyUploadBitrate) {
           let lastSize = (item.size - (item.size * item.progress())) * 8;
-          let time = Math.floor(lastSize / uploadBitrate);
+          let time = Math.floor(lastSize / legacyUploadBitrate);
           item.remainingTime = time;
         }
         // All chunk bytes have been transferred but the server hasn't acked
@@ -486,7 +595,7 @@ class FileUploader extends React.Component {
     });
 
     this.setState({
-      uploadBitrate: uploadBitrate,
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
       uploadFileList: uploadFileList
     });
     this.scheduleFinalizeStateRefresh(resumableFile);
@@ -503,7 +612,7 @@ class FileUploader extends React.Component {
         return item;
       });
       if (didMarkFinalizing) {
-        this.setState({ uploadFileList });
+        this.setState({ uploadFileList, uploadBitrate: this.calculateUploadBitrate(uploadFileList) });
       }
     }, 0);
   };
@@ -524,7 +633,7 @@ class FileUploader extends React.Component {
     if (this.timestamp) {
       let timeDiff = (now - this.timestamp);
       if (timeDiff < this.bitrateInterval) {
-        return this.state.uploadBitrate;
+        return this.legacyUploadBitrate;
       }
 
       // 1. Cancel will produce loaded greater than this.loaded
@@ -538,6 +647,7 @@ class FileUploader extends React.Component {
 
     this.timestamp = now;
     this.loaded = loaded;
+    this.legacyUploadBitrate = uploadBitrate;
 
     return uploadBitrate;
   };
@@ -558,6 +668,7 @@ class FileUploader extends React.Component {
     this.setState({
       uploadFileList: uploadFileList,
       totalProgress: this.calculateTotalProgress(uploadFileList),
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
     });
     this.restoreConcurrencyIfIdle();
   };
@@ -571,7 +682,11 @@ class FileUploader extends React.Component {
     console.error('Upload finalize metadata missing for', resumableFile.fileName, 'message:', message);
     const error = gettext('Upload could not be confirmed. Please retry.');
     const { retryFileList, uploadFileList } = moveUploadToRetryState(this.state.uploadFileList, this.state.retryFileList, resumableFile, error);
-    this.setState({ retryFileList: retryFileList, uploadFileList: uploadFileList });
+    this.setState({
+      retryFileList: retryFileList,
+      uploadFileList: uploadFileList,
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+    });
     this.restoreConcurrencyIfIdle();
   };
 
@@ -710,7 +825,8 @@ class FileUploader extends React.Component {
     this.loaded = 0;  // reset loaded data;
     this.setState({
       retryFileList: retryFileList,
-      uploadFileList: uploadFileList
+      uploadFileList: uploadFileList,
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
     });
     this.restoreConcurrencyIfIdle();
   };
@@ -747,7 +863,8 @@ class FileUploader extends React.Component {
 
     this.setState({
       retryFileList: retryFileList,
-      uploadFileList: uploadFileList
+      uploadFileList: uploadFileList,
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
     });
     this.restoreConcurrencyIfIdle();
   };
@@ -839,6 +956,7 @@ class FileUploader extends React.Component {
   onCloseUploadDialog = () => {
     this.cancelActiveUploads();
     this.loaded = 0;
+    this.legacyUploadBitrate = 0;
     this.resumable.files = [];
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
@@ -868,13 +986,18 @@ class FileUploader extends React.Component {
     this.setState({
       uploadFileList: uploadFileList,
       totalProgress: hasActiveUploads ? this.calculateTotalProgress(uploadFileList) : 100,
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
     });
     this.restoreConcurrencyIfIdle();
   };
 
   onCancelAllUploading = () => {
     let uploadFileList = this.state.uploadFileList.filter(item => {
-      if (Math.round(item.progress() !== 1)) {
+      // Cancel every unsaved entry, including block uploads already at 100% that
+      // are still inside the final commit ('saving').
+      // (The old `Math.round(item.progress() !== 1)` rounded a boolean — it worked
+      // only by accident; compare against isSaved directly.)
+      if (!item.isSaved) {
         clearFileUploadRuntimeState(item, { resetRemainingTime: true });
         item.cancel();
         return false;
@@ -883,10 +1006,12 @@ class FileUploader extends React.Component {
     });
 
     this.loaded = 0;
+    this.legacyUploadBitrate = 0;
 
     this.setState({
       totalProgress: 100,
-      uploadFileList: uploadFileList
+      uploadFileList: uploadFileList,
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
     });
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
@@ -926,6 +1051,7 @@ class FileUploader extends React.Component {
       retryFileList: [],
       uploadFileList: uploadFileList,
       totalProgress: this.calculateTotalProgress(uploadFileList),
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
     }, () => {
       blockRetryList.forEach(item => {
         this.runBlockUpload(item, item.file);
@@ -944,6 +1070,7 @@ class FileUploader extends React.Component {
       retryFileList: retryFileList,
       uploadFileList: uploadFileList,
       totalProgress: this.calculateTotalProgress(uploadFileList),
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
     }, () => {
       this.runBlockUpload(entry, entry.file);
     });
