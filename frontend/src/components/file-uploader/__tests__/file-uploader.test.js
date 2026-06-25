@@ -645,4 +645,65 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(uploader.state.isUploadRemindDialogShow).toBe(true);
     expect(uploader.state.currentResumableFile).toBe(f);
   });
+
+  test('a "keep" duplicate does NOT start the queue when the shared target fetch fails', async () => {
+    // Regression: the catch used to call resumable.upload() anyway, so a "keep" file
+    // (no per-file target) would POST to the empty/stale shared target → 405. It must
+    // hold the queue and re-offer the duplicate instead.
+    seafileAPI.getFileServerUploadLink.mockRejectedValue(new Error('network'));
+    const uploader = createUploader(dupProps(['k.txt']));
+    const f = createResumableFile('k.txt', { file: { name: 'k.txt', size: 10 } });
+    uploader.state.currentResumableFile = f;
+
+    uploader.uploadFile(false); // keep → startLegacyDuplicateUpload → ensureUploadTargetReady rejects
+    await flushPromises();
+
+    expect(uploader.resumable.upload).not.toHaveBeenCalled();
+    expect(uploader.resumable.removeFile).toHaveBeenCalledWith(f);
+    // Re-queued and surfaced again rather than silently dropped against a bad target.
+    expect(uploader.state.isUploadRemindDialogShow).toBe(true);
+    expect(uploader.state.currentResumableFile).toBe(f);
+  });
+});
+
+describe('FileUploader shared upload target lifecycle', () => {
+  test('a new batch adopts a fresh token instead of reusing the stale target from the last session', async () => {
+    seafileAPI.getFileServerUploadLink
+      .mockResolvedValueOnce({ data: '/upload/token-a' })
+      .mockResolvedValueOnce({ data: '/upload/token-b' });
+
+    const uploader = createUploader();
+    const first = createResumableFile('a.iso');
+    uploader.resumable.files = [first];
+    uploader.onFileAdded(first, [first]);
+    await flushPromises();
+    expect(uploader.resumable.opts.target).toBe('/upload/token-a?ret-json=1');
+
+    // Session completes → cached link AND the stale shared target are cleared.
+    uploader.onComplete();
+    expect(uploader.resumable.opts.target).toBe('');
+    expect(uploader.isUploadLinkLoaded).toBe(false);
+
+    // Next batch must mint and ADOPT a new token, not keep posting to token-a.
+    const second = createResumableFile('b.iso');
+    uploader.resumable.files = [second];
+    uploader.onFileAdded(second, [second]);
+    await flushPromises();
+
+    expect(seafileAPI.getFileServerUploadLink).toHaveBeenCalledTimes(2);
+    expect(uploader.resumable.opts.target).toBe('/upload/token-b?ret-json=1');
+  });
+
+  test('resetSharedUploadTarget keeps the running target when uploads are still in flight', () => {
+    const uploader = createUploader();
+    uploader.resumable.opts.target = '/upload/token-a?ret-json=1';
+    uploader.isUploadLinkLoaded = true;
+
+    // clearTarget defaults to false: only the cached promise/flag are reset.
+    uploader.resetSharedUploadTarget();
+
+    expect(uploader.isUploadLinkLoaded).toBe(false);
+    expect(uploader._uploadTargetPromise).toBe(null);
+    expect(uploader.resumable.opts.target).toBe('/upload/token-a?ret-json=1');
+  });
 });

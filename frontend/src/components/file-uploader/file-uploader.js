@@ -582,11 +582,22 @@ class FileUploader extends React.Component {
         totalProgress: this.calculateTotalProgress(uploadFileList),
         uploadBitrate: this.calculateUploadBitrate(uploadFileList),
       });
-      // Start only once the shared target is set (replace files carry their own
-      // per-file target and upload regardless).
+      // Start only once the shared target is set. If the link fetch fails we must
+      // NOT kick the queue: a "keep" file has no per-file target and depends on the
+      // shared one, so starting now would POST to the empty/stale target (→ 405).
+      // A "replace" file does carry its own per-file target, but its non-duplicate
+      // siblings still waiting in the queue depend on the shared target, so we hold
+      // the whole queue and re-offer this duplicate instead of dropping it.
       this.ensureUploadTargetReady()
         .then(() => this.resumable.upload())
-        .catch(() => this.resumable.upload());
+        .catch(error => {
+          toaster.danger(this.getAxiosErrorMessage(error));
+          this.resumable.removeFile(resumableFile);
+          this.pendingDuplicates.unshift(resumableFile);
+          if (!this.state.isUploadRemindDialogShow) {
+            this.showNextDuplicatePrompt();
+          }
+        });
     };
 
     if (!replace) {
@@ -697,8 +708,14 @@ class FileUploader extends React.Component {
     this.isUploadLinkLoaded = true;
     const { repoID, path } = this.props;
     this._uploadTargetPromise = seafileAPI.getFileServerUploadLink(repoID, path).then(res => {
-      // Set once; never overwrite an existing target (would reroute in-flight uploads).
-      if (!this.resumable.opts.target) {
+      // Adopt the freshly-minted target as long as nothing is in flight. Overwriting
+      // while uploads are running would reroute them onto a different server-side
+      // tracker (keyed by token) and split them across two trackers, so we keep the
+      // existing target in that case. A stale target left over from a previous batch
+      // is cleared by resetSharedUploadTarget at session end, so on a fresh batch
+      // opts.target is empty and the new token is always adopted (no more stale 405).
+      const noUploadsInFlight = !(this.resumable.isUploading && this.resumable.isUploading());
+      if (!this.resumable.opts.target || noUploadsInFlight) {
         this.resumable.opts.target = res.data + '?ret-json=1';
       }
       return this.resumable.opts.target;
@@ -709,6 +726,19 @@ class FileUploader extends React.Component {
       throw error;
     });
     return this._uploadTargetPromise;
+  };
+
+  // resetSharedUploadTarget clears the per-batch upload-link state so the next batch
+  // re-fetches a fresh token. clearTarget also wipes this.resumable.opts.target — do
+  // this ONLY when no uploads are in flight (session complete / cancelled / closed),
+  // otherwise a running upload would lose its target. Leaving opts.target populated
+  // across batches is what let a new batch keep posting to a stale token.
+  resetSharedUploadTarget = ({ clearTarget = false } = {}) => {
+    this.isUploadLinkLoaded = false;
+    this._uploadTargetPromise = null;
+    if (clearTarget && this.resumable && this.resumable.opts) {
+      this.resumable.opts.target = '';
+    }
   };
 
   resumableUpload = (resumableFile) => {
@@ -1042,9 +1072,9 @@ class FileUploader extends React.Component {
 
   onComplete = () => {
     this.notifiedFolders = [];
-    // reset upload link loaded + cached target promise so the next batch re-fetches
-    this.isUploadLinkLoaded = false;
-    this._uploadTargetPromise = null;
+    // Session done, queue idle: drop the cached link AND the shared target so the
+    // next batch mints and adopts a fresh token instead of reusing a stale one.
+    this.resetSharedUploadTarget({ clearTarget: true });
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
   };
 
@@ -1057,8 +1087,7 @@ class FileUploader extends React.Component {
     // until the queue is actually idle so a later file add cannot mint a new
     // token and split an in-flight upload across trackers.
     if (!this.resumable || !this.resumable.isUploading()) {
-      this.isUploadLinkLoaded = false;
-      this._uploadTargetPromise = null;
+      this.resetSharedUploadTarget({ clearTarget: true });
     }
   };
 
@@ -1133,9 +1162,8 @@ class FileUploader extends React.Component {
     this.resumable.files = [];
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
-    // reset upload link loaded + cached target promise so the next batch re-fetches
-    this.isUploadLinkLoaded = false;
-    this._uploadTargetPromise = null;
+    // Dialog closed, uploads cancelled: clear the cached link AND the shared target.
+    this.resetSharedUploadTarget({ clearTarget: true });
     // Drop any undecided duplicates and the bulk choice so the next session starts clean.
     this.pendingDuplicates = [];
     this.duplicateBulkAction = null;
@@ -1192,9 +1220,9 @@ class FileUploader extends React.Component {
     });
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
-    // reset upload link loaded + cached target promise so the next batch re-fetches
-    this.isUploadLinkLoaded = false;
-    this._uploadTargetPromise = null;
+    // All uploads cancelled: clear the cached link AND the shared target so the next
+    // batch re-fetches and adopts a fresh token.
+    this.resetSharedUploadTarget({ clearTarget: true });
   };
 
   onUploadRetry = (resumableFile) => {
