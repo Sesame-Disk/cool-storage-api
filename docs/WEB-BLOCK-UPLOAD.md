@@ -398,10 +398,13 @@ is mapped onto the *legacy* resumable.js progress UI, which only understands
 - **No dedup/throughput observability.** The UI does not surface bytes already
   existing vs actually uploaded vs pending, nor the deduplicated percentage, so a
   fast repeat upload or an oddly-moving bar is unexplained to the user.
-- **Aggregated concurrency of multiple large files is unbounded across files.**
-  Each large file spawns its own orchestrator with internal block concurrency, so
-  `N` large files in one batch run `N × M` concurrent block operations
-  (hashing/network/backend). There is no cross-file ceiling yet.
+- **~~Aggregated concurrency of multiple large files is unbounded across files.~~ —
+  FIXED (PR2, global block-upload limiter).** Previously each large file spawned its
+  own orchestrator with its own pool, so `N` files ran `N × M` concurrent block
+  operations with no cross-file ceiling. A single shared `createBlockLimiter` now caps
+  the total blocks on the wire to the configured `simultaneous_uploads` ceiling; see
+  the "Frontend re-implementation from main → PR2" section below. (Hashing is still
+  per-file off-thread; the limiter bounds the network/backend block operations.)
 - **Cancel during `Saving…`/commit is undefined.** Cancel aborts the in-flight
   client requests, but its effect once the commit has started is not specified
   (whether the commit is interrupted, whether provisional refs linger until TTL,
@@ -450,9 +453,34 @@ must **not** reintroduce any target clearing.
   "preserves block entries when a legacy upload is added later".
 - Cancel-All now cancels every `!isSaved` entry (incl. a block at 100% in commit). Test:
   "cancel all still aborts a block upload that is already in saving at 100%".
-- Pending (next PRs): global adaptive block concurrency (static ceiling from
-  `simultaneous_uploads` first, then adaptive ramp); single-source upload list +
-  duplicate-name prompt for batch/large; broader browser E2E with the flag on.
+
+**PR2 — global STATIC block concurrency limiter (done; behind flag).**
+- Closed: CAS ignored global concurrency — each file ran its own pool of `3`, so N
+  files opened N×3 requests. New `frontend/src/utils/block-upload-limiter.js`
+  (`createBlockLimiter`) is a SINGLE semaphore shared by every block upload; the
+  ceiling is the config value `simultaneous_uploads` (via
+  `getBaselineSimultaneousUploads(props.simultaneousUploads || resumableSimultaneousUploads)`,
+  built once in `componentDidMount`) — the hardcoded `concurrency = 3` is removed from
+  the orchestrator (now `concurrency` is only a no-limiter test fallback, default 1).
+  Every block `acquire`s a slot before its network upload and releases after, so the
+  TOTAL blocks on the wire across ALL files never exceed the ceiling. Test:
+  `block-upload-orchestrator.test.js` "never exceeds the shared ceiling across multiple
+  files (no N×max)".
+- `acquire({ signal })` is signal-aware: an already-aborted signal rejects without
+  taking a slot; a waiter whose signal aborts is removed from the FIFO and never
+  uploads (no "ghost" upload after cancel). Tests: `block-upload-limiter.test.js`
+  "a waiter whose signal aborts…" + orchestrator "a block waiting for a slot is NOT
+  uploaded after its file is cancelled".
+- Anti-starvation: a file spawns at most `maxConcurrency` workers (NOT one waiter per
+  block) and each worker re-acquires at the back of the FIFO after every block, so
+  files interleave instead of the first one monopolising the queue. Test: orchestrator
+  "does not starve later files…".
+- STATIC ceiling here (`effective === max`); `setMax`/the adaptive ramp land in PR3.
+  The limiter is `reset()` on dialog close / cancel-all. Legacy resumable concurrency
+  (`upload-finalization.js` adaptive engine) is untouched — block-only.
+- Pending (next PRs): PR3 adaptive ramp (1→max by bandwidth, →1 on degrade); PR4
+  single-source upload list + duplicate-name prompt for batch/large; broader browser
+  E2E with the flag on.
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 

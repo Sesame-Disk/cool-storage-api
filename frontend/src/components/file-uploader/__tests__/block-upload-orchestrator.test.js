@@ -1,4 +1,5 @@
 import { isStallError, uploadFileViaBlocks } from '../block-upload-orchestrator';
+import { createBlockLimiter } from '../../../utils/block-upload-limiter';
 
 jest.mock('../../../utils/seafile-api', () => ({ seafileAPI: {} }));
 jest.mock('../../../utils/constants', () => ({ enableBlockUpload: true, blockUploadThresholdMB: 64 }));
@@ -253,6 +254,105 @@ describe('stall watchdog', () => {
     expect(isStallError(stall)).toBe(true);
     expect(isStallError(abort)).toBe(false);
     expect(isStallError(null)).toBe(false);
+  });
+});
+
+describe('global concurrency limiter (shared across files)', () => {
+  // hashOf returns N blocks tagged by file (sha256 = `${tag}${i}` so the first char
+  // identifies the file in the upload-order trace).
+  const hashOf = (tag, n) => jest.fn().mockResolvedValue({
+    blocks: Array.from({ length: n }, (_, i) => ({ index: i, sha1: `${tag}sha1-${i}`, sha256: `${tag}${i}`, size: 1 })),
+    size: n,
+  });
+
+  test('never exceeds the shared ceiling across multiple files (no N×max)', async () => {
+    const track = { active: 0, peak: 0 };
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn(() => {
+        track.active += 1;
+        track.peak = Math.max(track.peak, track.active);
+        return new Promise((resolve) => setTimeout(() => { track.active -= 1; resolve({ data: {} }); }, 0));
+      }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+    const limiter = createBlockLimiter({ maxConcurrency: 2 });
+
+    await Promise.all([
+      uploadFileViaBlocks(makeFile(4), { repoID: 'r', api, hashFn: hashOf('A', 4), blockSize: 1, limiter }),
+      uploadFileViaBlocks(makeFile(4), { repoID: 'r', api, hashFn: hashOf('B', 4), blockSize: 1, limiter }),
+      uploadFileViaBlocks(makeFile(4), { repoID: 'r', api, hashFn: hashOf('C', 4), blockSize: 1, limiter }),
+    ]);
+
+    // 3 files × 4 blocks were uploaded, but never more than 2 at once globally.
+    expect(api.uploadBlock).toHaveBeenCalledTimes(12);
+    expect(track.peak).toBeLessThanOrEqual(2);
+    expect(track.peak).toBeGreaterThan(0);
+    expect(limiter.getInFlight()).toBe(0);
+  });
+
+  test('does not starve later files: another file starts before the first finishes all its blocks', async () => {
+    const starts = [];
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn((session, hash) => {
+        starts.push(hash[0]); // file tag
+        return new Promise((resolve) => setTimeout(() => resolve({ data: {} }), 0));
+      }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+    const limiter = createBlockLimiter({ maxConcurrency: 2 });
+
+    await Promise.all([
+      uploadFileViaBlocks(makeFile(6), { repoID: 'r', api, hashFn: hashOf('A', 6), blockSize: 1, limiter }),
+      uploadFileViaBlocks(makeFile(6), { repoID: 'r', api, hashFn: hashOf('B', 6), blockSize: 1, limiter }),
+      uploadFileViaBlocks(makeFile(6), { repoID: 'r', api, hashFn: hashOf('C', 6), blockSize: 1, limiter }),
+    ]);
+
+    // A worker re-queues at the back after each block, so a later file gets a turn
+    // before the first file drains all of its blocks (no FIFO monopoly).
+    const lastA = starts.lastIndexOf('A');
+    const firstNonA = starts.findIndex((t) => t !== 'A');
+    expect(firstNonA).toBeGreaterThanOrEqual(0);
+    expect(firstNonA).toBeLessThan(lastA);
+  });
+
+  test('a block waiting for a slot is NOT uploaded after its file is cancelled', async () => {
+    const calls = [];
+    let releaseA;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn((session, hash) => {
+        calls.push(hash);
+        return new Promise((resolve) => {
+          if (hash[0] === 'A') {
+            releaseA = () => resolve({ data: {} }); // A holds the only slot until we let go
+          }
+        });
+      }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+    const limiter = createBlockLimiter({ maxConcurrency: 1 });
+    const ctrlB = new AbortController();
+
+    const pA = uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter });
+    await new Promise((r) => setTimeout(r, 5)); // let A take the only slot
+    const pB = uploadFileViaBlocks(makeFile(1), {
+      repoID: 'r', api, hashFn: hashOf('B', 1), blockSize: 1, limiter, signal: ctrlB.signal,
+    });
+    await new Promise((r) => setTimeout(r, 5)); // B's block is now queued behind A
+
+    ctrlB.abort(); // cancel B while it waits for a slot
+    await expect(pB).rejects.toHaveProperty('name', 'AbortError');
+    expect(calls).toEqual(['A0']); // B never uploaded
+
+    releaseA();
+    await pA;
+    expect(calls).toEqual(['A0']); // still only A even after the slot freed
+    expect(limiter.getInFlight()).toBe(0);
   });
 });
 
