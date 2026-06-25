@@ -675,6 +675,16 @@ class FileUploader extends React.Component {
   // "/folder/name", never the malformed "/foldername".
   getCurrentParentDir = () => (this.props.path === '/' ? '/' : `${this.props.path}/`);
 
+  // hasSharedTargetDependentLegacyFiles reports whether any OTHER file queued in
+  // resumable.files relies on the shared session target (i.e. has no per-file
+  // opts.target of its own). Such files must not be kicked by resumable.upload()
+  // before the shared target is set, or they POST to the empty target → 405.
+  hasSharedTargetDependentLegacyFiles = (currentFile) => {
+    return (this.resumable.files || []).some(file => (
+      file !== currentFile && !(file.opts && file.opts.target)
+    ));
+  };
+
   // startLegacyDuplicateUpload re-drives a held legacy file:
   //   - "keep"    → upload via the SHARED target (backend auto-renames to "name (1).ext"),
   //   - "replace" → a PER-FILE update-link target + replace flag (file.opts wins in
@@ -723,17 +733,24 @@ class FileUploader extends React.Component {
     };
 
     if (replace) {
-      // Replace carries its OWN per-file update-link target, so it does NOT depend on
-      // the shared session target — gating it on ensureSharedUploadTarget would let a
-      // shared-link failure block a perfectly valid replace. Fetch the update link,
-      // arm the per-file target, and start.
+      // Replace carries its OWN per-file update-link target, so the replace file itself
+      // does NOT need the shared session target. Fetch the update link, arm the per-file
+      // target, then start.
       const { repoID, path } = this.props;
       seafileAPI.getUpdateLink(repoID, path).then(res => {
         resumableFile.opts.target = res.data;
         resumableFile.formData['replace'] = 1;
         resumableFile.formData['target_file'] = `${parentDir}${resumableFile.fileName}`;
         pushFile();
-        this.resumable.upload();
+        // resumable.upload() starts the WHOLE queue, not just this file. If OTHER
+        // queued files still depend on the shared target (a normal/keep sibling with no
+        // per-file target), starting now would POST them to the empty target → 405. So
+        // only skip the shared-target wait when nothing else depends on it.
+        if (this.hasSharedTargetDependentLegacyFiles(resumableFile)) {
+          this.ensureSharedUploadTarget().then(() => this.resumable.upload()).catch(reofferHeldFile);
+        } else {
+          this.resumable.upload();
+        }
       }).catch(error => {
         toaster.danger(Utils.getErrorMsg(error));
         // Pulled from the queue before the link fetch (never in the list); re-queue.
@@ -768,7 +785,14 @@ class FileUploader extends React.Component {
     if (applyToAll) {
       const rest = this.pendingDuplicates.splice(0);
       rest.forEach(f => this.applyDuplicateDecision(f, action));
-      this.setState({ duplicateBatchActive: false });
+      // A bulk "Cancel" uploads nothing; if there is nothing else visible, don't leave
+      // an empty progress panel behind. Replace/keep always produce uploads (some via an
+      // async link fetch), so keep the panel open for those.
+      const hasVisibleUploads = (this.state.uploadFileList || []).length > 0;
+      this.setState({
+        duplicateBatchActive: false,
+        isUploadProgressDialogShow: action === 'cancel' ? hasVisibleUploads : true,
+      });
     } else {
       this.showNextDuplicatePrompt();
     }

@@ -957,4 +957,60 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(dialog).not.toBeNull();
     expect(dialog.props.showApplyToAll).toBe(true);
   });
+
+  test('replace in a mixed batch waits for the shared target so legacy siblings do not 405', async () => {
+    let resolveShared;
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' }); // resolves immediately
+    seafileAPI.getFileServerUploadLink.mockReturnValue(new Promise(r => { resolveShared = r; })); // pending
+    const uploader = createUploader(dupProps(['dup.txt']));
+    const dup = createResumableFile('dup.txt', { file: { name: 'dup.txt', size: 10 } });
+    // A normal sibling already queued, with NO per-file target → depends on the shared one.
+    const sibling = createResumableFile('new.txt', { file: { name: 'new.txt', size: 10 } });
+    uploader.resumable.files = [sibling];
+    uploader.state.currentResumableFile = dup;
+
+    uploader.replaceRepetitionFile(false); // Replace dup.txt
+    await flushPromises();
+
+    // getUpdateLink resolved, but the queue must NOT start: starting it would POST the
+    // sibling to the still-empty shared target → 405.
+    expect(uploader.resumable.upload).not.toHaveBeenCalled();
+
+    resolveShared({ data: '/upload/tok' });
+    await flushPromises();
+    expect(uploader.resumable.opts.target).toBe('/upload/tok?ret-json=1');
+    expect(uploader.resumable.upload).toHaveBeenCalled();
+  });
+
+  test('replace with no shared-target-dependent siblings starts immediately (own update link)', async () => {
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
+    seafileAPI.getFileServerUploadLink.mockRejectedValue(new Error('shared down'));
+    const uploader = createUploader(dupProps(['only.txt']));
+    const f = createResumableFile('only.txt', { file: { name: 'only.txt', size: 10 } });
+    uploader.state.currentResumableFile = f;
+
+    uploader.replaceRepetitionFile(false);
+    await flushPromises();
+
+    // Lone replace → no sibling needs the shared target → starts without waiting for it.
+    expect(uploader.resumable.upload).toHaveBeenCalled();
+    expect(f.opts.target).toBe('/update/tok');
+  });
+
+  test('apply-to-all Cancel closes both dialogs and leaves no empty progress panel', () => {
+    const uploader = createUploader(dupProps(['a.txt', 'b.txt']));
+    const a = createResumableFile('a.txt', { file: { name: 'a.txt', size: 10 } });
+    const b = createResumableFile('b.txt', { file: { name: 'b.txt', size: 10 } });
+    uploader.resumable.files = [a, b];
+
+    uploader.onFileAdded(a, [a, b]); // prompt a
+    uploader.onFileAdded(b, [a, b]); // queue b
+    expect(uploader.state.isUploadProgressDialogShow).toBe(true);
+
+    uploader.cancelFileUpload(true); // Cancel + apply to all
+
+    expect(uploader.state.isUploadRemindDialogShow).toBe(false);
+    expect(uploader.state.isUploadProgressDialogShow).toBe(false); // no empty panel
+    expect(uploader.pendingDuplicates).toEqual([]);
+  });
 });

@@ -602,6 +602,21 @@ must **not** reintroduce any target clearing.
   `showApplyToAll={duplicateBatchActive}` to the dialog, and the dialog renders the
   checkbox / `getApplyToAll` only when offered. Tests: `file-uploader.test.js` "the parent
   passes showApplyToAll…" + new `upload-remind-dialog.test.js`.
+
+**PR4 review hotfix #2 (same branch).** Two more issues from a follow-up review:
+- **[P1] Replace in a MIXED batch could re-open the 405.** Skipping the shared-target
+  wait is safe for the replace file (it has its own update link) but `resumable.upload()`
+  starts the WHOLE queue — so a normal/keep sibling still awaiting the shared target would
+  POST to the empty target → 405. Replace now only skips the wait when
+  `hasSharedTargetDependentLegacyFiles` is false (no other queued file lacks a per-file
+  target); otherwise it awaits `ensureSharedUploadTarget` before starting. Tests: "replace
+  in a mixed batch waits for the shared target…" + "replace with no shared-target-dependent
+  siblings starts immediately".
+- **[P2] Apply-to-all + Cancel could leave an empty progress panel** (the bulk branch of
+  `resolveDuplicate` bypassed `showNextDuplicatePrompt`). It now closes
+  `isUploadProgressDialogShow` after a bulk cancel when nothing is visible (replace/keep
+  keep it open). Test: "apply-to-all Cancel closes both dialogs and leaves no empty
+  progress panel".
 - **Manual verification with the flag OFF still required before merge** (legacy:
   small files, folders, replace/keep/cancel, cancel-all/retry-all → identical behavior,
   no duplicate/stale rows, no 405), then flag-ON browser E2E.
