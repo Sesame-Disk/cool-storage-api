@@ -593,6 +593,14 @@ class FileUploader extends React.Component {
         .catch(error => {
           toaster.danger(this.getAxiosErrorMessage(error));
           this.resumable.removeFile(resumableFile);
+          // Recompute the list now so the held file's row does not linger as a
+          // stale "waiting" entry while it is re-offered in the prompt.
+          const remaining = this.mergeUploadFileList(this.resumable.files);
+          this.setState({
+            uploadFileList: remaining,
+            totalProgress: this.calculateTotalProgress(remaining),
+            uploadBitrate: this.calculateUploadBitrate(remaining),
+          });
           this.pendingDuplicates.unshift(resumableFile);
           if (!this.state.isUploadRemindDialogShow) {
             this.showNextDuplicatePrompt();
@@ -1047,27 +1055,52 @@ class FileUploader extends React.Component {
     // auto-retry swaps the token out from under a big file still uploading.
     // The session token is multi-use and valid for the whole session (it already
     // serves every chunk of every file), so retrying on it is correct.
-    let retryFileList = this.state.retryFileList.filter(item => {
-      return item.uniqueIdentifier !== resumableFile.uniqueIdentifier;
-    });
-    let uploadFileList = this.state.uploadFileList.map(item => {
-      if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
-        clearFileUploadRuntimeState(item, { resetRemainingTime: true });
-        item.error = null;
-        if (resetAutoRetry) {
-          resetUploadConflictAutoRetry(item);
+    const doRetry = () => {
+      let retryFileList = this.state.retryFileList.filter(item => {
+        return item.uniqueIdentifier !== resumableFile.uniqueIdentifier;
+      });
+      let uploadFileList = this.state.uploadFileList.map(item => {
+        if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+          clearFileUploadRuntimeState(item, { resetRemainingTime: true });
+          item.error = null;
+          if (resetAutoRetry) {
+            resetUploadConflictAutoRetry(item);
+          }
+          this.retryUploadFile(item);
         }
-        this.retryUploadFile(item);
-      }
-      return item;
-    });
+        return item;
+      });
 
-    this.setState({
-      retryFileList: retryFileList,
-      uploadFileList: uploadFileList,
-      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
-    });
-    this.restoreConcurrencyIfIdle();
+      this.setState({
+        retryFileList: retryFileList,
+        uploadFileList: uploadFileList,
+        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+      });
+      this.restoreConcurrencyIfIdle();
+    };
+
+    this.withSharedTargetForLegacyRetry([resumableFile], doRetry);
+  };
+
+  // withSharedTargetForLegacyRetry re-establishes the shared upload target before a
+  // legacy "keep"/normal retry runs, then invokes proceed(). onError clears the
+  // shared target once the queue goes idle, so a retry triggered AFTER that would
+  // otherwise POST to the empty default target (page URL → 405). It only re-fetches
+  // when a file actually needs the shared target (legacy, non-replace) AND the
+  // target is currently empty — replace files carry their own per-file target, block
+  // files don't use resumable at all, and an existing target must be preserved so a
+  // still-in-flight upload is never rerouted onto a different tracker.
+  withSharedTargetForLegacyRetry = (files, proceed) => {
+    const needsSharedTarget = files.some(item => (
+      item && !item.isBlockUpload && !(item.formData && item.formData.replace)
+    )) && !(this.resumable && this.resumable.opts && this.resumable.opts.target);
+    if (needsSharedTarget) {
+      this.ensureUploadTargetReady()
+        .then(proceed)
+        .catch(error => toaster.danger(this.getAxiosErrorMessage(error)));
+      return;
+    }
+    proceed();
   };
 
   onComplete = () => {
@@ -1240,6 +1273,7 @@ class FileUploader extends React.Component {
     // onto a different server-side tracker mid-upload and split it across two
     // trackers (see retryUploadWithFreshLink). The session token stays valid.
     const blockRetryList = [];
+    const legacyRetryList = [];
     this.state.retryFileList.forEach(item => {
       if (item.isBlockUpload) {
         this.prepareBlockUploadRetry(item);
@@ -1249,7 +1283,9 @@ class FileUploader extends React.Component {
       clearFileUploadRuntimeState(item, { resetRemainingTime: true });
       resetUploadConflictAutoRetry(item);
       item.error = null;
-      this.retryUploadFile(item);
+      // Defer the actual retryUploadFile() (which POSTs) until the shared target is
+      // re-established — onError may have cleared it once the queue went idle.
+      legacyRetryList.push(item);
     });
 
     let uploadFileList = this.state.uploadFileList.slice(0);
@@ -1261,6 +1297,9 @@ class FileUploader extends React.Component {
     }, () => {
       blockRetryList.forEach(item => {
         this.runBlockUpload(item, item.file);
+      });
+      this.withSharedTargetForLegacyRetry(legacyRetryList, () => {
+        legacyRetryList.forEach(item => this.retryUploadFile(item));
       });
     });
     this.restoreConcurrencyIfIdle();

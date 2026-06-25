@@ -147,6 +147,49 @@ describe('FileUploader upload link reuse regression', () => {
     expect(uploader.isUploadLinkLoaded).toBe(false);
   });
 
+  test('legacy retry re-fetches/adopts a shared target after onError cleared it', async () => {
+    // Regression: onError clears opts.target once the queue is idle, but the legacy
+    // retry path reused the shared target without re-establishing it — so a Retry
+    // after an error POSTed to the empty default target (page URL → 405).
+    let resolveLink;
+    seafileAPI.getFileServerUploadLink.mockReturnValue(new Promise(r => { resolveLink = r; }));
+
+    const uploader = createUploader();
+    const failed = createResumableFile('a.iso'); // legacy, no per-file target
+    uploader.state.retryFileList = [failed];
+    uploader.state.uploadFileList = [failed];
+    uploader.resumable.opts.target = ''; // onError cleared it
+    uploader.resumable.isUploading.mockReturnValue(false);
+
+    uploader.onUploadRetry(failed);
+    // Held until the shared target exists — no POST yet.
+    expect(uploader.retryUploadFile).not.toHaveBeenCalled();
+
+    resolveLink({ data: '/upload/retry-token' });
+    await flushPromises();
+
+    expect(uploader.resumable.opts.target).toBe('/upload/retry-token?ret-json=1');
+    expect(uploader.retryUploadFile).toHaveBeenCalledWith(failed);
+  });
+
+  test('a replace retry does NOT wait on the shared target (it carries its own per-file target)', async () => {
+    const uploader = createUploader();
+    const replaceFile = createResumableFile('a.iso', {
+      opts: { target: '/update/token' },
+      formData: { parent_dir: '/', replace: 1 },
+    });
+    uploader.state.retryFileList = [replaceFile];
+    uploader.state.uploadFileList = [replaceFile];
+    uploader.resumable.opts.target = ''; // shared target gone, but replace doesn't need it
+    uploader.resumable.isUploading.mockReturnValue(false);
+
+    uploader.onUploadRetry(replaceFile);
+
+    // Synchronous: no shared-target fetch, retry runs immediately.
+    expect(seafileAPI.getFileServerUploadLink).not.toHaveBeenCalled();
+    expect(uploader.retryUploadFile).toHaveBeenCalledWith(replaceFile);
+  });
+
   test('initializes per-file opts before scoping a replace upload target', async () => {
     seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/token-a' });
     seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/token-a' }); // shared target
