@@ -64,6 +64,12 @@ class FileUploader extends React.Component {
     window.onbeforeunload = this.onbeforeunload;
     this.isUploadLinkLoaded = false;
     this.adaptiveUploadCleanup = null;
+    // Block (CAS) uploads run ONE FILE AT A TIME: a file-level FIFO on top of the
+    // block-level limiter. So a single large file gets the full block-concurrency
+    // ceiling while the others wait ("Waiting..."), instead of several large files
+    // crawling in parallel. Legacy resumable uploads are unaffected.
+    this.blockUploadQueue = [];
+    this.activeBlockUpload = null;
     this.navigationGuard = new UploadNavigationGuard(this.hasActiveUploadWork);
   }
 
@@ -312,8 +318,75 @@ class FileUploader extends React.Component {
       uploadFileList: [...prev.uploadFileList, entry],
       isUploadProgressDialogShow: true,
     }));
-    this.runBlockUpload(entry, file);
+    // The entry renders immediately (progress 0 → "Waiting...") and is started by the
+    // file-level queue when no other block upload is active.
+    this.enqueueBlockUpload(entry, file);
     return true;
+  };
+
+  // enqueueBlockUpload / drainBlockUploadQueue serialize block (CAS) uploads to ONE
+  // active file at a time. The block-level limiter still bounds concurrency WITHIN the
+  // active file; this only governs how many block FILES run at once (exactly one).
+  // Idempotent per entry (by object identity): a double Retry / Retry-All, or events
+  // firing before React removes the item from retryFileList, must not enqueue the same
+  // entry twice and open two CAS sessions for one file.
+  enqueueBlockUpload = (entry, file) => {
+    if (!entry) {
+      return false;
+    }
+    if (this.activeBlockUpload && this.activeBlockUpload.entry === entry) {
+      return false; // already running
+    }
+    if (this.blockUploadQueue.some(job => job.entry === entry)) {
+      return false; // already waiting
+    }
+    this.blockUploadQueue.push({ entry, file });
+    this.drainBlockUploadQueue();
+    return true;
+  };
+
+  drainBlockUploadQueue = () => {
+    if (this.activeBlockUpload) {
+      return; // a block file is already running; the rest stay "Waiting..."
+    }
+    const job = this.blockUploadQueue.shift();
+    if (!job) {
+      return;
+    }
+    this.activeBlockUpload = job;
+    // runBlockUpload resolves on success, handled error, or cancel (it never rejects),
+    // so the queue always advances. Guard a synchronous throw before the promise is
+    // returned so a future bug cannot strand activeBlockUpload and wedge the queue.
+    let promise;
+    try {
+      promise = this.runBlockUpload(job.entry, job.file);
+    } catch (error) {
+      promise = Promise.reject(error);
+    }
+    Promise.resolve(promise).finally(() => {
+      if (this.activeBlockUpload === job) {
+        this.activeBlockUpload = null;
+      }
+      this.drainBlockUploadQueue();
+    });
+  };
+
+  // removeQueuedBlockUpload drops a not-yet-started block file from the queue (it never
+  // ran, so there is nothing to abort). Matched by object identity so re-uploading the
+  // same filename in a later batch (a different entry) is not removed by accident. The
+  // active file is cancelled via entry.cancel().
+  removeQueuedBlockUpload = (item) => {
+    this.blockUploadQueue = this.blockUploadQueue.filter(job => job.entry !== item);
+  };
+
+  // clearBlockUploadQueue drops every PENDING block file (dialog close / cancel-all).
+  // It deliberately does NOT clear activeBlockUpload: the active file is being aborted
+  // via entry.cancel() but its promise may not have reached the finally yet, so nulling
+  // the marker here would let a freshly-added file start while the old one is still
+  // tearing down — breaking the one-active-at-a-time guarantee. The marker is released
+  // only by the active job's own finally.
+  clearBlockUploadQueue = () => {
+    this.blockUploadQueue = [];
   };
 
   // createBlockUploadEntry builds a resumable-file-shaped adapter so the existing
@@ -440,7 +513,8 @@ class FileUploader extends React.Component {
     // Hashing is the first half of the bar, uploading the second half. onPhase
     // drives the explicit entry._phase so the row renders Uploading…/Saving…
     // correctly; onTransferProgress feeds real wire bytes for the speed readout.
-    uploadFileViaBlocks(file, {
+    // Returns the settled promise so the file-level queue can start the next file.
+    return uploadFileViaBlocks(file, {
       repoID,
       parentDir: path,
       filename: file.name,
@@ -976,6 +1050,7 @@ class FileUploader extends React.Component {
 
   onCloseUploadDialog = () => {
     this.cancelActiveUploads();
+    this.clearBlockUploadQueue();
     if (this.blockLimiter) {
       this.blockLimiter.reset();
     }
@@ -990,6 +1065,9 @@ class FileUploader extends React.Component {
   };
 
   onUploadCancel = (uploadingItem) => {
+    // Drop it from the file-level queue if it was only waiting (never started); if it
+    // is the active block file, entry.cancel() below aborts it and the queue advances.
+    this.removeQueuedBlockUpload(uploadingItem);
 
     let uploadFileList = this.state.uploadFileList.filter(item => {
       if (item.uniqueIdentifier === uploadingItem.uniqueIdentifier) {
@@ -1031,6 +1109,7 @@ class FileUploader extends React.Component {
 
     this.loaded = 0;
     this.legacyUploadBitrate = 0;
+    this.clearBlockUploadQueue();
     if (this.blockLimiter) {
       this.blockLimiter.reset();
     }
@@ -1081,7 +1160,7 @@ class FileUploader extends React.Component {
       uploadBitrate: this.calculateUploadBitrate(uploadFileList),
     }, () => {
       blockRetryList.forEach(item => {
-        this.runBlockUpload(item, item.file);
+        this.enqueueBlockUpload(item, item.file);
       });
     });
     this.restoreConcurrencyIfIdle();
@@ -1099,7 +1178,7 @@ class FileUploader extends React.Component {
       totalProgress: this.calculateTotalProgress(uploadFileList),
       uploadBitrate: this.calculateUploadBitrate(uploadFileList),
     }, () => {
-      this.runBlockUpload(entry, entry.file);
+      this.enqueueBlockUpload(entry, entry.file);
     });
     this.restoreConcurrencyIfIdle();
   };

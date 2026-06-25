@@ -505,9 +505,43 @@ must **not** reintroduce any target clearing.
   sustained collapse, `noteFailure`/`noteRetry` drop to 1, ignore idle); orchestrator
   "a failed block upload tells the limiter to back off"; `file-uploader.test.js`
   "feeds the global block aggregate into the adaptive limiter on transfer progress".
+- Pending (next PRs): PR3.5 file-level serialization; PR4 single-source upload list +
+  duplicate-name prompt for batch/large; broader browser E2E with the flag on (verify
+  the ceiling ramps 1→`max` on a healthy link and backs off on a throttled one).
+
+**PR3.5 — serialize block uploads to one active file at a time (done; behind flag).**
+- The block (CAS) flow now runs **one file at a time**: a file-level FIFO
+  (`this.blockUploadQueue` + `this.activeBlockUpload`) sits on top of the block-level
+  limiter. A single large file gets the full adaptive block-concurrency ceiling while
+  the others wait ("Waiting...", they render at progress 0), instead of several large
+  files crawling in parallel. Rationale: clearer UX, fewer simultaneous CAS sessions,
+  and fewer odd list states while the single-source `uploadEntries` map (PR4) is not in
+  yet. The block-level limiter (PR2/PR3) is unchanged — it still bounds concurrency
+  WITHIN the active file. Legacy resumable uploads are NOT serialized (untouched).
+- `maybeBlockUpload` and the block retry paths (`retryBlockUpload`, `onUploadRetryAll`)
+  now `enqueueBlockUpload(entry, file)` instead of calling `runBlockUpload` directly;
+  `drainBlockUploadQueue` starts the next file only when none is active. `runBlockUpload`
+  returns its settled promise so the queue advances on success, handled error, or cancel
+  (it never rejects); `drainBlockUploadQueue` also guards a synchronous throw so a future
+  bug cannot strand `activeBlockUpload` and wedge the queue.
+- `enqueueBlockUpload` is **idempotent per entry (object identity)** — a double Retry /
+  Retry-All cannot enqueue the same file twice and open two CAS sessions.
+  `removeQueuedBlockUpload` also matches by identity (not `uniqueIdentifier`), so
+  re-uploading the same filename in a later batch is never removed by accident.
+- Cancellation: cancelling a queued file removes it (it never started); cancelling the
+  active file aborts it via `entry.cancel()` and the queue advances when its promise
+  settles. **Dialog close / cancel-all `clearBlockUploadQueue()` drops only the PENDING
+  queue — it does NOT null `activeBlockUpload`.** The active file is being torn down
+  (aborted) but its promise may not have reached the `finally` yet; nulling the marker
+  early would let a freshly-added file start mid-teardown and break the
+  one-active-at-a-time guarantee. The marker is released solely by the active job's own
+  `finally`.
+- Tests: `file-uploader.test.js` "block upload file-level queue (serialization)" — one
+  active at a time + advance on settle; cancelling a queued file removes it; close keeps
+  the active marker until the cancelled job settles; a new file added during the abort
+  window waits; idempotent enqueue.
 - Pending (next PR): PR4 single-source upload list + duplicate-name prompt for
-  batch/large; broader browser E2E with the flag on (verify the ceiling ramps 1→`max`
-  on a healthy link and backs off on a throttled one).
+  batch/large; broader browser E2E with the flag on.
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
