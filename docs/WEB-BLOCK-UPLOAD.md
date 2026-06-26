@@ -749,18 +749,35 @@ must **not** reintroduce any target clearing.
   `'hashing'` only when the file actually starts, so a queued row no longer shows the
   active file's "Hashing…". Test: `upload-list-item.test.js` "queued → Waiting" +
   `file-uploader.test.js` "freshly created block entry starts queued".
-- **[RESOLVED — PR6] Duplicate row for a file uploaded to an empty folder.** A block
-  file that finished (commonly fully deduplicated, so it completes fast) released its
-  `activeUploadNameKeys` guard on `markUploadSaved`; a second add of the SAME destination
-  then slipped past both the released guard AND `fileNameExistsInDir` (whose async
-  `uploadFileList` / server `direntList` may not yet reflect the just-finished upload, and
-  resumablejs never dedups because `generateUniqueIdentifier` is time-based), materializing
-  a second "Waiting…" row next to the "Uploaded" one. Fix: on success the key MOVES to a
-  new session-scoped `completedUploadNameKeys` set; `onFileAdded` checks it SYNCHRONOUSLY
-  and routes a re-add to the Replace? prompt regardless of async state. Cleared on close /
-  cancel-all. Tests: `file-uploader.test.js` "re-add of a destination completed THIS session
-  is caught synchronously even if the list is stale" + "closing the dialog clears the
-  completed-destination guard".
+- **[RESOLVED — PR6] Duplicate row for a single file (one add → two rows), and its mirror
+  (the file vanishing).** A block file rendered TWICE — a stale "Waiting…" row next to the
+  real "Uploaded … deduplicated" one — even though it was added once. Root cause: the
+  block file's original resumableFile leaks into `uploadFileList` as a phantom legacy row
+  with the SAME `uniqueIdentifier` as the block entry → two list items sharing a React
+  key, one stuck on stale state. (A naive `[...prev, entry]` append ALSO duplicates when
+  React double-invokes the state updater under StrictMode / re-entrant calls.) The first
+  attempted fix — *skip* the append when the id is already present — backfired: it skipped
+  the real block entry because the phantom already held the id, and then
+  `mergeUploadFileList` (which keeps only `isBlockUpload` items from the list) dropped the
+  phantom too, so the file vanished from the dialog entirely (uploaded fine, just
+  invisible). Correct fix: `appendUploadEntry` REPLACES — it filters out any entry with the
+  same id, then appends the block entry, so the block entry is both idempotent under
+  re-invocation AND authoritative over a phantom. Plus `mergeUploadFileList` now dedups by
+  `uniqueIdentifier` across ALL sources (block entries included). Tests:
+  `file-uploader.test.js` "appendUploadEntry replaces a phantom legacy entry sharing the
+  block id (no dup, no vanish)" + "idempotent when the updater is double-invoked" +
+  "mergeUploadFileList renders a block entry once even if it appears twice".
+- **[RESOLVED — PR6] Re-add of a just-completed destination + auto-rename guard.** A
+  separate hardening for re-dropping a file already uploaded THIS session: on success the
+  destination key MOVES from `activeUploadNameKeys` to a session-scoped
+  `completedUploadNameKeys` set, checked SYNCHRONOUSLY in `onFileAdded` so a re-add is
+  routed to the Replace? prompt even when the async `uploadFileList` / server `direntList`
+  has not refreshed (and resumablejs never dedups — `generateUniqueIdentifier` is
+  time-based). When the backend auto-renamed a standalone file ("keep both" →
+  "foo (1).txt"), the REAL saved destination is recorded too. Cleared on close /
+  cancel-all. Tests: "re-add … caught synchronously even if the list is stale", "closing
+  the dialog clears the completed-destination guard", "completed guard also catches the
+  backend auto-renamed destination".
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 

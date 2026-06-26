@@ -374,14 +374,32 @@ class FileUploader extends React.Component {
     this.resumable.removeFile(resumableFile);
 
     const entry = this.createBlockUploadEntry(resumableFile);
-    this.setState(prev => ({
-      uploadFileList: [...prev.uploadFileList, entry],
-      isUploadProgressDialogShow: true,
-    }));
+    this.appendUploadEntry(entry);
     // The entry renders immediately (progress 0 → "Waiting...") and is started by the
     // file-level queue when no other block upload is active.
     this.enqueueBlockUpload(entry, file);
     return true;
+  };
+
+  // appendUploadEntry puts a block entry into the rendered list as the SINGLE entry for
+  // its uniqueIdentifier. It drops any pre-existing entry with the same id, then appends
+  // the new one. This fixes the duplicate-row screenshot AND its mirror (the entry
+  // vanishing): a block file's original resumableFile can leak into uploadFileList as a
+  // phantom legacy "Waiting…" row with the SAME uniqueIdentifier as the block entry — two
+  // rows sharing a React key, one stuck on stale state. A naive `[...prev, entry]` append
+  // also duplicates whenever the updater runs twice (React double-invokes state updaters
+  // under StrictMode / re-entrant calls). Filtering the id out first makes the updater
+  // both idempotent (a second run replaces the same entry) and authoritative (the block
+  // entry always wins over a phantom, so mergeUploadFileList — which keeps only
+  // isBlockUpload items from the list — never drops the file).
+  appendUploadEntry = (entry) => {
+    this.setState(prev => ({
+      uploadFileList: [
+        ...prev.uploadFileList.filter(item => item && item.uniqueIdentifier !== entry.uniqueIdentifier),
+        entry,
+      ],
+      isUploadProgressDialogShow: true,
+    }));
   };
 
   // enqueueBlockUpload / drainBlockUploadQueue serialize block (CAS) uploads to ONE
@@ -755,10 +773,7 @@ class FileUploader extends React.Component {
     if (file && shouldUseBlockUpload(file, { encrypted: this.props.repoEncrypted })) {
       const entry = this.createBlockUploadEntry(resumableFile);
       entry._replace = replace; // persisted; the file-level queue runs it later
-      this.setState(prev => ({
-        uploadFileList: [...prev.uploadFileList, entry],
-        isUploadProgressDialogShow: true,
-      }));
+      this.appendUploadEntry(entry);
       this.enqueueBlockUpload(entry, file);
       return;
     }
@@ -1095,14 +1110,19 @@ class FileUploader extends React.Component {
   // uniqueIdentifier. Rebuilding from this.resumable.files alone erased block rows the
   // moment a legacy file was added, and would drop held files entirely.
   mergeUploadFileList = (resumableFiles = this.resumable ? this.resumable.files : [], uploadFileList = this.state.uploadFileList) => {
-    const merged = uploadFileList.filter(item => item && item.isBlockUpload);
-    const seen = new Set(merged.map(item => item.uniqueIdentifier));
+    const merged = [];
+    const seen = new Set();
     const addAll = (files) => (files || []).forEach(file => {
       if (file && !seen.has(file.uniqueIdentifier)) {
         merged.push(file);
         seen.add(file.uniqueIdentifier);
       }
     });
+    // Dedup by uniqueIdentifier across ALL sources, including the block entries (the
+    // initial filter used to keep them WITHOUT deduping, so a block entry that appeared
+    // twice in uploadFileList rendered twice). Block entries first (they live outside
+    // resumable.files), then resumable files, then held legacy files.
+    addAll(uploadFileList.filter(item => item && item.isBlockUpload));
     addAll(resumableFiles);
     addAll((this.legacyHold || []).map(h => h.resumableFile));
     return merged;
@@ -1211,6 +1231,14 @@ class FileUploader extends React.Component {
     const destKey = this.getUploadDestinationKey(resumableFile);
     this.activeUploadNameKeys.delete(destKey);
     this.completedUploadNameKeys.add(destKey);
+    // If the backend auto-renamed a standalone file ("keep both" → "foo (1).txt"), also
+    // record the REAL saved destination, so re-dropping that exact name before the
+    // server direntList refreshes is caught too (the original-name key alone misses it).
+    if (newFileName
+        && resumableFile.fileName === resumableFile.relativePath
+        && newFileName !== resumableFile.fileName) {
+      this.completedUploadNameKeys.add(`${this.props.repoID}:${this.props.path}:${newFileName}`);
+    }
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
         clearFileUploadRuntimeState(item);

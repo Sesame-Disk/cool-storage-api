@@ -1123,6 +1123,63 @@ describe('FileUploader duplicate-name prompting', () => {
 describe('FileUploader target-mode scheduler + sync dedup guard', () => {
   const dupProps = (names) => ({ direntList: names.map(name => ({ type: 'file', name })) });
 
+  test('appendUploadEntry is idempotent when the state updater is double-invoked (StrictMode-safe)', () => {
+    const uploader = createUploader();
+    uploader.state.uploadFileList = [];
+    // Simulate React StrictMode double-invoking the updater, chaining the first result
+    // into the second call (the impurity the old plain append exposed → a duplicate row).
+    uploader.setState = (update) => {
+      if (typeof update !== 'function') { uploader.state = { ...uploader.state, ...update }; return; }
+      const first = update(uploader.state) || {};
+      const mid = { ...uploader.state, ...first };
+      const second = update(mid) || {};
+      uploader.state = { ...mid, ...second };
+    };
+
+    uploader.appendUploadEntry({ uniqueIdentifier: 'b1', isBlockUpload: true });
+
+    expect(uploader.state.uploadFileList.filter(i => i.uniqueIdentifier === 'b1').length).toBe(1);
+  });
+
+  test('appendUploadEntry replaces a phantom legacy entry sharing the block id (no dup, no vanish)', () => {
+    const uploader = createUploader();
+    // A phantom legacy resumableFile leaked into the list with the SAME id as the block
+    // entry (the real-world cause of both the duplicate row and, with a naive skip, the
+    // file vanishing entirely once mergeUploadFileList drops non-block entries).
+    const phantom = { uniqueIdentifier: 'Y', fileName: 'all-databases.sql', isBlockUpload: false };
+    uploader.state.uploadFileList = [phantom];
+    const blockEntry = { uniqueIdentifier: 'Y', fileName: 'all-databases.sql', isBlockUpload: true };
+
+    uploader.appendUploadEntry(blockEntry);
+
+    const matches = uploader.state.uploadFileList.filter(i => i.uniqueIdentifier === 'Y');
+    expect(matches).toHaveLength(1); // exactly one row
+    expect(matches[0].isBlockUpload).toBe(true); // the block entry won, phantom gone
+  });
+
+  test('mergeUploadFileList renders a block entry once even if it appears twice in the list', () => {
+    const uploader = createUploader();
+    const entry = { uniqueIdentifier: 'b1', isBlockUpload: true };
+    const merged = uploader.mergeUploadFileList([], [entry, entry]);
+    expect(merged.filter(i => i.uniqueIdentifier === 'b1').length).toBe(1);
+  });
+
+  test('completed guard also catches the backend auto-renamed destination while the list is stale', () => {
+    const uploader = createUploader();
+    uploader.state.uploadFileList = [];
+    const first = createResumableFile('foo.txt', { uniqueIdentifier: 'done', file: { name: 'foo.txt', size: 10 } });
+
+    uploader.markUploadSaved(first, 'foo (1).txt'); // backend kept both → auto-renamed
+
+    uploader.state.uploadFileList = [];
+    const second = createResumableFile('foo (1).txt', { uniqueIdentifier: 'redrop', file: { name: 'foo (1).txt', size: 10 } });
+    uploader.resumable.files = [second];
+    uploader.onFileAdded(second, [second]);
+
+    expect(uploader.resumable.removeFile).toHaveBeenCalledWith(second);
+    expect(uploader.state.isUploadRemindDialogShow).toBe(true);
+  });
+
   test('a rapid second add of the same destination is dropped (synchronous dedup guard)', () => {
     seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/tok' });
     const uploader = createUploader(); // empty direntList → not a server duplicate
