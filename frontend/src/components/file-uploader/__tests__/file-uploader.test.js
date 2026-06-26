@@ -2,6 +2,7 @@ import FileUploader from '../file-uploader';
 import { seafileAPI } from '../../../utils/seafile-api';
 import { shouldUseBlockUpload } from '../block-upload-orchestrator';
 import UploadRemindDialog from '../../dialog/upload-remind-dialog';
+import toaster from '../../toast';
 
 // Recursively find the first rendered element of a given component type.
 const findRenderedByType = (node, type) => {
@@ -46,6 +47,7 @@ jest.mock('../../../utils/utils', () => ({
 jest.mock('../../toast', () => ({
   danger: jest.fn(),
   success: jest.fn(),
+  warning: jest.fn(),
 }));
 
 const flushPromises = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -168,22 +170,21 @@ describe('FileUploader upload link reuse regression', () => {
     expect(uploader.isUploadLinkLoaded).toBe(false);
   });
 
-  test('initializes per-file opts before scoping a replace upload target', async () => {
+  test('replace sets the INSTANCE target to the update-link (resumablejs ignores per-file target)', async () => {
     seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/token-a' });
-    seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/token-a' }); // shared target
 
     const uploader = createUploader();
     const resumableFile = createResumableFile('existing.txt', { opts: undefined });
 
-    // New flow: the held duplicate is the one currently prompted; replace resolves it,
-    // arms its per-file update-link target, and pushes it back into the queue.
+    // Lone replace, queue idle → 'update' mode runs immediately with the update-link as
+    // the shared instance target (per-file opts.target is ignored by resumablejs 1.1.16).
     uploader.resumable.files = [];
     uploader.state.currentResumableFile = resumableFile;
 
     uploader.replaceRepetitionFile();
     await flushPromises();
 
-    expect(resumableFile.opts).toEqual({ target: '/update/token-a' });
+    expect(uploader.resumable.opts.target).toBe('/update/token-a');
     expect(resumableFile.formData.replace).toBe(1);
     expect(resumableFile.formData.target_file).toBe('/existing.txt');
     expect(uploader.resumable.files).toContain(resumableFile);
@@ -900,7 +901,7 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(f.formData.target_file).toBeUndefined();
   });
 
-  test('a replace decision proceeds even when the shared-target fetch fails (uses its own update link)', async () => {
+  test('a replace decision uses the update-link instance target, never the shared upload-link', async () => {
     seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
     seafileAPI.getFileServerUploadLink.mockRejectedValue(new Error('shared link down'));
     const uploader = createUploader(dupProps(['x.txt']));
@@ -910,11 +911,14 @@ describe('FileUploader duplicate-name prompting', () => {
     uploader.replaceRepetitionFile(false);
     await flushPromises();
 
-    expect(f.opts.target).toBe('/update/tok');
+    // Replace ('update' mode) never touches the upload-link; a shared-link failure is
+    // irrelevant to it.
+    expect(seafileAPI.getFileServerUploadLink).not.toHaveBeenCalled();
+    expect(uploader.resumable.opts.target).toBe('/update/tok');
     expect(f.formData.replace).toBe(1);
     expect(f.formData.target_file).toBe('/x.txt');
     expect(uploader.resumable.files).toContain(f);
-    expect(uploader.resumable.upload).toHaveBeenCalled(); // not blocked by the shared-link failure
+    expect(uploader.resumable.upload).toHaveBeenCalled();
   });
 
   test('cancelling the only held duplicate closes the otherwise-empty progress dialog', () => {
@@ -958,33 +962,44 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(dialog.props.showApplyToAll).toBe(true);
   });
 
-  test('replace in a mixed batch waits for the shared target so legacy siblings do not 405', async () => {
-    let resolveShared;
-    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' }); // resolves immediately
-    seafileAPI.getFileServerUploadLink.mockReturnValue(new Promise(r => { resolveShared = r; })); // pending
+  test('a replace is HELD while the upload-link queue is busy, then runs with the update-link when idle', async () => {
+    seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/tok' });
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
     const uploader = createUploader(dupProps(['dup.txt']));
+
+    // A normal file uploads via the upload-link → 'upload' mode active.
+    const normal = createResumableFile('new.txt', { file: { name: 'new.txt', size: 10 } });
+    uploader.resumable.files = [normal];
+    uploader.onFileAdded(normal, [normal]);
+    await flushPromises();
+    expect(uploader.activeLegacyMode).toBe('upload');
+    uploader.resumable.isUploading.mockReturnValue(true);
+    uploader.resumable.upload.mockClear();
+
+    // Resolve a Replace while the upload-link queue is in flight → it must be HELD, not
+    // started (resumablejs routes ALL chunks to one instance target, so starting now
+    // would reroute the normal file to the update endpoint).
     const dup = createResumableFile('dup.txt', { file: { name: 'dup.txt', size: 10 } });
-    // A normal sibling already queued, with NO per-file target → depends on the shared one.
-    const sibling = createResumableFile('new.txt', { file: { name: 'new.txt', size: 10 } });
-    uploader.resumable.files = [sibling];
     uploader.state.currentResumableFile = dup;
-
-    uploader.replaceRepetitionFile(false); // Replace dup.txt
+    uploader.replaceRepetitionFile(false);
     await flushPromises();
 
-    // getUpdateLink resolved, but the queue must NOT start: starting it would POST the
-    // sibling to the still-empty shared target → 405.
     expect(uploader.resumable.upload).not.toHaveBeenCalled();
+    expect(uploader.legacyHold.some(h => h.resumableFile === dup)).toBe(true);
+    expect(uploader.resumable.files).not.toContain(dup); // held out of the running queue
 
-    resolveShared({ data: '/upload/tok' });
+    // The upload-link queue finishes → the held replace runs with the update-link target.
+    uploader.resumable.isUploading.mockReturnValue(false);
+    uploader.onComplete();
     await flushPromises();
-    expect(uploader.resumable.opts.target).toBe('/upload/tok?ret-json=1');
+
+    expect(uploader.resumable.opts.target).toBe('/update/tok');
+    expect(uploader.resumable.files).toContain(dup);
     expect(uploader.resumable.upload).toHaveBeenCalled();
   });
 
-  test('replace with no shared-target-dependent siblings starts immediately (own update link)', async () => {
+  test('a lone replace (queue idle) starts immediately with the update-link', async () => {
     seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
-    seafileAPI.getFileServerUploadLink.mockRejectedValue(new Error('shared down'));
     const uploader = createUploader(dupProps(['only.txt']));
     const f = createResumableFile('only.txt', { file: { name: 'only.txt', size: 10 } });
     uploader.state.currentResumableFile = f;
@@ -992,9 +1007,9 @@ describe('FileUploader duplicate-name prompting', () => {
     uploader.replaceRepetitionFile(false);
     await flushPromises();
 
-    // Lone replace → no sibling needs the shared target → starts without waiting for it.
+    expect(uploader.activeLegacyMode).toBe('update');
+    expect(uploader.resumable.opts.target).toBe('/update/tok');
     expect(uploader.resumable.upload).toHaveBeenCalled();
-    expect(f.opts.target).toBe('/update/tok');
   });
 
   test('apply-to-all Cancel closes both dialogs and leaves no empty progress panel', () => {
@@ -1012,5 +1027,91 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(uploader.state.isUploadRemindDialogShow).toBe(false);
     expect(uploader.state.isUploadProgressDialogShow).toBe(false); // no empty panel
     expect(uploader.pendingDuplicates).toEqual([]);
+  });
+});
+
+describe('FileUploader target-mode scheduler + sync dedup guard', () => {
+  const dupProps = (names) => ({ direntList: names.map(name => ({ type: 'file', name })) });
+
+  test('a rapid second add of the same destination is dropped (synchronous dedup guard)', () => {
+    seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/tok' });
+    const uploader = createUploader(); // empty direntList → not a server duplicate
+    const f1 = createResumableFile('a.txt', { uniqueIdentifier: 'a-1', file: { name: 'a.txt', size: 10 } });
+    const f2 = createResumableFile('a.txt', { uniqueIdentifier: 'a-2', file: { name: 'a.txt', size: 10 } });
+
+    uploader.onFileAdded(f1, [f1]); // first → reserves the key, schedules
+    uploader.onFileAdded(f2, [f2]); // rapid second, same destination → dropped
+
+    expect(uploader.resumable.removeFile).toHaveBeenCalledWith(f2);
+    expect(toaster.warning).toHaveBeenCalled();
+    expect(uploader.legacyHold.length).toBe(0);
+    expect(uploader.activeUploadNameKeys.has('repo-1:/:a.txt')).toBe(true);
+  });
+
+  test('the dedup key is released on success so a later re-drop can be offered the prompt', () => {
+    const uploader = createUploader();
+    const f = createResumableFile('a.txt', { uniqueIdentifier: 'a-1' });
+    uploader.activeUploadNameKeys.add(uploader.getUploadDestinationKey(f));
+    uploader.state.uploadFileList = [{ uniqueIdentifier: 'a-1', fileName: 'a.txt' }];
+
+    uploader.markUploadSaved(f, 'a.txt');
+
+    expect(uploader.activeUploadNameKeys.has(uploader.getUploadDestinationKey(f))).toBe(false);
+  });
+
+  test('apply-to-all Replace runs every replace via the update-link with no hold (queue idle)', async () => {
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
+    const uploader = createUploader(dupProps(['a.txt', 'b.txt']));
+    const a = createResumableFile('a.txt', { file: { name: 'a.txt', size: 10 } });
+    const b = createResumableFile('b.txt', { file: { name: 'b.txt', size: 10 } });
+    uploader.resumable.files = [a, b];
+
+    uploader.onFileAdded(a, [a, b]); // prompt a
+    uploader.onFileAdded(b, [a, b]); // queue b
+    uploader.replaceRepetitionFile(true); // Replace + apply to all
+    await flushPromises();
+
+    expect(uploader.activeLegacyMode).toBe('update');
+    expect(uploader.legacyHold.length).toBe(0); // both share 'update' → no conflict
+    expect(uploader.resumable.files).toEqual(expect.arrayContaining([a, b]));
+    expect(uploader.resumable.opts.target).toBe('/update/tok');
+    expect(a.formData.replace).toBe(1);
+    expect(b.formData.replace).toBe(1);
+  });
+
+  test('a normal file added while a replace is uploading is held (Waiting), then runs upload-link when idle', async () => {
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
+    seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/tok' });
+    const uploader = createUploader(dupProps(['dup.txt']));
+
+    // Replace running → 'update' mode active.
+    const dup = createResumableFile('dup.txt', { file: { name: 'dup.txt', size: 10 } });
+    uploader.state.currentResumableFile = dup;
+    uploader.replaceRepetitionFile(false);
+    await flushPromises();
+    expect(uploader.activeLegacyMode).toBe('update');
+    uploader.resumable.isUploading.mockReturnValue(true);
+    uploader.resumable.upload.mockClear();
+
+    // A normal file is dropped during the replace → must be held (different mode).
+    const normal = createResumableFile('new.txt', { file: { name: 'new.txt', size: 10 } });
+    uploader.resumable.files = [...uploader.resumable.files, normal];
+    uploader.onFileAdded(normal, [normal]);
+    await flushPromises();
+
+    expect(uploader.resumable.upload).not.toHaveBeenCalled();
+    expect(uploader.legacyHold.some(h => h.resumableFile === normal && h.mode === 'upload')).toBe(true);
+    expect(uploader.resumable.removeFile).toHaveBeenCalledWith(normal);
+    expect(uploader.state.uploadFileList).toContain(normal); // rendered as "Waiting…"
+
+    // Replace finishes → the held normal file runs with the upload-link. A lone file
+    // resumes from its uploaded-bytes offset (resumableUpload), not a bare upload().
+    uploader.resumable.isUploading.mockReturnValue(false);
+    uploader.onComplete();
+    await flushPromises();
+    expect(uploader.activeLegacyMode).toBe('upload');
+    expect(uploader.resumable.opts.target).toBe('/upload/tok?ret-json=1');
+    expect(uploader.resumable.files).toContain(normal);
+    expect(uploader.resumableUpload).toHaveBeenCalledWith(normal);
   });
 });

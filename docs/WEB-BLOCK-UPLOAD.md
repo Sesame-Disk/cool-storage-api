@@ -621,6 +621,50 @@ must **not** reintroduce any target clearing.
   small files, folders, replace/keep/cancel, cancel-all/retry-all → identical behavior,
   no duplicate/stale rows, no 405), then flag-ON browser E2E.
 
+**PR5 — target-mode scheduler for legacy uploads + synchronous dedup guard.**
+
+> **Critical finding — `@seafile/resumablejs@1.1.16` ignores per-file `opts.target`.**
+> Its `$h.getTarget` reads `$.getOpt('target')` where `$` is bound to the Resumable
+> INSTANCE (not the chunk/file), and the chunk's real POST (`getTarget('upload', [])`)
+> passes empty params — so even a function target gets no per-file context. Every chunk
+> of every queued file therefore POSTs to the single instance-level
+> `resumable.opts.target`. This invalidated the per-file-target assumption baked into
+> every prior PR's replace flow ("file.opts wins in getOpt"): replace files setting
+> `resumableFile.opts.target = updateLink` had NO effect — their chunks went to the
+> shared upload-link. Replace was effectively broken for the real (un-mocked) path.
+
+- **Target-mode scheduler.** Because only ONE instance target can be active, files
+  needing different endpoints — `'upload'` (new + keep → upload-link) vs `'update'`
+  (replace → update-link) — cannot run concurrently. `enqueueLegacyUpload(file, mode)`
+  routes a prepared legacy file: if its mode matches the in-flight mode (or the queue is
+  idle) it starts (`startLegacyFiles` sets the instance target for the mode, then
+  `resumable.upload()`); if it conflicts, the file is **held** (`holdLegacyFile` pulls it
+  out of `resumable.files` and renders it "Waiting…"). When the queue goes idle
+  (`onComplete` / idle `onError` / `onCancel` → `onLegacyQueueIdle`) the next held
+  same-mode group is started, switching the instance target. No-conflict batches
+  (all-upload or all-update) never hit the hold path, so the common flow is unchanged.
+  `startLegacyDuplicateUpload` is now just "prepare formData + `enqueueLegacyUpload`";
+  replace uses a per-replace-group cached update-link (`ensureReplaceUpdateLink`).
+  `mergeUploadFileList` unions the held files so they render. Replace now actually routes
+  to the update endpoint (instance target), fixing the broken/`405` replace.
+- **Synchronous dedup guard (`activeUploadNameKeys`).** `fileNameExistsInDir` reads the
+  async `uploadFileList` and (for legacy) requires `isUploading()`, so a rapid SECOND
+  `fileAdded` for the same destination slips past it before the first is visible —
+  producing a duplicate row (the user's screenshot: "Waiting…" next to "Uploaded"). A
+  `Set` of `repoID:path:relativePath` keys is updated SYNCHRONOUSLY the moment a file is
+  committed (queued or held for a prompt); a second add is dropped at once ("This file is
+  already queued"). Released on success (`markUploadSaved`), per-file cancel, bulk
+  cancel/close, and a cancelled held duplicate — so a re-drop AFTER completion still gets
+  the Replace? prompt. No `_ownsDestinationKey` flag needed: Option-A drop means only the
+  original ever holds a key.
+- Tests: `file-uploader.test.js` "target-mode scheduler + sync dedup guard" (rapid
+  double-drop dropped; key released on save; apply-to-all Replace runs all via update-link
+  with no hold; a normal file added during a replace is held "Waiting" then runs
+  upload-link when idle) + the replace tests rewritten for the instance-target model (lone
+  replace → update-link immediately; replace held behind an in-flight upload-link queue).
+- Pending: manual flag-OFF verification (incl. a real replace POSTing to the update
+  endpoint) + flag-ON browser E2E.
+
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
 None of these block merging the branch: the flow ships **disabled** in every prod

@@ -58,6 +58,15 @@ class FileUploader extends React.Component {
 
     this.uploadInput = React.createRef();
 
+    // Synchronous duplicate guard. fileNameExistsInDir reads this.state.uploadFileList
+    // (async setState) and only matches a legacy file once it is uploading/saved, so a
+    // rapid SECOND fileAdded for the same destination can slip past it before the first
+    // is visible — producing two rows. This Set of destination keys (repoID:path:
+    // relativePath) is updated SYNCHRONOUSLY the moment a file is committed (queued or
+    // held for a prompt), so the second drop is caught immediately. Released when the
+    // file reaches a terminal state (saved / cancelled / dialog closed).
+    this.activeUploadNameKeys = new Set();
+
     this.notifiedFolders = [];
 
     this.timestamp = null;
@@ -83,6 +92,21 @@ class FileUploader extends React.Component {
     // every fileAdded within one drag/selection). Scopes "apply to all" to its batch
     // instead of every later upload in the session.
     this._currentBatchRef = null;
+    // Target-mode scheduler for LEGACY resumable uploads. resumablejs@1.1.16's
+    // $h.getTarget reads ONLY the instance-level resumable.opts.target (it ignores
+    // per-file opts.target), so every chunk of every queued file POSTs to that single
+    // target. Files needing different endpoints — 'upload' (new/keep → upload-link) vs
+    // 'update' (replace → update-link) — therefore CANNOT run concurrently. The
+    // scheduler serializes them: while one mode is in flight, files of the other mode
+    // are held out of resumable.files (rendered "Waiting…") and started after the queue
+    // goes idle and the instance target is switched. No-conflict batches (all-upload or
+    // all-update) never hit the hold path.
+    this.legacyHold = []; // [{ resumableFile, mode }] held due to a target-mode conflict
+    this.activeLegacyMode = null; // 'upload' | 'update' | null (queue idle)
+    // Cached update-link promise for the current replace group: multiple replace files
+    // share the single instance target, so they reuse one update-link token. Reset when
+    // the session ends (close / cancel-all).
+    this._replaceUpdateLinkPromise = null;
     this.adaptiveUploadCleanup = null;
     // Block (CAS) uploads run ONE FILE AT A TIME: a file-level FIFO on top of the
     // block-level limiter. So a single large file gets the full block-concurrency
@@ -653,6 +677,12 @@ class FileUploader extends React.Component {
   // otherwise. 'cancel' simply drops the held file (already removed from the queue).
   applyDuplicateDecision = (resumableFile, action) => {
     if (!resumableFile || action === 'cancel') {
+      // Cancel drops the held duplicate: release its destination key so a later drop of
+      // the same name can be offered again (the held file owns the key — a rapid second
+      // drop was caught and never registered one).
+      if (resumableFile && action === 'cancel') {
+        this.activeUploadNameKeys.delete(this.getUploadDestinationKey(resumableFile));
+      }
       return;
     }
     const replace = action === 'replace';
@@ -675,101 +705,158 @@ class FileUploader extends React.Component {
   // "/folder/name", never the malformed "/foldername".
   getCurrentParentDir = () => (this.props.path === '/' ? '/' : `${this.props.path}/`);
 
-  // hasSharedTargetDependentLegacyFiles reports whether any OTHER file queued in
-  // resumable.files relies on the shared session target (i.e. has no per-file
-  // opts.target of its own). Such files must not be kicked by resumable.upload()
-  // before the shared target is set, or they POST to the empty target → 405.
-  hasSharedTargetDependentLegacyFiles = (currentFile) => {
-    return (this.resumable.files || []).some(file => (
-      file !== currentFile && !(file.opts && file.opts.target)
-    ));
+  // ensureReplaceUpdateLink fetches (once per replace group) the update-link used as
+  // the instance target for replace ('update' mode) uploads. Cached so multiple
+  // replace files in one group share a single token; reset at session end.
+  ensureReplaceUpdateLink = () => {
+    if (this._replaceUpdateLinkPromise) {
+      return this._replaceUpdateLinkPromise;
+    }
+    const { repoID, path } = this.props;
+    this._replaceUpdateLinkPromise = seafileAPI.getUpdateLink(repoID, path)
+      .then(res => res.data)
+      .catch(error => {
+        this._replaceUpdateLinkPromise = null; // allow a retry on next attempt
+        throw error;
+      });
+    return this._replaceUpdateLinkPromise;
   };
 
-  // startLegacyDuplicateUpload re-drives a held legacy file:
-  //   - "keep"    → upload via the SHARED target (backend auto-renames to "name (1).ext"),
-  //   - "replace" → a PER-FILE update-link target + replace flag (file.opts wins in
-  //                 resumable.getOpt, so it never reroutes other in-flight uploads).
+  // renderLegacyList rebuilds the rendered upload list from resumable.files + the
+  // held ("Waiting…") files + block entries, and refreshes progress/bitrate.
+  renderLegacyList = () => {
+    const uploadFileList = this.mergeUploadFileList(this.resumable.files);
+    this.setState({
+      isUploadProgressDialogShow: true,
+      uploadFileList,
+      totalProgress: this.calculateTotalProgress(uploadFileList),
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+    });
+  };
+
+  // enqueueLegacyUpload starts (or holds) an already-prepared legacy resumable file
+  // under the target-mode scheduler. 'upload' = new/keep via the upload-link; 'update'
+  // = replace via the update-link. Because resumablejs routes every chunk to the single
+  // instance-level opts.target, only ONE mode can be in flight at a time: a file whose
+  // mode conflicts with the active one is held (rendered "Waiting…") until the queue
+  // goes idle and the instance target is switched. A no-conflict file starts at once.
+  enqueueLegacyUpload = (resumableFile, mode, { resume = false } = {}) => {
+    resumableFile._uploadMode = mode;
+    resumableFile._resumeOnStart = resume;
+    // Self-heal a stale active mode if an idle event was missed (queue truly idle and
+    // nothing held), so a new mode is not blocked forever.
+    if (!this.resumable.isUploading() && this.legacyHold.length === 0) {
+      this.activeLegacyMode = null;
+    }
+    if (this.activeLegacyMode !== null && this.activeLegacyMode !== mode) {
+      this.holdLegacyFile(resumableFile, mode);
+      return;
+    }
+    this.activeLegacyMode = mode;
+    this.startLegacyFiles([resumableFile]);
+  };
+
+  // startLegacyFiles ensures the instance target for the (single, shared) mode of the
+  // given queued files, then uploads. All files passed share one mode.
+  startLegacyFiles = (resumableFiles) => {
+    if (resumableFiles.length === 0) {
+      return;
+    }
+    const mode = resumableFiles[0]._uploadMode;
+    resumableFiles.forEach(f => {
+      if (this.resumable.files.indexOf(f) === -1) {
+        this.resumable.files.push(f);
+      }
+    });
+    this.renderLegacyList();
+
+    const targetPromise = mode === 'update' ? this.ensureReplaceUpdateLink() : this.ensureSharedUploadTarget();
+    targetPromise.then((target) => {
+      // resumablejs ignores per-file opts.target — route the whole queue via the
+      // instance target. Safe because the scheduler guarantees only same-mode files
+      // are in resumable.files right now.
+      this.resumable.opts.target = target;
+      // A lone fresh normal file resumes from its uploaded-bytes offset; otherwise just
+      // start the queue.
+      if (mode === 'upload' && resumableFiles.length === 1 && resumableFiles[0]._resumeOnStart) {
+        this.resumableUpload(resumableFiles[0]);
+      } else {
+        this.resumable.upload();
+      }
+    }).catch((error) => {
+      toaster.danger(this.getAxiosErrorMessage(error));
+      // A held duplicate whose link fetch failed must be re-offered (don't lose the
+      // user's pending decision); a plain normal file just surfaces the error.
+      resumableFiles.forEach(f => {
+        if (f._fromDuplicatePrompt) {
+          this.reofferLegacyFile(f);
+        }
+      });
+    });
+  };
+
+  // holdLegacyFile pulls a file out of resumable.files (so the running other-mode queue
+  // cannot start it against the wrong instance target) and records it as held; it
+  // renders as a "Waiting…" row and is started by onLegacyQueueIdle when its turn comes.
+  holdLegacyFile = (resumableFile, mode) => {
+    this.resumable.removeFile(resumableFile);
+    resumableFile.remainingTime = -1; // show "Preparing…" rather than a stuck 0% bar
+    this.legacyHold.push({ resumableFile, mode });
+    this.renderLegacyList();
+  };
+
+  // onLegacyQueueIdle runs when the resumable queue goes idle (complete / all errored /
+  // cancelled). It clears the active mode and, if files of another mode are held, starts
+  // the next same-mode group (switching the instance target for it).
+  onLegacyQueueIdle = () => {
+    this.activeLegacyMode = null;
+    if (this.legacyHold.length === 0) {
+      return;
+    }
+    const mode = this.legacyHold[0].mode;
+    const group = this.legacyHold.filter(h => h.mode === mode).map(h => h.resumableFile);
+    this.legacyHold = this.legacyHold.filter(h => h.mode !== mode);
+    this.activeLegacyMode = mode;
+    this.startLegacyFiles(group);
+  };
+
+  // reofferLegacyFile pulls a (held duplicate) file back out and re-prompts, leaving no
+  // stale "Waiting…" row. Used when its target fetch fails.
+  reofferLegacyFile = (resumableFile) => {
+    this.resumable.removeFile(resumableFile);
+    this.legacyHold = this.legacyHold.filter(h => h.resumableFile !== resumableFile);
+    this.renderLegacyList();
+    this.pendingDuplicates.unshift(resumableFile);
+    if (!this.state.isUploadRemindDialogShow) {
+      this.showNextDuplicatePrompt();
+    }
+  };
+
+  // startLegacyDuplicateUpload prepares a held legacy duplicate and hands it to the
+  // target-mode scheduler:
+  //   - "keep"    → 'upload' mode (shared upload-link; backend auto-renames to "name (1).ext"),
+  //   - "replace" → 'update' mode (update-link as the instance target + replace flag).
   startLegacyDuplicateUpload = (resumableFile, replace) => {
     resumableFile.formData = resumableFile.formData || {};
     resumableFile.opts = resumableFile.opts || {};
-    // Clear any routing left by a PREVIOUS decision on this SAME held object (e.g. a
-    // Replace attempt that got re-queued after a failure). Otherwise a later "Don't
-    // replace" would inherit the stale update-link target + target_file and overwrite
-    // the existing file against the user's explicit choice.
+    resumableFile._fromDuplicatePrompt = true;
+    // Clear routing left by a PREVIOUS decision on this SAME held object (e.g. a Replace
+    // attempt that was re-offered): a later "Don't replace" must not inherit the stale
+    // update target_file and overwrite the file against the user's choice.
     delete resumableFile.opts.target;
     delete resumableFile.formData.target_file;
 
     const parentDir = resumableFile.formData.parent_dir || this.getCurrentParentDir();
     resumableFile.formData['parent_dir'] = parentDir;
 
-    const pushFile = () => {
-      if (this.resumable.files.indexOf(resumableFile) === -1) {
-        this.resumable.files.push(resumableFile);
-      }
-      const uploadFileList = this.mergeUploadFileList(this.resumable.files);
-      this.setState({
-        isUploadProgressDialogShow: true,
-        uploadFileList,
-        totalProgress: this.calculateTotalProgress(uploadFileList),
-        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
-      });
-    };
-
-    // reofferHeldFile re-queues a file that was already pushed into the queue/list (so
-    // it must be pulled back out, leaving no stale "Waiting..." row) and re-prompts.
-    const reofferHeldFile = (error) => {
-      toaster.danger(this.getAxiosErrorMessage(error));
-      this.resumable.removeFile(resumableFile);
-      const remaining = this.mergeUploadFileList(this.resumable.files);
-      this.setState({
-        uploadFileList: remaining,
-        totalProgress: this.calculateTotalProgress(remaining),
-        uploadBitrate: this.calculateUploadBitrate(remaining),
-      });
-      this.pendingDuplicates.unshift(resumableFile);
-      if (!this.state.isUploadRemindDialogShow) {
-        this.showNextDuplicatePrompt();
-      }
-    };
-
     if (replace) {
-      // Replace carries its OWN per-file update-link target, so the replace file itself
-      // does NOT need the shared session target. Fetch the update link, arm the per-file
-      // target, then start.
-      const { repoID, path } = this.props;
-      seafileAPI.getUpdateLink(repoID, path).then(res => {
-        resumableFile.opts.target = res.data;
-        resumableFile.formData['replace'] = 1;
-        resumableFile.formData['target_file'] = `${parentDir}${resumableFile.fileName}`;
-        pushFile();
-        // resumable.upload() starts the WHOLE queue, not just this file. If OTHER
-        // queued files still depend on the shared target (a normal/keep sibling with no
-        // per-file target), starting now would POST them to the empty target → 405. So
-        // only skip the shared-target wait when nothing else depends on it.
-        if (this.hasSharedTargetDependentLegacyFiles(resumableFile)) {
-          this.ensureSharedUploadTarget().then(() => this.resumable.upload()).catch(reofferHeldFile);
-        } else {
-          this.resumable.upload();
-        }
-      }).catch(error => {
-        toaster.danger(Utils.getErrorMsg(error));
-        // Pulled from the queue before the link fetch (never in the list); re-queue.
-        this.pendingDuplicates.push(resumableFile);
-        if (!this.state.isUploadRemindDialogShow) {
-          this.showNextDuplicatePrompt();
-        }
-      });
-      return;
+      resumableFile.formData['replace'] = 1;
+      resumableFile.formData['target_file'] = `${parentDir}${resumableFile.fileName}`;
+      this.enqueueLegacyUpload(resumableFile, 'update');
+    } else {
+      resumableFile.formData['replace'] = 0;
+      this.enqueueLegacyUpload(resumableFile, 'upload');
     }
-
-    // Keep: no per-file target → it uploads through the SHARED session target, so wait
-    // for that to be set. If the fetch fails, DON'T kick the queue (it would POST to the
-    // empty target → 405) — re-offer the file instead.
-    resumableFile.formData['replace'] = 0;
-    pushFile();
-    this.ensureSharedUploadTarget()
-      .then(() => this.resumable.upload())
-      .catch(reofferHeldFile);
   };
 
   // resolveDuplicate is invoked by the replace dialog. It applies the action to the
@@ -798,6 +885,14 @@ class FileUploader extends React.Component {
     }
   };
 
+  // getUploadDestinationKey returns the synchronous duplicate-guard key for a file.
+  // relativePath (not just fileName) distinguishes folder-upload siblings in different
+  // subdirs; for a standalone file relativePath === fileName.
+  getUploadDestinationKey = (resumableFile) => {
+    const relative = resumableFile.relativePath || resumableFile.fileName;
+    return `${this.props.repoID}:${this.props.path}:${relative}`;
+  };
+
   onFileAdded = (resumableFile, files) => {
     const { isCustomPermission } = this.props;
     const isFile = resumableFile.fileName === resumableFile.relativePath;
@@ -810,15 +905,30 @@ class FileUploader extends React.Component {
       this.duplicateBulkAction = null;
     }
 
+    // Synchronous duplicate guard: catch a rapid SECOND add of the same destination
+    // BEFORE fileNameExistsInDir (which depends on async setState + isUploading state).
+    // The first add registers the key below; a second one is dropped here so it can
+    // never materialize a duplicate row.
+    const destKey = this.getUploadDestinationKey(resumableFile);
+    if (this.activeUploadNameKeys.has(destKey)) {
+      this.resumable.removeFile(resumableFile);
+      toaster.warning(gettext('This file is already queued for upload.'));
+      return;
+    }
+
     // Duplicate-name detection runs for EVERY file (single OR batch, small OR large)
     // and BEFORE the block-flow diversion below, so a duplicate inside a batch — or a
     // large file routed to the block flow — is offered the replace dialog instead of
     // silently landing as "name (1).ext". The matched file is held OUT of the queue
     // and the rendered list until the user decides.
     if (isFile && !isCustomPermission && this.fileNameExistsInDir(resumableFile.fileName)) {
+      this.activeUploadNameKeys.add(destKey); // reserve so a rapid second drop is caught
       this.handleDuplicateFile(resumableFile, files);
       return;
     }
+
+    // Committed to upload — reserve the destination key synchronously.
+    this.activeUploadNameKeys.add(destKey);
 
     // Web content-addressed (block) upload flow, behind enableBlockUpload. Large
     // non-encrypted files are diverted out of resumable.js. Anything ineligible
@@ -827,21 +937,10 @@ class FileUploader extends React.Component {
       return;
     }
 
-    this.setUploadFileList(this.resumable.files);
-
-    // Kick the queue only AFTER the shared upload target is set. A single file
-    // resumes from its uploaded-bytes offset; a batch just starts the queue and
-    // later files are picked up by it.
+    // Normal legacy file → upload-link ('upload') mode via the target-mode scheduler.
+    // A single file resumes from its uploaded-bytes offset; a batch just joins the queue.
     const isSingleFile = isFile && files.length === 1;
-    this.ensureSharedUploadTarget().then(() => {
-      if (isSingleFile) {
-        this.resumableUpload(resumableFile);
-      } else {
-        this.resumable.upload();
-      }
-    }).catch(error => {
-      toaster.danger(this.getAxiosErrorMessage(error));
-    });
+    this.enqueueLegacyUpload(resumableFile, 'upload', { resume: isSingleFile });
   };
 
   // ensureSharedUploadTarget fetches the session upload link EXACTLY ONCE per batch
@@ -895,18 +994,21 @@ class FileUploader extends React.Component {
   };
 
   // mergeUploadFileList unions the resumable.js files with the in-flight block
-  // entries (which live outside this.resumable.files), deduped by uniqueIdentifier.
-  // Rebuilding the list from this.resumable.files alone erased block rows from the
-  // dialog the moment a legacy file was added after a block upload had started.
+  // entries (which live outside this.resumable.files) AND the scheduler-held legacy
+  // files (pulled out of resumable.files but rendered "Waiting…"), deduped by
+  // uniqueIdentifier. Rebuilding from this.resumable.files alone erased block rows the
+  // moment a legacy file was added, and would drop held files entirely.
   mergeUploadFileList = (resumableFiles = this.resumable ? this.resumable.files : [], uploadFileList = this.state.uploadFileList) => {
     const merged = uploadFileList.filter(item => item && item.isBlockUpload);
     const seen = new Set(merged.map(item => item.uniqueIdentifier));
-    (resumableFiles || []).forEach(file => {
-      if (!seen.has(file.uniqueIdentifier)) {
+    const addAll = (files) => (files || []).forEach(file => {
+      if (file && !seen.has(file.uniqueIdentifier)) {
         merged.push(file);
         seen.add(file.uniqueIdentifier);
       }
     });
+    addAll(resumableFiles);
+    addAll((this.legacyHold || []).map(h => h.resumableFile));
     return merged;
   };
 
@@ -1003,6 +1105,10 @@ class FileUploader extends React.Component {
   };
 
   markUploadSaved = (resumableFile, newFileName) => {
+    // Release the synchronous duplicate key on success, so a LATER drop of the same
+    // name is offered the Replace? prompt (via fileNameExistsInDir's isSaved check)
+    // instead of being silently blocked as "already queued".
+    this.activeUploadNameKeys.delete(this.getUploadDestinationKey(resumableFile));
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
         clearFileUploadRuntimeState(item);
@@ -1222,6 +1328,8 @@ class FileUploader extends React.Component {
     this.isUploadLinkLoaded = false;
     this._uploadTargetPromise = null;
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
+    // The legacy queue is idle — run the next held target-mode group (if any).
+    this.onLegacyQueueIdle();
   };
 
   onPause = () => {
@@ -1235,6 +1343,7 @@ class FileUploader extends React.Component {
     if (!this.resumable || !this.resumable.isUploading()) {
       this.isUploadLinkLoaded = false;
       this._uploadTargetPromise = null;
+      this.onLegacyQueueIdle(); // queue stopped → switch to the next held mode group
     }
   };
 
@@ -1247,7 +1356,8 @@ class FileUploader extends React.Component {
   };
 
   onCancel = () => {
-
+    // The whole queue was cancelled → run any held mode group.
+    this.onLegacyQueueIdle();
   };
 
   setHeaders = (resumableFile, resumable) => {
@@ -1313,9 +1423,14 @@ class FileUploader extends React.Component {
     this.resumable.files = [];
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
-    // reset upload link loaded + cached target promise so the next batch re-fetches
+    // reset upload link loaded + cached target promises so the next batch re-fetches
     this.isUploadLinkLoaded = false;
     this._uploadTargetPromise = null;
+    this._replaceUpdateLinkPromise = null;
+    // Reset the target-mode scheduler and the synchronous duplicate guard.
+    this.legacyHold = [];
+    this.activeLegacyMode = null;
+    this.activeUploadNameKeys.clear();
     // Drop any undecided duplicates and the bulk choice so the next session starts clean.
     this.pendingDuplicates = [];
     this.duplicateBulkAction = null;
@@ -1326,6 +1441,9 @@ class FileUploader extends React.Component {
     // Drop it from the file-level queue if it was only waiting (never started); if it
     // is the active block file, entry.cancel() below aborts it and the queue advances.
     this.removeQueuedBlockUpload(uploadingItem);
+    // Release its destination key and drop it from the scheduler hold list (if held).
+    this.activeUploadNameKeys.delete(this.getUploadDestinationKey(uploadingItem));
+    this.legacyHold = this.legacyHold.filter(h => h.resumableFile.uniqueIdentifier !== uploadingItem.uniqueIdentifier);
 
     let uploadFileList = this.state.uploadFileList.filter(item => {
       if (item.uniqueIdentifier === uploadingItem.uniqueIdentifier) {
@@ -1371,6 +1489,11 @@ class FileUploader extends React.Component {
     if (this.blockLimiter) {
       this.blockLimiter.reset();
     }
+    // Reset the target-mode scheduler and release the synchronous duplicate guard for
+    // every cancelled entry (saved entries stay caught by fileNameExistsInDir).
+    this.legacyHold = [];
+    this.activeLegacyMode = null;
+    this.activeUploadNameKeys.clear();
 
     this.setState({
       totalProgress: 100,
@@ -1379,9 +1502,10 @@ class FileUploader extends React.Component {
     });
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
-    // reset upload link loaded + cached target promise
+    // reset upload link loaded + cached target promises
     this.isUploadLinkLoaded = false;
     this._uploadTargetPromise = null;
+    this._replaceUpdateLinkPromise = null;
   };
 
   onUploadRetry = (resumableFile) => {
