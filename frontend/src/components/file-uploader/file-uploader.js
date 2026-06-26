@@ -827,9 +827,13 @@ class FileUploader extends React.Component {
   // instance-level opts.target, only ONE mode can be in flight at a time: a file whose
   // mode conflicts with the active one is held (rendered "Waiting…") until the queue
   // goes idle and the instance target is switched. A no-conflict file starts at once.
-  enqueueLegacyUpload = (resumableFile, mode, { resume = false } = {}) => {
+  enqueueLegacyUpload = (resumableFile, mode, { resume = false, retry = false } = {}) => {
     resumableFile._uploadMode = mode;
     resumableFile._resumeOnStart = resume;
+    // A retry re-drives an errored file from its uploaded-bytes offset (resumeRetry)
+    // instead of a fresh start, but still goes through the scheduler so it runs against
+    // ITS mode's instance target.
+    resumableFile._retryOnStart = retry;
     // Self-heal a stale active mode if an idle event was missed (queue truly idle and
     // nothing held), so a new mode is not blocked forever.
     if (!this.resumable.isUploading() && this.legacyHold.length === 0) {
@@ -863,6 +867,16 @@ class FileUploader extends React.Component {
       // instance target. Safe because the scheduler guarantees only same-mode files
       // are in resumable.files right now.
       this.resumable.opts.target = target;
+      // Retry files re-drive from their uploaded-bytes offset against the now-correct
+      // mode target (their resumableObj.upload() also drives any fresh siblings already
+      // queued). This is the whole point of routing a manual retry through the scheduler:
+      // it cannot POST a replace to the upload endpoint just because a later mode switch
+      // left the instance target on the upload-link.
+      const retryFiles = resumableFiles.filter(f => f._retryOnStart);
+      if (retryFiles.length > 0) {
+        retryFiles.forEach(f => { f._retryOnStart = false; this.retryUploadFile(f); });
+        return;
+      }
       // A lone fresh normal file resumes from its uploaded-bytes offset; otherwise just
       // start the queue.
       if (mode === 'upload' && resumableFiles.length === 1 && resumableFiles[0]._resumeOnStart) {
@@ -1656,16 +1670,40 @@ class FileUploader extends React.Component {
       this.retryBlockUpload(resumableFile);
       return;
     }
-    this.retryUploadWithFreshLink(resumableFile);
+    this.retryLegacyViaScheduler(resumableFile);
+  };
+
+  // retryLegacyViaScheduler re-drives a MANUAL retry of a legacy file through the
+  // target-mode scheduler, so it uploads against ITS mode's instance target. A manual
+  // retry can happen AFTER the queue went idle and the scheduler switched the instance
+  // target to another mode's link; a bare resumableObj.upload() (the old path) would then
+  // POST a replace to the upload endpoint → silent auto-rename instead of an overwrite.
+  // (The 409 AUTO-retry stays on retryUploadWithFreshLink: it fires mid-flight, before
+  // any mode switch, and must reuse the live session token — see that method.)
+  retryLegacyViaScheduler = (resumableFile) => {
+    this.clearLegacyRetryRowState(resumableFile);
+    this.enqueueLegacyUpload(resumableFile, resumableFile._uploadMode || 'upload', { retry: true });
+    this.restoreConcurrencyIfIdle();
+  };
+
+  // clearLegacyRetryRowState removes a file from the retry list and clears its error /
+  // runtime state (it stays in uploadFileList) ahead of a re-drive.
+  clearLegacyRetryRowState = (resumableFile) => {
+    const retryFileList = this.state.retryFileList.filter(i => i.uniqueIdentifier !== resumableFile.uniqueIdentifier);
+    const uploadFileList = this.state.uploadFileList.map(item => {
+      if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+        clearFileUploadRuntimeState(item, { resetRemainingTime: true });
+        item.error = null;
+        resetUploadConflictAutoRetry(item);
+      }
+      return item;
+    });
+    this.setState({ retryFileList, uploadFileList, uploadBitrate: this.calculateUploadBitrate(uploadFileList) });
   };
 
   onUploadRetryAll = () => {
-    // Reuse the session's existing upload link instead of fetching a fresh one.
-    // Re-fetching mints a new upload token and overwrites the shared
-    // this.resumable.opts.target, which would reroute any still-in-flight file
-    // onto a different server-side tracker mid-upload and split it across two
-    // trackers (see retryUploadWithFreshLink). The session token stays valid.
     const blockRetryList = [];
+    const legacyRetryList = [];
     this.state.retryFileList.forEach(item => {
       if (item.isBlockUpload) {
         this.prepareBlockUploadRetry(item);
@@ -1675,7 +1713,7 @@ class FileUploader extends React.Component {
       clearFileUploadRuntimeState(item, { resetRemainingTime: true });
       resetUploadConflictAutoRetry(item);
       item.error = null;
-      this.retryUploadFile(item);
+      legacyRetryList.push(item);
     });
 
     let uploadFileList = this.state.uploadFileList.slice(0);
@@ -1687,6 +1725,12 @@ class FileUploader extends React.Component {
     }, () => {
       blockRetryList.forEach(item => {
         this.enqueueBlockUpload(item, item.file);
+      });
+      // Each legacy file re-enters the scheduler under its own mode. Mixed modes are
+      // serialized automatically (one runs, the other is held "Waiting…" until idle), so
+      // a replace and a normal retry never share the wrong instance target.
+      legacyRetryList.forEach(item => {
+        this.enqueueLegacyUpload(item, item._uploadMode || 'upload', { retry: true });
       });
     });
     this.restoreConcurrencyIfIdle();

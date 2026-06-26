@@ -1349,4 +1349,72 @@ describe('FileUploader target-mode scheduler + sync dedup guard', () => {
     expect(uploader.resumable.upload).not.toHaveBeenCalled();
     expect(uploader.activeLegacyMode).toBe('upload'); // untouched during the reset
   });
+
+  test('a manual retry of a replace re-establishes the update-link target (not a stale upload-link)', async () => {
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
+    const uploader = createUploader();
+    // The hazard: a previous mode switch left the instance target on the upload-link and
+    // the queue is idle.
+    uploader.resumable.opts.target = '/upload/stale';
+    uploader.resumable.isUploading.mockReturnValue(false);
+    const replaceFile = createResumableFile('r.txt', { uniqueIdentifier: 'r' });
+    replaceFile._uploadMode = 'update';
+    replaceFile.error = 'boom';
+    uploader.resumable.files = [replaceFile];
+    uploader.state.retryFileList = [replaceFile];
+    uploader.state.uploadFileList = [replaceFile];
+
+    uploader.onUploadRetry(replaceFile);
+    await flushPromises();
+
+    expect(uploader.resumable.opts.target).toBe('/update/tok'); // routed to the update endpoint
+    expect(uploader.retryUploadFile).toHaveBeenCalledWith(replaceFile);
+    expect(uploader.activeLegacyMode).toBe('update');
+    expect(uploader.state.retryFileList).toEqual([]);
+  });
+
+  test('a manual retry of a replace while an upload group is busy is held, then runs the update-link when idle', async () => {
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
+    const uploader = createUploader();
+    uploader.activeLegacyMode = 'upload';
+    uploader.resumable.isUploading.mockReturnValue(true);
+    const replaceFile = createResumableFile('r.txt', { uniqueIdentifier: 'r' });
+    replaceFile._uploadMode = 'update';
+    replaceFile.error = 'boom';
+    uploader.resumable.files = [replaceFile];
+    uploader.state.retryFileList = [replaceFile];
+    uploader.state.uploadFileList = [replaceFile];
+
+    uploader.onUploadRetry(replaceFile);
+    await flushPromises();
+
+    // Different mode while busy → held, never started against the upload-link.
+    expect(uploader.legacyHold.some(h => h.resumableFile === replaceFile)).toBe(true);
+    expect(uploader.retryUploadFile).not.toHaveBeenCalled();
+
+    // The upload group finishes → the held replace retry runs under the update-link.
+    uploader.resumable.isUploading.mockReturnValue(false);
+    uploader.onComplete();
+    await flushPromises();
+
+    expect(uploader.resumable.opts.target).toBe('/update/tok');
+    expect(uploader.retryUploadFile).toHaveBeenCalledWith(replaceFile);
+  });
+
+  test('onUploadRetryAll routes each legacy file through the scheduler under its own mode', () => {
+    const uploader = createUploader();
+    const enqueueSpy = jest.spyOn(uploader, 'enqueueLegacyUpload').mockImplementation(() => {});
+    const normal = createResumableFile('n.txt', { uniqueIdentifier: 'n' });
+    normal._uploadMode = 'upload'; normal.error = 'e';
+    const replace = createResumableFile('r.txt', { uniqueIdentifier: 'r' });
+    replace._uploadMode = 'update'; replace.error = 'e';
+    uploader.state.uploadFileList = [normal, replace];
+    uploader.state.retryFileList = [normal, replace];
+
+    uploader.onUploadRetryAll();
+
+    expect(enqueueSpy).toHaveBeenCalledWith(normal, 'upload', { retry: true });
+    expect(enqueueSpy).toHaveBeenCalledWith(replace, 'update', { retry: true });
+    expect(uploader.state.retryFileList).toEqual([]);
+  });
 });
