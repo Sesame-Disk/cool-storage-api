@@ -418,6 +418,22 @@ class FileUploader extends React.Component {
     });
   };
 
+  // releaseActiveBlockSlotForCommit hands the file-level slot back the moment the
+  // active block file enters its commit ('saving') phase, so the next queued file
+  // can start uploading while this one's commit is in flight. Idempotent per job
+  // (the needs_upload path can re-enter 'saving'): once released, the job no longer
+  // owns the slot, so the guard and the job's own finally (which only nulls when it
+  // still owns the slot) cannot double-release or strand the queue.
+  releaseActiveBlockSlotForCommit = (entry) => {
+    const job = this.activeBlockUpload;
+    if (!job || job.entry !== entry || job._committing) {
+      return;
+    }
+    job._committing = true;
+    this.activeBlockUpload = null;
+    this.drainBlockUploadQueue();
+  };
+
   // removeQueuedBlockUpload drops a not-yet-started block file from the queue (it never
   // ran, so there is nothing to abort). Matched by object identity so re-uploading the
   // same filename in a later batch (a different entry) is not removed by accident. The
@@ -453,14 +469,18 @@ class FileUploader extends React.Component {
       file,
       isBlockUpload: true,
       // Explicit flow phase, the single source of truth for how this entry
-      // renders: 'hashing' | 'uploading' | 'saving' | 'done' | 'error'. It is
-      // driven by the orchestrator's onPhase callback, NOT inferred from
-      // resumable.js chunk/remainingTime state (which a block entry does not have).
+      // renders: 'hashing' | 'checking' | 'uploading' | 'saving' | 'done' |
+      // 'error'. It is driven by the orchestrator's onPhase callback, NOT inferred
+      // from resumable.js chunk/remainingTime state (a block entry has none).
       _phase: 'hashing',
       _abortController: null,
       _cancelled: false,
       _progress: 0,
       _uploading: true,
+      // Dedup plan from /blocks/check (set via onPlan): bytes already on the server
+      // (shared/repeated blocks) vs bytes actually uploaded. 0 until the check runs.
+      _dedupedBytes: 0,
+      _uploadBytes: 0,
     };
     entry.progress = () => entry._progress;
     entry.isUploading = () => entry._uploading;
@@ -534,6 +554,13 @@ class FileUploader extends React.Component {
       resetBlockUploadBitrate(entry);
     }
     entry._phase = phase;
+    if (phase === 'saving') {
+      // The bytes are all on the server; only the commit is left. Release the
+      // file-level slot NOW so the next queued block file starts uploading while
+      // this one finishes its commit (the block limiter still caps total blocks
+      // on the wire). Mirrors the legacy finalize-slot handoff.
+      this.releaseActiveBlockSlotForCommit(entry);
+    }
     this.setState(prev => {
       const uploadFileList = prev.uploadFileList.map(item => (
         item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
@@ -542,6 +569,22 @@ class FileUploader extends React.Component {
         uploadFileList,
         uploadBitrate: this.calculateUploadBitrate(uploadFileList),
       };
+    });
+  };
+
+  // setBlockUploadPlan records the dedup plan from /blocks/check so the row can show
+  // how much of the file was already on the server (skipped) vs actually uploaded.
+  setBlockUploadPlan = (entry, plan) => {
+    if (!plan) {
+      return;
+    }
+    entry._dedupedBytes = Math.max(0, Number(plan.dedupedBytes) || 0);
+    entry._uploadBytes = Math.max(0, Number(plan.uploadBytes) || 0);
+    this.setState(prev => {
+      const uploadFileList = prev.uploadFileList.map(item => (
+        item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
+      ));
+      return { uploadFileList };
     });
   };
 
@@ -555,6 +598,8 @@ class FileUploader extends React.Component {
     entry.isSaved = false;
     entry.remainingTime = -1;
     entry._phase = 'hashing';
+    entry._dedupedBytes = 0;
+    entry._uploadBytes = 0;
     // Persist the replace decision so a Retry / Retry-All re-runs with the same
     // semantics the user chose in the duplicate dialog.
     entry._replace = replace;
@@ -573,6 +618,7 @@ class FileUploader extends React.Component {
       limiter: this.blockLimiter,
       signal: abortController ? abortController.signal : undefined,
       onPhase: (phase) => this.setBlockUploadPhase(entry, phase),
+      onPlan: (plan) => this.setBlockUploadPlan(entry, plan),
       onHashProgress: (hashed, total) => this.updateBlockUploadProgress(entry, (total ? hashed / total : 0) * 0.5),
       onUploadProgress: (done, total) => this.updateBlockUploadProgress(entry, 0.5 + (total ? done / total : 1) * 0.5),
       onTransferProgress: (deltaBytes) => this.updateBlockUploadTransferredBytes(entry, deltaBytes),

@@ -587,6 +587,53 @@ describe('FileUploader block upload file-level queue (serialization)', () => {
     expect(uploader.blockUploadQueue.length).toBe(0);
   });
 
+  test('a block file releases the slot at "saving" so the next starts while it commits', async () => {
+    const uploader = createUploader();
+    const deferreds = withDeferredRunBlockUpload(uploader);
+    const a = makeQueueEntry('a');
+    const b = makeQueueEntry('b');
+    uploader.state.uploadFileList = [a, b];
+
+    uploader.enqueueBlockUpload(a, a.file); // active
+    uploader.enqueueBlockUpload(b, b.file); // waiting
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1);
+    expect(uploader.activeBlockUpload.entry).toBe(a);
+    expect(uploader.blockUploadQueue.length).toBe(1);
+
+    // a enters its commit phase → slot handed off, b starts WITHOUT a having settled.
+    uploader.setBlockUploadPhase(a, 'saving');
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(b, b.file);
+    expect(uploader.activeBlockUpload.entry).toBe(b);
+    expect(uploader.blockUploadQueue.length).toBe(0);
+
+    // a's commit finishing later must NOT null b's slot or wedge the queue.
+    deferreds[0].resolve();
+    await settle();
+    expect(uploader.activeBlockUpload.entry).toBe(b);
+  });
+
+  test('a needs_upload re-entry into "saving" does not re-release or strand the slot', async () => {
+    const uploader = createUploader();
+    withDeferredRunBlockUpload(uploader);
+    const a = makeQueueEntry('a');
+    const b = makeQueueEntry('b');
+    uploader.state.uploadFileList = [a, b];
+
+    uploader.enqueueBlockUpload(a, a.file);
+    uploader.enqueueBlockUpload(b, b.file);
+    uploader.setBlockUploadPhase(a, 'saving'); // hands off to b
+    expect(uploader.activeBlockUpload.entry).toBe(b);
+
+    // commit reported needs_upload → a goes back to uploading, then saving again.
+    uploader.setBlockUploadPhase(a, 'uploading');
+    uploader.setBlockUploadPhase(a, 'saving');
+
+    // b keeps the slot; a (already handed off) cannot grab or strand it.
+    expect(uploader.activeBlockUpload.entry).toBe(b);
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
+  });
+
   test('cancelling a queued (waiting) block file removes it so it never starts', async () => {
     const uploader = createUploader();
     const deferreds = withDeferredRunBlockUpload(uploader);

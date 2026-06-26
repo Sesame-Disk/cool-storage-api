@@ -722,20 +722,25 @@ must **not** reintroduce any target clearing.
   `activeUploadNameKeys` guard + the functional-`setState` batching fixes; a full Map keyed
   by `uniqueIdentifier` (the originally-sketched single-source list) remains an architecture
   cleanup, not a bug fix. Deferred.
-- **[UX] Finer per-phase labels for block uploads: `Hashing… / Checking… / Uploading… /
-  Saving…`.** The block flow currently renders only `Uploading… X%` and `Saving…` (the
-  `_phase` model is coarse: `hashing→uploading→saving→done`, with hashing folded into the
-  first half of the bar and `check` not surfaced at all). Plumb the orchestrator's distinct
-  phases (session → **hashing** → **checking** (`/blocks/check`) → **uploading** →
-  **saving** (commit)) through `onPhase`/`_phase` and `upload-list-item` so each step shows
-  its own label. Deferred (UX polish before flag-on).
-- **[Observability] Surface deduplicated bytes vs bytes actually uploaded.** The block
-  flow already knows the manifest (total bytes), the `missing` set from `/blocks/check`
-  (bytes to upload), and the real wire bytes (`_uploadedNetworkBytes`); the difference is
-  the **deduplicated** (skipped) bytes. The UI shows neither the dedup amount nor the
-  "X% already existed" ratio, so a fast repeat upload looks unexplained. Expose
-  `deduplicatedBytes` / `uploadedBytes` per entry (and an aggregate) and render them (e.g.
-  "Skipped N MB already on server"). Deferred (observability polish before flag-on).
+- **[RESOLVED — PR6] Finer per-phase labels for block uploads + commit-phase pipelining.**
+  The orchestrator now emits a distinct **`checking`** phase before `/blocks/check`
+  (`emitPhase('checking')`), so `_phase` is `hashing → checking → uploading → saving → done`.
+  `upload-list-item` renders each step from `_phase` (`blockProgressText`): `Hashing… /
+  Checking… / Uploading… X% / Saving…` (percent is the overall bar, hashing being its first
+  half). **Pipelining:** the file-level FIFO no longer holds the slot through the commit —
+  `setBlockUploadPhase` calls `releaseActiveBlockSlotForCommit` the moment a file enters
+  `saving`, handing the slot to the next queued block file so it starts uploading while the
+  first commits (the block limiter still caps total blocks on the wire). Idempotent per job
+  (`_committing`) so the `needs_upload` re-entry into `saving` cannot double-release or
+  strand the queue. Mirrors the legacy finalize-slot handoff. Tests: orchestrator phase
+  order + `file-uploader.test.js` "releases the slot at saving" / "needs_upload re-entry"
+  + `upload-list-item.test.js` phase labels.
+- **[RESOLVED — PR6] Deduplicated bytes surfaced.** The orchestrator reports a dedup plan
+  from the AUTHORITATIVE missing set after `/blocks/check` (`onPlan({ totalBytes, uploadBytes,
+  dedupedBytes })`), computed from each unique missing block's real size (not wire bytes,
+  which include retries). The row shows `N M already on server` (`dedupNote`) during the
+  upload and on the completed row, so a fast repeat upload is explained. Tests: orchestrator
+  `onPlan` (mixed + all-missing) + `upload-list-item.test.js` dedup note.
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
@@ -781,11 +786,13 @@ flag were on*.
    file hashes differently, so it is stored twice. Out of phase 1; closing it needs
    FastCDC + SHA-1 aliasing in the browser. See
    [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md) and the limitations section above.
-6. **[Med] Frontend phase/progress/throughput UX.** The block flow is mapped onto
-   the legacy resumable.js dialog, which loses per-phase state, shows `0.00 B/s`,
-   surfaces `Saving…` early and without its own progress, has no dedup
-   observability, and is not fully integrated with the global aggregator. Full
-   detail in *Frontend UX gaps* above — the main polish cluster before flag-on.
+6. **[Med, mostly addressed] Frontend phase/progress/throughput UX.** The block flow
+   is mapped onto the legacy resumable.js dialog. **Done (PR6):** explicit per-phase
+   labels (`Hashing… / Checking… / Uploading… X% / Saving…`), commit-phase pipelining
+   (the next file uploads while the previous commits), and dedup observability
+   (`N M already on server`). Real block-upload throughput already replaced the legacy
+   `0.00 B/s`. **Remaining:** fuller integration with the global progress aggregator and
+   any further polish before flag-on.
 7. **[Resolved] Concurrent-loser `409 "commit still in progress"` retry.** The LWT
    guarantees a single winner; losing/retried commits poll only ~10s for the
    winner's `ResultFilename`, after which the server returns
