@@ -665,6 +665,34 @@ must **not** reintroduce any target clearing.
 - Pending: manual flag-OFF verification (incl. a real replace POSTing to the update
   endpoint) + flag-ON browser E2E.
 
+**PR5 review hotfix (same branch).** One screenshot bug + three review findings:
+- **Large (block-flow) files that already exist in the folder were dropped from the list
+  entirely** (screenshot: small files added, large ones vanished). Root cause: block
+  entries are added with a FUNCTIONAL `setState(prev => …)`, but `renderLegacyList` /
+  `setUploadFileList` rebuilt the list with a PLAIN `setState({ uploadFileList })` whose
+  value was computed against stale `this.state`. Under React batching, a legacy render
+  fired right after a block entry was added would OVERWRITE the list without the
+  not-yet-committed block entry → the large file never appeared. Both now use a functional
+  `setState` reading `prev.uploadFileList`, so block entries survive. (Sync-setState tests
+  did not reproduce it; a new batched-setState test does.)
+- **[P1] A target-fetch failure could wedge the scheduler / mix modes.**
+  `startLegacyFiles`' catch only toasted: it left `activeLegacyMode` set, the failed files
+  in `resumable.files`, and never drained held work — so a held replace could wait forever,
+  and a later different-mode group would run with the failed files still mixed in (wrong
+  endpoint). The catch now removes the failed files from `resumable.files`, frees the
+  active mode, re-offers duplicate-prompt files (releases the key for plain files), and
+  calls `onLegacyQueueIdle` to drain the next mode group.
+- **[P2] `_replaceUpdateLinkPromise` was not cleared in `onComplete`** — a second replace
+  after an idle batch (dialog left open) could reuse a stale update-link. Now cleared in
+  `onComplete` (and still on close / cancel-all).
+- **Cancel-all / close could start held work mid-teardown** (a resumable `cancel` event →
+  `onCancel` → `onLegacyQueueIdle`). `onLegacyQueueIdle` is now a no-op while
+  `this.resumable.isUploading()` OR a `_resettingUploads` flag is set; cancel-all/close set
+  that flag and clear `legacyHold`/`activeLegacyMode` FIRST.
+- Tests: "a legacy render preserves an in-flight block entry…", "a target-fetch failure
+  frees the active mode and drains the next held group", "onComplete clears the cached
+  update-link…", "onLegacyQueueIdle does not start held work while a reset is in progress".
+
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
 None of these block merging the branch: the flow ships **disabled** in every prod

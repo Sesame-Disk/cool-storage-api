@@ -103,6 +103,9 @@ class FileUploader extends React.Component {
     // all-update) never hit the hold path.
     this.legacyHold = []; // [{ resumableFile, mode }] held due to a target-mode conflict
     this.activeLegacyMode = null; // 'upload' | 'update' | null (queue idle)
+    // True while cancel-all / close-dialog is tearing the session down, so a resumable
+    // 'cancel' event cannot start a held mode group mid-reset.
+    this._resettingUploads = false;
     // Cached update-link promise for the current replace group: multiple replace files
     // share the single instance target, so they reuse one update-link token. Reset when
     // the session ends (close / cancel-all).
@@ -723,14 +726,21 @@ class FileUploader extends React.Component {
   };
 
   // renderLegacyList rebuilds the rendered upload list from resumable.files + the
-  // held ("Waiting…") files + block entries, and refreshes progress/bitrate.
+  // held ("Waiting…") files + block entries, and refreshes progress/bitrate. It uses a
+  // FUNCTIONAL setState (reads prev.uploadFileList), so a block entry just added by an
+  // earlier-but-not-yet-committed setState is preserved. With a plain setState the value
+  // is computed against stale this.state, and under React batching this render would
+  // OVERWRITE the list and silently drop a large block-flow file that was added moments
+  // earlier (it never even appeared in the list).
   renderLegacyList = () => {
-    const uploadFileList = this.mergeUploadFileList(this.resumable.files);
-    this.setState({
-      isUploadProgressDialogShow: true,
-      uploadFileList,
-      totalProgress: this.calculateTotalProgress(uploadFileList),
-      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+    this.setState(prev => {
+      const uploadFileList = this.mergeUploadFileList(this.resumable.files, prev.uploadFileList);
+      return {
+        isUploadProgressDialogShow: true,
+        uploadFileList,
+        totalProgress: this.calculateTotalProgress(uploadFileList),
+        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+      };
     });
   };
 
@@ -785,13 +795,29 @@ class FileUploader extends React.Component {
       }
     }).catch((error) => {
       toaster.danger(this.getAxiosErrorMessage(error));
-      // A held duplicate whose link fetch failed must be re-offered (don't lose the
-      // user's pending decision); a plain normal file just surfaces the error.
+      // The group's target could not be fetched and it never started. Take its files OUT
+      // of resumable.files (so a later DIFFERENT-mode group can't run with them mixed in
+      // against the wrong instance target) and FREE the active mode, otherwise the queue
+      // would wedge — no real complete/error event fires to drain held work.
       resumableFiles.forEach(f => {
+        this.resumable.removeFile(f);
+        this.legacyHold = this.legacyHold.filter(h => h.resumableFile !== f);
         if (f._fromDuplicatePrompt) {
-          this.reofferLegacyFile(f);
+          this.pendingDuplicates.unshift(f); // re-offer the user's pending decision
+        } else {
+          // Abandon a plain normal file (release its dedup key so it can be re-added).
+          this.activeUploadNameKeys.delete(this.getUploadDestinationKey(f));
         }
       });
+      if (this.activeLegacyMode === mode) {
+        this.activeLegacyMode = null;
+      }
+      this.renderLegacyList();
+      if (!this.state.isUploadRemindDialogShow && this.pendingDuplicates.length > 0) {
+        this.showNextDuplicatePrompt();
+      }
+      // Continue with any other held mode group now that this one is cleared.
+      this.onLegacyQueueIdle();
     });
   };
 
@@ -807,8 +833,13 @@ class FileUploader extends React.Component {
 
   // onLegacyQueueIdle runs when the resumable queue goes idle (complete / all errored /
   // cancelled). It clears the active mode and, if files of another mode are held, starts
-  // the next same-mode group (switching the instance target for it).
+  // the next same-mode group (switching the instance target for it). It is a no-op while
+  // the queue is still uploading, or while a cancel-all/close reset is in progress (so a
+  // resumable 'cancel' event cannot start held work as the session is being torn down).
   onLegacyQueueIdle = () => {
+    if (this._resettingUploads || (this.resumable && this.resumable.isUploading())) {
+      return;
+    }
     this.activeLegacyMode = null;
     if (this.legacyHold.length === 0) {
       return;
@@ -1013,12 +1044,16 @@ class FileUploader extends React.Component {
   };
 
   setUploadFileList = (resumableFiles = this.resumable.files) => {
-    const uploadFileList = this.mergeUploadFileList(resumableFiles);
-    this.setState({
-      uploadFileList,
-      isUploadProgressDialogShow: true,
-      totalProgress: this.calculateTotalProgress(uploadFileList),
-      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+    // Functional setState so an in-flight block entry added by a not-yet-committed
+    // setState is preserved (see renderLegacyList).
+    this.setState(prev => {
+      const uploadFileList = this.mergeUploadFileList(resumableFiles, prev.uploadFileList);
+      return {
+        uploadFileList,
+        isUploadProgressDialogShow: true,
+        totalProgress: this.calculateTotalProgress(uploadFileList),
+        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+      };
     });
   };
 
@@ -1323,10 +1358,12 @@ class FileUploader extends React.Component {
 
   onComplete = () => {
     this.notifiedFolders = [];
-    // Batch done: drop the cached link promise so the next batch re-fetches a fresh
-    // token. The target itself is NOT cleared (a retry reuses the last token).
+    // Batch done: drop the cached link promises so the next batch / next replace group
+    // re-fetches a fresh token. The target itself is NOT cleared (a retry reuses the
+    // last token).
     this.isUploadLinkLoaded = false;
     this._uploadTargetPromise = null;
+    this._replaceUpdateLinkPromise = null;
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     // The legacy queue is idle — run the next held target-mode group (if any).
     this.onLegacyQueueIdle();
@@ -1413,6 +1450,11 @@ class FileUploader extends React.Component {
   };
 
   onCloseUploadDialog = () => {
+    // Reset the scheduler FIRST so a resumable 'cancel' fired by cancelActiveUploads()
+    // (→ onCancel → onLegacyQueueIdle) cannot start a held mode group mid-teardown.
+    this._resettingUploads = true;
+    this.legacyHold = [];
+    this.activeLegacyMode = null;
     this.cancelActiveUploads();
     this.clearBlockUploadQueue();
     if (this.blockLimiter) {
@@ -1427,13 +1469,12 @@ class FileUploader extends React.Component {
     this.isUploadLinkLoaded = false;
     this._uploadTargetPromise = null;
     this._replaceUpdateLinkPromise = null;
-    // Reset the target-mode scheduler and the synchronous duplicate guard.
-    this.legacyHold = [];
-    this.activeLegacyMode = null;
+    // Scheduler already reset at the top; clear the synchronous duplicate guard too.
     this.activeUploadNameKeys.clear();
     // Drop any undecided duplicates and the bulk choice so the next session starts clean.
     this.pendingDuplicates = [];
     this.duplicateBulkAction = null;
+    this._resettingUploads = false;
     this.setState({ isUploadProgressDialogShow: false, uploadFileList: [], forbidUploadFileList: [], retryFileList: [], totalProgress: 0, uploadBitrate: 0, isUploadRemindDialogShow: false, currentResumableFile: null, duplicateBatchActive: false });
   };
 
@@ -1470,6 +1511,12 @@ class FileUploader extends React.Component {
   };
 
   onCancelAllUploading = () => {
+    // Reset the scheduler FIRST so a resumable 'cancel' fired by item.cancel() below
+    // (→ onCancel → onLegacyQueueIdle) cannot start a held mode group mid-cancel.
+    this._resettingUploads = true;
+    this.legacyHold = [];
+    this.activeLegacyMode = null;
+
     let uploadFileList = this.state.uploadFileList.filter(item => {
       // Cancel every unsaved entry, including block uploads already at 100% that
       // are still inside the final commit ('saving').
@@ -1489,10 +1536,8 @@ class FileUploader extends React.Component {
     if (this.blockLimiter) {
       this.blockLimiter.reset();
     }
-    // Reset the target-mode scheduler and release the synchronous duplicate guard for
-    // every cancelled entry (saved entries stay caught by fileNameExistsInDir).
-    this.legacyHold = [];
-    this.activeLegacyMode = null;
+    // Release the synchronous duplicate guard for every cancelled entry (saved entries
+    // stay caught by fileNameExistsInDir).
     this.activeUploadNameKeys.clear();
 
     this.setState({
@@ -1506,6 +1551,7 @@ class FileUploader extends React.Component {
     this.isUploadLinkLoaded = false;
     this._uploadTargetPromise = null;
     this._replaceUpdateLinkPromise = null;
+    this._resettingUploads = false;
   };
 
   onUploadRetry = (resumableFile) => {

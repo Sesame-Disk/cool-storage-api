@@ -1114,4 +1114,92 @@ describe('FileUploader target-mode scheduler + sync dedup guard', () => {
     expect(uploader.resumable.files).toContain(normal);
     expect(uploader.resumableUpload).toHaveBeenCalledWith(normal);
   });
+
+  test('a legacy render preserves an in-flight block entry queued by a not-yet-committed setState (large file not dropped)', () => {
+    const uploader = createUploader();
+    // Simulate React batching: setState only QUEUES; commit applies updaters in order,
+    // and a plain-object setState keeps the value it was computed with at call time.
+    const pending = [];
+    uploader.setState = (u) => { pending.push(u); };
+    const commit = () => {
+      while (pending.length) {
+        const u = pending.shift();
+        const next = typeof u === 'function' ? u(uploader.state) : u;
+        uploader.state = { ...uploader.state, ...next };
+      }
+    };
+
+    const blockEntry = {
+      uniqueIdentifier: 'big', fileName: 'big.bin', isBlockUpload: true,
+      isSaved: false, error: null, progress: () => 0, isUploading: () => true,
+    };
+    // Block entry added via a functional setState (like maybeBlockUpload), not committed yet.
+    uploader.setState(prev => ({ uploadFileList: [...prev.uploadFileList, blockEntry] }));
+
+    // A legacy file renders BEFORE the block setState commits.
+    const small = createResumableFile('small.txt');
+    uploader.resumable.files = [small];
+    uploader.renderLegacyList();
+
+    commit();
+
+    const ids = uploader.state.uploadFileList.map(i => i.uniqueIdentifier);
+    expect(ids).toContain('big'); // the large/block file is NOT dropped from the list
+    expect(ids).toContain('small.txt-id');
+  });
+
+  test('a target-fetch failure frees the active mode and drains the next held group (no wedge)', async () => {
+    seafileAPI.getFileServerUploadLink.mockRejectedValue(new Error('upload link down'));
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
+    const uploader = createUploader();
+
+    const normal = createResumableFile('n.txt');
+    normal._uploadMode = 'upload';
+    const replaceFile = createResumableFile('r.txt', { uniqueIdentifier: 'r' });
+    replaceFile._fromDuplicatePrompt = true;
+    replaceFile._uploadMode = 'update'; // set by enqueueLegacyUpload before holding
+    uploader.legacyHold = [{ resumableFile: replaceFile, mode: 'update' }];
+    uploader.resumable.files = [normal];
+    uploader.activeLegacyMode = 'upload';
+
+    uploader.startLegacyFiles([normal]); // upload-link fetch rejects
+    await flushPromises(); // upload-link rejection → catch drains the held replace group
+    await flushPromises(); // update-link fetch resolves → instance target set
+
+    // The failed normal file is removed; the held replace runs with the update-link.
+    expect(uploader.resumable.files).not.toContain(normal);
+    expect(uploader.resumable.opts.target).toBe('/update/tok');
+    expect(uploader.resumable.files).toContain(replaceFile);
+    expect(uploader.activeLegacyMode).toBe('update');
+  });
+
+  test('onComplete clears the cached update-link so the next replace fetches a fresh one', async () => {
+    seafileAPI.getUpdateLink.mockResolvedValue({ data: '/update/tok' });
+    const uploader = createUploader();
+    const a = createResumableFile('a.txt', { file: { name: 'a.txt', size: 10 } });
+    uploader.state.currentResumableFile = a;
+    uploader.replaceRepetitionFile(false);
+    await flushPromises();
+    expect(seafileAPI.getUpdateLink).toHaveBeenCalledTimes(1);
+
+    uploader.onComplete(); // batch done → cached update-link dropped
+
+    const b = createResumableFile('b.txt', { uniqueIdentifier: 'b', file: { name: 'b.txt', size: 10 } });
+    uploader.state.currentResumableFile = b;
+    uploader.replaceRepetitionFile(false);
+    await flushPromises();
+    expect(seafileAPI.getUpdateLink).toHaveBeenCalledTimes(2); // fresh fetch, not the stale cache
+  });
+
+  test('onLegacyQueueIdle does not start held work while a reset is in progress', () => {
+    const uploader = createUploader();
+    uploader._resettingUploads = true;
+    uploader.legacyHold = [{ resumableFile: createResumableFile('h.txt'), mode: 'update' }];
+    uploader.activeLegacyMode = 'upload';
+
+    uploader.onLegacyQueueIdle();
+
+    expect(uploader.resumable.upload).not.toHaveBeenCalled();
+    expect(uploader.activeLegacyMode).toBe('upload'); // untouched during the reset
+  });
 });
