@@ -706,6 +706,20 @@ must **not** reintroduce any target clearing.
   `activeUploadNameKeys` guard + the functional-`setState` batching fixes; a full Map keyed
   by `uniqueIdentifier` (the originally-sketched single-source list) remains an architecture
   cleanup, not a bug fix. Deferred.
+- **[UX] Finer per-phase labels for block uploads: `Hashing… / Checking… / Uploading… /
+  Saving…`.** The block flow currently renders only `Uploading… X%` and `Saving…` (the
+  `_phase` model is coarse: `hashing→uploading→saving→done`, with hashing folded into the
+  first half of the bar and `check` not surfaced at all). Plumb the orchestrator's distinct
+  phases (session → **hashing** → **checking** (`/blocks/check`) → **uploading** →
+  **saving** (commit)) through `onPhase`/`_phase` and `upload-list-item` so each step shows
+  its own label. Deferred (UX polish before flag-on).
+- **[Observability] Surface deduplicated bytes vs bytes actually uploaded.** The block
+  flow already knows the manifest (total bytes), the `missing` set from `/blocks/check`
+  (bytes to upload), and the real wire bytes (`_uploadedNetworkBytes`); the difference is
+  the **deduplicated** (skipped) bytes. The UI shows neither the dedup amount nor the
+  "X% already existed" ratio, so a fast repeat upload looks unexplained. Expose
+  `deduplicatedBytes` / `uploadedBytes` per entry (and an aggregate) and render them (e.g.
+  "Skipped N MB already on server"). Deferred (observability polish before flag-on).
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
