@@ -714,6 +714,15 @@ must **not** reintroduce any target clearing.
   (incremented before each link fetch, decremented on settle) added to the self-heal guard,
   so a group mid-fetch counts as active. Test: "retry-all mixed legacy modes holds the second
   mode while the first target link is pending" (real scheduler, link left pending).
+- **[PR7 hardening] Stale `startLegacyFiles` continuation across a teardown.** A pre-existing
+  (not introduced here) race: if a target-link fetch is pending and the user does close /
+  cancel-all, the already-registered `.then()` continuation was not invalidated — on resolve
+  it could still set `resumable.opts.target` and enter the start branch. Mostly benign
+  (`resumable.files` was emptied, so nothing uploads, and the next session re-fetches the
+  target), but not clean. Fixed with a `_legacySessionGeneration` counter bumped on every
+  teardown; `startLegacyFiles` captures it before the fetch and its `.then` / `.catch` bail
+  if it changed. Test: "a link resolving AFTER close/cancel-all is dropped (stale start
+  continuation)".
 - **[RESOLVED — PR7] A manual retry of a held replace after a mode switch routed to the
   wrong instance target.** Previously `retryUploadWithFreshLink` / `retryUploadFile`
   re-drove a file via `resumableObj.upload()` reusing whatever `resumable.opts.target` was

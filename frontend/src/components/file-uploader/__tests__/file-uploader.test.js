@@ -1445,6 +1445,27 @@ describe('FileUploader target-mode scheduler + sync dedup guard', () => {
     resolveUploadLink({ data: '/upload/tok' });
   });
 
+  test('a link resolving AFTER close/cancel-all is dropped (stale start continuation)', async () => {
+    let resolveLink;
+    seafileAPI.getFileServerUploadLink.mockReturnValue(new Promise(r => { resolveLink = r; }));
+    const uploader = createUploader();
+    const f = createResumableFile('n.txt', { uniqueIdentifier: 'n' });
+    f._uploadMode = 'upload';
+    uploader.resumable.files = [f];
+    uploader.activeLegacyMode = null;
+
+    uploader.enqueueLegacyUpload(f, 'upload'); // start; link fetch pending
+    expect(uploader._legacyStartsInFlight).toBe(1);
+
+    uploader.onCloseUploadDialog(); // teardown bumps the session generation
+    resolveLink({ data: '/new/tok' });
+    await flushPromises();
+
+    // The stale continuation bailed: no fresh-session upload was kicked with stale files.
+    expect(uploader.resumable.upload).not.toHaveBeenCalled();
+    expect(uploader.resumableUpload).not.toHaveBeenCalled();
+  });
+
   test('a plain file whose target fetch fails becomes a retryable row (not dropped)', async () => {
     seafileAPI.getFileServerUploadLink.mockRejectedValue(new Error('link down'));
     const uploader = createUploader();

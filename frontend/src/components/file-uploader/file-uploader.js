@@ -125,6 +125,11 @@ class FileUploader extends React.Component {
     // second, different-mode enqueue would wrongly clear activeLegacyMode and skip the
     // hold, mixing modes on the single instance target.
     this._legacyStartsInFlight = 0;
+    // Bumped on every session teardown (close / cancel-all). startLegacyFiles captures it
+    // before its async link fetch and bails if it changed by the time the promise settles,
+    // so a continuation left pending across a teardown cannot touch the (now reset) target
+    // or kick a fresh-session upload with stale files.
+    this._legacySessionGeneration = 0;
     // True while cancel-all / close-dialog is tearing the session down, so a resumable
     // 'cancel' event cannot start a held mode group mid-reset.
     this._resettingUploads = false;
@@ -884,8 +889,16 @@ class FileUploader extends React.Component {
     // another mode is held (not mixed) during the fetch window.
     this._legacyStartsInFlight += 1;
     const settleStart = () => { this._legacyStartsInFlight = Math.max(0, this._legacyStartsInFlight - 1); };
+    // Capture the session generation: if the dialog is closed / cancelled while this link
+    // fetch is pending, the continuation below must NOT touch the (reset) target or start
+    // an upload — teardown already wiped legacyHold / activeLegacyMode / _legacyStartsInFlight.
+    const startGeneration = this._legacySessionGeneration;
+    const isStaleStart = () => startGeneration !== this._legacySessionGeneration;
     const targetPromise = mode === 'update' ? this.ensureReplaceUpdateLink() : this.ensureSharedUploadTarget();
     targetPromise.then((target) => {
+      if (isStaleStart()) {
+        return; // session torn down mid-fetch — drop this continuation (counter already reset)
+      }
       settleStart();
       // resumablejs ignores per-file opts.target — route the whole queue via the
       // instance target. Safe because the scheduler guarantees only same-mode files
@@ -909,6 +922,9 @@ class FileUploader extends React.Component {
         this.resumable.upload();
       }
     }).catch((error) => {
+      if (isStaleStart()) {
+        return; // session torn down mid-fetch — nothing to re-offer or abandon
+      }
       settleStart();
       const errorMsg = this.getAxiosErrorMessage(error) || gettext('Network error');
       toaster.danger(errorMsg);
@@ -1608,6 +1624,7 @@ class FileUploader extends React.Component {
     this.abandonedLegacyFiles = [];
     this.activeLegacyMode = null;
     this._legacyStartsInFlight = 0;
+    this._legacySessionGeneration += 1; // invalidate any pending startLegacyFiles continuation
     this.cancelActiveUploads();
     this.clearBlockUploadQueue();
     if (this.blockLimiter) {
@@ -1673,6 +1690,7 @@ class FileUploader extends React.Component {
     this.abandonedLegacyFiles = [];
     this.activeLegacyMode = null;
     this._legacyStartsInFlight = 0;
+    this._legacySessionGeneration += 1; // invalidate any pending startLegacyFiles continuation
 
     let uploadFileList = this.state.uploadFileList.filter(item => {
       // Cancel every unsaved entry, including block uploads already at 100% that
