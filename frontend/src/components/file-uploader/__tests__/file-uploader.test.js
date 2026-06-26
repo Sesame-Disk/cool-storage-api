@@ -1466,6 +1466,36 @@ describe('FileUploader target-mode scheduler + sync dedup guard', () => {
     expect(uploader.resumableUpload).not.toHaveBeenCalled();
   });
 
+  test('a stale upload-link promise cannot overwrite a fresh session target', async () => {
+    let resolveOld;
+    let resolveFresh;
+    seafileAPI.getFileServerUploadLink
+      .mockReturnValueOnce(new Promise(r => { resolveOld = r; }))
+      .mockReturnValueOnce(new Promise(r => { resolveFresh = r; }));
+    const uploader = createUploader();
+
+    const oldFile = createResumableFile('old.txt', { uniqueIdentifier: 'old' });
+    uploader.resumable.files = [oldFile];
+    uploader.enqueueLegacyUpload(oldFile, 'upload'); // old link fetch pending
+
+    uploader.onCloseUploadDialog(); // teardown: generation++, _uploadTargetPromise = null
+
+    const freshFile = createResumableFile('fresh.txt', { uniqueIdentifier: 'fresh' });
+    uploader.resumable.files = [freshFile];
+    uploader.enqueueLegacyUpload(freshFile, 'upload'); // fresh link fetch pending
+
+    resolveFresh({ data: '/fresh/tok' });
+    await flushPromises();
+    expect(uploader.resumable.opts.target).toBe('/fresh/tok?ret-json=1');
+
+    // The OLD link resolves late. ensureSharedUploadTarget is pure (no target write) and
+    // startLegacyFiles' continuation bails on the changed generation, so the fresh
+    // session's instance target is NOT clobbered with the stale token.
+    resolveOld({ data: '/old/tok' });
+    await flushPromises();
+    expect(uploader.resumable.opts.target).toBe('/fresh/tok?ret-json=1');
+  });
+
   test('a plain file whose target fetch fails becomes a retryable row (not dropped)', async () => {
     seafileAPI.getFileServerUploadLink.mockRejectedValue(new Error('link down'));
     const uploader = createUploader();

@@ -1125,29 +1125,27 @@ class FileUploader extends React.Component {
     this.enqueueLegacyUpload(resumableFile, 'upload', { resume: isSingleFile });
   };
 
-  // ensureSharedUploadTarget fetches the session upload link EXACTLY ONCE per batch
-  // and sets the shared this.resumable.opts.target, returning a cached promise that
-  // resolves when the target is set. Fetching once matters: re-minting a token and
+  // ensureSharedUploadTarget fetches the session upload link EXACTLY ONCE per batch and
+  // resolves to the target string. Fetching once matters: re-minting a token and
   // overwriting the shared target reroutes any in-flight file onto a different
-  // server-side tracker (keyed by token). Both onFileAdded and the duplicate flow
-  // await this, so no file POSTs to the empty default target (→ 405). The target is
-  // OVERWRITTEN with a fresh token per batch (matching the original onFileAdded) but
-  // NEVER cleared elsewhere — a legacy retry reuses the last token.
+  // server-side tracker (keyed by token). It is PURE — it does NOT write
+  // this.resumable.opts.target; only the generation-guarded .then in startLegacyFiles
+  // does, so a stale link promise that resolves AFTER a close/cancel-all cannot
+  // contaminate a fresh session's instance target. A legacy retry reuses the last token.
   ensureSharedUploadTarget = () => {
     if (this._uploadTargetPromise) {
       return this._uploadTargetPromise;
     }
     this.isUploadLinkLoaded = true;
     const { repoID, path } = this.props;
-    this._uploadTargetPromise = seafileAPI.getFileServerUploadLink(repoID, path).then(res => {
-      this.resumable.opts.target = res.data + '?ret-json=1';
-      return this.resumable.opts.target;
-    }).catch(error => {
-      // Allow a later add/retry to try again.
-      this.isUploadLinkLoaded = false;
-      this._uploadTargetPromise = null;
-      throw error;
-    });
+    this._uploadTargetPromise = seafileAPI.getFileServerUploadLink(repoID, path)
+      .then(res => res.data + '?ret-json=1')
+      .catch(error => {
+        // Allow a later add/retry to try again.
+        this.isUploadLinkLoaded = false;
+        this._uploadTargetPromise = null;
+        throw error;
+      });
     return this._uploadTargetPromise;
   };
 

@@ -723,6 +723,15 @@ must **not** reintroduce any target clearing.
   teardown; `startLegacyFiles` captures it before the fetch and its `.then` / `.catch` bail
   if it changed. Test: "a link resolving AFTER close/cancel-all is dropped (stale start
   continuation)".
+- **[PR7 hardening] `ensureSharedUploadTarget` made pure (stale token could clobber a fresh
+  target).** The generation guard above stops the START branch, but `ensureSharedUploadTarget`
+  wrote `resumable.opts.target` inside its OWN `.then` — which runs BEFORE that guard — so a
+  stale upload-link promise resolving after a teardown could still overwrite a NEW session's
+  instance target with an old token (resumablejs keys the tracker by the instance target).
+  Fixed by making it pure: it resolves to the target string and NEVER writes
+  `resumable.opts.target`; the only writer is the generation-guarded `.then` in
+  `startLegacyFiles`. (`ensureReplaceUpdateLink` was already pure.) Test: "a stale upload-link
+  promise cannot overwrite a fresh session target".
 - **[RESOLVED — PR7] A manual retry of a held replace after a mode switch routed to the
   wrong instance target.** Previously `retryUploadWithFreshLink` / `retryUploadFile`
   re-drove a file via `resumableObj.upload()` reusing whatever `resumable.opts.target` was
