@@ -694,13 +694,26 @@ must **not** reintroduce any target clearing.
   update-link…", "onLegacyQueueIdle does not start held work while a reset is in progress".
 
 **Deferred frontend cleanups (reviewed, non-blocking).**
-- **Abandoned normal file on target-fetch failure is not a retryable row.** When
-  `ensureSharedUploadTarget` fails for a plain (non-duplicate) file, `startLegacyFiles`'
-  catch removes it and surfaces a toast — clear feedback, and strictly better than the old
-  `main` behavior (a file stuck on "Preparing…" forever with no retry). A nicer UX would
-  move it to the retry list, but the retry path (`retryUploadWithFreshLink`) assumes a file
-  that already started and errored, so wiring a pre-start failure into it needs care. Rare
-  (a network blip on the session-link fetch); deferred, not a blocker.
+- **[RESOLVED — PR7] Abandoned normal file on target-fetch failure is now a retryable row.**
+  When `ensureSharedUploadTarget` fails for a plain (non-duplicate) file, `startLegacyFiles`'
+  catch used to remove it + toast (gone from the dialog, user must re-drop). Now the file
+  is kept as a RETRYABLE error row: it is pulled out of `resumable.files` (so a later
+  different-mode group can't run it against the wrong target) but tracked in a new
+  `abandonedLegacyFiles` list that `mergeUploadFileList` unions, its `error` is set, and it
+  joins `retryFileList`. `onUploadRetry` re-enqueues it through the scheduler (which
+  re-fetches the target); its dedup key stays reserved so a re-drop is still caught. Cleared
+  on close / cancel-all / per-file cancel. Possible now that retries route through the
+  scheduler (above). Tests: "a plain file whose target fetch fails becomes a retryable row",
+  "retrying an abandoned file re-enters the scheduler and re-fetches its target".
+- **[PR7 hardening] Self-heal race during the target-fetch window.** A retry-all of mixed
+  legacy modes enqueues files one by one; the first `startLegacyFiles` sets `activeLegacyMode`
+  but its link fetch is async, so `resumable.isUploading()` stays false. The self-heal in
+  `enqueueLegacyUpload` (`!isUploading() && !legacyHold.length → activeLegacyMode = null`)
+  would then clear the mode on the SECOND enqueue and start it without a hold — re-mixing
+  `upload` + `update` on one instance target. Fixed with a `_legacyStartsInFlight` counter
+  (incremented before each link fetch, decremented on settle) added to the self-heal guard,
+  so a group mid-fetch counts as active. Test: "retry-all mixed legacy modes holds the second
+  mode while the first target link is pending" (real scheduler, link left pending).
 - **[RESOLVED — PR7] A manual retry of a held replace after a mode switch routed to the
   wrong instance target.** Previously `retryUploadWithFreshLink` / `retryUploadFile`
   re-drove a file via `resumableObj.upload()` reusing whatever `resumable.opts.target` was

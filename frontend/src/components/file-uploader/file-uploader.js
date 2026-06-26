@@ -113,7 +113,18 @@ class FileUploader extends React.Component {
     // goes idle and the instance target is switched. No-conflict batches (all-upload or
     // all-update) never hit the hold path.
     this.legacyHold = []; // [{ resumableFile, mode }] held due to a target-mode conflict
+    // Legacy files whose target fetch failed before they could start: pulled OUT of
+    // resumable.files (so a later different-mode group can't run them against the wrong
+    // target) but kept rendered as RETRYABLE error rows. mergeUploadFileList unions them;
+    // onUploadRetry re-enqueues them through the scheduler. Cleared with the session.
+    this.abandonedLegacyFiles = [];
     this.activeLegacyMode = null; // 'upload' | 'update' | null (queue idle)
+    // Count of legacy groups whose target link is being fetched but that have not started
+    // uploading yet. During this window resumable.isUploading() is still false, so the
+    // self-heal in enqueueLegacyUpload must NOT treat the queue as idle — otherwise a
+    // second, different-mode enqueue would wrongly clear activeLegacyMode and skip the
+    // hold, mixing modes on the single instance target.
+    this._legacyStartsInFlight = 0;
     // True while cancel-all / close-dialog is tearing the session down, so a resumable
     // 'cancel' event cannot start a held mode group mid-reset.
     this._resettingUploads = false;
@@ -828,15 +839,23 @@ class FileUploader extends React.Component {
   // mode conflicts with the active one is held (rendered "Waiting…") until the queue
   // goes idle and the instance target is switched. A no-conflict file starts at once.
   enqueueLegacyUpload = (resumableFile, mode, { resume = false, retry = false } = {}) => {
+    // Re-entering the scheduler clears any "abandoned" (target-fetch-failed) marker: the
+    // file is being driven again (no-op for a fresh file that was never abandoned).
+    if (this.abandonedLegacyFiles.length > 0) {
+      this.abandonedLegacyFiles = this.abandonedLegacyFiles.filter(f => f !== resumableFile);
+    }
     resumableFile._uploadMode = mode;
     resumableFile._resumeOnStart = resume;
     // A retry re-drives an errored file from its uploaded-bytes offset (resumeRetry)
     // instead of a fresh start, but still goes through the scheduler so it runs against
     // ITS mode's instance target.
     resumableFile._retryOnStart = retry;
-    // Self-heal a stale active mode if an idle event was missed (queue truly idle and
-    // nothing held), so a new mode is not blocked forever.
-    if (!this.resumable.isUploading() && this.legacyHold.length === 0) {
+    // Self-heal a stale active mode if an idle event was missed (queue truly idle: not
+    // uploading, nothing held, and no group mid target-fetch), so a new mode is not
+    // blocked forever. The _legacyStartsInFlight guard is essential: a just-started group
+    // sits with isUploading()===false while its link is still being fetched, and without
+    // it a second different-mode enqueue would reset the mode and skip the hold.
+    if (!this.resumable.isUploading() && this.legacyHold.length === 0 && this._legacyStartsInFlight === 0) {
       this.activeLegacyMode = null;
     }
     if (this.activeLegacyMode !== null && this.activeLegacyMode !== mode) {
@@ -861,8 +880,13 @@ class FileUploader extends React.Component {
     });
     this.renderLegacyList();
 
+    // Mark a start as in flight until the link resolves, so a concurrent enqueue of
+    // another mode is held (not mixed) during the fetch window.
+    this._legacyStartsInFlight += 1;
+    const settleStart = () => { this._legacyStartsInFlight = Math.max(0, this._legacyStartsInFlight - 1); };
     const targetPromise = mode === 'update' ? this.ensureReplaceUpdateLink() : this.ensureSharedUploadTarget();
     targetPromise.then((target) => {
+      settleStart();
       // resumablejs ignores per-file opts.target — route the whole queue via the
       // instance target. Safe because the scheduler guarantees only same-mode files
       // are in resumable.files right now.
@@ -885,23 +909,40 @@ class FileUploader extends React.Component {
         this.resumable.upload();
       }
     }).catch((error) => {
-      toaster.danger(this.getAxiosErrorMessage(error));
+      settleStart();
+      const errorMsg = this.getAxiosErrorMessage(error) || gettext('Network error');
+      toaster.danger(errorMsg);
       // The group's target could not be fetched and it never started. Take its files OUT
       // of resumable.files (so a later DIFFERENT-mode group can't run with them mixed in
       // against the wrong instance target) and FREE the active mode, otherwise the queue
       // would wedge — no real complete/error event fires to drain held work.
+      const newlyRetryable = [];
       resumableFiles.forEach(f => {
         this.resumable.removeFile(f);
         this.legacyHold = this.legacyHold.filter(h => h.resumableFile !== f);
+        f._retryOnStart = false;
         if (f._fromDuplicatePrompt) {
           this.pendingDuplicates.unshift(f); // re-offer the user's pending decision
         } else {
-          // Abandon a plain normal file (release its dedup key so it can be re-added).
-          this.activeUploadNameKeys.delete(this.getUploadDestinationKey(f));
+          // Keep a plain file as a RETRYABLE error row instead of dropping it: a
+          // session-link blip is recoverable from the dialog (onUploadRetry re-enqueues
+          // it through the scheduler, which re-fetches the target). It is out of
+          // resumable.files, so abandonedLegacyFiles keeps it rendered; the dedup key
+          // stays reserved so a re-drop is still caught.
+          f.error = errorMsg;
+          if (!this.abandonedLegacyFiles.includes(f)) {
+            this.abandonedLegacyFiles.push(f);
+          }
+          newlyRetryable.push(f);
         }
       });
       if (this.activeLegacyMode === mode) {
         this.activeLegacyMode = null;
+      }
+      if (newlyRetryable.length > 0) {
+        this.setState(prev => ({
+          retryFileList: [...prev.retryFileList, ...newlyRetryable.filter(f => !prev.retryFileList.includes(f))],
+        }));
       }
       this.renderLegacyList();
       if (!this.state.isUploadRemindDialogShow && this.pendingDuplicates.length > 0) {
@@ -1139,6 +1180,7 @@ class FileUploader extends React.Component {
     addAll(uploadFileList.filter(item => item && item.isBlockUpload));
     addAll(resumableFiles);
     addAll((this.legacyHold || []).map(h => h.resumableFile));
+    addAll(this.abandonedLegacyFiles || []);
     return merged;
   };
 
@@ -1563,7 +1605,9 @@ class FileUploader extends React.Component {
     // (→ onCancel → onLegacyQueueIdle) cannot start a held mode group mid-teardown.
     this._resettingUploads = true;
     this.legacyHold = [];
+    this.abandonedLegacyFiles = [];
     this.activeLegacyMode = null;
+    this._legacyStartsInFlight = 0;
     this.cancelActiveUploads();
     this.clearBlockUploadQueue();
     if (this.blockLimiter) {
@@ -1592,9 +1636,10 @@ class FileUploader extends React.Component {
     // Drop it from the file-level queue if it was only waiting (never started); if it
     // is the active block file, entry.cancel() below aborts it and the queue advances.
     this.removeQueuedBlockUpload(uploadingItem);
-    // Release its destination key and drop it from the scheduler hold list (if held).
+    // Release its destination key and drop it from the scheduler hold / abandoned lists.
     this.activeUploadNameKeys.delete(this.getUploadDestinationKey(uploadingItem));
     this.legacyHold = this.legacyHold.filter(h => h.resumableFile.uniqueIdentifier !== uploadingItem.uniqueIdentifier);
+    this.abandonedLegacyFiles = this.abandonedLegacyFiles.filter(f => f.uniqueIdentifier !== uploadingItem.uniqueIdentifier);
 
     let uploadFileList = this.state.uploadFileList.filter(item => {
       if (item.uniqueIdentifier === uploadingItem.uniqueIdentifier) {
@@ -1625,7 +1670,9 @@ class FileUploader extends React.Component {
     // (→ onCancel → onLegacyQueueIdle) cannot start a held mode group mid-cancel.
     this._resettingUploads = true;
     this.legacyHold = [];
+    this.abandonedLegacyFiles = [];
     this.activeLegacyMode = null;
+    this._legacyStartsInFlight = 0;
 
     let uploadFileList = this.state.uploadFileList.filter(item => {
       // Cancel every unsaved entry, including block uploads already at 100% that
