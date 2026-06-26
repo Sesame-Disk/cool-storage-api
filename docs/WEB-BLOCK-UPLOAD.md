@@ -701,6 +701,22 @@ must **not** reintroduce any target clearing.
   move it to the retry list, but the retry path (`retryUploadWithFreshLink`) assumes a file
   that already started and errored, so wiring a pre-start failure into it needs care. Rare
   (a network blip on the session-link fetch); deferred, not a blocker.
+- **A manual retry of a held replace after a mode switch can route to the wrong instance
+  target.** `retryUploadWithFreshLink` (and `retryUploadFile`) re-drive a file via
+  `resumableObj.upload()` reusing whatever `resumable.opts.target` is CURRENTLY set — it
+  does NOT re-enter the target-mode scheduler. So in the narrow case where a replace
+  (`'update'`) file errors and lands in the retry list, the queue then goes idle and
+  `onLegacyQueueIdle` switches the instance target to a held `'upload'` group, a later
+  **manual** retry of that replace would POST to the upload-link → it would auto-rename
+  ("name (1).ext") instead of overwriting, and momentarily mix modes against the running
+  group. Requires the exact combination: mixed replace+normal in one session **+** the
+  replace errors **+** the user clicks retry **after** the mode switched. The common
+  auto-retry path (409 conflict) is unaffected: it fires from `onFileError` before any
+  mode switch, while the instance target is still the update-link. Strictly better than
+  `main` (where replace via per-file target never worked at all), same class as the items
+  above; the clean fix is to route retries back through `enqueueLegacyUpload(file, mode)`
+  using the file's `_uploadMode`, so the scheduler re-establishes the correct target.
+  Deferred, not a blocker.
 - **`mergeUploadFileList` is still a bridge, not a single-source `uploadEntries` Map.** The
   functional duplicate-row / disappearing-block-entry bugs are covered by the synchronous
   `activeUploadNameKeys` guard + the functional-`setState` batching fixes; a full Map keyed
