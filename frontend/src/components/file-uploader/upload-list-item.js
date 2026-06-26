@@ -59,6 +59,43 @@ class UploadListItem extends React.Component {
     this.props.onUploadRetry(this.props.resumableFile);
   };
 
+  // blockProgressText maps a block-upload entry's explicit phase to a label, so the
+  // row reports the actual step ('Hashing…' / 'Checking…' / 'Uploading… X%' /
+  // 'Saving…') instead of the legacy chunk/remainingTime heuristics, which a block
+  // entry has no data for. The percent is the overall bar (hashing is its first
+  // half), so the number and the bar always agree.
+  blockProgressText = (resumableFile, progress) => {
+    switch (resumableFile._phase) {
+      case 'queued':
+        return gettext('Waiting...');
+      case 'hashing':
+        return gettext('Hashing...');
+      case 'checking':
+        return gettext('Checking...');
+      case 'saving':
+        return gettext('Saving...');
+      case 'uploading':
+      default:
+        return progress === 0 ? gettext('Waiting...') : `${gettext('Uploading...')} ${progress}%`;
+    }
+  };
+
+  // dedupNote surfaces the bytes NOT uploaded thanks to content-addressed dedup, so a
+  // fast repeat upload is explained ("40.0 M deduplicated") instead of looking
+  // suspicious. "Deduplicated" (not "already on server") because the saving covers
+  // both blocks already on the server AND blocks repeated within this same file.
+  // Rendered only once the /blocks/check plan is known and something was skipped.
+  dedupNote = (resumableFile) => {
+    if (!resumableFile.isBlockUpload || !(resumableFile._dedupedBytes > 0)) {
+      return null;
+    }
+    return (
+      <span className="dedup-note text-muted ml-2">
+        {`${this.formatFileSize(resumableFile._dedupedBytes)} ${gettext('deduplicated')}`}
+      </span>
+    );
+  };
+
   formatFileSize = (size) => {
     if (typeof size !== 'number') {
       return '';
@@ -100,12 +137,13 @@ class UploadListItem extends React.Component {
                         <div className="progress-bar" role="progressbar" style={{ width: `${progress}%` }} aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100"></div>
                       </div>
                       {resumableFile.isBlockUpload ? (
-                        // Block uploads have no chunk ETA; show real progress (or
-                        // "Saving..." once the server-side commit is in flight)
+                        // Block uploads have no chunk ETA; show the explicit phase
+                        // ('Hashing…' / 'Checking…' / 'Uploading… X%' / 'Saving…')
                         // instead of a perpetual "Preparing to upload...".
-                        isFileSaving(resumableFile)
-                          ? <div className="progress-text">{gettext('Saving...')}</div>
-                          : <div className="progress-text">{progress === 0 ? gettext('Waiting...') : `${gettext('Uploading...')} ${progress}%`}</div>
+                        <div className="progress-text">
+                          {this.blockProgressText(resumableFile, progress)}
+                          {this.dedupNote(resumableFile)}
+                        </div>
                       ) : (
                         <Fragment>
                           {(resumableFile.remainingTime === -1) && <div className="progress-text">{gettext('Preparing to upload...')}</div>}
@@ -134,14 +172,25 @@ class UploadListItem extends React.Component {
                       <div className="progress-bar" role="progressbar" style={{ width: `${progress}%` }} aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100"></div>
                     </div>
                   </div>
-                  {this.state.uploadState === UPLOAD_UPLOADING && (
+                  {resumableFile.isBlockUpload ? (
+                    // Block entry: drive the label off the explicit phase, not the
+                    // legacy uploadState (which only knows uploading vs saving).
+                    <p className="progress-text mb-0">
+                      {this.blockProgressText(resumableFile, progress)}
+                      {this.dedupNote(resumableFile)}
+                    </p>
+                  ) : (
                     <>
-                      {progress === 0 && <p className="progress-text mb-0">{gettext('Waiting...')}</p>}
-                      {progress > 0 && <p className="progress-text mb-0">{`${gettext('Uploading...')} ${progress}%`}</p>}
+                      {this.state.uploadState === UPLOAD_UPLOADING && (
+                        <>
+                          {progress === 0 && <p className="progress-text mb-0">{gettext('Waiting...')}</p>}
+                          {progress > 0 && <p className="progress-text mb-0">{`${gettext('Uploading...')} ${progress}%`}</p>}
+                        </>
+                      )}
+                      {this.state.uploadState === UPLOAD_ISSAVING && (
+                        <p className="progress-text mb-0">{gettext('Saving...')}</p>
+                      )}
                     </>
-                  )}
-                  {this.state.uploadState === UPLOAD_ISSAVING && (
-                    <p className="progress-text mb-0">{gettext('Saving...')}</p>
                   )}
                 </>
               )}
@@ -151,6 +200,7 @@ class UploadListItem extends React.Component {
             <div className="d-flex align-items-center">
               <span className="upload-success-icon sf2-icon-tick mr-2"></span>
               <span className="upload-success-msg">{gettext('Uploaded')}</span>
+              {this.dedupNote(resumableFile)}
             </div>
           )}
           {this.state.uploadState === UPLOAD_ERROR && (

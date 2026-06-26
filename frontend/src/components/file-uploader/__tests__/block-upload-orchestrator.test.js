@@ -196,7 +196,7 @@ test('aborts before starting when the caller signal is already cancelled', async
 });
 
 describe('phase reporting (onPhase)', () => {
-  test('emits hashing -> uploading -> saving in order', async () => {
+  test('emits hashing -> checking -> uploading -> saving in order', async () => {
     const phases = [];
     const api = {
       createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
@@ -210,7 +210,52 @@ describe('phase reporting (onPhase)', () => {
       repoID: 'r', api, hashFn, blockSize: 50, onPhase: (p) => phases.push(p),
     });
 
-    expect(phases).toEqual(['hashing', 'uploading', 'saving']);
+    expect(phases).toEqual(['hashing', 'checking', 'uploading', 'saving']);
+  });
+});
+
+describe('dedup plan reporting (onPlan)', () => {
+  test('reports uploaded vs deduplicated bytes from the missing set', async () => {
+    // 3 blocks of 50 bytes (last is 30) = 130 bytes total; only block 1 is missing,
+    // so 50 bytes are uploaded and 80 (blocks 0 + 2) were already on the server.
+    let plan = null;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: ['h1'] } }),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '130' }] }),
+    };
+    const hashFn = jest.fn().mockResolvedValue({
+      blocks: [
+        { index: 0, sha256: 'h0', size: 50 },
+        { index: 1, sha256: 'h1', size: 50 },
+        { index: 2, sha256: 'h2', size: 30 },
+      ],
+      size: 130,
+    });
+
+    await uploadFileViaBlocks(makeFile(130), {
+      repoID: 'r', api, hashFn, blockSize: 50, onPlan: (p) => { plan = p; },
+    });
+
+    expect(plan).toEqual({ totalBytes: 130, uploadBytes: 50, dedupedBytes: 80 });
+  });
+
+  test('reports zero dedup when every block is missing', async () => {
+    let plan = null;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: ['h0'] } }),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '10' }] }),
+    };
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
+
+    await uploadFileViaBlocks(makeFile(10), {
+      repoID: 'r', api, hashFn, blockSize: 50, onPlan: (p) => { plan = p; },
+    });
+
+    expect(plan).toEqual({ totalBytes: 10, uploadBytes: 10, dedupedBytes: 0 });
   });
 });
 

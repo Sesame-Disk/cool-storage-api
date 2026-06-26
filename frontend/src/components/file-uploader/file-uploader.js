@@ -64,8 +64,19 @@ class FileUploader extends React.Component {
     // is visible — producing two rows. This Set of destination keys (repoID:path:
     // relativePath) is updated SYNCHRONOUSLY the moment a file is committed (queued or
     // held for a prompt), so the second drop is caught immediately. Released when the
-    // file reaches a terminal state (saved / cancelled / dialog closed).
+    // file reaches a non-saved terminal state (cancelled / dialog closed); on SUCCESS the
+    // key moves to completedUploadNameKeys instead (see below).
     this.activeUploadNameKeys = new Set();
+
+    // Synchronous record of destinations already UPLOADED in this session. On success a
+    // key moves here from activeUploadNameKeys. A later add of the same destination is
+    // routed to the Replace? prompt SYNCHRONOUSLY (not via the async uploadFileList scan
+    // in fileNameExistsInDir, which the server-side direntList prop may not reflect after
+    // a just-finished upload — and resumablejs never dedups because generateUniqueIdentifier
+    // is time-based). Without this, a re-add of a just-completed file slipped past the
+    // (now-released) guard AND the stale direntList, materializing a duplicate "Waiting…"
+    // row next to the "Uploaded" one. Cleared with the session (close / cancel-all).
+    this.completedUploadNameKeys = new Set();
 
     this.notifiedFolders = [];
 
@@ -256,7 +267,9 @@ class FileUploader extends React.Component {
     entry._uploading = false;
     entry._cancelled = false;
     entry._abortController = null;
-    entry._phase = 'hashing';
+    // Re-queued for retry: it waits in the FIFO until it actually starts, so render
+    // it as "Waiting…" ('queued'), not "Hashing…". runBlockUpload sets 'hashing'.
+    entry._phase = 'queued';
   };
 
   // Thin delegators onto the shared guard; kept as instance methods so callers
@@ -361,14 +374,32 @@ class FileUploader extends React.Component {
     this.resumable.removeFile(resumableFile);
 
     const entry = this.createBlockUploadEntry(resumableFile);
-    this.setState(prev => ({
-      uploadFileList: [...prev.uploadFileList, entry],
-      isUploadProgressDialogShow: true,
-    }));
+    this.appendUploadEntry(entry);
     // The entry renders immediately (progress 0 → "Waiting...") and is started by the
     // file-level queue when no other block upload is active.
     this.enqueueBlockUpload(entry, file);
     return true;
+  };
+
+  // appendUploadEntry puts a block entry into the rendered list as the SINGLE entry for
+  // its uniqueIdentifier. It drops any pre-existing entry with the same id, then appends
+  // the new one. This fixes the duplicate-row screenshot AND its mirror (the entry
+  // vanishing): a block file's original resumableFile can leak into uploadFileList as a
+  // phantom legacy "Waiting…" row with the SAME uniqueIdentifier as the block entry — two
+  // rows sharing a React key, one stuck on stale state. A naive `[...prev, entry]` append
+  // also duplicates whenever the updater runs twice (React double-invokes state updaters
+  // under StrictMode / re-entrant calls). Filtering the id out first makes the updater
+  // both idempotent (a second run replaces the same entry) and authoritative (the block
+  // entry always wins over a phantom, so mergeUploadFileList — which keeps only
+  // isBlockUpload items from the list — never drops the file).
+  appendUploadEntry = (entry) => {
+    this.setState(prev => ({
+      uploadFileList: [
+        ...prev.uploadFileList.filter(item => item && item.uniqueIdentifier !== entry.uniqueIdentifier),
+        entry,
+      ],
+      isUploadProgressDialogShow: true,
+    }));
   };
 
   // enqueueBlockUpload / drainBlockUploadQueue serialize block (CAS) uploads to ONE
@@ -418,6 +449,22 @@ class FileUploader extends React.Component {
     });
   };
 
+  // releaseActiveBlockSlotForCommit hands the file-level slot back the moment the
+  // active block file enters its commit ('saving') phase, so the next queued file
+  // can start uploading while this one's commit is in flight. Idempotent per job
+  // (the needs_upload path can re-enter 'saving'): once released, the job no longer
+  // owns the slot, so the guard and the job's own finally (which only nulls when it
+  // still owns the slot) cannot double-release or strand the queue.
+  releaseActiveBlockSlotForCommit = (entry) => {
+    const job = this.activeBlockUpload;
+    if (!job || job.entry !== entry || job._committing) {
+      return;
+    }
+    job._committing = true;
+    this.activeBlockUpload = null;
+    this.drainBlockUploadQueue();
+  };
+
   // removeQueuedBlockUpload drops a not-yet-started block file from the queue (it never
   // ran, so there is nothing to abort). Matched by object identity so re-uploading the
   // same filename in a later batch (a different entry) is not removed by accident. The
@@ -453,14 +500,21 @@ class FileUploader extends React.Component {
       file,
       isBlockUpload: true,
       // Explicit flow phase, the single source of truth for how this entry
-      // renders: 'hashing' | 'uploading' | 'saving' | 'done' | 'error'. It is
-      // driven by the orchestrator's onPhase callback, NOT inferred from
-      // resumable.js chunk/remainingTime state (which a block entry does not have).
-      _phase: 'hashing',
+      // renders: 'queued' | 'hashing' | 'checking' | 'uploading' | 'saving' |
+      // 'done' | 'error'. Starts 'queued' so a file WAITING in the file-level FIFO
+      // renders "Waiting…", not "Hashing…" (only the active file is hashing).
+      // runBlockUpload flips it to 'hashing' when the file actually starts; the rest
+      // is driven by the orchestrator's onPhase callback, NOT inferred from
+      // resumable.js chunk/remainingTime state (a block entry has none).
+      _phase: 'queued',
       _abortController: null,
       _cancelled: false,
       _progress: 0,
       _uploading: true,
+      // Dedup plan from /blocks/check (set via onPlan): bytes already on the server
+      // (shared/repeated blocks) vs bytes actually uploaded. 0 until the check runs.
+      _dedupedBytes: 0,
+      _uploadBytes: 0,
     };
     entry.progress = () => entry._progress;
     entry.isUploading = () => entry._uploading;
@@ -534,6 +588,13 @@ class FileUploader extends React.Component {
       resetBlockUploadBitrate(entry);
     }
     entry._phase = phase;
+    if (phase === 'saving') {
+      // The bytes are all on the server; only the commit is left. Release the
+      // file-level slot NOW so the next queued block file starts uploading while
+      // this one finishes its commit (the block limiter still caps total blocks
+      // on the wire). Mirrors the legacy finalize-slot handoff.
+      this.releaseActiveBlockSlotForCommit(entry);
+    }
     this.setState(prev => {
       const uploadFileList = prev.uploadFileList.map(item => (
         item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
@@ -542,6 +603,22 @@ class FileUploader extends React.Component {
         uploadFileList,
         uploadBitrate: this.calculateUploadBitrate(uploadFileList),
       };
+    });
+  };
+
+  // setBlockUploadPlan records the dedup plan from /blocks/check so the row can show
+  // how much of the file was already on the server (skipped) vs actually uploaded.
+  setBlockUploadPlan = (entry, plan) => {
+    if (!plan) {
+      return;
+    }
+    entry._dedupedBytes = Math.max(0, Number(plan.dedupedBytes) || 0);
+    entry._uploadBytes = Math.max(0, Number(plan.uploadBytes) || 0);
+    this.setState(prev => {
+      const uploadFileList = prev.uploadFileList.map(item => (
+        item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
+      ));
+      return { uploadFileList };
     });
   };
 
@@ -555,6 +632,8 @@ class FileUploader extends React.Component {
     entry.isSaved = false;
     entry.remainingTime = -1;
     entry._phase = 'hashing';
+    entry._dedupedBytes = 0;
+    entry._uploadBytes = 0;
     // Persist the replace decision so a Retry / Retry-All re-runs with the same
     // semantics the user chose in the duplicate dialog.
     entry._replace = replace;
@@ -573,6 +652,7 @@ class FileUploader extends React.Component {
       limiter: this.blockLimiter,
       signal: abortController ? abortController.signal : undefined,
       onPhase: (phase) => this.setBlockUploadPhase(entry, phase),
+      onPlan: (plan) => this.setBlockUploadPlan(entry, plan),
       onHashProgress: (hashed, total) => this.updateBlockUploadProgress(entry, (total ? hashed / total : 0) * 0.5),
       onUploadProgress: (done, total) => this.updateBlockUploadProgress(entry, 0.5 + (total ? done / total : 1) * 0.5),
       onTransferProgress: (deltaBytes) => this.updateBlockUploadTransferredBytes(entry, deltaBytes),
@@ -693,10 +773,7 @@ class FileUploader extends React.Component {
     if (file && shouldUseBlockUpload(file, { encrypted: this.props.repoEncrypted })) {
       const entry = this.createBlockUploadEntry(resumableFile);
       entry._replace = replace; // persisted; the file-level queue runs it later
-      this.setState(prev => ({
-        uploadFileList: [...prev.uploadFileList, entry],
-        isUploadProgressDialogShow: true,
-      }));
+      this.appendUploadEntry(entry);
       this.enqueueBlockUpload(entry, file);
       return;
     }
@@ -951,8 +1028,11 @@ class FileUploader extends React.Component {
     // and BEFORE the block-flow diversion below, so a duplicate inside a batch — or a
     // large file routed to the block flow — is offered the replace dialog instead of
     // silently landing as "name (1).ext". The matched file is held OUT of the queue
-    // and the rendered list until the user decides.
-    if (isFile && !isCustomPermission && this.fileNameExistsInDir(resumableFile.fileName)) {
+    // and the rendered list until the user decides. completedUploadNameKeys is the
+    // SYNCHRONOUS authority for "already uploaded this session" (the async direntList /
+    // uploadFileList scan in fileNameExistsInDir can miss a just-finished upload).
+    if (isFile && !isCustomPermission
+        && (this.completedUploadNameKeys.has(destKey) || this.fileNameExistsInDir(resumableFile.fileName))) {
       this.activeUploadNameKeys.add(destKey); // reserve so a rapid second drop is caught
       this.handleDuplicateFile(resumableFile, files);
       return;
@@ -1030,14 +1110,19 @@ class FileUploader extends React.Component {
   // uniqueIdentifier. Rebuilding from this.resumable.files alone erased block rows the
   // moment a legacy file was added, and would drop held files entirely.
   mergeUploadFileList = (resumableFiles = this.resumable ? this.resumable.files : [], uploadFileList = this.state.uploadFileList) => {
-    const merged = uploadFileList.filter(item => item && item.isBlockUpload);
-    const seen = new Set(merged.map(item => item.uniqueIdentifier));
+    const merged = [];
+    const seen = new Set();
     const addAll = (files) => (files || []).forEach(file => {
       if (file && !seen.has(file.uniqueIdentifier)) {
         merged.push(file);
         seen.add(file.uniqueIdentifier);
       }
     });
+    // Dedup by uniqueIdentifier across ALL sources, including the block entries (the
+    // initial filter used to keep them WITHOUT deduping, so a block entry that appeared
+    // twice in uploadFileList rendered twice). Block entries first (they live outside
+    // resumable.files), then resumable files, then held legacy files.
+    addAll(uploadFileList.filter(item => item && item.isBlockUpload));
     addAll(resumableFiles);
     addAll((this.legacyHold || []).map(h => h.resumableFile));
     return merged;
@@ -1140,10 +1225,20 @@ class FileUploader extends React.Component {
   };
 
   markUploadSaved = (resumableFile, newFileName) => {
-    // Release the synchronous duplicate key on success, so a LATER drop of the same
-    // name is offered the Replace? prompt (via fileNameExistsInDir's isSaved check)
-    // instead of being silently blocked as "already queued".
-    this.activeUploadNameKeys.delete(this.getUploadDestinationKey(resumableFile));
+    // Move the synchronous duplicate key from "in flight" to "completed this session",
+    // so a LATER drop of the same destination is offered the Replace? prompt (caught
+    // SYNCHRONOUSLY in onFileAdded) instead of silently materializing a second row.
+    const destKey = this.getUploadDestinationKey(resumableFile);
+    this.activeUploadNameKeys.delete(destKey);
+    this.completedUploadNameKeys.add(destKey);
+    // If the backend auto-renamed a standalone file ("keep both" → "foo (1).txt"), also
+    // record the REAL saved destination, so re-dropping that exact name before the
+    // server direntList refreshes is caught too (the original-name key alone misses it).
+    if (newFileName
+        && resumableFile.fileName === resumableFile.relativePath
+        && newFileName !== resumableFile.fileName) {
+      this.completedUploadNameKeys.add(`${this.props.repoID}:${this.props.path}:${newFileName}`);
+    }
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
         clearFileUploadRuntimeState(item);
@@ -1469,8 +1564,9 @@ class FileUploader extends React.Component {
     this.isUploadLinkLoaded = false;
     this._uploadTargetPromise = null;
     this._replaceUpdateLinkPromise = null;
-    // Scheduler already reset at the top; clear the synchronous duplicate guard too.
+    // Scheduler already reset at the top; clear the synchronous duplicate guards too.
     this.activeUploadNameKeys.clear();
+    this.completedUploadNameKeys.clear();
     // Drop any undecided duplicates and the bulk choice so the next session starts clean.
     this.pendingDuplicates = [];
     this.duplicateBulkAction = null;
@@ -1536,9 +1632,10 @@ class FileUploader extends React.Component {
     if (this.blockLimiter) {
       this.blockLimiter.reset();
     }
-    // Release the synchronous duplicate guard for every cancelled entry (saved entries
-    // stay caught by fileNameExistsInDir).
+    // Release the synchronous duplicate guards: cancel-all ends the session, so both
+    // in-flight and completed-this-session destinations reset.
     this.activeUploadNameKeys.clear();
+    this.completedUploadNameKeys.clear();
 
     this.setState({
       totalProgress: 100,

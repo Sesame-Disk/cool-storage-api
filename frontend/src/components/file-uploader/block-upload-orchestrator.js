@@ -449,6 +449,7 @@ export async function uploadFileViaBlocks(file, {
   onUploadProgress,
   onTransferProgress,
   onPhase,
+  onPlan,
   signal,
 } = {}) {
   if (!repoID) throw new Error('repoID is required');
@@ -457,9 +458,9 @@ export async function uploadFileViaBlocks(file, {
   // socket cannot hang the flow forever. signal may be undefined (axios ignores it).
   const ctrlConfig = { signal, timeout: controlPlaneTimeoutMs };
 
-  // emitPhase reports the coarse flow phase ('hashing' | 'uploading' | 'saving')
-  // so the UI can render an accurate state instead of inferring it from the
-  // legacy resumable.js chunk/remainingTime heuristics (which do not apply to a
+  // emitPhase reports the flow phase ('hashing' | 'checking' | 'uploading' |
+  // 'saving') so the UI can render an accurate state instead of inferring it from
+  // the legacy resumable.js chunk/remainingTime heuristics (which do not apply to a
   // block-upload entry and otherwise read as "Saving..." the whole time).
   const emitPhase = (phase) => { if (onPhase) onPhase(phase); };
 
@@ -483,6 +484,7 @@ export async function uploadFileViaBlocks(file, {
 
   // 3. Which blocks are missing (de-duplicated hash set). Batched to stay within
   //    the server's per-request hash cap (CHECK_BATCH_SIZE < 10000).
+  emitPhase('checking');
   const uniqueHashes = Array.from(new Set(blocks.map((b) => b.sha256)));
   const missing = [];
   for (let i = 0; i < uniqueHashes.length; i += CHECK_BATCH_SIZE) {
@@ -494,6 +496,26 @@ export async function uploadFileViaBlocks(file, {
     for (let j = 0; j < batchMissing.length; j += 1) {
       missing.push(batchMissing[j]);
     }
+  }
+
+  // Report the dedup plan from the AUTHORITATIVE missing set (not wire bytes,
+  // which include retries): every UNIQUE block present on the server is a save.
+  // uploadBytes counts each missing block once at its real size; dedupedBytes is
+  // the rest of the logical file (shared/repeated blocks already on the server).
+  if (onPlan) {
+    const lastBlockIndex = blocks.length - 1;
+    const blockBytes = (index) => (
+      index === lastBlockIndex ? size - (lastBlockIndex * blockSize) : blockSize
+    );
+    let uploadBytes = 0;
+    for (let i = 0; i < missing.length; i += 1) {
+      const index = blockIndexByHash[missing[i]];
+      if (index !== undefined) {
+        uploadBytes += blockBytes(index);
+      }
+    }
+    uploadBytes = Math.min(uploadBytes, size);
+    onPlan({ totalBytes: size, uploadBytes, dedupedBytes: Math.max(0, size - uploadBytes) });
   }
 
   // 4. Upload missing blocks.

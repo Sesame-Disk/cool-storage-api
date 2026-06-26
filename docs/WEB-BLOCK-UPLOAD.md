@@ -722,20 +722,62 @@ must **not** reintroduce any target clearing.
   `activeUploadNameKeys` guard + the functional-`setState` batching fixes; a full Map keyed
   by `uniqueIdentifier` (the originally-sketched single-source list) remains an architecture
   cleanup, not a bug fix. Deferred.
-- **[UX] Finer per-phase labels for block uploads: `Hashing… / Checking… / Uploading… /
-  Saving…`.** The block flow currently renders only `Uploading… X%` and `Saving…` (the
-  `_phase` model is coarse: `hashing→uploading→saving→done`, with hashing folded into the
-  first half of the bar and `check` not surfaced at all). Plumb the orchestrator's distinct
-  phases (session → **hashing** → **checking** (`/blocks/check`) → **uploading** →
-  **saving** (commit)) through `onPhase`/`_phase` and `upload-list-item` so each step shows
-  its own label. Deferred (UX polish before flag-on).
-- **[Observability] Surface deduplicated bytes vs bytes actually uploaded.** The block
-  flow already knows the manifest (total bytes), the `missing` set from `/blocks/check`
-  (bytes to upload), and the real wire bytes (`_uploadedNetworkBytes`); the difference is
-  the **deduplicated** (skipped) bytes. The UI shows neither the dedup amount nor the
-  "X% already existed" ratio, so a fast repeat upload looks unexplained. Expose
-  `deduplicatedBytes` / `uploadedBytes` per entry (and an aggregate) and render them (e.g.
-  "Skipped N MB already on server"). Deferred (observability polish before flag-on).
+- **[RESOLVED — PR6] Finer per-phase labels for block uploads + commit-phase pipelining.**
+  The orchestrator now emits a distinct **`checking`** phase before `/blocks/check`
+  (`emitPhase('checking')`), so `_phase` is `hashing → checking → uploading → saving → done`.
+  `upload-list-item` renders each step from `_phase` (`blockProgressText`): `Hashing… /
+  Checking… / Uploading… X% / Saving…` (percent is the overall bar, hashing being its first
+  half). **Pipelining:** the file-level FIFO no longer holds the slot through the commit —
+  `setBlockUploadPhase` calls `releaseActiveBlockSlotForCommit` the moment a file enters
+  `saving`, handing the slot to the next queued block file so it starts uploading while the
+  first commits (the block limiter still caps total blocks on the wire). Idempotent per job
+  (`_committing`) so the `needs_upload` re-entry into `saving` cannot double-release or
+  strand the queue. Mirrors the legacy finalize-slot handoff. Tests: orchestrator phase
+  order + `file-uploader.test.js` "releases the slot at saving" / "needs_upload re-entry"
+  + `upload-list-item.test.js` phase labels.
+- **[RESOLVED — PR6] Deduplicated bytes surfaced.** The orchestrator reports a dedup plan
+  from the AUTHORITATIVE missing set after `/blocks/check` (`onPlan({ totalBytes, uploadBytes,
+  dedupedBytes })`), computed from each unique missing block's real size (not wire bytes,
+  which include retries). The row shows `N M deduplicated` (`dedupNote`) during the upload
+  and on the completed row, so a fast repeat upload is explained. "Deduplicated" (not
+  "already on server") because the saving covers BOTH blocks already on the server AND
+  blocks repeated within the same file. Tests: orchestrator `onPlan` (mixed + all-missing)
+  + `upload-list-item.test.js` dedup note.
+- **[RESOLVED — PR6] Queued block files render "Waiting…", not "Hashing…".** The block
+  FIFO runs one file at a time; the rest wait. The entry phase now starts `'queued'`
+  (createBlockUploadEntry / prepareBlockUploadRetry) and `runBlockUpload` flips it to
+  `'hashing'` only when the file actually starts, so a queued row no longer shows the
+  active file's "Hashing…". Test: `upload-list-item.test.js` "queued → Waiting" +
+  `file-uploader.test.js` "freshly created block entry starts queued".
+- **[RESOLVED — PR6] Duplicate row for a single file (one add → two rows), and its mirror
+  (the file vanishing).** A block file rendered TWICE — a stale "Waiting…" row next to the
+  real "Uploaded … deduplicated" one — even though it was added once. Root cause: the
+  block file's original resumableFile leaks into `uploadFileList` as a phantom legacy row
+  with the SAME `uniqueIdentifier` as the block entry → two list items sharing a React
+  key, one stuck on stale state. (A naive `[...prev, entry]` append ALSO duplicates when
+  React double-invokes the state updater under StrictMode / re-entrant calls.) The first
+  attempted fix — *skip* the append when the id is already present — backfired: it skipped
+  the real block entry because the phantom already held the id, and then
+  `mergeUploadFileList` (which keeps only `isBlockUpload` items from the list) dropped the
+  phantom too, so the file vanished from the dialog entirely (uploaded fine, just
+  invisible). Correct fix: `appendUploadEntry` REPLACES — it filters out any entry with the
+  same id, then appends the block entry, so the block entry is both idempotent under
+  re-invocation AND authoritative over a phantom. Plus `mergeUploadFileList` now dedups by
+  `uniqueIdentifier` across ALL sources (block entries included). Tests:
+  `file-uploader.test.js` "appendUploadEntry replaces a phantom legacy entry sharing the
+  block id (no dup, no vanish)" + "idempotent when the updater is double-invoked" +
+  "mergeUploadFileList renders a block entry once even if it appears twice".
+- **[RESOLVED — PR6] Re-add of a just-completed destination + auto-rename guard.** A
+  separate hardening for re-dropping a file already uploaded THIS session: on success the
+  destination key MOVES from `activeUploadNameKeys` to a session-scoped
+  `completedUploadNameKeys` set, checked SYNCHRONOUSLY in `onFileAdded` so a re-add is
+  routed to the Replace? prompt even when the async `uploadFileList` / server `direntList`
+  has not refreshed (and resumablejs never dedups — `generateUniqueIdentifier` is
+  time-based). When the backend auto-renamed a standalone file ("keep both" →
+  "foo (1).txt"), the REAL saved destination is recorded too. Cleared on close /
+  cancel-all. Tests: "re-add … caught synchronously even if the list is stale", "closing
+  the dialog clears the completed-destination guard", "completed guard also catches the
+  backend auto-renamed destination".
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
@@ -781,11 +823,13 @@ flag were on*.
    file hashes differently, so it is stored twice. Out of phase 1; closing it needs
    FastCDC + SHA-1 aliasing in the browser. See
    [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md) and the limitations section above.
-6. **[Med] Frontend phase/progress/throughput UX.** The block flow is mapped onto
-   the legacy resumable.js dialog, which loses per-phase state, shows `0.00 B/s`,
-   surfaces `Saving…` early and without its own progress, has no dedup
-   observability, and is not fully integrated with the global aggregator. Full
-   detail in *Frontend UX gaps* above — the main polish cluster before flag-on.
+6. **[Med, mostly addressed] Frontend phase/progress/throughput UX.** The block flow
+   is mapped onto the legacy resumable.js dialog. **Done (PR6):** explicit per-phase
+   labels (`Hashing… / Checking… / Uploading… X% / Saving…`), commit-phase pipelining
+   (the next file uploads while the previous commits), and dedup observability
+   (`N M deduplicated`). Real block-upload throughput already replaced the legacy
+   `0.00 B/s`. **Remaining:** fuller integration with the global progress aggregator and
+   any further polish before flag-on.
 7. **[Resolved] Concurrent-loser `409 "commit still in progress"` retry.** The LWT
    guarantees a single winner; losing/retried commits poll only ~10s for the
    winner's `ResultFilename`, after which the server returns

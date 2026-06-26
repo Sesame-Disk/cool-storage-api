@@ -555,6 +555,14 @@ describe('FileUploader block upload file-level queue (serialization)', () => {
     return deferreds;
   };
 
+  test('a freshly created block entry starts in the "queued" phase (renders Waiting, not Hashing)', () => {
+    const uploader = createUploader();
+    const entry = uploader.createBlockUploadEntry({
+      uniqueIdentifier: 'x', fileName: 'x.bin', relativePath: 'x.bin', file: { name: 'x.bin', size: 10 },
+    });
+    expect(entry._phase).toBe('queued');
+  });
+
   test('runs only one block file at a time; the next starts when the active one settles', async () => {
     const uploader = createUploader();
     const deferreds = withDeferredRunBlockUpload(uploader);
@@ -585,6 +593,53 @@ describe('FileUploader block upload file-level queue (serialization)', () => {
     await settle();
     expect(uploader.activeBlockUpload).toBe(null);
     expect(uploader.blockUploadQueue.length).toBe(0);
+  });
+
+  test('a block file releases the slot at "saving" so the next starts while it commits', async () => {
+    const uploader = createUploader();
+    const deferreds = withDeferredRunBlockUpload(uploader);
+    const a = makeQueueEntry('a');
+    const b = makeQueueEntry('b');
+    uploader.state.uploadFileList = [a, b];
+
+    uploader.enqueueBlockUpload(a, a.file); // active
+    uploader.enqueueBlockUpload(b, b.file); // waiting
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1);
+    expect(uploader.activeBlockUpload.entry).toBe(a);
+    expect(uploader.blockUploadQueue.length).toBe(1);
+
+    // a enters its commit phase → slot handed off, b starts WITHOUT a having settled.
+    uploader.setBlockUploadPhase(a, 'saving');
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(b, b.file);
+    expect(uploader.activeBlockUpload.entry).toBe(b);
+    expect(uploader.blockUploadQueue.length).toBe(0);
+
+    // a's commit finishing later must NOT null b's slot or wedge the queue.
+    deferreds[0].resolve();
+    await settle();
+    expect(uploader.activeBlockUpload.entry).toBe(b);
+  });
+
+  test('a needs_upload re-entry into "saving" does not re-release or strand the slot', async () => {
+    const uploader = createUploader();
+    withDeferredRunBlockUpload(uploader);
+    const a = makeQueueEntry('a');
+    const b = makeQueueEntry('b');
+    uploader.state.uploadFileList = [a, b];
+
+    uploader.enqueueBlockUpload(a, a.file);
+    uploader.enqueueBlockUpload(b, b.file);
+    uploader.setBlockUploadPhase(a, 'saving'); // hands off to b
+    expect(uploader.activeBlockUpload.entry).toBe(b);
+
+    // commit reported needs_upload → a goes back to uploading, then saving again.
+    uploader.setBlockUploadPhase(a, 'uploading');
+    uploader.setBlockUploadPhase(a, 'saving');
+
+    // b keeps the slot; a (already handed off) cannot grab or strand it.
+    expect(uploader.activeBlockUpload.entry).toBe(b);
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
   });
 
   test('cancelling a queued (waiting) block file removes it so it never starts', async () => {
@@ -951,6 +1006,41 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(uploader.state.currentResumableFile).toBe(f);
   });
 
+  test('a re-add of a destination completed THIS session is caught synchronously even if the list is stale', () => {
+    // The production bug: a block file finishes (fully deduplicated), then the same
+    // destination is added again before the async uploadFileList / server direntList
+    // reflects it → it slipped past the released guard and the stale list, producing a
+    // second "Waiting…" row next to the "Uploaded" one. completedUploadNameKeys is the
+    // synchronous authority that catches it regardless of the async state.
+    const uploader = createUploader(); // empty server direntList
+    uploader.state.uploadFileList = [];
+    const first = createResumableFile('all-databases.sql', { uniqueIdentifier: 'done', file: { name: 'all-databases.sql', size: 10 } });
+    uploader.markUploadSaved(first, 'all-databases.sql'); // moves the key to completed
+    expect(uploader.completedUploadNameKeys.has('repo-1:/:all-databases.sql')).toBe(true);
+
+    // Simulate the race: the saved entry is NOT in the rendered list yet.
+    uploader.state.uploadFileList = [];
+    const second = createResumableFile('all-databases.sql', { uniqueIdentifier: 'redrop', file: { name: 'all-databases.sql', size: 10 } });
+    uploader.resumable.files = [second];
+    uploader.onFileAdded(second, [second]);
+
+    expect(uploader.resumable.removeFile).toHaveBeenCalledWith(second); // held out, prompted
+    expect(uploader.state.isUploadRemindDialogShow).toBe(true); // not a silent 2nd row
+    expect(uploader.state.currentResumableFile).toBe(second);
+  });
+
+  test('closing the dialog clears the completed-destination guard for the next session', () => {
+    const uploader = createUploader();
+    uploader.state.uploadFileList = [];
+    const f = createResumableFile('a.txt', { uniqueIdentifier: 'a', file: { name: 'a.txt', size: 10 } });
+    uploader.markUploadSaved(f, 'a.txt');
+    expect(uploader.completedUploadNameKeys.size).toBe(1);
+
+    uploader.onCloseUploadDialog();
+
+    expect(uploader.completedUploadNameKeys.size).toBe(0);
+  });
+
   test('the parent passes showApplyToAll (duplicateBatchActive) to the remind dialog', () => {
     const uploader = createUploader();
     uploader.state.isUploadRemindDialogShow = true;
@@ -1032,6 +1122,63 @@ describe('FileUploader duplicate-name prompting', () => {
 
 describe('FileUploader target-mode scheduler + sync dedup guard', () => {
   const dupProps = (names) => ({ direntList: names.map(name => ({ type: 'file', name })) });
+
+  test('appendUploadEntry is idempotent when the state updater is double-invoked (StrictMode-safe)', () => {
+    const uploader = createUploader();
+    uploader.state.uploadFileList = [];
+    // Simulate React StrictMode double-invoking the updater, chaining the first result
+    // into the second call (the impurity the old plain append exposed → a duplicate row).
+    uploader.setState = (update) => {
+      if (typeof update !== 'function') { uploader.state = { ...uploader.state, ...update }; return; }
+      const first = update(uploader.state) || {};
+      const mid = { ...uploader.state, ...first };
+      const second = update(mid) || {};
+      uploader.state = { ...mid, ...second };
+    };
+
+    uploader.appendUploadEntry({ uniqueIdentifier: 'b1', isBlockUpload: true });
+
+    expect(uploader.state.uploadFileList.filter(i => i.uniqueIdentifier === 'b1').length).toBe(1);
+  });
+
+  test('appendUploadEntry replaces a phantom legacy entry sharing the block id (no dup, no vanish)', () => {
+    const uploader = createUploader();
+    // A phantom legacy resumableFile leaked into the list with the SAME id as the block
+    // entry (the real-world cause of both the duplicate row and, with a naive skip, the
+    // file vanishing entirely once mergeUploadFileList drops non-block entries).
+    const phantom = { uniqueIdentifier: 'Y', fileName: 'all-databases.sql', isBlockUpload: false };
+    uploader.state.uploadFileList = [phantom];
+    const blockEntry = { uniqueIdentifier: 'Y', fileName: 'all-databases.sql', isBlockUpload: true };
+
+    uploader.appendUploadEntry(blockEntry);
+
+    const matches = uploader.state.uploadFileList.filter(i => i.uniqueIdentifier === 'Y');
+    expect(matches).toHaveLength(1); // exactly one row
+    expect(matches[0].isBlockUpload).toBe(true); // the block entry won, phantom gone
+  });
+
+  test('mergeUploadFileList renders a block entry once even if it appears twice in the list', () => {
+    const uploader = createUploader();
+    const entry = { uniqueIdentifier: 'b1', isBlockUpload: true };
+    const merged = uploader.mergeUploadFileList([], [entry, entry]);
+    expect(merged.filter(i => i.uniqueIdentifier === 'b1').length).toBe(1);
+  });
+
+  test('completed guard also catches the backend auto-renamed destination while the list is stale', () => {
+    const uploader = createUploader();
+    uploader.state.uploadFileList = [];
+    const first = createResumableFile('foo.txt', { uniqueIdentifier: 'done', file: { name: 'foo.txt', size: 10 } });
+
+    uploader.markUploadSaved(first, 'foo (1).txt'); // backend kept both → auto-renamed
+
+    uploader.state.uploadFileList = [];
+    const second = createResumableFile('foo (1).txt', { uniqueIdentifier: 'redrop', file: { name: 'foo (1).txt', size: 10 } });
+    uploader.resumable.files = [second];
+    uploader.onFileAdded(second, [second]);
+
+    expect(uploader.resumable.removeFile).toHaveBeenCalledWith(second);
+    expect(uploader.state.isUploadRemindDialogShow).toBe(true);
+  });
 
   test('a rapid second add of the same destination is dropped (synchronous dedup guard)', () => {
     seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/tok' });
