@@ -621,6 +621,122 @@ must **not** reintroduce any target clearing.
   small files, folders, replace/keep/cancel, cancel-all/retry-all → identical behavior,
   no duplicate/stale rows, no 405), then flag-ON browser E2E.
 
+**PR5 — target-mode scheduler for legacy uploads + synchronous dedup guard.**
+
+> **Critical finding — `@seafile/resumablejs@1.1.16` ignores per-file `opts.target`.**
+> Its `$h.getTarget` reads `$.getOpt('target')` where `$` is bound to the Resumable
+> INSTANCE (not the chunk/file), and the chunk's real POST (`getTarget('upload', [])`)
+> passes empty params — so even a function target gets no per-file context. Every chunk
+> of every queued file therefore POSTs to the single instance-level
+> `resumable.opts.target`. This invalidated the per-file-target assumption baked into
+> every prior PR's replace flow ("file.opts wins in getOpt"): replace files setting
+> `resumableFile.opts.target = updateLink` had NO effect — their chunks went to the
+> shared upload-link. Replace was effectively broken for the real (un-mocked) path.
+
+- **Target-mode scheduler.** Because only ONE instance target can be active, files
+  needing different endpoints — `'upload'` (new + keep → upload-link) vs `'update'`
+  (replace → update-link) — cannot run concurrently. `enqueueLegacyUpload(file, mode)`
+  routes a prepared legacy file: if its mode matches the in-flight mode (or the queue is
+  idle) it starts (`startLegacyFiles` sets the instance target for the mode, then
+  `resumable.upload()`); if it conflicts, the file is **held** (`holdLegacyFile` pulls it
+  out of `resumable.files` and renders it "Waiting…"). When the queue goes idle
+  (`onComplete` / idle `onError` / `onCancel` → `onLegacyQueueIdle`) the next held
+  same-mode group is started, switching the instance target. No-conflict batches
+  (all-upload or all-update) never hit the hold path, so the common flow is unchanged.
+  `startLegacyDuplicateUpload` is now just "prepare formData + `enqueueLegacyUpload`";
+  replace uses a per-replace-group cached update-link (`ensureReplaceUpdateLink`).
+  `mergeUploadFileList` unions the held files so they render. Replace now actually routes
+  to the update endpoint (instance target), fixing the broken/`405` replace.
+- **Synchronous dedup guard (`activeUploadNameKeys`).** `fileNameExistsInDir` reads the
+  async `uploadFileList` and (for legacy) requires `isUploading()`, so a rapid SECOND
+  `fileAdded` for the same destination slips past it before the first is visible —
+  producing a duplicate row (the user's screenshot: "Waiting…" next to "Uploaded"). A
+  `Set` of `repoID:path:relativePath` keys is updated SYNCHRONOUSLY the moment a file is
+  committed (queued or held for a prompt); a second add is dropped at once ("This file is
+  already queued"). Released on success (`markUploadSaved`), per-file cancel, bulk
+  cancel/close, and a cancelled held duplicate — so a re-drop AFTER completion still gets
+  the Replace? prompt. No `_ownsDestinationKey` flag needed: Option-A drop means only the
+  original ever holds a key.
+- Tests: `file-uploader.test.js` "target-mode scheduler + sync dedup guard" (rapid
+  double-drop dropped; key released on save; apply-to-all Replace runs all via update-link
+  with no hold; a normal file added during a replace is held "Waiting" then runs
+  upload-link when idle) + the replace tests rewritten for the instance-target model (lone
+  replace → update-link immediately; replace held behind an in-flight upload-link queue).
+- Pending: manual flag-OFF verification (incl. a real replace POSTing to the update
+  endpoint) + flag-ON browser E2E.
+
+**PR5 review hotfix (same branch).** One screenshot bug + three review findings:
+- **Large (block-flow) files that already exist in the folder were dropped from the list
+  entirely** (screenshot: small files added, large ones vanished). Root cause: block
+  entries are added with a FUNCTIONAL `setState(prev => …)`, but `renderLegacyList` /
+  `setUploadFileList` rebuilt the list with a PLAIN `setState({ uploadFileList })` whose
+  value was computed against stale `this.state`. Under React batching, a legacy render
+  fired right after a block entry was added would OVERWRITE the list without the
+  not-yet-committed block entry → the large file never appeared. Both now use a functional
+  `setState` reading `prev.uploadFileList`, so block entries survive. (Sync-setState tests
+  did not reproduce it; a new batched-setState test does.)
+- **[P1] A target-fetch failure could wedge the scheduler / mix modes.**
+  `startLegacyFiles`' catch only toasted: it left `activeLegacyMode` set, the failed files
+  in `resumable.files`, and never drained held work — so a held replace could wait forever,
+  and a later different-mode group would run with the failed files still mixed in (wrong
+  endpoint). The catch now removes the failed files from `resumable.files`, frees the
+  active mode, re-offers duplicate-prompt files (releases the key for plain files), and
+  calls `onLegacyQueueIdle` to drain the next mode group.
+- **[P2] `_replaceUpdateLinkPromise` was not cleared in `onComplete`** — a second replace
+  after an idle batch (dialog left open) could reuse a stale update-link. Now cleared in
+  `onComplete` (and still on close / cancel-all).
+- **Cancel-all / close could start held work mid-teardown** (a resumable `cancel` event →
+  `onCancel` → `onLegacyQueueIdle`). `onLegacyQueueIdle` is now a no-op while
+  `this.resumable.isUploading()` OR a `_resettingUploads` flag is set; cancel-all/close set
+  that flag and clear `legacyHold`/`activeLegacyMode` FIRST.
+- Tests: "a legacy render preserves an in-flight block entry…", "a target-fetch failure
+  frees the active mode and drains the next held group", "onComplete clears the cached
+  update-link…", "onLegacyQueueIdle does not start held work while a reset is in progress".
+
+**Deferred frontend cleanups (reviewed, non-blocking).**
+- **Abandoned normal file on target-fetch failure is not a retryable row.** When
+  `ensureSharedUploadTarget` fails for a plain (non-duplicate) file, `startLegacyFiles`'
+  catch removes it and surfaces a toast — clear feedback, and strictly better than the old
+  `main` behavior (a file stuck on "Preparing…" forever with no retry). A nicer UX would
+  move it to the retry list, but the retry path (`retryUploadWithFreshLink`) assumes a file
+  that already started and errored, so wiring a pre-start failure into it needs care. Rare
+  (a network blip on the session-link fetch); deferred, not a blocker.
+- **A manual retry of a held replace after a mode switch can route to the wrong instance
+  target.** `retryUploadWithFreshLink` (and `retryUploadFile`) re-drive a file via
+  `resumableObj.upload()` reusing whatever `resumable.opts.target` is CURRENTLY set — it
+  does NOT re-enter the target-mode scheduler. So in the narrow case where a replace
+  (`'update'`) file errors and lands in the retry list, the queue then goes idle and
+  `onLegacyQueueIdle` switches the instance target to a held `'upload'` group, a later
+  **manual** retry of that replace would POST to the upload-link → it would auto-rename
+  ("name (1).ext") instead of overwriting, and momentarily mix modes against the running
+  group. Requires the exact combination: mixed replace+normal in one session **+** the
+  replace errors **+** the user clicks retry **after** the mode switched. The common
+  auto-retry path (409 conflict) is unaffected: it fires from `onFileError` before any
+  mode switch, while the instance target is still the update-link. Strictly better than
+  `main` (where replace via per-file target never worked at all), same class as the items
+  above; the clean fix is to route retries back through `enqueueLegacyUpload(file, mode)`
+  using the file's `_uploadMode`, so the scheduler re-establishes the correct target.
+  Deferred, not a blocker.
+- **`mergeUploadFileList` is still a bridge, not a single-source `uploadEntries` Map.** The
+  functional duplicate-row / disappearing-block-entry bugs are covered by the synchronous
+  `activeUploadNameKeys` guard + the functional-`setState` batching fixes; a full Map keyed
+  by `uniqueIdentifier` (the originally-sketched single-source list) remains an architecture
+  cleanup, not a bug fix. Deferred.
+- **[UX] Finer per-phase labels for block uploads: `Hashing… / Checking… / Uploading… /
+  Saving…`.** The block flow currently renders only `Uploading… X%` and `Saving…` (the
+  `_phase` model is coarse: `hashing→uploading→saving→done`, with hashing folded into the
+  first half of the bar and `check` not surfaced at all). Plumb the orchestrator's distinct
+  phases (session → **hashing** → **checking** (`/blocks/check`) → **uploading** →
+  **saving** (commit)) through `onPhase`/`_phase` and `upload-list-item` so each step shows
+  its own label. Deferred (UX polish before flag-on).
+- **[Observability] Surface deduplicated bytes vs bytes actually uploaded.** The block
+  flow already knows the manifest (total bytes), the `missing` set from `/blocks/check`
+  (bytes to upload), and the real wire bytes (`_uploadedNetworkBytes`); the difference is
+  the **deduplicated** (skipped) bytes. The UI shows neither the dedup amount nor the
+  "X% already existed" ratio, so a fast repeat upload looks unexplained. Expose
+  `deduplicatedBytes` / `uploadedBytes` per entry (and an aggregate) and render them (e.g.
+  "Skipped N MB already on server"). Deferred (observability polish before flag-on).
+
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
 None of these block merging the branch: the flow ships **disabled** in every prod
