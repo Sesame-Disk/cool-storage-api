@@ -693,6 +693,20 @@ must **not** reintroduce any target clearing.
   frees the active mode and drains the next held group", "onComplete clears the cached
   update-link…", "onLegacyQueueIdle does not start held work while a reset is in progress".
 
+**Deferred frontend cleanups (reviewed, non-blocking).**
+- **Abandoned normal file on target-fetch failure is not a retryable row.** When
+  `ensureSharedUploadTarget` fails for a plain (non-duplicate) file, `startLegacyFiles`'
+  catch removes it and surfaces a toast — clear feedback, and strictly better than the old
+  `main` behavior (a file stuck on "Preparing…" forever with no retry). A nicer UX would
+  move it to the retry list, but the retry path (`retryUploadWithFreshLink`) assumes a file
+  that already started and errored, so wiring a pre-start failure into it needs care. Rare
+  (a network blip on the session-link fetch); deferred, not a blocker.
+- **`mergeUploadFileList` is still a bridge, not a single-source `uploadEntries` Map.** The
+  functional duplicate-row / disappearing-block-entry bugs are covered by the synchronous
+  `activeUploadNameKeys` guard + the functional-`setState` batching fixes; a full Map keyed
+  by `uniqueIdentifier` (the originally-sketched single-source list) remains an architecture
+  cleanup, not a bug fix. Deferred.
+
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
 None of these block merging the branch: the flow ships **disabled** in every prod
