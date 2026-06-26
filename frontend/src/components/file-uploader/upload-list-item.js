@@ -66,6 +66,8 @@ class UploadListItem extends React.Component {
   // half), so the number and the bar always agree.
   blockProgressText = (resumableFile, progress) => {
     switch (resumableFile._phase) {
+      case 'queued':
+        return gettext('Waiting...');
       case 'hashing':
         return gettext('Hashing...');
       case 'checking':
@@ -78,8 +80,10 @@ class UploadListItem extends React.Component {
     }
   };
 
-  // dedupNote surfaces the bytes already on the server (CAS dedup) so a fast repeat
-  // upload is explained ("40.0 M already on server") instead of looking suspicious.
+  // dedupNote surfaces the bytes NOT uploaded thanks to content-addressed dedup, so a
+  // fast repeat upload is explained ("40.0 M deduplicated") instead of looking
+  // suspicious. "Deduplicated" (not "already on server") because the saving covers
+  // both blocks already on the server AND blocks repeated within this same file.
   // Rendered only once the /blocks/check plan is known and something was skipped.
   dedupNote = (resumableFile) => {
     if (!resumableFile.isBlockUpload || !(resumableFile._dedupedBytes > 0)) {
@@ -87,7 +91,7 @@ class UploadListItem extends React.Component {
     }
     return (
       <span className="dedup-note text-muted ml-2">
-        {`${this.formatFileSize(resumableFile._dedupedBytes)} ${gettext('already on server')}`}
+        {`${this.formatFileSize(resumableFile._dedupedBytes)} ${gettext('deduplicated')}`}
       </span>
     );
   };

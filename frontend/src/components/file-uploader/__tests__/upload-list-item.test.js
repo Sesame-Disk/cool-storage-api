@@ -49,6 +49,12 @@ const renderRow = (resumableFile, uploadState) => {
 };
 
 describe('UploadListItem block-upload phase labels', () => {
+  test('shows "Waiting..." while the block entry is queued (not the active file)', () => {
+    const text = renderRow(blockFile({ _phase: 'queued', _progress: 0 }), UPLOAD_UPLOADING);
+    expect(text).toContain('Waiting...');
+    expect(text).not.toContain('Hashing...');
+  });
+
   test('shows "Hashing..." while the block entry is hashing', () => {
     const text = renderRow(blockFile({ _phase: 'hashing' }), UPLOAD_UPLOADING);
     expect(text).toContain('Hashing...');
@@ -70,20 +76,20 @@ describe('UploadListItem block-upload phase labels', () => {
     expect(text).toContain('Saving...');
   });
 
-  test('shows the dedup note when bytes were already on the server', () => {
+  test('shows the dedup note when bytes were skipped by dedup', () => {
     const text = renderRow(blockFile({ _phase: 'uploading', _progress: 0.8, _dedupedBytes: 40 * 1000 * 1000 }), UPLOAD_UPLOADING);
-    expect(text).toContain('already on server');
+    expect(text).toContain('deduplicated');
     expect(text).toContain('40.0 M');
   });
 
   test('keeps the dedup note on the completed row', () => {
     const text = renderRow(blockFile({ isSaved: true, _phase: 'done', _progress: 1, _dedupedBytes: 40 * 1000 * 1000 }), UPLOAD_UPLOADED);
     expect(text).toContain('Uploaded');
-    expect(text).toContain('already on server');
+    expect(text).toContain('deduplicated');
   });
 
   test('no dedup note when nothing was deduplicated', () => {
     const text = renderRow(blockFile({ _phase: 'uploading', _progress: 0.8, _dedupedBytes: 0 }), UPLOAD_UPLOADING);
-    expect(text).not.toContain('already on server');
+    expect(text).not.toContain('deduplicated');
   });
 });

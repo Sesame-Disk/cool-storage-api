@@ -555,6 +555,14 @@ describe('FileUploader block upload file-level queue (serialization)', () => {
     return deferreds;
   };
 
+  test('a freshly created block entry starts in the "queued" phase (renders Waiting, not Hashing)', () => {
+    const uploader = createUploader();
+    const entry = uploader.createBlockUploadEntry({
+      uniqueIdentifier: 'x', fileName: 'x.bin', relativePath: 'x.bin', file: { name: 'x.bin', size: 10 },
+    });
+    expect(entry._phase).toBe('queued');
+  });
+
   test('runs only one block file at a time; the next starts when the active one settles', async () => {
     const uploader = createUploader();
     const deferreds = withDeferredRunBlockUpload(uploader);

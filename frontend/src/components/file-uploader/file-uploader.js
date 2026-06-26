@@ -256,7 +256,9 @@ class FileUploader extends React.Component {
     entry._uploading = false;
     entry._cancelled = false;
     entry._abortController = null;
-    entry._phase = 'hashing';
+    // Re-queued for retry: it waits in the FIFO until it actually starts, so render
+    // it as "Waiting…" ('queued'), not "Hashing…". runBlockUpload sets 'hashing'.
+    entry._phase = 'queued';
   };
 
   // Thin delegators onto the shared guard; kept as instance methods so callers
@@ -469,10 +471,13 @@ class FileUploader extends React.Component {
       file,
       isBlockUpload: true,
       // Explicit flow phase, the single source of truth for how this entry
-      // renders: 'hashing' | 'checking' | 'uploading' | 'saving' | 'done' |
-      // 'error'. It is driven by the orchestrator's onPhase callback, NOT inferred
-      // from resumable.js chunk/remainingTime state (a block entry has none).
-      _phase: 'hashing',
+      // renders: 'queued' | 'hashing' | 'checking' | 'uploading' | 'saving' |
+      // 'done' | 'error'. Starts 'queued' so a file WAITING in the file-level FIFO
+      // renders "Waiting…", not "Hashing…" (only the active file is hashing).
+      // runBlockUpload flips it to 'hashing' when the file actually starts; the rest
+      // is driven by the orchestrator's onPhase callback, NOT inferred from
+      // resumable.js chunk/remainingTime state (a block entry has none).
+      _phase: 'queued',
       _abortController: null,
       _cancelled: false,
       _progress: 0,

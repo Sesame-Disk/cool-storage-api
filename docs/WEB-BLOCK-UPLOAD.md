@@ -738,9 +738,17 @@ must **not** reintroduce any target clearing.
 - **[RESOLVED — PR6] Deduplicated bytes surfaced.** The orchestrator reports a dedup plan
   from the AUTHORITATIVE missing set after `/blocks/check` (`onPlan({ totalBytes, uploadBytes,
   dedupedBytes })`), computed from each unique missing block's real size (not wire bytes,
-  which include retries). The row shows `N M already on server` (`dedupNote`) during the
-  upload and on the completed row, so a fast repeat upload is explained. Tests: orchestrator
-  `onPlan` (mixed + all-missing) + `upload-list-item.test.js` dedup note.
+  which include retries). The row shows `N M deduplicated` (`dedupNote`) during the upload
+  and on the completed row, so a fast repeat upload is explained. "Deduplicated" (not
+  "already on server") because the saving covers BOTH blocks already on the server AND
+  blocks repeated within the same file. Tests: orchestrator `onPlan` (mixed + all-missing)
+  + `upload-list-item.test.js` dedup note.
+- **[RESOLVED — PR6] Queued block files render "Waiting…", not "Hashing…".** The block
+  FIFO runs one file at a time; the rest wait. The entry phase now starts `'queued'`
+  (createBlockUploadEntry / prepareBlockUploadRetry) and `runBlockUpload` flips it to
+  `'hashing'` only when the file actually starts, so a queued row no longer shows the
+  active file's "Hashing…". Test: `upload-list-item.test.js` "queued → Waiting" +
+  `file-uploader.test.js` "freshly created block entry starts queued".
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
@@ -790,7 +798,7 @@ flag were on*.
    is mapped onto the legacy resumable.js dialog. **Done (PR6):** explicit per-phase
    labels (`Hashing… / Checking… / Uploading… X% / Saving…`), commit-phase pipelining
    (the next file uploads while the previous commits), and dedup observability
-   (`N M already on server`). Real block-upload throughput already replaced the legacy
+   (`N M deduplicated`). Real block-upload throughput already replaced the legacy
    `0.00 B/s`. **Remaining:** fuller integration with the global progress aggregator and
    any further polish before flag-on.
 7. **[Resolved] Concurrent-loser `409 "commit still in progress"` retry.** The LWT
