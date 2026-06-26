@@ -64,8 +64,19 @@ class FileUploader extends React.Component {
     // is visible — producing two rows. This Set of destination keys (repoID:path:
     // relativePath) is updated SYNCHRONOUSLY the moment a file is committed (queued or
     // held for a prompt), so the second drop is caught immediately. Released when the
-    // file reaches a terminal state (saved / cancelled / dialog closed).
+    // file reaches a non-saved terminal state (cancelled / dialog closed); on SUCCESS the
+    // key moves to completedUploadNameKeys instead (see below).
     this.activeUploadNameKeys = new Set();
+
+    // Synchronous record of destinations already UPLOADED in this session. On success a
+    // key moves here from activeUploadNameKeys. A later add of the same destination is
+    // routed to the Replace? prompt SYNCHRONOUSLY (not via the async uploadFileList scan
+    // in fileNameExistsInDir, which the server-side direntList prop may not reflect after
+    // a just-finished upload — and resumablejs never dedups because generateUniqueIdentifier
+    // is time-based). Without this, a re-add of a just-completed file slipped past the
+    // (now-released) guard AND the stale direntList, materializing a duplicate "Waiting…"
+    // row next to the "Uploaded" one. Cleared with the session (close / cancel-all).
+    this.completedUploadNameKeys = new Set();
 
     this.notifiedFolders = [];
 
@@ -1002,8 +1013,11 @@ class FileUploader extends React.Component {
     // and BEFORE the block-flow diversion below, so a duplicate inside a batch — or a
     // large file routed to the block flow — is offered the replace dialog instead of
     // silently landing as "name (1).ext". The matched file is held OUT of the queue
-    // and the rendered list until the user decides.
-    if (isFile && !isCustomPermission && this.fileNameExistsInDir(resumableFile.fileName)) {
+    // and the rendered list until the user decides. completedUploadNameKeys is the
+    // SYNCHRONOUS authority for "already uploaded this session" (the async direntList /
+    // uploadFileList scan in fileNameExistsInDir can miss a just-finished upload).
+    if (isFile && !isCustomPermission
+        && (this.completedUploadNameKeys.has(destKey) || this.fileNameExistsInDir(resumableFile.fileName))) {
       this.activeUploadNameKeys.add(destKey); // reserve so a rapid second drop is caught
       this.handleDuplicateFile(resumableFile, files);
       return;
@@ -1191,10 +1205,12 @@ class FileUploader extends React.Component {
   };
 
   markUploadSaved = (resumableFile, newFileName) => {
-    // Release the synchronous duplicate key on success, so a LATER drop of the same
-    // name is offered the Replace? prompt (via fileNameExistsInDir's isSaved check)
-    // instead of being silently blocked as "already queued".
-    this.activeUploadNameKeys.delete(this.getUploadDestinationKey(resumableFile));
+    // Move the synchronous duplicate key from "in flight" to "completed this session",
+    // so a LATER drop of the same destination is offered the Replace? prompt (caught
+    // SYNCHRONOUSLY in onFileAdded) instead of silently materializing a second row.
+    const destKey = this.getUploadDestinationKey(resumableFile);
+    this.activeUploadNameKeys.delete(destKey);
+    this.completedUploadNameKeys.add(destKey);
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
         clearFileUploadRuntimeState(item);
@@ -1520,8 +1536,9 @@ class FileUploader extends React.Component {
     this.isUploadLinkLoaded = false;
     this._uploadTargetPromise = null;
     this._replaceUpdateLinkPromise = null;
-    // Scheduler already reset at the top; clear the synchronous duplicate guard too.
+    // Scheduler already reset at the top; clear the synchronous duplicate guards too.
     this.activeUploadNameKeys.clear();
+    this.completedUploadNameKeys.clear();
     // Drop any undecided duplicates and the bulk choice so the next session starts clean.
     this.pendingDuplicates = [];
     this.duplicateBulkAction = null;
@@ -1587,9 +1604,10 @@ class FileUploader extends React.Component {
     if (this.blockLimiter) {
       this.blockLimiter.reset();
     }
-    // Release the synchronous duplicate guard for every cancelled entry (saved entries
-    // stay caught by fileNameExistsInDir).
+    // Release the synchronous duplicate guards: cancel-all ends the session, so both
+    // in-flight and completed-this-session destinations reset.
     this.activeUploadNameKeys.clear();
+    this.completedUploadNameKeys.clear();
 
     this.setState({
       totalProgress: 100,

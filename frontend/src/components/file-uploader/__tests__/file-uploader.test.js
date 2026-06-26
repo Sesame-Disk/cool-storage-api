@@ -1006,6 +1006,41 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(uploader.state.currentResumableFile).toBe(f);
   });
 
+  test('a re-add of a destination completed THIS session is caught synchronously even if the list is stale', () => {
+    // The production bug: a block file finishes (fully deduplicated), then the same
+    // destination is added again before the async uploadFileList / server direntList
+    // reflects it → it slipped past the released guard and the stale list, producing a
+    // second "Waiting…" row next to the "Uploaded" one. completedUploadNameKeys is the
+    // synchronous authority that catches it regardless of the async state.
+    const uploader = createUploader(); // empty server direntList
+    uploader.state.uploadFileList = [];
+    const first = createResumableFile('all-databases.sql', { uniqueIdentifier: 'done', file: { name: 'all-databases.sql', size: 10 } });
+    uploader.markUploadSaved(first, 'all-databases.sql'); // moves the key to completed
+    expect(uploader.completedUploadNameKeys.has('repo-1:/:all-databases.sql')).toBe(true);
+
+    // Simulate the race: the saved entry is NOT in the rendered list yet.
+    uploader.state.uploadFileList = [];
+    const second = createResumableFile('all-databases.sql', { uniqueIdentifier: 'redrop', file: { name: 'all-databases.sql', size: 10 } });
+    uploader.resumable.files = [second];
+    uploader.onFileAdded(second, [second]);
+
+    expect(uploader.resumable.removeFile).toHaveBeenCalledWith(second); // held out, prompted
+    expect(uploader.state.isUploadRemindDialogShow).toBe(true); // not a silent 2nd row
+    expect(uploader.state.currentResumableFile).toBe(second);
+  });
+
+  test('closing the dialog clears the completed-destination guard for the next session', () => {
+    const uploader = createUploader();
+    uploader.state.uploadFileList = [];
+    const f = createResumableFile('a.txt', { uniqueIdentifier: 'a', file: { name: 'a.txt', size: 10 } });
+    uploader.markUploadSaved(f, 'a.txt');
+    expect(uploader.completedUploadNameKeys.size).toBe(1);
+
+    uploader.onCloseUploadDialog();
+
+    expect(uploader.completedUploadNameKeys.size).toBe(0);
+  });
+
   test('the parent passes showApplyToAll (duplicateBatchActive) to the remind dialog', () => {
     const uploader = createUploader();
     uploader.state.isUploadRemindDialogShow = true;

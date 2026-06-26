@@ -749,6 +749,18 @@ must **not** reintroduce any target clearing.
   `'hashing'` only when the file actually starts, so a queued row no longer shows the
   active file's "Hashing…". Test: `upload-list-item.test.js` "queued → Waiting" +
   `file-uploader.test.js` "freshly created block entry starts queued".
+- **[RESOLVED — PR6] Duplicate row for a file uploaded to an empty folder.** A block
+  file that finished (commonly fully deduplicated, so it completes fast) released its
+  `activeUploadNameKeys` guard on `markUploadSaved`; a second add of the SAME destination
+  then slipped past both the released guard AND `fileNameExistsInDir` (whose async
+  `uploadFileList` / server `direntList` may not yet reflect the just-finished upload, and
+  resumablejs never dedups because `generateUniqueIdentifier` is time-based), materializing
+  a second "Waiting…" row next to the "Uploaded" one. Fix: on success the key MOVES to a
+  new session-scoped `completedUploadNameKeys` set; `onFileAdded` checks it SYNCHRONOUSLY
+  and routes a re-add to the Replace? prompt regardless of async state. Cleared on close /
+  cancel-all. Tests: `file-uploader.test.js` "re-add of a destination completed THIS session
+  is caught synchronously even if the list is stale" + "closing the dialog clears the
+  completed-destination guard".
 
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
