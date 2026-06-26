@@ -694,29 +694,60 @@ must **not** reintroduce any target clearing.
   update-link…", "onLegacyQueueIdle does not start held work while a reset is in progress".
 
 **Deferred frontend cleanups (reviewed, non-blocking).**
-- **Abandoned normal file on target-fetch failure is not a retryable row.** When
-  `ensureSharedUploadTarget` fails for a plain (non-duplicate) file, `startLegacyFiles`'
-  catch removes it and surfaces a toast — clear feedback, and strictly better than the old
-  `main` behavior (a file stuck on "Preparing…" forever with no retry). A nicer UX would
-  move it to the retry list, but the retry path (`retryUploadWithFreshLink`) assumes a file
-  that already started and errored, so wiring a pre-start failure into it needs care. Rare
-  (a network blip on the session-link fetch); deferred, not a blocker.
-- **A manual retry of a held replace after a mode switch can route to the wrong instance
-  target.** `retryUploadWithFreshLink` (and `retryUploadFile`) re-drive a file via
-  `resumableObj.upload()` reusing whatever `resumable.opts.target` is CURRENTLY set — it
-  does NOT re-enter the target-mode scheduler. So in the narrow case where a replace
-  (`'update'`) file errors and lands in the retry list, the queue then goes idle and
-  `onLegacyQueueIdle` switches the instance target to a held `'upload'` group, a later
-  **manual** retry of that replace would POST to the upload-link → it would auto-rename
-  ("name (1).ext") instead of overwriting, and momentarily mix modes against the running
-  group. Requires the exact combination: mixed replace+normal in one session **+** the
-  replace errors **+** the user clicks retry **after** the mode switched. The common
-  auto-retry path (409 conflict) is unaffected: it fires from `onFileError` before any
-  mode switch, while the instance target is still the update-link. Strictly better than
-  `main` (where replace via per-file target never worked at all), same class as the items
-  above; the clean fix is to route retries back through `enqueueLegacyUpload(file, mode)`
-  using the file's `_uploadMode`, so the scheduler re-establishes the correct target.
-  Deferred, not a blocker.
+- **[RESOLVED — PR7] Abandoned normal file on target-fetch failure is now a retryable row.**
+  When `ensureSharedUploadTarget` fails for a plain (non-duplicate) file, `startLegacyFiles`'
+  catch used to remove it + toast (gone from the dialog, user must re-drop). Now the file
+  is kept as a RETRYABLE error row: it is pulled out of `resumable.files` (so a later
+  different-mode group can't run it against the wrong target) but tracked in a new
+  `abandonedLegacyFiles` list that `mergeUploadFileList` unions, its `error` is set, and it
+  joins `retryFileList`. `onUploadRetry` re-enqueues it through the scheduler (which
+  re-fetches the target); its dedup key stays reserved so a re-drop is still caught. Cleared
+  on close / cancel-all / per-file cancel. Possible now that retries route through the
+  scheduler (above). Tests: "a plain file whose target fetch fails becomes a retryable row",
+  "retrying an abandoned file re-enters the scheduler and re-fetches its target".
+- **[PR7 hardening] Self-heal race during the target-fetch window.** A retry-all of mixed
+  legacy modes enqueues files one by one; the first `startLegacyFiles` sets `activeLegacyMode`
+  but its link fetch is async, so `resumable.isUploading()` stays false. The self-heal in
+  `enqueueLegacyUpload` (`!isUploading() && !legacyHold.length → activeLegacyMode = null`)
+  would then clear the mode on the SECOND enqueue and start it without a hold — re-mixing
+  `upload` + `update` on one instance target. Fixed with a `_legacyStartsInFlight` counter
+  (incremented before each link fetch, decremented on settle) added to the self-heal guard,
+  so a group mid-fetch counts as active. Test: "retry-all mixed legacy modes holds the second
+  mode while the first target link is pending" (real scheduler, link left pending).
+- **[PR7 hardening] Stale `startLegacyFiles` continuation across a teardown.** A pre-existing
+  (not introduced here) race: if a target-link fetch is pending and the user does close /
+  cancel-all, the already-registered `.then()` continuation was not invalidated — on resolve
+  it could still set `resumable.opts.target` and enter the start branch. Mostly benign
+  (`resumable.files` was emptied, so nothing uploads, and the next session re-fetches the
+  target), but not clean. Fixed with a `_legacySessionGeneration` counter bumped on every
+  teardown; `startLegacyFiles` captures it before the fetch and its `.then` / `.catch` bail
+  if it changed. Test: "a link resolving AFTER close/cancel-all is dropped (stale start
+  continuation)".
+- **[PR7 hardening] `ensureSharedUploadTarget` made pure (stale token could clobber a fresh
+  target).** The generation guard above stops the START branch, but `ensureSharedUploadTarget`
+  wrote `resumable.opts.target` inside its OWN `.then` — which runs BEFORE that guard — so a
+  stale upload-link promise resolving after a teardown could still overwrite a NEW session's
+  instance target with an old token (resumablejs keys the tracker by the instance target).
+  Fixed by making it pure: it resolves to the target string and NEVER writes
+  `resumable.opts.target`; the only writer is the generation-guarded `.then` in
+  `startLegacyFiles`. (`ensureReplaceUpdateLink` was already pure.) Test: "a stale upload-link
+  promise cannot overwrite a fresh session target".
+- **[RESOLVED — PR7] A manual retry of a held replace after a mode switch routed to the
+  wrong instance target.** Previously `retryUploadWithFreshLink` / `retryUploadFile`
+  re-drove a file via `resumableObj.upload()` reusing whatever `resumable.opts.target` was
+  CURRENTLY set, NOT re-entering the scheduler — so a manual retry of an errored replace
+  AFTER the queue went idle and switched the instance target to a held `'upload'` group
+  would POST to the upload-link → silent auto-rename ("name (1).ext") instead of an
+  overwrite. Fix: a MANUAL retry now goes through `retryLegacyViaScheduler` →
+  `enqueueLegacyUpload(file, file._uploadMode, { retry: true })`, so the scheduler
+  re-establishes the file's own mode target (and holds it "Waiting…" if another mode is
+  busy, then drains when idle). `startLegacyFiles` runs `_retryOnStart` files via
+  `retryUploadFile` (resume-from-offset) once the correct target is set; `onUploadRetryAll`
+  routes each legacy file the same way under its own mode. The 409 AUTO-retry stays on
+  `retryUploadWithFreshLink` (fires mid-flight, before any switch, must reuse the live
+  session token). Tests: "manual retry of a replace re-establishes the update-link target",
+  "… held while an upload group is busy, then runs the update-link when idle",
+  "onUploadRetryAll routes each legacy file through the scheduler under its own mode".
 - **`mergeUploadFileList` is still a bridge, not a single-source `uploadEntries` Map.** The
   functional duplicate-row / disappearing-block-entry bugs are covered by the synchronous
   `activeUploadNameKeys` guard + the functional-`setState` batching fixes; a full Map keyed
