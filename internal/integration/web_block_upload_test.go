@@ -200,12 +200,10 @@ func TestWebBlockUploadRoundTripAndDedup(t *testing.T) {
 }
 
 // TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat is the regression guard for
-// the desktop/mobile sync download bug: a file committed via the web block flow
-// must store SHA-1 (40-hex) block IDs in its fs_object (the Seafile sync client
-// cannot parse 64-hex SHA-256 block IDs), backed by SHA-1→SHA-256 mappings so the
-// blocks still resolve to their SHA-256 storage identity on download. pack-fs
-// serves the fs_object's block_ids column verbatim, so SHA-1 there is exactly what
-// the desktop client receives.
+// the post-flip canonical layout: a file committed via the web block flow must
+// store SHA-256 block IDs in fs_objects.block_ids for fast internal reads, while
+// the Seafile-compatible SHA-1 list lives in fs_objects.seafile_block_ids_sha1 so
+// sync endpoints can still serialize the 40-hex IDs the desktop client expects.
 func TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-sha1-%d", time.Now().UnixNano()))
 	first := bytes.Repeat([]byte("Z"), 8*1024*1024) // one full 8 MB block
@@ -247,32 +245,44 @@ func TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat(t *testing.T) {
 	}
 
 	var blockIDs []string
-	if err := session.Query(`SELECT block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fileFSID).Scan(&blockIDs); err != nil {
+	var seafileBlockIDs []string
+	if err := session.Query(`SELECT block_ids, seafile_block_ids_sha1 FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fileFSID).Scan(&blockIDs, &seafileBlockIDs); err != nil {
 		t.Fatalf("read block ids: %v", err)
 	}
 	if len(blockIDs) != len(blocks) {
 		t.Fatalf("expected %d block ids, got %d", len(blocks), len(blockIDs))
 	}
+	if len(seafileBlockIDs) != len(blocks) {
+		t.Fatalf("expected %d seafile block ids, got %d", len(blocks), len(seafileBlockIDs))
+	}
 
-	// Each fs_object block ID must be the SHA-1 (40-hex) of the block, and its
-	// SHA-1→SHA-256 mapping must resolve to the actual SHA-256 storage identity.
-	for i, ext := range blockIDs {
-		if len(ext) != 40 {
-			t.Fatalf("block %d id %q is not a 40-hex SHA-1 (desktop sync would reject it)", i, ext)
-		}
-		if want := sha1hex(blocks[i]); ext != want {
-			t.Fatalf("block %d sha1 = %s, want %s", i, ext, want)
-		}
-		var internal string
-		if err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, ext).Scan(&internal); err != nil {
-			t.Fatalf("block %d: no SHA-1→SHA-256 mapping for %s: %v", i, ext, err)
+	// Canonical/internal block_ids must be SHA-256, while the Seafile boundary
+	// column stays SHA-1 and resolves to the same storage identity.
+	for i, internal := range blockIDs {
+		if len(internal) != 64 {
+			t.Fatalf("block %d internal id %q is not a 64-hex SHA-256", i, internal)
 		}
 		if want := sha256hex(blocks[i]); internal != want {
-			t.Fatalf("block %d mapping internal_id = %s, want sha256 %s", i, internal, want)
+			t.Fatalf("block %d sha256 = %s, want %s", i, internal, want)
+		}
+
+		ext := seafileBlockIDs[i]
+		if len(ext) != 40 {
+			t.Fatalf("block %d seafile id %q is not a 40-hex SHA-1 (desktop sync would reject it)", i, ext)
+		}
+		if want := sha1hex(blocks[i]); ext != want {
+			t.Fatalf("block %d seafile sha1 = %s, want %s", i, ext, want)
+		}
+		var mappedInternal string
+		if err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, ext).Scan(&mappedInternal); err != nil {
+			t.Fatalf("block %d: no SHA-1→SHA-256 mapping for %s: %v", i, ext, err)
+		}
+		if mappedInternal != internal {
+			t.Fatalf("block %d mapping internal_id = %s, want canonical sha256 %s", i, mappedInternal, internal)
 		}
 	}
 
-	// Download must still reassemble correctly (SHA-1 ids resolve to SHA-256).
+	// Download must still reassemble correctly from the canonical SHA-256 list.
 	got := downloadRepoFile(t, adminClient, repoID, "/compat.bin")
 	want := append(append([]byte{}, first...), last...)
 	if !bytes.Equal(got, want) {

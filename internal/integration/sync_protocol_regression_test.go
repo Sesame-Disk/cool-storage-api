@@ -193,6 +193,32 @@ func syncSHA256HexForTest(data []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
+func unpackSingleSyncFSObjectForTest(t *testing.T, packed []byte) (string, []byte) {
+	t.Helper()
+
+	if len(packed) < 44 {
+		t.Fatalf("packed fs payload too short: %d", len(packed))
+	}
+
+	fsID := string(packed[:40])
+	objSize := binary.BigEndian.Uint32(packed[40:44])
+	if len(packed) != 44+int(objSize) {
+		t.Fatalf("packed fs payload length = %d, want %d", len(packed), 44+int(objSize))
+	}
+
+	zr, err := zlib.NewReader(bytes.NewReader(packed[44:]))
+	if err != nil {
+		t.Fatalf("zlib reader: %v", err)
+	}
+	defer zr.Close()
+
+	jsonData, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("decompress packed fs object: %v", err)
+	}
+	return fsID, jsonData
+}
+
 // TestSyncServesSHA1BlockIDsForCanonicalFSObject verifies the PR4 serve path on a
 // post-flip file fs_object stored in the SHA-256-canonical layout (block_ids =
 // SHA-256 storage ids, seafile_block_ids_sha1 = SHA-1): GetFSObject must serve the
@@ -284,6 +310,140 @@ func TestSyncRefusesToServeSHA256BlockIDsWithoutSHA1Column(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("GET broken fs object status = %d, want 500 (fail closed)", resp.StatusCode)
+	}
+}
+
+func TestSyncPackFSServesSHA1BlockIDsForCanonicalFSObject(t *testing.T) {
+	requireCassandra(t)
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-packfs-sha1-serve-%d", time.Now().UnixNano()))
+	session := shareProjectionDBForTest(t).Session()
+
+	fileData := []byte("post-flip canonical pack-fs payload\n")
+	externalBlockID := syncSHA1HexForTest(fileData)
+	internalBlockID := syncSHA256HexForTest(fileData)
+
+	fileObj := map[string]interface{}{
+		"block_ids": []string{externalBlockID},
+		"size":      int64(len(fileData)),
+		"type":      1,
+		"version":   1,
+	}
+	canonicalJSON := mustMarshalSyncObjectForTest(t, fileObj)
+	fileFSID := syncSHA1HexForTest(canonicalJSON)
+
+	if err := session.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, size_bytes, mtime, block_ids, seafile_block_ids_sha1)
+		VALUES (?, ?, 'file', '', ?, ?, ?, ?)
+	`, repoID, fileFSID, int64(len(fileData)), time.Now().Unix(), []string{internalBlockID}, []string{externalBlockID}).Exec(); err != nil {
+		t.Fatalf("failed to seed canonical fs_object: %v", err)
+	}
+
+	resp := doSyncProtocolRequestForTest(t, http.MethodPost, fmt.Sprintf("/seafhttp/repo/%s/pack-fs", repoID), mustMarshalSyncObjectForTest(t, []string{fileFSID}), "application/json")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pack-fs status = %d, want 200", resp.StatusCode)
+	}
+
+	packed, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read pack-fs response: %v", err)
+	}
+
+	servedFSID, servedJSON := unpackSingleSyncFSObjectForTest(t, packed)
+	if servedFSID != fileFSID {
+		t.Fatalf("packed fs_id = %s, want %s", servedFSID, fileFSID)
+	}
+
+	var parsed struct {
+		BlockIDs []string `json:"block_ids"`
+	}
+	if err := json.Unmarshal(servedJSON, &parsed); err != nil {
+		t.Fatalf("parse packed fs object: %v", err)
+	}
+	if len(parsed.BlockIDs) != 1 || parsed.BlockIDs[0] != externalBlockID {
+		t.Fatalf("pack-fs block_ids = %v, want SHA-1 [%s] (not SHA-256 %s)", parsed.BlockIDs, externalBlockID, internalBlockID)
+	}
+	if got := syncSHA1HexForTest(servedJSON); got != fileFSID {
+		t.Fatalf("pack-fs JSON re-hash = %s, want fs_id %s", got, fileFSID)
+	}
+}
+
+func TestSyncPackFSRefusesBrokenCanonicalObject(t *testing.T) {
+	requireCassandra(t)
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-packfs-sha1-guard-%d", time.Now().UnixNano()))
+	session := shareProjectionDBForTest(t).Session()
+
+	internalBlockID := syncSHA256HexForTest([]byte("packfs guard payload"))
+	fsID := syncSHA1HexForTest([]byte(fmt.Sprintf("packfs-guard-%s-%d", repoID, time.Now().UnixNano())))
+
+	if err := session.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, size_bytes, mtime, block_ids)
+		VALUES (?, ?, 'file', '', ?, ?, ?)
+	`, repoID, fsID, int64(20), time.Now().Unix(), []string{internalBlockID}).Exec(); err != nil {
+		t.Fatalf("failed to seed broken fs_object: %v", err)
+	}
+
+	resp := doSyncProtocolRequestForTest(t, http.MethodPost, fmt.Sprintf("/seafhttp/repo/%s/pack-fs", repoID), mustMarshalSyncObjectForTest(t, []string{fsID}), "application/json")
+	body := responseBody(t, resp)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("pack-fs broken object status = %d, want 500; body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestSyncCheckFSRefusesBrokenCanonicalTree(t *testing.T) {
+	requireCassandra(t)
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-checkfs-sha1-guard-%d", time.Now().UnixNano()))
+	session := shareProjectionDBForTest(t).Session()
+	initial := readLibrarySyncHeadState(t, session, repoID)
+
+	internalBlockID := syncSHA256HexForTest([]byte("checkfs guard payload"))
+	fileFSID := syncSHA1HexForTest([]byte(fmt.Sprintf("checkfs-file-%s-%d", repoID, time.Now().UnixNano())))
+	rootEntries := []apipkg.FSEntry{{
+		ID:    fileFSID,
+		Mode:  33188,
+		Mtime: time.Now().Unix(),
+		Name:  "guard.txt",
+		Size:  int64(21),
+	}}
+	rootObjectJSON := mustMarshalSyncObjectForTest(t, map[string]interface{}{
+		"dirents": rootEntries,
+		"type":    3,
+		"version": 1,
+	})
+	rootFSID := syncSHA1HexForTest(rootObjectJSON)
+	commitID := syncSHA1HexForTest([]byte(fmt.Sprintf("checkfs-guard-%s-%d", repoID, time.Now().UnixNano())))
+
+	if err := session.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, size_bytes, mtime, block_ids)
+		VALUES (?, ?, 'file', '', ?, ?, ?)
+	`, repoID, fileFSID, int64(21), time.Now().Unix(), []string{internalBlockID}).Exec(); err != nil {
+		t.Fatalf("failed to seed broken file fs_object: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, size_bytes, mtime, dir_entries, block_ids)
+		VALUES (?, ?, 'dir', '', 0, ?, ?, [])
+	`, repoID, rootFSID, time.Now().Unix(), string(mustMarshalSyncObjectForTest(t, rootEntries))).Exec(); err != nil {
+		t.Fatalf("failed to seed root dir fs_object: %v", err)
+	}
+	insertSyntheticCommitForTest(t, session, repoID, commitID, initial.HeadCommitID, rootFSID, "check-fs guard")
+	if err := session.Query(`
+		UPDATE libraries SET head_commit_id = ? WHERE org_id = ? AND library_id = ?
+	`, commitID, defaultOrgID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to update library head: %v", err)
+	}
+	if err := session.Query(`
+		UPDATE libraries_by_id SET head_commit_id = ? WHERE library_id = ?
+	`, commitID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to update library lookup head: %v", err)
+	}
+
+	resp := doSyncProtocolRequestForTest(t, http.MethodPost, fmt.Sprintf("/seafhttp/repo/%s/check-fs", repoID), mustMarshalSyncObjectForTest(t, []string{rootFSID}), "application/json")
+	body := responseBody(t, resp)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("check-fs broken tree status = %d, want 500; body=%s", resp.StatusCode, body)
 	}
 }
 

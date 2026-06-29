@@ -38,6 +38,7 @@ var ErrHeadConflict = fmt.Errorf("HEAD was modified concurrently")
 
 var errSyncHeadAutoMergeConflict = errors.New("sync head auto-merge conflict")
 var errSyncHeadRepairPending = errors.New("sync head publish pending background repair")
+var errSeafileBlockIDsUnavailable = errors.New("seafile sha1 block ids unavailable")
 
 // SyncTokenCreator interface for creating sync tokens
 type SyncTokenCreator interface {
@@ -412,10 +413,10 @@ type CorrectedFSObject struct {
 // computeCorrectedObject recursively computes the correct fs_id for an fs_object
 // It handles directories by first computing children's correct fs_ids and using those in dirents
 // Returns nil if object not found
-func (h *SyncHandler) computeCorrectedObject(repoID, storedFSID string, cache map[string]*CorrectedFSObject) *CorrectedFSObject {
+func (h *SyncHandler) computeCorrectedObject(repoID, storedFSID string, cache map[string]*CorrectedFSObject) (*CorrectedFSObject, error) {
 	// Check cache first
 	if cached, ok := cache[storedFSID]; ok {
-		return cached
+		return cached, nil
 	}
 
 	// Query the fs_object
@@ -429,7 +430,10 @@ func (h *SyncHandler) computeCorrectedObject(repoID, storedFSID string, cache ma
 	`, repoID, storedFSID).Scan(&fsType, &size, &entriesJSON, &blockIDs, &seafileBlockIDs)
 
 	if err != nil {
-		return nil
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
 	}
 
 	var jsonObj map[string]interface{}
@@ -440,11 +444,14 @@ func (h *SyncHandler) computeCorrectedObject(repoID, storedFSID string, cache ma
 		if entriesJSON != "" && entriesJSON != "[]" {
 			var entries []FSEntry
 			if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
-				return nil
+				return nil, err
 			}
 			for _, entry := range entries {
 				// Recursively compute child's correct fs_id
-				childCorrect := h.computeCorrectedObject(repoID, entry.ID, cache)
+				childCorrect, err := h.computeCorrectedObject(repoID, entry.ID, cache)
+				if err != nil {
+					return nil, err
+				}
 				childID := entry.ID // Default to stored if child not found
 				if childCorrect != nil {
 					childID = childCorrect.ComputedFSID
@@ -480,7 +487,7 @@ func (h *SyncHandler) computeCorrectedObject(repoID, storedFSID string, cache ma
 		serveBlockIDs, ok := seafileServeBlockIDs(blockIDs, seafileBlockIDs)
 		if !ok {
 			log.Printf("[computeCorrectedObject] fs_object %s has SHA-256 block_ids without seafile_block_ids_sha1; cannot recompute a Seafile fs_id", storedFSID)
-			return nil
+			return nil, errSeafileBlockIDsUnavailable
 		}
 		jsonObj = map[string]interface{}{
 			"block_ids": serveBlockIDs,
@@ -493,7 +500,7 @@ func (h *SyncHandler) computeCorrectedObject(repoID, storedFSID string, cache ma
 	// Serialize and compute hash
 	jsonBytes, err := json.Marshal(jsonObj)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	computedHash := sha1.Sum(jsonBytes)
 	computedFSID := hex.EncodeToString(computedHash[:])
@@ -507,37 +514,40 @@ func (h *SyncHandler) computeCorrectedObject(repoID, storedFSID string, cache ma
 	// Cache result
 	cache[storedFSID] = result
 
-	return result
+	return result, nil
 }
 
 // buildFSIDMapping builds a complete mapping of computed→stored fs_ids for a repo tree
 // Starting from a root stored fs_id, recursively computes all correct fs_ids
-func (h *SyncHandler) buildFSIDMapping(repoID, rootStoredFSID string) (computedToStored map[string]string, storedToCorrected map[string]*CorrectedFSObject) {
+func (h *SyncHandler) buildFSIDMapping(repoID, rootStoredFSID string) (computedToStored map[string]string, storedToCorrected map[string]*CorrectedFSObject, err error) {
 	computedToStored = make(map[string]string)
 	storedToCorrected = make(map[string]*CorrectedFSObject)
 
 	// Recursively compute all objects starting from root
-	h.collectCorrectedObjects(repoID, rootStoredFSID, storedToCorrected)
+	if err := h.collectCorrectedObjects(repoID, rootStoredFSID, storedToCorrected); err != nil {
+		return nil, nil, err
+	}
 
 	// Build the reverse mapping
 	for storedID, corrected := range storedToCorrected {
 		computedToStored[corrected.ComputedFSID] = storedID
 	}
 
-	return
+	return computedToStored, storedToCorrected, nil
 }
 
 // collectCorrectedObjects recursively collects all corrected fs_objects
-func (h *SyncHandler) collectCorrectedObjects(repoID, storedFSID string, cache map[string]*CorrectedFSObject) {
+func (h *SyncHandler) collectCorrectedObjects(repoID, storedFSID string, cache map[string]*CorrectedFSObject) error {
 	if storedFSID == "" || len(storedFSID) != 40 {
-		return
+		return nil
 	}
 	if _, ok := cache[storedFSID]; ok {
-		return // Already processed
+		return nil // Already processed
 	}
 
 	// Compute this object (will recurse into children)
-	h.computeCorrectedObject(repoID, storedFSID, cache)
+	_, err := h.computeCorrectedObject(repoID, storedFSID, cache)
+	return err
 }
 
 // GetHeadCommit returns the HEAD commit for a repository
@@ -1287,85 +1297,6 @@ func (h *SyncHandler) collectStoredFSIDsWithFilter(repoID, storedFSID string, di
 	}
 }
 
-// collectCorrectedObjectsWithFilter recursively collects corrected fs_ids with dir-only filter support
-// IMPORTANT: Returns parent (root) FIRST, then children (breadth-first order)
-// This matches Seafile server behavior and ensures client can build directory tree in order
-// DEPRECATED: This function computes corrected fs_ids which breaks sync. Use collectStoredFSIDsWithFilter instead.
-func (h *SyncHandler) collectCorrectedObjectsWithFilter(repoID, storedFSID string, dirOnly bool, cache map[string]*CorrectedFSObject, fsIDs *[]string, added map[string]bool) {
-	if storedFSID == "" || len(storedFSID) != 40 {
-		return
-	}
-
-	// Query the object type first
-	var fsType string
-	var entriesJSON string
-	err := h.db.Session().Query(`
-		SELECT obj_type, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, repoID, storedFSID).Scan(&fsType, &entriesJSON)
-
-	if err != nil {
-		return
-	}
-
-	// Parse entries for directories
-	var entries []FSEntry
-	if fsType == "dir" && entriesJSON != "" && entriesJSON != "[]" {
-		json.Unmarshal([]byte(entriesJSON), &entries)
-	}
-
-	// First, recursively compute children so their IDs are in cache (needed for parent's dirent IDs)
-	// This doesn't add them to fsIDs yet
-	for _, entry := range entries {
-		if entry.ID == "" || len(entry.ID) != 40 {
-			continue
-		}
-		isDir := (entry.Mode & 0040000) != 0
-		if dirOnly && !isDir {
-			continue
-		}
-		h.computeCorrectedObject(repoID, entry.ID, cache)
-	}
-
-	// Now compute this object's correct fs_id (children are already in cache)
-	corrected := h.computeCorrectedObject(repoID, storedFSID, cache)
-	if corrected != nil && !added[corrected.ComputedFSID] {
-		// Add THIS object (parent) FIRST
-		*fsIDs = append(*fsIDs, corrected.ComputedFSID)
-		added[corrected.ComputedFSID] = true
-	}
-
-	// Then add children AFTER parent
-	for _, entry := range entries {
-		if entry.ID == "" || len(entry.ID) != 40 {
-			continue
-		}
-		isDir := (entry.Mode & 0040000) != 0
-		if dirOnly && !isDir {
-			continue
-		}
-
-		// Add this child's computed ID
-		// CRITICAL: Even if fs_object doesn't exist in DB (cache miss), we must include
-		// the fs_id that's referenced in the directory entry. Desktop client may have
-		// the same fs_id for duplicate files (same content) and expects to find it in fs-id-list.
-		var childFSID string
-		if childCorrected, ok := cache[entry.ID]; ok {
-			childFSID = childCorrected.ComputedFSID
-		} else {
-			// Use the stored ID as-is (client computed it)
-			childFSID = entry.ID
-		}
-
-		if !added[childFSID] {
-			*fsIDs = append(*fsIDs, childFSID)
-			added[childFSID] = true
-		}
-
-		// Recursively collect grandchildren
-		h.collectCorrectedObjectsWithFilter(repoID, entry.ID, dirOnly, cache, fsIDs, added)
-	}
-}
-
 // seafileServeBlockIDs returns the SHA-1 block-id list for any Seafile-boundary
 // file fs_object operation: serializing an object to the desktop/mobile client
 // (GetFSObject/PackFS) AND recomputing a Seafile-compatible fs_id
@@ -1563,8 +1494,9 @@ func (h *SyncHandler) PackFS(c *gin.Context) {
 		} else {
 			serveBlockIDs, ok := seafileServeBlockIDs(blockIDs, seafileBlockIDs)
 			if !ok {
-				log.Printf("pack-fs: object %s has SHA-256 block_ids without seafile_block_ids_sha1; skipping", requestedFSID)
-				continue
+				log.Printf("pack-fs: object %s has SHA-256 block_ids without seafile_block_ids_sha1; refusing to serve a non-SHA-1 list", requestedFSID)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "fs object block ids unavailable"})
+				return
 			}
 			jsonObj = map[string]interface{}{
 				"block_ids": serveBlockIDs,
@@ -1797,7 +1729,13 @@ func (h *SyncHandler) CheckFS(c *gin.Context) {
 	// Build the computed→stored mapping
 	computedToStored := make(map[string]string)
 	if rootFSID != "" {
-		computedToStored, _ = h.buildFSIDMapping(repoID, rootFSID)
+		var mapErr error
+		computedToStored, _, mapErr = h.buildFSIDMapping(repoID, rootFSID)
+		if mapErr != nil {
+			log.Printf("check-fs: failed to build fs_id mapping for repo %s root %s: %v", repoID, rootFSID, mapErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate fs objects"})
+			return
+		}
 	}
 
 	log.Printf("[CheckFS] Checking %d FS IDs for repo %s (have %d mappings)", len(fsIDs), repoID, len(computedToStored))
