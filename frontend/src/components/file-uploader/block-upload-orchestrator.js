@@ -8,9 +8,14 @@
 // real Worker or network (pass `api` and `hashFn`).
 
 import { seafileAPI } from '../../utils/seafile-api';
-import { enableBlockUpload, blockUploadThresholdMB } from '../../utils/constants';
+import { enableBlockUpload, blockUploadThresholdMB, blockUploadBlockSizeMB } from '../../utils/constants';
 
-export const BLOCK_SIZE = 8 * 1024 * 1024; // must match backend WebUploadBlockSize
+// BLOCK_SIZE is the FALLBACK content-addressed block size, sourced from config
+// (web_uploads.web_block_upload_block_size_mb) rather than hardcoded. The server
+// is authoritative: uploadFileViaBlocks prefers the block_size echoed in the
+// block-upload-session response so the client always splits exactly as the
+// backend's file-from-blocks commit validates.
+export const BLOCK_SIZE = (Number(blockUploadBlockSizeMB) || 8) * 1024 * 1024;
 
 // Max hashes per /blocks/check request — must stay under the server cap (10000).
 const CHECK_BATCH_SIZE = 5000;
@@ -324,20 +329,15 @@ async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockD
   let uploadedCount = 0;
 
   const uploadOne = async (hash, index) => {
-    const t0 = performance.now();
     try {
       return await withRetry(async () => {
         throwIfAborted(signal);
-        const t1 = performance.now();
         const data = await getBlockData(index);
-        const tPrep = performance.now() - t1;
         throwIfAborted(signal);
         if (!limiter) {
           return uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
         }
-        const t2 = performance.now();
         const release = await limiter.acquire({ signal });
-        const tWait = performance.now() - t2;
         try {
           return await uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
         } catch (err) {
@@ -486,6 +486,14 @@ export async function uploadFileViaBlocks(file, {
   // 1. Server-issued session.
   const sessionResp = await api.createBlockUploadSession(repoID, parentDir, ctrlConfig);
   const session = sessionResp.data.session_id;
+
+  // The server is authoritative on the CAS block size: hash/slice to exactly the
+  // size the file-from-blocks commit will validate. Fall back to the configured
+  // default only if the session omits it (older server).
+  const serverBlockSize = Number(sessionResp.data && sessionResp.data.block_size);
+  if (Number.isFinite(serverBlockSize) && serverBlockSize > 0) {
+    blockSize = serverBlockSize;
+  }
 
   // 2. Hash blocks off the main thread.
   emitPhase('hashing');

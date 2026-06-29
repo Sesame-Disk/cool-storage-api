@@ -17,6 +17,20 @@ are out of scope for phase 1.
   flag alone would not stop a direct API call).
 - `bootstrap` emits `enableBlockUpload` (real boolean) so the UI matches the server.
 
+### Block size (server-authoritative, configurable)
+
+- Config: `web_uploads.web_block_upload_block_size_mb` (default `8`) in all
+  `configs/*.yaml`; env override `WEB_UPLOADS_BLOCK_UPLOAD_BLOCK_SIZE_MB`.
+- This is the **content-addressed (CAS) block size** the file is split and SHA-256
+  hashed into — **not** `resumable_chunk_size_mb` (that is the legacy resumable.js
+  transport chunk). Keep it at 8 MB to match the system block size so web blocks
+  dedup against blocks produced by the rest of the system; the commit
+  (`file-from-blocks`) validates each non-final block is exactly this size.
+- The server is the single source of truth: `block-upload-session` echoes it as
+  `block_size`, and the web client hashes/slices to that value (falling back to the
+  bootstrap-injected `blockUploadBlockSizeMB` default only if the session omits it).
+  Backend and frontend therefore never hardcode the size independently.
+
 ### Post-review hardening (2026-06-22)
 
 - **Idempotency vs counters:** the idempotent result is persisted immediately

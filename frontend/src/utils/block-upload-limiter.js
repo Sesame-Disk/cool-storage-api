@@ -70,7 +70,6 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
   // Adaptive ramp state (mirrors resumable's adaptive state).
   let stableSamples = 0;
   let smoothedBitrate = 0;
-  let lastBitrate = 0;
   let lastRampBitrate = 0;
   let cooldownUntil = 0;
   let lowDropSamples = 0;
@@ -143,7 +142,6 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
   const degradeToOne = (now = Date.now()) => {
     stableSamples = 0;
     smoothedBitrate = 0;
-    lastBitrate = 0;
     lastRampBitrate = 0;
     cooldownUntil = now + COOLDOWN_MS;
     lowDropSamples = 0;
@@ -180,7 +178,6 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
     smoothedBitrate = previousSmoothed > 0
       ? previousSmoothed * SMOOTHING_FACTOR + v * (1 - SMOOTHING_FACTOR)
       : v;
-    lastBitrate = v;
 
     // Reset stable samples on instability (bitrate drifted below the floor).
     if (previousSmoothed > 0 && v < previousSmoothed * STABLE_FLOOR_RATIO) {
@@ -243,7 +240,6 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
     effective = MIN_CONCURRENCY;
     stableSamples = 0;
     smoothedBitrate = 0;
-    lastBitrate = 0;
     lastRampBitrate = 0;
     cooldownUntil = 0;
     lowDropSamples = 0;

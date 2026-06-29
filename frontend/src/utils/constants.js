@@ -100,6 +100,10 @@ export const maxNumberOfFilesForFileupload = appPageOptions.maxNumberOfFilesForF
 // back to the resumable.js path otherwise. Threshold in MB.
 export const enableBlockUpload = appPageOptions.enableBlockUpload || false;
 export const blockUploadThresholdMB = appPageOptions.blockUploadThresholdMB || 64;
+// Content-addressed (CAS) block size in MB, from web_uploads.web_block_upload_block_size_mb.
+// The block-upload-session response is authoritative per upload; this is the fallback
+// default and the value fed to the adaptive limiter's bitrate heuristic.
+export const blockUploadBlockSizeMB = appPageOptions.blockUploadBlockSizeMB || 8;
 export const enableOCM = appPageOptions.enableOCM || false;
 export const ocmRemoteServers = appPageOptions.ocmRemoteServers || [];
 export const enableOCMViaWebdav = appPageOptions.enableOCMViaWebdav || false;

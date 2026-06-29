@@ -542,6 +542,7 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		// reads false correctly — a "false" string would be truthy.
 		"enableBlockUpload":             s.config.WebUploads.EnableWebBlockUpload,
 		"resumableUploadFileBlockSize":  s.config.WebUploads.ResumableChunkSizeMB,
+		"blockUploadBlockSizeMB":        s.config.WebUploads.WebBlockUploadBlockSizeMB,
 		"maxUploadFileSize":             s.config.ResolvedMaxFileSizeMB(),
 		"maxNumberOfFilesForFileupload": s.config.WebUploads.MaxFilesPerBatch,
 		"resumableSimultaneousUploads":  s.config.WebUploads.SimultaneousUploads,

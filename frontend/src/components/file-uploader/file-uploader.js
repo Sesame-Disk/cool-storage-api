@@ -12,7 +12,7 @@ import { createBlockLimiter } from '../../utils/block-upload-limiter';
 import UploadProgressDialog from './upload-progress-dialog';
 import UploadRemindDialog from '../dialog/upload-remind-dialog';
 import toaster from '../toast';
-import { isAbortError, shouldUseBlockUpload, uploadFileViaBlocks } from './block-upload-orchestrator';
+import { isAbortError, shouldUseBlockUpload, uploadFileViaBlocks, BLOCK_SIZE } from './block-upload-orchestrator';
 import '../../css/file-uploader.css';
 
 const propTypes = {
@@ -156,7 +156,7 @@ class FileUploader extends React.Component {
     // total blocks on the wire across all files never exceed the configured ceiling
     // (`simultaneous_uploads`). Adaptive: it starts at 1 and ramps up to that ceiling
     // while the link stays healthy (fed by noteBitrate/noteFailure).
-    this.blockLimiter = createBlockLimiter({ maxConcurrency: configuredSimultaneousUploads });
+    this.blockLimiter = createBlockLimiter({ maxConcurrency: configuredSimultaneousUploads, blockSize: BLOCK_SIZE });
     this.resumable = new Resumablejs({
       target: '',
       query: this.setQuery || {},

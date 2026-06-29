@@ -585,6 +585,14 @@ func TestConfigValidate(t *testing.T) {
 			wantErr:        true,
 			wantErrContain: "storage.mode=single requires server.region to be empty",
 		},
+		{
+			name: "non-positive web block upload block size",
+			modify: func(c *Config) {
+				c.WebUploads.WebBlockUploadBlockSizeMB = 0
+			},
+			wantErr:        true,
+			wantErrContain: "web_block_upload_block_size_mb must be greater than zero",
+		},
 	}
 
 	for _, tt := range tests {

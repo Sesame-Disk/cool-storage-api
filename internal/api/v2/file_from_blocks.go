@@ -75,10 +75,8 @@ func (h *FileHandler) waitForBlockUploadResult(sessionID, digest string) (string
 // Manifest limits for the web content-addressed upload flow (R6). A 131072-block
 // manifest at 8 MB/block bounds a single committed file at ~1 TiB, which is far
 // beyond any realistic web upload while still rejecting absurd manifests early.
-const (
-	maxBlocksPerManifest       = 131072
-	maxFileFromBlocksTotalSize = int64(maxBlocksPerManifest) * WebUploadBlockSize
-)
+// The total-size cap scales with the configured block size (see validateManifest).
+const maxBlocksPerManifest = 131072
 
 // fileFromBlocksBlock is one ordered entry of the commit manifest. It carries
 // BOTH content hashes of the same 8 MB block:
@@ -141,17 +139,22 @@ func isHex40(s string) bool {
 	return err == nil
 }
 
-// validateManifest enforces the structural rules (R6): fixed 8 MB blocks except
-// the last, total size consistency, hash format, and manifest bounds. It does
-// NOT touch storage — physical/liveness checks happen per block in the handler.
-func validateManifest(req *fileFromBlocksRequest) error {
+// validateManifest enforces the structural rules (R6): fixed blockSize blocks
+// except the last, total size consistency, hash format, and manifest bounds. It
+// does NOT touch storage — physical/liveness checks happen per block in the
+// handler. blockSize is the configured CAS block size (bytes).
+func validateManifest(req *fileFromBlocksRequest, blockSize int64) error {
+	if blockSize <= 0 {
+		blockSize = WebUploadBlockSize
+	}
+	maxTotalSize := int64(maxBlocksPerManifest) * blockSize
 	if len(req.Blocks) == 0 {
 		return fmt.Errorf("blocks is required")
 	}
 	if len(req.Blocks) > maxBlocksPerManifest {
 		return fmt.Errorf("too many blocks (max %d)", maxBlocksPerManifest)
 	}
-	if req.Size <= 0 || req.Size > maxFileFromBlocksTotalSize {
+	if req.Size <= 0 || req.Size > maxTotalSize {
 		return fmt.Errorf("invalid size")
 	}
 	if strings.TrimSpace(req.Filename) == "" ||
@@ -195,11 +198,11 @@ func validateManifest(req *fileFromBlocksRequest) error {
 		}
 		sizeSeen[b.SHA256] = b.Size
 		if i < lastIdx {
-			if b.Size != WebUploadBlockSize {
-				return fmt.Errorf("block %d: non-final blocks must be exactly %d bytes", i, WebUploadBlockSize)
+			if b.Size != blockSize {
+				return fmt.Errorf("block %d: non-final blocks must be exactly %d bytes", i, blockSize)
 			}
 		} else {
-			if b.Size <= 0 || b.Size > WebUploadBlockSize {
+			if b.Size <= 0 || b.Size > blockSize {
 				return fmt.Errorf("block %d: final block size out of range", i)
 			}
 		}
@@ -248,7 +251,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	if req.ParentDir == "" {
 		req.ParentDir = "/"
 	}
-	if err := validateManifest(&req); err != nil {
+	if err := validateManifest(&req, h.webBlockUploadBlockSize()); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
