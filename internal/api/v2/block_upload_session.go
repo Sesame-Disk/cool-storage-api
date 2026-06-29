@@ -8,11 +8,22 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// WebUploadBlockSize is the fixed plaintext block size used by the web
-// content-addressed upload flow. It MUST match api.uploadBlockSize (8 MB) so a
-// file uploaded by the web client splits into the same blocks the rest of the
-// system expects on download/streaming.
+// WebUploadBlockSize is the DEFAULT plaintext block size for the web
+// content-addressed upload flow, used when no config is wired (e.g. tests). The
+// effective size is sourced from web_uploads.web_block_upload_block_size_mb via
+// FileHandler.webBlockUploadBlockSize(); it MUST match api.uploadBlockSize (8 MB)
+// so a file uploaded by the web client splits into the same blocks the rest of
+// the system expects on download/streaming and for cross-flow dedup.
 const WebUploadBlockSize = 8 * 1024 * 1024
+
+// webBlockUploadBlockSize returns the effective CAS block size (bytes) for this
+// handler, sourced from config and falling back to WebUploadBlockSize.
+func (h *FileHandler) webBlockUploadBlockSize() int64 {
+	if h != nil && h.config != nil {
+		return h.config.WebBlockUploadBlockSize()
+	}
+	return WebUploadBlockSize
+}
 
 // libraryEncrypted reports whether a library is encrypted. Unlike
 // requireDecryptSession (which permits access when a decrypt session exists),
@@ -95,7 +106,7 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 		"session_id": session.SessionID,
 		"repo_id":    repoID,
 		"parent_dir": session.ParentDir,
-		"block_size": WebUploadBlockSize,
+		"block_size": h.webBlockUploadBlockSize(),
 		"expires_at": session.ExpiresAt.Unix(),
 	})
 }

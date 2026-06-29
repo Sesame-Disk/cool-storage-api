@@ -232,6 +232,7 @@ web_uploads:
   enable_resumable_file_upload: true
   enable_web_block_upload: false  # content-addressed (block) web upload flow; off until phase-1 rollout
   resumable_chunk_size_mb: 8
+  web_block_upload_block_size_mb: 8
   max_file_size_mb: 0
   max_files_per_batch: 1000
   simultaneous_uploads: 1  # Max parallel browser upload slots; the adaptive client starts at 1 and only ramps up to this ceiling on stable networks

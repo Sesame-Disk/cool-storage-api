@@ -46,6 +46,14 @@ type WebUploadsConfig struct {
 	// stays closed even though the routes are always registered.
 	EnableWebBlockUpload      bool  `yaml:"enable_web_block_upload"`
 	ResumableChunkSizeMB      int64 `yaml:"resumable_chunk_size_mb"`
+	// WebBlockUploadBlockSizeMB is the content-addressed (CAS) block size used by
+	// the web block-upload flow: the size each file is split and SHA-256 hashed
+	// into, validated exactly on commit (file-from-blocks). It is NOT the resumable
+	// transport chunk size — keep it equal to the system block size (8 MB) so web
+	// blocks dedup against blocks produced by the rest of the system. The server is
+	// the single source of truth: it is echoed in the block-upload-session response
+	// and the web client hashes/slices to it instead of hardcoding a size.
+	WebBlockUploadBlockSizeMB int64 `yaml:"web_block_upload_block_size_mb"`
 	MaxFileSizeMB             int64 `yaml:"max_file_size_mb"`
 	MaxFilesPerBatch          int   `yaml:"max_files_per_batch"`
 	SimultaneousUploads       int   `yaml:"simultaneous_uploads"`
@@ -64,6 +72,22 @@ func (c *Config) ResolvedMaxFileSizeMB() int64 {
 		return c.Server.MaxUploadMB
 	}
 	return 0
+}
+
+// DefaultWebBlockUploadBlockSizeMB is the fallback CAS block size (MiB) when the
+// config is missing or non-positive. It must match the system block size so web
+// blocks dedup against blocks produced by the rest of the system.
+const DefaultWebBlockUploadBlockSizeMB int64 = 8
+
+// WebBlockUploadBlockSize returns the content-addressed (CAS) block size in bytes
+// for the web block-upload flow, sourced from web_uploads.web_block_upload_block_size_mb.
+// A nil/non-positive config falls back to the default so callers never split on 0.
+func (c *Config) WebBlockUploadBlockSize() int64 {
+	mb := DefaultWebBlockUploadBlockSizeMB
+	if c != nil && c.WebUploads.WebBlockUploadBlockSizeMB > 0 {
+		mb = c.WebUploads.WebBlockUploadBlockSizeMB
+	}
+	return mb * 1024 * 1024
 }
 
 var cassandraDCNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -709,6 +733,7 @@ func DefaultConfig() *Config {
 			EnableUploadFolder:        true,
 			EnableResumableFileUpload: true,
 			ResumableChunkSizeMB:      8,
+			WebBlockUploadBlockSizeMB: 8,
 			MaxFileSizeMB:             0,
 			MaxFilesPerBatch:          1000,
 			SimultaneousUploads:       1,
@@ -1004,6 +1029,13 @@ func (c *Config) applyEnvOverrides() {
 			c.addEnvOverrideError("WEB_UPLOADS_RESUMABLE_CHUNK_SIZE_MB must be an integer, got %q", v)
 		} else {
 			c.WebUploads.ResumableChunkSizeMB = i
+		}
+	}
+	if v := os.Getenv("WEB_UPLOADS_BLOCK_UPLOAD_BLOCK_SIZE_MB"); v != "" {
+		if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {
+			c.addEnvOverrideError("WEB_UPLOADS_BLOCK_UPLOAD_BLOCK_SIZE_MB must be an integer, got %q", v)
+		} else {
+			c.WebUploads.WebBlockUploadBlockSizeMB = i
 		}
 	}
 	if v := os.Getenv("WEB_UPLOADS_MAX_FILE_SIZE_MB"); v != "" {
@@ -1457,6 +1489,9 @@ func (c *Config) Validate() error {
 	}
 	if c.WebUploads.ResumableChunkSizeMB <= 0 {
 		return fmt.Errorf("web_uploads.resumable_chunk_size_mb must be greater than zero")
+	}
+	if c.WebUploads.WebBlockUploadBlockSizeMB <= 0 {
+		return fmt.Errorf("web_uploads.web_block_upload_block_size_mb must be greater than zero")
 	}
 	if c.WebUploads.MaxFilesPerBatch < 0 {
 		return fmt.Errorf("web_uploads.max_files_per_batch must be zero or greater")

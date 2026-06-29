@@ -8,9 +8,14 @@
 // real Worker or network (pass `api` and `hashFn`).
 
 import { seafileAPI } from '../../utils/seafile-api';
-import { enableBlockUpload, blockUploadThresholdMB } from '../../utils/constants';
+import { enableBlockUpload, blockUploadThresholdMB, blockUploadBlockSizeMB } from '../../utils/constants';
 
-export const BLOCK_SIZE = 8 * 1024 * 1024; // must match backend WebUploadBlockSize
+// BLOCK_SIZE is the FALLBACK content-addressed block size, sourced from config
+// (web_uploads.web_block_upload_block_size_mb) rather than hardcoded. The server
+// is authoritative: uploadFileViaBlocks prefers the block_size echoed in the
+// block-upload-session response so the client always splits exactly as the
+// backend's file-from-blocks commit validates.
+export const BLOCK_SIZE = (Number(blockUploadBlockSizeMB) || 8) * 1024 * 1024;
 
 // Max hashes per /blocks/check request — must stay under the server cap (10000).
 const CHECK_BATCH_SIZE = 5000;
@@ -323,27 +328,37 @@ async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockD
   let cursor = 0;
   let uploadedCount = 0;
 
-  const uploadOne = (hash, index) => withRetry(async () => {
-    throwIfAborted(signal);
-    const data = await getBlockData(index);
-    throwIfAborted(signal);
-    if (!limiter) {
-      return uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
-    }
-    const release = await limiter.acquire({ signal });
+  const uploadOne = async (hash, index) => {
     try {
-      return await uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
+      return await withRetry(async () => {
+        throwIfAborted(signal);
+        const data = await getBlockData(index);
+        throwIfAborted(signal);
+        if (!limiter) {
+          return uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
+        }
+        const release = await limiter.acquire({ signal });
+        try {
+          return await uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
+        } catch (err) {
+          // Match resumable parity: every real transport retry backs the adaptive
+          // limiter off immediately, even if a later attempt succeeds.
+          if (limiter.noteRetry && !isAbortError(err) && !(signal && signal.aborted)) {
+            limiter.noteRetry();
+          }
+          throw err;
+        } finally {
+          release();
+        }
+      }, retries, { signal });
     } catch (err) {
-      // A real upload failure (stall/timeout/transport) signals a degraded link, so
-      // tell the limiter to back off. A user abort is NOT a link problem.
-      if (limiter.noteFailure && !isAbortError(err) && !(signal && signal.aborted)) {
+      // A final failure still counts as a hard degrade after the per-retry backoffs.
+      if (limiter && limiter.noteFailure && !isAbortError(err) && !(signal && signal.aborted)) {
         limiter.noteFailure();
       }
       throw err;
-    } finally {
-      release();
     }
-  }, retries, { signal });
+  };
 
   const worker = async () => {
     for (;;) {
@@ -450,6 +465,8 @@ export async function uploadFileViaBlocks(file, {
   onTransferProgress,
   onPhase,
   onPlan,
+  waitForUploadSlot,
+  onReadyForUpload,
   signal,
 } = {}) {
   if (!repoID) throw new Error('repoID is required');
@@ -470,6 +487,14 @@ export async function uploadFileViaBlocks(file, {
   const sessionResp = await api.createBlockUploadSession(repoID, parentDir, ctrlConfig);
   const session = sessionResp.data.session_id;
 
+  // The server is authoritative on the CAS block size: hash/slice to exactly the
+  // size the file-from-blocks commit will validate. Fall back to the configured
+  // default only if the session omits it (older server).
+  const serverBlockSize = Number(sessionResp.data && sessionResp.data.block_size);
+  if (Number.isFinite(serverBlockSize) && serverBlockSize > 0) {
+    blockSize = serverBlockSize;
+  }
+
   // 2. Hash blocks off the main thread.
   emitPhase('hashing');
   const { blocks, size } = await hashFn(file, { blockSize, onProgress: onHashProgress, signal });
@@ -479,7 +504,7 @@ export async function uploadFileViaBlocks(file, {
   const getBlockData = (index) => {
     const start = index * blockSize;
     const end = Math.min(start + blockSize, size);
-    return file.slice(start, end).arrayBuffer();
+    return file.slice(start, end);
   };
 
   // 3. Which blocks are missing (de-duplicated hash set). Batched to stay within
@@ -518,19 +543,29 @@ export async function uploadFileViaBlocks(file, {
     onPlan({ totalBytes: size, uploadBytes, dedupedBytes: Math.max(0, size - uploadBytes) });
   }
 
+  if (onReadyForUpload) {
+    onReadyForUpload({ missingCount: missing.length, totalCount: blocks.length });
+  }
+  if (waitForUploadSlot) {
+    await waitForUploadSlot({ signal, missingCount: missing.length, totalCount: blocks.length });
+    throwIfAborted(signal);
+  }
+
   // 4. Upload missing blocks.
-  emitPhase('uploading');
-  await uploadMissingBlocks(session, missing, blockIndexByHash, getBlockData, {
-    api,
-    concurrency,
-    limiter,
-    retries,
-    onBlockUploaded: onUploadProgress,
-    onTransferProgress,
-    signal,
-    stallMs: blockStallTimeoutMs,
-    responseTimeoutMs: blockResponseTimeoutMs,
-  });
+  if (missing.length > 0) {
+    emitPhase('uploading');
+    await uploadMissingBlocks(session, missing, blockIndexByHash, getBlockData, {
+      api,
+      concurrency,
+      limiter,
+      retries,
+      onBlockUploaded: onUploadProgress,
+      onTransferProgress,
+      signal,
+      stallMs: blockStallTimeoutMs,
+      responseTimeoutMs: blockResponseTimeoutMs,
+    });
+  }
 
   // 5. Commit from the ordered manifest. If the server reports some blocks are
   //    not commit-ready (race / orphan), re-upload exactly those once and retry.

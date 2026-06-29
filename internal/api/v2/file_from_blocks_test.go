@@ -48,7 +48,7 @@ func TestValidateManifest_AcceptsDualHashBlocks(t *testing.T) {
 			validDualBlock(2, 100),
 		},
 	}
-	if err := validateManifest(req); err != nil {
+	if err := validateManifest(req, WebUploadBlockSize); err != nil {
 		t.Fatalf("valid dual-hash manifest rejected: %v", err)
 	}
 }
@@ -60,7 +60,7 @@ func TestValidateManifest_RejectsMissingOrInvalidSHA1(t *testing.T) {
 			Size:     100,
 			Blocks:   []fileFromBlocksBlock{{SHA1: sha1, SHA256: hex64(1), Size: 100}},
 		}
-		if err := validateManifest(req); err == nil {
+		if err := validateManifest(req, WebUploadBlockSize); err == nil {
 			t.Fatalf("expected rejection for invalid sha1 %q", sha1)
 		}
 	}
@@ -77,7 +77,7 @@ func TestValidateManifest_RejectsConflictingSHA1ForSameSHA256(t *testing.T) {
 			{SHA1: hex40(2), SHA256: hex64(7), Size: WebUploadBlockSize},
 		},
 	}
-	if err := validateManifest(req); err == nil {
+	if err := validateManifest(req, WebUploadBlockSize); err == nil {
 		t.Fatal("expected rejection for conflicting sha1 for same sha256")
 	}
 }
@@ -91,8 +91,39 @@ func TestValidateManifest_RejectsConflictingSHA256ForSameSHA1(t *testing.T) {
 			{SHA1: hex40(9), SHA256: hex64(2), Size: WebUploadBlockSize},
 		},
 	}
-	if err := validateManifest(req); err == nil {
+	if err := validateManifest(req, WebUploadBlockSize); err == nil {
 		t.Fatal("expected rejection for conflicting sha256 for same sha1")
+	}
+}
+
+func TestValidateManifest_HonorsConfiguredBlockSize(t *testing.T) {
+	// The non-final block size is validated against the CONFIGURED CAS block size,
+	// not a hardcoded 8 MB. With a 4 MB configured size, a 4 MB non-final block is
+	// valid and an 8 MB one is rejected -- and vice versa.
+	const fourMB = int64(4 * 1024 * 1024)
+
+	okReq := &fileFromBlocksRequest{
+		Filename: "f.bin",
+		Size:     fourMB + 100,
+		Blocks: []fileFromBlocksBlock{
+			validDualBlock(1, fourMB),
+			validDualBlock(2, 100),
+		},
+	}
+	if err := validateManifest(okReq, fourMB); err != nil {
+		t.Fatalf("4 MB non-final block rejected under 4 MB config: %v", err)
+	}
+
+	badReq := &fileFromBlocksRequest{
+		Filename: "f.bin",
+		Size:     WebUploadBlockSize + 100,
+		Blocks: []fileFromBlocksBlock{
+			validDualBlock(1, WebUploadBlockSize),
+			validDualBlock(2, 100),
+		},
+	}
+	if err := validateManifest(badReq, fourMB); err == nil {
+		t.Fatal("8 MB non-final block must be rejected under a 4 MB block-size config")
 	}
 }
 
@@ -105,7 +136,7 @@ func TestValidateManifest_AllowsRepeatedIdenticalDualBlocks(t *testing.T) {
 		Size:     WebUploadBlockSize * 2,
 		Blocks:   []fileFromBlocksBlock{b, b},
 	}
-	if err := validateManifest(req); err != nil {
+	if err := validateManifest(req, WebUploadBlockSize); err != nil {
 		t.Fatalf("repeated identical dual block rejected: %v", err)
 	}
 }

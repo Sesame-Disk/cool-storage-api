@@ -344,7 +344,7 @@ describe('FileUploader block upload integration', () => {
 
     uploader.onUploadRetry(blockEntry);
 
-    expect(uploader.runBlockUpload).toHaveBeenCalledWith(blockEntry, blockEntry.file);
+    expect(uploader.runBlockUpload).toHaveBeenCalledWith(blockEntry, blockEntry.file, expect.any(Object));
     expect(uploader.retryUploadFile).not.toHaveBeenCalled();
     expect(uploader.state.retryFileList).toEqual([]);
     expect(blockEntry.error).toBeNull();
@@ -487,7 +487,7 @@ describe('FileUploader block upload integration', () => {
     expect(uploader.state.uploadBitrate).toBe(5000);
   });
 
-  test('feeds the block limiter only on fresh bitrate samples, not every progress tick', () => {
+  test('feeds the block limiter only on fresh sampler windows, even if the bitrate value repeats', () => {
     jest.useFakeTimers();
     try {
       jest.setSystemTime(1000);
@@ -506,21 +506,28 @@ describe('FileUploader block upload integration', () => {
       };
       uploader.state.uploadFileList = [entry];
 
-      // First call seeds the sampler (not a real sample): no limiter feed.
+      // First tick only seeds the sampler; there is no fresh bitrate sample yet.
       uploader.updateBlockUploadTransferredBytes(entry, 1024);
       expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
 
-      // Rapid progress ticks inside the 500ms throttle window reuse the same reading
-      // and must NOT count as new healthy samples (this is what made the ramp shoot up).
-      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      // Rapid ticks inside the same 500 ms window reuse the stale reading and must
+      // NOT count as extra healthy samples.
       uploader.updateBlockUploadTransferredBytes(entry, 1024);
       expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
 
-      // After the window elapses, exactly one fresh sample is fed.
+      // Once the window elapses, a fresh sample is fed.
       jest.setSystemTime(1600);
       uploader.updateBlockUploadTransferredBytes(entry, 1024);
       expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(1);
-      expect(typeof uploader.blockLimiter.noteBitrate.mock.calls[0][0]).toBe('number');
+      const repeatedBitrate = uploader.blockLimiter.noteBitrate.mock.calls[0][0];
+      expect(typeof repeatedBitrate).toBe('number');
+
+      // Another fresh window with the SAME bitrate value must still feed again:
+      // same value, new sample.
+      jest.setSystemTime(2200);
+      uploader.updateBlockUploadTransferredBytes(entry, 2048);
+      expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(2);
+      expect(uploader.blockLimiter.noteBitrate.mock.calls[1][0]).toBe(repeatedBitrate);
     } finally {
       jest.useRealTimers();
     }
@@ -576,18 +583,18 @@ describe('FileUploader block upload file-level queue (serialization)', () => {
 
     // Only the first file is active; the other two wait.
     expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1);
-    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(a, a.file);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(a, a.file, expect.any(Object));
     expect(uploader.blockUploadQueue.length).toBe(2);
 
     deferreds[0].resolve();
     await settle();
     expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
-    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(b, b.file);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(b, b.file, expect.any(Object));
 
     deferreds[1].resolve();
     await settle();
     expect(uploader.runBlockUpload).toHaveBeenCalledTimes(3);
-    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(c, c.file);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(c, c.file, expect.any(Object));
 
     deferreds[2].resolve();
     await settle();
@@ -595,45 +602,111 @@ describe('FileUploader block upload file-level queue (serialization)', () => {
     expect(uploader.blockUploadQueue.length).toBe(0);
   });
 
-  test('a block file releases the slot at "saving" so the next starts while it commits', async () => {
+  test('while one file is uploading, exactly one next block file can prepare ahead', () => {
     const uploader = createUploader();
-    const deferreds = withDeferredRunBlockUpload(uploader);
+    const jobs = [];
+    uploader.runBlockUpload = jest.fn((entry, file, options = {}) => {
+      jobs.push({ entry, file, options });
+      return new Promise(() => {});
+    });
+
     const a = makeQueueEntry('a');
     const b = makeQueueEntry('b');
-    uploader.state.uploadFileList = [a, b];
+    const c = makeQueueEntry('c');
+    uploader.state.uploadFileList = [a, b, c];
 
-    uploader.enqueueBlockUpload(a, a.file); // active
-    uploader.enqueueBlockUpload(b, b.file); // waiting
+    uploader.enqueueBlockUpload(a, a.file);
+    uploader.enqueueBlockUpload(b, b.file);
+    uploader.enqueueBlockUpload(c, c.file);
+
     expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1);
+    expect(jobs[0].entry).toBe(a);
     expect(uploader.activeBlockUpload.entry).toBe(a);
-    expect(uploader.blockUploadQueue.length).toBe(1);
+    expect(uploader.preparingBlockUpload.entry).toBe(a);
+    expect(uploader.blockUploadQueue.map(job => job.entry)).toEqual([b, c]);
 
-    // a enters its commit phase → slot handed off, b starts WITHOUT a having settled.
-    uploader.setBlockUploadPhase(a, 'saving');
+    jobs[0].options.onReadyForUpload();
+
     expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
-    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(b, b.file);
-    expect(uploader.activeBlockUpload.entry).toBe(b);
-    expect(uploader.blockUploadQueue.length).toBe(0);
+    expect(jobs[1].entry).toBe(b);
+    expect(uploader.activeBlockUpload.entry).toBe(a);
+    expect(uploader.preparingBlockUpload.entry).toBe(b);
+    expect(uploader.preparedBlockUpload).toBe(null);
+    expect(uploader.blockUploadQueue.map(job => job.entry)).toEqual([c]);
 
-    // a's commit finishing later must NOT null b's slot or wedge the queue.
-    deferreds[0].resolve();
-    await settle();
+    jobs[1].options.onReadyForUpload();
+
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
+    expect(uploader.activeBlockUpload.entry).toBe(a);
+    expect(uploader.preparingBlockUpload).toBe(null);
+    expect(uploader.preparedBlockUpload.entry).toBe(b);
+    expect(b._phase).toBe('queued');
+    expect(uploader.blockUploadQueue.map(job => job.entry)).toEqual([c]);
+
+    uploader.setBlockUploadPhase(a, 'saving');
+
     expect(uploader.activeBlockUpload.entry).toBe(b);
+    expect(uploader.preparedBlockUpload).toBe(null);
+    expect(uploader.preparingBlockUpload.entry).toBe(c);
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(3);
+    expect(jobs[2].entry).toBe(c);
   });
 
-  test('a needs_upload re-entry into "saving" does not re-release or strand the slot', async () => {
+  test('a block file releases the slot at "saving" so the next prepared file takes the upload turn while it commits', async () => {
     const uploader = createUploader();
-    withDeferredRunBlockUpload(uploader);
+    const jobs = [];
+    uploader.runBlockUpload = jest.fn((entry, file, options = {}) => {
+      let resolve;
+      const promise = new Promise((r) => { resolve = r; });
+      jobs.push({ entry, file, options, resolve, promise });
+      return promise;
+    });
     const a = makeQueueEntry('a');
     const b = makeQueueEntry('b');
     uploader.state.uploadFileList = [a, b];
 
     uploader.enqueueBlockUpload(a, a.file);
     uploader.enqueueBlockUpload(b, b.file);
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1);
+    expect(uploader.activeBlockUpload.entry).toBe(a);
+
+    jobs[0].options.onReadyForUpload();
+    expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
+    expect(jobs[1].entry).toBe(b);
+    expect(uploader.preparingBlockUpload.entry).toBe(b);
+
+    jobs[1].options.onReadyForUpload();
+    expect(uploader.preparedBlockUpload.entry).toBe(b);
+    expect(uploader.activeBlockUpload.entry).toBe(a);
+
+    uploader.setBlockUploadPhase(a, 'saving');
+    expect(uploader.activeBlockUpload.entry).toBe(b);
+    expect(uploader.preparedBlockUpload).toBe(null);
+
+    jobs[0].resolve();
+    await settle();
+    expect(uploader.activeBlockUpload.entry).toBe(b);
+  });
+
+  test('a needs_upload re-entry into "saving" does not re-release or strand the slot', () => {
+    const uploader = createUploader();
+    const jobs = [];
+    uploader.runBlockUpload = jest.fn((entry, file, options = {}) => {
+      jobs.push({ entry, file, options });
+      return new Promise(() => {});
+    });
+    const a = makeQueueEntry('a');
+    const b = makeQueueEntry('b');
+    uploader.state.uploadFileList = [a, b];
+
+    uploader.enqueueBlockUpload(a, a.file);
+    uploader.enqueueBlockUpload(b, b.file);
+    jobs[0].options.onReadyForUpload();
+    jobs[1].options.onReadyForUpload();
     uploader.setBlockUploadPhase(a, 'saving'); // hands off to b
     expect(uploader.activeBlockUpload.entry).toBe(b);
 
-    // commit reported needs_upload → a goes back to uploading, then saving again.
+    // commit reported needs_upload -> a goes back to uploading, then saving again.
     uploader.setBlockUploadPhase(a, 'uploading');
     uploader.setBlockUploadPhase(a, 'saving');
 
@@ -661,7 +734,7 @@ describe('FileUploader block upload file-level queue (serialization)', () => {
     deferreds[0].resolve(); // active finishes → drain finds an empty queue
     await settle();
     expect(uploader.runBlockUpload).toHaveBeenCalledTimes(1); // b never ran
-    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(a, a.file);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(a, a.file, expect.any(Object));
   });
 
   test('closing the dialog clears queued jobs but keeps the active marker until it settles', async () => {
@@ -706,7 +779,7 @@ describe('FileUploader block upload file-level queue (serialization)', () => {
     deferreds[0].resolve(); // old active finally settles → release slot
     await settle();
     expect(uploader.runBlockUpload).toHaveBeenCalledTimes(2);
-    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(b, b.file);
+    expect(uploader.runBlockUpload).toHaveBeenLastCalledWith(b, b.file, expect.any(Object));
   });
 
   test('enqueueBlockUpload is idempotent for the same entry (no double CAS session)', () => {

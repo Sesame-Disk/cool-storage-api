@@ -131,7 +131,8 @@ web_uploads:
   enable_upload_folder: true           # Browser drag-and-drop folder uploads
   enable_resumable_file_upload: true   # Browser chunked/resumable uploads
   enable_web_block_upload: false       # Content-addressed (block) web upload flow: resume + dedup. Phase 1, off by default
-  resumable_chunk_size_mb: 8           # Client chunk size in MiB for web uploads
+  resumable_chunk_size_mb: 8           # Client chunk size in MiB for the resumable.js (legacy) web upload flow
+  web_block_upload_block_size_mb: 8    # CAS block size in MiB for the block-upload flow; keep at 8 to match the system block size (dedup). NOT the resumable chunk size
   max_file_size_mb: 0                  # 0 = use server.max_upload_mb for the browser limit
   max_files_per_batch: 1000            # 0 = unlimited files selectable in one batch
   simultaneous_uploads: 1              # Max parallel browser upload slots; the adaptive client starts at 1 and only ramps up to this ceiling on stable networks

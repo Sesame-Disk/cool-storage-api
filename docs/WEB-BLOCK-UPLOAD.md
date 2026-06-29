@@ -17,6 +17,20 @@ are out of scope for phase 1.
   flag alone would not stop a direct API call).
 - `bootstrap` emits `enableBlockUpload` (real boolean) so the UI matches the server.
 
+### Block size (server-authoritative, configurable)
+
+- Config: `web_uploads.web_block_upload_block_size_mb` (default `8`) in all
+  `configs/*.yaml`; env override `WEB_UPLOADS_BLOCK_UPLOAD_BLOCK_SIZE_MB`.
+- This is the **content-addressed (CAS) block size** the file is split and SHA-256
+  hashed into — **not** `resumable_chunk_size_mb` (that is the legacy resumable.js
+  transport chunk). Keep it at 8 MB to match the system block size so web blocks
+  dedup against blocks produced by the rest of the system; the commit
+  (`file-from-blocks`) validates each non-final block is exactly this size.
+- The server is the single source of truth: `block-upload-session` echoes it as
+  `block_size`, and the web client hashes/slices to that value (falling back to the
+  bootstrap-injected `blockUploadBlockSizeMB` default only if the session omits it).
+  Backend and frontend therefore never hardcode the size independently.
+
 ### Post-review hardening (2026-06-22)
 
 - **Idempotency vs counters:** the idempotent result is persisted immediately
@@ -509,6 +523,13 @@ must **not** reintroduce any target clearing.
   duplicate-name prompt for batch/large; broader browser E2E with the flag on (verify
   the ceiling ramps 1→`max` on a healthy link and backs off on a throttled one).
 
+> **Superseded by PR8.** The simple sample-count policy above (`RAMP_MIN_SAMPLES=3` /
+> `DEGRADE_MIN_SAMPLES=2` / `< 0.6 × smoothed`) was later rewritten to mirror resumable's
+> `updateAdaptiveUploadConcurrency` engine: EMA smoothing, `DROP_RATIO=0.55` with
+> `DROP_MIN_SAMPLES=2`, `STABLE_FLOOR_RATIO=0.7`, `minimumBitrateForSlots` per slot,
+> `FIRST_RAMP_SAMPLES=3` / `NEXT_RAMP_SAMPLES=5`, `GAIN_RATIO=1.05`, and a `COOLDOWN_MS`
+> that gates the **ramp** (not the degrade). See PR8 for the current constants and signals.
+
 **PR3.5 — serialize block uploads to one active file at a time (done; behind flag).**
 - The block (CAS) flow now runs **one file at a time**: a file-level FIFO
   (`this.blockUploadQueue` + `this.activeBlockUpload`) sits on top of the block-level
@@ -542,6 +563,11 @@ must **not** reintroduce any target clearing.
   window waits; idempotent enqueue.
 - Pending (next PR): PR4 duplicate-name prompt for batch/large; broader browser E2E
   with the flag on.
+
+> **Relaxed by PR8.** The strict one-file-at-a-time rule is loosened to "one file in the
+> upload/commit half + one file allowed to get ahead through hashing/checking", so the
+> next file's expensive prep overlaps the active file's upload. Still never two files in
+> block upload at once. See PR8.
 
 **PR4 — duplicate-name prompt for batch/large + apply-to-all (done; touches legacy).**
 - The "Replace?" dialog now fires for **every** file (single / batch / large), BEFORE
@@ -810,6 +836,52 @@ must **not** reintroduce any target clearing.
   the dialog clears the completed-destination guard", "completed guard also catches the
   backend auto-renamed destination".
 
+**PR8 — throughput parity with resumable.js (Blob streaming + resumable-mirror adaptive policy + prep pipelining).**
+Block upload topped out at ~half of resumable.js throughput (≈60 vs ≈110 MB/s at 3
+concurrent slots) even though both use 8 MB chunks and the same `simultaneous_uploads`
+ceiling. The gap was structural in how blocks were read/sent and how the limiter was fed
+— not the concurrency policy. Four fixes bring it to parity:
+
+- **Stream blocks instead of materialising them.** `getBlockData` now returns the
+  `file.slice(start, end)` **Blob** directly instead of `.arrayBuffer()`. The old path
+  re-read the whole file a second time (the hasher already read it once) and copied every
+  8 MB block into the JS heap before sending, serialising the read with the upload per
+  worker (≈50% duty cycle on multi-GB files that exceed the page cache). Handing the Blob
+  to the transport lets the browser stream disk→socket in a single read — exactly what
+  resumable.js does. This is the bulk of the recovered throughput.
+- **Adaptive policy now mirrors resumable's engine** (`updateAdaptiveUploadConcurrency`),
+  replacing the simpler PR3 sample-count policy: EMA smoothing (`SMOOTHING_FACTOR=0.7`),
+  `DROP_RATIO=0.55` sharp-drop detection requiring `DROP_MIN_SAMPLES=2` consecutive low
+  windows (one noisy LAN sample is noise, not a collapse), `STABLE_FLOOR_RATIO=0.7`,
+  `minimumBitrateForSlots` per added slot, `FIRST_RAMP_SAMPLES=3` / `NEXT_RAMP_SAMPLES=5`,
+  `GAIN_RATIO=1.05` above 2 slots, and `COOLDOWN_MS=10000` that gates the **ramp** (not
+  the degrade) so a link that just failed backs off for the penalty window.
+- **Limiter feed is de-staled and per-retry backoff matches resumable.**
+  `updateBlockUploadTransferredBytes` feeds `noteBitrate` only when
+  `sampleBlockUploadBitrate` produced a **fresh** reading (`entry._bitrateTs` advanced,
+  ≤ one per `BLOCK_BITRATE_SAMPLE_MS = 500 ms`) — not on every ~50 ms progress tick — so a
+  burst of ticks cannot inflate `stableSamples`, while a steady link that repeats the same
+  value still contributes one healthy sample per window (no ramp starvation). The
+  orchestrator calls `limiter.noteRetry()` on **every** failed upload attempt (not only on
+  terminal exhaustion), matching resumable which degrades on each `fileRetry`; the final
+  exhaustion still marks one hard `noteFailure()`. A full-dedup file (`missing.length === 0`)
+  skips the `uploading` phase entirely and goes straight to `saving`.
+- **Prep pipelining (one file ahead).** Relaxes PR3.5: the file-level queue keeps exactly
+  one file in the upload/commit half (`activeBlockUpload`) but lets **one** next file get
+  ahead through hashing/checking (`preparingBlockUpload` → `preparedBlockUpload`), so the
+  next file's expensive prep overlaps the active file's network upload. The orchestrator
+  exposes two hooks: it calls `onReadyForUpload({missingCount,totalCount})` after the check
+  and then `await waitForUploadSlot(...)` before any block upload / commit, so the component
+  grants the upload turn to exactly one file at a time (`createBlockUploadTurnWaiter`,
+  granted by `grantPreparedBlockUpload` / `maybeGrantPreparedBlockUpload`). A prepared file
+  takes the turn the moment the active file hits `saving` (commit-phase handoff). Aborts on
+  a preparing/prepared file reject the turn waiter and self-release in the job `finally`.
+- Tests: `block-upload-throughput-regression.test.js` (Blob streamed, cooldown gates the
+  ramp); `block-upload-limiter.test.js` (`DROP_MIN_SAMPLES=2`, gain/floor/min-bitrate/
+  cooldown ramp); `block-upload-orchestrator.test.js` ("upload slot handoff" ready→wait→
+  upload→commit ordering, skip-uploading on full dedup, `noteRetry` per attempt);
+  `file-uploader.test.js` (one-file-ahead prep, slot handoff at `saving`, fresh-window feed).
+
 ## Known issues / deferred debts (tracked — gated by the flag being OFF in prod)
 
 None of these block merging the branch: the flow ships **disabled** in every prod
@@ -859,8 +931,10 @@ flag were on*.
    labels (`Hashing… / Checking… / Uploading… X% / Saving…`), commit-phase pipelining
    (the next file uploads while the previous commits), and dedup observability
    (`N M deduplicated`). Real block-upload throughput already replaced the legacy
-   `0.00 B/s`. **Remaining:** fuller integration with the global progress aggregator and
-   any further polish before flag-on.
+   `0.00 B/s`. **Done (PR8):** throughput parity with resumable.js (Blob streaming +
+   resumable-mirror adaptive policy) and prep pipelining (the next file hashes/checks
+   while the active one uploads). **Remaining:** fuller integration with the global
+   progress aggregator and any further polish before flag-on.
 7. **[Resolved] Concurrent-loser `409 "commit still in progress"` retry.** The LWT
    guarantees a single winner; losing/retried commits poll only ~10s for the
    winner's `ResultFilename`, after which the server returns
