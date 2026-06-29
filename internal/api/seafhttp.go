@@ -2794,10 +2794,49 @@ func (h *SeafHTTPHandler) createPendingSeafHTTPFileFSObject(orgID, repoID, attem
 		}
 		return fmt.Errorf("failed to create pending fs_object owner: %w", err)
 	}
+	// Canonical layout: block_ids holds the internal SHA-256 ids, seafile_block_ids_sha1
+	// the external SHA-1 ids the desktop client needs (and which derive fs_id). Resolve
+	// the POSITIONAL SHA-1 list (externalBlockIDs) to SHA-256 — not stagedBlockIDs, which
+	// is deduped for references and would drop repeated blocks / reorder the file. The
+	// SHA-1->SHA-256 mappings were written from real bytes during block upload.
+	internalBlockIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, externalBlockIDs)
+	if err != nil {
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, attemptID, fsID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return errors.Join(fmt.Errorf("failed to resolve block ids for fs_object: %w", err), cleanupErr)
+		}
+		return fmt.Errorf("failed to resolve block ids for fs_object: %w", err)
+	}
+	if len(internalBlockIDs) != len(externalBlockIDs) {
+		err := fmt.Errorf("resolved block id list length mismatch: internal=%d external=%d", len(internalBlockIDs), len(externalBlockIDs))
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, attemptID, fsID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return errors.Join(err, cleanupErr)
+		}
+		return err
+	}
+	for i := range internalBlockIDs {
+		if !isHexN(internalBlockIDs[i], 64) {
+			err := fmt.Errorf("resolved internal block id %d is not SHA-256", i)
+			cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, attemptID, fsID, stagedBlockIDs)
+			if cleanupErr != nil {
+				return errors.Join(err, cleanupErr)
+			}
+			return err
+		}
+		if !isHexN(externalBlockIDs[i], 40) {
+			err := fmt.Errorf("external block id %d is not SHA-1", i)
+			cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, attemptID, fsID, stagedBlockIDs)
+			if cleanupErr != nil {
+				return errors.Join(err, cleanupErr)
+			}
+			return err
+		}
+	}
 	if err := h.db.Session().Query(`
-		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, repoID, fsID, "file", filename, fullPath, fileSize, createdAt.Unix(), externalBlockIDs).Exec(); err != nil {
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids, seafile_block_ids_sha1)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, repoID, fsID, "file", filename, fullPath, fileSize, createdAt.Unix(), internalBlockIDs, externalBlockIDs).Exec(); err != nil {
 		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, attemptID, fsID, stagedBlockIDs)
 		if cleanupErr != nil {
 			return errors.Join(fmt.Errorf("failed to create file fs_object: %w", err), cleanupErr)

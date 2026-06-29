@@ -2444,18 +2444,48 @@ func TestSeafileServeBlockIDs(t *testing.T) {
 	sha1IDs := []string{strings.Repeat("c", 40), strings.Repeat("d", 40)}
 
 	t.Run("prefers the SHA-1 column when present (post-PR4 layout)", func(t *testing.T) {
-		got := seafileServeBlockIDs(sha256IDs, sha1IDs)
-		if len(got) != 2 || got[0] != sha1IDs[0] || got[1] != sha1IDs[1] {
-			t.Fatalf("got %v, want the SHA-1 list %v", got, sha1IDs)
+		got, ok := seafileServeBlockIDs(sha256IDs, sha1IDs)
+		if !ok || len(got) != 2 || got[0] != sha1IDs[0] || got[1] != sha1IDs[1] {
+			t.Fatalf("got %v ok=%v, want the SHA-1 list %v", got, ok, sha1IDs)
 		}
 	})
 
 	t.Run("falls back to block_ids when the SHA-1 column is empty", func(t *testing.T) {
-		if got := seafileServeBlockIDs(sha1IDs, nil); len(got) != 2 || got[0] != sha1IDs[0] {
-			t.Fatalf("got %v, want fallback to block_ids %v", got, sha1IDs)
+		if got, ok := seafileServeBlockIDs(sha1IDs, nil); !ok || len(got) != 2 || got[0] != sha1IDs[0] {
+			t.Fatalf("got %v ok=%v, want fallback to block_ids %v", got, ok, sha1IDs)
 		}
-		if got := seafileServeBlockIDs(sha1IDs, []string{}); len(got) != 2 || got[0] != sha1IDs[0] {
-			t.Fatalf("empty (non-nil) SHA-1 list must also fall back, got %v", got)
+		if got, ok := seafileServeBlockIDs(sha1IDs, []string{}); !ok || len(got) != 2 || got[0] != sha1IDs[0] {
+			t.Fatalf("empty (non-nil) SHA-1 list must also fall back, got %v ok=%v", got, ok)
+		}
+	})
+
+	t.Run("empty file (no blocks) is safe", func(t *testing.T) {
+		if got, ok := seafileServeBlockIDs(nil, nil); !ok || len(got) != 0 {
+			t.Fatalf("got %v ok=%v, want empty+ok", got, ok)
+		}
+	})
+
+	t.Run("fails closed on SHA-256 block_ids without the SHA-1 column", func(t *testing.T) {
+		if got, ok := seafileServeBlockIDs(sha256IDs, nil); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false (fail closed)", got, ok)
+		}
+	})
+
+	t.Run("fails closed on mismatched SHA-1 column length", func(t *testing.T) {
+		if got, ok := seafileServeBlockIDs(sha256IDs, sha1IDs[:1]); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false on length mismatch", got, ok)
+		}
+		if got, ok := seafileServeBlockIDs(nil, sha1IDs[:1]); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false when SHA-1 column is non-empty but block_ids is empty", got, ok)
+		}
+	})
+
+	t.Run("fails closed on invalid SHA-1 column content", func(t *testing.T) {
+		if got, ok := seafileServeBlockIDs(sha256IDs[:1], []string{"not-a-sha1"}); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false on invalid SHA-1", got, ok)
+		}
+		if got, ok := seafileServeBlockIDs(sha256IDs[:1], []string{sha256IDs[0]}); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false on SHA-256 leaked into SHA-1 column", got, ok)
 		}
 	})
 }

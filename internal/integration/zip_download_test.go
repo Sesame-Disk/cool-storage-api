@@ -117,7 +117,7 @@ func TestRegionPinnedZipDownload(t *testing.T) {
 	}
 }
 
-func TestZipDownloadFailsBeforeHeadersWhenMappingIsMissing(t *testing.T) {
+func TestZipDownloadFailsBeforeHeadersWhenLegacyMappingIsMissing(t *testing.T) {
 	requireCassandra(t)
 
 	const requestHost = "eu.sesamefs.local"
@@ -184,14 +184,27 @@ func TestZipDownloadFailsBeforeHeadersWhenMappingIsMissing(t *testing.T) {
 	}
 
 	var blockIDs []string
-	if err := session.Query(`SELECT block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fileFSID).Scan(&blockIDs); err != nil {
+	var seafileBlockIDs []string
+	if err := session.Query(`SELECT block_ids, seafile_block_ids_sha1 FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fileFSID).Scan(&blockIDs, &seafileBlockIDs); err != nil {
 		t.Fatalf("failed to read block ids for %s: %v", fileFSID, err)
 	}
 	if len(blockIDs) == 0 {
 		t.Fatalf("expected block ids for uploaded file %q", fileName)
 	}
+	if len(seafileBlockIDs) == 0 {
+		t.Fatalf("expected seafile block ids for uploaded file %q", fileName)
+	}
 
-	brokenMapping := blockIDs[0]
+	// Post-flip canonical rows keep ZIP downloads off the SHA-1 mapping path.
+	// Force a legacy SHA-1-only row so the preflight still exercises the strict
+	// "fail before headers when resolution is broken" contract.
+	if err := session.Query(`
+		UPDATE fs_objects SET block_ids = ?, seafile_block_ids_sha1 = ? WHERE library_id = ? AND fs_id = ?
+	`, seafileBlockIDs, []string{}, repoID, fileFSID).Exec(); err != nil {
+		t.Fatalf("failed to force legacy block id layout for %s: %v", fileFSID, err)
+	}
+
+	brokenMapping := seafileBlockIDs[0]
 	if err := session.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, brokenMapping).Exec(); err != nil {
 		t.Fatalf("failed to delete block mapping %s: %v", brokenMapping, err)
 	}

@@ -1703,3 +1703,66 @@ func splitPathParts(p string) []string {
 	}
 	return result
 }
+
+func TestSeafileFSObjectBlockIDs(t *testing.T) {
+	sha256IDs := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+	sha1IDs := []string{strings.Repeat("c", 40), strings.Repeat("d", 40)}
+
+	t.Run("prefers validated SHA-1 column when present", func(t *testing.T) {
+		got, ok := seafileFSObjectBlockIDs(sha256IDs, sha1IDs)
+		if !ok || len(got) != 2 || got[0] != sha1IDs[0] || got[1] != sha1IDs[1] {
+			t.Fatalf("got %v ok=%v, want %v", got, ok, sha1IDs)
+		}
+	})
+
+	t.Run("falls back to legacy SHA-1 block_ids", func(t *testing.T) {
+		got, ok := seafileFSObjectBlockIDs(sha1IDs, nil)
+		if !ok || len(got) != 2 || got[0] != sha1IDs[0] || got[1] != sha1IDs[1] {
+			t.Fatalf("got %v ok=%v, want fallback %v", got, ok, sha1IDs)
+		}
+	})
+
+	t.Run("fails closed on length mismatch or invalid SHA-1 content", func(t *testing.T) {
+		if got, ok := seafileFSObjectBlockIDs(sha256IDs, sha1IDs[:1]); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false on length mismatch", got, ok)
+		}
+		if got, ok := seafileFSObjectBlockIDs(nil, sha1IDs[:1]); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false when SHA-1 column is non-empty but block_ids is empty", got, ok)
+		}
+		if got, ok := seafileFSObjectBlockIDs(sha256IDs[:1], []string{"not-a-sha1"}); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false on invalid SHA-1", got, ok)
+		}
+		if got, ok := seafileFSObjectBlockIDs(sha256IDs[:1], []string{sha256IDs[0]}); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false on SHA-256 in SHA-1 column", got, ok)
+		}
+	})
+}
+
+func TestValidateCanonicalFSObjectBlockIDs(t *testing.T) {
+	validInternal := []string{strings.Repeat("a", 64)}
+	validSeafile := []string{strings.Repeat("b", 40)}
+
+	if err := validateCanonicalFSObjectBlockIDs(validInternal, validSeafile); err != nil {
+		t.Fatalf("validateCanonicalFSObjectBlockIDs(valid) error = %v, want nil", err)
+	}
+	if err := validateCanonicalFSObjectBlockIDs(nil, nil); err != nil {
+		t.Fatalf("validateCanonicalFSObjectBlockIDs(empty) error = %v, want nil", err)
+	}
+
+	tests := []struct {
+		name     string
+		internal []string
+		seafile  []string
+	}{
+		{name: "length mismatch", internal: []string{strings.Repeat("a", 64)}, seafile: nil},
+		{name: "invalid internal", internal: []string{"bad"}, seafile: validSeafile},
+		{name: "invalid seafile", internal: validInternal, seafile: []string{"bad"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateCanonicalFSObjectBlockIDs(tt.internal, tt.seafile); err == nil {
+				t.Fatal("validateCanonicalFSObjectBlockIDs() error = nil, want non-nil")
+			}
+		})
+	}
+}
