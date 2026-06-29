@@ -1404,20 +1404,55 @@ func (h *FSHelper) createPendingPublishedFileRow(repoID string, pending *pending
 // cycle). See docs/SHA256-CANONICAL-BLOCK-IDS.md.
 func seafileFSObjectBlockIDs(blockIDs, seafileSHA1 []string) ([]string, bool) {
 	if len(seafileSHA1) > 0 {
+		if len(blockIDs) > 0 && len(seafileSHA1) != len(blockIDs) {
+			return nil, false
+		}
+		for _, id := range seafileSHA1 {
+			if !isHexN(id, 40) {
+				return nil, false
+			}
+		}
 		return seafileSHA1, true
 	}
 	for _, id := range blockIDs {
-		if len(strings.TrimSpace(id)) != 40 {
+		if !isHexN(id, 40) {
 			return nil, false
 		}
 	}
 	return blockIDs, true
 }
 
+func isHexN(s string, n int) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != n {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+func validateCanonicalFSObjectBlockIDs(internalBlockIDs, seafileBlockIDsSHA1 []string) error {
+	if len(internalBlockIDs) != len(seafileBlockIDsSHA1) {
+		return fmt.Errorf("block id list length mismatch: internal=%d seafile=%d", len(internalBlockIDs), len(seafileBlockIDsSHA1))
+	}
+	for i := range internalBlockIDs {
+		if !isHexN(internalBlockIDs[i], 64) {
+			return fmt.Errorf("internal block id %d is not SHA-256", i)
+		}
+		if !isHexN(seafileBlockIDsSHA1[i], 40) {
+			return fmt.Errorf("seafile block id %d is not SHA-1", i)
+		}
+	}
+	return nil
+}
+
 // createFileFSObjectRow writes a file fs_object row in the SHA-256-canonical layout:
 // block_ids holds the internal SHA-256 storage ids and seafile_block_ids_sha1 holds
 // the external SHA-1 ids the desktop/mobile client needs (and which derive fs_id).
 func (h *FSHelper) createFileFSObjectRow(repoID, fsID, name string, size int64, internalBlockIDs, seafileBlockIDsSHA1 []string) error {
+	if err := validateCanonicalFSObjectBlockIDs(internalBlockIDs, seafileBlockIDsSHA1); err != nil {
+		return fmt.Errorf("invalid canonical fs_object block ids: %w", err)
+	}
 	err := h.db.Session().Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, block_ids, seafile_block_ids_sha1, size_bytes, mtime)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)

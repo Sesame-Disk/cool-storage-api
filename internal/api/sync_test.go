@@ -2470,4 +2470,19 @@ func TestSeafileServeBlockIDs(t *testing.T) {
 			t.Fatalf("got %v ok=%v, want nil+false (fail closed)", got, ok)
 		}
 	})
+
+	t.Run("fails closed on mismatched SHA-1 column length", func(t *testing.T) {
+		if got, ok := seafileServeBlockIDs(sha256IDs, sha1IDs[:1]); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false on length mismatch", got, ok)
+		}
+	})
+
+	t.Run("fails closed on invalid SHA-1 column content", func(t *testing.T) {
+		if got, ok := seafileServeBlockIDs(sha256IDs[:1], []string{"not-a-sha1"}); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false on invalid SHA-1", got, ok)
+		}
+		if got, ok := seafileServeBlockIDs(sha256IDs[:1], []string{sha256IDs[0]}); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false on SHA-256 leaked into SHA-1 column", got, ok)
+		}
+	})
 }

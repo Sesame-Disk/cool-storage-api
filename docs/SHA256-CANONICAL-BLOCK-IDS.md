@@ -71,7 +71,12 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
   - **DONE — blocker #5 (fail-closed guard):** the boundary helpers now return `(list, ok)` and
     refuse a 64-hex `block_ids` with an empty SHA-1 column; `GetFSObject`, `PackFS`, `CheckFS`
     fs-id recomputation, and copy now all fail closed instead of serving / hashing a non-Seafile
-    block-id list or silently degrading to "missing".
+    block-id list or silently degrading to "missing". The guard also validates that
+    `seafile_block_ids_sha1` stays positional and well-formed when present: same length as
+    `block_ids`, every entry 40-hex SHA-1, never a leaked 64-hex SHA-256.
+  - **DONE — writer invariant hardening:** the canonical writers now fail fast if asked to persist
+    mismatched or malformed block-id lists (`block_ids` must be 64-hex SHA-256,
+    `seafile_block_ids_sha1` must be positional 40-hex SHA-1).
   - **DONE — blocker #6 (post-flip integration tests):** serve returns the SHA-1 list and the
     served JSON re-hashes to the `fs_id`; `PackFS` also serves the SHA-1 list, and the guard
     returns 500 for broken `GetFSObject`, `PackFS`, and `CheckFS` states.

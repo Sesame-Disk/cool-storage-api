@@ -1315,14 +1315,31 @@ func (h *SyncHandler) collectStoredFSIDsWithFilter(repoID, storedFSID string, di
 // than silently corrupt. See docs/SHA256-CANONICAL-BLOCK-IDS.md.
 func seafileServeBlockIDs(blockIDs, seafileSHA1 []string) ([]string, bool) {
 	if len(seafileSHA1) > 0 {
+		if len(blockIDs) > 0 && len(seafileSHA1) != len(blockIDs) {
+			return nil, false
+		}
+		for _, id := range seafileSHA1 {
+			if !isHexN(id, 40) {
+				return nil, false
+			}
+		}
 		return seafileSHA1, true
 	}
 	for _, id := range blockIDs {
-		if len(strings.TrimSpace(id)) != 40 {
+		if !isHexN(id, 40) {
 			return nil, false
 		}
 	}
 	return blockIDs, true
+}
+
+func isHexN(s string, n int) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != n {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 // GetFSObject retrieves a filesystem object
