@@ -27,13 +27,6 @@ const (
 
 const blockVerifyConcurrency = 20
 
-// getBlockIDMappingFn resolves one external SHA-1 to its internal SHA-256 forward
-// mapping. Injected as a package var so resolveManifestForwardMappings can be unit
-// tested (forward missing / mismatch / match) without a live Cassandra.
-var getBlockIDMappingFn = func(database *db.DB, orgID, externalID string) (string, bool, error) {
-	return database.GetBlockIDMapping(orgID, externalID)
-}
-
 const (
 	blockUploadCommitInProgressCode               = "commit_in_progress"
 	blockUploadCommittedDifferentFileConflictCode = "session_committed_different_file"
@@ -78,19 +71,14 @@ func (h *FileHandler) waitForBlockUploadResult(sessionID, digest string) (string
 // The total-size cap scales with the configured block size (see validateManifest).
 const maxBlocksPerManifest = 131072
 
-// fileFromBlocksBlock is one ordered entry of the commit manifest. It carries
-// BOTH content hashes of the same 8 MB block:
-//   - SHA256: the internal/storage identity (S3 key, blocks row, refs, GC, dedup).
-//   - SHA1:   the EXTERNAL Seafile block ID written into the file fs_object so the
-//     desktop/mobile sync client (which requires 40-hex SHA-1 block IDs) can parse
-//     and download the file. UploadBlock writes the verified SHA-1->SHA-256
-//     mapping, and the commit validates that forward mapping before using the
-//     manifest SHA-1 in the fs_object.
-//
-// Both hashes derive from the same bytes, so for any honest client a given SHA256
-// always pairs with the same SHA1 (enforced in validateManifest).
+// fileFromBlocksBlock is one ordered entry of the commit manifest. The client now
+// sends ONLY the SHA-256 (the internal/storage identity: S3 key, blocks row, refs,
+// GC, dedup) and the block size. The external Seafile block ID (SHA-1) is no longer
+// client-asserted: the server already computed it from the real bytes at UploadBlock
+// time and stored it in blocks.sha1, so the commit derives the SHA-1 server-side
+// (see ProbeBlockReuse.Sha1) — never trusting a client hash, never minting one. A
+// legacy `sha1` field in the JSON is simply ignored.
 type fileFromBlocksBlock struct {
-	SHA1   string `json:"sha1"`
 	SHA256 string `json:"sha256"`
 	Size   int64  `json:"size"`
 }
@@ -113,12 +101,10 @@ func (r *fileFromBlocksRequest) manifestDigest() string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s\n%s\n%t\n%d\n", r.ParentDir, r.Filename, r.Replace, r.Size)
 	for _, b := range r.Blocks {
-		// SHA-1 is part of the committed file's logical identity: the fs_object
-		// stores SHA-1 block IDs, so its id derives from them. Including SHA-1 here
-		// makes a replay with the same SHA-256s but a different SHA-1 a "different
-		// file" (409) instead of a silent mismatch between the returned id and the
-		// persisted object.
-		fmt.Fprintf(h, "%s:%s:%d\n", b.SHA1, b.SHA256, b.Size)
+		// The digest is over the true content identity (ordered SHA-256s + sizes).
+		// The fs_object's SHA-1 block ids are derived deterministically from these
+		// SHA-256s server-side, so they add nothing to the logical identity.
+		fmt.Fprintf(h, "%s:%d\n", b.SHA256, b.Size)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -171,28 +157,10 @@ func validateManifest(req *fileFromBlocksRequest, blockSize int64) error {
 	// cannot survive the later last-wins dedup in sizeByHash and corrupt the
 	// committed file's size/offsets.
 	sizeSeen := make(map[string]int64, len(req.Blocks))
-	// SHA-1 is the external Seafile block ID; SHA-256 is the storage identity.
-	// Both derive from the same bytes, so the pairing must be 1:1 across the whole
-	// manifest. A manifest that maps one SHA-256 to two SHA-1s (or vice versa) is a
-	// lie that would corrupt the SHA-1→SHA-256 mapping the desktop download relies
-	// on, so it is rejected here before any mapping row is written.
-	sha1BySha256 := make(map[string]string, len(req.Blocks))
-	sha256BySha1 := make(map[string]string, len(req.Blocks))
 	for i, b := range req.Blocks {
 		if !isHex64(b.SHA256) {
 			return fmt.Errorf("block %d: invalid sha256", i)
 		}
-		if !isHex40(b.SHA1) {
-			return fmt.Errorf("block %d: invalid sha1", i)
-		}
-		if prev, ok := sha1BySha256[b.SHA256]; ok && prev != b.SHA1 {
-			return fmt.Errorf("block %d: sha256 %s mapped to conflicting sha1 (%s and %s)", i, b.SHA256, prev, b.SHA1)
-		}
-		if prev, ok := sha256BySha1[b.SHA1]; ok && prev != b.SHA256 {
-			return fmt.Errorf("block %d: sha1 %s mapped to conflicting sha256 (%s and %s)", i, b.SHA1, prev, b.SHA256)
-		}
-		sha1BySha256[b.SHA256] = b.SHA1
-		sha256BySha1[b.SHA1] = b.SHA256
 		if prev, ok := sizeSeen[b.SHA256]; ok && prev != b.Size {
 			return fmt.Errorf("block %d: sha256 %s declared with conflicting sizes (%d and %d)", i, b.SHA256, prev, b.Size)
 		}
@@ -290,12 +258,12 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 			return
 		}
 		if session.ResultFilename != "" {
-			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, session.ResultFilename))
+			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, session.ResultFilename, h.resolveSeafileBlockIDsForResponse(orgID, req.Blocks)))
 			return
 		}
 		// Claimed but finalize not finished yet (concurrent commit in flight).
 		if name, ok := h.waitForBlockUploadResult(session.SessionID, digest); ok {
-			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, name))
+			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, name, h.resolveSeafileBlockIDsForResponse(orgID, req.Blocks)))
 			return
 		}
 		c.JSON(http.StatusConflict, gin.H{
@@ -330,16 +298,11 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	}
 	uniqueHashes := make([]string, 0, len(req.Blocks))
 	sizeByHash := make(map[string]int64, len(req.Blocks))
-	// sha1ByHash is the client's CLAIMED SHA-1 per block. It is only cross-checked
-	// against the server-verified mapping below (never trusted to write one), so a
-	// forged manifest SHA-1 is rejected rather than persisted.
-	sha1ByHash := make(map[string]string, len(req.Blocks))
 	for _, b := range req.Blocks {
 		if _, ok := sizeByHash[b.SHA256]; !ok {
 			uniqueHashes = append(uniqueHashes, b.SHA256)
 		}
 		sizeByHash[b.SHA256] = b.Size
-		sha1ByHash[b.SHA256] = b.SHA1
 	}
 	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, blockVerifyConcurrency)
 	if err != nil {
@@ -350,7 +313,10 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// R1/R8/R11: per block, never trust S3 existence alone — checked in parallel
 	// (bounded concurrency) since a large manifest is thousands of blocks.
 	referrer := db.BlockReferrerForUpload(session.SessionID)
-	statuses, err := h.verifyManifestBlocks(c.Request.Context(), orgID, referrer, uniqueHashes, sizeByHash, existsMap)
+	// sha1ByHash256 is the SERVER-derived external SHA-1 per block, read from
+	// blocks.sha1 (which UploadBlock wrote from the block's real bytes) via
+	// ProbeBlockReuse. The client no longer sends a SHA-1: the server owns it.
+	statuses, sha1ByHash256, err := h.verifyManifestBlocks(c.Request.Context(), orgID, referrer, uniqueHashes, sizeByHash, existsMap)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify blocks"})
 		return
@@ -377,39 +343,18 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		}
 	}
 
-	// Validate the manifest's SHA-1 against the FORWARD mapping (sha1 -> sha256)
-	// that UploadBlock wrote from the block's REAL bytes. The forward table is the
-	// authoritative, client-visible row (download resolution uses it too); the
-	// reverse table is only a GC/repair projection and is NOT used here because its
-	// schema allows several SHA-1 aliases per SHA-256 and a reverse row can lag a
-	// forward one. The server never trusts the client's SHA-1 blindly, but it also
-	// never invents one: a client SHA-1 is accepted only if the forward mapping
-	// proves it resolves to the declared SHA-256.
-	//
-	// The lookups run in bounded parallel (like the block-presence/liveness checks
-	// above), since a large manifest is thousands of blocks; the decisions below are
-	// then applied in manifest order so the needs_upload list and the first 400 are
-	// deterministic.
-	//   - forward missing        -> needs_upload (re-upload writes the verified row)
-	//   - forward != declared    -> 400 (SHA-1 does not belong to this content)
-	//   - forward == declared    -> accept the manifest SHA-1 for the fs_object
-	forwardMappings, err := h.resolveManifestForwardMappings(c.Request.Context(), orgID, uniqueHashes, sha1ByHash, statuses)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block id mapping"})
-		return
-	}
+	// Fail-closed validation of the SERVER-derived SHA-1 (blocks.sha1). For a block
+	// to be committed, the server must hold a well-formed 40-hex SHA-1 for it; that
+	// SHA-1 was written from the block's real bytes at UploadBlock time. A ready
+	// block whose blocks.sha1 is missing or malformed is treated as needs_upload —
+	// the re-upload recomputes and rewrites a verified SHA-1 — so a half-written or
+	// pre-PR2 block can never put an unvalidated id into an fs_object.
 	for _, sha256ID := range uniqueHashes {
 		if statuses[sha256ID] != blockStatusReady {
 			continue
 		}
-		internal, found := forwardMappings[sha256ID]
-		if !found {
+		if !isHex40(sha1ByHash256[sha256ID]) {
 			addNeedsUpload(sha256ID)
-			continue
-		}
-		if internal != sha256ID {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "manifest sha1 does not match the block content", "sha256": sha256ID})
-			return
 		}
 	}
 
@@ -422,12 +367,11 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	}
 
 	// externalBlockIDs is the ordered SHA-1 list written into the file fs_object so
-	// the desktop/mobile Seafile client can parse and download the file. The
-	// manifest SHA-1 is safe to use here: the forward-mapping check above proved
-	// each one resolves to its declared SHA-256.
+	// the desktop/mobile Seafile client can parse and download the file. Each SHA-1
+	// is server-derived from blocks.sha1 and validated 40-hex above.
 	externalBlockIDs := make([]string, len(req.Blocks))
 	for i, b := range req.Blocks {
-		externalBlockIDs[i] = b.SHA1
+		externalBlockIDs[i] = sha1ByHash256[b.SHA256]
 	}
 
 	// R7 concurrency: atomically claim the session for this commit. Exactly one
@@ -444,13 +388,13 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		// result if the manifest matches; otherwise it's a different file.
 		resultName, ok := h.waitForBlockUploadResult(session.SessionID, digest)
 		if ok {
-			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, resultName))
+			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, resultName, h.resolveSeafileBlockIDsForResponse(orgID, req.Blocks)))
 			return
 		}
 		current, found, readErr := h.db.GetBlockUploadSession(session.SessionID)
 		if readErr == nil {
 			if resultName, code, message := classifyBlockUploadCommitConflict(current, found, digest); resultName != "" {
-				c.JSON(http.StatusOK, fileFromBlocksResponse(&req, resultName))
+				c.JSON(http.StatusOK, fileFromBlocksResponse(&req, resultName, h.resolveSeafileBlockIDsForResponse(orgID, req.Blocks)))
 				return
 			} else {
 				c.JSON(http.StatusConflict, gin.H{
@@ -524,20 +468,36 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		log.Printf("[CreateFileFromBlocks] WARNING: file committed but failed to update storage counters: %v", err)
 	}
 
-	c.JSON(http.StatusOK, fileFromBlocksResponse(&req, actualFilename))
+	c.JSON(http.StatusOK, fileFromBlocksResponse(&req, actualFilename, externalBlockIDs))
+}
+
+// resolveSeafileBlockIDsForResponse reads the server-derived external SHA-1 of each
+// manifest block (blocks.sha1, via ProbeBlockReuse) in manifest order, so the
+// idempotent-replay / lost-race responses can derive the same fs_id the committed
+// file has. Best-effort: a per-block read failure leaves that entry empty (the id
+// is a derived echo, not load-bearing for storage). Deduped per SHA-256.
+func (h *FileHandler) resolveSeafileBlockIDsForResponse(orgID string, blocks []fileFromBlocksBlock) []string {
+	cache := make(map[string]string, len(blocks))
+	out := make([]string, len(blocks))
+	for i, b := range blocks {
+		sha1, ok := cache[b.SHA256]
+		if !ok {
+			if probe, err := h.db.ProbeBlockReuse(orgID, b.SHA256); err == nil {
+				sha1 = strings.TrimSpace(probe.Sha1)
+			}
+			cache[b.SHA256] = sha1
+		}
+		out[i] = sha1
+	}
+	return out
 }
 
 // fileFromBlocksResponse mirrors the Seafile-compatible upload response shape.
-// The file id is the deterministic content-addressed fs_object id derived from
-// the manifest (block_ids + size), so it is recomputable on idempotent replay.
-// The fs_object stores the SHA-1 (external) block IDs, so the id MUST be derived
-// from those to match the persisted fs_id.
-func fileFromBlocksResponse(req *fileFromBlocksRequest, actualFilename string) []gin.H {
-	blockIDs := make([]string, len(req.Blocks))
-	for i, b := range req.Blocks {
-		blockIDs[i] = b.SHA1
-	}
-	fileID, err := buildFileFSObjectID(blockIDs, req.Size)
+// The file id is the deterministic content-addressed fs_object id derived from the
+// SHA-1 (external) block IDs the fs_object stores, so it MUST be built from those
+// (server-derived) SHA-1s to match the persisted fs_id.
+func fileFromBlocksResponse(req *fileFromBlocksRequest, actualFilename string, seafileBlockIDs []string) []gin.H {
+	fileID, err := buildFileFSObjectID(seafileBlockIDs, req.Size)
 	if err != nil {
 		// The file is already committed; the response id is derived, not load-bearing
 		// for storage. Log so a (rare) marshaling/input failure is debuggable instead
@@ -555,8 +515,9 @@ func fileFromBlocksResponse(req *fileFromBlocksRequest, actualFilename string) [
 // readiness with bounded concurrency (a large manifest is thousands of blocks,
 // so a sequential probe-per-block would be thousands of serial round-trips).
 // Returns a hard error only on infrastructure failure (caller should 500).
-func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer string, uniqueHashes []string, sizeByHash map[string]int64, existsMap map[string]bool) (map[string]int, error) {
+func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer string, uniqueHashes []string, sizeByHash map[string]int64, existsMap map[string]bool) (map[string]int, map[string]string, error) {
 	result := make(map[string]int, len(uniqueHashes))
+	sha1ByHash := make(map[string]string, len(uniqueHashes))
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
 	sem := make(chan struct{}, blockVerifyConcurrency)
@@ -569,96 +530,53 @@ func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer 
 				return gctx.Err()
 			}
 			defer func() { <-sem }()
-			status, err := h.classifyBlockForCommit(orgID, referrer, hash, sizeByHash[hash], existsMap[hash])
+			status, sha1, err := h.classifyBlockForCommit(orgID, referrer, hash, sizeByHash[hash], existsMap[hash])
 			if err != nil {
 				return err
 			}
 			mu.Lock()
 			result[hash] = status
+			sha1ByHash[hash] = sha1
 			mu.Unlock()
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return result, nil
-}
-
-// resolveManifestForwardMappings looks up, in bounded parallel, the FORWARD
-// SHA-1 -> SHA-256 mapping row for each ready block's claimed SHA-1. Only blocks
-// whose status is blockStatusReady are queried (a needs_upload block is re-uploaded
-// regardless, which rewrites the verified mapping). The returned map is keyed by
-// SHA-256; a key being ABSENT means "no forward mapping row" (caller treats it as
-// needs_upload), while a present value is the internal SHA-256 the SHA-1 resolves
-// to (caller compares it against the declared SHA-256). Concurrency matches the
-// block-presence checks so a multi-thousand-block manifest does not serialize a
-// point read per block.
-func (h *FileHandler) resolveManifestForwardMappings(ctx context.Context, orgID string, uniqueHashes []string, sha1ByHash map[string]string, statuses map[string]int) (map[string]string, error) {
-	result := make(map[string]string, len(uniqueHashes))
-	var mu sync.Mutex
-	g, gctx := errgroup.WithContext(ctx)
-	sem := make(chan struct{}, blockVerifyConcurrency)
-	for _, sha256ID := range uniqueHashes {
-		if statuses[sha256ID] != blockStatusReady {
-			continue
-		}
-		sha256ID := sha256ID
-		g.Go(func() error {
-			select {
-			case sem <- struct{}{}:
-			case <-gctx.Done():
-				return gctx.Err()
-			}
-			defer func() { <-sem }()
-			internal, found, err := getBlockIDMappingFn(h.db, orgID, sha1ByHash[sha256ID])
-			if err != nil {
-				return err
-			}
-			if !found {
-				return nil
-			}
-			mu.Lock()
-			result[sha256ID] = internal
-			mu.Unlock()
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return result, sha1ByHash, nil
 }
 
 // classifyBlockForCommit decides whether one block is commit-ready (R1/R8/R11):
 // live (ProbeBlockReuse == Reusable), physically present, at the declared size,
 // and owned by this session OR kept alive by a committed file ("fs:") reference.
-func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, declaredSize int64, exists bool) (int, error) {
+func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, declaredSize int64, exists bool) (int, string, error) {
 	probe, err := h.db.ProbeBlockReuse(orgID, hash)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
+	sha1 := strings.TrimSpace(probe.Sha1)
 	if probe.Decision != db.BlockReuseReusable || !exists {
-		return blockStatusNeedsUpload, nil
+		return blockStatusNeedsUpload, sha1, nil
 	}
 	if int64(probe.SizeBytes) != declaredSize {
-		return blockStatusSizeMismatch, nil
+		return blockStatusSizeMismatch, sha1, nil
 	}
 	owned, err := h.db.BlockHasReferrer(orgID, hash, referrer)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if owned {
-		return blockStatusReady, nil
+		return blockStatusReady, sha1, nil
 	}
 	permanent, err := blockHasPermanentReference(h.db, orgID, hash)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if permanent {
-		return blockStatusReady, nil
+		return blockStatusReady, sha1, nil
 	}
-	return blockStatusNeedsUpload, nil
+	return blockStatusNeedsUpload, sha1, nil
 }
 
 // blockHasPermanentReference reports whether a block is kept alive by a DURABLE
