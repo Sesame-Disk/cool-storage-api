@@ -48,13 +48,28 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     `CreateFile` computes the template's SHA-1, uses it as the external (Seafile) block id, and
     writes the SHA-1→SHA-256 mapping + `blocks.sha1` via `RegisterUploadedBlockAndMapping`. Still
     pre-flip (block_ids = SHA-1), consistent with the other v2 writers.
-  - **Pending — the writer flip.** Because PR3 made all readers tolerant (64-hex passthrough +
-    `seafile…` fallback), writers can be flipped **one at a time**, each commit safe with mixed
-    old/new rows. Per-writer queue: (a) v2 publish path `createFileFSObjectRow` + copy; (b)
-    `finalizeStoredUploadMetadata`; (c) `CreateFileFromBlocks`; (d) `createPendingSeafHTTPFileFSObject`;
-    (e) `RecvFS`. Each: write `block_ids` = SHA-256 + `seafile_block_ids_sha1` = SHA-1, keep
-    `fs_id` SHA-1-derived; the copy path must read `seafile_block_ids_sha1` (else it would hash a
-    SHA-256 list into the copied `fs_id`).
+  - **DONE — writer flip.** Because PR3 made all readers tolerant (64-hex passthrough +
+    `seafile…` fallback), writers were flipped incrementally, each commit safe with mixed
+    old/new rows. Production file-fs_object writers and their status:
+    - **v2 publish path — flipped.** `createFileFSObjectRow` writes `block_ids` = SHA-256 +
+      `seafile_block_ids_sha1` = SHA-1; covers direct upload (`finalizeStoredUploadMetadata`),
+      web commit (`CreateFileFromBlocks`), `CreateFile`, OnlyOffice and copy (all reach it via
+      `stagePendingPublishedFiles` → `createPendingPublishedFileRow`). `copyFSObjectToLibraryForPublish`
+      reads `seafile_block_ids_sha1` so the copied `fs_id` stays SHA-1-derived (helper
+      `seafileFSObjectBlockIDs`).
+    - **seafhttp — flipped.** `createPendingSeafHTTPFileFSObject` resolves the POSITIONAL SHA-1
+      list to SHA-256 via `streaming.BatchResolveBlockIDs` (not `stagedBlockIDs`, which is deduped
+      for refs) and writes both columns. Mappings exist by commit time (blocks uploaded first).
+    - **RecvFS — intentionally NOT flipped.** Desktop sync can send recv-fs *before* put-block
+      (`TestSyncRecvFSBeforePutBlockPublishesDownloadableFile`), so the SHA-1→SHA-256 mapping may
+      not exist yet and a strict resolve would fail. Desktop-sync files therefore keep
+      `block_ids` = SHA-1 (empty `seafile_block_ids_sha1`) — the legacy layout readers already
+      tolerate (serve falls back to `block_ids`; web download resolves via the forward mapping).
+      Not a blocker-#5 violation (that is SHA-256 `block_ids` + empty SHA-1 column).
+  - `fs_id` stays SHA-1-derived everywhere (unchanged). All dir-object writers are untouched
+    (no `block_ids`).
+  - **Pending in PR4:** blocker #5 (fail-closed guard against serving a 64-hex id to the client)
+    and blocker #6 (post-flip integration test).
 - `PR5`–`PR7` — pending.
 
 ## Notes / Debt
