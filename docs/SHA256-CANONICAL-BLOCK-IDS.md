@@ -1,11 +1,34 @@
 # SHA-256 canonical block IDs (and removing SHA-1 from the web client)
 
 **Date:** 2026-06-29
-**Status:** Design + PR breakdown. Not yet implemented.
+**Status:** Design + PR breakdown. PR1 and PR2 are implemented in the workspace and pending
+review/commit; PR3+ remain pending.
 **Supersedes:** the out-of-tree `implementation_plan.md` draft (backend/read-side only),
 which is removed in favour of this document.
 **Related:** [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md) (R10 dual-hash, the current state
 this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
+
+## Progress
+
+- `PR1` — implemented in workspace: additive migration `005_sha256_canonical_block_ids.cql`,
+  `internal/models` fields for `seafile_block_ids_sha1` / `blocks.sha1`, and regression coverage
+  for the new migration + JSON shape. No behavior has been flipped yet.
+- `PR2` — implemented in workspace: `blocks.sha1` is now written from verified bytes on the web
+  block-upload materialization path and the legacy seafhttp upload/finalize path, and
+  `ProbeBlockReuse` now reads/exposes `sha1` for later commit-time use.
+- `PR3`–`PR7` — pending.
+
+## Notes / Debt
+
+- The current additive/no-backfill approach still assumes the current pre-deploy / empty-DB
+  rollout. If this branch were ever applied to a non-empty environment, older `blocks` rows would
+  retain empty `sha1` until a dedicated backfill or rewrite path is added.
+- **TODO (before PR4/PR5):** the template-block path in `CreateFile`
+  ([files.go:1355](../internal/api/v2/files.go#L1355)) currently registers its block with an
+  empty `sha1` (the SHA-1 is not threaded there yet). That is harmless while nothing reads
+  `blocks.sha1`, but once PR4/PR5 derive `seafile_block_ids_sha1` / the `fs_id` from
+  `blocks.sha1`, this path must supply the block's SHA-1 (or compute it locally) or
+  template-created files would get an empty Seafile block id and break desktop `fs_id` matching.
 
 ---
 

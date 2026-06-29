@@ -93,8 +93,8 @@ var registerUploadedBlockReleaseClaimFn = func(h *FSHelper, orgID, blockID, clai
 	return h.db.ReleaseBlockDeleteClaim(orgID, blockID, claimID)
 }
 
-var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-	return h.db.UpsertBlockMetadata(orgID, blockID, sizeBytes, storageClass, storageKey)
+var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
+	return h.db.UpsertBlockMetadataWithSHA1(orgID, blockID, sha1ID, sizeBytes, storageClass, storageKey)
 }
 
 var registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
@@ -1008,7 +1008,7 @@ func (h *FSHelper) releaseStaleUploadedBlockDeleteClaim(orgID, blockID string) (
 	return released, nil
 }
 
-func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey string) error {
+func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
 	referrer := db.BlockReferrerForUpload(operationID)
 	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
 
@@ -1032,7 +1032,7 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 			return fmt.Errorf("read block delete fence for %s: %w", blockID, err)
 		}
 		if !deleteFenceActive {
-			if err := registerUploadedBlockUpsertMetadataFn(h, orgID, blockID, sizeBytes, storageClass, storageKey); err != nil {
+			if err := registerUploadedBlockUpsertMetadataFn(h, orgID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
 				return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
 			}
 			return nil

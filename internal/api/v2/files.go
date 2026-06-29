@@ -1352,7 +1352,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			}, func() error {
 				// Keep the freshly stored template block alive and respect the GC
 				// delete fence until publish-attempt refs take over below.
-				if err := fsHelper.RegisterUploadedBlock(orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateStorageClass, ""); err != nil {
+				if err := fsHelper.RegisterUploadedBlock(orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateStorageClass, "", ""); err != nil {
 					return fmt.Errorf("failed to register template block metadata: %w", err)
 				}
 				templateBlockPinned = true

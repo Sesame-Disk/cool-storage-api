@@ -205,10 +205,10 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 		t.Fatal("stale claim release should not run for a normal retrying fence")
 		return false, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		calls = append(calls, "upsert")
-		if sizeBytes != 123 || storageClass != "hot" || storageKey != "key-1" {
-			t.Fatalf("upsert args = %d/%s/%s, want 123/hot/key-1", sizeBytes, storageClass, storageKey)
+		if sizeBytes != 123 || storageClass != "hot" || storageKey != "key-1" || sha1ID != "sha1-1" {
+			t.Fatalf("upsert args = %d/%s/%s/%s, want 123/hot/key-1/sha1-1", sizeBytes, storageClass, storageKey, sha1ID)
 		}
 		return nil
 	}
@@ -235,7 +235,7 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 		calls = append(calls, fmt.Sprintf("sleep-%s", delay))
 	}
 
-	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1")
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
 	if err != nil {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
 	}
@@ -295,8 +295,11 @@ func TestRegisterUploadedBlock_ReleasesStaleDeleteClaimWithEmptyStorageClass(t *
 		}
 		return true, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		calls = append(calls, "upsert")
+		if sha1ID != "sha1-1" {
+			t.Fatalf("sha1ID = %q, want sha1-1", sha1ID)
+		}
 		return nil
 	}
 	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
@@ -315,7 +318,7 @@ func TestRegisterUploadedBlock_ReleasesStaleDeleteClaimWithEmptyStorageClass(t *
 		t.Fatalf("sleep should not run when stale claim release succeeds, got %s", delay)
 	}
 
-	if err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1"); err != nil {
+	if err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1"); err != nil {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
 	}
 	want := []string{"add", "expiry", "fence-1", "claim-info", "release-claim", "fence-2", "upsert"}
@@ -348,7 +351,7 @@ func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
 		return false, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		return nil
 	}
 
@@ -362,7 +365,7 @@ func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	}
 
 	before := time.Now().UTC()
-	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1")
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
 	after := time.Now().UTC()
 	if err != nil {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
@@ -403,7 +406,7 @@ func TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails(t *testing.T) {
 		t.Fatal("fence check should not run when expiry tracking fails")
 		return false, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		t.Fatal("metadata upsert should not run when expiry tracking fails")
 		return nil
 	}
@@ -420,7 +423,7 @@ func TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails(t *testing.T) {
 		calls = append(calls, "enqueue")
 	}
 
-	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1")
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
 	if !errors.Is(err, expiryErr) {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want wrapped %v", err, expiryErr)
 	}
@@ -465,7 +468,7 @@ func TestRegisterUploadedBlock_ReenqueuesZeroRefWhenFenceNeverClears(t *testing.
 		calls = append(calls, "fence")
 		return true, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		t.Fatal("upsert should not run while the delete fence remains active")
 		return nil
 	}
@@ -497,7 +500,7 @@ func TestRegisterUploadedBlock_ReenqueuesZeroRefWhenFenceNeverClears(t *testing.
 		}
 	}
 
-	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "")
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "", "")
 	if !errors.Is(err, ErrBlockDeleteInProgress) {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want ErrBlockDeleteInProgress", err)
 	}

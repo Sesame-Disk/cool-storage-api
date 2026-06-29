@@ -11,8 +11,8 @@ import (
 )
 
 var rollbackUploadedBlockRefsFn = RollbackUploadedBlockRefs
-var registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey string) error {
-	return NewFSHelper(database).RegisterUploadedBlock(orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey)
+var registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
+	return NewFSHelper(database).RegisterUploadedBlock(orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, sha1ID)
 }
 var writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, externalBlockID, internalBlockID string) error {
 	if database == nil {
@@ -63,7 +63,7 @@ func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID, operationID strin
 // provisional reference is rolled back so retries can restart from a clean
 // state instead of leaving a registered block without a usable mapping.
 func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
-	if err := registerUploadedBlockForMaterializationFn(database, orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey); err != nil {
+	if err := registerUploadedBlockForMaterializationFn(database, orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, externalBlockID); err != nil {
 		return err
 	}
 	if strings.TrimSpace(externalBlockID) == "" {
@@ -88,7 +88,7 @@ func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlo
 // A db.ErrBlockIDMappingConflict is returned unwrapped (so callers can errors.Is
 // it into a 409); any other mapping failure is wrapped as ErrBlockMappingWriteFailed.
 func RegisterWebUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
-	if err := registerUploadedBlockForMaterializationFn(database, orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey); err != nil {
+	if err := registerUploadedBlockForMaterializationFn(database, orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, externalBlockID); err != nil {
 		return err
 	}
 	if strings.TrimSpace(externalBlockID) == "" {
