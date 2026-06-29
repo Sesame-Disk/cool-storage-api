@@ -17,13 +17,13 @@
 //     cooldown after a degrade.
 //   - `noteFailure` / `noteRetry` drop to MIN_CONCURRENCY with a 10 s cooldown.
 //   - `noteSuccess` is intentionally absent: block completions alone do not justify
-//     more concurrency — only sustained throughput does.
+//     more concurrency -- only sustained throughput does.
 
 const MIN_CONCURRENCY = 1;
-const DROP_RATIO = 0.55;           // bitrate < smoothed × 0.55 → degrade
+const DROP_RATIO = 0.55;           // bitrate < smoothed x 0.55 -> degrade
 const SMOOTHING_FACTOR = 0.7;      // EMA weight on previous smoothed bitrate
-const STABLE_FLOOR_RATIO = 0.7;    // bitrate < smoothed × 0.7 → reset stable samples
-const FIRST_RAMP_SAMPLES = 3;      // stable samples needed for 1→2 ramp
+const STABLE_FLOOR_RATIO = 0.7;    // bitrate < smoothed x 0.7 -> reset stable samples
+const FIRST_RAMP_SAMPLES = 3;      // stable samples needed for 1->2 ramp
 const NEXT_RAMP_SAMPLES = 5;       // stable samples needed for each subsequent ramp
 const GAIN_RATIO = 1.05;           // minimum throughput gain to justify >2 slots
 const COOLDOWN_MS = 10000;         // cooldown after a degrade
@@ -134,7 +134,6 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
   // does NOT abort in-flight uploads (we cannot un-send a block); it just stops NEW
   // acquires until inFlight falls below the new ceiling. Raising it pumps waiters.
   const setEffective = (n) => {
-    const was = effective;
     effective = Math.max(MIN_CONCURRENCY, Math.min(max, Math.floor(Number(n) || 1)));
     pump();
   };
@@ -193,7 +192,7 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
 
     // Cooldown gate: after a failure/retry/degrade, wait out the penalty window
     // before ramping. Stable samples still accumulate so the ramp fires
-    // immediately once the cooldown expires — same as resumable.
+    // immediately once the cooldown expires -- same as resumable.
     if (Date.now() < cooldownUntil) {
       return;
     }
@@ -220,14 +219,14 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
       return;
     }
 
-    // All checks passed — ramp up.
+    // All checks passed -- ramp up.
     stableSamples = 0;
     lastRampBitrate = smoothedBitrate;
     setEffective(nextSlotCount);
   };
 
   // A real block-upload failure/retry (stall, timeout, transport error) is a strong
-  // signal — drop straight to MIN_CONCURRENCY with cooldown.
+  // signal -- drop straight to MIN_CONCURRENCY with cooldown.
   const noteFailure = () => degradeToOne();
   const noteRetry = () => degradeToOne();
 

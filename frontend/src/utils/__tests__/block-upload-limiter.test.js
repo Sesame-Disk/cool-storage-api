@@ -114,7 +114,7 @@ describe('createBlockLimiter adaptive ramp', () => {
     const limiter = createBlockLimiter({ maxConcurrency: 3, blockSize: 1 });
     expect(limiter.getEffective()).toBe(1);
 
-    // 3 stable samples → one ramp step (1→2).
+    // 3 stable samples -> one ramp step (1->2).
     limiter.noteBitrate(1000000);
     limiter.noteBitrate(1000000);
     expect(limiter.getEffective()).toBe(1);
@@ -127,7 +127,7 @@ describe('createBlockLimiter adaptive ramp', () => {
     limiter.noteBitrate(2000000); // stableSamples=2
     limiter.noteBitrate(2000000); // stableSamples=3
     limiter.noteBitrate(2000000); // stableSamples=4
-    limiter.noteBitrate(2000000); // stableSamples=5 → ramp to 3
+    limiter.noteBitrate(2000000); // stableSamples=5 -> ramp to 3
     expect(limiter.getEffective()).toBe(3);
 
     // Extra healthy samples must NOT push effective past max (3).
@@ -157,19 +157,19 @@ describe('createBlockLimiter adaptive ramp', () => {
     limiter.noteBitrate(1000000);
     limiter.noteBitrate(1000000);
     // STABLE_FLOOR_RATIO = 0.7: bitrate between 55% and 70% of smoothed is
-    // "unstable" — resets stableSamples but does NOT degrade.
+    // "unstable" -- resets stableSamples but does NOT degrade.
     limiter.noteBitrate(1000000 * 0.6);
     expect(limiter.getEffective()).toBe(1);
 
     // Must re-accumulate samples from 0 after instability.
     limiter.noteBitrate(1000000);
     limiter.noteBitrate(1000000);
-    limiter.noteBitrate(1000000); // 3rd stable sample → ramp
+    limiter.noteBitrate(1000000); // 3rd stable sample -> ramp
     expect(limiter.getEffective()).toBe(2);
   });
 
   test('minimum bitrate gate blocks ramp when throughput is too low', () => {
-    // Default blockSize = 8 MB → minBitrate for 2 slots ≈ 11.2 Mbps.
+    // Default blockSize = 8 MB -> minBitrate for 2 slots ~= 11.2 Mbps.
     // With a 1 Mbps sample, the ramp must be blocked.
     const limiter = createBlockLimiter({ maxConcurrency: 3 });
     limiter.noteBitrate(1000000); // seed (1 Mbps)
@@ -180,10 +180,10 @@ describe('createBlockLimiter adaptive ramp', () => {
 
   test('gain check blocks ramp to 3 without throughput improvement', () => {
     const limiter = createBlockLimiter({ maxConcurrency: 3, blockSize: 1 });
-    rampTo(limiter, 2); // effective=2, lastRampBitrate ≈ 1 Mbps
+    rampTo(limiter, 2); // effective=2, lastRampBitrate ~= 1 Mbps
     expect(limiter.getEffective()).toBe(2);
 
-    // 5 stable samples at the same bitrate → gain check blocks: smoothed 1 Mbps
+    // 5 stable samples at the same bitrate -> gain check blocks: smoothed 1 Mbps
     // < lastRampBitrate (1 Mbps) * 1.05 = 1.05 Mbps
     limiter.noteBitrate(1000000);
     limiter.noteBitrate(1000000);
@@ -195,14 +195,14 @@ describe('createBlockLimiter adaptive ramp', () => {
 
   test('gain check passes when throughput improves >5%', () => {
     const limiter = createBlockLimiter({ maxConcurrency: 3, blockSize: 1 });
-    rampTo(limiter, 2); // effective=2, lastRampBitrate ≈ 1 Mbps
+    rampTo(limiter, 2); // effective=2, lastRampBitrate ~= 1 Mbps
 
-    // 5 stable samples at >5% higher bitrate → gain check passes.
+    // 5 stable samples at >5% higher bitrate -> gain check passes.
     limiter.noteBitrate(1100000); // 10% above lastRampBitrate
     limiter.noteBitrate(1100000);
     limiter.noteBitrate(1100000);
     limiter.noteBitrate(1100000);
-    limiter.noteBitrate(1100000); // 5th → ramp
+    limiter.noteBitrate(1100000); // 5th -> ramp
     expect(limiter.getEffective()).toBe(3);
   });
 
@@ -217,7 +217,7 @@ describe('createBlockLimiter adaptive ramp', () => {
     // Re-seed smoothedBitrate so we can test that degrade fires unconditionally.
     limiter.noteBitrate(1000000);
 
-    // A sharp drop below DROP_RATIO — cooldown does NOT prevent the degrade.
+    // A sharp drop below DROP_RATIO -- cooldown does NOT prevent the degrade.
     limiter.noteBitrate(1);
     expect(limiter.getEffective()).toBe(1); // still 1 (was already 1 after failure)
 

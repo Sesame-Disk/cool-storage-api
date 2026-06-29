@@ -508,7 +508,7 @@ describe('global concurrency limiter (shared across files)', () => {
     await uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 3 });
 
     // The failed first attempt backs off the retry path (resumable parity), but the
-    // recovering retry means it is NOT a hard failure → noteFailure must NOT fire.
+    // recovering retry means it is NOT a hard failure -> noteFailure must NOT fire.
     expect(limiter.noteRetry).toHaveBeenCalledTimes(1);
     expect(limiter.noteFailure).not.toHaveBeenCalled();
     expect(attempt).toBe(2);

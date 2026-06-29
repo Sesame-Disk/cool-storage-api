@@ -19,8 +19,8 @@ jest.mock('../../../utils/constants', () => ({ enableBlockUpload: true, blockUpl
 
 // A File stand-in whose slice() returns a streamable Blob-like object. We tag it
 // so the test can tell whether the orchestrator streamed the Blob straight to the
-// transport (good — what resumable does) or eagerly read it into a JS ArrayBuffer
-// (bad — a second full read of the file + heap materialisation per block).
+// transport (good -- what resumable does) or eagerly read it into a JS ArrayBuffer
+// (bad -- a second full read of the file + heap materialisation per block).
 function makeStreamableFile(size, name = 'big.bin') {
   return {
     name,
@@ -39,7 +39,7 @@ function makeStreamableFile(size, name = 'big.bin') {
 }
 
 describe('block bytes are streamed, not eagerly read into the JS heap', () => {
-  // resumable.js hands the Blob slice straight to XHR, which streams it disk→socket
+  // resumable.js hands the Blob slice straight to XHR, which streams it disk->socket
   // with no JS-side copy and a single read. The block flow instead does
   // `file.slice(...).arrayBuffer()` in getBlockData, fully materialising every 8 MB
   // block in the JS heap AND re-reading the file a second time (the worker already
@@ -72,17 +72,17 @@ describe('block bytes are streamed, not eagerly read into the JS heap', () => {
 
 describe('cooldown after a failure gates the RAMP (resumable parity)', () => {
   // The reference engine (upload-finalization.js:updateAdaptiveUploadConcurrency)
-  // returns early — NO ramp — while `now < state.cooldownUntil`, and degrades
+  // returns early -- NO ramp -- while `now < state.cooldownUntil`, and degrades
   // UNCONDITIONALLY on a bitrate collapse. The block limiter mirrors this: a link
   // that JUST failed must back off for the 10 s penalty window instead of being
-  // slammed back to full concurrency within ~1–2 s (which thrashes a flaky link).
+  // slammed back to full concurrency within ~1-2 s (which thrashes a flaky link).
   test('healthy samples do NOT ramp back up during the post-failure cooldown', () => {
     jest.useFakeTimers();
     try {
       jest.setSystemTime(0);
       const limiter = createBlockLimiter({ maxConcurrency: 3, blockSize: 1 });
 
-      // Climb to 2, then take a real transport failure → drop to 1 + 10 s cooldown.
+      // Climb to 2, then take a real transport failure -> drop to 1 + 10 s cooldown.
       for (let i = 0; i < 10 && limiter.getEffective() < 2; i += 1) {
         limiter.noteBitrate(1000000);
       }
