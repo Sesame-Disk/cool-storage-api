@@ -487,7 +487,7 @@ describe('FileUploader block upload integration', () => {
     expect(uploader.state.uploadBitrate).toBe(5000);
   });
 
-  test('feeds the block limiter aggregate bitrate only when the value changes (not stale repeats)', () => {
+  test('feeds the block limiter only on fresh sampler windows, even if the bitrate value repeats', () => {
     jest.useFakeTimers();
     try {
       jest.setSystemTime(1000);
@@ -506,19 +506,28 @@ describe('FileUploader block upload integration', () => {
       };
       uploader.state.uploadFileList = [entry];
 
-      // First tick feeds the initial aggregate (even if 0, the limiter ignores 0).
+      // First tick only seeds the sampler; there is no fresh bitrate sample yet.
+      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
+
+      // Rapid ticks inside the same 500 ms window reuse the stale reading and must
+      // NOT count as extra healthy samples.
+      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
+
+      // Once the window elapses, a fresh sample is fed.
+      jest.setSystemTime(1600);
       uploader.updateBlockUploadTransferredBytes(entry, 1024);
       expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(1);
-      expect(typeof uploader.blockLimiter.noteBitrate.mock.calls[0][0]).toBe('number');
+      const repeatedBitrate = uploader.blockLimiter.noteBitrate.mock.calls[0][0];
+      expect(typeof repeatedBitrate).toBe('number');
 
-      // Subsequent ticks with the same (stale) aggregate value are skipped.
-      uploader.updateBlockUploadTransferredBytes(entry, 1024);
-      expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(1); // unchanged
-
-      // After the 500 ms sampling window elapses, a new sample feeds again.
-      jest.setSystemTime(2000);
-      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      // Another fresh window with the SAME bitrate value must still feed again:
+      // same value, new sample.
+      jest.setSystemTime(2200);
+      uploader.updateBlockUploadTransferredBytes(entry, 2048);
       expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(2);
+      expect(uploader.blockLimiter.noteBitrate.mock.calls[1][0]).toBe(repeatedBitrate);
     } finally {
       jest.useRealTimers();
     }

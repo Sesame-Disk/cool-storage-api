@@ -340,14 +340,19 @@ async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockD
         const tWait = performance.now() - t2;
         try {
           return await uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
+        } catch (err) {
+          // Match resumable parity: every real transport retry backs the adaptive
+          // limiter off immediately, even if a later attempt succeeds.
+          if (limiter.noteRetry && !isAbortError(err) && !(signal && signal.aborted)) {
+            limiter.noteRetry();
+          }
+          throw err;
         } finally {
           release();
         }
       }, retries, { signal });
     } catch (err) {
-      // Only signal a degraded link when ALL retries have been exhausted. A single
-      // transient failure that recovers on retry must NOT count as a link problem.
-      // A user abort is NOT a link problem either.
+      // A final failure still counts as a hard degrade after the per-retry backoffs.
       if (limiter && limiter.noteFailure && !isAbortError(err) && !(signal && signal.aborted)) {
         limiter.noteFailure();
       }

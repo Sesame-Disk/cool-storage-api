@@ -410,7 +410,7 @@ describe('global concurrency limiter (shared across files)', () => {
     expect(limiter.getInFlight()).toBe(0);
   });
 
-  test('a transient block failure that recovers on retry does NOT call noteFailure', async () => {
+  test('a transient block failure that recovers on retry calls noteRetry but not noteFailure', async () => {
     let attempt = 0;
     const api = {
       createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
@@ -425,14 +425,17 @@ describe('global concurrency limiter (shared across files)', () => {
       createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
     };
     const limiter = {
-      acquire: jest.fn().mockResolvedValue(() => {}),
+      acquire: jest.fn().mockResolvedValue(() => { }),
+      noteRetry: jest.fn(),
       noteFailure: jest.fn(),
       getMaxConcurrency: () => 1,
     };
 
     await uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 3 });
 
-    // The first attempt failed but the retry succeeded → noteFailure must NOT fire.
+    // The failed first attempt backs off the retry path (resumable parity), but the
+    // recovering retry means it is NOT a hard failure → noteFailure must NOT fire.
+    expect(limiter.noteRetry).toHaveBeenCalledTimes(1);
     expect(limiter.noteFailure).not.toHaveBeenCalled();
     expect(attempt).toBe(2);
   });
@@ -449,7 +452,8 @@ describe('global concurrency limiter (shared across files)', () => {
       createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
     };
     const limiter = {
-      acquire: jest.fn().mockResolvedValue(() => {}),
+      acquire: jest.fn().mockResolvedValue(() => { }),
+      noteRetry: jest.fn(),
       noteFailure: jest.fn(),
       getMaxConcurrency: () => 1,
     };
@@ -458,9 +462,10 @@ describe('global concurrency limiter (shared across files)', () => {
       uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 3 }),
     ).rejects.toThrow('network');
 
-    // noteFailure fired once AFTER all 3 retries were exhausted.
+    // Every failed attempt backs off the retry path; the final exhaustion also
+    // marks a hard failure once.
+    expect(limiter.noteRetry).toHaveBeenCalledTimes(3);
     expect(limiter.noteFailure).toHaveBeenCalledTimes(1);
     expect(attempt).toBe(3);
   });
 });
-

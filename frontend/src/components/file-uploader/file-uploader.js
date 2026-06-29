@@ -66,7 +66,6 @@ class FileUploader extends React.Component {
     // held for a prompt), so the second drop is caught immediately. Released when the
     // file reaches a non-saved terminal state (cancelled / dialog closed); on SUCCESS the
     // key moves to completedUploadNameKeys instead (see below).
-    this._lastFedBlockBitrate = -1;
     this.activeUploadNameKeys = new Set();
 
     // Synchronous record of destinations already UPLOADED in this session. On success a
@@ -572,17 +571,15 @@ class FileUploader extends React.Component {
       return;
     }
     entry._uploadedNetworkBytes = (Number(entry._uploadedNetworkBytes) || 0) + deltaBytes;
-    // sampleBlockUploadBitrate updates entry._bitrate (throttled to ~500 ms for a
-    // stable dialog reading). Feed the adaptive limiter only when the aggregate
-    // bitrate actually changes — otherwise a stale value repeated at every progress
-    // tick (~50 ms) inflates stableSamples and can trigger premature degrades.
+    // sampleBlockUploadBitrate is throttled to one fresh reading per
+    // BLOCK_BITRATE_SAMPLE_MS. Feed the adaptive limiter only when a NEW sample was
+    // produced -- not on every progress tick -- so steady links still contribute one
+    // healthy sample per window even when the measured bitrate repeats exactly.
+    const bitrateTsBefore = entry._bitrateTs;
     sampleBlockUploadBitrate(entry, entry._uploadedNetworkBytes);
-    if (this.blockLimiter) {
-      const bps = aggregateBlockUploadBitrate(this.state.uploadFileList);
-      if (bps !== this._lastFedBlockBitrate) {
-        this._lastFedBlockBitrate = bps;
-        this.blockLimiter.noteBitrate(bps);
-      }
+    const freshBitrateSample = typeof bitrateTsBefore === 'number' && entry._bitrateTs !== bitrateTsBefore;
+    if (freshBitrateSample && this.blockLimiter) {
+      this.blockLimiter.noteBitrate(aggregateBlockUploadBitrate(this.state.uploadFileList));
     }
     this.setState(prev => {
       const uploadFileList = prev.uploadFileList.map(item => (
