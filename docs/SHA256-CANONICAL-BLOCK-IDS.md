@@ -16,7 +16,19 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
 - `PR2` — implemented in workspace: `blocks.sha1` is now written from verified bytes on the web
   block-upload materialization path and the legacy seafhttp upload/finalize path, and
   `ProbeBlockReuse` now reads/exposes `sha1` for later commit-time use.
-- `PR3`–`PR7` — pending.
+- `PR3` — in progress (branch `feat/sha256-canonical-block-ids-pr3`):
+  - The read hot path was **already tolerant**: `BatchResolveBlockIDs` / `resolveBlockIDs`
+    already pass 64-hex (SHA-256) IDs through untouched and only resolve 40-hex
+    ([streaming.go:48,88](../internal/streaming/streaming.go#L48)), so download / zip / file view
+    / share-link become O(0) automatically once PR4 stores SHA-256 in `block_ids`. No change
+    needed there.
+  - Implemented the **Seafile serve** path: `GetFSObject` and `PackFS` now serialize
+    `seafile_block_ids_sha1` (falling back to `block_ids` when empty) via the shared
+    `seafileServeBlockIDs` helper. No-op until PR4 (the column is empty, so it falls back to the
+    still-SHA-1 `block_ids`), correct afterwards. Unit test `TestSeafileServeBlockIDs`.
+  - **Still pending in PR3** — the sync **reference-accounting / fs_id-recompute** readers, which
+    need a hash-space trace first (see open question below).
+- `PR4`–`PR7` — pending.
 
 ## Notes / Debt
 
@@ -200,13 +212,24 @@ Each PR must leave `go test` / Jest + lint + build green, keep the web block-upl
 - `BatchResolveBlockIDs` already pass-throughs 64-hex SHA-256 IDs today; keep that behavior as
   the compatibility base for mixed old/new rows. No new behavior is needed there beyond
   preserving the "resolve only 40-hex" contract.
-- Seafile serve (`GetFSObject`, `PackFS`): serialize `seafile_block_ids_sha1` as the JSON
-  `block_ids`; fall back to `block_ids` when the new column is empty.
+- **DONE** — Seafile serve (`GetFSObject`, `PackFS`): serialize `seafile_block_ids_sha1` as the
+  JSON `block_ids`, falling back to `block_ids` when the column is empty, via the shared
+  `seafileServeBlockIDs` helper ([sync.go](../internal/api/sync.go)). Unit test
+  `TestSeafileServeBlockIDs`.
 - `CheckFS` / `buildFSIDMapping` / corrected-fs-id computation: when re-serializing a file
   fs_object to compute a Seafile-compatible `fs_id`, use `seafile_block_ids_sha1`; fall back to
   `block_ids` when the new column is empty. They must never hash the internal SHA-256 block-id
   list.
-- GC reads the list directly when it is SHA-256.
+- **PENDING — needs a hash-space trace first.** The sync reference-accounting readers
+  `collectSyncReachableFiles` / `loadSyncFileBlockIDs` → `buildSyncCommitBlockDelta` →
+  `block_references` ([sync.go:2561,2620](../internal/api/sync.go#L2561)).
+  **Open question — is the sync block-reference model keyed by SHA-1 or SHA-256?**
+  `block_references` is documented SHA-256-keyed, but RecvFS currently stores SHA-1 in `block_ids`.
+  Confirm whether these readers feed `block_references` in SHA-256 space (→ use `block_ids`, which
+  becomes SHA-256 in PR4) or in the client's SHA-1 space (→ use `seafile_block_ids_sha1`). Getting
+  it wrong corrupts live-sync reference counting / GC. Resolve before PR4.
+- GC reads the list directly when it is SHA-256 (the resolver passthrough already covers the
+  transition).
 - With writers still emitting SHA-1, everything falls back to the old behavior → no observable
   change.
 

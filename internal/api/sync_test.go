@@ -2438,3 +2438,24 @@ func TestSyncFinalizedDeltaSet(t *testing.T) {
 		}
 	})
 }
+
+func TestSeafileServeBlockIDs(t *testing.T) {
+	sha256IDs := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+	sha1IDs := []string{strings.Repeat("c", 40), strings.Repeat("d", 40)}
+
+	t.Run("prefers the SHA-1 column when present (post-PR4 layout)", func(t *testing.T) {
+		got := seafileServeBlockIDs(sha256IDs, sha1IDs)
+		if len(got) != 2 || got[0] != sha1IDs[0] || got[1] != sha1IDs[1] {
+			t.Fatalf("got %v, want the SHA-1 list %v", got, sha1IDs)
+		}
+	})
+
+	t.Run("falls back to block_ids when the SHA-1 column is empty", func(t *testing.T) {
+		if got := seafileServeBlockIDs(sha1IDs, nil); len(got) != 2 || got[0] != sha1IDs[0] {
+			t.Fatalf("got %v, want fallback to block_ids %v", got, sha1IDs)
+		}
+		if got := seafileServeBlockIDs(sha1IDs, []string{}); len(got) != 2 || got[0] != sha1IDs[0] {
+			t.Fatalf("empty (non-nil) SHA-1 list must also fall back, got %v", got)
+		}
+	})
+}

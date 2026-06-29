@@ -1357,6 +1357,22 @@ func (h *SyncHandler) collectCorrectedObjectsWithFilter(repoID, storedFSID strin
 	}
 }
 
+// seafileServeBlockIDs returns the SHA-1 block-id list to serialize into a
+// Seafile file fs_object served to the desktop/mobile client. The client
+// requests an fs_object by its fs_id (= SHA-1 of the object JSON) and verifies
+// that the JSON it receives hashes back to that id, so the serialized block_ids
+// MUST be the SHA-1 list. After the SHA-256 canonicalization, that list lives in
+// fs_objects.seafile_block_ids_sha1 while fs_objects.block_ids holds the internal
+// SHA-256 ids. Falls back to block_ids when the SHA-1 column is empty (rows
+// written before the PR4 writer flip), which is still SHA-1 then — so this is a
+// no-op until PR4 and correct afterwards. See docs/SHA256-CANONICAL-BLOCK-IDS.md.
+func seafileServeBlockIDs(blockIDs, seafileSHA1 []string) []string {
+	if len(seafileSHA1) > 0 {
+		return seafileSHA1
+	}
+	return blockIDs
+}
+
 // GetFSObject retrieves a filesystem object
 // GET /seafhttp/repo/:repo_id/fs/:fs_id
 // Returns zlib-compressed JSON in Seafile format:
@@ -1377,11 +1393,12 @@ func (h *SyncHandler) GetFSObject(c *gin.Context) {
 	var mtime int64
 	var entriesJSON string
 	var blockIDs []string
+	var seafileBlockIDs []string
 
 	err := h.db.Session().Query(`
-		SELECT obj_type, obj_name, size_bytes, mtime, dir_entries, block_ids
+		SELECT obj_type, obj_name, size_bytes, mtime, dir_entries, block_ids, seafile_block_ids_sha1
 		FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, repoID, fsID).Scan(&fsType, &name, &size, &mtime, &entriesJSON, &blockIDs)
+	`, repoID, fsID).Scan(&fsType, &name, &size, &mtime, &entriesJSON, &blockIDs, &seafileBlockIDs)
 
 	if err != nil {
 		log.Printf("[GetFSObject] fs_object %s not found in repo %s: %v", fsID, repoID, err)
@@ -1410,10 +1427,11 @@ func (h *SyncHandler) GetFSObject(c *gin.Context) {
 		}
 	} else {
 		// File format: {"version": 1, "type": 1, "block_ids": [...], "size": N}
+		// Serve the SHA-1 list (Seafile boundary); see seafileServeBlockIDs.
 		jsonObj = map[string]interface{}{
 			"version":   1,
 			"type":      1, // SEAF_METADATA_TYPE_FILE
-			"block_ids": blockIDs,
+			"block_ids": seafileServeBlockIDs(blockIDs, seafileBlockIDs),
 			"size":      size,
 		}
 	}
@@ -1485,11 +1503,12 @@ func (h *SyncHandler) PackFS(c *gin.Context) {
 		var size int64
 		var entriesJSON string
 		var blockIDs []string
+		var seafileBlockIDs []string
 
 		err := h.db.Session().Query(`
-			SELECT obj_type, size_bytes, dir_entries, block_ids
+			SELECT obj_type, size_bytes, dir_entries, block_ids, seafile_block_ids_sha1
 			FROM fs_objects WHERE library_id = ? AND fs_id = ?
-		`, repoID, requestedFSID).Scan(&fsType, &size, &entriesJSON, &blockIDs)
+		`, repoID, requestedFSID).Scan(&fsType, &size, &entriesJSON, &blockIDs, &seafileBlockIDs)
 
 		if err != nil {
 			log.Printf("pack-fs: object %s not found: %v", requestedFSID, err)
@@ -1516,7 +1535,7 @@ func (h *SyncHandler) PackFS(c *gin.Context) {
 			}
 		} else {
 			jsonObj = map[string]interface{}{
-				"block_ids": blockIDs,
+				"block_ids": seafileServeBlockIDs(blockIDs, seafileBlockIDs),
 				"size":      size,
 				"type":      1,
 				"version":   1,
