@@ -89,14 +89,15 @@ type Commit struct {
 
 // FSObject represents a file system object (file or directory)
 type FSObject struct {
-	LibraryID uuid.UUID  `json:"library_id"`
-	FSID      string     `json:"fs_id"` // SHA-256 of content
-	Type      string     `json:"type"`  // "file" or "dir"
-	Name      string     `json:"name"`
-	Entries   []DirEntry `json:"entries,omitempty"`   // For directories
-	BlockIDs  []string   `json:"block_ids,omitempty"` // For files
-	SizeBytes int64      `json:"size"`
-	MTime     int64      `json:"mtime"` // Unix timestamp
+	LibraryID           uuid.UUID  `json:"library_id"`
+	FSID                string     `json:"fs_id"` // Seafile fs object ID (SHA-1 of object JSON)
+	Type                string     `json:"type"`  // "file" or "dir"
+	Name                string     `json:"name"`
+	Entries             []DirEntry `json:"entries,omitempty"`                // For directories
+	BlockIDs            []string   `json:"block_ids,omitempty"`              // Canonical/internal block IDs
+	SeafileBlockIDsSHA1 []string   `json:"seafile_block_ids_sha1,omitempty"` // Desktop/mobile Seafile compatibility block IDs
+	SizeBytes           int64      `json:"size"`
+	MTime               int64      `json:"mtime"` // Unix timestamp
 }
 
 // DirEntry represents an entry in a directory
@@ -112,6 +113,7 @@ type DirEntry struct {
 type Block struct {
 	OrgID        uuid.UUID `json:"org_id"`
 	BlockID      string    `json:"block_id"` // SHA-256 hash
+	Sha1         string    `json:"sha1,omitempty"`
 	SizeBytes    int       `json:"size"`
 	StorageClass string    `json:"storage_class"`
 	StorageKey   string    `json:"storage_key"` // S3 key or Glacier archive ID

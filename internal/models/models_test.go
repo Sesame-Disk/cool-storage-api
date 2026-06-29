@@ -313,13 +313,14 @@ func TestOrganizationJSONSerialization(t *testing.T) {
 
 func TestFSObjectJSONSerialization(t *testing.T) {
 	obj := FSObject{
-		LibraryID: uuid.New(),
-		FSID:      "abc123def456",
-		Type:      "file",
-		Name:      "test.txt",
-		BlockIDs:  []string{"block1", "block2"},
-		SizeBytes: 2048,
-		MTime:     time.Now().Unix(),
+		LibraryID:           uuid.New(),
+		FSID:                "abc123def456",
+		Type:                "file",
+		Name:                "test.txt",
+		BlockIDs:            []string{"block1", "block2"},
+		SeafileBlockIDsSHA1: []string{"sha1block1", "sha1block2"},
+		SizeBytes:           2048,
+		MTime:               time.Now().Unix(),
 	}
 
 	data, err := json.Marshal(obj)
@@ -338,6 +339,10 @@ func TestFSObjectJSONSerialization(t *testing.T) {
 	if jsonMap["type"] != "file" {
 		t.Errorf("type = %v, want file", jsonMap["type"])
 	}
+	seafileBlockIDs, ok := jsonMap["seafile_block_ids_sha1"].([]interface{})
+	if !ok || len(seafileBlockIDs) != 2 {
+		t.Errorf("seafile_block_ids_sha1 length = %d, want 2", len(seafileBlockIDs))
+	}
 }
 
 func TestBlockJSONSerialization(t *testing.T) {
@@ -345,6 +350,7 @@ func TestBlockJSONSerialization(t *testing.T) {
 	block := Block{
 		OrgID:        uuid.New(),
 		BlockID:      "sha256hash",
+		Sha1:         "sha1hash",
 		SizeBytes:    1024,
 		StorageClass: "hot",
 		StorageKey:   "org123/sha256hash",
@@ -367,5 +373,8 @@ func TestBlockJSONSerialization(t *testing.T) {
 	}
 	if jsonMap["storage_class"] != "hot" {
 		t.Errorf("storage_class = %v, want hot", jsonMap["storage_class"])
+	}
+	if jsonMap["sha1"] != "sha1hash" {
+		t.Errorf("sha1 = %v, want sha1hash", jsonMap["sha1"])
 	}
 }
