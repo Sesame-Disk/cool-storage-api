@@ -2475,6 +2475,9 @@ func TestSeafileServeBlockIDs(t *testing.T) {
 		if got, ok := seafileServeBlockIDs(sha256IDs, sha1IDs[:1]); ok || got != nil {
 			t.Fatalf("got %v ok=%v, want nil+false on length mismatch", got, ok)
 		}
+		if got, ok := seafileServeBlockIDs(nil, sha1IDs[:1]); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false when SHA-1 column is non-empty but block_ids is empty", got, ok)
+		}
 	})
 
 	t.Run("fails closed on invalid SHA-1 column content", func(t *testing.T) {

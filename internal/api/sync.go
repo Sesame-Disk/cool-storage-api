@@ -1315,7 +1315,7 @@ func (h *SyncHandler) collectStoredFSIDsWithFilter(repoID, storedFSID string, di
 // than silently corrupt. See docs/SHA256-CANONICAL-BLOCK-IDS.md.
 func seafileServeBlockIDs(blockIDs, seafileSHA1 []string) ([]string, bool) {
 	if len(seafileSHA1) > 0 {
-		if len(blockIDs) > 0 && len(seafileSHA1) != len(blockIDs) {
+		if len(seafileSHA1) != len(blockIDs) {
 			return nil, false
 		}
 		for _, id := range seafileSHA1 {

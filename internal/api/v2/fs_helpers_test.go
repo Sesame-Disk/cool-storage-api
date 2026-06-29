@@ -1726,6 +1726,9 @@ func TestSeafileFSObjectBlockIDs(t *testing.T) {
 		if got, ok := seafileFSObjectBlockIDs(sha256IDs, sha1IDs[:1]); ok || got != nil {
 			t.Fatalf("got %v ok=%v, want nil+false on length mismatch", got, ok)
 		}
+		if got, ok := seafileFSObjectBlockIDs(nil, sha1IDs[:1]); ok || got != nil {
+			t.Fatalf("got %v ok=%v, want nil+false when SHA-1 column is non-empty but block_ids is empty", got, ok)
+		}
 		if got, ok := seafileFSObjectBlockIDs(sha256IDs[:1], []string{"not-a-sha1"}); ok || got != nil {
 			t.Fatalf("got %v ok=%v, want nil+false on invalid SHA-1", got, ok)
 		}
