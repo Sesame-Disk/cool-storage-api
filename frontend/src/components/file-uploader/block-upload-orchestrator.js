@@ -323,27 +323,37 @@ async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockD
   let cursor = 0;
   let uploadedCount = 0;
 
-  const uploadOne = (hash, index) => withRetry(async () => {
-    throwIfAborted(signal);
-    const data = await getBlockData(index);
-    throwIfAborted(signal);
-    if (!limiter) {
-      return uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
-    }
-    const release = await limiter.acquire({ signal });
+  const uploadOne = async (hash, index) => {
+    const t0 = performance.now();
     try {
-      return await uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
+      return await withRetry(async () => {
+        throwIfAborted(signal);
+        const t1 = performance.now();
+        const data = await getBlockData(index);
+        const tPrep = performance.now() - t1;
+        throwIfAborted(signal);
+        if (!limiter) {
+          return uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
+        }
+        const t2 = performance.now();
+        const release = await limiter.acquire({ signal });
+        const tWait = performance.now() - t2;
+        try {
+          return await uploadBlockWithStallGuard(api, session, hash, data, { signal, stallMs, responseTimeoutMs, onTransferProgress });
+        } finally {
+          release();
+        }
+      }, retries, { signal });
     } catch (err) {
-      // A real upload failure (stall/timeout/transport) signals a degraded link, so
-      // tell the limiter to back off. A user abort is NOT a link problem.
-      if (limiter.noteFailure && !isAbortError(err) && !(signal && signal.aborted)) {
+      // Only signal a degraded link when ALL retries have been exhausted. A single
+      // transient failure that recovers on retry must NOT count as a link problem.
+      // A user abort is NOT a link problem either.
+      if (limiter && limiter.noteFailure && !isAbortError(err) && !(signal && signal.aborted)) {
         limiter.noteFailure();
       }
       throw err;
-    } finally {
-      release();
     }
-  }, retries, { signal });
+  };
 
   const worker = async () => {
     for (;;) {
@@ -479,7 +489,7 @@ export async function uploadFileViaBlocks(file, {
   const getBlockData = (index) => {
     const start = index * blockSize;
     const end = Math.min(start + blockSize, size);
-    return file.slice(start, end).arrayBuffer();
+    return file.slice(start, end);
   };
 
   // 3. Which blocks are missing (de-duplicated hash set). Batched to stay within

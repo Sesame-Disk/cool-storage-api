@@ -7,19 +7,27 @@
 // the TOTAL number of blocks on the wire never exceeds the configured ceiling
 // (`simultaneous_uploads`, sourced from config — never hardcoded here).
 //
-// ADAPTIVE: the live ceiling `effective` starts at 1 and climbs toward `max` while
-// the link stays healthy (sustained throughput), and drops back to 1 when the link
-// degrades (a sustained bitrate collapse, or a block upload failure/retry). This
-// mirrors the legacy resumable adaptive engine's intent — "start at 1 and ramp up to
-// the configured ceiling when the link stays healthy" — for the block flow, fed by
-// `noteBitrate` (aggregate block throughput), `noteFailure`, and `noteRetry`.
+// ADAPTIVE POLICY (mirrors the legacy resumable adaptive engine in
+// upload-finalization.js:updateAdaptiveUploadConcurrency):
+//   - The live ceiling `effective` starts at MIN_CONCURRENCY (1) and climbs toward
+//     `max` while the link stays healthy.
+//   - `noteBitrate` feeds aggregate block throughput samples. It runs the same state
+//     machine as resumable: EMA smoothing, drop detection, stability floor, minimum
+//     bitrate per slot, stable-samples counting, gain check above 2 slots, and
+//     cooldown after a degrade.
+//   - `noteFailure` / `noteRetry` drop to MIN_CONCURRENCY with a 10 s cooldown.
+//   - `noteSuccess` is intentionally absent: block completions alone do not justify
+//     more concurrency — only sustained throughput does.
 
-// Ramp tuning (sample-based so it is deterministic and testable without timers; a
-// "sample" is one noteBitrate call, throttled upstream to ~one per 500 ms):
-const RAMP_MIN_SAMPLES = 3;   // consecutive healthy samples before a +1 ramp-up step
-const DEGRADE_MIN_SAMPLES = 2; // consecutive low samples before dropping to 1
-const DROP_RATIO = 0.6;       // sample < DROP_RATIO × smoothed ⇒ "low" (link degraded)
-const EMA_ALPHA = 0.4;        // smoothing weight for the throughput baseline
+const MIN_CONCURRENCY = 1;
+const DROP_RATIO = 0.55;           // bitrate < smoothed × 0.55 → degrade
+const SMOOTHING_FACTOR = 0.7;      // EMA weight on previous smoothed bitrate
+const STABLE_FLOOR_RATIO = 0.7;    // bitrate < smoothed × 0.7 → reset stable samples
+const FIRST_RAMP_SAMPLES = 3;      // stable samples needed for 1→2 ramp
+const NEXT_RAMP_SAMPLES = 5;       // stable samples needed for each subsequent ramp
+const GAIN_RATIO = 1.05;           // minimum throughput gain to justify >2 slots
+const COOLDOWN_MS = 10000;         // cooldown after a degrade
+const DEFAULT_BLOCK_SIZE = 8 * 1024 * 1024; // must match backend WebUploadBlockSize
 
 function createAbortError() {
   if (typeof DOMException === 'function') {
@@ -30,6 +38,17 @@ function createAbortError() {
   return error;
 }
 
+// minimumBitrateForSlots returns the minimum smoothed bitrate (bits/s) needed to
+// justify running `slotCount` concurrent block uploads. Formula matches resumable's
+// minimumBitrateForSlots: target per-block completion of max(3, 12 / slotCount) s.
+const minimumBitrateForSlots = (blockBits, slotCount) => {
+  if (blockBits <= 0 || slotCount <= MIN_CONCURRENCY) {
+    return 0;
+  }
+  const targetSecondsPerBlock = Math.max(3, 12 / slotCount);
+  return blockBits / targetSecondsPerBlock;
+};
+
 // createBlockLimiter returns a shared async semaphore.
 //   acquire({ signal }) -> Promise<release>
 //     - resolves with an idempotent release() once a slot is free;
@@ -37,18 +56,22 @@ function createAbortError() {
 //     - if it is waiting and `signal` aborts, it is removed from the queue and
 //       rejects (no "ghost" upload that starts after the user cancelled).
 //   release() (the resolved value) frees the slot and hands it to the next waiter.
-export function createBlockLimiter({ maxConcurrency } = {}) {
+export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_SIZE } = {}) {
   const max = Math.max(1, Math.floor(Number(maxConcurrency) || 1));
+  const blockBits = Math.max(0, Math.floor(Number(blockSize) || 0)) * 8;
+
   // effective is the live ceiling acquire() honours. Starts conservative (1) and is
-  // moved by the adaptive ramp between 1 and max.
-  let effective = 1;
+  // moved by the adaptive ramp between MIN_CONCURRENCY and max.
+  let effective = MIN_CONCURRENCY;
   let inFlight = 0;
   const waiters = []; // FIFO: { resolve, reject, signal, onAbort }
 
-  // Adaptive ramp state.
-  let smoothed = 0;        // EMA of healthy throughput samples (bits/s)
-  let healthySamples = 0;  // consecutive healthy samples since the last ramp-up
-  let lowSamples = 0;      // consecutive low samples (toward a degrade)
+  // Adaptive ramp state (mirrors resumable's adaptive state).
+  let stableSamples = 0;
+  let smoothedBitrate = 0;
+  let lastBitrate = 0;
+  let lastRampBitrate = 0;
+  let cooldownUntil = 0;
 
   const detachAbort = (waiter) => {
     if (waiter.signal && waiter.onAbort) {
@@ -105,57 +128,99 @@ export function createBlockLimiter({ maxConcurrency } = {}) {
     });
   };
 
-  // setEffective moves the live ceiling within [1, max]. Lowering it does NOT abort
-  // in-flight uploads (we cannot un-send a block); it just stops NEW acquires until
-  // inFlight falls below the new ceiling. Raising it pumps queued waiters.
+  // setEffective moves the live ceiling within [MIN_CONCURRENCY, max]. Lowering it
+  // does NOT abort in-flight uploads (we cannot un-send a block); it just stops NEW
+  // acquires until inFlight falls below the new ceiling. Raising it pumps waiters.
   const setEffective = (n) => {
-    effective = Math.max(1, Math.min(max, Math.floor(Number(n) || 1)));
+    const was = effective;
+    effective = Math.max(MIN_CONCURRENCY, Math.min(max, Math.floor(Number(n) || 1)));
     pump();
   };
 
-  const degradeToOne = () => {
-    healthySamples = 0;
-    lowSamples = 0;
-    setEffective(1);
+  // degradeToOne drops to MIN_CONCURRENCY with cooldown and resets all adaptive
+  // state. Called on sustained bitrate collapse, failure, or retry.
+  const degradeToOne = (now = Date.now()) => {
+    stableSamples = 0;
+    smoothedBitrate = 0;
+    lastBitrate = 0;
+    lastRampBitrate = 0;
+    cooldownUntil = now + COOLDOWN_MS;
+    setEffective(MIN_CONCURRENCY);
   };
 
-  // noteBitrate feeds one aggregate-throughput sample (bits/s) into the ramp. A run
-  // of healthy samples ramps effective up by one step; a run of low samples (a
-  // sustained collapse vs the smoothed baseline) drops it to 1. Idle/zero samples
-  // (e.g. the pure-hashing phase, before any bytes are on the wire) are ignored so
-  // they neither ramp nor degrade.
+  // noteBitrate feeds one aggregate-throughput sample (bits/s) into the adaptive
+  // state machine. Implements the same policy as resumable's
+  // updateAdaptiveUploadConcurrency: EMA smoothing, drop detection, stability floor,
+  // minimum bitrate per slot, stable-samples gate, and gain check for >2 slots.
+  // Idle/zero samples (e.g. the pure-hashing phase, before bytes are on the wire)
+  // are ignored.
   const noteBitrate = (bitsPerSecond) => {
     const v = Math.max(0, Number(bitsPerSecond) || 0);
     if (v <= 0) {
       return;
     }
-    if (smoothed === 0) {
-      smoothed = v;
-      healthySamples = 1;
-      lowSamples = 0;
+
+    const previousSmoothed = smoothedBitrate;
+
+    // Degrade on a sharp sustained drop — unconditional, matching resumable.
+    // After a failure/retry the cooldown prevents a premature ramp, not the
+    // degrade itself (the link IS in trouble — trust the measurement).
+    if (previousSmoothed > 0 && v < previousSmoothed * DROP_RATIO) {
+      degradeToOne();
       return;
     }
-    if (v < DROP_RATIO * smoothed) {
-      lowSamples += 1;
-      healthySamples = 0;
-      if (lowSamples >= DEGRADE_MIN_SAMPLES) {
-        smoothed = v; // re-baseline at the degraded level
-        degradeToOne();
-      }
+
+    // EMA smoothing (first sample seeds directly).
+    smoothedBitrate = previousSmoothed > 0
+      ? previousSmoothed * SMOOTHING_FACTOR + v * (1 - SMOOTHING_FACTOR)
+      : v;
+    lastBitrate = v;
+
+    // Reset stable samples on instability (bitrate drifted below the floor).
+    if (previousSmoothed > 0 && v < previousSmoothed * STABLE_FLOOR_RATIO) {
+      stableSamples = 0;
       return;
     }
-    // Healthy (stable or improving): update the baseline and count toward a ramp-up.
-    lowSamples = 0;
-    smoothed = EMA_ALPHA * v + (1 - EMA_ALPHA) * smoothed;
-    healthySamples += 1;
-    if (healthySamples >= RAMP_MIN_SAMPLES && effective < max) {
-      healthySamples = 0; // cooldown: another full run is needed before the next step
-      setEffective(effective + 1);
+
+    stableSamples += 1;
+
+    // Cooldown gate: after a failure/retry/degrade, wait out the penalty window
+    // before ramping. Stable samples still accumulate so the ramp fires
+    // immediately once the cooldown expires — same as resumable.
+    if (Date.now() < cooldownUntil) {
+      return;
     }
+
+    const nextSlotCount = effective + 1;
+    if (nextSlotCount > max) {
+      return; // already at the ceiling
+    }
+
+    // Minimum bitrate gate: the smoothed throughput must be enough to justify
+    // completing a block in a reasonable time with one more slot.
+    if (smoothedBitrate < minimumBitrateForSlots(blockBits, nextSlotCount)) {
+      return;
+    }
+
+    const requiredSamples = nextSlotCount === 2 ? FIRST_RAMP_SAMPLES : NEXT_RAMP_SAMPLES;
+    if (stableSamples < requiredSamples) {
+      return;
+    }
+
+    // Gain check: above 2 slots, require meaningful throughput improvement vs the
+    // last ramp point (avoids adding concurrency that does not move the needle).
+    if (nextSlotCount > 2 && lastRampBitrate > 0 && smoothedBitrate < lastRampBitrate * GAIN_RATIO) {
+      return;
+    }
+
+    // All checks passed — ramp up.
+    stableSamples = 0;
+    lastRampBitrate = smoothedBitrate;
+    setEffective(nextSlotCount);
   };
 
   // A real block-upload failure/retry (stall, timeout, transport error) is a strong
-  // "link is unhealthy" signal — drop straight to 1.
+  // signal — drop straight to MIN_CONCURRENCY with cooldown.
   const noteFailure = () => degradeToOne();
   const noteRetry = () => degradeToOne();
 
@@ -169,10 +234,12 @@ export function createBlockLimiter({ maxConcurrency } = {}) {
       detachAbort(waiter);
       waiter.reject(createAbortError());
     }
-    effective = 1;
-    smoothed = 0;
-    healthySamples = 0;
-    lowSamples = 0;
+    effective = MIN_CONCURRENCY;
+    stableSamples = 0;
+    smoothedBitrate = 0;
+    lastBitrate = 0;
+    lastRampBitrate = 0;
+    cooldownUntil = 0;
   };
 
   return {

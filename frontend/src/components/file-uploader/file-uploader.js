@@ -66,6 +66,7 @@ class FileUploader extends React.Component {
     // held for a prompt), so the second drop is caught immediately. Released when the
     // file reaches a non-saved terminal state (cancelled / dialog closed); on SUCCESS the
     // key moves to completedUploadNameKeys instead (see below).
+    this._lastFedBlockBitrate = -1;
     this.activeUploadNameKeys = new Set();
 
     // Synchronous record of destinations already UPLOADED in this session. On success a
@@ -571,19 +572,17 @@ class FileUploader extends React.Component {
       return;
     }
     entry._uploadedNetworkBytes = (Number(entry._uploadedNetworkBytes) || 0) + deltaBytes;
-    // sampleBlockUploadBitrate is throttled to one fresh reading per
-    // BLOCK_BITRATE_SAMPLE_MS and only advances entry._bitrateTs when it actually
-    // produced a new sample. Feed the adaptive limiter ONLY on a fresh sample — not on
-    // every progress tick — otherwise a burst of rapid progress events would count as
-    // many "healthy samples" and ramp the shared ceiling up almost instantly, defeating
-    // the gradual 1→max climb. The first (seed) call has no prior timestamp, so it is
-    // not a real sample either. Block-only signal (not the combined legacy+block figure).
-    const bitrateTsBefore = entry._bitrateTs;
+    // sampleBlockUploadBitrate updates entry._bitrate (throttled to ~500 ms for a
+    // stable dialog reading). Feed the adaptive limiter only when the aggregate
+    // bitrate actually changes — otherwise a stale value repeated at every progress
+    // tick (~50 ms) inflates stableSamples and can trigger premature degrades.
     sampleBlockUploadBitrate(entry, entry._uploadedNetworkBytes);
-    const freshBitrateSample = typeof bitrateTsBefore === 'number' && entry._bitrateTs !== bitrateTsBefore;
-    if (freshBitrateSample && this.blockLimiter) {
-      // Entries are mutated in place, so the current list already reflects the new bitrate.
-      this.blockLimiter.noteBitrate(aggregateBlockUploadBitrate(this.state.uploadFileList));
+    if (this.blockLimiter) {
+      const bps = aggregateBlockUploadBitrate(this.state.uploadFileList);
+      if (bps !== this._lastFedBlockBitrate) {
+        this._lastFedBlockBitrate = bps;
+        this.blockLimiter.noteBitrate(bps);
+      }
     }
     this.setState(prev => {
       const uploadFileList = prev.uploadFileList.map(item => (

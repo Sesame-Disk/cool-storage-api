@@ -487,7 +487,7 @@ describe('FileUploader block upload integration', () => {
     expect(uploader.state.uploadBitrate).toBe(5000);
   });
 
-  test('feeds the block limiter only on fresh bitrate samples, not every progress tick', () => {
+  test('feeds the block limiter aggregate bitrate only when the value changes (not stale repeats)', () => {
     jest.useFakeTimers();
     try {
       jest.setSystemTime(1000);
@@ -506,21 +506,19 @@ describe('FileUploader block upload integration', () => {
       };
       uploader.state.uploadFileList = [entry];
 
-      // First call seeds the sampler (not a real sample): no limiter feed.
-      uploader.updateBlockUploadTransferredBytes(entry, 1024);
-      expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
-
-      // Rapid progress ticks inside the 500ms throttle window reuse the same reading
-      // and must NOT count as new healthy samples (this is what made the ramp shoot up).
-      uploader.updateBlockUploadTransferredBytes(entry, 1024);
-      uploader.updateBlockUploadTransferredBytes(entry, 1024);
-      expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
-
-      // After the window elapses, exactly one fresh sample is fed.
-      jest.setSystemTime(1600);
+      // First tick feeds the initial aggregate (even if 0, the limiter ignores 0).
       uploader.updateBlockUploadTransferredBytes(entry, 1024);
       expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(1);
       expect(typeof uploader.blockLimiter.noteBitrate.mock.calls[0][0]).toBe('number');
+
+      // Subsequent ticks with the same (stale) aggregate value are skipped.
+      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(1); // unchanged
+
+      // After the 500 ms sampling window elapses, a new sample feeds again.
+      jest.setSystemTime(2000);
+      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(2);
     } finally {
       jest.useRealTimers();
     }

@@ -330,7 +330,7 @@ describe('global concurrency limiter (shared across files)', () => {
       }),
       createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
     };
-    const limiter = createBlockLimiter({ maxConcurrency: 2 });
+    const limiter = createBlockLimiter({ maxConcurrency: 2, blockSize: 1 });
     rampTo(limiter, 2);
 
     await Promise.all([
@@ -357,7 +357,7 @@ describe('global concurrency limiter (shared across files)', () => {
       }),
       createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
     };
-    const limiter = createBlockLimiter({ maxConcurrency: 2 });
+    const limiter = createBlockLimiter({ maxConcurrency: 2, blockSize: 1 });
     rampTo(limiter, 2);
 
     await Promise.all([
@@ -410,7 +410,7 @@ describe('global concurrency limiter (shared across files)', () => {
     expect(limiter.getInFlight()).toBe(0);
   });
 
-  test('a failed block upload tells the limiter to back off (noteFailure)', async () => {
+  test('a transient block failure that recovers on retry does NOT call noteFailure', async () => {
     let attempt = 0;
     const api = {
       createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
@@ -432,9 +432,35 @@ describe('global concurrency limiter (shared across files)', () => {
 
     await uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 3 });
 
-    // The first attempt failed (non-abort) → limiter backs off; the retry succeeds.
-    expect(limiter.noteFailure).toHaveBeenCalledTimes(1);
+    // The first attempt failed but the retry succeeded → noteFailure must NOT fire.
+    expect(limiter.noteFailure).not.toHaveBeenCalled();
     expect(attempt).toBe(2);
+  });
+
+  test('noteFailure fires only when ALL retries are exhausted', async () => {
+    let attempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn(() => {
+        attempt += 1;
+        return Promise.reject(new Error('network'));
+      }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+    const limiter = {
+      acquire: jest.fn().mockResolvedValue(() => {}),
+      noteFailure: jest.fn(),
+      getMaxConcurrency: () => 1,
+    };
+
+    await expect(
+      uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 3 }),
+    ).rejects.toThrow('network');
+
+    // noteFailure fired once AFTER all 3 retries were exhausted.
+    expect(limiter.noteFailure).toHaveBeenCalledTimes(1);
+    expect(attempt).toBe(3);
   });
 });
 
