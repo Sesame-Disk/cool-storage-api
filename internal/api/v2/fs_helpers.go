@@ -1315,19 +1315,23 @@ func (h *FSHelper) copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, fsID st
 	// Read the source fs_object
 	var objType, objName, dirEntries string
 	var blockIDs []string
+	var seafileBlockIDs []string
 	var sizeBytes int64
 	var mtime int64
 
 	err := h.db.Session().Query(`
-		SELECT obj_type, obj_name, dir_entries, block_ids, size_bytes, mtime
+		SELECT obj_type, obj_name, dir_entries, block_ids, seafile_block_ids_sha1, size_bytes, mtime
 		FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, srcRepoID, fsID).Scan(&objType, &objName, &dirEntries, &blockIDs, &sizeBytes, &mtime)
+	`, srcRepoID, fsID).Scan(&objType, &objName, &dirEntries, &blockIDs, &seafileBlockIDs, &sizeBytes, &mtime)
 	if err != nil {
 		return "", nil, fmt.Errorf("source fs_object not found (library=%s, fs_id=%s): %w", srcRepoID, fsID, err)
 	}
 
 	if objType == "file" || objType == "" {
-		pendingFile, err := h.prepareFileFSObjectForPublish(dstRepoID, objName, sizeBytes, blockIDs)
+		// prepareFileFSObjectForPublish derives the copied fs_id from the SHA-1 list,
+		// so pass the external SHA-1 ids (seafile_block_ids_sha1), not the internal
+		// SHA-256 block_ids — staging re-resolves them back to SHA-256.
+		pendingFile, err := h.prepareFileFSObjectForPublish(dstRepoID, objName, sizeBytes, seafileFSObjectBlockIDs(blockIDs, seafileBlockIDs))
 		if err != nil {
 			return "", nil, fmt.Errorf("failed to prepare copied file fs_object: %w", err)
 		}
@@ -1373,7 +1377,7 @@ func (h *FSHelper) createPendingPublishedFileRow(repoID string, pending *pending
 	if err := h.db.UpsertPendingPublishedFSObjectOwner(repoID, pending.fsID, pending.cleanupOwnerID, pending.cleanupCreatedAt, pending.cleanupOrgID, pending.cleanupAttemptID, pending.internalBlockIDs); err != nil {
 		return fmt.Errorf("failed to create tracked fs_object: %w", err)
 	}
-	if err := h.createFileFSObjectRow(repoID, pending.fsID, pending.name, pending.size, pending.externalBlockIDs); err != nil {
+	if err := h.createFileFSObjectRow(repoID, pending.fsID, pending.name, pending.size, pending.internalBlockIDs, pending.externalBlockIDs); err != nil {
 		cleanupErr := cleanupPendingPublishedFileOwnerAttempt(h.db, repoID, pending)
 		if cleanupErr != nil {
 			return errors.Join(fmt.Errorf("failed to create tracked fs_object: %w", err), cleanupErr)
@@ -1383,11 +1387,27 @@ func (h *FSHelper) createPendingPublishedFileRow(repoID string, pending *pending
 	return nil
 }
 
-func (h *FSHelper) createFileFSObjectRow(repoID, fsID, name string, size int64, blockIDs []string) error {
+// seafileFSObjectBlockIDs returns the SHA-1 (Seafile-boundary) block-id list for an
+// fs_object given its internal block_ids and seafile_block_ids_sha1 columns. After
+// the writer flip block_ids holds SHA-256 and seafile_block_ids_sha1 holds the SHA-1
+// the client needs; pre-flip rows have SHA-1 in block_ids and an empty SHA-1 column,
+// so fall back to block_ids. Mirrors seafileServeBlockIDs in the api package (kept
+// local to avoid an import cycle). See docs/SHA256-CANONICAL-BLOCK-IDS.md.
+func seafileFSObjectBlockIDs(blockIDs, seafileSHA1 []string) []string {
+	if len(seafileSHA1) > 0 {
+		return seafileSHA1
+	}
+	return blockIDs
+}
+
+// createFileFSObjectRow writes a file fs_object row in the SHA-256-canonical layout:
+// block_ids holds the internal SHA-256 storage ids and seafile_block_ids_sha1 holds
+// the external SHA-1 ids the desktop/mobile client needs (and which derive fs_id).
+func (h *FSHelper) createFileFSObjectRow(repoID, fsID, name string, size int64, internalBlockIDs, seafileBlockIDsSHA1 []string) error {
 	err := h.db.Session().Query(`
-		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, block_ids, size_bytes, mtime)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, repoID, fsID, "file", name, blockIDs, size, time.Now().Unix()).Exec()
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, block_ids, seafile_block_ids_sha1, size_bytes, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, repoID, fsID, "file", name, internalBlockIDs, seafileBlockIDsSHA1, size, time.Now().Unix()).Exec()
 	if err != nil {
 		return fmt.Errorf("failed to create fs_object: %w", err)
 	}
