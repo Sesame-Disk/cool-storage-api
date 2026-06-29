@@ -1331,7 +1331,11 @@ func (h *FSHelper) copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, fsID st
 		// prepareFileFSObjectForPublish derives the copied fs_id from the SHA-1 list,
 		// so pass the external SHA-1 ids (seafile_block_ids_sha1), not the internal
 		// SHA-256 block_ids — staging re-resolves them back to SHA-256.
-		pendingFile, err := h.prepareFileFSObjectForPublish(dstRepoID, objName, sizeBytes, seafileFSObjectBlockIDs(blockIDs, seafileBlockIDs))
+		externalIDs, ok := seafileFSObjectBlockIDs(blockIDs, seafileBlockIDs)
+		if !ok {
+			return "", nil, fmt.Errorf("source fs_object %s has SHA-256 block_ids without seafile_block_ids_sha1; cannot derive a Seafile fs_id", fsID)
+		}
+		pendingFile, err := h.prepareFileFSObjectForPublish(dstRepoID, objName, sizeBytes, externalIDs)
 		if err != nil {
 			return "", nil, fmt.Errorf("failed to prepare copied file fs_object: %w", err)
 		}
@@ -1391,13 +1395,23 @@ func (h *FSHelper) createPendingPublishedFileRow(repoID string, pending *pending
 // fs_object given its internal block_ids and seafile_block_ids_sha1 columns. After
 // the writer flip block_ids holds SHA-256 and seafile_block_ids_sha1 holds the SHA-1
 // the client needs; pre-flip rows have SHA-1 in block_ids and an empty SHA-1 column,
-// so fall back to block_ids. Mirrors seafileServeBlockIDs in the api package (kept
-// local to avoid an import cycle). See docs/SHA256-CANONICAL-BLOCK-IDS.md.
-func seafileFSObjectBlockIDs(blockIDs, seafileSHA1 []string) []string {
+// so fall back to block_ids.
+//
+// ok is false (fail-closed guard) when the SHA-1 column is empty AND block_ids holds
+// a non-40-hex (SHA-256) id — the dangerous post-flip state where SHA-256 block_ids
+// were written without the SHA-1 column; using those would derive a wrong fs_id.
+// Mirrors seafileServeBlockIDs in the api package (kept local to avoid an import
+// cycle). See docs/SHA256-CANONICAL-BLOCK-IDS.md.
+func seafileFSObjectBlockIDs(blockIDs, seafileSHA1 []string) ([]string, bool) {
 	if len(seafileSHA1) > 0 {
-		return seafileSHA1
+		return seafileSHA1, true
 	}
-	return blockIDs
+	for _, id := range blockIDs {
+		if len(strings.TrimSpace(id)) != 40 {
+			return nil, false
+		}
+	}
+	return blockIDs, true
 }
 
 // createFileFSObjectRow writes a file fs_object row in the SHA-256-canonical layout:

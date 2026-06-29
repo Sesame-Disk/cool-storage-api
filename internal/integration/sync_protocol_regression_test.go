@@ -193,6 +193,100 @@ func syncSHA256HexForTest(data []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// TestSyncServesSHA1BlockIDsForCanonicalFSObject verifies the PR4 serve path on a
+// post-flip file fs_object stored in the SHA-256-canonical layout (block_ids =
+// SHA-256 storage ids, seafile_block_ids_sha1 = SHA-1): GetFSObject must serve the
+// SHA-1 list to the Seafile client, and the served JSON must re-hash to the
+// requested fs_id (otherwise the desktop client rejects the object).
+func TestSyncServesSHA1BlockIDsForCanonicalFSObject(t *testing.T) {
+	requireCassandra(t)
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-sha1-serve-%d", time.Now().UnixNano()))
+	session := shareProjectionDBForTest(t).Session()
+
+	fileData := []byte("post-flip canonical serve payload\n")
+	externalBlockID := syncSHA1HexForTest(fileData)   // SHA-1 (Seafile boundary id)
+	internalBlockID := syncSHA256HexForTest(fileData) // SHA-256 (storage id)
+
+	// fs_id is SHA-1 of the file-object JSON built from the SHA-1 block list — the
+	// exact JSON GetFSObject re-emits (json.Marshal sorts the map keys).
+	fileObj := map[string]interface{}{
+		"block_ids": []string{externalBlockID},
+		"size":      int64(len(fileData)),
+		"type":      1,
+		"version":   1,
+	}
+	canonicalJSON := mustMarshalSyncObjectForTest(t, fileObj)
+	fileFSID := syncSHA1HexForTest(canonicalJSON)
+
+	if err := session.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, size_bytes, mtime, block_ids, seafile_block_ids_sha1)
+		VALUES (?, ?, 'file', '', ?, ?, ?, ?)
+	`, repoID, fileFSID, int64(len(fileData)), time.Now().Unix(), []string{internalBlockID}, []string{externalBlockID}).Exec(); err != nil {
+		t.Fatalf("failed to seed canonical fs_object: %v", err)
+	}
+
+	resp := doSyncProtocolRequestForTest(t, http.MethodGet, fmt.Sprintf("/seafhttp/repo/%s/fs/%s", repoID, fileFSID), nil, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET fs object status = %d, want 200", resp.StatusCode)
+	}
+	compressed, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		t.Fatalf("zlib reader: %v", err)
+	}
+	served, err := io.ReadAll(zr)
+	zr.Close()
+	if err != nil {
+		t.Fatalf("decompress served fs object: %v", err)
+	}
+
+	var parsed struct {
+		BlockIDs []string `json:"block_ids"`
+	}
+	if err := json.Unmarshal(served, &parsed); err != nil {
+		t.Fatalf("parse served fs object: %v", err)
+	}
+	if len(parsed.BlockIDs) != 1 || parsed.BlockIDs[0] != externalBlockID {
+		t.Fatalf("served block_ids = %v, want SHA-1 [%s] (not the SHA-256 storage id %s)", parsed.BlockIDs, externalBlockID, internalBlockID)
+	}
+	if got := syncSHA1HexForTest(served); got != fileFSID {
+		t.Fatalf("served JSON re-hash = %s, want fs_id %s (desktop would reject a mismatch)", got, fileFSID)
+	}
+}
+
+// TestSyncRefusesToServeSHA256BlockIDsWithoutSHA1Column verifies the PR4 fail-closed
+// guard (blocker #5): a row stuck with SHA-256 block_ids and an empty
+// seafile_block_ids_sha1 must NOT be served, since handing the client a 64-hex
+// SHA-256 list would corrupt its fs_id verification.
+func TestSyncRefusesToServeSHA256BlockIDsWithoutSHA1Column(t *testing.T) {
+	requireCassandra(t)
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-sha1-guard-%d", time.Now().UnixNano()))
+	session := shareProjectionDBForTest(t).Session()
+
+	internalBlockID := syncSHA256HexForTest([]byte("guard payload"))
+	fsID := syncSHA1HexForTest([]byte(fmt.Sprintf("guard-%s-%d", repoID, time.Now().UnixNano())))
+
+	// Deliberately broken row: SHA-256 block_ids, no seafile_block_ids_sha1.
+	if err := session.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, size_bytes, mtime, block_ids)
+		VALUES (?, ?, 'file', '', ?, ?, ?)
+	`, repoID, fsID, int64(13), time.Now().Unix(), []string{internalBlockID}).Exec(); err != nil {
+		t.Fatalf("failed to seed broken fs_object: %v", err)
+	}
+
+	resp := doSyncProtocolRequestForTest(t, http.MethodGet, fmt.Sprintf("/seafhttp/repo/%s/fs/%s", repoID, fsID), nil, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("GET broken fs object status = %d, want 500 (fail closed)", resp.StatusCode)
+	}
+}
+
 func containsStringForTest(items []string, want string) bool {
 	for _, item := range items {
 		if item == want {

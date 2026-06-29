@@ -477,8 +477,13 @@ func (h *SyncHandler) computeCorrectedObject(repoID, storedFSID string, cache ma
 		// client computes, which hashes the SHA-1 block-id list — so serialize the
 		// SHA-1 list (seafile_block_ids_sha1), falling back to block_ids when empty.
 		// See seafileServeBlockIDs.
+		serveBlockIDs, ok := seafileServeBlockIDs(blockIDs, seafileBlockIDs)
+		if !ok {
+			log.Printf("[computeCorrectedObject] fs_object %s has SHA-256 block_ids without seafile_block_ids_sha1; cannot recompute a Seafile fs_id", storedFSID)
+			return nil
+		}
 		jsonObj = map[string]interface{}{
-			"block_ids": seafileServeBlockIDs(blockIDs, seafileBlockIDs),
+			"block_ids": serveBlockIDs,
 			"size":      size,
 			"type":      1,
 			"version":   1,
@@ -1369,14 +1374,24 @@ func (h *SyncHandler) collectCorrectedObjectsWithFilter(repoID, storedFSID strin
 // list), so the list MUST be the SHA-1 one. After the SHA-256 canonicalization
 // that list lives in fs_objects.seafile_block_ids_sha1 while fs_objects.block_ids
 // holds the internal SHA-256 ids. Falls back to block_ids when the SHA-1 column
-// is empty (rows written before the PR4 writer flip), which is still SHA-1 then —
-// so this is a no-op until PR4 and correct afterwards. See
-// docs/SHA256-CANONICAL-BLOCK-IDS.md.
-func seafileServeBlockIDs(blockIDs, seafileSHA1 []string) []string {
+// is empty (rows written before the PR4 writer flip), which is still SHA-1 then.
+//
+// ok is false (fail-closed guard) when the SHA-1 column is empty AND block_ids
+// already holds a non-40-hex (SHA-256) id: that is the dangerous post-flip state
+// where a writer stored SHA-256 block_ids without the SHA-1 column, and serving
+// or hashing those would hand the client an id it cannot parse / that does not
+// match the requested fs_id. Callers MUST refuse to serve in that case rather
+// than silently corrupt. See docs/SHA256-CANONICAL-BLOCK-IDS.md.
+func seafileServeBlockIDs(blockIDs, seafileSHA1 []string) ([]string, bool) {
 	if len(seafileSHA1) > 0 {
-		return seafileSHA1
+		return seafileSHA1, true
 	}
-	return blockIDs
+	for _, id := range blockIDs {
+		if len(strings.TrimSpace(id)) != 40 {
+			return nil, false
+		}
+	}
+	return blockIDs, true
 }
 
 // GetFSObject retrieves a filesystem object
@@ -1434,10 +1449,16 @@ func (h *SyncHandler) GetFSObject(c *gin.Context) {
 	} else {
 		// File format: {"version": 1, "type": 1, "block_ids": [...], "size": N}
 		// Serve the SHA-1 list (Seafile boundary); see seafileServeBlockIDs.
+		serveBlockIDs, ok := seafileServeBlockIDs(blockIDs, seafileBlockIDs)
+		if !ok {
+			log.Printf("[GetFSObject] fs_object %s has SHA-256 block_ids without seafile_block_ids_sha1; refusing to serve a non-SHA-1 list", fsID)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "fs object block ids unavailable"})
+			return
+		}
 		jsonObj = map[string]interface{}{
 			"version":   1,
 			"type":      1, // SEAF_METADATA_TYPE_FILE
-			"block_ids": seafileServeBlockIDs(blockIDs, seafileBlockIDs),
+			"block_ids": serveBlockIDs,
 			"size":      size,
 		}
 	}
@@ -1540,8 +1561,13 @@ func (h *SyncHandler) PackFS(c *gin.Context) {
 				"version": 1,
 			}
 		} else {
+			serveBlockIDs, ok := seafileServeBlockIDs(blockIDs, seafileBlockIDs)
+			if !ok {
+				log.Printf("pack-fs: object %s has SHA-256 block_ids without seafile_block_ids_sha1; skipping", requestedFSID)
+				continue
+			}
 			jsonObj = map[string]interface{}{
-				"block_ids": seafileServeBlockIDs(blockIDs, seafileBlockIDs),
+				"block_ids": serveBlockIDs,
 				"size":      size,
 				"type":      1,
 				"version":   1,
