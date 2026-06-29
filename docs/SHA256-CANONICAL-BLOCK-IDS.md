@@ -42,7 +42,20 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
   - **PR3 is functionally complete.** The only remaining PR3-adjacent item is a post-flip
     integration test, tracked as a PR4 blocker (it needs PR4 data: SHA-256 `block_ids` + SHA-1
     `seafile_block_ids_sha1`).
-- `PR4`–`PR7` — pending.
+- `PR4` — in progress (branch `feat/sha256-canonical-block-ids-pr4`):
+  - **DONE — `CreateFile` template SHA-1 fix** (blocker #3 + a latent desktop-incompat bug):
+    Office-created files used SHA-256 as the block id and derived a SHA-256-based `fs_id`. Now
+    `CreateFile` computes the template's SHA-1, uses it as the external (Seafile) block id, and
+    writes the SHA-1→SHA-256 mapping + `blocks.sha1` via `RegisterUploadedBlockAndMapping`. Still
+    pre-flip (block_ids = SHA-1), consistent with the other v2 writers.
+  - **Pending — the writer flip.** Because PR3 made all readers tolerant (64-hex passthrough +
+    `seafile…` fallback), writers can be flipped **one at a time**, each commit safe with mixed
+    old/new rows. Per-writer queue: (a) v2 publish path `createFileFSObjectRow` + copy; (b)
+    `finalizeStoredUploadMetadata`; (c) `CreateFileFromBlocks`; (d) `createPendingSeafHTTPFileFSObject`;
+    (e) `RecvFS`. Each: write `block_ids` = SHA-256 + `seafile_block_ids_sha1` = SHA-1, keep
+    `fs_id` SHA-1-derived; the copy path must read `seafile_block_ids_sha1` (else it would hash a
+    SHA-256 list into the copied `fs_id`).
+- `PR5`–`PR7` — pending.
 
 ## Notes / Debt
 
@@ -81,7 +94,7 @@ Carried forward from review. Status as of the PR3 partial branch:
 |---|---|---|---|
 | 1 | Desktop breaks if any Seafile endpoint serializes SHA-256 into `"block_ids"`. Serve path (`GetFSObject`/`PackFS`) is fixed; the remaining serializers must be audited. | Critical | PR4 |
 | 2 | ~~`CheckFS` / `buildFSIDMapping` must use `seafile_block_ids_sha1` (fallback `block_ids`), never hash SHA-256 into the file JSON.~~ **DONE (PR3)** in `computeCorrectedObject`. | Blocker | resolved |
-| 3 | `CreateFile` template block must register a real SHA-1, not empty. | Blocker | PR4 |
+| 3 | ~~`CreateFile` template block must register a real SHA-1, not empty.~~ **DONE (PR4)** — `CreateFile` now computes the template SHA-1, uses it as the external block id, and writes the mapping + `blocks.sha1` via `RegisterUploadedBlockAndMapping` (mirrors `UploadFile`). Also fixes a pre-existing desktop-incompat bug: Office-created files used SHA-256 block ids / fs_id. | Blocker | resolved |
 | 4 | Validate `blocks.sha1` (40-hex, non-empty) before using it for `seafile_block_ids_sha1` / `fs_id`; else `needs_upload`. Reuse `isHex40`, fail closed. | Blocker | PR4/PR5 |
 | 5 | After the writer flip, **no row may have SHA-256 `block_ids` with empty `seafile_block_ids_sha1`**. Add a guard (strong log / fail-closed / repair) in `seafileServeBlockIDs` and at write time. | Blocker | PR4 |
 | 6 | Add an integration test for a post-flip file object (`block_ids`=64-hex, `seafile_block_ids_sha1`=40-hex): client receives the 40-hex list and the served JSON re-hashes to the requested `fs_id`. | Med | PR4 |

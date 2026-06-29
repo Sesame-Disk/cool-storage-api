@@ -1231,6 +1231,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 
 	var fileSize int64
 	var blockIDs []string
+	var externalBlockID string
 	var templateBlockData *storage.BlockData
 	// These survive across retry attempts. Office templates are content-addressed
 	// by SHA-256, so reusing the first successful upload avoids rewriting the
@@ -1242,10 +1243,15 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	if len(templateContent) > 0 {
 		fileSize = int64(len(templateContent))
 
-		// Calculate block hash (SHA256)
+		// Internal storage identity is SHA-256; the Seafile-facing block id in the
+		// fs_object (and therefore the derived fs_id) MUST be SHA-1, like every other
+		// upload path (see UploadFile). Compute both: SHA-256 addresses the block in
+		// storage, SHA-1 is the external id written into fs_objects + mapped below.
 		hash := sha256.Sum256(templateContent)
 		blockID := hex.EncodeToString(hash[:])
-		blockIDs = []string{blockID}
+		sha1Hash := sha1.Sum(templateContent)
+		externalBlockID = hex.EncodeToString(sha1Hash[:])
+		blockIDs = []string{externalBlockID}
 		templateBlockData = &storage.BlockData{
 			Hash: blockID,
 			Data: templateContent,
@@ -1351,8 +1357,12 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				return nil
 			}, func() error {
 				// Keep the freshly stored template block alive and respect the GC
-				// delete fence until publish-attempt refs take over below.
-				if err := fsHelper.RegisterUploadedBlock(orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateStorageClass, "", ""); err != nil {
+				// delete fence until publish-attempt refs take over below. Use the
+				// mapping variant so the SHA-1 (external) -> SHA-256 (internal) row and
+				// blocks.sha1 are written from the real bytes — required for desktop
+				// downloads (which fetch by SHA-1) and for staging to resolve the
+				// fs_object's SHA-1 block id back to its storage identity.
+				if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateStorageClass, "", externalBlockID); err != nil {
 					return fmt.Errorf("failed to register template block metadata: %w", err)
 				}
 				templateBlockPinned = true
