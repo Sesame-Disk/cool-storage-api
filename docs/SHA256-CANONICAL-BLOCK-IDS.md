@@ -35,9 +35,13 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     → **Reference-accounting readers MUST keep reading `block_ids`** (not `seafile_block_ids_sha1`):
     after PR4 `block_ids` is SHA-256, the resolve becomes a passthrough, and refs stay SHA-256.
     No PR4 change needed for them; switching them to SHA-1 would be a regression.
-  - **Still pending in PR3** — only the **fs_id-recompute** boundary readers `CheckFS` /
-    `buildFSIDMapping` must switch to `seafile_block_ids_sha1` (fallback `block_ids`), since the
-    client validates those objects by `fs_id`.
+  - Implemented the **fs_id-recompute** boundary: `computeCorrectedObject` (used by
+    `buildFSIDMapping` / `CheckFS`) now builds the file JSON from `seafile_block_ids_sha1`
+    (fallback `block_ids`) via the same `seafileServeBlockIDs` helper, so the computed→stored
+    fs_id mapping keeps matching the client after PR4. No-op until PR4.
+  - **PR3 is functionally complete.** The only remaining PR3-adjacent item is a post-flip
+    integration test, tracked as a PR4 blocker (it needs PR4 data: SHA-256 `block_ids` + SHA-1
+    `seafile_block_ids_sha1`).
 - `PR4`–`PR7` — pending.
 
 ## Notes / Debt
@@ -76,7 +80,7 @@ Carried forward from review. Status as of the PR3 partial branch:
 | # | Item | Severity | Gates |
 |---|---|---|---|
 | 1 | Desktop breaks if any Seafile endpoint serializes SHA-256 into `"block_ids"`. Serve path (`GetFSObject`/`PackFS`) is fixed; the remaining serializers must be audited. | Critical | PR4 |
-| 2 | `CheckFS` / `buildFSIDMapping` must use `seafile_block_ids_sha1` (fallback `block_ids`), never hash SHA-256 into the file JSON. | Blocker | PR3/PR4 |
+| 2 | ~~`CheckFS` / `buildFSIDMapping` must use `seafile_block_ids_sha1` (fallback `block_ids`), never hash SHA-256 into the file JSON.~~ **DONE (PR3)** in `computeCorrectedObject`. | Blocker | resolved |
 | 3 | `CreateFile` template block must register a real SHA-1, not empty. | Blocker | PR4 |
 | 4 | Validate `blocks.sha1` (40-hex, non-empty) before using it for `seafile_block_ids_sha1` / `fs_id`; else `needs_upload`. Reuse `isHex40`, fail closed. | Blocker | PR4/PR5 |
 | 5 | After the writer flip, **no row may have SHA-256 `block_ids` with empty `seafile_block_ids_sha1`**. Add a guard (strong log / fail-closed / repair) in `seafileServeBlockIDs` and at write time. | Blocker | PR4 |
@@ -241,10 +245,10 @@ Each PR must leave `go test` / Jest + lint + build green, keep the web block-upl
   JSON `block_ids`, falling back to `block_ids` when the column is empty, via the shared
   `seafileServeBlockIDs` helper ([sync.go](../internal/api/sync.go)). Unit test
   `TestSeafileServeBlockIDs`.
-- `CheckFS` / `buildFSIDMapping` / corrected-fs-id computation: when re-serializing a file
-  fs_object to compute a Seafile-compatible `fs_id`, use `seafile_block_ids_sha1`; fall back to
-  `block_ids` when the new column is empty. They must never hash the internal SHA-256 block-id
-  list.
+- **DONE** — `CheckFS` / `buildFSIDMapping` / corrected-fs-id computation: `computeCorrectedObject`
+  ([sync.go](../internal/api/sync.go)) builds the file JSON from `seafile_block_ids_sha1` (fallback
+  `block_ids`) via `seafileServeBlockIDs`, so the recomputed `fs_id` matches the client. Never
+  hashes the internal SHA-256 list.
 - **RESOLVED — reference-accounting is SHA-256; keep reading `block_ids`.** The sync readers
   `collectSyncReachableFiles` / `loadSyncFileBlockIDs` → `buildSyncCommitBlockDelta` →
   `block_references` ([sync.go:2561,2620](../internal/api/sync.go#L2561)) feed refs only after a
