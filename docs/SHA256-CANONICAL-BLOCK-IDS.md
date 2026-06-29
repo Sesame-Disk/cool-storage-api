@@ -30,6 +30,23 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
   `blocks.sha1`, this path must supply the block's SHA-1 (or compute it locally) or
   template-created files would get an empty Seafile block id and break desktop `fs_id` matching.
 
+### Gating rule for the next branch (PR4/PR5)
+
+Do **not** start PR4/PR5 until both are closed:
+
+1. **Close the template-block TODO above** — `CreateFile` must persist a real `blocks.sha1`.
+2. **Add fail-closed validation of `blocks.sha1` at the point of consumption.** `ProbeBlockReuse`
+   exposes `Sha1` raw (only `TrimSpace`d); the commit that uses it as the source for
+   `seafile_block_ids_sha1` / `fs_id` (PR5) MUST reject empty or non-40-hex values by treating
+   the block as `needs_upload` (the re-upload recomputes and rewrites a verified `sha1`) — never
+   write an unvalidated SHA-1 into an fs_object. Reuse `isHex40`
+   ([file_from_blocks.go:134](../internal/api/v2/file_from_blocks.go#L134)); mirror the existing
+   R1/R10 "forward mapping missing → needs_upload" pattern. Fail closed, never silently.
+
+Also add, when the value first drives `fs_id` (PR5): a test with a **real 40-hex SHA-1** plus the
+integration round-trip asserting the desktop-expected `fs_id` (the current plumbing tests use
+`"sha1-1"`/`"ext-1"`, which only prove the argument travels).
+
 ---
 
 ## a. Context and goal
