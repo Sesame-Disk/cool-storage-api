@@ -1913,4 +1913,22 @@ Cross-referenced from `docs/BUG-LANGUAGE-LIST-ENGLISH-ONLY-20260618.md` (Known l
 
 ---
 
-*Last updated: 2026-06-20*
+## 22. SHA-256 Canonical Block IDs — Reverse Mapping Drop, Encrypted-GC Check (2026-06-29)
+
+### Status
+Design + PR breakdown in [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md). Not
+yet implemented. One open question is parked here so it is not lost.
+
+### Pending — verify before executing PR7 (drop `block_id_mappings_by_internal`)
+PR7 removes the reverse SHA-256 → SHA-1 mapping table, relying on the new `blocks.sha1` column as
+the authoritative single-valued source. This is safe for unencrypted content (SHA-1 ↔ SHA-256 is
+1:1). **Before dropping the table, confirm the encrypted-library case:** for encrypted repos SHA-1
+is computed over plaintext and SHA-256 over ciphertext, so one SHA-1 can map to several SHA-256.
+The SHA-256 → SHA-1 direction used by GC stays 1:1 (each block row carries its own SHA-1), but we
+must confirm no encrypted-GC cleanup path relies on enumerating *all* SHA-1 aliases for an internal
+id (`ListBlockMappingsByInternalID` in `internal/gc/store_cassandra.go`). If such a path exists,
+keep the table or replace it with a narrower index instead of dropping it.
+
+---
+
+*Last updated: 2026-06-29*

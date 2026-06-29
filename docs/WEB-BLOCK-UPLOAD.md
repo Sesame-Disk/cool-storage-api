@@ -157,6 +157,15 @@ re-reading this section.
 - **R9 — `/blocks/upload?session=` always materializes**, even when
   `PutBlockData` was a no-op because the object already existed in S3. The point
   is to *govern* the block, not just store bytes.
+> **Planned evolution (2026-06-29):** the storage layout below (SHA-1 in
+> `fs_objects.block_ids`, resolved to SHA-256 on every read) is being moved to
+> **SHA-256-canonical block IDs** — SHA-256 in `fs_objects.block_ids` (O(0) read/GC
+> mapping lookups) plus a dedicated `seafile_block_ids_sha1` column for the desktop
+> boundary, and the web frontend stops computing/sending SHA-1 (the server derives it
+> from a new `blocks.sha1` column). The `fs_id` stays SHA-1-derived. See
+> [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) for the full design
+> and PR breakdown.
+
 - **R10 — Dual-hash: SHA-1 is the external Seafile block ID, SHA-256 is the
   storage identity.** A file's `fs_object.block_ids` MUST be SHA-1 (40-hex): the
   Seafile desktop/mobile sync client parses block IDs as 20-byte SHA-1 and cannot
@@ -969,6 +978,11 @@ flag were on*.
 
 ## Remaining work
 
+- **SHA-256-canonical block IDs** (separate iteration): move `fs_objects.block_ids` to
+  SHA-256 with a `seafile_block_ids_sha1` column for desktop, and drop SHA-1 from the
+  web frontend (server-derived). Eliminates the per-read SHA-1→SHA-256 mapping lookups
+  and ~halves browser hashing. Design + PR breakdown in
+  [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md).
 - Clear the prod-readiness checklist above (items 1, 2, 4 in particular) before
   enabling `enable_web_block_upload` in production.
 - **"metadata present but S3 object deleted"** is handled (commit verifies physical
