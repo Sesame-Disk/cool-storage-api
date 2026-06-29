@@ -45,6 +45,12 @@ from the **SHA-1** list (`seafile_block_ids_sha1`), exactly as today. The `block
 [WEB-BLOCK-UPLOAD.md R10](./WEB-BLOCK-UPLOAD.md) / the merge #91 regression) while making
 internal reads O(0).
 
+That rule applies not only to direct sync serving (`GetFSObject`, `PackFS`) but to **any code
+path that rebuilds or re-hashes a Seafile file object**. In particular, `CheckFS` /
+`buildFSIDMapping` / corrected-fs-id computation must build file JSON from
+`seafile_block_ids_sha1`, never from internal SHA-256 `block_ids`, or the computed fs_ids will
+stop matching what the desktop client expects.
+
 ---
 
 ## b. Current-state audit
@@ -151,10 +157,15 @@ Each PR must leave `go test` / Jest + lint + build green, keep the web block-upl
 - Still unconsumed by fs_object writers.
 
 ### PR3 — Tolerant reads (read-side prep, centralized)
-- Make `BatchResolveBlockIDs` pass-through already-64-hex IDs (resolve only 40-hex). One change
-  covers all 9 call sites.
+- `BatchResolveBlockIDs` already pass-throughs 64-hex SHA-256 IDs today; keep that behavior as
+  the compatibility base for mixed old/new rows. No new behavior is needed there beyond
+  preserving the "resolve only 40-hex" contract.
 - Seafile serve (`GetFSObject`, `PackFS`): serialize `seafile_block_ids_sha1` as the JSON
   `block_ids`; fall back to `block_ids` when the new column is empty.
+- `CheckFS` / `buildFSIDMapping` / corrected-fs-id computation: when re-serializing a file
+  fs_object to compute a Seafile-compatible `fs_id`, use `seafile_block_ids_sha1`; fall back to
+  `block_ids` when the new column is empty. They must never hash the internal SHA-256 block-id
+  list.
 - GC reads the list directly when it is SHA-256.
 - With writers still emitting SHA-1, everything falls back to the old behavior → no observable
   change.
@@ -219,6 +230,9 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
   (`block_id_mappings_by_internal`), which is best-effort and multi-alias. The column is
   authoritative, single-valued, and free via the `ProbeBlockReuse` the commit already runs.
 - **`fs_id` stays SHA-1-derived** — the desktop-compat invariant.
+- **Any code that recomputes or serializes Seafile file objects (`GetFSObject`, `PackFS`,
+  `CheckFS`, `buildFSIDMapping`, corrected-fs-id helpers) must source the file block list from
+  `seafile_block_ids_sha1`, falling back to `block_ids` only for pre-flip rows.**
 - **`block_id_mappings` (forward) is kept** — the desktop block download resolves by SHA-1;
   it is now read only at the Seafile boundary, not on web/internal reads.
 - **`block_id_mappings_by_internal` (reverse) is dropped (PR7)** — `blocks.sha1` is the
@@ -245,4 +259,6 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
 - **Real desktop E2E** (the same protocol as the dual-hash validation in
   [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md)): upload via the web block flow, sync from a real
   Seafile desktop client, confirm checkout succeeds, compare local-vs-source file hash.
+- Explicit `CheckFS` / sync-mapping regression coverage: mixed old/new fs_object rows must still
+  compute the same Seafile-compatible file ids the desktop client sends.
 - Confirm **0 SELECTs against `block_id_mappings`** when downloading SHA-256-canonical files.
