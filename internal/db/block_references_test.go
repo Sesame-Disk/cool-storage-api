@@ -244,7 +244,7 @@ func TestProbeBlockReuseReusable(t *testing.T) {
 	})
 
 	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
-		return blockReuseMetadataRow{SizeBytes: 123, StorageClass: "hot-s3", StorageKey: "", GCState: ""}, true, nil
+		return blockReuseMetadataRow{Sha1: "sha1-abc", SizeBytes: 123, StorageClass: "hot-s3", StorageKey: "", GCState: ""}, true, nil
 	}
 	probeBlockReuseHasReferencesFn = func(database *DB, orgID, blockID string) (bool, error) {
 		return true, nil
@@ -262,6 +262,9 @@ func TestProbeBlockReuseReusable(t *testing.T) {
 	}
 	if probe.StorageClass != "hot-s3" {
 		t.Fatalf("storage class = %q, want hot-s3", probe.StorageClass)
+	}
+	if probe.Sha1 != "sha1-abc" {
+		t.Fatalf("sha1 = %q, want sha1-abc", probe.Sha1)
 	}
 }
 
@@ -347,7 +350,7 @@ func TestProbeBlockReuseNeedsPutWhenMetadataPresentButNoReferences(t *testing.T)
 	})
 
 	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
-		return blockReuseMetadataRow{SizeBytes: 4096, StorageClass: "cold-archive", StorageKey: "blocks/ab/cd", GCState: ""}, true, nil
+		return blockReuseMetadataRow{Sha1: "sha1-cold", SizeBytes: 4096, StorageClass: "cold-archive", StorageKey: "blocks/ab/cd", GCState: ""}, true, nil
 	}
 	probeBlockReuseHasReferencesFn = func(database *DB, orgID, blockID string) (bool, error) {
 		return false, nil
@@ -368,6 +371,9 @@ func TestProbeBlockReuseNeedsPutWhenMetadataPresentButNoReferences(t *testing.T)
 	}
 	if probe.SizeBytes != 4096 {
 		t.Fatalf("size = %d, want 4096", probe.SizeBytes)
+	}
+	if probe.Sha1 != "sha1-cold" {
+		t.Fatalf("sha1 = %q, want sha1-cold", probe.Sha1)
 	}
 }
 

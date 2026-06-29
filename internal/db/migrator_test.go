@@ -223,3 +223,12 @@ func TestMigration003AppliesLCSToGCQueueTables(t *testing.T) {
 	// Parser sanity: the five ALTERs split into exactly five executable statements.
 	assert.Len(t, parseCQLStatements(content), 5)
 }
+
+func TestMigration005AddsSHA256CanonicalBlockIDColumns(t *testing.T) {
+	raw, err := migrationsFS.ReadFile("migrations/005_sha256_canonical_block_ids.cql")
+	require.NoError(t, err)
+	content := string(raw)
+
+	assert.Contains(t, content, "ALTER TABLE fs_objects ADD seafile_block_ids_sha1 LIST<TEXT>;")
+	assert.Contains(t, content, "ALTER TABLE blocks ADD sha1 TEXT;")
+}

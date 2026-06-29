@@ -1,11 +1,51 @@
 # SHA-256 canonical block IDs (and removing SHA-1 from the web client)
 
 **Date:** 2026-06-29
-**Status:** Design + PR breakdown. Not yet implemented.
+**Status:** Design + PR breakdown. PR1 and PR2 are implemented in the workspace and pending
+review/commit; PR3+ remain pending.
 **Supersedes:** the out-of-tree `implementation_plan.md` draft (backend/read-side only),
 which is removed in favour of this document.
 **Related:** [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md) (R10 dual-hash, the current state
 this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
+
+## Progress
+
+- `PR1` — implemented in workspace: additive migration `005_sha256_canonical_block_ids.cql`,
+  `internal/models` fields for `seafile_block_ids_sha1` / `blocks.sha1`, and regression coverage
+  for the new migration + JSON shape. No behavior has been flipped yet.
+- `PR2` — implemented in workspace: `blocks.sha1` is now written from verified bytes on the web
+  block-upload materialization path and the legacy seafhttp upload/finalize path, and
+  `ProbeBlockReuse` now reads/exposes `sha1` for later commit-time use.
+- `PR3`–`PR7` — pending.
+
+## Notes / Debt
+
+- The current additive/no-backfill approach still assumes the current pre-deploy / empty-DB
+  rollout. If this branch were ever applied to a non-empty environment, older `blocks` rows would
+  retain empty `sha1` until a dedicated backfill or rewrite path is added.
+- **TODO (before PR4/PR5):** the template-block path in `CreateFile`
+  ([files.go:1355](../internal/api/v2/files.go#L1355)) currently registers its block with an
+  empty `sha1` (the SHA-1 is not threaded there yet). That is harmless while nothing reads
+  `blocks.sha1`, but once PR4/PR5 derive `seafile_block_ids_sha1` / the `fs_id` from
+  `blocks.sha1`, this path must supply the block's SHA-1 (or compute it locally) or
+  template-created files would get an empty Seafile block id and break desktop `fs_id` matching.
+
+### Gating rule for the next branch (PR4/PR5)
+
+Do **not** start PR4/PR5 until both are closed:
+
+1. **Close the template-block TODO above** — `CreateFile` must persist a real `blocks.sha1`.
+2. **Add fail-closed validation of `blocks.sha1` at the point of consumption.** `ProbeBlockReuse`
+   exposes `Sha1` raw (only `TrimSpace`d); the commit that uses it as the source for
+   `seafile_block_ids_sha1` / `fs_id` (PR5) MUST reject empty or non-40-hex values by treating
+   the block as `needs_upload` (the re-upload recomputes and rewrites a verified `sha1`) — never
+   write an unvalidated SHA-1 into an fs_object. Reuse `isHex40`
+   ([file_from_blocks.go:134](../internal/api/v2/file_from_blocks.go#L134)); mirror the existing
+   R1/R10 "forward mapping missing → needs_upload" pattern. Fail closed, never silently.
+
+Also add, when the value first drives `fs_id` (PR5): a test with a **real 40-hex SHA-1** plus the
+integration round-trip asserting the desktop-expected `fs_id` (the current plumbing tests use
+`"sha1-1"`/`"ext-1"`, which only prove the argument travels).
 
 ---
 

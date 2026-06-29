@@ -2,6 +2,7 @@ package v2
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -18,8 +19,11 @@ func TestRegisterUploadedBlockAndMapping_WritesMappingAfterMetadata(t *testing.T
 	}()
 
 	var calls []string
-	registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
 		calls = append(calls, "register")
+		if sha1ID != "ext-1" {
+			t.Fatalf("sha1ID = %q, want ext-1", sha1ID)
+		}
 		return nil
 	}
 	writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, externalBlockID, internalBlockID string) error {
@@ -55,7 +59,7 @@ func TestRegisterUploadedBlockAndMapping_RollsBackOnMappingFailure(t *testing.T)
 		rollbackUploadedBlockRefsFn = oldRollback
 	}()
 
-	registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
 		return nil
 	}
 	wantErr := errors.New("mapping boom")
@@ -96,7 +100,10 @@ func TestRegisterUploadedBlockAndMapping_SkipsMappingWithoutExternalID(t *testin
 		writeBlockMappingForMaterializationFn = oldWriteMapping
 	}()
 
-	registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
+		if strings.TrimSpace(sha1ID) != "" {
+			t.Fatalf("sha1ID = %q, want empty", sha1ID)
+		}
 		return nil
 	}
 	writeCalled := false
@@ -125,7 +132,7 @@ func TestRegisterUploadedBlockAndMapping_StopsOnRegisterFailure(t *testing.T) {
 	}()
 
 	wantErr := errors.New("register boom")
-	registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
 		return wantErr
 	}
 	writeCalled := false

@@ -59,12 +59,14 @@ const (
 
 type BlockReuseProbe struct {
 	Decision     BlockReuseDecision
+	Sha1         string
 	SizeBytes    int
 	StorageClass string
 	StorageKey   string
 }
 
 type blockReuseMetadataRow struct {
+	Sha1         string
 	SizeBytes    int
 	StorageClass string
 	StorageKey   string
@@ -405,20 +407,28 @@ func PromotePublishAttemptReferences(database *DB, orgID, attemptID string, bloc
 // blocks never contend — it is NOT globally serialized (the old process-wide
 // concurrency permit that did serialize it has been removed).
 func (db *DB) UpsertBlockMetadata(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	return db.UpsertBlockMetadataWithSHA1(orgID, blockID, "", sizeBytes, storageClass, storageKey)
+}
+
+// UpsertBlockMetadataWithSHA1 stores immutable block metadata plus the
+// authoritative SHA-1 of the real block bytes when that value is available at
+// write time. Callers that do not know the SHA-1 can keep using
+// UpsertBlockMetadata, which passes an empty string.
+func (db *DB) UpsertBlockMetadataWithSHA1(orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string) error {
 	now := time.Now().UTC()
 	return db.Session().Query(`
-		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, created_at, last_accessed)
-		VALUES (?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID, blockID, sizeBytes, storageClass, storageKey, now, now).Exec()
+		INSERT INTO blocks (org_id, block_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID, blockID, strings.TrimSpace(sha1), sizeBytes, storageClass, storageKey, now, now).Exec()
 }
 
 var probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
 	var row blockReuseMetadataRow
 	err := database.Session().Query(`
-		SELECT size_bytes, storage_class, storage_key, gc_state
+		SELECT sha1, size_bytes, storage_class, storage_key, gc_state
 		FROM blocks
 		WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(&row.SizeBytes, &row.StorageClass, &row.StorageKey, &row.GCState)
+	`, orgID, blockID).Scan(&row.Sha1, &row.SizeBytes, &row.StorageClass, &row.StorageKey, &row.GCState)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return blockReuseMetadataRow{}, false, nil
@@ -465,6 +475,7 @@ func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
 	}
 
 	probe := BlockReuseProbe{
+		Sha1:         strings.TrimSpace(metadata.Sha1),
 		SizeBytes:    metadata.SizeBytes,
 		StorageClass: strings.TrimSpace(metadata.StorageClass),
 		StorageKey:   strings.TrimSpace(metadata.StorageKey),
