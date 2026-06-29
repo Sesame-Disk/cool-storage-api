@@ -137,13 +137,17 @@ describe('createBlockLimiter adaptive ramp', () => {
     expect(limiter.getEffective()).toBe(3); // never above the configured ceiling
   });
 
-  test('drops to 1 on a sharp bitrate collapse', () => {
+  test('drops to 1 only after two consecutive sharp bitrate collapses', () => {
     const limiter = createBlockLimiter({ maxConcurrency: 3, blockSize: 1 });
     rampTo(limiter, 2);
     expect(limiter.getEffective()).toBe(2);
 
-    // DROP_RATIO = 0.55: bitrate < 55% of smoothed triggers immediate degrade.
-    limiter.noteBitrate(1000000 * 0.5); // 50% of smoothed → collapse → degrade
+    // DROP_RATIO = 0.55: one low sample is treated as noise on a healthy LAN;
+    // the second consecutive drop confirms the collapse and degrades.
+    limiter.noteBitrate(1000000 * 0.5);
+    expect(limiter.getEffective()).toBe(2);
+
+    limiter.noteBitrate(1000000 * 0.5);
     expect(limiter.getEffective()).toBe(1);
   });
 

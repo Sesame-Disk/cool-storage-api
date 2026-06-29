@@ -195,6 +195,80 @@ test('aborts before starting when the caller signal is already cancelled', async
   expect(api.createBlockUploadSession).not.toHaveBeenCalled();
 });
 
+describe('upload slot handoff', () => {
+  test('announces readiness after checking and waits before upload/commit work starts', async () => {
+    const events = [];
+    let releaseUploadSlot;
+    const waitForUploadSlot = jest.fn(() => new Promise((resolve) => {
+      releaseUploadSlot = () => {
+        events.push('slot:released');
+        resolve();
+      };
+    }));
+    const onReadyForUpload = jest.fn(() => {
+      events.push('ready');
+    });
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: ['h0'] } }),
+      uploadBlock: jest.fn().mockImplementation(() => {
+        events.push('upload');
+        return Promise.resolve({ data: {} });
+      }),
+      createFileFromBlocks: jest.fn().mockImplementation(() => {
+        events.push('commit');
+        return Promise.resolve({ data: [{ name: 'f', id: 'i', size: '10' }] });
+      }),
+    };
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha1: 's0', sha256: 'h0', size: 10 }], size: 10 });
+
+    const promise = uploadFileViaBlocks(makeFile(10), {
+      repoID: 'r',
+      api,
+      hashFn,
+      blockSize: 50,
+      onReadyForUpload,
+      waitForUploadSlot,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(onReadyForUpload).toHaveBeenCalledWith({ missingCount: 1, totalCount: 1 });
+    expect(waitForUploadSlot).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(['ready']);
+    expect(api.uploadBlock).not.toHaveBeenCalled();
+    expect(api.createFileFromBlocks).not.toHaveBeenCalled();
+
+    releaseUploadSlot();
+    await promise;
+
+    expect(events).toEqual(['ready', 'slot:released', 'upload', 'commit']);
+  });
+
+  test('skips the uploading phase when no blocks are missing, but still waits for the slot before commit', async () => {
+    const phases = [];
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: [] } }),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '10' }] }),
+    };
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha1: 's0', sha256: 'h0', size: 10 }], size: 10 });
+
+    await uploadFileViaBlocks(makeFile(10), {
+      repoID: 'r',
+      api,
+      hashFn,
+      blockSize: 50,
+      onPhase: (phase) => phases.push(phase),
+      waitForUploadSlot: () => Promise.resolve(),
+    });
+
+    expect(api.uploadBlock).not.toHaveBeenCalled();
+    expect(phases).toEqual(['hashing', 'checking', 'saving']);
+  });
+});
+
 describe('phase reporting (onPhase)', () => {
   test('emits hashing -> checking -> uploading -> saving in order', async () => {
     const phases = [];

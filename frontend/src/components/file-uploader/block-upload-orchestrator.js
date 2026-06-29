@@ -465,6 +465,8 @@ export async function uploadFileViaBlocks(file, {
   onTransferProgress,
   onPhase,
   onPlan,
+  waitForUploadSlot,
+  onReadyForUpload,
   signal,
 } = {}) {
   if (!repoID) throw new Error('repoID is required');
@@ -533,19 +535,29 @@ export async function uploadFileViaBlocks(file, {
     onPlan({ totalBytes: size, uploadBytes, dedupedBytes: Math.max(0, size - uploadBytes) });
   }
 
+  if (onReadyForUpload) {
+    onReadyForUpload({ missingCount: missing.length, totalCount: blocks.length });
+  }
+  if (waitForUploadSlot) {
+    await waitForUploadSlot({ signal, missingCount: missing.length, totalCount: blocks.length });
+    throwIfAborted(signal);
+  }
+
   // 4. Upload missing blocks.
-  emitPhase('uploading');
-  await uploadMissingBlocks(session, missing, blockIndexByHash, getBlockData, {
-    api,
-    concurrency,
-    limiter,
-    retries,
-    onBlockUploaded: onUploadProgress,
-    onTransferProgress,
-    signal,
-    stallMs: blockStallTimeoutMs,
-    responseTimeoutMs: blockResponseTimeoutMs,
-  });
+  if (missing.length > 0) {
+    emitPhase('uploading');
+    await uploadMissingBlocks(session, missing, blockIndexByHash, getBlockData, {
+      api,
+      concurrency,
+      limiter,
+      retries,
+      onBlockUploaded: onUploadProgress,
+      onTransferProgress,
+      signal,
+      stallMs: blockStallTimeoutMs,
+      responseTimeoutMs: blockResponseTimeoutMs,
+    });
+  }
 
   // 5. Commit from the ordered manifest. If the server reports some blocks are
   //    not commit-ready (race / orphan), re-upload exactly those once and retry.

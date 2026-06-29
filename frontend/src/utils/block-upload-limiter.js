@@ -27,6 +27,7 @@ const FIRST_RAMP_SAMPLES = 3;      // stable samples needed for 1→2 ramp
 const NEXT_RAMP_SAMPLES = 5;       // stable samples needed for each subsequent ramp
 const GAIN_RATIO = 1.05;           // minimum throughput gain to justify >2 slots
 const COOLDOWN_MS = 10000;         // cooldown after a degrade
+const DROP_MIN_SAMPLES = 2;        // require 2 low samples before bitrate-drop degrade
 const DEFAULT_BLOCK_SIZE = 8 * 1024 * 1024; // must match backend WebUploadBlockSize
 
 function createAbortError() {
@@ -72,6 +73,7 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
   let lastBitrate = 0;
   let lastRampBitrate = 0;
   let cooldownUntil = 0;
+  let lowDropSamples = 0;
 
   const detachAbort = (waiter) => {
     if (waiter.signal && waiter.onAbort) {
@@ -145,6 +147,7 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
     lastBitrate = 0;
     lastRampBitrate = 0;
     cooldownUntil = now + COOLDOWN_MS;
+    lowDropSamples = 0;
     setEffective(MIN_CONCURRENCY);
   };
 
@@ -162,13 +165,17 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
 
     const previousSmoothed = smoothedBitrate;
 
-    // Degrade on a sharp sustained drop — unconditional, matching resumable.
-    // After a failure/retry the cooldown prevents a premature ramp, not the
-    // degrade itself (the link IS in trouble — trust the measurement).
+    // A single noisy sampler window on a healthy LAN should not collapse
+    // concurrency. Require a sustained sharp drop before degrading, while real
+    // transport retries/failures still call noteRetry/noteFailure immediately.
     if (previousSmoothed > 0 && v < previousSmoothed * DROP_RATIO) {
-      degradeToOne();
+      lowDropSamples += 1;
+      if (lowDropSamples >= DROP_MIN_SAMPLES) {
+        degradeToOne();
+      }
       return;
     }
+    lowDropSamples = 0;
 
     // EMA smoothing (first sample seeds directly).
     smoothedBitrate = previousSmoothed > 0
@@ -240,6 +247,7 @@ export function createBlockLimiter({ maxConcurrency, blockSize = DEFAULT_BLOCK_S
     lastBitrate = 0;
     lastRampBitrate = 0;
     cooldownUntil = 0;
+    lowDropSamples = 0;
   };
 
   return {

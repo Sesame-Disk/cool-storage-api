@@ -138,12 +138,13 @@ class FileUploader extends React.Component {
     // the session ends (close / cancel-all).
     this._replaceUpdateLinkPromise = null;
     this.adaptiveUploadCleanup = null;
-    // Block (CAS) uploads run ONE FILE AT A TIME: a file-level FIFO on top of the
-    // block-level limiter. So a single large file gets the full block-concurrency
-    // ceiling while the others wait ("Waiting..."), instead of several large files
-    // crawling in parallel. Legacy resumable uploads are unaffected.
+    // Block (CAS) uploads keep a SINGLE file in the upload/commit half of the flow,
+    // but allow ONE next file to get ahead through hashing/checking. That pipelines
+    // expensive prep work without ever putting two files into block upload at once.
     this.blockUploadQueue = [];
     this.activeBlockUpload = null;
+    this.preparingBlockUpload = null;
+    this.preparedBlockUpload = null;
     this.navigationGuard = new UploadNavigationGuard(this.hasActiveUploadWork);
   }
 
@@ -428,45 +429,189 @@ class FileUploader extends React.Component {
     if (!entry) {
       return false;
     }
-    if (this.activeBlockUpload && this.activeBlockUpload.entry === entry) {
-      return false; // already running
+    if ((this.activeBlockUpload && this.activeBlockUpload.entry === entry)
+      || (this.preparingBlockUpload && this.preparingBlockUpload.entry === entry)
+      || (this.preparedBlockUpload && this.preparedBlockUpload.entry === entry)) {
+      return false; // already running / prepared
     }
     if (this.blockUploadQueue.some(job => job.entry === entry)) {
       return false; // already waiting
     }
-    this.blockUploadQueue.push({ entry, file });
+    this.blockUploadQueue.push({
+      entry,
+      file,
+      _committing: false,
+      _uploadTurnGranted: false,
+      _grantUploadTurn: null,
+      _rejectUploadTurn: null,
+    });
     this.drainBlockUploadQueue();
     return true;
   };
 
+  createBlockUploadAbortError = () => {
+    if (typeof DOMException === 'function') {
+      return new DOMException('Upload aborted', 'AbortError');
+    }
+    const error = new Error('Upload aborted');
+    error.name = 'AbortError';
+    return error;
+  };
+
+  createBlockUploadTurnWaiter = (job, signal) => {
+    if (!job || job._uploadTurnGranted) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let onAbort;
+      const cleanup = () => {
+        if (signal && onAbort) {
+          signal.removeEventListener('abort', onAbort);
+        }
+        if (job._grantUploadTurn === grant) {
+          job._grantUploadTurn = null;
+        }
+        if (job._rejectUploadTurn === rejectWait) {
+          job._rejectUploadTurn = null;
+        }
+      };
+      const finish = (fn, value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        fn(value);
+      };
+      const grant = () => {
+        job._uploadTurnGranted = true;
+        finish(resolve);
+      };
+      const rejectWait = (error) => {
+        finish(reject, error);
+      };
+
+      if (signal && signal.aborted) {
+        rejectWait(this.createBlockUploadAbortError());
+        return;
+      }
+
+      if (signal) {
+        onAbort = () => rejectWait(this.createBlockUploadAbortError());
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      job._grantUploadTurn = grant;
+      job._rejectUploadTurn = rejectWait;
+
+      if (job._uploadTurnGranted) {
+        grant();
+      }
+    });
+  };
+
+  grantPreparedBlockUpload = (job) => {
+    if (!job) {
+      return;
+    }
+    if (this.preparedBlockUpload === job) {
+      this.preparedBlockUpload = null;
+    }
+    job._committing = false;
+    this.activeBlockUpload = job;
+    job._uploadTurnGranted = true;
+    if (typeof job._grantUploadTurn === 'function') {
+      const grant = job._grantUploadTurn;
+      job._grantUploadTurn = null;
+      job._rejectUploadTurn = null;
+      grant();
+    }
+  };
+
+  maybeGrantPreparedBlockUpload = () => {
+    if (!this.activeBlockUpload && this.preparedBlockUpload) {
+      this.grantPreparedBlockUpload(this.preparedBlockUpload);
+      return true;
+    }
+    return false;
+  };
+
+  onBlockUploadReadyForUpload = (job) => {
+    if (!job) {
+      return;
+    }
+    if (this.preparingBlockUpload === job) {
+      this.preparingBlockUpload = null;
+    }
+
+    if (this.activeBlockUpload === job) {
+      this.drainBlockUploadQueue();
+      return;
+    }
+
+    if (!this.activeBlockUpload) {
+      this.grantPreparedBlockUpload(job);
+      this.drainBlockUploadQueue();
+      return;
+    }
+
+    this.preparedBlockUpload = job;
+    this.setBlockUploadPhase(job.entry, 'queued');
+    this.drainBlockUploadQueue();
+  };
+
+  startBlockUploadJob = (job) => {
+    this.preparingBlockUpload = job;
+    let promise;
+    try {
+      promise = this.runBlockUpload(job.entry, job.file, {
+        waitForUploadSlot: ({ signal } = {}) => this.createBlockUploadTurnWaiter(job, signal),
+        onReadyForUpload: () => this.onBlockUploadReadyForUpload(job),
+      });
+    } catch (error) {
+      promise = Promise.reject(error);
+    }
+
+    Promise.resolve(promise).finally(() => {
+      if (this.preparingBlockUpload === job) {
+        this.preparingBlockUpload = null;
+      }
+      if (this.preparedBlockUpload === job) {
+        this.preparedBlockUpload = null;
+      }
+      if (this.activeBlockUpload === job) {
+        this.activeBlockUpload = null;
+      }
+      if (!job._uploadTurnGranted && typeof job._rejectUploadTurn === 'function') {
+        job._rejectUploadTurn(this.createBlockUploadAbortError());
+      }
+      job._grantUploadTurn = null;
+      job._rejectUploadTurn = null;
+      this.maybeGrantPreparedBlockUpload();
+      this.drainBlockUploadQueue();
+    });
+  };
+
   drainBlockUploadQueue = () => {
-    if (this.activeBlockUpload) {
-      return; // a block file is already running; the rest stay "Waiting..."
+    this.maybeGrantPreparedBlockUpload();
+    if (this.preparingBlockUpload || this.preparedBlockUpload) {
+      return; // keep only one file ahead in hashing/checking
     }
     const job = this.blockUploadQueue.shift();
     if (!job) {
       return;
     }
-    this.activeBlockUpload = job;
-    // runBlockUpload resolves on success, handled error, or cancel (it never rejects),
-    // so the queue always advances. Guard a synchronous throw before the promise is
-    // returned so a future bug cannot strand activeBlockUpload and wedge the queue.
-    let promise;
-    try {
-      promise = this.runBlockUpload(job.entry, job.file);
-    } catch (error) {
-      promise = Promise.reject(error);
+    if (!this.activeBlockUpload) {
+      this.activeBlockUpload = job;
+      job._uploadTurnGranted = true;
     }
-    Promise.resolve(promise).finally(() => {
-      if (this.activeBlockUpload === job) {
-        this.activeBlockUpload = null;
-      }
-      this.drainBlockUploadQueue();
-    });
+    this.startBlockUploadJob(job);
   };
 
   // releaseActiveBlockSlotForCommit hands the file-level slot back the moment the
-  // active block file enters its commit ('saving') phase, so the next queued file
+  // active block file enters its commit ('saving') phase, so the next prepared file
   // can start uploading while this one's commit is in flight. Idempotent per job
   // (the needs_upload path can re-enter 'saving'): once released, the job no longer
   // owns the slot, so the guard and the job's own finally (which only nulls when it
@@ -478,6 +623,7 @@ class FileUploader extends React.Component {
     }
     job._committing = true;
     this.activeBlockUpload = null;
+    this.maybeGrantPreparedBlockUpload();
     this.drainBlockUploadQueue();
   };
 
@@ -490,11 +636,8 @@ class FileUploader extends React.Component {
   };
 
   // clearBlockUploadQueue drops every PENDING block file (dialog close / cancel-all).
-  // It deliberately does NOT clear activeBlockUpload: the active file is being aborted
-  // via entry.cancel() but its promise may not have reached the finally yet, so nulling
-  // the marker here would let a freshly-added file start while the old one is still
-  // tearing down — breaking the one-active-at-a-time guarantee. The marker is released
-  // only by the active job's own finally.
+  // Prepared / active files are aborted via entry.cancel() and release themselves when
+  // their promise settles; only jobs that never started are removed synchronously here.
   clearBlockUploadQueue = () => {
     this.blockUploadQueue = [];
   };
@@ -634,7 +777,11 @@ class FileUploader extends React.Component {
     });
   };
 
-  runBlockUpload = (entry, file, { replace = entry._replace || false } = {}) => {
+  runBlockUpload = (entry, file, {
+    replace = entry._replace || false,
+    waitForUploadSlot,
+    onReadyForUpload,
+  } = {}) => {
     const { repoID, path } = this.props;
     const abortController = typeof AbortController === 'function' ? new AbortController() : null;
     entry._abortController = abortController;
@@ -665,6 +812,8 @@ class FileUploader extends React.Component {
       signal: abortController ? abortController.signal : undefined,
       onPhase: (phase) => this.setBlockUploadPhase(entry, phase),
       onPlan: (plan) => this.setBlockUploadPlan(entry, plan),
+      waitForUploadSlot,
+      onReadyForUpload,
       onHashProgress: (hashed, total) => this.updateBlockUploadProgress(entry, (total ? hashed / total : 0) * 0.5),
       onUploadProgress: (done, total) => this.updateBlockUploadProgress(entry, 0.5 + (total ? done / total : 1) * 0.5),
       onTransferProgress: (deltaBytes) => this.updateBlockUploadTransferredBytes(entry, deltaBytes),
