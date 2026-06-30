@@ -89,12 +89,11 @@ flowchart TD
         Enc -->|No| AsIs["Use plaintext"]
         Cipher --> SHA256["SHA-256(stored content)<br/>= 64 hex chars<br/>S3 storage key"]
         AsIs --> SHA256
-        SHA256 --> DualWrite["Dual-write mappings"]
+        SHA256 --> ForwardOnly["Forward mapping write<br/>SHA-1 → SHA-256"]
     end
 
     subgraph Tables["Cassandra Tables"]
         T1["block_id_mappings<br/>SHA-1 → SHA-256<br/>(forward lookup)"]
-        T2["block_id_mappings_by_internal<br/>SHA-256 → SHA-1<br/>(reverse lookup)"]
     end
 
     subgraph Download["On Download"]
@@ -103,13 +102,12 @@ flowchart TD
         Resolve --> S3Get["S3 Get by SHA-256"]
     end
 
-    DualWrite --> T1
-    DualWrite --> T2
+    ForwardOnly --> T1
     Resolve --> T1
 
     style SHA1 fill:#ffc107,color:#000
     style SHA256 fill:#17a2b8,color:#fff
-    style DualWrite fill:#17a2b8,color:#fff
+    style ForwardOnly fill:#17a2b8,color:#fff
 ```
 
 ---

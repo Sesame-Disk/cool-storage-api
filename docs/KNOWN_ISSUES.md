@@ -579,7 +579,7 @@ The schema for block-related tables now uses per-block partitioning:
 - `gc_block_candidates` → `PRIMARY KEY ((org_id, block_id))`
 - `gc_s3_orphans` → `PRIMARY KEY ((org_id, block_id))`
 - `block_id_mappings` → `PRIMARY KEY ((org_id, external_id))`
-- `block_id_mappings_by_internal` → `PRIMARY KEY ((org_id, internal_id), external_id)`
+- `block_id_mappings_by_internal` → historical only; dropped in PR7 after GC moved to `blocks.sha1`
 
 Each block now lives in its own Cassandra partition, so concurrent LWTs from one upload cannot contend at the Paxos layer.
 
@@ -2657,7 +2657,7 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 - Scanner: 8 phases (orphaned blocks/commits/fs_objects, expired share links/versions/auto-delete/shares/restore jobs)
 - Commit deletion now cascades → root fs_object → child entries → blocks (was missing cascade)
 - Library deletion enqueues all artifacts (shares, tags, tokens, locked files)
-- Reverse lookup table `block_id_mappings_by_internal` eliminates full-table scans on block deletion
+- GC now avoids full-table scans on block deletion by resolving SHA-1 from `blocks.sha1` and deleting the single forward mapping row by key
 - `walkFSTree` converted from recursive to iterative (prevents stack overflow)
 - Stats persisted to `gc_stats` table on shutdown, restored on startup (survives container restarts)
 - Scanner runs immediately on startup before entering 24h ticker loop
@@ -3171,8 +3171,8 @@ There is still ordinary async-cleanup risk if the enqueue or GC worker path is u
 
 **Evidence**:
 - OnlyOffice rollback path: `internal/api/v2/onlyoffice.go` calls `DecrementBlockRefCountsOnce` and `enqueueZeroRefBlocks` after metadata publish failure.
-- GC worker block deletion: `internal/gc/worker.go` calls `ListBlockMappingsByInternalID` for the deleted internal block and then `DeleteBlockMapping` for each external mapping.
-- Cassandra store cleanup: `DeleteBlockMapping` deletes both `block_id_mappings` and `block_id_mappings_by_internal`.
+- GC worker block deletion now resolves the external SHA-1 from `blocks.sha1` on the canonical row before deleting the single forward `block_id_mappings` row.
+- The reverse table `block_id_mappings_by_internal` was dropped in PR7; leftover forward mappings are only possible on the documented fail-safe/crash path and are observable via `gc_block_mapping_sha1_missing`.
 
 ---
 

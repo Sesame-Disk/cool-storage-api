@@ -56,6 +56,41 @@ func TestEncryptDecryptBlockSeafile_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestEncryptBlockSeafile_DeterministicForSameKeyIVAndPlaintext(t *testing.T) {
+	fileKey := make([]byte, FileKeySize)
+	fileIV := make([]byte, IVSize)
+	for i := range fileKey {
+		fileKey[i] = byte(i + 3)
+	}
+	for i := range fileIV {
+		fileIV[i] = byte(i + 17)
+	}
+
+	plaintext := []byte("deterministic encrypted block payload")
+
+	first, err := EncryptBlockSeafile(plaintext, fileKey, fileIV)
+	if err != nil {
+		t.Fatalf("first EncryptBlockSeafile failed: %v", err)
+	}
+	second, err := EncryptBlockSeafile(plaintext, fileKey, fileIV)
+	if err != nil {
+		t.Fatalf("second EncryptBlockSeafile failed: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatal("same plaintext + same file key/IV should produce identical ciphertext")
+	}
+
+	differentIV := append([]byte(nil), fileIV...)
+	differentIV[len(differentIV)-1] ^= 0xff
+	third, err := EncryptBlockSeafile(plaintext, fileKey, differentIV)
+	if err != nil {
+		t.Fatalf("third EncryptBlockSeafile failed: %v", err)
+	}
+	if bytes.Equal(first, third) {
+		t.Fatal("changing the derived IV should change ciphertext")
+	}
+}
+
 func TestEncryptBlockSeafile_BadKeySize(t *testing.T) {
 	_, err := EncryptBlockSeafile([]byte("data"), make([]byte, 16), make([]byte, IVSize))
 	if err == nil {

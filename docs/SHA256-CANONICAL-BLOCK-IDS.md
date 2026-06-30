@@ -1,8 +1,9 @@
 # SHA-256 canonical block IDs (and removing SHA-1 from the web client)
 
 **Date:** 2026-06-29 (last updated 2026-06-30)
-**Status:** Design + implementation tracker. PR1-PR5 are **merged to `main`**; PR6 (cleanup)
-is in progress; PR7 (drop the reverse mapping table) remains pending its encrypted-GC check.
+**Status:** Design + implementation tracker. PR1-PR6 are **merged to `main`**; PR7 (drop the reverse
+mapping table) is **implemented** on `feat/sha256-canonical-block-ids-pr7` (pending integration run +
+merge). The whole SHA-256-canonical block-id effort is functionally complete.
 **Supersedes:** the out-of-tree `implementation_plan.md` draft (backend/read-side only),
 which is removed in favour of this document.
 **Related:** [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md) (R10 dual-hash, the current state
@@ -404,7 +405,8 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
    "NO prepended IV"), not a random per-upload IV; the file key/IV are stable per repo. So the same
    plaintext block always produces the same ciphertext → the same SHA-256. SHA-1(plaintext) ↔
    SHA-256(ciphertext) is therefore **1:1 in practice**, encrypted or not. The "one SHA-1 → many
-   SHA-256" hazard the table guarded against is not realized by this code.
+   SHA-256" hazard the table guarded against is not realized by this code. This is now pinned by the
+   unit test `TestEncryptBlockSeafile_DeterministicForSameKeyIVAndPlaintext`.
 2. **GC needs only the SHA-256 → SHA-1 direction, which is single-valued.** Each `blocks` row (one
    SHA-256) carries exactly one `sha1`. The reverse table's multi-alias capability was only ever
    populated by stale/orphan ("reverse-only") rows for defensive cleanup, never by honest content —
@@ -424,6 +426,15 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
    *source* (from a reverse-table enumeration to the single `blocks.sha1`). The encrypted-equivalent
    path (external SHA-1 ≠ internal block_id) is covered by
    `TestGC_WorkerCleansForwardMappingViaBlockSHA1`.
+6. **Crash residue is bounded and observable.** If GC deletes the canonical `blocks` row and then
+   crashes/redeploys before forward-mapping cleanup, a retry can no longer recover `blocks.sha1`
+   because the reverse table is gone. PR7 intentionally fail-closes here: it leaves at most a dangling
+   forward pointer, increments `gc_block_mapping_sha1_missing`, and never risks deleting the wrong
+   row. This is not a data-loss path. The leak is bounded and observable now; the **optimal closure**
+   (persist the external SHA-1 in the durable `gc_s3_orphans` record GC already writes *before*
+   `FinalizeBlockDelete`, so a post-crash retry can finish the mapping delete) is specified in
+   [TECHNICAL-DEBT.md §22 "Open risk — GC crash/redeploy recoverability"](./TECHNICAL-DEBT.md) and
+   deferred until the metric shows real volume.
 
 **No tombstone / hot-partition risk (Cassandra access pattern).** Both queries hit a full partition
 key, so there is no `ALLOW FILTERING`, no clustering-row scan, and no tombstone accumulation to read

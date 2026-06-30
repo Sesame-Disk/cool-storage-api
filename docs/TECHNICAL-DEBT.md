@@ -1930,6 +1930,46 @@ rows, which disappear with the table. `ListBlockMappingsByInternalID` and `Delet
 are removed; the fail-safe (`gc_block_mapping_sha1_missing`) makes any empty-`sha1` block observable
 rather than triggering a blind delete.
 
+### Post-merge monitoring
+PR7 accepts one small recoverability tradeoff: if GC deletes the canonical `blocks` row and then
+dies before forward-mapping cleanup, the retry can no longer reconstruct `blocks.sha1` without the
+dropped reverse table. The remaining row is a harmless dangling pointer, but production should watch
+`gc_block_mapping_sha1_missing`; sustained growth would indicate crashes or repeated failures in the
+window between `FinalizeBlockDelete` and mapping cleanup.
+
+### Open risk — GC crash/redeploy recoverability of forward-mapping cleanup
+
+**Risk.** Block deletion in `processBlock` is a multi-step sequence:
+`RecordS3Orphan` → `FinalizeBlockDelete` (canonical `blocks` row gone) → S3 delete →
+`cleanupBlockMapping` (forward `block_id_mappings` row). The forward-mapping cleanup sources the
+external SHA-1 from `blocks.sha1`, captured *before* `FinalizeBlockDelete`. If the worker is killed
+(crash, OOM, **redeploy/rolling restart**, pod eviction) in the window after `FinalizeBlockDelete`
+but before `cleanupBlockMapping` succeeds, the retried item lands in the `!exists` path where the
+row — and therefore `blocks.sha1` — is gone. With the reverse table dropped there is no way to
+re-derive the external SHA-1, so the forward `block_id_mappings` row leaks permanently.
+
+**Severity: low.** Not data loss and not a correctness hazard: the orphan forward row is a dangling
+pointer (a desktop bare-SHA-1 GET 404s; it self-heals if the identical block is ever re-uploaded,
+since the mapping is rewritten). It only wastes a little Cassandra storage. It is fully observable
+via `gc_block_mapping_sha1_missing`. This is strictly the *mapping-cleanup* step; the block bytes
+(S3) and canonical row are already handled by the existing crash-safe ordering and the
+`gc_s3_orphans` recovery record.
+
+**Optimal closure (deferred — implement when the metric shows real volume).** Make mapping cleanup
+crash-recoverable by carrying the external SHA-1 in the durable record GC *already* writes on the
+delete path. `RecordS3Orphan` persists a `gc_s3_orphans` row **before** `FinalizeBlockDelete`; extend
+it (or add a tiny dedicated `gc_pending_mapping_deletes` row keyed by `(org_id, block_id)`) to store
+`blocks.sha1` at that point. Then:
+- The normal path deletes the forward mapping from the in-memory `blockInfo.Sha1` as today, then
+  clears the durable SHA-1 alongside the orphan row.
+- A post-crash retry that finds the canonical row already gone reads the SHA-1 back from that durable
+  record and completes the forward-mapping delete (and clears the record).
+
+This closes the gap with **no extra hot-path cost** (the orphan row is already written on the delete
+path, not on upload), keeps every query single-partition/keyed, and needs no reverse table. Until
+then the fail-safe + `gc_block_mapping_sha1_missing` metric bound and surface the residue. Tracked
+here so the leak cannot silently become unbounded across redeploys.
+
 ---
 
-*Last updated: 2026-06-29*
+*Last updated: 2026-06-30*
