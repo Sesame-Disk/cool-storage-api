@@ -3172,7 +3172,7 @@ There is still ordinary async-cleanup risk if the enqueue or GC worker path is u
 **Evidence**:
 - OnlyOffice rollback path: `internal/api/v2/onlyoffice.go` calls `DecrementBlockRefCountsOnce` and `enqueueZeroRefBlocks` after metadata publish failure.
 - GC worker block deletion now resolves the external SHA-1 from `blocks.sha1` on the canonical row before deleting the single forward `block_id_mappings` row.
-- The reverse table `block_id_mappings_by_internal` was dropped in PR7; leftover forward mappings are only possible on the documented fail-safe/crash path and are observable via `gc_block_mapping_sha1_missing`.
+- The reverse table `block_id_mappings_by_internal` was dropped in PR7; PR8 closes the restart/redeploy cleanup gap by persisting `external_sha1` + `recovery_phase` in `gc_s3_orphans`, so normal crash recovery can now finish the forward mapping cleanup without the reverse table.
 
 ---
 

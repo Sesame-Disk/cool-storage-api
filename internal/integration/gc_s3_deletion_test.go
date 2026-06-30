@@ -210,7 +210,7 @@ func TestGC_S3OrphanRecovery_DeletesLingeringObject(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = bs.DeleteBlock(ctx, blockID) })
 
-	if _, err := store.RecordS3Orphan(orgID, blockID, storageClass, "seed: simulated S3 delete failure", time.Now().UTC()); err != nil {
+	if _, err := store.RecordS3Orphan(orgID, blockID, storageClass, "", "seed: simulated S3 delete failure", time.Now().UTC()); err != nil {
 		t.Fatalf("RecordS3Orphan: %v", err)
 	}
 	if _, found, err := shareProjectionDBForTest(t).GetBlockS3OrphanInfo(orgID.String(), blockID); err != nil || !found {

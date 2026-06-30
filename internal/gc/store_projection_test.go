@@ -83,12 +83,12 @@ func TestStore_RecordS3Orphan_RepairsMissingProjectionAndPreservesFirstSeenAt(t 
 	orgID := uuid.New()
 	firstSeenAt := time.Now().Add(-48 * time.Hour).UTC().Truncate(time.Millisecond)
 
-	if _, err := store.RecordS3Orphan(orgID, "orph-repair", "hot", "prev", firstSeenAt); err != nil {
+	if _, err := store.RecordS3Orphan(orgID, "orph-repair", "hot", "", "prev", firstSeenAt); err != nil {
 		t.Fatalf("initial RecordS3Orphan failed: %v", err)
 	}
 	store.DeleteS3OrphanProjectionForTest(orgID, "orph-repair", firstSeenAt)
 
-	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, "orph-repair", "cold", "", time.Now())
+	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, "orph-repair", "cold", "", "", time.Now())
 	if err != nil {
 		t.Fatalf("repair RecordS3Orphan failed: %v", err)
 	}
@@ -108,5 +108,71 @@ func TestStore_RecordS3Orphan_RepairsMissingProjectionAndPreservesFirstSeenAt(t 
 	}
 	if orphans[0].StorageClass != "hot" {
 		t.Fatalf("projection storage_class = %q, want %q", orphans[0].StorageClass, "hot")
+	}
+}
+
+func TestStore_StartBlockDeleteOrphan_ResetsStalePendingMappingCleanup(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	firstSeenAt := time.Now().Add(-48 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	if _, err := store.RecordS3Orphan(orgID, "orph-reset", "cold", "sha1-old", "prev", firstSeenAt); err != nil {
+		t.Fatalf("initial RecordS3Orphan failed: %v", err)
+	}
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "orph-reset", "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
+		t.Fatalf("MarkS3OrphanMappingCleanupPending failed: %v", err)
+	}
+
+	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, "orph-reset", "hot", "sha1-new", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("StartBlockDeleteOrphan failed: %v", err)
+	}
+	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
+	}
+
+	orphans := store.AllS3Orphans()
+	if len(orphans) != 1 {
+		t.Fatalf("expected 1 orphan row, got %d", len(orphans))
+	}
+	if orphans[0].RecoveryPhase != S3OrphanPhasePendingS3 {
+		t.Fatalf("recovery phase = %q, want %q", orphans[0].RecoveryPhase, S3OrphanPhasePendingS3)
+	}
+	if orphans[0].ExternalSHA1 != "sha1-new" {
+		t.Fatalf("external sha1 = %q, want %q", orphans[0].ExternalSHA1, "sha1-new")
+	}
+	if orphans[0].StorageClass != "hot" {
+		t.Fatalf("storage class = %q, want %q", orphans[0].StorageClass, "hot")
+	}
+}
+
+func TestStore_RecordS3Orphan_RepairRaceDoesNotResurrectRow(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	firstSeenAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.mu.Lock()
+	store.s3Orphans[orgID.String()+":orph-race"] = &S3OrphanInfo{
+		OrgID:        orgID,
+		BlockID:      "orph-race",
+		StorageClass: "hot",
+		FirstSeenAt:  firstSeenAt,
+	}
+	store.upsertS3OrphanProjection(store.s3Orphans[orgID.String()+":orph-race"])
+	store.mu.Unlock()
+	store.SetRecordS3OrphanRepairRaceForTest(true)
+
+	if _, err := store.RecordS3Orphan(orgID, "orph-race", "hot", "sha1-race", "", time.Now().UTC()); err == nil {
+		t.Fatal("RecordS3Orphan error = nil, want repair-race error")
+	}
+	if got := store.S3OrphanCount(); got != 0 {
+		t.Fatalf("expected no orphan rows after repair race, got %d", got)
+	}
+	orphans, err := store.ListS3OrphansByDay(firstSeenAt, db.GCDiscoveryBucket(orgID.String(), "orph-race"), 10)
+	if err != nil {
+		t.Fatalf("ListS3OrphansByDay failed: %v", err)
+	}
+	if len(orphans) != 0 {
+		t.Fatalf("expected no resurrected projection rows, got %d", len(orphans))
 	}
 }

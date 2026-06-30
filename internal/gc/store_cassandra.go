@@ -1368,20 +1368,63 @@ func (s *CassandraStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockI
 
 // --- S3 orphan recovery ---
 
-func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, storageClass string, firstSeenAt time.Time) error {
+func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, storageClass, externalSHA1, recoveryPhase string, firstSeenAt time.Time) error {
 	return s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass).Exec()
+		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class, external_sha1, recovery_phase)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass, externalSHA1, recoveryPhase).Exec()
+}
+
+// StartBlockDeleteOrphan records the durable recovery row for a NEW block
+// delete lifecycle. It always resets the phase to pending_s3, even when a
+// stale row from an older delete already exists for the same block_id.
+func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
+	externalSHA1 = strings.TrimSpace(externalSHA1)
+	existing := map[string]interface{}{}
+	applied, err := s.db.Session().Query(`
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to record block delete orphan: %w", err)
+	}
+	effectiveFirstSeenAt := now.UTC()
+	effectiveStorageClass := storageClass
+	if !applied {
+		effectiveFirstSeenAt, err = casTimeValue(existing, "first_seen_at")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if effectiveFirstSeenAt.IsZero() {
+			return time.Time{}, fmt.Errorf("gc_s3_orphans row for org=%s block=%s is missing first_seen_at", orgID, blockID)
+		}
+		updateState := map[string]interface{}{}
+		updated, err := s.db.Session().Query(`
+			UPDATE gc_s3_orphans
+			SET storage_class = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
+			WHERE org_id = ? AND block_id = ?
+			IF EXISTS
+		`, effectiveStorageClass, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
+		if err != nil {
+			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
+		}
+		if !updated {
+			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
+		}
+	}
+	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, externalSHA1, S3OrphanPhasePendingS3, effectiveFirstSeenAt); err != nil {
+		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+	}
+	return effectiveFirstSeenAt, nil
 }
 
 // RecordS3Orphan upserts a gc_s3_orphans row preserving and returning the
 // effective first_seen_at when the row already exists. Called both for the
-// initial "S3 pending" record and for actual S3 delete failures.
+// recovery scanner and for actual S3 delete failures.
 //
 // It also guarantees the matching gc_s3_orphans_by_day discovery row exists so
 // recovery can enumerate every orphan without scanning canonical partitions.
-func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) (time.Time, error) {
+func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
 	initialRetryCount := 0
 	if errMsg != "" {
 		initialRetryCount = 1
@@ -1390,14 +1433,16 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 	// INSERT IF NOT EXISTS preserves the original first_seen_at on conflict;
 	// if the row exists we fall through to UpdateS3OrphanAttempt-style update.
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, first_seen_at, last_attempt_at, retry_count, last_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, now, now, initialRetryCount, errMsg).MapScanCAS(existing)
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, externalSHA1, S3OrphanPhasePendingS3, now, now, initialRetryCount, errMsg).MapScanCAS(existing)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to record S3 orphan: %w", err)
 	}
 	effectiveFirstSeenAt := now.UTC()
 	effectiveStorageClass := storageClass
+	effectiveExternalSHA1 := strings.TrimSpace(externalSHA1)
+	effectiveRecoveryPhase := S3OrphanPhasePendingS3
 	if !applied {
 		effectiveFirstSeenAt, err = casTimeValue(existing, "first_seen_at")
 		if err != nil {
@@ -1413,8 +1458,38 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 		if effectiveStorageClass == "" {
 			effectiveStorageClass = storageClass
 		}
+		effectiveExternalSHA1, err = casStringValue(existing, "external_sha1")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if strings.TrimSpace(effectiveExternalSHA1) == "" {
+			effectiveExternalSHA1 = strings.TrimSpace(externalSHA1)
+		}
+		effectiveRecoveryPhase, err = casStringValue(existing, "recovery_phase")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if strings.TrimSpace(effectiveRecoveryPhase) == "" {
+			effectiveRecoveryPhase = S3OrphanPhasePendingS3
+		}
 	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, effectiveFirstSeenAt); err != nil {
+	if !applied && (strings.TrimSpace(parseCASString(existing["external_sha1"])) == "" && effectiveExternalSHA1 != "" ||
+		strings.TrimSpace(parseCASString(existing["recovery_phase"])) == "") {
+		updateState := map[string]interface{}{}
+		updated, err := s.db.Session().Query(`
+			UPDATE gc_s3_orphans
+			SET external_sha1 = ?, recovery_phase = ?
+			WHERE org_id = ? AND block_id = ?
+			IF EXISTS
+		`, effectiveExternalSHA1, effectiveRecoveryPhase, orgID.String(), blockID).MapScanCAS(updateState)
+		if err != nil {
+			return effectiveFirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
+		}
+		if !updated {
+			return effectiveFirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: row disappeared before repair", orgID, blockID)
+		}
+	}
+	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, effectiveExternalSHA1, effectiveRecoveryPhase, effectiveFirstSeenAt); err != nil {
 		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
 	}
 	if !applied && errMsg != "" {
@@ -1423,6 +1498,42 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 		}
 	}
 	return effectiveFirstSeenAt, nil
+}
+
+func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error {
+	externalSHA1 = strings.TrimSpace(externalSHA1)
+	// IF EXISTS: a plain UPDATE is an upsert in Cassandra, so if a concurrent
+	// DeleteS3Orphan (multi-worker recovery race) already removed the row, an
+	// unconditional UPDATE would resurrect a partial phantom row (PK + these cols,
+	// null first_seen_at) plus a stranded projection. IF EXISTS refuses that;
+	// applied=false means another worker finished the recovery — nothing to advance.
+	applied, err := s.db.Session().Query(`
+		UPDATE gc_s3_orphans
+		SET external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, last_error = ?
+		WHERE org_id = ? AND block_id = ?
+		IF EXISTS
+	`, externalSHA1, S3OrphanPhasePendingMappingCleanup, now, "", orgID.String(), blockID).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return fmt.Errorf("mark S3 orphan mapping cleanup pending org=%s block=%s: %w", orgID, blockID, err)
+	}
+	if !applied {
+		return nil
+	}
+	var firstSeenAt time.Time
+	var storageClass string
+	err = s.db.Session().Query(`
+		SELECT first_seen_at, storage_class FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&firstSeenAt, &storageClass)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("read S3 orphan after phase advance org=%s block=%s: %w", orgID, blockID, err)
+	}
+	if err := s.upsertS3OrphanProjection(orgID, blockID, storageClass, externalSHA1, S3OrphanPhasePendingMappingCleanup, firstSeenAt); err != nil {
+		return fmt.Errorf("update S3 orphan discovery phase org=%s block=%s: %w", orgID, blockID, err)
+	}
+	return nil
 }
 
 func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error {
@@ -1485,20 +1596,22 @@ func (s *CassandraStore) ListS3OrphansByDay(day time.Time, bucket int, limit int
 		limit = 100
 	}
 	iter := s.db.Session().Query(`
-		SELECT first_seen_at, org_id, block_id, storage_class
+		SELECT first_seen_at, org_id, block_id, storage_class, external_sha1, recovery_phase
 		FROM gc_s3_orphans_by_day
 		WHERE first_seen_day = ? AND bucket = ?
 		LIMIT ?
 	`, db.GCProjectionUTCDate(day), bucket, limit).Iter()
 	var out []S3OrphanInfo
 	var firstSeen time.Time
-	var orgIDStr, blockID, storageClass string
-	for iter.Scan(&firstSeen, &orgIDStr, &blockID, &storageClass) {
+	var orgIDStr, blockID, storageClass, externalSHA1, recoveryPhase string
+	for iter.Scan(&firstSeen, &orgIDStr, &blockID, &storageClass, &externalSHA1, &recoveryPhase) {
 		out = append(out, S3OrphanInfo{
-			OrgID:        parseUUID(orgIDStr),
-			BlockID:      blockID,
-			StorageClass: storageClass,
-			FirstSeenAt:  firstSeen,
+			OrgID:         parseUUID(orgIDStr),
+			BlockID:       blockID,
+			StorageClass:  storageClass,
+			ExternalSHA1:  strings.TrimSpace(externalSHA1),
+			RecoveryPhase: strings.TrimSpace(recoveryPhase),
+			FirstSeenAt:   firstSeen,
 		})
 	}
 	if err := iter.Close(); err != nil {

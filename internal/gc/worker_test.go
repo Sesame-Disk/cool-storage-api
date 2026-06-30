@@ -298,14 +298,8 @@ func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testi
 		t.Fatal("expected block row to be finalized from DB")
 	}
 	orphans := store.AllS3Orphans()
-	if len(orphans) != 1 {
-		t.Fatalf("AllS3Orphans() len = %d, want 1", len(orphans))
-	}
-	if orphans[0].BlockID != "block-canonical-cold" {
-		t.Fatalf("orphan block = %q, want block-canonical-cold", orphans[0].BlockID)
-	}
-	if orphans[0].StorageClass != "cold-tier" {
-		t.Fatalf("orphan storage_class = %q, want cold-tier", orphans[0].StorageClass)
+	if len(orphans) != 0 {
+		t.Fatalf("AllS3Orphans() len = %d, want 0 after cleanup completes", len(orphans))
 	}
 }
 
