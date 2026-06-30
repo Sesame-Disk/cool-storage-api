@@ -30,10 +30,13 @@ func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
 		calls = append(calls, "read")
 		return "", true, nil
 	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		calls = append(calls, "backfill")
 		if sha1 != strings.Repeat("a", 40) {
 			t.Fatalf("backfill sha1 = %q, want %q", sha1, strings.Repeat("a", 40))
+		}
+		if expectedCurrent != "" {
+			t.Fatalf("expectedCurrent = %q, want empty", expectedCurrent)
 		}
 		return true, nil
 	}
@@ -72,7 +75,7 @@ func TestUpsertBlockMetadataWithSHA1_FirstWriterSkipsReadAndBackfill(t *testing.
 		t.Fatal("read should not run when the INSERT applied")
 		return "", false, nil
 	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		t.Fatal("backfill should not run when the INSERT applied")
 		return false, nil
 	}
@@ -82,7 +85,7 @@ func TestUpsertBlockMetadataWithSHA1_FirstWriterSkipsReadAndBackfill(t *testing.
 	}
 }
 
-func TestUpsertBlockMetadataWithSHA1_FailsWhenRowDisappearsBeforeBackfill(t *testing.T) {
+func TestUpsertBlockMetadataWithSHA1_FailsWhenRowChangesBeforeBackfill(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
 	oldRead := readBlockSHA1ForRepairFn
@@ -99,16 +102,19 @@ func TestUpsertBlockMetadataWithSHA1_FailsWhenRowDisappearsBeforeBackfill(t *tes
 	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
 		return "", true, nil
 	}
-	// The conditional backfill does not apply: the row was GC'd between read and
-	// write. The IF EXISTS guard reports applied=false instead of upserting a
-	// partial row, and the caller must fail closed.
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
+	// The conditional backfill does not apply: another writer (or GC) changed the
+	// row between read and write. The CAS reports applied=false and the caller must
+	// fail closed instead of overwriting or creating a phantom row.
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
+		if expectedCurrent != "" {
+			t.Fatalf("expectedCurrent = %q, want empty", expectedCurrent)
+		}
 		return false, nil
 	}
 
 	err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key")
-	if err == nil || !strings.Contains(err.Error(), "disappeared") {
-		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want disappeared", err)
+	if err == nil || !strings.Contains(err.Error(), "changed before sha1 repair") {
+		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want changed-before-sha1-repair", err)
 	}
 }
 
@@ -129,7 +135,7 @@ func TestUpsertBlockMetadataWithSHA1_LeavesMatchingSHA1Untouched(t *testing.T) {
 	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
 		return strings.Repeat("b", 40), true, nil
 	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		t.Fatal("backfill should not run when the stored sha1 already matches")
 		return false, nil
 	}
@@ -156,7 +162,7 @@ func TestUpsertBlockMetadataWithSHA1_RejectsConflictingExistingSHA1(t *testing.T
 	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
 		return strings.Repeat("c", 40), true, nil
 	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		t.Fatal("backfill should not run when the stored sha1 conflicts")
 		return false, nil
 	}

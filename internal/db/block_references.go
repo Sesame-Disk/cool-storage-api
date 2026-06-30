@@ -145,18 +145,18 @@ var readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string
 	return sha1, true, nil
 }
 
-// backfillBlockSHA1Fn fills in a missing sha1 with IF EXISTS so a plain UPDATE can
-// never upsert a partial blocks row (just primary key + sha1) if the row was GC'd
-// between the read and the write. Returns applied=false when the row no longer
-// exists; the caller fails closed so the block is re-uploaded rather than leaving
-// a phantom row behind.
-var backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
+// backfillBlockSHA1Fn fills in a missing sha1 with a compare-and-set against the
+// sha1 value the caller just observed. That keeps the repair fail-closed in both
+// races we care about:
+//   - if the row was GC'd between read and write, applied=false (no phantom row),
+//   - if another writer populated sha1 concurrently, applied=false (no overwrite).
+var backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 	return database.Session().Query(`
 		UPDATE blocks
 		SET sha1 = ?
 		WHERE org_id = ? AND block_id = ?
-		IF EXISTS
-	`, sha1, orgID, blockID).ScanCAS()
+		IF sha1 = ?
+	`, sha1, orgID, blockID, expectedCurrent).ScanCAS()
 }
 
 func publishAttemptPromotionRetryBackoff(attempt int) time.Duration {
@@ -489,12 +489,12 @@ func (db *DB) ensureBlockSHA1(orgID, blockID, sha1 string) error {
 	}
 	current = strings.TrimSpace(current)
 	if current == "" {
-		applied, err := backfillBlockSHA1Fn(db, orgID, blockID, sha1)
+		applied, err := backfillBlockSHA1Fn(db, orgID, blockID, sha1, current)
 		if err != nil {
 			return fmt.Errorf("backfill block sha1 for %s: %w", blockID, err)
 		}
 		if !applied {
-			return fmt.Errorf("block metadata for %s disappeared before sha1 repair", blockID)
+			return fmt.Errorf("block metadata for %s changed before sha1 repair", blockID)
 		}
 		return nil
 	}
