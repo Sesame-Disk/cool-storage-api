@@ -19,23 +19,23 @@ func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
 	})
 
 	var calls []string
-	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) error {
+	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		calls = append(calls, "insert")
 		if orgID != "org-1" || blockID != "block-1" || sha1 != strings.Repeat("a", 40) {
 			t.Fatalf("insert args = %s/%s/%s", orgID, blockID, sha1)
 		}
-		return nil
+		return false, nil // row already existed -> proceed to read + backfill
 	}
 	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
 		calls = append(calls, "read")
 		return "", true, nil
 	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) error {
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
 		calls = append(calls, "backfill")
 		if sha1 != strings.Repeat("a", 40) {
 			t.Fatalf("backfill sha1 = %q, want %q", sha1, strings.Repeat("a", 40))
 		}
-		return nil
+		return true, nil
 	}
 
 	if err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key"); err != nil {
@@ -52,6 +52,66 @@ func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
 	}
 }
 
+func TestUpsertBlockMetadataWithSHA1_FirstWriterSkipsReadAndBackfill(t *testing.T) {
+	// Hot path: when the INSERT IF NOT EXISTS applies (a brand-new block), the row
+	// already holds our sha1, so there must be NO extra read and NO backfill LWT.
+	database := &DB{}
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockSHA1ForRepairFn
+	oldBackfill := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockSHA1ForRepairFn = oldRead
+		backfillBlockSHA1Fn = oldBackfill
+	})
+
+	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
+		return true, nil // first writer created the row with this sha1
+	}
+	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+		t.Fatal("read should not run when the INSERT applied")
+		return "", false, nil
+	}
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
+		t.Fatal("backfill should not run when the INSERT applied")
+		return false, nil
+	}
+
+	if err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key"); err != nil {
+		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
+	}
+}
+
+func TestUpsertBlockMetadataWithSHA1_FailsWhenRowDisappearsBeforeBackfill(t *testing.T) {
+	database := &DB{}
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockSHA1ForRepairFn
+	oldBackfill := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockSHA1ForRepairFn = oldRead
+		backfillBlockSHA1Fn = oldBackfill
+	})
+
+	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
+		return false, nil // row already existed -> proceed to read/ensure
+	}
+	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+		return "", true, nil
+	}
+	// The conditional backfill does not apply: the row was GC'd between read and
+	// write. The IF EXISTS guard reports applied=false instead of upserting a
+	// partial row, and the caller must fail closed.
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
+		return false, nil
+	}
+
+	err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key")
+	if err == nil || !strings.Contains(err.Error(), "disappeared") {
+		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want disappeared", err)
+	}
+}
+
 func TestUpsertBlockMetadataWithSHA1_LeavesMatchingSHA1Untouched(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
@@ -63,15 +123,15 @@ func TestUpsertBlockMetadataWithSHA1_LeavesMatchingSHA1Untouched(t *testing.T) {
 		backfillBlockSHA1Fn = oldBackfill
 	})
 
-	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) error {
-		return nil
+	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
+		return false, nil // row already existed -> proceed to read/ensure
 	}
 	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
 		return strings.Repeat("b", 40), true, nil
 	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) error {
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
 		t.Fatal("backfill should not run when the stored sha1 already matches")
-		return nil
+		return false, nil
 	}
 
 	if err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("b", 40), 123, "hot", "key"); err != nil {
@@ -90,15 +150,15 @@ func TestUpsertBlockMetadataWithSHA1_RejectsConflictingExistingSHA1(t *testing.T
 		backfillBlockSHA1Fn = oldBackfill
 	})
 
-	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) error {
-		return nil
+	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
+		return false, nil // row already existed -> proceed to read/ensure
 	}
 	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
 		return strings.Repeat("c", 40), true, nil
 	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) error {
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
 		t.Fatal("backfill should not run when the stored sha1 conflicts")
-		return nil
+		return false, nil
 	}
 
 	err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("d", 40), 123, "hot", "key")
@@ -116,9 +176,9 @@ func TestUpsertBlockMetadataWithSHA1_RejectsMalformedInputSHA1(t *testing.T) {
 		readBlockSHA1ForRepairFn = oldRead
 	})
 
-	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) error {
+	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		t.Fatal("insert should not run for malformed sha1 input")
-		return nil
+		return false, nil
 	}
 	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
 		t.Fatal("read should not run for malformed sha1 input")

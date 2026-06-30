@@ -107,29 +107,17 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
   rollout. On a non-empty environment, untouched older `blocks` rows could still retain empty
   `sha1` until a dedicated backfill runs; the PR5 repair path now self-heals any such row that is
   re-uploaded with verified bytes, but it is not a bulk migration.
-- **TODO (before PR4/PR5):** the template-block path in `CreateFile`
-  ([files.go:1355](../internal/api/v2/files.go#L1355)) currently registers its block with an
-  empty `sha1` (the SHA-1 is not threaded there yet). That is harmless while nothing reads
-  `blocks.sha1`, but once PR4/PR5 derive `seafile_block_ids_sha1` / the `fs_id` from
-  `blocks.sha1`, this path must supply the block's SHA-1 (or compute it locally) or
-  template-created files would get an empty Seafile block id and break desktop `fs_id` matching.
+### Gating rule for PR4/PR5 — RESOLVED
 
-### Gating rule for the next branch (PR4/PR5)
+The two preconditions that gated PR4/PR5 are both closed:
 
-Do **not** start PR4/PR5 until both are closed:
-
-1. **Close the template-block TODO above** — `CreateFile` must persist a real `blocks.sha1`.
-2. **Add fail-closed validation of `blocks.sha1` at the point of consumption.** `ProbeBlockReuse`
-   exposes `Sha1` raw (only `TrimSpace`d); the commit that uses it as the source for
-   `seafile_block_ids_sha1` / `fs_id` (PR5) MUST reject empty or non-40-hex values by treating
-   the block as `needs_upload` (the re-upload now recomputes and repairs a verified `sha1`) — never
-   write an unvalidated SHA-1 into an fs_object. Reuse `isHex40`
-   ([file_from_blocks.go:134](../internal/api/v2/file_from_blocks.go#L134)); mirror the existing
-   R1/R10 "forward mapping missing → needs_upload" pattern. Fail closed, never silently.
-
-Also add, when the value first drives `fs_id` (PR5): a test with a **real 40-hex SHA-1** plus the
-integration round-trip asserting the desktop-expected `fs_id` (the current plumbing tests use
-`"sha1-1"`/`"ext-1"`, which only prove the argument travels).
+1. ~~`CreateFile` template block must persist a real `blocks.sha1`.~~ **Done (PR4):** `CreateFile`
+   computes the template SHA-1, uses it as the external block id, and writes the mapping +
+   `blocks.sha1` via `RegisterUploadedBlockAndMapping`.
+2. ~~Fail-closed validation of `blocks.sha1` at the point of consumption.~~ **Done (PR5):**
+   `file-from-blocks` reads `blocks.sha1` via `ProbeBlockReuse` and `needs_upload`s any ready
+   block whose `blocks.sha1` is empty/non-40-hex (`isHex40`); the re-upload repairs the row (see
+   `ensureBlockSHA1`, `IF EXISTS` backfill). An unvalidated SHA-1 never reaches an fs_object.
 
 ### Blocker checklist (single source of truth)
 

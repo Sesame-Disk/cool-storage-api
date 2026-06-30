@@ -118,11 +118,15 @@ var removePublishAttemptReferenceFn = func(database *DB, orgID, blockID, referre
 	return database.RemoveBlockReference(orgID, blockID, referrer)
 }
 
-var upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) error {
+// upsertBlockMetadataInsertFn does the first-writer-wins INSERT IF NOT EXISTS (the
+// one LWT this path has always taken) and reports whether the row was created by
+// this call. When applied, the row now holds exactly the sha1 passed here, so the
+// caller can skip any read/repair entirely.
+var upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 	return database.Session().Query(`
 		INSERT INTO blocks (org_id, block_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID, blockID, sha1, sizeBytes, storageClass, storageKey, now, now).Exec()
+	`, orgID, blockID, sha1, sizeBytes, storageClass, storageKey, now, now).MapScanCAS(map[string]interface{}{})
 }
 
 var readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
@@ -141,12 +145,18 @@ var readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string
 	return sha1, true, nil
 }
 
-var backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) error {
+// backfillBlockSHA1Fn fills in a missing sha1 with IF EXISTS so a plain UPDATE can
+// never upsert a partial blocks row (just primary key + sha1) if the row was GC'd
+// between the read and the write. Returns applied=false when the row no longer
+// exists; the caller fails closed so the block is re-uploaded rather than leaving
+// a phantom row behind.
+var backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) (bool, error) {
 	return database.Session().Query(`
 		UPDATE blocks
 		SET sha1 = ?
 		WHERE org_id = ? AND block_id = ?
-	`, sha1, orgID, blockID).Exec()
+		IF EXISTS
+	`, sha1, orgID, blockID).ScanCAS()
 }
 
 func publishAttemptPromotionRetryBackoff(attempt int) time.Duration {
@@ -451,8 +461,16 @@ func (db *DB) UpsertBlockMetadataWithSHA1(orgID, blockID, sha1 string, sizeBytes
 		return fmt.Errorf("invalid block sha1 for %s", blockID)
 	}
 	now := time.Now().UTC()
-	if err := upsertBlockMetadataInsertFn(db, orgID, blockID, sha1, sizeBytes, storageClass, storageKey, now); err != nil {
+	applied, err := upsertBlockMetadataInsertFn(db, orgID, blockID, sha1, sizeBytes, storageClass, storageKey, now)
+	if err != nil {
 		return err
+	}
+	// Hot path: when this call created the row it already holds our sha1, and when
+	// the caller has no sha1 there is nothing to add — either way return without an
+	// extra read or a second LWT. The read + IF EXISTS repair below only runs when a
+	// PRE-EXISTING row (dedup) might be missing its sha1.
+	if applied || sha1 == "" {
+		return nil
 	}
 	return db.ensureBlockSHA1(orgID, blockID, sha1)
 }
@@ -471,8 +489,12 @@ func (db *DB) ensureBlockSHA1(orgID, blockID, sha1 string) error {
 	}
 	current = strings.TrimSpace(current)
 	if current == "" {
-		if err := backfillBlockSHA1Fn(db, orgID, blockID, sha1); err != nil {
+		applied, err := backfillBlockSHA1Fn(db, orgID, blockID, sha1)
+		if err != nil {
 			return fmt.Errorf("backfill block sha1 for %s: %w", blockID, err)
+		}
+		if !applied {
+			return fmt.Errorf("block metadata for %s disappeared before sha1 repair", blockID)
 		}
 		return nil
 	}
