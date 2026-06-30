@@ -371,11 +371,14 @@ func TestWebBlockUploadIgnoresForgedClientSHA1(t *testing.T) {
 // TestWebBlockUploadCommitIndependentOfReverseMapping proves the commit relies on
 // the FORWARD mapping only: deleting the reverse projection row (which is
 // best-effort and may lag) must NOT block a commit whose forward row is intact.
-func TestWebBlockUploadCommitIndependentOfReverseMapping(t *testing.T) {
-	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-rev-%d", time.Now().UnixNano()))
-	orgID := resolveOrgID(t, repoID)
+// TestWebBlockUploadCommitForwardMappingOnly confirms a web block upload commits
+// and downloads using only the forward block_id_mappings row. The reverse index
+// (block_id_mappings_by_internal) was dropped in migration 006; commit and the
+// desktop bare-SHA-1 block download both resolve through the forward table alone.
+func TestWebBlockUploadCommitForwardMappingOnly(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-fwd-%d", time.Now().UnixNano()))
 	session := webCreateBlockSession(t, adminClient, repoID, "/")
-	content := []byte("reverse-independent block " + fmt.Sprint(time.Now().UnixNano()))
+	content := []byte("forward-mapping block " + fmt.Sprint(time.Now().UnixNano()))
 
 	resp := webUploadBlock(t, adminClient, session, content)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
@@ -383,23 +386,17 @@ func TestWebBlockUploadCommitIndependentOfReverseMapping(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Remove the reverse projection row; the forward row stays intact.
-	dbSession := shareProjectionDBForTest(t).Session()
-	if err := dbSession.Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ?`, orgID, sha256hex(content)).Exec(); err != nil {
-		t.Fatalf("delete reverse mapping: %v", err)
-	}
-
 	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
 		"session": session, "parent_dir": "/", "filename": "revindep.bin",
 		"replace": false, "size": len(content),
-		"blocks": []map[string]interface{}{{"sha1": sha1hex(content), "sha256": sha256hex(content), "size": len(content)}},
+		"blocks": []map[string]interface{}{{"sha256": sha256hex(content), "size": len(content)}},
 	})
 	expectStatus(t, commit, http.StatusOK)
 	commit.Body.Close()
 
 	got := downloadRepoFile(t, adminClient, repoID, "/revindep.bin")
 	if !bytes.Equal(got, content) {
-		t.Fatalf("download mismatch after reverse-mapping deletion")
+		t.Fatalf("download mismatch with forward mapping only")
 	}
 }
 

@@ -570,9 +570,9 @@ only one DC (see `configs/config.prod.yaml` comments and KNOWN_ISSUES.md
 `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period (>>200ms cross-DC replication lag)
 ensures a block's references are fully replicated before the gate runs.
 
-#### Reverse Lookup Table
+#### Reverse Lookup Table — DROPPED (PR7, migration 006)
 
-`block_id_mappings_by_internal` provides reverse lookup (internal SHA-256 → external SHA-1) so the worker can find and clean mappings when deleting a block without scanning the entire `block_id_mappings` table. Dual-written alongside the forward table on every upload.
+`block_id_mappings_by_internal` (a reverse internal SHA-256 → external SHA-1 lookup, dual-written on every upload) **was dropped** in `006_drop_block_id_mappings_by_internal.cql`. GC cleanup now sources the external SHA-1 from `blocks.sha1` (a keyed point read captured before the block row is deleted) and deletes the single forward `block_id_mappings` row by `(org_id, external_id)` — no reverse enumeration, no dual-write. See [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) (PR7).
 
 ---
 
@@ -714,13 +714,6 @@ erDiagram
         TIMESTAMP created_at
     }
 
-    block_id_mappings_by_internal {
-        UUID org_id PK
-        TEXT internal_id PK
-        TEXT external_id PK
-        TIMESTAMP created_at
-    }
-
     share_links {
         TEXT link_token PK
         TEXT link_type
@@ -809,7 +802,6 @@ erDiagram
     organizations ||--o{ libraries : "contains"
     organizations ||--o{ blocks : "contains"
     organizations ||--o{ block_id_mappings : "contains"
-    organizations ||--o{ block_id_mappings_by_internal : "contains"
     organizations ||--o{ restore_jobs : "contains"
     organizations ||--o{ hostname_mappings : "mapped_to"
 
@@ -838,7 +830,7 @@ erDiagram
 | `commits` → `fs_objects` | Each commit points to a root fs_object (directory tree) |
 | `fs_objects` → `blocks` | Files reference content blocks by ID |
 | `blocks` ← `block_id_mappings` | SHA-1 to SHA-256 translation for Seafile clients |
-| `block_id_mappings` ↔ `block_id_mappings_by_internal` | Reverse lookup (SHA-256 → SHA-1) for GC cleanup |
+| `blocks.sha1` + `block_id_mappings` | GC resolves SHA-256 → SHA-1 from the block row, while desktop download keeps the forward SHA-1 → SHA-256 mapping |
 | `users` → `starred_files` | User favorites |
 | `libraries` → `locked_files` | File locking for collaborative editing |
 
@@ -853,7 +845,7 @@ Cassandra tables use partition keys (PK) for data distribution:
 | `commits` | `library_id` | `commit_id` | History per library |
 | `fs_objects` | `library_id` | `fs_id` | Tree per library |
 | `blocks` | `org_id` | `block_id` | Blocks per org (dedup) |
-| `block_id_mappings_by_internal` | `org_id` | `internal_id, external_id` | Reverse lookup for GC |
+| `block_id_mappings` | `org_id, external_id` | — | Desktop SHA-1 → SHA-256 lookup |
 | `starred_files` | `user_id` | `repo_id, path` | User favorites |
 
 ---

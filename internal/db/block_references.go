@@ -213,33 +213,11 @@ func NormalizeBlockIDs(blockIDs []string) []string {
 	return normalized
 }
 
-// WriteBlockIDMappingDualWrite executes the forward mapping write, the reverse
-// write, and optionally a compensating rollback of the forward write if the
-// reverse side fails. Passing a nil rollback keeps the forward row in place,
-// which is safer for caller-visible SHA-1 resolution than deleting a mapping
-// that another concurrent writer may already rely on.
-func WriteBlockIDMappingDualWrite(writeForward func() error, rollbackForward func() error, writeReverse func() error) error {
-	if err := writeForward(); err != nil {
-		return err
-	}
-	if err := writeReverse(); err != nil {
-		if rollbackForward == nil {
-			return err
-		}
-		if rollbackErr := rollbackForward(); rollbackErr != nil {
-			return errors.Join(err, fmt.Errorf("rollback forward block mapping: %w", rollbackErr))
-		}
-		return err
-	}
-	return nil
-}
-
-// WriteBlockIDMapping dual-writes the external SHA-1 -> internal SHA-256 mapping
-// plus the reverse lookup row used by GC cleanup. Reverse-write failures do NOT
-// delete the forward row: client-visible SHA-1 resolution depends on that row,
-// and deleting it after a partial failure can clobber a mapping that another
-// concurrent writer has already made valid. Callers still fail closed so a
-// later retry can heal the reverse lookup.
+// WriteBlockIDMapping writes the forward external SHA-1 -> internal SHA-256
+// mapping used to resolve a desktop bare-SHA-1 block download. The reverse
+// projection (block_id_mappings_by_internal) was dropped in migration 006: GC
+// mapping cleanup now sources the external SHA-1 from blocks.sha1, so this is a
+// single forward INSERT with no dual-write on the upload hot path.
 func (db *DB) WriteBlockIDMapping(orgID, externalID, internalID string, createdAt time.Time) error {
 	if db == nil {
 		return nil
@@ -248,19 +226,9 @@ func (db *DB) WriteBlockIDMapping(orgID, externalID, internalID string, createdA
 	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
-	return WriteBlockIDMappingDualWrite(
-		func() error {
-			return db.Session().Query(`
-				INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?)
-			`, orgID, externalID, internalID, ts).Exec()
-		},
-		nil,
-		func() error {
-			return db.Session().Query(`
-				INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, ?)
-			`, orgID, internalID, externalID, ts).Exec()
-		},
-	)
+	return db.Session().Query(`
+		INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?)
+	`, orgID, externalID, internalID, ts).Exec()
 }
 
 // GetBlockIDMapping resolves one external SHA-1 block ID to its internal SHA-256
@@ -304,8 +272,8 @@ func (db *DB) GetBlockIDMapping(orgID, externalID string) (internalID string, ok
 // SHA-1, different content) racing the tiny read->write window — astronomically
 // unlikely.
 //
-// The reverse row is a best-effort GC/repair projection and is NEVER the source
-// of truth for a commit.
+// Only the forward row is written: the reverse projection was dropped in
+// migration 006 (GC cleanup now sources the external SHA-1 from blocks.sha1).
 func (db *DB) WriteVerifiedWebBlockMapping(orgID, externalID, internalID string, createdAt time.Time) error {
 	if db == nil {
 		return nil
@@ -324,18 +292,11 @@ func (db *DB) WriteVerifiedWebBlockMapping(orgID, externalID, internalID string,
 		if strings.TrimSpace(existing) != internalID {
 			return fmt.Errorf("%w: external %s already maps to %s (got %s)", ErrBlockIDMappingConflict, externalID, existing, internalID)
 		}
-	} else {
-		if err := db.Session().Query(`
-			INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?)
-		`, orgID, externalID, internalID, ts).Exec(); err != nil {
-			return err
-		}
+		return nil
 	}
-	// Reverse projection (GC/repair only; never authoritative for a commit). It is
-	// rewritten idempotently and fails closed so a retry can heal it.
 	return db.Session().Query(`
-		INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, ?)
-	`, orgID, internalID, externalID, ts).Exec()
+		INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?)
+	`, orgID, externalID, internalID, ts).Exec()
 }
 
 // AddPublishAttemptReferences stages temporary pub:<attempt> references for an

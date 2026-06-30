@@ -190,16 +190,6 @@ func blockIDMappingExists(t *testing.T, orgID, externalID string) bool {
 	return err == nil && internalID != ""
 }
 
-func reverseBlockIDMappingExists(t *testing.T, orgID, internalID, externalID string) bool {
-	t.Helper()
-	session := shareProjectionDBForTest(t).Session()
-	var storedExternalID string
-	err := session.Query(`
-		SELECT external_id FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?
-	`, orgID, internalID, externalID).Scan(&storedExternalID)
-	return err == nil && storedExternalID == externalID
-}
-
 func gcS3OrphanProjectionExists(t *testing.T, orgID, blockID string, firstSeenAt time.Time) bool {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
@@ -976,24 +966,15 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 	orgID := orgUUID.String()
 	blockID := fmt.Sprintf("cand-missing-%d", time.Now().UnixNano())
 	externalBlockID := fmt.Sprintf("%040x", time.Now().UnixNano())
-	reverseOnlyExternalBlockID := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
 	candidateAt := ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", queuedAt)
 	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", queuedAt)
 	if err := database.WriteBlockIDMapping(orgID, externalBlockID, blockID, time.Now().UTC()); err != nil {
 		t.Fatalf("failed to seed block mapping for %s/%s: %v", orgID, blockID, err)
 	}
-	if err := database.Session().Query(`
-		INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at)
-		VALUES (?, ?, ?, ?)
-	`, orgID, blockID, reverseOnlyExternalBlockID, time.Now().UTC()).Exec(); err != nil {
-		t.Fatalf("failed to seed reverse-only block mapping for %s/%s: %v", orgID, blockID, err)
-	}
 	t.Cleanup(func() {
 		cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
 		_ = database.Session().Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, externalBlockID).Exec()
-		_ = database.Session().Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`, orgID, blockID, externalBlockID).Exec()
-		_ = database.Session().Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`, orgID, blockID, reverseOnlyExternalBlockID).Exec()
 		if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
 			t.Fatalf("failed to delete blocks row for %s/%s: %v", orgID, blockID, err)
 		}
@@ -1011,23 +992,22 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 	if !gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) {
 		t.Fatal("expected gc_queue row before worker")
 	}
-	if !blockIDMappingExists(t, orgID, externalBlockID) || !reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID) {
-		t.Fatal("expected block_id_mappings rows before worker")
-	}
-	if !reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID) {
-		t.Fatal("expected reverse-only block_id_mappings_by_internal row before worker")
+	if !blockIDMappingExists(t, orgID, externalBlockID) {
+		t.Fatal("expected forward block_id_mappings row before worker")
 	}
 
+	// The candidate has no canonical blocks row, so the worker sweeps the
+	// candidate/queue/projection but CANNOT resolve the forward mapping: blocks.sha1
+	// is unavailable once the row is gone, and the reverse index was dropped in
+	// migration 006. The forward mapping is left as a harmless dangling pointer
+	// (recorded via the gc_block_mapping_sha1_missing metric).
 	for attempt := 0; attempt < 8; attempt++ {
 		if !gcCandidateExists(t, orgID, blockID) &&
 			!gcCandidateProjectionExists(t, orgID, blockID, candidateAt) &&
 			!gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) &&
 			!failedQueueItemExists(t, orgID, "block", blockID) &&
-			!blockIDMappingExists(t, orgID, externalBlockID) &&
-			!reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID) &&
-			!reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID) &&
 			!blockExistsInDB(t, orgID, blockID) {
-			return
+			break
 		}
 		// Scope processing to the synthetic org. A bare ProcessOnce would fan out
 		// across every active org and, with this nil-storage worker, could dequeue
@@ -1046,20 +1026,86 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 		gcCandidateProjectionExists(t, orgID, blockID, candidateAt) ||
 		gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) ||
 		failedQueueItemExists(t, orgID, "block", blockID) ||
-		blockIDMappingExists(t, orgID, externalBlockID) ||
-		reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID) ||
-		reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID) ||
 		blockExistsInDB(t, orgID, blockID) {
-		t.Fatalf("stale candidate without canonical row was not fully skipped: block_exists=%v candidate=%v projection=%v queue=%v failed=%v mapping=%v reverse_mapping=%v reverse_only_mapping=%v",
+		t.Fatalf("stale candidate without canonical row was not fully skipped: block_exists=%v candidate=%v projection=%v queue=%v failed=%v",
 			blockExistsInDB(t, orgID, blockID),
 			gcCandidateExists(t, orgID, blockID),
 			gcCandidateProjectionExists(t, orgID, blockID, candidateAt),
 			gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)),
 			failedQueueItemExists(t, orgID, "block", blockID),
-			blockIDMappingExists(t, orgID, externalBlockID),
-			reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID),
-			reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID),
 		)
+	}
+
+	// The forward mapping survives: with the canonical row gone there is no
+	// blocks.sha1 to resolve it, and PR7 must not blind-delete it.
+	if !blockIDMappingExists(t, orgID, externalBlockID) {
+		t.Fatal("expected forward mapping to survive the missing-canonical-row path (dangling pointer, observable via metric)")
+	}
+}
+
+// TestGC_WorkerCleansForwardMappingViaBlockSHA1 is the PR7 encrypted-equivalent
+// guard: it deletes a real block whose external SHA-1 differs from its internal
+// block_id (exactly the encrypted-library shape — SHA-1 over plaintext, SHA-256
+// over ciphertext — but the same shape any web/seafhttp block has). With the
+// reverse index dropped (migration 006), GC must resolve and delete the forward
+// block_id_mappings row from blocks.sha1, NOT from block_id. A wrong source would
+// leave the forward mapping behind (or delete the wrong row).
+func TestGC_WorkerCleansForwardMappingViaBlockSHA1(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	queue := gcpkg.NewQueue(store)
+	worker := gcpkg.NewWorker(store, nil, queue, 100, 0, false, &gcpkg.Stats{})
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	// block_id is the 64-hex internal (ciphertext) identity; externalSHA1 is the
+	// 40-hex Seafile (plaintext) id. They differ, as in an encrypted library.
+	blockID := fmt.Sprintf("%064x", time.Now().UnixNano())
+	externalSHA1 := fmt.Sprintf("%040x", time.Now().UnixNano())
+	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+
+	// Real zero-ref canonical row carrying blocks.sha1 = externalSHA1 (what every
+	// materialization path writes), plus the forward mapping it resolves to.
+	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, externalSHA1, 1, "hot", ""); err != nil {
+		t.Fatalf("seed block with sha1: %v", err)
+	}
+	if err := database.WriteBlockIDMapping(orgID, externalSHA1, blockID, time.Now().UTC()); err != nil {
+		t.Fatalf("seed forward mapping: %v", err)
+	}
+	_ = ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", queuedAt)
+	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", queuedAt)
+	t.Cleanup(func() {
+		cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
+		_ = database.Session().Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, externalSHA1).Exec()
+		_ = database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec()
+	})
+
+	if !blockExistsInDB(t, orgID, blockID) {
+		t.Fatal("expected canonical block row before worker")
+	}
+	if !blockIDMappingExists(t, orgID, externalSHA1) {
+		t.Fatal("expected forward mapping before worker")
+	}
+
+	for attempt := 0; attempt < 8; attempt++ {
+		if !blockExistsInDB(t, orgID, blockID) && !blockIDMappingExists(t, orgID, externalSHA1) {
+			break
+		}
+		processed, err := worker.ProcessOrgOnce(context.Background(), orgUUID)
+		if err != nil {
+			t.Fatalf("ProcessOrgOnce attempt %d failed: %v", attempt+1, err)
+		}
+		if processed == 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	if blockExistsInDB(t, orgID, blockID) {
+		t.Fatal("expected block row deleted")
+	}
+	if blockIDMappingExists(t, orgID, externalSHA1) {
+		t.Fatal("expected forward mapping deleted via blocks.sha1 (resolved from sha1, not block_id)")
 	}
 }
 

@@ -201,6 +201,7 @@ type mockBlock struct {
 	CreatedAt    *time.Time
 	GCState      string
 	GCClaimID    string
+	Sha1         string
 }
 
 type mockPendingItemKey struct {
@@ -608,6 +609,22 @@ func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID stri
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, externalID)
 	m.mappings[key] = internalID
+	// Mirror the server-derived blocks.sha1 onto the block row so GC mapping
+	// cleanup (which now reads blocks.sha1 instead of the dropped reverse index)
+	// can resolve the forward row for this internal id.
+	if b := m.blocks[fmt.Sprintf("%s:%s", orgID, internalID)]; b != nil && strings.TrimSpace(b.Sha1) == "" {
+		b.Sha1 = externalID
+	}
+}
+
+// ForwardBlockMappingExists reports whether the forward external->internal block
+// mapping row still exists. Test accessor that replaces the dropped reverse-index
+// assertions.
+func (m *MockStore) ForwardBlockMappingExists(orgID uuid.UUID, externalID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.mappings[fmt.Sprintf("%s:%s", orgID, externalID)]
+	return ok
 }
 
 func (m *MockStore) AddStorageSnapshot(scope string, bytesUsed, fileCount int64) {
@@ -998,7 +1015,7 @@ func (m *MockStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, er
 	if block == nil {
 		return BlockInfo{}, gocql.ErrNotFound
 	}
-	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, CreatedAt: block.CreatedAt}, nil
+	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, CreatedAt: block.CreatedAt, Sha1: block.Sha1}, nil
 }
 
 // BlockReferenceCount returns how many reference rows a block currently has.
@@ -1890,31 +1907,7 @@ func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string
 	return nil
 }
 
-func (m *MockStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	prefix := fmt.Sprintf("%s:", orgID)
-	var mappings []BlockMapping
-	for key, intID := range m.mappings {
-		if len(key) > len(prefix) && key[:len(prefix)] == prefix && intID == internalID {
-			extID := key[len(prefix):]
-			mappings = append(mappings, BlockMapping{ExternalID: extID, InternalID: intID})
-		}
-	}
-	return mappings, nil
-}
-
 func (m *MockStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	key := fmt.Sprintf("%s:%s", orgID, externalID)
-	delete(m.mappings, key)
-	return nil
-}
-
-func (m *MockStore) DeleteBlockMappingResolved(orgID uuid.UUID, externalID, internalID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

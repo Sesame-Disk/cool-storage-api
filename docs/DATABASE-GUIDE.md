@@ -587,25 +587,29 @@ PUT /seafhttp/repo/{repo_id}/block/{sha1_hash}
 
 ---
 
-### 9b. `block_id_mappings_by_internal`
-**Purpose:** Reverse lookup (SHA-256 → SHA-1) for GC cleanup — avoids full table scans when deleting blocks
+### 9b. `block_id_mappings_by_internal` — DROPPED (PR7, migration 006)
+> **Removed.** This reverse table was dropped in `006_drop_block_id_mappings_by_internal.cql`. GC
+> cleanup now sources a block's external SHA-1 from `blocks.sha1` (a keyed point read, captured from
+> `GetBlockInfo` before the row is deleted) and deletes the single forward `block_id_mappings` row by
+> `(org_id, external_id)`. No reverse enumeration, no dual-write. The description below is retained
+> for historical context only.
+
+**Historical purpose:** Reverse lookup (SHA-256 → SHA-1) for GC cleanup before PR7.
 
 **Schema:**
 ```sql
 PRIMARY KEY ((org_id), internal_id, external_id)  -- Lookup by SHA-256
 ```
 
-**Why needed?**
-- When GC deletes a block (by SHA-256 internal_id), it needs to find and clean the corresponding forward mapping
-- Without this table, the worker would have to scan the entire `block_id_mappings` table per org
-- Dual-written alongside `block_id_mappings` on every upload
+**Why it was needed:**
+- GC used to delete blocks by SHA-256 and enumerate the matching SHA-1 alias(es) from this table.
+- It was dual-written alongside `block_id_mappings` on every upload.
+- PR7 removed that need by reading the authoritative SHA-1 from `blocks.sha1` on the canonical block row itself.
 
 **GC Usage:**
 ```
-Worker deletes block (SHA-256) →
-  ListBlockMappingsByInternalID(org_id, internal_id) →
-  Returns external_id (SHA-1) →
-  Delete from both block_id_mappings + block_id_mappings_by_internal
+Worker reads blocks.sha1 from blocks(org_id, block_id) →
+  Deletes the single forward row from block_id_mappings(org_id, external_id)
 ```
 
 ---

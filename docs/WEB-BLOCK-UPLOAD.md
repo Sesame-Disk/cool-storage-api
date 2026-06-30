@@ -266,7 +266,7 @@ the canonical id moved into `block_ids` and the SHA-1 list moved to its own colu
 | `block_references.block_id` | SHA-256 |
 | S3 object key | SHA-256 |
 | `block_id_mappings` (forward) | SHA-1 → SHA-256 (still resolves the desktop bare-SHA-1 block GET) |
-| `block_id_mappings_by_internal` (reverse) | SHA-256 → SHA-1 (best-effort GC/repair projection; slated for removal in PR7) |
+| `block_id_mappings_by_internal` (reverse) | **DROPPED (PR7, migration 006)** — GC cleanup now sources the SHA-1 from `blocks.sha1` |
 
 
 **Validated end-to-end (2026-06-24) against a real Seafile desktop client** on
@@ -299,7 +299,8 @@ canonical layout and the server-derived-SHA-1 semantics (PR5):
 seafile_block_ids_sha1 = SHA-1),
 `TestWebBlockUploadIgnoresForgedClientSHA1` (a forged client SHA-1 is ignored; the
 fs_object stores the server-derived SHA-1),
-`TestWebBlockUploadCommitIndependentOfReverseMapping`,
+`TestWebBlockUploadCommitForwardMappingOnly` (commit + download resolve through the
+forward mapping alone; the reverse table was dropped in PR7),
 `TestWebBlockUploadReplayIgnoresClientSHA1` (replay with a different client SHA-1 is the
 same file),
 `TestWebBlockUploadReuploadRepairsMissingBlockSHA1` (a blank `blocks.sha1` is repaired on

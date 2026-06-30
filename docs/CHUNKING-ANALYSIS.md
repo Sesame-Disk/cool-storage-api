@@ -23,9 +23,10 @@ missing → create commit → download and verify content.
 
 ### HIGH: No test for SHA-1 ↔ SHA-256 mapping correctness
 
-The dual mapping tables (`block_id_mappings` and `block_id_mappings_by_internal`)
-are written on every upload and read on every download. If the mapping is wrong or
-missing, downloads return 404 or corrupted data.
+The forward mapping table (`block_id_mappings`) is written on upload and read on
+desktop/sync download. PR7 dropped the reverse table
+`block_id_mappings_by_internal`; GC now resolves SHA-1 from `blocks.sha1`. If the
+forward mapping is wrong or missing, downloads return 404 or corrupted data.
 
 **Currently:** Mapping is tested implicitly (upload via web, download via web works).
 But there's no test that verifies: upload via web (creates mapping) → download via
@@ -125,13 +126,15 @@ network endpoint.
 
 ### LOW: Orphaned block mappings after block deletion
 
-When GC deletes a block from S3 and the `blocks` table, it also deletes mappings
-found via the `block_id_mappings_by_internal` index. If the index is stale or
-incomplete, some forward mappings (`block_id_mappings`) may remain as orphans.
+When GC deletes a block from S3 and the `blocks` table, PR7 deletes the forward
+mapping using `blocks.sha1`. If the worker crashes after deleting the canonical
+row but before mapping cleanup, some forward mappings (`block_id_mappings`) may
+remain as harmless dangling pointers because the reverse table no longer exists.
 
 **Impact:** Wasted Cassandra storage. No data loss.
 
-**Tested:** No.
+**Tested:** Covered by unit/integration tests for the PR7 fail-safe; monitor
+`gc_block_mapping_sha1_missing` in production.
 
 ---
 
