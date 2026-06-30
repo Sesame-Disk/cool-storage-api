@@ -186,3 +186,16 @@ func TestClassifyBlockUploadCommitConflict_TreatsMissingSessionStateAsInProgress
 		t.Fatalf("errorMessage = %q, want retryable in-progress conflict", errorMessage)
 	}
 }
+
+func TestCommittedFileIDFromSession(t *testing.T) {
+	valid := strings.Repeat("a", 40)
+	if got := committedFileIDFromSession(db.BlockUploadSession{ResultCommitID: valid}); got != valid {
+		t.Fatalf("committedFileIDFromSession(valid) = %q, want %q", got, valid)
+	}
+	if got := committedFileIDFromSession(db.BlockUploadSession{ResultCommitID: strings.Repeat("b", 64)}); got != "" {
+		t.Fatalf("committedFileIDFromSession(sha256) = %q, want empty", got)
+	}
+	if got := committedFileIDFromSession(db.BlockUploadSession{ResultCommitID: "not-a-fsid"}); got != "" {
+		t.Fatalf("committedFileIDFromSession(invalid) = %q, want empty", got)
+	}
+}

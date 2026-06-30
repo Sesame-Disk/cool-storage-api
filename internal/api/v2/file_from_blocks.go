@@ -44,25 +44,33 @@ func classifyBlockUploadCommitConflict(session db.BlockUploadSession, found bool
 	return "", blockUploadCommitInProgressCode, "commit still in progress; retry"
 }
 
+func committedFileIDFromSession(session db.BlockUploadSession) string {
+	fileID := strings.TrimSpace(session.ResultCommitID)
+	if isHex40(fileID) {
+		return fileID
+	}
+	return ""
+}
+
 // waitForBlockUploadResult polls for the result of a concurrent winner's commit
 // on the same session, so a losing/retried request returns the same file
 // (idempotency, R7) instead of duplicating it. Bounded (~10s); returns ok=false
 // on timeout or if a different manifest won the session.
-func (h *FileHandler) waitForBlockUploadResult(sessionID, digest string) (string, bool) {
+func (h *FileHandler) waitForBlockUploadResult(sessionID, digest string) (db.BlockUploadSession, bool) {
 	for i := 0; i < 50; i++ {
 		s, ok, err := h.db.GetBlockUploadSession(sessionID)
 		if err != nil || !ok {
-			return "", false
+			return db.BlockUploadSession{}, false
 		}
 		if s.Committed && s.ManifestDigest != digest {
-			return "", false
+			return db.BlockUploadSession{}, false
 		}
 		if s.ResultFilename != "" && s.ManifestDigest == digest {
-			return s.ResultFilename, true
+			return s, true
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return "", false
+	return db.BlockUploadSession{}, false
 }
 
 // Manifest limits for the web content-addressed upload flow (R6). A 131072-block
@@ -258,12 +266,12 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 			return
 		}
 		if session.ResultFilename != "" {
-			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, session.ResultFilename, h.resolveSeafileBlockIDsForResponse(orgID, req.Blocks)))
+			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, session.ResultFilename, committedFileIDFromSession(session)))
 			return
 		}
 		// Claimed but finalize not finished yet (concurrent commit in flight).
-		if name, ok := h.waitForBlockUploadResult(session.SessionID, digest); ok {
-			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, name, h.resolveSeafileBlockIDsForResponse(orgID, req.Blocks)))
+		if winner, ok := h.waitForBlockUploadResult(session.SessionID, digest); ok {
+			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, winner.ResultFilename, committedFileIDFromSession(winner)))
 			return
 		}
 		c.JSON(http.StatusConflict, gin.H{
@@ -386,15 +394,15 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	if !applied {
 		// We lost the race (or it was already committed). Return the winner's
 		// result if the manifest matches; otherwise it's a different file.
-		resultName, ok := h.waitForBlockUploadResult(session.SessionID, digest)
+		winner, ok := h.waitForBlockUploadResult(session.SessionID, digest)
 		if ok {
-			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, resultName, h.resolveSeafileBlockIDsForResponse(orgID, req.Blocks)))
+			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, winner.ResultFilename, committedFileIDFromSession(winner)))
 			return
 		}
 		current, found, readErr := h.db.GetBlockUploadSession(session.SessionID)
 		if readErr == nil {
 			if resultName, code, message := classifyBlockUploadCommitConflict(current, found, digest); resultName != "" {
-				c.JSON(http.StatusOK, fileFromBlocksResponse(&req, resultName, h.resolveSeafileBlockIDsForResponse(orgID, req.Blocks)))
+				c.JSON(http.StatusOK, fileFromBlocksResponse(&req, resultName, committedFileIDFromSession(current)))
 				return
 			} else {
 				c.JSON(http.StatusConflict, gin.H{
@@ -447,8 +455,13 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// all but a pathological sustained-Cassandra-outage window (documented in
 	// docs/WEB-BLOCK-UPLOAD.md as a deferred edge).
 	var markErr error
+	fileID, fileIDErr := buildFileFSObjectID(externalBlockIDs, req.Size)
+	if fileIDErr != nil {
+		log.Printf("[CreateFileFromBlocks] WARNING: failed to derive committed fs_object id for session result (filename=%q size=%d): %v", actualFilename, req.Size, fileIDErr)
+		fileID = ""
+	}
 	for attempt := 0; attempt < 3; attempt++ {
-		if markErr = h.db.MarkBlockUploadSessionCommitted(session, digest, resultPath, actualFilename, ""); markErr == nil {
+		if markErr = h.db.MarkBlockUploadSessionCommitted(session, digest, resultPath, actualFilename, fileID); markErr == nil {
 			break
 		}
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
@@ -468,42 +481,13 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		log.Printf("[CreateFileFromBlocks] WARNING: file committed but failed to update storage counters: %v", err)
 	}
 
-	c.JSON(http.StatusOK, fileFromBlocksResponse(&req, actualFilename, externalBlockIDs))
-}
-
-// resolveSeafileBlockIDsForResponse reads the server-derived external SHA-1 of each
-// manifest block (blocks.sha1, via ProbeBlockReuse) in manifest order, so the
-// idempotent-replay / lost-race responses can derive the same fs_id the committed
-// file has. Best-effort: a per-block read failure leaves that entry empty (the id
-// is a derived echo, not load-bearing for storage). Deduped per SHA-256.
-func (h *FileHandler) resolveSeafileBlockIDsForResponse(orgID string, blocks []fileFromBlocksBlock) []string {
-	cache := make(map[string]string, len(blocks))
-	out := make([]string, len(blocks))
-	for i, b := range blocks {
-		sha1, ok := cache[b.SHA256]
-		if !ok {
-			if probe, err := h.db.ProbeBlockReuse(orgID, b.SHA256); err == nil {
-				sha1 = strings.TrimSpace(probe.Sha1)
-			}
-			cache[b.SHA256] = sha1
-		}
-		out[i] = sha1
-	}
-	return out
+	c.JSON(http.StatusOK, fileFromBlocksResponse(&req, actualFilename, fileID))
 }
 
 // fileFromBlocksResponse mirrors the Seafile-compatible upload response shape.
-// The file id is the deterministic content-addressed fs_object id derived from the
-// SHA-1 (external) block IDs the fs_object stores, so it MUST be built from those
-// (server-derived) SHA-1s to match the persisted fs_id.
-func fileFromBlocksResponse(req *fileFromBlocksRequest, actualFilename string, seafileBlockIDs []string) []gin.H {
-	fileID, err := buildFileFSObjectID(seafileBlockIDs, req.Size)
-	if err != nil {
-		// The file is already committed; the response id is derived, not load-bearing
-		// for storage. Log so a (rare) marshaling/input failure is debuggable instead
-		// of silently returning an empty id.
-		log.Printf("[CreateFileFromBlocks] WARNING: failed to derive fs_object id for response (filename=%q size=%d): %v", actualFilename, req.Size, err)
-	}
+// The file id must match the published fs_object id. Callers should therefore
+// pass the committed/stored fs_id, not a best-effort recomputation.
+func fileFromBlocksResponse(req *fileFromBlocksRequest, actualFilename, fileID string) []gin.H {
 	return []gin.H{{
 		"name": actualFilename,
 		"id":   fileID,

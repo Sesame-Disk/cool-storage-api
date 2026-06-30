@@ -1,8 +1,8 @@
 # SHA-256 canonical block IDs (and removing SHA-1 from the web client)
 
 **Date:** 2026-06-29
-**Status:** Design + implementation tracker. PR1-PR4 are implemented on branches/workspace;
-PR5+ remain pending.
+**Status:** Design + implementation tracker. PR1-PR5 are implemented on branches/workspace;
+PR6+ remain pending.
 **Supersedes:** the out-of-tree `implementation_plan.md` draft (backend/read-side only),
 which is removed in favour of this document.
 **Related:** [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md) (R10 dual-hash, the current state
@@ -89,6 +89,9 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     through `verifyManifestBlocks`) and validated 40-hex — a ready block missing a well-formed
     `blocks.sha1` is sent to `needs_upload` (blocker #4, fail-closed). Removed the client-SHA-1
     forward-mapping validation (`resolveManifestForwardMappings` / `getBlockIDMappingFn`).
+  - **Replay/idempotency hardening:** successful `file-from-blocks` commits now persist the
+    published file `fs_id` in the session result row, so replays / lost-race retries return the
+    exact committed id instead of a best-effort re-derivation from fresh `ProbeBlockReuse` reads.
   - **Frontend:** the worker (`block-hash.js` / `block-hasher.worker.js`) computes a single
     SHA-256 digest per block (≈half the hashing CPU); `buildManifest` emits `{sha256, size}`.
   - Integration guards rewritten to the inverse semantics (forged client SHA-1 ignored;
