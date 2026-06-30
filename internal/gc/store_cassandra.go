@@ -1398,13 +1398,6 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 		if effectiveFirstSeenAt.IsZero() {
 			return time.Time{}, fmt.Errorf("gc_s3_orphans row for org=%s block=%s is missing first_seen_at", orgID, blockID)
 		}
-		effectiveStorageClass, err = casStringValue(existing, "storage_class")
-		if err != nil {
-			return time.Time{}, err
-		}
-		if effectiveStorageClass == "" {
-			effectiveStorageClass = storageClass
-		}
 		updateState := map[string]interface{}{}
 		updated, err := s.db.Session().Query(`
 			UPDATE gc_s3_orphans

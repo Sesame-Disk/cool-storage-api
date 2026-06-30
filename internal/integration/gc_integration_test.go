@@ -1297,6 +1297,84 @@ func TestGC_DeleteS3Orphan_RemovesDiscoveryRowWithoutCanonical(t *testing.T) {
 	}
 }
 
+func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("orph-reset-%d", time.Now().UnixNano())
+	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, blockID, "cold", "sha1-old", "seed", firstSeenAt)
+	if err != nil {
+		t.Fatalf("initial RecordS3Orphan: %v", err)
+	}
+	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
+	}
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
+		t.Fatalf("MarkS3OrphanMappingCleanupPending: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.DeleteS3Orphan(orgID, blockID, effectiveFirstSeenAt); err != nil {
+			t.Fatalf("cleanup DeleteS3Orphan(%s): %v", blockID, err)
+		}
+	})
+
+	resetFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "sha1-new", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("StartBlockDeleteOrphan: %v", err)
+	}
+	if !resetFirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("reset first_seen_at = %v, want original %v", resetFirstSeenAt, firstSeenAt)
+	}
+
+	var storageClass, externalSHA1, recoveryPhase string
+	var storedFirstSeenAt time.Time
+	if err := database.Session().Query(`
+		SELECT storage_class, external_sha1, recovery_phase, first_seen_at
+		FROM gc_s3_orphans
+		WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&storageClass, &externalSHA1, &recoveryPhase, &storedFirstSeenAt); err != nil {
+		t.Fatalf("read gc_s3_orphans: %v", err)
+	}
+	if storageClass != "hot" {
+		t.Fatalf("gc_s3_orphans.storage_class = %q, want %q", storageClass, "hot")
+	}
+	if externalSHA1 != "sha1-new" {
+		t.Fatalf("gc_s3_orphans.external_sha1 = %q, want %q", externalSHA1, "sha1-new")
+	}
+	if recoveryPhase != gcpkg.S3OrphanPhasePendingS3 {
+		t.Fatalf("gc_s3_orphans.recovery_phase = %q, want %q", recoveryPhase, gcpkg.S3OrphanPhasePendingS3)
+	}
+	if !storedFirstSeenAt.UTC().Equal(firstSeenAt.UTC()) {
+		t.Fatalf("gc_s3_orphans.first_seen_at = %v, want %v", storedFirstSeenAt.UTC(), firstSeenAt.UTC())
+	}
+
+	var projStorageClass, projExternalSHA1, projRecoveryPhase string
+	var projFirstSeenAt time.Time
+	if err := database.Session().Query(`
+		SELECT storage_class, external_sha1, recovery_phase, first_seen_at
+		FROM gc_s3_orphans_by_day
+		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID).Scan(&projStorageClass, &projExternalSHA1, &projRecoveryPhase, &projFirstSeenAt); err != nil {
+		t.Fatalf("read gc_s3_orphans_by_day: %v", err)
+	}
+	if projStorageClass != "hot" {
+		t.Fatalf("gc_s3_orphans_by_day.storage_class = %q, want %q", projStorageClass, "hot")
+	}
+	if projExternalSHA1 != "sha1-new" {
+		t.Fatalf("gc_s3_orphans_by_day.external_sha1 = %q, want %q", projExternalSHA1, "sha1-new")
+	}
+	if projRecoveryPhase != gcpkg.S3OrphanPhasePendingS3 {
+		t.Fatalf("gc_s3_orphans_by_day.recovery_phase = %q, want %q", projRecoveryPhase, gcpkg.S3OrphanPhasePendingS3)
+	}
+	if !projFirstSeenAt.UTC().Equal(firstSeenAt.UTC()) {
+		t.Fatalf("gc_s3_orphans_by_day.first_seen_at = %v, want %v", projFirstSeenAt.UTC(), firstSeenAt.UTC())
+	}
+}
+
 // getGCGracePeriod reads the configured grace period from the admin status API.
 // Returns 0 if the field is absent or the server is too old to expose it.
 func getGCGracePeriod(t *testing.T) time.Duration {
