@@ -229,9 +229,9 @@ export function shouldUseBlockUpload(file, { encrypted = false } = {}) {
   return file && file.size >= thresholdBytes;
 }
 
-// hashFileWithWorker splits + hashes a File off the main thread, computing both
-// SHA-256 (storage identity) and SHA-1 (external Seafile block ID) per block.
-// Resolves to { blocks: [{index, sha1, sha256, size}], size }.
+// hashFileWithWorker splits + hashes a File off the main thread, computing the
+// SHA-256 (storage identity) per block. Resolves to { blocks: [{index, sha256,
+// size}], size }. The external Seafile block ID (SHA-1) is derived server-side.
 export function hashFileWithWorker(file, { blockSize = BLOCK_SIZE, onProgress, signal } = {}) {
   return new Promise((resolve, reject) => {
     let worker;
@@ -385,11 +385,12 @@ async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockD
   await Promise.all(workers);
 }
 
-// buildManifest emits the dual-hash commit manifest. sha256 is the storage
-// identity (check/upload/refs); sha1 is the external Seafile block ID the backend
-// writes into the file fs_object for desktop/mobile download compatibility.
+// buildManifest emits the commit manifest. Only sha256 (the storage identity used
+// for check/upload/refs) and size are sent; the external Seafile block ID (SHA-1)
+// is derived server-side from blocks.sha1 at commit, so the client no longer
+// computes or sends it.
 function buildManifest(blocks) {
-  return blocks.map((b) => ({ sha1: b.sha1, sha256: b.sha256, size: b.size }));
+  return blocks.map((b) => ({ sha256: b.sha256, size: b.size }));
 }
 
 // isCommitInProgress detects the backend's transient "winner still finalizing"

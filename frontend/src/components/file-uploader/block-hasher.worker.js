@@ -1,14 +1,13 @@
 /* eslint-disable no-restricted-globals */
-// Web Worker: split a File into fixed-size blocks and compute BOTH the SHA-256 and
-// the SHA-1 of each block off the main thread, so hashing a multi-GB file never
-// freezes the UI. Posts incremental {type:'progress'} messages and a final
-// {type:'done'} with an ordered manifest of { index, sha1, sha256, size } entries.
+// Web Worker: split a File into fixed-size blocks and compute the SHA-256 of each
+// block off the main thread, so hashing a multi-GB file never freezes the UI. Posts
+// incremental {type:'progress'} messages and a final {type:'done'} with an ordered
+// manifest of { index, sha256, size } entries.
 //
-// Why two hashes: SHA-256 is the internal/storage identity (check/upload, S3 key,
-// refs, GC, dedup); SHA-1 is the EXTERNAL Seafile block ID the backend writes into
-// the file fs_object so the desktop/mobile sync client (which requires 40-hex
-// SHA-1 block IDs) can parse and download the file. Both digests run over the same
-// in-memory block buffer (one slice/read of the file, two separate digests).
+// Only SHA-256 is computed (the internal/storage identity used by check/upload, S3
+// key, refs, GC, dedup). The EXTERNAL Seafile block ID (SHA-1) is derived
+// server-side from blocks.sha1 at commit, so the worker does a single digest per
+// block (one slice/read of the file) instead of two.
 //
 // BLOCK_SIZE MUST match the backend (api.uploadBlockSize / v2.WebUploadBlockSize
 // = 8 MB) so the blocks line up with what the rest of the system expects.
@@ -26,8 +25,8 @@ async function hashFile(file, blockSize) {
     const start = index * blockSize;
     const end = Math.min(start + blockSize, size);
     const buf = await file.slice(start, end).arrayBuffer();
-    const { sha1, sha256, size: blockSizeBytes } = await hashBlockBytes(buf);
-    blocks.push({ index, sha1, sha256, size: blockSizeBytes });
+    const { sha256, size: blockSizeBytes } = await hashBlockBytes(buf);
+    blocks.push({ index, sha256, size: blockSizeBytes });
     hashedBytes += blockSizeBytes;
     self.postMessage({ type: 'progress', hashedBytes, totalBytes: size });
   }

@@ -82,7 +82,18 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     returns 500 for broken `GetFSObject`, `PackFS`, and `CheckFS` states.
   - **PR4 is functionally complete** (writer flip + guard + tests). `RecvFS` intentionally stays on
     the legacy SHA-1 layout (see above).
-- `PR5`–`PR7` — pending.
+- `PR5` — implemented (branch `feat/sha256-canonical-block-ids-pr5`): the frontend stops
+  computing/sending SHA-1 and the server derives it.
+  - **Backend:** `file-from-blocks` manifest is `{sha256, size}` only; `manifestDigest` is over
+    sha256+size. The external SHA-1 is read from `blocks.sha1` (via `ProbeBlockReuse`, surfaced
+    through `verifyManifestBlocks`) and validated 40-hex — a ready block missing a well-formed
+    `blocks.sha1` is sent to `needs_upload` (blocker #4, fail-closed). Removed the client-SHA-1
+    forward-mapping validation (`resolveManifestForwardMappings` / `getBlockIDMappingFn`).
+  - **Frontend:** the worker (`block-hash.js` / `block-hasher.worker.js`) computes a single
+    SHA-256 digest per block (≈half the hashing CPU); `buildManifest` emits `{sha256, size}`.
+  - Integration guards rewritten to the inverse semantics (forged client SHA-1 ignored;
+    replay with a different client SHA-1 is the same file).
+- `PR6`–`PR7` — pending.
 
 ## Notes / Debt
 
@@ -122,7 +133,7 @@ Carried forward from review. Status as of the PR3 partial branch:
 | 1 | Desktop breaks if any Seafile endpoint serializes SHA-256 into `"block_ids"`. Serve path (`GetFSObject`/`PackFS`) is fixed; the remaining serializers must be audited. | Critical | PR4 |
 | 2 | ~~`CheckFS` / `buildFSIDMapping` must use `seafile_block_ids_sha1` (fallback `block_ids`), never hash SHA-256 into the file JSON.~~ **DONE (PR3)** in `computeCorrectedObject`. | Blocker | resolved |
 | 3 | ~~`CreateFile` template block must register a real SHA-1, not empty.~~ **DONE (PR4)** — `CreateFile` now computes the template SHA-1, uses it as the external block id, and writes the mapping + `blocks.sha1` via `RegisterUploadedBlockAndMapping` (mirrors `UploadFile`). Also fixes a pre-existing desktop-incompat bug: Office-created files used SHA-256 block ids / fs_id. | Blocker | resolved |
-| 4 | Validate `blocks.sha1` (40-hex, non-empty) before using it for `seafile_block_ids_sha1` / `fs_id`; else `needs_upload`. Reuse `isHex40`, fail closed. | Blocker | PR4/PR5 |
+| 4 | ~~Validate `blocks.sha1` (40-hex, non-empty) before using it for `seafile_block_ids_sha1` / `fs_id`; else `needs_upload`.~~ **DONE (PR5)** — `file-from-blocks` reads `blocks.sha1` via `ProbeBlockReuse` and `needs_upload`s any ready block whose `blocks.sha1` is missing/non-40-hex (`isHex40`, fail-closed). | Blocker | resolved |
 | 5 | ~~After the writer flip, no row may have SHA-256 `block_ids` with empty `seafile_block_ids_sha1`.~~ **DONE (PR4)** — `seafileServeBlockIDs` / `seafileFSObjectBlockIDs` return `(list, ok)` and fail closed when the SHA-1 column is empty and `block_ids` is 64-hex; `GetFSObject`, `PackFS`, `CheckFS`/`buildFSIDMapping`, and copy all refuse to serve/hash corrupted rows. (Writers already set both columns, so this is defense-in-depth.) | Blocker | resolved |
 | 6 | ~~Add an integration test for a post-flip file object.~~ **DONE (PR4)** — `TestSyncServesSHA1BlockIDsForCanonicalFSObject`, `TestSyncPackFSServesSHA1BlockIDsForCanonicalFSObject`, `TestSyncRefusesToServeSHA256BlockIDsWithoutSHA1Column`, `TestSyncPackFSRefusesBrokenCanonicalObject`, and `TestSyncCheckFSRefusesBrokenCanonicalTree`. | Med | resolved |
 | 7 | ~~Confirm sync reference-accounting feeds `block_references` in SHA-256.~~ **DONE** — it resolves before writing refs; keep reading `block_ids`. | — | resolved |
