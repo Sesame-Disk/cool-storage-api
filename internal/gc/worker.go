@@ -490,7 +490,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if item.StorageClass != "" && item.StorageClass != storageClass {
 		log.Printf("[GC Worker] WARNING: block %s queued with storage_class=%s but canonical storage_class=%s; using canonical value", item.ItemID, item.StorageClass, storageClass)
 	}
-	orphanFirstSeenAt, err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, blockInfo.Sha1, "", w.clock().UTC())
+	orphanFirstSeenAt, err := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, blockInfo.Sha1, w.clock().UTC())
 	if err != nil {
 		return fmt.Errorf("failed to record pending S3 delete for block %s: %w", item.ItemID, err)
 	}

@@ -253,6 +253,53 @@ func TestWorker_RecoverS3Orphans_CompletesPendingMappingCleanupWithoutS3(t *test
 	}
 }
 
+func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "blk-redelete", "hot", 0)
+	store.AddBlockMapping(orgID, "sha1-new", "blk-redelete")
+	firstSeenAt, err := store.RecordS3Orphan(orgID, "blk-redelete", "hot", "sha1-old", "prev", time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("seed stale orphan: %v", err)
+	}
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "blk-redelete", "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
+		t.Fatalf("advance stale orphan phase: %v", err)
+	}
+	applied, err := store.ClaimBlockDelete(orgID, "blk-redelete", "claim-1")
+	if err != nil || !applied {
+		t.Fatalf("claim block delete: applied=%v err=%v", applied, err)
+	}
+	if _, err := store.StartBlockDeleteOrphan(orgID, "blk-redelete", "hot", "sha1-new", time.Now().UTC()); err != nil {
+		t.Fatalf("StartBlockDeleteOrphan: %v", err)
+	}
+	if err := store.FinalizeBlockDelete(orgID, "blk-redelete", "claim-1"); err != nil {
+		t.Fatalf("FinalizeBlockDelete: %v", err)
+	}
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("RecoverS3Orphans: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered=%d, want 1", recovered)
+	}
+	if store.S3OrphanCount() != 0 {
+		t.Fatalf("orphan should be cleared, got %d", store.S3OrphanCount())
+	}
+	if store.ForwardBlockMappingExists(orgID, "sha1-new") {
+		t.Fatal("forward mapping should be cleaned up after recovered S3 delete")
+	}
+	deleted := sp.DeletedBlocks()
+	if len(deleted) != 1 || deleted[0] != "blk-redelete" {
+		t.Fatalf("expected one S3 delete for blk-redelete, got %v", deleted)
+	}
+}
+
 // TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping
 // pins the resurrection guard: if a crash leaves a recovery row at
 // pending_mapping_cleanup and the same block_id is re-uploaded before recovery

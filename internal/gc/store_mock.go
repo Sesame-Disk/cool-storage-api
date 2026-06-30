@@ -184,6 +184,9 @@ type MockStore struct {
 	// allowed to overlap (i.e. whether dlqOpsMu in the Service is doing
 	// its job).
 	dlqOpHook func(orgID uuid.UUID, op string)
+	// force the "row disappeared between CAS read and repair update" path in
+	// RecordS3Orphan so tests can verify we do not resurrect partial phantom rows.
+	recordS3OrphanRepairRace bool
 
 	// audit_log entries
 	auditLog []AuditLogEntry
@@ -3145,6 +3148,34 @@ func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) erro
 
 // --- S3 orphan recovery (mock) ---
 
+func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if existing, ok := m.s3Orphans[key]; ok {
+		existing.StorageClass = storageClass
+		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
+		existing.RecoveryPhase = S3OrphanPhasePendingS3
+		existing.LastAttemptAt = now
+		existing.RetryCount = 0
+		existing.LastError = ""
+		m.upsertS3OrphanProjection(existing)
+		return existing.FirstSeenAt, nil
+	}
+	orphan := &S3OrphanInfo{
+		OrgID:         orgID,
+		BlockID:       blockID,
+		StorageClass:  storageClass,
+		ExternalSHA1:  strings.TrimSpace(externalSHA1),
+		RecoveryPhase: S3OrphanPhasePendingS3,
+		FirstSeenAt:   now.UTC(),
+		LastAttemptAt: now,
+	}
+	m.s3Orphans[key] = orphan
+	m.upsertS3OrphanProjection(orphan)
+	return orphan.FirstSeenAt, nil
+}
+
 func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3154,6 +3185,12 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, exter
 		initialRetryCount = 1
 	}
 	if existing, ok := m.s3Orphans[key]; ok {
+		needsRepair := strings.TrimSpace(existing.ExternalSHA1) == "" || strings.TrimSpace(existing.RecoveryPhase) == ""
+		if needsRepair && m.recordS3OrphanRepairRace {
+			delete(m.s3Orphans, key)
+			delete(m.s3OrphanProjections, newMockS3OrphanProjectionKey(orgID, blockID, existing.FirstSeenAt))
+			return existing.FirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: row disappeared before repair", orgID, blockID)
+		}
 		if strings.TrimSpace(existing.ExternalSHA1) == "" {
 			existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		}
@@ -3282,6 +3319,12 @@ func (m *MockStore) AllS3Orphans() []S3OrphanInfo {
 		return out[i].BlockID < out[j].BlockID
 	})
 	return out
+}
+
+func (m *MockStore) SetRecordS3OrphanRepairRaceForTest(enabled bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordS3OrphanRepairRace = enabled
 }
 
 // AllBlockGCCandidates is a test helper returning every candidate row across

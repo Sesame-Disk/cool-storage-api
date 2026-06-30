@@ -440,6 +440,14 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
      discards the stale recovery row (incrementing `gc_s3_orphan_resurrected_discarded`) instead of
      cleaning the mapping. Pinned by
      `TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping`.
+   - **Stale-phase reset on a new delete.** A NEW block delete writes its recovery row via
+     `StartBlockDeleteOrphan`, which always resets the phase to `pending_s3` (and `retry_count`,
+     `last_error`) — even if a stale row from an older delete of the same `block_id` was left at
+     `pending_mapping_cleanup`. Otherwise recovery would inherit the stale phase and SKIP the
+     physical S3 delete for the new lifecycle, leaking the new object. `first_seen_at` is preserved
+     so the discovery projection stays a single in-place row; the reset is fail-closed (`IF EXISTS`).
+     Pinned by `TestStore_StartBlockDeleteOrphan_ResetsStalePendingMappingCleanup` and
+     `TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3`.
 
 **No tombstone / hot-partition risk (Cassandra access pattern).** Both queries hit a full partition
 key, so there is no `ALLOW FILTERING`, no clustering-row scan, and no tombstone accumulation to read

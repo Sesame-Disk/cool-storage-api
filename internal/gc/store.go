@@ -102,9 +102,14 @@ type GCStore interface {
 	DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error
 
 	// S3 orphan recovery / pending delete tracking for blocks claimed by GC.
+	// StartBlockDeleteOrphan records the durable recovery row for a NEW block
+	// deletion. It always resets recovery state to pending_s3 so a stale
+	// pending_mapping_cleanup row from an older delete cannot make recovery skip
+	// the physical object delete for this new lifecycle.
+	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error)
 	// RecordS3Orphan preserves and returns the effective first_seen_at identity
-	// for the orphan row so callers can reliably clean up the discovery
-	// projection even after retries or partial crashes.
+	// for an existing orphan row so callers can repair missing recovery metadata
+	// or seed test/recovery fixtures without clobbering a newer phase.
 	RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, now time.Time) (time.Time, error)
 	// ListS3OrphansByDay enumerates S3-orphan rows whose `first_seen_at`
 	// falls on the given UTC day for one discovery bucket. `limit` caps the

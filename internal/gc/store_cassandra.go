@@ -1375,9 +1375,59 @@ func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, stor
 	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass, externalSHA1, recoveryPhase).Exec()
 }
 
+// StartBlockDeleteOrphan records the durable recovery row for a NEW block
+// delete lifecycle. It always resets the phase to pending_s3, even when a
+// stale row from an older delete already exists for the same block_id.
+func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
+	externalSHA1 = strings.TrimSpace(externalSHA1)
+	existing := map[string]interface{}{}
+	applied, err := s.db.Session().Query(`
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to record block delete orphan: %w", err)
+	}
+	effectiveFirstSeenAt := now.UTC()
+	effectiveStorageClass := storageClass
+	if !applied {
+		effectiveFirstSeenAt, err = casTimeValue(existing, "first_seen_at")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if effectiveFirstSeenAt.IsZero() {
+			return time.Time{}, fmt.Errorf("gc_s3_orphans row for org=%s block=%s is missing first_seen_at", orgID, blockID)
+		}
+		effectiveStorageClass, err = casStringValue(existing, "storage_class")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if effectiveStorageClass == "" {
+			effectiveStorageClass = storageClass
+		}
+		updateState := map[string]interface{}{}
+		updated, err := s.db.Session().Query(`
+			UPDATE gc_s3_orphans
+			SET storage_class = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
+			WHERE org_id = ? AND block_id = ?
+			IF EXISTS
+		`, effectiveStorageClass, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
+		if err != nil {
+			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
+		}
+		if !updated {
+			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
+		}
+	}
+	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, externalSHA1, S3OrphanPhasePendingS3, effectiveFirstSeenAt); err != nil {
+		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+	}
+	return effectiveFirstSeenAt, nil
+}
+
 // RecordS3Orphan upserts a gc_s3_orphans row preserving and returning the
 // effective first_seen_at when the row already exists. Called both for the
-// initial "S3 pending" record and for actual S3 delete failures.
+// recovery scanner and for actual S3 delete failures.
 //
 // It also guarantees the matching gc_s3_orphans_by_day discovery row exists so
 // recovery can enumerate every orphan without scanning canonical partitions.
@@ -1432,12 +1482,18 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 	}
 	if !applied && (strings.TrimSpace(parseCASString(existing["external_sha1"])) == "" && effectiveExternalSHA1 != "" ||
 		strings.TrimSpace(parseCASString(existing["recovery_phase"])) == "") {
-		if err := s.db.Session().Query(`
+		updateState := map[string]interface{}{}
+		updated, err := s.db.Session().Query(`
 			UPDATE gc_s3_orphans
 			SET external_sha1 = ?, recovery_phase = ?
 			WHERE org_id = ? AND block_id = ?
-		`, effectiveExternalSHA1, effectiveRecoveryPhase, orgID.String(), blockID).Exec(); err != nil {
+			IF EXISTS
+		`, effectiveExternalSHA1, effectiveRecoveryPhase, orgID.String(), blockID).MapScanCAS(updateState)
+		if err != nil {
 			return effectiveFirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
+		}
+		if !updated {
+			return effectiveFirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: row disappeared before repair", orgID, blockID)
 		}
 	}
 	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, effectiveExternalSHA1, effectiveRecoveryPhase, effectiveFirstSeenAt); err != nil {
