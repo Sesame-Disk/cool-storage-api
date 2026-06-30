@@ -21,7 +21,10 @@ const BlockUploadSessionTTLSeconds = ProvisionalBlockReferenceTTLSeconds
 // BlockUploadSession is a server-issued handle for the web content-addressed
 // upload flow. It scopes a batch of /blocks/upload calls and the final
 // file-from-blocks commit to one (org, user, repo). SessionID doubles as the
-// provisional block reference owner ("up:<session_id>").
+// provisional block reference owner ("up:<session_id>"). ResultCommitID is a
+// generic stable result token for the idempotent winner; the web block-upload
+// flow currently stores the published file fs_id there because this path does
+// not create a standalone commit object of its own.
 type BlockUploadSession struct {
 	SessionID      string
 	OrgID          string

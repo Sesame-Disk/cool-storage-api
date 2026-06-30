@@ -290,68 +290,82 @@ func TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat(t *testing.T) {
 	}
 }
 
-// TestWebBlockUploadRejectsForgedSHA1 covers the mapping-integrity fix: the
-// server computes SHA-1 from the real bytes at upload and owns the mapping; the
-// commit must NOT trust a client-supplied SHA-1. A manifest that pairs a real
-// SHA-256 with a SHA-1 that resolves to different content is rejected (400), and
-// an unknown SHA-1 forces a re-upload (needs_upload) — the commit validates the
-// FORWARD mapping (sha1 -> sha256) written from verified bytes, never trusting the
-// client's SHA-1 and never minting a mapping from the manifest.
-func TestWebBlockUploadForwardMappingIsSourceOfTruth(t *testing.T) {
-	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-forge-%d", time.Now().UnixNano()))
+// webReadCommittedFileBlockIDs returns the block_ids (SHA-256) and
+// seafile_block_ids_sha1 (SHA-1) columns of a committed file, located by walking
+// the library HEAD's root dir entries for the given filename.
+func webReadCommittedFileBlockIDs(t *testing.T, repoID, filename string) (blockIDs, seafileBlockIDs []string) {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
 	orgID := resolveOrgID(t, repoID)
-
-	t.Run("manifest sha1 belongs to different content -> 400", func(t *testing.T) {
-		session := webCreateBlockSession(t, adminClient, repoID, "/")
-		blockA := []byte("forward-truth block A " + fmt.Sprint(time.Now().UnixNano()))
-		blockB := []byte("forward-truth block B " + fmt.Sprint(time.Now().UnixNano()))
-		for _, b := range [][]byte{blockA, blockB} {
-			resp := webUploadBlock(t, adminClient, session, b)
-			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-				t.Fatalf("upload status %d", resp.StatusCode)
-			}
-			resp.Body.Close()
+	var headCommit string
+	if err := session.Query(`SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, repoID).Scan(&headCommit); err != nil {
+		t.Fatalf("read head commit: %v", err)
+	}
+	var rootFSID string
+	if err := session.Query(`SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, headCommit).Scan(&rootFSID); err != nil {
+		t.Fatalf("read root fs: %v", err)
+	}
+	var dirEntriesJSON string
+	if err := session.Query(`SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, rootFSID).Scan(&dirEntriesJSON); err != nil {
+		t.Fatalf("read root dir entries: %v", err)
+	}
+	var dirEntries []map[string]interface{}
+	if err := json.Unmarshal([]byte(dirEntriesJSON), &dirEntries); err != nil {
+		t.Fatalf("decode dir entries: %v", err)
+	}
+	var fileFSID string
+	for _, e := range dirEntries {
+		if name, _ := e["name"].(string); name == filename {
+			fileFSID, _ = e["id"].(string)
+			break
 		}
-		// Commit a 1-block file claiming A's SHA-1 paired with B's SHA-256. The
-		// forward mapping proves sha1(A) -> sha256(A) != sha256(B) → integrity 400.
-		commit := webCommit(t, adminClient, repoID, map[string]interface{}{
-			"session": session, "parent_dir": "/", "filename": "crosspair.bin",
-			"replace": false, "size": len(blockB),
-			"blocks": []map[string]interface{}{{"sha1": sha1hex(blockA), "sha256": sha256hex(blockB), "size": len(blockB)}},
-		})
-		expectStatus(t, commit, http.StatusBadRequest)
-		commit.Body.Close()
+	}
+	if fileFSID == "" {
+		t.Fatalf("committed file %q not found in root dir entries: %s", filename, dirEntriesJSON)
+	}
+	if err := session.Query(`SELECT block_ids, seafile_block_ids_sha1 FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fileFSID).Scan(&blockIDs, &seafileBlockIDs); err != nil {
+		t.Fatalf("read block ids: %v", err)
+	}
+	return blockIDs, seafileBlockIDs
+}
+
+// TestWebBlockUploadIgnoresForgedClientSHA1 is the PR5 source-of-truth guard: the
+// client no longer asserts a SHA-1 — the server derives it from blocks.sha1 (the
+// value it computed from the real bytes at upload). A manifest carrying a forged
+// SHA-1 must therefore commit fine, and the fs_object must store the server-derived
+// REAL SHA-1, never the forged one.
+func TestWebBlockUploadIgnoresForgedClientSHA1(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-srvsha1-%d", time.Now().UnixNano()))
+	session := webCreateBlockSession(t, adminClient, repoID, "/")
+	content := []byte("server-derived sha1 " + fmt.Sprint(time.Now().UnixNano()))
+	resp := webUploadBlock(t, adminClient, session, content)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	forgedSHA1 := strings.Repeat("a", 40) // valid 40-hex, wrong content
+	if forgedSHA1 == sha1hex(content) {
+		t.Skip("astronomical: forged sha1 equals real sha1")
+	}
+	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
+		"session": session, "parent_dir": "/", "filename": "forged.bin",
+		"replace": false, "size": len(content),
+		// A legacy/forged sha1 in the manifest is simply ignored by the server.
+		"blocks": []map[string]interface{}{{"sha1": forgedSHA1, "sha256": sha256hex(content), "size": len(content)}},
 	})
+	expectStatus(t, commit, http.StatusOK)
+	commit.Body.Close()
 
-	t.Run("unknown manifest sha1 -> needs_upload, no mapping poisoning", func(t *testing.T) {
-		session := webCreateBlockSession(t, adminClient, repoID, "/")
-		content := []byte("unknown sha1 block " + fmt.Sprint(time.Now().UnixNano()))
-		resp := webUploadBlock(t, adminClient, session, content)
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-			t.Fatalf("upload status %d", resp.StatusCode)
-		}
-		resp.Body.Close()
+	_, seafileBlockIDs := webReadCommittedFileBlockIDs(t, repoID, "forged.bin")
+	if len(seafileBlockIDs) != 1 || seafileBlockIDs[0] != sha1hex(content) {
+		t.Fatalf("seafile_block_ids_sha1 = %v, want server-derived [%s] (forged client sha1 must be ignored)", seafileBlockIDs, sha1hex(content))
+	}
 
-		forgedSHA1 := strings.Repeat("a", 40) // valid 40-hex, never uploaded
-		if forgedSHA1 == sha1hex(content) {
-			t.Skip("astronomical: forged sha1 equals real sha1")
-		}
-		commit := webCommit(t, adminClient, repoID, map[string]interface{}{
-			"session": session, "parent_dir": "/", "filename": "unknown.bin",
-			"replace": false, "size": len(content),
-			"blocks": []map[string]interface{}{{"sha1": forgedSHA1, "sha256": sha256hex(content), "size": len(content)}},
-		})
-		// Unknown forward mapping → the server asks the client to (re)upload it.
-		expectStatus(t, commit, http.StatusConflict)
-		commit.Body.Close()
-
-		// The forged SHA-1 must not have been persisted as a mapping (no poisoning).
-		dbSession := shareProjectionDBForTest(t).Session()
-		var internal string
-		if err := dbSession.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, forgedSHA1).Scan(&internal); err == nil {
-			t.Fatalf("forged sha1 was persisted as a mapping → %s (poisoning not prevented)", internal)
-		}
-	})
+	got := downloadRepoFile(t, adminClient, repoID, "/forged.bin")
+	if !bytes.Equal(got, content) {
+		t.Fatal("download mismatch")
+	}
 }
 
 // TestWebBlockUploadCommitIndependentOfReverseMapping proves the commit relies on
@@ -389,35 +403,35 @@ func TestWebBlockUploadCommitIndependentOfReverseMapping(t *testing.T) {
 	}
 }
 
-// TestWebBlockUploadReplayDifferentSHA1IsDifferentFile covers the idempotency
-// fix: SHA-1 is part of manifestDigest, so replaying a committed session with the
-// same SHA-256 but a different SHA-1 is treated as a different file (409), never
-// an OK replay returning an id that does not match the persisted object.
-func TestWebBlockUploadReplayDifferentSHA1IsDifferentFile(t *testing.T) {
+// TestWebBlockUploadReplayIgnoresClientSHA1 covers the PR5 idempotency model: the
+// manifest digest is over SHA-256 + size only (the SHA-1 is server-derived, not
+// part of the logical identity). Replaying a committed session with the same
+// SHA-256 but a different client-sent SHA-1 is therefore the SAME file — an
+// idempotent 200 replay, never a spurious 409.
+func TestWebBlockUploadReplayIgnoresClientSHA1(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-replay-%d", time.Now().UnixNano()))
 	session := webCreateBlockSession(t, adminClient, repoID, "/")
-	content := []byte("replay different sha1 " + fmt.Sprint(time.Now().UnixNano()))
+	content := []byte("replay ignores sha1 " + fmt.Sprint(time.Now().UnixNano()))
 
 	resp := webUploadBlock(t, adminClient, session, content)
 	resp.Body.Close()
 
-	honest := map[string]interface{}{
+	first := webCommit(t, adminClient, repoID, map[string]interface{}{
 		"session": session, "parent_dir": "/", "filename": "replay.bin",
 		"replace": false, "size": len(content),
-		"blocks": []map[string]interface{}{{"sha1": sha1hex(content), "sha256": sha256hex(content), "size": len(content)}},
-	}
-	first := webCommit(t, adminClient, repoID, honest)
+		"blocks": []map[string]interface{}{{"sha256": sha256hex(content), "size": len(content)}},
+	})
 	expectStatus(t, first, http.StatusOK)
 	first.Body.Close()
 
-	// Same session + same sha256 but a different (forged) sha1 → different digest.
-	forged := map[string]interface{}{
+	// Same session + same sha256 but a stray different client sha1 → same digest →
+	// idempotent replay (200), not a different file.
+	second := webCommit(t, adminClient, repoID, map[string]interface{}{
 		"session": session, "parent_dir": "/", "filename": "replay.bin",
 		"replace": false, "size": len(content),
 		"blocks": []map[string]interface{}{{"sha1": strings.Repeat("b", 40), "sha256": sha256hex(content), "size": len(content)}},
-	}
-	second := webCommit(t, adminClient, repoID, forged)
-	expectStatus(t, second, http.StatusConflict)
+	})
+	expectStatus(t, second, http.StatusOK)
 	second.Body.Close()
 }
 
@@ -483,6 +497,71 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 		expectStatus(t, resp, http.StatusConflict)
 		resp.Body.Close()
 	})
+}
+
+func TestWebBlockUploadReuploadRepairsMissingBlockSHA1(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-repair-%d", time.Now().UnixNano()))
+	orgID := resolveOrgID(t, repoID)
+	sessionID := webCreateBlockSession(t, adminClient, repoID, "/")
+	content := []byte("repair missing block sha1 " + fmt.Sprint(time.Now().UnixNano()))
+	sha256ID := sha256hex(content)
+	sha1ID := sha1hex(content)
+
+	upload := webUploadBlock(t, adminClient, sessionID, content)
+	if upload.StatusCode != http.StatusOK && upload.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(upload.Body)
+		upload.Body.Close()
+		t.Fatalf("initial upload status %d: %s", upload.StatusCode, body)
+	}
+	upload.Body.Close()
+
+	dbSession := shareProjectionDBForTest(t).Session()
+	if err := dbSession.Query(`UPDATE blocks SET sha1 = ? WHERE org_id = ? AND block_id = ?`, "", orgID, sha256ID).Exec(); err != nil {
+		t.Fatalf("blank block sha1: %v", err)
+	}
+
+	manifest := map[string]interface{}{
+		"session": sessionID, "parent_dir": "/", "filename": "repair.bin",
+		"replace": false, "size": len(content),
+		"blocks": []map[string]interface{}{{"sha256": sha256ID, "size": len(content)}},
+	}
+
+	firstCommit := webCommit(t, adminClient, repoID, manifest)
+	expectStatus(t, firstCommit, http.StatusConflict)
+	var out map[string]interface{}
+	decodeJSON(t, firstCommit, &out)
+	needsUpload, _ := out["needs_upload"].([]interface{})
+	if len(needsUpload) != 1 || needsUpload[0] != sha256ID {
+		t.Fatalf("needs_upload = %#v, want [%s]", out["needs_upload"], sha256ID)
+	}
+
+	reupload := webUploadBlock(t, adminClient, sessionID, content)
+	if reupload.StatusCode != http.StatusOK && reupload.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(reupload.Body)
+		reupload.Body.Close()
+		t.Fatalf("repair upload status %d: %s", reupload.StatusCode, body)
+	}
+	reupload.Body.Close()
+
+	var repairedSHA1 string
+	if err := dbSession.Query(`SELECT sha1 FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, sha256ID).Scan(&repairedSHA1); err != nil {
+		t.Fatalf("read repaired block sha1: %v", err)
+	}
+	if repairedSHA1 != sha1ID {
+		t.Fatalf("repaired block sha1 = %q, want %q", repairedSHA1, sha1ID)
+	}
+
+	secondCommit := webCommit(t, adminClient, repoID, manifest)
+	expectStatus(t, secondCommit, http.StatusOK)
+	secondCommit.Body.Close()
+
+	blockIDs, seafileBlockIDs := webReadCommittedFileBlockIDs(t, repoID, "repair.bin")
+	if len(blockIDs) != 1 || blockIDs[0] != sha256ID {
+		t.Fatalf("block_ids = %#v, want [%s]", blockIDs, sha256ID)
+	}
+	if len(seafileBlockIDs) != 1 || seafileBlockIDs[0] != sha1ID {
+		t.Fatalf("seafile_block_ids_sha1 = %#v, want [%s]", seafileBlockIDs, sha1ID)
+	}
 }
 
 func TestWebBlockUploadManifestValidation(t *testing.T) {

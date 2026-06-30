@@ -48,12 +48,12 @@ describe('uploadFileViaBlocks', () => {
     // Only the block reported missing is uploaded (dedup/resume).
     expect(uploaded).toEqual(['h1']);
     expect(api.uploadBlock).toHaveBeenCalledTimes(1);
-    // Commit carries the full ordered dual-hash manifest (sha256 = storage id,
-    // sha1 = external Seafile block id for desktop/mobile download compat).
+    // Commit carries the full ordered manifest (sha256 = storage id + size only;
+    // the external Seafile SHA-1 is derived server-side from blocks.sha1).
     const manifest = api.createFileFromBlocks.mock.calls[0][1];
     expect(manifest.blocks).toEqual([
-      { sha1: 's0', sha256: 'h0', size: 50 },
-      { sha1: 's1', sha256: 'h1', size: 50 },
+      { sha256: 'h0', size: 50 },
+      { sha256: 'h1', size: 50 },
     ]);
     expect(manifest.session).toBe('sess1');
     expect(res).toEqual([{ name: 'big.bin', id: 'fid', size: '100' }]);
@@ -89,9 +89,9 @@ describe('uploadFileViaBlocks', () => {
     expect(uploaded).toEqual(['h0']); // re-uploaded the block the commit demanded
     expect(commitCalls).toBe(2);
     expect(res[0].name).toBe('f');
-    // Both commit attempts carry the dual-hash manifest (no sha1: undefined on retry).
+    // Both commit attempts carry the same {sha256, size} manifest.
     api.createFileFromBlocks.mock.calls.forEach(([, manifest]) => {
-      expect(manifest.blocks).toEqual([{ sha1: 's0', sha256: 'h0', size: 50 }]);
+      expect(manifest.blocks).toEqual([{ sha256: 'h0', size: 50 }]);
     });
   });
 
