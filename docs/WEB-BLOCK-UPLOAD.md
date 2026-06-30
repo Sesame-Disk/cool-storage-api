@@ -157,14 +157,17 @@ re-reading this section.
 - **R9 — `/blocks/upload?session=` always materializes**, even when
   `PutBlockData` was a no-op because the object already existed in S3. The point
   is to *govern* the block, not just store bytes.
-> **Planned evolution (2026-06-29):** the storage layout below (SHA-1 in
-> `fs_objects.block_ids`, resolved to SHA-256 on every read) is being moved to
-> **SHA-256-canonical block IDs** — SHA-256 in `fs_objects.block_ids` (O(0) read/GC
-> mapping lookups) plus a dedicated `seafile_block_ids_sha1` column for the desktop
-> boundary, and the web frontend stops computing/sending SHA-1 (the server derives it
-> from a new `blocks.sha1` column). The `fs_id` stays SHA-1-derived. See
-> [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) for the full design
-> and PR breakdown.
+> **⚠️ Superseded (2026-06-30, PR1–PR5 merged to `main`):** the **SHA-256-canonical
+> block IDs** change has shipped. The current layout is **SHA-256 in
+> `fs_objects.block_ids`** (O(0) read/GC mapping lookups) plus a dedicated
+> `seafile_block_ids_sha1` column holding the 40-hex SHA-1 list for the desktop
+> boundary; the web frontend now sends only `{sha256, size}` and the server derives the
+> SHA-1 from the `blocks.sha1` column. The `fs_id` stays SHA-1-derived. **The R10 /
+> dual-hash narrative below (client sends `{sha1, sha256, size}`; `block_ids` = SHA-1;
+> commit validates the client SHA-1 against the forward mapping) describes the prior
+> interim state and is kept for history only — it no longer reflects the code.** See
+> [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) for the shipped design,
+> the canonical end-state, and the remaining PR6/PR7 cleanup.
 
 - **R10 — Dual-hash: SHA-1 is the external Seafile block ID, SHA-256 is the
   storage identity.** A file's `fs_object.block_ids` MUST be SHA-1 (40-hex): the
@@ -251,14 +254,19 @@ verified SHA-1 into the fs_object (never trusting the client's SHA-1, never mint
 a mapping, never using the reverse table as truth). End state per the design
 decision:
 
+End state **as shipped (PR1–PR5)** — note this differs from the original dual-hash table:
+the canonical id moved into `block_ids` and the SHA-1 list moved to its own column.
+
 | Field | Value |
 |---|---|
-| `fs_objects.block_ids` | **SHA-1** (desktop/mobile Seafile compat) |
+| `fs_objects.block_ids` | **SHA-256** (canonical internal id; O(0) reads/GC) |
+| `fs_objects.seafile_block_ids_sha1` | **SHA-1** (40-hex; serialized to the desktop client + `fs_id`) |
 | `blocks.block_id` | SHA-256 |
+| `blocks.sha1` | **SHA-1** (written from real bytes at `UploadBlock`; the server-side source for the SHA-1 list) |
 | `block_references.block_id` | SHA-256 |
 | S3 object key | SHA-256 |
-| `block_id_mappings` (forward, source of truth) | SHA-1 → SHA-256 (written at upload, from verified bytes, non-Paxos) |
-| `block_id_mappings_by_internal` (reverse) | SHA-256 → SHA-1 (best-effort GC/repair projection only) |
+| `block_id_mappings` (forward) | SHA-1 → SHA-256 (still resolves the desktop bare-SHA-1 block GET) |
+| `block_id_mappings_by_internal` (reverse) | SHA-256 → SHA-1 (best-effort GC/repair projection; slated for removal in PR7) |
 
 
 **Validated end-to-end (2026-06-24) against a real Seafile desktop client** on
@@ -285,11 +293,17 @@ files already committed by the broken merge that stored SHA-256 block IDs in the
 file object. Repairing those files is a separate migration/rewrite problem
 because changing the block IDs changes the file `fs_id`; in dev/local the safe
 answer is delete and re-upload.
-Regression guards (`internal/integration/web_block_upload_test.go`):
-`TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat`,
-`TestWebBlockUploadForwardMappingIsSourceOfTruth`,
+Regression guards (`internal/integration/web_block_upload_test.go`), updated to the
+canonical layout and the server-derived-SHA-1 semantics (PR5):
+`TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat` (block_ids = SHA-256,
+seafile_block_ids_sha1 = SHA-1),
+`TestWebBlockUploadIgnoresForgedClientSHA1` (a forged client SHA-1 is ignored; the
+fs_object stores the server-derived SHA-1),
 `TestWebBlockUploadCommitIndependentOfReverseMapping`,
-`TestWebBlockUploadReplayDifferentSHA1IsDifferentFile`.
+`TestWebBlockUploadReplayIgnoresClientSHA1` (replay with a different client SHA-1 is the
+same file),
+`TestWebBlockUploadReuploadRepairsMissingBlockSHA1` (a blank `blocks.sha1` is repaired on
+re-upload).
 
 ---
 

@@ -1,8 +1,8 @@
 # SHA-256 canonical block IDs (and removing SHA-1 from the web client)
 
-**Date:** 2026-06-29
-**Status:** Design + implementation tracker. PR1-PR5 are implemented on branches/workspace;
-PR6+ remain pending.
+**Date:** 2026-06-29 (last updated 2026-06-30)
+**Status:** Design + implementation tracker. PR1-PR5 are **merged to `main`**; PR6 (cleanup)
+is in progress; PR7 (drop the reverse mapping table) remains pending its encrypted-GC check.
 **Supersedes:** the out-of-tree `implementation_plan.md` draft (backend/read-side only),
 which is removed in favour of this document.
 **Related:** [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md) (R10 dual-hash, the current state
@@ -82,7 +82,7 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     returns 500 for broken `GetFSObject`, `PackFS`, and `CheckFS` states.
   - **PR4 is functionally complete** (writer flip + guard + tests). `RecvFS` intentionally stays on
     the legacy SHA-1 layout (see above).
-- `PR5` — implemented (branch `feat/sha256-canonical-block-ids-pr5`): the frontend stops
+- `PR5` — **merged** (PR #107, branch `feat/sha256-canonical-block-ids-pr5`): the frontend stops
   computing/sending SHA-1 and the server derives it.
   - **Backend:** `file-from-blocks` manifest is `{sha256, size}` only; `manifestDigest` is over
     sha256+size. The external SHA-1 is read from `blocks.sha1` (via `ProbeBlockReuse`, surfaced
@@ -99,7 +99,21 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     SHA-256 digest per block (single digest per block; expected lower hashing CPU); `buildManifest` emits `{sha256, size}`.
   - Integration guards rewritten to the inverse semantics (forged client SHA-1 ignored;
     replay with a different client SHA-1 is the same file).
-- `PR6`–`PR7` — pending.
+- `PR6` — **in progress** (branch `feat/sha256-canonical-block-ids-pr6`): cleanup + docs close-out.
+  - **DONE — dead `X-Block-Hash-SHA1` reader removed.** `UploadBlock` no longer reads/cross-checks
+    a client-supplied SHA-1 header (the frontend stopped sending it in PR5). The server still
+    computes the SHA-1 from the real bytes and stores it in `blocks.sha1` — that is the canonical
+    source — so the removed header was pure dead code.
+  - **N/A — dead manifest-SHA-1 validation** (`resolveManifestForwardMappings` / `getBlockIDMappingFn`)
+    was already removed in PR5.
+  - **DONE — docs close-out.** This tracker + [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md) updated to
+    the canonical end-state (`block_ids` = SHA-256, `seafile_block_ids_sha1` = SHA-1, client sends
+    only `{sha256, size}`); stale regression-guard test names corrected.
+  - **Deferred to PR7 — the `WriteVerifiedWebBlockMapping` collision guard.** Removing the client
+    SHA-1 surface eliminates the *crafted-collision* threat that motivated the guard, but the guard
+    is still the active web mapping writer; it is now harmless defense-in-depth and is removed as
+    part of the PR7 mapping rework, not here.
+- `PR7` — pending (drop the reverse mapping table; gated on the encrypted-GC enumeration check, blocker #8).
 
 ## Notes / Debt
 
@@ -125,7 +139,7 @@ Carried forward from review. Status as of the PR3 partial branch:
 
 | # | Item | Severity | Gates |
 |---|---|---|---|
-| 1 | Desktop breaks if any Seafile endpoint serializes SHA-256 into `"block_ids"`. Serve path (`GetFSObject`/`PackFS`) is fixed; the remaining serializers must be audited. | Critical | PR4 |
+| 1 | ~~Desktop breaks if any Seafile endpoint serializes SHA-256 into `"block_ids"`.~~ **DONE (PR4)** — every Seafile-boundary serializer/​re-hasher (`GetFSObject`, `PackFS`, the serve/recompute path, and copy/publish) routes through the guarded `seafileServeBlockIDs` / `seafileFSObjectBlockIDs` helpers, which return `(list, ok)` and **fail closed (500)** on a 64-hex `block_ids` with an empty SHA-1 column — so a missed serializer cannot leak SHA-256 to the desktop client. | Critical | resolved |
 | 2 | ~~`CheckFS` / `buildFSIDMapping` must use `seafile_block_ids_sha1` (fallback `block_ids`), never hash SHA-256 into the file JSON.~~ **DONE (PR3)** in `computeCorrectedObject`. | Blocker | resolved |
 | 3 | ~~`CreateFile` template block must register a real SHA-1, not empty.~~ **DONE (PR4)** — `CreateFile` now computes the template SHA-1, uses it as the external block id, and writes the mapping + `blocks.sha1` via `RegisterUploadedBlockAndMapping` (mirrors `UploadFile`). Also fixes a pre-existing desktop-incompat bug: Office-created files used SHA-256 block ids / fs_id. | Blocker | resolved |
 | 4 | ~~Validate `blocks.sha1` (40-hex, non-empty) before using it for `seafile_block_ids_sha1` / `fs_id`; else `needs_upload`.~~ **DONE (PR5)** — `file-from-blocks` reads `blocks.sha1` via `ProbeBlockReuse` and `needs_upload`s any ready block whose `blocks.sha1` is missing/non-40-hex (`isHex40`, fail-closed). | Blocker | resolved |

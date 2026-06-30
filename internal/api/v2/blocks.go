@@ -369,7 +369,10 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	sha1Bytes := sha1.Sum(data)
 	sha1Hash := hex.EncodeToString(sha1Bytes[:])
 
-	// Optional: verify client-provided hashes if present.
+	// Optional: verify the client-provided SHA-256 if present. The SHA-1 is no
+	// longer client-asserted (PR5): the server derives it from the real bytes
+	// (sha1Hash above) and stores it in blocks.sha1, so there is no X-Block-Hash-SHA1
+	// to cross-check anymore.
 	clientHash := c.GetHeader("X-Block-Hash")
 	if clientHash != "" && clientHash != hash {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -377,16 +380,6 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 			"algorithm":     "sha256",
 			"expected_hash": clientHash,
 			"actual_hash":   hash,
-		})
-		return
-	}
-	clientSHA1 := c.GetHeader("X-Block-Hash-SHA1")
-	if clientSHA1 != "" && clientSHA1 != sha1Hash {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":         "hash mismatch",
-			"algorithm":     "sha1",
-			"expected_hash": clientSHA1,
-			"actual_hash":   sha1Hash,
 		})
 		return
 	}
