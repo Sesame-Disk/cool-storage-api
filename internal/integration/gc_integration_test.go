@@ -756,7 +756,7 @@ func TestUploadLink_ReuploadBlockedByS3OrphanFence(t *testing.T) {
 		t.Fatalf("parse orgID %q: %v", orgID, err)
 	}
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
-	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgUUID, blockID, "hot", "seed orphan fence", firstSeenAt)
+	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgUUID, blockID, "hot", "", "seed orphan fence", firstSeenAt)
 	if err != nil {
 		t.Fatalf("RecordS3Orphan: %v", err)
 	}
@@ -1235,7 +1235,7 @@ func TestGC_RecordS3Orphan_RepairsDiscoveryRowWhenCanonicalExists(t *testing.T) 
 	blockID := fmt.Sprintf("orph-repair-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, blockID, "hot", "seed", firstSeenAt)
+	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, blockID, "hot", "", "seed", firstSeenAt)
 	if err != nil {
 		t.Fatalf("initial RecordS3Orphan: %v", err)
 	}
@@ -1257,7 +1257,7 @@ func TestGC_RecordS3Orphan_RepairsDiscoveryRowWhenCanonicalExists(t *testing.T) 
 		t.Fatal("expected S3 orphan projection row to be deleted before repair")
 	}
 
-	repairedFirstSeenAt, err := store.RecordS3Orphan(orgID, blockID, "cold", "", time.Now().UTC())
+	repairedFirstSeenAt, err := store.RecordS3Orphan(orgID, blockID, "cold", "", "", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("repair RecordS3Orphan: %v", err)
 	}
@@ -1278,7 +1278,7 @@ func TestGC_DeleteS3Orphan_RemovesDiscoveryRowWithoutCanonical(t *testing.T) {
 	blockID := fmt.Sprintf("orph-cleanup-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, blockID, "hot", "seed", firstSeenAt)
+	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, blockID, "hot", "", "seed", firstSeenAt)
 	if err != nil {
 		t.Fatalf("RecordS3Orphan: %v", err)
 	}

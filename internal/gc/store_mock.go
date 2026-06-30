@@ -3145,7 +3145,7 @@ func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) erro
 
 // --- S3 orphan recovery (mock) ---
 
-func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) (time.Time, error) {
+func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
@@ -3154,6 +3154,12 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMs
 		initialRetryCount = 1
 	}
 	if existing, ok := m.s3Orphans[key]; ok {
+		if strings.TrimSpace(existing.ExternalSHA1) == "" {
+			existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
+		}
+		if strings.TrimSpace(existing.RecoveryPhase) == "" {
+			existing.RecoveryPhase = S3OrphanPhasePendingS3
+		}
 		m.upsertS3OrphanProjection(existing)
 		if errMsg != "" {
 			existing.LastAttemptAt = now
@@ -3166,6 +3172,8 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMs
 		OrgID:         orgID,
 		BlockID:       blockID,
 		StorageClass:  storageClass,
+		ExternalSHA1:  strings.TrimSpace(externalSHA1),
+		RecoveryPhase: S3OrphanPhasePendingS3,
 		FirstSeenAt:   now.UTC(),
 		LastAttemptAt: now,
 		RetryCount:    initialRetryCount,
@@ -3174,6 +3182,20 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMs
 	m.s3Orphans[key] = orphan
 	m.upsertS3OrphanProjection(orphan)
 	return orphan.FirstSeenAt, nil
+}
+
+func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if existing, ok := m.s3Orphans[key]; ok {
+		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
+		existing.RecoveryPhase = S3OrphanPhasePendingMappingCleanup
+		existing.LastAttemptAt = now
+		existing.LastError = ""
+		m.upsertS3OrphanProjection(existing)
+	}
+	return nil
 }
 
 func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error {

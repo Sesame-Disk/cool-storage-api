@@ -490,7 +490,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if item.StorageClass != "" && item.StorageClass != storageClass {
 		log.Printf("[GC Worker] WARNING: block %s queued with storage_class=%s but canonical storage_class=%s; using canonical value", item.ItemID, item.StorageClass, storageClass)
 	}
-	orphanFirstSeenAt, err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, "", w.clock().UTC())
+	orphanFirstSeenAt, err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, blockInfo.Sha1, "", w.clock().UTC())
 	if err != nil {
 		return fmt.Errorf("failed to record pending S3 delete for block %s: %w", item.ItemID, err)
 	}
@@ -501,6 +501,12 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return fmt.Errorf("failed to finalize claimed block delete for %s: %w", item.ItemID, err)
 	}
 
+	// With no storage provider (degenerate/no-storage-manager config) there is no S3
+	// step and RecoverS3Orphans is a no-op, so the recovery row has nothing left to
+	// drive: clear it after mapping cleanup instead of leaving it to TTL. With
+	// storage, the row is only cleared once the S3 delete has succeeded (or it stays
+	// for RecoverS3Orphans to retry).
+	clearRecoveryRow := w.storage == nil
 	if w.storage != nil {
 		blockStore, err := w.storage.GetBlockStore(storageClass)
 		if err != nil {
@@ -515,18 +521,25 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_s3_orphaned").Inc()
 			// Do NOT return error — the block is recorded for recovery.
 			// Continue to post-delete cleanup so the queue item completes.
-		} else if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID, orphanFirstSeenAt); err != nil {
-			log.Printf("[GC Worker] WARNING: S3 delete for block %s succeeded but failed to clear recovery row: %v", item.ItemID, err)
+		} else if err := w.store.MarkS3OrphanMappingCleanupPending(item.OrgID, item.ItemID, blockInfo.Sha1, w.clock()); err != nil {
+			log.Printf("[GC Worker] WARNING: S3 delete for block %s succeeded but failed to advance recovery row: %v", item.ItemID, err)
+			clearRecoveryRow = true
+		} else {
+			clearRecoveryRow = true
 		}
 	}
 
 	// 5. Clean up the forward mapping after the canonical row is gone, using the
-	// blocks.sha1 captured in blockInfo BEFORE FinalizeBlockDelete. If the worker
-	// crashes after FinalizeBlockDelete but before this cleanup, the retry lands in
-	// the missing-row cleanup path above (the row is gone, so blocks.sha1 is no
-	// longer readable — a leftover forward row is then a harmless dangling pointer).
+	// blocks.sha1 captured in blockInfo BEFORE FinalizeBlockDelete. The recovery
+	// row now persists this SHA-1 and remains live until this cleanup finishes, so
+	// restart recovery can resume safely after either the DB delete or the S3 step.
 	if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.Sha1); err != nil {
 		return err
+	}
+	if clearRecoveryRow {
+		if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID, orphanFirstSeenAt); err != nil {
+			log.Printf("[GC Worker] WARNING: block %s mapping cleanup succeeded but failed to clear recovery row: %v", item.ItemID, err)
+		}
 	}
 
 	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
@@ -631,6 +644,50 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					return recovered, ctx.Err()
 				default:
 				}
+				if strings.TrimSpace(orph.RecoveryPhase) == S3OrphanPhasePendingMappingCleanup {
+					// Guard against block resurrection: if the same block_id was
+					// re-uploaded after its delete (deterministic content -> same
+					// block_id + same SHA-1), the live block now OWNS the forward
+					// mapping. Deleting it here would strand the resurrected block (a
+					// desktop bare-SHA-1 GET would 404, with no self-heal). Discard the
+					// stale recovery row instead of cleaning the mapping.
+					if exists, err := w.store.BlockExists(orph.OrgID, orph.BlockID); err != nil {
+						log.Printf("[GC Worker] S3 orphan recovery: block existence lookup failed for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("check block existence for mapping-cleanup orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
+						}
+						continue
+					} else if exists {
+						if err := w.store.DeleteS3Orphan(orph.OrgID, orph.BlockID, orph.FirstSeenAt); err != nil {
+							log.Printf("[GC Worker] S3 orphan recovery: failed to discard stale mapping-cleanup row for resurrected block %s: %v", orph.BlockID, err)
+							if phaseErr == nil {
+								phaseErr = fmt.Errorf("discard stale mapping-cleanup orphan for resurrected block %s: %w", orph.BlockID, err)
+							}
+							continue
+						}
+						metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_resurrected_discarded").Inc()
+						log.Printf("[GC Worker] S3 orphan recovery: block %s resurrected; discarded stale mapping-cleanup row, kept its live forward mapping", orph.BlockID)
+						continue
+					}
+					if err := w.cleanupBlockMapping(orph.OrgID, orph.BlockID, orph.ExternalSHA1); err != nil {
+						log.Printf("[GC Worker] S3 orphan recovery: forward mapping cleanup failed for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("cleanup forward mapping for recovered block org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
+						}
+						continue
+					}
+					if err := w.store.DeleteS3Orphan(orph.OrgID, orph.BlockID, orph.FirstSeenAt); err != nil {
+						log.Printf("[GC Worker] S3 orphan recovery: failed to clear mapping-cleanup row %s: %v", orph.BlockID, err)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("clear mapping-cleanup orphan row for block %s: %w", orph.BlockID, err)
+						}
+						continue
+					}
+					recovered++
+					metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_recovered").Inc()
+					log.Printf("[GC Worker] Recovered mapping cleanup for block %s (org=%s, retries=%d)", orph.BlockID, orph.OrgID, orph.RetryCount)
+					continue
+				}
 				if exists, err := w.store.BlockExists(orph.OrgID, orph.BlockID); err != nil {
 					log.Printf("[GC Worker] S3 orphan recovery: block existence lookup failed for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
 					if phaseErr == nil {
@@ -667,6 +724,20 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					}
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("delete S3 orphan block %s from backing store: %w", orph.BlockID, err)
+					}
+					continue
+				}
+				if err := w.store.MarkS3OrphanMappingCleanupPending(orph.OrgID, orph.BlockID, orph.ExternalSHA1, w.clock()); err != nil {
+					log.Printf("[GC Worker] S3 orphan recovery: failed to advance %s to mapping cleanup: %v", orph.BlockID, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("advance recovered block %s to mapping cleanup: %w", orph.BlockID, err)
+					}
+					continue
+				}
+				if err := w.cleanupBlockMapping(orph.OrgID, orph.BlockID, orph.ExternalSHA1); err != nil {
+					log.Printf("[GC Worker] S3 orphan recovery: forward mapping cleanup failed after S3 delete for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("cleanup forward mapping after S3 recovery for block %s: %w", orph.BlockID, err)
 					}
 					continue
 				}

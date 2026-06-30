@@ -105,11 +105,15 @@ type GCStore interface {
 	// RecordS3Orphan preserves and returns the effective first_seen_at identity
 	// for the orphan row so callers can reliably clean up the discovery
 	// projection even after retries or partial crashes.
-	RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) (time.Time, error)
+	RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, now time.Time) (time.Time, error)
 	// ListS3OrphansByDay enumerates S3-orphan rows whose `first_seen_at`
 	// falls on the given UTC day for one discovery bucket. `limit` caps the
 	// number of rows returned for a single (day, bucket) pair.
 	ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanInfo, error)
+	// MarkS3OrphanMappingCleanupPending advances the recovery row after the S3
+	// delete has completed so restart recovery can finish forward-mapping cleanup
+	// without touching S3 again.
+	MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error
 	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error
 	DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error
 
@@ -365,11 +369,18 @@ type S3OrphanInfo struct {
 	OrgID         uuid.UUID
 	BlockID       string
 	StorageClass  string
+	ExternalSHA1  string
+	RecoveryPhase string
 	FirstSeenAt   time.Time
 	LastAttemptAt time.Time
 	RetryCount    int
 	LastError     string
 }
+
+const (
+	S3OrphanPhasePendingS3             = "pending_s3"
+	S3OrphanPhasePendingMappingCleanup = "pending_mapping_cleanup"
+)
 
 // ShareLinkInfo holds data about a share link needed by the scanner.
 type ShareLinkInfo struct {

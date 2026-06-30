@@ -426,15 +426,20 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
    *source* (from a reverse-table enumeration to the single `blocks.sha1`). The encrypted-equivalent
    path (external SHA-1 ≠ internal block_id) is covered by
    `TestGC_WorkerCleansForwardMappingViaBlockSHA1`.
-6. **Crash residue is bounded and observable.** If GC deletes the canonical `blocks` row and then
-   crashes/redeploys before forward-mapping cleanup, a retry can no longer recover `blocks.sha1`
-   because the reverse table is gone. PR7 intentionally fail-closes here: it leaves at most a dangling
-   forward pointer, increments `gc_block_mapping_sha1_missing`, and never risks deleting the wrong
-   row. This is not a data-loss path. The leak is bounded and observable now; the **optimal closure**
-   (persist the external SHA-1 in the durable `gc_s3_orphans` record GC already writes *before*
-   `FinalizeBlockDelete`, so a post-crash retry can finish the mapping delete) is specified in
-   [TECHNICAL-DEBT.md §22 "Open risk — GC crash/redeploy recoverability"](./TECHNICAL-DEBT.md) and
-   deferred until the metric shows real volume.
+6. **Crash recovery now covers mapping cleanup too.** PR8 extends the existing
+   `gc_s3_orphans` recovery row with `external_sha1` and `recovery_phase`, written before
+   `FinalizeBlockDelete`. If a worker crashes/redeploys after the canonical `blocks` row is gone,
+   recovery can still either (a) retry S3 deletion in `pending_s3`, or (b) skip straight to forward
+   mapping cleanup in `pending_mapping_cleanup`. The fail-safe metric
+   `gc_block_mapping_sha1_missing` remains only for genuinely legacy / metadata-free rows where no
+   `blocks.sha1` was ever available.
+   - **Resurrection guard (both phases).** Block content is deterministic, so a re-uploaded block
+     reuses the same `block_id` + SHA-1 and re-creates a *live* forward mapping. Recovery must not
+     delete that live mapping. Both recovery phases therefore re-check `BlockExists` before touching
+     the mapping: `pending_s3` defers while the canonical row is present, and `pending_mapping_cleanup`
+     discards the stale recovery row (incrementing `gc_s3_orphan_resurrected_discarded`) instead of
+     cleaning the mapping. Pinned by
+     `TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping`.
 
 **No tombstone / hot-partition risk (Cassandra access pattern).** Both queries hit a full partition
 key, so there is no `ALLOW FILTERING`, no clustering-row scan, and no tombstone accumulation to read

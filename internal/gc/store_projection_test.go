@@ -83,12 +83,12 @@ func TestStore_RecordS3Orphan_RepairsMissingProjectionAndPreservesFirstSeenAt(t 
 	orgID := uuid.New()
 	firstSeenAt := time.Now().Add(-48 * time.Hour).UTC().Truncate(time.Millisecond)
 
-	if _, err := store.RecordS3Orphan(orgID, "orph-repair", "hot", "prev", firstSeenAt); err != nil {
+	if _, err := store.RecordS3Orphan(orgID, "orph-repair", "hot", "", "prev", firstSeenAt); err != nil {
 		t.Fatalf("initial RecordS3Orphan failed: %v", err)
 	}
 	store.DeleteS3OrphanProjectionForTest(orgID, "orph-repair", firstSeenAt)
 
-	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, "orph-repair", "cold", "", time.Now())
+	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, "orph-repair", "cold", "", "", time.Now())
 	if err != nil {
 		t.Fatalf("repair RecordS3Orphan failed: %v", err)
 	}
