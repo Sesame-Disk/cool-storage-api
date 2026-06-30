@@ -87,13 +87,16 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
   - **Backend:** `file-from-blocks` manifest is `{sha256, size}` only; `manifestDigest` is over
     sha256+size. The external SHA-1 is read from `blocks.sha1` (via `ProbeBlockReuse`, surfaced
     through `verifyManifestBlocks`) and validated 40-hex — a ready block missing a well-formed
-    `blocks.sha1` is sent to `needs_upload` (blocker #4, fail-closed). Removed the client-SHA-1
-    forward-mapping validation (`resolveManifestForwardMappings` / `getBlockIDMappingFn`).
+    `blocks.sha1` is sent to `needs_upload` (blocker #4, fail-closed). Re-uploading verified
+    bytes now also repairs an existing `blocks` row whose `sha1` was empty: the writer keeps
+    `INSERT ... IF NOT EXISTS` for immutable storage metadata but backfills `sha1` when blank,
+    and rejects conflicting non-empty values. Removed the client-SHA-1 forward-mapping
+    validation (`resolveManifestForwardMappings` / `getBlockIDMappingFn`).
   - **Replay/idempotency hardening:** successful `file-from-blocks` commits now persist the
     published file `fs_id` in the session result row, so replays / lost-race retries return the
     exact committed id instead of a best-effort re-derivation from fresh `ProbeBlockReuse` reads.
   - **Frontend:** the worker (`block-hash.js` / `block-hasher.worker.js`) computes a single
-    SHA-256 digest per block (≈half the hashing CPU); `buildManifest` emits `{sha256, size}`.
+    SHA-256 digest per block (single digest per block; expected lower hashing CPU); `buildManifest` emits `{sha256, size}`.
   - Integration guards rewritten to the inverse semantics (forged client SHA-1 ignored;
     replay with a different client SHA-1 is the same file).
 - `PR6`–`PR7` — pending.
@@ -101,8 +104,9 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
 ## Notes / Debt
 
 - The current additive/no-backfill approach still assumes the current pre-deploy / empty-DB
-  rollout. If this branch were ever applied to a non-empty environment, older `blocks` rows would
-  retain empty `sha1` until a dedicated backfill or rewrite path is added.
+  rollout. On a non-empty environment, untouched older `blocks` rows could still retain empty
+  `sha1` until a dedicated backfill runs; the PR5 repair path now self-heals any such row that is
+  re-uploaded with verified bytes, but it is not a bulk migration.
 - **TODO (before PR4/PR5):** the template-block path in `CreateFile`
   ([files.go:1355](../internal/api/v2/files.go#L1355)) currently registers its block with an
   empty `sha1` (the SHA-1 is not threaded there yet). That is harmless while nothing reads
@@ -118,7 +122,7 @@ Do **not** start PR4/PR5 until both are closed:
 2. **Add fail-closed validation of `blocks.sha1` at the point of consumption.** `ProbeBlockReuse`
    exposes `Sha1` raw (only `TrimSpace`d); the commit that uses it as the source for
    `seafile_block_ids_sha1` / `fs_id` (PR5) MUST reject empty or non-40-hex values by treating
-   the block as `needs_upload` (the re-upload recomputes and rewrites a verified `sha1`) — never
+   the block as `needs_upload` (the re-upload now recomputes and repairs a verified `sha1`) — never
    write an unvalidated SHA-1 into an fs_object. Reuse `isHex40`
    ([file_from_blocks.go:134](../internal/api/v2/file_from_blocks.go#L134)); mirror the existing
    R1/R10 "forward mapping missing → needs_upload" pattern. Fail closed, never silently.

@@ -118,6 +118,37 @@ var removePublishAttemptReferenceFn = func(database *DB, orgID, blockID, referre
 	return database.RemoveBlockReference(orgID, blockID, referrer)
 }
 
+var upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) error {
+	return database.Session().Query(`
+		INSERT INTO blocks (org_id, block_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID, blockID, sha1, sizeBytes, storageClass, storageKey, now, now).Exec()
+}
+
+var readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+	var sha1 string
+	err := database.Session().Query(`
+		SELECT sha1
+		FROM blocks
+		WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).Scan(&sha1)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return sha1, true, nil
+}
+
+var backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) error {
+	return database.Session().Query(`
+		UPDATE blocks
+		SET sha1 = ?
+		WHERE org_id = ? AND block_id = ?
+	`, sha1, orgID, blockID).Exec()
+}
+
 func publishAttemptPromotionRetryBackoff(attempt int) time.Duration {
 	if attempt < 1 || publishAttemptPromotionRetryDelay <= 0 {
 		return 0
@@ -415,11 +446,52 @@ func (db *DB) UpsertBlockMetadata(orgID, blockID string, sizeBytes int, storageC
 // write time. Callers that do not know the SHA-1 can keep using
 // UpsertBlockMetadata, which passes an empty string.
 func (db *DB) UpsertBlockMetadataWithSHA1(orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string) error {
+	sha1 = strings.TrimSpace(sha1)
+	if sha1 != "" && !isHexN(sha1, 40) {
+		return fmt.Errorf("invalid block sha1 for %s", blockID)
+	}
 	now := time.Now().UTC()
-	return db.Session().Query(`
-		INSERT INTO blocks (org_id, block_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID, blockID, strings.TrimSpace(sha1), sizeBytes, storageClass, storageKey, now, now).Exec()
+	if err := upsertBlockMetadataInsertFn(db, orgID, blockID, sha1, sizeBytes, storageClass, storageKey, now); err != nil {
+		return err
+	}
+	return db.ensureBlockSHA1(orgID, blockID, sha1)
+}
+
+func (db *DB) ensureBlockSHA1(orgID, blockID, sha1 string) error {
+	if sha1 == "" {
+		return nil
+	}
+
+	current, found, err := readBlockSHA1ForRepairFn(db, orgID, blockID)
+	if err != nil {
+		return fmt.Errorf("read block sha1 for %s: %w", blockID, err)
+	}
+	if !found {
+		return fmt.Errorf("block metadata for %s disappeared before sha1 repair", blockID)
+	}
+	current = strings.TrimSpace(current)
+	if current == "" {
+		if err := backfillBlockSHA1Fn(db, orgID, blockID, sha1); err != nil {
+			return fmt.Errorf("backfill block sha1 for %s: %w", blockID, err)
+		}
+		return nil
+	}
+	if current != sha1 {
+		return fmt.Errorf("block %s already has conflicting sha1 %s", blockID, current)
+	}
+	return nil
+}
+
+func isHexN(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 var probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {

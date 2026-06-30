@@ -499,6 +499,71 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 	})
 }
 
+func TestWebBlockUploadReuploadRepairsMissingBlockSHA1(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-repair-%d", time.Now().UnixNano()))
+	orgID := resolveOrgID(t, repoID)
+	sessionID := webCreateBlockSession(t, adminClient, repoID, "/")
+	content := []byte("repair missing block sha1 " + fmt.Sprint(time.Now().UnixNano()))
+	sha256ID := sha256hex(content)
+	sha1ID := sha1hex(content)
+
+	upload := webUploadBlock(t, adminClient, sessionID, content)
+	if upload.StatusCode != http.StatusOK && upload.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(upload.Body)
+		upload.Body.Close()
+		t.Fatalf("initial upload status %d: %s", upload.StatusCode, body)
+	}
+	upload.Body.Close()
+
+	dbSession := shareProjectionDBForTest(t).Session()
+	if err := dbSession.Query(`UPDATE blocks SET sha1 = ? WHERE org_id = ? AND block_id = ?`, "", orgID, sha256ID).Exec(); err != nil {
+		t.Fatalf("blank block sha1: %v", err)
+	}
+
+	manifest := map[string]interface{}{
+		"session": sessionID, "parent_dir": "/", "filename": "repair.bin",
+		"replace": false, "size": len(content),
+		"blocks": []map[string]interface{}{{"sha256": sha256ID, "size": len(content)}},
+	}
+
+	firstCommit := webCommit(t, adminClient, repoID, manifest)
+	expectStatus(t, firstCommit, http.StatusConflict)
+	var out map[string]interface{}
+	decodeJSON(t, firstCommit, &out)
+	needsUpload, _ := out["needs_upload"].([]interface{})
+	if len(needsUpload) != 1 || needsUpload[0] != sha256ID {
+		t.Fatalf("needs_upload = %#v, want [%s]", out["needs_upload"], sha256ID)
+	}
+
+	reupload := webUploadBlock(t, adminClient, sessionID, content)
+	if reupload.StatusCode != http.StatusOK && reupload.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(reupload.Body)
+		reupload.Body.Close()
+		t.Fatalf("repair upload status %d: %s", reupload.StatusCode, body)
+	}
+	reupload.Body.Close()
+
+	var repairedSHA1 string
+	if err := dbSession.Query(`SELECT sha1 FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, sha256ID).Scan(&repairedSHA1); err != nil {
+		t.Fatalf("read repaired block sha1: %v", err)
+	}
+	if repairedSHA1 != sha1ID {
+		t.Fatalf("repaired block sha1 = %q, want %q", repairedSHA1, sha1ID)
+	}
+
+	secondCommit := webCommit(t, adminClient, repoID, manifest)
+	expectStatus(t, secondCommit, http.StatusOK)
+	secondCommit.Body.Close()
+
+	blockIDs, seafileBlockIDs := webReadCommittedFileBlockIDs(t, repoID, "repair.bin")
+	if len(blockIDs) != 1 || blockIDs[0] != sha256ID {
+		t.Fatalf("block_ids = %#v, want [%s]", blockIDs, sha256ID)
+	}
+	if len(seafileBlockIDs) != 1 || seafileBlockIDs[0] != sha1ID {
+		t.Fatalf("seafile_block_ids_sha1 = %#v, want [%s]", seafileBlockIDs, sha1ID)
+	}
+}
+
 func TestWebBlockUploadManifestValidation(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-r6-%d", time.Now().UnixNano()))
 	session := webCreateBlockSession(t, adminClient, repoID, "/")

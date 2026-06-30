@@ -2,9 +2,134 @@ package db
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
+	database := &DB{}
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockSHA1ForRepairFn
+	oldBackfill := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockSHA1ForRepairFn = oldRead
+		backfillBlockSHA1Fn = oldBackfill
+	})
+
+	var calls []string
+	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) error {
+		calls = append(calls, "insert")
+		if orgID != "org-1" || blockID != "block-1" || sha1 != strings.Repeat("a", 40) {
+			t.Fatalf("insert args = %s/%s/%s", orgID, blockID, sha1)
+		}
+		return nil
+	}
+	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+		calls = append(calls, "read")
+		return "", true, nil
+	}
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) error {
+		calls = append(calls, "backfill")
+		if sha1 != strings.Repeat("a", 40) {
+			t.Fatalf("backfill sha1 = %q, want %q", sha1, strings.Repeat("a", 40))
+		}
+		return nil
+	}
+
+	if err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key"); err != nil {
+		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
+	}
+	want := []string{"insert", "read", "backfill"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
+		}
+	}
+}
+
+func TestUpsertBlockMetadataWithSHA1_LeavesMatchingSHA1Untouched(t *testing.T) {
+	database := &DB{}
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockSHA1ForRepairFn
+	oldBackfill := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockSHA1ForRepairFn = oldRead
+		backfillBlockSHA1Fn = oldBackfill
+	})
+
+	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) error {
+		return nil
+	}
+	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+		return strings.Repeat("b", 40), true, nil
+	}
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) error {
+		t.Fatal("backfill should not run when the stored sha1 already matches")
+		return nil
+	}
+
+	if err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("b", 40), 123, "hot", "key"); err != nil {
+		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
+	}
+}
+
+func TestUpsertBlockMetadataWithSHA1_RejectsConflictingExistingSHA1(t *testing.T) {
+	database := &DB{}
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockSHA1ForRepairFn
+	oldBackfill := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockSHA1ForRepairFn = oldRead
+		backfillBlockSHA1Fn = oldBackfill
+	})
+
+	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) error {
+		return nil
+	}
+	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+		return strings.Repeat("c", 40), true, nil
+	}
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1 string) error {
+		t.Fatal("backfill should not run when the stored sha1 conflicts")
+		return nil
+	}
+
+	err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("d", 40), 123, "hot", "key")
+	if err == nil || !strings.Contains(err.Error(), "conflicting sha1") {
+		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want conflicting sha1", err)
+	}
+}
+
+func TestUpsertBlockMetadataWithSHA1_RejectsMalformedInputSHA1(t *testing.T) {
+	database := &DB{}
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockSHA1ForRepairFn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockSHA1ForRepairFn = oldRead
+	})
+
+	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) error {
+		t.Fatal("insert should not run for malformed sha1 input")
+		return nil
+	}
+	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+		t.Fatal("read should not run for malformed sha1 input")
+		return "", false, nil
+	}
+
+	err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", "not-a-sha1", 123, "hot", "key")
+	if err == nil || !strings.Contains(err.Error(), "invalid block sha1") {
+		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want invalid block sha1", err)
+	}
+}
 
 func TestPromotePublishAttemptReferences_RetriesRegisterFailure(t *testing.T) {
 	oldAttempts := publishAttemptPromotionRetryAttempts
