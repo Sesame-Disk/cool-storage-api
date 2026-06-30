@@ -570,9 +570,9 @@ only one DC (see `configs/config.prod.yaml` comments and KNOWN_ISSUES.md
 `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period (>>200ms cross-DC replication lag)
 ensures a block's references are fully replicated before the gate runs.
 
-#### Reverse Lookup Table
+#### Reverse Lookup Table — DROPPED (PR7, migration 006)
 
-`block_id_mappings_by_internal` provides reverse lookup (internal SHA-256 → external SHA-1) so the worker can find and clean mappings when deleting a block without scanning the entire `block_id_mappings` table. Dual-written alongside the forward table on every upload.
+`block_id_mappings_by_internal` (a reverse internal SHA-256 → external SHA-1 lookup, dual-written on every upload) **was dropped** in `006_drop_block_id_mappings_by_internal.cql`. GC cleanup now sources the external SHA-1 from `blocks.sha1` (a keyed point read captured before the block row is deleted) and deletes the single forward `block_id_mappings` row by `(org_id, external_id)` — no reverse enumeration, no dual-write. See [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) (PR7).
 
 ---
 

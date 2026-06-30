@@ -113,7 +113,25 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     SHA-1 surface eliminates the *crafted-collision* threat that motivated the guard, but the guard
     is still the active web mapping writer; it is now harmless defense-in-depth and is removed as
     part of the PR7 mapping rework, not here.
-- `PR7` — pending (drop the reverse mapping table; gated on the encrypted-GC enumeration check, blocker #8).
+- `PR7` — **implemented** (branch `feat/sha256-canonical-block-ids-pr7`): drop the reverse mapping
+  table `block_id_mappings_by_internal`.
+  - **Migration `006_drop_block_id_mappings_by_internal.cql`** (`DROP TABLE IF EXISTS`).
+  - **Stopped the reverse dual-write** in `WriteBlockIDMapping` and `WriteVerifiedWebBlockMapping`
+    (both are now single forward INSERTs); removed the now-dead `WriteBlockIDMappingDualWrite`.
+  - **GC cleanup sources the SHA-1 from `blocks.sha1`**: `GetBlockInfo` now also returns `sha1`
+    (same single-partition point read, no extra query); `cleanupBlockMapping(orgID, internalID,
+    externalSHA1)` deletes the single forward row by its `(org_id, external_id)` key. Removed
+    `ListBlockMappingsByInternalID` and `DeleteBlockMappingResolved`; `DeleteBlockMapping` is a
+    plain single-partition delete (no read-before-delete, no reverse cleanup).
+  - **Fail-safe**: when `blocks.sha1` is empty (legacy/pre-PR2 row, or the canonical row is already
+    gone), GC does NOT blind-delete a mapping — it records `gc_block_mapping_sha1_missing` and
+    leaves the forward row as a harmless dangling pointer (a desktop SHA-1 GET 404s; it self-heals
+    on re-upload).
+  - **Tests**: unit `TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable` (fail-safe);
+    rewrote the GC mapping-cleanup unit/integration assertions to the forward-only model; added the
+    encrypted-equivalent integration guard `TestGC_WorkerCleansForwardMappingViaBlockSHA1` (deletes a
+    block whose external SHA-1 != internal block_id and asserts the forward row is resolved/cleaned
+    from `blocks.sha1`). See the safety + performance section below.
 
 ## Notes / Debt
 
@@ -146,7 +164,7 @@ Carried forward from review. Status as of the PR3 partial branch:
 | 5 | ~~After the writer flip, no row may have SHA-256 `block_ids` with empty `seafile_block_ids_sha1`.~~ **DONE (PR4)** — `seafileServeBlockIDs` / `seafileFSObjectBlockIDs` return `(list, ok)` and fail closed when the SHA-1 column is empty and `block_ids` is 64-hex; `GetFSObject`, `PackFS`, `CheckFS`/`buildFSIDMapping`, and copy all refuse to serve/hash corrupted rows. (Writers already set both columns, so this is defense-in-depth.) | Blocker | resolved |
 | 6 | ~~Add an integration test for a post-flip file object.~~ **DONE (PR4)** — `TestSyncServesSHA1BlockIDsForCanonicalFSObject`, `TestSyncPackFSServesSHA1BlockIDsForCanonicalFSObject`, `TestSyncRefusesToServeSHA256BlockIDsWithoutSHA1Column`, `TestSyncPackFSRefusesBrokenCanonicalObject`, and `TestSyncCheckFSRefusesBrokenCanonicalTree`. | Med | resolved |
 | 7 | ~~Confirm sync reference-accounting feeds `block_references` in SHA-256.~~ **DONE** — it resolves before writing refs; keep reading `block_ids`. | — | resolved |
-| 8 | Do not drop the reverse mapping (`block_id_mappings_by_internal`) until the alias / encrypted / GC enumeration check passes. | Med | PR7 |
+| 8 | ~~Do not drop the reverse mapping (`block_id_mappings_by_internal`) until the alias / encrypted / GC enumeration check passes.~~ **DONE (PR7)** — block encryption is deterministic (AES-CBC, derived fixed IV), so SHA-256 -> SHA-1 is 1:1 and `blocks.sha1` is the complete single-valued source; no honest internal id has multiple aliases. GC no longer enumerates; it resolves the single forward row from `blocks.sha1`. See the safety section. | Med | resolved |
 
 ---
 
@@ -269,7 +287,7 @@ block lists (`published_block_reference_repairs.staged_block_ids`,
 | `gc_provisional_block_refs` / `_by_day` | `block_id` | SHA-256 | unchanged |
 | `gc_s3_orphans` / `_by_day` | `block_id` | SHA-256 | unchanged |
 | `block_id_mappings` (forward) | SHA-1 → SHA-256 | SHA-1 key | **kept** (desktop boundary only) |
-| `block_id_mappings_by_internal` (reverse) | SHA-256 → SHA-1 | mixed | **DROP** (PR7) — redundant with `blocks.sha1` |
+| `block_id_mappings_by_internal` (reverse) | SHA-256 → SHA-1 | mixed | **DROPPED** (PR7, migration 006) — redundant with `blocks.sha1` |
 | `fs_objects.block_ids` | list | SHA-1 | **SHA-256** |
 | `onlyoffice_pending_blocks` | `internal_block_id` + `external_block_id` | both | external derivable from `blocks.sha1`; TTL 7d, leave as is |
 
@@ -376,6 +394,62 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
   used here stays 1:1 (each block row has its own SHA-1), but confirm no encrypted-GC path relies
   on enumerating *all* SHA-1 aliases for an internal id before dropping the table. If such a path
   exists, keep the table or replace it with a narrower index.
+
+### PR7 — why it is safe and clean (verification + performance)
+
+**Safety — the encrypted aliasing concern is cleared by deterministic encryption.**
+
+1. **Block encryption is deterministic.** `EncryptBlockSeafile`
+   ([crypto.go](../internal/crypto/crypto.go)) is AES-256-CBC with a **derived, fixed IV** (PBKDF2,
+   "NO prepended IV"), not a random per-upload IV; the file key/IV are stable per repo. So the same
+   plaintext block always produces the same ciphertext → the same SHA-256. SHA-1(plaintext) ↔
+   SHA-256(ciphertext) is therefore **1:1 in practice**, encrypted or not. The "one SHA-1 → many
+   SHA-256" hazard the table guarded against is not realized by this code.
+2. **GC needs only the SHA-256 → SHA-1 direction, which is single-valued.** Each `blocks` row (one
+   SHA-256) carries exactly one `sha1`. The reverse table's multi-alias capability was only ever
+   populated by stale/orphan ("reverse-only") rows for defensive cleanup, never by honest content —
+   and those vanish with the table.
+3. **`blocks.sha1` is complete.** Every block-materialization path co-writes `blocks.sha1` with the
+   forward mapping via `UpsertBlockMetadataWithSHA1`: web block flow, seafhttp upload/finalize,
+   desktop `PutBlock`, `CreateFile`, OnlyOffice, copy. On the pre-deploy/empty DB there are no
+   pre-PR2 rows with an empty `sha1`; PR5 self-heals any such row on re-upload.
+4. **No blind deletes, fail-closed and observable.** When `blocks.sha1` is empty (or the canonical
+   row is already gone, so it cannot be read), GC does NOT delete a forward row by guessing — it
+   increments `gc_block_mapping_sha1_missing` and leaves the row as a harmless dangling pointer (a
+   desktop bare-SHA-1 GET 404s; it self-heals on re-upload). Pinned by
+   `TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable` and the rewritten
+   missing-canonical-row guard.
+5. **No regression vs. today.** The previous code already deleted the forward row unconditionally
+   (`DeleteBlockMappingResolved`); PR7 keeps identical delete semantics and only changes the SHA-1
+   *source* (from a reverse-table enumeration to the single `blocks.sha1`). The encrypted-equivalent
+   path (external SHA-1 ≠ internal block_id) is covered by
+   `TestGC_WorkerCleansForwardMappingViaBlockSHA1`.
+
+**No tombstone / hot-partition risk (Cassandra access pattern).** Both queries hit a full partition
+key, so there is no `ALLOW FILTERING`, no clustering-row scan, and no tombstone accumulation to read
+through:
+- `GetBlockInfo` reads `blocks` by `((org_id), block_id)` — a single-row point read; `sha1` is the
+  same row, so it adds no query.
+- `DeleteBlockMapping` deletes `block_id_mappings` by `((org_id, external_id))` — a single-partition
+  delete with no read-before-delete.
+- The dropped table was the only one that required reading a clustering range
+  (`block_id_mappings_by_internal WHERE org_id=? AND internal_id=?`); removing it removes that
+  pattern entirely. Critically, GC never queries `block_id_mappings WHERE internal_id=?` (that would
+  be `ALLOW FILTERING` over the whole table) — `blocks.sha1` makes the SHA-256 → SHA-1 lookup a keyed
+  single-row read.
+
+**Performance / cost wins.**
+- **Upload hot path: one fewer write per block.** `WriteBlockIDMapping` /
+  `WriteVerifiedWebBlockMapping` drop the second INSERT (the reverse row), halving the mapping-write
+  cost on every block upload (web + seafhttp/desktop). `WriteVerifiedWebBlockMapping` also no longer
+  needs the no-op reverse rewrite on the already-mapped path.
+- **GC block delete: fewer round-trips and no LWT batch.** Per deleted block GC now does one keyed
+  point read (folded into the `GetBlockInfo` it already issues — **zero extra reads**) plus one
+  single-partition delete, instead of a clustering-range SELECT (`ListBlockMappingsByInternalID`)
+  followed by a per-alias `LoggedBatch` deleting two tables. No `LoggedBatch`, no reverse partition
+  writes.
+- **Less storage + compaction.** One fewer table to store, replicate, repair, and compact; the
+  upload path stops generating reverse-partition tombstones on GC.
 
 ---
 

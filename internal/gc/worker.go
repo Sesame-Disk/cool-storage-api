@@ -205,15 +205,27 @@ func (w *Worker) ProcessOrgOnce(ctx context.Context, orgID uuid.UUID) (int, erro
 	return w.processOrg(ctx, orgID)
 }
 
-func (w *Worker) cleanupBlockMappings(orgID uuid.UUID, internalBlockID string) error {
-	mappings, err := w.store.ListBlockMappingsByInternalID(orgID, internalBlockID)
-	if err != nil {
-		return fmt.Errorf("failed to list block mappings for %s: %w", internalBlockID, err)
+// cleanupBlockMapping removes the single forward block_id_mappings row (external
+// SHA-1 -> internal SHA-256) for a block being GC'd. externalSHA1 is the block's
+// blocks.sha1, captured from GetBlockInfo BEFORE the canonical row is deleted.
+//
+// The reverse index (block_id_mappings_by_internal) was dropped in migration 006,
+// so there is no alias enumeration: blocks.sha1 is the authoritative, single-
+// valued external id (block encryption is deterministic — AES-CBC with a derived
+// fixed IV — so SHA-256 -> SHA-1 is 1:1). The delete is a single-partition write
+// by (org_id, external_id): no ALLOW FILTERING, no clustering/tombstone scan.
+func (w *Worker) cleanupBlockMapping(orgID uuid.UUID, internalBlockID, externalSHA1 string) error {
+	externalSHA1 = strings.TrimSpace(externalSHA1)
+	if externalSHA1 == "" {
+		// No server-derived SHA-1 to resolve the forward row. Without the reverse
+		// index we cannot locate it; a leftover forward row is a harmless dangling
+		// pointer (a desktop bare-SHA-1 block GET 404s; it self-heals if the
+		// identical block is re-uploaded). Record it so any such leak is observable.
+		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_sha1_missing").Inc()
+		return nil
 	}
-	for _, mapping := range mappings {
-		if err := w.store.DeleteBlockMappingResolved(orgID, mapping.ExternalID, mapping.InternalID); err != nil {
-			return fmt.Errorf("failed to delete block mapping %s for %s: %w", mapping.ExternalID, internalBlockID, err)
-		}
+	if err := w.store.DeleteBlockMapping(orgID, externalSHA1); err != nil {
+		return fmt.Errorf("failed to delete forward block mapping %s for %s: %w", externalSHA1, internalBlockID, err)
 	}
 	return nil
 }
@@ -396,7 +408,10 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return fmt.Errorf("failed to check canonical block row for %s: %w", item.ItemID, err)
 	}
 	if !exists {
-		if err := w.cleanupBlockMappings(item.OrgID, item.ItemID); err != nil {
+		// Canonical blocks row is already gone, so blocks.sha1 is unavailable; the
+		// forward mapping (if any) can no longer be resolved without the dropped
+		// reverse index. cleanupBlockMapping records this as observable.
+		if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, ""); err != nil {
 			return err
 		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
@@ -455,7 +470,9 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, claimID); err != nil {
 				return fmt.Errorf("failed to remove stub block row for %s: %w", item.ItemID, err)
 			}
-			if err := w.cleanupBlockMappings(item.OrgID, item.ItemID); err != nil {
+			// Stub row carries no metadata; blockInfo.Sha1 is captured before the
+			// FinalizeBlockDelete above and is normally empty for a stub.
+			if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.Sha1); err != nil {
 				return err
 			}
 			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
@@ -503,11 +520,12 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		}
 	}
 
-	// 5. Clean up related mappings after the canonical row is gone. If the
-	// worker crashes after FinalizeBlockDelete but before this cleanup, the retry
-	// lands in the missing-row/stub cleanup paths above and re-runs the same
-	// mapping cleanup without leaving the delete fence stuck active.
-	if err := w.cleanupBlockMappings(item.OrgID, item.ItemID); err != nil {
+	// 5. Clean up the forward mapping after the canonical row is gone, using the
+	// blocks.sha1 captured in blockInfo BEFORE FinalizeBlockDelete. If the worker
+	// crashes after FinalizeBlockDelete but before this cleanup, the retry lands in
+	// the missing-row cleanup path above (the row is gone, so blocks.sha1 is no
+	// longer readable — a leftover forward row is then a harmless dangling pointer).
+	if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.Sha1); err != nil {
 		return err
 	}
 

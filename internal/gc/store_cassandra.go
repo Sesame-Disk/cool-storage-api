@@ -8,6 +8,7 @@ import (
 	"log"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -1531,13 +1532,17 @@ func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bo
 func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
 	info := BlockInfo{BlockID: blockID}
 	var createdAt *time.Time
+	var sha1 string
+	// Single-partition point read by the full ((org_id), block_id) key. sha1 is
+	// the same row, so reading it adds no extra query and no tombstone scan.
 	err := s.db.Session().Query(`
-		SELECT storage_class, created_at FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&info.StorageClass, &createdAt)
+		SELECT storage_class, created_at, sha1 FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&info.StorageClass, &createdAt, &sha1)
 	if err != nil {
 		return BlockInfo{}, err
 	}
 	info.CreatedAt = createdAt
+	info.Sha1 = strings.TrimSpace(sha1)
 	return info, nil
 }
 
@@ -1709,48 +1714,15 @@ func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID s
 	return nil
 }
 
-func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {
-	iter := s.db.Session().Query(`
-		SELECT internal_id, external_id FROM block_id_mappings_by_internal
-		WHERE org_id = ? AND internal_id = ?
-	`, orgID.String(), internalID).Iter()
-
-	var mappings []BlockMapping
-	var intID, extID string
-	for iter.Scan(&intID, &extID) {
-		mappings = append(mappings, BlockMapping{ExternalID: extID, InternalID: intID})
-	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("list block mappings for org=%s internal_id=%s: %w", orgID, internalID, err)
-	}
-	return mappings, nil
-}
-
+// DeleteBlockMapping removes the forward block_id_mappings row by its full
+// ((org_id), external_id) partition key. The reverse projection was dropped in
+// migration 006, so this is a single-partition DELETE with no read-before-delete
+// and no reverse cleanup.
 func (s *CassandraStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error {
-	// Read the internal_id first for reverse table cleanup
-	var internalID string
-	err := s.db.Session().Query(`
-		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
-	`, orgID.String(), externalID).Scan(&internalID)
-	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
-		return fmt.Errorf("read block mapping org=%s external_id=%s: %w", orgID, externalID, err)
-	}
-	if err == nil && internalID != "" {
-		return s.DeleteBlockMappingResolved(orgID, externalID, internalID)
-	}
-
-	batch := s.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID.String(), externalID)
-	return batch.Exec()
-}
-
-func (s *CassandraStore) DeleteBlockMappingResolved(orgID uuid.UUID, externalID, internalID string) error {
-	batch := s.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID.String(), externalID)
-	batch.Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`,
-		orgID.String(), internalID, externalID)
-	if err := batch.Exec(); err != nil {
-		return fmt.Errorf("delete resolved block mapping org=%s external_id=%s internal_id=%s: %w", orgID, externalID, internalID, err)
+	if err := s.db.Session().Query(`
+		DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?
+	`, orgID.String(), externalID).Exec(); err != nil {
+		return fmt.Errorf("delete block mapping org=%s external_id=%s: %w", orgID, externalID, err)
 	}
 	return nil
 }

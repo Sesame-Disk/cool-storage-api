@@ -103,9 +103,8 @@ func TestWorker_ProcessBlock_S3RetryExhausted(t *testing.T) {
 	if store.GetBlock(orgID, "block-perma") != nil {
 		t.Error("block DB row should be gone after LWT delete")
 	}
-	mappings, _ := store.ListBlockMappingsByInternalID(orgID, "block-perma")
-	if len(mappings) != 0 {
-		t.Errorf("expected mappings cleaned up, got %d", len(mappings))
+	if store.ForwardBlockMappingExists(orgID, "sha1-xyz") {
+		t.Error("expected forward block mapping cleaned up via blocks.sha1")
 	}
 	if stats.BlocksDeleted() != 1 {
 		t.Errorf("BlocksDeleted=%d, want 1 (logical deletion counts even with S3 orphan)", stats.BlocksDeleted())

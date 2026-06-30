@@ -79,7 +79,6 @@ type GCStore interface {
 	// owns the row.
 	FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
-	DeleteBlockMappingResolved(orgID uuid.UUID, externalID, internalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error
 	// ListBlockGCCandidatesByDay enumerates candidates whose `candidate_at`
@@ -113,9 +112,6 @@ type GCStore interface {
 	ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanInfo, error)
 	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error
 	DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error
-
-	// Reverse lookup: find block mappings by internal_id (avoids full scan)
-	ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error)
 
 	// Commit operations (worker)
 	GetCommit(libraryID uuid.UUID, commitID string) (CommitInfo, error)
@@ -268,12 +264,6 @@ const (
 	ItemRestoreJob ItemType = "restore_job"
 )
 
-// BlockMapping represents a SHA-1 to SHA-256 block ID mapping.
-type BlockMapping struct {
-	ExternalID string
-	InternalID string
-}
-
 // FSObjectInfo holds data about an fs_object needed by the worker.
 type FSObjectInfo struct {
 	FSID       string
@@ -293,6 +283,10 @@ type BlockInfo struct {
 	BlockID      string
 	StorageClass string
 	CreatedAt    *time.Time
+	// Sha1 is the block's external Seafile SHA-1 (blocks.sha1), captured here so
+	// GC mapping cleanup can delete the single forward block_id_mappings row
+	// without the dropped reverse index. Empty for legacy/pre-PR2 rows.
+	Sha1 string
 }
 
 type BlockGCCandidateInfo struct {

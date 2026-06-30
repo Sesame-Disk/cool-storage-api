@@ -587,7 +587,13 @@ PUT /seafhttp/repo/{repo_id}/block/{sha1_hash}
 
 ---
 
-### 9b. `block_id_mappings_by_internal`
+### 9b. `block_id_mappings_by_internal` — DROPPED (PR7, migration 006)
+> **Removed.** This reverse table was dropped in `006_drop_block_id_mappings_by_internal.cql`. GC
+> cleanup now sources a block's external SHA-1 from `blocks.sha1` (a keyed point read, captured from
+> `GetBlockInfo` before the row is deleted) and deletes the single forward `block_id_mappings` row by
+> `(org_id, external_id)`. No reverse enumeration, no dual-write. The description below is retained
+> for historical context only.
+
 **Purpose:** Reverse lookup (SHA-256 → SHA-1) for GC cleanup — avoids full table scans when deleting blocks
 
 **Schema:**

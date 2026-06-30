@@ -1,0 +1,23 @@
+-- Migration 006: drop the reverse block-id mapping table
+--
+-- block_id_mappings_by_internal was a SHA-256 -> SHA-1 reverse projection whose
+-- only consumer was GC mapping cleanup (enumerate a block's external SHA-1
+-- alias(es) when deleting it by SHA-256). It is now redundant: blocks.sha1
+-- (migration 005, written from the block's real bytes on every materialization
+-- path) is the authoritative, single-valued SHA-256 -> SHA-1 source.
+--
+-- Safe to drop because:
+--   - Block encryption is deterministic (AES-256-CBC with a derived, fixed IV;
+--     no random IV), so SHA-1(plaintext) <-> SHA-256(ciphertext) is 1:1 even for
+--     encrypted libraries. The reverse table's multi-alias capability was only
+--     ever populated by stale/orphan rows, never by honest content.
+--   - GC now reads blocks.sha1 (a single-partition point read by the full
+--     (org_id, block_id) key, captured before the block row is deleted) and
+--     deletes the single forward block_id_mappings row by (org_id, external_id).
+--     No reverse enumeration, no ALLOW FILTERING, no clustering-row /
+--     tombstone scans.
+--
+-- The forward table block_id_mappings is KEPT: the desktop client still
+-- downloads blocks by SHA-1, so the SHA-1 -> SHA-256 resolution stays.
+
+DROP TABLE IF EXISTS block_id_mappings_by_internal;

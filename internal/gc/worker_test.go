@@ -83,15 +83,49 @@ func TestWorker_ProcessBlock_RefCountZero(t *testing.T) {
 		t.Errorf("expected S3 deletion of block-1, got %v", deleted)
 	}
 
-	// Block mapping should be cleaned up (via reverse lookup)
-	mappings, _ := store.ListBlockMappingsByInternalID(orgID, "block-1")
-	if len(mappings) != 0 {
-		t.Errorf("expected 0 mappings, got %d", len(mappings))
+	// Forward block mapping should be cleaned up (resolved via blocks.sha1)
+	if store.ForwardBlockMappingExists(orgID, "sha1-abc") {
+		t.Error("expected forward mapping sha1-abc cleaned up via blocks.sha1")
 	}
 
 	// Stats should be updated
 	if stats.BlocksDeleted() != 1 {
 		t.Errorf("BlocksDeleted = %d, want 1", stats.BlocksDeleted())
+	}
+}
+
+// TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable pins the
+// PR7 fail-safe: when a deleted block has no blocks.sha1 (a legacy/pre-PR2 row),
+// GC cannot resolve its forward block_id_mappings row without the dropped reverse
+// index, so it must NOT delete a mapping blindly. The mapping survives as a
+// harmless dangling pointer (recorded via the gc_block_mapping_sha1_missing
+// metric), and the block itself is still deleted from DB + S3.
+func TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	// Seed the forward mapping BEFORE the block exists, so the block row carries an
+	// empty blocks.sha1 (the legacy shape this fail-safe guards).
+	store.AddBlockMapping(orgID, "sha1-orphan", "block-nosha1")
+	store.AddBlock(orgID, "block-nosha1", "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-nosha1", uuid.Nil, "hot", 0)
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed, got %d", n)
+	}
+	if store.GetBlock(orgID, "block-nosha1") != nil {
+		t.Error("block should be deleted from DB even when blocks.sha1 is empty")
+	}
+	if !store.ForwardBlockMappingExists(orgID, "sha1-orphan") {
+		t.Error("forward mapping must survive when blocks.sha1 is empty (fail-safe, not a blind delete)")
 	}
 }
 
@@ -304,8 +338,12 @@ func TestWorker_ProcessBlock_MissingCanonicalRowSkipsWithoutClaimOrDLQ(t *testin
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("expected block candidate cleanup, got %d rows", got)
 	}
-	if mappings, _ := store.ListBlockMappingsByInternalID(orgID, "block-missing"); len(mappings) != 0 {
-		t.Fatalf("expected missing-row cleanup to remove mappings, got %d rows", len(mappings))
+	// The canonical blocks row never existed here, so blocks.sha1 is unavailable
+	// and the forward mapping cannot be resolved without the (dropped) reverse
+	// index. It survives as a harmless dangling pointer (recorded via the
+	// gc_block_mapping_sha1_missing metric); it is NOT swept on this path.
+	if !store.ForwardBlockMappingExists(orgID, "sha1-missing") {
+		t.Fatal("missing-row path should leave the unresolvable forward mapping in place")
 	}
 	if got := len(store.FailedItems(orgID)); got != 0 {
 		t.Fatalf("expected no DLQ entries, got %d", got)
@@ -342,8 +380,8 @@ func TestWorker_ProcessBlock_StubRowAfterClaimIsCleanedWithoutDLQ(t *testing.T) 
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("expected block candidate cleanup, got %d rows", got)
 	}
-	if mappings, _ := store.ListBlockMappingsByInternalID(orgID, "block-stub"); len(mappings) != 0 {
-		t.Fatalf("expected stub cleanup to remove mappings, got %d rows", len(mappings))
+	if store.ForwardBlockMappingExists(orgID, "sha1-stub") {
+		t.Fatal("expected stub cleanup to remove the forward mapping via blocks.sha1")
 	}
 	if got := len(store.FailedItems(orgID)); got != 0 {
 		t.Fatalf("expected no DLQ entries, got %d", got)
@@ -1329,10 +1367,9 @@ func TestWorker_ProcessBlockMapping(t *testing.T) {
 		t.Errorf("expected 1 processed, got %d", n)
 	}
 
-	// Mapping should be deleted
-	mappings, _ := store.ListBlockMappingsByInternalID(orgID, "int-sha256")
-	if len(mappings) != 0 {
-		t.Errorf("expected 0 mappings, got %d", len(mappings))
+	// Forward mapping should be deleted (by its external_id partition key)
+	if store.ForwardBlockMappingExists(orgID, "ext-sha1") {
+		t.Error("expected forward mapping ext-sha1 deleted")
 	}
 }
 
