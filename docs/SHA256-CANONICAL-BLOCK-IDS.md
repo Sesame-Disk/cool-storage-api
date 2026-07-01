@@ -1,9 +1,9 @@
 # SHA-256 canonical block IDs (and removing SHA-1 from the web client)
 
-**Date:** 2026-06-29 (last updated 2026-06-30)
-**Status:** Design + implementation tracker. PR1-PR6 are **merged to `main`**; PR7 (drop the reverse
-mapping table) is **implemented** on `feat/sha256-canonical-block-ids-pr7` (pending integration run +
-merge). The whole SHA-256-canonical block-id effort is functionally complete.
+**Date:** 2026-06-29 (last updated 2026-07-01)
+**Status:** Design + implementation tracker. PR1-PR8 are **merged to `main`**. The SHA-256-canonical
+block-id effort is implemented end-to-end, including the GC recovery hardening that followed the PR7
+reverse-mapping drop.
 **Supersedes:** the out-of-tree `implementation_plan.md` draft (backend/read-side only),
 which is removed in favour of this document.
 **Related:** [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md) (R10 dual-hash, the current state
@@ -114,8 +114,8 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     SHA-1 surface eliminates the *crafted-collision* threat that motivated the guard, but the guard
     is still the active web mapping writer; it is now harmless defense-in-depth and is removed as
     part of the PR7 mapping rework, not here.
-- `PR7` — **implemented** (branch `feat/sha256-canonical-block-ids-pr7`): drop the reverse mapping
-  table `block_id_mappings_by_internal`.
+- `PR7` — **merged to `main`**: drop the reverse mapping table
+  `block_id_mappings_by_internal`.
   - **Migration `006_drop_block_id_mappings_by_internal.cql`** (`DROP TABLE IF EXISTS`).
   - **Stopped the reverse dual-write** in `WriteBlockIDMapping` and `WriteVerifiedWebBlockMapping`
     (both are now single forward INSERTs); removed the now-dead `WriteBlockIDMappingDualWrite`.
@@ -133,6 +133,16 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     encrypted-equivalent integration guard `TestGC_WorkerCleansForwardMappingViaBlockSHA1` (deletes a
     block whose external SHA-1 != internal block_id and asserts the forward row is resolved/cleaned
     from `blocks.sha1`). See the safety + performance section below.
+- `PR8` — **merged to `main`**: GC recovery hardening for the forward-only mapping-cleanup model.
+  - **Migration `007_gc_s3_orphan_mapping_recovery.cql`** extends `gc_s3_orphans` and
+    `gc_s3_orphans_by_day` with `external_sha1` and `recovery_phase`, so recovery can still clean the
+    forward SHA-1 mapping after the canonical `blocks` row is gone.
+  - **Resurrection-safe recovery** re-checks `BlockExists` before mapping cleanup, so a re-uploaded
+    live block does not lose its freshly re-created forward mapping.
+  - **Stale-phase reset on new delete** ensures a fresh block lifecycle cannot inherit an old
+    `pending_mapping_cleanup` phase and skip the physical S3 delete.
+  - **Tests** pin both behaviors: `TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping`
+    and `TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3`.
 
 ## Notes / Debt
 
@@ -396,7 +406,7 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
   on enumerating *all* SHA-1 aliases for an internal id before dropping the table. If such a path
   exists, keep the table or replace it with a narrower index.
 
-### PR7 — why it is safe and clean (verification + performance)
+### PR7 / PR8 — why it is safe and clean (verification + performance)
 
 **Safety — the encrypted aliasing concern is cleared by deterministic encryption.**
 
