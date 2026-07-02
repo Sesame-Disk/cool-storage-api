@@ -493,21 +493,6 @@ var probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (block
 	return row, true, nil
 }
 
-// GetOrgBlockSize reports whether the caller's org has a materialized metadata
-// row for a block (the `blocks` table is org-partitioned), returning its size
-// when found. This is the ownership gate for the direct block read endpoints:
-// S3 keys are global content-addressed objects with no org scoping, so serving
-// a block by hash alone would let any authenticated user of any org read or
-// probe any block in the system. found=false means the org does not govern
-// this block.
-func (db *DB) GetOrgBlockSize(orgID, blockID string) (int64, bool, error) {
-	row, found, err := probeBlockReuseMetadataFn(db, orgID, blockID)
-	if err != nil || !found {
-		return 0, false, err
-	}
-	return int64(row.SizeBytes), true, nil
-}
-
 var probeBlockReuseHasReferencesFn = func(database *DB, orgID, blockID string) (bool, error) {
 	return database.BlockHasReferences(orgID, blockID)
 }

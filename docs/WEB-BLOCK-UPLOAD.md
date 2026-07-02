@@ -998,22 +998,29 @@ is genuinely multi-node (state in Cassandra/S3, LWT commit claim, no sticky
 routing, per-repo storage-class resolution). It also surfaced findings NOT
 tracked above. Progress is tracked here; each fix ships as its own small PR.
 
-11. **[High — FIXED, PR `fix/block-endpoint-org-authorization`] `GET/HEAD
-    /api/v2/blocks/:hash` had no org/library authorization.** S3 block keys are
-    global content-addressed objects with no org scoping, so any authenticated
-    user of ANY org could download any block in the system by hash, and `HEAD`
-    was an unlimited cross-tenant existence oracle (the classic CAS dedup
-    confirmation attack). Neither endpoint is used by the web app (download goes
-    through file paths; desktop uses seafhttp). Fix: both endpoints now require
-    the caller's org to hold a materialized `blocks` metadata row for the hash
-    (`requireOrgOwnedBlock` → `db.GetOrgBlockSize`, org-partitioned, 1 query);
-    a non-owned block returns 404 indistinguishable from a missing one; no DB →
-    503 fail-closed. Both endpoints got the same per-IP rate limit as `/check`.
-    Bonus: the download's traffic-quota check now runs BEFORE the S3 read (using
-    the org-scoped metadata size), so a quota-rejected request no longer costs a
-    full S3 GET. Unit tests: `TestBlockReadEndpoints_*` in
-    `internal/api/v2/blocks_test.go`. Follow-up (deferred): a cross-org
-    integration test needs a two-org harness which does not exist yet.
+11. **[High — FIXED by REMOVAL, PR `fix/block-endpoint-org-authorization`]
+    `GET/HEAD /api/v2/blocks/:hash` had no authorization beyond authentication —
+    the routes were removed.** S3 block keys are global content-addressed
+    objects with no org scoping, so any authenticated user of ANY org could
+    download any block in the system by hash, and `HEAD` was an unlimited
+    cross-tenant existence oracle (the classic CAS dedup confirmation attack).
+    A first fix gated both endpoints on the caller's org holding a `blocks`
+    metadata row, but review showed that gate was still too weak: it did **not**
+    close the intra-org leak (any user of the org could read blocks of another
+    user's private library — no library permission is checkable from a bare
+    hash), it admitted rows that survive during GC (`gc_state='deleting'`) and
+    rows materialized by uncommitted staging, and the read still resolved the
+    store by hostname instead of the block's canonical `storage_class` (false
+    404 on multi-backend). Since NOTHING consumes these endpoints (web download
+    goes through file paths; desktop sync uses the repo-scoped,
+    permission-checked `/seafhttp/repo/:repo_id/block/:block_id`; the only
+    reference was a benchmark script), the correct fix is **no endpoint**: a
+    bare-hash block read is an oracle by construction. If a client-side block
+    download flow is ever needed, reintroduce it repo-scoped like seafhttp
+    (`repos/:repo_id/blocks/:hash` + library permission + verify the library
+    references the block + resolve the store by the block's canonical storage
+    class). Locked by `TestDirectBlockReadRoutesAreNotRegistered` in
+    `internal/api/v2/blocks_test.go`.
 12. **[Low/med — pending] `/blocks/upload?session=` and `/blocks/check?session=`
     do not re-check repo write permission.** Only session ownership is verified;
     the write permission is checked at session mint and at commit. A user whose

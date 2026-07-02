@@ -71,33 +71,10 @@ for size_kb in 64 256 1024 4096; do
   echo
 done
 
-# --- Block Download ---
-echo
-echo "--- Block Download (GET /api/v2/blocks/:hash) ---"
-# Upload a known block first, then download it
-dd if=/dev/urandom of="$TMPDIR/dl_block.bin" bs=1K count=256 2>/dev/null
-upload_resp=$(curl -sS $INSECURE \
-  -X POST "$HOST/api/v2/blocks/upload" \
-  "${AUTH[@]}" \
-  -H "Content-Type: application/octet-stream" \
-  --data-binary "@$TMPDIR/dl_block.bin" \
-  --max-time 15 2>/dev/null)
-dl_hash=$(echo "$upload_resp" | grep -o '"hash":"[^"]*"' | cut -d'"' -f4)
-
-if [ -n "$dl_hash" ]; then
-  for i in 1 2 3 4 5; do
-    start=$(date +%s%N)
-    code=$(curl -sS $INSECURE -o /dev/null -w "%{http_code}" \
-      "$HOST/api/v2/blocks/$dl_hash" \
-      "${AUTH[@]}" \
-      --max-time 15 2>/dev/null || echo "000")
-    end=$(date +%s%N)
-    ms=$(( (end - start) / 1000000 ))
-    printf "  256KB download #%d -> HTTP %s  %5dms\n" "$i" "$code" "$ms"
-  done
-else
-  echo "  SKIP: could not upload test block"
-fi
+# NOTE: the "Block Download (GET /api/v2/blocks/:hash)" benchmark was removed:
+# the bare-hash block read endpoint no longer exists (it was an unauthorized
+# cross-tenant content oracle; see docs/WEB-BLOCK-UPLOAD.md finding 11).
+# Download performance is covered by the file download benchmark below.
 
 # --- File Upload via seafhttp ---
 echo
