@@ -320,6 +320,11 @@ func TestGetLockedFiles_DeduplicatesRepoEntries(t *testing.T) {
 		"tok-1": downloadTokenFor("repo-1", "user-1"),
 	}}
 	queryCount := 0
+	accountChecks := 0
+	withAccountStatusStub(handler, func(c *gin.Context, userID, orgID string) error {
+		accountChecks++
+		return nil
+	})
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
 		queryCount++
 		return []db.RepoLockedFile{{Path: "/a.txt", LockedBy: "user-2"}}, nil
@@ -336,6 +341,9 @@ func TestGetLockedFiles_DeduplicatesRepoEntries(t *testing.T) {
 	}
 	if queryCount != 1 {
 		t.Fatalf("lock queries = %d, want 1 (duplicates must be skipped)", queryCount)
+	}
+	if accountChecks != 1 {
+		t.Fatalf("account status checks = %d, want 1 (duplicates must be skipped before account-status validation)", accountChecks)
 	}
 	if got := strings.Count(w.Body.String(), `"repo_id":"repo-1"`); got != 1 {
 		t.Fatalf("repo-1 appears %d times in response, want 1", got)

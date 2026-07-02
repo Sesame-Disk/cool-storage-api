@@ -490,6 +490,15 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 			accessToken.Path != "/" || strings.EqualFold(accessToken.Source, "link") {
 			continue
 		}
+		// Dedupe after validation so a duplicate entry with a stale token
+		// cannot shadow a later entry for the same repo carrying a valid one.
+		// It runs before account-status checks and lock queries so valid
+		// duplicates do not repeat extra per-repo work.
+		if _, dup := seen[req.RepoID]; dup {
+			continue
+		}
+		seen[req.RepoID] = struct{}{}
+
 		if h.accountStatus != nil {
 			if err := h.accountStatus(c, accessToken.UserID, accessToken.OrgID); err != nil {
 				return
@@ -498,13 +507,6 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 		if c.IsAborted() {
 			return
 		}
-
-		// Dedupe after validation so a duplicate entry with a stale token
-		// cannot shadow a later entry for the same repo carrying a valid one.
-		if _, dup := seen[req.RepoID]; dup {
-			continue
-		}
-		seen[req.RepoID] = struct{}{}
 
 		locks, err := listRepoLocksFn(h, req.RepoID)
 		if err != nil {
