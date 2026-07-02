@@ -810,6 +810,10 @@ func (s *Server) resolveUserAuth(c *gin.Context) (userID, orgID, role string) {
 // enforceAccountStatus checks that the user and their org are active.
 // Used ONLY for repo API token auth (sessions are killed at source on deactivate/delete).
 func (s *Server) checkAccountStatus(userID, orgID string) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+
 	// Check user status
 	var userStatus string
 	if err := s.db.Session().Query(

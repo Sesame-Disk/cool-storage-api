@@ -1160,6 +1160,13 @@ func TestHandleEmptyWikis(t *testing.T) {
 	}
 }
 
+func TestCheckAccountStatus_NilDBIsNoOp(t *testing.T) {
+	s := createTestServer()
+	if err := s.checkAccountStatus("user-1", "org-1"); err != nil {
+		t.Fatalf("checkAccountStatus() error = %v, want nil when db is unavailable", err)
+	}
+}
+
 func TestHandleEmptyRepoTags(t *testing.T) {
 	s := createTestServer()
 	s.router.GET("/api/v2.1/repos/:repo_id/repo-tags/", s.handleEmptyRepoTags)

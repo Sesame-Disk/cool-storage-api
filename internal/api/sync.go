@@ -438,6 +438,12 @@ type lockedFilesResponseEntry struct {
 	LockedFiles []lockedFileEntry `json:"locked_files"`
 }
 
+type lockedFilesSeenKey struct {
+	repoID string
+	userID string
+	orgID  string
+}
+
 // listRepoLocksFn is a test seam for db.ListRepoLocks, so unit tests can exercise
 // GetLockedFiles without a real Cassandra session.
 var listRepoLocksFn = func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
@@ -495,7 +501,8 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 	}
 
 	now := time.Now().Unix()
-	seen := make(map[string]struct{}, len(reqs))
+	seenRepoUsers := make(map[lockedFilesSeenKey]struct{}, len(reqs))
+	respondedRepos := make(map[string]struct{}, len(reqs))
 	result := make([]lockedFilesResponseEntry, 0, len(reqs))
 	for _, req := range reqs {
 		if req.RepoID == "" || req.Token == "" {
@@ -513,19 +520,29 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 			accessToken.Path != "/" || strings.EqualFold(accessToken.Source, "link") {
 			continue
 		}
-		// Dedupe after validation so a duplicate entry with a stale token
-		// cannot shadow a later entry for the same repo carrying a valid one.
-		// It runs before account-status checks and lock queries so valid
-		// duplicates do not repeat extra per-repo work.
-		if _, dup := seen[req.RepoID]; dup {
+		// Dedupe repeated work for the same authenticated repo/user/org tuple
+		// so identical duplicates do not repeat account checks or lock lookups.
+		// Repo-level response dedupe stays separate: a later entry for the same
+		// repo but a different authenticated user must still get a chance after
+		// this one, because one token could fail account-status while the next
+		// remains valid.
+		seenKey := lockedFilesSeenKey{
+			repoID: req.RepoID,
+			userID: accessToken.UserID,
+			orgID:  accessToken.OrgID,
+		}
+		if _, dup := seenRepoUsers[seenKey]; dup {
 			continue
 		}
-		seen[req.RepoID] = struct{}{}
+		seenRepoUsers[seenKey] = struct{}{}
 
 		if h.accountStatus != nil {
 			if err := h.accountStatus(accessToken.UserID, accessToken.OrgID); err != nil {
 				continue
 			}
+		}
+		if _, dup := respondedRepos[req.RepoID]; dup {
+			continue
 		}
 
 		locks, err := listRepoLocksFn(h, req.RepoID)
@@ -556,6 +573,7 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 				ByMe: strings.EqualFold(lock.LockedBy, accessToken.UserID),
 			})
 		}
+		respondedRepos[req.RepoID] = struct{}{}
 		result = append(result, entry)
 	}
 

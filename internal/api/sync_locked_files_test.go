@@ -351,6 +351,43 @@ func TestGetLockedFiles_DeduplicatesRepoEntries(t *testing.T) {
 	}
 }
 
+func TestGetLockedFiles_AccountStatusRejectedDuplicateDoesNotShadowLaterValidEntry(t *testing.T) {
+	handler := newTestSyncHandler()
+	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
+		"tok-disabled": downloadTokenFor("repo-1", "user-disabled"),
+		"tok-valid":    downloadTokenFor("repo-1", "user-valid"),
+	}}
+	accountChecks := 0
+	withAccountStatusStub(handler, func(userID, orgID string) error {
+		accountChecks++
+		if userID == "user-disabled" {
+			return errors.New("account deactivated")
+		}
+		return nil
+	})
+	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
+		return []db.RepoLockedFile{{Path: "/a.txt", LockedBy: "user-valid"}}, nil
+	})
+
+	body := `[
+		{"repo_id":"repo-1","token":"tok-disabled","ts":0},
+		{"repo_id":"repo-1","token":"tok-valid","ts":0}
+	]`
+	w := postLockedFiles(newLockedFilesRouter(handler), body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if accountChecks != 2 {
+		t.Fatalf("account status checks = %d, want 2 (different authenticated users for same repo must each be evaluated)", accountChecks)
+	}
+	if !strings.Contains(w.Body.String(), `"repo_id":"repo-1"`) {
+		t.Fatalf("body = %q, want repo-1 lock data from later valid entry", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"by_me":true`) {
+		t.Fatalf("body = %q, want later valid token user to drive by_me", w.Body.String())
+	}
+}
+
 func TestGetLockedFiles_AccountStatusRejectsOneEntryButKeepsValidRepos(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
