@@ -11,8 +11,8 @@ are out of scope for phase 1.
 
 - Config: `web_uploads.enable_web_block_upload` (default `false`) in all
   `configs/*.yaml`; env override `WEB_UPLOADS_ENABLE_WEB_BLOCK_UPLOAD=true`.
-- When off, `block-upload-session` and `file-from-blocks` return 404 and the
-  `?session=` mode of `/blocks/check` + `/blocks/upload` is rejected — the routes
+- When off, `block-upload-session` and `file-from-blocks` return 404 and any
+  session-mode call to `/blocks/check` + `/blocks/upload` is rejected — the routes
   are always registered, so this flag is the real gate (defense in depth: the UI
   flag alone would not stop a direct API call).
 - `bootstrap` emits `enableBlockUpload` (real boolean) so the UI matches the server.
@@ -37,7 +37,7 @@ are out of scope for phase 1.
   after the file is published, *before* the (best-effort) storage-counter update —
   a counter failure no longer leaves a `committed` session without a result, and
   never returns 500 after the file already exists.
-- **Storage-class correctness:** `/blocks/upload?session=` resolves the block
+- **Storage-class correctness:** session-mode `/blocks/upload` resolves the block
   store by the session repo's storage class (not generic hostname/"hot"), so a
   block lands in the same backend `file-from-blocks` later verifies.
 - **Parallel verification:** session-mode `/blocks/check` and the commit's
@@ -52,7 +52,7 @@ are out of scope for phase 1.
   only) to avoid flattening directory structure.
 - **Batched check:** the client batches `/blocks/check` (≤5000 hashes/request) to
   stay under the server's 10000 cap for very large files.
-- **Staging does not pay logical storage quota (R5):** `/blocks/upload?session=`
+- **Staging does not pay logical storage quota (R5):** session-mode `/blocks/upload`
   no longer applies the user's *logical* storage quota per block. That quota is a
   property of the final file delta and is decided once at `file-from-blocks`;
   charging it per staged block wrongly rejected valid cases like a same-size
@@ -74,8 +74,8 @@ tracker.
 ```
 1. POST /api/v2/repos/:repo_id/block-upload-session/   → server-issued session_id
 2. client splits file into fixed 8 MB blocks, SHA-256 + SHA-1 each (Web Worker)
-3. POST /api/v2/blocks/check?session=...               → { existing, missing } (by SHA-256)
-4. POST /api/v2/blocks/upload?session=... (per missing) → store + materialize (SHA-256)
+3. POST /api/v2/blocks/check + `X-Block-Upload-Session` → { existing, missing } (by SHA-256)
+4. POST /api/v2/blocks/upload + `X-Block-Upload-Session` (per missing) → store + materialize (SHA-256)
 5. POST /api/v2/repos/:repo_id/file-from-blocks/        → commit from dual-hash manifest
 ```
 
@@ -116,7 +116,7 @@ re-reading this section.
   The session flow materializes a provisional reference with TTL
   (`gc_provisional_block_refs`), so an abandoned upload self-expires and the GC
   sweeper reclaims it.
-- **R3 — Session-aware check.** `/blocks/check?session=` reports a block as
+- **R3 — Session-aware check.** session-mode `/blocks/check` reports a block as
   `existing` only when `ProbeBlockReuse == Reusable`, not merely present in S3 —
   avoiding the "exists in S3 but unmaterialized → commit says NeedsPut" trap.
 - **R5 — Quota in three planes.** Traffic is charged per block at
@@ -154,7 +154,7 @@ re-reading this section.
   publish-attempt staging still pins every block under the commit *before* its
   HEAD CAS, so a concurrent rollback of another session's provisional ref cannot
   drop liveness for this file.
-- **R9 — `/blocks/upload?session=` always materializes**, even when
+- **R9 — session-mode `/blocks/upload` always materializes**, even when
   `PutBlockData` was a no-op because the object already existed in S3. The point
   is to *govern* the block, not just store bytes.
 > **⚠️ Superseded (2026-06-30, PR1–PR5 merged to `main`):** the **SHA-256-canonical
@@ -932,7 +932,7 @@ flag were on*.
    outage window. Full fix (deferred): reconstruct the result by re-reading the
    published path on a committed-but-resultless session, instead of waiting for TTL.
 3. **[RESOLVED, PR `feat/block-upload-observability-and-session-hardening`]
-   `/blocks/check?session=` is aligned with the commit's classifier.** Check now
+   session-mode `/blocks/check` is aligned with the commit's classifier.** Check now
    runs the SAME liveness + physical-S3-presence + ownership classification the
    commit uses (`classifyBlockOwnership`, shared with `classifyBlockForCommit`
    via `checkBlocksReadyParallel`/`blockStore.CheckBlocksParallel`), minus the
@@ -988,10 +988,11 @@ flag were on*.
    `TestObserveBlockVerification_*` in `internal/api/v2/file_from_blocks_test.go`.
 9. **[RESOLVED, PR `feat/block-upload-observability-and-session-hardening`]
    `session` moved out of the query string.** `/blocks/check` and
-   `/blocks/upload` now read the session id from the `X-Block-Upload-Session`
-   header first (`sessionIDFromRequest`), falling back to `?session=` for any
-   caller not yet updated. The web frontend (`seafile-api.js` `checkBlocks` /
-   `uploadBlock`) sends the header exclusively. Covered by
+   `/blocks/upload` now require the `X-Block-Upload-Session` header for
+   session-mode requests; the legacy `?session=` transport is rejected
+   explicitly so an outdated caller cannot silently fall back to the no-session
+   path. The web frontend (`seafile-api.js` `checkBlocks` / `uploadBlock`)
+   sends the header exclusively. Covered by
    `TestSessionIDFromRequest` (backend) and
    `seafile-api-block-upload.test.js` (frontend).
 10. **[Low/med] No local manifest persistence (resume survives the server, not a
@@ -1034,7 +1035,7 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
     note that the removed `DownloadBlock` read the full block from S3 before
     checking the traffic quota — the code path no longer exists.)
 12. **[RESOLVED, PR `feat/block-upload-observability-and-session-hardening`]
-    `/blocks/upload?session=` and `/blocks/check?session=` now re-check upload
+    session-mode `/blocks/upload` and `/blocks/check` now re-check upload
     permission mid-session.** `resolveUploadSession` re-verifies the caller's
     "upload" permission flag on the session's repo
     (`permMiddleware.RequirePermFlagForRepo`) whenever `permMiddleware` is
@@ -1071,7 +1072,7 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
     every referrer (a superset of what `BlockHasReferrer` checks), so the new
     shared `classifyBlockOwnership` helper answers both questions with ONE
     partition read — used by both the commit and the now-aligned
-    `/blocks/check?session=` (item 3).
+    session-mode `/blocks/check` (item 3).
 15. **[RESOLVED, PR `feat/block-upload-observability-and-session-hardening`]
     Removed the per-block upload log line** (`v2/blocks: uploading block …`) —
     at production scale (1500+ blocks per large file × concurrent users) it was

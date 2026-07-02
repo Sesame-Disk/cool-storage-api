@@ -1449,8 +1449,8 @@ seafileAPI.createBlockUploadSession = function (repoID, parentDir, config) {
 // reference), not merely present in object storage.
 //
 // The session id travels in the X-Block-Upload-Session header, not the query
-// string, so it does not land in access/proxy logs (the server still accepts
-// ?session= as a fallback for older callers).
+// string, so it does not land in access/proxy logs. The backend rejects the
+// legacy ?session= transport explicitly.
 seafileAPI.checkBlocks = function (hashes, session, config) {
   let url = this.server + '/api/v2/blocks/check';
   const requestConfig = withBlockUploadSessionHeader(config, session);

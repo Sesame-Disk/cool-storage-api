@@ -232,7 +232,7 @@ func TestObserveBlockVerification_AllReady(t *testing.T) {
 
 	hashes := []string{hex64(1), hex64(2)}
 	statuses := map[string]int{hex64(1): blockStatusReady, hex64(2): blockStatusReady}
-	observeBlockVerification(time.Now(), hashes, statuses)
+	observeBlockVerification(time.Now(), hashes, statuses, nil)
 
 	if got := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("ready")); got != before+2 {
 		t.Errorf("ready count = %v, want %v", got, before+2)
@@ -254,7 +254,7 @@ func TestObserveBlockVerification_MixedResultIsNeedsUpload(t *testing.T) {
 		hex64(4): blockStatusNeedsUpload,
 		hex64(5): blockStatusSizeMismatch,
 	}
-	observeBlockVerification(time.Now(), hashes, statuses)
+	observeBlockVerification(time.Now(), hashes, statuses, nil)
 
 	if got := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("ready")); got != beforeReady+1 {
 		t.Errorf("ready count = %v, want %v", got, beforeReady+1)
@@ -267,6 +267,27 @@ func TestObserveBlockVerification_MixedResultIsNeedsUpload(t *testing.T) {
 	}
 	// A single not-ready block downgrades the WHOLE pass's duration label to
 	// "needs_upload", not just "ready" for the ready ones.
+	if got := histogramSampleCount(t, metrics.BlockUploadVerifyDuration.WithLabelValues("needs_upload")); got != beforeNeedsUploadSamples+1 {
+		t.Errorf("needs_upload duration sample count = %d, want %d", got, beforeNeedsUploadSamples+1)
+	}
+}
+
+func TestObserveBlockVerification_ForcedNeedsUploadOverridesReadyMetric(t *testing.T) {
+	beforeReady := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("ready"))
+	beforeNeeds := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("needs_upload"))
+	beforeNeedsUploadSamples := histogramSampleCount(t, metrics.BlockUploadVerifyDuration.WithLabelValues("needs_upload"))
+
+	hashes := []string{hex64(6)}
+	statuses := map[string]int{hex64(6): blockStatusReady}
+	forcedNeedsUpload := map[string]struct{}{hex64(6): {}}
+	observeBlockVerification(time.Now(), hashes, statuses, forcedNeedsUpload)
+
+	if got := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("ready")); got != beforeReady {
+		t.Errorf("ready count = %v, want unchanged %v", got, beforeReady)
+	}
+	if got := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("needs_upload")); got != beforeNeeds+1 {
+		t.Errorf("needs_upload count = %v, want %v", got, beforeNeeds+1)
+	}
 	if got := histogramSampleCount(t, metrics.BlockUploadVerifyDuration.WithLabelValues("needs_upload")); got != beforeNeedsUploadSamples+1 {
 		t.Errorf("needs_upload duration sample count = %d, want %d", got, beforeNeedsUploadSamples+1)
 	}

@@ -281,7 +281,9 @@ func buildCORSConfig(cfg *config.Config) cors.Config {
 			"Content-Disposition", // Required for filename in uploads
 			"Accept",
 			"Authorization",
+			"X-Block-Hash",
 			"Seafile-Repo-Token",
+			"X-Block-Upload-Session",
 			"X-Requested-With", // Common AJAX header
 		},
 		ExposeHeaders:    []string{"Content-Length", "Content-Type", "X-Quota-Warning"},

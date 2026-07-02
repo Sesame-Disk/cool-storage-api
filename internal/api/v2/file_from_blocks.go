@@ -335,7 +335,6 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify blocks"})
 		return
 	}
-	observeBlockVerification(verifyStart, uniqueHashes, statuses)
 
 	// blockIDs is the ordered SHA-256 list (verification, refs, GC, quota).
 	blockIDs := make([]string, len(req.Blocks))
@@ -372,6 +371,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 			addNeedsUpload(sha256ID)
 		}
 	}
+	observeBlockVerification(verifyStart, uniqueHashes, statuses, needsSeen)
 
 	if len(needsUpload) > 0 {
 		c.JSON(http.StatusConflict, gin.H{
@@ -513,11 +513,17 @@ func fileFromBlocksResponse(req *fileFromBlocksRequest, actualFilename, fileID s
 // observeBlockVerification records the commit's per-block verification pass
 // duration and per-status counts (finding 8). Called only after a successful
 // pass — an infrastructure error (caller returns 500 before this runs) is not
-// a verification outcome to report a duration for.
-func observeBlockVerification(start time.Time, uniqueHashes []string, statuses map[string]int) {
+// a verification outcome to report a duration for. needsUpload contains any
+// extra fail-closed rejections that happened after the primary classifier, such
+// as a malformed server-derived SHA-1.
+func observeBlockVerification(start time.Time, uniqueHashes []string, statuses map[string]int, forcedNeedsUpload map[string]struct{}) {
 	result := "ready"
 	var ready, needsUpload, sizeMismatch int
 	for _, hash := range uniqueHashes {
+		if _, forced := forcedNeedsUpload[hash]; forced {
+			needsUpload++
+			continue
+		}
 		switch statuses[hash] {
 		case blockStatusReady:
 			ready++

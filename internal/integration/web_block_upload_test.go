@@ -45,7 +45,7 @@ func webCreateBlockSession(t *testing.T, c *testClient, repoID, parentDir string
 // webUploadBlock POSTs raw block bytes under a session. Returns the response.
 func webUploadBlock(t *testing.T, c *testClient, session string, data []byte) *http.Response {
 	t.Helper()
-	url := c.baseURL + "/api/v2/blocks/upload?session=" + session
+	url := c.baseURL + "/api/v2/blocks/upload"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("new block upload request: %v", err)
@@ -53,6 +53,7 @@ func webUploadBlock(t *testing.T, c *testClient, session string, data []byte) *h
 	req.Header.Set("Authorization", "Token "+c.token)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Block-Hash", sha256hex(data))
+	req.Header.Set("X-Block-Upload-Session", session)
 	req.ContentLength = int64(len(data))
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -83,7 +84,21 @@ func webUploadBlockLegacy(t *testing.T, c *testClient, data []byte) *http.Respon
 
 func webCheckBlocks(t *testing.T, c *testClient, session string, hashes []string) (existing, missing []string) {
 	t.Helper()
-	resp := c.PostJSON(t, "/api/v2/blocks/check?session="+session, map[string]interface{}{"hashes": hashes})
+	data, err := json.Marshal(map[string]interface{}{"hashes": hashes})
+	if err != nil {
+		t.Fatalf("marshal block check request: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/v2/blocks/check", bytes.NewBuffer(data))
+	if err != nil {
+		t.Fatalf("new block check request: %v", err)
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Block-Upload-Session", session)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		t.Fatalf("block check request failed: %v", err)
+	}
 	expectStatus(t, resp, http.StatusOK)
 	var out struct {
 		Existing []string `json:"existing"`

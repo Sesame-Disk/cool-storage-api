@@ -2,13 +2,16 @@ package v2
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
@@ -131,21 +134,23 @@ func TestDirectBlockReadRoutesAreNotRegistered(t *testing.T) {
 	}
 }
 
-// finding 9: the X-Block-Upload-Session header must win over the legacy
-// ?session= query parameter, and the query parameter must still work as a
-// fallback for any caller not yet updated.
+// finding 9: the X-Block-Upload-Session header is the only supported transport
+// for a block-upload session id. The legacy ?session= query parameter is
+// rejected explicitly so an outdated caller cannot silently fall back to the
+// legacy no-session path.
 func TestSessionIDFromRequest(t *testing.T) {
 	tests := []struct {
 		name   string
 		header string
 		query  string
 		want   string
+		legacy bool
 	}{
-		{"header only", "sess-header", "", "sess-header"},
-		{"query only", "", "sess-query", "sess-query"},
-		{"header wins over query", "sess-header", "sess-query", "sess-header"},
-		{"neither present", "", "", ""},
-		{"whitespace-only header falls back to query", "   ", "sess-query", "sess-query"},
+		{"header only", "sess-header", "", "sess-header", false},
+		{"query only rejected", "", "sess-query", "", true},
+		{"header wins over query", "sess-header", "sess-query", "sess-header", false},
+		{"neither present", "", "", "", false},
+		{"whitespace-only header still rejects query transport", "   ", "sess-query", "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -160,8 +165,12 @@ func TestSessionIDFromRequest(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = req
 
-			if got := sessionIDFromRequest(c); got != tt.want {
-				t.Errorf("sessionIDFromRequest() = %q, want %q", got, tt.want)
+			got, legacy := sessionIDFromRequest(c)
+			if got != tt.want {
+				t.Errorf("sessionIDFromRequest() id = %q, want %q", got, tt.want)
+			}
+			if legacy != tt.legacy {
+				t.Errorf("sessionIDFromRequest() legacy = %v, want %v", legacy, tt.legacy)
 			}
 		})
 	}
@@ -239,7 +248,7 @@ func TestSessionPermissionCache_Allow(t *testing.T) {
 		c := &sessionPermissionCache{checked: make(map[string]time.Time, sessionPermissionCacheSweepSize+1)}
 		stale := time.Now().Add(-sessionPermissionRecheckInterval - time.Second)
 		for i := 0; i < sessionPermissionCacheSweepSize; i++ {
-			c.checked[strings.Repeat("x", 1)+string(rune(i))] = stale
+			c.checked[fmt.Sprintf("stale-%d", i)] = stale
 		}
 		verify := func() bool { return true }
 
@@ -251,6 +260,172 @@ func TestSessionPermissionCache_Allow(t *testing.T) {
 		}
 		if _, ok := c.checked["sess-fresh"]; !ok {
 			t.Error("the fresh entry that triggered the sweep must survive it")
+		}
+	})
+
+	t.Run("evicts oldest fresh entries to keep a hard cap during bursts", func(t *testing.T) {
+		c := &sessionPermissionCache{checked: make(map[string]time.Time, sessionPermissionCacheSweepSize)}
+		base := time.Now()
+		for i := 0; i < sessionPermissionCacheSweepSize; i++ {
+			c.checked[hexSessionID(i)] = base.Add(time.Duration(i) * time.Millisecond)
+		}
+		verifyCalls := 0
+		verify := func() bool { verifyCalls++; return true }
+
+		if !c.allow("sess-new", verify) {
+			t.Fatal("expected allow")
+		}
+		if verifyCalls != 1 {
+			t.Fatalf("verify called %d times, want 1", verifyCalls)
+		}
+		if len(c.checked) > sessionPermissionCacheSweepSize {
+			t.Fatalf("cache size = %d, want <= %d hard cap", len(c.checked), sessionPermissionCacheSweepSize)
+		}
+		if len(c.checked) != sessionPermissionCacheTrimTo {
+			t.Fatalf("cache size = %d, want trim target %d after burst eviction", len(c.checked), sessionPermissionCacheTrimTo)
+		}
+		if _, ok := c.checked["sess-new"]; !ok {
+			t.Fatal("newly verified session should remain cached")
+		}
+		if _, ok := c.checked[hexSessionID(0)]; ok {
+			t.Fatal("oldest fresh entry should have been evicted under burst pressure")
+		}
+	})
+}
+
+func hexSessionID(i int) string {
+	return fmt.Sprintf("sess-%05d", i)
+}
+
+func TestDedupePreserveOrder(t *testing.T) {
+	input := []string{"a", "b", "a", "c", "b", "d"}
+	got := dedupePreserveOrder(input)
+	want := []string{"a", "b", "c", "d"}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCheckBlocksReusableCandidatesParallel_ProbesMetadataFirst(t *testing.T) {
+	origProbe := checkBlocksProbeReuseFn
+	defer func() {
+		checkBlocksProbeReuseFn = origProbe
+	}()
+
+	var probeCalls int
+	checkBlocksProbeReuseFn = func(database *db.DB, orgID, hash string) (db.BlockReuseProbe, error) {
+		probeCalls++
+		if hash == "reusable" {
+			return db.BlockReuseProbe{Decision: db.BlockReuseReusable}, nil
+		}
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+	}
+
+	reusableByHash, reusableHashes, err := checkBlocksReusableCandidatesParallel(
+		context.Background(),
+		nil,
+		"org",
+		[]string{"new", "reusable"},
+		2,
+	)
+	if err != nil {
+		t.Fatalf("checkBlocksReusableCandidatesParallel returned error: %v", err)
+	}
+	if probeCalls != 2 {
+		t.Fatalf("probeCalls = %d, want 2 (probe all hashes in metadata plane first)", probeCalls)
+	}
+	if reusableByHash["new"] {
+		t.Fatal("non-reusable block reported reusable")
+	}
+	if !reusableByHash["reusable"] {
+		t.Fatal("reusable block not reported reusable")
+	}
+	if len(reusableHashes) != 1 || reusableHashes[0] != "reusable" {
+		t.Fatalf("reusableHashes = %v, want [reusable]", reusableHashes)
+	}
+}
+
+func TestCheckBlocksReadyParallel_OnlyChecksOwnershipForPhysicallyPresentCandidates(t *testing.T) {
+	origClassify := checkBlocksClassifyOwnershipFn
+	defer func() {
+		checkBlocksClassifyOwnershipFn = origClassify
+	}()
+
+	var classifyCalls int
+	checkBlocksClassifyOwnershipFn = func(database *db.DB, orgID, referrer, blockID string) (bool, error) {
+		classifyCalls++
+		return blockID == "present", nil
+	}
+
+	ready, err := checkBlocksReadyParallel(
+		context.Background(),
+		nil,
+		"org",
+		"up:sess",
+		[]string{"missing", "present"},
+		map[string]bool{"missing": false, "present": true},
+		2,
+	)
+	if err != nil {
+		t.Fatalf("checkBlocksReadyParallel returned error: %v", err)
+	}
+	if classifyCalls != 1 {
+		t.Fatalf("classifyCalls = %d, want 1 (missing physical object should skip ownership read)", classifyCalls)
+	}
+	if ready["missing"] {
+		t.Fatal("missing block reported ready")
+	}
+	if !ready["present"] {
+		t.Fatal("present reusable block should be ready")
+	}
+}
+
+func TestBlockUploadSessionQueryTransportIsRejected(t *testing.T) {
+	t.Run("check blocks rejects legacy session query transport", func(t *testing.T) {
+		r := gin.New()
+		h := &BlockHandler{}
+		r.POST("/api/v2/blocks/check", h.CheckBlocks)
+
+		body := CheckBlocksRequest{Hashes: []string{strings.Repeat("a", 64)}}
+		jsonBody, _ := json.Marshal(body)
+		req, _ := http.NewRequest("POST", "/api/v2/blocks/check?session=legacy", bytes.NewBuffer(jsonBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		}
+		var resp map[string]interface{}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp["error"] != "block upload session must be sent via X-Block-Upload-Session header" {
+			t.Fatalf("error = %v", resp["error"])
+		}
+	})
+
+	t.Run("upload block rejects legacy session query transport", func(t *testing.T) {
+		r := gin.New()
+		h := &BlockHandler{}
+		r.POST("/api/v2/blocks/upload", h.UploadBlock)
+
+		req, _ := http.NewRequest("POST", "/api/v2/blocks/upload?session=legacy", bytes.NewBufferString("abc"))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.ContentLength = 3
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		}
+		var resp map[string]interface{}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp["error"] != "block upload session must be sent via X-Block-Upload-Session header" {
+			t.Fatalf("error = %v", resp["error"])
 		}
 	})
 }

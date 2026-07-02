@@ -620,6 +620,22 @@ func TestBuildCORSConfig(t *testing.T) {
 		if corsConfig.AllowOrigins[0] != "https://app.example.com" {
 			t.Fatalf("AllowOrigins[0] = %q, want %q", corsConfig.AllowOrigins[0], "https://app.example.com")
 		}
+		foundSessionHeader := false
+		foundBlockHashHeader := false
+		for _, h := range corsConfig.AllowHeaders {
+			if h == "X-Block-Upload-Session" {
+				foundSessionHeader = true
+			}
+			if h == "X-Block-Hash" {
+				foundBlockHashHeader = true
+			}
+		}
+		if !foundSessionHeader {
+			t.Fatal("expected X-Block-Upload-Session to be allowed for cross-origin block uploads")
+		}
+		if !foundBlockHashHeader {
+			t.Fatal("expected X-Block-Hash to be allowed for cross-origin block uploads")
+		}
 	})
 
 	t.Run("production without allowlist fails closed", func(t *testing.T) {
