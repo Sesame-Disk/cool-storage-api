@@ -5,6 +5,8 @@ package integration
 import (
 	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,7 +35,6 @@ func TestAdminStatsFanOutAcrossPlatformShards(t *testing.T) {
 	session := shareProjectionDBForTest(t).Session()
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	yesterday := today.AddDate(0, 0, -1)
-	currentMonth := today.Format("200601")
 
 	const (
 		storageShardA = 3
@@ -78,45 +79,48 @@ func TestAdminStatsFanOutAcrossPlatformShards(t *testing.T) {
 	wantDownloadBytes := int64(333_000 + 444_000)
 	wantTrafficTotal := wantUploadBytes + wantDownloadBytes
 
-	baselineSysinfo := getJSONMap(t, superadminClient.Get(t, "/api/v2.1/admin/sysinfo/"))
-	baselineStorageRow := adminStatsRowForDate(
-		t,
-		fmt.Sprintf("/api/v2.1/admin/statistics/total-storage/?start=%s&end=%s", yesterday.Format("2006-01-02"), yesterday.Format("2006-01-02")),
-		yesterday,
-	)
-	baselineTrafficRow := adminStatsRowForDate(
-		t,
-		fmt.Sprintf("/api/v2.1/admin/statistics/system-traffic/?start=%s&end=%s", today.Format("2006-01-02"), today.Format("2006-01-02")),
-		today,
-	)
-
 	seedPlatformStorageCounterDeltasForTest(t, session, storageDeltas)
-	seedPlatformTrafficCounterDeltasForTest(t, session, currentMonth, trafficDeltas)
+	seedPlatformTrafficCounterDeltasForTest(t, session, trafficDeltas)
 
+	var lastMismatch string
 	waitForCondition(t, "admin shard-aware platform stats to reflect seeded counter deltas", func() bool {
+		expectedStorage := readPlatformStorageSnapshotForTest(t, session)
+		expectedMonthTraffic := readPlatformTrafficUsageForMonthsForTest(t, session, []string{today.Format("200601")})
+		expectedYearTraffic := readPlatformTrafficUsageForMonthsForTest(t, session, yearMonthKeysForTest(today))
+		expectedHistoricalStorage := expectedStorage.BytesUsed - readPlatformStorageDayBytesForTest(t, session, today)
+		expectedTrafficByType := readPlatformTrafficByDayForTest(t, session, today)
+
 		sysinfo := getJSONMap(t, superadminClient.Get(t, "/api/v2.1/admin/sysinfo/"))
-		if jsonInt64(sysinfo, "total_storage") != jsonInt64(baselineSysinfo, "total_storage")+wantStorageBytes {
+		if jsonInt64(sysinfo, "total_storage") != expectedStorage.BytesUsed {
+			lastMismatch = fmt.Sprintf("sysinfo total_storage=%d want=%d", jsonInt64(sysinfo, "total_storage"), expectedStorage.BytesUsed)
 			return false
 		}
-		if jsonInt64(sysinfo, "total_files_count") != jsonInt64(baselineSysinfo, "total_files_count")+wantStorageFiles {
+		if jsonInt64(sysinfo, "total_files_count") != expectedStorage.FileCount {
+			lastMismatch = fmt.Sprintf("sysinfo total_files_count=%d want=%d", jsonInt64(sysinfo, "total_files_count"), expectedStorage.FileCount)
 			return false
 		}
-		if jsonInt64(sysinfo, "traffic_month_total") != jsonInt64(baselineSysinfo, "traffic_month_total")+wantTrafficTotal {
+		if jsonInt64(sysinfo, "traffic_month_total") != expectedMonthTraffic.Combined {
+			lastMismatch = fmt.Sprintf("sysinfo traffic_month_total=%d want=%d", jsonInt64(sysinfo, "traffic_month_total"), expectedMonthTraffic.Combined)
 			return false
 		}
-		if jsonInt64(sysinfo, "traffic_month_upload") != jsonInt64(baselineSysinfo, "traffic_month_upload")+wantUploadBytes {
+		if jsonInt64(sysinfo, "traffic_month_upload") != expectedMonthTraffic.Upload {
+			lastMismatch = fmt.Sprintf("sysinfo traffic_month_upload=%d want=%d", jsonInt64(sysinfo, "traffic_month_upload"), expectedMonthTraffic.Upload)
 			return false
 		}
-		if jsonInt64(sysinfo, "traffic_month_download") != jsonInt64(baselineSysinfo, "traffic_month_download")+wantDownloadBytes {
+		if jsonInt64(sysinfo, "traffic_month_download") != expectedMonthTraffic.Download {
+			lastMismatch = fmt.Sprintf("sysinfo traffic_month_download=%d want=%d", jsonInt64(sysinfo, "traffic_month_download"), expectedMonthTraffic.Download)
 			return false
 		}
-		if jsonInt64(sysinfo, "traffic_year_total") != jsonInt64(baselineSysinfo, "traffic_year_total")+wantTrafficTotal {
+		if jsonInt64(sysinfo, "traffic_year_total") != expectedYearTraffic.Combined {
+			lastMismatch = fmt.Sprintf("sysinfo traffic_year_total=%d want=%d", jsonInt64(sysinfo, "traffic_year_total"), expectedYearTraffic.Combined)
 			return false
 		}
-		if jsonInt64(sysinfo, "traffic_year_upload") != jsonInt64(baselineSysinfo, "traffic_year_upload")+wantUploadBytes {
+		if jsonInt64(sysinfo, "traffic_year_upload") != expectedYearTraffic.Upload {
+			lastMismatch = fmt.Sprintf("sysinfo traffic_year_upload=%d want=%d", jsonInt64(sysinfo, "traffic_year_upload"), expectedYearTraffic.Upload)
 			return false
 		}
-		if jsonInt64(sysinfo, "traffic_year_download") != jsonInt64(baselineSysinfo, "traffic_year_download")+wantDownloadBytes {
+		if jsonInt64(sysinfo, "traffic_year_download") != expectedYearTraffic.Download {
+			lastMismatch = fmt.Sprintf("sysinfo traffic_year_download=%d want=%d", jsonInt64(sysinfo, "traffic_year_download"), expectedYearTraffic.Download)
 			return false
 		}
 
@@ -125,7 +129,8 @@ func TestAdminStatsFanOutAcrossPlatformShards(t *testing.T) {
 			fmt.Sprintf("/api/v2.1/admin/statistics/total-storage/?start=%s&end=%s", yesterday.Format("2006-01-02"), yesterday.Format("2006-01-02")),
 			yesterday,
 		)
-		if jsonInt64(storageRow, "total_storage") != jsonInt64(baselineStorageRow, "total_storage")+wantHistoricalStorageBytes {
+		if jsonInt64(storageRow, "total_storage") != expectedHistoricalStorage {
+			lastMismatch = fmt.Sprintf("storage row total_storage=%d want=%d", jsonInt64(storageRow, "total_storage"), expectedHistoricalStorage)
 			return false
 		}
 
@@ -134,15 +139,22 @@ func TestAdminStatsFanOutAcrossPlatformShards(t *testing.T) {
 			fmt.Sprintf("/api/v2.1/admin/statistics/system-traffic/?start=%s&end=%s", today.Format("2006-01-02"), today.Format("2006-01-02")),
 			today,
 		)
-		if jsonInt64(trafficRow, traffic.WebUpload) != jsonInt64(baselineTrafficRow, traffic.WebUpload)+wantUploadBytes {
+		if jsonInt64(trafficRow, traffic.WebUpload) != expectedTrafficByType[traffic.WebUpload] {
+			lastMismatch = fmt.Sprintf("traffic row %s=%d want=%d", traffic.WebUpload, jsonInt64(trafficRow, traffic.WebUpload), expectedTrafficByType[traffic.WebUpload])
 			return false
 		}
-		if jsonInt64(trafficRow, traffic.LinkDownload) != jsonInt64(baselineTrafficRow, traffic.LinkDownload)+wantDownloadBytes {
+		if jsonInt64(trafficRow, traffic.LinkDownload) != expectedTrafficByType[traffic.LinkDownload] {
+			lastMismatch = fmt.Sprintf("traffic row %s=%d want=%d", traffic.LinkDownload, jsonInt64(trafficRow, traffic.LinkDownload), expectedTrafficByType[traffic.LinkDownload])
 			return false
 		}
 
 		return true
 	})
+
+	t.Logf("verified admin shard fan-out with storage +%d bytes/%d files and traffic +%d upload/+%d download; last mismatch before success: %s", wantStorageBytes, wantStorageFiles, wantUploadBytes, wantDownloadBytes, lastMismatch)
+	if wantHistoricalStorageBytes <= 0 || wantTrafficTotal <= 0 {
+		t.Fatalf("test setup invalid: wantHistoricalStorageBytes=%d wantTrafficTotal=%d", wantHistoricalStorageBytes, wantTrafficTotal)
+	}
 }
 
 func seedPlatformStorageCounterDeltasForTest(t *testing.T, session *gocql.Session, deltas []platformStorageCounterDeltaForTest) {
@@ -170,28 +182,142 @@ func applyPlatformStorageCounterDeltaForTest(t *testing.T, session *gocql.Sessio
 	}
 }
 
-func seedPlatformTrafficCounterDeltasForTest(t *testing.T, session *gocql.Session, month string, deltas []platformTrafficCounterDeltaForTest) {
+func seedPlatformTrafficCounterDeltasForTest(t *testing.T, session *gocql.Session, deltas []platformTrafficCounterDeltaForTest) {
 	t.Helper()
 
 	for _, delta := range deltas {
-		applyPlatformTrafficCounterDeltaForTest(t, session, month, delta)
+		applyPlatformTrafficCounterDeltaForTest(t, session, delta)
 		t.Cleanup(func() {
 			revert := delta
 			revert.bytes = -revert.bytes
-			applyPlatformTrafficCounterDeltaForTest(t, session, month, revert)
+			applyPlatformTrafficCounterDeltaForTest(t, session, revert)
 		})
 	}
 }
 
-func applyPlatformTrafficCounterDeltaForTest(t *testing.T, session *gocql.Session, month string, delta platformTrafficCounterDeltaForTest) {
+func applyPlatformTrafficCounterDeltaForTest(t *testing.T, session *gocql.Session, delta platformTrafficCounterDeltaForTest) {
 	t.Helper()
 
 	if err := session.Query(`
 		UPDATE traffic_counters SET bytes_transferred = bytes_transferred + ?
 		WHERE org_id = ? AND month = ? AND shard = ? AND day = ? AND user_id = ? AND traffic_type = ?
-	`, delta.bytes, gocql.UUID{}, month, delta.shard, delta.day, delta.userID, delta.trafficType).Exec(); err != nil {
+	`, delta.bytes, gocql.UUID{}, delta.day.UTC().Format("200601"), delta.shard, delta.day, delta.userID, delta.trafficType).Exec(); err != nil {
 		t.Fatalf("failed to update platform traffic counter shard %d type %s day %s: %v", delta.shard, delta.trafficType, delta.day.Format(time.RFC3339), err)
 	}
+}
+
+func readPlatformStorageSnapshotForTest(t *testing.T, session *gocql.Session) traffic.StorageSnapshot {
+	t.Helper()
+
+	var snapshot traffic.StorageSnapshot
+	traffic.ForEachCounterShard(func(shard int) {
+		var bytesUsed, fileCount int64
+		if err := session.Query(
+			`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND shard = ? AND day = ?`,
+			traffic.PlatformStorageScope(), shard, platformStorageTotalDayForTest,
+		).Scan(&bytesUsed, &fileCount); err != nil && !errorsIsNotFoundForTest(err) {
+			t.Fatalf("failed to read platform storage snapshot shard %d: %v", shard, err)
+		}
+		snapshot.BytesUsed += maxInt64ForTest(bytesUsed, 0)
+		snapshot.FileCount += maxInt64ForTest(fileCount, 0)
+	})
+	return snapshot
+}
+
+func readPlatformStorageDayBytesForTest(t *testing.T, session *gocql.Session, day time.Time) int64 {
+	t.Helper()
+
+	var total int64
+	traffic.ForEachCounterShard(func(shard int) {
+		var bytesUsed int64
+		if err := session.Query(
+			`SELECT bytes_used FROM storage_counters WHERE scope = ? AND shard = ? AND day = ?`,
+			traffic.PlatformStorageScope(), shard, day,
+		).Scan(&bytesUsed); err != nil && !errorsIsNotFoundForTest(err) {
+			t.Fatalf("failed to read platform storage day bytes shard %d day %s: %v", shard, day.Format("2006-01-02"), err)
+		}
+		total += bytesUsed
+	})
+	return total
+}
+
+func readPlatformTrafficUsageForMonthsForTest(t *testing.T, session *gocql.Session, months []string) traffic.MonthlyTransferUsage {
+	t.Helper()
+
+	usage := traffic.MonthlyTransferUsage{}
+	for _, month := range months {
+		traffic.ForEachCounterShard(func(shard int) {
+			iter := session.Query(
+				`SELECT user_id, traffic_type, bytes_transferred FROM traffic_counters WHERE org_id = ? AND month = ? AND shard = ?`,
+				gocql.UUID{}, month, shard,
+			).Iter()
+			var userUUID gocql.UUID
+			var trafficType string
+			var bytes int64
+			for iter.Scan(&userUUID, &trafficType, &bytes) {
+				if userUUID != (gocql.UUID{}) {
+					continue
+				}
+				usage.Combined += bytes
+				if strings.HasSuffix(trafficType, "-upload") {
+					usage.Upload += bytes
+				} else if strings.HasSuffix(trafficType, "-download") {
+					usage.Download += bytes
+				}
+			}
+			if err := iter.Close(); err != nil {
+				t.Fatalf("failed to read platform traffic usage month %s shard %d: %v", month, shard, err)
+			}
+		})
+	}
+	return usage
+}
+
+func readPlatformTrafficByDayForTest(t *testing.T, session *gocql.Session, day time.Time) map[string]int64 {
+	t.Helper()
+
+	byType := map[string]int64{}
+	month := day.UTC().Format("200601")
+	traffic.ForEachCounterShard(func(shard int) {
+		iter := session.Query(
+			`SELECT day, user_id, traffic_type, bytes_transferred FROM traffic_counters WHERE org_id = ? AND month = ? AND shard = ?`,
+			gocql.UUID{}, month, shard,
+		).Iter()
+		var rowDay time.Time
+		var userUUID gocql.UUID
+		var trafficType string
+		var bytes int64
+		for iter.Scan(&rowDay, &userUUID, &trafficType, &bytes) {
+			if userUUID != (gocql.UUID{}) || !rowDay.UTC().Equal(day.UTC()) {
+				continue
+			}
+			byType[trafficType] += bytes
+		}
+		if err := iter.Close(); err != nil {
+			t.Fatalf("failed to read platform traffic day %s shard %d: %v", day.Format("2006-01-02"), shard, err)
+		}
+	})
+	return byType
+}
+
+func yearMonthKeysForTest(now time.Time) []string {
+	months := make([]string, 0, int(now.Month()))
+	for month := time.January; month <= now.Month(); month++ {
+		months = append(months, time.Date(now.Year(), month, 1, 0, 0, 0, 0, time.UTC).Format("200601"))
+	}
+	sort.Strings(months)
+	return months
+}
+
+func errorsIsNotFoundForTest(err error) bool {
+	return err == nil || err == gocql.ErrNotFound
+}
+
+func maxInt64ForTest(value, floor int64) int64 {
+	if value < floor {
+		return floor
+	}
+	return value
 }
 
 func adminStatsRowForDate(t *testing.T, path string, day time.Time) map[string]interface{} {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/sync/errgroup"
@@ -55,8 +56,12 @@ func committedFileIDFromSession(session db.BlockUploadSession) string {
 // waitForBlockUploadResult polls for the result of a concurrent winner's commit
 // on the same session, so a losing/retried request returns the same file
 // (idempotency, R7) instead of duplicating it. Bounded (~10s); returns ok=false
-// on timeout or if a different manifest won the session.
+// on timeout or if a different manifest won the session. Observes the wait
+// duration (finding 8) so operators can see how often losers approach the
+// ~10s bound instead of resolving quickly.
 func (h *FileHandler) waitForBlockUploadResult(sessionID, digest string) (db.BlockUploadSession, bool) {
+	start := time.Now()
+	defer func() { metrics.BlockUploadSessionWaitDuration.Observe(time.Since(start).Seconds()) }()
 	for i := 0; i < 50; i++ {
 		s, ok, err := h.db.GetBlockUploadSession(sessionID)
 		if err != nil || !ok {
@@ -314,6 +319,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	}
 	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, blockVerifyConcurrency)
 	if err != nil {
+		metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("presence").Inc()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify block presence"})
 		return
 	}
@@ -324,46 +330,19 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// sha1ByHash256 is the SERVER-derived external SHA-1 per block, read from
 	// blocks.sha1 (which UploadBlock wrote from the block's real bytes) via
 	// ProbeBlockReuse. The client no longer sends a SHA-1: the server owns it.
+	verifyStart := time.Now()
 	statuses, sha1ByHash256, err := h.verifyManifestBlocks(c.Request.Context(), orgID, referrer, uniqueHashes, sizeByHash, existsMap)
 	if err != nil {
+		metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("classify").Inc()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify blocks"})
 		return
 	}
 
-	// blockIDs is the ordered SHA-256 list (verification, refs, GC, quota).
-	blockIDs := make([]string, len(req.Blocks))
-	var needsUpload []string
-	needsSeen := make(map[string]struct{})
-	addNeedsUpload := func(sha256ID string) {
-		if _, ok := needsSeen[sha256ID]; !ok {
-			needsSeen[sha256ID] = struct{}{}
-			needsUpload = append(needsUpload, sha256ID)
-		}
-	}
-	for i, b := range req.Blocks {
-		blockIDs[i] = b.SHA256
-		switch statuses[b.SHA256] {
-		case blockStatusSizeMismatch:
-			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "block size mismatch", "sha256": b.SHA256})
-			return
-		case blockStatusNeedsUpload:
-			addNeedsUpload(b.SHA256)
-		}
-	}
+	blockIDs, needsUpload, sizeMismatchHash := summarizeBlockVerification(verifyStart, req.Blocks, uniqueHashes, statuses, sha1ByHash256)
 
-	// Fail-closed validation of the SERVER-derived SHA-1 (blocks.sha1). For a block
-	// to be committed, the server must hold a well-formed 40-hex SHA-1 for it; that
-	// SHA-1 was written from the block's real bytes at UploadBlock time. A ready
-	// block whose blocks.sha1 is missing or malformed is treated as needs_upload —
-	// the re-upload recomputes and rewrites a verified SHA-1 — so a half-written or
-	// pre-PR2 block can never put an unvalidated id into an fs_object.
-	for _, sha256ID := range uniqueHashes {
-		if statuses[sha256ID] != blockStatusReady {
-			continue
-		}
-		if !isHex40(sha1ByHash256[sha256ID]) {
-			addNeedsUpload(sha256ID)
-		}
+	if sizeMismatchHash != "" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "block size mismatch", "sha256": sizeMismatchHash})
+		return
 	}
 
 	if len(needsUpload) > 0 {
@@ -385,7 +364,8 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// R7 concurrency: atomically claim the session for this commit. Exactly one
 	// concurrent request wins and runs finalize; the others wait for and return
 	// the same result, so a double/concurrent commit never creates a duplicate
-	// auto-renamed file.
+	// auto-renamed file. Claim outcomes are counted (finding 8) so operators can
+	// see how often concurrent commits actually contend on a session.
 	applied, err := h.db.ClaimBlockUploadSessionForCommit(session.SessionID, digest)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to claim upload session"})
@@ -396,15 +376,18 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		// result if the manifest matches; otherwise it's a different file.
 		winner, ok := h.waitForBlockUploadResult(session.SessionID, digest)
 		if ok {
+			metrics.BlockUploadSessionClaimTotal.WithLabelValues("lost_result_ready").Inc()
 			c.JSON(http.StatusOK, fileFromBlocksResponse(&req, winner.ResultFilename, committedFileIDFromSession(winner)))
 			return
 		}
 		current, found, readErr := h.db.GetBlockUploadSession(session.SessionID)
 		if readErr == nil {
 			if resultName, code, message := classifyBlockUploadCommitConflict(current, found, digest); resultName != "" {
+				metrics.BlockUploadSessionClaimTotal.WithLabelValues("lost_result_ready").Inc()
 				c.JSON(http.StatusOK, fileFromBlocksResponse(&req, resultName, committedFileIDFromSession(current)))
 				return
 			} else {
+				metrics.BlockUploadSessionClaimTotal.WithLabelValues("lost_conflict").Inc()
 				c.JSON(http.StatusConflict, gin.H{
 					"error": message,
 					"code":  code,
@@ -412,19 +395,23 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 				return
 			}
 		}
+		metrics.BlockUploadSessionClaimTotal.WithLabelValues("lost_timeout").Inc()
 		c.JSON(http.StatusConflict, gin.H{
 			"error": "commit still in progress; retry",
 			"code":  blockUploadCommitInProgressCode,
 		})
 		return
 	}
+	metrics.BlockUploadSessionClaimTotal.WithLabelValues("won").Inc()
 
 	// Commit the file from the ordered manifest. finalize handles
 	// replace/autorename, the logical storage-delta quota (R5), HEAD CAS with
-	// retry, and promotion of provisional → permanent block references. It is given
-	// the SHA-1 (external) IDs: those go into the fs_object and derive its id, and
-	// stage/promote resolve them back to SHA-256 via the mappings UploadBlock
-	// already wrote from verified bytes (no mapping is minted here).
+	// retry, and promotion of provisional → permanent block references. It is
+	// given the SHA-1 (external) IDs: those derive the fs_object's id and are
+	// stored in fs_objects.seafile_block_ids_sha1 for desktop compat, while
+	// fs_objects.block_ids stays the SHA-256 canonical id (post PR1–PR5, see
+	// docs/WEB-BLOCK-UPLOAD.md); either direction resolves through the mappings
+	// UploadBlock already wrote from verified bytes (no mapping is minted here).
 	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(
 		orgID, userID, repoID, req.ParentDir, req.Filename, externalBlockIDs, req.Size, req.Replace)
 	if err != nil {
@@ -495,6 +482,44 @@ func fileFromBlocksResponse(req *fileFromBlocksRequest, actualFilename, fileID s
 	}}
 }
 
+// observeBlockVerification records the commit's per-block verification pass
+// duration and per-status counts (finding 8). Called only after a successful
+// pass — an infrastructure error (caller returns 500 before this runs) is not
+// a verification outcome to report a duration for. needsUpload contains any
+// extra fail-closed rejections that happened after the primary classifier, such
+// as a malformed server-derived SHA-1.
+func observeBlockVerification(start time.Time, uniqueHashes []string, statuses map[string]int, forcedNeedsUpload map[string]struct{}) {
+	result := "ready"
+	var ready, needsUpload, sizeMismatch int
+	for _, hash := range uniqueHashes {
+		if _, forced := forcedNeedsUpload[hash]; forced {
+			needsUpload++
+			continue
+		}
+		switch statuses[hash] {
+		case blockStatusReady:
+			ready++
+		case blockStatusSizeMismatch:
+			sizeMismatch++
+		default: // blockStatusNeedsUpload
+			needsUpload++
+		}
+	}
+	if needsUpload > 0 || sizeMismatch > 0 {
+		result = "needs_upload"
+	}
+	metrics.BlockUploadVerifyDuration.WithLabelValues(result).Observe(time.Since(start).Seconds())
+	if ready > 0 {
+		metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("ready").Add(float64(ready))
+	}
+	if needsUpload > 0 {
+		metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("needs_upload").Add(float64(needsUpload))
+	}
+	if sizeMismatch > 0 {
+		metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("size_mismatch").Add(float64(sizeMismatch))
+	}
+}
+
 // verifyManifestBlocks classifies every distinct manifest block for commit
 // readiness with bounded concurrency (a large manifest is thousands of blocks,
 // so a sequential probe-per-block would be thousands of serial round-trips).
@@ -531,6 +556,52 @@ func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer 
 	return result, sha1ByHash, nil
 }
 
+// summarizeBlockVerification translates the raw per-distinct-block verification
+// statuses into the ordered handler outcome, including fail-closed SHA-1
+// downgrades. It ALWAYS emits verification metrics before returning so
+// size-mismatch exits still show up in observability.
+func summarizeBlockVerification(start time.Time, blocks []fileFromBlocksBlock, uniqueHashes []string, statuses map[string]int, sha1ByHash256 map[string]string) ([]string, []string, string) {
+	// blockIDs is the ordered SHA-256 list (verification, refs, GC, quota).
+	blockIDs := make([]string, len(blocks))
+	var needsUpload []string
+	var sizeMismatchHash string
+	needsSeen := make(map[string]struct{})
+	addNeedsUpload := func(sha256ID string) {
+		if _, ok := needsSeen[sha256ID]; !ok {
+			needsSeen[sha256ID] = struct{}{}
+			needsUpload = append(needsUpload, sha256ID)
+		}
+	}
+	for i, b := range blocks {
+		blockIDs[i] = b.SHA256
+		switch statuses[b.SHA256] {
+		case blockStatusSizeMismatch:
+			if sizeMismatchHash == "" {
+				sizeMismatchHash = b.SHA256
+			}
+		case blockStatusNeedsUpload:
+			addNeedsUpload(b.SHA256)
+		}
+	}
+
+	// Fail-closed validation of the SERVER-derived SHA-1 (blocks.sha1). For a block
+	// to be committed, the server must hold a well-formed 40-hex SHA-1 for it; that
+	// SHA-1 was written from the block's real bytes at UploadBlock time. A ready
+	// block whose blocks.sha1 is missing or malformed is treated as needs_upload —
+	// the re-upload recomputes and rewrites a verified SHA-1 — so a half-written or
+	// pre-PR2 block can never put an unvalidated id into an fs_object.
+	for _, sha256ID := range uniqueHashes {
+		if statuses[sha256ID] != blockStatusReady {
+			continue
+		}
+		if !isHex40(sha1ByHash256[sha256ID]) {
+			addNeedsUpload(sha256ID)
+		}
+	}
+	observeBlockVerification(start, uniqueHashes, statuses, needsSeen)
+	return blockIDs, needsUpload, sizeMismatchHash
+}
+
 // classifyBlockForCommit decides whether one block is commit-ready (R1/R8/R11):
 // live (ProbeBlockReuse == Reusable), physically present, at the declared size,
 // and owned by this session OR kept alive by a committed file ("fs:") reference.
@@ -546,37 +617,39 @@ func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, decla
 	if int64(probe.SizeBytes) != declaredSize {
 		return blockStatusSizeMismatch, sha1, nil
 	}
-	owned, err := h.db.BlockHasReferrer(orgID, hash, referrer)
+	owned, err := classifyBlockOwnership(h.db, orgID, referrer, hash)
 	if err != nil {
 		return 0, "", err
 	}
 	if owned {
 		return blockStatusReady, sha1, nil
 	}
-	permanent, err := blockHasPermanentReference(h.db, orgID, hash)
-	if err != nil {
-		return 0, "", err
-	}
-	if permanent {
-		return blockStatusReady, sha1, nil
-	}
 	return blockStatusNeedsUpload, sha1, nil
 }
 
-// blockHasPermanentReference reports whether a block is kept alive by a DURABLE
-// committed-file reference ("fs:<library>:<fs_id>"). It deliberately does NOT
-// count a publish-attempt ref ("pub:<attempt>") as permanent: that ref is
-// transient and disappears if the foreign attempt loses its HEAD CAS and cleans
-// up, which would leave this commit pointing at a block that can be GC'd. A
-// block alive only via a foreign pub: ref is therefore treated as needs_upload,
-// so the client re-uploads it and we materialize our own session-owned ref.
-func blockHasPermanentReference(database *db.DB, orgID, blockID string) (bool, error) {
+// classifyBlockOwnership reports whether a block is committable: kept alive by
+// THIS session's own provisional reference, or by a permanent committed-file
+// ("fs:<library>:<fs_id>") reference (R8). It deliberately does NOT count a
+// foreign publish-attempt ref ("pub:<attempt>") as permanent: that ref is
+// transient and disappears if the foreign attempt loses its HEAD CAS and
+// cleans up, which would leave this commit pointing at a block that can be
+// GC'd — a block alive only via a foreign pub: ref is treated as not owned, so
+// the caller re-uploads it and materializes its own session-owned ref.
+//
+// This reads the block's reference partition ONCE via ListBlockReferrers
+// (finding 14): the previous version ran BlockHasReferrer (exact-match read)
+// first and, only on a miss, a second ListBlockReferrers (full-partition read)
+// to check for a permanent ref — two queries in the common "not owned by this
+// session, but permanently referenced" case. ListBlockReferrers already
+// returns every referrer, a superset of what BlockHasReferrer checks, so a
+// single partition read now answers both questions.
+func classifyBlockOwnership(database *db.DB, orgID, referrer, blockID string) (bool, error) {
 	referrers, err := database.ListBlockReferrers(orgID, blockID)
 	if err != nil {
 		return false, err
 	}
 	for _, r := range referrers {
-		if strings.HasPrefix(r, "fs:") {
+		if r == referrer || strings.HasPrefix(r, "fs:") {
 			return true, nil
 		}
 	}
