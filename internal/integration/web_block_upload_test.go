@@ -820,12 +820,12 @@ func TestWebBlockUploadSessionRoutesRejectRevokedSharedRepoPermission(t *testing
 		cleanup := adminClient.Delete(t,
 			fmt.Sprintf("/api2/repos/%s/dir/shared_items/?p=/&share_type=user&username=%s", repoID, url.QueryEscape(defaultUserEmail)),
 		)
+		defer cleanup.Body.Close()
 		if cleanup.StatusCode != http.StatusOK && cleanup.StatusCode != http.StatusNotFound {
 			body := responseBody(t, cleanup)
 			t.Errorf("cleanup delete share status=%d body=%s", cleanup.StatusCode, body)
 			return
 		}
-		cleanup.Body.Close()
 	})
 
 	waitForIntegrationCondition(t, "shared repo becomes writable for user before session mint", func() bool {
@@ -848,7 +848,10 @@ func TestWebBlockUploadSessionRoutesRejectRevokedSharedRepoPermission(t *testing
 		return resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound
 	})
 
+	// This covers the first post-revocation use of the session routes, before any
+	// successful route call could warm the 2-minute per-session permission cache.
 	checkResp := webCheckBlocksResponse(t, userClient, sessionID, []string{strings.Repeat("a", 64)})
+	defer checkResp.Body.Close()
 	if checkResp.StatusCode != http.StatusForbidden {
 		body := responseBody(t, checkResp)
 		t.Fatalf("check after permission revocation status=%d, want 403; body=%s", checkResp.StatusCode, body)
@@ -860,6 +863,7 @@ func TestWebBlockUploadSessionRoutesRejectRevokedSharedRepoPermission(t *testing
 	}
 
 	uploadResp := webUploadBlock(t, userClient, sessionID, []byte("revoked session upload "+fmt.Sprint(time.Now().UnixNano())))
+	defer uploadResp.Body.Close()
 	if uploadResp.StatusCode != http.StatusForbidden {
 		body := responseBody(t, uploadResp)
 		t.Fatalf("upload after permission revocation status=%d, want 403; body=%s", uploadResp.StatusCode, body)
