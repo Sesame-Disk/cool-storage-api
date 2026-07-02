@@ -1201,23 +1201,55 @@ Do **not** change these without a deliberate decision on whether to accept the h
 
 ## ⚠️ SeaDrive 3.x Missing Endpoints (Discovered 2026-02-19)
 
-Observed in SeaDrive 3.0.19 client logs after successful SSO login and basic sync. All 4 are currently returning 404. Sync works despite these errors — they degrade UX or efficiency but are non-fatal.
+Observed in SeaDrive 3.0.19 client logs after successful SSO login and basic sync. Sync works despite these errors — they degrade UX or efficiency but are non-fatal. SD-01 is fixed (2026-07-02, see below — earlier "not a gap" framing from the same day was itself wrong, corrected after live-testing a real server). SD-02 is confirmed to 404 the same way against a real server when notifications are disabled — not a gap. SD-05 (nginx false-positive notification detection) is fixed.
 
 ---
 
-### ISSUE-SD-01: `GET /seafhttp/repo/locked-files` — File Lock Status
+### ISSUE-SD-01: `POST /seafhttp/repo/locked-files` — File Lock Status — FIXED (2026-07-02)
 
-**Observed**: SeaDrive logs `Bad response code for GET .../seafhttp/repo/locked-files: 404`
+**Observed**: SeaDrive/desktop client logs `Bad response code for GET .../seafhttp/repo/locked-files: 404`
 **When**: Immediately after repo trees are loaded, before first sync cycle
-**What Seafile does**: Returns the list of files currently locked by any user across the repo. Used by SeaDrive to show lock indicators (padlock icon) on files being actively edited by someone else.
-**Expected response format**:
-```json
-{"locked_files": [{"repo_id": "...", "path": "/filename.docx", "locked_by": "user@example.com", "lock_time": 1234567890}]}
+
+**False start, then correction, both same day (2026-07-02)**: First pass cloned the public `haiwen/seafile-server` (`master`, Community Edition) and found no `/repo/locked-files` route in the Go fileserver's route table — concluded this was upstream parity, not a gap, and decided not to implement it. That was wrong. Live-tested against `app.nihaoshares.com`, a genuine company-operated **Seafile Pro 11.0.16** instance (confirmed via `/api2/server-info/` reporting `"features": ["seafile-basic", "seafile-pro", "file-search"]`):
+
 ```
-**Stub response** (safe to return now): `{"locked_files": []}` — empty list means no files are locked.
-**Auth**: No auth (SeaDrive sends without token, same pattern as folder-perm)
-**Query params**: `repo_id` (optional, may be for a specific repo)
-**Priority**: 🟡 Medium — needed for collaborative editing UX, lockout indicators, OnlyOffice/Office integration
+GET  /seafhttp/repo/locked-files                    → 400, body "EOF"   (empty-body JSON decode error — the handler IS real)
+POST /seafhttp/repo/locked-files  body: []           → 200, body []
+POST /seafhttp/repo/locked-files  body: [{repo_id,token,ts}] (nonexistent repo) → 200, body []
+```
+
+The `"EOF"` body is the literal string Go's `json.Decoder.Decode()` returns on an empty body — proof the route is real and JSON-body-driven, not a blanket 404. Locked-files (and folder-perm, see ISSUE-SD-06) are Seafile **Pro/Enterprise-only** features (closed-source), which is why they're absent from the public CE repo but present against a real Pro server. Since our own `/api2/server-info/` already advertises `"seafile-pro"` in its `features` array, we were already telling clients we support this tier without implementing two of its defining sync endpoints.
+
+**Confirmed wire format**: POST-only (GET 400s on the real server too — the client's error-log message says "GET" but the actual call, per `daemon/http-tx-mgr.c` `get_locked_files_thread`, is always `http_post`). Body is a JSON array of `{repo_id, token, ts}`; response is a JSON array where **repos with no active locks are omitted entirely** (confirmed: even a garbage/nonexistent repo_id returns `[]`, not an entry with an empty `locked_files` list).
+
+**Fix**: Implemented `POST /seafhttp/repo/locked-files` in `internal/api/sync.go` (`GetLockedFiles`), backed by the real `locked_files` table via `db.ListRepoLocks` (`internal/db/file_locks.go`).
+
+**Security hardening (same day, post-review)**: the first cut returned real lock paths for any posted `repo_id` without validating the per-repo `token` in the body — an information-disclosure hole (lock paths leak file/folder names, and repo UUIDs appear in URLs/logs/share flows so they must not be treated as secrets). Now every body entry is authenticated: the entry's `token` must resolve via the token store (`TokenTypeDownload`) **and** belong to that same `repo_id`, or the entry is silently omitted — indistinguishable from "no locks", so the endpoint never confirms whether a guessed repo_id exists. The token's user also enables a real `by_me` (lock holder == token's user, case-insensitive), instead of hardcoded `false` which could have made SeaDrive show a user's own locks as foreign. Also added: 500-entry cap, per-request `repo_id` dedupe, `ShouldBindJSON` (avoid Gin's auto-abort double-write), and fail-closed behavior when no token validator is wired. Note the endpoint is registered without route middleware only because it's multi-repo (no `:repo_id` in path) — it is NOT unauthenticated.
+
+**Second hardening round (same day)**: `TokenTypeDownload` is shared by three grant shapes — the repo-level sync token from download-info (`Path=="/"`, `Source==""`), path-scoped file-download tokens (e.g. `/docs/report.docx`), and share-link tokens (`Source=="link"`, created by `CreateLinkDownloadToken`). Only the first may enumerate repo locks; the handler now additionally requires `Path == "/" && Source != "link"` so a share-link recipient or a single-file download token cannot widen into repo-wide lock visibility (verified `Source` survives the `CassandraTokenAdapter.GetToken` conversion, so the check holds against the production store). Also: `http.MaxBytesReader` (256 KiB) before JSON decoding on this middleware-less route; dedupe moved **after** token validation so a duplicate entry with a stale token can't shadow a later valid one; nil-guard on the validator's returned token.
+
+**Additional hardening (same day, follow-up review)**: the body-token path now also reuses the same account/org usability check that `syncAuthMiddleware` applies to repo-token requests, so a deactivated user with an old token cannot keep enumerating lock metadata. And lock-table lookup failures no longer degrade to "no locks" — the handler now fails closed with `503 file lock status unavailable` instead of pretending the repo is unlocked.
+
+**Residual limitation**: whether genuine Seafile Pro validates these tokens is still unverified (Pro is closed-source; our black-box probes with nonexistent repos can't distinguish invalid-token from no-locks responses) — we validate regardless, since the client always sends real tokens and failing closed costs nothing.
+
+**Files**: `internal/api/sync.go`, `internal/db/file_locks.go`, `internal/api/sync_locked_files_test.go`, `internal/db/file_locks_test.go`
+
+---
+
+### ISSUE-SD-06: `POST /seafhttp/repo/folder-perm` Response Was `{}` Instead of `[]` — FIXED (2026-07-02)
+
+**Discovered** while live-testing ISSUE-SD-01 against `app.nihaoshares.com` (Seafile Pro 11.0.16): `folder-perm` uses the **same array-based wire format** as `locked-files`, not the `{}` object our handler had returned since 2026-02-19:
+
+```
+GET  /seafhttp/repo/folder-perm                     → 400, body "EOF"
+POST /seafhttp/repo/folder-perm  body: [{repo_id,token,ts}] → 200, body []
+```
+
+**Impact**: Low in practice — SeaDrive never logged an error against our `{}` response, so it evidently tolerates the wrong shape (or never got far enough to strictly parse it). But it wasn't protocol-correct, and since we don't implement folder-level permissions at all yet, the honest answer for every request is "no restrictions anywhere," which the real server expresses as an empty array.
+
+**Fix**: `GetFolderPerm` now returns `[]` instead of `{}` for both GET and POST. Kept as a single stub answer (empty array unconditionally) — we have no folder-permission data source to look up yet.
+
+**Files**: `internal/api/sync.go`, `internal/api/sync_locked_files_test.go`
 
 ---
 
@@ -1254,6 +1286,18 @@ JWT payload: `{"repo_id": "...", "user": "user@example.com", "exp": <unix+72h>}`
 
 **Auth**: Requires `syncAuthMiddleware` (repo sync token in `Seafile-Repo-Token` header)
 **Priority**: 🟢 Low — 404 is safe; only needed to enable real-time file change notifications via notification server
+
+---
+
+### ISSUE-SD-05: `frontend/nginx.conf` SPA Catch-All Faked a "Notification Server Enabled" Response — FIXED (2026-07-02)
+
+**Observed**: Client logs showed `Notification server is enabled on the remote server http://localhost:3000.` immediately followed by a 404 on `GET .../seafhttp/repo/:id/jwt-token`.
+
+**Root cause**: The desktop client autodetects the notification (WebSocket) server by calling `GET <server>/notification/ping` and treats **any HTTP 200** as "alive" — it never inspects the body (confirmed against `daemon/http-tx-mgr.c` `check_notif_server_thread`, upstream). Our deployment terminates the client's base URL at `frontend/nginx.conf`, whose SPA catch-all (`location / { try_files $uri $uri/ /index.html; }`) returned `200 index.html` for `/notification/ping` since no dedicated location existed for it. The client then believed notifications were enabled and started requesting `jwt-token`, which correctly 404s per ISSUE-SD-02 (we don't run a notification server) — but the client had already been misled into thinking it should expect JWTs, producing a confusing log sequence even though nothing was actually broken.
+
+**Fix**: Added a dedicated `location /notification/ { return 404; }` block in `frontend/nginx.conf`, placed before the SPA catch-all. The client now correctly detects "notifications disabled" up front from the `/ping` call itself and never requests `jwt-token`, so the log noise disappears entirely. Sync behavior is unaffected either way (notifications were never actually used) — this only cleans up the client-side log/detection path.
+
+**Files**: `frontend/nginx.conf`
 
 ---
 
@@ -1378,7 +1422,7 @@ Added `getEffectiveHostname(c *gin.Context) string` helper in `server.go` for th
 1. Previous commit replaced static `router.GET("/seafhttp/repo/folder-perm")` with `repo.GET("")` inside the wildcard group — Gin returned 405 for both GET and POST.
 2. After fixing routing, POST still returned 405 because only GET was registered.
 3. After adding POST, both returned 401 because SeaDrive sends folder-perm requests with NO auth token.
-**Fix**: Register both GET and POST as static routes (no auth middleware) before the wildcard group. Response is always `{}` so no auth is needed.
+**Fix**: Register both GET and POST as static routes (no auth middleware) before the wildcard group. Response was `{}` — no auth is needed either way. **Update (2026-07-02)**: the response shape itself was wrong; see ISSUE-SD-06 — real wire format is an empty array `[]`, not `{}`.
 **Files**: `internal/api/sync.go`
 
 ---

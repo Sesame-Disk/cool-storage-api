@@ -20,6 +20,24 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
+func withSyncFSObjectStub(t *testing.T, stub func(h *SyncHandler, repoID, fsID string) (string, string, []string, error)) {
+	t.Helper()
+	old := loadSyncFSObjectFn
+	loadSyncFSObjectFn = stub
+	t.Cleanup(func() {
+		loadSyncFSObjectFn = old
+	})
+}
+
+func withSyncFileBlockIDsStub(t *testing.T, stub func(h *SyncHandler, repoID string, fileIDs []string) (map[string][]string, error)) {
+	t.Helper()
+	old := loadSyncFileBlockIDsFn
+	loadSyncFileBlockIDsFn = stub
+	t.Cleanup(func() {
+		loadSyncFileBlockIDsFn = old
+	})
+}
+
 // setupSyncTestRouter creates a test router with auth context
 func setupSyncTestRouter() *gin.Engine {
 	r := gin.New()
@@ -2118,6 +2136,65 @@ func TestBlockIDFormats(t *testing.T) {
 				t.Errorf("isSHA256 = %v, want %v", isSHA256, tt.isSHA256)
 			}
 		})
+	}
+}
+
+func TestIsEmptySyncFSID(t *testing.T) {
+	tests := []struct {
+		name string
+		fsID string
+		want bool
+	}{
+		{name: "empty", fsID: "", want: true},
+		{name: "whitespace", fsID: "   ", want: true},
+		{name: "zero sentinel", fsID: "0000000000000000000000000000000000000000", want: true},
+		{name: "zero sentinel with whitespace", fsID: " 0000000000000000000000000000000000000000 ", want: true},
+		{name: "real fs id", fsID: "1f4d4f9086d9530417458c9b12b80dc3c97d957b", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isEmptySyncFSID(tt.fsID); got != tt.want {
+				t.Fatalf("isEmptySyncFSID(%q) = %v, want %v", tt.fsID, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCollectSyncReachableFiles_IgnoresAllZeroChildFSID(t *testing.T) {
+	h := &SyncHandler{}
+	withSyncFSObjectStub(t, func(h *SyncHandler, repoID, fsID string) (string, string, []string, error) {
+		switch fsID {
+		case "root-dir":
+			entries := `[
+				{"id":"0000000000000000000000000000000000000000","mode":33188,"name":"broken.txt"},
+				{"id":"child-file","mode":33188,"name":"real.txt"}
+			]`
+			return "dir", entries, nil, nil
+		default:
+			return "", "", nil, fmt.Errorf("unexpected fsID %s", fsID)
+		}
+	})
+	withSyncFileBlockIDsStub(t, func(h *SyncHandler, repoID string, fileIDs []string) (map[string][]string, error) {
+		if len(fileIDs) != 1 || fileIDs[0] != "child-file" {
+			return nil, fmt.Errorf("fileIDs = %v, want [child-file]", fileIDs)
+		}
+		return map[string][]string{"child-file": {"blk-1", "blk-2"}}, nil
+	})
+
+	files, err := h.collectSyncReachableFiles("repo-1", "root-dir")
+	if err != nil {
+		t.Fatalf("collectSyncReachableFiles() error = %v, want nil", err)
+	}
+	blockIDs, ok := files["child-file"]
+	if !ok {
+		t.Fatalf("files = %v, want child-file entry", files)
+	}
+	if strings.Join(blockIDs, ",") != "blk-1,blk-2" {
+		t.Fatalf("blockIDs = %v, want [blk-1 blk-2]", blockIDs)
+	}
+	if _, ok := files[emptySyncFSID40]; ok {
+		t.Fatalf("files = %v, zero sentinel child must be ignored", files)
 	}
 }
 

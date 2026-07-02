@@ -45,6 +45,19 @@ type SyncTokenCreator interface {
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
 }
 
+// SyncTokenValidator resolves a sync token string to its access metadata. The
+// production TokenStore implements this; locked-files uses it to authenticate
+// each per-repo token the desktop client sends in its request body.
+type SyncTokenValidator interface {
+	GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool)
+}
+
+// SyncAccountStatusChecker revalidates that the token's user/org are still
+// active before a body-authenticated locked-files entry is honored.
+// It is intentionally side-effect free: locked-files omits rejected entries
+// per repo instead of writing a route-level HTTP error.
+type SyncAccountStatusChecker func(userID, orgID string) error
+
 // SyncHandler handles Seafile sync protocol operations
 // These endpoints are used by the Seafile Desktop client for file synchronization
 type SyncHandler struct {
@@ -53,7 +66,9 @@ type SyncHandler struct {
 	blockStore     *storage.BlockStore // Legacy single block store
 	storageManager *storage.Manager    // Multi-backend storage manager
 	config         *config.Config
-	tokenCreator   SyncTokenCreator // Token creator for download-info
+	tokenCreator   SyncTokenCreator   // Token creator for download-info
+	tokenValidator SyncTokenValidator // Validates per-repo tokens in locked-files bodies
+	accountStatus  SyncAccountStatusChecker
 	permMiddleware *middleware.PermissionMiddleware
 
 	// repairSyncHeadDerivedStateIfDriftedFn is an optional test seam used by
@@ -173,9 +188,23 @@ func (h *SyncHandler) checkSyncPermission(c *gin.Context, repoID string, require
 	return true
 }
 
-// SetTokenCreator sets the token creator for download-info endpoint
+// SetTokenCreator sets the token creator for download-info endpoint. When the
+// creator also implements SyncTokenValidator (the production TokenStore does),
+// it doubles as the validator for per-repo tokens sent in locked-files request
+// bodies — one wiring point keeps issuance and validation on the same store.
 func (h *SyncHandler) SetTokenCreator(tc SyncTokenCreator) {
 	h.tokenCreator = tc
+	if v, ok := tc.(SyncTokenValidator); ok {
+		h.tokenValidator = v
+	}
+}
+
+// SetAccountStatusChecker injects the same repo-token account/org usability
+// check the route-level sync auth middleware applies on :repo_id endpoints.
+// The checker must be pure: locked-files treats rejection like any other
+// per-entry validation failure and silently omits that repo from the result.
+func (h *SyncHandler) SetAccountStatusChecker(checker SyncAccountStatusChecker) {
+	h.accountStatus = checker
 }
 
 func (h *SyncHandler) lookupLibraryStorageClass(orgID, repoID string) string {
@@ -293,10 +322,18 @@ func (h *SyncHandler) RegisterSyncRoutes(router *gin.Engine, authMiddleware gin.
 
 	// Folder permissions — no auth required. SeaDrive sends GET and POST to
 	// /seafhttp/repo/folder-perm?repo_id=XXX without any auth token. The response
-	// is always {} (no folder-level restrictions), so no auth is needed.
+	// is always [] (no folder-level restrictions), so no auth is needed.
 	// Registered before the wildcard group so Gin matches exactly.
 	router.GET("/seafhttp/repo/folder-perm", h.GetFolderPerm)
 	router.POST("/seafhttp/repo/folder-perm", h.GetFolderPerm)
+
+	// Locked-files polling — no route-level auth middleware because this is a
+	// multi-repo endpoint with no :repo_id in the path. It is still
+	// authenticated per body entry via the repo token in that JSON payload.
+	// Verified live against a genuine Seafile Pro 11.0.16 instance (2026-07-02):
+	// only POST is accepted (GET 400s with an empty-body decode error there too).
+	router.POST("/seafhttp/repo/locked-files", h.GetLockedFiles)
+	router.POST("/seafhttp/repo/locked-files/", h.GetLockedFiles)
 
 	// Sync protocol routes under /seafhttp/repo/
 	repo := router.Group("/seafhttp/repo/:repo_id")
@@ -350,11 +387,197 @@ func (h *SyncHandler) GetProtocolVersion(c *gin.Context) {
 }
 
 // GetFolderPerm returns folder-level permission rules for a repository.
-// GET /seafhttp/repo/folder-perm?repo_id=XXX
+// GET/POST /seafhttp/repo/folder-perm
 // SeaDrive calls this during sync to check if any sub-folders have restricted
-// permissions. An empty object means no folder-level restrictions (full access).
+// permissions. Wire format confirmed live against a genuine Seafile Pro 11.0.16
+// instance (2026-07-02): POST body is a JSON array of {repo_id, token, ts} and
+// the response is a JSON array, not an object — a repo with no folder-level
+// restrictions is simply absent from the response (empty array overall). We
+// have no folder-permission feature implemented yet, so every request gets
+// that same "no restrictions anywhere" answer.
 func (h *SyncHandler) GetFolderPerm(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{})
+	c.JSON(http.StatusOK, []struct{}{})
+}
+
+// lockedFilesRequestEntry is one element of the JSON array the desktop/SeaDrive
+// client POSTs to /seafhttp/repo/locked-files. Token is the per-repo sync token
+// the client obtained from download-info; each entry is authenticated with it
+// before any lock data is returned. Ts is the client's last-seen lock timestamp
+// (accepted but unused — we always return current state; the client re-applies
+// idempotently).
+type lockedFilesRequestEntry struct {
+	RepoID string `json:"repo_id"`
+	Token  string `json:"token"`
+	Ts     int64  `json:"ts"`
+}
+
+// maxLockedFilesRepos bounds how many per-repo entries a single locked-files
+// request may carry. The desktop client sends one entry per synced library, so
+// real requests stay far below this; the cap only exists so an abusive caller
+// cannot turn one unauthenticated-route POST into thousands of token lookups.
+const maxLockedFilesRepos = 500
+
+// maxLockedFilesBodyBytes bounds the request body before JSON decoding starts.
+// 500 entries of {repo_id, token, ts} fit comfortably under 256 KiB; without
+// this, a caller could stream an arbitrarily large body into ShouldBindJSON
+// on a route that carries no middleware limits.
+const maxLockedFilesBodyBytes = 256 * 1024
+
+const emptySyncFSID40 = "0000000000000000000000000000000000000000"
+
+// lockedFileEntry is one locked path within a repo's response entry.
+type lockedFileEntry struct {
+	Path string `json:"path"`
+	ByMe bool   `json:"by_me"`
+}
+
+// lockedFilesResponseEntry is the per-repo answer.
+type lockedFilesResponseEntry struct {
+	RepoID      string            `json:"repo_id"`
+	Ts          int64             `json:"ts"`
+	LockedFiles []lockedFileEntry `json:"locked_files"`
+}
+
+type lockedFilesSeenKey struct {
+	repoID string
+	userID string
+	orgID  string
+}
+
+// listRepoLocksFn is a test seam for db.ListRepoLocks, so unit tests can exercise
+// GetLockedFiles without a real Cassandra session.
+var listRepoLocksFn = func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
+	return db.ListRepoLocks(h.db.Session(), repoID)
+}
+
+var loadSyncFSObjectFn = func(h *SyncHandler, repoID, fsID string) (string, string, []string, error) {
+	var objType string
+	var dirEntries string
+	var blockIDs []string
+	err := h.db.Session().Query(`
+		SELECT obj_type, dir_entries, block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, fsID).Scan(&objType, &dirEntries, &blockIDs)
+	if err != nil {
+		return "", "", nil, err
+	}
+	return objType, dirEntries, blockIDs, nil
+}
+
+var loadSyncFileBlockIDsFn = func(h *SyncHandler, repoID string, fileIDs []string) (map[string][]string, error) {
+	return h.loadSyncFileBlockIDs(repoID, fileIDs)
+}
+
+// GetLockedFiles returns the currently locked paths for each requested repo.
+// POST /seafhttp/repo/locked-files
+// Registered without the route-level auth middleware because it is multi-repo
+// (no :repo_id in the path) — but it is NOT unauthenticated: every body entry
+// carries the per-repo sync token the client got from download-info, and lock
+// data is only returned for entries whose token resolves to that same repo.
+// Entries that fail validation are silently omitted, indistinguishable from
+// "no locks", so the endpoint never confirms whether a guessed repo_id exists.
+// Wire format confirmed live against a genuine Seafile Pro 11.0.16 instance
+// (2026-07-02): a repo with no (visible) locks is omitted from the response
+// array entirely, rather than included with an empty locked_files list.
+// "by_me" compares the lock holder against the user the entry's token was
+// issued to.
+func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxLockedFilesBodyBytes)
+
+	var reqs []lockedFilesRequestEntry
+	if err := c.ShouldBindJSON(&reqs); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON array"})
+		return
+	}
+	if len(reqs) > maxLockedFilesRepos {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "too many repos in request"})
+		return
+	}
+
+	// Fail closed: without a validator there is no way to authenticate the
+	// per-repo tokens, so no lock data may be returned at all.
+	if h.tokenValidator == nil {
+		c.JSON(http.StatusOK, []lockedFilesResponseEntry{})
+		return
+	}
+
+	now := time.Now().Unix()
+	seenRepoUsers := make(map[lockedFilesSeenKey]struct{}, len(reqs))
+	respondedRepos := make(map[string]struct{}, len(reqs))
+	result := make([]lockedFilesResponseEntry, 0, len(reqs))
+	for _, req := range reqs {
+		if req.RepoID == "" || req.Token == "" {
+			continue
+		}
+
+		// Only a repo-level sync token (issued by download-info: root path,
+		// non-link source) may enumerate a repo's locks. TokenTypeDownload is
+		// shared with path-scoped file-download tokens and share-link tokens
+		// (Source=="link"), and neither of those narrower grants should widen
+		// into repo-wide lock visibility.
+		accessToken, valid := h.tokenValidator.GetToken(req.Token, TokenTypeDownload)
+		if !valid || accessToken == nil ||
+			!strings.EqualFold(accessToken.RepoID, req.RepoID) ||
+			accessToken.Path != "/" || strings.EqualFold(accessToken.Source, "link") {
+			continue
+		}
+		// Dedupe repeated work for the same authenticated repo/user/org tuple
+		// so identical duplicates do not repeat account checks or lock lookups.
+		// Repo-level response dedupe stays separate: a later entry for the same
+		// repo but a different authenticated user must still get a chance after
+		// this one, because one token could fail account-status while the next
+		// remains valid.
+		seenKey := lockedFilesSeenKey{
+			repoID: req.RepoID,
+			userID: accessToken.UserID,
+			orgID:  accessToken.OrgID,
+		}
+		if _, dup := seenRepoUsers[seenKey]; dup {
+			continue
+		}
+		seenRepoUsers[seenKey] = struct{}{}
+
+		if h.accountStatus != nil {
+			if err := h.accountStatus(accessToken.UserID, accessToken.OrgID); err != nil {
+				continue
+			}
+		}
+		if _, dup := respondedRepos[req.RepoID]; dup {
+			continue
+		}
+
+		locks, err := listRepoLocksFn(h, req.RepoID)
+		if err != nil {
+			// Auth/account validation failures are per-entry and omitted.
+			// Lock backend failures are global fail-closed: omitting an
+			// authorized repo here would falsely report "no locks".
+			status := http.StatusInternalServerError
+			message := "failed to list locked files"
+			if errors.Is(err, db.ErrFileLockStatusUnavailable) {
+				status = http.StatusServiceUnavailable
+				message = "file lock status unavailable"
+			}
+			c.JSON(status, gin.H{"error": message})
+			return
+		}
+		respondedRepos[req.RepoID] = struct{}{}
+		if len(locks) == 0 {
+			continue
+		}
+		entry := lockedFilesResponseEntry{
+			RepoID:      req.RepoID,
+			Ts:          now,
+			LockedFiles: make([]lockedFileEntry, 0, len(locks)),
+		}
+		for _, lock := range locks {
+			entry.LockedFiles = append(entry.LockedFiles, lockedFileEntry{
+				Path: lock.Path,
+				ByMe: strings.EqualFold(lock.LockedBy, accessToken.UserID),
+			})
+		}
+		result = append(result, entry)
+	}
+
+	c.JSON(http.StatusOK, result)
 }
 
 // Commit represents a Seafile commit object
@@ -2536,6 +2759,11 @@ func shortSyncCommitID(commitID string) string {
 	return commitID[:8]
 }
 
+func isEmptySyncFSID(fsID string) bool {
+	fsID = strings.TrimSpace(fsID)
+	return fsID == "" || fsID == emptySyncFSID40
+}
+
 type syncCommitFileReference struct {
 	fsID     string
 	blockIDs []string
@@ -2625,28 +2853,23 @@ func (h *SyncHandler) loadSyncFileBlockIDs(repoID string, fileIDs []string) (map
 
 func (h *SyncHandler) collectSyncReachableFiles(repoID, rootFSID string) (map[string][]string, error) {
 	files := make(map[string][]string)
-	rootFSID = strings.TrimSpace(rootFSID)
-	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
+	if isEmptySyncFSID(rootFSID) {
 		return files, nil
 	}
 	visited := make(map[string]struct{})
 	var walk func(string) error
 	walk = func(fsID string) error {
-		fsID = strings.TrimSpace(fsID)
-		if fsID == "" {
+		if isEmptySyncFSID(fsID) {
 			return nil
 		}
+		fsID = strings.TrimSpace(fsID)
 		if _, seen := visited[fsID]; seen {
 			return nil
 		}
 		visited[fsID] = struct{}{}
 
-		var objType string
-		var dirEntries string
-		var blockIDs []string
-		if err := h.db.Session().Query(`
-			SELECT obj_type, dir_entries, block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?
-		`, repoID, fsID).Scan(&objType, &dirEntries, &blockIDs); err != nil {
+		objType, dirEntries, blockIDs, err := loadSyncFSObjectFn(h, repoID, fsID)
+		if err != nil {
 			return fmt.Errorf("load fs_object %s: %w", fsID, err)
 		}
 
@@ -2669,7 +2892,7 @@ func (h *SyncHandler) collectSyncReachableFiles(repoID, rootFSID string) (map[st
 			dirIDs := make([]string, 0, len(entries))
 			fallbackIDs := make([]string, 0)
 			for _, entry := range entries {
-				if entry.ID == "" {
+				if isEmptySyncFSID(entry.ID) {
 					continue
 				}
 				switch entry.Mode {
@@ -2681,7 +2904,7 @@ func (h *SyncHandler) collectSyncReachableFiles(repoID, rootFSID string) (map[st
 					fallbackIDs = append(fallbackIDs, entry.ID)
 				}
 			}
-			fileBlockIDs, err := h.loadSyncFileBlockIDs(repoID, fileIDs)
+			fileBlockIDs, err := loadSyncFileBlockIDsFn(h, repoID, fileIDs)
 			if err != nil {
 				return err
 			}

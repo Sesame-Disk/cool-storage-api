@@ -79,6 +79,42 @@ type fileLockRow struct {
 	lockedAt time.Time
 }
 
+// RepoLockedFile is one active lock, as returned by the desktop/SeaDrive client's
+// locked-files polling endpoint.
+type RepoLockedFile struct {
+	Path     string
+	LockedBy string // canonical UUID string of the lock holder
+}
+
+// ListRepoLocks returns every active lock in repoID. Unlike ReadFileLock this is
+// not scoped to a single path: locked_files is partitioned by repo_id, so a full
+// per-repo scan is cheap and this is what the desktop client's locked-files
+// endpoint needs (it wants the whole repo's lock state in one call). An
+// unparseable repoID is reported as "no locks" rather than an error, matching
+// how the sync protocol's other unauthenticated per-repo endpoints degrade.
+func ListRepoLocks(session *gocql.Session, repoID string) ([]RepoLockedFile, error) {
+	if session == nil {
+		return nil, ErrFileLockStatusUnavailable
+	}
+	repoUUID, err := gocql.ParseUUID(repoID)
+	if err != nil {
+		return nil, nil
+	}
+	iter := session.Query(
+		`SELECT path, locked_by FROM locked_files WHERE repo_id = ?`, repoUUID,
+	).Iter()
+	var locks []RepoLockedFile
+	var path string
+	var lockedBy gocql.UUID
+	for iter.Scan(&path, &lockedBy) {
+		locks = append(locks, RepoLockedFile{Path: path, LockedBy: lockedBy.String()})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrFileLockStatusUnavailable, err)
+	}
+	return locks, nil
+}
+
 var listLocksUnderFn = listLocksUnder
 
 var relocateLockRowCASFn = func(session *gocql.Session, repoUUID gocql.UUID, oldPath, newPath string, lockedBy gocql.UUID, lockedAt time.Time, userUUID gocql.UUID) (bool, error) {

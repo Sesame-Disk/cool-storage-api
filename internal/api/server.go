@@ -809,17 +809,18 @@ func (s *Server) resolveUserAuth(c *gin.Context) (userID, orgID, role string) {
 
 // enforceAccountStatus checks that the user and their org are active.
 // Used ONLY for repo API token auth (sessions are killed at source on deactivate/delete).
-// Returns an error (and aborts the gin context) if access is denied.
-func (s *Server) enforceAccountStatus(c *gin.Context, userID, orgID string) error {
+func (s *Server) checkAccountStatus(userID, orgID string) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+
 	// Check user status
 	var userStatus string
 	if err := s.db.Session().Query(
 		`SELECT status FROM users WHERE org_id = ? AND user_id = ?`, orgID, userID,
 	).Scan(&userStatus); err == nil {
 		if !v2.IsUserUsable(userStatus) {
-			c.JSON(http.StatusForbidden, gin.H{"error": "account " + userStatus})
-			c.Abort()
-			return fmt.Errorf("user %s", userStatus)
+			return fmt.Errorf("account %s", userStatus)
 		}
 	}
 
@@ -829,12 +830,22 @@ func (s *Server) enforceAccountStatus(c *gin.Context, userID, orgID string) erro
 		`SELECT status FROM organizations WHERE org_id = ?`, orgID,
 	).Scan(&orgStatus); err == nil {
 		if !v2.IsOrgUsable(orgStatus) {
-			c.JSON(http.StatusForbidden, gin.H{"error": "organization " + orgStatus})
-			c.Abort()
-			return fmt.Errorf("org %s", orgStatus)
+			return fmt.Errorf("organization %s", orgStatus)
 		}
 	}
 
+	return nil
+}
+
+// enforceAccountStatus checks that the user and their org are active.
+// Used ONLY for repo API token auth (sessions are killed at source on deactivate/delete).
+// Returns an error (and aborts the gin context) if access is denied.
+func (s *Server) enforceAccountStatus(c *gin.Context, userID, orgID string) error {
+	if err := s.checkAccountStatus(userID, orgID); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+		c.Abort()
+		return err
+	}
 	return nil
 }
 

@@ -8,6 +8,55 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-07-02 - Fix nginx false-positive notification-server detection; clear up locked-files/jwt-token 404s
+
+### Fixed
+
+Client logs (`applet.log`/`seafile.log`) showed `Notification server is enabled on the remote server http://localhost:3000.` immediately followed by a 404 on `GET .../seafhttp/repo/:id/jwt-token`. Traced the client-side detection to `daemon/http-tx-mgr.c` (`check_notif_server_thread`): the desktop client calls `GET <server>/notification/ping` and treats **any HTTP 200** as "notification server alive" — it never inspects the response body. Our `frontend/nginx.conf` SPA catch-all (`location / { try_files $uri $uri/ /index.html; }`) had no dedicated route for `/notification/`, so it fell through and returned `200 index.html`, faking a live notification server. The client then requested `jwt-token`, which correctly 404s (we don't run one), but only after being misled into expecting a JWT.
+
+Added `location /notification/ { return 404; }` in `frontend/nginx.conf`, before the SPA catch-all, so the client's own `/ping` probe reports "disabled" up front and it never requests `jwt-token`. Sync itself was never affected — this only removes confusing log noise on the client.
+
+### `locked-files` and `folder-perm` — implemented for real, after a false start
+
+First pass re-examined `GET /seafhttp/repo/locked-files` (ISSUE-SD-01) by cloning the public `haiwen/seafile-server` (`master`, Community Edition) and finding no such route in the Go fileserver's route table — concluded it was upstream parity (a stock server 404s it too) and decided not to implement it. **That conclusion was wrong**, caught the same day: live-tested against `app.nihaoshares.com`, a genuine company-operated **Seafile Pro 11.0.16** instance (`/api2/server-info/` confirms `"features": ["seafile-basic", "seafile-pro", "file-search"]`):
+
+```
+GET  /seafhttp/repo/locked-files                              → 400, body "EOF"  (empty-body JSON decode error, not a route 404)
+POST /seafhttp/repo/locked-files  body: []                     → 200, body []
+POST /seafhttp/repo/locked-files  body: [{repo_id,token,ts}]   → 200, body []  (even for a nonexistent repo)
+GET  /seafhttp/repo/folder-perm                                → 400, body "EOF"
+POST /seafhttp/repo/folder-perm   body: [{repo_id,token,ts}]   → 200, body []
+```
+
+The `"EOF"` body is Go's `json.Decoder` error string for an empty body — proof the handler is real. Both endpoints are Pro/Enterprise-only features (closed-source, hence absent from the public CE repo), and since our own `server-info` already advertises `"seafile-pro"`, we were already implicitly promising clients this tier.
+
+**Implemented**:
+- `POST /seafhttp/repo/locked-files` (`internal/api/sync.go` `GetLockedFiles`) — real data from the existing `locked_files` table via new `db.ListRepoLocks` (`internal/db/file_locks.go`). Repos with no locks are omitted from the response array, matching the real server's observed behavior.
+- Fixed `GetFolderPerm`'s response shape: was `{}` (an object) since 2026-02-19, real protocol expects `[]` (an array). Never caused a visible client error, but wasn't protocol-correct.
+
+**Security hardening (same session, post-review)**: the first cut of `GetLockedFiles` ignored the per-repo `token` in the request body and returned real lock paths for any posted `repo_id` — information disclosure, since repo UUIDs appear in URLs/logs/share flows and aren't secrets. Reworked before merge:
+- Each body entry's `token` must resolve in the token store (`TokenTypeDownload` — the per-repo sync token from download-info) **and** match that entry's `repo_id`; failing entries are silently omitted (indistinguishable from "no locks", no repo-existence oracle).
+- `by_me` is now real: lock holder compared against the token's user (was hardcoded `false`, which could make SeaDrive show a user's own locks as foreign).
+- Added 500-entry cap + per-request `repo_id` dedupe (an unauthenticated-route POST can no longer fan out unbounded Cassandra queries), switched `BindJSON` → `ShouldBindJSON`, and fail-closed `[]` when no token validator is wired.
+- Wiring: `SetTokenCreator` now also captures the store as `SyncTokenValidator` when it implements it (production `TokenStore` does) — one wiring point, no new setter.
+- nginx: added exact `location = /notification` alongside the `^~ /notification/` prefix so the slashless path can't fall to the SPA catch-all either.
+
+**Second hardening round (same session)**: `TokenTypeDownload` is shared by repo-level sync tokens (download-info: `Path=="/"`, non-link), path-scoped file-download tokens, and share-link tokens (`Source=="link"`). The handler now additionally requires `Path == "/" && Source != "link"`, so a share-link recipient or single-file download token cannot enumerate a repo's locks. Plus: `http.MaxBytesReader` (256 KiB) before JSON decode on this middleware-less route, dedupe moved after token validation (a stale-token duplicate can't shadow a later valid entry for the same repo), and a nil-guard on the validator result.
+
+**Third hardening round (same session)**: the first authenticated implementation still had two subtle gaps that review caught:
+- If the `locked_files` lookup failed, the handler omitted that repo exactly like "no locks". That was a fail-open downgrade against the lock subsystem's own contract. It now returns `503 file lock status unavailable` and stops the whole response instead of pretending the repo is unlocked.
+- `locked-files` sits outside the normal sync auth middleware because it is multi-repo and body-authenticated. It now reuses the same account/org usability check as repo-token middleware before honoring a body token, so a deactivated user with an old token cannot keep enumerating lock metadata.
+
+### Files
+- `frontend/nginx.conf` — added `/notification/` 404 location
+- `internal/api/sync.go` — `GetLockedFiles` handler + route, `GetFolderPerm` response shape fix
+- `internal/db/file_locks.go` — `ListRepoLocks`
+- `internal/api/sync_locked_files_test.go`, `internal/db/file_locks_test.go` — new tests
+- `docs/KNOWN_ISSUES.md` — corrected ISSUE-SD-01 (now FIXED), added ISSUE-SD-05 (nginx, fixed) and ISSUE-SD-06 (folder-perm format, fixed)
+- `docs/IMPLEMENTATION_STATUS.md` — updated folder-perm row, added locked-files row, corrected locked-files auth/`by_me` notes
+
+---
+
 ## 2026-06-19 - Adaptive uploads: keep the queue flowing during server-side finalize
 
 ### Fixed
