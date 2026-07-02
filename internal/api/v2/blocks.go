@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -482,6 +483,12 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 	if len(req.Hashes) > 10000 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "too many hashes, maximum is 10000"})
 		return
+	}
+	for i, hash := range req.Hashes {
+		if !isHex64(hash) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("hashes[%d]: invalid sha256", i)})
+			return
+		}
 	}
 
 	session, resolution := h.resolveUploadSession(c)

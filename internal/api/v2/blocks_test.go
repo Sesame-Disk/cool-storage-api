@@ -92,6 +92,31 @@ func TestCheckBlocks_TooManyHashes(t *testing.T) {
 	}
 }
 
+func TestCheckBlocks_InvalidSHA256(t *testing.T) {
+	r := gin.New()
+	r.Use(gin.Recovery())
+
+	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
+	r.POST("/api/v2/blocks/check", h.CheckBlocks)
+
+	body := CheckBlocksRequest{Hashes: []string{strings.Repeat("g", 64)}}
+	jsonBody, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", "/api/v2/blocks/check", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "hashes[0]: invalid sha256" {
+		t.Errorf("error = %v, want 'hashes[0]: invalid sha256'", resp["error"])
+	}
+}
+
 func TestCheckBlocks_NilBlockStore(t *testing.T) {
 	r := gin.New()
 	r.Use(gin.Recovery())

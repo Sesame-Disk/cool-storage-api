@@ -351,7 +351,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "block_upload_verify_duration_seconds",
 			Help:    "Duration of the web block-upload commit's per-block verification pass.",
-			Buckets: prometheus.DefBuckets,
+			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120},
 		},
 		[]string{"result"}, // "ready" or "needs_upload"
 	)
@@ -364,6 +364,17 @@ var (
 			Help: "Total number of blocks classified during web block-upload commit verification, by outcome.",
 		},
 		[]string{"status"}, // "ready", "needs_upload", or "size_mismatch"
+	)
+
+	// BlockUploadVerifyErrorsTotal counts infrastructure failures during the web
+	// block-upload commit's verification pass, before a logical verification
+	// result could be emitted.
+	BlockUploadVerifyErrorsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "block_upload_verify_errors_total",
+			Help: "Total number of infrastructure errors during web block-upload commit verification.",
+		},
+		[]string{"stage"}, // "presence" or "classify"
 	)
 
 	// BlockUploadSessionClaimTotal counts commit-claim outcomes for concurrent
@@ -447,6 +458,7 @@ func Register() {
 		UploadFinalizeDuration,
 		BlockUploadVerifyDuration,
 		BlockUploadVerifyBlocksTotal,
+		BlockUploadVerifyErrorsTotal,
 		BlockUploadSessionClaimTotal,
 		BlockUploadSessionWaitDuration,
 		BlockUploadStagedBlocksTotal,

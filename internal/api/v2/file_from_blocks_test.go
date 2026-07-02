@@ -2,6 +2,7 @@ package v2
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -290,5 +291,82 @@ func TestObserveBlockVerification_ForcedNeedsUploadOverridesReadyMetric(t *testi
 	}
 	if got := histogramSampleCount(t, metrics.BlockUploadVerifyDuration.WithLabelValues("needs_upload")); got != beforeNeedsUploadSamples+1 {
 		t.Errorf("needs_upload duration sample count = %d, want %d", got, beforeNeedsUploadSamples+1)
+	}
+}
+
+func TestSummarizeBlockVerification_ObservesSizeMismatchBefore422Path(t *testing.T) {
+	beforeMismatch := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("size_mismatch"))
+	beforeNeeds := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("needs_upload"))
+	beforeSamples := histogramSampleCount(t, metrics.BlockUploadVerifyDuration.WithLabelValues("needs_upload"))
+
+	blocks := []fileFromBlocksBlock{
+		{SHA256: hex64(7), Size: 10},
+		{SHA256: hex64(8), Size: 11},
+	}
+	statuses := map[string]int{
+		hex64(7): blockStatusSizeMismatch,
+		hex64(8): blockStatusNeedsUpload,
+	}
+
+	blockIDs, needsUpload, sizeMismatchHash := summarizeBlockVerification(time.Now(), blocks, []string{hex64(7), hex64(8)}, statuses, map[string]string{})
+
+	if len(blockIDs) != 2 || blockIDs[0] != hex64(7) || blockIDs[1] != hex64(8) {
+		t.Fatalf("blockIDs = %v, want ordered SHA-256 list", blockIDs)
+	}
+	if len(needsUpload) != 1 || needsUpload[0] != hex64(8) {
+		t.Fatalf("needsUpload = %v, want [%s]", needsUpload, hex64(8))
+	}
+	if sizeMismatchHash != hex64(7) {
+		t.Fatalf("sizeMismatchHash = %q, want %q", sizeMismatchHash, hex64(7))
+	}
+	if got := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("size_mismatch")); got != beforeMismatch+1 {
+		t.Fatalf("size_mismatch count = %v, want %v", got, beforeMismatch+1)
+	}
+	if got := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("needs_upload")); got != beforeNeeds+1 {
+		t.Fatalf("needs_upload count = %v, want %v", got, beforeNeeds+1)
+	}
+	if got := histogramSampleCount(t, metrics.BlockUploadVerifyDuration.WithLabelValues("needs_upload")); got != beforeSamples+1 {
+		t.Fatalf("needs_upload duration sample count = %d, want %d", got, beforeSamples+1)
+	}
+}
+
+func TestBlockUploadVerifyDurationBucketsExtendForLargeFiles(t *testing.T) {
+	h, ok := metrics.BlockUploadVerifyDuration.WithLabelValues("ready").(prometheus.Histogram)
+	if !ok {
+		t.Fatalf("observer is not a prometheus.Histogram: %T", metrics.BlockUploadVerifyDuration.WithLabelValues("ready"))
+	}
+
+	var m dto.Metric
+	if err := h.Write(&m); err != nil {
+		t.Fatalf("write histogram metric: %v", err)
+	}
+
+	var got []float64
+	for _, b := range m.GetHistogram().GetBucket() {
+		got = append(got, b.GetUpperBound())
+	}
+	want := []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120}
+	if len(got) != len(want) {
+		t.Fatalf("bucket count = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if math.Abs(got[i]-want[i]) > 1e-9 {
+			t.Fatalf("bucket[%d] = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestBlockUploadVerifyErrorsTotal(t *testing.T) {
+	beforePresence := testutil.ToFloat64(metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("presence"))
+	beforeClassify := testutil.ToFloat64(metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("classify"))
+
+	metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("presence").Inc()
+	metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("classify").Inc()
+
+	if got := testutil.ToFloat64(metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("presence")); got != beforePresence+1 {
+		t.Fatalf("presence errors = %v, want %v", got, beforePresence+1)
+	}
+	if got := testutil.ToFloat64(metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("classify")); got != beforeClassify+1 {
+		t.Fatalf("classify errors = %v, want %v", got, beforeClassify+1)
 	}
 }

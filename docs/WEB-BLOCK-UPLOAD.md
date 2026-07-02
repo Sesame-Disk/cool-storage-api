@@ -974,18 +974,25 @@ flag were on*.
    distinct permanent code for the "different file" case, so the old ambiguous
    `"different file or commit is still in progress"` branch is gone (covered by
    Go + Jest tests). The `needs_upload` re-upload path is unchanged.
-8. **[RESOLVED, PR `feat/block-upload-observability-and-session-hardening`]
+8. **[RESOLVED, PR `feat/block-upload-observability-and-session-hardening` +
+   follow-up 2026-07-02]
    Commit verification/session/staging observability.** `finalizeStoredUploadMetadata`
    already had metrics; the block-verification phase, the session claim/wait
    path, and staging did not. New series in `internal/metrics/metrics.go`:
    `block_upload_verify_duration_seconds` / `block_upload_verify_blocks_total`
    (the commit's `verifyManifestBlocks` pass, labeled ready vs needs_upload, and
-   per-block-status counts), `block_upload_session_claim_total` (R7's LWT claim
+   with buckets extended out to 120s so large-file verification does not collapse
+   into `+Inf`),
+   `block_upload_verify_errors_total` (infrastructure failures during block
+   presence/classification before a logical verification result exists), and
+   the verification metrics now also cover the real `size_mismatch` handler path
+   instead of only the helper-level unit case. `block_upload_session_claim_total` (R7's LWT claim
    outcome: won / lost_result_ready / lost_timeout / lost_conflict),
    `block_upload_session_wait_duration_seconds` (how long a loser waited for the
    winner, bounded ~10s), and `block_upload_staged_blocks_total` (blocks
    materialized at `/blocks/upload`, labeled new vs dedup). Covered by
-   `TestObserveBlockVerification_*` in `internal/api/v2/file_from_blocks_test.go`.
+   `TestObserveBlockVerification_*`, `TestSummarizeBlockVerification_*`, and the
+   block-upload metric tests in `internal/api/v2/file_from_blocks_test.go`.
 9. **[RESOLVED, PR `feat/block-upload-observability-and-session-hardening`]
    `session` moved out of the query string.** `/blocks/check` and
    `/blocks/upload` now require the `X-Block-Upload-Session` header for
@@ -1084,7 +1091,15 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
     SHA-1 IDs go into the fs_object"); now reflects that `block_ids` is SHA-256
     canonical (post PR1–PR5) and the SHA-1 list lives in
     `seafile_block_ids_sha1`.
-17. **[Perf/DoS — pending] `UploadBlock` buffers the whole block in memory**
+17. **[RESOLVED, follow-up 2026-07-02] `/blocks/check` now validates every
+    requested hash as 64-hex SHA-256 before touching DB/S3.** The commit
+    manifest (`file-from-blocks`) already enforced 64-hex in R6, but `/blocks/check`
+    still accepted malformed hash strings and could send them into
+    `ProbeBlockReuse` / `CheckBlocksParallel`. The handler now rejects the
+    request with `400 hashes[i]: invalid sha256` before any metadata/object-store
+    work, aligning the cheap preflight check with the commit's manifest hygiene.
+    Covered by `TestCheckBlocks_InvalidSHA256` in `internal/api/v2/blocks_test.go`.
+18. **[Perf/DoS — pending] `UploadBlock` buffers the whole block in memory**
     (`io.ReadAll` up to `Chunking.Adaptive.AbsoluteMax`) with no per-user cap on
     concurrent `/blocks/upload` requests. At 8–16 MB per in-flight request this
     is fine at normal load, but nothing bounds how many concurrent uploads one

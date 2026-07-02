@@ -319,6 +319,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	}
 	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, blockVerifyConcurrency)
 	if err != nil {
+		metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("presence").Inc()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify block presence"})
 		return
 	}
@@ -332,46 +333,17 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	verifyStart := time.Now()
 	statuses, sha1ByHash256, err := h.verifyManifestBlocks(c.Request.Context(), orgID, referrer, uniqueHashes, sizeByHash, existsMap)
 	if err != nil {
+		metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("classify").Inc()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify blocks"})
 		return
 	}
 
-	// blockIDs is the ordered SHA-256 list (verification, refs, GC, quota).
-	blockIDs := make([]string, len(req.Blocks))
-	var needsUpload []string
-	needsSeen := make(map[string]struct{})
-	addNeedsUpload := func(sha256ID string) {
-		if _, ok := needsSeen[sha256ID]; !ok {
-			needsSeen[sha256ID] = struct{}{}
-			needsUpload = append(needsUpload, sha256ID)
-		}
-	}
-	for i, b := range req.Blocks {
-		blockIDs[i] = b.SHA256
-		switch statuses[b.SHA256] {
-		case blockStatusSizeMismatch:
-			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "block size mismatch", "sha256": b.SHA256})
-			return
-		case blockStatusNeedsUpload:
-			addNeedsUpload(b.SHA256)
-		}
-	}
+	blockIDs, needsUpload, sizeMismatchHash := summarizeBlockVerification(verifyStart, req.Blocks, uniqueHashes, statuses, sha1ByHash256)
 
-	// Fail-closed validation of the SERVER-derived SHA-1 (blocks.sha1). For a block
-	// to be committed, the server must hold a well-formed 40-hex SHA-1 for it; that
-	// SHA-1 was written from the block's real bytes at UploadBlock time. A ready
-	// block whose blocks.sha1 is missing or malformed is treated as needs_upload —
-	// the re-upload recomputes and rewrites a verified SHA-1 — so a half-written or
-	// pre-PR2 block can never put an unvalidated id into an fs_object.
-	for _, sha256ID := range uniqueHashes {
-		if statuses[sha256ID] != blockStatusReady {
-			continue
-		}
-		if !isHex40(sha1ByHash256[sha256ID]) {
-			addNeedsUpload(sha256ID)
-		}
+	if sizeMismatchHash != "" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "block size mismatch", "sha256": sizeMismatchHash})
+		return
 	}
-	observeBlockVerification(verifyStart, uniqueHashes, statuses, needsSeen)
 
 	if len(needsUpload) > 0 {
 		c.JSON(http.StatusConflict, gin.H{
@@ -582,6 +554,52 @@ func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer 
 		return nil, nil, err
 	}
 	return result, sha1ByHash, nil
+}
+
+// summarizeBlockVerification translates the raw per-distinct-block verification
+// statuses into the ordered handler outcome, including fail-closed SHA-1
+// downgrades. It ALWAYS emits verification metrics before returning so
+// size-mismatch exits still show up in observability.
+func summarizeBlockVerification(start time.Time, blocks []fileFromBlocksBlock, uniqueHashes []string, statuses map[string]int, sha1ByHash256 map[string]string) ([]string, []string, string) {
+	// blockIDs is the ordered SHA-256 list (verification, refs, GC, quota).
+	blockIDs := make([]string, len(blocks))
+	var needsUpload []string
+	var sizeMismatchHash string
+	needsSeen := make(map[string]struct{})
+	addNeedsUpload := func(sha256ID string) {
+		if _, ok := needsSeen[sha256ID]; !ok {
+			needsSeen[sha256ID] = struct{}{}
+			needsUpload = append(needsUpload, sha256ID)
+		}
+	}
+	for i, b := range blocks {
+		blockIDs[i] = b.SHA256
+		switch statuses[b.SHA256] {
+		case blockStatusSizeMismatch:
+			if sizeMismatchHash == "" {
+				sizeMismatchHash = b.SHA256
+			}
+		case blockStatusNeedsUpload:
+			addNeedsUpload(b.SHA256)
+		}
+	}
+
+	// Fail-closed validation of the SERVER-derived SHA-1 (blocks.sha1). For a block
+	// to be committed, the server must hold a well-formed 40-hex SHA-1 for it; that
+	// SHA-1 was written from the block's real bytes at UploadBlock time. A ready
+	// block whose blocks.sha1 is missing or malformed is treated as needs_upload —
+	// the re-upload recomputes and rewrites a verified SHA-1 — so a half-written or
+	// pre-PR2 block can never put an unvalidated id into an fs_object.
+	for _, sha256ID := range uniqueHashes {
+		if statuses[sha256ID] != blockStatusReady {
+			continue
+		}
+		if !isHex40(sha1ByHash256[sha256ID]) {
+			addNeedsUpload(sha256ID)
+		}
+	}
+	observeBlockVerification(start, uniqueHashes, statuses, needsSeen)
+	return blockIDs, needsUpload, sizeMismatchHash
 }
 
 // classifyBlockForCommit decides whether one block is commit-ready (R1/R8/R11):
