@@ -32,6 +32,8 @@ import (
 // Cassandra/S3 round-trips.
 const blockProbeConcurrency = 20
 
+var errSessionCheckBlockStoreUnavailable = errors.New("block storage not available")
+
 var checkBlocksProbeReuseFn = func(database *db.DB, orgID, hash string) (db.BlockReuseProbe, error) {
 	return database.ProbeBlockReuse(orgID, hash)
 }
@@ -431,6 +433,45 @@ func dedupePreserveOrder(values []string) []string {
 	return deduped
 }
 
+func (h *BlockHandler) checkBlocksForSession(c *gin.Context, session db.BlockUploadSession, hashes []string) (CheckBlocksResponse, error) {
+	orgID := c.GetString("org_id")
+	uniqueHashes := dedupePreserveOrder(hashes)
+	reusableByHash, reusableHashes, err := checkBlocksReusableCandidatesParallel(c.Request.Context(), h.db, orgID, uniqueHashes, blockProbeConcurrency)
+	if err != nil {
+		return CheckBlocksResponse{}, err
+	}
+
+	if len(reusableHashes) == 0 {
+		return CheckBlocksResponse{Existing: nil, Missing: append([]string(nil), hashes...)}, nil
+	}
+
+	blockStore, _ := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
+	if blockStore == nil {
+		return CheckBlocksResponse{}, errSessionCheckBlockStoreUnavailable
+	}
+
+	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), reusableHashes, blockProbeConcurrency)
+	if err != nil {
+		return CheckBlocksResponse{}, err
+	}
+
+	referrer := db.BlockReferrerForUpload(session.SessionID)
+	ready, err := checkBlocksReadyParallel(c.Request.Context(), h.db, orgID, referrer, reusableHashes, existsMap, blockProbeConcurrency)
+	if err != nil {
+		return CheckBlocksResponse{}, err
+	}
+
+	var existing, missing []string
+	for _, hash := range hashes {
+		if reusableByHash[hash] && ready[hash] {
+			existing = append(existing, hash)
+		} else {
+			missing = append(missing, hash)
+		}
+	}
+	return CheckBlocksResponse{Existing: existing, Missing: missing}, nil
+}
+
 // materializeUploadedBlock records block metadata plus a provisional reference
 // owned by the session ("up:<session_id>") so the block is GC-governed and
 // commit-ready (R9). It ALSO writes the authoritative SHA-1 → SHA-256 mapping
@@ -505,42 +546,16 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 	// Anything less is reported missing so the client (re)uploads it under the
 	// session and materializes its own reference.
 	if resolution == uploadSessionValid {
-		orgID := c.GetString("org_id")
-		uniqueHashes := dedupePreserveOrder(req.Hashes)
-		reusableByHash, reusableHashes, rerr := checkBlocksReusableCandidatesParallel(c.Request.Context(), h.db, orgID, uniqueHashes, blockProbeConcurrency)
-		if rerr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
-			return
-		}
-		blockStore, _ := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
-		if blockStore == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-			return
-		}
-		existsMap := make(map[string]bool, len(reusableHashes))
-		if len(reusableHashes) > 0 {
-			var serr error
-			existsMap, serr = blockStore.CheckBlocksParallel(c.Request.Context(), reusableHashes, blockProbeConcurrency)
-			if serr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
+		resp, err := h.checkBlocksForSession(c, session, req.Hashes)
+		if err != nil {
+			if errors.Is(err, errSessionCheckBlockStoreUnavailable) {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 				return
 			}
-		}
-		referrer := db.BlockReferrerForUpload(session.SessionID)
-		ready, perr := checkBlocksReadyParallel(c.Request.Context(), h.db, orgID, referrer, reusableHashes, existsMap, blockProbeConcurrency)
-		if perr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 			return
 		}
-		var existing, missing []string
-		for _, hash := range req.Hashes {
-			if reusableByHash[hash] && ready[hash] {
-				existing = append(existing, hash)
-			} else {
-				missing = append(missing, hash)
-			}
-		}
-		c.JSON(http.StatusOK, CheckBlocksResponse{Existing: existing, Missing: missing})
+		c.JSON(http.StatusOK, resp)
 		return
 	}
 

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -84,6 +85,19 @@ func webUploadBlockLegacy(t *testing.T, c *testClient, data []byte) *http.Respon
 
 func webCheckBlocks(t *testing.T, c *testClient, session string, hashes []string) (existing, missing []string) {
 	t.Helper()
+	resp := webCheckBlocksResponse(t, c, session, hashes)
+	defer resp.Body.Close()
+	expectStatus(t, resp, http.StatusOK)
+	var out struct {
+		Existing []string `json:"existing"`
+		Missing  []string `json:"missing"`
+	}
+	decodeJSON(t, resp, &out)
+	return out.Existing, out.Missing
+}
+
+func webCheckBlocksResponse(t *testing.T, c *testClient, session string, hashes []string) *http.Response {
+	t.Helper()
 	data, err := json.Marshal(map[string]interface{}{"hashes": hashes})
 	if err != nil {
 		t.Fatalf("marshal block check request: %v", err)
@@ -99,13 +113,7 @@ func webCheckBlocks(t *testing.T, c *testClient, session string, hashes []string
 	if err != nil {
 		t.Fatalf("block check request failed: %v", err)
 	}
-	expectStatus(t, resp, http.StatusOK)
-	var out struct {
-		Existing []string `json:"existing"`
-		Missing  []string `json:"missing"`
-	}
-	decodeJSON(t, resp, &out)
-	return out.Existing, out.Missing
+	return resp
 }
 
 func webCommit(t *testing.T, c *testClient, repoID string, manifest map[string]interface{}) *http.Response {
@@ -796,6 +804,71 @@ func TestWebBlockUploadForeignPubRefNotPermanent(t *testing.T) {
 	})
 	expectStatus(t, commit, http.StatusConflict)
 	commit.Body.Close()
+}
+
+func TestWebBlockUploadSessionRoutesRejectRevokedSharedRepoPermission(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-revoke-%d", time.Now().UnixNano()))
+
+	shareResp := adminClient.PutJSON(t, fmt.Sprintf("/api2/repos/%s/dir/shared_items/?p=/", repoID), map[string]interface{}{
+		"share_type": "user",
+		"username":   []string{defaultUserEmail},
+		"permission": "rw",
+	})
+	expectStatus(t, shareResp, http.StatusOK)
+	shareResp.Body.Close()
+	t.Cleanup(func() {
+		cleanup := adminClient.Delete(t,
+			fmt.Sprintf("/api2/repos/%s/dir/shared_items/?p=/&share_type=user&username=%s", repoID, url.QueryEscape(defaultUserEmail)),
+		)
+		if cleanup.StatusCode != http.StatusOK && cleanup.StatusCode != http.StatusNotFound {
+			body := responseBody(t, cleanup)
+			t.Errorf("cleanup delete share status=%d body=%s", cleanup.StatusCode, body)
+			return
+		}
+		cleanup.Body.Close()
+	})
+
+	waitForIntegrationCondition(t, "shared repo becomes writable for user before session mint", func() bool {
+		resp := userClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+		defer resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+
+	sessionID := webCreateBlockSession(t, userClient, repoID, "/")
+
+	deleteResp := adminClient.Delete(t,
+		fmt.Sprintf("/api2/repos/%s/dir/shared_items/?p=/&share_type=user&username=%s", repoID, url.QueryEscape(defaultUserEmail)),
+	)
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "shared repo permission revocation reaches user-facing reads", func() bool {
+		resp := userClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+		defer resp.Body.Close()
+		return resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound
+	})
+
+	checkResp := webCheckBlocksResponse(t, userClient, sessionID, []string{strings.Repeat("a", 64)})
+	if checkResp.StatusCode != http.StatusForbidden {
+		body := responseBody(t, checkResp)
+		t.Fatalf("check after permission revocation status=%d, want 403; body=%s", checkResp.StatusCode, body)
+	}
+	var checkBody map[string]interface{}
+	decodeJSON(t, checkResp, &checkBody)
+	if checkBody["error"] != "upload is no longer allowed for this session" {
+		t.Fatalf("check after permission revocation error=%v, want upload is no longer allowed for this session", checkBody["error"])
+	}
+
+	uploadResp := webUploadBlock(t, userClient, sessionID, []byte("revoked session upload "+fmt.Sprint(time.Now().UnixNano())))
+	if uploadResp.StatusCode != http.StatusForbidden {
+		body := responseBody(t, uploadResp)
+		t.Fatalf("upload after permission revocation status=%d, want 403; body=%s", uploadResp.StatusCode, body)
+	}
+	var uploadBody map[string]interface{}
+	decodeJSON(t, uploadResp, &uploadBody)
+	if uploadBody["error"] != "upload is no longer allowed for this session" {
+		t.Fatalf("upload after permission revocation error=%v, want upload is no longer allowed for this session", uploadBody["error"])
+	}
 }
 
 // TestWebBlockUploadSessionStagingSkipsLogicalStorageQuota verifies R5: a block

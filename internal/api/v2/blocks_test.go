@@ -410,6 +410,40 @@ func TestCheckBlocksReadyParallel_OnlyChecksOwnershipForPhysicallyPresentCandida
 	}
 }
 
+func TestCheckBlocksForSession_AllMetadataMissingSkipsBlockStore(t *testing.T) {
+	origProbe := checkBlocksProbeReuseFn
+	defer func() {
+		checkBlocksProbeReuseFn = origProbe
+	}()
+
+	checkBlocksProbeReuseFn = func(database *db.DB, orgID, hash string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+	}
+
+	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", nil)
+	c.Set("org_id", "org-1")
+
+	resp, err := h.checkBlocksForSession(c, db.BlockUploadSession{SessionID: "sess-1", OrgID: "org-1", RepoID: "repo-1"}, []string{"new-a", "new-b", "new-a"})
+	if err != nil {
+		t.Fatalf("checkBlocksForSession returned error: %v", err)
+	}
+	if len(resp.Existing) != 0 {
+		t.Fatalf("existing = %v, want empty", resp.Existing)
+	}
+	wantMissing := []string{"new-a", "new-b", "new-a"}
+	if len(resp.Missing) != len(wantMissing) {
+		t.Fatalf("missing len = %d, want %d (%v)", len(resp.Missing), len(wantMissing), resp.Missing)
+	}
+	for i := range wantMissing {
+		if resp.Missing[i] != wantMissing[i] {
+			t.Fatalf("missing[%d] = %q, want %q (order and duplicates should be preserved)", i, resp.Missing[i], wantMissing[i])
+		}
+	}
+}
+
 func TestBlockUploadSessionQueryTransportIsRejected(t *testing.T) {
 	t.Run("check blocks rejects legacy session query transport", func(t *testing.T) {
 		r := gin.New()
