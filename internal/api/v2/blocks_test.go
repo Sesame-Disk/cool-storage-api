@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
@@ -117,7 +118,7 @@ func TestCheckBlocks_NilBlockStore(t *testing.T) {
 func TestDirectBlockReadRoutesAreNotRegistered(t *testing.T) {
 	r := gin.New()
 	rg := r.Group("/api/v2")
-	RegisterBlockRoutes(rg, nil, nil, nil, nil)
+	RegisterBlockRoutes(rg, nil, nil, nil, nil, nil)
 
 	validHash := strings.Repeat("a", 64)
 	for _, method := range []string{"GET", "HEAD"} {
@@ -128,6 +129,130 @@ func TestDirectBlockReadRoutesAreNotRegistered(t *testing.T) {
 			t.Errorf("%s /blocks/:hash status = %d, want %d (route must not exist)", method, w.Code, http.StatusNotFound)
 		}
 	}
+}
+
+// finding 9: the X-Block-Upload-Session header must win over the legacy
+// ?session= query parameter, and the query parameter must still work as a
+// fallback for any caller not yet updated.
+func TestSessionIDFromRequest(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		query  string
+		want   string
+	}{
+		{"header only", "sess-header", "", "sess-header"},
+		{"query only", "", "sess-query", "sess-query"},
+		{"header wins over query", "sess-header", "sess-query", "sess-header"},
+		{"neither present", "", "", ""},
+		{"whitespace-only header falls back to query", "   ", "sess-query", "sess-query"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url := "/api/v2/blocks/check"
+			if tt.query != "" {
+				url += "?session=" + tt.query
+			}
+			req := httptest.NewRequest(http.MethodPost, url, nil)
+			if tt.header != "" {
+				req.Header.Set("X-Block-Upload-Session", tt.header)
+			}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = req
+
+			if got := sessionIDFromRequest(c); got != tt.want {
+				t.Errorf("sessionIDFromRequest() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// finding 12: sessionPermissionCache must skip re-verification within the
+// interval, always re-verify once it elapses, and never cache a denial (so a
+// permission fix takes effect on the very next request instead of waiting out
+// the interval).
+func TestSessionPermissionCache_Allow(t *testing.T) {
+	t.Run("caches a successful check for the interval", func(t *testing.T) {
+		c := &sessionPermissionCache{}
+		calls := 0
+		verify := func() bool { calls++; return true }
+
+		if !c.allow("sess-1", verify) {
+			t.Fatal("first call should be allowed")
+		}
+		if !c.allow("sess-1", verify) {
+			t.Fatal("second call within the interval should be allowed")
+		}
+		if calls != 1 {
+			t.Errorf("verify called %d times, want 1 (second call should hit the cache)", calls)
+		}
+	})
+
+	t.Run("never caches a denial", func(t *testing.T) {
+		c := &sessionPermissionCache{}
+		calls := 0
+		verify := func() bool { calls++; return false }
+
+		if c.allow("sess-2", verify) {
+			t.Fatal("denial must not be allowed")
+		}
+		if c.allow("sess-2", verify) {
+			t.Fatal("denial must not be allowed")
+		}
+		if calls != 2 {
+			t.Errorf("verify called %d times, want 2 (a denial must never be cached)", calls)
+		}
+	})
+
+	t.Run("re-verifies once the interval elapses", func(t *testing.T) {
+		c := &sessionPermissionCache{checked: map[string]time.Time{
+			"sess-3": time.Now().Add(-sessionPermissionRecheckInterval - time.Second),
+		}}
+		calls := 0
+		verify := func() bool { calls++; return true }
+
+		if !c.allow("sess-3", verify) {
+			t.Fatal("expected allow")
+		}
+		if calls != 1 {
+			t.Errorf("verify called %d times, want 1 (stale entry must trigger re-verification)", calls)
+		}
+	})
+
+	t.Run("different sessions are independent", func(t *testing.T) {
+		c := &sessionPermissionCache{}
+		allowVerify := func() bool { return true }
+		denyVerify := func() bool { return false }
+
+		if !c.allow("sess-allowed", allowVerify) {
+			t.Fatal("sess-allowed should be allowed")
+		}
+		if c.allow("sess-denied", denyVerify) {
+			t.Fatal("sess-denied should be denied")
+		}
+		if !c.allow("sess-allowed", allowVerify) {
+			t.Fatal("sess-allowed should still be cached as allowed")
+		}
+	})
+
+	t.Run("sweeps stale entries once the cache is full", func(t *testing.T) {
+		c := &sessionPermissionCache{checked: make(map[string]time.Time, sessionPermissionCacheSweepSize+1)}
+		stale := time.Now().Add(-sessionPermissionRecheckInterval - time.Second)
+		for i := 0; i < sessionPermissionCacheSweepSize; i++ {
+			c.checked[strings.Repeat("x", 1)+string(rune(i))] = stale
+		}
+		verify := func() bool { return true }
+
+		if !c.allow("sess-fresh", verify) {
+			t.Fatal("expected allow")
+		}
+		if len(c.checked) >= sessionPermissionCacheSweepSize {
+			t.Errorf("cache size = %d, want the stale entries swept below the sweep threshold", len(c.checked))
+		}
+		if _, ok := c.checked["sess-fresh"]; !ok {
+			t.Error("the fresh entry that triggered the sweep must survive it")
+		}
+	})
 }
 
 func TestGetBlockStoreDoesNotFallBackToLegacyWhenStorageManagerFails(t *testing.T) {
@@ -294,7 +419,7 @@ func TestUploadBlockResponse_JSONFormat(t *testing.T) {
 func TestRegisterBlockRoutes(t *testing.T) {
 	r := gin.New()
 	rg := r.Group("/api/v2")
-	RegisterBlockRoutes(rg, nil, nil, nil, nil)
+	RegisterBlockRoutes(rg, nil, nil, nil, nil, nil)
 
 	routes := []struct {
 		method string

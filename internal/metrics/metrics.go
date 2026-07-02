@@ -338,6 +338,72 @@ var (
 		},
 		[]string{"surface", "result"},
 	)
+
+	// BlockUploadVerifyDuration observes how long the web block-upload commit's
+	// per-block verification pass (verifyManifestBlocks: liveness + physical
+	// presence + ownership + size, per distinct block, bounded concurrency)
+	// took, labeled by whether every block turned out ready or some needed
+	// re-upload. This — plus BlockUploadSession* and BlockUploadStagedBlocksTotal
+	// below — closes the observability gap noted in docs/WEB-BLOCK-UPLOAD.md
+	// finding 8: finalizeStoredUploadMetadata already had metrics, but the
+	// verification pass, the session claim/wait path, and staging did not.
+	BlockUploadVerifyDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "block_upload_verify_duration_seconds",
+			Help:    "Duration of the web block-upload commit's per-block verification pass.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"result"}, // "ready" or "needs_upload"
+	)
+
+	// BlockUploadVerifyBlocksTotal counts distinct blocks classified during web
+	// block-upload commit verification, by outcome.
+	BlockUploadVerifyBlocksTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "block_upload_verify_blocks_total",
+			Help: "Total number of blocks classified during web block-upload commit verification, by outcome.",
+		},
+		[]string{"status"}, // "ready", "needs_upload", or "size_mismatch"
+	)
+
+	// BlockUploadSessionClaimTotal counts commit-claim outcomes for concurrent
+	// file-from-blocks requests on the same session (R7's LWT claim).
+	BlockUploadSessionClaimTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "block_upload_session_claim_total",
+			Help: "Total number of web block-upload session commit claim attempts, by outcome.",
+		},
+		// "won": this request finalized the file.
+		// "lost_result_ready": lost the claim, but the winner's result was
+		//   already available (no wait, or the wait completed before timing out).
+		// "lost_timeout": lost the claim and the ~10s wait for the winner's
+		//   result expired; the client must retry.
+		// "lost_conflict": lost the claim to a commit for a DIFFERENT manifest
+		//   on the same session (permanent, not retryable as-is).
+		[]string{"result"},
+	)
+
+	// BlockUploadSessionWaitDuration observes how long a losing/retried commit
+	// waited for a concurrent winner's result (bounded to ~10s).
+	BlockUploadSessionWaitDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "block_upload_session_wait_duration_seconds",
+			Help:    "Duration a web block-upload commit waited for a concurrent winner's result.",
+			Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 4, 6, 8, 10, 15},
+		},
+	)
+
+	// BlockUploadStagedBlocksTotal counts blocks materialized (staged: metadata
+	// + provisional reference) under a web block-upload session at
+	// /blocks/upload, by whether the underlying S3 PUT was a new write or a
+	// dedup no-op (R9 — a session governs a block either way).
+	BlockUploadStagedBlocksTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "block_upload_staged_blocks_total",
+			Help: "Total number of blocks materialized under a web block-upload session.",
+		},
+		[]string{"new"}, // "true" or "false"
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -379,5 +445,10 @@ func Register() {
 		UploadFinalizeRetryExhaustedTotal,
 		UploadFinalizeAttempts,
 		UploadFinalizeDuration,
+		BlockUploadVerifyDuration,
+		BlockUploadVerifyBlocksTotal,
+		BlockUploadSessionClaimTotal,
+		BlockUploadSessionWaitDuration,
+		BlockUploadStagedBlocksTotal,
 	)
 }

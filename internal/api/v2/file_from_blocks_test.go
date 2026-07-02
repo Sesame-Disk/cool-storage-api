@@ -4,9 +4,31 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 )
+
+// histogramSampleCount reads the observation count off a single Histogram
+// series (a HistogramVec.WithLabelValues() result), used to assert a metric
+// gained an observation since Histogram values aren't comparable via
+// testutil.ToFloat64 (which only works for single-value Counters/Gauges).
+func histogramSampleCount(t *testing.T, o prometheus.Observer) uint64 {
+	t.Helper()
+	h, ok := o.(prometheus.Histogram)
+	if !ok {
+		t.Fatalf("observer is not a prometheus.Histogram: %T", o)
+	}
+	var m dto.Metric
+	if err := h.Write(&m); err != nil {
+		t.Fatalf("write histogram metric: %v", err)
+	}
+	return m.GetHistogram().GetSampleCount()
+}
 
 // hex64 builds deterministic, distinct valid lowercase-hex SHA-256 ids for
 // manifest validation tests (n keeps each block unique without colliding).
@@ -197,5 +219,55 @@ func TestCommittedFileIDFromSession(t *testing.T) {
 	}
 	if got := committedFileIDFromSession(db.BlockUploadSession{ResultCommitID: "not-a-fsid"}); got != "" {
 		t.Fatalf("committedFileIDFromSession(invalid) = %q, want empty", got)
+	}
+}
+
+// finding 8: observeBlockVerification must classify the WHOLE pass as
+// "needs_upload" if even one block wasn't ready (size_mismatch counts as not
+// ready), and must tally each distinct block exactly once into the right
+// per-status counter.
+func TestObserveBlockVerification_AllReady(t *testing.T) {
+	before := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("ready"))
+	beforeSamples := histogramSampleCount(t, metrics.BlockUploadVerifyDuration.WithLabelValues("ready"))
+
+	hashes := []string{hex64(1), hex64(2)}
+	statuses := map[string]int{hex64(1): blockStatusReady, hex64(2): blockStatusReady}
+	observeBlockVerification(time.Now(), hashes, statuses)
+
+	if got := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("ready")); got != before+2 {
+		t.Errorf("ready count = %v, want %v", got, before+2)
+	}
+	if got := histogramSampleCount(t, metrics.BlockUploadVerifyDuration.WithLabelValues("ready")); got != beforeSamples+1 {
+		t.Errorf("ready duration sample count = %d, want %d", got, beforeSamples+1)
+	}
+}
+
+func TestObserveBlockVerification_MixedResultIsNeedsUpload(t *testing.T) {
+	beforeReady := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("ready"))
+	beforeNeeds := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("needs_upload"))
+	beforeMismatch := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("size_mismatch"))
+	beforeNeedsUploadSamples := histogramSampleCount(t, metrics.BlockUploadVerifyDuration.WithLabelValues("needs_upload"))
+
+	hashes := []string{hex64(3), hex64(4), hex64(5)}
+	statuses := map[string]int{
+		hex64(3): blockStatusReady,
+		hex64(4): blockStatusNeedsUpload,
+		hex64(5): blockStatusSizeMismatch,
+	}
+	observeBlockVerification(time.Now(), hashes, statuses)
+
+	if got := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("ready")); got != beforeReady+1 {
+		t.Errorf("ready count = %v, want %v", got, beforeReady+1)
+	}
+	if got := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("needs_upload")); got != beforeNeeds+1 {
+		t.Errorf("needs_upload count = %v, want %v", got, beforeNeeds+1)
+	}
+	if got := testutil.ToFloat64(metrics.BlockUploadVerifyBlocksTotal.WithLabelValues("size_mismatch")); got != beforeMismatch+1 {
+		t.Errorf("size_mismatch count = %v, want %v", got, beforeMismatch+1)
+	}
+	// A single not-ready block downgrades the WHOLE pass's duration label to
+	// "needs_upload", not just "ready" for the ready ones.
+	if got := histogramSampleCount(t, metrics.BlockUploadVerifyDuration.WithLabelValues("needs_upload")); got != beforeNeedsUploadSamples+1 {
+		t.Errorf("needs_upload duration sample count = %d, want %d", got, beforeNeedsUploadSamples+1)
 	}
 }

@@ -9,11 +9,14 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
@@ -22,13 +25,25 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// blockProbeConcurrency bounds parallel ProbeBlockReuse calls for session-mode
-// /blocks/check so a large hash list does not become serial Cassandra round-trips.
+// blockProbeConcurrency bounds parallel per-block classification for
+// session-mode /blocks/check so a large hash list does not become serial
+// Cassandra/S3 round-trips.
 const blockProbeConcurrency = 20
 
-// probeBlocksReusableParallel returns, per hash, whether the block is commit-ready
-// (ProbeBlockReuse == Reusable), computed with bounded concurrency.
-func probeBlocksReusableParallel(ctx context.Context, database *db.DB, orgID string, hashes []string, concurrency int) (map[string]bool, error) {
+// checkBlocksReadyParallel classifies, per hash, whether a block is truly
+// commit-ready for session-mode /blocks/check (R3 + finding 3): live in
+// Cassandra (ProbeBlockReuse == Reusable), physically present in S3
+// (existsMap, from the same CheckBlocksParallel call the commit itself runs),
+// and owned by this session or permanently referenced (classifyBlockOwnership
+// — the same helper file_from_blocks.go's classifyBlockForCommit uses). This
+// is the commit's classifier minus the size check (check has no declared
+// per-block sizes to compare against; sizes only arrive in the commit
+// manifest), so a block /blocks/check reports "existing" is exactly the set
+// the commit will accept modulo size — closing the "check says existing,
+// commit says needs_upload" gap for anything both endpoints can see (e.g. a
+// block reachable in Cassandra whose S3 object was deleted, or a block kept
+// alive only by a foreign session's transient reference).
+func checkBlocksReadyParallel(ctx context.Context, database *db.DB, orgID, referrer string, hashes []string, existsMap map[string]bool, concurrency int) (map[string]bool, error) {
 	result := make(map[string]bool, len(hashes))
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
@@ -46,8 +61,15 @@ func probeBlocksReusableParallel(ctx context.Context, database *db.DB, orgID str
 			if err != nil {
 				return err
 			}
+			ready := false
+			if probe.Decision == db.BlockReuseReusable && existsMap[hash] {
+				ready, err = classifyBlockOwnership(database, orgID, referrer, hash)
+				if err != nil {
+					return err
+				}
+			}
 			mu.Lock()
-			result[hash] = probe.Decision == db.BlockReuseReusable
+			result[hash] = ready
 			mu.Unlock()
 			return nil
 		})
@@ -60,20 +82,24 @@ func probeBlocksReusableParallel(ctx context.Context, database *db.DB, orgID str
 
 // BlockHandler handles block-level API operations
 type BlockHandler struct {
-	blockStore     *storage.BlockStore // Legacy single store (fallback)
-	storageManager *storage.Manager    // Multi-backend storage manager
-	config         *config.Config
-	db             *db.DB // Optional: enables session-scoped materialization for the web flow
+	blockStore       *storage.BlockStore // Legacy single store (fallback)
+	storageManager   *storage.Manager    // Multi-backend storage manager
+	config           *config.Config
+	db               *db.DB                           // Optional: enables session-scoped materialization for the web flow
+	permMiddleware   *middleware.PermissionMiddleware // Optional: re-verifies upload permission for long-lived sessions (R12)
+	sessionPermCache *sessionPermissionCache          // Bounds how often that re-verification runs (see sessionPermissionCache)
 }
 
 // RegisterBlockRoutes registers the block API routes
 // Supports both legacy single BlockStore and multi-region StorageManager
-func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config) {
+func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) {
 	h := &BlockHandler{
-		blockStore:     blockStore,
-		storageManager: storageManager,
-		config:         cfg,
-		db:             database,
+		blockStore:       blockStore,
+		storageManager:   storageManager,
+		config:           cfg,
+		db:               database,
+		permMiddleware:   permMiddleware,
+		sessionPermCache: &sessionPermissionCache{},
 	}
 
 	// Per-IP rate limit for the block existence oracle.
@@ -163,13 +189,90 @@ func (h *BlockHandler) blockUploadFlowEnabled() bool {
 	return h.config != nil && h.config.WebUploads.EnableWebBlockUpload
 }
 
-// resolveUploadSession reads an optional ?session= query parameter for the web
-// content-addressed upload flow. Returns (session, present, ok): present=false
-// means no session was supplied (legacy desktop/mobile behavior); ok=false means
-// a session was supplied but the flow is disabled, or it is invalid/expired or
-// does not belong to the caller.
+// sessionIDFromRequest reads the web block-upload session id, preferring the
+// `X-Block-Upload-Session` header over the legacy `?session=` query parameter
+// (finding 9): a query parameter can land in access/proxy logs, while a header
+// does not. The query parameter is kept as a fallback for any caller not yet
+// updated.
+func sessionIDFromRequest(c *gin.Context) string {
+	if h := strings.TrimSpace(c.GetHeader("X-Block-Upload-Session")); h != "" {
+		return h
+	}
+	return c.Query("session")
+}
+
+// sessionPermissionRecheckInterval bounds how often resolveUploadSession
+// re-verifies the caller's upload permission for a session's repo (finding
+// 12). A block-upload session lives up to 48h; if upload access is revoked
+// mid-session (independent of org role/account status, which already
+// invalidate the auth token via invalidateSessionsOnDemotion /
+// invalidateUserCredentials), staging should stop well before the TTL. But
+// re-running the full library-permission resolution (a shares-table scan) on
+// EVERY /blocks/upload call — up to thousands per large file — would make
+// this "cheap fix" the most expensive query in the hot path. Caching the
+// outcome for a short interval keeps staleness bounded to minutes instead of
+// 48h while adding no cost to the overwhelming majority of requests. The
+// commit (file-from-blocks) always re-verifies permission fresh regardless
+// (requireWritePermission + RequirePermFlag), so this is defense in depth,
+// not the sole enforcement point.
+const sessionPermissionRecheckInterval = 2 * time.Minute
+
+// sessionPermissionCacheSweepSize bounds the cache's memory: once it holds
+// this many entries, the next insert sweeps stale ones inline instead of
+// running a background goroutine for what is a soft, best-effort mitigation.
+const sessionPermissionCacheSweepSize = 10000
+
+// sessionPermissionCache remembers, per session id, the last time upload
+// permission was confirmed. It is per-process (not shared across nodes) —
+// acceptable because it only narrows an already-bounded exposure window, and
+// every node still converges on the same fresh check within the interval.
+type sessionPermissionCache struct {
+	mu      sync.Mutex
+	checked map[string]time.Time
+}
+
+// allow reports whether the session's permission was confirmed within the
+// last sessionPermissionRecheckInterval; otherwise it runs verify() and caches
+// a fresh confirmation only on success (a denial is never cached, so a
+// mid-window permission fix is picked up on the very next request rather than
+// waiting out the interval).
+func (c *sessionPermissionCache) allow(sessionID string, verify func() bool) bool {
+	c.mu.Lock()
+	if t, ok := c.checked[sessionID]; ok && time.Since(t) < sessionPermissionRecheckInterval {
+		c.mu.Unlock()
+		return true
+	}
+	c.mu.Unlock()
+
+	if !verify() {
+		return false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.checked == nil {
+		c.checked = make(map[string]time.Time)
+	}
+	if len(c.checked) >= sessionPermissionCacheSweepSize {
+		cutoff := time.Now().Add(-sessionPermissionRecheckInterval)
+		for id, t := range c.checked {
+			if t.Before(cutoff) {
+				delete(c.checked, id)
+			}
+		}
+	}
+	c.checked[sessionID] = time.Now()
+	return true
+}
+
+// resolveUploadSession reads the web content-addressed upload session id (see
+// sessionIDFromRequest) and validates it. Returns (session, present, ok):
+// present=false means no session was supplied (legacy desktop/mobile
+// behavior); ok=false means a session was supplied but the flow is disabled,
+// it is invalid/expired, does not belong to the caller, or (finding 12) the
+// caller no longer holds upload permission on the session's repo.
 func (h *BlockHandler) resolveUploadSession(c *gin.Context) (db.BlockUploadSession, bool, bool) {
-	sessionID := c.Query("session")
+	sessionID := sessionIDFromRequest(c)
 	if sessionID == "" {
 		return db.BlockUploadSession{}, false, true
 	}
@@ -183,6 +286,14 @@ func (h *BlockHandler) resolveUploadSession(c *gin.Context) (db.BlockUploadSessi
 	if session.OrgID != c.GetString("org_id") || session.UserID != c.GetString("user_id") {
 		return db.BlockUploadSession{}, true, false
 	}
+	if h.permMiddleware != nil {
+		allowed := h.sessionPermCache.allow(session.SessionID, func() bool {
+			return h.permMiddleware.RequirePermFlagForRepo(c, session.RepoID, "upload")
+		})
+		if !allowed {
+			return db.BlockUploadSession{}, true, false
+		}
+	}
 	return session, true, true
 }
 
@@ -195,9 +306,15 @@ func (h *BlockHandler) resolveUploadSession(c *gin.Context) (db.BlockUploadSessi
 // remap fails closed (db.ErrBlockIDMappingConflict). The commit (file-from-blocks)
 // only ever READS this mapping; it never mints one from the manifest, which is why
 // a forged manifest SHA-1 cannot poison resolution. The shared legacy/seafhttp
-// mapping path (WriteBlockIDMapping) is left untouched.
-func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, sha256ID, sha1ID string, size int, storageClass string) error {
-	return RegisterWebUploadedBlockAndMapping(h.db, session.OrgID, session.RepoID, sha256ID, session.SessionID, size, storageClass, "", sha1ID)
+// mapping path (WriteBlockIDMapping) is left untouched. isNew labels the
+// staging metric (finding 8) by whether the underlying S3 PUT was a fresh
+// write or a dedup no-op — governance work happens either way (R9).
+func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, sha256ID, sha1ID string, size int, storageClass string, isNew bool) error {
+	if err := RegisterWebUploadedBlockAndMapping(h.db, session.OrgID, session.RepoID, sha256ID, session.SessionID, size, storageClass, "", sha1ID); err != nil {
+		return err
+	}
+	metrics.BlockUploadStagedBlocksTotal.WithLabelValues(strconv.FormatBool(isNew)).Inc()
+	return nil
 }
 
 // CheckBlocksRequest is the request body for checking blocks
@@ -240,23 +357,34 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 		return
 	}
 
-	// Session mode (web flow, R3): a block counts as "existing" only when it is
-	// commit-ready (ProbeBlockReuse == Reusable). A block that exists physically
-	// in S3 but has no live metadata/reference is reported as missing so the
-	// client (re)uploads it under the session and materializes it — avoiding the
-	// "S3 exists but unmaterialized → commit says NeedsPut" trap of the raw
-	// physical oracle.
+	// Session mode (web flow, R3 + finding 3): a block counts as "existing" only
+	// when checkBlocksReadyParallel agrees it is truly commit-ready — live,
+	// physically present in S3, AND owned by this session or permanently
+	// referenced — the same classifier the commit uses (minus the size check,
+	// which check cannot evaluate without the manifest's declared sizes).
+	// Anything less is reported missing so the client (re)uploads it under the
+	// session and materializes its own reference.
 	if present {
-		_ = session
 		orgID := c.GetString("org_id")
-		reusable, perr := probeBlocksReusableParallel(c.Request.Context(), h.db, orgID, req.Hashes, blockProbeConcurrency)
+		blockStore, _ := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
+		if blockStore == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+			return
+		}
+		existsMap, serr := blockStore.CheckBlocksParallel(c.Request.Context(), req.Hashes, blockProbeConcurrency)
+		if serr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
+			return
+		}
+		referrer := db.BlockReferrerForUpload(session.SessionID)
+		ready, perr := checkBlocksReadyParallel(c.Request.Context(), h.db, orgID, referrer, req.Hashes, existsMap, blockProbeConcurrency)
 		if perr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 			return
 		}
 		var existing, missing []string
 		for _, hash := range req.Hashes {
-			if reusable[hash] {
+			if ready[hash] {
 				existing = append(existing, hash)
 			} else {
 				missing = append(missing, hash)
@@ -404,8 +532,6 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
-	log.Printf("v2/blocks: uploading block %s to storage class %s\n", hash[:12], storageClass)
-
 	// Check if block already exists
 	exists, err := blockStore.BlockExists(c.Request.Context(), hash)
 	if err != nil {
@@ -422,7 +548,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		// GOVERN the block (metadata + provisional ref) so the session can commit
 		// it and GC can reclaim it, not merely to store bytes.
 		if sessionPresent {
-			if err := h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass); err != nil {
+			if err := h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, false); err != nil {
 				if errors.Is(err, db.ErrBlockIDMappingConflict) {
 					c.JSON(http.StatusConflict, gin.H{"error": "block id mapping conflict"})
 					return
@@ -481,7 +607,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 
 	// R9: govern the freshly stored block under the session.
 	if sessionPresent {
-		if err := h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass); err != nil {
+		if err := h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, true); err != nil {
 			if errors.Is(err, db.ErrBlockIDMappingConflict) {
 				c.JSON(http.StatusConflict, gin.H{"error": "block id mapping conflict"})
 				return
