@@ -2718,6 +2718,11 @@ func shortSyncCommitID(commitID string) string {
 	return commitID[:8]
 }
 
+func isEmptySyncFSID(fsID string) bool {
+	fsID = strings.TrimSpace(fsID)
+	return fsID == "" || fsID == strings.Repeat("0", 40)
+}
+
 type syncCommitFileReference struct {
 	fsID     string
 	blockIDs []string
@@ -2807,17 +2812,16 @@ func (h *SyncHandler) loadSyncFileBlockIDs(repoID string, fileIDs []string) (map
 
 func (h *SyncHandler) collectSyncReachableFiles(repoID, rootFSID string) (map[string][]string, error) {
 	files := make(map[string][]string)
-	rootFSID = strings.TrimSpace(rootFSID)
-	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
+	if isEmptySyncFSID(rootFSID) {
 		return files, nil
 	}
 	visited := make(map[string]struct{})
 	var walk func(string) error
 	walk = func(fsID string) error {
-		fsID = strings.TrimSpace(fsID)
-		if fsID == "" {
+		if isEmptySyncFSID(fsID) {
 			return nil
 		}
+		fsID = strings.TrimSpace(fsID)
 		if _, seen := visited[fsID]; seen {
 			return nil
 		}
@@ -2851,7 +2855,7 @@ func (h *SyncHandler) collectSyncReachableFiles(repoID, rootFSID string) (map[st
 			dirIDs := make([]string, 0, len(entries))
 			fallbackIDs := make([]string, 0)
 			for _, entry := range entries {
-				if entry.ID == "" {
+				if isEmptySyncFSID(entry.ID) {
 					continue
 				}
 				switch entry.Mode {

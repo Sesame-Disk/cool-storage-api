@@ -2121,6 +2121,28 @@ func TestBlockIDFormats(t *testing.T) {
 	}
 }
 
+func TestIsEmptySyncFSID(t *testing.T) {
+	tests := []struct {
+		name string
+		fsID string
+		want bool
+	}{
+		{name: "empty", fsID: "", want: true},
+		{name: "whitespace", fsID: "   ", want: true},
+		{name: "zero sentinel", fsID: "0000000000000000000000000000000000000000", want: true},
+		{name: "zero sentinel with whitespace", fsID: " 0000000000000000000000000000000000000000 ", want: true},
+		{name: "real fs id", fsID: "1f4d4f9086d9530417458c9b12b80dc3c97d957b", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isEmptySyncFSID(tt.fsID); got != tt.want {
+				t.Fatalf("isEmptySyncFSID(%q) = %v, want %v", tt.fsID, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestSHA256Computation tests that SHA-256 is computed correctly for block data
 func TestSHA256Computation(t *testing.T) {
 	tests := []struct {
