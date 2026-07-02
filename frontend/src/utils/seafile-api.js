@@ -1445,23 +1445,23 @@ seafileAPI.createBlockUploadSession = function (repoID, parentDir, config) {
 
 // Ask which of the given SHA-256 block hashes still need to be uploaded.
 // In session mode the server reports a block as "existing" only when it is
-// commit-ready (live + present), not merely present in object storage.
+// commit-ready (live + present + owned by this session or a permanent
+// reference), not merely present in object storage.
+//
+// The session id travels in the X-Block-Upload-Session header, not the query
+// string, so it does not land in access/proxy logs (the server still accepts
+// ?session= as a fallback for older callers).
 seafileAPI.checkBlocks = function (hashes, session, config) {
   let url = this.server + '/api/v2/blocks/check';
-  if (session) {
-    url += '?session=' + encodeURIComponent(session);
-  }
-  return this.req.post(url, { hashes: hashes }, config);
+  const requestConfig = withBlockUploadSessionHeader(config, session);
+  return this.req.post(url, { hashes: hashes }, requestConfig);
 };
 
 // Upload a single block. The body is the raw block bytes; the server recomputes
 // and verifies the SHA-256. Under a session the block is also materialized.
 seafileAPI.uploadBlock = function (session, hash, data, config) {
   let url = this.server + '/api/v2/blocks/upload';
-  if (session) {
-    url += '?session=' + encodeURIComponent(session);
-  }
-  const requestConfig = config || {};
+  const requestConfig = withBlockUploadSessionHeader(config, session);
   const options = Object.assign({}, requestConfig, {
     headers: Object.assign({}, requestConfig.headers || {}, {
       'Content-Type': 'application/octet-stream',
@@ -1470,6 +1470,20 @@ seafileAPI.uploadBlock = function (session, hash, data, config) {
   });
   return this.req.post(url, data, options);
 };
+
+// withBlockUploadSessionHeader merges the X-Block-Upload-Session header into an
+// axios config without mutating the caller's object.
+function withBlockUploadSessionHeader(config, session) {
+  const requestConfig = config || {};
+  if (!session) {
+    return requestConfig;
+  }
+  return Object.assign({}, requestConfig, {
+    headers: Object.assign({}, requestConfig.headers || {}, {
+      'X-Block-Upload-Session': session,
+    }),
+  });
+}
 
 // Commit a file from an ordered manifest of already-uploaded blocks.
 // manifest = { session, parent_dir, filename, replace, size, blocks:[{sha256,size}] }
