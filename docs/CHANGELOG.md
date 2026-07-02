@@ -8,6 +8,24 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-07-02 - Fix nginx false-positive notification-server detection; clear up locked-files/jwt-token 404s
+
+### Fixed
+
+Client logs (`applet.log`/`seafile.log`) showed `Notification server is enabled on the remote server http://localhost:3000.` immediately followed by a 404 on `GET .../seafhttp/repo/:id/jwt-token`. Traced the client-side detection to `daemon/http-tx-mgr.c` (`check_notif_server_thread`): the desktop client calls `GET <server>/notification/ping` and treats **any HTTP 200** as "notification server alive" — it never inspects the response body. Our `frontend/nginx.conf` SPA catch-all (`location / { try_files $uri $uri/ /index.html; }`) had no dedicated route for `/notification/`, so it fell through and returned `200 index.html`, faking a live notification server. The client then requested `jwt-token`, which correctly 404s (we don't run one), but only after being misled into expecting a JWT.
+
+Added `location /notification/ { return 404; }` in `frontend/nginx.conf`, before the SPA catch-all, so the client's own `/ping` probe reports "disabled" up front and it never requests `jwt-token`. Sync itself was never affected — this only removes confusing log noise on the client.
+
+### Investigated — not a gap on our side
+
+Also re-examined `GET /seafhttp/repo/locked-files` (previously tracked as ISSUE-SD-01, framed as a feature we were missing). Cloned the actual upstream fileserver (`haiwen/seafile-server`, `fileserver/fileserver.go`) and confirmed the current Go-rewritten fileserver (Seafile 11.x) **does not register a `/repo/locked-files` route at all** — a stock, up-to-date Seafile server 404s this too. The desktop client only probes it for backward-compat with older deployments. Corrected `docs/KNOWN_ISSUES.md` (ISSUE-SD-01) to reflect this — not implementing a stub, since that would add protocol surface upstream itself dropped. `jwt-token`'s 404-when-notifications-disabled behavior (ISSUE-SD-02) was already confirmed correct in an earlier session.
+
+### Files
+- `frontend/nginx.conf` — added `/notification/` 404 location
+- `docs/KNOWN_ISSUES.md` — corrected ISSUE-SD-01, added ISSUE-SD-05 (fixed)
+
+---
+
 ## 2026-06-19 - Adaptive uploads: keep the queue flowing during server-side finalize
 
 ### Fixed

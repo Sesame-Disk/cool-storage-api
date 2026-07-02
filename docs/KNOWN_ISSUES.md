@@ -1201,23 +1201,25 @@ Do **not** change these without a deliberate decision on whether to accept the h
 
 ## ⚠️ SeaDrive 3.x Missing Endpoints (Discovered 2026-02-19)
 
-Observed in SeaDrive 3.0.19 client logs after successful SSO login and basic sync. All 4 are currently returning 404. Sync works despite these errors — they degrade UX or efficiency but are non-fatal.
+Observed in SeaDrive 3.0.19 client logs after successful SSO login and basic sync. Sync works despite these errors — they degrade UX or efficiency but are non-fatal. SD-01 and SD-02 are confirmed (2026-07-02) to 404 the same way against a stock, up-to-date Seafile server — not gaps on our side. SD-05 (nginx false-positive notification detection) is fixed.
 
 ---
 
-### ISSUE-SD-01: `GET /seafhttp/repo/locked-files` — File Lock Status
+### ISSUE-SD-01: `GET /seafhttp/repo/locked-files` — File Lock Status — NOT A GAP (confirmed 2026-07-02)
 
-**Observed**: SeaDrive logs `Bad response code for GET .../seafhttp/repo/locked-files: 404`
+**Observed**: SeaDrive/desktop client logs `Bad response code for GET .../seafhttp/repo/locked-files: 404`
 **When**: Immediately after repo trees are loaded, before first sync cycle
-**What Seafile does**: Returns the list of files currently locked by any user across the repo. Used by SeaDrive to show lock indicators (padlock icon) on files being actively edited by someone else.
-**Expected response format**:
-```json
-{"locked_files": [{"repo_id": "...", "path": "/filename.docx", "locked_by": "user@example.com", "lock_time": 1234567890}]}
-```
-**Stub response** (safe to return now): `{"locked_files": []}` — empty list means no files are locked.
-**Auth**: No auth (SeaDrive sends without token, same pattern as folder-perm)
-**Query params**: `repo_id` (optional, may be for a specific repo)
-**Priority**: 🟡 Medium — needed for collaborative editing UX, lockout indicators, OnlyOffice/Office integration
+
+**Correction (2026-07-02)**: Cloned the actual upstream fileserver (`haiwen/seafile-server`, `fileserver/fileserver.go` route table) and confirmed **the current Go-rewritten fileserver (Seafile 11.x) does not register a `/repo/locked-files` route at all** — no `locked-files`, no `folder-perm` either. A stock, up-to-date Seafile server returns 404 for `locked-files` too. The desktop client still probes it for backward-compat with older C-fileserver/Pro deployments, but this is not something we are missing relative to current upstream — implementing a stub here would be adding protocol surface upstream itself dropped, not closing a compatibility gap.
+
+**Decision**: Not implementing. Left as 404 (matches modern upstream behavior). Already annotated as non-fatal — sync proceeds normally.
+
+~~Previous (incorrect) framing, kept for history~~:
+~~**What Seafile does**: Returns the list of files currently locked by any user across the repo...~~
+~~**Priority**: Medium — needed for collaborative editing UX...~~
+
+Real-time lock UX (padlock icons in SeaDrive) is genuinely absent, but the fix is upstream's own to make, not ours — we already expose real lock state via `internal/db/file_locks.go` (`locked_files` table) to our own web/API/OnlyOffice lock flows.
+**Priority**: 🟢 Low / not planned
 
 ---
 
@@ -1254,6 +1256,18 @@ JWT payload: `{"repo_id": "...", "user": "user@example.com", "exp": <unix+72h>}`
 
 **Auth**: Requires `syncAuthMiddleware` (repo sync token in `Seafile-Repo-Token` header)
 **Priority**: 🟢 Low — 404 is safe; only needed to enable real-time file change notifications via notification server
+
+---
+
+### ISSUE-SD-05: `frontend/nginx.conf` SPA Catch-All Faked a "Notification Server Enabled" Response — FIXED (2026-07-02)
+
+**Observed**: Client logs showed `Notification server is enabled on the remote server http://localhost:3000.` immediately followed by a 404 on `GET .../seafhttp/repo/:id/jwt-token`.
+
+**Root cause**: The desktop client autodetects the notification (WebSocket) server by calling `GET <server>/notification/ping` and treats **any HTTP 200** as "alive" — it never inspects the body (confirmed against `daemon/http-tx-mgr.c` `check_notif_server_thread`, upstream). Our deployment terminates the client's base URL at `frontend/nginx.conf`, whose SPA catch-all (`location / { try_files $uri $uri/ /index.html; }`) returned `200 index.html` for `/notification/ping` since no dedicated location existed for it. The client then believed notifications were enabled and started requesting `jwt-token`, which correctly 404s per ISSUE-SD-02 (we don't run a notification server) — but the client had already been misled into thinking it should expect JWTs, producing a confusing log sequence even though nothing was actually broken.
+
+**Fix**: Added a dedicated `location /notification/ { return 404; }` block in `frontend/nginx.conf`, placed before the SPA catch-all. The client now correctly detects "notifications disabled" up front from the `/ping` call itself and never requests `jwt-token`, so the log noise disappears entirely. Sync behavior is unaffected either way (notifications were never actually used) — this only cleans up the client-side log/detection path.
+
+**Files**: `frontend/nginx.conf`
 
 ---
 
