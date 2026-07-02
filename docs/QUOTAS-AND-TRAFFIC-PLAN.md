@@ -128,7 +128,7 @@ Compatible with Seafile. Upload and download are tracked separately, subdivided 
 | `sync-file-upload` | Desktop sync client uploads blocks | `PutBlock` (sync.go:762) |
 | `sync-file-download` | Desktop sync client downloads blocks | `GetBlock` (sync.go:665) |
 | `web-file-upload` | Web UI uploads files (resumable.js) | `HandleUpload` (seafhttp.go:481), `UploadFile` (files.go:2638), `UploadBlock` (blocks.go:149) |
-| `web-file-download` | Web UI downloads files | `HandleDownload` (seafhttp.go:1251), `HandleZipDownload` (seafhttp.go:1584), `DownloadBlock` (blocks.go:244), `DownloadHistoricFile` (fileview.go:759) |
+| `web-file-download` | Web UI downloads files | `HandleDownload` (seafhttp.go:1251), `HandleZipDownload` (seafhttp.go:1584), `DownloadHistoricFile` (fileview.go:759) |
 | `link-file-upload` | Upload via public share/upload link | `HandleUpload` with token source=link |
 | `link-file-download` | Download via public share link | `handleShareLinkDownload` (sharelink_view.go:391) |
 
@@ -391,7 +391,6 @@ if rec := traffic.Get(); rec != nil {
 ### Files to modify
 - `internal/api/seafhttp.go` — HandleDownload, HandleZipDownload
 - `internal/api/sync.go` — GetBlock
-- `internal/api/v2/blocks.go` — DownloadBlock
 - `internal/api/v2/sharelink_view.go` — handleShareLinkDownload
 - `internal/api/v2/fileview.go` — DownloadHistoricFile
 
@@ -402,7 +401,6 @@ if rec := traffic.Get(); rec != nil {
 | `HandleDownload` | seafhttp.go | `WebDownload` | `fileSize` from fs_objects | After successful streaming |
 | `HandleZipDownload` | seafhttp.go | `WebDownload` | accumulated byte count | After zip stream |
 | `GetBlock` | sync.go | `SyncDownload` | `len(data)` | After sending |
-| `DownloadBlock` | blocks.go | `WebDownload` | `len(data)` | After sending |
 | `handleShareLinkDownload` | sharelink_view.go | `LinkDownload` | `fileSize` from metadata | After streaming |
 | `DownloadHistoricFile` | fileview.go | `WebDownload` | file size | After sending |
 
@@ -797,7 +795,7 @@ Phase 2 (TrafficRecorder core)
 | `internal/traffic/storage.go` | **New** — Storage counter helpers (Increment/Decrement/Read/Adjust/Delete) |
 | `internal/api/seafhttp.go` | AccessToken.Source, instrument HandleUpload/HandleDownload, pre-checks |
 | `internal/api/sync.go` | Instrument PutBlock/GetBlock, implement real QuotaCheck |
-| `internal/api/v2/blocks.go` | Instrument UploadBlock/DownloadBlock, pre-checks |
+| `internal/api/v2/blocks.go` | Instrument UploadBlock, pre-checks |
 | `internal/api/v2/files.go` | Instrument UploadFile, decrement on DeleteFile |
 | `internal/api/v2/write_helpers.go` | softDeleteLibrary/restoreDeletedLibrary (delegates to traffic package) |
 | `internal/api/v2/admin_extra.go` | Replace statistics stubs, subscription endpoint |
@@ -845,7 +843,7 @@ Phase 2 (TrafficRecorder core)
 | **Phase 1** | Schema — tables + ALTER TABLE | ✅ COMPLETE | 3 counter tables + 8 ALTER TABLE migrations in db.go |
 | **Phase 2** | TrafficRecorder core | ✅ COMPLETE | `internal/traffic/recorder.go` — semaphore-bounded goroutines, UUID validation, platform aggregate |
 | **Phase 3** | Upload instrumentation | ✅ COMPLETE | HandleUpload, PutBlock, UploadBlock, UploadFile. Token.Source distinguishes link vs web |
-| **Phase 4** | Download instrumentation | ✅ COMPLETE | HandleDownload, HandleZipDownload, GetBlock, DownloadBlock, DownloadHistoricFile, handleShareLinkDownload |
+| **Phase 4** | Download instrumentation | ✅ COMPLETE | HandleDownload, HandleZipDownload, GetBlock, DownloadHistoricFile, handleShareLinkDownload |
 | **Phase 5** | Storage tracking | ✅ COMPLETE | Increment/DecrementStorageCounters in `traffic/storage.go` (4 scopes), negative delta guard, library soft-delete/restore adjusts aggregates |
 | **Phase 6** | Quota enforcement | ✅ COMPLETE for upload/download | CheckStorageQuota, CheckTrafficQuota, CheckMaxUsers. Free=hard block, paid=soft warning. Uploads check visible storage deltas, sync HEAD publication checks the committed tree delta and applies the counter delta before returning, downloads check traffic. Non-upload storage-growing mutations are tracked separately in ISSUE-QUOTA-COVERAGE-01, and split-phase publish/counter atomicity remains technical debt. |
 | **Phase 7** | Statistics API | ✅ COMPLETE | AdminStatisticTraffic, AdminStatisticStorage, OrgStatisticTraffic, OrgStatisticUserTraffic, AdminListOrgTraffic, AdminListUserTraffic — all real data |

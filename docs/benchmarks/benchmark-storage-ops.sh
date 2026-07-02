@@ -43,6 +43,10 @@ TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
 # --- Block Upload ---
+# NOTE: this intentionally exercises the legacy no-session POST /api/v2/blocks/upload
+# path for raw storage timing. That path stores bytes but does NOT materialize the
+# block metadata/reference rows used by the web session flow, so it must not be
+# treated as a correctness benchmark for resumable web uploads.
 echo
 echo "--- Block Upload (POST /api/v2/blocks/upload) ---"
 for size_kb in 64 256 1024 4096; do
