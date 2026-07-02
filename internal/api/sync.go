@@ -52,6 +52,10 @@ type SyncTokenValidator interface {
 	GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool)
 }
 
+// SyncAccountStatusChecker revalidates that the token's user/org are still
+// active before a body-authenticated locked-files entry is honored.
+type SyncAccountStatusChecker func(c *gin.Context, userID, orgID string) error
+
 // SyncHandler handles Seafile sync protocol operations
 // These endpoints are used by the Seafile Desktop client for file synchronization
 type SyncHandler struct {
@@ -62,6 +66,7 @@ type SyncHandler struct {
 	config         *config.Config
 	tokenCreator   SyncTokenCreator   // Token creator for download-info
 	tokenValidator SyncTokenValidator // Validates per-repo tokens in locked-files bodies
+	accountStatus  SyncAccountStatusChecker
 	permMiddleware *middleware.PermissionMiddleware
 
 	// repairSyncHeadDerivedStateIfDriftedFn is an optional test seam used by
@@ -192,6 +197,12 @@ func (h *SyncHandler) SetTokenCreator(tc SyncTokenCreator) {
 	}
 }
 
+// SetAccountStatusChecker injects the same repo-token account/org usability
+// check the route-level sync auth middleware applies on :repo_id endpoints.
+func (h *SyncHandler) SetAccountStatusChecker(checker SyncAccountStatusChecker) {
+	h.accountStatus = checker
+}
+
 func (h *SyncHandler) lookupLibraryStorageClass(orgID, repoID string) string {
 	if h == nil || h.db == nil || orgID == "" || repoID == "" {
 		return ""
@@ -312,8 +323,9 @@ func (h *SyncHandler) RegisterSyncRoutes(router *gin.Engine, authMiddleware gin.
 	router.GET("/seafhttp/repo/folder-perm", h.GetFolderPerm)
 	router.POST("/seafhttp/repo/folder-perm", h.GetFolderPerm)
 
-	// Locked-files polling — no auth required, same pattern as folder-perm and
-	// head-commits-multi (the desktop client polls this without a token).
+	// Locked-files polling — no route-level auth middleware because this is a
+	// multi-repo endpoint with no :repo_id in the path. It is still
+	// authenticated per body entry via the repo token in that JSON payload.
 	// Verified live against a genuine Seafile Pro 11.0.16 instance (2026-07-02):
 	// only POST is accepted (GET 400s with an empty-body decode error there too).
 	router.POST("/seafhttp/repo/locked-files", h.GetLockedFiles)
@@ -475,8 +487,16 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 		accessToken, valid := h.tokenValidator.GetToken(req.Token, TokenTypeDownload)
 		if !valid || accessToken == nil ||
 			!strings.EqualFold(accessToken.RepoID, req.RepoID) ||
-			accessToken.Path != "/" || accessToken.Source == "link" {
+			accessToken.Path != "/" || strings.EqualFold(accessToken.Source, "link") {
 			continue
+		}
+		if h.accountStatus != nil {
+			if err := h.accountStatus(c, accessToken.UserID, accessToken.OrgID); err != nil {
+				return
+			}
+		}
+		if c.IsAborted() {
+			return
 		}
 
 		// Dedupe after validation so a duplicate entry with a stale token
@@ -487,7 +507,17 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 		seen[req.RepoID] = struct{}{}
 
 		locks, err := listRepoLocksFn(h, req.RepoID)
-		if err != nil || len(locks) == 0 {
+		if err != nil {
+			status := http.StatusInternalServerError
+			message := "failed to list locked files"
+			if errors.Is(err, db.ErrFileLockStatusUnavailable) {
+				status = http.StatusServiceUnavailable
+				message = "file lock status unavailable"
+			}
+			c.JSON(status, gin.H{"error": message})
+			return
+		}
+		if len(locks) == 0 {
 			continue
 		}
 		entry := lockedFilesResponseEntry{

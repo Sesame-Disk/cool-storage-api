@@ -39,6 +39,10 @@ func newTestSyncHandler() *SyncHandler {
 	return NewSyncHandler(nil, nil, nil, nil, nil, nil)
 }
 
+func withAccountStatusStub(h *SyncHandler, stub SyncAccountStatusChecker) {
+	h.accountStatus = stub
+}
+
 func newLockedFilesRouter(h *SyncHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -205,6 +209,24 @@ func TestGetLockedFiles_OversizedBodyReturns400(t *testing.T) {
 	}
 }
 
+func TestGetLockedFiles_LockBackendErrorFailsClosed(t *testing.T) {
+	handler := newTestSyncHandler()
+	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
+		"tok-1": downloadTokenFor("repo-1", "user-1"),
+	}}
+	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
+		return nil, db.ErrFileLockStatusUnavailable
+	})
+
+	w := postLockedFiles(newLockedFilesRouter(handler), `[{"repo_id":"repo-1","token":"tok-1","ts":0}]`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "file lock status unavailable") {
+		t.Fatalf("body = %q, want file lock status unavailable error", w.Body.String())
+	}
+}
+
 // A duplicate entry with an invalid token must not shadow a later entry for
 // the same repo carrying a valid token — dedupe runs after validation.
 func TestGetLockedFiles_InvalidDuplicateDoesNotShadowValidEntry(t *testing.T) {
@@ -317,6 +339,31 @@ func TestGetLockedFiles_DeduplicatesRepoEntries(t *testing.T) {
 	}
 	if got := strings.Count(w.Body.String(), `"repo_id":"repo-1"`); got != 1 {
 		t.Fatalf("repo-1 appears %d times in response, want 1", got)
+	}
+}
+
+func TestGetLockedFiles_AccountStatusCheckCanRejectToken(t *testing.T) {
+	handler := newTestSyncHandler()
+	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
+		"tok-1": downloadTokenFor("repo-1", "user-1"),
+	}}
+	locksQueried := false
+	withAccountStatusStub(handler, func(c *gin.Context, userID, orgID string) error {
+		c.JSON(http.StatusForbidden, gin.H{"error": "account deactivated"})
+		c.Abort()
+		return fmt.Errorf("account deactivated")
+	})
+	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
+		locksQueried = true
+		return []db.RepoLockedFile{{Path: "/a.txt", LockedBy: "user-1"}}, nil
+	})
+
+	w := postLockedFiles(newLockedFilesRouter(handler), `[{"repo_id":"repo-1","token":"tok-1","ts":0}]`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+	if locksQueried {
+		t.Fatal("lock data must not be queried when account status check rejects the token")
 	}
 }
 

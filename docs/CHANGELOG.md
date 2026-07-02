@@ -43,13 +43,17 @@ The `"EOF"` body is Go's `json.Decoder` error string for an empty body — proof
 
 **Second hardening round (same session)**: `TokenTypeDownload` is shared by repo-level sync tokens (download-info: `Path=="/"`, non-link), path-scoped file-download tokens, and share-link tokens (`Source=="link"`). The handler now additionally requires `Path == "/" && Source != "link"`, so a share-link recipient or single-file download token cannot enumerate a repo's locks. Plus: `http.MaxBytesReader` (256 KiB) before JSON decode on this middleware-less route, dedupe moved after token validation (a stale-token duplicate can't shadow a later valid entry for the same repo), and a nil-guard on the validator result.
 
+**Third hardening round (same session)**: the first authenticated implementation still had two subtle gaps that review caught:
+- If the `locked_files` lookup failed, the handler omitted that repo exactly like "no locks". That was a fail-open downgrade against the lock subsystem's own contract. It now returns `503 file lock status unavailable` and stops the whole response instead of pretending the repo is unlocked.
+- `locked-files` sits outside the normal sync auth middleware because it is multi-repo and body-authenticated. It now reuses the same account/org usability check as repo-token middleware before honoring a body token, so a deactivated user with an old token cannot keep enumerating lock metadata.
+
 ### Files
 - `frontend/nginx.conf` — added `/notification/` 404 location
 - `internal/api/sync.go` — `GetLockedFiles` handler + route, `GetFolderPerm` response shape fix
 - `internal/db/file_locks.go` — `ListRepoLocks`
 - `internal/api/sync_locked_files_test.go`, `internal/db/file_locks_test.go` — new tests
 - `docs/KNOWN_ISSUES.md` — corrected ISSUE-SD-01 (now FIXED), added ISSUE-SD-05 (nginx, fixed) and ISSUE-SD-06 (folder-perm format, fixed)
-- `docs/IMPLEMENTATION_STATUS.md` — updated folder-perm row, added locked-files row
+- `docs/IMPLEMENTATION_STATUS.md` — updated folder-perm row, added locked-files row, corrected locked-files auth/`by_me` notes
 
 ---
 
