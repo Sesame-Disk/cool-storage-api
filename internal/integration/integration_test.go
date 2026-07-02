@@ -11,6 +11,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Sesame-Disk/sesamefs/internal/config"
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 var (
@@ -77,7 +81,73 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	afterCleanupDone = true
 	cleanupIntegrationEphemeralLibraries("after")
+	if verifyErr := verifyNoOrphanAdminLibraryProjections(); verifyErr != nil {
+		fmt.Printf("integration cleanup verification failed: %v\n", verifyErr)
+		if code == 0 {
+			code = 1
+		}
+	}
 	os.Exit(code)
+}
+
+func verifyNoOrphanAdminLibraryProjections() error {
+	database, err := openIntegrationProjectionDB()
+	if err != nil {
+		return fmt.Errorf("connect Cassandra for cleanup verification: %w", err)
+	}
+	defer database.Close()
+
+	rows, err := dbpkg.ListAdminGlobalLibraryRows(database.Session())
+	if err != nil {
+		return fmt.Errorf("list admin global library rows: %w", err)
+	}
+
+	const maxExamples = 8
+	examples := make([]string, 0, maxExamples)
+	orphanCount := 0
+	for _, row := range rows {
+		reason := ""
+		switch {
+		case strings.TrimSpace(row.Name) == "":
+			reason = "empty name"
+		case strings.TrimSpace(row.OwnerID) == "":
+			reason = "empty owner_id"
+		case strings.TrimSpace(row.OwnerEmail) == "":
+			reason = "empty owner_email"
+		default:
+			if _, readErr := dbpkg.ReadAdminLibraryProjectionRow(database.Session(), row.OrgID, row.LibraryID); readErr != nil {
+				if readErr == gocql.ErrNotFound {
+					reason = "missing canonical libraries row"
+				} else {
+					return fmt.Errorf("read canonical library %s/%s: %w", row.OrgID, row.LibraryID, readErr)
+				}
+			}
+		}
+		if reason == "" {
+			continue
+		}
+		orphanCount++
+		if len(examples) < maxExamples {
+			examples = append(examples, fmt.Sprintf("%s/%s (%s)", row.OrgID, row.LibraryID, reason))
+		}
+	}
+
+	if orphanCount == 0 {
+		return nil
+	}
+	return fmt.Errorf("found %d orphan or partial admin global library projection rows after cleanup: %s", orphanCount, strings.Join(examples, ", "))
+}
+
+func openIntegrationProjectionDB() (*dbpkg.DB, error) {
+	cfg := config.DatabaseConfig{
+		Hosts:       splitEnvOrDefault("CASSANDRA_HOSTS", "cassandra:9042"),
+		Keyspace:    envOrDefault("CASSANDRA_KEYSPACE", "sesamefs"),
+		Consistency: envOrDefault("CASSANDRA_CONSISTENCY", "LOCAL_QUORUM"),
+		LocalDC:     envOrDefault("CASSANDRA_LOCAL_DC", "datacenter1"),
+		Username:    os.Getenv("CASSANDRA_USERNAME"),
+		Password:    os.Getenv("CASSANDRA_PASSWORD"),
+	}
+	return dbpkg.New(cfg)
 }
 
 func resolveIntegrationBaseURL(baseURL string) (string, error) {
