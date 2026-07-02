@@ -973,12 +973,19 @@ flag were on*.
    distinct permanent code for the "different file" case, so the old ambiguous
    `"different file or commit is still in progress"` branch is gone (covered by
    Go + Jest tests). The `needs_upload` re-upload path is unchanged.
-8. **[Med] Commit latency/observability at large block counts.** `file-from-blocks`
-   is not a cheap metadata flip: on large files it verifies every distinct block,
-   checks logical quota, does the HEAD CAS, promotes provisional→permanent refs,
-   and cleans up staging. The UX doc already notes the visible `Saving…` phase;
-   before prod flag-on we still need operator-facing observability for this path
-   (commit latency, retries, and timeout/error rates at high block counts).
+8. **[Med, partially covered] Commit latency/observability at large block counts.**
+   `file-from-blocks` is not a cheap metadata flip: on large files it verifies
+   every distinct block, checks logical quota, does the HEAD CAS, promotes
+   provisional→permanent refs, and cleans up staging. `finalizeStoredUploadMetadata`
+   already emits `UploadFinalizeAttempts`/`UploadFinalizeDuration`/
+   `UploadFinalizeHeadConflictsTotal`/`UploadFinalizeRetryExhaustedTotal` (label
+   `v2_direct`), but the block-verification phase (`verifyManifestBlocks`/
+   `classifyBlockForCommit`), the session claim/wait path, and staging have no
+   metrics of their own (`internal/metrics/metrics.go` has no block-upload-
+   specific series). The UX doc already notes the visible `Saving…` phase; before
+   prod flag-on we still need operator-facing observability for the
+   verification/session slice specifically (latency, retries, timeout/error
+   rates at high block counts).
 9. **[Low/med] `session` travels in the query string.** `/blocks/check?session=`
    and `/blocks/upload?session=` carry the session id as a query parameter, which
    can land in access logs. It is not a strong secret leak (the request is already
@@ -1020,7 +1027,9 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
     (`repos/:repo_id/blocks/:hash` + library permission + verify the library
     references the block + resolve the store by the block's canonical storage
     class). Locked by `TestDirectBlockReadRoutesAreNotRegistered` in
-    `internal/api/v2/blocks_test.go`.
+    `internal/api/v2/blocks_test.go`. (This also makes moot the earlier review
+    note that the removed `DownloadBlock` read the full block from S3 before
+    checking the traffic quota — the code path no longer exists.)
 12. **[Low/med — pending] `/blocks/upload?session=` and `/blocks/check?session=`
     do not re-check repo write permission.** Only session ownership is verified;
     the write permission is checked at session mint and at commit. A user whose
@@ -1047,6 +1056,16 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
     `finalizeStoredUploadMetadata` still describes the pre-canonical layout**
     ("the SHA-1 IDs go into the fs_object"); post PR1–PR5 `block_ids` is SHA-256
     and the SHA-1 list lives in `seafile_block_ids_sha1`.
+17. **[Perf/DoS — pending] `UploadBlock` buffers the whole block in memory**
+    (`io.ReadAll` up to `Chunking.Adaptive.AbsoluteMax`) with no per-user cap on
+    concurrent `/blocks/upload` requests. At 8–16 MB per in-flight request this
+    is fine at normal load, but nothing bounds how many concurrent uploads one
+    user can have in flight, so a burst is real RAM pressure under abuse. This is
+    a different axis from item 1 (item 1 bounds total *staged, uncommitted*
+    bytes over time; this is instantaneous per-request memory) — the staging-
+    bytes cap would not by itself fix it. Cheap follow-up: a per-user/session
+    concurrency cap on `/blocks/upload`, or stream-to-temp-file instead of
+    buffering in RAM for blocks above a threshold.
 
 ## Remaining work
 
