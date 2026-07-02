@@ -388,6 +388,42 @@ func TestGetLockedFiles_AccountStatusRejectedDuplicateDoesNotShadowLaterValidEnt
 	}
 }
 
+func TestGetLockedFiles_ZeroLockRepoIsOnlyQueriedOnceAcrossValidUsers(t *testing.T) {
+	handler := newTestSyncHandler()
+	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
+		"tok-user-1": downloadTokenFor("repo-1", "user-1"),
+		"tok-user-2": downloadTokenFor("repo-1", "user-2"),
+	}}
+	accountChecks := 0
+	queryCount := 0
+	withAccountStatusStub(handler, func(userID, orgID string) error {
+		accountChecks++
+		return nil
+	})
+	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
+		queryCount++
+		return nil, nil
+	})
+
+	body := `[
+		{"repo_id":"repo-1","token":"tok-user-1","ts":0},
+		{"repo_id":"repo-1","token":"tok-user-2","ts":0}
+	]`
+	w := postLockedFiles(newLockedFilesRouter(handler), body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if queryCount != 1 {
+		t.Fatalf("lock queries = %d, want 1 when an authorized repo has no locks", queryCount)
+	}
+	if accountChecks != 2 {
+		t.Fatalf("account status checks = %d, want 2 before the later repo-level no-lock short-circuit", accountChecks)
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != "[]" {
+		t.Fatalf("body = %q, want %q", got, "[]")
+	}
+}
+
 func TestGetLockedFiles_AccountStatusRejectsOneEntryButKeepsValidRepos(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{

@@ -559,6 +559,7 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 			c.JSON(status, gin.H{"error": message})
 			return
 		}
+		respondedRepos[req.RepoID] = struct{}{}
 		if len(locks) == 0 {
 			continue
 		}
@@ -573,7 +574,6 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 				ByMe: strings.EqualFold(lock.LockedBy, accessToken.UserID),
 			})
 		}
-		respondedRepos[req.RepoID] = struct{}{}
 		result = append(result, entry)
 	}
 
