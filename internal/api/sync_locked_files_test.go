@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -321,7 +322,7 @@ func TestGetLockedFiles_DeduplicatesRepoEntries(t *testing.T) {
 	}}
 	queryCount := 0
 	accountChecks := 0
-	withAccountStatusStub(handler, func(c *gin.Context, userID, orgID string) error {
+	withAccountStatusStub(handler, func(userID, orgID string) error {
 		accountChecks++
 		return nil
 	})
@@ -350,28 +351,97 @@ func TestGetLockedFiles_DeduplicatesRepoEntries(t *testing.T) {
 	}
 }
 
-func TestGetLockedFiles_AccountStatusCheckCanRejectToken(t *testing.T) {
+func TestGetLockedFiles_AccountStatusRejectsOneEntryButKeepsValidRepos(t *testing.T) {
+	handler := newTestSyncHandler()
+	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
+		"tok-disabled": downloadTokenFor("repo-disabled", "user-1"),
+		"tok-valid":    downloadTokenFor("repo-valid", "user-2"),
+	}}
+	queriedRepos := make([]string, 0, 1)
+	withAccountStatusStub(handler, func(userID, orgID string) error {
+		if userID == "user-1" {
+			return errors.New("account deactivated")
+		}
+		return nil
+	})
+	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
+		queriedRepos = append(queriedRepos, repoID)
+		return []db.RepoLockedFile{{Path: "/a.txt", LockedBy: "user-2"}}, nil
+	})
+
+	body := `[
+		{"repo_id":"repo-disabled","token":"tok-disabled","ts":0},
+		{"repo_id":"repo-valid","token":"tok-valid","ts":0}
+	]`
+	w := postLockedFiles(newLockedFilesRouter(handler), body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if len(queriedRepos) != 1 || queriedRepos[0] != "repo-valid" {
+		t.Fatalf("queried repos = %v, want only repo-valid", queriedRepos)
+	}
+	if strings.Contains(w.Body.String(), "repo-disabled") {
+		t.Fatalf("body = %q, rejected repo must be omitted", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"repo_id":"repo-valid"`) {
+		t.Fatalf("body = %q, want valid repo to remain in batch response", w.Body.String())
+	}
+}
+
+func TestGetLockedFiles_AllEntriesRejectedByAccountStatusReturnsEmptyArray(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
 		"tok-1": downloadTokenFor("repo-1", "user-1"),
+		"tok-2": downloadTokenFor("repo-2", "user-2"),
 	}}
-	locksQueried := false
-	withAccountStatusStub(handler, func(c *gin.Context, userID, orgID string) error {
-		c.JSON(http.StatusForbidden, gin.H{"error": "account deactivated"})
-		c.Abort()
-		return fmt.Errorf("account deactivated")
+	withAccountStatusStub(handler, func(userID, orgID string) error {
+		return errors.New("account deactivated")
 	})
+	locksQueried := false
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
 		locksQueried = true
 		return []db.RepoLockedFile{{Path: "/a.txt", LockedBy: "user-1"}}, nil
 	})
 
-	w := postLockedFiles(newLockedFilesRouter(handler), `[{"repo_id":"repo-1","token":"tok-1","ts":0}]`)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", w.Code)
+	body := `[
+		{"repo_id":"repo-1","token":"tok-1","ts":0},
+		{"repo_id":"repo-2","token":"tok-2","ts":0}
+	]`
+	w := postLockedFiles(newLockedFilesRouter(handler), body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != "[]" {
+		t.Fatalf("body = %q, want %q", got, "[]")
 	}
 	if locksQueried {
-		t.Fatal("lock data must not be queried when account status check rejects the token")
+		t.Fatal("lock data must not be queried for account-status rejected entries")
+	}
+}
+
+func TestGetLockedFiles_LockBackendErrorInMixedBatchFailsWholeRequest(t *testing.T) {
+	handler := newTestSyncHandler()
+	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
+		"tok-1": downloadTokenFor("repo-1", "user-1"),
+		"tok-2": downloadTokenFor("repo-2", "user-2"),
+	}}
+	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
+		if repoID == "repo-2" {
+			return nil, db.ErrFileLockStatusUnavailable
+		}
+		return []db.RepoLockedFile{{Path: "/a.txt", LockedBy: "user-1"}}, nil
+	})
+
+	body := `[
+		{"repo_id":"repo-1","token":"tok-1","ts":0},
+		{"repo_id":"repo-2","token":"tok-2","ts":0}
+	]`
+	w := postLockedFiles(newLockedFilesRouter(handler), body)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "file lock status unavailable") {
+		t.Fatalf("body = %q, want file lock status unavailable error", w.Body.String())
 	}
 }
 

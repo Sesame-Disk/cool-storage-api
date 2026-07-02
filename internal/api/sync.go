@@ -54,7 +54,9 @@ type SyncTokenValidator interface {
 
 // SyncAccountStatusChecker revalidates that the token's user/org are still
 // active before a body-authenticated locked-files entry is honored.
-type SyncAccountStatusChecker func(c *gin.Context, userID, orgID string) error
+// It is intentionally side-effect free: locked-files omits rejected entries
+// per repo instead of writing a route-level HTTP error.
+type SyncAccountStatusChecker func(userID, orgID string) error
 
 // SyncHandler handles Seafile sync protocol operations
 // These endpoints are used by the Seafile Desktop client for file synchronization
@@ -199,6 +201,8 @@ func (h *SyncHandler) SetTokenCreator(tc SyncTokenCreator) {
 
 // SetAccountStatusChecker injects the same repo-token account/org usability
 // check the route-level sync auth middleware applies on :repo_id endpoints.
+// The checker must be pure: locked-files treats rejection like any other
+// per-entry validation failure and silently omits that repo from the result.
 func (h *SyncHandler) SetAccountStatusChecker(checker SyncAccountStatusChecker) {
 	h.accountStatus = checker
 }
@@ -419,6 +423,8 @@ const maxLockedFilesRepos = 500
 // on a route that carries no middleware limits.
 const maxLockedFilesBodyBytes = 256 * 1024
 
+const emptySyncFSID40 = "0000000000000000000000000000000000000000"
+
 // lockedFileEntry is one locked path within a repo's response entry.
 type lockedFileEntry struct {
 	Path string `json:"path"`
@@ -436,6 +442,23 @@ type lockedFilesResponseEntry struct {
 // GetLockedFiles without a real Cassandra session.
 var listRepoLocksFn = func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
 	return db.ListRepoLocks(h.db.Session(), repoID)
+}
+
+var loadSyncFSObjectFn = func(h *SyncHandler, repoID, fsID string) (string, string, []string, error) {
+	var objType string
+	var dirEntries string
+	var blockIDs []string
+	err := h.db.Session().Query(`
+		SELECT obj_type, dir_entries, block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, fsID).Scan(&objType, &dirEntries, &blockIDs)
+	if err != nil {
+		return "", "", nil, err
+	}
+	return objType, dirEntries, blockIDs, nil
+}
+
+var loadSyncFileBlockIDsFn = func(h *SyncHandler, repoID string, fileIDs []string) (map[string][]string, error) {
+	return h.loadSyncFileBlockIDs(repoID, fileIDs)
 }
 
 // GetLockedFiles returns the currently locked paths for each requested repo.
@@ -500,16 +523,16 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 		seen[req.RepoID] = struct{}{}
 
 		if h.accountStatus != nil {
-			if err := h.accountStatus(c, accessToken.UserID, accessToken.OrgID); err != nil {
-				return
+			if err := h.accountStatus(accessToken.UserID, accessToken.OrgID); err != nil {
+				continue
 			}
-		}
-		if c.IsAborted() {
-			return
 		}
 
 		locks, err := listRepoLocksFn(h, req.RepoID)
 		if err != nil {
+			// Auth/account validation failures are per-entry and omitted.
+			// Lock backend failures are global fail-closed: omitting an
+			// authorized repo here would falsely report "no locks".
 			status := http.StatusInternalServerError
 			message := "failed to list locked files"
 			if errors.Is(err, db.ErrFileLockStatusUnavailable) {
@@ -2720,7 +2743,7 @@ func shortSyncCommitID(commitID string) string {
 
 func isEmptySyncFSID(fsID string) bool {
 	fsID = strings.TrimSpace(fsID)
-	return fsID == "" || fsID == strings.Repeat("0", 40)
+	return fsID == "" || fsID == emptySyncFSID40
 }
 
 type syncCommitFileReference struct {
@@ -2827,12 +2850,8 @@ func (h *SyncHandler) collectSyncReachableFiles(repoID, rootFSID string) (map[st
 		}
 		visited[fsID] = struct{}{}
 
-		var objType string
-		var dirEntries string
-		var blockIDs []string
-		if err := h.db.Session().Query(`
-			SELECT obj_type, dir_entries, block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?
-		`, repoID, fsID).Scan(&objType, &dirEntries, &blockIDs); err != nil {
+		objType, dirEntries, blockIDs, err := loadSyncFSObjectFn(h, repoID, fsID)
+		if err != nil {
 			return fmt.Errorf("load fs_object %s: %w", fsID, err)
 		}
 
@@ -2867,7 +2886,7 @@ func (h *SyncHandler) collectSyncReachableFiles(repoID, rootFSID string) (map[st
 					fallbackIDs = append(fallbackIDs, entry.ID)
 				}
 			}
-			fileBlockIDs, err := h.loadSyncFileBlockIDs(repoID, fileIDs)
+			fileBlockIDs, err := loadSyncFileBlockIDsFn(h, repoID, fileIDs)
 			if err != nil {
 				return err
 			}
