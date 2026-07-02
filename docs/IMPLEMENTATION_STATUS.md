@@ -124,7 +124,8 @@ Functional coverage exists, but active-active desktop conflict recovery is still
 | `GET /seafhttp/repo/:id/block/:bid` | ✅ COMPLETE | Mostly stable | 2026-01-09 | SHA-1→SHA-256 mapping works |
 | `PUT /seafhttp/repo/:id/block/:bid` | ✅ COMPLETE | Mostly stable | 2026-01-09 | Block upload works |
 | `POST /seafhttp/repo/head-commits-multi` | 🔒 FROZEN | **STABLE** | 2026-01-16 | Multi-repo HEAD check |
-| `GET /seafhttp/repo/folder-perm` | ✅ COMPLETE | Mostly stable | 2026-02-19 | Folder-level permissions (stub: returns empty = full access) |
+| `GET/POST /seafhttp/repo/folder-perm` | ✅ COMPLETE | Mostly stable | 2026-07-02 | Folder-level permissions (stub: returns `[]` = full access everywhere; array shape confirmed 2026-07-02 against a real Seafile Pro 11.0.16 server) |
+| `POST /seafhttp/repo/locked-files` | ✅ COMPLETE | New | 2026-07-02 | Real lock data from `locked_files` table; no auth, `by_me` always `false` |
 
 **Protocol Requirements** (from `docs/SEAFILE-SYNC-PROTOCOL-RFC.md`):
 - Authentication: `Seafile-Repo-Token` header (NOT `Authorization`)

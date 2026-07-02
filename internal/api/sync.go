@@ -293,10 +293,17 @@ func (h *SyncHandler) RegisterSyncRoutes(router *gin.Engine, authMiddleware gin.
 
 	// Folder permissions — no auth required. SeaDrive sends GET and POST to
 	// /seafhttp/repo/folder-perm?repo_id=XXX without any auth token. The response
-	// is always {} (no folder-level restrictions), so no auth is needed.
+	// is always [] (no folder-level restrictions), so no auth is needed.
 	// Registered before the wildcard group so Gin matches exactly.
 	router.GET("/seafhttp/repo/folder-perm", h.GetFolderPerm)
 	router.POST("/seafhttp/repo/folder-perm", h.GetFolderPerm)
+
+	// Locked-files polling — no auth required, same pattern as folder-perm and
+	// head-commits-multi (the desktop client polls this without a token).
+	// Verified live against a genuine Seafile Pro 11.0.16 instance (2026-07-02):
+	// only POST is accepted (GET 400s with an empty-body decode error there too).
+	router.POST("/seafhttp/repo/locked-files", h.GetLockedFiles)
+	router.POST("/seafhttp/repo/locked-files/", h.GetLockedFiles)
 
 	// Sync protocol routes under /seafhttp/repo/
 	repo := router.Group("/seafhttp/repo/:repo_id")
@@ -350,11 +357,85 @@ func (h *SyncHandler) GetProtocolVersion(c *gin.Context) {
 }
 
 // GetFolderPerm returns folder-level permission rules for a repository.
-// GET /seafhttp/repo/folder-perm?repo_id=XXX
+// GET/POST /seafhttp/repo/folder-perm
 // SeaDrive calls this during sync to check if any sub-folders have restricted
-// permissions. An empty object means no folder-level restrictions (full access).
+// permissions. Wire format confirmed live against a genuine Seafile Pro 11.0.16
+// instance (2026-07-02): POST body is a JSON array of {repo_id, token, ts} and
+// the response is a JSON array, not an object — a repo with no folder-level
+// restrictions is simply absent from the response (empty array overall). We
+// have no folder-permission feature implemented yet, so every request gets
+// that same "no restrictions anywhere" answer.
 func (h *SyncHandler) GetFolderPerm(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{})
+	c.JSON(http.StatusOK, []struct{}{})
+}
+
+// lockedFilesRequestEntry is one element of the JSON array the desktop/SeaDrive
+// client POSTs to /seafhttp/repo/locked-files. Token and Ts are accepted but
+// unused: this endpoint is unauthenticated (no per-repo token validation, same
+// as folder-perm/head-commits-multi), so there is no per-user identity to check
+// them against.
+type lockedFilesRequestEntry struct {
+	RepoID string `json:"repo_id"`
+	Token  string `json:"token"`
+	Ts     int64  `json:"ts"`
+}
+
+// lockedFileEntry is one locked path within a repo's response entry.
+type lockedFileEntry struct {
+	Path string `json:"path"`
+	ByMe bool   `json:"by_me"`
+}
+
+// lockedFilesResponseEntry is the per-repo answer.
+type lockedFilesResponseEntry struct {
+	RepoID      string            `json:"repo_id"`
+	Ts          int64             `json:"ts"`
+	LockedFiles []lockedFileEntry `json:"locked_files"`
+}
+
+// listRepoLocksFn is a test seam for db.ListRepoLocks, so unit tests can exercise
+// GetLockedFiles without a real Cassandra session.
+var listRepoLocksFn = func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
+	return db.ListRepoLocks(h.db.Session(), repoID)
+}
+
+// GetLockedFiles returns the currently locked paths for each requested repo.
+// POST /seafhttp/repo/locked-files
+// No auth middleware — mirrors GetFolderPerm/GetHeadCommitsMulti (the desktop
+// client polls this without a token). Wire format confirmed live against a
+// genuine Seafile Pro 11.0.16 instance (2026-07-02): a repo with no locks is
+// omitted from the response array entirely, rather than included with an empty
+// locked_files list. "by_me" is always false since we have no per-user identity
+// in this unauthenticated flow.
+func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
+	var reqs []lockedFilesRequestEntry
+	if err := c.BindJSON(&reqs); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON array"})
+		return
+	}
+
+	now := time.Now().Unix()
+	result := make([]lockedFilesResponseEntry, 0, len(reqs))
+	for _, req := range reqs {
+		if req.RepoID == "" {
+			continue
+		}
+		locks, err := listRepoLocksFn(h, req.RepoID)
+		if err != nil || len(locks) == 0 {
+			continue
+		}
+		entry := lockedFilesResponseEntry{
+			RepoID:      req.RepoID,
+			Ts:          now,
+			LockedFiles: make([]lockedFileEntry, 0, len(locks)),
+		}
+		for _, lock := range locks {
+			entry.LockedFiles = append(entry.LockedFiles, lockedFileEntry{Path: lock.Path, ByMe: false})
+		}
+		result = append(result, entry)
+	}
+
+	c.JSON(http.StatusOK, result)
 }
 
 // Commit represents a Seafile commit object

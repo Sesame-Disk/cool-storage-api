@@ -16,13 +16,31 @@ Client logs (`applet.log`/`seafile.log`) showed `Notification server is enabled 
 
 Added `location /notification/ { return 404; }` in `frontend/nginx.conf`, before the SPA catch-all, so the client's own `/ping` probe reports "disabled" up front and it never requests `jwt-token`. Sync itself was never affected — this only removes confusing log noise on the client.
 
-### Investigated — not a gap on our side
+### `locked-files` and `folder-perm` — implemented for real, after a false start
 
-Also re-examined `GET /seafhttp/repo/locked-files` (previously tracked as ISSUE-SD-01, framed as a feature we were missing). Cloned the actual upstream fileserver (`haiwen/seafile-server`, `fileserver/fileserver.go`) and confirmed the current Go-rewritten fileserver (Seafile 11.x) **does not register a `/repo/locked-files` route at all** — a stock, up-to-date Seafile server 404s this too. The desktop client only probes it for backward-compat with older deployments. Corrected `docs/KNOWN_ISSUES.md` (ISSUE-SD-01) to reflect this — not implementing a stub, since that would add protocol surface upstream itself dropped. `jwt-token`'s 404-when-notifications-disabled behavior (ISSUE-SD-02) was already confirmed correct in an earlier session.
+First pass re-examined `GET /seafhttp/repo/locked-files` (ISSUE-SD-01) by cloning the public `haiwen/seafile-server` (`master`, Community Edition) and finding no such route in the Go fileserver's route table — concluded it was upstream parity (a stock server 404s it too) and decided not to implement it. **That conclusion was wrong**, caught the same day: live-tested against `app.nihaoshares.com`, a genuine company-operated **Seafile Pro 11.0.16** instance (`/api2/server-info/` confirms `"features": ["seafile-basic", "seafile-pro", "file-search"]`):
+
+```
+GET  /seafhttp/repo/locked-files                              → 400, body "EOF"  (empty-body JSON decode error, not a route 404)
+POST /seafhttp/repo/locked-files  body: []                     → 200, body []
+POST /seafhttp/repo/locked-files  body: [{repo_id,token,ts}]   → 200, body []  (even for a nonexistent repo)
+GET  /seafhttp/repo/folder-perm                                → 400, body "EOF"
+POST /seafhttp/repo/folder-perm   body: [{repo_id,token,ts}]   → 200, body []
+```
+
+The `"EOF"` body is Go's `json.Decoder` error string for an empty body — proof the handler is real. Both endpoints are Pro/Enterprise-only features (closed-source, hence absent from the public CE repo), and since our own `server-info` already advertises `"seafile-pro"`, we were already implicitly promising clients this tier.
+
+**Implemented**:
+- `POST /seafhttp/repo/locked-files` (`internal/api/sync.go` `GetLockedFiles`) — real data from the existing `locked_files` table via new `db.ListRepoLocks` (`internal/db/file_locks.go`). No auth (matches `folder-perm`/`head-commits-multi`), so `by_me` is always `false`. Repos with no locks are omitted from the response array, matching the real server's observed behavior.
+- Fixed `GetFolderPerm`'s response shape: was `{}` (an object) since 2026-02-19, real protocol expects `[]` (an array). Never caused a visible client error, but wasn't protocol-correct.
 
 ### Files
 - `frontend/nginx.conf` — added `/notification/` 404 location
-- `docs/KNOWN_ISSUES.md` — corrected ISSUE-SD-01, added ISSUE-SD-05 (fixed)
+- `internal/api/sync.go` — `GetLockedFiles` handler + route, `GetFolderPerm` response shape fix
+- `internal/db/file_locks.go` — `ListRepoLocks`
+- `internal/api/sync_locked_files_test.go`, `internal/db/file_locks_test.go` — new tests
+- `docs/KNOWN_ISSUES.md` — corrected ISSUE-SD-01 (now FIXED), added ISSUE-SD-05 (nginx, fixed) and ISSUE-SD-06 (folder-perm format, fixed)
+- `docs/IMPLEMENTATION_STATUS.md` — updated folder-perm row, added locked-files row
 
 ---
 

@@ -39,6 +39,33 @@ func TestReadFileLock_NilSessionReturnsUnavailable(t *testing.T) {
 	}
 }
 
+func TestListRepoLocks_NilSessionReturnsUnavailable(t *testing.T) {
+	repoUUID, err := gocql.RandomUUID()
+	if err != nil {
+		t.Fatalf("RandomUUID() error = %v", err)
+	}
+
+	_, err = ListRepoLocks(nil, repoUUID.String())
+	if !errors.Is(err, ErrFileLockStatusUnavailable) {
+		t.Fatalf("err = %v, want %v", err, ErrFileLockStatusUnavailable)
+	}
+}
+
+func TestListRepoLocks_InvalidRepoIDReturnsNoLocksNotError(t *testing.T) {
+	// A non-nil session is required to reach the UUID-parse branch — the nil
+	// check above short-circuits first otherwise. Any non-nil pointer is fine
+	// here since the invalid repo ID must return before it's ever used.
+	fakeSession := &gocql.Session{}
+
+	locks, err := ListRepoLocks(fakeSession, "not-a-uuid")
+	if err != nil {
+		t.Fatalf("err = %v, want nil (invalid repo id reported as no locks)", err)
+	}
+	if locks != nil {
+		t.Fatalf("locks = %v, want nil", locks)
+	}
+}
+
 func TestFileLockedByOther_InvalidRepoIDDoesNotBlock(t *testing.T) {
 	blocked, ownerID, err := FileLockedByOther(nil, "not-a-uuid", "/file.txt", "user-1")
 	if err != nil {
