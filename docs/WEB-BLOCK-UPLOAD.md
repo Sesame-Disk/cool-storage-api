@@ -991,15 +991,66 @@ flag were on*.
     blocks are still missing. The network resume is preserved; the local hashing
     work is not.
 
+## Security/performance review findings (2026-07-02)
+
+A full doc-vs-code review confirmed R1–R11 are enforced as documented and the flow
+is genuinely multi-node (state in Cassandra/S3, LWT commit claim, no sticky
+routing, per-repo storage-class resolution). It also surfaced findings NOT
+tracked above. Progress is tracked here; each fix ships as its own small PR.
+
+11. **[High — FIXED, PR `fix/block-endpoint-org-authorization`] `GET/HEAD
+    /api/v2/blocks/:hash` had no org/library authorization.** S3 block keys are
+    global content-addressed objects with no org scoping, so any authenticated
+    user of ANY org could download any block in the system by hash, and `HEAD`
+    was an unlimited cross-tenant existence oracle (the classic CAS dedup
+    confirmation attack). Neither endpoint is used by the web app (download goes
+    through file paths; desktop uses seafhttp). Fix: both endpoints now require
+    the caller's org to hold a materialized `blocks` metadata row for the hash
+    (`requireOrgOwnedBlock` → `db.GetOrgBlockSize`, org-partitioned, 1 query);
+    a non-owned block returns 404 indistinguishable from a missing one; no DB →
+    503 fail-closed. Both endpoints got the same per-IP rate limit as `/check`.
+    Bonus: the download's traffic-quota check now runs BEFORE the S3 read (using
+    the org-scoped metadata size), so a quota-rejected request no longer costs a
+    full S3 GET. Unit tests: `TestBlockReadEndpoints_*` in
+    `internal/api/v2/blocks_test.go`. Follow-up (deferred): a cross-org
+    integration test needs a two-org harness which does not exist yet.
+12. **[Low/med — pending] `/blocks/upload?session=` and `/blocks/check?session=`
+    do not re-check repo write permission.** Only session ownership is verified;
+    the write permission is checked at session mint and at commit. A user whose
+    upload permission (or account status) is revoked mid-session can keep staging
+    blocks for up to the 48h session TTL (bounded by traffic quota + provisional
+    TTL; they can never publish). Cheap fix: status/permission check in
+    `resolveUploadSession`.
+13. **[Note — multi-node] The per-IP rate limiters are in-memory per node.** With
+    N nodes behind the LB the effective budget is N× the configured rate, and the
+    limiter needs a trusted client IP (X-Forwarded-For). Acceptable as a
+    mitigation, but not a hard guarantee in multi-node; a shared limiter would
+    need a distributed budget.
+14. **[Perf — pending] `classifyBlockForCommit` spends 2–3 org-partition queries
+    per unique block** (`ProbeBlockReuse` + `BlockHasReferrer` + sometimes
+    `ListBlockReferrers`). `BlockHasReferrer` and `ListBlockReferrers` read the
+    SAME `(org, block)` partition; a single partition read can decide
+    owned/permanent at once, saving ~1 query per unique block (thousands on large
+    manifests).
+15. **[Perf — pending] `UploadBlock` logs one line per uploaded block**
+    (`v2/blocks: uploading block …`); at production scale (1500+ blocks per large
+    file × concurrent users) this is significant log volume. Demote to debug or
+    sample.
+16. **[Doc drift — pending] The comment in `file_from_blocks.go` above
+    `finalizeStoredUploadMetadata` still describes the pre-canonical layout**
+    ("the SHA-1 IDs go into the fs_object"); post PR1–PR5 `block_ids` is SHA-256
+    and the SHA-1 list lives in `seafile_block_ids_sha1`.
+
 ## Remaining work
 
-- **SHA-256-canonical block IDs** (separate iteration): move `fs_objects.block_ids` to
-  SHA-256 with a `seafile_block_ids_sha1` column for desktop, and drop SHA-1 from the
-  web frontend (server-derived). Eliminates the per-read SHA-1→SHA-256 mapping lookups
-  and ~halves browser hashing. Design + PR breakdown in
-  [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md).
-- Clear the prod-readiness checklist above (items 1, 2, 4 in particular) before
-  enabling `enable_web_block_upload` in production.
+- **SHA-256-canonical block IDs — SHIPPED (PR1–PR5, 2026-06-30; reverse table
+  dropped in PR7/migration 006).** `fs_objects.block_ids` is SHA-256 with a
+  `seafile_block_ids_sha1` column for desktop and the web frontend sends only
+  `{sha256, size}` (SHA-1 server-derived). See the superseded note in R9/R10 above
+  and [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) for any
+  residual cleanup.
+- Clear the prod-readiness checklist above (items 1, 2, 4 and now 12 in
+  particular) before enabling `enable_web_block_upload` in production.
 - **"metadata present but S3 object deleted"** is handled (commit verifies physical
   presence via `CheckBlocksParallel` → `needs_upload`); an automated test for it
   needs direct MinIO object deletion and is not yet added.

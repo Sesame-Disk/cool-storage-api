@@ -26,6 +26,12 @@ import (
 // /blocks/check so a large hash list does not become serial Cassandra round-trips.
 const blockProbeConcurrency = 20
 
+// orgBlockSizeFn is the org-scoped ownership lookup for the direct block read
+// endpoints (GET/HEAD /blocks/:hash). A package var so unit tests can stub it.
+var orgBlockSizeFn = func(database *db.DB, orgID, blockID string) (int64, bool, error) {
+	return database.GetOrgBlockSize(orgID, blockID)
+}
+
 // probeBlocksReusableParallel returns, per hash, whether the block is commit-ready
 // (ProbeBlockReuse == Reusable), computed with bounded concurrency.
 func probeBlocksReusableParallel(ctx context.Context, database *db.DB, orgID string, hashes []string, concurrency int) (map[string]bool, error) {
@@ -81,6 +87,13 @@ func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *stora
 	// resumable uploads while cutting off hash-enumeration probes.
 	checkBlocksLimiter := middleware.NewRateLimiter(rate.Every(time.Second), 120)
 
+	// Per-IP rate limit for direct block reads. GET serves content and HEAD is an
+	// existence oracle; neither is used by the web upload/download flow, so the
+	// same conservative budget as /check cuts off enumeration without affecting
+	// legitimate clients. NOTE: per-node in-memory limiter — in a multi-node
+	// deployment the effective ceiling is N× and requires trusted client IPs.
+	blockReadLimiter := middleware.NewRateLimiter(rate.Every(time.Second), 120)
+
 	blocks := rg.Group("/blocks")
 	{
 		// Check which blocks exist (for deduplication and resume)
@@ -89,11 +102,11 @@ func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *stora
 		// Upload a single block
 		blocks.POST("/upload", h.UploadBlock)
 
-		// Download a block by hash
-		blocks.GET("/:hash", h.DownloadBlock)
+		// Download a block by hash (org-authorized, see requireOrgOwnedBlock)
+		blocks.GET("/:hash", blockReadLimiter.Limit(), h.DownloadBlock)
 
-		// Check if a single block exists
-		blocks.HEAD("/:hash", h.BlockExists)
+		// Check if a single block exists (org-authorized)
+		blocks.HEAD("/:hash", blockReadLimiter.Limit(), h.BlockExists)
 	}
 }
 
@@ -493,6 +506,34 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	})
 }
 
+// requireOrgOwnedBlock authorizes a direct block read: the caller's org must
+// hold a materialized metadata row for the block (org-partitioned `blocks`
+// table). S3 objects are global content-addressed keys with NO org scoping, so
+// without this gate any authenticated user of any org could download any block
+// in the system by hash, and HEAD would be a cross-tenant existence oracle. A
+// block the org does not govern is reported 404 — indistinguishable from a
+// block that does not exist at all, so nothing leaks about other tenants.
+//
+// Returns (sizeBytes, true) when authorized; when false a response has been
+// written (503 without a DB — fail closed, never serve unauthorized; 500 on a
+// lookup failure; 404 when not owned).
+func (h *BlockHandler) requireOrgOwnedBlock(c *gin.Context, hash string) (int64, bool) {
+	if h.db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return 0, false
+	}
+	sizeBytes, owned, err := orgBlockSizeFn(h.db, c.GetString("org_id"), hash)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block"})
+		return 0, false
+	}
+	if !owned {
+		c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
+		return 0, false
+	}
+	return sizeBytes, true
+}
+
 // DownloadBlock downloads a block by its hash
 // GET /api/v2/blocks/:hash
 func (h *BlockHandler) DownloadBlock(c *gin.Context) {
@@ -501,6 +542,32 @@ func (h *BlockHandler) DownloadBlock(c *gin.Context) {
 	if len(hash) != 64 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hash format, expected 64 hex characters"})
 		return
+	}
+
+	sizeBytes, ok := h.requireOrgOwnedBlock(c, hash)
+	if !ok {
+		return
+	}
+
+	// Traffic quota BEFORE the S3 read, using the org-scoped metadata size (R11
+	// keeps it equal to the stored object) — a request that will be rejected must
+	// not cost an S3 GET of the full block first.
+	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true}
+	if checker := traffic.GetChecker(); checker != nil {
+		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(
+			checker,
+			c.GetString("org_id"),
+			c.GetString("user_id"),
+			"download",
+			sizeBytes,
+		)
+		if !downloadTrafficStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(downloadTrafficStatus, "traffic quota exceeded", true))
+			return
+		}
+		if warning, ok := traffic.TrafficQuotaWarningHeader(downloadTrafficStatus); ok {
+			c.Header("X-Quota-Warning", warning)
+		}
 	}
 
 	// Get appropriate BlockStore based on hostname routing
@@ -515,24 +582,6 @@ func (h *BlockHandler) DownloadBlock(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
 		return
-	}
-
-	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true}
-	if checker := traffic.GetChecker(); checker != nil {
-		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(
-			checker,
-			c.GetString("org_id"),
-			c.GetString("user_id"),
-			"download",
-			int64(len(data)),
-		)
-		if !downloadTrafficStatus.Allowed {
-			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(downloadTrafficStatus, "traffic quota exceeded", true))
-			return
-		}
-		if warning, ok := traffic.TrafficQuotaWarningHeader(downloadTrafficStatus); ok {
-			c.Header("X-Quota-Warning", warning)
-		}
 	}
 
 	// Set headers
@@ -554,6 +603,10 @@ func (h *BlockHandler) BlockExists(c *gin.Context) {
 
 	if len(hash) != 64 {
 		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	if _, ok := h.requireOrgOwnedBlock(c, hash); !ok {
 		return
 	}
 

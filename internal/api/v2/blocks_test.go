@@ -3,11 +3,13 @@ package v2
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
@@ -180,6 +182,110 @@ func TestBlockExists_NilBlockStore(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// stubOrgBlockSize replaces the org-scoped block ownership lookup for the test
+// and restores it on cleanup.
+func stubOrgBlockSize(t *testing.T, fn func(database *db.DB, orgID, blockID string) (int64, bool, error)) {
+	t.Helper()
+	old := orgBlockSizeFn
+	t.Cleanup(func() { orgBlockSizeFn = old })
+	orgBlockSizeFn = fn
+}
+
+// newBlockReadRouter mounts GET+HEAD /blocks/:hash with an org_id injected the
+// way authMiddleware would.
+func newBlockReadRouter(h *BlockHandler, orgID string) *gin.Engine {
+	r := gin.New()
+	setOrg := func(c *gin.Context) { c.Set("org_id", orgID) }
+	r.GET("/api/v2/blocks/:hash", setOrg, h.DownloadBlock)
+	r.HEAD("/api/v2/blocks/:hash", setOrg, h.BlockExists)
+	return r
+}
+
+// A block that exists globally in S3 but has no metadata row in the CALLER'S org
+// must be 404 for both GET and HEAD — otherwise any authenticated user of any
+// org could read/probe any block in the system by hash (cross-tenant oracle).
+// The zero-value BlockStore would panic if the handler reached S3, so a clean
+// 404 also proves the request never touched storage.
+func TestBlockReadEndpoints_CrossOrgBlockIsNotFound(t *testing.T) {
+	stubOrgBlockSize(t, func(database *db.DB, orgID, blockID string) (int64, bool, error) {
+		if orgID != "org-a" {
+			t.Fatalf("orgID = %q, want org-a", orgID)
+		}
+		return 0, false, nil
+	})
+	h := &BlockHandler{db: &db.DB{}, blockStore: &storage.BlockStore{}}
+	r := newBlockReadRouter(h, "org-a")
+
+	validHash := strings.Repeat("a", 64)
+	for _, method := range []string{"GET", "HEAD"} {
+		req, _ := http.NewRequest(method, "/api/v2/blocks/"+validHash, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s status = %d, want %d", method, w.Code, http.StatusNotFound)
+		}
+	}
+}
+
+// An org-owned block passes authorization and proceeds to storage resolution
+// (503 with a nil store) — distinguishing the authorization 404 from the
+// store-resolution path and locking the check order.
+func TestBlockReadEndpoints_OwnedBlockProceedsToStore(t *testing.T) {
+	stubOrgBlockSize(t, func(database *db.DB, orgID, blockID string) (int64, bool, error) {
+		return 8 * 1024 * 1024, true, nil
+	})
+	h := &BlockHandler{db: &db.DB{}, blockStore: nil}
+	r := newBlockReadRouter(h, "org-a")
+
+	validHash := strings.Repeat("a", 64)
+	for _, method := range []string{"GET", "HEAD"} {
+		req, _ := http.NewRequest(method, "/api/v2/blocks/"+validHash, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s status = %d, want %d", method, w.Code, http.StatusServiceUnavailable)
+		}
+	}
+}
+
+// An infrastructure failure reading the ownership row must fail closed (500),
+// never fall through to serving the block.
+func TestBlockReadEndpoints_OwnershipLookupErrorFailsClosed(t *testing.T) {
+	lookupErr := errors.New("cassandra unavailable")
+	stubOrgBlockSize(t, func(database *db.DB, orgID, blockID string) (int64, bool, error) {
+		return 0, false, lookupErr
+	})
+	h := &BlockHandler{db: &db.DB{}, blockStore: &storage.BlockStore{}}
+	r := newBlockReadRouter(h, "org-a")
+
+	validHash := strings.Repeat("a", 64)
+	for _, method := range []string{"GET", "HEAD"} {
+		req, _ := http.NewRequest(method, "/api/v2/blocks/"+validHash, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("%s status = %d, want %d", method, w.Code, http.StatusInternalServerError)
+		}
+	}
+}
+
+// Without a database there is no way to authorize the read: fail closed with
+// 503 instead of serving global content-addressed data to any caller.
+func TestBlockReadEndpoints_NilDBFailsClosed(t *testing.T) {
+	h := &BlockHandler{db: nil, blockStore: &storage.BlockStore{}}
+	r := newBlockReadRouter(h, "org-a")
+
+	validHash := strings.Repeat("a", 64)
+	for _, method := range []string{"GET", "HEAD"} {
+		req, _ := http.NewRequest(method, "/api/v2/blocks/"+validHash, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s status = %d, want %d", method, w.Code, http.StatusServiceUnavailable)
+		}
 	}
 }
 
