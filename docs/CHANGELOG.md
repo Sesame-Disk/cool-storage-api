@@ -41,6 +41,8 @@ The `"EOF"` body is Go's `json.Decoder` error string for an empty body — proof
 - Wiring: `SetTokenCreator` now also captures the store as `SyncTokenValidator` when it implements it (production `TokenStore` does) — one wiring point, no new setter.
 - nginx: added exact `location = /notification` alongside the `^~ /notification/` prefix so the slashless path can't fall to the SPA catch-all either.
 
+**Second hardening round (same session)**: `TokenTypeDownload` is shared by repo-level sync tokens (download-info: `Path=="/"`, non-link), path-scoped file-download tokens, and share-link tokens (`Source=="link"`). The handler now additionally requires `Path == "/" && Source != "link"`, so a share-link recipient or single-file download token cannot enumerate a repo's locks. Plus: `http.MaxBytesReader` (256 KiB) before JSON decode on this middleware-less route, dedupe moved after token validation (a stale-token duplicate can't shadow a later valid entry for the same repo), and a nil-guard on the validator result.
+
 ### Files
 - `frontend/nginx.conf` — added `/notification/` 404 location
 - `internal/api/sync.go` — `GetLockedFiles` handler + route, `GetFolderPerm` response shape fix

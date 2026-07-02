@@ -401,6 +401,12 @@ type lockedFilesRequestEntry struct {
 // cannot turn one unauthenticated-route POST into thousands of token lookups.
 const maxLockedFilesRepos = 500
 
+// maxLockedFilesBodyBytes bounds the request body before JSON decoding starts.
+// 500 entries of {repo_id, token, ts} fit comfortably under 256 KiB; without
+// this, a caller could stream an arbitrarily large body into ShouldBindJSON
+// on a route that carries no middleware limits.
+const maxLockedFilesBodyBytes = 256 * 1024
+
 // lockedFileEntry is one locked path within a repo's response entry.
 type lockedFileEntry struct {
 	Path string `json:"path"`
@@ -434,6 +440,8 @@ var listRepoLocksFn = func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, 
 // "by_me" compares the lock holder against the user the entry's token was
 // issued to.
 func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxLockedFilesBodyBytes)
+
 	var reqs []lockedFilesRequestEntry
 	if err := c.ShouldBindJSON(&reqs); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON array"})
@@ -458,15 +466,25 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 		if req.RepoID == "" || req.Token == "" {
 			continue
 		}
+
+		// Only a repo-level sync token (issued by download-info: root path,
+		// non-link source) may enumerate a repo's locks. TokenTypeDownload is
+		// shared with path-scoped file-download tokens and share-link tokens
+		// (Source=="link"), and neither of those narrower grants should widen
+		// into repo-wide lock visibility.
+		accessToken, valid := h.tokenValidator.GetToken(req.Token, TokenTypeDownload)
+		if !valid || accessToken == nil ||
+			!strings.EqualFold(accessToken.RepoID, req.RepoID) ||
+			accessToken.Path != "/" || accessToken.Source == "link" {
+			continue
+		}
+
+		// Dedupe after validation so a duplicate entry with a stale token
+		// cannot shadow a later entry for the same repo carrying a valid one.
 		if _, dup := seen[req.RepoID]; dup {
 			continue
 		}
 		seen[req.RepoID] = struct{}{}
-
-		accessToken, valid := h.tokenValidator.GetToken(req.Token, TokenTypeDownload)
-		if !valid || !strings.EqualFold(accessToken.RepoID, req.RepoID) {
-			continue
-		}
 
 		locks, err := listRepoLocksFn(h, req.RepoID)
 		if err != nil || len(locks) == 0 {

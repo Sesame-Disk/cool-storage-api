@@ -53,8 +53,10 @@ func postLockedFiles(r *gin.Engine, body string) *httptest.ResponseRecorder {
 	return w
 }
 
+// downloadTokenFor models the repo-level sync token download-info issues:
+// TokenTypeDownload with root path and non-link source.
 func downloadTokenFor(repoID, userID string) *AccessToken {
-	return &AccessToken{Type: TokenTypeDownload, RepoID: repoID, UserID: userID}
+	return &AccessToken{Type: TokenTypeDownload, RepoID: repoID, UserID: userID, Path: "/"}
 }
 
 // GetFolderPerm's wire format was confirmed live against a genuine Seafile Pro
@@ -155,6 +157,75 @@ func TestGetLockedFiles_InvalidTokenOmitsRepoWithoutQuerying(t *testing.T) {
 	}
 	if locksQueried {
 		t.Fatal("lock data must not be queried for entries that fail token validation")
+	}
+}
+
+// TokenTypeDownload is shared with narrower grants: path-scoped file-download
+// tokens and share-link tokens (Source=="link"). Neither may widen into
+// repo-wide lock enumeration — only the root-path, non-link sync token from
+// download-info qualifies.
+func TestGetLockedFiles_RejectsNarrowerDownloadTokens(t *testing.T) {
+	handler := newTestSyncHandler()
+	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
+		"tok-file-scoped": {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/docs/report.docx"},
+		"tok-share-link":  {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/", Source: "link"},
+	}}
+	locksQueried := false
+	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
+		locksQueried = true
+		return []db.RepoLockedFile{{Path: "/secret.docx", LockedBy: "user-2"}}, nil
+	})
+
+	body := `[
+		{"repo_id":"repo-1","token":"tok-file-scoped","ts":0},
+		{"repo_id":"repo-1","token":"tok-share-link","ts":0}
+	]`
+	w := postLockedFiles(newLockedFilesRouter(handler), body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != "[]" {
+		t.Fatalf("body = %q, want %q (narrow tokens must not enumerate locks)", got, "[]")
+	}
+	if locksQueried {
+		t.Fatal("lock data must not be queried for path-scoped or share-link tokens")
+	}
+}
+
+func TestGetLockedFiles_OversizedBodyReturns400(t *testing.T) {
+	handler := newTestSyncHandler()
+	handler.tokenValidator = &stubTokenValidator{}
+
+	// A single oversized entry: the body must be rejected by the byte limit
+	// before entry-count or token checks ever run.
+	body := `[{"repo_id":"repo-1","token":"` + strings.Repeat("x", maxLockedFilesBodyBytes) + `","ts":0}]`
+	w := postLockedFiles(newLockedFilesRouter(handler), body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+// A duplicate entry with an invalid token must not shadow a later entry for
+// the same repo carrying a valid token — dedupe runs after validation.
+func TestGetLockedFiles_InvalidDuplicateDoesNotShadowValidEntry(t *testing.T) {
+	handler := newTestSyncHandler()
+	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
+		"tok-valid": downloadTokenFor("repo-1", "user-1"),
+	}}
+	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
+		return []db.RepoLockedFile{{Path: "/a.txt", LockedBy: "user-1"}}, nil
+	})
+
+	body := `[
+		{"repo_id":"repo-1","token":"tok-stale","ts":0},
+		{"repo_id":"repo-1","token":"tok-valid","ts":0}
+	]`
+	w := postLockedFiles(newLockedFilesRouter(handler), body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"repo_id":"repo-1"`) {
+		t.Fatalf("body = %q, want repo-1's locks (valid entry shadowed by invalid duplicate)", w.Body.String())
 	}
 }
 
