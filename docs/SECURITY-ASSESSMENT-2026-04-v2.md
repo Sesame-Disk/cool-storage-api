@@ -424,7 +424,7 @@ throughput scales well up to 8 concurrent, then plateaus around 700 Mbps.
 | Block upload | 256 KB | 31ms | Includes hash + dedup check |
 | Block upload | 1 MB | 59ms | |
 | Block upload | 4 MB | 109ms | |
-| Block download | 256 KB | 20–25ms | GET /api/v2/blocks/:hash, 5 runs |
+| Block download | Removed | N/A | `GET /api/v2/blocks/:hash` was removed later because a bare-hash block read could not be authorized safely |
 
 #### API endpoint latency
 

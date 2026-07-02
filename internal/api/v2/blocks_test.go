@@ -107,79 +107,26 @@ func TestCheckBlocks_NilBlockStore(t *testing.T) {
 	}
 }
 
-func TestDownloadBlock_InvalidHash(t *testing.T) {
+// Direct block reads by bare hash are deliberately NOT part of the API: S3
+// block keys are global content-addressed objects with no org scoping, and a
+// bare-hash read cannot be authorized against a library permission, so the
+// endpoint was a cross-tenant (and intra-org) content/existence oracle. Web
+// downloads go through file paths; desktop sync uses the repo-scoped,
+// permission-checked seafhttp block route. This test locks the removal so the
+// routes cannot quietly come back without a repo-scoped design.
+func TestDirectBlockReadRoutesAreNotRegistered(t *testing.T) {
 	r := gin.New()
-
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
-	r.GET("/api/v2/blocks/:hash", h.DownloadBlock)
-
-	tests := []struct {
-		name       string
-		hash       string
-		wantStatus int
-	}{
-		{"too short", "abc123", http.StatusBadRequest},
-		{"too long", strings.Repeat("a", 65), http.StatusBadRequest},
-		{"exactly 63", strings.Repeat("a", 63), http.StatusBadRequest},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req, _ := http.NewRequest("GET", "/api/v2/blocks/"+tt.hash, nil)
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-
-			if w.Code != tt.wantStatus {
-				t.Errorf("status = %d, want %d", w.Code, tt.wantStatus)
-			}
-		})
-	}
-}
-
-func TestDownloadBlock_NilBlockStore(t *testing.T) {
-	r := gin.New()
-
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
-	r.GET("/api/v2/blocks/:hash", h.DownloadBlock)
+	rg := r.Group("/api/v2")
+	RegisterBlockRoutes(rg, nil, nil, nil, nil)
 
 	validHash := strings.Repeat("a", 64)
-	req, _ := http.NewRequest("GET", "/api/v2/blocks/"+validHash, nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
-	}
-}
-
-func TestBlockExists_InvalidHash(t *testing.T) {
-	r := gin.New()
-
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
-	r.HEAD("/api/v2/blocks/:hash", h.BlockExists)
-
-	req, _ := http.NewRequest("HEAD", "/api/v2/blocks/short", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
-	}
-}
-
-func TestBlockExists_NilBlockStore(t *testing.T) {
-	r := gin.New()
-
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
-	r.HEAD("/api/v2/blocks/:hash", h.BlockExists)
-
-	validHash := strings.Repeat("a", 64)
-	req, _ := http.NewRequest("HEAD", "/api/v2/blocks/"+validHash, nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	for _, method := range []string{"GET", "HEAD"} {
+		req, _ := http.NewRequest(method, "/api/v2/blocks/"+validHash, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s /blocks/:hash status = %d, want %d (route must not exist)", method, w.Code, http.StatusNotFound)
+		}
 	}
 }
 
@@ -355,8 +302,6 @@ func TestRegisterBlockRoutes(t *testing.T) {
 	}{
 		{"POST", "/api/v2/blocks/check"},
 		{"POST", "/api/v2/blocks/upload"},
-		{"GET", "/api/v2/blocks/" + strings.Repeat("a", 64)},
-		{"HEAD", "/api/v2/blocks/" + strings.Repeat("a", 64)},
 	}
 
 	for _, rt := range routes {

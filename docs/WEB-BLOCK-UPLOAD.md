@@ -973,12 +973,19 @@ flag were on*.
    distinct permanent code for the "different file" case, so the old ambiguous
    `"different file or commit is still in progress"` branch is gone (covered by
    Go + Jest tests). The `needs_upload` re-upload path is unchanged.
-8. **[Med] Commit latency/observability at large block counts.** `file-from-blocks`
-   is not a cheap metadata flip: on large files it verifies every distinct block,
-   checks logical quota, does the HEAD CAS, promotes provisional→permanent refs,
-   and cleans up staging. The UX doc already notes the visible `Saving…` phase;
-   before prod flag-on we still need operator-facing observability for this path
-   (commit latency, retries, and timeout/error rates at high block counts).
+8. **[Med, partially covered] Commit latency/observability at large block counts.**
+   `file-from-blocks` is not a cheap metadata flip: on large files it verifies
+   every distinct block, checks logical quota, does the HEAD CAS, promotes
+   provisional→permanent refs, and cleans up staging. `finalizeStoredUploadMetadata`
+   already emits `UploadFinalizeAttempts`/`UploadFinalizeDuration`/
+   `UploadFinalizeHeadConflictsTotal`/`UploadFinalizeRetryExhaustedTotal` (label
+   `v2_direct`), but the block-verification phase (`verifyManifestBlocks`/
+   `classifyBlockForCommit`), the session claim/wait path, and staging have no
+   metrics of their own (`internal/metrics/metrics.go` has no block-upload-
+   specific series). The UX doc already notes the visible `Saving…` phase; before
+   prod flag-on we still need operator-facing observability for the
+   verification/session slice specifically (latency, retries, timeout/error
+   rates at high block counts).
 9. **[Low/med] `session` travels in the query string.** `/blocks/check?session=`
    and `/blocks/upload?session=` carry the session id as a query parameter, which
    can land in access logs. It is not a strong secret leak (the request is already
@@ -991,15 +998,85 @@ flag were on*.
     blocks are still missing. The network resume is preserved; the local hashing
     work is not.
 
+## Security/performance review findings (2026-07-02)
+
+A full doc-vs-code review confirmed R1–R11 are enforced as documented and the flow
+is genuinely multi-node (state in Cassandra/S3, LWT commit claim, no sticky
+routing, per-repo storage-class resolution). It also surfaced findings NOT
+tracked above. Progress is tracked here; each fix ships as its own small PR.
+
+11. **[High — FIXED by REMOVAL, PR `fix/block-endpoint-org-authorization`]
+    `GET/HEAD /api/v2/blocks/:hash` had no authorization beyond authentication —
+    the routes were removed.** S3 block keys are global content-addressed
+    objects with no org scoping, so any authenticated user of ANY org could
+    download any block in the system by hash, and `HEAD` was an unlimited
+    cross-tenant existence oracle (the classic CAS dedup confirmation attack).
+    A first fix gated both endpoints on the caller's org holding a `blocks`
+    metadata row, but review showed that gate was still too weak: it did **not**
+    close the intra-org leak (any user of the org could read blocks of another
+    user's private library — no library permission is checkable from a bare
+    hash), it admitted rows that survive during GC (`gc_state='deleting'`) and
+    rows materialized by uncommitted staging, and the read still resolved the
+    store by hostname instead of the block's canonical `storage_class` (false
+    404 on multi-backend). Since NOTHING consumes these endpoints (web download
+    goes through file paths; desktop sync uses the repo-scoped,
+    permission-checked `/seafhttp/repo/:repo_id/block/:block_id`; the only
+    reference was a benchmark script), the correct fix is **no endpoint**: a
+    bare-hash block read is an oracle by construction. If a client-side block
+    download flow is ever needed, reintroduce it repo-scoped like seafhttp
+    (`repos/:repo_id/blocks/:hash` + library permission + verify the library
+    references the block + resolve the store by the block's canonical storage
+    class). Locked by `TestDirectBlockReadRoutesAreNotRegistered` in
+    `internal/api/v2/blocks_test.go`. (This also makes moot the earlier review
+    note that the removed `DownloadBlock` read the full block from S3 before
+    checking the traffic quota — the code path no longer exists.)
+12. **[Low/med — pending] `/blocks/upload?session=` and `/blocks/check?session=`
+    do not re-check repo write permission.** Only session ownership is verified;
+    the write permission is checked at session mint and at commit. A user whose
+    upload permission (or account status) is revoked mid-session can keep staging
+    blocks for up to the 48h session TTL (bounded by traffic quota + provisional
+    TTL; they can never publish). Cheap fix: status/permission check in
+    `resolveUploadSession`.
+13. **[Note — multi-node] The per-IP rate limiters are in-memory per node.** With
+    N nodes behind the LB the effective budget is N× the configured rate, and the
+    limiter needs a trusted client IP (X-Forwarded-For). Acceptable as a
+    mitigation, but not a hard guarantee in multi-node; a shared limiter would
+    need a distributed budget.
+14. **[Perf — pending] `classifyBlockForCommit` spends 2–3 org-partition queries
+    per unique block** (`ProbeBlockReuse` + `BlockHasReferrer` + sometimes
+    `ListBlockReferrers`). `BlockHasReferrer` and `ListBlockReferrers` read the
+    SAME `(org, block)` partition; a single partition read can decide
+    owned/permanent at once, saving ~1 query per unique block (thousands on large
+    manifests).
+15. **[Perf — pending] `UploadBlock` logs one line per uploaded block**
+    (`v2/blocks: uploading block …`); at production scale (1500+ blocks per large
+    file × concurrent users) this is significant log volume. Demote to debug or
+    sample.
+16. **[Doc drift — pending] The comment in `file_from_blocks.go` above
+    `finalizeStoredUploadMetadata` still describes the pre-canonical layout**
+    ("the SHA-1 IDs go into the fs_object"); post PR1–PR5 `block_ids` is SHA-256
+    and the SHA-1 list lives in `seafile_block_ids_sha1`.
+17. **[Perf/DoS — pending] `UploadBlock` buffers the whole block in memory**
+    (`io.ReadAll` up to `Chunking.Adaptive.AbsoluteMax`) with no per-user cap on
+    concurrent `/blocks/upload` requests. At 8–16 MB per in-flight request this
+    is fine at normal load, but nothing bounds how many concurrent uploads one
+    user can have in flight, so a burst is real RAM pressure under abuse. This is
+    a different axis from item 1 (item 1 bounds total *staged, uncommitted*
+    bytes over time; this is instantaneous per-request memory) — the staging-
+    bytes cap would not by itself fix it. Cheap follow-up: a per-user/session
+    concurrency cap on `/blocks/upload`, or stream-to-temp-file instead of
+    buffering in RAM for blocks above a threshold.
+
 ## Remaining work
 
-- **SHA-256-canonical block IDs** (separate iteration): move `fs_objects.block_ids` to
-  SHA-256 with a `seafile_block_ids_sha1` column for desktop, and drop SHA-1 from the
-  web frontend (server-derived). Eliminates the per-read SHA-1→SHA-256 mapping lookups
-  and ~halves browser hashing. Design + PR breakdown in
-  [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md).
-- Clear the prod-readiness checklist above (items 1, 2, 4 in particular) before
-  enabling `enable_web_block_upload` in production.
+- **SHA-256-canonical block IDs — SHIPPED (PR1–PR5, 2026-06-30; reverse table
+  dropped in PR7/migration 006).** `fs_objects.block_ids` is SHA-256 with a
+  `seafile_block_ids_sha1` column for desktop and the web frontend sends only
+  `{sha256, size}` (SHA-1 server-derived). See the superseded note in R9/R10 above
+  and [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) for any
+  residual cleanup.
+- Clear the prod-readiness checklist above (items 1, 2, 4 and now 12 in
+  particular) before enabling `enable_web_block_upload` in production.
 - **"metadata present but S3 object deleted"** is handled (commit verifies physical
   presence via `CheckBlocksParallel` → `needs_upload`); an automated test for it
   needs direct MinIO object deletion and is not yet added.

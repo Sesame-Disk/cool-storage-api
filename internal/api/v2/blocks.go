@@ -89,11 +89,16 @@ func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *stora
 		// Upload a single block
 		blocks.POST("/upload", h.UploadBlock)
 
-		// Download a block by hash
-		blocks.GET("/:hash", h.DownloadBlock)
-
-		// Check if a single block exists
-		blocks.HEAD("/:hash", h.BlockExists)
+		// There is deliberately NO GET/HEAD /blocks/:hash. S3 block keys are
+		// global content-addressed objects with no org scoping, and block-level
+		// reads cannot be authorized against a library permission without a repo
+		// context — a bare-hash read endpoint is a cross-tenant (and intra-org)
+		// content oracle by construction. Nothing consumes it: web downloads go
+		// through file paths and desktop sync uses the repo-scoped, permission-
+		// checked /seafhttp/repo/:repo_id/block/:block_id. If a client-side block
+		// download flow is ever needed, reintroduce it repo-scoped like seafhttp
+		// (repos/:repo_id/blocks/:hash + library permission + the block's
+		// canonical storage class). See docs/WEB-BLOCK-UPLOAD.md finding 11.
 	}
 }
 
@@ -491,88 +496,4 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		Size: int64(len(data)),
 		New:  true,
 	})
-}
-
-// DownloadBlock downloads a block by its hash
-// GET /api/v2/blocks/:hash
-func (h *BlockHandler) DownloadBlock(c *gin.Context) {
-	hash := c.Param("hash")
-
-	if len(hash) != 64 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hash format, expected 64 hex characters"})
-		return
-	}
-
-	// Get appropriate BlockStore based on hostname routing
-	blockStore, _ := h.getBlockStore(c)
-	if blockStore == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-		return
-	}
-
-	// Get the block
-	data, err := blockStore.GetBlock(c.Request.Context(), hash)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
-		return
-	}
-
-	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true}
-	if checker := traffic.GetChecker(); checker != nil {
-		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(
-			checker,
-			c.GetString("org_id"),
-			c.GetString("user_id"),
-			"download",
-			int64(len(data)),
-		)
-		if !downloadTrafficStatus.Allowed {
-			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(downloadTrafficStatus, "traffic quota exceeded", true))
-			return
-		}
-		if warning, ok := traffic.TrafficQuotaWarningHeader(downloadTrafficStatus); ok {
-			c.Header("X-Quota-Warning", warning)
-		}
-	}
-
-	// Set headers
-	c.Header("Content-Type", "application/octet-stream")
-	c.Header("X-Block-Hash", hash)
-
-	c.Data(http.StatusOK, "application/octet-stream", data)
-
-	// Record download traffic — fire-and-forget.
-	if rec := traffic.Get(); rec != nil {
-		traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebDownload, int64(len(data)))
-	}
-}
-
-// BlockExists checks if a block exists (HEAD request)
-// HEAD /api/v2/blocks/:hash
-func (h *BlockHandler) BlockExists(c *gin.Context) {
-	hash := c.Param("hash")
-
-	if len(hash) != 64 {
-		c.Status(http.StatusBadRequest)
-		return
-	}
-
-	// Get appropriate BlockStore based on hostname routing
-	blockStore, _ := h.getBlockStore(c)
-	if blockStore == nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
-
-	exists, err := blockStore.BlockExists(c.Request.Context(), hash)
-	if err != nil {
-		c.Status(http.StatusInternalServerError)
-		return
-	}
-
-	if exists {
-		c.Status(http.StatusOK)
-	} else {
-		c.Status(http.StatusNotFound)
-	}
 }
