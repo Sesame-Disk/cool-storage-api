@@ -31,8 +31,15 @@ POST /seafhttp/repo/folder-perm   body: [{repo_id,token,ts}]   → 200, body []
 The `"EOF"` body is Go's `json.Decoder` error string for an empty body — proof the handler is real. Both endpoints are Pro/Enterprise-only features (closed-source, hence absent from the public CE repo), and since our own `server-info` already advertises `"seafile-pro"`, we were already implicitly promising clients this tier.
 
 **Implemented**:
-- `POST /seafhttp/repo/locked-files` (`internal/api/sync.go` `GetLockedFiles`) — real data from the existing `locked_files` table via new `db.ListRepoLocks` (`internal/db/file_locks.go`). No auth (matches `folder-perm`/`head-commits-multi`), so `by_me` is always `false`. Repos with no locks are omitted from the response array, matching the real server's observed behavior.
+- `POST /seafhttp/repo/locked-files` (`internal/api/sync.go` `GetLockedFiles`) — real data from the existing `locked_files` table via new `db.ListRepoLocks` (`internal/db/file_locks.go`). Repos with no locks are omitted from the response array, matching the real server's observed behavior.
 - Fixed `GetFolderPerm`'s response shape: was `{}` (an object) since 2026-02-19, real protocol expects `[]` (an array). Never caused a visible client error, but wasn't protocol-correct.
+
+**Security hardening (same session, post-review)**: the first cut of `GetLockedFiles` ignored the per-repo `token` in the request body and returned real lock paths for any posted `repo_id` — information disclosure, since repo UUIDs appear in URLs/logs/share flows and aren't secrets. Reworked before merge:
+- Each body entry's `token` must resolve in the token store (`TokenTypeDownload` — the per-repo sync token from download-info) **and** match that entry's `repo_id`; failing entries are silently omitted (indistinguishable from "no locks", no repo-existence oracle).
+- `by_me` is now real: lock holder compared against the token's user (was hardcoded `false`, which could make SeaDrive show a user's own locks as foreign).
+- Added 500-entry cap + per-request `repo_id` dedupe (an unauthenticated-route POST can no longer fan out unbounded Cassandra queries), switched `BindJSON` → `ShouldBindJSON`, and fail-closed `[]` when no token validator is wired.
+- Wiring: `SetTokenCreator` now also captures the store as `SyncTokenValidator` when it implements it (production `TokenStore` does) — one wiring point, no new setter.
+- nginx: added exact `location = /notification` alongside the `^~ /notification/` prefix so the slashless path can't fall to the SPA catch-all either.
 
 ### Files
 - `frontend/nginx.conf` — added `/notification/` 404 location
