@@ -422,6 +422,21 @@ func (l *blockUploadConcurrencyLimiter) release(userKey string) {
 // (legacy sync path) are never capped — release is a no-op and ok is always
 // true. A 429 is retryable: the web client's withRetry loop backs off and
 // re-sends, so legitimate bursts self-throttle instead of failing.
+// blockBodyLimit is the maximum request body a /blocks/upload call may buffer in
+// memory (io.ReadAll). For the web (session) flow every block is exactly the
+// configured CAS block size (the last block is ≤ it), so a session request is
+// bounded to that size — NOT chunking.adaptive.absolute_max, which can be 256 MB
+// and would let one authenticated user force a 256 MB allocation per request,
+// making the per-user concurrency cap (item 18) almost useless for RAM
+// protection (cap × 256 MB = GBs). The legacy no-session path (desktop/mobile
+// sync, variable FastCDC blocks up to absolute_max) keeps the larger bound.
+func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution) int64 {
+	if resolution == uploadSessionValid {
+		return h.config.WebBlockUploadBlockSize()
+	}
+	return h.config.Chunking.Adaptive.AbsoluteMax
+}
+
 func (h *BlockHandler) tryAdmitSessionUpload(c *gin.Context, resolution uploadSessionResolution) (release func(), ok bool) {
 	if resolution != uploadSessionValid {
 		return func() {}, true
@@ -709,8 +724,11 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
-	// Check against maximum block size
-	maxSize := h.config.Chunking.Adaptive.AbsoluteMax
+	// Check against maximum block size. For the session (web) flow this is the
+	// configured CAS block size, not chunking.absolute_max — so one authenticated
+	// user cannot force a 256 MB buffer per request and defeat the per-user
+	// concurrency cap (item 18). Legacy sync keeps the larger absolute_max bound.
+	maxSize := h.blockBodyLimit(resolution)
 	if c.Request.ContentLength > maxSize {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":    "block too large",

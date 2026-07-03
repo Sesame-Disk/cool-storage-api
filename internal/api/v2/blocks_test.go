@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
@@ -743,6 +744,26 @@ func TestBlockUploadConcurrencyLimiter(t *testing.T) {
 		}
 		l.release("org1:userA") // must not panic
 	})
+}
+
+// TestBlockBodyLimit covers that a session-mode upload is bounded to the CAS
+// block size (not chunking.absolute_max), so the per-user concurrency cap is a
+// meaningful RAM bound (cap × block_size), while the legacy no-session path keeps
+// the larger absolute_max bound (variable FastCDC sync blocks).
+func TestBlockBodyLimit(t *testing.T) {
+	const blockSizeMB = 8
+	const absoluteMax = 256 * 1024 * 1024
+	cfg := &config.Config{}
+	cfg.WebUploads.WebBlockUploadBlockSizeMB = blockSizeMB
+	cfg.Chunking.Adaptive.AbsoluteMax = absoluteMax
+	h := &BlockHandler{config: cfg}
+
+	if got := h.blockBodyLimit(uploadSessionValid); got != int64(blockSizeMB)*1024*1024 {
+		t.Fatalf("session-mode body limit = %d, want %d (the CAS block size, not absolute_max)", got, int64(blockSizeMB)*1024*1024)
+	}
+	if got := h.blockBodyLimit(uploadSessionAbsent); got != absoluteMax {
+		t.Fatalf("legacy body limit = %d, want %d (chunking.absolute_max)", got, absoluteMax)
+	}
 }
 
 // TestUploadBlockPerUserConcurrencyCap covers the handler wiring: a session-mode

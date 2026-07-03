@@ -56,10 +56,13 @@ type WebUploadsConfig struct {
 	WebBlockUploadBlockSizeMB int64 `yaml:"web_block_upload_block_size_mb"`
 	// MaxConcurrentBlockUploadsPerUser caps how many concurrent session-mode
 	// /blocks/upload requests a single user may have in flight at once. Each such
-	// request buffers a whole block (up to chunking.adaptive.absolute_max, ~8–16 MB)
-	// in memory, so this bounds the instantaneous RAM one authenticated user can
-	// force the server to hold — an anti-abuse backstop, not the staging-bytes cap.
-	// A value <= 0 disables the cap (unlimited). See docs/WEB-BLOCK-UPLOAD.md item 18.
+	// request buffers one CAS block (the configured web_block_upload_block_size_mb,
+	// default 8 MB — the server bounds a session upload to that size, not
+	// chunking.absolute_max), so this bounds the instantaneous RAM one
+	// authenticated user can force the server to hold to roughly
+	// cap × block_size (default 8 × 8 MB = 64 MB) — an anti-abuse backstop, not the
+	// staging-bytes cap. A value <= 0 disables the cap (unlimited).
+	// See docs/WEB-BLOCK-UPLOAD.md item 18.
 	MaxConcurrentBlockUploadsPerUser int   `yaml:"max_concurrent_block_uploads_per_user"`
 	MaxFileSizeMB                    int64 `yaml:"max_file_size_mb"`
 	MaxFilesPerBatch                 int   `yaml:"max_files_per_batch"`
@@ -741,7 +744,7 @@ func DefaultConfig() *Config {
 			EnableResumableFileUpload:        true,
 			ResumableChunkSizeMB:             8,
 			WebBlockUploadBlockSizeMB:        8,
-			MaxConcurrentBlockUploadsPerUser: 16,
+			MaxConcurrentBlockUploadsPerUser: 8,
 			MaxFileSizeMB:                    0,
 			MaxFilesPerBatch:                 1000,
 			SimultaneousUploads:              1,

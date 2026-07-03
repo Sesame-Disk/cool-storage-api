@@ -1101,30 +1101,44 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
     request with `400 hashes[i]: invalid sha256` before any metadata/object-store
     work, aligning the cheap preflight check with the commit's manifest hygiene.
     Covered by `TestCheckBlocks_InvalidSHA256` in `internal/api/v2/blocks_test.go`.
-18. **[RESOLVED, PR `fix/block-upload-per-user-concurrency-cap`] Per-user
-    concurrency cap on session-mode `/blocks/upload`.** `UploadBlock` buffers the
-    whole block in memory (`io.ReadAll` up to `Chunking.Adaptive.AbsoluteMax`), and
-    previously nothing bounded how many concurrent uploads one user could have in
-    flight, so a burst was real RAM pressure under abuse. A per-process
-    `blockUploadConcurrencyLimiter` (keyed by `org_id:user_id`, self-cleaning map,
-    same pattern as `sessionPermissionCache`) now caps the number of concurrent
-    **session-mode** `/blocks/upload` requests a single user may hold. The slot is
-    acquired **before** `io.ReadAll`, so a rejected request never allocates the
-    ~8–16 MB buffer — this is what bounds a user's instantaneous memory footprint.
-    Over the cap returns `429 Too Many Requests` + `Retry-After`; the web client's
-    `withRetry` loop backs off and re-sends, so legitimate bursts self-throttle
-    instead of failing. The limit is
-    `web_uploads.max_concurrent_block_uploads_per_user`
-    (env `WEB_UPLOADS_MAX_CONCURRENT_BLOCK_UPLOADS_PER_USER`, default `16` ≈
-    128–256 MB resident per user; `<= 0` disables). The legacy no-session path is
-    intentionally **not** capped (trusted sync clients with their own admission).
-    Rejections are counted by `block_upload_concurrency_rejections_total`. This is
-    a **different axis** from item 1 (item 1 bounds total *staged, uncommitted*
-    bytes over time; this is instantaneous per-request memory — the staging-bytes
-    cap would not by itself fix it). Covered by `TestBlockUploadConcurrencyLimiter`
-    and `TestUploadBlockPerUserConcurrencyCap` in
-    `internal/api/v2/blocks_test.go`. Residual option, if per-request block size
-    ever grows well beyond 16 MB: stream-to-temp-file instead of buffering in RAM.
+18. **[RESOLVED, PR `fix/block-upload-per-user-concurrency-cap`] Per-request size
+    bound + per-user concurrency cap on session-mode `/blocks/upload`.**
+    `UploadBlock` buffers the whole block in memory (`io.ReadAll`). Two things
+    together bound the RAM one authenticated user can force the server to hold:
+    - **Per-request size bound.** A session-mode upload is limited to the
+      configured CAS block size (`web_block_upload_block_size_mb`, default 8 MB),
+      **not** `chunking.adaptive.absolute_max` — which is **256 MB** in the prod
+      configs. Without this, one user could force a 256 MB allocation per request
+      and the concurrency cap below would bound RAM to `cap × 256 MB` (GBs), making
+      it almost useless. Every session block is exactly the block size (last block
+      ≤ it), so this rejects nothing legitimate (`blockBodyLimit`). The legacy
+      no-session path (desktop/mobile sync, variable FastCDC blocks) keeps the
+      larger `absolute_max` bound.
+    - **Per-user concurrency cap.** A per-process `blockUploadConcurrencyLimiter`
+      (keyed by `org_id:user_id`, self-cleaning map, same pattern as
+      `sessionPermissionCache`) caps how many concurrent **session-mode**
+      `/blocks/upload` a single user may hold. The slot is acquired **before**
+      `io.ReadAll`, so a rejected request never allocates the buffer. The limit is
+      `web_uploads.max_concurrent_block_uploads_per_user`
+      (env `WEB_UPLOADS_MAX_CONCURRENT_BLOCK_UPLOADS_PER_USER`, default `8`;
+      `<= 0` disables). The legacy no-session path is intentionally **not** capped.
+
+    Together the worst-case resident memory per user is `cap × block_size`
+    (default `8 × 8 MB = 64 MB`). Over the cap returns `429 Too Many Requests` +
+    `Retry-After`; the web client honors it — a 429 is treated as **soft
+    backpressure**, retried honoring `Retry-After` (with jitter) **without**
+    consuming the hard retry budget, and it also tells the client's adaptive block
+    limiter to back off (`noteRetry`), so legitimate multi-tab bursts self-throttle
+    and recover instead of surfacing as a failed upload
+    (`is429Error`/`retryAfterMs` in `block-upload-orchestrator.js`). Rejections are
+    counted by `block_upload_concurrency_rejections_total`. This is a **different
+    axis** from item 1 (item 1 bounds total *staged, uncommitted* bytes over time;
+    this is instantaneous per-request memory — the staging-bytes cap would not by
+    itself fix it). Covered by `TestBlockBodyLimit`,
+    `TestBlockUploadConcurrencyLimiter`, and `TestUploadBlockPerUserConcurrencyCap`
+    in `internal/api/v2/blocks_test.go` and the "429 (per-user cap) is honored via
+    Retry-After" Jest test. Residual option, if the CAS block size is ever
+    configured well beyond ~16 MB: stream-to-temp-file instead of buffering in RAM.
 
 ## Remaining work
 
