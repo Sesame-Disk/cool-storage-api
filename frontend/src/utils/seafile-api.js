@@ -1444,9 +1444,13 @@ seafileAPI.shareLinksUploadDone = function (token) {
 // ============================================================================
 
 // Mint a server-issued upload session bound to (org, user, repo).
-seafileAPI.createBlockUploadSession = function (repoID, parentDir, config) {
+// `size` is the client-declared file size: the server validates it against the
+// per-session staging ceiling (max web-block file size) so an oversized upload
+// fails fast before any hashing/upload, and re-checks it against the manifest at
+// commit. Pass 0 when unknown.
+seafileAPI.createBlockUploadSession = function (repoID, parentDir, size, config) {
   let url = this.server + '/api/v2/repos/' + repoID + '/block-upload-session/';
-  return this.req.post(url, { parent_dir: parentDir }, withBlockUploadAuthHandling(config));
+  return this.req.post(url, { parent_dir: parentDir, size: size || 0 }, withBlockUploadAuthHandling(config));
 };
 
 // Ask which of the given SHA-256 block hashes still need to be uploaded.

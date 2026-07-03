@@ -785,6 +785,61 @@ func TestBlockUploadConcurrencyLimiter(t *testing.T) {
 	})
 }
 
+// TestStagedBlockBucket verifies the ledger bucket is deterministic and in range
+// (so the reserve is idempotent by (session, bucket, block_id)).
+func TestStagedBlockBucket(t *testing.T) {
+	for _, id := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64), "deadbeef"} {
+		b1 := db.StagedBlockBucket(id)
+		b2 := db.StagedBlockBucket(id)
+		if b1 != b2 {
+			t.Fatalf("bucket for %q not deterministic: %d vs %d", id, b1, b2)
+		}
+		if b1 < 0 || b1 >= db.BlockUploadStagedBlockBuckets {
+			t.Fatalf("bucket %d out of range [0,%d)", b1, db.BlockUploadStagedBlockBuckets)
+		}
+	}
+}
+
+// TestStagedBlockBucketCap covers the per-bucket cap math and the enabled flag.
+func TestStagedBlockBucketCap(t *testing.T) {
+	t.Run("derives per-bucket cap from the ceiling and block size", func(t *testing.T) {
+		cfg := &config.Config{}
+		cfg.WebUploads.WebBlockUploadBlockSizeMB = 8
+		cfg.WebUploads.MaxStagedBytesPerSessionMB = 12 * 1024 // 12 GiB explicit
+		h := &BlockHandler{config: cfg, db: &db.DB{}}
+
+		cap, enabled := h.stagedBlockBucketCap()
+		if !enabled {
+			t.Fatal("expected the per-session cap to be enabled")
+		}
+		// 12 GiB / 8 MiB = 1536 blocks; /64 buckets = 24; + slack.
+		want := 1536/db.BlockUploadStagedBlockBuckets + stagedBlockBucketSlack
+		if cap != want {
+			t.Fatalf("bucket cap = %d, want %d", cap, want)
+		}
+	})
+
+	t.Run("disabled when the ceiling is disabled", func(t *testing.T) {
+		cfg := &config.Config{}
+		cfg.WebUploads.WebBlockUploadBlockSizeMB = 8
+		cfg.WebUploads.MaxStagedBytesPerSessionMB = -1 // disabled
+		h := &BlockHandler{config: cfg, db: &db.DB{}}
+		if _, enabled := h.stagedBlockBucketCap(); enabled {
+			t.Fatal("expected disabled when the per-session ceiling is disabled")
+		}
+	})
+
+	t.Run("disabled when db is not wired", func(t *testing.T) {
+		cfg := &config.Config{}
+		cfg.WebUploads.WebBlockUploadBlockSizeMB = 8
+		cfg.WebUploads.MaxStagedBytesPerSessionMB = 100
+		h := &BlockHandler{config: cfg}
+		if _, enabled := h.stagedBlockBucketCap(); enabled {
+			t.Fatal("expected disabled when db is nil (no ledger to check)")
+		}
+	})
+}
+
 // TestBlockBodyLimit covers that a session-mode upload is bounded to the CAS
 // block size (not chunking.absolute_max), so the per-user concurrency cap is a
 // meaningful RAM bound (cap × block_size), while the legacy no-session path keeps

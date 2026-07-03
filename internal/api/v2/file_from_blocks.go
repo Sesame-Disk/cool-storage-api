@@ -257,6 +257,13 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "session parent_dir does not match this commit"})
 		return
 	}
+	// If the client declared a size at session creation (fail-fast staging check,
+	// item 1), the committed manifest must match it — a cheap extra guard on top of
+	// R6's sum(sizes)==size that ties the commit to the declared intent.
+	if session.ExpectedSize > 0 && req.Size != session.ExpectedSize {
+		c.JSON(http.StatusConflict, gin.H{"error": "manifest size does not match the size declared at session creation"})
+		return
+	}
 
 	digest := req.manifestDigest()
 
@@ -455,6 +462,14 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	}
 	if markErr != nil {
 		log.Printf("[CreateFileFromBlocks] WARNING: commit succeeded but failed to record session idempotency after retries: %v", markErr)
+	}
+
+	// Free the session's staging caps (per-user slot) now that it is committed —
+	// BEST-EFFORT and strictly AFTER the critical idempotency write above, never
+	// coupled to it: a cleanup failure must not make a committed file look
+	// uncommitted. A lingering slot self-expires at the session TTL (fail-safe).
+	if err := h.db.CleanupCommittedBlockUploadSessionCaps(session); err != nil {
+		log.Printf("[CreateFileFromBlocks] WARNING: committed but failed to release session staging slot (self-expires at TTL): %v", err)
 	}
 
 	// Release the session's provisional refs now that permanent fs: refs exist.

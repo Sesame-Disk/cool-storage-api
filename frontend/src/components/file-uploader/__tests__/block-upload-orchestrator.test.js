@@ -43,7 +43,7 @@ describe('uploadFileViaBlocks', () => {
 
     // Control-plane calls now carry a bounded timeout so a half-open socket can't
     // hang the flow forever.
-    expect(api.createBlockUploadSession).toHaveBeenCalledWith('r1', '/', expect.objectContaining({ timeout: expect.any(Number) }));
+    expect(api.createBlockUploadSession).toHaveBeenCalledWith('r1', '/', 100, expect.objectContaining({ timeout: expect.any(Number) }));
     expect(api.checkBlocks).toHaveBeenCalledWith(['h0', 'h1'], 'sess1', expect.objectContaining({ timeout: expect.any(Number) }));
     // Only the block reported missing is uploaded (dedup/resume).
     expect(uploaded).toEqual(['h1']);

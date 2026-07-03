@@ -428,6 +428,22 @@ var (
 			Help: "Total number of session-mode /blocks/upload requests rejected by the per-user concurrency cap.",
 		},
 	)
+
+	// BlockUploadSessionAdmissionRejectionsTotal counts web block-upload requests
+	// rejected by the staging caps (docs/WEB-BLOCK-UPLOAD.md item 1), by reason:
+	//   "max_sessions"  — CreateBlockUploadSession over the per-user concurrent
+	//                     uncommitted-session cap (all LWT slots claimed).
+	//   "staged_blocks" — /blocks/upload over a session's per-bucket staged-block
+	//                     ceiling (per-session staged-bytes cap).
+	// A non-zero rate means a cap is biting; use it to tune the limits before/after
+	// flag-on.
+	BlockUploadSessionAdmissionRejectionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "block_upload_session_admission_rejections_total",
+			Help: "Total number of web block-upload requests rejected by the staging caps, by reason.",
+		},
+		[]string{"reason"},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -476,5 +492,6 @@ func Register() {
 		BlockUploadSessionWaitDuration,
 		BlockUploadStagedBlocksTotal,
 		BlockUploadConcurrencyRejectionsTotal,
+		BlockUploadSessionAdmissionRejectionsTotal,
 	)
 }

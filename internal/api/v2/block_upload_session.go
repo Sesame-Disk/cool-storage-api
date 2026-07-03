@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/gin-gonic/gin"
 )
 
@@ -83,9 +85,13 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 
 	// The body is optional (defaults parent_dir to "/"), but a non-empty body that
 	// is malformed JSON should be a clear 400 rather than a silent default — only
-	// an empty body (io.EOF) is treated as "no parent_dir given".
+	// an empty body (io.EOF) is treated as "no parent_dir given". `size` is the
+	// client-declared file size (the browser knows file.size); it lets us fail
+	// fast before any hashing/upload and is re-checked against the manifest at
+	// commit.
 	var req struct {
 		ParentDir string `json:"parent_dir"`
+		Size      int64  `json:"size"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -95,9 +101,33 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 	if parentDir == "" {
 		parentDir = "/"
 	}
+	if req.Size < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid size"})
+		return
+	}
 
-	session, err := h.db.CreateBlockUploadSession(orgID, userID, repoID, parentDir)
+	// Fail fast: a declared size over the per-session staging ceiling (the maximum
+	// web-block file size) is rejected before any hashing/upload (item 1).
+	if ceiling := h.config.EffectiveMaxStagedBytesPerSession(); ceiling > 0 && req.Size > ceiling {
+		metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error":    "file exceeds the maximum web-block upload size",
+			"max_size": ceiling,
+		})
+		return
+	}
+
+	session, err := h.db.CreateAdmittedBlockUploadSession(
+		orgID, userID, repoID, parentDir, req.Size,
+		h.config.WebUploads.MaxUncommittedBlockSessionsPerUser,
+	)
 	if err != nil {
+		if errors.Is(err, db.ErrBlockUploadSessionSlotsExhausted) {
+			metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("max_sessions").Inc()
+			c.Header("Retry-After", "5")
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many concurrent uploads; retry shortly"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create upload session"})
 		return
 	}

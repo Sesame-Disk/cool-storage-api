@@ -429,6 +429,33 @@ func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution) int64 
 	return h.config.Chunking.Adaptive.AbsoluteMax
 }
 
+// stagedBlockBucketSlack is added to each bucket's cap so an even hash
+// distribution that lands a few extra blocks in one bucket does not reject a
+// legitimate file near the ceiling. The total bound stays
+// B × (perBucket + slack) × blockSize.
+const stagedBlockBucketSlack = 2
+
+// stagedBlockBucketCap returns the per-bucket staged-block cap for the session
+// flow and whether the per-session cap is enabled. maxBlocks is the ceiling
+// (EffectiveMaxStagedBytesPerSession) divided by the CAS block size; it is spread
+// across BlockUploadStagedBlockBuckets buckets so per-block admission reads only
+// one small bucket. enabled=false when the config disables the per-session cap
+// (or config is missing), meaning no ledger check runs.
+func (h *BlockHandler) stagedBlockBucketCap() (int, bool) {
+	if h.config == nil || h.db == nil {
+		return 0, false
+	}
+	ceiling := h.config.EffectiveMaxStagedBytesPerSession()
+	blockSize := h.config.WebBlockUploadBlockSize()
+	if ceiling <= 0 || blockSize <= 0 {
+		return 0, false
+	}
+	maxBlocks := (ceiling + blockSize - 1) / blockSize
+	buckets := int64(db.BlockUploadStagedBlockBuckets)
+	perBucket := (maxBlocks + buckets - 1) / buckets
+	return int(perBucket) + stagedBlockBucketSlack, true
+}
+
 // tryAdmitSessionUpload enforces the per-user concurrency cap for the web
 // (session) flow. For a valid session it reserves a slot keyed by
 // "org_id:user_id"; if the user is already at the cap it emits 429 + Retry-After
@@ -854,6 +881,34 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
+	// Session (web) flow: per-session staged-block admission (item 1). This block
+	// is NEW (it did not exist above), so reserve a ledger slot BEFORE storing it
+	// (reserve-before-PUT, fail-closed): if the session's bucket is already at its
+	// cap, reject; otherwise record the reservation and proceed. The reserve is
+	// idempotent by (session, bucket, block_id) — a retried block never
+	// double-counts — and self-expires with the session TTL (no Cassandra COUNTER).
+	// If the PUT below fails after the reserve, the row lingers and TTL reclaims it.
+	if resolution == uploadSessionValid {
+		if bucketCap, enabled := h.stagedBlockBucketCap(); enabled {
+			bucket := db.StagedBlockBucket(hash)
+			staged, err := h.db.CountSessionStagedBlocksInBucket(session.SessionID, bucket, bucketCap+1)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
+				return
+			}
+			if staged >= bucketCap {
+				metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusTooManyRequests, gin.H{"error": "session staging limit reached; commit the file or start a new upload"})
+				return
+			}
+			if err := h.db.ReserveSessionStagedBlock(session.SessionID, bucket, hash, int64(len(data))); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reserve staged block"})
+				return
+			}
+		}
+	}
+
 	// Logical storage quota is NOT applied per block in the session (web) flow.
 	// R5: the user's repo/storage quota is a property of the FINAL file delta and
 	// is decided exactly once at file-from-blocks (finalizeStoredUploadMetadata) —
@@ -861,12 +916,12 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// it here would wrongly reject e.g. a same-size overwrite (logical delta ≈ 0)
 	// at the first new block. Traffic is still charged per block (above).
 	//
-	// NOTE: this is NOT a staging-bytes cap. CheckStorageQuota is a LOGICAL quota
-	// (it reads storage_used/quota counters, not physical staging). The legacy
-	// no-session path below keeps running it per block only because it predates
-	// this flow. Neither path bounds total uncommitted staged bytes; for the web
-	// flow that is bounded instead by the upload traffic quota (charged above) and
-	// the 48h provisional-ref TTL + GC. See docs/WEB-BLOCK-UPLOAD.md.
+	// NOTE: this is NOT the LOGICAL quota. CheckStorageQuota reads
+	// storage_used/quota counters, not physical staging. Total uncommitted staged
+	// bytes ARE now bounded for the session flow by the per-session staged-block
+	// ledger above (item 1) plus the per-user session cap; the legacy no-session
+	// path below keeps its own per-block logical check because it predates this
+	// flow. See docs/WEB-BLOCK-UPLOAD.md.
 	if resolution != uploadSessionValid {
 		if checker := traffic.GetChecker(); checker != nil {
 			if st, _ := checker.CheckStorageQuota(c.GetString("org_id"), c.GetString("user_id"), int64(len(data))); !st.Allowed {

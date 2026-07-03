@@ -38,35 +38,100 @@ type BlockUploadSession struct {
 	ResultPath     string
 	ResultFilename string
 	ResultCommitID string
+	// Slot is the per-user concurrency slot this session claimed at creation
+	// (0..cap-1), or -1 when the per-user session cap is disabled. Stored so
+	// commit cleanup frees the exact slot without scanning. See item 1 in
+	// docs/WEB-BLOCK-UPLOAD.md.
+	Slot int
+	// ExpectedSize is the client-declared file size, validated against the
+	// per-session ceiling at creation (fail-fast) and re-checked against the
+	// manifest at commit. 0 when the client did not declare a size.
+	ExpectedSize int64
 }
 
-// CreateBlockUploadSession mints a new server-issued session bound to the
-// caller's (org, user, repo). The random 256-bit SessionID is unguessable so it
-// cannot be reused or collided across users. The row carries a TTL so an
-// abandoned session self-expires.
-func (db *DB) CreateBlockUploadSession(orgID, userID, repoID, parentDir string) (BlockUploadSession, error) {
+// ErrBlockUploadSessionSlotsExhausted is returned by CreateAdmittedBlockUploadSession
+// when the caller already holds the maximum number of concurrent uncommitted
+// block-upload sessions (all per-user slots claimed). The API maps it to 429.
+var ErrBlockUploadSessionSlotsExhausted = errors.New("block upload session slots exhausted")
+
+// CreateAdmittedBlockUploadSession mints a new server-issued session bound to the
+// caller's (org, user, repo), enforcing the per-user concurrent-session cap
+// atomically. The whole admission + creation lives here so a caller can never
+// leave block_upload_session_slots_by_user and block_upload_sessions out of sync.
+//
+// When cap > 0, a slot 0..cap-1 is claimed via a Cassandra LWT
+// (INSERT ... IF NOT EXISTS); if every slot is taken it returns
+// ErrBlockUploadSessionSlotsExhausted (Paxos runs only here, at session creation
+// — never per block). cap <= 0 disables the cap (slot = -1). expectedSize is the
+// client-declared file size (0 if none). The session row and its slot both carry
+// the session TTL so an abandoned session self-expires.
+func (db *DB) CreateAdmittedBlockUploadSession(orgID, userID, repoID, parentDir string, expectedSize int64, cap int) (BlockUploadSession, error) {
 	idBytes := make([]byte, 32)
 	if _, err := rand.Read(idBytes); err != nil {
 		return BlockUploadSession{}, fmt.Errorf("generate block upload session id: %w", err)
 	}
 	now := time.Now().UTC()
 	s := BlockUploadSession{
-		SessionID: hex.EncodeToString(idBytes),
-		OrgID:     orgID,
-		UserID:    userID,
-		RepoID:    repoID,
-		ParentDir: parentDir,
-		CreatedAt: now,
-		ExpiresAt: now.Add(BlockUploadSessionTTLSeconds * time.Second),
+		SessionID:    hex.EncodeToString(idBytes),
+		OrgID:        orgID,
+		UserID:       userID,
+		RepoID:       repoID,
+		ParentDir:    parentDir,
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(BlockUploadSessionTTLSeconds * time.Second),
+		Slot:         -1,
+		ExpectedSize: expectedSize,
 	}
+
+	if cap > 0 {
+		slot, ok, err := db.claimBlockUploadSessionSlot(orgID, userID, s.SessionID, cap, now)
+		if err != nil {
+			return BlockUploadSession{}, err
+		}
+		if !ok {
+			return BlockUploadSession{}, ErrBlockUploadSessionSlotsExhausted
+		}
+		s.Slot = slot
+	}
+
 	if err := db.Session().Query(`
 		INSERT INTO block_upload_sessions
-			(session_id, org_id, user_id, repo_id, parent_dir, created_at, expires_at, committed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?
-	`, s.SessionID, s.OrgID, s.UserID, s.RepoID, s.ParentDir, s.CreatedAt, s.ExpiresAt, false, BlockUploadSessionTTLSeconds).Exec(); err != nil {
+			(session_id, org_id, user_id, repo_id, parent_dir, created_at, expires_at, committed, slot, expected_size)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?
+	`, s.SessionID, s.OrgID, s.UserID, s.RepoID, s.ParentDir, s.CreatedAt, s.ExpiresAt, false, s.Slot, s.ExpectedSize, BlockUploadSessionTTLSeconds).Exec(); err != nil {
+		// Roll back the claimed slot best-effort so a failed insert does not leak
+		// a slot for the whole TTL.
+		if s.Slot >= 0 {
+			_ = db.releaseBlockUploadSessionSlot(orgID, userID, s.Slot)
+		}
 		return BlockUploadSession{}, fmt.Errorf("insert block upload session: %w", err)
 	}
 	return s, nil
+}
+
+// claimBlockUploadSessionSlot tries slots 0..cap-1 with an LWT INSERT IF NOT
+// EXISTS (TTL-bound). Returns the first slot it wins; ok=false when all are taken.
+func (db *DB) claimBlockUploadSessionSlot(orgID, userID, sessionID string, cap int, now time.Time) (int, bool, error) {
+	for slot := 0; slot < cap; slot++ {
+		m := make(map[string]interface{})
+		applied, err := db.Session().Query(`
+			INSERT INTO block_upload_session_slots_by_user (org_id, user_id, slot, session_id, created_at)
+			VALUES (?, ?, ?, ?, ?) IF NOT EXISTS USING TTL ?
+		`, orgID, userID, slot, sessionID, now, BlockUploadSessionTTLSeconds).MapScanCAS(m)
+		if err != nil {
+			return 0, false, fmt.Errorf("claim block upload session slot %d: %w", slot, err)
+		}
+		if applied {
+			return slot, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func (db *DB) releaseBlockUploadSessionSlot(orgID, userID string, slot int) error {
+	return db.Session().Query(`
+		DELETE FROM block_upload_session_slots_by_user WHERE org_id = ? AND user_id = ? AND slot = ?
+	`, orgID, userID, slot).Exec()
 }
 
 // GetBlockUploadSession reads a session by id. ok=false when the row is missing
@@ -75,11 +140,12 @@ func (db *DB) GetBlockUploadSession(sessionID string) (BlockUploadSession, bool,
 	var s BlockUploadSession
 	err := db.Session().Query(`
 		SELECT session_id, org_id, user_id, repo_id, parent_dir, created_at, expires_at,
-		       committed, manifest_digest, result_path, result_filename, result_commit_id
+		       committed, manifest_digest, result_path, result_filename, result_commit_id,
+		       slot, expected_size
 		FROM block_upload_sessions WHERE session_id = ?
 	`, sessionID).Scan(&s.SessionID, &s.OrgID, &s.UserID, &s.RepoID, &s.ParentDir,
 		&s.CreatedAt, &s.ExpiresAt, &s.Committed, &s.ManifestDigest,
-		&s.ResultPath, &s.ResultFilename, &s.ResultCommitID)
+		&s.ResultPath, &s.ResultFilename, &s.ResultCommitID, &s.Slot, &s.ExpectedSize)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return BlockUploadSession{}, false, nil
@@ -98,11 +164,12 @@ func (db *DB) MarkBlockUploadSessionCommitted(s BlockUploadSession, manifestDige
 	if err := db.Session().Query(`
 		INSERT INTO block_upload_sessions
 			(session_id, org_id, user_id, repo_id, parent_dir, created_at, expires_at,
-			 committed, manifest_digest, result_path, result_filename, result_commit_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?
+			 committed, manifest_digest, result_path, result_filename, result_commit_id,
+			 slot, expected_size)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?
 	`, s.SessionID, s.OrgID, s.UserID, s.RepoID, s.ParentDir, s.CreatedAt, expiresAt,
 		true, manifestDigest, resultPath, resultFilename, resultCommitID,
-		BlockUploadSessionTTLSeconds).Exec(); err != nil {
+		s.Slot, s.ExpectedSize, BlockUploadSessionTTLSeconds).Exec(); err != nil {
 		return fmt.Errorf("mark block upload session committed: %w", err)
 	}
 	return nil

@@ -1450,3 +1450,46 @@ func TestS3OverrideNoHotBackend(t *testing.T) {
 		t.Error("S3_BUCKET should not create 'hot' backend if it doesn't exist")
 	}
 }
+
+// TestEffectiveMaxStagedBytesPerSession covers the per-session staging ceiling
+// derivation (docs/WEB-BLOCK-UPLOAD.md item 1): explicit MB, derive-from-max-file,
+// unlimited-max-file fallback, and disabled.
+func TestEffectiveMaxStagedBytesPerSession(t *testing.T) {
+	const mb = int64(1024 * 1024)
+
+	t.Run("explicit MB wins", func(t *testing.T) {
+		c := DefaultConfig()
+		c.WebUploads.MaxStagedBytesPerSessionMB = 500
+		if got := c.EffectiveMaxStagedBytesPerSession(); got != 500*mb {
+			t.Fatalf("got %d, want %d", got, 500*mb)
+		}
+	})
+
+	t.Run("derive from max file size x1.25", func(t *testing.T) {
+		c := DefaultConfig()
+		c.WebUploads.MaxStagedBytesPerSessionMB = 0
+		c.WebUploads.MaxFileSizeMB = 1000
+		want := 1000 * mb * 5 / 4
+		if got := c.EffectiveMaxStagedBytesPerSession(); got != want {
+			t.Fatalf("got %d, want %d (max file x1.25)", got, want)
+		}
+	})
+
+	t.Run("unlimited max file size falls back to the documented default", func(t *testing.T) {
+		c := DefaultConfig()
+		c.WebUploads.MaxStagedBytesPerSessionMB = 0
+		c.WebUploads.MaxFileSizeMB = 0
+		c.Server.MaxUploadMB = 0 // ResolvedMaxFileSizeMB -> 0 (unlimited)
+		if got := c.EffectiveMaxStagedBytesPerSession(); got != DefaultMaxStagedBytesPerSession {
+			t.Fatalf("got %d, want fallback %d", got, DefaultMaxStagedBytesPerSession)
+		}
+	})
+
+	t.Run("negative disables", func(t *testing.T) {
+		c := DefaultConfig()
+		c.WebUploads.MaxStagedBytesPerSessionMB = -1
+		if got := c.EffectiveMaxStagedBytesPerSession(); got != 0 {
+			t.Fatalf("got %d, want 0 (disabled)", got)
+		}
+	})
+}

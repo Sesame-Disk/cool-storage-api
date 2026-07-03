@@ -647,7 +647,7 @@ export async function uploadFileViaBlocks(file, {
 
   // 1. Server-issued session.
   const sessionResp = await withControlPlaneRetry(
-    () => api.createBlockUploadSession(repoID, parentDir, ctrlConfig),
+    () => api.createBlockUploadSession(repoID, parentDir, file && file.size, ctrlConfig),
     controlPlaneRetries,
     { signal, baseMs: controlPlaneRetryBaseMs },
   );
