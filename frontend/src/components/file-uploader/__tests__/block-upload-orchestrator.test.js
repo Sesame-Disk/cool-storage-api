@@ -122,6 +122,7 @@ describe('uploadFileViaBlocks', () => {
   });
 
   test('retries /blocks/check on a transient 502 without re-hashing', async () => {
+    const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0);
     let checkCalls = 0;
     const api = {
       createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's', block_size: 10 } }),
@@ -139,12 +140,16 @@ describe('uploadFileViaBlocks', () => {
     };
     const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
 
-    await uploadFileViaBlocks(makeFile(10), {
-      repoID: 'r', api, hashFn, blockSize: 10, controlPlaneRetryBaseMs: 1,
-    });
+    try {
+      await uploadFileViaBlocks(makeFile(10), {
+        repoID: 'r', api, hashFn, blockSize: 10, controlPlaneRetryBaseMs: 1,
+      });
 
-    expect(checkCalls).toBe(2);
-    expect(hashFn).toHaveBeenCalledTimes(1);
+      expect(checkCalls).toBe(2);
+      expect(hashFn).toHaveBeenCalledTimes(1);
+    } finally {
+      randomSpy.mockRestore();
+    }
   });
 
   test('retries the commit on "commit still in progress" with backoff until the idempotent result', async () => {

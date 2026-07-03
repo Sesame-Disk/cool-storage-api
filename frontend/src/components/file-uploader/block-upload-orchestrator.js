@@ -401,26 +401,50 @@ async function withRetry(fn, attempts, { signal } = {}) {
   throw lastErr;
 }
 
-function buildHashPlanCache(blocks, size, blockSize) {
+function buildFileFingerprint(file) {
+  if (!file) {
+    return null;
+  }
+  return {
+    name: String(file.name || ''),
+    lastModified: Number(file.lastModified) || 0,
+    relativePath: String(file.relativePath || file.webkitRelativePath || ''),
+  };
+}
+
+function buildHashPlanCache(blocks, size, blockSize, file) {
   const blockIndexByHash = {};
   blocks.forEach((b) => { blockIndexByHash[b.sha256] = b.index; });
   return {
     blockSize,
     size,
     blocks,
+    fileFingerprint: buildFileFingerprint(file),
     blockIndexByHash,
     uniqueHashes: Array.from(new Set(blocks.map((b) => b.sha256))),
   };
 }
 
-function restoreHashPlanFromCache(hashCache, fileSize, blockSize) {
+function sameFileFingerprint(expected, actual) {
+  if (!expected || !actual) {
+    return true;
+  }
+  return expected.name === actual.name
+    && expected.lastModified === actual.lastModified
+    && expected.relativePath === actual.relativePath;
+}
+
+function restoreHashPlanFromCache(hashCache, file, blockSize) {
   if (!hashCache || !Array.isArray(hashCache.blocks) || !Array.isArray(hashCache.uniqueHashes)) {
     return null;
   }
-  if (hashCache.size !== fileSize || hashCache.blockSize !== blockSize) {
+  if (hashCache.size !== file.size || hashCache.blockSize !== blockSize) {
     return null;
   }
   if (!hashCache.blockIndexByHash || typeof hashCache.blockIndexByHash !== 'object') {
+    return null;
+  }
+  if (!sameFileFingerprint(hashCache.fileFingerprint, buildFileFingerprint(file))) {
     return null;
   }
   return {
@@ -635,13 +659,16 @@ export async function uploadFileViaBlocks(file, {
   let size;
   let blockIndexByHash;
   let uniqueHashes;
-  const cachedHashPlan = restoreHashPlanFromCache(hashCache, file.size, blockSize);
+  const cachedHashPlan = restoreHashPlanFromCache(hashCache, file, blockSize);
   if (cachedHashPlan) {
     ({ blocks, size, blockIndexByHash, uniqueHashes } = cachedHashPlan);
+    if (onHashProgress && size > 0) {
+      onHashProgress(size, size);
+    }
   } else {
     emitPhase('hashing');
     const hashed = await hashFn(file, { blockSize, onProgress: onHashProgress, signal });
-    const nextHashCache = buildHashPlanCache(hashed.blocks, hashed.size, blockSize);
+    const nextHashCache = buildHashPlanCache(hashed.blocks, hashed.size, blockSize, file);
     ({ blocks, size, blockIndexByHash, uniqueHashes } = nextHashCache);
     if (onHashCache) {
       onHashCache(nextHashCache);

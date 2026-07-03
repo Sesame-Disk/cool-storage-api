@@ -202,6 +202,40 @@ func TestSessionIDFromRequest(t *testing.T) {
 	}
 }
 
+func TestCheckBlocks_SessionValidationUnavailable(t *testing.T) {
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(func(c *gin.Context) {
+		c.Set("org_id", "org-1")
+		c.Set("user_id", "user-1")
+		c.Next()
+	})
+
+	h := &BlockHandler{
+		db:     nil,
+		config: &config.Config{WebUploads: config.WebUploadsConfig{EnableWebBlockUpload: true}},
+	}
+	r.POST("/api/v2/blocks/check", h.CheckBlocks)
+
+	body := CheckBlocksRequest{Hashes: []string{strings.Repeat("a", 64)}}
+	jsonBody, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Block-Upload-Session", "sess-unavailable")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "upload session unavailable" {
+		t.Errorf("error = %v, want 'upload session unavailable'", resp["error"])
+	}
+}
+
 // finding 12: sessionPermissionCache must skip re-verification within the
 // interval, always re-verify once it elapses, and never cache a denial (so a
 // permission fix takes effect on the very next request instead of waiting out

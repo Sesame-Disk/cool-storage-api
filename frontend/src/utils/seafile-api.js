@@ -71,7 +71,13 @@ function setupResponseInterceptor() {
         // Avoid redirect loops: only redirect if not already on login page.
         if (window.location.pathname !== '/login/' && window.location.pathname !== '/login') {
           redirectToLogin('expired');
-          // Return a pending promise to prevent further .catch() handling
+          // Long-running flows like block upload must still see the rejection so
+          // they can leave "Checking..." / "Saving..." instead of hanging on an
+          // unresolved promise.
+          if (error.config && error.config._propagate401) {
+            return Promise.reject(error);
+          }
+          // Preserve the legacy "redirect and swallow" behavior everywhere else.
           return new Promise(() => { });
         }
       }
@@ -1440,7 +1446,7 @@ seafileAPI.shareLinksUploadDone = function (token) {
 // Mint a server-issued upload session bound to (org, user, repo).
 seafileAPI.createBlockUploadSession = function (repoID, parentDir, config) {
   let url = this.server + '/api/v2/repos/' + repoID + '/block-upload-session/';
-  return this.req.post(url, { parent_dir: parentDir }, config);
+  return this.req.post(url, { parent_dir: parentDir }, withBlockUploadAuthHandling(config));
 };
 
 // Ask which of the given SHA-256 block hashes still need to be uploaded.
@@ -1453,7 +1459,7 @@ seafileAPI.createBlockUploadSession = function (repoID, parentDir, config) {
 // legacy ?session= transport explicitly.
 seafileAPI.checkBlocks = function (hashes, session, config) {
   let url = this.server + '/api/v2/blocks/check';
-  const requestConfig = withBlockUploadSessionHeader(config, session);
+  const requestConfig = withBlockUploadSessionHeader(withBlockUploadAuthHandling(config), session);
   return this.req.post(url, { hashes: hashes }, requestConfig);
 };
 
@@ -1461,7 +1467,7 @@ seafileAPI.checkBlocks = function (hashes, session, config) {
 // and verifies the SHA-256. Under a session the block is also materialized.
 seafileAPI.uploadBlock = function (session, hash, data, config) {
   let url = this.server + '/api/v2/blocks/upload';
-  const requestConfig = withBlockUploadSessionHeader(config, session);
+  const requestConfig = withBlockUploadSessionHeader(withBlockUploadAuthHandling(config), session);
   const options = Object.assign({}, requestConfig, {
     headers: Object.assign({}, requestConfig.headers || {}, {
       'Content-Type': 'application/octet-stream',
@@ -1470,6 +1476,10 @@ seafileAPI.uploadBlock = function (session, hash, data, config) {
   });
   return this.req.post(url, data, options);
 };
+
+function withBlockUploadAuthHandling(config) {
+  return Object.assign({}, config || {}, { _propagate401: true });
+}
 
 // withBlockUploadSessionHeader merges the X-Block-Upload-Session header into an
 // axios config without mutating the caller's object.
@@ -1489,7 +1499,7 @@ function withBlockUploadSessionHeader(config, session) {
 // manifest = { session, parent_dir, filename, replace, size, blocks:[{sha256,size}] }
 seafileAPI.createFileFromBlocks = function (repoID, manifest, config) {
   let url = this.server + '/api/v2/repos/' + repoID + '/file-from-blocks/';
-  return this.req.post(url, manifest, config);
+  return this.req.post(url, manifest, withBlockUploadAuthHandling(config));
 };
 
 // ============================================================================
