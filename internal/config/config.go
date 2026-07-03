@@ -54,9 +54,16 @@ type WebUploadsConfig struct {
 	// the single source of truth: it is echoed in the block-upload-session response
 	// and the web client hashes/slices to it instead of hardcoding a size.
 	WebBlockUploadBlockSizeMB int64 `yaml:"web_block_upload_block_size_mb"`
-	MaxFileSizeMB             int64 `yaml:"max_file_size_mb"`
-	MaxFilesPerBatch          int   `yaml:"max_files_per_batch"`
-	SimultaneousUploads       int   `yaml:"simultaneous_uploads"`
+	// MaxConcurrentBlockUploadsPerUser caps how many concurrent session-mode
+	// /blocks/upload requests a single user may have in flight at once. Each such
+	// request buffers a whole block (up to chunking.adaptive.absolute_max, ~8–16 MB)
+	// in memory, so this bounds the instantaneous RAM one authenticated user can
+	// force the server to hold — an anti-abuse backstop, not the staging-bytes cap.
+	// A value <= 0 disables the cap (unlimited). See docs/WEB-BLOCK-UPLOAD.md item 18.
+	MaxConcurrentBlockUploadsPerUser int   `yaml:"max_concurrent_block_uploads_per_user"`
+	MaxFileSizeMB                    int64 `yaml:"max_file_size_mb"`
+	MaxFilesPerBatch                 int   `yaml:"max_files_per_batch"`
+	SimultaneousUploads              int   `yaml:"simultaneous_uploads"`
 }
 
 // ResolvedMaxFileSizeMB returns the effective browser upload file-size cap.
@@ -730,13 +737,14 @@ func DefaultConfig() *Config {
 			},
 		},
 		WebUploads: WebUploadsConfig{
-			EnableUploadFolder:        true,
-			EnableResumableFileUpload: true,
-			ResumableChunkSizeMB:      8,
-			WebBlockUploadBlockSizeMB: 8,
-			MaxFileSizeMB:             0,
-			MaxFilesPerBatch:          1000,
-			SimultaneousUploads:       1,
+			EnableUploadFolder:               true,
+			EnableResumableFileUpload:        true,
+			ResumableChunkSizeMB:             8,
+			WebBlockUploadBlockSizeMB:        8,
+			MaxConcurrentBlockUploadsPerUser: 16,
+			MaxFileSizeMB:                    0,
+			MaxFilesPerBatch:                 1000,
+			SimultaneousUploads:              1,
 		},
 		Billing: BillingConfig{},
 		Accounts: AccountsConfig{
@@ -1057,6 +1065,13 @@ func (c *Config) applyEnvOverrides() {
 			c.addEnvOverrideError("WEB_UPLOADS_SIMULTANEOUS_UPLOADS must be an integer, got %q", v)
 		} else {
 			c.WebUploads.SimultaneousUploads = i
+		}
+	}
+	if v := os.Getenv("WEB_UPLOADS_MAX_CONCURRENT_BLOCK_UPLOADS_PER_USER"); v != "" {
+		if i, err := strconv.Atoi(strings.TrimSpace(v)); err != nil {
+			c.addEnvOverrideError("WEB_UPLOADS_MAX_CONCURRENT_BLOCK_UPLOADS_PER_USER must be an integer, got %q", v)
+		} else {
+			c.WebUploads.MaxConcurrentBlockUploadsPerUser = i
 		}
 	}
 

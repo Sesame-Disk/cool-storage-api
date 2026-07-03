@@ -672,3 +672,132 @@ func TestRegisterBlockRoutes(t *testing.T) {
 		}
 	}
 }
+
+// TestBlockUploadConcurrencyLimiter covers the pure per-user in-flight cap logic
+// (item 18): acquire up to max, reject at max, release frees a slot, the key is
+// deleted at zero (map self-cleans), and max <= 0 disables the cap.
+func TestBlockUploadConcurrencyLimiter(t *testing.T) {
+	t.Run("caps per user and frees on release", func(t *testing.T) {
+		l := newBlockUploadConcurrencyLimiter(2)
+		const user = "org1:userA"
+
+		if !l.tryAcquire(user) {
+			t.Fatal("first acquire should succeed")
+		}
+		if !l.tryAcquire(user) {
+			t.Fatal("second acquire should succeed (at cap)")
+		}
+		if l.tryAcquire(user) {
+			t.Fatal("third acquire should be rejected (over cap)")
+		}
+
+		// A different user has an independent budget.
+		if !l.tryAcquire("org1:userB") {
+			t.Fatal("a different user should not be affected by userA's cap")
+		}
+
+		// Releasing one slot lets the next acquire through.
+		l.release(user)
+		if !l.tryAcquire(user) {
+			t.Fatal("acquire after release should succeed")
+		}
+	})
+
+	t.Run("key is deleted when the count returns to zero", func(t *testing.T) {
+		l := newBlockUploadConcurrencyLimiter(3)
+		const user = "org1:userA"
+		l.tryAcquire(user)
+		l.tryAcquire(user)
+		l.release(user)
+		l.release(user)
+
+		l.mu.Lock()
+		_, present := l.inflight[user]
+		l.mu.Unlock()
+		if present {
+			t.Fatal("key should be deleted from the map once its count is zero (self-cleaning)")
+		}
+	})
+
+	t.Run("max <= 0 disables the cap", func(t *testing.T) {
+		for _, max := range []int{0, -1} {
+			l := newBlockUploadConcurrencyLimiter(max)
+			for i := 0; i < 100; i++ {
+				if !l.tryAcquire("org1:userA") {
+					t.Fatalf("max=%d should disable the cap; acquire %d was rejected", max, i)
+				}
+			}
+			l.mu.Lock()
+			n := len(l.inflight)
+			l.mu.Unlock()
+			if n != 0 {
+				t.Fatalf("disabled limiter should not record in-flight entries, got %d", n)
+			}
+		}
+	})
+
+	t.Run("nil limiter is a no-op that always admits", func(t *testing.T) {
+		var l *blockUploadConcurrencyLimiter
+		if !l.tryAcquire("org1:userA") {
+			t.Fatal("nil limiter should always admit")
+		}
+		l.release("org1:userA") // must not panic
+	})
+}
+
+// TestUploadBlockPerUserConcurrencyCap covers the handler wiring: a session-mode
+// upload is admitted until the user's cap is full, then rejected with 429 +
+// Retry-After, while a non-session (legacy) request is never capped.
+func TestUploadBlockPerUserConcurrencyCap(t *testing.T) {
+	newCtx := func() (*gin.Context, *httptest.ResponseRecorder) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/v2/blocks/upload", nil)
+		c.Set("org_id", "org1")
+		c.Set("user_id", "userA")
+		return c, w
+	}
+
+	t.Run("session mode rejects over the cap with 429 + Retry-After", func(t *testing.T) {
+		h := &BlockHandler{uploadLimiter: newBlockUploadConcurrencyLimiter(1)}
+
+		c1, _ := newCtx()
+		release, ok := h.tryAdmitSessionUpload(c1, uploadSessionValid)
+		if !ok {
+			t.Fatal("first session upload should be admitted")
+		}
+
+		c2, w2 := newCtx()
+		_, ok = h.tryAdmitSessionUpload(c2, uploadSessionValid)
+		if ok {
+			t.Fatal("second concurrent session upload should be rejected at the cap")
+		}
+		if w2.Code != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want %d", w2.Code, http.StatusTooManyRequests)
+		}
+		if got := w2.Header().Get("Retry-After"); got == "" {
+			t.Fatal("expected a Retry-After header on the 429")
+		}
+
+		// Releasing the first slot lets a later upload through again.
+		release()
+		c3, _ := newCtx()
+		if _, ok := h.tryAdmitSessionUpload(c3, uploadSessionValid); !ok {
+			t.Fatal("upload after release should be admitted")
+		}
+	})
+
+	t.Run("non-session (legacy) uploads are never capped", func(t *testing.T) {
+		h := &BlockHandler{uploadLimiter: newBlockUploadConcurrencyLimiter(1)}
+		for i := 0; i < 5; i++ {
+			c, w := newCtx()
+			_, ok := h.tryAdmitSessionUpload(c, uploadSessionAbsent)
+			if !ok {
+				t.Fatalf("legacy no-session upload %d should never be capped", i)
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("legacy path should not write an error status, got %d", w.Code)
+			}
+		}
+	})
+}

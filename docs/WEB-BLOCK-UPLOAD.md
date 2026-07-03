@@ -328,7 +328,9 @@ re-upload).
   would need client-side encryption before hashing.
 - **Public share/upload links are out of scope**: they have no authenticated
   session token, so they cannot mint a block-upload session. They keep restarting
-  from zero. A signed-session variant would be a separate design.
+  from zero. A signed-session variant would be a separate design — tracked as a
+  forward-looking item in `## Remaining work` (extend the block-upload flow to the
+  share-link / upload-link surfaces).
 - **`GetFileUploadedBytes` remains a safe stub returning 0.** Real resume is now
   provided by `/blocks/check`; the old endpoint is kept only for the legacy
   frontend path.
@@ -1099,16 +1101,30 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
     request with `400 hashes[i]: invalid sha256` before any metadata/object-store
     work, aligning the cheap preflight check with the commit's manifest hygiene.
     Covered by `TestCheckBlocks_InvalidSHA256` in `internal/api/v2/blocks_test.go`.
-18. **[Perf/DoS — pending] `UploadBlock` buffers the whole block in memory**
-    (`io.ReadAll` up to `Chunking.Adaptive.AbsoluteMax`) with no per-user cap on
-    concurrent `/blocks/upload` requests. At 8–16 MB per in-flight request this
-    is fine at normal load, but nothing bounds how many concurrent uploads one
-    user can have in flight, so a burst is real RAM pressure under abuse. This is
-    a different axis from item 1 (item 1 bounds total *staged, uncommitted*
-    bytes over time; this is instantaneous per-request memory) — the staging-
-    bytes cap would not by itself fix it. Cheap follow-up: a per-user/session
-    concurrency cap on `/blocks/upload`, or stream-to-temp-file instead of
-    buffering in RAM for blocks above a threshold.
+18. **[RESOLVED, PR `fix/block-upload-per-user-concurrency-cap`] Per-user
+    concurrency cap on session-mode `/blocks/upload`.** `UploadBlock` buffers the
+    whole block in memory (`io.ReadAll` up to `Chunking.Adaptive.AbsoluteMax`), and
+    previously nothing bounded how many concurrent uploads one user could have in
+    flight, so a burst was real RAM pressure under abuse. A per-process
+    `blockUploadConcurrencyLimiter` (keyed by `org_id:user_id`, self-cleaning map,
+    same pattern as `sessionPermissionCache`) now caps the number of concurrent
+    **session-mode** `/blocks/upload` requests a single user may hold. The slot is
+    acquired **before** `io.ReadAll`, so a rejected request never allocates the
+    ~8–16 MB buffer — this is what bounds a user's instantaneous memory footprint.
+    Over the cap returns `429 Too Many Requests` + `Retry-After`; the web client's
+    `withRetry` loop backs off and re-sends, so legitimate bursts self-throttle
+    instead of failing. The limit is
+    `web_uploads.max_concurrent_block_uploads_per_user`
+    (env `WEB_UPLOADS_MAX_CONCURRENT_BLOCK_UPLOADS_PER_USER`, default `16` ≈
+    128–256 MB resident per user; `<= 0` disables). The legacy no-session path is
+    intentionally **not** capped (trusted sync clients with their own admission).
+    Rejections are counted by `block_upload_concurrency_rejections_total`. This is
+    a **different axis** from item 1 (item 1 bounds total *staged, uncommitted*
+    bytes over time; this is instantaneous per-request memory — the staging-bytes
+    cap would not by itself fix it). Covered by `TestBlockUploadConcurrencyLimiter`
+    and `TestUploadBlockPerUserConcurrencyCap` in
+    `internal/api/v2/blocks_test.go`. Residual option, if per-request block size
+    ever grows well beyond 16 MB: stream-to-temp-file instead of buffering in RAM.
 
 ## Remaining work
 
@@ -1120,9 +1136,21 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
   residual cleanup.
 - Clear the prod-readiness checklist above before enabling
   `enable_web_block_upload` in production — items 1 (staging-bytes cap), 2
-  (idempotency reconstruction on sustained outage), 4 (browser E2E), and 17
-  (per-request memory/concurrency cap) remain open; items 3, 8, 9, and 12 are
-  now resolved.
+  (idempotency reconstruction on sustained outage), and 4 (browser E2E) remain
+  open; items 3, 8, 9, 12, 17, and 18 are now resolved.
+- **Extend the block-upload flow to the other frontend upload surfaces — share
+  links and public upload links.** Today only the authenticated in-app uploader
+  routes eligible files through the CAS (block) flow; share-link and upload-link
+  uploads (`/u/d/…` and the public upload-link pages) still fall back entirely to
+  the legacy resumable path because they have no authenticated session token and
+  therefore cannot mint a block-upload session (see the "Public share/upload
+  links are out of scope" limitation above). Bringing resume + dedup + parity
+  throughput to those surfaces needs a **signed/scoped-session variant**: a
+  server-minted, link-scoped session token (bound to the share/upload link's repo
+  + target dir + its own TTL and permission checks) that `/blocks/check`,
+  `/blocks/upload`, and `file-from-blocks` accept in place of the user-auth
+  session, without widening the block endpoints into an unauthenticated oracle.
+  A separate design + PR; not part of phase 1.
 - **"metadata present but S3 object deleted"** is handled (commit verifies physical
   presence via `CheckBlocksParallel` → `needs_upload`); an automated test for it
   needs direct MinIO object deletion and is not yet added.

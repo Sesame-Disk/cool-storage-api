@@ -136,6 +136,7 @@ web_uploads:
   max_file_size_mb: 0                  # 0 = use server.max_upload_mb for the browser limit
   max_files_per_batch: 1000            # 0 = unlimited files selectable in one batch
   simultaneous_uploads: 1              # Max parallel browser upload slots; the adaptive client starts at 1 and only ramps up to this ceiling on stable networks
+  max_concurrent_block_uploads_per_user: 16  # Anti-abuse cap on concurrent session-mode /blocks/upload per user (each buffers a block in RAM); <=0 disables
 
 auth:
   dev_mode: false                     # Enable only for local development with explicit test tokens
