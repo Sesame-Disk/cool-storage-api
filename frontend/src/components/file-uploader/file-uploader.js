@@ -201,7 +201,15 @@ class FileUploader extends React.Component {
 
   hasActiveUploadWork = () => {
     return this.state.isUploadProgressDialogShow
-      && this.state.uploadFileList.some(file => file && !file.isSaved && !file.error);
+      && this.hasPendingUploadEntries(this.state.uploadFileList);
+  };
+
+  hasPendingUploadEntries = (uploadFileList = this.state.uploadFileList) => {
+    return uploadFileList.some(file => (
+      file
+      && !file.isSaved
+      && !file.error
+    ));
   };
 
   hasUploadingEntries = (uploadFileList = this.state.uploadFileList) => {
@@ -264,7 +272,7 @@ class FileUploader extends React.Component {
 
   isUploading = () => {
     return Boolean(this.resumable && this.resumable.isUploading && this.resumable.isUploading())
-      || this.hasUploadingEntries();
+      || this.hasPendingUploadEntries();
   };
 
   cancelActiveUploads = (uploadFileList = this.state.uploadFileList) => {
@@ -1814,7 +1822,7 @@ class FileUploader extends React.Component {
     });
 
     const hasActiveUploads = Boolean(this.resumable && this.resumable.isUploading && this.resumable.isUploading())
-      || this.hasUploadingEntries(uploadFileList);
+      || this.hasPendingUploadEntries(uploadFileList);
 
     if (!hasActiveUploads) {
       this.loaded = 0;

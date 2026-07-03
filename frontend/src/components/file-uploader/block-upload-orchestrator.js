@@ -426,10 +426,8 @@ function buildHashPlanCache(blocks, size, blockSize, file) {
 }
 
 function sameFileFingerprint(expected, actual) {
-  if (!expected || !actual) {
-    return true;
-  }
-  return expected.name === actual.name
+  return Boolean(expected && actual)
+    && expected.name === actual.name
     && expected.lastModified === actual.lastModified
     && expected.relativePath === actual.relativePath;
 }

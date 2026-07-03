@@ -327,6 +327,24 @@ describe('FileUploader block upload integration', () => {
     expect(uploader.hasActiveUploadWork()).toBe(true);
   });
 
+  test('treats queued retry work as uploading work even before bytes start moving', () => {
+    const uploader = createUploader();
+    uploader.state.isUploadProgressDialogShow = true;
+    uploader.state.uploadFileList = [{
+      uniqueIdentifier: 'block-queued-1',
+      isSaved: false,
+      error: null,
+      _phase: 'queued',
+      progress: () => 0,
+      isUploading: () => false,
+    }];
+
+    expect(uploader.isUploading()).toBe(true);
+    expect(uploader.hasActiveUploadWork()).toBe(true);
+    expect(uploader.hasPendingUploadEntries()).toBe(true);
+    expect(uploader.hasUploadingEntries()).toBe(false);
+  });
+
   test('retries failed block uploads through the block flow instead of resumable bootstrap', () => {
     const uploader = createUploader();
     const blockEntry = {
