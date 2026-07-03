@@ -1,7 +1,7 @@
 # Web content-addressed (block) upload flow
 
-**Date:** 2026-06-22
-**Status:** Phase 1 implemented (backend + frontend) + post-review hardening.
+**Date:** 2026-07-03
+**Status:** Phase 1 implemented (backend + frontend) + post-review hardening + retry/hash-cache hardening.
 Gated OFF by default by a **server-side** flag (`web_uploads.enable_web_block_upload`
 / `WEB_UPLOADS_ENABLE_WEB_BLOCK_UPLOAD`); the frontend flag (`enableBlockUpload`) is
 driven from it via bootstrap. Encrypted libraries and public share/upload links
@@ -59,6 +59,18 @@ are out of scope for phase 1.
   overwrite (delta ≈ 0). Traffic is still charged per block, and the legacy
   no-session path keeps its per-block admission check (covered by an integration
   test).
+- **Retry no longer re-hashes a large file inside the same tab/session:** a
+  failed block upload still retries with a **fresh server session** and a fresh
+  authoritative `/blocks/check`, but the frontend now keeps the computed local
+  hash plan in memory and reuses it on manual `Retry` / `Retry All` when the
+  file size and the server-authoritative `block_size` still match. This avoids
+  burning CPU and disk reads to hash a multi-GB file again after a transient
+  network or proxy failure.
+- **Control-plane retries are bounded and explicit:** `block-upload-session`,
+  `/blocks/check`, and `file-from-blocks` now retry only the safe transient
+  cases (`502/503/504`, bounded request timeout, transient network failure),
+  with exponential backoff. This closes the "502 during check/commit forces a
+  full restart" gap without reusing a stale upload session.
 
 This is the implementation of **Option B** from
 [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md): the web
@@ -73,14 +85,18 @@ tracker.
 
 ```
 1. POST /api/v2/repos/:repo_id/block-upload-session/   → server-issued session_id
-2. client splits file into fixed 8 MB blocks, SHA-256 + SHA-1 each (Web Worker)
+2. client splits file into fixed 8 MB blocks, SHA-256 each (Web Worker)
 3. POST /api/v2/blocks/check + `X-Block-Upload-Session` → { existing, missing } (by SHA-256)
 4. POST /api/v2/blocks/upload + `X-Block-Upload-Session` (per missing) → store + materialize (SHA-256)
-5. POST /api/v2/repos/:repo_id/file-from-blocks/        → commit from dual-hash manifest
+5. POST /api/v2/repos/:repo_id/file-from-blocks/        → commit from ordered `{sha256, size}` manifest (server derives SHA-1)
 ```
 
 The resume state is the `missing` set recomputed by step 3 from shared storage —
 no offsets, no in-memory trackers, no sticky routing required.
+Within the **same browser tab/session**, a manual retry also reuses the already
+computed local hash plan when it is still valid for the server's `block_size`;
+after a full page reload there is still no persistent local manifest cache, so
+the file must be hashed again before `/blocks/check`.
 
 ### Key files
 
@@ -275,8 +291,10 @@ this implementation, including the file types that originally failed:
 1. Uploaded files through the web block flow with the feature flag enabled in dev
    (a ZIP and a MOV — the cases that previously broke — plus a large binary).
 2. Confirmed in the database that every committed `fs_objects.block_ids` entry is
-   a 40-hex SHA-1, and that its `sha1 → sha256` forward mapping resolves to the
-   real SHA-256 storage identity (`blocks` / `block_references` stay 64-hex).
+   the canonical 64-hex SHA-256, that `fs_objects.seafile_block_ids_sha1` holds
+   the 40-hex SHA-1 list exposed to desktop/mobile, and that each
+   `sha1 → sha256` forward mapping resolves to the real SHA-256 storage
+   identity (`blocks` / `block_references` stay 64-hex).
 3. Synced the library from the desktop client: checkout **succeeds**, with no
    `File <fs_id> does not exist` / `Failed to checkout file ...` errors.
 4. Compared the local/downloaded file hash against the source bytes — identical.
@@ -288,11 +306,11 @@ the web block flow. The regression introduced by merge #91 (SHA-256 block IDs in
 the file object) is fixed and verified, with the internal SHA-256 model unchanged.
 
 
-This branch prevents new SHA-256 `fs_objects.block_ids`, but it does not repair
-files already committed by the broken merge that stored SHA-256 block IDs in the
-file object. Repairing those files is a separate migration/rewrite problem
-because changing the block IDs changes the file `fs_id`; in dev/local the safe
-answer is delete and re-upload.
+This branch prevents new **desktop-incompatible** file objects, but it does not
+repair files already committed by the broken merge that stored SHA-256 block IDs
+without the correct SHA-1 desktop/mobile sidecar. Repairing those files is a
+separate migration/rewrite problem because changing the serialized block-ID view
+changes the file `fs_id`; in dev/local the safe answer is delete and re-upload.
 Regression guards (`internal/integration/web_block_upload_test.go`), updated to the
 canonical layout and the server-derived-SHA-1 semantics (PR5):
 `TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat` (block_ids = SHA-256,
@@ -374,8 +392,8 @@ passing against real Cassandra + MinIO via `docker compose`):
 - R7: idempotent sequential replay → no duplicate file
 - R7: **concurrent double commit → single file** (this caught a real read-then-act
   race, fixed with the LWT claim)
-- R4: rename + re-download + history over a web-block-upload file (SHA-1 `block_ids`
-  fs_object resolving to SHA-256 storage)
+- R4: rename + re-download + history over a web-block-upload file (canonical
+  SHA-256 `block_ids` + desktop/mobile SHA-1 sidecar)
 
 ## Frontend wiring (implemented, behind flag)
 
@@ -1004,12 +1022,13 @@ flag were on*.
    sends the header exclusively. Covered by
    `TestSessionIDFromRequest` (backend) and
    `seafile-api-block-upload.test.js` (frontend).
-10. **[Low/med] No local manifest persistence (resume survives the server, not a
-    reload).** Real resume lives server-side via `/blocks/check`, but the client
-    does not cache the computed manifest (e.g. in IndexedDB). After a page reload
-    the browser must re-hash the whole file before it can ask `/blocks/check` which
-    blocks are still missing. The network resume is preserved; the local hashing
-    work is not.
+10. **[Low/med] No persistent local manifest cache across reloads.** Real resume
+    lives server-side via `/blocks/check`, and the frontend now preserves the
+    in-memory hash plan across manual `Retry` / `Retry All` within the same tab.
+    But the client still does not persist that plan to IndexedDB or similar, so
+    after a full page reload the browser must re-hash the whole file before it
+    can ask `/blocks/check` which blocks are still missing. The network resume is
+    preserved; the cross-reload local hashing work is not.
 
 ## Security/performance review findings (2026-07-02)
 

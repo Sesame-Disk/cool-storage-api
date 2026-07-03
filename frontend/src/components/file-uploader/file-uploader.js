@@ -670,6 +670,7 @@ class FileUploader extends React.Component {
       _cancelled: false,
       _progress: 0,
       _uploading: true,
+      _blockUploadHashCache: null,
       // Dedup plan from /blocks/check (set via onPlan): bytes already on the server
       // (shared/repeated blocks) vs bytes actually uploaded. 0 until the check runs.
       _dedupedBytes: 0,
@@ -810,7 +811,9 @@ class FileUploader extends React.Component {
       // Shared global ceiling: every block upload competes for the same slots.
       limiter: this.blockLimiter,
       signal: abortController ? abortController.signal : undefined,
+      hashCache: entry._blockUploadHashCache,
       onPhase: (phase) => this.setBlockUploadPhase(entry, phase),
+      onHashCache: (cache) => { entry._blockUploadHashCache = cache; },
       onPlan: (plan) => this.setBlockUploadPlan(entry, plan),
       waitForUploadSlot,
       onReadyForUpload,

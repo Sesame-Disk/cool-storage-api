@@ -95,6 +95,58 @@ describe('uploadFileViaBlocks', () => {
     });
   });
 
+  test('reuses a cached hash plan on retry when the server block size matches', async () => {
+    let cachedHashPlan = null;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's', block_size: 50 } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: [] } }),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '50' }] }),
+    };
+    const hashFn = jest.fn().mockResolvedValue({
+      blocks: [{ index: 0, sha256: 'h0', size: 50 }],
+      size: 50,
+    });
+    const file = makeFile(50);
+
+    await uploadFileViaBlocks(file, {
+      repoID: 'r', api, hashFn, blockSize: 50, onHashCache: (cache) => { cachedHashPlan = cache; },
+    });
+    await uploadFileViaBlocks(file, {
+      repoID: 'r', api, hashFn, blockSize: 50, hashCache: cachedHashPlan, onHashCache: (cache) => { cachedHashPlan = cache; },
+    });
+
+    expect(hashFn).toHaveBeenCalledTimes(1);
+    expect(api.createBlockUploadSession).toHaveBeenCalledTimes(2);
+    expect(api.checkBlocks).toHaveBeenCalledTimes(2);
+  });
+
+  test('retries /blocks/check on a transient 502 without re-hashing', async () => {
+    let checkCalls = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's', block_size: 10 } }),
+      checkBlocks: jest.fn().mockImplementation(() => {
+        checkCalls += 1;
+        if (checkCalls === 1) {
+          return Promise.reject(Object.assign(new Error('bad gateway'), {
+            response: { status: 502, data: { error: 'bad gateway' } },
+          }));
+        }
+        return Promise.resolve({ data: { missing: [] } });
+      }),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '10' }] }),
+    };
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
+
+    await uploadFileViaBlocks(makeFile(10), {
+      repoID: 'r', api, hashFn, blockSize: 10, controlPlaneRetryBaseMs: 1,
+    });
+
+    expect(checkCalls).toBe(2);
+    expect(hashFn).toHaveBeenCalledTimes(1);
+  });
+
   test('retries the commit on "commit still in progress" with backoff until the idempotent result', async () => {
     let commitCalls = 0;
     const api = {
@@ -119,6 +171,34 @@ describe('uploadFileViaBlocks', () => {
 
     // The two "in progress" responses are retried; the third returns the result.
     expect(commitCalls).toBe(3);
+    expect(res[0].name).toBe('f');
+  });
+
+  test('retries the commit on a transient 502 and preserves the uploaded work', async () => {
+    let commitCalls = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn().mockResolvedValue({ data: { missing: ['h0'] } }),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockImplementation(() => {
+        commitCalls += 1;
+        if (commitCalls === 1) {
+          return Promise.reject(Object.assign(new Error('bad gateway'), {
+            response: { status: 502, data: { error: 'bad gateway' } },
+          }));
+        }
+        return Promise.resolve({ data: [{ name: 'f', id: 'i', size: '10' }] });
+      }),
+    };
+    const hashFn = jest.fn().mockResolvedValue({ blocks: [{ index: 0, sha256: 'h0', size: 10 }], size: 10 });
+
+    const res = await uploadFileViaBlocks(makeFile(10), {
+      repoID: 'r', api, hashFn, blockSize: 10, commitRetryBaseMs: 1,
+    });
+
+    expect(api.uploadBlock).toHaveBeenCalledTimes(1);
+    expect(hashFn).toHaveBeenCalledTimes(1);
+    expect(commitCalls).toBe(2);
     expect(res[0].name).toBe('f');
   });
 
