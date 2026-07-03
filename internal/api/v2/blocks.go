@@ -416,14 +416,18 @@ func (l *blockUploadConcurrencyLimiter) release(userKey string) {
 
 // blockBodyLimit is the maximum request body a /blocks/upload call may buffer in
 // memory (io.ReadAll). For the web (session) flow every block is exactly the
-// configured CAS block size (the last block is ≤ it), so a session request is
-// bounded to that size — NOT chunking.adaptive.absolute_max, which can be 256 MB
-// and would let one authenticated user force a 256 MB allocation per request,
-// making the per-user concurrency cap (item 18) almost useless for RAM
-// protection (cap × 256 MB = GBs). The legacy no-session path (desktop/mobile
-// sync, variable FastCDC blocks up to absolute_max) keeps the larger bound.
-func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution) int64 {
+// CAS block size frozen onto the session at creation time (the last block is ≤
+// it), so a session request is bounded to THAT size — NOT
+// chunking.adaptive.absolute_max, which can be 256 MB and would let one
+// authenticated user force a 256 MB allocation per request, making the per-user
+// concurrency cap (item 18) almost useless for RAM protection (cap × 256 MB =
+// GBs). The legacy no-session path (desktop/mobile sync, variable FastCDC blocks
+// up to absolute_max) keeps the larger bound.
+func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution, session db.BlockUploadSession) int64 {
 	if resolution == uploadSessionValid {
+		if session.BlockSizeBytes > 0 {
+			return session.BlockSizeBytes
+		}
 		return h.config.WebBlockUploadBlockSize()
 	}
 	return h.config.Chunking.Adaptive.AbsoluteMax
@@ -432,28 +436,26 @@ func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution) int64 
 // staged-block bucket cap headroom. The per-bucket cap is
 // stagedBlockBucketCapFactor × perBucket + stagedBlockBucketSlack so hash-collision
 // variance never falsely rejects a legitimate file. This makes the *ledger* a
-// deliberately loose anti-abuse backstop (total staged blocks bounded to ~2–4× the
-// configured ceiling, worst case for tiny ceilings). The EXACT per-file size is
-// still enforced elsewhere: the declared-size fail-fast at session creation and the
-// commit's `manifest.size == expected_size` guard. See docs/WEB-BLOCK-UPLOAD.md item 1.
+// deliberately loose anti-abuse backstop (roughly 2x per-bucket headroom plus
+// slack; up to 5x for a one-block ceiling), not an exact byte cap. The EXACT
+// per-file size is still enforced elsewhere: the declared-size fail-fast at
+// session creation and the commit's `manifest.size == expected_size` guard. See
+// docs/WEB-BLOCK-UPLOAD.md item 1.
 const stagedBlockBucketCapFactor = 2
 const stagedBlockBucketSlack = 3
 
-// stagedBlockBucketCap returns, for the session flow, the effective bucket count,
-// the per-bucket staged-block cap, and whether the per-session cap is enabled.
-// maxBlocks is the ceiling (EffectiveMaxStagedBytesPerSession) divided by the CAS
-// block size; buckets = min(BlockUploadStagedBlockBuckets, maxBlocks) so a tiny
-// ceiling does not fan out into 64 near-empty buckets and inflate the real bound.
-// enabled=false when the config disables the per-session cap (or config/db is
-// missing), meaning no ledger check runs.
-func (h *BlockHandler) stagedBlockBucketCap() (bucketCount, bucketCap int, enabled bool) {
-	if h.config == nil || h.db == nil {
-		return 0, 0, false
+// blockUploadStagingAdmissionFromConfig derives the immutable staging-admission
+// contract for a NEW session from the then-current config. The result is frozen
+// onto block_upload_sessions so live config changes cannot move a retry to a
+// different bucket or change the accepted block size mid-session.
+func blockUploadStagingAdmissionFromConfig(cfg *config.Config) db.BlockUploadSessionAdmission {
+	if cfg == nil {
+		return db.BlockUploadSessionAdmission{}
 	}
-	ceiling := h.config.EffectiveMaxStagedBytesPerSession()
-	blockSize := h.config.WebBlockUploadBlockSize()
+	ceiling := cfg.EffectiveMaxStagedBytesPerSession()
+	blockSize := cfg.WebBlockUploadBlockSize()
 	if ceiling <= 0 || blockSize <= 0 {
-		return 0, 0, false
+		return db.BlockUploadSessionAdmission{BlockSizeBytes: blockSize}
 	}
 	maxBlocks := (ceiling + blockSize - 1) / blockSize // >= 1
 	buckets := int64(db.BlockUploadStagedBlockBuckets)
@@ -461,7 +463,29 @@ func (h *BlockHandler) stagedBlockBucketCap() (bucketCount, bucketCap int, enabl
 		buckets = maxBlocks
 	}
 	perBucket := (maxBlocks + buckets - 1) / buckets
-	return int(buckets), int(perBucket)*stagedBlockBucketCapFactor + stagedBlockBucketSlack, true
+	return db.BlockUploadSessionAdmission{
+		BlockSizeBytes:    blockSize,
+		StagedBucketCount: int(buckets),
+		StagedBucketCap:   int(perBucket)*stagedBlockBucketCapFactor + stagedBlockBucketSlack,
+	}
+}
+
+// stagedBlockBucketCap returns, for the session flow, the effective bucket count,
+// the per-bucket staged-block cap, and whether the per-session cap is enabled. A
+// persisted session contract wins; older sessions without frozen params fall back
+// to the current config for compatibility during rollout.
+func (h *BlockHandler) stagedBlockBucketCap(session db.BlockUploadSession) (bucketCount, bucketCap int, enabled bool) {
+	if session.StagedBucketCount > 0 && session.StagedBucketCap > 0 {
+		return session.StagedBucketCount, session.StagedBucketCap, true
+	}
+	if h.db == nil {
+		return 0, 0, false
+	}
+	admission := blockUploadStagingAdmissionFromConfig(h.config)
+	if admission.StagedBucketCount <= 0 || admission.StagedBucketCap <= 0 {
+		return 0, 0, false
+	}
+	return admission.StagedBucketCount, admission.StagedBucketCap, true
 }
 
 // tryAdmitSessionUpload enforces the per-user concurrency cap for the web
@@ -776,7 +800,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// configured CAS block size, not chunking.absolute_max — so one authenticated
 	// user cannot force a 256 MB buffer per request and defeat the per-user
 	// concurrency cap (item 18). Legacy sync keeps the larger absolute_max bound.
-	maxSize := h.blockBodyLimit(resolution)
+	maxSize := h.blockBodyLimit(resolution, session)
 	if c.Request.ContentLength > maxSize {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":    "block too large",
@@ -897,7 +921,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// double-counts — and self-expires with the session TTL (no Cassandra COUNTER).
 	// If the PUT below fails after the reserve, the row lingers and TTL reclaims it.
 	if resolution == uploadSessionValid {
-		if bucketCount, bucketCap, enabled := h.stagedBlockBucketCap(); enabled {
+		if bucketCount, bucketCap, enabled := h.stagedBlockBucketCap(session); enabled {
 			bucket := db.StagedBlockBucket(hash, bucketCount)
 			staged, err := h.db.CountSessionStagedBlocksInBucket(session.SessionID, bucket, bucketCap+1)
 			if err != nil {

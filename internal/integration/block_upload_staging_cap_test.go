@@ -21,6 +21,19 @@ func newStagingCapIDs() (orgID, userID, repoID string) {
 	return gocql.TimeUUID().String(), gocql.TimeUUID().String(), gocql.TimeUUID().String()
 }
 
+func testSessionAdmission(declared *int64) dbpkg.BlockUploadSessionAdmission {
+	admission := dbpkg.BlockUploadSessionAdmission{
+		BlockSizeBytes:    8 * 1024 * 1024,
+		StagedBucketCount: 8,
+		StagedBucketCap:   8,
+	}
+	if declared != nil {
+		admission.ExpectedSize = *declared
+		admission.ExpectedSizeDeclared = true
+	}
+	return admission
+}
+
 func TestBlockUploadSessionSlotCapAtomicAndFreedOnCleanup(t *testing.T) {
 	db := shareProjectionDBForTest(t)
 	orgID, userID, repoID := newStagingCapIDs()
@@ -28,7 +41,7 @@ func TestBlockUploadSessionSlotCapAtomicAndFreedOnCleanup(t *testing.T) {
 
 	var sessions []dbpkg.BlockUploadSession
 	for i := 0; i < cap; i++ {
-		s, err := db.CreateAdmittedBlockUploadSession(orgID, userID, repoID, "/", 0, cap)
+		s, err := db.CreateAdmittedBlockUploadSession(orgID, userID, repoID, "/", testSessionAdmission(nil), cap)
 		if err != nil {
 			t.Fatalf("create session %d: %v", i, err)
 		}
@@ -39,7 +52,7 @@ func TestBlockUploadSessionSlotCapAtomicAndFreedOnCleanup(t *testing.T) {
 	}
 
 	// The (cap+1)-th create must be rejected — every slot is taken.
-	if _, err := db.CreateAdmittedBlockUploadSession(orgID, userID, repoID, "/", 0, cap); !errors.Is(err, dbpkg.ErrBlockUploadSessionSlotsExhausted) {
+	if _, err := db.CreateAdmittedBlockUploadSession(orgID, userID, repoID, "/", testSessionAdmission(nil), cap); !errors.Is(err, dbpkg.ErrBlockUploadSessionSlotsExhausted) {
 		t.Fatalf("expected ErrBlockUploadSessionSlotsExhausted, got %v", err)
 	}
 
@@ -47,7 +60,7 @@ func TestBlockUploadSessionSlotCapAtomicAndFreedOnCleanup(t *testing.T) {
 	if err := db.CleanupCommittedBlockUploadSessionCaps(sessions[0]); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
-	if _, err := db.CreateAdmittedBlockUploadSession(orgID, userID, repoID, "/", 0, cap); err != nil {
+	if _, err := db.CreateAdmittedBlockUploadSession(orgID, userID, repoID, "/", testSessionAdmission(nil), cap); err != nil {
 		t.Fatalf("create after freeing a slot should succeed, got %v", err)
 	}
 }
@@ -58,7 +71,7 @@ func TestBlockUploadSessionSlotCapDisabled(t *testing.T) {
 
 	// cap <= 0 disables the per-user cap: many creates all succeed with slot = -1.
 	for i := 0; i < 5; i++ {
-		s, err := db.CreateAdmittedBlockUploadSession(orgID, userID, repoID, "/", 0, 0)
+		s, err := db.CreateAdmittedBlockUploadSession(orgID, userID, repoID, "/", testSessionAdmission(nil), 0)
 		if err != nil {
 			t.Fatalf("create %d with disabled cap: %v", i, err)
 		}
@@ -75,6 +88,15 @@ func blockIDInBucket(bucket, bucketCount int) string {
 	for i := 0; ; i++ {
 		id := fmt.Sprintf("blk-%d", i)
 		if dbpkg.StagedBlockBucket(id, bucketCount) == bucket {
+			return id
+		}
+	}
+}
+
+func distinctBlockIDInBucket(bucket, bucketCount int, exclude string) string {
+	for i := 0; ; i++ {
+		id := fmt.Sprintf("blk-distinct-%d", i)
+		if id != exclude && dbpkg.StagedBlockBucket(id, bucketCount) == bucket {
 			return id
 		}
 	}
@@ -109,10 +131,7 @@ func TestBlockUploadStagedBlockLedgerIdempotentCountAndReserve(t *testing.T) {
 	}
 
 	// A DISTINCT block deterministically placed in the SAME bucket increments count.
-	blockB := blockIDInBucket(bucket, bucketCount)
-	for blockB == blockA {
-		blockB += "x"
-	}
+	blockB := distinctBlockIDInBucket(bucket, bucketCount, blockA)
 	if err := db.ReserveSessionStagedBlock(sessionID, bucket, blockB, 1024); err != nil {
 		t.Fatalf("reserve distinct block in same bucket: %v", err)
 	}
@@ -167,9 +186,9 @@ func TestBlockUploadStagedBucketConcurrentReserveBoundedOvershoot(t *testing.T) 
 func TestBlockUploadSessionStoresExpectedSize(t *testing.T) {
 	db := shareProjectionDBForTest(t)
 	orgID, userID, repoID := newStagingCapIDs()
-	const declared = int64(123456789)
+	declared := int64(123456789)
 
-	s, err := db.CreateAdmittedBlockUploadSession(orgID, userID, repoID, "/", declared, 0)
+	s, err := db.CreateAdmittedBlockUploadSession(orgID, userID, repoID, "/", testSessionAdmission(&declared), 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -179,5 +198,11 @@ func TestBlockUploadSessionStoresExpectedSize(t *testing.T) {
 	}
 	if got.ExpectedSize != declared {
 		t.Fatalf("expected_size = %d, want %d", got.ExpectedSize, declared)
+	}
+	if !got.ExpectedSizeDeclared {
+		t.Fatal("expected_size_declared = false, want true")
+	}
+	if got.BlockSizeBytes == 0 || got.StagedBucketCount == 0 || got.StagedBucketCap == 0 {
+		t.Fatalf("persisted admission params missing: block_size=%d buckets=%d cap=%d", got.BlockSizeBytes, got.StagedBucketCount, got.StagedBucketCap)
 	}
 }

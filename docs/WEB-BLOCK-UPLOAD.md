@@ -958,10 +958,11 @@ flag were on*.
      counted). **The bucket count is dynamic** (`min(64, maxBlocks)`) and the
      per-bucket cap carries headroom for hash-collision variance, so it never
      falsely rejects a legit file — which makes the *total* a deliberately **loose,
-     bounded overshoot** (~2–4× the ceiling worst case), **not an exact byte cap**,
-     and NOT atomic per block (a concurrent burst can overshoot by up to the
-     concurrency; no per-block Paxos). This is acceptable because the EXACT per-file
-     bound is enforced elsewhere (below). The ceiling is
+     bounded overshoot** (roughly 2× plus slack per bucket; up to 5× for a
+     one-block ceiling), **not an exact byte cap**, and NOT atomic per block (a
+     concurrent burst can overshoot by up to the concurrency; no per-block Paxos).
+     This is acceptable because the EXACT per-file/publicable-file bound is
+     enforced elsewhere (below). The ceiling is
      `web_uploads.max_staged_bytes_per_session_mb` (0 = derive from the max file size
      × 1.25; unlimited max file size falls back to a documented default; `<0`
      disables).
@@ -974,8 +975,10 @@ flag were on*.
      client that under-declares `size` and then PUTs extra unique blocks.
 
    Rejections are counted by `block_upload_session_admission_rejections_total{reason}`
-   (`max_sessions` | `staged_blocks`). Bound per user ≈ `session_cap ×
-   per_session_ceiling`. Covered by `TestEffectiveMaxStagedBytesPerSession`,
+   (`max_sessions` | `staged_blocks`). Publishable-file bound per user is still
+   driven by the session-create/commit exact limit; transient staged bytes are
+   bounded operationally by `session_cap × loose_ledger_bound`. Covered by
+   `TestEffectiveMaxStagedBytesPerSession`,
    `TestStagedBlockBucket`/`TestStagedBlockBucketCap`, and the DB-level
    `internal/integration/block_upload_staging_cap_test.go` (atomic slot cap, freed on
    cleanup, idempotent ledger reserve/count, expected_size persisted). Deferred cheap

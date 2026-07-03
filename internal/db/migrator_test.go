@@ -232,3 +232,22 @@ func TestMigration005AddsSHA256CanonicalBlockIDColumns(t *testing.T) {
 	assert.Contains(t, content, "ALTER TABLE fs_objects ADD seafile_block_ids_sha1 LIST<TEXT>;")
 	assert.Contains(t, content, "ALTER TABLE blocks ADD sha1 TEXT;")
 }
+
+func TestMigration008AddsBlockUploadStagingCapsAndFrozenAdmission(t *testing.T) {
+	raw, err := migrationsFS.ReadFile("migrations/008_block_upload_staging_caps.cql")
+	require.NoError(t, err)
+	content := string(raw)
+
+	// Staging-cap tables.
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS block_upload_session_slots_by_user")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS block_upload_session_staged_blocks")
+
+	// Frozen per-session admission columns (consolidated — one migration in the branch).
+	assert.Contains(t, content, "ALTER TABLE block_upload_sessions ADD (")
+	assert.Contains(t, content, "slot INT")
+	assert.Contains(t, content, "expected_size BIGINT")
+	assert.Contains(t, content, "expected_size_declared BOOLEAN")
+	assert.Contains(t, content, "block_size_bytes BIGINT")
+	assert.Contains(t, content, "staged_bucket_count INT")
+	assert.Contains(t, content, "staged_bucket_cap INT")
+}

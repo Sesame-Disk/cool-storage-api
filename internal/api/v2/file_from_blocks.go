@@ -260,7 +260,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// If the client declared a size at session creation (fail-fast staging check,
 	// item 1), the committed manifest must match it — a cheap extra guard on top of
 	// R6's sum(sizes)==size that ties the commit to the declared intent.
-	if session.ExpectedSize > 0 && req.Size != session.ExpectedSize {
+	if session.ExpectedSizeDeclared && req.Size != session.ExpectedSize {
 		c.JSON(http.StatusConflict, gin.H{"error": "manifest size does not match the size declared at session creation"})
 		return
 	}

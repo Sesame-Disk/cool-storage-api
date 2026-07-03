@@ -39,14 +39,14 @@ type Config struct {
 // WebUploadsConfig holds browser upload behavior exposed to the web frontend.
 // Size values are expressed in MB to match the legacy frontend page-option contract.
 type WebUploadsConfig struct {
-	EnableUploadFolder        bool  `yaml:"enable_upload_folder"`
-	EnableResumableFileUpload bool  `yaml:"enable_resumable_file_upload"`
+	EnableUploadFolder        bool `yaml:"enable_upload_folder"`
+	EnableResumableFileUpload bool `yaml:"enable_resumable_file_upload"`
 	// EnableWebBlockUpload server-side-gates the web content-addressed (block)
 	// upload flow: block-upload-session, file-from-blocks, and the session mode
 	// of /blocks/check and /blocks/upload. Default false so the backend surface
 	// stays closed even though the routes are always registered.
-	EnableWebBlockUpload      bool  `yaml:"enable_web_block_upload"`
-	ResumableChunkSizeMB      int64 `yaml:"resumable_chunk_size_mb"`
+	EnableWebBlockUpload bool  `yaml:"enable_web_block_upload"`
+	ResumableChunkSizeMB int64 `yaml:"resumable_chunk_size_mb"`
 	// WebBlockUploadBlockSizeMB is the content-addressed (CAS) block size used by
 	// the web block-upload flow: the size each file is split and SHA-256 hashed
 	// into, validated exactly on commit (file-from-blocks). It is NOT the resumable
@@ -64,7 +64,7 @@ type WebUploadsConfig struct {
 	// cap × block_size (default 8 × 8 MB = 64 MB) — an anti-abuse backstop, not the
 	// staging-bytes cap. A value <= 0 disables the cap (unlimited).
 	// See docs/WEB-BLOCK-UPLOAD.md item 18.
-	MaxConcurrentBlockUploadsPerUser int   `yaml:"max_concurrent_block_uploads_per_user"`
+	MaxConcurrentBlockUploadsPerUser int `yaml:"max_concurrent_block_uploads_per_user"`
 	// MaxUncommittedBlockSessionsPerUser caps how many concurrent *uncommitted*
 	// web block-upload sessions one user may hold (claimed atomically via LWT slots
 	// at session creation). Together with MaxStagedBytesPerSessionMB it bounds the
@@ -77,15 +77,15 @@ type WebUploadsConfig struct {
 	// per-file bound is enforced by the declared-size fail-fast at session creation
 	// plus the commit's manifest.size == expected_size guard; the per-block
 	// staged-block ledger derived from this value is a deliberately LOOSE anti-abuse
-	// backstop (total staged blocks bounded to ~2–4× this value in the worst case),
-	// not an exact byte limit. > 0 = explicit MB; 0 = derive from the resolved max
-	// file size × 1.25 (falling back to a documented operational default when max
-	// file size is unlimited); < 0 = disable the per-session cap.
+	// backstop (roughly 2x per-bucket headroom plus slack; up to 5x for a one-block
+	// ceiling), not an exact byte limit. > 0 = explicit MB; 0 = derive from the
+	// resolved max file size × 1.25 (falling back to a documented operational
+	// default when max file size is unlimited); < 0 = disable the per-session cap.
 	// See EffectiveMaxStagedBytesPerSession().
 	MaxStagedBytesPerSessionMB int64 `yaml:"max_staged_bytes_per_session_mb"`
 	MaxFileSizeMB              int64 `yaml:"max_file_size_mb"`
-	MaxFilesPerBatch          int   `yaml:"max_files_per_batch"`
-	SimultaneousUploads       int   `yaml:"simultaneous_uploads"`
+	MaxFilesPerBatch           int   `yaml:"max_files_per_batch"`
+	SimultaneousUploads        int   `yaml:"simultaneous_uploads"`
 }
 
 // ResolvedMaxFileSizeMB returns the effective browser upload file-size cap.

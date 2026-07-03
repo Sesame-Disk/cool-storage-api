@@ -88,10 +88,11 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 	// an empty body (io.EOF) is treated as "no parent_dir given". `size` is the
 	// client-declared file size (the browser knows file.size); it lets us fail
 	// fast before any hashing/upload and is re-checked against the manifest at
-	// commit.
+	// commit. It is a pointer so the API can distinguish "missing" from an
+	// explicit size=0 (empty file).
 	var req struct {
 		ParentDir string `json:"parent_dir"`
-		Size      int64  `json:"size"`
+		Size      *int64 `json:"size"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -101,23 +102,25 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 	if parentDir == "" {
 		parentDir = "/"
 	}
-	if req.Size < 0 {
+	if req.Size != nil && *req.Size < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid size"})
 		return
 	}
+
+	admission := h.blockUploadSessionAdmission(req.Size)
 
 	// When the per-session staging ceiling is enabled, `size` is REQUIRED so the
 	// exact per-file bound (this fail-fast check + the commit's
 	// manifest.size == expected_size guard) always applies — a client that omits it
 	// could otherwise only be caught by the looser staged-block ledger backstop.
 	if ceiling := h.config.EffectiveMaxStagedBytesPerSession(); ceiling > 0 {
-		if req.Size == 0 {
+		if req.Size == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "size is required"})
 			return
 		}
 		// Fail fast: a declared size over the per-session ceiling (the maximum
 		// web-block file size) is rejected before any hashing/upload (item 1).
-		if req.Size > ceiling {
+		if *req.Size > ceiling {
 			metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
 				"error":    "file exceeds the maximum web-block upload size",
@@ -128,7 +131,7 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 	}
 
 	session, err := h.db.CreateAdmittedBlockUploadSession(
-		orgID, userID, repoID, parentDir, req.Size,
+		orgID, userID, repoID, parentDir, admission,
 		h.config.WebUploads.MaxUncommittedBlockSessionsPerUser,
 	)
 	if err != nil {
@@ -146,7 +149,19 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 		"session_id": session.SessionID,
 		"repo_id":    repoID,
 		"parent_dir": session.ParentDir,
-		"block_size": h.webBlockUploadBlockSize(),
+		"block_size": session.BlockSizeBytes,
 		"expires_at": session.ExpiresAt.Unix(),
 	})
+}
+
+func (h *FileHandler) blockUploadSessionAdmission(size *int64) db.BlockUploadSessionAdmission {
+	admission := blockUploadStagingAdmissionFromConfig(h.config)
+	if h != nil {
+		admission.BlockSizeBytes = h.webBlockUploadBlockSize()
+	}
+	if size != nil {
+		admission.ExpectedSize = *size
+		admission.ExpectedSizeDeclared = true
+	}
+	return admission
 }

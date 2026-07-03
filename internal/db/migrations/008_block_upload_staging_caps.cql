@@ -19,10 +19,26 @@
 --
 -- org_id/user_id are UUID to match the rest of the schema (blocks, libraries,
 -- block_upload_sessions). block_upload_sessions is defined in migration 004; the
--- ALTER adds the slot the session claimed and the client-declared expected file size
--- (validated at session creation for fail-fast UX and re-checked against the manifest
--- at commit). Applied exactly once (tracked in schema_migrations); the combined ADD is
--- the final statement so the idempotent CREATEs above it are safe on any retry.
+-- ALTER adds the per-session admission contract frozen at session creation so the
+-- rules in effect when the session was minted stay stable for its whole 48h life,
+-- even across config changes or restarts, WITHOUT adding coordination to the
+-- /blocks/upload hot path:
+--   - slot                    : the per-user concurrency slot claimed (freed at commit).
+--   - expected_size           : the client-declared file size (fail-fast at creation,
+--                               re-checked against the manifest at commit).
+--   - expected_size_declared  : distinguishes an explicit size=0 (empty file) from
+--                               "size missing" so the commit guard only applies when
+--                               a size was actually declared.
+--   - block_size_bytes        : the authoritative CAS block size echoed to the client
+--                               and reused by /blocks/upload, so a live config change
+--                               cannot reject an in-flight upload's body size.
+--   - staged_bucket_count /
+--     staged_bucket_cap        : the staged-block ledger parameters, frozen so retries
+--                               hash into the SAME bucket partitions (a config change
+--                               must not move a block to a different bucket and count
+--                               it twice).
+-- Applied exactly once (tracked in schema_migrations); the combined ADD is the final
+-- statement so the idempotent CREATEs above it are safe on any retry.
 
 CREATE TABLE IF NOT EXISTS block_upload_session_slots_by_user (
     org_id     UUID,
@@ -42,4 +58,11 @@ CREATE TABLE IF NOT EXISTS block_upload_session_staged_blocks (
     PRIMARY KEY ((session_id, bucket), block_id)
 );
 
-ALTER TABLE block_upload_sessions ADD (slot INT, expected_size BIGINT);
+ALTER TABLE block_upload_sessions ADD (
+    slot INT,
+    expected_size BIGINT,
+    expected_size_declared BOOLEAN,
+    block_size_bytes BIGINT,
+    staged_bucket_count INT,
+    staged_bucket_cap INT
+);
