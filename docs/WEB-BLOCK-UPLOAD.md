@@ -973,6 +973,24 @@ flag were on*.
      (on top of R6's `sum(sizes) == size`). This pair is the real, exact
      per-file size limit; the staged-block ledger above only bounds a *misbehaving*
      client that under-declares `size` and then PUTs extra unique blocks.
+   - **Frozen admission contract (no hot-path coordination).** A session lives up to
+     48h; the admission rules in effect when it was minted are **frozen onto the
+     session row at creation** so they stay stable for its whole life even across
+     live config changes or restarts — without adding any coordination to the
+     `/blocks/upload` hot path. Migration 008 adds, on `block_upload_sessions`:
+     `block_size_bytes` (the authoritative CAS block size — echoed to the client and
+     used by `blockBodyLimit`, so a config change cannot reject an in-flight upload
+     whose body was hashed to the old size), `staged_bucket_count` / `staged_bucket_cap`
+     (the ledger bucketing — frozen so a retry always hashes into the **same** bucket
+     partition; otherwise a mid-session config change could move a block to a
+     different bucket and count it twice), and `expected_size` / `expected_size_declared`
+     (the latter distinguishes an explicit `size=0` **empty file** from "size
+     omitted", so the commit guard applies exactly when a size was declared — `size`
+     is a JSON pointer on the request for the same reason). Derived once by
+     `blockUploadStagingAdmissionFromConfig` at creation; `/blocks/upload` reads the
+     frozen values from the session (falling back to live config only for sessions
+     minted before this change — rollout compat). Regression-guarded by
+     `TestMigration008AddsBlockUploadStagingCapsAndFrozenAdmission`.
 
    Rejections are counted by `block_upload_session_admission_rejections_total{reason}`
    (`max_sessions` | `staged_blocks`). Publishable-file bound per user is still
