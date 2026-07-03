@@ -1904,7 +1904,7 @@ type libraryBaseRowSnapshot struct {
 	VersionTTLDays   int
 	AutoDeleteDays   int
 	DeletedAt        *time.Time
-	DeletedBy        string
+	DeletedBy        *string
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	DeletedMarkerSet bool
@@ -1931,6 +1931,7 @@ func snapshotLibraryBaseRowsForCleanup(t *testing.T, session *gocql.Session, org
 	t.Helper()
 
 	var deletedAt time.Time
+	var deletedBy string
 	snapshot := libraryBaseRowSnapshot{OrgID: orgID, LibraryID: repoID}
 	if err := session.Query(`
 		SELECT owner_id, name, description, encrypted, enc_version, magic, random_key, salt,
@@ -1958,7 +1959,7 @@ func snapshotLibraryBaseRowsForCleanup(t *testing.T, session *gocql.Session, org
 		&snapshot.VersionTTLDays,
 		&snapshot.AutoDeleteDays,
 		&deletedAt,
-		&snapshot.DeletedBy,
+		&deletedBy,
 		&snapshot.CreatedAt,
 		&snapshot.UpdatedAt,
 	); err != nil {
@@ -1967,6 +1968,10 @@ func snapshotLibraryBaseRowsForCleanup(t *testing.T, session *gocql.Session, org
 	if !deletedAt.IsZero() {
 		deletedCopy := deletedAt
 		snapshot.DeletedAt = &deletedCopy
+	}
+	if deletedBy != "" {
+		deletedByCopy := deletedBy
+		snapshot.DeletedBy = &deletedByCopy
 	}
 
 	var markerOrgID, markerStorageClass string
@@ -1989,10 +1994,21 @@ func snapshotLibraryBaseRowsForCleanup(t *testing.T, session *gocql.Session, org
 	return snapshot
 }
 
+// registerLibraryBaseRowRestoreCleanup restores the base library rows removed
+// by removeLibraryBaseRowsForFallbackTest, but only if the test failed before
+// the code under test (GC hard-delete / admin trash-clean) could finish
+// purging them. On a passing test, the library's terminal state is meant to
+// be fully gone - restoring it there would resurrect rows with no admin
+// projection backing, permanently orphaned and invisible to both the stale
+// -library reaper (which skips soft-deleted rows) and the orphan-projection
+// guard (which only checks projection-without-canonical, not the reverse).
 func registerLibraryBaseRowRestoreCleanup(t *testing.T, session *gocql.Session, snapshot libraryBaseRowSnapshot) {
 	t.Helper()
 
 	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
 		batch := session.Batch(gocql.LoggedBatch)
 		batch.Query(`
 			INSERT INTO libraries (

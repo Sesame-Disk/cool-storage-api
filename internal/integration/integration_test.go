@@ -106,6 +106,13 @@ func verifyNoOrphanAdminLibraryProjections() error {
 	examples := make([]string, 0, maxExamples)
 	orphanCount := 0
 	for _, row := range rows {
+		// Scope to libraries this suite owns. A populated, non-ephemeral name
+		// means the row belongs to data outside this test run (or a shared
+		// keyspace); an empty name is itself a corruption signature and must
+		// still be checked regardless of naming.
+		if row.Name != "" && !isEphemeralLibraryName(row.Name) {
+			continue
+		}
 		reason := ""
 		switch {
 		case strings.TrimSpace(row.Name) == "":
