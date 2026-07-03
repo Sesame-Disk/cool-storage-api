@@ -113,16 +113,26 @@ function isRetriableControlPlaneError(error) {
   return String(error.message || '').toLowerCase().includes('network');
 }
 
+function normalizeAttempts(value, fallback) {
+  const fallbackCount = Math.max(1, Math.floor(Number(fallback) || 1));
+  const count = Number(value);
+  if (!Number.isFinite(count)) {
+    return fallbackCount;
+  }
+  return Math.max(1, Math.floor(count));
+}
+
 async function withControlPlaneRetry(fn, attempts, { signal, baseMs = CONTROL_PLANE_RETRY_BASE_MS } = {}) {
+  const maxAttempts = normalizeAttempts(attempts, CONTROL_PLANE_RETRY_ATTEMPTS);
   let lastErr;
-  for (let i = 1; i <= attempts; i += 1) {
+  for (let i = 1; i <= maxAttempts; i += 1) {
     throwIfAborted(signal);
     try {
       // eslint-disable-next-line no-await-in-loop
       return await fn();
     } catch (err) {
       lastErr = err;
-      if (!isRetriableControlPlaneError(err) || i >= attempts) {
+      if (!isRetriableControlPlaneError(err) || i >= maxAttempts) {
         throw err;
       }
       const jitter = Math.floor(Math.random() * 250);
@@ -373,6 +383,7 @@ const MAX_BACKPRESSURE_WAITS = 8;
 // off on every failed attempt, including a 429, so client concurrency drops in
 // response to the server signal.
 async function withRetry(fn, attempts, { signal } = {}) {
+  const maxAttempts = normalizeAttempts(attempts, 3);
   let lastErr;
   let hardAttempt = 0;
   let softWaits = 0;
@@ -392,7 +403,7 @@ async function withRetry(fn, attempts, { signal } = {}) {
         continue;
       }
       hardAttempt += 1;
-      if (hardAttempt >= attempts) {
+      if (hardAttempt >= maxAttempts) {
         break;
       }
       await waitWithAbort(100 * 2 ** (hardAttempt - 1), signal);
@@ -560,8 +571,9 @@ function isCommitInProgress(err) {
 // to the caller unchanged so the existing needs_upload path and fallbacks still
 // work.
 async function commitFromManifest(api, repoID, manifest, { signal, attempts, baseMs, timeout }) {
+  const maxAttempts = normalizeAttempts(attempts, 6);
   let lastErr;
-  for (let i = 1; i <= attempts; i += 1) {
+  for (let i = 1; i <= maxAttempts; i += 1) {
     throwIfAborted(signal);
     try {
       // eslint-disable-next-line no-await-in-loop
@@ -570,7 +582,7 @@ async function commitFromManifest(api, repoID, manifest, { signal, attempts, bas
     } catch (err) {
       lastErr = err;
       if (isAbortError(err) || (signal && signal.aborted)) throw err;
-      if ((isCommitInProgress(err) || isRetriableControlPlaneError(err)) && i < attempts) {
+      if ((isCommitInProgress(err) || isRetriableControlPlaneError(err)) && i < maxAttempts) {
         // eslint-disable-next-line no-await-in-loop
         await waitWithAbort(Math.min(baseMs * 2 ** (i - 1), 5000), signal);
         // eslint-disable-next-line no-continue

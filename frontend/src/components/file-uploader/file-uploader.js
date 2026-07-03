@@ -830,6 +830,7 @@ class FileUploader extends React.Component {
       onTransferProgress: (deltaBytes) => this.updateBlockUploadTransferredBytes(entry, deltaBytes),
     }).then(result => {
       entry._abortController = null;
+      entry._blockUploadHashCache = null;
       entry._progress = 1;
       entry._uploading = false;
       entry._phase = 'done';

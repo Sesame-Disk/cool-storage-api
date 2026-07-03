@@ -152,6 +152,27 @@ describe('uploadFileViaBlocks', () => {
     }
   });
 
+  test('normalizes controlPlaneRetries=0 to one real attempt instead of throwing undefined', async () => {
+    const api = {
+      createBlockUploadSession: jest.fn().mockRejectedValue(Object.assign(new Error('bad gateway'), {
+        response: { status: 502, data: { error: 'bad gateway' } },
+      })),
+      checkBlocks: jest.fn(),
+      uploadBlock: jest.fn(),
+      createFileFromBlocks: jest.fn(),
+    };
+    const hashFn = jest.fn();
+
+    await expect(
+      uploadFileViaBlocks(makeFile(10), {
+        repoID: 'r', api, hashFn, blockSize: 10, controlPlaneRetries: 0,
+      }),
+    ).rejects.toThrow('bad gateway');
+
+    expect(api.createBlockUploadSession).toHaveBeenCalledTimes(1);
+    expect(hashFn).not.toHaveBeenCalled();
+  });
+
   test('retries the commit on "commit still in progress" with backoff until the idempotent result', async () => {
     let commitCalls = 0;
     const api = {

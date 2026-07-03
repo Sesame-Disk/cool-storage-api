@@ -218,7 +218,10 @@ func TestCheckBlocks_SessionValidationUnavailable(t *testing.T) {
 	r.POST("/api/v2/blocks/check", h.CheckBlocks)
 
 	body := CheckBlocksRequest{Hashes: []string{strings.Repeat("a", 64)}}
-	jsonBody, _ := json.Marshal(body)
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
 	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", bytes.NewBuffer(jsonBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Block-Upload-Session", "sess-unavailable")
@@ -226,11 +229,13 @@ func TestCheckBlocks_SessionValidationUnavailable(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusServiceUnavailable, w.Body.String())
 	}
 
 	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v; body=%s", err, w.Body.String())
+	}
 	if resp["error"] != "upload session unavailable" {
 		t.Errorf("error = %v, want 'upload session unavailable'", resp["error"])
 	}

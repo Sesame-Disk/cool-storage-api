@@ -85,7 +85,8 @@ tracker.
 
 ```
 1. POST /api/v2/repos/:repo_id/block-upload-session/   → server-issued session_id
-2. client splits file into fixed 8 MB blocks, SHA-256 each (Web Worker)
+2. client splits file into server-authoritative CAS blocks
+   (`block-upload-session.block_size`, default 8 MB), SHA-256 each (Web Worker)
 3. POST /api/v2/blocks/check + `X-Block-Upload-Session` → { existing, missing } (by SHA-256)
 4. POST /api/v2/blocks/upload + `X-Block-Upload-Session` (per missing) → store + materialize (SHA-256)
 5. POST /api/v2/repos/:repo_id/file-from-blocks/        → commit from ordered `{sha256, size}` manifest (server derives SHA-1)
