@@ -542,4 +542,36 @@ describe('global concurrency limiter (shared across files)', () => {
     expect(limiter.noteFailure).toHaveBeenCalledTimes(1);
     expect(attempt).toBe(3);
   });
+
+  test('a 429 (per-user cap) is honored via Retry-After and does not fail the upload', async () => {
+    let attempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn(() => {
+        attempt += 1;
+        if (attempt <= 2) {
+          const err = new Error('rate limited');
+          err.response = { status: 429, headers: { 'retry-after': '0.05' } };
+          return Promise.reject(err);
+        }
+        return Promise.resolve({ data: {} });
+      }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+    const limiter = {
+      acquire: jest.fn().mockResolvedValue(() => { }),
+      noteRetry: jest.fn(),
+      noteFailure: jest.fn(),
+      getMaxConcurrency: () => 1,
+    };
+
+    // retries:1 proves the 429 waits are SOFT — they do NOT consume the hard retry
+    // budget (2 backpressure waits then success, even with only one hard attempt).
+    await uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 1 });
+
+    expect(attempt).toBe(3); // two 429s then a success — the block still uploads
+    expect(limiter.noteRetry).toHaveBeenCalledTimes(2); // each 429 tells the limiter to back off
+    expect(limiter.noteFailure).not.toHaveBeenCalled(); // backpressure is never a hard failure
+  });
 });

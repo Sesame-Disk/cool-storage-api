@@ -134,11 +134,16 @@ type BlockHandler struct {
 	db               *db.DB                           // Optional: enables session-scoped materialization for the web flow
 	permMiddleware   *middleware.PermissionMiddleware // Optional: re-verifies upload permission for long-lived sessions (R12)
 	sessionPermCache *sessionPermissionCache          // Bounds how often that re-verification runs (see sessionPermissionCache)
+	uploadLimiter    *blockUploadConcurrencyLimiter   // Bounds concurrent session-mode /blocks/upload per user (item 18)
 }
 
 // RegisterBlockRoutes registers the block API routes
 // Supports both legacy single BlockStore and multi-region StorageManager
 func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) {
+	maxConcurrentUploads := 0
+	if cfg != nil {
+		maxConcurrentUploads = cfg.WebUploads.MaxConcurrentBlockUploadsPerUser
+	}
 	h := &BlockHandler{
 		blockStore:       blockStore,
 		storageManager:   storageManager,
@@ -146,6 +151,7 @@ func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *stora
 		db:               database,
 		permMiddleware:   permMiddleware,
 		sessionPermCache: &sessionPermissionCache{},
+		uploadLimiter:    newBlockUploadConcurrencyLimiter(maxConcurrentUploads),
 	}
 
 	// Per-IP rate limit for the block existence oracle.
@@ -352,6 +358,97 @@ func (c *sessionPermissionCache) trimLocked(now time.Time) {
 	for i := 0; i < trimCount; i++ {
 		delete(c.checked, entries[i].sessionID)
 	}
+}
+
+// blockUploadConcurrencyLimiter bounds how many concurrent session-mode
+// /blocks/upload requests a single user may have in flight. Each such request
+// buffers a whole block (~8–16 MB) in memory (io.ReadAll in UploadBlock), so
+// without a cap a burst from one authenticated user is real RAM pressure under
+// abuse (docs/WEB-BLOCK-UPLOAD.md item 18). The slot is acquired BEFORE the body
+// is read, so a rejected request never allocates the buffer.
+//
+// It is per-process (not shared across nodes) — like sessionPermissionCache and
+// the per-IP rate limiter (finding 13): with N nodes the effective budget is N×,
+// which is acceptable for an anti-abuse backstop. The map is keyed by
+// "org_id:user_id" and self-cleans (a key is deleted when its count returns to
+// zero), so it stays bounded to currently-active users. max <= 0 disables the cap.
+type blockUploadConcurrencyLimiter struct {
+	max      int
+	mu       sync.Mutex
+	inflight map[string]int
+}
+
+func newBlockUploadConcurrencyLimiter(max int) *blockUploadConcurrencyLimiter {
+	return &blockUploadConcurrencyLimiter{max: max, inflight: make(map[string]int)}
+}
+
+// tryAcquire reserves a slot for userKey. It returns false (without mutating the
+// map) when the user is already at the cap; the caller must NOT release in that
+// case. A non-positive max means the cap is disabled and every acquire succeeds.
+func (l *blockUploadConcurrencyLimiter) tryAcquire(userKey string) bool {
+	if l == nil || l.max <= 0 {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.inflight[userKey] >= l.max {
+		return false
+	}
+	l.inflight[userKey]++
+	return true
+}
+
+// release returns a slot previously taken by a successful tryAcquire. It deletes
+// the key at zero so the map does not retain idle users. It is a no-op when the
+// cap is disabled (tryAcquire never recorded anything).
+func (l *blockUploadConcurrencyLimiter) release(userKey string) {
+	if l == nil || l.max <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if n := l.inflight[userKey]; n <= 1 {
+		delete(l.inflight, userKey)
+	} else {
+		l.inflight[userKey] = n - 1
+	}
+}
+
+// blockBodyLimit is the maximum request body a /blocks/upload call may buffer in
+// memory (io.ReadAll). For the web (session) flow every block is exactly the
+// configured CAS block size (the last block is ≤ it), so a session request is
+// bounded to that size — NOT chunking.adaptive.absolute_max, which can be 256 MB
+// and would let one authenticated user force a 256 MB allocation per request,
+// making the per-user concurrency cap (item 18) almost useless for RAM
+// protection (cap × 256 MB = GBs). The legacy no-session path (desktop/mobile
+// sync, variable FastCDC blocks up to absolute_max) keeps the larger bound.
+func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution) int64 {
+	if resolution == uploadSessionValid {
+		return h.config.WebBlockUploadBlockSize()
+	}
+	return h.config.Chunking.Adaptive.AbsoluteMax
+}
+
+// tryAdmitSessionUpload enforces the per-user concurrency cap for the web
+// (session) flow. For a valid session it reserves a slot keyed by
+// "org_id:user_id"; if the user is already at the cap it emits 429 + Retry-After
+// (counted by BlockUploadConcurrencyRejectionsTotal) and returns ok=false. When
+// ok is true the caller MUST defer the returned release. Non-session requests
+// (legacy sync path) are never capped — release is a no-op and ok is always
+// true. A 429 is retryable: the web client's withRetry loop backs off and
+// re-sends, so legitimate bursts self-throttle instead of failing.
+func (h *BlockHandler) tryAdmitSessionUpload(c *gin.Context, resolution uploadSessionResolution) (release func(), ok bool) {
+	if resolution != uploadSessionValid {
+		return func() {}, true
+	}
+	userKey := c.GetString("org_id") + ":" + c.GetString("user_id")
+	if !h.uploadLimiter.tryAcquire(userKey) {
+		metrics.BlockUploadConcurrencyRejectionsTotal.Inc()
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many concurrent block uploads; retry shortly"})
+		return func() {}, false
+	}
+	return func() { h.uploadLimiter.release(userKey) }, true
 }
 
 type uploadSessionResolution int
@@ -611,14 +708,27 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
+	// Per-user concurrency cap for the web (session) flow. Acquired BEFORE the
+	// block body is read into RAM (io.ReadAll below), so a rejected request never
+	// allocates the ~8–16 MB buffer — this is what bounds a single user's
+	// instantaneous memory footprint under a burst (item 18).
+	release, ok := h.tryAdmitSessionUpload(c, resolution)
+	if !ok {
+		return
+	}
+	defer release()
+
 	// Check content length
 	if c.Request.ContentLength <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "content length required"})
 		return
 	}
 
-	// Check against maximum block size
-	maxSize := h.config.Chunking.Adaptive.AbsoluteMax
+	// Check against maximum block size. For the session (web) flow this is the
+	// configured CAS block size, not chunking.absolute_max — so one authenticated
+	// user cannot force a 256 MB buffer per request and defeat the per-user
+	// concurrency cap (item 18). Legacy sync keeps the larger absolute_max bound.
+	maxSize := h.blockBodyLimit(resolution)
 	if c.Request.ContentLength > maxSize {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":    "block too large",

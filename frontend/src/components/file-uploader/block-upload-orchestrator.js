@@ -291,9 +291,45 @@ export function hashFileWithWorker(file, { blockSize = BLOCK_SIZE, onProgress, s
   });
 }
 
+// is429Error reports whether an error is the server's per-user block-upload
+// concurrency backpressure (429). This is NOT a failure — it is the server
+// asking the client to slow down (item 18: max_concurrent_block_uploads_per_user).
+export function is429Error(error) {
+  return Boolean(error && error.response && error.response.status === 429);
+}
+
+// retryAfterMs reads the server's Retry-After hint (seconds) from a 429 response,
+// clamped to a sane range, so the client waits as long as the server asked
+// instead of the much shorter default exponential backoff (which could exhaust
+// the retry budget before a slot frees). Falls back to fallbackMs when absent.
+export function retryAfterMs(error, fallbackMs = 1000) {
+  const headers = (error && error.response && error.response.headers) || {};
+  const raw = headers['retry-after'] !== undefined ? headers['retry-after'] : headers['Retry-After'];
+  const secs = Number(raw);
+  if (Number.isFinite(secs) && secs > 0) {
+    return Math.min(Math.max(secs * 1000, 100), 30000);
+  }
+  return fallbackMs;
+}
+
+// Cap how many times a single block waits out 429 backpressure so a permanently
+// saturated cap cannot loop forever; well above what a healthy link needs (a
+// slot frees as soon as any of the user's in-flight blocks completes).
+const MAX_BACKPRESSURE_WAITS = 8;
+
+// withRetry runs fn up to `attempts` times with exponential backoff. A 429
+// (per-user concurrency backpressure) is treated as SOFT: it is retried honoring
+// the server's Retry-After (with jitter) and does NOT consume the hard retry
+// budget — bounded by MAX_BACKPRESSURE_WAITS — so legitimate throttling
+// self-recovers instead of surfacing as an upload failure. The caller's
+// per-attempt hook (uploadMissingBlocks) still tells the local limiter to back
+// off on every failed attempt, including a 429, so client concurrency drops in
+// response to the server signal.
 async function withRetry(fn, attempts, { signal } = {}) {
   let lastErr;
-  for (let i = 1; i <= attempts; i++) {
+  let hardAttempt = 0;
+  let softWaits = 0;
+  for (;;) {
     throwIfAborted(signal);
     try {
       return await fn();
@@ -302,9 +338,17 @@ async function withRetry(fn, attempts, { signal } = {}) {
       if (isAbortError(err) || (signal && signal.aborted)) {
         throw err;
       }
-      if (i < attempts) {
-        await waitWithAbort(100 * 2 ** (i - 1), signal);
+      if (is429Error(err) && softWaits < MAX_BACKPRESSURE_WAITS) {
+        softWaits += 1;
+        const jitter = Math.floor(Math.random() * 250);
+        await waitWithAbort(retryAfterMs(err) + jitter, signal);
+        continue;
       }
+      hardAttempt += 1;
+      if (hardAttempt >= attempts) {
+        break;
+      }
+      await waitWithAbort(100 * 2 ** (hardAttempt - 1), signal);
     }
   }
   throw lastErr;

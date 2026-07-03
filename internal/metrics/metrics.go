@@ -415,6 +415,19 @@ var (
 		},
 		[]string{"new"}, // "true" or "false"
 	)
+
+	// BlockUploadConcurrencyRejectionsTotal counts session-mode /blocks/upload
+	// requests rejected with 429 because the caller already had the configured
+	// maximum number of concurrent block uploads in flight
+	// (web_uploads.max_concurrent_block_uploads_per_user). A non-zero rate means
+	// the per-user in-flight cap is biting; use it to tune the limit before/after
+	// flag-on. See docs/WEB-BLOCK-UPLOAD.md item 18.
+	BlockUploadConcurrencyRejectionsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "block_upload_concurrency_rejections_total",
+			Help: "Total number of session-mode /blocks/upload requests rejected by the per-user concurrency cap.",
+		},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -462,5 +475,6 @@ func Register() {
 		BlockUploadSessionClaimTotal,
 		BlockUploadSessionWaitDuration,
 		BlockUploadStagedBlocksTotal,
+		BlockUploadConcurrencyRejectionsTotal,
 	)
 }
