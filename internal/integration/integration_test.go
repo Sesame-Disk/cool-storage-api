@@ -81,13 +81,28 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	afterCleanupDone = true
 	cleanupIntegrationEphemeralLibraries("after")
-	if verifyErr := verifyNoOrphanAdminLibraryProjections(); verifyErr != nil {
+	if verifyErr := verifyNoOrphanAdminLibraryProjectionsWithRetry(5*time.Second, 250*time.Millisecond); verifyErr != nil {
 		fmt.Printf("integration cleanup verification failed: %v\n", verifyErr)
 		if code == 0 {
 			code = 1
 		}
 	}
 	os.Exit(code)
+}
+
+func verifyNoOrphanAdminLibraryProjectionsWithRetry(timeout, interval time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		lastErr = verifyNoOrphanAdminLibraryProjections()
+		if lastErr == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return lastErr
+		}
+		time.Sleep(interval)
+	}
 }
 
 func verifyNoOrphanAdminLibraryProjections() error {
@@ -97,52 +112,105 @@ func verifyNoOrphanAdminLibraryProjections() error {
 	}
 	defer database.Close()
 
-	rows, err := dbpkg.ListAdminGlobalLibraryRows(database.Session())
-	if err != nil {
-		return fmt.Errorf("list admin global library rows: %w", err)
+	return verifyNoOrphanAdminLibraryProjectionsInDB(database)
+}
+
+func verifyNoOrphanAdminLibraryProjectionsInDB(database *dbpkg.DB) error {
+	type projectionIssue struct {
+		scope string
+		orgID string
+		repoID string
+		reason string
+	}
+
+	issues := make([]projectionIssue, 0)
+	appendIssues := func(scope string, rows []dbpkg.AdminLibraryProjectionRow, err error) error {
+		if err != nil {
+			return fmt.Errorf("list %s admin library rows: %w", scope, err)
+		}
+		for _, row := range rows {
+			reason, err := classifyProjectionIntegrityIssue(database.Session(), row)
+			if err != nil {
+				return fmt.Errorf("verify %s projection %s/%s: %w", scope, row.OrgID, row.LibraryID, err)
+			}
+			if reason == "" {
+				continue
+			}
+			issues = append(issues, projectionIssue{scope: scope, orgID: row.OrgID, repoID: row.LibraryID, reason: reason})
+		}
+		return nil
+	}
+
+	globalRows, err := dbpkg.ListAdminGlobalLibraryRows(database.Session())
+	if err := appendIssues("global", globalRows, err); err != nil {
+		return err
+	}
+	orgRows, err := dbpkg.ListAdminOrgLibraryRows(database.Session(), defaultOrgID)
+	if err := appendIssues("org", orgRows, err); err != nil {
+		return err
+	}
+	for _, ownerEmail := range []string{defaultAdminEmail, defaultUserEmail, "superadmin@sesamefs.local"} {
+		ownerID, ok, err := lookupUserIDByEmailForCleanup(database.Session(), ownerEmail)
+		if err != nil {
+			return fmt.Errorf("lookup cleanup owner %s: %w", ownerEmail, err)
+		}
+		if !ok {
+			continue
+		}
+		ownerRows, err := dbpkg.ListAdminOwnerLibraryRows(database.Session(), defaultOrgID, ownerID)
+		if err := appendIssues("owner", ownerRows, err); err != nil {
+			return err
+		}
 	}
 
 	const maxExamples = 8
 	examples := make([]string, 0, maxExamples)
-	orphanCount := 0
-	for _, row := range rows {
-		// Scope to libraries this suite owns. A populated, non-ephemeral name
-		// means the row belongs to data outside this test run (or a shared
-		// keyspace); an empty name is itself a corruption signature and must
-		// still be checked regardless of naming.
-		if row.Name != "" && !isEphemeralLibraryName(row.Name) {
-			continue
-		}
-		reason := ""
-		switch {
-		case strings.TrimSpace(row.Name) == "":
-			reason = "empty name"
-		case strings.TrimSpace(row.OwnerID) == "":
-			reason = "empty owner_id"
-		case strings.TrimSpace(row.OwnerEmail) == "":
-			reason = "empty owner_email"
-		default:
-			if _, readErr := dbpkg.ReadAdminLibraryProjectionRow(database.Session(), row.OrgID, row.LibraryID); readErr != nil {
-				if readErr == gocql.ErrNotFound {
-					reason = "missing canonical libraries row"
-				} else {
-					return fmt.Errorf("read canonical library %s/%s: %w", row.OrgID, row.LibraryID, readErr)
-				}
-			}
-		}
-		if reason == "" {
-			continue
-		}
-		orphanCount++
+	for _, issue := range issues {
 		if len(examples) < maxExamples {
-			examples = append(examples, fmt.Sprintf("%s/%s (%s)", row.OrgID, row.LibraryID, reason))
+			examples = append(examples, fmt.Sprintf("%s:%s/%s (%s)", issue.scope, issue.orgID, issue.repoID, issue.reason))
 		}
 	}
 
-	if orphanCount == 0 {
+	if len(issues) == 0 {
 		return nil
 	}
-	return fmt.Errorf("found %d orphan or partial admin global library projection rows after cleanup: %s", orphanCount, strings.Join(examples, ", "))
+	return fmt.Errorf("found %d orphan or partial admin library projection rows after cleanup: %s", len(issues), strings.Join(examples, ", "))
+}
+
+func classifyProjectionIntegrityIssue(session *gocql.Session, row dbpkg.AdminLibraryProjectionRow) (string, error) {
+	// Scope to libraries this suite owns. A populated, non-ephemeral name means
+	// the row belongs to data outside this test run (or a shared keyspace); an
+	// empty name is itself a corruption signature and must still be checked.
+	if row.Name != "" && !isEphemeralLibraryName(row.Name) {
+		return "", nil
+	}
+	switch {
+	case strings.TrimSpace(row.Name) == "":
+		return "empty name", nil
+	case strings.TrimSpace(row.OwnerID) == "":
+		return "empty owner_id", nil
+	case strings.TrimSpace(row.OwnerEmail) == "":
+		return "empty owner_email", nil
+	default:
+		if _, err := dbpkg.ReadAdminLibraryProjectionRow(session, row.OrgID, row.LibraryID); err != nil {
+			if err == gocql.ErrNotFound {
+				return "missing canonical libraries row", nil
+			}
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+func lookupUserIDByEmailForCleanup(session *gocql.Session, email string) (string, bool, error) {
+	var userID string
+	if err := session.Query(`SELECT user_id FROM users_by_email WHERE email = ?`, email).Scan(&userID); err != nil {
+		if err == gocql.ErrNotFound {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return userID, userID != "", nil
 }
 
 func openIntegrationProjectionDB() (*dbpkg.DB, error) {
@@ -351,9 +419,114 @@ func cleanupIntegrationEphemeralLibraries(phase string) {
 		seen[client.token] = struct{}{}
 		total += cleanupOwnedEphemeralLibrariesWithoutTesting(client)
 	}
+	orphaned, err := cleanupOrphanAdminLibraryProjectionsWithoutTesting()
+	if err != nil {
+		fmt.Printf("skipping orphan admin library projection cleanup %s test run: %v\n", phase, err)
+	} else {
+		total += orphaned
+	}
 	if total > 0 {
 		fmt.Printf("cleaned up %d stale integration test libraries %s test run\n", total, phase)
 	}
+}
+
+func cleanupOrphanAdminLibraryProjectionsWithoutTesting() (int, error) {
+	database, err := openIntegrationProjectionDB()
+	if err != nil {
+		return 0, err
+	}
+	defer database.Close()
+
+	return cleanupOrphanAdminLibraryProjectionsInDB(database)
+}
+
+func cleanupOrphanAdminLibraryProjectionsInDB(database *dbpkg.DB) (int, error) {
+	type cleanupTarget struct {
+		orgID string
+		repoID string
+		row   dbpkg.AdminLibraryProjectionRow
+	}
+
+	targets := map[string]cleanupTarget{}
+	appendTargets := func(rows []dbpkg.AdminLibraryProjectionRow, err error) error {
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			reason, classifyErr := classifyProjectionIntegrityIssue(database.Session(), row)
+			if classifyErr != nil {
+				return classifyErr
+			}
+			if reason == "" {
+				continue
+			}
+			key := row.OrgID + "/" + row.LibraryID
+			if _, exists := targets[key]; !exists {
+				targets[key] = cleanupTarget{orgID: row.OrgID, repoID: row.LibraryID, row: row}
+			}
+		}
+		return nil
+	}
+
+	globalRows, err := dbpkg.ListAdminGlobalLibraryRows(database.Session())
+	if err != nil {
+		return 0, fmt.Errorf("list global admin library rows: %w", err)
+	}
+	if err := appendTargets(globalRows, nil); err != nil {
+		return 0, fmt.Errorf("collect global orphan admin library rows: %w", err)
+	}
+	orgRows, err := dbpkg.ListAdminOrgLibraryRows(database.Session(), defaultOrgID)
+	if err != nil {
+		return 0, fmt.Errorf("list org admin library rows: %w", err)
+	}
+	if err := appendTargets(orgRows, nil); err != nil {
+		return 0, fmt.Errorf("collect org orphan admin library rows: %w", err)
+	}
+	for _, ownerEmail := range []string{defaultAdminEmail, defaultUserEmail, "superadmin@sesamefs.local"} {
+		ownerID, ok, err := lookupUserIDByEmailForCleanup(database.Session(), ownerEmail)
+		if err != nil {
+			return 0, fmt.Errorf("lookup cleanup owner %s: %w", ownerEmail, err)
+		}
+		if !ok {
+			continue
+		}
+		ownerRows, err := dbpkg.ListAdminOwnerLibraryRows(database.Session(), defaultOrgID, ownerID)
+		if err != nil {
+			return 0, fmt.Errorf("list owner admin library rows for %s: %w", ownerEmail, err)
+		}
+		if err := appendTargets(ownerRows, nil); err != nil {
+			return 0, fmt.Errorf("collect owner orphan admin library rows for %s: %w", ownerEmail, err)
+		}
+	}
+
+	if len(targets) == 0 {
+		return 0, nil
+	}
+
+	buckets, err := dbpkg.ListAdminLibraryBucketDays(database.Session())
+	if err != nil {
+		return 0, fmt.Errorf("list admin library bucket days: %w", err)
+	}
+
+	batch := database.Session().Batch(gocql.LoggedBatch)
+	cleaned := 0
+	for _, target := range targets {
+		batch.Query(`DELETE FROM libraries_by_org_updated WHERE org_id = ? AND library_id = ?`, target.orgID, target.repoID)
+		if strings.TrimSpace(target.row.OwnerID) != "" {
+			batch.Query(`DELETE FROM libraries_by_owner WHERE org_id = ? AND owner_id = ? AND library_id = ?`, target.orgID, target.row.OwnerID, target.repoID)
+		}
+		for _, bucketDay := range buckets {
+			batch.Query(`DELETE FROM libraries_admin_global_by_updated WHERE bucket_day = ? AND org_id = ? AND library_id = ?`, bucketDay, target.orgID, target.repoID)
+		}
+		if target.row.DeletedAt != nil && !target.row.DeletedAt.IsZero() {
+			batch.Query(`DELETE FROM libraries_deleted_by_org WHERE org_id = ? AND deleted_at = ? AND library_id = ?`, target.orgID, *target.row.DeletedAt, target.repoID)
+		}
+		cleaned++
+	}
+	if err := batch.Exec(); err != nil {
+		return 0, fmt.Errorf("delete orphan admin library projections: %w", err)
+	}
+	return cleaned, nil
 }
 
 func cleanupOwnedEphemeralLibrariesWithoutTesting(c *testClient) int {
