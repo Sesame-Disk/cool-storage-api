@@ -414,14 +414,6 @@ func (l *blockUploadConcurrencyLimiter) release(userKey string) {
 	}
 }
 
-// tryAdmitSessionUpload enforces the per-user concurrency cap for the web
-// (session) flow. For a valid session it reserves a slot keyed by
-// "org_id:user_id"; if the user is already at the cap it emits 429 + Retry-After
-// (counted by BlockUploadConcurrencyRejectionsTotal) and returns ok=false. When
-// ok is true the caller MUST defer the returned release. Non-session requests
-// (legacy sync path) are never capped — release is a no-op and ok is always
-// true. A 429 is retryable: the web client's withRetry loop backs off and
-// re-sends, so legitimate bursts self-throttle instead of failing.
 // blockBodyLimit is the maximum request body a /blocks/upload call may buffer in
 // memory (io.ReadAll). For the web (session) flow every block is exactly the
 // configured CAS block size (the last block is ≤ it), so a session request is
@@ -437,6 +429,14 @@ func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution) int64 
 	return h.config.Chunking.Adaptive.AbsoluteMax
 }
 
+// tryAdmitSessionUpload enforces the per-user concurrency cap for the web
+// (session) flow. For a valid session it reserves a slot keyed by
+// "org_id:user_id"; if the user is already at the cap it emits 429 + Retry-After
+// (counted by BlockUploadConcurrencyRejectionsTotal) and returns ok=false. When
+// ok is true the caller MUST defer the returned release. Non-session requests
+// (legacy sync path) are never capped — release is a no-op and ok is always
+// true. A 429 is retryable: the web client's withRetry loop backs off and
+// re-sends, so legitimate bursts self-throttle instead of failing.
 func (h *BlockHandler) tryAdmitSessionUpload(c *gin.Context, resolution uploadSessionResolution) (release func(), ok bool) {
 	if resolution != uploadSessionValid {
 		return func() {}, true
