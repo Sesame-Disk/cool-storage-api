@@ -429,31 +429,39 @@ func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution) int64 
 	return h.config.Chunking.Adaptive.AbsoluteMax
 }
 
-// stagedBlockBucketSlack is added to each bucket's cap so an even hash
-// distribution that lands a few extra blocks in one bucket does not reject a
-// legitimate file near the ceiling. The total bound stays
-// B × (perBucket + slack) × blockSize.
-const stagedBlockBucketSlack = 2
+// staged-block bucket cap headroom. The per-bucket cap is
+// stagedBlockBucketCapFactor × perBucket + stagedBlockBucketSlack so hash-collision
+// variance never falsely rejects a legitimate file. This makes the *ledger* a
+// deliberately loose anti-abuse backstop (total staged blocks bounded to ~2–4× the
+// configured ceiling, worst case for tiny ceilings). The EXACT per-file size is
+// still enforced elsewhere: the declared-size fail-fast at session creation and the
+// commit's `manifest.size == expected_size` guard. See docs/WEB-BLOCK-UPLOAD.md item 1.
+const stagedBlockBucketCapFactor = 2
+const stagedBlockBucketSlack = 3
 
-// stagedBlockBucketCap returns the per-bucket staged-block cap for the session
-// flow and whether the per-session cap is enabled. maxBlocks is the ceiling
-// (EffectiveMaxStagedBytesPerSession) divided by the CAS block size; it is spread
-// across BlockUploadStagedBlockBuckets buckets so per-block admission reads only
-// one small bucket. enabled=false when the config disables the per-session cap
-// (or config is missing), meaning no ledger check runs.
-func (h *BlockHandler) stagedBlockBucketCap() (int, bool) {
+// stagedBlockBucketCap returns, for the session flow, the effective bucket count,
+// the per-bucket staged-block cap, and whether the per-session cap is enabled.
+// maxBlocks is the ceiling (EffectiveMaxStagedBytesPerSession) divided by the CAS
+// block size; buckets = min(BlockUploadStagedBlockBuckets, maxBlocks) so a tiny
+// ceiling does not fan out into 64 near-empty buckets and inflate the real bound.
+// enabled=false when the config disables the per-session cap (or config/db is
+// missing), meaning no ledger check runs.
+func (h *BlockHandler) stagedBlockBucketCap() (bucketCount, bucketCap int, enabled bool) {
 	if h.config == nil || h.db == nil {
-		return 0, false
+		return 0, 0, false
 	}
 	ceiling := h.config.EffectiveMaxStagedBytesPerSession()
 	blockSize := h.config.WebBlockUploadBlockSize()
 	if ceiling <= 0 || blockSize <= 0 {
-		return 0, false
+		return 0, 0, false
 	}
-	maxBlocks := (ceiling + blockSize - 1) / blockSize
+	maxBlocks := (ceiling + blockSize - 1) / blockSize // >= 1
 	buckets := int64(db.BlockUploadStagedBlockBuckets)
+	if maxBlocks < buckets {
+		buckets = maxBlocks
+	}
 	perBucket := (maxBlocks + buckets - 1) / buckets
-	return int(perBucket) + stagedBlockBucketSlack, true
+	return int(buckets), int(perBucket)*stagedBlockBucketCapFactor + stagedBlockBucketSlack, true
 }
 
 // tryAdmitSessionUpload enforces the per-user concurrency cap for the web
@@ -889,20 +897,30 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// double-counts — and self-expires with the session TTL (no Cassandra COUNTER).
 	// If the PUT below fails after the reserve, the row lingers and TTL reclaims it.
 	if resolution == uploadSessionValid {
-		if bucketCap, enabled := h.stagedBlockBucketCap(); enabled {
-			bucket := db.StagedBlockBucket(hash)
+		if bucketCount, bucketCap, enabled := h.stagedBlockBucketCap(); enabled {
+			bucket := db.StagedBlockBucket(hash, bucketCount)
 			staged, err := h.db.CountSessionStagedBlocksInBucket(session.SessionID, bucket, bucketCap+1)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
 				return
 			}
 			if staged >= bucketCap {
-				metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
-				c.Header("Retry-After", "1")
-				c.JSON(http.StatusTooManyRequests, gin.H{"error": "session staging limit reached; commit the file or start a new upload"})
-				return
-			}
-			if err := h.db.ReserveSessionStagedBlock(session.SessionID, bucket, hash, int64(len(data))); err != nil {
+				// The bucket is full — but let a RETRY of an already-reserved block
+				// through (its PUT may have failed): it is already counted, so
+				// admitting it does not grow the bound. Only a genuinely new block
+				// is rejected.
+				reserved, err := h.db.SessionStagedBlockExists(session.SessionID, bucket, hash)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
+					return
+				}
+				if !reserved {
+					metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
+					c.Header("Retry-After", "1")
+					c.JSON(http.StatusTooManyRequests, gin.H{"error": "session staging limit reached; commit the file or start a new upload"})
+					return
+				}
+			} else if err := h.db.ReserveSessionStagedBlock(session.SessionID, bucket, hash, int64(len(data))); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reserve staged block"})
 				return
 			}

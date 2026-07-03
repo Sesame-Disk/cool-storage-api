@@ -788,43 +788,64 @@ func TestBlockUploadConcurrencyLimiter(t *testing.T) {
 // TestStagedBlockBucket verifies the ledger bucket is deterministic and in range
 // (so the reserve is idempotent by (session, bucket, block_id)).
 func TestStagedBlockBucket(t *testing.T) {
-	for _, id := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64), "deadbeef"} {
-		b1 := db.StagedBlockBucket(id)
-		b2 := db.StagedBlockBucket(id)
-		if b1 != b2 {
-			t.Fatalf("bucket for %q not deterministic: %d vs %d", id, b1, b2)
-		}
-		if b1 < 0 || b1 >= db.BlockUploadStagedBlockBuckets {
-			t.Fatalf("bucket %d out of range [0,%d)", b1, db.BlockUploadStagedBlockBuckets)
+	for _, bucketCount := range []int{1, 8, 64} {
+		for _, id := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64), "deadbeef"} {
+			b1 := db.StagedBlockBucket(id, bucketCount)
+			b2 := db.StagedBlockBucket(id, bucketCount)
+			if b1 != b2 {
+				t.Fatalf("bucket for %q (n=%d) not deterministic: %d vs %d", id, bucketCount, b1, b2)
+			}
+			if b1 < 0 || b1 >= bucketCount {
+				t.Fatalf("bucket %d out of range [0,%d)", b1, bucketCount)
+			}
 		}
 	}
 }
 
-// TestStagedBlockBucketCap covers the per-bucket cap math and the enabled flag.
+// TestStagedBlockBucketCap covers the per-bucket cap math, the dynamic bucket
+// count for small ceilings, and the enabled flag.
 func TestStagedBlockBucketCap(t *testing.T) {
-	t.Run("derives per-bucket cap from the ceiling and block size", func(t *testing.T) {
+	newHandler := func(stagedMB int64) *BlockHandler {
 		cfg := &config.Config{}
 		cfg.WebUploads.WebBlockUploadBlockSizeMB = 8
-		cfg.WebUploads.MaxStagedBytesPerSessionMB = 12 * 1024 // 12 GiB explicit
-		h := &BlockHandler{config: cfg, db: &db.DB{}}
+		cfg.WebUploads.MaxStagedBytesPerSessionMB = stagedMB
+		return &BlockHandler{config: cfg, db: &db.DB{}}
+	}
 
-		cap, enabled := h.stagedBlockBucketCap()
+	t.Run("large ceiling fans out to the max bucket count", func(t *testing.T) {
+		h := newHandler(12 * 1024) // 12 GiB / 8 MiB = 1536 blocks
+		buckets, cap, enabled := h.stagedBlockBucketCap()
 		if !enabled {
-			t.Fatal("expected the per-session cap to be enabled")
+			t.Fatal("expected enabled")
 		}
-		// 12 GiB / 8 MiB = 1536 blocks; /64 buckets = 24; + slack.
-		want := 1536/db.BlockUploadStagedBlockBuckets + stagedBlockBucketSlack
+		if buckets != db.BlockUploadStagedBlockBuckets {
+			t.Fatalf("bucketCount = %d, want %d", buckets, db.BlockUploadStagedBlockBuckets)
+		}
+		perBucket := 1536 / db.BlockUploadStagedBlockBuckets // 24
+		want := perBucket*stagedBlockBucketCapFactor + stagedBlockBucketSlack
 		if cap != want {
 			t.Fatalf("bucket cap = %d, want %d", cap, want)
 		}
 	})
 
+	t.Run("tiny ceiling uses few buckets and a bounded total (no explosion)", func(t *testing.T) {
+		h := newHandler(8) // 8 MiB / 8 MiB = 1 block
+		buckets, cap, enabled := h.stagedBlockBucketCap()
+		if !enabled {
+			t.Fatal("expected enabled")
+		}
+		if buckets != 1 {
+			t.Fatalf("bucketCount = %d, want 1 for a single-block ceiling", buckets)
+		}
+		// Total bound = buckets × cap must stay small (was ~192 blocks with the old
+		// fixed-64-buckets bug); here it is 1 × (1×2+3) = 5.
+		if total := buckets * cap; total > 8 {
+			t.Fatalf("total staged-block bound = %d, want a small bounded number (<=8)", total)
+		}
+	})
+
 	t.Run("disabled when the ceiling is disabled", func(t *testing.T) {
-		cfg := &config.Config{}
-		cfg.WebUploads.WebBlockUploadBlockSizeMB = 8
-		cfg.WebUploads.MaxStagedBytesPerSessionMB = -1 // disabled
-		h := &BlockHandler{config: cfg, db: &db.DB{}}
-		if _, enabled := h.stagedBlockBucketCap(); enabled {
+		if _, _, enabled := newHandler(-1).stagedBlockBucketCap(); enabled {
 			t.Fatal("expected disabled when the per-session ceiling is disabled")
 		}
 	})
@@ -834,7 +855,7 @@ func TestStagedBlockBucketCap(t *testing.T) {
 		cfg.WebUploads.WebBlockUploadBlockSizeMB = 8
 		cfg.WebUploads.MaxStagedBytesPerSessionMB = 100
 		h := &BlockHandler{config: cfg}
-		if _, enabled := h.stagedBlockBucketCap(); enabled {
+		if _, _, enabled := h.stagedBlockBucketCap(); enabled {
 			t.Fatal("expected disabled when db is nil (no ledger to check)")
 		}
 	})

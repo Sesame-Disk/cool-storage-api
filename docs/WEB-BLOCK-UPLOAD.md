@@ -947,21 +947,31 @@ flag were on*.
      never desync. The claimed slot is stored on the session row and released at
      commit by `CleanupCommittedBlockUploadSessionCaps` — **best-effort, after** the
      critical `MarkBlockUploadSessionCommitted`, never coupled to it.
-   - **Per-session staged-block cap.** A **bucketed ledger**
-     (`block_upload_session_staged_blocks`, `((session_id, bucket), block_id)`,
-     64 buckets, per-row TTL — no Cassandra COUNTER) of the distinct NEW blocks a
-     session has staged. `/blocks/upload` **reserves before the PUT** (fail-closed):
-     it counts one small bucket (`LIMIT bucketCap+1`, O(1) rows, no O(N²) re-scan)
-     and rejects with `429` at the cap, else inserts the row (idempotent by PK, so a
-     retry never double-counts) and stores. The ceiling is
+   - **Per-session staged-block cap (loose anti-abuse backstop).** A **bucketed
+     ledger** (`block_upload_session_staged_blocks`, `((session_id, bucket),
+     block_id)`, up to 64 buckets, per-row TTL — no Cassandra COUNTER) of the
+     distinct NEW blocks a session has staged. `/blocks/upload` **reserves before
+     the PUT** (fail-closed): it counts one small bucket (`LIMIT bucketCap+1`, O(1)
+     rows, no O(N²) re-scan) and rejects with `429` at the cap, else inserts the row
+     (idempotent by PK, so a retry never double-counts) and stores. A retry of an
+     already-reserved block is admitted even when its bucket is full (it is already
+     counted). **The bucket count is dynamic** (`min(64, maxBlocks)`) and the
+     per-bucket cap carries headroom for hash-collision variance, so it never
+     falsely rejects a legit file — which makes the *total* a deliberately **loose,
+     bounded overshoot** (~2–4× the ceiling worst case), **not an exact byte cap**,
+     and NOT atomic per block (a concurrent burst can overshoot by up to the
+     concurrency; no per-block Paxos). This is acceptable because the EXACT per-file
+     bound is enforced elsewhere (below). The ceiling is
      `web_uploads.max_staged_bytes_per_session_mb` (0 = derive from the max file size
      × 1.25; unlimited max file size falls back to a documented default; `<0`
-     disables) — effectively the **maximum web-block file size**, since one session
-     uploads one file.
-   - **Fail-fast + commit guard.** `block-upload-session` accepts the client's
-     declared `size`, rejects `size > ceiling` with `413` before any hashing/upload,
-     stores it as `expected_size`, and the commit additionally requires
-     `manifest.size == expected_size` (on top of R6's `sum(sizes) == size`).
+     disables).
+   - **Exact bound: fail-fast + commit guard.** When the ceiling is enabled,
+     `block-upload-session` **requires** the client's declared `size` (400 if
+     missing), rejects `size > ceiling` with `413` before any hashing/upload, stores
+     it as `expected_size`, and the commit requires `manifest.size == expected_size`
+     (on top of R6's `sum(sizes) == size`). This pair is the real, exact
+     per-file size limit; the staged-block ledger above only bounds a *misbehaving*
+     client that under-declares `size` and then PUTs extra unique blocks.
 
    Rejections are counted by `block_upload_session_admission_rejections_total{reason}`
    (`max_sessions` | `staged_blocks`). Bound per user ≈ `session_cap ×

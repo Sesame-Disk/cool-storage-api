@@ -106,15 +106,25 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 		return
 	}
 
-	// Fail fast: a declared size over the per-session staging ceiling (the maximum
-	// web-block file size) is rejected before any hashing/upload (item 1).
-	if ceiling := h.config.EffectiveMaxStagedBytesPerSession(); ceiling > 0 && req.Size > ceiling {
-		metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
-			"error":    "file exceeds the maximum web-block upload size",
-			"max_size": ceiling,
-		})
-		return
+	// When the per-session staging ceiling is enabled, `size` is REQUIRED so the
+	// exact per-file bound (this fail-fast check + the commit's
+	// manifest.size == expected_size guard) always applies — a client that omits it
+	// could otherwise only be caught by the looser staged-block ledger backstop.
+	if ceiling := h.config.EffectiveMaxStagedBytesPerSession(); ceiling > 0 {
+		if req.Size == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "size is required"})
+			return
+		}
+		// Fail fast: a declared size over the per-session ceiling (the maximum
+		// web-block file size) is rejected before any hashing/upload (item 1).
+		if req.Size > ceiling {
+			metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+				"error":    "file exceeds the maximum web-block upload size",
+				"max_size": ceiling,
+			})
+			return
+		}
 	}
 
 	session, err := h.db.CreateAdmittedBlockUploadSession(

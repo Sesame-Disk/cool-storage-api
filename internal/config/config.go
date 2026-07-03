@@ -72,11 +72,16 @@ type WebUploadsConfig struct {
 	// without a drifting aggregate counter. A value <= 0 disables the cap.
 	// See docs/WEB-BLOCK-UPLOAD.md item 1.
 	MaxUncommittedBlockSessionsPerUser int `yaml:"max_uncommitted_block_sessions_per_user"`
-	// MaxStagedBytesPerSessionMB is the per-session staged-bytes ceiling — in
-	// effect the MAXIMUM web-block file size, because one session uploads one file.
-	// > 0 = explicit MB; 0 = derive from the resolved max file size × 1.25 (falling
-	// back to a documented operational default when max file size is unlimited);
-	// < 0 = disable the per-session cap. See EffectiveMaxStagedBytesPerSession().
+	// MaxStagedBytesPerSessionMB is the per-session staging ceiling — in effect the
+	// MAXIMUM web-block file size, because one session uploads one file. The EXACT
+	// per-file bound is enforced by the declared-size fail-fast at session creation
+	// plus the commit's manifest.size == expected_size guard; the per-block
+	// staged-block ledger derived from this value is a deliberately LOOSE anti-abuse
+	// backstop (total staged blocks bounded to ~2–4× this value in the worst case),
+	// not an exact byte limit. > 0 = explicit MB; 0 = derive from the resolved max
+	// file size × 1.25 (falling back to a documented operational default when max
+	// file size is unlimited); < 0 = disable the per-session cap.
+	// See EffectiveMaxStagedBytesPerSession().
 	MaxStagedBytesPerSessionMB int64 `yaml:"max_staged_bytes_per_session_mb"`
 	MaxFileSizeMB              int64 `yaml:"max_file_size_mb"`
 	MaxFilesPerBatch          int   `yaml:"max_files_per_batch"`

@@ -1,26 +1,54 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"time"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
-// BlockUploadStagedBlockBuckets is the number of ledger buckets a session's
-// staged blocks are spread across. Bucketing keeps the per-block admission read
-// O(1) rows (one small bucket) instead of an O(N^2) partition re-scan for large
-// files: for a 12 GB file (~1536 8 MB blocks) each of 64 buckets holds ~24 rows.
-// It is a fixed protocol constant (changing it re-buckets existing sessions), so
-// it is not configurable. See docs/WEB-BLOCK-UPLOAD.md item 1.
+// BlockUploadStagedBlockBuckets is the MAXIMUM number of ledger buckets a
+// session's staged blocks are spread across. Bucketing keeps the per-block
+// admission read O(1) rows (one small bucket) instead of an O(N^2) partition
+// re-scan for large files: for a 12 GB file (~1536 8 MB blocks) each of 64
+// buckets holds ~24 rows. The EFFECTIVE bucket count is chosen per session as
+// min(this, maxBlocks) so a tiny ceiling does not fan out into 64 near-empty
+// buckets (which, times a per-bucket slack, would inflate the real bound). See
+// docs/WEB-BLOCK-UPLOAD.md item 1 and the caller's stagedBlockBucketCap.
 const BlockUploadStagedBlockBuckets = 64
 
-// StagedBlockBucket maps a block id to its ledger bucket. Deterministic, so the
-// same block always lands in the same (session_id, bucket) partition and the
-// reserve is idempotent under retries.
-func StagedBlockBucket(blockID string) int {
+// StagedBlockBucket maps a block id to its ledger bucket for a session using
+// `bucketCount` buckets. Deterministic for a fixed bucketCount, so the same block
+// always lands in the same (session_id, bucket) partition and the reserve is
+// idempotent under retries. bucketCount must be >= 1.
+func StagedBlockBucket(blockID string, bucketCount int) int {
+	if bucketCount < 1 {
+		bucketCount = 1
+	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(blockID))
-	return int(h.Sum32() % uint32(BlockUploadStagedBlockBuckets))
+	return int(h.Sum32() % uint32(bucketCount))
+}
+
+// SessionStagedBlockExists reports whether a block is already reserved in the
+// session's ledger. Used to let a retry through even when its bucket is at the
+// cap (e.g. the block was reserved but its PUT failed and is being retried) — the
+// block is already counted, so admitting it does not grow the bound.
+func (db *DB) SessionStagedBlockExists(sessionID string, bucket int, blockID string) (bool, error) {
+	var got string
+	err := db.Session().Query(`
+		SELECT block_id FROM block_upload_session_staged_blocks
+		WHERE session_id = ? AND bucket = ? AND block_id = ?
+	`, sessionID, bucket, blockID).Scan(&got)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("check staged block session=%s block=%s: %w", sessionID, blockID, err)
+	}
+	return true, nil
 }
 
 // CountSessionStagedBlocksInBucket returns how many distinct blocks the session
