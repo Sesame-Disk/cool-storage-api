@@ -901,6 +901,7 @@ func testSyncHeadSameHeadRepairsMissingOwnerProjection(t *testing.T, method, rou
 		return true
 	})
 
+	registerAdminLibraryProjectionRestoreCleanup(t, session, defaultOrgID, repoID)
 	if err := session.Query(`DELETE FROM libraries_by_owner WHERE org_id = ? AND owner_id = ? AND library_id = ?`, defaultOrgID, ownerID, repoID).Exec(); err != nil {
 		t.Fatalf("failed to remove owner projection row for repo %s: %v", repoID, err)
 	}
@@ -996,6 +997,7 @@ func testSyncHeadSameHeadRepairsMissingOrgProjection(t *testing.T, method, route
 		return true
 	})
 
+	registerAdminLibraryProjectionRestoreCleanup(t, session, defaultOrgID, repoID)
 	if err := session.Query(`DELETE FROM libraries_by_org_updated WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Exec(); err != nil {
 		t.Fatalf("failed to remove org projection row for repo %s: %v", repoID, err)
 	}
@@ -1088,6 +1090,7 @@ func testSyncHeadSameHeadRepairsMissingGlobalProjection(t *testing.T, method, ro
 		return true
 	})
 
+	registerAdminLibraryProjectionRestoreCleanup(t, session, defaultOrgID, repoID)
 	// Delete the global projection row from every active bucket day; the
 	// canary reads via the canonical created_at-derived bucket, but the
 	// fixture stays robust against clock skew during test setup.
@@ -1182,6 +1185,7 @@ func testSyncHeadSameHeadRepairsDriftedProjectionStats(t *testing.T, method, rou
 		return true
 	})
 
+	registerAdminLibraryProjectionRestoreCleanup(t, session, defaultOrgID, repoID)
 	const driftBytes int64 = 7777777
 	const driftFiles int64 = 99
 	if err := session.Query(`UPDATE libraries_by_org_updated SET size_bytes = ?, file_count = ? WHERE org_id = ? AND library_id = ?`, driftBytes, driftFiles, defaultOrgID, repoID).Exec(); err != nil {
@@ -1190,14 +1194,13 @@ func testSyncHeadSameHeadRepairsDriftedProjectionStats(t *testing.T, method, rou
 	if err := session.Query(`UPDATE libraries_by_owner SET size_bytes = ?, file_count = ? WHERE org_id = ? AND owner_id = ? AND library_id = ?`, driftBytes, driftFiles, defaultOrgID, ownerID, repoID).Exec(); err != nil {
 		t.Fatalf("failed to drift owner projection size/file count for repo %s: %v", repoID, err)
 	}
-	buckets, err := dbpkg.ListAdminLibraryBucketDays(session)
-	if err != nil {
-		t.Fatalf("failed to list admin library bucket days for repo %s: %v", repoID, err)
+	globalRow, ok := globalAdminLibraryProjectionRowForTest(t, session, defaultOrgID, repoID)
+	if !ok {
+		t.Fatalf("global projection row unexpectedly missing for repo %s before drift", repoID)
 	}
-	for _, bucketDay := range buckets {
-		if err := session.Query(`UPDATE libraries_admin_global_by_updated SET size_bytes = ?, file_count = ? WHERE bucket_day = ? AND org_id = ? AND library_id = ?`, driftBytes, driftFiles, bucketDay, defaultOrgID, repoID).Exec(); err != nil {
-			t.Fatalf("failed to drift global projection size/file count for repo %s bucket %s: %v", repoID, bucketDay, err)
-		}
+	bucketDay := dbpkg.AdminLibraryBucketDay(globalRow.CreatedAt)
+	if err := session.Query(`UPDATE libraries_admin_global_by_updated SET size_bytes = ?, file_count = ? WHERE bucket_day = ? AND org_id = ? AND library_id = ?`, driftBytes, driftFiles, bucketDay, defaultOrgID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to drift global projection size/file count for repo %s bucket %s: %v", repoID, bucketDay, err)
 	}
 
 	idempotentResp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(nextHead)), nil)
@@ -1836,6 +1839,7 @@ func deletedAdminLibraryProjectionRowForTest(t *testing.T, session *gocql.Sessio
 
 func removeAdminLibraryProjectionRowsForSoftDeleteFallbackTest(t *testing.T, session *gocql.Session, orgID, repoID, ownerID string) {
 	t.Helper()
+	registerAdminLibraryProjectionRestoreCleanup(t, session, orgID, repoID)
 	if err := session.Query(`DELETE FROM libraries_by_org_updated WHERE org_id = ? AND library_id = ?`, orgID, repoID).Exec(); err != nil {
 		t.Fatalf("failed to remove org projection row for repo %s: %v", repoID, err)
 	}
@@ -1859,6 +1863,8 @@ func removeAdminLibraryProjectionRowsForSoftDeleteFallbackTest(t *testing.T, ses
 // broken state, so the fixture is intentionally low-level.
 func removeLibraryBaseRowsForFallbackTest(t *testing.T, session *gocql.Session, repoID string) {
 	t.Helper()
+	snapshot := snapshotLibraryBaseRowsForCleanup(t, session, defaultOrgID, repoID)
+	registerLibraryBaseRowRestoreCleanup(t, session, snapshot)
 	if err := session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Exec(); err != nil {
 		t.Fatalf("failed to remove base library row for repo %s: %v", repoID, err)
 	}
@@ -1875,6 +1881,169 @@ type syntheticDirEntry struct {
 	Name string `json:"name"`
 	Mode int    `json:"mode"`
 	Size int64  `json:"size,omitempty"`
+}
+
+type libraryBaseRowSnapshot struct {
+	OrgID            string
+	LibraryID        string
+	OwnerID          string
+	Name             string
+	Description      string
+	Encrypted        bool
+	EncVersion       int
+	Magic            string
+	RandomKey        string
+	Salt             string
+	MagicStrong      string
+	RandomKeyStrong  string
+	RootCommitID     string
+	HeadCommitID     string
+	StorageClass     string
+	SizeBytes        int64
+	FileCount        int64
+	VersionTTLDays   int
+	AutoDeleteDays   int
+	DeletedAt        *time.Time
+	DeletedBy        *string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	DeletedMarkerSet bool
+}
+
+func registerAdminLibraryProjectionRestoreCleanup(t *testing.T, session *gocql.Session, orgID, repoID string) {
+	t.Helper()
+
+	row, err := dbpkg.ReadAdminLibraryProjectionRow(session, orgID, repoID)
+	if err != nil {
+		t.Fatalf("failed to snapshot admin library projection for repo %s: %v", repoID, err)
+	}
+
+	t.Cleanup(func() {
+		batch := session.Batch(gocql.LoggedBatch)
+		dbpkg.AddUpsertAdminLibraryReadModelQuery(batch, row)
+		if err := batch.Exec(); err != nil {
+			t.Errorf("cleanup restore admin library projections for repo %s failed: %v", repoID, err)
+		}
+	})
+}
+
+func snapshotLibraryBaseRowsForCleanup(t *testing.T, session *gocql.Session, orgID, repoID string) libraryBaseRowSnapshot {
+	t.Helper()
+
+	var deletedAt time.Time
+	var deletedBy string
+	snapshot := libraryBaseRowSnapshot{OrgID: orgID, LibraryID: repoID}
+	if err := session.Query(`
+		SELECT owner_id, name, description, encrypted, enc_version, magic, random_key, salt,
+		       magic_strong, random_key_strong, root_commit_id, head_commit_id, storage_class,
+		       size_bytes, file_count, version_ttl_days, auto_delete_days, deleted_at,
+		       deleted_by, created_at, updated_at
+		FROM libraries
+		WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(
+		&snapshot.OwnerID,
+		&snapshot.Name,
+		&snapshot.Description,
+		&snapshot.Encrypted,
+		&snapshot.EncVersion,
+		&snapshot.Magic,
+		&snapshot.RandomKey,
+		&snapshot.Salt,
+		&snapshot.MagicStrong,
+		&snapshot.RandomKeyStrong,
+		&snapshot.RootCommitID,
+		&snapshot.HeadCommitID,
+		&snapshot.StorageClass,
+		&snapshot.SizeBytes,
+		&snapshot.FileCount,
+		&snapshot.VersionTTLDays,
+		&snapshot.AutoDeleteDays,
+		&deletedAt,
+		&deletedBy,
+		&snapshot.CreatedAt,
+		&snapshot.UpdatedAt,
+	); err != nil {
+		t.Fatalf("failed to snapshot base library row for repo %s: %v", repoID, err)
+	}
+	if !deletedAt.IsZero() {
+		deletedCopy := deletedAt
+		snapshot.DeletedAt = &deletedCopy
+	}
+	if deletedBy != "" {
+		deletedByCopy := deletedBy
+		snapshot.DeletedBy = &deletedByCopy
+	}
+
+	var markerOrgID, markerStorageClass string
+	var markerDeletedAt time.Time
+	if err := session.Query(`
+		SELECT org_id, deleted_at, storage_class FROM deleted_libraries WHERE library_id = ?
+	`, repoID).Scan(&markerOrgID, &markerDeletedAt, &markerStorageClass); err == nil {
+		snapshot.DeletedMarkerSet = true
+		if snapshot.DeletedAt == nil && !markerDeletedAt.IsZero() {
+			deletedCopy := markerDeletedAt
+			snapshot.DeletedAt = &deletedCopy
+		}
+		if snapshot.StorageClass == "" {
+			snapshot.StorageClass = markerStorageClass
+		}
+	} else if err != gocql.ErrNotFound {
+		t.Fatalf("failed to snapshot deleted_libraries row for repo %s: %v", repoID, err)
+	}
+
+	return snapshot
+}
+
+// registerLibraryBaseRowRestoreCleanup restores the base library rows removed
+// by removeLibraryBaseRowsForFallbackTest, but only if the test failed before
+// the code under test (GC hard-delete / admin trash-clean) could finish
+// purging them. On a passing test, the library's terminal state is meant to
+// be fully gone - restoring it there would resurrect rows with no admin
+// projection backing, permanently orphaned and invisible to both the stale
+// -library reaper (which skips soft-deleted rows) and the orphan-projection
+// guard (which only checks projection-without-canonical, not the reverse).
+func registerLibraryBaseRowRestoreCleanup(t *testing.T, session *gocql.Session, snapshot libraryBaseRowSnapshot) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		batch := session.Batch(gocql.LoggedBatch)
+		batch.Query(`
+			INSERT INTO libraries (
+				org_id, library_id, owner_id, name, description, encrypted, enc_version, magic,
+				random_key, salt, magic_strong, random_key_strong, root_commit_id, head_commit_id,
+				storage_class, size_bytes, file_count, version_ttl_days, auto_delete_days,
+				deleted_at, deleted_by, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			snapshot.OrgID, snapshot.LibraryID, snapshot.OwnerID, snapshot.Name, snapshot.Description,
+			snapshot.Encrypted, snapshot.EncVersion, snapshot.Magic, snapshot.RandomKey, snapshot.Salt,
+			snapshot.MagicStrong, snapshot.RandomKeyStrong, snapshot.RootCommitID, snapshot.HeadCommitID,
+			snapshot.StorageClass, snapshot.SizeBytes, snapshot.FileCount, snapshot.VersionTTLDays,
+			snapshot.AutoDeleteDays, snapshot.DeletedAt, snapshot.DeletedBy, snapshot.CreatedAt, snapshot.UpdatedAt,
+		)
+		batch.Query(`
+			INSERT INTO libraries_by_id (
+				library_id, org_id, owner_id, name, head_commit_id, encrypted, enc_version, magic,
+				random_key, salt, magic_strong, random_key_strong
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			snapshot.LibraryID, snapshot.OrgID, snapshot.OwnerID, snapshot.Name, snapshot.HeadCommitID,
+			snapshot.Encrypted, snapshot.EncVersion, snapshot.Magic, snapshot.RandomKey, snapshot.Salt,
+			snapshot.MagicStrong, snapshot.RandomKeyStrong,
+		)
+		if snapshot.DeletedMarkerSet && snapshot.DeletedAt != nil {
+			batch.Query(`
+				INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class)
+				VALUES (?, ?, ?, ?)
+			`, snapshot.LibraryID, snapshot.OrgID, *snapshot.DeletedAt, snapshot.StorageClass)
+		}
+		if err := batch.Exec(); err != nil {
+			t.Errorf("cleanup restore base library rows for repo %s failed: %v", snapshot.LibraryID, err)
+		}
+	})
 }
 
 func insertSyntheticDirectoryTreeForTest(t *testing.T, session *gocql.Session, repoID, rootFSID string, childDirCount, filesPerChild int, fileSize int64) {
