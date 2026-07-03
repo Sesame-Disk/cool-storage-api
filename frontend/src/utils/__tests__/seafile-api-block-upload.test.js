@@ -35,8 +35,25 @@ describe('seafileAPI block-upload session id transport', () => {
     const checkBlocksBody = apiContent.match(/seafileAPI\.checkBlocks = function[\s\S]*?\n};/)[0];
     const uploadBlockBody = apiContent.match(/seafileAPI\.uploadBlock = function[\s\S]*?\n};/)[0];
 
-    expect(checkBlocksBody).toMatch(/withBlockUploadSessionHeader\(config, session\)/);
-    expect(uploadBlockBody).toMatch(/withBlockUploadSessionHeader\(config, session\)/);
+    expect(checkBlocksBody).toMatch(/withBlockUploadSessionHeader\([\s\S]*session\)/);
+    expect(uploadBlockBody).toMatch(/withBlockUploadSessionHeader\([\s\S]*session\)/);
+  });
+
+  test('block-upload requests opt into propagated 401 handling', () => {
+    expect(apiContent).toMatch(/function withBlockUploadAuthHandling\(config\)/);
+
+    const createSessionBody = apiContent.match(/seafileAPI\.createBlockUploadSession = function[\s\S]*?\n};/)[0];
+    const checkBlocksBody = apiContent.match(/seafileAPI\.checkBlocks = function[\s\S]*?\n};/)[0];
+    const uploadBlockBody = apiContent.match(/seafileAPI\.uploadBlock = function[\s\S]*?\n};/)[0];
+    const commitBody = apiContent.match(/seafileAPI\.createFileFromBlocks = function[\s\S]*?\n};/)[0];
+    const interceptorBody = apiContent.match(/function setupResponseInterceptor\(\)[\s\S]*?\n}/)[0];
+
+    expect(createSessionBody).toMatch(/withBlockUploadAuthHandling\(config\)/);
+    expect(checkBlocksBody).toMatch(/withBlockUploadAuthHandling\(config\)/);
+    expect(uploadBlockBody).toMatch(/withBlockUploadAuthHandling\(config\)/);
+    expect(commitBody).toMatch(/withBlockUploadAuthHandling\(config\)/);
+    expect(interceptorBody).toMatch(/error\.config && error\.config\._propagate401/);
+    expect(interceptorBody).toMatch(/return Promise\.reject\(error\);/);
   });
 
   test('withBlockUploadSessionHeader sets X-Block-Upload-Session and never mutates the caller config', () => {

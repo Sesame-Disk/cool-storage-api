@@ -201,7 +201,15 @@ class FileUploader extends React.Component {
 
   hasActiveUploadWork = () => {
     return this.state.isUploadProgressDialogShow
-      && this.state.uploadFileList.some(file => file && !file.isSaved && !file.error);
+      && this.hasPendingUploadEntries(this.state.uploadFileList);
+  };
+
+  hasPendingUploadEntries = (uploadFileList = this.state.uploadFileList) => {
+    return uploadFileList.some(file => (
+      file
+      && !file.isSaved
+      && !file.error
+    ));
   };
 
   hasUploadingEntries = (uploadFileList = this.state.uploadFileList) => {
@@ -264,7 +272,7 @@ class FileUploader extends React.Component {
 
   isUploading = () => {
     return Boolean(this.resumable && this.resumable.isUploading && this.resumable.isUploading())
-      || this.hasUploadingEntries();
+      || this.hasPendingUploadEntries();
   };
 
   cancelActiveUploads = (uploadFileList = this.state.uploadFileList) => {
@@ -670,6 +678,7 @@ class FileUploader extends React.Component {
       _cancelled: false,
       _progress: 0,
       _uploading: true,
+      _blockUploadHashCache: null,
       // Dedup plan from /blocks/check (set via onPlan): bytes already on the server
       // (shared/repeated blocks) vs bytes actually uploaded. 0 until the check runs.
       _dedupedBytes: 0,
@@ -810,7 +819,9 @@ class FileUploader extends React.Component {
       // Shared global ceiling: every block upload competes for the same slots.
       limiter: this.blockLimiter,
       signal: abortController ? abortController.signal : undefined,
+      hashCache: entry._blockUploadHashCache,
       onPhase: (phase) => this.setBlockUploadPhase(entry, phase),
+      onHashCache: (cache) => { entry._blockUploadHashCache = cache; },
       onPlan: (plan) => this.setBlockUploadPlan(entry, plan),
       waitForUploadSlot,
       onReadyForUpload,
@@ -819,6 +830,7 @@ class FileUploader extends React.Component {
       onTransferProgress: (deltaBytes) => this.updateBlockUploadTransferredBytes(entry, deltaBytes),
     }).then(result => {
       entry._abortController = null;
+      entry._blockUploadHashCache = null;
       entry._progress = 1;
       entry._uploading = false;
       entry._phase = 'done';
@@ -1811,7 +1823,7 @@ class FileUploader extends React.Component {
     });
 
     const hasActiveUploads = Boolean(this.resumable && this.resumable.isUploading && this.resumable.isUploading())
-      || this.hasUploadingEntries(uploadFileList);
+      || this.hasPendingUploadEntries(uploadFileList);
 
     if (!hasActiveUploads) {
       this.loaded = 0;

@@ -457,11 +457,15 @@ const (
 	uploadSessionAbsent uploadSessionResolution = iota
 	uploadSessionValid
 	uploadSessionInvalid
+	uploadSessionUnavailable
 	uploadSessionHeaderRequired
 	uploadSessionPermissionDenied
 )
 
 func (r uploadSessionResolution) deniedStatus() int {
+	if r == uploadSessionUnavailable {
+		return http.StatusServiceUnavailable
+	}
 	if r == uploadSessionPermissionDenied {
 		return http.StatusForbidden
 	}
@@ -474,6 +478,9 @@ func (r uploadSessionResolution) deniedStatus() int {
 func (r uploadSessionResolution) deniedMessage() string {
 	if r == uploadSessionHeaderRequired {
 		return "block upload session must be sent via X-Block-Upload-Session header"
+	}
+	if r == uploadSessionUnavailable {
+		return "upload session unavailable"
 	}
 	if r == uploadSessionPermissionDenied {
 		return "upload is no longer allowed for this session"
@@ -493,11 +500,17 @@ func (h *BlockHandler) resolveUploadSession(c *gin.Context) (db.BlockUploadSessi
 	if sessionID == "" {
 		return db.BlockUploadSession{}, uploadSessionAbsent
 	}
-	if h.db == nil || !h.blockUploadFlowEnabled() {
+	if !h.blockUploadFlowEnabled() {
 		return db.BlockUploadSession{}, uploadSessionInvalid
 	}
+	if h.db == nil {
+		return db.BlockUploadSession{}, uploadSessionUnavailable
+	}
 	session, found, err := h.db.GetBlockUploadSession(sessionID)
-	if err != nil || !found {
+	if err != nil {
+		return db.BlockUploadSession{}, uploadSessionUnavailable
+	}
+	if !found {
 		return db.BlockUploadSession{}, uploadSessionInvalid
 	}
 	if session.OrgID != c.GetString("org_id") || session.UserID != c.GetString("user_id") {

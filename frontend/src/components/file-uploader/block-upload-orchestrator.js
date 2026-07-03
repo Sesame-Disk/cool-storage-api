@@ -24,6 +24,8 @@ const CHECK_BATCH_SIZE = 5000;
 // check, commit) transfers little data and should never hang a multi-GB upload
 // indefinitely on a half-open socket, so cap it.
 export const CONTROL_PLANE_TIMEOUT_MS = 120000;
+const CONTROL_PLANE_RETRY_ATTEMPTS = 3;
+const CONTROL_PLANE_RETRY_BASE_MS = 500;
 
 // Commits can legitimately run much longer than session/check because the server
 // may need to verify a large manifest, promote refs and serialize metadata.
@@ -84,6 +86,61 @@ function isRequestTimeoutError(error) {
     return true;
   }
   return String(error.message || '').toLowerCase().includes('timeout');
+}
+
+function isRetriableGatewayStatus(status) {
+  return status === 502 || status === 503 || status === 504;
+}
+
+// isRetriableControlPlaneError reports transient failures where retrying the
+// light control-plane request is safe: upstream/proxy 5xx, bounded request
+// timeout, or a network failure with no HTTP response.
+function isRetriableControlPlaneError(error) {
+  if (!error || isAbortError(error)) {
+    return false;
+  }
+  const status = error && error.response && error.response.status;
+  if (isRetriableGatewayStatus(status) || isRequestTimeoutError(error)) {
+    return true;
+  }
+  if (error.response) {
+    return false;
+  }
+  const code = String(error.code || '').toUpperCase();
+  if (code === 'ERR_NETWORK' || code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'EAI_AGAIN') {
+    return true;
+  }
+  return String(error.message || '').toLowerCase().includes('network');
+}
+
+function normalizeAttempts(value, fallback) {
+  const fallbackCount = Math.max(1, Math.floor(Number(fallback) || 1));
+  const count = Number(value);
+  if (!Number.isFinite(count)) {
+    return fallbackCount;
+  }
+  return Math.max(1, Math.floor(count));
+}
+
+async function withControlPlaneRetry(fn, attempts, { signal, baseMs = CONTROL_PLANE_RETRY_BASE_MS } = {}) {
+  const maxAttempts = normalizeAttempts(attempts, CONTROL_PLANE_RETRY_ATTEMPTS);
+  let lastErr;
+  for (let i = 1; i <= maxAttempts; i += 1) {
+    throwIfAborted(signal);
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRetriableControlPlaneError(err) || i >= maxAttempts) {
+        throw err;
+      }
+      const jitter = Math.floor(Math.random() * 250);
+      // eslint-disable-next-line no-await-in-loop
+      await waitWithAbort(Math.min(baseMs * 2 ** (i - 1), 5000) + jitter, signal);
+    }
+  }
+  throw lastErr;
 }
 
 // uploadBlockWithStallGuard uploads one block and aborts+rejects it if no bytes
@@ -326,6 +383,7 @@ const MAX_BACKPRESSURE_WAITS = 8;
 // off on every failed attempt, including a 429, so client concurrency drops in
 // response to the server signal.
 async function withRetry(fn, attempts, { signal } = {}) {
+  const maxAttempts = normalizeAttempts(attempts, 3);
   let lastErr;
   let hardAttempt = 0;
   let softWaits = 0;
@@ -345,13 +403,65 @@ async function withRetry(fn, attempts, { signal } = {}) {
         continue;
       }
       hardAttempt += 1;
-      if (hardAttempt >= attempts) {
+      if (hardAttempt >= maxAttempts) {
         break;
       }
       await waitWithAbort(100 * 2 ** (hardAttempt - 1), signal);
     }
   }
   throw lastErr;
+}
+
+function buildFileFingerprint(file) {
+  if (!file) {
+    return null;
+  }
+  return {
+    name: String(file.name || ''),
+    lastModified: Number(file.lastModified) || 0,
+    relativePath: String(file.relativePath || file.webkitRelativePath || ''),
+  };
+}
+
+function buildHashPlanCache(blocks, size, blockSize, file) {
+  const blockIndexByHash = {};
+  blocks.forEach((b) => { blockIndexByHash[b.sha256] = b.index; });
+  return {
+    blockSize,
+    size,
+    blocks,
+    fileFingerprint: buildFileFingerprint(file),
+    blockIndexByHash,
+    uniqueHashes: Array.from(new Set(blocks.map((b) => b.sha256))),
+  };
+}
+
+function sameFileFingerprint(expected, actual) {
+  return Boolean(expected && actual)
+    && expected.name === actual.name
+    && expected.lastModified === actual.lastModified
+    && expected.relativePath === actual.relativePath;
+}
+
+function restoreHashPlanFromCache(hashCache, file, blockSize) {
+  if (!hashCache || !Array.isArray(hashCache.blocks) || !Array.isArray(hashCache.uniqueHashes)) {
+    return null;
+  }
+  if (hashCache.size !== file.size || hashCache.blockSize !== blockSize) {
+    return null;
+  }
+  if (!hashCache.blockIndexByHash || typeof hashCache.blockIndexByHash !== 'object') {
+    return null;
+  }
+  if (!sameFileFingerprint(hashCache.fileFingerprint, buildFileFingerprint(file))) {
+    return null;
+  }
+  return {
+    blocks: hashCache.blocks,
+    size: hashCache.size,
+    blockIndexByHash: hashCache.blockIndexByHash,
+    uniqueHashes: hashCache.uniqueHashes,
+  };
 }
 
 // uploadMissingBlocks uploads the given block hashes, gating EACH block on a slot
@@ -454,13 +564,16 @@ function isCommitInProgress(err) {
   return String(data.error || '').trim().toLowerCase() === 'commit still in progress; retry';
 }
 
-// commitFromManifest posts the commit, retrying ONLY the transient "commit still
-// in progress" 409 with bounded exponential backoff. Every other outcome (success,
-// needs_upload conflict, permanent 409, abort, other errors) is returned/thrown to
-// the caller unchanged so the existing needs_upload path and fallbacks still work.
+// commitFromManifest posts the commit, retrying transient commit-finalizing
+// conflicts plus control-plane transport failures (timeout / 502 / 503 / 504 /
+// network) with bounded exponential backoff. Every other outcome (success,
+// needs_upload conflict, permanent 409, abort, other errors) is returned/thrown
+// to the caller unchanged so the existing needs_upload path and fallbacks still
+// work.
 async function commitFromManifest(api, repoID, manifest, { signal, attempts, baseMs, timeout }) {
+  const maxAttempts = normalizeAttempts(attempts, 6);
   let lastErr;
-  for (let i = 1; i <= attempts; i += 1) {
+  for (let i = 1; i <= maxAttempts; i += 1) {
     throwIfAborted(signal);
     try {
       // eslint-disable-next-line no-await-in-loop
@@ -469,7 +582,7 @@ async function commitFromManifest(api, repoID, manifest, { signal, attempts, bas
     } catch (err) {
       lastErr = err;
       if (isAbortError(err) || (signal && signal.aborted)) throw err;
-      if ((isCommitInProgress(err) || isRequestTimeoutError(err)) && i < attempts) {
+      if ((isCommitInProgress(err) || isRetriableControlPlaneError(err)) && i < maxAttempts) {
         // eslint-disable-next-line no-await-in-loop
         await waitWithAbort(Math.min(baseMs * 2 ** (i - 1), 5000), signal);
         // eslint-disable-next-line no-continue
@@ -491,6 +604,7 @@ export async function uploadFileViaBlocks(file, {
   replace = false,
   api = seafileAPI,
   hashFn = hashFileWithWorker,
+  hashCache = null,
   blockSize = BLOCK_SIZE,
   // Global per-component concurrency limiter shared across all block uploads; it
   // bounds the TOTAL blocks on the wire to the configured ceiling. `concurrency` is
@@ -504,8 +618,11 @@ export async function uploadFileViaBlocks(file, {
   blockStallTimeoutMs = BLOCK_STALL_TIMEOUT_MS,
   blockResponseTimeoutMs = BLOCK_RESPONSE_TIMEOUT_MS,
   controlPlaneTimeoutMs = CONTROL_PLANE_TIMEOUT_MS,
+  controlPlaneRetries = CONTROL_PLANE_RETRY_ATTEMPTS,
+  controlPlaneRetryBaseMs = CONTROL_PLANE_RETRY_BASE_MS,
   commitTimeoutMs = COMMIT_TIMEOUT_MS,
   onHashProgress,
+  onHashCache,
   onUploadProgress,
   onTransferProgress,
   onPhase,
@@ -529,7 +646,11 @@ export async function uploadFileViaBlocks(file, {
   throwIfAborted(signal);
 
   // 1. Server-issued session.
-  const sessionResp = await api.createBlockUploadSession(repoID, parentDir, ctrlConfig);
+  const sessionResp = await withControlPlaneRetry(
+    () => api.createBlockUploadSession(repoID, parentDir, ctrlConfig),
+    controlPlaneRetries,
+    { signal, baseMs: controlPlaneRetryBaseMs },
+  );
   const session = sessionResp.data.session_id;
 
   // The server is authoritative on the CAS block size: hash/slice to exactly the
@@ -540,11 +661,29 @@ export async function uploadFileViaBlocks(file, {
     blockSize = serverBlockSize;
   }
 
-  // 2. Hash blocks off the main thread.
-  emitPhase('hashing');
-  const { blocks, size } = await hashFn(file, { blockSize, onProgress: onHashProgress, signal });
-  const blockIndexByHash = {};
-  blocks.forEach((b) => { blockIndexByHash[b.sha256] = b.index; });
+  // 2. Hash blocks off the main thread unless we already have a cache for THIS
+  // exact file size + server-authoritative block size. A retry gets a fresh
+  // session and re-checks against the server, but need not burn CPU re-hashing
+  // the same bytes.
+  let blocks;
+  let size;
+  let blockIndexByHash;
+  let uniqueHashes;
+  const cachedHashPlan = restoreHashPlanFromCache(hashCache, file, blockSize);
+  if (cachedHashPlan) {
+    ({ blocks, size, blockIndexByHash, uniqueHashes } = cachedHashPlan);
+    if (onHashProgress && size > 0) {
+      onHashProgress(size, size);
+    }
+  } else {
+    emitPhase('hashing');
+    const hashed = await hashFn(file, { blockSize, onProgress: onHashProgress, signal });
+    const nextHashCache = buildHashPlanCache(hashed.blocks, hashed.size, blockSize, file);
+    ({ blocks, size, blockIndexByHash, uniqueHashes } = nextHashCache);
+    if (onHashCache) {
+      onHashCache(nextHashCache);
+    }
+  }
 
   const getBlockData = (index) => {
     const start = index * blockSize;
@@ -555,13 +694,16 @@ export async function uploadFileViaBlocks(file, {
   // 3. Which blocks are missing (de-duplicated hash set). Batched to stay within
   //    the server's per-request hash cap (CHECK_BATCH_SIZE < 10000).
   emitPhase('checking');
-  const uniqueHashes = Array.from(new Set(blocks.map((b) => b.sha256)));
   const missing = [];
   for (let i = 0; i < uniqueHashes.length; i += CHECK_BATCH_SIZE) {
     throwIfAborted(signal);
     const batch = uniqueHashes.slice(i, i + CHECK_BATCH_SIZE);
     // eslint-disable-next-line no-await-in-loop
-    const checkResp = await api.checkBlocks(batch, session, ctrlConfig);
+    const checkResp = await withControlPlaneRetry(
+      () => api.checkBlocks(batch, session, ctrlConfig),
+      controlPlaneRetries,
+      { signal, baseMs: controlPlaneRetryBaseMs },
+    );
     const batchMissing = (checkResp.data && checkResp.data.missing) || [];
     for (let j = 0; j < batchMissing.length; j += 1) {
       missing.push(batchMissing[j]);
