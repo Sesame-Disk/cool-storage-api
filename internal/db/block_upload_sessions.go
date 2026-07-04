@@ -140,7 +140,7 @@ func (db *DB) CreateAdmittedBlockUploadSession(orgID, userID, repoID, parentDir 
 		// Roll back the claimed slot best-effort so a failed insert does not leak
 		// a slot for the whole TTL.
 		if s.Slot >= 0 {
-			_ = db.releaseBlockUploadSessionSlot(orgID, userID, s.Slot)
+			_ = db.releaseBlockUploadSessionSlot(orgID, userID, s.Slot, s.SessionID)
 		}
 		return BlockUploadSession{}, fmt.Errorf("insert block upload session: %w", err)
 	}
@@ -166,10 +166,22 @@ func (db *DB) claimBlockUploadSessionSlot(orgID, userID, sessionID string, cap i
 	return 0, false, nil
 }
 
-func (db *DB) releaseBlockUploadSessionSlot(orgID, userID string, slot int) error {
-	return db.Session().Query(`
-		DELETE FROM block_upload_session_slots_by_user WHERE org_id = ? AND user_id = ? AND slot = ?
-	`, orgID, userID, slot).Exec()
+// releaseBlockUploadSessionSlot frees a claimed slot, but ONLY if it still belongs
+// to sessionID — a conditional (LWT) delete. Slot rows carry a fixed 48h TTL from
+// creation and are not refreshed, so a slot can expire and be re-claimed by a NEWER
+// session before a slow/late commit runs cleanup; an unconditional delete by
+// (org,user,slot) would then drop the new session's slot and over-admit that user.
+// The IF session_id guard makes the release a no-op in that race. This runs at
+// commit/rollback (not the /blocks/upload hot path), so the LWT cost is fine.
+func (db *DB) releaseBlockUploadSessionSlot(orgID, userID string, slot int, sessionID string) error {
+	var current string
+	if _, err := db.Session().Query(`
+		DELETE FROM block_upload_session_slots_by_user
+		WHERE org_id = ? AND user_id = ? AND slot = ? IF session_id = ?
+	`, orgID, userID, slot, sessionID).ScanCAS(&current); err != nil {
+		return err
+	}
+	return nil
 }
 
 // GetBlockUploadSession reads a session by id. ok=false when the row is missing

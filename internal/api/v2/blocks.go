@@ -519,6 +519,7 @@ const (
 	uploadSessionUnavailable
 	uploadSessionHeaderRequired
 	uploadSessionPermissionDenied
+	uploadSessionCommitted
 )
 
 func (r uploadSessionResolution) deniedStatus() int {
@@ -530,6 +531,9 @@ func (r uploadSessionResolution) deniedStatus() int {
 	}
 	if r == uploadSessionHeaderRequired {
 		return http.StatusBadRequest
+	}
+	if r == uploadSessionCommitted {
+		return http.StatusConflict
 	}
 	return http.StatusUnauthorized
 }
@@ -543,6 +547,9 @@ func (r uploadSessionResolution) deniedMessage() string {
 	}
 	if r == uploadSessionPermissionDenied {
 		return "upload is no longer allowed for this session"
+	}
+	if r == uploadSessionCommitted {
+		return "upload session already committed; start a new upload"
 	}
 	return "invalid or expired upload session"
 }
@@ -574,6 +581,15 @@ func (h *BlockHandler) resolveUploadSession(c *gin.Context) (db.BlockUploadSessi
 	}
 	if session.OrgID != c.GetString("org_id") || session.UserID != c.GetString("user_id") {
 		return db.BlockUploadSession{}, uploadSessionInvalid
+	}
+	// A committed session is TERMINAL for /blocks/check and /blocks/upload: its file
+	// is already published and its per-user slot was freed at commit, so continuing
+	// to stage blocks under it would (a) leak provisional refs that can never be
+	// committed and (b) defeat max_uncommitted_block_sessions_per_user (a client
+	// could commit once to recover its budget, then keep staging for the 48h TTL).
+	// Commit idempotency (R7) is handled on the commit path, not here.
+	if session.Committed {
+		return db.BlockUploadSession{}, uploadSessionCommitted
 	}
 	if h.permMiddleware != nil {
 		allowed := h.sessionPermCache.allow(session.SessionID, func() bool {

@@ -98,7 +98,7 @@ func (db *DB) CleanupCommittedBlockUploadSessionCaps(s BlockUploadSession) error
 	if s.Slot < 0 {
 		return nil // cap was disabled at creation; nothing to release
 	}
-	if err := db.releaseBlockUploadSessionSlot(s.OrgID, s.UserID, s.Slot); err != nil {
+	if err := db.releaseBlockUploadSessionSlot(s.OrgID, s.UserID, s.Slot, s.SessionID); err != nil {
 		return fmt.Errorf("release block upload session slot org=%s user=%s slot=%d: %w", s.OrgID, s.UserID, s.Slot, err)
 	}
 	return nil

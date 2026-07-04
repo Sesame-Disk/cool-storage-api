@@ -198,6 +198,44 @@ func uploadFileViaBlocksFlow(t *testing.T, c *testClient, repoID, parentDir, fil
 	})
 }
 
+// TestWebBlockUploadCommittedSessionIsTerminal guards that a committed session can
+// no longer be used for /blocks/check or /blocks/upload (item 1): otherwise a client
+// could commit once, recover its per-user session slot, and keep staging blocks under
+// the committed session for the whole 48h TTL — defeating
+// max_uncommitted_block_sessions_per_user and leaking never-committable provisional
+// refs.
+func TestWebBlockUploadCommittedSessionIsTerminal(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-terminal-%d", time.Now().UnixNano()))
+	content := []byte("committed-session terminal " + fmt.Sprint(time.Now().UnixNano()))
+	blocks := [][]byte{content}
+
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(totalSize(blocks)))
+	upResp := webUploadBlock(t, adminClient, session, content)
+	expectStatus(t, upResp, http.StatusOK)
+	upResp.Body.Close()
+
+	commitResp := webCommit(t, adminClient, repoID, map[string]interface{}{
+		"session":    session,
+		"parent_dir": "/",
+		"filename":   "terminal.txt",
+		"replace":    false,
+		"size":       totalSize(blocks),
+		"blocks":     blocksManifest(blocks),
+	})
+	expectStatus(t, commitResp, http.StatusOK)
+	commitResp.Body.Close()
+
+	// A further upload under the committed session must be rejected (409), not accepted.
+	again := webUploadBlock(t, adminClient, session, []byte("extra staged block "+fmt.Sprint(time.Now().UnixNano())))
+	expectStatus(t, again, http.StatusConflict)
+	again.Body.Close()
+
+	// /blocks/check under the committed session is likewise terminal.
+	checkResp := webCheckBlocksResponse(t, adminClient, session, []string{sha256hex(content)})
+	expectStatus(t, checkResp, http.StatusConflict)
+	checkResp.Body.Close()
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 func TestWebBlockUploadSessionRequiresDeclaredSizeWhenCapEnabled(t *testing.T) {

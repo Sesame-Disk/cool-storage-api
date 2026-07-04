@@ -102,8 +102,13 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 	if parentDir == "" {
 		parentDir = "/"
 	}
-	if req.Size != nil && *req.Size < 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid size"})
+	// A declared size must be positive: the block flow does not commit empty files
+	// (they fall below blockUploadThresholdMB and use the legacy uploader), so a
+	// size<=0 declaration could never reach a valid commit — reject it here instead
+	// of minting a session that can only fail. "size omitted" (nil) is handled below
+	// (required only when the per-session ceiling is enabled).
+	if req.Size != nil && *req.Size <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid size (the block upload flow does not support empty files)"})
 		return
 	}
 

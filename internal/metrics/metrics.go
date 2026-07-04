@@ -433,8 +433,10 @@ var (
 	// rejected by the staging caps (docs/WEB-BLOCK-UPLOAD.md item 1), by reason:
 	//   "max_sessions"  — CreateBlockUploadSession over the per-user concurrent
 	//                     uncommitted-session cap (all LWT slots claimed).
-	//   "staged_blocks" — /blocks/upload over a session's per-bucket staged-block
-	//                     ceiling (per-session staged-bytes cap).
+	//   "staged_blocks" — the per-session staging ceiling was hit, on EITHER path:
+	//                     CreateBlockUploadSession rejecting a declared size over the
+	//                     ceiling (413, fail-fast), OR /blocks/upload rejecting a new
+	//                     block over a session's per-bucket staged-block cap (429).
 	// A non-zero rate means a cap is biting; use it to tune the limits before/after
 	// flag-on.
 	BlockUploadSessionAdmissionRejectionsTotal = prometheus.NewCounterVec(

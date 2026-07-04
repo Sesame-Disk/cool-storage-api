@@ -163,14 +163,21 @@ func TestBlockUploadStagedBucketConcurrentReserveBoundedOvershoot(t *testing.T) 
 	}
 
 	var wg sync.WaitGroup
+	errs := make(chan error, parallel)
 	for _, id := range ids {
 		wg.Add(1)
 		go func(blockID string) {
 			defer wg.Done()
-			_ = db.ReserveSessionStagedBlock(sessionID, bucket, blockID, 1024)
+			errs <- db.ReserveSessionStagedBlock(sessionID, bucket, blockID, 1024)
 		}(id)
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent reserve failed: %v", err)
+		}
+	}
 
 	// All distinct reserves landed as distinct rows (idempotency is per PK, so
 	// distinct ids are all counted) — the ledger records exactly what was staged.
