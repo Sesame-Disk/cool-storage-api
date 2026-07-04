@@ -946,7 +946,13 @@ flag were on*.
      that also rolls the slot back if the session insert fails, so the two tables
      never desync. The claimed slot is stored on the session row and released at
      commit by `CleanupCommittedBlockUploadSessionCaps` — **best-effort, after** the
-     critical `MarkBlockUploadSessionCommitted`, never coupled to it.
+     critical `MarkBlockUploadSessionCommitted`, never coupled to it; the release is an
+     **owner-checked conditional delete** (`IF session_id = ?`) so a slow commit cannot
+     drop a slot a newer session re-claimed after the old one's TTL. Crucially, a
+     **committed session is terminal** for `/blocks/check` and `/blocks/upload`
+     (`resolveUploadSession` → 409): without this a client could commit once to recover
+     its slot and then keep staging under the committed session for the TTL, defeating
+     the cap (guarded by `TestWebBlockUploadCommittedSessionIsTerminal`).
    - **Per-session staged-block cap (loose anti-abuse backstop).** A **bucketed
      ledger** (`block_upload_session_staged_blocks`, `((session_id, bucket),
      block_id)`, up to 64 buckets, per-row TTL — no Cassandra COUNTER) of the
