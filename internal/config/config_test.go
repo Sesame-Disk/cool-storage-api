@@ -29,6 +29,13 @@ func clearLoadEnvOverrides(t *testing.T) {
 		"BILLING_URL", "ACCOUNTS_DELETE_ACCOUNT_URL",
 		"ACCOUNTS_ORG_USER_MANAGEMENT_URL", "ACCOUNTS_DISABLE_ORG_USER_WRITES",
 		"AUTH_DEV_MODE", "FIRST_SUPERADMIN_EMAIL", "SHARE_LINK_HMAC_KEY",
+		"WEB_UPLOADS_ENABLE_UPLOAD_FOLDER", "WEB_UPLOADS_ENABLE_RESUMABLE_FILE_UPLOAD",
+		"WEB_UPLOADS_ENABLE_WEB_BLOCK_UPLOAD", "WEB_UPLOADS_RESUMABLE_CHUNK_SIZE_MB",
+		"WEB_UPLOADS_BLOCK_UPLOAD_BLOCK_SIZE_MB", "WEB_UPLOADS_MAX_FILE_SIZE_MB",
+		"WEB_UPLOADS_MAX_FILES_PER_BATCH", "WEB_UPLOADS_SIMULTANEOUS_UPLOADS",
+		"WEB_UPLOADS_MAX_CONCURRENT_BLOCK_UPLOADS_PER_USER",
+		"WEB_UPLOADS_MAX_UNCOMMITTED_BLOCK_SESSIONS_PER_USER",
+		"WEB_UPLOADS_MAX_STAGED_BYTES_PER_SESSION_MB",
 		"SEAFHTTP_TOKEN_TTL", "SEAFHTTP_ZIP_MAX_ENTRIES",
 		"SEAFHTTP_ZIP_MAX_DEPTH", "SEAFHTTP_ZIP_MAX_BYTES",
 	} {
@@ -592,6 +599,16 @@ func TestConfigValidate(t *testing.T) {
 			},
 			wantErr:        true,
 			wantErrContain: "web_block_upload_block_size_mb must be greater than zero",
+		},
+		{
+			name: "web block upload staged cap requires positive concurrent upload cap",
+			modify: func(c *Config) {
+				c.WebUploads.EnableWebBlockUpload = true
+				c.WebUploads.MaxStagedBytesPerSessionMB = 1024
+				c.WebUploads.MaxConcurrentBlockUploadsPerUser = 0
+			},
+			wantErr:        true,
+			wantErrContain: "web block upload with a staged-bytes cap requires web_uploads.max_concurrent_block_uploads_per_user to be greater than zero",
 		},
 	}
 
@@ -1449,4 +1466,47 @@ func TestS3OverrideNoHotBackend(t *testing.T) {
 	if _, ok := cfg.Storage.Backends["hot"]; ok {
 		t.Error("S3_BUCKET should not create 'hot' backend if it doesn't exist")
 	}
+}
+
+// TestEffectiveMaxStagedBytesPerSession covers the per-session staging ceiling
+// derivation (docs/WEB-BLOCK-UPLOAD.md item 1): explicit MB, derive-from-max-file,
+// unlimited-max-file fallback, and disabled.
+func TestEffectiveMaxStagedBytesPerSession(t *testing.T) {
+	const mb = int64(1024 * 1024)
+
+	t.Run("explicit MB wins", func(t *testing.T) {
+		c := DefaultConfig()
+		c.WebUploads.MaxStagedBytesPerSessionMB = 500
+		if got := c.EffectiveMaxStagedBytesPerSession(); got != 500*mb {
+			t.Fatalf("got %d, want %d", got, 500*mb)
+		}
+	})
+
+	t.Run("derive from max file size x1.25", func(t *testing.T) {
+		c := DefaultConfig()
+		c.WebUploads.MaxStagedBytesPerSessionMB = 0
+		c.WebUploads.MaxFileSizeMB = 1000
+		want := 1000 * mb * 5 / 4
+		if got := c.EffectiveMaxStagedBytesPerSession(); got != want {
+			t.Fatalf("got %d, want %d (max file x1.25)", got, want)
+		}
+	})
+
+	t.Run("unlimited max file size falls back to the documented default", func(t *testing.T) {
+		c := DefaultConfig()
+		c.WebUploads.MaxStagedBytesPerSessionMB = 0
+		c.WebUploads.MaxFileSizeMB = 0
+		c.Server.MaxUploadMB = 0 // ResolvedMaxFileSizeMB -> 0 (unlimited)
+		if got := c.EffectiveMaxStagedBytesPerSession(); got != DefaultMaxStagedBytesPerSession {
+			t.Fatalf("got %d, want fallback %d", got, DefaultMaxStagedBytesPerSession)
+		}
+	})
+
+	t.Run("negative disables", func(t *testing.T) {
+		c := DefaultConfig()
+		c.WebUploads.MaxStagedBytesPerSessionMB = -1
+		if got := c.EffectiveMaxStagedBytesPerSession(); got != 0 {
+			t.Fatalf("got %d, want 0 (disabled)", got)
+		}
+	})
 }

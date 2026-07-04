@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -30,9 +32,12 @@ func sha1hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func webCreateBlockSession(t *testing.T, c *testClient, repoID, parentDir string) string {
+func webCreateBlockSession(t *testing.T, c *testClient, repoID, parentDir string, size int64) string {
 	t.Helper()
-	resp := c.PostJSON(t, fmt.Sprintf("/api/v2/repos/%s/block-upload-session/", repoID), map[string]string{"parent_dir": parentDir})
+	resp := c.PostJSON(t, fmt.Sprintf("/api/v2/repos/%s/block-upload-session/", repoID), map[string]interface{}{
+		"parent_dir": parentDir,
+		"size":       size,
+	})
 	expectStatus(t, resp, http.StatusOK)
 	var out map[string]interface{}
 	decodeJSON(t, resp, &out)
@@ -40,7 +45,63 @@ func webCreateBlockSession(t *testing.T, c *testClient, repoID, parentDir string
 	if sid == "" {
 		t.Fatalf("empty session_id in response: %v", out)
 	}
+	t.Cleanup(func() {
+		cleanupBlockUploadSessionForTest(t, sid)
+	})
 	return sid
+}
+
+func cleanupBlockUploadSessionForTest(t *testing.T, sessionID string) {
+	t.Helper()
+
+	database := shareProjectionDBForTest(t)
+	session, ok, err := database.GetBlockUploadSession(sessionID)
+	if err != nil {
+		t.Errorf("cleanup block upload session %s: read session: %v", sessionID, err)
+		return
+	}
+	if !ok {
+		return
+	}
+
+	if err := database.CleanupCommittedBlockUploadSessionCaps(session); err != nil {
+		t.Errorf("cleanup block upload session %s: release slot: %v", sessionID, err)
+	}
+
+	referrer := dbpkg.BlockReferrerForUpload(sessionID)
+	for bucket := 0; bucket < dbpkg.BlockUploadStagedBlockBuckets; bucket++ {
+		iter := database.Session().Query(`
+			SELECT block_id FROM block_upload_session_staged_blocks
+			WHERE session_id = ? AND bucket = ?
+		`, sessionID, bucket).Iter()
+		var blockID string
+		var blockIDs []string
+		for iter.Scan(&blockID) {
+			blockIDs = append(blockIDs, blockID)
+		}
+		if err := iter.Close(); err != nil {
+			t.Errorf("cleanup block upload session %s: list staged blocks for bucket %d: %v", sessionID, bucket, err)
+			continue
+		}
+		for _, blockID := range blockIDs {
+			if err := database.Session().Query(`
+				DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
+			`, session.OrgID, blockID, referrer).Exec(); err != nil {
+				t.Errorf("cleanup block upload session %s: delete provisional ref for block %s: %v", sessionID, blockID, err)
+			}
+		}
+		if err := database.Session().Query(`
+			DELETE FROM block_upload_session_staged_blocks WHERE session_id = ? AND bucket = ?
+		`, sessionID, bucket).Exec(); err != nil {
+			t.Errorf("cleanup block upload session %s: delete staged bucket %d: %v", sessionID, bucket, err)
+		}
+	}
+
+	if err := database.Session().Query(`
+		DELETE FROM block_upload_sessions WHERE session_id = ?
+	`, sessionID).Exec(); err != nil {
+		t.Errorf("cleanup block upload session %s: delete session row: %v", sessionID, err)
+	}
 }
 
 // webUploadBlock POSTs raw block bytes under a session. Returns the response.
@@ -163,7 +224,7 @@ func downloadRepoFile(t *testing.T, c *testClient, repoID, path string) []byte {
 // and returns the actual filename from the commit response.
 func uploadFileViaBlocksFlow(t *testing.T, c *testClient, repoID, parentDir, filename string, blocks [][]byte, replace bool) *http.Response {
 	t.Helper()
-	session := webCreateBlockSession(t, c, repoID, parentDir)
+	session := webCreateBlockSession(t, c, repoID, parentDir, int64(totalSize(blocks)))
 	manifest := blocksManifest(blocks)
 	hashes := make([]string, len(manifest))
 	for i, m := range manifest {
@@ -195,7 +256,102 @@ func uploadFileViaBlocksFlow(t *testing.T, c *testClient, repoID, parentDir, fil
 	})
 }
 
+// TestWebBlockUploadCommittedSessionIsTerminal guards that a committed session can
+// no longer be used for /blocks/check or /blocks/upload (item 1): otherwise a client
+// could commit once, recover its per-user session slot, and keep staging blocks under
+// the committed session for the whole 48h TTL — defeating
+// max_uncommitted_block_sessions_per_user and leaking never-committable provisional
+// refs.
+func TestWebBlockUploadCommittedSessionIsTerminal(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-terminal-%d", time.Now().UnixNano()))
+	content := []byte("committed-session terminal " + fmt.Sprint(time.Now().UnixNano()))
+	blocks := [][]byte{content}
+
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(totalSize(blocks)))
+	upResp := webUploadBlock(t, adminClient, session, content)
+	if upResp.StatusCode != http.StatusOK && upResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(upResp.Body)
+		upResp.Body.Close()
+		t.Fatalf("upload status %d, want 200/201; body=%s", upResp.StatusCode, body)
+	}
+	upResp.Body.Close()
+
+	commitResp := webCommit(t, adminClient, repoID, map[string]interface{}{
+		"session":    session,
+		"parent_dir": "/",
+		"filename":   "terminal.txt",
+		"replace":    false,
+		"size":       totalSize(blocks),
+		"blocks":     blocksManifest(blocks),
+	})
+	expectStatus(t, commitResp, http.StatusOK)
+	commitResp.Body.Close()
+
+	// A further upload under the committed session must be rejected (409), not accepted.
+	again := webUploadBlock(t, adminClient, session, []byte("extra staged block "+fmt.Sprint(time.Now().UnixNano())))
+	expectStatus(t, again, http.StatusConflict)
+	again.Body.Close()
+
+	// /blocks/check under the committed session is likewise terminal.
+	checkResp := webCheckBlocksResponse(t, adminClient, session, []string{sha256hex(content)})
+	expectStatus(t, checkResp, http.StatusConflict)
+	checkResp.Body.Close()
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
+
+func TestWebBlockUploadSessionRequiresDeclaredSizeWhenCapEnabled(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-size-required-%d", time.Now().UnixNano()))
+	resp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2/repos/%s/block-upload-session/", repoID), map[string]interface{}{
+		"parent_dir": "/",
+	})
+	expectStatus(t, resp, http.StatusBadRequest)
+	var out map[string]interface{}
+	decodeJSON(t, resp, &out)
+	if out["error"] != "size is required" {
+		t.Fatalf("error = %v, want size is required", out["error"])
+	}
+}
+
+func TestWebBlockUploadSessionRejectsExplicitZeroSize(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-zero-size-%d", time.Now().UnixNano()))
+	resp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2/repos/%s/block-upload-session/", repoID), map[string]interface{}{
+		"parent_dir": "/",
+		"size":       0,
+	})
+	expectStatus(t, resp, http.StatusBadRequest)
+	var out map[string]interface{}
+	decodeJSON(t, resp, &out)
+	if out["error"] != "invalid size (the block upload flow does not support empty files)" {
+		t.Fatalf("error = %v, want invalid empty-file size rejection", out["error"])
+	}
+}
+
+func TestWebBlockUploadCommitRejectsSubdeclaredSessionSize(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-underdeclared-%d", time.Now().UnixNano()))
+	content := []byte("underdeclared session size " + fmt.Sprint(time.Now().UnixNano()))
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)-1))
+
+	resp := webUploadBlock(t, adminClient, session, content)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("upload status %d: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
+		"session": session, "parent_dir": "/", "filename": "underdeclared.txt",
+		"replace": false, "size": len(content),
+		"blocks": []map[string]interface{}{{"sha256": sha256hex(content), "size": len(content)}},
+	})
+	expectStatus(t, commit, http.StatusConflict)
+	var out map[string]interface{}
+	decodeJSON(t, commit, &out)
+	if out["error"] != "manifest size does not match the size declared at session creation" {
+		t.Fatalf("error = %v, want manifest size mismatch", out["error"])
+	}
+}
 
 func TestWebBlockUploadRoundTripAndDedup(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-rt-%d", time.Now().UnixNano()))
@@ -215,7 +371,7 @@ func TestWebBlockUploadRoundTripAndDedup(t *testing.T) {
 	assertNoUploadReferrers(t, repoID, "/", "wbu.txt")
 
 	// Dedup/resume: a session over the same hash reports it as already existing.
-	session := webCreateBlockSession(t, adminClient, repoID, "/")
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 	existing, missing := webCheckBlocks(t, adminClient, session, []string{sha256hex(content)})
 	if len(missing) != 0 || len(existing) != 1 {
 		t.Fatalf("expected block to be existing (dedup), got existing=%v missing=%v", existing, missing)
@@ -359,8 +515,8 @@ func webReadCommittedFileBlockIDs(t *testing.T, repoID, filename string) (blockI
 // REAL SHA-1, never the forged one.
 func TestWebBlockUploadIgnoresForgedClientSHA1(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-srvsha1-%d", time.Now().UnixNano()))
-	session := webCreateBlockSession(t, adminClient, repoID, "/")
 	content := []byte("server-derived sha1 " + fmt.Sprint(time.Now().UnixNano()))
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 	resp := webUploadBlock(t, adminClient, session, content)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		t.Fatalf("upload status %d", resp.StatusCode)
@@ -400,8 +556,8 @@ func TestWebBlockUploadIgnoresForgedClientSHA1(t *testing.T) {
 // desktop bare-SHA-1 block download both resolve through the forward table alone.
 func TestWebBlockUploadCommitForwardMappingOnly(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-fwd-%d", time.Now().UnixNano()))
-	session := webCreateBlockSession(t, adminClient, repoID, "/")
 	content := []byte("forward-mapping block " + fmt.Sprint(time.Now().UnixNano()))
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 
 	resp := webUploadBlock(t, adminClient, session, content)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
@@ -430,8 +586,8 @@ func TestWebBlockUploadCommitForwardMappingOnly(t *testing.T) {
 // idempotent 200 replay, never a spurious 409.
 func TestWebBlockUploadReplayIgnoresClientSHA1(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-replay-%d", time.Now().UnixNano()))
-	session := webCreateBlockSession(t, adminClient, repoID, "/")
 	content := []byte("replay ignores sha1 " + fmt.Sprint(time.Now().UnixNano()))
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 
 	resp := webUploadBlock(t, adminClient, session, content)
 	resp.Body.Close()
@@ -476,8 +632,8 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-r1-%d", time.Now().UnixNano()))
 
 	t.Run("manifest block never uploaded -> needs_upload", func(t *testing.T) {
-		session := webCreateBlockSession(t, adminClient, repoID, "/")
 		content := []byte("never uploaded " + fmt.Sprint(time.Now().UnixNano()))
+		session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 		resp := webCommit(t, adminClient, repoID, map[string]interface{}{
 			"session": session, "parent_dir": "/", "filename": "ghost.txt",
 			"replace": false, "size": len(content),
@@ -502,7 +658,7 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 		}
 		legacy.Body.Close()
 
-		session := webCreateBlockSession(t, adminClient, repoID, "/")
+		session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 		// Session-aware check must report it MISSING despite S3 presence (R3).
 		_, missing := webCheckBlocks(t, adminClient, session, []string{sha256hex(content)})
 		if len(missing) != 1 {
@@ -522,8 +678,8 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 func TestWebBlockUploadReuploadRepairsMissingBlockSHA1(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-repair-%d", time.Now().UnixNano()))
 	orgID := resolveOrgID(t, repoID)
-	sessionID := webCreateBlockSession(t, adminClient, repoID, "/")
 	content := []byte("repair missing block sha1 " + fmt.Sprint(time.Now().UnixNano()))
+	sessionID := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 	sha256ID := sha256hex(content)
 	sha1ID := sha1hex(content)
 
@@ -586,8 +742,8 @@ func TestWebBlockUploadReuploadRepairsMissingBlockSHA1(t *testing.T) {
 
 func TestWebBlockUploadManifestValidation(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-r6-%d", time.Now().UnixNano()))
-	session := webCreateBlockSession(t, adminClient, repoID, "/")
 	content := []byte("size sum mismatch")
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 
 	// sum(block sizes) != declared size → 400.
 	resp := webCommit(t, adminClient, repoID, map[string]interface{}{
@@ -605,9 +761,9 @@ func TestWebBlockUploadManifestValidation(t *testing.T) {
 // the last-wins size dedup cannot mask a lie and corrupt the file's size/offsets.
 func TestWebBlockUploadManifestRejectsConflictingBlockSizes(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-dupsize-%d", time.Now().UnixNano()))
-	session := webCreateBlockSession(t, adminClient, repoID, "/")
 	const blockSize = 8 * 1024 * 1024
 	raw := []byte("conflicting size block " + fmt.Sprint(time.Now().UnixNano()))
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(blockSize+4))
 	hash := sha256hex(raw)
 	hash1 := sha1hex(raw)
 
@@ -628,8 +784,8 @@ func TestWebBlockUploadManifestRejectsConflictingBlockSizes(t *testing.T) {
 
 func TestWebBlockUploadSizeMismatch(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-r11-%d", time.Now().UnixNano()))
-	session := webCreateBlockSession(t, adminClient, repoID, "/")
 	content := []byte("ten bytes!") // 10 bytes
+	session := webCreateBlockSession(t, adminClient, repoID, "/", 20)
 	resp := webUploadBlock(t, adminClient, session, content)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		t.Fatalf("upload status %d", resp.StatusCode)
@@ -649,8 +805,8 @@ func TestWebBlockUploadSizeMismatch(t *testing.T) {
 func TestWebBlockUploadGCFenceRejected(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-gc-%d", time.Now().UnixNano()))
 	orgID := resolveOrgID(t, repoID)
-	session := webCreateBlockSession(t, adminClient, repoID, "/")
 	content := []byte("gc fenced block " + fmt.Sprint(time.Now().UnixNano()))
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 	hash := sha256hex(content)
 	hash1 := sha1hex(content)
 
@@ -679,7 +835,7 @@ func TestWebBlockUploadGCFenceRejected(t *testing.T) {
 func TestWebBlockUploadIdempotentCommit(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-idem-%d", time.Now().UnixNano()))
 	content := []byte("idempotent commit content " + fmt.Sprint(time.Now().UnixNano()))
-	session := webCreateBlockSession(t, adminClient, repoID, "/")
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 	resp := webUploadBlock(t, adminClient, session, content)
 	resp.Body.Close()
 
@@ -719,7 +875,7 @@ func TestWebBlockUploadIdempotentCommit(t *testing.T) {
 func TestWebBlockUploadConcurrentDoubleCommit(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-conc-%d", time.Now().UnixNano()))
 	content := []byte("concurrent commit content " + fmt.Sprint(time.Now().UnixNano()))
-	session := webCreateBlockSession(t, adminClient, repoID, "/")
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 	resp := webUploadBlock(t, adminClient, session, content)
 	resp.Body.Close()
 
@@ -777,7 +933,7 @@ func TestWebBlockUploadForeignPubRefNotPermanent(t *testing.T) {
 	hash1 := sha1hex(content)
 
 	// Upload under session A → materializes metadata + S3 object + up:<A> ref.
-	sessionA := webCreateBlockSession(t, adminClient, repoID, "/")
+	sessionA := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 	resp := webUploadBlock(t, adminClient, sessionA, content)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		t.Fatalf("upload status %d", resp.StatusCode)
@@ -796,7 +952,7 @@ func TestWebBlockUploadForeignPubRefNotPermanent(t *testing.T) {
 	}
 
 	// Commit under a fresh session B without uploading → must refuse the block.
-	sessionB := webCreateBlockSession(t, adminClient, repoID, "/")
+	sessionB := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
 		"session": sessionB, "parent_dir": "/", "filename": "pubonly.txt",
 		"replace": false, "size": len(content),
@@ -834,7 +990,7 @@ func TestWebBlockUploadSessionRoutesRejectRevokedSharedRepoPermission(t *testing
 		return resp.StatusCode == http.StatusOK
 	})
 
-	sessionID := webCreateBlockSession(t, userClient, repoID, "/")
+	sessionID := webCreateBlockSession(t, userClient, repoID, "/", 1)
 
 	deleteResp := adminClient.Delete(t,
 		fmt.Sprintf("/api2/repos/%s/dir/shared_items/?p=/&share_type=user&username=%s", repoID, url.QueryEscape(defaultUserEmail)),
@@ -909,7 +1065,7 @@ func TestWebBlockUploadSessionStagingSkipsLogicalStorageQuota(t *testing.T) {
 
 	// Session staging of fresh content must succeed despite the same 1-byte quota.
 	sessionContent := []byte("session block under tiny quota " + fmt.Sprint(time.Now().UnixNano()))
-	session := webCreateBlockSession(t, userClient, repoID, "/")
+	session := webCreateBlockSession(t, userClient, repoID, "/", int64(len(sessionContent)))
 	resp := webUploadBlock(t, userClient, session, sessionContent)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)

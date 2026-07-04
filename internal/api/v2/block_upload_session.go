@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/gin-gonic/gin"
 )
 
@@ -83,9 +85,14 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 
 	// The body is optional (defaults parent_dir to "/"), but a non-empty body that
 	// is malformed JSON should be a clear 400 rather than a silent default — only
-	// an empty body (io.EOF) is treated as "no parent_dir given".
+	// an empty body (io.EOF) is treated as "no parent_dir given". `size` is the
+	// client-declared file size (the browser knows file.size); it lets us fail
+	// fast before any hashing/upload and is re-checked against the manifest at
+	// commit. It is a pointer so the API can distinguish "missing" from an
+	// explicit size=0 (empty file).
 	var req struct {
 		ParentDir string `json:"parent_dir"`
+		Size      *int64 `json:"size"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -95,9 +102,50 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 	if parentDir == "" {
 		parentDir = "/"
 	}
+	// A declared size must be positive: the block flow does not commit empty files
+	// (they fall below blockUploadThresholdMB and use the legacy uploader), so a
+	// size<=0 declaration could never reach a valid commit — reject it here instead
+	// of minting a session that can only fail. "size omitted" (nil) is handled below
+	// (required only when the per-session ceiling is enabled).
+	if req.Size != nil && *req.Size <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid size (the block upload flow does not support empty files)"})
+		return
+	}
 
-	session, err := h.db.CreateBlockUploadSession(orgID, userID, repoID, parentDir)
+	admission := h.blockUploadSessionAdmission(req.Size)
+
+	// When the per-session staging ceiling is enabled, `size` is REQUIRED so the
+	// exact per-file bound (this fail-fast check + the commit's
+	// manifest.size == expected_size guard) always applies — a client that omits it
+	// could otherwise only be caught by the looser staged-block ledger backstop.
+	if ceiling := h.config.EffectiveMaxStagedBytesPerSession(); ceiling > 0 {
+		if req.Size == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "size is required"})
+			return
+		}
+		// Fail fast: a declared size over the per-session ceiling (the maximum
+		// web-block file size) is rejected before any hashing/upload (item 1).
+		if *req.Size > ceiling {
+			metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+				"error":    "file exceeds the maximum web-block upload size",
+				"max_size": ceiling,
+			})
+			return
+		}
+	}
+
+	session, err := h.db.CreateAdmittedBlockUploadSession(
+		orgID, userID, repoID, parentDir, admission,
+		h.config.WebUploads.MaxUncommittedBlockSessionsPerUser,
+	)
 	if err != nil {
+		if errors.Is(err, db.ErrBlockUploadSessionSlotsExhausted) {
+			metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("max_sessions").Inc()
+			c.Header("Retry-After", "5")
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many concurrent uploads; retry shortly"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create upload session"})
 		return
 	}
@@ -106,7 +154,20 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 		"session_id": session.SessionID,
 		"repo_id":    repoID,
 		"parent_dir": session.ParentDir,
-		"block_size": h.webBlockUploadBlockSize(),
+		"block_size": session.BlockSizeBytes,
 		"expires_at": session.ExpiresAt.Unix(),
 	})
+}
+
+func (h *FileHandler) blockUploadSessionAdmission(size *int64) db.BlockUploadSessionAdmission {
+	admission := blockUploadStagingAdmissionFromConfig(h.config)
+	// webBlockUploadBlockSize() falls back to a sane default when config is nil
+	// (where the config-derived BlockSizeBytes above would be 0), so it is the
+	// authoritative CAS block size frozen onto the session and echoed to the client.
+	admission.BlockSizeBytes = h.webBlockUploadBlockSize()
+	if size != nil {
+		admission.ExpectedSize = *size
+		admission.ExpectedSizeDeclared = true
+	}
+	return admission
 }

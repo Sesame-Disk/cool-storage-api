@@ -785,6 +785,94 @@ func TestBlockUploadConcurrencyLimiter(t *testing.T) {
 	})
 }
 
+// TestStagedBlockBucket verifies the ledger bucket is deterministic and in range
+// (so the reserve is idempotent by (session, bucket, block_id)).
+func TestStagedBlockBucket(t *testing.T) {
+	for _, bucketCount := range []int{1, 8, 64} {
+		for _, id := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64), "deadbeef"} {
+			b1 := db.StagedBlockBucket(id, bucketCount)
+			b2 := db.StagedBlockBucket(id, bucketCount)
+			if b1 != b2 {
+				t.Fatalf("bucket for %q (n=%d) not deterministic: %d vs %d", id, bucketCount, b1, b2)
+			}
+			if b1 < 0 || b1 >= bucketCount {
+				t.Fatalf("bucket %d out of range [0,%d)", b1, bucketCount)
+			}
+		}
+	}
+}
+
+// TestStagedBlockBucketCap covers the per-bucket cap math, the dynamic bucket
+// count for small ceilings, and the enabled flag.
+func TestStagedBlockBucketCap(t *testing.T) {
+	newHandler := func(stagedMB int64) *BlockHandler {
+		cfg := &config.Config{}
+		cfg.WebUploads.WebBlockUploadBlockSizeMB = 8
+		cfg.WebUploads.MaxStagedBytesPerSessionMB = stagedMB
+		return &BlockHandler{config: cfg, db: &db.DB{}}
+	}
+
+	t.Run("large ceiling fans out to the max bucket count", func(t *testing.T) {
+		h := newHandler(12 * 1024) // 12 GiB / 8 MiB = 1536 blocks
+		buckets, cap, enabled := h.stagedBlockBucketCap(db.BlockUploadSession{})
+		if !enabled {
+			t.Fatal("expected enabled")
+		}
+		if buckets != db.BlockUploadStagedBlockBuckets {
+			t.Fatalf("bucketCount = %d, want %d", buckets, db.BlockUploadStagedBlockBuckets)
+		}
+		perBucket := 1536 / db.BlockUploadStagedBlockBuckets // 24
+		want := perBucket*stagedBlockBucketCapFactor + stagedBlockBucketSlack
+		if cap != want {
+			t.Fatalf("bucket cap = %d, want %d", cap, want)
+		}
+	})
+
+	t.Run("tiny ceiling uses few buckets and a bounded total (no explosion)", func(t *testing.T) {
+		h := newHandler(8) // 8 MiB / 8 MiB = 1 block
+		buckets, cap, enabled := h.stagedBlockBucketCap(db.BlockUploadSession{})
+		if !enabled {
+			t.Fatal("expected enabled")
+		}
+		if buckets != 1 {
+			t.Fatalf("bucketCount = %d, want 1 for a single-block ceiling", buckets)
+		}
+		// Total bound = buckets × cap must stay small (was ~192 blocks with the old
+		// fixed-64-buckets bug); here it is 1 × (1×2+3) = 5.
+		if total := buckets * cap; total > 8 {
+			t.Fatalf("total staged-block bound = %d, want a small bounded number (<=8)", total)
+		}
+	})
+
+	t.Run("disabled when the ceiling is disabled", func(t *testing.T) {
+		if _, _, enabled := newHandler(-1).stagedBlockBucketCap(db.BlockUploadSession{}); enabled {
+			t.Fatal("expected disabled when the per-session ceiling is disabled")
+		}
+	})
+
+	t.Run("disabled when db is not wired", func(t *testing.T) {
+		cfg := &config.Config{}
+		cfg.WebUploads.WebBlockUploadBlockSizeMB = 8
+		cfg.WebUploads.MaxStagedBytesPerSessionMB = 100
+		h := &BlockHandler{config: cfg}
+		if _, _, enabled := h.stagedBlockBucketCap(db.BlockUploadSession{}); enabled {
+			t.Fatal("expected disabled when db is nil (no ledger to check)")
+		}
+	})
+
+	t.Run("persisted session params override live config", func(t *testing.T) {
+		h := newHandler(12 * 1024)
+		session := db.BlockUploadSession{StagedBucketCount: 3, StagedBucketCap: 11}
+		buckets, cap, enabled := h.stagedBlockBucketCap(session)
+		if !enabled {
+			t.Fatal("expected enabled")
+		}
+		if buckets != 3 || cap != 11 {
+			t.Fatalf("got buckets=%d cap=%d, want persisted 3/11", buckets, cap)
+		}
+	})
+}
+
 // TestBlockBodyLimit covers that a session-mode upload is bounded to the CAS
 // block size (not chunking.absolute_max), so the per-user concurrency cap is a
 // meaningful RAM bound (cap × block_size), while the legacy no-session path keeps
@@ -797,11 +885,16 @@ func TestBlockBodyLimit(t *testing.T) {
 	cfg.Chunking.Adaptive.AbsoluteMax = absoluteMax
 	h := &BlockHandler{config: cfg}
 
-	if got := h.blockBodyLimit(uploadSessionValid); got != int64(blockSizeMB)*1024*1024 {
+	if got := h.blockBodyLimit(uploadSessionValid, db.BlockUploadSession{}); got != int64(blockSizeMB)*1024*1024 {
 		t.Fatalf("session-mode body limit = %d, want %d (the CAS block size, not absolute_max)", got, int64(blockSizeMB)*1024*1024)
 	}
-	if got := h.blockBodyLimit(uploadSessionAbsent); got != absoluteMax {
+	if got := h.blockBodyLimit(uploadSessionAbsent, db.BlockUploadSession{}); got != absoluteMax {
 		t.Fatalf("legacy body limit = %d, want %d (chunking.absolute_max)", got, absoluteMax)
+	}
+
+	session := db.BlockUploadSession{BlockSizeBytes: 4 * 1024 * 1024}
+	if got := h.blockBodyLimit(uploadSessionValid, session); got != session.BlockSizeBytes {
+		t.Fatalf("session-mode body limit = %d, want persisted session block size %d", got, session.BlockSizeBytes)
 	}
 }
 

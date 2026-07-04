@@ -71,6 +71,11 @@ are out of scope for phase 1.
   cases (`502/503/504`, bounded request timeout, transient network failure),
   with exponential backoff. This closes the "502 during check/commit forces a
   full restart" gap without reusing a stale upload session.
+- **Backpressure vs terminal staging cap are distinct on 429:** transient
+  per-user backpressure still uses `429 + Retry-After` and is soft-retried by the
+  client, but the per-session staged-block ceiling now tags its `429` with
+  `code=staging_cap_reached` so the client surfaces it immediately instead of
+  consuming its soft-wait budget on a condition that waiting cannot clear.
 
 This is the implementation of **Option B** from
 [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md): the web
@@ -353,19 +358,20 @@ re-upload).
 - **`GetFileUploadedBytes` remains a safe stub returning 0.** Real resume is now
   provided by `/blocks/check`; the old endpoint is kept only for the legacy
   frontend path.
-- **No staging-bytes cap (uncommitted backend consumption).** Because session
-  staging skips the logical storage quota (R5), and there is no separate cap on
-  *uncommitted* staged bytes, an authenticated user can `PutBlockData` many new
-  blocks under sessions and never commit. This is bounded — not unbounded — by:
-  (a) the upload **traffic quota**, charged per block at `/blocks/upload`, which
-  hard-blocks free/hard-tier users once their monthly upload allowance is spent;
-  and (b) the **48h provisional-ref TTL** + GC sweeper, which reclaims abandoned
-  blocks. The gap is real for **soft-tier or disabled traffic quota**, where the
-  brake is only (b): up to 48h of transient backend bytes. The proper fix is a
-  dedicated staging-bytes cap (a per-user/org counter of materialized-but-
-  uncommitted bytes, decremented at commit/expiry, checked at `/blocks/upload`) —
-  a separate limit from the final logical quota, so it would NOT reintroduce the
-  same-size-overwrite rejection. It is a follow-up feature, not yet implemented.
+- **Staging-bytes cap — IMPLEMENTED (PR `feat/block-upload-staging-cap`).** Session
+  staging skips the logical storage quota (R5); uncommitted staged bytes are now
+  bounded by the product of a **per-user concurrent-session cap** (atomic LWT slots
+  at session creation) and a **per-session staged-block cap** (a bucketed,
+  counter-free, reserve-before-PUT ledger), plus a fail-fast declared-`size` check at
+  session creation. See the RESOLVED item 1 under "Known issues / deferred debts" for
+  the full mechanics. This supersedes the earlier "not yet implemented" note and the
+  "abandoned staged blocks live until TTL" observation (abandoned sessions still
+  self-expire at the 48h TTL, but a live user can no longer stage without bound).
+- **Operational guardrail:** when web block upload is enabled and the per-session
+  staged-bytes cap is active, config now requires
+  `web_uploads.max_concurrent_block_uploads_per_user > 0`. The staged-block ledger
+  is a bounded anti-abuse backstop rather than an atomic limit, so disabling the
+  concurrent upload cap while keeping the staged cap would weaken that bound too far.
 - **Session TTL is fixed from mint time (not sliding).** `block_upload_sessions`
   is created with a 48h TTL when the session is minted, and each provisional
   `up:<session_id>` block ref gets its own 48h TTL when that block is uploaded.
@@ -934,16 +940,118 @@ config (`enable_web_block_upload: false`); they are the checklist to clear befor
 flipping the flag on in production. Severity is the operator-facing risk *if the
 flag were on*.
 
-1. **[Med/high] No staging-bytes cap.** Session staging skips the logical storage
-   quota (R5) and nothing caps *uncommitted* staged bytes, so an authenticated
-   user can `PutBlockData` many new blocks and never commit. Bounded by the upload
-   **traffic quota** (per-block, hard-blocks free/hard tier) and the **48h
-   provisional-ref TTL + GC**; the gap is real only for **soft-tier or disabled
-   traffic quota** (≤48h of transient backend bytes). Fix before prod: a dedicated
-   per-user/org/session counter of materialized-but-uncommitted bytes, decremented
-   at commit/expiry, checked at `/blocks/upload` — a *separate* limit from the
-   final logical quota so it cannot reintroduce the same-size-overwrite rejection.
-   (Subsumes the "abandoned staged blocks live until TTL" observation.)
+1. **[RESOLVED, PR `feat/block-upload-staging-cap`] Staging-bytes cap.** Session
+   staging skips the logical storage quota (R5); previously nothing capped
+   *uncommitted* staged bytes, so an authenticated user could `PutBlockData` many
+   new blocks and never commit (a gap for **soft-tier or disabled traffic quota**,
+   ≤48h of transient backend bytes). Fixed with **two drift-free, counter-free caps**
+   whose product bounds a user's uncommitted backend bytes without breaking legit
+   large uploads and without reintroducing the same-size-overwrite rejection (R5):
+   - **Per-user concurrent uncommitted-session cap.** Claimed atomically at session
+     creation via **LWT slots** (`block_upload_session_slots_by_user`,
+     `INSERT ... IF NOT EXISTS`, TTL-bound) — Paxos runs only here, never per block.
+     Over the cap → `429` + `Retry-After`. Config
+     `web_uploads.max_uncommitted_block_sessions_per_user` (default 8; `<=0` disables).
+     The whole admission+creation is one DB helper (`CreateAdmittedBlockUploadSession`)
+     that also rolls the slot back if the session insert fails, so the two tables
+     never desync. The claimed slot is stored on the session row and released at
+     commit by `CleanupCommittedBlockUploadSessionCaps` — **best-effort, after** the
+     critical `MarkBlockUploadSessionCommitted`, never coupled to it; the release is an
+     **owner-checked conditional delete** (`IF session_id = ?`) so a slow commit cannot
+     drop a slot a newer session re-claimed after the old one's TTL. Crucially, a
+     **committed session is terminal** for `/blocks/check` and `/blocks/upload`
+     (`resolveUploadSession` → 409): without this a client could commit once to recover
+     its slot and then keep staging under the committed session for the TTL, defeating
+     the cap (guarded by `TestWebBlockUploadCommittedSessionIsTerminal`).
+   - **Per-session staged-block cap (loose anti-abuse backstop).** A **bucketed
+     ledger** (`block_upload_session_staged_blocks`, `((session_id, bucket),
+     block_id)`, up to 64 buckets, per-row TTL — no Cassandra COUNTER) of the
+     distinct NEW blocks a session has staged. `/blocks/upload` **reserves before
+     the PUT** (fail-closed): it counts one small bucket (`LIMIT bucketCap+1`, O(1)
+     rows, no O(N²) re-scan) and rejects with `429` at the cap, else inserts the row
+     (idempotent by PK, so a retry never double-counts) and stores. A retry of an
+     already-reserved block is admitted even when its bucket is full (it is already
+     counted). **The bucket count is dynamic** (`min(64, maxBlocks)`) and the
+     per-bucket cap carries headroom for hash-collision variance, so it never
+     falsely rejects a legit file — which makes the *total* a deliberately **loose,
+     bounded overshoot** (roughly 2× plus slack per bucket; up to 5× for a
+     one-block ceiling), **not an exact byte cap**, and NOT atomic per block (a
+     concurrent burst can overshoot by up to the concurrency; no per-block Paxos).
+     This is acceptable because the EXACT per-file/publicable-file bound is
+     enforced elsewhere (below). The ceiling is
+     `web_uploads.max_staged_bytes_per_session_mb` (0 = derive from the max file size
+     × 1.25; unlimited max file size falls back to a documented default; `<0`
+     disables).
+   - **Exact bound: fail-fast + commit guard.** When the ceiling is enabled,
+     `block-upload-session` **requires** the client's declared `size` (400 if
+     missing), rejects `size > ceiling` with `413` before any hashing/upload, stores
+     it as `expected_size`, and the commit requires `manifest.size == expected_size`
+     (on top of R6's `sum(sizes) == size`). This pair is the real, exact
+     per-file size limit; the staged-block ledger above only bounds a *misbehaving*
+     client that under-declares `size` and then PUTs extra unique blocks.
+   - **Frozen admission contract (no hot-path coordination).** A session lives up to
+     48h; the admission rules in effect when it was minted are **frozen onto the
+     session row at creation** so they stay stable for its whole life even across
+     live config changes or restarts — without adding any coordination to the
+     `/blocks/upload` hot path. Migration 008 adds, on `block_upload_sessions`:
+     `block_size_bytes` (the authoritative CAS block size — echoed to the client and
+     used by BOTH `blockBodyLimit` (the accepted `/blocks/upload` body size) AND the
+     commit's `validateManifest`, so a config change during the session can neither
+     reject an in-flight upload's body nor reject the manifest at publish — the commit
+     loads the session before validating the manifest), `staged_bucket_count` / `staged_bucket_cap`
+     (the ledger bucketing — frozen so a retry always hashes into the **same** bucket
+     partition; otherwise a mid-session config change could move a block to a
+     different bucket and count it twice), and `expected_size` / `expected_size_declared`
+     (the latter distinguishes an explicit `size=0` **empty file** from "size
+     omitted", so the commit guard applies exactly when a size was declared — `size`
+     is a JSON pointer on the request for the same reason). Derived once by
+     `blockUploadStagingAdmissionFromConfig` at creation; `/blocks/upload` reads the
+     frozen values from the session (falling back to live config only for sessions
+     minted before this change — rollout compat). Regression-guarded by
+     `TestMigration008AddsBlockUploadStagingCapsAndFrozenAdmission`.
+
+   Rejections are counted by `block_upload_session_admission_rejections_total{reason}`
+   (`max_sessions` | `staged_blocks`). Publishable-file bound per user is still
+   driven by the session-create/commit exact limit; transient staged bytes are
+   bounded operationally by `session_cap × loose_ledger_bound`. Covered by
+   `TestEffectiveMaxStagedBytesPerSession`,
+   `TestStagedBlockBucket`/`TestStagedBlockBucketCap`, and the DB-level
+   `internal/integration/block_upload_staging_cap_test.go` (atomic slot cap, freed on
+   cleanup, idempotent ledger reserve/count, expected_size persisted). Deferred cheap
+   follow-up: a GC reap of ledger rows for abandoned sessions (TTL already bounds them).
+
+   **Client retry semantics for the two rejection kinds (audit 2026-07-04).** The
+   caps surface as different HTTP codes on different paths, and the frontend now
+   handles them symmetrically:
+   - The **413** at session creation (declared `size > ceiling`) is **terminal** —
+     `isRetriableControlPlaneError` returns false for a 4xx-with-response, so the
+     upload fails fast without wasted retries. Correct: the file is simply too big.
+   - The **`max_sessions` 429** at session creation (`block-upload-session`) and the
+     **`/blocks/check` rate-limit 429** are **transient backpressure**. These ride the
+     *control-plane* path (`withControlPlaneRetry`), which — like the block path's
+     `withRetry` — now waits out `Retry-After` as a **soft** wait (bounded by
+     `MAX_BACKPRESSURE_WAITS`) **without** consuming the hard retry budget, so a user
+     transiently at their session cap self-recovers instead of failing the upload.
+     (Before the audit fix, `withControlPlaneRetry` treated the 429 as terminal and
+     hard-failed the file, ignoring the server's `Retry-After: 5`.) Guarded by the
+     "429 on session creation … is waited out" Jest test.
+   - The **`staged_blocks` 429** on `/blocks/upload` is terminal for that session
+     (its bucket does not drain until commit), so the server now tags it with
+     `code=staging_cap_reached` and the client (`isTerminal429Error`) surfaces it
+     **immediately** — it is NOT soft-retried and does NOT burn the hard retry budget
+     re-uploading a doomed block; the transient concurrency `429` (no code) keeps its
+     soft-wait behavior. A legit file never trips the staging cap anyway (the 413
+     fail-fast + `expected_size` commit guard already bound the real size), so this
+     only makes a misbehaving client fail fast and clearly. Guarded by the "terminal
+     staging-cap 429 is surfaced immediately" Jest test.
+
+   **Residual note — slot-claim cost (audit 2026-07-04).** `claimBlockUploadSessionSlot`
+   probes slots `0..cap-1` with sequential LWTs, so a user already at the cap costs up
+   to `cap` Paxos rounds before the `429`. Trivial at the default `cap=8` and only on
+   the (cold) session-create path, but it grows linearly — operators who raise
+   `max_uncommitted_block_sessions_per_user` substantially should note the create-time
+   latency floor under contention (a randomized start slot or a small counter would cap
+   it; not worth the complexity today).
 2. **[Med, mitigated] Idempotency result can still be lost on a sustained
    Cassandra outage.** After publish, `MarkBlockUploadSessionCommitted` is now
    retried (3× bounded backoff). If *all* retries fail the session is left
@@ -1150,7 +1258,10 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
     consuming the hard retry budget, and it also tells the client's adaptive block
     limiter to back off (`noteRetry`), so legitimate multi-tab bursts self-throttle
     and recover instead of surfacing as a failed upload
-    (`is429Error`/`retryAfterMs` in `block-upload-orchestrator.js`). Rejections are
+    (`is429Error`/`retryAfterMs` in `block-upload-orchestrator.js`). The same soft
+    handling now applies on the **control-plane** path (`withControlPlaneRetry`), so a
+    `max_sessions` 429 at session creation is likewise waited out rather than failing
+    the file — see the client-retry-semantics note under item 1. Rejections are
     counted by `block_upload_concurrency_rejections_total`. This is a **different
     axis** from item 1 (item 1 bounds total *staged, uncommitted* bytes over time;
     this is instantaneous per-request memory — the staging-bytes cap would not by
@@ -1169,9 +1280,9 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
   and [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) for any
   residual cleanup.
 - Clear the prod-readiness checklist above before enabling
-  `enable_web_block_upload` in production — items 1 (staging-bytes cap), 2
-  (idempotency reconstruction on sustained outage), and 4 (browser E2E) remain
-  open; items 3, 8, 9, 12, 17, and 18 are now resolved.
+  `enable_web_block_upload` in production — items 2 (idempotency reconstruction on
+  sustained outage) and 4 (browser E2E) remain open; items 1, 3, 8, 9, 12, 17, and
+  18 are now resolved.
 - **Extend the block-upload flow to the other frontend upload surfaces — share
   links and public upload links.** Today only the authenticated in-app uploader
   routes eligible files through the CAS (block) flow; share-link and upload-link

@@ -232,6 +232,8 @@ web_uploads:
   max_files_per_batch: 1000
   simultaneous_uploads: 1  # Max parallel browser upload slots; the adaptive client starts at 1 and only ramps up to this ceiling on stable networks
   max_concurrent_block_uploads_per_user: 8  # Anti-abuse cap on concurrent session-mode /blocks/upload per user; RAM/user ~= cap x block_size (8x8MB=64MB); <=0 disables
+  max_uncommitted_block_sessions_per_user: 8  # Max concurrent uncommitted web block-upload sessions per user (LWT slots); <=0 disables
+  max_staged_bytes_per_session_mb: 0  # Per-session staged-bytes ceiling = max web-block file size; 0=derive from max file size x1.25, <0 disables
 
 seafhttp:
   token_ttl: 24h

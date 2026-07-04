@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"regexp"
@@ -38,14 +39,14 @@ type Config struct {
 // WebUploadsConfig holds browser upload behavior exposed to the web frontend.
 // Size values are expressed in MB to match the legacy frontend page-option contract.
 type WebUploadsConfig struct {
-	EnableUploadFolder        bool  `yaml:"enable_upload_folder"`
-	EnableResumableFileUpload bool  `yaml:"enable_resumable_file_upload"`
+	EnableUploadFolder        bool `yaml:"enable_upload_folder"`
+	EnableResumableFileUpload bool `yaml:"enable_resumable_file_upload"`
 	// EnableWebBlockUpload server-side-gates the web content-addressed (block)
 	// upload flow: block-upload-session, file-from-blocks, and the session mode
 	// of /blocks/check and /blocks/upload. Default false so the backend surface
 	// stays closed even though the routes are always registered.
-	EnableWebBlockUpload      bool  `yaml:"enable_web_block_upload"`
-	ResumableChunkSizeMB      int64 `yaml:"resumable_chunk_size_mb"`
+	EnableWebBlockUpload bool  `yaml:"enable_web_block_upload"`
+	ResumableChunkSizeMB int64 `yaml:"resumable_chunk_size_mb"`
 	// WebBlockUploadBlockSizeMB is the content-addressed (CAS) block size used by
 	// the web block-upload flow: the size each file is split and SHA-256 hashed
 	// into, validated exactly on commit (file-from-blocks). It is NOT the resumable
@@ -63,10 +64,28 @@ type WebUploadsConfig struct {
 	// cap × block_size (default 8 × 8 MB = 64 MB) — an anti-abuse backstop, not the
 	// staging-bytes cap. A value <= 0 disables the cap (unlimited).
 	// See docs/WEB-BLOCK-UPLOAD.md item 18.
-	MaxConcurrentBlockUploadsPerUser int   `yaml:"max_concurrent_block_uploads_per_user"`
-	MaxFileSizeMB                    int64 `yaml:"max_file_size_mb"`
-	MaxFilesPerBatch                 int   `yaml:"max_files_per_batch"`
-	SimultaneousUploads              int   `yaml:"simultaneous_uploads"`
+	MaxConcurrentBlockUploadsPerUser int `yaml:"max_concurrent_block_uploads_per_user"`
+	// MaxUncommittedBlockSessionsPerUser caps how many concurrent *uncommitted*
+	// web block-upload sessions one user may hold (claimed atomically via LWT slots
+	// at session creation). Together with MaxStagedBytesPerSessionMB it bounds the
+	// uncommitted backend bytes a user can force (≈ sessions × per-session ceiling)
+	// without a drifting aggregate counter. A value <= 0 disables the cap.
+	// See docs/WEB-BLOCK-UPLOAD.md item 1.
+	MaxUncommittedBlockSessionsPerUser int `yaml:"max_uncommitted_block_sessions_per_user"`
+	// MaxStagedBytesPerSessionMB is the per-session staging ceiling — in effect the
+	// MAXIMUM web-block file size, because one session uploads one file. The EXACT
+	// per-file bound is enforced by the declared-size fail-fast at session creation
+	// plus the commit's manifest.size == expected_size guard; the per-block
+	// staged-block ledger derived from this value is a deliberately LOOSE anti-abuse
+	// backstop (roughly 2x per-bucket headroom plus slack; up to 5x for a one-block
+	// ceiling), not an exact byte limit. > 0 = explicit MB; 0 = derive from the
+	// resolved max file size × 1.25 (falling back to a documented operational
+	// default when max file size is unlimited); < 0 = disable the per-session cap.
+	// See EffectiveMaxStagedBytesPerSession().
+	MaxStagedBytesPerSessionMB int64 `yaml:"max_staged_bytes_per_session_mb"`
+	MaxFileSizeMB              int64 `yaml:"max_file_size_mb"`
+	MaxFilesPerBatch           int   `yaml:"max_files_per_batch"`
+	SimultaneousUploads        int   `yaml:"simultaneous_uploads"`
 }
 
 // ResolvedMaxFileSizeMB returns the effective browser upload file-size cap.
@@ -98,6 +117,44 @@ func (c *Config) WebBlockUploadBlockSize() int64 {
 		mb = c.WebUploads.WebBlockUploadBlockSizeMB
 	}
 	return mb * 1024 * 1024
+}
+
+// DefaultMaxStagedBytesPerSession is the operational fallback ceiling (bytes) for
+// the per-session staged cap when web_uploads.max_staged_bytes_per_session_mb is 0
+// (derive) AND the resolved max file size is unlimited. It is effectively the
+// maximum web-block file size in that configuration; operators must raise the knob
+// to allow larger web block uploads. 12 GiB.
+const DefaultMaxStagedBytesPerSession int64 = 12 * 1024 * 1024 * 1024
+
+// stagedBytesPerSessionDeriveSlackNum/Den apply a 1.25× slack when deriving the
+// per-session ceiling from the max file size, so a legit file that hashes/dedups
+// slightly imperfectly is not rejected at its last blocks.
+const stagedBytesPerSessionDeriveSlackNum = 5
+const stagedBytesPerSessionDeriveSlackDen = 4
+
+// EffectiveMaxStagedBytesPerSession returns the per-session staged-bytes ceiling in
+// bytes (in effect the maximum web-block file size, since one session uploads one
+// file). Semantics of web_uploads.max_staged_bytes_per_session_mb:
+//   - > 0 : explicit MB.
+//   - 0   : derive from ResolvedMaxFileSizeMB() × 1.25; if max file size is
+//     unlimited, fall back to DefaultMaxStagedBytesPerSession.
+//   - < 0 : disabled — returns 0, which callers treat as "no per-session cap".
+func (c *Config) EffectiveMaxStagedBytesPerSession() int64 {
+	if c == nil {
+		return DefaultMaxStagedBytesPerSession
+	}
+	v := c.WebUploads.MaxStagedBytesPerSessionMB
+	if v > 0 {
+		return v * 1024 * 1024
+	}
+	if v < 0 {
+		return 0 // disabled
+	}
+	maxFileMB := c.ResolvedMaxFileSizeMB()
+	if maxFileMB <= 0 {
+		return DefaultMaxStagedBytesPerSession
+	}
+	return maxFileMB * 1024 * 1024 * stagedBytesPerSessionDeriveSlackNum / stagedBytesPerSessionDeriveSlackDen
 }
 
 var cassandraDCNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -701,6 +758,18 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
+	// The per-session staging ceiling is effectively the maximum web-block file
+	// size. When the block flow is enabled, the max file size is unlimited, and the
+	// ceiling is left to derive (0), it falls back to a fixed operational default —
+	// warn so operators know large web block uploads will be capped there.
+	if cfg.WebUploads.EnableWebBlockUpload &&
+		cfg.WebUploads.MaxStagedBytesPerSessionMB == 0 &&
+		cfg.ResolvedMaxFileSizeMB() <= 0 {
+		slog.Warn("web block upload: max_staged_bytes_per_session_mb is derive(0) but max file size is unlimited; "+
+			"per-session staging (max web-block file size) falls back to a fixed default — set the knob to allow larger uploads",
+			"fallback_bytes", DefaultMaxStagedBytesPerSession)
+	}
+
 	return cfg, nil
 }
 
@@ -740,14 +809,16 @@ func DefaultConfig() *Config {
 			},
 		},
 		WebUploads: WebUploadsConfig{
-			EnableUploadFolder:               true,
-			EnableResumableFileUpload:        true,
-			ResumableChunkSizeMB:             8,
-			WebBlockUploadBlockSizeMB:        8,
-			MaxConcurrentBlockUploadsPerUser: 8,
-			MaxFileSizeMB:                    0,
-			MaxFilesPerBatch:                 1000,
-			SimultaneousUploads:              1,
+			EnableUploadFolder:                 true,
+			EnableResumableFileUpload:          true,
+			ResumableChunkSizeMB:               8,
+			WebBlockUploadBlockSizeMB:          8,
+			MaxConcurrentBlockUploadsPerUser:   8,
+			MaxUncommittedBlockSessionsPerUser: 8,
+			MaxStagedBytesPerSessionMB:         0, // 0 = derive from max file size × 1.25
+			MaxFileSizeMB:                      0,
+			MaxFilesPerBatch:                   1000,
+			SimultaneousUploads:                1,
 		},
 		Billing: BillingConfig{},
 		Accounts: AccountsConfig{
@@ -1075,6 +1146,20 @@ func (c *Config) applyEnvOverrides() {
 			c.addEnvOverrideError("WEB_UPLOADS_MAX_CONCURRENT_BLOCK_UPLOADS_PER_USER must be an integer, got %q", v)
 		} else {
 			c.WebUploads.MaxConcurrentBlockUploadsPerUser = i
+		}
+	}
+	if v := os.Getenv("WEB_UPLOADS_MAX_UNCOMMITTED_BLOCK_SESSIONS_PER_USER"); v != "" {
+		if i, err := strconv.Atoi(strings.TrimSpace(v)); err != nil {
+			c.addEnvOverrideError("WEB_UPLOADS_MAX_UNCOMMITTED_BLOCK_SESSIONS_PER_USER must be an integer, got %q", v)
+		} else {
+			c.WebUploads.MaxUncommittedBlockSessionsPerUser = i
+		}
+	}
+	if v := os.Getenv("WEB_UPLOADS_MAX_STAGED_BYTES_PER_SESSION_MB"); v != "" {
+		if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {
+			c.addEnvOverrideError("WEB_UPLOADS_MAX_STAGED_BYTES_PER_SESSION_MB must be an integer, got %q", v)
+		} else {
+			c.WebUploads.MaxStagedBytesPerSessionMB = i
 		}
 	}
 
@@ -1510,6 +1595,11 @@ func (c *Config) Validate() error {
 	}
 	if c.WebUploads.WebBlockUploadBlockSizeMB <= 0 {
 		return fmt.Errorf("web_uploads.web_block_upload_block_size_mb must be greater than zero")
+	}
+	if c.WebUploads.EnableWebBlockUpload &&
+		c.EffectiveMaxStagedBytesPerSession() > 0 &&
+		c.WebUploads.MaxConcurrentBlockUploadsPerUser <= 0 {
+		return fmt.Errorf("web block upload with a staged-bytes cap requires web_uploads.max_concurrent_block_uploads_per_user to be greater than zero")
 	}
 	if c.WebUploads.MaxFilesPerBatch < 0 {
 		return fmt.Errorf("web_uploads.max_files_per_batch must be zero or greater")

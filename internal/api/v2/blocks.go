@@ -416,17 +416,78 @@ func (l *blockUploadConcurrencyLimiter) release(userKey string) {
 
 // blockBodyLimit is the maximum request body a /blocks/upload call may buffer in
 // memory (io.ReadAll). For the web (session) flow every block is exactly the
-// configured CAS block size (the last block is ≤ it), so a session request is
-// bounded to that size — NOT chunking.adaptive.absolute_max, which can be 256 MB
-// and would let one authenticated user force a 256 MB allocation per request,
-// making the per-user concurrency cap (item 18) almost useless for RAM
-// protection (cap × 256 MB = GBs). The legacy no-session path (desktop/mobile
-// sync, variable FastCDC blocks up to absolute_max) keeps the larger bound.
-func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution) int64 {
+// CAS block size frozen onto the session at creation time (the last block is ≤
+// it), so a session request is bounded to THAT size — NOT
+// chunking.adaptive.absolute_max, which can be 256 MB and would let one
+// authenticated user force a 256 MB allocation per request, making the per-user
+// concurrency cap (item 18) almost useless for RAM protection (cap × 256 MB =
+// GBs). The legacy no-session path (desktop/mobile sync, variable FastCDC blocks
+// up to absolute_max) keeps the larger bound.
+func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution, session db.BlockUploadSession) int64 {
 	if resolution == uploadSessionValid {
+		if session.BlockSizeBytes > 0 {
+			return session.BlockSizeBytes
+		}
 		return h.config.WebBlockUploadBlockSize()
 	}
 	return h.config.Chunking.Adaptive.AbsoluteMax
+}
+
+// staged-block bucket cap headroom. The per-bucket cap is
+// stagedBlockBucketCapFactor × perBucket + stagedBlockBucketSlack so hash-collision
+// variance never falsely rejects a legitimate file. This makes the *ledger* a
+// deliberately loose anti-abuse backstop (roughly 2x per-bucket headroom plus
+// slack; up to 5x for a one-block ceiling), not an exact byte cap. The EXACT
+// per-file size is still enforced elsewhere: the declared-size fail-fast at
+// session creation and the commit's `manifest.size == expected_size` guard. See
+// docs/WEB-BLOCK-UPLOAD.md item 1.
+const stagedBlockBucketCapFactor = 2
+const stagedBlockBucketSlack = 3
+
+const blockUploadStagingCapReachedCode = "staging_cap_reached"
+
+// blockUploadStagingAdmissionFromConfig derives the immutable staging-admission
+// contract for a NEW session from the then-current config. The result is frozen
+// onto block_upload_sessions so live config changes cannot move a retry to a
+// different bucket or change the accepted block size mid-session.
+func blockUploadStagingAdmissionFromConfig(cfg *config.Config) db.BlockUploadSessionAdmission {
+	if cfg == nil {
+		return db.BlockUploadSessionAdmission{}
+	}
+	ceiling := cfg.EffectiveMaxStagedBytesPerSession()
+	blockSize := cfg.WebBlockUploadBlockSize()
+	if ceiling <= 0 || blockSize <= 0 {
+		return db.BlockUploadSessionAdmission{BlockSizeBytes: blockSize}
+	}
+	maxBlocks := (ceiling + blockSize - 1) / blockSize // >= 1
+	buckets := int64(db.BlockUploadStagedBlockBuckets)
+	if maxBlocks < buckets {
+		buckets = maxBlocks
+	}
+	perBucket := (maxBlocks + buckets - 1) / buckets
+	return db.BlockUploadSessionAdmission{
+		BlockSizeBytes:    blockSize,
+		StagedBucketCount: int(buckets),
+		StagedBucketCap:   int(perBucket)*stagedBlockBucketCapFactor + stagedBlockBucketSlack,
+	}
+}
+
+// stagedBlockBucketCap returns, for the session flow, the effective bucket count,
+// the per-bucket staged-block cap, and whether the per-session cap is enabled. A
+// persisted session contract wins; older sessions without frozen params fall back
+// to the current config for compatibility during rollout.
+func (h *BlockHandler) stagedBlockBucketCap(session db.BlockUploadSession) (bucketCount, bucketCap int, enabled bool) {
+	if session.StagedBucketCount > 0 && session.StagedBucketCap > 0 {
+		return session.StagedBucketCount, session.StagedBucketCap, true
+	}
+	if h.db == nil {
+		return 0, 0, false
+	}
+	admission := blockUploadStagingAdmissionFromConfig(h.config)
+	if admission.StagedBucketCount <= 0 || admission.StagedBucketCap <= 0 {
+		return 0, 0, false
+	}
+	return admission.StagedBucketCount, admission.StagedBucketCap, true
 }
 
 // tryAdmitSessionUpload enforces the per-user concurrency cap for the web
@@ -460,6 +521,7 @@ const (
 	uploadSessionUnavailable
 	uploadSessionHeaderRequired
 	uploadSessionPermissionDenied
+	uploadSessionCommitted
 )
 
 func (r uploadSessionResolution) deniedStatus() int {
@@ -471,6 +533,9 @@ func (r uploadSessionResolution) deniedStatus() int {
 	}
 	if r == uploadSessionHeaderRequired {
 		return http.StatusBadRequest
+	}
+	if r == uploadSessionCommitted {
+		return http.StatusConflict
 	}
 	return http.StatusUnauthorized
 }
@@ -484,6 +549,9 @@ func (r uploadSessionResolution) deniedMessage() string {
 	}
 	if r == uploadSessionPermissionDenied {
 		return "upload is no longer allowed for this session"
+	}
+	if r == uploadSessionCommitted {
+		return "upload session already committed; start a new upload"
 	}
 	return "invalid or expired upload session"
 }
@@ -515,6 +583,15 @@ func (h *BlockHandler) resolveUploadSession(c *gin.Context) (db.BlockUploadSessi
 	}
 	if session.OrgID != c.GetString("org_id") || session.UserID != c.GetString("user_id") {
 		return db.BlockUploadSession{}, uploadSessionInvalid
+	}
+	// A committed session is TERMINAL for /blocks/check and /blocks/upload: its file
+	// is already published and its per-user slot was freed at commit, so continuing
+	// to stage blocks under it would (a) leak provisional refs that can never be
+	// committed and (b) defeat max_uncommitted_block_sessions_per_user (a client
+	// could commit once to recover its budget, then keep staging for the 48h TTL).
+	// Commit idempotency (R7) is handled on the commit path, not here.
+	if session.Committed {
+		return db.BlockUploadSession{}, uploadSessionCommitted
 	}
 	if h.permMiddleware != nil {
 		allowed := h.sessionPermCache.allow(session.SessionID, func() bool {
@@ -741,7 +818,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// configured CAS block size, not chunking.absolute_max — so one authenticated
 	// user cannot force a 256 MB buffer per request and defeat the per-user
 	// concurrency cap (item 18). Legacy sync keeps the larger absolute_max bound.
-	maxSize := h.blockBodyLimit(resolution)
+	maxSize := h.blockBodyLimit(resolution, session)
 	if c.Request.ContentLength > maxSize {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":    "block too large",
@@ -854,6 +931,47 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
+	// Session (web) flow: per-session staged-block admission (item 1). This block
+	// is NEW (it did not exist above), so reserve a ledger slot BEFORE storing it
+	// (reserve-before-PUT, fail-closed): if the session's bucket is already at its
+	// cap, reject; otherwise record the reservation and proceed. The reserve is
+	// idempotent by (session, bucket, block_id) — a retried block never
+	// double-counts — and self-expires with the session TTL (no Cassandra COUNTER).
+	// If the PUT below fails after the reserve, the row lingers and TTL reclaims it.
+	if resolution == uploadSessionValid {
+		if bucketCount, bucketCap, enabled := h.stagedBlockBucketCap(session); enabled {
+			bucket := db.StagedBlockBucket(hash, bucketCount)
+			staged, err := h.db.CountSessionStagedBlocksInBucket(session.SessionID, bucket, bucketCap+1)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
+				return
+			}
+			if staged >= bucketCap {
+				// The bucket is full — but let a RETRY of an already-reserved block
+				// through (its PUT may have failed): it is already counted, so
+				// admitting it does not grow the bound. Only a genuinely new block
+				// is rejected.
+				reserved, err := h.db.SessionStagedBlockExists(session.SessionID, bucket, hash)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
+					return
+				}
+				if !reserved {
+					metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
+					c.Header("Retry-After", "1")
+					c.JSON(http.StatusTooManyRequests, gin.H{
+						"error": "session staging limit reached; commit the file or start a new upload",
+						"code":  blockUploadStagingCapReachedCode,
+					})
+					return
+				}
+			} else if err := h.db.ReserveSessionStagedBlock(session.SessionID, bucket, hash, int64(len(data))); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reserve staged block"})
+				return
+			}
+		}
+	}
+
 	// Logical storage quota is NOT applied per block in the session (web) flow.
 	// R5: the user's repo/storage quota is a property of the FINAL file delta and
 	// is decided exactly once at file-from-blocks (finalizeStoredUploadMetadata) —
@@ -861,12 +979,12 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// it here would wrongly reject e.g. a same-size overwrite (logical delta ≈ 0)
 	// at the first new block. Traffic is still charged per block (above).
 	//
-	// NOTE: this is NOT a staging-bytes cap. CheckStorageQuota is a LOGICAL quota
-	// (it reads storage_used/quota counters, not physical staging). The legacy
-	// no-session path below keeps running it per block only because it predates
-	// this flow. Neither path bounds total uncommitted staged bytes; for the web
-	// flow that is bounded instead by the upload traffic quota (charged above) and
-	// the 48h provisional-ref TTL + GC. See docs/WEB-BLOCK-UPLOAD.md.
+	// NOTE: this is NOT the LOGICAL quota. CheckStorageQuota reads
+	// storage_used/quota counters, not physical staging. Total uncommitted staged
+	// bytes ARE now bounded for the session flow by the per-session staged-block
+	// ledger above (item 1) plus the per-user session cap; the legacy no-session
+	// path below keeps its own per-block logical check because it predates this
+	// flow. See docs/WEB-BLOCK-UPLOAD.md.
 	if resolution != uploadSessionValid {
 		if checker := traffic.GetChecker(); checker != nil {
 			if st, _ := checker.CheckStorageQuota(c.GetString("org_id"), c.GetString("user_id"), int64(len(data))); !st.Allowed {

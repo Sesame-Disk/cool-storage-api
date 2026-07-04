@@ -43,7 +43,7 @@ describe('uploadFileViaBlocks', () => {
 
     // Control-plane calls now carry a bounded timeout so a half-open socket can't
     // hang the flow forever.
-    expect(api.createBlockUploadSession).toHaveBeenCalledWith('r1', '/', expect.objectContaining({ timeout: expect.any(Number) }));
+    expect(api.createBlockUploadSession).toHaveBeenCalledWith('r1', '/', 100, expect.objectContaining({ timeout: expect.any(Number) }));
     expect(api.checkBlocks).toHaveBeenCalledWith(['h0', 'h1'], 'sess1', expect.objectContaining({ timeout: expect.any(Number) }));
     // Only the block reported missing is uploaded (dedup/resume).
     expect(uploaded).toEqual(['h1']);
@@ -679,5 +679,67 @@ describe('global concurrency limiter (shared across files)', () => {
     expect(attempt).toBe(3); // two 429s then a success — the block still uploads
     expect(limiter.noteRetry).toHaveBeenCalledTimes(2); // each 429 tells the limiter to back off
     expect(limiter.noteFailure).not.toHaveBeenCalled(); // backpressure is never a hard failure
+  });
+
+  test('a 429 on session creation (per-user session cap) is waited out, not a hard failure', async () => {
+    let sessionAttempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn(() => {
+        sessionAttempt += 1;
+        if (sessionAttempt <= 2) {
+          const err = new Error('too many concurrent uploads');
+          err.response = { status: 429, headers: { 'retry-after': '0.01' } };
+          return Promise.reject(err);
+        }
+        return Promise.resolve({ data: { session_id: 's' } });
+      }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+
+    // controlPlaneRetries:1 proves the session 429 waits are SOFT — two backpressure
+    // waits then success, even with only a single hard control-plane attempt.
+    const res = await uploadFileViaBlocks(makeFile(1), {
+      repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, controlPlaneRetries: 1, controlPlaneRetryBaseMs: 1,
+    });
+
+    expect(sessionAttempt).toBe(3); // two 429s then a minted session
+    expect(api.createFileFromBlocks).toHaveBeenCalledTimes(1); // the upload still commits
+    expect(res).toEqual([{ name: 'f', id: 'i', size: '1' }]);
+  });
+
+  test('a terminal staging-cap 429 is surfaced immediately instead of being soft-retried', async () => {
+    let attempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn(() => {
+        attempt += 1;
+        const err = new Error('session staging limit reached; commit the file or start a new upload');
+        err.response = {
+          status: 429,
+          headers: { 'retry-after': '1' },
+          data: { code: 'staging_cap_reached' },
+        };
+        return Promise.reject(err);
+      }),
+      createFileFromBlocks: jest.fn(),
+    };
+    const limiter = {
+      acquire: jest.fn().mockResolvedValue(() => { }),
+      noteRetry: jest.fn(),
+      noteFailure: jest.fn(),
+      getMaxConcurrency: () => 1,
+    };
+
+    await expect(
+      uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 3 }),
+    ).rejects.toThrow('session staging limit reached; commit the file or start a new upload');
+
+    expect(attempt).toBe(1);
+    expect(limiter.noteRetry).toHaveBeenCalledTimes(1);
+    expect(limiter.noteFailure).toHaveBeenCalledTimes(1);
+    expect(api.createFileFromBlocks).not.toHaveBeenCalled();
   });
 });

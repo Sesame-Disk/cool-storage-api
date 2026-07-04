@@ -147,6 +147,12 @@ func validateManifest(req *fileFromBlocksRequest, blockSize int64) error {
 		blockSize = WebUploadBlockSize
 	}
 	maxTotalSize := int64(maxBlocksPerManifest) * blockSize
+	// The block flow does NOT commit empty (0-byte / 0-block) files by design:
+	// files below blockUploadThresholdMB (default 64 MB) never enter this flow — the
+	// frontend routes them to the legacy resumable uploader — so an empty-file commit
+	// cannot legitimately arrive here. A 0-block or size<=0 manifest is therefore
+	// rejected rather than special-cased. (A size=0 declared at session creation is
+	// still distinguished from "size missing"; it simply cannot reach a valid commit.)
 	if len(req.Blocks) == 0 {
 		return fmt.Errorf("blocks is required")
 	}
@@ -232,12 +238,12 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	if req.ParentDir == "" {
 		req.ParentDir = "/"
 	}
-	if err := validateManifest(&req, h.webBlockUploadBlockSize()); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// R7: validate the server-issued session and bind it to this caller + repo.
+	// R7: validate the server-issued session and bind it to this caller + repo
+	// BEFORE validating the manifest, so the manifest is checked against the CAS
+	// block size FROZEN on the session at creation — not live config. Otherwise a
+	// config change during the 48h session could accept blocks at the frozen size
+	// in /blocks/upload yet reject the very same manifest here (item 1, frozen
+	// admission contract).
 	session, ok, err := h.db.GetBlockUploadSession(req.Session)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read upload session"})
@@ -251,10 +257,26 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "session does not belong to this request"})
 		return
 	}
+
+	commitBlockSize := session.BlockSizeBytes
+	if commitBlockSize <= 0 {
+		commitBlockSize = h.webBlockUploadBlockSize() // pre-freeze session fallback
+	}
+	if err := validateManifest(&req, commitBlockSize); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	// The session captures the commit intent: it must target the parent_dir it was
 	// minted for (defends the session as an intent token, not just an auth scope).
 	if normalizePath(session.ParentDir) != req.ParentDir {
 		c.JSON(http.StatusConflict, gin.H{"error": "session parent_dir does not match this commit"})
+		return
+	}
+	// If the client declared a size at session creation (fail-fast staging check,
+	// item 1), the committed manifest must match it — a cheap extra guard on top of
+	// R6's sum(sizes)==size that ties the commit to the declared intent.
+	if session.ExpectedSizeDeclared && req.Size != session.ExpectedSize {
+		c.JSON(http.StatusConflict, gin.H{"error": "manifest size does not match the size declared at session creation"})
 		return
 	}
 
@@ -455,6 +477,14 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	}
 	if markErr != nil {
 		log.Printf("[CreateFileFromBlocks] WARNING: commit succeeded but failed to record session idempotency after retries: %v", markErr)
+	}
+
+	// Free the session's staging caps (per-user slot) now that it is committed —
+	// BEST-EFFORT and strictly AFTER the critical idempotency write above, never
+	// coupled to it: a cleanup failure must not make a committed file look
+	// uncommitted. A lingering slot self-expires at the session TTL (fail-safe).
+	if err := h.db.CleanupCommittedBlockUploadSessionCaps(session); err != nil {
+		log.Printf("[CreateFileFromBlocks] WARNING: committed but failed to release session staging slot (self-expires at TTL): %v", err)
 	}
 
 	// Release the session's provisional refs now that permanent fs: refs exist.
