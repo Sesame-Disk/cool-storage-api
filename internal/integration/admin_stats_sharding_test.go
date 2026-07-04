@@ -82,74 +82,84 @@ func TestAdminStatsFanOutAcrossPlatformShards(t *testing.T) {
 	seedPlatformStorageCounterDeltasForTest(t, session, storageDeltas)
 	seedPlatformTrafficCounterDeltasForTest(t, session, trafficDeltas)
 
+	const adminStatsPollTimeout = 20 * time.Second
 	var lastMismatch string
-	waitForCondition(t, "admin shard-aware platform stats to reflect seeded counter deltas", func() bool {
-		expectedStorage := readPlatformStorageSnapshotForTest(t, session)
-		expectedMonthTraffic := readPlatformTrafficUsageForMonthsForTest(t, session, []string{today.Format("200601")})
-		expectedYearTraffic := readPlatformTrafficUsageForMonthsForTest(t, session, yearMonthKeysForTest(today))
-		expectedHistoricalStorage := expectedStorage.BytesUsed - readPlatformStorageDayBytesForTest(t, session, today)
-		expectedTrafficByType := readPlatformTrafficByDayForTest(t, session, today)
+	deadline := time.Now().Add(adminStatsPollTimeout)
+	for {
+		matched := func() bool {
+			expectedStorage := readPlatformStorageSnapshotForTest(t, session)
+			expectedMonthTraffic := readPlatformTrafficUsageForMonthsForTest(t, session, []string{today.Format("200601")})
+			expectedYearTraffic := readPlatformTrafficUsageForMonthsForTest(t, session, yearMonthKeysForTest(today))
+			expectedHistoricalStorage := expectedStorage.BytesUsed - readPlatformStorageDayBytesForTest(t, session, today)
+			expectedTrafficByType := readPlatformTrafficByDayForTest(t, session, today)
 
-		sysinfo := getJSONMap(t, superadminClient.Get(t, "/api/v2.1/admin/sysinfo/"))
-		if jsonInt64(sysinfo, "total_storage") != expectedStorage.BytesUsed {
-			lastMismatch = fmt.Sprintf("sysinfo total_storage=%d want=%d", jsonInt64(sysinfo, "total_storage"), expectedStorage.BytesUsed)
-			return false
-		}
-		if jsonInt64(sysinfo, "total_files_count") != expectedStorage.FileCount {
-			lastMismatch = fmt.Sprintf("sysinfo total_files_count=%d want=%d", jsonInt64(sysinfo, "total_files_count"), expectedStorage.FileCount)
-			return false
-		}
-		if jsonInt64(sysinfo, "traffic_month_total") != expectedMonthTraffic.Combined {
-			lastMismatch = fmt.Sprintf("sysinfo traffic_month_total=%d want=%d", jsonInt64(sysinfo, "traffic_month_total"), expectedMonthTraffic.Combined)
-			return false
-		}
-		if jsonInt64(sysinfo, "traffic_month_upload") != expectedMonthTraffic.Upload {
-			lastMismatch = fmt.Sprintf("sysinfo traffic_month_upload=%d want=%d", jsonInt64(sysinfo, "traffic_month_upload"), expectedMonthTraffic.Upload)
-			return false
-		}
-		if jsonInt64(sysinfo, "traffic_month_download") != expectedMonthTraffic.Download {
-			lastMismatch = fmt.Sprintf("sysinfo traffic_month_download=%d want=%d", jsonInt64(sysinfo, "traffic_month_download"), expectedMonthTraffic.Download)
-			return false
-		}
-		if jsonInt64(sysinfo, "traffic_year_total") != expectedYearTraffic.Combined {
-			lastMismatch = fmt.Sprintf("sysinfo traffic_year_total=%d want=%d", jsonInt64(sysinfo, "traffic_year_total"), expectedYearTraffic.Combined)
-			return false
-		}
-		if jsonInt64(sysinfo, "traffic_year_upload") != expectedYearTraffic.Upload {
-			lastMismatch = fmt.Sprintf("sysinfo traffic_year_upload=%d want=%d", jsonInt64(sysinfo, "traffic_year_upload"), expectedYearTraffic.Upload)
-			return false
-		}
-		if jsonInt64(sysinfo, "traffic_year_download") != expectedYearTraffic.Download {
-			lastMismatch = fmt.Sprintf("sysinfo traffic_year_download=%d want=%d", jsonInt64(sysinfo, "traffic_year_download"), expectedYearTraffic.Download)
-			return false
-		}
+			sysinfo := getJSONMap(t, superadminClient.Get(t, "/api/v2.1/admin/sysinfo/"))
+			if jsonInt64(sysinfo, "total_storage") != expectedStorage.BytesUsed {
+				lastMismatch = fmt.Sprintf("sysinfo total_storage=%d want=%d", jsonInt64(sysinfo, "total_storage"), expectedStorage.BytesUsed)
+				return false
+			}
+			if jsonInt64(sysinfo, "total_files_count") != expectedStorage.FileCount {
+				lastMismatch = fmt.Sprintf("sysinfo total_files_count=%d want=%d", jsonInt64(sysinfo, "total_files_count"), expectedStorage.FileCount)
+				return false
+			}
+			if jsonInt64(sysinfo, "traffic_month_total") != expectedMonthTraffic.Combined {
+				lastMismatch = fmt.Sprintf("sysinfo traffic_month_total=%d want=%d", jsonInt64(sysinfo, "traffic_month_total"), expectedMonthTraffic.Combined)
+				return false
+			}
+			if jsonInt64(sysinfo, "traffic_month_upload") != expectedMonthTraffic.Upload {
+				lastMismatch = fmt.Sprintf("sysinfo traffic_month_upload=%d want=%d", jsonInt64(sysinfo, "traffic_month_upload"), expectedMonthTraffic.Upload)
+				return false
+			}
+			if jsonInt64(sysinfo, "traffic_month_download") != expectedMonthTraffic.Download {
+				lastMismatch = fmt.Sprintf("sysinfo traffic_month_download=%d want=%d", jsonInt64(sysinfo, "traffic_month_download"), expectedMonthTraffic.Download)
+				return false
+			}
+			if jsonInt64(sysinfo, "traffic_year_total") != expectedYearTraffic.Combined {
+				lastMismatch = fmt.Sprintf("sysinfo traffic_year_total=%d want=%d", jsonInt64(sysinfo, "traffic_year_total"), expectedYearTraffic.Combined)
+				return false
+			}
+			if jsonInt64(sysinfo, "traffic_year_upload") != expectedYearTraffic.Upload {
+				lastMismatch = fmt.Sprintf("sysinfo traffic_year_upload=%d want=%d", jsonInt64(sysinfo, "traffic_year_upload"), expectedYearTraffic.Upload)
+				return false
+			}
+			if jsonInt64(sysinfo, "traffic_year_download") != expectedYearTraffic.Download {
+				lastMismatch = fmt.Sprintf("sysinfo traffic_year_download=%d want=%d", jsonInt64(sysinfo, "traffic_year_download"), expectedYearTraffic.Download)
+				return false
+			}
 
-		storageRow := adminStatsRowForDate(
-			t,
-			fmt.Sprintf("/api/v2.1/admin/statistics/total-storage/?start=%s&end=%s", yesterday.Format("2006-01-02"), yesterday.Format("2006-01-02")),
-			yesterday,
-		)
-		if jsonInt64(storageRow, "total_storage") != expectedHistoricalStorage {
-			lastMismatch = fmt.Sprintf("storage row total_storage=%d want=%d", jsonInt64(storageRow, "total_storage"), expectedHistoricalStorage)
-			return false
-		}
+			storageRow := adminStatsRowForDate(
+				t,
+				fmt.Sprintf("/api/v2.1/admin/statistics/total-storage/?start=%s&end=%s", yesterday.Format("2006-01-02"), yesterday.Format("2006-01-02")),
+				yesterday,
+			)
+			if jsonInt64(storageRow, "total_storage") != expectedHistoricalStorage {
+				lastMismatch = fmt.Sprintf("storage row total_storage=%d want=%d", jsonInt64(storageRow, "total_storage"), expectedHistoricalStorage)
+				return false
+			}
 
-		trafficRow := adminStatsRowForDate(
-			t,
-			fmt.Sprintf("/api/v2.1/admin/statistics/system-traffic/?start=%s&end=%s", today.Format("2006-01-02"), today.Format("2006-01-02")),
-			today,
-		)
-		if jsonInt64(trafficRow, traffic.WebUpload) != expectedTrafficByType[traffic.WebUpload] {
-			lastMismatch = fmt.Sprintf("traffic row %s=%d want=%d", traffic.WebUpload, jsonInt64(trafficRow, traffic.WebUpload), expectedTrafficByType[traffic.WebUpload])
-			return false
+			trafficRow := adminStatsRowForDate(
+				t,
+				fmt.Sprintf("/api/v2.1/admin/statistics/system-traffic/?start=%s&end=%s", today.Format("2006-01-02"), today.Format("2006-01-02")),
+				today,
+			)
+			if jsonInt64(trafficRow, traffic.WebUpload) != expectedTrafficByType[traffic.WebUpload] {
+				lastMismatch = fmt.Sprintf("traffic row %s=%d want=%d", traffic.WebUpload, jsonInt64(trafficRow, traffic.WebUpload), expectedTrafficByType[traffic.WebUpload])
+				return false
+			}
+			if jsonInt64(trafficRow, traffic.LinkDownload) != expectedTrafficByType[traffic.LinkDownload] {
+				lastMismatch = fmt.Sprintf("traffic row %s=%d want=%d", traffic.LinkDownload, jsonInt64(trafficRow, traffic.LinkDownload), expectedTrafficByType[traffic.LinkDownload])
+				return false
+			}
+			return true
+		}()
+		if matched {
+			break
 		}
-		if jsonInt64(trafficRow, traffic.LinkDownload) != expectedTrafficByType[traffic.LinkDownload] {
-			lastMismatch = fmt.Sprintf("traffic row %s=%d want=%d", traffic.LinkDownload, jsonInt64(trafficRow, traffic.LinkDownload), expectedTrafficByType[traffic.LinkDownload])
-			return false
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for admin shard-aware platform stats to reflect seeded counter deltas; last mismatch: %s", lastMismatch)
 		}
-
-		return true
-	})
+		time.Sleep(pollInterval)
+	}
 
 	t.Logf("verified admin shard fan-out with storage +%d bytes/%d files and traffic +%d upload/+%d download; last mismatch before success: %s", wantStorageBytes, wantStorageFiles, wantUploadBytes, wantDownloadBytes, lastMismatch)
 	if wantHistoricalStorageBytes <= 0 || wantTrafficTotal <= 0 {
