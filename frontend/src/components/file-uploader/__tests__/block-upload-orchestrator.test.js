@@ -680,4 +680,32 @@ describe('global concurrency limiter (shared across files)', () => {
     expect(limiter.noteRetry).toHaveBeenCalledTimes(2); // each 429 tells the limiter to back off
     expect(limiter.noteFailure).not.toHaveBeenCalled(); // backpressure is never a hard failure
   });
+
+  test('a 429 on session creation (per-user session cap) is waited out, not a hard failure', async () => {
+    let sessionAttempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn(() => {
+        sessionAttempt += 1;
+        if (sessionAttempt <= 2) {
+          const err = new Error('too many concurrent uploads');
+          err.response = { status: 429, headers: { 'retry-after': '0.01' } };
+          return Promise.reject(err);
+        }
+        return Promise.resolve({ data: { session_id: 's' } });
+      }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn().mockResolvedValue({ data: {} }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+
+    // controlPlaneRetries:1 proves the session 429 waits are SOFT — two backpressure
+    // waits then success, even with only a single hard control-plane attempt.
+    const res = await uploadFileViaBlocks(makeFile(1), {
+      repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, controlPlaneRetries: 1, controlPlaneRetryBaseMs: 1,
+    });
+
+    expect(sessionAttempt).toBe(3); // two 429s then a minted session
+    expect(api.createFileFromBlocks).toHaveBeenCalledTimes(1); // the upload still commits
+    expect(res).toEqual([{ name: 'f', id: 'i', size: '1' }]);
+  });
 });

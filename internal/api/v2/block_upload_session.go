@@ -161,9 +161,10 @@ func (h *FileHandler) CreateBlockUploadSession(c *gin.Context) {
 
 func (h *FileHandler) blockUploadSessionAdmission(size *int64) db.BlockUploadSessionAdmission {
 	admission := blockUploadStagingAdmissionFromConfig(h.config)
-	if h != nil {
-		admission.BlockSizeBytes = h.webBlockUploadBlockSize()
-	}
+	// webBlockUploadBlockSize() falls back to a sane default when config is nil
+	// (where the config-derived BlockSizeBytes above would be 0), so it is the
+	// authoritative CAS block size frozen onto the session and echoed to the client.
+	admission.BlockSizeBytes = h.webBlockUploadBlockSize()
 	if size != nil {
 		admission.ExpectedSize = *size
 		admission.ExpectedSizeDeclared = true

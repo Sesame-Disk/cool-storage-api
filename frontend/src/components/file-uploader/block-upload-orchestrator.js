@@ -124,23 +124,41 @@ function normalizeAttempts(value, fallback) {
 
 async function withControlPlaneRetry(fn, attempts, { signal, baseMs = CONTROL_PLANE_RETRY_BASE_MS } = {}) {
   const maxAttempts = normalizeAttempts(attempts, CONTROL_PLANE_RETRY_ATTEMPTS);
-  let lastErr;
-  for (let i = 1; i <= maxAttempts; i += 1) {
+  let hardAttempt = 0;
+  let softWaits = 0;
+  for (; ;) {
     throwIfAborted(signal);
     try {
       // eslint-disable-next-line no-await-in-loop
       return await fn();
     } catch (err) {
-      lastErr = err;
-      if (!isRetriableControlPlaneError(err) || i >= maxAttempts) {
+      if (isAbortError(err) || (signal && signal.aborted)) {
+        throw err;
+      }
+      // A 429 on a control-plane call (block-upload-session over the per-user
+      // uncommitted-session cap → Retry-After 5, or /blocks/check over its
+      // rate-limit) is transient backpressure, NEVER terminal — the only terminal
+      // staging rejection is the 413 fail-fast at session creation, which is not a
+      // 429. So wait out the server's Retry-After WITHOUT consuming the hard retry
+      // budget (bounded by MAX_BACKPRESSURE_WAITS so a permanently saturated cap
+      // cannot loop forever), mirroring the block path's withRetry. Session
+      // creation is only retried here, on FAILURE, so no partial session leaks.
+      if (is429Error(err) && softWaits < MAX_BACKPRESSURE_WAITS) {
+        softWaits += 1;
+        const jitter = Math.floor(Math.random() * 250);
+        // eslint-disable-next-line no-await-in-loop
+        await waitWithAbort(retryAfterMs(err, baseMs) + jitter, signal);
+        continue;
+      }
+      hardAttempt += 1;
+      if (!isRetriableControlPlaneError(err) || hardAttempt >= maxAttempts) {
         throw err;
       }
       const jitter = Math.floor(Math.random() * 250);
       // eslint-disable-next-line no-await-in-loop
-      await waitWithAbort(Math.min(baseMs * 2 ** (i - 1), 5000) + jitter, signal);
+      await waitWithAbort(Math.min(baseMs * 2 ** (hardAttempt - 1), 5000) + jitter, signal);
     }
   }
-  throw lastErr;
 }
 
 // uploadBlockWithStallGuard uploads one block and aborts+rejects it if no bytes
@@ -387,7 +405,7 @@ async function withRetry(fn, attempts, { signal } = {}) {
   let lastErr;
   let hardAttempt = 0;
   let softWaits = 0;
-  for (;;) {
+  for (; ;) {
     throwIfAborted(signal);
     try {
       return await fn();
@@ -515,7 +533,7 @@ async function uploadMissingBlocks(session, missing, blockIndexByHash, getBlockD
   };
 
   const worker = async () => {
-    for (;;) {
+    for (; ;) {
       throwIfAborted(signal);
       const i = cursor;
       cursor += 1;

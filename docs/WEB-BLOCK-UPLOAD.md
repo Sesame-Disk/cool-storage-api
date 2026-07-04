@@ -1009,6 +1009,39 @@ flag were on*.
    `internal/integration/block_upload_staging_cap_test.go` (atomic slot cap, freed on
    cleanup, idempotent ledger reserve/count, expected_size persisted). Deferred cheap
    follow-up: a GC reap of ledger rows for abandoned sessions (TTL already bounds them).
+
+   **Client retry semantics for the two rejection kinds (audit 2026-07-04).** The
+   caps surface as different HTTP codes on different paths, and the frontend now
+   handles them symmetrically:
+   - The **413** at session creation (declared `size > ceiling`) is **terminal** —
+     `isRetriableControlPlaneError` returns false for a 4xx-with-response, so the
+     upload fails fast without wasted retries. Correct: the file is simply too big.
+   - The **`max_sessions` 429** at session creation (`block-upload-session`) and the
+     **`/blocks/check` rate-limit 429** are **transient backpressure**. These ride the
+     *control-plane* path (`withControlPlaneRetry`), which — like the block path's
+     `withRetry` — now waits out `Retry-After` as a **soft** wait (bounded by
+     `MAX_BACKPRESSURE_WAITS`) **without** consuming the hard retry budget, so a user
+     transiently at their session cap self-recovers instead of failing the upload.
+     (Before the audit fix, `withControlPlaneRetry` treated the 429 as terminal and
+     hard-failed the file, ignoring the server's `Retry-After: 5`.) Guarded by the
+     "429 on session creation … is waited out" Jest test.
+   - The **`staged_blocks` 429** on `/blocks/upload` is *semantically* terminal for
+     that session (its bucket does not drain until commit), but it rides the block
+     path, which soft-retries any 429 up to `MAX_BACKPRESSURE_WAITS` then surfaces it.
+     This is acceptable **only** because a legit file never trips it (the 413
+     fail-fast + `expected_size` commit guard already bound the real size); it bites
+     only a misbehaving client, for whom a few bounded waits before a hard error is
+     fine. A distinct status/error-code for the two `/blocks/upload` 429s (concurrency
+     vs staging) would let the client stop retrying the terminal one sooner —
+     deferred, low value while the flag is off.
+
+   **Residual note — slot-claim cost (audit 2026-07-04).** `claimBlockUploadSessionSlot`
+   probes slots `0..cap-1` with sequential LWTs, so a user already at the cap costs up
+   to `cap` Paxos rounds before the `429`. Trivial at the default `cap=8` and only on
+   the (cold) session-create path, but it grows linearly — operators who raise
+   `max_uncommitted_block_sessions_per_user` substantially should note the create-time
+   latency floor under contention (a randomized start slot or a small counter would cap
+   it; not worth the complexity today).
 2. **[Med, mitigated] Idempotency result can still be lost on a sustained
    Cassandra outage.** After publish, `MarkBlockUploadSessionCommitted` is now
    retried (3× bounded backoff). If *all* retries fail the session is left
@@ -1215,7 +1248,10 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
     consuming the hard retry budget, and it also tells the client's adaptive block
     limiter to back off (`noteRetry`), so legitimate multi-tab bursts self-throttle
     and recover instead of surfacing as a failed upload
-    (`is429Error`/`retryAfterMs` in `block-upload-orchestrator.js`). Rejections are
+    (`is429Error`/`retryAfterMs` in `block-upload-orchestrator.js`). The same soft
+    handling now applies on the **control-plane** path (`withControlPlaneRetry`), so a
+    `max_sessions` 429 at session creation is likewise waited out rather than failing
+    the file — see the client-retry-semantics note under item 1. Rejections are
     counted by `block_upload_concurrency_rejections_total`. This is a **different
     axis** from item 1 (item 1 bounds total *staged, uncommitted* bytes over time;
     this is instantaneous per-request memory — the staging-bytes cap would not by
