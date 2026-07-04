@@ -242,12 +242,12 @@ func TestMigration008AddsBlockUploadStagingCapsAndFrozenAdmission(t *testing.T) 
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS block_upload_session_slots_by_user")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS block_upload_session_staged_blocks")
 
-	// Frozen per-session admission columns (consolidated — one migration in the branch).
-	assert.Contains(t, content, "ALTER TABLE block_upload_sessions ADD (")
-	assert.Contains(t, content, "slot INT")
-	assert.Contains(t, content, "expected_size BIGINT")
-	assert.Contains(t, content, "expected_size_declared BOOLEAN")
-	assert.Contains(t, content, "block_size_bytes BIGINT")
-	assert.Contains(t, content, "staged_bucket_count INT")
-	assert.Contains(t, content, "staged_bucket_cap INT")
+	// Frozen per-session admission columns (consolidated — one migration in the
+	// branch). Added as separate single-column ALTERs, per the repo convention.
+	assert.Contains(t, content, "ALTER TABLE block_upload_sessions ADD slot INT;")
+	assert.Contains(t, content, "ALTER TABLE block_upload_sessions ADD expected_size BIGINT;")
+	assert.Contains(t, content, "ALTER TABLE block_upload_sessions ADD expected_size_declared BOOLEAN;")
+	assert.Contains(t, content, "ALTER TABLE block_upload_sessions ADD block_size_bytes BIGINT;")
+	assert.Contains(t, content, "ALTER TABLE block_upload_sessions ADD staged_bucket_count INT;")
+	assert.Contains(t, content, "ALTER TABLE block_upload_sessions ADD staged_bucket_cap INT;")
 }

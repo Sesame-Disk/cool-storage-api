@@ -979,8 +979,10 @@ flag were on*.
      live config changes or restarts — without adding any coordination to the
      `/blocks/upload` hot path. Migration 008 adds, on `block_upload_sessions`:
      `block_size_bytes` (the authoritative CAS block size — echoed to the client and
-     used by `blockBodyLimit`, so a config change cannot reject an in-flight upload
-     whose body was hashed to the old size), `staged_bucket_count` / `staged_bucket_cap`
+     used by BOTH `blockBodyLimit` (the accepted `/blocks/upload` body size) AND the
+     commit's `validateManifest`, so a config change during the session can neither
+     reject an in-flight upload's body nor reject the manifest at publish — the commit
+     loads the session before validating the manifest), `staged_bucket_count` / `staged_bucket_cap`
      (the ledger bucketing — frozen so a retry always hashes into the **same** bucket
      partition; otherwise a mid-session config change could move a block to a
      different bucket and count it twice), and `expected_size` / `expected_size_declared`

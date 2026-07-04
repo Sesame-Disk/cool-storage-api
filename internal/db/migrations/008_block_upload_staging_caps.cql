@@ -37,8 +37,9 @@
 --                               hash into the SAME bucket partitions (a config change
 --                               must not move a block to a different bucket and count
 --                               it twice).
--- Applied exactly once (tracked in schema_migrations); the combined ADD is the final
--- statement so the idempotent CREATEs above it are safe on any retry.
+-- Applied exactly once (tracked in schema_migrations). The columns are added with
+-- one single-column ALTER each, matching the repo convention (see migration 005) for
+-- the widest CQL compatibility.
 
 CREATE TABLE IF NOT EXISTS block_upload_session_slots_by_user (
     org_id     UUID,
@@ -58,11 +59,9 @@ CREATE TABLE IF NOT EXISTS block_upload_session_staged_blocks (
     PRIMARY KEY ((session_id, bucket), block_id)
 );
 
-ALTER TABLE block_upload_sessions ADD (
-    slot INT,
-    expected_size BIGINT,
-    expected_size_declared BOOLEAN,
-    block_size_bytes BIGINT,
-    staged_bucket_count INT,
-    staged_bucket_cap INT
-);
+ALTER TABLE block_upload_sessions ADD slot INT;
+ALTER TABLE block_upload_sessions ADD expected_size BIGINT;
+ALTER TABLE block_upload_sessions ADD expected_size_declared BOOLEAN;
+ALTER TABLE block_upload_sessions ADD block_size_bytes BIGINT;
+ALTER TABLE block_upload_sessions ADD staged_bucket_count INT;
+ALTER TABLE block_upload_sessions ADD staged_bucket_cap INT;
