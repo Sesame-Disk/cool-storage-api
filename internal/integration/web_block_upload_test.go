@@ -251,17 +251,17 @@ func TestWebBlockUploadSessionRequiresDeclaredSizeWhenCapEnabled(t *testing.T) {
 	}
 }
 
-func TestWebBlockUploadSessionAllowsExplicitZeroSize(t *testing.T) {
+func TestWebBlockUploadSessionRejectsExplicitZeroSize(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-zero-size-%d", time.Now().UnixNano()))
 	resp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2/repos/%s/block-upload-session/", repoID), map[string]interface{}{
 		"parent_dir": "/",
 		"size":       0,
 	})
-	expectStatus(t, resp, http.StatusOK)
+	expectStatus(t, resp, http.StatusBadRequest)
 	var out map[string]interface{}
 	decodeJSON(t, resp, &out)
-	if sid, _ := out["session_id"].(string); sid == "" {
-		t.Fatalf("empty session_id in response: %v", out)
+	if out["error"] != "invalid size (the block upload flow does not support empty files)" {
+		t.Fatalf("error = %v, want invalid empty-file size rejection", out["error"])
 	}
 }
 
