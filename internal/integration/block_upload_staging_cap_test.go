@@ -81,22 +81,29 @@ func TestBlockUploadSessionSlotCapDisabled(t *testing.T) {
 	}
 }
 
-// blockIDInBucket returns a hex-ish block id that hashes into the target bucket,
-// so a test can put two DISTINCT blocks into the SAME (session, bucket) partition
-// deterministically instead of hoping a hardcoded id collides.
-func blockIDInBucket(bucket, bucketCount int) string {
+// blockIDInBucketWithPrefix returns a block id with the given prefix that hashes
+// into the target bucket, so a test can put DISTINCT blocks into the SAME
+// (session, bucket) partition deterministically instead of hoping a hardcoded id
+// collides.
+func blockIDInBucketWithPrefix(prefix string, bucket, bucketCount int) string {
 	for i := 0; ; i++ {
-		id := fmt.Sprintf("blk-%d", i)
+		id := fmt.Sprintf("%s-%d", prefix, i)
 		if dbpkg.StagedBlockBucket(id, bucketCount) == bucket {
 			return id
 		}
 	}
 }
 
+// blockIDInBucket keeps the old helper shape for callers that do not care about
+// the exact prefix.
+func blockIDInBucket(bucket, bucketCount int) string {
+	return blockIDInBucketWithPrefix("blk", bucket, bucketCount)
+}
+
 func distinctBlockIDInBucket(bucket, bucketCount int, exclude string) string {
 	for i := 0; ; i++ {
-		id := fmt.Sprintf("blk-distinct-%d", i)
-		if id != exclude && dbpkg.StagedBlockBucket(id, bucketCount) == bucket {
+		id := blockIDInBucketWithPrefix(fmt.Sprintf("blk-distinct-%d", i), bucket, bucketCount)
+		if id != exclude {
 			return id
 		}
 	}
@@ -154,12 +161,7 @@ func TestBlockUploadStagedBucketConcurrentReserveBoundedOvershoot(t *testing.T) 
 	const parallel = 12
 	ids := make([]string, parallel)
 	for i := range ids {
-		id := blockIDInBucket(bucket, bucketCount) + fmt.Sprintf("-%d", i)
-		// Keep it in the target bucket even with the suffix.
-		for dbpkg.StagedBlockBucket(id, bucketCount) != bucket {
-			id += "z"
-		}
-		ids[i] = id
+		ids[i] = blockIDInBucketWithPrefix(fmt.Sprintf("blk-concurrent-%d", i), bucket, bucketCount)
 	}
 
 	var wg sync.WaitGroup

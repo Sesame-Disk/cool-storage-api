@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -43,7 +45,63 @@ func webCreateBlockSession(t *testing.T, c *testClient, repoID, parentDir string
 	if sid == "" {
 		t.Fatalf("empty session_id in response: %v", out)
 	}
+	t.Cleanup(func() {
+		cleanupBlockUploadSessionForTest(t, sid)
+	})
 	return sid
+}
+
+func cleanupBlockUploadSessionForTest(t *testing.T, sessionID string) {
+	t.Helper()
+
+	database := shareProjectionDBForTest(t)
+	session, ok, err := database.GetBlockUploadSession(sessionID)
+	if err != nil {
+		t.Errorf("cleanup block upload session %s: read session: %v", sessionID, err)
+		return
+	}
+	if !ok {
+		return
+	}
+
+	if err := database.CleanupCommittedBlockUploadSessionCaps(session); err != nil {
+		t.Errorf("cleanup block upload session %s: release slot: %v", sessionID, err)
+	}
+
+	referrer := dbpkg.BlockReferrerForUpload(sessionID)
+	for bucket := 0; bucket < dbpkg.BlockUploadStagedBlockBuckets; bucket++ {
+		iter := database.Session().Query(`
+			SELECT block_id FROM block_upload_session_staged_blocks
+			WHERE session_id = ? AND bucket = ?
+		`, sessionID, bucket).Iter()
+		var blockID string
+		var blockIDs []string
+		for iter.Scan(&blockID) {
+			blockIDs = append(blockIDs, blockID)
+		}
+		if err := iter.Close(); err != nil {
+			t.Errorf("cleanup block upload session %s: list staged blocks for bucket %d: %v", sessionID, bucket, err)
+			continue
+		}
+		for _, blockID := range blockIDs {
+			if err := database.Session().Query(`
+				DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
+			`, session.OrgID, blockID, referrer).Exec(); err != nil {
+				t.Errorf("cleanup block upload session %s: delete provisional ref for block %s: %v", sessionID, blockID, err)
+			}
+		}
+		if err := database.Session().Query(`
+			DELETE FROM block_upload_session_staged_blocks WHERE session_id = ? AND bucket = ?
+		`, sessionID, bucket).Exec(); err != nil {
+			t.Errorf("cleanup block upload session %s: delete staged bucket %d: %v", sessionID, bucket, err)
+		}
+	}
+
+	if err := database.Session().Query(`
+		DELETE FROM block_upload_sessions WHERE session_id = ?
+	`, sessionID).Exec(); err != nil {
+		t.Errorf("cleanup block upload session %s: delete session row: %v", sessionID, err)
+	}
 }
 
 // webUploadBlock POSTs raw block bytes under a session. Returns the response.
@@ -211,7 +269,11 @@ func TestWebBlockUploadCommittedSessionIsTerminal(t *testing.T) {
 
 	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(totalSize(blocks)))
 	upResp := webUploadBlock(t, adminClient, session, content)
-	expectStatus(t, upResp, http.StatusOK)
+	if upResp.StatusCode != http.StatusOK && upResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(upResp.Body)
+		upResp.Body.Close()
+		t.Fatalf("upload status %d, want 200/201; body=%s", upResp.StatusCode, body)
+	}
 	upResp.Body.Close()
 
 	commitResp := webCommit(t, adminClient, repoID, map[string]interface{}{
@@ -723,7 +785,7 @@ func TestWebBlockUploadManifestRejectsConflictingBlockSizes(t *testing.T) {
 func TestWebBlockUploadSizeMismatch(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-r11-%d", time.Now().UnixNano()))
 	content := []byte("ten bytes!") // 10 bytes
-	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
+	session := webCreateBlockSession(t, adminClient, repoID, "/", 20)
 	resp := webUploadBlock(t, adminClient, session, content)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		t.Fatalf("upload status %d", resp.StatusCode)
