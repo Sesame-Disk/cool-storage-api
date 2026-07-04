@@ -708,4 +708,38 @@ describe('global concurrency limiter (shared across files)', () => {
     expect(api.createFileFromBlocks).toHaveBeenCalledTimes(1); // the upload still commits
     expect(res).toEqual([{ name: 'f', id: 'i', size: '1' }]);
   });
+
+  test('a terminal staging-cap 429 is surfaced immediately instead of being soft-retried', async () => {
+    let attempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn(() => {
+        attempt += 1;
+        const err = new Error('session staging limit reached; commit the file or start a new upload');
+        err.response = {
+          status: 429,
+          headers: { 'retry-after': '1' },
+          data: { code: 'staging_cap_reached' },
+        };
+        return Promise.reject(err);
+      }),
+      createFileFromBlocks: jest.fn(),
+    };
+    const limiter = {
+      acquire: jest.fn().mockResolvedValue(() => { }),
+      noteRetry: jest.fn(),
+      noteFailure: jest.fn(),
+      getMaxConcurrency: () => 1,
+    };
+
+    await expect(
+      uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 3 }),
+    ).rejects.toThrow('session staging limit reached; commit the file or start a new upload');
+
+    expect(attempt).toBe(1);
+    expect(limiter.noteRetry).toHaveBeenCalledTimes(1);
+    expect(limiter.noteFailure).toHaveBeenCalledTimes(1);
+    expect(api.createFileFromBlocks).not.toHaveBeenCalled();
+  });
 });

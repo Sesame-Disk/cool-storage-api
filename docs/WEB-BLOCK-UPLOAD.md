@@ -71,6 +71,11 @@ are out of scope for phase 1.
   cases (`502/503/504`, bounded request timeout, transient network failure),
   with exponential backoff. This closes the "502 during check/commit forces a
   full restart" gap without reusing a stale upload session.
+- **Backpressure vs terminal staging cap are distinct on 429:** transient
+  per-user backpressure still uses `429 + Retry-After` and is soft-retried by the
+  client, but the per-session staged-block ceiling now tags its `429` with
+  `code=staging_cap_reached` so the client surfaces it immediately instead of
+  consuming its soft-wait budget on a condition that waiting cannot clear.
 
 This is the implementation of **Option B** from
 [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md): the web
@@ -362,6 +367,11 @@ re-upload).
   the full mechanics. This supersedes the earlier "not yet implemented" note and the
   "abandoned staged blocks live until TTL" observation (abandoned sessions still
   self-expire at the 48h TTL, but a live user can no longer stage without bound).
+- **Operational guardrail:** when web block upload is enabled and the per-session
+  staged-bytes cap is active, config now requires
+  `web_uploads.max_concurrent_block_uploads_per_user > 0`. The staged-block ledger
+  is a bounded anti-abuse backstop rather than an atomic limit, so disabling the
+  concurrent upload cap while keeping the staged cap would weaken that bound too far.
 - **Session TTL is fixed from mint time (not sliding).** `block_upload_sessions`
   is created with a 48h TTL when the session is minted, and each provisional
   `up:<session_id>` block ref gets its own 48h TTL when that block is uploaded.
@@ -1025,15 +1035,15 @@ flag were on*.
      (Before the audit fix, `withControlPlaneRetry` treated the 429 as terminal and
      hard-failed the file, ignoring the server's `Retry-After: 5`.) Guarded by the
      "429 on session creation … is waited out" Jest test.
-   - The **`staged_blocks` 429** on `/blocks/upload` is *semantically* terminal for
-     that session (its bucket does not drain until commit), but it rides the block
-     path, which soft-retries any 429 up to `MAX_BACKPRESSURE_WAITS` then surfaces it.
-     This is acceptable **only** because a legit file never trips it (the 413
-     fail-fast + `expected_size` commit guard already bound the real size); it bites
-     only a misbehaving client, for whom a few bounded waits before a hard error is
-     fine. A distinct status/error-code for the two `/blocks/upload` 429s (concurrency
-     vs staging) would let the client stop retrying the terminal one sooner —
-     deferred, low value while the flag is off.
+   - The **`staged_blocks` 429** on `/blocks/upload` is terminal for that session
+     (its bucket does not drain until commit), so the server now tags it with
+     `code=staging_cap_reached` and the client (`isTerminal429Error`) surfaces it
+     **immediately** — it is NOT soft-retried and does NOT burn the hard retry budget
+     re-uploading a doomed block; the transient concurrency `429` (no code) keeps its
+     soft-wait behavior. A legit file never trips the staging cap anyway (the 413
+     fail-fast + `expected_size` commit guard already bound the real size), so this
+     only makes a misbehaving client fail fast and clearly. Guarded by the "terminal
+     staging-cap 429 is surfaced immediately" Jest test.
 
    **Residual note — slot-claim cost (audit 2026-07-04).** `claimBlockUploadSessionSlot`
    probes slots `0..cap-1` with sequential LWTs, so a user already at the cap costs up

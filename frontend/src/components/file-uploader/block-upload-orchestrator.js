@@ -143,7 +143,7 @@ async function withControlPlaneRetry(fn, attempts, { signal, baseMs = CONTROL_PL
       // budget (bounded by MAX_BACKPRESSURE_WAITS so a permanently saturated cap
       // cannot loop forever), mirroring the block path's withRetry. Session
       // creation is only retried here, on FAILURE, so no partial session leaks.
-      if (is429Error(err) && softWaits < MAX_BACKPRESSURE_WAITS) {
+      if (is429Error(err) && !isTerminal429Error(err) && softWaits < MAX_BACKPRESSURE_WAITS) {
         softWaits += 1;
         const jitter = Math.floor(Math.random() * 250);
         // eslint-disable-next-line no-await-in-loop
@@ -373,6 +373,14 @@ export function is429Error(error) {
   return Boolean(error && error.response && error.response.status === 429);
 }
 
+function isTerminal429Error(error) {
+  if (!is429Error(error)) {
+    return false;
+  }
+  const data = (error && error.response && error.response.data) || {};
+  return String(data.code || '').toLowerCase() === 'staging_cap_reached';
+}
+
 // retryAfterMs reads the server's Retry-After hint (seconds) from a 429 response,
 // clamped to a sane range, so the client waits as long as the server asked
 // instead of the much shorter default exponential backoff (which could exhaust
@@ -414,11 +422,18 @@ async function withRetry(fn, attempts, { signal } = {}) {
       if (isAbortError(err) || (signal && signal.aborted)) {
         throw err;
       }
-      if (is429Error(err) && softWaits < MAX_BACKPRESSURE_WAITS) {
+      if (is429Error(err) && !isTerminal429Error(err) && softWaits < MAX_BACKPRESSURE_WAITS) {
         softWaits += 1;
         const jitter = Math.floor(Math.random() * 250);
         await waitWithAbort(retryAfterMs(err) + jitter, signal);
         continue;
+      }
+      // A terminal 429 (session staging cap reached) will NEVER clear by resending
+      // the same block — its bucket does not drain until the file commits — so
+      // surface it immediately instead of burning hard retries (and re-uploading
+      // the block body) on a doomed request.
+      if (isTerminal429Error(err)) {
+        throw err;
       }
       hardAttempt += 1;
       if (hardAttempt >= maxAttempts) {

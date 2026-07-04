@@ -600,6 +600,16 @@ func TestConfigValidate(t *testing.T) {
 			wantErr:        true,
 			wantErrContain: "web_block_upload_block_size_mb must be greater than zero",
 		},
+		{
+			name: "web block upload staged cap requires positive concurrent upload cap",
+			modify: func(c *Config) {
+				c.WebUploads.EnableWebBlockUpload = true
+				c.WebUploads.MaxStagedBytesPerSessionMB = 1024
+				c.WebUploads.MaxConcurrentBlockUploadsPerUser = 0
+			},
+			wantErr:        true,
+			wantErrContain: "web block upload with a staged-bytes cap requires web_uploads.max_concurrent_block_uploads_per_user to be greater than zero",
+		},
 	}
 
 	for _, tt := range tests {

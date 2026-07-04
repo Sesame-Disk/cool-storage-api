@@ -444,6 +444,8 @@ func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution, sessio
 const stagedBlockBucketCapFactor = 2
 const stagedBlockBucketSlack = 3
 
+const blockUploadStagingCapReachedCode = "staging_cap_reached"
+
 // blockUploadStagingAdmissionFromConfig derives the immutable staging-admission
 // contract for a NEW session from the then-current config. The result is frozen
 // onto block_upload_sessions so live config changes cannot move a retry to a
@@ -957,7 +959,10 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 				if !reserved {
 					metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
 					c.Header("Retry-After", "1")
-					c.JSON(http.StatusTooManyRequests, gin.H{"error": "session staging limit reached; commit the file or start a new upload"})
+					c.JSON(http.StatusTooManyRequests, gin.H{
+						"error": "session staging limit reached; commit the file or start a new upload",
+						"code":  blockUploadStagingCapReachedCode,
+					})
 					return
 				}
 			} else if err := h.db.ReserveSessionStagedBlock(session.SessionID, bucket, hash, int64(len(data))); err != nil {

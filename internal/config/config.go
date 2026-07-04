@@ -1596,6 +1596,11 @@ func (c *Config) Validate() error {
 	if c.WebUploads.WebBlockUploadBlockSizeMB <= 0 {
 		return fmt.Errorf("web_uploads.web_block_upload_block_size_mb must be greater than zero")
 	}
+	if c.WebUploads.EnableWebBlockUpload &&
+		c.EffectiveMaxStagedBytesPerSession() > 0 &&
+		c.WebUploads.MaxConcurrentBlockUploadsPerUser <= 0 {
+		return fmt.Errorf("web block upload with a staged-bytes cap requires web_uploads.max_concurrent_block_uploads_per_user to be greater than zero")
+	}
 	if c.WebUploads.MaxFilesPerBatch < 0 {
 		return fmt.Errorf("web_uploads.max_files_per_batch must be zero or greater")
 	}
