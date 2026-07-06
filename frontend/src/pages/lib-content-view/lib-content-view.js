@@ -44,8 +44,15 @@ class LibContentView extends React.Component {
       hash: '',
       currentRepoInfo: null,
       repoName: '',
-      repoEncrypted: false,
+      // undefined = "not yet known" so the block-upload gate fails closed (undefined
+      // → resumable) during the initial repo-info load; set to the real boolean below,
+      // atomically with currentRepoInfo, before any uploader can mount.
+      repoEncrypted: undefined,
       libNeedDecrypt: false,
+      // Overlay (not the full-view gate): re-prompt for the repo password when an
+      // upload 403s because the 1h decrypt session expired, WITHOUT unmounting the
+      // upload dialog so the user keeps their retryable rows.
+      isUploadDecryptDialogShow: false,
       isGroupOwnedRepo: false,
       userPerm: '',
       selectedDirentList: [],
@@ -151,8 +158,13 @@ class LibContentView extends React.Component {
       const repoInfo = new RepoInfo(repoRes.data);
       const isGroupOwnedRepo = repoInfo.owner_email.indexOf('@seafile_group') > -1;
 
+      // Set repoEncrypted TOGETHER with currentRepoInfo (not in the later setState
+      // after the await below): otherwise a custom-permission repo has a render window
+      // where currentRepoInfo is present but repoEncrypted is still the default, which
+      // would let the uploader mount as "not encrypted" and wrongly enable block upload.
       this.setState({
         currentRepoInfo: repoInfo,
+        repoEncrypted: repoInfo.encrypted,
       });
 
       if (repoInfo.permission.startsWith('custom-')) {
@@ -165,7 +177,7 @@ class LibContentView extends React.Component {
       this.setState({
         repoName: repoInfo.repo_name,
         libNeedDecrypt: repoInfo.lib_need_decrypt,
-        repoEncrypted: repoInfo.encrypted,
+        // repoEncrypted already set atomically with currentRepoInfo above.
         isGroupOwnedRepo: isGroupOwnedRepo,
         path: path
       });
@@ -1946,6 +1958,22 @@ class LibContentView extends React.Component {
     }
   };
 
+  // Triggered by the uploader when an upload fails because the library's decrypt
+  // session expired (403 "Library is encrypted"). Shown as an OVERLAY so the upload
+  // dialog and its retryable rows survive; on success we auto-retry those uploads.
+  onUploadLibNeedDecrypt = () => {
+    this.setState({ isUploadDecryptDialogShow: true });
+  };
+
+  onUploadLibDecryptDialog = (success) => {
+    this.setState({ isUploadDecryptDialogShow: false });
+    // On success the server decrypt session is unlocked again — auto-retry exactly
+    // the uploads that failed because it had expired (no manual "Retry All" needed).
+    if (success && this.uploader && this.uploader.retryPendingDecryptFailures) {
+      this.uploader.retryPendingDecryptFailures();
+    }
+  };
+
   onLibDecryptWhenCopyMove = (success) => {
     if (!success) {
       // Cancelled - just close the dialog without performing copy/move
@@ -2286,12 +2314,22 @@ class LibContentView extends React.Component {
               dragAndDrop={true}
               path={this.state.path}
               repoID={this.props.repoID}
+              repoEncrypted={this.state.repoEncrypted}
+              onLibNeedDecrypt={this.onUploadLibNeedDecrypt}
               direntList={this.state.direntList}
               onFileUploadSuccess={this.onFileUploadSuccess}
               isCustomPermission={isCustomPermission}
             />
           )}
         </div>
+        {this.state.isUploadDecryptDialogShow && (
+          <ModalPortal>
+            <LibDecryptDialog
+              repoID={this.props.repoID}
+              onLibDecryptDialog={this.onUploadLibDecryptDialog}
+            />
+          </ModalPortal>
+        )}
         {isCopyMoveProgressDialogShow && (
           <CopyMoveDirentProgressDialog
             type={this.state.asyncOperationType}

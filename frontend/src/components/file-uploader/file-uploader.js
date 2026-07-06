@@ -4,7 +4,7 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { aggregateBlockUploadBitrate, clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetBlockUploadBitrate, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, sampleBlockUploadBitrate, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
+import { aggregateBlockUploadBitrate, clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, isLibraryEncryptedError, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetBlockUploadBitrate, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, sampleBlockUploadBitrate, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
@@ -18,6 +18,7 @@ import '../../css/file-uploader.css';
 const propTypes = {
   repoID: PropTypes.string.isRequired,
   repoEncrypted: PropTypes.bool,
+  onLibNeedDecrypt: PropTypes.func,
   direntList: PropTypes.array.isRequired,
   filetypes: PropTypes.array,
   chunkSize: PropTypes.number,
@@ -1083,18 +1084,45 @@ class FileUploader extends React.Component {
         return; // session torn down mid-fetch — nothing to re-offer or abandon
       }
       settleStart();
-      const errorMsg = this.getAxiosErrorMessage(error) || gettext('Network error');
-      toaster.danger(errorMsg);
+      // An encrypted library whose 1h server-side decrypt session has expired 403s
+      // the upload-link fetch. Surface the repo password dialog (via the parent)
+      // instead of the generic "Permission denied" toaster, and keep the files as
+      // retryable rows so the user can Retry once the library is unlocked again.
+      const encryptedLib = isLibraryEncryptedError(error);
+      const errorMsg = encryptedLib
+        ? gettext('This library is encrypted. Please enter the password to continue.')
+        : (this.getAxiosErrorMessage(error) || gettext('Network error'));
+      if (encryptedLib && this.props.onLibNeedDecrypt) {
+        this.props.onLibNeedDecrypt();
+      } else {
+        toaster.danger(errorMsg);
+      }
       // The group's target could not be fetched and it never started. Take its files OUT
       // of resumable.files (so a later DIFFERENT-mode group can't run with them mixed in
       // against the wrong instance target) and FREE the active mode, otherwise the queue
       // would wedge — no real complete/error event fires to drain held work.
       const newlyRetryable = [];
+      const markRetryable = (f) => {
+        f.error = errorMsg;
+        if (!this.abandonedLegacyFiles.includes(f)) {
+          this.abandonedLegacyFiles.push(f);
+        }
+        newlyRetryable.push(f);
+      };
       resumableFiles.forEach(f => {
         this.resumable.removeFile(f);
         this.legacyHold = this.legacyHold.filter(h => h.resumableFile !== f);
         f._retryOnStart = false;
-        if (f._fromDuplicatePrompt) {
+        if (encryptedLib) {
+          // The decrypt session expired for the WHOLE group. Tag EVERY file — including
+          // one whose duplicate decision (Replace/Keep) was already made — as
+          // decrypt-retry so the parent can auto-retry exactly these once the password
+          // is re-entered. The Replace/Keep choice is already encoded on the file
+          // (_uploadMode + formData.replace/target_file), so re-driving through the
+          // scheduler honors it WITHOUT re-prompting the duplicate dialog.
+          f._pendingDecryptRetry = true;
+          markRetryable(f);
+        } else if (f._fromDuplicatePrompt) {
           this.pendingDuplicates.unshift(f); // re-offer the user's pending decision
         } else {
           // Keep a plain file as a RETRYABLE error row instead of dropping it: a
@@ -1102,11 +1130,7 @@ class FileUploader extends React.Component {
           // it through the scheduler, which re-fetches the target). It is out of
           // resumable.files, so abandonedLegacyFiles keeps it rendered; the dedup key
           // stays reserved so a re-drop is still caught.
-          f.error = errorMsg;
-          if (!this.abandonedLegacyFiles.includes(f)) {
-            this.abandonedLegacyFiles.push(f);
-          }
-          newlyRetryable.push(f);
+          markRetryable(f);
         }
       });
       if (this.activeLegacyMode === mode) {
@@ -1950,6 +1974,40 @@ class FileUploader extends React.Component {
       // serialized automatically (one runs, the other is held "Waiting…" until idle), so
       // a replace and a normal retry never share the wrong instance target.
       legacyRetryList.forEach(item => {
+        this.enqueueLegacyUpload(item, item._uploadMode || 'upload', { retry: true });
+      });
+    });
+    this.restoreConcurrencyIfIdle();
+  };
+
+  // retryPendingDecryptFailures re-drives exactly the files that failed because the
+  // library's 1h decrypt session had expired (tagged in the upload-link catch),
+  // called by the parent after the user re-enters the password. Encrypted libraries
+  // only use the legacy resumable path (the block flow is gated off), so every tagged
+  // file re-enters the target-mode scheduler, which re-fetches a fresh upload link —
+  // now succeeding because the session is unlocked. Untagged failures are left for a
+  // manual Retry. Modeled on onUploadRetryAll (single setState, then enqueue).
+  retryPendingDecryptFailures = () => {
+    const toRetry = this.state.retryFileList.filter(item => item && item._pendingDecryptRetry);
+    if (toRetry.length === 0) {
+      return;
+    }
+    const retryIds = new Set(toRetry.map(item => item.uniqueIdentifier));
+    toRetry.forEach(item => {
+      clearFileUploadRuntimeState(item, { resetRemainingTime: true });
+      resetUploadConflictAutoRetry(item);
+      item.error = null;
+      item._pendingDecryptRetry = false;
+    });
+    const retryFileList = this.state.retryFileList.filter(item => !retryIds.has(item.uniqueIdentifier));
+    const uploadFileList = this.state.uploadFileList.slice(0);
+    this.setState({
+      retryFileList,
+      uploadFileList,
+      totalProgress: this.calculateTotalProgress(uploadFileList),
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+    }, () => {
+      toRetry.forEach(item => {
         this.enqueueLegacyUpload(item, item._uploadMode || 'upload', { retry: true });
       });
     });
