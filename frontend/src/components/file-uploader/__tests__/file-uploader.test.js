@@ -1012,6 +1012,48 @@ describe('FileUploader duplicate-name prompting', () => {
     expect(uploader.state.currentResumableFile).toBe(f);
   });
 
+  const encryptedError = () => Object.assign(new Error('encrypted'), {
+    response: { status: 403, data: { lib_need_decrypt: true } },
+  });
+
+  test('a "keep" duplicate blocked by an expired decrypt session is tagged for decrypt auto-retry, not re-prompted', async () => {
+    seafileAPI.getFileServerUploadLink.mockRejectedValue(encryptedError());
+    const onLibNeedDecrypt = jest.fn();
+    const uploader = createUploader({ onLibNeedDecrypt });
+    const f = createResumableFile('k.txt', { file: { name: 'k.txt', size: 10 } });
+
+    uploader.startLegacyDuplicateUpload(f, false); // keep → 'upload' mode, shared link 403s
+    await flushPromises();
+
+    expect(onLibNeedDecrypt).toHaveBeenCalled();          // password dialog is surfaced
+    expect(f._pendingDecryptRetry).toBe(true);            // tagged for auto-retry, even as a duplicate
+    expect(f._uploadMode).toBe('upload');                 // Keep decision preserved for the re-drive
+    expect(uploader.state.retryFileList).toContain(f);
+    expect(uploader.pendingDuplicates).not.toContain(f);  // NOT re-offered as a duplicate
+    expect(uploader.state.isUploadRemindDialogShow).toBe(false); // no duplicate re-prompt
+  });
+
+  test('a "replace" duplicate blocked by an expired decrypt session keeps update mode for decrypt auto-retry', async () => {
+    seafileAPI.getUpdateLink.mockRejectedValue(encryptedError());
+    const onLibNeedDecrypt = jest.fn();
+    const uploader = createUploader({ onLibNeedDecrypt });
+    const f = createResumableFile('r.txt', { file: { name: 'r.txt', size: 10 } });
+
+    uploader.startLegacyDuplicateUpload(f, true); // replace → 'update' mode, update link 403s
+    await flushPromises();
+
+    expect(onLibNeedDecrypt).toHaveBeenCalled();
+    expect(f._pendingDecryptRetry).toBe(true);
+    expect(f._uploadMode).toBe('update');       // Replace decision preserved
+    expect(f.formData.replace).toBe(1);
+    expect(uploader.state.retryFileList).toContain(f);
+
+    // Auto-retry after unlock re-drives it in update mode, honoring the Replace choice.
+    const enqueueSpy = jest.spyOn(uploader, 'enqueueLegacyUpload').mockImplementation(() => {});
+    uploader.retryPendingDecryptFailures();
+    expect(enqueueSpy).toHaveBeenCalledWith(f, 'update', { retry: true });
+  });
+
   test('flag OFF: a non-duplicate legacy file uploads through the shared target (no per-page 405)', async () => {
     shouldUseBlockUpload.mockReturnValue(false);
     seafileAPI.getFileServerUploadLink.mockResolvedValue({ data: '/upload/tok' });

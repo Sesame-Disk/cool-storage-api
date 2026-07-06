@@ -16,16 +16,27 @@ function makeFile(size, name = 'big.bin') {
 }
 
 describe('shouldUseBlockUpload (encrypted-library gate)', () => {
+  const bigFile = makeFile(100 * 1024 * 1024); // 100 MB, well above the 64 MB threshold
+
   test('an encrypted library never routes through the block flow, even for a large file', () => {
     // Regression guard for the "encrypted libraries are not supported by the block
     // upload flow" 409: the block flow computes SHA-256 block IDs over PLAINTEXT on
     // the client, which is incompatible with server-side Seafile block encryption,
     // so encrypted libraries must stay on the resumable path. shouldUseBlockUpload
     // short-circuits on `encrypted` before any size/browser check — so a large file
-    // in an encrypted library is NOT eligible. (The original bug was upstream: the
-    // in-app FileUploader was not given repoEncrypted, so this gate saw undefined.)
-    const bigFile = makeFile(100 * 1024 * 1024); // 100 MB, well above the 64 MB threshold
+    // in an encrypted library is NOT eligible.
     expect(shouldUseBlockUpload(bigFile, { encrypted: true })).toBe(false);
+  });
+
+  test('fails closed: a missing/undefined encrypted flag keeps files on resumable', () => {
+    // The original bug was upstream — the in-app FileUploader was not given
+    // repoEncrypted, so this gate saw undefined and (before the fix) assumed
+    // not-encrypted. Now only a POSITIVE `encrypted === false` diverts to blocks, so
+    // a parent that forgets the prop degrades to a safe resumable fallback, never a 409.
+    expect(shouldUseBlockUpload(bigFile, {})).toBe(false);        // prop omitted
+    expect(shouldUseBlockUpload(bigFile, { encrypted: undefined })).toBe(false);
+    expect(shouldUseBlockUpload(bigFile, { encrypted: null })).toBe(false);
+    expect(shouldUseBlockUpload(bigFile, { encrypted: 0 })).toBe(false); // int, not strict false
   });
 });
 

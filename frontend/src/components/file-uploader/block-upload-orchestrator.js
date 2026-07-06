@@ -295,10 +295,17 @@ export function browserSupportsBlockUpload() {
 }
 
 // shouldUseBlockUpload decides whether a given file goes through the block flow:
-// feature flag on, file at/above the size threshold, library not encrypted, and
-// the browser supports the required APIs.
-export function shouldUseBlockUpload(file, { encrypted = false } = {}) {
-  if (!enableBlockUpload || encrypted) return false;
+// feature flag on, file at/above the size threshold, library POSITIVELY known to be
+// non-encrypted, and the browser supports the required APIs.
+//
+// Fail closed on `encrypted`: the block flow rejects encrypted libraries server-side
+// (SHA-256 block IDs are over plaintext), so we only divert when we can confirm the
+// library is not encrypted — i.e. `encrypted === false`. Anything else (undefined
+// because a parent forgot to pass repoEncrypted, null, or truthy) keeps the file on
+// the resumable path. Callers must pass a real boolean (coerce nullish → false at the
+// call site) so a legit non-encrypted repo still gets the block flow.
+export function shouldUseBlockUpload(file, { encrypted } = {}) {
+  if (!enableBlockUpload || encrypted !== false) return false;
   if (!browserSupportsBlockUpload()) return false;
   const thresholdBytes = (blockUploadThresholdMB || 64) * 1024 * 1024;
   return file && file.size >= thresholdBytes;

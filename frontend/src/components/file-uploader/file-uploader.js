@@ -1102,11 +1102,27 @@ class FileUploader extends React.Component {
       // against the wrong instance target) and FREE the active mode, otherwise the queue
       // would wedge — no real complete/error event fires to drain held work.
       const newlyRetryable = [];
+      const markRetryable = (f) => {
+        f.error = errorMsg;
+        if (!this.abandonedLegacyFiles.includes(f)) {
+          this.abandonedLegacyFiles.push(f);
+        }
+        newlyRetryable.push(f);
+      };
       resumableFiles.forEach(f => {
         this.resumable.removeFile(f);
         this.legacyHold = this.legacyHold.filter(h => h.resumableFile !== f);
         f._retryOnStart = false;
-        if (f._fromDuplicatePrompt) {
+        if (encryptedLib) {
+          // The decrypt session expired for the WHOLE group. Tag EVERY file — including
+          // one whose duplicate decision (Replace/Keep) was already made — as
+          // decrypt-retry so the parent can auto-retry exactly these once the password
+          // is re-entered. The Replace/Keep choice is already encoded on the file
+          // (_uploadMode + formData.replace/target_file), so re-driving through the
+          // scheduler honors it WITHOUT re-prompting the duplicate dialog.
+          f._pendingDecryptRetry = true;
+          markRetryable(f);
+        } else if (f._fromDuplicatePrompt) {
           this.pendingDuplicates.unshift(f); // re-offer the user's pending decision
         } else {
           // Keep a plain file as a RETRYABLE error row instead of dropping it: a
@@ -1114,15 +1130,7 @@ class FileUploader extends React.Component {
           // it through the scheduler, which re-fetches the target). It is out of
           // resumable.files, so abandonedLegacyFiles keeps it rendered; the dedup key
           // stays reserved so a re-drop is still caught.
-          f.error = errorMsg;
-          // Tag files blocked ONLY by the expired decrypt session so the parent can
-          // auto-retry exactly these once the password is re-entered — real failures
-          // (untagged) are left for a manual Retry.
-          f._pendingDecryptRetry = encryptedLib;
-          if (!this.abandonedLegacyFiles.includes(f)) {
-            this.abandonedLegacyFiles.push(f);
-          }
-          newlyRetryable.push(f);
+          markRetryable(f);
         }
       });
       if (this.activeLegacyMode === mode) {
