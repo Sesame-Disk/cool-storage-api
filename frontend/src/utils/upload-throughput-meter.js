@@ -39,9 +39,12 @@ export function createUploadThroughputMeter({ windowMs = 3000, bucketMs = 250, n
         // straddles the cutoff — the correct baseline. Gating on buckets[0] (not its
         // successor) is what prevents a stale pre-window bucket from lingering after an
         // idle gap longer than the window: on the first new sample after such a gap the
-        // old bucket is fully expired and dropped, so rate() never counts bytes older
-        // than the cutoff. Always retain the most recent bucket (length >= 2 guard) so an
-        // idle meter still has a last-seen timestamp for the inactivity check.
+        // old bucket is fully expired and dropped. Note the surviving straddling baseline
+        // can still contribute up to ~bucketMs of pre-cutoff bytes (rate() measures from
+        // baseline.startCumulative, i.e. the bucket's start, not the exact cutoff) — a
+        // bounded, intentional smoothing skew, never the unbounded stale-baseline it
+        // replaces. Always retain the most recent bucket (length >= 2 guard) so an idle
+        // meter still has a last-seen timestamp for the inactivity check.
         while (buckets.length >= 2 && buckets[0].t + bucketMs <= cutoff) {
             buckets.shift();
         }

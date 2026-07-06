@@ -61,8 +61,29 @@ describe('createUploadThroughputMeter', () => {
     // ~2 MB over ~500ms of real history, NOT (100 MB + 2 MB) mis-spread over the window.
     expect(r).toBeGreaterThan(0);
     expect(r).toBeLessThan(bitsPerSec(2 * MB, 500) * 1.5);
-    // The adaptive reading also stays sane (no inflated warm-up spike feeding the ramp).
-    expect(meter.rate(clock.now(), { minSpanMs: 1000 })).toBeLessThan(bitsPerSec(2 * MB, 500) * 1.5);
+    // The adaptive reading is gated to EXACTLY 0: only ~500ms of history exists after
+    // the gap, below the 1s warm-up floor, so no inflated spike can feed the ramp.
+    expect(meter.rate(clock.now(), { minSpanMs: 1000 })).toBe(0);
+  });
+  test('irregular event cadence (jittery progress / throttled timers) still tracks the true rate', () => {
+    const clock = makeClock();
+    const meter = createUploadThroughputMeter({ windowMs: 3000, bucketMs: 250, now: clock.now });
+    // Sustained ~8 MB/s delivered with irregular gaps between progress events and
+    // irregular rate() reads, as a backgrounded/throttled tab (or a very fast localhost
+    // firing sparse, bursty events) would produce.
+    const gaps = [10, 400, 30, 900, 5, 600, 50, 700, 20, 500]; // ms
+    gaps.forEach((gap) => {
+      meter.addBytes(Math.round(8 * MB * (gap / 1000))); // bytes that 8 MB/s moves in gap
+      clock.advance(gap);
+      // Never collapses to 0 mid-transfer despite the jitter (the original-bug symptom).
+      expect(meter.rate()).toBeGreaterThan(0);
+    });
+    const target = bitsPerSec(8 * MB, 1000);
+    const r = meter.rate();
+    expect(r).toBeGreaterThan(target * 0.5);
+    expect(r).toBeLessThan(target * 1.7);
+    // Bucketing keeps the buffer bounded no matter how irregular the cadence was.
+    expect(meter.sampleCount()).toBeLessThanOrEqual(3000 / 250 + 2);
   });
   test('ignores non-positive deltas so a progress reset makes no negative/fake rate', () => {
     const clock = makeClock();

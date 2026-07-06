@@ -1753,3 +1753,48 @@ describe('FileUploader target-mode scheduler + sync dedup guard', () => {
     expect(uploader.retryUploadFile).toHaveBeenCalledWith(f);
   });
 });
+
+describe('FileUploader throughput timer lifecycle', () => {
+  test('componentWillUnmount clears the throughput interval so no tick leaks after unmount', () => {
+    const uploader = createUploader();
+    const clearSpy = jest.spyOn(global, 'clearInterval');
+    uploader.ensureThroughputTimer();
+    const timerId = uploader._throughputTimer;
+    expect(timerId).not.toBeNull();
+
+    uploader.componentWillUnmount();
+
+    expect(clearSpy).toHaveBeenCalledWith(timerId);
+    expect(uploader._throughputTimer).toBeNull();
+    clearSpy.mockRestore();
+  });
+
+  test('resetThroughput stops the ticker and lets a new batch re-arm a fresh one', () => {
+    const uploader = createUploader();
+    uploader.ensureThroughputTimer();
+    expect(uploader._throughputTimer).not.toBeNull();
+
+    uploader.resetThroughput();
+    expect(uploader._throughputTimer).toBeNull();
+
+    uploader.ensureThroughputTimer(); // a new batch starts clean
+    expect(uploader._throughputTimer).not.toBeNull();
+    uploader.stopThroughputTimer();
+  });
+
+  test('the ticker self-stops on the first tick once the meters read 0 with no active work', () => {
+    jest.useFakeTimers();
+    try {
+      const uploader = createUploader();
+      uploader.hasActiveUploadWork = () => false; // queue already drained
+      uploader.ensureThroughputTimer();
+      expect(uploader._throughputTimer).not.toBeNull();
+
+      // No bytes were ever fed -> aggregate rate is 0 -> the tick self-stops the ticker.
+      jest.advanceTimersByTime(uploader.bitrateInterval);
+      expect(uploader._throughputTimer).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
