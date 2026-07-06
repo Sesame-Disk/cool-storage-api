@@ -697,67 +697,13 @@ export const isFileSaving = (resumableFile) => {
 // ---------------------------------------------------------------------------
 // Block-upload throughput
 //
-// Block uploads run outside resumable.js, so the legacy getBitrate() (which only
-// sums resumable.files) always reports 0.00 B/s for them. These helpers derive a
-// real bits/s figure from successive progress samples taken on the block entry
-// itself, so the dialog header shows an actual speed.
+// Block-upload throughput is measured by the shared sliding-window meter
+// (utils/upload-throughput-meter.js), fed with real wire bytes from both the legacy
+// and block paths — see FileUploader. The old per-entry instantaneous sampler
+// (sampleBlockUploadBitrate / aggregateBlockUploadBitrate / resetBlockUploadBitrate)
+// was removed because it read ~0 B/s at low concurrency; see docs/WEB-BLOCK-UPLOAD.md
+// item 6.
 // ---------------------------------------------------------------------------
-
-export const BLOCK_BITRATE_SAMPLE_MS = 500;
-
-// sampleBlockUploadBitrate updates the entry's sampling state from the real
-// bytes transferred over the network and returns the latest bits/s. Sampling is
-// throttled so frequent progress ticks do not divide by a near-zero interval and
-// spike the reading.
-export const sampleBlockUploadBitrate = (entry, transferredBytes = entry && entry._uploadedNetworkBytes, now = Date.now()) => {
-    if (!entry) {
-        return 0;
-    }
-    const bytes = Math.max(0, Number(transferredBytes) || 0);
-    if (typeof entry._bitrateTs !== 'number') {
-        entry._bitrateTs = now;
-        entry._bitrateBytes = bytes;
-        entry._bitrate = 0;
-        return 0;
-    }
-    const elapsed = now - entry._bitrateTs;
-    if (elapsed < BLOCK_BITRATE_SAMPLE_MS) {
-        return Number(entry._bitrate) || 0;
-    }
-    const deltaBytes = bytes - (Number(entry._bitrateBytes) || 0);
-    entry._bitrate = elapsed > 0 ? Math.max(0, (deltaBytes / elapsed) * 1000 * 8) : 0;
-    entry._bitrateBytes = bytes;
-    entry._bitrateTs = now;
-    return entry._bitrate;
-};
-
-export const resetBlockUploadBitrate = (entry, now = Date.now()) => {
-    if (!entry) {
-        return;
-    }
-    entry._bitrate = 0;
-    entry._bitrateBytes = 0;
-    entry._uploadedNetworkBytes = 0;
-    entry._bitrateTs = now;
-};
-
-// aggregateBlockUploadBitrate sums the throughput of the still-active block
-// entries (finished/saved ones are excluded so their last reading does not linger).
-export const aggregateBlockUploadBitrate = (uploadFileList) => {
-    if (!Array.isArray(uploadFileList)) {
-        return 0;
-    }
-    return uploadFileList.reduce((sum, item) => (
-        item
-            && item.isBlockUpload
-            && item._uploading
-            && item._phase === 'uploading'
-            && !item.isSaved
-            && typeof item._bitrate === 'number'
-            ? sum + item._bitrate
-            : sum
-    ), 0);
-};
 
 export const maybeStartPendingUploadDuringFinalize = (resumable) => {
     if (!hasFinalizingFiles(resumable)) {

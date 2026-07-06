@@ -4,11 +4,12 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { aggregateBlockUploadBitrate, clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, isLibraryEncryptedError, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetBlockUploadBitrate, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, sampleBlockUploadBitrate, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
+import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, isLibraryEncryptedError, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
 import { createBlockLimiter } from '../../utils/block-upload-limiter';
+import { createUploadThroughputMeter } from '../../utils/upload-throughput-meter';
 import UploadProgressDialog from './upload-progress-dialog';
 import UploadRemindDialog from '../dialog/upload-remind-dialog';
 import toaster from '../toast';
@@ -85,6 +86,14 @@ class FileUploader extends React.Component {
     this.loaded = 0;
     this.legacyUploadBitrate = 0;
     this.bitrateInterval = 500; // Interval in milliseconds to calculate the bitrate
+    // Shared sliding-window throughput meter fed by REAL wire bytes from BOTH the
+    // legacy and block paths, so the speed readout is a smooth ~3s average instead of
+    // a per-event instantaneous delta that collapsed to ~0 at low concurrency. A timer
+    // recomputes the displayed value so it updates (and decays to 0) even between
+    // sparse progress events. See utils/upload-throughput-meter.js.
+    this.throughputMeter = createUploadThroughputMeter();
+    this._legacyMeterLoaded = 0; // last cumulative legacy loaded-bytes fed to the meter
+    this._throughputTimer = null;
     window.onbeforeunload = this.onbeforeunload;
     this.isUploadLinkLoaded = false;
     // Cached promise of the shared resumable upload target for the current batch.
@@ -198,6 +207,7 @@ class FileUploader extends React.Component {
     if (typeof this.adaptiveUploadCleanup === 'function') {
       this.adaptiveUploadCleanup();
     }
+    this.stopThroughputTimer();
   };
 
   hasActiveUploadWork = () => {
@@ -223,28 +233,47 @@ class FileUploader extends React.Component {
     ));
   };
 
-  hasActiveLegacyUploads = (uploadFileList = this.state.uploadFileList) => {
-    return uploadFileList.some(file => (
-      file
-      && !file.isBlockUpload
-      && !file.isSaved
-      && !file.error
-      && typeof file.isUploading === 'function'
-      && file.isUploading()
-    ));
+  // calculateUploadBitrate returns the current aggregate speed from the shared
+  // sliding-window meter (fed by real wire bytes from both the legacy and block
+  // paths). The meter self-decays to 0 after real inactivity, so a stale reading does
+  // not linger after either queue drains — no per-path bookkeeping needed here.
+  calculateUploadBitrate = () => {
+    return this.throughputMeter.rate();
   };
 
-  // calculateUploadBitrate combines the isolated legacy resumable bitrate with the
-  // summed block-upload bitrate. The legacy figure is held in this.legacyUploadBitrate
-  // (computed in getBitrate); it is zeroed when no legacy upload is active so a stale
-  // reading does not linger after the resumable queue drains while block uploads run.
-  calculateUploadBitrate = (uploadFileList = this.state.uploadFileList) => {
-    const hasActiveLegacyUploads = this.hasActiveLegacyUploads(uploadFileList);
-    if (!hasActiveLegacyUploads) {
-      this.legacyUploadBitrate = 0;
+  // ensureThroughputTimer starts a low-frequency ticker that re-reads the meter and
+  // pushes the smoothed speed to the UI + adaptive limiter, so the readout updates
+  // (and decays toward 0) even between sparse progress events. It self-stops once
+  // there is nothing left to measure.
+  ensureThroughputTimer = () => {
+    if (this._throughputTimer) {
+      return;
     }
-    const legacyUploadBitrate = hasActiveLegacyUploads ? this.legacyUploadBitrate : 0;
-    return legacyUploadBitrate + aggregateBlockUploadBitrate(uploadFileList);
+    this._throughputTimer = setInterval(() => {
+      const rate = this.throughputMeter.rate();
+      if (this.blockLimiter && rate > 0) {
+        this.blockLimiter.noteBitrate(rate);
+      }
+      this.setState({ uploadBitrate: rate });
+      if (rate === 0 && !this.hasActiveUploadWork()) {
+        this.stopThroughputTimer();
+      }
+    }, this.bitrateInterval);
+  };
+
+  stopThroughputTimer = () => {
+    if (this._throughputTimer) {
+      clearInterval(this._throughputTimer);
+      this._throughputTimer = null;
+    }
+  };
+
+  // resetThroughput clears the meter + timer at session teardown so a new batch starts
+  // from a clean baseline (and no orphan interval keeps ticking).
+  resetThroughput = () => {
+    this.stopThroughputTimer();
+    this.throughputMeter.reset();
+    this._legacyMeterLoaded = 0;
   };
 
   calculateTotalProgress = (uploadFileList = this.state.uploadFileList) => {
@@ -715,32 +744,26 @@ class FileUploader extends React.Component {
     });
   };
 
-  // updateBlockUploadTransferredBytes accumulates real bytes moved over the wire
-  // (from the orchestrator's onTransferProgress) and samples a bits/s figure on the
-  // entry, so the dialog header shows an actual block-upload speed instead of the
-  // legacy 0.00 B/s (block entries are not in this.resumable.files).
+  // updateBlockUploadTransferredBytes feeds the real bytes moved over the wire (from
+  // the orchestrator's onTransferProgress) into the shared throughput meter, so the
+  // dialog header shows an actual block-upload speed instead of the legacy 0.00 B/s
+  // (block entries are not in this.resumable.files).
   updateBlockUploadTransferredBytes = (entry, deltaBytes) => {
     if (!deltaBytes || deltaBytes <= 0) {
       return;
     }
-    entry._uploadedNetworkBytes = (Number(entry._uploadedNetworkBytes) || 0) + deltaBytes;
-    // sampleBlockUploadBitrate is throttled to one fresh reading per
-    // BLOCK_BITRATE_SAMPLE_MS. Feed the adaptive limiter only when a NEW sample was
-    // produced -- not on every progress tick -- so steady links still contribute one
-    // healthy sample per window even when the measured bitrate repeats exactly.
-    const bitrateTsBefore = entry._bitrateTs;
-    sampleBlockUploadBitrate(entry, entry._uploadedNetworkBytes);
-    const freshBitrateSample = typeof bitrateTsBefore === 'number' && entry._bitrateTs !== bitrateTsBefore;
-    if (freshBitrateSample && this.blockLimiter) {
-      this.blockLimiter.noteBitrate(aggregateBlockUploadBitrate(this.state.uploadFileList));
-    }
+    // Feed the shared throughput meter with the REAL wire bytes and make sure the
+    // ticker is running so the readout keeps updating (and the adaptive limiter keeps
+    // getting a smoothed signal) between sparse progress events.
+    this.throughputMeter.addBytes(deltaBytes);
+    this.ensureThroughputTimer();
     this.setState(prev => {
       const uploadFileList = prev.uploadFileList.map(item => (
         item.uniqueIdentifier === entry.uniqueIdentifier ? entry : item
       ));
       return {
         uploadFileList,
-        uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+        uploadBitrate: this.throughputMeter.rate(),
       };
     });
   };
@@ -748,9 +771,6 @@ class FileUploader extends React.Component {
   setBlockUploadPhase = (entry, phase) => {
     if (entry._phase === phase) {
       return;
-    }
-    if (phase === 'uploading') {
-      resetBlockUploadBitrate(entry);
     }
     entry._phase = phase;
     if (phase === 'saving') {
@@ -806,7 +826,6 @@ class FileUploader extends React.Component {
     // Persist the replace decision so a Retry / Retry-All re-runs with the same
     // semantics the user chose in the duplicate dialog.
     entry._replace = replace;
-    resetBlockUploadBitrate(entry);
 
     // Hashing is the first half of the bar, uploading the second half. onPhase
     // drives the explicit entry._phase so the row renders Uploading…/Saving…
@@ -1440,35 +1459,27 @@ class FileUploader extends React.Component {
     restoreUploadConcurrencyIfIdle(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
   };
 
+  // getBitrate feeds the shared throughput meter with the real bytes the legacy
+  // resumable queue has moved since the last call, then returns the meter's smoothed
+  // ~3s average. Legacy has no direct wire-byte callback, so we derive the delta from
+  // the summed per-file loaded bytes (progress() × size); a drop (a file was removed /
+  // reset) yields a non-positive delta the meter ignores while we re-baseline. This
+  // replaces the old single-window instantaneous delta that read ~0 at low concurrency.
   getBitrate = () => {
     let loaded = 0;
-    let uploadBitrate = 0;
-    let now = new Date().getTime();
-
     this.resumable.files.forEach(file => {
       loaded += file.progress() * file.size;
     });
-
-    if (this.timestamp) {
-      let timeDiff = (now - this.timestamp);
-      if (timeDiff < this.bitrateInterval) {
-        return this.legacyUploadBitrate;
-      }
-
-      // 1. Cancel will produce loaded greater than this.loaded
-      // 2. reset can make this.loaded to be 0
-      if (loaded < this.loaded || this.loaded === 0) {
-        this.loaded = loaded; //
-      }
-
-      uploadBitrate = (loaded - this.loaded) * (1000 / timeDiff) * 8;
+    const delta = loaded - this._legacyMeterLoaded;
+    if (delta > 0) {
+      this.throughputMeter.addBytes(delta);
+      this.ensureThroughputTimer();
     }
-
-    this.timestamp = now;
-    this.loaded = loaded;
-    this.legacyUploadBitrate = uploadBitrate;
-
-    return uploadBitrate;
+    // Re-baseline whether the delta was positive (consumed) or a drop (files removed),
+    // so the next positive delta is measured from the correct point.
+    this._legacyMeterLoaded = loaded;
+    this.legacyUploadBitrate = this.throughputMeter.rate();
+    return this.legacyUploadBitrate;
   };
 
   onProgress = () => {
@@ -1811,6 +1822,7 @@ class FileUploader extends React.Component {
     }
     this.loaded = 0;
     this.legacyUploadBitrate = 0;
+    this.resetThroughput();
     this.resumable.files = [];
     resetAdaptiveUploadConcurrency(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
     this.restoreConcurrencyIfIdle();
@@ -1851,6 +1863,7 @@ class FileUploader extends React.Component {
 
     if (!hasActiveUploads) {
       this.loaded = 0;
+      this.resetThroughput(); // nothing left to measure — clear the meter + ticker
     }
 
     this.setState({
@@ -1886,6 +1899,7 @@ class FileUploader extends React.Component {
 
     this.loaded = 0;
     this.legacyUploadBitrate = 0;
+    this.resetThroughput();
     this.clearBlockUploadQueue();
     if (this.blockLimiter) {
       this.blockLimiter.reset();

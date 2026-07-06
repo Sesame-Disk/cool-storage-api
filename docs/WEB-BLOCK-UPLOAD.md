@@ -1090,22 +1090,27 @@ flag were on*.
    while the active one uploads). **Remaining:** fuller integration with the global
    progress aggregator and any further polish before flag-on.
 
-   **[Open — pending] Speed readout collapses to ~0 B/s at low concurrency (audit
-   2026-07-06).** On BOTH paths — legacy resumable (`getBitrate`) and blocks
-   (`sampleBlockUploadBitrate`) — the throughput is an *instantaneous* delta over a
-   fixed ~500 ms window, recomputed ONLY when a progress event arrives. With a single
-   transfer in flight (the adaptive client starts at `simultaneousUploads = 1` and
-   ramps up), progress events are sparse/bursty — especially on a fast localhost where
-   an 8 MB chunk/block completes between window boundaries or axios fires
-   `onUploadProgress` only coarsely — so most 500 ms windows see no fresh sample or a
-   delta that lands unevenly, and the reading collapses to ~0. It stabilizes once
-   concurrency climbs above 1 because events from multiple transfers interleave and
-   fill every window. **Fix (deferred to the frontend-microfix pass):** replace the
-   single-window instantaneous delta with a **sliding-window average over real wire
-   bytes (~2–3 s), recomputed on a timer** (not only on progress events), shared by
-   both paths — so a single slow/fast transfer still yields a smooth, non-zero
-   readout and decays to 0 only after genuine inactivity. Timing-sensitive; verify in
-   the running app (item 4 E2E gap).
+   **[RESOLVED, PR `fix/upload-throughput-low-concurrency`] Speed readout collapsed to
+   ~0 B/s at low concurrency (audit 2026-07-06).** Previously, on BOTH paths — legacy
+   resumable (`getBitrate`) and blocks (`sampleBlockUploadBitrate`) — throughput was an
+   *instantaneous* delta over a fixed ~500 ms window, recomputed ONLY when a progress
+   event arrived. With a single transfer in flight (the adaptive client starts at
+   `simultaneousUploads = 1` and ramps up), progress events are sparse/bursty —
+   especially on a fast localhost where an 8 MB chunk/block completes between window
+   boundaries or axios fires `onUploadProgress` only coarsely — so most windows saw no
+   fresh sample and the reading collapsed to ~0, stabilizing only once concurrency
+   climbed. **Fix:** a single shared `createUploadThroughputMeter` (a sliding-window
+   average over REAL wire bytes, default 3 s horizon) fed by BOTH paths — blocks via
+   `onTransferProgress`, legacy via the per-file loaded-bytes delta — recomputed on a
+   ~500 ms timer (not only on progress events) so the readout stays smooth at low
+   concurrency and decays to 0 only after a full window of genuine inactivity. It also
+   feeds the adaptive limiter, so a false-low sample no longer makes the ramp overly
+   conservative. The old per-entry sampler
+   (`sampleBlockUploadBitrate`/`aggregateBlockUploadBitrate`/`resetBlockUploadBitrate`)
+   was removed so there is ONE throughput source (no two-mechanism drift). Covered by
+   `utils/__tests__/upload-throughput-meter.test.js` (single sparse event, bursty
+   stability, inactivity decay, reset/negative-delta safety) and the file-uploader
+   meter/limiter tests. Still worth an eyes-on check in the running app (item 4 gap).
 7. **[Resolved] Concurrent-loser `409 "commit still in progress"` retry.** The LWT
    guarantees a single winner; losing/retried commits poll only ~10s for the
    winner's `ResultFilename`, after which the server returns

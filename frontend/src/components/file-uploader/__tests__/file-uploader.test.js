@@ -466,50 +466,46 @@ describe('FileUploader block upload integration', () => {
     expect(uploader.state.uploadFileList).toEqual([done]);
   });
 
-  test('does not fake block bitrate from logical progress and sums block + legacy bitrate', () => {
+  test('block speed is driven by real wire bytes (the shared meter), not logical progress', () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(1000);
     const uploader = createUploader();
-    const blockEntry = {
-      uniqueIdentifier: 'block-1',
-      isBlockUpload: true,
-      isSaved: false,
-      error: null,
-      size: 1000,
-      _phase: 'uploading',
-      _uploading: true,
-      _progress: 0,
-      progress: () => blockEntry._progress,
-      isUploading: () => true,
-    };
-    uploader.state.uploadFileList = [blockEntry];
+    try {
+      const blockEntry = {
+        uniqueIdentifier: 'block-1',
+        isBlockUpload: true,
+        isSaved: false,
+        error: null,
+        size: 1000,
+        _phase: 'uploading',
+        _uploading: true,
+        _progress: 0,
+        progress: () => blockEntry._progress,
+        isUploading: () => true,
+      };
+      uploader.state.uploadFileList = [blockEntry];
 
-    // Logical progress must NOT fabricate a speed — bytes on the wire drive it.
-    uploader.updateBlockUploadProgress(blockEntry, 0.5);
-    expect(uploader.state.uploadBitrate).toBe(0);
+      // Logical progress must NOT fabricate a speed — only bytes on the wire do.
+      uploader.updateBlockUploadProgress(blockEntry, 0.5);
+      expect(uploader.state.uploadBitrate).toBe(0);
 
-    blockEntry._bitrate = 3000;
-    const legacyFile = createResumableFile('small.txt', {
-      size: 1000,
-      progress: () => 0.5,
-      isUploading: () => true,
-      remainingTime: -1,
-    });
-    uploader.state.uploadFileList = [blockEntry, legacyFile];
-    uploader.resumable.files = [legacyFile];
-    uploader.getBitrate = jest.fn(() => {
-      uploader.legacyUploadBitrate = 2000;
-      return 2000;
-    });
-
-    uploader.onFileProgress(legacyFile);
-
-    expect(uploader.state.uploadBitrate).toBe(5000);
+      // Real wire bytes across two timestamps feed the shared sliding-window meter →
+      // a non-zero readout (the whole point of the fix at low concurrency).
+      uploader.updateBlockUploadTransferredBytes(blockEntry, 4 * 1024 * 1024);
+      jest.setSystemTime(1200);
+      uploader.updateBlockUploadTransferredBytes(blockEntry, 4 * 1024 * 1024);
+      expect(uploader.state.uploadBitrate).toBeGreaterThan(0);
+    } finally {
+      uploader.stopThroughputTimer();
+      jest.useRealTimers();
+    }
   });
 
-  test('feeds the block limiter only on fresh sampler windows, even if the bitrate value repeats', () => {
+  test('the throughput timer feeds the block limiter the smoothed meter rate on tick, not per event', () => {
     jest.useFakeTimers();
+    jest.setSystemTime(0);
+    const uploader = createUploader();
     try {
-      jest.setSystemTime(1000);
-      const uploader = createUploader();
       uploader.blockLimiter = { noteBitrate: jest.fn() };
       const entry = {
         uniqueIdentifier: 'block-1',
@@ -518,35 +514,25 @@ describe('FileUploader block upload integration', () => {
         error: null,
         _phase: 'uploading',
         _uploading: true,
-        _progress: 0.5,
         progress: () => 0.5,
         isUploading: () => true,
       };
       uploader.state.uploadFileList = [entry];
 
-      // First tick only seeds the sampler; there is no fresh bitrate sample yet.
-      uploader.updateBlockUploadTransferredBytes(entry, 1024);
+      // Real bytes across two timestamps; the limiter is NOT fed per progress event.
+      uploader.updateBlockUploadTransferredBytes(entry, 4 * 1024 * 1024); // t=0, starts the ticker
+      jest.advanceTimersByTime(300);
+      uploader.updateBlockUploadTransferredBytes(entry, 4 * 1024 * 1024); // t=300
       expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
 
-      // Rapid ticks inside the same 500 ms window reuse the stale reading and must
-      // NOT count as extra healthy samples.
-      uploader.updateBlockUploadTransferredBytes(entry, 1024);
-      expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
-
-      // Once the window elapses, a fresh sample is fed.
-      jest.setSystemTime(1600);
-      uploader.updateBlockUploadTransferredBytes(entry, 1024);
-      expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(1);
-      const repeatedBitrate = uploader.blockLimiter.noteBitrate.mock.calls[0][0];
-      expect(typeof repeatedBitrate).toBe('number');
-
-      // Another fresh window with the SAME bitrate value must still feed again:
-      // same value, new sample.
-      jest.setSystemTime(2200);
-      uploader.updateBlockUploadTransferredBytes(entry, 2048);
-      expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalledTimes(2);
-      expect(uploader.blockLimiter.noteBitrate.mock.calls[1][0]).toBe(repeatedBitrate);
+      // The 500ms tick pushes the smoothed rate to the limiter.
+      jest.advanceTimersByTime(200); // t=500 → interval fires
+      expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalled();
+      const fed = uploader.blockLimiter.noteBitrate.mock.calls[0][0];
+      expect(typeof fed).toBe('number');
+      expect(fed).toBeGreaterThan(0);
     } finally {
+      uploader.stopThroughputTimer();
       jest.useRealTimers();
     }
   });
