@@ -2306,7 +2306,7 @@ class LibContentView extends React.Component {
               dragAndDrop={true}
               path={this.state.path}
               repoID={this.props.repoID}
-              repoEncrypted={!!this.state.repoEncrypted}
+              repoEncrypted={this.state.repoEncrypted}
               onLibNeedDecrypt={this.onUploadLibNeedDecrypt}
               direntList={this.state.direntList}
               onFileUploadSuccess={this.onFileUploadSuccess}

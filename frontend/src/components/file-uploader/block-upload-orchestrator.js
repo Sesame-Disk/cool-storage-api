@@ -302,8 +302,9 @@ export function browserSupportsBlockUpload() {
 // (SHA-256 block IDs are over plaintext), so we only divert when we can confirm the
 // library is not encrypted — i.e. `encrypted === false`. Anything else (undefined
 // because a parent forgot to pass repoEncrypted, null, or truthy) keeps the file on
-// the resumable path. Callers must pass a real boolean (coerce nullish → false at the
-// call site) so a legit non-encrypted repo still gets the block flow.
+// the resumable path. Callers pass the library's real encrypted boolean RAW (the repo
+// detail endpoint returns a proper bool) — do NOT coerce with `!!`, which would turn
+// an unknown (undefined) into `false` and wrongly enable the block flow.
 export function shouldUseBlockUpload(file, { encrypted } = {}) {
   if (!enableBlockUpload || encrypted !== false) return false;
   if (!browserSupportsBlockUpload()) return false;
