@@ -1509,6 +1509,41 @@ describe('FileUploader target-mode scheduler + sync dedup guard', () => {
     expect(uploader.state.retryFileList).toEqual([]);
   });
 
+  test('retryPendingDecryptFailures re-drives only the decrypt-blocked files, leaving other failures', () => {
+    const uploader = createUploader();
+    const enqueueSpy = jest.spyOn(uploader, 'enqueueLegacyUpload').mockImplementation(() => {});
+    const decryptBlocked = createResumableFile('big.zip', { uniqueIdentifier: 'enc' });
+    decryptBlocked._uploadMode = 'upload'; decryptBlocked.error = 'encrypted'; decryptBlocked._pendingDecryptRetry = true;
+    const otherFailure = createResumableFile('other.txt', { uniqueIdentifier: 'net' });
+    otherFailure._uploadMode = 'upload'; otherFailure.error = 'Network error';
+    uploader.state.uploadFileList = [decryptBlocked, otherFailure];
+    uploader.state.retryFileList = [decryptBlocked, otherFailure];
+
+    uploader.retryPendingDecryptFailures();
+
+    // Only the decrypt-blocked file is re-enqueued and cleared of its tag + error...
+    expect(enqueueSpy).toHaveBeenCalledTimes(1);
+    expect(enqueueSpy).toHaveBeenCalledWith(decryptBlocked, 'upload', { retry: true });
+    expect(decryptBlocked._pendingDecryptRetry).toBe(false);
+    expect(decryptBlocked.error).toBeNull();
+    // ...the unrelated failure stays in the retry list for a manual Retry.
+    expect(uploader.state.retryFileList).toEqual([otherFailure]);
+  });
+
+  test('retryPendingDecryptFailures is a no-op when nothing was blocked by decrypt', () => {
+    const uploader = createUploader();
+    const enqueueSpy = jest.spyOn(uploader, 'enqueueLegacyUpload').mockImplementation(() => {});
+    const otherFailure = createResumableFile('other.txt', { uniqueIdentifier: 'net' });
+    otherFailure._uploadMode = 'upload'; otherFailure.error = 'Network error';
+    uploader.state.uploadFileList = [otherFailure];
+    uploader.state.retryFileList = [otherFailure];
+
+    uploader.retryPendingDecryptFailures();
+
+    expect(enqueueSpy).not.toHaveBeenCalled();
+    expect(uploader.state.retryFileList).toEqual([otherFailure]);
+  });
+
   test('retry-all mixed legacy modes holds the second mode while the first target link is pending', async () => {
     // Real scheduler (no enqueueLegacyUpload mock): the upload-link fetch stays PENDING,
     // so resumable.isUploading() is false the whole time. Without the _legacyStartsInFlight

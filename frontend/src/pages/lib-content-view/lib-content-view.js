@@ -1952,14 +1952,18 @@ class LibContentView extends React.Component {
 
   // Triggered by the uploader when an upload fails because the library's decrypt
   // session expired (403 "Library is encrypted"). Shown as an OVERLAY so the upload
-  // dialog and its retryable rows survive; on close we just dismiss (on success the
-  // server session is unlocked again and the user can Retry).
+  // dialog and its retryable rows survive; on success we auto-retry those uploads.
   onUploadLibNeedDecrypt = () => {
     this.setState({ isUploadDecryptDialogShow: true });
   };
 
-  onUploadLibDecryptDialog = () => {
+  onUploadLibDecryptDialog = (success) => {
     this.setState({ isUploadDecryptDialogShow: false });
+    // On success the server decrypt session is unlocked again — auto-retry exactly
+    // the uploads that failed because it had expired (no manual "Retry All" needed).
+    if (success && this.uploader && this.uploader.retryPendingDecryptFailures) {
+      this.uploader.retryPendingDecryptFailures();
+    }
   };
 
   onLibDecryptWhenCopyMove = (success) => {

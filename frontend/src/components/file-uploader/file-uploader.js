@@ -1115,6 +1115,10 @@ class FileUploader extends React.Component {
           // resumable.files, so abandonedLegacyFiles keeps it rendered; the dedup key
           // stays reserved so a re-drop is still caught.
           f.error = errorMsg;
+          // Tag files blocked ONLY by the expired decrypt session so the parent can
+          // auto-retry exactly these once the password is re-entered — real failures
+          // (untagged) are left for a manual Retry.
+          f._pendingDecryptRetry = encryptedLib;
           if (!this.abandonedLegacyFiles.includes(f)) {
             this.abandonedLegacyFiles.push(f);
           }
@@ -1962,6 +1966,40 @@ class FileUploader extends React.Component {
       // serialized automatically (one runs, the other is held "Waiting…" until idle), so
       // a replace and a normal retry never share the wrong instance target.
       legacyRetryList.forEach(item => {
+        this.enqueueLegacyUpload(item, item._uploadMode || 'upload', { retry: true });
+      });
+    });
+    this.restoreConcurrencyIfIdle();
+  };
+
+  // retryPendingDecryptFailures re-drives exactly the files that failed because the
+  // library's 1h decrypt session had expired (tagged in the upload-link catch),
+  // called by the parent after the user re-enters the password. Encrypted libraries
+  // only use the legacy resumable path (the block flow is gated off), so every tagged
+  // file re-enters the target-mode scheduler, which re-fetches a fresh upload link —
+  // now succeeding because the session is unlocked. Untagged failures are left for a
+  // manual Retry. Modeled on onUploadRetryAll (single setState, then enqueue).
+  retryPendingDecryptFailures = () => {
+    const toRetry = this.state.retryFileList.filter(item => item && item._pendingDecryptRetry);
+    if (toRetry.length === 0) {
+      return;
+    }
+    const retryIds = new Set(toRetry.map(item => item.uniqueIdentifier));
+    toRetry.forEach(item => {
+      clearFileUploadRuntimeState(item, { resetRemainingTime: true });
+      resetUploadConflictAutoRetry(item);
+      item.error = null;
+      item._pendingDecryptRetry = false;
+    });
+    const retryFileList = this.state.retryFileList.filter(item => !retryIds.has(item.uniqueIdentifier));
+    const uploadFileList = this.state.uploadFileList.slice(0);
+    this.setState({
+      retryFileList,
+      uploadFileList,
+      totalProgress: this.calculateTotalProgress(uploadFileList),
+      uploadBitrate: this.calculateUploadBitrate(uploadFileList),
+    }, () => {
+      toRetry.forEach(item => {
         this.enqueueLegacyUpload(item, item._uploadMode || 'upload', { retry: true });
       });
     });
