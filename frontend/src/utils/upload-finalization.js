@@ -830,6 +830,27 @@ export const shouldAutoRetryUploadConflict = (resumableFile, message) => {
     return typeof message === 'string' && message.includes(RETRYABLE_UPLOAD_CONFLICT_ERROR);
 };
 
+// isLibraryEncryptedError reports whether an axios error is the backend's
+// "library is encrypted, unlock it first" rejection (403 on the upload-link
+// fetch). The block flow is already gated off for encrypted libraries, so this
+// fires on the resumable upload-link GET once the 1h server-side decrypt session
+// has expired. The caller re-opens the repo password dialog instead of surfacing
+// the generic "Permission denied" (Utils.getErrorMsg collapses every 403 to that,
+// dropping the specific error_msg).
+//
+// Detection keys off the STABLE `lib_need_decrypt: true` flag — the app-wide
+// convention already emitted by copy/move and batch_operations and now by
+// requireDecryptSession — rather than the human-readable error string. The string
+// match is only a defensive fallback for any endpoint not yet emitting the flag.
+export const isLibraryEncryptedError = (error) => {
+    const resp = error && error.response;
+    if (!resp || resp.status !== 403) {
+        return false;
+    }
+    const data = resp.data || {};
+    return data.lib_need_decrypt === true || data.error === 'Library is encrypted';
+};
+
 export const markUploadConflictAutoRetry = (resumableFile) => {
     if (!resumableFile) {
         return;

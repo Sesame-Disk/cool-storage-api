@@ -4,7 +4,7 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { aggregateBlockUploadBitrate, clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetBlockUploadBitrate, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, sampleBlockUploadBitrate, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
+import { aggregateBlockUploadBitrate, clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitialSimultaneousUploads, initializeAdaptiveUploadConcurrency, isLibraryEncryptedError, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, noteAdaptiveUploadFailure, noteAdaptiveUploadRetry, resetAdaptiveUploadConcurrency, resetBlockUploadBitrate, resetUploadConflictAutoRetry, resolveUploadSuccessResult, restoreUploadConcurrencyIfIdle, sampleBlockUploadBitrate, shouldAutoRetryUploadConflict, trackUploadResponseStatus, updateAdaptiveUploadConcurrency } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
@@ -18,6 +18,7 @@ import '../../css/file-uploader.css';
 const propTypes = {
   repoID: PropTypes.string.isRequired,
   repoEncrypted: PropTypes.bool,
+  onLibNeedDecrypt: PropTypes.func,
   direntList: PropTypes.array.isRequired,
   filetypes: PropTypes.array,
   chunkSize: PropTypes.number,
@@ -1083,8 +1084,19 @@ class FileUploader extends React.Component {
         return; // session torn down mid-fetch — nothing to re-offer or abandon
       }
       settleStart();
-      const errorMsg = this.getAxiosErrorMessage(error) || gettext('Network error');
-      toaster.danger(errorMsg);
+      // An encrypted library whose 1h server-side decrypt session has expired 403s
+      // the upload-link fetch. Surface the repo password dialog (via the parent)
+      // instead of the generic "Permission denied" toaster, and keep the files as
+      // retryable rows so the user can Retry once the library is unlocked again.
+      const encryptedLib = isLibraryEncryptedError(error);
+      const errorMsg = encryptedLib
+        ? gettext('This library is encrypted. Please enter the password to continue.')
+        : (this.getAxiosErrorMessage(error) || gettext('Network error'));
+      if (encryptedLib && this.props.onLibNeedDecrypt) {
+        this.props.onLibNeedDecrypt();
+      } else {
+        toaster.danger(errorMsg);
+      }
       // The group's target could not be fetched and it never started. Take its files OUT
       // of resumable.files (so a later DIFFERENT-mode group can't run with them mixed in
       // against the wrong instance target) and FREE the active mode, otherwise the queue

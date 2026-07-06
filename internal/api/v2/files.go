@@ -379,6 +379,10 @@ func (h *FileHandler) requireDecryptSession(c *gin.Context, orgID, userID, repoI
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":     "Library is encrypted",
 			"error_msg": "This library is encrypted. Please provide the password to unlock it.",
+			// Stable, machine-readable flag (the app-wide convention used by copy/move
+			// and batch_operations) so clients detect "needs decrypt" without matching
+			// the human-readable error string. See isLibraryEncryptedError (frontend).
+			"lib_need_decrypt": true,
 		})
 		return false
 	}

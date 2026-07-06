@@ -5,6 +5,7 @@ import {
     getInitialSimultaneousUploads,
     initializeAdaptiveUploadConcurrency,
     isFileSaving,
+    isLibraryEncryptedError,
     markUploadConflictAutoRetry,
     maybeStartPendingUploadDuringFinalize,
     moveUploadToRetryState,
@@ -109,6 +110,26 @@ const completeOneUploadingChunk = (file) => {
         chunk._status = 'success';
     }
 };
+
+describe('isLibraryEncryptedError', () => {
+    test('detects the backend "Library is encrypted" 403 (upload-link fetch)', () => {
+        expect(isLibraryEncryptedError({
+            response: { status: 403, data: { error: 'Library is encrypted', error_msg: 'unlock it' } },
+        })).toBe(true);
+    });
+
+    test('detects a 403 carrying lib_need_decrypt', () => {
+        expect(isLibraryEncryptedError({ response: { status: 403, data: { lib_need_decrypt: true } } })).toBe(true);
+    });
+
+    test('ignores other 403s and non-403 errors', () => {
+        expect(isLibraryEncryptedError({ response: { status: 403, data: { error: 'Permission denied' } } })).toBe(false);
+        expect(isLibraryEncryptedError({ response: { status: 500, data: { error: 'Library is encrypted' } } })).toBe(false);
+        expect(isLibraryEncryptedError({ response: { status: 403 } })).toBe(false);
+        expect(isLibraryEncryptedError(new Error('network'))).toBe(false);
+        expect(isLibraryEncryptedError(null)).toBe(false);
+    });
+});
 
 describe('upload finalization helpers', () => {
     test('auto-retries the finalize conflict only once per file until reset', () => {

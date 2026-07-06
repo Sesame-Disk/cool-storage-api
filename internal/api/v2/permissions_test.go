@@ -295,10 +295,13 @@ func TestEncryptedLibraryPermissionDenied(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	// Simulate the encrypted library access denied response
+	// Simulate the encrypted library access denied response (mirrors
+	// requireDecryptSession): it carries the stable lib_need_decrypt flag so clients
+	// can detect "needs decrypt" without matching the human-readable error string.
 	c.JSON(http.StatusForbidden, gin.H{
-		"error":     "Library is encrypted",
-		"error_msg": "This library is encrypted. Please provide the password to unlock it.",
+		"error":            "Library is encrypted",
+		"error_msg":        "This library is encrypted. Please provide the password to unlock it.",
+		"lib_need_decrypt": true,
 	})
 
 	assert := assert.New(t)
@@ -309,6 +312,7 @@ func TestEncryptedLibraryPermissionDenied(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal("Library is encrypted", resp["error"])
 	assert.Contains(resp["error_msg"], "password")
+	assert.Equal(true, resp["lib_need_decrypt"])
 }
 
 // BenchmarkRoleHierarchyCheck benchmarks the role hierarchy check

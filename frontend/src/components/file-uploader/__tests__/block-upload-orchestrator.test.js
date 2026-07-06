@@ -1,4 +1,4 @@
-import { isStallError, uploadFileViaBlocks } from '../block-upload-orchestrator';
+import { isStallError, shouldUseBlockUpload, uploadFileViaBlocks } from '../block-upload-orchestrator';
 import { createBlockLimiter } from '../../../utils/block-upload-limiter';
 
 jest.mock('../../../utils/seafile-api', () => ({ seafileAPI: {} }));
@@ -14,6 +14,20 @@ function makeFile(size, name = 'big.bin') {
     }),
   };
 }
+
+describe('shouldUseBlockUpload (encrypted-library gate)', () => {
+  test('an encrypted library never routes through the block flow, even for a large file', () => {
+    // Regression guard for the "encrypted libraries are not supported by the block
+    // upload flow" 409: the block flow computes SHA-256 block IDs over PLAINTEXT on
+    // the client, which is incompatible with server-side Seafile block encryption,
+    // so encrypted libraries must stay on the resumable path. shouldUseBlockUpload
+    // short-circuits on `encrypted` before any size/browser check — so a large file
+    // in an encrypted library is NOT eligible. (The original bug was upstream: the
+    // in-app FileUploader was not given repoEncrypted, so this gate saw undefined.)
+    const bigFile = makeFile(100 * 1024 * 1024); // 100 MB, well above the 64 MB threshold
+    expect(shouldUseBlockUpload(bigFile, { encrypted: true })).toBe(false);
+  });
+});
 
 describe('uploadFileViaBlocks', () => {
   test('uploads only the missing blocks then commits the ordered manifest', async () => {

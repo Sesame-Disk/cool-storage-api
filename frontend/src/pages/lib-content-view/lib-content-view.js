@@ -46,6 +46,10 @@ class LibContentView extends React.Component {
       repoName: '',
       repoEncrypted: false,
       libNeedDecrypt: false,
+      // Overlay (not the full-view gate): re-prompt for the repo password when an
+      // upload 403s because the 1h decrypt session expired, WITHOUT unmounting the
+      // upload dialog so the user keeps their retryable rows.
+      isUploadDecryptDialogShow: false,
       isGroupOwnedRepo: false,
       userPerm: '',
       selectedDirentList: [],
@@ -1946,6 +1950,18 @@ class LibContentView extends React.Component {
     }
   };
 
+  // Triggered by the uploader when an upload fails because the library's decrypt
+  // session expired (403 "Library is encrypted"). Shown as an OVERLAY so the upload
+  // dialog and its retryable rows survive; on close we just dismiss (on success the
+  // server session is unlocked again and the user can Retry).
+  onUploadLibNeedDecrypt = () => {
+    this.setState({ isUploadDecryptDialogShow: true });
+  };
+
+  onUploadLibDecryptDialog = () => {
+    this.setState({ isUploadDecryptDialogShow: false });
+  };
+
   onLibDecryptWhenCopyMove = (success) => {
     if (!success) {
       // Cancelled - just close the dialog without performing copy/move
@@ -2286,12 +2302,22 @@ class LibContentView extends React.Component {
               dragAndDrop={true}
               path={this.state.path}
               repoID={this.props.repoID}
+              repoEncrypted={this.state.repoEncrypted}
+              onLibNeedDecrypt={this.onUploadLibNeedDecrypt}
               direntList={this.state.direntList}
               onFileUploadSuccess={this.onFileUploadSuccess}
               isCustomPermission={isCustomPermission}
             />
           )}
         </div>
+        {this.state.isUploadDecryptDialogShow && (
+          <ModalPortal>
+            <LibDecryptDialog
+              repoID={this.props.repoID}
+              onLibDecryptDialog={this.onUploadLibDecryptDialog}
+            />
+          </ModalPortal>
+        )}
         {isCopyMoveProgressDialogShow && (
           <CopyMoveDirentProgressDialog
             type={this.state.asyncOperationType}
