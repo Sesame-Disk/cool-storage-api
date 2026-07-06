@@ -82,10 +82,8 @@ class FileUploader extends React.Component {
 
     this.notifiedFolders = [];
 
-    this.timestamp = null;
-    this.loaded = 0;
     this.legacyUploadBitrate = 0;
-    this.bitrateInterval = 500; // Interval in milliseconds to calculate the bitrate
+    this.bitrateInterval = 500; // Interval in milliseconds between throughput ticks
     // Sliding-window throughput meters fed by REAL wire bytes, so the speed readout is a
     // smooth ~3s average instead of a per-event instantaneous delta that collapsed to ~0
     // at low concurrency. ONE meter PER path (see upload-throughput-meter.js): the UI
@@ -264,7 +262,13 @@ class FileUploader extends React.Component {
         this.blockLimiter.noteBitrate(blockRate);
       }
       const displayRate = this.calculateUploadBitrate();
-      this.setState({ uploadBitrate: displayRate });
+      // Only re-render when the shown value actually moved. On a steady link the value
+      // shifts every tick (so it still updates); the win is when it is pinned — e.g.
+      // decayed to 0 while a stalled entry keeps the ticker alive — where this avoids a
+      // stream of no-op setState(0) renders.
+      if (displayRate !== this.state.uploadBitrate) {
+        this.setState({ uploadBitrate: displayRate });
+      }
       if (displayRate === 0 && !this.hasActiveUploadWork()) {
         this.stopThroughputTimer();
       }
@@ -1681,7 +1685,6 @@ class FileUploader extends React.Component {
 
     const { retryFileList, uploadFileList } = moveUploadToRetryState(this.state.uploadFileList, this.state.retryFileList, resumableFile, error);
 
-    this.loaded = 0;  // reset loaded data;
     this.setState({
       retryFileList: retryFileList,
       uploadFileList: uploadFileList,
@@ -1835,7 +1838,6 @@ class FileUploader extends React.Component {
     if (this.blockLimiter) {
       this.blockLimiter.reset();
     }
-    this.loaded = 0;
     this.legacyUploadBitrate = 0;
     this.resetThroughput();
     this.resumable.files = [];
@@ -1877,7 +1879,6 @@ class FileUploader extends React.Component {
       || this.hasPendingUploadEntries(uploadFileList);
 
     if (!hasActiveUploads) {
-      this.loaded = 0;
       this.resetThroughput(); // nothing left to measure — clear the meter + ticker
     }
 
@@ -1912,7 +1913,6 @@ class FileUploader extends React.Component {
       return true;
     });
 
-    this.loaded = 0;
     this.legacyUploadBitrate = 0;
     this.resetThroughput();
     this.clearBlockUploadQueue();

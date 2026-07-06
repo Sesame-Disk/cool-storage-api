@@ -34,9 +34,15 @@ export function createUploadThroughputMeter({ windowMs = 3000, bucketMs = 250, n
     let buckets = [];
     const prune = (at) => {
         const cutoff = at - windowMs;
-        // Keep buckets[0] as the baseline that straddles/precedes the window start; drop
-        // a bucket only once its SUCCESSOR has fully passed the cutoff.
-        while (buckets.length >= 2 && buckets[1].t + bucketMs <= cutoff) {
+        // Drop a bucket once it has FULLY expired (its whole [t, t+bucketMs) range is at
+        // or before the window start), so the surviving buckets[0] is the one that
+        // straddles the cutoff — the correct baseline. Gating on buckets[0] (not its
+        // successor) is what prevents a stale pre-window bucket from lingering after an
+        // idle gap longer than the window: on the first new sample after such a gap the
+        // old bucket is fully expired and dropped, so rate() never counts bytes older
+        // than the cutoff. Always retain the most recent bucket (length >= 2 guard) so an
+        // idle meter still has a last-seen timestamp for the inactivity check.
+        while (buckets.length >= 2 && buckets[0].t + bucketMs <= cutoff) {
             buckets.shift();
         }
     };

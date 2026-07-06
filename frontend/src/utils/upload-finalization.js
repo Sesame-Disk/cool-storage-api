@@ -697,12 +697,13 @@ export const isFileSaving = (resumableFile) => {
 // ---------------------------------------------------------------------------
 // Block-upload throughput
 //
-// Block-upload throughput is measured by the shared sliding-window meter
-// (utils/upload-throughput-meter.js), fed with real wire bytes from both the legacy
-// and block paths — see FileUploader. The old per-entry instantaneous sampler
-// (sampleBlockUploadBitrate / aggregateBlockUploadBitrate / resetBlockUploadBitrate)
-// was removed because it read ~0 B/s at low concurrency; see docs/WEB-BLOCK-UPLOAD.md
-// item 6.
+// Block-upload throughput is measured by a sliding-window meter
+// (utils/upload-throughput-meter.js), fed with real wire bytes. FileUploader keeps ONE
+// meter PER path (legacy vs block): the UI shows the SUM, but each adaptive controller
+// reads only its own path's meter so one path's bytes never inflate the other's ramp.
+// The old per-entry instantaneous sampler (sampleBlockUploadBitrate /
+// aggregateBlockUploadBitrate / resetBlockUploadBitrate) was removed because it read
+// ~0 B/s at low concurrency; see docs/WEB-BLOCK-UPLOAD.md item 6.
 // ---------------------------------------------------------------------------
 
 export const maybeStartPendingUploadDuringFinalize = (resumable) => {

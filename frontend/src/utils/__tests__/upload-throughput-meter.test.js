@@ -45,6 +45,25 @@ describe('createUploadThroughputMeter', () => {
     clock.advance(3000); // 4s total since last byte -> past the window
     expect(meter.rate()).toBe(0);
   });
+  test('a new burst after an idle gap longer than the window ignores the pre-gap bytes', () => {
+    const clock = makeClock();
+    const meter = createUploadThroughputMeter({ windowMs: 3000, bucketMs: 250, now: clock.now });
+    // A big transfer, then a long stall well past the window.
+    meter.addBytes(100 * MB);
+    clock.advance(10000); // 10s idle -> fully decayed
+    expect(meter.rate()).toBe(0);
+    // A fresh, small burst arrives. Its rate must reflect ONLY the new bytes over the
+    // new span, not the 100 MB baseline that expired 10s ago (the stale-baseline bug).
+    meter.addBytes(MB);
+    clock.advance(500);
+    meter.addBytes(MB);
+    const r = meter.rate();
+    // ~2 MB over ~500ms of real history, NOT (100 MB + 2 MB) mis-spread over the window.
+    expect(r).toBeGreaterThan(0);
+    expect(r).toBeLessThan(bitsPerSec(2 * MB, 500) * 1.5);
+    // The adaptive reading also stays sane (no inflated warm-up spike feeding the ramp).
+    expect(meter.rate(clock.now(), { minSpanMs: 1000 })).toBeLessThan(bitsPerSec(2 * MB, 500) * 1.5);
+  });
   test('ignores non-positive deltas so a progress reset makes no negative/fake rate', () => {
     const clock = makeClock();
     const meter = createUploadThroughputMeter({ windowMs: 3000, now: clock.now });
