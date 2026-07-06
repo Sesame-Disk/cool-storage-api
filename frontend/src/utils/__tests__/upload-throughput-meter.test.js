@@ -83,6 +83,37 @@ describe('createUploadThroughputMeter', () => {
     expect(meter.rate()).toBe(0);
   });
 
+  test('retained sample count stays bounded under a verbose event stream (time bucketing)', () => {
+    const clock = makeClock();
+    const meter = createUploadThroughputMeter({ windowMs: 3000, bucketMs: 250, now: clock.now });
+
+    // 3000 events across 3s (one every ~1ms) must NOT grow one sample per event.
+    for (let i = 0; i < 3000; i += 1) {
+      meter.addBytes(1024);
+      clock.advance(1);
+    }
+    // Bounded to ~windowMs/bucketMs (12) + a small constant, never the event count.
+    expect(meter.sampleCount()).toBeLessThanOrEqual(3000 / 250 + 2);
+    expect(meter.rate()).toBeGreaterThan(0);
+  });
+
+  test('minSpanMs holds the adaptive reading at 0 until the window is mature, without hiding it from the UI', () => {
+    const clock = makeClock();
+    const meter = createUploadThroughputMeter({ windowMs: 3000, now: clock.now });
+
+    meter.addBytes(8 * MB);
+    clock.advance(300); // only 300ms of history
+
+    // UI (minSpanMs 0) shows a value early…
+    expect(meter.rate()).toBeGreaterThan(0);
+    // …but an adaptive consumer requiring a 1s-mature window sees 0 (no warm-up spike).
+    expect(meter.rate(clock.now(), { minSpanMs: 1000 })).toBe(0);
+
+    meter.addBytes(8 * MB);
+    clock.advance(900); // now ~1.2s of history
+    expect(meter.rate(clock.now(), { minSpanMs: 1000 })).toBeGreaterThan(0);
+  });
+
   test('averages over the window: a burst is spread across the horizon, not divided by a near-zero span', () => {
     const clock = makeClock();
     const meter = createUploadThroughputMeter({ windowMs: 2000, now: clock.now });

@@ -86,14 +86,21 @@ class FileUploader extends React.Component {
     this.loaded = 0;
     this.legacyUploadBitrate = 0;
     this.bitrateInterval = 500; // Interval in milliseconds to calculate the bitrate
-    // Shared sliding-window throughput meter fed by REAL wire bytes from BOTH the
-    // legacy and block paths, so the speed readout is a smooth ~3s average instead of
-    // a per-event instantaneous delta that collapsed to ~0 at low concurrency. A timer
-    // recomputes the displayed value so it updates (and decays to 0) even between
-    // sparse progress events. See utils/upload-throughput-meter.js.
-    this.throughputMeter = createUploadThroughputMeter();
+    // Sliding-window throughput meters fed by REAL wire bytes, so the speed readout is a
+    // smooth ~3s average instead of a per-event instantaneous delta that collapsed to ~0
+    // at low concurrency. ONE meter PER path (see upload-throughput-meter.js): the UI
+    // shows the SUM, but each adaptive controller is fed ONLY its own path's meter — a
+    // shared meter would let legacy bytes inflate the block limiter's ramp and vice
+    // versa. A timer recomputes the value so it updates (and decays to 0) even between
+    // sparse progress events.
+    this.legacyThroughputMeter = createUploadThroughputMeter();
+    this.blockThroughputMeter = createUploadThroughputMeter();
     this._legacyMeterLoaded = 0; // last cumulative legacy loaded-bytes fed to the meter
     this._throughputTimer = null;
+    // Adaptive controllers ignore an immature first burst (a big block landing near the
+    // window start would otherwise read as a huge instantaneous rate) until the meter
+    // has this much history; the UI still shows the value immediately.
+    this._adaptiveMinSpanMs = 1000;
     window.onbeforeunload = this.onbeforeunload;
     this.isUploadLinkLoaded = false;
     // Cached promise of the shared resumable upload target for the current batch.
@@ -233,29 +240,32 @@ class FileUploader extends React.Component {
     ));
   };
 
-  // calculateUploadBitrate returns the current aggregate speed from the shared
-  // sliding-window meter (fed by real wire bytes from both the legacy and block
-  // paths). The meter self-decays to 0 after real inactivity, so a stale reading does
-  // not linger after either queue drains — no per-path bookkeeping needed here.
+  // calculateUploadBitrate returns the aggregate speed shown in the UI: the SUM of the
+  // per-path meters (each a sliding-window average over real wire bytes). Both self-
+  // decay to 0 after real inactivity, so a stale reading never lingers after a queue
+  // drains. The adaptive controllers, by contrast, read their OWN path's meter (see
+  // the timer and getBitrate) so one path's bytes never inflate the other's ramp.
   calculateUploadBitrate = () => {
-    return this.throughputMeter.rate();
+    return this.legacyThroughputMeter.rate() + this.blockThroughputMeter.rate();
   };
 
-  // ensureThroughputTimer starts a low-frequency ticker that re-reads the meter and
-  // pushes the smoothed speed to the UI + adaptive limiter, so the readout updates
-  // (and decays toward 0) even between sparse progress events. It self-stops once
-  // there is nothing left to measure.
+  // ensureThroughputTimer starts a low-frequency ticker that re-reads the meters and
+  // pushes the smoothed aggregate speed to the UI, and the BLOCK-only rate to the block
+  // limiter, so both update (and decay toward 0) even between sparse progress events.
+  // It self-stops once there is nothing left to measure.
   ensureThroughputTimer = () => {
     if (this._throughputTimer) {
       return;
     }
     this._throughputTimer = setInterval(() => {
-      const rate = this.throughputMeter.rate();
-      if (this.blockLimiter && rate > 0) {
-        this.blockLimiter.noteBitrate(rate);
+      // Block limiter gets ONLY block bytes, and only a mature (non-warm-up) reading.
+      const blockRate = this.blockThroughputMeter.rate(undefined, { minSpanMs: this._adaptiveMinSpanMs });
+      if (this.blockLimiter && blockRate > 0) {
+        this.blockLimiter.noteBitrate(blockRate);
       }
-      this.setState({ uploadBitrate: rate });
-      if (rate === 0 && !this.hasActiveUploadWork()) {
+      const displayRate = this.calculateUploadBitrate();
+      this.setState({ uploadBitrate: displayRate });
+      if (displayRate === 0 && !this.hasActiveUploadWork()) {
         this.stopThroughputTimer();
       }
     }, this.bitrateInterval);
@@ -268,11 +278,12 @@ class FileUploader extends React.Component {
     }
   };
 
-  // resetThroughput clears the meter + timer at session teardown so a new batch starts
-  // from a clean baseline (and no orphan interval keeps ticking).
+  // resetThroughput clears both meters + the timer at session teardown so a new batch
+  // starts from a clean baseline (and no orphan interval keeps ticking).
   resetThroughput = () => {
     this.stopThroughputTimer();
-    this.throughputMeter.reset();
+    this.legacyThroughputMeter.reset();
+    this.blockThroughputMeter.reset();
     this._legacyMeterLoaded = 0;
   };
 
@@ -745,17 +756,17 @@ class FileUploader extends React.Component {
   };
 
   // updateBlockUploadTransferredBytes feeds the real bytes moved over the wire (from
-  // the orchestrator's onTransferProgress) into the shared throughput meter, so the
+  // the orchestrator's onTransferProgress) into the BLOCK throughput meter, so the
   // dialog header shows an actual block-upload speed instead of the legacy 0.00 B/s
   // (block entries are not in this.resumable.files).
   updateBlockUploadTransferredBytes = (entry, deltaBytes) => {
     if (!deltaBytes || deltaBytes <= 0) {
       return;
     }
-    // Feed the shared throughput meter with the REAL wire bytes and make sure the
-    // ticker is running so the readout keeps updating (and the adaptive limiter keeps
-    // getting a smoothed signal) between sparse progress events.
-    this.throughputMeter.addBytes(deltaBytes);
+    // Feed the BLOCK throughput meter with the REAL wire bytes and make sure the ticker
+    // is running so the readout keeps updating (and the block limiter keeps getting a
+    // smoothed, path-isolated signal) between sparse progress events.
+    this.blockThroughputMeter.addBytes(deltaBytes);
     this.ensureThroughputTimer();
     this.setState(prev => {
       const uploadFileList = prev.uploadFileList.map(item => (
@@ -763,7 +774,7 @@ class FileUploader extends React.Component {
       ));
       return {
         uploadFileList,
-        uploadBitrate: this.throughputMeter.rate(),
+        uploadBitrate: this.calculateUploadBitrate(),
       };
     });
   };
@@ -1459,12 +1470,13 @@ class FileUploader extends React.Component {
     restoreUploadConcurrencyIfIdle(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
   };
 
-  // getBitrate feeds the shared throughput meter with the real bytes the legacy
-  // resumable queue has moved since the last call, then returns the meter's smoothed
-  // ~3s average. Legacy has no direct wire-byte callback, so we derive the delta from
-  // the summed per-file loaded bytes (progress() × size); a drop (a file was removed /
-  // reset) yields a non-positive delta the meter ignores while we re-baseline. This
-  // replaces the old single-window instantaneous delta that read ~0 at low concurrency.
+  // getBitrate feeds the LEGACY throughput meter with the real bytes the legacy
+  // resumable queue has moved since the last call, then returns that meter's smoothed
+  // ~3s average (legacy-only, for the legacy adaptive controller). Legacy has no direct
+  // wire-byte callback, so we derive the delta from the summed per-file loaded bytes
+  // (progress() × size); a drop (a file was removed / reset) yields a non-positive delta
+  // the meter ignores while we re-baseline. This replaces the old single-window
+  // instantaneous delta that read ~0 at low concurrency.
   getBitrate = () => {
     let loaded = 0;
     this.resumable.files.forEach(file => {
@@ -1472,13 +1484,16 @@ class FileUploader extends React.Component {
     });
     const delta = loaded - this._legacyMeterLoaded;
     if (delta > 0) {
-      this.throughputMeter.addBytes(delta);
+      this.legacyThroughputMeter.addBytes(delta);
       this.ensureThroughputTimer();
     }
     // Re-baseline whether the delta was positive (consumed) or a drop (files removed),
     // so the next positive delta is measured from the correct point.
     this._legacyMeterLoaded = loaded;
-    this.legacyUploadBitrate = this.throughputMeter.rate();
+    // The LEGACY adaptive controller reads the legacy-only meter with the warm-up guard
+    // (a big early chunk must not read as a huge instantaneous ramp signal). The UI
+    // aggregate is computed separately via calculateUploadBitrate.
+    this.legacyUploadBitrate = this.legacyThroughputMeter.rate(undefined, { minSpanMs: this._adaptiveMinSpanMs });
     return this.legacyUploadBitrate;
   };
 

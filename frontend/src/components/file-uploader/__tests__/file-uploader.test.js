@@ -466,31 +466,32 @@ describe('FileUploader block upload integration', () => {
     expect(uploader.state.uploadFileList).toEqual([done]);
   });
 
-  test('block speed is driven by real wire bytes (the shared meter), not logical progress', () => {
+  const makeBlockEntry = (id = 'block-1') => ({
+    uniqueIdentifier: id,
+    isBlockUpload: true,
+    isSaved: false,
+    error: null,
+    size: 1000,
+    _phase: 'uploading',
+    _uploading: true,
+    _progress: 0,
+    progress() { return this._progress; },
+    isUploading: () => true,
+  });
+
+  test('block speed is driven by real wire bytes, not logical progress', () => {
     jest.useFakeTimers();
     jest.setSystemTime(1000);
     const uploader = createUploader();
     try {
-      const blockEntry = {
-        uniqueIdentifier: 'block-1',
-        isBlockUpload: true,
-        isSaved: false,
-        error: null,
-        size: 1000,
-        _phase: 'uploading',
-        _uploading: true,
-        _progress: 0,
-        progress: () => blockEntry._progress,
-        isUploading: () => true,
-      };
+      const blockEntry = makeBlockEntry();
       uploader.state.uploadFileList = [blockEntry];
 
       // Logical progress must NOT fabricate a speed — only bytes on the wire do.
       uploader.updateBlockUploadProgress(blockEntry, 0.5);
       expect(uploader.state.uploadBitrate).toBe(0);
 
-      // Real wire bytes across two timestamps feed the shared sliding-window meter →
-      // a non-zero readout (the whole point of the fix at low concurrency).
+      // Real wire bytes across two timestamps feed the block meter → non-zero UI readout.
       uploader.updateBlockUploadTransferredBytes(blockEntry, 4 * 1024 * 1024);
       jest.setSystemTime(1200);
       uploader.updateBlockUploadTransferredBytes(blockEntry, 4 * 1024 * 1024);
@@ -501,36 +502,100 @@ describe('FileUploader block upload integration', () => {
     }
   });
 
-  test('the throughput timer feeds the block limiter the smoothed meter rate on tick, not per event', () => {
+  test('the throughput timer feeds the block limiter the block rate on tick — only once the window is mature', () => {
     jest.useFakeTimers();
     jest.setSystemTime(0);
     const uploader = createUploader();
     try {
       uploader.blockLimiter = { noteBitrate: jest.fn() };
-      const entry = {
-        uniqueIdentifier: 'block-1',
-        isBlockUpload: true,
-        isSaved: false,
-        error: null,
-        _phase: 'uploading',
-        _uploading: true,
-        progress: () => 0.5,
-        isUploading: () => true,
-      };
+      const entry = makeBlockEntry();
       uploader.state.uploadFileList = [entry];
 
-      // Real bytes across two timestamps; the limiter is NOT fed per progress event.
       uploader.updateBlockUploadTransferredBytes(entry, 4 * 1024 * 1024); // t=0, starts the ticker
-      jest.advanceTimersByTime(300);
-      uploader.updateBlockUploadTransferredBytes(entry, 4 * 1024 * 1024); // t=300
+      // Tick at 500ms: the block window is still immature (<1000ms) → limiter NOT fed
+      // (warm-up guard), and never per-event.
+      jest.advanceTimersByTime(500);
       expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
 
-      // The 500ms tick pushes the smoothed rate to the limiter.
-      jest.advanceTimersByTime(200); // t=500 → interval fires
+      uploader.updateBlockUploadTransferredBytes(entry, 4 * 1024 * 1024); // t=500
+      // Tick at 1000ms: window is now mature → the smoothed block rate is fed.
+      jest.advanceTimersByTime(500);
       expect(uploader.blockLimiter.noteBitrate).toHaveBeenCalled();
       const fed = uploader.blockLimiter.noteBitrate.mock.calls[0][0];
       expect(typeof fed).toBe('number');
       expect(fed).toBeGreaterThan(0);
+    } finally {
+      uploader.stopThroughputTimer();
+      jest.useRealTimers();
+    }
+  });
+
+  test('path isolation: legacy wire bytes never reach the block meter or the block limiter', () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    const uploader = createUploader();
+    try {
+      uploader.blockLimiter = { noteBitrate: jest.fn() };
+      // Two legacy progress reads with growing loaded bytes feed ONLY the legacy meter.
+      uploader.resumable.files = [{ progress: () => 0.25, size: 8 * 1024 * 1024 }];
+      uploader.getBitrate();
+      jest.setSystemTime(1200);
+      uploader.resumable.files = [{ progress: () => 0.75, size: 8 * 1024 * 1024 }];
+      uploader.getBitrate();
+
+      expect(uploader.legacyThroughputMeter.rate()).toBeGreaterThan(0);
+      expect(uploader.blockThroughputMeter.rate()).toBe(0); // block path untouched
+
+      // The ticker started by getBitrate must not feed the block limiter from legacy bytes.
+      jest.advanceTimersByTime(500);
+      expect(uploader.blockLimiter.noteBitrate).not.toHaveBeenCalled();
+    } finally {
+      uploader.stopThroughputTimer();
+      jest.useRealTimers();
+    }
+  });
+
+  test('path isolation: block wire bytes never reach the legacy (adaptive) meter', () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    const uploader = createUploader();
+    try {
+      const entry = makeBlockEntry();
+      uploader.state.uploadFileList = [entry];
+      uploader.updateBlockUploadTransferredBytes(entry, 4 * 1024 * 1024);
+      jest.setSystemTime(300);
+      uploader.updateBlockUploadTransferredBytes(entry, 4 * 1024 * 1024);
+
+      expect(uploader.blockThroughputMeter.rate()).toBeGreaterThan(0);
+      expect(uploader.legacyThroughputMeter.rate()).toBe(0); // legacy adaptive untouched
+    } finally {
+      uploader.stopThroughputTimer();
+      jest.useRealTimers();
+    }
+  });
+
+  test('a mixed batch shows the SUM of both path meters in the UI', () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    const uploader = createUploader();
+    try {
+      const entry = makeBlockEntry();
+      uploader.state.uploadFileList = [entry];
+
+      uploader.resumable.files = [{ progress: () => 0.5, size: 8 * 1024 * 1024 }];
+      uploader.getBitrate();                                        // legacy bytes @ t=0
+      uploader.updateBlockUploadTransferredBytes(entry, 4 * 1024 * 1024); // block bytes @ t=0
+      jest.setSystemTime(500);
+      uploader.resumable.files = [{ progress: () => 1, size: 8 * 1024 * 1024 }];
+      uploader.getBitrate();                                        // more legacy @ t=500
+      uploader.updateBlockUploadTransferredBytes(entry, 4 * 1024 * 1024); // more block @ t=500
+
+      const legacy = uploader.legacyThroughputMeter.rate();
+      const block = uploader.blockThroughputMeter.rate();
+      expect(legacy).toBeGreaterThan(0);
+      expect(block).toBeGreaterThan(0);
+      // UI aggregate = sum of the two isolated meters.
+      expect(uploader.calculateUploadBitrate()).toBeCloseTo(legacy + block, 5);
     } finally {
       uploader.stopThroughputTimer();
       jest.useRealTimers();

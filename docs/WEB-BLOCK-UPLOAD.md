@@ -1099,17 +1099,24 @@ flag were on*.
    especially on a fast localhost where an 8 MB chunk/block completes between window
    boundaries or axios fires `onUploadProgress` only coarsely — so most windows saw no
    fresh sample and the reading collapsed to ~0, stabilizing only once concurrency
-   climbed. **Fix:** a single shared `createUploadThroughputMeter` (a sliding-window
-   average over REAL wire bytes, default 3 s horizon) fed by BOTH paths — blocks via
-   `onTransferProgress`, legacy via the per-file loaded-bytes delta — recomputed on a
-   ~500 ms timer (not only on progress events) so the readout stays smooth at low
-   concurrency and decays to 0 only after a full window of genuine inactivity. It also
-   feeds the adaptive limiter, so a false-low sample no longer makes the ramp overly
-   conservative. The old per-entry sampler
+   climbed. **Fix:** `createUploadThroughputMeter` — a sliding-window average over REAL
+   wire bytes (default 3 s horizon, time-bucketed at 250 ms so the retained sample
+   count is HARD-bounded regardless of how verbose `onUploadProgress` is) — recomputed
+   on a ~500 ms timer (not only on progress events) so the readout stays smooth at low
+   concurrency and decays to 0 only after a full window of genuine inactivity. **Two
+   meters, path-isolated:** one per path (legacy via the per-file loaded-bytes delta,
+   blocks via `onTransferProgress`). The **UI shows the SUM**, but each adaptive
+   controller is fed ONLY its own path's meter — the block limiter gets block bytes,
+   the legacy concurrency controller gets legacy bytes — so one path's throughput can
+   never inflate the other's ramp in a mixed batch. Adaptive consumers additionally
+   read with a `minSpanMs` warm-up guard (≈1 s) so a big first block landing near the
+   window start does not read as a huge instantaneous ramp signal (the UI still shows
+   the value immediately). The old per-entry sampler
    (`sampleBlockUploadBitrate`/`aggregateBlockUploadBitrate`/`resetBlockUploadBitrate`)
-   was removed so there is ONE throughput source (no two-mechanism drift). Covered by
-   `utils/__tests__/upload-throughput-meter.test.js` (single sparse event, bursty
-   stability, inactivity decay, reset/negative-delta safety) and the file-uploader
+   was removed so there is ONE throughput mechanism (no two-mechanism drift). Covered
+   by `utils/__tests__/upload-throughput-meter.test.js` (single sparse event, bursty
+   stability, inactivity decay, reset/negative-delta safety, bounded buffer, warm-up
+   guard) and the file-uploader
    meter/limiter tests. Still worth an eyes-on check in the running app (item 4 gap).
 7. **[Resolved] Concurrent-loser `409 "commit still in progress"` retry.** The LWT
    guarantees a single winner; losing/retried commits poll only ~10s for the
@@ -1160,6 +1167,43 @@ flag were on*.
     after a full page reload the browser must re-hash the whole file before it
     can ask `/blocks/check` which blocks are still missing. The network resume is
     preserved; the cross-reload local hashing work is not.
+19. **[Open — P1, before flag-ON] Abandoned block-upload sessions hold a per-user slot
+    until TTL.** The per-user concurrent-uncommitted-session cap (item 1) claims an LWT
+    slot at `block-upload-session` creation and releases it explicitly only at commit
+    (or if the creation insert itself fails). A session abandoned AFTER creation but
+    BEFORE commit — terminal `/blocks/upload` error (e.g. `block id mapping conflict`),
+    user cancel, tab close, or any failure short of commit — keeps its slot until the
+    48 h TTL. Because the cap is per user, 8 such abandoned sessions block that user's
+    next upload (in any tab or repo) with `429 {"error":"too many concurrent uploads;
+    retry shortly"}` until TTL. **Fix:** an explicit release endpoint (e.g.
+    `DELETE /api/v2/repos/:repo_id/block-upload-session/:session_id` or
+    `.../abort`) that validates owner/org/repo, rejects a committed session, and
+    releases the slot with the same owner-checked conditional delete as commit (refs /
+    ledger left to TTL or reaped async); frontend calls it best-effort on cancel /
+    cancel-all / terminal block error / mapping conflict / session failure /
+    unmount-close. Tests: 8 sessions created→aborted then a 9th succeeds; terminal
+    error releases the slot; commit still releases as today; abort must NOT drop a
+    slot re-claimed by a newer session after the old one's TTL.
+20. **[Open — P1/P2 diagnostic] `409 block id mapping conflict` on `/blocks/upload`.**
+    NOT caused by the throughput work; a backend/block-upload issue. The verified web
+    writer refuses to remap an external SHA-1 that already points at a different
+    internal id (the guard that prevents a SHA-1 → different SHA-256 remap). Most likely
+    cause is a **stale/legacy or identity mapping** in `block_id_mappings`
+    (`internal_id = sha1`, from old tests/migration) now colliding with the web CAS
+    `internal_id = sha256`. Do NOT assume it comes from an encrypted library — encrypted
+    libs are rejected at session creation, before `/blocks/upload`, so a `/blocks/upload`
+    conflict is more likely a stale bundle/tab or a normal lib with a contaminated
+    mapping. **Actions:** (1) add temporary diagnostic logging in the
+    `ErrBlockIDMappingConflict` catch (org/repo/session/sha1/sha256/size); (2) inspect
+    `block_id_mappings` for that external_id; (3) classify — a 40-char/identity
+    `internal_id` is a legacy mapping safe to repair via a CAS `UPDATE ... IF
+    internal_id = ?`, a 64-char mapping to a DIFFERENT id with refs must NOT be
+    overwritten (investigate corruption/collision). Related frontend follow-up: treat a
+    `block id mapping conflict` (ideally tagged with a `code`) as **terminal** — abort
+    the session (item 19), show a terminal error, do NOT auto-retry into the same
+    mapping. Also needs an **E2E encrypted+normal cross-tab** check (encrypted lib →
+    legacy, never `block-upload-session/`; normal lib → block flow, not blocked by the
+    other tab's sessions), incl. a hard reload with a fresh bundle.
 
 ## Security/performance review findings (2026-07-02)
 
