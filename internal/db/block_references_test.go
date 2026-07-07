@@ -252,6 +252,44 @@ func TestWriteBlockIDMapping_RejectsSameDomainRemap(t *testing.T) {
 	}
 }
 
+func TestWriteBlockIDMapping_CanonicalizesHashesToLowercase(t *testing.T) {
+	database := &DB{}
+	oldGet := getBlockIDMappingForWriteCheckFn
+	oldInsert := insertBlockIDMappingForWriteCheckFn
+	t.Cleanup(func() {
+		getBlockIDMappingForWriteCheckFn = oldGet
+		insertBlockIDMappingForWriteCheckFn = oldInsert
+	})
+
+	getCalled := false
+	insertCalled := false
+	getBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID string) (string, bool, error) {
+		getCalled = true
+		if externalID != strings.Repeat("a", 40) {
+			t.Fatalf("externalID = %q, want lowercase", externalID)
+		}
+		return "", false, nil
+	}
+	insertBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID, internalID string, createdAt time.Time) error {
+		insertCalled = true
+		if externalID != strings.Repeat("a", 40) {
+			t.Fatalf("insert externalID = %q, want lowercase", externalID)
+		}
+		if internalID != strings.Repeat("b", 64) {
+			t.Fatalf("insert internalID = %q, want lowercase", internalID)
+		}
+		return nil
+	}
+
+	err := database.WriteBlockIDMapping("org-1", PlainBlockRepresentationID, strings.Repeat("A", 40), strings.Repeat("B", 64), time.Time{})
+	if err != nil {
+		t.Fatalf("WriteBlockIDMapping() error = %v, want nil", err)
+	}
+	if !getCalled || !insertCalled {
+		t.Fatalf("expected canonicalized lookup+insert path, got lookup=%v insert=%v", getCalled, insertCalled)
+	}
+}
+
 func TestEnsureBlockIdentity_PlaintextBackfillsMissingRepresentationID(t *testing.T) {
 	database := &DB{}
 	oldRead := readBlockIdentityForRepairFn

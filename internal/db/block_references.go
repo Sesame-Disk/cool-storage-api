@@ -238,8 +238,8 @@ func (db *DB) WriteBlockIDMapping(orgID, representationID, externalID, internalI
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		return err
 	}
-	externalID = strings.TrimSpace(externalID)
-	internalID = strings.TrimSpace(internalID)
+	externalID = strings.ToLower(strings.TrimSpace(externalID))
+	internalID = strings.ToLower(strings.TrimSpace(internalID))
 	ts := createdAt.UTC()
 	if ts.IsZero() {
 		ts = time.Now().UTC()
@@ -267,7 +267,7 @@ func (db *DB) GetBlockIDMapping(orgID, representationID, externalID string) (int
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		return "", false, err
 	}
-	externalID = strings.TrimSpace(externalID)
+	externalID = strings.ToLower(strings.TrimSpace(externalID))
 	if externalID == "" {
 		return "", false, nil
 	}
@@ -304,8 +304,8 @@ func (db *DB) WriteVerifiedWebBlockMapping(orgID, representationID, externalID, 
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		return err
 	}
-	externalID = strings.TrimSpace(externalID)
-	internalID = strings.TrimSpace(internalID)
+	externalID = strings.ToLower(strings.TrimSpace(externalID))
+	internalID = strings.ToLower(strings.TrimSpace(internalID))
 	ts := createdAt.UTC()
 	if ts.IsZero() {
 		ts = time.Now().UTC()

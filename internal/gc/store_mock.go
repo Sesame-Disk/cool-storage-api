@@ -641,6 +641,19 @@ func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID stri
 	}
 }
 
+func (m *MockStore) AddBlockMappingForRepresentation(orgID uuid.UUID, representationID, externalID, internalID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := mockMappingKey(orgID, representationID, externalID)
+	m.mappings[key] = internalID
+	if b := m.blocks[fmt.Sprintf("%s:%s", orgID, internalID)]; b != nil && strings.TrimSpace(b.Sha1) == "" {
+		b.Sha1 = externalID
+		if rep := strings.TrimSpace(representationID); rep != "" {
+			b.RepresentationID = rep
+		}
+	}
+}
+
 // ForwardBlockMappingExists reports whether the forward external->internal block
 // mapping row still exists. Test accessor that replaces the dropped reverse-index
 // assertions.
@@ -648,6 +661,13 @@ func (m *MockStore) ForwardBlockMappingExists(orgID uuid.UUID, externalID string
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	_, ok := m.mappings[mockMappingKey(orgID, db.PlainBlockRepresentationID, externalID)]
+	return ok
+}
+
+func (m *MockStore) ForwardBlockMappingExistsForRepresentation(orgID uuid.UUID, representationID, externalID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.mappings[mockMappingKey(orgID, representationID, externalID)]
 	return ok
 }
 

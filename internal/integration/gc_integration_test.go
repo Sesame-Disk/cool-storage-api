@@ -974,7 +974,7 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 	worker := gcpkg.NewWorker(store, nil, queue, 100, 0, false, &gcpkg.Stats{})
 	orgUUID := uuid.New()
 	orgID := orgUUID.String()
-	blockID := fmt.Sprintf("cand-missing-%d", time.Now().UnixNano())
+	blockID := fmt.Sprintf("%064x", time.Now().UnixNano())
 	externalBlockID := fmt.Sprintf("%040x", time.Now().UnixNano())
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
 	candidateAt := ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", queuedAt)

@@ -341,6 +341,50 @@ func TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMappi
 	}
 }
 
+func TestWorker_RecoverS3Orphans_PendingMappingCleanupPreservesSiblingRepresentation(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	externalSHA1 := "sha1-shared"
+	plainBlockID := "blk-plain"
+	encBlockID := "blk-enc"
+	encRep := db.EncryptedLibraryBlockRepresentationID(uuid.NewString())
+
+	store.AddBlockMappingForRepresentation(orgID, db.PlainBlockRepresentationID, externalSHA1, plainBlockID)
+	store.AddBlockMappingForRepresentation(orgID, encRep, externalSHA1, encBlockID)
+	firstSeenAt, err := store.RecordS3Orphan(orgID, encBlockID, "hot", encRep, externalSHA1, "", time.Now())
+	if err != nil {
+		t.Fatalf("seed orphan: %v", err)
+	}
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, encBlockID, encRep, externalSHA1, firstSeenAt.Add(5*time.Second)); err != nil {
+		t.Fatalf("advance orphan phase: %v", err)
+	}
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("RecoverS3Orphans: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered=%d, want 1", recovered)
+	}
+	if store.ForwardBlockMappingExistsForRepresentation(orgID, encRep, externalSHA1) {
+		t.Fatal("encrypted forward mapping should be cleaned up from pending mapping phase")
+	}
+	if !store.ForwardBlockMappingExistsForRepresentation(orgID, db.PlainBlockRepresentationID, externalSHA1) {
+		t.Fatal("plain sibling mapping must be preserved during encrypted orphan cleanup")
+	}
+	if store.S3OrphanCount() != 0 {
+		t.Fatalf("orphan should be cleared, got %d", store.S3OrphanCount())
+	}
+	if got := sp.DeletedBlocks(); len(got) != 0 {
+		t.Fatalf("S3 should not be touched in pending mapping phase, got %v", got)
+	}
+}
+
 // TestWorker_RecoverS3Orphans_PartialFailure confirms that when S3 is still
 // down for some orphans, those rows stay (with bumped retry count) while the
 // succeeding ones are removed.

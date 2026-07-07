@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,5 +124,91 @@ func TestBlockMappingConflict_EncryptedThenNormal_E2E(t *testing.T) {
 	}
 	if got := downloadRepoFile(t, adminClient, encRepo, "/shared.txt"); string(got) != content {
 		t.Fatalf("encrypted library download mismatch:\n  got:  %q\n  want: %q", string(got), content)
+	}
+}
+
+func TestBlockMappingConflict_NormalThenEncrypted_E2E(t *testing.T) {
+	content := fmt.Sprintf("shared content across normal and encrypted libs %d\n", time.Now().UnixNano())
+
+	normalName := fmt.Sprintf("inttest-bmc-normal-first-%d", time.Now().UnixNano())
+	normalRepo := createTestLibrary(t, adminClient, normalName)
+	resp := uploadFileViaBlocksFlow(t, adminClient, normalRepo, "/", "shared.txt", [][]byte{[]byte(content)}, false)
+	if resp.StatusCode == http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("web block upload to normal library returned 409: %s", body)
+	}
+	expectStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	encName := fmt.Sprintf("inttest-bmc-enc-second-%d", time.Now().UnixNano())
+	password := "test-password-123"
+	encRepo := createLibraryWithBody(t, adminClient, encName, map[string]interface{}{
+		"repo_name": encName,
+		"encrypted": true,
+		"passwd":    password,
+	}, true)
+	setPassResp := adminClient.PostForm(t, fmt.Sprintf("/api/v2.1/repos/%s/set-password/", encRepo), url.Values{"password": {password}})
+	expectStatus(t, setPassResp, http.StatusOK)
+	setPassResp.Body.Close()
+
+	encUploadURL := getUploadURL(t, adminClient, encRepo)
+	uploadFileThroughLink(t, adminClient, encUploadURL, "shared.txt", "/", content)
+
+	if got := downloadRepoFile(t, adminClient, normalRepo, "/shared.txt"); string(got) != content {
+		t.Fatalf("normal library download mismatch:\n  got:  %q\n  want: %q", string(got), content)
+	}
+	if got := downloadRepoFile(t, adminClient, encRepo, "/shared.txt"); string(got) != content {
+		t.Fatalf("encrypted library download mismatch:\n  got:  %q\n  want: %q", string(got), content)
+	}
+}
+
+func TestBlockMappingConflict_EncryptedThenNormal_Multiblock_E2E(t *testing.T) {
+	// The web block flow (validateManifest) requires every non-final block to be
+	// exactly the CAS block size (v2.WebUploadBlockSize = 8 MiB); only the final
+	// block may be shorter. Build a real 2-block file: one full 8 MiB block plus a
+	// small tail. seafhttp chunks the encrypted upload on the same 8 MiB boundary,
+	// so both libraries store the same 2-block decomposition of identical content.
+	const webBlockSize = 8 * 1024 * 1024
+	blocks := [][]byte{
+		[]byte(strings.Repeat("A", webBlockSize)),
+		[]byte(fmt.Sprintf("multiblock-tail-%d\n", time.Now().UnixNano())),
+	}
+	var builder strings.Builder
+	for _, block := range blocks {
+		builder.Write(block)
+	}
+	content := builder.String()
+
+	encName := fmt.Sprintf("inttest-bmc-enc-multiblock-%d", time.Now().UnixNano())
+	password := "test-password-123"
+	encRepo := createLibraryWithBody(t, adminClient, encName, map[string]interface{}{
+		"repo_name": encName,
+		"encrypted": true,
+		"passwd":    password,
+	}, true)
+	setPassResp := adminClient.PostForm(t, fmt.Sprintf("/api/v2.1/repos/%s/set-password/", encRepo), url.Values{"password": {password}})
+	expectStatus(t, setPassResp, http.StatusOK)
+	setPassResp.Body.Close()
+
+	encUploadURL := getUploadURL(t, adminClient, encRepo)
+	uploadFileThroughLink(t, adminClient, encUploadURL, "shared-multi.txt", "/", content)
+
+	normalName := fmt.Sprintf("inttest-bmc-normal-multiblock-%d", time.Now().UnixNano())
+	normalRepo := createTestLibrary(t, adminClient, normalName)
+	resp := uploadFileViaBlocksFlow(t, adminClient, normalRepo, "/", "shared-multi.txt", blocks, false)
+	if resp.StatusCode == http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("web block upload multiblock to normal library returned 409: %s", body)
+	}
+	expectStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	if got := downloadRepoFile(t, adminClient, normalRepo, "/shared-multi.txt"); string(got) != content {
+		t.Fatalf("normal multiblock download mismatch: got %d bytes, want %d", len(got), len(content))
+	}
+	if got := downloadRepoFile(t, adminClient, encRepo, "/shared-multi.txt"); string(got) != content {
+		t.Fatalf("encrypted multiblock download mismatch: got %d bytes, want %d", len(got), len(content))
 	}
 }
