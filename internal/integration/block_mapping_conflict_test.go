@@ -98,7 +98,7 @@ func TestBlockMappingConflict_EncryptedThenNormal_E2E(t *testing.T) {
 		"repo_name": encName,
 		"encrypted": true,
 		"passwd":    password,
-	}, false)
+	}, true)
 	setPassResp := adminClient.PostForm(t, fmt.Sprintf("/api/v2.1/repos/%s/set-password/", encRepo), url.Values{"password": {password}})
 	expectStatus(t, setPassResp, http.StatusOK)
 	setPassResp.Body.Close()
