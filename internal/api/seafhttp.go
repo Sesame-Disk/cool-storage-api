@@ -1243,16 +1243,16 @@ func parseContentRange(header string) (int64, int64, int64, bool) {
 
 // SeafHTTPHandler handles Seafile-compatible file operations
 type SeafHTTPHandler struct {
-	storage        *storage.S3Store
-	storageManager *storage.Manager
-	db             *db.DB
-	tokenStore     TokenStore
-	config         *config.Config
-	permMiddleware *middleware.PermissionMiddleware
+	storage                *storage.S3Store
+	storageManager         *storage.Manager
+	db                     *db.DB
+	tokenStore             TokenStore
+	config                 *config.Config
+	permMiddleware         *middleware.PermissionMiddleware
 	blockRepresentationIDs *syncBlockRepresentationIDCache
-	zipMaxEntries  int
-	zipMaxDepth    int
-	zipMaxBytes    int64
+	zipMaxEntries          int
+	zipMaxDepth            int
+	zipMaxBytes            int64
 }
 
 const (
@@ -1314,16 +1314,16 @@ func (b *zipTraversalBudget) noteFile(size int64) error {
 // NewSeafHTTPHandler creates a new SeafHTTP handler
 func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manager, database *db.DB, tokenStore TokenStore, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) *SeafHTTPHandler {
 	return &SeafHTTPHandler{
-		storage:        s3Store,
-		storageManager: storageManager,
-		db:             database,
-		tokenStore:     tokenStore,
-		config:         cfg,
-		permMiddleware: permMiddleware,
+		storage:                s3Store,
+		storageManager:         storageManager,
+		db:                     database,
+		tokenStore:             tokenStore,
+		config:                 cfg,
+		permMiddleware:         permMiddleware,
 		blockRepresentationIDs: newSyncBlockRepresentationIDCache(),
-		zipMaxEntries:  defaultZipMaxEntries,
-		zipMaxDepth:    defaultZipMaxDepth,
-		zipMaxBytes:    defaultZipMaxBytes,
+		zipMaxEntries:          defaultZipMaxEntries,
+		zipMaxDepth:            defaultZipMaxDepth,
+		zipMaxBytes:            defaultZipMaxBytes,
 	}
 }
 

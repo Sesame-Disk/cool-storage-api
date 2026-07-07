@@ -900,11 +900,17 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 
 	// Determine MIME type from extension
 	mimeType := resolveInlineContentType(ext)
-	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), sl.orgID, sl.libraryID)
-	if err != nil {
-		slog.Error("failed to resolve block representation for share link", "org", sl.orgID, "library", sl.libraryID, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
-		return
+	// Skip the representation lookup on the all-SHA-256 fast path: it is only
+	// consulted when a legacy SHA-1 block id has to be resolved via block_id_mappings.
+	representationID := db.PlainBlockRepresentationID
+	if streaming.ContainsLegacySHA1(blockIDs) {
+		resolved, err := db.ResolveBlockRepresentationID(h.db.Session(), sl.orgID, sl.libraryID)
+		if err != nil {
+			slog.Error("failed to resolve block representation for share link", "org", sl.orgID, "library", sl.libraryID, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+			return
+		}
+		representationID = resolved
 	}
 
 	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries.
@@ -1013,10 +1019,14 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 	}
 
 	ctx := context.Background()
-	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), sl.orgID, sl.libraryID)
-	if err != nil {
-		slog.Error("failed to resolve block representation for inline text content", "org", sl.orgID, "library", sl.libraryID, "error", err)
-		return ""
+	representationID := db.PlainBlockRepresentationID
+	if streaming.ContainsLegacySHA1(blockIDs) {
+		resolved, err := db.ResolveBlockRepresentationID(h.db.Session(), sl.orgID, sl.libraryID)
+		if err != nil {
+			slog.Error("failed to resolve block representation for inline text content", "org", sl.orgID, "library", sl.libraryID, "error", err)
+			return ""
+		}
+		representationID = resolved
 	}
 	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, sl.orgID, representationID, blockIDs)
 	if err != nil {

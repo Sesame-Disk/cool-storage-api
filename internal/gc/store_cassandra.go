@@ -1619,13 +1619,13 @@ func (s *CassandraStore) ListS3OrphansByDay(day time.Time, bucket int, limit int
 	var orgIDStr, blockID, storageClass, representationID, externalSHA1, recoveryPhase string
 	for iter.Scan(&firstSeen, &orgIDStr, &blockID, &storageClass, &representationID, &externalSHA1, &recoveryPhase) {
 		out = append(out, S3OrphanInfo{
-			OrgID:         parseUUID(orgIDStr),
-			BlockID:       blockID,
-			StorageClass:  storageClass,
+			OrgID:            parseUUID(orgIDStr),
+			BlockID:          blockID,
+			StorageClass:     storageClass,
 			RepresentationID: strings.TrimSpace(representationID),
-			ExternalSHA1:  strings.TrimSpace(externalSHA1),
-			RecoveryPhase: strings.TrimSpace(recoveryPhase),
-			FirstSeenAt:   firstSeen,
+			ExternalSHA1:     strings.TrimSpace(externalSHA1),
+			RecoveryPhase:    strings.TrimSpace(recoveryPhase),
+			FirstSeenAt:      firstSeen,
 		})
 	}
 	if err := iter.Close(); err != nil {
@@ -1715,11 +1715,15 @@ func (s *CassandraStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockIDs []
 // Cassandra (block_id_mappings has no in-process fake).
 func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) ([]string, error) {
 	resolved := make([]string, len(blockIDs))
-	copy(resolved, blockIDs)
 
+	// Canonicalize (trim + lowercase) before classifying, mirroring the streaming
+	// resolver and the Cassandra mapping query, so a padded/uppercase id is still
+	// recognized as a SHA-1 and a passthrough SHA-256 lands canonicalized.
 	var toResolve []int
 	for i, blockID := range blockIDs {
-		if len(blockID) == 40 {
+		normalized := db.NormalizeBlockID(blockID)
+		resolved[i] = normalized
+		if len(normalized) == 40 {
 			toResolve = append(toResolve, i)
 		}
 	}
@@ -1761,8 +1765,8 @@ func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrenc
 			}
 			continue
 		}
-		if result.internalID != "" {
-			resolved[result.idx] = result.internalID
+		if internalID := db.NormalizeBlockID(result.internalID); internalID != "" {
+			resolved[result.idx] = internalID
 		}
 	}
 	if resolveErr != nil {

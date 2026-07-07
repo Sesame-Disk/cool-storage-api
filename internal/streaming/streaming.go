@@ -45,6 +45,20 @@ func PutCopyBuf(buf []byte) {
 // against block_id_mappings so a large file's block list cannot flood the driver.
 const mappingResolveConcurrency = 32
 
+// ContainsLegacySHA1 reports whether any entry canonicalizes to a 40-char SHA-1
+// that BatchResolveBlockIDs would have to resolve through block_id_mappings.
+// Callers use it to skip the per-request representation_id lookup on the common
+// all-SHA-256 path, where BatchResolveBlockIDs is a no-op passthrough and the
+// representation is never consulted.
+func ContainsLegacySHA1(blockIDs []string) bool {
+	for _, id := range blockIDs {
+		if len(db.NormalizeBlockID(id)) == 40 {
+			return true
+		}
+	}
+	return false
+}
+
 // BatchResolveBlockIDs resolves all SHA-1 block IDs (40 chars) to their internal
 // SHA-256 content address inside one block-representation domain. IDs that are
 // already SHA-256 (64 chars) pass through untouched.
@@ -71,25 +85,40 @@ func BatchResolveBlockIDs(database *db.DB, orgID, representationID string, block
 
 // resolveBlockIDs maps every 40-char SHA-1 entry of blockIDs to its internal
 // SHA-256 by calling lookup with bounded concurrency, preserving slice order.
-// 64-char SHA-256 IDs are left untouched and lookup is never called for them.
-// lookup must return gocql.ErrNotFound when no mapping row exists.
+// Every ID is canonicalized with db.NormalizeBlockID (trim + lowercase) BEFORE
+// it is classified, so a padded or uppercase SHA-1 is still recognized and a
+// 64-char SHA-256 passes through canonicalized instead of raw. lookup must
+// return gocql.ErrNotFound when no mapping row exists.
 //
-// Resolution is strict: a lookup error, a missing mapping row, or an empty
-// internal_id all mark the block as unresolved. If any block is unresolved the
-// function returns (nil, err) with every cause joined, so callers never act on a
-// partially-resolved slice. orgID is used only for error/log context. The
-// DB-backed lookup is injected so the concurrency/ordering/error semantics stay
-// unit-testable without a live Cassandra (block_id_mappings has no in-process fake).
+// Resolution is strict: an ID that is neither a 40-char SHA-1 nor a 64-char
+// SHA-256, a lookup error, a missing mapping row, or an internal_id that does
+// not canonicalize to a 64-char SHA-256 all mark the block as unresolved. If any
+// block is unresolved the function returns (nil, err) with every cause joined, so
+// callers never act on a partially-resolved slice. orgID is used only for
+// error/log context. The DB-backed lookup is injected so the
+// concurrency/ordering/error semantics stay unit-testable without a live
+// Cassandra (block_id_mappings has no in-process fake).
 func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) ([]string, error) {
 	resolved := make([]string, len(blockIDs))
-	copy(resolved, blockIDs)
 
-	// Collect indices that need resolution (SHA-1 = 40 chars)
+	// Canonicalize first, THEN classify. 64-char SHA-256 IDs land canonicalized
+	// and lookup is never called for them; 40-char SHA-1 IDs are queued.
 	var toResolve []int
+	var invalidErr error
 	for i, bid := range blockIDs {
-		if len(bid) == 40 {
+		normalized := db.NormalizeBlockID(bid)
+		switch len(normalized) {
+		case 40:
+			resolved[i] = normalized
 			toResolve = append(toResolve, i)
+		case 64:
+			resolved[i] = normalized
+		default:
+			invalidErr = errors.Join(invalidErr, fmt.Errorf("block %q is not a valid SHA-1 or SHA-256 block id", bid))
 		}
+	}
+	if invalidErr != nil {
+		return nil, invalidErr
 	}
 	if len(toResolve) == 0 {
 		return resolved, nil
@@ -135,12 +164,17 @@ func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup
 			}
 			continue
 		}
-		if result.internalID == "" {
+		internalID := db.NormalizeBlockID(result.internalID)
+		if len(internalID) != 64 {
 			missingMappings++
-			resolveErr = errors.Join(resolveErr, fmt.Errorf("block %s mapping row has empty internal_id", blockIDs[result.idx]))
+			if internalID == "" {
+				resolveErr = errors.Join(resolveErr, fmt.Errorf("block %s mapping row has empty internal_id", blockIDs[result.idx]))
+			} else {
+				resolveErr = errors.Join(resolveErr, fmt.Errorf("block %s mapping resolved to non-SHA-256 internal id %q", blockIDs[result.idx], result.internalID))
+			}
 			continue
 		}
-		resolved[result.idx] = result.internalID
+		resolved[result.idx] = internalID
 	}
 	if resolveErr != nil {
 		log.Printf("[BatchResolveBlockIDs] ERROR: aborting resolution for org=%s: %d/%d blocks unresolved (query_failures=%d, missing_mappings=%d)",

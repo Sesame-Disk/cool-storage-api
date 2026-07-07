@@ -46,8 +46,9 @@ type MockStore struct {
 	// provisional upload-ref expiry discovery rows keyed by the full projection PK.
 	provisionalBlockRefExpiryProjections map[mockProvisionalBlockRefExpiryProjectionKey]ProvisionalBlockRefExpiryInfo
 
-	// block_id_mappings keyed by "orgID:representationID:externalID"
-	mappings map[string]string // externalID -> internalID
+	// block_id_mappings keyed by "orgID:representationID:normalizedExternalID"
+	// (see mockMappingKey); value is the canonicalized internal SHA-256 id.
+	mappings map[string]string
 
 	// commits keyed by "libraryID:commitID"
 	commits map[string]*mockCommit
@@ -198,14 +199,14 @@ type MockStore struct {
 }
 
 type mockBlock struct {
-	OrgID        uuid.UUID
-	BlockID      string
-	StorageClass string
-	CreatedAt    *time.Time
-	GCState      string
-	GCClaimID    string
+	OrgID            uuid.UUID
+	BlockID          string
+	StorageClass     string
+	CreatedAt        *time.Time
+	GCState          string
+	GCClaimID        string
 	RepresentationID string
-	Sha1         string
+	Sha1             string
 }
 
 type mockPendingItemKey struct {
@@ -273,15 +274,15 @@ type mockFSObject struct {
 }
 
 type mockLibrary struct {
-	OrgID          uuid.UUID
-	LibraryID      uuid.UUID
-	OwnerID        uuid.UUID
+	OrgID                 uuid.UUID
+	LibraryID             uuid.UUID
+	OwnerID               uuid.UUID
 	BlockRepresentationID string
-	StorageClass   string
-	HeadCommitID   string
-	VersionTTLDays int
-	AutoDeleteDays int
-	DeletedAt      time.Time
+	StorageClass          string
+	HeadCommitID          string
+	VersionTTLDays        int
+	AutoDeleteDays        int
+	DeletedAt             time.Time
 	// SizeBytes and FileCount mirror the canonical libraries.size_bytes and
 	// libraries.file_count columns used by ReconcilePendingStorageCounters
 	// in production. Storage-counter rows (m.storageSnapshots) are derived
@@ -539,11 +540,11 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	createdAt := time.Now().UTC()
 	m.blocks[key] = &mockBlock{
-		OrgID:        orgID,
-		BlockID:      blockID,
-		StorageClass: storageClass,
+		OrgID:            orgID,
+		BlockID:          blockID,
+		StorageClass:     storageClass,
 		RepresentationID: db.PlainBlockRepresentationID,
-		CreatedAt:    &createdAt,
+		CreatedAt:        &createdAt,
 	}
 	// Model the legacy refCount as that many distinct reference rows so existing
 	// tests keep their "block is alive with N refs" intent under the row model.
@@ -563,10 +564,10 @@ func (m *MockStore) AddStubBlockForTest(orgID uuid.UUID, blockID string) {
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	m.blocks[key] = &mockBlock{
-		OrgID:     orgID,
-		BlockID:   blockID,
+		OrgID:            orgID,
+		BlockID:          blockID,
 		RepresentationID: db.PlainBlockRepresentationID,
-		CreatedAt: nil,
+		CreatedAt:        nil,
 	}
 }
 
@@ -648,12 +649,18 @@ func (m *MockStore) AddBlockMappingForRepresentation(orgID uuid.UUID, representa
 // field is filled independently so a block that already carries a sha1 still gets its
 // representation modeled. Caller must hold m.mu.
 func (m *MockStore) addBlockMappingLocked(orgID uuid.UUID, representationID, externalID, internalID string) {
+	// Canonicalize exactly like the Cassandra writer (writeCheckedBlockIDMapping +
+	// UpsertBlockMetadataWithRepresentationAndSHA1) so a test that passes an
+	// uppercase/padded id behaves identically in the mock and against Cassandra.
+	externalID = db.NormalizeBlockID(externalID)
+	internalID = db.NormalizeBlockID(internalID)
+	representationID = strings.TrimSpace(representationID)
 	m.mappings[mockMappingKey(orgID, representationID, externalID)] = internalID
 	if b := m.blocks[fmt.Sprintf("%s:%s", orgID, internalID)]; b != nil {
 		if strings.TrimSpace(b.Sha1) == "" {
 			b.Sha1 = externalID
 		}
-		if strings.TrimSpace(b.RepresentationID) == "" && strings.TrimSpace(representationID) != "" {
+		if strings.TrimSpace(b.RepresentationID) == "" && representationID != "" {
 			b.RepresentationID = representationID
 		}
 	}
@@ -744,12 +751,12 @@ func (m *MockStore) AddLibraryWithTTL(orgID, libraryID uuid.UUID, storageClass, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{
-		OrgID:          orgID,
-		LibraryID:      libraryID,
+		OrgID:                 orgID,
+		LibraryID:             libraryID,
 		BlockRepresentationID: db.PlainBlockRepresentationID,
-		StorageClass:   storageClass,
-		HeadCommitID:   headCommitID,
-		VersionTTLDays: versionTTLDays,
+		StorageClass:          storageClass,
+		HeadCommitID:          headCommitID,
+		VersionTTLDays:        versionTTLDays,
 	}
 }
 
@@ -784,12 +791,12 @@ func (m *MockStore) AddLibraryWithAutoDelete(orgID, libraryID uuid.UUID, storage
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{
-		OrgID:          orgID,
-		LibraryID:      libraryID,
+		OrgID:                 orgID,
+		LibraryID:             libraryID,
 		BlockRepresentationID: db.PlainBlockRepresentationID,
-		StorageClass:   storageClass,
-		HeadCommitID:   headCommitID,
-		AutoDeleteDays: autoDeleteDays,
+		StorageClass:          storageClass,
+		HeadCommitID:          headCommitID,
+		AutoDeleteDays:        autoDeleteDays,
 	}
 }
 
@@ -797,10 +804,10 @@ func (m *MockStore) AddLibrary(orgID, libraryID uuid.UUID, storageClass string) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{
-		OrgID:        orgID,
-		LibraryID:    libraryID,
+		OrgID:                 orgID,
+		LibraryID:             libraryID,
 		BlockRepresentationID: db.PlainBlockRepresentationID,
-		StorageClass: storageClass,
+		StorageClass:          storageClass,
 	}
 }
 
@@ -808,11 +815,11 @@ func (m *MockStore) AddLibraryWithOwner(orgID, libraryID, ownerID uuid.UUID, sto
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{
-		OrgID:        orgID,
-		LibraryID:    libraryID,
-		OwnerID:      ownerID,
+		OrgID:                 orgID,
+		LibraryID:             libraryID,
+		OwnerID:               ownerID,
 		BlockRepresentationID: db.PlainBlockRepresentationID,
-		StorageClass: storageClass,
+		StorageClass:          storageClass,
 	}
 }
 
@@ -3215,14 +3222,14 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 		return existing.FirstSeenAt, nil
 	}
 	orphan := &S3OrphanInfo{
-		OrgID:         orgID,
-		BlockID:       blockID,
-		StorageClass:  storageClass,
+		OrgID:            orgID,
+		BlockID:          blockID,
+		StorageClass:     storageClass,
 		RepresentationID: strings.TrimSpace(representationID),
-		ExternalSHA1:  strings.TrimSpace(externalSHA1),
-		RecoveryPhase: S3OrphanPhasePendingS3,
-		FirstSeenAt:   now.UTC(),
-		LastAttemptAt: now,
+		ExternalSHA1:     strings.TrimSpace(externalSHA1),
+		RecoveryPhase:    S3OrphanPhasePendingS3,
+		FirstSeenAt:      now.UTC(),
+		LastAttemptAt:    now,
 	}
 	m.s3Orphans[key] = orphan
 	m.upsertS3OrphanProjection(orphan)
@@ -3262,16 +3269,16 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, repre
 		return existing.FirstSeenAt, nil
 	}
 	orphan := &S3OrphanInfo{
-		OrgID:         orgID,
-		BlockID:       blockID,
-		StorageClass:  storageClass,
+		OrgID:            orgID,
+		BlockID:          blockID,
+		StorageClass:     storageClass,
 		RepresentationID: strings.TrimSpace(representationID),
-		ExternalSHA1:  strings.TrimSpace(externalSHA1),
-		RecoveryPhase: S3OrphanPhasePendingS3,
-		FirstSeenAt:   now.UTC(),
-		LastAttemptAt: now,
-		RetryCount:    initialRetryCount,
-		LastError:     errMsg,
+		ExternalSHA1:     strings.TrimSpace(externalSHA1),
+		RecoveryPhase:    S3OrphanPhasePendingS3,
+		FirstSeenAt:      now.UTC(),
+		LastAttemptAt:    now,
+		RetryCount:       initialRetryCount,
+		LastError:        errMsg,
 	}
 	m.s3Orphans[key] = orphan
 	m.upsertS3OrphanProjection(orphan)

@@ -17,9 +17,9 @@ import (
 )
 
 type publishRepairIntegrationFileState struct {
-	orgID           string
-	headCommitID    string
-	fsID            string
+	orgID            string
+	headCommitID     string
+	fsID             string
 	internalBlockIDs []string
 }
 

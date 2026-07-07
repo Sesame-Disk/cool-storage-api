@@ -289,9 +289,9 @@ type CommitInfo struct {
 
 // BlockInfo holds data about a block needed by the scanner.
 type BlockInfo struct {
-	BlockID      string
-	StorageClass string
-	CreatedAt    *time.Time
+	BlockID          string
+	StorageClass     string
+	CreatedAt        *time.Time
 	RepresentationID string
 	// Sha1 is the block's external Seafile SHA-1 (blocks.sha1), captured here so
 	// GC mapping cleanup can delete the single forward block_id_mappings row
@@ -372,16 +372,16 @@ type GCDirtyOrg struct {
 // row is physically removed, so a crash between DB and S3 phases remains
 // recoverable after restart.
 type S3OrphanInfo struct {
-	OrgID         uuid.UUID
-	BlockID       string
-	StorageClass  string
+	OrgID            uuid.UUID
+	BlockID          string
+	StorageClass     string
 	RepresentationID string
-	ExternalSHA1  string
-	RecoveryPhase string
-	FirstSeenAt   time.Time
-	LastAttemptAt time.Time
-	RetryCount    int
-	LastError     string
+	ExternalSHA1     string
+	RecoveryPhase    string
+	FirstSeenAt      time.Time
+	LastAttemptAt    time.Time
+	RetryCount       int
+	LastError        string
 }
 
 const (

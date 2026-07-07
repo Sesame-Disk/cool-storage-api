@@ -29,7 +29,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | API Token Library Access | ✅ Complete | 37 integration tests, full RW/RO enforcement |
 | Move/Copy Dialog Tree | ✅ Fixed | `with_parents` param missing in ListDirectoryV21 |
 | **Cross-Representation Copy/Move** | 🟡 Guarded limitation | Cross-library batch copy/move is now rejected when source and destination libraries use different block representations. Safe same-representation paths continue to work; a re-materializing transform path is still missing. See ISSUE-BLOCK-REPRESENTATION-COPY-01 and `docs/BLOCK-REPRESENTATION-DESIGN.md`. |
-| **Cross-Library Block Read Authorization (hash-only)** | 🟡 Hardening backlog | Blocks are content-addressed and deduplicated per **org**, not per library. The hash-only surfaces (bare-SHA `seafhttp` block GET, `CheckBlocks`, SHA-1→SHA-256 mapping resolution) authorize by org + a repo-scoped token + knowledge of the content hash, not by real library membership. Low severity (requires the exact SHA-256/SHA-1, and claiming an org block you did not upload is blocked by session materialization), but library-scoped read authorization is future hardening. See ISSUE-BLOCK-CROSS-LIBRARY-READ-01 below. |
+| **Cross-Library Block Read Authorization (hash-only)** | 🟡 Hardening backlog | Blocks are content-addressed and deduplicated per **org**, not per library. The hash-only surfaces (bare-SHA `seafhttp` block GET, `CheckBlocks`, SHA-1→SHA-256 mapping resolution) authorize by org + a repo-scoped token + knowledge of the content hash, not by real library membership. Medium severity — a broken object-level authorization (BOLA) gated only by knowing the exact SHA-256/SHA-1; the session materialization gate blocks *claiming* but not the direct block read or the `CheckBlocks` oracle. Library-scoped read authorization is the fix. See ISSUE-BLOCK-CROSS-LIBRARY-READ-01 below. |
 | GC TTL Enforcement | Partial | `version_ttl_days` and `auto_delete_days` have storage, API, and scanner wiring, but their current behavior does not fully match the library settings UI. See ISSUE-LIB-RETENTION-01. |
 | Admin Panel | ✅ Working in Docker | `/sys/` route serves sysadmin.html via nginx + Go catch-all |
 | Frontend Permission UI | 🟡 ~85% Done | API layer returns real permissions on all directory/file endpoints. **Fixed**: `"owner"` permission now mapped to `"rw"` in API responses (was breaking upload button). **Enhanced (2026-03-11)**: Granular `PermissionFlags` (8 flags) now enforced backend-side via `RequirePermFlag()`. Upload/share link uploaders updated. Remaining: some UI components that conditionally render controls based on flags. |
@@ -281,8 +281,8 @@ This is the safe PR1 boundary for representation-aware mappings.
 
 ### ISSUE-BLOCK-CROSS-LIBRARY-READ-01: Hash-Only Block Surfaces Authorize by Org, Not Library Membership
 
-**Status**: 🟡 Hardening backlog (2026-07-07)
-**Severity**: Low — requires knowing the exact content hash; org blocks a caller did not upload cannot be silently claimed (session materialization gate). Not an open data-exfiltration hole today, but a defense-in-depth gap.
+**Status**: 🟡 Hardening backlog / known authorization gap (BOLA) (2026-07-07)
+**Severity**: Medium — a broken object-level authorization, not merely defense-in-depth. Exploitability is limited by the precondition that the caller knows the exact SHA-256/SHA-1 of the target block, but knowing a hash is not authorization: common-content hashes can be predictable, shared, or leaked via metadata/logs. The session materialization gate only blocks *claiming* an org block into a new file — it does **not** gate the direct `GET /block/:block_id` read or the `CheckBlocks` existence oracle. Representation-awareness narrows the exposure (encrypted libraries use a per-library `representation_id`, so cross-library resolution across encrypted libs is blocked); the residual is same-representation plaintext libraries and the bare SHA-256 read path.
 **Affected**: `seafhttp` bare-SHA block GET, `POST /api/v2/blocks/check` (`CheckBlocks`), and SHA-1→SHA-256 mapping resolution.
 
 #### Problem
@@ -297,10 +297,14 @@ block*. Within one org, a party who already knows a block's SHA-256/SHA-1 can:
 - in principle read block bytes it can address by hash even if it only holds a token
   for a different library in the same org.
 
-Knowing the exact 256-bit content address is itself derived from possessing the
-content, and claiming an org block you did not upload into a new file is already
-blocked (the session-aware check reports S3-only blocks as `needs_upload`), so this
-is a hardening item rather than an active exploit.
+Claiming an org block you did not upload *into a new file* is already blocked (the
+session-aware check reports S3-only blocks as `needs_upload`), but that gate does not
+cover the direct `GET /block/:block_id` read path or the `CheckBlocks` existence
+oracle — those remain authorized by org + hash only. Knowing the exact 256-bit
+content address is often derived from possessing the content, which limits real-world
+exploitability, but it is a precondition, not an authorization check. Treat this as a
+genuine (if hard-to-reach) broken authorization to be closed, not a purely theoretical
+defense-in-depth nicety.
 
 #### Remaining Work (future hardening)
 

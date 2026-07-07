@@ -98,13 +98,13 @@ type SyncHandler struct {
 // NewSyncHandler creates a new sync protocol handler
 func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) *SyncHandler {
 	return &SyncHandler{
-		db:                   database,
-		storage:              s3Store,
-		blockStore:           blockStore,
-		storageManager:       storageManager,
-		config:               cfg,
-		permMiddleware:       permMiddleware,
-		finalizedBlockDeltas: newSyncFinalizedDeltaSet(),
+		db:                     database,
+		storage:                s3Store,
+		blockStore:             blockStore,
+		storageManager:         storageManager,
+		config:                 cfg,
+		permMiddleware:         permMiddleware,
+		finalizedBlockDeltas:   newSyncFinalizedDeltaSet(),
 		blockRepresentationIDs: newSyncBlockRepresentationIDCache(),
 	}
 }

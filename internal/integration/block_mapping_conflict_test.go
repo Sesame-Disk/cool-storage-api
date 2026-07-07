@@ -27,7 +27,7 @@ import (
 // the verified read-before-write guard and returned 409. Migration 009 scopes the
 // mapping by block-representation domain (plain:v1 vs library:<id>) so both coexist.
 
-func mcSHA1(b []byte) string { s := sha1.Sum(b); return hex.EncodeToString(s[:]) }
+func mcSHA1(b []byte) string   { s := sha1.Sum(b); return hex.EncodeToString(s[:]) }
 func mcSHA256(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 
 // TestBlockMappingRepresentationScoped_NoCrossDomainConflict is the DB-level

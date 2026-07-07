@@ -576,11 +576,17 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
-	if err != nil {
-		log.Printf("[ServeRawFile] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
-		return
+	// Only the legacy SHA-1 path consults block_id_mappings; on the common
+	// all-SHA-256 block list BatchResolveBlockIDs is a passthrough, so skip the
+	// per-request representation lookup and pass the non-empty plaintext default.
+	representationID := db.PlainBlockRepresentationID
+	if streaming.ContainsLegacySHA1(blockIDs) {
+		representationID, err = db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+		if err != nil {
+			log.Printf("[ServeRawFile] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+			return
+		}
 	}
 
 	// For iWork preview, we need to buffer the content (requires random access for ZIP parsing)
@@ -974,11 +980,14 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Block storage not available.")
 		return
 	}
-	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
-	if err != nil {
-		log.Printf("[DownloadHistoricFile] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
-		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Could not read the requested file revision.")
-		return
+	representationID := db.PlainBlockRepresentationID
+	if streaming.ContainsLegacySHA1(blockIDs) {
+		representationID, err = db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+		if err != nil {
+			log.Printf("[DownloadHistoricFile] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
+			redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Could not read the requested file revision.")
+			return
+		}
 	}
 
 	// Resolve block IDs before writing headers so a resolution failure fails

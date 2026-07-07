@@ -15,15 +15,15 @@ var ErrLibraryDeleted = errors.New("library deleted")
 // LibraryState captures the canonical fields that write/read fences need in
 // order to treat soft-deleted libraries as unavailable.
 type LibraryState struct {
-	OrgID        string
-	LibraryID    string
-	OwnerID      string
-	Name         string
-	Encrypted    bool
+	OrgID                 string
+	LibraryID             string
+	OwnerID               string
+	Name                  string
+	Encrypted             bool
 	BlockRepresentationID string
-	HeadCommitID string
-	StorageClass string
-	DeletedAt    *time.Time
+	HeadCommitID          string
+	StorageClass          string
+	DeletedAt             *time.Time
 }
 
 func (state LibraryState) BlockRepresentationIDOrDefault() string {
