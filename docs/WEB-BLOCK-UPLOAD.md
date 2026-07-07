@@ -7,6 +7,12 @@ Gated OFF by default by a **server-side** flag (`web_uploads.enable_web_block_up
 driven from it via bootstrap. Encrypted libraries and public share/upload links
 are out of scope for phase 1.
 
+Representation note: runtime SHA-1 mapping is now representation-aware. Any future
+encrypted-library block-upload rollout must resolve and persist forward mappings in
+the destination library's `representation_id` domain (`plain:v1` or
+`library:<library_id>`), never as an org-wide alias. See
+[BLOCK-REPRESENTATION-DESIGN.md](./BLOCK-REPRESENTATION-DESIGN.md).
+
 ### Feature flag (server-authoritative)
 
 - Config: `web_uploads.enable_web_block_upload` (default `false`) in all

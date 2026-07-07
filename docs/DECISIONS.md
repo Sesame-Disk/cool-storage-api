@@ -245,9 +245,10 @@ S3 Storage: block stored with SHA-256 key (64 hex chars)
 ```sql
 CREATE TABLE block_id_mappings (
     org_id UUID,
+    representation_id TEXT,
     external_id TEXT,  -- SHA-1 (what clients use)
     internal_id TEXT,  -- SHA-256 (how we store)
-    PRIMARY KEY (org_id, external_id)
+    PRIMARY KEY ((org_id, representation_id, external_id))
 );
 ```
 
