@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -79,6 +80,29 @@ func TestResolveBlockIDsConcurrent_NotFoundLeavesOriginalID(t *testing.T) {
 	want := []string{sha256Hex(101), sha1Hex(2)}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("resolveBlockIDsConcurrent() = %v, want %v", got, want)
+	}
+}
+
+// TestResolveBlockIDsConcurrent_GarbageInternalIDLeavesOriginal verifies the
+// deliberate GC leniency: a mapping whose internal_id is not a hex SHA-256 is
+// SKIPPED (original SHA-1 kept), not fatal — GC must not wedge on a garbage/stale
+// mapping row, and must not poison the reference key with a non-canonical id.
+func TestResolveBlockIDsConcurrent_GarbageInternalIDLeavesOriginal(t *testing.T) {
+	blockIDs := []string{sha1Hex(1), sha1Hex(2)}
+	lookup := func(idx int) (string, error) {
+		if idx == 0 {
+			return sha256Hex(101), nil
+		}
+		return strings.Repeat("g", 64), nil // right length, non-hex garbage
+	}
+
+	got, err := resolveBlockIDsConcurrent(uuid.Nil, blockIDs, 8, lookup)
+	if err != nil {
+		t.Fatalf("resolveBlockIDsConcurrent() error = %v, want nil (garbage internal_id is not fatal)", err)
+	}
+	want := []string{sha256Hex(101), sha1Hex(2)}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolveBlockIDsConcurrent() = %v, want %v (garbage kept as original SHA-1)", got, want)
 	}
 }
 

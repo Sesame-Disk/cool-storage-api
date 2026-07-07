@@ -238,19 +238,53 @@ func TestResolveBlockIDs_CanonicalizesBeforeAndAfterLookup(t *testing.T) {
 }
 
 // TestResolveBlockIDs_RejectsNonSHAInternalID verifies that a mapping row whose
-// internal_id does not canonicalize to a 64-char SHA-256 aborts resolution rather
-// than streaming a bogus block id to storage.
+// internal_id is not a hex 64-char SHA-256 aborts resolution rather than streaming
+// a bogus block id to storage — both a short non-hex value and a 64-char non-hex
+// value (right length, wrong content) must fail.
 func TestResolveBlockIDs_RejectsNonSHAInternalID(t *testing.T) {
-	blockIDs := []string{sha1Hex(1)}
-	lookup := func(idx int) (string, error) {
-		return "not-a-sha256", nil
+	for name, internal := range map[string]string{
+		"short-non-hex":    "not-a-sha256",
+		"64-char-non-hex":  strings.Repeat("g", 64), // g is not a hex digit
+		"64-char-with-dot": strings.Repeat("a", 63) + ".",
+	} {
+		t.Run(name, func(t *testing.T) {
+			lookup := func(idx int) (string, error) { return internal, nil }
+			got, err := resolveBlockIDs("org", []string{sha1Hex(1)}, 8, lookup)
+			if err == nil {
+				t.Fatalf("resolveBlockIDs() error = nil, want non-nil on internal_id %q", internal)
+			}
+			if got != nil {
+				t.Errorf("resolveBlockIDs() = %v, want nil slice on error", got)
+			}
+		})
 	}
-	got, err := resolveBlockIDs("org", blockIDs, 8, lookup)
-	if err == nil {
-		t.Fatal("resolveBlockIDs() error = nil, want non-nil on non-SHA-256 internal_id")
-	}
-	if got != nil {
-		t.Errorf("resolveBlockIDs() = %v, want nil slice on error", got)
+}
+
+// TestResolveBlockIDs_RejectsNonHexBlockIDs verifies that an input id of the right
+// LENGTH but wrong CONTENT (40 or 64 non-hex chars) is a fatal, pre-lookup error,
+// so the "valid hex SHA-1/SHA-256" contract is enforced on content, not length.
+func TestResolveBlockIDs_RejectsNonHexBlockIDs(t *testing.T) {
+	for name, id := range map[string]string{
+		"40-char-non-hex": strings.Repeat("z", 40),
+		"64-char-non-hex": strings.Repeat("z", 64),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var called atomic.Int32
+			lookup := func(idx int) (string, error) {
+				called.Add(1)
+				return sha256Hex(1), nil
+			}
+			got, err := resolveBlockIDs("org", []string{id}, 8, lookup)
+			if err == nil {
+				t.Fatalf("resolveBlockIDs() error = nil, want non-nil on non-hex id %q", id)
+			}
+			if got != nil {
+				t.Errorf("resolveBlockIDs() = %v, want nil slice on error", got)
+			}
+			if n := called.Load(); n != 0 {
+				t.Errorf("lookup called %d times, want 0 (non-hex id rejected before lookup)", n)
+			}
+		})
 	}
 }
 

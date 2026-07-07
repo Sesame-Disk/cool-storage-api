@@ -1716,14 +1716,21 @@ func (s *CassandraStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockIDs []
 func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) ([]string, error) {
 	resolved := make([]string, len(blockIDs))
 
-	// Canonicalize (trim + lowercase) before classifying, mirroring the streaming
-	// resolver and the Cassandra mapping query, so a padded/uppercase id is still
-	// recognized as a SHA-1 and a passthrough SHA-256 lands canonicalized.
+	// Canonicalize (trim + lowercase) before classifying by hex content, mirroring
+	// the streaming resolver and the Cassandra mapping query, so a padded/uppercase
+	// id is still recognized as a SHA-1 and a passthrough SHA-256 lands canonicalized.
+	//
+	// Unlike streaming this resolver is deliberately LENIENT: a non-hex or
+	// wrong-length id is not a fatal error and a missing/garbage mapping keeps the
+	// original id. GC mapping cleanup legitimately runs after the forward mapping
+	// was already deleted, so failing closed here would wedge fs_object GC on a
+	// row that can never resolve. Worst case is a skipped reference removal (a
+	// leak + a harmless GC candidate), never a live-data delete.
 	var toResolve []int
 	for i, blockID := range blockIDs {
 		normalized := db.NormalizeBlockID(blockID)
 		resolved[i] = normalized
-		if len(normalized) == 40 {
+		if db.IsSHA1BlockID(normalized) {
 			toResolve = append(toResolve, i)
 		}
 	}
@@ -1765,7 +1772,9 @@ func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrenc
 			}
 			continue
 		}
-		if internalID := db.NormalizeBlockID(result.internalID); internalID != "" {
+		// Only accept a hex 64-char SHA-256; a garbage internal_id is left as the
+		// original SHA-1 (lenient, see above) instead of poisoning the reference key.
+		if internalID := db.NormalizeBlockID(result.internalID); db.IsSHA256BlockID(internalID) {
 			resolved[result.idx] = internalID
 		}
 	}

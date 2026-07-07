@@ -52,7 +52,7 @@ const mappingResolveConcurrency = 32
 // representation is never consulted.
 func ContainsLegacySHA1(blockIDs []string) bool {
 	for _, id := range blockIDs {
-		if len(db.NormalizeBlockID(id)) == 40 {
+		if db.IsSHA1BlockID(db.NormalizeBlockID(id)) {
 			return true
 		}
 	}
@@ -86,13 +86,14 @@ func BatchResolveBlockIDs(database *db.DB, orgID, representationID string, block
 // resolveBlockIDs maps every 40-char SHA-1 entry of blockIDs to its internal
 // SHA-256 by calling lookup with bounded concurrency, preserving slice order.
 // Every ID is canonicalized with db.NormalizeBlockID (trim + lowercase) BEFORE
-// it is classified, so a padded or uppercase SHA-1 is still recognized and a
-// 64-char SHA-256 passes through canonicalized instead of raw. lookup must
-// return gocql.ErrNotFound when no mapping row exists.
+// it is classified by hex content (db.IsSHA1BlockID / db.IsSHA256BlockID), so a
+// padded or uppercase SHA-1 is still recognized and a 64-char SHA-256 passes
+// through canonicalized instead of raw. lookup must return gocql.ErrNotFound when
+// no mapping row exists.
 //
-// Resolution is strict: an ID that is neither a 40-char SHA-1 nor a 64-char
-// SHA-256, a lookup error, a missing mapping row, or an internal_id that does
-// not canonicalize to a 64-char SHA-256 all mark the block as unresolved. If any
+// Resolution is strict: an ID that is neither a hex 40-char SHA-1 nor a hex
+// 64-char SHA-256, a lookup error, a missing mapping row, or an internal_id that
+// is not a hex 64-char SHA-256 all mark the block as unresolved. If any
 // block is unresolved the function returns (nil, err) with every cause joined, so
 // callers never act on a partially-resolved slice. orgID is used only for
 // error/log context. The DB-backed lookup is injected so the
@@ -107,14 +108,14 @@ func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup
 	var invalidErr error
 	for i, bid := range blockIDs {
 		normalized := db.NormalizeBlockID(bid)
-		switch len(normalized) {
-		case 40:
+		switch {
+		case db.IsSHA1BlockID(normalized):
 			resolved[i] = normalized
 			toResolve = append(toResolve, i)
-		case 64:
+		case db.IsSHA256BlockID(normalized):
 			resolved[i] = normalized
 		default:
-			invalidErr = errors.Join(invalidErr, fmt.Errorf("block %q is not a valid SHA-1 or SHA-256 block id", bid))
+			invalidErr = errors.Join(invalidErr, fmt.Errorf("block %q is not a valid hex SHA-1 or SHA-256 block id", bid))
 		}
 	}
 	if invalidErr != nil {
@@ -165,12 +166,12 @@ func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup
 			continue
 		}
 		internalID := db.NormalizeBlockID(result.internalID)
-		if len(internalID) != 64 {
+		if !db.IsSHA256BlockID(internalID) {
 			missingMappings++
 			if internalID == "" {
 				resolveErr = errors.Join(resolveErr, fmt.Errorf("block %s mapping row has empty internal_id", blockIDs[result.idx]))
 			} else {
-				resolveErr = errors.Join(resolveErr, fmt.Errorf("block %s mapping resolved to non-SHA-256 internal id %q", blockIDs[result.idx], result.internalID))
+				resolveErr = errors.Join(resolveErr, fmt.Errorf("block %s mapping resolved to non-hex/non-SHA-256 internal id %q", blockIDs[result.idx], result.internalID))
 			}
 			continue
 		}

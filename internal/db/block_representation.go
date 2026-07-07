@@ -19,6 +19,14 @@ func NormalizeBlockID(id string) string {
 	return strings.ToLower(strings.TrimSpace(id))
 }
 
+// IsSHA1BlockID reports whether id is a 40-char hex external SHA-1 block id, and
+// IsSHA256BlockID whether it is a 64-char hex internal content address. Both
+// validate hex CONTENT, not just length, so a 40/64-char non-hex string is
+// rejected. Callers should normalize with NormalizeBlockID first.
+func IsSHA1BlockID(id string) bool { return isHexN(id, 40) }
+
+func IsSHA256BlockID(id string) bool { return isHexN(id, 64) }
+
 func EncryptedLibraryBlockRepresentationID(libraryID string) string {
 	libraryID = strings.TrimSpace(libraryID)
 	if libraryID == "" {
