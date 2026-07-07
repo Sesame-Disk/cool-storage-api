@@ -78,7 +78,6 @@ type GCStore interface {
 	// FinalizeBlockDelete removes the block row only when the same claimID still
 	// owns the row.
 	FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error
-	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 	DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error

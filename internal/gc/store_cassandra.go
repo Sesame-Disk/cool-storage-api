@@ -1848,14 +1848,6 @@ func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID s
 	return nil
 }
 
-// DeleteBlockMapping removes the forward block_id_mappings row by its full
-// ((org_id), external_id) partition key. The reverse projection was dropped in
-// migration 006, so this is a single-partition DELETE with no read-before-delete
-// and no reverse cleanup.
-func (s *CassandraStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error {
-	return s.DeleteBlockMappingExact(orgID, db.PlainBlockRepresentationID, externalID)
-}
-
 func (s *CassandraStore) DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error {
 	if err := s.db.Session().Query(`
 		DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?

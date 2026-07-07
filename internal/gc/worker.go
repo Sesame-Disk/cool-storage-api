@@ -944,12 +944,7 @@ func (w *Worker) processBlockMapping(ctx context.Context, item QueueItem) error 
 		log.Printf("[GC Worker] DRY RUN: Would delete block mapping %s", item.ItemID)
 		return nil
 	}
-
-	if err := w.store.DeleteBlockMapping(item.OrgID, item.ItemID); err != nil {
-		return fmt.Errorf("failed to delete block mapping: %w", err)
-	}
-
-	return nil
+	return fmt.Errorf("block_mapping queue items are unsupported without representation_id")
 }
 
 func (w *Worker) processShareLink(ctx context.Context, item QueueItem) error {

@@ -43,9 +43,8 @@ const (
 )
 
 // ErrBlockIDMappingConflict indicates an external SHA-1 already maps to a
-// DIFFERENT internal SHA-256. The web block-upload flow refuses to overwrite it
-// (a crafted SHA-1 collision could otherwise corrupt downloads of already
-// committed files); see WriteVerifiedWebBlockMapping.
+// DIFFERENT internal SHA-256 inside the same representation domain. Writers fail
+// closed instead of overwriting such a row.
 var ErrBlockIDMappingConflict = errors.New("block id mapping conflict")
 
 type BlockReuseDecision int
@@ -150,11 +149,6 @@ var readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (st
 	return representationID, sha1, true, nil
 }
 
-var readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
-	_, sha1, found, err := readBlockIdentityForRepairFn(database, orgID, blockID)
-	return sha1, found, err
-}
-
 // backfillBlockSHA1Fn fills in a missing sha1 with a compare-and-set against the
 // sha1 value the caller just observed. That keeps the repair fail-closed in both
 // races we care about:
@@ -234,7 +228,8 @@ func NormalizeBlockIDs(blockIDs []string) []string {
 
 // WriteBlockIDMapping writes the forward external SHA-1 -> internal SHA-256
 // mapping used to resolve a bare-SHA-1 compatibility read inside one block
-// representation domain.
+// representation domain. The write is idempotent for the same internal ID and
+// fails closed on a conflicting remap.
 func (db *DB) WriteBlockIDMapping(orgID, representationID, externalID, internalID string, createdAt time.Time) error {
 	if db == nil {
 		return nil
@@ -242,13 +237,13 @@ func (db *DB) WriteBlockIDMapping(orgID, representationID, externalID, internalI
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		return err
 	}
+	externalID = strings.TrimSpace(externalID)
+	internalID = strings.TrimSpace(internalID)
 	ts := createdAt.UTC()
 	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
-	return db.Session().Query(`
-		INSERT INTO block_id_mappings (org_id, representation_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?, ?)
-	`, orgID, representationID, externalID, internalID, ts).Exec()
+	return db.writeCheckedBlockIDMapping(orgID, representationID, externalID, internalID, ts)
 }
 
 // GetBlockIDMapping resolves one external SHA-1 block ID to its internal SHA-256
@@ -282,20 +277,15 @@ func (db *DB) GetBlockIDMapping(orgID, representationID, externalID string) (int
 // computed server-side from the block's real bytes in UploadBlock, so the mapping
 // is verified content, never client-asserted.
 //
-// Unlike WriteBlockIDMapping (the shared legacy/seafhttp hot path, which does a
-// plain idempotent INSERT and is intentionally left untouched), this guards
-// against silently remapping an existing external SHA-1 to a DIFFERENT internal
-// SHA-256 — which a crafted SHA-1 collision could exploit to corrupt downloads of
-// already-committed files. The guard is a plain read-before-write, NOT a
-// Cassandra LWT/Paxos: per-block Paxos on the upload hot path causes latency,
-// contention, and timeouts in multi-DC deployments, and the commit-side
-// forward-mapping check (file-from-blocks) remains the integrity authority
-// regardless. The only residual gap versus LWT is two *colliding* blocks (same
-// SHA-1, different content) racing the tiny read->write window — astronomically
-// unlikely.
-//
-// Only the forward row is written and it is scoped to the caller's block
-// representation domain.
+// The actual write contract is shared with WriteBlockIDMapping: create when
+// absent, succeed when the same row already exists, and fail closed when the
+// same (org, representation, external) key points at a different internal ID.
+// The guard is a plain read-before-write, NOT a Cassandra LWT/Paxos: per-block
+// Paxos on the upload hot path causes latency, contention, and timeouts in
+// multi-DC deployments, and the commit-side forward-mapping check remains the
+// integrity authority regardless. The only residual gap versus LWT is two
+// *colliding* blocks (same SHA-1, different content) racing the tiny read->write
+// window — astronomically unlikely.
 func (db *DB) WriteVerifiedWebBlockMapping(orgID, representationID, externalID, internalID string, createdAt time.Time) error {
 	if db == nil {
 		return nil
@@ -309,6 +299,10 @@ func (db *DB) WriteVerifiedWebBlockMapping(orgID, representationID, externalID, 
 	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
+	return db.writeCheckedBlockIDMapping(orgID, representationID, externalID, internalID, ts)
+}
+
+func (db *DB) writeCheckedBlockIDMapping(orgID, representationID, externalID, internalID string, createdAt time.Time) error {
 	existing, found, err := db.GetBlockIDMapping(orgID, representationID, externalID)
 	if err != nil {
 		return fmt.Errorf("read existing block mapping %s: %w", externalID, err)
@@ -321,7 +315,7 @@ func (db *DB) WriteVerifiedWebBlockMapping(orgID, representationID, externalID, 
 	}
 	return db.Session().Query(`
 		INSERT INTO block_id_mappings (org_id, representation_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?, ?)
-	`, orgID, representationID, externalID, internalID, ts).Exec()
+	`, orgID, representationID, externalID, internalID, createdAt).Exec()
 }
 
 // AddPublishAttemptReferences stages temporary pub:<attempt> references for an
@@ -480,23 +474,7 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 }
 
 func (db *DB) ensureBlockIdentity(orgID, blockID, representationID, sha1 string) error {
-	var currentRepresentationID string
-	var currentSHA1 string
-	var found bool
-	var err error
-	if representationID == PlainBlockRepresentationID && (db == nil || db.session == nil) {
-		currentSHA1, found, err = readBlockSHA1ForRepairFn(db, orgID, blockID)
-		if err == nil && found {
-			currentRepresentationID = representationID
-		}
-	} else if representationID == PlainBlockRepresentationID {
-		currentSHA1, found, err = readBlockSHA1ForRepairFn(db, orgID, blockID)
-		if err == nil && found {
-			currentRepresentationID = representationID
-		}
-	} else {
-		currentRepresentationID, currentSHA1, found, err = readBlockIdentityForRepairFn(db, orgID, blockID)
-	}
+	currentRepresentationID, currentSHA1, found, err := readBlockIdentityForRepairFn(db, orgID, blockID)
 	if err != nil {
 		return fmt.Errorf("read block identity for %s: %w", blockID, err)
 	}

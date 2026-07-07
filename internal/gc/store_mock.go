@@ -1936,10 +1936,6 @@ func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string
 	return nil
 }
 
-func (m *MockStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error {
-	return m.DeleteBlockMappingExact(orgID, db.PlainBlockRepresentationID, externalID)
-}
-
 func (m *MockStore) DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

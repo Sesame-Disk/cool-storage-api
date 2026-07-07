@@ -366,25 +366,27 @@ mapping set.
 ## 28. Representation-ID Hotpath Reuse Outside Sync (DEFERRED)
 
 ### Current State
-PR1 now caches `(org_id, repo_id) -> representation_id` inside `SyncHandler`, so
-legacy sync `GetBlock`, `CheckBlocks`, and sync commit block-resolution no longer
-re-read the library row on every hot request after the first miss in one process.
+PR1 now caches `(org_id, repo_id) -> representation_id` inside both
+`SyncHandler` and `SeafHTTPHandler`, so legacy sync/seafhttp SHA-1 resolution no
+longer re-reads the library row on every hot request after the first miss in one
+process.
 
 Other read paths still resolve the representation from Cassandra directly per
-request or per operation, including SeafHTTP file/block reads and v2 file/share
-download flows.
+request or per operation, mainly in v2 file/share download flows and other
+helpers that already loaded the library row but do not yet thread the value
+through.
 
 ### Why It Was Deferred
-PR1's correctness goal was to split the mapping namespace safely. The sync cache
-was a narrow, low-risk optimization because `block_representation_id` is
-effectively immutable for a library in the current model. Generalizing reuse
-across other handlers is valid follow-up work, but it should be done deliberately
-so cache scope and invalidation remain explicit.
+PR1's correctness goal was to split the mapping namespace safely. The sync and
+SeafHTTP caches were narrow, low-risk optimizations because
+`block_representation_id` is effectively immutable for a library in the current
+model. Generalizing reuse across other handlers is valid follow-up work, but it
+should be done deliberately so cache scope and invalidation remain explicit.
 
 ### Follow-Up Plan
-1. Reuse the same cache pattern in `SeafHTTPHandler` for legacy SHA-1 block resolution.
-2. Thread known representation IDs through v2/fileview/sharelink flows when the library row was already read earlier in the request.
-3. Add targeted benchmarks or request-count tracing around legacy SHA-1 download paths before and after the change.
+1. Thread known representation IDs through v2/fileview/sharelink flows when the library row was already read earlier in the request.
+2. Add targeted benchmarks or request-count tracing around legacy SHA-1 download paths before and after the change.
+3. Only widen caching if the remaining over-fetch survives those measurements.
 
 ---
 
@@ -429,7 +431,28 @@ larger hotpath optimization, not part of the namespace-safety change.
 1. Audit whether `storage_class` can be piggybacked on an existing metadata read or safely memoized for block GET traffic.
 2. Evaluate whether legacy SHA-1 GET traffic warrants a small resolved-block metadata cache keyed by `(org_id, representation_id, external_id)`.
 3. Keep the optimization secondary to correctness: no fallback that can bypass representation scoping or canonical block metadata.
-  Only `EnsureReusableBlockPresent` (P-2) honors `storage_key`. Harmless today
+
+---
+
+## 31. Legacy GC `block_mapping` Queue Items (DEFERRED CLEANUP)
+
+### Current State
+Exact forward-mapping cleanup now requires `(org_id, representation_id,
+external_sha1)` from canonical block metadata. The worker therefore rejects the
+legacy `block_mapping` queue item shape fail-closed because it carries only
+`external_id` and cannot safely infer the representation domain.
+
+### Why It Was Deferred
+The current production cleanup path no longer needs this queue item type; exact
+mapping deletion happens during canonical block GC. Removing the enum and every
+fixture/reference is a follow-up cleanup task, not a correctness blocker.
+
+### Follow-Up Plan
+1. Confirm no live enqueue path still emits `ItemBlockMapping`.
+2. Remove the deprecated queue item type and any dead deserialization/test fixtures.
+3. Add a one-shot audit or migration note for operators in case old queued rows exist in pre-PR1 environments.
+
+- Only `EnsureReusableBlockPresent` (P-2) honors `storage_key`. Harmless today
   because `storage_key` is either empty (4 of 5 upload paths write `""`) or equal to
   the hash-derived key (OnlyOffice), so the hash-derived key is always correct. The
   risk surfaces only if a future write persists a `storage_key` that differs from

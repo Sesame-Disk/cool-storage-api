@@ -13,11 +13,12 @@ exactly one physical byte sequence inside that org.
 That assumption breaks once encrypted libraries are considered as a first-class
 storage representation:
 
-- plaintext libraries expose the SHA-1 of plaintext bytes;
-- encrypted libraries expose the SHA-1 of encrypted block bytes;
-- the encrypted bytes depend on the library-specific encryption material, so the
-  same logical plaintext can legitimately produce different SHA-256 block objects
-  in different libraries.
+- compatibility surfaces still exchange Seafile-style SHA-1 IDs for the logical
+  plaintext block content;
+- encrypted libraries can materialize different encrypted physical block bytes for
+  that same plaintext because the library-specific encryption material differs;
+- the same external SHA-1 can therefore legitimately resolve to different
+  physical SHA-256 block objects in different representation domains.
 
 An org-only mapping can therefore resolve a SHA-1 from one representation domain
 to the wrong SHA-256 from another domain.
@@ -29,8 +30,8 @@ PR1 moves the runtime contract to two distinct identities:
 1. Physical block identity: `(org_id, internal_sha256)`
 2. External mapping identity: `(org_id, representation_id, external_sha1)`
 
-`representation_id` identifies the byte-domain in which the external SHA-1 was
-computed. The current model is:
+`representation_id` identifies the storage/materialization domain in which that
+external SHA-1 must resolve. The current model is:
 
 - `plain:v1` for plaintext libraries
 - `library:<library_id>` for encrypted libraries
@@ -40,8 +41,8 @@ inside an org, but only across different representation domains.
 
 ## Schema and persistence
 
-PR1 uses an additive migration because `001_initial_schema.cql` is already tracked
-by checksum in deployed environments.
+PR1 adds a new migration because `001_initial_schema.cql` is already tracked by
+checksum in deployed environments.
 
 Migration `009_block_representation_mappings.cql` adds:
 
@@ -52,8 +53,12 @@ Migration `009_block_representation_mappings.cql` adds:
 - `gc_s3_orphans_by_day.representation_id`
 - `block_id_mappings ((org_id, representation_id, external_id), internal_id)`
 
-New library creation paths now persist `block_representation_id` explicitly. Older
-rows still fall back at runtime to the derived default for their library shape.
+Under the clean-cut rollout accepted for this branch, migration `009` also drops
+the legacy org-scoped `block_id_mappings` contents and recreates the table with
+the representation-aware primary key. New library creation paths now persist
+`block_representation_id` explicitly. Runtime fallback remains only for missing
+representation metadata on surviving library/block rows; it does not preserve the
+old org-wide forward-mapping namespace.
 
 ## PR1 runtime scope
 
@@ -77,9 +82,10 @@ content between libraries with different representation domains would require
 re-materializing blocks in the destination domain, not reusing the source
 `fs_object` block list.
 
-PR1 also does not bulk-backfill legacy rows. Runtime fallback keeps older data
-readable while later work can backfill `block_representation_id` and any missing
-`blocks.representation_id` deterministically.
+PR1 also does not provide a mixed-mode compatibility layer for the dropped
+org-wide mapping table. This branch assumes a clean-cut rollout before production
+uploads. Separate follow-up work can still backfill `block_representation_id` and
+any missing `blocks.representation_id` deterministically on imported/legacy rows.
 
 ## Operational rules
 
@@ -87,6 +93,8 @@ readable while later work can backfill `block_representation_id` and any missing
   `representation_id`.
 - Treat `blocks.representation_id` as the exact forward-mapping cleanup domain for
   GC; do not infer it from the current destination library at delete time.
+- Do not delete forward mappings from GC without an explicit `representation_id`;
+  exact cleanup must come from canonical block metadata, not a guessed default.
 - Add future schema changes as new migrations; do not rewrite migration `001`.
 
 ## Follow-up work
@@ -98,4 +106,4 @@ readable while later work can backfill `block_representation_id` and any missing
 - Extend any future encrypted web-upload flow to resolve/write mappings through the
   same `representation_id` contract.
 - Reuse or cache `representation_id` on the remaining legacy SHA-1 read hotpaths
-  (sync block GET is cached in-process now; SeafHTTP/v2 follow-up remains open).
+  beyond sync and SeafHTTP, especially v2 file/share download flows.

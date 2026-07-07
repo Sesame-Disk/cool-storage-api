@@ -1249,6 +1249,7 @@ type SeafHTTPHandler struct {
 	tokenStore     TokenStore
 	config         *config.Config
 	permMiddleware *middleware.PermissionMiddleware
+	blockRepresentationIDs *syncBlockRepresentationIDCache
 	zipMaxEntries  int
 	zipMaxDepth    int
 	zipMaxBytes    int64
@@ -1319,10 +1320,30 @@ func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manage
 		tokenStore:     tokenStore,
 		config:         cfg,
 		permMiddleware: permMiddleware,
+		blockRepresentationIDs: newSyncBlockRepresentationIDCache(),
 		zipMaxEntries:  defaultZipMaxEntries,
 		zipMaxDepth:    defaultZipMaxDepth,
 		zipMaxBytes:    defaultZipMaxBytes,
 	}
+}
+
+func (h *SeafHTTPHandler) resolveBlockRepresentationID(orgID, repoID string) (string, error) {
+	if h == nil || h.db == nil {
+		return db.PlainBlockRepresentationID, nil
+	}
+	if h.blockRepresentationIDs != nil {
+		if representationID, ok := h.blockRepresentationIDs.get(orgID, repoID); ok {
+			return representationID, nil
+		}
+	}
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+	if err != nil {
+		return "", err
+	}
+	if h.blockRepresentationIDs != nil {
+		h.blockRepresentationIDs.put(orgID, repoID, representationID)
+	}
+	return representationID, nil
 }
 
 func (h *SeafHTTPHandler) SetZipLimits(maxEntries, maxDepth int, maxBytes int64) {
@@ -3507,7 +3528,7 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string,
 	if len(blockID) != 40 {
 		return blockID, nil
 	}
-	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+	representationID, err := h.resolveBlockRepresentationID(orgID, repoID)
 	if err != nil {
 		return "", err
 	}
@@ -3620,7 +3641,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	}
 
 	log.Printf("[streamFileFromBlocks] Streaming %d blocks, size=%d, encrypted=%v", len(blockIDs), fileSize, fileKey != nil)
-	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), token.OrgID, token.RepoID)
+	representationID, err := h.resolveBlockRepresentationID(token.OrgID, token.RepoID)
 	if err != nil {
 		return fmt.Errorf("resolve block representation: %w", err)
 	}
@@ -4032,7 +4053,7 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 			}
 		}
 
-		representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+		representationID, err := h.resolveBlockRepresentationID(orgID, repoID)
 		if err != nil {
 			return nil, fmt.Errorf("resolve block representation for %s: %w", entryPath, err)
 		}

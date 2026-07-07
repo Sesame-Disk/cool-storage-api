@@ -1357,13 +1357,14 @@ func TestWorker_ProcessBlockMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessOnce failed: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("expected 1 processed, got %d", n)
+	if n != 0 {
+		t.Errorf("expected 0 processed, got %d", n)
 	}
 
-	// Forward mapping should be deleted (by its external_id partition key)
-	if store.ForwardBlockMappingExists(orgID, "ext-sha1") {
-		t.Error("expected forward mapping ext-sha1 deleted")
+	// Legacy block_mapping items no longer carry representation_id, so the worker
+	// must fail closed instead of guessing the deletion domain.
+	if !store.ForwardBlockMappingExists(orgID, "ext-sha1") {
+		t.Error("expected forward mapping ext-sha1 left untouched")
 	}
 }
 

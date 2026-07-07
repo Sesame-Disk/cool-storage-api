@@ -14,6 +14,9 @@ const (
 	ItemBlock          ItemType = "block"
 	ItemCommit         ItemType = "commit"
 	ItemFSObject       ItemType = "fs_object"
+	// ItemBlockMapping is a deprecated queue item shape kept only so historical
+	// tests/fixtures can still deserialize it. The worker now fails closed on it
+	// because exact mapping cleanup requires representation_id.
 	ItemBlockMapping   ItemType = "block_mapping"
 	ItemShareLink      ItemType = "share_link"
 	ItemUserCascade    ItemType = "user_cascade"
