@@ -39,6 +39,8 @@ import (
 	"testing"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
@@ -226,7 +228,7 @@ func uploadedFileBlockReferrers(t *testing.T, repoID, dirPath, fileName string) 
 	}
 
 	var internalBlockID string
-	if err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, blockIDs[0]).Scan(&internalBlockID); err != nil {
+	if err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`, orgID, dbpkg.PlainBlockRepresentationID, blockIDs[0]).Scan(&internalBlockID); err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			internalBlockID = blockIDs[0]
 		} else {

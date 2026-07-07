@@ -214,7 +214,7 @@ func (w *Worker) ProcessOrgOnce(ctx context.Context, orgID uuid.UUID) (int, erro
 // valued external id (block encryption is deterministic — AES-CBC with a derived
 // fixed IV — so SHA-256 -> SHA-1 is 1:1). The delete is a single-partition write
 // by (org_id, external_id): no ALLOW FILTERING, no clustering/tombstone scan.
-func (w *Worker) cleanupBlockMapping(orgID uuid.UUID, internalBlockID, externalSHA1 string) error {
+func (w *Worker) cleanupBlockMapping(orgID uuid.UUID, internalBlockID, representationID, externalSHA1 string) error {
 	externalSHA1 = strings.TrimSpace(externalSHA1)
 	if externalSHA1 == "" {
 		// No server-derived SHA-1 to resolve the forward row. Without the reverse
@@ -224,7 +224,12 @@ func (w *Worker) cleanupBlockMapping(orgID uuid.UUID, internalBlockID, externalS
 		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_sha1_missing").Inc()
 		return nil
 	}
-	if err := w.store.DeleteBlockMapping(orgID, externalSHA1); err != nil {
+	representationID = strings.TrimSpace(representationID)
+	if representationID == "" {
+		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_representation_missing").Inc()
+		return nil
+	}
+	if err := w.store.DeleteBlockMappingExact(orgID, representationID, externalSHA1); err != nil {
 		return fmt.Errorf("failed to delete forward block mapping %s for %s: %w", externalSHA1, internalBlockID, err)
 	}
 	return nil
@@ -411,7 +416,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// Canonical blocks row is already gone, so blocks.sha1 is unavailable; the
 		// forward mapping (if any) can no longer be resolved without the dropped
 		// reverse index. cleanupBlockMapping records this as observable.
-		if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, ""); err != nil {
+		if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, "", ""); err != nil {
 			return err
 		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
@@ -472,7 +477,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			}
 			// Stub row carries no metadata; blockInfo.Sha1 is captured before the
 			// FinalizeBlockDelete above and is normally empty for a stub.
-			if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.Sha1); err != nil {
+			if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.RepresentationID, blockInfo.Sha1); err != nil {
 				return err
 			}
 			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
@@ -490,7 +495,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if item.StorageClass != "" && item.StorageClass != storageClass {
 		log.Printf("[GC Worker] WARNING: block %s queued with storage_class=%s but canonical storage_class=%s; using canonical value", item.ItemID, item.StorageClass, storageClass)
 	}
-	orphanFirstSeenAt, err := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, blockInfo.Sha1, w.clock().UTC())
+	orphanFirstSeenAt, err := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, blockInfo.RepresentationID, blockInfo.Sha1, w.clock().UTC())
 	if err != nil {
 		return fmt.Errorf("failed to record pending S3 delete for block %s: %w", item.ItemID, err)
 	}
@@ -521,7 +526,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_s3_orphaned").Inc()
 			// Do NOT return error — the block is recorded for recovery.
 			// Continue to post-delete cleanup so the queue item completes.
-		} else if err := w.store.MarkS3OrphanMappingCleanupPending(item.OrgID, item.ItemID, blockInfo.Sha1, w.clock()); err != nil {
+		} else if err := w.store.MarkS3OrphanMappingCleanupPending(item.OrgID, item.ItemID, blockInfo.RepresentationID, blockInfo.Sha1, w.clock()); err != nil {
 			log.Printf("[GC Worker] WARNING: S3 delete for block %s succeeded but failed to advance recovery row: %v", item.ItemID, err)
 			clearRecoveryRow = true
 		} else {
@@ -533,7 +538,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// blocks.sha1 captured in blockInfo BEFORE FinalizeBlockDelete. The recovery
 	// row now persists this SHA-1 and remains live until this cleanup finishes, so
 	// restart recovery can resume safely after either the DB delete or the S3 step.
-	if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.Sha1); err != nil {
+	if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.RepresentationID, blockInfo.Sha1); err != nil {
 		return err
 	}
 	if clearRecoveryRow {
@@ -669,7 +674,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 						log.Printf("[GC Worker] S3 orphan recovery: block %s resurrected; discarded stale mapping-cleanup row, kept its live forward mapping", orph.BlockID)
 						continue
 					}
-					if err := w.cleanupBlockMapping(orph.OrgID, orph.BlockID, orph.ExternalSHA1); err != nil {
+					if err := w.cleanupBlockMapping(orph.OrgID, orph.BlockID, orph.RepresentationID, orph.ExternalSHA1); err != nil {
 						log.Printf("[GC Worker] S3 orphan recovery: forward mapping cleanup failed for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
 						if phaseErr == nil {
 							phaseErr = fmt.Errorf("cleanup forward mapping for recovered block org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
@@ -727,14 +732,14 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					}
 					continue
 				}
-				if err := w.store.MarkS3OrphanMappingCleanupPending(orph.OrgID, orph.BlockID, orph.ExternalSHA1, w.clock()); err != nil {
+				if err := w.store.MarkS3OrphanMappingCleanupPending(orph.OrgID, orph.BlockID, orph.RepresentationID, orph.ExternalSHA1, w.clock()); err != nil {
 					log.Printf("[GC Worker] S3 orphan recovery: failed to advance %s to mapping cleanup: %v", orph.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("advance recovered block %s to mapping cleanup: %w", orph.BlockID, err)
 					}
 					continue
 				}
-				if err := w.cleanupBlockMapping(orph.OrgID, orph.BlockID, orph.ExternalSHA1); err != nil {
+				if err := w.cleanupBlockMapping(orph.OrgID, orph.BlockID, orph.RepresentationID, orph.ExternalSHA1); err != nil {
 					log.Printf("[GC Worker] S3 orphan recovery: forward mapping cleanup failed after S3 delete for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("cleanup forward mapping after S3 recovery for block %s: %w", orph.BlockID, err)
@@ -1438,7 +1443,7 @@ func fsObjectBlockDecrementTaskID(libraryID uuid.UUID, fsID string, identityAt t
 // is a no-op, so a retried fs_object GC pass is safe (no double-decrement risk —
 // the whole class of decrement idempotency bugs disappears with the counter).
 func (w *Worker) removeFSObjectBlockReferences(orgID, libraryID uuid.UUID, fsID string, blockIDs []string) ([]string, error) {
-	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, blockIDs)
+	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, libraryID, blockIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve block IDs for fs_object %s/%s: %w", libraryID, fsID, err)
 	}

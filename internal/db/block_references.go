@@ -120,29 +120,39 @@ var removePublishAttemptReferenceFn = func(database *DB, orgID, blockID, referre
 
 // upsertBlockMetadataInsertFn does the first-writer-wins INSERT IF NOT EXISTS (the
 // one LWT this path has always taken) and reports whether the row was created by
-// this call. When applied, the row now holds exactly the sha1 passed here, so the
-// caller can skip any read/repair entirely.
+// this call. When applied, the row now holds exactly the sha1 and representation
+// id passed here, so the caller can skip any read/repair entirely.
 var upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
+	return upsertBlockMetadataInsertWithRepresentationFn(database, orgID, blockID, PlainBlockRepresentationID, sha1, sizeBytes, storageClass, storageKey, now)
+}
+
+var upsertBlockMetadataInsertWithRepresentationFn = func(database *DB, orgID, blockID, representationID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 	return database.Session().Query(`
-		INSERT INTO blocks (org_id, block_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID, blockID, sha1, sizeBytes, storageClass, storageKey, now, now).MapScanCAS(map[string]interface{}{})
+		INSERT INTO blocks (org_id, block_id, representation_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID, blockID, representationID, sha1, sizeBytes, storageClass, storageKey, now, now).MapScanCAS(map[string]interface{}{})
+}
+
+var readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+	var representationID string
+	var sha1 string
+	err := database.Session().Query(`
+		SELECT representation_id, sha1
+		FROM blocks
+		WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).Scan(&representationID, &sha1)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	return representationID, sha1, true, nil
 }
 
 var readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
-	var sha1 string
-	err := database.Session().Query(`
-		SELECT sha1
-		FROM blocks
-		WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(&sha1)
-	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return "", false, nil
-		}
-		return "", false, err
-	}
-	return sha1, true, nil
+	_, sha1, found, err := readBlockIdentityForRepairFn(database, orgID, blockID)
+	return sha1, found, err
 }
 
 // backfillBlockSHA1Fn fills in a missing sha1 with a compare-and-set against the
@@ -157,6 +167,15 @@ var backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurre
 		WHERE org_id = ? AND block_id = ?
 		IF sha1 = ?
 	`, sha1, orgID, blockID, expectedCurrent).ScanCAS()
+}
+
+var backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
+	return database.Session().Query(`
+		UPDATE blocks
+		SET representation_id = ?
+		WHERE org_id = ? AND block_id = ?
+		IF representation_id = ?
+	`, representationID, orgID, blockID, expectedCurrent).ScanCAS()
 }
 
 func publishAttemptPromotionRetryBackoff(attempt int) time.Duration {
@@ -214,38 +233,41 @@ func NormalizeBlockIDs(blockIDs []string) []string {
 }
 
 // WriteBlockIDMapping writes the forward external SHA-1 -> internal SHA-256
-// mapping used to resolve a desktop bare-SHA-1 block download. The reverse
-// projection (block_id_mappings_by_internal) was dropped in migration 006: GC
-// mapping cleanup now sources the external SHA-1 from blocks.sha1, so this is a
-// single forward INSERT with no dual-write on the upload hot path.
-func (db *DB) WriteBlockIDMapping(orgID, externalID, internalID string, createdAt time.Time) error {
+// mapping used to resolve a bare-SHA-1 compatibility read inside one block
+// representation domain.
+func (db *DB) WriteBlockIDMapping(orgID, representationID, externalID, internalID string, createdAt time.Time) error {
 	if db == nil {
 		return nil
+	}
+	if err := ValidateBlockRepresentationID(representationID); err != nil {
+		return err
 	}
 	ts := createdAt.UTC()
 	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
 	return db.Session().Query(`
-		INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?)
-	`, orgID, externalID, internalID, ts).Exec()
+		INSERT INTO block_id_mappings (org_id, representation_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?, ?)
+	`, orgID, representationID, externalID, internalID, ts).Exec()
 }
 
 // GetBlockIDMapping resolves one external SHA-1 block ID to its internal SHA-256
-// storage identity using the FORWARD (client-visible, authoritative) row. ok ==
-// false means no mapping row exists. This is the only mapping read the web commit
-// (file-from-blocks) trusts; the reverse projection is never consulted there.
-func (db *DB) GetBlockIDMapping(orgID, externalID string) (internalID string, ok bool, err error) {
+// storage identity using the forward row scoped to one representation domain.
+// ok == false means no mapping row exists.
+func (db *DB) GetBlockIDMapping(orgID, representationID, externalID string) (internalID string, ok bool, err error) {
 	if db == nil {
 		return "", false, nil
+	}
+	if err := ValidateBlockRepresentationID(representationID); err != nil {
+		return "", false, err
 	}
 	externalID = strings.TrimSpace(externalID)
 	if externalID == "" {
 		return "", false, nil
 	}
 	err = db.Session().Query(`
-		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
-	`, orgID, externalID).Scan(&internalID)
+		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?
+	`, orgID, representationID, externalID).Scan(&internalID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return "", false, nil
@@ -272,11 +294,14 @@ func (db *DB) GetBlockIDMapping(orgID, externalID string) (internalID string, ok
 // SHA-1, different content) racing the tiny read->write window — astronomically
 // unlikely.
 //
-// Only the forward row is written: the reverse projection was dropped in
-// migration 006 (GC cleanup now sources the external SHA-1 from blocks.sha1).
-func (db *DB) WriteVerifiedWebBlockMapping(orgID, externalID, internalID string, createdAt time.Time) error {
+// Only the forward row is written and it is scoped to the caller's block
+// representation domain.
+func (db *DB) WriteVerifiedWebBlockMapping(orgID, representationID, externalID, internalID string, createdAt time.Time) error {
 	if db == nil {
 		return nil
+	}
+	if err := ValidateBlockRepresentationID(representationID); err != nil {
+		return err
 	}
 	externalID = strings.TrimSpace(externalID)
 	internalID = strings.TrimSpace(internalID)
@@ -284,7 +309,7 @@ func (db *DB) WriteVerifiedWebBlockMapping(orgID, externalID, internalID string,
 	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
-	existing, found, err := db.GetBlockIDMapping(orgID, externalID)
+	existing, found, err := db.GetBlockIDMapping(orgID, representationID, externalID)
 	if err != nil {
 		return fmt.Errorf("read existing block mapping %s: %w", externalID, err)
 	}
@@ -295,8 +320,8 @@ func (db *DB) WriteVerifiedWebBlockMapping(orgID, externalID, internalID string,
 		return nil
 	}
 	return db.Session().Query(`
-		INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?)
-	`, orgID, externalID, internalID, ts).Exec()
+		INSERT INTO block_id_mappings (org_id, representation_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?, ?)
+	`, orgID, representationID, externalID, internalID, ts).Exec()
 }
 
 // AddPublishAttemptReferences stages temporary pub:<attempt> references for an
@@ -417,12 +442,30 @@ func (db *DB) UpsertBlockMetadata(orgID, blockID string, sizeBytes int, storageC
 // write time. Callers that do not know the SHA-1 can keep using
 // UpsertBlockMetadata, which passes an empty string.
 func (db *DB) UpsertBlockMetadataWithSHA1(orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string) error {
+	return db.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, PlainBlockRepresentationID, blockID, sha1, sizeBytes, storageClass, storageKey)
+}
+
+func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string) error {
+	if err := ValidateBlockRepresentationID(representationID); err != nil {
+		return err
+	}
 	sha1 = strings.TrimSpace(sha1)
 	if sha1 != "" && !isHexN(sha1, 40) {
 		return fmt.Errorf("invalid block sha1 for %s", blockID)
 	}
 	now := time.Now().UTC()
-	applied, err := upsertBlockMetadataInsertFn(db, orgID, blockID, sha1, sizeBytes, storageClass, storageKey, now)
+	insertFn := upsertBlockMetadataInsertWithRepresentationFn
+	if representationID == PlainBlockRepresentationID {
+		applied, err := upsertBlockMetadataInsertFn(db, orgID, blockID, sha1, sizeBytes, storageClass, storageKey, now)
+		if err != nil {
+			return err
+		}
+		if applied {
+			return nil
+		}
+		return db.ensureBlockIdentity(orgID, blockID, representationID, sha1)
+	}
+	applied, err := insertFn(db, orgID, blockID, representationID, sha1, sizeBytes, storageClass, storageKey, now)
 	if err != nil {
 		return err
 	}
@@ -430,27 +473,54 @@ func (db *DB) UpsertBlockMetadataWithSHA1(orgID, blockID, sha1 string, sizeBytes
 	// the caller has no sha1 there is nothing to add — either way return without an
 	// extra read or a second LWT. The read + IF EXISTS repair below only runs when a
 	// PRE-EXISTING row (dedup) might be missing its sha1.
-	if applied || sha1 == "" {
+	if applied {
 		return nil
 	}
-	return db.ensureBlockSHA1(orgID, blockID, sha1)
+	return db.ensureBlockIdentity(orgID, blockID, representationID, sha1)
 }
 
-func (db *DB) ensureBlockSHA1(orgID, blockID, sha1 string) error {
+func (db *DB) ensureBlockIdentity(orgID, blockID, representationID, sha1 string) error {
+	var currentRepresentationID string
+	var currentSHA1 string
+	var found bool
+	var err error
+	if representationID == PlainBlockRepresentationID && (db == nil || db.session == nil) {
+		currentSHA1, found, err = readBlockSHA1ForRepairFn(db, orgID, blockID)
+		if err == nil && found {
+			currentRepresentationID = representationID
+		}
+	} else if representationID == PlainBlockRepresentationID {
+		currentSHA1, found, err = readBlockSHA1ForRepairFn(db, orgID, blockID)
+		if err == nil && found {
+			currentRepresentationID = representationID
+		}
+	} else {
+		currentRepresentationID, currentSHA1, found, err = readBlockIdentityForRepairFn(db, orgID, blockID)
+	}
+	if err != nil {
+		return fmt.Errorf("read block identity for %s: %w", blockID, err)
+	}
+	if !found {
+		return fmt.Errorf("block metadata for %s disappeared before identity repair", blockID)
+	}
+	currentRepresentationID = strings.TrimSpace(currentRepresentationID)
+	currentSHA1 = strings.TrimSpace(currentSHA1)
+	if currentRepresentationID == "" {
+		applied, err := backfillBlockRepresentationIDFn(db, orgID, blockID, representationID, currentRepresentationID)
+		if err != nil {
+			return fmt.Errorf("backfill block representation id for %s: %w", blockID, err)
+		}
+		if !applied {
+			return fmt.Errorf("block metadata for %s changed before representation repair", blockID)
+		}
+	} else if currentRepresentationID != representationID {
+		return fmt.Errorf("block %s already has conflicting representation id %s", blockID, currentRepresentationID)
+	}
 	if sha1 == "" {
 		return nil
 	}
-
-	current, found, err := readBlockSHA1ForRepairFn(db, orgID, blockID)
-	if err != nil {
-		return fmt.Errorf("read block sha1 for %s: %w", blockID, err)
-	}
-	if !found {
-		return fmt.Errorf("block metadata for %s disappeared before sha1 repair", blockID)
-	}
-	current = strings.TrimSpace(current)
-	if current == "" {
-		applied, err := backfillBlockSHA1Fn(db, orgID, blockID, sha1, current)
+	if currentSHA1 == "" {
+		applied, err := backfillBlockSHA1Fn(db, orgID, blockID, sha1, currentSHA1)
 		if err != nil {
 			return fmt.Errorf("backfill block sha1 for %s: %w", blockID, err)
 		}
@@ -459,8 +529,8 @@ func (db *DB) ensureBlockSHA1(orgID, blockID, sha1 string) error {
 		}
 		return nil
 	}
-	if current != sha1 {
-		return fmt.Errorf("block %s already has conflicting sha1 %s", blockID, current)
+	if currentSHA1 != sha1 {
+		return fmt.Errorf("block %s already has conflicting sha1 %s", blockID, currentSHA1)
 	}
 	return nil
 }

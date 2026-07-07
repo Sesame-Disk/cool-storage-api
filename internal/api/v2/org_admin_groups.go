@@ -656,14 +656,15 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	}
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	blockRepresentationID := dbpkg.EffectiveBlockRepresentationID(newLibID, false, "")
 	batch.Query(`
-		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, storage_class, size_bytes, file_count, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, targetOrgID, newLibID, callerUserID, repoName, false, resolvedStorageClass, int64(0), int64(0), now, now)
+		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, block_representation_id, storage_class, size_bytes, file_count, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, targetOrgID, newLibID, callerUserID, repoName, false, blockRepresentationID, resolvedStorageClass, int64(0), int64(0), now, now)
 	batch.Query(`
-		INSERT INTO libraries_by_id (library_id, org_id, owner_id, name, encrypted)
-		VALUES (?, ?, ?, ?, ?)
-	`, newLibID, targetOrgID, callerUserID, repoName, false)
+		INSERT INTO libraries_by_id (library_id, org_id, owner_id, name, encrypted, block_representation_id)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, newLibID, targetOrgID, callerUserID, repoName, false, blockRepresentationID)
 	projectionRow := addNewLibraryProjectionQueries(h.db.Session(), batch, targetOrgID, newLibID, callerUserID, repoName, false, resolvedStorageClass, 0, 0, now, now)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})

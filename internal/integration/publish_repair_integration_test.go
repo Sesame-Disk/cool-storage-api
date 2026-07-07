@@ -118,7 +118,7 @@ func publishRepairIntegrationReadFileState(t *testing.T, repoID, dirPath, fileNa
 	internalBlockIDs := make([]string, 0, len(externalBlockIDs))
 	for _, externalBlockID := range externalBlockIDs {
 		var internalBlockID string
-		err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, externalBlockID).Scan(&internalBlockID)
+		err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`, orgID, dbpkg.PlainBlockRepresentationID, externalBlockID).Scan(&internalBlockID)
 		if err != nil {
 			if errors.Is(err, gocql.ErrNotFound) {
 				internalBlockID = externalBlockID

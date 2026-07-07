@@ -1368,23 +1368,24 @@ func (s *CassandraStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockI
 
 // --- S3 orphan recovery ---
 
-func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, storageClass, externalSHA1, recoveryPhase string, firstSeenAt time.Time) error {
+func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1, recoveryPhase string, firstSeenAt time.Time) error {
 	return s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class, external_sha1, recovery_phase)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass, externalSHA1, recoveryPhase).Exec()
+		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass, representationID, externalSHA1, recoveryPhase).Exec()
 }
 
 // StartBlockDeleteOrphan records the durable recovery row for a NEW block
 // delete lifecycle. It always resets the phase to pending_s3, even when a
 // stale row from an older delete already exists for the same block_id.
-func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
+func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1 string, now time.Time) (time.Time, error) {
 	externalSHA1 = strings.TrimSpace(externalSHA1)
+	representationID = strings.TrimSpace(representationID)
 	existing := map[string]interface{}{}
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to record block delete orphan: %w", err)
 	}
@@ -1401,10 +1402,10 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 		updateState := map[string]interface{}{}
 		updated, err := s.db.Session().Query(`
 			UPDATE gc_s3_orphans
-			SET storage_class = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
+			SET storage_class = ?, representation_id = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
 			WHERE org_id = ? AND block_id = ?
 			IF EXISTS
-		`, effectiveStorageClass, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
+		`, effectiveStorageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
 		if err != nil {
 			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
 		}
@@ -1412,7 +1413,7 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
 		}
 	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, externalSHA1, S3OrphanPhasePendingS3, effectiveFirstSeenAt); err != nil {
+	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, effectiveFirstSeenAt); err != nil {
 		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
 	}
 	return effectiveFirstSeenAt, nil
@@ -1424,23 +1425,25 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 //
 // It also guarantees the matching gc_s3_orphans_by_day discovery row exists so
 // recovery can enumerate every orphan without scanning canonical partitions.
-func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
+func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
 	initialRetryCount := 0
 	if errMsg != "" {
 		initialRetryCount = 1
 	}
+	representationID = strings.TrimSpace(representationID)
 	existing := map[string]interface{}{}
 	// INSERT IF NOT EXISTS preserves the original first_seen_at on conflict;
 	// if the row exists we fall through to UpdateS3OrphanAttempt-style update.
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, externalSHA1, S3OrphanPhasePendingS3, now, now, initialRetryCount, errMsg).MapScanCAS(existing)
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, now, now, initialRetryCount, errMsg).MapScanCAS(existing)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to record S3 orphan: %w", err)
 	}
 	effectiveFirstSeenAt := now.UTC()
 	effectiveStorageClass := storageClass
+	effectiveRepresentationID := representationID
 	effectiveExternalSHA1 := strings.TrimSpace(externalSHA1)
 	effectiveRecoveryPhase := S3OrphanPhasePendingS3
 	if !applied {
@@ -1458,6 +1461,13 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 		if effectiveStorageClass == "" {
 			effectiveStorageClass = storageClass
 		}
+		effectiveRepresentationID, err = casStringValue(existing, "representation_id")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if strings.TrimSpace(effectiveRepresentationID) == "" {
+			effectiveRepresentationID = representationID
+		}
 		effectiveExternalSHA1, err = casStringValue(existing, "external_sha1")
 		if err != nil {
 			return time.Time{}, err
@@ -1473,15 +1483,16 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 			effectiveRecoveryPhase = S3OrphanPhasePendingS3
 		}
 	}
-	if !applied && (strings.TrimSpace(parseCASString(existing["external_sha1"])) == "" && effectiveExternalSHA1 != "" ||
+	if !applied && (strings.TrimSpace(parseCASString(existing["representation_id"])) == "" ||
+		strings.TrimSpace(parseCASString(existing["external_sha1"])) == "" && effectiveExternalSHA1 != "" ||
 		strings.TrimSpace(parseCASString(existing["recovery_phase"])) == "") {
 		updateState := map[string]interface{}{}
 		updated, err := s.db.Session().Query(`
 			UPDATE gc_s3_orphans
-			SET external_sha1 = ?, recovery_phase = ?
+			SET representation_id = ?, external_sha1 = ?, recovery_phase = ?
 			WHERE org_id = ? AND block_id = ?
 			IF EXISTS
-		`, effectiveExternalSHA1, effectiveRecoveryPhase, orgID.String(), blockID).MapScanCAS(updateState)
+		`, effectiveRepresentationID, effectiveExternalSHA1, effectiveRecoveryPhase, orgID.String(), blockID).MapScanCAS(updateState)
 		if err != nil {
 			return effectiveFirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
 		}
@@ -1489,7 +1500,7 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 			return effectiveFirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: row disappeared before repair", orgID, blockID)
 		}
 	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, effectiveExternalSHA1, effectiveRecoveryPhase, effectiveFirstSeenAt); err != nil {
+	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, effectiveRepresentationID, effectiveExternalSHA1, effectiveRecoveryPhase, effectiveFirstSeenAt); err != nil {
 		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
 	}
 	if !applied && errMsg != "" {
@@ -1500,8 +1511,9 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 	return effectiveFirstSeenAt, nil
 }
 
-func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error {
+func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error {
 	externalSHA1 = strings.TrimSpace(externalSHA1)
+	representationID = strings.TrimSpace(representationID)
 	// IF EXISTS: a plain UPDATE is an upsert in Cassandra, so if a concurrent
 	// DeleteS3Orphan (multi-worker recovery race) already removed the row, an
 	// unconditional UPDATE would resurrect a partial phantom row (PK + these cols,
@@ -1509,10 +1521,10 @@ func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, bloc
 	// applied=false means another worker finished the recovery — nothing to advance.
 	applied, err := s.db.Session().Query(`
 		UPDATE gc_s3_orphans
-		SET external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, last_error = ?
+		SET representation_id = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, last_error = ?
 		WHERE org_id = ? AND block_id = ?
 		IF EXISTS
-	`, externalSHA1, S3OrphanPhasePendingMappingCleanup, now, "", orgID.String(), blockID).MapScanCAS(map[string]interface{}{})
+	`, representationID, externalSHA1, S3OrphanPhasePendingMappingCleanup, now, "", orgID.String(), blockID).MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return fmt.Errorf("mark S3 orphan mapping cleanup pending org=%s block=%s: %w", orgID, blockID, err)
 	}
@@ -1521,16 +1533,17 @@ func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, bloc
 	}
 	var firstSeenAt time.Time
 	var storageClass string
+	var effectiveRepresentationID string
 	err = s.db.Session().Query(`
-		SELECT first_seen_at, storage_class FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&firstSeenAt, &storageClass)
+		SELECT first_seen_at, storage_class, representation_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&firstSeenAt, &storageClass, &effectiveRepresentationID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return nil
 		}
 		return fmt.Errorf("read S3 orphan after phase advance org=%s block=%s: %w", orgID, blockID, err)
 	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, storageClass, externalSHA1, S3OrphanPhasePendingMappingCleanup, firstSeenAt); err != nil {
+	if err := s.upsertS3OrphanProjection(orgID, blockID, storageClass, effectiveRepresentationID, externalSHA1, S3OrphanPhasePendingMappingCleanup, firstSeenAt); err != nil {
 		return fmt.Errorf("update S3 orphan discovery phase org=%s block=%s: %w", orgID, blockID, err)
 	}
 	return nil
@@ -1596,19 +1609,20 @@ func (s *CassandraStore) ListS3OrphansByDay(day time.Time, bucket int, limit int
 		limit = 100
 	}
 	iter := s.db.Session().Query(`
-		SELECT first_seen_at, org_id, block_id, storage_class, external_sha1, recovery_phase
+		SELECT first_seen_at, org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase
 		FROM gc_s3_orphans_by_day
 		WHERE first_seen_day = ? AND bucket = ?
 		LIMIT ?
 	`, db.GCProjectionUTCDate(day), bucket, limit).Iter()
 	var out []S3OrphanInfo
 	var firstSeen time.Time
-	var orgIDStr, blockID, storageClass, externalSHA1, recoveryPhase string
-	for iter.Scan(&firstSeen, &orgIDStr, &blockID, &storageClass, &externalSHA1, &recoveryPhase) {
+	var orgIDStr, blockID, storageClass, representationID, externalSHA1, recoveryPhase string
+	for iter.Scan(&firstSeen, &orgIDStr, &blockID, &storageClass, &representationID, &externalSHA1, &recoveryPhase) {
 		out = append(out, S3OrphanInfo{
 			OrgID:         parseUUID(orgIDStr),
 			BlockID:       blockID,
 			StorageClass:  storageClass,
+			RepresentationID: strings.TrimSpace(representationID),
 			ExternalSHA1:  strings.TrimSpace(externalSHA1),
 			RecoveryPhase: strings.TrimSpace(recoveryPhase),
 			FirstSeenAt:   firstSeen,
@@ -1645,16 +1659,18 @@ func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bo
 func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
 	info := BlockInfo{BlockID: blockID}
 	var createdAt *time.Time
+	var representationID string
 	var sha1 string
 	// Single-partition point read by the full ((org_id), block_id) key. sha1 is
 	// the same row, so reading it adds no extra query and no tombstone scan.
 	err := s.db.Session().Query(`
-		SELECT storage_class, created_at, sha1 FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&info.StorageClass, &createdAt, &sha1)
+		SELECT storage_class, created_at, representation_id, sha1 FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&info.StorageClass, &createdAt, &representationID, &sha1)
 	if err != nil {
 		return BlockInfo{}, err
 	}
 	info.CreatedAt = createdAt
+	info.RepresentationID = strings.TrimSpace(representationID)
 	info.Sha1 = strings.TrimSpace(sha1)
 	return info, nil
 }
@@ -1666,17 +1682,22 @@ func (s *CassandraStore) RemoveBlockReference(orgID uuid.UUID, blockID, referrer
 
 // mappingResolveConcurrency bounds the number of in-flight single-row lookups
 // against block_id_mappings so a large fs_object's block list cannot flood the
-// driver. block_id_mappings is partitioned by ((org_id, external_id)), so each
-// lookup is a single-partition point read.
+// driver. block_id_mappings is partitioned by
+// ((org_id, representation_id, external_id)), so each lookup is a single-
+// partition point read.
 const mappingResolveConcurrency = 32
 
-func (s *CassandraStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error) {
+func (s *CassandraStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockIDs []string) ([]string, error) {
+	representationID, err := db.ResolveBlockRepresentationIDByLibraryID(s.db.Session(), libraryID.String())
+	if err != nil {
+		return nil, err
+	}
 	return resolveBlockIDsConcurrent(orgID, blockIDs, mappingResolveConcurrency, func(idx int) (string, error) {
 		var internalID string
 		err := s.db.Session().Query(`
 			SELECT internal_id FROM block_id_mappings
-			WHERE org_id = ? AND external_id = ?
-		`, orgID.String(), blockIDs[idx]).Scan(&internalID)
+			WHERE org_id = ? AND representation_id = ? AND external_id = ?
+		`, orgID.String(), representationID, blockIDs[idx]).Scan(&internalID)
 		return internalID, err
 	})
 }
@@ -1832,10 +1853,14 @@ func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID s
 // migration 006, so this is a single-partition DELETE with no read-before-delete
 // and no reverse cleanup.
 func (s *CassandraStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error {
+	return s.DeleteBlockMappingExact(orgID, db.PlainBlockRepresentationID, externalID)
+}
+
+func (s *CassandraStore) DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error {
 	if err := s.db.Session().Query(`
-		DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?
-	`, orgID.String(), externalID).Exec(); err != nil {
-		return fmt.Errorf("delete block mapping org=%s external_id=%s: %w", orgID, externalID, err)
+		DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?
+	`, orgID.String(), representationID, externalID).Exec(); err != nil {
+		return fmt.Errorf("delete block mapping org=%s representation_id=%s external_id=%s: %w", orgID, representationID, externalID, err)
 	}
 	return nil
 }

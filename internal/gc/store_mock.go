@@ -46,7 +46,7 @@ type MockStore struct {
 	// provisional upload-ref expiry discovery rows keyed by the full projection PK.
 	provisionalBlockRefExpiryProjections map[mockProvisionalBlockRefExpiryProjectionKey]ProvisionalBlockRefExpiryInfo
 
-	// block_id_mappings keyed by "orgID:externalID"
+	// block_id_mappings keyed by "orgID:representationID:externalID"
 	mappings map[string]string // externalID -> internalID
 
 	// commits keyed by "libraryID:commitID"
@@ -204,6 +204,7 @@ type mockBlock struct {
 	CreatedAt    *time.Time
 	GCState      string
 	GCClaimID    string
+	RepresentationID string
 	Sha1         string
 }
 
@@ -275,6 +276,7 @@ type mockLibrary struct {
 	OrgID          uuid.UUID
 	LibraryID      uuid.UUID
 	OwnerID        uuid.UUID
+	BlockRepresentationID string
 	StorageClass   string
 	HeadCommitID   string
 	VersionTTLDays int
@@ -478,6 +480,23 @@ func (m *MockStore) upsertS3OrphanProjection(orphan *S3OrphanInfo) {
 	m.s3OrphanProjections[key] = *orphan
 }
 
+func mockMappingKey(orgID uuid.UUID, representationID, externalID string) string {
+	representationID = strings.TrimSpace(representationID)
+	if representationID == "" {
+		representationID = db.PlainBlockRepresentationID
+	}
+	return fmt.Sprintf("%s:%s:%s", orgID, representationID, externalID)
+}
+
+func (m *MockStore) blockRepresentationIDForLibraryLocked(libraryID uuid.UUID) string {
+	if lib := m.libraries[libraryID]; lib != nil {
+		if rep := strings.TrimSpace(lib.BlockRepresentationID); rep != "" {
+			return rep
+		}
+	}
+	return db.PlainBlockRepresentationID
+}
+
 func (m *MockStore) upsertProvisionalBlockRefExpiryProjection(expiry *mockProvisionalBlockRefExpiry) {
 	key := newMockProvisionalBlockRefExpiryProjectionKey(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt)
 	m.provisionalBlockRefExpiryProjections[key] = ProvisionalBlockRefExpiryInfo{
@@ -521,6 +540,7 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 		OrgID:        orgID,
 		BlockID:      blockID,
 		StorageClass: storageClass,
+		RepresentationID: db.PlainBlockRepresentationID,
 		CreatedAt:    &createdAt,
 	}
 	// Model the legacy refCount as that many distinct reference rows so existing
@@ -543,6 +563,7 @@ func (m *MockStore) AddStubBlockForTest(orgID uuid.UUID, blockID string) {
 	m.blocks[key] = &mockBlock{
 		OrgID:     orgID,
 		BlockID:   blockID,
+		RepresentationID: db.PlainBlockRepresentationID,
 		CreatedAt: nil,
 	}
 }
@@ -610,7 +631,7 @@ func (m *MockStore) DeleteS3OrphanProjectionForTest(orgID uuid.UUID, blockID str
 func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := fmt.Sprintf("%s:%s", orgID, externalID)
+	key := mockMappingKey(orgID, db.PlainBlockRepresentationID, externalID)
 	m.mappings[key] = internalID
 	// Mirror the server-derived blocks.sha1 onto the block row so GC mapping
 	// cleanup (which now reads blocks.sha1 instead of the dropped reverse index)
@@ -626,7 +647,7 @@ func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID stri
 func (m *MockStore) ForwardBlockMappingExists(orgID uuid.UUID, externalID string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	_, ok := m.mappings[fmt.Sprintf("%s:%s", orgID, externalID)]
+	_, ok := m.mappings[mockMappingKey(orgID, db.PlainBlockRepresentationID, externalID)]
 	return ok
 }
 
@@ -700,6 +721,7 @@ func (m *MockStore) AddLibraryWithTTL(orgID, libraryID uuid.UUID, storageClass, 
 	m.libraries[libraryID] = &mockLibrary{
 		OrgID:          orgID,
 		LibraryID:      libraryID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
 		StorageClass:   storageClass,
 		HeadCommitID:   headCommitID,
 		VersionTTLDays: versionTTLDays,
@@ -739,6 +761,7 @@ func (m *MockStore) AddLibraryWithAutoDelete(orgID, libraryID uuid.UUID, storage
 	m.libraries[libraryID] = &mockLibrary{
 		OrgID:          orgID,
 		LibraryID:      libraryID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
 		StorageClass:   storageClass,
 		HeadCommitID:   headCommitID,
 		AutoDeleteDays: autoDeleteDays,
@@ -751,6 +774,7 @@ func (m *MockStore) AddLibrary(orgID, libraryID uuid.UUID, storageClass string) 
 	m.libraries[libraryID] = &mockLibrary{
 		OrgID:        orgID,
 		LibraryID:    libraryID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
 		StorageClass: storageClass,
 	}
 }
@@ -762,6 +786,7 @@ func (m *MockStore) AddLibraryWithOwner(orgID, libraryID, ownerID uuid.UUID, sto
 		OrgID:        orgID,
 		LibraryID:    libraryID,
 		OwnerID:      ownerID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
 		StorageClass: storageClass,
 	}
 }
@@ -1018,7 +1043,7 @@ func (m *MockStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, er
 	if block == nil {
 		return BlockInfo{}, gocql.ErrNotFound
 	}
-	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, CreatedAt: block.CreatedAt, Sha1: block.Sha1}, nil
+	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, CreatedAt: block.CreatedAt, RepresentationID: block.RepresentationID, Sha1: block.Sha1}, nil
 }
 
 // BlockReferenceCount returns how many reference rows a block currently has.
@@ -1715,9 +1740,10 @@ func (m *MockStore) AddFSObjectReferenceForTest(orgID uuid.UUID, blockID string,
 	m.AddBlockReferenceForTest(orgID, blockID, db.BlockReferrerForFSObject(libID.String(), fsID))
 }
 
-func (m *MockStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error) {
+func (m *MockStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockIDs []string) ([]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	representationID := m.blockRepresentationIDForLibraryLocked(libraryID)
 
 	resolved := make([]string, len(blockIDs))
 	copy(resolved, blockIDs)
@@ -1725,7 +1751,7 @@ func (m *MockStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]strin
 		if len(blockID) != 40 {
 			continue
 		}
-		if internalID, ok := m.mappings[fmt.Sprintf("%s:%s", orgID, blockID)]; ok && internalID != "" {
+		if internalID, ok := m.mappings[mockMappingKey(orgID, representationID, blockID)]; ok && internalID != "" {
 			resolved[i] = internalID
 		}
 	}
@@ -1911,10 +1937,14 @@ func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string
 }
 
 func (m *MockStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error {
+	return m.DeleteBlockMappingExact(orgID, db.PlainBlockRepresentationID, externalID)
+}
+
+func (m *MockStore) DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	key := fmt.Sprintf("%s:%s", orgID, externalID)
+	key := mockMappingKey(orgID, representationID, externalID)
 	delete(m.mappings, key)
 	return nil
 }
@@ -3148,12 +3178,13 @@ func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) erro
 
 // --- S3 orphan recovery (mock) ---
 
-func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
+func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1 string, now time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
 		existing.StorageClass = storageClass
+		existing.RepresentationID = strings.TrimSpace(representationID)
 		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		existing.RecoveryPhase = S3OrphanPhasePendingS3
 		existing.LastAttemptAt = now
@@ -3166,6 +3197,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 		OrgID:         orgID,
 		BlockID:       blockID,
 		StorageClass:  storageClass,
+		RepresentationID: strings.TrimSpace(representationID),
 		ExternalSHA1:  strings.TrimSpace(externalSHA1),
 		RecoveryPhase: S3OrphanPhasePendingS3,
 		FirstSeenAt:   now.UTC(),
@@ -3176,7 +3208,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 	return orphan.FirstSeenAt, nil
 }
 
-func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
+func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
@@ -3194,6 +3226,9 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, exter
 		if strings.TrimSpace(existing.ExternalSHA1) == "" {
 			existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		}
+		if strings.TrimSpace(existing.RepresentationID) == "" {
+			existing.RepresentationID = strings.TrimSpace(representationID)
+		}
 		if strings.TrimSpace(existing.RecoveryPhase) == "" {
 			existing.RecoveryPhase = S3OrphanPhasePendingS3
 		}
@@ -3209,6 +3244,7 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, exter
 		OrgID:         orgID,
 		BlockID:       blockID,
 		StorageClass:  storageClass,
+		RepresentationID: strings.TrimSpace(representationID),
 		ExternalSHA1:  strings.TrimSpace(externalSHA1),
 		RecoveryPhase: S3OrphanPhasePendingS3,
 		FirstSeenAt:   now.UTC(),
@@ -3221,11 +3257,12 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, exter
 	return orphan.FirstSeenAt, nil
 }
 
-func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error {
+func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
+		existing.RepresentationID = strings.TrimSpace(representationID)
 		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		existing.RecoveryPhase = S3OrphanPhasePendingMappingCleanup
 		existing.LastAttemptAt = now

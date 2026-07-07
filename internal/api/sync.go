@@ -88,6 +88,11 @@ type SyncHandler struct {
 	// the costly full-tree repair. Nil-safe: a handler built without it just always
 	// runs the full (idempotent) repair.
 	finalizedBlockDeltas *syncFinalizedDeltaSet
+
+	// blockRepresentationIDs memoizes immutable per-library representation IDs so
+	// legacy SHA-1 sync reads do not re-read the libraries row on every block
+	// request. A miss only falls back to the authoritative DB read.
+	blockRepresentationIDs *syncBlockRepresentationIDCache
 }
 
 // NewSyncHandler creates a new sync protocol handler
@@ -100,6 +105,7 @@ func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *stora
 		config:               cfg,
 		permMiddleware:       permMiddleware,
 		finalizedBlockDeltas: newSyncFinalizedDeltaSet(),
+		blockRepresentationIDs: newSyncBlockRepresentationIDCache(),
 	}
 }
 
@@ -107,6 +113,12 @@ func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *stora
 // At most 2x this many entries are retained (current + previous generation), so
 // memory stays capped without per-entry timestamps or a background sweeper.
 const syncFinalizedDeltaShardCap = 4096
+
+// syncBlockRepresentationIDCache bounds the number of memoized
+// (org, repo)->representation_id entries. Representation IDs are immutable for a
+// library in the current model, so eviction or restart can only cause an extra
+// DB read, never a stale correctness bug.
+const syncBlockRepresentationIDCacheCap = 4096
 
 // syncFinalizedDeltaSet is a bounded, thread-safe set of "(repo, head) finalized"
 // markers. It exists purely to let handleSyncHeadIdempotentSuccess skip the
@@ -153,6 +165,59 @@ func (s *syncFinalizedDeltaSet) contains(repoID, commitID string) bool {
 	}
 	_, ok := s.prev[key]
 	return ok
+}
+
+type syncBlockRepresentationIDCache struct {
+	mu   sync.Mutex
+	cur  map[string]string
+	prev map[string]string
+}
+
+func newSyncBlockRepresentationIDCache() *syncBlockRepresentationIDCache {
+	return &syncBlockRepresentationIDCache{cur: make(map[string]string, syncBlockRepresentationIDCacheCap)}
+}
+
+func (c *syncBlockRepresentationIDCache) get(orgID, repoID string) (string, bool) {
+	if c == nil || orgID == "" || repoID == "" {
+		return "", false
+	}
+	key := orgID + ":" + repoID
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if value, ok := c.cur[key]; ok {
+		return value, true
+	}
+	value, ok := c.prev[key]
+	return value, ok
+}
+
+func (c *syncBlockRepresentationIDCache) put(orgID, repoID, representationID string) {
+	if c == nil || orgID == "" || repoID == "" || representationID == "" {
+		return
+	}
+	key := orgID + ":" + repoID
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.cur) >= syncBlockRepresentationIDCacheCap {
+		c.prev = c.cur
+		c.cur = make(map[string]string, syncBlockRepresentationIDCacheCap)
+	}
+	c.cur[key] = representationID
+}
+
+func (h *SyncHandler) resolveSyncBlockRepresentationID(orgID, repoID string) (string, error) {
+	if h == nil || h.db == nil {
+		return db.PlainBlockRepresentationID, nil
+	}
+	if representationID, ok := h.blockRepresentationIDs.get(orgID, repoID); ok {
+		return representationID, nil
+	}
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+	if err != nil {
+		return "", err
+	}
+	h.blockRepresentationIDs.put(orgID, repoID, representationID)
+	return representationID, nil
 }
 
 // checkSyncPermission verifies the user has the required permission level on the library.
@@ -1044,19 +1109,22 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	isLegacySHA1 := len(externalID) == 40
 
 	if h.db != nil && isLegacySHA1 {
-		// SHA-1: look up internal SHA-256 ID from mapping
-		err := h.db.Session().Query(`
-			SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
-		`, orgID, externalID).Scan(&internalID)
-
-		if err != nil || internalID == "" {
-			// Fallback: maybe this is an old block stored with SHA-1 directly
-			// Try using the external ID as the internal ID
-			internalID = externalID
-			log.Printf("GetBlock: no mapping found for %s, using as-is\n", externalID)
-		} else {
-			log.Printf("GetBlock: resolved %s → %s\n", externalID, internalID)
+		representationID, err := h.resolveSyncBlockRepresentationID(orgID, repoID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
+			return
 		}
+		mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, externalID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
+			return
+		}
+		if !ok || strings.TrimSpace(mappedID) == "" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
+			return
+		}
+		internalID = mappedID
+		log.Printf("GetBlock: resolved %s → %s\n", externalID, internalID)
 	} else {
 		// SHA-256 or no DB: use external ID directly
 		internalID = externalID
@@ -1360,6 +1428,19 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 	// For SHA-256 IDs (64 chars), use directly
 	externalToInternal := make(map[string]string)
 	var internalIDs []string
+	var representationID string
+	if h.db != nil {
+		for _, extID := range externalIDs {
+			if len(extID) == 40 {
+				representationID, err = h.resolveSyncBlockRepresentationID(orgID, repoID)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
+					return
+				}
+				break
+			}
+		}
+	}
 
 	for _, extID := range externalIDs {
 		if extID == "" {
@@ -1370,16 +1451,16 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 		isLegacySHA1 := len(extID) == 40
 
 		if h.db != nil && isLegacySHA1 {
-			// SHA-1: look up internal SHA-256 ID from mapping
-			err := h.db.Session().Query(`
-				SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
-			`, orgID, extID).Scan(&internalID)
-
-			if err != nil || internalID == "" {
-				// No mapping found - this block hasn't been uploaded yet
-				// or it's an old block stored with SHA-1 directly
-				internalID = extID
+			mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, extID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
+				return
 			}
+			if !ok || strings.TrimSpace(mappedID) == "" {
+				externalToInternal[extID] = ""
+				continue
+			}
+			internalID = mappedID
 		} else {
 			// SHA-256 or no DB: use external ID directly
 			internalID = extID
@@ -1410,6 +1491,10 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 			continue
 		}
 		internalID := externalToInternal[extID]
+		if internalID == "" {
+			needed = append(needed, extID)
+			continue
+		}
 		if !existMap[internalID] {
 			needed = append(needed, extID)
 		}
@@ -2992,12 +3077,16 @@ func (h *SyncHandler) buildSyncCommitBlockDelta(repoID, targetCommitID string) (
 	return delta, nil
 }
 
-func (h *SyncHandler) resolveSyncBlockIDs(orgID string, blockIDs []string) ([]string, error) {
+func (h *SyncHandler) resolveSyncBlockIDs(orgID, repoID string, blockIDs []string) ([]string, error) {
 	blockIDs = db.NormalizeBlockIDs(blockIDs)
 	if len(blockIDs) == 0 {
 		return nil, nil
 	}
-	resolved, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	representationID, err := h.resolveSyncBlockRepresentationID(orgID, repoID)
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := streaming.BatchResolveBlockIDs(h.db, orgID, representationID, blockIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -3010,7 +3099,7 @@ func (h *SyncHandler) stageSyncCommitBlockDelta(orgID, repoID, targetCommitID st
 		return syncCommitBlockDelta{}, err
 	}
 	resolved, err := db.StagePublishAttemptReferences(h.db, orgID, repoID, targetCommitID, delta.addedBlockIDs(), func(blockIDs []string) ([]string, error) {
-		return h.resolveSyncBlockIDs(orgID, blockIDs)
+		return h.resolveSyncBlockIDs(orgID, repoID, blockIDs)
 	})
 	if err != nil {
 		return syncCommitBlockDelta{}, fmt.Errorf("stage publish-attempt refs for sync commit %s: %w", targetCommitID, err)
@@ -3057,7 +3146,7 @@ func (h *SyncHandler) enqueueSyncZeroRefBlocks(orgID, repoID string, blockIDs []
 
 func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID string, delta syncCommitBlockDelta) error {
 	if len(delta.resolvedAddedBlockIDs) == 0 && len(delta.addedFiles) > 0 {
-		resolved, err := h.resolveSyncBlockIDs(orgID, delta.addedBlockIDs())
+		resolved, err := h.resolveSyncBlockIDs(orgID, repoID, delta.addedBlockIDs())
 		if err != nil {
 			return fmt.Errorf("resolve added block IDs for sync commit %s: %w", targetCommitID, err)
 		}

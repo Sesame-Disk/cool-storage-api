@@ -46,9 +46,8 @@ func PutCopyBuf(buf []byte) {
 const mappingResolveConcurrency = 32
 
 // BatchResolveBlockIDs resolves all SHA-1 block IDs (40 chars) to their internal
-// SHA-256 content address. IDs that are already SHA-256 (64 chars) pass through
-// untouched. block_id_mappings is partitioned by ((org_id, external_id)), so each
-// lookup is a single-partition point read, run with bounded concurrency.
+// SHA-256 content address inside one block-representation domain. IDs that are
+// already SHA-256 (64 chars) pass through untouched.
 //
 // Resolution is STRICT: if any 40-char ID cannot be resolved — whether the lookup
 // errored (e.g. Cassandra timeout) or no mapping row exists — the call returns a
@@ -56,13 +55,16 @@ const mappingResolveConcurrency = 32
 // writing any response headers/body. Streaming a partially-resolved list would
 // send a stale SHA-1 to SHA-256 storage, truncating the download mid-stream after
 // the headers are already committed (see StreamBlocks: "headers already sent").
-func BatchResolveBlockIDs(database *db.DB, orgID string, blockIDs []string) ([]string, error) {
+func BatchResolveBlockIDs(database *db.DB, orgID, representationID string, blockIDs []string) ([]string, error) {
+	if err := db.ValidateBlockRepresentationID(representationID); err != nil {
+		return nil, err
+	}
 	return resolveBlockIDs(orgID, blockIDs, mappingResolveConcurrency, func(idx int) (string, error) {
 		var internalID string
 		err := database.Session().Query(`
 			SELECT internal_id FROM block_id_mappings
-			WHERE org_id = ? AND external_id = ?
-		`, orgID, blockIDs[idx]).Scan(&internalID)
+			WHERE org_id = ? AND representation_id = ? AND external_id = ?
+		`, orgID, representationID, blockIDs[idx]).Scan(&internalID)
 		return internalID, err
 	})
 }

@@ -57,9 +57,12 @@ func TestRegisterFSObjectBlockReferences_ResolutionFailureAborts(t *testing.T) {
 	}
 
 	resolveErr := errors.New("resolve failed")
-	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+	resolveStoredBlockIDsFn = func(h *FSHelper, orgID, libraryID string, blockIDs []string) ([]string, error) {
 		if orgID != "org-1" {
 			t.Fatalf("resolve orgID = %q, want %q", orgID, "org-1")
+		}
+		if libraryID != "lib-1" {
+			t.Fatalf("resolve libraryID = %q, want %q", libraryID, "lib-1")
 		}
 		if len(blockIDs) != 1 || blockIDs[0] != "sha1-block" {
 			t.Fatalf("resolve blockIDs = %v, want [sha1-block]", blockIDs)
@@ -84,7 +87,7 @@ func TestRegisterFSObjectBlockReferences_RequiresPersistedFSObject(t *testing.T)
 		registerFSObjectBlockReferencesAddReferenceFn = prevAdd
 	})
 
-	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+	resolveStoredBlockIDsFn = func(h *FSHelper, orgID, libraryID string, blockIDs []string) ([]string, error) {
 		t.Fatal("resolve should not run when the fs_object row is missing")
 		return nil, nil
 	}
@@ -119,9 +122,12 @@ func TestRegisterFSObjectBlockReferences_AddsReferencesForPersistedFSObject(t *t
 	registerFSObjectBlockReferencesFSObjectExistsFn = func(h *FSHelper, libraryID, fsID string) (bool, error) {
 		return true, nil
 	}
-	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+	resolveStoredBlockIDsFn = func(h *FSHelper, orgID, libraryID string, blockIDs []string) ([]string, error) {
 		if orgID != "org-1" {
 			t.Fatalf("resolve orgID = %q, want org-1", orgID)
+		}
+		if libraryID != "lib-1" {
+			t.Fatalf("resolve libraryID = %q, want lib-1", libraryID)
 		}
 		if len(blockIDs) != 2 || blockIDs[0] != "sha1-a" || blockIDs[1] != "sha1-b" {
 			t.Fatalf("resolve blockIDs = %v, want [sha1-a sha1-b]", blockIDs)
@@ -205,8 +211,11 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 		t.Fatal("stale claim release should not run for a normal retrying fence")
 		return false, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		calls = append(calls, "upsert")
+		if libraryID != "lib-1" {
+			t.Fatalf("libraryID = %q, want lib-1", libraryID)
+		}
 		if sizeBytes != 123 || storageClass != "hot" || storageKey != "key-1" || sha1ID != "sha1-1" {
 			t.Fatalf("upsert args = %d/%s/%s/%s, want 123/hot/key-1/sha1-1", sizeBytes, storageClass, storageKey, sha1ID)
 		}
@@ -295,8 +304,11 @@ func TestRegisterUploadedBlock_ReleasesStaleDeleteClaimWithEmptyStorageClass(t *
 		}
 		return true, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		calls = append(calls, "upsert")
+		if libraryID != "lib-1" {
+			t.Fatalf("libraryID = %q, want lib-1", libraryID)
+		}
 		if sha1ID != "sha1-1" {
 			t.Fatalf("sha1ID = %q, want sha1-1", sha1ID)
 		}
@@ -351,7 +363,7 @@ func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
 		return false, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		return nil
 	}
 
@@ -406,7 +418,7 @@ func TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails(t *testing.T) {
 		t.Fatal("fence check should not run when expiry tracking fails")
 		return false, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		t.Fatal("metadata upsert should not run when expiry tracking fails")
 		return nil
 	}
@@ -468,7 +480,7 @@ func TestRegisterUploadedBlock_ReenqueuesZeroRefWhenFenceNeverClears(t *testing.
 		calls = append(calls, "fence")
 		return true, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		t.Fatal("upsert should not run while the delete fence remains active")
 		return nil
 	}
@@ -547,10 +559,13 @@ func TestStagePendingPublishedFiles_AssignsResolvedInternalBlockIDs(t *testing.T
 	}
 
 	resolveCalls := 0
-	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID, libraryID string, blockIDs []string) ([]string, error) {
 		resolveCalls++
 		if orgID != "org-1" {
 			t.Fatalf("resolve orgID = %q, want org-1", orgID)
+		}
+		if libraryID != "repo-1" {
+			t.Fatalf("resolve libraryID = %q, want repo-1", libraryID)
 		}
 		if len(blockIDs) != 1 || blockIDs[0] != "sha1-1" {
 			t.Fatalf("resolve blockIDs = %#v, want []string{\"sha1-1\"}", blockIDs)
@@ -605,7 +620,7 @@ func TestStagePendingPublishedFiles_ReturnsRollbackFailureAndKeepsResolvedIDs(t 
 		stagePendingPublishedFilesPersistFn = oldPersist
 	})
 
-	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID, libraryID string, blockIDs []string) ([]string, error) {
 		if len(blockIDs) != 1 {
 			t.Fatalf("resolve blockIDs len = %d, want 1", len(blockIDs))
 		}

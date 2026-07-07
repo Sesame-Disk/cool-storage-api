@@ -900,11 +900,17 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 
 	// Determine MIME type from extension
 	mimeType := resolveInlineContentType(ext)
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), sl.orgID, sl.libraryID)
+	if err != nil {
+		slog.Error("failed to resolve block representation for share link", "org", sl.orgID, "library", sl.libraryID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
 
 	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries.
 	// Strict: fail before any header is written (see BatchResolveBlockIDs) so a
 	// stale SHA-1 can never truncate the response mid-stream.
-	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, sl.orgID, blockIDs)
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, sl.orgID, representationID, blockIDs)
 	if err != nil {
 		slog.Error("block ID resolution failed for share link", "org", sl.orgID, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
@@ -1007,7 +1013,12 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 	}
 
 	ctx := context.Background()
-	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, sl.orgID, blockIDs)
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), sl.orgID, sl.libraryID)
+	if err != nil {
+		slog.Error("failed to resolve block representation for inline text content", "org", sl.orgID, "library", sl.libraryID, "error", err)
+		return ""
+	}
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, sl.orgID, representationID, blockIDs)
 	if err != nil {
 		slog.Error("block ID resolution failed for inline text content", "org", sl.orgID, "error", err)
 		return ""

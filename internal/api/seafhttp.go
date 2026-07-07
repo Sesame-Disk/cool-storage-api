@@ -1496,8 +1496,8 @@ var putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore
 var probeUploadedBlockReuseForUploadFn = v2.ProbeUploadedBlockReuse
 var ensureReusableBlockPresentForUploadFn = v2.EnsureReusableBlockPresent
 var registerUploadedBlockAndMappingForUploadFn = v2.RegisterUploadedBlockAndMapping
-var resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID string, blockIDs []string) ([]string, error) {
-	return fsHelper.ResolveStoredBlockIDs(orgID, blockIDs)
+var resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID, repoID string, blockIDs []string) ([]string, error) {
+	return fsHelper.ResolveStoredBlockIDs(orgID, repoID, blockIDs)
 }
 var stageSeafHTTPPublishAttemptReferencesFn = db.StagePublishAttemptReferences
 var cleanupSeafHTTPFailedPublishAttemptFn = v2.CleanupFailedPublishArtifacts
@@ -2753,7 +2753,7 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(ctx context.Context, orgI
 }
 
 func stageSeafHTTPPublishAttemptReferences(fsHelper *v2.FSHelper, database *db.DB, orgID, repoID, attemptID string, externalBlockIDs []string) ([]string, error) {
-	resolved, err := resolveSeafHTTPStoredBlockIDsFn(fsHelper, orgID, externalBlockIDs)
+	resolved, err := resolveSeafHTTPStoredBlockIDsFn(fsHelper, orgID, repoID, externalBlockIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -2799,7 +2799,15 @@ func (h *SeafHTTPHandler) createPendingSeafHTTPFileFSObject(orgID, repoID, attem
 	// the POSITIONAL SHA-1 list (externalBlockIDs) to SHA-256 — not stagedBlockIDs, which
 	// is deduped for references and would drop repeated blocks / reorder the file. The
 	// SHA-1->SHA-256 mappings were written from real bytes during block upload.
-	internalBlockIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, externalBlockIDs)
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+	if err != nil {
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, attemptID, fsID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return errors.Join(fmt.Errorf("failed to resolve block representation for fs_object: %w", err), cleanupErr)
+		}
+		return fmt.Errorf("failed to resolve block representation for fs_object: %w", err)
+	}
+	internalBlockIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, representationID, externalBlockIDs)
 	if err != nil {
 		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, attemptID, fsID, stagedBlockIDs)
 		if cleanupErr != nil {
@@ -3493,19 +3501,24 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	}
 }
 
-// resolveBlockID translates a SHA-1 block ID (40 chars) to SHA-256 (64 chars) if needed.
-func (h *SeafHTTPHandler) resolveBlockID(orgID, blockID string) string {
+// resolveBlockID translates a SHA-1 block ID (40 chars) to SHA-256 (64 chars)
+// inside the target library's representation namespace.
+func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string, error) {
 	if len(blockID) != 40 {
-		return blockID
+		return blockID, nil
 	}
-	var mappedID string
-	err := h.db.Session().Query(`
-		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
-	`, orgID, blockID).Scan(&mappedID)
-	if err == nil && mappedID != "" {
-		return mappedID
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+	if err != nil {
+		return "", err
 	}
-	return blockID
+	mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, blockID)
+	if err != nil {
+		return "", err
+	}
+	if !ok || strings.TrimSpace(mappedID) == "" {
+		return "", fmt.Errorf("block mapping not found for %s", blockID)
+	}
+	return mappedID, nil
 }
 
 // lookupFileBlocks resolves a token's path to its block IDs, file size, encryption key, and block store.
@@ -3607,11 +3620,15 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	}
 
 	log.Printf("[streamFileFromBlocks] Streaming %d blocks, size=%d, encrypted=%v", len(blockIDs), fileSize, fileKey != nil)
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), token.OrgID, token.RepoID)
+	if err != nil {
+		return fmt.Errorf("resolve block representation: %w", err)
+	}
 
 	// Batch resolve all block IDs upfront (avoids per-block Cassandra queries).
 	// Strict: a stale SHA-1 sent to SHA-256 storage would truncate the stream
 	// mid-download, so we resolve BEFORE committing any headers and fail clean.
-	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, token.OrgID, blockIDs)
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, token.OrgID, representationID, blockIDs)
 	if err != nil {
 		log.Printf("[streamFileFromBlocks] block ID resolution failed for org=%s: %v", token.OrgID, err)
 		return fmt.Errorf("resolve block IDs: %w", err)
@@ -3657,7 +3674,10 @@ func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) 
 	ctx := c.Request.Context()
 	var content bytes.Buffer
 	for _, blockID := range blockIDs {
-		internalID := h.resolveBlockID(token.OrgID, blockID)
+		internalID, err := h.resolveBlockID(token.OrgID, token.RepoID, blockID)
+		if err != nil {
+			return nil, err
+		}
 
 		blockData, err := blockStore.GetBlock(ctx, internalID)
 		if err != nil {
@@ -4012,7 +4032,11 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 			}
 		}
 
-		resolvedIDs, err := zipBatchResolveBlockIDsFn(h.db, orgID, blockIDs)
+		representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve block representation for %s: %w", entryPath, err)
+		}
+		resolvedIDs, err := zipBatchResolveBlockIDsFn(h.db, orgID, representationID, blockIDs)
 		if err != nil {
 			return nil, fmt.Errorf("resolve block IDs for %s: %w", entryPath, err)
 		}
