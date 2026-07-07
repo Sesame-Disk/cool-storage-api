@@ -252,6 +252,22 @@ func TestWriteBlockIDMapping_RejectsSameDomainRemap(t *testing.T) {
 	}
 }
 
+func TestNormalizeBlockID(t *testing.T) {
+	cases := map[string]string{
+		"":                      "",
+		"  ":                    "",
+		"  ABCDEF  ":            "abcdef",
+		"DeadBeef":              "deadbeef",
+		strings.Repeat("A", 40): strings.Repeat("a", 40),
+		strings.Repeat("f", 64): strings.Repeat("f", 64),
+	}
+	for in, want := range cases {
+		if got := NormalizeBlockID(in); got != want {
+			t.Fatalf("NormalizeBlockID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestWriteBlockIDMapping_CanonicalizesHashesToLowercase(t *testing.T) {
 	database := &DB{}
 	oldGet := getBlockIDMappingForWriteCheckFn

@@ -64,7 +64,7 @@ func BatchResolveBlockIDs(database *db.DB, orgID, representationID string, block
 		err := database.Session().Query(`
 			SELECT internal_id FROM block_id_mappings
 			WHERE org_id = ? AND representation_id = ? AND external_id = ?
-		`, orgID, representationID, blockIDs[idx]).Scan(&internalID)
+		`, orgID, representationID, db.NormalizeBlockID(blockIDs[idx])).Scan(&internalID)
 		return internalID, err
 	})
 }

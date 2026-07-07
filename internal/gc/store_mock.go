@@ -485,7 +485,9 @@ func mockMappingKey(orgID uuid.UUID, representationID, externalID string) string
 	if representationID == "" {
 		representationID = db.PlainBlockRepresentationID
 	}
-	return fmt.Sprintf("%s:%s:%s", orgID, representationID, externalID)
+	// Mirror the real store's canonicalization (db.NormalizeBlockID) so the mock
+	// resolves/deletes case-insensitively too.
+	return fmt.Sprintf("%s:%s:%s", orgID, representationID, db.NormalizeBlockID(externalID))
 }
 
 func (m *MockStore) blockRepresentationIDForLibraryLocked(libraryID uuid.UUID) string {
@@ -631,25 +633,28 @@ func (m *MockStore) DeleteS3OrphanProjectionForTest(orgID uuid.UUID, blockID str
 func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := mockMappingKey(orgID, db.PlainBlockRepresentationID, externalID)
-	m.mappings[key] = internalID
-	// Mirror the server-derived blocks.sha1 onto the block row so GC mapping
-	// cleanup (which now reads blocks.sha1 instead of the dropped reverse index)
-	// can resolve the forward row for this internal id.
-	if b := m.blocks[fmt.Sprintf("%s:%s", orgID, internalID)]; b != nil && strings.TrimSpace(b.Sha1) == "" {
-		b.Sha1 = externalID
-	}
+	m.addBlockMappingLocked(orgID, db.PlainBlockRepresentationID, externalID, internalID)
 }
 
 func (m *MockStore) AddBlockMappingForRepresentation(orgID uuid.UUID, representationID, externalID, internalID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := mockMappingKey(orgID, representationID, externalID)
-	m.mappings[key] = internalID
-	if b := m.blocks[fmt.Sprintf("%s:%s", orgID, internalID)]; b != nil && strings.TrimSpace(b.Sha1) == "" {
-		b.Sha1 = externalID
-		if rep := strings.TrimSpace(representationID); rep != "" {
-			b.RepresentationID = rep
+	m.addBlockMappingLocked(orgID, representationID, externalID, internalID)
+}
+
+// addBlockMappingLocked mirrors the server-derived blocks.sha1 + representation_id
+// onto the block row so GC mapping cleanup (which reads blocks.sha1 / representation_id
+// instead of the dropped reverse index) can resolve and scope the forward row. Each
+// field is filled independently so a block that already carries a sha1 still gets its
+// representation modeled. Caller must hold m.mu.
+func (m *MockStore) addBlockMappingLocked(orgID uuid.UUID, representationID, externalID, internalID string) {
+	m.mappings[mockMappingKey(orgID, representationID, externalID)] = internalID
+	if b := m.blocks[fmt.Sprintf("%s:%s", orgID, internalID)]; b != nil {
+		if strings.TrimSpace(b.Sha1) == "" {
+			b.Sha1 = externalID
+		}
+		if strings.TrimSpace(b.RepresentationID) == "" && strings.TrimSpace(representationID) != "" {
+			b.RepresentationID = representationID
 		}
 	}
 }

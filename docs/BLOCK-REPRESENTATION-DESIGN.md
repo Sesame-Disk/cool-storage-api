@@ -107,3 +107,15 @@ any missing `blocks.representation_id` deterministically on imported/legacy rows
   same `representation_id` contract.
 - Reuse or cache `representation_id` on the remaining legacy SHA-1 read hotpaths
   beyond sync and SeafHTTP, especially v2 file/share download flows.
+- Authorize the hash-only block surfaces (bare-SHA GET, `CheckBlocks`, mapping
+  resolution) by real library membership rather than org + content hash. Tracked as
+  `KNOWN_ISSUES.md → ISSUE-BLOCK-CROSS-LIBRARY-READ-01`.
+
+## Block ID canonicalization
+
+External SHA-1 and internal SHA-256 identifiers are canonicalized to trimmed
+lowercase via `db.NormalizeBlockID` at every mapping write, lookup, delete, and on
+`blocks.sha1`, plus the streaming and GC resolvers. Hex is case-insensitive, so this
+keeps a single content-address from splitting across partition keys or missing a
+lookup on letter case. Server-derived IDs are already lowercase; the canonicalization
+is applied consistently as defense-in-depth against any non-server-derived id.

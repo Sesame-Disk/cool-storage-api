@@ -29,6 +29,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | API Token Library Access | ✅ Complete | 37 integration tests, full RW/RO enforcement |
 | Move/Copy Dialog Tree | ✅ Fixed | `with_parents` param missing in ListDirectoryV21 |
 | **Cross-Representation Copy/Move** | 🟡 Guarded limitation | Cross-library batch copy/move is now rejected when source and destination libraries use different block representations. Safe same-representation paths continue to work; a re-materializing transform path is still missing. See ISSUE-BLOCK-REPRESENTATION-COPY-01 and `docs/BLOCK-REPRESENTATION-DESIGN.md`. |
+| **Cross-Library Block Read Authorization (hash-only)** | 🟡 Hardening backlog | Blocks are content-addressed and deduplicated per **org**, not per library. The hash-only surfaces (bare-SHA `seafhttp` block GET, `CheckBlocks`, SHA-1→SHA-256 mapping resolution) authorize by org + a repo-scoped token + knowledge of the content hash, not by real library membership. Low severity (requires the exact SHA-256/SHA-1, and claiming an org block you did not upload is blocked by session materialization), but library-scoped read authorization is future hardening. See ISSUE-BLOCK-CROSS-LIBRARY-READ-01 below. |
 | GC TTL Enforcement | Partial | `version_ttl_days` and `auto_delete_days` have storage, API, and scanner wiring, but their current behavior does not fully match the library settings UI. See ISSUE-LIB-RETENTION-01. |
 | Admin Panel | ✅ Working in Docker | `/sys/` route serves sysadmin.html via nginx + Go catch-all |
 | Frontend Permission UI | 🟡 ~85% Done | API layer returns real permissions on all directory/file endpoints. **Fixed**: `"owner"` permission now mapped to `"rw"` in API responses (was breaking upload button). **Enhanced (2026-03-11)**: Granular `PermissionFlags` (8 flags) now enforced backend-side via `RequirePermFlag()`. Upload/share link uploaders updated. Remaining: some UI components that conditionally render controls based on flags. |
@@ -277,6 +278,45 @@ This is the safe PR1 boundary for representation-aware mappings.
 
 - `docs/BLOCK-REPRESENTATION-DESIGN.md`
 - `docs/ARCHITECTURE.md`
+
+### ISSUE-BLOCK-CROSS-LIBRARY-READ-01: Hash-Only Block Surfaces Authorize by Org, Not Library Membership
+
+**Status**: 🟡 Hardening backlog (2026-07-07)
+**Severity**: Low — requires knowing the exact content hash; org blocks a caller did not upload cannot be silently claimed (session materialization gate). Not an open data-exfiltration hole today, but a defense-in-depth gap.
+**Affected**: `seafhttp` bare-SHA block GET, `POST /api/v2/blocks/check` (`CheckBlocks`), and SHA-1→SHA-256 mapping resolution.
+
+#### Problem
+
+Physical blocks are content-addressed and deduplicated per **org** (`blocks`,
+`block_id_mappings`, and S3 objects are keyed by `(org_id, hash)`), not per library.
+The hash-only surfaces authenticate a repo-scoped token and check org + hash, but do
+not verify that the caller is a member of the *library that actually references the
+block*. Within one org, a party who already knows a block's SHA-256/SHA-1 can:
+
+- confirm the block exists org-wide via `CheckBlocks` (an existence oracle), and
+- in principle read block bytes it can address by hash even if it only holds a token
+  for a different library in the same org.
+
+Knowing the exact 256-bit content address is itself derived from possessing the
+content, and claiming an org block you did not upload into a new file is already
+blocked (the session-aware check reports S3-only blocks as `needs_upload`), so this
+is a hardening item rather than an active exploit.
+
+#### Remaining Work (future hardening)
+
+1. Authorize hash-only reads by real membership of the library that references the block.
+2. Block cross-library reads that address a block purely by its SHA-256.
+3. Prevent `CheckBlocks` from acting as a cross-library existence oracle.
+4. Evolve `block_references` toward `(library_id, ref_kind)` so liveness/authorization can be reasoned about per library rather than per org.
+5. Strengthen the publication invariant for `fs:` references so a library only ever gains references to blocks it legitimately owns.
+
+#### Related Docs
+
+- `docs/BLOCK-REPRESENTATION-DESIGN.md`
+- `docs/ARCHITECTURE.md`
+
+### (file statistics follow-up, see ISSUE-FILE-STATS-01)
+
 - Write file operation events from upload/create/edit/delete/move/rename/download/preview handlers
 - Implement real aggregation in `AdminStatisticFiles`
 - Implement `OrgStatisticFiles` using the same event source scoped by org

@@ -238,8 +238,8 @@ func (db *DB) WriteBlockIDMapping(orgID, representationID, externalID, internalI
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		return err
 	}
-	externalID = strings.ToLower(strings.TrimSpace(externalID))
-	internalID = strings.ToLower(strings.TrimSpace(internalID))
+	externalID = NormalizeBlockID(externalID)
+	internalID = NormalizeBlockID(internalID)
 	ts := createdAt.UTC()
 	if ts.IsZero() {
 		ts = time.Now().UTC()
@@ -267,7 +267,7 @@ func (db *DB) GetBlockIDMapping(orgID, representationID, externalID string) (int
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		return "", false, err
 	}
-	externalID = strings.ToLower(strings.TrimSpace(externalID))
+	externalID = NormalizeBlockID(externalID)
 	if externalID == "" {
 		return "", false, nil
 	}
@@ -304,8 +304,8 @@ func (db *DB) WriteVerifiedWebBlockMapping(orgID, representationID, externalID, 
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		return err
 	}
-	externalID = strings.ToLower(strings.TrimSpace(externalID))
-	internalID = strings.ToLower(strings.TrimSpace(internalID))
+	externalID = NormalizeBlockID(externalID)
+	internalID = NormalizeBlockID(internalID)
 	ts := createdAt.UTC()
 	if ts.IsZero() {
 		ts = time.Now().UTC()
@@ -458,7 +458,7 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		return err
 	}
-	sha1 = strings.TrimSpace(sha1)
+	sha1 = NormalizeBlockID(sha1)
 	if sha1 != "" && !isHexN(sha1, 40) {
 		return fmt.Errorf("invalid block sha1 for %s", blockID)
 	}

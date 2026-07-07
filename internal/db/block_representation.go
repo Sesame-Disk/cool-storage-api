@@ -9,6 +9,16 @@ import (
 
 const PlainBlockRepresentationID = "plain:v1"
 
+// NormalizeBlockID canonicalizes a hex block identifier (external SHA-1 or internal
+// SHA-256) to trimmed lowercase. Hex is case-insensitive, so without this the same
+// content-address could land in two different partition keys or miss a lookup purely
+// on letter case. Server-derived IDs are already lowercase; applying this at every
+// mapping read/write/delete and on blocks.sha1 keeps the canonicalization consistent
+// (and defensive if a non-server-derived uppercase id ever reaches these paths).
+func NormalizeBlockID(id string) string {
+	return strings.ToLower(strings.TrimSpace(id))
+}
+
 func EncryptedLibraryBlockRepresentationID(libraryID string) string {
 	libraryID = strings.TrimSpace(libraryID)
 	if libraryID == "" {

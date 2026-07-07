@@ -1697,7 +1697,7 @@ func (s *CassandraStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockIDs []
 		err := s.db.Session().Query(`
 			SELECT internal_id FROM block_id_mappings
 			WHERE org_id = ? AND representation_id = ? AND external_id = ?
-		`, orgID.String(), representationID, blockIDs[idx]).Scan(&internalID)
+		`, orgID.String(), representationID, db.NormalizeBlockID(blockIDs[idx])).Scan(&internalID)
 		return internalID, err
 	})
 }
@@ -1849,6 +1849,7 @@ func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID s
 }
 
 func (s *CassandraStore) DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error {
+	externalID = db.NormalizeBlockID(externalID)
 	if err := s.db.Session().Query(`
 		DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?
 	`, orgID.String(), representationID, externalID).Exec(); err != nil {
