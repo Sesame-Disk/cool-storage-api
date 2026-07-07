@@ -73,6 +73,11 @@ func TestBlockMappingRepresentationScoped_NoCrossDomainConflict(t *testing.T) {
 	if err := database.WriteVerifiedWebBlockMapping(orgID, plainRep, externalSHA1, internalPlain, time.Now().UTC()); err != nil {
 		t.Fatalf("idempotent re-write must not conflict, got: %v", err)
 	}
+	// The legacy writer must reject the same-domain remap too.
+	tamperedCipher := mcSHA256(append(content, []byte("-ciphertext-tampered")...))
+	if err := database.WriteBlockIDMapping(orgID, encRep, externalSHA1, tamperedCipher, time.Now().UTC()); !errors.Is(err, dbpkg.ErrBlockIDMappingConflict) {
+		t.Fatalf("legacy same-domain external->different-internal must conflict, got: %v", err)
+	}
 	// The integrity guard still fires on a genuine SAME-domain collision.
 	tampered := mcSHA256(append(content, []byte("-tampered")...))
 	if err := database.WriteVerifiedWebBlockMapping(orgID, plainRep, externalSHA1, tampered, time.Now().UTC()); !errors.Is(err, dbpkg.ErrBlockIDMappingConflict) {

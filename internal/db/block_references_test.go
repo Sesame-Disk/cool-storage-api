@@ -197,6 +197,61 @@ func TestUpsertBlockMetadataWithSHA1_RejectsMalformedInputSHA1(t *testing.T) {
 	}
 }
 
+func TestWriteBlockIDMapping_RejectsMalformedIDs(t *testing.T) {
+	database := &DB{}
+	oldGet := getBlockIDMappingForWriteCheckFn
+	oldInsert := insertBlockIDMappingForWriteCheckFn
+	t.Cleanup(func() {
+		getBlockIDMappingForWriteCheckFn = oldGet
+		insertBlockIDMappingForWriteCheckFn = oldInsert
+	})
+
+	getBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID string) (string, bool, error) {
+		t.Fatal("existing mapping lookup should not run for malformed IDs")
+		return "", false, nil
+	}
+	insertBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID, internalID string, createdAt time.Time) error {
+		t.Fatal("insert should not run for malformed IDs")
+		return nil
+	}
+
+	err := database.WriteBlockIDMapping("org-1", PlainBlockRepresentationID, "not-a-sha1", strings.Repeat("a", 64), time.Time{})
+	if err == nil || !strings.Contains(err.Error(), "invalid external block id") {
+		t.Fatalf("WriteBlockIDMapping() external error = %v, want invalid external block id", err)
+	}
+
+	err = database.WriteBlockIDMapping("org-1", PlainBlockRepresentationID, strings.Repeat("b", 40), "not-a-sha256", time.Time{})
+	if err == nil || !strings.Contains(err.Error(), "invalid internal block id") {
+		t.Fatalf("WriteBlockIDMapping() internal error = %v, want invalid internal block id", err)
+	}
+}
+
+func TestWriteBlockIDMapping_RejectsSameDomainRemap(t *testing.T) {
+	database := &DB{}
+	oldGet := getBlockIDMappingForWriteCheckFn
+	oldInsert := insertBlockIDMappingForWriteCheckFn
+	t.Cleanup(func() {
+		getBlockIDMappingForWriteCheckFn = oldGet
+		insertBlockIDMappingForWriteCheckFn = oldInsert
+	})
+
+	getBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID string) (string, bool, error) {
+		if orgID != "org-1" || representationID != PlainBlockRepresentationID || externalID != strings.Repeat("b", 40) {
+			t.Fatalf("lookup args = %s/%s/%s", orgID, representationID, externalID)
+		}
+		return strings.Repeat("a", 64), true, nil
+	}
+	insertBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID, internalID string, createdAt time.Time) error {
+		t.Fatal("insert should not run when an existing conflicting mapping is present")
+		return nil
+	}
+
+	err := database.WriteBlockIDMapping("org-1", PlainBlockRepresentationID, strings.Repeat("b", 40), strings.Repeat("c", 64), time.Time{})
+	if !errors.Is(err, ErrBlockIDMappingConflict) {
+		t.Fatalf("WriteBlockIDMapping() error = %v, want ErrBlockIDMappingConflict", err)
+	}
+}
+
 func TestEnsureBlockIdentity_PlaintextBackfillsMissingRepresentationID(t *testing.T) {
 	database := &DB{}
 	oldRead := readBlockIdentityForRepairFn
@@ -256,6 +311,35 @@ func TestEnsureBlockIdentity_PlaintextRejectsStoredRepresentationConflict(t *tes
 	err := database.ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("a", 40))
 	if err == nil || !strings.Contains(err.Error(), "conflicting representation id") {
 		t.Fatalf("ensureBlockIdentity() error = %v, want conflicting representation id", err)
+	}
+}
+
+func TestEnsureBlockIdentity_DoesNotBackfillRepresentationWhenSHA1Conflicts(t *testing.T) {
+	database := &DB{}
+	oldRead := readBlockIdentityForRepairFn
+	oldBackfillRepresentation := backfillBlockRepresentationIDFn
+	oldBackfillSHA1 := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		readBlockIdentityForRepairFn = oldRead
+		backfillBlockRepresentationIDFn = oldBackfillRepresentation
+		backfillBlockSHA1Fn = oldBackfillSHA1
+	})
+
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+		return "", strings.Repeat("d", 40), true, nil
+	}
+	backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
+		t.Fatal("representation backfill should not run when the stored sha1 already conflicts")
+		return false, nil
+	}
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
+		t.Fatal("sha1 backfill should not run when the stored sha1 already conflicts")
+		return false, nil
+	}
+
+	err := database.ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("e", 40))
+	if err == nil || !strings.Contains(err.Error(), "conflicting sha1") {
+		t.Fatalf("ensureBlockIdentity() error = %v, want conflicting sha1", err)
 	}
 }
 

@@ -1341,33 +1341,6 @@ func TestWorker_ProcessFSObject_LibraryCascadeChildSkipsAfterRestore(t *testing.
 	}
 }
 
-func TestWorker_ProcessBlockMapping(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	w := NewWorker(store, nil, q, 100, 0, false, stats)
-
-	orgID := uuid.New()
-	store.AddBlockMapping(orgID, "ext-sha1", "int-sha256")
-
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlockMapping, "ext-sha1", uuid.Nil, "", 0)
-
-	ctx := context.Background()
-	n, err := w.ProcessOnce(ctx)
-	if err != nil {
-		t.Fatalf("ProcessOnce failed: %v", err)
-	}
-	if n != 0 {
-		t.Errorf("expected 0 processed, got %d", n)
-	}
-
-	// Legacy block_mapping items no longer carry representation_id, so the worker
-	// must fail closed instead of guessing the deletion domain.
-	if !store.ForwardBlockMappingExists(orgID, "ext-sha1") {
-		t.Error("expected forward mapping ext-sha1 left untouched")
-	}
-}
-
 // Unit test for QueueItem type conversion
 func TestQueueItem_TypeConversion(t *testing.T) {
 	tests := []struct {
@@ -1377,7 +1350,6 @@ func TestQueueItem_TypeConversion(t *testing.T) {
 		{"block", ItemBlock},
 		{"commit", ItemCommit},
 		{"fs_object", ItemFSObject},
-		{"block_mapping", ItemBlockMapping},
 		{"share_link", ItemShareLink},
 		{"share", ItemShare},
 		{"restore_job", ItemRestoreJob},

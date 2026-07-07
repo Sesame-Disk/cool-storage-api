@@ -434,24 +434,6 @@ larger hotpath optimization, not part of the namespace-safety change.
 
 ---
 
-## 31. Legacy GC `block_mapping` Queue Items (DEFERRED CLEANUP)
-
-### Current State
-Exact forward-mapping cleanup now requires `(org_id, representation_id,
-external_sha1)` from canonical block metadata. The worker therefore rejects the
-legacy `block_mapping` queue item shape fail-closed because it carries only
-`external_id` and cannot safely infer the representation domain.
-
-### Why It Was Deferred
-The current production cleanup path no longer needs this queue item type; exact
-mapping deletion happens during canonical block GC. Removing the enum and every
-fixture/reference is a follow-up cleanup task, not a correctness blocker.
-
-### Follow-Up Plan
-1. Confirm no live enqueue path still emits `ItemBlockMapping`.
-2. Remove the deprecated queue item type and any dead deserialization/test fixtures.
-3. Add a one-shot audit or migration note for operators in case old queued rows exist in pre-PR1 environments.
-
 - Only `EnsureReusableBlockPresent` (P-2) honors `storage_key`. Harmless today
   because `storage_key` is either empty (4 of 5 upload paths write `""`) or equal to
   the hash-derived key (OnlyOffice), so the hash-derived key is always correct. The

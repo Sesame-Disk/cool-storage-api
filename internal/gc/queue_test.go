@@ -16,7 +16,6 @@ func TestItemType_Constants(t *testing.T) {
 		{ItemBlock, "block"},
 		{ItemCommit, "commit"},
 		{ItemFSObject, "fs_object"},
-		{ItemBlockMapping, "block_mapping"},
 		{ItemShareLink, "share_link"},
 	}
 
@@ -367,14 +366,13 @@ func TestQueue_MultipleItemTypes(t *testing.T) {
 	q.Enqueue(orgID, ItemCommit, "commit-1", libID, "")
 	q.Enqueue(orgID, ItemFSObject, "fs-1", libID, "")
 	q.Enqueue(orgID, ItemShareLink, "token-abc", uuid.Nil, "")
-	q.Enqueue(orgID, ItemBlockMapping, "ext-123", uuid.Nil, "")
 
 	items, err := q.DequeueBatch(orgID, 10, 0)
 	if err != nil {
 		t.Fatalf("DequeueBatch failed: %v", err)
 	}
-	if len(items) != 5 {
-		t.Errorf("expected 5 items, got %d", len(items))
+	if len(items) != 4 {
+		t.Errorf("expected 4 items, got %d", len(items))
 	}
 
 	// Verify all types are present
@@ -382,7 +380,7 @@ func TestQueue_MultipleItemTypes(t *testing.T) {
 	for _, item := range items {
 		typeSet[item.ItemType] = true
 	}
-	for _, expected := range []ItemType{ItemBlock, ItemCommit, ItemFSObject, ItemShareLink, ItemBlockMapping} {
+	for _, expected := range []ItemType{ItemBlock, ItemCommit, ItemFSObject, ItemShareLink} {
 		if !typeSet[expected] {
 			t.Errorf("missing item type %s", expected)
 		}

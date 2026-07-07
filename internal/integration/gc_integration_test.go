@@ -190,6 +190,16 @@ func blockIDMappingExists(t *testing.T, orgID, externalID string) bool {
 	return err == nil && internalID != ""
 }
 
+func blockIDMappingExistsForRepresentation(t *testing.T, orgID, representationID, externalID string) bool {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	var internalID string
+	err := session.Query(`
+		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?
+	`, orgID, representationID, externalID).Scan(&internalID)
+	return err == nil && internalID != ""
+}
+
 func gcS3OrphanProjectionExists(t *testing.T, orgID, blockID string, firstSeenAt time.Time) bool {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
@@ -1106,6 +1116,156 @@ func TestGC_WorkerCleansForwardMappingViaBlockSHA1(t *testing.T) {
 	}
 	if blockIDMappingExists(t, orgID, externalSHA1) {
 		t.Fatal("expected forward mapping deleted via blocks.sha1 (resolved from sha1, not block_id)")
+	}
+}
+
+func TestGC_WorkerDeletingPlainBlockPreservesEncryptedSibling(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	queue := gcpkg.NewQueue(store)
+	worker := gcpkg.NewWorker(store, nil, queue, 100, 0, false, &gcpkg.Stats{})
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	encLibraryID := uuid.NewString()
+	plainRep := db.PlainBlockRepresentationID
+	encRep := db.EncryptedLibraryBlockRepresentationID(encLibraryID)
+	externalSHA1 := fmt.Sprintf("%040x", time.Now().UnixNano())
+	plainBlockID := fmt.Sprintf("%064x", time.Now().UnixNano())
+	encBlockID := fmt.Sprintf("%064x", time.Now().UnixNano()+1)
+	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", ""); err != nil {
+		t.Fatalf("seed plain block: %v", err)
+	}
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", ""); err != nil {
+		t.Fatalf("seed encrypted block: %v", err)
+	}
+	if err := database.WriteBlockIDMapping(orgID, plainRep, externalSHA1, plainBlockID, time.Now().UTC()); err != nil {
+		t.Fatalf("seed plain mapping: %v", err)
+	}
+	if err := database.WriteBlockIDMapping(orgID, encRep, externalSHA1, encBlockID, time.Now().UTC()); err != nil {
+		t.Fatalf("seed encrypted mapping: %v", err)
+	}
+	_ = ensureSyntheticBlockCandidateForTest(t, orgUUID, plainBlockID, "hot", queuedAt)
+	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, plainBlockID, "hot", queuedAt)
+	t.Cleanup(func() {
+		cleanupGCBlockFixturesForTest(t, orgUUID, plainBlockID)
+		cleanupGCBlockFixturesForTest(t, orgUUID, encBlockID)
+		_ = database.Session().Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`, orgID, plainRep, externalSHA1).Exec()
+		_ = database.Session().Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`, orgID, encRep, externalSHA1).Exec()
+		_ = database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, plainBlockID).Exec()
+		_ = database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, encBlockID).Exec()
+	})
+
+	if !blockExistsInDB(t, orgID, plainBlockID) || !blockExistsInDB(t, orgID, encBlockID) {
+		t.Fatal("expected both canonical block rows before worker")
+	}
+	if !blockIDMappingExistsForRepresentation(t, orgID, plainRep, externalSHA1) || !blockIDMappingExistsForRepresentation(t, orgID, encRep, externalSHA1) {
+		t.Fatal("expected both forward mappings before worker")
+	}
+
+	for attempt := 0; attempt < 8; attempt++ {
+		if !blockExistsInDB(t, orgID, plainBlockID) &&
+			!blockIDMappingExistsForRepresentation(t, orgID, plainRep, externalSHA1) {
+			break
+		}
+		processed, err := worker.ProcessOrgOnce(context.Background(), orgUUID)
+		if err != nil {
+			t.Fatalf("ProcessOrgOnce attempt %d failed: %v", attempt+1, err)
+		}
+		if processed == 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	if blockExistsInDB(t, orgID, plainBlockID) {
+		t.Fatal("expected plain block row deleted")
+	}
+	if blockIDMappingExistsForRepresentation(t, orgID, plainRep, externalSHA1) {
+		t.Fatal("expected plain forward mapping deleted")
+	}
+	if !blockExistsInDB(t, orgID, encBlockID) {
+		t.Fatal("expected encrypted sibling block row preserved")
+	}
+	if !blockIDMappingExistsForRepresentation(t, orgID, encRep, externalSHA1) {
+		t.Fatal("expected encrypted sibling forward mapping preserved")
+	}
+}
+
+func TestGC_WorkerDeletingEncryptedBlockPreservesPlainSibling(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	queue := gcpkg.NewQueue(store)
+	worker := gcpkg.NewWorker(store, nil, queue, 100, 0, false, &gcpkg.Stats{})
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	encLibraryID := uuid.NewString()
+	plainRep := db.PlainBlockRepresentationID
+	encRep := db.EncryptedLibraryBlockRepresentationID(encLibraryID)
+	externalSHA1 := fmt.Sprintf("%040x", time.Now().UnixNano())
+	plainBlockID := fmt.Sprintf("%064x", time.Now().UnixNano())
+	encBlockID := fmt.Sprintf("%064x", time.Now().UnixNano()+1)
+	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", ""); err != nil {
+		t.Fatalf("seed plain block: %v", err)
+	}
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", ""); err != nil {
+		t.Fatalf("seed encrypted block: %v", err)
+	}
+	if err := database.WriteBlockIDMapping(orgID, plainRep, externalSHA1, plainBlockID, time.Now().UTC()); err != nil {
+		t.Fatalf("seed plain mapping: %v", err)
+	}
+	if err := database.WriteBlockIDMapping(orgID, encRep, externalSHA1, encBlockID, time.Now().UTC()); err != nil {
+		t.Fatalf("seed encrypted mapping: %v", err)
+	}
+	_ = ensureSyntheticBlockCandidateForTest(t, orgUUID, encBlockID, "hot", queuedAt)
+	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, encBlockID, "hot", queuedAt)
+	t.Cleanup(func() {
+		cleanupGCBlockFixturesForTest(t, orgUUID, plainBlockID)
+		cleanupGCBlockFixturesForTest(t, orgUUID, encBlockID)
+		_ = database.Session().Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`, orgID, plainRep, externalSHA1).Exec()
+		_ = database.Session().Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`, orgID, encRep, externalSHA1).Exec()
+		_ = database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, plainBlockID).Exec()
+		_ = database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, encBlockID).Exec()
+	})
+
+	if !blockExistsInDB(t, orgID, plainBlockID) || !blockExistsInDB(t, orgID, encBlockID) {
+		t.Fatal("expected both canonical block rows before worker")
+	}
+	if !blockIDMappingExistsForRepresentation(t, orgID, plainRep, externalSHA1) || !blockIDMappingExistsForRepresentation(t, orgID, encRep, externalSHA1) {
+		t.Fatal("expected both forward mappings before worker")
+	}
+
+	for attempt := 0; attempt < 8; attempt++ {
+		if !blockExistsInDB(t, orgID, encBlockID) &&
+			!blockIDMappingExistsForRepresentation(t, orgID, encRep, externalSHA1) {
+			break
+		}
+		processed, err := worker.ProcessOrgOnce(context.Background(), orgUUID)
+		if err != nil {
+			t.Fatalf("ProcessOrgOnce attempt %d failed: %v", attempt+1, err)
+		}
+		if processed == 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	if blockExistsInDB(t, orgID, encBlockID) {
+		t.Fatal("expected encrypted block row deleted")
+	}
+	if blockIDMappingExistsForRepresentation(t, orgID, encRep, externalSHA1) {
+		t.Fatal("expected encrypted forward mapping deleted")
+	}
+	if !blockExistsInDB(t, orgID, plainBlockID) {
+		t.Fatal("expected plain sibling block row preserved")
+	}
+	if !blockIDMappingExistsForRepresentation(t, orgID, plainRep, externalSHA1) {
+		t.Fatal("expected plain sibling forward mapping preserved")
 	}
 }
 

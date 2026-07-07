@@ -229,7 +229,8 @@ func NormalizeBlockIDs(blockIDs []string) []string {
 // WriteBlockIDMapping writes the forward external SHA-1 -> internal SHA-256
 // mapping used to resolve a bare-SHA-1 compatibility read inside one block
 // representation domain. The write is idempotent for the same internal ID and
-// fails closed on a conflicting remap.
+// fails closed on a conflicting remap, except for the documented tiny
+// read-before-write race between two same-key concurrent SHA-1 collisions.
 func (db *DB) WriteBlockIDMapping(orgID, representationID, externalID, internalID string, createdAt time.Time) error {
 	if db == nil {
 		return nil
@@ -244,6 +245,16 @@ func (db *DB) WriteBlockIDMapping(orgID, representationID, externalID, internalI
 		ts = time.Now().UTC()
 	}
 	return db.writeCheckedBlockIDMapping(orgID, representationID, externalID, internalID, ts)
+}
+
+var getBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID string) (string, bool, error) {
+	return database.GetBlockIDMapping(orgID, representationID, externalID)
+}
+
+var insertBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID, internalID string, createdAt time.Time) error {
+	return database.Session().Query(`
+		INSERT INTO block_id_mappings (org_id, representation_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?, ?)
+	`, orgID, representationID, externalID, internalID, createdAt).Exec()
 }
 
 // GetBlockIDMapping resolves one external SHA-1 block ID to its internal SHA-256
@@ -303,7 +314,13 @@ func (db *DB) WriteVerifiedWebBlockMapping(orgID, representationID, externalID, 
 }
 
 func (db *DB) writeCheckedBlockIDMapping(orgID, representationID, externalID, internalID string, createdAt time.Time) error {
-	existing, found, err := db.GetBlockIDMapping(orgID, representationID, externalID)
+	if !isHexN(externalID, 40) {
+		return fmt.Errorf("invalid external block id for mapping %s", externalID)
+	}
+	if !isHexN(internalID, 64) {
+		return fmt.Errorf("invalid internal block id for mapping %s", internalID)
+	}
+	existing, found, err := getBlockIDMappingForWriteCheckFn(db, orgID, representationID, externalID)
 	if err != nil {
 		return fmt.Errorf("read existing block mapping %s: %w", externalID, err)
 	}
@@ -313,9 +330,7 @@ func (db *DB) writeCheckedBlockIDMapping(orgID, representationID, externalID, in
 		}
 		return nil
 	}
-	return db.Session().Query(`
-		INSERT INTO block_id_mappings (org_id, representation_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?, ?)
-	`, orgID, representationID, externalID, internalID, createdAt).Exec()
+	return insertBlockIDMappingForWriteCheckFn(db, orgID, representationID, externalID, internalID, createdAt)
 }
 
 // AddPublishAttemptReferences stages temporary pub:<attempt> references for an
@@ -483,6 +498,12 @@ func (db *DB) ensureBlockIdentity(orgID, blockID, representationID, sha1 string)
 	}
 	currentRepresentationID = strings.TrimSpace(currentRepresentationID)
 	currentSHA1 = strings.TrimSpace(currentSHA1)
+	if currentRepresentationID != "" && currentRepresentationID != representationID {
+		return fmt.Errorf("block %s already has conflicting representation id %s", blockID, currentRepresentationID)
+	}
+	if sha1 != "" && currentSHA1 != "" && currentSHA1 != sha1 {
+		return fmt.Errorf("block %s already has conflicting sha1 %s", blockID, currentSHA1)
+	}
 	if currentRepresentationID == "" {
 		applied, err := backfillBlockRepresentationIDFn(db, orgID, blockID, representationID, currentRepresentationID)
 		if err != nil {
@@ -491,8 +512,6 @@ func (db *DB) ensureBlockIdentity(orgID, blockID, representationID, sha1 string)
 		if !applied {
 			return fmt.Errorf("block metadata for %s changed before representation repair", blockID)
 		}
-	} else if currentRepresentationID != representationID {
-		return fmt.Errorf("block %s already has conflicting representation id %s", blockID, currentRepresentationID)
 	}
 	if sha1 == "" {
 		return nil
@@ -506,9 +525,6 @@ func (db *DB) ensureBlockIdentity(orgID, blockID, representationID, sha1 string)
 			return fmt.Errorf("block metadata for %s changed before sha1 repair", blockID)
 		}
 		return nil
-	}
-	if currentSHA1 != sha1 {
-		return fmt.Errorf("block %s already has conflicting sha1 %s", blockID, currentSHA1)
 	}
 	return nil
 }

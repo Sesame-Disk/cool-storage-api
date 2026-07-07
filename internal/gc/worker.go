@@ -365,8 +365,6 @@ func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
 		return w.processCommit(item)
 	case ItemFSObject:
 		return w.processFSObject(ctx, item)
-	case ItemBlockMapping:
-		return w.processBlockMapping(ctx, item)
 	case ItemShareLink:
 		return w.processShareLink(ctx, item)
 	case ItemShare:
@@ -937,14 +935,6 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 
 	log.Printf("[GC Worker] Deleted fs_object %s", item.ItemID)
 	return nil
-}
-
-func (w *Worker) processBlockMapping(ctx context.Context, item QueueItem) error {
-	if w.dryRun {
-		log.Printf("[GC Worker] DRY RUN: Would delete block mapping %s", item.ItemID)
-		return nil
-	}
-	return fmt.Errorf("block_mapping queue items are unsupported without representation_id")
 }
 
 func (w *Worker) processShareLink(ctx context.Context, item QueueItem) error {
