@@ -77,3 +77,21 @@ func TestResolveRequiredLibraryBlockRepresentation_NonCanonicalIsFatal(t *testin
 		t.Fatalf("error = %v, want non-canonical message", err)
 	}
 }
+
+func TestResolveRequiredLibraryBlockRepresentation_WrongLibraryIsFatal(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	otherLibraryID := uuid.New()
+
+	got, err := resolveRequiredLibraryBlockRepresentation(store, orgID, libraryID, db.EncryptedLibraryBlockRepresentationID(otherLibraryID.String()), "library match test")
+	if err == nil {
+		t.Fatal("resolveRequiredLibraryBlockRepresentation() error = nil, want different-library error")
+	}
+	if got != "" {
+		t.Fatalf("resolveRequiredLibraryBlockRepresentation() = %q, want empty result on error", got)
+	}
+	if !strings.Contains(err.Error(), "does not belong") {
+		t.Fatalf("error = %v, want different-library message", err)
+	}
+}

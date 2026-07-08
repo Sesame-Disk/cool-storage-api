@@ -1172,6 +1172,11 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 }
 
 func (m *MockStore) EnqueueBatch(items []QueueItem) error {
+	for _, item := range items {
+		if err := validateQueueItemBlockRepresentation(item); err != nil {
+			return err
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.enqueueBatchErr != nil {

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/google/uuid"
 )
 
@@ -84,8 +83,8 @@ func (q *Queue) EnqueueBatch(items []QueueItem) error {
 		return nil
 	}
 	for _, item := range items {
-		if itemTypeRequiresBlockRepresentation(item.ItemType) && !db.IsCanonicalBlockRepresentationID(item.BlockRepresentationID) {
-			return fmt.Errorf("gc: item type %s (%s) requires a canonical block representation, got %q", item.ItemType, item.ItemID, item.BlockRepresentationID)
+		if err := validateQueueItemBlockRepresentation(item); err != nil {
+			return err
 		}
 	}
 	return q.store.EnqueueBatch(items)

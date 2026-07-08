@@ -2,6 +2,7 @@ package gc
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -508,6 +509,51 @@ func TestQueue_EnqueueBatchRejectsItemsMissingRepresentation(t *testing.T) {
 				t.Fatalf("rejected batch must not persist any item, got %#v", items)
 			}
 		})
+	}
+}
+
+func TestQueue_EnqueueBatchRejectsItemsWithForeignRepresentation(t *testing.T) {
+	orgID := uuid.New()
+	libID := uuid.New()
+	otherLibID := uuid.New()
+	now := time.Now()
+	q := NewQueue(NewMockStore())
+
+	err := q.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              now,
+		ItemType:              ItemCommit,
+		ItemID:                "commit-1",
+		LibraryID:             libID,
+		BlockRepresentationID: db.EncryptedLibraryBlockRepresentationID(otherLibID.String()),
+	}})
+	if err == nil {
+		t.Fatal("expected foreign library representation to be rejected")
+	}
+}
+
+func TestQueue_EnqueueBatchRejectsNonCanonicalRepresentationFormats(t *testing.T) {
+	orgID := uuid.New()
+	libID := uuid.New()
+	now := time.Now()
+	q := NewQueue(NewMockStore())
+
+	cases := []string{
+		"library:" + strings.ReplaceAll(libID.String(), "-", ""),
+		"library:{" + libID.String() + "}",
+	}
+	for _, representationID := range cases {
+		err := q.EnqueueBatch([]QueueItem{{
+			OrgID:                 orgID,
+			QueuedAt:              now,
+			ItemType:              ItemCommit,
+			ItemID:                "commit-1",
+			LibraryID:             libID,
+			BlockRepresentationID: representationID,
+		}})
+		if err == nil {
+			t.Fatalf("expected non-canonical representation %q to be rejected", representationID)
+		}
 	}
 }
 

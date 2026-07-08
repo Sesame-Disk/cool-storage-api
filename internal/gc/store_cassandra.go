@@ -300,6 +300,11 @@ func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
 	if len(items) == 0 {
 		return nil
 	}
+	for _, item := range items {
+		if err := validateQueueItemBlockRepresentation(item); err != nil {
+			return err
+		}
+	}
 
 	// Insert in chunks of maxBatchSize to stay within Cassandra batch limits
 	for i := 0; i < len(items); i += maxBatchSize {

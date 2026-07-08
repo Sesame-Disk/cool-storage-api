@@ -672,9 +672,18 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 		default:
 		}
 
-		if strings.TrimSpace(lib.BlockRepresentationID) == "" {
-			metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
-			log.Printf("[GC Scanner] Phase 5: skipping library %s: missing block representation", lib.LibraryID)
+		if err := validateQueueItemBlockRepresentation(QueueItem{
+			ItemType:              ItemCommit,
+			ItemID:                lib.HeadCommitID,
+			LibraryID:             lib.LibraryID,
+			BlockRepresentationID: lib.BlockRepresentationID,
+		}); err != nil {
+			if strings.TrimSpace(lib.BlockRepresentationID) == "" {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+			} else {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
+			}
+			log.Printf("[GC Scanner] Phase 5: skipping library %s: %v", lib.LibraryID, err)
 			continue
 		}
 
@@ -767,9 +776,18 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 		default:
 		}
 
-		if strings.TrimSpace(lib.BlockRepresentationID) == "" {
-			metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
-			log.Printf("[GC Scanner] Phase 6: skipping library %s: missing block representation", lib.LibraryID)
+		if err := validateQueueItemBlockRepresentation(QueueItem{
+			ItemType:              ItemFSObject,
+			ItemID:                lib.HeadCommitID,
+			LibraryID:             lib.LibraryID,
+			BlockRepresentationID: lib.BlockRepresentationID,
+		}); err != nil {
+			if strings.TrimSpace(lib.BlockRepresentationID) == "" {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+			} else {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
+			}
+			log.Printf("[GC Scanner] Phase 6: skipping library %s: %v", lib.LibraryID, err)
 			continue
 		}
 
@@ -1165,9 +1183,17 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 		if exists {
 			continue
 		}
-		if strings.TrimSpace(lib.BlockRepresentationID) == "" {
-			metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
-			log.Printf("[GC Scanner] Phase 13: skipping deleted library %s: missing block representation", lib.LibraryID)
+		if err := validateQueueItemBlockRepresentation(QueueItem{
+			ItemType:              ItemLibraryCascade,
+			ItemID:                lib.LibraryID.String(),
+			BlockRepresentationID: lib.BlockRepresentationID,
+		}); err != nil {
+			if strings.TrimSpace(lib.BlockRepresentationID) == "" {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+			} else {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
+			}
+			log.Printf("[GC Scanner] Phase 13: skipping deleted library %s: %v", lib.LibraryID, err)
 			continue
 		}
 		batch = append(batch, QueueItem{

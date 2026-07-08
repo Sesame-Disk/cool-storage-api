@@ -33,6 +33,9 @@ func EncryptedLibraryBlockRepresentationID(libraryID string) string {
 	if libraryID == "" {
 		return ""
 	}
+	if parsed, err := uuid.Parse(libraryID); err == nil {
+		libraryID = parsed.String()
+	}
 	return "library:" + libraryID
 }
 
@@ -64,12 +67,29 @@ func IsCanonicalBlockRepresentationID(representationID string) bool {
 	if representationID == PlainBlockRepresentationID {
 		return true
 	}
-	rest, ok := strings.CutPrefix(representationID, "library:")
-	if !ok {
-		return false
+	_, ok := parseCanonicalLibraryBlockRepresentationID(representationID)
+	return ok
+}
+
+func IsCanonicalBlockRepresentationForLibrary(representationID string, libraryID uuid.UUID) bool {
+	representationID = strings.TrimSpace(representationID)
+	if representationID == PlainBlockRepresentationID {
+		return true
 	}
-	_, err := uuid.Parse(rest)
-	return err == nil
+	parsedLibraryID, ok := parseCanonicalLibraryBlockRepresentationID(representationID)
+	return ok && parsedLibraryID == libraryID
+}
+
+func parseCanonicalLibraryBlockRepresentationID(representationID string) (uuid.UUID, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(representationID), "library:")
+	if !ok {
+		return uuid.Nil, false
+	}
+	parsed, err := uuid.Parse(rest)
+	if err != nil || parsed.String() != rest {
+		return uuid.Nil, false
+	}
+	return parsed, true
 }
 
 func ResolveBlockRepresentationID(session *gocql.Session, orgID, libraryID string) (string, error) {

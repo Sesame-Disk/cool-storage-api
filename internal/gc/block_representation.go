@@ -24,6 +24,47 @@ func itemTypeRequiresBlockRepresentation(itemType ItemType) bool {
 	}
 }
 
+func queueItemRepresentationLibraryID(item QueueItem) (uuid.UUID, error) {
+	switch item.ItemType {
+	case ItemCommit, ItemFSObject:
+		if item.LibraryID == uuid.Nil {
+			return uuid.Nil, fmt.Errorf("gc: item type %s (%s) requires library_id", item.ItemType, item.ItemID)
+		}
+		return item.LibraryID, nil
+	case ItemLibraryCascade:
+		libraryID, err := uuid.Parse(strings.TrimSpace(item.ItemID))
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("gc: item type %s has invalid library id %q: %w", item.ItemType, item.ItemID, err)
+		}
+		return libraryID, nil
+	default:
+		return uuid.Nil, nil
+	}
+}
+
+func validateQueueItemBlockRepresentation(item QueueItem) error {
+	if !itemTypeRequiresBlockRepresentation(item.ItemType) {
+		return nil
+	}
+
+	representationID := strings.TrimSpace(item.BlockRepresentationID)
+	if representationID == "" {
+		return fmt.Errorf("gc: item type %s (%s) requires a block representation", item.ItemType, item.ItemID)
+	}
+	if !db.IsCanonicalBlockRepresentationID(representationID) {
+		return fmt.Errorf("gc: item type %s (%s) requires a canonical block representation, got %q", item.ItemType, item.ItemID, representationID)
+	}
+
+	libraryID, err := queueItemRepresentationLibraryID(item)
+	if err != nil {
+		return err
+	}
+	if !db.IsCanonicalBlockRepresentationForLibrary(representationID, libraryID) {
+		return fmt.Errorf("gc: item type %s (%s) carries block representation %q for different library %s", item.ItemType, item.ItemID, representationID, libraryID)
+	}
+	return nil
+}
+
 // resolveRequiredLibraryBlockRepresentation resolves the canonical block
 // representation for a library at enqueue time. It uses providedRepresentationID
 // (already persisted on the queue item) when present, otherwise reads it from the
@@ -51,9 +92,12 @@ func resolveRequiredLibraryBlockRepresentation(resolver libraryBlockRepresentati
 		metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
 		return "", fmt.Errorf("empty block representation for library %s during %s", libraryID, source)
 	}
-	if !db.IsCanonicalBlockRepresentationID(representationID) {
+	if !db.IsCanonicalBlockRepresentationForLibrary(representationID, libraryID) {
 		metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
-		return "", fmt.Errorf("non-canonical block representation %q for library %s during %s", representationID, libraryID, source)
+		if !db.IsCanonicalBlockRepresentationID(representationID) {
+			return "", fmt.Errorf("non-canonical block representation %q for library %s during %s", representationID, libraryID, source)
+		}
+		return "", fmt.Errorf("block representation %q does not belong to library %s during %s", representationID, libraryID, source)
 	}
 	return representationID, nil
 }
