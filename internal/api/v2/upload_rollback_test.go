@@ -26,7 +26,7 @@ func TestRegisterUploadedBlockAndMapping_WritesMappingAfterMetadata(t *testing.T
 		}
 		return nil
 	}
-	writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, externalBlockID, internalBlockID string) error {
+	writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, repoID, externalBlockID, internalBlockID string) error {
 		calls = append(calls, "mapping")
 		return nil
 	}
@@ -63,7 +63,7 @@ func TestRegisterUploadedBlockAndMapping_RollsBackOnMappingFailure(t *testing.T)
 		return nil
 	}
 	wantErr := errors.New("mapping boom")
-	writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, externalBlockID, internalBlockID string) error {
+	writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, repoID, externalBlockID, internalBlockID string) error {
 		return wantErr
 	}
 	var rollbackCalled bool
@@ -107,7 +107,7 @@ func TestRegisterUploadedBlockAndMapping_SkipsMappingWithoutExternalID(t *testin
 		return nil
 	}
 	writeCalled := false
-	writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, externalBlockID, internalBlockID string) error {
+	writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, repoID, externalBlockID, internalBlockID string) error {
 		writeCalled = true
 		return nil
 	}
@@ -136,7 +136,7 @@ func TestRegisterUploadedBlockAndMapping_StopsOnRegisterFailure(t *testing.T) {
 		return wantErr
 	}
 	writeCalled := false
-	writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, externalBlockID, internalBlockID string) error {
+	writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, repoID, externalBlockID, internalBlockID string) error {
 		writeCalled = true
 		return nil
 	}

@@ -598,6 +598,7 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		userEmail = h.resolveOwnerEmail(orgID, userID)
 	}
 	ownerName := strings.Split(userEmail, "@")[0]
+	blockRepresentationID := db.EffectiveBlockRepresentationID(newLibID.String(), library.Encrypted, "")
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
@@ -608,12 +609,14 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		batch.Query(`
 			INSERT INTO libraries (
 				org_id, library_id, owner_id, name, description, encrypted,
+				block_representation_id,
 				enc_version, salt, magic, random_key, magic_strong, random_key_strong,
 				storage_class, size_bytes, file_count, version_ttl_days,
 				head_commit_id, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, orgID, newLibID.String(), userID, library.Name,
 			library.Description, library.Encrypted,
+			blockRepresentationID,
 			encParams.EncVersion, encParams.Salt, encParams.Magic, encParams.RandomKey,
 			encParams.MagicStrong, encParams.RandomKeyStrong,
 			library.StorageClass, library.SizeBytes, library.FileCount, library.VersionTTLDays,
@@ -623,10 +626,11 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		// Dual-write to lookup table
 		batch.Query(`
 			INSERT INTO libraries_by_id (
-				library_id, org_id, owner_id, name, head_commit_id, encrypted,
+				library_id, org_id, owner_id, name, head_commit_id, encrypted, block_representation_id,
 				enc_version, magic, random_key, salt, magic_strong, random_key_strong
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, newLibID.String(), orgID, userID, library.Name, headCommitID, library.Encrypted,
+			blockRepresentationID,
 			encParams.EncVersion, encParams.Magic, encParams.RandomKey, encParams.Salt,
 			encParams.MagicStrong, encParams.RandomKeyStrong,
 		)
@@ -634,11 +638,12 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		batch.Query(`
 			INSERT INTO libraries (
 				org_id, library_id, owner_id, name, description, encrypted,
+				block_representation_id,
 				storage_class, size_bytes, file_count, version_ttl_days,
 				head_commit_id, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, orgID, newLibID.String(), userID, library.Name,
-			library.Description, library.Encrypted, library.StorageClass,
+			library.Description, library.Encrypted, blockRepresentationID, library.StorageClass,
 			library.SizeBytes, library.FileCount, library.VersionTTLDays,
 			headCommitID, library.CreatedAt, library.UpdatedAt,
 		)
@@ -646,9 +651,9 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		// Dual-write to lookup table (unencrypted)
 		batch.Query(`
 			INSERT INTO libraries_by_id (
-				library_id, org_id, owner_id, name, head_commit_id, encrypted
-			) VALUES (?, ?, ?, ?, ?, ?)
-		`, newLibID.String(), orgID, userID, library.Name, headCommitID, false,
+				library_id, org_id, owner_id, name, head_commit_id, encrypted, block_representation_id
+			) VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, newLibID.String(), orgID, userID, library.Name, headCommitID, false, blockRepresentationID,
 		)
 	}
 	if library.VersionTTLDays > 0 {

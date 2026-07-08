@@ -576,6 +576,18 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	// Only the legacy SHA-1 path consults block_id_mappings; on the common
+	// all-SHA-256 block list BatchResolveBlockIDs is a passthrough, so skip the
+	// per-request representation lookup and pass the non-empty plaintext default.
+	representationID := db.PlainBlockRepresentationID
+	if streaming.ContainsLegacySHA1(blockIDs) {
+		representationID, err = db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+		if err != nil {
+			log.Printf("[ServeRawFile] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+			return
+		}
+	}
 
 	// For iWork preview, we need to buffer the content (requires random access for ZIP parsing)
 	needsBuffer := c.Query("preview") == "1" && isAppleIWorkFile(ext)
@@ -583,7 +595,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	if needsBuffer {
 		// iWork preview: must buffer for ZIP extraction
 		var content bytes.Buffer
-		iworkResolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+		iworkResolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, representationID, blockIDs)
 		if err != nil {
 			log.Printf("[ServeRawFile] block ID resolution failed for org=%s: %v", orgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
@@ -646,7 +658,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries.
 	// Strict: fail before any header is written (see BatchResolveBlockIDs) so a
 	// stale SHA-1 can never truncate the response mid-stream.
-	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, representationID, blockIDs)
 	if err != nil {
 		log.Printf("[ServeRawFile] block ID resolution failed for org=%s: %v", orgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
@@ -968,10 +980,19 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Block storage not available.")
 		return
 	}
+	representationID := db.PlainBlockRepresentationID
+	if streaming.ContainsLegacySHA1(blockIDs) {
+		representationID, err = db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+		if err != nil {
+			log.Printf("[DownloadHistoricFile] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
+			redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Could not read the requested file revision.")
+			return
+		}
+	}
 
 	// Resolve block IDs before writing headers so a resolution failure fails
 	// clean instead of truncating the stream mid-download.
-	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, representationID, blockIDs)
 	if err != nil {
 		log.Printf("[DownloadHistoricFile] block ID resolution failed for org=%s: %v", orgID, err)
 		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Could not read the requested file revision.")
@@ -1139,10 +1160,16 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
 	}
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+	if err != nil {
+		log.Printf("[ServeHistoricFileRaw] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
 
 	// Resolve block IDs before writing headers so a resolution failure fails
 	// clean instead of truncating the stream mid-download.
-	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, representationID, blockIDs)
 	if err != nil {
 		log.Printf("[ServeHistoricFileRaw] block ID resolution failed for org=%s: %v", orgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})

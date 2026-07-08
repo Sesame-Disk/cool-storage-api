@@ -66,6 +66,11 @@ var ErrBatchItemLocked = errors.New("batch item locked by another user")
 // operation fails closed instead of silently bypassing lock enforcement.
 var ErrBatchLockStatusUnavailable = errors.New("batch lock status unavailable")
 
+// ErrBatchCrossRepresentationUnsupported indicates the source and destination
+// libraries use different block-representation domains, so block-ID-carrying
+// fs_objects cannot be copied or moved between them safely.
+var ErrBatchCrossRepresentationUnsupported = errors.New("cross-library batch operation across different block representations is not supported")
+
 // checkBatchSubtreeLocked reports whether targetPath or any descendant is locked by
 // another user. Injectable for tests.
 var checkBatchSubtreeLocked = func(h *BatchOperationHandler, repoID, targetPath, userID string) (bool, string, error) {
@@ -83,6 +88,13 @@ var checkBatchPathLocked = func(h *BatchOperationHandler, repoID, targetPath, us
 		return false, "", nil
 	}
 	return db.SubtreeLockedByOther(h.db.Session(), repoID, normalizePath(targetPath), userID)
+}
+
+var resolveBatchLibraryRepresentationID = func(h *BatchOperationHandler, orgID, repoID string) (string, error) {
+	if h == nil || h.db == nil {
+		return db.PlainBlockRepresentationID, nil
+	}
+	return db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
 }
 
 // processSameRepoMoveFn is the seam through which processSingleItem executes a same-repo
@@ -237,6 +249,9 @@ func batchOperationErrorResponse(err error, opType, itemName string) (int, gin.H
 	case errors.Is(err, ErrBatchLockStatusUnavailable):
 		msg := "failed to verify file lock"
 		return http.StatusServiceUnavailable, gin.H{"error": msg}, msg
+	case errors.Is(err, ErrBatchCrossRepresentationUnsupported):
+		msg := "source and destination libraries use different block representations"
+		return http.StatusBadRequest, gin.H{"error": msg}, msg
 	case errors.Is(err, ErrStorageQuotaExceeded):
 		msg := "storage quota exceeded"
 		return http.StatusForbidden, gin.H{"error": msg}, msg
@@ -579,6 +594,19 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 		log.Printf("[processSingleItem] no-op same-location move: %s", srcPath)
 		return nil
+	}
+	if srcRepoID != dstRepoID {
+		srcRepresentationID, err := resolveBatchLibraryRepresentationID(h, orgID, srcRepoID)
+		if err != nil {
+			return fmt.Errorf("resolve source block representation for library %s: %w", srcRepoID, err)
+		}
+		dstRepresentationID, err := resolveBatchLibraryRepresentationID(h, orgID, dstRepoID)
+		if err != nil {
+			return fmt.Errorf("resolve destination block representation for library %s: %w", dstRepoID, err)
+		}
+		if srcRepresentationID != dstRepresentationID {
+			return ErrBatchCrossRepresentationUnsupported
+		}
 	}
 	if opType == "move" && srcRepoID == dstRepoID {
 		moved, err := processSameRepoMoveFn(h, orgID, userID, srcRepoID, srcPath, dstDir, fsHelper, policy)
