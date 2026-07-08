@@ -1160,11 +1160,17 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
 	}
-	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
-	if err != nil {
-		log.Printf("[ServeHistoricFileRaw] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
-		return
+	// Only the legacy SHA-1 path consults block_id_mappings; on the common
+	// all-SHA-256 block list BatchResolveBlockIDs is a passthrough, so skip the
+	// per-request representation lookup and pass the non-empty plaintext default.
+	representationID := db.PlainBlockRepresentationID
+	if streaming.ContainsLegacySHA1(blockIDs) {
+		representationID, err = db.ResolveBlockRepresentationID(h.db.Session(), orgID, repoID)
+		if err != nil {
+			log.Printf("[ServeHistoricFileRaw] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+			return
+		}
 	}
 
 	// Resolve block IDs before writing headers so a resolution failure fails

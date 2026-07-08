@@ -127,12 +127,10 @@ func TestMockStore_ResolveBlockIDs_DualProbeSameInternalResolvesWithoutAmbiguity
 
 // TestMockStore_ResolveBlockIDs_DualProbeAmbiguousLeavesUnresolvedAndCountsMetric
 // covers the genuinely ambiguous case: plaintext and encrypted representations
-// both have a forward mapping for the same external SHA-1, but they point to two
-// DIFFERENT internal SHA-256 values (two unrelated libraries/orgs collided on the
-// same client-visible hash). The resolver must refuse to guess — leave the id
-// unresolved (never delete/rewrite the wrong reference) — and must record the
-// ambiguity so it stays visible for drift/corruption alerting instead of a silent
-// leak.
+// within the same org map the same external SHA-1 to different internal
+// SHA-256 values. The resolver must refuse to guess — leave the id unresolved
+// (never delete/rewrite the wrong reference) — and must record the ambiguity
+// so it stays visible for drift/corruption alerting instead of a silent leak.
 func TestMockStore_ResolveBlockIDs_DualProbeAmbiguousLeavesUnresolvedAndCountsMetric(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()
