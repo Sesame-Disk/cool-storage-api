@@ -3,6 +3,8 @@ package v2
 import (
 	"errors"
 	"testing"
+
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 )
 
 // These exercise the centralized lock enforcement at the top of processSingleItem,
@@ -22,6 +24,13 @@ func withBatchPathStub(t *testing.T, stub func(*BatchOperationHandler, string, s
 	old := checkBatchPathLocked
 	checkBatchPathLocked = stub
 	t.Cleanup(func() { checkBatchPathLocked = old })
+}
+
+func withBatchRepresentationResolverStub(t *testing.T, stub func(*BatchOperationHandler, string, string) (string, error)) {
+	t.Helper()
+	old := resolveBatchLibraryRepresentationID
+	resolveBatchLibraryRepresentationID = stub
+	t.Cleanup(func() { resolveBatchLibraryRepresentationID = old })
 }
 
 func TestProcessSingleItem_MoveRejectsLockedSource(t *testing.T) {
@@ -86,6 +95,24 @@ func TestProcessSingleItem_ReplaceRejectsLockedDestinationDirectory(t *testing.T
 	err := h.processSingleItem("org", "user", "repo-1", "repo-1", "/src/folder", "/dst", "copy", nil, "replace")
 	if !errors.Is(err, ErrBatchItemLocked) {
 		t.Fatalf("replace onto locked destination directory: err = %v, want ErrBatchItemLocked", err)
+	}
+}
+
+func TestProcessSingleItem_CrossRepoRejectsDifferentBlockRepresentations(t *testing.T) {
+	withBatchSubtreeStub(t, func(_ *BatchOperationHandler, _, _, _ string) (bool, string, error) {
+		return false, "", nil
+	})
+	withBatchRepresentationResolverStub(t, func(_ *BatchOperationHandler, _, repoID string) (string, error) {
+		if repoID == "repo-src" {
+			return db.PlainBlockRepresentationID, nil
+		}
+		return "library:encrypted-dst", nil
+	})
+
+	h := &BatchOperationHandler{}
+	err := h.processSingleItem("org", "user", "repo-src", "repo-dst", "/src/file.txt", "/dst", "copy", nil)
+	if !errors.Is(err, ErrBatchCrossRepresentationUnsupported) {
+		t.Fatalf("cross-repo copy mismatch: err = %v, want ErrBatchCrossRepresentationUnsupported", err)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
@@ -46,8 +47,9 @@ type MockStore struct {
 	// provisional upload-ref expiry discovery rows keyed by the full projection PK.
 	provisionalBlockRefExpiryProjections map[mockProvisionalBlockRefExpiryProjectionKey]ProvisionalBlockRefExpiryInfo
 
-	// block_id_mappings keyed by "orgID:externalID"
-	mappings map[string]string // externalID -> internalID
+	// block_id_mappings keyed by "orgID:representationID:normalizedExternalID"
+	// (see mockMappingKey); value is the canonicalized internal SHA-256 id.
+	mappings map[string]string
 
 	// commits keyed by "libraryID:commitID"
 	commits map[string]*mockCommit
@@ -198,13 +200,14 @@ type MockStore struct {
 }
 
 type mockBlock struct {
-	OrgID        uuid.UUID
-	BlockID      string
-	StorageClass string
-	CreatedAt    *time.Time
-	GCState      string
-	GCClaimID    string
-	Sha1         string
+	OrgID            uuid.UUID
+	BlockID          string
+	StorageClass     string
+	CreatedAt        *time.Time
+	GCState          string
+	GCClaimID        string
+	RepresentationID string
+	Sha1             string
 }
 
 type mockPendingItemKey struct {
@@ -272,14 +275,15 @@ type mockFSObject struct {
 }
 
 type mockLibrary struct {
-	OrgID          uuid.UUID
-	LibraryID      uuid.UUID
-	OwnerID        uuid.UUID
-	StorageClass   string
-	HeadCommitID   string
-	VersionTTLDays int
-	AutoDeleteDays int
-	DeletedAt      time.Time
+	OrgID                 uuid.UUID
+	LibraryID             uuid.UUID
+	OwnerID               uuid.UUID
+	BlockRepresentationID string
+	StorageClass          string
+	HeadCommitID          string
+	VersionTTLDays        int
+	AutoDeleteDays        int
+	DeletedAt             time.Time
 	// SizeBytes and FileCount mirror the canonical libraries.size_bytes and
 	// libraries.file_count columns used by ReconcilePendingStorageCounters
 	// in production. Storage-counter rows (m.storageSnapshots) are derived
@@ -478,6 +482,32 @@ func (m *MockStore) upsertS3OrphanProjection(orphan *S3OrphanInfo) {
 	m.s3OrphanProjections[key] = *orphan
 }
 
+func mockMappingKey(orgID uuid.UUID, representationID, externalID string) string {
+	representationID = strings.TrimSpace(representationID)
+	if representationID == "" {
+		representationID = db.PlainBlockRepresentationID
+	}
+	// Mirror the real store's canonicalization (db.NormalizeBlockID) so the mock
+	// resolves/deletes case-insensitively too.
+	return fmt.Sprintf("%s:%s:%s", orgID, representationID, db.NormalizeBlockID(externalID))
+}
+
+// blockRepresentationIDForLibraryLocked mirrors CassandraStore.GetLibraryBlockRepresentationID:
+// it only resolves from the live libraries row. deleted_libraries carries no
+// block_representation_id in this schema yet, so a library with no live row
+// intentionally resolves to (_, false) here, same as Cassandra returns
+// gocql.ErrNotFound — callers fall back to the conservative dual-probe.
+func (m *MockStore) blockRepresentationIDForLibraryLocked(orgID, libraryID uuid.UUID) (string, bool) {
+	lib := m.libraries[libraryID]
+	if lib == nil || lib.OrgID != orgID {
+		return "", false
+	}
+	if rep := strings.TrimSpace(lib.BlockRepresentationID); rep != "" {
+		return rep, true
+	}
+	return db.PlainBlockRepresentationID, true
+}
+
 func (m *MockStore) upsertProvisionalBlockRefExpiryProjection(expiry *mockProvisionalBlockRefExpiry) {
 	key := newMockProvisionalBlockRefExpiryProjectionKey(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt)
 	m.provisionalBlockRefExpiryProjections[key] = ProvisionalBlockRefExpiryInfo{
@@ -518,10 +548,11 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	createdAt := time.Now().UTC()
 	m.blocks[key] = &mockBlock{
-		OrgID:        orgID,
-		BlockID:      blockID,
-		StorageClass: storageClass,
-		CreatedAt:    &createdAt,
+		OrgID:            orgID,
+		BlockID:          blockID,
+		StorageClass:     storageClass,
+		RepresentationID: db.PlainBlockRepresentationID,
+		CreatedAt:        &createdAt,
 	}
 	// Model the legacy refCount as that many distinct reference rows so existing
 	// tests keep their "block is alive with N refs" intent under the row model.
@@ -541,9 +572,10 @@ func (m *MockStore) AddStubBlockForTest(orgID uuid.UUID, blockID string) {
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	m.blocks[key] = &mockBlock{
-		OrgID:     orgID,
-		BlockID:   blockID,
-		CreatedAt: nil,
+		OrgID:            orgID,
+		BlockID:          blockID,
+		RepresentationID: db.PlainBlockRepresentationID,
+		CreatedAt:        nil,
 	}
 }
 
@@ -610,13 +642,35 @@ func (m *MockStore) DeleteS3OrphanProjectionForTest(orgID uuid.UUID, blockID str
 func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := fmt.Sprintf("%s:%s", orgID, externalID)
-	m.mappings[key] = internalID
-	// Mirror the server-derived blocks.sha1 onto the block row so GC mapping
-	// cleanup (which now reads blocks.sha1 instead of the dropped reverse index)
-	// can resolve the forward row for this internal id.
-	if b := m.blocks[fmt.Sprintf("%s:%s", orgID, internalID)]; b != nil && strings.TrimSpace(b.Sha1) == "" {
-		b.Sha1 = externalID
+	m.addBlockMappingLocked(orgID, db.PlainBlockRepresentationID, externalID, internalID)
+}
+
+func (m *MockStore) AddBlockMappingForRepresentation(orgID uuid.UUID, representationID, externalID, internalID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addBlockMappingLocked(orgID, representationID, externalID, internalID)
+}
+
+// addBlockMappingLocked mirrors the server-derived blocks.sha1 + representation_id
+// onto the block row so GC mapping cleanup (which reads blocks.sha1 / representation_id
+// instead of the dropped reverse index) can resolve and scope the forward row. Each
+// field is filled independently so a block that already carries a sha1 still gets its
+// representation modeled. Caller must hold m.mu.
+func (m *MockStore) addBlockMappingLocked(orgID uuid.UUID, representationID, externalID, internalID string) {
+	// Canonicalize exactly like the Cassandra writer (writeCheckedBlockIDMapping +
+	// UpsertBlockMetadataWithRepresentationAndSHA1) so a test that passes an
+	// uppercase/padded id behaves identically in the mock and against Cassandra.
+	externalID = db.NormalizeBlockID(externalID)
+	internalID = db.NormalizeBlockID(internalID)
+	representationID = strings.TrimSpace(representationID)
+	m.mappings[mockMappingKey(orgID, representationID, externalID)] = internalID
+	if b := m.blocks[fmt.Sprintf("%s:%s", orgID, internalID)]; b != nil {
+		if strings.TrimSpace(b.Sha1) == "" {
+			b.Sha1 = externalID
+		}
+		if strings.TrimSpace(b.RepresentationID) == "" && representationID != "" {
+			b.RepresentationID = representationID
+		}
 	}
 }
 
@@ -626,7 +680,14 @@ func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID stri
 func (m *MockStore) ForwardBlockMappingExists(orgID uuid.UUID, externalID string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	_, ok := m.mappings[fmt.Sprintf("%s:%s", orgID, externalID)]
+	_, ok := m.mappings[mockMappingKey(orgID, db.PlainBlockRepresentationID, externalID)]
+	return ok
+}
+
+func (m *MockStore) ForwardBlockMappingExistsForRepresentation(orgID uuid.UUID, representationID, externalID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.mappings[mockMappingKey(orgID, representationID, externalID)]
 	return ok
 }
 
@@ -698,11 +759,12 @@ func (m *MockStore) AddLibraryWithTTL(orgID, libraryID uuid.UUID, storageClass, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{
-		OrgID:          orgID,
-		LibraryID:      libraryID,
-		StorageClass:   storageClass,
-		HeadCommitID:   headCommitID,
-		VersionTTLDays: versionTTLDays,
+		OrgID:                 orgID,
+		LibraryID:             libraryID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+		StorageClass:          storageClass,
+		HeadCommitID:          headCommitID,
+		VersionTTLDays:        versionTTLDays,
 	}
 }
 
@@ -737,11 +799,12 @@ func (m *MockStore) AddLibraryWithAutoDelete(orgID, libraryID uuid.UUID, storage
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{
-		OrgID:          orgID,
-		LibraryID:      libraryID,
-		StorageClass:   storageClass,
-		HeadCommitID:   headCommitID,
-		AutoDeleteDays: autoDeleteDays,
+		OrgID:                 orgID,
+		LibraryID:             libraryID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+		StorageClass:          storageClass,
+		HeadCommitID:          headCommitID,
+		AutoDeleteDays:        autoDeleteDays,
 	}
 }
 
@@ -749,9 +812,10 @@ func (m *MockStore) AddLibrary(orgID, libraryID uuid.UUID, storageClass string) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{
-		OrgID:        orgID,
-		LibraryID:    libraryID,
-		StorageClass: storageClass,
+		OrgID:                 orgID,
+		LibraryID:             libraryID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+		StorageClass:          storageClass,
 	}
 }
 
@@ -759,10 +823,11 @@ func (m *MockStore) AddLibraryWithOwner(orgID, libraryID, ownerID uuid.UUID, sto
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{
-		OrgID:        orgID,
-		LibraryID:    libraryID,
-		OwnerID:      ownerID,
-		StorageClass: storageClass,
+		OrgID:                 orgID,
+		LibraryID:             libraryID,
+		OwnerID:               ownerID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+		StorageClass:          storageClass,
 	}
 }
 
@@ -904,7 +969,7 @@ func (m *MockStore) AddGroupMembership(orgID, userID, groupID uuid.UUID) {
 func (m *MockStore) AddDeletedLibrary(orgID, libraryID uuid.UUID, storageClass string, deletedAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass}
+	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass}
 	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass, DeletedAt: deletedAt}
 }
 
@@ -1018,7 +1083,7 @@ func (m *MockStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, er
 	if block == nil {
 		return BlockInfo{}, gocql.ErrNotFound
 	}
-	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, CreatedAt: block.CreatedAt, Sha1: block.Sha1}, nil
+	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, CreatedAt: block.CreatedAt, RepresentationID: block.RepresentationID, Sha1: block.Sha1}, nil
 }
 
 // BlockReferenceCount returns how many reference rows a block currently has.
@@ -1715,18 +1780,62 @@ func (m *MockStore) AddFSObjectReferenceForTest(orgID uuid.UUID, blockID string,
 	m.AddBlockReferenceForTest(orgID, blockID, db.BlockReferrerForFSObject(libID.String(), fsID))
 }
 
-func (m *MockStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error) {
+func (m *MockStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.UUID) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if representationID, ok := m.blockRepresentationIDForLibraryLocked(orgID, libraryID); ok {
+		return representationID, nil
+	}
+	return "", gocql.ErrNotFound
+}
 
+func (m *MockStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentationID string, blockIDs []string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	representationID := strings.TrimSpace(blockRepresentationID)
+	if representationID == "" {
+		if resolvedRepresentationID, ok := m.blockRepresentationIDForLibraryLocked(orgID, libraryID); ok {
+			representationID = resolvedRepresentationID
+		}
+	}
+
+	// Mirror CassandraStore.resolveBlockIDsConcurrent exactly: canonicalize before
+	// classifying by hex content, only resolve hex SHA-1 ids, and only accept a hex
+	// SHA-256 internal id — otherwise keep the original (lenient). Without this the
+	// mock would pass GC tests that behave differently against Cassandra for
+	// uppercase / padded / non-hex garbage ids.
 	resolved := make([]string, len(blockIDs))
-	copy(resolved, blockIDs)
 	for i, blockID := range blockIDs {
-		if len(blockID) != 40 {
+		normalized := db.NormalizeBlockID(blockID)
+		resolved[i] = normalized
+		if !db.IsSHA1BlockID(normalized) {
 			continue
 		}
-		if internalID, ok := m.mappings[fmt.Sprintf("%s:%s", orgID, blockID)]; ok && internalID != "" {
-			resolved[i] = internalID
+		if representationID != "" {
+			if internalID, ok := m.mappings[mockMappingKey(orgID, representationID, normalized)]; ok {
+				if canonical := db.NormalizeBlockID(internalID); db.IsSHA256BlockID(canonical) {
+					resolved[i] = canonical
+				}
+			}
+			continue
+		}
+
+		plainInternalID, plainOK := m.mappings[mockMappingKey(orgID, db.PlainBlockRepresentationID, normalized)]
+		plainCanonical := db.NormalizeBlockID(plainInternalID)
+		plainValid := plainOK && db.IsSHA256BlockID(plainCanonical)
+		encryptedInternalID, encryptedOK := m.mappings[mockMappingKey(orgID, db.EncryptedLibraryBlockRepresentationID(libraryID.String()), normalized)]
+		encryptedCanonical := db.NormalizeBlockID(encryptedInternalID)
+		encryptedValid := encryptedOK && db.IsSHA256BlockID(encryptedCanonical)
+
+		switch {
+		case plainValid && encryptedValid && plainCanonical == encryptedCanonical:
+			resolved[i] = plainCanonical
+		case plainValid && encryptedValid:
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_unresolved_ambiguous_representation").Inc()
+		case plainValid:
+			resolved[i] = plainCanonical
+		case encryptedValid:
+			resolved[i] = encryptedCanonical
 		}
 	}
 	return resolved, nil
@@ -1910,11 +2019,11 @@ func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string
 	return nil
 }
 
-func (m *MockStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error {
+func (m *MockStore) DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	key := fmt.Sprintf("%s:%s", orgID, externalID)
+	key := mockMappingKey(orgID, representationID, externalID)
 	delete(m.mappings, key)
 	return nil
 }
@@ -3148,12 +3257,13 @@ func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) erro
 
 // --- S3 orphan recovery (mock) ---
 
-func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
+func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1 string, now time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
 		existing.StorageClass = storageClass
+		existing.RepresentationID = strings.TrimSpace(representationID)
 		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		existing.RecoveryPhase = S3OrphanPhasePendingS3
 		existing.LastAttemptAt = now
@@ -3163,20 +3273,21 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 		return existing.FirstSeenAt, nil
 	}
 	orphan := &S3OrphanInfo{
-		OrgID:         orgID,
-		BlockID:       blockID,
-		StorageClass:  storageClass,
-		ExternalSHA1:  strings.TrimSpace(externalSHA1),
-		RecoveryPhase: S3OrphanPhasePendingS3,
-		FirstSeenAt:   now.UTC(),
-		LastAttemptAt: now,
+		OrgID:            orgID,
+		BlockID:          blockID,
+		StorageClass:     storageClass,
+		RepresentationID: strings.TrimSpace(representationID),
+		ExternalSHA1:     strings.TrimSpace(externalSHA1),
+		RecoveryPhase:    S3OrphanPhasePendingS3,
+		FirstSeenAt:      now.UTC(),
+		LastAttemptAt:    now,
 	}
 	m.s3Orphans[key] = orphan
 	m.upsertS3OrphanProjection(orphan)
 	return orphan.FirstSeenAt, nil
 }
 
-func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
+func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
@@ -3194,6 +3305,9 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, exter
 		if strings.TrimSpace(existing.ExternalSHA1) == "" {
 			existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		}
+		if strings.TrimSpace(existing.RepresentationID) == "" {
+			existing.RepresentationID = strings.TrimSpace(representationID)
+		}
 		if strings.TrimSpace(existing.RecoveryPhase) == "" {
 			existing.RecoveryPhase = S3OrphanPhasePendingS3
 		}
@@ -3206,26 +3320,28 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, exter
 		return existing.FirstSeenAt, nil
 	}
 	orphan := &S3OrphanInfo{
-		OrgID:         orgID,
-		BlockID:       blockID,
-		StorageClass:  storageClass,
-		ExternalSHA1:  strings.TrimSpace(externalSHA1),
-		RecoveryPhase: S3OrphanPhasePendingS3,
-		FirstSeenAt:   now.UTC(),
-		LastAttemptAt: now,
-		RetryCount:    initialRetryCount,
-		LastError:     errMsg,
+		OrgID:            orgID,
+		BlockID:          blockID,
+		StorageClass:     storageClass,
+		RepresentationID: strings.TrimSpace(representationID),
+		ExternalSHA1:     strings.TrimSpace(externalSHA1),
+		RecoveryPhase:    S3OrphanPhasePendingS3,
+		FirstSeenAt:      now.UTC(),
+		LastAttemptAt:    now,
+		RetryCount:       initialRetryCount,
+		LastError:        errMsg,
 	}
 	m.s3Orphans[key] = orphan
 	m.upsertS3OrphanProjection(orphan)
 	return orphan.FirstSeenAt, nil
 }
 
-func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error {
+func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
+		existing.RepresentationID = strings.TrimSpace(representationID)
 		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		existing.RecoveryPhase = S3OrphanPhasePendingMappingCleanup
 		existing.LastAttemptAt = now

@@ -328,7 +328,7 @@ func TestSyncHandlerWithoutDB(t *testing.T) {
 		{
 			name:       "get block without storage",
 			method:     "GET",
-			path:       "/seafhttp/repo/00000000-0000-0000-0000-000000000001/block/abc123",
+			path:       "/seafhttp/repo/00000000-0000-0000-0000-000000000001/block/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 			wantStatus: http.StatusServiceUnavailable,
 		},
 		{
@@ -355,7 +355,10 @@ func TestSyncHandlerWithoutDB(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var body *bytes.Buffer
 			if tt.method == "POST" {
-				body = bytes.NewBufferString("block1\nblock2\n")
+				body = bytes.NewBufferString(
+					"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n" +
+						"dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986f\n",
+				)
 			} else {
 				body = bytes.NewBuffer(nil)
 			}
@@ -2246,6 +2249,7 @@ func TestHashTypeParameter(t *testing.T) {
 		name     string
 		blockID  string
 		hashType string
+		wantErr  bool
 		isLegacy bool
 		isDirect bool
 	}{
@@ -2257,11 +2261,10 @@ func TestHashTypeParameter(t *testing.T) {
 			isDirect: false,
 		},
 		{
-			name:     "SHA-1 with hash_type=sha256 (direct)",
+			name:     "SHA-1 with hash_type=sha256 (rejected)",
 			blockID:  "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 			hashType: "sha256",
-			isLegacy: false,
-			isDirect: true,
+			wantErr:  true,
 		},
 		{
 			name:     "SHA-256 without hash_type (direct by length)",
@@ -2277,142 +2280,141 @@ func TestHashTypeParameter(t *testing.T) {
 			isLegacy: false,
 			isDirect: true,
 		},
+		{
+			name:     "SHA-256 with hash_type=sha1 (rejected)",
+			blockID:  "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			hashType: "sha1",
+			wantErr:  true,
+		},
+		{
+			name:     "SHA-256 with uppercase hash_type (rejected)",
+			blockID:  "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			hashType: "SHA256",
+			wantErr:  true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Logic matching PutBlock implementation
-			isLegacySHA1 := len(tt.blockID) == 40 && tt.hashType != "sha256"
-			isDirectSHA256 := len(tt.blockID) == 64 || tt.hashType == "sha256"
-
-			if isLegacySHA1 != tt.isLegacy {
-				t.Errorf("isLegacySHA1 = %v, want %v", isLegacySHA1, tt.isLegacy)
+			classifiedID, err := classifySyncUploadBlockID(tt.blockID, tt.hashType)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("classifySyncUploadBlockID() error = nil, want non-nil")
+				}
+				return
 			}
-			if isDirectSHA256 != tt.isDirect {
-				t.Errorf("isDirectSHA256 = %v, want %v", isDirectSHA256, tt.isDirect)
+			if err != nil {
+				t.Fatalf("classifySyncUploadBlockID() error = %v", err)
+			}
+
+			if classifiedID.isLegacySHA1 != tt.isLegacy {
+				t.Errorf("isLegacySHA1 = %v, want %v", classifiedID.isLegacySHA1, tt.isLegacy)
+			}
+			if classifiedID.isDirectSHA256 != tt.isDirect {
+				t.Errorf("isDirectSHA256 = %v, want %v", classifiedID.isDirectSHA256, tt.isDirect)
 			}
 		})
 	}
 }
 
-// TestExternalToInternalMapping tests the mapping logic for block IDs
-func TestExternalToInternalMapping(t *testing.T) {
-	// Simulated mapping table (in real code this is in Cassandra)
-	mappings := map[string]string{
-		"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-		"b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3": "dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986f",
-	}
-
+func TestClassifyClientReadableBlockID(t *testing.T) {
 	tests := []struct {
-		name       string
-		externalID string
-		wantFound  bool
-		wantID     string
+		name           string
+		blockID        string
+		wantErr        bool
+		wantLegacy     bool
+		wantDirect     bool
+		wantNormalized string
 	}{
 		{
-			name:       "mapped SHA-1 ID",
-			externalID: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-			wantFound:  true,
-			wantID:     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			name:           "SHA-1",
+			blockID:        "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2",
+			wantLegacy:     true,
+			wantNormalized: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		},
 		{
-			name:       "unmapped SHA-1 ID (fallback to self)",
-			externalID: "0000000000000000000000000000000000000000",
-			wantFound:  false,
-			wantID:     "0000000000000000000000000000000000000000",
+			name:           "SHA-256",
+			blockID:        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+			wantDirect:     true,
+			wantNormalized: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 		},
 		{
-			name:       "SHA-256 ID (no mapping needed)",
-			externalID: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-			wantFound:  false, // SHA-256 doesn't need lookup
-			wantID:     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			name:    "invalid wrong length",
+			blockID: "foo",
+			wantErr: true,
+		},
+		{
+			name:    "invalid non-hex 64",
+			blockID: strings.Repeat("z", 64),
+			wantErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var internalID string
-			var found bool
-
-			// Simulate the lookup logic from GetBlock
-			if len(tt.externalID) == 40 {
-				// SHA-1: look up in mapping
-				if mapped, ok := mappings[tt.externalID]; ok {
-					internalID = mapped
-					found = true
-				} else {
-					// Fallback: use external ID directly
-					internalID = tt.externalID
-					found = false
+			classifiedID, err := classifyClientReadableBlockID(tt.blockID)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("classifyClientReadableBlockID() error = nil, want non-nil")
 				}
-			} else {
-				// SHA-256: use directly
-				internalID = tt.externalID
-				found = false
+				return
 			}
-
-			if found != tt.wantFound {
-				t.Errorf("found = %v, want %v", found, tt.wantFound)
+			if err != nil {
+				t.Fatalf("classifyClientReadableBlockID() error = %v", err)
 			}
-			if internalID != tt.wantID {
-				t.Errorf("internalID = %s, want %s", internalID, tt.wantID)
+			if classifiedID.isLegacySHA1 != tt.wantLegacy {
+				t.Errorf("isLegacySHA1 = %v, want %v", classifiedID.isLegacySHA1, tt.wantLegacy)
+			}
+			if classifiedID.isDirectSHA256 != tt.wantDirect {
+				t.Errorf("isDirectSHA256 = %v, want %v", classifiedID.isDirectSHA256, tt.wantDirect)
+			}
+			if classifiedID.normalized != tt.wantNormalized {
+				t.Errorf("normalized = %q, want %q", classifiedID.normalized, tt.wantNormalized)
 			}
 		})
 	}
 }
 
-// TestCheckBlocksMapping tests the CheckBlocks mapping logic
-func TestCheckBlocksMapping(t *testing.T) {
-	// Simulated mapping and existence
-	mappings := map[string]string{
-		"sha1id11111111111111111111111111111111111": "sha256id1111111111111111111111111111111111111111111111111111111111",
-		"sha1id22222222222222222222222222222222222": "sha256id2222222222222222222222222222222222222222222222222222222222",
+func TestNormalizeResolvedInternalBlockID(t *testing.T) {
+	tests := []struct {
+		name       string
+		blockID    string
+		wantErr    bool
+		wantResult string
+	}{
+		{
+			name:       "canonicalizes uppercase",
+			blockID:    strings.ToUpper("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+			wantResult: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		},
+		{
+			name:    "rejects empty",
+			blockID: "",
+			wantErr: true,
+		},
+		{
+			name:    "rejects non-hex",
+			blockID: strings.Repeat("z", 64),
+			wantErr: true,
+		},
 	}
 
-	existsInStorage := map[string]bool{
-		"sha256id1111111111111111111111111111111111111111111111111111111111": true,
-		"sha256id2222222222222222222222222222222222222222222222222222222222": false,
-	}
-
-	externalIDs := []string{
-		"sha1id11111111111111111111111111111111111", // exists
-		"sha1id22222222222222222222222222222222222", // missing
-		"sha1id33333333333333333333333333333333333", // no mapping, missing
-	}
-
-	// Build external to internal mapping
-	externalToInternal := make(map[string]string)
-	for _, extID := range externalIDs {
-		if mapped, ok := mappings[extID]; ok {
-			externalToInternal[extID] = mapped
-		} else {
-			externalToInternal[extID] = extID // fallback
-		}
-	}
-
-	// Check existence using internal IDs
-	var needed []string
-	for _, extID := range externalIDs {
-		internalID := externalToInternal[extID]
-		if !existsInStorage[internalID] {
-			needed = append(needed, extID)
-		}
-	}
-
-	// Verify results
-	expectedNeeded := []string{
-		"sha1id22222222222222222222222222222222222",
-		"sha1id33333333333333333333333333333333333",
-	}
-
-	if len(needed) != len(expectedNeeded) {
-		t.Errorf("needed count = %d, want %d", len(needed), len(expectedNeeded))
-	}
-
-	for i, id := range needed {
-		if id != expectedNeeded[i] {
-			t.Errorf("needed[%d] = %s, want %s", i, id, expectedNeeded[i])
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeResolvedInternalBlockID(tt.blockID)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("normalizeResolvedInternalBlockID() error = nil, want non-nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeResolvedInternalBlockID() error = %v", err)
+			}
+			if got != tt.wantResult {
+				t.Fatalf("normalizeResolvedInternalBlockID() = %q, want %q", got, tt.wantResult)
+			}
+		})
 	}
 }
 
@@ -2455,6 +2457,76 @@ func TestBlockHashValidation(t *testing.T) {
 
 			if shouldReject != tt.shouldReject {
 				t.Errorf("shouldReject = %v, want %v", shouldReject, tt.shouldReject)
+			}
+		})
+	}
+}
+
+func TestPutBlockIDClassificationRejectsMalformedHashIDs(t *testing.T) {
+	tests := []struct {
+		name       string
+		externalID string
+		hashType   string
+		wantReject bool
+		isLegacy   bool
+		isDirect   bool
+	}{
+		{
+			name:       "invalid 40-char non-hex SHA-1",
+			externalID: strings.Repeat("z", 40),
+			wantReject: true,
+		},
+		{
+			name:       "invalid 64-char non-hex SHA-256",
+			externalID: strings.Repeat("z", 64),
+			wantReject: true,
+		},
+		{
+			name:       "explicit sha256 with invalid id",
+			externalID: strings.Repeat("z", 64),
+			hashType:   "sha256",
+			wantReject: true,
+		},
+		{
+			name:       "unknown hash_type is rejected",
+			externalID: strings.Repeat("a", 64),
+			hashType:   "sha25",
+			wantReject: true,
+		},
+		{
+			name:       "invalid wrong length",
+			externalID: strings.Repeat("a", 30),
+			wantReject: true,
+		},
+		{
+			name:       "valid SHA-1 remains legacy",
+			externalID: strings.Repeat("a", 40),
+			isLegacy:   true,
+		},
+		{
+			name:       "valid SHA-256 remains direct",
+			externalID: strings.Repeat("a", 64),
+			isDirect:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			classifiedID, err := classifySyncUploadBlockID(tt.externalID, tt.hashType)
+			if tt.wantReject {
+				if err == nil {
+					t.Fatal("classifySyncUploadBlockID() error = nil, want non-nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("classifySyncUploadBlockID() error = %v", err)
+			}
+			if classifiedID.isLegacySHA1 != tt.isLegacy {
+				t.Errorf("isLegacySHA1 = %v, want %v", classifiedID.isLegacySHA1, tt.isLegacy)
+			}
+			if classifiedID.isDirectSHA256 != tt.isDirect {
+				t.Errorf("isDirectSHA256 = %v, want %v", classifiedID.isDirectSHA256, tt.isDirect)
 			}
 		})
 	}

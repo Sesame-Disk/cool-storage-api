@@ -560,6 +560,7 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	}
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	blockRepresentationID := dbpkg.EffectiveBlockRepresentationID(newLibID.String(), false, "")
 	batch.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
 		VALUES (?, ?, ?, ?, ?, ?)
@@ -567,18 +568,19 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	batch.Query(`
 		INSERT INTO libraries (
 			org_id, library_id, owner_id, name, description, encrypted,
+			block_representation_id,
 			storage_class, size_bytes, file_count, version_ttl_days,
 			head_commit_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, ownerOrgID, newLibID.String(), ownerUserID, repoName,
-		"", false, storageClass, int64(0), int64(0), versionTTLDays,
+		"", false, blockRepresentationID, storageClass, int64(0), int64(0), versionTTLDays,
 		headCommitID, now, now,
 	)
 	batch.Query(`
 		INSERT INTO libraries_by_id (
-			library_id, org_id, owner_id, name, head_commit_id, encrypted
-		) VALUES (?, ?, ?, ?, ?, ?)
-	`, newLibID.String(), ownerOrgID, ownerUserID, repoName, headCommitID, false,
+			library_id, org_id, owner_id, name, head_commit_id, encrypted, block_representation_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, newLibID.String(), ownerOrgID, ownerUserID, repoName, headCommitID, false, blockRepresentationID,
 	)
 	batch.Query(`
 		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)

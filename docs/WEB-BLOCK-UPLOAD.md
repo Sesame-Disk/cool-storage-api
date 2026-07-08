@@ -7,6 +7,12 @@ Gated OFF by default by a **server-side** flag (`web_uploads.enable_web_block_up
 driven from it via bootstrap. Encrypted libraries and public share/upload links
 are out of scope for phase 1.
 
+Representation note: runtime SHA-1 mapping is now representation-aware. Any future
+encrypted-library block-upload rollout must resolve and persist forward mappings in
+the destination library's `representation_id` domain (`plain:v1` or
+`library:<library_id>`), never as an org-wide alias. See
+[BLOCK-REPRESENTATION-DESIGN.md](./BLOCK-REPRESENTATION-DESIGN.md).
+
 ### Feature flag (server-authoritative)
 
 - Config: `web_uploads.enable_web_block_upload` (default `false`) in all
@@ -224,7 +230,7 @@ re-reading this section.
   `manifestDigest`, so an idempotent replay with the same SHA-256s but a different
   SHA-1 is a different file (409), not a silent id/object mismatch.
 
-  **No Paxos on the hot path, and legacy is untouched.** The forward mapping for
+  **No Paxos on the hot path, and both writers share the same remap guard.** The forward mapping for
   the web flow is written by a **web-only** helper, `WriteVerifiedWebBlockMapping`
   (via `RegisterWebUploadedBlockAndMapping`), which guards against remapping an
   existing SHA-1 to different content (a crafted SHA-1 collision could otherwise
@@ -234,16 +240,11 @@ re-reading this section.
   written concurrently in the tiny read→write window (astronomically unlikely), and
   the commit-side forward check is the integrity authority regardless.
 
-  The shared legacy/seafhttp path keeps using the original `WriteBlockIDMapping`
-  (plain idempotent dual-write) unchanged — **it pays no extra read and sees no
-  behavior change**. The two writers diverge only in the conflict guard, which is
-  needed solely on the new web flow where the server, not a trusted desktop client,
-  mints the SHA-1.
-
-Although the reverse row is non-authoritative, the web-only writer still fails
-the upload if rewriting `block_id_mappings_by_internal` fails after the forward
-row is in place. That is deliberate fail-closed behavior: a client retry can
-heal the auxiliary GC/repair projection instead of silently leaving it behind.
+  The shared legacy/seafhttp path now routes through the same fail-closed
+  forward-mapping contract via `WriteBlockIDMapping`: create when absent,
+  succeed when the row already points to the same SHA-256, and reject a
+  same-domain remap to different content. The helpers still differ in trust
+  boundary and call-site ergonomics, but not in conflict semantics.
 - **R11 — Sizes validated against real metadata.** The commit checks
   `manifest.size == ProbeBlockReuse.SizeBytes` per block; a manifest cannot
   declare a size that disagrees with the stored block.

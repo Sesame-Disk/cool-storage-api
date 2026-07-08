@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -1104,6 +1105,27 @@ func (s *CassandraStore) GetLibraryDeletedAt(libraryID uuid.UUID) (*time.Time, e
 	return &deletedAtCopy, nil
 }
 
+// GetLibraryBlockRepresentationID resolves the representation ID from the live
+// libraries row only. deleted_libraries does not carry block_representation_id
+// in this schema yet (it is added, together with gc_queue/DLQ propagation, once
+// representation durability across hard-delete lands); callers must treat
+// gocql.ErrNotFound as "fall back to the conservative dual-probe", not as "the
+// library was never encrypted".
+func (s *CassandraStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.UUID) (string, error) {
+	var encrypted bool
+	var storedRepresentationID string
+	err := s.db.Session().Query(`
+		SELECT encrypted, block_representation_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID.String(), libraryID.String()).Scan(&encrypted, &storedRepresentationID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return "", gocql.ErrNotFound
+		}
+		return "", err
+	}
+	return db.EffectiveBlockRepresentationID(libraryID.String(), encrypted, storedRepresentationID), nil
+}
+
 func (s *CassandraStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
 	var status string
 	var deletedAt *time.Time
@@ -1368,23 +1390,24 @@ func (s *CassandraStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockI
 
 // --- S3 orphan recovery ---
 
-func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, storageClass, externalSHA1, recoveryPhase string, firstSeenAt time.Time) error {
+func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1, recoveryPhase string, firstSeenAt time.Time) error {
 	return s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class, external_sha1, recovery_phase)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass, externalSHA1, recoveryPhase).Exec()
+		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass, representationID, externalSHA1, recoveryPhase).Exec()
 }
 
 // StartBlockDeleteOrphan records the durable recovery row for a NEW block
 // delete lifecycle. It always resets the phase to pending_s3, even when a
 // stale row from an older delete already exists for the same block_id.
-func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
+func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1 string, now time.Time) (time.Time, error) {
 	externalSHA1 = strings.TrimSpace(externalSHA1)
+	representationID = strings.TrimSpace(representationID)
 	existing := map[string]interface{}{}
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to record block delete orphan: %w", err)
 	}
@@ -1401,10 +1424,10 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 		updateState := map[string]interface{}{}
 		updated, err := s.db.Session().Query(`
 			UPDATE gc_s3_orphans
-			SET storage_class = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
+			SET storage_class = ?, representation_id = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
 			WHERE org_id = ? AND block_id = ?
 			IF EXISTS
-		`, effectiveStorageClass, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
+		`, effectiveStorageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
 		if err != nil {
 			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
 		}
@@ -1412,7 +1435,7 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
 		}
 	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, externalSHA1, S3OrphanPhasePendingS3, effectiveFirstSeenAt); err != nil {
+	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, effectiveFirstSeenAt); err != nil {
 		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
 	}
 	return effectiveFirstSeenAt, nil
@@ -1424,23 +1447,25 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 //
 // It also guarantees the matching gc_s3_orphans_by_day discovery row exists so
 // recovery can enumerate every orphan without scanning canonical partitions.
-func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
+func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
 	initialRetryCount := 0
 	if errMsg != "" {
 		initialRetryCount = 1
 	}
+	representationID = strings.TrimSpace(representationID)
 	existing := map[string]interface{}{}
 	// INSERT IF NOT EXISTS preserves the original first_seen_at on conflict;
 	// if the row exists we fall through to UpdateS3OrphanAttempt-style update.
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, externalSHA1, S3OrphanPhasePendingS3, now, now, initialRetryCount, errMsg).MapScanCAS(existing)
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, now, now, initialRetryCount, errMsg).MapScanCAS(existing)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to record S3 orphan: %w", err)
 	}
 	effectiveFirstSeenAt := now.UTC()
 	effectiveStorageClass := storageClass
+	effectiveRepresentationID := representationID
 	effectiveExternalSHA1 := strings.TrimSpace(externalSHA1)
 	effectiveRecoveryPhase := S3OrphanPhasePendingS3
 	if !applied {
@@ -1458,6 +1483,13 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 		if effectiveStorageClass == "" {
 			effectiveStorageClass = storageClass
 		}
+		effectiveRepresentationID, err = casStringValue(existing, "representation_id")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if strings.TrimSpace(effectiveRepresentationID) == "" {
+			effectiveRepresentationID = representationID
+		}
 		effectiveExternalSHA1, err = casStringValue(existing, "external_sha1")
 		if err != nil {
 			return time.Time{}, err
@@ -1473,15 +1505,16 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 			effectiveRecoveryPhase = S3OrphanPhasePendingS3
 		}
 	}
-	if !applied && (strings.TrimSpace(parseCASString(existing["external_sha1"])) == "" && effectiveExternalSHA1 != "" ||
+	if !applied && (strings.TrimSpace(parseCASString(existing["representation_id"])) == "" ||
+		strings.TrimSpace(parseCASString(existing["external_sha1"])) == "" && effectiveExternalSHA1 != "" ||
 		strings.TrimSpace(parseCASString(existing["recovery_phase"])) == "") {
 		updateState := map[string]interface{}{}
 		updated, err := s.db.Session().Query(`
 			UPDATE gc_s3_orphans
-			SET external_sha1 = ?, recovery_phase = ?
+			SET representation_id = ?, external_sha1 = ?, recovery_phase = ?
 			WHERE org_id = ? AND block_id = ?
 			IF EXISTS
-		`, effectiveExternalSHA1, effectiveRecoveryPhase, orgID.String(), blockID).MapScanCAS(updateState)
+		`, effectiveRepresentationID, effectiveExternalSHA1, effectiveRecoveryPhase, orgID.String(), blockID).MapScanCAS(updateState)
 		if err != nil {
 			return effectiveFirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
 		}
@@ -1489,7 +1522,7 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 			return effectiveFirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: row disappeared before repair", orgID, blockID)
 		}
 	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, effectiveExternalSHA1, effectiveRecoveryPhase, effectiveFirstSeenAt); err != nil {
+	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, effectiveRepresentationID, effectiveExternalSHA1, effectiveRecoveryPhase, effectiveFirstSeenAt); err != nil {
 		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
 	}
 	if !applied && errMsg != "" {
@@ -1500,8 +1533,9 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 	return effectiveFirstSeenAt, nil
 }
 
-func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error {
+func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error {
 	externalSHA1 = strings.TrimSpace(externalSHA1)
+	representationID = strings.TrimSpace(representationID)
 	// IF EXISTS: a plain UPDATE is an upsert in Cassandra, so if a concurrent
 	// DeleteS3Orphan (multi-worker recovery race) already removed the row, an
 	// unconditional UPDATE would resurrect a partial phantom row (PK + these cols,
@@ -1509,10 +1543,10 @@ func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, bloc
 	// applied=false means another worker finished the recovery — nothing to advance.
 	applied, err := s.db.Session().Query(`
 		UPDATE gc_s3_orphans
-		SET external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, last_error = ?
+		SET representation_id = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, last_error = ?
 		WHERE org_id = ? AND block_id = ?
 		IF EXISTS
-	`, externalSHA1, S3OrphanPhasePendingMappingCleanup, now, "", orgID.String(), blockID).MapScanCAS(map[string]interface{}{})
+	`, representationID, externalSHA1, S3OrphanPhasePendingMappingCleanup, now, "", orgID.String(), blockID).MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return fmt.Errorf("mark S3 orphan mapping cleanup pending org=%s block=%s: %w", orgID, blockID, err)
 	}
@@ -1521,16 +1555,17 @@ func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, bloc
 	}
 	var firstSeenAt time.Time
 	var storageClass string
+	var effectiveRepresentationID string
 	err = s.db.Session().Query(`
-		SELECT first_seen_at, storage_class FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&firstSeenAt, &storageClass)
+		SELECT first_seen_at, storage_class, representation_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&firstSeenAt, &storageClass, &effectiveRepresentationID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return nil
 		}
 		return fmt.Errorf("read S3 orphan after phase advance org=%s block=%s: %w", orgID, blockID, err)
 	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, storageClass, externalSHA1, S3OrphanPhasePendingMappingCleanup, firstSeenAt); err != nil {
+	if err := s.upsertS3OrphanProjection(orgID, blockID, storageClass, effectiveRepresentationID, externalSHA1, S3OrphanPhasePendingMappingCleanup, firstSeenAt); err != nil {
 		return fmt.Errorf("update S3 orphan discovery phase org=%s block=%s: %w", orgID, blockID, err)
 	}
 	return nil
@@ -1596,22 +1631,23 @@ func (s *CassandraStore) ListS3OrphansByDay(day time.Time, bucket int, limit int
 		limit = 100
 	}
 	iter := s.db.Session().Query(`
-		SELECT first_seen_at, org_id, block_id, storage_class, external_sha1, recovery_phase
+		SELECT first_seen_at, org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase
 		FROM gc_s3_orphans_by_day
 		WHERE first_seen_day = ? AND bucket = ?
 		LIMIT ?
 	`, db.GCProjectionUTCDate(day), bucket, limit).Iter()
 	var out []S3OrphanInfo
 	var firstSeen time.Time
-	var orgIDStr, blockID, storageClass, externalSHA1, recoveryPhase string
-	for iter.Scan(&firstSeen, &orgIDStr, &blockID, &storageClass, &externalSHA1, &recoveryPhase) {
+	var orgIDStr, blockID, storageClass, representationID, externalSHA1, recoveryPhase string
+	for iter.Scan(&firstSeen, &orgIDStr, &blockID, &storageClass, &representationID, &externalSHA1, &recoveryPhase) {
 		out = append(out, S3OrphanInfo{
-			OrgID:         parseUUID(orgIDStr),
-			BlockID:       blockID,
-			StorageClass:  storageClass,
-			ExternalSHA1:  strings.TrimSpace(externalSHA1),
-			RecoveryPhase: strings.TrimSpace(recoveryPhase),
-			FirstSeenAt:   firstSeen,
+			OrgID:            parseUUID(orgIDStr),
+			BlockID:          blockID,
+			StorageClass:     storageClass,
+			RepresentationID: strings.TrimSpace(representationID),
+			ExternalSHA1:     strings.TrimSpace(externalSHA1),
+			RecoveryPhase:    strings.TrimSpace(recoveryPhase),
+			FirstSeenAt:      firstSeen,
 		})
 	}
 	if err := iter.Close(); err != nil {
@@ -1645,16 +1681,18 @@ func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bo
 func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
 	info := BlockInfo{BlockID: blockID}
 	var createdAt *time.Time
+	var representationID string
 	var sha1 string
 	// Single-partition point read by the full ((org_id), block_id) key. sha1 is
 	// the same row, so reading it adds no extra query and no tombstone scan.
 	err := s.db.Session().Query(`
-		SELECT storage_class, created_at, sha1 FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&info.StorageClass, &createdAt, &sha1)
+		SELECT storage_class, created_at, representation_id, sha1 FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&info.StorageClass, &createdAt, &representationID, &sha1)
 	if err != nil {
 		return BlockInfo{}, err
 	}
 	info.CreatedAt = createdAt
+	info.RepresentationID = strings.TrimSpace(representationID)
 	info.Sha1 = strings.TrimSpace(sha1)
 	return info, nil
 }
@@ -1666,18 +1704,88 @@ func (s *CassandraStore) RemoveBlockReference(orgID uuid.UUID, blockID, referrer
 
 // mappingResolveConcurrency bounds the number of in-flight single-row lookups
 // against block_id_mappings so a large fs_object's block list cannot flood the
-// driver. block_id_mappings is partitioned by ((org_id, external_id)), so each
-// lookup is a single-partition point read.
+// driver. block_id_mappings is partitioned by
+// ((org_id, representation_id, external_id)), so each lookup is a single-
+// partition point read.
 const mappingResolveConcurrency = 32
 
-func (s *CassandraStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error) {
+func (s *CassandraStore) lookupBlockMapping(orgID uuid.UUID, representationID, externalID string) (string, error) {
+	var internalID string
+	err := s.db.Session().Query(`
+		SELECT internal_id FROM block_id_mappings
+		WHERE org_id = ? AND representation_id = ? AND external_id = ?
+	`, orgID.String(), representationID, externalID).Scan(&internalID)
+	return internalID, err
+}
+
+func (s *CassandraStore) lookupBlockMappingWithFallback(orgID, libraryID uuid.UUID, representationID, externalID string) (string, error) {
+	if strings.TrimSpace(representationID) != "" {
+		return s.lookupBlockMapping(orgID, representationID, externalID)
+	}
+
+	plainInternalID, plainErr := s.lookupBlockMapping(orgID, db.PlainBlockRepresentationID, externalID)
+	if plainErr != nil && !errors.Is(plainErr, gocql.ErrNotFound) {
+		return "", plainErr
+	}
+
+	encryptedInternalID, encryptedErr := s.lookupBlockMapping(orgID, db.EncryptedLibraryBlockRepresentationID(libraryID.String()), externalID)
+	if encryptedErr != nil && !errors.Is(encryptedErr, gocql.ErrNotFound) {
+		return "", encryptedErr
+	}
+
+	plainCanonical := db.NormalizeBlockID(plainInternalID)
+	plainValid := plainErr == nil && db.IsSHA256BlockID(plainCanonical)
+	encryptedCanonical := db.NormalizeBlockID(encryptedInternalID)
+	encryptedValid := encryptedErr == nil && db.IsSHA256BlockID(encryptedCanonical)
+
+	switch {
+	case plainValid && encryptedValid && plainCanonical == encryptedCanonical:
+		return plainCanonical, nil
+	case plainValid && encryptedValid:
+		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_unresolved_ambiguous_representation").Inc()
+		return "", nil
+	case plainValid:
+		return plainCanonical, nil
+	case encryptedValid:
+		return encryptedCanonical, nil
+	case plainErr == nil:
+		return plainInternalID, nil
+	case encryptedErr == nil:
+		return encryptedInternalID, nil
+	case errors.Is(plainErr, gocql.ErrNotFound) && errors.Is(encryptedErr, gocql.ErrNotFound):
+		return "", gocql.ErrNotFound
+	default:
+		return "", nil
+	}
+}
+
+func (s *CassandraStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentationID string, blockIDs []string) ([]string, error) {
+	// Fast path: an all-SHA-256 block list never consults block_id_mappings, so
+	// skip representation resolution entirely. For SHA-1 lists we prefer the
+	// representation persisted on the queue item; when absent we resolve from the
+	// live libraries row via GetLibraryBlockRepresentationID. That row is gone
+	// once the library has been soft/hard-deleted (deleted_libraries carries no
+	// block_representation_id yet — that lands with gc_queue/DLQ representation
+	// persistence in the follow-up PR), so GetLibraryBlockRepresentationID
+	// returns ErrNotFound and we fall back to the conservative plain/encrypted
+	// dual-probe below for both that case and legacy queue rows created before
+	// representation persistence existed.
+	representationID := strings.TrimSpace(blockRepresentationID)
+	if representationID == "" {
+		for _, id := range blockIDs {
+			if db.IsSHA1BlockID(db.NormalizeBlockID(id)) {
+				resolvedRepresentationID, err := s.GetLibraryBlockRepresentationID(orgID, libraryID)
+				if err == nil {
+					representationID = resolvedRepresentationID
+				} else if !errors.Is(err, gocql.ErrNotFound) {
+					return nil, err
+				}
+				break
+			}
+		}
+	}
 	return resolveBlockIDsConcurrent(orgID, blockIDs, mappingResolveConcurrency, func(idx int) (string, error) {
-		var internalID string
-		err := s.db.Session().Query(`
-			SELECT internal_id FROM block_id_mappings
-			WHERE org_id = ? AND external_id = ?
-		`, orgID.String(), blockIDs[idx]).Scan(&internalID)
-		return internalID, err
+		return s.lookupBlockMappingWithFallback(orgID, libraryID, representationID, db.NormalizeBlockID(blockIDs[idx]))
 	})
 }
 
@@ -1694,12 +1802,30 @@ func (s *CassandraStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]
 // Cassandra (block_id_mappings has no in-process fake).
 func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) ([]string, error) {
 	resolved := make([]string, len(blockIDs))
-	copy(resolved, blockIDs)
 
+	// Canonicalize (trim + lowercase) before classifying by hex content, mirroring
+	// the streaming resolver and the Cassandra mapping query, so a padded/uppercase
+	// id is still recognized as a SHA-1 and a passthrough SHA-256 lands canonicalized.
+	//
+	// Unlike streaming this resolver is deliberately LENIENT: a non-hex or
+	// wrong-length id is not a fatal error and a missing/garbage mapping keeps the
+	// original id. GC mapping cleanup legitimately runs after the forward mapping
+	// was already deleted, so failing closed here would wedge fs_object GC on a
+	// row that can never resolve. Worst case is a skipped reference removal (a
+	// leak + a harmless GC candidate), never a live-data delete. Each lenient skip
+	// is counted (gc_block_id_invalid / gc_block_mapping_unresolved_*) so silent
+	// leaks stay visible for drift/corruption alerting instead of vanishing.
 	var toResolve []int
 	for i, blockID := range blockIDs {
-		if len(blockID) == 40 {
+		normalized := db.NormalizeBlockID(blockID)
+		resolved[i] = normalized
+		switch {
+		case db.IsSHA1BlockID(normalized):
 			toResolve = append(toResolve, i)
+		case db.IsSHA256BlockID(normalized):
+			// already-internal id, nothing to resolve
+		default:
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_id_invalid").Inc()
 		}
 	}
 	if len(toResolve) == 0 {
@@ -1735,13 +1861,23 @@ func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrenc
 	for range toResolve {
 		result := <-results
 		if result.err != nil {
-			if !errors.Is(result.err, gocql.ErrNotFound) {
+			if errors.Is(result.err, gocql.ErrNotFound) {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_unresolved_not_found").Inc()
+			} else {
 				resolveErr = errors.Join(resolveErr, fmt.Errorf("resolve block mapping org=%s external=%s: %w", orgID, blockIDs[result.idx], result.err))
 			}
 			continue
 		}
-		if result.internalID != "" {
-			resolved[result.idx] = result.internalID
+		// Only accept a hex 64-char SHA-256; a garbage internal_id is left as the
+		// original SHA-1 (lenient, see above) instead of poisoning the reference key.
+		internalID := db.NormalizeBlockID(result.internalID)
+		switch {
+		case internalID == "":
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_unresolved_empty_internal").Inc()
+		case !db.IsSHA256BlockID(internalID):
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_unresolved_invalid_internal").Inc()
+		default:
+			resolved[result.idx] = internalID
 		}
 	}
 	if resolveErr != nil {
@@ -1827,15 +1963,12 @@ func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID s
 	return nil
 }
 
-// DeleteBlockMapping removes the forward block_id_mappings row by its full
-// ((org_id), external_id) partition key. The reverse projection was dropped in
-// migration 006, so this is a single-partition DELETE with no read-before-delete
-// and no reverse cleanup.
-func (s *CassandraStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error {
+func (s *CassandraStore) DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error {
+	externalID = db.NormalizeBlockID(externalID)
 	if err := s.db.Session().Query(`
-		DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?
-	`, orgID.String(), externalID).Exec(); err != nil {
-		return fmt.Errorf("delete block mapping org=%s external_id=%s: %w", orgID, externalID, err)
+		DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?
+	`, orgID.String(), representationID, externalID).Exec(); err != nil {
+		return fmt.Errorf("delete block mapping org=%s representation_id=%s external_id=%s: %w", orgID, representationID, externalID, err)
 	}
 	return nil
 }

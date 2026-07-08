@@ -61,12 +61,12 @@ func NewFSHelper(database *db.DB) *FSHelper {
 	return &FSHelper{db: database}
 }
 
-var resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
-	return h.resolveStoredBlockIDs(orgID, blockIDs)
+var resolveStoredBlockIDsFn = func(h *FSHelper, orgID, libraryID string, blockIDs []string) ([]string, error) {
+	return h.resolveStoredBlockIDs(orgID, libraryID, blockIDs)
 }
 
-var stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
-	return resolveStoredBlockIDsFn(h, orgID, blockIDs)
+var stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID, libraryID string, blockIDs []string) ([]string, error) {
+	return resolveStoredBlockIDsFn(h, orgID, libraryID, blockIDs)
 }
 
 var stagePendingPublishedFilesAddReferencesFn = db.AddPublishAttemptReferences
@@ -93,8 +93,12 @@ var registerUploadedBlockReleaseClaimFn = func(h *FSHelper, orgID, blockID, clai
 	return h.db.ReleaseBlockDeleteClaim(orgID, blockID, claimID)
 }
 
-var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
-	return h.db.UpsertBlockMetadataWithSHA1(orgID, blockID, sha1ID, sizeBytes, storageClass, storageKey)
+var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, libraryID)
+	if err != nil {
+		return err
+	}
+	return h.db.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1ID, sizeBytes, storageClass, storageKey)
 }
 
 var registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
@@ -952,19 +956,23 @@ func (h *FSHelper) CollectBlockIDsRecursive(repoID, fsID string) ([]string, erro
 // block. Interim fail-closed handling only — see
 // ISSUE-REFCOUNT-RESOLVE-FAILCLOSED-01; the root fix lands with the ref_count
 // counter→per-block redesign, not here.
-func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) ([]string, error) {
+func (h *FSHelper) resolveStoredBlockIDs(orgID, libraryID string, blockIDs []string) ([]string, error) {
 	if len(blockIDs) == 0 {
 		return nil, nil
 	}
-	return streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, libraryID)
+	if err != nil {
+		return nil, err
+	}
+	return streaming.BatchResolveBlockIDs(h.db, orgID, representationID, blockIDs)
 }
 
 // ResolveStoredBlockIDs maps external SHA-1 block IDs to the internal SHA-256
 // block IDs stored in Cassandra. Callers that need block-liveness operations
 // outside package v2 should resolve first and then stage/promote on the
 // resulting internal IDs.
-func (h *FSHelper) ResolveStoredBlockIDs(orgID string, blockIDs []string) ([]string, error) {
-	return resolveStoredBlockIDsFn(h, orgID, blockIDs)
+func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []string) ([]string, error) {
+	return resolveStoredBlockIDsFn(h, orgID, libraryID, blockIDs)
 }
 
 // RegisterUploadedBlock records freshly-uploaded block metadata plus a
@@ -1032,7 +1040,7 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 			return fmt.Errorf("read block delete fence for %s: %w", blockID, err)
 		}
 		if !deleteFenceActive {
-			if err := registerUploadedBlockUpsertMetadataFn(h, orgID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
+			if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
 				return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
 			}
 			return nil
@@ -1085,7 +1093,7 @@ func (h *FSHelper) RegisterFSObjectBlockReferences(orgID, libraryID, fsID string
 	if !exists {
 		return fmt.Errorf("attach block references to fs_object %s/%s: %w", libraryID, fsID, errFSObjectNotPersistedForBlockReferences)
 	}
-	resolved, err := resolveStoredBlockIDsFn(h, orgID, blockIDs)
+	resolved, err := resolveStoredBlockIDsFn(h, orgID, libraryID, blockIDs)
 	if err != nil {
 		return fmt.Errorf("resolve block IDs before referencing fs_object %s/%s: %w", libraryID, fsID, err)
 	}
@@ -1274,7 +1282,7 @@ func (h *FSHelper) stagePendingPublishedFiles(orgID, repoID, attemptID string, p
 		}
 
 		pending.internalBlockIDs = nil
-		resolved, err := stagePendingPublishedFilesResolveFn(h, orgID, pending.externalBlockIDs)
+		resolved, err := stagePendingPublishedFilesResolveFn(h, orgID, repoID, pending.externalBlockIDs)
 		if err != nil {
 			return rollbackStagedRefs(stagedBlockIDs, fmt.Errorf("stage publish-attempt block references for fs_object %s: resolve block IDs: %w", pending.fsID, err))
 		}

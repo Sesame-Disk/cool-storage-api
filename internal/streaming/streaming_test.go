@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
@@ -198,5 +200,125 @@ func TestResolveBlockIDs_ConcurrentResolutionPreservesOrder(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("concurrency=%d: order/value mismatch", concurrency)
 		}
+	}
+}
+
+// TestResolveBlockIDs_CanonicalizesBeforeAndAfterLookup verifies the "trimmed
+// lowercase" contract holds end-to-end: an uppercase SHA-1, a space-padded SHA-1,
+// and an uppercase SHA-256 are all canonicalized BEFORE classification, and an
+// uppercase internal_id returned by the mapping is canonicalized before it is
+// handed back. The lookup normalizes its key exactly like the Cassandra query.
+func TestResolveBlockIDs_CanonicalizesBeforeAndAfterLookup(t *testing.T) {
+	upperSHA1 := strings.ToUpper(sha1Hex(1)) // classified as SHA-1 after normalize
+	paddedSHA1 := "  " + sha1Hex(2) + "  "   // 44 chars raw, 40 after trim
+	upperSHA256 := strings.ToUpper(sha256Hex(3))
+	blockIDs := []string{upperSHA1, paddedSHA1, upperSHA256, sha1Hex(4)}
+
+	mapping := map[string]string{
+		sha1Hex(1): sha256Hex(1001),
+		sha1Hex(2): sha256Hex(1002),
+		sha1Hex(4): strings.ToUpper(sha256Hex(1004)), // uppercase internal_id
+	}
+	lookup := func(idx int) (string, error) {
+		key := db.NormalizeBlockID(blockIDs[idx])
+		if v, ok := mapping[key]; ok {
+			return v, nil
+		}
+		return "", gocql.ErrNotFound
+	}
+
+	got, err := resolveBlockIDs("org", blockIDs, 32, lookup)
+	if err != nil {
+		t.Fatalf("resolveBlockIDs() error = %v, want nil", err)
+	}
+	want := []string{sha256Hex(1001), sha256Hex(1002), sha256Hex(3), sha256Hex(1004)}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolveBlockIDs() = %v, want %v (canonicalized)", got, want)
+	}
+}
+
+// TestResolveBlockIDs_RejectsNonSHAInternalID verifies that a mapping row whose
+// internal_id is not a hex 64-char SHA-256 aborts resolution rather than streaming
+// a bogus block id to storage — both a short non-hex value and a 64-char non-hex
+// value (right length, wrong content) must fail.
+func TestResolveBlockIDs_RejectsNonSHAInternalID(t *testing.T) {
+	for name, internal := range map[string]string{
+		"short-non-hex":    "not-a-sha256",
+		"64-char-non-hex":  strings.Repeat("g", 64), // g is not a hex digit
+		"64-char-with-dot": strings.Repeat("a", 63) + ".",
+	} {
+		t.Run(name, func(t *testing.T) {
+			lookup := func(idx int) (string, error) { return internal, nil }
+			got, err := resolveBlockIDs("org", []string{sha1Hex(1)}, 8, lookup)
+			if err == nil {
+				t.Fatalf("resolveBlockIDs() error = nil, want non-nil on internal_id %q", internal)
+			}
+			if got != nil {
+				t.Errorf("resolveBlockIDs() = %v, want nil slice on error", got)
+			}
+		})
+	}
+}
+
+// TestResolveBlockIDs_RejectsNonHexBlockIDs verifies that an input id of the right
+// LENGTH but wrong CONTENT (40 or 64 non-hex chars) is a fatal, pre-lookup error,
+// so the "valid hex SHA-1/SHA-256" contract is enforced on content, not length.
+func TestResolveBlockIDs_RejectsNonHexBlockIDs(t *testing.T) {
+	for name, id := range map[string]string{
+		"40-char-non-hex": strings.Repeat("z", 40),
+		"64-char-non-hex": strings.Repeat("z", 64),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var called atomic.Int32
+			lookup := func(idx int) (string, error) {
+				called.Add(1)
+				return sha256Hex(1), nil
+			}
+			got, err := resolveBlockIDs("org", []string{id}, 8, lookup)
+			if err == nil {
+				t.Fatalf("resolveBlockIDs() error = nil, want non-nil on non-hex id %q", id)
+			}
+			if got != nil {
+				t.Errorf("resolveBlockIDs() = %v, want nil slice on error", got)
+			}
+			if n := called.Load(); n != 0 {
+				t.Errorf("lookup called %d times, want 0 (non-hex id rejected before lookup)", n)
+			}
+		})
+	}
+}
+
+// TestResolveBlockIDs_RejectsInvalidLengthID verifies that an id which is neither a
+// 40-char SHA-1 nor a 64-char SHA-256 is a fatal, pre-lookup error.
+func TestResolveBlockIDs_RejectsInvalidLengthID(t *testing.T) {
+	blockIDs := []string{sha256Hex(0), "deadbeef"} // second is 8 chars
+	var called atomic.Int32
+	lookup := func(idx int) (string, error) {
+		called.Add(1)
+		return sha256Hex(1), nil
+	}
+	got, err := resolveBlockIDs("org", blockIDs, 8, lookup)
+	if err == nil {
+		t.Fatal("resolveBlockIDs() error = nil, want non-nil on invalid-length id")
+	}
+	if got != nil {
+		t.Errorf("resolveBlockIDs() = %v, want nil slice on error", got)
+	}
+	if n := called.Load(); n != 0 {
+		t.Errorf("lookup called %d times, want 0 (invalid id rejected before lookup)", n)
+	}
+}
+
+// TestContainsLegacySHA1 verifies the fast-path guard callers use to skip the
+// representation_id lookup on all-SHA-256 block lists.
+func TestContainsLegacySHA1(t *testing.T) {
+	if ContainsLegacySHA1([]string{sha256Hex(0), sha256Hex(1)}) {
+		t.Error("ContainsLegacySHA1 = true for all-SHA-256 list, want false")
+	}
+	if !ContainsLegacySHA1([]string{sha256Hex(0), sha1Hex(1)}) {
+		t.Error("ContainsLegacySHA1 = false with a SHA-1 present, want true")
+	}
+	if !ContainsLegacySHA1([]string{"  " + strings.ToUpper(sha1Hex(2)) + "  "}) {
+		t.Error("ContainsLegacySHA1 = false for a padded/uppercase SHA-1, want true")
 	}
 }

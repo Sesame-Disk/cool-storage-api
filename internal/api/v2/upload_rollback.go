@@ -14,21 +14,29 @@ var rollbackUploadedBlockRefsFn = RollbackUploadedBlockRefs
 var registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
 	return NewFSHelper(database).RegisterUploadedBlock(orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, sha1ID)
 }
-var writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, externalBlockID, internalBlockID string) error {
+var writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, repoID, externalBlockID, internalBlockID string) error {
 	if database == nil {
 		return nil
 	}
-	return database.WriteBlockIDMapping(orgID, externalBlockID, internalBlockID, time.Time{})
+	representationID, err := db.ResolveBlockRepresentationID(database.Session(), orgID, repoID)
+	if err != nil {
+		return err
+	}
+	return database.WriteBlockIDMapping(orgID, representationID, externalBlockID, internalBlockID, time.Time{})
 }
 
 // writeVerifiedWebBlockMappingFn is the WEB block-upload (session) variant of the
 // mapping writer. It uses WriteVerifiedWebBlockMapping, which fails closed on an
 // external→different-internal conflict. Legacy paths keep writeBlockMappingForMaterializationFn.
-var writeVerifiedWebBlockMappingFn = func(database *db.DB, orgID, externalBlockID, internalBlockID string) error {
+var writeVerifiedWebBlockMappingFn = func(database *db.DB, orgID, repoID, externalBlockID, internalBlockID string) error {
 	if database == nil {
 		return nil
 	}
-	return database.WriteVerifiedWebBlockMapping(orgID, externalBlockID, internalBlockID, time.Time{})
+	representationID, err := db.ResolveBlockRepresentationID(database.Session(), orgID, repoID)
+	if err != nil {
+		return err
+	}
+	return database.WriteVerifiedWebBlockMapping(orgID, representationID, externalBlockID, internalBlockID, time.Time{})
 }
 
 func releaseUploadedBlockRefs(database *db.DB, orgID, repoID, operationID string, blockIDs []string, logPrefix string) {
@@ -69,7 +77,7 @@ func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlo
 	if strings.TrimSpace(externalBlockID) == "" {
 		return nil
 	}
-	if err := writeBlockMappingForMaterializationFn(database, orgID, externalBlockID, internalBlockID); err != nil {
+	if err := writeBlockMappingForMaterializationFn(database, orgID, repoID, externalBlockID, internalBlockID); err != nil {
 		rollbackUploadedBlockRefsFn(database, orgID, repoID, operationID, []string{internalBlockID})
 		return fmt.Errorf("%w: %v", ErrBlockMappingWriteFailed, err)
 	}
@@ -94,7 +102,7 @@ func RegisterWebUploadedBlockAndMapping(database *db.DB, orgID, repoID, internal
 	if strings.TrimSpace(externalBlockID) == "" {
 		return nil
 	}
-	if err := writeVerifiedWebBlockMappingFn(database, orgID, externalBlockID, internalBlockID); err != nil {
+	if err := writeVerifiedWebBlockMappingFn(database, orgID, repoID, externalBlockID, internalBlockID); err != nil {
 		rollbackUploadedBlockRefsFn(database, orgID, repoID, operationID, []string{internalBlockID})
 		if errors.Is(err, db.ErrBlockIDMappingConflict) {
 			return err

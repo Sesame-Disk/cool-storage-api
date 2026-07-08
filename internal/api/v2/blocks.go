@@ -668,7 +668,7 @@ func (h *BlockHandler) checkBlocksForSession(c *gin.Context, session db.BlockUpl
 // remap fails closed (db.ErrBlockIDMappingConflict). The commit (file-from-blocks)
 // only ever READS this mapping; it never mints one from the manifest, which is why
 // a forged manifest SHA-1 cannot poison resolution. The shared legacy/seafhttp
-// mapping path (WriteBlockIDMapping) is left untouched. isNew labels the
+// mapping path now uses the same fail-closed conflict contract. isNew labels the
 // staging metric (finding 8) by whether the underlying S3 PUT was a fresh
 // write or a dedup no-op — governance work happens either way (R9).
 func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, sha256ID, sha1ID string, size int, storageClass string, isNew bool) error {

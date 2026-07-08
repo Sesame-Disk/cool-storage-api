@@ -218,6 +218,7 @@ func TestBatchOperationErrorResponse_MapsKnownErrors(t *testing.T) {
 		{name: "head conflict", err: ErrLibraryHeadConflict, wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the move", wantReason: "library was modified concurrently; retry the move"},
 		{name: "source missing", err: ErrBatchSourceNotFound, wantStatus: http.StatusNotFound, wantError: "source item not found", wantReason: "source item not found"},
 		{name: "destination missing", err: ErrBatchDestinationNotFound, wantStatus: http.StatusNotFound, wantError: "destination directory not found", wantReason: "destination directory not found"},
+		{name: "cross representation", err: ErrBatchCrossRepresentationUnsupported, wantStatus: http.StatusBadRequest, wantError: "source and destination libraries use different block representations", wantReason: "source and destination libraries use different block representations"},
 		{name: "quota exceeded", err: ErrStorageQuotaExceeded, wantStatus: http.StatusForbidden, wantError: "storage quota exceeded", wantReason: "storage quota exceeded"},
 		{name: "conflict", err: &ConflictError{ItemName: "renamed.txt"}, wantStatus: http.StatusConflict, wantError: "conflict", wantReason: "conflict", wantConflict: []string{"renamed.txt"}},
 		{name: "generic", err: errors.New("boom"), wantStatus: http.StatusInternalServerError, wantError: "failed to move file.txt", wantReason: "failed to move file.txt"},

@@ -727,10 +727,13 @@ func TestStageSeafHTTPPublishAttemptReferences_UsesResolvedInternalBlockIDs(t *t
 	})
 
 	resolveCalls := 0
-	resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID string, blockIDs []string) ([]string, error) {
+	resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID, repoID string, blockIDs []string) ([]string, error) {
 		resolveCalls++
 		if orgID != "org-1" {
 			t.Fatalf("resolve orgID = %q, want org-1", orgID)
+		}
+		if repoID != "repo-1" {
+			t.Fatalf("resolve repoID = %q, want repo-1", repoID)
 		}
 		if !reflect.DeepEqual(blockIDs, []string{"sha1-a", "sha1-b"}) {
 			t.Fatalf("resolve blockIDs = %#v, want external ids", blockIDs)

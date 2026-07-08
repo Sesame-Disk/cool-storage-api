@@ -110,10 +110,10 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
   - **DONE — docs close-out.** This tracker + [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md) updated to
     the canonical end-state (`block_ids` = SHA-256, `seafile_block_ids_sha1` = SHA-1, client sends
     only `{sha256, size}`); stale regression-guard test names corrected.
-  - **Deferred to PR7 — the `WriteVerifiedWebBlockMapping` collision guard.** Removing the client
-    SHA-1 surface eliminates the *crafted-collision* threat that motivated the guard, but the guard
-    is still the active web mapping writer; it is now harmless defense-in-depth and is removed as
-    part of the PR7 mapping rework, not here.
+  - **Followed through in the later mapping rework.** The collision/remap guard
+    on `WriteVerifiedWebBlockMapping` stayed in place through the SHA-256
+    transition and the later representation-aware mapping work generalized the
+    same fail-closed contract to `WriteBlockIDMapping` as well.
 - `PR7` — **merged to `main`**: drop the reverse mapping table
   `block_id_mappings_by_internal`.
   - **Migration `006_drop_block_id_mappings_by_internal.cql`** (`DROP TABLE IF EXISTS`).
@@ -396,6 +396,8 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
 - Stop writing the reverse row in `WriteBlockIDMapping` ([block_references.go:200](../internal/db/block_references.go#L200))
   and `WriteVerifiedWebBlockMapping` ([block_references.go:266](../internal/db/block_references.go#L266))
   → removes a dual-write on the upload hot path.
+- Keep the forward writers fail-closed on same-domain remaps: create when absent,
+  treat identical replays as idempotent, and reject `external_id -> different internal_id`.
 - Drop `ListBlockMappingsByInternalID` ([store_cassandra.go:1712](../internal/gc/store_cassandra.go#L1712))
   and the reverse delete in `DeleteBlockMappingResolved` ([store_cassandra.go:1747](../internal/gc/store_cassandra.go#L1747));
   rewrite GC mapping cleanup to resolve the SHA-1 from `blocks.sha1`.
