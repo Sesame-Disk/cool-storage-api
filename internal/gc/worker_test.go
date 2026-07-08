@@ -775,12 +775,24 @@ func TestWorker_ProcessFSObject_CascadesDirEntries(t *testing.T) {
 
 	orgID := uuid.New()
 	libID := uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	blockRepresentationID := db.EncryptedLibraryBlockRepresentationID(libID.String())
 
 	// Create a directory with children
 	store.AddFSObjectWithEntries(libID, "fs-dir", "dir", nil, []string{"fs-child1", "fs-child2"})
 	store.AddLibrary(orgID, libID, "hot")
 
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemFSObject, "fs-dir", libID, "", 0)
+	if err := store.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              queuedAt,
+		IdentityAt:            queuedAt,
+		ItemType:              ItemFSObject,
+		ItemID:                "fs-dir",
+		LibraryID:             libID,
+		BlockRepresentationID: blockRepresentationID,
+	}}); err != nil {
+		t.Fatalf("EnqueueBatch failed: %v", err)
+	}
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -802,6 +814,9 @@ func TestWorker_ProcessFSObject_CascadesDirEntries(t *testing.T) {
 	for _, item := range items {
 		if item.ItemType == ItemFSObject {
 			childCount++
+			if item.BlockRepresentationID != blockRepresentationID {
+				t.Fatalf("child %s BlockRepresentationID = %q, want %q", item.ItemID, item.BlockRepresentationID, blockRepresentationID)
+			}
 		}
 	}
 	if childCount != 2 {
@@ -1159,7 +1174,7 @@ func TestWorker_EnqueueLibraryContents_DoesNotCrossSuppressAcrossLibraries(t *te
 		t.Fatalf("seed pending fs_object failed: %v", err)
 	}
 
-	err := w.enqueueLibraryContentsAt(orgID, libTarget, "hot", identityAt, false)
+	err := w.enqueueLibraryContentsAt(orgID, libTarget, "", "hot", identityAt, false)
 	if err != nil {
 		t.Fatalf("enqueueLibraryContentsAt failed: %v", err)
 	}
@@ -1238,12 +1253,16 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 	orgID := uuid.New()
 	libID := uuid.New()
 	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	blockRepresentationID := db.EncryptedLibraryBlockRepresentationID(libID.String())
 
 	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
 	store.AddCommit(libID, "commit-1", "fs-root")
 	store.AddBlock(orgID, "blk-a", "hot", 0)
 	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-root")
 	store.AddFSObject(libID, "fs-root", "file", []string{"blk-a"})
+	store.mu.Lock()
+	store.deletedLibraries[libID].BlockRepresentationID = blockRepresentationID
+	store.mu.Unlock()
 
 	guardedCommit := QueueItem{
 		OrgID:                       orgID,
@@ -1253,6 +1272,7 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 		ItemType:                    ItemCommit,
 		ItemID:                      "commit-1",
 		LibraryID:                   libID,
+		BlockRepresentationID:       blockRepresentationID,
 	}
 	if err := w.processCommit(guardedCommit); err != nil {
 		t.Fatalf("processCommit while library deleted failed: %v", err)
@@ -1273,6 +1293,9 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 	}
 	if !rootChild.RequiresLibraryDeletedCheck {
 		t.Fatal("expected root fs_object child to inherit library delete guard")
+	}
+	if rootChild.BlockRepresentationID != blockRepresentationID {
+		t.Fatalf("root fs_object child BlockRepresentationID = %q, want %q", rootChild.BlockRepresentationID, blockRepresentationID)
 	}
 
 	store.mu.Lock()

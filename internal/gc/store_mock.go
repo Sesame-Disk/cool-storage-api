@@ -493,14 +493,20 @@ func mockMappingKey(orgID uuid.UUID, representationID, externalID string) string
 	return fmt.Sprintf("%s:%s:%s", orgID, representationID, db.NormalizeBlockID(externalID))
 }
 
-func (m *MockStore) blockRepresentationIDForLibraryLocked(libraryID uuid.UUID) (string, bool) {
+func (m *MockStore) blockRepresentationIDForLibraryLocked(orgID, libraryID uuid.UUID) (string, bool) {
 	if lib := m.libraries[libraryID]; lib != nil {
+		if lib.OrgID != orgID {
+			return "", false
+		}
 		if rep := strings.TrimSpace(lib.BlockRepresentationID); rep != "" {
 			return rep, true
 		}
 		return db.PlainBlockRepresentationID, true
 	}
 	if deleted := m.deletedLibraries[libraryID]; deleted != nil {
+		if deleted.OrgID != orgID {
+			return "", false
+		}
 		if rep := strings.TrimSpace(deleted.BlockRepresentationID); rep != "" {
 			return rep, true
 		}
@@ -1788,7 +1794,7 @@ func (m *MockStore) AddFSObjectReferenceForTest(orgID uuid.UUID, blockID string,
 func (m *MockStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.UUID) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if representationID, ok := m.blockRepresentationIDForLibraryLocked(libraryID); ok {
+	if representationID, ok := m.blockRepresentationIDForLibraryLocked(orgID, libraryID); ok {
 		return representationID, nil
 	}
 	return "", gocql.ErrNotFound
@@ -1799,7 +1805,7 @@ func (m *MockStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentat
 	defer m.mu.RUnlock()
 	representationID := strings.TrimSpace(blockRepresentationID)
 	if representationID == "" {
-		if resolvedRepresentationID, ok := m.blockRepresentationIDForLibraryLocked(libraryID); ok {
+		if resolvedRepresentationID, ok := m.blockRepresentationIDForLibraryLocked(orgID, libraryID); ok {
 			representationID = resolvedRepresentationID
 		}
 	}

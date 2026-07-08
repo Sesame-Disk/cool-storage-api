@@ -188,7 +188,20 @@ func TestQueue_IncrementRetry_PreservesIdentityAtForCascadeItems(t *testing.T) {
 
 	orgID := uuid.New()
 	originalQueuedAt := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Millisecond)
-	store.EnqueueItem(orgID, originalQueuedAt, ItemLibraryCascade, uuid.New().String(), uuid.Nil, "hot", 2)
+	blockRepresentationID := "library:test"
+	if err := store.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              originalQueuedAt,
+		IdentityAt:            originalQueuedAt,
+		ItemType:              ItemLibraryCascade,
+		ItemID:                uuid.New().String(),
+		LibraryID:             uuid.Nil,
+		BlockRepresentationID: blockRepresentationID,
+		StorageClass:          "hot",
+		RetryCount:            2,
+	}}); err != nil {
+		t.Fatalf("EnqueueBatch failed: %v", err)
+	}
 
 	items, err := store.DequeueBatch(orgID, 1, time.Now())
 	if err != nil || len(items) != 1 {
@@ -211,6 +224,9 @@ func TestQueue_IncrementRetry_PreservesIdentityAtForCascadeItems(t *testing.T) {
 	}
 	if !requeued[0].IdentityAt.Equal(originalQueuedAt) {
 		t.Errorf("cascade retry IdentityAt = %v, want %v", requeued[0].IdentityAt, originalQueuedAt)
+	}
+	if requeued[0].BlockRepresentationID != blockRepresentationID {
+		t.Errorf("cascade retry BlockRepresentationID = %q, want %q", requeued[0].BlockRepresentationID, blockRepresentationID)
 	}
 }
 

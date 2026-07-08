@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -989,17 +990,19 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 	failedAt := time.Now().UTC().Truncate(time.Millisecond)
 	originalQueuedAt := failedAt.Add(-time.Minute)
 	itemID := uuid.New().String()
+	blockRepresentationID := db.EncryptedLibraryBlockRepresentationID(uuid.NewString())
 
 	store.failedItems[orgID] = []GCFailedItemInfo{{
-		OrgID:        orgID,
-		FailedAt:     failedAt,
-		QueuedAt:     originalQueuedAt,
-		IdentityAt:   deletedAt,
-		ItemType:     ItemLibraryCascade,
-		ItemID:       itemID,
-		LibraryID:    uuid.Nil,
-		StorageClass: "hot",
-		RetryCount:   5,
+		OrgID:                 orgID,
+		FailedAt:              failedAt,
+		QueuedAt:              originalQueuedAt,
+		IdentityAt:            deletedAt,
+		ItemType:              ItemLibraryCascade,
+		ItemID:                itemID,
+		LibraryID:             uuid.Nil,
+		BlockRepresentationID: blockRepresentationID,
+		StorageClass:          "hot",
+		RetryCount:            5,
 	}}
 
 	svc := &Service{
@@ -1021,6 +1024,9 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 	}
 	if !items[0].IdentityAt.Equal(deletedAt) {
 		t.Fatalf("requeued cascade item IdentityAt = %v, want %v", items[0].IdentityAt, deletedAt)
+	}
+	if items[0].BlockRepresentationID != blockRepresentationID {
+		t.Fatalf("requeued cascade item BlockRepresentationID = %q, want %q", items[0].BlockRepresentationID, blockRepresentationID)
 	}
 }
 
@@ -1096,6 +1102,7 @@ func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(
 	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	failedAt := time.Now().UTC().Truncate(time.Millisecond)
 	itemID := "heavy-root-child"
+	blockRepresentationID := db.EncryptedLibraryBlockRepresentationID(libID.String())
 
 	store.failedItems[orgID] = []GCFailedItemInfo{{
 		OrgID:                       orgID,
@@ -1106,6 +1113,7 @@ func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(
 		ItemType:                    ItemFSObject,
 		ItemID:                      itemID,
 		LibraryID:                   libID,
+		BlockRepresentationID:       blockRepresentationID,
 		StorageClass:                "hot",
 		RetryCount:                  5,
 		LastError:                   "library " + libID.String() + " hard delete already in progress for child " + itemID,
@@ -1152,6 +1160,9 @@ func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(
 	}
 	if !items[0].RequiresLibraryDeletedCheck {
 		t.Fatal("requeued item lost RequiresLibraryDeletedCheck flag")
+	}
+	if items[0].BlockRepresentationID != blockRepresentationID {
+		t.Fatalf("requeued item BlockRepresentationID = %q, want %q", items[0].BlockRepresentationID, blockRepresentationID)
 	}
 }
 

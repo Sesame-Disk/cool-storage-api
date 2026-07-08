@@ -1126,12 +1126,16 @@ func (s *CassandraStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.U
 		return "", err
 	}
 
+	var deletedOrgID string
 	var deletedRepresentationID string
 	err = s.db.Session().Query(`
-		SELECT block_representation_id FROM deleted_libraries WHERE library_id = ?
-	`, libraryID.String()).Scan(&deletedRepresentationID)
+		SELECT org_id, block_representation_id FROM deleted_libraries WHERE library_id = ?
+	`, libraryID.String()).Scan(&deletedOrgID, &deletedRepresentationID)
 	if err != nil {
 		return "", err
+	}
+	if parseUUID(deletedOrgID) != orgID {
+		return "", gocql.ErrNotFound
 	}
 	deletedRepresentationID = strings.TrimSpace(deletedRepresentationID)
 	if deletedRepresentationID == "" {
