@@ -1777,14 +1777,22 @@ func (m *MockStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockIDs []strin
 	defer m.mu.RUnlock()
 	representationID := m.blockRepresentationIDForLibraryLocked(libraryID)
 
+	// Mirror CassandraStore.resolveBlockIDsConcurrent exactly: canonicalize before
+	// classifying by hex content, only resolve hex SHA-1 ids, and only accept a hex
+	// SHA-256 internal id — otherwise keep the original (lenient). Without this the
+	// mock would pass GC tests that behave differently against Cassandra for
+	// uppercase / padded / non-hex garbage ids.
 	resolved := make([]string, len(blockIDs))
-	copy(resolved, blockIDs)
 	for i, blockID := range blockIDs {
-		if len(blockID) != 40 {
+		normalized := db.NormalizeBlockID(blockID)
+		resolved[i] = normalized
+		if !db.IsSHA1BlockID(normalized) {
 			continue
 		}
-		if internalID, ok := m.mappings[mockMappingKey(orgID, representationID, blockID)]; ok && internalID != "" {
-			resolved[i] = internalID
+		if internalID, ok := m.mappings[mockMappingKey(orgID, representationID, normalized)]; ok {
+			if canonical := db.NormalizeBlockID(internalID); db.IsSHA256BlockID(canonical) {
+				resolved[i] = canonical
+			}
 		}
 	}
 	return resolved, nil

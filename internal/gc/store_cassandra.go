@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -1688,9 +1689,19 @@ func (s *CassandraStore) RemoveBlockReference(orgID uuid.UUID, blockID, referrer
 const mappingResolveConcurrency = 32
 
 func (s *CassandraStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockIDs []string) ([]string, error) {
-	representationID, err := db.ResolveBlockRepresentationIDByLibraryID(s.db.Session(), libraryID.String())
-	if err != nil {
-		return nil, err
+	// Fast path: an all-SHA-256 block list never consults block_id_mappings, so
+	// skip the library representation read entirely (mirrors the optimized readers
+	// in fileview/sharelink). representation_id is only needed to scope SHA-1 lookups.
+	representationID := db.PlainBlockRepresentationID
+	for _, id := range blockIDs {
+		if db.IsSHA1BlockID(db.NormalizeBlockID(id)) {
+			resolved, err := db.ResolveBlockRepresentationIDByLibraryID(s.db.Session(), libraryID.String())
+			if err != nil {
+				return nil, err
+			}
+			representationID = resolved
+			break
+		}
 	}
 	return resolveBlockIDsConcurrent(orgID, blockIDs, mappingResolveConcurrency, func(idx int) (string, error) {
 		var internalID string
@@ -1725,13 +1736,20 @@ func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrenc
 	// original id. GC mapping cleanup legitimately runs after the forward mapping
 	// was already deleted, so failing closed here would wedge fs_object GC on a
 	// row that can never resolve. Worst case is a skipped reference removal (a
-	// leak + a harmless GC candidate), never a live-data delete.
+	// leak + a harmless GC candidate), never a live-data delete. Each lenient skip
+	// is counted (gc_block_id_invalid / gc_block_mapping_unresolved_*) so silent
+	// leaks stay visible for drift/corruption alerting instead of vanishing.
 	var toResolve []int
 	for i, blockID := range blockIDs {
 		normalized := db.NormalizeBlockID(blockID)
 		resolved[i] = normalized
-		if db.IsSHA1BlockID(normalized) {
+		switch {
+		case db.IsSHA1BlockID(normalized):
 			toResolve = append(toResolve, i)
+		case db.IsSHA256BlockID(normalized):
+			// already-internal id, nothing to resolve
+		default:
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_id_invalid").Inc()
 		}
 	}
 	if len(toResolve) == 0 {
@@ -1767,14 +1785,22 @@ func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrenc
 	for range toResolve {
 		result := <-results
 		if result.err != nil {
-			if !errors.Is(result.err, gocql.ErrNotFound) {
+			if errors.Is(result.err, gocql.ErrNotFound) {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_unresolved_not_found").Inc()
+			} else {
 				resolveErr = errors.Join(resolveErr, fmt.Errorf("resolve block mapping org=%s external=%s: %w", orgID, blockIDs[result.idx], result.err))
 			}
 			continue
 		}
 		// Only accept a hex 64-char SHA-256; a garbage internal_id is left as the
 		// original SHA-1 (lenient, see above) instead of poisoning the reference key.
-		if internalID := db.NormalizeBlockID(result.internalID); db.IsSHA256BlockID(internalID) {
+		internalID := db.NormalizeBlockID(result.internalID)
+		switch {
+		case internalID == "":
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_unresolved_empty_internal").Inc()
+		case !db.IsSHA256BlockID(internalID):
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_unresolved_invalid_internal").Inc()
+		default:
 			resolved[result.idx] = internalID
 		}
 	}

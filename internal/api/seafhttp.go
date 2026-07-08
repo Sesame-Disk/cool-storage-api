@@ -3537,17 +3537,20 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	}
 }
 
-// resolveBlockID translates a SHA-1 block ID (40 chars) to SHA-256 (64 chars)
-// inside the target library's representation namespace.
+// resolveBlockID translates a hex SHA-1 block ID (40 chars) to SHA-256 (64 chars)
+// inside the target library's representation namespace. Classification is by hex
+// content, matching the streaming resolver: a non-SHA-1 id (already-SHA-256 or
+// anything else) is returned canonicalized without a mapping lookup.
 func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string, error) {
-	if len(blockID) != 40 {
-		return blockID, nil
+	normalized := db.NormalizeBlockID(blockID)
+	if !db.IsSHA1BlockID(normalized) {
+		return normalized, nil
 	}
 	representationID, err := h.resolveBlockRepresentationID(orgID, repoID)
 	if err != nil {
 		return "", err
 	}
-	mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, blockID)
+	mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, normalized)
 	if err != nil {
 		return "", err
 	}

@@ -106,6 +106,38 @@ func TestResolveBlockIDsConcurrent_GarbageInternalIDLeavesOriginal(t *testing.T)
 	}
 }
 
+// TestResolveBlockIDsConcurrent_NonHexInputIsLenient pins the deliberate GC
+// leniency for malformed INPUT ids so a future refactor cannot silently make GC
+// strict and wedge cleanups over damaged metadata: a 40-char non-hex id is not
+// looked up (it is not a valid SHA-1) and a wrong-length id is kept as-is, both
+// without error.
+func TestResolveBlockIDsConcurrent_NonHexInputIsLenient(t *testing.T) {
+	nonHex40 := strings.Repeat("z", 40)
+	wrongLen := strings.Repeat("a", 30)
+	blockIDs := []string{nonHex40, wrongLen, sha1Hex(1)}
+
+	var called atomic.Int32
+	lookup := func(idx int) (string, error) {
+		called.Add(1)
+		if blockIDs[idx] != sha1Hex(1) {
+			t.Errorf("lookup called for non-SHA-1 index %d (%q)", idx, blockIDs[idx])
+		}
+		return sha256Hex(101), nil
+	}
+
+	got, err := resolveBlockIDsConcurrent(uuid.Nil, blockIDs, 8, lookup)
+	if err != nil {
+		t.Fatalf("resolveBlockIDsConcurrent() error = %v, want nil (malformed input is not fatal)", err)
+	}
+	want := []string{nonHex40, wrongLen, sha256Hex(101)}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolveBlockIDsConcurrent() = %v, want %v (malformed inputs kept, only SHA-1 resolved)", got, want)
+	}
+	if n := called.Load(); n != 1 {
+		t.Errorf("lookup called %d times, want 1 (only the hex SHA-1 entry)", n)
+	}
+}
+
 // TestResolveBlockIDsConcurrent_RealErrorFailsBatch verifies that a real
 // (non-NotFound) lookup error fails the whole resolution: the slice is nil and
 // the returned error wraps the underlying cause (callers must not act on a

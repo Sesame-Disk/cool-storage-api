@@ -2460,6 +2460,74 @@ func TestBlockHashValidation(t *testing.T) {
 	}
 }
 
+func TestPutBlockIDClassificationRejectsMalformedHashIDs(t *testing.T) {
+	tests := []struct {
+		name       string
+		externalID string
+		hashType   string
+		wantReject bool
+		isLegacy   bool
+		isDirect   bool
+	}{
+		{
+			name:       "invalid 40-char non-hex SHA-1",
+			externalID: strings.Repeat("z", 40),
+			wantReject: true,
+		},
+		{
+			name:       "invalid 64-char non-hex SHA-256",
+			externalID: strings.Repeat("z", 64),
+			wantReject: true,
+		},
+		{
+			name:       "explicit sha256 with invalid id",
+			externalID: strings.Repeat("z", 64),
+			hashType:   "sha256",
+			wantReject: true,
+		},
+		{
+			name:       "valid SHA-1 remains legacy",
+			externalID: strings.Repeat("a", 40),
+			isLegacy:   true,
+		},
+		{
+			name:       "valid SHA-256 remains direct",
+			externalID: strings.Repeat("a", 64),
+			isDirect:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			normalizedExternal := db.NormalizeBlockID(tt.externalID)
+			rejected := false
+			switch {
+			case tt.hashType == "sha256":
+				rejected = !db.IsSHA256BlockID(normalizedExternal)
+			case len(normalizedExternal) == 40:
+				rejected = !db.IsSHA1BlockID(normalizedExternal)
+			case len(normalizedExternal) == 64:
+				rejected = !db.IsSHA256BlockID(normalizedExternal)
+			}
+			if rejected != tt.wantReject {
+				t.Fatalf("rejected = %v, want %v", rejected, tt.wantReject)
+			}
+			if rejected {
+				return
+			}
+
+			isLegacySHA1 := db.IsSHA1BlockID(normalizedExternal) && tt.hashType != "sha256"
+			isDirectSHA256 := db.IsSHA256BlockID(normalizedExternal) || tt.hashType == "sha256"
+			if isLegacySHA1 != tt.isLegacy {
+				t.Errorf("isLegacySHA1 = %v, want %v", isLegacySHA1, tt.isLegacy)
+			}
+			if isDirectSHA256 != tt.isDirect {
+				t.Errorf("isDirectSHA256 = %v, want %v", isDirectSHA256, tt.isDirect)
+			}
+		})
+	}
+}
+
 func TestSyncFinalizedDeltaSet(t *testing.T) {
 	t.Run("miss before mark, hit after", func(t *testing.T) {
 		set := newSyncFinalizedDeltaSet()

@@ -1104,9 +1104,12 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 		return
 	}
 
-	// Determine internal ID based on external ID length
+	// Classify by hex CONTENT, not just length, so the whole read path shares the
+	// streaming resolver's "valid hex SHA-1/SHA-256" contract instead of routing a
+	// 40-char non-hex id into the mapping lookup.
+	normalizedExternal := db.NormalizeBlockID(externalID)
 	var internalID string
-	isLegacySHA1 := len(externalID) == 40
+	isLegacySHA1 := db.IsSHA1BlockID(normalizedExternal)
 
 	if h.db != nil && isLegacySHA1 {
 		representationID, err := h.resolveSyncBlockRepresentationID(orgID, repoID)
@@ -1114,7 +1117,7 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
 			return
 		}
-		mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, externalID)
+		mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, normalizedExternal)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
 			return
@@ -1126,8 +1129,8 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 		internalID = mappedID
 		log.Printf("GetBlock: resolved %s → %s\n", externalID, internalID)
 	} else {
-		// SHA-256 or no DB: use external ID directly
-		internalID = externalID
+		// SHA-256 or no DB: use the canonicalized external ID directly.
+		internalID = normalizedExternal
 	}
 
 	// Look up storage class from database
@@ -1235,12 +1238,35 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	sha256Hash := sha256.Sum256(data)
 	internalID := hex.EncodeToString(sha256Hash[:])
 
-	// Determine if this is a legacy SHA-1 ID or new SHA-256 ID
-	isLegacySHA1 := len(externalID) == 40 && hashType != "sha256"
-	isDirectSHA256 := len(externalID) == 64 || hashType == "sha256"
+	// Classify by normalized content, but reject malformed 40/64-char ids early so
+	// a non-hex block id cannot bypass the direct SHA-256 verification path.
+	normalizedExternal := db.NormalizeBlockID(externalID)
+	switch {
+	case hashType == "sha256":
+		if !db.IsSHA256BlockID(normalizedExternal) {
+			log.Printf("PutBlock: invalid explicit SHA-256 block id %q\n", externalID)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block id"})
+			return
+		}
+	case len(normalizedExternal) == 40:
+		if !db.IsSHA1BlockID(normalizedExternal) {
+			log.Printf("PutBlock: invalid SHA-1 block id %q\n", externalID)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block id"})
+			return
+		}
+	case len(normalizedExternal) == 64:
+		if !db.IsSHA256BlockID(normalizedExternal) {
+			log.Printf("PutBlock: invalid SHA-256 block id %q\n", externalID)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block id"})
+			return
+		}
+	}
+
+	isLegacySHA1 := db.IsSHA1BlockID(normalizedExternal) && hashType != "sha256"
+	isDirectSHA256 := db.IsSHA256BlockID(normalizedExternal) || hashType == "sha256"
 
 	// Verify hash for SHA-256 clients
-	if isDirectSHA256 && externalID != internalID {
+	if isDirectSHA256 && normalizedExternal != internalID {
 		log.Printf("PutBlock: SHA-256 hash mismatch, expected %s got %s\n", externalID, internalID)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "block hash mismatch"})
 		return
@@ -1431,7 +1457,7 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 	var representationID string
 	if h.db != nil {
 		for _, extID := range externalIDs {
-			if len(extID) == 40 {
+			if db.IsSHA1BlockID(db.NormalizeBlockID(extID)) {
 				representationID, err = h.resolveSyncBlockRepresentationID(orgID, repoID)
 				if err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
@@ -1447,11 +1473,14 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 			continue
 		}
 
+		// Classify by hex content; the client-facing map key stays the original
+		// extID, but the mapping lookup / existence check use the canonical form.
+		normalized := db.NormalizeBlockID(extID)
 		var internalID string
-		isLegacySHA1 := len(extID) == 40
+		isLegacySHA1 := db.IsSHA1BlockID(normalized)
 
 		if h.db != nil && isLegacySHA1 {
-			mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, extID)
+			mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, normalized)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
 				return
@@ -1462,8 +1491,8 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 			}
 			internalID = mappedID
 		} else {
-			// SHA-256 or no DB: use external ID directly
-			internalID = extID
+			// SHA-256 or no DB: use the canonicalized external ID directly.
+			internalID = normalized
 		}
 
 		externalToInternal[extID] = internalID
