@@ -2280,6 +2280,18 @@ func TestHashTypeParameter(t *testing.T) {
 			isLegacy: false,
 			isDirect: true,
 		},
+		{
+			name:     "SHA-256 with hash_type=sha1 (rejected)",
+			blockID:  "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			hashType: "sha1",
+			wantErr:  true,
+		},
+		{
+			name:     "SHA-256 with uppercase hash_type (rejected)",
+			blockID:  "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			hashType: "SHA256",
+			wantErr:  true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2473,6 +2485,12 @@ func TestPutBlockIDClassificationRejectsMalformedHashIDs(t *testing.T) {
 			name:       "explicit sha256 with invalid id",
 			externalID: strings.Repeat("z", 64),
 			hashType:   "sha256",
+			wantReject: true,
+		},
+		{
+			name:       "unknown hash_type is rejected",
+			externalID: strings.Repeat("a", 64),
+			hashType:   "sha25",
 			wantReject: true,
 		},
 		{

@@ -1360,7 +1360,8 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			return
 		}
 
-		// If legacy SHA-1 client, store mapping external→internal (dual-write: forward + reverse)
+		// If the client addressed the upload by legacy SHA-1, we stored the
+		// representation-scoped SHA-1 → SHA-256 mapping above.
 		if classifiedID.isLegacySHA1 {
 			log.Printf("PutBlock: stored mapping %s → %s\n", externalID, internalID)
 		}
@@ -1434,66 +1435,68 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 		externalIDs = strings.Split(bodyStr, "\n")
 	}
 
+	type requestedBlock struct {
+		external   string
+		classified classifiedClientBlockID
+	}
+
 	// Build mapping from external IDs to internal IDs
-	// For SHA-1 IDs (40 chars), look up the internal SHA-256 from mapping table
-	// For SHA-256 IDs (64 chars), use directly
+	// For SHA-1 IDs, look up the internal SHA-256 from the mapping table.
+	// For SHA-256 IDs, use the normalized value directly.
 	externalToInternal := make(map[string]string)
 	var internalIDs []string
 	var representationID string
-	if h.db != nil {
-		for _, extID := range externalIDs {
-			if strings.TrimSpace(extID) == "" {
-				continue
-			}
-			classifiedID, classifyErr := classifyClientReadableBlockID(extID)
-			if classifyErr != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block id"})
-				return
-			}
-			if classifiedID.isLegacySHA1 {
-				representationID, err = h.resolveSyncBlockRepresentationID(orgID, repoID)
-				if err != nil {
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
-					return
-				}
-				break
-			}
-		}
-	}
-
+	requestedBlocks := make([]requestedBlock, 0, len(externalIDs))
+	needsRepresentationID := false
 	for _, extID := range externalIDs {
-		if extID == "" {
+		if strings.TrimSpace(extID) == "" {
 			continue
 		}
-
 		classifiedID, classifyErr := classifyClientReadableBlockID(extID)
 		if classifyErr != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block id"})
 			return
 		}
+		requestedBlocks = append(requestedBlocks, requestedBlock{
+			external:   extID,
+			classified: classifiedID,
+		})
+		if h.db != nil && classifiedID.isLegacySHA1 {
+			needsRepresentationID = true
+		}
+	}
+	if h.db != nil && needsRepresentationID {
+		representationID, err = h.resolveSyncBlockRepresentationID(orgID, repoID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
+			return
+		}
+	}
+
+	for _, reqBlock := range requestedBlocks {
 		var internalID string
 
-		if h.db != nil && classifiedID.isLegacySHA1 {
-			mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, classifiedID.normalized)
+		if h.db != nil && reqBlock.classified.isLegacySHA1 {
+			mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, reqBlock.classified.normalized)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
 				return
 			}
 			if !ok || strings.TrimSpace(mappedID) == "" {
-				externalToInternal[extID] = ""
+				externalToInternal[reqBlock.external] = ""
 				continue
 			}
 			internalID, err = normalizeResolvedInternalBlockID(mappedID)
 			if err != nil {
-				log.Printf("CheckBlocks: invalid mapped internal id for %s: %q", extID, mappedID)
+				log.Printf("CheckBlocks: invalid mapped internal id for %s: %q", reqBlock.external, mappedID)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
 				return
 			}
 		} else {
-			internalID = classifiedID.normalized
+			internalID = reqBlock.classified.normalized
 		}
 
-		externalToInternal[extID] = internalID
+		externalToInternal[reqBlock.external] = internalID
 		internalIDs = append(internalIDs, internalID)
 	}
 
@@ -1513,17 +1516,14 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 	// Return list of missing blocks using external IDs (client expects these)
 	// Initialize as empty slice so JSON serializes as [] not null
 	needed := make([]string, 0)
-	for _, extID := range externalIDs {
-		if extID == "" {
-			continue
-		}
-		internalID := externalToInternal[extID]
+	for _, reqBlock := range requestedBlocks {
+		internalID := externalToInternal[reqBlock.external]
 		if internalID == "" {
-			needed = append(needed, extID)
+			needed = append(needed, reqBlock.external)
 			continue
 		}
 		if !existMap[internalID] {
-			needed = append(needed, extID)
+			needed = append(needed, reqBlock.external)
 		}
 	}
 

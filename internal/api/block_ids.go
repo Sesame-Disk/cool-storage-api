@@ -28,11 +28,14 @@ func classifyClientReadableBlockID(blockID string) (classifiedClientBlockID, err
 }
 
 // classifySyncUploadBlockID enforces the upload contract before reading the body:
-// the declared external id must be a valid hex SHA-1 or SHA-256, and an explicit
-// hash_type=sha256 must always carry a SHA-256 id.
+// the declared external id must be a valid hex SHA-1 or SHA-256. If hash_type is
+// omitted we infer from the id; if it is provided it must be exactly "sha256" and
+// must carry a SHA-256 id.
 func classifySyncUploadBlockID(blockID, hashType string) (classifiedClientBlockID, error) {
 	normalized := db.NormalizeBlockID(blockID)
 	switch {
+	case hashType != "" && hashType != "sha256":
+		return classifiedClientBlockID{}, fmt.Errorf("invalid hash type")
 	case hashType == "sha256":
 		if !db.IsSHA256BlockID(normalized) {
 			return classifiedClientBlockID{}, fmt.Errorf("invalid block id")
