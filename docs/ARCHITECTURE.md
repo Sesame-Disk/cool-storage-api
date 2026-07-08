@@ -85,32 +85,59 @@ chunking:
 
 ---
 
-### SHA-1 to SHA-256 Block ID Mapping
+### Representation-Aware Block ID Mapping
 
-Seafile clients use SHA-1 (40 chars) for block IDs, but SesameFS stores everything as SHA-256 (64 chars) internally.
+Seafile-facing surfaces still use SHA-1 block IDs, while SesameFS stores canonical
+block data by SHA-256 internally. The mapping is no longer modeled as org-wide
+`SHA-1 -> SHA-256`; it is representation-aware.
 
-**Schema**:
+Why: the same logical content can exist in different byte domains inside one org.
+For plaintext libraries the external SHA-1 is computed over plaintext bytes; for
+encrypted libraries it is computed over library-specific encrypted bytes. Those are
+different physical block identities and must not share one mapping namespace.
+
+**Active identity model**:
+
+- physical block identity: `(org_id, internal_sha256)`
+- external mapping identity: `(org_id, representation_id, external_sha1)`
+
+**Representation IDs**:
+
+- `plain:v1` for plaintext libraries
+- `library:<library_id>` for encrypted libraries
+
+**Active schema**:
 ```cql
 CREATE TABLE block_id_mappings (
-    org_id UUID,
-    external_id TEXT,    -- SHA-1 from Seafile client (40 chars)
-    internal_id TEXT,    -- SHA-256 used in storage (64 chars)
-    created_at TIMESTAMP,
-    PRIMARY KEY ((org_id), external_id)
+  org_id UUID,
+  representation_id TEXT,
+  external_id TEXT,
+  internal_id TEXT,
+  created_at TIMESTAMP,
+  PRIMARY KEY ((org_id, representation_id, external_id))
 );
 ```
 
+Libraries persist `block_representation_id`, and canonical `blocks` rows also keep
+the `representation_id` used for exact forward-mapping cleanup during GC.
+
 **Flow**:
 ```
-Seafile Client (SHA-1)           SesameFS (SHA-256)
-─────────────────────────────────────────────────────────
-PUT block/abc123... (40)         → Compute SHA-256 of data
-                                 → Store with internal SHA-256 ID
-                                 → Save mapping: abc123... → SHA-256
-─────────────────────────────────────────────────────────
-GET block/abc123... (40)         → Lookup mapping: abc123... → SHA-256
-                                 → Retrieve using internal SHA-256 ID
+Seafile-facing SHA-1            SesameFS canonical storage
+────────────────────────────────────────────────────────────────────
+PUT block in library L          → compute internal SHA-256 from bytes
+                → resolve effective representation_id for L
+                → store canonical block metadata
+                → save mapping:
+                  (org, representation_id, external_sha1) -> internal_sha256
+────────────────────────────────────────────────────────────────────
+GET/resolve block for library L → resolve effective representation_id for L
+                → look up mapping inside that representation only
+                → retrieve by internal SHA-256
 ```
+
+See [BLOCK-REPRESENTATION-DESIGN.md](./BLOCK-REPRESENTATION-DESIGN.md) for the PR1
+design and rollout notes.
 
 ---
 
@@ -572,7 +599,7 @@ ensures a block's references are fully replicated before the gate runs.
 
 #### Reverse Lookup Table — DROPPED (PR7, migration 006)
 
-`block_id_mappings_by_internal` (a reverse internal SHA-256 → external SHA-1 lookup, dual-written on every upload) **was dropped** in `006_drop_block_id_mappings_by_internal.cql`. GC cleanup now sources the external SHA-1 from `blocks.sha1` (a keyed point read captured before the block row is deleted) and deletes the single forward `block_id_mappings` row by `(org_id, external_id)` — no reverse enumeration, no dual-write. See [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) (PR7).
+`block_id_mappings_by_internal` (a reverse internal SHA-256 → external SHA-1 lookup, dual-written on every upload) **was dropped** in `006_drop_block_id_mappings_by_internal.cql`. GC cleanup now sources the external SHA-1 from `blocks.sha1` (a keyed point read captured before the block row is deleted) and deletes the single forward `block_id_mappings` row by `(org_id, representation_id, external_id)` — no reverse enumeration, no dual-write. See [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) (PR7).
 
 ---
 
@@ -1119,11 +1146,11 @@ For encrypted libraries, the goroutine fetches AND decrypts the block.
 
 #### Batch Block ID Resolution
 
-SHA-1 block IDs (from Seafile clients) are translated to SHA-256 via `block_id_mappings` table. Because that table is now partitioned by `((org_id, external_id))`, resolution uses bounded concurrent single-row reads (`mappingResolveConcurrency = 32`) instead of cross-partition `IN` queries:
+SHA-1 block IDs (from Seafile clients) are translated to SHA-256 via `block_id_mappings` table. Because that table is now partitioned by `((org_id, representation_id, external_id))`, resolution uses bounded concurrent single-row reads (`mappingResolveConcurrency = 32`) instead of cross-partition `IN` queries:
 
 ```sql
 SELECT internal_id FROM block_id_mappings
-WHERE org_id = ? AND external_id = ?
+WHERE org_id = ? AND representation_id = ? AND external_id = ?
 ```
 
 For a 28 GB file with ~1,763 blocks, the path still resolves upfront before streaming, but it does so as up to 32 concurrent point reads instead of serial per-block lookups or partition-crossing `IN` batches.

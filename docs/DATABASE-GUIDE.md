@@ -565,7 +565,7 @@ POST /api/v2/blocks/upload
 
 **Schema:**
 ```sql
-PRIMARY KEY ((org_id), external_id)  -- Lookup by SHA-1
+PRIMARY KEY ((org_id, representation_id, external_id))  -- Lookup by SHA-1 inside one representation domain
 ```
 
 **Why needed?**
@@ -591,7 +591,7 @@ PUT /seafhttp/repo/{repo_id}/block/{sha1_hash}
 > **Removed.** This reverse table was dropped in `006_drop_block_id_mappings_by_internal.cql`. GC
 > cleanup now sources a block's external SHA-1 from `blocks.sha1` (a keyed point read, captured from
 > `GetBlockInfo` before the row is deleted) and deletes the single forward `block_id_mappings` row by
-> `(org_id, external_id)`. No reverse enumeration, no dual-write. The description below is retained
+> `(org_id, representation_id, external_id)`. No reverse enumeration, no dual-write. The description below is retained
 > for historical context only.
 
 **Historical purpose:** Reverse lookup (SHA-256 → SHA-1) for GC cleanup before PR7.
@@ -609,7 +609,7 @@ PRIMARY KEY ((org_id), internal_id, external_id)  -- Lookup by SHA-256
 **GC Usage:**
 ```
 Worker reads blocks.sha1 from blocks(org_id, block_id) →
-  Deletes the single forward row from block_id_mappings(org_id, external_id)
+    Deletes the single forward row from block_id_mappings(org_id, representation_id, external_id)
 ```
 
 ---

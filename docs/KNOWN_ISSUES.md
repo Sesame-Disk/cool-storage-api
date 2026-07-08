@@ -28,6 +28,8 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Departments Support | ✅ Complete | Full CRUD, hierarchy, 29 integration tests |
 | API Token Library Access | ✅ Complete | 37 integration tests, full RW/RO enforcement |
 | Move/Copy Dialog Tree | ✅ Fixed | `with_parents` param missing in ListDirectoryV21 |
+| **Cross-Representation Copy/Move** | 🟡 Guarded limitation | Cross-library batch copy/move is now rejected when source and destination libraries use different block representations. Safe same-representation paths continue to work; a re-materializing transform path is still missing. See ISSUE-BLOCK-REPRESENTATION-COPY-01 and `docs/BLOCK-REPRESENTATION-DESIGN.md`. |
+| **Cross-Library Block Read Authorization (hash-only)** | 🟡 Hardening backlog | Blocks are content-addressed and deduplicated per **org**, not per library. The hash-only surfaces (bare-SHA `seafhttp` block GET, `CheckBlocks`, SHA-1→SHA-256 mapping resolution) authorize by org + a repo-scoped token + knowledge of the content hash, not by real library membership. Medium severity — a broken object-level authorization (BOLA) gated only by knowing the exact SHA-256/SHA-1; the session materialization gate blocks *claiming* but not the direct block read or the `CheckBlocks` oracle. Library-scoped read authorization is the fix. See ISSUE-BLOCK-CROSS-LIBRARY-READ-01 below. |
 | GC TTL Enforcement | Partial | `version_ttl_days` and `auto_delete_days` have storage, API, and scanner wiring, but their current behavior does not fully match the library settings UI. See ISSUE-LIB-RETENTION-01. |
 | Admin Panel | ✅ Working in Docker | `/sys/` route serves sysadmin.html via nginx + Go catch-all |
 | Frontend Permission UI | 🟡 ~85% Done | API layer returns real permissions on all directory/file endpoints. **Fixed**: `"owner"` permission now mapped to `"rw"` in API responses (was breaking upload button). **Enhanced (2026-03-11)**: Granular `PermissionFlags` (8 flags) now enforced backend-side via `RequirePermFlag()`. Upload/share link uploaders updated. Remaining: some UI components that conditionally render controls based on flags. |
@@ -238,6 +240,87 @@ An optional `activities` table can support dashboard feeds and broader event bro
 #### Remaining Work
 
 - Add immutable file event tables (`file_update_logs`, `file_access_logs`)
+
+---
+
+### ISSUE-BLOCK-REPRESENTATION-COPY-01: Cross-Representation Library Copy/Move Is Intentionally Blocked
+
+**Status**: 🟡 Guarded limitation (2026-07-07)
+**Severity**: Medium - fail-closed behavior is correct, but users cannot yet move/copy directly between every library pair
+**Affected**: Cross-library batch copy/move when source and destination libraries use different block representations
+
+#### Problem
+
+External SHA-1 block IDs are now resolved inside a library representation domain,
+not org-wide. A plaintext library and an encrypted library can legitimately reuse
+the same external SHA-1 for different physical SHA-256 blocks.
+
+Reusing the source `fs_object` block list across those domains would therefore risk
+resolving blocks against the wrong byte representation.
+
+#### Current Behavior
+
+- same-representation copy/move paths are allowed;
+- cross-representation batch copy/move is rejected before copying `fs_objects`;
+- direct runtime reads no longer fall back to treating SHA-1 as a canonical
+  internal block ID.
+
+This is the safe PR1 boundary for representation-aware mappings.
+
+#### Remaining Work
+
+- Add a real transform path that re-materializes destination blocks in the target
+  representation domain.
+- Backfill explicit `block_representation_id` metadata on legacy rows so the guard
+  no longer depends on runtime fallback for older libraries.
+
+#### Related Docs
+
+- `docs/BLOCK-REPRESENTATION-DESIGN.md`
+- `docs/ARCHITECTURE.md`
+
+### ISSUE-BLOCK-CROSS-LIBRARY-READ-01: Hash-Only Block Surfaces Authorize by Org, Not Library Membership
+
+**Status**: 🟡 Hardening backlog / known authorization gap (BOLA) (2026-07-07)
+**Severity**: Medium — a broken object-level authorization, not merely defense-in-depth. Exploitability is limited by the precondition that the caller knows the exact SHA-256/SHA-1 of the target block, but knowing a hash is not authorization: common-content hashes can be predictable, shared, or leaked via metadata/logs. The session materialization gate only blocks *claiming* an org block into a new file — it does **not** gate the direct `GET /block/:block_id` read or the `CheckBlocks` existence oracle. Representation-awareness narrows the exposure (encrypted libraries use a per-library `representation_id`, so cross-library resolution across encrypted libs is blocked); the residual is same-representation plaintext libraries and the bare SHA-256 read path.
+**Affected**: `seafhttp` bare-SHA block GET, `POST /api/v2/blocks/check` (`CheckBlocks`), and SHA-1→SHA-256 mapping resolution.
+
+#### Problem
+
+Physical blocks are content-addressed and deduplicated per **org** (`blocks`,
+`block_id_mappings`, and S3 objects are keyed by `(org_id, hash)`), not per library.
+The hash-only surfaces authenticate a repo-scoped token and check org + hash, but do
+not verify that the caller is a member of the *library that actually references the
+block*. Within one org, a party who already knows a block's SHA-256/SHA-1 can:
+
+- confirm the block exists org-wide via `CheckBlocks` (an existence oracle), and
+- in principle read block bytes it can address by hash even if it only holds a token
+  for a different library in the same org.
+
+Claiming an org block you did not upload *into a new file* is already blocked (the
+session-aware check reports S3-only blocks as `needs_upload`), but that gate does not
+cover the direct `GET /block/:block_id` read path or the `CheckBlocks` existence
+oracle — those remain authorized by org + hash only. Knowing the exact 256-bit
+content address is often derived from possessing the content, which limits real-world
+exploitability, but it is a precondition, not an authorization check. Treat this as a
+genuine (if hard-to-reach) broken authorization to be closed, not a purely theoretical
+defense-in-depth nicety.
+
+#### Remaining Work (future hardening)
+
+1. Authorize hash-only reads by real membership of the library that references the block.
+2. Block cross-library reads that address a block purely by its SHA-256.
+3. Prevent `CheckBlocks` from acting as a cross-library existence oracle.
+4. Evolve `block_references` toward `(library_id, ref_kind)` so liveness/authorization can be reasoned about per library rather than per org.
+5. Strengthen the publication invariant for `fs:` references so a library only ever gains references to blocks it legitimately owns.
+
+#### Related Docs
+
+- `docs/BLOCK-REPRESENTATION-DESIGN.md`
+- `docs/ARCHITECTURE.md`
+
+### (file statistics follow-up, see ISSUE-FILE-STATS-01)
+
 - Write file operation events from upload/create/edit/delete/move/rename/download/preview handlers
 - Implement real aggregation in `AdminStatisticFiles`
 - Implement `OrgStatisticFiles` using the same event source scoped by org
@@ -578,7 +661,7 @@ The schema for block-related tables now uses per-block partitioning:
 - `blocks` → `PRIMARY KEY ((org_id, block_id))`
 - `gc_block_candidates` → `PRIMARY KEY ((org_id, block_id))`
 - `gc_s3_orphans` → `PRIMARY KEY ((org_id, block_id))`
-- `block_id_mappings` → `PRIMARY KEY ((org_id, external_id))`
+- `block_id_mappings` → `PRIMARY KEY ((org_id, representation_id, external_id))`
 - `block_id_mappings_by_internal` → historical only; dropped in PR7 after GC moved to `blocks.sha1`
 
 Each block now lives in its own Cassandra partition, so concurrent LWTs from one upload cannot contend at the Paxos layer.

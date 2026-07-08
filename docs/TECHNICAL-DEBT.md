@@ -318,7 +318,123 @@ stores may retain orphaned MPU parts until an explicit abort or lifecycle sweep.
   in `internal/storage/blocks.go` (`GetBlock`, `GetBlockReader`, `GetBlockSize`,
   `BlockExists`, …) derives the S3 key from the content hash via `hashToKey(hash)`
   and never consults the canonical `storage_key` column; GC deletes the same way.
-  Only `EnsureReusableBlockPresent` (P-2) honors `storage_key`. Harmless today
+
+---
+
+## 26. Representation Metadata Backfill (DEFERRED)
+
+### Current State
+PR1 adds explicit `block_representation_id` to library rows, `representation_id`
+to canonical `blocks`, and a new representation-aware `block_id_mappings` keyed by
+`(org_id, representation_id, external_id)`. New writes persist that metadata.
+Legacy rows can still rely on runtime fallback to the library-derived default.
+
+### Why It Was Deferred
+The correctness-critical work for PR1 is the runtime namespace split and the
+fail-closed guardrails. Bulk backfill is operationally heavier and is not required
+to make new writes and new reads safe.
+
+### Follow-Up Plan
+1. Backfill `libraries.block_representation_id` and `libraries_by_id.block_representation_id` for legacy rows.
+2. Backfill `blocks.representation_id` where it can be derived deterministically.
+3. Add an audit command/report that counts rows still depending on runtime fallback.
+4. Re-run focused DB, API, and GC tests after the backfill tooling lands.
+
+---
+
+## 27. Cross-Representation Copy/Move Transform Path (DEFERRED)
+
+### Current State
+Cross-library batch copy/move now rejects operations when source and destination
+libraries use different block-representation domains. Same-representation paths
+still work.
+
+### Why It Was Deferred
+Safe support is not a metadata-only change. A cross-representation copy cannot
+reuse the source `fs_object` block list as-is; it must materialize destination
+blocks in the destination representation domain and publish a destination-specific
+mapping set.
+
+### Follow-Up Plan
+1. Define the transform contract for plaintext -> encrypted, encrypted -> plaintext, and encrypted -> different-encrypted-library.
+2. Re-materialize destination blocks instead of reusing source block IDs.
+3. Preserve GC/accounting invariants for the newly materialized destination blocks.
+4. Add integration coverage for copy, move, rollback, and retry across representation boundaries.
+
+---
+
+## 28. Representation-ID Hotpath Reuse Outside Sync (DEFERRED)
+
+### Current State
+PR1 now caches `(org_id, repo_id) -> representation_id` inside both
+`SyncHandler` and `SeafHTTPHandler`, so legacy sync/seafhttp SHA-1 resolution no
+longer re-reads the library row on every hot request after the first miss in one
+process.
+
+Other read paths still resolve the representation from Cassandra directly per
+request or per operation, mainly in v2 file/share download flows and other
+helpers that already loaded the library row but do not yet thread the value
+through.
+
+### Why It Was Deferred
+PR1's correctness goal was to split the mapping namespace safely. The sync and
+SeafHTTP caches were narrow, low-risk optimizations because
+`block_representation_id` is effectively immutable for a library in the current
+model. Generalizing reuse across other handlers is valid follow-up work, but it
+should be done deliberately so cache scope and invalidation remain explicit.
+
+### Follow-Up Plan
+1. Thread known representation IDs through v2/fileview/sharelink flows when the library row was already read earlier in the request.
+2. Add targeted benchmarks or request-count tracing around legacy SHA-1 download paths before and after the change.
+3. Only widen caching if the remaining over-fetch survives those measurements.
+
+---
+
+## 29. Narrow Representation Lookup Query (DEFERRED)
+
+### Current State
+`ResolveBlockRepresentationID` currently routes through `ReadLiveLibraryState`,
+which reads `owner_id`, `name`, `encrypted`, `block_representation_id`,
+`head_commit_id`, `storage_class`, and `deleted_at` just to derive one value.
+
+### Why It Was Deferred
+This is not a round-trip count problem; it is a row-width / over-fetch issue.
+PR1 kept the existing canonical library-state helper to minimize moving parts
+while the representation-aware namespace was being introduced.
+
+### Follow-Up Plan
+1. Add a dedicated live-library representation lookup that reads only `encrypted`, `block_representation_id`, and `deleted_at`.
+2. Keep the same deleted-library fail-closed behavior as `ReadLiveLibraryState`.
+3. Repoint the hot resolution helpers to that narrower query once covered by focused tests.
+
+---
+
+## 30. Legacy Block GET Metadata Round-Trips (DEFERRED)
+
+### Current State
+For legacy SHA-1 sync block GETs, the server still performs per-request metadata
+work after mapping resolution:
+
+1. resolve `SHA-1 -> SHA-256` from `block_id_mappings`
+2. read `blocks.storage_class`
+3. fetch the object from the resolved block store
+
+The sync representation-ID cache removes one extra library-state read, but the
+mapping lookup and canonical block metadata lookup remain on the hot request path.
+
+### Why It Was Deferred
+Those lookups are part of the current correctness contract and were already on the
+critical path conceptually before PR1. Removing or collapsing them safely is a
+larger hotpath optimization, not part of the namespace-safety change.
+
+### Follow-Up Plan
+1. Audit whether `storage_class` can be piggybacked on an existing metadata read or safely memoized for block GET traffic.
+2. Evaluate whether legacy SHA-1 GET traffic warrants a small resolved-block metadata cache keyed by `(org_id, representation_id, external_id)`.
+3. Keep the optimization secondary to correctness: no fallback that can bypass representation scoping or canonical block metadata.
+
+---
+
+- Only `EnsureReusableBlockPresent` (P-2) honors `storage_key`. Harmless today
   because `storage_key` is either empty (4 of 5 upload paths write `""`) or equal to
   the hash-derived key (OnlyOffice), so the hash-derived key is always correct. The
   risk surfaces only if a future write persists a `storage_key` that differs from
