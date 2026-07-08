@@ -53,6 +53,9 @@ func NewQueue(store GCStore) *Queue {
 
 // Enqueue inserts an item into the gc_queue for later deletion.
 func (q *Queue) Enqueue(orgID uuid.UUID, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string) error {
+	if itemTypeRequiresBlockRepresentation(itemType) {
+		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
+	}
 	return q.store.EnqueueItem(orgID, time.Now(), itemType, itemID, libraryID, storageClass, 0)
 }
 
@@ -61,6 +64,9 @@ func (q *Queue) Enqueue(orgID uuid.UUID, itemType ItemType, itemID string, libra
 // cascade children become immediately eligible for processing — they are known
 // to be unreferenced (the parent object is being deleted).
 func (q *Queue) EnqueueCascade(orgID uuid.UUID, parentQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string) error {
+	if itemTypeRequiresBlockRepresentation(itemType) {
+		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
+	}
 	return q.store.EnqueueItem(orgID, parentQueuedAt, itemType, itemID, libraryID, storageClass, 0)
 }
 

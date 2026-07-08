@@ -1113,6 +1113,7 @@ func TestWorker_EnqueueLibraryContents_NoDuplicateBlocks(t *testing.T) {
 	libID := uuid.New()
 
 	// Create library data
+	store.AddLibrary(orgID, libID, "hot")
 	store.AddCommit(libID, "commit-1", "fs-root-1")
 	store.AddCommit(libID, "commit-2", "fs-root-2")
 	store.AddFSObject(libID, "fs-1", "file", []string{"blk-a", "blk-b"})
@@ -1163,6 +1164,8 @@ func TestWorker_EnqueueLibraryContents_DoesNotCrossSuppressAcrossLibraries(t *te
 	libTarget := uuid.New()
 	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 
+	store.AddLibrary(orgID, libPending, "hot")
+	store.AddLibrary(orgID, libTarget, "hot")
 	store.AddCommit(libPending, "shared-commit", "fs-pending")
 	store.AddFSObject(libPending, "shared-fs", "file", []string{"blk-pending"})
 	store.AddCommit(libTarget, "shared-commit", "fs-target")
@@ -1174,7 +1177,7 @@ func TestWorker_EnqueueLibraryContents_DoesNotCrossSuppressAcrossLibraries(t *te
 		t.Fatalf("seed pending fs_object failed: %v", err)
 	}
 
-	err := w.enqueueLibraryContentsAt(orgID, libTarget, "", "hot", identityAt, false)
+	err := w.enqueueLibraryContentsAt(orgID, libTarget, "", "hot", identityAt, false, false)
 	if err != nil {
 		t.Fatalf("enqueueLibraryContentsAt failed: %v", err)
 	}
@@ -1812,6 +1815,27 @@ func TestWorker_ProcessLibraryCascade_ChildrenContinueAfterHardDelete(t *testing
 	}
 	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 0 {
 		t.Fatalf("block references after hard-delete child processing = %d, want 0", got)
+	}
+}
+
+func TestWorker_EnqueueLibraryContents_RequiresBlockRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+
+	store.AddCommit(libID, "commit-1", "fs-root")
+	store.AddFSObject(libID, "fs-root", "file", []string{"0123456789abcdef0123456789abcdef01234567"})
+
+	err := w.EnqueueLibraryContents(orgID, libID, "hot")
+	if err == nil {
+		t.Fatal("expected missing block representation error")
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("queue items = %#v, want no enqueued work", items)
 	}
 }
 
@@ -2459,5 +2483,102 @@ func TestWorker_ProcessFSObject_HardDeletedLibraryUsesQueuedRepresentation(t *te
 	}
 	if items := store.QueueItems(orgID); len(items) != 1 || items[0].ItemType != ItemBlock || items[0].ItemID != internalBlockID {
 		t.Fatalf("queue items = %#v, want one ItemBlock for %s", items, internalBlockID)
+	}
+}
+
+func TestWorker_ProcessLibraryCascade_EndToEndUsesQueuedRepresentationWithoutMetadata(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	externalBlockID := "fedcba9876543210fedcba9876543210fedcba98"
+	encryptedInternalID := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	plainInternalID := "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	encRep := db.EncryptedLibraryBlockRepresentationID(libID.String())
+
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot")
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = encRep
+	store.mu.Unlock()
+	store.AddCommit(libID, "commit-1", "fs-root")
+	store.AddFSObject(libID, "fs-root", "file", []string{externalBlockID})
+	store.AddBlock(orgID, encryptedInternalID, "hot", 0)
+	store.AddBlock(orgID, plainInternalID, "hot", 0)
+	store.AddBlockMappingForRepresentation(orgID, encRep, externalBlockID, encryptedInternalID)
+	store.AddBlockMappingForRepresentation(orgID, db.PlainBlockRepresentationID, externalBlockID, plainInternalID)
+	store.AddFSObjectReferenceForTest(orgID, encryptedInternalID, libID, "fs-root")
+	store.AddBlockReferenceForTest(orgID, plainInternalID, "keep:plain")
+	if err := store.SoftDeleteLibrary(orgID, libID, uuid.Nil); err != nil {
+		t.Fatalf("SoftDeleteLibrary failed: %v", err)
+	}
+	deletedAt, err := store.GetLibraryDeletedAt(libID)
+	if err != nil || deletedAt == nil {
+		t.Fatalf("GetLibraryDeletedAt failed: %v deletedAt=%v", err, deletedAt)
+	}
+
+	parent := QueueItem{
+		OrgID:                 orgID,
+		QueuedAt:              *deletedAt,
+		IdentityAt:            *deletedAt,
+		ItemType:              ItemLibraryCascade,
+		ItemID:                libID.String(),
+		BlockRepresentationID: encRep,
+		StorageClass:          "hot",
+	}
+	if err := w.processLibraryCascade(context.Background(), parent); err != nil {
+		t.Fatalf("processLibraryCascade failed: %v", err)
+	}
+	if exists, err := store.LibraryExists(libID); err != nil {
+		t.Fatalf("LibraryExists failed: %v", err)
+	} else if exists {
+		t.Fatal("library should be hard-deleted after cascade")
+	}
+
+	var commitItem QueueItem
+	var fsObjectItem QueueItem
+	for _, item := range store.QueueItems(orgID) {
+		switch {
+		case item.ItemType == ItemCommit && item.ItemID == "commit-1":
+			commitItem = item
+		case item.ItemType == ItemFSObject && item.ItemID == "fs-root":
+			fsObjectItem = item
+		}
+	}
+	if commitItem.ItemID == "" || fsObjectItem.ItemID == "" {
+		t.Fatalf("expected commit and fs_object children, got commit=%q fs_object=%q", commitItem.ItemID, fsObjectItem.ItemID)
+	}
+	if commitItem.BlockRepresentationID != encRep || fsObjectItem.BlockRepresentationID != encRep {
+		t.Fatalf("children lost queued representation: commit=%q fs=%q want %q", commitItem.BlockRepresentationID, fsObjectItem.BlockRepresentationID, encRep)
+	}
+
+	if err := w.processCommit(commitItem); err != nil {
+		t.Fatalf("processCommit failed: %v", err)
+	}
+	if err := w.processFSObject(context.Background(), fsObjectItem); err != nil {
+		t.Fatalf("processFSObject failed: %v", err)
+	}
+
+	if got := store.BlockReferenceCount(orgID, encryptedInternalID); got != 0 {
+		t.Fatalf("encrypted block references = %d, want 0", got)
+	}
+	if got := store.BlockReferenceCount(orgID, plainInternalID); got != 1 {
+		t.Fatalf("plain sibling references = %d, want 1", got)
+	}
+	if !store.ForwardBlockMappingExistsForRepresentation(orgID, db.PlainBlockRepresentationID, externalBlockID) {
+		t.Fatal("plain sibling mapping should remain untouched")
+	}
+
+	var blockItems []QueueItem
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemBlock {
+			blockItems = append(blockItems, item)
+		}
+	}
+	if len(blockItems) != 1 || blockItems[0].ItemID != encryptedInternalID {
+		t.Fatalf("block queue items = %#v, want only encrypted internal block %s", blockItems, encryptedInternalID)
 	}
 }

@@ -1229,18 +1229,18 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		return err
 	}
 
-	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.BlockRepresentationID, item.StorageClass, identityAt); err != nil {
+	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.BlockRepresentationID, item.StorageClass, identityAt, strings.TrimSpace(item.BlockRepresentationID) == ""); err != nil {
 		return err
 	}
 	return lease.Check()
 }
 
-func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, libraryDeletedAt time.Time) error {
+func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, libraryDeletedAt time.Time, allowLegacyRepresentationLookup bool) error {
 	if storageClass == "" {
 		storageClass, _ = w.store.GetLibraryStorageClass(orgID, libraryID)
 	}
 
-	if err := w.enqueueLibraryContentsAt(orgID, libraryID, blockRepresentationID, storageClass, libraryDeletedAt, true); err != nil {
+	if err := w.enqueueLibraryContentsAt(orgID, libraryID, blockRepresentationID, storageClass, libraryDeletedAt, true, allowLegacyRepresentationLookup); err != nil {
 		return fmt.Errorf("failed to enqueue library contents: %w", err)
 	}
 
@@ -1354,11 +1354,11 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 			}
 			libraryDeletedAt = *deletedLibraryAt
 		}
-		blockRepresentationID, err := w.store.GetLibraryBlockRepresentationID(orgID, lib.LibraryID)
-		if err != nil && !errors.Is(err, gocql.ErrNotFound) {
-			return fmt.Errorf("failed to resolve block representation for library %s during org delete: %w", lib.LibraryID, err)
+		blockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(w.store, orgID, lib.LibraryID, "", "org cascade", false)
+		if err != nil {
+			return err
 		}
-		if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, blockRepresentationID, lib.StorageClass, libraryDeletedAt); err != nil {
+		if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, blockRepresentationID, lib.StorageClass, libraryDeletedAt, false); err != nil {
 			return fmt.Errorf("failed to cascade-delete library %s during org delete: %w", lib.LibraryID, err)
 		}
 		if err := lease.Check(); err != nil {
@@ -1506,21 +1506,18 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 // Only enqueues commits and fs_objects — blocks are handled in cascade
 // when fs_objects are processed (via decrementFSObjectBlocks).
 func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass string) error {
-	return w.enqueueLibraryContentsAt(orgID, libraryID, "", storageClass, w.clock(), false)
+	return w.enqueueLibraryContentsAt(orgID, libraryID, "", storageClass, w.clock(), false, false)
 }
 
-func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
+func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, identityAt time.Time, requiresLibraryDeletedCheck, allowLegacyRepresentationLookup bool) error {
 	if identityAt.IsZero() {
 		identityAt = w.clock()
 	}
-	blockRepresentationID = strings.TrimSpace(blockRepresentationID)
-	if blockRepresentationID == "" {
-		resolvedBlockRepresentationID, err := w.store.GetLibraryBlockRepresentationID(orgID, libraryID)
-		if err != nil && !errors.Is(err, gocql.ErrNotFound) {
-			return fmt.Errorf("failed to resolve block representation for library %s: %w", libraryID, err)
-		}
-		blockRepresentationID = strings.TrimSpace(resolvedBlockRepresentationID)
+	resolvedBlockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(w.store, orgID, libraryID, blockRepresentationID, "library contents enqueue", allowLegacyRepresentationLookup)
+	if err != nil {
+		return err
 	}
+	blockRepresentationID = resolvedBlockRepresentationID
 
 	// Enqueue all commits for this library (batched)
 	commits, err := w.store.ListCommitsForLibrary(libraryID)

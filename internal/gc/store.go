@@ -20,6 +20,9 @@ const (
 // This allows unit tests to use an in-memory mock instead of Cassandra.
 type GCStore interface {
 	// Queue operations
+	// EnqueueItem is the low-level path for queue rows that do not need
+	// block_representation_id context. Callers enqueuing commits, fs_objects,
+	// or library cascades must use EnqueueBatch with QueueItem.
 	EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error
 	EnqueueBatch(items []QueueItem) error
 	QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) (bool, error)

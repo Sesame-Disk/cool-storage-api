@@ -1014,6 +1014,36 @@ func TestScanner_ScanOrphanedCommits_DoesNotCrossSuppressAcrossLibraries(t *test
 	}
 }
 
+func TestScanner_ScanOrphanedCommits_AllowsLegacyMissingRepresentationMetadata(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.mu.Lock()
+	store.deletedLibraries[libID].BlockRepresentationID = ""
+	delete(store.libraries, libID)
+	store.mu.Unlock()
+	store.AddCommit(libID, "commit-orphan-legacy", "fs-root")
+
+	n, err := s.scanOrphanedCommits(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("scanOrphanedCommits = (%d, %v), want (1, nil)", n, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued orphaned commit, got %d", len(items))
+	}
+	if items[0].BlockRepresentationID != "" {
+		t.Fatalf("queued BlockRepresentationID = %q, want empty legacy fallback", items[0].BlockRepresentationID)
+	}
+}
+
 func TestScanner_ScanOrphanedFSObjects(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -1113,6 +1143,36 @@ func TestScanner_ScanOrphanedFSObjects_DoesNotCrossSuppressAcrossLibraries(t *te
 	}
 	if orphanCount != 1 {
 		t.Fatalf("expected orphaned library fs_object to enqueue once despite same fs id in another library, got %d", orphanCount)
+	}
+}
+
+func TestScanner_ScanOrphanedFSObjects_AllowsLegacyMissingRepresentationMetadata(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.mu.Lock()
+	store.deletedLibraries[libID].BlockRepresentationID = ""
+	delete(store.libraries, libID)
+	store.mu.Unlock()
+	store.AddFSObject(libID, "fs-orphan-legacy", "file", []string{"blk-legacy"})
+
+	n, err := s.scanOrphanedFSObjects(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("scanOrphanedFSObjects = (%d, %v), want (1, nil)", n, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued orphaned fs_object, got %d", len(items))
+	}
+	if items[0].BlockRepresentationID != "" {
+		t.Fatalf("queued BlockRepresentationID = %q, want empty legacy fallback", items[0].BlockRepresentationID)
 	}
 }
 

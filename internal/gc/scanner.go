@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -534,8 +535,8 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 			log.Printf("[GC Scanner] Phase 3: Library %s deleted, org lookup failed, skipping", libID)
 			continue
 		}
-		blockRepresentationID, repErr := s.store.GetLibraryBlockRepresentationID(orgID, libID)
-		if repErr != nil && !errors.Is(repErr, gocql.ErrNotFound) {
+		blockRepresentationID, repErr := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libID, "", "orphaned commit scan", true)
+		if repErr != nil {
 			log.Printf("[GC Scanner] Phase 3: failed to resolve block representation for library %s: %v", libID, repErr)
 			continue
 		}
@@ -607,8 +608,8 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 			log.Printf("[GC Scanner] Phase 4: Library %s deleted, org lookup failed, skipping", libID)
 			continue
 		}
-		blockRepresentationID, repErr := s.store.GetLibraryBlockRepresentationID(orgID, libID)
-		if repErr != nil && !errors.Is(repErr, gocql.ErrNotFound) {
+		blockRepresentationID, repErr := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libID, "", "orphaned fs_object scan", true)
+		if repErr != nil {
 			log.Printf("[GC Scanner] Phase 4: failed to resolve block representation for library %s: %v", libID, repErr)
 			continue
 		}
@@ -1150,6 +1151,11 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 			continue
 		}
 		if exists {
+			continue
+		}
+		if strings.TrimSpace(lib.BlockRepresentationID) == "" {
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+			log.Printf("[GC Scanner] Phase 13: skipping deleted library %s: missing block representation", lib.LibraryID)
 			continue
 		}
 		batch = append(batch, QueueItem{

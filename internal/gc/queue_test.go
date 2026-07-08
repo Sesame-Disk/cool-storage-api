@@ -293,8 +293,19 @@ func TestQueue_ListOrgsWithQueuedItems(t *testing.T) {
 	org2 := uuid.New()
 
 	// Enqueue items for two orgs
-	q.Enqueue(org1, ItemBlock, "b1", uuid.Nil, "hot")
-	q.Enqueue(org2, ItemCommit, "c1", uuid.New(), "")
+	if err := q.Enqueue(org1, ItemBlock, "b1", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("Enqueue ItemBlock failed: %v", err)
+	}
+	if err := q.EnqueueBatch([]QueueItem{{
+		OrgID:                 org2,
+		QueuedAt:              time.Now(),
+		ItemType:              ItemCommit,
+		ItemID:                "c1",
+		LibraryID:             uuid.New(),
+		BlockRepresentationID: "library:test",
+	}}); err != nil {
+		t.Fatalf("EnqueueBatch ItemCommit failed: %v", err)
+	}
 
 	orgs, err := q.ListOrgsWithQueuedItems()
 	if err != nil {
@@ -332,9 +343,22 @@ func TestQueue_GetQueueSize(t *testing.T) {
 	}
 
 	// Enqueue 3 items
-	q.Enqueue(orgID, ItemBlock, "b1", uuid.Nil, "hot")
-	q.Enqueue(orgID, ItemBlock, "b2", uuid.Nil, "hot")
-	q.Enqueue(orgID, ItemCommit, "c1", uuid.New(), "")
+	if err := q.Enqueue(orgID, ItemBlock, "b1", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("Enqueue b1 failed: %v", err)
+	}
+	if err := q.Enqueue(orgID, ItemBlock, "b2", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("Enqueue b2 failed: %v", err)
+	}
+	if err := q.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              time.Now(),
+		ItemType:              ItemCommit,
+		ItemID:                "c1",
+		LibraryID:             uuid.New(),
+		BlockRepresentationID: "library:test",
+	}}); err != nil {
+		t.Fatalf("EnqueueBatch commit failed: %v", err)
+	}
 
 	size, _ = q.GetQueueSize(orgID)
 	if size != 3 {
@@ -358,9 +382,22 @@ func TestQueue_GetTotalQueueSize(t *testing.T) {
 	org1 := uuid.New()
 	org2 := uuid.New()
 
-	q.Enqueue(org1, ItemBlock, "b1", uuid.Nil, "hot")
-	q.Enqueue(org1, ItemBlock, "b2", uuid.Nil, "hot")
-	q.Enqueue(org2, ItemCommit, "c1", uuid.New(), "")
+	if err := q.Enqueue(org1, ItemBlock, "b1", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("Enqueue org1 b1 failed: %v", err)
+	}
+	if err := q.Enqueue(org1, ItemBlock, "b2", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("Enqueue org1 b2 failed: %v", err)
+	}
+	if err := q.EnqueueBatch([]QueueItem{{
+		OrgID:                 org2,
+		QueuedAt:              time.Now(),
+		ItemType:              ItemCommit,
+		ItemID:                "c1",
+		LibraryID:             uuid.New(),
+		BlockRepresentationID: "library:test",
+	}}); err != nil {
+		t.Fatalf("EnqueueBatch org2 commit failed: %v", err)
+	}
 
 	total, err := q.GetTotalQueueSize()
 	if err != nil {
@@ -379,8 +416,26 @@ func TestQueue_MultipleItemTypes(t *testing.T) {
 	libID := uuid.New()
 
 	q.Enqueue(orgID, ItemBlock, "block-1", uuid.Nil, "hot")
-	q.Enqueue(orgID, ItemCommit, "commit-1", libID, "")
-	q.Enqueue(orgID, ItemFSObject, "fs-1", libID, "")
+	if err := q.EnqueueBatch([]QueueItem{
+		{
+			OrgID:                 orgID,
+			QueuedAt:              time.Now(),
+			ItemType:              ItemCommit,
+			ItemID:                "commit-1",
+			LibraryID:             libID,
+			BlockRepresentationID: "library:test",
+		},
+		{
+			OrgID:                 orgID,
+			QueuedAt:              time.Now(),
+			ItemType:              ItemFSObject,
+			ItemID:                "fs-1",
+			LibraryID:             libID,
+			BlockRepresentationID: "library:test",
+		},
+	}); err != nil {
+		t.Fatalf("EnqueueBatch data items failed: %v", err)
+	}
 	q.Enqueue(orgID, ItemShareLink, "token-abc", uuid.Nil, "")
 
 	items, err := q.DequeueBatch(orgID, 10, 0)
@@ -400,6 +455,23 @@ func TestQueue_MultipleItemTypes(t *testing.T) {
 		if !typeSet[expected] {
 			t.Errorf("missing item type %s", expected)
 		}
+	}
+}
+
+func TestQueue_EnqueueRejectsItemsThatRequireRepresentation(t *testing.T) {
+	store := NewMockStore()
+	q := NewQueue(store)
+	orgID := uuid.New()
+	libID := uuid.New()
+
+	if err := q.Enqueue(orgID, ItemCommit, "commit-1", libID, ""); err == nil {
+		t.Fatal("expected ItemCommit enqueue to require explicit representation")
+	}
+	if err := q.Enqueue(orgID, ItemFSObject, "fs-1", libID, ""); err == nil {
+		t.Fatal("expected ItemFSObject enqueue to require explicit representation")
+	}
+	if err := q.EnqueueCascade(orgID, time.Now(), ItemLibraryCascade, libID.String(), uuid.Nil, "hot"); err == nil {
+		t.Fatal("expected ItemLibraryCascade enqueue to require explicit representation")
 	}
 }
 
