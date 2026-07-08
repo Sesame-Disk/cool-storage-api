@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -3256,6 +3257,160 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryWithoutDecryptSessionReturn
 	}
 	if outcome, ok := upload.FinalizeOutcome(); !ok || outcome == nil || !errors.Is(outcome.err, v2.ErrLibraryEncryptedNotUnlocked) {
 		t.Fatalf("finalize outcome = %#v, ok=%v, want published ErrLibraryEncryptedNotUnlocked for same-session waiters", outcome, ok)
+	}
+}
+
+func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAndSucceeds(t *testing.T) {
+	const (
+		orgID            = "org-encrypted-retry"
+		repoID           = "repo-encrypted-retry"
+		userID           = "user-encrypted-retry"
+		uploadIdentifier = "resumable-retry-secret-bin"
+	)
+
+	cm, _ := newTestChunkManager(t)
+	originalChunkManager := chunkManager
+	chunkManager = cm
+	t.Cleanup(func() {
+		chunkManager = originalChunkManager
+		if upload := cm.GetUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5); upload != nil {
+			cm.CleanupTrackedUpload(upload)
+		}
+		v2.GetDecryptSessions().Lock(userID, repoID)
+	})
+
+	tokenStore := NewMockTokenStore()
+	tokenStore.CreateUploadToken(orgID, repoID, "/", userID)
+	v2.GetDecryptSessions().Lock(userID, repoID)
+
+	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
+	originalEncrypted := lookupLibraryEncryptedForUploadFn
+	originalProbe := probeUploadedBlockReuseForUploadFn
+	originalPut := putUploadedBlockAutoFn
+	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
+	originalReleaseRefs := releaseUploadedBlockRefsFn
+	t.Cleanup(func() {
+		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
+		lookupLibraryEncryptedForUploadFn = originalEncrypted
+		probeUploadedBlockReuseForUploadFn = originalProbe
+		putUploadedBlockAutoFn = originalPut
+		registerUploadedBlockAndMappingForUploadFn = originalRegister
+		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
+		releaseUploadedBlockRefsFn = originalReleaseRefs
+	})
+
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+		return true, nil
+	}
+	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{}, errors.New("probe unavailable in test")
+	}
+
+	var putCalls, registerCalls, commitCalls atomic.Int32
+	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
+		putCalls.Add(1)
+		return hash, nil
+	}
+	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+		registerCalls.Add(1)
+		return nil
+	}
+	releaseUploadedBlockRefsFn = func(_ *db.DB, _, _, _ string, _ []string) {}
+
+	expectedSHA1 := sha1.Sum([]byte("hello"))
+	expectedFileID := hex.EncodeToString(expectedSHA1[:])
+	commitSeafHTTPUploadedFileMultiBlockFn = func(h *SeafHTTPHandler, ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+		commitCalls.Add(1)
+		if fileID != expectedFileID {
+			return "", "", 0, 0, fmt.Errorf("commit fileID = %s, want %s", fileID, expectedFileID)
+		}
+		if !reflect.DeepEqual(blockIDs, []string{expectedFileID}) {
+			return "", "", 0, 0, fmt.Errorf("commit blockIDs = %v, want [%s]", blockIDs, expectedFileID)
+		}
+		if fileSize != 5 {
+			return "", "", 0, 0, fmt.Errorf("commit fileSize = %d, want 5", fileSize)
+		}
+		return "commit-1", filename, 0, 0, nil
+	}
+
+	upload, err := cm.GetOrCreateUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadByIdentity failed: %v", err)
+	}
+	upload.MarkQuotaPrecheck("/", 5, false)
+
+	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, tokenStore, nil, nil)
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	req1 := newMultipartUploadRequestWithFields(t, "/seafhttp/upload-api/mock-upload-token", "secret.bin", []byte("hello"), map[string]string{
+		"resumableIdentifier": uploadIdentifier,
+	})
+	req1.Header.Set("Content-Range", "bytes 0-4/5")
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, req1)
+
+	assertLibraryEncryptedNotUnlockedResponse(t, w1)
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("putCalls after locked finalize = %d, want 0", got)
+	}
+	if got := registerCalls.Load(); got != 0 {
+		t.Fatalf("registerCalls after locked finalize = %d, want 0", got)
+	}
+	if got := commitCalls.Load(); got != 0 {
+		t.Fatalf("commitCalls after locked finalize = %d, want 0", got)
+	}
+
+	tracked := cm.GetUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5)
+	if tracked != upload {
+		t.Fatalf("tracked upload pointer changed after locked finalize: got %p want %p", tracked, upload)
+	}
+	if outcome, ok := upload.FinalizeOutcome(); !ok || outcome == nil || !errors.Is(outcome.err, v2.ErrLibraryEncryptedNotUnlocked) {
+		t.Fatalf("first finalize outcome = %#v, ok=%v, want ErrLibraryEncryptedNotUnlocked", outcome, ok)
+	}
+
+	fileKey := bytes.Repeat([]byte{0x11}, 32)
+	fileIV := bytes.Repeat([]byte{0x22}, 16)
+	v2.GetDecryptSessions().Unlock(userID, repoID, fileKey, fileIV)
+
+	req2 := newMultipartUploadRequestWithFields(t, "/seafhttp/upload-api/mock-upload-token", "secret.bin", []byte("hello"), map[string]string{
+		"resumableIdentifier": uploadIdentifier,
+	})
+	req2.Header.Set("Content-Range", "bytes 0-4/5")
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want %d body=%q", w2.Code, http.StatusOK, w2.Body.String())
+	}
+	if got := strings.TrimSpace(w2.Body.String()); got != expectedFileID {
+		t.Fatalf("retry body = %q, want file id %q", got, expectedFileID)
+	}
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("putCalls after unlock retry = %d, want 1", got)
+	}
+	if got := registerCalls.Load(); got != 1 {
+		t.Fatalf("registerCalls after unlock retry = %d, want 1", got)
+	}
+	if got := commitCalls.Load(); got != 1 {
+		t.Fatalf("commitCalls after unlock retry = %d, want 1", got)
+	}
+	if got := cm.GetUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5); got != nil {
+		t.Fatalf("tracker should be cleaned after successful retry, got %p", got)
+	}
+	outcome, ok := upload.FinalizeOutcome()
+	if !ok || outcome == nil {
+		t.Fatal("successful retry should publish a new finalize outcome on the original tracker")
+	}
+	if outcome.err != nil {
+		t.Fatalf("retry outcome.err = %v, want nil", outcome.err)
+	}
+	if outcome.fileID != expectedFileID || outcome.actualFilename != "secret.bin" || outcome.totalSize != 5 {
+		t.Fatalf("retry outcome = %+v, want fileID=%s actualFilename=secret.bin totalSize=5", outcome, expectedFileID)
 	}
 }
 
