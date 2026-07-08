@@ -453,7 +453,7 @@ func TestWebBlockUploadFSObjectUsesSHA1ForDesktopCompat(t *testing.T) {
 			t.Fatalf("block %d seafile sha1 = %s, want %s", i, ext, want)
 		}
 		var mappedInternal string
-		if err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, ext).Scan(&mappedInternal); err != nil {
+		if err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`, orgID, dbpkg.PlainBlockRepresentationID, ext).Scan(&mappedInternal); err != nil {
 			t.Fatalf("block %d: no SHA-1→SHA-256 mapping for %s: %v", i, ext, err)
 		}
 		if mappedInternal != internal {

@@ -52,6 +52,7 @@ type GCStore interface {
 	GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error)
 	GetLibraryDeletedAt(libraryID uuid.UUID) (*time.Time, error)
 	GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error)
+	GetLibraryBlockRepresentationID(orgID, libraryID uuid.UUID) (string, error)
 
 	// Block operations (worker)
 	//
@@ -66,7 +67,7 @@ type GCStore interface {
 	GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error)
 	// RemoveBlockReference deletes one (block, referrer) reference row. Idempotent.
 	RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error
-	ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error)
+	ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentationID string, blockIDs []string) ([]string, error)
 	// ClaimBlockDelete atomically marks the block row gc_state='deleting' via LWT
 	// and records the deterministic claimID for the logical delete attempt.
 	// Callers MUST re-check BlockHasReferences after a successful claim before
@@ -78,7 +79,7 @@ type GCStore interface {
 	// FinalizeBlockDelete removes the block row only when the same claimID still
 	// owns the row.
 	FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error
-	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
+	DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error
 	// ListBlockGCCandidatesByDay enumerates candidates whose `candidate_at`
@@ -106,11 +107,11 @@ type GCStore interface {
 	// deletion. It always resets recovery state to pending_s3 so a stale
 	// pending_mapping_cleanup row from an older delete cannot make recovery skip
 	// the physical object delete for this new lifecycle.
-	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error)
+	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1 string, now time.Time) (time.Time, error)
 	// RecordS3Orphan preserves and returns the effective first_seen_at identity
 	// for an existing orphan row so callers can repair missing recovery metadata
 	// or seed test/recovery fixtures without clobbering a newer phase.
-	RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, now time.Time) (time.Time, error)
+	RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1, errMsg string, now time.Time) (time.Time, error)
 	// ListS3OrphansByDay enumerates S3-orphan rows whose `first_seen_at`
 	// falls on the given UTC day for one discovery bucket. `limit` caps the
 	// number of rows returned for a single (day, bucket) pair.
@@ -118,7 +119,7 @@ type GCStore interface {
 	// MarkS3OrphanMappingCleanupPending advances the recovery row after the S3
 	// delete has completed so restart recovery can finish forward-mapping cleanup
 	// without touching S3 again.
-	MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error
+	MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error
 	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error
 	DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error
 
@@ -289,9 +290,10 @@ type CommitInfo struct {
 
 // BlockInfo holds data about a block needed by the scanner.
 type BlockInfo struct {
-	BlockID      string
-	StorageClass string
-	CreatedAt    *time.Time
+	BlockID          string
+	StorageClass     string
+	CreatedAt        *time.Time
+	RepresentationID string
 	// Sha1 is the block's external Seafile SHA-1 (blocks.sha1), captured here so
 	// GC mapping cleanup can delete the single forward block_id_mappings row
 	// without the dropped reverse index. Empty for legacy/pre-PR2 rows.
@@ -371,15 +373,16 @@ type GCDirtyOrg struct {
 // row is physically removed, so a crash between DB and S3 phases remains
 // recoverable after restart.
 type S3OrphanInfo struct {
-	OrgID         uuid.UUID
-	BlockID       string
-	StorageClass  string
-	ExternalSHA1  string
-	RecoveryPhase string
-	FirstSeenAt   time.Time
-	LastAttemptAt time.Time
-	RetryCount    int
-	LastError     string
+	OrgID            uuid.UUID
+	BlockID          string
+	StorageClass     string
+	RepresentationID string
+	ExternalSHA1     string
+	RecoveryPhase    string
+	FirstSeenAt      time.Time
+	LastAttemptAt    time.Time
+	RetryCount       int
+	LastError        string
 }
 
 const (

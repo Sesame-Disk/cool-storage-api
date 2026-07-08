@@ -14,7 +14,6 @@ const (
 	ItemBlock          ItemType = "block"
 	ItemCommit         ItemType = "commit"
 	ItemFSObject       ItemType = "fs_object"
-	ItemBlockMapping   ItemType = "block_mapping"
 	ItemShareLink      ItemType = "share_link"
 	ItemUserCascade    ItemType = "user_cascade"
 	ItemLibraryCascade ItemType = "library_cascade"

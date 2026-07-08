@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -79,6 +80,61 @@ func TestResolveBlockIDsConcurrent_NotFoundLeavesOriginalID(t *testing.T) {
 	want := []string{sha256Hex(101), sha1Hex(2)}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("resolveBlockIDsConcurrent() = %v, want %v", got, want)
+	}
+}
+
+// TestResolveBlockIDsConcurrent_GarbageInternalIDLeavesOriginal verifies the
+// deliberate GC leniency: a mapping whose internal_id is not a hex SHA-256 is
+// SKIPPED (original SHA-1 kept), not fatal — GC must not wedge on a garbage/stale
+// mapping row, and must not poison the reference key with a non-canonical id.
+func TestResolveBlockIDsConcurrent_GarbageInternalIDLeavesOriginal(t *testing.T) {
+	blockIDs := []string{sha1Hex(1), sha1Hex(2)}
+	lookup := func(idx int) (string, error) {
+		if idx == 0 {
+			return sha256Hex(101), nil
+		}
+		return strings.Repeat("g", 64), nil // right length, non-hex garbage
+	}
+
+	got, err := resolveBlockIDsConcurrent(uuid.Nil, blockIDs, 8, lookup)
+	if err != nil {
+		t.Fatalf("resolveBlockIDsConcurrent() error = %v, want nil (garbage internal_id is not fatal)", err)
+	}
+	want := []string{sha256Hex(101), sha1Hex(2)}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolveBlockIDsConcurrent() = %v, want %v (garbage kept as original SHA-1)", got, want)
+	}
+}
+
+// TestResolveBlockIDsConcurrent_NonHexInputIsLenient pins the deliberate GC
+// leniency for malformed INPUT ids so a future refactor cannot silently make GC
+// strict and wedge cleanups over damaged metadata: a 40-char non-hex id is not
+// looked up (it is not a valid SHA-1) and a wrong-length id is kept as-is, both
+// without error.
+func TestResolveBlockIDsConcurrent_NonHexInputIsLenient(t *testing.T) {
+	nonHex40 := strings.Repeat("z", 40)
+	wrongLen := strings.Repeat("a", 30)
+	blockIDs := []string{nonHex40, wrongLen, sha1Hex(1)}
+
+	var called atomic.Int32
+	lookup := func(idx int) (string, error) {
+		called.Add(1)
+		if blockIDs[idx] != sha1Hex(1) {
+			t.Errorf("lookup called for non-SHA-1 index %d (%q)", idx, blockIDs[idx])
+		}
+		return sha256Hex(101), nil
+	}
+
+	got, err := resolveBlockIDsConcurrent(uuid.Nil, blockIDs, 8, lookup)
+	if err != nil {
+		t.Fatalf("resolveBlockIDsConcurrent() error = %v, want nil (malformed input is not fatal)", err)
+	}
+	want := []string{nonHex40, wrongLen, sha256Hex(101)}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolveBlockIDsConcurrent() = %v, want %v (malformed inputs kept, only SHA-1 resolved)", got, want)
+	}
+	if n := called.Load(); n != 1 {
+		t.Errorf("lookup called %d times, want 1 (only the hex SHA-1 entry)", n)
 	}
 }
 

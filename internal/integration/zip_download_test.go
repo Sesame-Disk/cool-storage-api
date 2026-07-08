@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 )
 
 func TestRegionPinnedZipDownload(t *testing.T) {
@@ -205,7 +207,7 @@ func TestZipDownloadFailsBeforeHeadersWhenLegacyMappingIsMissing(t *testing.T) {
 	}
 
 	brokenMapping := seafileBlockIDs[0]
-	if err := session.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, brokenMapping).Exec(); err != nil {
+	if err := session.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`, orgID, dbpkg.PlainBlockRepresentationID, brokenMapping).Exec(); err != nil {
 		t.Fatalf("failed to delete block mapping %s: %v", brokenMapping, err)
 	}
 
