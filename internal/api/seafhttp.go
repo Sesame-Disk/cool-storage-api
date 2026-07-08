@@ -2109,7 +2109,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	if encrypted {
 		fileKey, fileIV := v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
-			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted and not unlocked"})
+			writeLibraryEncryptedNotUnlocked(c)
 			return
 		}
 		encryptedContent, err := crypto.EncryptBlockSeafile(chunkData, fileKey, fileIV)
@@ -2316,11 +2316,26 @@ func writeSeafHTTPUploadError(c *gin.Context, err error, genericMsg string) {
 		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
 	case errors.Is(err, v2.ErrBlockDeleteInProgress):
 		c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
+	case errors.Is(err, v2.ErrLibraryEncryptedNotUnlocked):
+		writeLibraryEncryptedNotUnlocked(c)
 	case errors.Is(err, errStorageQuotaExceeded):
 		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
 	}
+}
+
+// writeLibraryEncryptedNotUnlocked emits the app-wide 403 "needs decrypt" contract
+// (matching v2 requireDecryptSession) so the frontend re-opens the repo password
+// dialog instead of collapsing the response to a generic error. The resumable
+// (streaming) upload only encrypts at finalize, so a decrypt session that expired
+// or was never established surfaces here rather than on the upload-link GET.
+func writeLibraryEncryptedNotUnlocked(c *gin.Context) {
+	c.JSON(http.StatusForbidden, gin.H{
+		"error":            "Library is encrypted",
+		"error_msg":        "This library is encrypted. Please provide the password to unlock it.",
+		"lib_need_decrypt": true,
+	})
 }
 
 func clearSeafHTTPS3OrphanFence(ctx context.Context, database *db.DB, storageManager *storage.Manager, label, orgID, blockID string) (bool, error) {
@@ -2537,7 +2552,7 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 	if encrypted {
 		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
-			return "", "", 0, 0, fmt.Errorf("library is encrypted but not unlocked")
+			return "", "", 0, 0, v2.ErrLibraryEncryptedNotUnlocked
 		}
 	}
 

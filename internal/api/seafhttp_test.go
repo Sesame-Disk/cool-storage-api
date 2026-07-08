@@ -452,16 +452,22 @@ func TestChunkJanitor_DiskOrphanCleaned(t *testing.T) {
 
 func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
 	tests := []struct {
-		name       string
-		err        error
-		genericMsg string
-		wantStatus int
-		wantError  string
+		name               string
+		err                error
+		genericMsg         string
+		wantStatus         int
+		wantError          string
+		wantLibNeedDecrypt bool
 	}{
 		{name: "head conflict", err: v2.ErrLibraryHeadConflict, genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the upload"},
 		{name: "wrapped head conflict (mirrors retry_exhausted production path)", err: fmt.Errorf("%w: failed to finalize upload metadata after 20 attempts", v2.ErrLibraryHeadConflict), genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the upload"},
 		{name: "block delete in progress", err: v2.ErrBlockDeleteInProgress, genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "block is being deleted; retry the upload"},
 		{name: "quota exceeded", err: errStorageQuotaExceeded, genericMsg: "failed to finalize upload", wantStatus: http.StatusForbidden, wantError: "storage quota exceeded"},
+		// Encrypted library without a decrypt session must surface the app-wide
+		// 403 { lib_need_decrypt: true } contract (not a generic 500) so the
+		// frontend re-opens the repo password dialog. See isLibraryEncryptedError.
+		{name: "encrypted not unlocked", err: v2.ErrLibraryEncryptedNotUnlocked, genericMsg: "failed to finalize upload", wantStatus: http.StatusForbidden, wantError: "Library is encrypted", wantLibNeedDecrypt: true},
+		{name: "wrapped encrypted not unlocked", err: fmt.Errorf("finalize: %w", v2.ErrLibraryEncryptedNotUnlocked), genericMsg: "failed to finalize upload", wantStatus: http.StatusForbidden, wantError: "Library is encrypted", wantLibNeedDecrypt: true},
 		{name: "generic", err: errors.New("boom"), genericMsg: "failed to finalize upload", wantStatus: http.StatusInternalServerError, wantError: "failed to finalize upload"},
 	}
 
@@ -482,6 +488,9 @@ func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
 			}
 			if got := resp["error"]; got != tt.wantError {
 				t.Fatalf("error = %v, want %q", got, tt.wantError)
+			}
+			if tt.wantLibNeedDecrypt && resp["lib_need_decrypt"] != true {
+				t.Fatalf("lib_need_decrypt = %v, want true (frontend needs this flag to prompt for the password)", resp["lib_need_decrypt"])
 			}
 		})
 	}
