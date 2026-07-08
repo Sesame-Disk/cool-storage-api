@@ -1763,8 +1763,13 @@ func (s *CassandraStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepres
 	// Fast path: an all-SHA-256 block list never consults block_id_mappings, so
 	// skip representation resolution entirely. For SHA-1 lists we prefer the
 	// representation persisted on the queue item; when absent we resolve from the
-	// canonical/deleted library rows and only fall back to a safe dual-probe path
-	// for legacy queue rows created before representation persistence existed.
+	// live libraries row via GetLibraryBlockRepresentationID. That row is gone
+	// once the library has been soft/hard-deleted (deleted_libraries carries no
+	// block_representation_id yet — that lands with gc_queue/DLQ representation
+	// persistence in the follow-up PR), so GetLibraryBlockRepresentationID
+	// returns ErrNotFound and we fall back to the conservative plain/encrypted
+	// dual-probe below for both that case and legacy queue rows created before
+	// representation persistence existed.
 	representationID := strings.TrimSpace(blockRepresentationID)
 	if representationID == "" {
 		for _, id := range blockIDs {
