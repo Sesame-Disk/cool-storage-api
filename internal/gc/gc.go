@@ -439,7 +439,7 @@ func (s *Service) EnqueueCommits(orgID, libraryID uuid.UUID, commitIDs []string)
 	// Stamp the block representation at enqueue time (the library is still live
 	// here) so fs_object GC never has to re-resolve it from a possibly-deleted
 	// library row later.
-	blockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libraryID, "", "commit enqueue", false)
+	blockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libraryID, "", "commit enqueue")
 	if err != nil {
 		return err
 	}

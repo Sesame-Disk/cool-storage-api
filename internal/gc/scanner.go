@@ -535,9 +535,9 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 			log.Printf("[GC Scanner] Phase 3: Library %s deleted, org lookup failed, skipping", libID)
 			continue
 		}
-		blockRepresentationID, repErr := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libID, "", "orphaned commit scan", true)
+		blockRepresentationID, repErr := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libID, "", "orphaned commit scan")
 		if repErr != nil {
-			log.Printf("[GC Scanner] Phase 3: failed to resolve block representation for library %s: %v", libID, repErr)
+			log.Printf("[GC Scanner] Phase 3: skipping library %s: %v", libID, repErr)
 			continue
 		}
 
@@ -608,9 +608,9 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 			log.Printf("[GC Scanner] Phase 4: Library %s deleted, org lookup failed, skipping", libID)
 			continue
 		}
-		blockRepresentationID, repErr := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libID, "", "orphaned fs_object scan", true)
+		blockRepresentationID, repErr := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libID, "", "orphaned fs_object scan")
 		if repErr != nil {
-			log.Printf("[GC Scanner] Phase 4: failed to resolve block representation for library %s: %v", libID, repErr)
+			log.Printf("[GC Scanner] Phase 4: skipping library %s: %v", libID, repErr)
 			continue
 		}
 
@@ -670,6 +670,12 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 		case <-ctx.Done():
 			return enqueued, ctx.Err()
 		default:
+		}
+
+		if strings.TrimSpace(lib.BlockRepresentationID) == "" {
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+			log.Printf("[GC Scanner] Phase 5: skipping library %s: missing block representation", lib.LibraryID)
+			continue
 		}
 
 		commits, err := s.store.ListCommitsWithTimestamps(lib.LibraryID)
@@ -759,6 +765,12 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 		case <-ctx.Done():
 			return enqueued, ctx.Err()
 		default:
+		}
+
+		if strings.TrimSpace(lib.BlockRepresentationID) == "" {
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+			log.Printf("[GC Scanner] Phase 6: skipping library %s: missing block representation", lib.LibraryID)
+			continue
 		}
 
 		commits, err := s.store.ListCommitsWithTimestamps(lib.LibraryID)

@@ -499,7 +499,16 @@ func TestWorker_ProcessCommit_CascadesFSObjects(t *testing.T) {
 	// Commit points to a root fs_object
 	store.AddCommit(libID, "commit-abc", "fs-root")
 
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemCommit, "commit-abc", libID, "", 0)
+	if err := store.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              time.Now().Add(-2 * time.Hour),
+		ItemType:              ItemCommit,
+		ItemID:                "commit-abc",
+		LibraryID:             libID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+	}}); err != nil {
+		t.Fatalf("seed commit failed: %v", err)
+	}
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -618,7 +627,7 @@ func TestWorker_ProcessCommit_DoesNotCrossSuppressRootFSObjectAcrossLibraries(t 
 		t.Fatalf("seed cross-library root fs_object failed: %v", err)
 	}
 
-	if err := w.processCommit(QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemCommit, ItemID: "commit-abc", LibraryID: libTarget}); err != nil {
+	if err := w.processCommit(QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemCommit, ItemID: "commit-abc", LibraryID: libTarget, BlockRepresentationID: db.PlainBlockRepresentationID}); err != nil {
 		t.Fatalf("processCommit failed: %v", err)
 	}
 
@@ -848,7 +857,7 @@ func TestWorker_ProcessFSObject_SkipsAlreadyPendingChild(t *testing.T) {
 		t.Fatalf("IncrementRetry failed: %v", err)
 	}
 
-	err = w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libID})
+	err = w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libID, BlockRepresentationID: db.PlainBlockRepresentationID})
 	if err != nil {
 		t.Fatalf("processFSObject failed: %v", err)
 	}
@@ -888,7 +897,7 @@ func TestWorker_ProcessFSObject_DoesNotCrossSuppressChildAcrossLibraries(t *test
 		t.Fatalf("seed cross-library child fs_object failed: %v", err)
 	}
 
-	err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libTarget})
+	err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libTarget, BlockRepresentationID: db.PlainBlockRepresentationID})
 	if err != nil {
 		t.Fatalf("processFSObject failed: %v", err)
 	}
@@ -1177,7 +1186,7 @@ func TestWorker_EnqueueLibraryContents_DoesNotCrossSuppressAcrossLibraries(t *te
 		t.Fatalf("seed pending fs_object failed: %v", err)
 	}
 
-	err := w.enqueueLibraryContentsAt(orgID, libTarget, "", "hot", identityAt, false, false)
+	err := w.enqueueLibraryContentsAt(orgID, libTarget, "", "hot", identityAt, false)
 	if err != nil {
 		t.Fatalf("enqueueLibraryContentsAt failed: %v", err)
 	}

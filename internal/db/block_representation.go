@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 )
 
 const PlainBlockRepresentationID = "plain:v1"
@@ -51,6 +52,24 @@ func ValidateBlockRepresentationID(representationID string) error {
 		return fmt.Errorf("missing block representation id")
 	}
 	return nil
+}
+
+// IsCanonicalBlockRepresentationID reports whether representationID is one of the
+// exact forms this system mints: the plaintext default "plain:v1", or a per-library
+// encrypted id "library:<uuid>". A non-empty value that matches neither indicates a
+// corrupt/foreign id that would resolve mappings in a nonexistent namespace, so
+// callers that require a *usable* representation validate format, not just presence.
+func IsCanonicalBlockRepresentationID(representationID string) bool {
+	representationID = strings.TrimSpace(representationID)
+	if representationID == PlainBlockRepresentationID {
+		return true
+	}
+	rest, ok := strings.CutPrefix(representationID, "library:")
+	if !ok {
+		return false
+	}
+	_, err := uuid.Parse(rest)
+	return err == nil
 }
 
 func ResolveBlockRepresentationID(session *gocql.Session, orgID, libraryID string) (string, error) {

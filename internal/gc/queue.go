@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/google/uuid"
 )
 
@@ -71,9 +72,21 @@ func (q *Queue) EnqueueCascade(orgID uuid.UUID, parentQueuedAt time.Time, itemTy
 }
 
 // EnqueueBatch inserts multiple items into the gc_queue efficiently.
+//
+// EnqueueBatch is the real choke point every producer uses, so the block
+// representation invariant is enforced here (not only in Enqueue/EnqueueCascade):
+// commits, fs_objects and library cascades must carry a *canonical*
+// BlockRepresentationID. Rejecting an empty OR malformed value keeps an
+// incomplete task — which the worker would fail to map and then retry forever,
+// leaking references/blocks/mappings — from ever reaching gc_queue.
 func (q *Queue) EnqueueBatch(items []QueueItem) error {
 	if len(items) == 0 {
 		return nil
+	}
+	for _, item := range items {
+		if itemTypeRequiresBlockRepresentation(item.ItemType) && !db.IsCanonicalBlockRepresentationID(item.BlockRepresentationID) {
+			return fmt.Errorf("gc: item type %s (%s) requires a canonical block representation, got %q", item.ItemType, item.ItemID, item.BlockRepresentationID)
+		}
 	}
 	return q.store.EnqueueBatch(items)
 }
