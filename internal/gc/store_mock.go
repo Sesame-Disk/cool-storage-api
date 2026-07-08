@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
@@ -343,10 +344,11 @@ type mockUser struct {
 }
 
 type mockDeletedLibrary struct {
-	OrgID        uuid.UUID
-	LibraryID    uuid.UUID
-	StorageClass string
-	DeletedAt    time.Time
+	OrgID                 uuid.UUID
+	LibraryID             uuid.UUID
+	BlockRepresentationID string
+	StorageClass          string
+	DeletedAt             time.Time
 }
 
 type mockStorageCounterReconciliation struct {
@@ -491,13 +493,20 @@ func mockMappingKey(orgID uuid.UUID, representationID, externalID string) string
 	return fmt.Sprintf("%s:%s:%s", orgID, representationID, db.NormalizeBlockID(externalID))
 }
 
-func (m *MockStore) blockRepresentationIDForLibraryLocked(libraryID uuid.UUID) string {
+func (m *MockStore) blockRepresentationIDForLibraryLocked(libraryID uuid.UUID) (string, bool) {
 	if lib := m.libraries[libraryID]; lib != nil {
 		if rep := strings.TrimSpace(lib.BlockRepresentationID); rep != "" {
-			return rep
+			return rep, true
 		}
+		return db.PlainBlockRepresentationID, true
 	}
-	return db.PlainBlockRepresentationID
+	if deleted := m.deletedLibraries[libraryID]; deleted != nil {
+		if rep := strings.TrimSpace(deleted.BlockRepresentationID); rep != "" {
+			return rep, true
+		}
+		return "", false
+	}
+	return "", false
 }
 
 func (m *MockStore) upsertProvisionalBlockRefExpiryProjection(expiry *mockProvisionalBlockRefExpiry) {
@@ -961,8 +970,8 @@ func (m *MockStore) AddGroupMembership(orgID, userID, groupID uuid.UUID) {
 func (m *MockStore) AddDeletedLibrary(orgID, libraryID uuid.UUID, storageClass string, deletedAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass}
-	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass, DeletedAt: deletedAt}
+	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass}
+	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass, DeletedAt: deletedAt}
 }
 
 // AddShareByUser adds a share received by a user.
@@ -1145,6 +1154,7 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 		ItemType:                    itemType,
 		ItemID:                      itemID,
 		LibraryID:                   libraryID,
+		BlockRepresentationID:       "",
 		StorageClass:                storageClass,
 		RetryCount:                  retryCount,
 	}
@@ -1244,7 +1254,7 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType I
 	return nil
 }
 
-func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
+func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1263,6 +1273,7 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 			newItem.QueuedAt = newQueuedAt
 			newItem.IdentityAt = effectiveIdentityAt(item.QueuedAt, identityAt)
 			newItem.RequiresLibraryDeletedCheck = item.RequiresLibraryDeletedCheck
+			newItem.BlockRepresentationID = strings.TrimSpace(blockRepresentationID)
 			newItem.RetryCount = newRetryCount
 			m.queue[orgID] = append(m.queue[orgID], newItem)
 			m.upsertPendingItem(orgID, libraryID, itemType, itemID, newItem.IdentityAt, nil)
@@ -1304,6 +1315,7 @@ func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError, fail
 		ItemType:                    item.ItemType,
 		ItemID:                      item.ItemID,
 		LibraryID:                   item.LibraryID,
+		BlockRepresentationID:       strings.TrimSpace(item.BlockRepresentationID),
 		StorageClass:                item.StorageClass,
 		RetryCount:                  item.RetryCount,
 		LastError:                   lastError,
@@ -1504,6 +1516,7 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 				ItemType:                    item.ItemType,
 				ItemID:                      item.ItemID,
 				LibraryID:                   item.LibraryID,
+				BlockRepresentationID:       strings.TrimSpace(item.BlockRepresentationID),
 				StorageClass:                item.StorageClass,
 				RetryCount:                  0,
 			})
@@ -1772,10 +1785,24 @@ func (m *MockStore) AddFSObjectReferenceForTest(orgID uuid.UUID, blockID string,
 	m.AddBlockReferenceForTest(orgID, blockID, db.BlockReferrerForFSObject(libID.String(), fsID))
 }
 
-func (m *MockStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockIDs []string) ([]string, error) {
+func (m *MockStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.UUID) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	representationID := m.blockRepresentationIDForLibraryLocked(libraryID)
+	if representationID, ok := m.blockRepresentationIDForLibraryLocked(libraryID); ok {
+		return representationID, nil
+	}
+	return "", gocql.ErrNotFound
+}
+
+func (m *MockStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentationID string, blockIDs []string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	representationID := strings.TrimSpace(blockRepresentationID)
+	if representationID == "" {
+		if resolvedRepresentationID, ok := m.blockRepresentationIDForLibraryLocked(libraryID); ok {
+			representationID = resolvedRepresentationID
+		}
+	}
 
 	// Mirror CassandraStore.resolveBlockIDsConcurrent exactly: canonicalize before
 	// classifying by hex content, only resolve hex SHA-1 ids, and only accept a hex
@@ -1789,10 +1816,31 @@ func (m *MockStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockIDs []strin
 		if !db.IsSHA1BlockID(normalized) {
 			continue
 		}
-		if internalID, ok := m.mappings[mockMappingKey(orgID, representationID, normalized)]; ok {
-			if canonical := db.NormalizeBlockID(internalID); db.IsSHA256BlockID(canonical) {
-				resolved[i] = canonical
+		if representationID != "" {
+			if internalID, ok := m.mappings[mockMappingKey(orgID, representationID, normalized)]; ok {
+				if canonical := db.NormalizeBlockID(internalID); db.IsSHA256BlockID(canonical) {
+					resolved[i] = canonical
+				}
 			}
+			continue
+		}
+
+		plainInternalID, plainOK := m.mappings[mockMappingKey(orgID, db.PlainBlockRepresentationID, normalized)]
+		plainCanonical := db.NormalizeBlockID(plainInternalID)
+		plainValid := plainOK && db.IsSHA256BlockID(plainCanonical)
+		encryptedInternalID, encryptedOK := m.mappings[mockMappingKey(orgID, db.EncryptedLibraryBlockRepresentationID(libraryID.String()), normalized)]
+		encryptedCanonical := db.NormalizeBlockID(encryptedInternalID)
+		encryptedValid := encryptedOK && db.IsSHA256BlockID(encryptedCanonical)
+
+		switch {
+		case plainValid && encryptedValid && plainCanonical == encryptedCanonical:
+			resolved[i] = plainCanonical
+		case plainValid && encryptedValid:
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_unresolved_ambiguous_representation").Inc()
+		case plainValid:
+			resolved[i] = plainCanonical
+		case encryptedValid:
+			resolved[i] = encryptedCanonical
 		}
 	}
 	return resolved, nil
@@ -2286,10 +2334,11 @@ func (m *MockStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error) {
 	for _, lib := range m.libraries {
 		if lib.VersionTTLDays > 0 {
 			results = append(results, LibraryTTLInfo{
-				OrgID:          lib.OrgID,
-				LibraryID:      lib.LibraryID,
-				HeadCommitID:   lib.HeadCommitID,
-				VersionTTLDays: lib.VersionTTLDays,
+				OrgID:                 lib.OrgID,
+				LibraryID:             lib.LibraryID,
+				HeadCommitID:          lib.HeadCommitID,
+				BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
+				VersionTTLDays:        lib.VersionTTLDays,
 			})
 		}
 	}
@@ -2304,10 +2353,11 @@ func (m *MockStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo, erro
 	for _, lib := range m.libraries {
 		if lib.AutoDeleteDays > 0 {
 			results = append(results, LibraryAutoDeleteInfo{
-				OrgID:          lib.OrgID,
-				LibraryID:      lib.LibraryID,
-				HeadCommitID:   lib.HeadCommitID,
-				AutoDeleteDays: lib.AutoDeleteDays,
+				OrgID:                 lib.OrgID,
+				LibraryID:             lib.LibraryID,
+				HeadCommitID:          lib.HeadCommitID,
+				BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
+				AutoDeleteDays:        lib.AutoDeleteDays,
 			})
 		}
 	}
@@ -2632,10 +2682,11 @@ func (m *MockStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLib
 	for _, dl := range m.deletedLibraries {
 		if dl.DeletedAt.Before(cutoff) {
 			result = append(result, DeletedLibraryInfo{
-				OrgID:        dl.OrgID,
-				LibraryID:    dl.LibraryID,
-				StorageClass: dl.StorageClass,
-				DeletedAt:    dl.DeletedAt,
+				OrgID:                 dl.OrgID,
+				LibraryID:             dl.LibraryID,
+				BlockRepresentationID: strings.TrimSpace(dl.BlockRepresentationID),
+				StorageClass:          dl.StorageClass,
+				DeletedAt:             dl.DeletedAt,
 			})
 		}
 	}
@@ -2697,10 +2748,11 @@ func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) err
 	}
 	lib.DeletedAt = time.Now()
 	m.deletedLibraries[libraryID] = &mockDeletedLibrary{
-		OrgID:        orgID,
-		LibraryID:    libraryID,
-		StorageClass: lib.StorageClass,
-		DeletedAt:    lib.DeletedAt,
+		OrgID:                 orgID,
+		LibraryID:             libraryID,
+		BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
+		StorageClass:          lib.StorageClass,
+		DeletedAt:             lib.DeletedAt,
 	}
 	m.storageCounterReconciliations[traffic.PlatformStorageScope()] = &mockStorageCounterReconciliation{Scope: traffic.PlatformStorageScope(), RequestedAt: time.Now()}
 	m.storageCounterReconciliations[traffic.OrganizationStorageScope(orgID.String())] = &mockStorageCounterReconciliation{Scope: traffic.OrganizationStorageScope(orgID.String()), OrgID: orgID, RequestedAt: time.Now()}

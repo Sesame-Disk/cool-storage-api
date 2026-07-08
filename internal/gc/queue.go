@@ -29,6 +29,7 @@ type QueueItem struct {
 	ItemType                    ItemType
 	ItemID                      string
 	LibraryID                   uuid.UUID
+	BlockRepresentationID       string
 	StorageClass                string
 	RetryCount                  int
 }
@@ -86,7 +87,7 @@ func (q *Queue) Complete(orgID uuid.UUID, queuedAt time.Time, itemType ItemType,
 // IncrementRetry updates the retry count for a failed item and requeues it at the back of the queue.
 func (q *Queue) IncrementRetry(item QueueItem) error {
 	newQueuedAt := time.Now()
-	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.StorageClass, item.RetryCount+1, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.RequiresLibraryDeletedCheck)
+	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.BlockRepresentationID, item.StorageClass, item.RetryCount+1, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.RequiresLibraryDeletedCheck)
 }
 
 // GetQueueSize returns the approximate number of items in the queue for an org.

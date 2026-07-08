@@ -534,6 +534,11 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 			log.Printf("[GC Scanner] Phase 3: Library %s deleted, org lookup failed, skipping", libID)
 			continue
 		}
+		blockRepresentationID, repErr := s.store.GetLibraryBlockRepresentationID(orgID, libID)
+		if repErr != nil && !errors.Is(repErr, gocql.ErrNotFound) {
+			log.Printf("[GC Scanner] Phase 3: failed to resolve block representation for library %s: %v", libID, repErr)
+			continue
+		}
 
 		commitIDs, err := s.store.ListCommitIDsForLibrary(libID)
 		if err != nil {
@@ -552,12 +557,13 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:      orgID,
-					QueuedAt:   now,
-					IdentityAt: now,
-					ItemType:   ItemCommit,
-					ItemID:     commitID,
-					LibraryID:  libID,
+					OrgID:                 orgID,
+					QueuedAt:              now,
+					IdentityAt:            now,
+					ItemType:              ItemCommit,
+					ItemID:                commitID,
+					LibraryID:             libID,
+					BlockRepresentationID: blockRepresentationID,
 				})
 			}
 			if err := s.queue.EnqueueBatch(batch); err != nil {
@@ -601,6 +607,11 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 			log.Printf("[GC Scanner] Phase 4: Library %s deleted, org lookup failed, skipping", libID)
 			continue
 		}
+		blockRepresentationID, repErr := s.store.GetLibraryBlockRepresentationID(orgID, libID)
+		if repErr != nil && !errors.Is(repErr, gocql.ErrNotFound) {
+			log.Printf("[GC Scanner] Phase 4: failed to resolve block representation for library %s: %v", libID, repErr)
+			continue
+		}
 
 		fsIDs, err := s.store.ListFSObjectIDsForLibrary(libID)
 		if err != nil {
@@ -619,12 +630,13 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:      orgID,
-					QueuedAt:   now,
-					IdentityAt: now,
-					ItemType:   ItemFSObject,
-					ItemID:     fsID,
-					LibraryID:  libID,
+					OrgID:                 orgID,
+					QueuedAt:              now,
+					IdentityAt:            now,
+					ItemType:              ItemFSObject,
+					ItemID:                fsID,
+					LibraryID:             libID,
+					BlockRepresentationID: blockRepresentationID,
 				})
 			}
 			if err := s.queue.EnqueueBatch(batch); err != nil {
@@ -704,12 +716,13 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:      lib.OrgID,
-					QueuedAt:   now,
-					IdentityAt: now,
-					ItemType:   ItemCommit,
-					ItemID:     c.CommitID,
-					LibraryID:  lib.LibraryID,
+					OrgID:                 lib.OrgID,
+					QueuedAt:              now,
+					IdentityAt:            now,
+					ItemType:              ItemCommit,
+					ItemID:                c.CommitID,
+					LibraryID:             lib.LibraryID,
+					BlockRepresentationID: lib.BlockRepresentationID,
 				})
 			}
 		}
@@ -818,12 +831,13 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:      lib.OrgID,
-					QueuedAt:   now,
-					IdentityAt: now,
-					ItemType:   ItemFSObject,
-					ItemID:     fsID,
-					LibraryID:  lib.LibraryID,
+					OrgID:                 lib.OrgID,
+					QueuedAt:              now,
+					IdentityAt:            now,
+					ItemType:              ItemFSObject,
+					ItemID:                fsID,
+					LibraryID:             lib.LibraryID,
+					BlockRepresentationID: lib.BlockRepresentationID,
 				})
 			}
 		}
@@ -1139,11 +1153,12 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 			continue
 		}
 		batch = append(batch, QueueItem{
-			OrgID:        lib.OrgID,
-			QueuedAt:     lib.DeletedAt,
-			ItemType:     ItemLibraryCascade,
-			ItemID:       lib.LibraryID.String(),
-			StorageClass: lib.StorageClass,
+			OrgID:                 lib.OrgID,
+			QueuedAt:              lib.DeletedAt,
+			ItemType:              ItemLibraryCascade,
+			ItemID:                lib.LibraryID.String(),
+			BlockRepresentationID: lib.BlockRepresentationID,
+			StorageClass:          lib.StorageClass,
 		})
 	}
 	if len(batch) > 0 {

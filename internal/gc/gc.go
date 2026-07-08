@@ -436,14 +436,23 @@ func (s *Service) EnqueueCommits(orgID, libraryID uuid.UUID, commitIDs []string)
 		return nil
 	}
 	now := time.Now()
+	// Stamp the block representation at enqueue time (the library is still live
+	// here) so fs_object GC never has to re-resolve it from a possibly-deleted
+	// library row later, matching every other enqueue site. A missing library is
+	// tolerated: ResolveBlockIDs falls back to the dual-probe path.
+	blockRepresentationID, err := s.store.GetLibraryBlockRepresentationID(orgID, libraryID)
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return fmt.Errorf("failed to resolve block representation for library %s: %w", libraryID, err)
+	}
 	items := make([]QueueItem, 0, len(commitIDs))
 	for _, id := range commitIDs {
 		items = append(items, QueueItem{
-			OrgID:     orgID,
-			QueuedAt:  now,
-			ItemType:  ItemCommit,
-			ItemID:    id,
-			LibraryID: libraryID,
+			OrgID:                 orgID,
+			QueuedAt:              now,
+			ItemType:              ItemCommit,
+			ItemID:                id,
+			LibraryID:             libraryID,
+			BlockRepresentationID: blockRepresentationID,
 		})
 	}
 	return s.queue.EnqueueBatch(items)

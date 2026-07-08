@@ -2340,7 +2340,7 @@ func TestWorker_RemoveFSObjectBlockReferences_ReturnsOnlyZeroTransitions(t *test
 	store.AddFSObjectReferenceForTest(orgID, "stays-positive", libID, "fs-obj")
 	store.AddFSObjectReferenceForTest(orgID, "stays-positive", libID, "fs-other")
 
-	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "fs-obj", []string{"hits-zero", "stays-positive"})
+	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-obj", []string{"hits-zero", "stays-positive"})
 	if err != nil {
 		t.Fatalf("removeFSObjectBlockReferences failed: %v", err)
 	}
@@ -2353,5 +2353,88 @@ func TestWorker_RemoveFSObjectBlockReferences_ReturnsOnlyZeroTransitions(t *test
 	}
 	if got := store.BlockReferenceCount(orgID, "stays-positive"); got != 1 {
 		t.Fatalf("stays-positive references = %d, want 1", got)
+	}
+}
+
+func TestWorker_RemoveFSObjectBlockReferences_SoftDeletedLibraryUsesStoredRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	externalBlockID := "0123456789abcdef0123456789abcdef01234567"
+	internalBlockID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	encRep := db.EncryptedLibraryBlockRepresentationID(libID.String())
+
+	store.AddLibrary(orgID, libID, "hot")
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = encRep
+	store.mu.Unlock()
+	store.AddBlock(orgID, internalBlockID, "hot", 0)
+	store.AddBlockMappingForRepresentation(orgID, encRep, externalBlockID, internalBlockID)
+	store.AddFSObjectReferenceForTest(orgID, internalBlockID, libID, "fs-soft")
+	if err := store.SoftDeleteLibrary(orgID, libID, uuid.Nil); err != nil {
+		t.Fatalf("SoftDeleteLibrary failed: %v", err)
+	}
+
+	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-soft", []string{externalBlockID})
+	if err != nil {
+		t.Fatalf("removeFSObjectBlockReferences failed: %v", err)
+	}
+	if len(zeroRef) != 1 || zeroRef[0] != internalBlockID {
+		t.Fatalf("zeroRef = %#v, want only %s", zeroRef, internalBlockID)
+	}
+	if got := store.BlockReferenceCount(orgID, internalBlockID); got != 0 {
+		t.Fatalf("internal block references = %d, want 0", got)
+	}
+}
+
+func TestWorker_ProcessFSObject_HardDeletedLibraryUsesQueuedRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	externalBlockID := "89abcdef0123456789abcdef0123456789abcdef"
+	internalBlockID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	encRep := db.EncryptedLibraryBlockRepresentationID(libID.String())
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC()
+
+	store.AddLibrary(orgID, libID, "hot")
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = encRep
+	store.mu.Unlock()
+	store.AddBlock(orgID, internalBlockID, "hot", 0)
+	store.AddBlockMappingForRepresentation(orgID, encRep, externalBlockID, internalBlockID)
+	store.AddFSObjectReferenceForTest(orgID, internalBlockID, libID, "fs-hard")
+	store.AddFSObject(libID, "fs-hard", "file", []string{externalBlockID})
+	if err := store.SoftDeleteLibrary(orgID, libID, uuid.Nil); err != nil {
+		t.Fatalf("SoftDeleteLibrary failed: %v", err)
+	}
+	if err := store.HardDeleteLibrary(orgID, libID); err != nil {
+		t.Fatalf("HardDeleteLibrary failed: %v", err)
+	}
+
+	err := w.processFSObject(context.Background(), QueueItem{
+		OrgID:                 orgID,
+		QueuedAt:              queuedAt,
+		IdentityAt:            queuedAt,
+		ItemType:              ItemFSObject,
+		ItemID:                "fs-hard",
+		LibraryID:             libID,
+		BlockRepresentationID: encRep,
+	})
+	if err != nil {
+		t.Fatalf("processFSObject failed: %v", err)
+	}
+	if got := store.BlockReferenceCount(orgID, internalBlockID); got != 0 {
+		t.Fatalf("internal block references = %d, want 0", got)
+	}
+	if items := store.QueueItems(orgID); len(items) != 1 || items[0].ItemType != ItemBlock || items[0].ItemID != internalBlockID {
+		t.Fatalf("queue items = %#v, want one ItemBlock for %s", items, internalBlockID)
 	}
 }
