@@ -344,11 +344,10 @@ type mockUser struct {
 }
 
 type mockDeletedLibrary struct {
-	OrgID                 uuid.UUID
-	LibraryID             uuid.UUID
-	BlockRepresentationID string
-	StorageClass          string
-	DeletedAt             time.Time
+	OrgID        uuid.UUID
+	LibraryID    uuid.UUID
+	StorageClass string
+	DeletedAt    time.Time
 }
 
 type mockStorageCounterReconciliation struct {
@@ -493,26 +492,20 @@ func mockMappingKey(orgID uuid.UUID, representationID, externalID string) string
 	return fmt.Sprintf("%s:%s:%s", orgID, representationID, db.NormalizeBlockID(externalID))
 }
 
+// blockRepresentationIDForLibraryLocked mirrors CassandraStore.GetLibraryBlockRepresentationID:
+// it only resolves from the live libraries row. deleted_libraries carries no
+// block_representation_id in this schema yet, so a library with no live row
+// intentionally resolves to (_, false) here, same as Cassandra returns
+// gocql.ErrNotFound — callers fall back to the conservative dual-probe.
 func (m *MockStore) blockRepresentationIDForLibraryLocked(orgID, libraryID uuid.UUID) (string, bool) {
-	if lib := m.libraries[libraryID]; lib != nil {
-		if lib.OrgID != orgID {
-			return "", false
-		}
-		if rep := strings.TrimSpace(lib.BlockRepresentationID); rep != "" {
-			return rep, true
-		}
-		return db.PlainBlockRepresentationID, true
-	}
-	if deleted := m.deletedLibraries[libraryID]; deleted != nil {
-		if deleted.OrgID != orgID {
-			return "", false
-		}
-		if rep := strings.TrimSpace(deleted.BlockRepresentationID); rep != "" {
-			return rep, true
-		}
+	lib := m.libraries[libraryID]
+	if lib == nil || lib.OrgID != orgID {
 		return "", false
 	}
-	return "", false
+	if rep := strings.TrimSpace(lib.BlockRepresentationID); rep != "" {
+		return rep, true
+	}
+	return db.PlainBlockRepresentationID, true
 }
 
 func (m *MockStore) upsertProvisionalBlockRefExpiryProjection(expiry *mockProvisionalBlockRefExpiry) {
@@ -977,7 +970,7 @@ func (m *MockStore) AddDeletedLibrary(orgID, libraryID uuid.UUID, storageClass s
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass}
-	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass, DeletedAt: deletedAt}
+	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass, DeletedAt: deletedAt}
 }
 
 // AddShareByUser adds a share received by a user.

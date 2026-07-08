@@ -1105,35 +1105,25 @@ func (s *CassandraStore) GetLibraryDeletedAt(libraryID uuid.UUID) (*time.Time, e
 	return &deletedAtCopy, nil
 }
 
+// GetLibraryBlockRepresentationID resolves the representation ID from the live
+// libraries row only. deleted_libraries does not carry block_representation_id
+// in this schema yet (it is added, together with gc_queue/DLQ propagation, once
+// representation durability across hard-delete lands); callers must treat
+// gocql.ErrNotFound as "fall back to the conservative dual-probe", not as "the
+// library was never encrypted".
 func (s *CassandraStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.UUID) (string, error) {
 	var encrypted bool
 	var storedRepresentationID string
 	err := s.db.Session().Query(`
 		SELECT encrypted, block_representation_id FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID.String(), libraryID.String()).Scan(&encrypted, &storedRepresentationID)
-	if err == nil {
-		return db.EffectiveBlockRepresentationID(libraryID.String(), encrypted, storedRepresentationID), nil
-	}
-	if !errors.Is(err, gocql.ErrNotFound) {
-		return "", err
-	}
-
-	var deletedOrgID string
-	var deletedRepresentationID string
-	err = s.db.Session().Query(`
-		SELECT org_id, block_representation_id FROM deleted_libraries WHERE library_id = ?
-	`, libraryID.String()).Scan(&deletedOrgID, &deletedRepresentationID)
 	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return "", gocql.ErrNotFound
+		}
 		return "", err
 	}
-	if parseUUID(deletedOrgID) != orgID {
-		return "", gocql.ErrNotFound
-	}
-	deletedRepresentationID = strings.TrimSpace(deletedRepresentationID)
-	if deletedRepresentationID == "" {
-		return "", gocql.ErrNotFound
-	}
-	return deletedRepresentationID, nil
+	return db.EffectiveBlockRepresentationID(libraryID.String(), encrypted, storedRepresentationID), nil
 }
 
 func (s *CassandraStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
