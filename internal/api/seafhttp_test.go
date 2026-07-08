@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -333,6 +334,54 @@ func (m *mockObjectStore) GetRestoreExpiry(ctx context.Context, storageKey strin
 	return nil, nil
 }
 
+func newMultipartUploadRequestWithFields(t *testing.T, target, filename string, content []byte, fields map[string]string) *http.Request {
+	t.Helper()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range fields {
+		if err := writer.WriteField(key, value); err != nil {
+			t.Fatalf("WriteField(%q) failed: %v", key, err)
+		}
+	}
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatalf("CreateFormFile() failed: %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatalf("part.Write() failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close() failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, target, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	return req
+}
+
+func assertLibraryEncryptedNotUnlockedResponse(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if got := resp["error"]; got != "Library is encrypted" {
+		t.Fatalf("error = %v, want %q", got, "Library is encrypted")
+	}
+	if got := resp["error_msg"]; got != "This library is encrypted. Please provide the password to unlock it." {
+		t.Fatalf("error_msg = %v, want decrypt-session prompt", got)
+	}
+	if resp["lib_need_decrypt"] != true {
+		t.Fatalf("lib_need_decrypt = %v, want true", resp["lib_need_decrypt"])
+	}
+}
+
 // ============================================================================
 // ChunkManager janitor Tests
 // ============================================================================
@@ -452,16 +501,22 @@ func TestChunkJanitor_DiskOrphanCleaned(t *testing.T) {
 
 func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
 	tests := []struct {
-		name       string
-		err        error
-		genericMsg string
-		wantStatus int
-		wantError  string
+		name               string
+		err                error
+		genericMsg         string
+		wantStatus         int
+		wantError          string
+		wantLibNeedDecrypt bool
 	}{
 		{name: "head conflict", err: v2.ErrLibraryHeadConflict, genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the upload"},
 		{name: "wrapped head conflict (mirrors retry_exhausted production path)", err: fmt.Errorf("%w: failed to finalize upload metadata after 20 attempts", v2.ErrLibraryHeadConflict), genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the upload"},
 		{name: "block delete in progress", err: v2.ErrBlockDeleteInProgress, genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "block is being deleted; retry the upload"},
 		{name: "quota exceeded", err: errStorageQuotaExceeded, genericMsg: "failed to finalize upload", wantStatus: http.StatusForbidden, wantError: "storage quota exceeded"},
+		// Encrypted library without a decrypt session must surface the app-wide
+		// 403 { lib_need_decrypt: true } contract (not a generic 500) so the
+		// frontend re-opens the repo password dialog. See isLibraryEncryptedError.
+		{name: "encrypted not unlocked", err: v2.ErrLibraryEncryptedNotUnlocked, genericMsg: "failed to finalize upload", wantStatus: http.StatusForbidden, wantError: "Library is encrypted", wantLibNeedDecrypt: true},
+		{name: "wrapped encrypted not unlocked", err: fmt.Errorf("finalize: %w", v2.ErrLibraryEncryptedNotUnlocked), genericMsg: "failed to finalize upload", wantStatus: http.StatusForbidden, wantError: "Library is encrypted", wantLibNeedDecrypt: true},
 		{name: "generic", err: errors.New("boom"), genericMsg: "failed to finalize upload", wantStatus: http.StatusInternalServerError, wantError: "failed to finalize upload"},
 	}
 
@@ -482,6 +537,9 @@ func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
 			}
 			if got := resp["error"]; got != tt.wantError {
 				t.Fatalf("error = %v, want %q", got, tt.wantError)
+			}
+			if tt.wantLibNeedDecrypt && resp["lib_need_decrypt"] != true {
+				t.Fatalf("lib_need_decrypt = %v, want true (frontend needs this flag to prompt for the password)", resp["lib_need_decrypt"])
 			}
 		})
 	}
@@ -1797,6 +1855,45 @@ func TestSeafHTTPHandlerUploadNoFileWithStorageManager(t *testing.T) {
 	}
 }
 
+func TestSeafHTTPHandlerUploadSingleShotEncryptedLibraryWithoutDecryptSessionReturnsUnlockContract(t *testing.T) {
+	const (
+		orgID  = "org-encrypted-single"
+		repoID = "repo-encrypted-single"
+		userID = "user-encrypted-single"
+	)
+
+	tokenStore := NewMockTokenStore()
+	tokenStore.CreateUploadToken(orgID, repoID, "/", userID)
+	v2.GetDecryptSessions().Lock(userID, repoID)
+	t.Cleanup(func() {
+		v2.GetDecryptSessions().Lock(userID, repoID)
+	})
+
+	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
+	originalEncrypted := lookupLibraryEncryptedForUploadFn
+	t.Cleanup(func() {
+		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
+		lookupLibraryEncryptedForUploadFn = originalEncrypted
+	})
+
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+		return true, nil
+	}
+
+	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, tokenStore, nil, nil)
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	req := newMultipartUploadRequestWithFields(t, "/seafhttp/upload-api/mock-upload-token", "secret.txt", []byte("hello"), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assertLibraryEncryptedNotUnlockedResponse(t, w)
+}
+
 func TestSeafHTTPHandlerDownloadInvalidToken(t *testing.T) {
 	tokenStore := NewMockTokenStore()
 	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil, nil)
@@ -2779,6 +2876,94 @@ func TestFinalizeUploadStreamingFailsClosedWhenEncryptionStatusLookupFails(t *te
 	}
 }
 
+func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSentinelBeforeStorage(t *testing.T) {
+	const (
+		orgID  = "org-encrypted-finalize"
+		repoID = "repo-encrypted-finalize"
+		userID = "user-encrypted-finalize"
+	)
+
+	cm, _ := newTestChunkManager(t)
+
+	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 5)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token1", "test.bin")
+	}()
+
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk failed: %v", err)
+	}
+
+	v2.GetDecryptSessions().Lock(userID, repoID)
+	t.Cleanup(func() {
+		v2.GetDecryptSessions().Lock(userID, repoID)
+	})
+
+	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
+	originalEncrypted := lookupLibraryEncryptedForUploadFn
+	originalPut := putUploadedBlockAutoFn
+	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
+	originalEnsureReusable := ensureReusableBlockPresentForUploadFn
+	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
+	t.Cleanup(func() {
+		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
+		lookupLibraryEncryptedForUploadFn = originalEncrypted
+		putUploadedBlockAutoFn = originalPut
+		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
+		ensureReusableBlockPresentForUploadFn = originalEnsureReusable
+		registerUploadedBlockAndMappingForUploadFn = originalRegister
+		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
+	})
+
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+		return true, nil
+	}
+
+	var storeCalls atomic.Int32
+	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
+		storeCalls.Add(1)
+		return hash, nil
+	}
+	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
+		storeCalls.Add(1)
+		return hash, nil
+	}
+	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string) (string, error) {
+		storeCalls.Add(1)
+		return "", nil
+	}
+	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+		storeCalls.Add(1)
+		return nil
+	}
+	commitSeafHTTPUploadedFileMultiBlockFn = func(h *SeafHTTPHandler, ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+		storeCalls.Add(1)
+		return "", "", 0, 0, nil
+	}
+
+	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/token1", nil)
+	token := &AccessToken{OrgID: orgID, RepoID: repoID, UserID: userID, Token: "token1"}
+
+	_, _, _, _, err = handler.finalizeUploadStreaming(c, token, upload, "/", "test.bin", "", 5, false)
+	if !errors.Is(err, v2.ErrLibraryEncryptedNotUnlocked) {
+		t.Fatalf("finalizeUploadStreaming error = %v, want %v", err, v2.ErrLibraryEncryptedNotUnlocked)
+	}
+	if got := storeCalls.Load(); got != 0 {
+		t.Fatalf("storage/metadata side effects = %d, want 0 when decrypt session is missing", got)
+	}
+}
+
 func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	cm, _ := newTestChunkManager(t)
 
@@ -3005,6 +3190,228 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		return fileID, err
 	}
 	return legacyPuts, directPuts, reusableChecks, registerCalls, run
+}
+
+func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryWithoutDecryptSessionReturnsUnlockContract(t *testing.T) {
+	const (
+		orgID            = "org-encrypted-chunk"
+		repoID           = "repo-encrypted-chunk"
+		userID           = "user-encrypted-chunk"
+		uploadIdentifier = "resumable-secret-bin"
+	)
+
+	cm, _ := newTestChunkManager(t)
+	originalChunkManager := chunkManager
+	chunkManager = cm
+	t.Cleanup(func() {
+		chunkManager = originalChunkManager
+		if upload := cm.GetUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5); upload != nil {
+			cm.CleanupTrackedUpload(upload)
+		}
+	})
+
+	tokenStore := NewMockTokenStore()
+	tokenStore.CreateUploadToken(orgID, repoID, "/", userID)
+	v2.GetDecryptSessions().Lock(userID, repoID)
+	t.Cleanup(func() {
+		v2.GetDecryptSessions().Lock(userID, repoID)
+	})
+
+	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
+	originalEncrypted := lookupLibraryEncryptedForUploadFn
+	t.Cleanup(func() {
+		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
+		lookupLibraryEncryptedForUploadFn = originalEncrypted
+	})
+
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+		return true, nil
+	}
+
+	upload, err := cm.GetOrCreateUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadByIdentity failed: %v", err)
+	}
+	upload.MarkQuotaPrecheck("/", 5, false)
+
+	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, tokenStore, nil, nil)
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	req := newMultipartUploadRequestWithFields(t, "/seafhttp/upload-api/mock-upload-token", "secret.bin", []byte("hello"), map[string]string{
+		"resumableIdentifier": uploadIdentifier,
+	})
+	req.Header.Set("Content-Range", "bytes 0-4/5")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assertLibraryEncryptedNotUnlockedResponse(t, w)
+
+	upload = cm.GetUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5)
+	if upload == nil {
+		t.Fatal("chunk tracker should remain so the client can unlock and retry the same upload session")
+	}
+	if outcome, ok := upload.FinalizeOutcome(); !ok || outcome == nil || !errors.Is(outcome.err, v2.ErrLibraryEncryptedNotUnlocked) {
+		t.Fatalf("finalize outcome = %#v, ok=%v, want published ErrLibraryEncryptedNotUnlocked for same-session waiters", outcome, ok)
+	}
+}
+
+func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAndSucceeds(t *testing.T) {
+	const (
+		orgID            = "org-encrypted-retry"
+		repoID           = "repo-encrypted-retry"
+		userID           = "user-encrypted-retry"
+		uploadIdentifier = "resumable-retry-secret-bin"
+	)
+
+	cm, _ := newTestChunkManager(t)
+	originalChunkManager := chunkManager
+	chunkManager = cm
+	t.Cleanup(func() {
+		chunkManager = originalChunkManager
+		if upload := cm.GetUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5); upload != nil {
+			cm.CleanupTrackedUpload(upload)
+		}
+		v2.GetDecryptSessions().Lock(userID, repoID)
+	})
+
+	tokenStore := NewMockTokenStore()
+	tokenStore.CreateUploadToken(orgID, repoID, "/", userID)
+	v2.GetDecryptSessions().Lock(userID, repoID)
+
+	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
+	originalEncrypted := lookupLibraryEncryptedForUploadFn
+	originalProbe := probeUploadedBlockReuseForUploadFn
+	originalPut := putUploadedBlockAutoFn
+	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
+	originalReleaseRefs := releaseUploadedBlockRefsFn
+	t.Cleanup(func() {
+		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
+		lookupLibraryEncryptedForUploadFn = originalEncrypted
+		probeUploadedBlockReuseForUploadFn = originalProbe
+		putUploadedBlockAutoFn = originalPut
+		registerUploadedBlockAndMappingForUploadFn = originalRegister
+		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
+		releaseUploadedBlockRefsFn = originalReleaseRefs
+	})
+
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+		return true, nil
+	}
+	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{}, errors.New("probe unavailable in test")
+	}
+
+	var putCalls, registerCalls, commitCalls atomic.Int32
+	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
+		putCalls.Add(1)
+		return hash, nil
+	}
+	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+		registerCalls.Add(1)
+		return nil
+	}
+	releaseUploadedBlockRefsFn = func(_ *db.DB, _, _, _ string, _ []string) {}
+
+	expectedSHA1 := sha1.Sum([]byte("hello"))
+	expectedFileID := hex.EncodeToString(expectedSHA1[:])
+	commitSeafHTTPUploadedFileMultiBlockFn = func(h *SeafHTTPHandler, ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+		commitCalls.Add(1)
+		if fileID != expectedFileID {
+			return "", "", 0, 0, fmt.Errorf("commit fileID = %s, want %s", fileID, expectedFileID)
+		}
+		if !reflect.DeepEqual(blockIDs, []string{expectedFileID}) {
+			return "", "", 0, 0, fmt.Errorf("commit blockIDs = %v, want [%s]", blockIDs, expectedFileID)
+		}
+		if fileSize != 5 {
+			return "", "", 0, 0, fmt.Errorf("commit fileSize = %d, want 5", fileSize)
+		}
+		return "commit-1", filename, 0, 0, nil
+	}
+
+	upload, err := cm.GetOrCreateUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5)
+	if err != nil {
+		t.Fatalf("GetOrCreateUploadByIdentity failed: %v", err)
+	}
+	upload.MarkQuotaPrecheck("/", 5, false)
+
+	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, tokenStore, nil, nil)
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	req1 := newMultipartUploadRequestWithFields(t, "/seafhttp/upload-api/mock-upload-token", "secret.bin", []byte("hello"), map[string]string{
+		"resumableIdentifier": uploadIdentifier,
+	})
+	req1.Header.Set("Content-Range", "bytes 0-4/5")
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, req1)
+
+	assertLibraryEncryptedNotUnlockedResponse(t, w1)
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("putCalls after locked finalize = %d, want 0", got)
+	}
+	if got := registerCalls.Load(); got != 0 {
+		t.Fatalf("registerCalls after locked finalize = %d, want 0", got)
+	}
+	if got := commitCalls.Load(); got != 0 {
+		t.Fatalf("commitCalls after locked finalize = %d, want 0", got)
+	}
+
+	tracked := cm.GetUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5)
+	if tracked != upload {
+		t.Fatalf("tracked upload pointer changed after locked finalize: got %p want %p", tracked, upload)
+	}
+	if outcome, ok := upload.FinalizeOutcome(); !ok || outcome == nil || !errors.Is(outcome.err, v2.ErrLibraryEncryptedNotUnlocked) {
+		t.Fatalf("first finalize outcome = %#v, ok=%v, want ErrLibraryEncryptedNotUnlocked", outcome, ok)
+	}
+
+	fileKey := bytes.Repeat([]byte{0x11}, 32)
+	fileIV := bytes.Repeat([]byte{0x22}, 16)
+	v2.GetDecryptSessions().Unlock(userID, repoID, fileKey, fileIV)
+
+	req2 := newMultipartUploadRequestWithFields(t, "/seafhttp/upload-api/mock-upload-token", "secret.bin", []byte("hello"), map[string]string{
+		"resumableIdentifier": uploadIdentifier,
+	})
+	req2.Header.Set("Content-Range", "bytes 0-4/5")
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want %d body=%q", w2.Code, http.StatusOK, w2.Body.String())
+	}
+	if got := strings.TrimSpace(w2.Body.String()); got != expectedFileID {
+		t.Fatalf("retry body = %q, want file id %q", got, expectedFileID)
+	}
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("putCalls after unlock retry = %d, want 1", got)
+	}
+	if got := registerCalls.Load(); got != 1 {
+		t.Fatalf("registerCalls after unlock retry = %d, want 1", got)
+	}
+	if got := commitCalls.Load(); got != 1 {
+		t.Fatalf("commitCalls after unlock retry = %d, want 1", got)
+	}
+	if got := cm.GetUploadByIdentity("mock-upload-token", uploadIdentifier, "/", "secret.bin", 5); got != nil {
+		t.Fatalf("tracker should be cleaned after successful retry, got %p", got)
+	}
+	outcome, ok := upload.FinalizeOutcome()
+	if !ok || outcome == nil {
+		t.Fatal("successful retry should publish a new finalize outcome on the original tracker")
+	}
+	if outcome.err != nil {
+		t.Fatalf("retry outcome.err = %v, want nil", outcome.err)
+	}
+	if outcome.fileID != expectedFileID || outcome.actualFilename != "secret.bin" || outcome.totalSize != 5 {
+		t.Fatalf("retry outcome = %+v, want fileID=%s actualFilename=secret.bin totalSize=5", outcome, expectedFileID)
+	}
 }
 
 // TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut verifies that

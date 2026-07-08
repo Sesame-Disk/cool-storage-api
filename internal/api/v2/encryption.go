@@ -17,6 +17,14 @@ import (
 	"github.com/google/uuid"
 )
 
+// ErrLibraryEncryptedNotUnlocked signals that an encrypted library has no active
+// decrypt session for the caller. Upload/finalize paths that cannot render a
+// gin.Context response inline return it so the transport layer can emit the
+// app-wide 403 { lib_need_decrypt: true } contract the frontend keys off to
+// re-open the repo password dialog (see isLibraryEncryptedError in
+// frontend/src/utils/upload-finalization.js) instead of a generic 500.
+var ErrLibraryEncryptedNotUnlocked = errors.New("library is encrypted and not unlocked")
+
 // DecryptSession tracks which libraries a user has unlocked and their file keys
 type DecryptSession struct {
 	UnlockedAt        time.Time
