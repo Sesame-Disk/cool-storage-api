@@ -10,11 +10,11 @@ import (
 func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockSHA1ForRepairFn
+	oldRead := readBlockIdentityForRepairFn
 	oldBackfill := backfillBlockSHA1Fn
 	t.Cleanup(func() {
 		upsertBlockMetadataInsertFn = oldInsert
-		readBlockSHA1ForRepairFn = oldRead
+		readBlockIdentityForRepairFn = oldRead
 		backfillBlockSHA1Fn = oldBackfill
 	})
 
@@ -26,9 +26,9 @@ func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
 		}
 		return false, nil // row already existed -> proceed to read + backfill
 	}
-	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
 		calls = append(calls, "read")
-		return "", true, nil
+		return PlainBlockRepresentationID, "", true, nil
 	}
 	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		calls = append(calls, "backfill")
@@ -60,20 +60,20 @@ func TestUpsertBlockMetadataWithSHA1_FirstWriterSkipsReadAndBackfill(t *testing.
 	// already holds our sha1, so there must be NO extra read and NO backfill LWT.
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockSHA1ForRepairFn
+	oldRead := readBlockIdentityForRepairFn
 	oldBackfill := backfillBlockSHA1Fn
 	t.Cleanup(func() {
 		upsertBlockMetadataInsertFn = oldInsert
-		readBlockSHA1ForRepairFn = oldRead
+		readBlockIdentityForRepairFn = oldRead
 		backfillBlockSHA1Fn = oldBackfill
 	})
 
 	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		return true, nil // first writer created the row with this sha1
 	}
-	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
 		t.Fatal("read should not run when the INSERT applied")
-		return "", false, nil
+		return "", "", false, nil
 	}
 	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		t.Fatal("backfill should not run when the INSERT applied")
@@ -88,19 +88,19 @@ func TestUpsertBlockMetadataWithSHA1_FirstWriterSkipsReadAndBackfill(t *testing.
 func TestUpsertBlockMetadataWithSHA1_FailsWhenRowChangesBeforeBackfill(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockSHA1ForRepairFn
+	oldRead := readBlockIdentityForRepairFn
 	oldBackfill := backfillBlockSHA1Fn
 	t.Cleanup(func() {
 		upsertBlockMetadataInsertFn = oldInsert
-		readBlockSHA1ForRepairFn = oldRead
+		readBlockIdentityForRepairFn = oldRead
 		backfillBlockSHA1Fn = oldBackfill
 	})
 
 	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		return false, nil // row already existed -> proceed to read/ensure
 	}
-	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
-		return "", true, nil
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+		return PlainBlockRepresentationID, "", true, nil
 	}
 	// The conditional backfill does not apply: another writer (or GC) changed the
 	// row between read and write. The CAS reports applied=false and the caller must
@@ -121,19 +121,19 @@ func TestUpsertBlockMetadataWithSHA1_FailsWhenRowChangesBeforeBackfill(t *testin
 func TestUpsertBlockMetadataWithSHA1_LeavesMatchingSHA1Untouched(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockSHA1ForRepairFn
+	oldRead := readBlockIdentityForRepairFn
 	oldBackfill := backfillBlockSHA1Fn
 	t.Cleanup(func() {
 		upsertBlockMetadataInsertFn = oldInsert
-		readBlockSHA1ForRepairFn = oldRead
+		readBlockIdentityForRepairFn = oldRead
 		backfillBlockSHA1Fn = oldBackfill
 	})
 
 	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		return false, nil // row already existed -> proceed to read/ensure
 	}
-	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
-		return strings.Repeat("b", 40), true, nil
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+		return PlainBlockRepresentationID, strings.Repeat("b", 40), true, nil
 	}
 	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		t.Fatal("backfill should not run when the stored sha1 already matches")
@@ -148,19 +148,19 @@ func TestUpsertBlockMetadataWithSHA1_LeavesMatchingSHA1Untouched(t *testing.T) {
 func TestUpsertBlockMetadataWithSHA1_RejectsConflictingExistingSHA1(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockSHA1ForRepairFn
+	oldRead := readBlockIdentityForRepairFn
 	oldBackfill := backfillBlockSHA1Fn
 	t.Cleanup(func() {
 		upsertBlockMetadataInsertFn = oldInsert
-		readBlockSHA1ForRepairFn = oldRead
+		readBlockIdentityForRepairFn = oldRead
 		backfillBlockSHA1Fn = oldBackfill
 	})
 
 	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		return false, nil // row already existed -> proceed to read/ensure
 	}
-	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
-		return strings.Repeat("c", 40), true, nil
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+		return PlainBlockRepresentationID, strings.Repeat("c", 40), true, nil
 	}
 	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		t.Fatal("backfill should not run when the stored sha1 conflicts")
@@ -176,24 +176,224 @@ func TestUpsertBlockMetadataWithSHA1_RejectsConflictingExistingSHA1(t *testing.T
 func TestUpsertBlockMetadataWithSHA1_RejectsMalformedInputSHA1(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockSHA1ForRepairFn
+	oldRead := readBlockIdentityForRepairFn
 	t.Cleanup(func() {
 		upsertBlockMetadataInsertFn = oldInsert
-		readBlockSHA1ForRepairFn = oldRead
+		readBlockIdentityForRepairFn = oldRead
 	})
 
 	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		t.Fatal("insert should not run for malformed sha1 input")
 		return false, nil
 	}
-	readBlockSHA1ForRepairFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
 		t.Fatal("read should not run for malformed sha1 input")
-		return "", false, nil
+		return "", "", false, nil
 	}
 
 	err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", "not-a-sha1", 123, "hot", "key")
 	if err == nil || !strings.Contains(err.Error(), "invalid block sha1") {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want invalid block sha1", err)
+	}
+}
+
+func TestWriteBlockIDMapping_RejectsMalformedIDs(t *testing.T) {
+	database := &DB{}
+	oldGet := getBlockIDMappingForWriteCheckFn
+	oldInsert := insertBlockIDMappingForWriteCheckFn
+	t.Cleanup(func() {
+		getBlockIDMappingForWriteCheckFn = oldGet
+		insertBlockIDMappingForWriteCheckFn = oldInsert
+	})
+
+	getBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID string) (string, bool, error) {
+		t.Fatal("existing mapping lookup should not run for malformed IDs")
+		return "", false, nil
+	}
+	insertBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID, internalID string, createdAt time.Time) error {
+		t.Fatal("insert should not run for malformed IDs")
+		return nil
+	}
+
+	err := database.WriteBlockIDMapping("org-1", PlainBlockRepresentationID, "not-a-sha1", strings.Repeat("a", 64), time.Time{})
+	if err == nil || !strings.Contains(err.Error(), "invalid external block id") {
+		t.Fatalf("WriteBlockIDMapping() external error = %v, want invalid external block id", err)
+	}
+
+	err = database.WriteBlockIDMapping("org-1", PlainBlockRepresentationID, strings.Repeat("b", 40), "not-a-sha256", time.Time{})
+	if err == nil || !strings.Contains(err.Error(), "invalid internal block id") {
+		t.Fatalf("WriteBlockIDMapping() internal error = %v, want invalid internal block id", err)
+	}
+}
+
+func TestWriteBlockIDMapping_RejectsSameDomainRemap(t *testing.T) {
+	database := &DB{}
+	oldGet := getBlockIDMappingForWriteCheckFn
+	oldInsert := insertBlockIDMappingForWriteCheckFn
+	t.Cleanup(func() {
+		getBlockIDMappingForWriteCheckFn = oldGet
+		insertBlockIDMappingForWriteCheckFn = oldInsert
+	})
+
+	getBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID string) (string, bool, error) {
+		if orgID != "org-1" || representationID != PlainBlockRepresentationID || externalID != strings.Repeat("b", 40) {
+			t.Fatalf("lookup args = %s/%s/%s", orgID, representationID, externalID)
+		}
+		return strings.Repeat("a", 64), true, nil
+	}
+	insertBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID, internalID string, createdAt time.Time) error {
+		t.Fatal("insert should not run when an existing conflicting mapping is present")
+		return nil
+	}
+
+	err := database.WriteBlockIDMapping("org-1", PlainBlockRepresentationID, strings.Repeat("b", 40), strings.Repeat("c", 64), time.Time{})
+	if !errors.Is(err, ErrBlockIDMappingConflict) {
+		t.Fatalf("WriteBlockIDMapping() error = %v, want ErrBlockIDMappingConflict", err)
+	}
+}
+
+func TestNormalizeBlockID(t *testing.T) {
+	cases := map[string]string{
+		"":                      "",
+		"  ":                    "",
+		"  ABCDEF  ":            "abcdef",
+		"DeadBeef":              "deadbeef",
+		strings.Repeat("A", 40): strings.Repeat("a", 40),
+		strings.Repeat("f", 64): strings.Repeat("f", 64),
+	}
+	for in, want := range cases {
+		if got := NormalizeBlockID(in); got != want {
+			t.Fatalf("NormalizeBlockID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestWriteBlockIDMapping_CanonicalizesHashesToLowercase(t *testing.T) {
+	database := &DB{}
+	oldGet := getBlockIDMappingForWriteCheckFn
+	oldInsert := insertBlockIDMappingForWriteCheckFn
+	t.Cleanup(func() {
+		getBlockIDMappingForWriteCheckFn = oldGet
+		insertBlockIDMappingForWriteCheckFn = oldInsert
+	})
+
+	getCalled := false
+	insertCalled := false
+	getBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID string) (string, bool, error) {
+		getCalled = true
+		if externalID != strings.Repeat("a", 40) {
+			t.Fatalf("externalID = %q, want lowercase", externalID)
+		}
+		return "", false, nil
+	}
+	insertBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representationID, externalID, internalID string, createdAt time.Time) error {
+		insertCalled = true
+		if externalID != strings.Repeat("a", 40) {
+			t.Fatalf("insert externalID = %q, want lowercase", externalID)
+		}
+		if internalID != strings.Repeat("b", 64) {
+			t.Fatalf("insert internalID = %q, want lowercase", internalID)
+		}
+		return nil
+	}
+
+	err := database.WriteBlockIDMapping("org-1", PlainBlockRepresentationID, strings.Repeat("A", 40), strings.Repeat("B", 64), time.Time{})
+	if err != nil {
+		t.Fatalf("WriteBlockIDMapping() error = %v, want nil", err)
+	}
+	if !getCalled || !insertCalled {
+		t.Fatalf("expected canonicalized lookup+insert path, got lookup=%v insert=%v", getCalled, insertCalled)
+	}
+}
+
+func TestEnsureBlockIdentity_PlaintextBackfillsMissingRepresentationID(t *testing.T) {
+	database := &DB{}
+	oldRead := readBlockIdentityForRepairFn
+	oldBackfillRepresentation := backfillBlockRepresentationIDFn
+	oldBackfillSHA1 := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		readBlockIdentityForRepairFn = oldRead
+		backfillBlockRepresentationIDFn = oldBackfillRepresentation
+		backfillBlockSHA1Fn = oldBackfillSHA1
+	})
+
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+		return "", strings.Repeat("a", 40), true, nil
+	}
+	backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
+		if representationID != PlainBlockRepresentationID {
+			t.Fatalf("representationID = %q, want %q", representationID, PlainBlockRepresentationID)
+		}
+		if expectedCurrent != "" {
+			t.Fatalf("expectedCurrent = %q, want empty", expectedCurrent)
+		}
+		return true, nil
+	}
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
+		t.Fatal("sha1 backfill should not run when the stored sha1 already matches")
+		return false, nil
+	}
+
+	if err := database.ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("a", 40)); err != nil {
+		t.Fatalf("ensureBlockIdentity() error = %v, want nil", err)
+	}
+}
+
+func TestEnsureBlockIdentity_PlaintextRejectsStoredRepresentationConflict(t *testing.T) {
+	database := &DB{}
+	oldRead := readBlockIdentityForRepairFn
+	oldBackfillRepresentation := backfillBlockRepresentationIDFn
+	oldBackfillSHA1 := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		readBlockIdentityForRepairFn = oldRead
+		backfillBlockRepresentationIDFn = oldBackfillRepresentation
+		backfillBlockSHA1Fn = oldBackfillSHA1
+	})
+
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+		return EncryptedLibraryBlockRepresentationID("library-1"), strings.Repeat("a", 40), true, nil
+	}
+	backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
+		t.Fatal("representation backfill should not run on a stored conflict")
+		return false, nil
+	}
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
+		t.Fatal("sha1 backfill should not run on a stored conflict")
+		return false, nil
+	}
+
+	err := database.ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("a", 40))
+	if err == nil || !strings.Contains(err.Error(), "conflicting representation id") {
+		t.Fatalf("ensureBlockIdentity() error = %v, want conflicting representation id", err)
+	}
+}
+
+func TestEnsureBlockIdentity_DoesNotBackfillRepresentationWhenSHA1Conflicts(t *testing.T) {
+	database := &DB{}
+	oldRead := readBlockIdentityForRepairFn
+	oldBackfillRepresentation := backfillBlockRepresentationIDFn
+	oldBackfillSHA1 := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		readBlockIdentityForRepairFn = oldRead
+		backfillBlockRepresentationIDFn = oldBackfillRepresentation
+		backfillBlockSHA1Fn = oldBackfillSHA1
+	})
+
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+		return "", strings.Repeat("d", 40), true, nil
+	}
+	backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
+		t.Fatal("representation backfill should not run when the stored sha1 already conflicts")
+		return false, nil
+	}
+	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
+		t.Fatal("sha1 backfill should not run when the stored sha1 already conflicts")
+		return false, nil
+	}
+
+	err := database.ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("e", 40))
+	if err == nil || !strings.Contains(err.Error(), "conflicting sha1") {
+		t.Fatalf("ensureBlockIdentity() error = %v, want conflicting sha1", err)
 	}
 }
 

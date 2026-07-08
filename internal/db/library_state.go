@@ -15,14 +15,19 @@ var ErrLibraryDeleted = errors.New("library deleted")
 // LibraryState captures the canonical fields that write/read fences need in
 // order to treat soft-deleted libraries as unavailable.
 type LibraryState struct {
-	OrgID        string
-	LibraryID    string
-	OwnerID      string
-	Name         string
-	Encrypted    bool
-	HeadCommitID string
-	StorageClass string
-	DeletedAt    *time.Time
+	OrgID                 string
+	LibraryID             string
+	OwnerID               string
+	Name                  string
+	Encrypted             bool
+	BlockRepresentationID string
+	HeadCommitID          string
+	StorageClass          string
+	DeletedAt             *time.Time
+}
+
+func (state LibraryState) BlockRepresentationIDOrDefault() string {
+	return EffectiveBlockRepresentationID(state.LibraryID, state.Encrypted, state.BlockRepresentationID)
 }
 
 // ReadLibraryState loads the canonical libraries row for a known org/library
@@ -35,13 +40,14 @@ func ReadLibraryState(session *gocql.Session, orgID, libraryID string) (LibraryS
 
 	var deletedAt time.Time
 	if err := session.Query(`
-		SELECT owner_id, name, encrypted, head_commit_id, storage_class, deleted_at
+		SELECT owner_id, name, encrypted, block_representation_id, head_commit_id, storage_class, deleted_at
 		FROM libraries
 		WHERE org_id = ? AND library_id = ?
 	`, orgID, libraryID).Scan(
 		&state.OwnerID,
 		&state.Name,
 		&state.Encrypted,
+		&state.BlockRepresentationID,
 		&state.HeadCommitID,
 		&state.StorageClass,
 		&deletedAt,
