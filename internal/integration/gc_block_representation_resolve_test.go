@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -49,13 +51,12 @@ func TestGC_GetLibraryBlockRepresentationID_NoLiveRow_RealCassandra(t *testing.T
 		_ = database.Session().Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
 	})
 
-	if _, err := store.GetLibraryBlockRepresentationID(orgID, libraryID); err == nil {
-		t.Fatalf("GetLibraryBlockRepresentationID returned nil error, want gocql.ErrNotFound")
-	} else if err.Error() != "not found" {
-		// gocql.ErrNotFound.Error() == "not found". A real Cassandra
-		// InvalidRequest (the pre-fix bug) would surface as a driver error
-		// mentioning "Undefined column" instead.
-		t.Fatalf("GetLibraryBlockRepresentationID error = %q, want gocql.ErrNotFound (\"not found\")", err.Error())
+	// Sentinel comparison, not a message match: the pre-fix bug surfaced as a
+	// driver InvalidRequest ("Undefined column name ...") which errors.Is would
+	// also correctly reject, but asserting the sentinel directly keeps this test
+	// from being coupled to either error's wording.
+	if _, err := store.GetLibraryBlockRepresentationID(orgID, libraryID); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("GetLibraryBlockRepresentationID error = %v, want gocql.ErrNotFound", err)
 	}
 }
 
