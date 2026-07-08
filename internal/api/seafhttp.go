@@ -3537,27 +3537,29 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	}
 }
 
-// resolveBlockID translates a hex SHA-1 block ID (40 chars) to SHA-256 (64 chars)
-// inside the target library's representation namespace. Classification is by hex
-// content, matching the streaming resolver: a non-SHA-1 id (already-SHA-256 or
-// anything else) is returned canonicalized without a mapping lookup.
+// resolveBlockID translates a client-facing block id to the internal SHA-256
+// storage id inside the target library's representation namespace. Only hex
+// SHA-1 or SHA-256 ids are accepted here; GC keeps its own lenient resolver.
 func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string, error) {
-	normalized := db.NormalizeBlockID(blockID)
-	if !db.IsSHA1BlockID(normalized) {
-		return normalized, nil
+	classifiedID, err := classifyClientReadableBlockID(blockID)
+	if err != nil {
+		return "", err
+	}
+	if !classifiedID.isLegacySHA1 {
+		return classifiedID.normalized, nil
 	}
 	representationID, err := h.resolveBlockRepresentationID(orgID, repoID)
 	if err != nil {
 		return "", err
 	}
-	mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, normalized)
+	mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, classifiedID.normalized)
 	if err != nil {
 		return "", err
 	}
 	if !ok || strings.TrimSpace(mappedID) == "" {
 		return "", fmt.Errorf("block mapping not found for %s", blockID)
 	}
-	return mappedID, nil
+	return normalizeResolvedInternalBlockID(mappedID)
 }
 
 // lookupFileBlocks resolves a token's path to its block IDs, file size, encryption key, and block store.

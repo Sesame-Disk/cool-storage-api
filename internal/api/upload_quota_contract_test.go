@@ -379,7 +379,7 @@ func TestPutBlockQuotaContract_TrafficExceeded(t *testing.T) {
 	handler := &SyncHandler{}
 	r.PUT("/seafhttp/repo/:repo_id/block/:block_id", handler.PutBlock)
 
-	req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo-1/block/block-1", bytes.NewBufferString("hello"))
+	req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo-1/block/0123456789012345678901234567890123456789", bytes.NewBufferString("hello"))
 	req.ContentLength = int64(len("hello"))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -403,7 +403,7 @@ func TestPutBlockWithoutQuotaCheckerDoesNotPanic(t *testing.T) {
 	handler := &SyncHandler{}
 	r.PUT("/seafhttp/repo/:repo_id/block/:block_id", handler.PutBlock)
 
-	req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo-1/block/block-1", bytes.NewBufferString("hello"))
+	req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo-1/block/0123456789012345678901234567890123456789", bytes.NewBufferString("hello"))
 	req.ContentLength = int64(len("hello"))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
