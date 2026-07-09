@@ -1189,21 +1189,32 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 		if exists {
 			continue
 		}
-		if err := validateQueueItemBlockRepresentation(QueueItem{
-			ItemType:              ItemLibraryCascade,
-			ItemID:                lib.LibraryID.String(),
-			BlockRepresentationID: lib.BlockRepresentationID,
-		}); err != nil {
-			countLibraryRepresentationDrift(lib.BlockRepresentationID)
-			log.Printf("[GC Scanner] Phase 13: skipping deleted library %s: %v", lib.LibraryID, err)
+		// Resolve (do not just validate) the representation: most production
+		// soft-delete/permanent-delete paths write the deleted_libraries marker
+		// without copying block_representation_id, so lib.BlockRepresentationID is
+		// usually empty here. The library row still exists at soft-delete time and
+		// carries the authoritative value, so recover it from there and stamp it on
+		// the cascade — mirroring phases 3/4 — instead of skipping the library and
+		// stranding it in trash forever. Only a genuinely unresolvable library
+		// (row gone AND marker empty) is skipped and reported as drift.
+		blockRepresentationID, repErr := resolveRequiredLibraryBlockRepresentation(s.store, lib.OrgID, lib.LibraryID, lib.BlockRepresentationID, "expired deleted library scan")
+		if repErr != nil {
+			log.Printf("[GC Scanner] Phase 13: skipping deleted library %s: %v", lib.LibraryID, repErr)
 			continue
+		}
+		if lib.BlockRepresentationID == "" {
+			// The deleted_libraries marker was written without a representation and
+			// we recovered it from the surviving library row; surface that as drift
+			// so the unstamped write path stays visible.
+			countLibraryRepresentationDefaulted()
+			log.Printf("[GC Scanner] Phase 13: deleted library %s had no stamped block_representation_id; recovered %q from library row (drift)", lib.LibraryID, blockRepresentationID)
 		}
 		batch = append(batch, QueueItem{
 			OrgID:                 lib.OrgID,
 			QueuedAt:              lib.DeletedAt,
 			ItemType:              ItemLibraryCascade,
 			ItemID:                lib.LibraryID.String(),
-			BlockRepresentationID: lib.BlockRepresentationID,
+			BlockRepresentationID: blockRepresentationID,
 			StorageClass:          lib.StorageClass,
 		})
 	}

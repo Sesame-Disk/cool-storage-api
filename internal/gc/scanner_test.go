@@ -2294,6 +2294,47 @@ func TestScanner_ScanExpiredDeletedLibraries_EnqueuesExpired(t *testing.T) {
 	}
 }
 
+// TestScanner_ScanExpiredDeletedLibraries_RecoversUnstampedMarker is the
+// regression guard for the trash-stuck bug: the canonical soft-delete path writes
+// the deleted_libraries marker WITHOUT block_representation_id, so the marker is
+// empty even though the surviving library row still carries the representation.
+// Phase 13 must recover it from the library row and enqueue the cascade (stamped),
+// not skip the library and strand it in trash forever.
+func TestScanner_ScanExpiredDeletedLibraries_RecoversUnstampedMarker(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	expiredLib := uuid.New()
+	store.AddDeletedLibrary(orgID, expiredLib, "hot", time.Now().AddDate(0, 0, -45))
+	// Simulate the unstamped write path: the marker has no representation, but the
+	// live (soft-deleted) library row still carries plain:v1.
+	store.mu.Lock()
+	store.deletedLibraries[expiredLib].BlockRepresentationID = ""
+	store.mu.Unlock()
+
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
+
+	n, err := s.scanExpiredDeletedLibraries(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("scanExpiredDeletedLibraries = (%d, %v), want (1, nil)", n, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 || items[0].ItemType != ItemLibraryCascade {
+		t.Fatalf("expected 1 library_cascade item, got %#v", items)
+	}
+	if items[0].BlockRepresentationID != db.PlainBlockRepresentationID {
+		t.Fatalf("recovered cascade representation = %q, want %q", items[0].BlockRepresentationID, db.PlainBlockRepresentationID)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
+		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
+	}
+}
+
 func TestScanner_ScanExpiredDeletedLibraries_UsesDeletedMarkerStorageClassWithoutLiveLibrary(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
