@@ -917,6 +917,15 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 	nextRow := previousRow
 	nextRow.UpdatedAt = now
 	nextRow.DeletedAt = &now
+	// Stamp the block representation onto the GC marker while the libraries row is
+	// still present, so the deferred trash-purge cascade can resolve the SHA-1
+	// mapping domain even after the row is hard-deleted. Best-effort: never fail a
+	// user delete over it — an empty stamp is recovered by GC Phase 13 from the
+	// still-present (soft-deleted) row.
+	blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(db.Session(), orgID, libraryID)
+	if repErr != nil {
+		log.Printf("[softDeleteLibrary] could not resolve block representation for %s/%s: %v", orgID, libraryID, repErr)
+	}
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries SET deleted_at = ?, deleted_by = ?, updated_at = ?
@@ -924,9 +933,9 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 		now, deletedBy, now, orgID, libraryID,
 	)
 	batch.Query(`
-		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class)
-		VALUES (?, ?, ?, ?)`,
-		libraryID, orgID, now, previousRow.StorageClass,
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id)
+		VALUES (?, ?, ?, ?, ?)`,
+		libraryID, orgID, now, previousRow.StorageClass, blockRepresentationID,
 	)
 	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, now)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)

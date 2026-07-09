@@ -107,3 +107,19 @@ func ResolveBlockRepresentationIDByLibraryID(session *gocql.Session, libraryID s
 	}
 	return state.BlockRepresentationIDOrDefault(), nil
 }
+
+// ResolveBlockRepresentationIDForDelete resolves the effective block
+// representation for a library that is being soft- or permanently deleted.
+// Unlike ResolveBlockRepresentationID it reads the row even when deleted_at is
+// already set (a permanent delete acts on a library that is already in trash),
+// so callers can stamp block_representation_id onto the deleted_libraries GC
+// marker before the libraries row disappears. GC relies on that stamp to purge
+// the library later; without it the cascade cannot resolve the SHA-1 mapping
+// domain once the live row is gone.
+func ResolveBlockRepresentationIDForDelete(session *gocql.Session, orgID, libraryID string) (string, error) {
+	state, err := ReadLibraryState(session, orgID, libraryID)
+	if err != nil {
+		return "", err
+	}
+	return state.BlockRepresentationIDOrDefault(), nil
+}

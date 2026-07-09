@@ -276,6 +276,16 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 		return
 	}
 
+	// Resolve the block representation while the libraries row still exists — this
+	// path deletes it below, after which GC can no longer recover the SHA-1
+	// mapping domain. Stamping it on the deleted_libraries marker keeps the
+	// deferred cascade (and the immediate EnqueueLibraryDeletion enqueue) able to
+	// resolve it. Best-effort: do not fail the delete if resolution fails.
+	blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), orgID, repoID)
+	if repErr != nil {
+		log.Printf("[PermanentDeleteRepo] could not resolve block representation for %s/%s: %v", orgID, repoID, repErr)
+	}
+
 	// Hard delete the library records
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, orgID, repoID); err != nil {
@@ -286,7 +296,7 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID)
 
 	// Preserve the org lookup for the Garbage Collector
-	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`, repoID, orgID, time.Now(), storageClass)
+	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`, repoID, orgID, time.Now(), storageClass, blockRepresentationID)
 
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})

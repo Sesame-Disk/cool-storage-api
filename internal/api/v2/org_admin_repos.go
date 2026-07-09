@@ -409,7 +409,12 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library links"})
 			return
 		}
-		// Hard-delete library rows + preserve org lookup for GC
+		// Hard-delete library rows + preserve org lookup for GC. Resolve the block
+		// representation before the row is gone so GC can still purge the library.
+		blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), targetOrgID, libID)
+		if repErr != nil {
+			log.Printf("[CleanOrgTrashLibraries] could not resolve block representation for %s/%s: %v", targetOrgID, libID, repErr)
+		}
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
 		if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, targetOrgID, libID); err != nil {
 			iter.Close()
@@ -418,7 +423,7 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 		}
 		batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, libID)
 		batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libID)
-		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`, libID, targetOrgID, time.Now(), storageClass)
+		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`, libID, targetOrgID, time.Now(), storageClass, blockRepresentationID)
 		if err := batch.Exec(); err != nil {
 			iter.Close()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
@@ -464,7 +469,12 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 		return
 	}
 
-	// Hard-delete + preserve org lookup for GC
+	// Hard-delete + preserve org lookup for GC. Resolve the block representation
+	// before the row is gone so GC can still purge the library.
+	blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), targetOrgID, repoID)
+	if repErr != nil {
+		log.Printf("[DeleteOrgTrashLibrary] could not resolve block representation for %s/%s: %v", targetOrgID, repoID, repErr)
+	}
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, targetOrgID, repoID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
@@ -472,7 +482,7 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 	}
 	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, repoID)
 	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID)
-	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`, repoID, targetOrgID, time.Now(), storageClass)
+	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`, repoID, targetOrgID, time.Now(), storageClass, blockRepresentationID)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return

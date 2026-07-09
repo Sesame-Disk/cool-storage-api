@@ -1273,6 +1273,12 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			}(lib.libID)
 
 			// 3. Hard-delete library rows (same batch approach as PermanentDeleteRepo)
+			// Resolve the block representation before the row is deleted so GC can
+			// still purge the library afterwards (best-effort).
+			blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), orgID, lib.libID)
+			if repErr != nil {
+				log.Printf("[AdminCleanTrashLibraries] could not resolve block representation for %s/%s: %v", orgID, lib.libID, repErr)
+			}
 			batch := h.db.Session().Batch(gocql.LoggedBatch)
 			if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, orgID, lib.libID); err != nil {
 				log.Printf("[AdminCleanTrashLibraries] failed to stage read model delete for library %s (org %s): %v", lib.libID, orgID, err)
@@ -1282,7 +1288,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, lib.libID)
 
 			// Preserve the org lookup for the Garbage Collector
-			batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`, lib.libID, orgID, time.Now(), lib.storageClass)
+			batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`, lib.libID, orgID, time.Now(), lib.storageClass, blockRepresentationID)
 
 			if err := batch.Exec(); err != nil {
 				log.Printf("[AdminCleanTrashLibraries] failed to delete library %s (org %s): %v", lib.libID, orgID, err)
