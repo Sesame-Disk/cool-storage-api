@@ -20,13 +20,16 @@ const (
 // This allows unit tests to use an in-memory mock instead of Cassandra.
 type GCStore interface {
 	// Queue operations
+	// EnqueueItem is the low-level path for queue rows that do not need
+	// block_representation_id context. Callers enqueuing commits, fs_objects,
+	// or library cascades must use EnqueueBatch with QueueItem.
 	EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error
 	EnqueueBatch(items []QueueItem) error
 	QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) (bool, error)
 	PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string) (bool, error)
 	DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error)
 	CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error
-	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error
+	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error
 	FailItem(item QueueItem, failedAt time.Time, lastError, failureCode string) error
 	GetQueueSize(orgID uuid.UUID) (int, error)
 	GetTotalQueueSize() (int, error)
@@ -344,6 +347,7 @@ type GCFailedItemInfo struct {
 	ItemType                    ItemType   `json:"item_type"`
 	ItemID                      string     `json:"item_id"`
 	LibraryID                   uuid.UUID  `json:"library_id"`
+	BlockRepresentationID       string     `json:"block_representation_id"`
 	StorageClass                string     `json:"storage_class"`
 	RetryCount                  int        `json:"retry_count"`
 	LastError                   string     `json:"last_error"`
@@ -410,10 +414,11 @@ type ExpiredShareLinkInfo struct {
 
 // LibraryTTLInfo holds library data needed for version TTL enforcement.
 type LibraryTTLInfo struct {
-	OrgID          uuid.UUID
-	LibraryID      uuid.UUID
-	HeadCommitID   string
-	VersionTTLDays int
+	OrgID                 uuid.UUID
+	LibraryID             uuid.UUID
+	HeadCommitID          string
+	BlockRepresentationID string
+	VersionTTLDays        int
 }
 
 // CommitWithTimestamp holds commit data needed for version TTL enforcement.
@@ -426,10 +431,11 @@ type CommitWithTimestamp struct {
 
 // LibraryAutoDeleteInfo holds library data needed for auto_delete_days enforcement.
 type LibraryAutoDeleteInfo struct {
-	OrgID          uuid.UUID
-	LibraryID      uuid.UUID
-	HeadCommitID   string
-	AutoDeleteDays int
+	OrgID                 uuid.UUID
+	LibraryID             uuid.UUID
+	HeadCommitID          string
+	BlockRepresentationID string
+	AutoDeleteDays        int
 }
 
 // ExpiredShareInfo holds data about an expired user-to-user share.
@@ -494,10 +500,11 @@ type DeletedUserInfo struct {
 
 // DeletedLibraryInfo holds data about a soft-deleted library for trash auto-purge.
 type DeletedLibraryInfo struct {
-	OrgID        uuid.UUID
-	LibraryID    uuid.UUID
-	StorageClass string
-	DeletedAt    time.Time
+	OrgID                 uuid.UUID
+	LibraryID             uuid.UUID
+	BlockRepresentationID string
+	StorageClass          string
+	DeletedAt             time.Time
 }
 
 // DeletedOrgInfo holds data about a soft-deleted org for cascade processing.

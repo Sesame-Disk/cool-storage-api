@@ -2,9 +2,11 @@ package gc
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/google/uuid"
 )
 
@@ -188,7 +190,20 @@ func TestQueue_IncrementRetry_PreservesIdentityAtForCascadeItems(t *testing.T) {
 
 	orgID := uuid.New()
 	originalQueuedAt := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Millisecond)
-	store.EnqueueItem(orgID, originalQueuedAt, ItemLibraryCascade, uuid.New().String(), uuid.Nil, "hot", 2)
+	blockRepresentationID := db.PlainBlockRepresentationID
+	if err := store.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              originalQueuedAt,
+		IdentityAt:            originalQueuedAt,
+		ItemType:              ItemLibraryCascade,
+		ItemID:                uuid.New().String(),
+		LibraryID:             uuid.Nil,
+		BlockRepresentationID: blockRepresentationID,
+		StorageClass:          "hot",
+		RetryCount:            2,
+	}}); err != nil {
+		t.Fatalf("EnqueueBatch failed: %v", err)
+	}
 
 	items, err := store.DequeueBatch(orgID, 1, time.Now())
 	if err != nil || len(items) != 1 {
@@ -211,6 +226,9 @@ func TestQueue_IncrementRetry_PreservesIdentityAtForCascadeItems(t *testing.T) {
 	}
 	if !requeued[0].IdentityAt.Equal(originalQueuedAt) {
 		t.Errorf("cascade retry IdentityAt = %v, want %v", requeued[0].IdentityAt, originalQueuedAt)
+	}
+	if requeued[0].BlockRepresentationID != blockRepresentationID {
+		t.Errorf("cascade retry BlockRepresentationID = %q, want %q", requeued[0].BlockRepresentationID, blockRepresentationID)
 	}
 }
 
@@ -277,8 +295,19 @@ func TestQueue_ListOrgsWithQueuedItems(t *testing.T) {
 	org2 := uuid.New()
 
 	// Enqueue items for two orgs
-	q.Enqueue(org1, ItemBlock, "b1", uuid.Nil, "hot")
-	q.Enqueue(org2, ItemCommit, "c1", uuid.New(), "")
+	if err := q.Enqueue(org1, ItemBlock, "b1", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("Enqueue ItemBlock failed: %v", err)
+	}
+	if err := q.EnqueueBatch([]QueueItem{{
+		OrgID:                 org2,
+		QueuedAt:              time.Now(),
+		ItemType:              ItemCommit,
+		ItemID:                "c1",
+		LibraryID:             uuid.New(),
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+	}}); err != nil {
+		t.Fatalf("EnqueueBatch ItemCommit failed: %v", err)
+	}
 
 	orgs, err := q.ListOrgsWithQueuedItems()
 	if err != nil {
@@ -316,9 +345,22 @@ func TestQueue_GetQueueSize(t *testing.T) {
 	}
 
 	// Enqueue 3 items
-	q.Enqueue(orgID, ItemBlock, "b1", uuid.Nil, "hot")
-	q.Enqueue(orgID, ItemBlock, "b2", uuid.Nil, "hot")
-	q.Enqueue(orgID, ItemCommit, "c1", uuid.New(), "")
+	if err := q.Enqueue(orgID, ItemBlock, "b1", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("Enqueue b1 failed: %v", err)
+	}
+	if err := q.Enqueue(orgID, ItemBlock, "b2", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("Enqueue b2 failed: %v", err)
+	}
+	if err := q.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              time.Now(),
+		ItemType:              ItemCommit,
+		ItemID:                "c1",
+		LibraryID:             uuid.New(),
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+	}}); err != nil {
+		t.Fatalf("EnqueueBatch commit failed: %v", err)
+	}
 
 	size, _ = q.GetQueueSize(orgID)
 	if size != 3 {
@@ -342,9 +384,22 @@ func TestQueue_GetTotalQueueSize(t *testing.T) {
 	org1 := uuid.New()
 	org2 := uuid.New()
 
-	q.Enqueue(org1, ItemBlock, "b1", uuid.Nil, "hot")
-	q.Enqueue(org1, ItemBlock, "b2", uuid.Nil, "hot")
-	q.Enqueue(org2, ItemCommit, "c1", uuid.New(), "")
+	if err := q.Enqueue(org1, ItemBlock, "b1", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("Enqueue org1 b1 failed: %v", err)
+	}
+	if err := q.Enqueue(org1, ItemBlock, "b2", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("Enqueue org1 b2 failed: %v", err)
+	}
+	if err := q.EnqueueBatch([]QueueItem{{
+		OrgID:                 org2,
+		QueuedAt:              time.Now(),
+		ItemType:              ItemCommit,
+		ItemID:                "c1",
+		LibraryID:             uuid.New(),
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+	}}); err != nil {
+		t.Fatalf("EnqueueBatch org2 commit failed: %v", err)
+	}
 
 	total, err := q.GetTotalQueueSize()
 	if err != nil {
@@ -363,8 +418,26 @@ func TestQueue_MultipleItemTypes(t *testing.T) {
 	libID := uuid.New()
 
 	q.Enqueue(orgID, ItemBlock, "block-1", uuid.Nil, "hot")
-	q.Enqueue(orgID, ItemCommit, "commit-1", libID, "")
-	q.Enqueue(orgID, ItemFSObject, "fs-1", libID, "")
+	if err := q.EnqueueBatch([]QueueItem{
+		{
+			OrgID:                 orgID,
+			QueuedAt:              time.Now(),
+			ItemType:              ItemCommit,
+			ItemID:                "commit-1",
+			LibraryID:             libID,
+			BlockRepresentationID: db.PlainBlockRepresentationID,
+		},
+		{
+			OrgID:                 orgID,
+			QueuedAt:              time.Now(),
+			ItemType:              ItemFSObject,
+			ItemID:                "fs-1",
+			LibraryID:             libID,
+			BlockRepresentationID: db.PlainBlockRepresentationID,
+		},
+	}); err != nil {
+		t.Fatalf("EnqueueBatch data items failed: %v", err)
+	}
 	q.Enqueue(orgID, ItemShareLink, "token-abc", uuid.Nil, "")
 
 	items, err := q.DequeueBatch(orgID, 10, 0)
@@ -383,6 +456,103 @@ func TestQueue_MultipleItemTypes(t *testing.T) {
 	for _, expected := range []ItemType{ItemBlock, ItemCommit, ItemFSObject, ItemShareLink} {
 		if !typeSet[expected] {
 			t.Errorf("missing item type %s", expected)
+		}
+	}
+}
+
+func TestQueue_EnqueueRejectsItemsThatRequireRepresentation(t *testing.T) {
+	store := NewMockStore()
+	q := NewQueue(store)
+	orgID := uuid.New()
+	libID := uuid.New()
+
+	if err := q.Enqueue(orgID, ItemCommit, "commit-1", libID, ""); err == nil {
+		t.Fatal("expected ItemCommit enqueue to require explicit representation")
+	}
+	if err := q.Enqueue(orgID, ItemFSObject, "fs-1", libID, ""); err == nil {
+		t.Fatal("expected ItemFSObject enqueue to require explicit representation")
+	}
+	if err := q.EnqueueCascade(orgID, time.Now(), ItemLibraryCascade, libID.String(), uuid.Nil, "hot"); err == nil {
+		t.Fatal("expected ItemLibraryCascade enqueue to require explicit representation")
+	}
+}
+
+func TestQueue_EnqueueBatchRejectsItemsMissingRepresentation(t *testing.T) {
+	orgID := uuid.New()
+	libID := uuid.New()
+	now := time.Now()
+
+	cases := []struct {
+		name     string
+		itemType ItemType
+		itemID   string
+	}{
+		{"commit", ItemCommit, "commit-1"},
+		{"fs_object", ItemFSObject, "fs-1"},
+		{"library_cascade", ItemLibraryCascade, libID.String()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMockStore()
+			q := NewQueue(store)
+			item := QueueItem{
+				OrgID:     orgID,
+				QueuedAt:  now,
+				ItemType:  tc.itemType,
+				ItemID:    tc.itemID,
+				LibraryID: libID,
+			}
+			if err := q.EnqueueBatch([]QueueItem{item}); err == nil {
+				t.Fatalf("expected %s batch enqueue to require a block representation", tc.itemType)
+			}
+			if items := store.QueueItems(orgID); len(items) != 0 {
+				t.Fatalf("rejected batch must not persist any item, got %#v", items)
+			}
+		})
+	}
+}
+
+func TestQueue_EnqueueBatchRejectsItemsWithForeignRepresentation(t *testing.T) {
+	orgID := uuid.New()
+	libID := uuid.New()
+	otherLibID := uuid.New()
+	now := time.Now()
+	q := NewQueue(NewMockStore())
+
+	err := q.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              now,
+		ItemType:              ItemCommit,
+		ItemID:                "commit-1",
+		LibraryID:             libID,
+		BlockRepresentationID: db.EncryptedLibraryBlockRepresentationID(otherLibID.String()),
+	}})
+	if err == nil {
+		t.Fatal("expected foreign library representation to be rejected")
+	}
+}
+
+func TestQueue_EnqueueBatchRejectsNonCanonicalRepresentationFormats(t *testing.T) {
+	orgID := uuid.New()
+	libID := uuid.New()
+	now := time.Now()
+	q := NewQueue(NewMockStore())
+
+	cases := []string{
+		"library:" + strings.ReplaceAll(libID.String(), "-", ""),
+		"library:{" + libID.String() + "}",
+	}
+	for _, representationID := range cases {
+		err := q.EnqueueBatch([]QueueItem{{
+			OrgID:                 orgID,
+			QueuedAt:              now,
+			ItemType:              ItemCommit,
+			ItemID:                "commit-1",
+			LibraryID:             libID,
+			BlockRepresentationID: representationID,
+		}})
+		if err == nil {
+			t.Fatalf("expected non-canonical representation %q to be rejected", representationID)
 		}
 	}
 }

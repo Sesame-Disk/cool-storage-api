@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -534,6 +535,11 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 			log.Printf("[GC Scanner] Phase 3: Library %s deleted, org lookup failed, skipping", libID)
 			continue
 		}
+		blockRepresentationID, repErr := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libID, "", "orphaned commit scan")
+		if repErr != nil {
+			log.Printf("[GC Scanner] Phase 3: skipping library %s: %v", libID, repErr)
+			continue
+		}
 
 		commitIDs, err := s.store.ListCommitIDsForLibrary(libID)
 		if err != nil {
@@ -552,12 +558,13 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:      orgID,
-					QueuedAt:   now,
-					IdentityAt: now,
-					ItemType:   ItemCommit,
-					ItemID:     commitID,
-					LibraryID:  libID,
+					OrgID:                 orgID,
+					QueuedAt:              now,
+					IdentityAt:            now,
+					ItemType:              ItemCommit,
+					ItemID:                commitID,
+					LibraryID:             libID,
+					BlockRepresentationID: blockRepresentationID,
 				})
 			}
 			if err := s.queue.EnqueueBatch(batch); err != nil {
@@ -601,6 +608,11 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 			log.Printf("[GC Scanner] Phase 4: Library %s deleted, org lookup failed, skipping", libID)
 			continue
 		}
+		blockRepresentationID, repErr := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libID, "", "orphaned fs_object scan")
+		if repErr != nil {
+			log.Printf("[GC Scanner] Phase 4: skipping library %s: %v", libID, repErr)
+			continue
+		}
 
 		fsIDs, err := s.store.ListFSObjectIDsForLibrary(libID)
 		if err != nil {
@@ -619,12 +631,13 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:      orgID,
-					QueuedAt:   now,
-					IdentityAt: now,
-					ItemType:   ItemFSObject,
-					ItemID:     fsID,
-					LibraryID:  libID,
+					OrgID:                 orgID,
+					QueuedAt:              now,
+					IdentityAt:            now,
+					ItemType:              ItemFSObject,
+					ItemID:                fsID,
+					LibraryID:             libID,
+					BlockRepresentationID: blockRepresentationID,
 				})
 			}
 			if err := s.queue.EnqueueBatch(batch); err != nil {
@@ -657,6 +670,21 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 		case <-ctx.Done():
 			return enqueued, ctx.Err()
 		default:
+		}
+
+		if err := validateQueueItemBlockRepresentation(QueueItem{
+			ItemType:              ItemCommit,
+			ItemID:                lib.HeadCommitID,
+			LibraryID:             lib.LibraryID,
+			BlockRepresentationID: lib.BlockRepresentationID,
+		}); err != nil {
+			if strings.TrimSpace(lib.BlockRepresentationID) == "" {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+			} else {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
+			}
+			log.Printf("[GC Scanner] Phase 5: skipping library %s: %v", lib.LibraryID, err)
+			continue
 		}
 
 		commits, err := s.store.ListCommitsWithTimestamps(lib.LibraryID)
@@ -704,12 +732,13 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:      lib.OrgID,
-					QueuedAt:   now,
-					IdentityAt: now,
-					ItemType:   ItemCommit,
-					ItemID:     c.CommitID,
-					LibraryID:  lib.LibraryID,
+					OrgID:                 lib.OrgID,
+					QueuedAt:              now,
+					IdentityAt:            now,
+					ItemType:              ItemCommit,
+					ItemID:                c.CommitID,
+					LibraryID:             lib.LibraryID,
+					BlockRepresentationID: lib.BlockRepresentationID,
 				})
 			}
 		}
@@ -745,6 +774,21 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 		case <-ctx.Done():
 			return enqueued, ctx.Err()
 		default:
+		}
+
+		if err := validateQueueItemBlockRepresentation(QueueItem{
+			ItemType:              ItemFSObject,
+			ItemID:                lib.HeadCommitID,
+			LibraryID:             lib.LibraryID,
+			BlockRepresentationID: lib.BlockRepresentationID,
+		}); err != nil {
+			if strings.TrimSpace(lib.BlockRepresentationID) == "" {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+			} else {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
+			}
+			log.Printf("[GC Scanner] Phase 6: skipping library %s: %v", lib.LibraryID, err)
+			continue
 		}
 
 		commits, err := s.store.ListCommitsWithTimestamps(lib.LibraryID)
@@ -818,12 +862,13 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:      lib.OrgID,
-					QueuedAt:   now,
-					IdentityAt: now,
-					ItemType:   ItemFSObject,
-					ItemID:     fsID,
-					LibraryID:  lib.LibraryID,
+					OrgID:                 lib.OrgID,
+					QueuedAt:              now,
+					IdentityAt:            now,
+					ItemType:              ItemFSObject,
+					ItemID:                fsID,
+					LibraryID:             lib.LibraryID,
+					BlockRepresentationID: lib.BlockRepresentationID,
 				})
 			}
 		}
@@ -1138,12 +1183,26 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 		if exists {
 			continue
 		}
+		if err := validateQueueItemBlockRepresentation(QueueItem{
+			ItemType:              ItemLibraryCascade,
+			ItemID:                lib.LibraryID.String(),
+			BlockRepresentationID: lib.BlockRepresentationID,
+		}); err != nil {
+			if strings.TrimSpace(lib.BlockRepresentationID) == "" {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+			} else {
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
+			}
+			log.Printf("[GC Scanner] Phase 13: skipping deleted library %s: %v", lib.LibraryID, err)
+			continue
+		}
 		batch = append(batch, QueueItem{
-			OrgID:        lib.OrgID,
-			QueuedAt:     lib.DeletedAt,
-			ItemType:     ItemLibraryCascade,
-			ItemID:       lib.LibraryID.String(),
-			StorageClass: lib.StorageClass,
+			OrgID:                 lib.OrgID,
+			QueuedAt:              lib.DeletedAt,
+			ItemType:              ItemLibraryCascade,
+			ItemID:                lib.LibraryID.String(),
+			BlockRepresentationID: lib.BlockRepresentationID,
+			StorageClass:          lib.StorageClass,
 		})
 	}
 	if len(batch) > 0 {

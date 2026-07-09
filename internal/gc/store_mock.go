@@ -344,10 +344,11 @@ type mockUser struct {
 }
 
 type mockDeletedLibrary struct {
-	OrgID        uuid.UUID
-	LibraryID    uuid.UUID
-	StorageClass string
-	DeletedAt    time.Time
+	OrgID                 uuid.UUID
+	LibraryID             uuid.UUID
+	BlockRepresentationID string
+	StorageClass          string
+	DeletedAt             time.Time
 }
 
 type mockStorageCounterReconciliation struct {
@@ -492,20 +493,26 @@ func mockMappingKey(orgID uuid.UUID, representationID, externalID string) string
 	return fmt.Sprintf("%s:%s:%s", orgID, representationID, db.NormalizeBlockID(externalID))
 }
 
-// blockRepresentationIDForLibraryLocked mirrors CassandraStore.GetLibraryBlockRepresentationID:
-// it only resolves from the live libraries row. deleted_libraries carries no
-// block_representation_id in this schema yet, so a library with no live row
-// intentionally resolves to (_, false) here, same as Cassandra returns
-// gocql.ErrNotFound — callers fall back to the conservative dual-probe.
 func (m *MockStore) blockRepresentationIDForLibraryLocked(orgID, libraryID uuid.UUID) (string, bool) {
-	lib := m.libraries[libraryID]
-	if lib == nil || lib.OrgID != orgID {
+	if lib := m.libraries[libraryID]; lib != nil {
+		if lib.OrgID != orgID {
+			return "", false
+		}
+		if rep := strings.TrimSpace(lib.BlockRepresentationID); rep != "" {
+			return rep, true
+		}
+		return db.PlainBlockRepresentationID, true
+	}
+	if deleted := m.deletedLibraries[libraryID]; deleted != nil {
+		if deleted.OrgID != orgID {
+			return "", false
+		}
+		if rep := strings.TrimSpace(deleted.BlockRepresentationID); rep != "" {
+			return rep, true
+		}
 		return "", false
 	}
-	if rep := strings.TrimSpace(lib.BlockRepresentationID); rep != "" {
-		return rep, true
-	}
-	return db.PlainBlockRepresentationID, true
+	return "", false
 }
 
 func (m *MockStore) upsertProvisionalBlockRefExpiryProjection(expiry *mockProvisionalBlockRefExpiry) {
@@ -970,7 +977,7 @@ func (m *MockStore) AddDeletedLibrary(orgID, libraryID uuid.UUID, storageClass s
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass}
-	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass, DeletedAt: deletedAt}
+	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass, DeletedAt: deletedAt}
 }
 
 // AddShareByUser adds a share received by a user.
@@ -1153,6 +1160,7 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 		ItemType:                    itemType,
 		ItemID:                      itemID,
 		LibraryID:                   libraryID,
+		BlockRepresentationID:       "",
 		StorageClass:                storageClass,
 		RetryCount:                  retryCount,
 	}
@@ -1164,6 +1172,11 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 }
 
 func (m *MockStore) EnqueueBatch(items []QueueItem) error {
+	for _, item := range items {
+		if err := validateQueueItemBlockRepresentation(item); err != nil {
+			return err
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.enqueueBatchErr != nil {
@@ -1252,7 +1265,7 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType I
 	return nil
 }
 
-func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
+func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1271,6 +1284,7 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 			newItem.QueuedAt = newQueuedAt
 			newItem.IdentityAt = effectiveIdentityAt(item.QueuedAt, identityAt)
 			newItem.RequiresLibraryDeletedCheck = item.RequiresLibraryDeletedCheck
+			newItem.BlockRepresentationID = strings.TrimSpace(blockRepresentationID)
 			newItem.RetryCount = newRetryCount
 			m.queue[orgID] = append(m.queue[orgID], newItem)
 			m.upsertPendingItem(orgID, libraryID, itemType, itemID, newItem.IdentityAt, nil)
@@ -1312,6 +1326,7 @@ func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError, fail
 		ItemType:                    item.ItemType,
 		ItemID:                      item.ItemID,
 		LibraryID:                   item.LibraryID,
+		BlockRepresentationID:       strings.TrimSpace(item.BlockRepresentationID),
 		StorageClass:                item.StorageClass,
 		RetryCount:                  item.RetryCount,
 		LastError:                   lastError,
@@ -1512,6 +1527,7 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 				ItemType:                    item.ItemType,
 				ItemID:                      item.ItemID,
 				LibraryID:                   item.LibraryID,
+				BlockRepresentationID:       strings.TrimSpace(item.BlockRepresentationID),
 				StorageClass:                item.StorageClass,
 				RetryCount:                  0,
 			})
@@ -2329,10 +2345,11 @@ func (m *MockStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error) {
 	for _, lib := range m.libraries {
 		if lib.VersionTTLDays > 0 {
 			results = append(results, LibraryTTLInfo{
-				OrgID:          lib.OrgID,
-				LibraryID:      lib.LibraryID,
-				HeadCommitID:   lib.HeadCommitID,
-				VersionTTLDays: lib.VersionTTLDays,
+				OrgID:                 lib.OrgID,
+				LibraryID:             lib.LibraryID,
+				HeadCommitID:          lib.HeadCommitID,
+				BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
+				VersionTTLDays:        lib.VersionTTLDays,
 			})
 		}
 	}
@@ -2347,10 +2364,11 @@ func (m *MockStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo, erro
 	for _, lib := range m.libraries {
 		if lib.AutoDeleteDays > 0 {
 			results = append(results, LibraryAutoDeleteInfo{
-				OrgID:          lib.OrgID,
-				LibraryID:      lib.LibraryID,
-				HeadCommitID:   lib.HeadCommitID,
-				AutoDeleteDays: lib.AutoDeleteDays,
+				OrgID:                 lib.OrgID,
+				LibraryID:             lib.LibraryID,
+				HeadCommitID:          lib.HeadCommitID,
+				BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
+				AutoDeleteDays:        lib.AutoDeleteDays,
 			})
 		}
 	}
@@ -2675,10 +2693,11 @@ func (m *MockStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLib
 	for _, dl := range m.deletedLibraries {
 		if dl.DeletedAt.Before(cutoff) {
 			result = append(result, DeletedLibraryInfo{
-				OrgID:        dl.OrgID,
-				LibraryID:    dl.LibraryID,
-				StorageClass: dl.StorageClass,
-				DeletedAt:    dl.DeletedAt,
+				OrgID:                 dl.OrgID,
+				LibraryID:             dl.LibraryID,
+				BlockRepresentationID: strings.TrimSpace(dl.BlockRepresentationID),
+				StorageClass:          dl.StorageClass,
+				DeletedAt:             dl.DeletedAt,
 			})
 		}
 	}
@@ -2740,10 +2759,11 @@ func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) err
 	}
 	lib.DeletedAt = time.Now()
 	m.deletedLibraries[libraryID] = &mockDeletedLibrary{
-		OrgID:        orgID,
-		LibraryID:    libraryID,
-		StorageClass: lib.StorageClass,
-		DeletedAt:    lib.DeletedAt,
+		OrgID:                 orgID,
+		LibraryID:             libraryID,
+		BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
+		StorageClass:          lib.StorageClass,
+		DeletedAt:             lib.DeletedAt,
 	}
 	m.storageCounterReconciliations[traffic.PlatformStorageScope()] = &mockStorageCounterReconciliation{Scope: traffic.PlatformStorageScope(), RequestedAt: time.Now()}
 	m.storageCounterReconciliations[traffic.OrganizationStorageScope(orgID.String())] = &mockStorageCounterReconciliation{Scope: traffic.OrganizationStorageScope(orgID.String()), OrgID: orgID, RequestedAt: time.Now()}

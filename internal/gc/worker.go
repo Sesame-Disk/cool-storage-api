@@ -350,6 +350,7 @@ func (w *Worker) postponeItem(item QueueItem) error {
 		item.ItemType,
 		item.ItemID,
 		item.LibraryID,
+		item.BlockRepresentationID,
 		item.StorageClass,
 		item.RetryCount,
 		effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
@@ -844,6 +845,7 @@ func (w *Worker) processCommit(item QueueItem) error {
 				ItemType:                    ItemFSObject,
 				ItemID:                      commit.RootFSID,
 				LibraryID:                   item.LibraryID,
+				BlockRepresentationID:       item.BlockRepresentationID,
 			}
 			if err := w.queue.EnqueueBatch([]QueueItem{child}); err != nil {
 				return fmt.Errorf("failed to enqueue root fs_object %s for commit %s: %w", commit.RootFSID, item.ItemID, err)
@@ -903,6 +905,7 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 				ItemType:                    ItemFSObject,
 				ItemID:                      childID,
 				LibraryID:                   item.LibraryID,
+				BlockRepresentationID:       item.BlockRepresentationID,
 				StorageClass:                "",
 				RetryCount:                  0,
 			})
@@ -916,7 +919,7 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 	// If it's a file with blocks, remove its permanent block references. Any block
 	// left with no references becomes a GC candidate.
 	if len(fsObj.BlockIDs) > 0 {
-		zeroRefBlocks, err := w.removeFSObjectBlockReferences(item.OrgID, item.LibraryID, item.ItemID, fsObj.BlockIDs)
+		zeroRefBlocks, err := w.removeFSObjectBlockReferences(item.OrgID, item.LibraryID, item.BlockRepresentationID, item.ItemID, fsObj.BlockIDs)
 		if err != nil {
 			return err
 		}
@@ -1226,18 +1229,18 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		return err
 	}
 
-	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.StorageClass, identityAt); err != nil {
+	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.BlockRepresentationID, item.StorageClass, identityAt); err != nil {
 		return err
 	}
 	return lease.Check()
 }
 
-func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, storageClass string, libraryDeletedAt time.Time) error {
+func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, libraryDeletedAt time.Time) error {
 	if storageClass == "" {
 		storageClass, _ = w.store.GetLibraryStorageClass(orgID, libraryID)
 	}
 
-	if err := w.enqueueLibraryContentsAt(orgID, libraryID, storageClass, libraryDeletedAt, true); err != nil {
+	if err := w.enqueueLibraryContentsAt(orgID, libraryID, blockRepresentationID, storageClass, libraryDeletedAt, true); err != nil {
 		return fmt.Errorf("failed to enqueue library contents: %w", err)
 	}
 
@@ -1351,7 +1354,11 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 			}
 			libraryDeletedAt = *deletedLibraryAt
 		}
-		if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, lib.StorageClass, libraryDeletedAt); err != nil {
+		blockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(w.store, orgID, lib.LibraryID, "", "org cascade")
+		if err != nil {
+			return err
+		}
+		if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, blockRepresentationID, lib.StorageClass, libraryDeletedAt); err != nil {
 			return fmt.Errorf("failed to cascade-delete library %s during org delete: %w", lib.LibraryID, err)
 		}
 		if err := lease.Check(); err != nil {
@@ -1427,8 +1434,8 @@ func fsObjectBlockDecrementTaskID(libraryID uuid.UUID, fsID string, identityAt t
 // resolved to internal SHA-256 IDs first. Idempotent: deleting a missing reference
 // is a no-op, so a retried fs_object GC pass is safe (no double-decrement risk —
 // the whole class of decrement idempotency bugs disappears with the counter).
-func (w *Worker) removeFSObjectBlockReferences(orgID, libraryID uuid.UUID, fsID string, blockIDs []string) ([]string, error) {
-	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, libraryID, "", blockIDs)
+func (w *Worker) removeFSObjectBlockReferences(orgID, libraryID uuid.UUID, blockRepresentationID, fsID string, blockIDs []string) ([]string, error) {
+	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, libraryID, blockRepresentationID, blockIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve block IDs for fs_object %s/%s: %w", libraryID, fsID, err)
 	}
@@ -1499,13 +1506,18 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 // Only enqueues commits and fs_objects — blocks are handled in cascade
 // when fs_objects are processed (via decrementFSObjectBlocks).
 func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass string) error {
-	return w.enqueueLibraryContentsAt(orgID, libraryID, storageClass, w.clock(), false)
+	return w.enqueueLibraryContentsAt(orgID, libraryID, "", storageClass, w.clock(), false)
 }
 
-func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, storageClass string, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
+func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
 	if identityAt.IsZero() {
 		identityAt = w.clock()
 	}
+	resolvedBlockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(w.store, orgID, libraryID, blockRepresentationID, "library contents enqueue")
+	if err != nil {
+		return err
+	}
+	blockRepresentationID = resolvedBlockRepresentationID
 
 	// Enqueue all commits for this library (batched)
 	commits, err := w.store.ListCommitsForLibrary(libraryID)
@@ -1524,7 +1536,7 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, storageCla
 			}
 			batch = append(batch, QueueItem{
 				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, RequiresLibraryDeletedCheck: requiresLibraryDeletedCheck, ItemType: ItemCommit,
-				ItemID: c.CommitID, LibraryID: libraryID,
+				ItemID: c.CommitID, LibraryID: libraryID, BlockRepresentationID: blockRepresentationID,
 			})
 		}
 		if len(batch) > 0 {
@@ -1551,7 +1563,7 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, storageCla
 			}
 			batch = append(batch, QueueItem{
 				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, RequiresLibraryDeletedCheck: requiresLibraryDeletedCheck, ItemType: ItemFSObject,
-				ItemID: obj.FSID, LibraryID: libraryID,
+				ItemID: obj.FSID, LibraryID: libraryID, BlockRepresentationID: blockRepresentationID,
 			})
 		}
 		if len(batch) > 0 {

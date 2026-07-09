@@ -436,14 +436,22 @@ func (s *Service) EnqueueCommits(orgID, libraryID uuid.UUID, commitIDs []string)
 		return nil
 	}
 	now := time.Now()
+	// Stamp the block representation at enqueue time (the library is still live
+	// here) so fs_object GC never has to re-resolve it from a possibly-deleted
+	// library row later.
+	blockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(s.store, orgID, libraryID, "", "commit enqueue")
+	if err != nil {
+		return err
+	}
 	items := make([]QueueItem, 0, len(commitIDs))
 	for _, id := range commitIDs {
 		items = append(items, QueueItem{
-			OrgID:     orgID,
-			QueuedAt:  now,
-			ItemType:  ItemCommit,
-			ItemID:    id,
-			LibraryID: libraryID,
+			OrgID:                 orgID,
+			QueuedAt:              now,
+			ItemType:              ItemCommit,
+			ItemID:                id,
+			LibraryID:             libraryID,
+			BlockRepresentationID: blockRepresentationID,
 		})
 	}
 	return s.queue.EnqueueBatch(items)

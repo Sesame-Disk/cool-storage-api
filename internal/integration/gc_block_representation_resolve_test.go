@@ -18,46 +18,95 @@ import (
 
 // Real-Cassandra counterpart to internal/gc/store_mock_test.go's
 // GetLibraryBlockRepresentationID / ResolveBlockIDs coverage. The mock is
-// hand-written to mirror CassandraStore's query shape, so these two pin the
-// same contracts against the actual schema/driver instead of the in-memory
-// map — in particular the deleted_libraries P1 fixed in 77339b79f, which the
-// mock could not have caught (see block_representation.go / store_cassandra.go
-// GetLibraryBlockRepresentationID doc comment for the full story).
+// hand-written to mirror CassandraStore's query shape, so these pin the same
+// contracts against the actual schema/driver instead of the in-memory map.
 
-// TestGC_GetLibraryBlockRepresentationID_NoLiveRow_RealCassandra verifies that
-// a library with no live `libraries` row resolves to a clean gocql.ErrNotFound
-// against real Cassandra, rather than the "Undefined column name
-// block_representation_id in table deleted_libraries" InvalidRequest that
-// existed before 77339b79f (deleted_libraries carries no representation
-// column in this schema; that lands with gc_queue/DLQ durability in the
-// follow-up PR).
-func TestGC_GetLibraryBlockRepresentationID_NoLiveRow_RealCassandra(t *testing.T) {
+// TestGC_GetLibraryBlockRepresentationID_DeletedLibrary_RealCassandra pins the
+// Rama 3 durability contract against real Cassandra: with the live `libraries`
+// row gone, GetLibraryBlockRepresentationID resolves the representation from the
+// soft-deleted row's block_representation_id column (added by migration 010).
+//   - a deleted row carrying a representation returns exactly that value;
+//   - a deleted row with an empty representation fails closed with
+//     gocql.ErrNotFound, so callers fall back to the conservative dual-probe
+//     rather than resolving against a guess.
+//
+// This is the behavior that Rama 2 temporarily could not have — migration 009
+// had no block_representation_id on deleted_libraries, so the reader had to skip
+// that table entirely and always returned ErrNotFound here. Now that migration
+// 010 adds the column, the reader consults it again; these cases prove it reads
+// correctly and still fails closed on an absent value.
+func TestGC_GetLibraryBlockRepresentationID_DeletedLibrary_RealCassandra(t *testing.T) {
 	requireCassandra(t)
 	database := shareProjectionDBForTest(t)
 	store := gcpkg.NewCassandraStore(database)
 
-	orgID := uuid.New()
-	libraryID := uuid.New() // deliberately never inserted into `libraries`
+	t.Run("deleted row with representation resolves it", func(t *testing.T) {
+		orgID := uuid.New()
+		libraryID := uuid.New() // never inserted into live `libraries`
+		representationID := dbpkg.EncryptedLibraryBlockRepresentationID(libraryID.String())
 
-	// Soft-delete marker, exactly as write_helpers.go inserts it: no
-	// representation column, because this schema doesn't have one yet.
-	if err := database.Session().Query(
-		`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`,
-		libraryID.String(), orgID.String(), time.Now(), "hot",
-	).Exec(); err != nil {
-		t.Fatalf("seed deleted_libraries: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = database.Session().Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		if err := database.Session().Query(
+			`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`,
+			libraryID.String(), orgID.String(), time.Now(), "hot", representationID,
+		).Exec(); err != nil {
+			t.Fatalf("seed deleted_libraries: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = database.Session().Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		})
+
+		got, err := store.GetLibraryBlockRepresentationID(orgID, libraryID)
+		if err != nil {
+			t.Fatalf("GetLibraryBlockRepresentationID: %v", err)
+		}
+		if got != representationID {
+			t.Fatalf("representation = %q, want %q", got, representationID)
+		}
 	})
 
-	// Sentinel comparison, not a message match: the pre-fix bug surfaced as a
-	// driver InvalidRequest ("Undefined column name ...") which errors.Is would
-	// also correctly reject, but asserting the sentinel directly keeps this test
-	// from being coupled to either error's wording.
-	if _, err := store.GetLibraryBlockRepresentationID(orgID, libraryID); !errors.Is(err, gocql.ErrNotFound) {
-		t.Fatalf("GetLibraryBlockRepresentationID error = %v, want gocql.ErrNotFound", err)
-	}
+	t.Run("deleted row without representation fails closed", func(t *testing.T) {
+		orgID := uuid.New()
+		libraryID := uuid.New()
+
+		// No block_representation_id column set (nil), e.g. a row written before
+		// migration 010 backfill or a plaintext library whose value was empty.
+		if err := database.Session().Query(
+			`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`,
+			libraryID.String(), orgID.String(), time.Now(), "hot",
+		).Exec(); err != nil {
+			t.Fatalf("seed deleted_libraries: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = database.Session().Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		})
+
+		// Sentinel comparison, not a message match, so the test is not coupled to
+		// the driver's error wording.
+		if _, err := store.GetLibraryBlockRepresentationID(orgID, libraryID); !errors.Is(err, gocql.ErrNotFound) {
+			t.Fatalf("GetLibraryBlockRepresentationID error = %v, want gocql.ErrNotFound", err)
+		}
+	})
+
+	t.Run("org mismatch fails closed", func(t *testing.T) {
+		orgID := uuid.New()
+		otherOrgID := uuid.New()
+		libraryID := uuid.New()
+		representationID := dbpkg.EncryptedLibraryBlockRepresentationID(libraryID.String())
+
+		if err := database.Session().Query(
+			`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`,
+			libraryID.String(), orgID.String(), time.Now(), "hot", representationID,
+		).Exec(); err != nil {
+			t.Fatalf("seed deleted_libraries: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = database.Session().Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		})
+
+		if _, err := store.GetLibraryBlockRepresentationID(otherOrgID, libraryID); !errors.Is(err, gocql.ErrNotFound) {
+			t.Fatalf("GetLibraryBlockRepresentationID error = %v, want gocql.ErrNotFound", err)
+		}
+	})
 }
 
 // TestGC_ResolveBlockIDs_AmbiguousDualProbe_RealCassandra is the DB-level

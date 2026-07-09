@@ -1014,6 +1014,34 @@ func TestScanner_ScanOrphanedCommits_DoesNotCrossSuppressAcrossLibraries(t *test
 	}
 }
 
+func TestScanner_ScanOrphanedCommits_SkipsUnresolvableRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.mu.Lock()
+	store.deletedLibraries[libID].BlockRepresentationID = ""
+	delete(store.libraries, libID)
+	store.mu.Unlock()
+	store.AddCommit(libID, "commit-orphan-legacy", "fs-root")
+
+	// Representation is unresolvable (canonical row gone, no persisted rep): the
+	// scanner must skip rather than enqueue an incomplete task.
+	n, err := s.scanOrphanedCommits(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("scanOrphanedCommits = (%d, %v), want (0, nil)", n, err)
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("expected no queued work, got %#v", items)
+	}
+}
+
 func TestScanner_ScanOrphanedFSObjects(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -1113,6 +1141,33 @@ func TestScanner_ScanOrphanedFSObjects_DoesNotCrossSuppressAcrossLibraries(t *te
 	}
 	if orphanCount != 1 {
 		t.Fatalf("expected orphaned library fs_object to enqueue once despite same fs id in another library, got %d", orphanCount)
+	}
+}
+
+func TestScanner_ScanOrphanedFSObjects_SkipsUnresolvableRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.mu.Lock()
+	store.deletedLibraries[libID].BlockRepresentationID = ""
+	delete(store.libraries, libID)
+	store.mu.Unlock()
+	store.AddFSObject(libID, "fs-orphan-legacy", "file", []string{"blk-legacy"})
+
+	n, err := s.scanOrphanedFSObjects(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("scanOrphanedFSObjects = (%d, %v), want (0, nil)", n, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 0 {
+		t.Fatalf("expected no queued work, got %#v", items)
 	}
 }
 
@@ -1254,6 +1309,81 @@ func TestScanner_ScanExpiredVersions_EnqueuesExpired(t *testing.T) {
 	}
 	if commitItems != 2 {
 		t.Errorf("expected 2 expired commits enqueued, got %d", commitItems)
+	}
+}
+
+func TestScanner_ScanExpiredVersions_SkipsLibraryMissingRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithTTL(orgID, libID, "hot", "commit-head", 1)
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = ""
+	store.mu.Unlock()
+	store.AddCommitWithDetails(libID, "commit-head", "fs-1", "", time.Now())
+	store.AddCommitWithDetails(libID, "commit-expired", "fs-2", "", time.Now().Add(-48*time.Hour))
+
+	n, err := s.scanExpiredVersions(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("scanExpiredVersions = (%d, %v), want (0, nil)", n, err)
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("expected no queued work for representation-less library, got %#v", items)
+	}
+}
+
+func TestScanner_ScanAutoDeleteExpiredObjects_SkipsLibraryMissingRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = ""
+	store.mu.Unlock()
+	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
+	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-a"})
+
+	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (0, nil)", n, err)
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("expected no queued work for representation-less library, got %#v", items)
+	}
+}
+
+func TestScanner_ScanExpiredVersions_SkipsLibraryWithNonCanonicalRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithTTL(orgID, libID, "hot", "commit-head", 1)
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = "library:{" + libID.String() + "}"
+	store.mu.Unlock()
+	store.AddCommitWithDetails(libID, "commit-head", "fs-1", "", time.Now())
+	store.AddCommitWithDetails(libID, "commit-expired", "fs-2", "", time.Now().Add(-48*time.Hour))
+
+	n, err := s.scanExpiredVersions(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("scanExpiredVersions = (%d, %v), want (0, nil)", n, err)
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("expected no queued work for library with non-canonical representation, got %#v", items)
 	}
 }
 
@@ -2156,6 +2286,42 @@ func TestScanner_ScanExpiredDeletedLibraries_Multiple(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanExpiredDeletedLibraries_SkipsInvalidRepresentationWithoutPoisoningBatch(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	validLib := uuid.New()
+	invalidLib := uuid.New()
+	deletedAt := time.Now().AddDate(0, 0, -45)
+	store.AddDeletedLibrary(orgID, validLib, "hot", deletedAt)
+	store.AddDeletedLibrary(orgID, invalidLib, "hot", deletedAt)
+
+	store.mu.Lock()
+	store.deletedLibraries[invalidLib].BlockRepresentationID = "library:{" + invalidLib.String() + "}"
+	store.mu.Unlock()
+
+	n, err := s.scanExpiredDeletedLibraries(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedLibraries failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 expired library enqueued, got %d", n)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected exactly 1 queued item, got %d", len(items))
+	}
+	if items[0].ItemType != ItemLibraryCascade || items[0].ItemID != validLib.String() {
+		t.Fatalf("queued item = %#v, want library_cascade for valid library %s", items[0], validLib)
+	}
+}
+
 func TestScanner_ScanExpiredDeletedLibraries_DeduplicatesAcrossRuns(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -2222,13 +2388,14 @@ func TestScanner_ScanExpiredDeletedLibraries_ExpiredFailedMarkerDoesNotSuppressF
 	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
 
 	failedItem := QueueItem{
-		OrgID:        orgID,
-		QueuedAt:     deletedAt,
-		IdentityAt:   deletedAt,
-		ItemType:     ItemLibraryCascade,
-		ItemID:       libID.String(),
-		LibraryID:    uuid.Nil,
-		StorageClass: "hot",
+		OrgID:                 orgID,
+		QueuedAt:              deletedAt,
+		IdentityAt:            deletedAt,
+		ItemType:              ItemLibraryCascade,
+		ItemID:                libID.String(),
+		LibraryID:             uuid.Nil,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+		StorageClass:          "hot",
 	}
 	if err := store.EnqueueBatch([]QueueItem{failedItem}); err != nil {
 		t.Fatalf("failed to seed queue item: %v", err)

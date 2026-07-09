@@ -13,7 +13,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 )
 
-func TestMockStore_GetLibraryBlockRepresentationID_RejectsOrgMismatchOnLiveLibrary(t *testing.T) {
+func TestMockStore_GetLibraryBlockRepresentationID_RejectsOrgMismatchOnDeletedLibrary(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()
 	otherOrgID := uuid.New()
@@ -26,34 +26,80 @@ func TestMockStore_GetLibraryBlockRepresentationID_RejectsOrgMismatchOnLiveLibra
 	}
 }
 
-// TestMockStore_GetLibraryBlockRepresentationID_NoLiveRowIgnoresDeletedLibraries
-// pins the fix for the schema gap where deleted_libraries has no
-// block_representation_id column yet: a library absent from the live libraries
-// table must resolve to gocql.ErrNotFound even when deletedLibraries holds a
-// row for it, never a value read off the deleted-library marker.
-func TestMockStore_GetLibraryBlockRepresentationID_NoLiveRowIgnoresDeletedLibraries(t *testing.T) {
+// TestMockStore_GetLibraryBlockRepresentationID_ResolvesFromDeletedLibrary pins the
+// Rama 3 durability contract: once migration 010 gives deleted_libraries a
+// block_representation_id column, GetLibraryBlockRepresentationID resolves from
+// the soft-deleted row when the live libraries row is already gone. A stored
+// representation is returned as-is; an empty one still fails closed with
+// gocql.ErrNotFound so callers fall back to the conservative dual-probe rather
+// than resolving against a guessed representation.
+func TestMockStore_GetLibraryBlockRepresentationID_ResolvesFromDeletedLibrary(t *testing.T) {
+	orgID := uuid.New()
+
+	t.Run("with representation returns it", func(t *testing.T) {
+		store := NewMockStore()
+		libID := uuid.New()
+		store.deletedLibraries[libID] = &mockDeletedLibrary{
+			OrgID:                 orgID,
+			LibraryID:             libID,
+			BlockRepresentationID: db.EncryptedLibraryBlockRepresentationID(libID.String()),
+			StorageClass:          "hot",
+			DeletedAt:             time.Now().UTC(),
+		}
+
+		got, err := store.GetLibraryBlockRepresentationID(orgID, libID)
+		if err != nil {
+			t.Fatalf("GetLibraryBlockRepresentationID: %v", err)
+		}
+		if want := db.EncryptedLibraryBlockRepresentationID(libID.String()); got != want {
+			t.Fatalf("representation = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("empty representation fails closed", func(t *testing.T) {
+		store := NewMockStore()
+		libID := uuid.New()
+		store.deletedLibraries[libID] = &mockDeletedLibrary{
+			OrgID:        orgID,
+			LibraryID:    libID,
+			StorageClass: "hot",
+			DeletedAt:    time.Now().UTC(),
+		}
+
+		if _, err := store.GetLibraryBlockRepresentationID(orgID, libID); !errors.Is(err, gocql.ErrNotFound) {
+			t.Fatalf("GetLibraryBlockRepresentationID error = %v, want %v", err, gocql.ErrNotFound)
+		}
+	})
+}
+
+// TestMockStore_EnqueueBatchRejectsForeignRepresentation verifies the enqueue
+// choke point applies the block-representation invariant directly at the store
+// level (not just in the Queue wrapper): a commit item carrying a canonical
+// representation that belongs to a *different* library must be rejected.
+func TestMockStore_EnqueueBatchRejectsForeignRepresentation(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()
 	libID := uuid.New()
 
-	store.deletedLibraries[libID] = &mockDeletedLibrary{
-		OrgID:        orgID,
-		LibraryID:    libID,
-		StorageClass: "hot",
-		DeletedAt:    time.Now().UTC(),
-	}
-
-	if _, err := store.GetLibraryBlockRepresentationID(orgID, libID); !errors.Is(err, gocql.ErrNotFound) {
-		t.Fatalf("GetLibraryBlockRepresentationID error = %v, want %v", err, gocql.ErrNotFound)
+	err := store.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              time.Now().UTC(),
+		ItemType:              ItemCommit,
+		ItemID:                "commit-1",
+		LibraryID:             libID,
+		BlockRepresentationID: db.EncryptedLibraryBlockRepresentationID(uuid.NewString()),
+	}})
+	if err == nil {
+		t.Fatal("expected direct store enqueue to reject foreign representation")
 	}
 }
 
 // TestMockStore_ResolveBlockIDs_NoLiveLibraryUsesDualProbeFallback verifies that
-// once a library has no live row (the case after hard-delete, or before Rama 3
-// gives gc_queue items a persisted representation), ResolveBlockIDs falls back
-// to probing both the plaintext and encrypted representations instead of
-// erroring or silently leaving the SHA-1 unresolved. This is the plain-only leg
-// of the dual-probe.
+// when the queue item carries no representation and the library has no live or
+// soft-deleted row at all, ResolveBlockIDs falls back to probing both the
+// plaintext and encrypted representations instead of erroring or silently
+// leaving the SHA-1 unresolved. This is the plain-only leg of the dual-probe,
+// which Rama 3 keeps as conservative protection (not the expected path).
 func TestMockStore_ResolveBlockIDs_NoLiveLibraryUsesDualProbeFallback(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()
@@ -73,9 +119,9 @@ func TestMockStore_ResolveBlockIDs_NoLiveLibraryUsesDualProbeFallback(t *testing
 }
 
 // TestMockStore_ResolveBlockIDs_DualProbeEncryptedOnlyResolves is the encrypted-only
-// leg of the dual-probe: no live library row, no plaintext mapping, only the
-// library's encrypted representation has a forward mapping. ResolveBlockIDs must
-// still resolve it instead of only ever trying plain:v1.
+// leg of the dual-probe: no live/soft-deleted library row, no plaintext mapping,
+// only the library's encrypted representation has a forward mapping. ResolveBlockIDs
+// must still resolve it instead of only ever trying plain:v1.
 func TestMockStore_ResolveBlockIDs_DualProbeEncryptedOnlyResolves(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()

@@ -29,6 +29,7 @@ type QueueItem struct {
 	ItemType                    ItemType
 	ItemID                      string
 	LibraryID                   uuid.UUID
+	BlockRepresentationID       string
 	StorageClass                string
 	RetryCount                  int
 }
@@ -52,6 +53,9 @@ func NewQueue(store GCStore) *Queue {
 
 // Enqueue inserts an item into the gc_queue for later deletion.
 func (q *Queue) Enqueue(orgID uuid.UUID, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string) error {
+	if itemTypeRequiresBlockRepresentation(itemType) {
+		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
+	}
 	return q.store.EnqueueItem(orgID, time.Now(), itemType, itemID, libraryID, storageClass, 0)
 }
 
@@ -60,13 +64,28 @@ func (q *Queue) Enqueue(orgID uuid.UUID, itemType ItemType, itemID string, libra
 // cascade children become immediately eligible for processing — they are known
 // to be unreferenced (the parent object is being deleted).
 func (q *Queue) EnqueueCascade(orgID uuid.UUID, parentQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string) error {
+	if itemTypeRequiresBlockRepresentation(itemType) {
+		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
+	}
 	return q.store.EnqueueItem(orgID, parentQueuedAt, itemType, itemID, libraryID, storageClass, 0)
 }
 
 // EnqueueBatch inserts multiple items into the gc_queue efficiently.
+//
+// EnqueueBatch is the real choke point every producer uses, so the block
+// representation invariant is enforced here (not only in Enqueue/EnqueueCascade):
+// commits, fs_objects and library cascades must carry a *canonical*
+// BlockRepresentationID. Rejecting an empty OR malformed value keeps an
+// incomplete task — which the worker would fail to map and then retry forever,
+// leaking references/blocks/mappings — from ever reaching gc_queue.
 func (q *Queue) EnqueueBatch(items []QueueItem) error {
 	if len(items) == 0 {
 		return nil
+	}
+	for _, item := range items {
+		if err := validateQueueItemBlockRepresentation(item); err != nil {
+			return err
+		}
 	}
 	return q.store.EnqueueBatch(items)
 }
@@ -86,7 +105,7 @@ func (q *Queue) Complete(orgID uuid.UUID, queuedAt time.Time, itemType ItemType,
 // IncrementRetry updates the retry count for a failed item and requeues it at the back of the queue.
 func (q *Queue) IncrementRetry(item QueueItem) error {
 	newQueuedAt := time.Now()
-	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.StorageClass, item.RetryCount+1, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.RequiresLibraryDeletedCheck)
+	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.BlockRepresentationID, item.StorageClass, item.RetryCount+1, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.RequiresLibraryDeletedCheck)
 }
 
 // GetQueueSize returns the approximate number of items in the queue for an org.
