@@ -7,9 +7,7 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
-	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
-	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -269,64 +267,7 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 		}
 	}
 
-	// Resolve + validate the representation while the libraries row still exists —
-	// this path deletes it below, after which GC can no longer recover the SHA-1
-	// mapping domain. Hard-delete must fail CLOSED: if we cannot resolve a
-	// canonical representation now, GC would inherit an empty marker and strand the
-	// library forever, so refuse before touching any state (this runs before
-	// cleanupLibraryLinks so a refusal leaves the library fully intact).
-	blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), orgID, repoID)
-	if repErr != nil {
-		metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("permanent_delete").Inc()
-		log.Printf("[PermanentDeleteRepo] refusing to hard-delete %s/%s: block representation unresolved: %v", orgID, repoID, repErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare library for permanent deletion"})
-		return
-	}
-
-	// Clean up share/upload links before hard delete so derived tables do not
-	// outlive the library row on partial failures.
-	if err := cleanupLibraryLinks(h.db, orgID, repoID); err != nil {
-		log.Printf("[PermanentDeleteRepo] Failed to clean share links for %s: %v", repoID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean share links"})
-		return
-	}
-
-	// Hard delete the library records
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, orgID, repoID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
-		return
-	}
-	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, repoID)
-	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID)
-
-	// Preserve the org lookup for the Garbage Collector
-	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`, repoID, orgID, time.Now(), storageClass, blockRepresentationID)
-
-	if err := batch.Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
-		return
-	}
-
-	// Enqueue all library contents for GC after the delete marker is persisted.
-	if h.libHandler != nil && h.libHandler.gcEnqueuer != nil {
-		go h.libHandler.gcEnqueuer.EnqueueLibraryDeletion(orgID, repoID, storageClass)
-	}
-
-	// Clean up the lib-scope storage counter row. Aggregate scopes (org, user,
-	// platform) were already adjusted when the library was soft-deleted.
-	if err := traffic.DeleteLibraryStorageCounter(h.db, orgID, repoID); err != nil {
-		log.Printf("failed to delete storage counter for permanently deleted library %s/%s: %v", orgID, repoID, err)
-	}
-
-	// Tag cleanup is secondary metadata and can remain asynchronous.
-	go func(libraryID string) {
-		if err := CleanupAllLibraryTags(h.db, libraryID); err != nil {
-			log.Printf("failed to clean tag metadata for permanently deleted library %s: %v", libraryID, err)
-		}
-	}(repoID)
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	h.permanentDeleteResolvedRepo(c, orgID, repoID, storageClass)
 }
 
 // cleanupLibraryLinks removes all share/upload links for a deleted library

@@ -179,7 +179,8 @@ rollout — no such legacy rows exist — and fail-closed is the intended postur
   (which reads the row even when `deleted_at` is already set, and validates the value
   is canonical for that library).
 - **Soft-delete** may proceed best-effort if resolution fails: the live row survives,
-  so GC Phase 13 can recover the representation later.
+  so GC Phase 13 can recover the representation later, or an operator can repair
+  the surviving row and retry if the row itself is persistently inconsistent.
 - **Hard-delete fails closed.** Resolution runs before any state change, so on a
   resolution failure **no state is modified**: a single hard-delete endpoint returns an
   error, and a bulk cleaner skips the offending library (keeping its live row for retry)

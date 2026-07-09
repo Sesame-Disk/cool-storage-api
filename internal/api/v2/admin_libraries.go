@@ -14,7 +14,6 @@ import (
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
-	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -1243,11 +1242,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 		}
 
 		// Collect all soft-deleted libraries for this org in one pass.
-		type trashedLib struct {
-			libID        string
-			storageClass string
-		}
-		var candidates []trashedLib
+		var candidates []trashLibraryCandidate
 
 		iter := h.db.Session().Query(`
 			SELECT library_id, storage_class, deleted_at FROM libraries WHERE org_id = ?
@@ -1256,64 +1251,24 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 		var deletedAt time.Time
 		for iter.Scan(&libID, &storageClass, &deletedAt) {
 			if !deletedAt.IsZero() {
-				candidates = append(candidates, trashedLib{libID, storageClass})
+				candidates = append(candidates, trashLibraryCandidate{
+					OrgID:        orgID,
+					LibraryID:    libID,
+					StorageClass: storageClass,
+				})
 			}
 		}
 		iter.Close()
 
-		for _, lib := range candidates {
-			// Resolve + validate the representation FIRST. It must precede the GC
-			// enqueue and the row delete: if it fails we skip this library entirely
-			// (no enqueue, no delete), keeping its live row so it can be retried
-			// rather than enqueuing its contents for deletion while stranding the
-			// library with an unresolvable marker.
-			blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), orgID, lib.libID)
-			if repErr != nil {
-				metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("admin_clean_trash").Inc()
-				log.Printf("[AdminCleanTrashLibraries] skipping hard-delete of %s/%s: block representation unresolved: %v", orgID, lib.libID, repErr)
-				failed++
-				continue
-			}
-
-			// Hard-delete library rows (same batch approach as PermanentDeleteRepo).
-			// The GC enqueue and tag cleanup are irreversible, so they must run only
-			// AFTER a successful batch.Exec — otherwise a failed batch would leave the
-			// library alive in trash while its content/tags are already being deleted.
-			// The stamped marker lets the enqueuer resolve the representation from
-			// deleted_libraries even though the live row is now gone.
-			batch := h.db.Session().Batch(gocql.LoggedBatch)
-			if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, orgID, lib.libID); err != nil {
-				log.Printf("[AdminCleanTrashLibraries] failed to stage read model delete for library %s (org %s): %v", lib.libID, orgID, err)
-				failed++
-				continue
-			}
-			batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, lib.libID)
-			batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, lib.libID)
-
-			// Preserve the org lookup for the Garbage Collector
-			batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`, lib.libID, orgID, time.Now(), lib.storageClass, blockRepresentationID)
-
-			if err := batch.Exec(); err != nil {
-				log.Printf("[AdminCleanTrashLibraries] failed to delete library %s (org %s): %v", lib.libID, orgID, err)
-				failed++
-				continue
-			}
-
-			// Post-commit, irreversible side effects.
-			if libEnqueuer != nil {
-				go libEnqueuer.EnqueueLibraryDeletion(orgID, lib.libID, lib.storageClass)
-			}
-			go func(libraryID string) {
-				if err := CleanupAllLibraryTags(h.db, libraryID); err != nil {
-					log.Printf("[AdminCleanTrashLibraries] failed to clean tag metadata for library %s: %v", libraryID, err)
-				}
-			}(lib.libID)
-
-			cleaned++
-		}
+		processedCleaned, processedFailed := h.processAdminTrashCandidates(candidates, libEnqueuer)
+		cleaned += processedCleaned
+		failed += processedFailed
 	}
 
-	// success=true means the operation completed; partial=true flags that some
-	// libraries were skipped (e.g. unresolvable representation) and were NOT deleted.
-	c.JSON(http.StatusOK, gin.H{"success": true, "partial": failed > 0, "cleaned": cleaned, "skipped": failed})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"partial": failed > 0,
+		"cleaned": cleaned,
+		"skipped": failed,
+	})
 }
