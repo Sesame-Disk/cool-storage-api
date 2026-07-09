@@ -1532,6 +1532,17 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 	items := m.failedItems[orgID]
 	for i, item := range items {
 		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID {
+			// Mirror CassandraStore.RequeueFailedItem: this path writes straight
+			// into the queue, so re-assert the block-representation invariant that
+			// EnqueueBatch would otherwise enforce.
+			if verr := validateQueueItemBlockRepresentation(QueueItem{
+				ItemType:              item.ItemType,
+				ItemID:                item.ItemID,
+				LibraryID:             item.LibraryID,
+				BlockRepresentationID: item.BlockRepresentationID,
+			}); verr != nil {
+				return fmt.Errorf("refusing to requeue failed item %s/%s: %w", orgID, itemID, verr)
+			}
 			m.queue[orgID] = append(m.queue[orgID], QueueItem{
 				OrgID:                       orgID,
 				QueuedAt:                    item.QueuedAt,

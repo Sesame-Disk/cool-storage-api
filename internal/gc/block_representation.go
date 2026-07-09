@@ -42,6 +42,19 @@ func queueItemRepresentationLibraryID(item QueueItem) (uuid.UUID, error) {
 	}
 }
 
+// countLibraryRepresentationDrift emits the drift metric that matches a
+// representation which just failed validateQueueItemBlockRepresentation: a blank
+// value is "missing", anything else is "invalid" (non-canonical or wrong
+// library). Scanner phases call this when they skip a library so the classify
+// logic lives in one place instead of being copied at every skip site.
+func countLibraryRepresentationDrift(blockRepresentationID string) {
+	if strings.TrimSpace(blockRepresentationID) == "" {
+		metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+	} else {
+		metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
+	}
+}
+
 func validateQueueItemBlockRepresentation(item QueueItem) error {
 	if !itemTypeRequiresBlockRepresentation(item.ItemType) {
 		return nil

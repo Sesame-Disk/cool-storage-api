@@ -136,6 +136,18 @@ work. The `plain:v1`/`library:<uuid>` dual-probe in `ResolveBlockIDs` remains on
 as conservative protection for legacy queue rows written before persistence
 existed, not as an expected path.
 
+Note one deliberate asymmetry in that legacy protection. The dual-probe only
+covers the *leaf read* path (`ResolveBlockIDs` when removing an fs_object's block
+references). A directory fs_object that re-enqueues its child fs_objects, and a
+commit that enqueues its root fs_object, both route the child through
+`EnqueueBatch`, which fail-closes on a blank/non-canonical representation. So a
+legacy queue row for a *directory* commit/fs_object (written before persistence
+existed) cannot make progress and will land in the DLQ, whereas a legacy *leaf*
+row still resolves via the dual-probe. This is acceptable under the clean-cut
+rollout — no such legacy rows exist — and fail-closed is the intended posture
+(the alternative would be guessing a representation for the children). Backfilling
+`block_representation_id` on any surviving queue rows removes the asymmetry.
+
 ## Operational rules
 
 - Resolve external SHA-1 block IDs only within the target library's effective

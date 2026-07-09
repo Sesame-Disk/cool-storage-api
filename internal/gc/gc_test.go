@@ -990,7 +990,10 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 	failedAt := time.Now().UTC().Truncate(time.Millisecond)
 	originalQueuedAt := failedAt.Add(-time.Minute)
 	itemID := uuid.New().String()
-	blockRepresentationID := db.EncryptedLibraryBlockRepresentationID(uuid.NewString())
+	// A library_cascade's representation must name its own library (EnqueueBatch
+	// enforces this at enqueue, and RequeueFailedItem re-asserts it), so derive it
+	// from itemID rather than an unrelated random UUID.
+	blockRepresentationID := db.EncryptedLibraryBlockRepresentationID(itemID)
 
 	store.failedItems[orgID] = []GCFailedItemInfo{{
 		OrgID:                 orgID,
@@ -1027,6 +1030,60 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 	}
 	if items[0].BlockRepresentationID != blockRepresentationID {
 		t.Fatalf("requeued cascade item BlockRepresentationID = %q, want %q", items[0].BlockRepresentationID, blockRepresentationID)
+	}
+}
+
+// TestService_RequeueFailedItem_RejectsNonCanonicalRepresentation pins the
+// fail-closed guard on the manual DLQ requeue path: because RequeueFailedItem
+// writes straight into gc_queue (bypassing EnqueueBatch), a representation-
+// required item whose stored representation is blank or non-canonical must be
+// refused rather than re-queued into a doomed, retry-forever state.
+func TestService_RequeueFailedItem_RejectsNonCanonicalRepresentation(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		representation string
+	}{
+		{name: "blank", representation: ""},
+		{name: "non_canonical", representation: "library:not-a-uuid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMockStore()
+			orgID := uuid.New()
+			libraryID := uuid.New()
+			failedAt := time.Now().UTC().Truncate(time.Millisecond)
+			itemID := uuid.New().String()
+
+			store.failedItems[orgID] = []GCFailedItemInfo{{
+				OrgID:                 orgID,
+				FailedAt:              failedAt,
+				QueuedAt:              failedAt.Add(-time.Minute),
+				IdentityAt:            failedAt.Add(-time.Minute),
+				ItemType:              ItemFSObject,
+				ItemID:                itemID,
+				LibraryID:             libraryID,
+				BlockRepresentationID: tc.representation,
+				StorageClass:          "hot",
+				RetryCount:            5,
+			}}
+
+			svc := &Service{
+				store:  store,
+				config: config.GCConfig{Enabled: true},
+				lease:  &fakeLeaderLease{allowed: true},
+			}
+
+			if err := svc.RequeueFailedItem(orgID, failedAt, ItemFSObject, itemID); err == nil {
+				t.Fatalf("expected RequeueFailedItem to reject representation %q, got nil", tc.representation)
+			}
+			if items := store.QueueItems(orgID); len(items) != 0 {
+				t.Fatalf("expected no queued work after rejected requeue, got %#v", items)
+			}
+			// The DLQ row must survive a rejected requeue so an operator can fix
+			// the drift and retry, rather than losing the item.
+			if got := len(store.failedItems[orgID]); got != 1 {
+				t.Fatalf("expected failed item to remain in DLQ after rejected requeue, got %d", got)
+			}
+		})
 	}
 }
 

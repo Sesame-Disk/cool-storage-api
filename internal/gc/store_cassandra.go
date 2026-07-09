@@ -874,6 +874,19 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 	if err != nil {
 		return fmt.Errorf("load failed item for requeue %s/%s: %w", orgID, itemID, err)
 	}
+	// RequeueFailedItem writes straight into gc_queue (it does not go through
+	// EnqueueBatch), so re-assert the block-representation invariant here too. A
+	// representation-required item whose stored representation is blank or
+	// non-canonical would be re-processed and fail forever, so refuse the manual
+	// DLQ requeue with a clear error instead of silently re-queuing a doomed row.
+	if verr := validateQueueItemBlockRepresentation(QueueItem{
+		ItemType:              itemType,
+		ItemID:                itemID,
+		LibraryID:             parseUUID(libraryIDStr),
+		BlockRepresentationID: blockRepresentationID,
+	}); verr != nil {
+		return fmt.Errorf("refusing to requeue failed item %s/%s: %w", orgID, itemID, verr)
+	}
 	requeueAt := failedQueuedAt
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`

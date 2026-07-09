@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -685,11 +684,7 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 			LibraryID:             lib.LibraryID,
 			BlockRepresentationID: lib.BlockRepresentationID,
 		}); err != nil {
-			if strings.TrimSpace(lib.BlockRepresentationID) == "" {
-				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
-			} else {
-				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
-			}
+			countLibraryRepresentationDrift(lib.BlockRepresentationID)
 			log.Printf("[GC Scanner] Phase 5: skipping library %s: %v", lib.LibraryID, err)
 			continue
 		}
@@ -789,11 +784,7 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 			LibraryID:             lib.LibraryID,
 			BlockRepresentationID: lib.BlockRepresentationID,
 		}); err != nil {
-			if strings.TrimSpace(lib.BlockRepresentationID) == "" {
-				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
-			} else {
-				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
-			}
+			countLibraryRepresentationDrift(lib.BlockRepresentationID)
 			log.Printf("[GC Scanner] Phase 6: skipping library %s: %v", lib.LibraryID, err)
 			continue
 		}
@@ -1195,11 +1186,7 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 			ItemID:                lib.LibraryID.String(),
 			BlockRepresentationID: lib.BlockRepresentationID,
 		}); err != nil {
-			if strings.TrimSpace(lib.BlockRepresentationID) == "" {
-				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
-			} else {
-				metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
-			}
+			countLibraryRepresentationDrift(lib.BlockRepresentationID)
 			log.Printf("[GC Scanner] Phase 13: skipping deleted library %s: %v", lib.LibraryID, err)
 			continue
 		}
