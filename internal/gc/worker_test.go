@@ -458,9 +458,7 @@ func TestWorker_ProcessFSObject_DryRunLeavesQueueAndRefsUntouched(t *testing.T) 
 	store.AddBlock(orgID, "blk-live", "hot", 2)
 	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-child"})
 	store.AddFSObject(libID, "fs-child", "file", []string{"blk-live"})
-	if err := store.EnqueueItem(orgID, queuedAt, ItemFSObject, "fs-root", libID, "", 0); err != nil {
-		t.Fatalf("failed to seed fs_object queue item: %v", err)
-	}
+	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "fs-root", libID, "", 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -580,9 +578,7 @@ func TestWorker_ProcessCommit_SkipsAlreadyPendingRootFSObject(t *testing.T) {
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 
 	store.AddCommit(libID, "commit-abc", "fs-root")
-	if err := store.EnqueueItem(orgID, queuedAt, ItemFSObject, "fs-root", libID, "", 0); err != nil {
-		t.Fatalf("seed root fs_object failed: %v", err)
-	}
+	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "fs-root", libID, "", 0)
 
 	items, err := store.DequeueBatch(orgID, 1, time.Now())
 	if err != nil || len(items) != 1 {
@@ -623,9 +619,7 @@ func TestWorker_ProcessCommit_DoesNotCrossSuppressRootFSObjectAcrossLibraries(t 
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 
 	store.AddCommit(libTarget, "commit-abc", "shared-root")
-	if err := store.EnqueueItem(orgID, queuedAt, ItemFSObject, "shared-root", libPending, "", 0); err != nil {
-		t.Fatalf("seed cross-library root fs_object failed: %v", err)
-	}
+	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "shared-root", libPending, "", 0)
 
 	if err := w.processCommit(QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemCommit, ItemID: "commit-abc", LibraryID: libTarget, BlockRepresentationID: db.PlainBlockRepresentationID}); err != nil {
 		t.Fatalf("processCommit failed: %v", err)
@@ -652,7 +646,7 @@ func TestWorker_ProcessCommit_AlreadyDeleted(t *testing.T) {
 	libID := uuid.New()
 
 	// Don't add the commit — simulate already deleted
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemCommit, "commit-gone", libID, "", 0)
+	store.SeedQueueItemForTest(orgID, time.Now().Add(-2*time.Hour), ItemCommit, "commit-gone", libID, "", 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -690,7 +684,7 @@ func TestWorker_ProcessFSObject_CascadeBlocks(t *testing.T) {
 	store.AddLibrary(orgID, libID, "hot")
 
 	// Enqueue the fs_object
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemFSObject, "fs-obj-1", libID, "", 0)
+	store.SeedQueueItemForTest(orgID, time.Now().Add(-2*time.Hour), ItemFSObject, "fs-obj-1", libID, "", 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -845,9 +839,7 @@ func TestWorker_ProcessFSObject_SkipsAlreadyPendingChild(t *testing.T) {
 
 	store.AddFSObjectWithEntries(libID, "fs-dir", "dir", nil, []string{"fs-child1", "fs-child2"})
 	store.AddLibrary(orgID, libID, "hot")
-	if err := store.EnqueueItem(orgID, queuedAt, ItemFSObject, "fs-child1", libID, "", 0); err != nil {
-		t.Fatalf("seed child fs_object failed: %v", err)
-	}
+	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "fs-child1", libID, "", 0)
 
 	items, err := store.DequeueBatch(orgID, 1, time.Now())
 	if err != nil || len(items) != 1 {
@@ -893,9 +885,7 @@ func TestWorker_ProcessFSObject_DoesNotCrossSuppressChildAcrossLibraries(t *test
 
 	store.AddFSObjectWithEntries(libTarget, "fs-dir", "dir", nil, []string{"shared-child"})
 	store.AddLibrary(orgID, libTarget, "hot")
-	if err := store.EnqueueItem(orgID, queuedAt, ItemFSObject, "shared-child", libPending, "", 0); err != nil {
-		t.Fatalf("seed cross-library child fs_object failed: %v", err)
-	}
+	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "shared-child", libPending, "", 0)
 
 	err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libTarget, BlockRepresentationID: db.PlainBlockRepresentationID})
 	if err != nil {
@@ -1179,12 +1169,8 @@ func TestWorker_EnqueueLibraryContents_DoesNotCrossSuppressAcrossLibraries(t *te
 	store.AddFSObject(libPending, "shared-fs", "file", []string{"blk-pending"})
 	store.AddCommit(libTarget, "shared-commit", "fs-target")
 	store.AddFSObject(libTarget, "shared-fs", "file", []string{"blk-target"})
-	if err := store.EnqueueItem(orgID, identityAt, ItemCommit, "shared-commit", libPending, "", 0); err != nil {
-		t.Fatalf("seed pending commit failed: %v", err)
-	}
-	if err := store.EnqueueItem(orgID, identityAt, ItemFSObject, "shared-fs", libPending, "", 0); err != nil {
-		t.Fatalf("seed pending fs_object failed: %v", err)
-	}
+	store.SeedQueueItemForTest(orgID, identityAt, ItemCommit, "shared-commit", libPending, "", 0)
+	store.SeedQueueItemForTest(orgID, identityAt, ItemFSObject, "shared-fs", libPending, "", 0)
 
 	err := w.enqueueLibraryContentsAt(orgID, libTarget, "", "hot", identityAt, false)
 	if err != nil {
@@ -1486,7 +1472,7 @@ func TestWorker_ProcessLibraryCascade_DryRun(t *testing.T) {
 	store.AddOrganization(orgID)
 	store.AddLibrary(orgID, libID, "hot")
 
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
+	store.SeedQueueItemForTest(orgID, time.Now().Add(-2*time.Hour), ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -1565,7 +1551,7 @@ func TestWorker_ProcessLibraryCascade_InvalidUUID(t *testing.T) {
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
 
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemLibraryCascade, "not-a-uuid", uuid.Nil, "", 0)
+	store.SeedQueueItemForTest(orgID, time.Now().Add(-2*time.Hour), ItemLibraryCascade, "not-a-uuid", uuid.Nil, "", 0)
 
 	ctx := context.Background()
 	n, _ := w.ProcessOnce(ctx)
@@ -1685,7 +1671,7 @@ func TestWorker_ProcessLibraryCascade_FullCascade(t *testing.T) {
 	store.AddCommit(libID, "commit-1", "fs-root")
 	store.AddFSObject(libID, "fs-root", "dir", nil)
 
-	store.EnqueueItem(orgID, deletedAt, ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
+	store.SeedQueueItemForTest(orgID, deletedAt, ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -2331,7 +2317,7 @@ func TestWorker_ProcessLibraryCascade_SkipsRestoredLibrary(t *testing.T) {
 
 	store.AddOrganization(orgID)
 	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
-	store.EnqueueItem(orgID, deletedAt, ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
+	store.SeedQueueItemForTest(orgID, deletedAt, ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
 
 	delete(store.deletedLibraries, libID)
 

@@ -277,6 +277,14 @@ func (s *CassandraStore) scanOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error) 
 // --- Queue operations ---
 
 func (s *CassandraStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error {
+	// EnqueueItem is the raw single-row path and cannot carry a block
+	// representation, so it must never accept a type that requires one. Enforce
+	// the invariant here (not just in Queue.Enqueue/EnqueueCascade) so writing
+	// straight to the store can't smuggle an incomplete commit/fs_object/
+	// library_cascade row past the representation contract.
+	if itemTypeRequiresBlockRepresentation(itemType) {
+		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
+	}
 	now := time.Now().UTC()
 	queueBucket := gcQueueBucket(orgID, itemType, itemID)
 	batch := s.db.Session().Batch(gocql.LoggedBatch)

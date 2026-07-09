@@ -1150,6 +1150,27 @@ func (m *MockStore) GetShareLink(shareToken string) *mockShareLink {
 // --- GCStore interface implementation ---
 
 func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error {
+	// Mirror CassandraStore.EnqueueItem: the raw single-row path carries no block
+	// representation, so it must reject the types that require one.
+	if itemTypeRequiresBlockRepresentation(itemType) {
+		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
+	}
+	m.seedQueueItemRow(orgID, queuedAt, itemType, itemID, libraryID, "", storageClass, retryCount)
+	return nil
+}
+
+// SeedQueueItemForTest injects a raw gc_queue row for test setup, deliberately
+// bypassing the block-representation enqueue contract that EnqueueItem and
+// EnqueueBatch enforce. Production code must never use this: it exists only so
+// unit tests can stage commit/fs_object/library_cascade queue rows (which the
+// guarded enqueue paths now reject) without building full library +
+// representation fixtures. blockRepresentationID may be empty to reproduce a
+// legacy/incomplete row.
+func (m *MockStore) SeedQueueItemForTest(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) {
+	m.seedQueueItemRow(orgID, queuedAt, itemType, itemID, libraryID, "", storageClass, retryCount)
+}
+
+func (m *MockStore) seedQueueItemRow(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, retryCount int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	item := QueueItem{
@@ -1160,7 +1181,7 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 		ItemType:                    itemType,
 		ItemID:                      itemID,
 		LibraryID:                   libraryID,
-		BlockRepresentationID:       "",
+		BlockRepresentationID:       blockRepresentationID,
 		StorageClass:                storageClass,
 		RetryCount:                  retryCount,
 	}
@@ -1168,7 +1189,6 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 	m.upsertPendingItem(orgID, libraryID, itemType, itemID, queuedAt, nil)
 	m.activeQueueOrgs[orgID] = time.Now().UTC()
 	m.dirtyQueueOrgs[orgID] = time.Now().UTC()
-	return nil
 }
 
 func (m *MockStore) EnqueueBatch(items []QueueItem) error {

@@ -115,8 +115,11 @@ its `block_representation_id` is present, is *canonical* (`plain:v1` or
 `library:<uuid>`), and — for the encrypted form — names the item's own library.
 The check runs in `Queue.EnqueueBatch`, `CassandraStore.EnqueueBatch`, and
 `MockStore.EnqueueBatch`, so it cannot be bypassed by writing to the store
-directly. `Enqueue`/`EnqueueCascade` reject those item types outright and steer
-callers to `EnqueueBatch`.
+directly. The raw single-row path (`Queue.Enqueue`/`EnqueueCascade` and the
+underlying `CassandraStore.EnqueueItem`/`MockStore.EnqueueItem`) cannot carry a
+representation, so it rejects those three item types outright and steers callers
+to `EnqueueBatch` — the guard lives on the store methods too, not just the queue
+wrappers, so it holds even for a direct store caller.
 
 `library_cascade` takes its representation from the cascade item itself (captured
 from `deleted_libraries.block_representation_id` before the hard-delete), so a

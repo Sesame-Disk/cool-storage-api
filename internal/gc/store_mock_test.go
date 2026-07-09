@@ -94,6 +94,32 @@ func TestMockStore_EnqueueBatchRejectsForeignRepresentation(t *testing.T) {
 	}
 }
 
+// TestMockStore_EnqueueItemRejectsRepresentationRequiredTypes verifies the raw
+// single-row EnqueueItem path — which cannot carry a block representation — fails
+// closed for the item types that require one, so a caller cannot bypass the
+// EnqueueBatch invariant by writing straight to the store. Non-representation
+// types (e.g. ItemBlock) still enqueue normally.
+func TestMockStore_EnqueueItemRejectsRepresentationRequiredTypes(t *testing.T) {
+	orgID := uuid.New()
+	libID := uuid.New()
+
+	for _, itemType := range []ItemType{ItemCommit, ItemFSObject, ItemLibraryCascade} {
+		t.Run(string(itemType), func(t *testing.T) {
+			store := NewMockStore()
+			if err := store.EnqueueItem(orgID, time.Now().UTC(), itemType, "item-1", libID, "hot", 0); err == nil {
+				t.Fatalf("EnqueueItem(%s) = nil, want rejection", itemType)
+			}
+		})
+	}
+
+	t.Run("ItemBlock still allowed", func(t *testing.T) {
+		store := NewMockStore()
+		if err := store.EnqueueItem(orgID, time.Now().UTC(), ItemBlock, "block-1", libID, "hot", 0); err != nil {
+			t.Fatalf("EnqueueItem(ItemBlock) = %v, want nil", err)
+		}
+	})
+}
+
 // TestMockStore_ResolveBlockIDs_NoLiveLibraryUsesDualProbeFallback verifies that
 // when the queue item carries no representation and the library has no live or
 // soft-deleted row at all, ResolveBlockIDs falls back to probing both the

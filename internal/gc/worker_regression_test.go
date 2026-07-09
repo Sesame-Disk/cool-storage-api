@@ -260,9 +260,7 @@ func TestWorker_IncrementRetryAmbiguousCascadeError_DoesNotFalseDLQ(t *testing.T
 	store.deleteRestoreJobsByLibraryErr = errors.New("restore jobs unavailable")
 	store.requeueItemErrAfterMutate = errors.New("simulated cassandra write timeout — batch may have applied")
 
-	if err := store.EnqueueItem(orgID, deletedAt, ItemLibraryCascade, libraryID.String(), uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
+	store.SeedQueueItemForTest(orgID, deletedAt, ItemLibraryCascade, libraryID.String(), uuid.Nil, "hot", 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce: %v", err)
