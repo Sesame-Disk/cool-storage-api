@@ -1,7 +1,7 @@
 # Block Representation-Aware Mappings
 
-**Date:** 2026-07-07  
-**Status:** PR1 implemented on branch `feat/representation-aware-mappings-pr1`
+**Date:** 2026-07-08  
+**Status:** PR1 (representation-aware mappings) and PR2 (GC representation durability) implemented
 
 ## Problem
 
@@ -87,6 +87,52 @@ org-wide mapping table. This branch assumes a clean-cut rollout before productio
 uploads. Separate follow-up work can still backfill `block_representation_id` and
 any missing `blocks.representation_id` deterministically on imported/legacy rows.
 
+## GC representation durability (PR2)
+
+PR1 keyed GC mapping cleanup by `representation_id`, but the GC *queue* did not
+carry that representation. fs_object/commit GC can run long after a library is
+soft-deleted or fully hard-deleted, at which point re-resolving the SHA-1 domain
+from live library state is no longer reliable. PR2 makes the representation
+survive the whole durable GC lifecycle.
+
+Migration `010_gc_queue_block_representation_id.cql` adds
+`block_representation_id` to:
+
+- `gc_queue`
+- `gc_failed_items`
+- `deleted_libraries`
+
+The representation is stamped at enqueue time — while the library row is still
+live — and then carried, never re-derived, through every durable hop: initial
+enqueue, `EnqueueBatch`, dequeue, retry/requeue, postpone, DLQ (`FailItem`) and
+manual DLQ requeue, org cascade, library cascade, commit → root `fs_object`, and
+directory → child `fs_objects`.
+
+`EnqueueBatch` is the single enqueue choke point and enforces the invariant for
+the item types that carry a block reference — `commit`, `fs_object`, and
+`library_cascade`. Such an item is rejected (fail-closed, never enqueued) unless
+its `block_representation_id` is present, is *canonical* (`plain:v1` or
+`library:<uuid>`), and — for the encrypted form — names the item's own library.
+The check runs in `Queue.EnqueueBatch`, `CassandraStore.EnqueueBatch`, and
+`MockStore.EnqueueBatch`, so it cannot be bypassed by writing to the store
+directly. `Enqueue`/`EnqueueCascade` reject those item types outright and steer
+callers to `EnqueueBatch`.
+
+`library_cascade` takes its representation from the cascade item itself (captured
+from `deleted_libraries.block_representation_id` before the hard-delete), so a
+cascade that runs after the live `libraries` row is gone still cleans the correct
+domain. `GetLibraryBlockRepresentationID` now resolves from the live `libraries`
+row first and falls back to `deleted_libraries`; an absent/empty stored value
+fails closed with `ErrNotFound` so the resolver never guesses.
+
+Under the accepted clean deployment, an empty or non-canonical representation on
+a `commit`/`fs_object`/`library_cascade` is treated as drift: scanners skip and
+report the offending library (`gc_library_representation_missing` /
+`gc_library_representation_invalid` metrics) rather than enqueuing incomplete
+work. The `plain:v1`/`library:<uuid>` dual-probe in `ResolveBlockIDs` remains only
+as conservative protection for legacy queue rows written before persistence
+existed, not as an expected path.
+
 ## Operational rules
 
 - Resolve external SHA-1 block IDs only within the target library's effective
@@ -95,6 +141,8 @@ any missing `blocks.representation_id` deterministically on imported/legacy rows
   GC; do not infer it from the current destination library at delete time.
 - Do not delete forward mappings from GC without an explicit `representation_id`;
   exact cleanup must come from canonical block metadata, not a guessed default.
+- Stamp `block_representation_id` on GC queue work at enqueue time; never
+  re-resolve it from live library state during durable processing.
 - Add future schema changes as new migrations; do not rewrite migration `001`.
 
 ## Follow-up work
