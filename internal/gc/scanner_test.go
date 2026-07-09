@@ -1356,22 +1356,104 @@ func TestScanner_ScanAutoDeleteExpiredObjects_DefaultsMissingPlaintextRepresenta
 	store.mu.Lock()
 	store.libraries[libID].BlockRepresentationID = ""
 	store.mu.Unlock()
-	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now().Add(-48*time.Hour))
-	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-a"})
+	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
+	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
+	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
 
 	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
 
 	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
-	if err != nil {
-		t.Fatalf("scanAutoDeleteExpiredObjects error = %v", err)
+	if err != nil || n != 1 {
+		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (1, nil)", n, err)
 	}
-	for _, item := range store.QueueItems(orgID) {
-		if item.BlockRepresentationID != db.PlainBlockRepresentationID {
-			t.Fatalf("queued item %s representation = %q, want %q", item.ItemID, item.BlockRepresentationID, db.PlainBlockRepresentationID)
-		}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued orphan fs_object for defaulted plaintext library, got %#v", items)
+	}
+	if items[0].ItemID != "fs-orphan" || items[0].BlockRepresentationID != db.PlainBlockRepresentationID {
+		t.Fatalf("queued item = %s/%q, want fs-orphan/%q", items[0].ItemID, items[0].BlockRepresentationID, db.PlainBlockRepresentationID)
 	}
 	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
-		t.Fatalf("drift metric = %v, want %v (n=%d)", afterDrift, beforeDrift+1, n)
+		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
+	}
+}
+
+// TestScanner_ScanExpiredVersions_DefaultsMissingEncryptedRepresentation pins the
+// encrypted half of the policy: an encrypted library with an empty stored
+// block_representation_id derives library:<id> (not plain:v1), processes, and
+// reports drift.
+func TestScanner_ScanExpiredVersions_DefaultsMissingEncryptedRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithTTL(orgID, libID, "hot", "commit-head", 1)
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = ""
+	store.mu.Unlock()
+	store.SetLibraryEncrypted(libID, true)
+	store.AddCommitWithDetails(libID, "commit-head", "fs-1", "", time.Now())
+	store.AddCommitWithDetails(libID, "commit-expired", "fs-2", "", time.Now().Add(-48*time.Hour))
+
+	wantRep := db.EncryptedLibraryBlockRepresentationID(libID.String())
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
+
+	n, err := s.scanExpiredVersions(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("scanExpiredVersions = (%d, %v), want (1, nil)", n, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued commit, got %#v", items)
+	}
+	if items[0].BlockRepresentationID != wantRep {
+		t.Fatalf("queued item representation = %q, want %q", items[0].BlockRepresentationID, wantRep)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
+		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
+	}
+}
+
+func TestScanner_ScanAutoDeleteExpiredObjects_DefaultsMissingEncryptedRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = ""
+	store.mu.Unlock()
+	store.SetLibraryEncrypted(libID, true)
+	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
+	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
+	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
+
+	wantRep := db.EncryptedLibraryBlockRepresentationID(libID.String())
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
+
+	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (1, nil)", n, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued orphan fs_object, got %#v", items)
+	}
+	if items[0].ItemID != "fs-orphan" || items[0].BlockRepresentationID != wantRep {
+		t.Fatalf("queued item = %s/%q, want fs-orphan/%q", items[0].ItemID, items[0].BlockRepresentationID, wantRep)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
+		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
 	}
 }
 

@@ -279,6 +279,10 @@ type mockLibrary struct {
 	LibraryID             uuid.UUID
 	OwnerID               uuid.UUID
 	BlockRepresentationID string
+	// Encrypted mirrors libraries.encrypted so the mock can resolve an empty
+	// stored block_representation_id the same way CassandraStore does — plaintext
+	// derives plain:v1, encrypted derives library:<id>.
+	Encrypted             bool
 	StorageClass          string
 	HeadCommitID          string
 	VersionTTLDays        int
@@ -812,6 +816,17 @@ func (m *MockStore) AddLibraryWithAutoDelete(orgID, libraryID uuid.UUID, storage
 		StorageClass:          storageClass,
 		HeadCommitID:          headCommitID,
 		AutoDeleteDays:        autoDeleteDays,
+	}
+}
+
+// SetLibraryEncrypted flips a mock library's encrypted flag and clears any
+// pre-seeded block_representation_id so tests can exercise the "encrypted +
+// empty stored representation → library:<id>" derivation path.
+func (m *MockStore) SetLibraryEncrypted(libraryID uuid.UUID, encrypted bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if lib := m.libraries[libraryID]; lib != nil {
+		lib.Encrypted = encrypted
 	}
 }
 
@@ -2374,7 +2389,7 @@ func (m *MockStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error) {
 				OrgID:                   lib.OrgID,
 				LibraryID:               lib.LibraryID,
 				HeadCommitID:            lib.HeadCommitID,
-				BlockRepresentationID:   db.EffectiveBlockRepresentationID(lib.LibraryID.String(), false, stored),
+				BlockRepresentationID:   db.EffectiveBlockRepresentationID(lib.LibraryID.String(), lib.Encrypted, stored),
 				RepresentationDefaulted: stored == "",
 				VersionTTLDays:          lib.VersionTTLDays,
 			})
@@ -2395,7 +2410,7 @@ func (m *MockStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo, erro
 				OrgID:                   lib.OrgID,
 				LibraryID:               lib.LibraryID,
 				HeadCommitID:            lib.HeadCommitID,
-				BlockRepresentationID:   db.EffectiveBlockRepresentationID(lib.LibraryID.String(), false, stored),
+				BlockRepresentationID:   db.EffectiveBlockRepresentationID(lib.LibraryID.String(), lib.Encrypted, stored),
 				RepresentationDefaulted: stored == "",
 				AutoDeleteDays:          lib.AutoDeleteDays,
 			})
