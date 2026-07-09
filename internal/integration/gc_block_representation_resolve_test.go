@@ -164,7 +164,8 @@ func TestGC_ResolveBlockIDs_AmbiguousDualProbe_RealCassandra(t *testing.T) {
 }
 
 // TestGC_DeletedLibraryRepresentation_CascadeLifecycle_RealCassandra pins the
-// clean-deploy durability path end-to-end against real Cassandra:
+// deleted-library scanner-to-cascade-to-child-queue durability path against
+// real Cassandra:
 //
 //  1. scanner sees an expired deleted_libraries row whose
 //     block_representation_id was persisted at soft-delete time;
@@ -197,6 +198,7 @@ func TestGC_DeletedLibraryRepresentation_CascadeLifecycle_RealCassandra(t *testi
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
 	t.Cleanup(func() {
+		_ = store.RemoveOrgFromActiveSet(orgID, time.Now().UTC().Add(time.Hour))
 		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?`,
 			orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemLibraryCascade, libraryID.String()), deletedAt, string(gcpkg.ItemLibraryCascade), libraryID.String()).Exec()
 		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?`,
@@ -259,8 +261,15 @@ func TestGC_DeletedLibraryRepresentation_CascadeLifecycle_RealCassandra(t *testi
 		t.Fatalf("seed fs_objects: %v", err)
 	}
 
-	if err := scanner.ScanOnce(context.Background()); err != nil {
-		t.Fatalf("ScanOnce: %v", err)
+	if n, err := scanner.ScanExpiredDeletedLibrariesOnce(context.Background()); err != nil {
+		t.Fatalf("ScanExpiredDeletedLibrariesOnce: %v", err)
+	} else if n != 1 {
+		t.Fatalf("ScanExpiredDeletedLibrariesOnce enqueued %d items, want 1", n)
+	}
+	// Keep background GC workers from stealing this org's queued cascade while
+	// the test inspects the hand-off and drives the worker explicitly below.
+	if err := store.RemoveOrgFromActiveSet(orgID, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatalf("RemoveOrgFromActiveSet(after scan): %v", err)
 	}
 
 	items, err := store.DequeueBatch(orgID, 10, time.Now().UTC().Add(time.Hour))
@@ -289,6 +298,14 @@ func TestGC_DeletedLibraryRepresentation_CascadeLifecycle_RealCassandra(t *testi
 		t.Fatalf("GetLibraryDeletedAt(after worker): %v", err)
 	} else if deletedMarker != nil {
 		t.Fatalf("expected deleted_libraries row to be hard-deleted, still found deleted_at=%v", *deletedMarker)
+	}
+	var liveLibraryID string
+	if err := session.Query(`SELECT library_id FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Scan(&liveLibraryID); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("libraries row still present or query failed after worker: library_id=%q err=%v", liveLibraryID, err)
+	}
+	var projectedLibraryID string
+	if err := session.Query(`SELECT library_id FROM libraries_by_id WHERE library_id = ?`, libraryID.String()).Scan(&projectedLibraryID); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("libraries_by_id row still present or query failed after worker: library_id=%q err=%v", projectedLibraryID, err)
 	}
 
 	children, err := store.DequeueBatch(orgID, 10, time.Now().UTC().Add(time.Hour))

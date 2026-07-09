@@ -51,6 +51,13 @@ func NewScanner(store GCStore, queue *Queue, stats *Stats, cfg config.GCConfig) 
 	}
 }
 
+// ScanExpiredDeletedLibrariesOnce runs only the deleted-library expiry phase.
+// Integration tests use this narrow entry point to avoid mutating unrelated
+// scanner cursors/global state via a full ScanOnce pass.
+func (s *Scanner) ScanExpiredDeletedLibrariesOnce(ctx context.Context) (int, error) {
+	return s.scanExpiredDeletedLibraries(ctx)
+}
+
 // SetOrphanRecoverer wires the S3 orphan recovery dependency. Optional; if
 // unset, the s3_orphan_recovery phase is a no-op (useful for mock-only tests).
 func (s *Scanner) SetOrphanRecoverer(r OrphanRecoverer) {
