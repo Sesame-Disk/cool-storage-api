@@ -128,12 +128,24 @@ domain. `GetLibraryBlockRepresentationID` now resolves from the live `libraries`
 row first and falls back to `deleted_libraries`; an absent/empty stored value
 fails closed with `ErrNotFound` so the resolver never guesses.
 
-Under the accepted clean deployment, an empty or non-canonical representation on
-a `commit`/`fs_object`/`library_cascade` is treated as drift: scanners skip and
-report the offending library (`gc_library_representation_missing` /
-`gc_library_representation_invalid` metrics) rather than enqueuing incomplete
-work. The `plain:v1`/`library:<uuid>` dual-probe in `ResolveBlockIDs` remains only
-as conservative protection for legacy queue rows written before persistence
+The scanner phases that read the *live* `libraries` row (version-TTL and
+auto-delete, phases 5/6) resolve the representation through
+`EffectiveBlockRepresentationID`, so an **empty** stored value is not skipped: it
+is derived safely from the library's own identity — `plain:v1` for a plaintext
+library, `library:<id>` for an encrypted one. Both derivations are deterministic
+functions of `(library_id, encrypted)`, so this is a safe default, not a guess.
+An empty stored value still signals that a writer or migration did not stamp the
+column, so the scanner processes the library **and** reports it as drift
+(`gc_library_representation_defaulted`) instead of hiding it. Only a **non-canonical
+or library-mismatched** stored representation is treated as hard drift and skipped
+(`gc_library_representation_missing` for an unexpectedly blank value on a path that
+requires an explicit one, `gc_library_representation_invalid` otherwise).
+
+The deleted-library cascade path (phase 13) reads the raw
+`deleted_libraries.block_representation_id`, which was stamped (non-empty) at
+soft-delete time; a blank value there is genuine drift and is skipped, not
+defaulted. The `plain:v1`/`library:<uuid>` dual-probe in `ResolveBlockIDs` remains
+only as conservative protection for legacy queue rows written before persistence
 existed, not as an expected path.
 
 Note one deliberate asymmetry in that legacy protection. The dual-probe only

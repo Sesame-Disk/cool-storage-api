@@ -1304,7 +1304,12 @@ func TestScanner_ScanExpiredVersions_EnqueuesExpired(t *testing.T) {
 	}
 }
 
-func TestScanner_ScanExpiredVersions_SkipsLibraryMissingRepresentation(t *testing.T) {
+// TestScanner_ScanExpiredVersions_DefaultsMissingPlaintextRepresentation pins the
+// chosen policy: a plaintext library with an empty stored block_representation_id
+// is NOT skipped — the scanner derives the safe default (plain:v1), processes the
+// library, and reports the empty stored value as drift so a writer/migration that
+// failed to stamp it stays visible.
+func TestScanner_ScanExpiredVersions_DefaultsMissingPlaintextRepresentation(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -1320,16 +1325,25 @@ func TestScanner_ScanExpiredVersions_SkipsLibraryMissingRepresentation(t *testin
 	store.AddCommitWithDetails(libID, "commit-head", "fs-1", "", time.Now())
 	store.AddCommitWithDetails(libID, "commit-expired", "fs-2", "", time.Now().Add(-48*time.Hour))
 
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
+
 	n, err := s.scanExpiredVersions(context.Background())
-	if err != nil || n != 0 {
-		t.Fatalf("scanExpiredVersions = (%d, %v), want (0, nil)", n, err)
+	if err != nil || n != 1 {
+		t.Fatalf("scanExpiredVersions = (%d, %v), want (1, nil)", n, err)
 	}
-	if items := store.QueueItems(orgID); len(items) != 0 {
-		t.Fatalf("expected no queued work for representation-less library, got %#v", items)
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued commit for defaulted plaintext library, got %#v", items)
+	}
+	if items[0].BlockRepresentationID != db.PlainBlockRepresentationID {
+		t.Fatalf("queued item representation = %q, want %q", items[0].BlockRepresentationID, db.PlainBlockRepresentationID)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
+		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
 	}
 }
 
-func TestScanner_ScanAutoDeleteExpiredObjects_SkipsLibraryMissingRepresentation(t *testing.T) {
+func TestScanner_ScanAutoDeleteExpiredObjects_DefaultsMissingPlaintextRepresentation(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -1342,15 +1356,22 @@ func TestScanner_ScanAutoDeleteExpiredObjects_SkipsLibraryMissingRepresentation(
 	store.mu.Lock()
 	store.libraries[libID].BlockRepresentationID = ""
 	store.mu.Unlock()
-	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
+	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now().Add(-48*time.Hour))
 	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-a"})
 
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
+
 	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
-	if err != nil || n != 0 {
-		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (0, nil)", n, err)
+	if err != nil {
+		t.Fatalf("scanAutoDeleteExpiredObjects error = %v", err)
 	}
-	if items := store.QueueItems(orgID); len(items) != 0 {
-		t.Fatalf("expected no queued work for representation-less library, got %#v", items)
+	for _, item := range store.QueueItems(orgID) {
+		if item.BlockRepresentationID != db.PlainBlockRepresentationID {
+			t.Fatalf("queued item %s representation = %q, want %q", item.ItemID, item.BlockRepresentationID, db.PlainBlockRepresentationID)
+		}
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
+		t.Fatalf("drift metric = %v, want %v (n=%d)", afterDrift, beforeDrift+1, n)
 	}
 }
 

@@ -1078,7 +1078,7 @@ func TestService_RequeueFailedItem_RejectsNonCanonicalRepresentation(t *testing.
 			}
 			// The refusal must carry enough context for an operator to find the
 			// exact DLQ row (ids can collide across item types).
-			for _, want := range []string{string(ItemFSObject), itemID, failedAt.UTC().Format(time.RFC3339Nano)} {
+			for _, want := range []string{orgID.String(), string(ItemFSObject), itemID, failedAt.UTC().Format(time.RFC3339Nano)} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("refusal error %q missing context %q", err.Error(), want)
 				}

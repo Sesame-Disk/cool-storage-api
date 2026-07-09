@@ -55,6 +55,15 @@ func countLibraryRepresentationDrift(blockRepresentationID string) {
 	}
 }
 
+// countLibraryRepresentationDefaulted records that a scanned library had no
+// stored block_representation_id and was processed under the safe derived default
+// (plain:v1 / library:<id>). Deriving the representation from the library's own
+// identity is correct, but an empty stored value means a writer/migration did not
+// stamp it, so scanners surface it as drift instead of hiding it.
+func countLibraryRepresentationDefaulted() {
+	metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted").Inc()
+}
+
 func validateQueueItemBlockRepresentation(item QueueItem) error {
 	if !itemTypeRequiresBlockRepresentation(item.ItemType) {
 		return nil

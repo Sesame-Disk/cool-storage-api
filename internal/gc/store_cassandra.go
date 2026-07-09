@@ -857,6 +857,25 @@ func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, 
 	return true, nil
 }
 
+// parseStoredQueueLibraryID interprets a library_id string read back from
+// gc_failed_items / gc_queue. It returns the parsed UUID (uuid.Nil for a
+// library-less item such as an org/user cascade), the value to persist back into
+// gc_queue, and an error when a non-empty value is not a valid UUID. An empty
+// value is preserved as empty; a valid UUID — including the nil UUID cascades
+// legitimately carry — is re-emitted in canonical form so a stray non-canonical
+// spelling is normalized on the round-trip rather than propagated.
+func parseStoredQueueLibraryID(raw string) (uuid.UUID, string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return uuid.Nil, "", nil
+	}
+	parsed, err := uuid.Parse(trimmed)
+	if err != nil {
+		return uuid.Nil, "", err
+	}
+	return parsed, parsed.String(), nil
+}
+
 func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error {
 	var (
 		failedQueuedAt              time.Time
@@ -874,24 +893,19 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 	if err != nil {
 		return fmt.Errorf("load failed item for requeue %s/%s: %w", orgID, itemID, err)
 	}
-	// Parse the stored library_id explicitly instead of via parseUUID, which
-	// would silently coerce a corrupted value to uuid.Nil — masking the
-	// corruption as a generic "requires library_id" validation error and writing
-	// pending state under the nil library. A non-empty value that does not parse
-	// is refused outright. The nil UUID is NOT corruption: org/user cascades carry
-	// no library and legitimately persist library_id as the nil UUID string, so
-	// rejecting it would break their DLQ requeue. The queue row is re-written with
-	// the exact stored value (round-trip — no durable-contract change), while the
-	// parsed UUID drives validation and the pending-item row.
-	trimmedLibraryID := strings.TrimSpace(libraryIDStr)
-	libraryID := uuid.Nil
-	if trimmedLibraryID != "" {
-		parsedLibraryID, perr := uuid.Parse(trimmedLibraryID)
-		if perr != nil {
-			return fmt.Errorf("refusing to requeue failed item org=%s item_type=%s item_id=%s failed_at=%s: corrupted stored library_id %q: %w",
-				orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), trimmedLibraryID, perr)
-		}
-		libraryID = parsedLibraryID
+	// Interpret the stored library_id via parseStoredQueueLibraryID instead of
+	// parseUUID, which would silently coerce a corrupted value to uuid.Nil —
+	// masking the corruption as a generic "requires library_id" validation error
+	// and writing pending state under the nil library. A non-empty value that does
+	// not parse is refused outright. The nil UUID is NOT corruption: org/user
+	// cascades carry no library and legitimately persist library_id as the nil
+	// UUID string, so rejecting it would break their DLQ requeue. queueLibraryID is
+	// the normalized value round-tripped back into gc_queue; libraryID drives
+	// validation and the pending-item row.
+	libraryID, queueLibraryID, perr := parseStoredQueueLibraryID(libraryIDStr)
+	if perr != nil {
+		return fmt.Errorf("refusing to requeue failed item org=%s item_type=%s item_id=%s failed_at=%s: corrupted stored library_id %q: %w",
+			orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), strings.TrimSpace(libraryIDStr), perr)
 	}
 
 	// RequeueFailedItem writes straight into gc_queue (it does not go through
@@ -913,7 +927,7 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 	batch.Query(`
 		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, block_representation_id, storage_class, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), requeueAt, effectiveIdentityAt(failedQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, trimmedLibraryID, strings.TrimSpace(blockRepresentationID), storageClass, 0)
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), requeueAt, effectiveIdentityAt(failedQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, queueLibraryID, strings.TrimSpace(blockRepresentationID), storageClass, 0)
 	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, effectiveIdentityAt(failedQueuedAt, identityAt))
 	batch.Query(`
 		DELETE FROM gc_failed_items
@@ -2445,11 +2459,12 @@ func (s *CassandraStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo,
 	results := make([]LibraryAutoDeleteInfo, 0, len(rows))
 	for _, row := range rows {
 		results = append(results, LibraryAutoDeleteInfo{
-			OrgID:                 row.OrgID,
-			LibraryID:             row.LibraryID,
-			HeadCommitID:          row.HeadCommitID,
-			BlockRepresentationID: row.BlockRepresentationID,
-			AutoDeleteDays:        row.VersionTTLDays,
+			OrgID:                   row.OrgID,
+			LibraryID:               row.LibraryID,
+			HeadCommitID:            row.HeadCommitID,
+			BlockRepresentationID:   row.BlockRepresentationID,
+			RepresentationDefaulted: row.RepresentationDefaulted,
+			AutoDeleteDays:          row.VersionTTLDays,
 		})
 	}
 	return results, nil
@@ -2492,11 +2507,12 @@ func (s *CassandraStore) listLibrariesByPolicy(policyType string) ([]LibraryTTLI
 			}
 
 			results = append(results, LibraryTTLInfo{
-				OrgID:                 parseUUID(orgIDStr),
-				LibraryID:             parseUUID(libraryIDStr),
-				HeadCommitID:          headCommitID,
-				BlockRepresentationID: db.EffectiveBlockRepresentationID(libraryIDStr, encrypted, storedRepresentationID),
-				VersionTTLDays:        days,
+				OrgID:                   parseUUID(orgIDStr),
+				LibraryID:               parseUUID(libraryIDStr),
+				HeadCommitID:            headCommitID,
+				BlockRepresentationID:   db.EffectiveBlockRepresentationID(libraryIDStr, encrypted, storedRepresentationID),
+				RepresentationDefaulted: strings.TrimSpace(storedRepresentationID) == "",
+				VersionTTLDays:          days,
 			})
 		}
 		if err := iter.Close(); err != nil {

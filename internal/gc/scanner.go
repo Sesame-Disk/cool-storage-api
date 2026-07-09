@@ -688,6 +688,10 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 			log.Printf("[GC Scanner] Phase 5: skipping library %s: %v", lib.LibraryID, err)
 			continue
 		}
+		if lib.RepresentationDefaulted {
+			countLibraryRepresentationDefaulted()
+			log.Printf("[GC Scanner] Phase 5: library %s has no stored block_representation_id; processing under derived default %q (drift)", lib.LibraryID, lib.BlockRepresentationID)
+		}
 
 		commits, err := s.store.ListCommitsWithTimestamps(lib.LibraryID)
 		if err != nil {
@@ -787,6 +791,10 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 			countLibraryRepresentationDrift(lib.BlockRepresentationID)
 			log.Printf("[GC Scanner] Phase 6: skipping library %s: %v", lib.LibraryID, err)
 			continue
+		}
+		if lib.RepresentationDefaulted {
+			countLibraryRepresentationDefaulted()
+			log.Printf("[GC Scanner] Phase 6: library %s has no stored block_representation_id; processing under derived default %q (drift)", lib.LibraryID, lib.BlockRepresentationID)
 		}
 
 		commits, err := s.store.ListCommitsWithTimestamps(lib.LibraryID)

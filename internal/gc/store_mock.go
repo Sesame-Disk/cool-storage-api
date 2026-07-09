@@ -2369,12 +2369,14 @@ func (m *MockStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error) {
 	var results []LibraryTTLInfo
 	for _, lib := range m.libraries {
 		if lib.VersionTTLDays > 0 {
+			stored := strings.TrimSpace(lib.BlockRepresentationID)
 			results = append(results, LibraryTTLInfo{
-				OrgID:                 lib.OrgID,
-				LibraryID:             lib.LibraryID,
-				HeadCommitID:          lib.HeadCommitID,
-				BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
-				VersionTTLDays:        lib.VersionTTLDays,
+				OrgID:                   lib.OrgID,
+				LibraryID:               lib.LibraryID,
+				HeadCommitID:            lib.HeadCommitID,
+				BlockRepresentationID:   db.EffectiveBlockRepresentationID(lib.LibraryID.String(), false, stored),
+				RepresentationDefaulted: stored == "",
+				VersionTTLDays:          lib.VersionTTLDays,
 			})
 		}
 	}
@@ -2388,12 +2390,14 @@ func (m *MockStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo, erro
 	var results []LibraryAutoDeleteInfo
 	for _, lib := range m.libraries {
 		if lib.AutoDeleteDays > 0 {
+			stored := strings.TrimSpace(lib.BlockRepresentationID)
 			results = append(results, LibraryAutoDeleteInfo{
-				OrgID:                 lib.OrgID,
-				LibraryID:             lib.LibraryID,
-				HeadCommitID:          lib.HeadCommitID,
-				BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
-				AutoDeleteDays:        lib.AutoDeleteDays,
+				OrgID:                   lib.OrgID,
+				LibraryID:               lib.LibraryID,
+				HeadCommitID:            lib.HeadCommitID,
+				BlockRepresentationID:   db.EffectiveBlockRepresentationID(lib.LibraryID.String(), false, stored),
+				RepresentationDefaulted: stored == "",
+				AutoDeleteDays:          lib.AutoDeleteDays,
 			})
 		}
 	}

@@ -418,7 +418,13 @@ type LibraryTTLInfo struct {
 	LibraryID             uuid.UUID
 	HeadCommitID          string
 	BlockRepresentationID string
-	VersionTTLDays        int
+	// RepresentationDefaulted is true when the stored block_representation_id was
+	// empty and BlockRepresentationID was derived from the library's own identity
+	// (plain:v1 / library:<id>). The derivation is safe, but an empty stored value
+	// signals a writer/migration that did not stamp it, so scanners report it as
+	// drift rather than hiding it.
+	RepresentationDefaulted bool
+	VersionTTLDays          int
 }
 
 // CommitWithTimestamp holds commit data needed for version TTL enforcement.
@@ -435,7 +441,9 @@ type LibraryAutoDeleteInfo struct {
 	LibraryID             uuid.UUID
 	HeadCommitID          string
 	BlockRepresentationID string
-	AutoDeleteDays        int
+	// RepresentationDefaulted mirrors LibraryTTLInfo.RepresentationDefaulted.
+	RepresentationDefaulted bool
+	AutoDeleteDays          int
 }
 
 // ExpiredShareInfo holds data about an expired user-to-user share.
