@@ -819,9 +819,9 @@ func (m *MockStore) AddLibraryWithAutoDelete(orgID, libraryID uuid.UUID, storage
 	}
 }
 
-// SetLibraryEncrypted flips a mock library's encrypted flag and clears any
-// pre-seeded block_representation_id so tests can exercise the "encrypted +
-// empty stored representation → library:<id>" derivation path.
+// SetLibraryEncrypted flips a mock library's encrypted flag. Tests that need
+// the "encrypted + empty stored representation -> library:<id>" derivation
+// path must clear BlockRepresentationID separately.
 func (m *MockStore) SetLibraryEncrypted(libraryID uuid.UUID, encrypted bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
