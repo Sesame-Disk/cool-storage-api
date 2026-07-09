@@ -14,6 +14,7 @@ import (
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -1228,6 +1229,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 
 	libEnqueuer := getLibraryEnqueuer()
 	cleaned := 0
+	failed := 0
 
 	for _, orgID := range orgIDs {
 		_, cleanedStale, err := dbpkg.ReconcileDeletedAdminLibraryRowsByOrg(h.db.Session(), orgID)
@@ -1260,6 +1262,19 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 		iter.Close()
 
 		for _, lib := range candidates {
+			// Resolve + validate the representation FIRST. It must precede the GC
+			// enqueue and the row delete: if it fails we skip this library entirely
+			// (no enqueue, no delete), keeping its live row so it can be retried
+			// rather than enqueuing its contents for deletion while stranding the
+			// library with an unresolvable marker.
+			blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), orgID, lib.libID)
+			if repErr != nil {
+				metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("admin_clean_trash").Inc()
+				log.Printf("[AdminCleanTrashLibraries] skipping hard-delete of %s/%s: block representation unresolved: %v", orgID, lib.libID, repErr)
+				failed++
+				continue
+			}
+
 			// 1. Enqueue all file data for GC (commits, fs_objects, blocks → S3 deletion)
 			if libEnqueuer != nil {
 				go libEnqueuer.EnqueueLibraryDeletion(orgID, lib.libID, lib.storageClass)
@@ -1273,12 +1288,6 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			}(lib.libID)
 
 			// 3. Hard-delete library rows (same batch approach as PermanentDeleteRepo)
-			// Resolve the block representation before the row is deleted so GC can
-			// still purge the library afterwards (best-effort).
-			blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), orgID, lib.libID)
-			if repErr != nil {
-				log.Printf("[AdminCleanTrashLibraries] could not resolve block representation for %s/%s: %v", orgID, lib.libID, repErr)
-			}
 			batch := h.db.Session().Batch(gocql.LoggedBatch)
 			if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, orgID, lib.libID); err != nil {
 				log.Printf("[AdminCleanTrashLibraries] failed to stage read model delete for library %s (org %s): %v", lib.libID, orgID, err)
@@ -1299,5 +1308,5 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": true, "cleaned": cleaned})
+	c.JSON(http.StatusOK, gin.H{"success": true, "cleaned": cleaned, "skipped": failed})
 }

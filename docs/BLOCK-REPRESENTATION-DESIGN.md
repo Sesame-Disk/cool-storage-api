@@ -172,6 +172,23 @@ rollout — no such legacy rows exist — and fail-closed is the intended postur
   re-resolve it from live library state during durable processing.
 - Add future schema changes as new migrations; do not rewrite migration `001`.
 
+### Library deletion → `deleted_libraries` marker
+
+- Every production writer of `deleted_libraries` MUST stamp `block_representation_id`,
+  resolved from the live `libraries` row via `db.ResolveBlockRepresentationIDForDelete`
+  (which reads the row even when `deleted_at` is already set, and validates the value
+  is canonical for that library).
+- **Soft-delete** may proceed best-effort if resolution fails: the live row survives,
+  so GC Phase 13 can recover the representation later.
+- **Hard-delete fails closed.** A single hard-delete endpoint returns an error and
+  deletes nothing; a bulk cleaner skips the offending library (keeping its live row for
+  retry) and continues with the rest. Deleting the authoritative row while stamping an
+  empty/non-canonical marker would strand the library in trash forever — exactly the bug
+  this design closes. Resolution failures increment
+  `gc_library_delete_representation_resolution_failures_total{operation}`.
+- GC Phase 13 recovery from the surviving library row MUST be kept even after all
+  writers stamp correctly, to repair pre-deploy / legacy / partial-failure markers.
+
 ## Follow-up work
 
 - Backfill legacy libraries and canonical block rows so runtime fallback becomes an

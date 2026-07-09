@@ -10,6 +10,7 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -399,21 +400,26 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 	var libID, storageClass string
 	var deletedAt time.Time
 	cleaned := 0
+	failed := 0
 
 	for iter.Scan(&libID, &storageClass, &deletedAt) {
 		if deletedAt.IsZero() {
+			continue
+		}
+		// Bulk hard-delete: if the representation cannot be resolved, skip THIS
+		// library (keep its live row so it can be retried) and keep purging the
+		// rest, rather than deleting the authoritative row and stranding it.
+		blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), targetOrgID, libID)
+		if repErr != nil {
+			metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("org_clean_trash").Inc()
+			log.Printf("[CleanOrgTrashLibraries] skipping hard-delete of %s/%s: block representation unresolved: %v", targetOrgID, libID, repErr)
+			failed++
 			continue
 		}
 		if err := cleanupLibraryLinks(h.db, targetOrgID, libID); err != nil {
 			iter.Close()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library links"})
 			return
-		}
-		// Hard-delete library rows + preserve org lookup for GC. Resolve the block
-		// representation before the row is gone so GC can still purge the library.
-		blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), targetOrgID, libID)
-		if repErr != nil {
-			log.Printf("[CleanOrgTrashLibraries] could not resolve block representation for %s/%s: %v", targetOrgID, libID, repErr)
 		}
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
 		if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, targetOrgID, libID); err != nil {
@@ -436,8 +442,8 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[CleanOrgTrashLibraries] Cleaned %d trashed libraries in org %s", cleaned, targetOrgID)
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	log.Printf("[CleanOrgTrashLibraries] Cleaned %d trashed libraries in org %s (%d skipped)", cleaned, targetOrgID, failed)
+	c.JSON(http.StatusOK, gin.H{"success": true, "cleaned": cleaned, "skipped": failed})
 }
 
 // DeleteOrgTrashLibrary permanently deletes a single trashed library.
@@ -464,17 +470,23 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 		return
 	}
 
+	// Resolve + validate the representation before touching any state; fail closed
+	// if it cannot be resolved, since the live row (the only authoritative source)
+	// is about to be deleted. Runs before cleanupLibraryLinks so a refusal leaves
+	// the library fully intact.
+	blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), targetOrgID, repoID)
+	if repErr != nil {
+		metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("org_delete_trash_library").Inc()
+		log.Printf("[DeleteOrgTrashLibrary] refusing to hard-delete %s/%s: block representation unresolved: %v", targetOrgID, repoID, repErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare library for permanent deletion"})
+		return
+	}
+
 	if err := cleanupLibraryLinks(h.db, targetOrgID, repoID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library links"})
 		return
 	}
 
-	// Hard-delete + preserve org lookup for GC. Resolve the block representation
-	// before the row is gone so GC can still purge the library.
-	blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), targetOrgID, repoID)
-	if repErr != nil {
-		log.Printf("[DeleteOrgTrashLibrary] could not resolve block representation for %s/%s: %v", targetOrgID, repoID, repErr)
-	}
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, targetOrgID, repoID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})

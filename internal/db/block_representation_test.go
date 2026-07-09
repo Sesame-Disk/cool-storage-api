@@ -60,3 +60,58 @@ func TestIsCanonicalBlockRepresentationForLibrary(t *testing.T) {
 		})
 	}
 }
+
+func TestDeleteBlockRepresentationFromState(t *testing.T) {
+	libID := uuid.New()
+	otherID := uuid.New()
+
+	cases := []struct {
+		name      string
+		state     LibraryState
+		want      string
+		wantError bool
+	}{
+		{
+			name:  "plaintext empty derives plain:v1",
+			state: LibraryState{LibraryID: libID.String(), Encrypted: false, BlockRepresentationID: ""},
+			want:  PlainBlockRepresentationID,
+		},
+		{
+			name:  "encrypted empty derives library:<id>",
+			state: LibraryState{LibraryID: libID.String(), Encrypted: true, BlockRepresentationID: ""},
+			want:  EncryptedLibraryBlockRepresentationID(libID.String()),
+		},
+		{
+			name:  "explicit plain:v1 preserved",
+			state: LibraryState{LibraryID: libID.String(), BlockRepresentationID: PlainBlockRepresentationID},
+			want:  PlainBlockRepresentationID,
+		},
+		{
+			name:      "garbage stored value rejected",
+			state:     LibraryState{LibraryID: libID.String(), BlockRepresentationID: "garbage"},
+			wantError: true,
+		},
+		{
+			name:      "representation of a different library rejected",
+			state:     LibraryState{LibraryID: libID.String(), BlockRepresentationID: EncryptedLibraryBlockRepresentationID(otherID.String())},
+			wantError: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := deleteBlockRepresentationFromState(tc.state)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("deleteBlockRepresentationFromState(%+v) = %q, want error", tc.state, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("deleteBlockRepresentationFromState(%+v) unexpected error: %v", tc.state, err)
+			}
+			if got != tc.want {
+				t.Fatalf("deleteBlockRepresentationFromState(%+v) = %q, want %q", tc.state, got, tc.want)
+			}
+		})
+	}
+}

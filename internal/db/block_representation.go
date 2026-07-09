@@ -116,10 +116,31 @@ func ResolveBlockRepresentationIDByLibraryID(session *gocql.Session, libraryID s
 // marker before the libraries row disappears. GC relies on that stamp to purge
 // the library later; without it the cascade cannot resolve the SHA-1 mapping
 // domain once the live row is gone.
+//
+// The result is guaranteed non-empty AND canonical for this library
+// (plain:v1, or library:<this-library-id>); a stored value that is malformed or
+// belongs to a different library is a hard error, so a hard-delete caller can
+// fail closed instead of stamping a marker GC would later reject as non-canonical
+// and strand in trash.
 func ResolveBlockRepresentationIDForDelete(session *gocql.Session, orgID, libraryID string) (string, error) {
 	state, err := ReadLibraryState(session, orgID, libraryID)
 	if err != nil {
 		return "", err
 	}
-	return state.BlockRepresentationIDOrDefault(), nil
+	return deleteBlockRepresentationFromState(state)
+}
+
+// deleteBlockRepresentationFromState is the pure derive-and-validate step of
+// ResolveBlockRepresentationIDForDelete, split out so it can be unit-tested
+// without a live session.
+func deleteBlockRepresentationFromState(state LibraryState) (string, error) {
+	representationID := state.BlockRepresentationIDOrDefault()
+	libUUID, err := uuid.Parse(strings.TrimSpace(state.LibraryID))
+	if err != nil {
+		return "", fmt.Errorf("invalid library id %q: %w", state.LibraryID, err)
+	}
+	if !IsCanonicalBlockRepresentationForLibrary(representationID, libUUID) {
+		return "", fmt.Errorf("non-canonical block representation %q for library %s", representationID, state.LibraryID)
+	}
+	return representationID, nil
 }

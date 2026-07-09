@@ -7,6 +7,7 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -268,22 +269,26 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 		}
 	}
 
+	// Resolve + validate the representation while the libraries row still exists —
+	// this path deletes it below, after which GC can no longer recover the SHA-1
+	// mapping domain. Hard-delete must fail CLOSED: if we cannot resolve a
+	// canonical representation now, GC would inherit an empty marker and strand the
+	// library forever, so refuse before touching any state (this runs before
+	// cleanupLibraryLinks so a refusal leaves the library fully intact).
+	blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), orgID, repoID)
+	if repErr != nil {
+		metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("permanent_delete").Inc()
+		log.Printf("[PermanentDeleteRepo] refusing to hard-delete %s/%s: block representation unresolved: %v", orgID, repoID, repErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare library for permanent deletion"})
+		return
+	}
+
 	// Clean up share/upload links before hard delete so derived tables do not
 	// outlive the library row on partial failures.
 	if err := cleanupLibraryLinks(h.db, orgID, repoID); err != nil {
 		log.Printf("[PermanentDeleteRepo] Failed to clean share links for %s: %v", repoID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean share links"})
 		return
-	}
-
-	// Resolve the block representation while the libraries row still exists — this
-	// path deletes it below, after which GC can no longer recover the SHA-1
-	// mapping domain. Stamping it on the deleted_libraries marker keeps the
-	// deferred cascade (and the immediate EnqueueLibraryDeletion enqueue) able to
-	// resolve it. Best-effort: do not fail the delete if resolution fails.
-	blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), orgID, repoID)
-	if repErr != nil {
-		log.Printf("[PermanentDeleteRepo] could not resolve block representation for %s/%s: %v", orgID, repoID, repErr)
 	}
 
 	// Hard delete the library records
