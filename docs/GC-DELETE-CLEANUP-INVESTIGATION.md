@@ -21,7 +21,7 @@ broader than the representation-stamping bug PR #123 fixes.
 
 ### Dev cluster access (for reproducing)
 
-- Cassandra: `docker exec sesamefs-cassandra-1 cqlsh -u cassandra -p dev-cassandra-admin` (keyspace `sesamefs`). Creds in `.env` (`CASSANDRA_SUPERUSER_PASSWORD`, app user `sesamefs_app`).
+- Cassandra: `docker exec sesamefs-cassandra-1 cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD"` (keyspace `sesamefs`). Creds in `.env` (`CASSANDRA_SUPERUSER_PASSWORD`, app user `sesamefs_app`).
 - MinIO: `docker exec sesamefs-minio-1 mc ...` (root creds in `$MINIO_ROOT_USER`/`$MINIO_ROOT_PASSWORD`). Buckets: `sesamefs-blocks/eu/usa/china/archive`.
 
 ### Observed residue after a clean-DB full test run (2026-07-09 ~22:06)
@@ -135,18 +135,31 @@ not part of the delete path.
 
 ## Proposed work for the follow-up branch
 
-1. **Centralize library hard-delete cleanup** in a single helper/batch builder so
-   no delete path can forget a step. It must, atomically:
-   - resolve + validate representation (fail-closed for hard-delete, see PR #123
-     review),
-   - stamp `deleted_libraries.block_representation_id`,
-   - remove the library's permanent block references (`fs:` and `pub:foreign:`),
-     decrementing to zero-ref so blocks become GC candidates,
-   - delete `gc_libraries_by_policy` rows (both `version_ttl` and `auto_delete`),
-   - enqueue the library contents for GC.
-2. **Fix the `pub:foreign:` block-ref cleanup** for deleted libraries (understand
-   who owns those refs — CAS/publish path — and ensure library deletion releases
-   them).
+1. **Centralize the library-delete entry point**, but do NOT model the whole
+   cleanup as one atomic Cassandra batch. Releasing refs, moving blocks to
+   candidates, deleting policy indexes and enqueuing content is variable-size,
+   multi-partition, includes queue/S3 work, and overlaps the existing cascade —
+   a single "atomic" batch is neither possible nor safe, and doing ref removal in
+   the delete path AND again in `removeFSObjectBlockReferences` risks a
+   double-decrement / double zero-ref transition unless idempotency is exact.
+   Instead, the delete entry point should do only the small, synchronous,
+   idempotent-safe part (resolve+validate representation, stamp marker, delete the
+   library row + `gc_libraries_by_policy` rows) and then hand off to a **durable,
+   idempotent cascade** that owns all content release:
+   ```
+   hard-delete marker stamped (+ policy index removed)
+     → durable library_cascade queued
+       → cascade enumerates contents
+       → releases each ref exactly once (fs: and, once owned, pub:foreign:)
+       → zero-ref blocks become candidates
+       → physical block + S3 deletion
+       → final cleanup
+   ```
+   Prefer a durable outbox/queue over fire-and-forget goroutines for the enqueue.
+2. **Determine the single owner of `pub:foreign:` ref cleanup FIRST** (CAS/publish
+   path) before wiring any release. Until that owner is defined, do not have two
+   subsystems remove the same ref — decide whether the cascade or the publish
+   subsystem releases `pub:foreign:` refs, and release it in exactly one place.
 3. **Audit tests** (F3): route library create/delete through canonical helpers.
 4. **Reconcile job / backfill** for already-leaked blocks + S3 orphans and stale
    policy rows on existing clusters.
@@ -157,7 +170,7 @@ not part of the delete path.
 ## One-off dev cleanup commands (test cruft only)
 
 ```bash
-docker exec sesamefs-cassandra-1 cqlsh -u cassandra -p dev-cassandra-admin \
+docker exec sesamefs-cassandra-1 cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD" \
   -e "TRUNCATE sesamefs.gc_libraries_by_policy;"
 # Leaked blocks/refs/objects need a proper reconcile; TRUNCATE-ing block_references
 # without deleting the S3 objects would orphan MinIO further — do a real GC/reconcile

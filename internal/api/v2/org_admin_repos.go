@@ -443,7 +443,8 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 	}
 
 	log.Printf("[CleanOrgTrashLibraries] Cleaned %d trashed libraries in org %s (%d skipped)", cleaned, targetOrgID, failed)
-	c.JSON(http.StatusOK, gin.H{"success": true, "cleaned": cleaned, "skipped": failed})
+	// success=true means the operation completed; partial=true flags skipped libs.
+	c.JSON(http.StatusOK, gin.H{"success": true, "partial": failed > 0, "cleaned": cleaned, "skipped": failed})
 }
 
 // DeleteOrgTrashLibrary permanently deletes a single trashed library.

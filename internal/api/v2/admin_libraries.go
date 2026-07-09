@@ -1275,22 +1275,16 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 				continue
 			}
 
-			// 1. Enqueue all file data for GC (commits, fs_objects, blocks → S3 deletion)
-			if libEnqueuer != nil {
-				go libEnqueuer.EnqueueLibraryDeletion(orgID, lib.libID, lib.storageClass)
-			}
-
-			// 2. Remove all tag metadata for this library
-			go func(libraryID string) {
-				if err := CleanupAllLibraryTags(h.db, libraryID); err != nil {
-					log.Printf("[AdminCleanTrashLibraries] failed to clean tag metadata for library %s: %v", libraryID, err)
-				}
-			}(lib.libID)
-
-			// 3. Hard-delete library rows (same batch approach as PermanentDeleteRepo)
+			// Hard-delete library rows (same batch approach as PermanentDeleteRepo).
+			// The GC enqueue and tag cleanup are irreversible, so they must run only
+			// AFTER a successful batch.Exec — otherwise a failed batch would leave the
+			// library alive in trash while its content/tags are already being deleted.
+			// The stamped marker lets the enqueuer resolve the representation from
+			// deleted_libraries even though the live row is now gone.
 			batch := h.db.Session().Batch(gocql.LoggedBatch)
 			if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, orgID, lib.libID); err != nil {
 				log.Printf("[AdminCleanTrashLibraries] failed to stage read model delete for library %s (org %s): %v", lib.libID, orgID, err)
+				failed++
 				continue
 			}
 			batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, lib.libID)
@@ -1301,12 +1295,25 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 
 			if err := batch.Exec(); err != nil {
 				log.Printf("[AdminCleanTrashLibraries] failed to delete library %s (org %s): %v", lib.libID, orgID, err)
+				failed++
 				continue
 			}
+
+			// Post-commit, irreversible side effects.
+			if libEnqueuer != nil {
+				go libEnqueuer.EnqueueLibraryDeletion(orgID, lib.libID, lib.storageClass)
+			}
+			go func(libraryID string) {
+				if err := CleanupAllLibraryTags(h.db, libraryID); err != nil {
+					log.Printf("[AdminCleanTrashLibraries] failed to clean tag metadata for library %s: %v", libraryID, err)
+				}
+			}(lib.libID)
 
 			cleaned++
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": true, "cleaned": cleaned, "skipped": failed})
+	// success=true means the operation completed; partial=true flags that some
+	// libraries were skipped (e.g. unresolvable representation) and were NOT deleted.
+	c.JSON(http.StatusOK, gin.H{"success": true, "partial": failed > 0, "cleaned": cleaned, "skipped": failed})
 }

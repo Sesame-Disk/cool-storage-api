@@ -180,12 +180,18 @@ rollout — no such legacy rows exist — and fail-closed is the intended postur
   is canonical for that library).
 - **Soft-delete** may proceed best-effort if resolution fails: the live row survives,
   so GC Phase 13 can recover the representation later.
-- **Hard-delete fails closed.** A single hard-delete endpoint returns an error and
-  deletes nothing; a bulk cleaner skips the offending library (keeping its live row for
-  retry) and continues with the rest. Deleting the authoritative row while stamping an
-  empty/non-canonical marker would strand the library in trash forever — exactly the bug
-  this design closes. Resolution failures increment
-  `gc_library_delete_representation_resolution_failures_total{operation}`.
+- **Hard-delete fails closed.** Resolution runs before any state change, so on a
+  resolution failure **no state is modified**: a single hard-delete endpoint returns an
+  error, and a bulk cleaner skips the offending library (keeping its live row for retry)
+  and continues with the rest. (This is not a claim of end-to-end endpoint atomicity —
+  once resolution succeeds, later destructive steps such as `cleanupLibraryLinks` run
+  outside the delete batch. The guarantee is specifically that an *unresolved*
+  representation never deletes the authoritative row.) In the bulk/global cleaner the
+  irreversible GC enqueue and tag cleanup run only AFTER a successful delete batch, so a
+  failed batch leaves the library fully intact. Deleting the authoritative row while
+  stamping an empty/non-canonical marker would strand the library in trash forever —
+  exactly the bug this design closes. All resolution failures (soft and hard delete)
+  increment `gc_library_delete_representation_resolution_failures_total{operation}`.
 - GC Phase 13 recovery from the surviving library row MUST be kept even after all
   writers stamp correctly, to repair pre-deploy / legacy / partial-failure markers.
 

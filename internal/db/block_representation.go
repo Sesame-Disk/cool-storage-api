@@ -133,14 +133,33 @@ func ResolveBlockRepresentationIDForDelete(session *gocql.Session, orgID, librar
 // deleteBlockRepresentationFromState is the pure derive-and-validate step of
 // ResolveBlockRepresentationIDForDelete, split out so it can be unit-tested
 // without a live session.
+//
+// It computes the ONE representation the library must have from its own identity
+// and encrypted flag — plain:v1 for plaintext, library:<id> for encrypted — and
+// requires the stored value to be empty (derive it) or exactly that value.
+// IsCanonicalBlockRepresentationForLibrary alone is insufficient here: it does
+// not see Encrypted, so it would accept a domain-crossed value that is
+// syntactically canonical for the UUID but wrong for the library, e.g. an
+// encrypted library stamped plain:v1, or a plaintext library stamped
+// library:<same-id>. Both would send GC to the wrong SHA-1 mapping domain, so
+// they are rejected.
 func deleteBlockRepresentationFromState(state LibraryState) (string, error) {
-	representationID := state.BlockRepresentationIDOrDefault()
 	libUUID, err := uuid.Parse(strings.TrimSpace(state.LibraryID))
 	if err != nil {
 		return "", fmt.Errorf("invalid library id %q: %w", state.LibraryID, err)
 	}
-	if !IsCanonicalBlockRepresentationForLibrary(representationID, libUUID) {
-		return "", fmt.Errorf("non-canonical block representation %q for library %s", representationID, state.LibraryID)
+
+	expected := PlainBlockRepresentationID
+	if state.Encrypted {
+		expected = EncryptedLibraryBlockRepresentationID(libUUID.String())
 	}
-	return representationID, nil
+
+	stored := strings.TrimSpace(state.BlockRepresentationID)
+	if stored == "" {
+		return expected, nil
+	}
+	if stored != expected {
+		return "", fmt.Errorf("block representation %q does not match library %s encrypted=%t; expected %q", stored, libUUID, state.Encrypted, expected)
+	}
+	return expected, nil
 }

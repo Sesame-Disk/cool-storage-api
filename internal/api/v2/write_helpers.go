@@ -8,6 +8,7 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
@@ -924,6 +925,10 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 	// still-present (soft-deleted) row.
 	blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(db.Session(), orgID, libraryID)
 	if repErr != nil {
+		// Soft-delete proceeds best-effort (the live row survives, so Phase 13 can
+		// recover the representation later), but count the fallback so a broken
+		// writer/migration is still observable alongside the hard-delete failures.
+		metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("soft_delete").Inc()
 		log.Printf("[softDeleteLibrary] could not resolve block representation for %s/%s: %v", orgID, libraryID, repErr)
 	}
 	batch := db.Session().Batch(gocql.LoggedBatch)

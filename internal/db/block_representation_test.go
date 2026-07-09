@@ -87,6 +87,11 @@ func TestDeleteBlockRepresentationFromState(t *testing.T) {
 			want:  PlainBlockRepresentationID,
 		},
 		{
+			name:  "encrypted explicit library:<id> preserved",
+			state: LibraryState{LibraryID: libID.String(), Encrypted: true, BlockRepresentationID: EncryptedLibraryBlockRepresentationID(libID.String())},
+			want:  EncryptedLibraryBlockRepresentationID(libID.String()),
+		},
+		{
 			name:      "garbage stored value rejected",
 			state:     LibraryState{LibraryID: libID.String(), BlockRepresentationID: "garbage"},
 			wantError: true,
@@ -94,6 +99,21 @@ func TestDeleteBlockRepresentationFromState(t *testing.T) {
 		{
 			name:      "representation of a different library rejected",
 			state:     LibraryState{LibraryID: libID.String(), BlockRepresentationID: EncryptedLibraryBlockRepresentationID(otherID.String())},
+			wantError: true,
+		},
+		{
+			name:      "encrypted library stamped plain:v1 rejected (domain cross)",
+			state:     LibraryState{LibraryID: libID.String(), Encrypted: true, BlockRepresentationID: PlainBlockRepresentationID},
+			wantError: true,
+		},
+		{
+			name:      "plaintext library stamped library:<same-id> rejected (domain cross)",
+			state:     LibraryState{LibraryID: libID.String(), Encrypted: false, BlockRepresentationID: EncryptedLibraryBlockRepresentationID(libID.String())},
+			wantError: true,
+		},
+		{
+			name:      "invalid library uuid rejected",
+			state:     LibraryState{LibraryID: "not-a-uuid", BlockRepresentationID: PlainBlockRepresentationID},
 			wantError: true,
 		},
 	}
