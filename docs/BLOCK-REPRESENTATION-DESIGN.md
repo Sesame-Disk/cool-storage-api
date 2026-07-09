@@ -102,11 +102,11 @@ Migration `010_gc_queue_block_representation_id.cql` adds
 - `gc_failed_items`
 - `deleted_libraries`
 
-The representation is stamped at enqueue time — while the library row is still
-live — and then carried, never re-derived, through every durable hop: initial
-enqueue, `EnqueueBatch`, dequeue, retry/requeue, postpone, DLQ (`FailItem`) and
-manual DLQ requeue, org cascade, library cascade, commit → root `fs_object`, and
-directory → child `fs_objects`.
+The representation is stamped at enqueue time — while authoritative library or
+deleted-library metadata is still available — and then carried, never
+re-derived, through every durable hop: initial enqueue, `EnqueueBatch`, dequeue,
+retry/requeue, postpone, DLQ (`FailItem`) and manual DLQ requeue, org cascade,
+library cascade, commit → root `fs_object`, and directory → child `fs_objects`.
 
 `EnqueueBatch` is the single enqueue choke point and enforces the invariant for
 the item types that carry a block reference — `commit`, `fs_object`, and

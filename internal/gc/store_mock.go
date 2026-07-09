@@ -1155,22 +1155,15 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 	if itemTypeRequiresBlockRepresentation(itemType) {
 		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
 	}
-	m.seedQueueItemRow(orgID, queuedAt, itemType, itemID, libraryID, "", storageClass, retryCount)
+	m.seedQueueItemRow(orgID, queuedAt, itemType, itemID, libraryID, storageClass, retryCount)
 	return nil
 }
 
-// SeedQueueItemForTest injects a raw gc_queue row for test setup, deliberately
-// bypassing the block-representation enqueue contract that EnqueueItem and
-// EnqueueBatch enforce. Production code must never use this: it exists only so
-// unit tests can stage commit/fs_object/library_cascade queue rows (which the
-// guarded enqueue paths now reject) without building full library +
-// representation fixtures. blockRepresentationID may be empty to reproduce a
-// legacy/incomplete row.
-func (m *MockStore) SeedQueueItemForTest(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) {
-	m.seedQueueItemRow(orgID, queuedAt, itemType, itemID, libraryID, "", storageClass, retryCount)
-}
-
-func (m *MockStore) seedQueueItemRow(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, retryCount int) {
+// seedQueueItemRow appends a raw gc_queue row with an empty block representation.
+// It backs both the guarded EnqueueItem and the test-only SeedQueueItemForTest
+// (defined in a _test.go file so it never compiles into a production build); the
+// block representation is intentionally always empty on this raw single-row path.
+func (m *MockStore) seedQueueItemRow(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	item := QueueItem{
@@ -1181,7 +1174,7 @@ func (m *MockStore) seedQueueItemRow(orgID uuid.UUID, queuedAt time.Time, itemTy
 		ItemType:                    itemType,
 		ItemID:                      itemID,
 		LibraryID:                   libraryID,
-		BlockRepresentationID:       blockRepresentationID,
+		BlockRepresentationID:       "",
 		StorageClass:                storageClass,
 		RetryCount:                  retryCount,
 	}
