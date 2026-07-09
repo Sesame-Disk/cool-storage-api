@@ -3,11 +3,13 @@
 package integration
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
@@ -158,5 +160,163 @@ func TestGC_ResolveBlockIDs_AmbiguousDualProbe_RealCassandra(t *testing.T) {
 	afterAmbiguous := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_unresolved_ambiguous_representation"))
 	if afterAmbiguous-beforeAmbiguous != 1 {
 		t.Fatalf("ambiguous metric delta = %v, want 1", afterAmbiguous-beforeAmbiguous)
+	}
+}
+
+// TestGC_DeletedLibraryRepresentation_CascadeLifecycle_RealCassandra pins the
+// clean-deploy durability path end-to-end against real Cassandra:
+//
+//  1. scanner sees an expired deleted_libraries row whose
+//     block_representation_id was persisted at soft-delete time;
+//  2. it enqueues a library_cascade row carrying that exact representation; then
+//  3. the worker processes the cascade, hard-deletes the library rows, and
+//     enqueues commit/fs_object children that still carry the same persisted
+//     representation.
+//
+// This is the real DB counterpart to the unit coverage around
+// scanExpiredDeletedLibraries + processLibraryCascade, and it closes the gap
+// where the resolver/dual-probe tests alone did not prove the queue hand-off
+// from deleted_libraries to durable child work.
+func TestGC_DeletedLibraryRepresentation_CascadeLifecycle_RealCassandra(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	store := gcpkg.NewCassandraStore(database)
+	queue := gcpkg.NewQueue(store)
+	scanner := gcpkg.NewScanner(store, queue, &gcpkg.Stats{}, config.GCConfig{TrashRetentionDays: 30})
+	worker := gcpkg.NewWorker(store, nil, queue, 100, 0, false, &gcpkg.Stats{})
+
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	ownerID := uuid.New()
+	commitID := fmt.Sprintf("commit-cascade-%d", time.Now().UnixNano())
+	rootFSID := fmt.Sprintf("fs-root-%d", time.Now().UnixNano())
+	representationID := dbpkg.EncryptedLibraryBlockRepresentationID(libraryID.String())
+	deletedAt := time.Now().AddDate(0, 0, -45).UTC().Truncate(time.Millisecond)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?`,
+			orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemLibraryCascade, libraryID.String()), deletedAt, string(gcpkg.ItemLibraryCascade), libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?`,
+			orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemCommit, commitID), deletedAt, string(gcpkg.ItemCommit), commitID).Exec()
+		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?`,
+			orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemFSObject, rootFSID), deletedAt, string(gcpkg.ItemFSObject), rootFSID).Exec()
+		_ = session.Query(`DELETE FROM gc_pending_items WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?`,
+			orgID.String(), gcpkg.PendingItemBucket(orgID, uuid.Nil, gcpkg.ItemLibraryCascade, libraryID.String()), string(gcpkg.ItemLibraryCascade), uuid.Nil.String(), libraryID.String(), deletedAt).Exec()
+		_ = session.Query(`DELETE FROM gc_pending_items WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?`,
+			orgID.String(), gcpkg.PendingItemBucket(orgID, libraryID, gcpkg.ItemCommit, commitID), string(gcpkg.ItemCommit), libraryID.String(), commitID, deletedAt).Exec()
+		_ = session.Query(`DELETE FROM gc_pending_items WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?`,
+			orgID.String(), gcpkg.PendingItemBucket(orgID, libraryID, gcpkg.ItemFSObject, rootFSID), string(gcpkg.ItemFSObject), libraryID.String(), rootFSID, deletedAt).Exec()
+		_ = session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, libraryID.String(), commitID).Exec()
+		_ = session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, libraryID.String(), rootFSID).Exec()
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	if err := session.Query(`
+		INSERT INTO libraries (
+			org_id, library_id, owner_id, name, description, encrypted, enc_version,
+			root_commit_id, head_commit_id, storage_class, size_bytes, file_count,
+			deleted_at, deleted_by, created_at, updated_at, block_representation_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		orgID.String(), libraryID.String(), ownerID.String(), "gc-cascade-test", "",
+		true, 2, commitID, commitID, "hot", int64(0), int64(1), deletedAt,
+		ownerID.String(), now, now, representationID,
+	).Exec(); err != nil {
+		t.Fatalf("seed libraries: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO libraries_by_id (
+			library_id, org_id, owner_id, name, head_commit_id, encrypted, enc_version,
+			block_representation_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		libraryID.String(), orgID.String(), ownerID.String(), "gc-cascade-test", commitID,
+		true, 2, representationID,
+	).Exec(); err != nil {
+		t.Fatalf("seed libraries_by_id: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id)
+		VALUES (?, ?, ?, ?, ?)
+	`, libraryID.String(), orgID.String(), deletedAt, "hot", representationID).Exec(); err != nil {
+		t.Fatalf("seed deleted_libraries: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, libraryID.String(), commitID, "", rootFSID, ownerID.String(), "gc representation cascade", now).Exec(); err != nil {
+		t.Fatalf("seed commits: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, libraryID.String(), rootFSID, "file", rootFSID, "/", int64(0), now.Unix(), []string{}).Exec(); err != nil {
+		t.Fatalf("seed fs_objects: %v", err)
+	}
+
+	if err := scanner.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("ScanOnce: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 10, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("DequeueBatch(after scanner): %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued library cascade after scanner, got %d (%+v)", len(items), items)
+	}
+	if items[0].ItemType != gcpkg.ItemLibraryCascade || items[0].ItemID != libraryID.String() {
+		t.Fatalf("scanner queued unexpected item: %+v", items[0])
+	}
+	if items[0].BlockRepresentationID != representationID {
+		t.Fatalf("library_cascade BlockRepresentationID = %q, want %q", items[0].BlockRepresentationID, representationID)
+	}
+
+	processed, err := worker.ProcessOrgOnce(context.Background(), orgID)
+	if err != nil {
+		t.Fatalf("ProcessOrgOnce: %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("ProcessOrgOnce processed %d items, want 1 library cascade", processed)
+	}
+
+	if deletedMarker, err := store.GetLibraryDeletedAt(libraryID); err != nil {
+		t.Fatalf("GetLibraryDeletedAt(after worker): %v", err)
+	} else if deletedMarker != nil {
+		t.Fatalf("expected deleted_libraries row to be hard-deleted, still found deleted_at=%v", *deletedMarker)
+	}
+
+	children, err := store.DequeueBatch(orgID, 10, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("DequeueBatch(after worker): %v", err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("expected 2 child items after library cascade, got %d (%+v)", len(children), children)
+	}
+
+	gotByType := make(map[gcpkg.ItemType]gcpkg.QueueItem, len(children))
+	for _, item := range children {
+		gotByType[item.ItemType] = item
+		if item.BlockRepresentationID != representationID {
+			t.Fatalf("child %s/%s BlockRepresentationID = %q, want %q", item.ItemType, item.ItemID, item.BlockRepresentationID, representationID)
+		}
+		if !item.IdentityAt.Equal(deletedAt) {
+			t.Fatalf("child %s/%s IdentityAt = %v, want %v", item.ItemType, item.ItemID, item.IdentityAt, deletedAt)
+		}
+		if !item.RequiresLibraryDeletedCheck {
+			t.Fatalf("child %s/%s RequiresLibraryDeletedCheck = false, want true", item.ItemType, item.ItemID)
+		}
+	}
+
+	if commitItem, ok := gotByType[gcpkg.ItemCommit]; !ok || commitItem.ItemID != commitID {
+		t.Fatalf("missing commit child %s in %+v", commitID, children)
+	}
+	if fsItem, ok := gotByType[gcpkg.ItemFSObject]; !ok || fsItem.ItemID != rootFSID {
+		t.Fatalf("missing fs_object child %s in %+v", rootFSID, children)
 	}
 }

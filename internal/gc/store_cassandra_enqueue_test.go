@@ -1,6 +1,7 @@
 package gc
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -19,8 +20,8 @@ func TestCassandraStore_EnqueueItem_RejectsRepresentationRequiredTypes(t *testin
 	for _, itemType := range []ItemType{ItemCommit, ItemFSObject, ItemLibraryCascade} {
 		t.Run(string(itemType), func(t *testing.T) {
 			err := store.EnqueueItem(uuid.New(), time.Now(), itemType, "item-1", uuid.New(), "hot", 0)
-			if err == nil {
-				t.Fatalf("EnqueueItem(%s) = nil, want rejection", itemType)
+			if err == nil || !strings.Contains(err.Error(), "use EnqueueBatch") {
+				t.Fatalf("EnqueueItem(%s) error = %v, want raw-path guard mentioning use EnqueueBatch", itemType, err)
 			}
 		})
 	}
