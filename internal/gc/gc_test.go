@@ -1072,8 +1072,16 @@ func TestService_RequeueFailedItem_RejectsNonCanonicalRepresentation(t *testing.
 				lease:  &fakeLeaderLease{allowed: true},
 			}
 
-			if err := svc.RequeueFailedItem(orgID, failedAt, ItemFSObject, itemID); err == nil {
+			err := svc.RequeueFailedItem(orgID, failedAt, ItemFSObject, itemID)
+			if err == nil {
 				t.Fatalf("expected RequeueFailedItem to reject representation %q, got nil", tc.representation)
+			}
+			// The refusal must carry enough context for an operator to find the
+			// exact DLQ row (ids can collide across item types).
+			for _, want := range []string{string(ItemFSObject), itemID, failedAt.UTC().Format(time.RFC3339Nano)} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("refusal error %q missing context %q", err.Error(), want)
+				}
 			}
 			if items := store.QueueItems(orgID); len(items) != 0 {
 				t.Fatalf("expected no queued work after rejected requeue, got %#v", items)

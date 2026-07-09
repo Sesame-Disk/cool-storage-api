@@ -1542,7 +1542,7 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 				BlockRepresentationID: item.BlockRepresentationID,
 			}); verr != nil {
 				return fmt.Errorf("refusing to requeue failed item org=%s item_type=%s item_id=%s failed_at=%s: %w",
-					orgID, itemType, itemID, failedAt.Format(time.RFC3339Nano), verr)
+					orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), verr)
 			}
 			m.queue[orgID] = append(m.queue[orgID], QueueItem{
 				OrgID:                       orgID,
