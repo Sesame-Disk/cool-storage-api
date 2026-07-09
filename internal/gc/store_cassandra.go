@@ -874,6 +874,23 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 	if err != nil {
 		return fmt.Errorf("load failed item for requeue %s/%s: %w", orgID, itemID, err)
 	}
+	// Parse the stored library_id explicitly instead of via parseUUID, which
+	// would silently coerce a corrupted value to uuid.Nil — masking the
+	// corruption as a generic "requires library_id" validation error and writing
+	// pending state under the nil library. A non-empty value that does not parse
+	// is refused outright; an empty value stays nil for the item types that carry
+	// no library. The parsed UUID is then reused for validation, the queue insert
+	// and the pending-item row so all three agree.
+	libraryID := uuid.Nil
+	if trimmedLibraryID := strings.TrimSpace(libraryIDStr); trimmedLibraryID != "" {
+		parsedLibraryID, perr := uuid.Parse(trimmedLibraryID)
+		if perr != nil {
+			return fmt.Errorf("refusing to requeue failed item org=%s item_type=%s item_id=%s failed_at=%s: corrupted stored library_id %q: %w",
+				orgID, itemType, itemID, failedAt.Format(time.RFC3339Nano), trimmedLibraryID, perr)
+		}
+		libraryID = parsedLibraryID
+	}
+
 	// RequeueFailedItem writes straight into gc_queue (it does not go through
 	// EnqueueBatch), so re-assert the block-representation invariant here too. A
 	// representation-required item whose stored representation is blank or
@@ -882,18 +899,19 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 	if verr := validateQueueItemBlockRepresentation(QueueItem{
 		ItemType:              itemType,
 		ItemID:                itemID,
-		LibraryID:             parseUUID(libraryIDStr),
+		LibraryID:             libraryID,
 		BlockRepresentationID: blockRepresentationID,
 	}); verr != nil {
-		return fmt.Errorf("refusing to requeue failed item %s/%s: %w", orgID, itemID, verr)
+		return fmt.Errorf("refusing to requeue failed item org=%s item_type=%s item_id=%s failed_at=%s: %w",
+			orgID, itemType, itemID, failedAt.Format(time.RFC3339Nano), verr)
 	}
 	requeueAt := failedQueuedAt
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, block_representation_id, storage_class, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), requeueAt, effectiveIdentityAt(failedQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, libraryIDStr, strings.TrimSpace(blockRepresentationID), storageClass, 0)
-	addPendingItemBatchQuery(batch, orgID, parseUUID(libraryIDStr), itemType, itemID, effectiveIdentityAt(failedQueuedAt, identityAt))
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), requeueAt, effectiveIdentityAt(failedQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, libraryID.String(), strings.TrimSpace(blockRepresentationID), storageClass, 0)
+	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, effectiveIdentityAt(failedQueuedAt, identityAt))
 	batch.Query(`
 		DELETE FROM gc_failed_items
 		WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
