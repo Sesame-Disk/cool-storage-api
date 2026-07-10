@@ -1235,6 +1235,65 @@ func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(
 	}
 }
 
+func TestLibraryGuardMode_UnknownFailsClosedBeforeQueueAndAutoRecovery(t *testing.T) {
+	store := NewMockStore()
+	queue := NewQueue(store)
+	orgID, libraryID := uuid.New(), uuid.New()
+	unknown := LibraryGuardMode("future_mode")
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: time.Now(), IdentityAt: time.Now(),
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: unknown,
+		ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libraryID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+	}
+	if err := queue.EnqueueBatch([]QueueItem{item}); err == nil {
+		t.Fatal("unknown guard mode reached queue")
+	}
+
+	service := &Service{store: store}
+	failed := GCFailedItemInfo{
+		OrgID: orgID, FailedAt: time.Now(), QueuedAt: item.QueuedAt, IdentityAt: item.IdentityAt,
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: unknown,
+		ItemType: ItemCommit, ItemID: item.ItemID, LibraryID: libraryID,
+		FailureCode: GCFailureCodeLibraryHardDeleteInProgress, ResolvedState: "open",
+	}
+	if eligible, err := service.isAutoRecoverableFailedItem(failed); err == nil || eligible {
+		t.Fatalf("unknown DLQ guard classification = (%v, %v), want (false, error)", eligible, err)
+	}
+}
+
+func TestWorker_UnknownPersistedGuardIsQuarantinedWithoutBlockingHealthyRows(t *testing.T) {
+	store := NewMockStore()
+	worker := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+	orgID := uuid.New()
+	now := time.Now().Add(-time.Hour).UTC()
+	store.mu.Lock()
+	store.queue[orgID] = []QueueItem{
+		{OrgID: orgID, QueuedAt: now, IdentityAt: now, ItemType: ItemCommit, ItemID: "invalid", LibraryID: uuid.New(), LibraryGuardMode: LibraryGuardMode("future_mode")},
+		{OrgID: orgID, QueuedAt: now.Add(time.Millisecond), IdentityAt: now.Add(time.Millisecond), ItemType: ItemShareLink, ItemID: "healthy"},
+	}
+	store.activeQueueOrgs[orgID] = now
+	store.mu.Unlock()
+
+	processed, err := worker.ProcessOrgOnce(context.Background(), orgID)
+	if err != nil {
+		t.Fatalf("ProcessOrgOnce: %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("processed = %d, want healthy row only", processed)
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("queue still contains rows: %#v", items)
+	}
+	failed := store.FailedItems(orgID)
+	if len(failed) != 1 || failed[0].FailureCode != GCFailureCodeInvalidLibraryGuardMode || failed[0].LibraryGuardMode != LibraryGuardMode("future_mode") {
+		t.Fatalf("invalid row quarantine = %#v", failed)
+	}
+	if err := store.RequeueFailedItem(orgID, failed[0].FailedAt, failed[0].ItemType, failed[0].ItemID, time.Now()); !errors.Is(err, errInvalidLibraryGuardMode) {
+		t.Fatalf("manual requeue error = %v, want invalid guard mode", err)
+	}
+}
+
 func TestService_ReconcileDirtyQueueStats_CorrectsSnapshotDrift(t *testing.T) {
 	store := NewMockStore()
 	orgA := uuid.New()

@@ -76,8 +76,9 @@ flowchart TD
 Scanner-created orphan work uses durable `library_guard_mode=canonical_absent`; normal cascade
 children use `deleted_at_identity`. P6a closed the fail-open existence read, and P6b (1E,
 `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`) makes the worker acquire the shared restore/GC lifecycle
-lease and prove global canonical absence before deletion. Projection drift, stale org metadata, and
-scanner→worker restore races therefore fail closed.
+lease and fail closed on an O(1) point read of the canonical `(org_id, library_id)` row before
+deletion. Library UUIDs are globally unique and immutable and are never moved between orgs, so the
+queue's org partition is authoritative. Projection drift and scanner→worker restore races fail closed.
 
 ## 4. Library delete and purge handoff
 

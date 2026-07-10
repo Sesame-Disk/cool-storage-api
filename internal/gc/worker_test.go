@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
@@ -661,32 +662,121 @@ func TestWorker_ProcessFSObject_OrphanSkipsWhenCanonicalLibraryLive(t *testing.T
 	}
 }
 
-func TestWorker_ProcessCommit_OrphanSkipsWhenCanonicalLibraryLivesInDifferentOrg(t *testing.T) {
+func TestWorker_OrphanGuardAndRestoreLeaseSerializeBothDirections(t *testing.T) {
 	store := NewMockStore()
 	worker := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
-
-	staleOrgID := uuid.New()
-	canonicalOrgID := uuid.New()
-	libraryID := uuid.New()
-	store.AddLibrary(canonicalOrgID, libraryID, "hot")
-	store.AddCommit(libraryID, "commit-1", "")
-
+	orgID, libraryID := uuid.New(), uuid.New()
 	item := QueueItem{
-		OrgID:                       staleOrgID,
-		QueuedAt:                    time.Now().UTC(),
-		IdentityAt:                  time.Now().UTC(),
-		RequiresLibraryDeletedCheck: true,
-		LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
-		ItemType:                    ItemCommit,
-		ItemID:                      "commit-1",
-		LibraryID:                   libraryID,
+		OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent,
+		ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libraryID,
 	}
+	store.AddCommit(libraryID, item.ItemID, "")
+
+	workerToken := uuid.New()
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libraryID, workerToken); err != nil || !acquired {
+		t.Fatalf("worker acquire = (%v, %v), want (true, nil)", acquired, err)
+	}
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libraryID, uuid.New()); err != nil || acquired {
+		t.Fatalf("restore acquire while worker owns lease = (%v, %v), want (false, nil)", acquired, err)
+	}
+	if err := store.ReleaseLibraryHardDeleteLock(libraryID, workerToken); err != nil {
+		t.Fatalf("release worker lease: %v", err)
+	}
+
+	restoreToken := uuid.New()
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libraryID, restoreToken); err != nil || !acquired {
+		t.Fatalf("restore acquire = (%v, %v), want (true, nil)", acquired, err)
+	}
+	if err := worker.processCommit(item); !isHardDeleteInProgressError(err) {
+		t.Fatalf("worker during restore error = %v, want lock contention", err)
+	}
+	if store.GetCommitRecord(libraryID, item.ItemID) == nil {
+		t.Fatal("worker deleted commit while restore owned lifecycle lease")
+	}
+	if err := store.ReleaseLibraryHardDeleteLock(libraryID, restoreToken); err != nil {
+		t.Fatalf("release restore lease: %v", err)
+	}
+	store.AddLibrary(orgID, libraryID, "hot")
 	if err := worker.processCommit(item); err != nil {
-		t.Fatalf("processCommit: %v", err)
+		t.Fatalf("worker retry after restore: %v", err)
 	}
-	if store.GetCommitRecord(libraryID, "commit-1") == nil {
-		t.Fatal("orphan work resolved through a stale org must not delete another org's canonical library content")
+	if store.GetCommitRecord(libraryID, item.ItemID) == nil {
+		t.Fatal("worker retry deleted content after restore recreated canonical row")
 	}
+}
+
+func TestMockLibraryLease_OldTokenCannotReleaseNewOwner(t *testing.T) {
+	store := NewMockStore()
+	libraryID := uuid.New()
+	oldToken, newToken := uuid.New(), uuid.New()
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libraryID, oldToken); err != nil || !acquired {
+		t.Fatalf("old owner acquire = (%v, %v)", acquired, err)
+	}
+	store.mu.Lock()
+	lock := store.libraryHardDeleteLocks[libraryID]
+	lock.Heartbeat = time.Now().Add(-hardDeleteLockStaleAfter - time.Minute)
+	store.libraryHardDeleteLocks[libraryID] = lock
+	store.mu.Unlock()
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libraryID, newToken); err != nil || !acquired {
+		t.Fatalf("new owner takeover = (%v, %v)", acquired, err)
+	}
+	if err := store.ReleaseLibraryHardDeleteLock(libraryID, oldToken); err != nil {
+		t.Fatalf("old owner release: %v", err)
+	}
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libraryID, uuid.New()); err != nil || acquired {
+		t.Fatalf("third owner acquire after stale release = (%v, %v), want (false, nil)", acquired, err)
+	}
+}
+
+func TestWorker_OrphanGuardRenewsLibraryLease(t *testing.T) {
+	store := NewMockStore()
+	worker := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+	orgID, libraryID := uuid.New(), uuid.New()
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: time.Now(), IdentityAt: time.Now(),
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent,
+		ItemType: ItemCommit, ItemID: "commit-renew", LibraryID: libraryID,
+	}
+	originalInterval := hardDeleteLockHeartbeatInterval
+	hardDeleteLockHeartbeatInterval = time.Millisecond
+	t.Cleanup(func() { hardDeleteLockHeartbeatInterval = originalInterval })
+
+	lease, stale, err := worker.acquireLibraryDeleteGuard(item)
+	if err != nil || stale || lease == nil {
+		t.Fatalf("acquire guard = (%v, %v, %v)", lease, stale, err)
+	}
+	store.mu.Lock()
+	initialHeartbeat := store.libraryHardDeleteLocks[libraryID].Heartbeat
+	store.mu.Unlock()
+	deadline := time.Now().Add(time.Second)
+	for {
+		store.mu.Lock()
+		renewedHeartbeat := store.libraryHardDeleteLocks[libraryID].Heartbeat
+		store.mu.Unlock()
+		if renewedHeartbeat.After(initialHeartbeat) {
+			break
+		}
+		if time.Now().After(deadline) {
+			lease.Close()
+			t.Fatal("guard lease heartbeat was not renewed")
+		}
+		runtime.Gosched()
+	}
+	lease.Close()
+}
+
+func TestHardDeleteLease_CancellationFailsClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	lease := newHardDeleteLease(ctx, "library", uuid.NewString(), func() (bool, error) {
+		return true, nil
+	}, func() error { return nil })
+	cancel()
+	<-lease.closedChan
+	if err := lease.Check(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Check after cancellation = %v, want context.Canceled", err)
+	}
+	lease.Close()
 }
 
 func TestWorker_ProcessCommit_SkipsAlreadyPendingRootFSObject(t *testing.T) {
@@ -1105,6 +1195,46 @@ func TestWorker_ProcessUserCascade_LockBusyPostponesWithoutRetryOrDLQ(t *testing
 	}
 	if failed := store.FailedItems(orgID); len(failed) != 0 {
 		t.Fatalf("lock contention should not move item to DLQ, got %d failed items", len(failed))
+	}
+}
+
+func TestWorker_OrphanLockBusyPostponesWithoutRetryOrDLQ(t *testing.T) {
+	store := NewMockStore()
+	queue := NewQueue(store)
+	worker := NewWorker(store, nil, queue, 100, 0, false, &Stats{})
+	orgID, libraryID := uuid.New(), uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddCommit(libraryID, "commit-orphan", "")
+	restoreToken := uuid.New()
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libraryID, restoreToken); err != nil || !acquired {
+		t.Fatalf("seed restore lease = (%v, %v)", acquired, err)
+	}
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt,
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent,
+		ItemType: ItemCommit, ItemID: "commit-orphan", LibraryID: libraryID,
+		BlockRepresentationID: db.PlainBlockRepresentationID, RetryCount: 4,
+	}
+	if err := queue.EnqueueBatch([]QueueItem{item}); err != nil {
+		t.Fatalf("enqueue orphan item: %v", err)
+	}
+
+	processed, err := worker.ProcessOrgOnce(context.Background(), orgID)
+	if err != nil {
+		t.Fatalf("ProcessOrgOnce: %v", err)
+	}
+	if processed != 0 {
+		t.Fatalf("processed = %d, want 0", processed)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 || items[0].RetryCount != 4 {
+		t.Fatalf("postponed items = %#v, want one item with retry_count=4", items)
+	}
+	if failed := store.FailedItems(orgID); len(failed) != 0 {
+		t.Fatalf("lock contention moved item to DLQ: %#v", failed)
+	}
+	if store.GetCommitRecord(libraryID, item.ItemID) == nil {
+		t.Fatal("lock-contended orphan was deleted")
 	}
 }
 
@@ -2507,7 +2637,7 @@ func TestWorker_RemoveFSObjectBlockReferences_ReturnsOnlyZeroTransitions(t *test
 	store.AddFSObjectReferenceForTest(orgID, "stays-positive", libID, "fs-obj")
 	store.AddFSObjectReferenceForTest(orgID, "stays-positive", libID, "fs-other")
 
-	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-obj", []string{"hits-zero", "stays-positive"})
+	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-obj", []string{"hits-zero", "stays-positive"}, func() error { return nil })
 	if err != nil {
 		t.Fatalf("removeFSObjectBlockReferences failed: %v", err)
 	}
@@ -2547,7 +2677,7 @@ func TestWorker_RemoveFSObjectBlockReferences_SoftDeletedLibraryUsesStoredRepres
 		t.Fatalf("SoftDeleteLibrary failed: %v", err)
 	}
 
-	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-soft", []string{externalBlockID})
+	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-soft", []string{externalBlockID}, func() error { return nil })
 	if err != nil {
 		t.Fatalf("removeFSObjectBlockReferences failed: %v", err)
 	}

@@ -740,7 +740,10 @@ func (s *Service) isAutoRecoverableFailedItem(item GCFailedItemInfo) (bool, erro
 	if item.ResolvedState != "" && item.ResolvedState != "open" {
 		return false, nil
 	}
-	guardMode := effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck)
+	guardMode, err := validateLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck)
+	if err != nil {
+		return false, fmt.Errorf("invalid library guard for DLQ item %s/%s: %w", item.LibraryID, item.ItemID, err)
+	}
 	if guardMode == LibraryGuardNone {
 		return false, nil
 	}
@@ -755,14 +758,14 @@ func (s *Service) isAutoRecoverableFailedItem(item GCFailedItemInfo) (bool, erro
 	}
 
 	var exists bool
-	var err error
+	var existsErr error
 	if guardMode == LibraryGuardCanonicalMustBeAbsent {
-		exists, err = s.store.CanonicalLibraryExistsAnywhere(item.LibraryID)
+		exists, existsErr = s.store.CanonicalLibraryExists(item.OrgID, item.LibraryID)
 	} else {
-		exists, err = s.store.LibraryExists(item.LibraryID)
+		exists, existsErr = s.store.LibraryExists(item.LibraryID)
 	}
-	if err != nil {
-		return false, fmt.Errorf("confirm library existence for DLQ item %s/%s: %w", item.LibraryID, item.ItemID, err)
+	if existsErr != nil {
+		return false, fmt.Errorf("confirm library existence for DLQ item %s/%s: %w", item.LibraryID, item.ItemID, existsErr)
 	}
 	return !exists, nil
 }

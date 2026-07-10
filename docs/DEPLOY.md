@@ -740,10 +740,45 @@ The build containing `011_gc_library_guard_mode.cql` changes the meaning of guar
 items. Do not mix pre-011 GC scanners/workers with the new binaries: old workers do not understand
 `library_guard_mode` and can rewrite it as the legacy deleted-marker contract.
 
-For this upgrade, stop or drain every old SesameFS instance that can run GC, start one new instance
-so migrations complete, then start the remaining new instances. Resume/schedule GC only after all
-regions run the new image. API downtime is not intrinsically required if GC execution is separately
-disabled, but mixed-version GC execution is unsupported for this migration.
+For this upgrade, **GC must remain disabled** from before the first old instance is drained until
+every region runs the new image. Stop or drain every old SesameFS instance that can run GC, start
+one new instance so migrations complete, then start the remaining new instances. Resume/schedule
+GC only after verifying no pre-011 process remains. API downtime is not intrinsically required if
+GC execution is separately disabled. There is no mixed-version compatibility barrier in the
+binary, so this stop-the-world GC window is a release requirement, not an optional precaution.
+
+Run this sequence in **every region**. First set `GC_ENABLED=false` in that region's configured
+env file and recreate the existing backend before pulling or starting the new image:
+
+```bash
+export ENV_FILE="${ENV_FILE:-.env}"
+docker compose --env-file "$ENV_FILE" -f docker-compose.prod.yml up -d --force-recreate sesamefs
+docker compose --env-file "$ENV_FILE" -f docker-compose.prod.yml exec sesamefs printenv GC_ENABLED
+# Required output: false
+```
+
+After every old backend reports `false`, deploy the new image in each region. Verify each running
+container uses the expected image ID; do not infer completion only from a healthy HTTP response:
+
+```bash
+docker compose --env-file "$ENV_FILE" -f docker-compose.prod.yml pull sesamefs
+docker compose --env-file "$ENV_FILE" -f docker-compose.prod.yml up -d --force-recreate sesamefs
+docker inspect --format '{{.Image}}' "$(docker compose --env-file "$ENV_FILE" -f docker-compose.prod.yml ps -q sesamefs)"
+docker compose --env-file "$ENV_FILE" -f docker-compose.prod.yml images -q sesamefs
+```
+
+The two IDs must match in every region. Only after that verification, set `GC_ENABLED=true` in
+the single designated GC region/DC and leave it `false` everywhere else. Recreate that backend
+and confirm `printenv GC_ENABLED` reports `true`; confirm all other regions still report `false`.
+If any region cannot complete the upgrade, leave GC disabled everywhere and roll back the binary
+fleet as a unit before re-enabling it.
+
+```bash
+# Designated GC region only, after editing its env file:
+docker compose --env-file "$ENV_FILE" -f docker-compose.prod.yml up -d --force-recreate sesamefs
+docker compose --env-file "$ENV_FILE" -f docker-compose.prod.yml exec sesamefs printenv GC_ENABLED
+# Required output here: true. Required output in every other region: false.
+```
 
 ```bash
 cd /opt/sesamefs

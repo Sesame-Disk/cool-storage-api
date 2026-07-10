@@ -72,7 +72,7 @@ existence check (P6) that could enqueue destructive work for live libraries is *
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
 | **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
 | **Existence Checks Fail Open (transient errors, P6a)** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors and scanner Phases 3/4/9 fail closed. Phase 9 scans `shares_by_group` directly and uses each projection row's `OrgID`, with unit and real-Cassandra regression coverage. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
-| **Orphan Work Lacks Worker Canonical Revalidation (P6b)** | ✅ Fixed (2026-07-10) | Phase 3/4 orphan items carry durable `canonical_absent` guard semantics. Under the shared restore/GC lifecycle lease, the worker proves global canonical absence and fails closed before deleting; retry/DLQ preserve the mode. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
+| **Orphan Work Lacks Worker Canonical Revalidation (P6b)** | ✅ Fixed (2026-07-10) | Phase 3/4 orphan items carry durable `canonical_absent` guard semantics. Under the shared renewable restore/GC lifecycle lease, the worker fail-closes on an O(1) canonical `(org_id, library_id)` point read before deleting; retry/DLQ preserve the mode. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
 | **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (High/Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
 | **Phase 9 Group-Share Discovery Is a Global Scan** | 🟠 Pending (Med) | The immediate fix streams `shares_by_group` in bounded driver pages with cancellation, but Cassandra still scans every partition. Replace with bucketed active-partition discovery. See ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01 below. |
 | **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Former E3 is escalated to the High P6 issue. See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
@@ -3494,23 +3494,16 @@ size/row count.
 **Affected**: `internal/api/v2/libraries.go`, `internal/api/v2/search.go`, `internal/gc/store_cassandra.go`, canonical `libraries` reads by org
 
 The recent projection branch moved several owner/enforcement reads off the
-canonical `libraries` org partition, but a few important callers still scan the
-canonical partition or even the whole table:
+canonical `libraries` org partition, but a few important callers still scan canonical
+partitions or the whole table:
 
 - library list endpoints still fetch full canonical rows by org
 - GC storage reconciliation still scans `FROM libraries`
-- destructive GC orphan revalidation uses `CanonicalLibraryExistsAnywhere`, a full canonical
-  scan, because neither `libraries_by_id` nor historical deletion metadata can prove global
-  absence under projection drift. This runs only for guarded orphan commit/fs_object work, but a
-  library with many residual rows can repeat the scan per item.
 - search prefilter still does org-scoped canonical enumeration
 
 **Fix direction**:
 - Bound library list reads to the caller's accessible library IDs and point-read canonical rows by id.
 - Revisit the full-table maintenance scan separately from hot-path readers.
-- Optimize orphan revalidation only with an authoritative lifecycle/ownership design that remains
-  synchronized with create, restore, and hard delete; do not replace the proof with another
-  best-effort projection.
 - Replace the search prefilter with a shape that matches the access pattern.
 
 ---
@@ -3766,18 +3759,23 @@ failure can delete a still-valid group share
   `library_guard_mode=canonical_absent`; normal library-cascade children use the distinct
   `deleted_at_identity` mode. Migration 011 persists the mode through queue, retry, DLQ, and
   requeue while retaining the legacy boolean for old-row reads.
-- `acquireLibraryDeleteGuard` acquires the library lifecycle lease, then uses
-  `CanonicalLibraryExistsAnywhere` to prove the UUID is absent from every canonical org
-  partition. It does not trust `libraries_by_id` or the `org_id` in a historical deletion marker.
-  Present → skip; absent → proceed; scan/read error → fail closed.
-- `restoreDeletedLibrary` now acquires and holds the same tokenized lease through its restoring
-  batch. Restore and orphan cleanup therefore cannot pass independent check-then-write windows.
+- `acquireLibraryDeleteGuard` acquires the library lifecycle lease, then point-reads the canonical
+  row by `(org_id, library_id)`. It does not trust `libraries_by_id`. This O(1) proof relies on the
+  existing repository invariant that library UUIDs are globally unique, immutable, and never moved
+  between org partitions; every creation path generates a fresh UUID. Present → skip; absent →
+  proceed; read error → fail closed.
+- `restoreDeletedLibrary` acquires the same tokenized lease, renews its heartbeat, and checks lease
+  ownership across the restoring batch and counter reconciliation. Restore and orphan cleanup
+  therefore cannot pass independent check-then-write or lease-expiry windows.
+- Guarded commit/fs_object processing also renews the lease and checks ownership before each
+  destructive boundary. Unknown persisted guard modes are quarantined directly in the DLQ and
+  remain visible, while healthy rows continue processing.
 - Historical markers no longer force orphan `IdentityAt` to equal `deleted_at`; genuine residual
   commits/fs_objects drain safely even when discovery occurs later. Cascade children retain their
   original delete identity and continue after the parent hard-deletes the marker and canonical row.
-- Tests cover live/gone/read-error, scanner→worker historical-marker cleanup, canonical presence
-  under a different org, child propagation, retry/DLQ preservation, and real-Cassandra canonical
-  and queue round trips.
+- Tests cover live/gone/read-error, scanner→worker historical-marker cleanup, child propagation,
+  retry/DLQ preservation, unknown-mode rejection, deterministic restore/worker contention in both
+  directions, token-safe takeover, and real-Cassandra canonical/lease/queue round trips.
 
 The original analysis is retained below for provenance.
 

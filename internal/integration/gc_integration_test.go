@@ -118,12 +118,37 @@ func TestGC_CanonicalLibraryExistsReadsCanonicalTableNotProjection(t *testing.T)
 		t.Fatal("CanonicalLibraryExists should be false for a non-existent library")
 	}
 
-	global, err := store.CanonicalLibraryExistsAnywhere(libraryID)
-	if err != nil {
-		t.Fatalf("CanonicalLibraryExistsAnywhere: %v", err)
+}
+
+func TestGC_LibraryLifecycleLeaseSerializesOwnersAndProtectsNewToken(t *testing.T) {
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	libraryID := uuid.New()
+	oldToken, newToken := uuid.New(), uuid.New()
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, libraryID.String()).Exec()
+	})
+
+	acquired, err := db.AcquireHardDeleteLease(session, db.HardDeleteLeaseLibrary, libraryID, oldToken, 90*time.Minute)
+	if err != nil || !acquired {
+		t.Fatalf("old owner acquire = (%v, %v), want (true, nil)", acquired, err)
 	}
-	if !global {
-		t.Fatal("CanonicalLibraryExistsAnywhere should find the canonical row without relying on org metadata")
+	if acquired, err := db.AcquireHardDeleteLease(session, db.HardDeleteLeaseLibrary, libraryID, uuid.New(), 90*time.Minute); err != nil || acquired {
+		t.Fatalf("competing owner acquire = (%v, %v), want (false, nil)", acquired, err)
+	}
+
+	staleAt := time.Now().Add(-2 * time.Hour).UTC()
+	if err := session.Query(`UPDATE gc_library_hard_delete_locks SET heartbeat = ? WHERE library_id = ?`, staleAt, libraryID.String()).Exec(); err != nil {
+		t.Fatalf("age old lease: %v", err)
+	}
+	if acquired, err := db.AcquireHardDeleteLease(session, db.HardDeleteLeaseLibrary, libraryID, newToken, 90*time.Minute); err != nil || !acquired {
+		t.Fatalf("new owner takeover = (%v, %v), want (true, nil)", acquired, err)
+	}
+	if err := db.ReleaseHardDeleteLease(session, db.HardDeleteLeaseLibrary, libraryID, oldToken); err == nil {
+		t.Fatal("old owner release should report lost ownership")
+	}
+	if acquired, err := db.AcquireHardDeleteLease(session, db.HardDeleteLeaseLibrary, libraryID, uuid.New(), 90*time.Minute); err != nil || acquired {
+		t.Fatalf("third owner acquire after stale release = (%v, %v), want (false, nil)", acquired, err)
 	}
 }
 

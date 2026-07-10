@@ -14,6 +14,7 @@ var gcFailedItemRetention = time.Duration(gcFailedItemRetentionSeconds) * time.S
 const (
 	GCFailureCodeNone                        = ""
 	GCFailureCodeLibraryHardDeleteInProgress = "library_hard_delete_in_progress"
+	GCFailureCodeInvalidLibraryGuardMode     = "invalid_library_guard_mode"
 )
 
 // GCStore abstracts all database operations used by the GC system.
@@ -150,10 +151,6 @@ type GCStore interface {
 	// projection), this consults the canonical table so orphan cleanup cannot act on a
 	// library that is still live under projection drift. Fails closed on read errors.
 	CanonicalLibraryExists(orgID, libraryID uuid.UUID) (bool, error)
-	// CanonicalLibraryExistsAnywhere proves whether libraryID exists in any
-	// canonical organization partition. It is reserved for destructive orphan
-	// cleanup where an org-scoped absence is not sufficient proof.
-	CanonicalLibraryExistsAnywhere(libraryID uuid.UUID) (bool, error)
 	FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error)
 	ListCommitIDsForLibrary(libraryID uuid.UUID) ([]string, error)
 	ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]string, error)

@@ -31,40 +31,6 @@ func parseUUID(s string) uuid.UUID {
 	return id
 }
 
-func parseCASUUID(value interface{}) uuid.UUID {
-	switch v := value.(type) {
-	case uuid.UUID:
-		return v
-	case string:
-		return parseUUID(v)
-	case []byte:
-		id, err := uuid.FromBytes(v)
-		if err != nil {
-			return uuid.Nil
-		}
-		return id
-	case fmt.Stringer:
-		return parseUUID(v.String())
-	default:
-		return parseUUID(fmt.Sprint(v))
-	}
-}
-
-func parseCASTime(value interface{}) time.Time {
-	switch v := value.(type) {
-	case time.Time:
-		return v
-	case string:
-		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
-			return t
-		}
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			return t
-		}
-	}
-	return time.Time{}
-}
-
 func parseCASString(value interface{}) string {
 	switch v := value.(type) {
 	case string:
@@ -78,34 +44,6 @@ func parseCASString(value interface{}) string {
 	default:
 		return fmt.Sprint(v)
 	}
-}
-
-func (s *CassandraStore) acquireHardDeleteLock(tableName, keyColumn string, keyValue, leaseToken uuid.UUID) (bool, error) {
-	now := time.Now().UTC()
-	existing := map[string]interface{}{}
-	applied, err := s.db.Session().Query(fmt.Sprintf(`
-		INSERT INTO %s (%s, started_at, heartbeat, lease_token)
-		VALUES (?, ?, ?, ?) IF NOT EXISTS
-	`, tableName, keyColumn), keyValue.String(), now, now, leaseToken.String()).MapScanCAS(existing)
-	if err != nil || applied {
-		return applied, err
-	}
-
-	heartbeat := parseCASTime(existing["heartbeat"])
-	existingToken := parseCASUUID(existing["lease_token"])
-	if heartbeat.IsZero() || existingToken == uuid.Nil || now.Sub(heartbeat) < hardDeleteLockStaleAfter {
-		return false, nil
-	}
-
-	applied, err = s.db.Session().Query(fmt.Sprintf(`
-		UPDATE %s USING TTL 21600
-		SET started_at = ?, heartbeat = ?, lease_token = ?
-		WHERE %s = ? IF lease_token = ?
-	`, tableName, keyColumn), now, now, leaseToken.String(), keyValue.String(), existingToken.String()).MapScanCAS(map[string]interface{}{})
-	if err != nil {
-		return false, err
-	}
-	return applied, nil
 }
 
 // parseDirEntries extracts child fs_ids from a JSON dir_entries column.
@@ -310,6 +248,9 @@ func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
 		return nil
 	}
 	for _, item := range items {
+		if _, err := validateLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck); err != nil {
+			return fmt.Errorf("invalid guard for %s/%s: %w", item.ItemType, item.ItemID, err)
+		}
 		if err := validateQueueItemBlockRepresentation(item); err != nil {
 			return err
 		}
@@ -532,7 +473,10 @@ func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemT
 // It deletes the old queue record and inserts a new one with a new queued_at timestamp and incremented retry count.
 func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error {
 	now := time.Now().UTC()
-	guardMode := effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
+	guardMode, err := validateLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
+	if err != nil {
+		return fmt.Errorf("invalid guard for requeue %s/%s: %w", itemType, itemID, err)
+	}
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 
 	// Delete old item
@@ -904,6 +848,10 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 	if err != nil {
 		return fmt.Errorf("load failed item for requeue %s/%s: %w", orgID, itemID, err)
 	}
+	guardMode, guardErr := validateLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
+	if guardErr != nil {
+		return fmt.Errorf("refusing to requeue failed item org=%s item_type=%s item_id=%s: %w", orgID, itemType, itemID, guardErr)
+	}
 	// Interpret the stored library_id via parseStoredQueueLibraryID instead of
 	// parseUUID, which would silently coerce a corrupted value to uuid.Nil —
 	// masking the corruption as a generic "requires library_id" validation error
@@ -934,7 +882,6 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 			orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), verr)
 	}
 	requeueAt := failedQueuedAt
-	guardMode := effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, library_guard_mode, item_type, item_id, library_id, block_representation_id, storage_class, retry_count)
@@ -2313,23 +2260,6 @@ func (s *CassandraStore) CanonicalLibraryExists(orgID, libraryID uuid.UUID) (boo
 		return false, fmt.Errorf("check canonical library existence for %s/%s: %w", orgID, libraryID, err)
 	}
 	return true, nil
-}
-
-func (s *CassandraStore) CanonicalLibraryExistsAnywhere(libraryID uuid.UUID) (bool, error) {
-	iter := s.db.Session().Query(`SELECT library_id FROM libraries`).Iter()
-	var libraryIDStr string
-	for iter.Scan(&libraryIDStr) {
-		if parseUUID(libraryIDStr) == libraryID {
-			if err := iter.Close(); err != nil {
-				return false, fmt.Errorf("finish canonical library scan for %s: %w", libraryID, err)
-			}
-			return true, nil
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return false, fmt.Errorf("scan canonical libraries for %s: %w", libraryID, err)
-	}
-	return false, nil
 }
 
 func (s *CassandraStore) FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error) {
@@ -3771,49 +3701,27 @@ func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) e
 }
 
 func (s *CassandraStore) AcquireUserHardDeleteLock(userID, leaseToken uuid.UUID) (bool, error) {
-	return s.acquireHardDeleteLock("gc_user_hard_delete_locks", "user_id", userID, leaseToken)
+	return db.AcquireHardDeleteLease(s.db.Session(), db.HardDeleteLeaseUser, userID, leaseToken, hardDeleteLockStaleAfter)
 }
 
 func (s *CassandraStore) RenewUserHardDeleteLock(userID, leaseToken uuid.UUID) (bool, error) {
-	applied, err := s.db.Session().Query(`
-		UPDATE gc_user_hard_delete_locks USING TTL 21600
-		SET heartbeat = ?, lease_token = ?
-		WHERE user_id = ? IF lease_token = ?
-	`, time.Now().UTC(), leaseToken.String(), userID.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
-	if err != nil {
-		return false, err
-	}
-	return applied, nil
+	return db.RenewHardDeleteLease(s.db.Session(), db.HardDeleteLeaseUser, userID, leaseToken)
 }
 
 func (s *CassandraStore) ReleaseUserHardDeleteLock(userID, leaseToken uuid.UUID) error {
-	_, err := s.db.Session().Query(`
-		DELETE FROM gc_user_hard_delete_locks WHERE user_id = ? IF lease_token = ?
-	`, userID.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
-	return err
+	return db.ReleaseHardDeleteLease(s.db.Session(), db.HardDeleteLeaseUser, userID, leaseToken)
 }
 
 func (s *CassandraStore) AcquireLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error) {
-	return s.acquireHardDeleteLock("gc_library_hard_delete_locks", "library_id", libraryID, leaseToken)
+	return db.AcquireHardDeleteLease(s.db.Session(), db.HardDeleteLeaseLibrary, libraryID, leaseToken, hardDeleteLockStaleAfter)
 }
 
 func (s *CassandraStore) RenewLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error) {
-	applied, err := s.db.Session().Query(`
-		UPDATE gc_library_hard_delete_locks USING TTL 21600
-		SET heartbeat = ?, lease_token = ?
-		WHERE library_id = ? IF lease_token = ?
-	`, time.Now().UTC(), leaseToken.String(), libraryID.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
-	if err != nil {
-		return false, err
-	}
-	return applied, nil
+	return db.RenewHardDeleteLease(s.db.Session(), db.HardDeleteLeaseLibrary, libraryID, leaseToken)
 }
 
 func (s *CassandraStore) ReleaseLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) error {
-	_, err := s.db.Session().Query(`
-		DELETE FROM gc_library_hard_delete_locks WHERE library_id = ? IF lease_token = ?
-	`, libraryID.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
-	return err
+	return db.ReleaseHardDeleteLease(s.db.Session(), db.HardDeleteLeaseLibrary, libraryID, leaseToken)
 }
 
 func (s *CassandraStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
@@ -4044,7 +3952,7 @@ func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 }
 
 func (s *CassandraStore) AcquireOrgHardDeleteLock(orgID, leaseToken uuid.UUID) (bool, error) {
-	return s.acquireHardDeleteLock("gc_org_hard_delete_locks", "org_id", orgID, leaseToken)
+	return db.AcquireHardDeleteLease(s.db.Session(), db.HardDeleteLeaseOrg, orgID, leaseToken, hardDeleteLockStaleAfter)
 }
 
 func (s *CassandraStore) RenewOrgHardDeleteLock(orgID, leaseToken uuid.UUID) (bool, error) {

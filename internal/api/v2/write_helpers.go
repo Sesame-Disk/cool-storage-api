@@ -958,23 +958,23 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 // the library's storage to aggregate counters. Mirror image of softDeleteLibrary.
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
 	now := time.Now().UTC()
-	leaseToken := uuid.New()
-	applied, err := db.Session().Query(`
-		INSERT INTO gc_library_hard_delete_locks (library_id, started_at, heartbeat, lease_token)
-		VALUES (?, ?, ?, ?) IF NOT EXISTS
-	`, libraryID, now, now, leaseToken.String()).MapScanCAS(map[string]interface{}{})
+	libraryUUID, err := uuid.Parse(libraryID)
 	if err != nil {
-		return fmt.Errorf("acquire library restore lock: %w", err)
+		return fmt.Errorf("parse library restore identity: %w", err)
+	}
+	lease, applied, err := dbpkg.AcquireRenewingHardDeleteLease(
+		db.Session(), dbpkg.HardDeleteLeaseLibrary, libraryUUID,
+		dbpkg.HardDeleteLeaseStaleAfter, dbpkg.HardDeleteLeaseHeartbeatInterval,
+	)
+	if err != nil {
+		return fmt.Errorf("acquire library restore lease: %w", err)
 	}
 	if !applied {
 		return fmt.Errorf("library is pending permanent deletion")
 	}
 	defer func() {
-		if err := db.Session().Query(`
-			DELETE FROM gc_library_hard_delete_locks
-			WHERE library_id = ? IF lease_token = ?
-		`, libraryID, leaseToken.String()).Exec(); err != nil {
-			log.Printf("[restoreDeletedLibrary] failed to release restore lock for %s: %v", libraryID, err)
+		if err := lease.Close(); err != nil {
+			log.Printf("[restoreDeletedLibrary] failed to close restore lease for %s: %v", libraryID, err)
 		}
 	}()
 
@@ -985,6 +985,9 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	nextRow := previousRow
 	nextRow.UpdatedAt = now
 	nextRow.DeletedAt = nil
+	if err := lease.Check(); err != nil {
+		return fmt.Errorf("library restore lease lost before write: %w", err)
+	}
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries SET updated_at = ?
@@ -1002,9 +1005,15 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("restore library: %w", err)
 	}
+	if err := lease.Check(); err != nil {
+		return fmt.Errorf("library restore lease lost during write: %w", err)
+	}
 
 	// Re-add the library's storage to aggregates.
 	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
+	if err := lease.Check(); err != nil {
+		return fmt.Errorf("library restore lease lost during storage reconciliation: %w", err)
+	}
 	return nil
 }
 

@@ -1215,6 +1215,9 @@ func (m *MockStore) seedQueueItemRow(orgID uuid.UUID, queuedAt time.Time, itemTy
 
 func (m *MockStore) EnqueueBatch(items []QueueItem) error {
 	for _, item := range items {
+		if _, err := validateLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck); err != nil {
+			return err
+		}
 		if err := validateQueueItemBlockRepresentation(item); err != nil {
 			return err
 		}
@@ -1563,6 +1566,10 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 	items := m.failedItems[orgID]
 	for i, item := range items {
 		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID {
+			guardMode, guardErr := validateLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck)
+			if guardErr != nil {
+				return fmt.Errorf("refusing to requeue failed item org=%s item_type=%s item_id=%s: %w", orgID, itemType, itemID, guardErr)
+			}
 			// Mirror CassandraStore.RequeueFailedItem: this path writes straight
 			// into the queue, so re-assert the block-representation invariant that
 			// EnqueueBatch would otherwise enforce.
@@ -1580,7 +1587,7 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 				QueuedAt:                    item.QueuedAt,
 				IdentityAt:                  effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
 				RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
-				LibraryGuardMode:            effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck),
+				LibraryGuardMode:            guardMode,
 				ItemType:                    item.ItemType,
 				ItemID:                      item.ItemID,
 				LibraryID:                   item.LibraryID,
@@ -2294,16 +2301,6 @@ func (m *MockStore) CanonicalLibraryExists(orgID, libraryID uuid.UUID) (bool, er
 	}
 	lib, ok := m.libraries[libraryID]
 	return ok && lib.OrgID == orgID, nil
-}
-
-func (m *MockStore) CanonicalLibraryExistsAnywhere(libraryID uuid.UUID) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.canonicalLibraryExistsErr != nil {
-		return false, m.canonicalLibraryExistsErr
-	}
-	_, ok := m.libraries[libraryID]
-	return ok, nil
 }
 
 func (m *MockStore) FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error) {

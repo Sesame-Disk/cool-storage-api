@@ -14,17 +14,21 @@ Session-by-session development history for SesameFS.
   `library_guard_mode=canonical_absent` (the mode propagates to cascade children), while normal
   library-cascade children use `deleted_at_identity`. Migration 011 persists the explicit mode
   through queue, retry, DLQ, and DLQ requeue; the legacy boolean remains reader-compatible.
-- The orphan guard acquires the library hard-delete lease and then proves global absence from the
-  **canonical** `libraries` table (`CanonicalLibraryExistsAnywhere`, fail-closed), rather than
-  trusting `libraries_by_id` or an org ID from a historical marker. A live library under any org
-  is skipped, including projection-drift and stale-marker cases.
-- Restore now acquires and holds the same tokenized lease through its restoring batch, closing the
-  check-then-update race with orphan cleanup and hard delete.
+- The orphan guard acquires the library lifecycle lease and performs an O(1), fail-closed point
+  read of the **canonical** `(org_id, library_id)` row instead of trusting `libraries_by_id`.
+  This uses the existing invariant that library UUIDs are globally unique, immutable, and never
+  moved between org partitions; all creation paths generate a fresh UUID.
+- Restore now holds the same tokenized lease through its restoring batch and renews its heartbeat
+  until release, closing the check-then-update and lease-expiry races with orphan cleanup.
+  Guarded commit/fs_object workers renew the lease too and check ownership before destructive
+  mutations; a stale owner cannot continue after token takeover.
   This closes P6b (`ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`); together with P6a (1D) both
   live-data classification exposures in the GC are now fixed.
 - Regression tests cover scanner→worker cleanup with a mismatched historical marker identity,
-  live canonical rows under the expected and a different org, fail-closed read errors, cascade
-  child propagation, retry/DLQ preservation, and Cassandra queue/global-existence round trips.
+  live canonical rows, fail-closed read errors and unknown modes, cascade child propagation,
+  retry/DLQ preservation, both restore/worker lock directions, and token-safe stale takeover.
+- Unknown persisted guard modes fail closed before item dispatch and move directly to a visible
+  DLQ quarantine row; they neither consume retry budget nor block healthy rows in the same batch.
 - Deployment note: do not run mixed old/new GC binaries while enabling migration 011 behavior.
   Stop or drain old GC workers, apply migrations/start the new image, then resume GC.
 

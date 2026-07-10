@@ -1,11 +1,14 @@
 package gc
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+var errInvalidLibraryGuardMode = errors.New("invalid library guard mode")
 
 // ItemType identifies the kind of object in the GC queue
 type ItemType string
@@ -62,6 +65,16 @@ func effectiveLibraryGuardMode(mode LibraryGuardMode, requiresLibraryDeletedChec
 	return LibraryGuardNone
 }
 
+func validateLibraryGuardMode(mode LibraryGuardMode, requiresLibraryDeletedCheck bool) (LibraryGuardMode, error) {
+	effective := effectiveLibraryGuardMode(mode, requiresLibraryDeletedCheck)
+	switch effective {
+	case LibraryGuardNone, LibraryGuardDeletedAtIdentity, LibraryGuardCanonicalMustBeAbsent:
+		return effective, nil
+	default:
+		return LibraryGuardNone, fmt.Errorf("%w %q", errInvalidLibraryGuardMode, effective)
+	}
+}
+
 // Queue provides operations for the gc_queue.
 type Queue struct {
 	store GCStore
@@ -104,6 +117,9 @@ func (q *Queue) EnqueueBatch(items []QueueItem) error {
 		return nil
 	}
 	for _, item := range items {
+		if _, err := validateLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck); err != nil {
+			return fmt.Errorf("invalid guard for %s/%s: %w", item.ItemType, item.ItemID, err)
+		}
 		if err := validateQueueItemBlockRepresentation(item); err != nil {
 			return err
 		}
