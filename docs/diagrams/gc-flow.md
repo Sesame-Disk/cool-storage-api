@@ -5,8 +5,8 @@
 > Current model: keyed `block_references`, durable candidates, LWT claim + live-ref recheck,
 > and write-ahead `gc_s3_orphans`. The retired `blocks.ref_count = -999` protocol is preserved
 > in Git history, not in this live diagram. The physical block-delete sequence is conservative,
-> and the fail-open orphan classification that blocked end-to-end safety (P6) is now fixed (1D).
-> Full audit:
+> and the transient-error fail-open in orphan classification (P6a) is now fixed (1D); a narrower
+> drift-only execution-time revalidation gap (P6b) remains. Full audit:
 > [../GC-DELETE-CLEANUP-INVESTIGATION.md](../GC-DELETE-CLEANUP-INVESTIGATION.md).
 
 ## 1. Worker loop
@@ -73,8 +73,9 @@ flowchart TD
     Candidate --> DeleteFS
 ```
 
-Scanner-created orphan work lacks the deleted-library guard, so P6 closed the fail-open existence
-read that fed it destructive work; a defense-in-depth execution-time guard remains possible future work.
+Scanner-created orphan work runs with `RequiresLibraryDeletedCheck=false`. P6a closed the fail-open
+existence read that fed it destructive work; an execution-time canonical-library revalidation guard
+(P6b, `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`) remains pending as defense-in-depth against drift.
 
 ## 4. Library delete and purge handoff
 
@@ -129,7 +130,8 @@ Important limits:
 
 - P3/P4 discovery currently enumerates only `libraries_by_id` + `deleted_libraries`, so
   markerless artifact partitions are invisible (audit P7).
-- `LibraryExists`/`GroupExists` now fail **closed** on Cassandra errors (audit P6, fixed 1D).
+- `LibraryExists`/`GroupExists` now fail **closed** on Cassandra errors (audit P6a, fixed 1D);
+  execution-time canonical revalidation of orphan work (P6b) is pending.
 - `up:` expiry has durable discovery; `pub:` expiry does not (audit P4).
 - Phase 13 currently logs some delivery failures without returning them (audit P5).
 

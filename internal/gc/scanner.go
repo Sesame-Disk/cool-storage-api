@@ -1015,8 +1015,9 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	// Cache group existence checks to avoid repeated lookups
-	groupExistsCache := make(map[uuid.UUID]bool)
+	// Cache group existence checks to avoid repeated lookups. Group existence is
+	// keyed by (org_id, group_id) in the data model, so cache on both.
+	groupExistsCache := make(map[string]bool)
 
 	cleaned := 0
 	failed := 0
@@ -1028,15 +1029,31 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 		default:
 		}
 
-		// Check if group still exists (with cache)
-		exists, cached := groupExistsCache[gs.SharedTo]
-		if !cached {
-			// We need the org_id to check group existence.
-			// Try to find it via the library's org.
-			orgID, err := s.store.FindOrgForLibrary(gs.LibraryID)
-			if err != nil || orgID == uuid.Nil {
+		// Resolve the group's org. Prefer the authoritative org_id carried on the
+		// share record (ListAllGroupShares derives it from the groups table); only
+		// fall back to the library→org projection when it is absent, and surface that
+		// fallback failure instead of silently skipping a share we could not classify.
+		orgID := gs.OrgID
+		if orgID == uuid.Nil {
+			resolvedOrgID, err := s.store.FindOrgForLibrary(gs.LibraryID)
+			if err != nil || resolvedOrgID == uuid.Nil {
+				log.Printf("[GC Scanner] Phase 9: cannot resolve org for group share %s (library %s); skipping: %v", gs.ShareID, gs.LibraryID, err)
+				failed++
+				if phaseErr == nil {
+					if err != nil {
+						phaseErr = err
+					} else {
+						phaseErr = fmt.Errorf("cannot resolve org for library %s", gs.LibraryID)
+					}
+				}
 				continue
 			}
+			orgID = resolvedOrgID
+		}
+
+		cacheKey := orgID.String() + ":" + gs.SharedTo.String()
+		exists, cached := groupExistsCache[cacheKey]
+		if !cached {
 			// Fail closed: a GroupExists error must NOT be read as "group gone",
 			// which would delete a valid share. Skip this share and surface the error.
 			groupExists, err := s.store.GroupExists(orgID, gs.SharedTo)
@@ -1049,7 +1066,7 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 				continue
 			}
 			exists = groupExists
-			groupExistsCache[gs.SharedTo] = exists
+			groupExistsCache[cacheKey] = exists
 		}
 
 		if !exists {

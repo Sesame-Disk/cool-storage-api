@@ -880,6 +880,43 @@ func TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError(t *testing
 	}
 }
 
+// Phase 9 must use the authoritative org_id carried on the group-share record and
+// not depend on the library→org projection: an orphaned share whose group is gone
+// is cleaned even when the library (and thus FindOrgForLibrary) can no longer resolve.
+func TestScanner_ScanOrphanedGroupShares_UsesShareOrgIDWithoutLibraryLookup(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	missingGroupID := uuid.New() // group does NOT exist
+	libID := uuid.New()
+	shareID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot")               // stamps gs.OrgID on the share
+	store.AddGroupShare(libID, shareID, missingGroupID)
+
+	// Break the library→org projection: FindOrgForLibrary can no longer resolve.
+	// The share still carries OrgID, so Phase 9 must still clean the orphan.
+	store.mu.Lock()
+	delete(store.libraries, libID)
+	store.mu.Unlock()
+
+	n, err := s.scanOrphanedGroupShares(context.Background())
+	if err != nil {
+		t.Fatalf("scanOrphanedGroupShares returned error: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 orphaned share cleaned via the share's own org_id, got %d", n)
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", libID, shareID)]; ok {
+		t.Fatal("orphaned group share was not cleaned even though the share carried its org_id")
+	}
+}
+
 // Regression for P6: a transient LibraryExists error in Phase 3 must NOT be treated
 // as "library gone" and enqueue a live library's commits for deletion.
 func TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError(t *testing.T) {
