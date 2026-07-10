@@ -1,5 +1,16 @@
 import { serviceURL } from './config';
-import { getAuthToken } from './api';
+import { getAuthToken, invalidateApiCache } from './api';
+
+// Content-addressed (block) upload block size. Must match the server's frozen
+// CAS block size (WebUploadBlockSize = 8 MiB): every non-final block MUST be
+// exactly this many bytes or the commit's manifest validation rejects it.
+export const BLOCK_SIZE = 8 * 1024 * 1024; // 8 MiB
+
+// Files at/above this size use the block-upload protocol (session → check →
+// upload blocks → commit). Smaller files keep the single-request path. Kept
+// intentionally low (1 MiB) so large uploads dedup/resume via the block flow
+// while typical small files stay on the cheap single POST.
+export const BLOCK_UPLOAD_THRESHOLD = 1 * 1024 * 1024; // 1 MiB
 
 export interface UploadFile {
   id: string;
@@ -28,6 +39,14 @@ let idCounter = 0;
 
 function generateId(): string {
   return `upload-${Date.now()}-${++idCounter}`;
+}
+
+/** Lowercase hex SHA-256 of the given bytes (the block hash the server verifies). */
+async function sha256Hex(data: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 class UploadManager {
@@ -125,11 +144,19 @@ class UploadManager {
     this.emit({ type: 'queue-changed', fileId: uploadFile.id });
 
     try {
-      // Step 1: Get upload link
-      const uploadLink = await this.getUploadLink(uploadFile.repoId, uploadFile.parentDir);
+      if (uploadFile.file.size >= BLOCK_UPLOAD_THRESHOLD) {
+        // Large file: content-addressed (block) upload with dedup + resume.
+        await this.performBlockUpload(uploadFile);
+      } else {
+        // Small file: single-request upload via a fresh upload link.
+        const uploadLink = await this.getUploadLink(uploadFile.repoId, uploadFile.parentDir);
+        await this.performUpload(uploadFile, uploadLink);
+      }
 
-      // Step 2: Upload the file
-      await this.performUpload(uploadFile, uploadLink);
+      // Refresh the directory listing (the service worker caches GET
+      // /api2/repos/<id>/dir/ and would otherwise serve a stale listing that
+      // omits the just-uploaded file). Matches create-folder/rename/delete.
+      await invalidateApiCache(`/api2/repos/${uploadFile.repoId}/dir`);
 
       uploadFile.status = 'completed';
       uploadFile.progress = 100;
@@ -166,6 +193,138 @@ class UploadManager {
     if (!res.ok) throw new Error('Failed to get upload link');
     const url = await res.json();
     return url as string;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Block (content-addressed) upload — mirrors the web flow:
+  //   1. POST /api/v2/repos/:id/block-upload-session/  → session_id, block_size
+  //   2. split file into fixed-size blocks, SHA-256 each
+  //   3. POST /api/v2/blocks/check                     → which blocks are missing
+  //   4. POST /api/v2/blocks/upload (per missing block, raw bytes)
+  //   5. POST /api/v2/repos/:id/file-from-blocks/      → commit the manifest
+  // ---------------------------------------------------------------------------
+  private async performBlockUpload(uploadFile: UploadFile): Promise<void> {
+    const { repoId, parentDir, file } = uploadFile;
+    const filename = uploadFile.relativePath.split('/').pop() || file.name;
+
+    // Step 1: mint a session (declare the size so the server can fail fast).
+    const session = await this.createBlockUploadSession(repoId, parentDir, file.size);
+    const blockSize = session.block_size > 0 ? session.block_size : BLOCK_SIZE;
+
+    // Step 2: split into blocks and hash each (ordered manifest).
+    // Files that reach this path are always non-empty (>= BLOCK_UPLOAD_THRESHOLD);
+    // the server rejects 0-block/empty manifests by design.
+    const blocks: { sha256: string; size: number; data: ArrayBuffer }[] = [];
+    for (let offset = 0; offset < file.size; offset += blockSize) {
+      const slice = file.slice(offset, Math.min(offset + blockSize, file.size));
+      const data = await slice.arrayBuffer();
+      const sha256 = await sha256Hex(data);
+      blocks.push({ sha256, size: data.byteLength, data });
+    }
+
+    // Step 3: ask which blocks the server still needs (dedup/resume).
+    const uniqueHashes = Array.from(new Set(blocks.map(b => b.sha256)));
+    const missing = new Set(await this.checkBlocks(uniqueHashes, session.session_id));
+
+    // Step 4: upload each missing block once, updating progress as we go.
+    const uploaded = new Set<string>();
+    let bytesDone = 0;
+    const totalBytes = file.size || 1;
+    for (const block of blocks) {
+      if (missing.has(block.sha256) && !uploaded.has(block.sha256)) {
+        await this.uploadBlock(session.session_id, block.sha256, block.data);
+        uploaded.add(block.sha256);
+      }
+      bytesDone += block.size;
+      uploadFile.progress = Math.min(99, Math.round((bytesDone / totalBytes) * 100));
+      this.emit({ type: 'progress', fileId: uploadFile.id, progress: uploadFile.progress });
+    }
+
+    // Step 5: commit the file from the ordered block manifest.
+    await this.createFileFromBlocks(repoId, {
+      session: session.session_id,
+      parent_dir: parentDir,
+      filename,
+      replace: false,
+      size: file.size,
+      blocks: blocks.map(b => ({ sha256: b.sha256, size: b.size })),
+    });
+  }
+
+  private async createBlockUploadSession(
+    repoId: string,
+    parentDir: string,
+    size: number,
+  ): Promise<{ session_id: string; block_size: number }> {
+    const token = getAuthToken();
+    const res = await fetch(`${serviceURL()}/api/v2/repos/${repoId}/block-upload-session/`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${token}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ parent_dir: parentDir, size }),
+    });
+    if (!res.ok) throw new Error(`Failed to create block-upload session (${res.status})`);
+    const data = await res.json();
+    return { session_id: data.session_id, block_size: data.block_size };
+  }
+
+  private async checkBlocks(hashes: string[], session: string): Promise<string[]> {
+    const token = getAuthToken();
+    const res = await fetch(`${serviceURL()}/api/v2/blocks/check`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${token}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Block-Upload-Session': session,
+      },
+      body: JSON.stringify({ hashes }),
+    });
+    if (!res.ok) throw new Error(`Failed to check blocks (${res.status})`);
+    const data = await res.json();
+    return (data.missing ?? []) as string[];
+  }
+
+  private async uploadBlock(session: string, hash: string, data: ArrayBuffer): Promise<void> {
+    const token = getAuthToken();
+    const res = await fetch(`${serviceURL()}/api/v2/blocks/upload`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${token}`,
+        'Content-Type': 'application/octet-stream',
+        'X-Block-Hash': hash,
+        'X-Block-Upload-Session': session,
+      },
+      body: data,
+    });
+    if (!res.ok) throw new Error(`Failed to upload block (${res.status})`);
+  }
+
+  private async createFileFromBlocks(
+    repoId: string,
+    manifest: {
+      session: string;
+      parent_dir: string;
+      filename: string;
+      replace: boolean;
+      size: number;
+      blocks: { sha256: string; size: number }[];
+    },
+  ): Promise<void> {
+    const token = getAuthToken();
+    const res = await fetch(`${serviceURL()}/api/v2/repos/${repoId}/file-from-blocks/`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${token}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(manifest),
+    });
+    if (!res.ok) throw new Error(`Failed to commit file from blocks (${res.status})`);
   }
 
   private performUpload(uploadFile: UploadFile, uploadLink: string): Promise<void> {

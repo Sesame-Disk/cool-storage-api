@@ -14,7 +14,7 @@ export function clearAuthToken(): void {
   localStorage.removeItem(TOKEN_KEY);
 }
 
-function authHeaders(): Record<string, string> {
+export function authHeaders(): Record<string, string> {
   const token = getAuthToken();
   return {
     'Authorization': `Token ${token}`,
@@ -23,7 +23,7 @@ function authHeaders(): Record<string, string> {
 }
 
 /** Remove a URL from the service-worker API cache so the next fetch hits the network. */
-async function invalidateApiCache(path: string): Promise<void> {
+export async function invalidateApiCache(path: string): Promise<void> {
   try {
     const cache = await caches.open('sesamefs-api-v1');
     const keys = await cache.keys();
@@ -53,6 +53,87 @@ export async function login(email: string, password: string): Promise<string> {
   const token: string = data.token;
   setAuthToken(token);
   return token;
+}
+
+// --------------------------- Local auth (sesameauth) ---------------------------
+// Unified auth (E11): the mobile login mirrors the web. Which methods are shown
+// is advertised by GET /api/v2.1/auth/methods; local username/password login is
+// handled by the optional sesameauth service, proxied same-origin by nginx.
+
+export interface AuthMethods {
+  local: boolean;
+  oidc: boolean;
+}
+
+/**
+ * Discover which auth methods are enabled so the login UI can render the right
+ * options. Resolves to `{ local: false, oidc: false }` when the endpoint is
+ * unavailable (e.g. sesameauth not running → 502), so callers can fall back to
+ * the legacy dev/password path.
+ */
+export async function getAuthMethods(): Promise<AuthMethods> {
+  try {
+    const res = await fetch(`${serviceURL()}/api/v2.1/auth/methods`, {
+      headers: { Accept: 'application/json' },
+      credentials: 'include',
+    });
+    if (!res.ok) return { local: false, oidc: false };
+    const data = await res.json();
+    return { local: Boolean(data.local), oidc: Boolean(data.oidc) };
+  } catch {
+    return { local: false, oidc: false };
+  }
+}
+
+export interface LocalLoginResult {
+  token: string;
+  email?: string;
+  name?: string;
+  role?: string;
+  must_change_password?: boolean;
+}
+
+/**
+ * Log in with a local (username/password) account against sesameauth. On
+ * success the returned session token is stored the same way as any other
+ * session (localStorage.seahub_token) so the rest of the app works.
+ */
+export async function localLogin(email: string, password: string): Promise<LocalLoginResult> {
+  const res = await fetch(`${serviceURL()}/api/v2.1/auth/local/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ email: email.trim(), password }),
+  });
+
+  if (!res.ok) {
+    if (res.status === 429) {
+      throw new Error('Too many failed attempts. Please wait and try again.');
+    }
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || data.error_msg || 'Login failed. Please check your credentials.');
+  }
+
+  const data = (await res.json()) as LocalLoginResult;
+  if (data.token) setAuthToken(data.token);
+  return data;
+}
+
+/**
+ * Change the current user's local-auth password (verifies the current one).
+ * Authenticated with the active session token.
+ */
+export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  const res = await fetch(`${serviceURL()}/api/v2.1/auth/local/change-password`, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || data.error_msg || 'Failed to change password');
+  }
 }
 
 // Group types
@@ -213,48 +294,53 @@ export async function deleteDir(repoId: string, path: string): Promise<void> {
   await invalidateApiCache(`/api2/repos/${repoId}/dir`);
 }
 
-// Move / Copy
-
-export async function moveFile(srcRepoId: string, srcPath: string, dstRepoId: string, dstDir: string): Promise<void> {
-  const res = await fetch(`${serviceURL()}/api2/repos/${srcRepoId}/file/?p=${encodeURIComponent(srcPath)}`, {
+// Move / Copy — use the batch-item endpoints (same-repo = sync, cross-repo =
+// async), matching the web app. The older /api2 `operation=move|copy` path is
+// NOT accepted by this backend ("source path is required").
+async function batchTransfer(
+  kind: 'move' | 'copy',
+  srcRepoId: string,
+  srcPath: string,
+  dstRepoId: string,
+  dstDir: string,
+): Promise<void> {
+  const lastSlash = srcPath.lastIndexOf('/');
+  const srcParent = lastSlash <= 0 ? '/' : srcPath.slice(0, lastSlash);
+  const name = srcPath.slice(lastSlash + 1);
+  const mode = srcRepoId === dstRepoId ? 'sync' : 'async';
+  const res = await fetch(`${serviceURL()}/api/v2.1/repos/${mode}-batch-${kind}-item/`, {
     method: 'POST',
-    headers: { ...authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ operation: 'move', dst_repo: dstRepoId, dst_dir: dstDir }),
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      src_repo_id: srcRepoId,
+      src_parent_dir: srcParent,
+      src_dirents: [name],
+      dst_repo_id: dstRepoId,
+      dst_parent_dir: dstDir,
+    }),
   });
-  if (!res.ok) throw new Error('Failed to move file');
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error_msg || data.error || `Failed to ${kind}`);
+  }
   await invalidateApiCache(`/api2/repos/${srcRepoId}/dir`);
   await invalidateApiCache(`/api2/repos/${dstRepoId}/dir`);
+}
+
+export async function moveFile(srcRepoId: string, srcPath: string, dstRepoId: string, dstDir: string): Promise<void> {
+  return batchTransfer('move', srcRepoId, srcPath, dstRepoId, dstDir);
 }
 
 export async function copyFile(srcRepoId: string, srcPath: string, dstRepoId: string, dstDir: string): Promise<void> {
-  const res = await fetch(`${serviceURL()}/api2/repos/${srcRepoId}/file/?p=${encodeURIComponent(srcPath)}`, {
-    method: 'POST',
-    headers: { ...authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ operation: 'copy', dst_repo: dstRepoId, dst_dir: dstDir }),
-  });
-  if (!res.ok) throw new Error('Failed to copy file');
-  await invalidateApiCache(`/api2/repos/${dstRepoId}/dir`);
+  return batchTransfer('copy', srcRepoId, srcPath, dstRepoId, dstDir);
 }
 
 export async function moveDir(srcRepoId: string, srcPath: string, dstRepoId: string, dstDir: string): Promise<void> {
-  const res = await fetch(`${serviceURL()}/api2/repos/${srcRepoId}/dir/?p=${encodeURIComponent(srcPath)}`, {
-    method: 'POST',
-    headers: { ...authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ operation: 'move', dst_repo: dstRepoId, dst_dir: dstDir }),
-  });
-  if (!res.ok) throw new Error('Failed to move folder');
-  await invalidateApiCache(`/api2/repos/${srcRepoId}/dir`);
-  await invalidateApiCache(`/api2/repos/${dstRepoId}/dir`);
+  return batchTransfer('move', srcRepoId, srcPath, dstRepoId, dstDir);
 }
 
 export async function copyDir(srcRepoId: string, srcPath: string, dstRepoId: string, dstDir: string): Promise<void> {
-  const res = await fetch(`${serviceURL()}/api2/repos/${srcRepoId}/dir/?p=${encodeURIComponent(srcPath)}`, {
-    method: 'POST',
-    headers: { ...authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ operation: 'copy', dst_repo: dstRepoId, dst_dir: dstDir }),
-  });
-  if (!res.ok) throw new Error('Failed to copy folder');
-  await invalidateApiCache(`/api2/repos/${dstRepoId}/dir`);
+  return batchTransfer('copy', srcRepoId, srcPath, dstRepoId, dstDir);
 }
 
 // File download link
@@ -286,7 +372,11 @@ export async function listStarredFiles(): Promise<StarredFile[]> {
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error('Failed to load starred files');
-  return await res.json();
+  // The API returns { starred_item_list: [...] }; older builds returned a bare
+  // array. Normalize to an array so callers can always .map() safely.
+  const data = await res.json();
+  if (Array.isArray(data)) return data;
+  return (data?.starred_item_list as StarredFile[]) ?? [];
 }
 
 export async function starFile(repoId: string, path: string): Promise<void> {
@@ -296,6 +386,9 @@ export async function starFile(repoId: string, path: string): Promise<void> {
     body: new URLSearchParams({ repo_id: repoId, p: path }),
   });
   if (!res.ok) throw new Error('Failed to star file');
+  // Refresh the dir listing's `starred` flag (SW caches GET /api2/... stale).
+  await invalidateApiCache(`/api2/repos/${repoId}`);
+  await invalidateApiCache('/api2/starredfiles');
 }
 
 export async function unstarFile(repoId: string, path: string): Promise<void> {
@@ -305,6 +398,8 @@ export async function unstarFile(repoId: string, path: string): Promise<void> {
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error('Failed to unstar file');
+  await invalidateApiCache(`/api2/repos/${repoId}`);
+  await invalidateApiCache('/api2/starredfiles');
 }
 
 // Share link types
@@ -350,7 +445,11 @@ export async function createShareLink(repoId: string, path: string, options: Sha
   const body: Record<string, unknown> = { repo_id: repoId, path };
   if (options.password) body.password = options.password;
   if (options.expire_days) body.expire_days = options.expire_days;
-  if (options.permissions) body.permissions = options.permissions;
+  if (options.permissions) {
+    // The backend expects a permission STRING, not an object.
+    const p = options.permissions;
+    body.permissions = p.can_edit ? 'edit' : p.can_download ? 'download' : 'preview_only';
+  }
   const res = await fetch(`${serviceURL()}/api/v2.1/share-links/`, {
     method: 'POST',
     headers: { ...authHeaders(), 'Content-Type': 'application/json' },
@@ -472,14 +571,39 @@ export async function listActivities(page: number = 1): Promise<{ events: Activi
   return { events: data.events || [], more: !!data.more };
 }
 
-export async function searchFiles(query: string, page: number = 1, perPage: number = 25): Promise<{ results: SearchResult[]; total: number }> {
+/**
+ * Advanced-search filter options. Mirrors the params the Go backend's
+ * /api/v2.1/search/ endpoint understands:
+ *   - objType: 'file' | 'dir' | 'repo' → sent as `type`; omit for "all types".
+ *   - repoId: limit search to a single library → sent as `repo_id`.
+ * All fields are optional so existing 3-arg callers keep working unchanged.
+ */
+export interface SearchOptions {
+  objType?: 'file' | 'dir' | 'repo';
+  repoId?: string;
+}
+
+export async function searchFiles(
+  query: string,
+  page: number = 1,
+  perPage: number = 25,
+  options: SearchOptions = {},
+): Promise<{ results: SearchResult[]; total: number }> {
   const params = new URLSearchParams({ q: query, page: String(page), per_page: String(perPage) });
-  const res = await fetch(`${serviceURL()}/api/v2.1/search-file/?${params}`, {
+  if (options.objType) params.set('type', options.objType);
+  if (options.repoId) params.set('repo_id', options.repoId);
+  const res = await fetch(`${serviceURL()}/api/v2.1/search/?${params}`, {
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error('Failed to search files');
   const data = await res.json();
-  return { results: data.results || [], total: data.total || 0 };
+  const rawResults: Record<string, unknown>[] = data.results || [];
+  // The backend returns `fullpath`; the app's SearchResult model uses `path`.
+  const results = rawResults.map((r) => ({
+    ...r,
+    path: (r.path ?? r.fullpath ?? '') as string,
+  })) as unknown as SearchResult[];
+  return { results, total: data.total ?? results.length };
 }
 
 // Shared repos types
@@ -566,6 +690,8 @@ export interface AccountInfo {
   login_id: string;
   institution: string;
   is_staff: boolean;
+  /** 1/true when the account is an org admin (org staff). May be 0/1 or boolean. */
+  is_org_staff?: number | boolean;
   avatar_url: string;
 }
 
@@ -574,6 +700,27 @@ export async function getAccountInfo(): Promise<AccountInfo> {
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error('Failed to load account info');
+  return await res.json();
+}
+
+/**
+ * Update the current user's profile. Mirrors the web `updateUserInfo`
+ * (PUT /api2/account/info/ with a `name` field). Invalidates the SW cache so
+ * the next getAccountInfo() reflects the change.
+ */
+export async function updateAccountInfo(fields: { name?: string }): Promise<AccountInfo> {
+  const payload: Record<string, string> = {};
+  if (typeof fields.name === 'string') payload.name = fields.name;
+  const res = await fetch(`${serviceURL()}/api2/account/info/`, {
+    method: 'PUT',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error_msg || data.error || 'Failed to update profile');
+  }
+  await invalidateApiCache('/api2/account');
   return await res.json();
 }
 

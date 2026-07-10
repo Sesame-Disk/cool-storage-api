@@ -1,8 +1,29 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Search, X, Clock, Trash2 } from 'lucide-react';
-import { searchFiles } from '../../lib/api';
-import type { SearchResult } from '../../lib/models';
+import { Search, X, Clock, SlidersHorizontal } from 'lucide-react';
+import { searchFiles, listRepos } from '../../lib/api';
+import type { SearchOptions } from '../../lib/api';
+import type { SearchResult, Repo } from '../../lib/models';
 import FileIcon from '../ui/FileIcon';
+
+/** Advanced-search filters. `objType` maps to the backend `type` param and
+ *  `repoId` to `repo_id`. Empty strings mean "no filter" (all types / all libs). */
+type ObjTypeFilter = '' | 'file' | 'dir';
+interface Filters {
+  objType: ObjTypeFilter;
+  repoId: string;
+}
+const DEFAULT_FILTERS: Filters = { objType: '', repoId: '' };
+
+function filtersToOptions(f: Filters): SearchOptions {
+  const opts: SearchOptions = {};
+  if (f.objType) opts.objType = f.objType;
+  if (f.repoId) opts.repoId = f.repoId;
+  return opts;
+}
+
+function filtersActive(f: Filters): boolean {
+  return !!f.objType || !!f.repoId;
+}
 
 const RECENT_SEARCHES_KEY = 'recent_searches';
 const MAX_RECENT = 10;
@@ -61,13 +82,29 @@ export default function SearchPage() {
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
+  const [filters, setFilters] = useState<Filters>(DEFAULT_FILTERS);
+  const [repos, setRepos] = useState<Repo[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const sentinelRef = useRef<HTMLDivElement>(null);
+  const filtersRef = useRef<Filters>(filters);
+  filtersRef.current = filters;
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  // Load libraries lazily the first time the filter panel is opened (for the
+  // search-scope selector). Failure is non-fatal — scope just stays "all".
+  useEffect(() => {
+    if (!showFilters || repos.length > 0) return;
+    let cancelled = false;
+    listRepos()
+      .then((r) => { if (!cancelled) setRepos(r); })
+      .catch(() => { /* scope selector degrades to All libraries */ });
+    return () => { cancelled = true; };
+  }, [showFilters, repos.length]);
 
   const performSearch = useCallback(async (q: string, pageNum: number = 1) => {
     if (q.length < MIN_QUERY_LENGTH) {
@@ -84,7 +121,7 @@ export default function SearchPage() {
     }
 
     try {
-      const data = await searchFiles(q, pageNum, PER_PAGE);
+      const data = await searchFiles(q, pageNum, PER_PAGE, filtersToOptions(filtersRef.current));
       if (pageNum === 1) {
         setResults(data.results);
       } else {
@@ -118,7 +155,8 @@ export default function SearchPage() {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [query, performSearch]);
+    // Re-search from page 1 whenever the query OR the active filters change.
+  }, [query, filters, performSearch]);
 
   // Infinite scroll via IntersectionObserver
   useEffect(() => {
@@ -221,6 +259,21 @@ export default function SearchPage() {
         </div>
         <button
           type="button"
+          onClick={() => setShowFilters((v) => !v)}
+          aria-label="Toggle search filters"
+          aria-expanded={showFilters}
+          className={`relative shrink-0 p-2 rounded-lg ${showFilters || filtersActive(filters) ? 'text-blue-500 bg-blue-50' : 'text-gray-500'}`}
+          data-testid="search-filter-toggle"
+        >
+          <SlidersHorizontal className="w-5 h-5" />
+          {filtersActive(filters) && (
+            <span className="absolute top-1 right-1 w-2 h-2 bg-blue-500 rounded-full" data-testid="filter-active-dot" />
+          )}
+        </button>
+        {/* Explicit submit control (Enter also submits the form). */}
+        <button type="submit" className="sr-only" data-testid="search-submit">Search</button>
+        <button
+          type="button"
           onClick={handleCancel}
           className="text-blue-500 text-sm font-medium shrink-0"
           data-testid="cancel-button"
@@ -228,6 +281,64 @@ export default function SearchPage() {
           Cancel
         </button>
       </form>
+
+      {/* Advanced filter panel (inline — no overlay, avoids z-index conflicts) */}
+      {showFilters && (
+        <div className="p-3 border-b border-gray-200 bg-gray-50 space-y-3" data-testid="search-filters">
+          <div>
+            <p className="text-xs font-semibold text-gray-500 uppercase mb-1.5">Show</p>
+            <div className="flex gap-2" role="radiogroup" aria-label="File type filter">
+              {([
+                { value: '', label: 'All' },
+                { value: 'file', label: 'Files' },
+                { value: 'dir', label: 'Folders' },
+              ] as const).map((opt) => (
+                <button
+                  key={opt.value || 'all'}
+                  type="button"
+                  role="radio"
+                  aria-checked={filters.objType === opt.value}
+                  onClick={() => setFilters((f) => ({ ...f, objType: opt.value }))}
+                  className={`px-3 py-1.5 rounded-full text-sm border ${
+                    filters.objType === opt.value
+                      ? 'bg-blue-500 text-white border-blue-500'
+                      : 'bg-white text-text border-gray-300'
+                  }`}
+                  data-testid={`filter-type-${opt.value || 'all'}`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <p className="text-xs font-semibold text-gray-500 uppercase mb-1.5">Search in</p>
+            <select
+              value={filters.repoId}
+              onChange={(e) => setFilters((f) => ({ ...f, repoId: e.target.value }))}
+              className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-sm text-text outline-none"
+              data-testid="filter-scope"
+            >
+              <option value="">All libraries</option>
+              {repos.map((r) => (
+                <option key={r.repo_id} value={r.repo_id}>{r.repo_name}</option>
+              ))}
+            </select>
+          </div>
+
+          {filtersActive(filters) && (
+            <button
+              type="button"
+              onClick={() => setFilters(DEFAULT_FILTERS)}
+              className="text-sm text-red-500"
+              data-testid="filter-reset"
+            >
+              Reset filters
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Recent searches */}
       {showRecent && (

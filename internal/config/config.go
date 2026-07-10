@@ -613,8 +613,35 @@ type AuthConfig struct {
 	DevMode              bool            `yaml:"dev_mode"`
 	DevTokens            []DevTokenEntry `yaml:"dev_tokens"`
 	OIDC                 OIDCConfig      `yaml:"oidc"`
+	Local                LocalAuthConfig `yaml:"local"`
 	FirstSuperAdminEmail string          `yaml:"first_superadmin_email"` // Email of the first superadmin to seed in the platform org on first startup
 	ShareLinkHMACKey     string          `yaml:"share_link_hmac_key"`    // HMAC key for share link password cookies
+}
+
+// LocalAuthConfig holds settings for local (username/password) authentication.
+// Local auth is an optional, independently-deployable path (the sesameauth
+// service): it coexists with OIDC and is fully disabled by default.
+type LocalAuthConfig struct {
+	// Enabled toggles local password authentication on/off.
+	Enabled bool `yaml:"enabled"`
+
+	// MinPasswordLength is the minimum acceptable password length.
+	MinPasswordLength int `yaml:"min_password_length"`
+
+	// MaxFailedAttempts is how many consecutive failed logins (per email|ip)
+	// trigger a temporary lockout. Zero disables lockout.
+	MaxFailedAttempts int `yaml:"max_failed_attempts"`
+
+	// LockoutDuration is how long an actor is blocked after exceeding
+	// MaxFailedAttempts.
+	LockoutDuration time.Duration `yaml:"lockout_duration"`
+
+	// BootstrapAdminEmail / BootstrapAdminPassword seed a first local admin
+	// credential on startup so a fresh open-source install can log in without
+	// OIDC or static dev tokens. The credential is created only if the email
+	// maps to a seeded user and no credential exists yet.
+	BootstrapAdminEmail    string `yaml:"bootstrap_admin_email"`
+	BootstrapAdminPassword string `yaml:"bootstrap_admin_password"`
 }
 
 // DevTokenEntry holds a development token for testing
@@ -846,6 +873,12 @@ func DefaultConfig() *Config {
 				RequirePKCE:      true,
 				ValidateAudience: true,
 				AllowedClockSkew: 2 * time.Minute,
+			},
+			Local: LocalAuthConfig{
+				Enabled:           false, // Disabled by default; opt-in for local accounts
+				MinPasswordLength: 8,
+				MaxFailedAttempts: 5,
+				LockoutDuration:   15 * time.Minute,
 			},
 		},
 		Chunking: ChunkingConfig{
@@ -1094,6 +1127,32 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("SHARE_LINK_HMAC_KEY"); v != "" {
 		c.Auth.ShareLinkHMACKey = v
+	}
+
+	// Local (username/password) auth
+	if v := os.Getenv("AUTH_LOCAL_ENABLED"); v != "" {
+		c.Auth.Local.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("AUTH_LOCAL_MIN_PASSWORD_LENGTH"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			c.Auth.Local.MinPasswordLength = n
+		}
+	}
+	if v := os.Getenv("AUTH_LOCAL_MAX_FAILED_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			c.Auth.Local.MaxFailedAttempts = n
+		}
+	}
+	if v := os.Getenv("AUTH_LOCAL_LOCKOUT_DURATION"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.Auth.Local.LockoutDuration = d
+		}
+	}
+	if v := os.Getenv("BOOTSTRAP_ADMIN_EMAIL"); v != "" {
+		c.Auth.Local.BootstrapAdminEmail = v
+	}
+	if v := os.Getenv("BOOTSTRAP_ADMIN_PASSWORD"); v != "" {
+		c.Auth.Local.BootstrapAdminPassword = v
 	}
 
 	// Web uploads

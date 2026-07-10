@@ -1,0 +1,13 @@
+---
+import AuthenticatedLayout from '../../layouts/AuthenticatedLayout.astro';
+import OpenInDesktop from '../../components/org-admin/OpenInDesktop';
+---
+
+<AuthenticatedLayout title="Statistics" pageTitle="Statistics">
+  <OpenInDesktop
+    client:load
+    screen="statistics"
+    title="Statistics"
+    description="Org usage and traffic charts are available in the desktop version."
+  />
+</AuthenticatedLayout>

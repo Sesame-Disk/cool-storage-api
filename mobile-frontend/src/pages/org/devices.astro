@@ -1,0 +1,13 @@
+---
+import AuthenticatedLayout from '../../layouts/AuthenticatedLayout.astro';
+import OpenInDesktop from '../../components/org-admin/OpenInDesktop';
+---
+
+<AuthenticatedLayout title="Devices" pageTitle="Devices">
+  <OpenInDesktop
+    client:load
+    screen="devices"
+    title="Devices"
+    description="Linked desktop and mobile devices are managed in the desktop version."
+  />
+</AuthenticatedLayout>

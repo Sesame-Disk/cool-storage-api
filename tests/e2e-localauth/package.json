@@ -1,0 +1,12 @@
+{
+  "name": "sesamefs-localauth-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "End-to-end tests for SesameFS local authentication (sesameauth + storage service).",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.48.2"
+  }
+}

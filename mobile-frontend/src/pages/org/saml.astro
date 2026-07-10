@@ -1,0 +1,13 @@
+---
+import AuthenticatedLayout from '../../layouts/AuthenticatedLayout.astro';
+import OpenInDesktop from '../../components/org-admin/OpenInDesktop';
+---
+
+<AuthenticatedLayout title="SAML / SSO" pageTitle="SAML / SSO">
+  <OpenInDesktop
+    client:load
+    screen="saml"
+    title="SAML / SSO"
+    description="SAML single sign-on configuration is managed in the desktop version."
+  />
+</AuthenticatedLayout>

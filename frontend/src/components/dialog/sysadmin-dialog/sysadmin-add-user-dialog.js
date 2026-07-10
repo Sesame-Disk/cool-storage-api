@@ -22,10 +22,24 @@ class SysAdminAddUserDialog extends React.Component {
       errorMsg: '',
       email: '',
       name: '',
+      password: '',
       role: 'default',
       isSubmitBtnActive: false
     };
   }
+
+  inputPassword = (e) => {
+    this.setState({ password: e.target.value });
+  };
+
+  generatePassword = () => {
+    // URL-safe random password; long enough to satisfy the default policy.
+    const bytes = new Uint8Array(12);
+    (window.crypto || window.msCrypto).getRandomValues(bytes);
+    const password = btoa(String.fromCharCode(...bytes))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    this.setState({ password });
+  };
 
   checkSubmitBtnActive = () => {
     const { email } = this.state;
@@ -62,13 +76,16 @@ class SysAdminAddUserDialog extends React.Component {
   };
 
   handleSubmit = () => {
-    const { email, name, role } = this.state;
+    const { email, name, role, password } = this.state;
     let data = {
       email: email.trim(),
       name: name.trim()
     };
     if (this.props.showRole) {
       data.role = role;
+    }
+    if (password) {
+      data.password = password;
     }
     this.setState({ isSubmitBtnActive: false });
     this.props.addUser(data).then(() => {
@@ -83,7 +100,7 @@ class SysAdminAddUserDialog extends React.Component {
   render() {
     const { dialogTitle, showRole } = this.props;
     const {
-      errorMsg, email, name, role,
+      errorMsg, email, name, password, role,
       isSubmitBtnActive
     } = this.state;
     return (
@@ -105,6 +122,21 @@ class SysAdminAddUserDialog extends React.Component {
                 <FormGroup>
                   <Label>{gettext('Name(optional)')}</Label>
                   <Input type="text" value={name} onChange={this.inputName} />
+                </FormGroup>
+                <FormGroup>
+                  <Label>{gettext('Password(optional)')}</Label>
+                  <InputGroup>
+                    <Input
+                      type="text"
+                      value={password}
+                      onChange={this.inputPassword}
+                      autoComplete="new-password"
+                      placeholder={gettext('Leave blank to auto-generate a temporary password')}
+                    />
+                    <InputGroupAddon addonType="append">
+                      <Button color="secondary" onClick={this.generatePassword}>{gettext('Generate')}</Button>
+                    </InputGroupAddon>
+                  </InputGroup>
                 </FormGroup>
                 {showRole &&
                   <FormGroup>

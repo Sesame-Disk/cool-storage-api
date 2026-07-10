@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { login } from '../../lib/api';
+import { login, localLogin, getAuthMethods } from '../../lib/api';
 import { getOIDCLoginURL, isDevBypass } from '../../lib/oidc';
 import { getConfig } from '../../lib/config';
 
@@ -9,6 +9,15 @@ export default function LoginForm() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+
+  // Unified auth (E11): discover which methods the backend advertises so we can
+  // render the right options. `local` gates the email+password form; `oidc`
+  // gates the SSO button. When methods are unavailable (sesameauth not running
+  // → 502, both false) we still render the legacy dev/password + SSO paths so
+  // dev-token login keeps working.
+  const [localEnabled, setLocalEnabled] = useState(false);
+  const [oidcEnabled, setOidcEnabled] = useState(false);
+  const [methodsLoaded, setMethodsLoaded] = useState(false);
 
   const config = getConfig();
   const params = new URLSearchParams(window.location.search);
@@ -21,9 +30,30 @@ export default function LoginForm() {
     }
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    getAuthMethods()
+      .then((methods) => {
+        if (cancelled) return;
+        setLocalEnabled(methods.local);
+        if (methods.oidc) setOidcEnabled(true);
+      })
+      .finally(() => {
+        if (!cancelled) setMethodsLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   if (isDevBypass()) {
     return null;
   }
+
+  // If methods were discovered and local is off, fall back to the legacy
+  // dev/password path (POST /api2/auth-token/). When methods advertise `local`
+  // we use the sesameauth login endpoint instead.
+  const useLocalAuth = localEnabled;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -31,7 +61,11 @@ export default function LoginForm() {
     setLoading(true);
 
     try {
-      await login(email, password);
+      if (useLocalAuth) {
+        await localLogin(email, password);
+      } else {
+        await login(email, password);
+      }
       window.location.href = '/libraries/';
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed');
@@ -53,8 +87,13 @@ export default function LoginForm() {
     }
   };
 
+  // Show the SSO button when OIDC is advertised, OR until methods have loaded
+  // (so the legacy SSO path is available before discovery / when the methods
+  // endpoint is unavailable). Once methods load and OIDC is off, hide it.
+  const showSSO = oidcEnabled || !methodsLoaded;
+
   return (
-    <div className="flex flex-col items-center w-full">
+    <div className="flex flex-col items-center w-full" data-testid="login-form">
       <img
         src={`${config.mediaUrl}${config.logoPath}`}
         alt={config.siteTitle}
@@ -75,7 +114,11 @@ export default function LoginForm() {
       )}
 
       {error && (
-        <p className="text-red-600 text-sm mb-4 text-center" role="alert">
+        <p
+          className="text-red-600 text-sm mb-4 text-center"
+          role="alert"
+          data-testid="login-error"
+        >
           {error}
         </p>
       )}
@@ -88,6 +131,7 @@ export default function LoginForm() {
           onChange={(e) => setEmail(e.target.value)}
           autoComplete="username"
           required
+          data-testid="login-email"
           className="w-full min-h-[44px] px-4 py-3 rounded-lg border border-border focus:outline-none focus:ring-2 focus:ring-primary"
         />
 
@@ -99,6 +143,7 @@ export default function LoginForm() {
             onChange={(e) => setPassword(e.target.value)}
             autoComplete="current-password"
             required
+            data-testid="login-password"
             className="w-full min-h-[44px] px-4 py-3 rounded-lg border border-border focus:outline-none focus:ring-2 focus:ring-primary pr-16"
           />
           <button
@@ -113,25 +158,31 @@ export default function LoginForm() {
         <button
           type="submit"
           disabled={loading}
+          data-testid="login-submit"
           className="w-full h-12 bg-primary-button text-white rounded-lg font-medium hover:bg-primary-hover disabled:opacity-50 transition-colors"
         >
           {loading ? 'Logging in...' : 'Log In'}
         </button>
       </form>
 
-      <div className="w-full flex items-center my-6">
-        <div className="flex-1 border-t border-border" />
-        <span className="px-4 text-sm text-gray-400">or</span>
-        <div className="flex-1 border-t border-border" />
-      </div>
+      {showSSO && (
+        <>
+          <div className="w-full flex items-center my-6">
+            <div className="flex-1 border-t border-border" />
+            <span className="px-4 text-sm text-gray-400">or</span>
+            <div className="flex-1 border-t border-border" />
+          </div>
 
-      <button
-        onClick={handleSSO}
-        disabled={loading}
-        className="w-full h-12 border border-border rounded-lg font-medium text-text hover:bg-gray-50 disabled:opacity-50 transition-colors"
-      >
-        Sign in with SSO
-      </button>
+          <button
+            onClick={handleSSO}
+            disabled={loading}
+            data-testid="login-sso"
+            className="w-full h-12 border border-border rounded-lg font-medium text-text hover:bg-gray-50 disabled:opacity-50 transition-colors"
+          >
+            Sign in with SSO
+          </button>
+        </>
+      )}
     </div>
   );
 }

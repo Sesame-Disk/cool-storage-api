@@ -1,0 +1,12 @@
+---
+import AuthenticatedLayout from '../../../layouts/AuthenticatedLayout.astro';
+import HistoryPage from '../../../components/pages/HistoryPage';
+
+export function getStaticPaths() {
+  return [];
+}
+---
+
+<AuthenticatedLayout title="History" pageTitle="History">
+  <HistoryPage client:load />
+</AuthenticatedLayout>

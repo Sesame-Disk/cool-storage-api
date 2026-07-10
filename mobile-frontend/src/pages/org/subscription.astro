@@ -1,0 +1,13 @@
+---
+import AuthenticatedLayout from '../../layouts/AuthenticatedLayout.astro';
+import OpenInDesktop from '../../components/org-admin/OpenInDesktop';
+---
+
+<AuthenticatedLayout title="Subscription" pageTitle="Subscription">
+  <OpenInDesktop
+    client:load
+    screen="subscription"
+    title="Subscription"
+    description="Plan and billing details are managed in the desktop version."
+  />
+</AuthenticatedLayout>

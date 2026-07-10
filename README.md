@@ -159,6 +159,9 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 
 ### Quick Start (Development)
 
+The stack ships with **dev tokens** on by default (static bearer tokens, dev-only).
+For real username/password logins or SSO, see [Authentication modes](#authentication-modes) below.
+
 ```bash
 # Clone the repository
 git clone https://github.com/Sesame-Disk/sesamefs.git
@@ -185,6 +188,31 @@ curl -I http://localhost:3000/accounts/delete/
 # Stop when done
 docker compose down
 ```
+
+#### Authentication modes
+
+SesameFS supports three login paths that can be mixed; pick per deployment:
+
+| Mode | Enable | How you log in |
+|------|--------|----------------|
+| **Dev tokens** (default) | `AUTH_DEV_MODE=true` (default in `.env`) | Static header `Authorization: Token dev-token-admin` — **dev only** |
+| **Local accounts** | `AUTH_LOCAL_ENABLED=true` + start the `auth` profile | Username/password at `/login/`, served by the optional `sesameauth` container |
+| **OIDC (SSO)** | `OIDC_ENABLED=true` + `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | "Continue with SSO" against your IdP |
+
+Dev tokens ship on by default (the Quick Start above). To run local accounts —
+real bcrypt-hashed username/password accounts with no external IdP:
+
+```bash
+# Enable local auth, seed a first admin, and start the optional login service
+AUTH_LOCAL_ENABLED=true \
+BOOTSTRAP_ADMIN_EMAIL=superadmin@sesamefs.local \
+BOOTSTRAP_ADMIN_PASSWORD=change-me \
+  docker compose --profile auth up -d sesamefs sesameauth frontend
+# then sign in at http://localhost:3000/login/ (superadmin can then open /sys/)
+```
+
+See **[docs/LOCAL-AUTH.md](docs/LOCAL-AUTH.md)** for the full guide (admin user
+management, password policy/lockout, reverse-proxy setup, and E2E tests).
 
 `/billing/` is always an internal SesameFS route. The backend checks authentication and redirects to the external portal configured by `BILLING_URL`. In local Docker Compose, that env var defaults to `https://t-accounts.sesamedisk.com/billing/` for testing only.
 

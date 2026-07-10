@@ -5,6 +5,10 @@ import LoginForm from '../LoginForm';
 
 vi.mock('../../../lib/api', () => ({
   login: vi.fn(),
+  localLogin: vi.fn(),
+  // Default: advertise OIDC (keeps the SSO button rendered) but not local, so
+  // the legacy dev/password login() path these tests assert stays in effect.
+  getAuthMethods: vi.fn(() => Promise.resolve({ local: false, oidc: true })),
 }));
 
 vi.mock('../../../lib/oidc', () => ({

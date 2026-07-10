@@ -1,0 +1,5 @@
+
+# Parity e2e auth states + reports
+e2e-parity/.auth/
+playwright-report/
+test-results/

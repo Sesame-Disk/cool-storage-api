@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { X } from 'lucide-react';
-import { getAuthToken } from '../../lib/api';
+import { getAuthToken, invalidateApiCache } from '../../lib/api';
 import { serviceURL } from '../../lib/config';
 
 interface NewFolderDialogProps {
@@ -26,6 +26,9 @@ async function createFolder(repoId: string, path: string): Promise<void> {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error_msg || 'Failed to create folder');
   }
+  // Drop the cached directory listing so the new folder shows on refresh
+  // (the service worker caches GET /api2/... stale-while-revalidate).
+  await invalidateApiCache(`/api2/repos/${repoId}`);
 }
 
 export default function NewFolderDialog({ isOpen, onClose, repoId, path, onSuccess }: NewFolderDialogProps) {

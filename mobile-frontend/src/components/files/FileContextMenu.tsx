@@ -24,12 +24,14 @@ interface MenuItemProps {
   label: string;
   onClick: () => void;
   danger?: boolean;
+  testId?: string;
 }
 
-function MenuItem({ icon, label, onClick, danger }: MenuItemProps) {
+function MenuItem({ icon, label, onClick, danger, testId }: MenuItemProps) {
   return (
     <button
       onClick={onClick}
+      data-testid={testId}
       className={`flex items-center gap-3 w-full px-4 py-3 min-h-[44px] text-left hover:bg-gray-50 ${danger ? 'text-red-500' : 'text-text'}`}
     >
       {icon}
@@ -65,42 +67,50 @@ export default function FileContextMenu({
           icon={<Star className="w-5 h-5" />}
           label={dirent.starred ? 'Unstar' : 'Star'}
           onClick={() => handleAction(onStar)}
+          testId="context-menu-star"
         />
         <MenuItem
           icon={<Share2 className="w-5 h-5" />}
           label="Share"
           onClick={() => handleAction(onShare)}
+          testId="context-menu-share"
         />
         <MenuItem
           icon={<Pencil className="w-5 h-5" />}
           label="Rename"
           onClick={() => handleAction(onRename)}
+          testId="context-menu-rename"
         />
         <MenuItem
           icon={<Copy className="w-5 h-5" />}
           label="Copy"
           onClick={() => handleAction(onCopy)}
+          testId="context-menu-copy"
         />
         <MenuItem
           icon={<FolderInput className="w-5 h-5" />}
           label="Move"
           onClick={() => handleAction(onMove)}
+          testId="context-menu-move"
         />
         <MenuItem
           icon={<Download className="w-5 h-5" />}
           label="Download"
           onClick={() => handleAction(onDownload)}
+          testId="context-menu-download"
         />
         <MenuItem
           icon={<Info className="w-5 h-5" />}
           label="Details"
           onClick={() => handleAction(onDetails)}
+          testId="context-menu-details"
         />
         <MenuItem
           icon={<Trash2 className="w-5 h-5" />}
           label="Delete"
           onClick={() => handleAction(onDelete)}
           danger
+          testId="context-menu-delete"
         />
       </div>
     </BottomSheet>

@@ -1,0 +1,13 @@
+---
+import AuthenticatedLayout from '../../layouts/AuthenticatedLayout.astro';
+import OpenInDesktop from '../../components/org-admin/OpenInDesktop';
+---
+
+<AuthenticatedLayout title="Departments" pageTitle="Departments">
+  <OpenInDesktop
+    client:load
+    screen="departments"
+    title="Departments"
+    description="The department / address-book structure is managed in the desktop version."
+  />
+</AuthenticatedLayout>

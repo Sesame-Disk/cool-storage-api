@@ -1,0 +1,8 @@
+---
+import AuthenticatedLayout from '../../layouts/AuthenticatedLayout.astro';
+import OrgSettingsPage from '../../components/org-admin/OrgSettingsPage';
+---
+
+<AuthenticatedLayout title="Org Settings" pageTitle="Org Settings">
+  <OrgSettingsPage client:load />
+</AuthenticatedLayout>

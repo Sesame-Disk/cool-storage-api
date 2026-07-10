@@ -1,0 +1,12 @@
+---
+import AuthenticatedLayout from '../../../layouts/AuthenticatedLayout.astro';
+import TrashPage from '../../../components/pages/TrashPage';
+
+export function getStaticPaths() {
+  return [];
+}
+---
+
+<AuthenticatedLayout title="Trash" pageTitle="Trash">
+  <TrashPage client:load />
+</AuthenticatedLayout>

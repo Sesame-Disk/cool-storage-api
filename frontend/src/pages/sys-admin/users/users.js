@@ -320,14 +320,27 @@ class Users extends Component {
   };
 
   addUser = (data) => {
-    const { email, name, role } = data;
-    return seafileAPI.sysAdminAddUser(email, name, role).then((res) => {
+    const { email, name, role, password } = data;
+    return seafileAPI.sysAdminAddUser(email, name, role, password).then((res) => {
+      // With local auth enabled the backend wraps the user as { user, temp_password };
+      // otherwise res.data is the user object directly.
+      const user = res.data.user || res.data;
       let userList = this.state.userList;
-      userList.unshift(res.data);
+      userList.unshift(user);
       this.setState({
         userList: userList
       });
-      toaster.success(res.data.add_user_tip);
+      if (res.data.temp_password) {
+        // Temporary password is returned only once — surface it so the admin
+        // can hand it to the user. It must be changed on first login.
+        toaster.success(
+          gettext('User created. Temporary password: {password}')
+            .replace('{password}', res.data.temp_password),
+          { duration: 30 }
+        );
+      } else {
+        toaster.success(res.data.add_user_tip || gettext('Successfully added user %(email)s.').replace('%(email)s', email));
+      }
     });
   };
 

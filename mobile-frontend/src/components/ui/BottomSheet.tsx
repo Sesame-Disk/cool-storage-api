@@ -25,7 +25,7 @@ export default function BottomSheet({ isOpen, onClose, title, fullScreen, childr
     <AnimatePresence>
       {isOpen && (
         <motion.div
-          className="fixed inset-0 z-50 flex items-end justify-center"
+          className="fixed inset-0 z-[60] flex items-end justify-center"
           initial={{ backgroundColor: 'rgba(0,0,0,0)' }}
           animate={{ backgroundColor: 'rgba(0,0,0,0.4)' }}
           exit={{ backgroundColor: 'rgba(0,0,0,0)' }}

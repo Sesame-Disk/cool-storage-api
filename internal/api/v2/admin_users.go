@@ -9,6 +9,7 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/localauth"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
@@ -346,9 +347,10 @@ func (h *AdminHandler) AdminCreateUser(c *gin.Context) {
 	}
 
 	var req struct {
-		Email string `json:"email"`
-		Name  string `json:"name"`
-		Role  string `json:"role"`
+		Email    string `json:"email"`
+		Name     string `json:"name"`
+		Role     string `json:"role"`
+		Password string `json:"password"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -399,7 +401,102 @@ func (h *AdminHandler) AdminCreateUser(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, makeAdminUserResponse(email, name, role, "active", -2, 0, now, time.Time{}))
+	userResp := makeAdminUserResponse(email, name, role, "active", -2, 0, now, time.Time{})
+
+	// When local auth is enabled, attach a credential so the new user can log
+	// in. An explicit password is usable as-is; otherwise generate a one-time
+	// temporary password and return it so the admin can share it out-of-band.
+	if svc := h.localAuthService(); svc != nil {
+		password := strings.TrimSpace(req.Password)
+		mustChange := false
+		var tempPassword string
+		if password == "" {
+			tempPassword = generateTempPassword()
+			password = tempPassword
+			mustChange = true
+		}
+		if err := svc.SetPassword(email, userID, orgID, password, mustChange, now); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		resp := gin.H{"user": userResp}
+		if tempPassword != "" {
+			resp["temp_password"] = tempPassword
+			resp["must_change_password"] = true
+		}
+		c.JSON(http.StatusCreated, resp)
+		return
+	}
+
+	c.JSON(http.StatusCreated, userResp)
+}
+
+// AdminSetUserPassword sets or resets a local user's password (platform admin).
+// If local auth is disabled it is a graceful no-op. Body (optional):
+// { "password": "..." }; when omitted a one-time temporary password is returned.
+// PUT /admin/users/:email/set-password/
+func (h *AdminHandler) AdminSetUserPassword(c *gin.Context) {
+	callerOrgID := c.GetString("org_id")
+	callerUserID := c.GetString("user_id")
+	if err := h.requireAdminAccess(c, callerOrgID, callerUserID); err != nil {
+		return
+	}
+
+	email := strings.TrimSpace(c.GetString("resolved_user_param"))
+	if email == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user identifier required"})
+		return
+	}
+
+	svc := h.localAuthService()
+	if svc == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"detail":  "local authentication is not enabled; password management is a no-op",
+		})
+		return
+	}
+
+	// Resolve the target user's identity from the global email index.
+	var userID, orgID string
+	if err := h.db.Session().Query(`
+		SELECT user_id, org_id FROM users_by_email WHERE email = ?
+	`, email).Scan(&userID, &orgID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	var body struct {
+		Password string `json:"password"`
+	}
+	_ = c.ShouldBindJSON(&body) // optional
+
+	password := strings.TrimSpace(body.Password)
+	mustChange := false
+	var tempPassword string
+	if password == "" {
+		tempPassword = generateTempPassword()
+		password = tempPassword
+		mustChange = true
+	}
+
+	if err := svc.SetPassword(email, userID, orgID, password, mustChange, time.Now()); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	resp := gin.H{"success": true}
+	if tempPassword != "" {
+		resp["temp_password"] = tempPassword
+		resp["must_change_password"] = true
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// localAuthService returns a localauth.Service bound to this handler's DB and
+// the configured password policy, or nil when local auth is disabled.
+func (h *AdminHandler) localAuthService() *localauth.Service {
+	return buildLocalAuthService(h.config, h.db)
 }
 
 // GetUserByEmail returns user details by email.

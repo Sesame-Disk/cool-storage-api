@@ -16,6 +16,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/api"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/localauth"
 	"github.com/Sesame-Disk/sesamefs/internal/logging"
 	"github.com/joho/godotenv"
 )
@@ -93,6 +94,12 @@ func runServer() {
 		os.Exit(1)
 	}
 
+	// Seed the first local admin credential so a fresh open-source install can
+	// log in without OIDC or static dev tokens. Idempotent and best-effort.
+	if err := seedBootstrapAdminCredential(database, cfg); err != nil {
+		slog.Warn("Bootstrap admin credential not seeded", "error", err)
+	}
+
 	// Create and start the API server
 	server := api.NewServer(cfg, database, Version)
 
@@ -132,6 +139,43 @@ func runServer() {
 			os.Exit(1)
 		}
 	}
+}
+
+// seedBootstrapAdminCredential attaches a local password to an already-seeded
+// user identified by BOOTSTRAP_ADMIN_EMAIL, so operators can log in on first
+// boot. It is a no-op unless local auth is enabled and both email+password are
+// configured, and it never overwrites an existing credential.
+func seedBootstrapAdminCredential(database *db.DB, cfg *config.Config) error {
+	lc := cfg.Auth.Local
+	if !lc.Enabled || lc.BootstrapAdminEmail == "" || lc.BootstrapAdminPassword == "" {
+		return nil
+	}
+
+	email := localauth.NormalizeEmail(lc.BootstrapAdminEmail)
+
+	var userID, orgID string
+	if err := database.Session().Query(
+		`SELECT user_id, org_id FROM users_by_email WHERE email = ?`, email,
+	).Scan(&userID, &orgID); err != nil {
+		return fmt.Errorf("bootstrap admin %q not found among seeded users (seed it via FIRST_SUPERADMIN_EMAIL or dev_mode first): %w", email, err)
+	}
+
+	if has, err := localauth.HasCredential(database.Session(), email); err != nil {
+		return err
+	} else if has {
+		return nil // already provisioned; don't clobber a rotated password
+	}
+
+	svc := localauth.NewService(database.Session(), localauth.Policy{
+		MinPasswordLength: lc.MinPasswordLength,
+		MaxFailedAttempts: lc.MaxFailedAttempts,
+		LockoutDuration:   lc.LockoutDuration,
+	})
+	if err := svc.SetPassword(email, userID, orgID, lc.BootstrapAdminPassword, false, time.Now()); err != nil {
+		return err
+	}
+	slog.Info("Seeded bootstrap admin credential", "email", email)
+	return nil
 }
 
 func runHealthCheck() {

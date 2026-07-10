@@ -64,6 +64,14 @@ describe('MorePage', () => {
     expect(screen.getByText('Sort Preference')).toBeInTheDocument();
   });
 
+  it('shows feature links to Settings and Deleted Libraries', async () => {
+    render(<MorePage />);
+    const settings = screen.getByTestId('more-link-settings');
+    expect(settings).toHaveAttribute('href', '/settings/');
+    const deleted = screen.getByTestId('more-link-deleted-libraries');
+    expect(deleted).toHaveAttribute('href', '/deleted-libraries/');
+  });
+
   it('shows theme options', async () => {
     render(<MorePage />);
     expect(screen.getByText('Light')).toBeInTheDocument();

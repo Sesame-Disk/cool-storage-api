@@ -17,8 +17,14 @@ vi.mock('../ImageViewer', () => ({
 vi.mock('../VideoPlayer', () => ({
   default: ({ fileName }: { fileName: string }) => <div data-testid="video-player">{fileName}</div>,
 }));
+vi.mock('../AudioPlayer', () => ({
+  default: ({ fileName }: { fileName: string }) => <div data-testid="audio-player">{fileName}</div>,
+}));
 vi.mock('../TextViewer', () => ({
   default: ({ fileName }: { fileName: string }) => <div data-testid="text-viewer">{fileName}</div>,
+}));
+vi.mock('../MarkdownViewer', () => ({
+  default: ({ fileName }: { fileName: string }) => <div data-testid="markdown-viewer">{fileName}</div>,
 }));
 vi.mock('../CodeViewer', () => ({
   default: ({ fileName }: { fileName: string }) => <div data-testid="code-viewer">{fileName}</div>,
@@ -79,10 +85,31 @@ describe('FilePreview', () => {
     });
   });
 
-  it('selects TextViewer for .md files', async () => {
+  it('selects MarkdownViewer for .md files', async () => {
     render(<FilePreview {...defaultProps} file={makeDirent('README.md')} />);
     await waitFor(() => {
-      expect(screen.getByTestId('text-viewer')).toBeInTheDocument();
+      expect(screen.getByTestId('markdown-viewer')).toBeInTheDocument();
+    });
+  });
+
+  it('selects MarkdownViewer for .markdown files', async () => {
+    render(<FilePreview {...defaultProps} file={makeDirent('NOTES.markdown')} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('markdown-viewer')).toBeInTheDocument();
+    });
+  });
+
+  it('selects AudioPlayer for .mp3 files', async () => {
+    render(<FilePreview {...defaultProps} file={makeDirent('song.mp3')} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('audio-player')).toBeInTheDocument();
+    });
+  });
+
+  it('selects AudioPlayer for .flac files', async () => {
+    render(<FilePreview {...defaultProps} file={makeDirent('track.flac')} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('audio-player')).toBeInTheDocument();
     });
   });
 

@@ -59,6 +59,7 @@ export default function DeleteConfirmDialog({ isOpen, onClose, items, repoId, pa
           onClick={handleDelete}
           disabled={loading}
           className="flex-1 bg-red-500 text-white rounded-lg py-3 min-h-[44px] font-medium disabled:opacity-50"
+          data-testid="delete-confirm"
         >
           {loading ? 'Deleting...' : 'Delete'}
         </button>

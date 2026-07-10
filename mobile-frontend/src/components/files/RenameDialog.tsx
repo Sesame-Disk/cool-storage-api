@@ -73,6 +73,7 @@ export default function RenameDialog({ isOpen, onClose, dirent, repoId, path, on
           className="w-full border border-gray-300 rounded-lg px-4 py-3 min-h-[44px] text-base focus:outline-none focus:ring-2 focus:ring-primary mb-3"
           autoFocus
           aria-label="New name"
+          data-testid="rename-input"
         />
         {error && (
           <p role="alert" className="text-red-500 text-sm mb-3">{error}</p>
@@ -81,6 +82,7 @@ export default function RenameDialog({ isOpen, onClose, dirent, repoId, path, on
           type="submit"
           disabled={loading || !name.trim()}
           className="w-full bg-primary-button text-white rounded-lg py-3 min-h-[44px] font-medium disabled:opacity-50"
+          data-testid="rename-submit"
         >
           {loading ? 'Saving...' : 'Save'}
         </button>

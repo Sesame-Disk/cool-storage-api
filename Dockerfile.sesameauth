@@ -1,0 +1,45 @@
+# Standalone local-authentication service (optional).
+# Build stage
+FROM --platform=$BUILDPLATFORM golang:1.25-trixie AS builder
+
+ARG TARGETOS TARGETARCH
+
+WORKDIR /build
+
+COPY go.mod go.sum* ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-arm64} go build \
+    -ldflags="-w -s" \
+    -o sesameauth \
+    ./cmd/sesameauth
+
+# Runtime stage
+FROM debian:trixie-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates tzdata wget && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
+
+RUN useradd -r -u 1000 -s /bin/false sesameauth
+
+WORKDIR /app
+
+COPY --from=builder /build/sesameauth .
+
+# Reuse the same baked config as the storage service so config-file settings
+# (org templates, TTLs, etc.) stay consistent; env vars override at runtime.
+ARG CONFIG_FILE=configs/config.docker.yaml
+COPY --from=builder /build/${CONFIG_FILE} ./config.yaml
+
+USER sesameauth
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD wget -q -O - http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["/app/sesameauth"]

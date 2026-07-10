@@ -1089,9 +1089,12 @@ func (h *AdminHandler) adminUsersHandler(c *gin.Context) {
 				h.GetUser(c)
 			}
 		case "PUT":
-			if strings.HasPrefix(subResource, "restore") {
+			switch {
+			case strings.HasPrefix(subResource, "restore"):
 				h.RestoreUser(c)
-			} else {
+			case strings.HasPrefix(subResource, "set-password"):
+				h.AdminSetUserPassword(c)
+			default:
 				h.UpdateUser(c)
 			}
 		case "POST":
