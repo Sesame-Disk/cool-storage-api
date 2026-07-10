@@ -1010,13 +1010,20 @@ func (s *Scanner) scanExpiredRestoreJobs(ctx context.Context) (int, error) {
 func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 9: Scanning for orphaned group shares...")
 
-	// Cache group existence checks to avoid repeated lookups. Group existence is
-	// keyed by (org_id, group_id) in the data model, so cache on both.
+	// shares_by_group is partitioned by (org_id, group_id), so a full scan returns
+	// every row of a partition consecutively. A single-entry "last partition" cache
+	// therefore does exactly one GroupExists per partition with O(1) memory — unlike a
+	// map, it does not grow with the number of distinct groups. A partition reappearing
+	// non-consecutively would only cost one extra lookup, never a wrong answer.
 	type groupExistenceKey struct {
 		orgID   uuid.UUID
 		groupID uuid.UUID
 	}
-	groupExistsCache := make(map[groupExistenceKey]bool)
+	var (
+		lastKey    groupExistenceKey
+		lastExists bool
+		haveLast   bool
+	)
 
 	cleaned := 0
 	failed := 0
@@ -1051,8 +1058,8 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 		}
 
 		cacheKey := groupExistenceKey{orgID: orgID, groupID: gs.SharedTo}
-		exists, cached := groupExistsCache[cacheKey]
-		if !cached {
+		exists := lastExists
+		if !haveLast || cacheKey != lastKey {
 			// Fail closed: a GroupExists error must NOT be read as "group gone",
 			// which would delete a valid share. Skip this share and surface the error.
 			groupExists, err := s.store.GroupExists(orgID, gs.SharedTo)
@@ -1065,7 +1072,9 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 				return nil
 			}
 			exists = groupExists
-			groupExistsCache[cacheKey] = exists
+			lastKey = cacheKey
+			lastExists = groupExists
+			haveLast = true
 		}
 
 		if !exists {

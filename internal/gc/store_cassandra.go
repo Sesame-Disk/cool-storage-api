@@ -3196,8 +3196,9 @@ func (s *CassandraStore) ScanAllGroupShares(ctx context.Context, visit func(Grou
 			SharedToType: "group",
 			OrgID:        parseUUID(orgIDStr),
 		}); err != nil {
-			_ = iter.Close()
-			return err
+			// Preserve a concurrent Cassandra/iteration failure alongside the
+			// visitor error instead of discarding it.
+			return errors.Join(err, iter.Close())
 		}
 	}
 	if err := iter.Close(); err != nil {

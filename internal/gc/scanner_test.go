@@ -988,6 +988,29 @@ func TestScanner_ScanOrphanedGroupShares_StreamingHonorsCancellation(t *testing.
 	}
 }
 
+// Cancellation that happens partway through the stream must stop further visits and
+// return context.Canceled, not just a pre-cancelled context.
+func TestMockStore_ScanAllGroupShares_StopsMidStreamOnCancel(t *testing.T) {
+	store := NewMockStore()
+	store.AddGroupShare(uuid.New(), uuid.New(), uuid.New())
+	store.AddGroupShare(uuid.New(), uuid.New(), uuid.New())
+	store.AddGroupShare(uuid.New(), uuid.New(), uuid.New())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	visited := 0
+	err := store.ScanAllGroupShares(ctx, func(gs GroupShareInfo) error {
+		visited++
+		cancel() // cancel during the first visit
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled after mid-stream cancel, got %v", err)
+	}
+	if visited != 1 {
+		t.Fatalf("expected the scan to stop after the first visit, got %d visits", visited)
+	}
+}
+
 // Regression for P6: a transient LibraryExists error in Phase 3 must NOT be treated
 // as "library gone" and enqueue a live library's commits for deletion.
 func TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError(t *testing.T) {
