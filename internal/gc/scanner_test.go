@@ -1180,6 +1180,43 @@ func TestScanner_ScanOrphanedCommits_WithOrgLookup(t *testing.T) {
 	}
 }
 
+func TestScannerOrphanedCommit_WorkerDeletesDespiteHistoricalMarkerIdentity(t *testing.T) {
+	store := NewMockStore()
+	queue := NewQueue(store)
+	scanner := NewScanner(store, queue, &Stats{}, config.GCConfig{})
+	worker := NewWorker(store, nil, queue, 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	deletedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddDeletedLibrary(orgID, libraryID, "hot", deletedAt)
+	store.AddCommit(libraryID, "commit-orphan", "")
+	store.mu.Lock()
+	delete(store.libraries, libraryID)
+	store.mu.Unlock()
+
+	if count, err := scanner.scanOrphanedCommits(context.Background()); err != nil || count != 1 {
+		t.Fatalf("scanOrphanedCommits = (%d, %v), want (1, nil)", count, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("queued items = %d, want 1", len(items))
+	}
+	item := items[0]
+	if item.LibraryGuardMode != LibraryGuardCanonicalMustBeAbsent {
+		t.Fatalf("LibraryGuardMode = %q, want %q", item.LibraryGuardMode, LibraryGuardCanonicalMustBeAbsent)
+	}
+	if item.IdentityAt.Equal(deletedAt) {
+		t.Fatal("test precondition failed: orphan scan identity unexpectedly matches historical delete marker")
+	}
+	if err := worker.processCommit(item); err != nil {
+		t.Fatalf("processCommit: %v", err)
+	}
+	if store.GetCommitRecord(libraryID, "commit-orphan") != nil {
+		t.Fatal("orphan commit remained after canonical-absence revalidation")
+	}
+}
+
 func TestScanner_ScanOrphanedCommits_SkipsRetriedQueuedCommit(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -1341,6 +1378,43 @@ func TestScanner_ScanOrphanedFSObjects(t *testing.T) {
 	}
 	if fsItems != 0 {
 		t.Errorf("expected 0 orphaned fs_objects (both libraries exist), got %d", fsItems)
+	}
+}
+
+func TestScannerOrphanedFSObject_WorkerDeletesDespiteHistoricalMarkerIdentity(t *testing.T) {
+	store := NewMockStore()
+	queue := NewQueue(store)
+	scanner := NewScanner(store, queue, &Stats{}, config.GCConfig{})
+	worker := NewWorker(store, nil, queue, 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	deletedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddDeletedLibrary(orgID, libraryID, "hot", deletedAt)
+	store.AddFSObject(libraryID, "fs-orphan", "file", nil)
+	store.mu.Lock()
+	delete(store.libraries, libraryID)
+	store.mu.Unlock()
+
+	if count, err := scanner.scanOrphanedFSObjects(context.Background()); err != nil || count != 1 {
+		t.Fatalf("scanOrphanedFSObjects = (%d, %v), want (1, nil)", count, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("queued items = %d, want 1", len(items))
+	}
+	item := items[0]
+	if item.LibraryGuardMode != LibraryGuardCanonicalMustBeAbsent {
+		t.Fatalf("LibraryGuardMode = %q, want %q", item.LibraryGuardMode, LibraryGuardCanonicalMustBeAbsent)
+	}
+	if item.IdentityAt.Equal(deletedAt) {
+		t.Fatal("test precondition failed: orphan scan identity unexpectedly matches historical delete marker")
+	}
+	if err := worker.processFSObject(context.Background(), item); err != nil {
+		t.Fatalf("processFSObject: %v", err)
+	}
+	if store.GetFSObj(libraryID, "fs-orphan") != nil {
+		t.Fatal("orphan fs_object remained after canonical-absence revalidation")
 	}
 }
 

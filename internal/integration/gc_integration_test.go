@@ -117,6 +117,14 @@ func TestGC_CanonicalLibraryExistsReadsCanonicalTableNotProjection(t *testing.T)
 	if absent {
 		t.Fatal("CanonicalLibraryExists should be false for a non-existent library")
 	}
+
+	global, err := store.CanonicalLibraryExistsAnywhere(libraryID)
+	if err != nil {
+		t.Fatalf("CanonicalLibraryExistsAnywhere: %v", err)
+	}
+	if !global {
+		t.Fatal("CanonicalLibraryExistsAnywhere should find the canonical row without relying on org metadata")
+	}
 }
 
 // requireGCEnabled skips the test if the GC admin endpoint is not reachable
@@ -1823,13 +1831,18 @@ func TestGC_DequeueBatchOrdersAcrossQueueBuckets(t *testing.T) {
 		t.Fatalf("failed to build cross-bucket fixtures: items=%d buckets=%d", len(fixtures), len(buckets))
 	}
 
-	for _, fixture := range fixtures {
+	for index, fixture := range fixtures {
+		requiresLibraryDeletedCheck := index == 0
+		libraryGuardMode := ""
+		if requiresLibraryDeletedCheck {
+			libraryGuardMode = string(gcpkg.LibraryGuardCanonicalMustBeAbsent)
+		}
 		if err := session.Query(`
 			INSERT INTO gc_queue (
 				org_id, bucket, queued_at, identity_at, requires_library_deleted_check,
-				item_type, item_id, library_id, storage_class, retry_count
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, orgID.String(), fixture.bucket, fixture.queuedAt, fixture.queuedAt, false, fixture.itemType, fixture.itemID, libraryID.String(), "hot", 0).Exec(); err != nil {
+				library_guard_mode, item_type, item_id, library_id, storage_class, retry_count
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, orgID.String(), fixture.bucket, fixture.queuedAt, fixture.queuedAt, requiresLibraryDeletedCheck, libraryGuardMode, fixture.itemType, fixture.itemID, libraryID.String(), "hot", 0).Exec(); err != nil {
 			t.Fatalf("failed to insert gc_queue fixture %s: %v", fixture.itemID, err)
 		}
 	}
@@ -1857,6 +1870,9 @@ func TestGC_DequeueBatchOrdersAcrossQueueBuckets(t *testing.T) {
 	}
 	if items[0].IdentityAt.IsZero() || items[1].IdentityAt.IsZero() {
 		t.Fatal("expected identity_at to round-trip for dequeued items")
+	}
+	if items[0].LibraryGuardMode != gcpkg.LibraryGuardCanonicalMustBeAbsent {
+		t.Fatalf("library_guard_mode = %q, want %q", items[0].LibraryGuardMode, gcpkg.LibraryGuardCanonicalMustBeAbsent)
 	}
 	if fixtures[0].bucket == fixtures[1].bucket {
 		t.Fatalf("test fixtures did not span distinct leading buckets: %d", fixtures[0].bucket)

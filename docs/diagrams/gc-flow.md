@@ -73,11 +73,11 @@ flowchart TD
     Candidate --> DeleteFS
 ```
 
-Scanner-created orphan work now runs with `RequiresLibraryDeletedCheck=true`. P6a closed the
-fail-open existence read that fed it destructive work, and P6b (1E,
-`ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`) added an execution-time canonical-library revalidation
-guard (`CanonicalLibraryExists`, fail-closed) so projection drift or a scanner→worker restore/recreate
-cannot make the worker delete a live library's content.
+Scanner-created orphan work uses durable `library_guard_mode=canonical_absent`; normal cascade
+children use `deleted_at_identity`. P6a closed the fail-open existence read, and P6b (1E,
+`ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`) makes the worker acquire the shared restore/GC lifecycle
+lease and prove global canonical absence before deletion. Projection drift, stale org metadata, and
+scanner→worker restore races therefore fail closed.
 
 ## 4. Library delete and purge handoff
 

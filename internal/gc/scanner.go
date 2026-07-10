@@ -582,6 +582,7 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 					// re-confirm it is still gone before deleting its content, in case it
 					// was restored/recreated or the projection drifted between scan and run.
 					RequiresLibraryDeletedCheck: true,
+					LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
 					ItemType:                    ItemCommit,
 					ItemID:                      commitID,
 					LibraryID:                   libID,
@@ -667,6 +668,7 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 					IdentityAt: now,
 					// Re-validate against the canonical libraries table at execution time (P6b).
 					RequiresLibraryDeletedCheck: true,
+					LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
 					ItemType:                    ItemFSObject,
 					ItemID:                      fsID,
 					LibraryID:                   libID,

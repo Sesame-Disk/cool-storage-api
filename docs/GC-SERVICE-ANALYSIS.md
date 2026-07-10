@@ -9,16 +9,17 @@ plan integration tests for long-running monitoring.
 > verified follow-up debt P1–P8. The physical block-delete claim/recovery protocol is
 > conservative, and both live-data classification exposures are now **fixed**: P6a (transient
 > existence-read failures read as "missing"; branch 1D, existence reads fail closed) and P6b
-> (orphan commit/fs_object work now revalidated against the canonical `libraries` table at
-> execution time; branch 1E, `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`). P7 records that
-> markerless commit/fs_object partitions are still invisible to current orphan discovery.
-> Full audit:
-> [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md);
-> per-item issues: `ISSUE-GC-*` in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
-
----
-
-## Architecture Overview
+ (orphan commit/fs_object work now carries durable `canonical_absent` guard semantics,
+ acquires the shared lifecycle lease, and proves global canonical absence at execution time;
+ restore holds the same lease through its write batch; branch 1E,
+ `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`). P7 records that
+   make the orphan scanners treat a live library/group as gone. Execution-time canonical
+   revalidation of already-enqueued orphan work is also fixed (P6b, 1E): queue/DLQ rows preserve
+   an explicit `canonical_absent` mode, and the worker acquires the lifecycle lease before proving
+   the library UUID is absent from every canonical org partition. Restore uses the same lease.
+(P6a, 1D) and the execution-time revalidation gap (P6b, 1E — orphan commit/fs_object items use
+durable guard modes and fail-closed global canonical validation under the shared restore/GC lease,
+`ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`). P8 tracks Phase 9's provisional global Cassandra
 
 ```mermaid
 flowchart TD

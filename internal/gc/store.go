@@ -29,7 +29,7 @@ type GCStore interface {
 	PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string) (bool, error)
 	DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error)
 	CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error
-	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error
+	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error
 	FailItem(item QueueItem, failedAt time.Time, lastError, failureCode string) error
 	GetQueueSize(orgID uuid.UUID) (int, error)
 	GetTotalQueueSize() (int, error)
@@ -150,6 +150,10 @@ type GCStore interface {
 	// projection), this consults the canonical table so orphan cleanup cannot act on a
 	// library that is still live under projection drift. Fails closed on read errors.
 	CanonicalLibraryExists(orgID, libraryID uuid.UUID) (bool, error)
+	// CanonicalLibraryExistsAnywhere proves whether libraryID exists in any
+	// canonical organization partition. It is reserved for destructive orphan
+	// cleanup where an org-scoped absence is not sufficient proof.
+	CanonicalLibraryExistsAnywhere(libraryID uuid.UUID) (bool, error)
 	FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error)
 	ListCommitIDsForLibrary(libraryID uuid.UUID) ([]string, error)
 	ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]string, error)
@@ -343,22 +347,23 @@ type GCFailedItemOrgInfo struct {
 
 // GCFailedItemInfo represents an item moved to the GC dead-letter queue.
 type GCFailedItemInfo struct {
-	OrgID                       uuid.UUID  `json:"org_id"`
-	FailedAt                    time.Time  `json:"failed_at"`
-	ExpiresAt                   time.Time  `json:"expires_at"`
-	QueuedAt                    time.Time  `json:"queued_at"`
-	IdentityAt                  time.Time  `json:"identity_at"`
-	RequiresLibraryDeletedCheck bool       `json:"requires_library_deleted_check"`
-	ItemType                    ItemType   `json:"item_type"`
-	ItemID                      string     `json:"item_id"`
-	LibraryID                   uuid.UUID  `json:"library_id"`
-	BlockRepresentationID       string     `json:"block_representation_id"`
-	StorageClass                string     `json:"storage_class"`
-	RetryCount                  int        `json:"retry_count"`
-	LastError                   string     `json:"last_error"`
-	FailureCode                 string     `json:"failure_code"`
-	ResolvedAt                  *time.Time `json:"resolved_at"`
-	ResolvedState               string     `json:"resolved_state"`
+	OrgID                       uuid.UUID        `json:"org_id"`
+	FailedAt                    time.Time        `json:"failed_at"`
+	ExpiresAt                   time.Time        `json:"expires_at"`
+	QueuedAt                    time.Time        `json:"queued_at"`
+	IdentityAt                  time.Time        `json:"identity_at"`
+	RequiresLibraryDeletedCheck bool             `json:"requires_library_deleted_check"`
+	LibraryGuardMode            LibraryGuardMode `json:"library_guard_mode"`
+	ItemType                    ItemType         `json:"item_type"`
+	ItemID                      string           `json:"item_id"`
+	LibraryID                   uuid.UUID        `json:"library_id"`
+	BlockRepresentationID       string           `json:"block_representation_id"`
+	StorageClass                string           `json:"storage_class"`
+	RetryCount                  int              `json:"retry_count"`
+	LastError                   string           `json:"last_error"`
+	FailureCode                 string           `json:"failure_code"`
+	ResolvedAt                  *time.Time       `json:"resolved_at"`
+	ResolvedState               string           `json:"resolved_state"`
 }
 
 // GCFailedItemExpiryInfo is the lightweight discovery row used by the scanner

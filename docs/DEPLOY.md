@@ -734,6 +734,17 @@ docker compose -f docker-compose.prod.yml logs -f cassandra
 
 ### Deploy an update
 
+#### GC guard-mode migration 011
+
+The build containing `011_gc_library_guard_mode.cql` changes the meaning of guarded GC queue
+items. Do not mix pre-011 GC scanners/workers with the new binaries: old workers do not understand
+`library_guard_mode` and can rewrite it as the legacy deleted-marker contract.
+
+For this upgrade, stop or drain every old SesameFS instance that can run GC, start one new instance
+so migrations complete, then start the remaining new instances. Resume/schedule GC only after all
+regions run the new image. API downtime is not intrinsically required if GC execution is separately
+disabled, but mixed-version GC execution is unsupported for this migration.
+
 ```bash
 cd /opt/sesamefs
 git pull

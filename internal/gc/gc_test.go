@@ -1175,6 +1175,7 @@ func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(
 		QueuedAt:                    identityAt,
 		IdentityAt:                  identityAt,
 		RequiresLibraryDeletedCheck: true,
+		LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
 		ItemType:                    ItemFSObject,
 		ItemID:                      itemID,
 		LibraryID:                   libID,
@@ -1225,6 +1226,9 @@ func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(
 	}
 	if !items[0].RequiresLibraryDeletedCheck {
 		t.Fatal("requeued item lost RequiresLibraryDeletedCheck flag")
+	}
+	if items[0].LibraryGuardMode != LibraryGuardCanonicalMustBeAbsent {
+		t.Fatalf("requeued item LibraryGuardMode = %q, want %q", items[0].LibraryGuardMode, LibraryGuardCanonicalMustBeAbsent)
 	}
 	if items[0].BlockRepresentationID != blockRepresentationID {
 		t.Fatalf("requeued item BlockRepresentationID = %q, want %q", items[0].BlockRepresentationID, blockRepresentationID)
