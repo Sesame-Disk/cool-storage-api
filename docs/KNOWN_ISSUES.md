@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-06-11
+**Last Updated**: 2026-07-10
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | ✅ Complete | `internal/gc/` — queue, worker, scanner, admin API |
+| Garbage Collection | 🔴 Safety fix required + follow-up debt | Physical block delete is conservative, but scanner existence checks can fail open for live libraries (P6). Reclamation/durability gaps P1–P5/P7 also remain. See the GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -47,13 +47,34 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Quota Enforcement Coverage Gaps in V2 Mutations** | ✅ Fixed (2026-05-14) | The affected non-upload mutation handlers now have visible-delta quota wiring. Deleted file/folder restore remains bounded by configured history retention, deleted-library restore remains bounded by trash retention, and cross-repo move still relies on split-phase destination publish plus source removal. Split-phase publish/counter atomicity remains documented as technical debt (§12d/§12e). See ISSUE-QUOTA-COVERAGE-01 below. |
 | **Concurrent Hard-Quota Reservation Hardening** | 🟡 Deferred to separate branch | The existing split pre-check → publish → counter-adjust window is still open. A canonical-row reservation prototype was audited and is not merge-ready for PR61 because it leaks reservations on finalize failure, regresses soft-policy evaluation, races with admin resync, and only hardens `seafhttp`. A smaller safe fix now caches repeated chunk prechecks per upload tracker, but that is not reservation hardening. See ISSUE-QUOTA-RESERVATION-01 below. |
 | **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, and repeated storage prechecks no longer walk HEAD on every chunk, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
-| **Block Refcount Idempotence After Ambiguous CAS** | 🟡 Accepted hotfix debt | Upload/sync block registration now fails closed when Cassandra cannot attribute an LWT outcome, but client retries can still inflate `blocks.ref_count` because block registration has no durable idempotency key yet. See ISSUE-BLOCK-REFCOUNT-IDEMPOTENCE-01 below. |
+| **Block Refcount Idempotence After Ambiguous CAS** | ✅ Fixed (2026-05-27) | Replaced mutable `blocks.ref_count` with keyed `block_references`; add/remove is idempotent per referrer. Historical issue retained below. |
 | **`blocks` Hot Partition by `org_id`** | ✅ Fixed (2026-05-26) | `blocks`, `gc_block_candidates`, `gc_s3_orphans`, and the block-id mapping tables now use per-block partitioning so no single org concentrates LWT traffic into one Cassandra partition. The GC scan and S3 orphan recovery paths walk per-day discovery projections instead of partition-scanning by org. See ISSUE-BLOCKS-HOT-PARTITION-01 below. |
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on the five server-side upload paths. NOT global: legacy `BlockStore` Exists+PUT methods remain for fallback + unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Read Paths Ignore `storage_key`** | 🟡 Pending | All block reads derive the S3 key from the content hash (`hashToKey`) and never consult the canonical `storage_key` column; only the new reuse verify/repair honors it. Harmless today (`storage_key` is empty or equal to the hash-derived key) but blocks any non-hash-derived key layout. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
+
+### 🔴 GC Library-Delete Cleanup Audit (2026-07-10)
+
+Follow-up debt from the PR #123 audit. The physical block-delete protocol is conservative
+(claim→recovery→delete ordering, fail-closed representation validation), but the end-to-end
+scanner pipeline has a High fail-open existence check (P6) that can enqueue destructive work
+for live libraries. P1–P5/P7 are reclamation/durability gaps. Full audit:
+`docs/GC-DELETE-CLEANUP-INVESTIGATION.md`. Close on small, auditable branches.
+
+| Issue | Status | Details |
+|-------|--------|---------|
+| **Org-Admin Trash Delete Defers Cleanup** | 🟡 Confirmed gap (High) | `DeleteOrgTrashLibrary` (single) and `CleanOrgTrashLibraries` (bulk) hard-delete the library but do **not** enqueue a cascade, delete the storage counter, or clean tags — they rely on Phase 13, which only fires after `TrashRetentionDays` (~30d), and the re-inserted marker resets that clock. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01 below. |
+| **Non-Durable, Content-Only Delete Handoff** | 🟡 Confirmed gap (High/Med) | Superadmin paths call `EnqueueLibraryDeletion` via `go fn()`, but it enqueues contents, not `ItemLibraryCascade`; final marker/policy cleanup waits for Phase 13, and global clean-trash also omits the library counter delete. See ISSUE-GC-DELETE-HANDOFF-DURABILITY-01 below. |
+| **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Confirmed, benign (Med) | The direct-delete helper does not call `AddDeleteLibraryPolicyQuery`; policy index rows for policy-bearing libraries accumulate. Scanner re-validates and skips, so no mis-processing. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
+| **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
+| **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
+| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
+| **Existence Checks Fail Open** | 🔴 Confirmed safety gap (High) | `LibraryExists`/`GroupExists` swallow Cassandra errors as "missing"; scanners can enqueue/delete live library metadata/refs or valid group shares. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
+| **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (High/Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
+| **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Former E3 is escalated to the High P6 issue. See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
+| **No Reconcile/Backfill for Existing Orphans** | 🟡 Follow-up | Existing clusters may hold blocks/S3 objects/stale policy rows orphaned by the gaps above. Needs a read-only-first reconcile pass, not blind truncation. See ISSUE-GC-RECONCILE-BACKFILL-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -387,7 +408,7 @@ This is a scope-boundary bug, not a traffic math bug.
 
 #### Resolution
 
-`quota_total` is persisted to the `users` table and validated on write against the org's `storage_quota` ([internal/api/v2/write_helpers.go:901-912](internal/api/v2/write_helpers.go#L901-L912)). `CheckStorageQuota` now receives `userID`, reads `users.quota_bytes`, reads the live per-user counter `user:<orgID>:<userID>`, and returns the more restrictive result between org-level storage and per-user storage.
+`quota_total` is persisted to the `users` table and validated on write against the org's `storage_quota` ([internal/api/v2/write_helpers.go:901-912](../internal/api/v2/write_helpers.go#L901-L912)). `CheckStorageQuota` now receives `userID`, reads `users.quota_bytes`, reads the live per-user counter `user:<orgID>:<userID>`, and returns the more restrictive result between org-level storage and per-user storage.
 
 Updated upload paths pass `userID` into the storage pre-check. Web/direct uploads validate the visible storage delta, including chunked upload totals and replace-over-existing cases. Sync also validates the real committed tree delta before publishing a new HEAD, so multi-block desktop uploads are checked against the final storage increase rather than only against each individual block.
 
@@ -422,7 +443,7 @@ Updated upload paths pass `userID` into the storage pre-check. Web/direct upload
 
 #### Resolution
 
-The handler-by-handler approach was chosen over centralizing the logic in `FSHelper.UpdateLibraryHead`. A small shared helper module was added in [internal/api/v2/quota_helpers.go](internal/api/v2/quota_helpers.go) with three primitives:
+The handler-by-handler approach was chosen over centralizing the logic in `FSHelper.UpdateLibraryHead`. A small shared helper module was added in [internal/api/v2/quota_helpers.go](../internal/api/v2/quota_helpers.go) with three primitives:
 
 - `fsEntryStats(fsHelper, repoID, entry)` returns `(size, fileCount)` for a file or directory entry, recursing through directories.
 - `fsEntryDelta(fsHelper, repoID, newEntry, replacing)` returns the `(bytes, files)` delta when `newEntry` is added to a tree, optionally replacing an existing entry.
@@ -435,10 +456,10 @@ Wiring per handler:
 2. **copyBatchFiles** (`internal/api/v2/files.go`, `copyBatchFiles`) — same wiring per item in the loop.
 3. **RevertFile** (`internal/api/v2/files.go`, `RevertFile`) — delta uses `oldEntry` from the target commit, subtracts the size of `existingEntry` when replacing.
 4. **RevertDirectory** (`internal/api/v2/files.go`, `RevertDirectory`) — delta walks both trees (old and replaced) recursively via `fsEntryStats`.
-5. **RestoreTrashItem** ([trash.go:329](internal/api/v2/trash.go#L329)) — pre-checks the visible delta; counter delta replaces the previous fire-and-forget `IncrementStorageCounters`.
-6. **RevertDirents** ([trash.go:656](internal/api/v2/trash.go#L656)) — per-item pre-check; items exceeding quota fall into `failedItems` so the batch returns partial success instead of a hard error.
-7. **OnlyOffice `saveEditedDocument`** ([onlyoffice.go:831](internal/api/v2/onlyoffice.go#L831)) — pre-check moved before the S3 `PutBlockData` so we never store bytes that would be rejected. The traversal previously done late in the function is reused.
-8. **Cross-repo batch (`processSingleItem`)** ([batch_operations.go:324](internal/api/v2/batch_operations.go#L324)) — pre-checks the destination delta, applies the destination counter increment after the destination publish, and decrements the source library counter on move.
+5. **RestoreTrashItem** ([trash.go:329](../internal/api/v2/trash.go#L329)) — pre-checks the visible delta; counter delta replaces the previous fire-and-forget `IncrementStorageCounters`.
+6. **RevertDirents** ([trash.go:656](../internal/api/v2/trash.go#L656)) — per-item pre-check; items exceeding quota fall into `failedItems` so the batch returns partial success instead of a hard error.
+7. **OnlyOffice `saveEditedDocument`** ([onlyoffice.go:831](../internal/api/v2/onlyoffice.go#L831)) — pre-check moved before the S3 `PutBlockData` so we never store bytes that would be rejected. The traversal previously done late in the function is reused.
+8. **Cross-repo batch (`processSingleItem`)** ([batch_operations.go:324](../internal/api/v2/batch_operations.go#L324)) — pre-checks the destination delta, applies the destination counter increment after the destination publish, and decrements the source library counter on move.
 
 Sync (`PutCommit HEAD`, `UpdateBranch`) and the upload paths (`HandleUpload`, `UploadFile`, `UploadBlock`, `PutBlock`) keep their existing wiring; this fix only adds coverage to the non-upload mutation paths.
 
@@ -475,8 +496,8 @@ Split-phase atomicity (pre-check → publish → counter adjust) remains documen
 #### Related
 
 - ISSUE-USER-STORAGE-ENFORCE-01 (fixed) — same enforcement model, narrower coverage.
-- [internal/api/v2/quota_helpers.go](internal/api/v2/quota_helpers.go) — shared primitives.
-- [internal/traffic/storage.go:136](internal/traffic/storage.go#L136) — `AdjustStorageCountersByDeltaSync` with negative-clamp protection.
+- [internal/api/v2/quota_helpers.go](../internal/api/v2/quota_helpers.go) — shared primitives.
+- [internal/traffic/storage.go:136](../internal/traffic/storage.go#L136) — `AdjustStorageCountersByDeltaSync` with negative-clamp protection.
 
 ---
 
@@ -782,7 +803,7 @@ The architecture claim "download handlers resolve before headers" is now true fo
 
 #### What Is True Today
 
-`StreamBlocks` ([`streaming.go`](internal/streaming/streaming.go#L176)) returns `void`. If `GetBlock`/`GetBlockReader`/`Write`/`io.CopyBuffer` fails mid-stream it logs and returns — by then headers are sent, so it genuinely cannot signal the client. That part is unavoidable.
+`StreamBlocks` ([`streaming.go`](../internal/streaming/streaming.go#L176)) returns `void`. If `GetBlock`/`GetBlockReader`/`Write`/`io.CopyBuffer` fails mid-stream it logs and returns — by then headers are sent, so it genuinely cannot signal the client. That part is unavoidable.
 
 The real gap is on the **caller** side. In `streamFileFromBlocks` the code after `StreamBlocks` runs unconditionally:
 
@@ -818,8 +839,8 @@ TTL) keeps the block alive meanwhile. Original analysis kept below for context.
 
 #### Current Behavior
 
-- **Increment** (`IncrementBlockRefCounts`, `IncrementBlockRefCountsTracked`): propagate the resolution error and abort the copy/publish. This is correct and *safer* than before — `IncrementOrCreateBlock` does `INSERT ... IF NOT EXISTS` ([`fs_helpers.go:996`](internal/api/v2/fs_helpers.go#L996)), so incrementing an unresolved SHA-1 would create a **phantom SHA-1 row** while leaving the real SHA-256 block un-incremented → potential data loss on a later delete. Failing closed prevents that. Callers here are pre-commit and can abort.
-- **Decrement** (`DecrementBlockRefCountsOnce`): resolves **before** consuming the idempotency marker (so a failure doesn't burn the marker), and on resolution failure logs `ERROR` and returns `nil` (decrements nothing). `decrementBlockRefCount` already skips rows that don't exist ([`fs_helpers.go:1107`](internal/api/v2/fs_helpers.go#L1107)), so there is **no corruption** — but two limitations remain:
+- **Increment** (`IncrementBlockRefCounts`, `IncrementBlockRefCountsTracked`): propagate the resolution error and abort the copy/publish. This is correct and *safer* than before — `IncrementOrCreateBlock` does `INSERT ... IF NOT EXISTS` ([`fs_helpers.go:996`](../internal/api/v2/fs_helpers.go#L996)), so incrementing an unresolved SHA-1 would create a **phantom SHA-1 row** while leaving the real SHA-256 block un-incremented → potential data loss on a later delete. Failing closed prevents that. Callers here are pre-commit and can abort.
+- **Decrement** (`DecrementBlockRefCountsOnce`): resolves **before** consuming the idempotency marker (so a failure doesn't burn the marker), and on resolution failure logs `ERROR` and returns `nil` (decrements nothing). `decrementBlockRefCount` already skips rows that don't exist ([`fs_helpers.go:1107`](../internal/api/v2/fs_helpers.go#L1107)), so there is **no corruption** — but two limitations remain:
   1. **Abort is total, not partial.** If one block of N fails to resolve, the whole decrement is skipped (the old best-effort path decremented the resolvable ones). So the *magnitude* of a leak is larger, though it is now logged.
   2. **The leak is permanent.** The `blocks WHERE org_id` backfill scan was removed (see ISSUE-BLOCKS-HOT-PARTITION-01), so an inflated `ref_count` is never re-discovered as zero-ref. The ~10 post-commit callers also can't distinguish "0 zero-ref blocks" from "aborted" because the signature stays `[]string`.
 
@@ -1700,7 +1721,7 @@ This closed the missing-CAS and missing-parent-validation bug class. The remaini
 
 ## 🔴 OPEN ISSUES
 
-### ISSUE-GC-MULTIINSTANCE-01: GC is not safe with multiple instances
+### ISSUE-GC-MULTIINSTANCE-01: Multi-instance GC coordination and split-brain hardening
 
 **Status**: 🟡 Pending with temporary prod workaround
 **Discovered**: 2026-03-17
@@ -2773,8 +2794,9 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 
 ## 🚧 BACKEND NOT IMPLEMENTED
 
-### Garbage Collection — COMPLETE ✅
-**Status**: ✅ Fully implemented (2026-01-30), major overhaul (2026-03-17)
+### Garbage Collection — IMPLEMENTED, OPEN SAFETY + DURABILITY DEBT
+**Status**: Core engine implemented (2026-01-30), major overhaul (2026-03-17);
+2026-07-10 audit found P1–P7 follow-ups including the High fail-open P6 safety gap.
 **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
 **Tests**: 55 Go unit tests + 21 bash integration tests
 **Admin API**: `GET /api/v2.1/admin/gc/status`, `POST /api/v2.1/admin/gc/run`
@@ -2788,6 +2810,11 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 - `walkFSTree` converted from recursive to iterative (prevents stack overflow)
 - Stats persisted to `gc_stats` table on shutdown, restored on startup (survives container restarts)
 - Scanner runs immediately on startup before entering 24h ticker loop
+
+**Current audit status:** do not treat this historical implementation-complete milestone as
+an end-to-end safety certification. See
+[GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) and the
+`ISSUE-GC-*` entries below.
 
 ### Authentication — COMPLETE ✅
 **Status**: ✅ OIDC Phase 1 complete (2026-01-28) + dev tokens
@@ -3531,9 +3558,317 @@ repo's total tagged files rather than the subtree size.
 
 ---
 
+### ISSUE-GC-ORG-TRASH-NO-CASCADE-01: Org-Admin Trash Delete Defers Content Cleanup
+
+**Status**: 🟡 Confirmed gap (2026-07-10)
+**Severity**: High — a permanent-delete action reports success and hides the library immediately, but its blocks/commits/counter/tags can linger for the whole retention window
+**Affected**: `DELETE /org/:org_id/admin/trash-libraries/:rid/` (`DeleteOrgTrashLibrary`), `DELETE /org/:org_id/admin/trash-libraries/` (`CleanOrgTrashLibraries`)
+
+#### Problem
+
+Both org-admin trash-delete paths hard-delete the library rows and insert the `deleted_libraries` marker, then return `200`, but — unlike the superadmin `PermanentDeleteRepo` — they do **not**:
+
+- enqueue an immediate GC cascade (`EnqueueLibraryDeletion`),
+- delete the storage counter,
+- clean library tags.
+
+They rely on scanner Phase 13 (`scanExpiredDeletedLibraries`), which only picks up a deleted library after `TrashRetentionDays` (~30 days by default). Worse, the hard-delete re-inserts the marker with `deleted_at = time.Now()` ([org_admin_repos.go:432](../internal/api/v2/org_admin_repos.go#L432), [library_delete_helpers.go:36](../internal/api/v2/library_delete_helpers.go#L36)), **resetting the retention clock**, so Phase 13's pickup is 30 days from the permanent-delete action, not from the original trashing.
+
+This is not an eternal leak (the marker keeps the content recoverable, and the cascade can run even after the `libraries` row is gone because `GetLibraryDeletedAt` reads the marker — [store_cassandra.go:1165](../internal/gc/store_cassandra.go#L1165)), but the user asked for a *permanent* delete and the physical content can survive for the full retention window.
+
+#### Evidence
+
+- [internal/api/v2/library_delete_helpers.go:98-116](../internal/api/v2/library_delete_helpers.go#L98) (`deleteResolvedTrashLibrary`)
+- [internal/api/v2/org_admin_repos.go:390-448](../internal/api/v2/org_admin_repos.go#L390) (`CleanOrgTrashLibraries`)
+
+#### Fix Direction (branches 3 & 4)
+
+- Branch 3: give `DeleteOrgTrashLibrary` the same tactical side effects as
+  `PermanentDeleteRepo` (enqueue contents + delete counter + clean tags). This is not
+  `ItemLibraryCascade`; branch 6B owns durable final cleanup.
+- Branch 4: replace the hand-rolled hard-delete in `CleanOrgTrashLibraries` with the shared per-candidate helper so it inherits cascade/counter/tags/policy cleanup.
+
+#### Related Docs
+
+- `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (P1/P1b)
+
+---
+
+### ISSUE-GC-DELETE-HANDOFF-DURABILITY-01: Permanent-Delete Handoff Is a Fire-and-Forget Goroutine
+
+**Status**: 🟡 Confirmed gap (2026-07-10)
+**Severity**: High/Med — recoverable via marker + Phase 13, but the immediate handoff is not durable
+**Affected**: `PermanentDeleteRepo` (`permanentDeleteResolvedRepo`), `AdminCleanTrashLibraries` (`processAdminTrashCandidates`)
+
+#### Problem
+
+The superadmin permanent-delete paths enqueue GC cleanup with
+`runAsyncLibraryDeleteSideEffectFn`, implemented as `go fn()`
+([library_delete_helpers.go:44,82-86,132-136](../internal/api/v2/library_delete_helpers.go#L44)).
+The HTTP response can complete after library-row deletion but before delivery. Moreover,
+`EnqueueLibraryDeletion` calls `EnqueueLibraryContents`; it does **not** enqueue
+`ItemLibraryCascade` ([gc.go:428-431](../internal/gc/gc.go#L428)). The accelerator therefore
+queues commits/fs_objects/artifacts but does not own final marker/policy cleanup. Global
+clean-trash also omits `DeleteLibraryStorageCounter`, unlike `PermanentDeleteRepo`.
+
+A restart or suite exit can lose the accelerator entirely. The `deleted_libraries` marker plus
+Phase 13 eventually runs the full cascade, but only after retention unless the durable purge
+marker proposed below is implemented.
+
+#### Fix Direction (branches 6A & 6B)
+
+- 6A: add a durable purge marker (`deleted_libraries.purge_requested_at`) via an incremental migration; make Phase 13 eligible when `purge_requested_at != null OR deleted_at < cutoff`.
+- 6B: stamp the durable marker at all permanent-delete writers; keep the immediate enqueue only as a best-effort accelerator. Do not return 500 after a confirmed hard-delete — recovery lives in the marker.
+
+#### Related Docs
+
+- `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (P2)
+
+---
+
+### ISSUE-GC-POLICY-INDEX-STALE-01: `gc_libraries_by_policy` Rows Leak on Direct Library Delete
+
+**Status**: 🟡 Confirmed, benign (2026-07-10)
+**Severity**: Medium — no mis-processing, but stale rows accumulate and add scan work
+**Affected**: All direct-delete paths that go through `hardDeleteLibraryRowsFn`
+
+#### Problem
+
+The `gc_libraries_by_policy` index rows are maintained by the policy-setting endpoints (`library_settings.go` disabling `version_ttl`/`auto_delete`, `admin_libraries.go` history edit), by `rollbackNewLibrary` ([write_helpers.go:872-873](../internal/api/v2/write_helpers.go#L872)), and by the GC cascade's `HardDeleteLibrary` ([store_cassandra.go:3816-3817](../internal/gc/store_cassandra.go#L3816)). The confirmed gap is that the shared direct hard-delete helper `hardDeleteLibraryRowsFn` ([library_delete_helpers.go:29-41](../internal/api/v2/library_delete_helpers.go#L29)) does **not** include the `AddDeleteLibraryPolicyQuery` deletes, so a policy-bearing library deleted via a direct path leaks its policy index row.
+
+Impact is benign: scanner Phase 5/6 re-read the `libraries` row per policy entry and `continue` on `ErrNotFound`, so stale rows are skipped, not mis-processed — but they accumulate.
+
+#### Fix Direction (branch 2)
+
+Fold both `AddDeleteLibraryPolicyQuery` calls (version_ttl + auto_delete) into the `hardDeleteLibraryRowsFn` batch so every direct-delete path clears the index. The cascade path already does this, so behavior converges.
+
+#### Related Docs
+
+- `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (F2/P3)
+
+---
+
+### ISSUE-GC-PUB-REF-ZERO-REF-01: `pub:` Refs Lack a Discoverable Zero-Ref Transition
+
+**Status**: 🟡 Confirmed gap (2026-07-10)
+**Severity**: Medium — a plausible retained-block path, not a demonstrated July-2026 incident
+**Affected**: publish-attempt block references (`pub:<attempt>`), block GC discovery
+
+#### Problem
+
+Provisional upload refs (`up:<op>`) register a durable expiry projection (`gc_provisional_block_refs` + `_by_day`); scanner Phase 0 walks it, removes the ref on expiry, checks `BlockHasReferences`, and promotes the block to `gc_block_candidates` if it hit zero. Publish-attempt refs (`pub:<attempt>`) do **not** register any such projection — `AddPublishAttemptReferences` ([block_references.go:339](../internal/db/block_references.go#L339)) only writes the ref with a 35-day Cassandra TTL.
+
+Scenario: a block is kept alive solely by a `pub:` ref from a dead publish attempt. The `up:` ref expires at 2 days; the scanner sees the `pub:` still present and does not create a candidate. At 35 days Cassandra silently expires the `pub:` ref. Now the block is at zero refs, but nothing runs the zero-ref → `EnsureBlockGCCandidate` transition, because `scanOrphanedBlocks` ([scanner.go:335](../internal/gc/scanner.go#L335)) only walks candidates that already exist. The `blocks` row, mapping, and S3 object can be retained indefinitely.
+
+#### Fix Direction (branch 7)
+
+Give `pub:` a discoverable expiry projection mirroring `up:`: register the projection when the ref is created (roll back the ref if the projection write fails); on expiry the scanner deletes the ref, checks `BlockHasReferences`, and creates a candidate if zero. The TTL stays as a backstop; the projection guarantees the transition. Ownership stays with the publish/expiry subsystem — the library cascade must never remove `pub:` refs (invariant #2).
+
+#### Related Docs
+
+- `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (P4)
+- `docs/WEB-BLOCK-UPLOAD.md`
+
+---
+
+### ISSUE-GC-PHASE13-ERROR-VISIBILITY-01: Phase 13 Reports Success on Enqueue Failure
+
+**Status**: 🟡 Confirmed gap (2026-07-10)
+**Severity**: Medium — observability/health, not data loss (marker allows retry)
+**Affected**: `Scanner.scanExpiredDeletedLibraries` (Phase 13)
+
+#### Problem
+
+`scanExpiredDeletedLibraries` ([scanner.go:1183-1243](../internal/gc/scanner.go#L1183)):
+
+- on `EnqueueBatch` failure, logs the error but leaves `enqueued = 0` and returns `nil` ([scanner.go:1231-1242](../internal/gc/scanner.go#L1231));
+- on per-library `PendingItemExists` failure, logs and `continue`s ([scanner.go:1194-1197](../internal/gc/scanner.go#L1194)).
+
+The failures are logged, but not surfaced through the phase result or a dedicated failure metric. Because the phase returns `nil`, the overall scan cycle can appear successful even though no cascade reached the queue. The `deleted_libraries` marker allows a later retry, so this is not data loss, but health and metrics are misleading.
+
+#### Fix Direction (branch 5)
+
+Keep processing all markers, accumulate errors (`errors.Join`), return the joined error, add a dedicated failure metric, and keep separate `enqueued` / `skipped` / `failed` counters. Do not flag global success when delivery failed. Do not change eligibility rules in this branch.
+
+#### Related Docs
+
+- `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (P5)
+
+---
+
+### ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01: Scanner Existence Reads Can Fail Open
+
+**Status**: 🔴 Confirmed safety gap (2026-07-10)
+**Severity**: High — a transient Cassandra read failure can lead to destructive work for a live library
+**Affected**: `LibraryExists`, `GroupExists`, scanner Phases 3/4/9, commit/fs_object worker guard
+
+#### Problem
+
+`CassandraStore.LibraryExists` returns `(false, nil)` for **every** query error instead of only
+`gocql.ErrNotFound` ([store_cassandra.go:2270-2278](../internal/gc/store_cassandra.go#L2270)).
+Phases 3/4 enumerate live and deleted library IDs, call `LibraryExists`, and treat false as an
+orphan. If that read fails transiently but the next org/representation read succeeds, the scanner
+enqueues live commits/fs_objects with `RequiresLibraryDeletedCheck=false`
+([scanner.go:531-579](../internal/gc/scanner.go#L531),
+[scanner.go:607-655](../internal/gc/scanner.go#L607)). `acquireLibraryDeleteGuard` intentionally
+bypasses all validation for such items ([worker.go:1586-1589](../internal/gc/worker.go#L1586)), so
+the worker can delete live commits/fs_objects and release their legitimate `fs:` refs. The safe
+physical block claim cannot compensate after GC itself removed the live reference.
+
+`GroupExists` has the same error swallowing, and Phase 9 discards its error, so a transient read
+failure can delete a still-valid group share
+([store_cassandra.go:3208-3216](../internal/gc/store_cassandra.go#L3208),
+[scanner.go:1013-1025](../internal/gc/scanner.go#L1013)).
+
+#### Fix Direction (branch 1D — before reclamation optimizations)
+
+- Return `false,nil` only for `gocql.ErrNotFound`; propagate every other error.
+- Stop discarding `LibraryExists`/`GroupExists` errors in scanners; accumulate/return them.
+- Add defense-in-depth guards to destructive orphan items so a live library is revalidated at
+  execution time. Preserve the correct deletion identity when a marker exists.
+- Add fault-injection tests: existence read fails, subsequent reads succeed, and no live
+  commit/fs_object/ref/share is deleted.
+
+---
+
+### ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01: Markerless Commit/FS Partitions Are Invisible
+
+**Status**: 🟡 Confirmed gap (2026-07-10)
+**Severity**: High/Medium — markerless artifacts can remain indefinitely and evade Phases 3/4
+**Affected**: `ListDistinctCommitLibraries`, `ListDistinctFSObjectLibraries`, scanner Phases 3/4
+
+#### Problem
+
+Despite their names, `ListDistinctCommitLibraries` and `ListDistinctFSObjectLibraries` both call
+`listGCArtifactLibraries`, which enumerates only `libraries_by_id` plus `deleted_libraries`
+([store_cassandra.go:2235-2268](../internal/gc/store_cassandra.go#L2235)). It never enumerates
+library IDs from surviving commit/fs_object partitions or a dedicated discovery projection.
+
+Once both library indexes/markers are gone, remaining commits/fs_objects are invisible to the
+orphan phases. This directly matches the audit snapshot: `libraries=0`,
+`deleted_libraries=0`, but `commits=4`. It also means DLQ expiry or legacy/manual drift can make
+child artifacts permanently undiscoverable after the parent marker has been removed.
+
+#### Fix Direction (branch 8D)
+
+- Add a durable, bounded discovery projection for artifact library IDs, or keep a durable cleanup
+  identity until every child queue/DLQ item reaches a terminal state.
+- Backfill/report markerless artifact partitions through the read-only reconciler first.
+- Never solve this with a new full-table production scan or direct S3 deletion.
+
+---
+
+### ISSUE-GC-TEST-RESIDUE-01: Integration Suite Leaves DB + MinIO Residue
+
+**Status**: 🟡 Test hygiene (2026-07-10)
+**Severity**: Medium — pollutes the shared dev keyspace/bucket and produced the misleading "leak" snapshot in the audit
+**Affected**: `internal/integration` test suite, shared Cassandra keyspace + MinIO bucket
+
+#### Problem
+
+The integration suite runs against a **shared** dev keyspace and MinIO bucket with no global
+truncate/teardown; cleanup is only by ephemeral library name. Confirmed residue/interference:
+
+1. `TestMain` does not start/own the external `Service`, but the dev backend has GC enabled and
+   normal tests call global `/api/v2.1/admin/gc/run`; therefore "nothing drains" is false.
+2. `TestAdminIdentityProjectionRegression_HardDeleteOrganization` constructs a worker with
+   `storage=nil` and calls global `ProcessOnce()`
+   ([admin_identity_projection_regression_test.go:333-334](../internal/integration/admin_identity_projection_regression_test.go#L333)).
+   It can process unrelated active orgs. For block items, nil storage removes Cassandra metadata
+   without deleting S3, plausibly contributing to unmatched MinIO objects.
+3. **`TestWebBlockUploadForeignPubRefNotPermanent`** injects a `pub:foreign-<ts>` ref with **no
+   TTL and no `t.Cleanup`** and removes the session's `up:` ref
+   ([web_block_upload_test.go:945-950](../internal/integration/web_block_upload_test.go#L945)).
+
+Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intentionally builds unstamped legacy markers and removes them via fixture cleanup — legitimate. But `library_projection_regression_test.go` still has a **failure-only** restore (`if !t.Failed() { return }`) that re-inserts `deleted_libraries` **without** `block_representation_id` ([library_projection_regression_test.go:2090-2094](../internal/integration/library_projection_regression_test.go#L2090)), so a failing run can recreate an unstamped marker in the shared keyspace.
+
+#### Fix Direction (branches 1A/1B/1C)
+
+- **Branch 1A**: fix `TestWebBlockUploadForeignPubRefNotPermanent` — capture the referrer in a variable, add a `t.Cleanup` that deletes **all** rows/objects identified by the fixture's exact org/library/session/operation/block IDs (ref + block + mapping + S3 object **+ the provisional expiry projection** created by the real upload session), or insert the fake `pub:` with a TTL and still clean up; assert the fake ref is gone. Clean only exact-ID artifacts — never broad cleanup. Preserve the test's purpose (a foreign `pub:` must not count as a permanent ref).
+- **Branch 1B**: inventory the E2E upload fixtures that leave `blocks` rows + S3 objects and add fixture-scoped teardown; also repair the `library_projection_regression_test.go` failure-restore so it does not re-insert an unstamped marker. Measure **no-net-growth** vs the pre-suite baseline. Do not run a global GC over the shared keyspace (invariants #5/#6).
+- **Branch 1C**: replace the direct global `ProcessOnce(storage=nil)` with `ProcessOrgOnce`;
+  inventory admin GC triggers and isolate them or measure their exact baseline delta.
+
+#### Related Docs
+
+- `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (F3, Verdict 2)
+
+---
+
+### ISSUE-GC-ENGINE-ROBUSTNESS-01: GC Worker/Scanner Robustness (E1/E2/E4/E5)
+
+**Status**: 🟡 Confirmed, low-severity (2026-07-10)
+**Severity**: Low / Low-Med — engine fragility and observability; former E3 is High P6
+**Affected**: `internal/gc` worker + scanner
+
+#### Problem
+
+A worker/scanner engine review confirmed E1/E2/E4/E5 as low-severity. Former E3 was
+incorrectly described as fail-safe: the Cassandra store swallows the error, making it the High
+P6 issue above.
+
+- **E1 — no postpone bound.** `postponeItem` re-queues a lock-contended (`hard_delete_in_progress`) item with `RetryCount` unchanged ([worker.go:345-358](../internal/gc/worker.go#L345)). Intentional (lock contention should not push toward the DLQ), but with no bound and no metric a permanently stuck hard-delete lock loops forever with no DLQ/alert.
+- **E2 — `dryRun` data race vs cutover semantics.** `dryRun` is read/written concurrently
+  without synchronization. `atomic.Bool` fixes the Go race and visibility, but does not stop work
+  already past its check; hard cutover requires drain/serialization or destructive-step rechecks.
+- **E3 — escalated to P6.** `LibraryExists`/`GroupExists` swallow errors as "missing"; this is
+  not a low-severity visibility problem.
+- **E4 — pending projection drift risk, not a proven normal leak.** Queue completion, DLQ
+  deletion, and DLQ expiry remove `gc_pending_items` in their logged batches
+  ([store_cassandra.go:499-583](../internal/gc/store_cassandra.go#L499)). No independent reconcile
+  exists for historical/manual/ambiguous drift. A blind TTL could expire valid dedup protection
+  while queue/DLQ work remains live.
+- **E5 — S3-orphan recovery lease-only exclusion.** `RecoverS3Orphans` ([worker.go:599-772](../internal/gc/worker.go#L599)) has no per-row LWT; mutual exclusion relies on the leader lease. Real double-processing risk only under a lease split-brain.
+
+#### Reviewed and found NOT to be bugs
+
+- "Infinite DLQ↔queue loop when the marker is deleted mid-cascade" — **not a bug**: the skip returns `nil` → the item is `Complete()`d (removed) ([worker.go:1199-1202](../internal/gc/worker.go#L1199) → [worker.go:311](../internal/gc/worker.go#L311)); Phase 13 lists from the marker, so a gone marker is not re-listed.
+- "Resurrection guard missing for the `pending_s3` phase" — **not a bug**: the branch checks `BlockExists` before the S3 delete and defers if the canonical row exists ([worker.go:695-708](../internal/gc/worker.go#L695)).
+- "Child-enqueue vs parent-delete race in `processCommit`/`processFSObject`" — **mitigated**: children carry `RequiresLibraryDeletedCheck` and their own `acquireLibraryDeleteGuard` catches restore/re-delete ([worker.go:1586-1616](../internal/gc/worker.go#L1586)).
+
+#### Fix Direction (branches 10A–10E)
+
+- 10A: `atomic.Bool` plus an explicit decision on hard-cutover semantics.
+- 10B: consistently surface remaining scanner errors; P5/P6 own their specific paths.
+- 10C: meter/bound repeated postpones without premature DLQ.
+- 10D: audit/reconcile pending rows against queue + retained DLQ; no standalone TTL unless
+  lifetimes are coordinated.
+- 10E: decide E5 explicitly — accept leader-lease exclusion as design because operations are
+  largely idempotent, or add a per-row orphan claim/LWT if split-brain tolerance is required.
+
+#### Related Docs
+
+- `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (Engine-level review)
+- `docs/GC-SERVICE-ANALYSIS.md`
+
+---
+
+### ISSUE-GC-RECONCILE-BACKFILL-01: No Reconcile/Backfill for Already-Orphaned Blocks + S3 Objects
+
+**Status**: 🟡 Follow-up (2026-07-10)
+**Severity**: Medium — production hygiene for existing clusters
+**Affected**: existing clusters with residue from the gaps above or from pre-#123 deletes
+
+#### Problem
+
+The GC engine has crash recovery for its own in-flight deletes (`gc_s3_orphans`) but no sweeper for content orphaned by the delete-path gaps (P1–P4) or by pre-#123 behavior: `fs:` refs whose library is gone, blocks with no ref and no candidate, candidates with no queue item, stale `gc_libraries_by_policy` rows, and S3 objects with no `blocks` row. Blind `TRUNCATE` is unsafe — truncating `block_references` without deleting the S3 objects would orphan MinIO further.
+
+#### Fix Direction (branches 8A–8C)
+
+- 8A: **read-only** reconcile (`--dry-run` default, per-org scope, paginated, JSON, no S3 delete) that reports every orphan class above.
+- 8B: low-risk repairs (delete stale policy rows; re-enqueue existing candidates; block with no refs → `EnsureBlockGCCandidate`, never a direct delete).
+- 8C: conservative `fs:` orphan repair (fs_object exists → enqueue; missing + lib gone + marker → delete only that ref → zero-ref → candidate). Do not touch `pub:` or delete S3 directly from the reconciler; let the safe worker protocol do the physical delete.
+
+#### Related Docs
+
+- `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (Proposed work item 4, branch roadmap)
+
+---
+
 ## See Also
 
 - [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) - Component completion status
 - [API-REFERENCE.md](API-REFERENCE.md) - API endpoint documentation
 - [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md) - Architectural issues
 - [CURRENT_WORK.md](../CURRENT_WORK.md) - Active priorities
+- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (corrected verdict, P1–P7, invariants, branch roadmap)
