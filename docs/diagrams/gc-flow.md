@@ -4,6 +4,14 @@
 > Red nodes are deletion actions. Yellow nodes are potential risk areas.
 > Diamonds are decision points.
 
+> **Delete-path audit (2026-07-10):** the yellow risk areas on the library-delete →
+> cascade handoff are catalogued as P1–P5 in
+> [../GC-DELETE-CLEANUP-INVESTIGATION.md](../GC-DELETE-CLEANUP-INVESTIGATION.md)
+> (`ISSUE-GC-*` in [../KNOWN_ISSUES.md](../KNOWN_ISSUES.md)). Key gaps to keep in mind while
+> reading: org-admin trash deletes skip the immediate cascade/counter/tags, the superadmin
+> enqueue is a fire-and-forget goroutine, and `pub:` refs have no discoverable zero-ref
+> transition (unlike `up:`). The physical block-delete protocol below is **verified safe**.
+
 ### How to read colors
 
 | Color | Meaning |

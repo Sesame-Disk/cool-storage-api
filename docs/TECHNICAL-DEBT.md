@@ -2063,4 +2063,54 @@ on that metric to bound leaked forward mappings.
 
 ---
 
-*Last updated: 2026-06-30*
+## 31. GC Library-Delete Cleanup Audit Follow-ups (2026-07-10)
+
+A cross-agent audit after PR #123 (`fix/gc-block-representation-durability`) verified the
+block-delete **engine is safe** but the **library-delete → cascade handoff is not fully durable
+or optimal**. Full audit and code citations: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`. Per-item
+issues: `ISSUE-GC-*` in `docs/KNOWN_ISSUES.md`. This extends the earlier §10 (Library Deletion:
+Cleanup Paths) — those paths are functionally correct but leave the durability/optimality debt below.
+
+**Verified-safe (no debt):** the physical block delete uses claim-then-verify LWT, registers
+`gc_s3_orphans` recovery before deleting the canonical row, orders DB→S3→mapping, guards against
+resurrection, and validates the block representation fail-closed. The risk profile is "fails to
+reclaim garbage", never "deletes live data".
+
+### Deferred / by-design debt
+
+- **Durable delete outbox (a).** Permanent-delete currently hands off via a fire-and-forget
+  `go fn()` enqueue (`ISSUE-GC-DELETE-HANDOFF-DURABILITY-01`). The durable fix is a
+  `deleted_libraries.purge_requested_at` marker that Phase 13 treats as immediately eligible, so
+  the goroutine becomes a mere accelerator. Intentionally **not** modeled as one atomic Cassandra
+  batch — ref release, candidate promotion, policy-index deletion, and content enqueue are
+  variable-size, multi-partition, and overlap the existing cascade; a single "atomic" batch is
+  neither possible nor safe and would risk double zero-ref transitions. The delete entry point does
+  only the small idempotent-safe part (resolve+validate representation, stamp marker, delete library
+  row + policy rows) and hands off to the durable, idempotent cascade.
+- **`pub:` ref ownership (b).** `pub:` refs lack a discoverable zero-ref transition
+  (`ISSUE-GC-PUB-REF-ZERO-REF-01`). Determine the single owner of `pub:` cleanup (publish/expiry
+  scanner) **before** wiring any release; the library cascade must never remove `pub:` refs
+  (invariant #2). Give `pub:` an expiry projection mirroring `up:` rather than having the cascade
+  release it.
+- **Reconcile by phases (c).** No sweeper exists for content already orphaned by the delete-path
+  gaps or pre-#123 behavior (`ISSUE-GC-RECONCILE-BACKFILL-01`). Start read-only (dry-run, per-org,
+  paginated, no S3 delete), then low-risk repairs, then conservative `fs:` orphan repair. Never
+  truncate `block_references`/mappings to clean a cluster (would orphan MinIO).
+- **N+1 in bulk cleaners (d).** The trash-listing path does one extra read per library to resolve
+  `encrypted` + `block_representation_id`; fold both into the listing query, with the extra resolver
+  only as a legacy fallback (branch 9). Do not mix this optimization with the durable-handoff work —
+  an optimization can mask functional errors and complicate the audit.
+
+### Architectural invariants (must not be broken by any follow-up)
+
+1. The API never removes `fs:` refs (owner: the `fs_object` cascade).
+2. The library cascade never removes `pub:` refs (owner: publish/expiry scanner).
+3. Zero-ref means `EnsureBlockGCCandidate`, not a direct delete.
+4. The worker keeps the LWT claim + final re-validation before any S3 delete.
+5. Never truncate `block_references`/mappings to clean a cluster.
+6. Tests never run a global GC over the shared keyspace; they only clean fixtures they created.
+7. PR #123 representation recovery (Phase 13) is kept always.
+
+---
+
+*Last updated: 2026-07-10*
