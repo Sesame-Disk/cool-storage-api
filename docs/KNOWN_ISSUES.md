@@ -3710,7 +3710,7 @@ Keep processing all markers, accumulate errors (`errors.Join`), return the joine
 - `LibraryExists` and `GroupExists` now return `(false, nil)` **only** for `gocql.ErrNotFound` and propagate every other error ([store_cassandra.go:2270-2283](../internal/gc/store_cassandra.go#L2270), [store_cassandra.go:3208-3222](../internal/gc/store_cassandra.go#L3208)).
 - Phase 9 no longer discards the `GroupExists` error — on error it skips the share (never deletes it) and records a phase error ([scanner.go:1013-1032](../internal/gc/scanner.go#L1013)).
 - Phases 3/4 handle the `LibraryExists` error explicitly (skip + surface `phaseErr`) so a transient read cannot enqueue a live library's commits/fs_objects ([scanner.go:531-546](../internal/gc/scanner.go#L531), [scanner.go:607-622](../internal/gc/scanner.go#L607)).
-- Phase 9 reads `OrgID` from each `shares_by_group` projection row and only falls back to the library→org projection when it is absent — surfacing that fallback failure instead of silently skipping a share. `ScanAllGroupShares` streams the projection directly in 256-row driver pages, so deleted-group partitions remain discoverable without materializing the full result; the Cassandra-wide scan is tracked separately as P8. The existence cache is a single-entry `(org_id, group_id)` "last partition" cache (O(1) memory), correct because a `shares_by_group` scan returns each partition's rows consecutively ([scanner.go:1013-1094](../internal/gc/scanner.go#L1013)).
+- Phase 9 reads `OrgID` from each `shares_by_group` projection row and only falls back to the library→org projection when it is absent — surfacing that fallback failure instead of silently skipping a share. `ScanAllGroupShares` streams the projection directly in 256-row driver pages, so deleted-group partitions remain discoverable without materializing the full result; the Cassandra-wide scan is tracked separately as P8. The existence cache is a single-entry `(org_id, group_id)` "last partition" cache (O(1) memory) that opportunistically reuses the result (or error) for consecutive rows of the same partition; correctness does not depend on scan ordering, since a partition reappearing later just triggers another lookup ([scanner.go:1013-1094](../internal/gc/scanner.go#L1013)).
 - The worker guard (`acquireLibraryDeleteGuard`) already propagated `LibraryExists` errors; with the store fix it is now genuinely fail-closed.
 - Regression tests inject a transient existence error and assert no live commit/fs_object is enqueued and no valid group share is deleted, plus that Phase 9 cleans via the share `OrgID` without the library lookup: `TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError`, `TestScanner_ScanOrphanedGroupShares_UsesShareOrgIDWithoutLibraryLookup`, `TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError`, `TestScanner_ScanOrphanedFSObjects_FailClosedOnLibraryExistsError` (`internal/gc/scanner_test.go`). MockStore gained `libraryExistsErr`/`groupExistsErr` injection hooks.
 
@@ -3806,9 +3806,9 @@ old groups-driven N+1 could not do that. The immediate implementation therefore 
 projection directly, but processes it as a context-aware stream with a 256-row driver page size:
 rows are handled immediately, cancellation can interrupt the query, and a late-page error is
 surfaced by the phase. Process memory is bounded to the driver page plus a single-entry
-`(org_id, group_id)` existence cache (O(1)) — the group-existence dedup does not grow with the
-number of distinct groups, because a `shares_by_group` scan returns each partition's rows
-consecutively.
+`(org_id, group_id)` existence cache (O(1)) that opportunistically reuses the result (or error)
+for consecutive rows of the same partition — the group-existence dedup does not grow with the
+number of distinct groups, and correctness does not depend on scan ordering.
 
 This does **not** make the Cassandra read scalable: without a partition key, every Phase 9 cycle
 still reads the global table. Treat the stream as a correctness-first bridge for controlled current

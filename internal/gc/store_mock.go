@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -163,6 +164,7 @@ type MockStore struct {
 	getBlockRefCountErr            error
 	libraryExistsErr               error
 	groupExistsErr                 error
+	groupExistsCalls               atomic.Int64
 	findOrgForLibraryErr           error
 	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
 
@@ -2765,6 +2767,7 @@ func (m *MockStore) ScanAllGroupShares(ctx context.Context, visit func(GroupShar
 	return nil
 }
 func (m *MockStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) {
+	m.groupExistsCalls.Add(1)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.groupExistsErr != nil {

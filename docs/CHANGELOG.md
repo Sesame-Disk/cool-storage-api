@@ -16,8 +16,9 @@ Session-by-session development history for SesameFS.
   issuing an N+1 query per group. This restores stable orphan discovery, bounds process memory,
   and supports cancellation; scalable bucketed partition discovery remains follow-up work.
   Process memory is now genuinely bounded: the existence cache is a single-entry `(org_id, group_id)`
-  "last partition" cache (O(1)), correct because a `shares_by_group` scan returns each partition's
-  rows consecutively — not a map that grows with the number of distinct groups.
+  "last partition" cache (O(1)) that opportunistically reuses the result (or error) for consecutive
+  rows of the same partition — not a map that grows with the number of distinct groups. Correctness
+  does not depend on scan ordering; a partition that reappears later just triggers another lookup.
 - Added fail-closed fallback and cross-org cache tests, a mid-stream cancellation test
   (`ScanAllGroupShares` stops after the first visit once the context is cancelled), and a
   real-Cassandra regression that inserts a `shares_by_group` row without a `groups` row and

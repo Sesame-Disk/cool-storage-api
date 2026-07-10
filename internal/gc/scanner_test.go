@@ -1011,6 +1011,41 @@ func TestMockStore_ScanAllGroupShares_StopsMidStreamOnCancel(t *testing.T) {
 	}
 }
 
+// A GroupExists error is cached for the whole partition: a transient failure must not
+// be re-issued (and re-logged) once per share in a large same-group partition.
+func TestScanner_ScanOrphanedGroupShares_CachesErrorPerPartition(t *testing.T) {
+	store := NewMockStore()
+	s := NewScanner(store, NewQueue(store), &Stats{}, config.GCConfig{})
+
+	orgID := uuid.New()
+	groupID := uuid.New()
+	libID := uuid.New()
+	store.AddLibrary(orgID, libID, "hot")
+	shareIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	for _, sid := range shareIDs {
+		store.AddGroupShare(libID, sid, groupID) // same (org, group) partition
+	}
+	store.groupExistsErr = errors.New("cassandra unavailable")
+
+	n, err := s.scanOrphanedGroupShares(context.Background())
+	if err == nil {
+		t.Fatal("expected the group-existence error to be surfaced, got nil")
+	}
+	if n != 0 {
+		t.Fatalf("expected no shares cleaned on existence error, got %d", n)
+	}
+	if calls := store.groupExistsCalls.Load(); calls != 1 {
+		t.Fatalf("expected exactly 1 GroupExists call for the shared partition, got %d", calls)
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	for _, sid := range shareIDs {
+		if _, ok := store.shares[fmt.Sprintf("%s:%s", libID, sid)]; !ok {
+			t.Fatalf("share %s was deleted despite a group-existence error", sid)
+		}
+	}
+}
+
 // Regression for P6: a transient LibraryExists error in Phase 3 must NOT be treated
 // as "library gone" and enqueue a live library's commits for deletion.
 func TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError(t *testing.T) {

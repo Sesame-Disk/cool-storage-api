@@ -1010,11 +1010,11 @@ func (s *Scanner) scanExpiredRestoreJobs(ctx context.Context) (int, error) {
 func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 9: Scanning for orphaned group shares...")
 
-	// shares_by_group is partitioned by (org_id, group_id), so a full scan returns
-	// every row of a partition consecutively. A single-entry "last partition" cache
-	// therefore does exactly one GroupExists per partition with O(1) memory — unlike a
-	// map, it does not grow with the number of distinct groups. A partition reappearing
-	// non-consecutively would only cost one extra lookup, never a wrong answer.
+	// A single-entry "last partition" cache opportunistically reuses the GroupExists
+	// result (or error) for consecutive rows of the same (org_id, group_id) partition,
+	// which is how a shares_by_group scan normally returns them. Memory stays O(1) and
+	// correctness does not depend on scan ordering: if a partition reappears later,
+	// Phase 9 simply performs another lookup — never a wrong answer.
 	type groupExistenceKey struct {
 		orgID   uuid.UUID
 		groupID uuid.UUID
@@ -1022,6 +1022,7 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 	var (
 		lastKey    groupExistenceKey
 		lastExists bool
+		lastErr    error
 		haveLast   bool
 	)
 
@@ -1058,26 +1059,29 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 		}
 
 		cacheKey := groupExistenceKey{orgID: orgID, groupID: gs.SharedTo}
-		exists := lastExists
 		if !haveLast || cacheKey != lastKey {
-			// Fail closed: a GroupExists error must NOT be read as "group gone",
-			// which would delete a valid share. Skip this share and surface the error.
-			groupExists, err := s.store.GroupExists(orgID, gs.SharedTo)
-			if err != nil {
-				log.Printf("[GC Scanner] Phase 9: group existence check failed for group %s (library %s); skipping share: %v", gs.SharedTo, gs.LibraryID, err)
-				failed++
-				if phaseErr == nil {
-					phaseErr = err
-				}
-				return nil
-			}
-			exists = groupExists
+			// Look up (and cache) the group's existence for this partition. Cache the
+			// error too, so a transient GroupExists failure is not re-issued and
+			// re-logged once per share in a large partition.
+			lastExists, lastErr = s.store.GroupExists(orgID, gs.SharedTo)
 			lastKey = cacheKey
-			lastExists = groupExists
 			haveLast = true
+			if lastErr != nil {
+				log.Printf("[GC Scanner] Phase 9: group existence check failed for group %s (library %s); skipping this partition's shares: %v", gs.SharedTo, gs.LibraryID, lastErr)
+				if phaseErr == nil {
+					phaseErr = lastErr
+				}
+			}
+		}
+		if lastErr != nil {
+			// Fail closed: a GroupExists error must NOT be read as "group gone",
+			// which would delete a valid share. Count each deferred share; the next
+			// scanner cycle retries the partition.
+			failed++
+			return nil
 		}
 
-		if !exists {
+		if !lastExists {
 			// Group deleted — clean up the orphaned share
 			if err := s.store.DeleteShare(gs.LibraryID, gs.ShareID); err != nil {
 				log.Printf("[GC Scanner] Phase 9: failed to delete orphaned group share %s for library %s: %v", gs.ShareID, gs.LibraryID, err)
