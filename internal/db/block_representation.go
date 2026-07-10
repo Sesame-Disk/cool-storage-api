@@ -130,6 +130,31 @@ func ResolveBlockRepresentationIDForDelete(session *gocql.Session, orgID, librar
 	return deleteBlockRepresentationFromState(state)
 }
 
+// CanonicalBlockRepresentationIDForLibrary derives the ONE block representation
+// a library may legally use from its own identity and encrypted flag. A blank
+// stored value is defaulted to that expected representation; a non-blank stored
+// value must match exactly or it is rejected as drift/corruption.
+func CanonicalBlockRepresentationIDForLibrary(libraryID string, encrypted bool, stored string) (string, error) {
+	libUUID, err := uuid.Parse(strings.TrimSpace(libraryID))
+	if err != nil {
+		return "", fmt.Errorf("invalid library id %q: %w", libraryID, err)
+	}
+
+	expected := PlainBlockRepresentationID
+	if encrypted {
+		expected = EncryptedLibraryBlockRepresentationID(libUUID.String())
+	}
+
+	stored = strings.TrimSpace(stored)
+	if stored == "" {
+		return expected, nil
+	}
+	if stored != expected {
+		return "", fmt.Errorf("block representation %q does not match library %s encrypted=%t; expected %q", stored, libUUID, encrypted, expected)
+	}
+	return expected, nil
+}
+
 // deleteBlockRepresentationFromState is the pure derive-and-validate step of
 // ResolveBlockRepresentationIDForDelete, split out so it can be unit-tested
 // without a live session.
@@ -144,22 +169,5 @@ func ResolveBlockRepresentationIDForDelete(session *gocql.Session, orgID, librar
 // library:<same-id>. Both would send GC to the wrong SHA-1 mapping domain, so
 // they are rejected.
 func deleteBlockRepresentationFromState(state LibraryState) (string, error) {
-	libUUID, err := uuid.Parse(strings.TrimSpace(state.LibraryID))
-	if err != nil {
-		return "", fmt.Errorf("invalid library id %q: %w", state.LibraryID, err)
-	}
-
-	expected := PlainBlockRepresentationID
-	if state.Encrypted {
-		expected = EncryptedLibraryBlockRepresentationID(libUUID.String())
-	}
-
-	stored := strings.TrimSpace(state.BlockRepresentationID)
-	if stored == "" {
-		return expected, nil
-	}
-	if stored != expected {
-		return "", fmt.Errorf("block representation %q does not match library %s encrypted=%t; expected %q", stored, libUUID, state.Encrypted, expected)
-	}
-	return expected, nil
+	return CanonicalBlockRepresentationIDForLibrary(state.LibraryID, state.Encrypted, state.BlockRepresentationID)
 }

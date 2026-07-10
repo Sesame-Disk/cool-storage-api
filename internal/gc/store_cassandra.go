@@ -1181,7 +1181,7 @@ func (s *CassandraStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.U
 		SELECT encrypted, block_representation_id FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID.String(), libraryID.String()).Scan(&encrypted, &storedRepresentationID)
 	if err == nil {
-		return db.EffectiveBlockRepresentationID(libraryID.String(), encrypted, storedRepresentationID), nil
+		return db.CanonicalBlockRepresentationIDForLibrary(libraryID.String(), encrypted, storedRepresentationID)
 	}
 	if !errors.Is(err, gocql.ErrNotFound) {
 		return "", err
@@ -1201,6 +1201,12 @@ func (s *CassandraStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.U
 	deletedRepresentationID = strings.TrimSpace(deletedRepresentationID)
 	if deletedRepresentationID == "" {
 		return "", gocql.ErrNotFound
+	}
+	if !db.IsCanonicalBlockRepresentationForLibrary(deletedRepresentationID, libraryID) {
+		if !db.IsCanonicalBlockRepresentationID(deletedRepresentationID) {
+			return "", fmt.Errorf("deleted library %s carries non-canonical block representation %q", libraryID, deletedRepresentationID)
+		}
+		return "", fmt.Errorf("deleted library %s carries block representation %q for a different library", libraryID, deletedRepresentationID)
 	}
 	return deletedRepresentationID, nil
 }
@@ -3348,16 +3354,26 @@ func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID
 		if baseErr := s.db.Session().Query(
 			`SELECT owner_id, storage_class, encrypted, block_representation_id FROM libraries WHERE org_id = ? AND library_id = ?`,
 			orgID.String(), libraryID.String(),
-		).Scan(&ownerID, &storageClass, &encrypted, &storedRepresentationID); baseErr != nil && !errors.Is(baseErr, gocql.ErrNotFound) {
+		).Scan(&ownerID, &storageClass, &encrypted, &storedRepresentationID); baseErr != nil {
+			if errors.Is(baseErr, gocql.ErrNotFound) {
+				return baseErr
+			}
 			return baseErr
 		}
 	} else if baseErr := s.db.Session().Query(
 		`SELECT encrypted, block_representation_id FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID.String(), libraryID.String(),
-	).Scan(&encrypted, &storedRepresentationID); baseErr != nil && !errors.Is(baseErr, gocql.ErrNotFound) {
+	).Scan(&encrypted, &storedRepresentationID); baseErr != nil {
+		if errors.Is(baseErr, gocql.ErrNotFound) {
+			return baseErr
+		}
 		return baseErr
 	}
-	blockRepresentationID := db.EffectiveBlockRepresentationID(libraryID.String(), encrypted, storedRepresentationID)
+	blockRepresentationID, repErr := db.CanonicalBlockRepresentationIDForLibrary(libraryID.String(), encrypted, storedRepresentationID)
+	if repErr != nil {
+		metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("gc_soft_delete").Inc()
+		return fmt.Errorf("resolve block representation for soft delete %s/%s: %w", orgID, libraryID, repErr)
+	}
 
 	now := time.Now().UTC()
 	batch := s.db.Session().Batch(gocql.LoggedBatch)

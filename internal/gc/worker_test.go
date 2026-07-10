@@ -2412,6 +2412,7 @@ func TestWorker_RemoveFSObjectBlockReferences_SoftDeletedLibraryUsesStoredRepres
 
 	store.AddLibrary(orgID, libID, "hot")
 	store.mu.Lock()
+	store.libraries[libID].Encrypted = true
 	store.libraries[libID].BlockRepresentationID = encRep
 	store.mu.Unlock()
 	store.AddBlock(orgID, internalBlockID, "hot", 0)
@@ -2448,6 +2449,7 @@ func TestWorker_ProcessFSObject_HardDeletedLibraryUsesQueuedRepresentation(t *te
 
 	store.AddLibrary(orgID, libID, "hot")
 	store.mu.Lock()
+	store.libraries[libID].Encrypted = true
 	store.libraries[libID].BlockRepresentationID = encRep
 	store.mu.Unlock()
 	store.AddBlock(orgID, internalBlockID, "hot", 0)
@@ -2497,6 +2499,7 @@ func TestWorker_ProcessLibraryCascade_EndToEndUsesQueuedRepresentationWithoutMet
 	store.AddOrganization(orgID)
 	store.AddLibrary(orgID, libID, "hot")
 	store.mu.Lock()
+	store.libraries[libID].Encrypted = true
 	store.libraries[libID].BlockRepresentationID = encRep
 	store.mu.Unlock()
 	store.AddCommit(libID, "commit-1", "fs-root")

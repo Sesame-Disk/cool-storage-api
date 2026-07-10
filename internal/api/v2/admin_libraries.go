@@ -1228,7 +1228,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 
 	libEnqueuer := getLibraryEnqueuer()
 	cleaned := 0
-	failed := 0
+	var candidates []trashLibraryCandidate
 
 	for _, orgID := range orgIDs {
 		_, cleanedStale, err := dbpkg.ReconcileDeletedAdminLibraryRowsByOrg(h.db.Session(), orgID)
@@ -1241,9 +1241,9 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			cleaned += cleanedStale
 		}
 
-		// Collect all soft-deleted libraries for this org in one pass.
-		var candidates []trashLibraryCandidate
-
+		// Collect all soft-deleted libraries for this org in one pass, accumulating
+		// into the shared candidates slice declared above so every org's trashed
+		// libraries reach completeAdminCleanTrashLibraries below.
 		iter := h.db.Session().Query(`
 			SELECT library_id, storage_class, deleted_at FROM libraries WHERE org_id = ?
 		`, orgID).Iter()
@@ -1259,16 +1259,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			}
 		}
 		iter.Close()
-
-		processedCleaned, processedFailed := h.processAdminTrashCandidates(candidates, libEnqueuer)
-		cleaned += processedCleaned
-		failed += processedFailed
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"partial": failed > 0,
-		"cleaned": cleaned,
-		"skipped": failed,
-	})
+	h.completeAdminCleanTrashLibraries(c, cleaned, candidates, libEnqueuer)
 }

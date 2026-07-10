@@ -26,6 +26,21 @@ func TestMockStore_GetLibraryBlockRepresentationID_RejectsOrgMismatchOnDeletedLi
 	}
 }
 
+func TestMockStore_GetLibraryBlockRepresentationID_RejectsCrossDomainLiveLibrary(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	libID := uuid.New()
+	store.AddLibrary(orgID, libID, "hot")
+	store.mu.Lock()
+	store.libraries[libID].Encrypted = false
+	store.libraries[libID].BlockRepresentationID = db.EncryptedLibraryBlockRepresentationID(libID.String())
+	store.mu.Unlock()
+
+	if _, err := store.GetLibraryBlockRepresentationID(orgID, libID); err == nil {
+		t.Fatal("GetLibraryBlockRepresentationID error = nil, want cross-domain rejection")
+	}
+}
+
 // TestMockStore_GetLibraryBlockRepresentationID_ResolvesFromDeletedLibrary pins the
 // Rama 3 durability contract: once migration 010 gives deleted_libraries a
 // block_representation_id column, GetLibraryBlockRepresentationID resolves from
@@ -91,6 +106,24 @@ func TestMockStore_EnqueueBatchRejectsForeignRepresentation(t *testing.T) {
 	}})
 	if err == nil {
 		t.Fatal("expected direct store enqueue to reject foreign representation")
+	}
+}
+
+func TestMockStore_SoftDeleteLibrary_RejectsCrossDomainRepresentation(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	libID := uuid.New()
+	store.AddLibrary(orgID, libID, "hot")
+	store.mu.Lock()
+	store.libraries[libID].Encrypted = true
+	store.libraries[libID].BlockRepresentationID = db.PlainBlockRepresentationID
+	store.mu.Unlock()
+
+	if err := store.SoftDeleteLibrary(orgID, libID, uuid.Nil); err == nil {
+		t.Fatal("SoftDeleteLibrary error = nil, want cross-domain rejection")
+	}
+	if deleted := store.deletedLibraries[libID]; deleted != nil {
+		t.Fatalf("deleted library marker = %#v, want no marker on rejected soft delete", deleted)
 	}
 }
 

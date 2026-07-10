@@ -95,3 +95,25 @@ func TestResolveRequiredLibraryBlockRepresentation_WrongLibraryIsFatal(t *testin
 		t.Fatalf("error = %v, want different-library message", err)
 	}
 }
+
+func TestResolveRequiredLibraryBlockRepresentation_CrossDomainLiveLibraryIsFatal(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	store.AddLibrary(orgID, libraryID, "hot")
+	store.mu.Lock()
+	store.libraries[libraryID].Encrypted = true
+	store.libraries[libraryID].BlockRepresentationID = db.PlainBlockRepresentationID
+	store.mu.Unlock()
+
+	got, err := resolveRequiredLibraryBlockRepresentation(store, orgID, libraryID, "", "cross-domain test")
+	if err == nil {
+		t.Fatal("resolveRequiredLibraryBlockRepresentation() error = nil, want cross-domain error")
+	}
+	if got != "" {
+		t.Fatalf("resolveRequiredLibraryBlockRepresentation() = %q, want empty result on error", got)
+	}
+	if !strings.Contains(err.Error(), "does not match library") {
+		t.Fatalf("error = %v, want encrypted-domain mismatch message", err)
+	}
+}
