@@ -6,23 +6,29 @@
 **Status:** partially fixed on PR #123 (representation stamping + Phase 13 recovery);
 the remaining items below are **out of scope for #123** and are being closed on a
 series of small, auditable follow-up branches. This document is the **canonical audit
-record**; the corrected verdict, the confirmed production-gap table (P1–P7), the
+record**; the corrected verdict, the confirmed production-gap table (P1–P8), the
 architectural invariants, and the branch roadmap live in the
 [**"Cross-agent audit — verified verdict"**](#cross-agent-audit--verified-verdict-2026-07-10)
 section at the end. The `F1`–`F4` findings below are the original notes, now annotated
 with their verified status.
 
 > **TL;DR of the corrected audit:** the physical block-delete protocol in isolation is
-> conservative, but the end-to-end GC has a **High fail-open existence check**. A transient
-> Cassandra error can be interpreted as "library missing", allowing destructive work for a
-> live library without the delete guard. The audit does not certify end-to-end GC safety until
-> P6 is fixed and regression-tested. Test residue is also affected by global GC test activity.
-> There are additional real reclamation gaps
+> conservative. The end-to-end GC had a **High fail-open existence check** — a transient
+> Cassandra error could be read as "library missing", allowing destructive work for a live
+> library without the delete guard — **now fixed** (P6a / branch 1D, 2026-07-10: existence
+> reads propagate non-`ErrNotFound` errors and Phases 3/4/9 fail closed, with regression tests).
+> A **narrower residual gap (P6b, Medium)** remains: already-enqueued orphan commit/fs_object
+> items still run with `RequiresLibraryDeletedCheck=false`, so the worker does not revalidate
+> them against the canonical `libraries` table — reachable under projection drift or a
+> scanner→queue→worker state transition (repair, restoration, or recreation), tracked as
+> `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`.
+> Test residue is also affected by global GC test activity. There are additional real
+> reclamation gaps
 > (org-admin trash deletes defer cleanup up to the retention window; non-durable goroutine
 > handoff; stale policy index; `pub:` refs lack a discoverable zero-ref transition; Phase 13
 > logs delivery failures but does not propagate them to the phase result/metrics) — tracked
-> as `ISSUE-GC-*` in `docs/KNOWN_ISSUES.md`. P1–P5/P7 concern delayed or missing
-> reclamation; P6 is the exception and can affect live metadata/content.
+> as `ISSUE-GC-*` in `docs/KNOWN_ISSUES.md`. P1–P5/P7 and P6b concern delayed/missing
+> reclamation or a narrower projection/TOCTOU exposure; P6a was the broad exception and is fixed.
 
 ### Audit scope and evidence
 
@@ -265,10 +271,13 @@ This section consolidates independent code-path reviews and direct Cassandra/Min
 inspection. Every confirmed claim below points to reproducible code or storage evidence at
 the cited `file:line`. The originating investigation asked two questions — *is the GC safe?*
 and *is it optimal?* — and the corrected answer is: **the physical block-delete protocol is
-conservative, but the end-to-end scanner/worker pipeline is not certifiable as safe until
-the fail-open existence classification in P6 is fixed. Durability/discovery gaps remain.**
+conservative. The transient-error fail-open in existence reads (P6a) that could misclassify a
+live library is fixed (branch 1D). A narrower execution-time gap remains — already-enqueued
+orphan commit/fs_object items are not revalidated against the canonical `libraries` table (P6b,
+Medium defense-in-depth) — so classification is hardened but not yet fully certified.
+Durability/discovery gaps (P1–P5/P7) also remain.**
 
-### Verdict 1 — physical block deletion is conservative; end-to-end classification is not
+### Verdict 1 — physical block deletion is conservative; classification is hardened (P6a fixed), not yet fully certified (P6b)
 
 The protocol that deletes a physical block is conservative and crash-safe (no path in the
 reviewed sequence deletes a live block, though a code audit cannot prove a universal
@@ -289,8 +298,9 @@ cross the plain↔encrypted mapping domain). Provisional `up:` refs auto-expire 
 re-discovered by scanner Phase 0.
 
 > **Scope boundary:** this sequence is safe only when candidate/reference-release work was
-> classified correctly. P6 shows that upstream scanner classification can fail open and cause
-> legitimate refs to be removed before this protocol runs.
+> classified correctly. The transient-error fail-open (P6a) that could misclassify a live library
+> is fixed; a residual execution-time gap (P6b) is that already-enqueued orphan commit/fs_object
+> items are not revalidated against the canonical `libraries` table before the worker acts on them.
 
 ### Verdict 2 — test residue is dominated by non-isolated fixture/GC behavior
 
@@ -311,7 +321,7 @@ re-discovered by scanner Phase 0.
 - No global `TRUNCATE`/teardown of keyspace or MinIO; cleanup is only by ephemeral library name.
   Blocks uploaded under synthetic `org_id`/`library_id` with no `t.Cleanup` persist forever.
 
-### Verdict 3 — confirmed production gaps (P1–P7)
+### Verdict 3 — confirmed production gaps (P1–P8)
 
 | # | Verified finding | Sev | Evidence | Issue |
 |---|---|---|---|---|
@@ -321,8 +331,10 @@ re-discovered by scanner Phase 0.
 | P3 | `gc_libraries_by_policy` is not cleared on direct delete. Policy-setting endpoints, `rollbackNewLibrary`, and the cascade's `HardDeleteLibrary` all maintain their policy rows, but the shared direct hard-delete helper does not include the `AddDeleteLibraryPolicyQuery` deletes. Benign (scanner re-validates and skips) but accumulates. | Med | [library_delete_helpers.go:29-41](../internal/api/v2/library_delete_helpers.go#L29) vs [store_cassandra.go:3816](../internal/gc/store_cassandra.go#L3816) | `ISSUE-GC-POLICY-INDEX-STALE-01` |
 | P4 | `pub:` refs have no discoverable expiry projection (`up:` has one via `gc_provisional_block_refs` + Phase 0). When the last `pub:` expires by Cassandra TTL (35d), nothing runs the zero-ref → `EnsureBlockGCCandidate` transition; `scanOrphanedBlocks` only walks already-created candidates. Block + mapping + S3 can be retained. Confirmed by protocol analysis; no production incident demonstrated. | Med | [block_references.go:339](../internal/db/block_references.go#L339); [scanner.go:335](../internal/gc/scanner.go#L335) | `ISSUE-GC-PUB-REF-ZERO-REF-01` |
 | P5 | Phase 13 **logs** delivery failures but does not surface them: on `EnqueueBatch` failure it logs and returns `nil`; on per-library `PendingItemExists` failure it logs and `continue`s. The failure is invisible to the phase result, health, and dedicated metrics, so the overall scan cycle can appear successful. | Med | [scanner.go:1194-1197,1231-1242](../internal/gc/scanner.go#L1194) | `ISSUE-GC-PHASE13-ERROR-VISIBILITY-01` |
-| P6 | **Fail-open live-library classification.** `CassandraStore.LibraryExists` maps every read error to `(false,nil)`. Phases 3/4 can then enqueue commits/fs_objects for a live library with `RequiresLibraryDeletedCheck=false`; the worker bypasses its delete guard and may remove live metadata/refs. `GroupExists` has the same error swallowing and Phase 9 ignores its error, risking deletion of a valid group share. | **High** | [store_cassandra.go:2270-2278](../internal/gc/store_cassandra.go#L2270), [scanner.go:531-534](../internal/gc/scanner.go#L531), [scanner.go:607-609](../internal/gc/scanner.go#L607), [worker.go:1586-1589](../internal/gc/worker.go#L1586), [store_cassandra.go:3208-3216](../internal/gc/store_cassandra.go#L3208) | `ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01` |
+| P6a ✅ **FIXED (1D)** | **Fail-open live-library classification (transient errors).** `LibraryExists`/`GroupExists` mapped every read error to `(false,nil)`, so a transient Cassandra error could make Phases 3/4 enqueue a live library's commits/fs_objects and Phase 9 delete a valid group share. **Fixed 2026-07-10:** existence reads return `(false,nil)` only for `gocql.ErrNotFound` and propagate all other errors; Phases 3/4/9 fail closed and surface the error. Phase 9 scans `shares_by_group` directly, uses each projection row's `OrgID`, and has unit plus real-Cassandra regression coverage. | **High** | [store_cassandra.go:2270-2283](../internal/gc/store_cassandra.go#L2270), [scanner.go:531-546](../internal/gc/scanner.go#L531), [scanner.go:607-622](../internal/gc/scanner.go#L607), [scanner.go:1030-1072](../internal/gc/scanner.go#L1030), [store_cassandra.go:3182-3222](../internal/gc/store_cassandra.go#L3182) | `ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01` |
+| P6b 🟠 **pending** | **No execution-time canonical revalidation of orphan work.** Phases 3/4 enqueue orphan commit/fs_object items with `RequiresLibraryDeletedCheck=false`, so `acquireLibraryDeleteGuard` is a no-op and the worker deletes them without re-checking the canonical `libraries` row. A live library's content could be removed under projection drift or if state changes after scanner classification but before worker execution. Narrower than P6a, not introduced by 1D — a pre-existing missing defense. | Med (defense-in-depth) | [scanner.go:566-574](../internal/gc/scanner.go#L566), [worker.go:1586-1589](../internal/gc/worker.go#L1586) | `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01` |
 | P7 | **Orphan phases cannot discover markerless artifact libraries.** `ListDistinctCommitLibraries` / `ListDistinctFSObjectLibraries` do not enumerate commits/fs_objects; both return the union of `libraries_by_id` + `deleted_libraries`. Once both library rows are gone, surviving commits/fs_objects are invisible to Phases 3/4. This matches the snapshot's `libraries=0`, `deleted_libraries=0`, `commits=4`. | High/Med | [store_cassandra.go:2235-2268](../internal/gc/store_cassandra.go#L2235) | `ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01` |
+| P8 | **Phase 9 group-share discovery still performs a global table scan.** The immediate fix streams `shares_by_group` with context and 256-row driver pages, so process memory is bounded and cancellation works, but Cassandra still reads every partition each cycle. Replace it with a bucketed active-partition projection plus reconcile/backfill. | Med (performance/operability) | [store_cassandra.go:3182](../internal/gc/store_cassandra.go#L3182) | `ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01` |
 
 ### Precisions (they confirm, they refine)
 
@@ -366,7 +378,7 @@ swallows existence-check errors and the resulting destructive work is unguarded.
 |---|---|---|---|
 | E1 | `postponeItem` re-queues a lock-contended (`hard_delete_in_progress`) item with `RetryCount` **unchanged** — intentional (lock contention should not push toward the DLQ), but there is no postpone bound and no dedicated metric, so a permanently stuck hard-delete lock ⇒ infinite postpone with no DLQ/alert. | Low (liveness/obs) | [worker.go:345-358](../internal/gc/worker.go#L345) |
 | E2 | `dryRun` is accessed concurrently without synchronization, which is a Go data race. `atomic.Bool` fixes visibility/race-detector correctness, but does **not** provide hard cutover for work already past its dry-run check; that requires worker drain/serialization or destructive-step rechecks. | Low/Med | [gc.go:1141-1146](../internal/gc/gc.go#L1141), [worker.go:386-390](../internal/gc/worker.go#L386) |
-| E3 | **Escalated to P6.** Scanner code appears to skip on `LibraryExists` errors, but the Cassandra implementation never returns them: it maps every failure to "missing". This is fail-open, not merely invisible accumulation. | **High** | [store_cassandra.go:2270-2278](../internal/gc/store_cassandra.go#L2270) |
+| E3 | **Escalated to P6a → ✅ fixed (1D).** Scanner code appeared to skip on `LibraryExists` errors, but the Cassandra implementation never returned them: it mapped every failure to "missing" (fail-open, not merely invisible accumulation). Closed by the P6a fix; the residual execution-time revalidation gap is tracked separately as P6b. | **High** | [store_cassandra.go:2270-2283](../internal/gc/store_cassandra.go#L2270) |
 | E4 | `gc_pending_items` has no TTL, but normal queue completion, DLQ deletion, and DLQ expiry explicitly remove the pending row in logged batches. The unconfirmed risk is projection drift after historical/manual/ambiguous mutations; there is no independent reconcile/backstop. Do **not** add a blind TTL, which could expire valid dedup protection while queue/DLQ work remains live. | Low (audit/reconcile) | [store_cassandra.go:499-525](../internal/gc/store_cassandra.go#L499), [store_cassandra.go:555-583](../internal/gc/store_cassandra.go#L555), [001_initial_schema.cql:1199](../internal/db/migrations/001_initial_schema.cql#L1199) |
 | E5 | `RecoverS3Orphans` has no per-row LWT; mutual exclusion relies entirely on the leader lease. Real double-processing risk only under a lease split-brain (single-instance/dev: none). | Low (defense-in-depth) | [worker.go:599-772](../internal/gc/worker.go#L599) |
 
@@ -398,7 +410,9 @@ Subsequent branches, in recommended merge order:
 
 | Branch | Objective | Issue | Risk |
 |---|---|---|---|
-| 1D (**merge first**) | Fail closed on existence reads: propagate non-`ErrNotFound` from `LibraryExists`/`GroupExists`, stop ignoring errors, and add scanner/worker tests proving transient reads cannot enqueue/delete live content or shares. | `ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01` | **High** |
+| 1D ✅ **DONE (P6a)** | Fail closed on existence reads and make Phase 9 scan `shares_by_group` directly using each projection row's `OrgID`, including stable orphan discovery without the groups N+1. Scanner tests plus a real-Cassandra store regression prove the behavior. Merged first (2026-07-10, branch `fix/gc-existence-check-failopen`). | `ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01` | **High** |
+| 1E (P6b) | Execution-time canonical revalidation: before a worker acts on an orphan commit/fs_object item, re-check the canonical `libraries` row by `(org_id, library_id)` and fail closed on error / cancel on a live library, without breaking markerless P7 cleanup or letting a stale marker authorize deleting a recreated library. Add worker-level tests. Design the guard semantics (marker/`IdentityAt`) explicitly. | `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01` | Med |
+| 1F (P8) | Replace Phase 9's provisional global `shares_by_group` stream with a bucketed active-partition discovery projection. Register on share creation, remove when empty, paginate buckets/partitions, and provide reconcile/backfill for drift. | `ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01` | Med |
 | 1A | `pub:foreign` test hygiene: capture the referrer, `t.Cleanup` **all** rows/objects identified by the fixture's exact org/library/session/operation/block IDs (ref + block + mapping + S3 object **+ the provisional expiry projection** from the real upload session), or add a TTL; assert the fake ref is gone. Never broad cleanup. No prod change. | `ISSUE-GC-TEST-RESIDUE-01` | Minimal |
 | 1B | Inventory upload fixtures that leave `blocks`/MinIO objects and add fixture-scoped teardown; also repair the `library_projection_regression_test.go` failure-restore so it does not re-insert an unstamped `deleted_libraries`. Measure **no-net-growth** vs the pre-suite baseline. | `ISSUE-GC-TEST-RESIDUE-01` | Low |
 | 1C | Remove global-GC cross-test interference: replace direct `ProcessOnce(storage=nil)` with `ProcessOrgOnce`; inventory `/admin/gc/run` callers and isolate or baseline their effects. | `ISSUE-GC-TEST-RESIDUE-01` | Med |

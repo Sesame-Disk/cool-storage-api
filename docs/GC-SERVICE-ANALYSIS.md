@@ -6,10 +6,14 @@
 plan integration tests for long-running monitoring.
 
 > **See also (2026-07-10 delete-path audit):** the library-delete → cascade handoff has
-> verified follow-up debt P1–P7. The physical block-delete claim/recovery protocol is
-> conservative, but end-to-end safety is blocked by P6: Cassandra existence-read failures can
-> be interpreted as "missing" and enqueue destructive work for live libraries. P7 records that
-> markerless commit/fs_object partitions are invisible to current orphan discovery. Full audit:
+> verified follow-up debt P1–P8. The physical block-delete claim/recovery protocol is
+> conservative. P6a (Cassandra existence-read failures interpreted as "missing", enqueuing
+> destructive work for live libraries on a transient error) is now **fixed** (branch 1D):
+> existence reads fail closed and Phases 3/4/9 surface the error. A narrower projection/TOCTOU gap
+> remains (P6b, Medium, `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`): orphan items are not
+> revalidated against the canonical `libraries` table at execution time. P7 records that
+> markerless commit/fs_object partitions are still invisible to current orphan discovery.
+> Full audit:
 > [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md);
 > per-item issues: `ISSUE-GC-*` in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
@@ -168,8 +172,9 @@ These are deliberate safety mechanisms that are correctly implemented and tested
    worker crashes, a later worker can take over after the heartbeat becomes
    stale; active lock contention is postponed without consuming retry budget.
 6. **Scanner safety nets are partial** — phases recover discoverable candidates/markers and
-   run on startup + every 24h, but P6 must be fixed before orphan classification is safe and
-   P7 requires durable discovery for markerless artifacts.
+   run on startup + every 24h. P6a (transient-error fail-open) is now fixed, so a transient
+   existence read no longer misclassifies a live library; P6b (execution-time canonical
+   revalidation of orphan work) and P7 (durable markerless discovery) remain.
 7. **Retry with cap** — Failed items retry up to 5 times with HOL-blocking prevention, then
    move to `gc_failed_items`; explicit expiry later removes DLQ + pending projection together.
 8. **Audit logging** — Cascade deletes write to `audit_log`.
@@ -197,12 +202,13 @@ remaining tradeoff is intentionally conservative cursor advancement: if the
 canonical block row still exists (for example claimed but not yet finalized),
 recovery defers that row to a later pass instead of touching S3 early.
 
-### HIGH: Existence checks fail open before destructive orphan cleanup
+### RESOLVED (High): Existence checks failed open before destructive orphan cleanup
 
-`CassandraStore.LibraryExists` and `GroupExists` return "missing" for any Cassandra error,
-not only `ErrNotFound`. Phases 3/4 may enqueue live commits/fs_objects without
-`RequiresLibraryDeletedCheck`; Phase 9 may delete a valid group share. This is the end-to-end
-safety exception to the conservative physical block protocol. See
+`CassandraStore.LibraryExists` and `GroupExists` returned "missing" for any Cassandra error,
+not only `ErrNotFound`, so Phases 3/4 could enqueue live commits/fs_objects without
+`RequiresLibraryDeletedCheck` and Phase 9 could delete a valid group share. **Fixed 2026-07-10
+(branch 1D):** existence reads return `(false,nil)` only for `gocql.ErrNotFound` and propagate
+all other errors; Phases 3/4/9 fail closed and surface the error; regression tests added. See
 `ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01`.
 
 ### HIGH/MEDIUM: Markerless artifacts are not discoverable
@@ -324,14 +330,19 @@ worker must never touch unrelated org work.
 - Phase 13 can recover while `deleted_libraries` remains discoverable.
 - Phases 3/4 currently cannot discover artifact partitions after both library indexes disappear
   (P7).
-- Existence reads currently fail open on Cassandra errors (P6); fix P6 before treating orphan
-  scanners as a destructive safety net.
+- Existence reads now fail **closed** on Cassandra errors (P6a, fixed 1D): a transient read cannot
+  make the orphan scanners treat a live library/group as gone. Execution-time canonical
+  revalidation of already-enqueued orphan work (P6b) is still pending.
 
 ### Current safety statement
 
 The physical block claim/recheck/recovery sequence is conservative **given correct classification**.
-End-to-end safety is not certified until P6 is fixed. The remaining P1–P5/P7 issues primarily retain
-or delay garbage rather than deleting referenced blocks.
+The transient-error fail-open existence read (P6a) that was the broad end-to-end safety exception is
+now fixed (1D). A narrower projection/TOCTOU gap remains (P6b, Medium): orphan commit/fs_object items are
+not revalidated against the canonical `libraries` table at execution time
+(`ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`). P8 tracks Phase 9's provisional global Cassandra
+scan (streamed and cancellable, but not partition-bounded). The remaining P1–P5/P7 issues
+primarily retain or delay garbage rather than deleting referenced blocks.
 
 ---
 
@@ -340,8 +351,8 @@ or delay garbage rather than deleting referenced blocks.
 ### Coverage snapshot (historical counts; re-run before using as a release gate)
 
 > These counts were recorded in the original 2026-04 audit and are not a current inventory.
-> The 2026-07 audit adds mandatory P6 fault-injection, P7 markerless-discovery, and
-> fixture-isolation coverage that is not represented in the table.
+> The 2026-07 audit added P6 fault-injection coverage (done: `TestScanner_ScanOrphaned*_FailClosedOn*Error`)
+> and still calls for P7 markerless-discovery and fixture-isolation coverage not represented in the table.
 
 | Area | Tests | Type | Verdict |
 |------|-------|------|---------|
@@ -382,7 +393,7 @@ or delay garbage rather than deleting referenced blocks.
 | **Grace period boundary (±1ms)** | Low | **Partially done** | `TestGC_GracePeriodEnforcement` tests the concept with real timing but not the exact ±1ms boundary. |
 | **User cascade end-to-end** | Medium | **Pending** | No integration test creates a user, soft-deletes them, and verifies full cascade through GC. |
 | **Soak test validation** | Medium | **Code written, needs run** | `TestGC_Soak` is implemented but hasn't been executed against the live stack yet. |
-| **Existence read failure → no live deletion (P6)** | **High** | **Missing** | Fault-inject `LibraryExists`/`GroupExists`; prove no destructive work is enqueued/executed. |
+| **Existence read failure → no live deletion (P6)** | **High** | **Done** | `TestScanner_ScanOrphaned{Commits,FSObjects}_FailClosedOnLibraryExistsError` and `TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError` fault-inject `LibraryExists`/`GroupExists` and prove no live commit/fs_object is enqueued and no valid share is deleted. |
 | **Markerless artifact discovery (P7)** | High/Med | **Missing** | Remove both library indexes while retaining fixture commits/fs_objects; prove bounded discovery/reconcile. |
 | **No global cross-test GC** | Medium | **Broken** | Replace direct `ProcessOnce(storage=nil)` with `ProcessOrgOnce`; isolate admin GC triggers. |
 

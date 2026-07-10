@@ -1,6 +1,7 @@
 package gc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2273,7 +2274,14 @@ func (s *CassandraStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
 		SELECT library_id FROM libraries_by_id WHERE library_id = ?
 	`, libraryID.String()).Scan(&existingLibIDStr)
 	if err != nil {
-		return false, nil // Not found
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil // genuinely absent
+		}
+		// Fail closed: a transient read error must NOT be reported as "missing".
+		// Callers (scanner Phases 3/4/9, the worker delete guard) treat "missing"
+		// as license to enqueue/delete a library's content, so swallowing the error
+		// here could destroy a live library on a Cassandra blip.
+		return false, fmt.Errorf("check library existence for %s: %w", libraryID, err)
 	}
 	return true, nil
 }
@@ -3172,37 +3180,31 @@ func (s *CassandraStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo,
 	return results, nil
 }
 
-// ListAllGroupShares returns all group shares for the scanner.
-// This scans groups, then reads each group's partition from shares_by_group.
-func (s *CassandraStore) ListAllGroupShares() ([]GroupShareInfo, error) {
-	groupIter := s.db.Session().Query(`
-		SELECT org_id, group_id FROM groups
-	`).Iter()
-
-	var results []GroupShareInfo
-	var orgIDStr, groupIDStr string
-	for groupIter.Scan(&orgIDStr, &groupIDStr) {
-		shareIter := s.db.Session().Query(`
-			SELECT library_id, share_id FROM shares_by_group WHERE org_id = ? AND group_id = ?
-		`, orgIDStr, groupIDStr).Iter()
-		var libIDStr, shareIDStr string
-		for shareIter.Scan(&libIDStr, &shareIDStr) {
-			results = append(results, GroupShareInfo{
-				LibraryID:    parseUUID(libIDStr),
-				ShareID:      parseUUID(shareIDStr),
-				SharedTo:     parseUUID(groupIDStr),
-				SharedToType: "group",
-				OrgID:        parseUUID(orgIDStr),
-			})
-		}
-		if err := shareIter.Close(); err != nil {
-			return nil, fmt.Errorf("failed to list shares for group %s: %w", groupIDStr, err)
+// ScanAllGroupShares streams all group-share projection rows to the scanner.
+// Scan the projection directly: enumerating groups first cannot discover a
+// shares_by_group partition after its group row has already been deleted.
+func (s *CassandraStore) ScanAllGroupShares(ctx context.Context, visit func(GroupShareInfo) error) error {
+	iter := s.db.Session().Query(`
+		SELECT org_id, group_id, library_id, share_id FROM shares_by_group
+	`).WithContext(ctx).PageSize(256).Iter()
+	var orgIDStr, groupIDStr, libIDStr, shareIDStr string
+	for iter.Scan(&orgIDStr, &groupIDStr, &libIDStr, &shareIDStr) {
+		if err := visit(GroupShareInfo{
+			LibraryID:    parseUUID(libIDStr),
+			ShareID:      parseUUID(shareIDStr),
+			SharedTo:     parseUUID(groupIDStr),
+			SharedToType: "group",
+			OrgID:        parseUUID(orgIDStr),
+		}); err != nil {
+			// Preserve a concurrent Cassandra/iteration failure alongside the
+			// visitor error instead of discarding it.
+			return errors.Join(err, iter.Close())
 		}
 	}
-	if err := groupIter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to list group shares: %w", err)
+	if err := iter.Close(); err != nil {
+		return fmt.Errorf("failed to scan group shares: %w", err)
 	}
-	return results, nil
+	return nil
 }
 
 func (s *CassandraStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) {
@@ -3211,7 +3213,13 @@ func (s *CassandraStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) {
 		SELECT name FROM groups WHERE org_id = ? AND group_id = ?
 	`, orgID.String(), groupID.String()).Scan(&name)
 	if err != nil {
-		return false, nil
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil // genuinely absent
+		}
+		// Fail closed: Phase 9 deletes a group share when the group is reported
+		// absent, so a transient read error must surface as an error rather than
+		// masquerading as "group deleted" and dropping a valid share.
+		return false, fmt.Errorf("check group existence for %s/%s: %w", orgID, groupID, err)
 	}
 	return true, nil
 }

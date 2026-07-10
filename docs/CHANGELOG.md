@@ -8,6 +8,27 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-07-10 - GC existence checks fail closed; Phase 9 orphan discovery repaired
+
+- `LibraryExists`/`GroupExists` now distinguish `gocql.ErrNotFound` from Cassandra failures;
+  scanner Phases 3/4/9 skip destructive work and surface transient errors (P6a).
+- Phase 9 now streams `shares_by_group` in driver pages instead of enumerating `groups` and
+  issuing an N+1 query per group. This restores stable orphan discovery, bounds process memory,
+  and supports cancellation; scalable bucketed partition discovery remains follow-up work.
+  Process memory is now genuinely bounded: the existence cache is a single-entry `(org_id, group_id)`
+  "last partition" cache (O(1)) that opportunistically reuses the result (or error) for consecutive
+  rows of the same partition — not a map that grows with the number of distinct groups. Correctness
+  does not depend on scan ordering; a partition that reappears later just triggers another lookup.
+- Added fail-closed fallback and cross-org cache tests, a mid-stream cancellation test
+  (`ScanAllGroupShares` stops after the first visit once the context is cancelled), and a
+  real-Cassandra regression that inserts a `shares_by_group` row without a `groups` row and
+  proves it remains discoverable. The streaming store now preserves a concurrent `iter.Close`
+  error alongside a visitor abort via `errors.Join`.
+- P6b remains explicit follow-up debt: already-enqueued orphan commit/fs_object work lacks
+  canonical execution-time revalidation across projection drift or scanner→worker state changes.
+
+---
+
 ## 2026-07-02 - Fix nginx false-positive notification-server detection; clear up locked-files/jwt-token 404s
 
 ### Fixed

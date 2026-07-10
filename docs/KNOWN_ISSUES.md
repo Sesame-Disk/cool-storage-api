@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🔴 Safety fix required + follow-up debt | Physical block delete is conservative, but scanner existence checks can fail open for live libraries (P6). Reclamation/durability gaps P1–P5/P7 also remain. See the GC audit section below. |
+| Garbage Collection | 🟠 Safety hardening + follow-up debt | Physical block delete is conservative and transient existence errors now fail closed (P6a fixed). Execution-time orphan revalidation (P6b), reclamation/durability gaps P1–P5/P7, and Phase 9 scale debt P8 remain. See the GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -58,9 +58,9 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 ### 🔴 GC Library-Delete Cleanup Audit (2026-07-10)
 
 Follow-up debt from the PR #123 audit. The physical block-delete protocol is conservative
-(claim→recovery→delete ordering, fail-closed representation validation), but the end-to-end
-scanner pipeline has a High fail-open existence check (P6) that can enqueue destructive work
-for live libraries. P1–P5/P7 are reclamation/durability gaps. Full audit:
+(claim→recovery→delete ordering, fail-closed representation validation). The High fail-open
+existence check (P6) that could enqueue destructive work for live libraries is **fixed** (branch
+1D, 2026-07-10); P1–P5/P7 are reclamation/durability gaps and P8 is Phase 9 scale debt. Full audit:
 `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`. Close on small, auditable branches.
 
 | Issue | Status | Details |
@@ -71,8 +71,10 @@ for live libraries. P1–P5/P7 are reclamation/durability gaps. Full audit:
 | **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
 | **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
-| **Existence Checks Fail Open** | 🔴 Confirmed safety gap (High) | `LibraryExists`/`GroupExists` swallow Cassandra errors as "missing"; scanners can enqueue/delete live library metadata/refs or valid group shares. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
+| **Existence Checks Fail Open (transient errors, P6a)** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors and scanner Phases 3/4/9 fail closed. Phase 9 scans `shares_by_group` directly and uses each projection row's `OrgID`, with unit and real-Cassandra regression coverage. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
+| **Orphan Work Lacks Worker Canonical Revalidation (P6b)** | 🟠 Pending (Med) | Orphan commit/fs_object items run with `RequiresLibraryDeletedCheck=false`, so the worker does not re-check the canonical `libraries` row; reachable under projection drift or a post-enqueue repair/restoration/recreation before execution. Defense-in-depth, not introduced by 1D. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
 | **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (High/Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
+| **Phase 9 Group-Share Discovery Is a Global Scan** | 🟠 Pending (Med) | The immediate fix streams `shares_by_group` in bounded driver pages with cancellation, but Cassandra still scans every partition. Replace with bucketed active-partition discovery. See ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01 below. |
 | **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Former E3 is escalated to the High P6 issue. See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
 | **No Reconcile/Backfill for Existing Orphans** | 🟡 Follow-up | Existing clusters may hold blocks/S3 objects/stale policy rows orphaned by the gaps above. Needs a read-only-first reconcile pass, not blind truncation. See ISSUE-GC-RECONCILE-BACKFILL-01 below. |
 
@@ -2796,7 +2798,8 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 
 ### Garbage Collection — IMPLEMENTED, OPEN SAFETY + DURABILITY DEBT
 **Status**: Core engine implemented (2026-01-30), major overhaul (2026-03-17);
-2026-07-10 audit found P1–P7 follow-ups including the High fail-open P6 safety gap.
+2026-07-10 audit found P1–P8 follow-ups including the High fail-open P6a safety gap (fixed)
+and the Medium Phase 9 global-scan debt P8.
 **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
 **Tests**: 55 Go unit tests + 21 bash integration tests
 **Admin API**: `GET /api/v2.1/admin/gc/status`, `POST /api/v2.1/admin/gc/run`
@@ -3698,9 +3701,22 @@ Keep processing all markers, accumulate errors (`errors.Join`), return the joine
 
 ### ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01: Scanner Existence Reads Can Fail Open
 
-**Status**: 🔴 Confirmed safety gap (2026-07-10)
-**Severity**: High — a transient Cassandra read failure can lead to destructive work for a live library
+**Status**: ✅ Fixed (2026-07-10, branch `fix/gc-existence-check-failopen` / roadmap 1D)
+**Severity**: High — a transient Cassandra read failure could lead to destructive work for a live library
 **Affected**: `LibraryExists`, `GroupExists`, scanner Phases 3/4/9, commit/fs_object worker guard
+
+#### Resolution
+
+- `LibraryExists` and `GroupExists` now return `(false, nil)` **only** for `gocql.ErrNotFound` and propagate every other error ([store_cassandra.go:2270-2283](../internal/gc/store_cassandra.go#L2270), [store_cassandra.go:3208-3222](../internal/gc/store_cassandra.go#L3208)).
+- Phase 9 no longer discards the `GroupExists` error — on error it skips the share (never deletes it) and records a phase error ([scanner.go:1013-1032](../internal/gc/scanner.go#L1013)).
+- Phases 3/4 handle the `LibraryExists` error explicitly (skip + surface `phaseErr`) so a transient read cannot enqueue a live library's commits/fs_objects ([scanner.go:531-546](../internal/gc/scanner.go#L531), [scanner.go:607-622](../internal/gc/scanner.go#L607)).
+- Phase 9 reads `OrgID` from each `shares_by_group` projection row and only falls back to the library→org projection when it is absent — surfacing that fallback failure instead of silently skipping a share. `ScanAllGroupShares` streams the projection directly in 256-row driver pages, so deleted-group partitions remain discoverable without materializing the full result; the Cassandra-wide scan is tracked separately as P8. The existence cache is a single-entry `(org_id, group_id)` "last partition" cache (O(1) memory) that opportunistically reuses the result (or error) for consecutive rows of the same partition; correctness does not depend on scan ordering, since a partition reappearing later just triggers another lookup ([scanner.go:1013-1094](../internal/gc/scanner.go#L1013)).
+- The worker guard (`acquireLibraryDeleteGuard`) already propagated `LibraryExists` errors; with the store fix it is now genuinely fail-closed.
+- Regression tests inject a transient existence error and assert no live commit/fs_object is enqueued and no valid group share is deleted, plus that Phase 9 cleans via the share `OrgID` without the library lookup: `TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError`, `TestScanner_ScanOrphanedGroupShares_UsesShareOrgIDWithoutLibraryLookup`, `TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError`, `TestScanner_ScanOrphanedFSObjects_FailClosedOnLibraryExistsError` (`internal/gc/scanner_test.go`). MockStore gained `libraryExistsErr`/`groupExistsErr` injection hooks.
+
+**Scope:** this closes the **transient-error** fail-open (P6a). A narrower execution-time gap — orphan commit/fs_object items still run with `RequiresLibraryDeletedCheck=false`, so the worker does not revalidate them against the canonical `libraries` table after projection drift or a post-enqueue state transition — is tracked separately as **ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01** (P6b).
+
+The original analysis is retained below for provenance.
 
 #### Problem
 
@@ -3728,6 +3744,90 @@ failure can delete a still-valid group share
   execution time. Preserve the correct deletion identity when a marker exists.
 - Add fault-injection tests: existence read fails, subsequent reads succeed, and no live
   commit/fs_object/ref/share is deleted.
+
+---
+
+### ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01: Orphan Commit/FS Work Is Not Revalidated Against the Canonical Library
+
+**Status**: 🟠 Pending (2026-07-10) — Medium safety hardening / defense-in-depth
+**Severity**: Medium — High impact (can delete live metadata/refs) but reduced probability (projection drift or scanner→worker state transition)
+**Affected**: scanner Phases 3/4 orphan enqueue, `acquireLibraryDeleteGuard`, commit/fs_object worker paths
+
+#### Problem
+
+Phases 3/4 enqueue orphan commit/fs_object items with `RequiresLibraryDeletedCheck=false`
+([scanner.go:566-574](../internal/gc/scanner.go#L566)), so `acquireLibraryDeleteGuard` returns a
+no-op guard ([worker.go:1586-1589](../internal/gc/worker.go#L1586)) and the worker deletes the
+item without revalidating that the library is actually gone. Classification is based on
+`LibraryExists`, which reads the `libraries_by_id` **projection**, not the canonical `libraries`
+table. If `libraries_by_id` is absent while the canonical `libraries` row is still live
+(projection drift from a partial/manual delete, or the historical drift this audit already
+observed), a live library's commits/fs_objects — and their legitimate `fs:` refs — can be removed.
+
+This is **not** introduced by branch 1D (P6a). P6a closed the transient-error class (a Cassandra
+blip can no longer be read as "missing"); this is a pre-existing missing defense against
+persistent projection drift, and it is narrower than P6a (requires drift, not just a transient
+error).
+
+#### Fix Direction (branch 1E)
+
+Add an execution-time revalidation before the worker acts on an orphan commit/fs_object item.
+Design the semantics explicitly — do **not** just flip `RequiresLibraryDeletedCheck=true`:
+
+- Re-read the **canonical** `libraries` row by `(org_id, library_id)` (not `libraries_by_id`).
+- If it exists → cancel/postpone the destructive work (the library is live).
+- If the read fails → fail closed.
+- If it is absent → validate `IdentityAt`/marker where available, and still permit genuine
+  markerless cleanup under the semantics designed for P7 (do not let this block P7).
+- A stale marker must not authorize deleting a recreated library with a new identity.
+
+Add worker-level tests: orphan item + live canonical library → no deletion (commit and
+fs_object/refs); revalidation read error → no deletion; genuinely-absent markerless library →
+cleanup not blocked; pre-recreation marker → new library untouched.
+
+#### Related Docs
+
+- `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (P6b, Verdict 1, branch roadmap)
+- `ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01` (P6a, the transient-error half, fixed)
+- `ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01` (P7 markerless discovery — keep compatible)
+
+---
+
+### ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01: Phase 9 Uses a Global `shares_by_group` Scan
+
+**Status**: 🟠 Pending (2026-07-10) — provisional streaming mitigation merged with P6a
+**Severity**: Medium — Cassandra performance and operability at scale
+**Affected**: `ScanAllGroupShares`, scanner Phase 9
+
+#### Current bounded mitigation
+
+Phase 9 must discover `shares_by_group` partitions after their canonical group row is gone. The
+old groups-driven N+1 could not do that. The immediate implementation therefore scans the share
+projection directly, but processes it as a context-aware stream with a 256-row driver page size:
+rows are handled immediately, cancellation can interrupt the query, and a late-page error is
+surfaced by the phase. Process memory is bounded to the driver page plus a single-entry
+`(org_id, group_id)` existence cache (O(1)) that opportunistically reuses the result (or error)
+for consecutive rows of the same partition — the group-existence dedup does not grow with the
+number of distinct groups, and correctness does not depend on scan ordering.
+
+This does **not** make the Cassandra read scalable: without a partition key, every Phase 9 cycle
+still reads the global table. Treat the stream as a correctness-first bridge for controlled current
+volumes, not the final discovery architecture.
+
+#### Required future design (roadmap 1F)
+
+Add a bucketed active-partition projection such as `gc_group_share_partitions`, keyed by a fixed
+bucket and `(org_id, group_id)`. Register the partition when creating a group share; remove it when
+the partition becomes empty; scan buckets and share partitions with explicit cursors/page bounds;
+and provide reconcile/backfill for projection drift. Preserve direct orphan discovery after the
+`groups` row is deleted. Do not regress to groups-first enumeration or a global in-memory result.
+
+#### Verification still needed for 1F
+
+- Multi-page/bucket traversal and cursor resume.
+- Cancellation and partial-page failure without losing durable progress.
+- Reconcile of missing/stale partition-index rows.
+- Load test on a representative multi-node Cassandra cluster.
 
 ---
 
@@ -3811,8 +3911,8 @@ P6 issue above.
 - **E2 — `dryRun` data race vs cutover semantics.** `dryRun` is read/written concurrently
   without synchronization. `atomic.Bool` fixes the Go race and visibility, but does not stop work
   already past its check; hard cutover requires drain/serialization or destructive-step rechecks.
-- **E3 — escalated to P6.** `LibraryExists`/`GroupExists` swallow errors as "missing"; this is
-  not a low-severity visibility problem.
+- **E3 — escalated to P6a and fixed.** `LibraryExists`/`GroupExists` previously swallowed errors
+  as "missing"; non-`ErrNotFound` errors now propagate and scanners fail closed.
 - **E4 — pending projection drift risk, not a proven normal leak.** Queue completion, DLQ
   deletion, and DLQ expiry remove `gc_pending_items` in their logged batches
   ([store_cassandra.go:499-583](../internal/gc/store_cassandra.go#L499)). No independent reconcile
@@ -3871,4 +3971,4 @@ The GC engine has crash recovery for its own in-flight deletes (`gc_s3_orphans`)
 - [API-REFERENCE.md](API-REFERENCE.md) - API endpoint documentation
 - [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md) - Architectural issues
 - [CURRENT_WORK.md](../CURRENT_WORK.md) - Active priorities
-- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (corrected verdict, P1–P7, invariants, branch roadmap)
+- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (corrected verdict, P1–P8, invariants, branch roadmap)

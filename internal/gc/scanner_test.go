@@ -841,6 +841,279 @@ func TestScanner_ScanOrphanedGroupShares(t *testing.T) {
 	t.Fatalf("live group share was incorrectly removed")
 }
 
+// Regression for P6 (ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01): a transient error on
+// the group-existence read must NOT be read as "group deleted" — that would drop a
+// valid group share. Fail closed: skip the share and surface the error.
+func TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	groupID := uuid.New()
+	libID := uuid.New()
+	shareID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot")
+	store.AddGroupForOrg(orgID, groupID) // group genuinely EXISTS
+	store.AddGroupShare(libID, shareID, groupID)
+
+	sentinel := errors.New("cassandra unavailable")
+	store.groupExistsErr = sentinel
+
+	n, err := s.scanOrphanedGroupShares(context.Background())
+	if err == nil {
+		t.Fatal("expected scanOrphanedGroupShares to surface the group-existence error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected the surfaced error to wrap the sentinel, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 shares cleaned on existence error, got %d", n)
+	}
+
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", libID, shareID)]; !ok {
+		t.Fatal("valid group share was deleted despite a transient group-existence error (fail-open regression)")
+	}
+}
+
+// Phase 9 must use the authoritative org_id carried on the group-share record and
+// not depend on the library→org projection: an orphaned share whose group is gone
+// is cleaned even when the library (and thus FindOrgForLibrary) can no longer resolve.
+func TestScanner_ScanOrphanedGroupShares_UsesShareOrgIDWithoutLibraryLookup(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	missingGroupID := uuid.New() // group does NOT exist
+	libID := uuid.New()
+	shareID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot") // stamps gs.OrgID on the share
+	store.AddGroupShare(libID, shareID, missingGroupID)
+
+	// Break the library→org projection: FindOrgForLibrary can no longer resolve.
+	// The share still carries OrgID, so Phase 9 must still clean the orphan.
+	store.mu.Lock()
+	delete(store.libraries, libID)
+	store.mu.Unlock()
+
+	n, err := s.scanOrphanedGroupShares(context.Background())
+	if err != nil {
+		t.Fatalf("scanOrphanedGroupShares returned error: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 orphaned share cleaned via the share's own org_id, got %d", n)
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", libID, shareID)]; ok {
+		t.Fatal("orphaned group share was not cleaned even though the share carried its org_id")
+	}
+}
+
+func TestScanner_ScanOrphanedGroupShares_FailClosedWhenOrgCannotBeResolved(t *testing.T) {
+	store := NewMockStore()
+	s := NewScanner(store, NewQueue(store), &Stats{}, config.GCConfig{})
+
+	libID := uuid.New()
+	shareID := uuid.New()
+	store.AddGroupShare(libID, shareID, uuid.New()) // no library: legacy row has no OrgID
+	sentinel := errors.New("library org projection unavailable")
+	store.findOrgForLibraryErr = sentinel
+
+	n, err := s.scanOrphanedGroupShares(context.Background())
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected org-resolution error, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected no cleanup when org resolution fails, got %d", n)
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", libID, shareID)]; !ok {
+		t.Fatal("share was deleted despite unresolved org")
+	}
+}
+
+func TestScanner_ScanOrphanedGroupShares_CacheIsScopedByOrg(t *testing.T) {
+	store := NewMockStore()
+	s := NewScanner(store, NewQueue(store), &Stats{}, config.GCConfig{})
+
+	groupID := uuid.New()
+	liveOrgID, orphanOrgID := uuid.New(), uuid.New()
+	liveLibID, orphanLibID := uuid.New(), uuid.New()
+	liveShareID, orphanShareID := uuid.New(), uuid.New()
+	store.AddLibrary(liveOrgID, liveLibID, "hot")
+	store.AddLibrary(orphanOrgID, orphanLibID, "hot")
+	store.AddGroupForOrg(liveOrgID, groupID)
+	store.AddGroupShare(liveLibID, liveShareID, groupID)
+	store.AddGroupShare(orphanLibID, orphanShareID, groupID)
+
+	n, err := s.scanOrphanedGroupShares(context.Background())
+	if err != nil {
+		t.Fatalf("scanOrphanedGroupShares returned error: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected only the orphan-org share cleaned, got %d", n)
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", liveLibID, liveShareID)]; !ok {
+		t.Fatal("live-org share was deleted through a cross-org cache collision")
+	}
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", orphanLibID, orphanShareID)]; ok {
+		t.Fatal("orphan-org share was retained through a cross-org cache collision")
+	}
+}
+
+func TestScanner_ScanOrphanedGroupShares_StreamingHonorsCancellation(t *testing.T) {
+	store := NewMockStore()
+	store.AddGroupShare(uuid.New(), uuid.New(), uuid.New())
+	s := NewScanner(store, NewQueue(store), &Stats{}, config.GCConfig{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	n, err := s.scanOrphanedGroupShares(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation from streaming scan, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected no cleanup after cancellation, got %d", n)
+	}
+}
+
+// Cancellation that happens partway through the stream must stop further visits and
+// return context.Canceled, not just a pre-cancelled context.
+func TestMockStore_ScanAllGroupShares_StopsMidStreamOnCancel(t *testing.T) {
+	store := NewMockStore()
+	store.AddGroupShare(uuid.New(), uuid.New(), uuid.New())
+	store.AddGroupShare(uuid.New(), uuid.New(), uuid.New())
+	store.AddGroupShare(uuid.New(), uuid.New(), uuid.New())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	visited := 0
+	err := store.ScanAllGroupShares(ctx, func(gs GroupShareInfo) error {
+		visited++
+		cancel() // cancel during the first visit
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled after mid-stream cancel, got %v", err)
+	}
+	if visited != 1 {
+		t.Fatalf("expected the scan to stop after the first visit, got %d visits", visited)
+	}
+}
+
+// A GroupExists error is cached for the whole partition: a transient failure must not
+// be re-issued (and re-logged) once per share in a large same-group partition.
+func TestScanner_ScanOrphanedGroupShares_CachesErrorPerPartition(t *testing.T) {
+	store := NewMockStore()
+	s := NewScanner(store, NewQueue(store), &Stats{}, config.GCConfig{})
+
+	orgID := uuid.New()
+	groupID := uuid.New()
+	libID := uuid.New()
+	store.AddLibrary(orgID, libID, "hot")
+	shareIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	for _, sid := range shareIDs {
+		store.AddGroupShare(libID, sid, groupID) // same (org, group) partition
+	}
+	store.groupExistsErr = errors.New("cassandra unavailable")
+
+	n, err := s.scanOrphanedGroupShares(context.Background())
+	if err == nil {
+		t.Fatal("expected the group-existence error to be surfaced, got nil")
+	}
+	if n != 0 {
+		t.Fatalf("expected no shares cleaned on existence error, got %d", n)
+	}
+	if calls := store.groupExistsCalls.Load(); calls != 1 {
+		t.Fatalf("expected exactly 1 GroupExists call for the shared partition, got %d", calls)
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	for _, sid := range shareIDs {
+		if _, ok := store.shares[fmt.Sprintf("%s:%s", libID, sid)]; !ok {
+			t.Fatalf("share %s was deleted despite a group-existence error", sid)
+		}
+	}
+}
+
+// Regression for P6: a transient LibraryExists error in Phase 3 must NOT be treated
+// as "library gone" and enqueue a live library's commits for deletion.
+func TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot") // live library with resolvable org
+	store.AddCommit(libID, "commit-1", "fs-root-1")
+
+	sentinel := errors.New("cassandra unavailable")
+	store.libraryExistsErr = sentinel
+
+	n, err := s.scanOrphanedCommits(context.Background())
+	if err == nil {
+		t.Fatal("expected scanOrphanedCommits to surface the existence-check error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected the surfaced error to wrap the sentinel, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 commits enqueued on existence error, got %d", n)
+	}
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemCommit {
+			t.Fatal("live library commit was enqueued for deletion despite an existence-check error (fail-open regression)")
+		}
+	}
+}
+
+// Regression for P6: a transient LibraryExists error in Phase 4 must NOT be treated
+// as "library gone" and enqueue a live library's fs_objects for deletion.
+func TestScanner_ScanOrphanedFSObjects_FailClosedOnLibraryExistsError(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot")
+	store.AddFSObject(libID, "fs-1", "file", []string{"blk-1"})
+
+	sentinel := errors.New("cassandra unavailable")
+	store.libraryExistsErr = sentinel
+
+	n, err := s.scanOrphanedFSObjects(context.Background())
+	if err == nil {
+		t.Fatal("expected scanOrphanedFSObjects to surface the existence-check error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected the surfaced error to wrap the sentinel, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 fs_objects enqueued on existence error, got %d", n)
+	}
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemFSObject {
+			t.Fatal("live library fs_object was enqueued for deletion despite an existence-check error (fail-open regression)")
+		}
+	}
+}
+
 func TestScanner_ScanOrphanedCommits(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

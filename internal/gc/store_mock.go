@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -161,6 +162,10 @@ type MockStore struct {
 	acquireOrgHardDeleteLockHook   func(orgID uuid.UUID)
 	beginOrgPurgeHook              func(orgID uuid.UUID)
 	getBlockRefCountErr            error
+	libraryExistsErr               error
+	groupExistsErr                 error
+	groupExistsCalls               atomic.Int64
+	findOrgForLibraryErr           error
 	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
 
 	// optional test hooks for reproducing concurrency windows deterministically.
@@ -2270,6 +2275,9 @@ func (m *MockStore) ListDistinctFSObjectLibraries() ([]uuid.UUID, error) {
 func (m *MockStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.libraryExistsErr != nil {
+		return false, m.libraryExistsErr
+	}
 	_, ok := m.libraries[libraryID]
 	return ok, nil
 }
@@ -2277,6 +2285,9 @@ func (m *MockStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
 func (m *MockStore) FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.findOrgForLibraryErr != nil {
+		return uuid.Nil, m.findOrgForLibraryErr
+	}
 
 	lib, ok := m.libraries[libraryID]
 	if ok {
@@ -2729,15 +2740,14 @@ func (m *MockStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo, erro
 	}
 	return result, nil
 }
-func (m *MockStore) ListAllGroupShares() ([]GroupShareInfo, error) {
+func (m *MockStore) ScanAllGroupShares(ctx context.Context, visit func(GroupShareInfo) error) error {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []GroupShareInfo
+	rows := make([]GroupShareInfo, 0, len(m.shares))
 	for _, share := range m.shares {
 		if share.SharedToType != "group" {
 			continue
 		}
-		result = append(result, GroupShareInfo{
+		rows = append(rows, GroupShareInfo{
 			LibraryID:    share.LibraryID,
 			ShareID:      share.ShareID,
 			SharedTo:     share.SharedTo,
@@ -2745,11 +2755,24 @@ func (m *MockStore) ListAllGroupShares() ([]GroupShareInfo, error) {
 			OrgID:        share.OrgID,
 		})
 	}
-	return result, nil
+	m.mu.RUnlock()
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := visit(row); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (m *MockStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) {
+	m.groupExistsCalls.Add(1)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.groupExistsErr != nil {
+		return false, m.groupExistsErr
+	}
 	return m.groups[fmt.Sprintf("%s:%s", orgID, groupID)], nil
 }
 func (m *MockStore) WriteAuditLog(entry AuditLogEntry) error {
