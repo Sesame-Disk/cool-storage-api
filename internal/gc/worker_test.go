@@ -567,6 +567,96 @@ func TestWorker_ProcessCommit_DryRunDoesNotAcquireLibraryDeleteGuard(t *testing.
 	}
 }
 
+// P6b (ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01): a scanner orphan item
+// (RequiresLibraryDeletedCheck=true, no delete marker) must be re-validated against the
+// CANONICAL libraries table at execution time. If the library is live/recoverable there
+// (projection drift, or restore/recreate after enqueue), the worker must NOT delete its content.
+func TestWorker_ProcessCommit_OrphanSkipsWhenCanonicalLibraryLive(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddLibrary(orgID, libID, "hot") // canonical libraries row present (live/restored)
+	store.AddCommit(libID, "commit-1", "fs-root")
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true, ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libID,
+	}
+	if err := w.processCommit(item); err != nil {
+		t.Fatalf("processCommit: %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") == nil {
+		t.Fatal("orphan commit of a live (canonical) library must NOT be deleted (P6b)")
+	}
+}
+
+// When the canonical library is genuinely gone, the orphan is cleaned as before.
+func TestWorker_ProcessCommit_OrphanDeletesWhenCanonicalLibraryGone(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	// No AddLibrary → canonical libraries row absent.
+	store.AddCommit(libID, "commit-1", "fs-root")
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true, ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libID,
+		BlockRepresentationID: db.PlainBlockRepresentationID, // needed to enqueue the root fs_object child
+	}
+	if err := w.processCommit(item); err != nil {
+		t.Fatalf("processCommit: %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") != nil {
+		t.Fatal("orphan commit of a genuinely gone library should be deleted")
+	}
+}
+
+// A canonical existence read error must fail closed: do not delete.
+func TestWorker_ProcessCommit_OrphanFailsClosedOnCanonicalError(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddCommit(libID, "commit-1", "fs-root")
+	store.canonicalLibraryExistsErr = errors.New("cassandra unavailable")
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true, ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libID,
+	}
+	if err := w.processCommit(item); err == nil {
+		t.Fatal("expected a fail-closed error on canonical existence read failure")
+	}
+	if store.GetCommitRecord(libID, "commit-1") == nil {
+		t.Fatal("commit must NOT be deleted when the canonical existence check errors (fail closed)")
+	}
+}
+
+// The fs_object path is where legitimate fs: refs get released, so it is the core P6b
+// protection: an orphan fs_object of a live canonical library must not be deleted.
+func TestWorker_ProcessFSObject_OrphanSkipsWhenCanonicalLibraryLive(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddLibrary(orgID, libID, "hot") // canonical present
+	store.AddFSObject(libID, "fs-1", "file", []string{"blk-1"})
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true, ItemType: ItemFSObject, ItemID: "fs-1", LibraryID: libID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+	}
+	if err := w.processFSObject(context.Background(), item); err != nil {
+		t.Fatalf("processFSObject: %v", err)
+	}
+	if _, err := store.GetFSObject(libID, "fs-1"); err != nil {
+		t.Fatal("orphan fs_object of a live (canonical) library must NOT be deleted (P6b)")
+	}
+}
+
 func TestWorker_ProcessCommit_SkipsAlreadyPendingRootFSObject(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

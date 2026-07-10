@@ -145,6 +145,11 @@ type GCStore interface {
 	ListDistinctCommitLibraries() ([]uuid.UUID, error)
 	ListDistinctFSObjectLibraries() ([]uuid.UUID, error)
 	LibraryExists(libraryID uuid.UUID) (bool, error)
+	// CanonicalLibraryExists reports whether the authoritative `libraries` row exists
+	// for (orgID, libraryID). Unlike LibraryExists (which reads the libraries_by_id
+	// projection), this consults the canonical table so orphan cleanup cannot act on a
+	// library that is still live under projection drift. Fails closed on read errors.
+	CanonicalLibraryExists(orgID, libraryID uuid.UUID) (bool, error)
 	FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error)
 	ListCommitIDsForLibrary(libraryID uuid.UUID) ([]string, error)
 	ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]string, error)

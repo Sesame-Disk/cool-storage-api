@@ -1591,9 +1591,15 @@ func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), bool, error)
 	libraryMissing := false
 	isStale := func(deletedAt *time.Time) (bool, error) {
 		if deletedAt == nil {
-			exists, err := w.store.LibraryExists(item.LibraryID)
+			// No delete marker: confirm against the CANONICAL libraries table, not the
+			// libraries_by_id projection. This closes the P6b window where a live library
+			// whose projection drifted (or that was restored/recreated after the scanner
+			// enqueued its orphan content) could have its live metadata/refs deleted.
+			// A present canonical row (even soft-deleted) means "live/recoverable" → stale.
+			// Fails closed on read error.
+			exists, err := w.store.CanonicalLibraryExists(item.OrgID, item.LibraryID)
 			if err != nil {
-				return false, fmt.Errorf("failed to confirm library existence for child %s/%s: %w", item.LibraryID, item.ItemID, err)
+				return false, fmt.Errorf("failed to confirm canonical library existence for %s/%s: %w", item.LibraryID, item.ItemID, err)
 			}
 			libraryMissing = !exists
 			return exists, nil

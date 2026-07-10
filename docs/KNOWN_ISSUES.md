@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🟠 Safety hardening + follow-up debt | Physical block delete is conservative and transient existence errors now fail closed (P6a fixed). Execution-time orphan revalidation (P6b), reclamation/durability gaps P1–P5/P7, and Phase 9 scale debt P8 remain. See the GC audit section below. |
+| Garbage Collection | 🟠 Follow-up debt (live-data exposures fixed) | Physical block delete is conservative; both live-data classification exposures are fixed — transient existence errors fail closed (P6a) and orphan work is revalidated against the canonical `libraries` table (P6b). Reclamation/durability gaps P1–P5/P7 and Phase 9 scale debt P8 remain. See the GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -72,7 +72,7 @@ existence check (P6) that could enqueue destructive work for live libraries is *
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
 | **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
 | **Existence Checks Fail Open (transient errors, P6a)** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors and scanner Phases 3/4/9 fail closed. Phase 9 scans `shares_by_group` directly and uses each projection row's `OrgID`, with unit and real-Cassandra regression coverage. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
-| **Orphan Work Lacks Worker Canonical Revalidation (P6b)** | 🟠 Pending (Med) | Orphan commit/fs_object items run with `RequiresLibraryDeletedCheck=false`, so the worker does not re-check the canonical `libraries` row; reachable under projection drift or a post-enqueue repair/restoration/recreation before execution. Defense-in-depth, not introduced by 1D. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
+| **Orphan Work Lacks Worker Canonical Revalidation (P6b)** | ✅ Fixed (2026-07-10) | Phase 3/4 orphan items now carry `RequiresLibraryDeletedCheck=true` and the worker guard revalidates against the canonical `libraries` table (`CanonicalLibraryExists`, fail-closed) before deleting — live/restored/recreated → skip. Worker + real-Cassandra tests added. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
 | **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (High/Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
 | **Phase 9 Group-Share Discovery Is a Global Scan** | 🟠 Pending (Med) | The immediate fix streams `shares_by_group` in bounded driver pages with cancellation, but Cassandra still scans every partition. Replace with bucketed active-partition discovery. See ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01 below. |
 | **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Former E3 is escalated to the High P6 issue. See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
@@ -3714,7 +3714,7 @@ Keep processing all markers, accumulate errors (`errors.Join`), return the joine
 - The worker guard (`acquireLibraryDeleteGuard`) already propagated `LibraryExists` errors; with the store fix it is now genuinely fail-closed.
 - Regression tests inject a transient existence error and assert no live commit/fs_object is enqueued and no valid group share is deleted, plus that Phase 9 cleans via the share `OrgID` without the library lookup: `TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError`, `TestScanner_ScanOrphanedGroupShares_UsesShareOrgIDWithoutLibraryLookup`, `TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError`, `TestScanner_ScanOrphanedFSObjects_FailClosedOnLibraryExistsError` (`internal/gc/scanner_test.go`). MockStore gained `libraryExistsErr`/`groupExistsErr` injection hooks.
 
-**Scope:** this closes the **transient-error** fail-open (P6a). A narrower execution-time gap — orphan commit/fs_object items still run with `RequiresLibraryDeletedCheck=false`, so the worker does not revalidate them against the canonical `libraries` table after projection drift or a post-enqueue state transition — is tracked separately as **ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01** (P6b).
+**Scope:** this closes the **transient-error** fail-open (P6a). The narrower execution-time gap (P6b) — orphan commit/fs_object items revalidated against the canonical `libraries` table at worker time — is **also fixed** (branch 1E, **ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01**).
 
 The original analysis is retained below for provenance.
 
@@ -3749,9 +3749,19 @@ failure can delete a still-valid group share
 
 ### ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01: Orphan Commit/FS Work Is Not Revalidated Against the Canonical Library
 
-**Status**: 🟠 Pending (2026-07-10) — Medium safety hardening / defense-in-depth
-**Severity**: Medium — High impact (can delete live metadata/refs) but reduced probability (projection drift or scanner→worker state transition)
+**Status**: ✅ Fixed (2026-07-10, branch `fix/gc-orphan-worker-revalidation` / roadmap 1E)
+**Severity**: Medium — High impact (could delete live metadata/refs) but reduced probability (projection drift or scanner→worker state transition)
 **Affected**: scanner Phases 3/4 orphan enqueue, `acquireLibraryDeleteGuard`, commit/fs_object worker paths
+
+#### Resolution
+
+- Phase 3/4 now enqueue orphan commit/fs_object items with `RequiresLibraryDeletedCheck=true` ([scanner.go:576-590](../internal/gc/scanner.go#L576), [scanner.go:659-670](../internal/gc/scanner.go#L659)); the flag propagates to their cascade children automatically.
+- `acquireLibraryDeleteGuard` now revalidates the marker-absent case against the **canonical** `libraries` table via a new `CanonicalLibraryExists(orgID, libraryID)` ([worker.go:1592-1608](../internal/gc/worker.go#L1592), [store_cassandra.go:2285-2302](../internal/gc/store_cassandra.go#L2285)) instead of the `libraries_by_id` projection. Present (live/restored, even soft-deleted) → skip; absent → proceed (markerless P7 cleanup preserved); read error → fail closed (item requeued).
+- A recreated library gets a new UUID, so the old orphan item's `(org, library_id)` is canonically absent → only the old (deleted) library's content is removed. A restored (same-id) library is canonically present → skipped.
+- Marker-present orphans of a permanently-deleted library defer to the primary cascade / Phase 13 (same delayed-cleanup class as P1), rather than being cleaned by Phase 3/4; not a leak.
+- Tests: `TestWorker_ProcessCommit_OrphanSkipsWhenCanonicalLibraryLive`, `..._OrphanDeletesWhenCanonicalLibraryGone`, `..._OrphanFailsClosedOnCanonicalError`, `TestWorker_ProcessFSObject_OrphanSkipsWhenCanonicalLibraryLive`, and real-Cassandra `TestGC_CanonicalLibraryExistsReadsCanonicalTableNotProjection`.
+
+The original analysis is retained below for provenance.
 
 #### Problem
 

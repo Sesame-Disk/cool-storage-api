@@ -8,6 +8,26 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-07-10 - GC orphan work revalidated against the canonical libraries table (P6b)
+
+- Scanner Phases 3/4 now enqueue orphan commit/fs_object items with
+  `RequiresLibraryDeletedCheck=true` (the flag propagates to their cascade children), routing
+  them through the worker's `acquireLibraryDeleteGuard`.
+- The guard's marker-absent branch now revalidates against the **canonical** `libraries` table
+  via a new `CanonicalLibraryExists(orgID, libraryID)` (fail-closed on read error), instead of
+  the `libraries_by_id` projection. So a live library whose projection drifted — or that was
+  restored/recreated between the scanner enqueue and worker execution — is skipped, not deleted.
+  This closes P6b (`ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`); together with P6a (1D) both
+  live-data classification exposures in the GC are now fixed.
+- Behavior note: marker-present orphans of a permanently-deleted library now defer to the primary
+  cascade / Phase 13 (same delayed-cleanup class as P1) rather than being cleaned early by
+  Phases 3/4 — not a leak.
+- Tests: four worker-level cases (live→skip, gone→delete, canonical read error→fail-closed,
+  fs_object live→skip) plus a real-Cassandra test proving `CanonicalLibraryExists` reads the
+  `libraries` table when the `libraries_by_id` projection is absent (drift).
+
+---
+
 ## 2026-07-10 - GC existence checks fail closed; Phase 9 orphan discovery repaired
 
 - `LibraryExists`/`GroupExists` now distinguish `gocql.ErrNotFound` from Cassandra failures;

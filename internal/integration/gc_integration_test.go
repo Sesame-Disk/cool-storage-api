@@ -68,6 +68,57 @@ func TestGC_ScanAllGroupSharesDiscoversPartitionWithoutGroupRow(t *testing.T) {
 	}
 }
 
+// P6b (ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01): CanonicalLibraryExists must read the
+// authoritative `libraries` table, not the `libraries_by_id` projection. This proves it
+// detects a live library whose projection has drifted away — the exact case where the old
+// projection-only check would have let the worker delete a live library's content.
+func TestGC_CanonicalLibraryExistsReadsCanonicalTableNotProjection(t *testing.T) {
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	orgID, libraryID := uuid.New(), uuid.New()
+
+	// Canonical libraries row present, but NO libraries_by_id projection row (drift).
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, name) VALUES (?, ?, ?)
+	`, orgID.String(), libraryID.String(), "p6b-canonical-test").Exec(); err != nil {
+		t.Fatalf("seed canonical libraries row: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`,
+			orgID.String(), libraryID.String()).Exec(); err != nil {
+			t.Errorf("cleanup canonical libraries row: %v", err)
+		}
+	})
+
+	store := gcpkg.NewCassandraStore(database)
+
+	canonical, err := store.CanonicalLibraryExists(orgID, libraryID)
+	if err != nil {
+		t.Fatalf("CanonicalLibraryExists: %v", err)
+	}
+	if !canonical {
+		t.Fatal("CanonicalLibraryExists should report the library present from the libraries table")
+	}
+
+	// Precondition: the projection genuinely lacks the row, so a projection-only check
+	// (LibraryExists) would wrongly classify this live library as gone.
+	projection, err := store.LibraryExists(libraryID)
+	if err != nil {
+		t.Fatalf("LibraryExists: %v", err)
+	}
+	if projection {
+		t.Fatal("expected the libraries_by_id projection to be absent for this drift scenario")
+	}
+
+	absent, err := store.CanonicalLibraryExists(orgID, uuid.New())
+	if err != nil {
+		t.Fatalf("CanonicalLibraryExists(absent): %v", err)
+	}
+	if absent {
+		t.Fatal("CanonicalLibraryExists should be false for a non-existent library")
+	}
+}
+
 // requireGCEnabled skips the test if the GC admin endpoint is not reachable
 // or GC is disabled.
 func requireGCEnabled(t *testing.T) {

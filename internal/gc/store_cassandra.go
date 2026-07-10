@@ -2286,6 +2286,24 @@ func (s *CassandraStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
 	return true, nil
 }
 
+// CanonicalLibraryExists reads the authoritative `libraries` table by (org_id,
+// library_id). A present row (even soft-deleted) means the library is live or
+// recoverable, so its content must not be orphan-deleted. Fails closed on read
+// errors so a Cassandra blip never masquerades as "library gone".
+func (s *CassandraStore) CanonicalLibraryExists(orgID, libraryID uuid.UUID) (bool, error) {
+	var existingLibIDStr string
+	err := s.db.Session().Query(`
+		SELECT library_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID.String(), libraryID.String()).Scan(&existingLibIDStr)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil // genuinely absent
+		}
+		return false, fmt.Errorf("check canonical library existence for %s/%s: %w", orgID, libraryID, err)
+	}
+	return true, nil
+}
+
 func (s *CassandraStore) FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error) {
 	var orgIDStr string
 	err := s.db.Session().Query(`

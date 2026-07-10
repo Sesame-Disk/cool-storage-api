@@ -163,6 +163,7 @@ type MockStore struct {
 	beginOrgPurgeHook              func(orgID uuid.UUID)
 	getBlockRefCountErr            error
 	libraryExistsErr               error
+	canonicalLibraryExistsErr      error
 	groupExistsErr                 error
 	groupExistsCalls               atomic.Int64
 	findOrgForLibraryErr           error
@@ -2280,6 +2281,16 @@ func (m *MockStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
 	}
 	_, ok := m.libraries[libraryID]
 	return ok, nil
+}
+
+func (m *MockStore) CanonicalLibraryExists(orgID, libraryID uuid.UUID) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.canonicalLibraryExistsErr != nil {
+		return false, m.canonicalLibraryExistsErr
+	}
+	lib, ok := m.libraries[libraryID]
+	return ok && lib.OrgID == orgID, nil
 }
 
 func (m *MockStore) FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error) {
