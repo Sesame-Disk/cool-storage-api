@@ -144,12 +144,3 @@ func (h *AdminHandler) processAdminTrashCandidates(candidates []trashLibraryCand
 	return cleaned, failed
 }
 
-func (h *AdminHandler) completeAdminCleanTrashLibraries(c *gin.Context, cleanedBase int, candidates []trashLibraryCandidate, libEnqueuer LibraryGCEnqueuer) {
-	cleaned, failed := h.processAdminTrashCandidates(candidates, libEnqueuer)
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"partial": failed > 0,
-		"cleaned": cleanedBase + cleaned,
-		"skipped": failed,
-	})
-}

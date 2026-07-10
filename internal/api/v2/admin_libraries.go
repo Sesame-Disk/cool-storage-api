@@ -1228,8 +1228,14 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 
 	libEnqueuer := getLibraryEnqueuer()
 	cleaned := 0
-	var candidates []trashLibraryCandidate
+	failed := 0
 
+	// Process each org's trash independently: collect that org's soft-deleted
+	// libraries and hard-delete them before moving on. Accumulating every org's
+	// candidates first would hold the whole platform's trash in memory and defer
+	// all deletion until the global enumeration finished — a late failure would
+	// then drop work already collected. Per-org keeps memory bounded to one org
+	// and makes progress incrementally; only the counters are global.
 	for _, orgID := range orgIDs {
 		_, cleanedStale, err := dbpkg.ReconcileDeletedAdminLibraryRowsByOrg(h.db.Session(), orgID)
 		if err != nil {
@@ -1241,9 +1247,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			cleaned += cleanedStale
 		}
 
-		// Collect all soft-deleted libraries for this org in one pass, accumulating
-		// into the shared candidates slice declared above so every org's trashed
-		// libraries reach completeAdminCleanTrashLibraries below.
+		var candidates []trashLibraryCandidate
 		iter := h.db.Session().Query(`
 			SELECT library_id, storage_class, deleted_at FROM libraries WHERE org_id = ?
 		`, orgID).Iter()
@@ -1259,7 +1263,16 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			}
 		}
 		iter.Close()
+
+		processedCleaned, processedFailed := h.processAdminTrashCandidates(candidates, libEnqueuer)
+		cleaned += processedCleaned
+		failed += processedFailed
 	}
 
-	h.completeAdminCleanTrashLibraries(c, cleaned, candidates, libEnqueuer)
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"partial": failed > 0,
+		"cleaned": cleaned,
+		"skipped": failed,
+	})
 }

@@ -425,17 +425,16 @@ func TestAdminCleanTrashLibraries_PrunesStaleProjectionRows(t *testing.T) {
 }
 
 // TestAdminCleanTrashLibraries_HardDeletesRealTrashedLibrary exercises the
-// candidate-collection path of the superadmin bulk trash cleaner: a genuinely
-// soft-deleted library whose canonical `libraries` row is still present (NOT a
-// stale projection). The clean endpoint must hard-delete that base row.
+// candidate-collection-and-delete path of the superadmin bulk trash cleaner: a
+// genuinely soft-deleted library whose canonical `libraries` row is still present
+// (NOT a stale projection). The clean endpoint must hard-delete that base row.
 //
-// This guards the exact regression where the per-org candidate accumulator was
-// shadowed inside the org loop, so the collected candidates never reached the
-// processor: the endpoint returned 200 OK while every real trashed library was
-// left stranded in trash forever — reintroducing the "stuck in trash" bug this
-// branch set out to fix. The pre-existing PrunesStaleProjectionRows test removes
-// the base rows first, so it only covers the stale-prune counter and never runs
-// the candidate loop; this test deliberately keeps the base row intact.
+// The pre-existing PrunesStaleProjectionRows test removes the base rows first, so
+// it only covers the stale-prune counter and never runs the candidate collection
+// or the hard-delete of a real trashed library. This test deliberately keeps the
+// base row intact so a regression that dropped collected candidates on the floor
+// (e.g. accumulating them into the wrong slice, or deferring/aborting deletion)
+// is caught instead of silently returning 200 OK while the library stays in trash.
 func TestAdminCleanTrashLibraries_HardDeletesRealTrashedLibrary(t *testing.T) {
 	name := fmt.Sprintf("inttest-admin-trash-real-%d", time.Now().UnixNano())
 	repoID := createDisposableTestLibrary(t, adminClient, name)

@@ -2393,11 +2393,23 @@ func (m *MockStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error) {
 	for _, lib := range m.libraries {
 		if lib.VersionTTLDays > 0 {
 			stored := strings.TrimSpace(lib.BlockRepresentationID)
+			resolved, repErr := db.CanonicalBlockRepresentationIDForLibrary(lib.LibraryID.String(), lib.Encrypted, stored)
+			if repErr != nil {
+				results = append(results, LibraryTTLInfo{
+					OrgID:                 lib.OrgID,
+					LibraryID:             lib.LibraryID,
+					HeadCommitID:          lib.HeadCommitID,
+					BlockRepresentationID: stored,
+					RepresentationInvalid: true,
+					VersionTTLDays:        lib.VersionTTLDays,
+				})
+				continue
+			}
 			results = append(results, LibraryTTLInfo{
 				OrgID:                   lib.OrgID,
 				LibraryID:               lib.LibraryID,
 				HeadCommitID:            lib.HeadCommitID,
-				BlockRepresentationID:   db.EffectiveBlockRepresentationID(lib.LibraryID.String(), lib.Encrypted, stored),
+				BlockRepresentationID:   resolved,
 				RepresentationDefaulted: stored == "",
 				VersionTTLDays:          lib.VersionTTLDays,
 			})
@@ -2414,11 +2426,23 @@ func (m *MockStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo, erro
 	for _, lib := range m.libraries {
 		if lib.AutoDeleteDays > 0 {
 			stored := strings.TrimSpace(lib.BlockRepresentationID)
+			resolved, repErr := db.CanonicalBlockRepresentationIDForLibrary(lib.LibraryID.String(), lib.Encrypted, stored)
+			if repErr != nil {
+				results = append(results, LibraryAutoDeleteInfo{
+					OrgID:                 lib.OrgID,
+					LibraryID:             lib.LibraryID,
+					HeadCommitID:          lib.HeadCommitID,
+					BlockRepresentationID: stored,
+					RepresentationInvalid: true,
+					AutoDeleteDays:        lib.AutoDeleteDays,
+				})
+				continue
+			}
 			results = append(results, LibraryAutoDeleteInfo{
 				OrgID:                   lib.OrgID,
 				LibraryID:               lib.LibraryID,
 				HeadCommitID:            lib.HeadCommitID,
-				BlockRepresentationID:   db.EffectiveBlockRepresentationID(lib.LibraryID.String(), lib.Encrypted, stored),
+				BlockRepresentationID:   resolved,
 				RepresentationDefaulted: stored == "",
 				AutoDeleteDays:          lib.AutoDeleteDays,
 			})

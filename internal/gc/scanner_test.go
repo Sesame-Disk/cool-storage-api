@@ -1482,6 +1482,77 @@ func TestScanner_ScanExpiredVersions_SkipsLibraryWithNonCanonicalRepresentation(
 	}
 }
 
+// TestScanner_ScanExpiredVersions_SkipsCrossDomainRepresentation pins that a
+// syntactically canonical but domain-crossed stored representation — an encrypted
+// library stamped plain:v1 — is skipped as drift, not enqueued under the wrong
+// SHA-1 mapping domain. validateQueueItemBlockRepresentation alone cannot catch
+// this (it never sees the encrypted flag); the list method now flags it via
+// RepresentationInvalid so the scanner fails closed like the delete paths.
+func TestScanner_ScanExpiredVersions_SkipsCrossDomainRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithTTL(orgID, libID, "hot", "commit-head", 1)
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = db.PlainBlockRepresentationID
+	store.mu.Unlock()
+	store.SetLibraryEncrypted(libID, true)
+	store.AddCommitWithDetails(libID, "commit-head", "fs-1", "", time.Now())
+	store.AddCommitWithDetails(libID, "commit-expired", "fs-2", "", time.Now().Add(-48*time.Hour))
+
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid"))
+
+	n, err := s.scanExpiredVersions(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("scanExpiredVersions = (%d, %v), want (0, nil)", n, err)
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("expected no queued work for cross-domain representation, got %#v", items)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid")); afterDrift != beforeDrift+1 {
+		t.Fatalf("invalid drift metric = %v, want %v", afterDrift, beforeDrift+1)
+	}
+}
+
+func TestScanner_ScanAutoDeleteExpiredObjects_SkipsCrossDomainRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
+	// Plaintext library (encrypted stays false) stamped with an encrypted
+	// per-library representation: canonical for the UUID but the wrong domain.
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = db.EncryptedLibraryBlockRepresentationID(libID.String())
+	store.mu.Unlock()
+	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
+	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
+	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
+
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid"))
+
+	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (0, nil)", n, err)
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("expected no queued work for cross-domain representation, got %#v", items)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid")); afterDrift != beforeDrift+1 {
+		t.Fatalf("invalid drift metric = %v, want %v", afterDrift, beforeDrift+1)
+	}
+}
+
 func TestScanner_ScanExpiredVersions_PreservesHEADChain(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

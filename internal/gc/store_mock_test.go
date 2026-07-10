@@ -127,6 +127,25 @@ func TestMockStore_SoftDeleteLibrary_RejectsCrossDomainRepresentation(t *testing
 	}
 }
 
+// TestMockStore_SoftDeleteLibrary_MissingLibraryIsIdempotent pins the contract
+// that CassandraStore.SoftDeleteLibrary now matches: a library that is absent
+// (already deleted, or the row vanished between a cascade's listing and this
+// call) is a no-op success, not an error. A GC user/org cascade aggregates
+// SoftDeleteLibrary errors and aborts, so returning an error here would fail the
+// whole cascade and push it to the DLQ over already-completed work.
+func TestMockStore_SoftDeleteLibrary_MissingLibraryIsIdempotent(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	libID := uuid.New()
+
+	if err := store.SoftDeleteLibrary(orgID, libID, uuid.Nil); err != nil {
+		t.Fatalf("SoftDeleteLibrary on missing library = %v, want nil", err)
+	}
+	if _, ok := store.deletedLibraries[libID]; ok {
+		t.Fatal("no deleted_libraries marker should be written for a missing library")
+	}
+}
+
 // TestMockStore_EnqueueItemRejectsRepresentationRequiredTypes verifies the raw
 // single-row EnqueueItem path — which cannot carry a block representation — fails
 // closed for the item types that require one, so a caller cannot bypass the

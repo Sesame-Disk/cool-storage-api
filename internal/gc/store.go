@@ -424,7 +424,15 @@ type LibraryTTLInfo struct {
 	// signals a writer/migration that did not stamp it, so scanners report it as
 	// drift rather than hiding it.
 	RepresentationDefaulted bool
-	VersionTTLDays          int
+	// RepresentationInvalid is true when the stored block_representation_id is
+	// non-empty but does NOT match the library's own identity+encrypted flag
+	// (e.g. an encrypted library stamped plain:v1, or a plaintext library stamped
+	// library:<same-id>). Such a value is syntactically canonical yet points GC at
+	// the wrong SHA-1 mapping domain, so the scanner must skip the library and
+	// report drift instead of enqueuing work under it. BlockRepresentationID then
+	// carries the raw stored value only so the drift metric can classify it.
+	RepresentationInvalid bool
+	VersionTTLDays        int
 }
 
 // CommitWithTimestamp holds commit data needed for version TTL enforcement.
@@ -443,7 +451,9 @@ type LibraryAutoDeleteInfo struct {
 	BlockRepresentationID string
 	// RepresentationDefaulted mirrors LibraryTTLInfo.RepresentationDefaulted.
 	RepresentationDefaulted bool
-	AutoDeleteDays          int
+	// RepresentationInvalid mirrors LibraryTTLInfo.RepresentationInvalid.
+	RepresentationInvalid bool
+	AutoDeleteDays        int
 }
 
 // ExpiredShareInfo holds data about an expired user-to-user share.

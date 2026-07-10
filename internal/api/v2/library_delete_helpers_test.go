@@ -241,20 +241,15 @@ func TestAdminCleanTrashLibraries_SkipsRepresentationFailuresWithoutSideEffects(
 	}
 	libEnq := &mockLibraryGCEnqueuer{}
 	h := &AdminHandler{db: &db.DB{}}
-	c, w := newDeleteTestContext(http.MethodDelete, "/api/v2.1/admin/trash-libraries/")
 
-	h.completeAdminCleanTrashLibraries(c, 0, []trashLibraryCandidate{{
+	cleaned, failed := h.processAdminTrashCandidates([]trashLibraryCandidate{{
 		OrgID:        "org-1",
 		LibraryID:    "repo-bad",
 		StorageClass: "hot",
 	}}, libEnq)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
-	}
-	payload := decodeDeleteTestJSON(t, w)
-	if payload["cleaned"] != float64(0) || payload["skipped"] != float64(1) || payload["partial"] != true {
-		t.Fatalf("unexpected bulk payload: %#v", payload)
+	if cleaned != 0 || failed != 1 {
+		t.Fatalf("processAdminTrashCandidates() = (cleaned=%d, failed=%d), want (0, 1)", cleaned, failed)
 	}
 	if hardDeleteCalled != 0 || cleanupTagsCalled != 0 || len(libEnq.calls) != 0 {
 		t.Fatalf("side effects ran for skipped library: hardDelete=%d cleanupTags=%d enqueues=%#v",
@@ -278,20 +273,15 @@ func TestAdminCleanTrashLibraries_BatchFailureDoesNotRunPostCommitSideEffects(t 
 	}
 	libEnq := &mockLibraryGCEnqueuer{}
 	h := &AdminHandler{db: &db.DB{}}
-	c, w := newDeleteTestContext(http.MethodDelete, "/api/v2.1/admin/trash-libraries/")
 
-	h.completeAdminCleanTrashLibraries(c, 0, []trashLibraryCandidate{{
+	cleaned, failed := h.processAdminTrashCandidates([]trashLibraryCandidate{{
 		OrgID:        "org-1",
 		LibraryID:    "repo-batch-fail",
 		StorageClass: "hot",
 	}}, libEnq)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
-	}
-	payload := decodeDeleteTestJSON(t, w)
-	if payload["cleaned"] != float64(0) || payload["skipped"] != float64(1) || payload["partial"] != true {
-		t.Fatalf("unexpected bulk payload: %#v", payload)
+	if cleaned != 0 || failed != 1 {
+		t.Fatalf("processAdminTrashCandidates() = (cleaned=%d, failed=%d), want (0, 1)", cleaned, failed)
 	}
 	if cleanupTagsCalled != 0 || len(libEnq.calls) != 0 {
 		t.Fatalf("post-commit side effects ran after failed hard delete: cleanupTags=%d enqueues=%#v",
@@ -320,19 +310,14 @@ func TestAdminCleanTrashLibraries_PartialSuccessLeavesBadLibraryUntouched(t *tes
 	}
 	libEnq := &mockLibraryGCEnqueuer{}
 	h := &AdminHandler{db: &db.DB{}}
-	c, w := newDeleteTestContext(http.MethodDelete, "/api/v2.1/admin/trash-libraries/")
 
-	h.completeAdminCleanTrashLibraries(c, 0, []trashLibraryCandidate{
+	cleaned, failed := h.processAdminTrashCandidates([]trashLibraryCandidate{
 		{OrgID: "org-1", LibraryID: "repo-good", StorageClass: "hot"},
 		{OrgID: "org-1", LibraryID: "repo-bad", StorageClass: "hot"},
 	}, libEnq)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
-	}
-	payload := decodeDeleteTestJSON(t, w)
-	if payload["cleaned"] != float64(1) || payload["skipped"] != float64(1) || payload["partial"] != true {
-		t.Fatalf("unexpected bulk payload: %#v", payload)
+	if cleaned != 1 || failed != 1 {
+		t.Fatalf("processAdminTrashCandidates() = (cleaned=%d, failed=%d), want (1, 1)", cleaned, failed)
 	}
 	if strings.Join(hardDeleteCalls, ",") != "repo-good" {
 		t.Fatalf("hard-delete calls = %#v, want only repo-good", hardDeleteCalls)

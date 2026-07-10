@@ -2470,6 +2470,7 @@ func (s *CassandraStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo,
 			HeadCommitID:            row.HeadCommitID,
 			BlockRepresentationID:   row.BlockRepresentationID,
 			RepresentationDefaulted: row.RepresentationDefaulted,
+			RepresentationInvalid:   row.RepresentationInvalid,
 			AutoDeleteDays:          row.VersionTTLDays,
 		})
 	}
@@ -2512,11 +2513,29 @@ func (s *CassandraStore) listLibrariesByPolicy(policyType string) ([]LibraryTTLI
 				continue
 			}
 
+			// Validate the stored representation against the library's own
+			// identity+encrypted flag (not just canonical shape) so a cross-domain
+			// value — e.g. an encrypted library stamped plain:v1 — is surfaced as
+			// drift and skipped by the scanner rather than enqueued under the wrong
+			// SHA-1 mapping domain. Mirrors the delete/GetLibraryBlockRepresentationID
+			// paths so every live resolver fails closed on the same rule.
+			resolvedRepresentationID, repErr := db.CanonicalBlockRepresentationIDForLibrary(libraryIDStr, encrypted, storedRepresentationID)
+			if repErr != nil {
+				results = append(results, LibraryTTLInfo{
+					OrgID:                 parseUUID(orgIDStr),
+					LibraryID:             parseUUID(libraryIDStr),
+					HeadCommitID:          headCommitID,
+					BlockRepresentationID: strings.TrimSpace(storedRepresentationID),
+					RepresentationInvalid: true,
+					VersionTTLDays:        days,
+				})
+				continue
+			}
 			results = append(results, LibraryTTLInfo{
 				OrgID:                   parseUUID(orgIDStr),
 				LibraryID:               parseUUID(libraryIDStr),
 				HeadCommitID:            headCommitID,
-				BlockRepresentationID:   db.EffectiveBlockRepresentationID(libraryIDStr, encrypted, storedRepresentationID),
+				BlockRepresentationID:   resolvedRepresentationID,
 				RepresentationDefaulted: strings.TrimSpace(storedRepresentationID) == "",
 				VersionTTLDays:          days,
 			})
@@ -3350,13 +3369,20 @@ func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID
 		encrypted              bool
 		storedRepresentationID string
 	)
+	// A missing canonical libraries row means there is nothing left to soft-delete.
+	// Return nil (idempotent success) rather than an error: SoftDeleteLibrary runs
+	// inside user/org GC cascades that enumerate libraries and then delete each one,
+	// so a row that vanished between listing and here is already-done work, not a
+	// failure. Surfacing ErrNotFound would fail the whole cascade and eventually
+	// push it to the DLQ. This also matches MockStore, which no-ops on a missing
+	// library. A genuine read error (non-NotFound) still propagates.
 	if errors.Is(err, gocql.ErrNotFound) {
 		if baseErr := s.db.Session().Query(
 			`SELECT owner_id, storage_class, encrypted, block_representation_id FROM libraries WHERE org_id = ? AND library_id = ?`,
 			orgID.String(), libraryID.String(),
 		).Scan(&ownerID, &storageClass, &encrypted, &storedRepresentationID); baseErr != nil {
 			if errors.Is(baseErr, gocql.ErrNotFound) {
-				return baseErr
+				return nil
 			}
 			return baseErr
 		}
@@ -3365,7 +3391,7 @@ func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID
 		orgID.String(), libraryID.String(),
 	).Scan(&encrypted, &storedRepresentationID); baseErr != nil {
 		if errors.Is(baseErr, gocql.ErrNotFound) {
-			return baseErr
+			return nil
 		}
 		return baseErr
 	}
