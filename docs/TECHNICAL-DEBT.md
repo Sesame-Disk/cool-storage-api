@@ -542,7 +542,7 @@ whole queue. Target design:
 
 **1. Stream blocks to storage as chunks arrive**
 
-Current chunked uploads still land in a temp file first and only become blocks during finalization in [internal/api/seafhttp.go](internal/api/seafhttp.go). That means large uploads still pay a real finalization phase at the end, even though it is shorter than before.
+Current chunked uploads still land in a temp file first and only become blocks during finalization in [internal/api/seafhttp.go](../internal/api/seafhttp.go). That means large uploads still pay a real finalization phase at the end, even though it is shorter than before.
 
 Pending improvement:
 - Convert each arriving 8 MB chunk directly into a stored block.
@@ -557,7 +557,7 @@ Main risks to design for:
 
 **2. Migrate the web frontend to the block API flow**
 
-The browser still uploads through `seafhttp` + ResumableJS. The repo already has block-oriented APIs in [internal/api/v2/blocks.go](internal/api/v2/blocks.go), but the web client does not use them yet.
+The browser still uploads through `seafhttp` + ResumableJS. The repo already has block-oriented APIs in [internal/api/v2/blocks.go](../internal/api/v2/blocks.go), but the web client does not use them yet.
 
 Pending improvement:
 - Hash blocks client-side.
@@ -599,15 +599,15 @@ Future fix options:
 stream past the limit.
 
 Current production callers:
-- `SeafHTTPHandler.HandleUpload` in [internal/api/seafhttp.go](internal/api/seafhttp.go)
-- `FileHandler.UploadFile` in [internal/api/v2/files.go](internal/api/v2/files.go)
+- `SeafHTTPHandler.HandleUpload` in [internal/api/seafhttp.go](../internal/api/seafhttp.go)
+- `FileHandler.UploadFile` in [internal/api/v2/files.go](../internal/api/v2/files.go)
 
-Test-only callers live in [internal/httputil/read_limit_test.go](internal/httputil/read_limit_test.go).
+Test-only callers live in [internal/httputil/read_limit_test.go](../internal/httputil/read_limit_test.go).
 Chunked web uploads already avoid whole-file reads on the request path.
 
 Still pending outside this branch's upload-finalization scope:
-- audit direct sync-protocol request-body reads and decompressed zlib reads in [internal/api/sync.go](internal/api/sync.go) and give each endpoint an explicit protocol-sized cap or streaming parser
-- cap diagnostic/body reads from external OIDC HTTP responses in [internal/auth/oidc.go](internal/auth/oidc.go)
+- audit direct sync-protocol request-body reads and decompressed zlib reads in [internal/api/sync.go](../internal/api/sync.go) and give each endpoint an explicit protocol-sized cap or streaming parser
+- cap diagnostic/body reads from external OIDC HTTP responses in [internal/auth/oidc.go](../internal/auth/oidc.go)
 - audit storage/buffer/streaming `ReadAll` helpers that are safe only when the caller already controls object size
 - keep tests/HTTP response reads as test-only exceptions unless they become production helpers
   run: |
@@ -1143,9 +1143,9 @@ The visible-delta storage pre-check landed for upload paths in 2026-05-14 and cl
 #### Hot spots
 
 **1. Chunked uploads still pay the full visible-delta traversal on first check and finalize**
-([internal/api/seafhttp.go:1069](internal/api/seafhttp.go#L1069))
+([internal/api/seafhttp.go:1069](../internal/api/seafhttp.go#L1069))
 
-`HandleUpload` now caches a successful chunked storage pre-check on the in-memory upload tracker (`HasQuotaPrecheck` / `MarkQuotaPrecheck`), so later chunk requests with the same `(parentDir, totalSize, replace)` tuple no longer re-run `checkUploadStorageQuotaForCurrentHead` on every request. Finalization still calls `checkUploadStorageQuotaForCurrentHead` again inside `finalizeUploadStreaming` ([internal/api/seafhttp.go:1403](internal/api/seafhttp.go#L1403)) so publish is revalidated against the current HEAD.
+`HandleUpload` now caches a successful chunked storage pre-check on the in-memory upload tracker (`HasQuotaPrecheck` / `MarkQuotaPrecheck`), so later chunk requests with the same `(parentDir, totalSize, replace)` tuple no longer re-run `checkUploadStorageQuotaForCurrentHead` on every request. Finalization still calls `checkUploadStorageQuotaForCurrentHead` again inside `finalizeUploadStreaming` ([internal/api/seafhttp.go:1403](../internal/api/seafhttp.go#L1403)) so publish is revalidated against the current HEAD.
 
 That means the hot path cost is no longer O(N chunks); the remaining cost is the full visible-delta traversal on the first accepted chunk plus the authoritative re-check at finalize. This is still worth optimizing for large/deep directory trees, but it is no longer the per-chunk storm described in earlier audits.
 
@@ -1155,7 +1155,7 @@ Possible mitigations (in order of preference):
 - If we later need tighter client/server resumable reconciliation, expand the tracker cache to retain the resolved target-state hash rather than only the boolean fact that a pre-check succeeded.
 
 **2. `directoryEntriesAtPath` does one Cassandra query per path segment**
-([internal/api/seafhttp.go:1327](internal/api/seafhttp.go#L1327))
+([internal/api/seafhttp.go:1327](../internal/api/seafhttp.go#L1327))
 
 The traversal does `SELECT dir_entries FROM fs_objects` once per directory level. A target path of `/a/b/c/d/file.txt` is 5 queries (root + 4 nested dirs). Even with the per-tracker pre-check cache, the first chunk and finalize still re-walk the same path, so deep/nested uploads keep paying that traversal cost twice.
 
@@ -1164,7 +1164,7 @@ Possible mitigations:
 - Add a path-resolution cache scoped to one upload session.
 
 **3. Repeated `traffic.GetChecker()` calls inside one handler**
-([internal/api/seafhttp.go:991](internal/api/seafhttp.go#L991) + [seafhttp.go:1282](internal/api/seafhttp.go#L1282) inside the helper, [internal/api/sync.go:874](internal/api/sync.go#L874) + [sync.go:927](internal/api/sync.go#L927))
+([internal/api/seafhttp.go:991](../internal/api/seafhttp.go#L991) + [seafhttp.go:1282](../internal/api/seafhttp.go#L1282) inside the helper, [internal/api/sync.go:874](../internal/api/sync.go#L874) + [sync.go:927](../internal/api/sync.go#L927))
 
 `GetChecker()` returns the process-wide singleton, so this is cheap. It is mostly a cosmetic concern: handlers that already resolved a non-nil checker for the traffic pre-check call `GetChecker()` again for the post-dedup or visible-delta storage pre-check. Trivial inline cleanup; bundle with the work above when it happens.
 
@@ -1634,11 +1634,17 @@ Missing: unit tests with mocked `FSHelper` that exercise `updateDirectoryAtPathF
 
 Path to add: introduce an `fsTreeStore` interface that `FSHelper` satisfies, and unit-test with an in-memory implementation.
 
-### 19.h. Cross-Repo Move Leaks Source Block References Until GC
+### 19.h. RESOLVED: Cross-Repo Move Mutable-Refcount Lag
+
+> Historical note: this section described the retired mutable `blocks.ref_count` model.
+> The 2026-05-27 row-per-reference redesign removed these increment/decrement symbols and
+> gives each destination/source fs_object an idempotent keyed `fs:` reference.
 
 In `internal/api/v2/batch_operations.go:626`, `pinCopiedTreeBlockRefs` increments source block refs for the destination's future reference. The source-removal step (`internal/api/v2/batch_operations.go:702-758`) commits the source-side tree update but does **not** explicitly decrement source's reference to those blocks.
 
-Net effect: every cross-repo move leaves `+1` per moved block on `blocks.ref_count`. The leak is reclaimed when GC eventually walks the source's older commit chain and decrements the references encoded there. Functionally correct (eventually consistent), but the counter is briefly inflated. Affects:
+Historical net effect: every cross-repo move left `+1` per moved block on
+`blocks.ref_count` until GC walked the old source chain. This no longer describes live code.
+Affects in the retired model:
 - Storage GC threshold timing (a block at `ref_count=2` instead of `ref_count=1` may keep an extra block alive past its lifecycle).
 - Counter-based observability (any tool that reads `blocks.ref_count` to estimate storage will be wrong during the lag).
 
@@ -1648,10 +1654,13 @@ Same-repo move via `processSameRepoMove` does not have this problem (no pin/unpi
 
 Multiple sites schedule cleanup as `go ...` with only `log.Printf` on failure:
 - tag cleanup after move/delete/replace (`CleanupFileTagsByPath`, `CleanupFileTagsByPrefix`, `MoveFileTagsByPath`, `MoveFileTagsByPrefix`);
-- block ref cleanup after replace/delete (`DecrementBlockRefCountsOnce` followed by `enqueueZeroRefBlocks` or GC enqueue);
+- block-ref cleanup after replace/delete (now keyed `block_references` removal followed by
+  `enqueueZeroRefBlocks`/candidate creation);
 - storage-counter cleanup after async delete paths.
 
-A transient DB failure on any of these is logged and forgotten. No retry, no metric, no surface for ops to know cleanup is lagging. Idempotency (via `DecrementBlockRefCountsOnce`'s LWT, and `INSERT IF NOT EXISTS` patterns) means re-running is safe, but there is no mechanism that triggers a re-run on transient failure.
+A transient DB failure on these best-effort goroutines can still be logged and forgotten. Keyed
+reference deletion is idempotent, but callers still need durable retry/reconciliation rather than
+relying on process-local goroutines.
 
 Update 2026-05-19: the OnlyOffice save path is now partially hardened. `saveEditedDocument` persists `onlyoffice_pending_blocks` before the S3 PUT, stores the candidate `publish_commit_id` before the library-head CAS, and reconciles stale pending rows conservatively by checking reachability from the current head. Reconciliation now runs both inline on later saves and from the GC scanner, so quiet libraries no longer depend on another OnlyOffice save to revisit stale rows. That narrows the crash window for OnlyOffice materialized blocks, but the broader debt still applies to the other async cleanup goroutines listed above.
 
@@ -1766,7 +1775,12 @@ default compose `test` profile using `SESAMEFS_URL`, `SESAMEFS_URL_2`, and
 `SESAMEFS_URL_3`, before any launch claim depends on strict active-active quota
 enforcement.
 
-### 19.p. Ambiguous `blocks` LWT Outcomes Still Lack Durable Idempotence
+### 19.p. RESOLVED: Ambiguous Mutable-Refcount LWT Idempotence
+
+> Historical rationale only. The row-per-reference redesign removed
+> `IncrementBlockRefCounts*` / `DecrementBlockRefCountsOnce`; a retried add/delete now targets
+> the same `(block_id, referrer)` key. The remaining publish crash windows are tracked through
+> `pub:`/`up:` expiry and pending-publish issues, not mutable refcount inflation.
 
 The upload/sync hotfix intentionally changed `resolveIncrementBlockMutationError`
 and `resolveInsertBlockMutationError` to return
@@ -1815,7 +1829,8 @@ mutation, a pending-upload/block-promotion table that can reconcile ambiguous
 outcomes, or a later refcount repair pass derived from published commit
 reachability.
 
-This should stay framed against the two viable design directions:
+**Resolved design decision (2026-05-27): Option C was implemented.** The alternatives below are
+retained only as historical rationale:
 
 - **Option B: mutable refcount with CAS/LWT**. Read the current `ref_count`,
   compute the new value, and `UPDATE ... IF ref_count = <value_read>`. This is
@@ -1890,9 +1905,8 @@ The two paths that relied on partition-scanning by org were rewritten:
   horizon instead of a fixed 14-day recovery window.
 
 The old `ListBlocksForOrg` partition scan that served as a backfill safety net
-is gone; the new contract is that `DecrementBlockRefCountsOnce` →
-`enqueueZeroRefBlocks` → `gcBlockEnqueuer.EnqueueBlocks` →
-`EnsureBlockGCCandidate` is the only path a block ever takes into GC.
+is gone; the live contract is keyed `fs:` removal → `BlockHasReferences` →
+`enqueueZeroRefBlocks` → `EnsureBlockGCCandidate`.
 `gc_zero_ref_enqueue_failures_total` remains the alertable hard-failure signal
 that this contract was violated, while
 `gc_block_candidate_discovery_degraded_total{source=...}` captures the softer
@@ -1928,9 +1942,11 @@ longer exist (`Scanner.scanOrphanedFSObjects` skips any library where
 `LibraryExists` is true), so a failed publish inside an ACTIVE library leaks an
 fs_object metadata row.
 
-Impact: the data-loss risk is resolved; what remains is a bounded metadata leak —
-the row is content-addressed (re-adopted by a later identical publish) and the
-backing blocks are still reclaimed once their `pub:` refs hit the 35d TTL.
+Impact: the shared-row data-loss race is resolved, but this is not necessarily a bounded
+physical leak. The fs_object row is content-addressed and may be re-adopted by a later identical
+publish. When the last `pub:` ref expires at 35d, Cassandra removes the ref silently; because
+`pub:` has no expiry discovery projection, nothing necessarily performs zero-ref → candidate.
+See `ISSUE-GC-PUB-REF-ZERO-REF-01`.
 Pending fix option: a GC pass that sweeps fs_objects unreachable from any commit
 in a live library after a grace period, re-verifying reachability AND
 owner-absence at delete time to stay race-safe.
@@ -1942,9 +1958,9 @@ to avoid `batch too large` on multi-GB uploads), then writes `block_ids` in a
 separate `UPDATE`. If the process dies between the two, the owner is already
 discoverable by the sweep but carries no `block_ids`; the sweep's artifact
 cleanup (`CleanupFailedPublishArtifacts`) only removes `pub:` refs when it has
-block IDs, so those refs leak until their 35d TTL expires. This is an operational
-leak only — not a visibility or correctness problem — and self-heals via TTL. The
-same future GC pass over abandoned owners could reconcile these earlier.
+block IDs, so those refs survive until their 35d TTL expires. The ref row self-expires, but
+physical block reclamation does **not** self-heal unless another path creates a GC candidate.
+The publish-expiry projection in audit branch 7 must own that transition.
 
 ---
 
@@ -2065,27 +2081,34 @@ on that metric to bound leaked forward mappings.
 
 ## 31. GC Library-Delete Cleanup Audit Follow-ups (2026-07-10)
 
-A cross-agent audit after PR #123 (`fix/gc-block-representation-durability`) found **no
-live-block-deletion flaw** in the block-delete protocol, but the **library-delete → cascade
-handoff is not fully durable or optimal**. Full audit and code citations:
+A cross-agent audit after PR #123 (`fix/gc-block-representation-durability`) found the
+**physical block-delete protocol conservative**, but identified a High end-to-end fail-open
+existence check (P6) plus durability/discovery debt. GC is not safety-certified until P6 is
+fixed and fault-injection tested. Full audit and code citations:
 `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`. Per-item
 issues: `ISSUE-GC-*` in `docs/KNOWN_ISSUES.md`. This extends the earlier §10 (Library Deletion:
 Cleanup Paths) — those paths are functionally correct but leave the durability/optimality debt below.
 
-**No live-block-deletion flaw identified (conservative protocol):** the physical block delete
+**Conservative physical protocol, unsafe upstream classification:** physical block delete
 uses claim-then-verify LWT, registers `gc_s3_orphans` recovery before deleting the canonical
 row, orders DB→S3→mapping, guards against resurrection, and validates the block representation
-fail-closed. A code audit cannot prove a universal "never", but no path in the reviewed
-sequence deletes a live block. The confirmed risk profile is "fails to reclaim garbage" /
-"reclaims late", not "deletes live data".
+fail-closed. However, `LibraryExists`/`GroupExists` swallow Cassandra errors as "missing";
+scanners can enqueue destructive work for live metadata without the delete guard
+(`ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01`). Physical fences cannot restore a legitimate
+reference after the GC itself removed it.
 
-**Engine-level robustness debt (E1–E5, low-severity, `ISSUE-GC-ENGINE-ROBUSTNESS-01`).** A
+**Engine-level robustness debt (E1/E2/E4/E5, low-severity,
+`ISSUE-GC-ENGINE-ROBUSTNESS-01`).** A
 worker/scanner review found: `postponeItem` re-queues lock-contended items without a bound or
-metric; `dryRun` is written under `s.mu` but read racily in the worker; `scanOrphaned*` silence
-`LibraryExists` errors and treat them as "exists"; `gc_pending_items` has no TTL; S3-orphan
-recovery relies on the leader lease with no per-row LWT. All are fragility/observability, not
-data loss. Three louder-sounding claims (mid-cascade DLQ loop, missing `pending_s3` resurrection
+metric; `dryRun` has a Go race distinct from hard-cutover semantics; pending rows lack an
+independent drift reconcile (a blind TTL is unsafe); S3-orphan recovery relies on the leader
+lease with no per-row LWT. Former E3 is escalated to P6. Three louder-sounding claims
+(mid-cascade DLQ loop, missing `pending_s3` resurrection
 guard, child/parent enqueue race) were reviewed and found NOT to be bugs — see the audit doc.
+
+**Markerless artifact discovery (P7).** Phase 3/4 discovery only walks
+`libraries_by_id` + `deleted_libraries`, not surviving commit/fs_object partitions. When both
+indexes are gone, artifacts are invisible (`ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`).
 
 ### Deferred / by-design debt
 
@@ -2119,7 +2142,8 @@ guard, child/parent enqueue race) were reviewed and found NOT to be bugs — see
 3. Zero-ref means `EnsureBlockGCCandidate`, not a direct delete.
 4. The worker keeps the LWT claim + final re-validation before any S3 delete.
 5. Never truncate `block_references`/mappings to clean a cluster.
-6. Tests never run a global GC over the shared keyspace; they only clean fixtures they created.
+6. Tests must not run global GC over the shared keyspace; current global trigger/direct-worker
+   violations are tracked in `ISSUE-GC-TEST-RESIDUE-01` and must become fixture/org scoped.
 7. PR #123 representation recovery (Phase 13) is kept always.
 
 ---
