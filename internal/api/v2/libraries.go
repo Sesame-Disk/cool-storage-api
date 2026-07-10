@@ -598,7 +598,7 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		userEmail = h.resolveOwnerEmail(orgID, userID)
 	}
 	ownerName := strings.Split(userEmail, "@")[0]
-	blockRepresentationID := db.EffectiveBlockRepresentationID(newLibID.String(), library.Encrypted, "")
+	blockRepresentationID := db.NewLibraryBlockRepresentationID(newLibID.String(), library.Encrypted)
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)

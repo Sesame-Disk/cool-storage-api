@@ -39,11 +39,10 @@ func EncryptedLibraryBlockRepresentationID(libraryID string) string {
 	return "library:" + libraryID
 }
 
-func EffectiveBlockRepresentationID(libraryID string, encrypted bool, stored string) string {
-	stored = strings.TrimSpace(stored)
-	if stored != "" {
-		return stored
-	}
+// NewLibraryBlockRepresentationID returns the representation stamped when a
+// library is first created. Persisted rows must instead be resolved through
+// CanonicalBlockRepresentationIDForLibrary so drift cannot bypass validation.
+func NewLibraryBlockRepresentationID(libraryID string, encrypted bool) string {
 	if encrypted {
 		return EncryptedLibraryBlockRepresentationID(libraryID)
 	}
@@ -97,7 +96,7 @@ func ResolveBlockRepresentationID(session *gocql.Session, orgID, libraryID strin
 	if err != nil {
 		return "", err
 	}
-	return state.BlockRepresentationIDOrDefault(), nil
+	return CanonicalBlockRepresentationIDForLibrary(state.LibraryID, state.Encrypted, state.BlockRepresentationID)
 }
 
 func ResolveBlockRepresentationIDByLibraryID(session *gocql.Session, libraryID string) (string, error) {
@@ -105,7 +104,7 @@ func ResolveBlockRepresentationIDByLibraryID(session *gocql.Session, libraryID s
 	if err != nil {
 		return "", err
 	}
-	return state.BlockRepresentationIDOrDefault(), nil
+	return CanonicalBlockRepresentationIDForLibrary(state.LibraryID, state.Encrypted, state.BlockRepresentationID)
 }
 
 // ResolveBlockRepresentationIDForDelete resolves the effective block

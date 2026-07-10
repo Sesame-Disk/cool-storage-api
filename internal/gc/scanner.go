@@ -680,7 +680,7 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 
 		if lib.RepresentationInvalid {
 			countLibraryRepresentationDrift(lib.BlockRepresentationID)
-			log.Printf("[GC Scanner] Phase 5: skipping library %s: stored block_representation_id %q is cross-domain for the library's encrypted flag", lib.LibraryID, lib.BlockRepresentationID)
+			log.Printf("[GC Scanner] Phase 5: skipping library %s: stored block_representation_id %q is invalid for the library identity/encryption state", lib.LibraryID, lib.BlockRepresentationID)
 			continue
 		}
 		if err := validateQueueItemBlockRepresentation(QueueItem{
@@ -789,7 +789,7 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 
 		if lib.RepresentationInvalid {
 			countLibraryRepresentationDrift(lib.BlockRepresentationID)
-			log.Printf("[GC Scanner] Phase 6: skipping library %s: stored block_representation_id %q is cross-domain for the library's encrypted flag", lib.LibraryID, lib.BlockRepresentationID)
+			log.Printf("[GC Scanner] Phase 6: skipping library %s: stored block_representation_id %q is invalid for the library identity/encryption state", lib.LibraryID, lib.BlockRepresentationID)
 			continue
 		}
 		if err := validateQueueItemBlockRepresentation(QueueItem{

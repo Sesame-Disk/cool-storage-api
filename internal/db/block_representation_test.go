@@ -37,6 +37,17 @@ func TestIsCanonicalBlockRepresentationID(t *testing.T) {
 	}
 }
 
+func TestNewLibraryBlockRepresentationID(t *testing.T) {
+	libraryID := uuid.NewString()
+	if got := NewLibraryBlockRepresentationID(libraryID, false); got != PlainBlockRepresentationID {
+		t.Fatalf("plaintext representation = %q, want %q", got, PlainBlockRepresentationID)
+	}
+	wantEncrypted := EncryptedLibraryBlockRepresentationID(libraryID)
+	if got := NewLibraryBlockRepresentationID(libraryID, true); got != wantEncrypted {
+		t.Fatalf("encrypted representation = %q, want %q", got, wantEncrypted)
+	}
+}
+
 func TestIsCanonicalBlockRepresentationForLibrary(t *testing.T) {
 	libID := uuid.New()
 	otherLibID := uuid.New()

@@ -125,19 +125,22 @@ wrappers, so it holds even for a direct store caller.
 from `deleted_libraries.block_representation_id` before the hard-delete), so a
 cascade that runs after the live `libraries` row is gone still cleans the correct
 domain. `GetLibraryBlockRepresentationID` now resolves from the live `libraries`
-row first and falls back to `deleted_libraries`; an absent/empty stored value
-fails closed with `ErrNotFound` so the resolver never guesses.
+row first and falls back to `deleted_libraries`. A live row can derive a safe
+default from `(library_id, encrypted)`; a deleted row has no encryption state, so
+an absent/empty persisted representation fails closed with `ErrNotFound` rather
+than guessing.
 
 The scanner phases that read the *live* `libraries` row (version-TTL and
 auto-delete, phases 5/6) resolve the representation through
-`EffectiveBlockRepresentationID`, so an **empty** stored value is not skipped: it
-is derived safely from the library's own identity — `plain:v1` for a plaintext
-library, `library:<id>` for an encrypted one. Both derivations are deterministic
-functions of `(library_id, encrypted)`, so this is a safe default, not a guess.
+`CanonicalBlockRepresentationIDForLibrary`, so an **empty** stored value is not
+skipped: it is derived safely from the library's own identity — `plain:v1` for a
+plaintext library, `library:<id>` for an encrypted one. Both derivations are
+deterministic functions of `(library_id, encrypted)`, so this is a safe default,
+not a guess. A stored value must match that derived domain exactly.
 An empty stored value still signals that a writer or migration did not stamp the
 column, so the scanner processes the library **and** reports it as drift
-(`gc_library_representation_defaulted`) instead of hiding it. Only a **non-canonical
-or library-mismatched** stored representation is treated as hard drift and skipped
+(`gc_library_representation_defaulted`) instead of hiding it. Only a stored value
+that is **invalid for the library identity/encryption state** is treated as hard drift and skipped
 (`gc_library_representation_missing` for an unexpectedly blank value on a path that
 requires an explicit one, `gc_library_representation_invalid` otherwise).
 

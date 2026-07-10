@@ -26,10 +26,6 @@ type LibraryState struct {
 	DeletedAt             *time.Time
 }
 
-func (state LibraryState) BlockRepresentationIDOrDefault() string {
-	return EffectiveBlockRepresentationID(state.LibraryID, state.Encrypted, state.BlockRepresentationID)
-}
-
 // ReadLibraryState loads the canonical libraries row for a known org/library
 // pair, including deleted_at so callers can distinguish live vs soft-deleted.
 func ReadLibraryState(session *gocql.Session, orgID, libraryID string) (LibraryState, error) {

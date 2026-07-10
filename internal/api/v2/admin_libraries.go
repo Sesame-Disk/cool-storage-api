@@ -560,7 +560,7 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	}
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	blockRepresentationID := dbpkg.EffectiveBlockRepresentationID(newLibID.String(), false, "")
+	blockRepresentationID := dbpkg.NewLibraryBlockRepresentationID(newLibID.String(), false)
 	batch.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
 		VALUES (?, ?, ?, ?, ?, ?)

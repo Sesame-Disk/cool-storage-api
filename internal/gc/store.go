@@ -424,13 +424,12 @@ type LibraryTTLInfo struct {
 	// signals a writer/migration that did not stamp it, so scanners report it as
 	// drift rather than hiding it.
 	RepresentationDefaulted bool
-	// RepresentationInvalid is true when the stored block_representation_id is
-	// non-empty but does NOT match the library's own identity+encrypted flag
-	// (e.g. an encrypted library stamped plain:v1, or a plaintext library stamped
-	// library:<same-id>). Such a value is syntactically canonical yet points GC at
-	// the wrong SHA-1 mapping domain, so the scanner must skip the library and
-	// report drift instead of enqueuing work under it. BlockRepresentationID then
-	// carries the raw stored value only so the drift metric can classify it.
+	// RepresentationInvalid is true when the stored block_representation_id cannot
+	// be validated against the library's identity and encrypted flag. This includes
+	// malformed identities/representations and cross-domain values. The scanner
+	// must skip the library and report drift instead of enqueuing work under an
+	// unsafe mapping domain. BlockRepresentationID carries the raw stored value
+	// only so the drift metric can classify it.
 	RepresentationInvalid bool
 	VersionTTLDays        int
 }
