@@ -560,7 +560,7 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	}
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	blockRepresentationID := dbpkg.EffectiveBlockRepresentationID(newLibID.String(), false, "")
+	blockRepresentationID := dbpkg.NewLibraryBlockRepresentationID(newLibID.String(), false)
 	batch.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
 		VALUES (?, ?, ?, ?, ?, ?)
@@ -1228,7 +1228,14 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 
 	libEnqueuer := getLibraryEnqueuer()
 	cleaned := 0
+	failed := 0
 
+	// Process each org's trash independently: collect that org's soft-deleted
+	// libraries and hard-delete them before moving on. Accumulating every org's
+	// candidates first would hold the whole platform's trash in memory and defer
+	// all deletion until the global enumeration finished — a late failure would
+	// then drop work already collected. Per-org keeps memory bounded to one org
+	// and makes progress incrementally; only the counters are global.
 	for _, orgID := range orgIDs {
 		_, cleanedStale, err := dbpkg.ReconcileDeletedAdminLibraryRowsByOrg(h.db.Session(), orgID)
 		if err != nil {
@@ -1240,13 +1247,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			cleaned += cleanedStale
 		}
 
-		// Collect all soft-deleted libraries for this org in one pass.
-		type trashedLib struct {
-			libID        string
-			storageClass string
-		}
-		var candidates []trashedLib
-
+		var candidates []trashLibraryCandidate
 		iter := h.db.Session().Query(`
 			SELECT library_id, storage_class, deleted_at FROM libraries WHERE org_id = ?
 		`, orgID).Iter()
@@ -1254,44 +1255,24 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 		var deletedAt time.Time
 		for iter.Scan(&libID, &storageClass, &deletedAt) {
 			if !deletedAt.IsZero() {
-				candidates = append(candidates, trashedLib{libID, storageClass})
+				candidates = append(candidates, trashLibraryCandidate{
+					OrgID:        orgID,
+					LibraryID:    libID,
+					StorageClass: storageClass,
+				})
 			}
 		}
 		iter.Close()
 
-		for _, lib := range candidates {
-			// 1. Enqueue all file data for GC (commits, fs_objects, blocks → S3 deletion)
-			if libEnqueuer != nil {
-				go libEnqueuer.EnqueueLibraryDeletion(orgID, lib.libID, lib.storageClass)
-			}
-
-			// 2. Remove all tag metadata for this library
-			go func(libraryID string) {
-				if err := CleanupAllLibraryTags(h.db, libraryID); err != nil {
-					log.Printf("[AdminCleanTrashLibraries] failed to clean tag metadata for library %s: %v", libraryID, err)
-				}
-			}(lib.libID)
-
-			// 3. Hard-delete library rows (same batch approach as PermanentDeleteRepo)
-			batch := h.db.Session().Batch(gocql.LoggedBatch)
-			if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, orgID, lib.libID); err != nil {
-				log.Printf("[AdminCleanTrashLibraries] failed to stage read model delete for library %s (org %s): %v", lib.libID, orgID, err)
-				continue
-			}
-			batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, lib.libID)
-			batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, lib.libID)
-
-			// Preserve the org lookup for the Garbage Collector
-			batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`, lib.libID, orgID, time.Now(), lib.storageClass)
-
-			if err := batch.Exec(); err != nil {
-				log.Printf("[AdminCleanTrashLibraries] failed to delete library %s (org %s): %v", lib.libID, orgID, err)
-				continue
-			}
-
-			cleaned++
-		}
+		processedCleaned, processedFailed := h.processAdminTrashCandidates(candidates, libEnqueuer)
+		cleaned += processedCleaned
+		failed += processedFailed
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": true, "cleaned": cleaned})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"partial": failed > 0,
+		"cleaned": cleaned,
+		"skipped": failed,
+	})
 }

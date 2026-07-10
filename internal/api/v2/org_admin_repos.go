@@ -10,6 +10,7 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -399,9 +400,20 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 	var libID, storageClass string
 	var deletedAt time.Time
 	cleaned := 0
+	failed := 0
 
 	for iter.Scan(&libID, &storageClass, &deletedAt) {
 		if deletedAt.IsZero() {
+			continue
+		}
+		// Bulk hard-delete: if the representation cannot be resolved, skip THIS
+		// library (keep its live row so it can be retried) and keep purging the
+		// rest, rather than deleting the authoritative row and stranding it.
+		blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(h.db.Session(), targetOrgID, libID)
+		if repErr != nil {
+			metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("org_clean_trash").Inc()
+			log.Printf("[CleanOrgTrashLibraries] skipping hard-delete of %s/%s: block representation unresolved: %v", targetOrgID, libID, repErr)
+			failed++
 			continue
 		}
 		if err := cleanupLibraryLinks(h.db, targetOrgID, libID); err != nil {
@@ -409,7 +421,6 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library links"})
 			return
 		}
-		// Hard-delete library rows + preserve org lookup for GC
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
 		if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, targetOrgID, libID); err != nil {
 			iter.Close()
@@ -418,7 +429,7 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 		}
 		batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, libID)
 		batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libID)
-		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`, libID, targetOrgID, time.Now(), storageClass)
+		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`, libID, targetOrgID, time.Now(), storageClass, blockRepresentationID)
 		if err := batch.Exec(); err != nil {
 			iter.Close()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
@@ -431,8 +442,9 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[CleanOrgTrashLibraries] Cleaned %d trashed libraries in org %s", cleaned, targetOrgID)
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	log.Printf("[CleanOrgTrashLibraries] Cleaned %d trashed libraries in org %s (%d skipped)", cleaned, targetOrgID, failed)
+	// success=true means the operation completed; partial=true flags skipped libs.
+	c.JSON(http.StatusOK, gin.H{"success": true, "partial": failed > 0, "cleaned": cleaned, "skipped": failed})
 }
 
 // DeleteOrgTrashLibrary permanently deletes a single trashed library.
@@ -459,26 +471,7 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 		return
 	}
 
-	if err := cleanupLibraryLinks(h.db, targetOrgID, repoID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library links"})
-		return
-	}
-
-	// Hard-delete + preserve org lookup for GC
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, targetOrgID, repoID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
-		return
-	}
-	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, repoID)
-	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID)
-	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`, repoID, targetOrgID, time.Now(), storageClass)
-	if err := batch.Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	h.deleteResolvedTrashLibrary(c, targetOrgID, repoID, storageClass)
 }
 
 // RestoreOrgTrashLibrary restores a trashed library.

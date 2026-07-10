@@ -1304,7 +1304,12 @@ func TestScanner_ScanExpiredVersions_EnqueuesExpired(t *testing.T) {
 	}
 }
 
-func TestScanner_ScanExpiredVersions_SkipsLibraryMissingRepresentation(t *testing.T) {
+// TestScanner_ScanExpiredVersions_DefaultsMissingPlaintextRepresentation pins the
+// chosen policy: a plaintext library with an empty stored block_representation_id
+// is NOT skipped — the scanner derives the safe default (plain:v1), processes the
+// library, and reports the empty stored value as drift so a writer/migration that
+// failed to stamp it stays visible.
+func TestScanner_ScanExpiredVersions_DefaultsMissingPlaintextRepresentation(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -1320,16 +1325,25 @@ func TestScanner_ScanExpiredVersions_SkipsLibraryMissingRepresentation(t *testin
 	store.AddCommitWithDetails(libID, "commit-head", "fs-1", "", time.Now())
 	store.AddCommitWithDetails(libID, "commit-expired", "fs-2", "", time.Now().Add(-48*time.Hour))
 
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
+
 	n, err := s.scanExpiredVersions(context.Background())
-	if err != nil || n != 0 {
-		t.Fatalf("scanExpiredVersions = (%d, %v), want (0, nil)", n, err)
+	if err != nil || n != 1 {
+		t.Fatalf("scanExpiredVersions = (%d, %v), want (1, nil)", n, err)
 	}
-	if items := store.QueueItems(orgID); len(items) != 0 {
-		t.Fatalf("expected no queued work for representation-less library, got %#v", items)
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued commit for defaulted plaintext library, got %#v", items)
+	}
+	if items[0].BlockRepresentationID != db.PlainBlockRepresentationID {
+		t.Fatalf("queued item representation = %q, want %q", items[0].BlockRepresentationID, db.PlainBlockRepresentationID)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
+		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
 	}
 }
 
-func TestScanner_ScanAutoDeleteExpiredObjects_SkipsLibraryMissingRepresentation(t *testing.T) {
+func TestScanner_ScanAutoDeleteExpiredObjects_DefaultsMissingPlaintextRepresentation(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -1343,14 +1357,103 @@ func TestScanner_ScanAutoDeleteExpiredObjects_SkipsLibraryMissingRepresentation(
 	store.libraries[libID].BlockRepresentationID = ""
 	store.mu.Unlock()
 	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
-	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-a"})
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
+	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
+	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
+
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
 
 	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
-	if err != nil || n != 0 {
-		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (0, nil)", n, err)
+	if err != nil || n != 1 {
+		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (1, nil)", n, err)
 	}
-	if items := store.QueueItems(orgID); len(items) != 0 {
-		t.Fatalf("expected no queued work for representation-less library, got %#v", items)
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued orphan fs_object for defaulted plaintext library, got %#v", items)
+	}
+	if items[0].ItemID != "fs-orphan" || items[0].BlockRepresentationID != db.PlainBlockRepresentationID {
+		t.Fatalf("queued item = %s/%q, want fs-orphan/%q", items[0].ItemID, items[0].BlockRepresentationID, db.PlainBlockRepresentationID)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
+		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
+	}
+}
+
+// TestScanner_ScanExpiredVersions_DefaultsMissingEncryptedRepresentation pins the
+// encrypted half of the policy: an encrypted library with an empty stored
+// block_representation_id derives library:<id> (not plain:v1), processes, and
+// reports drift.
+func TestScanner_ScanExpiredVersions_DefaultsMissingEncryptedRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithTTL(orgID, libID, "hot", "commit-head", 1)
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = ""
+	store.mu.Unlock()
+	store.SetLibraryEncrypted(libID, true)
+	store.AddCommitWithDetails(libID, "commit-head", "fs-1", "", time.Now())
+	store.AddCommitWithDetails(libID, "commit-expired", "fs-2", "", time.Now().Add(-48*time.Hour))
+
+	wantRep := db.EncryptedLibraryBlockRepresentationID(libID.String())
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
+
+	n, err := s.scanExpiredVersions(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("scanExpiredVersions = (%d, %v), want (1, nil)", n, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued commit, got %#v", items)
+	}
+	if items[0].BlockRepresentationID != wantRep {
+		t.Fatalf("queued item representation = %q, want %q", items[0].BlockRepresentationID, wantRep)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
+		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
+	}
+}
+
+func TestScanner_ScanAutoDeleteExpiredObjects_DefaultsMissingEncryptedRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = ""
+	store.mu.Unlock()
+	store.SetLibraryEncrypted(libID, true)
+	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
+	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
+	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
+
+	wantRep := db.EncryptedLibraryBlockRepresentationID(libID.String())
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
+
+	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (1, nil)", n, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued orphan fs_object, got %#v", items)
+	}
+	if items[0].ItemID != "fs-orphan" || items[0].BlockRepresentationID != wantRep {
+		t.Fatalf("queued item = %s/%q, want fs-orphan/%q", items[0].ItemID, items[0].BlockRepresentationID, wantRep)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
+		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
 	}
 }
 
@@ -1376,6 +1479,77 @@ func TestScanner_ScanExpiredVersions_SkipsLibraryWithNonCanonicalRepresentation(
 	}
 	if items := store.QueueItems(orgID); len(items) != 0 {
 		t.Fatalf("expected no queued work for library with non-canonical representation, got %#v", items)
+	}
+}
+
+// TestScanner_ScanExpiredVersions_SkipsCrossDomainRepresentation pins that a
+// syntactically canonical but domain-crossed stored representation — an encrypted
+// library stamped plain:v1 — is skipped as drift, not enqueued under the wrong
+// SHA-1 mapping domain. validateQueueItemBlockRepresentation alone cannot catch
+// this (it never sees the encrypted flag); the list method now flags it via
+// RepresentationInvalid so the scanner fails closed like the delete paths.
+func TestScanner_ScanExpiredVersions_SkipsCrossDomainRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithTTL(orgID, libID, "hot", "commit-head", 1)
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = db.PlainBlockRepresentationID
+	store.mu.Unlock()
+	store.SetLibraryEncrypted(libID, true)
+	store.AddCommitWithDetails(libID, "commit-head", "fs-1", "", time.Now())
+	store.AddCommitWithDetails(libID, "commit-expired", "fs-2", "", time.Now().Add(-48*time.Hour))
+
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid"))
+
+	n, err := s.scanExpiredVersions(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("scanExpiredVersions = (%d, %v), want (0, nil)", n, err)
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("expected no queued work for cross-domain representation, got %#v", items)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid")); afterDrift != beforeDrift+1 {
+		t.Fatalf("invalid drift metric = %v, want %v", afterDrift, beforeDrift+1)
+	}
+}
+
+func TestScanner_ScanAutoDeleteExpiredObjects_SkipsCrossDomainRepresentation(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
+	// Plaintext library (encrypted stays false) stamped with an encrypted
+	// per-library representation: canonical for the UUID but the wrong domain.
+	store.mu.Lock()
+	store.libraries[libID].BlockRepresentationID = db.EncryptedLibraryBlockRepresentationID(libID.String())
+	store.mu.Unlock()
+	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
+	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
+	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
+
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid"))
+
+	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (0, nil)", n, err)
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("expected no queued work for cross-domain representation, got %#v", items)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid")); afterDrift != beforeDrift+1 {
+		t.Fatalf("invalid drift metric = %v, want %v", afterDrift, beforeDrift+1)
 	}
 }
 
@@ -2188,6 +2362,47 @@ func TestScanner_ScanExpiredDeletedLibraries_EnqueuesExpired(t *testing.T) {
 	}
 	if cascadeCount != 1 {
 		t.Errorf("expected 1 library_cascade item, got %d", cascadeCount)
+	}
+}
+
+// TestScanner_ScanExpiredDeletedLibraries_RecoversUnstampedMarker is the
+// regression guard for the trash-stuck bug: the canonical soft-delete path writes
+// the deleted_libraries marker WITHOUT block_representation_id, so the marker is
+// empty even though the surviving library row still carries the representation.
+// Phase 13 must recover it from the library row and enqueue the cascade (stamped),
+// not skip the library and strand it in trash forever.
+func TestScanner_ScanExpiredDeletedLibraries_RecoversUnstampedMarker(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	expiredLib := uuid.New()
+	store.AddDeletedLibrary(orgID, expiredLib, "hot", time.Now().AddDate(0, 0, -45))
+	// Simulate the unstamped write path: the marker has no representation, but the
+	// live (soft-deleted) library row still carries plain:v1.
+	store.mu.Lock()
+	store.deletedLibraries[expiredLib].BlockRepresentationID = ""
+	store.mu.Unlock()
+
+	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
+
+	n, err := s.scanExpiredDeletedLibraries(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("scanExpiredDeletedLibraries = (%d, %v), want (1, nil)", n, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 || items[0].ItemType != ItemLibraryCascade {
+		t.Fatalf("expected 1 library_cascade item, got %#v", items)
+	}
+	if items[0].BlockRepresentationID != db.PlainBlockRepresentationID {
+		t.Fatalf("recovered cascade representation = %q, want %q", items[0].BlockRepresentationID, db.PlainBlockRepresentationID)
+	}
+	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
+		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
 	}
 }
 

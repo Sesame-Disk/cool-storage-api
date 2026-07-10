@@ -26,3 +26,46 @@ func TestCassandraStore_EnqueueItem_RejectsRepresentationRequiredTypes(t *testin
 		})
 	}
 }
+
+// TestParseStoredQueueLibraryID covers the library_id round-trip used by the
+// Cassandra DLQ requeue path: empty stays empty, valid UUIDs canonicalize, the
+// nil UUID (carried by library-less org/user cascades) is accepted, and a
+// non-empty non-UUID is rejected.
+func TestParseStoredQueueLibraryID(t *testing.T) {
+	realID := uuid.New()
+
+	for _, tc := range []struct {
+		name         string
+		raw          string
+		wantID       uuid.UUID
+		wantQueue    string
+		wantErr      bool
+	}{
+		{name: "empty", raw: "", wantID: uuid.Nil, wantQueue: ""},
+		{name: "whitespace_only", raw: "   ", wantID: uuid.Nil, wantQueue: ""},
+		{name: "nil_uuid", raw: uuid.Nil.String(), wantID: uuid.Nil, wantQueue: uuid.Nil.String()},
+		{name: "real_uuid", raw: realID.String(), wantID: realID, wantQueue: realID.String()},
+		{name: "surrounding_spaces", raw: "  " + realID.String() + "  ", wantID: realID, wantQueue: realID.String()},
+		{name: "uppercase_canonicalized", raw: strings.ToUpper(realID.String()), wantID: realID, wantQueue: realID.String()},
+		{name: "garbage", raw: "not-a-uuid", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotID, gotQueue, err := parseStoredQueueLibraryID(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseStoredQueueLibraryID(%q) err = nil, want error", tc.raw)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseStoredQueueLibraryID(%q) unexpected err = %v", tc.raw, err)
+			}
+			if gotID != tc.wantID {
+				t.Fatalf("parseStoredQueueLibraryID(%q) id = %s, want %s", tc.raw, gotID, tc.wantID)
+			}
+			if gotQueue != tc.wantQueue {
+				t.Fatalf("parseStoredQueueLibraryID(%q) queue value = %q, want %q", tc.raw, gotQueue, tc.wantQueue)
+			}
+		})
+	}
+}

@@ -125,16 +125,43 @@ wrappers, so it holds even for a direct store caller.
 from `deleted_libraries.block_representation_id` before the hard-delete), so a
 cascade that runs after the live `libraries` row is gone still cleans the correct
 domain. `GetLibraryBlockRepresentationID` now resolves from the live `libraries`
-row first and falls back to `deleted_libraries`; an absent/empty stored value
-fails closed with `ErrNotFound` so the resolver never guesses.
+row first and falls back to `deleted_libraries`. A live row can derive a safe
+default from `(library_id, encrypted)`; a deleted row has no encryption state, so
+an absent/empty persisted representation fails closed with `ErrNotFound` rather
+than guessing.
 
-Under the accepted clean deployment, an empty or non-canonical representation on
-a `commit`/`fs_object`/`library_cascade` is treated as drift: scanners skip and
-report the offending library (`gc_library_representation_missing` /
-`gc_library_representation_invalid` metrics) rather than enqueuing incomplete
-work. The `plain:v1`/`library:<uuid>` dual-probe in `ResolveBlockIDs` remains only
-as conservative protection for legacy queue rows written before persistence
+The scanner phases that read the *live* `libraries` row (version-TTL and
+auto-delete, phases 5/6) resolve the representation through
+`CanonicalBlockRepresentationIDForLibrary`, so an **empty** stored value is not
+skipped: it is derived safely from the library's own identity — `plain:v1` for a
+plaintext library, `library:<id>` for an encrypted one. Both derivations are
+deterministic functions of `(library_id, encrypted)`, so this is a safe default,
+not a guess. A stored value must match that derived domain exactly.
+An empty stored value still signals that a writer or migration did not stamp the
+column, so the scanner processes the library **and** reports it as drift
+(`gc_library_representation_defaulted`) instead of hiding it. Only a stored value
+that is **invalid for the library identity/encryption state** is treated as hard drift and skipped
+(`gc_library_representation_missing` for an unexpectedly blank value on a path that
+requires an explicit one, `gc_library_representation_invalid` otherwise).
+
+The deleted-library cascade path (phase 13) reads the raw
+`deleted_libraries.block_representation_id`, which was stamped (non-empty) at
+soft-delete time; a blank value there is genuine drift and is skipped, not
+defaulted. The `plain:v1`/`library:<uuid>` dual-probe in `ResolveBlockIDs` remains
+only as conservative protection for legacy queue rows written before persistence
 existed, not as an expected path.
+
+Note one deliberate asymmetry in that legacy protection. The dual-probe only
+covers the *leaf read* path (`ResolveBlockIDs` when removing an fs_object's block
+references). A directory fs_object that re-enqueues its child fs_objects, and a
+commit that enqueues its root fs_object, both route the child through
+`EnqueueBatch`, which fail-closes on a blank/non-canonical representation. So a
+legacy queue row for a *directory* commit/fs_object (written before persistence
+existed) cannot make progress and will land in the DLQ, whereas a legacy *leaf*
+row still resolves via the dual-probe. This is acceptable under the clean-cut
+rollout — no such legacy rows exist — and fail-closed is the intended posture
+(the alternative would be guessing a representation for the children). Backfilling
+`block_representation_id` on any surviving queue rows removes the asymmetry.
 
 ## Operational rules
 
@@ -147,6 +174,30 @@ existed, not as an expected path.
 - Stamp `block_representation_id` on GC queue work at enqueue time; never
   re-resolve it from live library state during durable processing.
 - Add future schema changes as new migrations; do not rewrite migration `001`.
+
+### Library deletion → `deleted_libraries` marker
+
+- Every production writer of `deleted_libraries` MUST stamp `block_representation_id`,
+  resolved from the live `libraries` row via `db.ResolveBlockRepresentationIDForDelete`
+  (which reads the row even when `deleted_at` is already set, and validates the value
+  is canonical for that library).
+- **Soft-delete** may proceed best-effort if resolution fails: the live row survives,
+  so GC Phase 13 can recover the representation later, or an operator can repair
+  the surviving row and retry if the row itself is persistently inconsistent.
+- **Hard-delete fails closed.** Resolution runs before any state change, so on a
+  resolution failure **no state is modified**: a single hard-delete endpoint returns an
+  error, and a bulk cleaner skips the offending library (keeping its live row for retry)
+  and continues with the rest. (This is not a claim of end-to-end endpoint atomicity —
+  once resolution succeeds, later destructive steps such as `cleanupLibraryLinks` run
+  outside the delete batch. The guarantee is specifically that an *unresolved*
+  representation never deletes the authoritative row.) In the bulk/global cleaner the
+  irreversible GC enqueue and tag cleanup run only AFTER a successful delete batch, so a
+  failed batch leaves the library fully intact. Deleting the authoritative row while
+  stamping an empty/non-canonical marker would strand the library in trash forever —
+  exactly the bug this design closes. All resolution failures (soft and hard delete)
+  increment `gc_library_delete_representation_resolution_failures_total{operation}`.
+- GC Phase 13 recovery from the surviving library row MUST be kept even after all
+  writers stamp correctly, to repair pre-deploy / legacy / partial-failure markers.
 
 ## Follow-up work
 

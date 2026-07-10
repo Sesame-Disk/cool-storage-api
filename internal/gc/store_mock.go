@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -279,11 +280,15 @@ type mockLibrary struct {
 	LibraryID             uuid.UUID
 	OwnerID               uuid.UUID
 	BlockRepresentationID string
-	StorageClass          string
-	HeadCommitID          string
-	VersionTTLDays        int
-	AutoDeleteDays        int
-	DeletedAt             time.Time
+	// Encrypted mirrors libraries.encrypted so the mock can resolve an empty
+	// stored block_representation_id the same way CassandraStore does — plaintext
+	// derives plain:v1, encrypted derives library:<id>.
+	Encrypted      bool
+	StorageClass   string
+	HeadCommitID   string
+	VersionTTLDays int
+	AutoDeleteDays int
+	DeletedAt      time.Time
 	// SizeBytes and FileCount mirror the canonical libraries.size_bytes and
 	// libraries.file_count columns used by ReconcilePendingStorageCounters
 	// in production. Storage-counter rows (m.storageSnapshots) are derived
@@ -493,26 +498,33 @@ func mockMappingKey(orgID uuid.UUID, representationID, externalID string) string
 	return fmt.Sprintf("%s:%s:%s", orgID, representationID, db.NormalizeBlockID(externalID))
 }
 
-func (m *MockStore) blockRepresentationIDForLibraryLocked(orgID, libraryID uuid.UUID) (string, bool) {
+func (m *MockStore) blockRepresentationIDForLibraryLocked(orgID, libraryID uuid.UUID) (string, error) {
 	if lib := m.libraries[libraryID]; lib != nil {
 		if lib.OrgID != orgID {
-			return "", false
+			return "", gocql.ErrNotFound
 		}
-		if rep := strings.TrimSpace(lib.BlockRepresentationID); rep != "" {
-			return rep, true
+		resolved, err := db.CanonicalBlockRepresentationIDForLibrary(lib.LibraryID.String(), lib.Encrypted, lib.BlockRepresentationID)
+		if err != nil {
+			return "", err
 		}
-		return db.PlainBlockRepresentationID, true
+		return resolved, nil
 	}
 	if deleted := m.deletedLibraries[libraryID]; deleted != nil {
 		if deleted.OrgID != orgID {
-			return "", false
+			return "", gocql.ErrNotFound
 		}
 		if rep := strings.TrimSpace(deleted.BlockRepresentationID); rep != "" {
-			return rep, true
+			if !db.IsCanonicalBlockRepresentationForLibrary(rep, libraryID) {
+				if !db.IsCanonicalBlockRepresentationID(rep) {
+					return "", fmt.Errorf("deleted library %s carries non-canonical block representation %q", libraryID, rep)
+				}
+				return "", fmt.Errorf("deleted library %s carries block representation %q for a different library", libraryID, rep)
+			}
+			return rep, nil
 		}
-		return "", false
+		return "", gocql.ErrNotFound
 	}
-	return "", false
+	return "", gocql.ErrNotFound
 }
 
 func (m *MockStore) upsertProvisionalBlockRefExpiryProjection(expiry *mockProvisionalBlockRefExpiry) {
@@ -812,6 +824,17 @@ func (m *MockStore) AddLibraryWithAutoDelete(orgID, libraryID uuid.UUID, storage
 		StorageClass:          storageClass,
 		HeadCommitID:          headCommitID,
 		AutoDeleteDays:        autoDeleteDays,
+	}
+}
+
+// SetLibraryEncrypted flips a mock library's encrypted flag. Tests that need
+// the "encrypted + empty stored representation -> library:<id>" derivation
+// path must clear BlockRepresentationID separately.
+func (m *MockStore) SetLibraryEncrypted(libraryID uuid.UUID, encrypted bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if lib := m.libraries[libraryID]; lib != nil {
+		lib.Encrypted = encrypted
 	}
 }
 
@@ -1532,6 +1555,18 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 	items := m.failedItems[orgID]
 	for i, item := range items {
 		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID {
+			// Mirror CassandraStore.RequeueFailedItem: this path writes straight
+			// into the queue, so re-assert the block-representation invariant that
+			// EnqueueBatch would otherwise enforce.
+			if verr := validateQueueItemBlockRepresentation(QueueItem{
+				ItemType:              item.ItemType,
+				ItemID:                item.ItemID,
+				LibraryID:             item.LibraryID,
+				BlockRepresentationID: item.BlockRepresentationID,
+			}); verr != nil {
+				return fmt.Errorf("refusing to requeue failed item org=%s item_type=%s item_id=%s failed_at=%s: %w",
+					orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), verr)
+			}
 			m.queue[orgID] = append(m.queue[orgID], QueueItem{
 				OrgID:                       orgID,
 				QueuedAt:                    item.QueuedAt,
@@ -1812,10 +1847,7 @@ func (m *MockStore) AddFSObjectReferenceForTest(orgID uuid.UUID, blockID string,
 func (m *MockStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.UUID) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if representationID, ok := m.blockRepresentationIDForLibraryLocked(orgID, libraryID); ok {
-		return representationID, nil
-	}
-	return "", gocql.ErrNotFound
+	return m.blockRepresentationIDForLibraryLocked(orgID, libraryID)
 }
 
 func (m *MockStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentationID string, blockIDs []string) ([]string, error) {
@@ -1823,8 +1855,11 @@ func (m *MockStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentat
 	defer m.mu.RUnlock()
 	representationID := strings.TrimSpace(blockRepresentationID)
 	if representationID == "" {
-		if resolvedRepresentationID, ok := m.blockRepresentationIDForLibraryLocked(orgID, libraryID); ok {
+		resolvedRepresentationID, err := m.blockRepresentationIDForLibraryLocked(orgID, libraryID)
+		if err == nil {
 			representationID = resolvedRepresentationID
+		} else if !errors.Is(err, gocql.ErrNotFound) {
+			return nil, err
 		}
 	}
 
@@ -2357,12 +2392,26 @@ func (m *MockStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error) {
 	var results []LibraryTTLInfo
 	for _, lib := range m.libraries {
 		if lib.VersionTTLDays > 0 {
+			stored := strings.TrimSpace(lib.BlockRepresentationID)
+			resolved, repErr := db.CanonicalBlockRepresentationIDForLibrary(lib.LibraryID.String(), lib.Encrypted, stored)
+			if repErr != nil {
+				results = append(results, LibraryTTLInfo{
+					OrgID:                 lib.OrgID,
+					LibraryID:             lib.LibraryID,
+					HeadCommitID:          lib.HeadCommitID,
+					BlockRepresentationID: stored,
+					RepresentationInvalid: true,
+					VersionTTLDays:        lib.VersionTTLDays,
+				})
+				continue
+			}
 			results = append(results, LibraryTTLInfo{
-				OrgID:                 lib.OrgID,
-				LibraryID:             lib.LibraryID,
-				HeadCommitID:          lib.HeadCommitID,
-				BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
-				VersionTTLDays:        lib.VersionTTLDays,
+				OrgID:                   lib.OrgID,
+				LibraryID:               lib.LibraryID,
+				HeadCommitID:            lib.HeadCommitID,
+				BlockRepresentationID:   resolved,
+				RepresentationDefaulted: stored == "",
+				VersionTTLDays:          lib.VersionTTLDays,
 			})
 		}
 	}
@@ -2376,12 +2425,26 @@ func (m *MockStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo, erro
 	var results []LibraryAutoDeleteInfo
 	for _, lib := range m.libraries {
 		if lib.AutoDeleteDays > 0 {
+			stored := strings.TrimSpace(lib.BlockRepresentationID)
+			resolved, repErr := db.CanonicalBlockRepresentationIDForLibrary(lib.LibraryID.String(), lib.Encrypted, stored)
+			if repErr != nil {
+				results = append(results, LibraryAutoDeleteInfo{
+					OrgID:                 lib.OrgID,
+					LibraryID:             lib.LibraryID,
+					HeadCommitID:          lib.HeadCommitID,
+					BlockRepresentationID: stored,
+					RepresentationInvalid: true,
+					AutoDeleteDays:        lib.AutoDeleteDays,
+				})
+				continue
+			}
 			results = append(results, LibraryAutoDeleteInfo{
-				OrgID:                 lib.OrgID,
-				LibraryID:             lib.LibraryID,
-				HeadCommitID:          lib.HeadCommitID,
-				BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
-				AutoDeleteDays:        lib.AutoDeleteDays,
+				OrgID:                   lib.OrgID,
+				LibraryID:               lib.LibraryID,
+				HeadCommitID:            lib.HeadCommitID,
+				BlockRepresentationID:   resolved,
+				RepresentationDefaulted: stored == "",
+				AutoDeleteDays:          lib.AutoDeleteDays,
 			})
 		}
 	}
@@ -2770,11 +2833,15 @@ func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) err
 	if !ok {
 		return nil
 	}
+	blockRepresentationID, err := db.CanonicalBlockRepresentationIDForLibrary(lib.LibraryID.String(), lib.Encrypted, lib.BlockRepresentationID)
+	if err != nil {
+		return err
+	}
 	lib.DeletedAt = time.Now()
 	m.deletedLibraries[libraryID] = &mockDeletedLibrary{
 		OrgID:                 orgID,
 		LibraryID:             libraryID,
-		BlockRepresentationID: strings.TrimSpace(lib.BlockRepresentationID),
+		BlockRepresentationID: blockRepresentationID,
 		StorageClass:          lib.StorageClass,
 		DeletedAt:             lib.DeletedAt,
 	}

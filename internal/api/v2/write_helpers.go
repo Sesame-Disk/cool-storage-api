@@ -8,6 +8,7 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
@@ -917,6 +918,19 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 	nextRow := previousRow
 	nextRow.UpdatedAt = now
 	nextRow.DeletedAt = &now
+	// Stamp the block representation onto the GC marker while the libraries row is
+	// still present, so the deferred trash-purge cascade can resolve the SHA-1
+	// mapping domain even after the row is hard-deleted. Best-effort: never fail a
+	// user delete over it — an empty stamp is recovered by GC Phase 13 from the
+	// still-present (soft-deleted) row.
+	blockRepresentationID, repErr := dbpkg.ResolveBlockRepresentationIDForDelete(db.Session(), orgID, libraryID)
+	if repErr != nil {
+		// Soft-delete proceeds best-effort (the live row survives, so Phase 13 can
+		// recover the representation later), but count the fallback so a broken
+		// writer/migration is still observable alongside the hard-delete failures.
+		metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("soft_delete").Inc()
+		log.Printf("[softDeleteLibrary] could not resolve block representation for %s/%s: %v", orgID, libraryID, repErr)
+	}
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries SET deleted_at = ?, deleted_by = ?, updated_at = ?
@@ -924,9 +938,9 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 		now, deletedBy, now, orgID, libraryID,
 	)
 	batch.Query(`
-		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class)
-		VALUES (?, ?, ?, ?)`,
-		libraryID, orgID, now, previousRow.StorageClass,
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id)
+		VALUES (?, ?, ?, ?, ?)`,
+		libraryID, orgID, now, previousRow.StorageClass, blockRepresentationID,
 	)
 	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, now)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)

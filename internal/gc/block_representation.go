@@ -42,6 +42,28 @@ func queueItemRepresentationLibraryID(item QueueItem) (uuid.UUID, error) {
 	}
 }
 
+// countLibraryRepresentationDrift emits the drift metric that matches a
+// representation which just failed validateQueueItemBlockRepresentation: a blank
+// value is "missing", anything else is "invalid" (non-canonical or wrong
+// library). Scanner phases call this when they skip a library so the classify
+// logic lives in one place instead of being copied at every skip site.
+func countLibraryRepresentationDrift(blockRepresentationID string) {
+	if strings.TrimSpace(blockRepresentationID) == "" {
+		metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_missing").Inc()
+	} else {
+		metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid").Inc()
+	}
+}
+
+// countLibraryRepresentationDefaulted records that a scanned library had no
+// stored block_representation_id and was processed under the safe derived default
+// (plain:v1 / library:<id>). Deriving the representation from the library's own
+// identity is correct, but an empty stored value means a writer/migration did not
+// stamp it, so scanners surface it as drift instead of hiding it.
+func countLibraryRepresentationDefaulted() {
+	metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted").Inc()
+}
+
 func validateQueueItemBlockRepresentation(item QueueItem) error {
 	if !itemTypeRequiresBlockRepresentation(item.ItemType) {
 		return nil

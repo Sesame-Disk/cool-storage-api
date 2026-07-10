@@ -857,6 +857,25 @@ func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, 
 	return true, nil
 }
 
+// parseStoredQueueLibraryID interprets a library_id string read back from
+// gc_failed_items / gc_queue. It returns the parsed UUID (uuid.Nil for a
+// library-less item such as an org/user cascade), the value to persist back into
+// gc_queue, and an error when a non-empty value is not a valid UUID. An empty
+// value is preserved as empty; a valid UUID — including the nil UUID cascades
+// legitimately carry — is re-emitted in canonical form so a stray non-canonical
+// spelling is normalized on the round-trip rather than propagated.
+func parseStoredQueueLibraryID(raw string) (uuid.UUID, string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return uuid.Nil, "", nil
+	}
+	parsed, err := uuid.Parse(trimmed)
+	if err != nil {
+		return uuid.Nil, "", err
+	}
+	return parsed, parsed.String(), nil
+}
+
 func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error {
 	var (
 		failedQueuedAt              time.Time
@@ -874,13 +893,42 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 	if err != nil {
 		return fmt.Errorf("load failed item for requeue %s/%s: %w", orgID, itemID, err)
 	}
+	// Interpret the stored library_id via parseStoredQueueLibraryID instead of
+	// parseUUID, which would silently coerce a corrupted value to uuid.Nil —
+	// masking the corruption as a generic "requires library_id" validation error
+	// and writing pending state under the nil library. A non-empty value that does
+	// not parse is refused outright. The nil UUID is NOT corruption: org/user
+	// cascades carry no library and legitimately persist library_id as the nil
+	// UUID string, so rejecting it would break their DLQ requeue. queueLibraryID is
+	// the normalized value round-tripped back into gc_queue; libraryID drives
+	// validation and the pending-item row.
+	libraryID, queueLibraryID, perr := parseStoredQueueLibraryID(libraryIDStr)
+	if perr != nil {
+		return fmt.Errorf("refusing to requeue failed item org=%s item_type=%s item_id=%s failed_at=%s: corrupted stored library_id %q: %w",
+			orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), strings.TrimSpace(libraryIDStr), perr)
+	}
+
+	// RequeueFailedItem writes straight into gc_queue (it does not go through
+	// EnqueueBatch), so re-assert the block-representation invariant here too. A
+	// representation-required item whose stored representation is blank or
+	// non-canonical would be re-processed and fail forever, so refuse the manual
+	// DLQ requeue with a clear error instead of silently re-queuing a doomed row.
+	if verr := validateQueueItemBlockRepresentation(QueueItem{
+		ItemType:              itemType,
+		ItemID:                itemID,
+		LibraryID:             libraryID,
+		BlockRepresentationID: blockRepresentationID,
+	}); verr != nil {
+		return fmt.Errorf("refusing to requeue failed item org=%s item_type=%s item_id=%s failed_at=%s: %w",
+			orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), verr)
+	}
 	requeueAt := failedQueuedAt
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, block_representation_id, storage_class, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), requeueAt, effectiveIdentityAt(failedQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, libraryIDStr, strings.TrimSpace(blockRepresentationID), storageClass, 0)
-	addPendingItemBatchQuery(batch, orgID, parseUUID(libraryIDStr), itemType, itemID, effectiveIdentityAt(failedQueuedAt, identityAt))
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), requeueAt, effectiveIdentityAt(failedQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, queueLibraryID, strings.TrimSpace(blockRepresentationID), storageClass, 0)
+	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, effectiveIdentityAt(failedQueuedAt, identityAt))
 	batch.Query(`
 		DELETE FROM gc_failed_items
 		WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
@@ -1133,7 +1181,7 @@ func (s *CassandraStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.U
 		SELECT encrypted, block_representation_id FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID.String(), libraryID.String()).Scan(&encrypted, &storedRepresentationID)
 	if err == nil {
-		return db.EffectiveBlockRepresentationID(libraryID.String(), encrypted, storedRepresentationID), nil
+		return db.CanonicalBlockRepresentationIDForLibrary(libraryID.String(), encrypted, storedRepresentationID)
 	}
 	if !errors.Is(err, gocql.ErrNotFound) {
 		return "", err
@@ -1153,6 +1201,12 @@ func (s *CassandraStore) GetLibraryBlockRepresentationID(orgID, libraryID uuid.U
 	deletedRepresentationID = strings.TrimSpace(deletedRepresentationID)
 	if deletedRepresentationID == "" {
 		return "", gocql.ErrNotFound
+	}
+	if !db.IsCanonicalBlockRepresentationForLibrary(deletedRepresentationID, libraryID) {
+		if !db.IsCanonicalBlockRepresentationID(deletedRepresentationID) {
+			return "", fmt.Errorf("deleted library %s carries non-canonical block representation %q", libraryID, deletedRepresentationID)
+		}
+		return "", fmt.Errorf("deleted library %s carries block representation %q for a different library", libraryID, deletedRepresentationID)
 	}
 	return deletedRepresentationID, nil
 }
@@ -2411,11 +2465,13 @@ func (s *CassandraStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo,
 	results := make([]LibraryAutoDeleteInfo, 0, len(rows))
 	for _, row := range rows {
 		results = append(results, LibraryAutoDeleteInfo{
-			OrgID:                 row.OrgID,
-			LibraryID:             row.LibraryID,
-			HeadCommitID:          row.HeadCommitID,
-			BlockRepresentationID: row.BlockRepresentationID,
-			AutoDeleteDays:        row.VersionTTLDays,
+			OrgID:                   row.OrgID,
+			LibraryID:               row.LibraryID,
+			HeadCommitID:            row.HeadCommitID,
+			BlockRepresentationID:   row.BlockRepresentationID,
+			RepresentationDefaulted: row.RepresentationDefaulted,
+			RepresentationInvalid:   row.RepresentationInvalid,
+			AutoDeleteDays:          row.VersionTTLDays,
 		})
 	}
 	return results, nil
@@ -2457,12 +2513,31 @@ func (s *CassandraStore) listLibrariesByPolicy(policyType string) ([]LibraryTTLI
 				continue
 			}
 
+			// Validate the stored representation against the library's own
+			// identity+encrypted flag (not just canonical shape) so a cross-domain
+			// value — e.g. an encrypted library stamped plain:v1 — is surfaced as
+			// drift and skipped by the scanner rather than enqueued under the wrong
+			// SHA-1 mapping domain. Mirrors the delete/GetLibraryBlockRepresentationID
+			// paths so every live resolver fails closed on the same rule.
+			resolvedRepresentationID, repErr := db.CanonicalBlockRepresentationIDForLibrary(libraryIDStr, encrypted, storedRepresentationID)
+			if repErr != nil {
+				results = append(results, LibraryTTLInfo{
+					OrgID:                 parseUUID(orgIDStr),
+					LibraryID:             parseUUID(libraryIDStr),
+					HeadCommitID:          headCommitID,
+					BlockRepresentationID: strings.TrimSpace(storedRepresentationID),
+					RepresentationInvalid: true,
+					VersionTTLDays:        days,
+				})
+				continue
+			}
 			results = append(results, LibraryTTLInfo{
-				OrgID:                 parseUUID(orgIDStr),
-				LibraryID:             parseUUID(libraryIDStr),
-				HeadCommitID:          headCommitID,
-				BlockRepresentationID: db.EffectiveBlockRepresentationID(libraryIDStr, encrypted, storedRepresentationID),
-				VersionTTLDays:        days,
+				OrgID:                   parseUUID(orgIDStr),
+				LibraryID:               parseUUID(libraryIDStr),
+				HeadCommitID:            headCommitID,
+				BlockRepresentationID:   resolvedRepresentationID,
+				RepresentationDefaulted: strings.TrimSpace(storedRepresentationID) == "",
+				VersionTTLDays:          days,
 			})
 		}
 		if err := iter.Close(); err != nil {
@@ -3294,20 +3369,37 @@ func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID
 		encrypted              bool
 		storedRepresentationID string
 	)
+	// A missing canonical libraries row means there is nothing left to soft-delete.
+	// Return nil (idempotent success) rather than an error: SoftDeleteLibrary runs
+	// inside user/org GC cascades that enumerate libraries and then delete each one,
+	// so a row that vanished between listing and here is already-done work, not a
+	// failure. Surfacing ErrNotFound would fail the whole cascade and eventually
+	// push it to the DLQ. This also matches MockStore, which no-ops on a missing
+	// library. A genuine read error (non-NotFound) still propagates.
 	if errors.Is(err, gocql.ErrNotFound) {
 		if baseErr := s.db.Session().Query(
 			`SELECT owner_id, storage_class, encrypted, block_representation_id FROM libraries WHERE org_id = ? AND library_id = ?`,
 			orgID.String(), libraryID.String(),
-		).Scan(&ownerID, &storageClass, &encrypted, &storedRepresentationID); baseErr != nil && !errors.Is(baseErr, gocql.ErrNotFound) {
+		).Scan(&ownerID, &storageClass, &encrypted, &storedRepresentationID); baseErr != nil {
+			if errors.Is(baseErr, gocql.ErrNotFound) {
+				return nil
+			}
 			return baseErr
 		}
 	} else if baseErr := s.db.Session().Query(
 		`SELECT encrypted, block_representation_id FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID.String(), libraryID.String(),
-	).Scan(&encrypted, &storedRepresentationID); baseErr != nil && !errors.Is(baseErr, gocql.ErrNotFound) {
+	).Scan(&encrypted, &storedRepresentationID); baseErr != nil {
+		if errors.Is(baseErr, gocql.ErrNotFound) {
+			return nil
+		}
 		return baseErr
 	}
-	blockRepresentationID := db.EffectiveBlockRepresentationID(libraryID.String(), encrypted, storedRepresentationID)
+	blockRepresentationID, repErr := db.CanonicalBlockRepresentationIDForLibrary(libraryID.String(), encrypted, storedRepresentationID)
+	if repErr != nil {
+		metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("gc_soft_delete").Inc()
+		return fmt.Errorf("resolve block representation for soft delete %s/%s: %w", orgID, libraryID, repErr)
+	}
 
 	now := time.Now().UTC()
 	batch := s.db.Session().Batch(gocql.LoggedBatch)

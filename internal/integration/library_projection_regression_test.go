@@ -424,6 +424,59 @@ func TestAdminCleanTrashLibraries_PrunesStaleProjectionRows(t *testing.T) {
 	}
 }
 
+// TestAdminCleanTrashLibraries_HardDeletesRealTrashedLibrary exercises the
+// candidate-collection-and-delete path of the superadmin bulk trash cleaner: a
+// genuinely soft-deleted library whose canonical `libraries` row is still present
+// (NOT a stale projection). The clean endpoint must hard-delete that base row.
+//
+// The pre-existing PrunesStaleProjectionRows test removes the base rows first, so
+// it only covers the stale-prune counter and never runs the candidate collection
+// or the hard-delete of a real trashed library. This test deliberately keeps the
+// base row intact so a regression that dropped collected candidates on the floor
+// (e.g. accumulating them into the wrong slice, or deferring/aborting deletion)
+// is caught instead of silently returning 200 OK while the library stays in trash.
+func TestAdminCleanTrashLibraries_HardDeletesRealTrashedLibrary(t *testing.T) {
+	name := fmt.Sprintf("inttest-admin-trash-real-%d", time.Now().UnixNano())
+	repoID := createDisposableTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+
+	// Soft-delete via the normal user path: this sets deleted_at but KEEPS the
+	// canonical libraries row — a genuine trashed library, not a stale projection.
+	deleteResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "real trashed library to appear in admin trash projection", func() bool {
+		return adminTrashContainsRepo(t, superadminClient, repoID, defaultAdminEmail)
+	})
+
+	// Precondition: the canonical libraries row is present and soft-deleted, so
+	// the clean endpoint reaches it through the candidate-collection loop rather
+	// than the stale-projection prune path.
+	var deletedAt time.Time
+	if err := session.Query(`SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&deletedAt); err != nil {
+		t.Fatalf("expected soft-deleted libraries row for repo %s before clean: %v", repoID, err)
+	}
+	if deletedAt.IsZero() {
+		t.Fatalf("libraries row for repo %s is not soft-deleted (deleted_at is zero)", repoID)
+	}
+
+	cleanResp := superadminClient.Do(t, http.MethodDelete, "/api/v2.1/admin/trash-libraries/", nil)
+	expectStatus(t, cleanResp, http.StatusOK)
+	cleanResp.Body.Close()
+
+	waitForIntegrationCondition(t, "real trashed library base row to be hard-deleted by admin clean", func() bool {
+		var gotDeletedAt time.Time
+		err := session.Query(`SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&gotDeletedAt)
+		return err == gocql.ErrNotFound
+	})
+
+	if adminTrashContainsRepo(t, superadminClient, repoID, defaultAdminEmail) {
+		t.Fatalf("repo %s still visible in admin trash after clean", repoID)
+	}
+}
+
 func TestSyncHeadUpdateKeepsLookupAndAdminProjectionAligned(t *testing.T) {
 	name := fmt.Sprintf("inttest-sync-head-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)

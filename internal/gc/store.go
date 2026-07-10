@@ -418,6 +418,19 @@ type LibraryTTLInfo struct {
 	LibraryID             uuid.UUID
 	HeadCommitID          string
 	BlockRepresentationID string
+	// RepresentationDefaulted is true when the stored block_representation_id was
+	// empty and BlockRepresentationID was derived from the library's own identity
+	// (plain:v1 / library:<id>). The derivation is safe, but an empty stored value
+	// signals a writer/migration that did not stamp it, so scanners report it as
+	// drift rather than hiding it.
+	RepresentationDefaulted bool
+	// RepresentationInvalid is true when the stored block_representation_id cannot
+	// be validated against the library's identity and encrypted flag. This includes
+	// malformed identities/representations and cross-domain values. The scanner
+	// must skip the library and report drift instead of enqueuing work under an
+	// unsafe mapping domain. BlockRepresentationID carries the raw stored value
+	// only so the drift metric can classify it.
+	RepresentationInvalid bool
 	VersionTTLDays        int
 }
 
@@ -435,6 +448,10 @@ type LibraryAutoDeleteInfo struct {
 	LibraryID             uuid.UUID
 	HeadCommitID          string
 	BlockRepresentationID string
+	// RepresentationDefaulted mirrors LibraryTTLInfo.RepresentationDefaulted.
+	RepresentationDefaulted bool
+	// RepresentationInvalid mirrors LibraryTTLInfo.RepresentationInvalid.
+	RepresentationInvalid bool
 	AutoDeleteDays        int
 }
 

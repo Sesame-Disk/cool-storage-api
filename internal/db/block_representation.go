@@ -39,11 +39,10 @@ func EncryptedLibraryBlockRepresentationID(libraryID string) string {
 	return "library:" + libraryID
 }
 
-func EffectiveBlockRepresentationID(libraryID string, encrypted bool, stored string) string {
-	stored = strings.TrimSpace(stored)
-	if stored != "" {
-		return stored
-	}
+// NewLibraryBlockRepresentationID returns the representation stamped when a
+// library is first created. Persisted rows must instead be resolved through
+// CanonicalBlockRepresentationIDForLibrary so drift cannot bypass validation.
+func NewLibraryBlockRepresentationID(libraryID string, encrypted bool) string {
 	if encrypted {
 		return EncryptedLibraryBlockRepresentationID(libraryID)
 	}
@@ -97,7 +96,7 @@ func ResolveBlockRepresentationID(session *gocql.Session, orgID, libraryID strin
 	if err != nil {
 		return "", err
 	}
-	return state.BlockRepresentationIDOrDefault(), nil
+	return CanonicalBlockRepresentationIDForLibrary(state.LibraryID, state.Encrypted, state.BlockRepresentationID)
 }
 
 func ResolveBlockRepresentationIDByLibraryID(session *gocql.Session, libraryID string) (string, error) {
@@ -105,5 +104,69 @@ func ResolveBlockRepresentationIDByLibraryID(session *gocql.Session, libraryID s
 	if err != nil {
 		return "", err
 	}
-	return state.BlockRepresentationIDOrDefault(), nil
+	return CanonicalBlockRepresentationIDForLibrary(state.LibraryID, state.Encrypted, state.BlockRepresentationID)
+}
+
+// ResolveBlockRepresentationIDForDelete resolves the effective block
+// representation for a library that is being soft- or permanently deleted.
+// Unlike ResolveBlockRepresentationID it reads the row even when deleted_at is
+// already set (a permanent delete acts on a library that is already in trash),
+// so callers can stamp block_representation_id onto the deleted_libraries GC
+// marker before the libraries row disappears. GC relies on that stamp to purge
+// the library later; without it the cascade cannot resolve the SHA-1 mapping
+// domain once the live row is gone.
+//
+// The result is guaranteed non-empty AND canonical for this library
+// (plain:v1, or library:<this-library-id>); a stored value that is malformed or
+// belongs to a different library is a hard error, so a hard-delete caller can
+// fail closed instead of stamping a marker GC would later reject as non-canonical
+// and strand in trash.
+func ResolveBlockRepresentationIDForDelete(session *gocql.Session, orgID, libraryID string) (string, error) {
+	state, err := ReadLibraryState(session, orgID, libraryID)
+	if err != nil {
+		return "", err
+	}
+	return deleteBlockRepresentationFromState(state)
+}
+
+// CanonicalBlockRepresentationIDForLibrary derives the ONE block representation
+// a library may legally use from its own identity and encrypted flag. A blank
+// stored value is defaulted to that expected representation; a non-blank stored
+// value must match exactly or it is rejected as drift/corruption.
+func CanonicalBlockRepresentationIDForLibrary(libraryID string, encrypted bool, stored string) (string, error) {
+	libUUID, err := uuid.Parse(strings.TrimSpace(libraryID))
+	if err != nil {
+		return "", fmt.Errorf("invalid library id %q: %w", libraryID, err)
+	}
+
+	expected := PlainBlockRepresentationID
+	if encrypted {
+		expected = EncryptedLibraryBlockRepresentationID(libUUID.String())
+	}
+
+	stored = strings.TrimSpace(stored)
+	if stored == "" {
+		return expected, nil
+	}
+	if stored != expected {
+		return "", fmt.Errorf("block representation %q does not match library %s encrypted=%t; expected %q", stored, libUUID, encrypted, expected)
+	}
+	return expected, nil
+}
+
+// deleteBlockRepresentationFromState is the pure derive-and-validate step of
+// ResolveBlockRepresentationIDForDelete, split out so it can be unit-tested
+// without a live session.
+//
+// It computes the ONE representation the library must have from its own identity
+// and encrypted flag — plain:v1 for plaintext, library:<id> for encrypted — and
+// requires the stored value to be empty (derive it) or exactly that value.
+// IsCanonicalBlockRepresentationForLibrary alone is insufficient here: it does
+// not see Encrypted, so it would accept a domain-crossed value that is
+// syntactically canonical for the UUID but wrong for the library, e.g. an
+// encrypted library stamped plain:v1, or a plaintext library stamped
+// library:<same-id>. Both would send GC to the wrong SHA-1 mapping domain, so
+// they are rejected.
+func deleteBlockRepresentationFromState(state LibraryState) (string, error) {
+	return CanonicalBlockRepresentationIDForLibrary(state.LibraryID, state.Encrypted, state.BlockRepresentationID)
 }

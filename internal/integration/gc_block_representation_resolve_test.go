@@ -111,6 +111,92 @@ func TestGC_GetLibraryBlockRepresentationID_DeletedLibrary_RealCassandra(t *test
 	})
 }
 
+// A missing canonical library is already-completed work during a retrying
+// user/org cascade. SoftDeleteLibrary must therefore succeed without creating a
+// deleted_libraries marker that could later trigger a phantom hard-delete.
+func TestGC_SoftDeleteLibrary_MissingLibraryIsIdempotent_RealCassandra(t *testing.T) {
+	requireCassandra(t)
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	t.Cleanup(func() {
+		_ = database.Session().Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+	})
+
+	if err := store.SoftDeleteLibrary(orgID, libraryID, uuid.New()); err != nil {
+		t.Fatalf("SoftDeleteLibrary on missing library: %v", err)
+	}
+
+	var markerLibraryID string
+	err := database.Session().Query(
+		`SELECT library_id FROM deleted_libraries WHERE library_id = ?`, libraryID.String(),
+	).Scan(&markerLibraryID)
+	if !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("deleted_libraries marker unexpectedly exists: library_id=%q err=%v", markerLibraryID, err)
+	}
+}
+
+// Policy discovery is only a projection. The Cassandra store must re-read the
+// canonical row and surface representation drift as per-row metadata so the
+// scanner can skip that library without aborting unrelated policy processing.
+func TestGC_ListLibrariesByPolicy_InvalidRepresentationIsPerRowDrift_RealCassandra(t *testing.T) {
+	requireCassandra(t)
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	store := gcpkg.NewCassandraStore(database)
+
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	headCommitID := fmt.Sprintf("policy-head-%d", time.Now().UnixNano())
+	bucket := dbpkg.GCDiscoveryBucket(libraryID.String())
+	now := time.Now().UTC()
+
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM gc_libraries_by_policy WHERE policy_type = ? AND bucket = ? AND org_id = ? AND library_id = ?`,
+			dbpkg.GCLibraryPolicyVersionTTL, bucket, orgID.String(), libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	// An encrypted library stamped plain:v1 is canonical in shape but belongs to
+	// the wrong mapping domain and must never be queued for GC.
+	if err := session.Query(`
+		INSERT INTO libraries (
+			org_id, library_id, encrypted, block_representation_id,
+			head_commit_id, version_ttl_days, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID.String(), libraryID.String(), true, dbpkg.PlainBlockRepresentationID,
+		headCommitID, 30, now, now).Exec(); err != nil {
+		t.Fatalf("seed libraries policy row: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO gc_libraries_by_policy (
+			policy_type, bucket, org_id, library_id, days, cached_head_commit_id, policy_updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, dbpkg.GCLibraryPolicyVersionTTL, bucket, orgID.String(), libraryID.String(), 30, headCommitID, now).Exec(); err != nil {
+		t.Fatalf("seed gc_libraries_by_policy: %v", err)
+	}
+
+	rows, err := store.ListLibrariesWithVersionTTL()
+	if err != nil {
+		t.Fatalf("ListLibrariesWithVersionTTL: %v", err)
+	}
+	for _, row := range rows {
+		if row.OrgID != orgID || row.LibraryID != libraryID {
+			continue
+		}
+		if !row.RepresentationInvalid {
+			t.Fatalf("RepresentationInvalid = false, want true: %+v", row)
+		}
+		if row.BlockRepresentationID != dbpkg.PlainBlockRepresentationID {
+			t.Fatalf("raw representation = %q, want %q", row.BlockRepresentationID, dbpkg.PlainBlockRepresentationID)
+		}
+		return
+	}
+	t.Fatalf("seeded policy row %s/%s was not returned", orgID, libraryID)
+}
+
 // TestGC_ResolveBlockIDs_AmbiguousDualProbe_RealCassandra is the DB-level
 // integration counterpart to
 // TestMockStore_ResolveBlockIDs_DualProbeAmbiguousLeavesUnresolvedAndCountsMetric:

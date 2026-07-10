@@ -255,6 +255,19 @@ var (
 		[]string{"action"},
 	)
 
+	// LibraryDeleteRepresentationResolutionFailures counts library delete
+	// operations that could not resolve a canonical block representation before
+	// writing the GC marker. A non-zero rate signals a delete path or migration
+	// that would leave a library un-purgeable; labelled by operation only (no
+	// org/library id — those stay in the structured log).
+	LibraryDeleteRepresentationResolutionFailures = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_library_delete_representation_resolution_failures_total",
+			Help: "Library delete operations where block representation resolution failed, by operation.",
+		},
+		[]string{"operation"},
+	)
+
 	// ChunkUploadTempOrphansCleaned counts stale chunked-upload temp files
 	// reaped by the ChunkManager janitor goroutine.
 	ChunkUploadTempOrphansCleaned = prometheus.NewCounterVec(
@@ -479,6 +492,7 @@ func Register() {
 		GCActiveOrgRecoveriesTotal,
 		GCWorkerLastSuccessTimestamp,
 		GCAuditEventsTotal,
+		LibraryDeleteRepresentationResolutionFailures,
 		ChunkUploadTempOrphansCleaned,
 		ChunkUploadFinalizationAttemptsTotal,
 		ChunkUploadFinalizeOutcomeCacheEntries,

@@ -656,7 +656,7 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	}
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	blockRepresentationID := dbpkg.EffectiveBlockRepresentationID(newLibID, false, "")
+	blockRepresentationID := dbpkg.NewLibraryBlockRepresentationID(newLibID, false)
 	batch.Query(`
 		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, block_representation_id, storage_class, size_bytes, file_count, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
