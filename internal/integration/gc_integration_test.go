@@ -29,6 +29,42 @@ import (
 // Prerequisite helpers
 // ---------------------------------------------------------------------------
 
+func TestGC_ListAllGroupSharesDiscoversPartitionWithoutGroupRow(t *testing.T) {
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	orgID, groupID, libraryID, shareID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	createdAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	if err := session.Query(`
+		INSERT INTO shares_by_group
+		(org_id, group_id, created_at, library_id, share_id, permission)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, orgID.String(), groupID.String(), createdAt, libraryID.String(), shareID.String(), "r").Exec(); err != nil {
+		t.Fatalf("seed orphan group-share projection: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := session.Query(`
+			DELETE FROM shares_by_group
+			WHERE org_id = ? AND group_id = ? AND created_at = ? AND library_id = ? AND share_id = ?
+		`, orgID.String(), groupID.String(), createdAt, libraryID.String(), shareID.String()).Exec(); err != nil {
+			t.Errorf("cleanup orphan group-share projection: %v", err)
+		}
+	})
+
+	// Deliberately do not insert a groups row. The production store must enumerate
+	// the share projection itself rather than depending on the deleted group.
+	rows, err := gcpkg.NewCassandraStore(database).ListAllGroupShares()
+	if err != nil {
+		t.Fatalf("ListAllGroupShares: %v", err)
+	}
+	for _, row := range rows {
+		if row.OrgID == orgID && row.SharedTo == groupID && row.LibraryID == libraryID && row.ShareID == shareID {
+			return
+		}
+	}
+	t.Fatal("orphan shares_by_group partition was not discovered without a groups row")
+}
+
 // requireGCEnabled skips the test if the GC admin endpoint is not reachable
 // or GC is disabled.
 func requireGCEnabled(t *testing.T) {

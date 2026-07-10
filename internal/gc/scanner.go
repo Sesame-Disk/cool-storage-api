@@ -1017,7 +1017,11 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 
 	// Cache group existence checks to avoid repeated lookups. Group existence is
 	// keyed by (org_id, group_id) in the data model, so cache on both.
-	groupExistsCache := make(map[string]bool)
+	type groupExistenceKey struct {
+		orgID   uuid.UUID
+		groupID uuid.UUID
+	}
+	groupExistsCache := make(map[groupExistenceKey]bool)
 
 	cleaned := 0
 	failed := 0
@@ -1029,8 +1033,8 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 		default:
 		}
 
-		// Resolve the group's org. Prefer the authoritative org_id carried on the
-		// share record (ListAllGroupShares derives it from the groups table); only
+		// Resolve the group's org. Prefer the org_id carried by the group-share
+		// projection row; only
 		// fall back to the library→org projection when it is absent, and surface that
 		// fallback failure instead of silently skipping a share we could not classify.
 		orgID := gs.OrgID
@@ -1051,7 +1055,7 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 			orgID = resolvedOrgID
 		}
 
-		cacheKey := orgID.String() + ":" + gs.SharedTo.String()
+		cacheKey := groupExistenceKey{orgID: orgID, groupID: gs.SharedTo}
 		exists, cached := groupExistsCache[cacheKey]
 		if !cached {
 			// Fail closed: a GroupExists error must NOT be read as "group gone",

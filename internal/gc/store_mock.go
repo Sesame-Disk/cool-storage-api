@@ -163,6 +163,7 @@ type MockStore struct {
 	getBlockRefCountErr            error
 	libraryExistsErr               error
 	groupExistsErr                 error
+	findOrgForLibraryErr           error
 	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
 
 	// optional test hooks for reproducing concurrency windows deterministically.
@@ -2282,6 +2283,9 @@ func (m *MockStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
 func (m *MockStore) FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.findOrgForLibraryErr != nil {
+		return uuid.Nil, m.findOrgForLibraryErr
+	}
 
 	lib, ok := m.libraries[libraryID]
 	if ok {

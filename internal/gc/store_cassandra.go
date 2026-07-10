@@ -3179,34 +3179,25 @@ func (s *CassandraStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo,
 	return results, nil
 }
 
-// ListAllGroupShares returns all group shares for the scanner.
-// This scans groups, then reads each group's partition from shares_by_group.
+// ListAllGroupShares returns all group-share projection rows for the scanner.
+// Scan the projection directly: enumerating groups first cannot discover a
+// shares_by_group partition after its group row has already been deleted.
 func (s *CassandraStore) ListAllGroupShares() ([]GroupShareInfo, error) {
-	groupIter := s.db.Session().Query(`
-		SELECT org_id, group_id FROM groups
+	iter := s.db.Session().Query(`
+		SELECT org_id, group_id, library_id, share_id FROM shares_by_group
 	`).Iter()
-
 	var results []GroupShareInfo
-	var orgIDStr, groupIDStr string
-	for groupIter.Scan(&orgIDStr, &groupIDStr) {
-		shareIter := s.db.Session().Query(`
-			SELECT library_id, share_id FROM shares_by_group WHERE org_id = ? AND group_id = ?
-		`, orgIDStr, groupIDStr).Iter()
-		var libIDStr, shareIDStr string
-		for shareIter.Scan(&libIDStr, &shareIDStr) {
-			results = append(results, GroupShareInfo{
-				LibraryID:    parseUUID(libIDStr),
-				ShareID:      parseUUID(shareIDStr),
-				SharedTo:     parseUUID(groupIDStr),
-				SharedToType: "group",
-				OrgID:        parseUUID(orgIDStr),
-			})
-		}
-		if err := shareIter.Close(); err != nil {
-			return nil, fmt.Errorf("failed to list shares for group %s: %w", groupIDStr, err)
-		}
+	var orgIDStr, groupIDStr, libIDStr, shareIDStr string
+	for iter.Scan(&orgIDStr, &groupIDStr, &libIDStr, &shareIDStr) {
+		results = append(results, GroupShareInfo{
+			LibraryID:    parseUUID(libIDStr),
+			ShareID:      parseUUID(shareIDStr),
+			SharedTo:     parseUUID(groupIDStr),
+			SharedToType: "group",
+			OrgID:        parseUUID(orgIDStr),
+		})
 	}
-	if err := groupIter.Close(); err != nil {
+	if err := iter.Close(); err != nil {
 		return nil, fmt.Errorf("failed to list group shares: %w", err)
 	}
 	return results, nil

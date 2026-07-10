@@ -894,7 +894,7 @@ func TestScanner_ScanOrphanedGroupShares_UsesShareOrgIDWithoutLibraryLookup(t *t
 	libID := uuid.New()
 	shareID := uuid.New()
 	store.AddOrganization(orgID)
-	store.AddLibrary(orgID, libID, "hot")               // stamps gs.OrgID on the share
+	store.AddLibrary(orgID, libID, "hot") // stamps gs.OrgID on the share
 	store.AddGroupShare(libID, shareID, missingGroupID)
 
 	// Break the library→org projection: FindOrgForLibrary can no longer resolve.
@@ -914,6 +914,61 @@ func TestScanner_ScanOrphanedGroupShares_UsesShareOrgIDWithoutLibraryLookup(t *t
 	defer store.mu.RUnlock()
 	if _, ok := store.shares[fmt.Sprintf("%s:%s", libID, shareID)]; ok {
 		t.Fatal("orphaned group share was not cleaned even though the share carried its org_id")
+	}
+}
+
+func TestScanner_ScanOrphanedGroupShares_FailClosedWhenOrgCannotBeResolved(t *testing.T) {
+	store := NewMockStore()
+	s := NewScanner(store, NewQueue(store), &Stats{}, config.GCConfig{})
+
+	libID := uuid.New()
+	shareID := uuid.New()
+	store.AddGroupShare(libID, shareID, uuid.New()) // no library: legacy row has no OrgID
+	sentinel := errors.New("library org projection unavailable")
+	store.findOrgForLibraryErr = sentinel
+
+	n, err := s.scanOrphanedGroupShares(context.Background())
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected org-resolution error, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected no cleanup when org resolution fails, got %d", n)
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", libID, shareID)]; !ok {
+		t.Fatal("share was deleted despite unresolved org")
+	}
+}
+
+func TestScanner_ScanOrphanedGroupShares_CacheIsScopedByOrg(t *testing.T) {
+	store := NewMockStore()
+	s := NewScanner(store, NewQueue(store), &Stats{}, config.GCConfig{})
+
+	groupID := uuid.New()
+	liveOrgID, orphanOrgID := uuid.New(), uuid.New()
+	liveLibID, orphanLibID := uuid.New(), uuid.New()
+	liveShareID, orphanShareID := uuid.New(), uuid.New()
+	store.AddLibrary(liveOrgID, liveLibID, "hot")
+	store.AddLibrary(orphanOrgID, orphanLibID, "hot")
+	store.AddGroupForOrg(liveOrgID, groupID)
+	store.AddGroupShare(liveLibID, liveShareID, groupID)
+	store.AddGroupShare(orphanLibID, orphanShareID, groupID)
+
+	n, err := s.scanOrphanedGroupShares(context.Background())
+	if err != nil {
+		t.Fatalf("scanOrphanedGroupShares returned error: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected only the orphan-org share cleaned, got %d", n)
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", liveLibID, liveShareID)]; !ok {
+		t.Fatal("live-org share was deleted through a cross-org cache collision")
+	}
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", orphanLibID, orphanShareID)]; ok {
+		t.Fatal("orphan-org share was retained through a cross-org cache collision")
 	}
 }
 

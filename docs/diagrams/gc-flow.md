@@ -6,7 +6,7 @@
 > and write-ahead `gc_s3_orphans`. The retired `blocks.ref_count = -999` protocol is preserved
 > in Git history, not in this live diagram. The physical block-delete sequence is conservative,
 > and the transient-error fail-open in orphan classification (P6a) is now fixed (1D); a narrower
-> drift-only execution-time revalidation gap (P6b) remains. Full audit:
+> projection/TOCTOU execution-time revalidation gap (P6b) remains. Full audit:
 > [../GC-DELETE-CLEANUP-INVESTIGATION.md](../GC-DELETE-CLEANUP-INVESTIGATION.md).
 
 ## 1. Worker loop
@@ -75,7 +75,8 @@ flowchart TD
 
 Scanner-created orphan work runs with `RequiresLibraryDeletedCheck=false`. P6a closed the fail-open
 existence read that fed it destructive work; an execution-time canonical-library revalidation guard
-(P6b, `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`) remains pending as defense-in-depth against drift.
+(P6b, `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`) remains pending against projection drift and
+scanner→worker state changes.
 
 ## 4. Library delete and purge handoff
 

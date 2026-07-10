@@ -9,7 +9,7 @@ plan integration tests for long-running monitoring.
 > verified follow-up debt P1–P7. The physical block-delete claim/recovery protocol is
 > conservative. P6a (Cassandra existence-read failures interpreted as "missing", enqueuing
 > destructive work for live libraries on a transient error) is now **fixed** (branch 1D):
-> existence reads fail closed and Phases 3/4/9 surface the error. A narrower drift-only gap
+> existence reads fail closed and Phases 3/4/9 surface the error. A narrower projection/TOCTOU gap
 > remains (P6b, Medium, `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`): orphan items are not
 > revalidated against the canonical `libraries` table at execution time. P7 records that
 > markerless commit/fs_object partitions are still invisible to current orphan discovery.
@@ -338,7 +338,7 @@ worker must never touch unrelated org work.
 
 The physical block claim/recheck/recovery sequence is conservative **given correct classification**.
 The transient-error fail-open existence read (P6a) that was the broad end-to-end safety exception is
-now fixed (1D). A narrower drift-only gap remains (P6b, Medium): orphan commit/fs_object items are
+now fixed (1D). A narrower projection/TOCTOU gap remains (P6b, Medium): orphan commit/fs_object items are
 not revalidated against the canonical `libraries` table at execution time
 (`ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`). The remaining P1–P5/P7 issues primarily retain or delay
 garbage rather than deleting referenced blocks.
