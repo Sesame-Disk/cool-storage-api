@@ -841,6 +841,113 @@ func TestScanner_ScanOrphanedGroupShares(t *testing.T) {
 	t.Fatalf("live group share was incorrectly removed")
 }
 
+// Regression for P6 (ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01): a transient error on
+// the group-existence read must NOT be read as "group deleted" — that would drop a
+// valid group share. Fail closed: skip the share and surface the error.
+func TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	groupID := uuid.New()
+	libID := uuid.New()
+	shareID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot")
+	store.AddGroupForOrg(orgID, groupID) // group genuinely EXISTS
+	store.AddGroupShare(libID, shareID, groupID)
+
+	sentinel := errors.New("cassandra unavailable")
+	store.groupExistsErr = sentinel
+
+	n, err := s.scanOrphanedGroupShares(context.Background())
+	if err == nil {
+		t.Fatal("expected scanOrphanedGroupShares to surface the group-existence error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected the surfaced error to wrap the sentinel, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 shares cleaned on existence error, got %d", n)
+	}
+
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", libID, shareID)]; !ok {
+		t.Fatal("valid group share was deleted despite a transient group-existence error (fail-open regression)")
+	}
+}
+
+// Regression for P6: a transient LibraryExists error in Phase 3 must NOT be treated
+// as "library gone" and enqueue a live library's commits for deletion.
+func TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot") // live library with resolvable org
+	store.AddCommit(libID, "commit-1", "fs-root-1")
+
+	sentinel := errors.New("cassandra unavailable")
+	store.libraryExistsErr = sentinel
+
+	n, err := s.scanOrphanedCommits(context.Background())
+	if err == nil {
+		t.Fatal("expected scanOrphanedCommits to surface the existence-check error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected the surfaced error to wrap the sentinel, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 commits enqueued on existence error, got %d", n)
+	}
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemCommit {
+			t.Fatal("live library commit was enqueued for deletion despite an existence-check error (fail-open regression)")
+		}
+	}
+}
+
+// Regression for P6: a transient LibraryExists error in Phase 4 must NOT be treated
+// as "library gone" and enqueue a live library's fs_objects for deletion.
+func TestScanner_ScanOrphanedFSObjects_FailClosedOnLibraryExistsError(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot")
+	store.AddFSObject(libID, "fs-1", "file", []string{"blk-1"})
+
+	sentinel := errors.New("cassandra unavailable")
+	store.libraryExistsErr = sentinel
+
+	n, err := s.scanOrphanedFSObjects(context.Background())
+	if err == nil {
+		t.Fatal("expected scanOrphanedFSObjects to surface the existence-check error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected the surfaced error to wrap the sentinel, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 fs_objects enqueued on existence error, got %d", n)
+	}
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemFSObject {
+			t.Fatal("live library fs_object was enqueued for deletion despite an existence-check error (fail-open regression)")
+		}
+	}
+}
+
 func TestScanner_ScanOrphanedCommits(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

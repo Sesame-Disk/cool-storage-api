@@ -2273,7 +2273,14 @@ func (s *CassandraStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
 		SELECT library_id FROM libraries_by_id WHERE library_id = ?
 	`, libraryID.String()).Scan(&existingLibIDStr)
 	if err != nil {
-		return false, nil // Not found
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil // genuinely absent
+		}
+		// Fail closed: a transient read error must NOT be reported as "missing".
+		// Callers (scanner Phases 3/4/9, the worker delete guard) treat "missing"
+		// as license to enqueue/delete a library's content, so swallowing the error
+		// here could destroy a live library on a Cassandra blip.
+		return false, fmt.Errorf("check library existence for %s: %w", libraryID, err)
 	}
 	return true, nil
 }
@@ -3211,7 +3218,13 @@ func (s *CassandraStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) {
 		SELECT name FROM groups WHERE org_id = ? AND group_id = ?
 	`, orgID.String(), groupID.String()).Scan(&name)
 	if err != nil {
-		return false, nil
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil // genuinely absent
+		}
+		// Fail closed: Phase 9 deletes a group share when the group is reported
+		// absent, so a transient read error must surface as an error rather than
+		// masquerading as "group deleted" and dropping a valid share.
+		return false, fmt.Errorf("check group existence for %s/%s: %w", orgID, groupID, err)
 	}
 	return true, nil
 }

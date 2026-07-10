@@ -5,7 +5,8 @@
 > Current model: keyed `block_references`, durable candidates, LWT claim + live-ref recheck,
 > and write-ahead `gc_s3_orphans`. The retired `blocks.ref_count = -999` protocol is preserved
 > in Git history, not in this live diagram. The physical block-delete sequence is conservative,
-> but end-to-end safety is blocked by fail-open orphan classification (P6). Full audit:
+> and the fail-open orphan classification that blocked end-to-end safety (P6) is now fixed (1D).
+> Full audit:
 > [../GC-DELETE-CLEANUP-INVESTIGATION.md](../GC-DELETE-CLEANUP-INVESTIGATION.md).
 
 ## 1. Worker loop
@@ -50,9 +51,9 @@ flowchart TD
     Mapping --> Clear[Clear orphan + candidate]
 ```
 
-The sequence above is safe **given correct upstream classification/reference ownership**. P6 can
-incorrectly enqueue live fs_objects, causing GC itself to remove legitimate `fs:` refs before this
-block protocol runs.
+The sequence above is safe **given correct upstream classification/reference ownership**. The P6
+fail-open path that could enqueue live fs_objects (causing GC itself to remove legitimate `fs:`
+refs before this block protocol runs) is now fixed: existence reads fail closed (1D).
 
 ## 3. FS object cleanup
 
@@ -72,7 +73,8 @@ flowchart TD
     Candidate --> DeleteFS
 ```
 
-Scanner-created orphan work currently lacks the deleted-library guard and is part of P6.
+Scanner-created orphan work lacks the deleted-library guard, so P6 closed the fail-open existence
+read that fed it destructive work; a defense-in-depth execution-time guard remains possible future work.
 
 ## 4. Library delete and purge handoff
 
@@ -127,7 +129,7 @@ Important limits:
 
 - P3/P4 discovery currently enumerates only `libraries_by_id` + `deleted_libraries`, so
   markerless artifact partitions are invisible (audit P7).
-- `LibraryExists`/`GroupExists` currently fail open on Cassandra errors (audit P6).
+- `LibraryExists`/`GroupExists` now fail **closed** on Cassandra errors (audit P6, fixed 1D).
 - `up:` expiry has durable discovery; `pub:` expiry does not (audit P4).
 - Phase 13 currently logs some delivery failures without returning them (audit P5).
 

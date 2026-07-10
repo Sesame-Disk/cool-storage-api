@@ -161,6 +161,8 @@ type MockStore struct {
 	acquireOrgHardDeleteLockHook   func(orgID uuid.UUID)
 	beginOrgPurgeHook              func(orgID uuid.UUID)
 	getBlockRefCountErr            error
+	libraryExistsErr               error
+	groupExistsErr                 error
 	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
 
 	// optional test hooks for reproducing concurrency windows deterministically.
@@ -2270,6 +2272,9 @@ func (m *MockStore) ListDistinctFSObjectLibraries() ([]uuid.UUID, error) {
 func (m *MockStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.libraryExistsErr != nil {
+		return false, m.libraryExistsErr
+	}
 	_, ok := m.libraries[libraryID]
 	return ok, nil
 }
@@ -2750,6 +2755,9 @@ func (m *MockStore) ListAllGroupShares() ([]GroupShareInfo, error) {
 func (m *MockStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.groupExistsErr != nil {
+		return false, m.groupExistsErr
+	}
 	return m.groups[fmt.Sprintf("%s:%s", orgID, groupID)], nil
 }
 func (m *MockStore) WriteAuditLog(entry AuditLogEntry) error {

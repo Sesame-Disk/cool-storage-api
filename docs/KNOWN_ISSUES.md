@@ -58,9 +58,9 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 ### 🔴 GC Library-Delete Cleanup Audit (2026-07-10)
 
 Follow-up debt from the PR #123 audit. The physical block-delete protocol is conservative
-(claim→recovery→delete ordering, fail-closed representation validation), but the end-to-end
-scanner pipeline has a High fail-open existence check (P6) that can enqueue destructive work
-for live libraries. P1–P5/P7 are reclamation/durability gaps. Full audit:
+(claim→recovery→delete ordering, fail-closed representation validation). The High fail-open
+existence check (P6) that could enqueue destructive work for live libraries is **fixed** (branch
+1D, 2026-07-10); P1–P5/P7 are the remaining reclamation/durability gaps. Full audit:
 `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`. Close on small, auditable branches.
 
 | Issue | Status | Details |
@@ -71,7 +71,7 @@ for live libraries. P1–P5/P7 are reclamation/durability gaps. Full audit:
 | **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
 | **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
-| **Existence Checks Fail Open** | 🔴 Confirmed safety gap (High) | `LibraryExists`/`GroupExists` swallow Cassandra errors as "missing"; scanners can enqueue/delete live library metadata/refs or valid group shares. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
+| **Existence Checks Fail Open** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors; scanner Phases 3/4/9 fail closed on existence errors. Regression tests added. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
 | **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (High/Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
 | **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Former E3 is escalated to the High P6 issue. See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
 | **No Reconcile/Backfill for Existing Orphans** | 🟡 Follow-up | Existing clusters may hold blocks/S3 objects/stale policy rows orphaned by the gaps above. Needs a read-only-first reconcile pass, not blind truncation. See ISSUE-GC-RECONCILE-BACKFILL-01 below. |
@@ -3698,9 +3698,19 @@ Keep processing all markers, accumulate errors (`errors.Join`), return the joine
 
 ### ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01: Scanner Existence Reads Can Fail Open
 
-**Status**: 🔴 Confirmed safety gap (2026-07-10)
-**Severity**: High — a transient Cassandra read failure can lead to destructive work for a live library
+**Status**: ✅ Fixed (2026-07-10, branch `fix/gc-existence-check-failopen` / roadmap 1D)
+**Severity**: High — a transient Cassandra read failure could lead to destructive work for a live library
 **Affected**: `LibraryExists`, `GroupExists`, scanner Phases 3/4/9, commit/fs_object worker guard
+
+#### Resolution
+
+- `LibraryExists` and `GroupExists` now return `(false, nil)` **only** for `gocql.ErrNotFound` and propagate every other error ([store_cassandra.go:2270-2283](../internal/gc/store_cassandra.go#L2270), [store_cassandra.go:3208-3222](../internal/gc/store_cassandra.go#L3208)).
+- Phase 9 no longer discards the `GroupExists` error — on error it skips the share (never deletes it) and records a phase error ([scanner.go:1013-1032](../internal/gc/scanner.go#L1013)).
+- Phases 3/4 handle the `LibraryExists` error explicitly (skip + surface `phaseErr`) so a transient read cannot enqueue a live library's commits/fs_objects ([scanner.go:531-546](../internal/gc/scanner.go#L531), [scanner.go:607-622](../internal/gc/scanner.go#L607)).
+- The worker guard (`acquireLibraryDeleteGuard`) already propagated `LibraryExists` errors; with the store fix it is now genuinely fail-closed.
+- Regression tests inject a transient existence error and assert no live commit/fs_object is enqueued and no valid group share is deleted: `TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError`, `TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError`, `TestScanner_ScanOrphanedFSObjects_FailClosedOnLibraryExistsError` (`internal/gc/scanner_test.go`). MockStore gained `libraryExistsErr`/`groupExistsErr` injection hooks.
+
+The original analysis is retained below for provenance.
 
 #### Problem
 

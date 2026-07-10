@@ -521,6 +521,7 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 	}
 
 	enqueued := 0
+	var phaseErr error
 	for _, libID := range libraryIDs {
 		select {
 		case <-ctx.Done():
@@ -528,8 +529,17 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 		default:
 		}
 
+		// Fail closed: a LibraryExists error must NOT be treated as "library gone"
+		// (that would enqueue a live library's commits for deletion). Skip and surface.
 		exists, err := s.store.LibraryExists(libID)
-		if err != nil || exists {
+		if err != nil {
+			log.Printf("[GC Scanner] Phase 3: library existence check failed for %s; skipping: %v", libID, err)
+			if phaseErr == nil {
+				phaseErr = err
+			}
+			continue
+		}
+		if exists {
 			continue
 		}
 
@@ -584,7 +594,7 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 	log.Printf("[GC Scanner] Phase 3 complete: enqueued %d orphaned commits", enqueued)
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("orphaned_commits").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("orphaned_commits").SetToCurrentTime()
-	return enqueued, nil
+	return enqueued, phaseErr
 }
 
 // scanOrphanedFSObjects finds fs_objects whose library no longer exists.
@@ -597,6 +607,7 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 	}
 
 	enqueued := 0
+	var phaseErr error
 	for _, libID := range libraryIDs {
 		select {
 		case <-ctx.Done():
@@ -604,8 +615,17 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 		default:
 		}
 
+		// Fail closed: a LibraryExists error must NOT be treated as "library gone"
+		// (that would enqueue a live library's fs_objects for deletion). Skip and surface.
 		exists, err := s.store.LibraryExists(libID)
-		if err != nil || exists {
+		if err != nil {
+			log.Printf("[GC Scanner] Phase 4: library existence check failed for %s; skipping: %v", libID, err)
+			if phaseErr == nil {
+				phaseErr = err
+			}
+			continue
+		}
+		if exists {
 			continue
 		}
 
@@ -657,7 +677,7 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 	log.Printf("[GC Scanner] Phase 4 complete: enqueued %d orphaned fs_objects", enqueued)
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("orphaned_fs_objects").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("orphaned_fs_objects").SetToCurrentTime()
-	return enqueued, nil
+	return enqueued, phaseErr
 }
 
 // scanExpiredVersions finds commits older than the library's version_ttl_days
@@ -1017,7 +1037,18 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 			if err != nil || orgID == uuid.Nil {
 				continue
 			}
-			exists, _ = s.store.GroupExists(orgID, gs.SharedTo)
+			// Fail closed: a GroupExists error must NOT be read as "group gone",
+			// which would delete a valid share. Skip this share and surface the error.
+			groupExists, err := s.store.GroupExists(orgID, gs.SharedTo)
+			if err != nil {
+				log.Printf("[GC Scanner] Phase 9: group existence check failed for group %s (library %s); skipping share: %v", gs.SharedTo, gs.LibraryID, err)
+				failed++
+				if phaseErr == nil {
+					phaseErr = err
+				}
+				continue
+			}
+			exists = groupExists
 			groupExistsCache[gs.SharedTo] = exists
 		}
 
