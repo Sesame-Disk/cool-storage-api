@@ -10,7 +10,9 @@
 > (`ISSUE-GC-*` in [../KNOWN_ISSUES.md](../KNOWN_ISSUES.md)). Key gaps to keep in mind while
 > reading: org-admin trash deletes skip the immediate cascade/counter/tags, the superadmin
 > enqueue is a fire-and-forget goroutine, and `pub:` refs have no discoverable zero-ref
-> transition (unlike `up:`). The physical block-delete protocol below is **verified safe**.
+> transition (unlike `up:`). **No live-block-deletion flaw was identified** in the physical
+> block-delete protocol below (conservative claim/revalidate/recovery fences); the confirmed
+> gaps concern delayed or missing reclamation.
 
 ### How to read colors
 

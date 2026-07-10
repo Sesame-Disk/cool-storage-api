@@ -8,8 +8,9 @@ plan integration tests for long-running monitoring.
 > **See also (2026-07-10 delete-path audit):** the library-delete → cascade handoff has
 > verified follow-up debt — org-admin trash deletes defer cleanup to the retention window,
 > a non-durable goroutine handoff, a stale policy index, `pub:` refs with no discoverable
-> zero-ref transition, and Phase 13 swallowing enqueue errors (P1–P5). The block-delete
-> engine itself is **verified safe**. Full audit:
+> zero-ref transition, and Phase 13 logging-but-not-propagating enqueue errors (P1–P5). Plus
+> five low-severity worker/scanner robustness items (E1–E5). **No live-block-deletion flaw was
+> identified** in the physical block-delete protocol. Full audit:
 > [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md);
 > per-item issues: `ISSUE-GC-*` in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 

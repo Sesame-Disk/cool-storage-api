@@ -2065,16 +2065,27 @@ on that metric to bound leaked forward mappings.
 
 ## 31. GC Library-Delete Cleanup Audit Follow-ups (2026-07-10)
 
-A cross-agent audit after PR #123 (`fix/gc-block-representation-durability`) verified the
-block-delete **engine is safe** but the **library-delete → cascade handoff is not fully durable
-or optimal**. Full audit and code citations: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`. Per-item
+A cross-agent audit after PR #123 (`fix/gc-block-representation-durability`) found **no
+live-block-deletion flaw** in the block-delete protocol, but the **library-delete → cascade
+handoff is not fully durable or optimal**. Full audit and code citations:
+`docs/GC-DELETE-CLEANUP-INVESTIGATION.md`. Per-item
 issues: `ISSUE-GC-*` in `docs/KNOWN_ISSUES.md`. This extends the earlier §10 (Library Deletion:
 Cleanup Paths) — those paths are functionally correct but leave the durability/optimality debt below.
 
-**Verified-safe (no debt):** the physical block delete uses claim-then-verify LWT, registers
-`gc_s3_orphans` recovery before deleting the canonical row, orders DB→S3→mapping, guards against
-resurrection, and validates the block representation fail-closed. The risk profile is "fails to
-reclaim garbage", never "deletes live data".
+**No live-block-deletion flaw identified (conservative protocol):** the physical block delete
+uses claim-then-verify LWT, registers `gc_s3_orphans` recovery before deleting the canonical
+row, orders DB→S3→mapping, guards against resurrection, and validates the block representation
+fail-closed. A code audit cannot prove a universal "never", but no path in the reviewed
+sequence deletes a live block. The confirmed risk profile is "fails to reclaim garbage" /
+"reclaims late", not "deletes live data".
+
+**Engine-level robustness debt (E1–E5, low-severity, `ISSUE-GC-ENGINE-ROBUSTNESS-01`).** A
+worker/scanner review found: `postponeItem` re-queues lock-contended items without a bound or
+metric; `dryRun` is written under `s.mu` but read racily in the worker; `scanOrphaned*` silence
+`LibraryExists` errors and treat them as "exists"; `gc_pending_items` has no TTL; S3-orphan
+recovery relies on the leader lease with no per-row LWT. All are fragility/observability, not
+data loss. Three louder-sounding claims (mid-cascade DLQ loop, missing `pending_s3` resurrection
+guard, child/parent enqueue race) were reviewed and found NOT to be bugs — see the audit doc.
 
 ### Deferred / by-design debt
 

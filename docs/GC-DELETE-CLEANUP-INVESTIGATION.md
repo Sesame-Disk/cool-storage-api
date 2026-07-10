@@ -11,14 +11,17 @@ architectural invariants, and the branch roadmap live in the
 section at the end. The `F1`–`F4` findings below are the original notes, now annotated
 with their verified status.
 
-> **TL;DR of the verified audit:** the block-delete **engine is safe** (crash-safe
-> claim→recovery→delete ordering, fail-closed representation validation). The "garbage
-> after tests" is **mostly test hygiene** (the GC daemon does not run in the integration
-> suite; one test injects a permanent fake `pub:` ref with no cleanup). There are still
-> a handful of **real production gaps** (org-admin trash deletes defer cleanup up to the
-> retention window; non-durable goroutine handoff; stale policy index; `pub:` refs lack a
-> discoverable zero-ref transition; Phase 13 swallows enqueue errors) — tracked as
-> `ISSUE-GC-*` in `docs/KNOWN_ISSUES.md`.
+> **TL;DR of the verified audit:** **no live-block-deletion flaw was identified** in the
+> reviewed block-delete protocol — it is conservative (claim-then-verify LWT,
+> write-ahead crash recovery, fail-closed representation validation), though a code audit
+> cannot prove a universal "never". The "garbage after tests" is **mostly test hygiene**
+> (the GC daemon does not run in the integration suite; one test injects a permanent fake
+> `pub:` ref with no cleanup). There are still a handful of **real production gaps**
+> (org-admin trash deletes defer cleanup up to the retention window; non-durable goroutine
+> handoff; stale policy index; `pub:` refs lack a discoverable zero-ref transition; Phase 13
+> logs delivery failures but does not propagate them to the phase result/metrics) — tracked
+> as `ISSUE-GC-*` in `docs/KNOWN_ISSUES.md`. The confirmed gaps all concern **delayed or
+> missing reclamation**, never deletion of live data.
 
 ## Context
 
@@ -98,11 +101,16 @@ and may have their own cleanup path that is not wired to library deletion.
 
 ### F2 — [Med] `gc_libraries_by_policy` stale entries after direct delete
 
-> **VERIFIED STATUS (2026-07-10): confirmed, benign.** `hardDeleteLibraryRowsFn`
+> **VERIFIED STATUS (2026-07-10): confirmed, benign.** The policy-index rows are
+> maintained by the policy-setting endpoints (`library_settings.go` disabling
+> `version_ttl`/`auto_delete`, `admin_libraries.go` history edit), by `rollbackNewLibrary`
+> ([write_helpers.go:872-873](../internal/api/v2/write_helpers.go#L872)), and by the GC
+> cascade's `HardDeleteLibrary`
+> ([store_cassandra.go:3816-3817](../internal/gc/store_cassandra.go#L3816)). The confirmed
+> gap is that the shared **direct hard-delete helper** `hardDeleteLibraryRowsFn`
 > ([library_delete_helpers.go:29-41](../internal/api/v2/library_delete_helpers.go#L29))
-> does not call `AddDeleteLibraryPolicyQuery`; only the cascade's `HardDeleteLibrary`
-> ([store_cassandra.go:3809](../internal/gc/store_cassandra.go#L3809)) and
-> `rollbackNewLibrary` do. Scanner re-validates the `libraries` row and skips on
+> does **not** include the `AddDeleteLibraryPolicyQuery` deletes, so direct-delete paths can
+> leave stale index rows. Scanner re-validates the `libraries` row and skips on
 > `ErrNotFound`, so no mis-processing — just accumulation. Tracked as
 > `ISSUE-GC-POLICY-INDEX-STALE-01` (branch 2).
 
@@ -125,16 +133,22 @@ delete paths.
 
 ### F3 — [Med] Tests may bypass canonical delete paths and manufacture drift
 
-> **VERIFIED STATUS (2026-07-10): corrected.** The two files named below are, on
-> re-inspection, **well-sanitized** — both stamp/register a `t.Cleanup` (or snapshot+restore
-> guarded by `t.Failed()`) for every seeded row. The **real** residue lives elsewhere:
-> (a) `TestWebBlockUploadForeignPubRefNotPermanent` injecting a permanent fake `pub:` ref
-> with no cleanup ([web_block_upload_test.go:949](../internal/integration/web_block_upload_test.go#L949));
-> (b) the many E2E tests that upload **real** blocks to MinIO with **no S3 teardown** (only
-> `gc_s3_deletion_test.go` ever deletes an object), because the GC daemon never runs in the
-> suite to reclaim them. Root cause is a **shared keyspace + shared bucket with no global
+> **VERIFIED STATUS (2026-07-10): mixed.**
+> `gc_block_representation_resolve_test.go` intentionally constructs unstamped legacy
+> markers and removes them through fixture cleanup; that raw CQL is a legitimate part of the
+> scenario. `library_projection_regression_test.go`, however, still has a **failure-only**
+> restore path (`if !t.Failed() { return }`) that re-inserts `deleted_libraries` **without**
+> `block_representation_id`
+> ([library_projection_regression_test.go:2090-2094](../internal/integration/library_projection_regression_test.go#L2090)) —
+> so a failing run can recreate an unstamped marker in the shared keyspace. Separately, the
+> **dominant physical residue** comes from (a)
+> `TestWebBlockUploadForeignPubRefNotPermanent` injecting a permanent fake `pub:` ref with no
+> cleanup ([web_block_upload_test.go:949](../internal/integration/web_block_upload_test.go#L949))
+> and (b) the many E2E tests that upload **real** blocks to MinIO with **no S3 teardown**
+> (only `gc_s3_deletion_test.go` ever deletes an object), because the GC daemon never runs in
+> the suite to reclaim them. Root cause is a **shared keyspace + shared bucket with no global
 > truncate/teardown** — cleanup is only by ephemeral library name. Tracked as
-> `ISSUE-GC-TEST-RESIDUE-01` (branch 1 + follow-ups).
+> `ISSUE-GC-TEST-RESIDUE-01` (branches 1A/1B).
 
 Several tests write `deleted_libraries` (and delete `libraries`) with **raw CQL**
 instead of the canonical helpers, e.g.:
@@ -228,15 +242,17 @@ docker exec sesamefs-cassandra-1 cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PAS
 
 ## Cross-agent audit — verified verdict (2026-07-10)
 
-Four agents investigated the GC delete path (three parallel explorations + one that
-cross-checked the results). Every claim below was **verified first-hand in the code** at
+This section consolidates independent code-path reviews and direct Cassandra/MinIO
+inspection. Every confirmed claim below points to reproducible code or storage evidence at
 the cited `file:line`. The originating investigation asked two questions — *is the GC safe?*
-and *is it optimal?* — and the answer is: **safe yes, optimal not yet.**
+and *is it optimal?* — and the answer is: **no live-block-deletion flaw was identified;
+optimality/durability gaps remain.**
 
-### Verdict 1 — the block-delete engine is SAFE
+### Verdict 1 — no live-block-deletion flaw identified in the block-delete protocol
 
-The protocol that deletes a physical block is conservative and crash-safe
-([worker.go:386-557](../internal/gc/worker.go#L386), `store_cassandra.go`):
+The protocol that deletes a physical block is conservative and crash-safe (no path in the
+reviewed sequence deletes a live block, though a code audit cannot prove a universal
+"never") — [worker.go:386-557](../internal/gc/worker.go#L386), `store_cassandra.go`:
 
 1. Pre-check refs; skip if any exist.
 2. Claim via LWT (`gc_state='deleting'`, stable `claimID`).
@@ -279,9 +295,9 @@ re-discovered by scanner Phase 0.
 | P1 | Org-admin trash deletes hard-delete the library **without** enqueuing a cascade, deleting the storage counter, or cleaning tags. Individual `deleteResolvedTrashLibrary` and bulk `CleanOrgTrashLibraries` rely on Phase 13, which only fires after `TrashRetentionDays` (~30d). | High | [library_delete_helpers.go:98-116](../internal/api/v2/library_delete_helpers.go#L98), [org_admin_repos.go:390-448](../internal/api/v2/org_admin_repos.go#L390) | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` |
 | P1b | The marker is re-inserted with `deleted_at = time.Now()`, **resetting the retention clock** → Phase 13 picks it up 30d after the permanent-delete action, not after the original trashing. | High | [org_admin_repos.go:432](../internal/api/v2/org_admin_repos.go#L432), [library_delete_helpers.go:36](../internal/api/v2/library_delete_helpers.go#L36) | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` |
 | P2 | Non-durable handoff on the superadmin paths: `PermanentDeleteRepo` and the global clean-trash enqueue via `go fn()` fire-and-forget after responding 200. A process exit / suite end in that window loses the work (recoverable only via marker + Phase 13). | High/Med | [library_delete_helpers.go:44,82-86,132-136](../internal/api/v2/library_delete_helpers.go#L44) | `ISSUE-GC-DELETE-HANDOFF-DURABILITY-01` |
-| P3 | `gc_libraries_by_policy` is not cleared on direct delete; only the cascade's `HardDeleteLibrary` and `rollbackNewLibrary` call `AddDeleteLibraryPolicyQuery`. Benign (scanner re-validates and skips) but accumulates. | Med | [library_delete_helpers.go:29-41](../internal/api/v2/library_delete_helpers.go#L29) vs [store_cassandra.go:3809](../internal/gc/store_cassandra.go#L3809) | `ISSUE-GC-POLICY-INDEX-STALE-01` |
-| P4 | `pub:` refs have no discoverable expiry projection (`up:` has one via `gc_provisional_block_refs` + Phase 0). When the last `pub:` expires by Cassandra TTL (35d), nothing runs the zero-ref → `EnsureBlockGCCandidate` transition; `scanOrphanedBlocks` only walks already-created candidates. Block + mapping + S3 can be retained. | Med | [block_references.go:339](../internal/db/block_references.go#L339); [scanner.go:335](../internal/gc/scanner.go#L335) | `ISSUE-GC-PUB-REF-ZERO-REF-01` |
-| P5 | Phase 13 hides delivery failures: on `EnqueueBatch` failure it logs and returns `nil`; on per-library `PendingItemExists` failure it `continue`s silently. Health/metrics can report success without delivering the work. | Med | [scanner.go:1194-1197,1231-1242](../internal/gc/scanner.go#L1194) | `ISSUE-GC-PHASE13-ERROR-VISIBILITY-01` |
+| P3 | `gc_libraries_by_policy` is not cleared on direct delete. Policy-setting endpoints, `rollbackNewLibrary`, and the cascade's `HardDeleteLibrary` all maintain their policy rows, but the shared direct hard-delete helper does not include the `AddDeleteLibraryPolicyQuery` deletes. Benign (scanner re-validates and skips) but accumulates. | Med | [library_delete_helpers.go:29-41](../internal/api/v2/library_delete_helpers.go#L29) vs [store_cassandra.go:3816](../internal/gc/store_cassandra.go#L3816) | `ISSUE-GC-POLICY-INDEX-STALE-01` |
+| P4 | `pub:` refs have no discoverable expiry projection (`up:` has one via `gc_provisional_block_refs` + Phase 0). When the last `pub:` expires by Cassandra TTL (35d), nothing runs the zero-ref → `EnsureBlockGCCandidate` transition; `scanOrphanedBlocks` only walks already-created candidates. Block + mapping + S3 can be retained. Confirmed by protocol analysis; no production incident demonstrated. | Med | [block_references.go:339](../internal/db/block_references.go#L339); [scanner.go:335](../internal/gc/scanner.go#L335) | `ISSUE-GC-PUB-REF-ZERO-REF-01` |
+| P5 | Phase 13 **logs** delivery failures but does not surface them: on `EnqueueBatch` failure it logs and returns `nil`; on per-library `PendingItemExists` failure it logs and `continue`s. The failure is invisible to the phase result, health, and dedicated metrics, so the overall scan cycle can appear successful. | Med | [scanner.go:1194-1197,1231-1242](../internal/gc/scanner.go#L1194) | `ISSUE-GC-PHASE13-ERROR-VISIBILITY-01` |
 
 ### Precisions (they confirm, they refine)
 
@@ -311,6 +327,45 @@ correctly — it repairs legacy / partial-failure markers.
 6. Tests never run a global GC over the shared keyspace; they only clean fixtures they created.
 7. PR #123 representation recovery is kept always.
 
+### Engine-level review — worker/scanner robustness (2026-07-10)
+
+A second pass reviewed the worker/scanner engine (not the delete *paths*) for races,
+liveness, and crash recovery. Overall crash recovery is **solid** (write-ahead
+`gc_s3_orphans` before finalize, persisted scanner cursors, grace period, LWT block claims,
+independent lease renewal, claim-then-verify, double stale-check for cascades). The
+confirmed items below are all **"fragility / does not reclaim garbage"**, none is
+"deletes live data":
+
+| # | Confirmed finding | Sev | Evidence |
+|---|---|---|---|
+| E1 | `postponeItem` re-queues a lock-contended (`hard_delete_in_progress`) item with `RetryCount` **unchanged** — intentional (lock contention should not push toward the DLQ), but there is no postpone bound and no dedicated metric, so a permanently stuck hard-delete lock ⇒ infinite postpone with no DLQ/alert. | Low (liveness/obs) | [worker.go:345-358](../internal/gc/worker.go#L345) |
+| E2 | `SetDryRun` writes `s.worker.dryRun` under `s.mu`, but the worker reads `w.dryRun` at ~13 sites with **no lock** — a genuine data race; toggling dry-run mid-processing has a window where a block is deleted despite `dryRun=true`. Use an `atomic.Bool`. | Low/Med | [gc.go:1141-1146](../internal/gc/gc.go#L1141) |
+| E3 | `scanOrphanedCommits` / `scanOrphanedFSObjects` use `if err != nil || exists { continue }` — a `LibraryExists` **error is silenced** and treated as "library exists" (skip). Fail-safe, but sustained Cassandra errors let orphaned commits/fs_objects accumulate invisibly. | Low/Med | [scanner.go:531-534](../internal/gc/scanner.go#L531), [scanner.go:607-609](../internal/gc/scanner.go#L607) |
+| E4 | `gc_pending_items` has `default_time_to_live = 0`; a cascade that fails midway leaves zombie pending markers with no TTL. Safe (scanner dedups on them) but the partition grows unbounded for GC-heavy orgs, adding weight to `PendingItemExists`. Same *class* as the existing `gc_queue` no-TTL debt. | Low (scale) | [001_initial_schema.cql:1199](../internal/db/migrations/001_initial_schema.cql#L1199) |
+| E5 | `RecoverS3Orphans` has no per-row LWT; mutual exclusion relies entirely on the leader lease. Real double-processing risk only under a lease split-brain (single-instance/dev: none). | Low (defense-in-depth) | [worker.go:599-772](../internal/gc/worker.go#L599) |
+
+**Reviewed and found NOT to be bugs** (recorded so they are not re-raised):
+
+- **"Infinite DLQ↔queue loop when the library marker is deleted mid-cascade" — not a bug.**
+  `processLibraryCascade` returns `nil` on the `deleted_at == nil` skip, and a `nil` result
+  makes `processOrg` call `Complete()`, which **removes** the item from the queue
+  ([worker.go:1199-1202](../internal/gc/worker.go#L1199) → [worker.go:311](../internal/gc/worker.go#L311)).
+  Phase 13 lists from the `deleted_libraries` marker, so a gone marker is not re-listed. No loop.
+- **"Resurrection guard missing for the `pending_s3` phase" — not a bug.** The `pending_s3`
+  branch checks `BlockExists` **before** the S3 delete and defers if the canonical row exists
+  (resurrected block) — [worker.go:695-708](../internal/gc/worker.go#L695). The guard covers
+  both recovery phases.
+- **"Race between child enqueue and parent delete in `processCommit`/`processFSObject`" —
+  mitigated.** The child items carry `RequiresLibraryDeletedCheck`; their own
+  `acquireLibraryDeleteGuard` catches restore (marker gone → `LibraryExists` → stale skip) and
+  re-delete under a different `identityAt` (`deleted_at != identityAt` → stale skip) —
+  [worker.go:1586-1616](../internal/gc/worker.go#L1586). The parent delete runs under a held
+  hard-delete lease on a soft-deleted library.
+
+These E1–E5 items are tracked as `ISSUE-GC-ENGINE-ROBUSTNESS-01` and slotted as branch 10
+(they are orthogonal to the delete-path roadmap 1–9 and can be interleaved when the worker is
+already being touched).
+
 ### Branch roadmap (small, auditable PRs)
 
 This document (branch `docs/gc-delete-cleanup-audit`) is **branch 0** — documentation only.
@@ -318,10 +373,11 @@ Subsequent branches, in recommended merge order:
 
 | Branch | Objective | Issue | Risk |
 |---|---|---|---|
-| 1 | `pub:foreign` test hygiene: capture the referrer, `t.Cleanup` the ref+block+mapping+object (or add a TTL), assert the ref is gone. No prod change. | `ISSUE-GC-TEST-RESIDUE-01` | Minimal |
+| 1A | `pub:foreign` test hygiene: capture the referrer, `t.Cleanup` **all** rows/objects identified by the fixture's exact org/library/session/operation/block IDs (ref + block + mapping + S3 object **+ the provisional expiry projection** from the real upload session), or add a TTL; assert the fake ref is gone. Never broad cleanup. No prod change. | `ISSUE-GC-TEST-RESIDUE-01` | Minimal |
+| 1B | Inventory upload fixtures that leave `blocks`/MinIO objects and add fixture-scoped teardown; also repair the `library_projection_regression_test.go` failure-restore so it does not re-insert an unstamped `deleted_libraries`. Measure **no-net-growth** vs the pre-suite baseline. | `ISSUE-GC-TEST-RESIDUE-01` | Low |
 | 2 | Fold `AddDeleteLibraryPolicyQuery` (version_ttl + auto_delete) into the `hardDeleteLibraryRowsFn` batch. Policy index only. | `ISSUE-GC-POLICY-INDEX-STALE-01` | Low |
-| 3 | Org-admin single parity (`DeleteOrgTrashLibrary`): after hard-delete, enqueue cascade + delete counter + clean tags (match `PermanentDeleteRepo`). | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Low/Med |
-| 4 | Org-admin bulk parity + centralization (`CleanOrgTrashLibraries`): use the per-candidate helper instead of the hand-rolled hard-delete; inherit cascade/counter/tags/policy. No N+1 yet. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Med |
+| 3 | Org-admin single parity (`DeleteOrgTrashLibrary`): after hard-delete, enqueue cascade + delete counter + clean tags (match `PermanentDeleteRepo`). **Tactical parity only** — removes the retention-only delay; the handoff stays best-effort (`go fn()`) until 6B. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Low/Med |
+| 4 | Org-admin bulk parity + centralization (`CleanOrgTrashLibraries`): use the per-candidate helper instead of the hand-rolled hard-delete; inherit cascade/counter/tags/policy. No N+1 yet. **Handoff still best-effort until 6B.** | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Med |
 | 5 | Phase 13 error visibility: accumulate (`errors.Join`), return the error, dedicated metric, don't flag global success on delivery failure; separate enqueued/skipped/failed counters. | `ISSUE-GC-PHASE13-ERROR-VISIBILITY-01` | Low |
 | 6A | Durable purge marker: `deleted_libraries.purge_requested_at`; Phase 13 eligible when `purge_requested_at != null OR deleted_at < cutoff`. Incremental `NNN_*.cql` migration. | `ISSUE-GC-DELETE-HANDOFF-DURABILITY-01` | Med |
 | 6B | Stamp the durable marker at all permanent-delete writers; keep immediate enqueue only as a best-effort accelerator. Never return 500 after a confirmed hard-delete. | `ISSUE-GC-DELETE-HANDOFF-DURABILITY-01` | Med |
@@ -330,13 +386,20 @@ Subsequent branches, in recommended merge order:
 | 8B | Low-risk repairs: delete stale policy rows; re-enqueue existing candidates; block with no refs → `EnsureBlockGCCandidate` (never delete directly). | `ISSUE-GC-RECONCILE-BACKFILL-01` | Med |
 | 8C | Conservative `fs:` orphan repair (fs_object exists → enqueue; missing + lib gone + marker → delete only that ref → zero-ref → candidate). Don't touch `pub:` or S3 directly. | `ISSUE-GC-RECONCILE-BACKFILL-01` | Med |
 | 9 | Remove the N+1 in bulk cleaners: fold `encrypted` + `block_representation_id` into the trash-listing query; extra resolver only as legacy fallback. | (opt) | Low |
+| 10 | Engine robustness (E1–E5): bound/meter `postponeItem`, make `dryRun` atomic, surface silenced `LibraryExists` scan errors, add a TTL/bound to `gc_pending_items`. Interleave when the worker is already being edited. | `ISSUE-GC-ENGINE-ROBUSTNESS-01` | Low |
 
 **Crash-matrix gates (after 6B):** exercise a crash at {before the batch, after the marker,
 after deleting `libraries`, before/after the enqueue, during the cascade, during fs_object
 cleanup, during the S3 delete}. Allowed outcome always: live content intact **or** recoverable
 garbage — never a deleted live block, never a library with no recoverable marker.
 
-**Global verification (after branches 1–4):** re-run the full suite on a clean cluster and
-re-inspect Cassandra + MinIO with the access commands above. Target: `blocks`,
-`block_references`, `block_id_mappings`, `commits`, `gc_libraries_by_policy` at 0 and an empty
-bucket after a clean run (once the tests that manufacture their own residue are sanitized).
+**Global verification (after branches 1–4):** the suite does **not** start the global GC
+daemon, so absolute zero is not a valid post-1–4 gate on the shared cluster. Two gates:
+
+- **Shared cluster:** *no net growth* in fixture-owned Cassandra rows and MinIO objects
+  relative to the pre-suite baseline.
+- **Ephemeral, empty cluster:** absolute zero (`blocks`, `block_references`,
+  `block_id_mappings`, `commits`, `gc_libraries_by_policy` at 0 and an empty bucket) is
+  required only after all upload fixtures have exact teardown *or* the harness runs an
+  isolated, deterministic GC drain. Do **not** run a global GC or `TRUNCATE` over the shared
+  keyspace (invariants #5/#6).
