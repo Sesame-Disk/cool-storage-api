@@ -1010,11 +1010,6 @@ func (s *Scanner) scanExpiredRestoreJobs(ctx context.Context) (int, error) {
 func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 9: Scanning for orphaned group shares...")
 
-	groupShares, err := s.store.ListAllGroupShares()
-	if err != nil {
-		return 0, err
-	}
-
 	// Cache group existence checks to avoid repeated lookups. Group existence is
 	// keyed by (org_id, group_id) in the data model, so cache on both.
 	type groupExistenceKey struct {
@@ -1026,10 +1021,10 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 	cleaned := 0
 	failed := 0
 	var phaseErr error
-	for _, gs := range groupShares {
+	scanErr := s.store.ScanAllGroupShares(ctx, func(gs GroupShareInfo) error {
 		select {
 		case <-ctx.Done():
-			return cleaned, ctx.Err()
+			return ctx.Err()
 		default:
 		}
 
@@ -1050,7 +1045,7 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 						phaseErr = fmt.Errorf("cannot resolve org for library %s", gs.LibraryID)
 					}
 				}
-				continue
+				return nil
 			}
 			orgID = resolvedOrgID
 		}
@@ -1067,7 +1062,7 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 				if phaseErr == nil {
 					phaseErr = err
 				}
-				continue
+				return nil
 			}
 			exists = groupExists
 			groupExistsCache[cacheKey] = exists
@@ -1081,10 +1076,14 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 				if phaseErr == nil {
 					phaseErr = err
 				}
-				continue
+				return nil
 			}
 			cleaned++
 		}
+		return nil
+	})
+	if scanErr != nil {
+		phaseErr = errors.Join(phaseErr, scanErr)
 	}
 
 	log.Printf("[GC Scanner] Phase 9 complete: cleaned %d orphaned group shares", cleaned)

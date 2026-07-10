@@ -29,7 +29,7 @@ import (
 // Prerequisite helpers
 // ---------------------------------------------------------------------------
 
-func TestGC_ListAllGroupSharesDiscoversPartitionWithoutGroupRow(t *testing.T) {
+func TestGC_ScanAllGroupSharesDiscoversPartitionWithoutGroupRow(t *testing.T) {
 	database := shareProjectionDBForTest(t)
 	session := database.Session()
 	orgID, groupID, libraryID, shareID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
@@ -53,16 +53,19 @@ func TestGC_ListAllGroupSharesDiscoversPartitionWithoutGroupRow(t *testing.T) {
 
 	// Deliberately do not insert a groups row. The production store must enumerate
 	// the share projection itself rather than depending on the deleted group.
-	rows, err := gcpkg.NewCassandraStore(database).ListAllGroupShares()
-	if err != nil {
-		t.Fatalf("ListAllGroupShares: %v", err)
-	}
-	for _, row := range rows {
+	found := false
+	err := gcpkg.NewCassandraStore(database).ScanAllGroupShares(context.Background(), func(row gcpkg.GroupShareInfo) error {
 		if row.OrgID == orgID && row.SharedTo == groupID && row.LibraryID == libraryID && row.ShareID == shareID {
-			return
+			found = true
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ScanAllGroupShares: %v", err)
 	}
-	t.Fatal("orphan shares_by_group partition was not discovered without a groups row")
+	if !found {
+		t.Fatal("orphan shares_by_group partition was not discovered without a groups row")
+	}
 }
 
 // requireGCEnabled skips the test if the GC admin endpoint is not reachable

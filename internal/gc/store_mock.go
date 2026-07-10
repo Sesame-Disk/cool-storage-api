@@ -2738,15 +2738,14 @@ func (m *MockStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo, erro
 	}
 	return result, nil
 }
-func (m *MockStore) ListAllGroupShares() ([]GroupShareInfo, error) {
+func (m *MockStore) ScanAllGroupShares(ctx context.Context, visit func(GroupShareInfo) error) error {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []GroupShareInfo
+	rows := make([]GroupShareInfo, 0, len(m.shares))
 	for _, share := range m.shares {
 		if share.SharedToType != "group" {
 			continue
 		}
-		result = append(result, GroupShareInfo{
+		rows = append(rows, GroupShareInfo{
 			LibraryID:    share.LibraryID,
 			ShareID:      share.ShareID,
 			SharedTo:     share.SharedTo,
@@ -2754,7 +2753,16 @@ func (m *MockStore) ListAllGroupShares() ([]GroupShareInfo, error) {
 			OrgID:        share.OrgID,
 		})
 	}
-	return result, nil
+	m.mu.RUnlock()
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := visit(row); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (m *MockStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) {
 	m.mu.RLock()

@@ -1,6 +1,7 @@
 package gc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3179,28 +3180,30 @@ func (s *CassandraStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo,
 	return results, nil
 }
 
-// ListAllGroupShares returns all group-share projection rows for the scanner.
+// ScanAllGroupShares streams all group-share projection rows to the scanner.
 // Scan the projection directly: enumerating groups first cannot discover a
 // shares_by_group partition after its group row has already been deleted.
-func (s *CassandraStore) ListAllGroupShares() ([]GroupShareInfo, error) {
+func (s *CassandraStore) ScanAllGroupShares(ctx context.Context, visit func(GroupShareInfo) error) error {
 	iter := s.db.Session().Query(`
 		SELECT org_id, group_id, library_id, share_id FROM shares_by_group
-	`).Iter()
-	var results []GroupShareInfo
+	`).WithContext(ctx).PageSize(256).Iter()
 	var orgIDStr, groupIDStr, libIDStr, shareIDStr string
 	for iter.Scan(&orgIDStr, &groupIDStr, &libIDStr, &shareIDStr) {
-		results = append(results, GroupShareInfo{
+		if err := visit(GroupShareInfo{
 			LibraryID:    parseUUID(libIDStr),
 			ShareID:      parseUUID(shareIDStr),
 			SharedTo:     parseUUID(groupIDStr),
 			SharedToType: "group",
 			OrgID:        parseUUID(orgIDStr),
-		})
+		}); err != nil {
+			_ = iter.Close()
+			return err
+		}
 	}
 	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to list group shares: %w", err)
+		return fmt.Errorf("failed to scan group shares: %w", err)
 	}
-	return results, nil
+	return nil
 }
 
 func (s *CassandraStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) {

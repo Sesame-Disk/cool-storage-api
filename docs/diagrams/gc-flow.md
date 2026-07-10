@@ -133,6 +133,8 @@ Important limits:
   markerless artifact partitions are invisible (audit P7).
 - `LibraryExists`/`GroupExists` now fail **closed** on Cassandra errors (audit P6a, fixed 1D);
   execution-time canonical revalidation of orphan work (P6b) is pending.
+- Phase 9 streams `shares_by_group` with bounded process memory and cancellation, but the
+  Cassandra read remains a global scan until bucketed partition discovery lands (audit P8).
 - `up:` expiry has durable discovery; `pub:` expiry does not (audit P4).
 - Phase 13 currently logs some delivery failures without returning them (audit P5).
 

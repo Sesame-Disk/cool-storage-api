@@ -6,7 +6,7 @@
 plan integration tests for long-running monitoring.
 
 > **See also (2026-07-10 delete-path audit):** the library-delete → cascade handoff has
-> verified follow-up debt P1–P7. The physical block-delete claim/recovery protocol is
+> verified follow-up debt P1–P8. The physical block-delete claim/recovery protocol is
 > conservative. P6a (Cassandra existence-read failures interpreted as "missing", enqueuing
 > destructive work for live libraries on a transient error) is now **fixed** (branch 1D):
 > existence reads fail closed and Phases 3/4/9 surface the error. A narrower projection/TOCTOU gap
@@ -340,8 +340,9 @@ The physical block claim/recheck/recovery sequence is conservative **given corre
 The transient-error fail-open existence read (P6a) that was the broad end-to-end safety exception is
 now fixed (1D). A narrower projection/TOCTOU gap remains (P6b, Medium): orphan commit/fs_object items are
 not revalidated against the canonical `libraries` table at execution time
-(`ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`). The remaining P1–P5/P7 issues primarily retain or delay
-garbage rather than deleting referenced blocks.
+(`ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`). P8 tracks Phase 9's provisional global Cassandra
+scan (streamed and cancellable, but not partition-bounded). The remaining P1–P5/P7 issues
+primarily retain or delay garbage rather than deleting referenced blocks.
 
 ---
 

@@ -12,9 +12,10 @@ Session-by-session development history for SesameFS.
 
 - `LibraryExists`/`GroupExists` now distinguish `gocql.ErrNotFound` from Cassandra failures;
   scanner Phases 3/4/9 skip destructive work and surface transient errors (P6a).
-- Phase 9 now scans `shares_by_group` directly instead of enumerating `groups` and issuing an
-  N+1 query per group. This both removes the N+1 and discovers stable share projections after
-  the canonical group row is gone. The existence cache is scoped by `(org_id, group_id)`.
+- Phase 9 now streams `shares_by_group` in driver pages instead of enumerating `groups` and
+  issuing an N+1 query per group. This restores stable orphan discovery, bounds process memory,
+  and supports cancellation; scalable bucketed partition discovery remains follow-up work.
+  The existence cache is scoped by `(org_id, group_id)`.
 - Added fail-closed fallback and cross-org cache tests plus a real-Cassandra regression that
   inserts a `shares_by_group` row without a `groups` row and proves it remains discoverable.
 - P6b remains explicit follow-up debt: already-enqueued orphan commit/fs_object work lacks

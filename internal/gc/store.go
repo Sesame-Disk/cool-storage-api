@@ -199,7 +199,7 @@ type GCStore interface {
 	ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo, error)
 
 	// Scanner: orphaned group shares
-	ListAllGroupShares() ([]GroupShareInfo, error)
+	ScanAllGroupShares(ctx context.Context, visit func(GroupShareInfo) error) error
 	GroupExists(orgID, groupID uuid.UUID) (bool, error)
 
 	// Audit log

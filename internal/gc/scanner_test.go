@@ -972,6 +972,22 @@ func TestScanner_ScanOrphanedGroupShares_CacheIsScopedByOrg(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanOrphanedGroupShares_StreamingHonorsCancellation(t *testing.T) {
+	store := NewMockStore()
+	store.AddGroupShare(uuid.New(), uuid.New(), uuid.New())
+	s := NewScanner(store, NewQueue(store), &Stats{}, config.GCConfig{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	n, err := s.scanOrphanedGroupShares(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation from streaming scan, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected no cleanup after cancellation, got %d", n)
+	}
+}
+
 // Regression for P6: a transient LibraryExists error in Phase 3 must NOT be treated
 // as "library gone" and enqueue a live library's commits for deletion.
 func TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError(t *testing.T) {
