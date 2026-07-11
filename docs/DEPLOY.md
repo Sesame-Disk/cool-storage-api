@@ -753,6 +753,38 @@ docker compose -f docker-compose.prod.yml up -d frontend
 
 Do not use `--build` for the normal prod path. The production compose consumes published images, not local Docker builds.
 
+### Upgrading GC to the library guard-mode build (migration 011) — stop-the-world
+
+Migration 011 adds `library_guard_mode` to `gc_queue` / `gc_failed_items` and the
+scanner starts stamping orphan work as `canonical_absent` (P6b execution-time
+revalidation). This is **not** safe under a mixed-version GC fleet: a new scanner
+enqueues `canonical_absent`, but an **old** worker ignores `library_guard_mode`,
+sees the legacy `requires_library_deleted_check=true` boolean, resolves it to
+`deleted_at_identity`, finds no matching delete marker, and drops the orphan as
+stale — completing the item without doing the canonical point-read guard.
+
+Because GC mutates shared state destructively, upgrade GC as a stop-the-world
+operation across the **whole fleet** (every region/DC), not as a rolling deploy:
+
+1. Set `GC_ENABLED=false` on every backend replica in every DC and roll them so
+   no scanner/worker runs anywhere. (The single-leader lease does not help here —
+   the risk is version skew, not concurrency.)
+2. Confirm no old GC worker is still running: check `M5.5` (GC lease is
+   single-leader) shows no active leader, and that every replica now reports
+   `GC_ENABLED=false`.
+3. Apply migration 011 (runs automatically on next boot, or `sesamefs migrate`).
+   Verify `schema_migrations` contains version 11 and both tables expose the
+   `library_guard_mode` column.
+4. Deploy the new image to **all** replicas in all DCs while GC stays disabled.
+5. Confirm the deployed image/commit is identical on every replica — no old
+   binary remains anywhere.
+6. Only then re-enable GC (`GC_ENABLED=true`) on exactly the designated
+   replica(s)/DC, per the single-leader guidance below.
+
+Legacy queue/DLQ rows written before the migration (NULL `library_guard_mode` +
+`requires_library_deleted_check=true`) remain correct: the new binary hydrates
+them as `deleted_at_identity`, matching their original intent.
+
 ### Upgrading from a pre-NetworkTopologyStrategy build
 
 Older builds bootstrapped the `sesamefs` keyspace as

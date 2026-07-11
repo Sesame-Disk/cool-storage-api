@@ -756,10 +756,16 @@ func (s *Service) isAutoRecoverableFailedItem(item GCFailedItemInfo) (bool, erro
 
 	var exists bool
 	var err error
-	if guardMode == LibraryGuardCanonicalMustBeAbsent {
+	switch guardMode {
+	case LibraryGuardCanonicalMustBeAbsent:
 		exists, err = s.store.CanonicalLibraryExists(item.OrgID, item.LibraryID)
-	} else {
+	case LibraryGuardDeletedAtIdentity:
 		exists, err = s.store.LibraryExists(item.LibraryID)
+	default:
+		// Unknown guard mode (e.g. a row written by a newer binary): do not guess a
+		// revalidation path. Leave it in the DLQ for operator inspection rather than
+		// auto-recovering it against the wrong existence check.
+		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("confirm library existence for DLQ item %s/%s: %w", item.LibraryID, item.ItemID, err)

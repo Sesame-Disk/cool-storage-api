@@ -960,7 +960,10 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
 	now := time.Now().UTC()
 	leaseToken := uuid.New()
-	libraryUUID := uuid.MustParse(libraryID)
+	libraryUUID, err := uuid.Parse(libraryID)
+	if err != nil {
+		return fmt.Errorf("invalid library id %q: %w", libraryID, err)
+	}
 	acquired, err := gcpkg.AcquireLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("acquire library restore lock: %w", err)
@@ -973,6 +976,28 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 			log.Printf("[restoreDeletedLibrary] failed to release restore lock for %s: %v", libraryID, err)
 		}
 	}()
+
+	// Canonical precondition, re-checked UNDER the lease. AcquireLibraryHardDeleteLockLease
+	// is stale-aware: it can steal a lease from a GC worker that crashed mid-purge. In
+	// Cassandra an UPDATE is an upsert, so the batch below would otherwise RECREATE the
+	// `libraries` row over partially-purged content. The only safe state to restore from is
+	// the original soft-deleted canonical row (present, deleted_at != null). If the canonical
+	// row is gone, permanent deletion / orphan purge already started — never resurrect it. A
+	// present-but-active row (deleted_at == null) is not in trash. The admin projection is a
+	// read model and does not prove canonical presence, so it cannot gate this.
+	var canonicalDeletedAt time.Time
+	err = db.Session().Query(`
+		SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID, libraryID,
+	).Scan(&canonicalDeletedAt)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return fmt.Errorf("library is pending permanent deletion")
+	} else if err != nil {
+		return fmt.Errorf("read canonical library for restore: %w", err)
+	}
+	if canonicalDeletedAt.IsZero() {
+		return fmt.Errorf("library is not in trash")
+	}
 
 	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err != nil {

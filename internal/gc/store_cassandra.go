@@ -126,10 +126,19 @@ func renewHardDeleteLock(session *gocql.Session, tableName, keyColumn string, ke
 }
 
 func releaseHardDeleteLock(session *gocql.Session, tableName, keyColumn string, keyValue, leaseToken uuid.UUID) error {
-	_, err := session.Query(fmt.Sprintf(`
+	applied, err := session.Query(fmt.Sprintf(`
 		DELETE FROM %s WHERE %s = ? IF lease_token = ?
 	`, tableName, keyColumn), keyValue.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
-	return err
+	if err != nil {
+		return err
+	}
+	if !applied {
+		// The lease was already stolen (stale takeover) or expired by TTL before we
+		// released it. Deleting is safely skipped — we no longer own the row — but this
+		// signals we lost ownership mid-operation, which is worth surfacing.
+		log.Printf("[gc] release %s lock %s: lease token is no longer the owner (stolen or expired)", tableName, keyValue)
+	}
+	return nil
 }
 
 // AcquireLibraryHardDeleteLockLease acquires the library hard-delete lock using
