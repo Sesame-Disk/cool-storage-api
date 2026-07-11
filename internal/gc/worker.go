@@ -1687,6 +1687,26 @@ func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), func() error
 			log.Printf("[GC Worker] Skipping stale guarded item %s/%s after lock (current deleted_at=%v identity_at=%v)", item.LibraryID, item.ItemID, deletedAt, identityAt)
 			return func() {}, func() error { return nil }, true, nil
 		}
+		// The delete marker still matches, but a matching marker does NOT prove the parent
+		// cascade finished HardDeleteLibrary. HardDeleteLibrary removes the canonical
+		// `libraries` row and the marker together; while the canonical row still exists the
+		// library is soft-deleted and RESTORABLE. If a child reaches here with the canonical
+		// row present, the parent crashed after enqueuing children but before the canonical
+		// delete (and this worker stole its stale lease). Purging content now would let a
+		// later restore revive a partially-purged library. Require the canonical row to be
+		// gone; otherwise postpone (no retry burn, no DLQ) until the cascade is re-driven and
+		// completes the hard delete. In the normal flow children run only after
+		// HardDeleteLibrary, so the marker is already gone and this branch is not reached.
+		exists, err := w.store.CanonicalLibraryExists(item.OrgID, item.LibraryID)
+		if err != nil {
+			release()
+			return nil, nil, false, fmt.Errorf("failed to confirm canonical library absence for guarded child %s/%s: %w", item.LibraryID, item.ItemID, err)
+		}
+		if exists {
+			release()
+			log.Printf("[GC Worker] Postponing guarded item %s/%s: canonical library still present (cascade not yet hard-deleted)", item.LibraryID, item.ItemID)
+			return nil, nil, false, libraryHardDeleteInProgressError{LibraryID: item.LibraryID, ItemID: item.ItemID}
+		}
 	}
 
 	fence := func() error {

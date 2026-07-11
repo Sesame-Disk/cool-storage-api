@@ -1514,14 +1514,14 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	blockRepresentationID := db.EncryptedLibraryBlockRepresentationID(libID.String())
 
-	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	// Post-hard-delete state: the parent cascade already removed the canonical
+	// `libraries` row and the delete marker together, so the guarded commit drains
+	// (canonical absent). A cascade child never legitimately deletes while the
+	// canonical row still exists — that path now postpones (see the guard).
 	store.AddCommit(libID, "commit-1", "fs-root")
 	store.AddBlock(orgID, "blk-a", "hot", 0)
 	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-root")
 	store.AddFSObject(libID, "fs-root", "file", []string{"blk-a"})
-	store.mu.Lock()
-	store.deletedLibraries[libID].BlockRepresentationID = blockRepresentationID
-	store.mu.Unlock()
 
 	guardedCommit := QueueItem{
 		OrgID:                       orgID,
@@ -1557,9 +1557,9 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 		t.Fatalf("root fs_object child BlockRepresentationID = %q, want %q", rootChild.BlockRepresentationID, blockRepresentationID)
 	}
 
-	store.mu.Lock()
-	delete(store.deletedLibraries, libID)
-	store.mu.Unlock()
+	// A restore re-creates the canonical `libraries` row (active). The still-queued
+	// root fs_object child must now be stale and skip rather than purge restored content.
+	store.AddLibrary(orgID, libID, "hot")
 
 	if err := w.processFSObject(context.Background(), rootChild); err != nil {
 		t.Fatalf("processFSObject after restore failed: %v", err)
@@ -1569,6 +1569,92 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 	}
 	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 1 {
 		t.Fatalf("block references after restored root child = %d, want 1", got)
+	}
+}
+
+// P6b crash-window guard: a deleted_at_identity cascade child must NOT purge content
+// while the canonical `libraries` row still exists (soft-deleted / restorable). The parent
+// cascade removes the canonical row only in HardDeleteLibrary; if it crashed before that
+// and this worker stole its stale lease, the child must postpone, not delete — otherwise a
+// later restore would revive a partially-purged library.
+func TestWorker_ProcessCommit_DeletedAtIdentityPostponesWhileCanonicalPresent(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt) // canonical row AND marker present
+	store.AddCommit(libID, "commit-1", "")
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt,
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: LibraryGuardDeletedAtIdentity,
+		ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libID,
+	}
+	err := w.processCommit(item)
+	if !isHardDeleteInProgressError(err) {
+		t.Fatalf("expected a hard-delete-in-progress (postpone) error, got %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") == nil {
+		t.Fatal("commit must NOT be deleted while the canonical (soft-deleted) library still exists")
+	}
+}
+
+// Once the parent cascade completes HardDeleteLibrary (canonical row gone), the same
+// child drains and deletes normally.
+func TestWorker_ProcessCommit_DeletedAtIdentityDeletesAfterCanonicalGone(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddCommit(libID, "commit-1", "")
+	if err := store.HardDeleteLibrary(orgID, libID); err != nil { // canonical + marker removed
+		t.Fatalf("HardDeleteLibrary: %v", err)
+	}
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt,
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: LibraryGuardDeletedAtIdentity,
+		ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libID,
+	}
+	if err := w.processCommit(item); err != nil {
+		t.Fatalf("processCommit after hard delete: %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") != nil {
+		t.Fatal("commit should be deleted once the canonical library is gone (hard delete completed)")
+	}
+}
+
+// The fs_object path releases block references (the irreversible step). It too must
+// postpone — and not release any reference — while the canonical library still exists.
+func TestWorker_ProcessFSObject_DeletedAtIdentityPostponesWhileCanonicalPresent(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddBlock(orgID, "blk-a", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-1")
+	store.AddFSObject(libID, "fs-1", "file", []string{"blk-a"})
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt,
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: LibraryGuardDeletedAtIdentity,
+		ItemType: ItemFSObject, ItemID: "fs-1", LibraryID: libID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+	}
+	err := w.processFSObject(context.Background(), item)
+	if !isHardDeleteInProgressError(err) {
+		t.Fatalf("expected a hard-delete-in-progress (postpone) error, got %v", err)
+	}
+	if _, gerr := store.GetFSObject(libID, "fs-1"); gerr != nil {
+		t.Fatal("fs_object must NOT be deleted while the canonical library still exists")
+	}
+	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 1 {
+		t.Fatalf("block reference must be preserved (not released) while canonical present; got %d want 1", got)
 	}
 }
 
