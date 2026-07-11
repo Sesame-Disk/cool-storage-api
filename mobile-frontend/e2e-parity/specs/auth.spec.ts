@@ -6,12 +6,14 @@ import { CREDENTIALS, TOKEN_KEY, waitForAppShell } from '../helpers/parity-helpe
 // these run UNauthenticated (fresh storageState) so the login form actually
 // renders and we exercise a full local-auth login end to end.
 //
-// Bootstrap admin on this stack: superadmin@sesamefs.local / BootstrapAdmin123.
+// Uses the same seeded superadmin credential the rest of the harness logs in
+// with (parity-helpers CREDENTIALS.super), so there is a single source of truth
+// for the bootstrap password rather than a hardcoded literal that can drift.
 test.use({ storageState: { cookies: [], origins: [] } });
 
 const LOCAL_CREDS = {
   email: CREDENTIALS.super.email, // superadmin@sesamefs.local
-  password: 'BootstrapAdmin123',
+  password: CREDENTIALS.super.password,
 };
 
 test.describe('Unified auth: local login', () => {

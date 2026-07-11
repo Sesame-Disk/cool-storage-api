@@ -355,6 +355,50 @@ export async function getFileDownloadLink(repoId: string, path: string): Promise
   return url as string;
 }
 
+// OnlyOffice document editor
+
+/** Full OnlyOffice editor config the DocsAPI.DocEditor constructor consumes. */
+export interface OnlyOfficeDocConfig {
+  document: Record<string, unknown>;
+  documentType: string;
+  editorConfig: Record<string, unknown>;
+  token?: string;
+}
+
+export interface OnlyOfficeConfigResponse {
+  /** Config object passed straight to `new DocsAPI.DocEditor(id, doc)`. */
+  doc: OnlyOfficeDocConfig;
+  /** URL of the OnlyOffice document server's api.js (browser-facing). */
+  api_js_url: string;
+}
+
+/**
+ * Fetch the signed OnlyOffice editor configuration for a document. Mirrors the
+ * web frontend: GET /api/v2.1/repos/:repo/onlyoffice/?p=<path>. Throws with the
+ * backend's error_msg (e.g. "OnlyOffice is not enabled") so the viewer can fall
+ * back to download.
+ */
+export async function getOnlyOfficeConfig(
+  repoId: string,
+  path: string,
+): Promise<OnlyOfficeConfigResponse> {
+  const params = new URLSearchParams({ p: path });
+  const res = await fetch(`${serviceURL()}/api/v2.1/repos/${repoId}/onlyoffice/?${params}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    let msg = 'Failed to open document';
+    try {
+      const body = await res.json();
+      if (body?.error_msg) msg = body.error_msg;
+    } catch {
+      // non-JSON error body — keep the generic message
+    }
+    throw new Error(msg);
+  }
+  return (await res.json()) as OnlyOfficeConfigResponse;
+}
+
 // Star / Unstar
 
 export interface StarredFile {

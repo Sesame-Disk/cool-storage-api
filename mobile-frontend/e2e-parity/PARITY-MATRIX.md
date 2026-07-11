@@ -63,7 +63,8 @@ Legend for spec column: `<spec file>::<test title>` in `e2e-parity/specs/`.
 | Tags (repo tags CRUD) (E3) | ✅ | `tags.spec.ts` |
 | Preview: image/video/text/pdf/code | ✅ | (existing viewers) |
 | Preview: audio + markdown (E6) | ✅ | `preview.spec.ts` |
-| Preview: office/seadoc (E6) | ➡️ | needs OnlyOffice/SeaDoc services; deferred |
+| Preview: office (OnlyOffice) | ✅ | `onlyoffice.spec.ts` (docx/xlsx/pptx open embedded editor + signed config) |
+| Preview: seadoc | ➡️ | needs SeaDoc service; deferred |
 
 ## Sharing
 | Operation | Status | Spec |

@@ -11,6 +11,14 @@ const CODE_EXTS = [
   'makefile', 'dockerfile', 'cmake',
 ];
 const PDF_EXTS = ['pdf'];
+// Office document formats handled by OnlyOffice (matches the backend's
+// onlyoffice.view_extensions, minus pdf/csv/txt/html which have native mobile
+// viewers). These open in the embedded OnlyOffice editor, at parity with web.
+const OFFICE_EXTS = [
+  'doc', 'docx', 'odt', 'fodt', 'rtf',
+  'xls', 'xlsx', 'ods', 'fods',
+  'ppt', 'pptx', 'odp', 'fodp',
+];
 
 export type FileViewerType =
   | 'image'
@@ -20,6 +28,7 @@ export type FileViewerType =
   | 'text'
   | 'code'
   | 'pdf'
+  | 'office'
   | 'generic';
 
 export function getFileExtension(filename: string): string {
@@ -38,6 +47,7 @@ export function getViewerType(filename: string): FileViewerType {
   if (PDF_EXTS.includes(ext)) return 'pdf';
   if (CODE_EXTS.includes(ext)) return 'code';
   if (TEXT_EXTS.includes(ext)) return 'text';
+  if (OFFICE_EXTS.includes(ext)) return 'office';
   return 'generic';
 }
 

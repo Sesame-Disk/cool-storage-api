@@ -9,6 +9,7 @@ import TextViewer from './TextViewer';
 import MarkdownViewer from './MarkdownViewer';
 import CodeViewer from './CodeViewer';
 import PDFViewer from './PDFViewer';
+import OnlyOfficeViewer from './OnlyOfficeViewer';
 import GenericFileView from './GenericFileView';
 
 interface FilePreviewProps {
@@ -149,6 +150,16 @@ export default function FilePreview({
           url={downloadUrl}
           fileName={file.name}
           onClose={onClose}
+        />
+      );
+    case 'office':
+      return (
+        <OnlyOfficeViewer
+          repoId={repoId}
+          filePath={fullPath}
+          fileName={file.name}
+          onClose={onClose}
+          onToast={onToast}
         />
       );
     default:

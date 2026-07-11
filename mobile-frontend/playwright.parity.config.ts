@@ -9,6 +9,22 @@ import { BASE_URL, authStateFile } from './e2e-parity/helpers/parity-helpers';
 //   test.use({ storageState: authStateFile('admin') })
 // ---------------------------------------------------------------------------
 
+// When the app is served over a non-localhost, non-HTTPS origin (e.g. the
+// containerized parity run hits http://mobile-frontend), the browser treats it
+// as an INSECURE context and disables secure-context-only APIs the PWA relies
+// on: Service Workers and crypto.subtle (used by the upload SHA-256 hashing).
+// A real end user reaches the app via http://localhost:<port>, which IS a
+// secure context. Set PARITY_SECURE_ORIGIN=<origin> to tell Chromium to treat
+// that origin as secure so the run faithfully mirrors the localhost experience.
+const SECURE_ORIGIN = process.env.PARITY_SECURE_ORIGIN;
+const chromiumLaunchOptions = SECURE_ORIGIN
+  ? {
+      launchOptions: {
+        args: [`--unsafely-treat-insecure-origin-as-secure=${SECURE_ORIGIN}`],
+      },
+    }
+  : {};
+
 const VIEWPORTS = [
   { name: 'phone-small', device: devices['iPhone SE'] },
   { name: 'phone', device: devices['Pixel 5'] },
@@ -49,7 +65,7 @@ export default defineConfig({
   projects: [
     ...VIEWPORTS.map((v) => ({
       name: v.name,
-      use: { ...v.device, browserName: 'chromium' as const, defaultBrowserType: 'chromium' as const },
+      use: { ...v.device, browserName: 'chromium' as const, defaultBrowserType: 'chromium' as const, ...chromiumLaunchOptions },
     })),
     // Real-WebKit iOS Safari, scoped to the foundation specs (routing, SW,
     // install prompt) — the surface most likely to behave differently on Safari.
