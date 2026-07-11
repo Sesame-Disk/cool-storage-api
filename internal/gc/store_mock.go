@@ -163,6 +163,8 @@ type MockStore struct {
 	beginOrgPurgeHook              func(orgID uuid.UUID)
 	getBlockRefCountErr            error
 	libraryExistsErr               error
+	canonicalLibraryExistsErr      error
+	forceRenewLibraryLockNotOwned  bool
 	groupExistsErr                 error
 	groupExistsCalls               atomic.Int64
 	findOrgForLibraryErr           error
@@ -1306,7 +1308,7 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType I
 	return nil
 }
 
-func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
+func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1325,6 +1327,7 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 			newItem.QueuedAt = newQueuedAt
 			newItem.IdentityAt = effectiveIdentityAt(item.QueuedAt, identityAt)
 			newItem.RequiresLibraryDeletedCheck = item.RequiresLibraryDeletedCheck
+			newItem.LibraryGuardMode = effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
 			newItem.BlockRepresentationID = strings.TrimSpace(blockRepresentationID)
 			newItem.RetryCount = newRetryCount
 			m.queue[orgID] = append(m.queue[orgID], newItem)
@@ -1364,6 +1367,7 @@ func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError, fail
 		QueuedAt:                    item.QueuedAt,
 		IdentityAt:                  effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
 		RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
+		LibraryGuardMode:            effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck),
 		ItemType:                    item.ItemType,
 		ItemID:                      item.ItemID,
 		LibraryID:                   item.LibraryID,
@@ -1577,6 +1581,7 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 				QueuedAt:                    item.QueuedAt,
 				IdentityAt:                  effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
 				RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
+				LibraryGuardMode:            effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck),
 				ItemType:                    item.ItemType,
 				ItemID:                      item.ItemID,
 				LibraryID:                   item.LibraryID,
@@ -2280,6 +2285,16 @@ func (m *MockStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
 	}
 	_, ok := m.libraries[libraryID]
 	return ok, nil
+}
+
+func (m *MockStore) CanonicalLibraryExists(orgID, libraryID uuid.UUID) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.canonicalLibraryExistsErr != nil {
+		return false, m.canonicalLibraryExistsErr
+	}
+	lib, ok := m.libraries[libraryID]
+	return ok && lib.OrgID == orgID, nil
 }
 
 func (m *MockStore) FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error) {
@@ -3011,6 +3026,10 @@ func (m *MockStore) AcquireLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID
 func (m *MockStore) RenewLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.forceRenewLibraryLockNotOwned {
+		// Simulate a lease lost to TTL expiry or a concurrent restore between acquire and fence.
+		return false, nil
+	}
 	lock, locked := m.libraryHardDeleteLocks[libraryID]
 	if !locked || lock.LeaseToken != leaseToken {
 		return false, nil

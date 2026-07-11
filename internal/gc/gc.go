@@ -740,7 +740,8 @@ func (s *Service) isAutoRecoverableFailedItem(item GCFailedItemInfo) (bool, erro
 	if item.ResolvedState != "" && item.ResolvedState != "open" {
 		return false, nil
 	}
-	if !item.RequiresLibraryDeletedCheck {
+	guardMode := effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck)
+	if guardMode == LibraryGuardNone {
 		return false, nil
 	}
 	if item.ItemType != ItemCommit && item.ItemType != ItemFSObject {
@@ -753,7 +754,13 @@ func (s *Service) isAutoRecoverableFailedItem(item GCFailedItemInfo) (bool, erro
 		return false, nil
 	}
 
-	exists, err := s.store.LibraryExists(item.LibraryID)
+	var exists bool
+	var err error
+	if guardMode == LibraryGuardCanonicalMustBeAbsent {
+		exists, err = s.store.CanonicalLibraryExists(item.OrgID, item.LibraryID)
+	} else {
+		exists, err = s.store.LibraryExists(item.LibraryID)
+	}
 	if err != nil {
 		return false, fmt.Errorf("confirm library existence for DLQ item %s/%s: %w", item.LibraryID, item.ItemID, err)
 	}

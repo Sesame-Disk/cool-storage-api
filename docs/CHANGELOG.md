@@ -8,6 +8,22 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-07-10 - GC orphan work revalidated canonically at execution time (P6b)
+
+- Added durable `LibraryGuardMode` semantics: scanner Phase 3/4 orphan work uses
+  `canonical_absent`, while normal library-cascade children use `deleted_at_identity`.
+- Queue, retry, postpone, DLQ, and DLQ requeue preserve the guard mode. Legacy rows remain
+  compatible: an empty mode plus `requires_library_deleted_check=true` resolves to
+  `deleted_at_identity`; unknown modes fail closed.
+- The worker acquires the existing library hard-delete lock, reads the canonical `libraries`
+  row by `(org_id, library_id)`, skips deletion when it exists, and fails closed on read errors.
+  Synchronous token renewal fences destructive commit/fs_object/reference mutations. Restore
+  takes the same library lock for its short idempotent operation.
+- Added scanner-to-worker, projection-drift, historical-marker, retry/DLQ round-trip, canonical
+  read-error, and unknown-mode regressions. P6b is closed; markerless discovery remains P7.
+
+---
+
 ## 2026-07-10 - GC existence checks fail closed; Phase 9 orphan discovery repaired
 
 - `LibraryExists`/`GroupExists` now distinguish `gocql.ErrNotFound` from Cassandra failures;
@@ -24,8 +40,7 @@ Session-by-session development history for SesameFS.
   real-Cassandra regression that inserts a `shares_by_group` row without a `groups` row and
   proves it remains discoverable. The streaming store now preserves a concurrent `iter.Close`
   error alongside a visitor abort via `errors.Join`.
-- P6b remains explicit follow-up debt: already-enqueued orphan commit/fs_object work lacks
-  canonical execution-time revalidation across projection drift or scanner→worker state changes.
+- P6b was explicit follow-up debt at this point and is closed by the subsequent entry above.
 
 ---
 

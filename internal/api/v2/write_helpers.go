@@ -11,6 +11,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 )
 
 // errFileTagNotFound is returned when a file tag lookup fails (SELECT miss).
@@ -956,16 +957,27 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 // restoreDeletedLibrary clears deleted_at, removes the GC marker, and re-adds
 // the library's storage to aggregate counters. Mirror image of softDeleteLibrary.
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
-	var lockedLibraryID string
-	if err := db.Session().Query(`
-		SELECT library_id FROM gc_library_hard_delete_locks WHERE library_id = ?
-	`, libraryID).Scan(&lockedLibraryID); err == nil {
-		return fmt.Errorf("library is pending permanent deletion")
-	} else if !errors.Is(err, gocql.ErrNotFound) {
-		return err
-	}
-
 	now := time.Now().UTC()
+	leaseToken := uuid.New()
+	applied, err := db.Session().Query(`
+		INSERT INTO gc_library_hard_delete_locks (library_id, started_at, heartbeat, lease_token)
+		VALUES (?, ?, ?, ?) IF NOT EXISTS
+	`, libraryID, now, now, leaseToken.String()).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return fmt.Errorf("acquire library restore lock: %w", err)
+	}
+	if !applied {
+		return fmt.Errorf("library is pending permanent deletion")
+	}
+	defer func() {
+		if err := db.Session().Query(`
+			DELETE FROM gc_library_hard_delete_locks
+			WHERE library_id = ? IF lease_token = ?
+		`, libraryID, leaseToken.String()).Exec(); err != nil {
+			log.Printf("[restoreDeletedLibrary] failed to release restore lock for %s: %v", libraryID, err)
+		}
+	}()
+
 	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err != nil {
 		return fmt.Errorf("read library projection row: %w", err)

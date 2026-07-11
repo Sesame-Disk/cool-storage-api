@@ -5,8 +5,8 @@
 > Current model: keyed `block_references`, durable candidates, LWT claim + live-ref recheck,
 > and write-ahead `gc_s3_orphans`. The retired `blocks.ref_count = -999` protocol is preserved
 > in Git history, not in this live diagram. The physical block-delete sequence is conservative,
-> and the transient-error fail-open in orphan classification (P6a) is now fixed (1D); a narrower
-> projection/TOCTOU execution-time revalidation gap (P6b) remains. Full audit:
+> and both the transient-error fail-open (P6a) and execution-time canonical revalidation gap
+> (P6b) are fixed. Markerless artifact discovery remains P7. Full audit:
 > [../GC-DELETE-CLEANUP-INVESTIGATION.md](../GC-DELETE-CLEANUP-INVESTIGATION.md).
 
 ## 1. Worker loop
@@ -73,10 +73,10 @@ flowchart TD
     Candidate --> DeleteFS
 ```
 
-Scanner-created orphan work runs with `RequiresLibraryDeletedCheck=false`. P6a closed the fail-open
-existence read that fed it destructive work; an execution-time canonical-library revalidation guard
-(P6b, `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01`) remains pending against projection drift and
-scanner→worker state changes.
+Scanner-created Phase 3/4 orphan work carries durable guard mode `canonical_absent`. At execution,
+the worker takes the library lock, point-reads canonical `libraries[(org_id, library_id)]`, skips a
+present library, fails closed on read errors, and synchronously fences destructive mutations. Normal
+cascade children use `deleted_at_identity`; legacy true booleans map to that mode. This closes P6b.
 
 ## 4. Library delete and purge handoff
 
@@ -131,8 +131,8 @@ Important limits:
 
 - P3/P4 discovery currently enumerates only `libraries_by_id` + `deleted_libraries`, so
   markerless artifact partitions are invisible (audit P7).
-- `LibraryExists`/`GroupExists` now fail **closed** on Cassandra errors (audit P6a, fixed 1D);
-  execution-time canonical revalidation of orphan work (P6b) is pending.
+- `LibraryExists`/`GroupExists` fail **closed** on Cassandra errors (P6a), and queued orphan work
+  is canonically revalidated at execution time (P6b); both are fixed.
 - Phase 9 streams `shares_by_group` with bounded process memory and cancellation, but the
   Cassandra read remains a global scan until bucketed partition discovery lands (audit P8).
 - `up:` expiry has durable discovery; `pub:` expiry does not (audit P4).
