@@ -2577,6 +2577,127 @@ func TestWorker_ProcessOrgCascade_RetryWhilePurgingContinues(t *testing.T) {
 	}
 }
 
+func TestWorker_ProcessOrgCascade_LibraryLockContentionPostponesWithoutRetryBurn(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	oldToken := uuid.New()
+
+	store.AddDeletedOrg(orgID, "Locked Corp", deletedAt)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libID, oldToken); err != nil || !acquired {
+		t.Fatalf("seed library hard-delete lock acquired=%v err=%v", acquired, err)
+	}
+	if err := store.EnqueueItem(orgID, deletedAt, ItemOrgCascade, orgID.String(), uuid.Nil, "", 4); err != nil {
+		t.Fatalf("enqueue org cascade failed: %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("lock-contended org cascade should not complete, got %d", n)
+	}
+	if !store.HasOrg(orgID) {
+		t.Fatal("org should remain while a library hard-delete lock is active")
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Fatalf("library should remain while a library hard-delete lock is active: %v", err)
+	}
+	if deletedMarker, err := store.GetLibraryDeletedAt(libID); err != nil || deletedMarker == nil {
+		t.Fatalf("deleted library marker should remain while org cascade is postponed: marker=%v err=%v", deletedMarker, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected one postponed queue item, got %d", len(items))
+	}
+	if items[0].RetryCount != 4 {
+		t.Fatalf("retry count after org-cascade library lock contention = %d, want 4", items[0].RetryCount)
+	}
+	if failed := store.FailedItems(orgID); len(failed) != 0 {
+		t.Fatalf("lock contention should not move org cascade to DLQ, got %d failed items", len(failed))
+	}
+}
+
+func TestWorker_ProcessOrgCascade_RetriesAfterLibraryLockReleases(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	oldToken := uuid.New()
+
+	store.AddDeletedOrg(orgID, "Retry Corp", deletedAt)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libID, oldToken); err != nil || !acquired {
+		t.Fatalf("seed library hard-delete lock acquired=%v err=%v", acquired, err)
+	}
+	if err := store.EnqueueItem(orgID, deletedAt, ItemOrgCascade, orgID.String(), uuid.Nil, "", 4); err != nil {
+		t.Fatalf("enqueue org cascade failed: %v", err)
+	}
+
+	if n, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("first ProcessOnce failed: %v", err)
+	} else if n != 0 {
+		t.Fatalf("lock-contended org cascade should not complete on first pass, got %d", n)
+	}
+	if err := store.ReleaseLibraryHardDeleteLock(libID, oldToken); err != nil {
+		t.Fatalf("release seeded library hard-delete lock: %v", err)
+	}
+
+	if n, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("second ProcessOnce failed: %v", err)
+	} else if n != 1 {
+		t.Fatalf("expected retried org cascade to complete once lock is released, got %d", n)
+	}
+	if store.HasOrg(orgID) {
+		t.Fatal("org should be hard-deleted after the retried org cascade acquires the library lock")
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err == nil {
+		t.Fatal("library should be hard-deleted after the retried org cascade acquires the library lock")
+	}
+}
+
+func TestWorker_ProcessOrgCascade_FenceFailsClosedWhenLibraryLockLost(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddDeletedOrg(orgID, "Fence Corp", deletedAt)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.forceRenewLibraryLockNotOwned = true
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemOrgCascade, ItemID: orgID.String()}
+	if err := w.processOrgCascade(context.Background(), item); err == nil {
+		t.Fatal("expected a fail-closed error when org cascade loses the per-library lock before hard delete")
+	}
+	if !store.HasOrg(orgID) {
+		t.Fatal("org must NOT be hard-deleted when the per-library fence loses the lock")
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Fatalf("library must NOT be hard-deleted when the per-library fence loses the lock: %v", err)
+	}
+	for _, entry := range store.AuditLogEntries() {
+		if entry.Action == "gc_library_cascade_deleted" || entry.Action == "gc_org_cascade_deleted" {
+			t.Fatalf("hard-delete audit %q should not be written before the per-library fence succeeds", entry.Action)
+		}
+	}
+}
+
 func TestWorker_ProcessUserCascade_AlreadyDeleted(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

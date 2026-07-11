@@ -1233,19 +1233,10 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		return nil
 	}
 
-	leaseToken := uuid.New()
-	acquired, err := w.store.AcquireLibraryHardDeleteLock(libraryID, leaseToken)
+	lease, fenceLibrary, err := w.acquireLibraryCascadeLease(ctx, libraryID, item.ItemID)
 	if err != nil {
-		return fmt.Errorf("failed to acquire library hard-delete lock for %s: %w", item.ItemID, err)
+		return err
 	}
-	if !acquired {
-		return hardDeleteInProgressError{Kind: "library", Target: libraryID.String(), ItemID: item.ItemID}
-	}
-	lease := newHardDeleteLease(ctx, "library", libraryID.String(), func() (bool, error) {
-		return w.store.RenewLibraryHardDeleteLock(libraryID, leaseToken)
-	}, func() error {
-		return w.store.ReleaseLibraryHardDeleteLock(libraryID, leaseToken)
-	})
 	defer lease.Close()
 
 	// Second stale-check after acquiring the lock.
@@ -1261,13 +1252,40 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		return err
 	}
 
-	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.BlockRepresentationID, item.StorageClass, identityAt); err != nil {
+	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.BlockRepresentationID, item.StorageClass, identityAt, fenceLibrary); err != nil {
 		return err
 	}
 	return lease.Check()
 }
 
-func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, libraryDeletedAt time.Time) error {
+func (w *Worker) acquireLibraryCascadeLease(ctx context.Context, libraryID uuid.UUID, itemID string) (*hardDeleteLease, func() error, error) {
+	leaseToken := uuid.New()
+	acquired, err := w.store.AcquireLibraryHardDeleteLock(libraryID, leaseToken)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to acquire library hard-delete lock for %s: %w", itemID, err)
+	}
+	if !acquired {
+		return nil, nil, hardDeleteInProgressError{Kind: "library", Target: libraryID.String(), ItemID: itemID}
+	}
+	lease := newHardDeleteLease(ctx, "library", libraryID.String(), func() (bool, error) {
+		return w.store.RenewLibraryHardDeleteLock(libraryID, leaseToken)
+	}, func() error {
+		return w.store.ReleaseLibraryHardDeleteLock(libraryID, leaseToken)
+	})
+	fence := func() error {
+		owned, err := w.store.RenewLibraryHardDeleteLock(libraryID, leaseToken)
+		if err != nil {
+			return fmt.Errorf("failed to fence library cascade for %s: %w", libraryID, err)
+		}
+		if !owned {
+			return fmt.Errorf("lost library hard-delete lock for %s", libraryID)
+		}
+		return nil
+	}
+	return lease, fence, nil
+}
+
+func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, libraryDeletedAt time.Time, fenceLibrary func() error) error {
 	if storageClass == "" {
 		storageClass, _ = w.store.GetLibraryStorageClass(orgID, libraryID)
 	}
@@ -1276,10 +1294,16 @@ func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresent
 		return fmt.Errorf("failed to enqueue library contents: %w", err)
 	}
 
+	if err := fenceLibrary(); err != nil {
+		return err
+	}
 	if err := w.store.DeleteLibraryStorageCounter(orgID, libraryID); err != nil {
 		return fmt.Errorf("failed to delete library storage counter for %s: %w", libraryID, err)
 	}
 
+	if err := fenceLibrary(); err != nil {
+		return err
+	}
 	if err := w.store.HardDeleteLibrary(orgID, libraryID); err != nil {
 		return fmt.Errorf("failed to hard-delete library %s: %w", libraryID, err)
 	}
@@ -1372,26 +1396,52 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		if err := lease.Check(); err != nil {
 			return err
 		}
-		libraryDeletedAt := lib.DeletedAt
-		if lib.DeletedAt.IsZero() {
-			if err := w.store.SoftDeleteLibrary(orgID, lib.LibraryID, uuid.Nil); err != nil {
-				return fmt.Errorf("failed to soft-delete library %s during org cascade: %w", lib.LibraryID, err)
+		libraryLease, fenceLibrary, err := w.acquireLibraryCascadeLease(ctx, lib.LibraryID, item.ItemID)
+		if err != nil {
+			return err
+		}
+		funcErr := func() error {
+			defer libraryLease.Close()
+			if err := lease.Check(); err != nil {
+				return err
 			}
 			deletedLibraryAt, err := w.store.GetLibraryDeletedAt(lib.LibraryID)
 			if err != nil {
 				return fmt.Errorf("failed to read deleted library marker for %s during org cascade: %w", lib.LibraryID, err)
 			}
 			if deletedLibraryAt == nil {
-				return fmt.Errorf("missing deleted library marker for %s during org cascade", lib.LibraryID)
+				exists, err := w.store.CanonicalLibraryExists(orgID, lib.LibraryID)
+				if err != nil {
+					return fmt.Errorf("failed to read canonical library row for %s during org cascade: %w", lib.LibraryID, err)
+				}
+				if !exists {
+					return nil
+				}
+				if err := w.store.SoftDeleteLibrary(orgID, lib.LibraryID, uuid.Nil); err != nil {
+					return fmt.Errorf("failed to soft-delete library %s during org cascade: %w", lib.LibraryID, err)
+				}
+				deletedLibraryAt, err = w.store.GetLibraryDeletedAt(lib.LibraryID)
+				if err != nil {
+					return fmt.Errorf("failed to read deleted library marker for %s during org cascade: %w", lib.LibraryID, err)
+				}
+				if deletedLibraryAt == nil {
+					return fmt.Errorf("missing deleted library marker for %s during org cascade", lib.LibraryID)
+				}
 			}
-			libraryDeletedAt = *deletedLibraryAt
-		}
-		blockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(w.store, orgID, lib.LibraryID, "", "org cascade")
-		if err != nil {
-			return err
-		}
-		if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, blockRepresentationID, lib.StorageClass, libraryDeletedAt); err != nil {
-			return fmt.Errorf("failed to cascade-delete library %s during org delete: %w", lib.LibraryID, err)
+			blockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(w.store, orgID, lib.LibraryID, "", "org cascade")
+			if err != nil {
+				return err
+			}
+			if err := libraryLease.Check(); err != nil {
+				return err
+			}
+			if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, blockRepresentationID, lib.StorageClass, *deletedLibraryAt, fenceLibrary); err != nil {
+				return fmt.Errorf("failed to cascade-delete library %s during org delete: %w", lib.LibraryID, err)
+			}
+			return libraryLease.Check()
+		}()
+		if funcErr != nil {
+			return funcErr
 		}
 		if err := lease.Check(); err != nil {
 			return err
