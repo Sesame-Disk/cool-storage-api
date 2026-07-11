@@ -73,7 +73,8 @@ existence check (P6) that could enqueue destructive work for live libraries is *
 | **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
 | **Existence Checks Fail Open (transient errors, P6a)** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors and scanner Phases 3/4/9 fail closed. Phase 9 scans `shares_by_group` directly and uses each projection row's `OrgID`, with unit and real-Cassandra regression coverage. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
 | **Worker Canonical Revalidation of Orphan Work (P6b)** | ✅ Fixed (2026-07-10) | Durable `canonical_absent` work is point-read against `libraries[(org_id, library_id)]` under the existing library lock; presence/read/fence/unknown-mode paths fail closed. Retry/DLQ and legacy compatibility are covered. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
-| **Cascade Deletes Counter Before Hard Delete** | ✅ Fixed (2026-07-11) | `cascadeDeleteLibrary` now hard-deletes the canonical row before removing the per-library storage counter, closing a crash+restore window that could reactivate an under-counted library. A canonical-absent retry reclaims an orphaned counter idempotently. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01 below. |
+| **Cascade Deletes Counter Before Hard Delete** | ✅ Fixed (2026-07-11) | `cascadeDeleteLibrary` now hard-deletes the canonical row before removing the per-library storage counter, closing a crash+restore window that could reactivate an under-counted library. The reordering (the real fix) covers both cascade callers; the counter auto-reclaim is wired only into `processLibraryCascade`. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01 below. |
+| **Org Cascade Can Leak an Inert Counter Row** | 🟡 Confirmed gap (Low) | If the per-library counter delete fails/crashes after the hard delete during an **org** cascade, the retry cannot re-find the (now canonical-absent) library to reclaim its counter. The row is inert — aggregates are adjusted at soft-delete and nothing sums `lib:*` counters — so no accounting impact. See ISSUE-GC-ORG-CASCADE-COUNTER-LEAK-01 below. |
 | **Legacy `NULL + false` Orphan Rows Run Unguarded** | 🟡 Confirmed gap (Low, pre-prod) | Orphan queue/DLQ rows written before migration 011 (empty `library_guard_mode` **and** `requires_library_deleted_check=false`) hydrate as `LibraryGuardNone` and skip the canonical guard — identical to `main`'s behavior, so not a regression, but P6b does not retroactively protect already-enqueued orphan work. See ISSUE-GC-LEGACY-ORPHAN-UNGUARDED-01 below. |
 | **Org Cascade Re-Soft-Deletes on Marker Drift** | 🟡 Confirmed, defense-in-depth (Low) | If `libraries.deleted_at` is set but the `deleted_libraries` marker is absent, the org cascade re-runs `SoftDeleteLibrary`, re-stamping `deleted_at` and re-subtracting aggregates (double-decrement, clamped). Unreachable under normal ops (marker + canonical are written/cleared atomically), so a corruption-only hardening. See ISSUE-GC-ORG-CASCADE-REMARK-01 below. |
 | **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (High/Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
@@ -3820,6 +3821,56 @@ in this window.
   definitive event is recorded even if the reclamation must be retried.
 - Tests: `TestWorker_ProcessLibraryCascade_HardDeletePrecedesCounterCleanup`,
   `..._CounterFailureReclaimedOnRetry`, `..._RestoredLibraryCounterNotReclaimed`.
+
+#### Scope of the reclamation (important)
+
+The **reordering** — the actual safety fix that closes the restore/under-count window — lives in the
+shared `cascadeDeleteLibrary`, so it protects **both** callers: `processLibraryCascade` and
+`processOrgCascade`. Once the canonical row is gone, restore refuses regardless of which cascade
+removed it.
+
+The **auto-reclamation** of a counter orphaned by a crash between the hard delete and the counter
+cleanup is only wired into `processLibraryCascade` (its queue item carries the `libraryID`, so a
+retry re-runs against the same library). `processOrgCascade` discovers libraries via
+`ListLibrariesForOrg`, which reads the canonical `libraries` table; a library that was already
+hard-deleted is gone from that list, so an org-cascade retry cannot re-find it to reclaim its
+counter. See ISSUE-GC-ORG-CASCADE-COUNTER-LEAK-01.
+
+---
+
+### ISSUE-GC-ORG-CASCADE-COUNTER-LEAK-01: Org Cascade Can Leak an Inert Storage-Counter Row
+
+**Status**: 🟡 Confirmed gap — Low (storage hygiene; no accounting/data impact)
+**Severity**: Low — a dead `lib:<org>:<library>` row for a fully-deleted org, never read again
+**Affected**: `processOrgCascade` → `cascadeDeleteLibrary` (counter reclamation only)
+
+#### Problem
+
+`cascadeDeleteLibrary` deletes the per-library storage counter after `HardDeleteLibrary`. If that
+counter delete fails (or the worker crashes) after the hard delete during an **org** cascade, the
+org-cascade retry re-lists libraries via `ListLibrariesForOrg` (canonical table) and no longer sees
+the hard-deleted library, so `reclaimHardDeletedLibraryStorageCounter` — which only runs in
+`processLibraryCascade` — is never invoked for it. The `lib:<org>:<library>` counter row is retained.
+
+#### Why it is Low
+
+The org/user/platform aggregates are adjusted at **soft-delete** time, independently of the lib
+counter (`storage.go`: *"Aggregate scopes were already adjusted by a prior soft-delete"*). No code
+path sums or scans `lib:*` counters into an aggregate — the only readers are per-library
+soft-delete/restore/sync, all impossible once the library (and, here, the entire org) is
+hard-deleted. The leaked row is therefore inert: it never revives the library, never affects any
+live counter, and never causes an under- or over-count. It is a dead row occupying a little
+Cassandra space.
+
+#### Future fix (if this is ever worth closing)
+
+Make the counter cleanup **durable and parent-independent**: enqueue an `ItemLibraryCounterCleanup`
+item (carrying `org_id` + `library_id` + `identity_at`) in `cascadeDeleteLibrary` before the hard
+delete. On processing: canonical present → skip (complete); canonical absent → idempotent
+`DeleteLibraryStorageCounter`. That single durable mechanism would cover both cascade callers and
+survive a full process crash, replacing both the inline delete and the library-cascade-only
+reclamation. Deferred because it adds a new safety-critical queue-item type and a queue item per
+library delete to clean up an otherwise inert row.
 
 ---
 

@@ -21,6 +21,12 @@ Session-by-session development history for SesameFS.
   canonical row is absent and idempotently deletes the orphaned counter. A live/restored library
   (canonical present) is never touched. The cascade audit is now written right after the hard
   delete so the definitive event survives a counter-cleanup retry.
+- Scope note: the reordering (the safety fix) is in the shared `cascadeDeleteLibrary`, so it covers
+  both `processLibraryCascade` and `processOrgCascade`. The counter auto-reclaim is only wired into
+  `processLibraryCascade`; an org cascade whose counter delete fails after the hard delete can leak
+  an **inert** `lib:*` row (no aggregate impact — aggregates are adjusted at soft-delete). Tracked
+  as Low debt ISSUE-GC-ORG-CASCADE-COUNTER-LEAK-01, with a durable `ItemLibraryCounterCleanup` item
+  noted as the future fix.
 - Tests: hard-delete-precedes-counter ordering, counter-failure-reclaimed-on-retry, and
   restored-library-counter-not-reclaimed. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01.
 - Documented the remaining non-blocking GC debts surfaced by the merge audit: legacy `NULL +
