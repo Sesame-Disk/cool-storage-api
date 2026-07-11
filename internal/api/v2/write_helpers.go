@@ -8,6 +8,7 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -959,21 +960,16 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
 	now := time.Now().UTC()
 	leaseToken := uuid.New()
-	applied, err := db.Session().Query(`
-		INSERT INTO gc_library_hard_delete_locks (library_id, started_at, heartbeat, lease_token)
-		VALUES (?, ?, ?, ?) IF NOT EXISTS
-	`, libraryID, now, now, leaseToken.String()).MapScanCAS(map[string]interface{}{})
+	libraryUUID := uuid.MustParse(libraryID)
+	acquired, err := gcpkg.AcquireLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("acquire library restore lock: %w", err)
 	}
-	if !applied {
+	if !acquired {
 		return fmt.Errorf("library is pending permanent deletion")
 	}
 	defer func() {
-		if err := db.Session().Query(`
-			DELETE FROM gc_library_hard_delete_locks
-			WHERE library_id = ? IF lease_token = ?
-		`, libraryID, leaseToken.String()).Exec(); err != nil {
+		if err := gcpkg.ReleaseLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken); err != nil {
 			log.Printf("[restoreDeletedLibrary] failed to release restore lock for %s: %v", libraryID, err)
 		}
 	}()
@@ -999,11 +995,19 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	batch.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID)
 	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, now)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
+	owned, err := gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("fence library restore lock for %s: %w", libraryID, err)
+	}
+	if !owned {
+		return fmt.Errorf("lost library restore lock for %s", libraryID)
+	}
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("restore library: %w", err)
 	}
 
-	// Re-add the library's storage to aggregates.
+	// Re-add the library's storage to aggregates after the canonical row and
+	// deleted marker have been restored.
 	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
 	return nil
 }

@@ -715,6 +715,91 @@ func TestWorker_ProcessFSObject_OrphanSkipsWhenCanonicalLibraryLive(t *testing.T
 	}
 }
 
+func TestWorker_ProcessFSObject_FenceFailsClosedWhenLockLostBeforeDelete(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddFSObject(libID, "fs-1", "dir", nil)
+	store.forceRenewLibraryLockNotOwned = true
+
+	item := QueueItem{
+		OrgID:                       orgID,
+		QueuedAt:                    time.Now().UTC(),
+		IdentityAt:                  time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true,
+		LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
+		ItemType:                    ItemFSObject,
+		ItemID:                      "fs-1",
+		LibraryID:                   libID,
+		BlockRepresentationID:       db.PlainBlockRepresentationID,
+	}
+	if err := w.processFSObject(context.Background(), item); err == nil {
+		t.Fatal("expected a fail-closed error when the fs_object delete fence loses the library lock")
+	}
+	if _, err := store.GetFSObject(libID, "fs-1"); err != nil {
+		t.Fatal("fs_object must NOT be deleted when the pre-delete fence loses the lock")
+	}
+}
+
+func TestWorker_ProcessFSObject_LongReferenceCleanupFailsClosedWhenLockLostMidLoop(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddFSObject(libID, "fs-1", "file", []string{"blk-1", "blk-2"})
+	store.AddBlock(orgID, "blk-1", "hot", 0)
+	store.AddBlock(orgID, "blk-2", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-1", libID, "fs-1")
+	store.AddFSObjectReferenceForTest(orgID, "blk-2", libID, "fs-1")
+
+	base := time.Now().UTC()
+	ticks := []time.Time{base, base.Add(fsObjectReferenceFenceInterval + time.Minute)}
+	w.clock = func() time.Time {
+		if len(ticks) == 0 {
+			return base.Add(2 * (fsObjectReferenceFenceInterval + time.Minute))
+		}
+		now := ticks[0]
+		ticks = ticks[1:]
+		return now
+	}
+	firstBlockChecked := false
+	store.blockHasReferencesHook = func(_ uuid.UUID, blockID string, current bool) (bool, error) {
+		if blockID == "blk-1" && !firstBlockChecked {
+			firstBlockChecked = true
+			store.forceRenewLibraryLockNotOwned = true
+		}
+		return current, nil
+	}
+
+	item := QueueItem{
+		OrgID:                       orgID,
+		QueuedAt:                    base,
+		IdentityAt:                  base,
+		RequiresLibraryDeletedCheck: true,
+		LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
+		ItemType:                    ItemFSObject,
+		ItemID:                      "fs-1",
+		LibraryID:                   libID,
+		BlockRepresentationID:       db.PlainBlockRepresentationID,
+	}
+	if err := w.processFSObject(context.Background(), item); err == nil {
+		t.Fatal("expected a fail-closed error when the long block-reference cleanup loses the library lock")
+	}
+	if _, err := store.GetFSObject(libID, "fs-1"); err != nil {
+		t.Fatal("fs_object must NOT be deleted when long reference cleanup loses the lock")
+	}
+	if got := store.BlockReferenceCount(orgID, "blk-1"); got != 0 {
+		t.Fatalf("first block references = %d, want 0 after the first guarded mutation", got)
+	}
+	if got := store.BlockReferenceCount(orgID, "blk-2"); got != 1 {
+		t.Fatalf("second block references = %d, want 1 because cleanup must stop before the stale-lease mutation", got)
+	}
+}
+
+// This intentionally proves the worker uses the queued org plus library UUID as
+// the canonical point-read key. It is not evidence of global library absence on
+// its own; the broader system invariant is that library_id is globally unique.
 func TestWorker_ProcessCommit_OrphanUsesScopedCanonicalPointRead(t *testing.T) {
 	store := NewMockStore()
 	worker := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
@@ -2561,7 +2646,7 @@ func TestWorker_RemoveFSObjectBlockReferences_ReturnsOnlyZeroTransitions(t *test
 	store.AddFSObjectReferenceForTest(orgID, "stays-positive", libID, "fs-obj")
 	store.AddFSObjectReferenceForTest(orgID, "stays-positive", libID, "fs-other")
 
-	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-obj", []string{"hits-zero", "stays-positive"})
+	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-obj", []string{"hits-zero", "stays-positive"}, func() error { return nil })
 	if err != nil {
 		t.Fatalf("removeFSObjectBlockReferences failed: %v", err)
 	}
@@ -2601,7 +2686,7 @@ func TestWorker_RemoveFSObjectBlockReferences_SoftDeletedLibraryUsesStoredRepres
 		t.Fatalf("SoftDeleteLibrary failed: %v", err)
 	}
 
-	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-soft", []string{externalBlockID})
+	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-soft", []string{externalBlockID}, func() error { return nil })
 	if err != nil {
 		t.Fatalf("removeFSObjectBlockReferences failed: %v", err)
 	}

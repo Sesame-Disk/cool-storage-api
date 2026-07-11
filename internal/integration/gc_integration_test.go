@@ -1871,6 +1871,108 @@ func TestGC_DequeueBatchOrdersAcrossQueueBuckets(t *testing.T) {
 	}
 }
 
+func TestGC_LegacyLibraryGuardModeNullHydratesAsDeletedAtIdentity(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	store := gcpkg.NewCassandraStore(database)
+	orgID, libraryID := uuid.New(), uuid.New()
+	queuedAt := time.Now().UTC().Truncate(time.Millisecond)
+	itemID := "legacy-guard-mode-commit"
+	bucket := gcpkg.QueueBucket(orgID, gcpkg.ItemCommit, itemID)
+
+	if err := session.Query(`
+		INSERT INTO gc_queue (
+			org_id, bucket, queued_at, identity_at, requires_library_deleted_check,
+			item_type, item_id, library_id, storage_class, retry_count
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID.String(), bucket, queuedAt, queuedAt, true, string(gcpkg.ItemCommit), itemID, libraryID.String(), "hot", 0).Exec(); err != nil {
+		t.Fatalf("failed to insert legacy gc_queue row: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`
+			DELETE FROM gc_queue
+			WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
+		`, orgID.String(), bucket, queuedAt, string(gcpkg.ItemCommit), itemID).Exec()
+	})
+
+	items, err := store.DequeueBatch(orgID, 1, queuedAt.Add(time.Second))
+	if err != nil {
+		t.Fatalf("DequeueBatch failed: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 dequeued item, got %d", len(items))
+	}
+	if items[0].LibraryGuardMode != gcpkg.LibraryGuardDeletedAtIdentity {
+		t.Fatalf("legacy null library_guard_mode hydrated as %q, want %q", items[0].LibraryGuardMode, gcpkg.LibraryGuardDeletedAtIdentity)
+	}
+}
+
+func TestGC_LibraryHardDeleteLockLeaseSetsTTLAndRecoversStaleRows(t *testing.T) {
+	requireCassandra(t)
+
+	session := shareProjectionDBForTest(t).Session()
+	freshLibraryID, staleLibraryID := uuid.New(), uuid.New()
+	freshToken, staleToken, takeoverToken := uuid.New(), uuid.New(), uuid.New()
+
+	acquired, err := gcpkg.AcquireLibraryHardDeleteLockLease(session, freshLibraryID, freshToken)
+	if err != nil {
+		t.Fatalf("AcquireLibraryHardDeleteLockLease(fresh): %v", err)
+	}
+	if !acquired {
+		t.Fatal("expected fresh library lock acquisition to succeed")
+	}
+	defer func() {
+		_ = gcpkg.ReleaseLibraryHardDeleteLockLease(session, freshLibraryID, freshToken)
+	}()
+
+	var freshTTL int
+	if err := session.Query(`
+		SELECT TTL(heartbeat) FROM gc_library_hard_delete_locks WHERE library_id = ?
+	`, freshLibraryID.String()).Scan(&freshTTL); err != nil {
+		t.Fatalf("read TTL for fresh library lock: %v", err)
+	}
+	if freshTTL <= 0 || freshTTL > gcpkgTestHardDeleteLockTTLSeconds {
+		t.Fatalf("fresh library lock TTL = %d, want 1..%d", freshTTL, gcpkgTestHardDeleteLockTTLSeconds)
+	}
+
+	staleAt := time.Now().UTC().Add(-2 * time.Hour)
+	if err := session.Query(`
+		INSERT INTO gc_library_hard_delete_locks (library_id, started_at, heartbeat, lease_token)
+		VALUES (?, ?, ?, ?)
+	`, staleLibraryID.String(), staleAt, staleAt, staleToken.String()).Exec(); err != nil {
+		t.Fatalf("seed stale library lock: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, staleLibraryID.String()).Exec()
+	})
+
+	acquired, err = gcpkg.AcquireLibraryHardDeleteLockLease(session, staleLibraryID, takeoverToken)
+	if err != nil {
+		t.Fatalf("AcquireLibraryHardDeleteLockLease(stale takeover): %v", err)
+	}
+	if !acquired {
+		t.Fatal("expected stale library lock takeover to succeed")
+	}
+
+	var leaseToken string
+	var takeoverTTL int
+	if err := session.Query(`
+		SELECT lease_token, TTL(heartbeat) FROM gc_library_hard_delete_locks WHERE library_id = ?
+	`, staleLibraryID.String()).Scan(&leaseToken, &takeoverTTL); err != nil {
+		t.Fatalf("read stale-taken-over library lock: %v", err)
+	}
+	if leaseToken != takeoverToken.String() {
+		t.Fatalf("stale library lock lease_token = %s, want %s", leaseToken, takeoverToken)
+	}
+	if takeoverTTL <= 0 || takeoverTTL > gcpkgTestHardDeleteLockTTLSeconds {
+		t.Fatalf("stale takeover TTL = %d, want 1..%d", takeoverTTL, gcpkgTestHardDeleteLockTTLSeconds)
+	}
+}
+
+const gcpkgTestHardDeleteLockTTLSeconds = 21600
+
 // TestGC_MaxRetryItemMovesToFailedQueue verifies that a max-retry item is
 // removed from the live queue and captured in gc_failed_items.
 func TestGC_MaxRetryItemMovesToFailedQueue(t *testing.T) {

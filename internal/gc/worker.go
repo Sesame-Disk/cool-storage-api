@@ -74,6 +74,7 @@ var s3DeleteRetryDelays = []time.Duration{
 
 var hardDeleteLockHeartbeatInterval = 30 * time.Minute
 var hardDeleteLockStaleAfter = 3 * hardDeleteLockHeartbeatInterval
+var fsObjectReferenceFenceInterval = 5 * time.Minute
 
 type hardDeleteLease struct {
 	stopCh  chan struct{}
@@ -139,6 +140,21 @@ func (l *hardDeleteLease) Close() {
 			l.setErr(err)
 		}
 	})
+}
+
+func (w *Worker) newTimedFence(fence func() error, interval time.Duration) func() error {
+	lastFenceAt := time.Time{}
+	return func() error {
+		now := w.clock().UTC()
+		if interval > 0 && !lastFenceAt.IsZero() && !now.Before(lastFenceAt) && now.Sub(lastFenceAt) < interval {
+			return nil
+		}
+		if err := fence(); err != nil {
+			return err
+		}
+		lastFenceAt = now
+		return nil
+	}
 }
 
 // Worker drains the gc_queue and deletes items from S3 and the database.
@@ -926,12 +942,11 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 	}
 
 	// If it's a file with blocks, remove its permanent block references. Any block
-	// left with no references becomes a GC candidate.
+	// left with no references becomes a GC candidate. Re-fence periodically during
+	// long loops so a suspended worker cannot keep mutating with a stale lease.
 	if len(fsObj.BlockIDs) > 0 {
-		if err := fenceGuard(); err != nil {
-			return err
-		}
-		zeroRefBlocks, err := w.removeFSObjectBlockReferences(item.OrgID, item.LibraryID, item.BlockRepresentationID, item.ItemID, fsObj.BlockIDs)
+		referenceFence := w.newTimedFence(fenceGuard, fsObjectReferenceFenceInterval)
+		zeroRefBlocks, err := w.removeFSObjectBlockReferences(item.OrgID, item.LibraryID, item.BlockRepresentationID, item.ItemID, fsObj.BlockIDs, referenceFence)
 		if err != nil {
 			return err
 		}
@@ -1451,7 +1466,7 @@ func fsObjectBlockDecrementTaskID(libraryID uuid.UUID, fsID string, identityAt t
 // resolved to internal SHA-256 IDs first. Idempotent: deleting a missing reference
 // is a no-op, so a retried fs_object GC pass is safe (no double-decrement risk —
 // the whole class of decrement idempotency bugs disappears with the counter).
-func (w *Worker) removeFSObjectBlockReferences(orgID, libraryID uuid.UUID, blockRepresentationID, fsID string, blockIDs []string) ([]string, error) {
+func (w *Worker) removeFSObjectBlockReferences(orgID, libraryID uuid.UUID, blockRepresentationID, fsID string, blockIDs []string, beforeMutation func() error) ([]string, error) {
 	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, libraryID, blockRepresentationID, blockIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve block IDs for fs_object %s/%s: %w", libraryID, fsID, err)
@@ -1466,6 +1481,9 @@ func (w *Worker) removeFSObjectBlockReferences(orgID, libraryID uuid.UUID, block
 		}
 		seen[blockID] = struct{}{}
 
+		if err := beforeMutation(); err != nil {
+			return nil, fmt.Errorf("failed to fence block reference cleanup for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
+		}
 		if err := w.store.RemoveBlockReference(orgID, blockID, referrer); err != nil {
 			return nil, fmt.Errorf("failed to remove block reference for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
 		}
