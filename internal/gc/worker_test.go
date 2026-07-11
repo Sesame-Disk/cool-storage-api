@@ -2069,7 +2069,39 @@ func TestWorker_ProcessLibraryCascade_FullCascade(t *testing.T) {
 	}
 }
 
-func TestWorker_ProcessLibraryCascade_StorageCounterFailureDoesNotHardDeleteLibrary(t *testing.T) {
+// The library hard delete must happen BEFORE the per-library storage counter is
+// removed. Deleting the counter first left a window where a crash between the two
+// let a concurrent restore reactivate a library whose storage was already
+// subtracted from the aggregates (under-counting). See reclaimHardDeletedLibraryStorageCounter.
+func TestWorker_ProcessLibraryCascade_HardDeletePrecedesCounterCleanup(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+	if err := w.processLibraryCascade(context.Background(), item); err != nil {
+		t.Fatalf("processLibraryCascade failed: %v", err)
+	}
+
+	want := []string{"HardDeleteLibrary", "DeleteLibraryStorageCounter"}
+	if len(store.libraryDestructiveCalls) != 2 ||
+		store.libraryDestructiveCalls[0] != want[0] || store.libraryDestructiveCalls[1] != want[1] {
+		t.Fatalf("destructive call order = %v, want %v (hard delete must precede counter cleanup)", store.libraryDestructiveCalls, want)
+	}
+}
+
+// If the worker crashes after HardDeleteLibrary but before the counter cleanup, the
+// orphaned counter must be reclaimed on the next cascade pass. The retry sees the
+// marker gone and the canonical row absent, and idempotently deletes the counter.
+func TestWorker_ProcessLibraryCascade_CounterFailureReclaimedOnRetry(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -2084,17 +2116,62 @@ func TestWorker_ProcessLibraryCascade_StorageCounterFailureDoesNotHardDeleteLibr
 	store.deleteLibraryStorageCounterErr = errors.New("counter delete unavailable")
 
 	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+
+	// First pass: hard delete succeeds (point of no return), counter cleanup fails.
 	err := w.processLibraryCascade(context.Background(), item)
 	if err == nil {
-		t.Fatal("expected storage counter cleanup failure")
+		t.Fatal("expected storage counter cleanup failure on first pass")
 	}
-	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
-		t.Fatalf("library should remain for retry when counter cleanup fails: %v", err)
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err == nil {
+		t.Fatal("library should be hard-deleted once the point of no return is passed")
 	}
+	// The definitive cascade event is still recorded even though counter cleanup failed.
+	sawAudit := false
 	for _, entry := range store.AuditLogEntries() {
 		if entry.Action == "gc_library_cascade_deleted" {
-			t.Fatal("library hard-delete audit should not be written before successful counter cleanup")
+			sawAudit = true
 		}
+	}
+	if !sawAudit {
+		t.Fatal("gc_library_cascade_deleted audit should be written after the hard delete")
+	}
+
+	// Retry: marker gone + canonical absent → reclaim the orphaned counter idempotently.
+	store.deleteLibraryStorageCounterErr = nil
+	store.libraryDestructiveCalls = nil
+	if err := w.processLibraryCascade(context.Background(), item); err != nil {
+		t.Fatalf("retry processLibraryCascade failed: %v", err)
+	}
+	if store.deleteLibraryStorageCounterFor[libID] != 1 {
+		t.Fatalf("expected orphaned counter reclaimed exactly once on retry, got %d", store.deleteLibraryStorageCounterFor[libID])
+	}
+}
+
+// A cascade item whose marker is gone because the library was RESTORED (canonical
+// row present again) must never touch the live library's storage counter.
+func TestWorker_ProcessLibraryCascade_RestoredLibraryCounterNotReclaimed(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	// Library is live (canonical present) with no deleted marker — the restored state.
+	store.AddLibrary(orgID, libID, "hot")
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+	if err := w.processLibraryCascade(context.Background(), item); err != nil {
+		t.Fatalf("processLibraryCascade should skip a restored library, got: %v", err)
+	}
+	if store.deleteLibraryStorageCounterFor[libID] != 0 {
+		t.Fatalf("restored library's counter must not be reclaimed, got %d deletes", store.deleteLibraryStorageCounterFor[libID])
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Fatalf("restored library must remain live: %v", err)
 	}
 }
 

@@ -1229,6 +1229,17 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 	}
 	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
 	if deletedAt == nil || !deletedAt.Equal(identityAt) {
+		if deletedAt == nil {
+			// The delete marker is gone: either the library was restored (canonical
+			// row present again) or a prior cascade pass already hard-deleted it. In
+			// the latter case a crash between HardDeleteLibrary and
+			// DeleteLibraryStorageCounter may have left the per-library storage
+			// counter behind — reclaim it, but only after confirming the canonical
+			// row is absent so we never disturb a restored library's live counter.
+			if err := w.reclaimHardDeletedLibraryStorageCounter(item.OrgID, libraryID); err != nil {
+				return err
+			}
+		}
 		log.Printf("[GC Worker] Skipping stale library cascade for %s (current deleted_at=%v identity_at=%v queued_at=%v)", item.ItemID, deletedAt, identityAt, item.QueuedAt)
 		return nil
 	}
@@ -1256,6 +1267,27 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		return err
 	}
 	return lease.Check()
+}
+
+// reclaimHardDeletedLibraryStorageCounter idempotently deletes the per-library
+// storage counter of a library whose canonical row is already gone. It exists to
+// recover from a crash between HardDeleteLibrary and DeleteLibraryStorageCounter
+// (see cascadeDeleteLibrary): the hard delete succeeded but the counter cleanup
+// did not, leaving an orphaned counter that would otherwise inflate future
+// reconciliation. It refuses to act while the canonical row still exists, so a
+// restored library keeps its live counter. Fails closed on read errors.
+func (w *Worker) reclaimHardDeletedLibraryStorageCounter(orgID, libraryID uuid.UUID) error {
+	exists, err := w.store.CanonicalLibraryExists(orgID, libraryID)
+	if err != nil {
+		return fmt.Errorf("failed to confirm canonical library absence before storage-counter reclaim for %s: %w", libraryID, err)
+	}
+	if exists {
+		return nil
+	}
+	if err := w.store.DeleteLibraryStorageCounter(orgID, libraryID); err != nil {
+		return fmt.Errorf("failed to reclaim storage counter for hard-deleted library %s: %w", libraryID, err)
+	}
+	return nil
 }
 
 func (w *Worker) acquireLibraryCascadeLease(ctx context.Context, libraryID uuid.UUID, itemID string) (*hardDeleteLease, func() error, error) {
@@ -1294,13 +1326,12 @@ func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresent
 		return fmt.Errorf("failed to enqueue library contents: %w", err)
 	}
 
-	if err := fenceLibrary(); err != nil {
-		return err
-	}
-	if err := w.store.DeleteLibraryStorageCounter(orgID, libraryID); err != nil {
-		return fmt.Errorf("failed to delete library storage counter for %s: %w", libraryID, err)
-	}
-
+	// Fence before the point of no return, then hard-delete the canonical row +
+	// marker FIRST. Ordering matters: once the canonical `libraries` row is gone,
+	// restoreDeletedLibrary can no longer resurrect the library, so a concurrent
+	// restore cannot observe a deleted storage counter and reactivate an
+	// under-counted library. Deleting the counter before the hard delete (the old
+	// order) left exactly that window. See DEBT-GC-COUNTER-ORDERING history.
 	if err := fenceLibrary(); err != nil {
 		return err
 	}
@@ -1308,6 +1339,9 @@ func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresent
 		return fmt.Errorf("failed to hard-delete library %s: %w", libraryID, err)
 	}
 
+	// The library is now definitively gone — record the audit here (not after the
+	// counter cleanup) so the event is captured even if the reclamation below has to
+	// be retried on a later pass.
 	w.store.WriteAuditLog(AuditLogEntry{
 		OrgID:      orgID,
 		Action:     "gc_library_cascade_deleted",
@@ -1317,8 +1351,17 @@ func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresent
 		Details:    fmt.Sprintf("storage_class=%s", storageClass),
 		Timestamp:  time.Now(),
 	})
-
 	log.Printf("[GC Worker] Cascade-deleted library %s (storage_class=%s)", libraryID, storageClass)
+
+	// Reclaim the per-library storage counter after the library is gone. No fence
+	// here: the canonical row no longer exists, so losing the lease past this point
+	// cannot corrupt a live/restored library. A failure still returns an error so the
+	// item is retried; the retry lands on the canonical-absent reclamation path in
+	// processLibraryCascade, which cleans the orphaned counter idempotently.
+	if err := w.store.DeleteLibraryStorageCounter(orgID, libraryID); err != nil {
+		return fmt.Errorf("failed to delete library storage counter for %s: %w", libraryID, err)
+	}
+
 	return nil
 }
 

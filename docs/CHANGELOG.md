@@ -8,6 +8,27 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-07-11 - GC library cascade hard-deletes before removing the storage counter
+
+- Reordered `cascadeDeleteLibrary` so `HardDeleteLibrary` (canonical row + delete marker)
+  runs **before** `DeleteLibraryStorageCounter`. Removing the counter first left a window where
+  a crash between the two, followed by a stale-lease restore, could reactivate a library whose
+  storage had already been subtracted from the org/user/platform aggregates — an under-count and
+  potential quota bypass. Once the canonical row is gone, `restoreDeletedLibrary` refuses, so the
+  counter cleanup below it is pure reclamation.
+- Added a canonical-absent reclamation path in `processLibraryCascade`: if the worker crashes
+  after the hard delete but before the counter cleanup, the retry (marker gone) confirms the
+  canonical row is absent and idempotently deletes the orphaned counter. A live/restored library
+  (canonical present) is never touched. The cascade audit is now written right after the hard
+  delete so the definitive event survives a counter-cleanup retry.
+- Tests: hard-delete-precedes-counter ordering, counter-failure-reclaimed-on-retry, and
+  restored-library-counter-not-reclaimed. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01.
+- Documented the remaining non-blocking GC debts surfaced by the merge audit: legacy `NULL +
+  requires_library_deleted_check=false` orphan rows (ISSUE-GC-LEGACY-ORPHAN-UNGUARDED-01) and
+  org-cascade re-soft-delete on marker/canonical drift (ISSUE-GC-ORG-CASCADE-REMARK-01).
+
+---
+
 ## 2026-07-10 - GC orphan work revalidated canonically at execution time (P6b)
 
 - Added durable `LibraryGuardMode` semantics: scanner Phase 3/4 orphan work uses

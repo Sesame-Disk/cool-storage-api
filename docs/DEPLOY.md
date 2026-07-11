@@ -785,6 +785,15 @@ Legacy queue/DLQ rows written before the migration (NULL `library_guard_mode` +
 `requires_library_deleted_check=true`) remain correct: the new binary hydrates
 them as `deleted_at_identity`, matching their original intent.
 
+**Legacy orphan rows are the exception.** Pre-011 scanner Phase 3/4 enqueued orphan
+commit/fs_object work with `requires_library_deleted_check=false` and no guard mode.
+Those rows hydrate as `LibraryGuardNone` and are purged **without** the canonical
+point-read guard — the same behavior as the old binary, but P6b does not
+retroactively protect them. On a cluster that previously ran GC in production,
+**drain `gc_queue` and the DLQ (or let them complete) before re-enabling GC**, or run
+the fail-closed preflight described in ISSUE-GC-LEGACY-ORPHAN-UNGUARDED-01. On a fresh
+/ pre-production deployment there is no such backlog and no action is needed.
+
 ### Upgrading from a pre-NetworkTopologyStrategy build
 
 Older builds bootstrapped the `sesamefs` keyspace as

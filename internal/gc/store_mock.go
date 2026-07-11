@@ -157,6 +157,10 @@ type MockStore struct {
 	listGroupsByOrgErr             error
 	listLibrariesForOrgErr         error
 	deleteLibraryStorageCounterErr error
+	// libraryDestructiveCalls records HardDeleteLibrary / DeleteLibraryStorageCounter
+	// in call order so tests can assert the hard delete precedes the counter cleanup.
+	libraryDestructiveCalls        []string
+	deleteLibraryStorageCounterFor map[uuid.UUID]int
 	deleteGroupFullErr             error
 	reconcileStorageCountersHook   func()
 	acquireOrgHardDeleteLockHook   func(orgID uuid.UUID)
@@ -2820,6 +2824,7 @@ func (m *MockStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLib
 func (m *MockStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.libraryDestructiveCalls = append(m.libraryDestructiveCalls, "HardDeleteLibrary")
 	delete(m.libraries, libraryID)
 	delete(m.deletedLibraries, libraryID)
 	return nil
@@ -3135,7 +3140,14 @@ func (m *MockStore) DeleteLibraryStorageCounter(orgID, libraryID uuid.UUID) erro
 	if m.deleteLibraryStorageCounterErr != nil {
 		return m.deleteLibraryStorageCounterErr
 	}
-	return nil // no-op in mock — storage_counters not simulated
+	m.mu.Lock()
+	m.libraryDestructiveCalls = append(m.libraryDestructiveCalls, "DeleteLibraryStorageCounter")
+	if m.deleteLibraryStorageCounterFor == nil {
+		m.deleteLibraryStorageCounterFor = make(map[uuid.UUID]int)
+	}
+	m.deleteLibraryStorageCounterFor[libraryID]++
+	m.mu.Unlock()
+	return nil // storage_counters not otherwise simulated
 }
 func (m *MockStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 	if m.deleteGroupFullErr != nil {

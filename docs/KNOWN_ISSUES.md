@@ -73,6 +73,9 @@ existence check (P6) that could enqueue destructive work for live libraries is *
 | **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
 | **Existence Checks Fail Open (transient errors, P6a)** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors and scanner Phases 3/4/9 fail closed. Phase 9 scans `shares_by_group` directly and uses each projection row's `OrgID`, with unit and real-Cassandra regression coverage. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
 | **Worker Canonical Revalidation of Orphan Work (P6b)** | ✅ Fixed (2026-07-10) | Durable `canonical_absent` work is point-read against `libraries[(org_id, library_id)]` under the existing library lock; presence/read/fence/unknown-mode paths fail closed. Retry/DLQ and legacy compatibility are covered. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
+| **Cascade Deletes Counter Before Hard Delete** | ✅ Fixed (2026-07-11) | `cascadeDeleteLibrary` now hard-deletes the canonical row before removing the per-library storage counter, closing a crash+restore window that could reactivate an under-counted library. A canonical-absent retry reclaims an orphaned counter idempotently. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01 below. |
+| **Legacy `NULL + false` Orphan Rows Run Unguarded** | 🟡 Confirmed gap (Low, pre-prod) | Orphan queue/DLQ rows written before migration 011 (empty `library_guard_mode` **and** `requires_library_deleted_check=false`) hydrate as `LibraryGuardNone` and skip the canonical guard — identical to `main`'s behavior, so not a regression, but P6b does not retroactively protect already-enqueued orphan work. See ISSUE-GC-LEGACY-ORPHAN-UNGUARDED-01 below. |
+| **Org Cascade Re-Soft-Deletes on Marker Drift** | 🟡 Confirmed, defense-in-depth (Low) | If `libraries.deleted_at` is set but the `deleted_libraries` marker is absent, the org cascade re-runs `SoftDeleteLibrary`, re-stamping `deleted_at` and re-subtracting aggregates (double-decrement, clamped). Unreachable under normal ops (marker + canonical are written/cleared atomically), so a corruption-only hardening. See ISSUE-GC-ORG-CASCADE-REMARK-01 below. |
 | **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (High/Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
 | **Phase 9 Group-Share Discovery Is a Global Scan** | 🟠 Pending (Med) | The immediate fix streams `shares_by_group` in bounded driver pages with cancellation, but Cassandra still scans every partition. Replace with bucketed active-partition discovery. See ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01 below. |
 | **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Former E3 is escalated to the High P6 issue. See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
@@ -3780,6 +3783,111 @@ discovery indexes are not found by Phases 3/4, so no worker guard can run for un
 - `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (P6b, Verdict 1, branch roadmap)
 - `ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01` (P6a, fixed)
 - `ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01` (P7 markerless discovery, still open)
+
+---
+
+### ISSUE-GC-CASCADE-COUNTER-ORDERING-01: Library Cascade Deleted the Storage Counter Before the Hard Delete
+
+**Status**: ✅ Fixed (2026-07-11) — Medium safety hardening
+**Severity**: Medium — resolved (storage under-count / quota-bypass window; content was never at risk)
+**Affected**: `cascadeDeleteLibrary`, `processLibraryCascade`, `restoreDeletedLibrary`
+
+#### Problem
+
+`cascadeDeleteLibrary` used the order `enqueue children → DeleteLibraryStorageCounter →
+HardDeleteLibrary` (inherited from `main`). While the canonical `libraries` row is still present
+the library is restorable. If the worker crashed after the counter delete but before the hard
+delete, and the lease later went stale/expired, `restoreDeletedLibrary` (stale-aware) could steal
+the lease, observe a present-and-soft-deleted canonical row, and reactivate the library. Its
+`AdjustAggregateStorageCounters(increment=true)` reads the per-library counter first and no-ops
+when it is zero/absent — which it now is — so the org/user/platform aggregates were never
+re-credited: an under-count and potential quota bypass. Library **content** was never at risk: the
+child guard postpones every commit/fs_object while the canonical row exists, so nothing is purged
+in this window.
+
+#### Resolution
+
+- Reordered to `enqueue → fence → HardDeleteLibrary → DeleteLibraryStorageCounter`. Once the
+  canonical row is gone, restore reads `ErrNotFound` and refuses ("pending permanent deletion"),
+  so no reactivation can observe the removed counter.
+- The counter delete after the hard delete is pure reclamation and is not fenced (no live library
+  left to corrupt). A crash between the two deletes leaves an orphaned counter, reclaimed on the
+  next cascade pass: `processLibraryCascade` sees the marker gone, confirms the canonical row is
+  absent via `CanonicalLibraryExists`, and idempotently deletes the counter
+  (`reclaimHardDeletedLibraryStorageCounter`). A restored library (canonical present) is never
+  touched.
+- The `gc_library_cascade_deleted` audit is written immediately after the hard delete so the
+  definitive event is recorded even if the reclamation must be retried.
+- Tests: `TestWorker_ProcessLibraryCascade_HardDeletePrecedesCounterCleanup`,
+  `..._CounterFailureReclaimedOnRetry`, `..._RestoredLibraryCounterNotReclaimed`.
+
+---
+
+### ISSUE-GC-LEGACY-ORPHAN-UNGUARDED-01: Pre-Migration-011 Orphan Rows Run Without the Canonical Guard
+
+**Status**: 🟡 Confirmed gap — Low (not a regression; pre-production has no such backlog)
+**Severity**: Low — bounded to clusters that already ran an older GC binary in production
+**Affected**: `gc_queue` / `gc_failed_items` rows enqueued before migration 011, worker guard path
+
+#### Problem
+
+The pre-011 scanner enqueued Phase 3/4 orphan commits/fs_objects with
+`requires_library_deleted_check=false` and no `library_guard_mode`. After the upgrade those rows
+hydrate as `LibraryGuardNone`, so the new worker deletes them **without** acquiring the library
+lock, without the canonical point-read, and without fencing — exactly as `main` did (orphans were
+purged with no revalidation there). This is therefore **not a regression**, but it means P6b's
+execution-time canonical guard does not retroactively cover work that was already queued. A
+lingering pre-011 pending marker can also make Phase 3/4 skip re-enqueuing a correctly-stamped
+`canonical_absent` row for the same artifact.
+
+A blanket `false → canonical_absent` backfill is unsafe: other legitimate producers (e.g.
+`EnqueueCommits` used by `CleanRepoTrash`) enqueue commit work for **live** libraries where
+canonical presence is expected.
+
+#### Why it is Low here
+
+Per project posture (pre-production, empty server, no legacy-data preservation) there is no
+production orphan backlog to inherit, and the stop-the-world GC upgrade (see `docs/DEPLOY.md`)
+plus a queue/DLQ drain before re-enabling GC removes any transient rows.
+
+#### Options if a real backlog ever exists
+
+- A fail-closed preflight that refuses to re-enable GC while commit/fs_object rows exist with
+  `library_guard_mode IS NULL AND requires_library_deleted_check=false`.
+- A `legacy_unclassified` mode that is quarantined (never auto-executed) for operator triage.
+- A `work_source` / `queue_protocol_version` column so this ambiguity cannot recur.
+
+---
+
+### ISSUE-GC-ORG-CASCADE-REMARK-01: Org Cascade Re-Soft-Deletes a Library on Marker/Canonical Drift
+
+**Status**: 🟡 Confirmed, defense-in-depth — Low (precondition unreachable under normal ops)
+**Severity**: Low — storage double-decrement (clamped, reconcilable), only under corruption
+**Affected**: `processOrgCascade`
+
+#### Problem
+
+`processOrgCascade` now decides on the `deleted_libraries` marker: marker absent + canonical
+present → `SoftDeleteLibrary`. In a drift state where `libraries.deleted_at = T1` but the marker is
+missing, it re-runs the full soft delete — re-stamping `deleted_at = T2`, changing the delete
+identity, and re-subtracting the library's bytes from the aggregates. Because the per-library
+counter is not cleared by soft delete, the second `AdjustAggregateStorageCounters(false)` reads the
+same bytes and subtracts again (clamped to non-negative). `main` used `lib.DeletedAt` directly and
+did not re-soft-delete, so this is a behavioral change in that state.
+
+#### Why it is Low
+
+Every path that writes `libraries.deleted_at` also writes the `deleted_libraries` marker in the
+same `LoggedBatch` (`softDeleteLibrary`, GC `SoftDeleteLibrary`), and restore/hard-delete clear both
+atomically. Cassandra logged batches are atomic, so the marker/canonical pair does not drift under
+normal operation; the double-decrement requires genuine corruption.
+
+#### Suggested hardening
+
+Add an `EnsureDeletedLibraryMarker` helper that, when the canonical row is already soft-deleted
+(`deleted_at != null`) but the marker is missing, reconstructs only the `deleted_libraries` row
+from the existing canonical `deleted_at` / storage class / representation, **without** re-running
+counter adjustments. Reserve the full `SoftDeleteLibrary` for a canonical row that is still active.
 
 ---
 
