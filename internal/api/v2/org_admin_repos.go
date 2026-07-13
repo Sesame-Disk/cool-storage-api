@@ -429,7 +429,11 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 		}
 		batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, libID)
 		batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libID)
-		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`, libID, targetOrgID, time.Now(), storageClass, blockRepresentationID)
+		// Permanent delete: stamp purge_requested_at so Phase 13 makes the library eligible
+		// on its next scan (then processed after the GC grace period) rather than deferring
+		// ~30d from now(). See migration 012 / P1b.
+		now := time.Now()
+		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id, purge_requested_at) VALUES (?, ?, ?, ?, ?, ?)`, libID, targetOrgID, now, storageClass, blockRepresentationID, now)
 		if err := batch.Exec(); err != nil {
 			iter.Close()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})

@@ -2712,6 +2712,53 @@ func TestScanner_ScanExpiredDeletedLibraries_EnqueuesExpired(t *testing.T) {
 	}
 }
 
+// TestScanner_ScanExpiredDeletedLibraries_EnqueuesPurgeRequestedWithinRetention guards
+// the durable purge-request marker (migration 012 / ISSUE-GC-ORG-TRASH-NO-CASCADE-01,
+// P1/P1b). A permanent delete stamps purge_requested_at and resets deleted_at to now(),
+// so the library is INSIDE the retention window; Phase 13 must still enqueue its cascade
+// on this scan on the strength of purge_requested_at (the worker then grace-gates it
+// before processing), while a normal recent soft-delete (no purge_requested_at) keeps
+// waiting out retention.
+func TestScanner_ScanExpiredDeletedLibraries_EnqueuesPurgeRequestedWithinRetention(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	// Permanent-deleted just now: deleted_at within retention, but purge_requested_at set.
+	purgeLib := uuid.New()
+	now := time.Now().UTC()
+	store.AddPurgeRequestedDeletedLibrary(orgID, purgeLib, "hot", now, now)
+
+	// Normal recent soft-delete (10 days ago, retention 30, no purge) → must NOT enqueue.
+	recentLib := uuid.New()
+	store.AddDeletedLibrary(orgID, recentLib, "cold", now.AddDate(0, 0, -10))
+
+	n, err := s.scanExpiredDeletedLibraries(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedLibraries failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 enqueued (the purge-requested lib), got %d", n)
+	}
+
+	cascadeCount := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemLibraryCascade {
+			cascadeCount++
+			if item.ItemID != purgeLib.String() {
+				t.Errorf("expected purge-requested lib %s enqueued, got %s", purgeLib, item.ItemID)
+			}
+		}
+	}
+	if cascadeCount != 1 {
+		t.Errorf("expected 1 library_cascade item, got %d", cascadeCount)
+	}
+}
+
 // TestScanner_ScanExpiredDeletedLibraries_RecoversUnstampedMarker is the
 // regression guard for the trash-stuck bug: the canonical soft-delete path writes
 // the deleted_libraries marker WITHOUT block_representation_id, so the marker is

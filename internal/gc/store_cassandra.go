@@ -3867,15 +3867,19 @@ func (s *CassandraStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
 
 func (s *CassandraStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error) {
 	iter := s.db.Session().Query(`
-		SELECT library_id, org_id, deleted_at, storage_class, block_representation_id FROM deleted_libraries
+		SELECT library_id, org_id, deleted_at, storage_class, block_representation_id, purge_requested_at FROM deleted_libraries
 	`).Iter()
 
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)
 	var libIDStr, orgIDStr, storageClass, blockRepresentationID string
-	var deletedAt time.Time
+	var deletedAt, purgeRequestedAt time.Time
 	var result []DeletedLibraryInfo
-	for iter.Scan(&libIDStr, &orgIDStr, &deletedAt, &storageClass, &blockRepresentationID) {
-		if deletedAt.Before(cutoff) {
+	for iter.Scan(&libIDStr, &orgIDStr, &deletedAt, &storageClass, &blockRepresentationID, &purgeRequestedAt) {
+		// A permanent-delete stamps purge_requested_at so the library becomes eligible on
+		// this scan instead of after TrashRetentionDays (it is still grace-gated before the
+		// worker processes it); a normal soft-delete leaves it null and waits out the
+		// retention window (deleted_at < cutoff). See migration 012 / P1b.
+		if !purgeRequestedAt.IsZero() || deletedAt.Before(cutoff) {
 			orgID := parseUUID(orgIDStr)
 			libID := parseUUID(libIDStr)
 			if storageClass == "" {
@@ -3887,6 +3891,7 @@ func (s *CassandraStore) ListExpiredDeletedLibraries(retentionDays int) ([]Delet
 				BlockRepresentationID: strings.TrimSpace(blockRepresentationID),
 				StorageClass:          storageClass,
 				DeletedAt:             deletedAt,
+				PurgeRequestedAt:      purgeRequestedAt,
 			})
 		}
 	}

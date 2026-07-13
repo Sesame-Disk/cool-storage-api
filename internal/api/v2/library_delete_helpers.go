@@ -33,7 +33,13 @@ var (
 		}
 		batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libraryID)
 		batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libraryID)
-		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)`, libraryID, orgID, time.Now(), storageClass, blockRepresentationID)
+		// This is a *permanent* delete: stamp purge_requested_at so Phase 13 makes the
+		// library eligible on its next scan instead of waiting out TrashRetentionDays from
+		// now() (the marker's deleted_at is reset here). The cascade is still gated by the
+		// GC grace period before the worker processes it — reclamation happens on the order
+		// of the grace period, not ~30 days. See migration 012 / ISSUE-GC-ORG-TRASH-NO-CASCADE-01.
+		now := time.Now()
+		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id, purge_requested_at) VALUES (?, ?, ?, ?, ?, ?)`, libraryID, orgID, now, storageClass, blockRepresentationID, now)
 		if err := batch.Exec(); err != nil {
 			return errors.Join(errHardDeleteLibraryBatchExec, err)
 		}

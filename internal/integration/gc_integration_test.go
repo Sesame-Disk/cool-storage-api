@@ -2402,3 +2402,70 @@ func TestGC_ZeroRefBlockTwoProducerLeavesNoPendingItem(t *testing.T) {
 		t.Fatalf("expected the uuid.Nil-keyed pending block row to be removed by CompleteItem, found %d", n)
 	}
 }
+
+// TestGC_PermanentDeleteMarkerEligibleWithinRetention verifies the durable
+// purge-request marker (migration 012 / ISSUE-GC-ORG-TRASH-NO-CASCADE-01, P1/P1b)
+// against real Cassandra: ListExpiredDeletedLibraries must return a permanent-delete
+// marker whose deleted_at is INSIDE the retention window purely because
+// purge_requested_at is set, while a normal recent soft-delete marker (no
+// purge_requested_at) stays hidden until retention elapses. This asserts eligibility
+// only (the worker still grace-gates the cascade before processing) and proves the
+// migration column exists and is read by the eligibility query.
+func TestGC_PermanentDeleteMarkerEligibleWithinRetention(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	session := database.Session()
+
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	purgeLib := uuid.New()
+	controlLib := uuid.New()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	// Permanent delete: deleted_at = now (well inside a 30-day retention) + purge_requested_at set.
+	if err := session.Query(`
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id, purge_requested_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, purgeLib.String(), orgID, now, "hot", db.PlainBlockRepresentationID, now).Exec(); err != nil {
+		t.Fatalf("seed purge-requested marker: %v", err)
+	}
+	// Normal recent soft-delete: deleted_at 5 days ago, no purge_requested_at → not yet eligible.
+	if err := session.Query(`
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id)
+		VALUES (?, ?, ?, ?, ?)
+	`, controlLib.String(), orgID, now.AddDate(0, 0, -5), "hot", db.PlainBlockRepresentationID).Exec(); err != nil {
+		t.Fatalf("seed control marker: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, purgeLib.String()).Exec()
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, controlLib.String()).Exec()
+	})
+
+	libs, err := store.ListExpiredDeletedLibraries(30)
+	if err != nil {
+		t.Fatalf("ListExpiredDeletedLibraries: %v", err)
+	}
+
+	var sawPurge, sawControl bool
+	var purgeRequestedAt time.Time
+	for _, l := range libs {
+		switch l.LibraryID {
+		case purgeLib:
+			sawPurge = true
+			purgeRequestedAt = l.PurgeRequestedAt
+		case controlLib:
+			sawControl = true
+		}
+	}
+	if !sawPurge {
+		t.Fatal("purge-requested marker (within retention) was NOT eligible — P1b regression")
+	}
+	if purgeRequestedAt.IsZero() {
+		t.Fatal("PurgeRequestedAt not populated from Cassandra")
+	}
+	if sawControl {
+		t.Fatal("recent soft-delete marker (no purge_requested_at) was eligible before retention — regression")
+	}
+}

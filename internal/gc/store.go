@@ -528,6 +528,11 @@ type DeletedLibraryInfo struct {
 	BlockRepresentationID string
 	StorageClass          string
 	DeletedAt             time.Time
+	// PurgeRequestedAt is set (non-zero) when a permanent-delete path asked for the
+	// library to be reclaimed on the retention-independent schedule rather than after
+	// TrashRetentionDays. When set, Phase 13 treats the row as eligible regardless of
+	// DeletedAt (the worker still applies the normal grace period before processing).
+	PurgeRequestedAt time.Time
 }
 
 // DeletedOrgInfo holds data about a soft-deleted org for cascade processing.

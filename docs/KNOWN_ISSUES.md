@@ -65,7 +65,7 @@ existence check (P6) that could enqueue destructive work for live libraries is *
 
 | Issue | Status | Details |
 |-------|--------|---------|
-| **Org-Admin Trash Delete Defers Cleanup** | 🟡 Confirmed gap (High) | `DeleteOrgTrashLibrary` (single) and `CleanOrgTrashLibraries` (bulk) hard-delete the library but do **not** enqueue a cascade, delete the storage counter, or clean tags — they rely on Phase 13, which only fires after `TrashRetentionDays` (~30d), and the re-inserted marker resets that clock. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01 below. |
+| **Org-Admin Trash Delete Defers Cleanup** | 🟢 Fixed (6A/6B, 2026-07-13) | Permanent-delete now stamps a durable `deleted_libraries.purge_requested_at` (migration 012); Phase 13 makes such libraries eligible on its next scan instead of after `TrashRetentionDays` (~30d), so the existing cascade reclaims them within ~the grace period. Grace gate preserved; branches 3/4 are optional accelerators. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01 below. |
 | **Non-Durable, Content-Only Delete Handoff** | 🟡 Confirmed gap (High/Med) | Superadmin paths call `EnqueueLibraryDeletion` via `go fn()`, but it enqueues contents, not `ItemLibraryCascade`; final marker/policy cleanup waits for Phase 13, and global clean-trash also omits the library counter delete. See ISSUE-GC-DELETE-HANDOFF-DURABILITY-01 below. |
 | **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Confirmed, benign (Med) | The direct-delete helper does not call `AddDeleteLibraryPolicyQuery`; policy index rows for policy-bearing libraries accumulate. Scanner re-validates and skips, so no mis-processing. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
 | **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
@@ -3568,11 +3568,33 @@ repo's total tagged files rather than the subtree size.
 
 ### ISSUE-GC-ORG-TRASH-NO-CASCADE-01: Org-Admin Trash Delete Defers Content Cleanup
 
-**Status**: 🟡 Confirmed gap (2026-07-10)
-**Severity**: High — a permanent-delete action reports success and hides the library immediately, but its blocks/commits/counter/tags can linger for the whole retention window
+**Status**: 🟢 Fixed (P1/P1b, 6A/6B — 2026-07-13); branches 3/4 remain optional latency accelerators
+**Severity**: High — a permanent-delete action reports success and hides the library immediately, but its blocks/commits/counter/tags could linger for the whole retention window
 **Affected**: `DELETE /org/:org_id/admin/trash-libraries/:rid/` (`DeleteOrgTrashLibrary`), `DELETE /org/:org_id/admin/trash-libraries/` (`CleanOrgTrashLibraries`)
 
-#### Problem
+#### Fix (this PR — durable purge-request marker, 6A/6B)
+
+Migration `012` adds `deleted_libraries.purge_requested_at`. Every permanent-delete marker
+writer (`hardDeleteLibraryRowsFn` — superadmin + org-admin single — and the
+`CleanOrgTrashLibraries` bulk batch) stamps it. Phase 13's `ListExpiredDeletedLibraries`
+now treats a row as eligible when `purge_requested_at IS set OR deleted_at < cutoff`, so a
+permanent delete is picked up on the **next scan** instead of ~30 days later, regardless of
+the reset `deleted_at`. The existing `ItemLibraryCascade` then performs the full reclamation
+it already owns (contents → `HardDeleteLibrary` = policy index + read models + marker,
+`DeleteLibraryStorageCounter`).
+
+**Timing (not "instant"):** this changes *eligibility*, not the grace gate. Phase 13 still
+enqueues the cascade with `QueuedAt = deleted_at`, and the worker only dequeues items older
+than the configured `grace_period` (default 1h) — the grace window is intentionally
+preserved. Net reclamation latency drops from ~`TrashRetentionDays` (~30d) to about the scan
+interval plus the grace period. Normal soft-delete leaves `purge_requested_at` null and keeps
+the retention behavior unchanged.
+
+Branches 3/4 (immediate tactical enqueue/counter/tags in the org-admin paths) are now
+**optional accelerators** — they only shave the time-to-next-scan, since the durable cascade
+already covers counter/tags/policy/content.
+
+#### Problem (original, pre-fix)
 
 Both org-admin trash-delete paths hard-delete the library rows and insert the `deleted_libraries` marker, then return `200`, but — unlike the superadmin `PermanentDeleteRepo` — they do **not**:
 
@@ -3589,12 +3611,14 @@ This is not an eternal leak (the marker keeps the content recoverable, and the c
 - [internal/api/v2/library_delete_helpers.go:98-116](../internal/api/v2/library_delete_helpers.go#L98) (`deleteResolvedTrashLibrary`)
 - [internal/api/v2/org_admin_repos.go:390-448](../internal/api/v2/org_admin_repos.go#L390) (`CleanOrgTrashLibraries`)
 
-#### Fix Direction (branches 3 & 4)
+#### Fix Direction (remaining optional accelerators — branches 3 & 4)
+
+With 6A/6B landed these are latency-only follow-ups, no longer correctness gaps:
 
 - Branch 3: give `DeleteOrgTrashLibrary` the same tactical side effects as
-  `PermanentDeleteRepo` (enqueue contents + delete counter + clean tags). This is not
-  `ItemLibraryCascade`; branch 6B owns durable final cleanup.
-- Branch 4: replace the hand-rolled hard-delete in `CleanOrgTrashLibraries` with the shared per-candidate helper so it inherits cascade/counter/tags/policy cleanup.
+  `PermanentDeleteRepo` (enqueue contents + delete counter + clean tags) to shave the
+  time-to-next-scan. The durable cascade still owns final cleanup.
+- Branch 4: replace the hand-rolled hard-delete in `CleanOrgTrashLibraries` with the shared per-candidate helper so it inherits the same accelerators.
 
 #### Related Docs
 
