@@ -3588,18 +3588,29 @@ existing `ItemLibraryCascade` then performs the full reclamation it already owns
   to now. Phase 13 dedups `library_cascade` by `deleted_at`; resetting it would let a cascade
   already queued under the original identity be enqueued a second time. `purge_requested_at`
   provides eligibility independently, so no reset is needed.
-- The permanent-delete paths **no longer fire an immediate `EnqueueLibraryDeletion`
-  content accelerator**. With prompt Phase 13 pickup that accelerator (identity = now,
-  `LibraryGuardNone`) is grace-gated like the cascade — so it gives no latency benefit — and
-  only duplicates the cascade's content items under a different identity. The durable marker
-  is now the single content producer.
+- The superadmin/platform permanent-delete paths **immediately queue the durable
+  `ItemLibraryCascade`** (`gcEnqueuer.EnqueueLibraryCascade`) so reclamation starts on the next
+  worker tick instead of waiting up to a full `ScanInterval` (default **24h**) for Phase 13 to
+  discover the marker. This enqueue mirrors Phase 13 exactly — `QueuedAt = deleted_at`, nil
+  library id, same representation — so it is the **same** row Phase 13 would create: a dedup
+  no-op, never a second producer (the earlier content-only `EnqueueLibraryDeletion`, identity =
+  now, was a second producer and was replaced). If the fire-and-forget enqueue is lost, the
+  durable marker still drives Phase 13. Org-admin paths have no enqueuer wired and rely on the
+  marker + Phase 13 (still a large improvement over the old ~retention wait).
 
-**Timing (not "instant"):** this changes *eligibility*, not the grace gate. Phase 13 still
-enqueues the cascade with `QueuedAt = deleted_at`, and the worker only dequeues items older
-than the configured `grace_period` (default 1h) — the grace window is intentionally
-preserved. Net reclamation latency drops from the configured `TrashRetentionDays` (~30d
-default) to about the scan interval plus the grace period. Normal soft-delete leaves
-`purge_requested_at` null and keeps the retention behavior unchanged.
+**Grace period semantics:** because the cascade (immediate or Phase-13) uses
+`QueuedAt = deleted_at`, the GC grace period is measured from the **original trash time**, not
+from the permanent-delete action. A library that has been in trash longer than the grace period
+is therefore processable on the next tick; one trashed moments before permanent-delete still
+waits out the grace window. This is intentional and consistent between both producers.
+
+**Timing (not "instant"):** this changes *eligibility*, not the grace gate. The cascade is
+enqueued with `QueuedAt = deleted_at`, and the worker only dequeues items older than the
+configured `grace_period` (default 1h) — the grace window is intentionally preserved. With the
+immediate `EnqueueLibraryCascade` on the superadmin/platform paths, net reclamation latency
+drops from the configured `TrashRetentionDays` (~30d default) to about the grace period; org-
+admin paths (marker + Phase 13 only) add up to one `ScanInterval` on top. Normal soft-delete
+leaves `purge_requested_at` null and keeps the retention behavior unchanged.
 
 Branches 3/4 (an immediate tactical *content* enqueue in the org-admin paths) are
 **superseded**: the review showed an immediate content accelerator duplicates the now-prompt

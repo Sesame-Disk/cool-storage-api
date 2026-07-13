@@ -36,7 +36,7 @@ func TestGCLibraryEnqueuer_InvalidOrgID(t *testing.T) {
 	adapter := &gcLibraryEnqueuer{service: svc}
 
 	// Should not panic with invalid org UUID
-	adapter.EnqueueLibraryDeletion("not-a-uuid", uuid.New().String(), "hot")
+	adapter.EnqueueLibraryCascade("not-a-uuid", uuid.New().String(), "plain:v1", "hot", time.Now())
 }
 
 func TestGCLibraryEnqueuer_InvalidLibraryID(t *testing.T) {
@@ -44,7 +44,7 @@ func TestGCLibraryEnqueuer_InvalidLibraryID(t *testing.T) {
 	adapter := &gcLibraryEnqueuer{service: svc}
 
 	// Should not panic with invalid library UUID
-	adapter.EnqueueLibraryDeletion(uuid.New().String(), "not-a-uuid", "hot")
+	adapter.EnqueueLibraryCascade(uuid.New().String(), "not-a-uuid", "plain:v1", "hot", time.Now())
 }
 
 func TestGCBlockEnqueuer_ImplementsInterface(t *testing.T) {
@@ -60,7 +60,7 @@ func TestGCLibraryEnqueuer_ImplementsInterface(t *testing.T) {
 	adapter := &gcLibraryEnqueuer{service: svc}
 
 	// Verify the method exists with correct signature
-	adapter.EnqueueLibraryDeletion("org-id", "lib-id", "hot")
+	adapter.EnqueueLibraryCascade("org-id", "lib-id", "plain:v1", "hot", time.Now())
 }
 
 func TestGCAdapters_NilService(t *testing.T) {

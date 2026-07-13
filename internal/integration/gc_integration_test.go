@@ -2650,11 +2650,13 @@ func TestGC_PermanentDeleteWriterStampsPurge_RealCassandra(t *testing.T) {
 	if permPurge.IsZero() {
 		t.Fatal("REGRESSION: permanent-delete marker did not stamp purge_requested_at")
 	}
-	// deleted_at MUST be preserved (not reset to now): Phase 13 dedups library_cascade by
-	// deleted_at, so resetting it would let a cascade already queued under the original
-	// identity be enqueued a second time. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01 (edge fix).
-	if delta := permDeletedAt.Sub(softDeletedAt); delta > time.Second || delta < -time.Second {
-		t.Fatalf("REGRESSION: permanent-delete reset deleted_at from %s to %s (delta %s) — it must preserve the original trash time for cascade dedup", softDeletedAt, permDeletedAt, delta)
+	// deleted_at MUST be preserved EXACTLY (not reset to now): Phase 13 dedups library_cascade
+	// by deleted_at, so resetting it would let a cascade already queued under the original
+	// identity be enqueued a second time. soft-delete writes libraries.deleted_at and the
+	// marker from the same timestamp, and permanent-delete copies libraries.deleted_at into
+	// the marker, so exact equality must hold. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01 (edge fix).
+	if !permDeletedAt.Equal(softDeletedAt) {
+		t.Fatalf("REGRESSION: permanent-delete changed deleted_at from %s to %s — it must preserve the original trash time exactly for cascade dedup", softDeletedAt, permDeletedAt)
 	}
 	if permOrg != orgIDStr {
 		t.Fatalf("marker org_id = %s, want %s", permOrg, orgIDStr)

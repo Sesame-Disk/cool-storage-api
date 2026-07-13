@@ -2,6 +2,7 @@ package v2
 
 import (
 	"testing"
+	"time"
 )
 
 // mockGCEnqueuer implements GCEnqueuer for testing
@@ -25,13 +26,15 @@ type mockLibraryGCEnqueuer struct {
 }
 
 type libGCEnqueueCall struct {
-	orgID        string
-	libraryID    string
-	storageClass string
+	orgID                 string
+	libraryID             string
+	blockRepresentationID string
+	storageClass          string
+	deletedAt             time.Time
 }
 
-func (m *mockLibraryGCEnqueuer) EnqueueLibraryDeletion(orgID, libraryID string, storageClass string) {
-	m.calls = append(m.calls, libGCEnqueueCall{orgID, libraryID, storageClass})
+func (m *mockLibraryGCEnqueuer) EnqueueLibraryCascade(orgID, libraryID, blockRepresentationID, storageClass string, deletedAt time.Time) {
+	m.calls = append(m.calls, libGCEnqueueCall{orgID, libraryID, blockRepresentationID, storageClass, deletedAt})
 }
 
 // mockCommitGCEnqueuer implements CommitGCEnqueuer for testing
@@ -161,7 +164,7 @@ func TestMockGCEnqueuer_RecordsCalls(t *testing.T) {
 func TestMockLibraryGCEnqueuer_RecordsCalls(t *testing.T) {
 	m := &mockLibraryGCEnqueuer{}
 
-	m.EnqueueLibraryDeletion("org-1", "lib-a", "hot")
+	m.EnqueueLibraryCascade("org-1", "lib-a", "plain:v1", "hot", time.Now())
 
 	if len(m.calls) != 1 {
 		t.Fatalf("expected 1 call, got %d", len(m.calls))

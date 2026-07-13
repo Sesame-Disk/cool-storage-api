@@ -165,6 +165,7 @@ func TestPermanentDeleteResolvedRepo_StampsResolvedRepresentationOnSuccess(t *te
 			}
 
 			var gotRepresentation string
+			var gotWriterDeletedAt time.Time
 			var cleanupLinksCalled, cleanupTagsCalled, deleteCounterCalled int
 			resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, _ string) (string, error) {
 				return resolved, nil
@@ -173,8 +174,9 @@ func TestPermanentDeleteResolvedRepo_StampsResolvedRepresentationOnSuccess(t *te
 				cleanupLinksCalled++
 				return nil
 			}
-			hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, _ time.Time) error {
+			hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, deletedAt time.Time) error {
 				gotRepresentation = blockRepresentationID
+				gotWriterDeletedAt = deletedAt
 				return nil
 			}
 			cleanupAllLibraryTagsForDeleteFn = func(_ *db.DB, _ string) error {
@@ -194,7 +196,10 @@ func TestPermanentDeleteResolvedRepo_StampsResolvedRepresentationOnSuccess(t *te
 			}
 			c, w := newDeleteTestContext(http.MethodDelete, "/api/v2.1/repos/deleted/"+tt.libraryID+"/")
 
-			h.permanentDeleteResolvedRepo(c, "org-1", tt.libraryID, "hot", time.Now())
+			// A fixed, non-now deleted_at (the original trash time) so we can assert it is
+			// threaded verbatim to the marker writer and the cascade — never reset to now().
+			wantDeletedAt := time.Now().Add(-72 * time.Hour).UTC().Truncate(time.Millisecond)
+			h.permanentDeleteResolvedRepo(c, "org-1", tt.libraryID, "hot", wantDeletedAt)
 
 			if w.Code != http.StatusOK {
 				t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
@@ -202,14 +207,24 @@ func TestPermanentDeleteResolvedRepo_StampsResolvedRepresentationOnSuccess(t *te
 			if gotRepresentation != resolved {
 				t.Fatalf("hard-delete marker representation = %q, want %q", gotRepresentation, resolved)
 			}
+			if !gotWriterDeletedAt.Equal(wantDeletedAt) {
+				t.Fatalf("writer deleted_at = %s, want the original trash time %s (must not be reset)", gotWriterDeletedAt, wantDeletedAt)
+			}
 			if cleanupLinksCalled != 1 || cleanupTagsCalled != 1 || deleteCounterCalled != 1 {
 				t.Fatalf("expected one successful destructive pass, got cleanupLinks=%d cleanupTags=%d deleteCounter=%d",
 					cleanupLinksCalled, cleanupTagsCalled, deleteCounterCalled)
 			}
-			// The permanent-delete path no longer fires an immediate content accelerator; the
-			// durable purge_requested_at marker drives the single Phase 13 cascade instead.
-			if len(libEnq.calls) != 0 {
-				t.Fatalf("expected no immediate GC enqueue (durable cascade owns content), got %#v", libEnq.calls)
+			// The permanent-delete path immediately queues the durable, Phase-13-deduplicated
+			// library cascade (not a content-only accelerator) with the resolved representation
+			// and the SAME original deleted_at identity Phase 13 would use.
+			if len(libEnq.calls) != 1 {
+				t.Fatalf("expected exactly one immediate library-cascade enqueue, got %#v", libEnq.calls)
+			}
+			if libEnq.calls[0].blockRepresentationID != resolved {
+				t.Fatalf("cascade enqueue representation = %q, want %q", libEnq.calls[0].blockRepresentationID, resolved)
+			}
+			if !libEnq.calls[0].deletedAt.Equal(wantDeletedAt) {
+				t.Fatalf("cascade enqueue deleted_at = %s, want %s (dedup identity must match Phase 13)", libEnq.calls[0].deletedAt, wantDeletedAt)
 			}
 		})
 	}
@@ -233,20 +248,21 @@ func TestAdminCleanTrashLibraries_SkipsRepresentationFailuresWithoutSideEffects(
 		cleanupTagsCalled++
 		return nil
 	}
+	libEnq := &mockLibraryGCEnqueuer{}
 	h := &AdminHandler{db: &db.DB{}}
 
 	cleaned, failed := h.processAdminTrashCandidates([]trashLibraryCandidate{{
 		OrgID:        "org-1",
 		LibraryID:    "repo-bad",
 		StorageClass: "hot",
-	}})
+	}}, libEnq)
 
 	if cleaned != 0 || failed != 1 {
 		t.Fatalf("processAdminTrashCandidates() = (cleaned=%d, failed=%d), want (0, 1)", cleaned, failed)
 	}
-	if hardDeleteCalled != 0 || cleanupTagsCalled != 0 {
-		t.Fatalf("side effects ran for skipped library: hardDelete=%d cleanupTags=%d",
-			hardDeleteCalled, cleanupTagsCalled)
+	if hardDeleteCalled != 0 || cleanupTagsCalled != 0 || len(libEnq.calls) != 0 {
+		t.Fatalf("side effects ran for skipped library: hardDelete=%d cleanupTags=%d enqueues=%#v",
+			hardDeleteCalled, cleanupTagsCalled, libEnq.calls)
 	}
 }
 
@@ -264,19 +280,21 @@ func TestAdminCleanTrashLibraries_BatchFailureDoesNotRunPostCommitSideEffects(t 
 		cleanupTagsCalled++
 		return nil
 	}
+	libEnq := &mockLibraryGCEnqueuer{}
 	h := &AdminHandler{db: &db.DB{}}
 
 	cleaned, failed := h.processAdminTrashCandidates([]trashLibraryCandidate{{
 		OrgID:        "org-1",
 		LibraryID:    "repo-batch-fail",
 		StorageClass: "hot",
-	}})
+	}}, libEnq)
 
 	if cleaned != 0 || failed != 1 {
 		t.Fatalf("processAdminTrashCandidates() = (cleaned=%d, failed=%d), want (0, 1)", cleaned, failed)
 	}
-	if cleanupTagsCalled != 0 {
-		t.Fatalf("post-commit side effects ran after failed hard delete: cleanupTags=%d", cleanupTagsCalled)
+	if cleanupTagsCalled != 0 || len(libEnq.calls) != 0 {
+		t.Fatalf("post-commit side effects ran after failed hard delete: cleanupTags=%d enqueues=%#v",
+			cleanupTagsCalled, libEnq.calls)
 	}
 }
 
@@ -299,12 +317,13 @@ func TestAdminCleanTrashLibraries_PartialSuccessLeavesBadLibraryUntouched(t *tes
 		cleanupTagCalls = append(cleanupTagCalls, libraryID)
 		return nil
 	}
+	libEnq := &mockLibraryGCEnqueuer{}
 	h := &AdminHandler{db: &db.DB{}}
 
 	cleaned, failed := h.processAdminTrashCandidates([]trashLibraryCandidate{
 		{OrgID: "org-1", LibraryID: "repo-good", StorageClass: "hot"},
 		{OrgID: "org-1", LibraryID: "repo-bad", StorageClass: "hot"},
-	})
+	}, libEnq)
 
 	if cleaned != 1 || failed != 1 {
 		t.Fatalf("processAdminTrashCandidates() = (cleaned=%d, failed=%d), want (1, 1)", cleaned, failed)
@@ -314,5 +333,8 @@ func TestAdminCleanTrashLibraries_PartialSuccessLeavesBadLibraryUntouched(t *tes
 	}
 	if strings.Join(cleanupTagCalls, ",") != "repo-good" {
 		t.Fatalf("tag cleanup calls = %#v, want only repo-good", cleanupTagCalls)
+	}
+	if len(libEnq.calls) != 1 || libEnq.calls[0].libraryID != "repo-good" {
+		t.Fatalf("library-cascade enqueue calls = %#v, want only repo-good", libEnq.calls)
 	}
 }

@@ -435,9 +435,25 @@ func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.U
 	return nil
 }
 
-// EnqueueLibraryDeletion enqueues all contents of a library for GC.
-func (s *Service) EnqueueLibraryDeletion(orgID, libraryID uuid.UUID, storageClass string) error {
-	return s.worker.EnqueueLibraryContents(orgID, libraryID, storageClass)
+// EnqueueLibraryCascade immediately queues the full library-cascade GC item for a
+// permanently deleted library, so reclamation can start on the next worker tick instead of
+// waiting up to a full ScanInterval (default 24h) for Phase 13 to discover the marker.
+//
+// It mirrors scanner Phase 13 exactly — QueuedAt = deletedAt (the original trash time, so
+// the grace gate is measured from the same event and long-trashed libraries process
+// promptly), LibraryID nil, same representation — so this immediate enqueue and any later
+// scan produce the IDENTICAL queue/pending row: the second write is a dedup no-op, never a
+// second producer. If this fire-and-forget enqueue is lost (crash/restart), the durable
+// purge_requested_at marker lets Phase 13 recover it. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01.
+func (s *Service) EnqueueLibraryCascade(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, deletedAt time.Time) error {
+	return s.queue.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              deletedAt,
+		ItemType:              ItemLibraryCascade,
+		ItemID:                libraryID.String(),
+		BlockRepresentationID: blockRepresentationID,
+		StorageClass:          storageClass,
+	}})
 }
 
 // EnqueueCommits enqueues specific commits for GC deletion (used by CleanRepoTrash).

@@ -98,11 +98,16 @@ func (h *DeletedLibraryHandler) permanentDeleteResolvedRepo(c *gin.Context, orgI
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return
 	}
-	// No immediate content enqueue here: the durable purge_requested_at marker makes Phase 13
-	// enqueue the full ItemLibraryCascade on its next scan, which owns content + counter +
-	// policy + marker cleanup. A separate fire-and-forget EnqueueLibraryDeletion would enqueue
-	// the same commits/fs_objects under a different identity (LibraryGuardNone, queued_at=now)
-	// and merely duplicate that grace-gated work. See migration 012 / ISSUE-GC-ORG-TRASH-NO-CASCADE-01.
+	// Immediately queue the durable library cascade so reclamation starts on the next worker
+	// tick instead of waiting up to a full ScanInterval for Phase 13. This is deduplicated
+	// against Phase 13 (identical deletedAt identity), so it is not a second producer; the
+	// durable purge_requested_at marker recovers it if this fire-and-forget enqueue is lost.
+	// See migration 012 / ISSUE-GC-ORG-TRASH-NO-CASCADE-01.
+	if h.libHandler != nil && h.libHandler.gcEnqueuer != nil {
+		runAsyncLibraryDeleteSideEffectFn(func() {
+			h.libHandler.gcEnqueuer.EnqueueLibraryCascade(orgID, repoID, blockRepresentationID, storageClass, deletedAt)
+		})
+	}
 	if err := deleteLibraryStorageCounterForDeleteFn(h.db, orgID, repoID); err != nil {
 		log.Printf("failed to delete storage counter for permanently deleted library %s/%s: %v", orgID, repoID, err)
 	}
@@ -134,7 +139,7 @@ func (h *OrgAdminHandler) deleteResolvedTrashLibrary(c *gin.Context, targetOrgID
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-func (h *AdminHandler) processAdminTrashCandidates(candidates []trashLibraryCandidate) (cleaned, failed int) {
+func (h *AdminHandler) processAdminTrashCandidates(candidates []trashLibraryCandidate, libEnqueuer LibraryGCEnqueuer) (cleaned, failed int) {
 	for _, candidate := range candidates {
 		blockRepresentationID, err := resolveDeleteBlockRepresentationFn(h.db, candidate.OrgID, candidate.LibraryID)
 		if err != nil {
@@ -148,9 +153,15 @@ func (h *AdminHandler) processAdminTrashCandidates(candidates []trashLibraryCand
 			failed++
 			continue
 		}
-		// No immediate content enqueue: the durable purge_requested_at marker drives the
-		// full ItemLibraryCascade via Phase 13; a fire-and-forget EnqueueLibraryDeletion would
-		// only duplicate that grace-gated content work under a different identity.
+		// Immediately queue the durable, Phase-13-deduplicated cascade so reclamation starts
+		// promptly rather than after up to a full ScanInterval; the purge_requested_at marker
+		// recovers it if this best-effort enqueue is lost.
+		if libEnqueuer != nil {
+			candidate := candidate
+			runAsyncLibraryDeleteSideEffectFn(func() {
+				libEnqueuer.EnqueueLibraryCascade(candidate.OrgID, candidate.LibraryID, blockRepresentationID, candidate.StorageClass, candidate.DeletedAt)
+			})
+		}
 		runAsyncLibraryDeleteSideEffectFn(func() {
 			if err := cleanupAllLibraryTagsForDeleteFn(h.db, candidate.LibraryID); err != nil {
 				log.Printf("[AdminCleanTrashLibraries] failed to clean tag metadata for library %s: %v", candidate.LibraryID, err)
