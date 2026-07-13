@@ -2260,18 +2260,22 @@ func deletePendingBlockRowsUnderLibraryBucket(t *testing.T, orgID, libraryID uui
 	_ = iter.Close()
 }
 
-// TestGC_ZeroRefBlockCascadeLeavesNoPendingItem is the regression guard for
-// ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01. When an fs_object cascade releases a
-// block to zero references, the worker enqueues the resulting ItemBlock. Because
-// gc_pending_items is library-scoped in its key while blocks are library-independent,
-// the enqueue MUST key the block under uuid.Nil — matching the worker/scanner dedup
-// checks and CompleteItem, which re-reads library_id from the single gc_queue row.
-// Before the fix, enqueueZeroRefBlocks wrote the pending row under the *real*
-// library_id, so CompleteItem (deleting under the queue row's key) could never remove
-// it, orphaning one gc_pending_items row per deleted block forever (~9,629 for a real
-// 50 GB delete). This test drives the real fs_object → zero-ref → block-delete cascade
-// through the worker and asserts no pending block row survives under either bucket.
-func TestGC_ZeroRefBlockCascadeLeavesNoPendingItem(t *testing.T) {
+// TestGC_ZeroRefBlockTwoProducerLeavesNoPendingItem is the end-to-end regression guard
+// for ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01. It reproduces the ACTUAL collision:
+// a single producer is self-consistent (CompleteItem re-reads library_id from the same
+// gc_queue row), so the leak only appears when TWO producers enqueue the same block /
+// candidate under different library_ids. gc_pending_items is library-scoped in its key
+// while gc_queue is not, so the two enqueues collapse into one gc_queue row (last writer
+// wins on the non-key library_id column) but leave TWO pending rows; CompleteItem then
+// clears only the one matching the surviving queue row and orphans the other forever.
+//
+// Producer A is the REAL worker cascade (an fs_object release drives enqueueZeroRefBlocks
+// with the owning library). Producer B is the scanner's orphan-block path (uuid.Nil) at
+// the SAME candidate_at. Ordering matters: A must enqueue before B and before the block
+// is processed. Pre-fix this leaves an orphaned pending row under the real library bucket;
+// with the fix (producers key uuid.Nil AND the store coerces ItemBlock pending rows to
+// uuid.Nil) both collapse to one row that CompleteItem removes.
+func TestGC_ZeroRefBlockTwoProducerLeavesNoPendingItem(t *testing.T) {
 	requireCassandra(t)
 
 	database := shareProjectionDBForTest(t)
@@ -2292,10 +2296,14 @@ func TestGC_ZeroRefBlockCascadeLeavesNoPendingItem(t *testing.T) {
 	blockID := fmt.Sprintf("%064x", time.Now().UnixNano())
 	fsID := fmt.Sprintf("%040x", time.Now().UnixNano())
 	referrer := db.BlockReferrerForFSObject(libraryID, fsID)
-	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	fsQueuedAt := time.Now().UTC().Add(-3 * time.Hour).Truncate(time.Millisecond)
+	// Pin the block candidate at a fixed past time so BOTH producers enqueue at the same
+	// candidate_at (EnsureBlockGCCandidate returns this existing earliest value), exactly
+	// as they would in production when the scanner re-discovers a worker-created candidate.
+	candidateAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
 
-	// Seed a real, singly-referenced block: canonical blocks row + one fs: reference,
-	// plus the fs_object that owns that reference.
+	// Seed a real, singly-referenced block: canonical blocks row + one fs: reference, the
+	// fs_object that owns that reference, and the pre-existing gc_block_candidate.
 	if err := database.UpsertBlockMetadata(orgID, blockID, 1, "hot", ""); err != nil {
 		t.Fatalf("seed blocks row: %v", err)
 	}
@@ -2305,9 +2313,10 @@ func TestGC_ZeroRefBlockCascadeLeavesNoPendingItem(t *testing.T) {
 	if err := session.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, libraryID, fsID, "file", "leak-probe.bin", "/leak-probe.bin", int64(1), queuedAt.Unix(), []string{blockID}).Exec(); err != nil {
+	`, libraryID, fsID, "file", "leak-probe.bin", "/leak-probe.bin", int64(1), fsQueuedAt.Unix(), []string{blockID}).Exec(); err != nil {
 		t.Fatalf("seed fs_objects: %v", err)
 	}
+	candidateAt = ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", candidateAt)
 
 	t.Cleanup(func() {
 		cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
@@ -2317,13 +2326,13 @@ func TestGC_ZeroRefBlockCascadeLeavesNoPendingItem(t *testing.T) {
 		_ = session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, libraryID, fsID).Exec()
 	})
 
-	// Enqueue the fs_object exactly as the live-library version/auto-delete cleanup path
-	// does (scanner Phase 5/6): LibraryGuardNone (the library stays alive, no marker),
-	// a canonical plain representation, and a past queued_at so DequeueBatch takes it.
+	// Enqueue the fs_object as the live-library version/auto-delete cleanup path does
+	// (scanner Phase 5/6): LibraryGuardNone (the library stays alive, no marker), a
+	// canonical plain representation, and a past queued_at so DequeueBatch takes it.
 	if err := queue.EnqueueBatch([]gcpkg.QueueItem{{
 		OrgID:                 orgUUID,
-		QueuedAt:              queuedAt,
-		IdentityAt:            queuedAt,
+		QueuedAt:              fsQueuedAt,
+		IdentityAt:            fsQueuedAt,
 		ItemType:              gcpkg.ItemFSObject,
 		ItemID:                fsID,
 		LibraryID:             libraryUUID,
@@ -2338,17 +2347,35 @@ func TestGC_ZeroRefBlockCascadeLeavesNoPendingItem(t *testing.T) {
 		t.Fatalf("RemoveOrgFromActiveSet: %v", err)
 	}
 
-	// Drain: fs_object → releases fs: ref → zero-ref block enqueued (the fixed line) →
-	// block deleted (nil storage skips S3) → queue items completed.
+	// Producer A: one worker tick processes the fs_object, which releases the fs: ref and
+	// enqueues the now-zero-ref block via enqueueZeroRefBlocks. DequeueBatch snapshots the
+	// queue before the block is enqueued, so the block is queued but NOT yet processed.
+	if _, err := worker.ProcessOrgOnce(context.Background(), orgUUID); err != nil {
+		t.Fatalf("ProcessOrgOnce (producer A): %v", err)
+	}
+	if !gcQueueItemExistsSince(t, orgID, "block", blockID, candidateAt.Add(-time.Second)) {
+		t.Fatalf("producer A (worker cascade) did not enqueue the zero-ref block")
+	}
+	if !blockExistsInDB(t, orgID, blockID) {
+		t.Fatalf("block was processed too early; cannot inject the second producer before deletion")
+	}
+
+	// Producer B: the scanner's orphan-block discovery re-enqueues the same block at the
+	// same candidate_at under uuid.Nil. Pre-fix this creates a SECOND pending row (under
+	// uuid.Nil) alongside producer A's real-library row, and overwrites the queue row's
+	// library_id column to uuid.Nil.
+	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", candidateAt)
+
+	// Drain the block: nil storage skips S3, the row is deleted, and CompleteItem removes
+	// the pending row keyed by the surviving queue row's library_id.
 	drained := false
 	for attempt := 0; attempt < 12; attempt++ {
 		processed, err := worker.ProcessOrgOnce(context.Background(), orgUUID)
 		if err != nil {
-			t.Fatalf("ProcessOrgOnce attempt %d: %v", attempt+1, err)
+			t.Fatalf("ProcessOrgOnce drain attempt %d: %v", attempt+1, err)
 		}
 		if !blockExistsInDB(t, orgID, blockID) &&
-			!gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-time.Second)) &&
-			!gcQueueItemExistsSince(t, orgID, "fs_object", fsID, queuedAt.Add(-time.Second)) {
+			!gcQueueItemExistsSince(t, orgID, "block", blockID, candidateAt.Add(-time.Second)) {
 			drained = true
 			break
 		}
@@ -2357,22 +2384,20 @@ func TestGC_ZeroRefBlockCascadeLeavesNoPendingItem(t *testing.T) {
 		}
 	}
 	if !drained {
-		t.Fatalf("GC did not drain the fs_object → block cascade (block_exists=%v, fs_queued=%v, block_queued=%v)",
+		t.Fatalf("GC did not drain the block (block_exists=%v, block_queued=%v)",
 			blockExistsInDB(t, orgID, blockID),
-			gcQueueItemExistsSince(t, orgID, "fs_object", fsID, queuedAt.Add(-time.Second)),
-			gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-time.Second)))
+			gcQueueItemExistsSince(t, orgID, "block", blockID, candidateAt.Add(-time.Second)))
 	}
-
-	// The block is physically gone.
 	if blockExistsInDB(t, orgID, blockID) {
-		t.Fatal("expected canonical block row to be deleted after the cascade")
+		t.Fatal("expected canonical block row to be deleted after the drain")
 	}
 
-	// Crux: no orphaned pending block row under the real library bucket (the leak) ...
+	// Crux: neither producer left an orphaned pending row. Pre-fix, producer A's
+	// real-library row survives here (the leak); with the fix both producers collapse to
+	// a single uuid.Nil row that CompleteItem removes.
 	if n := countPendingBlockRows(t, orgUUID, libraryUUID, blockID); n != 0 {
 		t.Fatalf("regression ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01: %d orphaned gc_pending_items block row(s) under the real library bucket (library_id=%s)", n, libraryID)
 	}
-	// ... and the canonical uuid.Nil-keyed pending row was removed by CompleteItem.
 	if n := countPendingBlockRows(t, orgUUID, uuid.Nil, blockID); n != 0 {
 		t.Fatalf("expected the uuid.Nil-keyed pending block row to be removed by CompleteItem, found %d", n)
 	}

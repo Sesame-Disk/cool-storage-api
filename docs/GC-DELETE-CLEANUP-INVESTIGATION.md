@@ -506,13 +506,17 @@ is library-scoped.**
   - `scanner.scanOrphanedBlocks` enqueues `LibraryID: uuid.Nil`
     ([scanner.go:386](../internal/gc/scanner.go#L386)) — **the correct reference**.
 
-Because worker and scanner enqueue the same block with the same `candidate_at` as `queued_at`,
-they **collapse into one `gc_queue` row** (last writer wins on the non-key `library_id` column)
-but write **two** `gc_pending_items` rows — `bucket(realLib)` and `bucket(Nil)`. On completion,
-`CompleteItem` re-reads `library_id` from the single surviving queue row and deletes **only**
-that one pending row ([store_cassandra.go:556-580](../internal/gc/store_cassandra.go#L556)); the
-other bucket's row is orphaned forever. The `uuid.Nil` dedup check also cannot see the worker's
-own `realLib` write, so it fails to suppress the double-enqueue.
+A **single** producer is self-consistent even with a real `library_id`: `CompleteItem` re-reads
+`library_id` from the **same** queue row it is completing and deletes the pending row under that
+exact key ([store_cassandra.go:556-580](../internal/gc/store_cassandra.go#L556)). The leak needs
+**two** producers enqueuing the same block/candidate under **different** `library_id`s — worker
+cascade (`realLib`) plus scanner (`Nil`), or two libraries sharing a block. They enqueue with the
+same `candidate_at` as `queued_at`, so they **collapse into one `gc_queue` row** (last writer
+wins on the non-key `library_id` column) but each already wrote its **own** `gc_pending_items`
+row — `bucket(realLib)` **and** `bucket(Nil)`. `CompleteItem` then deletes only the pending row
+matching the **surviving** queue row's `library_id` and **orphans the other forever**. The
+`uuid.Nil` dedup check also could not see the worker's own `realLib` write, so it failed to
+suppress the double-enqueue.
 
 **Bug, not intentional — git history:** `worker.go` was written with `LibraryID: libraryID` on
 2026-04-09 (`e9a9b369b`, "Track block GC candidates"). Its dedup check was migrated to
@@ -521,11 +525,17 @@ migration that left the function checking one key and writing another. The scann
 2026-05-26 (`f3597a935`) does both sides with `uuid.Nil`, codifying the intended convention:
 **blocks are `Nil`-keyed in `gc_pending_items`.**
 
-**Fix (branch `fix/gc-pending-items-block-library-scope`, this PR):** standardize every
-`ItemBlock` enqueue on `uuid.Nil`, matching the dedup checks and the scanner. This makes the two
-paths write one identical queue row and one identical pending row, restores dedup, and lets
-`CompleteItem` remove it. No data-safety impact (blocks never used `library_id`); the change is
-content-only. Pre-existing orphaned rows are not self-healed by the fix — they need the
-reconcile sweep (branch 8) or a coordinated one-off cleanup, tracked in
-`ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01`.
+**Fix (branch `fix/gc-pending-items-block-library-scope`, this PR):** two layers.
+1. **Producers** — every `ItemBlock` enqueue keys `uuid.Nil` (`worker.enqueueZeroRefBlocks`,
+   `Service.EnqueueBlock`), matching the dedup checks and the scanner.
+2. **Central backstop** — the store-level pending helpers (`addPendingItemBatchQuery`,
+   `addPendingItemDeleteBatchQuery`, `PendingItemExists`) coerce `ItemBlock` to `uuid.Nil` via
+   `pendingItemLibraryID`, so **every** pending write, delete, and dedup read for a block lands on
+   the single `uuid.Nil` key regardless of what any current or future producer passes. This is the
+   durable guard against the same class of partial-migration bug recurring.
+
+Both paths write one identical pending row and `CompleteItem` removes it. No data-safety impact
+(blocks never used `library_id`); the change is content-only. Pre-existing orphaned rows are not
+self-healed by the fix — they need the reconcile sweep (branch 8) or a coordinated one-off
+cleanup, tracked in `ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01`.
 

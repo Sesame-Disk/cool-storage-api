@@ -4125,10 +4125,14 @@ under the **real** `libraryID`:
 - `Service.EnqueueBlock` — passes `libraryID` ([gc.go:422](../internal/gc/gc.go#L422)) — latent; sole non-test caller already passes `uuid.Nil` ([gc_adapter.go:32](../internal/api/gc_adapter.go#L32)).
 - `scanner.scanOrphanedBlocks` — `LibraryID: uuid.Nil` ([scanner.go:386](../internal/gc/scanner.go#L386)) — **correct reference.**
 
-Worker + scanner enqueue the same block with the same `candidate_at`, collapsing to one
-`gc_queue` row but writing two `gc_pending_items` rows (`bucket(realLib)` + `bucket(Nil)`).
-`CompleteItem` deletes only the bucket matching the surviving queue row's `library_id`
-([store_cassandra.go:556-580](../internal/gc/store_cassandra.go#L556)); the other leaks.
+A single producer is self-consistent (`CompleteItem` re-reads `library_id` from the same queue
+row it completes). The leak needs **two** producers enqueuing the same block/candidate under
+different `library_id`s (worker `realLib` + scanner `Nil`, or two libraries sharing a block):
+same `candidate_at` collapses them to one `gc_queue` row (last writer wins on the non-key
+`library_id` column) but each already wrote its own `gc_pending_items` row (`bucket(realLib)` +
+`bucket(Nil)`). `CompleteItem` deletes only the row matching the surviving queue row's
+`library_id` ([store_cassandra.go:556-580](../internal/gc/store_cassandra.go#L556)); the other
+orphans forever.
 
 **Bug, not intentional (git history):** `worker.go` enqueue written with the real `libraryID`
 on 2026-04-09 (`e9a9b369b`); its dedup check migrated to `uuid.Nil` on 2026-04-30 (`5dee7eee2`)
@@ -4137,11 +4141,20 @@ on 2026-04-09 (`e9a9b369b`); its dedup check migrated to `uuid.Nil` on 2026-04-3
 
 #### Fix (this PR)
 
-Standardize every `ItemBlock` enqueue on `uuid.Nil` (worker + `Service.EnqueueBlock`), matching
-the dedup checks and the scanner. The two paths then write one identical queue row and one
-identical pending row; dedup works; `CompleteItem` removes it. Content-only, no data-safety
-impact. Covered by an integration test asserting no orphaned block pending rows survive a
-library delete + GC drain.
+Two layers:
+1. **Producers** — every `ItemBlock` enqueue keys `uuid.Nil` (`worker.enqueueZeroRefBlocks`,
+   `Service.EnqueueBlock`), matching the dedup checks and the scanner.
+2. **Central backstop** — the store pending helpers (`addPendingItemBatchQuery`,
+   `addPendingItemDeleteBatchQuery`, `PendingItemExists`) coerce `ItemBlock`'s `library_id` to
+   `uuid.Nil` via `pendingItemLibraryID`, so every pending write/delete/dedup-read for a block
+   lands on one key regardless of the caller. This makes the invariant impossible for a future
+   producer to break (the original bug was exactly a partial migration between the check and the
+   write).
+
+Content-only, no data-safety impact. Coverage: a pure-function unit test for the coercion, a
+worker unit test that the producer keys `uuid.Nil` (fails pre-fix), and an integration test that
+reproduces the real **two-producer** collision (worker cascade + scanner `uuid.Nil` at the same
+`candidate_at`) and asserts no orphaned pending row survives the drain.
 
 #### Still open
 

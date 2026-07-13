@@ -550,6 +550,8 @@ func (m *MockStore) upsertProvisionalBlockRefExpiryProjection(expiry *mockProvis
 }
 
 func (m *MockStore) upsertPendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, expiresAt *time.Time) {
+	// Mirror the Cassandra store: block pending rows are always keyed under uuid.Nil.
+	libraryID = pendingItemLibraryID(itemType, libraryID)
 	key := newMockPendingItemKey(orgID, libraryID, itemType, itemID, identityAt)
 	if expiresAt == nil {
 		m.pendingItems[key] = nil
@@ -560,6 +562,7 @@ func (m *MockStore) upsertPendingItem(orgID, libraryID uuid.UUID, itemType ItemT
 }
 
 func (m *MockStore) deletePendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time) {
+	libraryID = pendingItemLibraryID(itemType, libraryID)
 	delete(m.pendingItems, newMockPendingItemKey(orgID, libraryID, itemType, itemID, identityAt))
 }
 
@@ -1253,6 +1256,7 @@ func (m *MockStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemTyp
 func (m *MockStore) PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	libraryID = pendingItemLibraryID(itemType, libraryID)
 	now := time.Now().UTC()
 	for key, expiresAt := range m.pendingItems {
 		if key.OrgID != orgID || key.LibraryID != libraryID || key.ItemType != itemType || key.ItemID != itemID {
