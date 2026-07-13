@@ -2,6 +2,7 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"sort"
@@ -11,7 +12,6 @@ import (
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
-	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
 
@@ -421,22 +421,16 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library links"})
 			return
 		}
-		batch := h.db.Session().Batch(gocql.LoggedBatch)
-		if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, targetOrgID, libID); err != nil {
+		// Route through the shared permanent-delete writer so this bulk path can never
+		// drift from the single-library paths — including stamping purge_requested_at
+		// (migration 012 / P1b). Do not hand-roll the hard-delete + marker batch here.
+		if err := hardDeleteLibraryRowsFn(h.db, targetOrgID, libID, storageClass, blockRepresentationID); err != nil {
 			iter.Close()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
-			return
-		}
-		batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, libID)
-		batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libID)
-		// Permanent delete: stamp purge_requested_at so Phase 13 makes the library eligible
-		// on its next scan (then processed after the GC grace period) rather than deferring
-		// ~30d from now(). See migration 012 / P1b.
-		now := time.Now()
-		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id, purge_requested_at) VALUES (?, ?, ?, ?, ?, ?)`, libID, targetOrgID, now, storageClass, blockRepresentationID, now)
-		if err := batch.Exec(); err != nil {
-			iter.Close()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
+			if errors.Is(err, errHardDeleteLibraryReadModel) {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
+			}
 			return
 		}
 		cleaned++

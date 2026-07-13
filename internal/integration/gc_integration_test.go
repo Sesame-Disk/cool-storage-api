@@ -2469,3 +2469,199 @@ func TestGC_PermanentDeleteMarkerEligibleWithinRetention(t *testing.T) {
 		t.Fatal("recent soft-delete marker (no purge_requested_at) was eligible before retention — regression")
 	}
 }
+
+// TestGC_SoftDeleteRetentionInvariant_RealCassandra pins the sacred guarantee this branch
+// must never weaken: an ordinary (soft) delete puts the library in trash where it lives
+// out the configured trash-retention period fully recoverable, and GC must NOT purge it
+// early. Real end-to-end via the owner API against real Cassandra: create → trash → assert
+// (no purge_requested_at, canonical row still present, Phase 13 does not select it within
+// retention) → restore succeeds.
+func TestGC_SoftDeleteRetentionInvariant_RealCassandra(t *testing.T) {
+	requireCassandra(t)
+
+	repoID := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("soft-delete-invariant-%d", time.Now().UnixNano()))
+	session := shareProjectionDBForTest(t).Session()
+
+	// Ordinary delete == soft delete (trash) via the real API.
+	resp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("trash library: status=%d body=%s", resp.StatusCode, responseBody(t, resp))
+	}
+	resp.Body.Close()
+
+	// INVARIANT 1: the soft-delete marker carries NO purge_requested_at (retention path).
+	var orgIDStr, storageClass, repID string
+	var deletedAt, purgeRequestedAt time.Time
+	if err := session.Query(`
+		SELECT org_id, deleted_at, storage_class, block_representation_id, purge_requested_at
+		FROM deleted_libraries WHERE library_id = ?
+	`, repoID).Scan(&orgIDStr, &deletedAt, &storageClass, &repID, &purgeRequestedAt); err != nil {
+		t.Fatalf("read soft-delete marker: %v", err)
+	}
+	if deletedAt.IsZero() {
+		t.Fatal("soft-delete marker missing deleted_at")
+	}
+	if !purgeRequestedAt.IsZero() {
+		t.Fatalf("REGRESSION: ordinary soft-delete stamped purge_requested_at=%s — the retention path must leave it NULL", purgeRequestedAt)
+	}
+
+	// INVARIANT 2: the canonical libraries row still exists (recoverable), not hard-deleted.
+	var canonicalDeletedAt time.Time
+	if err := session.Query(`
+		SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgIDStr, repoID).Scan(&canonicalDeletedAt); err != nil {
+		t.Fatalf("REGRESSION: soft-deleted library canonical row is gone (%v) — a trashed lib must remain restorable", err)
+	}
+	if canonicalDeletedAt.IsZero() {
+		t.Fatal("canonical library row exists but deleted_at is not set")
+	}
+
+	// INVARIANT 3: within the configured retention window, GC Phase 13 must NOT select it.
+	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+	libs, err := store.ListExpiredDeletedLibraries(30)
+	if err != nil {
+		t.Fatalf("ListExpiredDeletedLibraries: %v", err)
+	}
+	for _, l := range libs {
+		if l.LibraryID.String() == repoID {
+			t.Fatalf("REGRESSION: a library trashed just now was selected for purge inside the retention window")
+		}
+	}
+
+	// INVARIANT 4: it is fully restorable via the real API.
+	restoreResp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", repoID), nil)
+	if restoreResp.StatusCode != http.StatusOK {
+		t.Fatalf("restore trashed library: status=%d body=%s", restoreResp.StatusCode, responseBody(t, restoreResp))
+	}
+	restoreResp.Body.Close()
+
+	// After restore: marker gone, canonical row active again.
+	var goneCheck time.Time
+	if err := session.Query(`SELECT deleted_at FROM deleted_libraries WHERE library_id = ?`, repoID).Scan(&goneCheck); err == nil {
+		t.Fatal("deleted_libraries marker still present after restore")
+	} else if !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("unexpected error checking marker removal after restore: %v", err)
+	}
+	var restoredDeletedAt time.Time
+	if err := session.Query(`SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`, orgIDStr, repoID).Scan(&restoredDeletedAt); err != nil {
+		t.Fatalf("restored library canonical row missing: %v", err)
+	}
+	if !restoredDeletedAt.IsZero() {
+		t.Fatal("restored library still has deleted_at set")
+	}
+
+	// Clean up the now-active library.
+	cleanupResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+	cleanupResp.Body.Close()
+}
+
+// TestGC_PermanentDeleteWriterStampsPurge_RealCassandra proves the REAL permanent-delete
+// writer (not a mocked hardDeleteLibraryRowsFn) persists purge_requested_at plus the
+// correct org_id / storage_class / block_representation_id, hard-deletes the canonical
+// rows, and produces a marker that Phase 13 selects within retention. Real end-to-end via
+// the owner API: create → trash → permanent delete.
+func TestGC_PermanentDeleteWriterStampsPurge_RealCassandra(t *testing.T) {
+	requireCassandra(t)
+
+	repoID := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("perm-delete-writer-%d", time.Now().UnixNano()))
+	session := shareProjectionDBForTest(t).Session()
+
+	// Trash first (permanent-delete requires the library to be in trash).
+	trashResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+	if trashResp.StatusCode != http.StatusOK {
+		t.Fatalf("trash library: status=%d body=%s", trashResp.StatusCode, responseBody(t, trashResp))
+	}
+	trashResp.Body.Close()
+
+	// Capture the soft-delete marker; its purge_requested_at MUST be NULL (retention path).
+	var orgIDStr, softStorage, softRep string
+	var softDeletedAt, softPurge time.Time
+	if err := session.Query(`
+		SELECT org_id, deleted_at, storage_class, block_representation_id, purge_requested_at
+		FROM deleted_libraries WHERE library_id = ?
+	`, repoID).Scan(&orgIDStr, &softDeletedAt, &softStorage, &softRep, &softPurge); err != nil {
+		t.Fatalf("read soft-delete marker: %v", err)
+	}
+	if !softPurge.IsZero() {
+		t.Fatal("soft-delete marker unexpectedly carried purge_requested_at")
+	}
+	if strings.TrimSpace(softRep) == "" {
+		t.Fatal("soft-delete marker missing block_representation_id")
+	}
+
+	orgUUID := uuid.MustParse(orgIDStr)
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, repoID).Exec()
+		// The purge-eligible marker may get a library_cascade enqueued by a background
+		// scan; remove any such queue/pending rows so nothing lingers.
+		deleteGCQueueItemsByIdentity(t, orgIDStr, "library_cascade", repoID)
+		bucket := gcpkg.PendingItemBucket(orgUUID, uuid.Nil, gcpkg.ItemLibraryCascade, repoID)
+		iter := session.Query(`
+			SELECT identity_at FROM gc_pending_items
+			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
+		`, orgIDStr, bucket, "library_cascade", uuid.Nil.String(), repoID).Iter()
+		var idAt time.Time
+		for iter.Scan(&idAt) {
+			_ = session.Query(`
+				DELETE FROM gc_pending_items
+				WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
+			`, orgIDStr, bucket, "library_cascade", uuid.Nil.String(), repoID, idAt).Exec()
+		}
+		_ = iter.Close()
+	})
+
+	// Permanent delete via the owner API (owner may permanently delete their own trash).
+	permResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", repoID))
+	if permResp.StatusCode != http.StatusOK {
+		t.Fatalf("permanent delete: status=%d body=%s", permResp.StatusCode, responseBody(t, permResp))
+	}
+	permResp.Body.Close()
+
+	// INVARIANT: the canonical libraries row is hard-deleted.
+	var goneAt time.Time
+	if err := session.Query(`SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`, orgIDStr, repoID).Scan(&goneAt); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("expected canonical libraries row gone after permanent delete, got err=%v", err)
+	}
+
+	// INVARIANT: the marker now carries purge_requested_at AND preserves org/storage/rep.
+	// The enqueued cascade is grace-gated, so the marker survives well beyond this read.
+	var permOrg, permStorage, permRep string
+	var permDeletedAt, permPurge time.Time
+	if err := session.Query(`
+		SELECT org_id, deleted_at, storage_class, block_representation_id, purge_requested_at
+		FROM deleted_libraries WHERE library_id = ?
+	`, repoID).Scan(&permOrg, &permDeletedAt, &permStorage, &permRep, &permPurge); err != nil {
+		t.Fatalf("read permanent-delete marker: %v", err)
+	}
+	if permPurge.IsZero() {
+		t.Fatal("REGRESSION: permanent-delete marker did not stamp purge_requested_at")
+	}
+	if permOrg != orgIDStr {
+		t.Fatalf("marker org_id = %s, want %s", permOrg, orgIDStr)
+	}
+	if permStorage != softStorage {
+		t.Fatalf("marker storage_class = %q, want %q (preserved from soft-delete)", permStorage, softStorage)
+	}
+	if strings.TrimSpace(permRep) != strings.TrimSpace(softRep) {
+		t.Fatalf("marker block_representation_id = %q, want %q (preserved)", permRep, softRep)
+	}
+
+	// INVARIANT: Phase 13 now selects it within retention on the strength of purge_requested_at.
+	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+	libs, err := store.ListExpiredDeletedLibraries(30)
+	if err != nil {
+		t.Fatalf("ListExpiredDeletedLibraries: %v", err)
+	}
+	found := false
+	for _, l := range libs {
+		if l.LibraryID.String() == repoID {
+			found = true
+			if l.PurgeRequestedAt.IsZero() {
+				t.Fatal("eligible library reported zero PurgeRequestedAt")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("REGRESSION: permanently-deleted library within retention was NOT Phase 13-eligible")
+	}
+}
