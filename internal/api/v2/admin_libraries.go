@@ -1226,7 +1226,6 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 		orgIDs = []string{callerOrgID}
 	}
 
-	libEnqueuer := getLibraryEnqueuer()
 	cleaned := 0
 	failed := 0
 
@@ -1259,12 +1258,13 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 					OrgID:        orgID,
 					LibraryID:    libID,
 					StorageClass: storageClass,
+					DeletedAt:    deletedAt,
 				})
 			}
 		}
 		iter.Close()
 
-		processedCleaned, processedFailed := h.processAdminTrashCandidates(candidates, libEnqueuer)
+		processedCleaned, processedFailed := h.processAdminTrashCandidates(candidates)
 		cleaned += processedCleaned
 		failed += processedFailed
 	}

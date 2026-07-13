@@ -2759,6 +2759,58 @@ func TestScanner_ScanExpiredDeletedLibraries_EnqueuesPurgeRequestedWithinRetenti
 	}
 }
 
+// TestScanner_ScanExpiredDeletedLibraries_PurgeRequestedDoesNotDoubleEnqueue is the edge
+// guard for ISSUE-GC-ORG-TRASH-NO-CASCADE-01: because the permanent-delete writer now
+// PRESERVES the original deleted_at (rather than resetting it to now), a library_cascade
+// already queued/retried under that identity stays deduplicated when the (now
+// purge-eligible) marker is rescanned. Phase 13 dedups library_cascade by deleted_at; if
+// the writer had reset it, this scan would enqueue a second cascade for the same library.
+func TestScanner_ScanExpiredDeletedLibraries_PurgeRequestedDoesNotDoubleEnqueue(t *testing.T) {
+	store := NewMockStore()
+	q := NewQueue(store)
+	s := NewScanner(store, q, &Stats{}, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	// Original trash time (within retention). The permanent delete preserves this deleted_at
+	// and stamps purge_requested_at, so the identity Phase 13 dedups on is unchanged.
+	deletedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	store.AddPurgeRequestedDeletedLibrary(orgID, libID, "hot", deletedAt, time.Now().UTC())
+
+	// A library_cascade already queued/retried under that same deleted_at identity, exactly
+	// as Phase 13 enqueues it (item LibraryID is uuid.Nil; the library is the ItemID).
+	if err := q.EnqueueBatch([]QueueItem{{
+		OrgID:                 orgID,
+		QueuedAt:              deletedAt,
+		IdentityAt:            deletedAt,
+		ItemType:              ItemLibraryCascade,
+		ItemID:                libID.String(),
+		LibraryID:             uuid.Nil,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+	}}); err != nil {
+		t.Fatalf("seed existing library_cascade: %v", err)
+	}
+
+	n, err := s.scanExpiredDeletedLibraries(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedLibraries: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 new cascades (dedup against the preserved identity), got %d", n)
+	}
+
+	cascades := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemLibraryCascade && item.ItemID == libID.String() {
+			cascades++
+		}
+	}
+	if cascades != 1 {
+		t.Fatalf("expected exactly 1 library_cascade for the library, got %d (double-enqueue regression)", cascades)
+	}
+}
+
 // TestScanner_ScanExpiredDeletedLibraries_RecoversUnstampedMarker is the
 // regression guard for the trash-stuck bug: the canonical soft-delete path writes
 // the deleted_libraries marker WITHOUT block_representation_id, so the marker is

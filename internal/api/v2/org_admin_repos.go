@@ -422,9 +422,9 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 			return
 		}
 		// Route through the shared permanent-delete writer so this bulk path can never
-		// drift from the single-library paths — including stamping purge_requested_at
-		// (migration 012 / P1b). Do not hand-roll the hard-delete + marker batch here.
-		if err := hardDeleteLibraryRowsFn(h.db, targetOrgID, libID, storageClass, blockRepresentationID); err != nil {
+		// drift from the single-library paths — including preserving deleted_at and stamping
+		// purge_requested_at (migration 012 / P1b). Do not hand-roll the hard-delete + marker batch here.
+		if err := hardDeleteLibraryRowsFn(h.db, targetOrgID, libID, storageClass, blockRepresentationID, deletedAt); err != nil {
 			iter.Close()
 			if errors.Is(err, errHardDeleteLibraryReadModel) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
@@ -469,7 +469,7 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 		return
 	}
 
-	h.deleteResolvedTrashLibrary(c, targetOrgID, repoID, storageClass)
+	h.deleteResolvedTrashLibrary(c, targetOrgID, repoID, storageClass, deletedAt)
 }
 
 // RestoreOrgTrashLibrary restores a trashed library.

@@ -267,7 +267,7 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 		}
 	}
 
-	h.permanentDeleteResolvedRepo(c, orgID, repoID, storageClass)
+	h.permanentDeleteResolvedRepo(c, orgID, repoID, storageClass, deletedAt)
 }
 
 // cleanupLibraryLinks removes all share/upload links for a deleted library

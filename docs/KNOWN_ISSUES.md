@@ -3574,15 +3574,25 @@ repo's total tagged files rather than the subtree size.
 
 #### Fix (this PR — durable purge-request marker, 6A/6B)
 
-Migration `012` adds `deleted_libraries.purge_requested_at`. Every permanent-delete marker
-writer (`hardDeleteLibraryRowsFn` — superadmin + org-admin single — and the
-`CleanOrgTrashLibraries` bulk batch) stamps it. Phase 13's `ListExpiredDeletedLibraries`
-now treats a row as eligible when `purge_requested_at IS set OR deleted_at < cutoff`, so a
-permanent delete is picked up on the **next scan** instead of after the configured
-`TrashRetentionDays` (~30d default), regardless of
-the reset `deleted_at`. The existing `ItemLibraryCascade` then performs the full reclamation
-it already owns (contents → `HardDeleteLibrary` = policy index + read models + marker,
-`DeleteLibraryStorageCounter`).
+Migration `012` adds `deleted_libraries.purge_requested_at`. Permanent-delete now routes
+through a single writer (`hardDeleteLibraryRowsFn`, shared by all four paths — superadmin
+single/bulk and org-admin single/bulk) that stamps it. Phase 13's
+`ListExpiredDeletedLibraries` now treats a row as eligible when
+`purge_requested_at IS set OR deleted_at < cutoff`, so a permanent delete is picked up on
+the **next scan** instead of after the configured `TrashRetentionDays` (~30d default). The
+existing `ItemLibraryCascade` then performs the full reclamation it already owns (contents →
+`HardDeleteLibrary` = policy index + read models + marker, `DeleteLibraryStorageCounter`).
+
+**Two edge invariants (post-review):**
+- The writer **preserves the original `deleted_at`** (the trash time) rather than resetting it
+  to now. Phase 13 dedups `library_cascade` by `deleted_at`; resetting it would let a cascade
+  already queued under the original identity be enqueued a second time. `purge_requested_at`
+  provides eligibility independently, so no reset is needed.
+- The permanent-delete paths **no longer fire an immediate `EnqueueLibraryDeletion`
+  content accelerator**. With prompt Phase 13 pickup that accelerator (identity = now,
+  `LibraryGuardNone`) is grace-gated like the cascade — so it gives no latency benefit — and
+  only duplicates the cascade's content items under a different identity. The durable marker
+  is now the single content producer.
 
 **Timing (not "instant"):** this changes *eligibility*, not the grace gate. Phase 13 still
 enqueues the cascade with `QueuedAt = deleted_at`, and the worker only dequeues items older
@@ -3591,9 +3601,11 @@ preserved. Net reclamation latency drops from the configured `TrashRetentionDays
 default) to about the scan interval plus the grace period. Normal soft-delete leaves
 `purge_requested_at` null and keeps the retention behavior unchanged.
 
-Branches 3/4 (immediate tactical enqueue/counter/tags in the org-admin paths) are now
-**optional accelerators** — they only shave the time-to-next-scan, since the durable cascade
-already covers counter/tags/policy/content.
+Branches 3/4 (an immediate tactical *content* enqueue in the org-admin paths) are
+**superseded**: the review showed an immediate content accelerator duplicates the now-prompt
+cascade under a different identity, so the design standardizes on the durable marker as the
+single content producer. (Counter/tags immediacy remains a possible minor follow-up but is
+covered by the cascade within the grace window.)
 
 #### Problem (original, pre-fix)
 

@@ -17,6 +17,10 @@ type trashLibraryCandidate struct {
 	OrgID        string
 	LibraryID    string
 	StorageClass string
+	// DeletedAt is the library's original trash time. The permanent-delete marker
+	// preserves it (rather than resetting to now) so a library_cascade already queued
+	// under that identity stays deduplicated — see hardDeleteLibraryRowsFn.
+	DeletedAt time.Time
 }
 
 var (
@@ -26,21 +30,29 @@ var (
 	cleanupLibraryLinksForDeleteFn = func(database *dbpkg.DB, orgID, libraryID string) error {
 		return cleanupLibraryLinks(database, orgID, libraryID)
 	}
-	hardDeleteLibraryRowsFn = func(database *dbpkg.DB, orgID, libraryID, storageClass, blockRepresentationID string) error {
+	hardDeleteLibraryRowsFn = func(database *dbpkg.DB, orgID, libraryID, storageClass, blockRepresentationID string, deletedAt time.Time) error {
 		batch := database.Session().Batch(gocql.LoggedBatch)
 		if err := addDeleteAdminLibraryReadModelQueries(database, batch, orgID, libraryID); err != nil {
 			return errors.Join(errHardDeleteLibraryReadModel, err)
 		}
 		batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libraryID)
 		batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libraryID)
-		// This is a *permanent* delete: stamp purge_requested_at so Phase 13 makes the
-		// library eligible on its next scan instead of waiting out the configured
-		// TrashRetentionDays from now() (the marker's deleted_at is reset here). The cascade
-		// is still gated by the GC grace period before the worker processes it — reclamation
-		// happens on the order of the grace period, not the retention period.
+		// This is a *permanent* delete. Two invariants:
+		//   1. PRESERVE the original deleted_at (the library's trash time). Phase 13 dedups
+		//      library_cascade by deleted_at; resetting it to now() would change the identity
+		//      and let a cascade already queued under the old deleted_at be enqueued a second
+		//      time. deletedAt is the authoritative libraries.deleted_at captured by the caller;
+		//      fall back to now() only if it is somehow zero.
+		//   2. Stamp purge_requested_at = now() so Phase 13 makes the library eligible on its
+		//      next scan instead of waiting out the configured TrashRetentionDays. The cascade
+		//      is still gated by the GC grace period before the worker processes it — reclamation
+		//      happens on the order of the grace period, not the retention period.
 		// See migration 012 / ISSUE-GC-ORG-TRASH-NO-CASCADE-01.
-		now := time.Now()
-		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id, purge_requested_at) VALUES (?, ?, ?, ?, ?, ?)`, libraryID, orgID, now, storageClass, blockRepresentationID, now)
+		markerDeletedAt := deletedAt
+		if markerDeletedAt.IsZero() {
+			markerDeletedAt = time.Now()
+		}
+		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id, purge_requested_at) VALUES (?, ?, ?, ?, ?, ?)`, libraryID, orgID, markerDeletedAt, storageClass, blockRepresentationID, time.Now())
 		if err := batch.Exec(); err != nil {
 			return errors.Join(errHardDeleteLibraryBatchExec, err)
 		}
@@ -68,7 +80,7 @@ func resolveDeleteRepresentationOrReject(c *gin.Context, database *dbpkg.DB, org
 	return "", false
 }
 
-func (h *DeletedLibraryHandler) permanentDeleteResolvedRepo(c *gin.Context, orgID, repoID, storageClass string) {
+func (h *DeletedLibraryHandler) permanentDeleteResolvedRepo(c *gin.Context, orgID, repoID, storageClass string, deletedAt time.Time) {
 	blockRepresentationID, ok := resolveDeleteRepresentationOrReject(c, h.db, orgID, repoID, "permanent_delete", "PermanentDeleteRepo")
 	if !ok {
 		return
@@ -78,7 +90,7 @@ func (h *DeletedLibraryHandler) permanentDeleteResolvedRepo(c *gin.Context, orgI
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean share links"})
 		return
 	}
-	if err := hardDeleteLibraryRowsFn(h.db, orgID, repoID, storageClass, blockRepresentationID); err != nil {
+	if err := hardDeleteLibraryRowsFn(h.db, orgID, repoID, storageClass, blockRepresentationID, deletedAt); err != nil {
 		if errors.Is(err, errHardDeleteLibraryReadModel) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
 			return
@@ -86,11 +98,11 @@ func (h *DeletedLibraryHandler) permanentDeleteResolvedRepo(c *gin.Context, orgI
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return
 	}
-	if h.libHandler != nil && h.libHandler.gcEnqueuer != nil {
-		runAsyncLibraryDeleteSideEffectFn(func() {
-			h.libHandler.gcEnqueuer.EnqueueLibraryDeletion(orgID, repoID, storageClass)
-		})
-	}
+	// No immediate content enqueue here: the durable purge_requested_at marker makes Phase 13
+	// enqueue the full ItemLibraryCascade on its next scan, which owns content + counter +
+	// policy + marker cleanup. A separate fire-and-forget EnqueueLibraryDeletion would enqueue
+	// the same commits/fs_objects under a different identity (LibraryGuardNone, queued_at=now)
+	// and merely duplicate that grace-gated work. See migration 012 / ISSUE-GC-ORG-TRASH-NO-CASCADE-01.
 	if err := deleteLibraryStorageCounterForDeleteFn(h.db, orgID, repoID); err != nil {
 		log.Printf("failed to delete storage counter for permanently deleted library %s/%s: %v", orgID, repoID, err)
 	}
@@ -102,7 +114,7 @@ func (h *DeletedLibraryHandler) permanentDeleteResolvedRepo(c *gin.Context, orgI
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-func (h *OrgAdminHandler) deleteResolvedTrashLibrary(c *gin.Context, targetOrgID, repoID, storageClass string) {
+func (h *OrgAdminHandler) deleteResolvedTrashLibrary(c *gin.Context, targetOrgID, repoID, storageClass string, deletedAt time.Time) {
 	blockRepresentationID, ok := resolveDeleteRepresentationOrReject(c, h.db, targetOrgID, repoID, "org_delete_trash_library", "DeleteOrgTrashLibrary")
 	if !ok {
 		return
@@ -111,7 +123,7 @@ func (h *OrgAdminHandler) deleteResolvedTrashLibrary(c *gin.Context, targetOrgID
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library links"})
 		return
 	}
-	if err := hardDeleteLibraryRowsFn(h.db, targetOrgID, repoID, storageClass, blockRepresentationID); err != nil {
+	if err := hardDeleteLibraryRowsFn(h.db, targetOrgID, repoID, storageClass, blockRepresentationID, deletedAt); err != nil {
 		if errors.Is(err, errHardDeleteLibraryReadModel) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
 			return
@@ -122,7 +134,7 @@ func (h *OrgAdminHandler) deleteResolvedTrashLibrary(c *gin.Context, targetOrgID
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-func (h *AdminHandler) processAdminTrashCandidates(candidates []trashLibraryCandidate, libEnqueuer LibraryGCEnqueuer) (cleaned, failed int) {
+func (h *AdminHandler) processAdminTrashCandidates(candidates []trashLibraryCandidate) (cleaned, failed int) {
 	for _, candidate := range candidates {
 		blockRepresentationID, err := resolveDeleteBlockRepresentationFn(h.db, candidate.OrgID, candidate.LibraryID)
 		if err != nil {
@@ -131,16 +143,14 @@ func (h *AdminHandler) processAdminTrashCandidates(candidates []trashLibraryCand
 			failed++
 			continue
 		}
-		if err := hardDeleteLibraryRowsFn(h.db, candidate.OrgID, candidate.LibraryID, candidate.StorageClass, blockRepresentationID); err != nil {
+		if err := hardDeleteLibraryRowsFn(h.db, candidate.OrgID, candidate.LibraryID, candidate.StorageClass, blockRepresentationID, candidate.DeletedAt); err != nil {
 			log.Printf("[AdminCleanTrashLibraries] failed to delete library %s (org %s): %v", candidate.LibraryID, candidate.OrgID, err)
 			failed++
 			continue
 		}
-		if libEnqueuer != nil {
-			runAsyncLibraryDeleteSideEffectFn(func() {
-				libEnqueuer.EnqueueLibraryDeletion(candidate.OrgID, candidate.LibraryID, candidate.StorageClass)
-			})
-		}
+		// No immediate content enqueue: the durable purge_requested_at marker drives the
+		// full ItemLibraryCascade via Phase 13; a fire-and-forget EnqueueLibraryDeletion would
+		// only duplicate that grace-gated content work under a different identity.
 		runAsyncLibraryDeleteSideEffectFn(func() {
 			if err := cleanupAllLibraryTagsForDeleteFn(h.db, candidate.LibraryID); err != nil {
 				log.Printf("[AdminCleanTrashLibraries] failed to clean tag metadata for library %s: %v", candidate.LibraryID, err)

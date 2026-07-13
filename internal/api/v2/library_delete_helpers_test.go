@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
@@ -63,7 +64,7 @@ func TestPermanentDeleteResolvedRepo_FailClosedOnRepresentationError(t *testing.
 		cleanupLinksCalled++
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -77,16 +78,10 @@ func TestPermanentDeleteResolvedRepo_FailClosedOnRepresentationError(t *testing.
 	}
 
 	before := testutil.ToFloat64(metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("permanent_delete"))
-	libEnq := &mockLibraryGCEnqueuer{}
-	h := &DeletedLibraryHandler{
-		db: &db.DB{},
-		libHandler: &LibraryHandler{
-			gcEnqueuer: libEnq,
-		},
-	}
+	h := &DeletedLibraryHandler{db: &db.DB{}}
 	c, w := newDeleteTestContext(http.MethodDelete, "/api/v2.1/repos/deleted/repo-1/")
 
-	h.permanentDeleteResolvedRepo(c, "org-1", "repo-1", "hot")
+	h.permanentDeleteResolvedRepo(c, "org-1", "repo-1", "hot", time.Now())
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusInternalServerError, w.Body.String())
@@ -98,9 +93,6 @@ func TestPermanentDeleteResolvedRepo_FailClosedOnRepresentationError(t *testing.
 	if cleanupLinksCalled != 0 || hardDeleteCalled != 0 || cleanupTagsCalled != 0 || deleteCounterCalled != 0 {
 		t.Fatalf("side effects ran despite fail-closed refusal: cleanupLinks=%d hardDelete=%d cleanupTags=%d deleteCounter=%d",
 			cleanupLinksCalled, hardDeleteCalled, cleanupTagsCalled, deleteCounterCalled)
-	}
-	if len(libEnq.calls) != 0 {
-		t.Fatalf("expected no GC enqueue on fail-closed refusal, got %#v", libEnq.calls)
 	}
 	after := testutil.ToFloat64(metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("permanent_delete"))
 	if after != before+1 {
@@ -119,7 +111,7 @@ func TestDeleteResolvedTrashLibrary_FailClosedOnRepresentationError(t *testing.T
 		cleanupLinksCalled++
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -128,7 +120,7 @@ func TestDeleteResolvedTrashLibrary_FailClosedOnRepresentationError(t *testing.T
 	h := &OrgAdminHandler{db: &db.DB{}}
 	c, w := newDeleteTestContext(http.MethodDelete, "/org/org-1/admin/trash-libraries/repo-1/")
 
-	h.deleteResolvedTrashLibrary(c, "org-1", "repo-1", "hot")
+	h.deleteResolvedTrashLibrary(c, "org-1", "repo-1", "hot", time.Now())
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusInternalServerError, w.Body.String())
@@ -181,7 +173,7 @@ func TestPermanentDeleteResolvedRepo_StampsResolvedRepresentationOnSuccess(t *te
 				cleanupLinksCalled++
 				return nil
 			}
-			hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string) error {
+			hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, _ time.Time) error {
 				gotRepresentation = blockRepresentationID
 				return nil
 			}
@@ -202,7 +194,7 @@ func TestPermanentDeleteResolvedRepo_StampsResolvedRepresentationOnSuccess(t *te
 			}
 			c, w := newDeleteTestContext(http.MethodDelete, "/api/v2.1/repos/deleted/"+tt.libraryID+"/")
 
-			h.permanentDeleteResolvedRepo(c, "org-1", tt.libraryID, "hot")
+			h.permanentDeleteResolvedRepo(c, "org-1", tt.libraryID, "hot", time.Now())
 
 			if w.Code != http.StatusOK {
 				t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
@@ -214,8 +206,10 @@ func TestPermanentDeleteResolvedRepo_StampsResolvedRepresentationOnSuccess(t *te
 				t.Fatalf("expected one successful destructive pass, got cleanupLinks=%d cleanupTags=%d deleteCounter=%d",
 					cleanupLinksCalled, cleanupTagsCalled, deleteCounterCalled)
 			}
-			if len(libEnq.calls) != 1 {
-				t.Fatalf("expected one GC enqueue after successful delete, got %#v", libEnq.calls)
+			// The permanent-delete path no longer fires an immediate content accelerator; the
+			// durable purge_requested_at marker drives the single Phase 13 cascade instead.
+			if len(libEnq.calls) != 0 {
+				t.Fatalf("expected no immediate GC enqueue (durable cascade owns content), got %#v", libEnq.calls)
 			}
 		})
 	}
@@ -231,7 +225,7 @@ func TestAdminCleanTrashLibraries_SkipsRepresentationFailuresWithoutSideEffects(
 		}
 		return db.PlainBlockRepresentationID, nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -239,21 +233,20 @@ func TestAdminCleanTrashLibraries_SkipsRepresentationFailuresWithoutSideEffects(
 		cleanupTagsCalled++
 		return nil
 	}
-	libEnq := &mockLibraryGCEnqueuer{}
 	h := &AdminHandler{db: &db.DB{}}
 
 	cleaned, failed := h.processAdminTrashCandidates([]trashLibraryCandidate{{
 		OrgID:        "org-1",
 		LibraryID:    "repo-bad",
 		StorageClass: "hot",
-	}}, libEnq)
+	}})
 
 	if cleaned != 0 || failed != 1 {
 		t.Fatalf("processAdminTrashCandidates() = (cleaned=%d, failed=%d), want (0, 1)", cleaned, failed)
 	}
-	if hardDeleteCalled != 0 || cleanupTagsCalled != 0 || len(libEnq.calls) != 0 {
-		t.Fatalf("side effects ran for skipped library: hardDelete=%d cleanupTags=%d enqueues=%#v",
-			hardDeleteCalled, cleanupTagsCalled, libEnq.calls)
+	if hardDeleteCalled != 0 || cleanupTagsCalled != 0 {
+		t.Fatalf("side effects ran for skipped library: hardDelete=%d cleanupTags=%d",
+			hardDeleteCalled, cleanupTagsCalled)
 	}
 }
 
@@ -264,28 +257,26 @@ func TestAdminCleanTrashLibraries_BatchFailureDoesNotRunPostCommitSideEffects(t 
 	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, _ string) (string, error) {
 		return db.PlainBlockRepresentationID, nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
 		return errors.New("batch exec failed")
 	}
 	cleanupAllLibraryTagsForDeleteFn = func(_ *db.DB, _ string) error {
 		cleanupTagsCalled++
 		return nil
 	}
-	libEnq := &mockLibraryGCEnqueuer{}
 	h := &AdminHandler{db: &db.DB{}}
 
 	cleaned, failed := h.processAdminTrashCandidates([]trashLibraryCandidate{{
 		OrgID:        "org-1",
 		LibraryID:    "repo-batch-fail",
 		StorageClass: "hot",
-	}}, libEnq)
+	}})
 
 	if cleaned != 0 || failed != 1 {
 		t.Fatalf("processAdminTrashCandidates() = (cleaned=%d, failed=%d), want (0, 1)", cleaned, failed)
 	}
-	if cleanupTagsCalled != 0 || len(libEnq.calls) != 0 {
-		t.Fatalf("post-commit side effects ran after failed hard delete: cleanupTags=%d enqueues=%#v",
-			cleanupTagsCalled, libEnq.calls)
+	if cleanupTagsCalled != 0 {
+		t.Fatalf("post-commit side effects ran after failed hard delete: cleanupTags=%d", cleanupTagsCalled)
 	}
 }
 
@@ -300,7 +291,7 @@ func TestAdminCleanTrashLibraries_PartialSuccessLeavesBadLibraryUntouched(t *tes
 		}
 		return db.PlainBlockRepresentationID, nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, libraryID, _, _ string) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, libraryID, _, _ string, _ time.Time) error {
 		hardDeleteCalls = append(hardDeleteCalls, libraryID)
 		return nil
 	}
@@ -308,13 +299,12 @@ func TestAdminCleanTrashLibraries_PartialSuccessLeavesBadLibraryUntouched(t *tes
 		cleanupTagCalls = append(cleanupTagCalls, libraryID)
 		return nil
 	}
-	libEnq := &mockLibraryGCEnqueuer{}
 	h := &AdminHandler{db: &db.DB{}}
 
 	cleaned, failed := h.processAdminTrashCandidates([]trashLibraryCandidate{
 		{OrgID: "org-1", LibraryID: "repo-good", StorageClass: "hot"},
 		{OrgID: "org-1", LibraryID: "repo-bad", StorageClass: "hot"},
-	}, libEnq)
+	})
 
 	if cleaned != 1 || failed != 1 {
 		t.Fatalf("processAdminTrashCandidates() = (cleaned=%d, failed=%d), want (1, 1)", cleaned, failed)
@@ -324,8 +314,5 @@ func TestAdminCleanTrashLibraries_PartialSuccessLeavesBadLibraryUntouched(t *tes
 	}
 	if strings.Join(cleanupTagCalls, ",") != "repo-good" {
 		t.Fatalf("tag cleanup calls = %#v, want only repo-good", cleanupTagCalls)
-	}
-	if len(libEnq.calls) != 1 || libEnq.calls[0].libraryID != "repo-good" {
-		t.Fatalf("GC enqueue calls = %#v, want only repo-good", libEnq.calls)
 	}
 }
