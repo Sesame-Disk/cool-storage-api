@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { login, localLogin, getAuthMethods } from '../../lib/api';
 import { getOIDCLoginURL, isDevBypass } from '../../lib/oidc';
 import { getConfig } from '../../lib/config';
+import Logo from '../common/Logo';
 
 export default function LoginForm() {
   const [email, setEmail] = useState('');
@@ -94,11 +95,7 @@ export default function LoginForm() {
 
   return (
     <div className="flex flex-col items-center w-full" data-testid="login-form">
-      <img
-        src={`${config.mediaUrl}${config.logoPath}`}
-        alt={config.siteTitle}
-        className="max-w-[200px] mb-4"
-      />
+      <Logo height={64} className="mb-4" />
       <h1 className="text-xl font-medium text-text mb-6">{config.siteTitle}</h1>
 
       {expired && (

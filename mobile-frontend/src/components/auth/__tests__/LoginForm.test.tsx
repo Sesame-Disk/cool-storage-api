@@ -22,6 +22,12 @@ vi.mock('../../../lib/config', () => ({
     mediaUrl: '/static/',
     logoPath: 'img/logo.png',
   }),
+  // Getter exports the <Logo> component reads directly.
+  siteRoot: () => '/',
+  mediaUrl: () => '/static/',
+  logoPath: () => 'img/logo.png',
+  logoHeight: () => 64,
+  siteTitle: () => 'Test App',
 }));
 
 import { login } from '../../../lib/api';

@@ -29,12 +29,41 @@ PARITY_BASE_URL=http://localhost:4321 PW_WORKERS=3 \
 npm run test:parity            # PARITY_BASE_URL defaults to http://localhost:18073
 ```
 
+**C. Non-dev / local-auth stack, inside the runner container** — the reproducible
+way when the host can't launch browsers. One command provisions the local-auth
+users, builds the `mobile-test` image, and runs the suite through a
+secure-context proxy (see below):
+```bash
+scripts/parity-local.sh                       # full matrix
+scripts/parity-local.sh onlyoffice.spec.ts    # specific specs
+PW_PROJECT=phone scripts/parity-local.sh      # single viewport
+```
+
+## Secure context (why uploads / service worker can falsely fail)
+The PWA uses **secure-context-only** browser APIs: Service Workers and
+`crypto.subtle` (upload SHA-256 hashing). A secure context is HTTPS **or**
+`http://localhost` / `127.0.0.1`. When the suite runs inside the `mobile-test`
+container and reaches the app via a container-DNS host (`http://mobile-frontend`),
+that's an **insecure** context, so uploads + SW silently fail — an environment
+artifact, not a PWA bug. Set `PARITY_PROXY_TARGET=mobile-frontend:80` and point
+`PARITY_BASE_URL` at `http://localhost:18073`; `global-setup` starts a loopback
+forwarder (`helpers/secure-proxy.ts`) so the browser sees a secure `localhost`
+origin. `scripts/parity-local.sh` wires this up for you.
+
+## Local-auth user provisioning
+In non-dev mode (`AUTH_DEV_MODE=false`) only the bootstrap superadmin is seeded.
+`node e2e-parity/provision-local-users.mjs` idempotently creates `user@` and
+`admin@` (org admin) in a real tenant org with the harness passwords. Run it once
+after bringing the stack up (or just use `scripts/parity-local.sh`, which calls it).
+
 ## Env vars
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `PARITY_BASE_URL` | `http://localhost:18073` | Mobile app origin under test |
 | `PARITY_API_URL` | = BASE_URL | API origin (same-origin proxy) |
 | `PARITY_AUTH_MODE` | `dev-token` | `dev-token` or `local` (sesameauth login) |
+| `PARITY_PROXY_TARGET` | — | `host:port` to forward `127.0.0.1:PARITY_PROXY_PORT` to (secure context) |
+| `PARITY_PROXY_PORT` | `18073` | Loopback port the secure-context proxy listens on |
 | `PW_WORKERS` | auto | Cap parallel workers (use `3` for the dev server) |
 | `PW_HTML` | — | Add HTML reporter when set |
 

@@ -111,6 +111,84 @@ export async function listOrgGroups(orgId: string): Promise<OrgGroup[]> {
 }
 
 // --------------------------------------------------------------------------
+// Departments (address-book groups). Managed by org admins / superadmins.
+//   list/create/delete: org admin (or superadmin) via the org-scoped endpoints
+//   add/remove members:  reuse addGroupMember / removeGroupMember (a department
+//                        IS a group; the admin who created it is its owner)
+// --------------------------------------------------------------------------
+
+export interface OrgDepartment {
+  id: string;
+  name: string;
+  parent_group_id?: string;
+  member_count?: number;
+}
+
+/** GET /address-book/groups/ → department groups in the org. */
+export async function listOrgDepartments(orgId: string): Promise<OrgDepartment[]> {
+  const res = await fetch(orgUrl(orgId, '/address-book/groups/'), { headers: authHeaders() });
+  const data = await readJson<{ groups?: OrgDepartment[] } | OrgDepartment[]>(
+    res,
+    'Failed to load departments',
+  );
+  const list = Array.isArray(data) ? data : (data.groups ?? []);
+  return list.map((d: any) => ({
+    id: d.id ?? d.group_id,
+    name: d.name ?? d.group_name,
+    parent_group_id: d.parent_group_id ?? '',
+    member_count: d.member_count,
+  }));
+}
+
+/** POST /address-book/groups/ { group_name } — create a top-level department. */
+export async function createDepartment(orgId: string, name: string): Promise<OrgDepartment> {
+  const res = await fetch(orgUrl(orgId, '/address-book/groups/'), {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ group_name: name }),
+  });
+  const d = await readJson<any>(res, 'Failed to create department');
+  return { id: d.id ?? d.group_id, name: d.name ?? d.group_name };
+}
+
+export interface OrgDepartmentMember {
+  email: string;
+  name: string;
+  role: string;
+  avatar_url?: string;
+}
+
+/** GET /address-book/groups/:id/ → a department with its members. */
+export async function getOrgDepartment(
+  orgId: string,
+  deptId: string,
+): Promise<{ id: string; name: string; members: OrgDepartmentMember[] }> {
+  const res = await fetch(orgUrl(orgId, `/address-book/groups/${deptId}/`), {
+    headers: authHeaders(),
+  });
+  const d = await readJson<any>(res, 'Failed to load department');
+  const members: OrgDepartmentMember[] = (d.members ?? []).map((m: any) => ({
+    email: m.email ?? m.contact_email,
+    name: m.name ?? m.email,
+    role: m.role ?? 'member',
+    avatar_url: m.avatar_url,
+  }));
+  return { id: d.id ?? d.group_id ?? deptId, name: d.name ?? d.group_name, members };
+}
+
+/** DELETE /address-book/groups/:id/ — remove a department (org admin). */
+export async function deleteDepartment(orgId: string, deptId: string): Promise<void> {
+  const res = await fetch(orgUrl(orgId, `/address-book/groups/${deptId}/`), {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error_msg || data.error || 'Failed to delete department');
+  }
+}
+
+// --------------------------------------------------------------------------
 // Repos / Libraries
 // --------------------------------------------------------------------------
 

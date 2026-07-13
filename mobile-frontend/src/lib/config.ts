@@ -109,6 +109,13 @@ export function parseBoolean(val: string | boolean): boolean {
 }
 
 export function getConfig(): AppConfig {
+  // SSR-safe: Astro server-renders client:load islands (e.g. TopBar → Logo)
+  // once for hydration markup, where `window` is undefined. Fall back to
+  // defaults there; the client re-renders with the real window.app.config.
+  if (typeof window === 'undefined') {
+    return { ...DEV_CONFIG };
+  }
+
   const raw = window.app?.config;
   if (!raw) return { ...DEV_CONFIG };
 

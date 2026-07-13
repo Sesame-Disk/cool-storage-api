@@ -14,6 +14,11 @@ interface NewFileDialogProps {
 const FILE_TYPES = [
   { label: 'Markdown', ext: '.md' },
   { label: 'Text', ext: '.txt' },
+  // Office documents — the backend seeds a valid template on create, so these
+  // open straight into the OnlyOffice editor (parity with the web frontend).
+  { label: 'Word', ext: '.docx' },
+  { label: 'Excel', ext: '.xlsx' },
+  { label: 'PowerPoint', ext: '.pptx' },
 ] as const;
 
 async function createEmptyFile(repoId: string, path: string): Promise<void> {
@@ -86,7 +91,7 @@ export default function NewFileDialog({ isOpen, onClose, repoId, path, onSuccess
             autoFocus
             data-testid="file-name-input"
           />
-          <div className="flex gap-2 mt-3">
+          <div className="flex flex-wrap gap-2 mt-3">
             {FILE_TYPES.map(ft => (
               <button
                 key={ft.ext}

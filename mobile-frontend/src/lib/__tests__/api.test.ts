@@ -14,6 +14,16 @@ import {
   starFile,
   createShareLink,
   searchUsers,
+  getOnlyOfficeConfig,
+  shareToUser,
+  listRepoShareItems,
+  removeUserShare,
+  createRepo,
+  setRepoPassword,
+  addGroupMember,
+  removeGroupMember,
+  setGroupAdmin,
+  deleteGroup,
 } from '../api';
 
 // Mock serviceURL to return a stable base URL
@@ -290,5 +300,215 @@ describe('Error handling for failed requests', () => {
   it('deleteFile throws on failure', async () => {
     vi.stubGlobal('fetch', mockFetchFail(404));
     await expect(deleteFile('repo-id', '/missing.txt')).rejects.toThrow('Failed to delete file');
+  });
+});
+
+describe('getOnlyOfficeConfig', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    setAuthToken(TOKEN);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('requests the editor config for the given repo + path and returns it', async () => {
+    const payload = {
+      doc: { document: {}, documentType: 'word', editorConfig: {}, token: 'jwt.signed.token' },
+      api_js_url: 'http://localhost:8088/web-apps/apps/api/documents/api.js',
+    };
+    const fetchMock = mockFetchOk(payload);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await getOnlyOfficeConfig('repo-1', '/docs/report.docx');
+
+    expect(res).toEqual(payload);
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toContain('/api/v2.1/repos/repo-1/onlyoffice/');
+    expect(url).toContain('p=%2Fdocs%2Freport.docx');
+    expect(opts.headers.Authorization).toBe(`Token ${TOKEN}`);
+  });
+
+  it("surfaces the backend's error_msg on failure (e.g. OnlyOffice disabled)", async () => {
+    vi.stubGlobal('fetch', mockFetchFail(503, { error_msg: 'OnlyOffice is not enabled' }));
+    await expect(getOnlyOfficeConfig('repo-1', '/x.docx')).rejects.toThrow(
+      'OnlyOffice is not enabled',
+    );
+  });
+
+  it('falls back to a generic message when the error body is not JSON', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: () => Promise.reject(new Error('not json')),
+    }));
+    await expect(getOnlyOfficeConfig('repo-1', '/x.docx')).rejects.toThrow('Failed to open document');
+  });
+});
+
+describe('User sharing (dir/shared_items contract)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    setAuthToken(TOKEN);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shareToUser sends username as an ARRAY with the path as the `p` query param', async () => {
+    const fetchMock = mockFetchOk({});
+    vi.stubGlobal('fetch', fetchMock);
+
+    await shareToUser('repo-1', '/team', 'bob@example.com', 'rw');
+
+    const [url, opts] = fetchMock.mock.calls[0];
+    // path must ride in `p`, not the body (the backend ignores a body path).
+    expect(url).toContain('/api/v2.1/repos/repo-1/dir/shared_items/');
+    expect(url).toContain('p=%2Fteam');
+    expect(opts.method).toBe('PUT');
+    const body = JSON.parse(opts.body);
+    expect(body).toEqual({ share_type: 'user', username: ['bob@example.com'], permission: 'rw' });
+    // Regression guard: username must be an array, never a bare string.
+    expect(Array.isArray(body.username)).toBe(true);
+    expect(body).not.toHaveProperty('path');
+  });
+
+  it('shareToUser surfaces the backend error_msg on failure', async () => {
+    vi.stubGlobal('fetch', mockFetchFail(400, { error_msg: 'invalid request body' }));
+    await expect(shareToUser('r', '/', 'x@y.z', 'r')).rejects.toThrow('invalid request body');
+  });
+
+  it('listRepoShareItems queries by `p` and maps user shares onto the UI shape', async () => {
+    const fetchMock = mockFetchOk([
+      { share_type: 'user', share_to: 'a@b.c', share_to_name: 'Alice', permission: 'r' },
+      { share_type: 'group', group_id: 1, permission: 'rw' },
+    ]);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const items = await listRepoShareItems('repo-1', '/team');
+
+    expect(fetchMock.mock.calls[0][0]).toContain('p=%2Fteam');
+    expect(items).toHaveLength(1);
+    // Mapped from share_to / share_to_name so the UI (user_email/user_name) renders.
+    expect(items[0].user_email).toBe('a@b.c');
+    expect(items[0].user_name).toBe('Alice');
+  });
+
+  it('removeUserShare deletes with `p` (not `path`) and the username', async () => {
+    const fetchMock = mockFetchOk({});
+    vi.stubGlobal('fetch', fetchMock);
+
+    await removeUserShare('repo-1', '/team', 'bob@example.com');
+
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(opts.method).toBe('DELETE');
+    expect(url).toContain('p=%2Fteam');
+    expect(url).toContain('username=bob%40example.com');
+    expect(url).not.toContain('path=');
+  });
+});
+
+describe('Encrypted libraries', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    setAuthToken(TOKEN);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('createRepo sends `encrypted` as a JSON boolean (not the string "true")', async () => {
+    const fetchMock = mockFetchOk({ repo_id: 'r1', name: 'Secret' });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await createRepo('Secret', true, 'pw12345678');
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.encrypted).toBe(true); // boolean, not "true"
+    expect(typeof body.encrypted).toBe('boolean');
+    expect(body.passwd).toBe('pw12345678');
+  });
+
+  it('createRepo omits encryption fields for a plain library', async () => {
+    const fetchMock = mockFetchOk({ repo_id: 'r1' });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await createRepo('Plain');
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).not.toHaveProperty('encrypted');
+    expect(body).not.toHaveProperty('passwd');
+  });
+
+  it('setRepoPassword unlocks via /api/v2.1/repos/:id/set-password/ with a JSON body', async () => {
+    const fetchMock = mockFetchOk({ success: true });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await setRepoPassword('repo-1', 'SecretPass123');
+
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toBe('http://localhost:8080/api/v2.1/repos/repo-1/set-password/');
+    expect(opts.method).toBe('POST');
+    expect(opts.headers['Content-Type']).toBe('application/json');
+    expect(JSON.parse(opts.body)).toEqual({ password: 'SecretPass123' });
+  });
+
+  it('setRepoPassword throws on an incorrect password', async () => {
+    vi.stubGlobal('fetch', mockFetchFail(400, {}));
+    await expect(setRepoPassword('repo-1', 'wrong')).rejects.toThrow('Incorrect password');
+  });
+});
+
+
+describe('Group management (access-gated mutations)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    setAuthToken(TOKEN);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('addGroupMember POSTs the email to the members endpoint', async () => {
+    const fetchMock = mockFetchOk({ success: true });
+    vi.stubGlobal('fetch', fetchMock);
+    await addGroupMember('7', 'bob@example.com');
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toBe('http://localhost:8080/api/v2.1/groups/7/members/');
+    expect(opts.method).toBe('POST');
+    expect(JSON.parse(opts.body)).toEqual({ email: 'bob@example.com' });
+  });
+
+  it('addGroupMember surfaces the backend permission error', async () => {
+    vi.stubGlobal('fetch', mockFetchFail(403, { error: 'permission denied' }));
+    await expect(addGroupMember('7', 'x@y.z')).rejects.toThrow('permission denied');
+  });
+
+  it('removeGroupMember DELETEs the encoded email', async () => {
+    const fetchMock = mockFetchOk({ success: true });
+    vi.stubGlobal('fetch', fetchMock);
+    await removeGroupMember('7', 'bob@example.com');
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toBe('http://localhost:8080/api/v2.1/groups/7/members/bob%40example.com');
+    expect(opts.method).toBe('DELETE');
+  });
+
+  it('setGroupAdmin PUTs is_admin', async () => {
+    const fetchMock = mockFetchOk({ success: true });
+    vi.stubGlobal('fetch', fetchMock);
+    await setGroupAdmin('7', 'bob@example.com', true);
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toBe('http://localhost:8080/api/v2.1/groups/7/members/bob%40example.com');
+    expect(opts.method).toBe('PUT');
+    expect(JSON.parse(opts.body)).toEqual({ is_admin: true });
+  });
+
+  it('deleteGroup DELETEs the group', async () => {
+    const fetchMock = mockFetchOk({ success: true });
+    vi.stubGlobal('fetch', fetchMock);
+    await deleteGroup('7');
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toBe('http://localhost:8080/api/v2.1/groups/7');
+    expect(opts.method).toBe('DELETE');
   });
 });

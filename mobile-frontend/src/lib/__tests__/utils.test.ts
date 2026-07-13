@@ -60,6 +60,26 @@ describe('getViewerType', () => {
     expect(getViewerType('beep.aac')).toBe('audio');
   });
 
+  it('returns office for OnlyOffice document types', () => {
+    expect(getViewerType('report.docx')).toBe('office');
+    expect(getViewerType('legacy.doc')).toBe('office');
+    expect(getViewerType('budget.xlsx')).toBe('office');
+    expect(getViewerType('sheet.xls')).toBe('office');
+    expect(getViewerType('deck.pptx')).toBe('office');
+    expect(getViewerType('slides.ppt')).toBe('office');
+    expect(getViewerType('notes.odt')).toBe('office');
+    expect(getViewerType('data.ods')).toBe('office');
+    expect(getViewerType('talk.odp')).toBe('office');
+  });
+
+  it('keeps native viewers for formats with a dedicated mobile viewer', () => {
+    // pdf/csv/txt/html have first-class mobile viewers and must NOT route to
+    // OnlyOffice even though the backend can also render them.
+    expect(getViewerType('doc.pdf')).toBe('pdf');
+    expect(getViewerType('table.csv')).toBe('text');
+    expect(getViewerType('page.html')).toBe('code');
+  });
+
   it('returns generic for unknown extensions', () => {
     expect(getViewerType('file.xyz')).toBe('generic');
   });

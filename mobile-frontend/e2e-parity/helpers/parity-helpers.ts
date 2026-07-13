@@ -191,3 +191,17 @@ export const TABS = ['libraries', 'shared', 'groups', 'starred', 'more'] as cons
 export async function waitForAppShell(page: Page) {
   await expect(page.locator('nav').first()).toBeVisible({ timeout: 15_000 });
 }
+
+/**
+ * Dismiss the PWA install / iOS "Add to Home Screen" banner if present. On the
+ * iOS device presets (iPhone SE / 14 Pro Max) the PwaManager renders a
+ * bottom-anchored banner whose ✕/Dismiss control overlays the FAB and
+ * intercepts pointer events — clicking the FAB before dismissing it times out.
+ */
+export async function dismissPwaBanner(page: Page) {
+  const dismiss = page.getByRole('button', { name: 'Dismiss' });
+  if (await dismiss.first().isVisible().catch(() => false)) {
+    await dismiss.first().click().catch(() => {});
+    await dismiss.first().waitFor({ state: 'hidden', timeout: 3_000 }).catch(() => {});
+  }
+}

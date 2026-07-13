@@ -41,7 +41,8 @@ Legend for spec column: `<spec file>::<test title>` in `e2e-parity/specs/`.
 | Operation | Status | Spec |
 |------|--------|------|
 | List libraries | ✅ | `libraries.spec.ts` |
-| Create (plain + encrypted) | 🟡 | via API arrange; UI e2e pending |
+| Create (plain) | ✅ | UI create in `encrypted-library.spec.ts` / `office-docs.spec.ts` |
+| Create + unlock ENCRYPTED library (E2E roundtrip) | ✅ | `encrypted-library.spec.ts` (+ fixed `encrypted` string→bool & unlock endpoint `/set-password/`) |
 | Rename | 🟡 | pending |
 | Delete | ✅ | `deleted-libs.spec.ts` (delete→restore) |
 | Deleted-libs list + restore (E4) | ✅ | `deleted-libs.spec.ts` |
@@ -52,12 +53,15 @@ Legend for spec column: `<spec file>::<test title>` in `e2e-parity/specs/`.
 | Browse / breadcrumb | ✅ | `deep-links.spec.ts`, `files.spec.ts` |
 | Create folder | ✅ | `files.spec.ts::create a folder` (+ SW cache-invalidation fix) |
 | Create file | ✅ | (SW cache-invalidation fix in NewFileDialog) |
+| Create office document (docx/xlsx/pptx) | ✅ | `office-docs.spec.ts` (New File → Word/Excel/PowerPoint → opens in OnlyOffice; template seeded server-side) |
+| Shared office doc opens for owner + receiver | ✅ | `office-docs.spec.ts::a shared office document opens for the owner and the receiver` |
 | Upload (small) | ✅ | `files.spec.ts::upload a small file` (+ SW cache-invalidation fix) |
 | Upload (block, large) (E5) | ✅ | `files.spec.ts::large file ... block-upload` (+ added /api/v2/ proxy — was 405) |
 | Rename | ✅ | `files.spec.ts::rename a file` |
 | Delete → trash | ✅ | `files.spec.ts::delete a file` |
 | Move / copy | ✅ | `files.spec.ts::move/copy` (+ fixed broken endpoint → sync-batch-move/copy-item) |
 | Star / unstar | ✅ | `files.spec.ts::star a file` (+ SW cache-invalidation fix) |
+| Download (file) | ✅ | `sharing-flows.spec.ts::upload…downloads with identical bytes` |
 | Trash: list / restore / clean (E1) | ✅ | `trash.spec.ts` (+ restore JSON-body & clean fixes) |
 | History / versions / revert (E2) | ✅ | `history.spec.ts` |
 | Tags (repo tags CRUD) (E3) | ✅ | `tags.spec.ts` |
@@ -72,7 +76,8 @@ Legend for spec column: `<spec file>::<test title>` in `e2e-parity/specs/`.
 | Share link create (from share sheet) | ✅ | `sharing.spec.ts::share sheet` (+ permissions string fix) |
 | Share link list/delete | ✅ | `sharing.spec.ts::share link ... deletes via UI` |
 | Upload link list/delete (E7) | ✅ | `sharing.spec.ts::upload link ... deletes via UI` |
-| Share with user / group | 🟡 | implemented; e2e pending |
+| Share with user / group | ✅ | `sharing-flows.spec.ts::shares a folder with another user` (+ fixed `username` array / `p` param, share-item field mapping, SW cache-invalidation) |
+| Public share link downloads (anon) | ✅ | `sharing-flows.spec.ts::share link downloads the file without authentication` |
 | Custom share permissions (E8) | ✅ | `custom-permissions.spec.ts` |
 | Share-admin management view | ✅ | `sharing.spec.ts` |
 

@@ -56,7 +56,17 @@ test.describe('OnlyOffice document viewer', () => {
         await openFile(page, name);
 
         // The office file routes to the OnlyOffice viewer (not GenericFileView).
-        await expect(page.getByTestId('onlyoffice-viewer')).toBeVisible();
+        const viewer = page.getByTestId('onlyoffice-viewer');
+        await expect(viewer).toBeVisible();
+
+        // Graceful degradation: even if the document server can't be reached,
+        // the viewer always exposes a download affordance, so an office file is
+        // never a dead end (parity with web, which also offers download). Match
+        // the header button exactly so it isn't confused with the error-state
+        // "Download instead" button (substring matching would hit both).
+        await expect(
+          viewer.getByRole('button', { name: 'Download', exact: true }),
+        ).toBeVisible();
 
         const res = await configResponse;
         expect(res.status(), 'backend serves an OnlyOffice editor config').toBe(200);

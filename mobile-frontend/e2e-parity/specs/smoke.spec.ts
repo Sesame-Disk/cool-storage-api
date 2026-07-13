@@ -38,6 +38,19 @@ test.describe('parity foundation smoke', () => {
     await go('libraries', /libraries/);
   });
 
+  test('brand logo renders in the app header (same mechanism as web)', async ({ page }) => {
+    await page.goto('/libraries/');
+    await waitForAppShell(page);
+    // The config-driven <Logo> (ported from the web frontend) renders in the
+    // TopBar and links home — brand parity with the web app shell.
+    const logo = page.getByTestId('app-logo').first();
+    await expect(logo).toBeVisible();
+    // The image actually loaded (non-zero intrinsic size), not a broken img.
+    await expect
+      .poll(async () => logo.evaluate((img: HTMLImageElement) => img.naturalWidth))
+      .toBeGreaterThan(0);
+  });
+
   test('core pages load without critical JS errors', async ({ page }) => {
     const errors: string[] = [];
     let current = '';

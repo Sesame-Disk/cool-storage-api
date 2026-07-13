@@ -187,6 +187,7 @@ export async function createGroup(name: string): Promise<Group> {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error_msg || 'Failed to create group');
   }
+  await invalidateApiCache('/api/v2.1/groups');
   return await res.json();
 }
 
@@ -206,13 +207,100 @@ export async function listGroupMembers(groupId: string): Promise<GroupMember[]> 
   return await res.json();
 }
 
+// Group management (mutations). Access levels enforced by the backend:
+//   - add member:      group owner OR admin
+//   - remove member:   owner/admin (anyone) · a plain member may remove only
+//                      themselves (i.e. "leave the group")
+//   - set/unset admin: owner only
+//   - delete group:    owner only
+
+/** Add a member to a group (owner/admin). POST /groups/:id/members/ {email}. */
+export async function addGroupMember(groupId: string, email: string): Promise<void> {
+  const res = await fetch(`${serviceURL()}/api/v2.1/groups/${groupId}/members/`, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || data.error_msg || 'Failed to add member');
+  }
+  await invalidateApiCache(`/api/v2.1/groups/${groupId}/members`);
+}
+
+/** Remove a member (owner/admin), or leave the group (member removing self). */
+export async function removeGroupMember(groupId: string, email: string): Promise<void> {
+  const res = await fetch(
+    `${serviceURL()}/api/v2.1/groups/${groupId}/members/${encodeURIComponent(email)}`,
+    { method: 'DELETE', headers: authHeaders() },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || data.error_msg || 'Failed to remove member');
+  }
+  await invalidateApiCache(`/api/v2.1/groups/${groupId}/members`);
+  await invalidateApiCache('/api/v2.1/groups');
+}
+
+/** Promote/demote a member to/from group admin (owner only). */
+export async function setGroupAdmin(
+  groupId: string,
+  email: string,
+  isAdmin: boolean,
+): Promise<void> {
+  const res = await fetch(
+    `${serviceURL()}/api/v2.1/groups/${groupId}/members/${encodeURIComponent(email)}`,
+    {
+      method: 'PUT',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_admin: isAdmin }),
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || data.error_msg || 'Failed to update member role');
+  }
+  await invalidateApiCache(`/api/v2.1/groups/${groupId}/members`);
+}
+
+/** Delete a group (owner only). */
+export async function deleteGroup(groupId: string): Promise<void> {
+  const res = await fetch(`${serviceURL()}/api/v2.1/groups/${groupId}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || data.error_msg || 'Failed to delete group');
+  }
+  await invalidateApiCache('/api/v2.1/groups');
+}
+
+export interface Department {
+  id: string;
+  name: string;
+}
+
+/** Departments the signed-in user belongs to. GET /api/v2.1/departments/. */
+export async function listMyDepartments(): Promise<Department[]> {
+  const res = await fetch(`${serviceURL()}/api/v2.1/departments/`, { headers: authHeaders() });
+  if (!res.ok) throw new Error('Failed to load departments');
+  const data = await res.json();
+  const list = Array.isArray(data) ? data : (data.departments ?? []);
+  return list.map((d: any) => ({ id: String(d.id ?? d.group_id), name: d.name ?? d.group_name }));
+}
+
 // Encryption
 
 export async function setRepoPassword(repoId: string, password: string): Promise<void> {
-  const res = await fetch(`${serviceURL()}/api2/repos/${repoId}/`, {
+  // Unlock an encrypted library. The dedicated endpoint verifies the password
+  // and opens a server-side decrypt session. (The old POST /api2/repos/:id/ with
+  // a form `password` returned 400 "unsupported operation" — unlocking never
+  // worked.)
+  const res = await fetch(`${serviceURL()}/api/v2.1/repos/${repoId}/set-password/`, {
     method: 'POST',
-    headers: { ...authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ password }),
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
   });
   if (!res.ok) throw new Error('Incorrect password');
 }
@@ -538,17 +626,30 @@ export interface SearchedUser {
 // Internal sharing API methods
 
 export async function listRepoShareItems(repoId: string, path: string): Promise<ShareItem[]> {
-  const params = new URLSearchParams({ repo_id: repoId, path });
+  // Backend reads the path from the `p` query param (not `path`); repo comes
+  // from the URL. Using the wrong name silently defaulted every lookup to "/".
+  const params = new URLSearchParams({ p: path });
   const res = await fetch(`${serviceURL()}/api/v2.1/repos/${repoId}/dir/shared_items/?${params}`, {
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error('Failed to list shared items');
   const data = await res.json();
-  return (data as any[]).filter(item => item.share_type === 'user');
+  // The backend returns each user share as { share_to, share_to_name, ... };
+  // map it onto the ShareItem shape the UI renders (user_email/user_name).
+  // Without this the shared-users list showed blank rows and "remove" sent an
+  // undefined username.
+  return (data as any[])
+    .filter(item => item.share_type === 'user')
+    .map(item => ({
+      user_email: item.user_email ?? item.share_to,
+      user_name: item.user_name ?? item.share_to_name ?? item.share_to,
+      avatar_url: item.avatar_url ?? '',
+      permission: item.permission,
+    }));
 }
 
 export async function listRepoGroupShares(repoId: string, path: string): Promise<GroupShareItem[]> {
-  const params = new URLSearchParams({ repo_id: repoId, path });
+  const params = new URLSearchParams({ p: path });
   const res = await fetch(`${serviceURL()}/api/v2.1/repos/${repoId}/dir/shared_items/?${params}`, {
     headers: authHeaders(),
   });
@@ -562,45 +663,56 @@ export async function listRepoGroupShares(repoId: string, path: string): Promise
 }
 
 export async function shareToUser(repoId: string, path: string, email: string, permission: string): Promise<void> {
-  const res = await fetch(`${serviceURL()}/api/v2.1/repos/${repoId}/dir/shared_items/`, {
+  // Backend contract: path is the `p` query param and `username` is an ARRAY.
+  // Sending it as a scalar (or path in the body) makes the bind fail → 400
+  // "invalid request body", which broke user sharing entirely.
+  const params = new URLSearchParams({ p: path });
+  const res = await fetch(`${serviceURL()}/api/v2.1/repos/${repoId}/dir/shared_items/?${params}`, {
     method: 'PUT',
     headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ share_type: 'user', username: email, path, permission }),
+    body: JSON.stringify({ share_type: 'user', username: [email], permission }),
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error_msg || 'Failed to share');
   }
+  // Drop the cached shared-items list so the UI reflects the new share.
+  await invalidateApiCache(`/api/v2.1/repos/${repoId}/dir/shared_items`);
 }
 
 export async function shareToGroup(repoId: string, path: string, groupId: number, permission: string): Promise<void> {
-  const res = await fetch(`${serviceURL()}/api/v2.1/repos/${repoId}/dir/shared_items/`, {
+  // Same contract as user sharing: path via `p` query, group_id as an ARRAY.
+  const params = new URLSearchParams({ p: path });
+  const res = await fetch(`${serviceURL()}/api/v2.1/repos/${repoId}/dir/shared_items/?${params}`, {
     method: 'PUT',
     headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ share_type: 'group', group_id: groupId, path, permission }),
+    body: JSON.stringify({ share_type: 'group', group_id: [String(groupId)], permission }),
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error_msg || 'Failed to share to group');
   }
+  await invalidateApiCache(`/api/v2.1/repos/${repoId}/dir/shared_items`);
 }
 
 export async function removeUserShare(repoId: string, path: string, email: string): Promise<void> {
-  const params = new URLSearchParams({ share_type: 'user', username: email, path });
+  const params = new URLSearchParams({ share_type: 'user', username: email, p: path });
   const res = await fetch(`${serviceURL()}/api/v2.1/repos/${repoId}/dir/shared_items/?${params}`, {
     method: 'DELETE',
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error('Failed to remove share');
+  await invalidateApiCache(`/api/v2.1/repos/${repoId}/dir/shared_items`);
 }
 
 export async function removeGroupShare(repoId: string, path: string, groupId: number): Promise<void> {
-  const params = new URLSearchParams({ share_type: 'group', group_id: String(groupId), path });
+  const params = new URLSearchParams({ share_type: 'group', group_id: String(groupId), p: path });
   const res = await fetch(`${serviceURL()}/api/v2.1/repos/${repoId}/dir/shared_items/?${params}`, {
     method: 'DELETE',
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error('Failed to remove group share');
+  await invalidateApiCache(`/api/v2.1/repos/${repoId}/dir/shared_items`);
 }
 
 // Activities
@@ -774,9 +886,12 @@ export async function createRepo(
   password?: string,
   storageID?: string,
 ): Promise<Repo> {
-  const body: Record<string, string> = { name };
+  // `encrypted` must be a JSON boolean — sending the string "true" makes the
+  // backend reject the body ("cannot unmarshal string into ... bool"), so
+  // encrypted-library creation failed outright.
+  const body: Record<string, unknown> = { name };
   if (encrypted) {
-    body.encrypted = 'true';
+    body.encrypted = true;
     if (password) body.passwd = password;
   }
   if (storageID) {
