@@ -1612,11 +1612,25 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 			candidateProjectionErr = errors.Join(candidateProjectionErr, fmt.Errorf("ensure block GC candidate projection for block %s: %w", blockID, candidateErr))
 		}
 		blockBatch = append(blockBatch, QueueItem{
-			OrgID:        orgID,
-			QueuedAt:     candidateAt,
-			ItemType:     ItemBlock,
-			ItemID:       blockID,
-			LibraryID:    libraryID,
+			OrgID:    orgID,
+			QueuedAt: candidateAt,
+			ItemType: ItemBlock,
+			ItemID:   blockID,
+			// Blocks are content-addressed and library-independent: processBlock only
+			// uses OrgID+ItemID. Enqueue every block under uuid.Nil, matching the
+			// uuid.Nil dedup check above and the scanner's orphan-block path. A single
+			// producer is self-consistent even with a real libraryID (CompleteItem
+			// re-reads it from the same queue row), but gc_pending_items is
+			// library-scoped in its key while gc_queue is not: if a second producer
+			// (the scanner, or another library sharing this block) enqueues the same
+			// block/candidate under a different libraryID, the single gc_queue row keeps
+			// only the last writer's library_id column while BOTH producers' pending
+			// rows survive — and CompleteItem then deletes only the one matching the
+			// surviving queue row, orphaning the other forever. Keying every producer
+			// under uuid.Nil collapses them to one pending row. The store-level pending
+			// helpers coerce ItemBlock to uuid.Nil as the backstop.
+			// See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01.
+			LibraryID:    uuid.Nil,
 			StorageClass: storageClass,
 			RetryCount:   0,
 		})

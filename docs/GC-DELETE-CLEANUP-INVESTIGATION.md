@@ -450,3 +450,92 @@ first remove/isolate global cross-test processing (1C), then use two gates:
   isolated, deterministic GC drain. Do **not** run a global GC or `TRUNCATE` over the shared
   keyspace (invariants #5/#6).
 
+---
+
+## Live-path verification and confirmed `gc_pending_items` leak (2026-07-13)
+
+After the P6b guard-mode work merged (PR #126), we re-ran the full suite on a wiped dev
+cluster (`docker compose down -v` → clean deploy) and, separately, exercised the **real**
+production delete path (uploaded ~50 GB across three folders through the normal web/desktop
+flow, then deleted the libraries and let GC drain). Direct Cassandra + MinIO inspection
+separated **test-only residue** from **live-path behavior** for the first time.
+
+### Verdict A — the physical/content delete is clean on the live path
+
+The 50 GB delete left **zero** content residue: `blocks`, `block_references`, `commits`, and
+the MinIO block buckets returned to exactly their pre-upload counts (MinIO total ≈ 880 bytes
+of pre-existing test residue; the 50 GB of real blocks + S3 objects were fully reclaimed).
+The library cascade → `fs:` ref release → zero-ref → candidate → LWT-claimed block + S3 delete
+ran end to end. This directly confirms that the **eternal content residue seen in the
+suite** — the `pub:foreign` block (F1/1A), the markerless `fs:`/commit/fs_object orphans (P7),
+and the S3-only orphans from `ProcessOnce(storage=nil)` (Verdict 2 / 1C) — is **test-only**:
+the real delete path reproduced **none** of it.
+
+### Verdict B — CONFIRMED live-path leak: `gc_pending_items` block rows are never removed
+
+`gc_pending_items` grew monotonically with deleted volume and **is not test-only** — the 50 GB
+real delete alone drove it from ~575 to **9,633 rows** (9,629 `block`, sampled rows point at
+blocks that are **already physically deleted**). With `gc_queue = 0`, `gc_block_candidates = 0`,
+and `gc_failed_items = 0`, no live work backs them: they are orphaned dedup rows with no TTL
+(`default_time_to_live = 0`, [001_initial_schema.cql:1207](../internal/db/migrations/001_initial_schema.cql#L1207)).
+This **upgrades E4 from "drift risk, not a proven leak" to a confirmed, unbounded live-path
+leak**, proportional to deleted block volume.
+
+**Root cause — `ItemBlock` is enqueued with an inconsistent `library_id`, and the pending key
+is library-scoped.**
+
+- `gc_pending_items` is keyed by `library_id` twice: the partition `bucket` hashes `library_id`
+  ([store_cassandra.go:251-259](../internal/gc/store_cassandra.go#L251)) **and** `library_id` is
+  a clustering column (`PRIMARY KEY ((org_id, bucket), item_type, library_id, item_id,
+  identity_at)`, [001_initial_schema.cql:1206](../internal/db/migrations/001_initial_schema.cql#L1206)).
+- `gc_queue` does **not** carry `library_id` in its key (`PRIMARY KEY ((org_id, bucket),
+  queued_at, item_type, item_id)`, [001_initial_schema.cql:1124](../internal/db/migrations/001_initial_schema.cql#L1124));
+  its bucket is `gcQueueBucket(orgID, itemType, itemID)`, library-independent.
+- Blocks are content-addressed and **library-independent** — `processBlock` uses only
+  `OrgID` + `ItemID`, never `item.LibraryID` ([worker.go:403-468](../internal/gc/worker.go#L403)).
+- There are three block-enqueue sites. Their pending **dedup checks all standardize on
+  `uuid.Nil`** ([worker.go:1602](../internal/gc/worker.go#L1602),
+  [scanner.go:370](../internal/gc/scanner.go#L370), [gc.go:411](../internal/gc/gc.go#L411)),
+  but two of them **write** the pending row under the **real** `libraryID`:
+  - `worker.enqueueZeroRefBlocks` enqueues `LibraryID: libraryID`
+    ([worker.go:1619](../internal/gc/worker.go#L1619)) — **the live leaker** (fired by every
+    cascade/version/auto-delete block release).
+  - `Service.EnqueueBlock` passes `libraryID` to `EnqueueItem`
+    ([gc.go:422](../internal/gc/gc.go#L422)) — latent only; its sole non-test caller already
+    passes `uuid.Nil` ([gc_adapter.go:32](../internal/api/gc_adapter.go#L32)).
+  - `scanner.scanOrphanedBlocks` enqueues `LibraryID: uuid.Nil`
+    ([scanner.go:386](../internal/gc/scanner.go#L386)) — **the correct reference**.
+
+A **single** producer is self-consistent even with a real `library_id`: `CompleteItem` re-reads
+`library_id` from the **same** queue row it is completing and deletes the pending row under that
+exact key ([store_cassandra.go:556-580](../internal/gc/store_cassandra.go#L556)). The leak needs
+**two** producers enqueuing the same block/candidate under **different** `library_id`s — worker
+cascade (`realLib`) plus scanner (`Nil`), or two libraries sharing a block. They enqueue with the
+same `candidate_at` as `queued_at`, so they **collapse into one `gc_queue` row** (last writer
+wins on the non-key `library_id` column) but each already wrote its **own** `gc_pending_items`
+row — `bucket(realLib)` **and** `bucket(Nil)`. `CompleteItem` then deletes only the pending row
+matching the **surviving** queue row's `library_id` and **orphans the other forever**. The
+`uuid.Nil` dedup check also could not see the worker's own `realLib` write, so it failed to
+suppress the double-enqueue.
+
+**Bug, not intentional — git history:** `worker.go` was written with `LibraryID: libraryID` on
+2026-04-09 (`e9a9b369b`, "Track block GC candidates"). Its dedup check was migrated to
+`uuid.Nil` on 2026-04-30 (`5dee7eee2`) **without** updating the paired enqueue — an incomplete
+migration that left the function checking one key and writing another. The scanner phase added
+2026-05-26 (`f3597a935`) does both sides with `uuid.Nil`, codifying the intended convention:
+**blocks are `Nil`-keyed in `gc_pending_items`.**
+
+**Fix (branch `fix/gc-pending-items-block-library-scope`, this PR):** two layers.
+1. **Producers** — every `ItemBlock` enqueue keys `uuid.Nil` (`worker.enqueueZeroRefBlocks`,
+   `Service.EnqueueBlock`), matching the dedup checks and the scanner.
+2. **Central backstop** — the store-level pending helpers (`addPendingItemBatchQuery`,
+   `addPendingItemDeleteBatchQuery`, `PendingItemExists`) coerce `ItemBlock` to `uuid.Nil` via
+   `pendingItemLibraryID`, so **every** pending write, delete, and dedup read for a block lands on
+   the single `uuid.Nil` key regardless of what any current or future producer passes. This is the
+   durable guard against the same class of partial-migration bug recurring.
+
+Both paths write one identical pending row and `CompleteItem` removes it. No data-safety impact
+(blocks never used `library_id`); the change is content-only. Pre-existing orphaned rows are not
+self-healed by the fix — they need the reconcile sweep (branch 8) or a coordinated one-off
+cleanup, tracked in `ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01`.
+

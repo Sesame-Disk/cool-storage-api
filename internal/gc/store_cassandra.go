@@ -421,6 +421,9 @@ func (s *CassandraStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, it
 }
 
 func (s *CassandraStore) PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string) (bool, error) {
+	// Read under the same coerced key the write/delete helpers use, so a block dedup
+	// probe always inspects the canonical uuid.Nil partition regardless of the caller.
+	libraryID = pendingItemLibraryID(itemType, libraryID)
 	var existingItemID string
 	query := `
 		SELECT item_id FROM gc_pending_items
@@ -442,7 +445,27 @@ func (s *CassandraStore) PendingItemExists(orgID, libraryID uuid.UUID, identityA
 	return true, nil
 }
 
+// pendingItemLibraryID is the single choke point that enforces the block/library
+// invariant for gc_pending_items. Blocks are content-addressed and library-independent
+// (processBlock never reads library_id), but the gc_pending_items key is library-scoped
+// (the bucket hashes library_id and library_id is a clustering column) while gc_queue is
+// not. If two producers enqueue the same block under different library_ids (worker
+// cascade vs scanner, or two libraries sharing a block), the single gc_queue row keeps
+// only the last writer's library_id column, but each producer wrote its OWN pending row;
+// CompleteItem then deletes only the pending row matching the surviving queue row and
+// orphans the other. Coercing every block pending write AND delete to uuid.Nil here makes
+// all block pending rows collapse to one key regardless of the caller, so a new producer
+// can never re-introduce the leak (ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01). Non-block
+// items keep their real library_id (they are always enqueued with a consistent one).
+func pendingItemLibraryID(itemType ItemType, libraryID uuid.UUID) uuid.UUID {
+	if itemType == ItemBlock {
+		return uuid.Nil
+	}
+	return libraryID
+}
+
 func addPendingItemBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time) {
+	libraryID = pendingItemLibraryID(itemType, libraryID)
 	batch.Query(`
 		INSERT INTO gc_pending_items (org_id, bucket, item_type, library_id, item_id, identity_at)
 		VALUES (?, ?, ?, ?, ?, ?)
@@ -450,6 +473,7 @@ func addPendingItemBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, it
 }
 
 func addPendingItemDeleteBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time) {
+	libraryID = pendingItemLibraryID(itemType, libraryID)
 	batch.Query(`
 		DELETE FROM gc_pending_items
 		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?

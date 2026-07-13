@@ -81,6 +81,7 @@ existence check (P6) that could enqueue destructive work for live libraries is *
 | **Phase 9 Group-Share Discovery Is a Global Scan** | 🟠 Pending (Med) | The immediate fix streams `shares_by_group` in bounded driver pages with cancellation, but Cassandra still scans every partition. Replace with bucketed active-partition discovery. See ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01 below. |
 | **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Former E3 is escalated to the High P6 issue. See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
 | **No Reconcile/Backfill for Existing Orphans** | 🟡 Follow-up | Existing clusters may hold blocks/S3 objects/stale policy rows orphaned by the gaps above. Needs a read-only-first reconcile pass, not blind truncation. See ISSUE-GC-RECONCILE-BACKFILL-01 below. |
+| **Block `gc_pending_items` Rows Leak (library-scope mismatch)** | 🟢 Root-caused + fixed (2026-07-13) | Confirmed live-path leak (was E4 "drift risk"): `ItemBlock` enqueued with the real `library_id` while the pending key is library-scoped and dedup checks use `uuid.Nil`, orphaning one pending row per block deleted (~9,629 for a 50 GB delete). No data-safety impact. Fixed by standardizing block enqueue on `uuid.Nil`. See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -4062,11 +4063,14 @@ P6 issue above.
   already past its check; hard cutover requires drain/serialization or destructive-step rechecks.
 - **E3 — escalated to P6a and fixed.** `LibraryExists`/`GroupExists` previously swallowed errors
   as "missing"; non-`ErrNotFound` errors now propagate and scanners fail closed.
-- **E4 — pending projection drift risk, not a proven normal leak.** Queue completion, DLQ
+- **E4 — pending projection drift.** Queue completion, DLQ
   deletion, and DLQ expiry remove `gc_pending_items` in their logged batches
   ([store_cassandra.go:499-583](../internal/gc/store_cassandra.go#L499)). No independent reconcile
   exists for historical/manual/ambiguous drift. A blind TTL could expire valid dedup protection
-  while queue/DLQ work remains live.
+  while queue/DLQ work remains live. **Update (2026-07-13): a concrete, unbounded live-path
+  source of this drift was found, root-caused, and fixed — the block/library-scope mismatch.
+  See `ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01` below.** The independent reconcile/backstop
+  (10D) is still open for pre-existing orphans and other drift sources.
 - **E5 — S3-orphan recovery lease-only exclusion.** `RecoverS3Orphans` ([worker.go:599-772](../internal/gc/worker.go#L599)) has no per-row LWT; mutual exclusion relies on the leader lease. Real double-processing risk only under a lease split-brain.
 
 #### Reviewed and found NOT to be bugs
@@ -4089,6 +4093,78 @@ P6 issue above.
 
 - `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (Engine-level review)
 - `docs/GC-SERVICE-ANALYSIS.md`
+
+---
+
+### ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01: Block `gc_pending_items` rows leak (library-scope mismatch)
+
+**Status**: 🟢 Root-caused + fixed (2026-07-13) — reconcile of pre-existing orphans still open (10D)
+**Severity**: Low-Med — unbounded metadata growth + scan cost; **no data-safety impact**
+**Affected**: `internal/gc` block enqueue paths, `gc_pending_items`
+
+#### Problem (confirmed live-path leak, was E4 "drift risk")
+
+`gc_pending_items` accumulates orphaned `block` rows proportional to deleted block volume. A real
+50 GB upload → delete → GC-drain on a wiped dev cluster drove it from ~575 to **9,633 rows**
+(9,629 `block`), with `gc_queue = 0` / `gc_block_candidates = 0` / `gc_failed_items = 0` and no
+TTL (`default_time_to_live = 0`). Sampled orphan rows point at blocks that are already physically
+deleted. The 50 GB of **content** (blocks, refs, commits, S3 objects) was reclaimed correctly —
+only the dedup rows leak.
+
+#### Root cause
+
+`gc_pending_items` is keyed by `library_id` (in the partition `bucket` hash
+[store_cassandra.go:251-259](../internal/gc/store_cassandra.go#L251) **and** as a clustering
+column [001_initial_schema.cql:1206](../internal/db/migrations/001_initial_schema.cql#L1206)),
+but `gc_queue` is not (library-independent bucket + key). Blocks are content-addressed;
+`processBlock` never reads `item.LibraryID` ([worker.go:403-468](../internal/gc/worker.go#L403)).
+All three block-enqueue **dedup checks** use `uuid.Nil`, but two paths **write** the pending row
+under the **real** `libraryID`:
+
+- `worker.enqueueZeroRefBlocks` — `LibraryID: libraryID` ([worker.go:1619](../internal/gc/worker.go#L1619)) — **the live leaker** (every cascade/version/auto-delete block release).
+- `Service.EnqueueBlock` — passes `libraryID` ([gc.go:422](../internal/gc/gc.go#L422)) — latent; sole non-test caller already passes `uuid.Nil` ([gc_adapter.go:32](../internal/api/gc_adapter.go#L32)).
+- `scanner.scanOrphanedBlocks` — `LibraryID: uuid.Nil` ([scanner.go:386](../internal/gc/scanner.go#L386)) — **correct reference.**
+
+A single producer is self-consistent (`CompleteItem` re-reads `library_id` from the same queue
+row it completes). The leak needs **two** producers enqueuing the same block/candidate under
+different `library_id`s (worker `realLib` + scanner `Nil`, or two libraries sharing a block):
+same `candidate_at` collapses them to one `gc_queue` row (last writer wins on the non-key
+`library_id` column) but each already wrote its own `gc_pending_items` row (`bucket(realLib)` +
+`bucket(Nil)`). `CompleteItem` deletes only the row matching the surviving queue row's
+`library_id` ([store_cassandra.go:556-580](../internal/gc/store_cassandra.go#L556)); the other
+orphans forever.
+
+**Bug, not intentional (git history):** `worker.go` enqueue written with the real `libraryID`
+on 2026-04-09 (`e9a9b369b`); its dedup check migrated to `uuid.Nil` on 2026-04-30 (`5dee7eee2`)
+**without** updating the paired enqueue — incomplete migration. Scanner phase (2026-05-26,
+`f3597a935`) does both sides `Nil`, codifying the intended convention.
+
+#### Fix (this PR)
+
+Two layers:
+1. **Producers** — every `ItemBlock` enqueue keys `uuid.Nil` (`worker.enqueueZeroRefBlocks`,
+   `Service.EnqueueBlock`), matching the dedup checks and the scanner.
+2. **Central backstop** — the store pending helpers (`addPendingItemBatchQuery`,
+   `addPendingItemDeleteBatchQuery`, `PendingItemExists`) coerce `ItemBlock`'s `library_id` to
+   `uuid.Nil` via `pendingItemLibraryID`, so every pending write/delete/dedup-read for a block
+   lands on one key regardless of the caller. This makes the invariant impossible for a future
+   producer to break (the original bug was exactly a partial migration between the check and the
+   write).
+
+Content-only, no data-safety impact. Coverage: a pure-function unit test for the coercion, a
+worker unit test that the producer keys `uuid.Nil` (fails pre-fix), and an integration test that
+reproduces the real **two-producer** collision (worker cascade + scanner `uuid.Nil` at the same
+`candidate_at`) and asserts no orphaned pending row survives the drain.
+
+#### Still open
+
+Pre-existing orphaned rows are not self-healed by the fix — they need the reconcile sweep
+(`ISSUE-GC-RECONCILE-BACKFILL-01` / branch 8) or a coordinated one-off cleanup. The general
+`gc_pending_items` reconcile/backstop is 10D under `ISSUE-GC-ENGINE-ROBUSTNESS-01`.
+
+#### Related Docs
+
+- `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` ("Live-path verification and confirmed `gc_pending_items` leak (2026-07-13)")
 
 ---
 

@@ -241,6 +241,54 @@ func TestWorker_EnqueueZeroRefBlocks_RecordsProjectionDegradationMetric(t *testi
 	}
 }
 
+// TestWorker_EnqueueZeroRefBlocks_KeysBlockUnderNil is the producer-level unit guard for
+// ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01. Blocks are content-addressed and
+// library-independent (processBlock never reads item.LibraryID), while gc_pending_items
+// is library-scoped in its key. enqueueZeroRefBlocks must key the block under uuid.Nil
+// regardless of which library's cascade released it, matching the uuid.Nil dedup check
+// and the scanner. Passing a real library UUID here and getting a real-library-keyed
+// queue row back is the exact producer bug this fixes (the store-level coercion in
+// TestPendingItemLibraryID_CoercesBlockToNil is the backstop for any future producer).
+func TestWorker_EnqueueZeroRefBlocks_KeysBlockUnderNil(t *testing.T) {
+	store := NewMockStore()
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, &Stats{})
+	orgID := uuid.New()
+	libraryID := uuid.New() // a real, non-nil library — the cascade's owning library
+
+	if err := w.enqueueZeroRefBlocks(orgID, libraryID, []string{"block-lib-scope"}, "hot"); err != nil {
+		t.Fatalf("enqueueZeroRefBlocks: %v", err)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued block item, got %d", len(items))
+	}
+	if items[0].LibraryID != uuid.Nil {
+		t.Fatalf("block enqueued with LibraryID=%s, want uuid.Nil (library-scope leak)", items[0].LibraryID)
+	}
+}
+
+// TestPendingItemLibraryID_CoercesBlockToNil guards the central store-level backstop:
+// every gc_pending_items write, delete, and dedup read for an ItemBlock is coerced to
+// uuid.Nil regardless of the caller's library_id, so a future producer that passes a real
+// library can never re-introduce the orphaned-pending-row leak. Non-block items keep
+// their real library_id (they are always enqueued with a consistent one).
+func TestPendingItemLibraryID_CoercesBlockToNil(t *testing.T) {
+	lib := uuid.New()
+	if got := pendingItemLibraryID(ItemBlock, lib); got != uuid.Nil {
+		t.Fatalf("pendingItemLibraryID(ItemBlock, %s) = %s, want uuid.Nil", lib, got)
+	}
+	if got := pendingItemLibraryID(ItemBlock, uuid.Nil); got != uuid.Nil {
+		t.Fatalf("pendingItemLibraryID(ItemBlock, Nil) = %s, want uuid.Nil", got)
+	}
+	for _, it := range []ItemType{ItemFSObject, ItemCommit, ItemLibraryCascade} {
+		if got := pendingItemLibraryID(it, lib); got != lib {
+			t.Fatalf("pendingItemLibraryID(%s, %s) = %s, want the real library", it, lib, got)
+		}
+	}
+}
+
 func TestWorker_ProcessBlock_RefCountZeroButLiveFSObjectReferenceSkipsDelete(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}

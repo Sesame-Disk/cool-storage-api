@@ -419,7 +419,17 @@ func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.U
 		metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("service").Inc()
 		log.Printf("[GC] WARNING: block candidate discovery degraded for org=%s block=%s: %v", orgID, blockID, candidateErr)
 	}
-	if err := s.store.EnqueueItem(orgID, candidateAt, ItemBlock, blockID, libraryID, storageClass, 0); err != nil {
+	// Blocks are content-addressed and library-independent; enqueue under uuid.Nil to
+	// match the dedup check above and the other block producers. The leak this avoids
+	// only manifests when two producers enqueue the same block under different
+	// library_ids (gc_pending_items is library-scoped in its key, gc_queue is not), so
+	// both pending rows survive but CompleteItem clears only the one matching the
+	// surviving queue row. The libraryID parameter is retained for API compatibility
+	// but is intentionally not used as the queue/pending key; the store-level pending
+	// helpers coerce ItemBlock to uuid.Nil as the backstop.
+	// See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01.
+	_ = libraryID
+	if err := s.store.EnqueueItem(orgID, candidateAt, ItemBlock, blockID, uuid.Nil, storageClass, 0); err != nil {
 		return errors.Join(candidateErr, err)
 	}
 	return nil
