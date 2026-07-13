@@ -574,13 +574,19 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:                 orgID,
-					QueuedAt:              now,
-					IdentityAt:            now,
-					ItemType:              ItemCommit,
-					ItemID:                commitID,
-					LibraryID:             libID,
-					BlockRepresentationID: blockRepresentationID,
+					OrgID:      orgID,
+					QueuedAt:   now,
+					IdentityAt: now,
+					// Re-validate against the canonical libraries table at execution time
+					// (P6b): the library was absent at scan time, but the worker must
+					// re-confirm it is still gone before deleting its content, in case it
+					// was restored/recreated or the projection drifted between scan and run.
+					RequiresLibraryDeletedCheck: true,
+					LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
+					ItemType:                    ItemCommit,
+					ItemID:                      commitID,
+					LibraryID:                   libID,
+					BlockRepresentationID:       blockRepresentationID,
 				})
 			}
 			if err := s.queue.EnqueueBatch(batch); err != nil {
@@ -657,13 +663,16 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:                 orgID,
-					QueuedAt:              now,
-					IdentityAt:            now,
-					ItemType:              ItemFSObject,
-					ItemID:                fsID,
-					LibraryID:             libID,
-					BlockRepresentationID: blockRepresentationID,
+					OrgID:      orgID,
+					QueuedAt:   now,
+					IdentityAt: now,
+					// Re-validate against the canonical libraries table at execution time (P6b).
+					RequiresLibraryDeletedCheck: true,
+					LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
+					ItemType:                    ItemFSObject,
+					ItemID:                      fsID,
+					LibraryID:                   libID,
+					BlockRepresentationID:       blockRepresentationID,
 				})
 			}
 			if err := s.queue.EnqueueBatch(batch); err != nil {

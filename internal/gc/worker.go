@@ -74,6 +74,7 @@ var s3DeleteRetryDelays = []time.Duration{
 
 var hardDeleteLockHeartbeatInterval = 30 * time.Minute
 var hardDeleteLockStaleAfter = 3 * hardDeleteLockHeartbeatInterval
+var fsObjectReferenceFenceInterval = 5 * time.Minute
 
 type hardDeleteLease struct {
 	stopCh  chan struct{}
@@ -139,6 +140,21 @@ func (l *hardDeleteLease) Close() {
 			l.setErr(err)
 		}
 	})
+}
+
+func (w *Worker) newTimedFence(fence func() error, interval time.Duration) func() error {
+	lastFenceAt := time.Time{}
+	return func() error {
+		now := w.clock().UTC()
+		if interval > 0 && !lastFenceAt.IsZero() && !now.Before(lastFenceAt) && now.Sub(lastFenceAt) < interval {
+			return nil
+		}
+		if err := fence(); err != nil {
+			return err
+		}
+		lastFenceAt = now
+		return nil
+	}
 }
 
 // Worker drains the gc_queue and deletes items from S3 and the database.
@@ -355,6 +371,7 @@ func (w *Worker) postponeItem(item QueueItem) error {
 		item.RetryCount,
 		effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
 		item.RequiresLibraryDeletedCheck,
+		item.LibraryGuardMode,
 	)
 }
 
@@ -817,7 +834,7 @@ func (w *Worker) processCommit(item QueueItem) error {
 	}
 
 	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
-	releaseGuard, stale, err := w.acquireLibraryDeleteGuard(item)
+	releaseGuard, fenceGuard, stale, err := w.acquireLibraryDeleteGuard(item)
 	if err != nil {
 		return err
 	}
@@ -842,6 +859,7 @@ func (w *Worker) processCommit(item QueueItem) error {
 				QueuedAt:                    item.QueuedAt,
 				IdentityAt:                  identityAt,
 				RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
+				LibraryGuardMode:            item.LibraryGuardMode,
 				ItemType:                    ItemFSObject,
 				ItemID:                      commit.RootFSID,
 				LibraryID:                   item.LibraryID,
@@ -853,6 +871,12 @@ func (w *Worker) processCommit(item QueueItem) error {
 		}
 	}
 
+	// Fence immediately before the destructive delete: re-confirm we still own the
+	// library hard-delete lock so a lease lost to expiry/restore cannot let us drop a
+	// live library's commit. Fail closed (item stays queued and re-validates on retry).
+	if err := fenceGuard(); err != nil {
+		return err
+	}
 	if err := w.store.DeleteCommit(item.LibraryID, item.ItemID); err != nil {
 		return fmt.Errorf("failed to delete commit: %w", err)
 	}
@@ -876,7 +900,7 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 	}
 
 	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
-	releaseGuard, stale, err := w.acquireLibraryDeleteGuard(item)
+	releaseGuard, fenceGuard, stale, err := w.acquireLibraryDeleteGuard(item)
 	if err != nil {
 		return err
 	}
@@ -902,6 +926,7 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 				QueuedAt:                    item.QueuedAt,
 				IdentityAt:                  identityAt,
 				RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
+				LibraryGuardMode:            item.LibraryGuardMode,
 				ItemType:                    ItemFSObject,
 				ItemID:                      childID,
 				LibraryID:                   item.LibraryID,
@@ -917,9 +942,11 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 	}
 
 	// If it's a file with blocks, remove its permanent block references. Any block
-	// left with no references becomes a GC candidate.
+	// left with no references becomes a GC candidate. Re-fence periodically during
+	// long loops so a suspended worker cannot keep mutating with a stale lease.
 	if len(fsObj.BlockIDs) > 0 {
-		zeroRefBlocks, err := w.removeFSObjectBlockReferences(item.OrgID, item.LibraryID, item.BlockRepresentationID, item.ItemID, fsObj.BlockIDs)
+		referenceFence := w.newTimedFence(fenceGuard, fsObjectReferenceFenceInterval)
+		zeroRefBlocks, err := w.removeFSObjectBlockReferences(item.OrgID, item.LibraryID, item.BlockRepresentationID, item.ItemID, fsObj.BlockIDs, referenceFence)
 		if err != nil {
 			return err
 		}
@@ -931,7 +958,12 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 		}
 	}
 
-	// Delete the fs_object
+	// Delete the fs_object. Fence immediately before this destructive delete so a lease
+	// lost to expiry/restore cannot let us drop a node from a live/restored library
+	// (the directory branch above releases no references, so this is its only fence).
+	if err := fenceGuard(); err != nil {
+		return err
+	}
 	if err := w.store.DeleteFSObject(item.LibraryID, item.ItemID); err != nil {
 		return fmt.Errorf("failed to delete fs_object: %w", err)
 	}
@@ -1197,23 +1229,25 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 	}
 	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
 	if deletedAt == nil || !deletedAt.Equal(identityAt) {
+		if deletedAt == nil {
+			// The delete marker is gone: either the library was restored (canonical
+			// row present again) or a prior cascade pass already hard-deleted it. In
+			// the latter case a crash between HardDeleteLibrary and
+			// DeleteLibraryStorageCounter may have left the per-library storage
+			// counter behind — reclaim it, but only after confirming the canonical
+			// row is absent so we never disturb a restored library's live counter.
+			if err := w.reclaimHardDeletedLibraryStorageCounter(item.OrgID, libraryID); err != nil {
+				return err
+			}
+		}
 		log.Printf("[GC Worker] Skipping stale library cascade for %s (current deleted_at=%v identity_at=%v queued_at=%v)", item.ItemID, deletedAt, identityAt, item.QueuedAt)
 		return nil
 	}
 
-	leaseToken := uuid.New()
-	acquired, err := w.store.AcquireLibraryHardDeleteLock(libraryID, leaseToken)
+	lease, fenceLibrary, err := w.acquireLibraryCascadeLease(ctx, libraryID, item.ItemID)
 	if err != nil {
-		return fmt.Errorf("failed to acquire library hard-delete lock for %s: %w", item.ItemID, err)
+		return err
 	}
-	if !acquired {
-		return hardDeleteInProgressError{Kind: "library", Target: libraryID.String(), ItemID: item.ItemID}
-	}
-	lease := newHardDeleteLease(ctx, "library", libraryID.String(), func() (bool, error) {
-		return w.store.RenewLibraryHardDeleteLock(libraryID, leaseToken)
-	}, func() error {
-		return w.store.ReleaseLibraryHardDeleteLock(libraryID, leaseToken)
-	})
 	defer lease.Close()
 
 	// Second stale-check after acquiring the lock.
@@ -1229,29 +1263,85 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		return err
 	}
 
-	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.BlockRepresentationID, item.StorageClass, identityAt); err != nil {
+	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.BlockRepresentationID, item.StorageClass, identityAt, fenceLibrary); err != nil {
 		return err
 	}
 	return lease.Check()
 }
 
-func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, libraryDeletedAt time.Time) error {
+// reclaimHardDeletedLibraryStorageCounter idempotently deletes the per-library
+// storage counter of a library whose canonical row is already gone. It exists to
+// recover from a crash between HardDeleteLibrary and DeleteLibraryStorageCounter
+// (see cascadeDeleteLibrary): the hard delete succeeded but the counter cleanup
+// did not, leaving an orphaned counter that would otherwise inflate future
+// reconciliation. It refuses to act while the canonical row still exists, so a
+// restored library keeps its live counter. Fails closed on read errors.
+func (w *Worker) reclaimHardDeletedLibraryStorageCounter(orgID, libraryID uuid.UUID) error {
+	exists, err := w.store.CanonicalLibraryExists(orgID, libraryID)
+	if err != nil {
+		return fmt.Errorf("failed to confirm canonical library absence before storage-counter reclaim for %s: %w", libraryID, err)
+	}
+	if exists {
+		return nil
+	}
+	if err := w.store.DeleteLibraryStorageCounter(orgID, libraryID); err != nil {
+		return fmt.Errorf("failed to reclaim storage counter for hard-deleted library %s: %w", libraryID, err)
+	}
+	return nil
+}
+
+func (w *Worker) acquireLibraryCascadeLease(ctx context.Context, libraryID uuid.UUID, itemID string) (*hardDeleteLease, func() error, error) {
+	leaseToken := uuid.New()
+	acquired, err := w.store.AcquireLibraryHardDeleteLock(libraryID, leaseToken)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to acquire library hard-delete lock for %s: %w", itemID, err)
+	}
+	if !acquired {
+		return nil, nil, hardDeleteInProgressError{Kind: "library", Target: libraryID.String(), ItemID: itemID}
+	}
+	lease := newHardDeleteLease(ctx, "library", libraryID.String(), func() (bool, error) {
+		return w.store.RenewLibraryHardDeleteLock(libraryID, leaseToken)
+	}, func() error {
+		return w.store.ReleaseLibraryHardDeleteLock(libraryID, leaseToken)
+	})
+	fence := func() error {
+		owned, err := w.store.RenewLibraryHardDeleteLock(libraryID, leaseToken)
+		if err != nil {
+			return fmt.Errorf("failed to fence library cascade for %s: %w", libraryID, err)
+		}
+		if !owned {
+			return fmt.Errorf("lost library hard-delete lock for %s", libraryID)
+		}
+		return nil
+	}
+	return lease, fence, nil
+}
+
+func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, libraryDeletedAt time.Time, fenceLibrary func() error) error {
 	if storageClass == "" {
 		storageClass, _ = w.store.GetLibraryStorageClass(orgID, libraryID)
 	}
 
-	if err := w.enqueueLibraryContentsAt(orgID, libraryID, blockRepresentationID, storageClass, libraryDeletedAt, true); err != nil {
+	if err := w.enqueueLibraryContentsAt(orgID, libraryID, blockRepresentationID, storageClass, libraryDeletedAt, LibraryGuardDeletedAtIdentity); err != nil {
 		return fmt.Errorf("failed to enqueue library contents: %w", err)
 	}
 
-	if err := w.store.DeleteLibraryStorageCounter(orgID, libraryID); err != nil {
-		return fmt.Errorf("failed to delete library storage counter for %s: %w", libraryID, err)
+	// Fence before the point of no return, then hard-delete the canonical row +
+	// marker FIRST. Ordering matters: once the canonical `libraries` row is gone,
+	// restoreDeletedLibrary can no longer resurrect the library, so a concurrent
+	// restore cannot observe a deleted storage counter and reactivate an
+	// under-counted library. Deleting the counter before the hard delete (the old
+	// order) left exactly that window. See DEBT-GC-COUNTER-ORDERING history.
+	if err := fenceLibrary(); err != nil {
+		return err
 	}
-
 	if err := w.store.HardDeleteLibrary(orgID, libraryID); err != nil {
 		return fmt.Errorf("failed to hard-delete library %s: %w", libraryID, err)
 	}
 
+	// The library is now definitively gone — record the audit here (not after the
+	// counter cleanup) so the event is captured even if the reclamation below has to
+	// be retried on a later pass.
 	w.store.WriteAuditLog(AuditLogEntry{
 		OrgID:      orgID,
 		Action:     "gc_library_cascade_deleted",
@@ -1261,8 +1351,17 @@ func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresent
 		Details:    fmt.Sprintf("storage_class=%s", storageClass),
 		Timestamp:  time.Now(),
 	})
-
 	log.Printf("[GC Worker] Cascade-deleted library %s (storage_class=%s)", libraryID, storageClass)
+
+	// Reclaim the per-library storage counter after the library is gone. No fence
+	// here: the canonical row no longer exists, so losing the lease past this point
+	// cannot corrupt a live/restored library. A failure still returns an error so the
+	// item is retried; the retry lands on the canonical-absent reclamation path in
+	// processLibraryCascade, which cleans the orphaned counter idempotently.
+	if err := w.store.DeleteLibraryStorageCounter(orgID, libraryID); err != nil {
+		return fmt.Errorf("failed to delete library storage counter for %s: %w", libraryID, err)
+	}
+
 	return nil
 }
 
@@ -1340,26 +1439,52 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		if err := lease.Check(); err != nil {
 			return err
 		}
-		libraryDeletedAt := lib.DeletedAt
-		if lib.DeletedAt.IsZero() {
-			if err := w.store.SoftDeleteLibrary(orgID, lib.LibraryID, uuid.Nil); err != nil {
-				return fmt.Errorf("failed to soft-delete library %s during org cascade: %w", lib.LibraryID, err)
+		libraryLease, fenceLibrary, err := w.acquireLibraryCascadeLease(ctx, lib.LibraryID, item.ItemID)
+		if err != nil {
+			return err
+		}
+		funcErr := func() error {
+			defer libraryLease.Close()
+			if err := lease.Check(); err != nil {
+				return err
 			}
 			deletedLibraryAt, err := w.store.GetLibraryDeletedAt(lib.LibraryID)
 			if err != nil {
 				return fmt.Errorf("failed to read deleted library marker for %s during org cascade: %w", lib.LibraryID, err)
 			}
 			if deletedLibraryAt == nil {
-				return fmt.Errorf("missing deleted library marker for %s during org cascade", lib.LibraryID)
+				exists, err := w.store.CanonicalLibraryExists(orgID, lib.LibraryID)
+				if err != nil {
+					return fmt.Errorf("failed to read canonical library row for %s during org cascade: %w", lib.LibraryID, err)
+				}
+				if !exists {
+					return nil
+				}
+				if err := w.store.SoftDeleteLibrary(orgID, lib.LibraryID, uuid.Nil); err != nil {
+					return fmt.Errorf("failed to soft-delete library %s during org cascade: %w", lib.LibraryID, err)
+				}
+				deletedLibraryAt, err = w.store.GetLibraryDeletedAt(lib.LibraryID)
+				if err != nil {
+					return fmt.Errorf("failed to read deleted library marker for %s during org cascade: %w", lib.LibraryID, err)
+				}
+				if deletedLibraryAt == nil {
+					return fmt.Errorf("missing deleted library marker for %s during org cascade", lib.LibraryID)
+				}
 			}
-			libraryDeletedAt = *deletedLibraryAt
-		}
-		blockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(w.store, orgID, lib.LibraryID, "", "org cascade")
-		if err != nil {
-			return err
-		}
-		if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, blockRepresentationID, lib.StorageClass, libraryDeletedAt); err != nil {
-			return fmt.Errorf("failed to cascade-delete library %s during org delete: %w", lib.LibraryID, err)
+			blockRepresentationID, err := resolveRequiredLibraryBlockRepresentation(w.store, orgID, lib.LibraryID, "", "org cascade")
+			if err != nil {
+				return err
+			}
+			if err := libraryLease.Check(); err != nil {
+				return err
+			}
+			if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, blockRepresentationID, lib.StorageClass, *deletedLibraryAt, fenceLibrary); err != nil {
+				return fmt.Errorf("failed to cascade-delete library %s during org delete: %w", lib.LibraryID, err)
+			}
+			return libraryLease.Check()
+		}()
+		if funcErr != nil {
+			return funcErr
 		}
 		if err := lease.Check(); err != nil {
 			return err
@@ -1434,7 +1559,7 @@ func fsObjectBlockDecrementTaskID(libraryID uuid.UUID, fsID string, identityAt t
 // resolved to internal SHA-256 IDs first. Idempotent: deleting a missing reference
 // is a no-op, so a retried fs_object GC pass is safe (no double-decrement risk —
 // the whole class of decrement idempotency bugs disappears with the counter).
-func (w *Worker) removeFSObjectBlockReferences(orgID, libraryID uuid.UUID, blockRepresentationID, fsID string, blockIDs []string) ([]string, error) {
+func (w *Worker) removeFSObjectBlockReferences(orgID, libraryID uuid.UUID, blockRepresentationID, fsID string, blockIDs []string, beforeMutation func() error) ([]string, error) {
 	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, libraryID, blockRepresentationID, blockIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve block IDs for fs_object %s/%s: %w", libraryID, fsID, err)
@@ -1449,6 +1574,9 @@ func (w *Worker) removeFSObjectBlockReferences(orgID, libraryID uuid.UUID, block
 		}
 		seen[blockID] = struct{}{}
 
+		if err := beforeMutation(); err != nil {
+			return nil, fmt.Errorf("failed to fence block reference cleanup for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
+		}
 		if err := w.store.RemoveBlockReference(orgID, blockID, referrer); err != nil {
 			return nil, fmt.Errorf("failed to remove block reference for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
 		}
@@ -1506,10 +1634,10 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 // Only enqueues commits and fs_objects — blocks are handled in cascade
 // when fs_objects are processed (via decrementFSObjectBlocks).
 func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass string) error {
-	return w.enqueueLibraryContentsAt(orgID, libraryID, "", storageClass, w.clock(), false)
+	return w.enqueueLibraryContentsAt(orgID, libraryID, "", storageClass, w.clock(), LibraryGuardNone)
 }
 
-func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
+func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, identityAt time.Time, libraryGuardMode LibraryGuardMode) error {
 	if identityAt.IsZero() {
 		identityAt = w.clock()
 	}
@@ -1518,6 +1646,7 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepre
 		return err
 	}
 	blockRepresentationID = resolvedBlockRepresentationID
+	requiresLibraryDeletedCheck := libraryGuardMode != LibraryGuardNone
 
 	// Enqueue all commits for this library (batched)
 	commits, err := w.store.ListCommitsForLibrary(libraryID)
@@ -1535,7 +1664,7 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepre
 				continue
 			}
 			batch = append(batch, QueueItem{
-				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, RequiresLibraryDeletedCheck: requiresLibraryDeletedCheck, ItemType: ItemCommit,
+				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, RequiresLibraryDeletedCheck: requiresLibraryDeletedCheck, LibraryGuardMode: libraryGuardMode, ItemType: ItemCommit,
 				ItemID: c.CommitID, LibraryID: libraryID, BlockRepresentationID: blockRepresentationID,
 			})
 		}
@@ -1562,7 +1691,7 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepre
 				continue
 			}
 			batch = append(batch, QueueItem{
-				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, RequiresLibraryDeletedCheck: requiresLibraryDeletedCheck, ItemType: ItemFSObject,
+				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, RequiresLibraryDeletedCheck: requiresLibraryDeletedCheck, LibraryGuardMode: libraryGuardMode, ItemType: ItemFSObject,
 				ItemID: obj.FSID, LibraryID: libraryID, BlockRepresentationID: blockRepresentationID,
 			})
 		}
@@ -1583,73 +1712,107 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepre
 	return nil
 }
 
-func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), bool, error) {
-	if !item.RequiresLibraryDeletedCheck {
-		return func() {}, false, nil
+func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), func() error, bool, error) {
+	guardMode := effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck)
+	if guardMode == LibraryGuardNone {
+		return func() {}, func() error { return nil }, false, nil
 	}
 	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
-	libraryMissing := false
-	isStale := func(deletedAt *time.Time) (bool, error) {
-		if deletedAt == nil {
-			exists, err := w.store.LibraryExists(item.LibraryID)
-			if err != nil {
-				return false, fmt.Errorf("failed to confirm library existence for child %s/%s: %w", item.LibraryID, item.ItemID, err)
-			}
-			libraryMissing = !exists
-			return exists, nil
+	if guardMode == LibraryGuardDeletedAtIdentity {
+		deletedAt, err := w.store.GetLibraryDeletedAt(item.LibraryID)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("failed to read deleted library marker for %s/%s: %w", item.LibraryID, item.ItemID, err)
 		}
-		libraryMissing = false
-		return !deletedAt.Equal(identityAt), nil
-	}
-
-	deletedAt, err := w.store.GetLibraryDeletedAt(item.LibraryID)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to read deleted library marker for %s/%s: %w", item.LibraryID, item.ItemID, err)
-	}
-	stale, err := isStale(deletedAt)
-	if err != nil {
-		return nil, false, err
-	}
-	if stale {
-		log.Printf("[GC Worker] Skipping stale guarded item %s/%s (current deleted_at=%v identity_at=%v)", item.LibraryID, item.ItemID, deletedAt, identityAt)
-		return func() {}, true, nil
-	}
-	if libraryMissing {
-		// The library has already been hard-deleted, so any remaining child items
-		// should continue draining even if a short-lived lock row lingers until TTL.
-		return func() {}, false, nil
+		if deletedAt == nil {
+			exists, err := w.store.CanonicalLibraryExists(item.OrgID, item.LibraryID)
+			if err != nil {
+				return nil, nil, false, fmt.Errorf("failed to confirm canonical library absence for completed cascade %s/%s: %w", item.LibraryID, item.ItemID, err)
+			}
+			if exists {
+				log.Printf("[GC Worker] Skipping stale guarded item %s/%s: delete marker is gone but canonical library exists", item.LibraryID, item.ItemID)
+				return func() {}, func() error { return nil }, true, nil
+			}
+			// The parent cascade already hard-deleted both the canonical row and its
+			// marker. Its children must keep draining; the row can no longer be
+			// restored through the guarded restore path.
+			return func() {}, func() error { return nil }, false, nil
+		}
+		if !deletedAt.Equal(identityAt) {
+			log.Printf("[GC Worker] Skipping stale guarded item %s/%s (current deleted_at=%v identity_at=%v)", item.LibraryID, item.ItemID, deletedAt, identityAt)
+			return func() {}, func() error { return nil }, true, nil
+		}
+	} else if guardMode != LibraryGuardCanonicalMustBeAbsent {
+		return nil, nil, false, fmt.Errorf("unknown library guard mode %q for %s/%s", guardMode, item.LibraryID, item.ItemID)
 	}
 
 	leaseToken := uuid.New()
 	acquired, err := w.store.AcquireLibraryHardDeleteLock(item.LibraryID, leaseToken)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to acquire library hard-delete lock for child %s/%s: %w", item.LibraryID, item.ItemID, err)
+		return nil, nil, false, fmt.Errorf("failed to acquire library hard-delete lock for child %s/%s: %w", item.LibraryID, item.ItemID, err)
 	}
 	if !acquired {
-		return nil, false, libraryHardDeleteInProgressError{LibraryID: item.LibraryID, ItemID: item.ItemID}
+		return nil, nil, false, libraryHardDeleteInProgressError{LibraryID: item.LibraryID, ItemID: item.ItemID}
 	}
 
 	release := func() {
 		_ = w.store.ReleaseLibraryHardDeleteLock(item.LibraryID, leaseToken)
 	}
 
-	deletedAt2, err := w.store.GetLibraryDeletedAt(item.LibraryID)
-	if err != nil {
-		release()
-		return nil, false, fmt.Errorf("failed to re-read deleted library marker for child %s/%s: %w", item.LibraryID, item.ItemID, err)
-	}
-	stale, err = isStale(deletedAt2)
-	if err != nil {
-		release()
-		return nil, false, err
-	}
-	if stale {
-		release()
-		log.Printf("[GC Worker] Skipping stale guarded item %s/%s after lock (current deleted_at=%v identity_at=%v)", item.LibraryID, item.ItemID, deletedAt2, identityAt)
-		return func() {}, true, nil
+	if guardMode == LibraryGuardCanonicalMustBeAbsent {
+		exists, err := w.store.CanonicalLibraryExists(item.OrgID, item.LibraryID)
+		if err != nil {
+			release()
+			return nil, nil, false, fmt.Errorf("failed to confirm canonical library absence for %s/%s: %w", item.LibraryID, item.ItemID, err)
+		}
+		if exists {
+			release()
+			log.Printf("[GC Worker] Skipping orphan item %s/%s: canonical library exists", item.LibraryID, item.ItemID)
+			return func() {}, func() error { return nil }, true, nil
+		}
+	} else {
+		deletedAt, err := w.store.GetLibraryDeletedAt(item.LibraryID)
+		if err != nil {
+			release()
+			return nil, nil, false, fmt.Errorf("failed to re-read deleted library marker for child %s/%s: %w", item.LibraryID, item.ItemID, err)
+		}
+		if deletedAt == nil || !deletedAt.Equal(identityAt) {
+			release()
+			log.Printf("[GC Worker] Skipping stale guarded item %s/%s after lock (current deleted_at=%v identity_at=%v)", item.LibraryID, item.ItemID, deletedAt, identityAt)
+			return func() {}, func() error { return nil }, true, nil
+		}
+		// The delete marker still matches, but a matching marker does NOT prove the parent
+		// cascade finished HardDeleteLibrary. HardDeleteLibrary removes the canonical
+		// `libraries` row and the marker together; while the canonical row still exists the
+		// library is soft-deleted and RESTORABLE. If a child reaches here with the canonical
+		// row present, the parent crashed after enqueuing children but before the canonical
+		// delete (and this worker stole its stale lease). Purging content now would let a
+		// later restore revive a partially-purged library. Require the canonical row to be
+		// gone; otherwise postpone (no retry burn, no DLQ) until the cascade is re-driven and
+		// completes the hard delete. In the normal flow children run only after
+		// HardDeleteLibrary, so the marker is already gone and this branch is not reached.
+		exists, err := w.store.CanonicalLibraryExists(item.OrgID, item.LibraryID)
+		if err != nil {
+			release()
+			return nil, nil, false, fmt.Errorf("failed to confirm canonical library absence for guarded child %s/%s: %w", item.LibraryID, item.ItemID, err)
+		}
+		if exists {
+			release()
+			log.Printf("[GC Worker] Postponing guarded item %s/%s: canonical library still present (cascade not yet hard-deleted)", item.LibraryID, item.ItemID)
+			return nil, nil, false, libraryHardDeleteInProgressError{LibraryID: item.LibraryID, ItemID: item.ItemID}
+		}
 	}
 
-	return release, false, nil
+	fence := func() error {
+		owned, err := w.store.RenewLibraryHardDeleteLock(item.LibraryID, leaseToken)
+		if err != nil {
+			return fmt.Errorf("failed to fence library delete for %s/%s: %w", item.LibraryID, item.ItemID, err)
+		}
+		if !owned {
+			return fmt.Errorf("lost library delete lock for %s/%s", item.LibraryID, item.ItemID)
+		}
+		return nil
+	}
+	return release, fence, false, nil
 }
 
 // enqueueLibraryArtifacts cleans up ALL auxiliary data tied to a deleted library:

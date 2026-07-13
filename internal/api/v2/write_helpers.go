@@ -8,9 +8,11 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 )
 
 // errFileTagNotFound is returned when a file tag lookup fails (SELECT miss).
@@ -956,16 +958,47 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 // restoreDeletedLibrary clears deleted_at, removes the GC marker, and re-adds
 // the library's storage to aggregate counters. Mirror image of softDeleteLibrary.
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
-	var lockedLibraryID string
-	if err := db.Session().Query(`
-		SELECT library_id FROM gc_library_hard_delete_locks WHERE library_id = ?
-	`, libraryID).Scan(&lockedLibraryID); err == nil {
+	now := time.Now().UTC()
+	leaseToken := uuid.New()
+	libraryUUID, err := uuid.Parse(libraryID)
+	if err != nil {
+		return fmt.Errorf("invalid library id %q: %w", libraryID, err)
+	}
+	acquired, err := gcpkg.AcquireLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("acquire library restore lock: %w", err)
+	}
+	if !acquired {
 		return fmt.Errorf("library is pending permanent deletion")
-	} else if !errors.Is(err, gocql.ErrNotFound) {
-		return err
+	}
+	defer func() {
+		if err := gcpkg.ReleaseLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken); err != nil {
+			log.Printf("[restoreDeletedLibrary] failed to release restore lock for %s: %v", libraryID, err)
+		}
+	}()
+
+	// Canonical precondition, re-checked UNDER the lease. AcquireLibraryHardDeleteLockLease
+	// is stale-aware: it can steal a lease from a GC worker that crashed mid-purge. In
+	// Cassandra an UPDATE is an upsert, so the batch below would otherwise RECREATE the
+	// `libraries` row over partially-purged content. The only safe state to restore from is
+	// the original soft-deleted canonical row (present, deleted_at != null). If the canonical
+	// row is gone, permanent deletion / orphan purge already started — never resurrect it. A
+	// present-but-active row (deleted_at == null) is not in trash. The admin projection is a
+	// read model and does not prove canonical presence, so it cannot gate this.
+	var canonicalDeletedAt time.Time
+	err = db.Session().Query(`
+		SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID, libraryID,
+	).Scan(&canonicalDeletedAt)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return fmt.Errorf("library is pending permanent deletion")
+	} else if err != nil {
+		return fmt.Errorf("read canonical library for restore: %w", err)
+	}
+	if canonicalDeletedAt.IsZero() {
+		return fmt.Errorf("library is not in trash")
 	}
 
-	now := time.Now().UTC()
 	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err != nil {
 		return fmt.Errorf("read library projection row: %w", err)
@@ -987,11 +1020,19 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	batch.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID)
 	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, now)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
+	owned, err := gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("fence library restore lock for %s: %w", libraryID, err)
+	}
+	if !owned {
+		return fmt.Errorf("lost library restore lock for %s", libraryID)
+	}
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("restore library: %w", err)
 	}
 
-	// Re-add the library's storage to aggregates.
+	// Re-add the library's storage to aggregates after the canonical row and
+	// deleted marker have been restored.
 	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
 	return nil
 }

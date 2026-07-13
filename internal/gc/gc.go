@@ -740,7 +740,8 @@ func (s *Service) isAutoRecoverableFailedItem(item GCFailedItemInfo) (bool, erro
 	if item.ResolvedState != "" && item.ResolvedState != "open" {
 		return false, nil
 	}
-	if !item.RequiresLibraryDeletedCheck {
+	guardMode := effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck)
+	if guardMode == LibraryGuardNone {
 		return false, nil
 	}
 	if item.ItemType != ItemCommit && item.ItemType != ItemFSObject {
@@ -753,7 +754,19 @@ func (s *Service) isAutoRecoverableFailedItem(item GCFailedItemInfo) (bool, erro
 		return false, nil
 	}
 
-	exists, err := s.store.LibraryExists(item.LibraryID)
+	var exists bool
+	var err error
+	switch guardMode {
+	case LibraryGuardCanonicalMustBeAbsent:
+		exists, err = s.store.CanonicalLibraryExists(item.OrgID, item.LibraryID)
+	case LibraryGuardDeletedAtIdentity:
+		exists, err = s.store.LibraryExists(item.LibraryID)
+	default:
+		// Unknown guard mode (e.g. a row written by a newer binary): do not guess a
+		// revalidation path. Leave it in the DLQ for operator inspection rather than
+		// auto-recovering it against the wrong existence check.
+		return false, nil
+	}
 	if err != nil {
 		return false, fmt.Errorf("confirm library existence for DLQ item %s/%s: %w", item.LibraryID, item.ItemID, err)
 	}

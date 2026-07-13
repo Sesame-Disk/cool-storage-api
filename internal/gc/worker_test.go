@@ -567,6 +567,267 @@ func TestWorker_ProcessCommit_DryRunDoesNotAcquireLibraryDeleteGuard(t *testing.
 	}
 }
 
+// P6b (ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01): a scanner orphan item
+// (RequiresLibraryDeletedCheck=true, no delete marker) must be re-validated against the
+// CANONICAL libraries table at execution time. If the library is live/recoverable there
+// (projection drift, or restore/recreate after enqueue), the worker must NOT delete its content.
+func TestWorker_ProcessCommit_OrphanSkipsWhenCanonicalLibraryLive(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddLibrary(orgID, libID, "hot") // canonical libraries row present (live/restored)
+	store.AddCommit(libID, "commit-1", "fs-root")
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true, ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libID,
+		LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent,
+	}
+	if err := w.processCommit(item); err != nil {
+		t.Fatalf("processCommit: %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") == nil {
+		t.Fatal("orphan commit of a live (canonical) library must NOT be deleted (P6b)")
+	}
+}
+
+// When the canonical library is genuinely gone, the orphan is cleaned as before.
+func TestWorker_ProcessCommit_OrphanDeletesWhenCanonicalLibraryGone(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	// No AddLibrary → canonical libraries row absent.
+	store.AddCommit(libID, "commit-1", "fs-root")
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true, ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libID,
+		LibraryGuardMode:      LibraryGuardCanonicalMustBeAbsent,
+		BlockRepresentationID: db.PlainBlockRepresentationID, // needed to enqueue the root fs_object child
+	}
+	if err := w.processCommit(item); err != nil {
+		t.Fatalf("processCommit: %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") != nil {
+		t.Fatal("orphan commit of a genuinely gone library should be deleted")
+	}
+}
+
+// A canonical existence read error must fail closed: do not delete.
+func TestWorker_ProcessCommit_OrphanFailsClosedOnCanonicalError(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddCommit(libID, "commit-1", "fs-root")
+	store.canonicalLibraryExistsErr = errors.New("cassandra unavailable")
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true, ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libID,
+		LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent,
+	}
+	if err := w.processCommit(item); err == nil {
+		t.Fatal("expected a fail-closed error on canonical existence read failure")
+	}
+	if store.GetCommitRecord(libID, "commit-1") == nil {
+		t.Fatal("commit must NOT be deleted when the canonical existence check errors (fail closed)")
+	}
+}
+
+// The fence (RenewLibraryHardDeleteLock) runs immediately before the destructive delete.
+// If the lease was lost to TTL expiry or a concurrent restore after the canonical-absence
+// check, the fence must fail closed and the commit must NOT be deleted.
+func TestWorker_ProcessCommit_FenceFailsClosedWhenLockLost(t *testing.T) {
+	store := NewMockStore()
+	worker := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libraryID := uuid.New(), uuid.New()
+	// Canonical library genuinely absent, so acquire-time revalidation passes...
+	store.AddCommit(libraryID, "commit-1", "")
+	// ...but the lease is lost between acquire and the pre-delete fence.
+	store.forceRenewLibraryLockNotOwned = true
+
+	item := QueueItem{
+		OrgID:                       orgID,
+		QueuedAt:                    time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true,
+		LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
+		ItemType:                    ItemCommit,
+		ItemID:                      "commit-1",
+		LibraryID:                   libraryID,
+	}
+	if err := worker.processCommit(item); err == nil {
+		t.Fatal("expected a fail-closed error when the delete fence loses the library lock")
+	}
+	if store.GetCommitRecord(libraryID, "commit-1") == nil {
+		t.Fatal("commit must NOT be deleted when the pre-delete fence loses the lock")
+	}
+}
+
+func TestWorker_ProcessCommit_UnknownLibraryGuardFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	worker := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libraryID := uuid.New(), uuid.New()
+	store.AddCommit(libraryID, "commit-1", "")
+	item := QueueItem{
+		OrgID:                       orgID,
+		QueuedAt:                    time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true,
+		LibraryGuardMode:            LibraryGuardMode("future_mode"),
+		ItemType:                    ItemCommit,
+		ItemID:                      "commit-1",
+		LibraryID:                   libraryID,
+	}
+
+	if err := worker.processCommit(item); err == nil {
+		t.Fatal("unknown library guard mode must fail closed")
+	}
+	if store.GetCommitRecord(libraryID, "commit-1") == nil {
+		t.Fatal("unknown library guard mode must not delete the commit")
+	}
+}
+
+// The fs_object path is where legitimate fs: refs get released, so it is the core P6b
+// protection: an orphan fs_object of a live canonical library must not be deleted.
+func TestWorker_ProcessFSObject_OrphanSkipsWhenCanonicalLibraryLive(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddLibrary(orgID, libID, "hot") // canonical present
+	store.AddFSObject(libID, "fs-1", "file", []string{"blk-1"})
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true, ItemType: ItemFSObject, ItemID: "fs-1", LibraryID: libID,
+		LibraryGuardMode:      LibraryGuardCanonicalMustBeAbsent,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+	}
+	if err := w.processFSObject(context.Background(), item); err != nil {
+		t.Fatalf("processFSObject: %v", err)
+	}
+	if _, err := store.GetFSObject(libID, "fs-1"); err != nil {
+		t.Fatal("orphan fs_object of a live (canonical) library must NOT be deleted (P6b)")
+	}
+}
+
+func TestWorker_ProcessFSObject_FenceFailsClosedWhenLockLostBeforeDelete(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddFSObject(libID, "fs-1", "dir", nil)
+	store.forceRenewLibraryLockNotOwned = true
+
+	item := QueueItem{
+		OrgID:                       orgID,
+		QueuedAt:                    time.Now().UTC(),
+		IdentityAt:                  time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true,
+		LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
+		ItemType:                    ItemFSObject,
+		ItemID:                      "fs-1",
+		LibraryID:                   libID,
+		BlockRepresentationID:       db.PlainBlockRepresentationID,
+	}
+	if err := w.processFSObject(context.Background(), item); err == nil {
+		t.Fatal("expected a fail-closed error when the fs_object delete fence loses the library lock")
+	}
+	if _, err := store.GetFSObject(libID, "fs-1"); err != nil {
+		t.Fatal("fs_object must NOT be deleted when the pre-delete fence loses the lock")
+	}
+}
+
+func TestWorker_ProcessFSObject_LongReferenceCleanupFailsClosedWhenLockLostMidLoop(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddFSObject(libID, "fs-1", "file", []string{"blk-1", "blk-2"})
+	store.AddBlock(orgID, "blk-1", "hot", 0)
+	store.AddBlock(orgID, "blk-2", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-1", libID, "fs-1")
+	store.AddFSObjectReferenceForTest(orgID, "blk-2", libID, "fs-1")
+
+	base := time.Now().UTC()
+	ticks := []time.Time{base, base.Add(fsObjectReferenceFenceInterval + time.Minute)}
+	w.clock = func() time.Time {
+		if len(ticks) == 0 {
+			return base.Add(2 * (fsObjectReferenceFenceInterval + time.Minute))
+		}
+		now := ticks[0]
+		ticks = ticks[1:]
+		return now
+	}
+	firstBlockChecked := false
+	store.blockHasReferencesHook = func(_ uuid.UUID, blockID string, current bool) (bool, error) {
+		if blockID == "blk-1" && !firstBlockChecked {
+			firstBlockChecked = true
+			store.forceRenewLibraryLockNotOwned = true
+		}
+		return current, nil
+	}
+
+	item := QueueItem{
+		OrgID:                       orgID,
+		QueuedAt:                    base,
+		IdentityAt:                  base,
+		RequiresLibraryDeletedCheck: true,
+		LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
+		ItemType:                    ItemFSObject,
+		ItemID:                      "fs-1",
+		LibraryID:                   libID,
+		BlockRepresentationID:       db.PlainBlockRepresentationID,
+	}
+	if err := w.processFSObject(context.Background(), item); err == nil {
+		t.Fatal("expected a fail-closed error when the long block-reference cleanup loses the library lock")
+	}
+	if _, err := store.GetFSObject(libID, "fs-1"); err != nil {
+		t.Fatal("fs_object must NOT be deleted when long reference cleanup loses the lock")
+	}
+	if got := store.BlockReferenceCount(orgID, "blk-1"); got != 0 {
+		t.Fatalf("first block references = %d, want 0 after the first guarded mutation", got)
+	}
+	if got := store.BlockReferenceCount(orgID, "blk-2"); got != 1 {
+		t.Fatalf("second block references = %d, want 1 because cleanup must stop before the stale-lease mutation", got)
+	}
+}
+
+// This intentionally proves the worker uses the queued org plus library UUID as
+// the canonical point-read key. It is not evidence of global library absence on
+// its own; the broader system invariant is that library_id is globally unique.
+func TestWorker_ProcessCommit_OrphanUsesScopedCanonicalPointRead(t *testing.T) {
+	store := NewMockStore()
+	worker := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	staleOrgID := uuid.New()
+	canonicalOrgID := uuid.New()
+	libraryID := uuid.New()
+	store.AddLibrary(canonicalOrgID, libraryID, "hot")
+	store.AddCommit(libraryID, "commit-1", "")
+
+	item := QueueItem{
+		OrgID:                       staleOrgID,
+		QueuedAt:                    time.Now().UTC(),
+		IdentityAt:                  time.Now().UTC(),
+		RequiresLibraryDeletedCheck: true,
+		LibraryGuardMode:            LibraryGuardCanonicalMustBeAbsent,
+		ItemType:                    ItemCommit,
+		ItemID:                      "commit-1",
+		LibraryID:                   libraryID,
+	}
+	if err := worker.processCommit(item); err != nil {
+		t.Fatalf("processCommit: %v", err)
+	}
+	if store.GetCommitRecord(libraryID, "commit-1") != nil {
+		t.Fatal("orphan work must use the queued org and library as the canonical point-read key")
+	}
+}
+
 func TestWorker_ProcessCommit_SkipsAlreadyPendingRootFSObject(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -1172,7 +1433,7 @@ func TestWorker_EnqueueLibraryContents_DoesNotCrossSuppressAcrossLibraries(t *te
 	store.SeedQueueItemForTest(orgID, identityAt, ItemCommit, "shared-commit", libPending, "", 0)
 	store.SeedQueueItemForTest(orgID, identityAt, ItemFSObject, "shared-fs", libPending, "", 0)
 
-	err := w.enqueueLibraryContentsAt(orgID, libTarget, "", "hot", identityAt, false)
+	err := w.enqueueLibraryContentsAt(orgID, libTarget, "", "hot", identityAt, LibraryGuardNone)
 	if err != nil {
 		t.Fatalf("enqueueLibraryContentsAt failed: %v", err)
 	}
@@ -1253,14 +1514,14 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	blockRepresentationID := db.EncryptedLibraryBlockRepresentationID(libID.String())
 
-	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	// Post-hard-delete state: the parent cascade already removed the canonical
+	// `libraries` row and the delete marker together, so the guarded commit drains
+	// (canonical absent). A cascade child never legitimately deletes while the
+	// canonical row still exists — that path now postpones (see the guard).
 	store.AddCommit(libID, "commit-1", "fs-root")
 	store.AddBlock(orgID, "blk-a", "hot", 0)
 	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-root")
 	store.AddFSObject(libID, "fs-root", "file", []string{"blk-a"})
-	store.mu.Lock()
-	store.deletedLibraries[libID].BlockRepresentationID = blockRepresentationID
-	store.mu.Unlock()
 
 	guardedCommit := QueueItem{
 		OrgID:                       orgID,
@@ -1296,9 +1557,9 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 		t.Fatalf("root fs_object child BlockRepresentationID = %q, want %q", rootChild.BlockRepresentationID, blockRepresentationID)
 	}
 
-	store.mu.Lock()
-	delete(store.deletedLibraries, libID)
-	store.mu.Unlock()
+	// A restore re-creates the canonical `libraries` row (active). The still-queued
+	// root fs_object child must now be stale and skip rather than purge restored content.
+	store.AddLibrary(orgID, libID, "hot")
 
 	if err := w.processFSObject(context.Background(), rootChild); err != nil {
 		t.Fatalf("processFSObject after restore failed: %v", err)
@@ -1308,6 +1569,92 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 	}
 	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 1 {
 		t.Fatalf("block references after restored root child = %d, want 1", got)
+	}
+}
+
+// P6b crash-window guard: a deleted_at_identity cascade child must NOT purge content
+// while the canonical `libraries` row still exists (soft-deleted / restorable). The parent
+// cascade removes the canonical row only in HardDeleteLibrary; if it crashed before that
+// and this worker stole its stale lease, the child must postpone, not delete — otherwise a
+// later restore would revive a partially-purged library.
+func TestWorker_ProcessCommit_DeletedAtIdentityPostponesWhileCanonicalPresent(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt) // canonical row AND marker present
+	store.AddCommit(libID, "commit-1", "")
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt,
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: LibraryGuardDeletedAtIdentity,
+		ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libID,
+	}
+	err := w.processCommit(item)
+	if !isHardDeleteInProgressError(err) {
+		t.Fatalf("expected a hard-delete-in-progress (postpone) error, got %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") == nil {
+		t.Fatal("commit must NOT be deleted while the canonical (soft-deleted) library still exists")
+	}
+}
+
+// Once the parent cascade completes HardDeleteLibrary (canonical row gone), the same
+// child drains and deletes normally.
+func TestWorker_ProcessCommit_DeletedAtIdentityDeletesAfterCanonicalGone(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddCommit(libID, "commit-1", "")
+	if err := store.HardDeleteLibrary(orgID, libID); err != nil { // canonical + marker removed
+		t.Fatalf("HardDeleteLibrary: %v", err)
+	}
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt,
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: LibraryGuardDeletedAtIdentity,
+		ItemType: ItemCommit, ItemID: "commit-1", LibraryID: libID,
+	}
+	if err := w.processCommit(item); err != nil {
+		t.Fatalf("processCommit after hard delete: %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") != nil {
+		t.Fatal("commit should be deleted once the canonical library is gone (hard delete completed)")
+	}
+}
+
+// The fs_object path releases block references (the irreversible step). It too must
+// postpone — and not release any reference — while the canonical library still exists.
+func TestWorker_ProcessFSObject_DeletedAtIdentityPostponesWhileCanonicalPresent(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID, libID := uuid.New(), uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddBlock(orgID, "blk-a", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-1")
+	store.AddFSObject(libID, "fs-1", "file", []string{"blk-a"})
+
+	item := QueueItem{
+		OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt,
+		RequiresLibraryDeletedCheck: true, LibraryGuardMode: LibraryGuardDeletedAtIdentity,
+		ItemType: ItemFSObject, ItemID: "fs-1", LibraryID: libID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+	}
+	err := w.processFSObject(context.Background(), item)
+	if !isHardDeleteInProgressError(err) {
+		t.Fatalf("expected a hard-delete-in-progress (postpone) error, got %v", err)
+	}
+	if _, gerr := store.GetFSObject(libID, "fs-1"); gerr != nil {
+		t.Fatal("fs_object must NOT be deleted while the canonical library still exists")
+	}
+	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 1 {
+		t.Fatalf("block reference must be preserved (not released) while canonical present; got %d want 1", got)
 	}
 }
 
@@ -1722,7 +2069,39 @@ func TestWorker_ProcessLibraryCascade_FullCascade(t *testing.T) {
 	}
 }
 
-func TestWorker_ProcessLibraryCascade_StorageCounterFailureDoesNotHardDeleteLibrary(t *testing.T) {
+// The library hard delete must happen BEFORE the per-library storage counter is
+// removed. Deleting the counter first left a window where a crash between the two
+// let a concurrent restore reactivate a library whose storage was already
+// subtracted from the aggregates (under-counting). See reclaimHardDeletedLibraryStorageCounter.
+func TestWorker_ProcessLibraryCascade_HardDeletePrecedesCounterCleanup(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+	if err := w.processLibraryCascade(context.Background(), item); err != nil {
+		t.Fatalf("processLibraryCascade failed: %v", err)
+	}
+
+	want := []string{"HardDeleteLibrary", "DeleteLibraryStorageCounter"}
+	if len(store.libraryDestructiveCalls) != 2 ||
+		store.libraryDestructiveCalls[0] != want[0] || store.libraryDestructiveCalls[1] != want[1] {
+		t.Fatalf("destructive call order = %v, want %v (hard delete must precede counter cleanup)", store.libraryDestructiveCalls, want)
+	}
+}
+
+// If the worker crashes after HardDeleteLibrary but before the counter cleanup, the
+// orphaned counter must be reclaimed on the next cascade pass. The retry sees the
+// marker gone and the canonical row absent, and idempotently deletes the counter.
+func TestWorker_ProcessLibraryCascade_CounterFailureReclaimedOnRetry(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -1737,17 +2116,62 @@ func TestWorker_ProcessLibraryCascade_StorageCounterFailureDoesNotHardDeleteLibr
 	store.deleteLibraryStorageCounterErr = errors.New("counter delete unavailable")
 
 	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+
+	// First pass: hard delete succeeds (point of no return), counter cleanup fails.
 	err := w.processLibraryCascade(context.Background(), item)
 	if err == nil {
-		t.Fatal("expected storage counter cleanup failure")
+		t.Fatal("expected storage counter cleanup failure on first pass")
 	}
-	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
-		t.Fatalf("library should remain for retry when counter cleanup fails: %v", err)
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err == nil {
+		t.Fatal("library should be hard-deleted once the point of no return is passed")
 	}
+	// The definitive cascade event is still recorded even though counter cleanup failed.
+	sawAudit := false
 	for _, entry := range store.AuditLogEntries() {
 		if entry.Action == "gc_library_cascade_deleted" {
-			t.Fatal("library hard-delete audit should not be written before successful counter cleanup")
+			sawAudit = true
 		}
+	}
+	if !sawAudit {
+		t.Fatal("gc_library_cascade_deleted audit should be written after the hard delete")
+	}
+
+	// Retry: marker gone + canonical absent → reclaim the orphaned counter idempotently.
+	store.deleteLibraryStorageCounterErr = nil
+	store.libraryDestructiveCalls = nil
+	if err := w.processLibraryCascade(context.Background(), item); err != nil {
+		t.Fatalf("retry processLibraryCascade failed: %v", err)
+	}
+	if store.deleteLibraryStorageCounterFor[libID] != 1 {
+		t.Fatalf("expected orphaned counter reclaimed exactly once on retry, got %d", store.deleteLibraryStorageCounterFor[libID])
+	}
+}
+
+// A cascade item whose marker is gone because the library was RESTORED (canonical
+// row present again) must never touch the live library's storage counter.
+func TestWorker_ProcessLibraryCascade_RestoredLibraryCounterNotReclaimed(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	// Library is live (canonical present) with no deleted marker — the restored state.
+	store.AddLibrary(orgID, libID, "hot")
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+	if err := w.processLibraryCascade(context.Background(), item); err != nil {
+		t.Fatalf("processLibraryCascade should skip a restored library, got: %v", err)
+	}
+	if store.deleteLibraryStorageCounterFor[libID] != 0 {
+		t.Fatalf("restored library's counter must not be reclaimed, got %d deletes", store.deleteLibraryStorageCounterFor[libID])
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Fatalf("restored library must remain live: %v", err)
 	}
 }
 
@@ -1793,6 +2217,9 @@ func TestWorker_ProcessLibraryCascade_ChildrenContinueAfterHardDelete(t *testing
 	}
 	if !commitItem.RequiresLibraryDeletedCheck || !fsObjectItem.RequiresLibraryDeletedCheck {
 		t.Fatal("expected hard-delete children to keep the library delete guard")
+	}
+	if commitItem.LibraryGuardMode != LibraryGuardDeletedAtIdentity || fsObjectItem.LibraryGuardMode != LibraryGuardDeletedAtIdentity {
+		t.Fatalf("hard-delete child guard modes = (%q, %q), want %q", commitItem.LibraryGuardMode, fsObjectItem.LibraryGuardMode, LibraryGuardDeletedAtIdentity)
 	}
 
 	if err := w.processCommit(commitItem); err != nil {
@@ -2227,6 +2654,127 @@ func TestWorker_ProcessOrgCascade_RetryWhilePurgingContinues(t *testing.T) {
 	}
 }
 
+func TestWorker_ProcessOrgCascade_LibraryLockContentionPostponesWithoutRetryBurn(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	oldToken := uuid.New()
+
+	store.AddDeletedOrg(orgID, "Locked Corp", deletedAt)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libID, oldToken); err != nil || !acquired {
+		t.Fatalf("seed library hard-delete lock acquired=%v err=%v", acquired, err)
+	}
+	if err := store.EnqueueItem(orgID, deletedAt, ItemOrgCascade, orgID.String(), uuid.Nil, "", 4); err != nil {
+		t.Fatalf("enqueue org cascade failed: %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("lock-contended org cascade should not complete, got %d", n)
+	}
+	if !store.HasOrg(orgID) {
+		t.Fatal("org should remain while a library hard-delete lock is active")
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Fatalf("library should remain while a library hard-delete lock is active: %v", err)
+	}
+	if deletedMarker, err := store.GetLibraryDeletedAt(libID); err != nil || deletedMarker == nil {
+		t.Fatalf("deleted library marker should remain while org cascade is postponed: marker=%v err=%v", deletedMarker, err)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected one postponed queue item, got %d", len(items))
+	}
+	if items[0].RetryCount != 4 {
+		t.Fatalf("retry count after org-cascade library lock contention = %d, want 4", items[0].RetryCount)
+	}
+	if failed := store.FailedItems(orgID); len(failed) != 0 {
+		t.Fatalf("lock contention should not move org cascade to DLQ, got %d failed items", len(failed))
+	}
+}
+
+func TestWorker_ProcessOrgCascade_RetriesAfterLibraryLockReleases(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	oldToken := uuid.New()
+
+	store.AddDeletedOrg(orgID, "Retry Corp", deletedAt)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	if acquired, err := store.AcquireLibraryHardDeleteLock(libID, oldToken); err != nil || !acquired {
+		t.Fatalf("seed library hard-delete lock acquired=%v err=%v", acquired, err)
+	}
+	if err := store.EnqueueItem(orgID, deletedAt, ItemOrgCascade, orgID.String(), uuid.Nil, "", 4); err != nil {
+		t.Fatalf("enqueue org cascade failed: %v", err)
+	}
+
+	if n, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("first ProcessOnce failed: %v", err)
+	} else if n != 0 {
+		t.Fatalf("lock-contended org cascade should not complete on first pass, got %d", n)
+	}
+	if err := store.ReleaseLibraryHardDeleteLock(libID, oldToken); err != nil {
+		t.Fatalf("release seeded library hard-delete lock: %v", err)
+	}
+
+	if n, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("second ProcessOnce failed: %v", err)
+	} else if n != 1 {
+		t.Fatalf("expected retried org cascade to complete once lock is released, got %d", n)
+	}
+	if store.HasOrg(orgID) {
+		t.Fatal("org should be hard-deleted after the retried org cascade acquires the library lock")
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err == nil {
+		t.Fatal("library should be hard-deleted after the retried org cascade acquires the library lock")
+	}
+}
+
+func TestWorker_ProcessOrgCascade_FenceFailsClosedWhenLibraryLockLost(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddDeletedOrg(orgID, "Fence Corp", deletedAt)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.forceRenewLibraryLockNotOwned = true
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemOrgCascade, ItemID: orgID.String()}
+	if err := w.processOrgCascade(context.Background(), item); err == nil {
+		t.Fatal("expected a fail-closed error when org cascade loses the per-library lock before hard delete")
+	}
+	if !store.HasOrg(orgID) {
+		t.Fatal("org must NOT be hard-deleted when the per-library fence loses the lock")
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Fatalf("library must NOT be hard-deleted when the per-library fence loses the lock: %v", err)
+	}
+	for _, entry := range store.AuditLogEntries() {
+		if entry.Action == "gc_library_cascade_deleted" || entry.Action == "gc_org_cascade_deleted" {
+			t.Fatalf("hard-delete audit %q should not be written before the per-library fence succeeds", entry.Action)
+		}
+	}
+}
+
 func TestWorker_ProcessUserCascade_AlreadyDeleted(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -2382,7 +2930,7 @@ func TestWorker_RemoveFSObjectBlockReferences_ReturnsOnlyZeroTransitions(t *test
 	store.AddFSObjectReferenceForTest(orgID, "stays-positive", libID, "fs-obj")
 	store.AddFSObjectReferenceForTest(orgID, "stays-positive", libID, "fs-other")
 
-	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-obj", []string{"hits-zero", "stays-positive"})
+	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-obj", []string{"hits-zero", "stays-positive"}, func() error { return nil })
 	if err != nil {
 		t.Fatalf("removeFSObjectBlockReferences failed: %v", err)
 	}
@@ -2422,7 +2970,7 @@ func TestWorker_RemoveFSObjectBlockReferences_SoftDeletedLibraryUsesStoredRepres
 		t.Fatalf("SoftDeleteLibrary failed: %v", err)
 	}
 
-	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-soft", []string{externalBlockID})
+	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "", "fs-soft", []string{externalBlockID}, func() error { return nil })
 	if err != nil {
 		t.Fatalf("removeFSObjectBlockReferences failed: %v", err)
 	}

@@ -8,6 +8,49 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-07-11 - GC library cascade hard-deletes before removing the storage counter
+
+- Reordered `cascadeDeleteLibrary` so `HardDeleteLibrary` (canonical row + delete marker)
+  runs **before** `DeleteLibraryStorageCounter`. Removing the counter first left a window where
+  a crash between the two, followed by a stale-lease restore, could reactivate a library whose
+  storage had already been subtracted from the org/user/platform aggregates — an under-count and
+  potential quota bypass. Once the canonical row is gone, `restoreDeletedLibrary` refuses, so the
+  counter cleanup below it is pure reclamation.
+- Added a canonical-absent reclamation path in `processLibraryCascade`: if the worker crashes
+  after the hard delete but before the counter cleanup, the retry (marker gone) confirms the
+  canonical row is absent and idempotently deletes the orphaned counter. A live/restored library
+  (canonical present) is never touched. The cascade audit is now written right after the hard
+  delete so the definitive event survives a counter-cleanup retry.
+- Scope note: the reordering (the safety fix) is in the shared `cascadeDeleteLibrary`, so it covers
+  both `processLibraryCascade` and `processOrgCascade`. The counter auto-reclaim is only wired into
+  `processLibraryCascade`; an org cascade whose counter delete fails after the hard delete can leak
+  an **inert** `lib:*` row (no aggregate impact — aggregates are adjusted at soft-delete). Tracked
+  as Low debt ISSUE-GC-ORG-CASCADE-COUNTER-LEAK-01, with a durable `ItemLibraryCounterCleanup` item
+  noted as the future fix.
+- Tests: hard-delete-precedes-counter ordering, counter-failure-reclaimed-on-retry, and
+  restored-library-counter-not-reclaimed. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01.
+- Documented the remaining non-blocking GC debts surfaced by the merge audit: legacy `NULL +
+  requires_library_deleted_check=false` orphan rows (ISSUE-GC-LEGACY-ORPHAN-UNGUARDED-01) and
+  org-cascade re-soft-delete on marker/canonical drift (ISSUE-GC-ORG-CASCADE-REMARK-01).
+
+---
+
+## 2026-07-10 - GC orphan work revalidated canonically at execution time (P6b)
+
+- Added durable `LibraryGuardMode` semantics: scanner Phase 3/4 orphan work uses
+  `canonical_absent`, while normal library-cascade children use `deleted_at_identity`.
+- Queue, retry, postpone, DLQ, and DLQ requeue preserve the guard mode. Legacy rows remain
+  compatible: an empty mode plus `requires_library_deleted_check=true` resolves to
+  `deleted_at_identity`; unknown modes fail closed.
+- The worker acquires the existing library hard-delete lock, reads the canonical `libraries`
+  row by `(org_id, library_id)`, skips deletion when it exists, and fails closed on read errors.
+  Synchronous token renewal fences destructive commit/fs_object/reference mutations. Restore
+  takes the same library lock for its short idempotent operation.
+- Added scanner-to-worker, projection-drift, historical-marker, retry/DLQ round-trip, canonical
+  read-error, and unknown-mode regressions. P6b is closed; markerless discovery remains P7.
+
+---
+
 ## 2026-07-10 - GC existence checks fail closed; Phase 9 orphan discovery repaired
 
 - `LibraryExists`/`GroupExists` now distinguish `gocql.ErrNotFound` from Cassandra failures;
@@ -24,8 +67,7 @@ Session-by-session development history for SesameFS.
   real-Cassandra regression that inserts a `shares_by_group` row without a `groups` row and
   proves it remains discoverable. The streaming store now preserves a concurrent `iter.Close`
   error alongside a visitor abort via `errors.Join`.
-- P6b remains explicit follow-up debt: already-enqueued orphan commit/fs_object work lacks
-  canonical execution-time revalidation across projection drift or scanner→worker state changes.
+- P6b was explicit follow-up debt at this point and is closed by the subsequent entry above.
 
 ---
 

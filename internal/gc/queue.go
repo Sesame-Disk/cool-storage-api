@@ -20,12 +20,23 @@ const (
 	ItemOrgCascade     ItemType = "org_cascade"
 )
 
+// LibraryGuardMode identifies the condition that must remain true before a
+// queued commit or fs_object can be deleted.
+type LibraryGuardMode string
+
+const (
+	LibraryGuardNone                  LibraryGuardMode = ""
+	LibraryGuardDeletedAtIdentity     LibraryGuardMode = "deleted_at_identity"
+	LibraryGuardCanonicalMustBeAbsent LibraryGuardMode = "canonical_absent"
+)
+
 // QueueItem represents a single item pending garbage collection
 type QueueItem struct {
 	OrgID                       uuid.UUID
 	QueuedAt                    time.Time
 	IdentityAt                  time.Time
 	RequiresLibraryDeletedCheck bool
+	LibraryGuardMode            LibraryGuardMode
 	ItemType                    ItemType
 	ItemID                      string
 	LibraryID                   uuid.UUID
@@ -39,6 +50,16 @@ func effectiveIdentityAt(queuedAt, identityAt time.Time) time.Time {
 		return queuedAt
 	}
 	return identityAt
+}
+
+func effectiveLibraryGuardMode(mode LibraryGuardMode, requiresLibraryDeletedCheck bool) LibraryGuardMode {
+	if mode != LibraryGuardNone {
+		return mode
+	}
+	if requiresLibraryDeletedCheck {
+		return LibraryGuardDeletedAtIdentity
+	}
+	return LibraryGuardNone
 }
 
 // Queue provides operations for the gc_queue.
@@ -105,7 +126,7 @@ func (q *Queue) Complete(orgID uuid.UUID, queuedAt time.Time, itemType ItemType,
 // IncrementRetry updates the retry count for a failed item and requeues it at the back of the queue.
 func (q *Queue) IncrementRetry(item QueueItem) error {
 	newQueuedAt := time.Now()
-	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.BlockRepresentationID, item.StorageClass, item.RetryCount+1, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.RequiresLibraryDeletedCheck)
+	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.BlockRepresentationID, item.StorageClass, item.RetryCount+1, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.RequiresLibraryDeletedCheck, item.LibraryGuardMode)
 }
 
 // GetQueueSize returns the approximate number of items in the queue for an org.
