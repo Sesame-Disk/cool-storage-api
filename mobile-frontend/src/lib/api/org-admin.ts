@@ -126,12 +126,12 @@ export interface OrgDepartment {
 
 /** GET /address-book/groups/ → department groups in the org. */
 export async function listOrgDepartments(orgId: string): Promise<OrgDepartment[]> {
-  const res = await fetch(orgUrl(orgId, '/address-book/groups/'), { headers: authHeaders() });
-  const data = await readJson<{ groups?: OrgDepartment[] } | OrgDepartment[]>(
-    res,
-    'Failed to load departments',
-  );
-  const list = Array.isArray(data) ? data : (data.groups ?? []);
+  const res = await fetch(`${orgUrl(orgId, '/address-book/groups/')}?per_page=1000`, {
+    headers: authHeaders(),
+  });
+  const data = await readJson<any>(res, 'Failed to load departments');
+  // The endpoint returns { data: [...] }; tolerate { groups } / bare array too.
+  const list: any[] = Array.isArray(data) ? data : (data.data ?? data.groups ?? []);
   return list.map((d: any) => ({
     id: d.id ?? d.group_id,
     name: d.name ?? d.group_name,
@@ -148,6 +148,8 @@ export async function createDepartment(orgId: string, name: string): Promise<Org
     body: JSON.stringify({ group_name: name }),
   });
   const d = await readJson<any>(res, 'Failed to create department');
+  // Drop the cached department list so the new one shows immediately.
+  await invalidateApiCache(`/api/v2.1/org/${orgId}/admin/address-book/groups`);
   return { id: d.id ?? d.group_id, name: d.name ?? d.group_name };
 }
 
@@ -186,6 +188,7 @@ export async function deleteDepartment(orgId: string, deptId: string): Promise<v
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error_msg || data.error || 'Failed to delete department');
   }
+  await invalidateApiCache(`/api/v2.1/org/${orgId}/admin/address-book/groups`);
 }
 
 // --------------------------------------------------------------------------

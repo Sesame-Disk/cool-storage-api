@@ -41,8 +41,9 @@ function generateId(): string {
   return `upload-${Date.now()}-${++idCounter}`;
 }
 
-/** Lowercase hex SHA-256 of the given bytes (the block hash the server verifies). */
-async function sha256Hex(data: ArrayBuffer): Promise<string> {
+/** Lowercase hex SHA-256 of the given bytes (the block hash the server verifies).
+ * Exported so the folder-sync engine hashes with the exact same algorithm. */
+export async function sha256Hex(data: ArrayBuffer): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', data);
   return Array.from(new Uint8Array(digest))
     .map(b => b.toString(16).padStart(2, '0'))

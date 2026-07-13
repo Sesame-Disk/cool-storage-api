@@ -85,9 +85,9 @@ Legend for spec column: `<spec file>::<test title>` in `e2e-parity/specs/`.
 | Operation | Status | Spec |
 |------|--------|------|
 | Groups list/create/delete | ✅ | `groups.spec.ts` |
-| Group members add/remove/role | ✅ | `groups.spec.ts` |
+| Group members add/remove/role | ✅ | `groups-departments.spec.ts` (role-gated: owner add/promote/delete, member leave) |
 | Group libraries | ✅ | `groups.spec.ts` |
-| Shared-with-me / activity | 🟡 | pages exist; e2e pending |
+| Shared-with-me | ✅ | `sharing-flows.spec.ts::a library shared with the user appears` (+ fixed 404 `beshared-repos` → `/api2/repos/?type=shared`) |
 | Search (full-text) | ✅ | `search.spec.ts` (+ fixed broken endpoint → `/api/v2.1/search/`) |
 | Advanced search filters (E9) | ✅ | `search.spec.ts::file-type filter` |
 
@@ -122,9 +122,27 @@ Legend for spec column: `<spec file>::<test title>` in `e2e-parity/specs/`.
 | Statistics (A8) | ➡️ | `org-admin.spec.ts::redirects` |
 | Audit logs (A9) | ➡️ | `org-admin.spec.ts::redirects` |
 | Devices (A7) | ➡️ | `org-admin.spec.ts::redirects` |
-| Departments (A6) | ➡️ | `org-admin.spec.ts::redirects` |
+| Departments (A6) | ✅ | `groups-departments.spec.ts` (org admin create/add-member/delete; users view their departments) |
 | Subscription (A10) | ➡️ | `org-admin.spec.ts::redirects` |
 | SAML (A11) | ➡️ | `org-admin.spec.ts::redirects` |
+
+## Folder Sync (Seafile-style, one-way local→remote MVP)
+> New capability (not a web-frontend parity row): pick a local disk folder via
+> the File System Access API and differentially push changes to a library on
+> app-focus + manual "Sync now". Gated — hidden/disabled on iOS Safari / Firefox
+> (no `showDirectoryPicker`). Uses OUR modern block/multipart upload (SHA-256,
+> `/api/v2/blocks/*`), never the legacy Seafile sync protocol / SHA-1.
+
+| Operation | Status | Spec |
+|------|--------|------|
+| Differential plan (add/modify/delete/nested/no-change) | ✅ | `src/lib/sync/__tests__/diff.test.ts` (unit) |
+| Capability gate (`supportsFolderSync`) | ✅ | `src/lib/sync/__tests__/capabilities.test.ts` (unit) |
+| Per-library manifest + config store (IndexedDB) | ✅ | `src/lib/sync/__tests__/offlineDb-sync.test.ts` (unit) |
+| Sync page: unsupported note when API absent | ✅ | `sync.spec.ts::sync page shows the unsupported note` |
+| Sync page: synced-folders view when API present | ✅ | `sync.spec.ts::sync page shows the synced-folders view` |
+| Library context menu: sync disabled when API absent | ✅ | `sync.spec.ts::library context menu disables sync` |
+| Library context menu: "Sync this folder" when API present | ✅ | `sync.spec.ts::library context menu offers "Sync this folder"` |
+| Real FS round-trip (pick → initial push → delta → unsync) | ➡️ | manual on Chrome/Edge/Android (`showDirectoryPicker` is a native dialog Playwright can't drive) |
 
 ## PWA
 | Operation | Status | Spec |
@@ -141,3 +159,13 @@ Legend for spec column: `<spec file>::<test title>` in `e2e-parity/specs/`.
 | Item | Status | Spec |
 |------|--------|------|
 | Foundation on real Safari (smoke/pwa/deep-links) | ✅ | `playwright.parity.config.ts` project `ios-safari` (webkit) |
+
+## Security / edge cases (adversarial)
+| Case | Status | Spec / note |
+|------|--------|-------------|
+| XSS: malicious markdown content is inert | ✅ | `edge-cases.spec.ts` (escaped; `javascript:` links neutered; no `<script>`/`<img>` in DOM) |
+| XSS: injection payload as file/folder NAME | ✅ | `edge-cases.spec.ts` (React-escaped, renders as text) |
+| Encrypted library shared with a user still needs the password | ✅ | `edge-cases.spec.ts` (decrypt prompt; wrong pwd rejected; dir list 403 until unlocked) |
+| Read-only recipient cannot write/delete/re-share | ✅ | verified at API (403 on upload-link/delete/rename/share) |
+| Unauthorized access to private repo / admin endpoints denied | ✅ | verified at API (403 across the board) |
+| Malformed / hostile `repo_id` → 404 (was **500**) | ✅ | backend fix in `db.ReadLibraryState` + `HasLibraryAccess` |

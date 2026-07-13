@@ -2,14 +2,17 @@ import React, { useRef } from 'react';
 import { Library, Lock } from 'lucide-react';
 import type { Repo } from '../../lib/models';
 import { bytesToSize } from '../../lib/models';
+import type { SyncStatus } from '../../lib/offlineDb';
+import SyncStatusBadge from './SyncStatusBadge';
 
 interface LibraryCardProps {
   repo: Repo;
   onTap: (repo: Repo) => void;
   onLongPress?: (repo: Repo) => void;
+  syncStatus?: SyncStatus;
 }
 
-export default function LibraryCard({ repo, onTap, onLongPress }: LibraryCardProps) {
+export default function LibraryCard({ repo, onTap, onLongPress, syncStatus }: LibraryCardProps) {
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handlePointerDown = () => {
@@ -49,6 +52,7 @@ export default function LibraryCard({ repo, onTap, onLongPress }: LibraryCardPro
         </p>
       </div>
       {repo.encrypted && <Lock className="w-4 h-4 text-gray-400 flex-shrink-0" />}
+      {syncStatus && <SyncStatusBadge status={syncStatus} />}
     </button>
   );
 }

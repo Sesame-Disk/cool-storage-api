@@ -10,6 +10,7 @@ import {
   createFile,
   createRepo,
   deleteRepo,
+  dismissPwaBanner,
   fetchToken,
   mkdir,
 } from '../helpers/parity-helpers';
@@ -207,6 +208,33 @@ test.describe('Public share link', () => {
       }
     } finally {
       await deleteRepo(request, token, repoId);
+    }
+  });
+});
+
+// Shared-with-me: a library shared WITH the end user shows up on their Shared
+// page. (Regression: the app fetched /api/v2.1/beshared-repos/ which 404s, so
+// the whole "Shared with me" tab silently failed — the web frontend lists these
+// via /api2/repos/?type=shared.)
+test.describe('Shared with me', () => {
+  test.use({ storageState: authStateFile('user') });
+
+  test('a library shared with the user appears on the Shared page', async ({ page, request }) => {
+    const adminToken = await fetchToken(request, 'admin');
+    const repoName = artifact('sharedwith');
+    const repoId = await createRepo(request, adminToken, repoName);
+    try {
+      await request.put(`${API_URL}/api/v2.1/repos/${repoId}/dir/shared_items/?p=%2F`, {
+        headers: { ...authHeaders(adminToken), 'Content-Type': 'application/json' },
+        data: { share_type: 'user', username: [CREDENTIALS.user.email], permission: 'rw' },
+      });
+
+      await page.goto('/shared/');
+      await dismissPwaBanner(page);
+      // "Shared with me" is the default tab; the shared library is listed.
+      await expect(page.getByText(repoName, { exact: false }).first()).toBeVisible({ timeout: 15_000 });
+    } finally {
+      await deleteRepo(request, adminToken, repoId);
     }
   });
 });

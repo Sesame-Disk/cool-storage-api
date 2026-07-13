@@ -362,6 +362,30 @@ export async function renameDir(repoId: string, path: string, newName: string): 
   await invalidateApiCache(`/api2/repos/${repoId}/dir`);
 }
 
+/**
+ * Create a folder. Mirrors NewFolderDialog's inline createFolder so the folder
+ * sync engine and the dialog share one implementation.
+ * POST /api2/repos/:id/dir/?p=<path> { operation: 'mkdir' }. Idempotent-ish: a
+ * 400 "already exists" is treated as success so a sync pass can be re-run.
+ */
+export async function mkdir(repoId: string, path: string): Promise<void> {
+  const res = await fetch(`${serviceURL()}/api2/repos/${repoId}/dir/?p=${encodeURIComponent(path)}`, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ operation: 'mkdir' }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data.error_msg || data.error || '';
+    if (res.status === 400 && /exist/i.test(msg)) {
+      // Folder already there — fine for a re-run of a sync pass.
+    } else {
+      throw new Error(msg || 'Failed to create folder');
+    }
+  }
+  await invalidateApiCache(`/api2/repos/${repoId}/dir`);
+}
+
 // Delete
 
 export async function deleteFile(repoId: string, path: string): Promise<void> {
@@ -787,11 +811,26 @@ export async function listSharedRepos(): Promise<SharedRepo[]> {
 }
 
 export async function listBeSharedRepos(): Promise<SharedRepo[]> {
-  const res = await fetch(`${serviceURL()}/api/v2.1/beshared-repos/`, {
+  // "Shared with me" = libraries others shared with you. The web frontend lists
+  // these via /api2/repos/?type=shared; the /api/v2.1/beshared-repos/ path the
+  // app used before 404s, so this whole tab silently failed to load.
+  const res = await fetch(`${serviceURL()}/api2/repos/?type=shared`, {
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error('Failed to load shared libraries');
-  return await res.json();
+  const data = await res.json();
+  const list = Array.isArray(data) ? data : (data.repos ?? []);
+  return list.map((r: any): SharedRepo => ({
+    repo_id: r.repo_id ?? r.id,
+    repo_name: r.repo_name ?? r.name,
+    repo_desc: r.desc ?? r.repo_desc ?? '',
+    permission: r.permission ?? 'r',
+    share_type: r.share_type ?? 'personal',
+    user: r.owner ?? r.owner_email ?? r.shared_from ?? r.modifier_email ?? '',
+    last_modified: r.mtime ?? r.last_modified ?? 0,
+    is_virtual: Boolean(r.is_virtual),
+    encrypted: r.encrypted ?? 0,
+  }));
 }
 
 // Upload link types

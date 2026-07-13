@@ -5,6 +5,7 @@ import (
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 )
 
 // ErrLibraryDeleted indicates the canonical libraries row still exists but the
@@ -29,6 +30,16 @@ type LibraryState struct {
 // ReadLibraryState loads the canonical libraries row for a known org/library
 // pair, including deleted_at so callers can distinguish live vs soft-deleted.
 func ReadLibraryState(session *gocql.Session, orgID, libraryID string) (LibraryState, error) {
+	// A malformed org/library id can never match a row; treat it as "not found"
+	// rather than letting gocql raise a UUID marshal error that callers surface
+	// as HTTP 500 (hostile/fat-fingered ids must not 500).
+	if _, err := uuid.Parse(orgID); err != nil {
+		return LibraryState{}, gocql.ErrNotFound
+	}
+	if _, err := uuid.Parse(libraryID); err != nil {
+		return LibraryState{}, gocql.ErrNotFound
+	}
+
 	state := LibraryState{
 		OrgID:     orgID,
 		LibraryID: libraryID,

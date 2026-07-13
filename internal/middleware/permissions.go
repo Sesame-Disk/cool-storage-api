@@ -815,6 +815,12 @@ func (m *PermissionMiddleware) CanReadLibrary(orgID, userID, repoID string) (boo
 // HasLibraryAccess checks if user has at least the specified permission level for a library
 // This is the main method used for permission checks throughout the API
 func (m *PermissionMiddleware) HasLibraryAccess(orgID, userID, repoID string, requiredPermission LibraryPermission) (bool, error) {
+	// A malformed repo_id is simply "no access" — never a 500. Callers surface
+	// the error as an internal error, so an unparseable id (e.g. from a hostile
+	// or fat-fingered request) must not reach the ownership/share lookups.
+	if _, err := uuid.Parse(repoID); err != nil {
+		return false, nil
+	}
 	// Get user's permission level for this library
 	permission, err := m.GetLibraryPermission(orgID, userID, repoID)
 	if err != nil {

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Sun, Moon, Monitor, Link2, ChevronRight, Activity, ArrowUpDown, LogOut, Info, HelpCircle, SlidersHorizontal, Trash2, Building2 } from 'lucide-react';
+import { Sun, Moon, Monitor, Link2, ChevronRight, Activity, ArrowUpDown, LogOut, Info, HelpCircle, SlidersHorizontal, Trash2, Building2, FolderSync } from 'lucide-react';
 import { useTheme } from '../../lib/hooks/useTheme';
 import type { ThemeOption } from '../../lib/hooks/useTheme';
 import { getAccountInfo, logout } from '../../lib/api';
@@ -78,13 +78,22 @@ export default function MorePage() {
           </a>
           <a
             href="/deleted-libraries/"
-            className={`w-full flex items-center gap-3 px-4 py-3 min-h-[44px] text-text dark:text-dark-text ${
-              isOrgAdmin ? 'border-b border-gray-200 dark:border-dark-border' : ''
-            }`}
+            className="w-full flex items-center gap-3 px-4 py-3 min-h-[44px] text-text dark:text-dark-text border-b border-gray-200 dark:border-dark-border"
             data-testid="more-link-deleted-libraries"
           >
             <Trash2 size={20} />
             <span className="flex-1">Deleted Libraries</span>
+            <ChevronRight size={16} className="text-gray-400" />
+          </a>
+          <a
+            href="/sync/"
+            className={`w-full flex items-center gap-3 px-4 py-3 min-h-[44px] text-text dark:text-dark-text ${
+              isOrgAdmin ? 'border-b border-gray-200 dark:border-dark-border' : ''
+            }`}
+            data-testid="more-link-sync"
+          >
+            <FolderSync size={20} />
+            <span className="flex-1">Folder Sync</span>
             <ChevronRight size={16} className="text-gray-400" />
           </a>
           {isOrgAdmin && (

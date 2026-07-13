@@ -24,6 +24,7 @@ import {
   removeGroupMember,
   setGroupAdmin,
   deleteGroup,
+  listBeSharedRepos,
 } from '../api';
 
 // Mock serviceURL to return a stable base URL
@@ -510,5 +511,25 @@ describe('Group management (access-gated mutations)', () => {
     const [url, opts] = fetchMock.mock.calls[0];
     expect(url).toBe('http://localhost:8080/api/v2.1/groups/7');
     expect(opts.method).toBe('DELETE');
+  });
+});
+
+
+describe('Shared-with-me (received shares)', () => {
+  beforeEach(() => { localStorage.clear(); setAuthToken(TOKEN); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('listBeSharedRepos uses /api2/repos/?type=shared and maps to SharedRepo', async () => {
+    const fetchMock = mockFetchOk([
+      { id: 'r1', name: 'FromAlice', permission: 'rw', owner: 'alice@x.io', mtime: 111, encrypted: 0 },
+    ]);
+    vi.stubGlobal('fetch', fetchMock);
+    const repos = await listBeSharedRepos();
+    expect(fetchMock.mock.calls[0][0]).toBe('http://localhost:8080/api2/repos/?type=shared');
+    expect(repos).toHaveLength(1);
+    expect(repos[0].repo_id).toBe('r1');
+    expect(repos[0].repo_name).toBe('FromAlice');
+    expect(repos[0].user).toBe('alice@x.io');
+    expect(repos[0].permission).toBe('rw');
   });
 });

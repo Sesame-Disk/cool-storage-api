@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Building2, Plus, ArrowLeft, Trash2 } from 'lucide-react';
-import { getAccountInfo, listMyDepartments } from '../../lib/api';
+import { getAccountInfo, listMyDepartments, invalidateApiCache } from '../../lib/api';
 import type { Department } from '../../lib/api';
 import {
   getOrgId,
@@ -27,7 +27,8 @@ export default function DepartmentsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
-  const [creating, setCreating] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [newName, setNewName] = useState('');
   const [selected, setSelected] = useState<{ id: string; name: string; members: OrgDepartmentMember[] } | null>(null);
   const [confirmDel, setConfirmDel] = useState<OrgDepartment | null>(null);
@@ -63,7 +64,7 @@ export default function DepartmentsPage() {
   const handleCreate = async () => {
     const name = newName.trim();
     if (!name) return;
-    setCreating(true);
+    setSubmitting(true);
     try {
       await createDepartment(orgId, name);
       setNewName('');
@@ -72,7 +73,7 @@ export default function DepartmentsPage() {
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to create department');
     } finally {
-      setCreating(false);
+      setSubmitting(false);
     }
   };
 
@@ -85,7 +86,11 @@ export default function DepartmentsPage() {
   };
 
   const refreshSelected = async () => {
-    if (selected) setSelected(await getOrgDepartment(orgId, selected.id));
+    if (!selected) return;
+    // The department detail (member list) is a cached GET; drop it so a just-
+    // added/removed member is reflected immediately.
+    await invalidateApiCache(`/api/v2.1/org/${orgId}/admin/address-book/groups/${selected.id}`);
+    setSelected(await getOrgDepartment(orgId, selected.id));
   };
 
   const handleDelete = async () => {
@@ -158,7 +163,7 @@ export default function DepartmentsPage() {
       <div className="flex-1 overflow-y-auto px-4 pb-20">
         {isAdmin && (
           <div className="mb-3">
-            {creating ? (
+            {showCreate ? (
               <div className="bg-white dark:bg-dark-surface rounded-lg p-3 shadow-sm flex flex-wrap gap-2 w-full" data-testid="create-department-panel">
                 <input
                   autoFocus
@@ -168,11 +173,11 @@ export default function DepartmentsPage() {
                   data-testid="department-name-input"
                   className="flex-1 min-w-[8rem] px-3 py-2 border border-gray-300 rounded-lg text-text min-h-[44px]"
                 />
-                <button onClick={handleCreate} disabled={creating} data-testid="create-department-submit" className="px-4 bg-primary text-white rounded-lg min-h-[44px] disabled:opacity-50">Add</button>
-                <button onClick={() => { setCreating(false); setNewName(''); }} className="px-3 text-gray-500 min-h-[44px]">Cancel</button>
+                <button onClick={handleCreate} disabled={submitting} data-testid="create-department-submit" className="px-4 bg-primary text-white rounded-lg min-h-[44px] disabled:opacity-50">Add</button>
+                <button onClick={() => { setShowCreate(false); setNewName(''); }} className="px-3 text-gray-500 min-h-[44px]">Cancel</button>
               </div>
             ) : (
-              <button onClick={() => setCreating(true)} data-testid="new-department-btn" className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg border border-dashed border-primary/50 text-primary text-sm font-medium min-h-[44px]">
+              <button onClick={() => setShowCreate(true)} data-testid="new-department-btn" className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg border border-dashed border-primary/50 text-primary text-sm font-medium min-h-[44px]">
                 <Plus className="w-4 h-4" /> New department
               </button>
             )}

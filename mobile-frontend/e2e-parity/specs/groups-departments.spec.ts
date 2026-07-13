@@ -121,33 +121,51 @@ test.describe('Group access gating (non-owner member)', () => {
 test.describe('Department management (org admin)', () => {
   test.use({ storageState: authStateFile('admin') });
 
-  test('org admin creates a department, adds a member, and deletes it', async ({ page }) => {
+  // The Default org the harness provisions user@/admin@ into (see
+  // provision-local-users.mjs); used only for best-effort API cleanup.
+  const DEFAULT_ORG = '00000000-0000-0000-0000-000000000001';
+
+  test('org admin creates a department, adds a member, and deletes it', async ({ page, request }) => {
+    const token = await fetchToken(request, 'admin');
     const deptName = artifact('dept');
-    await page.goto('/org/departments/');
-    await dismissPwaBanner(page);
-    await expect(page.getByTestId('departments-page')).toBeVisible({ timeout: 15_000 });
+    const deptBase = `${API_URL}/api/v2.1/org/${DEFAULT_ORG}/admin/address-book/groups/`;
+    try {
+      await page.goto('/org/departments/');
+      await dismissPwaBanner(page);
+      await expect(page.getByTestId('departments-page')).toBeVisible({ timeout: 15_000 });
 
-    // Create.
-    await page.getByTestId('new-department-btn').click();
-    await page.getByTestId('department-name-input').fill(deptName);
-    await page.getByTestId('create-department-submit').click();
-    const row = page.locator(`[data-testid="department-row"][data-name="${deptName}"]`);
-    await expect(row).toBeVisible({ timeout: 10_000 });
+      // Create.
+      await page.getByTestId('new-department-btn').click();
+      await page.getByTestId('department-name-input').fill(deptName);
+      await page.getByTestId('create-department-submit').click();
+      const row = page.locator(`[data-testid="department-row"][data-name="${deptName}"]`);
+      await expect(row).toBeVisible({ timeout: 10_000 });
 
-    // Open it → add a member.
-    await row.getByText(deptName).click();
-    await expect(page.getByTestId('department-detail')).toBeVisible();
-    await page.getByTestId('add-member-btn').click();
-    await page.getByLabel('Search users').fill('user');
-    await page.locator('button', { hasText: MEMBER }).first().click();
-    await expect(
-      page.locator(`[data-testid="group-member-row"][data-email="${MEMBER}"]`),
-    ).toBeVisible({ timeout: 10_000 });
+      // Open it → add a member.
+      await row.getByText(deptName).click();
+      await expect(page.getByTestId('department-detail')).toBeVisible();
+      await page.getByTestId('add-member-btn').click();
+      await page.getByLabel('Search users').fill('user');
+      await page.locator('button', { hasText: MEMBER }).first().click();
+      await expect(
+        page.locator(`[data-testid="group-member-row"][data-email="${MEMBER}"]`),
+      ).toBeVisible({ timeout: 10_000 });
 
-    // Back to the list → delete.
-    await page.getByRole('button', { name: 'Departments' }).click();
-    await page.getByTestId(`delete-department-${deptName}`).click();
-    await page.getByTestId('department-confirm-yes').click();
-    await expect(row).toBeHidden({ timeout: 10_000 });
+      // Back to the list → delete.
+      await page.getByRole('button', { name: 'Departments' }).click();
+      await page.getByTestId(`delete-department-${deptName}`).click();
+      await page.getByTestId('department-confirm-yes').click();
+      await expect(row).toBeHidden({ timeout: 10_000 });
+    } finally {
+      // Best-effort: remove the department if any step left it behind.
+      const res = await request.get(`${deptBase}?per_page=1000`, { headers: authHeaders(token) });
+      const body = await res.json().catch(() => ({}));
+      const list = body.data ?? body.groups ?? [];
+      for (const d of Array.isArray(list) ? list : []) {
+        if ((d.name ?? d.group_name) === deptName) {
+          await request.delete(`${deptBase}${d.id ?? d.group_id}/`, { headers: authHeaders(token) }).catch(() => {});
+        }
+      }
+    }
   });
 });

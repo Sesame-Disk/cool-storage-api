@@ -17,6 +17,9 @@ import PullToRefreshContainer from '../ui/PullToRefreshContainer';
 import { AnimatePresence } from 'framer-motion';
 import { getSortPreference, setSortPreference } from '../../lib/sortPreference';
 import type { SortField, SortDirection } from '../../lib/sortPreference';
+import { supportsFolderSync } from '../../lib/sync/capabilities';
+import { useSyncStatus } from '../../lib/sync/useSyncStatus';
+import { enableSync, unsync, setAutoSync, syncLibrary } from '../../lib/sync/syncEngine';
 
 const sortOptions: { field: SortField; label: string }[] = [
   { field: 'name', label: 'Name' },
@@ -55,6 +58,13 @@ export default function LibraryList() {
   const [contextRepo, setContextRepo] = useState<Repo | null>(null);
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const [showingCached, setShowingCached] = useState(false);
+  const [toast, setToast] = useState('');
+  const syncConfigs = useSyncStatus();
+
+  const showToast = (msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(''), 3000);
+  };
 
   // Load sort preference on mount
   useEffect(() => {
@@ -131,6 +141,44 @@ export default function LibraryList() {
     // Details could be expanded later
   };
 
+  // --- Folder sync -------------------------------------------------------
+  const handleSyncStart = async (repo: Repo) => {
+    if (!supportsFolderSync()) return;
+    try {
+      // Must run inside the user gesture that opened the context menu action.
+      const handle = await (window as unknown as {
+        showDirectoryPicker: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<FileSystemDirectoryHandle>;
+      }).showDirectoryPicker({ mode: 'read' });
+      showToast(`Syncing "${repo.repo_name}"…`);
+      await enableSync(repo.repo_id, repo.repo_name, handle);
+      showToast(`"${repo.repo_name}" synced`);
+    } catch (err) {
+      // AbortError = the user dismissed the native picker; stay silent.
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      showToast(err instanceof Error ? err.message : 'Failed to start sync');
+    }
+  };
+
+  const handleSyncNow = async (repo: Repo) => {
+    showToast(`Syncing "${repo.repo_name}"…`);
+    await syncLibrary(repo.repo_id, { interactive: true });
+    const cfg = syncConfigs.get(repo.repo_id);
+    showToast(cfg?.status === 'error' ? cfg.error || 'Sync failed' : 'Sync complete');
+  };
+
+  const handleSyncPauseResume = async (repo: Repo) => {
+    const cfg = syncConfigs.get(repo.repo_id);
+    const next = !(cfg?.autoSync ?? true);
+    await setAutoSync(repo.repo_id, next);
+    showToast(next ? 'Auto-sync resumed' : 'Auto-sync paused');
+  };
+
+  const handleUnsync = async (repo: Repo) => {
+    if (!window.confirm(`Stop syncing "${repo.repo_name}"? Remote files are kept; only the local link is removed.`)) return;
+    await unsync(repo.repo_id);
+    showToast('Sync removed');
+  };
+
   const currentSortLabel = sortOptions.find((o) => o.field === sortField)?.label ?? 'Name';
 
   if (error && repos.length === 0) {
@@ -194,6 +242,7 @@ export default function LibraryList() {
                       repo={repo}
                       onTap={handleTap}
                       onLongPress={handleLongPress}
+                      syncStatus={syncConfigs.get(repo.repo_id)?.status}
                     />
                   </AnimatedListItem>
                 ))}
@@ -251,7 +300,20 @@ export default function LibraryList() {
         onOpen={handleContextOpen}
         onShare={handleContextShare}
         onDetails={handleContextDetails}
+        syncStatus={contextRepo ? syncConfigs.get(contextRepo.repo_id)?.status : undefined}
+        autoSync={contextRepo ? syncConfigs.get(contextRepo.repo_id)?.autoSync ?? true : true}
+        onSyncStart={handleSyncStart}
+        onSyncNow={handleSyncNow}
+        onSyncPauseResume={handleSyncPauseResume}
+        onUnsync={handleUnsync}
       />
+
+      {/* Toast */}
+      {toast && (
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 bg-gray-800 text-white px-4 py-2 rounded-lg text-sm z-50" data-testid="library-toast">
+          {toast}
+        </div>
+      )}
     </div>
   );
 }
