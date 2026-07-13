@@ -1612,11 +1612,18 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 			candidateProjectionErr = errors.Join(candidateProjectionErr, fmt.Errorf("ensure block GC candidate projection for block %s: %w", blockID, candidateErr))
 		}
 		blockBatch = append(blockBatch, QueueItem{
-			OrgID:        orgID,
-			QueuedAt:     candidateAt,
-			ItemType:     ItemBlock,
-			ItemID:       blockID,
-			LibraryID:    libraryID,
+			OrgID:    orgID,
+			QueuedAt: candidateAt,
+			ItemType: ItemBlock,
+			ItemID:   blockID,
+			// Blocks are content-addressed and library-independent: processBlock
+			// only uses OrgID+ItemID, and gc_pending_items is library-scoped in its
+			// key. Enqueue every block under uuid.Nil so this write matches the
+			// uuid.Nil dedup check above and the scanner's orphan-block path
+			// (scanner.go). Using the real libraryID here writes the pending row in a
+			// different partition than CompleteItem later deletes, orphaning it
+			// forever. See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01.
+			LibraryID:    uuid.Nil,
 			StorageClass: storageClass,
 			RetryCount:   0,
 		})

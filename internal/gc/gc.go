@@ -419,7 +419,15 @@ func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.U
 		metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("service").Inc()
 		log.Printf("[GC] WARNING: block candidate discovery degraded for org=%s block=%s: %v", orgID, blockID, candidateErr)
 	}
-	if err := s.store.EnqueueItem(orgID, candidateAt, ItemBlock, blockID, libraryID, storageClass, 0); err != nil {
+	// Blocks are content-addressed and library-independent; gc_pending_items is
+	// library-scoped in its key while the dedup check above uses uuid.Nil. Enqueue
+	// under uuid.Nil so the pending write matches both the dedup check and the
+	// deletion in CompleteItem (which re-reads library_id from the queue row).
+	// Passing a real libraryID here would orphan the pending row forever. The
+	// libraryID parameter is retained for API compatibility but intentionally not
+	// used as the queue/pending key. See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01.
+	_ = libraryID
+	if err := s.store.EnqueueItem(orgID, candidateAt, ItemBlock, blockID, uuid.Nil, storageClass, 0); err != nil {
 		return errors.Join(candidateErr, err)
 	}
 	return nil

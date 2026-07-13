@@ -2212,3 +2212,168 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 		t.Fatalf("expected org failed depth to be 0 after requeue+delete, got %d", orgFailedDepth)
 	}
 }
+
+// countPendingBlockRows counts gc_pending_items block rows for blockID under the
+// partition/clustering derived from libraryID. gc_pending_items is library-scoped in
+// its key (the bucket hashes library_id and library_id is a clustering column), so a
+// block enqueued under the wrong library_id lands in a different partition than the
+// completion delete targets. Passing uuid.Nil counts the canonical (correct) key;
+// passing a real library UUID counts the leaked key.
+func countPendingBlockRows(t *testing.T, orgID, libraryID uuid.UUID, blockID string) int {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	bucket := gcpkg.PendingItemBucket(orgID, libraryID, gcpkg.ItemBlock, blockID)
+	iter := session.Query(`
+		SELECT identity_at FROM gc_pending_items
+		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
+	`, orgID.String(), bucket, "block", libraryID.String(), blockID).Iter()
+	var identityAt time.Time
+	count := 0
+	for iter.Scan(&identityAt) {
+		count++
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("count gc_pending_items block rows for %s/%s (lib=%s): %v", orgID, blockID, libraryID, err)
+	}
+	return count
+}
+
+// deletePendingBlockRowsUnderLibraryBucket removes any gc_pending_items block rows
+// keyed under a real library bucket. cleanupGCBlockFixturesForTest only sweeps the
+// uuid.Nil bucket, so this is the belt-and-suspenders teardown for a regression that
+// would leak a row under the real library partition.
+func deletePendingBlockRowsUnderLibraryBucket(t *testing.T, orgID, libraryID uuid.UUID, blockID string) {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	bucket := gcpkg.PendingItemBucket(orgID, libraryID, gcpkg.ItemBlock, blockID)
+	iter := session.Query(`
+		SELECT identity_at FROM gc_pending_items
+		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
+	`, orgID.String(), bucket, "block", libraryID.String(), blockID).Iter()
+	var identityAt time.Time
+	for iter.Scan(&identityAt) {
+		_ = session.Query(`
+			DELETE FROM gc_pending_items
+			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
+		`, orgID.String(), bucket, "block", libraryID.String(), blockID, identityAt).Exec()
+	}
+	_ = iter.Close()
+}
+
+// TestGC_ZeroRefBlockCascadeLeavesNoPendingItem is the regression guard for
+// ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01. When an fs_object cascade releases a
+// block to zero references, the worker enqueues the resulting ItemBlock. Because
+// gc_pending_items is library-scoped in its key while blocks are library-independent,
+// the enqueue MUST key the block under uuid.Nil — matching the worker/scanner dedup
+// checks and CompleteItem, which re-reads library_id from the single gc_queue row.
+// Before the fix, enqueueZeroRefBlocks wrote the pending row under the *real*
+// library_id, so CompleteItem (deleting under the queue row's key) could never remove
+// it, orphaning one gc_pending_items row per deleted block forever (~9,629 for a real
+// 50 GB delete). This test drives the real fs_object → zero-ref → block-delete cascade
+// through the worker and asserts no pending block row survives under either bucket.
+func TestGC_ZeroRefBlockCascadeLeavesNoPendingItem(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	queue := gcpkg.NewQueue(store)
+	// nil storage: processBlock still deletes the canonical blocks row and completes
+	// (the S3 step is skipped and the recovery row is cleared, worker.go), so the queue
+	// item is Completed and its pending row is deleted — exactly the path under test.
+	worker := gcpkg.NewWorker(store, nil, queue, 100, 0, false, &gcpkg.Stats{})
+	session := database.Session()
+
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	libraryUUID := uuid.New()
+	libraryID := libraryUUID.String()
+	// 64-hex SHA-256 internal id: an all-SHA-256 list skips block_id_mappings
+	// resolution, so no representation/mapping fixtures are needed.
+	blockID := fmt.Sprintf("%064x", time.Now().UnixNano())
+	fsID := fmt.Sprintf("%040x", time.Now().UnixNano())
+	referrer := db.BlockReferrerForFSObject(libraryID, fsID)
+	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+
+	// Seed a real, singly-referenced block: canonical blocks row + one fs: reference,
+	// plus the fs_object that owns that reference.
+	if err := database.UpsertBlockMetadata(orgID, blockID, 1, "hot", ""); err != nil {
+		t.Fatalf("seed blocks row: %v", err)
+	}
+	if err := database.AddBlockReference(orgID, blockID, referrer, libraryID, 0); err != nil {
+		t.Fatalf("seed fs: block_reference: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, libraryID, fsID, "file", "leak-probe.bin", "/leak-probe.bin", int64(1), queuedAt.Unix(), []string{blockID}).Exec(); err != nil {
+		t.Fatalf("seed fs_objects: %v", err)
+	}
+
+	t.Cleanup(func() {
+		cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
+		deletePendingBlockRowsUnderLibraryBucket(t, orgUUID, libraryUUID, blockID)
+		_ = session.Query(`DELETE FROM block_references WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec()
+		_ = session.Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec()
+		_ = session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, libraryID, fsID).Exec()
+	})
+
+	// Enqueue the fs_object exactly as the live-library version/auto-delete cleanup path
+	// does (scanner Phase 5/6): LibraryGuardNone (the library stays alive, no marker),
+	// a canonical plain representation, and a past queued_at so DequeueBatch takes it.
+	if err := queue.EnqueueBatch([]gcpkg.QueueItem{{
+		OrgID:                 orgUUID,
+		QueuedAt:              queuedAt,
+		IdentityAt:            queuedAt,
+		ItemType:              gcpkg.ItemFSObject,
+		ItemID:                fsID,
+		LibraryID:             libraryUUID,
+		BlockRepresentationID: db.PlainBlockRepresentationID,
+		LibraryGuardMode:      gcpkg.LibraryGuardNone,
+	}}); err != nil {
+		t.Fatalf("enqueue fs_object: %v", err)
+	}
+
+	// Keep background workers from stealing this org's queue while we drive it.
+	if err := store.RemoveOrgFromActiveSet(orgUUID, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatalf("RemoveOrgFromActiveSet: %v", err)
+	}
+
+	// Drain: fs_object → releases fs: ref → zero-ref block enqueued (the fixed line) →
+	// block deleted (nil storage skips S3) → queue items completed.
+	drained := false
+	for attempt := 0; attempt < 12; attempt++ {
+		processed, err := worker.ProcessOrgOnce(context.Background(), orgUUID)
+		if err != nil {
+			t.Fatalf("ProcessOrgOnce attempt %d: %v", attempt+1, err)
+		}
+		if !blockExistsInDB(t, orgID, blockID) &&
+			!gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-time.Second)) &&
+			!gcQueueItemExistsSince(t, orgID, "fs_object", fsID, queuedAt.Add(-time.Second)) {
+			drained = true
+			break
+		}
+		if processed == 0 {
+			time.Sleep(150 * time.Millisecond)
+		}
+	}
+	if !drained {
+		t.Fatalf("GC did not drain the fs_object → block cascade (block_exists=%v, fs_queued=%v, block_queued=%v)",
+			blockExistsInDB(t, orgID, blockID),
+			gcQueueItemExistsSince(t, orgID, "fs_object", fsID, queuedAt.Add(-time.Second)),
+			gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-time.Second)))
+	}
+
+	// The block is physically gone.
+	if blockExistsInDB(t, orgID, blockID) {
+		t.Fatal("expected canonical block row to be deleted after the cascade")
+	}
+
+	// Crux: no orphaned pending block row under the real library bucket (the leak) ...
+	if n := countPendingBlockRows(t, orgUUID, libraryUUID, blockID); n != 0 {
+		t.Fatalf("regression ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01: %d orphaned gc_pending_items block row(s) under the real library bucket (library_id=%s)", n, libraryID)
+	}
+	// ... and the canonical uuid.Nil-keyed pending row was removed by CompleteItem.
+	if n := countPendingBlockRows(t, orgUUID, uuid.Nil, blockID); n != 0 {
+		t.Fatalf("expected the uuid.Nil-keyed pending block row to be removed by CompleteItem, found %d", n)
+	}
+}

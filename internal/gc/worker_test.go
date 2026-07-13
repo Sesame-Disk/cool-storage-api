@@ -241,6 +241,52 @@ func TestWorker_EnqueueZeroRefBlocks_RecordsProjectionDegradationMetric(t *testi
 	}
 }
 
+// TestWorker_EnqueueZeroRefBlocks_KeysBlockUnderNilNotLibrary is the unit guard for
+// ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01. Blocks are content-addressed and
+// library-independent (processBlock never reads item.LibraryID), while gc_pending_items
+// is library-scoped in its key. enqueueZeroRefBlocks must therefore key the block under
+// uuid.Nil regardless of which library's cascade released it, so the enqueue matches the
+// uuid.Nil dedup check and CompleteItem's deletion. Passing a real library UUID here and
+// getting a real-library-keyed queue/pending row back is the exact leak this fixes.
+func TestWorker_EnqueueZeroRefBlocks_KeysBlockUnderNilNotLibrary(t *testing.T) {
+	store := NewMockStore()
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, &Stats{})
+	orgID := uuid.New()
+	libraryID := uuid.New() // a real, non-nil library — the cascade's owning library
+	blockID := "block-lib-scope"
+
+	if err := w.enqueueZeroRefBlocks(orgID, libraryID, []string{blockID}, "hot"); err != nil {
+		t.Fatalf("enqueueZeroRefBlocks: %v", err)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued block item, got %d", len(items))
+	}
+	if items[0].LibraryID != uuid.Nil {
+		t.Fatalf("block enqueued with LibraryID=%s, want uuid.Nil (library-scope leak)", items[0].LibraryID)
+	}
+
+	// The pending dedup row must live under the uuid.Nil key, not the real library key;
+	// otherwise CompleteItem (which deletes under the queue row's library_id) can never
+	// remove it.
+	nilPending, err := store.PendingItemExists(orgID, uuid.Nil, time.Time{}, ItemBlock, blockID)
+	if err != nil {
+		t.Fatalf("PendingItemExists(nil): %v", err)
+	}
+	if !nilPending {
+		t.Fatal("expected pending block row keyed under uuid.Nil")
+	}
+	libPending, err := store.PendingItemExists(orgID, libraryID, time.Time{}, ItemBlock, blockID)
+	if err != nil {
+		t.Fatalf("PendingItemExists(library): %v", err)
+	}
+	if libPending {
+		t.Fatalf("pending block row must NOT be keyed under the real library %s (library-scope leak)", libraryID)
+	}
+}
+
 func TestWorker_ProcessBlock_RefCountZeroButLiveFSObjectReferenceSkipsDelete(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
