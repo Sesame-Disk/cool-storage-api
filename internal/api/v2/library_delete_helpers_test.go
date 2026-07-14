@@ -230,6 +230,55 @@ func TestPermanentDeleteResolvedRepo_StampsResolvedRepresentationOnSuccess(t *te
 	}
 }
 
+func TestDeleteResolvedTrashLibrary_ImmediatelyEnqueuesLibraryCascadeOnSuccess(t *testing.T) {
+	installDeleteHelperStubs(t)
+
+	resolved := db.PlainBlockRepresentationID
+	wantDeletedAt := time.Now().Add(-48 * time.Hour).UTC().Truncate(time.Millisecond)
+	var gotRepresentation string
+	var gotWriterDeletedAt time.Time
+	var cleanupLinksCalled int
+	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, _ string) (string, error) {
+		return resolved, nil
+	}
+	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
+		cleanupLinksCalled++
+		return nil
+	}
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, deletedAt time.Time) error {
+		gotRepresentation = blockRepresentationID
+		gotWriterDeletedAt = deletedAt
+		return nil
+	}
+	libEnq := &mockLibraryGCEnqueuer{}
+	h := &OrgAdminHandler{db: &db.DB{}, gcEnqueuer: libEnq}
+	c, w := newDeleteTestContext(http.MethodDelete, "/org/org-1/admin/trash-libraries/repo-1/")
+
+	h.deleteResolvedTrashLibrary(c, "org-1", "repo-1", "hot", wantDeletedAt)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if cleanupLinksCalled != 1 {
+		t.Fatalf("cleanup links called %d times, want 1", cleanupLinksCalled)
+	}
+	if gotRepresentation != resolved {
+		t.Fatalf("hard-delete marker representation = %q, want %q", gotRepresentation, resolved)
+	}
+	if !gotWriterDeletedAt.Equal(wantDeletedAt) {
+		t.Fatalf("writer deleted_at = %s, want %s", gotWriterDeletedAt, wantDeletedAt)
+	}
+	if len(libEnq.calls) != 1 {
+		t.Fatalf("expected exactly one immediate library-cascade enqueue, got %#v", libEnq.calls)
+	}
+	if libEnq.calls[0].blockRepresentationID != resolved {
+		t.Fatalf("cascade enqueue representation = %q, want %q", libEnq.calls[0].blockRepresentationID, resolved)
+	}
+	if !libEnq.calls[0].deletedAt.Equal(wantDeletedAt) {
+		t.Fatalf("cascade enqueue deleted_at = %s, want %s", libEnq.calls[0].deletedAt, wantDeletedAt)
+	}
+}
+
 func TestAdminCleanTrashLibraries_SkipsRepresentationFailuresWithoutSideEffects(t *testing.T) {
 	installDeleteHelperStubs(t)
 

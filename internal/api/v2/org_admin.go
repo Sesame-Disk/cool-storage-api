@@ -31,6 +31,7 @@ type OrgAdminHandler struct {
 	permMiddleware orgRoleGetter
 	sessions       SessionInvalidator
 	apiKeys        APIKeyInvalidator
+	gcEnqueuer     LibraryGCEnqueuer
 }
 
 // NewOrgAdminHandler creates a new OrgAdminHandler.
@@ -41,6 +42,7 @@ func NewOrgAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.Pe
 		permMiddleware: perm,
 		sessions:       sessions,
 		apiKeys:        apiKeys,
+		gcEnqueuer:     getLibraryEnqueuer(),
 	}
 }
 

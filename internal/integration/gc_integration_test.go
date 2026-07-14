@@ -489,6 +489,107 @@ func deleteGCQueueItemsByIdentitySince(t *testing.T, orgID string, itemType stri
 	}
 }
 
+func deletedLibraryMarkerExistsInSessionForTest(t *testing.T, session *gocql.Session, repoID string) bool {
+	t.Helper()
+	var deletedAt time.Time
+	err := session.Query(`SELECT deleted_at FROM deleted_libraries WHERE library_id = ?`, repoID).Scan(&deletedAt)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return false
+	}
+	if err != nil {
+		t.Fatalf("check deleted_libraries marker for %s: %v", repoID, err)
+	}
+	return true
+}
+
+func gcPendingLibraryCascadeExistsForTest(t *testing.T, session *gocql.Session, orgID string, orgUUID uuid.UUID, repoID string) bool {
+	t.Helper()
+	bucket := gcpkg.PendingItemBucket(orgUUID, uuid.Nil, gcpkg.ItemLibraryCascade, repoID)
+	var identityAt time.Time
+	err := session.Query(`
+		SELECT identity_at FROM gc_pending_items
+		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? LIMIT 1
+	`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID).Scan(&identityAt)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return false
+	}
+	if err != nil {
+		t.Fatalf("check gc_pending_items library_cascade for %s/%s: %v", orgID, repoID, err)
+	}
+	return true
+}
+
+func deleteGCPendingLibraryCascadeItemsForTest(t *testing.T, session *gocql.Session, orgID string, orgUUID uuid.UUID, repoID string) {
+	t.Helper()
+	bucket := gcpkg.PendingItemBucket(orgUUID, uuid.Nil, gcpkg.ItemLibraryCascade, repoID)
+	iter := session.Query(`
+		SELECT identity_at FROM gc_pending_items
+		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
+	`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID).Iter()
+	var identityAt time.Time
+	for iter.Scan(&identityAt) {
+		if err := session.Query(`
+			DELETE FROM gc_pending_items
+			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
+		`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID, identityAt).Exec(); err != nil {
+			t.Fatalf("delete gc_pending_items library_cascade for %s/%s: %v", orgID, repoID, err)
+		}
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("scan gc_pending_items library_cascade for %s/%s: %v", orgID, repoID, err)
+	}
+}
+
+func purgeDisposableLibraryDeleteResiduals(t *testing.T, session *gocql.Session, orgID string, orgUUID uuid.UUID, repoID string) {
+	t.Helper()
+	// Disposable libraries created by createDisposableTestLibrary are empty apart from the
+	// root fs_object and initial commit, so we can remove those grace-gated rows directly
+	// after the real delete path has already cleaned the canonical/admin projections.
+	if err := session.Query(`DELETE FROM commits WHERE library_id = ?`, repoID).Exec(); err != nil {
+		t.Fatalf("delete commits partition for %s: %v", repoID, err)
+	}
+	if err := session.Query(`DELETE FROM fs_objects WHERE library_id = ?`, repoID).Exec(); err != nil {
+		t.Fatalf("delete fs_objects partition for %s: %v", repoID, err)
+	}
+	if err := session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, repoID).Exec(); err != nil {
+		t.Fatalf("delete deleted_libraries marker for %s: %v", repoID, err)
+	}
+	deleteGCQueueItemsByIdentity(t, orgID, "library_cascade", repoID)
+	deleteGCPendingLibraryCascadeItemsForTest(t, session, orgID, orgUUID, repoID)
+	repairGCSnapshotsForTest(t, orgUUID)
+}
+
+func cleanupDisposableLibraryDeleteState(t *testing.T, session *gocql.Session, orgID, repoID string) {
+	t.Helper()
+	orgUUID, err := uuid.Parse(orgID)
+	if err != nil {
+		t.Fatalf("parse org id for cleanup: %v", err)
+	}
+	purgeDisposableLibraryDeleteResiduals(t, session, orgID, orgUUID, repoID)
+	stableSince := time.Time{}
+	ok := pollUntil(t, 8*time.Second, 200*time.Millisecond, func() bool {
+		markerExists := deletedLibraryMarkerExistsInSessionForTest(t, session, repoID)
+		queueExists := gcQueueItemExists(t, orgID, "library_cascade", repoID)
+		pendingExists := gcPendingLibraryCascadeExistsForTest(t, session, orgID, orgUUID, repoID)
+		if markerExists || queueExists || pendingExists {
+			// The permanent-delete endpoint enqueues library_cascade on a fire-and-forget
+			// goroutine; if that races with teardown, scrub the recreated rows and wait for
+			// the absence to remain stable before returning.
+			stableSince = time.Time{}
+			purgeDisposableLibraryDeleteResiduals(t, session, orgID, orgUUID, repoID)
+			return false
+		}
+		if stableSince.IsZero() {
+			stableSince = time.Now()
+			return false
+		}
+		return time.Since(stableSince) >= 1500*time.Millisecond
+	})
+	if !ok {
+		t.Fatalf("timed out waiting for stable teardown cleanup of %s/%s", orgID, repoID)
+	}
+}
+
 func readGCOrgQueueStats(t *testing.T, orgID uuid.UUID) (int, int) {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
@@ -2564,40 +2665,29 @@ func TestGC_SoftDeleteRetentionInvariant_RealCassandra(t *testing.T) {
 	// real delete path so no canonical row OR admin-projection row leaks into the shared org.
 }
 
-// removeTestLibraryFully deletes a test library through the REAL API delete path (trash →
-// permanent delete), which runs the canonical admin read-model cleanup so every projection
-// row is removed — not just the libraries/libraries_by_id rows a raw CQL delete would touch.
-// It then clears the durable marker plus any immediate library-cascade queue/pending rows.
-// All steps are best-effort so it is safe to call regardless of the library's final state.
+// removeTestLibraryFully tears down an EMPTY disposable test library through the REAL API
+// delete path (trash → permanent delete), which runs the canonical admin read-model cleanup
+// so every projection row is removed — not just the libraries/libraries_by_id rows a raw CQL
+// delete would touch. Because the GC worker may still be grace-gated, the helper then removes
+// the disposable library's root commit/fs_object rows directly and polls until any late
+// library_cascade enqueue stops recreating marker/queue residue.
 func removeTestLibraryFully(t *testing.T, client *testClient, session *gocql.Session, orgID, repoID string) {
 	t.Helper()
 	// Trash (no-op if already trashed/gone), then permanent-delete so
 	// addDeleteAdminLibraryReadModelQueries clears libraries_by_org_updated/by_owner/admin_global.
 	if r := client.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID)); r != nil {
+		if r.StatusCode != http.StatusOK && r.StatusCode != http.StatusNotFound {
+			t.Fatalf("trash disposable library cleanup: status=%d body=%s", r.StatusCode, responseBody(t, r))
+		}
 		r.Body.Close()
 	}
 	if p := client.Delete(t, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", repoID)); p != nil {
+		if p.StatusCode != http.StatusOK && p.StatusCode != http.StatusNotFound {
+			t.Fatalf("permanent-delete disposable library cleanup: status=%d body=%s", p.StatusCode, responseBody(t, p))
+		}
 		p.Body.Close()
 	}
-	_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, repoID).Exec()
-	deleteGCQueueItemsByIdentity(t, orgID, "library_cascade", repoID)
-	orgUUID, err := uuid.Parse(orgID)
-	if err != nil {
-		return
-	}
-	bucket := gcpkg.PendingItemBucket(orgUUID, uuid.Nil, gcpkg.ItemLibraryCascade, repoID)
-	iter := session.Query(`
-		SELECT identity_at FROM gc_pending_items
-		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
-	`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID).Iter()
-	var idAt time.Time
-	for iter.Scan(&idAt) {
-		_ = session.Query(`
-			DELETE FROM gc_pending_items
-			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
-		`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID, idAt).Exec()
-	}
-	_ = iter.Close()
+	cleanupDisposableLibraryDeleteState(t, session, orgID, repoID)
 }
 
 // TestGC_PermanentDeleteWriterStampsPurge_RealCassandra proves the REAL permanent-delete
@@ -2634,25 +2724,8 @@ func TestGC_PermanentDeleteWriterStampsPurge_RealCassandra(t *testing.T) {
 		t.Fatal("soft-delete marker missing block_representation_id")
 	}
 
-	orgUUID := uuid.MustParse(orgIDStr)
 	t.Cleanup(func() {
-		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, repoID).Exec()
-		// The purge-eligible marker may get a library_cascade enqueued by a background
-		// scan; remove any such queue/pending rows so nothing lingers.
-		deleteGCQueueItemsByIdentity(t, orgIDStr, "library_cascade", repoID)
-		bucket := gcpkg.PendingItemBucket(orgUUID, uuid.Nil, gcpkg.ItemLibraryCascade, repoID)
-		iter := session.Query(`
-			SELECT identity_at FROM gc_pending_items
-			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
-		`, orgIDStr, bucket, "library_cascade", uuid.Nil.String(), repoID).Iter()
-		var idAt time.Time
-		for iter.Scan(&idAt) {
-			_ = session.Query(`
-				DELETE FROM gc_pending_items
-				WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
-			`, orgIDStr, bucket, "library_cascade", uuid.Nil.String(), repoID, idAt).Exec()
-		}
-		_ = iter.Close()
+		cleanupDisposableLibraryDeleteState(t, session, orgIDStr, repoID)
 	})
 
 	// Permanent delete via the owner API (owner may permanently delete their own trash).

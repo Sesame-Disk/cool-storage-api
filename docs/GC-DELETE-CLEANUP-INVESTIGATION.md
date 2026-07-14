@@ -337,10 +337,15 @@ re-discovered by scanner Phase 0.
 
 ### Precisions (they confirm, they refine)
 
-1. The two org-admin paths rely entirely on the retention rescue (P1). Superadmin paths attempt
-   immediate **content** enqueue, but not a full library cascade; marker/policy/final cleanup —
-   and the global clean-trash library counter — can still wait for Phase 13 (P2).
-2. The clock reset (P1b) makes P1 worse: even the Phase 13 rescue is delayed 30d **from the action**.
+1. All permanent-delete entry points now share the durable `purge_requested_at` writer. The
+   immediate best-effort `library_cascade` enqueue is wired on the v2.1 owner path plus the
+   platform/org-admin delete paths; the legacy `/api2/repos/deleted/:repo_id` registration still
+   mounts the shared handler with `libHandler=nil`, so it relies on the durable marker + Phase 13
+   recovery instead. Where the enqueue is wired, it mirrors Phase 13 exactly (`QueuedAt =
+   IdentityAt = deleted_at`, nil library id, same representation), so a later scan is a dedup
+   no-op and a lost goroutine costs only latency.
+2. The retention clock is no longer reset. `deleted_at` is preserved as the original trash time,
+   while `purge_requested_at` is the separate Phase 13 eligibility signal.
 3. A cascade can run after `libraries` is gone **only while its deleted marker/queued identity
    remains discoverable**, because `GetLibraryDeletedAt` reads `deleted_libraries`
    ([store_cassandra.go:1165](../internal/gc/store_cassandra.go#L1165)). The snapshot-specific
@@ -416,8 +421,8 @@ Subsequent branches, in recommended merge order:
 | 1B | Inventory upload fixtures that leave `blocks`/MinIO objects and add fixture-scoped teardown; also repair the `library_projection_regression_test.go` failure-restore so it does not re-insert an unstamped `deleted_libraries`. Measure **no-net-growth** vs the pre-suite baseline. | `ISSUE-GC-TEST-RESIDUE-01` | Low |
 | 1C | Remove global-GC cross-test interference: replace direct `ProcessOnce(storage=nil)` with `ProcessOrgOnce`; inventory `/admin/gc/run` callers and isolate or baseline their effects. | `ISSUE-GC-TEST-RESIDUE-01` | Med |
 | 2 | Fold `AddDeleteLibraryPolicyQuery` (version_ttl + auto_delete) into the `hardDeleteLibraryRowsFn` batch. Policy index only. | `ISSUE-GC-POLICY-INDEX-STALE-01` | Low |
-| 3 | Org-admin single tactical parity (`DeleteOrgTrashLibrary`): after hard-delete, enqueue contents + delete counter + clean tags (match `PermanentDeleteRepo`). This is **not** `ItemLibraryCascade`; final durable cleanup remains branch 6B. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Low/Med |
-| 4 | Org-admin bulk parity + centralization (`CleanOrgTrashLibraries`): use the enhanced per-candidate helper; inherit content enqueue/counter/tags/policy. No N+1 yet. **This remains content-only/best-effort until 6B.** | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Med |
+| 3 ✅ **DONE** | Org-admin single-path parity (`DeleteOrgTrashLibrary`): after hard-delete, immediately enqueue the same durable, Phase-13-deduplicated `ItemLibraryCascade` used by the other permanent-delete paths. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Low/Med |
+| 4 ✅ **DONE** | Org-admin bulk-path parity (`CleanOrgTrashLibraries`): after each successful hard-delete, immediately enqueue the same durable, Phase-13-deduplicated `ItemLibraryCascade`. No content-only accelerator remains. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Med |
 | 5 | Phase 13 error visibility: accumulate (`errors.Join`), return the error, dedicated metric, don't flag global success on delivery failure; separate enqueued/skipped/failed counters. | `ISSUE-GC-PHASE13-ERROR-VISIBILITY-01` | Low |
 | 6A ✅ **DONE** | Durable purge marker: `deleted_libraries.purge_requested_at` (migration 012); Phase 13 eligible when `purge_requested_at != null OR deleted_at < cutoff`. Eligibility only — the grace gate before worker processing is preserved. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Med |
 | 6B ✅ **DONE** | Stamp the durable marker at all permanent-delete marker writers (`hardDeleteLibraryRowsFn`, `CleanOrgTrashLibraries`). The existing cascade owns final cleanup; immediate enqueue stays a best-effort accelerator. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Med |

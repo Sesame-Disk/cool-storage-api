@@ -433,6 +433,7 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 			}
 			return
 		}
+		enqueueLibraryCascadeBestEffort(h.gcEnqueuer, targetOrgID, libID, blockRepresentationID, storageClass, deletedAt)
 		cleaned++
 	}
 	if err := iter.Close(); err != nil {
