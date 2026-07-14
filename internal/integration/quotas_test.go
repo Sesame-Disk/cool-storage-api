@@ -584,11 +584,17 @@ func setDefaultUserQuota(t *testing.T, quota int64) {
 func waitForUserQuotaUsage(t *testing.T, want int64) int64 {
 	t.Helper()
 	var got int64
-	waitForCondition(t, fmt.Sprintf("default user quota_usage=%d", want), func() bool {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
 		got = jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
-		return got == want
-	})
-	return got
+		if got == want {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for default user quota_usage=%d (last=%d)", want, got)
+		}
+		time.Sleep(pollInterval)
+	}
 }
 
 func restoreOrgQuotasOnCleanup(t *testing.T, original map[string]interface{}) {
