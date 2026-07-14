@@ -32,7 +32,10 @@ var (
 		return dbpkg.ResolveBlockRepresentationIDForDelete(database.Session(), orgID, libraryID)
 	}
 	cleanupLibraryLinksForDeleteFn = func(database *dbpkg.DB, orgID, libraryID string) error {
-		return cleanupLibraryLinks(database, orgID, libraryID)
+		return cleanupLibraryLinks(database, orgID, libraryID, nil)
+	}
+	cleanupLibraryLinksGuardedForDeleteFn = func(database *dbpkg.DB, orgID, libraryID string, beforeMutation func() error) error {
+		return cleanupLibraryLinks(database, orgID, libraryID, beforeMutation)
 	}
 	readPermanentDeleteLibraryStateFn = func(database *dbpkg.DB, orgID, libraryID string, _ time.Time) (dbpkg.LibraryState, error) {
 		return dbpkg.ReadLibraryState(database.Session(), orgID, libraryID)
@@ -212,7 +215,7 @@ func permanentlyDeleteTrashedLibraryCandidate(database *dbpkg.DB, candidate tras
 			return renewLibraryHardDeleteLockLeaseFn(database, libraryUUID, leaseToken)
 		})
 		defer leaseHeartbeat.Close()
-		if err := cleanupLibraryLinksForDeleteFn(database, candidate.OrgID, candidate.LibraryID); err != nil {
+		if err := cleanupLibraryLinksGuardedForDeleteFn(database, candidate.OrgID, candidate.LibraryID, leaseHeartbeat.Check); err != nil {
 			return "", errors.Join(errDeleteLibraryLinksCleanup, err)
 		}
 		leaseHeartbeat.Close()

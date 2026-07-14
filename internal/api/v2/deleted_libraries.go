@@ -272,7 +272,7 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 
 // cleanupLibraryLinks removes all share/upload links for a deleted library
 // by scanning share_links_by_library and quad-deleting each link.
-func cleanupLibraryLinks(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {
+func cleanupLibraryLinks(db interface{ Session() *gocql.Session }, orgID, libraryID string, beforeMutation func() error) error {
 	iter := db.Session().Query(`
 		SELECT link_token, link_type, created_by, created_at FROM share_links_by_library
 		WHERE org_id = ? AND library_id = ?
@@ -294,6 +294,12 @@ func cleanupLibraryLinks(db interface{ Session() *gocql.Session }, orgID, librar
 			dbpkg.AddDeleteShareLinkExpiryQuery(batch, linkToken, *expiresAt)
 		}
 		dbpkg.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, linkToken)
+		if beforeMutation != nil {
+			if err := beforeMutation(); err != nil {
+				_ = iter.Close()
+				return err
+			}
+		}
 		if err := batch.Exec(); err != nil {
 			_ = iter.Close()
 			return err

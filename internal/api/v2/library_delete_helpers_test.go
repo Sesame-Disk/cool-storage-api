@@ -38,6 +38,7 @@ func installDeleteHelperStubs(t *testing.T) {
 	t.Helper()
 	oldResolve := resolveDeleteBlockRepresentationFn
 	oldCleanupLinks := cleanupLibraryLinksForDeleteFn
+	oldCleanupLinksGuarded := cleanupLibraryLinksGuardedForDeleteFn
 	oldReadState := readPermanentDeleteLibraryStateFn
 	oldAcquireLease := acquireLibraryHardDeleteLockLeaseFn
 	oldRenewLease := renewLibraryHardDeleteLockLeaseFn
@@ -50,6 +51,7 @@ func installDeleteHelperStubs(t *testing.T) {
 	t.Cleanup(func() {
 		resolveDeleteBlockRepresentationFn = oldResolve
 		cleanupLibraryLinksForDeleteFn = oldCleanupLinks
+		cleanupLibraryLinksGuardedForDeleteFn = oldCleanupLinksGuarded
 		readPermanentDeleteLibraryStateFn = oldReadState
 		acquireLibraryHardDeleteLockLeaseFn = oldAcquireLease
 		renewLibraryHardDeleteLockLeaseFn = oldRenewLease
@@ -63,6 +65,14 @@ func installDeleteHelperStubs(t *testing.T) {
 	readPermanentDeleteLibraryStateFn = func(_ *db.DB, orgID, libraryID string, expectedDeletedAt time.Time) (db.LibraryState, error) {
 		deletedAt := expectedDeletedAt
 		return db.LibraryState{OrgID: orgID, LibraryID: libraryID, DeletedAt: &deletedAt}, nil
+	}
+	cleanupLibraryLinksGuardedForDeleteFn = func(database *db.DB, orgID, libraryID string, beforeMutation func() error) error {
+		if beforeMutation != nil {
+			if err := beforeMutation(); err != nil {
+				return err
+			}
+		}
+		return cleanupLibraryLinksForDeleteFn(database, orgID, libraryID)
 	}
 	acquireLibraryHardDeleteLockLeaseFn = func(_ *db.DB, _, _ uuid.UUID) (bool, error) { return true, nil }
 	renewLibraryHardDeleteLockLeaseFn = func(_ *db.DB, _, _ uuid.UUID) (bool, error) { return true, nil }
@@ -164,6 +174,71 @@ func TestPermanentDeleteResolvedRepo_RejectsWhenLeaseIsLostDuringLinkCleanup(t *
 	payload := decodeDeleteTestJSON(t, w)
 	if payload["error"] != "library permanent delete is already in progress" {
 		t.Fatalf("error = %v, want %q", payload["error"], "library permanent delete is already in progress")
+	}
+	if hardDeleteCalled != 0 {
+		t.Fatalf("hardDeleteCalled = %d, want 0", hardDeleteCalled)
+	}
+}
+
+func TestPermanentDeleteResolvedRepo_StopsFurtherLinkDeletesAfterLeaseLoss(t *testing.T) {
+	installDeleteHelperStubs(t)
+	repoID := uuid.NewString()
+	permanentDeleteLeaseHeartbeatInterval = time.Millisecond
+
+	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, _ string) (string, error) {
+		return db.PlainBlockRepresentationID, nil
+	}
+	// The lease is lost only AFTER the first link is deleted, so link 1's guard check is
+	// deterministically healthy; the very next heartbeat tick then makes renew fail.
+	link1Deleted := make(chan struct{})
+	renewLibraryHardDeleteLockLeaseFn = func(_ *db.DB, _, _ uuid.UUID) (bool, error) {
+		select {
+		case <-link1Deleted:
+			return false, nil
+		default:
+			return true, nil
+		}
+	}
+	deletedLinks := 0
+	cleanupLibraryLinksGuardedForDeleteFn = func(_ *db.DB, _, _ string, beforeMutation func() error) error {
+		// Link 1: guard is healthy (lease not yet lost), so the delete proceeds.
+		if err := beforeMutation(); err != nil {
+			return err
+		}
+		deletedLinks++
+		close(link1Deleted)
+		// Before link 2, the guard must observe the lost lease. The heartbeat records the
+		// loss asynchronously, so poll the guard (exactly as the real per-link check would)
+		// until it reports the loss, then stop WITHOUT deleting link 2. Polling rather than a
+		// single racy check makes the stop deterministic regardless of heartbeat tick timing.
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if err := beforeMutation(); err != nil {
+				return err // link 2 is never deleted
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("guarded cleanup never observed the lost lease")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	hardDeleteCalled := 0
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+		hardDeleteCalled++
+		return nil
+	}
+	cleanupAllLibraryTagsForDeleteFn = func(_ *db.DB, _ string) error { return nil }
+	deleteLibraryStorageCounterForDeleteFn = func(_ traffic.DBSession, _, _ string) error { return nil }
+	h := &DeletedLibraryHandler{db: &db.DB{}}
+	c, w := newDeleteTestContext(http.MethodDelete, "/api/v2.1/repos/deleted/"+repoID+"/")
+
+	h.permanentDeleteResolvedRepo(c, "org-1", repoID, "hot", time.Now().UTC())
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusConflict, w.Body.String())
+	}
+	if deletedLinks != 1 {
+		t.Fatalf("deletedLinks = %d, want 1 before lease loss stops further cleanup", deletedLinks)
 	}
 	if hardDeleteCalled != 0 {
 		t.Fatalf("hardDeleteCalled = %d, want 0", hardDeleteCalled)
