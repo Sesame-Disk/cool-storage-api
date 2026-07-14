@@ -556,6 +556,26 @@ func purgeDisposableLibraryDeleteResiduals(t *testing.T, session *gocql.Session,
 	}
 	deleteGCQueueItemsByIdentity(t, orgID, "library_cascade", repoID)
 	deleteGCPendingLibraryCascadeItemsForTest(t, session, orgID, orgUUID, repoID)
+	// EnqueueBatch also marks the org active (gc_active_orgs) and dirty (gc_dirty_orgs); those
+	// coordination markers survive queue/pending deletion. Clear them BEFORE recomputing the
+	// global snapshot so dirty_orgs_total does not count this teardown's own dirty marker, and
+	// so the org is not left active/dirty. Recalculate first, only drop the org from the active
+	// set when it truly has no queue/failed work, and use timestamped conditional deletes so a
+	// newer concurrent enqueue is never clobbered (the poll loop re-runs this on any residue).
+	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+	stats, err := store.RecalculateOrgQueueStats(orgUUID)
+	if err != nil {
+		t.Fatalf("recalculate org queue stats for %s: %v", orgUUID, err)
+	}
+	now := time.Now().UTC()
+	if err := store.ClearDirtyOrg(orgUUID, now); err != nil {
+		t.Fatalf("clear dirty org %s: %v", orgUUID, err)
+	}
+	if stats.QueueDepth == 0 && stats.FailedDepth == 0 {
+		if err := store.RemoveOrgFromActiveSet(orgUUID, now); err != nil {
+			t.Fatalf("remove org %s from active set: %v", orgUUID, err)
+		}
+	}
 	repairGCSnapshotsForTest(t, orgUUID)
 }
 
