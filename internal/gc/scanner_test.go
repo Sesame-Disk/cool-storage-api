@@ -2759,6 +2759,54 @@ func TestScanner_ScanExpiredDeletedLibraries_EnqueuesPurgeRequestedWithinRetenti
 	}
 }
 
+// TestService_EnqueueLibraryCascade_DeduplicatesWithPhase13 is the direct guard for the
+// central invariant of the immediate-cascade design (ISSUE-GC-ORG-TRASH-NO-CASCADE-01):
+// the permanent-delete path's immediate Service.EnqueueLibraryCascade and scanner Phase 13
+// must produce the SAME queue/pending row, so running both leaves exactly one library_cascade.
+func TestService_EnqueueLibraryCascade_DeduplicatesWithPhase13(t *testing.T) {
+	store := NewMockStore()
+	q := NewQueue(store)
+	svc := &Service{store: store, queue: q, config: config.GCConfig{TrashRetentionDays: 30}, stats: &Stats{}}
+	scanner := NewScanner(store, q, &Stats{}, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+	deletedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	// Permanent-deleted marker (canonical row gone, purge_requested_at set).
+	store.AddPurgeRequestedDeletedLibrary(orgID, libID, "hot", deletedAt, time.Now().UTC())
+
+	// Immediate enqueue from the delete path.
+	if err := svc.EnqueueLibraryCascade(orgID, libID, db.PlainBlockRepresentationID, "hot", deletedAt); err != nil {
+		t.Fatalf("EnqueueLibraryCascade: %v", err)
+	}
+	countCascades := func() int {
+		n := 0
+		for _, item := range store.QueueItems(orgID) {
+			if item.ItemType == ItemLibraryCascade && item.ItemID == libID.String() {
+				n++
+			}
+		}
+		return n
+	}
+	if got := countCascades(); got != 1 {
+		t.Fatalf("after immediate enqueue: %d library_cascade items, want 1", got)
+	}
+
+	// Phase 13 rediscovers the same marker; it must dedup against the immediate enqueue.
+	if _, err := scanner.scanExpiredDeletedLibraries(context.Background()); err != nil {
+		t.Fatalf("scanExpiredDeletedLibraries: %v", err)
+	}
+	if got := countCascades(); got != 1 {
+		t.Fatalf("after Phase 13: %d library_cascade items, want 1 (immediate enqueue + scan must dedup)", got)
+	}
+
+	// A zero deletedAt would key the row off the marker identity — reject it fail-closed.
+	if err := svc.EnqueueLibraryCascade(orgID, libID, db.PlainBlockRepresentationID, "hot", time.Time{}); err == nil {
+		t.Fatal("EnqueueLibraryCascade accepted a zero deletedAt; want a fail-closed error")
+	}
+}
+
 // TestScanner_ScanExpiredDeletedLibraries_PurgeRequestedDoesNotDoubleEnqueue is the edge
 // guard for ISSUE-GC-ORG-TRASH-NO-CASCADE-01: because the permanent-delete writer now
 // PRESERVES the original deleted_at (rather than resetting it to now), a library_cascade

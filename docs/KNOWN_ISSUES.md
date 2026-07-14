@@ -66,7 +66,7 @@ existence check (P6) that could enqueue destructive work for live libraries is *
 | Issue | Status | Details |
 |-------|--------|---------|
 | **Org-Admin Trash Delete Defers Cleanup** | 🟢 Fixed (6A/6B, 2026-07-13) | Permanent-delete now stamps a durable `deleted_libraries.purge_requested_at` (migration 012); Phase 13 makes such libraries eligible on its next scan instead of after the configured `TrashRetentionDays` (~30d default), so the existing cascade reclaims them within ~the grace period. Grace gate preserved; branches 3/4 are optional accelerators. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01 below. |
-| **Non-Durable, Content-Only Delete Handoff** | 🟡 Confirmed gap (High/Med) | Superadmin paths call `EnqueueLibraryDeletion` via `go fn()`, but it enqueues contents, not `ItemLibraryCascade`; final marker/policy cleanup waits for Phase 13, and global clean-trash also omits the library counter delete. See ISSUE-GC-DELETE-HANDOFF-DURABILITY-01 below. |
+| **Non-Durable, Content-Only Delete Handoff** | 🟢 Resolved (6A/6B, 2026-07-13) | Correctness is durable via `deleted_libraries.purge_requested_at` + Phase 13; the superadmin/platform paths now call `Service.EnqueueLibraryCascade` (identity-matched to Phase 13, a dedup no-op) as a best-effort accelerator, and a lost enqueue costs only latency. See ISSUE-GC-DELETE-HANDOFF-DURABILITY-01 below. |
 | **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Confirmed, benign (Med) | The direct-delete helper does not call `AddDeleteLibraryPolicyQuery`; policy index rows for policy-bearing libraries accumulate. Scanner re-validates and skips, so no mis-processing. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
 | **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
@@ -3652,29 +3652,30 @@ With 6A/6B landed these are latency-only follow-ups, no longer correctness gaps:
 
 ### ISSUE-GC-DELETE-HANDOFF-DURABILITY-01: Permanent-Delete Handoff Is a Fire-and-Forget Goroutine
 
-**Status**: 🟡 Confirmed gap (2026-07-10)
-**Severity**: High/Med — recoverable via marker + Phase 13, but the immediate handoff is not durable
+**Status**: 🟢 Resolved (6A/6B + edge review, 2026-07-13)
+**Severity**: was High/Med — correctness is now durable via the marker; the immediate enqueue is a pure best-effort accelerator
 **Affected**: `PermanentDeleteRepo` (`permanentDeleteResolvedRepo`), `AdminCleanTrashLibraries` (`processAdminTrashCandidates`)
 
-#### Problem
+#### Resolution
 
-The superadmin permanent-delete paths enqueue GC cleanup with
-`runAsyncLibraryDeleteSideEffectFn`, implemented as `go fn()`
-([library_delete_helpers.go:44,82-86,132-136](../internal/api/v2/library_delete_helpers.go#L44)).
-The HTTP response can complete after library-row deletion but before delivery. Moreover,
-`EnqueueLibraryDeletion` calls `EnqueueLibraryContents`; it does **not** enqueue
-`ItemLibraryCascade` ([gc.go:428-431](../internal/gc/gc.go#L428)). The accelerator therefore
-queues commits/fs_objects/artifacts but does not own final marker/policy cleanup. Global
-clean-trash also omits `DeleteLibraryStorageCounter`, unlike `PermanentDeleteRepo`.
+Correctness no longer depends on the fire-and-forget enqueue. Every permanent-delete writer
+stamps the durable `deleted_libraries.purge_requested_at` marker (migration 012); Phase 13 is
+eligible on `purge_requested_at != null OR deleted_at < cutoff` and enqueues the full
+`ItemLibraryCascade` (content + counter + policy + marker cleanup). The superadmin/platform
+paths additionally call `Service.EnqueueLibraryCascade` immediately so reclamation starts on
+the next worker tick instead of after up to a `ScanInterval`. That immediate enqueue is
+**best-effort**: it produces the byte-for-byte-identical row Phase 13 would (so it is a dedup
+no-op, not the old content-only second producer), and if the goroutine is lost to a
+restart/exit the marker still drives Phase 13. The only consequence of a lost enqueue is
+latency (up to one scan), never lost cleanup.
 
-A restart or suite exit can lose the accelerator entirely. The `deleted_libraries` marker plus
-Phase 13 eventually runs the full cascade, but only after retention unless the durable purge
-marker proposed below is implemented.
+#### Historical problem (pre-fix)
 
-#### Fix Direction (branches 6A & 6B)
-
-- 6A: add a durable purge marker (`deleted_libraries.purge_requested_at`) via an incremental migration; make Phase 13 eligible when `purge_requested_at != null OR deleted_at < cutoff`.
-- 6B: stamp the durable marker at all permanent-delete writers; keep the immediate enqueue only as a best-effort accelerator. Do not return 500 after a confirmed hard-delete — recovery lives in the marker.
+The superadmin permanent-delete paths enqueued GC cleanup with `runAsyncLibraryDeleteSideEffectFn`
+(`go fn()`). The old `EnqueueLibraryDeletion` enqueued **contents** (identity = now,
+`LibraryGuardNone`), not `ItemLibraryCascade`, and did not own final marker/policy cleanup, so a
+restart could lose it and the full cascade waited out retention. Replaced by the durable marker +
+identity-matched `EnqueueLibraryCascade`.
 
 #### Related Docs
 

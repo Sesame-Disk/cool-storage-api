@@ -2482,17 +2482,16 @@ func TestGC_SoftDeleteRetentionInvariant_RealCassandra(t *testing.T) {
 	repoID := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("soft-delete-invariant-%d", time.Now().UnixNano()))
 	session := shareProjectionDBForTest(t).Session()
 
-	// Hard-delete every row for this library at the end regardless of its final state, so
-	// the shared keyspace never accumulates a trashed test library (the global cleanup only
-	// sweeps ACTIVE libraries).
-	t.Cleanup(func() {
-		var orgForCleanup string
-		if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgForCleanup); err == nil && orgForCleanup != "" {
-			_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgForCleanup, repoID).Exec()
-		}
-		_ = session.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID).Exec()
-		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, repoID).Exec()
-	})
+	// Capture the org while the library is still active, then fully remove it at the end
+	// through the REAL delete path. A raw DELETE of the canonical rows leaves the admin
+	// projections (libraries_by_org_updated/by_owner/admin_global) behind — and
+	// CountActiveLibraries reads libraries_by_org_updated, so orphaned active rows there
+	// silently inflate the per-org library limit and break unrelated create-library tests.
+	var orgForCleanup string
+	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgForCleanup); err != nil {
+		t.Fatalf("read org for cleanup: %v", err)
+	}
+	t.Cleanup(func() { removeTestLibraryFully(t, adminClient, session, orgForCleanup, repoID) })
 
 	// Ordinary delete == soft delete (trash) via the real API.
 	resp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
@@ -2561,8 +2560,44 @@ func TestGC_SoftDeleteRetentionInvariant_RealCassandra(t *testing.T) {
 	if !restoredDeletedAt.IsZero() {
 		t.Fatal("restored library still has deleted_at set")
 	}
-	// The library is left active and recoverable; t.Cleanup hard-deletes its rows so the
-	// shared keyspace keeps no residue.
+	// The library is left active and recoverable; the registered t.Cleanup removes it via the
+	// real delete path so no canonical row OR admin-projection row leaks into the shared org.
+}
+
+// removeTestLibraryFully deletes a test library through the REAL API delete path (trash →
+// permanent delete), which runs the canonical admin read-model cleanup so every projection
+// row is removed — not just the libraries/libraries_by_id rows a raw CQL delete would touch.
+// It then clears the durable marker plus any immediate library-cascade queue/pending rows.
+// All steps are best-effort so it is safe to call regardless of the library's final state.
+func removeTestLibraryFully(t *testing.T, client *testClient, session *gocql.Session, orgID, repoID string) {
+	t.Helper()
+	// Trash (no-op if already trashed/gone), then permanent-delete so
+	// addDeleteAdminLibraryReadModelQueries clears libraries_by_org_updated/by_owner/admin_global.
+	if r := client.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID)); r != nil {
+		r.Body.Close()
+	}
+	if p := client.Delete(t, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", repoID)); p != nil {
+		p.Body.Close()
+	}
+	_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, repoID).Exec()
+	deleteGCQueueItemsByIdentity(t, orgID, "library_cascade", repoID)
+	orgUUID, err := uuid.Parse(orgID)
+	if err != nil {
+		return
+	}
+	bucket := gcpkg.PendingItemBucket(orgUUID, uuid.Nil, gcpkg.ItemLibraryCascade, repoID)
+	iter := session.Query(`
+		SELECT identity_at FROM gc_pending_items
+		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
+	`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID).Iter()
+	var idAt time.Time
+	for iter.Scan(&idAt) {
+		_ = session.Query(`
+			DELETE FROM gc_pending_items
+			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
+		`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID, idAt).Exec()
+	}
+	_ = iter.Close()
 }
 
 // TestGC_PermanentDeleteWriterStampsPurge_RealCassandra proves the REAL permanent-delete

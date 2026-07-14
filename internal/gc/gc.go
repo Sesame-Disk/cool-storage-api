@@ -446,11 +446,23 @@ func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.U
 // second producer. If this fire-and-forget enqueue is lost (crash/restart), the durable
 // purge_requested_at marker lets Phase 13 recover it. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01.
 func (s *Service) EnqueueLibraryCascade(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, deletedAt time.Time) error {
+	if deletedAt.IsZero() {
+		// deletedAt is the dedup identity shared with Phase 13; a zero value would key the
+		// row differently from the marker's deleted_at and defeat deduplication. Callers
+		// resolve it from the trashed library, so this is a fail-closed guard, not a path.
+		return fmt.Errorf("gc: EnqueueLibraryCascade requires a non-zero deletedAt for %s/%s", orgID, libraryID)
+	}
 	return s.queue.EnqueueBatch([]QueueItem{{
-		OrgID:                 orgID,
+		OrgID: orgID,
+		// QueuedAt and IdentityAt are both the original trash time, set EXPLICITLY (not via
+		// EnqueueBatch's zero-value fallback) so this row is byte-for-byte the one Phase 13
+		// enqueues — same queue key and same pending identity → the later scan is a dedup
+		// no-op. LibraryID is explicitly uuid.Nil because the cascade item is library-independent.
 		QueuedAt:              deletedAt,
+		IdentityAt:            deletedAt,
 		ItemType:              ItemLibraryCascade,
 		ItemID:                libraryID.String(),
+		LibraryID:             uuid.Nil,
 		BlockRepresentationID: blockRepresentationID,
 		StorageClass:          storageClass,
 	}})
