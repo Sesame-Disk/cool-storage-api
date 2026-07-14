@@ -2,15 +2,18 @@ package v2
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 type trashLibraryCandidate struct {
@@ -29,6 +32,18 @@ var (
 	}
 	cleanupLibraryLinksForDeleteFn = func(database *dbpkg.DB, orgID, libraryID string) error {
 		return cleanupLibraryLinks(database, orgID, libraryID)
+	}
+	readPermanentDeleteLibraryStateFn = func(database *dbpkg.DB, orgID, libraryID string, _ time.Time) (dbpkg.LibraryState, error) {
+		return dbpkg.ReadLibraryState(database.Session(), orgID, libraryID)
+	}
+	acquireLibraryHardDeleteLockLeaseFn = func(database *dbpkg.DB, libraryID, leaseToken uuid.UUID) (bool, error) {
+		return gcpkg.AcquireLibraryHardDeleteLockLease(database.Session(), libraryID, leaseToken)
+	}
+	renewLibraryHardDeleteLockLeaseFn = func(database *dbpkg.DB, libraryID, leaseToken uuid.UUID) (bool, error) {
+		return gcpkg.RenewLibraryHardDeleteLockLease(database.Session(), libraryID, leaseToken)
+	}
+	releaseLibraryHardDeleteLockLeaseFn = func(database *dbpkg.DB, libraryID, leaseToken uuid.UUID) error {
+		return gcpkg.ReleaseLibraryHardDeleteLockLease(database.Session(), libraryID, leaseToken)
 	}
 	hardDeleteLibraryRowsFn = func(database *dbpkg.DB, orgID, libraryID, storageClass, blockRepresentationID string, deletedAt time.Time) error {
 		batch := database.Session().Batch(gocql.LoggedBatch)
@@ -65,20 +80,12 @@ var (
 
 var (
 	errDeleteRepresentationUnresolved = errors.New("delete representation unresolved")
+	errDeleteLibraryLinksCleanup      = errors.New("delete library links cleanup")
 	errHardDeleteLibraryReadModel     = errors.New("hard delete library read model")
 	errHardDeleteLibraryBatchExec     = errors.New("hard delete library batch exec")
+	errPermanentDeleteCandidateStale  = errors.New("permanent delete candidate stale")
+	errPermanentDeleteInProgress      = errors.New("permanent delete in progress")
 )
-
-func resolveDeleteRepresentationOrReject(c *gin.Context, database *dbpkg.DB, orgID, libraryID, metricOp, logPrefix string) (string, bool) {
-	blockRepresentationID, err := resolveDeleteBlockRepresentationFn(database, orgID, libraryID)
-	if err == nil {
-		return blockRepresentationID, true
-	}
-	metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues(metricOp).Inc()
-	log.Printf("[%s] refusing to hard-delete %s/%s: block representation unresolved: %v", logPrefix, orgID, libraryID, err)
-	c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare library for permanent deletion"})
-	return "", false
-}
 
 func enqueueLibraryCascadeBestEffort(libEnqueuer LibraryGCEnqueuer, orgID, repoID, blockRepresentationID, storageClass string, deletedAt time.Time) {
 	if libEnqueuer == nil {
@@ -94,17 +101,96 @@ func enqueueLibraryCascadeBestEffort(libEnqueuer LibraryGCEnqueuer, orgID, repoI
 	})
 }
 
+func permanentlyDeleteTrashedLibraryCandidate(database *dbpkg.DB, candidate trashLibraryCandidate, metricOp, logPrefix string, cleanupLinks bool) (string, error) {
+	libraryUUID, err := uuid.Parse(candidate.LibraryID)
+	if err != nil {
+		return "", fmt.Errorf("parse library id %q: %w", candidate.LibraryID, err)
+	}
+
+	leaseToken := uuid.New()
+	acquired, err := acquireLibraryHardDeleteLockLeaseFn(database, libraryUUID, leaseToken)
+	if err != nil {
+		return "", fmt.Errorf("acquire library hard-delete lock for %s/%s: %w", candidate.OrgID, candidate.LibraryID, err)
+	}
+	if !acquired {
+		return "", errPermanentDeleteInProgress
+	}
+	defer func() {
+		if err := releaseLibraryHardDeleteLockLeaseFn(database, libraryUUID, leaseToken); err != nil {
+			log.Printf("[%s] failed to release hard-delete lock for %s/%s: %v", logPrefix, candidate.OrgID, candidate.LibraryID, err)
+		}
+	}()
+
+	state, err := readPermanentDeleteLibraryStateFn(database, candidate.OrgID, candidate.LibraryID, candidate.DeletedAt)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return "", errPermanentDeleteCandidateStale
+	}
+	if err != nil {
+		return "", fmt.Errorf("read canonical library state for %s/%s: %w", candidate.OrgID, candidate.LibraryID, err)
+	}
+	if state.DeletedAt == nil || !state.DeletedAt.Equal(candidate.DeletedAt) {
+		return "", errPermanentDeleteCandidateStale
+	}
+
+	blockRepresentationID, err := resolveDeleteBlockRepresentationFn(database, candidate.OrgID, candidate.LibraryID)
+	if err != nil {
+		metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues(metricOp).Inc()
+		log.Printf("[%s] refusing to hard-delete %s/%s: block representation unresolved: %v", logPrefix, candidate.OrgID, candidate.LibraryID, err)
+		return "", errDeleteRepresentationUnresolved
+	}
+
+	if cleanupLinks {
+		if err := cleanupLibraryLinksForDeleteFn(database, candidate.OrgID, candidate.LibraryID); err != nil {
+			return "", errors.Join(errDeleteLibraryLinksCleanup, err)
+		}
+	}
+
+	owned, err := renewLibraryHardDeleteLockLeaseFn(database, libraryUUID, leaseToken)
+	if err != nil {
+		return "", fmt.Errorf("fence library hard-delete lock for %s/%s: %w", candidate.OrgID, candidate.LibraryID, err)
+	}
+	if !owned {
+		return "", errPermanentDeleteInProgress
+	}
+
+	if err := hardDeleteLibraryRowsFn(database, candidate.OrgID, candidate.LibraryID, candidate.StorageClass, blockRepresentationID, candidate.DeletedAt); err != nil {
+		return "", err
+	}
+	return blockRepresentationID, nil
+}
+
+func writePermanentDeletePreconditionError(c *gin.Context, err error) bool {
+	if errors.Is(err, errPermanentDeleteCandidateStale) {
+		c.JSON(http.StatusConflict, gin.H{"error": "library is no longer in trash"})
+		return true
+	}
+	if errors.Is(err, errPermanentDeleteInProgress) {
+		c.JSON(http.StatusConflict, gin.H{"error": "library permanent delete is already in progress"})
+		return true
+	}
+	return false
+}
+
 func (h *DeletedLibraryHandler) permanentDeleteResolvedRepo(c *gin.Context, orgID, repoID, storageClass string, deletedAt time.Time) {
-	blockRepresentationID, ok := resolveDeleteRepresentationOrReject(c, h.db, orgID, repoID, "permanent_delete", "PermanentDeleteRepo")
-	if !ok {
+	blockRepresentationID, err := permanentlyDeleteTrashedLibraryCandidate(h.db, trashLibraryCandidate{
+		OrgID:        orgID,
+		LibraryID:    repoID,
+		StorageClass: storageClass,
+		DeletedAt:    deletedAt,
+	}, "permanent_delete", "PermanentDeleteRepo", true)
+	if writePermanentDeletePreconditionError(c, err) {
 		return
 	}
-	if err := cleanupLibraryLinksForDeleteFn(h.db, orgID, repoID); err != nil {
+	if errors.Is(err, errDeleteRepresentationUnresolved) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare library for permanent deletion"})
+		return
+	}
+	if errors.Is(err, errDeleteLibraryLinksCleanup) {
 		log.Printf("[PermanentDeleteRepo] Failed to clean share links for %s: %v", repoID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean share links"})
 		return
 	}
-	if err := hardDeleteLibraryRowsFn(h.db, orgID, repoID, storageClass, blockRepresentationID, deletedAt); err != nil {
+	if err != nil {
 		if errors.Is(err, errHardDeleteLibraryReadModel) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
 			return
@@ -127,15 +213,24 @@ func (h *DeletedLibraryHandler) permanentDeleteResolvedRepo(c *gin.Context, orgI
 }
 
 func (h *OrgAdminHandler) deleteResolvedTrashLibrary(c *gin.Context, targetOrgID, repoID, storageClass string, deletedAt time.Time) {
-	blockRepresentationID, ok := resolveDeleteRepresentationOrReject(c, h.db, targetOrgID, repoID, "org_delete_trash_library", "DeleteOrgTrashLibrary")
-	if !ok {
+	blockRepresentationID, err := permanentlyDeleteTrashedLibraryCandidate(h.db, trashLibraryCandidate{
+		OrgID:        targetOrgID,
+		LibraryID:    repoID,
+		StorageClass: storageClass,
+		DeletedAt:    deletedAt,
+	}, "org_delete_trash_library", "DeleteOrgTrashLibrary", true)
+	if writePermanentDeletePreconditionError(c, err) {
 		return
 	}
-	if err := cleanupLibraryLinksForDeleteFn(h.db, targetOrgID, repoID); err != nil {
+	if errors.Is(err, errDeleteRepresentationUnresolved) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare library for permanent deletion"})
+		return
+	}
+	if errors.Is(err, errDeleteLibraryLinksCleanup) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library links"})
 		return
 	}
-	if err := hardDeleteLibraryRowsFn(h.db, targetOrgID, repoID, storageClass, blockRepresentationID, deletedAt); err != nil {
+	if err != nil {
 		if errors.Is(err, errHardDeleteLibraryReadModel) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
 			return
@@ -160,19 +255,23 @@ func (h *OrgAdminHandler) deleteResolvedTrashLibrary(c *gin.Context, targetOrgID
 // a skipped library keeps its live canonical row and is retried on the next clean.
 func (h *OrgAdminHandler) processOrgTrashCandidates(candidates []trashLibraryCandidate, libEnqueuer LibraryGCEnqueuer) (cleaned, failed int) {
 	for _, candidate := range candidates {
-		blockRepresentationID, err := resolveDeleteBlockRepresentationFn(h.db, candidate.OrgID, candidate.LibraryID)
-		if err != nil {
-			metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("org_clean_trash").Inc()
-			log.Printf("[CleanOrgTrashLibraries] skipping hard-delete of %s/%s: block representation unresolved: %v", candidate.OrgID, candidate.LibraryID, err)
+		blockRepresentationID, err := permanentlyDeleteTrashedLibraryCandidate(h.db, candidate, "org_clean_trash", "CleanOrgTrashLibraries", true)
+		if errors.Is(err, errPermanentDeleteCandidateStale) {
+			log.Printf("[CleanOrgTrashLibraries] skipping stale trash candidate %s/%s: canonical deleted_at no longer matches %s", candidate.OrgID, candidate.LibraryID, candidate.DeletedAt.Format(time.RFC3339Nano))
 			failed++
 			continue
 		}
-		if err := cleanupLibraryLinksForDeleteFn(h.db, candidate.OrgID, candidate.LibraryID); err != nil {
+		if errors.Is(err, errPermanentDeleteInProgress) {
+			log.Printf("[CleanOrgTrashLibraries] skipping %s/%s: permanent delete or restore already holds the hard-delete lease", candidate.OrgID, candidate.LibraryID)
+			failed++
+			continue
+		}
+		if errors.Is(err, errDeleteLibraryLinksCleanup) {
 			log.Printf("[CleanOrgTrashLibraries] skipping %s/%s: failed to clean library links: %v", candidate.OrgID, candidate.LibraryID, err)
 			failed++
 			continue
 		}
-		if err := hardDeleteLibraryRowsFn(h.db, candidate.OrgID, candidate.LibraryID, candidate.StorageClass, blockRepresentationID, candidate.DeletedAt); err != nil {
+		if err != nil {
 			log.Printf("[CleanOrgTrashLibraries] failed to delete library %s (org %s): %v", candidate.LibraryID, candidate.OrgID, err)
 			failed++
 			continue
@@ -185,14 +284,18 @@ func (h *OrgAdminHandler) processOrgTrashCandidates(candidates []trashLibraryCan
 
 func (h *AdminHandler) processAdminTrashCandidates(candidates []trashLibraryCandidate, libEnqueuer LibraryGCEnqueuer) (cleaned, failed int) {
 	for _, candidate := range candidates {
-		blockRepresentationID, err := resolveDeleteBlockRepresentationFn(h.db, candidate.OrgID, candidate.LibraryID)
-		if err != nil {
-			metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("admin_clean_trash").Inc()
-			log.Printf("[AdminCleanTrashLibraries] skipping hard-delete of %s/%s: block representation unresolved: %v", candidate.OrgID, candidate.LibraryID, err)
+		blockRepresentationID, err := permanentlyDeleteTrashedLibraryCandidate(h.db, candidate, "admin_clean_trash", "AdminCleanTrashLibraries", false)
+		if errors.Is(err, errPermanentDeleteCandidateStale) {
+			log.Printf("[AdminCleanTrashLibraries] skipping stale trash candidate %s/%s: canonical deleted_at no longer matches %s", candidate.OrgID, candidate.LibraryID, candidate.DeletedAt.Format(time.RFC3339Nano))
 			failed++
 			continue
 		}
-		if err := hardDeleteLibraryRowsFn(h.db, candidate.OrgID, candidate.LibraryID, candidate.StorageClass, blockRepresentationID, candidate.DeletedAt); err != nil {
+		if errors.Is(err, errPermanentDeleteInProgress) {
+			log.Printf("[AdminCleanTrashLibraries] skipping %s/%s: permanent delete or restore already holds the hard-delete lease", candidate.OrgID, candidate.LibraryID)
+			failed++
+			continue
+		}
+		if err != nil {
 			log.Printf("[AdminCleanTrashLibraries] failed to delete library %s (org %s): %v", candidate.LibraryID, candidate.OrgID, err)
 			failed++
 			continue
@@ -207,4 +310,3 @@ func (h *AdminHandler) processAdminTrashCandidates(candidates []trashLibraryCand
 	}
 	return cleaned, failed
 }
-

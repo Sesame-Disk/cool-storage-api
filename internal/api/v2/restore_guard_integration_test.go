@@ -12,6 +12,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
@@ -127,5 +128,56 @@ func TestRestoreDeletedLibrary_RejectsWhenCanonicalRowActive(t *testing.T) {
 	}
 	if !deletedAt.IsZero() {
 		t.Fatal("active library must stay active (deleted_at null) after a rejected restore")
+	}
+}
+
+// While a fresh permanent-delete lease is actively owned, restore must reject
+// instead of clearing deleted_at and resurrecting a library whose hard delete is
+// already in progress.
+func TestRestoreDeletedLibrary_RejectsWhileHardDeleteLeaseOwned(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	deletedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	leaseToken := uuid.New()
+
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, owner_id, name, created_at, updated_at, deleted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "restore-guard-locked",
+		now.Add(-4*time.Hour), now, deletedAt).Exec(); err != nil {
+		t.Fatalf("seed trashed library: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class)
+		VALUES (?, ?, ?, ?)`,
+		libraryID.String(), orgID.String(), deletedAt, "hot").Exec(); err != nil {
+		t.Fatalf("seed deleted_libraries marker: %v", err)
+	}
+	acquired, err := gcpkg.AcquireLibraryHardDeleteLockLease(session, libraryID, leaseToken)
+	if err != nil {
+		t.Fatalf("AcquireLibraryHardDeleteLockLease: %v", err)
+	}
+	if !acquired {
+		t.Fatal("expected to acquire fresh library hard-delete lock")
+	}
+	t.Cleanup(func() {
+		_ = gcpkg.ReleaseLibraryHardDeleteLockLease(session, libraryID, leaseToken)
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	if err := restoreDeletedLibrary(db, orgID.String(), ownerID.String(), libraryID.String()); err == nil {
+		t.Fatal("restore must reject while the library hard-delete lease is actively owned")
+	}
+
+	var canonicalDeletedAt time.Time
+	if err := session.Query(`SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID.String(), libraryID.String()).Scan(&canonicalDeletedAt); err != nil {
+		t.Fatalf("read trashed library after rejected restore: %v", err)
+	}
+	if !canonicalDeletedAt.Equal(deletedAt) {
+		t.Fatalf("deleted_at = %s, want %s after rejected restore", canonicalDeletedAt, deletedAt)
 	}
 }
