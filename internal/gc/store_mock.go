@@ -365,6 +365,7 @@ type mockDeletedLibrary struct {
 	BlockRepresentationID string
 	StorageClass          string
 	DeletedAt             time.Time
+	PurgeRequestedAt      time.Time
 }
 
 type mockStorageCounterReconciliation struct {
@@ -1015,6 +1016,16 @@ func (m *MockStore) AddDeletedLibrary(orgID, libraryID uuid.UUID, storageClass s
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass}
 	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass, DeletedAt: deletedAt}
+}
+
+// AddPurgeRequestedDeletedLibrary adds a permanently-deleted library marker whose
+// canonical libraries row is already gone and whose purge_requested_at is set, so
+// Phase 13 must treat it as eligible on its next scan regardless of deleted_at (the
+// worker still grace-gates the enqueued cascade before processing).
+func (m *MockStore) AddPurgeRequestedDeletedLibrary(orgID, libraryID uuid.UUID, storageClass string, deletedAt, purgeRequestedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass, DeletedAt: deletedAt, PurgeRequestedAt: purgeRequestedAt}
 }
 
 // AddShareByUser adds a share received by a user.
@@ -2813,13 +2824,14 @@ func (m *MockStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLib
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)
 	var result []DeletedLibraryInfo
 	for _, dl := range m.deletedLibraries {
-		if dl.DeletedAt.Before(cutoff) {
+		if !dl.PurgeRequestedAt.IsZero() || dl.DeletedAt.Before(cutoff) {
 			result = append(result, DeletedLibraryInfo{
 				OrgID:                 dl.OrgID,
 				LibraryID:             dl.LibraryID,
 				BlockRepresentationID: strings.TrimSpace(dl.BlockRepresentationID),
 				StorageClass:          dl.StorageClass,
 				DeletedAt:             dl.DeletedAt,
+				PurgeRequestedAt:      dl.PurgeRequestedAt,
 			})
 		}
 	}

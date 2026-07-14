@@ -1259,6 +1259,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 					OrgID:        orgID,
 					LibraryID:    libID,
 					StorageClass: storageClass,
+					DeletedAt:    deletedAt,
 				})
 			}
 		}

@@ -2,6 +2,7 @@ package api
 
 import (
 	"log"
+	"time"
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -41,8 +42,10 @@ type gcLibraryEnqueuer struct {
 	service *gc.Service
 }
 
-// EnqueueLibraryDeletion enqueues all contents of a library for GC.
-func (e *gcLibraryEnqueuer) EnqueueLibraryDeletion(orgID, libraryID string, storageClass string) {
+// EnqueueLibraryCascade immediately queues the durable library cascade for a permanently
+// deleted library (deduplicated against Phase 13). Best-effort: on failure the durable
+// purge_requested_at marker still drives the cascade on the next scan.
+func (e *gcLibraryEnqueuer) EnqueueLibraryCascade(orgID, libraryID, blockRepresentationID, storageClass string, deletedAt time.Time) {
 	orgUUID, err := uuid.Parse(orgID)
 	if err != nil {
 		log.Printf("[GC Adapter] Invalid org_id %q: %v", orgID, err)
@@ -53,8 +56,8 @@ func (e *gcLibraryEnqueuer) EnqueueLibraryDeletion(orgID, libraryID string, stor
 		log.Printf("[GC Adapter] Invalid library_id %q: %v", libraryID, err)
 		return
 	}
-	if err := e.service.EnqueueLibraryDeletion(orgUUID, libUUID, storageClass); err != nil {
-		log.Printf("[GC Adapter] Failed to enqueue library %s deletion: %v", libraryID, err)
+	if err := e.service.EnqueueLibraryCascade(orgUUID, libUUID, blockRepresentationID, storageClass, deletedAt); err != nil {
+		log.Printf("[GC Adapter] Failed to enqueue library %s cascade: %v", libraryID, err)
 	}
 }
 

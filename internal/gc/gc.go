@@ -435,9 +435,37 @@ func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.U
 	return nil
 }
 
-// EnqueueLibraryDeletion enqueues all contents of a library for GC.
-func (s *Service) EnqueueLibraryDeletion(orgID, libraryID uuid.UUID, storageClass string) error {
-	return s.worker.EnqueueLibraryContents(orgID, libraryID, storageClass)
+// EnqueueLibraryCascade immediately queues the full library-cascade GC item for a
+// permanently deleted library, so reclamation can start on the next worker tick instead of
+// waiting up to a full ScanInterval (default 24h) for Phase 13 to discover the marker.
+//
+// It mirrors scanner Phase 13 exactly — QueuedAt = deletedAt (the original trash time, so
+// the grace gate is measured from the same event and long-trashed libraries process
+// promptly), LibraryID nil, same representation — so this immediate enqueue and any later
+// scan produce the IDENTICAL queue/pending row: the second write is a dedup no-op, never a
+// second producer. If this fire-and-forget enqueue is lost (crash/restart), the durable
+// purge_requested_at marker lets Phase 13 recover it. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01.
+func (s *Service) EnqueueLibraryCascade(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, deletedAt time.Time) error {
+	if deletedAt.IsZero() {
+		// deletedAt is the dedup identity shared with Phase 13; a zero value would key the
+		// row differently from the marker's deleted_at and defeat deduplication. Callers
+		// resolve it from the trashed library, so this is a fail-closed guard, not a path.
+		return fmt.Errorf("gc: EnqueueLibraryCascade requires a non-zero deletedAt for %s/%s", orgID, libraryID)
+	}
+	return s.queue.EnqueueBatch([]QueueItem{{
+		OrgID: orgID,
+		// QueuedAt and IdentityAt are both the original trash time, set EXPLICITLY (not via
+		// EnqueueBatch's zero-value fallback) so this row is byte-for-byte the one Phase 13
+		// enqueues — same queue key and same pending identity → the later scan is a dedup
+		// no-op. LibraryID is explicitly uuid.Nil because the cascade item is library-independent.
+		QueuedAt:              deletedAt,
+		IdentityAt:            deletedAt,
+		ItemType:              ItemLibraryCascade,
+		ItemID:                libraryID.String(),
+		LibraryID:             uuid.Nil,
+		BlockRepresentationID: blockRepresentationID,
+		StorageClass:          storageClass,
+	}})
 }
 
 // EnqueueCommits enqueues specific commits for GC deletion (used by CleanRepoTrash).

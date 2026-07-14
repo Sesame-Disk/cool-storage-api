@@ -37,8 +37,11 @@ func apiPermission(perm middleware.LibraryPermission) string {
 
 // LibraryGCEnqueuer is the interface for enqueuing library contents for garbage collection.
 type LibraryGCEnqueuer interface {
-	// EnqueueLibraryDeletion enqueues all commits, fs_objects, and blocks for a deleted library.
-	EnqueueLibraryDeletion(orgID, libraryID string, storageClass string)
+	// EnqueueLibraryCascade immediately queues the durable library cascade for a permanently
+	// deleted library, deduplicated against scanner Phase 13 (same deletedAt identity), so
+	// reclamation starts promptly instead of after up to a full ScanInterval. Best-effort:
+	// the durable purge_requested_at marker recovers it if this enqueue is lost.
+	EnqueueLibraryCascade(orgID, libraryID, blockRepresentationID, storageClass string, deletedAt time.Time)
 }
 
 // LibraryHandler handles library-related API requests
