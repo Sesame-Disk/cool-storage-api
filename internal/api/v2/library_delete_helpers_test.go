@@ -387,3 +387,201 @@ func TestAdminCleanTrashLibraries_PartialSuccessLeavesBadLibraryUntouched(t *tes
 		t.Fatalf("library-cascade enqueue calls = %#v, want only repo-good", libEnq.calls)
 	}
 }
+
+// The following tests cover the org-admin BULK clean-trash loop (processOrgTrashCandidates)
+// with explicit candidates — the same coverage the flawed org-wide E2E attempted, but with
+// no org-wide SELECT and no shared-org side effects, mirroring the admin-path tests above.
+
+func TestProcessOrgTrashCandidates_SkipsRepresentationFailuresWithoutSideEffects(t *testing.T) {
+	installDeleteHelperStubs(t)
+
+	var cleanupLinksCalled, hardDeleteCalled int
+	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, libraryID string) (string, error) {
+		if libraryID == "repo-bad" {
+			return "", errors.New("corrupt representation")
+		}
+		return db.PlainBlockRepresentationID, nil
+	}
+	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
+		cleanupLinksCalled++
+		return nil
+	}
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+		hardDeleteCalled++
+		return nil
+	}
+	libEnq := &mockLibraryGCEnqueuer{}
+	h := &OrgAdminHandler{db: &db.DB{}, gcEnqueuer: libEnq}
+
+	cleaned, failed := h.processOrgTrashCandidates([]trashLibraryCandidate{{
+		OrgID:        "org-1",
+		LibraryID:    "repo-bad",
+		StorageClass: "hot",
+	}}, libEnq)
+
+	if cleaned != 0 || failed != 1 {
+		t.Fatalf("processOrgTrashCandidates() = (cleaned=%d, failed=%d), want (0, 1)", cleaned, failed)
+	}
+	if cleanupLinksCalled != 0 || hardDeleteCalled != 0 || len(libEnq.calls) != 0 {
+		t.Fatalf("side effects ran for library skipped before hard-delete: cleanupLinks=%d hardDelete=%d enqueues=%#v",
+			cleanupLinksCalled, hardDeleteCalled, libEnq.calls)
+	}
+}
+
+func TestProcessOrgTrashCandidates_LinkCleanupFailureSkipsWithoutHardDelete(t *testing.T) {
+	installDeleteHelperStubs(t)
+
+	var hardDeleteCalled int
+	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, _ string) (string, error) {
+		return db.PlainBlockRepresentationID, nil
+	}
+	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
+		return errors.New("link cleanup failed")
+	}
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+		hardDeleteCalled++
+		return nil
+	}
+	libEnq := &mockLibraryGCEnqueuer{}
+	h := &OrgAdminHandler{db: &db.DB{}, gcEnqueuer: libEnq}
+
+	cleaned, failed := h.processOrgTrashCandidates([]trashLibraryCandidate{{
+		OrgID:        "org-1",
+		LibraryID:    "repo-links-fail",
+		StorageClass: "hot",
+	}}, libEnq)
+
+	if cleaned != 0 || failed != 1 {
+		t.Fatalf("processOrgTrashCandidates() = (cleaned=%d, failed=%d), want (0, 1)", cleaned, failed)
+	}
+	// A link-cleanup failure must skip THIS library (leaving its canonical row live and
+	// restorable) without hard-deleting or enqueuing — never abort the whole batch.
+	if hardDeleteCalled != 0 || len(libEnq.calls) != 0 {
+		t.Fatalf("hard-delete/enqueue ran after link cleanup failed: hardDelete=%d enqueues=%#v",
+			hardDeleteCalled, libEnq.calls)
+	}
+}
+
+func TestProcessOrgTrashCandidates_HardDeleteFailureSkipsEnqueue(t *testing.T) {
+	installDeleteHelperStubs(t)
+
+	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, _ string) (string, error) {
+		return db.PlainBlockRepresentationID, nil
+	}
+	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
+		return nil
+	}
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+		return errors.New("batch exec failed")
+	}
+	libEnq := &mockLibraryGCEnqueuer{}
+	h := &OrgAdminHandler{db: &db.DB{}, gcEnqueuer: libEnq}
+
+	cleaned, failed := h.processOrgTrashCandidates([]trashLibraryCandidate{{
+		OrgID:        "org-1",
+		LibraryID:    "repo-batch-fail",
+		StorageClass: "hot",
+	}}, libEnq)
+
+	if cleaned != 0 || failed != 1 {
+		t.Fatalf("processOrgTrashCandidates() = (cleaned=%d, failed=%d), want (0, 1)", cleaned, failed)
+	}
+	if len(libEnq.calls) != 0 {
+		t.Fatalf("cascade enqueue ran after failed hard delete: %#v", libEnq.calls)
+	}
+}
+
+func TestProcessOrgTrashCandidates_PartialSuccessLeavesBadLibraryUntouched(t *testing.T) {
+	installDeleteHelperStubs(t)
+
+	var hardDeleteCalls []string
+	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, libraryID string) (string, error) {
+		if libraryID == "repo-bad" {
+			return "", errors.New("corrupt representation")
+		}
+		return db.PlainBlockRepresentationID, nil
+	}
+	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
+		return nil
+	}
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, libraryID, _, _ string, _ time.Time) error {
+		hardDeleteCalls = append(hardDeleteCalls, libraryID)
+		return nil
+	}
+	libEnq := &mockLibraryGCEnqueuer{}
+	h := &OrgAdminHandler{db: &db.DB{}, gcEnqueuer: libEnq}
+
+	cleaned, failed := h.processOrgTrashCandidates([]trashLibraryCandidate{
+		{OrgID: "org-1", LibraryID: "repo-good", StorageClass: "hot"},
+		{OrgID: "org-1", LibraryID: "repo-bad", StorageClass: "hot"},
+	}, libEnq)
+
+	if cleaned != 1 || failed != 1 {
+		t.Fatalf("processOrgTrashCandidates() = (cleaned=%d, failed=%d), want (1, 1)", cleaned, failed)
+	}
+	if strings.Join(hardDeleteCalls, ",") != "repo-good" {
+		t.Fatalf("hard-delete calls = %#v, want only repo-good", hardDeleteCalls)
+	}
+	if len(libEnq.calls) != 1 || libEnq.calls[0].libraryID != "repo-good" {
+		t.Fatalf("library-cascade enqueue calls = %#v, want only repo-good", libEnq.calls)
+	}
+}
+
+func TestProcessOrgTrashCandidates_SuccessEnqueuesDedupCascadePreservingDeletedAt(t *testing.T) {
+	installDeleteHelperStubs(t)
+
+	resolved := db.PlainBlockRepresentationID
+	wantDeletedAt := time.Now().Add(-96 * time.Hour).UTC().Truncate(time.Millisecond)
+	var gotRepresentation string
+	var gotWriterDeletedAt time.Time
+	var cleanupLinksCalled int
+	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, _ string) (string, error) {
+		return resolved, nil
+	}
+	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
+		cleanupLinksCalled++
+		return nil
+	}
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, deletedAt time.Time) error {
+		gotRepresentation = blockRepresentationID
+		gotWriterDeletedAt = deletedAt
+		return nil
+	}
+	libEnq := &mockLibraryGCEnqueuer{}
+	h := &OrgAdminHandler{db: &db.DB{}, gcEnqueuer: libEnq}
+
+	cleaned, failed := h.processOrgTrashCandidates([]trashLibraryCandidate{{
+		OrgID:        "org-1",
+		LibraryID:    "repo-1",
+		StorageClass: "hot",
+		DeletedAt:    wantDeletedAt,
+	}}, libEnq)
+
+	if cleaned != 1 || failed != 0 {
+		t.Fatalf("processOrgTrashCandidates() = (cleaned=%d, failed=%d), want (1, 0)", cleaned, failed)
+	}
+	if cleanupLinksCalled != 1 {
+		t.Fatalf("cleanup links called %d times, want 1", cleanupLinksCalled)
+	}
+	if gotRepresentation != resolved {
+		t.Fatalf("hard-delete marker representation = %q, want %q", gotRepresentation, resolved)
+	}
+	// The bulk writer must preserve the ORIGINAL trash time so the immediate cascade shares
+	// Phase 13's dedup identity — never reset to now().
+	if !gotWriterDeletedAt.Equal(wantDeletedAt) {
+		t.Fatalf("writer deleted_at = %s, want the original trash time %s (must not be reset)", gotWriterDeletedAt, wantDeletedAt)
+	}
+	if len(libEnq.calls) != 1 {
+		t.Fatalf("expected exactly one immediate library-cascade enqueue, got %#v", libEnq.calls)
+	}
+	got := libEnq.calls[0]
+	if got.orgID != "org-1" || got.libraryID != "repo-1" || got.storageClass != "hot" {
+		t.Fatalf("cascade enqueue identity = %#v, want org-1/repo-1/hot", got)
+	}
+	if got.blockRepresentationID != resolved {
+		t.Fatalf("cascade enqueue representation = %q, want %q", got.blockRepresentationID, resolved)
+	}
+	if !got.deletedAt.Equal(wantDeletedAt) {
+		t.Fatalf("cascade enqueue deleted_at = %s, want %s (dedup identity must match Phase 13)", got.deletedAt, wantDeletedAt)
+	}
+}

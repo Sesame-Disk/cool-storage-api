@@ -2821,60 +2821,10 @@ func TestGC_PermanentDeleteWriterStampsPurge_RealCassandra(t *testing.T) {
 	}
 }
 
-// TestGC_OrgAdminCleanTrash_ImmediatelyEnqueuesLibraryCascade_RealCassandra covers the
-// org-admin BULK permanent-delete path (DELETE /org/:org_id/admin/trash-libraries/,
-// CleanOrgTrashLibraries) end-to-end: each cleaned library must hard-delete its canonical
-// rows, stamp purge_requested_at, and get the immediate deduplicated ItemLibraryCascade
-// enqueued — the same durable-cascade wiring as the single-delete path, exercised over the
-// bulk loop that has its own inline implementation.
-func TestGC_OrgAdminCleanTrash_ImmediatelyEnqueuesLibraryCascade_RealCassandra(t *testing.T) {
-	requireCassandra(t)
-	session := shareProjectionDBForTest(t).Session()
-
-	// adminClient is an org admin for defaultOrgID and owns the libraries it creates there.
-	repo1 := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("org-clean-bulk-1-%d", time.Now().UnixNano()))
-	repo2 := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("org-clean-bulk-2-%d", time.Now().UnixNano()))
-	repos := []string{repo1, repo2}
-
-	for _, r := range repos {
-		resp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", r))
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("trash library %s: status=%d body=%s", r, resp.StatusCode, responseBody(t, resp))
-		}
-		resp.Body.Close()
-	}
-	t.Cleanup(func() {
-		for _, r := range repos {
-			cleanupDisposableLibraryDeleteState(t, session, defaultOrgID, r)
-		}
-	})
-
-	// Org-admin bulk clean-trash: permanently deletes every trashed library in the org.
-	cleanResp := adminClient.Do(t, http.MethodDelete, fmt.Sprintf("/api/v2.1/org/%s/admin/trash-libraries/", defaultOrgID), nil)
-	if cleanResp.StatusCode != http.StatusOK {
-		t.Fatalf("org-admin clean-trash: status=%d body=%s", cleanResp.StatusCode, responseBody(t, cleanResp))
-	}
-	cleanResp.Body.Close()
-
-	for _, r := range repos {
-		// Canonical rows are hard-deleted.
-		var goneOrg string
-		if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, r).Scan(&goneOrg); !errors.Is(err, gocql.ErrNotFound) {
-			t.Fatalf("expected libraries_by_id gone for %s after bulk clean, got err=%v", r, err)
-		}
-		// The permanent-delete marker carries purge_requested_at.
-		var purge time.Time
-		if err := session.Query(`SELECT purge_requested_at FROM deleted_libraries WHERE library_id = ?`, r).Scan(&purge); err != nil {
-			t.Fatalf("read marker for %s: %v", r, err)
-		}
-		if purge.IsZero() {
-			t.Fatalf("bulk-clean marker for %s missing purge_requested_at", r)
-		}
-		// The immediate library_cascade enqueue is fire-and-forget; poll for it to land.
-		if !pollUntil(t, 8*time.Second, 200*time.Millisecond, func() bool {
-			return gcQueueItemExists(t, defaultOrgID, "library_cascade", r)
-		}) {
-			t.Fatalf("org-admin bulk clean did not enqueue an immediate library_cascade for %s", r)
-		}
-	}
-}
+// NOTE: The org-admin BULK clean-trash path (DELETE /org/:org_id/admin/trash-libraries/,
+// CleanOrgTrashLibraries) is covered by unit tests over its per-library processor
+// (processOrgTrashCandidates) in internal/api/v2/library_delete_helpers_test.go. Those drive
+// the bulk loop with EXPLICIT candidates, so they assert the hard-delete + purge_requested_at
+// marker + immediate deduplicated library_cascade wiring without the org-wide SELECT that a
+// real-Cassandra E2E against the shared defaultOrgID would run — which would permanently
+// delete every OTHER test's trashed library in that org and leak their GC coordination state.

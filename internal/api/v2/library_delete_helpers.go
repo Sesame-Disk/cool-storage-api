@@ -147,6 +147,42 @@ func (h *OrgAdminHandler) deleteResolvedTrashLibrary(c *gin.Context, targetOrgID
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
+// processOrgTrashCandidates hard-deletes each candidate trashed library for the org-admin
+// bulk clean-trash path and enqueues its durable, deduplicated library cascade — the same
+// shared-writer wiring as the single-library org-admin delete (deleteResolvedTrashLibrary),
+// run over an explicit candidate list. Splitting it from the org-wide SELECT lets the bulk
+// loop be exercised with explicit candidates in tests without triggering org-wide side
+// effects, and mirrors processAdminTrashCandidates so the two bulk paths cannot drift.
+//
+// Unlike the admin path it also cleans the library's share/upload links (org bulk always
+// has). A per-library failure (unresolved block representation, link cleanup, or hard-delete)
+// is counted and skipped so one bad library never strands the rest or aborts the whole batch;
+// a skipped library keeps its live canonical row and is retried on the next clean.
+func (h *OrgAdminHandler) processOrgTrashCandidates(candidates []trashLibraryCandidate, libEnqueuer LibraryGCEnqueuer) (cleaned, failed int) {
+	for _, candidate := range candidates {
+		blockRepresentationID, err := resolveDeleteBlockRepresentationFn(h.db, candidate.OrgID, candidate.LibraryID)
+		if err != nil {
+			metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("org_clean_trash").Inc()
+			log.Printf("[CleanOrgTrashLibraries] skipping hard-delete of %s/%s: block representation unresolved: %v", candidate.OrgID, candidate.LibraryID, err)
+			failed++
+			continue
+		}
+		if err := cleanupLibraryLinksForDeleteFn(h.db, candidate.OrgID, candidate.LibraryID); err != nil {
+			log.Printf("[CleanOrgTrashLibraries] skipping %s/%s: failed to clean library links: %v", candidate.OrgID, candidate.LibraryID, err)
+			failed++
+			continue
+		}
+		if err := hardDeleteLibraryRowsFn(h.db, candidate.OrgID, candidate.LibraryID, candidate.StorageClass, blockRepresentationID, candidate.DeletedAt); err != nil {
+			log.Printf("[CleanOrgTrashLibraries] failed to delete library %s (org %s): %v", candidate.LibraryID, candidate.OrgID, err)
+			failed++
+			continue
+		}
+		enqueueLibraryCascadeBestEffort(libEnqueuer, candidate.OrgID, candidate.LibraryID, blockRepresentationID, candidate.StorageClass, candidate.DeletedAt)
+		cleaned++
+	}
+	return cleaned, failed
+}
+
 func (h *AdminHandler) processAdminTrashCandidates(candidates []trashLibraryCandidate, libEnqueuer LibraryGCEnqueuer) (cleaned, failed int) {
 	for _, candidate := range candidates {
 		blockRepresentationID, err := resolveDeleteBlockRepresentationFn(h.db, candidate.OrgID, candidate.LibraryID)
