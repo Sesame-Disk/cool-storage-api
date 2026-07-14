@@ -3615,6 +3615,11 @@ best-effort enqueue is lost, Phase 13 recovers it on the next scan. The legacy
 marker-only recovery path. Normal soft-delete leaves `purge_requested_at` null and keeps the
 retention behavior unchanged.
 
+**Restore/delete race follow-up (landed):** the permanent-delete path now keeps the shared
+library hard-delete lease alive for the entire share/upload-link cleanup window before the final
+hard-delete batch. That closes the stale-lease hole where a very long link cleanup could let
+`restoreDeletedLibrary` steal the lease and restore the repo after links were already removed.
+
 The org-admin follow-up deliberately uses the same durable `ItemLibraryCascade`, not a separate
 content-only accelerator, so every producer shares one identity and Phase 13 remains the only
 recovery path needed.
@@ -3680,6 +3685,39 @@ identity-matched `EnqueueLibraryCascade`.
 #### Related Docs
 
 - `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (P2)
+
+---
+
+### ISSUE-TRASH-RESTORE-CONFLICT-STATUS-01: Restore/Delete Precondition Conflicts Surface as 500
+
+**Status**: 🟡 Confirmed, pending API polish (2026-07-14)
+**Severity**: Low — no data-loss or GC safety issue, but expected restore/delete races are exposed as generic server errors
+**Affected**: `PUT /api/v2.1/repos/deleted/:repo_id/` (`RestoreDeletedRepo`), `PUT /org/:org_id/admin/trash-libraries/:rid/` (`RestoreOrgTrashLibrary`)
+
+#### Problem
+
+`restoreDeletedLibrary()` now distinguishes normal precondition outcomes under the shared
+hard-delete lease:
+
+- the canonical row is already gone (`"library is pending permanent deletion"`),
+- the canonical row is active (`"library is not in trash"`),
+- or the restore lost the lease before its batch (`"lost library restore lock ..."`).
+
+The HTTP handlers still flatten all of those errors to `500 {"error":"failed to restore library"}`.
+That makes a normal restore/delete race look like a server fault and hides useful client-visible
+state.
+
+#### Fix direction
+
+- Map `pending permanent deletion` / lost-lease contention to `409 Conflict`.
+- Map `library is not in trash` to `400 Bad Request`.
+- Preserve `500` only for real storage/DB failures.
+
+#### Notes
+
+This is intentionally tracked as API debt only. The underlying GC/restore safety is already
+fail-closed because restore re-checks the canonical row under the same stale-aware hard-delete
+lease before writing.
 
 ---
 

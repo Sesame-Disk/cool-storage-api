@@ -46,6 +46,7 @@ func installDeleteHelperStubs(t *testing.T) {
 	oldCleanupTags := cleanupAllLibraryTagsForDeleteFn
 	oldDeleteStorageCounter := deleteLibraryStorageCounterForDeleteFn
 	oldRunAsync := runAsyncLibraryDeleteSideEffectFn
+	oldLeaseHeartbeatInterval := permanentDeleteLeaseHeartbeatInterval
 	t.Cleanup(func() {
 		resolveDeleteBlockRepresentationFn = oldResolve
 		cleanupLibraryLinksForDeleteFn = oldCleanupLinks
@@ -57,6 +58,7 @@ func installDeleteHelperStubs(t *testing.T) {
 		cleanupAllLibraryTagsForDeleteFn = oldCleanupTags
 		deleteLibraryStorageCounterForDeleteFn = oldDeleteStorageCounter
 		runAsyncLibraryDeleteSideEffectFn = oldRunAsync
+		permanentDeleteLeaseHeartbeatInterval = oldLeaseHeartbeatInterval
 	})
 	readPermanentDeleteLibraryStateFn = func(_ *db.DB, orgID, libraryID string, expectedDeletedAt time.Time) (db.LibraryState, error) {
 		deletedAt := expectedDeletedAt
@@ -66,6 +68,106 @@ func installDeleteHelperStubs(t *testing.T) {
 	renewLibraryHardDeleteLockLeaseFn = func(_ *db.DB, _, _ uuid.UUID) (bool, error) { return true, nil }
 	releaseLibraryHardDeleteLockLeaseFn = func(_ *db.DB, _, _ uuid.UUID) error { return nil }
 	runAsyncLibraryDeleteSideEffectFn = func(fn func()) { fn() }
+}
+
+func TestPermanentDeleteResolvedRepo_KeepsLeaseAliveDuringLinkCleanup(t *testing.T) {
+	installDeleteHelperStubs(t)
+	repoID := uuid.NewString()
+	permanentDeleteLeaseHeartbeatInterval = time.Millisecond
+
+	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, _ string) (string, error) {
+		return db.PlainBlockRepresentationID, nil
+	}
+	renewedDuringCleanup := make(chan struct{}, 1)
+	renewLibraryHardDeleteLockLeaseFn = func(_ *db.DB, _, _ uuid.UUID) (bool, error) {
+		select {
+		case renewedDuringCleanup <- struct{}{}:
+		default:
+		}
+		return true, nil
+	}
+	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
+		select {
+		case <-renewedDuringCleanup:
+			return nil
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("timed out waiting for lease heartbeat during link cleanup")
+			return nil
+		}
+	}
+	hardDeleteCalled := 0
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+		hardDeleteCalled++
+		return nil
+	}
+	cleanupAllLibraryTagsForDeleteFn = func(_ *db.DB, _ string) error { return nil }
+	deleteLibraryStorageCounterForDeleteFn = func(_ traffic.DBSession, _, _ string) error { return nil }
+	h := &DeletedLibraryHandler{db: &db.DB{}}
+	c, w := newDeleteTestContext(http.MethodDelete, "/api/v2.1/repos/deleted/"+repoID+"/")
+
+	h.permanentDeleteResolvedRepo(c, "org-1", repoID, "hot", time.Now().UTC())
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if hardDeleteCalled != 1 {
+		t.Fatalf("hardDeleteCalled = %d, want 1", hardDeleteCalled)
+	}
+}
+
+func TestPermanentDeleteResolvedRepo_RejectsWhenLeaseIsLostDuringLinkCleanup(t *testing.T) {
+	installDeleteHelperStubs(t)
+	repoID := uuid.NewString()
+	permanentDeleteLeaseHeartbeatInterval = time.Millisecond
+
+	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, _ string) (string, error) {
+		return db.PlainBlockRepresentationID, nil
+	}
+	lostLease := make(chan struct{})
+	renewCalls := 0
+	renewLibraryHardDeleteLockLeaseFn = func(_ *db.DB, _, _ uuid.UUID) (bool, error) {
+		renewCalls++
+		if renewCalls >= 2 {
+			select {
+			case <-lostLease:
+			default:
+				close(lostLease)
+			}
+			return false, nil
+		}
+		return true, nil
+	}
+	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
+		select {
+		case <-lostLease:
+			return nil
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("timed out waiting for lease loss during link cleanup")
+			return nil
+		}
+	}
+	hardDeleteCalled := 0
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+		hardDeleteCalled++
+		return nil
+	}
+	cleanupAllLibraryTagsForDeleteFn = func(_ *db.DB, _ string) error { return nil }
+	deleteLibraryStorageCounterForDeleteFn = func(_ traffic.DBSession, _, _ string) error { return nil }
+	h := &DeletedLibraryHandler{db: &db.DB{}}
+	c, w := newDeleteTestContext(http.MethodDelete, "/api/v2.1/repos/deleted/"+repoID+"/")
+
+	h.permanentDeleteResolvedRepo(c, "org-1", repoID, "hot", time.Now().UTC())
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusConflict, w.Body.String())
+	}
+	payload := decodeDeleteTestJSON(t, w)
+	if payload["error"] != "library permanent delete is already in progress" {
+		t.Fatalf("error = %v, want %q", payload["error"], "library permanent delete is already in progress")
+	}
+	if hardDeleteCalled != 0 {
+		t.Fatalf("hardDeleteCalled = %d, want 0", hardDeleteCalled)
+	}
 }
 
 func TestPermanentDeleteResolvedRepo_FailClosedOnRepresentationError(t *testing.T) {

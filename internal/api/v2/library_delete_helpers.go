@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
@@ -78,6 +79,69 @@ var (
 	runAsyncLibraryDeleteSideEffectFn      = func(fn func()) { go fn() }
 )
 
+// Match the GC worker's hard-delete lease heartbeat cadence so API-side permanent deletes stay
+// fresh under the same stale-takeover model during long link cleanup.
+var permanentDeleteLeaseHeartbeatInterval = 30 * time.Minute
+
+type permanentDeleteLeaseHeartbeat struct {
+	stopCh    chan struct{}
+	closedCh  chan struct{}
+	closeOnce sync.Once
+
+	mu  sync.Mutex
+	err error
+}
+
+func startPermanentDeleteLeaseHeartbeat(target string, renew func() (bool, error)) *permanentDeleteLeaseHeartbeat {
+	heartbeat := &permanentDeleteLeaseHeartbeat{
+		stopCh:   make(chan struct{}),
+		closedCh: make(chan struct{}),
+	}
+	go func() {
+		defer close(heartbeat.closedCh)
+		ticker := time.NewTicker(permanentDeleteLeaseHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeat.stopCh:
+				return
+			case <-ticker.C:
+				owned, err := renew()
+				if err != nil {
+					heartbeat.setErr(fmt.Errorf("renew library hard-delete lock for %s during permanent delete: %w", target, err))
+					return
+				}
+				if !owned {
+					heartbeat.setErr(errPermanentDeleteInProgress)
+					return
+				}
+			}
+		}
+	}()
+	return heartbeat
+}
+
+func (h *permanentDeleteLeaseHeartbeat) setErr(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.err == nil {
+		h.err = err
+	}
+}
+
+func (h *permanentDeleteLeaseHeartbeat) Check() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.err
+}
+
+func (h *permanentDeleteLeaseHeartbeat) Close() {
+	h.closeOnce.Do(func() {
+		close(h.stopCh)
+		<-h.closedCh
+	})
+}
+
 var (
 	errDeleteRepresentationUnresolved = errors.New("delete representation unresolved")
 	errDeleteLibraryLinksCleanup      = errors.New("delete library links cleanup")
@@ -139,9 +203,21 @@ func permanentlyDeleteTrashedLibraryCandidate(database *dbpkg.DB, candidate tras
 		return "", errDeleteRepresentationUnresolved
 	}
 
+	var leaseHeartbeat *permanentDeleteLeaseHeartbeat
 	if cleanupLinks {
+		// Keep the shared hard-delete lease alive for the entire link-cleanup window so a
+		// restore cannot steal a stale lease and revive the library after link rows were
+		// already deleted but before the hard-delete batch runs.
+		leaseHeartbeat = startPermanentDeleteLeaseHeartbeat(candidate.OrgID+"/"+candidate.LibraryID, func() (bool, error) {
+			return renewLibraryHardDeleteLockLeaseFn(database, libraryUUID, leaseToken)
+		})
+		defer leaseHeartbeat.Close()
 		if err := cleanupLibraryLinksForDeleteFn(database, candidate.OrgID, candidate.LibraryID); err != nil {
 			return "", errors.Join(errDeleteLibraryLinksCleanup, err)
+		}
+		leaseHeartbeat.Close()
+		if err := leaseHeartbeat.Check(); err != nil {
+			return "", err
 		}
 	}
 

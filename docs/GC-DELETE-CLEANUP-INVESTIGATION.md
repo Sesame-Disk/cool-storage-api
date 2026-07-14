@@ -344,9 +344,13 @@ re-discovered by scanner Phase 0.
    recovery instead. Where the enqueue is wired, it mirrors Phase 13 exactly (`QueuedAt =
    IdentityAt = deleted_at`, nil library id, same representation), so a later scan is a dedup
    no-op and a lost goroutine costs only latency.
-2. The retention clock is no longer reset. `deleted_at` is preserved as the original trash time,
+2. The permanent-delete path now keeps the shared library hard-delete lease alive while cleaning
+   share/upload links, then fences once more immediately before the hard-delete batch. That closes
+   the stale-lease window where restore could otherwise steal the lease after link cleanup but
+   before the canonical rows were removed.
+3. The retention clock is no longer reset. `deleted_at` is preserved as the original trash time,
    while `purge_requested_at` is the separate Phase 13 eligibility signal.
-3. A cascade can run after `libraries` is gone **only while its deleted marker/queued identity
+4. A cascade can run after `libraries` is gone **only while its deleted marker/queued identity
    remains discoverable**, because `GetLibraryDeletedAt` reads `deleted_libraries`
    ([store_cassandra.go:1165](../internal/gc/store_cassandra.go#L1165)). The snapshot-specific
    `fs:`/commit residue had no marker and is not discoverable by current Phases 3/4 (P7).
