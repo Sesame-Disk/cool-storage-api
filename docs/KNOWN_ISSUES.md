@@ -73,7 +73,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 | **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Low — transient for new deletes | `hardDeleteLibraryRowsFn` does not synchronously call `AddDeleteLibraryPolicyQuery`, but the durable cascade's `HardDeleteLibrary` clears both policy rows. At most a short stale window for new deletes; branch 2 is optional polish. Not a greenfield-prod blocker. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
 | **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. Storage retention, not incorrect deletion. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
-| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. Dev-cluster only; does not affect prod safety. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
+| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene — 1C fixed, 1A/1B open | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, and explicit global `/admin/gc/run` create cross-test drift. The global `ProcessOnce(storage=nil)` fan-out — the only one that deleted other tests' DB rows while orphaning their S3 objects — is **fixed** and guarded against reintroduction. Dev-cluster only; does not affect prod safety. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A/1B). |
 | **Existence Checks Fail Open (transient errors, P6a)** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors and scanner Phases 3/4/9 fail closed. Phase 9 scans `shares_by_group` directly and uses each projection row's `OrgID`, with unit and real-Cassandra regression coverage. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
 | **Worker Canonical Revalidation of Orphan Work (P6b)** | ✅ Fixed (2026-07-10) | Durable `canonical_absent` work is point-read against `libraries[(org_id, library_id)]` under the existing library lock; presence/read/fence/unknown-mode paths fail closed. Retry/DLQ and legacy compatibility are covered. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
 | **Cascade Deletes Counter Before Hard Delete** | ✅ Fixed (2026-07-11) | `cascadeDeleteLibrary` now hard-deletes the canonical row before removing the per-library storage counter, closing a crash+restore window that could reactivate an under-counted library. The reordering (the real fix) covers both cascade callers; the counter auto-reclaim is wired only into `processLibraryCascade`. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01 below. |
@@ -4153,8 +4153,15 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 
 - **Branch 1A**: fix `TestWebBlockUploadForeignPubRefNotPermanent` — capture the referrer in a variable, add a `t.Cleanup` that deletes **all** rows/objects identified by the fixture's exact org/library/session/operation/block IDs (ref + block + mapping + S3 object **+ the provisional expiry projection** created by the real upload session), or insert the fake `pub:` with a TTL and still clean up; assert the fake ref is gone. Clean only exact-ID artifacts — never broad cleanup. Preserve the test's purpose (a foreign `pub:` must not count as a permanent ref).
 - **Branch 1B**: inventory the E2E upload fixtures that leave `blocks` rows + S3 objects and add fixture-scoped teardown; also repair the `library_projection_regression_test.go` failure-restore so it does not re-insert an unstamped marker. Measure **no-net-growth** vs the pre-suite baseline. Do not run a global GC over the shared keyspace (invariants #5/#6).
-- **Branch 1C**: replace the direct global `ProcessOnce(storage=nil)` with `ProcessOrgOnce`;
-  inventory admin GC triggers and isolate them or measure their exact baseline delta.
+- **Branch 1C** ✅ **DONE**: the last direct global `ProcessOnce(storage=nil)`
+  (`admin_identity_projection_regression_test.go`, org-cascade hard-delete test) now calls
+  `ProcessOrgOnce(ctx, orgUUID)`, matching the pattern the rest of `gc_integration_test.go`
+  already used. `TestNoGlobalGCFanoutInIntegrationSuite` statically scans the package and fails if
+  any test reintroduces `.ProcessOnce(`; it carries **no** build tag, so it runs in the normal
+  `go test ./...` pass without Cassandra/MinIO. Admin GC triggers inventoried: `triggerGCWorker` /
+  `triggerGCScanner` (~20 call sites) drive the **real** backend worker with **real** storage —
+  globally noisy, but they cannot orphan S3 objects the way a `storage=nil` worker does, so
+  baselining them stays with 1B rather than blocking 1C.
 
 #### Related Docs
 

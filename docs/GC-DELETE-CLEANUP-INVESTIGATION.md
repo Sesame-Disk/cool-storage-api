@@ -29,7 +29,9 @@ their verified status.
 >   expiry leaves an artifact nothing can rediscover. Also historical drift / manual CQL. Not
 >   reproduced on a normal successful delete, but **not** greenfield-exempt — 8D stays open.
 > - **P8** — Phase 9 still scans all of `shares_by_group` (bounded memory, unbounded Cassandra I/O).
-> - **1A–1C** — integration tests leave residue and one still runs global `ProcessOnce(storage=nil)`.
+> - **1A–1B** — integration tests leave fixture residue (`pub:foreign`, upload blocks/S3 objects).
+>   **1C is done:** no test runs the global `ProcessOnce(storage=nil)` fan-out any more, and a
+>   guard test keeps it that way.
 > - **P3 (low)** — direct-delete omits policy-index delete, but the durable cascade's
 >   `HardDeleteLibrary` clears it; at most a short transient window for new deletes.
 > - **10A–10E, branch N+1** — engine robustness and bulk-cleaner N+1 (low priority).
@@ -66,7 +68,7 @@ grows.
 | Medium | Phase 13 error visibility | P5 / branch 5 | Health/metrics can look green while purge is delayed; marker allows retry |
 | Medium | Markerless artifact discovery | P7 / branch 8D | Reachable on a fresh cluster via terminal child-work loss (retry exhaustion → DLQ → DLQ expiry) after the parent cascade dropped canonical + marker; also drift/manual ops. Under-reclamation, never wrong deletion. Not the normal flow, but **not** greenfield-exempt |
 | Medium (scale) | Phase 9 global `shares_by_group` scan | P8 / branch 1F | Cassandra cost grows with total shares; memory bounded |
-| Medium (tests) | Integration isolation + teardown | 1A–1C | Dev-cluster diagnosis only; does not affect prod safety |
+| Medium (tests) | Fixture teardown (`pub:foreign`, upload blocks/S3) | 1A–1B (1C ✅ done) | Dev-cluster diagnosis only; does not affect prod safety |
 | Low | Policy index on direct delete | P3 / branch 2 | Transient stale row until cascade runs `HardDeleteLibrary`; optional polish |
 | Low | Engine robustness | 10A–10E | `dryRun` race, postpone metrics, pending audit, S3-orphan LWT decision |
 | Low | Bulk-cleaner N+1 | branch N+1 | Latency on mass permanent-delete only |
@@ -473,7 +475,7 @@ Subsequent branches, in recommended merge order:
 | 1F (P8) | Replace Phase 9's provisional global `shares_by_group` stream with a bucketed active-partition discovery projection. Register on share creation, remove when empty, paginate buckets/partitions, and provide reconcile/backfill for drift. | `ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01` | Med |
 | 1A | `pub:foreign` test hygiene: capture the referrer, `t.Cleanup` **all** rows/objects identified by the fixture's exact org/library/session/operation/block IDs (ref + block + mapping + S3 object **+ the provisional expiry projection** from the real upload session), or add a TTL; assert the fake ref is gone. Never broad cleanup. No prod change. | `ISSUE-GC-TEST-RESIDUE-01` | Minimal |
 | 1B | Inventory upload fixtures that leave `blocks`/MinIO objects and add fixture-scoped teardown; also repair the `library_projection_regression_test.go` failure-restore so it does not re-insert an unstamped `deleted_libraries`. Measure **no-net-growth** vs the pre-suite baseline. | `ISSUE-GC-TEST-RESIDUE-01` | Low |
-| 1C | Remove global-GC cross-test interference: replace direct `ProcessOnce(storage=nil)` with `ProcessOrgOnce`; inventory `/admin/gc/run` callers and isolate or baseline their effects. | `ISSUE-GC-TEST-RESIDUE-01` | Med |
+| 1C ✅ **DONE** | Removed global-GC cross-test interference: the last direct `ProcessOnce(storage=nil)` (`admin_identity_projection_regression_test.go`) is now `ProcessOrgOnce(ctx, orgUUID)`, and `TestNoGlobalGCFanoutInIntegrationSuite` (untagged, runs in the normal `go test ./...` pass — no backend needed) fails the build if any test reintroduces the fan-out. `/admin/gc/run` triggers inventoried: 2 helpers (`triggerGCWorker`/`triggerGCScanner`) used by ~20 call sites; they run the **real** backend worker with **real** storage, so they are globally noisy but do **not** manufacture S3 orphans — left as-is, tracked under 1B's baseline work. | `ISSUE-GC-TEST-RESIDUE-01` | Med |
 | 2 (optional) | Fold `AddDeleteLibraryPolicyQuery` (version_ttl + auto_delete) into the `hardDeleteLibraryRowsFn` batch. Eliminates the transient stale policy row between direct-delete and cascade. | `ISSUE-GC-POLICY-INDEX-STALE-01` | Low |
 | 3 ✅ **DONE** | Org-admin single-path parity (`DeleteOrgTrashLibrary`): after hard-delete, immediately enqueue the same durable, Phase-13-deduplicated `ItemLibraryCascade` used by the other permanent-delete paths. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Low/Med |
 | 4 ✅ **DONE** | Org-admin bulk-path parity (`CleanOrgTrashLibraries`): after each successful hard-delete, immediately enqueue the same durable, Phase-13-deduplicated `ItemLibraryCascade`. No content-only accelerator remains. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Med |
@@ -494,7 +496,8 @@ Subsequent branches, in recommended merge order:
 
 **Recommended merge order (greenfield prod, 2026-07-15):**
 
-1. **1C** — replace global `ProcessOnce(storage=nil)` with scoped `ProcessOrgOnce` (highest-value test fix).
+1. ~~**1C** — replace global `ProcessOnce(storage=nil)` with scoped `ProcessOrgOnce`~~ ✅ **DONE**
+   (plus a guard test that blocks reintroduction).
 2. **1A / 1B** — fixture-scoped teardown for upload/`pub:foreign` residue.
 3. **5 (P5)** — Phase 13 error visibility (small change, high ops value).
 4. **7 (P4)** — `pub:` expiry projection.

@@ -330,8 +330,13 @@ func TestAdminIdentityProjectionRegression_HardDeleteOrganization(t *testing.T) 
 	if err := store.EnqueueItem(orgUUID, queuedAt, gcpkg.ItemOrgCascade, orgID, uuid.Nil, "", 0); err != nil {
 		t.Fatalf("enqueue org cascade failed: %v", err)
 	}
+	// Scope processing to the synthetic org. A bare ProcessOnce fans out to every org
+	// with queued work, so it would drain other tests' items through this worker — which
+	// is built with storage=nil and therefore deletes their DB rows while leaving the S3
+	// objects behind (ISSUE-GC-TEST-RESIDUE-01 / branch 1C). ProcessOrgOnce touches only
+	// the org under test, whose cascade is user+org rows with no blocks.
 	worker := gcpkg.NewWorker(store, nil, queue, 100, 0, false, &gcpkg.Stats{})
-	processed, err := worker.ProcessOnce(context.Background())
+	processed, err := worker.ProcessOrgOnce(context.Background(), orgUUID)
 	if err != nil {
 		t.Fatalf("process org cascade failed: %v", err)
 	}
