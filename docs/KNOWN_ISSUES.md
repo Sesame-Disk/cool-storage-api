@@ -61,7 +61,10 @@ Follow-up debt from the PR #123 audit. **Verdict (2026-07-15):** no open known i
 live content in the normal production delete flow. P6a/P6b safety guards and P1/P1b/P2 durable
 purge + cascade are **fixed** on `main` (PR #129). The planned **greenfield prod deploy** starts
 from an empty cluster — reconcile/backfill (8A–8C) and pre-fix `gc_pending_items` orphans are
-**not required**. Full audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
+**not required**. Note this depends on a **recreated keyspace + empty/new buckets, never written
+by an older binary**: an empty dashboard or `gc_queue = 0` does *not* prove that (this audit began
+on a cluster that reported 0 libraries / 0 bytes and still held blocks + MinIO objects). Full
+audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 
 | Issue | Status | Details |
 |-------|--------|---------|
@@ -4072,7 +4075,7 @@ and provide reconcile/backfill for projection drift. Preserve direct orphan disc
 
 ### ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01: Markerless Commit/FS Partitions Are Invisible
 
-**Status**: 🟡 Confirmed gap (2026-07-10) — drift/manual-ops edge case; not a greenfield-prod blocker
+**Status**: 🟡 Confirmed gap (2026-07-10) — reachable on a fresh cluster via terminal child-work loss; not a launch blocker, but **not** greenfield-exempt
 **Severity**: Medium — markerless artifacts can remain indefinitely and evade Phases 3/4
 **Affected**: `ListDistinctCommitLibraries`, `ListDistinctFSObjectLibraries`, scanner Phases 3/4
 
@@ -4086,8 +4089,22 @@ library IDs from surviving commit/fs_object partitions or a dedicated discovery 
 Once both library indexes/markers are gone, remaining commits/fs_objects are invisible to the
 orphan phases. This directly matches the **audit dev-cluster snapshot** (`libraries=0`,
 `deleted_libraries=0`, but `commits=4`) — residue dominated by integration-test drift, not the
-current live delete path (~50 GB test left zero content residue). It remains a real edge case for
-historical drift, manual CQL, or terminal work loss.
+current live delete path (~50 GB exercise left zero content residue).
+
+**This is not confined to brownfield clusters.** The cascade enqueues its children
+([worker.go:1325](../internal/gc/worker.go#L1325)) *before* `HardDeleteLibrary` drops the
+canonical row and the marker ([worker.go:1338](../internal/gc/worker.go#L1338)) — deliberately,
+so a concurrent restore cannot resurrect a partially-purged library. The consequence is that from
+that point on, the children are the **only** thing that knows the artifacts exist. If a child
+exhausts its retries it lands in `gc_failed_items`, and Phase 10's `DeleteExpiredFailedItem`
+([store_cassandra.go:920-942](../internal/gc/store_cassandra.go#L920)) removes the DLQ row and
+its pending projection in one batch. The commit/fs_object then survives with no library index, no
+marker, and no queue/DLQ trace — exactly the P7 shape, on a **fresh** cluster.
+
+Trigger set: **terminal child-work loss / DLQ expiry, corruption, or manual drift; never a normal
+successful delete.** The failure mode is under-reclamation (storage retained), never incorrect
+deletion of live content. It is not a launch blocker, but 8D is not made unnecessary by starting
+from an empty keyspace.
 
 #### Fix Direction (branch 8D)
 
@@ -4096,7 +4113,9 @@ historical drift, manual CQL, or terminal work loss.
 - Brownfield: report markerless artifact partitions through the read-only reconciler (8A) first.
 - Never solve this with a new full-table production scan or direct S3 deletion.
 
-**Greenfield prod:** not required before launch; no historical markerless partitions exist.
+**Greenfield prod:** no *historical* markerless partitions exist, so nothing needs repairing
+before launch — but the DLQ-expiry path above can create them on any cluster, so 8D remains
+genuinely open rather than brownfield-only.
 
 ---
 
@@ -4194,54 +4213,62 @@ P6 issue above.
 **Severity**: Low-Med — unbounded metadata growth + scan cost; **no data-safety impact**
 **Affected**: `internal/gc` block enqueue paths, `gc_pending_items`
 
-#### Problem (confirmed live-path leak, was E4 "drift risk")
+#### Problem (confirmed live-path leak, was E4 "drift risk") — HISTORICAL, fixed in PR #128
 
-`gc_pending_items` accumulates orphaned `block` rows proportional to deleted block volume. A real
+> **This section describes the code as it was at `253e08fef`** (the pre-fix parent of
+> `869a455f3`). Its code links are **pinned to that commit on purpose**: on current `main` these
+> lines read `uuid.Nil` and would contradict the text. See "Fix" below for current-code links.
+
+`gc_pending_items` accumulated orphaned `block` rows proportional to deleted block volume. A real
 50 GB upload → delete → GC-drain on a wiped dev cluster drove it from ~575 to **9,633 rows**
 (9,629 `block`), with `gc_queue = 0` / `gc_block_candidates = 0` / `gc_failed_items = 0` and no
-TTL (`default_time_to_live = 0`). Sampled orphan rows point at blocks that are already physically
-deleted. The 50 GB of **content** (blocks, refs, commits, S3 objects) was reclaimed correctly —
-only the dedup rows leak.
+TTL (`default_time_to_live = 0`). Sampled orphan rows pointed at blocks that were already
+physically deleted. The 50 GB of **content** (blocks, refs, commits, S3 objects) was reclaimed
+correctly — only the dedup rows leaked.
 
-#### Root cause
+#### Root cause (at `253e08fef`)
 
 `gc_pending_items` is keyed by `library_id` (in the partition `bucket` hash
 [store_cassandra.go:251-259](../internal/gc/store_cassandra.go#L251) **and** as a clustering
 column [001_initial_schema.cql:1206](../internal/db/migrations/001_initial_schema.cql#L1206)),
 but `gc_queue` is not (library-independent bucket + key). Blocks are content-addressed;
 `processBlock` never reads `item.LibraryID` ([worker.go:403-468](../internal/gc/worker.go#L403)).
-All three block-enqueue **dedup checks** use `uuid.Nil`, but two paths **write** the pending row
+All three block-enqueue **dedup checks** used `uuid.Nil`, but two paths **wrote** the pending row
 under the **real** `libraryID`:
 
-- `worker.enqueueZeroRefBlocks` — `LibraryID: libraryID` ([worker.go:1619](../internal/gc/worker.go#L1619)) — **the live leaker** (every cascade/version/auto-delete block release).
-- `Service.EnqueueBlock` — passes `libraryID` ([gc.go:422](../internal/gc/gc.go#L422)) — latent; sole non-test caller already passes `uuid.Nil` ([gc_adapter.go:32](../internal/api/gc_adapter.go#L32)).
-- `scanner.scanOrphanedBlocks` — `LibraryID: uuid.Nil` ([scanner.go:386](../internal/gc/scanner.go#L386)) — **correct reference.**
+- `worker.enqueueZeroRefBlocks` — `LibraryID: libraryID` ([worker.go:1619@253e08f](https://github.com/Sesame-Disk/sesamefs/blob/253e08fef/internal/gc/worker.go#L1619)) — **the live leaker** (every cascade/version/auto-delete block release).
+- `Service.EnqueueBlock` — passed `libraryID` ([gc.go:422@253e08f](https://github.com/Sesame-Disk/sesamefs/blob/253e08fef/internal/gc/gc.go#L422)) — latent; sole non-test caller already passed `uuid.Nil`.
+- `scanner.scanOrphanedBlocks` — `LibraryID: uuid.Nil` ([scanner.go:386@253e08f](https://github.com/Sesame-Disk/sesamefs/blob/253e08fef/internal/gc/scanner.go#L386)) — **correct reference.**
 
 A single producer is self-consistent (`CompleteItem` re-reads `library_id` from the same queue
-row it completes). The leak needs **two** producers enqueuing the same block/candidate under
+row it completes). The leak needed **two** producers enqueuing the same block/candidate under
 different `library_id`s (worker `realLib` + scanner `Nil`, or two libraries sharing a block):
-same `candidate_at` collapses them to one `gc_queue` row (last writer wins on the non-key
-`library_id` column) but each already wrote its own `gc_pending_items` row (`bucket(realLib)` +
-`bucket(Nil)`). `CompleteItem` deletes only the row matching the surviving queue row's
-`library_id` ([store_cassandra.go:580-604](../internal/gc/store_cassandra.go#L580)); the other
-orphans forever.
+same `candidate_at` collapsed them to one `gc_queue` row (last writer wins on the non-key
+`library_id` column) but each had already written its own `gc_pending_items` row
+(`bucket(realLib)` + `bucket(Nil)`). `CompleteItem` deleted only the row matching the surviving
+queue row's `library_id` ([store_cassandra.go:580-604](../internal/gc/store_cassandra.go#L580) —
+unchanged by the fix, so this link tracks current `main`); the other orphaned forever.
 
 **Bug, not intentional (git history):** `worker.go` enqueue written with the real `libraryID`
 on 2026-04-09 (`e9a9b369b`); its dedup check migrated to `uuid.Nil` on 2026-04-30 (`5dee7eee2`)
 **without** updating the paired enqueue — incomplete migration. Scanner phase (2026-05-26,
 `f3597a935`) does both sides `Nil`, codifying the intended convention.
 
-#### Fix (this PR)
+#### Fix — merged 2026-07-13, PR #128
 
-Two layers:
-1. **Producers** — every `ItemBlock` enqueue keys `uuid.Nil` (`worker.enqueueZeroRefBlocks`,
-   `Service.EnqueueBlock`), matching the dedup checks and the scanner.
+`fix/gc-pending-items-block-library-scope` (`869a455f3` producers, `08402b3f9` central coercion).
+Two layers; links below track **current `main`**:
+1. **Producers** — every `ItemBlock` enqueue keys `uuid.Nil` (`worker.enqueueZeroRefBlocks`
+   [worker.go:1633](../internal/gc/worker.go#L1633), `Service.EnqueueBlock`, and
+   `scanner.scanOrphanedBlocks` [scanner.go:386](../internal/gc/scanner.go#L386)), matching the
+   dedup checks.
 2. **Central backstop** — the store pending helpers (`addPendingItemBatchQuery`,
    `addPendingItemDeleteBatchQuery`, `PendingItemExists`) coerce `ItemBlock`'s `library_id` to
-   `uuid.Nil` via `pendingItemLibraryID`, so every pending write/delete/dedup-read for a block
-   lands on one key regardless of the caller. This makes the invariant impossible for a future
-   producer to break (the original bug was exactly a partial migration between the check and the
-   write).
+   `uuid.Nil` via `pendingItemLibraryID`
+   ([store_cassandra.go:448-464](../internal/gc/store_cassandra.go#L448)), so every pending
+   write/delete/dedup-read for a block lands on one key regardless of the caller. This makes the
+   invariant impossible for a future producer to break (the original bug was exactly a partial
+   migration between the check and the write).
 
 Content-only, no data-safety impact. Coverage: a pure-function unit test for the coercion, a
 worker unit test that the producer keys `uuid.Nil` (fails pre-fix), and an integration test that

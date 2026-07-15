@@ -17,9 +17,10 @@ plan integration tests for long-running monitoring.
 >
 > Remaining debt is **storage retention in edge cases, observability, test hygiene, and scale** —
 > not live-data safety: P4 (`pub:` zero-ref transition), P5 (Phase 13 error visibility), P7
-> (markerless commit/fs_object partitions invisible to orphan discovery — a drift/manual-ops
-> edge case), P8 (Phase 9 `shares_by_group` global scan). Reconcile/backfill (8A–8C) applies only
-> to brownfield clusters and is **out of scope for the planned greenfield prod deploy**.
+> (markerless commit/fs_object partitions invisible to orphan discovery — reachable on any
+> cluster via terminal child-work loss/DLQ expiry, so 8D stays open), P8 (Phase 9
+> `shares_by_group` global scan). Reconcile/backfill (8A–8C) repairs *pre-existing* residue only
+> and is **out of scope for the planned greenfield prod deploy**.
 > Full audit (P1–P9, invariants, branch roadmap):
 > [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md);
 > per-item issues: `ISSUE-GC-*` in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
@@ -224,10 +225,12 @@ all other errors; Phases 3/4/9 fail closed and surface the error; regression tes
 
 The methods named `ListDistinctCommitLibraries` and `ListDistinctFSObjectLibraries` enumerate
 only `libraries_by_id` + `deleted_libraries`. If both indexes are gone, surviving artifact
-partitions cannot be found by Phases 3/4. Observed in the dev-cluster audit snapshot (test
-drift) but **not reproduced on the live delete path**, so it is a drift/manual-ops edge case
-rather than a normal-flow gap — under-reclamation, never incorrect deletion. Not a greenfield
-prod blocker. See `ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`.
+partitions cannot be found by Phases 3/4. Observed in the dev-cluster audit snapshot (test drift)
+and **not reproduced on the live delete path**, so it is not a normal-flow gap — but it is not
+brownfield-only either: the cascade enqueues children before `HardDeleteLibrary` drops canonical +
+marker, so terminal child-work loss (retry exhaustion → DLQ → DLQ expiry) strands artifacts on a
+fresh cluster too. Under-reclamation, never incorrect deletion. Not a launch blocker; 8D stays
+open. See `ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`.
 
 ### RESOLVED: Hot exact recounts removed without Cassandra COUNTER
 
@@ -350,8 +353,11 @@ The physical block claim/recheck/recovery sequence is conservative **given corre
 The transient-error fail-open existence read (P6a) and execution-time canonical revalidation gap
 (P6b) are fixed. P6b uses durable guard modes, the existing library lock, an O(1) canonical
 point read, and synchronous fences before destructive mutations. P8 tracks Phase 9's provisional
-global Cassandra scan (streamed and cancellable, but not partition-bounded). The remaining
-P1–P5/P7 issues primarily retain or delay garbage rather than deleting referenced blocks.
+global Cassandra scan (streamed and cancellable, but not partition-bounded). P1/P1b/P2 are fixed
+(durable `purge_requested_at` + cascade, PR #129) and P3 is downgraded to Low (the durable
+cascade's `HardDeleteLibrary` clears the policy rows the direct-delete batch leaves behind). The
+remaining P4/P5/P7 issues plus the P8 scale debt primarily retain or delay garbage rather than
+deleting referenced blocks.
 
 ---
 
@@ -403,7 +409,7 @@ P1–P5/P7 issues primarily retain or delay garbage rather than deleting referen
 | **User cascade end-to-end** | Medium | **Pending** | No integration test creates a user, soft-deletes them, and verifies full cascade through GC. |
 | **Soak test validation** | Medium | **Code written, needs run** | `TestGC_Soak` is implemented but hasn't been executed against the live stack yet. |
 | **Existence read failure → no live deletion (P6)** | **High** | **Done** | `TestScanner_ScanOrphaned{Commits,FSObjects}_FailClosedOnLibraryExistsError` and `TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError` fault-inject `LibraryExists`/`GroupExists` and prove no live commit/fs_object is enqueued and no valid share is deleted. |
-| **Markerless artifact discovery (P7)** | High/Med | **Missing** | Remove both library indexes while retaining fixture commits/fs_objects; prove bounded discovery/reconcile. |
+| **Markerless artifact discovery (P7)** | Med | **Missing** | Remove both library indexes while retaining fixture commits/fs_objects; prove bounded discovery/reconcile. Also cover the fresh-cluster trigger: drive a cascade child to DLQ, expire it, assert the artifact stays discoverable. |
 | **No global cross-test GC** | Medium | **Broken** | Replace direct `ProcessOnce(storage=nil)` with `ProcessOrgOnce`; isolate admin GC triggers. |
 
 ---
