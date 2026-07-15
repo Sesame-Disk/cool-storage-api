@@ -3805,7 +3805,7 @@ Keep processing all markers, accumulate errors (`errors.Join`), return the joine
 #### Resolution
 
 - `LibraryExists` and `GroupExists` now return `(false, nil)` **only** for `gocql.ErrNotFound` and propagate every other error ([store_cassandra.go:2357-2373](../internal/gc/store_cassandra.go#L2357), [store_cassandra.go:3314-3329](../internal/gc/store_cassandra.go#L3314)).
-- Phase 9 no longer discards the `GroupExists` error — on error it skips the share (never deletes it) and records a phase error ([scanner.go:1013-1032](../internal/gc/scanner.go#L1013)).
+- Phase 9 no longer discards the `GroupExists` error — on error it skips the share (never deletes it) and records a phase error ([scanner.go:1073-1090](../internal/gc/scanner.go#L1073)).
 - Phases 3/4 handle the `LibraryExists` error explicitly (skip + surface `phaseErr`) so a transient read cannot enqueue a live library's commits/fs_objects ([scanner.go:532-546](../internal/gc/scanner.go#L532), [scanner.go:624-638](../internal/gc/scanner.go#L624)).
 - Phase 9 reads `OrgID` from each `shares_by_group` projection row and only falls back to the library→org projection when it is absent — surfacing that fallback failure instead of silently skipping a share. `ScanAllGroupShares` streams the projection directly in 256-row driver pages, so deleted-group partitions remain discoverable without materializing the full result; the Cassandra-wide scan is tracked separately as P8. The existence cache is a single-entry `(org_id, group_id)` "last partition" cache (O(1) memory) that opportunistically reuses the result (or error) for consecutive rows of the same partition; correctness does not depend on scan ordering, since a partition reappearing later just triggers another lookup ([scanner.go:1013-1094](../internal/gc/scanner.go#L1013)).
 - The worker guard (`acquireLibraryDeleteGuard`) already propagated `LibraryExists` errors; with the store fix it is now genuinely fail-closed.
@@ -4083,7 +4083,7 @@ and provide reconcile/backfill for projection drift. Preserve direct orphan disc
 
 Despite their names, `ListDistinctCommitLibraries` and `ListDistinctFSObjectLibraries` both call
 `listGCArtifactLibraries`, which enumerates only `libraries_by_id` plus `deleted_libraries`
-([store_cassandra.go:2235-2268](../internal/gc/store_cassandra.go#L2235)). It never enumerates
+([store_cassandra.go:2314-2355](../internal/gc/store_cassandra.go#L2314)). It never enumerates
 library IDs from surviving commit/fs_object partitions or a dedicated discovery projection.
 
 Once both library indexes/markers are gone, remaining commits/fs_objects are invisible to the
@@ -4097,7 +4097,7 @@ canonical row and the marker ([worker.go:1338](../internal/gc/worker.go#L1338)) 
 so a concurrent restore cannot resurrect a partially-purged library. The consequence is that from
 that point on, the children are the **only** thing that knows the artifacts exist. If a child
 exhausts its retries it lands in `gc_failed_items`, and Phase 10's `DeleteExpiredFailedItem`
-([store_cassandra.go:920-942](../internal/gc/store_cassandra.go#L920)) removes the DLQ row and
+([store_cassandra.go:891-942](../internal/gc/store_cassandra.go#L891)) removes the DLQ row and
 its pending projection in one batch. The commit/fs_object then survives with no library index, no
 marker, and no queue/DLQ trace — exactly the P7 shape, on a **fresh** cluster.
 
@@ -4108,8 +4108,14 @@ from an empty keyspace.
 
 #### Fix Direction (branch 8D)
 
-- Add a durable, bounded discovery projection for artifact library IDs, or keep a durable cleanup
-  identity until every child queue/DLQ item reaches a terminal state.
+- Add a durable, bounded discovery projection for artifact library IDs, **or** retain a durable
+  library cleanup identity until every child **completes successfully**.
+- **Contract — do not weaken this to "terminal state".** Retry exhaustion and DLQ expiry *are*
+  terminal states, and they are exactly what produces P7 today: releasing the identity on those
+  transitions rebuilds the same hole this branch exists to close. Retry exhaustion or DLQ expiry
+  must **preserve or quarantine** the discovery identity and surface it for retry or operator
+  intervention. It must **never** erase the last discoverable reference to surviving artifacts.
+  "Successful completion of every child" is the only safe release condition.
 - Brownfield: report markerless artifact partitions through the read-only reconciler (8A) first.
 - Never solve this with a new full-table production scan or direct S3 deletion.
 
@@ -4176,7 +4182,11 @@ P6 issue above.
   as "missing"; non-`ErrNotFound` errors now propagate and scanners fail closed.
 - **E4 — pending projection drift.** Queue completion, DLQ
   deletion, and DLQ expiry remove `gc_pending_items` in their logged batches
-  ([store_cassandra.go:499-583](../internal/gc/store_cassandra.go#L499)). No independent reconcile
+  (`CompleteItem` [store_cassandra.go:580-604](../internal/gc/store_cassandra.go#L580),
+  `DeleteFailedItem` [store_cassandra.go:868-889](../internal/gc/store_cassandra.go#L868),
+  `DeleteExpiredFailedItem` [store_cassandra.go:891-942](../internal/gc/store_cassandra.go#L891),
+  all via `addPendingItemDeleteBatchQuery`
+  [store_cassandra.go:475](../internal/gc/store_cassandra.go#L475)). No independent reconcile
   exists for historical/manual/ambiguous drift. A blind TTL could expire valid dedup protection
   while queue/DLQ work remains live. **Update (2026-07-13): a concrete, unbounded live-path
   source of this drift was found, root-caused, and fixed — the block/library-scope mismatch.
