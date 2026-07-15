@@ -4,10 +4,12 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +20,8 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -49,6 +53,109 @@ func webCreateBlockSession(t *testing.T, c *testClient, repoID, parentDir string
 		cleanupBlockUploadSessionForTest(t, sid)
 	})
 	return sid
+}
+
+// cleanupUploadedBlockArtifactsForTest tears down everything a real web block upload
+// materializes for ONE block, plus any extra referrers the fixture injected by hand.
+//
+// cleanupBlockUploadSessionForTest only releases the session's own `up:` ref, staged
+// rows and caps; the block itself survives it. What survives a session-only teardown —
+// and what this helper removes — is: the `blocks` row, the forward SHA-1→SHA-256
+// `block_id_mappings` row, the S3 object, and the provisional expiry projection
+// (`gc_provisional_block_refs` + its by-day discovery row) that the upload registered.
+// Left in place, that set is a block with a permanent-looking reference and a physical
+// object that no GC phase will ever reclaim — the "eternal residue" F1 chased.
+//
+// Every delete is keyed by the fixture's EXACT ids (org/repo/block/referrer). Never
+// broaden this to a range or full-partition delete: the keyspace is shared with every
+// other integration test (invariants #5/#6).
+//
+// See ISSUE-GC-TEST-RESIDUE-01 (branch 1A) and docs/GC-DELETE-CLEANUP-INVESTIGATION.md F1.
+func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, externalSHA1 string, referrers ...string) {
+	t.Helper()
+
+	// Built here rather than inside t.Cleanup so an unreachable MinIO degrades to a
+	// logged skip of the S3 step only. newVerificationBlockStore would t.Skipf, which
+	// would silently turn this test into a no-op whenever the object store is not
+	// reachable from the test process.
+	blockStore := blockStoreForCleanupOrNil(t)
+
+	t.Cleanup(func() {
+		database := shareProjectionDBForTest(t)
+
+		for _, referrer := range referrers {
+			if err := database.Session().Query(
+				`DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+				orgID, blockID, referrer).Exec(); err != nil {
+				t.Errorf("cleanup block reference %s/%s/%s: %v", orgID, blockID, referrer, err)
+			}
+			// The upload's expiry projection is NOT removed by deleting the ref row:
+			// gc_provisional_block_refs and its by-day discovery row are written
+			// separately by the upload path. Use the production helper so this cannot
+			// drift from the write side. Harmless for referrers that never had one.
+			if err := database.DeleteProvisionalBlockReferenceExpiry(orgID, blockID, referrer, time.Time{}); err != nil {
+				t.Errorf("cleanup provisional expiry %s/%s/%s: %v", orgID, blockID, referrer, err)
+			}
+		}
+
+		if err := database.Session().Query(
+			`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`,
+			orgID, dbpkg.PlainBlockRepresentationID, externalSHA1).Exec(); err != nil {
+			t.Errorf("cleanup block mapping %s/%s: %v", orgID, externalSHA1, err)
+		}
+
+		if err := database.Session().Query(
+			`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+			t.Errorf("cleanup blocks row %s/%s: %v", orgID, blockID, err)
+		}
+
+		if blockStore != nil {
+			if err := blockStore.DeleteBlock(context.Background(), blockID); err != nil {
+				t.Errorf("cleanup S3 object for block %s: %v", blockID, err)
+			}
+		}
+
+		// Assert the teardown actually landed: a surviving referrer here is exactly the
+		// F1 leak this branch exists to close, and a silent cleanup failure would let it
+		// regress unnoticed.
+		for _, referrer := range referrers {
+			var found string
+			err := database.Session().Query(
+				`SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+				orgID, blockID, referrer).Scan(&found)
+			if err == nil {
+				t.Errorf("block reference %s/%s/%s survived teardown; it pins the block and its S3 object forever (ISSUE-GC-TEST-RESIDUE-01)", orgID, blockID, referrer)
+			} else if !errors.Is(err, gocql.ErrNotFound) {
+				t.Errorf("verify block reference %s/%s/%s removed: %v", orgID, blockID, referrer, err)
+			}
+		}
+	})
+}
+
+// blockStoreForCleanupOrNil returns a BlockStore for teardown, or nil (with a log) when
+// the object store is unreachable. Unlike newVerificationBlockStore it never skips: S3
+// reachability is incidental to callers that only need to delete their own object, and
+// skipping would cost real coverage.
+func blockStoreForCleanupOrNil(t *testing.T) *storage.BlockStore {
+	t.Helper()
+	ctx := context.Background()
+	s3Store, err := storage.NewS3Store(ctx, storage.S3Config{
+		Endpoint:        envOrDefault("S3_ENDPOINT", "http://minio:9000"),
+		Bucket:          envOrDefault("S3_BUCKET", "sesamefs-blocks"),
+		Region:          envOrDefault("S3_REGION", "us-east-1"),
+		AccessKeyID:     envOrDefault("S3_ACCESS_KEY_ID", "minioadmin"),
+		SecretAccessKey: envOrDefault("S3_SECRET_ACCESS_KEY", "minioadmin"),
+		UsePathStyle:    true,
+	})
+	if err != nil {
+		t.Logf("cleanup: S3 store unavailable (%v); block objects will be left behind", err)
+		return nil
+	}
+	if err := s3Store.HeadBucket(ctx); err != nil {
+		t.Logf("cleanup: S3 bucket unreachable (%v); block objects will be left behind", err)
+		return nil
+	}
+	return storage.NewBlockStore(s3Store, "blocks/")
 }
 
 func cleanupBlockUploadSessionForTest(t *testing.T, sessionID string) {
@@ -934,20 +1041,28 @@ func TestWebBlockUploadForeignPubRefNotPermanent(t *testing.T) {
 
 	// Upload under session A → materializes metadata + S3 object + up:<A> ref.
 	sessionA := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
+	uploadReferrer := dbpkg.BlockReferrerForUpload(sessionA)
 	resp := webUploadBlock(t, adminClient, sessionA, content)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		t.Fatalf("upload status %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 
+	// The fake ref is inserted with NO TTL, unlike a production pub: ref (35d). Capture
+	// the referrer so teardown can delete this exact row: left behind, it is a permanent
+	// reference that pins the block + mapping + S3 object forever and shows up in every
+	// later audit as unexplained residue (ISSUE-GC-TEST-RESIDUE-01 / F1 / branch 1A).
+	pubReferrer := fmt.Sprintf("pub:foreign-%d", time.Now().UnixNano())
+	cleanupUploadedBlockArtifactsForTest(t, orgID, repoID, hash, hash1, pubReferrer, uploadReferrer)
+
 	// Rewrite liveness so the ONLY ref is a foreign pub: attempt (no fs:, no up:B).
 	dbSession := shareProjectionDBForTest(t).Session()
 	if err := dbSession.Query(`DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
-		orgID, hash, "up:"+sessionA).Exec(); err != nil {
+		orgID, hash, uploadReferrer).Exec(); err != nil {
 		t.Fatalf("remove up ref: %v", err)
 	}
 	if err := dbSession.Query(`INSERT INTO block_references (org_id, block_id, referrer, library_id, created_at) VALUES (?, ?, ?, ?, ?)`,
-		orgID, hash, fmt.Sprintf("pub:foreign-%d", time.Now().UnixNano()), repoID, time.Now()).Exec(); err != nil {
+		orgID, hash, pubReferrer, repoID, time.Now()).Exec(); err != nil {
 		t.Fatalf("add pub ref: %v", err)
 	}
 
@@ -960,6 +1075,8 @@ func TestWebBlockUploadForeignPubRefNotPermanent(t *testing.T) {
 	})
 	expectStatus(t, commit, http.StatusConflict)
 	commit.Body.Close()
+	// Sessions A and B need no teardown here: webCreateBlockSession already registers
+	// cleanupBlockUploadSessionForTest for every session it hands out.
 }
 
 func TestWebBlockUploadSessionRoutesRejectRevokedSharedRepoPermission(t *testing.T) {
