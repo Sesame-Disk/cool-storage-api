@@ -306,14 +306,22 @@ func webUploadBlock(t *testing.T, c *testClient, session string, data []byte) *h
 // object with NO `blocks` row and no reference: it is a pure S3 orphan by construction.
 // Nothing reclaims it — GC discovers blocks through candidates, and its S3-orphan recovery
 // only replays its own in-flight deletes from `gc_s3_orphans`. So an untorn-down legacy
-// upload lives in the bucket forever (ISSUE-GC-TEST-RESIDUE-01 / branch 1B). The delete is
-// best-effort: callers that assert a rejection (e.g. quota 403) never created the object.
+// upload lives in the bucket forever (ISSUE-GC-TEST-RESIDUE-01 / branch 1B).
+//
+// The delete is reported, not swallowed: S3 DELETE is idempotent, so callers that assert a
+// rejection (e.g. quota 403) and never created the object still succeed here. That means a
+// real error is a real teardown failure — silently dropping it would leave the exact eternal
+// S3 object this teardown exists to remove, with the test still green.
 func webUploadBlockLegacy(t *testing.T, c *testClient, data []byte) *http.Response {
 	t.Helper()
 
 	if blockStore := blockStoreForCleanupOrNil(t); blockStore != nil {
 		hash := sha256hex(data)
-		t.Cleanup(func() { _ = blockStore.DeleteBlock(context.Background(), hash) })
+		t.Cleanup(func() {
+			if err := blockStore.DeleteBlock(context.Background(), hash); err != nil {
+				t.Errorf("cleanup legacy S3 block %s: %v", hash, err)
+			}
+		})
 	}
 	url := c.baseURL + "/api/v2/blocks/upload"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
@@ -882,6 +890,21 @@ func TestWebBlockUploadReuploadRepairsMissingBlockSHA1(t *testing.T) {
 	if err := dbSession.Query(`UPDATE blocks SET sha1 = ? WHERE org_id = ? AND block_id = ?`, "", orgID, sha256ID).Exec(); err != nil {
 		t.Fatalf("blank block sha1: %v", err)
 	}
+	// Put the sha1 back before teardown reads it. On the happy path the re-upload below
+	// repairs it (that is what this test asserts), but if the test fails earlier the row
+	// stays blank — and blocks.sha1 is the only way to name this block's forward
+	// block_id_mappings row, since the reverse index was dropped in migration 006. The
+	// session teardown would then skip the mapping while still deleting the block and its
+	// S3 object, stranding a mapping that points at nothing. Registered AFTER the session
+	// cleanup so LIFO runs this first. IF EXISTS keeps it from resurrecting a blocks row
+	// that GC already reclaimed (a bare UPDATE is an upsert in Cassandra).
+	t.Cleanup(func() {
+		if err := dbSession.Query(
+			`UPDATE blocks SET sha1 = ? WHERE org_id = ? AND block_id = ? IF EXISTS`,
+			sha1ID, orgID, sha256ID).Exec(); err != nil {
+			t.Errorf("restore block sha1 for %s/%s before teardown: %v", orgID, sha256ID, err)
+		}
+	})
 
 	manifest := map[string]interface{}{
 		"session": sessionID, "parent_dir": "/", "filename": "repair.bin",

@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🟢 Safe for prod (greenfield) | Normal delete path exercised end-to-end (~50 GB manual dev-cluster run, zero content residue — operator observation, not an automated test). P6a/P6b and P1/P2 closed on `main` (PR #129). Remaining GC debt is storage retention in edge cases (P4/P7), observability (P5), test hygiene (1A–1C), and scale (P8) — not live-data deletion. Reconcile/backfill not required for empty prod deploy. See GC audit section below. |
+| Garbage Collection | 🟢 Safe for prod (greenfield) | Normal delete path exercised end-to-end (~50 GB manual dev-cluster run, zero content residue — operator observation, not an automated test). P6a/P6b and P1/P2 closed on `main` (PR #129). Remaining GC debt is storage retention in edge cases (P4/P7), observability (P5), test hygiene (1G; 1A–1C done), and scale (P8) — not live-data deletion. Reconcile/backfill not required for empty prod deploy. See GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -73,7 +73,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 | **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Low — transient for new deletes | `hardDeleteLibraryRowsFn` does not synchronously call `AddDeleteLibraryPolicyQuery`, but the durable cascade's `HardDeleteLibrary` clears both policy rows. At most a short stale window for new deletes; branch 2 is optional polish. Not a greenfield-prod blocker. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
 | **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. Storage retention, not incorrect deletion. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
-| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene — 1C fixed, 1A/1B open | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, and explicit global `/admin/gc/run` create cross-test drift. The global `ProcessOnce(storage=nil)` fan-out — the only one that deleted other tests' DB rows while orphaning their S3 objects — is **fixed** and guarded against reintroduction. Dev-cluster only; does not affect prod safety. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A/1B). |
+| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene — **1A/1B/1C fixed; 1G open** | The global `ProcessOnce(storage=nil)` fan-out (the only one that deleted other tests' DB rows while orphaning their S3 objects), the permanent `pub:foreign` ref, and the upload fixtures' stranded blocks are **fixed** and guarded. `-run TestWebBlockUpload` now drains to a zero residue delta. A **full** suite run still ends at **2** stranded blocks (1D): one `fs:`-pinned block whose library is gone from both indexes (eternal), one `up:sync:` provisional (self-heals in 2d). Shared keyspace/bucket and the global `/admin/gc/run` triggers remain as designed. Dev-cluster only; does not affect prod safety. See ISSUE-GC-TEST-RESIDUE-01 below. |
 | **Existence Checks Fail Open (transient errors, P6a)** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors and scanner Phases 3/4/9 fail closed. Phase 9 scans `shares_by_group` directly and uses each projection row's `OrgID`, with unit and real-Cassandra regression coverage. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
 | **Worker Canonical Revalidation of Orphan Work (P6b)** | ✅ Fixed (2026-07-10) | Durable `canonical_absent` work is point-read against `libraries[(org_id, library_id)]` under the existing library lock; presence/read/fence/unknown-mode paths fail closed. Retry/DLQ and legacy compatibility are covered. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
 | **Cascade Deletes Counter Before Hard Delete** | ✅ Fixed (2026-07-11) | `cascadeDeleteLibrary` now hard-deletes the canonical row before removing the per-library storage counter, closing a crash+restore window that could reactivate an under-counted library. The reordering (the real fix) covers both cascade callers; the counter auto-reclaim is wired only into `processLibraryCascade`. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01 below. |
@@ -2808,7 +2808,7 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 **Status**: Core engine implemented (2026-01-30), major overhaul (2026-03-17);
 2026-07-10 audit found P1–P9 follow-ups. Refreshed 2026-07-15: the safety-classification gaps
 (P6a/P6b) and the normal permanent-delete path (P1/P1b/P2, PR #129) are **closed** on `main`.
-Remaining debt is reclamation edge cases (P4/P7), observability (P5), test hygiene (1A–1C), and
+Remaining debt is reclamation edge cases (P4/P7), observability (P5), test hygiene (1G; 1A–1C done), and
 the Medium Phase 9 global-scan scale debt (P8) — not live-data deletion.
 **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
 **Tests**: 55 Go unit tests + 21 bash integration tests
@@ -4189,6 +4189,16 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
   fail: the restored marker carries `block_representation_id=plain:v1` (previously empty) and a
   correctly-null `purge_requested_at`.
 
+  **Corrupting fixtures must restore what teardown reads.** `TestWebBlockUploadReuploadRepairsMissingBlockSHA1`
+  blanks `blocks.sha1` on purpose. On the happy path the re-upload repairs it, but this test is a
+  **known local flaky** (returns 200 instead of the expected 409 on a 1-node stack), so it
+  regularly aborts with the column still blank. `blocks.sha1` is the only way to name a block's
+  forward `block_id_mappings` row — the reverse index was dropped in migration 006 — so teardown
+  skipped the mapping and then deleted the block and its S3 object, stranding a mapping pointing at
+  nothing. Reproduced by forcing the failure: `mappings=1` with everything else 0; with the restore
+  in place, 0. The test now re-stamps the known sha1 in a `t.Cleanup` registered after the session's
+  (LIFO ⇒ runs first), using `IF EXISTS` so it cannot resurrect a row GC already reclaimed.
+
   **Scope of the fix, measured honestly.** 1A/1B cover the `web_block_upload_test.go` fixtures.
   A **full** suite run (`go test -tags integration ./internal/integration/`, 236s, all green)
   drains from **122 blocks / 117 S3 objects** down to **2**, not 0:
@@ -4201,7 +4211,7 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
   - `up:sync:<session>:<block>` from the sync-protocol fixtures — same class 1B fixed, different
     upload path. It carries a provisional expiry projection, so Phase 0 reclaims it in ~2 days.
 
-  Tracked as **branch 1D**.
+  Tracked as **branch 1G**.
 
   Do not run a global GC over the shared keyspace (invariants #5/#6).
 - **Branch 1C** ✅ **DONE**: the last direct global `ProcessOnce(storage=nil)`
