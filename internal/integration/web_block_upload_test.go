@@ -158,9 +158,76 @@ func blockStoreForCleanupOrNil(t *testing.T) *storage.BlockStore {
 	return storage.NewBlockStore(s3Store, "blocks/")
 }
 
+// releaseStagedBlockForTest finishes tearing down one block staged by an upload session
+// whose `up:` reference the caller has just deleted.
+//
+// Deleting that reference with raw CQL removes the block's last referrer without going
+// through the production release path, so nothing calls EnsureBlockGCCandidate: the block
+// becomes zero-ref but UNDISCOVERABLE. scanOrphanedBlocks only walks candidates that
+// already exist, so the only thing that eventually rescues it is Phase 0 firing on the
+// provisional expiry projection — two days later (P4 is the same shape for `pub:`). Until
+// then every suite run leaves its uploaded blocks and S3 objects lying around, which is
+// precisely the drift the delete audit had to untangle.
+//
+// So: drop the expiry projection the upload registered, and if the block has no referrers
+// left, remove the block row, its forward mapping and its S3 object. A block that still
+// has a referrer (a committed `fs:`) belongs to a library — leave it alone and let that
+// library's cascade reclaim it through the real GC path.
+//
+// See ISSUE-GC-TEST-RESIDUE-01 (branch 1B).
+func releaseStagedBlockForTest(t *testing.T, database *dbpkg.DB, orgID, blockID, referrer string, blockStore *storage.BlockStore) {
+	t.Helper()
+
+	if err := database.DeleteProvisionalBlockReferenceExpiry(orgID, blockID, referrer, time.Time{}); err != nil {
+		t.Errorf("cleanup staged block %s/%s: delete provisional expiry: %v", orgID, blockID, err)
+		return
+	}
+
+	var survivingReferrer string
+	err := database.Session().Query(
+		`SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? LIMIT 1`,
+		orgID, blockID).Scan(&survivingReferrer)
+	if err == nil {
+		return // still referenced (e.g. committed fs:) — its library's cascade owns it
+	}
+	if !errors.Is(err, gocql.ErrNotFound) {
+		t.Errorf("cleanup staged block %s/%s: check remaining referrers: %v", orgID, blockID, err)
+		return
+	}
+
+	// Zero-ref: read sha1 before deleting the row — it is the mapping's external id.
+	var externalSHA1 string
+	switch err := database.Session().Query(
+		`SELECT sha1 FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&externalSHA1); {
+	case errors.Is(err, gocql.ErrNotFound):
+		return // already reclaimed by GC
+	case err != nil:
+		t.Errorf("cleanup staged block %s/%s: read sha1: %v", orgID, blockID, err)
+		return
+	}
+
+	if externalSHA1 != "" {
+		if err := database.Session().Query(
+			`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`,
+			orgID, dbpkg.PlainBlockRepresentationID, externalSHA1).Exec(); err != nil {
+			t.Errorf("cleanup staged block %s/%s: delete mapping %s: %v", orgID, blockID, externalSHA1, err)
+		}
+	}
+	if err := database.Session().Query(
+		`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+		t.Errorf("cleanup staged block %s/%s: delete blocks row: %v", orgID, blockID, err)
+	}
+	if blockStore != nil {
+		if err := blockStore.DeleteBlock(context.Background(), blockID); err != nil {
+			t.Errorf("cleanup staged block %s/%s: delete S3 object: %v", orgID, blockID, err)
+		}
+	}
+}
+
 func cleanupBlockUploadSessionForTest(t *testing.T, sessionID string) {
 	t.Helper()
 
+	blockStore := blockStoreForCleanupOrNil(t)
 	database := shareProjectionDBForTest(t)
 	session, ok, err := database.GetBlockUploadSession(sessionID)
 	if err != nil {
@@ -196,6 +263,7 @@ func cleanupBlockUploadSessionForTest(t *testing.T, sessionID string) {
 			`, session.OrgID, blockID, referrer).Exec(); err != nil {
 				t.Errorf("cleanup block upload session %s: delete provisional ref for block %s: %v", sessionID, blockID, err)
 			}
+			releaseStagedBlockForTest(t, database, session.OrgID, blockID, referrer, blockStore)
 		}
 		if err := database.Session().Query(`
 			DELETE FROM block_upload_session_staged_blocks WHERE session_id = ? AND bucket = ?
@@ -233,8 +301,20 @@ func webUploadBlock(t *testing.T, c *testClient, session string, data []byte) *h
 
 // webUploadBlockLegacy POSTs raw block bytes WITHOUT a session (S3 only, no
 // materialization) — mirrors the desktop/mobile oracle path.
+//
+// Teardown is registered here rather than left to callers because this path writes an
+// object with NO `blocks` row and no reference: it is a pure S3 orphan by construction.
+// Nothing reclaims it — GC discovers blocks through candidates, and its S3-orphan recovery
+// only replays its own in-flight deletes from `gc_s3_orphans`. So an untorn-down legacy
+// upload lives in the bucket forever (ISSUE-GC-TEST-RESIDUE-01 / branch 1B). The delete is
+// best-effort: callers that assert a rejection (e.g. quota 403) never created the object.
 func webUploadBlockLegacy(t *testing.T, c *testClient, data []byte) *http.Response {
 	t.Helper()
+
+	if blockStore := blockStoreForCleanupOrNil(t); blockStore != nil {
+		hash := sha256hex(data)
+		t.Cleanup(func() { _ = blockStore.DeleteBlock(context.Background(), hash) })
+	}
 	url := c.baseURL + "/api/v2/blocks/upload"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {

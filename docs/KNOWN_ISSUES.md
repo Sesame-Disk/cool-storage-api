@@ -4152,7 +4152,38 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 #### Fix Direction (branches 1A/1B/1C)
 
 - **Branch 1A**: fix `TestWebBlockUploadForeignPubRefNotPermanent` — capture the referrer in a variable, add a `t.Cleanup` that deletes **all** rows/objects identified by the fixture's exact org/library/session/operation/block IDs (ref + block + mapping + S3 object **+ the provisional expiry projection** created by the real upload session), or insert the fake `pub:` with a TTL and still clean up; assert the fake ref is gone. Clean only exact-ID artifacts — never broad cleanup. Preserve the test's purpose (a foreign `pub:` must not count as a permanent ref).
-- **Branch 1B**: inventory the E2E upload fixtures that leave `blocks` rows + S3 objects and add fixture-scoped teardown; also repair the `library_projection_regression_test.go` failure-restore so it does not re-insert an unstamped marker. Measure **no-net-growth** vs the pre-suite baseline. Do not run a global GC over the shared keyspace (invariants #5/#6).
+- **Branch 1B** — *root-caused 2026-07-15; session-block teardown landed, `library_projection_regression_test.go` repair still open.*
+
+  **Why upload fixtures leaked, precisely.** `cleanupBlockUploadSessionForTest` deleted the
+  session's `up:` reference with **raw CQL**. That drops the block's last referrer without going
+  through the production release path, so nothing calls `EnsureBlockGCCandidate` — and
+  `scanOrphanedBlocks` only walks candidates that already exist. The block was therefore
+  **zero-ref and undiscoverable**: the only thing that ever rescued it was Phase 0 firing on the
+  provisional expiry projection, **two days later** (the same shape as P4 for `pub:`). Every suite
+  run left its uploaded blocks + S3 objects parked for 48h, which is a large part of the drift the
+  audit had to untangle. Measured on a clean single-node docker stack (`configs/config.docker.yaml`:
+  `scan_interval 30s`, `grace_period 1m`, `trash_retention_days 0`), `-run TestWebBlockUpload`:
+
+  | | blocks | mappings | prov_refs | prov_by_day | MinIO |
+  | --- | --- | --- | --- | --- | --- |
+  | before fix, right after suite | 20 | 20 | 4 | 4 | 21 |
+  | before fix, after GC drained | **4** | **4** | **4** | **4** | **5** ← stuck 2 days, GC idle |
+  | after fix, right after suite | 15 | 15 | **0** | **0** | 16 |
+
+  The `fs:` refs of committed files are *not* leaks: the library cascade releases them through the
+  real GC path (15 of 15 released, 16 of 20 blocks reclaimed). Only the staged-but-uncommitted
+  blocks were stranded.
+
+  **Fix:** `releaseStagedBlockForTest` now drops the expiry projection and, when the block has no
+  referrer left, its `blocks` row, forward mapping and S3 object. A block that still has a referrer
+  (a committed `fs:`) belongs to a library and is left to that library's cascade. It hangs off
+  `cleanupBlockUploadSessionForTest`, which `webCreateBlockSession` already registers for every
+  session, so every upload fixture inherits it.
+
+  **Still open:** repair the `library_projection_regression_test.go` failure-restore so it does not
+  re-insert an unstamped `deleted_libraries` marker.
+
+  Do not run a global GC over the shared keyspace (invariants #5/#6).
 - **Branch 1C** ✅ **DONE**: the last direct global `ProcessOnce(storage=nil)`
   (`admin_identity_projection_regression_test.go`, org-cascade hard-delete test) now calls
   `ProcessOrgOnce(ctx, orgUUID)`, matching the pattern the rest of `gc_integration_test.go`
