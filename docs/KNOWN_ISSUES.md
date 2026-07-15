@@ -4152,7 +4152,7 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 #### Fix Direction (branches 1A/1B/1C)
 
 - **Branch 1A**: fix `TestWebBlockUploadForeignPubRefNotPermanent` — capture the referrer in a variable, add a `t.Cleanup` that deletes **all** rows/objects identified by the fixture's exact org/library/session/operation/block IDs (ref + block + mapping + S3 object **+ the provisional expiry projection** created by the real upload session), or insert the fake `pub:` with a TTL and still clean up; assert the fake ref is gone. Clean only exact-ID artifacts — never broad cleanup. Preserve the test's purpose (a foreign `pub:` must not count as a permanent ref).
-- **Branch 1B** — *root-caused 2026-07-15; session-block teardown landed, `library_projection_regression_test.go` repair still open.*
+- **Branch 1B** ✅ **DONE** *(root-caused and closed 2026-07-15)*
 
   **Why upload fixtures leaked, precisely.** `cleanupBlockUploadSessionForTest` deleted the
   session's `up:` reference with **raw CQL**. That drops the block's last referrer without going
@@ -4180,8 +4180,28 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
   `cleanupBlockUploadSessionForTest`, which `webCreateBlockSession` already registers for every
   session, so every upload fixture inherits it.
 
-  **Still open:** repair the `library_projection_regression_test.go` failure-restore so it does not
-  re-insert an unstamped `deleted_libraries` marker.
+  **Unstamped-marker restore, also fixed.** `registerLibraryBaseRowRestoreCleanup` re-inserted
+  `deleted_libraries` **without** `block_representation_id`, recreating the exact state PR #123
+  fixed: Phase 13 then has to recover the representation from the `libraries` row and counts it as
+  drift, and if that row is gone the library is stranded in trash forever. It also dropped
+  `purge_requested_at` (migration 012), losing the permanent-delete signal. The snapshot now
+  captures both and the restore writes them back. Verified on the real path by forcing the test to
+  fail: the restored marker carries `block_representation_id=plain:v1` (previously empty) and a
+  correctly-null `purge_requested_at`.
+
+  **Scope of the fix, measured honestly.** 1A/1B cover the `web_block_upload_test.go` fixtures.
+  A **full** suite run (`go test -tags integration ./internal/integration/`, 236s, all green)
+  drains from **122 blocks / 117 S3 objects** down to **2**, not 0:
+
+  - `fs:<lib>:<path>` pinning one block whose library is gone from **both** `libraries` and
+    `deleted_libraries`, with GC idle (`gc_queue=0`, `candidates=0`). This is the **F1/P7 shape and
+    is eternal** — no phase can rediscover it. Most likely source is a fixture that removes library
+    base rows with raw CQL (e.g. `removeLibraryBaseRowsForFallbackTest`), whose restore only fires
+    on failure, so a *passing* run strands whatever the library still referenced.
+  - `up:sync:<session>:<block>` from the sync-protocol fixtures — same class 1B fixed, different
+    upload path. It carries a provisional expiry projection, so Phase 0 reclaims it in ~2 days.
+
+  Tracked as **branch 1D**.
 
   Do not run a global GC over the shared keyspace (invariants #5/#6).
 - **Branch 1C** ✅ **DONE**: the last direct global `ProcessOnce(storage=nil)`
