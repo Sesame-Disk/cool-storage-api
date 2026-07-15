@@ -1,19 +1,27 @@
 # GC Service Analysis
 
-**Date:** 2026-04-14 · **Corrected against `main` 4333be1b3:** 2026-07-10
+**Date:** 2026-04-14 · **Corrected against `main` 4333be1b3:** 2026-07-10 · **Status refresh against `main` 23f221ee9:** 2026-07-15
 **Scope:** `internal/gc/` — 9,940 lines across 9 files + 3,380 lines of tests.
 **Goal:** Evaluate correctness, test coverage, identify potential data-loss bugs, and
 plan integration tests for long-running monitoring.
 
-> **See also (2026-07-10 delete-path audit):** the library-delete → cascade handoff has
-> verified follow-up debt P1–P8. The physical block-delete claim/recovery protocol is
-> conservative. P6a (Cassandra existence-read failures interpreted as "missing", enqueuing
-> destructive work for live libraries on a transient error) is now **fixed** (branch 1D):
-> existence reads fail closed and Phases 3/4/9 surface the error. P6b is also **fixed**:
-> queued orphan work is revalidated by canonical `(org_id, library_id)` point read under the
-> existing library lock, with synchronous fencing before destructive mutations. P7 records that
-> markerless commit/fs_object partitions are still invisible to current orphan discovery.
-> Full audit:
+> **See also (delete-path audit, refreshed 2026-07-15):** **no open known issue can delete live
+> content in the normal production delete flow.** The physical block-delete claim/recovery
+> protocol is conservative. P6a (existence-read failures interpreted as "missing", enqueuing
+> destructive work for live libraries on a transient error) is **fixed** (branch 1D): existence
+> reads fail closed and Phases 3/4/9 surface the error. P6b is **fixed**: queued orphan work is
+> revalidated by canonical `(org_id, library_id)` point read under the existing library lock,
+> with synchronous fencing before destructive mutations. P1/P1b/P2 (durable purge marker +
+> cascade on every wired permanent-delete path) are **fixed** on `main` (PR #129), and P9
+> (`gc_pending_items` block-row leak) is fixed for new work.
+>
+> Remaining debt is **storage retention in edge cases, observability, test hygiene, and scale** —
+> not live-data safety: P4 (`pub:` zero-ref transition), P5 (Phase 13 error visibility), P7
+> (markerless commit/fs_object partitions invisible to orphan discovery — reachable on any
+> cluster via terminal child-work loss/DLQ expiry, so 8D stays open), P8 (Phase 9
+> `shares_by_group` global scan). Reconcile/backfill (8A–8C) repairs *pre-existing* residue only
+> and is **out of scope for the planned greenfield prod deploy**.
+> Full audit (P1–P9, invariants, branch roadmap):
 > [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md);
 > per-item issues: `ISSUE-GC-*` in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
@@ -172,9 +180,11 @@ These are deliberate safety mechanisms that are correctly implemented and tested
    worker crashes, a later worker can take over after the heartbeat becomes
    stale; active lock contention is postponed without consuming retry budget.
 6. **Scanner safety nets are partial** — phases recover discoverable candidates/markers and
-   run on startup + every 24h. P6a (transient-error fail-open) is now fixed, so a transient
+   run on startup + every 24h. P6a (transient-error fail-open) is fixed, so a transient
    existence read no longer misclassifies a live library; P6b execution-time canonical
-   revalidation is fixed, while P7 durable markerless discovery remains.
+   revalidation is fixed; Phase 13 now makes permanently-deleted libraries eligible via the
+   durable `purge_requested_at` marker (migration 012). P7 durable markerless discovery and
+   P5 Phase 13 error propagation remain.
 7. **Retry with cap** — Failed items retry up to 5 times with HOL-blocking prevention, then
    move to `gc_failed_items`; explicit expiry later removes DLQ + pending projection together.
 8. **Audit logging** — Cascade deletes write to `audit_log`.
@@ -211,12 +221,16 @@ not only `ErrNotFound`, so Phases 3/4 could enqueue live commits/fs_objects with
 all other errors; Phases 3/4/9 fail closed and surface the error; regression tests added. See
 `ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01`.
 
-### HIGH/MEDIUM: Markerless artifacts are not discoverable
+### MEDIUM: Markerless artifacts are not discoverable
 
 The methods named `ListDistinctCommitLibraries` and `ListDistinctFSObjectLibraries` enumerate
 only `libraries_by_id` + `deleted_libraries`. If both indexes are gone, surviving artifact
-partitions cannot be found by Phases 3/4. See
-`ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`.
+partitions cannot be found by Phases 3/4. Observed in the dev-cluster audit snapshot (test drift)
+and **not reproduced on the live delete path**, so it is not a normal-flow gap — but it is not
+brownfield-only either: the cascade enqueues children before `HardDeleteLibrary` drops canonical +
+marker, so terminal child-work loss (retry exhaustion → DLQ → DLQ expiry) strands artifacts on a
+fresh cluster too. Under-reclamation, never incorrect deletion. Not a launch blocker; 8D stays
+open. See `ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`.
 
 ### RESOLVED: Hot exact recounts removed without Cassandra COUNTER
 
@@ -339,8 +353,11 @@ The physical block claim/recheck/recovery sequence is conservative **given corre
 The transient-error fail-open existence read (P6a) and execution-time canonical revalidation gap
 (P6b) are fixed. P6b uses durable guard modes, the existing library lock, an O(1) canonical
 point read, and synchronous fences before destructive mutations. P8 tracks Phase 9's provisional
-global Cassandra scan (streamed and cancellable, but not partition-bounded). The remaining
-P1–P5/P7 issues primarily retain or delay garbage rather than deleting referenced blocks.
+global Cassandra scan (streamed and cancellable, but not partition-bounded). P1/P1b/P2 are fixed
+(durable `purge_requested_at` + cascade, PR #129) and P3 is downgraded to Low (the durable
+cascade's `HardDeleteLibrary` clears the policy rows the direct-delete batch leaves behind). The
+remaining P4/P5/P7 issues plus the P8 scale debt primarily retain or delay garbage rather than
+deleting referenced blocks.
 
 ---
 
@@ -392,7 +409,7 @@ P1–P5/P7 issues primarily retain or delay garbage rather than deleting referen
 | **User cascade end-to-end** | Medium | **Pending** | No integration test creates a user, soft-deletes them, and verifies full cascade through GC. |
 | **Soak test validation** | Medium | **Code written, needs run** | `TestGC_Soak` is implemented but hasn't been executed against the live stack yet. |
 | **Existence read failure → no live deletion (P6)** | **High** | **Done** | `TestScanner_ScanOrphaned{Commits,FSObjects}_FailClosedOnLibraryExistsError` and `TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError` fault-inject `LibraryExists`/`GroupExists` and prove no live commit/fs_object is enqueued and no valid share is deleted. |
-| **Markerless artifact discovery (P7)** | High/Med | **Missing** | Remove both library indexes while retaining fixture commits/fs_objects; prove bounded discovery/reconcile. |
+| **Markerless artifact discovery (P7)** | Med | **Missing** | Remove both library indexes while retaining fixture commits/fs_objects; prove bounded discovery/reconcile. Also cover the fresh-cluster trigger: drive a cascade child to DLQ, expire it, assert the artifact stays discoverable. |
 | **No global cross-test GC** | Medium | **Broken** | Replace direct `ProcessOnce(storage=nil)` with `ProcessOrgOnce`; isolate admin GC triggers. |
 
 ---

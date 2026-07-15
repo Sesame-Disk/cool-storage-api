@@ -2132,7 +2132,8 @@ indexes are gone, artifacts are invisible (`ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-0
   truncate `block_references`/mappings to clean a cluster (would orphan MinIO).
 - **N+1 in bulk cleaners (d).** The trash-listing path does one extra read per library to resolve
   `encrypted` + `block_representation_id`; fold both into the listing query, with the extra resolver
-  only as a legacy fallback (branch 9). Do not mix this optimization with the durable-handoff work —
+  only as a legacy fallback (branch N+1, formerly "branch 9" — renamed to avoid confusion with the
+  fixed **P9** pending-items leak). Do not mix this optimization with the durable-handoff work —
   an optimization can mask functional errors and complicate the audit.
 
 ### Architectural invariants (must not be broken by any follow-up)

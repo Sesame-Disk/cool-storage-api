@@ -755,6 +755,12 @@ Do not use `--build` for the normal prod path. The production compose consumes p
 
 ### Upgrading GC to the library guard-mode build (migration 011) — stop-the-world
 
+> **Not applicable to a greenfield deploy.** This procedure exists for clusters that already ran
+> an older GC binary against populated `gc_queue` / `gc_failed_items` tables. A fresh install
+> applies every migration at first boot, before any scanner or worker runs, so there is no
+> version skew and no pre-011 backlog to drain — deploy normally and enable GC per the
+> single-leader guidance below.
+
 Migration 011 adds `library_guard_mode` to `gc_queue` / `gc_failed_items` and the
 scanner starts stamping orphan work as `canonical_absent` (P6b execution-time
 revalidation). This is **not** safe under a mixed-version GC fleet: a new scanner

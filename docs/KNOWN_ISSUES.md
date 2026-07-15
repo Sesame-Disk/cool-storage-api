@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-07-10
+**Last Updated**: 2026-07-15
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🟠 Safety hardening + follow-up debt | Physical block delete is conservative; P6a and P6b safety-classification gaps are fixed. Reclamation/durability gaps P1–P5/P7 and Phase 9 scale debt P8 remain. See the GC audit section below. |
+| Garbage Collection | 🟢 Safe for prod (greenfield) | Normal delete path exercised end-to-end (~50 GB manual dev-cluster run, zero content residue — operator observation, not an automated test). P6a/P6b and P1/P2 closed on `main` (PR #129). Remaining GC debt is storage retention in edge cases (P4/P7), observability (P5), test hygiene (1A–1C), and scale (P8) — not live-data deletion. Reconcile/backfill not required for empty prod deploy. See GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -55,33 +55,36 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Read Paths Ignore `storage_key`** | 🟡 Pending | All block reads derive the S3 key from the content hash (`hashToKey`) and never consult the canonical `storage_key` column; only the new reuse verify/repair honors it. Harmless today (`storage_key` is empty or equal to the hash-derived key) but blocks any non-hash-derived key layout. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
-### 🔴 GC Library-Delete Cleanup Audit (2026-07-10)
+### 🟢 GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-15)
 
-Follow-up debt from the PR #123 audit. The physical block-delete protocol is conservative
-(claim→recovery→delete ordering, fail-closed representation validation). The High fail-open
-existence check (P6) that could enqueue destructive work for live libraries is **fixed** (branch
-1D, 2026-07-10); P1–P5/P7 are reclamation/durability gaps and P8 is Phase 9 scale debt. Full audit:
-`docs/GC-DELETE-CLEANUP-INVESTIGATION.md`. Close on small, auditable branches.
+Follow-up debt from the PR #123 audit. **Verdict (2026-07-15):** no open known issue can delete
+live content in the normal production delete flow. P6a/P6b safety guards and P1/P1b/P2 durable
+purge + cascade are **fixed** on `main` (PR #129). The planned **greenfield prod deploy** starts
+from an empty cluster — reconcile/backfill (8A–8C) and pre-fix `gc_pending_items` orphans are
+**not required**. Note this depends on a **recreated keyspace + empty/new buckets, never written
+by an older binary**: an empty dashboard or `gc_queue = 0` does *not* prove that (this audit began
+on a cluster that reported 0 libraries / 0 bytes and still held blocks + MinIO objects). Full
+audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 
 | Issue | Status | Details |
 |-------|--------|---------|
 | **Org-Admin Trash Delete Defers Cleanup** | 🟢 Fixed (6A/6B + parity follow-up, 2026-07-14) | Permanent-delete now stamps a durable `deleted_libraries.purge_requested_at` (migration 012). The immediate Phase-13-deduplicated `library_cascade` enqueue is wired on the v2.1 owner path and the platform/org-admin delete paths; the legacy `/api2/repos/deleted/:repo_id` registration still falls back to marker + Phase 13 recovery. In the wired paths, reclamation normally lands around the grace period; if that best-effort enqueue is lost, Phase 13 adds up to one `ScanInterval` before recovery. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01 below. |
 | **Non-Durable, Content-Only Delete Handoff** | 🟢 Resolved (6A/6B + org-admin parity, 2026-07-14) | Correctness is durable via `deleted_libraries.purge_requested_at` + Phase 13; all wired permanent-delete paths (v2.1 owner + platform + org-admin single/bulk) now call `Service.EnqueueLibraryCascade` (identity-matched to Phase 13, a dedup no-op) as a best-effort accelerator, and a lost enqueue costs only latency. The legacy `/api2/repos/deleted/:repo_id` route mounts the handler with `libHandler=nil` and relies on marker + Phase 13. See ISSUE-GC-DELETE-HANDOFF-DURABILITY-01 below. |
-| **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Confirmed, benign (Med) | The direct-delete helper does not call `AddDeleteLibraryPolicyQuery`; policy index rows for policy-bearing libraries accumulate. Scanner re-validates and skips, so no mis-processing. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
-| **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
+| **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Low — transient for new deletes | `hardDeleteLibraryRowsFn` does not synchronously call `AddDeleteLibraryPolicyQuery`, but the durable cascade's `HardDeleteLibrary` clears both policy rows. At most a short stale window for new deletes; branch 2 is optional polish. Not a greenfield-prod blocker. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
+| **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. Storage retention, not incorrect deletion. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
-| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
+| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. Dev-cluster only; does not affect prod safety. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
 | **Existence Checks Fail Open (transient errors, P6a)** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors and scanner Phases 3/4/9 fail closed. Phase 9 scans `shares_by_group` directly and uses each projection row's `OrgID`, with unit and real-Cassandra regression coverage. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
 | **Worker Canonical Revalidation of Orphan Work (P6b)** | ✅ Fixed (2026-07-10) | Durable `canonical_absent` work is point-read against `libraries[(org_id, library_id)]` under the existing library lock; presence/read/fence/unknown-mode paths fail closed. Retry/DLQ and legacy compatibility are covered. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
 | **Cascade Deletes Counter Before Hard Delete** | ✅ Fixed (2026-07-11) | `cascadeDeleteLibrary` now hard-deletes the canonical row before removing the per-library storage counter, closing a crash+restore window that could reactivate an under-counted library. The reordering (the real fix) covers both cascade callers; the counter auto-reclaim is wired only into `processLibraryCascade`. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01 below. |
 | **Org Cascade Can Leak an Inert Counter Row** | 🟡 Confirmed gap (Low) | If the per-library counter delete fails/crashes after the hard delete during an **org** cascade, the retry cannot re-find the (now canonical-absent) library to reclaim its counter. The row is inert — aggregates are adjusted at soft-delete and nothing sums `lib:*` counters — so no accounting impact. See ISSUE-GC-ORG-CASCADE-COUNTER-LEAK-01 below. |
-| **Legacy `NULL + false` Orphan Rows Run Unguarded** | 🟡 Confirmed gap (Low, pre-prod) | Orphan queue/DLQ rows written before migration 011 (empty `library_guard_mode` **and** `requires_library_deleted_check=false`) hydrate as `LibraryGuardNone` and skip the canonical guard — identical to `main`'s behavior, so not a regression, but P6b does not retroactively protect already-enqueued orphan work. See ISSUE-GC-LEGACY-ORPHAN-UNGUARDED-01 below. |
+| **Legacy `NULL + false` Orphan Rows Run Unguarded** | ⏸ N/A (greenfield prod) | Orphan queue/DLQ rows written before migration 011 would skip the canonical guard. Not present on a fresh deploy. See ISSUE-GC-LEGACY-ORPHAN-UNGUARDED-01 below. |
 | **Org Cascade Re-Soft-Deletes on Marker Drift** | 🟡 Confirmed, defense-in-depth (Low) | If `libraries.deleted_at` is set but the `deleted_libraries` marker is absent, the org cascade re-runs `SoftDeleteLibrary`, re-stamping `deleted_at` and re-subtracting aggregates (double-decrement, clamped). Unreachable under normal ops (marker + canonical are written/cleared atomically), so a corruption-only hardening. See ISSUE-GC-ORG-CASCADE-REMARK-01 below. |
-| **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (High/Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
+| **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. Drift/manual-ops edge case; not reproduced on the current live path. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
 | **Phase 9 Group-Share Discovery Is a Global Scan** | 🟠 Pending (Med) | The immediate fix streams `shares_by_group` in bounded driver pages with cancellation, but Cassandra still scans every partition. Replace with bucketed active-partition discovery. See ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01 below. |
-| **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Former E3 is escalated to the High P6 issue. See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
-| **No Reconcile/Backfill for Existing Orphans** | 🟡 Follow-up | Existing clusters may hold blocks/S3 objects/stale policy rows orphaned by the gaps above. Needs a read-only-first reconcile pass, not blind truncation. See ISSUE-GC-RECONCILE-BACKFILL-01 below. |
-| **Block `gc_pending_items` Rows Leak (library-scope mismatch)** | 🟢 Root-caused + fixed (2026-07-13) | Confirmed live-path leak (was E4 "drift risk"): `ItemBlock` enqueued with the real `library_id` while the pending key is library-scoped and dedup checks use `uuid.Nil`, orphaning one pending row per block deleted (~9,629 for a 50 GB delete). No data-safety impact. Fixed by standardizing block enqueue on `uuid.Nil`. See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01 below. |
+| **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Block pending leak (E4) fixed for new work (P9). See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
+| **No Reconcile/Backfill for Existing Orphans** | ⏸ Deferred (greenfield prod) | Brownfield clusters with pre-fix residue may need a read-only reconcile pass. **Not required** for the planned empty prod deploy. See ISSUE-GC-RECONCILE-BACKFILL-01 below. |
+| **Block `gc_pending_items` Rows Leak (library-scope mismatch)** | 🟢 Fixed (2026-07-13) | Confirmed live-path leak: `ItemBlock` enqueued with the real `library_id` while the pending key is library-scoped and dedup checks use `uuid.Nil`. Fixed by standardizing block enqueue on `uuid.Nil` + store backstop. Pre-existing orphans on brownfield clusters only. See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -2801,10 +2804,12 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 
 ## 🚧 BACKEND NOT IMPLEMENTED
 
-### Garbage Collection — IMPLEMENTED, OPEN SAFETY + DURABILITY DEBT
+### Garbage Collection — IMPLEMENTED, SAFE FOR GREENFIELD PROD; OPEN RECLAMATION/OPS DEBT
 **Status**: Core engine implemented (2026-01-30), major overhaul (2026-03-17);
-2026-07-10 audit found P1–P8 follow-ups including the High fail-open P6a safety gap (fixed)
-and the Medium Phase 9 global-scan debt P8.
+2026-07-10 audit found P1–P9 follow-ups. Refreshed 2026-07-15: the safety-classification gaps
+(P6a/P6b) and the normal permanent-delete path (P1/P1b/P2, PR #129) are **closed** on `main`.
+Remaining debt is reclamation edge cases (P4/P7), observability (P5), test hygiene (1A–1C), and
+the Medium Phase 9 global-scan scale debt (P8) — not live-data deletion.
 **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
 **Tests**: 55 Go unit tests + 21 bash integration tests
 **Admin API**: `GET /api/v2.1/admin/gc/status`, `POST /api/v2.1/admin/gc/run`
@@ -3634,7 +3639,7 @@ Both org-admin trash-delete paths hard-delete the library rows and insert the `d
 
 They rely on scanner Phase 13 (`scanExpiredDeletedLibraries`), which only picks up a deleted library after `TrashRetentionDays` (~30 days by default). Worse, the hard-delete re-inserts the marker with `deleted_at = time.Now()` ([org_admin_repos.go:432](../internal/api/v2/org_admin_repos.go#L432), [library_delete_helpers.go:36](../internal/api/v2/library_delete_helpers.go#L36)), **resetting the retention clock**, so Phase 13's pickup is 30 days from the permanent-delete action, not from the original trashing.
 
-This is not an eternal leak (the marker keeps the content recoverable, and the cascade can run even after the `libraries` row is gone because `GetLibraryDeletedAt` reads the marker — [store_cassandra.go:1165](../internal/gc/store_cassandra.go#L1165)), but the user asked for a *permanent* delete and the physical content can survive for the full retention window.
+This is not an eternal leak (the marker keeps the content recoverable, and the cascade can run even after the `libraries` row is gone because `GetLibraryDeletedAt` reads the marker — [store_cassandra.go:1249](../internal/gc/store_cassandra.go#L1249)), but the user asked for a *permanent* delete and the physical content can survive for the full retention window.
 
 #### Evidence
 
@@ -3723,19 +3728,19 @@ lease before writing.
 
 ### ISSUE-GC-POLICY-INDEX-STALE-01: `gc_libraries_by_policy` Rows Leak on Direct Library Delete
 
-**Status**: 🟡 Confirmed, benign (2026-07-10)
-**Severity**: Medium — no mis-processing, but stale rows accumulate and add scan work
+**Status**: 🟡 Low — transient for new deletes (refined 2026-07-15)
+**Severity**: Low for new deletes — no mis-processing; at most a short stale row until cascade runs
 **Affected**: All direct-delete paths that go through `hardDeleteLibraryRowsFn`
 
 #### Problem
 
-The `gc_libraries_by_policy` index rows are maintained by the policy-setting endpoints (`library_settings.go` disabling `version_ttl`/`auto_delete`, `admin_libraries.go` history edit), by `rollbackNewLibrary` ([write_helpers.go:872-873](../internal/api/v2/write_helpers.go#L872)), and by the GC cascade's `HardDeleteLibrary` ([store_cassandra.go:3816-3817](../internal/gc/store_cassandra.go#L3816)). The confirmed gap is that the shared direct hard-delete helper `hardDeleteLibraryRowsFn` ([library_delete_helpers.go:29-41](../internal/api/v2/library_delete_helpers.go#L29)) does **not** include the `AddDeleteLibraryPolicyQuery` deletes, so a policy-bearing library deleted via a direct path leaks its policy index row.
+The `gc_libraries_by_policy` index rows are maintained by the policy-setting endpoints (`library_settings.go` disabling `version_ttl`/`auto_delete`, `admin_libraries.go` history edit), by `rollbackNewLibrary` ([write_helpers.go:874-875](../internal/api/v2/write_helpers.go#L874)), and by the GC cascade's `HardDeleteLibrary` ([store_cassandra.go:3911-3912](../internal/gc/store_cassandra.go#L3911)). The confirmed gap is that the shared direct hard-delete helper `hardDeleteLibraryRowsFn` ([library_delete_helpers.go:52-79](../internal/api/v2/library_delete_helpers.go#L52)) does **not** include the `AddDeleteLibraryPolicyQuery` deletes in its synchronous batch.
 
-Impact is benign: scanner Phase 5/6 re-read the `libraries` row per policy entry and `continue` on `ErrNotFound`, so stale rows are skipped, not mis-processed — but they accumulate.
+Since PR #129, every wired permanent-delete path enqueues the durable `library_cascade`, and `HardDeleteLibrary` removes both policy index rows. For **new deletes** this is at most a transient stale row between the API batch and the cascade — not a permanent leak. Scanner Phase 5/6 re-read the `libraries` row per policy entry and `continue` on `ErrNotFound`, so stale rows are skipped, not mis-processed. Historical accumulation matters only on **brownfield** clusters that existed before the cascade fix.
 
-#### Fix Direction (branch 2)
+#### Fix Direction (branch 2 — optional polish)
 
-Fold both `AddDeleteLibraryPolicyQuery` calls (version_ttl + auto_delete) into the `hardDeleteLibraryRowsFn` batch so every direct-delete path clears the index. The cascade path already does this, so behavior converges.
+Fold both `AddDeleteLibraryPolicyQuery` calls (version_ttl + auto_delete) into the `hardDeleteLibraryRowsFn` batch so every direct-delete path clears the index synchronously. The cascade path already does this, so behavior converges.
 
 #### Related Docs
 
@@ -3774,10 +3779,10 @@ Give `pub:` a discoverable expiry projection mirroring `up:`: register the proje
 
 #### Problem
 
-`scanExpiredDeletedLibraries` ([scanner.go:1183-1243](../internal/gc/scanner.go#L1183)):
+`scanExpiredDeletedLibraries` ([scanner.go:1256-1319](../internal/gc/scanner.go#L1256)):
 
-- on `EnqueueBatch` failure, logs the error but leaves `enqueued = 0` and returns `nil` ([scanner.go:1231-1242](../internal/gc/scanner.go#L1231));
-- on per-library `PendingItemExists` failure, logs and `continue`s ([scanner.go:1194-1197](../internal/gc/scanner.go#L1194)).
+- on `EnqueueBatch` failure, logs the error but leaves `enqueued = 0` and returns `nil` ([scanner.go:1304-1315](../internal/gc/scanner.go#L1304));
+- on per-library `PendingItemExists` failure, logs and `continue`s ([scanner.go:1267-1271](../internal/gc/scanner.go#L1267)).
 
 The failures are logged, but not surfaced through the phase result or a dedicated failure metric. Because the phase returns `nil`, the overall scan cycle can appear successful even though no cascade reached the queue. The `deleted_libraries` marker allows a later retry, so this is not data loss, but health and metrics are misleading.
 
@@ -3799,9 +3804,9 @@ Keep processing all markers, accumulate errors (`errors.Join`), return the joine
 
 #### Resolution
 
-- `LibraryExists` and `GroupExists` now return `(false, nil)` **only** for `gocql.ErrNotFound` and propagate every other error ([store_cassandra.go:2270-2283](../internal/gc/store_cassandra.go#L2270), [store_cassandra.go:3208-3222](../internal/gc/store_cassandra.go#L3208)).
-- Phase 9 no longer discards the `GroupExists` error — on error it skips the share (never deletes it) and records a phase error ([scanner.go:1013-1032](../internal/gc/scanner.go#L1013)).
-- Phases 3/4 handle the `LibraryExists` error explicitly (skip + surface `phaseErr`) so a transient read cannot enqueue a live library's commits/fs_objects ([scanner.go:531-546](../internal/gc/scanner.go#L531), [scanner.go:607-622](../internal/gc/scanner.go#L607)).
+- `LibraryExists` and `GroupExists` now return `(false, nil)` **only** for `gocql.ErrNotFound` and propagate every other error ([store_cassandra.go:2357-2373](../internal/gc/store_cassandra.go#L2357), [store_cassandra.go:3314-3329](../internal/gc/store_cassandra.go#L3314)).
+- Phase 9 no longer discards the `GroupExists` error — on error it skips the share (never deletes it) and records a phase error ([scanner.go:1073-1090](../internal/gc/scanner.go#L1073)).
+- Phases 3/4 handle the `LibraryExists` error explicitly (skip + surface `phaseErr`) so a transient read cannot enqueue a live library's commits/fs_objects ([scanner.go:532-546](../internal/gc/scanner.go#L532), [scanner.go:624-638](../internal/gc/scanner.go#L624)).
 - Phase 9 reads `OrgID` from each `shares_by_group` projection row and only falls back to the library→org projection when it is absent — surfacing that fallback failure instead of silently skipping a share. `ScanAllGroupShares` streams the projection directly in 256-row driver pages, so deleted-group partitions remain discoverable without materializing the full result; the Cassandra-wide scan is tracked separately as P8. The existence cache is a single-entry `(org_id, group_id)` "last partition" cache (O(1) memory) that opportunistically reuses the result (or error) for consecutive rows of the same partition; correctness does not depend on scan ordering, since a partition reappearing later just triggers another lookup ([scanner.go:1013-1094](../internal/gc/scanner.go#L1013)).
 - The worker guard (`acquireLibraryDeleteGuard`) already propagated `LibraryExists` errors; with the store fix it is now genuinely fail-closed.
 - Regression tests inject a transient existence error and assert no live commit/fs_object is enqueued and no valid group share is deleted, plus that Phase 9 cleans via the share `OrgID` without the library lookup: `TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError`, `TestScanner_ScanOrphanedGroupShares_UsesShareOrgIDWithoutLibraryLookup`, `TestScanner_ScanOrphanedCommits_FailClosedOnLibraryExistsError`, `TestScanner_ScanOrphanedFSObjects_FailClosedOnLibraryExistsError` (`internal/gc/scanner_test.go`). MockStore gained `libraryExistsErr`/`groupExistsErr` injection hooks.
@@ -3815,20 +3820,20 @@ The original analysis is retained below for provenance.
 #### Problem
 
 `CassandraStore.LibraryExists` returns `(false, nil)` for **every** query error instead of only
-`gocql.ErrNotFound` ([store_cassandra.go:2270-2278](../internal/gc/store_cassandra.go#L2270)).
+`gocql.ErrNotFound` ([store_cassandra.go:2357-2373](../internal/gc/store_cassandra.go#L2357)).
 Phases 3/4 enumerate live and deleted library IDs, call `LibraryExists`, and treat false as an
 orphan. If that read fails transiently but the next org/representation read succeeds, the scanner
 enqueues live commits/fs_objects with `RequiresLibraryDeletedCheck=false`
 ([scanner.go:531-579](../internal/gc/scanner.go#L531),
-[scanner.go:607-655](../internal/gc/scanner.go#L607)). `acquireLibraryDeleteGuard` intentionally
-bypasses all validation for such items ([worker.go:1586-1589](../internal/gc/worker.go#L1586)), so
+[scanner.go:623-671](../internal/gc/scanner.go#L623)). `acquireLibraryDeleteGuard` intentionally
+bypasses all validation for such items ([worker.go:1731-1733](../internal/gc/worker.go#L1731)), so
 the worker can delete live commits/fs_objects and release their legitimate `fs:` refs. The safe
 physical block claim cannot compensate after GC itself removed the live reference.
 
 `GroupExists` has the same error swallowing, and Phase 9 discards its error, so a transient read
 failure can delete a still-valid group share
-([store_cassandra.go:3208-3216](../internal/gc/store_cassandra.go#L3208),
-[scanner.go:1013-1025](../internal/gc/scanner.go#L1013)).
+([store_cassandra.go:3314-3329](../internal/gc/store_cassandra.go#L3314),
+[scanner.go:1073-1090](../internal/gc/scanner.go#L1073)).
 
 #### Fix Direction (branch 1D — before reclamation optimizations)
 
@@ -4070,28 +4075,53 @@ and provide reconcile/backfill for projection drift. Preserve direct orphan disc
 
 ### ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01: Markerless Commit/FS Partitions Are Invisible
 
-**Status**: 🟡 Confirmed gap (2026-07-10)
-**Severity**: High/Medium — markerless artifacts can remain indefinitely and evade Phases 3/4
+**Status**: 🟡 Confirmed gap (2026-07-10) — reachable on a fresh cluster via terminal child-work loss; not a launch blocker, but **not** greenfield-exempt
+**Severity**: Medium — markerless artifacts can remain indefinitely and evade Phases 3/4
 **Affected**: `ListDistinctCommitLibraries`, `ListDistinctFSObjectLibraries`, scanner Phases 3/4
 
 #### Problem
 
 Despite their names, `ListDistinctCommitLibraries` and `ListDistinctFSObjectLibraries` both call
 `listGCArtifactLibraries`, which enumerates only `libraries_by_id` plus `deleted_libraries`
-([store_cassandra.go:2235-2268](../internal/gc/store_cassandra.go#L2235)). It never enumerates
+([store_cassandra.go:2314-2355](../internal/gc/store_cassandra.go#L2314)). It never enumerates
 library IDs from surviving commit/fs_object partitions or a dedicated discovery projection.
 
 Once both library indexes/markers are gone, remaining commits/fs_objects are invisible to the
-orphan phases. This directly matches the audit snapshot: `libraries=0`,
-`deleted_libraries=0`, but `commits=4`. It also means DLQ expiry or legacy/manual drift can make
-child artifacts permanently undiscoverable after the parent marker has been removed.
+orphan phases. This directly matches the **audit dev-cluster snapshot** (`libraries=0`,
+`deleted_libraries=0`, but `commits=4`) — residue dominated by integration-test drift, not the
+current live delete path (~50 GB exercise left zero content residue).
+
+**This is not confined to brownfield clusters.** The cascade enqueues its children
+([worker.go:1325](../internal/gc/worker.go#L1325)) *before* `HardDeleteLibrary` drops the
+canonical row and the marker ([worker.go:1338](../internal/gc/worker.go#L1338)) — deliberately,
+so a concurrent restore cannot resurrect a partially-purged library. The consequence is that from
+that point on, the children are the **only** thing that knows the artifacts exist. If a child
+exhausts its retries it lands in `gc_failed_items`, and Phase 10's `DeleteExpiredFailedItem`
+([store_cassandra.go:891-942](../internal/gc/store_cassandra.go#L891)) removes the DLQ row and
+its pending projection in one batch. The commit/fs_object then survives with no library index, no
+marker, and no queue/DLQ trace — exactly the P7 shape, on a **fresh** cluster.
+
+Trigger set: **terminal child-work loss / DLQ expiry, corruption, or manual drift; never a normal
+successful delete.** The failure mode is under-reclamation (storage retained), never incorrect
+deletion of live content. It is not a launch blocker, but 8D is not made unnecessary by starting
+from an empty keyspace.
 
 #### Fix Direction (branch 8D)
 
-- Add a durable, bounded discovery projection for artifact library IDs, or keep a durable cleanup
-  identity until every child queue/DLQ item reaches a terminal state.
-- Backfill/report markerless artifact partitions through the read-only reconciler first.
+- Add a durable, bounded discovery projection for artifact library IDs, **or** retain a durable
+  library cleanup identity until every child **completes successfully**.
+- **Contract — do not weaken this to "terminal state".** Retry exhaustion and DLQ expiry *are*
+  terminal states, and they are exactly what produces P7 today: releasing the identity on those
+  transitions rebuilds the same hole this branch exists to close. Retry exhaustion or DLQ expiry
+  must **preserve or quarantine** the discovery identity and surface it for retry or operator
+  intervention. It must **never** erase the last discoverable reference to surviving artifacts.
+  "Successful completion of every child" is the only safe release condition.
+- Brownfield: report markerless artifact partitions through the read-only reconciler (8A) first.
 - Never solve this with a new full-table production scan or direct S3 deletion.
+
+**Greenfield prod:** no *historical* markerless partitions exist, so nothing needs repairing
+before launch — but the DLQ-expiry path above can create them on any cluster, so 8D remains
+genuinely open rather than brownfield-only.
 
 ---
 
@@ -4144,7 +4174,7 @@ A worker/scanner engine review confirmed E1/E2/E4/E5 as low-severity. Former E3 
 incorrectly described as fail-safe: the Cassandra store swallows the error, making it the High
 P6 issue above.
 
-- **E1 — no postpone bound.** `postponeItem` re-queues a lock-contended (`hard_delete_in_progress`) item with `RetryCount` unchanged ([worker.go:345-358](../internal/gc/worker.go#L345)). Intentional (lock contention should not push toward the DLQ), but with no bound and no metric a permanently stuck hard-delete lock loops forever with no DLQ/alert.
+- **E1 — no postpone bound.** `postponeItem` re-queues a lock-contended (`hard_delete_in_progress`) item with `RetryCount` unchanged ([worker.go:361-376](../internal/gc/worker.go#L361)). Intentional (lock contention should not push toward the DLQ), but with no bound and no metric a permanently stuck hard-delete lock loops forever with no DLQ/alert.
 - **E2 — `dryRun` data race vs cutover semantics.** `dryRun` is read/written concurrently
   without synchronization. `atomic.Bool` fixes the Go race and visibility, but does not stop work
   already past its check; hard cutover requires drain/serialization or destructive-step rechecks.
@@ -4152,19 +4182,23 @@ P6 issue above.
   as "missing"; non-`ErrNotFound` errors now propagate and scanners fail closed.
 - **E4 — pending projection drift.** Queue completion, DLQ
   deletion, and DLQ expiry remove `gc_pending_items` in their logged batches
-  ([store_cassandra.go:499-583](../internal/gc/store_cassandra.go#L499)). No independent reconcile
+  (`CompleteItem` [store_cassandra.go:580-604](../internal/gc/store_cassandra.go#L580),
+  `DeleteFailedItem` [store_cassandra.go:868-889](../internal/gc/store_cassandra.go#L868),
+  `DeleteExpiredFailedItem` [store_cassandra.go:891-942](../internal/gc/store_cassandra.go#L891),
+  all via `addPendingItemDeleteBatchQuery`
+  [store_cassandra.go:475](../internal/gc/store_cassandra.go#L475)). No independent reconcile
   exists for historical/manual/ambiguous drift. A blind TTL could expire valid dedup protection
   while queue/DLQ work remains live. **Update (2026-07-13): a concrete, unbounded live-path
   source of this drift was found, root-caused, and fixed — the block/library-scope mismatch.
   See `ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01` below.** The independent reconcile/backstop
   (10D) is still open for pre-existing orphans and other drift sources.
-- **E5 — S3-orphan recovery lease-only exclusion.** `RecoverS3Orphans` ([worker.go:599-772](../internal/gc/worker.go#L599)) has no per-row LWT; mutual exclusion relies on the leader lease. Real double-processing risk only under a lease split-brain.
+- **E5 — S3-orphan recovery lease-only exclusion.** `RecoverS3Orphans` ([worker.go:616-789](../internal/gc/worker.go#L616)) has no per-row LWT; mutual exclusion relies on the leader lease. Real double-processing risk only under a lease split-brain.
 
 #### Reviewed and found NOT to be bugs
 
-- "Infinite DLQ↔queue loop when the marker is deleted mid-cascade" — **not a bug**: the skip returns `nil` → the item is `Complete()`d (removed) ([worker.go:1199-1202](../internal/gc/worker.go#L1199) → [worker.go:311](../internal/gc/worker.go#L311)); Phase 13 lists from the marker, so a gone marker is not re-listed.
-- "Resurrection guard missing for the `pending_s3` phase" — **not a bug**: the branch checks `BlockExists` before the S3 delete and defers if the canonical row exists ([worker.go:695-708](../internal/gc/worker.go#L695)).
-- "Child-enqueue vs parent-delete race in `processCommit`/`processFSObject`" — **mitigated**: children carry `RequiresLibraryDeletedCheck` and their own `acquireLibraryDeleteGuard` catches restore/re-delete ([worker.go:1586-1616](../internal/gc/worker.go#L1586)).
+- "Infinite DLQ↔queue loop when the marker is deleted mid-cascade" — **not a bug**: the skip returns `nil` → the item is `Complete()`d (removed) ([worker.go:1243-1244](../internal/gc/worker.go#L1243) → [worker.go:311](../internal/gc/worker.go#L311)); Phase 13 lists from the marker, so a gone marker is not re-listed.
+- "Resurrection guard missing for the `pending_s3` phase" — **not a bug**: the branch checks `BlockExists` before the S3 delete and defers if the canonical row exists ([worker.go:712-725](../internal/gc/worker.go#L712)).
+- "Child-enqueue vs parent-delete race in `processCommit`/`processFSObject`" — **mitigated**: children carry `RequiresLibraryDeletedCheck` and their own `acquireLibraryDeleteGuard` catches restore/re-delete ([worker.go:1729-1830](../internal/gc/worker.go#L1729)).
 
 #### Fix Direction (branches 10A–10E)
 
@@ -4185,58 +4219,66 @@ P6 issue above.
 
 ### ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01: Block `gc_pending_items` rows leak (library-scope mismatch)
 
-**Status**: 🟢 Root-caused + fixed (2026-07-13) — reconcile of pre-existing orphans still open (10D)
+**Status**: 🟢 Fixed (2026-07-13) — brownfield orphan sweep optional (10D/8B); N/A on greenfield prod
 **Severity**: Low-Med — unbounded metadata growth + scan cost; **no data-safety impact**
 **Affected**: `internal/gc` block enqueue paths, `gc_pending_items`
 
-#### Problem (confirmed live-path leak, was E4 "drift risk")
+#### Problem (confirmed live-path leak, was E4 "drift risk") — HISTORICAL, fixed in PR #128
 
-`gc_pending_items` accumulates orphaned `block` rows proportional to deleted block volume. A real
+> **This section describes the code as it was at `253e08fef`** (the pre-fix parent of
+> `869a455f3`). Its code links are **pinned to that commit on purpose**: on current `main` these
+> lines read `uuid.Nil` and would contradict the text. See "Fix" below for current-code links.
+
+`gc_pending_items` accumulated orphaned `block` rows proportional to deleted block volume. A real
 50 GB upload → delete → GC-drain on a wiped dev cluster drove it from ~575 to **9,633 rows**
 (9,629 `block`), with `gc_queue = 0` / `gc_block_candidates = 0` / `gc_failed_items = 0` and no
-TTL (`default_time_to_live = 0`). Sampled orphan rows point at blocks that are already physically
-deleted. The 50 GB of **content** (blocks, refs, commits, S3 objects) was reclaimed correctly —
-only the dedup rows leak.
+TTL (`default_time_to_live = 0`). Sampled orphan rows pointed at blocks that were already
+physically deleted. The 50 GB of **content** (blocks, refs, commits, S3 objects) was reclaimed
+correctly — only the dedup rows leaked.
 
-#### Root cause
+#### Root cause (at `253e08fef`)
 
 `gc_pending_items` is keyed by `library_id` (in the partition `bucket` hash
 [store_cassandra.go:251-259](../internal/gc/store_cassandra.go#L251) **and** as a clustering
 column [001_initial_schema.cql:1206](../internal/db/migrations/001_initial_schema.cql#L1206)),
 but `gc_queue` is not (library-independent bucket + key). Blocks are content-addressed;
 `processBlock` never reads `item.LibraryID` ([worker.go:403-468](../internal/gc/worker.go#L403)).
-All three block-enqueue **dedup checks** use `uuid.Nil`, but two paths **write** the pending row
+All three block-enqueue **dedup checks** used `uuid.Nil`, but two paths **wrote** the pending row
 under the **real** `libraryID`:
 
-- `worker.enqueueZeroRefBlocks` — `LibraryID: libraryID` ([worker.go:1619](../internal/gc/worker.go#L1619)) — **the live leaker** (every cascade/version/auto-delete block release).
-- `Service.EnqueueBlock` — passes `libraryID` ([gc.go:422](../internal/gc/gc.go#L422)) — latent; sole non-test caller already passes `uuid.Nil` ([gc_adapter.go:32](../internal/api/gc_adapter.go#L32)).
-- `scanner.scanOrphanedBlocks` — `LibraryID: uuid.Nil` ([scanner.go:386](../internal/gc/scanner.go#L386)) — **correct reference.**
+- `worker.enqueueZeroRefBlocks` — `LibraryID: libraryID` ([worker.go:1619@253e08f](https://github.com/Sesame-Disk/sesamefs/blob/253e08fef/internal/gc/worker.go#L1619)) — **the live leaker** (every cascade/version/auto-delete block release).
+- `Service.EnqueueBlock` — passed `libraryID` ([gc.go:422@253e08f](https://github.com/Sesame-Disk/sesamefs/blob/253e08fef/internal/gc/gc.go#L422)) — latent; sole non-test caller already passed `uuid.Nil`.
+- `scanner.scanOrphanedBlocks` — `LibraryID: uuid.Nil` ([scanner.go:386@253e08f](https://github.com/Sesame-Disk/sesamefs/blob/253e08fef/internal/gc/scanner.go#L386)) — **correct reference.**
 
 A single producer is self-consistent (`CompleteItem` re-reads `library_id` from the same queue
-row it completes). The leak needs **two** producers enqueuing the same block/candidate under
+row it completes). The leak needed **two** producers enqueuing the same block/candidate under
 different `library_id`s (worker `realLib` + scanner `Nil`, or two libraries sharing a block):
-same `candidate_at` collapses them to one `gc_queue` row (last writer wins on the non-key
-`library_id` column) but each already wrote its own `gc_pending_items` row (`bucket(realLib)` +
-`bucket(Nil)`). `CompleteItem` deletes only the row matching the surviving queue row's
-`library_id` ([store_cassandra.go:556-580](../internal/gc/store_cassandra.go#L556)); the other
-orphans forever.
+same `candidate_at` collapsed them to one `gc_queue` row (last writer wins on the non-key
+`library_id` column) but each had already written its own `gc_pending_items` row
+(`bucket(realLib)` + `bucket(Nil)`). `CompleteItem` deleted only the row matching the surviving
+queue row's `library_id` ([store_cassandra.go:580-604](../internal/gc/store_cassandra.go#L580) —
+unchanged by the fix, so this link tracks current `main`); the other orphaned forever.
 
 **Bug, not intentional (git history):** `worker.go` enqueue written with the real `libraryID`
 on 2026-04-09 (`e9a9b369b`); its dedup check migrated to `uuid.Nil` on 2026-04-30 (`5dee7eee2`)
 **without** updating the paired enqueue — incomplete migration. Scanner phase (2026-05-26,
 `f3597a935`) does both sides `Nil`, codifying the intended convention.
 
-#### Fix (this PR)
+#### Fix — merged 2026-07-13, PR #128
 
-Two layers:
-1. **Producers** — every `ItemBlock` enqueue keys `uuid.Nil` (`worker.enqueueZeroRefBlocks`,
-   `Service.EnqueueBlock`), matching the dedup checks and the scanner.
+`fix/gc-pending-items-block-library-scope` (`869a455f3` producers, `08402b3f9` central coercion).
+Two layers; links below track **current `main`**:
+1. **Producers** — every `ItemBlock` enqueue keys `uuid.Nil` (`worker.enqueueZeroRefBlocks`
+   [worker.go:1633](../internal/gc/worker.go#L1633), `Service.EnqueueBlock`, and
+   `scanner.scanOrphanedBlocks` [scanner.go:386](../internal/gc/scanner.go#L386)), matching the
+   dedup checks.
 2. **Central backstop** — the store pending helpers (`addPendingItemBatchQuery`,
    `addPendingItemDeleteBatchQuery`, `PendingItemExists`) coerce `ItemBlock`'s `library_id` to
-   `uuid.Nil` via `pendingItemLibraryID`, so every pending write/delete/dedup-read for a block
-   lands on one key regardless of the caller. This makes the invariant impossible for a future
-   producer to break (the original bug was exactly a partial migration between the check and the
-   write).
+   `uuid.Nil` via `pendingItemLibraryID`
+   ([store_cassandra.go:448-464](../internal/gc/store_cassandra.go#L448)), so every pending
+   write/delete/dedup-read for a block lands on one key regardless of the caller. This makes the
+   invariant impossible for a future producer to break (the original bug was exactly a partial
+   migration between the check and the write).
 
 Content-only, no data-safety impact. Coverage: a pure-function unit test for the coercion, a
 worker unit test that the producer keys `uuid.Nil` (fails pre-fix), and an integration test that
@@ -4245,9 +4287,10 @@ reproduces the real **two-producer** collision (worker cascade + scanner `uuid.N
 
 #### Still open
 
-Pre-existing orphaned rows are not self-healed by the fix — they need the reconcile sweep
-(`ISSUE-GC-RECONCILE-BACKFILL-01` / branch 8) or a coordinated one-off cleanup. The general
-`gc_pending_items` reconcile/backstop is 10D under `ISSUE-GC-ENGINE-ROBUSTNESS-01`.
+Pre-existing orphaned rows on **brownfield** clusters are not self-healed by the fix — they need
+the reconcile sweep (`ISSUE-GC-RECONCILE-BACKFILL-01` / branch 8B) or a coordinated one-off
+cleanup. **Not present on greenfield prod.** The general `gc_pending_items` reconcile/backstop is
+10D under `ISSUE-GC-ENGINE-ROBUSTNESS-01`.
 
 #### Related Docs
 
@@ -4257,15 +4300,23 @@ Pre-existing orphaned rows are not self-healed by the fix — they need the reco
 
 ### ISSUE-GC-RECONCILE-BACKFILL-01: No Reconcile/Backfill for Already-Orphaned Blocks + S3 Objects
 
-**Status**: 🟡 Follow-up (2026-07-10)
-**Severity**: Medium — production hygiene for existing clusters
-**Affected**: existing clusters with residue from the gaps above or from pre-#123 deletes
+**Status**: ⏸ Deferred for greenfield prod (2026-07-15) — brownfield follow-up only
+**Severity**: Medium — production hygiene for **existing** clusters with pre-fix residue
+**Affected**: brownfield clusters with residue from the gaps above or from pre-#123 deletes
 
 #### Problem
 
-The GC engine has crash recovery for its own in-flight deletes (`gc_s3_orphans`) but no sweeper for content orphaned by the delete-path gaps (P1–P4) or by pre-#123 behavior: `fs:` refs whose library is gone, blocks with no ref and no candidate, candidates with no queue item, stale `gc_libraries_by_policy` rows, and S3 objects with no `blocks` row. Blind `TRUNCATE` is unsafe — truncating `block_references` without deleting the S3 objects would orphan MinIO further.
+The GC engine has crash recovery for its own in-flight deletes (`gc_s3_orphans`) but no sweeper for
+content orphaned by historical delete-path gaps or pre-#123 behavior: `fs:` refs whose library is
+gone, blocks with no ref and no candidate, candidates with no queue item, stale
+`gc_libraries_by_policy` rows, pre-fix `gc_pending_items` orphans, and S3 objects with no `blocks`
+row. Blind `TRUNCATE` is unsafe — truncating `block_references` without deleting the S3 objects
+would orphan MinIO further.
 
-#### Fix Direction (branches 8A–8C)
+**Greenfield prod deploy:** starting from an empty keyspace and buckets, this issue does **not**
+apply. No reconcile/backfill pass is required before launch.
+
+#### Fix Direction (branches 8A–8C — brownfield only)
 
 - 8A: **read-only** reconcile (`--dry-run` default, per-org scope, paginated, JSON, no S3 delete) that reports every orphan class above.
 - 8B: low-risk repairs (delete stale policy rows; re-enqueue existing candidates; block with no refs → `EnsureBlockGCCandidate`, never a direct delete).
@@ -4283,4 +4334,4 @@ The GC engine has crash recovery for its own in-flight deletes (`gc_s3_orphans`)
 - [API-REFERENCE.md](API-REFERENCE.md) - API endpoint documentation
 - [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md) - Architectural issues
 - [CURRENT_WORK.md](../CURRENT_WORK.md) - Active priorities
-- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (corrected verdict, P1–P8, invariants, branch roadmap)
+- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (corrected verdict, P1–P9, invariants, branch roadmap; refreshed 2026-07-15 for greenfield prod)
