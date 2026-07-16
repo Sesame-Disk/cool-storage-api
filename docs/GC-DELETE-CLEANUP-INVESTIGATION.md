@@ -15,8 +15,10 @@ their verified status.
 > **TL;DR (current, 2026-07-16):** ⛔ **P10 is an OPEN, PROVEN live-content deletion bug and a
 > greenfield deploy blocker** — GC deletes the shared, content-addressed S3 object using an
 > **org-scoped** liveness check, so one org's delete destroys another org's still-referenced
-> block. Confirmed by a real two-org 2 GB upload (deleting one org emptied MinIO; the other org now
-> 404s) and by a seeded single-node repro (see P10). This **retracts** the previous "no open known issue
+> block. Confirmed by a real two-org 2 GB upload (deleting one org emptied MinIO; the other org's
+> downloads become unreadable — the raw GET has already sent its 200 headers, then the block 404s
+> mid-response, so the body is truncated, not a clean error) and by a seeded single-node repro (see
+> P10). This **retracts** the previous "no open known issue
 > can delete live content" verdict, which was wrong: the audit only ever reasoned about
 > liveness *within* an org.
 >
@@ -74,7 +76,7 @@ grows.
 
 | Priority | Item | Issue / branch | Prod impact (greenfield) |
 | --- | --- | --- | --- |
-| ⛔ **BLOCKER** | **Cross-org physical block isolation** | **P10 / `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01` (own branch)** | **Deleting one org's library destroys another org's still-referenced content.** Confirmed on a real 2 GB two-org upload: MinIO deduped to 2 GB, deleting one org emptied the bucket, the other org now 404s. Must be fixed **before** the greenfield deploy; org-scope the S3 key (trivial on an empty store). Regression test cross-org required |
+| ⛔ **BLOCKER** | **Cross-org physical block isolation (GC delete + orphan recovery)** | **P10 / `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01` — org-scoped-key series (storage → funnels → GC → coverage)** | **Deleting one org's library destroys another org's still-referenced content.** Confirmed on a real 2 GB two-org upload: MinIO deduped to 2 GB, deleting one org emptied the bucket, and the other org's downloads become unreadable (the raw GET has already sent 200 headers, then the block 404s mid-response → truncated body, not a clean error). Must be fixed **before** the greenfield deploy; org-scope the S3 key — migration-free on an empty store, but requires **all** storage paths (write, read, reuse, verify, GC) to use the org-scoped locator. Regression test cross-org required |
 | — | *(done)* Normal permanent delete + cascade | P1/P1b/P2, PR #129 | Closed — [~50 GB live exercise](#live-path-verification-and-confirmed-gc_pending_items-leak-2026-07-13) showed zero content residue (manual observation) |
 | — | *(done)* Safety classification | P6a/P6b | Closed |
 | — | *(done)* Block `gc_pending_items` new-row leak | P9, PR pending-items fix | Closed for new deletes |
@@ -514,11 +516,14 @@ Subsequent branches, in recommended merge order:
 
 **Recommended merge order (greenfield prod, 2026-07-16):**
 
-0. ⛔ **P10 (`ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`) — FIRST, its own branch, before the deploy.**
-   Org-scope the physical S3 key so one org's delete can never remove another org's content. Land
-   the cross-org regression test (two orgs upload identical bytes → delete + drain one → the other
-   still downloads) with the fix; it must fail on current `main`. Nothing else on this list matters
-   if live cross-org data can be deleted.
+0. ⛔ **P10 (`ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`) — FIRST, before the deploy, as an org-scoped-key
+   series of small branches:** docs corrections → storage-layer org-aware `BlockStore` (parallel
+   APIs, fail-closed validation) → API funnels flip (write/read/reuse/verify/fallback) → **GC on its
+   own branch** (delete **+ orphan recovery**, remove the global storage APIs) → coverage + doc
+   closure. Org-scope the physical S3 key so one org's delete can never remove another org's content.
+   Land the cross-org regression test (two orgs upload identical bytes → delete + drain one → the
+   other still downloads byte-for-byte) with the GC branch; it must fail on current `main`. Nothing
+   else on this list matters if live cross-org data can be deleted.
 1. ~~**1C** — replace global `ProcessOnce(storage=nil)` with scoped `ProcessOrgOnce`~~ ✅ **DONE**
    (plus a guard test that blocks reintroduction).
 2. ~~**1A / 1B** — fixture-scoped teardown for upload/`pub:foreign` residue~~ ✅ **DONE**
