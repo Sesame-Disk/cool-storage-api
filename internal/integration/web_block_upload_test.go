@@ -196,11 +196,19 @@ func releaseStagedBlockForTest(t *testing.T, database *dbpkg.DB, orgID, blockID,
 	}
 
 	// Zero-ref: read sha1 before deleting the row — it is the mapping's external id.
+	//
+	// A missing row means STOP, not "delete the object anyway". S3 keys are content-addressed
+	// with no org in them (hashToKey ⇒ blocks/<h0:2>/<h2:4>/<hash>), so one object backs every
+	// org that ever stored those bytes, while `blocks` and `block_references` are per-org. The
+	// zero-ref check above therefore only proves THIS org is done with it. The `blocks` row is
+	// the fixture's evidence that it materialized the object here, and it carries the
+	// storage_class that says which bucket the object even lives in. Without it we would be
+	// deleting a hash we cannot prove we created, from a bucket we are guessing.
 	var externalSHA1 string
 	switch err := database.Session().Query(
 		`SELECT sha1 FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&externalSHA1); {
 	case errors.Is(err, gocql.ErrNotFound):
-		return // already reclaimed by GC
+		return // already reclaimed by GC, or never materialized here
 	case err != nil:
 		t.Errorf("cleanup staged block %s/%s: read sha1: %v", orgID, blockID, err)
 		return

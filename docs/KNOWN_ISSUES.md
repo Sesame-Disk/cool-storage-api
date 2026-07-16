@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🟢 Safe for prod (greenfield) | Normal delete path exercised end-to-end (~50 GB manual dev-cluster run, zero content residue — operator observation, not an automated test). P6a/P6b and P1/P2 closed on `main` (PR #129). Remaining GC debt is storage retention in edge cases (P4/P7), observability (P5), test hygiene (1G; 1A–1C done), and scale (P8) — not live-data deletion. Reconcile/backfill not required for empty prod deploy. See GC audit section below. |
+| Garbage Collection | ⛔ **BLOCKER — P10 deletes live content across orgs** | **P10 (open, proven 2026-07-16):** GC's liveness check is org-scoped but the S3 object is shared by content hash, so one org's delete destroys another org's still-referenced block. Reproduced end-to-end; reachable on a greenfield deploy from day one. See ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01. **Everything else stands:** the single-org delete path was exercised end-to-end (~50 GB manual dev-cluster run, zero content residue — operator observation, not an automated test); P6a/P6b and P1/P2 closed on `main` (PR #129); the rest of the debt is storage retention (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done) and scale (P8). Reconcile/backfill not required for an empty prod deploy. See GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -55,10 +55,12 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Read Paths Ignore `storage_key`** | 🟡 Pending | All block reads derive the S3 key from the content hash (`hashToKey`) and never consult the canonical `storage_key` column; only the new reuse verify/repair honors it. Harmless today (`storage_key` is empty or equal to the hash-derived key) but blocks any non-hash-derived key layout. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
-### 🟢 GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-15)
+### ⛔ GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 blocker)
 
-Follow-up debt from the PR #123 audit. **Verdict (2026-07-15):** no open known issue can delete
-live content in the normal production delete flow. P6a/P6b safety guards and P1/P1b/P2 durable
+Follow-up debt from the PR #123 audit. **Verdict (2026-07-16): ⛔ P10 is an open, proven live-content
+deletion bug and a deploy blocker** — GC's org-scoped liveness check vs the content-hash-shared S3
+object. The previous "no open known issue can delete live content" verdict is **retracted**: it only
+ever reasoned about liveness within a single org. Within one org the delete path is still sound. P6a/P6b safety guards and P1/P1b/P2 durable
 purge + cascade are **fixed** on `main` (PR #129). The planned **greenfield prod deploy** starts
 from an empty cluster — reconcile/backfill (8A–8C) and pre-fix `gc_pending_items` orphans are
 **not required**. Note this depends on a **recreated keyspace + empty/new buckets, never written
@@ -73,7 +75,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 | **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Low — transient for new deletes | `hardDeleteLibraryRowsFn` does not synchronously call `AddDeleteLibraryPolicyQuery`, but the durable cascade's `HardDeleteLibrary` clears both policy rows. At most a short stale window for new deletes; branch 2 is optional polish. Not a greenfield-prod blocker. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
 | **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. Storage retention, not incorrect deletion. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
-| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene — **1A/1B/1C fixed; 1G open** | The global `ProcessOnce(storage=nil)` fan-out (the only one that deleted other tests' DB rows while orphaning their S3 objects), the permanent `pub:foreign` ref, and the upload fixtures' stranded blocks are **fixed** and guarded. `-run TestWebBlockUpload` now drains to a zero residue delta. A **full** suite run still ends at **2** stranded blocks (1G): one `fs:`-pinned block whose library is gone from both indexes (eternal), one `up:sync:` provisional (self-heals in 2d). Shared keyspace/bucket and the global `/admin/gc/run` triggers remain as designed. Dev-cluster only; does not affect prod safety. See ISSUE-GC-TEST-RESIDUE-01 below. |
+| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene — **1A/1B/1C/1G fixed; one S3-only orphan open** | The global `ProcessOnce(storage=nil)` fan-out (the only one that deleted other tests' DB rows while orphaning their S3 objects), the permanent `pub:foreign` ref, the upload fixtures' stranded blocks, and both blocks a full run used to strand (1G — the eternal `fs:` one from the zip fixture's SHA-1 corruption, and the `up:sync:` provisional from `quotas_test.go`) are **fixed** and guarded. Still open: one ~90-byte **S3-only object with no `blocks` row**, not yet attributed to a test — undiscoverable by any GC phase. Shared keyspace/buckets and the global `/admin/gc/run` triggers remain as designed. Dev-cluster only; does not affect prod safety. See ISSUE-GC-TEST-RESIDUE-01 below. |
 | **Existence Checks Fail Open (transient errors, P6a)** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors and scanner Phases 3/4/9 fail closed. Phase 9 scans `shares_by_group` directly and uses each projection row's `OrgID`, with unit and real-Cassandra regression coverage. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
 | **Worker Canonical Revalidation of Orphan Work (P6b)** | ✅ Fixed (2026-07-10) | Durable `canonical_absent` work is point-read against `libraries[(org_id, library_id)]` under the existing library lock; presence/read/fence/unknown-mode paths fail closed. Retry/DLQ and legacy compatibility are covered. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
 | **Cascade Deletes Counter Before Hard Delete** | ✅ Fixed (2026-07-11) | `cascadeDeleteLibrary` now hard-deletes the canonical row before removing the per-library storage counter, closing a crash+restore window that could reactivate an under-counted library. The reordering (the real fix) covers both cascade callers; the counter auto-reclaim is wired only into `processLibraryCascade`. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01 below. |
@@ -2806,10 +2808,11 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 
 ### Garbage Collection — IMPLEMENTED, SAFE FOR GREENFIELD PROD; OPEN RECLAMATION/OPS DEBT
 **Status**: Core engine implemented (2026-01-30), major overhaul (2026-03-17);
-2026-07-10 audit found P1–P9 follow-ups. Refreshed 2026-07-15: the safety-classification gaps
+2026-07-10 audit found P1–P10 follow-ups. Refreshed 2026-07-16: the safety-classification gaps
 (P6a/P6b) and the normal permanent-delete path (P1/P1b/P2, PR #129) are **closed** on `main`.
-Remaining debt is reclamation edge cases (P4/P7), observability (P5), test hygiene (1G; 1A–1C done), and
-the Medium Phase 9 global-scan scale debt (P8) — not live-data deletion.
+Remaining debt is reclamation edge cases (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and
+the Medium Phase 9 global-scan scale debt (P8). **P10 (2026-07-16) IS live-data deletion: cross-org
+shared-object deletion, open and proven — a deploy blocker.**
 **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
 **Tests**: 55 Go unit tests + 21 bash integration tests
 **Admin API**: `GET /api/v2.1/admin/gc/status`, `POST /api/v2.1/admin/gc/run`
@@ -4211,7 +4214,49 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
   - `up:sync:<session>:<block>` from the sync-protocol fixtures — same class 1B fixed, different
     upload path. It carries a provisional expiry projection, so Phase 0 reclaims it in ~2 days.
 
-  Tracked as **branch 1G**.
+  **1G — root-caused and fixed (2026-07-16).** Neither leftover was what the roadmap guessed
+  (`removeLibraryBaseRowsForFallbackTest`); running each file in isolation cleared both `TestSync*`
+  and `*Projection*`, so the suspects were wrong.
+
+  - **The eternal `fs:` block was `TestZipDownloadFailsBeforeHeadersWhenLegacyMappingIsMissing`.**
+    It deliberately corrupts two things and restored neither: it rewrites `fs_objects.block_ids`
+    to the **legacy SHA-1** layout, and deletes the SHA-1→SHA-256 `block_id_mappings` row. But
+    `block_references` is keyed by the canonical **SHA-256**, so the library cascade read SHA-1s,
+    released references that do not exist, and left the real `fs:` ref in place — pinning the
+    block with the library gone from both indexes, which no GC phase can rediscover (F1/P7 shape).
+    The `audit_log` proves the cascade ran (`gc_library_cascade_deleted`) and the fs_object was
+    processed (`Deleted fs_object 8ed27335…`) — the release simply targeted the wrong ids. Both
+    corruptions are now undone in a `t.Cleanup` registered after the library's, so LIFO restores
+    canonical ids before the cascade runs. Proven both ways on a clean stack: without the restore
+    the ref sits unchanged for 210s with GC idle (`gc_queue=0`, `libraries=0`) — **eternal**; with
+    it, the ref is released at ~90s and the block reclaimed by ~180s.
+  - **The `up:sync:` provisional was `quotas_test.go`'s `uploadSyncBlockStatus`** (not the sync
+    suite): it PUTs a block through the seafhttp sync path and never commits, so the handler's
+    `up:sync:<repo>:<block>` pin and its expiry projection survive until Phase 0 fires two days
+    later. Teardown now hangs off that shared helper. `prov` went 1 → 0.
+
+  **Measurement correction:** earlier residue numbers in this file undercounted S3. The dev stack
+  has **five** buckets (`sesamefs-blocks`, `-usa`, `-eu`, `-china`, `-archive`) and the script only
+  counted `sesamefs-blocks`; libraries created with `storage_id: hot-s3-usa` (zip/region/history
+  tests) write to `sesamefs-usa`, which had been accumulating blocks unseen across runs. Always
+  count every bucket.
+
+  **Teardown contract — a missing `blocks` row means STOP.** `releaseStagedBlockForTest`
+  deliberately does **not** delete the S3 object when the `blocks` row is gone. S3 keys are
+  content-addressed with no org in them (`hashToKey` ⇒ `blocks/<h0:2>/<h2:4>/<hash>`), so a single
+  object backs **every** org that ever stored those bytes, while `blocks` and `block_references`
+  are per-org. The zero-ref check therefore only proves *this* org is finished with it. The
+  `blocks` row is the fixture's only evidence that it materialized the object here, and it carries
+  the `storage_class` that says which of the five buckets the object is even in. Deleting without
+  it would mean removing a hash we cannot prove we created, from a bucket we are guessing — and
+  could take out a live block belonging to another org. If a future fixture needs "delete without
+  metadata", it must opt in explicitly and prove: a test-exclusive hash, the right bucket, and that
+  its own request could have physically created the object.
+
+  **Still open (new, smaller):** one ~90-byte S3 object with **no `blocks` row** survives a run —
+  an S3-only orphan that no GC phase can discover (blocks are found through candidates, and
+  S3-orphan recovery only replays `gc_s3_orphans`). Not yet attributed to a test. Full-suite
+  hygiene is therefore **not** yet at a zero delta across all five buckets.
 
   Do not run a global GC over the shared keyspace (invariants #5/#6).
 - **Branch 1C** ✅ **DONE**: the last direct global `ProcessOnce(storage=nil)`
@@ -4282,6 +4327,84 @@ P6 issue above.
 
 - `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (Engine-level review)
 - `docs/GC-SERVICE-ANALYSIS.md`
+
+---
+
+### ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01: GC deletes an S3 object still referenced by another org
+
+**Status**: ⛔ **OPEN — BLOCKER (found 2026-07-16, reproduced end-to-end)**
+**Severity**: **High — live-content deletion.** Not under-reclamation: committed data becomes unreadable.
+**Affected**: `internal/gc` block deletion, `internal/storage` block addressing. Any deploy with >1 org
+sharing a storage class — i.e. **greenfield from day one**.
+
+#### Problem
+
+Physical ownership and liveness are keyed differently:
+
+- **S3 objects are global per storage class.** `hashToKey` ([blocks.go:274](../internal/storage/blocks.go#L274))
+  takes **only** the hash — `blocks/<h0:2>/<h2:4>/<hash>` — and every production `NewBlockStore` passes
+  the literal `"blocks/"` prefix (`api/server.go`, `api/seafhttp.go`, `api/v2/files.go`,
+  `api/v2/onlyoffice.go`, `api/v2/storage_resolution.go`, `storage/storage.go`). There is no org in the
+  key, so **every org storing those bytes in that class shares one object**.
+- **Liveness is per-org.** `blocks` and `block_references` are partitioned by `org_id`.
+
+`processBlock` mixes the two: it decides with `BlockHasReferences(item.OrgID, item.ItemID)`
+([worker.go:412](../internal/gc/worker.go#L412), [store_cassandra.go:1849](../internal/gc/store_cassandra.go#L1849)),
+finalizes the org-scoped row ([store_cassandra.go:2118](../internal/gc/store_cassandra.go#L2118)), then
+deletes the **global** key ([worker.go:583](../internal/gc/worker.go#L583) →
+[blocks.go:251](../internal/storage/blocks.go#L251)). "No refs **in this org**" is treated as "nobody
+needs these bytes".
+
+The claim+verify fence does not help: it re-checks the same org-scoped partition.
+
+#### Confirmation
+
+**Real two-org E2E (operator, 2026-07-16) — the definitive evidence.** ~2 GB of **identical** files
+uploaded through the API into **two** orgs. MinIO showed **2 GB**, not 4 — the upload path deduplicates
+globally by content hash, so both orgs' metadata pointed at one physical copy. Deleting **all** files
+in one org and draining GC left the MinIO volume **empty**, and the other org's files now 404:
+
+```
+[ServeRawFile] Failed to get block 0/1: ... GetObject ... StatusCode: 404 ... NoSuchKey
+GET /repo/3acb1e2b-…/raw/01.pdf status=200   (headers already sent, body truncated)
+```
+
+This is unambiguous live-content deletion from real uploads, and it also shows the 404 lands
+**mid-response** (status line already 200), so the download fails with a corrupt body, not a clean error.
+
+**Seeded repro (single-node docker stack) — the mechanism in isolation.** For a tighter loop, org A
+uploaded through the API and org B was **seeded to the equivalent post-upload state** (`blocks[(B,hash)]`
++ an `fs:` ref for the same hash — exactly what B's own upload produces; org B did **not** re-run the
+upload). Precondition verified: **2 `blocks` rows, 1 S3 object**. Deleting org A's library and draining
+GC left, at ~210s, `objetoS3=0`, `blocks_rows=1`, **org B's `fs:` ref still live** — metadata intact,
+content gone. (Because org B was seeded rather than re-uploaded, this is a "second org in the equivalent
+state" repro; the real E2E above is the full-upload proof. The committed regression test below must use
+two real uploads.)
+
+Ordinary multi-tenancy triggers this: identical READMEs, empty files, shared templates, any
+re-uploaded document.
+
+#### Fix direction (decide before the greenfield deploy)
+
+1. **Org-scope the physical key** — e.g. `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`. Aligns physical
+   ownership with the existing per-org tables, claims and references; no coordination needed. Costs
+   cross-org dedup (each org stores its own copy). **Simplest and safest for a greenfield deploy — the
+   store is empty, so there is no migration.**
+2. **Global liveness per `(storage_class, block_id)`** — a global ref/owner registry plus a global claim
+   before physical delete. Keeps cross-org dedup, but needs global coordination and is materially more
+   complex.
+
+Do **not** paper over it with a pre-delete `HEAD`/existence probe: that is a TOCTOU race, not a fix.
+
+#### Required regression test (cross-org)
+
+Two orgs upload identical bytes to the same storage class; delete one org's library and drain GC;
+assert the other org can still download the file **and** the physical object still exists. **This test
+fails on current `main`.**
+
+#### Related Docs
+
+- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) — P10 in the confirmed-gap table.
 
 ---
 
@@ -4402,4 +4525,4 @@ apply. No reconcile/backfill pass is required before launch.
 - [API-REFERENCE.md](API-REFERENCE.md) - API endpoint documentation
 - [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md) - Architectural issues
 - [CURRENT_WORK.md](../CURRENT_WORK.md) - Active priorities
-- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (corrected verdict, P1–P9, invariants, branch roadmap; refreshed 2026-07-15 for greenfield prod)
+- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (P1–P10, invariants, branch roadmap; refreshed 2026-07-16 — P10 cross-org deletion is an open deploy blocker)
