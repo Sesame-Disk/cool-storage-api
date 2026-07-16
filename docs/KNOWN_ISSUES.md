@@ -982,7 +982,8 @@ work begins.
 
 ### ISSUE-BLOCK-STORAGE-KEY-READS-01: Read Paths Ignore `storage_key` (key derived from hash)
 
-**Status**: 🟡 Pending — latent inconsistency, no live bug today
+**Status**: 🟡 Pending — **will be resolved with P10** (`ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`);
+latent inconsistency, no live bug today
 **Severity**: Low (becomes High the moment any block is stored at a non-hash-derived key)
 **Affected**: `internal/storage/blocks.go` read methods; GC delete path
 
@@ -1022,6 +1023,16 @@ objects — reads would 404 and GC could delete the wrong (or no) object.
 Make `storage_key` the primary locator for reads and deletes, with `hashToKey(hash)`
 as the fallback only when the column is empty (mirroring `EnsureReusableBlockPresent`).
 This is a pre-existing, cross-cutting change; track it independently of P-2.
+
+**Resolution path (via P10):** the org-scoped-key fix resolves this **by construction** rather than
+by making `storage_key` authoritative. Once the key is `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`, the org
+is baked into the `BlockStore` at construction (the method signature stays
+`blockStore.StorageKeyForHash(hash)` — the org is not passed per call), the derivation is
+deterministic, and every path (read, GC delete, reuse/verify) recomputes the same locator — no
+divergence is possible, and no extra DB read is added on the
+download hot path. `storage_key` may only be empty or **exactly** the derived key; `EnsureReusableBlockPresent`
+always recomputes and **fails closed** (with a metric/log) if a stored `storage_key` differs from the
+derived one, and no block method accepts an arbitrary caller-supplied S3 key. Closed alongside P10.
 
 #### Related
 
@@ -2806,7 +2817,7 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 
 ## 🚧 BACKEND NOT IMPLEMENTED
 
-### Garbage Collection — IMPLEMENTED, SAFE FOR GREENFIELD PROD; OPEN RECLAMATION/OPS DEBT
+### Garbage Collection — IMPLEMENTED; ⛔ BLOCKED FOR GREENFIELD BY P10 (cross-org block delete)
 **Status**: Core engine implemented (2026-01-30), major overhaul (2026-03-17);
 2026-07-10 audit found P1–P10 follow-ups. Refreshed 2026-07-16: the safety-classification gaps
 (P6a/P6b) and the normal permanent-delete path (P1/P1b/P2, PR #129) are **closed** on `main`.
@@ -4362,7 +4373,9 @@ The claim+verify fence does not help: it re-checks the same org-scoped partition
 **Real two-org E2E (operator, 2026-07-16) — the definitive evidence.** ~2 GB of **identical** files
 uploaded through the API into **two** orgs. MinIO showed **2 GB**, not 4 — the upload path deduplicates
 globally by content hash, so both orgs' metadata pointed at one physical copy. Deleting **all** files
-in one org and draining GC left the MinIO volume **empty**, and the other org's files now 404:
+in one org and draining GC left the MinIO volume **empty**, and the other org's files become
+**unreadable** — the external request has already returned 200, then the 404/`NoSuchKey` happens
+internally while fetching the block, truncating the body:
 
 ```
 [ServeRawFile] Failed to get block 0/1: ... GetObject ... StatusCode: 404 ... NoSuchKey
@@ -4388,8 +4401,12 @@ re-uploaded document.
 
 1. **Org-scope the physical key** — e.g. `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`. Aligns physical
    ownership with the existing per-org tables, claims and references; no coordination needed. Costs
-   cross-org dedup (each org stores its own copy). **Simplest and safest for a greenfield deploy — the
-   store is empty, so there is no migration.**
+   cross-org dedup (each org stores its own copy). **Migration-free on an empty (greenfield) store —
+   but not trivial: it requires *all* storage paths (write, read, reuse, verify, GC delete + orphan
+   recovery) to resolve the org-scoped locator, and the org must enter the `BlockStore` at
+   construction with fail-closed validation so no path can ever produce a global key again.** This
+   is the chosen approach — see the org-scoped-key plan (docs-first, storage layer, API funnels, GC
+   own branch, coverage/closure).
 2. **Global liveness per `(storage_class, block_id)`** — a global ref/owner registry plus a global claim
    before physical delete. Keeps cross-org dedup, but needs global coordination and is materially more
    complex.
