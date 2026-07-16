@@ -4419,6 +4419,25 @@ Two orgs upload identical bytes to the same storage class; delete one org's libr
 assert the other org can still download the file **and** the physical object still exists. **This test
 fails on current `main`.**
 
+#### Series progress (org-scoped-key)
+
+The fix ships as a small, sequential series of branches (each its own PR):
+
+- ✅ **PR-0 — docs.** This section + the audit doc corrected (header, mid-response 404, path list).
+- ✅ **PR-1 — storage layer (org-aware `BlockStore`), no behavior change.** `NewOrgBlockStore`
+  ([internal/storage/blocks.go](../internal/storage/blocks.go)) validates the org id **fail-closed**
+  (non-empty canonical UUID, normalized; rejects empty/nil/non-UUID/path chars) and org-scopes
+  `hashToKey` → `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`. `Manager.GetBlockStoreForOrg` /
+  `GetHealthyBlockStoreForOrg` cache per `(org, class)` via a struct key
+  ([internal/storage/storage.go](../internal/storage/storage.go)). Legacy `NewBlockStore`/
+  `GetBlockStore` kept **temporarily** (deprecated) so production is unchanged until callers migrate.
+  Unit tests cover fail-closed validation, org-scoped keys, per-org cache separation, and pin the
+  legacy key (regression). ⚠️ **No production path is org-scoped yet** — that lands in PR-2/PR-3.
+- ⏳ **PR-2 — flip API funnels** (write/read/reuse/verify/fallback) to the org-scoped store.
+- ⏳ **PR-3 — GC own branch:** delete + orphan recovery org-scoped, **remove** the legacy global
+  APIs (compiler net), land the cross-org regression test above.
+- ⏳ **PR-4 — coverage + doc closure** (multiregion/buckets, per-org reclamation; mark P10 resolved).
+
 #### Related Docs
 
 - [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) — P10 in the confirmed-gap table.

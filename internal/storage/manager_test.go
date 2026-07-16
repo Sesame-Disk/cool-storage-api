@@ -531,3 +531,51 @@ func TestManagerUpdateHealthTracking(t *testing.T) {
 		t.Errorf("consecutive fails = %d after healthy, want 0", health.ConsecutiveFails)
 	}
 }
+
+// TestGetBlockStoreForOrg_ScopesAndCaches covers the org-scoped block store
+// resolution added for ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01 (PR-1): fail-closed on a
+// bad org id, cache per (org, class), and distinct keys across orgs.
+func TestGetBlockStoreForOrg_ScopesAndCaches(t *testing.T) {
+	m := NewManager()
+	// A zero-value S3Store is enough: GetBlockStoreForOrg only needs the concrete
+	// type for the cast; no S3 method is called on the validation/caching path.
+	m.RegisterBackend("hot-s3-usa", &S3Store{}, "")
+
+	// Fail closed on an invalid org id.
+	if _, err := m.GetBlockStoreForOrg("", "hot-s3-usa"); err == nil {
+		t.Fatal("empty org id should fail closed, got nil error")
+	}
+	if _, err := m.GetBlockStoreForOrg("not-a-uuid", "hot-s3-usa"); err == nil {
+		t.Fatal("non-uuid org id should fail closed, got nil error")
+	}
+
+	// Unknown storage class errors.
+	if _, err := m.GetBlockStoreForOrg(testOrgA, "nope"); err == nil {
+		t.Error("unknown storage class should error")
+	}
+
+	// Same (org, class) returns the cached instance.
+	a1, err := m.GetBlockStoreForOrg(testOrgA, "hot-s3-usa")
+	if err != nil {
+		t.Fatalf("org A: %v", err)
+	}
+	a2, err := m.GetBlockStoreForOrg(testOrgA, "hot-s3-usa")
+	if err != nil {
+		t.Fatalf("org A (cached): %v", err)
+	}
+	if a1 != a2 {
+		t.Error("same (org, class) should return the cached BlockStore")
+	}
+
+	// A different org gets a different store with a different physical key.
+	b, err := m.GetBlockStoreForOrg(testOrgB, "hot-s3-usa")
+	if err != nil {
+		t.Fatalf("org B: %v", err)
+	}
+	if a1 == b {
+		t.Fatal("distinct orgs must not share a BlockStore")
+	}
+	if a1.hashToKey(testHash64) == b.hashToKey(testHash64) {
+		t.Fatal("distinct orgs must map identical content to distinct keys")
+	}
+}

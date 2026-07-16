@@ -3,9 +3,12 @@
 **Date:** 2026-07-09 (original) · **Audit verified and corrected:** 2026-07-10 · **Status refresh:** 2026-07-15 · **P10 cross-org deletion blocker added:** 2026-07-16
 **Code audited at:** `23f221ee9` (merge of PR #129 into `main`)
 **Branch where found:** `fix/gc-block-representation-durability` (PR #123)
-**Status:** safety-classification gaps and the normal permanent-delete path are **closed** on
-`main` (PRs #123–#129). What remains is **reclamation edge cases, observability, test hygiene,
-and scale** — not a known path that deletes live content in the normal production flow. This
+**Status:** P1–P9 remain exactly as documented (safety-classification gaps and the normal
+permanent-delete path are **closed** on `main`, PRs #123–#129; what remains there is reclamation
+edge cases, observability, test hygiene, and scale). **But P10 is an OPEN, PROVEN cross-org
+live-content deletion blocker** — see the TL;DR immediately below. Until the org-scoped-key series
+closes P10, **the system is NOT safe for a greenfield multi-org deploy**, and no reader should
+conclude GC is safe from the P1–P9 status alone. This
 document is the **canonical audit record**; the corrected verdict, the confirmed production-gap
 table (P1–P10), the architectural invariants, and the branch roadmap live in the
 [**"Cross-agent audit — verified verdict"**](#cross-agent-audit--verified-verdict-2026-07-10)
@@ -76,7 +79,7 @@ grows.
 
 | Priority | Item | Issue / branch | Prod impact (greenfield) |
 | --- | --- | --- | --- |
-| ⛔ **BLOCKER** | **Cross-org physical block isolation (GC delete + orphan recovery)** | **P10 / `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01` — org-scoped-key series (storage → funnels → GC → coverage)** | **Deleting one org's library destroys another org's still-referenced content.** Confirmed on a real 2 GB two-org upload: MinIO deduped to 2 GB, deleting one org emptied the bucket, and the other org's downloads become unreadable (the raw GET has already sent 200 headers, then the block 404s mid-response → truncated body, not a clean error). Must be fixed **before** the greenfield deploy; org-scope the S3 key — migration-free on an empty store, but requires **all** storage paths (write, read, reuse, verify, GC) to use the org-scoped locator. Regression test cross-org required |
+| ⛔ **BLOCKER** | **Cross-org physical block isolation (GC delete + orphan recovery)** | **P10 / `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01` — org-scoped-key series (storage → funnels → GC → coverage)** | **Deleting one org's library destroys another org's still-referenced content.** Confirmed on a real 2 GB two-org upload: MinIO deduped to 2 GB, deleting one org emptied the bucket, and the other org's downloads become unreadable (the raw GET has already sent 200 headers, then the block 404s mid-response → truncated body, not a clean error). Must be fixed **before** the greenfield deploy; org-scope the S3 key — migration-free on an empty store, but requires **all** storage paths (write, read, reuse, verify, GC delete, orphan recovery) to use the org-scoped locator. Regression test cross-org required |
 | — | *(done)* Normal permanent delete + cascade | P1/P1b/P2, PR #129 | Closed — [~50 GB live exercise](#live-path-verification-and-confirmed-gc_pending_items-leak-2026-07-13) showed zero content residue (manual observation) |
 | — | *(done)* Safety classification | P6a/P6b | Closed |
 | — | *(done)* Block `gc_pending_items` new-row leak | P9, PR pending-items fix | Closed for new deletes |
@@ -399,7 +402,7 @@ re-discovered by scanner Phase 0.
 | P7 | **Orphan phases cannot discover markerless artifact libraries.** `ListDistinctCommitLibraries` / `ListDistinctFSObjectLibraries` do not enumerate commits/fs_objects; both return the union of `libraries_by_id` + `deleted_libraries`. Once both library rows are gone, surviving commits/fs_objects are invisible to Phases 3/4. Observed in the dev audit snapshot (test drift); **not reproduced on the live ~50 GB delete path.** But it is **not** confined to historical clusters: `cascadeDeleteLibrary` enqueues children ([worker.go:1325](../internal/gc/worker.go#L1325)) *before* `HardDeleteLibrary` drops canonical + marker ([worker.go:1338](../internal/gc/worker.go#L1338)), so on **any** cluster a child that exhausts retries → DLQ → `DeleteExpiredFailedItem` ([store_cassandra.go:891-942](../internal/gc/store_cassandra.go#L891)) leaves a commit/fs_object with no index and no marker to rediscover it. Trigger set: terminal child-work loss / DLQ expiry, corruption, or manual drift — never a normal successful delete. Under-reclamation only. | Med | [store_cassandra.go:2314-2355](../internal/gc/store_cassandra.go#L2314) | `ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01` |
 | P8 | **Phase 9 group-share discovery still performs a global table scan.** The immediate fix streams `shares_by_group` with context and 256-row driver pages, so process memory is bounded and cancellation works, but Cassandra still reads every partition each cycle. Replace it with a bucketed active-partition projection plus reconcile/backfill. | Med (performance/operability) | [store_cassandra.go:3290-3312](../internal/gc/store_cassandra.go#L3290) | `ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01` |
 | P9 ✅ **FIXED (2026-07-13)** | **`gc_pending_items` block rows leaked** when `ItemBlock` was enqueued under the real `library_id` while dedup/complete used `uuid.Nil` — one orphan pending row per deleted block (~9.6k on the 50 GB live test). No data-safety impact. Fixed: all block producers key `uuid.Nil`; store-level `pendingItemLibraryID` backstop. Pre-existing orphan rows on old clusters need a one-off sweep; **not present on greenfield prod.** | Low (fixed for new work) | [worker.go:1614-1633](../internal/gc/worker.go#L1614), [store_cassandra.go:448-464](../internal/gc/store_cassandra.go#L448) | `ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01` |
-| P10 ⛔ **OPEN — BLOCKER (2026-07-16)** | **Cross-org deletion of live content.** S3 objects are content-addressed with **no org in the key** — `hashToKey` takes only the hash and every production `NewBlockStore` uses the literal `"blocks/"` prefix — so all orgs sharing a storage class share ONE physical object per hash. But `blocks` and `block_references` are **org-partitioned**, and `processBlock` decides on `BlockHasReferences(item.OrgID, ...)`, finalizes `blocks[(org_id, block_id)]`, then deletes the **global** key. So org A's delete destroys org B's still-referenced bytes. **Confirmed by a real two-org 2 GB E2E** (identical files uploaded via API into both orgs; MinIO deduped to 2 GB; deleting one org emptied the bucket; the other org now 404s mid-response), and by a **seeded single-node repro** (org A real upload, org B seeded to the equivalent post-upload state; at 210s `objetoS3=0`, org B's `blocks` row AND `fs:` ref both survived). Trigger is ordinary multi-tenancy (identical README/empty/shared files), so it is reachable on a **greenfield** deploy from day one. **Under-reclamation was never the risk here; this is data loss.** | **High** | [worker.go:412-424](../internal/gc/worker.go#L412), [worker.go:583](../internal/gc/worker.go#L583), [store_cassandra.go:1849](../internal/gc/store_cassandra.go#L1849), [store_cassandra.go:2118](../internal/gc/store_cassandra.go#L2118), [blocks.go:251](../internal/storage/blocks.go#L251), [blocks.go:274](../internal/storage/blocks.go#L274) | `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01` |
+| P10 ⛔ **OPEN — BLOCKER (2026-07-16)** | **Cross-org deletion of live content.** S3 objects are content-addressed with **no org in the key** — `hashToKey` takes only the hash and every production `NewBlockStore` uses the literal `"blocks/"` prefix — so all orgs sharing a storage class share ONE physical object per hash. But `blocks` and `block_references` are **org-partitioned**, and `processBlock` decides on `BlockHasReferences(item.OrgID, ...)`, finalizes `blocks[(org_id, block_id)]`, then deletes the **global** key. So org A's delete destroys org B's still-referenced bytes. **Confirmed by a real two-org 2 GB E2E** (identical files uploaded via API into both orgs; MinIO deduped to 2 GB; deleting one org emptied the bucket; the other org's download becomes unreadable: the internal block fetch returns 404/`NoSuchKey` after the external response has already sent 200 headers), and by a **seeded single-node repro** (org A real upload, org B seeded to the equivalent post-upload state; at 210s `objetoS3=0`, org B's `blocks` row AND `fs:` ref both survived). Trigger is ordinary multi-tenancy (identical README/empty/shared files), so it is reachable on a **greenfield** deploy from day one. **Under-reclamation was never the risk here; this is data loss.** | **High** | [worker.go:412-424](../internal/gc/worker.go#L412), [worker.go:583](../internal/gc/worker.go#L583), [store_cassandra.go:1849](../internal/gc/store_cassandra.go#L1849), [store_cassandra.go:2118](../internal/gc/store_cassandra.go#L2118), [blocks.go:251](../internal/storage/blocks.go#L251), [blocks.go:274](../internal/storage/blocks.go#L274) | `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01` |
 
 ### Precisions (they confirm, they refine)
 
@@ -517,13 +520,14 @@ Subsequent branches, in recommended merge order:
 **Recommended merge order (greenfield prod, 2026-07-16):**
 
 0. ⛔ **P10 (`ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`) — FIRST, before the deploy, as an org-scoped-key
-   series of small branches:** docs corrections → storage-layer org-aware `BlockStore` (parallel
-   APIs, fail-closed validation) → API funnels flip (write/read/reuse/verify/fallback) → **GC on its
-   own branch** (delete **+ orphan recovery**, remove the global storage APIs) → coverage + doc
-   closure. Org-scope the physical S3 key so one org's delete can never remove another org's content.
-   Land the cross-org regression test (two orgs upload identical bytes → delete + drain one → the
-   other still downloads byte-for-byte) with the GC branch; it must fail on current `main`. Nothing
-   else on this list matters if live cross-org data can be deleted.
+   series of small branches:** ✅ docs corrections (PR #133) → ✅ storage-layer org-aware `BlockStore`
+   (parallel APIs, fail-closed validation, unit tests — no behavior change) → ⏳ API funnels flip
+   (write/read/reuse/verify/fallback) → ⏳ **GC on its own branch** (delete **+ orphan recovery**,
+   remove the global storage APIs) → ⏳ coverage + doc closure. Org-scope the physical S3 key so one
+   org's delete can never remove another org's content. Land the cross-org regression test (two orgs
+   upload identical bytes → delete + drain one → the other still downloads byte-for-byte) with the GC
+   branch; it must fail on current `main`. Nothing else on this list matters if live cross-org data
+   can be deleted.
 1. ~~**1C** — replace global `ProcessOnce(storage=nil)` with scoped `ProcessOrgOnce`~~ ✅ **DONE**
    (plus a guard test that blocks reintroduction).
 2. ~~**1A / 1B** — fixture-scoped teardown for upload/`pub:foreign` residue~~ ✅ **DONE**
