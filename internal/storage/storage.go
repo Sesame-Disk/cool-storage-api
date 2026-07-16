@@ -540,10 +540,14 @@ func (m *Manager) GetHealthyBlockStore(preferredClass string) (*BlockStore, stri
 // GetBlockStoreForOrg returns an org-scoped BlockStore for the given org and
 // storage class. The returned store writes/reads/deletes at org-scoped keys
 // (blocks/<org_id>/...), so one org's GC can never touch another org's object.
-// Fails closed on an empty/invalid org id (via NewOrgBlockStore). Stores are
-// cached and reused per (org, class).
+// Fails closed on an empty/invalid org id. Stores are cached and reused per
+// canonical (org, class).
 func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, error) {
-	key := blockStoreKey{orgID: orgID, class: className}
+	normalizedOrgID, err := normalizeOrgID(orgID)
+	if err != nil {
+		return nil, err
+	}
+	key := blockStoreKey{orgID: normalizedOrgID, class: className}
 
 	// Check cache first
 	m.blockStoresMu.RLock()
@@ -567,7 +571,7 @@ func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, err
 
 	// Validate + build the org-scoped store before taking the write lock so an
 	// invalid org id fails without holding the mutex.
-	bs, err := NewOrgBlockStore(s3Store, "blocks/", orgID)
+	bs, err := NewOrgBlockStore(s3Store, "blocks/", normalizedOrgID)
 	if err != nil {
 		return nil, err
 	}
@@ -580,17 +584,19 @@ func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, err
 		return existing, nil
 	}
 
-	// Cache under the normalized org id too, so callers passing an equivalent
-	// non-canonical id resolve to the same cached store.
 	m.blockStoresByOrg[key] = bs
-	m.blockStoresByOrg[blockStoreKey{orgID: bs.orgID, class: className}] = bs
 	return bs, nil
 }
 
 // GetHealthyBlockStoreForOrg returns an org-scoped BlockStore for a healthy
 // backend with failover, mirroring GetHealthyBlockStore. Fails closed on an
-// empty/invalid org id.
+// empty/invalid org id and caches by canonical (org, class).
 func (m *Manager) GetHealthyBlockStoreForOrg(orgID, preferredClass string) (*BlockStore, string, error) {
+	normalizedOrgID, err := normalizeOrgID(orgID)
+	if err != nil {
+		return nil, "", err
+	}
+
 	store, actualClass, err := m.GetHealthyBackend(preferredClass)
 	if err != nil {
 		return nil, "", err
@@ -602,7 +608,7 @@ func (m *Manager) GetHealthyBlockStoreForOrg(orgID, preferredClass string) (*Blo
 		return nil, "", fmt.Errorf("storage class %s is not an S3 backend", actualClass)
 	}
 
-	key := blockStoreKey{orgID: orgID, class: actualClass}
+	key := blockStoreKey{orgID: normalizedOrgID, class: actualClass}
 
 	m.blockStoresMu.RLock()
 	if bs, ok := m.blockStoresByOrg[key]; ok {
@@ -611,7 +617,7 @@ func (m *Manager) GetHealthyBlockStoreForOrg(orgID, preferredClass string) (*Blo
 	}
 	m.blockStoresMu.RUnlock()
 
-	bs, err := NewOrgBlockStore(s3Store, "blocks/", orgID)
+	bs, err := NewOrgBlockStore(s3Store, "blocks/", normalizedOrgID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -624,6 +630,5 @@ func (m *Manager) GetHealthyBlockStoreForOrg(orgID, preferredClass string) (*Blo
 	}
 
 	m.blockStoresByOrg[key] = bs
-	m.blockStoresByOrg[blockStoreKey{orgID: bs.orgID, class: actualClass}] = bs
 	return bs, actualClass, nil
 }

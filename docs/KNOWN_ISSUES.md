@@ -4426,8 +4426,11 @@ The fix ships as a small, sequential series of branches (each its own PR):
 - ✅ **PR-0 — docs.** This section + the audit doc corrected (header, mid-response 404, path list).
 - ✅ **PR-1 — storage layer (org-aware `BlockStore`), no behavior change.** `NewOrgBlockStore`
   ([internal/storage/blocks.go](../internal/storage/blocks.go)) validates the org id **fail-closed**
-  (non-empty canonical UUID, normalized; rejects empty/nil/non-UUID/path chars) and org-scopes
-  `hashToKey` → `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`. `Manager.GetBlockStoreForOrg` /
+  (must be a valid UUID, normalized to canonical form; rejects empty/whitespace/non-UUID/path chars)
+  and org-scopes `hashToKey` → `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`. The **nil UUID is accepted on
+  purpose** — it is the platform org (`PlatformOrgID`, `00000000-…`), a real partition in the per-org
+  `blocks`/`block_references` tables; the empty-string guard still catches an actually-missing org.
+  `Manager.GetBlockStoreForOrg` /
   `GetHealthyBlockStoreForOrg` cache per `(org, class)` via a struct key
   ([internal/storage/storage.go](../internal/storage/storage.go)). Legacy `NewBlockStore`/
   `GetBlockStore` kept **temporarily** (deprecated) so production is unchanged until callers migrate.

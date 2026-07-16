@@ -282,7 +282,6 @@ func TestNewOrgBlockStore_FailsClosedOnInvalidOrg(t *testing.T) {
 	}{
 		{"empty", ""},
 		{"whitespace only", "   "},
-		{"nil uuid", "00000000-0000-0000-0000-000000000000"},
 		{"not a uuid", "not-an-org"},
 		{"path traversal", "../../etc"},
 		{"contains slash", "org/blocks"},
@@ -309,22 +308,24 @@ func TestNewOrgBlockStore_NormalizesOrg(t *testing.T) {
 	cases := []struct {
 		name  string
 		input string
+		want  string
 	}{
-		{"canonical", testOrgA},
-		{"uppercase", "3FA85F64-5717-4562-B3FC-2C963F66AFA6"},
-		{"braced", "{3fa85f64-5717-4562-b3fc-2c963f66afa6}"},
+		{"canonical", testOrgA, testOrgA},
+		{"uppercase", "3FA85F64-5717-4562-B3FC-2C963F66AFA6", testOrgA},
+		{"braced", "{3fa85f64-5717-4562-b3fc-2c963f66afa6}", testOrgA},
+		{"platform org", "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000000"},
 	}
 
-	want := "blocks/" + testOrgA + "/e3/b0/" + testHash64
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			bs, err := NewOrgBlockStore(nil, "blocks/", tt.input)
 			if err != nil {
 				t.Fatalf("NewOrgBlockStore(%q) error: %v", tt.input, err)
 			}
-			if bs.orgID != testOrgA {
-				t.Errorf("orgID = %q, want normalized %q", bs.orgID, testOrgA)
+			if bs.orgID != tt.want {
+				t.Errorf("orgID = %q, want normalized %q", bs.orgID, tt.want)
 			}
+			want := "blocks/" + tt.want + "/e3/b0/" + testHash64
 			if got := bs.hashToKey(testHash64); got != want {
 				t.Errorf("hashToKey = %q, want %q", got, want)
 			}

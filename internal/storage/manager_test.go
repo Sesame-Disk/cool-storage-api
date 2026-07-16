@@ -566,6 +566,13 @@ func TestGetBlockStoreForOrg_ScopesAndCaches(t *testing.T) {
 	if a1 != a2 {
 		t.Error("same (org, class) should return the cached BlockStore")
 	}
+	a3, err := m.GetBlockStoreForOrg("{3FA85F64-5717-4562-B3FC-2C963F66AFA6}", "hot-s3-usa")
+	if err != nil {
+		t.Fatalf("org A (normalized alias): %v", err)
+	}
+	if a1 != a3 {
+		t.Error("equivalent org id representations should return the same cached BlockStore")
+	}
 
 	// A different org gets a different store with a different physical key.
 	b, err := m.GetBlockStoreForOrg(testOrgB, "hot-s3-usa")
@@ -577,5 +584,55 @@ func TestGetBlockStoreForOrg_ScopesAndCaches(t *testing.T) {
 	}
 	if a1.hashToKey(testHash64) == b.hashToKey(testHash64) {
 		t.Fatal("distinct orgs must map identical content to distinct keys")
+	}
+
+	platform, err := m.GetBlockStoreForOrg("{00000000-0000-0000-0000-000000000000}", "hot-s3-usa")
+	if err != nil {
+		t.Fatalf("platform org: %v", err)
+	}
+	if platform.orgID != "00000000-0000-0000-0000-000000000000" {
+		t.Fatalf("platform org normalized id = %q", platform.orgID)
+	}
+}
+
+func TestGetHealthyBlockStoreForOrg_FailoverCachesCanonicalStore(t *testing.T) {
+	m := NewManager()
+	m.RegisterBackend("hot-s3-primary", &S3Store{}, "hot-s3-fallback")
+	m.RegisterBackend("hot-s3-fallback", &S3Store{}, "")
+	m.UpdateHealth("hot-s3-primary", HealthUnhealthy, nil)
+	m.UpdateHealth("hot-s3-fallback", HealthHealthy, nil)
+
+	aliasOrg := "{3FA85F64-5717-4562-B3FC-2C963F66AFA6}"
+
+	bs1, class1, err := m.GetHealthyBlockStoreForOrg(aliasOrg, "hot-s3-primary")
+	if err != nil {
+		t.Fatalf("first failover lookup: %v", err)
+	}
+	if class1 != "hot-s3-fallback" {
+		t.Fatalf("selected class = %q, want hot-s3-fallback", class1)
+	}
+	if bs1.orgID != testOrgA {
+		t.Fatalf("store orgID = %q, want %q", bs1.orgID, testOrgA)
+	}
+	if got, want := bs1.hashToKey(testHash64), "blocks/"+testOrgA+"/e3/b0/"+testHash64; got != want {
+		t.Fatalf("hashToKey = %q, want %q", got, want)
+	}
+
+	m.blockStoresMu.RLock()
+	cached := m.blockStoresByOrg[blockStoreKey{orgID: testOrgA, class: "hot-s3-fallback"}]
+	m.blockStoresMu.RUnlock()
+	if cached != bs1 {
+		t.Fatal("store should be cached under the selected fallback class and canonical org id")
+	}
+
+	bs2, class2, err := m.GetHealthyBlockStoreForOrg(testOrgA, "hot-s3-primary")
+	if err != nil {
+		t.Fatalf("second failover lookup: %v", err)
+	}
+	if class2 != "hot-s3-fallback" {
+		t.Fatalf("selected class on repeat = %q, want hot-s3-fallback", class2)
+	}
+	if bs1 != bs2 {
+		t.Fatal("repeated healthy lookup should reuse the cached BlockStore")
 	}
 }

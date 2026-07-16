@@ -44,29 +44,36 @@ func NewBlockStore(s3Store *S3Store, prefix string) *BlockStore {
 	}
 }
 
+// normalizeOrgID trims and validates an org id, returning its canonical UUID
+// string form for deterministic cache keys and S3 paths.
+func normalizeOrgID(orgID string) (string, error) {
+	trimmed := strings.TrimSpace(orgID)
+	if trimmed == "" {
+		return "", fmt.Errorf("org-scoped block store requires a non-empty org id")
+	}
+	parsed, err := uuid.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("org-scoped block store org id %q is not a valid UUID: %w", orgID, err)
+	}
+	return parsed.String(), nil
+}
+
 // NewOrgBlockStore creates a block store whose physical S3 keys are org-scoped:
 // blocks/<org_id>/<h0:2>/<h2:4>/<hash>. This aligns physical ownership with the
 // per-org blocks/block_references tables and GC claims, so one org's delete can
 // never remove another org's content.
 //
-// It fails closed: an empty or non-canonical org id is rejected rather than
-// silently falling back to a global key. The org id is normalized to its
-// canonical UUID form so the derived key is deterministic regardless of input
-// casing/format and can never contain a path separator.
+// It fails closed: an empty or invalid org id is rejected rather than silently
+// falling back to a global key. The org id is normalized to its canonical UUID
+// form so the derived key is deterministic regardless of input casing/format
+// and can never contain a path separator.
 func NewOrgBlockStore(s3Store *S3Store, prefix, orgID string) (*BlockStore, error) {
-	trimmed := strings.TrimSpace(orgID)
-	if trimmed == "" {
-		return nil, fmt.Errorf("org-scoped block store requires a non-empty org id")
-	}
-	parsed, err := uuid.Parse(trimmed)
+	normalizedOrgID, err := normalizeOrgID(orgID)
 	if err != nil {
-		return nil, fmt.Errorf("org-scoped block store org id %q is not a valid UUID: %w", orgID, err)
-	}
-	if parsed == uuid.Nil {
-		return nil, fmt.Errorf("org-scoped block store requires a non-nil org id")
+		return nil, err
 	}
 	bs := NewBlockStore(s3Store, prefix)
-	bs.orgID = parsed.String()
+	bs.orgID = normalizedOrgID
 	return bs, nil
 }
 
