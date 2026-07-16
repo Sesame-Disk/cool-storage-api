@@ -153,19 +153,30 @@ type BackendHealth struct {
 	FailoverClass    string // Fallback class if this one is down
 }
 
+// blockStoreKey caches an org-scoped BlockStore by (org, storage class). A struct
+// key (never a concatenated string) so distinct (org, class) pairs can never collide.
+type blockStoreKey struct {
+	orgID string
+	class string
+}
+
 // Manager manages multiple storage backends and policies
 type Manager struct {
-	backends        map[string]Store
-	blockStores     map[string]*BlockStore // Cached BlockStore per backend
-	blockStoresMu   sync.RWMutex
-	health          map[string]*BackendHealth
-	healthMu        sync.RWMutex
-	policies        []StoragePolicy
-	lifecycle       []LifecycleRule
-	defaultClass    string
-	localRegion     string
-	endpointRegions map[string]string            // hostname → region
-	regionClasses   map[string]RegionClassConfig // region → {hot, cold}
+	backends map[string]Store
+	// blockStores caches the legacy global-key BlockStore per backend. Being retired
+	// as callers migrate to blockStoresByOrg; see NewBlockStore vs NewOrgBlockStore.
+	blockStores map[string]*BlockStore
+	// blockStoresByOrg caches the org-scoped BlockStore per (org, class).
+	blockStoresByOrg map[blockStoreKey]*BlockStore
+	blockStoresMu    sync.RWMutex
+	health           map[string]*BackendHealth
+	healthMu         sync.RWMutex
+	policies         []StoragePolicy
+	lifecycle        []LifecycleRule
+	defaultClass     string
+	localRegion      string
+	endpointRegions  map[string]string            // hostname → region
+	regionClasses    map[string]RegionClassConfig // region → {hot, cold}
 }
 
 // RegionClassConfig maps a region to its hot and cold storage classes
@@ -177,13 +188,14 @@ type RegionClassConfig struct {
 // NewManager creates a new storage manager
 func NewManager() *Manager {
 	return &Manager{
-		backends:        make(map[string]Store),
-		blockStores:     make(map[string]*BlockStore),
-		health:          make(map[string]*BackendHealth),
-		policies:        []StoragePolicy{},
-		lifecycle:       []LifecycleRule{},
-		endpointRegions: make(map[string]string),
-		regionClasses:   make(map[string]RegionClassConfig),
+		backends:         make(map[string]Store),
+		blockStores:      make(map[string]*BlockStore),
+		blockStoresByOrg: make(map[blockStoreKey]*BlockStore),
+		health:           make(map[string]*BackendHealth),
+		policies:         []StoragePolicy{},
+		lifecycle:        []LifecycleRule{},
+		endpointRegions:  make(map[string]string),
+		regionClasses:    make(map[string]RegionClassConfig),
 	}
 }
 
@@ -522,5 +534,101 @@ func (m *Manager) GetHealthyBlockStore(preferredClass string) (*BlockStore, stri
 
 	bs := NewBlockStore(s3Store, "blocks/")
 	m.blockStores[actualClass] = bs
+	return bs, actualClass, nil
+}
+
+// GetBlockStoreForOrg returns an org-scoped BlockStore for the given org and
+// storage class. The returned store writes/reads/deletes at org-scoped keys
+// (blocks/<org_id>/...), so one org's GC can never touch another org's object.
+// Fails closed on an empty/invalid org id. Stores are cached and reused per
+// canonical (org, class).
+func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, error) {
+	normalizedOrgID, err := normalizeOrgID(orgID)
+	if err != nil {
+		return nil, err
+	}
+	key := blockStoreKey{orgID: normalizedOrgID, class: className}
+
+	// Check cache first
+	m.blockStoresMu.RLock()
+	if bs, ok := m.blockStoresByOrg[key]; ok {
+		m.blockStoresMu.RUnlock()
+		return bs, nil
+	}
+	m.blockStoresMu.RUnlock()
+
+	// Get the backend store
+	store, ok := m.backends[className]
+	if !ok {
+		return nil, fmt.Errorf("storage class %s not found", className)
+	}
+
+	// Cast to S3Store (BlockStore requires S3Store)
+	s3Store, ok := store.(*S3Store)
+	if !ok {
+		return nil, fmt.Errorf("storage class %s is not an S3 backend", className)
+	}
+
+	// Validate + build the org-scoped store before taking the write lock so an
+	// invalid org id fails without holding the mutex.
+	bs, err := NewOrgBlockStore(s3Store, "blocks/", normalizedOrgID)
+	if err != nil {
+		return nil, err
+	}
+
+	m.blockStoresMu.Lock()
+	defer m.blockStoresMu.Unlock()
+
+	// Double-check (another goroutine may have created it)
+	if existing, ok := m.blockStoresByOrg[key]; ok {
+		return existing, nil
+	}
+
+	m.blockStoresByOrg[key] = bs
+	return bs, nil
+}
+
+// GetHealthyBlockStoreForOrg returns an org-scoped BlockStore for a healthy
+// backend with failover, mirroring GetHealthyBlockStore. Fails closed on an
+// empty/invalid org id and caches by canonical (org, class).
+func (m *Manager) GetHealthyBlockStoreForOrg(orgID, preferredClass string) (*BlockStore, string, error) {
+	normalizedOrgID, err := normalizeOrgID(orgID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	store, actualClass, err := m.GetHealthyBackend(preferredClass)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Cast to S3Store
+	s3Store, ok := store.(*S3Store)
+	if !ok {
+		return nil, "", fmt.Errorf("storage class %s is not an S3 backend", actualClass)
+	}
+
+	key := blockStoreKey{orgID: normalizedOrgID, class: actualClass}
+
+	m.blockStoresMu.RLock()
+	if bs, ok := m.blockStoresByOrg[key]; ok {
+		m.blockStoresMu.RUnlock()
+		return bs, actualClass, nil
+	}
+	m.blockStoresMu.RUnlock()
+
+	bs, err := NewOrgBlockStore(s3Store, "blocks/", normalizedOrgID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	m.blockStoresMu.Lock()
+	defer m.blockStoresMu.Unlock()
+
+	if existing, ok := m.blockStoresByOrg[key]; ok {
+		return existing, actualClass, nil
+	}
+
+	m.blockStoresByOrg[key] = bs
 	return bs, actualClass, nil
 }

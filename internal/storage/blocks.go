@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Sesame-Disk/sesamefs/internal/chunker"
+	"github.com/google/uuid"
 )
 
 // BlockStore provides content-addressable block storage
@@ -14,9 +15,22 @@ import (
 type BlockStore struct {
 	s3     *S3Store
 	prefix string // Prefix for block keys in S3 (e.g., "blocks/")
+	// orgID, when non-empty, org-scopes the physical S3 key so that identical
+	// content in different orgs maps to distinct objects
+	// (blocks/<org_id>/<h0:2>/<h2:4>/<hash>). It is always a canonical UUID string,
+	// validated at construction by NewOrgBlockStore, so it can never contain a path
+	// separator. Empty only for the legacy global-key constructor NewBlockStore,
+	// which is being retired as callers migrate to the org-scoped store.
+	orgID string
 }
 
-// NewBlockStore creates a new block store backed by S3
+// NewBlockStore creates a new block store backed by S3.
+//
+// Deprecated: this constructor yields the legacy GLOBAL key layout
+// (blocks/<h0:2>/<h2:4>/<hash>) with no org component, which lets one org's GC
+// delete an S3 object another org still references (ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01).
+// New code must use NewOrgBlockStore. This is kept only while callers migrate and
+// will be removed once every path threads the org through.
 func NewBlockStore(s3Store *S3Store, prefix string) *BlockStore {
 	if prefix == "" {
 		prefix = "blocks/"
@@ -28,6 +42,39 @@ func NewBlockStore(s3Store *S3Store, prefix string) *BlockStore {
 		s3:     s3Store,
 		prefix: prefix,
 	}
+}
+
+// normalizeOrgID trims and validates an org id, returning its canonical UUID
+// string form for deterministic cache keys and S3 paths.
+func normalizeOrgID(orgID string) (string, error) {
+	trimmed := strings.TrimSpace(orgID)
+	if trimmed == "" {
+		return "", fmt.Errorf("org-scoped block store requires a non-empty org id")
+	}
+	parsed, err := uuid.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("org-scoped block store org id %q is not a valid UUID: %w", orgID, err)
+	}
+	return parsed.String(), nil
+}
+
+// NewOrgBlockStore creates a block store whose physical S3 keys are org-scoped:
+// blocks/<org_id>/<h0:2>/<h2:4>/<hash>. This aligns physical ownership with the
+// per-org blocks/block_references tables and GC claims, so one org's delete can
+// never remove another org's content.
+//
+// It fails closed: an empty or invalid org id is rejected rather than silently
+// falling back to a global key. The org id is normalized to its canonical UUID
+// form so the derived key is deterministic regardless of input casing/format
+// and can never contain a path separator.
+func NewOrgBlockStore(s3Store *S3Store, prefix, orgID string) (*BlockStore, error) {
+	normalizedOrgID, err := normalizeOrgID(orgID)
+	if err != nil {
+		return nil, err
+	}
+	bs := NewBlockStore(s3Store, prefix)
+	bs.orgID = normalizedOrgID
+	return bs, nil
 }
 
 // BlockInfo contains metadata about a stored block
@@ -268,15 +315,22 @@ func (bs *BlockStore) PutBlocks(ctx context.Context, blocks []chunker.Block) ([]
 	return stored, nil
 }
 
-// hashToKey converts a block hash to an S3 key
-// Uses a two-level directory structure for better S3 performance
-// e.g., "blocks/ab/cd/abcdef123456..."
+// hashToKey converts a block hash to an S3 key.
+// Uses a two-level directory structure for better S3 performance, org-scoped when
+// this store was built with an org id:
+//
+//	org-scoped: "blocks/<org_id>/ab/cd/abcdef123456..."
+//	legacy:     "blocks/ab/cd/abcdef123456..."  (NewBlockStore only, being retired)
 func (bs *BlockStore) hashToKey(hash string) string {
+	prefix := bs.prefix
+	if bs.orgID != "" {
+		prefix = bs.prefix + bs.orgID + "/"
+	}
 	if len(hash) < 4 {
-		return bs.prefix + hash
+		return prefix + hash
 	}
 	// Two-level sharding: first 2 chars, next 2 chars
-	return fmt.Sprintf("%s%s/%s/%s", bs.prefix, hash[:2], hash[2:4], hash)
+	return fmt.Sprintf("%s%s/%s/%s", prefix, hash[:2], hash[2:4], hash)
 }
 
 // bytesReader wraps []byte to implement io.Reader
