@@ -506,8 +506,9 @@ blockStore.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content})
 ```
 
 There is no org-less `BlockStore` constructor. Manager-backed callers use
-`GetBlockStoreForOrg` or `GetHealthyBlockStoreForOrg`; GC uses the exact recorded
-storage class and never health-fails over a delete to another backend.
+`GetBlockStoreForOrg` or `GetHealthyBlockStoreForOrg`; GC normalizes incidental
+whitespace, selects the canonical storage class, and never health-fails over a
+delete to another backend.
 
 **Save Types:**
 - **Manual Save (Ctrl+S)**: Works with `forcesave: true` in config, sends status=6 callback

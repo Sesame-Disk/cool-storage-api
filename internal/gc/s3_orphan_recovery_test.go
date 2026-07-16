@@ -181,7 +181,7 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 		t.Errorf("orphan should be cleared, got %d", store.S3OrphanCount())
 	}
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: " hot ", BlockID: "orph-1"}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", BlockID: "orph-1"}) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 }

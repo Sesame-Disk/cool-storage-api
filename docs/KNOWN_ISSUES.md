@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🟡 **P10 fixed; non-blocking debt remains** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped; delete resolution uses the exact recorded class without health failover; org-less storage APIs are removed. Real Cassandra+MinIO regressions prove delete/drain/download and orphan-recovery isolation across the default and platform orgs. **Remaining:** storage retention (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and scale (P8). The single-org delete path also has the ~50 GB manual dev-cluster observation (not an automated test). Reconcile/backfill is not required for an empty prod deploy. See GC audit section below. |
+| Garbage Collection | 🟡 **P10 fixed; non-blocking debt remains** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped; delete resolution trims incidental whitespace and uses the canonical class without health failover; org-less storage APIs are removed. Real Cassandra+MinIO regressions prove delete/drain/download and orphan-recovery isolation across the default and platform orgs. **Remaining:** storage retention (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and scale (P8). The single-org delete path also has the ~50 GB manual dev-cluster observation (not an automated test). Reconcile/backfill is not required for an empty prod deploy. See GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -4440,7 +4440,7 @@ The fix ships as a small, sequential series of branches (each its own PR):
   differs. The process-wide org-less API singleton is no longer constructed. Integration coverage pins
   same-org dedup across libraries and distinct physical keys plus byte-for-byte reads across the default
   and platform orgs. This intermediate state required GC to remain disabled until PR-3.
-- ✅ **PR-3 — GC own branch:** delete + orphan recovery resolve `(org_id, exact storage_class)`,
+- ✅ **PR-3 — GC own branch:** delete + orphan recovery resolve `(org_id, normalized canonical storage_class)`,
   empty orphan classes fail closed, the legacy global APIs are removed as a compiler net, and the
   cross-org Cassandra+MinIO regressions above pass.
 - Broader multiregion/bucket coverage remains useful follow-up coverage, but it is not required to

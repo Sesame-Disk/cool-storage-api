@@ -11,9 +11,10 @@ Session-by-session development history for SesameFS.
 ## 2026-07-16 - GC physical deletion is org-scoped end to end (P10 PR-3)
 
 - Normal block deletion and S3 orphan recovery now resolve `BlockStore` by
-  `(org_id, exact storage_class)`, matching API reads/writes at
+  `(org_id, normalized canonical storage_class)`, matching API reads/writes at
   `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`.
-- GC delete resolution intentionally ignores backend health failover. Orphan rows
+- GC trims incidental whitespace before exact class lookup and intentionally ignores
+  backend health failover. Orphan rows
   with an empty storage class fail closed and retain their recovery position rather
   than guessing `hot`.
 - Removed the org-less `NewBlockStore`, `Manager.GetBlockStore`, and

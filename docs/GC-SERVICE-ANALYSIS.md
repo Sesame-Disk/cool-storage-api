@@ -141,7 +141,7 @@ for deletion while simultaneously being referenced by a new upload, the worker
 point-reads live references before and after the LWT claim, and releases the
 claim if a concurrent writer reintroduces liveness before S3 deletion.
 The physical delete is bound to the same org partition used by those checks and to
-the block row's exact canonical storage class. GC deliberately ignores backend
+the block row's normalized canonical storage class. GC deliberately ignores backend
 health failover because deleting from a fallback backend would target a different
 physical location.
 

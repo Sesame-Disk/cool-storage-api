@@ -485,8 +485,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if err != nil {
 		return fmt.Errorf("failed to load canonical block info for %s: %w", item.ItemID, err)
 	}
-	storageClass := blockInfo.StorageClass
-	if strings.TrimSpace(storageClass) == "" {
+	storageClass := strings.TrimSpace(blockInfo.StorageClass)
+	if storageClass == "" {
 		if blockInfo.CreatedAt == nil {
 			if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, claimID); err != nil {
 				return fmt.Errorf("failed to remove stub block row for %s: %w", item.ItemID, err)
@@ -724,8 +724,8 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					continue
 				}
 
-				storageClass := orph.StorageClass
-				if strings.TrimSpace(storageClass) == "" {
+				storageClass := strings.TrimSpace(orph.StorageClass)
+				if storageClass == "" {
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("S3 orphan recovery row has empty storage class for org=%s block=%s", orph.OrgID, orph.BlockID)
 					}
