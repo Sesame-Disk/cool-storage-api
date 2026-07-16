@@ -196,26 +196,33 @@ func releaseStagedBlockForTest(t *testing.T, database *dbpkg.DB, orgID, blockID,
 	}
 
 	// Zero-ref: read sha1 before deleting the row — it is the mapping's external id.
+	// A missing row is NOT a reason to stop: the object can outlive it (an upload whose
+	// materialization was rejected after the S3 PUT never gets a row at all), and that
+	// object is an orphan no GC phase can discover — blocks are found through candidates,
+	// and S3-orphan recovery only replays gc_s3_orphans. So fall through to the S3 delete.
 	var externalSHA1 string
+	blockRowExists := true
 	switch err := database.Session().Query(
 		`SELECT sha1 FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&externalSHA1); {
 	case errors.Is(err, gocql.ErrNotFound):
-		return // already reclaimed by GC
+		blockRowExists = false
 	case err != nil:
 		t.Errorf("cleanup staged block %s/%s: read sha1: %v", orgID, blockID, err)
 		return
 	}
 
-	if externalSHA1 != "" {
-		if err := database.Session().Query(
-			`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`,
-			orgID, dbpkg.PlainBlockRepresentationID, externalSHA1).Exec(); err != nil {
-			t.Errorf("cleanup staged block %s/%s: delete mapping %s: %v", orgID, blockID, externalSHA1, err)
+	if blockRowExists {
+		if externalSHA1 != "" {
+			if err := database.Session().Query(
+				`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`,
+				orgID, dbpkg.PlainBlockRepresentationID, externalSHA1).Exec(); err != nil {
+				t.Errorf("cleanup staged block %s/%s: delete mapping %s: %v", orgID, blockID, externalSHA1, err)
+			}
 		}
-	}
-	if err := database.Session().Query(
-		`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
-		t.Errorf("cleanup staged block %s/%s: delete blocks row: %v", orgID, blockID, err)
+		if err := database.Session().Query(
+			`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+			t.Errorf("cleanup staged block %s/%s: delete blocks row: %v", orgID, blockID, err)
+		}
 	}
 	if blockStore != nil {
 		if err := blockStore.DeleteBlock(context.Background(), blockID); err != nil {

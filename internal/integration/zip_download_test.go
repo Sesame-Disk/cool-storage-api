@@ -211,6 +211,31 @@ func TestZipDownloadFailsBeforeHeadersWhenLegacyMappingIsMissing(t *testing.T) {
 		t.Fatalf("failed to delete block mapping %s: %v", brokenMapping, err)
 	}
 
+	// Undo BOTH corruptions before the library is torn down. This fixture is why the full
+	// integration suite used to strand an eternal block (ISSUE-GC-TEST-RESIDUE-01 / 1G):
+	// `block_references` is keyed by the canonical SHA-256, but the legacy layout forced
+	// above leaves fs_objects.block_ids holding SHA-1s, and the mapping that would resolve
+	// SHA-1 → SHA-256 is deleted right here. So the library cascade read SHA-1s, released
+	// refs that do not exist, and left the real `fs:` ref in place — pinning the block and
+	// its S3 object with the library gone from both indexes, which no GC phase can ever
+	// rediscover (the F1/P7 shape).
+	//
+	// Registered AFTER createTestLibrary's cleanup so LIFO runs it first: the cascade then
+	// sees canonical SHA-256 block_ids and releases the ref through the real GC path.
+	// IF EXISTS keeps the restore from resurrecting rows GC already reclaimed.
+	t.Cleanup(func() {
+		if err := session.Query(`
+			UPDATE fs_objects SET block_ids = ?, seafile_block_ids_sha1 = ? WHERE library_id = ? AND fs_id = ? IF EXISTS
+		`, blockIDs, seafileBlockIDs, repoID, fileFSID).Exec(); err != nil {
+			t.Errorf("restore canonical block ids for %s/%s before teardown: %v", repoID, fileFSID, err)
+		}
+		if err := session.Query(`
+			INSERT INTO block_id_mappings (org_id, representation_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?, ?)
+		`, orgID, dbpkg.PlainBlockRepresentationID, brokenMapping, blockIDs[0], time.Now().UTC()).Exec(); err != nil {
+			t.Errorf("restore block mapping %s before teardown: %v", brokenMapping, err)
+		}
+	})
+
 	zipTaskResp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2.1/repos/%s/zip-task/?p=/", repoID), map[string]string{})
 	expectStatus(t, zipTaskResp, http.StatusOK)
 	zipTaskPayload := responseJSON(t, zipTaskResp)

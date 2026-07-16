@@ -4211,7 +4211,36 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
   - `up:sync:<session>:<block>` from the sync-protocol fixtures — same class 1B fixed, different
     upload path. It carries a provisional expiry projection, so Phase 0 reclaims it in ~2 days.
 
-  Tracked as **branch 1G**.
+  **1G — root-caused and fixed (2026-07-16).** Neither leftover was what the roadmap guessed
+  (`removeLibraryBaseRowsForFallbackTest`); running each file in isolation cleared both `TestSync*`
+  and `*Projection*`, so the suspects were wrong.
+
+  - **The eternal `fs:` block was `TestZipDownloadFailsBeforeHeadersWhenLegacyMappingIsMissing`.**
+    It deliberately corrupts two things and restored neither: it rewrites `fs_objects.block_ids`
+    to the **legacy SHA-1** layout, and deletes the SHA-1→SHA-256 `block_id_mappings` row. But
+    `block_references` is keyed by the canonical **SHA-256**, so the library cascade read SHA-1s,
+    released references that do not exist, and left the real `fs:` ref in place — pinning the
+    block with the library gone from both indexes, which no GC phase can rediscover (F1/P7 shape).
+    The `audit_log` proves the cascade ran (`gc_library_cascade_deleted`) and the fs_object was
+    processed (`Deleted fs_object 8ed27335…`) — the release simply targeted the wrong ids. Both
+    corruptions are now undone in a `t.Cleanup` registered after the library's, so LIFO restores
+    canonical ids before the cascade runs. Proven both ways on a clean stack: without the restore
+    the ref sits unchanged for 210s with GC idle (`gc_queue=0`, `libraries=0`) — **eternal**; with
+    it, the ref is released at ~90s and the block reclaimed by ~180s.
+  - **The `up:sync:` provisional was `quotas_test.go`'s `uploadSyncBlockStatus`** (not the sync
+    suite): it PUTs a block through the seafhttp sync path and never commits, so the handler's
+    `up:sync:<repo>:<block>` pin and its expiry projection survive until Phase 0 fires two days
+    later. Teardown now hangs off that shared helper. `prov` went 1 → 0.
+
+  **Measurement correction:** earlier residue numbers in this file undercounted S3. The dev stack
+  has **five** buckets (`sesamefs-blocks`, `-usa`, `-eu`, `-china`, `-archive`) and the script only
+  counted `sesamefs-blocks`; libraries created with `storage_id: hot-s3-usa` (zip/region/history
+  tests) write to `sesamefs-usa`, which had been accumulating blocks unseen across runs. Always
+  count every bucket.
+
+  **Still open (new, smaller):** one ~90-byte S3 object with **no `blocks` row** survives a run —
+  an S3-only orphan that no GC phase can discover (blocks are found through candidates, and
+  S3-orphan recovery only replays `gc_s3_orphans`). Not yet attributed to a test.
 
   Do not run a global GC over the shared keyspace (invariants #5/#6).
 - **Branch 1C** ✅ **DONE**: the last direct global `ProcessOnce(storage=nil)`

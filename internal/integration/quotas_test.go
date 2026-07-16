@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 )
 
 const (
@@ -820,11 +822,48 @@ func uploadRawBlockStatus(t *testing.T, c *testClient, content []byte) (int, map
 	return resp.StatusCode, payload
 }
 
+// releaseSyncStagedBlockForTest tears down one block staged by the sync/seafhttp upload
+// path: it drops the `up:sync:` pin the handler wrote, then hands the block to the shared
+// releaseStagedBlockForTest, which clears the expiry projection and — only if no referrer
+// survives — the blocks row, forward mapping and S3 object. A block that ends up committed
+// keeps an `fs:` ref, so it is left to its library's cascade.
+func releaseSyncStagedBlockForTest(t *testing.T, repoID, blockID string) {
+	t.Helper()
+
+	// Built outside t.Cleanup so an unreachable object store degrades to a logged skip.
+	blockStore := blockStoreForCleanupOrNil(t)
+	orgID := resolveOrgID(t, repoID)
+	// Mirrors internal/api.syncBlockUploadOperationID, which is unexported.
+	referrer := dbpkg.BlockReferrerForUpload("sync:" + repoID + ":" + blockID)
+
+	t.Cleanup(func() {
+		database := shareProjectionDBForTest(t)
+		if err := database.Session().Query(
+			`DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+			orgID, blockID, referrer).Exec(); err != nil {
+			t.Errorf("cleanup sync block reference %s/%s: %v", orgID, blockID, err)
+			return
+		}
+		releaseStagedBlockForTest(t, database, orgID, blockID, referrer, blockStore)
+	})
+}
+
+// uploadSyncBlockStatus PUTs a block through the desktop/sync seafhttp path and returns
+// the status. The block is staged, never committed: the handler pins it with a
+// deterministic `up:sync:<repo>:<block>` reference plus a provisional expiry projection,
+// which production only releases when the sync head publish promotes or drops it.
+//
+// Teardown is registered here because no caller commits. Left alone, the pin survives the
+// run and only Phase 0 clears it when the projection expires — two days later — so every
+// suite run parks a block and its S3 object in the cluster until then
+// (ISSUE-GC-TEST-RESIDUE-01 / branch 1G, same shape 1B fixed on the web upload path).
+// Best-effort: callers asserting a quota rejection never staged anything.
 func uploadSyncBlockStatus(t *testing.T, c *testClient, repoID string, content []byte) (int, string) {
 	t.Helper()
 
 	hash := sha256.Sum256(content)
 	blockID := hex.EncodeToString(hash[:])
+	releaseSyncStagedBlockForTest(t, repoID, blockID)
 	req, err := http.NewRequest(
 		http.MethodPut,
 		fmt.Sprintf("%s/seafhttp/repo/%s/block/%s?hash_type=sha256", c.baseURL, repoID, blockID),

@@ -29,9 +29,10 @@ their verified status.
 >   expiry leaves an artifact nothing can rediscover. Also historical drift / manual CQL. Not
 >   reproduced on a normal successful delete, but **not** greenfield-exempt — 8D stays open.
 > - **P8** — Phase 9 still scans all of `shares_by_group` (bounded memory, unbounded Cassandra I/O).
-> - **1G (tests, new)** — the **full** suite still drains to 2 stranded blocks: one `fs:`-pinned
->   block whose library is gone from both indexes (the F1/P7 shape, eternal) and one `up:sync:`
->   provisional (self-heals in 2d). See [Current open work](#current-open-work-2026-07-15).
+> - **1G (tests)** — both stranded blocks are **fixed** (the `fs:` one was
+>   `TestZipDownloadFailsBeforeHeadersWhenLegacyMappingIsMissing` corrupting `fs_objects.block_ids`
+>   to SHA-1 + deleting the mapping, so the cascade released the wrong ids; the `up:sync:` one was
+>   `quotas_test.go`). One ~90-byte **S3-only orphan** (no `blocks` row) is still unattributed.
 > - **P3 (low)** — direct-delete omits policy-index delete, but the durable cascade's
 >   `HardDeleteLibrary` clears it; at most a short transient window for new deletes.
 > - **10A–10E, branch N+1** — engine robustness and bulk-cleaner N+1 (low priority).
@@ -73,7 +74,7 @@ grows.
 | Medium | Markerless artifact discovery | P7 / branch 8D | Reachable on a fresh cluster via terminal child-work loss (retry exhaustion → DLQ → DLQ expiry) after the parent cascade dropped canonical + marker; also drift/manual ops. Under-reclamation, never wrong deletion. Not the normal flow, but **not** greenfield-exempt |
 | Medium (scale) | Phase 9 global `shares_by_group` scan | P8 / branch 1F | Cassandra cost grows with total shares; memory bounded |
 | — | *(done)* Integration isolation + upload-fixture teardown | 1A/1B/1C | Closed — `TestWebBlockUpload` drains to a zero residue delta (was 4 blocks + 5 S3 objects stranded 2 days); global GC fan-out removed and guarded |
-| Medium (tests) | Last 2 stranded blocks in the **full** suite | 1G (new) | Full run drains 122 blocks → **2**: one `fs:`-pinned block whose library is gone from both indexes (F1/P7 shape — **eternal**, GC idle) and one `up:sync:` provisional (self-heals in 2d via Phase 0). Dev-cluster diagnosis only |
+| Low (tests) | Unattributed S3-only orphan | 1G follow-up | One ~90-byte object with **no `blocks` row** survives a run. No GC phase can discover it (blocks are found via candidates; S3-orphan recovery only replays `gc_s3_orphans`). The two stranded blocks 1G targeted are **fixed** — see the branch table. Dev-cluster only |
 | Low | Policy index on direct delete | P3 / branch 2 | Transient stale row until cascade runs `HardDeleteLibrary`; optional polish |
 | Low | Engine robustness | 10A–10E | `dryRun` race, postpone metrics, pending audit, S3-orphan LWT decision |
 | Low | Bulk-cleaner N+1 | branch N+1 | Latency on mass permanent-delete only |
@@ -481,7 +482,7 @@ Subsequent branches, in recommended merge order:
 | 1A ✅ **DONE** | `pub:foreign` test hygiene: referrer captured; `t.Cleanup` removes the ref + block + mapping + S3 object + the upload's provisional expiry projection, all by exact id, and asserts the fake ref is gone. Measured: pre-fix the fixture leaked 1 row in each of the six dimensions permanently; post-fix all six are 0. No prod change. | `ISSUE-GC-TEST-RESIDUE-01` | Minimal |
 | 1B ✅ **DONE** | **Root cause found:** `cleanupBlockUploadSessionForTest` deleted the `up:` ref with raw CQL, bypassing the production release path, so `EnsureBlockGCCandidate` never ran and the zero-ref block became **undiscoverable** — rescued only by Phase 0 when the provisional expiry fired **2 days** later (same shape as P4). Fixed centrally in `releaseStagedBlockForTest` (drops the expiry projection; tears down block/mapping/S3 only when no referrer remains — a surviving `fs:` means a library owns it and its cascade reclaims it properly), which every fixture inherits via `webCreateBlockSession`. `webUploadBlockLegacy` now also tears down its own S3-only object, which is an orphan by construction (no `blocks` row ⇒ nothing ever reclaims it). Measured on `-run TestWebBlockUpload`: post-GC-drain residue went from **blocks=4 mappings=4 prov_refs=4 minio=5 stranded 2 days** to **0** — `-run TestWebBlockUpload` now drains to zero (the **full** suite still ends at 2 — see 1G). Also repaired `registerLibraryBaseRowRestoreCleanup`, which re-inserted `deleted_libraries` without `block_representation_id`/`purge_requested_at` (the unstamped-marker state PR #123 fixed); verified by forcing the test to fail. | `ISSUE-GC-TEST-RESIDUE-01` | Low |
 | 1C ✅ **DONE** | Removed global-GC cross-test interference: the last direct `ProcessOnce(storage=nil)` (`admin_identity_projection_regression_test.go`) is now `ProcessOrgOnce(ctx, orgUUID)`, and `TestNoGlobalGCFanoutInIntegrationSuite` (untagged, runs in the normal `go test ./...` pass — no backend needed) fails the build if any test reintroduces the fan-out. `/admin/gc/run` triggers inventoried: 2 helpers (`triggerGCWorker`/`triggerGCScanner`) used by ~20 call sites; they run the **real** backend worker with **real** storage, so they are globally noisy but do **not** manufacture S3 orphans — left as-is, tracked under 1B's baseline work. | `ISSUE-GC-TEST-RESIDUE-01` | Med |
-| 1G (new) | Close the last 2 stranded blocks a **full** suite run leaves (1A–1C got `TestWebBlockUpload` to zero, but the whole suite still ends at 2). (a) One `fs:`-pinned block whose library is gone from **both** indexes with GC idle — the F1/P7 shape, **eternal**; prime suspect is a fixture that removes library base rows with raw CQL (e.g. `removeLibraryBaseRowsForFallbackTest`), whose restore only fires on failure, so a *passing* run strands whatever the library still referenced. Find it and release its refs, or delete the library through the API so the cascade owns it. (b) One `up:sync:<session>:<block>` provisional from the sync-protocol fixtures — same class 1B fixed on a different upload path; give it the `releaseStagedBlockForTest` treatment instead of waiting out the 2-day expiry. Measure no-net-growth over the **full** suite, not just one file. | `ISSUE-GC-TEST-RESIDUE-01` | Low/Med |
+| 1G ✅ **DONE** | Closed the full suite's 2 stranded blocks. Neither was the guessed `removeLibraryBaseRowsForFallbackTest` — running each file in isolation cleared `TestSync*` and `*Projection*`. **(a)** The eternal `fs:` block was `TestZipDownloadFailsBeforeHeadersWhenLegacyMappingIsMissing`: it rewrites `fs_objects.block_ids` to the **legacy SHA-1** layout and deletes the SHA-1→SHA-256 mapping, but `block_references` is keyed by canonical **SHA-256** — so the cascade released ids that do not exist and left the real `fs:` ref pinning the block, with the library gone from both indexes (F1/P7 shape). `audit_log` confirms the cascade ran and the fs_object was deleted; only the release missed. Both corruptions are now undone in a `t.Cleanup` registered after the library's (LIFO ⇒ restores canonical ids first). Proven both ways: without it the ref sits unchanged 210s with GC idle (**eternal**); with it, released at ~90s, block reclaimed by ~180s. **(b)** The `up:sync:` provisional was `quotas_test.go`'s `uploadSyncBlockStatus` (not the sync suite), which stages a block through seafhttp and never commits; teardown now hangs off that shared helper (`prov` 1→0). **Measurement fix:** the dev stack has **5** buckets and the residue script only counted `sesamefs-blocks`; `storage_id: hot-s3-usa` libraries write to `sesamefs-usa`, which had been accumulating unseen. | `ISSUE-GC-TEST-RESIDUE-01` | Low/Med |
 | 2 (optional) | Fold `AddDeleteLibraryPolicyQuery` (version_ttl + auto_delete) into the `hardDeleteLibraryRowsFn` batch. Eliminates the transient stale policy row between direct-delete and cascade. | `ISSUE-GC-POLICY-INDEX-STALE-01` | Low |
 | 3 ✅ **DONE** | Org-admin single-path parity (`DeleteOrgTrashLibrary`): after hard-delete, immediately enqueue the same durable, Phase-13-deduplicated `ItemLibraryCascade` used by the other permanent-delete paths. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Low/Med |
 | 4 ✅ **DONE** | Org-admin bulk-path parity (`CleanOrgTrashLibraries`): after each successful hard-delete, immediately enqueue the same durable, Phase-13-deduplicated `ItemLibraryCascade`. No content-only accelerator remains. | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` | Med |
@@ -504,13 +505,16 @@ Subsequent branches, in recommended merge order:
 
 1. ~~**1C** — replace global `ProcessOnce(storage=nil)` with scoped `ProcessOrgOnce`~~ ✅ **DONE**
    (plus a guard test that blocks reintroduction).
-2. **1A / 1B** — fixture-scoped teardown for upload/`pub:foreign` residue.
-3. **5 (P5)** — Phase 13 error visibility (small change, high ops value).
-4. **7 (P4)** — `pub:` expiry projection.
-5. **8D (P7)** — markerless artifact discovery (covers terminal child-work loss/DLQ expiry on a
+2. ~~**1A / 1B** — fixture-scoped teardown for upload/`pub:foreign` residue~~ ✅ **DONE**
+   (`TestWebBlockUpload` drains to a zero delta; the **full** suite still ends at 2 — that
+   remainder is **1G**).
+3. **1G** — close the full suite's last 2 stranded blocks.
+4. **5 (P5)** — Phase 13 error visibility (small change, high ops value).
+5. **7 (P4)** — `pub:` expiry projection.
+6. **8D (P7)** — markerless artifact discovery (covers terminal child-work loss/DLQ expiry on a
    fresh cluster, plus drift/manual ops).
-6. **1F (P8)** — bucketed group-share discovery before share volume grows.
-7. **2, N+1, 10A–10E** — polish as capacity allows.
+7. **1F (P8)** — bucketed group-share discovery before share volume grows.
+8. **2, N+1, 10A–10E** — polish as capacity allows.
 
 Branches **8A–8C** remain documented for **brownfield** clusters only; they are **not** on the
 greenfield prod launch path.
