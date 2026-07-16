@@ -506,9 +506,11 @@ Subsequent branches, in recommended merge order:
 1. ~~**1C** — replace global `ProcessOnce(storage=nil)` with scoped `ProcessOrgOnce`~~ ✅ **DONE**
    (plus a guard test that blocks reintroduction).
 2. ~~**1A / 1B** — fixture-scoped teardown for upload/`pub:foreign` residue~~ ✅ **DONE**
-   (`TestWebBlockUpload` drains to a zero delta; the **full** suite still ends at 2 — that
-   remainder is **1G**).
-3. **1G** — close the full suite's last 2 stranded blocks.
+   (`TestWebBlockUpload` drains to a zero delta).
+3. ~~**1G** — close the full suite's last 2 stranded blocks~~ ✅ **DONE** (the eternal `fs:` one
+   and the `up:sync:` provisional). **Follow-up:** one ~90-byte **S3-only orphan** (no `blocks`
+   row) still survives a full run, unattributed — full-suite hygiene is not yet at a zero delta
+   across all five buckets.
 4. **5 (P5)** — Phase 13 error visibility (small change, high ops value).
 5. **7 (P4)** — `pub:` expiry projection.
 6. **8D (P7)** — markerless artifact discovery (covers terminal child-work loss/DLQ expiry on a

@@ -196,33 +196,34 @@ func releaseStagedBlockForTest(t *testing.T, database *dbpkg.DB, orgID, blockID,
 	}
 
 	// Zero-ref: read sha1 before deleting the row — it is the mapping's external id.
-	// A missing row is NOT a reason to stop: the object can outlive it (an upload whose
-	// materialization was rejected after the S3 PUT never gets a row at all), and that
-	// object is an orphan no GC phase can discover — blocks are found through candidates,
-	// and S3-orphan recovery only replays gc_s3_orphans. So fall through to the S3 delete.
+	//
+	// A missing row means STOP, not "delete the object anyway". S3 keys are content-addressed
+	// with no org in them (hashToKey ⇒ blocks/<h0:2>/<h2:4>/<hash>), so one object backs every
+	// org that ever stored those bytes, while `blocks` and `block_references` are per-org. The
+	// zero-ref check above therefore only proves THIS org is done with it. The `blocks` row is
+	// the fixture's evidence that it materialized the object here, and it carries the
+	// storage_class that says which bucket the object even lives in. Without it we would be
+	// deleting a hash we cannot prove we created, from a bucket we are guessing.
 	var externalSHA1 string
-	blockRowExists := true
 	switch err := database.Session().Query(
 		`SELECT sha1 FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&externalSHA1); {
 	case errors.Is(err, gocql.ErrNotFound):
-		blockRowExists = false
+		return // already reclaimed by GC, or never materialized here
 	case err != nil:
 		t.Errorf("cleanup staged block %s/%s: read sha1: %v", orgID, blockID, err)
 		return
 	}
 
-	if blockRowExists {
-		if externalSHA1 != "" {
-			if err := database.Session().Query(
-				`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`,
-				orgID, dbpkg.PlainBlockRepresentationID, externalSHA1).Exec(); err != nil {
-				t.Errorf("cleanup staged block %s/%s: delete mapping %s: %v", orgID, blockID, externalSHA1, err)
-			}
-		}
+	if externalSHA1 != "" {
 		if err := database.Session().Query(
-			`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
-			t.Errorf("cleanup staged block %s/%s: delete blocks row: %v", orgID, blockID, err)
+			`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`,
+			orgID, dbpkg.PlainBlockRepresentationID, externalSHA1).Exec(); err != nil {
+			t.Errorf("cleanup staged block %s/%s: delete mapping %s: %v", orgID, blockID, externalSHA1, err)
 		}
+	}
+	if err := database.Session().Query(
+		`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+		t.Errorf("cleanup staged block %s/%s: delete blocks row: %v", orgID, blockID, err)
 	}
 	if blockStore != nil {
 		if err := blockStore.DeleteBlock(context.Background(), blockID); err != nil {
