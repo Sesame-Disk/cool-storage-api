@@ -36,13 +36,17 @@ func ProbeUploadedBlockReuse(database *db.DB, orgID, blockID string) (db.BlockRe
 // ResolveCanonicalBlockStore resolves the exact canonical backend for a block.
 // It does not apply health failover because the caller is verifying or repairing
 // the physical location that Cassandra has already declared canonical.
-func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, canonicalClass string) (*storage.BlockStore, error) {
+//
+// orgID org-scopes the physical key so verify/repair target the requesting org's
+// object (blocks/<org_id>/...). The fallback store must already be org-scoped by
+// the caller.
+func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, canonicalClass, orgID string) (*storage.BlockStore, error) {
 	canonicalClass = strings.TrimSpace(canonicalClass)
 	if canonicalClass == "" {
 		return nil, errors.New("canonical storage class is empty")
 	}
 	if storageManager != nil {
-		return storageManager.GetBlockStore(canonicalClass)
+		return storageManager.GetBlockStoreForOrg(orgID, canonicalClass)
 	}
 	if fallbackStore != nil {
 		fallbackClass = strings.TrimSpace(fallbackClass)
@@ -54,20 +58,21 @@ func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *
 }
 
 // EnsureReusableBlockPresent verifies that the canonical physical copy exists for
-// a Cassandra-reusable block and repairs it in place when it is missing.
-func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass string) (string, error) {
+// a Cassandra-reusable block and repairs it in place when it is missing. orgID
+// org-scopes the canonical locator (see ResolveCanonicalBlockStore).
+func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string) (string, error) {
 	if probe.Decision != db.BlockReuseReusable {
 		return "", fmt.Errorf("block %s is not reusable", blockID)
 	}
 
-	canonicalStore, err := resolveCanonicalBlockStoreFn(storageManager, fallbackStore, fallbackClass, probe.StorageClass)
+	canonicalStore, err := resolveCanonicalBlockStoreFn(storageManager, fallbackStore, fallbackClass, probe.StorageClass, orgID)
 	if err != nil {
 		return "", fmt.Errorf("resolve canonical block store for %s: %w", blockID, err)
 	}
 
-	storageKey := strings.TrimSpace(probe.StorageKey)
-	if storageKey == "" {
-		storageKey = canonicalStore.StorageKeyForHash(blockID)
+	storageKey := canonicalStore.StorageKeyForHash(blockID)
+	if storedKey := strings.TrimSpace(probe.StorageKey); storedKey != "" && storedKey != storageKey {
+		return "", fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storedKey, storageKey)
 	}
 
 	exists, err := reusableCanonicalObjectExistsFn(ctx, canonicalStore, storageKey)

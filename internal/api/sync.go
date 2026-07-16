@@ -322,7 +322,7 @@ func (h *SyncHandler) resolveBlockStoreForLookup(c *gin.Context, orgID, repoID, 
 	storageClass = strings.TrimSpace(storageClass)
 	if h.storageManager != nil {
 		if storageClass != "" {
-			blockStore, err := h.storageManager.GetBlockStore(storageClass)
+			blockStore, err := h.storageManager.GetBlockStoreForOrg(orgID, storageClass)
 			if err == nil {
 				return blockStore, storageClass, nil
 			}
@@ -330,15 +330,20 @@ func (h *SyncHandler) resolveBlockStoreForLookup(c *gin.Context, orgID, repoID, 
 		}
 
 		fallbackClass := h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
-		blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(fallbackClass)
+		blockStore, actualClass, err := h.storageManager.GetHealthyBlockStoreForOrg(orgID, fallbackClass)
 		if err != nil {
 			return nil, fallbackClass, err
 		}
 		return blockStore, actualClass, nil
 	}
 
-	if h.blockStore != nil {
-		return h.blockStore, storageClass, nil
+	// Fallback: org-scoped store from the raw S3 store; never the org-less singleton.
+	if h.storage != nil {
+		bs, err := storage.NewOrgBlockStore(h.storage, "blocks/", orgID)
+		if err != nil {
+			return nil, storageClass, err
+		}
+		return bs, storageClass, nil
 	}
 
 	return nil, storageClass, fmt.Errorf("block storage not available")
@@ -347,10 +352,15 @@ func (h *SyncHandler) resolveBlockStoreForLookup(c *gin.Context, orgID, repoID, 
 func (h *SyncHandler) resolvePreferredBlockStore(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
 	preferredClass := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
 	if h.storageManager != nil {
-		return h.storageManager.GetHealthyBlockStore(preferredClass)
+		return h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
 	}
-	if h.blockStore != nil {
-		return h.blockStore, preferredClass, nil
+	// Fallback: org-scoped store from the raw S3 store; never the org-less singleton.
+	if h.storage != nil {
+		bs, err := storage.NewOrgBlockStore(h.storage, "blocks/", orgID)
+		if err != nil {
+			return nil, preferredClass, err
+		}
+		return bs, preferredClass, nil
 	}
 	return nil, preferredClass, fmt.Errorf("block storage not available")
 }
@@ -1301,7 +1311,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			if probeErr == nil {
 				switch probe.Decision {
 				case db.BlockReuseReusable:
-					_, ensureErr := v2.EnsureReusableBlockPresent(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass)
+					_, ensureErr := v2.EnsureReusableBlockPresent(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
 					return ensureErr
 				case db.BlockReuseNeedsPut:
 					if checker := getAPIQuotaChecker(); checker != nil {

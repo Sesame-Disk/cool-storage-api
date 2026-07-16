@@ -78,7 +78,7 @@ func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, 
 	// logged skip of the S3 step only. newVerificationBlockStore would t.Skipf, which
 	// would silently turn this test into a no-op whenever the object store is not
 	// reachable from the test process.
-	blockStore := blockStoreForCleanupOrNil(t)
+	blockStore := blockStoreForCleanupOrNil(t, orgID)
 
 	t.Cleanup(func() {
 		database := shareProjectionDBForTest(t)
@@ -136,7 +136,7 @@ func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, 
 // the object store is unreachable. Unlike newVerificationBlockStore it never skips: S3
 // reachability is incidental to callers that only need to delete their own object, and
 // skipping would cost real coverage.
-func blockStoreForCleanupOrNil(t *testing.T) *storage.BlockStore {
+func blockStoreForCleanupOrNil(t *testing.T, orgID string) *storage.BlockStore {
 	t.Helper()
 	ctx := context.Background()
 	s3Store, err := storage.NewS3Store(ctx, storage.S3Config{
@@ -155,7 +155,12 @@ func blockStoreForCleanupOrNil(t *testing.T) *storage.BlockStore {
 		t.Logf("cleanup: S3 bucket unreachable (%v); block objects will be left behind", err)
 		return nil
 	}
-	return storage.NewBlockStore(s3Store, "blocks/")
+	blockStore, err := storage.NewOrgBlockStore(s3Store, "blocks/", orgID)
+	if err != nil {
+		t.Errorf("cleanup: invalid org id %q: %v", orgID, err)
+		return nil
+	}
+	return blockStore
 }
 
 // releaseStagedBlockForTest finishes tearing down one block staged by an upload session
@@ -197,13 +202,10 @@ func releaseStagedBlockForTest(t *testing.T, database *dbpkg.DB, orgID, blockID,
 
 	// Zero-ref: read sha1 before deleting the row — it is the mapping's external id.
 	//
-	// A missing row means STOP, not "delete the object anyway". S3 keys are content-addressed
-	// with no org in them (hashToKey ⇒ blocks/<h0:2>/<h2:4>/<hash>), so one object backs every
-	// org that ever stored those bytes, while `blocks` and `block_references` are per-org. The
-	// zero-ref check above therefore only proves THIS org is done with it. The `blocks` row is
-	// the fixture's evidence that it materialized the object here, and it carries the
-	// storage_class that says which bucket the object even lives in. Without it we would be
-	// deleting a hash we cannot prove we created, from a bucket we are guessing.
+	// A missing row means STOP, not "delete the object anyway". The `blocks` row is the
+	// fixture's evidence that it materialized this org-scoped object, and it carries the
+	// storage_class that says which bucket the object lives in. Without it we would be
+	// deleting a hash we cannot prove this fixture created, from a bucket we are guessing.
 	var externalSHA1 string
 	switch err := database.Session().Query(
 		`SELECT sha1 FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&externalSHA1); {
@@ -235,7 +237,6 @@ func releaseStagedBlockForTest(t *testing.T, database *dbpkg.DB, orgID, blockID,
 func cleanupBlockUploadSessionForTest(t *testing.T, sessionID string) {
 	t.Helper()
 
-	blockStore := blockStoreForCleanupOrNil(t)
 	database := shareProjectionDBForTest(t)
 	session, ok, err := database.GetBlockUploadSession(sessionID)
 	if err != nil {
@@ -245,6 +246,7 @@ func cleanupBlockUploadSessionForTest(t *testing.T, sessionID string) {
 	if !ok {
 		return
 	}
+	blockStore := blockStoreForCleanupOrNil(t, session.OrgID)
 
 	if err := database.CleanupCommittedBlockUploadSessionCaps(session); err != nil {
 		t.Errorf("cleanup block upload session %s: release slot: %v", sessionID, err)
@@ -320,10 +322,10 @@ func webUploadBlock(t *testing.T, c *testClient, session string, data []byte) *h
 // rejection (e.g. quota 403) and never created the object still succeed here. That means a
 // real error is a real teardown failure — silently dropping it would leave the exact eternal
 // S3 object this teardown exists to remove, with the test still green.
-func webUploadBlockLegacy(t *testing.T, c *testClient, data []byte) *http.Response {
+func webUploadBlockLegacy(t *testing.T, c *testClient, orgID string, data []byte) *http.Response {
 	t.Helper()
 
-	if blockStore := blockStoreForCleanupOrNil(t); blockStore != nil {
+	if blockStore := blockStoreForCleanupOrNil(t, orgID); blockStore != nil {
 		hash := sha256hex(data)
 		t.Cleanup(func() {
 			if err := blockStore.DeleteBlock(context.Background(), hash); err != nil {
@@ -403,6 +405,20 @@ func totalSize(blocks [][]byte) int {
 	return n
 }
 
+func webFileFSID(t *testing.T, externalBlockIDs []string, size int) string {
+	t.Helper()
+	encoded, err := json.Marshal(map[string]interface{}{
+		"version":   1,
+		"type":      1,
+		"block_ids": externalBlockIDs,
+		"size":      size,
+	})
+	if err != nil {
+		t.Fatalf("marshal file fs object: %v", err)
+	}
+	return sha1hex(encoded)
+}
+
 // downloadRepoFile fetches a file's content through the standard two-step flow.
 func downloadRepoFile(t *testing.T, c *testClient, repoID, path string) []byte {
 	t.Helper()
@@ -457,6 +473,103 @@ func uploadFileViaBlocksFlow(t *testing.T, c *testClient, repoID, parentDir, fil
 		"size":       totalSize(blocks),
 		"blocks":     manifest,
 	})
+}
+
+func TestWebBlockUploadDeduplicatesAcrossLibrariesInSameOrg(t *testing.T) {
+	content := []byte(fmt.Sprintf("org-scoped intra-org dedup %d", time.Now().UnixNano()))
+	blockID := sha256hex(content)
+	externalSHA1 := sha1hex(content)
+	fileFSID := webFileFSID(t, []string{externalSHA1}, len(content))
+	repoA := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("inttest-org-dedup-a-%d", time.Now().UnixNano()))
+	repoB := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("inttest-org-dedup-b-%d", time.Now().UnixNano()))
+	blockStore := blockStoreForCleanupOrNil(t, defaultOrgID)
+	if blockStore == nil {
+		t.Skip("MinIO unavailable for physical org-scoped key verification")
+	}
+	t.Cleanup(func() {
+		session := shareProjectionDBForTest(t).Session()
+		removeTestLibraryFully(t, adminClient, session, defaultOrgID, repoA)
+		removeTestLibraryFully(t, adminClient, session, defaultOrgID, repoB)
+	})
+	cleanupUploadedBlockArtifactsForTest(t, defaultOrgID, repoA, blockID, externalSHA1,
+		dbpkg.BlockReferrerForFSObject(repoA, fileFSID),
+		dbpkg.BlockReferrerForFSObject(repoB, fileFSID))
+
+	for _, upload := range []struct {
+		repoID   string
+		filename string
+	}{
+		{repoID: repoA, filename: "same-a.bin"},
+		{repoID: repoB, filename: "same-b.bin"},
+	} {
+		resp := uploadFileViaBlocksFlow(t, adminClient, upload.repoID, "/", upload.filename, [][]byte{content}, false)
+		expectStatus(t, resp, http.StatusOK)
+		resp.Body.Close()
+		if got := downloadRepoFile(t, adminClient, upload.repoID, "/"+upload.filename); !bytes.Equal(got, content) {
+			t.Fatalf("download %s differed byte-for-byte: got %q want %q", upload.filename, got, content)
+		}
+	}
+
+	if exists, err := blockStore.BlockExists(context.Background(), blockID); err != nil {
+		t.Fatalf("check same-org physical block: %v", err)
+	} else if !exists {
+		t.Fatalf("same-org deduplicated block %s does not exist at %s", blockID, blockStore.StorageKeyForHash(blockID))
+	}
+}
+
+func TestWebBlockUploadIdenticalBytesUseDistinctOrgKeys(t *testing.T) {
+	content := []byte(fmt.Sprintf("org-scoped cross-org isolation %d", time.Now().UnixNano()))
+	blockID := sha256hex(content)
+	externalSHA1 := sha1hex(content)
+	fileFSID := webFileFSID(t, []string{externalSHA1}, len(content))
+	defaultRepo := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("inttest-org-isolation-default-%d", time.Now().UnixNano()))
+	platformRepo := createDisposableTestLibrary(t, superadminClient, fmt.Sprintf("inttest-org-isolation-platform-%d", time.Now().UnixNano()))
+	defaultStore := blockStoreForCleanupOrNil(t, defaultOrgID)
+	platformStore := blockStoreForCleanupOrNil(t, platformOrgID)
+	if defaultStore == nil || platformStore == nil {
+		t.Skip("MinIO unavailable for physical org-scoped key verification")
+	}
+	t.Cleanup(func() {
+		session := shareProjectionDBForTest(t).Session()
+		removeTestLibraryFully(t, adminClient, session, defaultOrgID, defaultRepo)
+		removeTestLibraryFully(t, superadminClient, session, platformOrgID, platformRepo)
+	})
+	cleanupUploadedBlockArtifactsForTest(t, defaultOrgID, defaultRepo, blockID, externalSHA1,
+		dbpkg.BlockReferrerForFSObject(defaultRepo, fileFSID))
+	cleanupUploadedBlockArtifactsForTest(t, platformOrgID, platformRepo, blockID, externalSHA1,
+		dbpkg.BlockReferrerForFSObject(platformRepo, fileFSID))
+
+	for _, upload := range []struct {
+		client   *testClient
+		repoID   string
+		filename string
+	}{
+		{client: adminClient, repoID: defaultRepo, filename: "default.bin"},
+		{client: superadminClient, repoID: platformRepo, filename: "platform.bin"},
+	} {
+		resp := uploadFileViaBlocksFlow(t, upload.client, upload.repoID, "/", upload.filename, [][]byte{content}, false)
+		expectStatus(t, resp, http.StatusOK)
+		resp.Body.Close()
+		if got := downloadRepoFile(t, upload.client, upload.repoID, "/"+upload.filename); !bytes.Equal(got, content) {
+			t.Fatalf("download %s differed byte-for-byte: got %q want %q", upload.filename, got, content)
+		}
+	}
+
+	defaultKey := defaultStore.StorageKeyForHash(blockID)
+	platformKey := platformStore.StorageKeyForHash(blockID)
+	if defaultKey == platformKey {
+		t.Fatalf("identical bytes in distinct orgs resolved to the same key %q", defaultKey)
+	}
+	for orgID, blockStore := range map[string]*storage.BlockStore{
+		defaultOrgID:  defaultStore,
+		platformOrgID: platformStore,
+	} {
+		if exists, err := blockStore.BlockExists(context.Background(), blockID); err != nil {
+			t.Fatalf("check physical block for org %s: %v", orgID, err)
+		} else if !exists {
+			t.Fatalf("physical block for org %s does not exist at %s", orgID, blockStore.StorageKeyForHash(blockID))
+		}
+	}
 }
 
 // TestWebBlockUploadCommittedSessionIsTerminal guards that a committed session can
@@ -853,7 +966,7 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 	t.Run("S3-only block (legacy upload, no metadata) -> needs_upload", func(t *testing.T) {
 		content := []byte("s3 only no metadata " + fmt.Sprint(time.Now().UnixNano()))
 		// Store physically in S3 but DO NOT materialize (no session).
-		legacy := webUploadBlockLegacy(t, adminClient, content)
+		legacy := webUploadBlockLegacy(t, adminClient, defaultOrgID, content)
 		if legacy.StatusCode != http.StatusOK && legacy.StatusCode != http.StatusCreated {
 			body, _ := io.ReadAll(legacy.Body)
 			legacy.Body.Close()
@@ -1283,7 +1396,7 @@ func TestWebBlockUploadSessionStagingSkipsLogicalStorageQuota(t *testing.T) {
 	// Legacy (no-session) upload of fresh content is still gated by the per-block
 	// physical admission check → 403 with the user pinned to 1 byte.
 	legacyContent := []byte("legacy block under tiny quota " + fmt.Sprint(time.Now().UnixNano()))
-	legacy := webUploadBlockLegacy(t, userClient, legacyContent)
+	legacy := webUploadBlockLegacy(t, userClient, defaultOrgID, legacyContent)
 	if legacy.StatusCode != http.StatusForbidden {
 		body, _ := io.ReadAll(legacy.Body)
 		legacy.Body.Close()

@@ -368,11 +368,13 @@ policies:
    SELECT storage_class, storage_key FROM blocks
    WHERE org_id = ? AND block_id = ?
 
-   → Returns: storage_class = "hot-s3-usa", storage_key = "blocks/ab/c1/abc123"
+   → Returns: storage_class = "hot-s3-usa"
 
-3. Server selects storage backend by class name
+3. Server selects storage backend by class name and constructs an org-scoped
+   BlockStore for `org_id`.
 
-4. Server retrieves from backend and returns to client
+4. Server derives `blocks/<org_id>/ab/c1/abc123`, retrieves it and returns it.
+   A persisted non-empty `storage_key` is an invariant check, not an arbitrary locator.
 ```
 
 ---

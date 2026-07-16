@@ -128,7 +128,8 @@ func checkBlocksReadyParallel(ctx context.Context, database *db.DB, orgID, refer
 
 // BlockHandler handles block-level API operations
 type BlockHandler struct {
-	blockStore       *storage.BlockStore // Legacy single store (fallback)
+	storage          *storage.S3Store    // Legacy single S3 store (fallback source; org-scoped per request)
+	blockStore       *storage.BlockStore // Legacy org-less single store (deprecated; no longer served)
 	storageManager   *storage.Manager    // Multi-backend storage manager
 	config           *config.Config
 	db               *db.DB                           // Optional: enables session-scoped materialization for the web flow
@@ -137,14 +138,15 @@ type BlockHandler struct {
 	uploadLimiter    *blockUploadConcurrencyLimiter   // Bounds concurrent session-mode /blocks/upload per user (item 18)
 }
 
-// RegisterBlockRoutes registers the block API routes
-// Supports both legacy single BlockStore and multi-region StorageManager
-func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) {
+// RegisterBlockRoutes registers block API routes with either a raw S3 fallback
+// or a multi-region StorageManager. Both resolve an org-scoped store per request.
+func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) {
 	maxConcurrentUploads := 0
 	if cfg != nil {
 		maxConcurrentUploads = cfg.WebUploads.MaxConcurrentBlockUploadsPerUser
 	}
 	h := &BlockHandler{
+		storage:          s3Store,
 		blockStore:       blockStore,
 		storageManager:   storageManager,
 		config:           cfg,
@@ -167,11 +169,11 @@ func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *stora
 		// Upload a single block
 		blocks.POST("/upload", h.UploadBlock)
 
-		// There is deliberately NO GET/HEAD /blocks/:hash. S3 block keys are
-		// global content-addressed objects with no org scoping, and block-level
-		// reads cannot be authorized against a library permission without a repo
-		// context — a bare-hash read endpoint is a cross-tenant (and intra-org)
-		// content oracle by construction. Nothing consumes it: web downloads go
+		// There is deliberately NO GET/HEAD /blocks/:hash. Even though S3 keys are
+		// now org-scoped (blocks/<org_id>/...), block-level reads still cannot be
+		// authorized against a library permission without a repo context — a
+		// bare-hash read endpoint is an intra-org content oracle by construction.
+		// Nothing consumes it: web downloads go
 		// through file paths and desktop sync uses the repo-scoped, permission-
 		// checked /seafhttp/repo/:repo_id/block/:block_id. If a client-side block
 		// download flow is ever needed, reintroduce it repo-scoped like seafhttp
@@ -180,26 +182,47 @@ func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, blockStore *stora
 	}
 }
 
-// getBlockStore returns the appropriate BlockStore based on hostname routing.
-// When StorageManager is configured, failed manager resolution does not fall
-// back to the legacy singleton store.
+// getBlockStore returns the appropriate org-scoped BlockStore based on hostname
+// routing. The org comes from the authenticated request context; without it (or
+// on any resolution error) it fails closed (nil), never an org-less global store.
 func (h *BlockHandler) getBlockStore(c *gin.Context) (*storage.BlockStore, string) {
+	orgID := c.GetString("org_id")
 	if h.storageManager == nil {
-		return h.blockStore, "legacy"
+		bs := h.buildFallbackOrgBlockStore(orgID)
+		if bs == nil {
+			return nil, "legacy"
+		}
+		return bs, "legacy"
 	}
 
 	// Resolve storage class based on hostname
 	hostname := routingHostname(c, h.config)
 	storageClass := h.storageManager.ResolveStorageClass(hostname, "", "hot")
 
-	// Get healthy BlockStore with failover
-	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(storageClass)
+	// Get healthy org-scoped BlockStore with failover
+	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStoreForOrg(orgID, storageClass)
 	if err != nil {
 		log.Printf("v2/blocks: failed to get healthy backend for %s: %v\n", storageClass, err)
 		return nil, storageClass
 	}
 
 	return blockStore, actualClass
+}
+
+// buildFallbackOrgBlockStore builds an org-scoped store from the legacy single S3
+// store for the no-storage-manager path. Returns nil (fail closed) when the raw
+// store is missing or the org id is invalid — the org-less singleton is never
+// served, as that would reintroduce the cross-org block-delete hazard (P10).
+func (h *BlockHandler) buildFallbackOrgBlockStore(orgID string) *storage.BlockStore {
+	if h.storage == nil {
+		return nil
+	}
+	bs, err := storage.NewOrgBlockStore(h.storage, "blocks/", orgID)
+	if err != nil {
+		log.Printf("v2/blocks: cannot build org-scoped fallback block store: %v\n", err)
+		return nil
+	}
+	return bs
 }
 
 // lookupLibraryStorageClass reads the storage class a library's blocks live in.
@@ -223,11 +246,15 @@ func (h *BlockHandler) lookupLibraryStorageClass(orgID, repoID string) string {
 // which would make the commit report the block missing even though it was sent.
 func (h *BlockHandler) getBlockStoreForRepo(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string) {
 	if h.storageManager == nil {
-		return h.blockStore, "legacy"
+		bs := h.buildFallbackOrgBlockStore(orgID)
+		if bs == nil {
+			return nil, "legacy"
+		}
+		return bs, "legacy"
 	}
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	preferred := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
-	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(preferred)
+	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferred)
 	if err != nil {
 		log.Printf("v2/blocks: failed to get healthy backend for repo %s (%s): %v\n", repoID, preferred, err)
 		return nil, preferred

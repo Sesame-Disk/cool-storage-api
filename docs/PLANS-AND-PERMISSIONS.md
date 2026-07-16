@@ -571,7 +571,7 @@ Every org MUST be born with an explicit plan and quota_policy. No more ambiguous
 
 ### Exception: Platform Org
 
-The platform org (`00000000-...`) gets `quota_policy="soft"` with unlimited everything. It exists only for superadmin users.
+The platform org (`00000000-...`) gets `quota_policy="soft"` with unlimited everything. It is reserved for platform identities and administration, while remaining a functional org partition for internal libraries and file data.
 
 ---
 

@@ -129,7 +129,8 @@ func TestOnlyOfficeResolveLibraryBlockStoreUsesLocalRegion(t *testing.T) {
 		storageManager: manager,
 	}
 
-	blockStore, storageClass, err := h.resolveLibraryBlockStore("org-id", "repo-id")
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	blockStore, storageClass, err := h.resolveLibraryBlockStore(orgID, "repo-id")
 	if err != nil {
 		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
 	}
@@ -138,6 +139,10 @@ func TestOnlyOfficeResolveLibraryBlockStoreUsesLocalRegion(t *testing.T) {
 	}
 	if storageClass != "hot-s3-eu" {
 		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-s3-eu")
+	}
+	// The resolved store must be org-scoped (P10): its key carries the org id.
+	if got := blockStore.StorageKeyForHash("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"); got != "blocks/"+orgID+"/e3/b0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
+		t.Fatalf("expected org-scoped key, got %q", got)
 	}
 }
 

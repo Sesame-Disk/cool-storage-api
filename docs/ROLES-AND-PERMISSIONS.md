@@ -508,7 +508,7 @@ Pending naming cleanup:
 
 1. **Super admin cannot directly browse tenant files** — They use admin API endpoints, not regular file endpoints. This prevents accidental data exposure.
 2. **OIDC is source of truth** — Roles cannot be changed through SesameFS API alone. The admin endpoints can deactivate users but not promote them. Role changes come from OIDC.
-3. **Platform org isolation** — The platform org should never contain libraries or file data. It exists only for user records.
+3. **Platform org reservation** — The platform org is reserved for platform identities and administration, but it remains a functional org partition. Internal libraries and file data are allowed and use the same org-scoped storage isolation as tenant orgs.
 4. **Audit logging** — All admin API calls should be logged with the acting super admin's identity.
 5. **Session role caching** — When a role changes via OIDC re-login, existing sessions still carry the old role until they expire. Consider invalidating sessions on role change.
 

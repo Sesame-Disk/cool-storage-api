@@ -260,7 +260,7 @@ func TestResolvePreferredBlockStoreUsesStorageManager(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo-id/block/block-id", nil)
 	c.Request.Host = "files.example.com"
 
-	blockStore, storageClass, err := h.resolvePreferredBlockStore(c, "org-id", "repo-id")
+	blockStore, storageClass, err := h.resolvePreferredBlockStore(c, "00000000-0000-0000-0000-000000000001", "repo-id")
 	if err != nil {
 		t.Fatalf("resolvePreferredBlockStore returned error: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestResolveBlockStoreForLookupFallsBackThroughManager(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo-id/block/block-id", nil)
 	c.Request.Host = "files.example.com"
 
-	blockStore, storageClass, err := h.resolveBlockStoreForLookup(c, "org-id", "repo-id", "missing-class")
+	blockStore, storageClass, err := h.resolveBlockStoreForLookup(c, "00000000-0000-0000-0000-000000000001", "repo-id", "missing-class")
 	if err != nil {
 		t.Fatalf("resolveBlockStoreForLookup returned error: %v", err)
 	}
