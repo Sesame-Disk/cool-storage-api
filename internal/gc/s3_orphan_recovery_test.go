@@ -52,9 +52,9 @@ func TestWorker_ProcessBlock_S3RetrySucceeds(t *testing.T) {
 	if stats.BlocksDeleted() != 1 {
 		t.Errorf("BlocksDeleted=%d, want 1", stats.BlocksDeleted())
 	}
-	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != "block-retry" {
-		t.Errorf("expected S3 delete of block-retry, got %v", deleted)
+	deletes := sp.ScopedBlockDeletes()
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", BlockID: "block-retry"}) {
+		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 }
 
@@ -166,7 +166,7 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 
 	orgID := uuid.New()
 	// Seed an orphan directly.
-	if _, err := store.RecordS3Orphan(orgID, "orph-1", "hot", db.PlainBlockRepresentationID, "", "earlier failure", time.Now()); err != nil {
+	if _, err := store.RecordS3Orphan(orgID, "orph-1", " hot ", db.PlainBlockRepresentationID, "", "earlier failure", time.Now()); err != nil {
 		t.Fatalf("seed orphan: %v", err)
 	}
 
@@ -180,9 +180,74 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 	if store.S3OrphanCount() != 0 {
 		t.Errorf("orphan should be cleared, got %d", store.S3OrphanCount())
 	}
-	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != "orph-1" {
-		t.Errorf("expected S3 delete of orph-1, got %v", deleted)
+	deletes := sp.ScopedBlockDeletes()
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: " hot ", BlockID: "orph-1"}) {
+		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
+	}
+}
+
+func TestWorker_RecoverS3Orphans_EmptyStorageClassFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	if _, err := store.RecordS3Orphan(orgID, "orph-empty-class", "", db.PlainBlockRepresentationID, "", "earlier failure", time.Now()); err != nil {
+		t.Fatalf("seed orphan: %v", err)
+	}
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want empty storage class error")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered = %d, want 0", recovered)
+	}
+	if store.S3OrphanCount() != 1 {
+		t.Fatal("orphan row must remain for repair/retry")
+	}
+	if got := sp.BlockStoreRequests(); len(got) != 0 {
+		t.Fatalf("storage must not be touched for empty class, got %+v", got)
+	}
+	if _, err := store.LoadGCStats(gcS3OrphansCursorKey); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("cursor advanced despite failed partition, err=%v", err)
+	}
+}
+
+func TestWorker_RecoverS3Orphans_SameHashInTwoOrgsDeletesBothScopes(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgA := uuid.New()
+	orgB := uuid.New()
+	for _, orgID := range []uuid.UUID{orgA, orgB} {
+		if _, err := store.RecordS3Orphan(orgID, "shared-hash", "hot", db.PlainBlockRepresentationID, "", "earlier failure", time.Now()); err != nil {
+			t.Fatalf("seed orphan for %s: %v", orgID, err)
+		}
+	}
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("RecoverS3Orphans() error: %v", err)
+	}
+	if recovered != 2 {
+		t.Fatalf("recovered = %d, want 2", recovered)
+	}
+	want := map[string]bool{orgA.String(): false, orgB.String(): false}
+	for _, deletion := range sp.ScopedBlockDeletes() {
+		if deletion.StorageClass != "hot" || deletion.BlockID != "shared-hash" {
+			t.Fatalf("unexpected scoped deletion: %+v", deletion)
+		}
+		if _, ok := want[deletion.OrgID]; !ok {
+			t.Fatalf("unexpected org deletion: %+v", deletion)
+		}
+		want[deletion.OrgID] = true
+	}
+	for orgID, found := range want {
+		if !found {
+			t.Fatalf("missing scoped deletion for org %s", orgID)
+		}
 	}
 }
 

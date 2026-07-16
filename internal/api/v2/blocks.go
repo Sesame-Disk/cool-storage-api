@@ -128,9 +128,8 @@ func checkBlocksReadyParallel(ctx context.Context, database *db.DB, orgID, refer
 
 // BlockHandler handles block-level API operations
 type BlockHandler struct {
-	storage          *storage.S3Store    // Legacy single S3 store (fallback source; org-scoped per request)
-	blockStore       *storage.BlockStore // Legacy org-less single store (deprecated; no longer served)
-	storageManager   *storage.Manager    // Multi-backend storage manager
+	storage          *storage.S3Store // Legacy single S3 store (fallback source; org-scoped per request)
+	storageManager   *storage.Manager // Multi-backend storage manager
 	config           *config.Config
 	db               *db.DB                           // Optional: enables session-scoped materialization for the web flow
 	permMiddleware   *middleware.PermissionMiddleware // Optional: re-verifies upload permission for long-lived sessions (R12)
@@ -140,14 +139,13 @@ type BlockHandler struct {
 
 // RegisterBlockRoutes registers block API routes with either a raw S3 fallback
 // or a multi-region StorageManager. Both resolve an org-scoped store per request.
-func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) {
+func RegisterBlockRoutes(rg *gin.RouterGroup, database *db.DB, s3Store *storage.S3Store, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) {
 	maxConcurrentUploads := 0
 	if cfg != nil {
 		maxConcurrentUploads = cfg.WebUploads.MaxConcurrentBlockUploadsPerUser
 	}
 	h := &BlockHandler{
 		storage:          s3Store,
-		blockStore:       blockStore,
 		storageManager:   storageManager,
 		config:           cfg,
 		db:               database,

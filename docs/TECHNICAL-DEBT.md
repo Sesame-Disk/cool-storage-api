@@ -435,9 +435,10 @@ larger hotpath optimization, not part of the namespace-safety change.
 ---
 
 - P10 PR-2 made `EnsureReusableBlockPresent` derive the org-scoped key and reject
-  any non-empty mismatched `storage_key` before S3 access. Arbitrary relocated keys
-  remain unsupported; GC must adopt the same org-scoped derivation in PR-3. See
-  KNOWN_ISSUES ISSUE-BLOCK-STORAGE-KEY-READS-01.
+  any non-empty mismatched `storage_key` before S3 access. PR-3 moved GC delete and
+  orphan recovery to the same derivation and removed the org-less storage APIs.
+  Arbitrary relocated keys remain unsupported. See KNOWN_ISSUES
+  ISSUE-BLOCK-STORAGE-KEY-READS-01.
 - Pending-owner and publish-repair sweepers need explicit per-run limits and
   metrics for skipped, repaired, released, and failed rows.
 - The upload-finalize `gc_leases` role should include `orgID` for extra isolation.

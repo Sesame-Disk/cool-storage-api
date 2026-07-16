@@ -4231,8 +4231,8 @@ func NewStorageManagerAdapter(manager *storage.Manager) *StorageManagerAdapter {
 	return &StorageManagerAdapter{manager: manager}
 }
 
-func (a *StorageManagerAdapter) GetBlockStore(storageClass string) (BlockStoreDeleter, error) {
-	bs, err := a.manager.GetBlockStore(storageClass)
+func (a *StorageManagerAdapter) GetBlockStoreForOrg(orgID, storageClass string) (BlockStoreDeleter, error) {
+	bs, err := a.manager.GetBlockStoreForOrg(orgID, storageClass)
 	if err != nil {
 		return nil, err
 	}

@@ -497,10 +497,17 @@ onlyoffice:
 
 Blocks must be stored using `BlockStore` with proper key sharding:
 ```go
-blockStore := storage.NewBlockStore(s3Store, "blocks/")
+blockStore, err := storage.NewOrgBlockStore(s3Store, "blocks/", orgID.String())
+if err != nil {
+    return err
+}
 blockStore.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content})
-// Stored at: blocks/XX/XX/blockID (two-level sharding)
+// Stored at: blocks/<org_id>/XX/XX/blockID (org scope + two-level sharding)
 ```
+
+There is no org-less `BlockStore` constructor. Manager-backed callers use
+`GetBlockStoreForOrg` or `GetHealthyBlockStoreForOrg`; GC uses the exact recorded
+storage class and never health-fails over a delete to another backend.
 
 **Save Types:**
 - **Manual Save (Ctrl+S)**: Works with `forcesave: true` in config, sends status=6 callback

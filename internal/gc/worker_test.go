@@ -78,9 +78,9 @@ func TestWorker_ProcessBlock_RefCountZero(t *testing.T) {
 	}
 
 	// Block should be deleted from S3
-	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != "block-1" {
-		t.Errorf("expected S3 deletion of block-1, got %v", deleted)
+	deletes := sp.ScopedBlockDeletes()
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", BlockID: "block-1"}) {
+		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 
 	// Forward block mapping should be cleaned up (resolved via blocks.sha1)
@@ -323,13 +323,14 @@ func TestWorker_ProcessBlock_RefCountZeroButLiveFSObjectReferenceSkipsDelete(t *
 
 func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testing.T) {
 	store := NewMockStore()
+	sp := &MockStorageProvider{}
 	stats := &Stats{}
 	q := NewQueue(store)
-	w := NewWorker(store, nil, q, 100, 0, false, stats)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
-	store.AddBlock(orgID, "block-canonical-cold", "cold-tier", 0)
+	store.AddBlock(orgID, "block-canonical-cold", "cold-tier ", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-canonical-cold", uuid.Nil, "hot-tier", 0); err != nil {
 		t.Fatalf("EnqueueItem() error = %v", err)
@@ -348,6 +349,10 @@ func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testi
 	orphans := store.AllS3Orphans()
 	if len(orphans) != 0 {
 		t.Fatalf("AllS3Orphans() len = %d, want 0 after cleanup completes", len(orphans))
+	}
+	deletes := sp.ScopedBlockDeletes()
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "cold-tier ", BlockID: "block-canonical-cold"}) {
+		t.Fatalf("delete used queued rather than canonical scope: %+v", deletes)
 	}
 }
 

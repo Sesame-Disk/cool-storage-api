@@ -485,8 +485,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if err != nil {
 		return fmt.Errorf("failed to load canonical block info for %s: %w", item.ItemID, err)
 	}
-	storageClass := strings.TrimSpace(blockInfo.StorageClass)
-	if storageClass == "" {
+	storageClass := blockInfo.StorageClass
+	if strings.TrimSpace(storageClass) == "" {
 		if blockInfo.CreatedAt == nil {
 			if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, claimID); err != nil {
 				return fmt.Errorf("failed to remove stub block row for %s: %w", item.ItemID, err)
@@ -529,9 +529,9 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// for RecoverS3Orphans to retry).
 	clearRecoveryRow := w.storage == nil
 	if w.storage != nil {
-		blockStore, err := w.storage.GetBlockStore(storageClass)
+		blockStore, err := w.storage.GetBlockStoreForOrg(item.OrgID.String(), storageClass)
 		if err != nil {
-			return fmt.Errorf("failed to get block store for class %s: %w", storageClass, err)
+			return fmt.Errorf("failed to get block store for org %s class %s: %w", item.OrgID, storageClass, err)
 		}
 		if delErr := w.deleteS3WithRetry(ctx, blockStore, item.ItemID); delErr != nil {
 			log.Printf("[GC Worker] WARNING: Failed to delete block %s from S3 after DB deletion: %v (recording for scanner recovery)", item.ItemID, delErr)
@@ -725,14 +725,17 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				}
 
 				storageClass := orph.StorageClass
-				if storageClass == "" {
-					storageClass = "hot"
-				}
-				blockStore, err := w.storage.GetBlockStore(storageClass)
-				if err != nil {
-					log.Printf("[GC Worker] S3 orphan recovery: get block store for class %s failed: %v", storageClass, err)
+				if strings.TrimSpace(storageClass) == "" {
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("get block store for S3 orphan class=%s: %w", storageClass, err)
+						phaseErr = fmt.Errorf("S3 orphan recovery row has empty storage class for org=%s block=%s", orph.OrgID, orph.BlockID)
+					}
+					continue
+				}
+				blockStore, err := w.storage.GetBlockStoreForOrg(orph.OrgID.String(), storageClass)
+				if err != nil {
+					log.Printf("[GC Worker] S3 orphan recovery: get block store for org=%s class=%s failed: %v", orph.OrgID, storageClass, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("get block store for S3 orphan org=%s class=%s: %w", orph.OrgID, storageClass, err)
 					}
 					continue
 				}

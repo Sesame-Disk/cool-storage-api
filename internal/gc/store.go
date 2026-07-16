@@ -586,8 +586,8 @@ type BlockStoreDeleter interface {
 	DeleteBlock(ctx context.Context, blockID string) error
 }
 
-// StorageProvider returns a BlockStoreDeleter for a given storage class.
-// Allows mocking the storage.Manager in tests.
+// StorageProvider returns a BlockStoreDeleter bound to one org and exact storage
+// class. GC must never health-failover a delete to a different physical backend.
 type StorageProvider interface {
-	GetBlockStore(storageClass string) (BlockStoreDeleter, error)
+	GetBlockStoreForOrg(orgID, storageClass string) (BlockStoreDeleter, error)
 }

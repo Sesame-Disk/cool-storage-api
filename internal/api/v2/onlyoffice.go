@@ -37,7 +37,6 @@ type OnlyOfficeHandler struct {
 	db             *db.DB
 	config         *config.Config
 	storage        *storage.S3Store
-	blockStore     *storage.BlockStore
 	storageManager *storage.Manager
 	tokenCreator   TokenCreator
 	serverURL      string
@@ -71,13 +70,12 @@ func cleanupOnlyOfficeFailedPublishAttempt(database *db.DB, orgID, repoID, commi
 }
 
 // RegisterOnlyOfficeRoutes registers OnlyOffice routes
-func RegisterOnlyOfficeRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) {
+func RegisterOnlyOfficeRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) {
 	permMiddleware := middleware.NewPermissionMiddleware(database)
 	h := &OnlyOfficeHandler{
 		db:             database,
 		config:         cfg,
 		storage:        s3Store,
-		blockStore:     blockStore,
 		storageManager: storageManager,
 		tokenCreator:   tokenCreator,
 		serverURL:      serverURL,
@@ -93,13 +91,12 @@ func RegisterOnlyOfficeRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.
 }
 
 // RegisterOnlyOfficeCallbackRoutes registers the callback route (under /onlyoffice/)
-func RegisterOnlyOfficeCallbackRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, serverURL string) {
+func RegisterOnlyOfficeCallbackRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, storageManager *storage.Manager, serverURL string) {
 	permMiddleware := middleware.NewPermissionMiddleware(database)
 	h := &OnlyOfficeHandler{
 		db:             database,
 		config:         cfg,
 		storage:        s3Store,
-		blockStore:     blockStore,
 		storageManager: storageManager,
 		serverURL:      serverURL,
 		permMiddleware: permMiddleware,

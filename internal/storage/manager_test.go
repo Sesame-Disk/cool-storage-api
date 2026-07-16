@@ -359,14 +359,14 @@ func TestManagerGetHotColdBackends(t *testing.T) {
 	}
 }
 
-func TestManagerGetBlockStore(t *testing.T) {
+func TestManagerGetBlockStoreForOrgErrors(t *testing.T) {
 	m := NewManager()
 
 	t.Run("non-S3 store returns error", func(t *testing.T) {
 		// Register a mock store (not S3Store)
 		m.RegisterBackend("mock-store", &mockStore{accessType: AccessImmediate}, "")
 
-		_, err := m.GetBlockStore("mock-store")
+		_, err := m.GetBlockStoreForOrg(testOrgA, "mock-store")
 		if err == nil {
 			t.Error("expected error for non-S3 store")
 		}
@@ -376,7 +376,7 @@ func TestManagerGetBlockStore(t *testing.T) {
 	})
 
 	t.Run("nonexistent class returns error", func(t *testing.T) {
-		_, err := m.GetBlockStore("nonexistent")
+		_, err := m.GetBlockStoreForOrg(testOrgA, "nonexistent")
 		if err == nil {
 			t.Error("expected error for nonexistent storage class")
 		}
@@ -386,21 +386,21 @@ func TestManagerGetBlockStore(t *testing.T) {
 	})
 }
 
-func TestManagerGetHealthyBlockStore(t *testing.T) {
+func TestManagerGetHealthyBlockStoreForOrgErrors(t *testing.T) {
 	m := NewManager()
 
 	t.Run("non-S3 store returns error", func(t *testing.T) {
 		// Register mock stores (not S3Store)
 		m.RegisterBackend("mock-usa", &mockStore{accessType: AccessImmediate, healthy: true}, "")
 
-		_, _, err := m.GetHealthyBlockStore("mock-usa")
+		_, _, err := m.GetHealthyBlockStoreForOrg(testOrgA, "mock-usa")
 		if err == nil {
 			t.Error("expected error for non-S3 store")
 		}
 	})
 
 	t.Run("nonexistent class returns error", func(t *testing.T) {
-		_, _, err := m.GetHealthyBlockStore("nonexistent")
+		_, _, err := m.GetHealthyBlockStoreForOrg(testOrgA, "nonexistent")
 		if err == nil {
 			t.Error("expected error for nonexistent storage class")
 		}
@@ -410,22 +410,21 @@ func TestManagerGetHealthyBlockStore(t *testing.T) {
 func TestManagerBlockStoreCaching(t *testing.T) {
 	m := NewManager()
 
-	// Verify that blockStores map is initialized
-	if m.blockStores == nil {
-		t.Error("blockStores map should be initialized")
+	if m.blockStoresByOrg == nil {
+		t.Error("blockStoresByOrg map should be initialized")
 	}
 
 	// Register a non-S3 store and try to get BlockStore
 	m.RegisterBackend("test-store", &mockStore{accessType: AccessImmediate}, "")
 
 	// First call should fail (not S3)
-	_, err1 := m.GetBlockStore("test-store")
+	_, err1 := m.GetBlockStoreForOrg(testOrgA, "test-store")
 	if err1 == nil {
 		t.Error("expected error for non-S3 store")
 	}
 
 	// Second call should also fail (not cached because of error)
-	_, err2 := m.GetBlockStore("test-store")
+	_, err2 := m.GetBlockStoreForOrg(testOrgA, "test-store")
 	if err2 == nil {
 		t.Error("expected error for non-S3 store on second call")
 	}

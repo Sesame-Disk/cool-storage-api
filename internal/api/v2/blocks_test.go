@@ -25,7 +25,7 @@ func TestCheckBlocks_InvalidJSON(t *testing.T) {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
+	h := &BlockHandler{storageManager: nil, config: nil}
 	r.POST("/api/v2/blocks/check", h.CheckBlocks)
 
 	req, _ := http.NewRequest("POST", "/api/v2/blocks/check", bytes.NewBufferString("not json"))
@@ -42,7 +42,7 @@ func TestCheckBlocks_EmptyHashes(t *testing.T) {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
+	h := &BlockHandler{storageManager: nil, config: nil}
 	r.POST("/api/v2/blocks/check", h.CheckBlocks)
 
 	body := CheckBlocksRequest{Hashes: []string{}}
@@ -67,7 +67,7 @@ func TestCheckBlocks_TooManyHashes(t *testing.T) {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
+	h := &BlockHandler{storageManager: nil, config: nil}
 	r.POST("/api/v2/blocks/check", h.CheckBlocks)
 
 	// Create 10001 hashes
@@ -97,7 +97,7 @@ func TestCheckBlocks_InvalidSHA256(t *testing.T) {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
+	h := &BlockHandler{storageManager: nil, config: nil}
 	r.POST("/api/v2/blocks/check", h.CheckBlocks)
 
 	body := CheckBlocksRequest{Hashes: []string{strings.Repeat("g", 64)}}
@@ -122,7 +122,7 @@ func TestCheckBlocks_NilBlockStore(t *testing.T) {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
+	h := &BlockHandler{storageManager: nil, config: nil}
 	r.POST("/api/v2/blocks/check", h.CheckBlocks)
 
 	body := CheckBlocksRequest{Hashes: []string{strings.Repeat("a", 64)}}
@@ -146,7 +146,7 @@ func TestCheckBlocks_NilBlockStore(t *testing.T) {
 func TestDirectBlockReadRoutesAreNotRegistered(t *testing.T) {
 	r := gin.New()
 	rg := r.Group("/api/v2")
-	RegisterBlockRoutes(rg, nil, nil, nil, nil, nil, nil)
+	RegisterBlockRoutes(rg, nil, nil, nil, nil, nil)
 
 	validHash := strings.Repeat("a", 64)
 	for _, method := range []string{"GET", "HEAD"} {
@@ -459,7 +459,7 @@ func TestCheckBlocksForSession_AllMetadataMissingSkipsBlockStore(t *testing.T) {
 		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
 	}
 
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
+	h := &BlockHandler{storageManager: nil, config: nil}
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", nil)
@@ -531,7 +531,7 @@ func TestBlockUploadSessionQueryTransportIsRejected(t *testing.T) {
 func TestGetBlockStoreDoesNotFallBackToLegacyWhenStorageManagerFails(t *testing.T) {
 	manager := storage.NewManager()
 	manager.SetDefaultClass("hot-s3-eu")
-	h := &BlockHandler{blockStore: &storage.BlockStore{}, storageManager: manager, config: nil}
+	h := &BlockHandler{storageManager: manager, config: nil}
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/api/v2/blocks/"+strings.Repeat("a", 64), nil)
@@ -580,7 +580,7 @@ func TestUploadBlock_NoContentLength(t *testing.T) {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	h := &BlockHandler{blockStore: nil, storageManager: nil, config: nil}
+	h := &BlockHandler{storageManager: nil, config: nil}
 	r.POST("/api/v2/blocks/upload", h.UploadBlock)
 
 	req, _ := http.NewRequest("POST", "/api/v2/blocks/upload", nil)
@@ -694,7 +694,7 @@ func TestUploadBlockResponse_JSONFormat(t *testing.T) {
 func TestRegisterBlockRoutes(t *testing.T) {
 	r := gin.New()
 	rg := r.Group("/api/v2")
-	RegisterBlockRoutes(rg, nil, nil, nil, nil, nil, nil)
+	RegisterBlockRoutes(rg, nil, nil, nil, nil, nil)
 
 	routes := []struct {
 		method string

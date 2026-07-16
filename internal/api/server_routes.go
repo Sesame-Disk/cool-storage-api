@@ -127,9 +127,9 @@ func (s *Server) registerAPIV2Routes(serverURL string) {
 	protected.Use(s.authMiddleware())
 
 	v2.RegisterLibraryRoutesWithToken(protected, s.db, s.config, s.tokenStore)
-	v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL)
+	v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL)
 	if s.storage != nil || s.storageManager != nil {
-		v2.RegisterBlockRoutes(protected, s.db, s.storage, s.blockStore, s.storageManager, s.config, s.permMiddleware)
+		v2.RegisterBlockRoutes(protected, s.db, s.storage, s.storageManager, s.config, s.permMiddleware)
 	}
 	v2.RegisterShareRoutes(protected, s.db, s.config)
 	v2.RegisterRestoreRoutes(protected, s.db, s.config)
@@ -163,7 +163,7 @@ func (s *Server) registerLegacyAPIV2Routes(serverURL string) {
 	protected.Use(s.authMiddleware())
 
 	v2.RegisterLibraryRoutesWithToken(protected, s.db, s.config, s.tokenStore)
-	v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL)
+	v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL)
 	v2.RegisterFileShareRoutes(protected, s.db, s.permMiddleware)
 	protected.GET("/search-user", s.handleSearchUser)
 	protected.GET("/search-user/", s.handleSearchUser)
@@ -216,9 +216,9 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 		gcAdmin.DELETE("/gc/failed-items/", s.handleGCFailedItemDelete)
 	}
 
-	v2.RegisterV21LibraryRoutes(protected, s.db, s.config, s.tokenStore, s.storage, s.blockStore, s.storageManager, serverURL)
+	v2.RegisterV21LibraryRoutes(protected, s.db, s.config, s.tokenStore, s.storage, s.storageManager, serverURL)
 
-	fileHandler := v2.NewFileHandler(s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL, s.permMiddleware)
+	fileHandler := v2.NewFileHandler(s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL, s.permMiddleware)
 	fileHandler.SetGCEnqueuer(v2.GetBlockEnqueuerFunc())
 	protected.DELETE("/repos/batch-delete-item/", fileHandler.BatchDeleteItems)
 	protected.DELETE("/repos/batch-delete-item", fileHandler.BatchDeleteItems)
@@ -231,7 +231,7 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 	protected.GET("/repos/:repo_id/history/", fileHandler.GetRepoHistory)
 	protected.GET("/repos/:repo_id/history", fileHandler.GetRepoHistory)
 	v2.RegisterBatchOperationRoutes(protected, s.db, s.config)
-	v2.RegisterOnlyOfficeRoutes(protected, s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL)
+	v2.RegisterOnlyOfficeRoutes(protected, s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL)
 	v2.RegisterV21StarredRoutes(protected, s.db)
 	v2.RegisterShareLinkRoutes(protected, s.db, serverURL, s.permMiddleware, s.config)
 	v2.RegisterUploadLinkRoutes(protected, s.db, serverURL, s.permMiddleware, s.config)
@@ -276,13 +276,13 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 
 func (s *Server) registerPublicRoutes(serverURL string) {
 	onlyoffice := s.router.Group("/onlyoffice")
-	v2.RegisterOnlyOfficeCallbackRoutes(onlyoffice, s.db, s.config, s.storage, s.blockStore, s.storageManager, serverURL)
+	v2.RegisterOnlyOfficeCallbackRoutes(onlyoffice, s.db, s.config, s.storage, s.storageManager, serverURL)
 
 	exportHandler := v2.NewShareLinkHandler(s.db, serverURL, s.permMiddleware, s.config)
 	s.router.GET("/share/link/export-excel/", s.authMiddleware(), exportHandler.ExportShareLinksExcel)
 	s.router.GET("/share/link/export-excel", s.authMiddleware(), exportHandler.ExportShareLinksExcel)
 
-	smartLinkHandler := v2.NewFileHandler(s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL, s.permMiddleware)
+	smartLinkHandler := v2.NewFileHandler(s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL, s.permMiddleware)
 	s.router.GET("/smart-link/:token", s.smartLinkAuthMiddleware(), smartLinkHandler.ResolveSmartLink)
 	s.router.GET("/smart-link/:token/", s.smartLinkAuthMiddleware(), smartLinkHandler.ResolveSmartLink)
 
@@ -364,7 +364,7 @@ func (s *Server) registerCompatibilityRoutes(serverURL string) {
 		seafHTTPHandler.RegisterSeafHTTPRoutes(s.router)
 	}
 
-	syncHandler := NewSyncHandler(s.db, s.storage, s.blockStore, s.storageManager, s.config, s.permMiddleware)
+	syncHandler := NewSyncHandler(s.db, s.storage, s.storageManager, s.config, s.permMiddleware)
 	syncHandler.SetTokenCreator(s.tokenStore)
 	syncHandler.SetAccountStatusChecker(s.checkAccountStatus)
 	syncHandler.RegisterSyncRoutes(s.router, s.syncAuthMiddleware())

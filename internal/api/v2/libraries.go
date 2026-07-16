@@ -139,19 +139,16 @@ func RegisterLibraryRoutesWithToken(rg *gin.RouterGroup, database *db.DB, cfg *c
 }
 
 // RegisterV21LibraryRoutes registers v2.1 library routes with Seahub-compatible response format
-func RegisterV21LibraryRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, tokenCreator LibraryTokenCreator, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, serverURL string) {
+func RegisterV21LibraryRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, tokenCreator LibraryTokenCreator, s3Store *storage.S3Store, storageManager *storage.Manager, serverURL string) {
 	permMiddleware := middleware.NewPermissionMiddleware(database)
 	h := &LibraryHandler{db: database, config: cfg, tokenCreator: tokenCreator, permMiddleware: permMiddleware, gcEnqueuer: getLibraryEnqueuer()}
 	fh := &FileHandler{db: database, config: cfg, serverURL: serverURL, permMiddleware: permMiddleware, gcEnqueuer: getBlockEnqueuer(), zipTokenCreator: tokenCreator, storageManager: storageManager}
 	eh := NewEncryptionHandler(database)
 	sh := NewFileShareHandler(database, permMiddleware)
 
-	// Pass storage and blockStore for Office file template creation
+	// Pass raw storage for org-scoped Office file template creation.
 	if s3Store != nil {
 		fh.storage = s3Store
-	}
-	if blockStore != nil {
-		fh.blockStore = blockStore
 	}
 
 	repos := rg.Group("/repos")

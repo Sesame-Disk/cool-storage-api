@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -21,15 +22,12 @@ import (
 // (MinIO), not merely removed from Cassandra. Every other GC test asserts on
 // Cassandra rows only; nothing ever queried the bucket.
 //
-// They drive the real server worker/scanner through the admin API (the same
-// code path production runs) and verify the physical object via an independent
-// BlockStore pointed at the same dev MinIO bucket. We never run a private worker
-// here, so we cannot disturb the live queue's global state.
+// They verify physical objects through an independent BlockStore pointed at the
+// same dev MinIO bucket. Tests that need deterministic draining construct the
+// production worker adapters and call ProcessOrgOnce for only their fixture org;
+// they never fan out across unrelated org queues.
 
-// newVerificationBlockStore builds a BlockStore pointed at the dev MinIO bucket
-// for direct object existence checks. It mirrors the server's block key layout
-// (NewBlockStore(s3, "blocks/")). Skips the test when MinIO is unreachable.
-func newVerificationBlockStore(t *testing.T) *storage.BlockStore {
+func newVerificationS3Store(t *testing.T) *storage.S3Store {
 	t.Helper()
 	ctx := context.Background()
 	s3cfg := storage.S3Config{
@@ -47,19 +45,162 @@ func newVerificationBlockStore(t *testing.T) *storage.BlockStore {
 	if err := s3Store.HeadBucket(ctx); err != nil {
 		t.Skipf("MinIO bucket %q unreachable (%v); skipping", s3cfg.Bucket, err)
 	}
-	return storage.NewBlockStore(s3Store, "blocks/")
+	return s3Store
+}
+
+// newVerificationBlockStore builds an org-scoped BlockStore pointed at the dev
+// MinIO bucket for direct object existence checks.
+func newVerificationBlockStore(t *testing.T, orgID string) *storage.BlockStore {
+	t.Helper()
+	blockStore, err := storage.NewOrgBlockStore(newVerificationS3Store(t), "blocks/", orgID)
+	if err != nil {
+		t.Fatalf("build org-scoped verification BlockStore: %v", err)
+	}
+	return blockStore
+}
+
+func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
+	requireCassandra(t)
+
+	ctx := context.Background()
+	content := []byte(fmt.Sprintf("gc-cross-org-delete-isolation-%s", uuid.NewString()))
+	blockID := sha256hex(content)
+	externalSHA1 := sha1hex(content)
+	fileFSID := webFileFSID(t, []string{externalSHA1}, len(content))
+	defaultRepo := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-isolation-default-%d", time.Now().UnixNano()))
+	platformRepo := createDisposableTestLibrary(t, superadminClient, fmt.Sprintf("inttest-gc-isolation-platform-%d", time.Now().UnixNano()))
+	defaultStore := newVerificationBlockStore(t, defaultOrgID)
+	platformStore := newVerificationBlockStore(t, platformOrgID)
+
+	t.Cleanup(func() {
+		session := shareProjectionDBForTest(t).Session()
+		removeTestLibraryFully(t, adminClient, session, defaultOrgID, defaultRepo)
+		removeTestLibraryFully(t, superadminClient, session, platformOrgID, platformRepo)
+	})
+	cleanupUploadedBlockArtifactsForTest(t, defaultOrgID, defaultRepo, blockID, externalSHA1,
+		db.BlockReferrerForFSObject(defaultRepo, fileFSID))
+	cleanupUploadedBlockArtifactsForTest(t, platformOrgID, platformRepo, blockID, externalSHA1,
+		db.BlockReferrerForFSObject(platformRepo, fileFSID))
+
+	for _, upload := range []struct {
+		client   *testClient
+		repoID   string
+		filename string
+	}{
+		{client: adminClient, repoID: defaultRepo, filename: "delete-me.bin"},
+		{client: superadminClient, repoID: platformRepo, filename: "keep-me.bin"},
+	} {
+		resp := uploadFileViaBlocksFlow(t, upload.client, upload.repoID, "/", upload.filename, [][]byte{content}, false)
+		expectStatus(t, resp, 200)
+		resp.Body.Close()
+		if got := downloadRepoFile(t, upload.client, upload.repoID, "/"+upload.filename); !bytes.Equal(got, content) {
+			t.Fatalf("pre-delete download %s differs", upload.filename)
+		}
+	}
+
+	session := shareProjectionDBForTest(t).Session()
+	var defaultClass, platformClass string
+	if err := session.Query(`SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?`, defaultOrgID, blockID).Scan(&defaultClass); err != nil {
+		t.Fatalf("read default block class: %v", err)
+	}
+	if err := session.Query(`SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?`, platformOrgID, blockID).Scan(&platformClass); err != nil {
+		t.Fatalf("read platform block class: %v", err)
+	}
+	if defaultClass == "" || defaultClass != platformClass {
+		t.Fatalf("test requires one shared storage class, default=%q platform=%q", defaultClass, platformClass)
+	}
+	if defaultStore.StorageKeyForHash(blockID) == platformStore.StorageKeyForHash(blockID) {
+		t.Fatal("precondition failed: org-scoped physical keys are equal")
+	}
+	for label, blockStore := range map[string]*storage.BlockStore{
+		"default":  defaultStore,
+		"platform": platformStore,
+	} {
+		if exists, err := blockStore.BlockExists(ctx, blockID); err != nil || !exists {
+			t.Fatalf("%s physical object missing before GC: exists=%v err=%v", label, exists, err)
+		}
+	}
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	defaultUUID := uuid.MustParse(defaultOrgID)
+	queuedItems, err := store.DequeueBatch(defaultUUID, 1, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("read canonical default-org GC queue: %v", err)
+	}
+	if len(queuedItems) != 0 {
+		t.Fatalf("refusing private default-org drain with unrelated queued item: %+v", queuedItems[0])
+	}
+
+	trash := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", defaultRepo))
+	expectStatus(t, trash, 200)
+	trash.Body.Close()
+	permanent := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", defaultRepo))
+	expectStatus(t, permanent, 200)
+	permanent.Body.Close()
+
+	manager := storage.NewManager()
+	manager.RegisterBackend(defaultClass, newVerificationS3Store(t), "")
+	worker := gcpkg.NewWorker(store, gcpkg.NewStorageManagerAdapter(manager), gcpkg.NewQueue(store), 1, 0, false, &gcpkg.Stats{})
+	defaultRepoUUID := uuid.MustParse(defaultRepo)
+
+	deleted := pollUntil(t, 90*time.Second, 250*time.Millisecond, func() bool {
+		items, err := store.DequeueBatch(defaultUUID, 1, time.Now())
+		if err != nil {
+			t.Fatalf("peek canonical default-org GC queue: %v", err)
+		}
+		if len(items) > 0 {
+			item := items[0]
+			owned := item.ItemID == defaultRepo || item.LibraryID == defaultRepoUUID || (item.ItemType == gcpkg.ItemBlock && item.ItemID == blockID)
+			if !owned {
+				t.Fatalf("refusing to process unrelated default-org GC item: %+v", item)
+			}
+		}
+		if _, err := worker.ProcessOrgOnce(ctx, defaultUUID); err != nil {
+			t.Fatalf("ProcessOrgOnce(default): %v", err)
+		}
+		canonicalExists, err := store.BlockExists(defaultUUID, blockID)
+		if err != nil {
+			t.Fatalf("default BlockExists: %v", err)
+		}
+		physicalExists, err := defaultStore.BlockExists(ctx, blockID)
+		if err != nil {
+			t.Fatalf("default S3 BlockExists: %v", err)
+		}
+		return !canonicalExists && !physicalExists
+	})
+	if !deleted {
+		t.Fatal("default-org canonical row or physical object survived scoped GC drain")
+	}
+
+	platformUUID := uuid.MustParse(platformOrgID)
+	if exists, err := store.BlockExists(platformUUID, blockID); err != nil || !exists {
+		t.Fatalf("platform canonical block lost: exists=%v err=%v", exists, err)
+	}
+	if exists, err := platformStore.BlockExists(ctx, blockID); err != nil || !exists {
+		t.Fatalf("platform physical block lost: exists=%v err=%v", exists, err)
+	}
+	platformRef := db.BlockReferrerForFSObject(platformRepo, fileFSID)
+	var foundRef string
+	if err := session.Query(`SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`, platformOrgID, blockID, platformRef).Scan(&foundRef); err != nil {
+		t.Fatalf("platform block reference lost: %v", err)
+	}
+	if got := downloadRepoFile(t, superadminClient, platformRepo, "/keep-me.bin"); !bytes.Equal(got, content) {
+		t.Fatalf("platform download after default-org GC differs byte-for-byte")
+	}
 }
 
 // discoverStorageClass uploads a real file and reads back the storage_class the
 // server recorded for its block. Returns the class plus the real block id so the
 // caller can confirm the verification BlockStore points at the same bucket the
 // server writes to. Skips on bucket mismatch (e.g. non-docker env).
-func discoverStorageClass(t *testing.T, bs *storage.BlockStore) string {
+func discoverStorageClass(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
 
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-s3disc-%d", time.Now().UnixNano()))
 	orgID := resolveOrgID(t, repoID)
+	bs := newVerificationBlockStore(t, orgID)
 	_, realBlockID := uploadUniqueFile(t, adminClient, repoID, "discover.txt", "/")
 
 	var storageClass string
@@ -90,7 +231,7 @@ func discoverStorageClass(t *testing.T, bs *storage.BlockStore) string {
 // seedSyntheticBlock uploads a unique object to MinIO and writes its canonical
 // `blocks` row with NO references — a legitimate, ready-to-collect GC candidate
 // under a synthetic org (so the live system never owned it).
-func seedSyntheticBlock(t *testing.T, bs *storage.BlockStore, storageClass string) (uuid.UUID, string) {
+func seedSyntheticBlock(t *testing.T, storageClass string) (uuid.UUID, string, *storage.BlockStore) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -98,6 +239,7 @@ func seedSyntheticBlock(t *testing.T, bs *storage.BlockStore, storageClass strin
 	sum := sha256.Sum256(content)
 	blockID := hex.EncodeToString(sum[:])
 	orgID := uuid.New()
+	bs := newVerificationBlockStore(t, orgID.String())
 
 	if _, err := bs.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content, Size: int64(len(content))}); err != nil {
 		t.Fatalf("seed PutBlockData: %v", err)
@@ -113,7 +255,7 @@ func seedSyntheticBlock(t *testing.T, bs *storage.BlockStore, storageClass strin
 	`, orgID.String(), blockID, len(content), storageClass, time.Now().UTC()).Exec(); err != nil {
 		t.Fatalf("seed canonical blocks row: %v", err)
 	}
-	return orgID, blockID
+	return orgID, blockID, bs
 }
 
 // TestGC_BlockDeletion_RemovesObjectFromS3 verifies the happy path end-to-end:
@@ -124,11 +266,10 @@ func TestGC_BlockDeletion_RemovesObjectFromS3(t *testing.T) {
 	requireCassandra(t)
 
 	ctx := context.Background()
-	bs := newVerificationBlockStore(t)
-	storageClass := discoverStorageClass(t, bs)
+	storageClass := discoverStorageClass(t)
 
 	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
-	orgID, blockID := seedSyntheticBlock(t, bs, storageClass)
+	orgID, blockID, bs := seedSyntheticBlock(t, storageClass)
 	t.Cleanup(func() {
 		_ = bs.DeleteBlock(ctx, blockID)
 		_ = shareProjectionDBForTest(t).Session().Query(
@@ -191,8 +332,7 @@ func TestGC_S3OrphanRecovery_DeletesLingeringObject(t *testing.T) {
 	requireCassandra(t)
 
 	ctx := context.Background()
-	bs := newVerificationBlockStore(t)
-	storageClass := discoverStorageClass(t, bs)
+	storageClass := discoverStorageClass(t)
 
 	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
 
@@ -202,14 +342,23 @@ func TestGC_S3OrphanRecovery_DeletesLingeringObject(t *testing.T) {
 	sum := sha256.Sum256(content)
 	blockID := hex.EncodeToString(sum[:])
 	orgID := uuid.New()
+	bs := newVerificationBlockStore(t, orgID.String())
+	siblingOrgID := uuid.New()
+	siblingStore := newVerificationBlockStore(t, siblingOrgID.String())
 
 	if _, err := bs.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content, Size: int64(len(content))}); err != nil {
 		t.Fatalf("seed PutBlockData: %v", err)
 	}
+	if _, err := siblingStore.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content, Size: int64(len(content))}); err != nil {
+		t.Fatalf("seed sibling PutBlockData: %v", err)
+	}
 	if exists, err := bs.BlockExists(ctx, blockID); err != nil || !exists {
 		t.Fatalf("seed orphan object not present in S3 (exists=%v err=%v)", exists, err)
 	}
-	t.Cleanup(func() { _ = bs.DeleteBlock(ctx, blockID) })
+	t.Cleanup(func() {
+		_ = bs.DeleteBlock(ctx, blockID)
+		_ = siblingStore.DeleteBlock(ctx, blockID)
+	})
 
 	if _, err := store.RecordS3Orphan(orgID, blockID, storageClass, db.PlainBlockRepresentationID, "", "seed: simulated S3 delete failure", time.Now().UTC()); err != nil {
 		t.Fatalf("RecordS3Orphan: %v", err)
@@ -230,6 +379,14 @@ func TestGC_S3OrphanRecovery_DeletesLingeringObject(t *testing.T) {
 	})
 	if !objectGone {
 		t.Fatal("orphaned object still exists in S3 after repeated scanner orphan-recovery runs")
+	}
+	if exists, err := siblingStore.BlockExists(ctx, blockID); err != nil || !exists {
+		t.Fatalf("sibling org object was deleted by orphan recovery: exists=%v err=%v", exists, err)
+	}
+	if got, err := siblingStore.GetBlock(ctx, blockID); err != nil {
+		t.Fatalf("read sibling org object: %v", err)
+	} else if !bytes.Equal(got, content) {
+		t.Fatalf("sibling org object changed: got %q want %q", got, content)
 	}
 
 	// Recovery must also clear the fence row once the object is gone.

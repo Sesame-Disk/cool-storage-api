@@ -471,9 +471,9 @@ Session 2 (China): Block abc123 → DB lookup finds it exists in hot-s3-usa
 
 The GC system is designed around a single overriding principle: **it is always better to leave garbage and retry than to delete data that might still be referenced**. Every decision in the GC pipeline favors data safety over cleanup speed:
 
-- If a block's `ref_count` is ambiguous (concurrent mutation), skip it — the next scanner sweep will re-enqueue it if it's truly orphaned.
+- If block liveness is ambiguous during concurrent reference mutation, skip it — the next scanner sweep will re-enqueue it if it is truly orphaned.
 - If enqueueing a child item fails, do NOT delete the parent — let the worker retry the entire operation.
-- If a block has been claimed by GC (sentinel -999) but a concurrent upload needs it, the upload waits and creates a fresh copy rather than fighting the GC.
+- If a block has been claimed by GC (`gc_state='deleting'`) but a concurrent upload needs it, the upload backs off and retries after GC finishes rather than fighting the delete claim.
 - Grace periods (1h default) ensure that recently-enqueued items have time for in-flight operations to complete before processing.
 - The scanner runs every 24h — any item missed in one pass will be caught in the next.
 
@@ -489,7 +489,7 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 
 | Item Type | Action |
 |-----------|--------|
-| `block` | Check `ref_count`; if 0 → delete from S3 + DB + reverse mappings |
+| `block` | Check org-scoped reference rows; if none, claim + recheck → delete metadata and the exact org-scoped S3 object |
 | `commit` | Fetch commit → enqueue root `fs_object` for cascading deletion → delete commit |
 | `fs_object` | Enqueue child dir entries (recursive) + enqueue blocks → delete fs_object |
 | `block_mapping` | Delete forward + reverse `block_id_mappings` entries |
@@ -512,7 +512,7 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 
 | Phase | What it scans | Action |
 |-------|--------------|--------|
-| 1 | Orphaned blocks (`ref_count=0`) | Enqueue for deletion |
+| 1 | Discoverable zero-reference block candidates | Enqueue for deletion |
 | 2 | Expired share links (`expires_at < now`) | Enqueue for deletion |
 | 3 | Orphaned commits (library no longer exists) | Enqueue for deletion |
 | 4 | Orphaned fs_objects (library no longer exists) | Enqueue for deletion |
@@ -580,7 +580,8 @@ A reference row is `((org_id, block_id), referrer)` where:
 - **File upload**: `RegisterUploadedBlock` — `UpsertBlockMetadata` (INSERT IF NOT EXISTS) + `AddBlockReference(up:…, TTL)`. Backs off if the row is mid-GC (`gc_state='deleting'`).
 - **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block. These are the **permanent** refs, promoted only after the fs_object row is persisted (the publish race holds liveness via provisional publish-attempt refs); the call fails closed if the fs_object row is missing. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
 - **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
-- **GC block deletion (the only expensive Paxos)**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferences` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise `RecordS3Orphan` → `DELETE blocks` → delete from S3.
+- **GC block deletion (the only expensive Paxos)**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferences` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise `RecordS3Orphan` → `DELETE blocks` → delete `blocks/<org_id>/...` through a `BlockStore` bound to the queued org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend.
+- **S3 orphan recovery**: reuses the orphan row's `(org_id, storage_class)` to resolve the same physical key. An empty class or invalid org fails closed, leaves the orphan row for operator repair/retry, and does not advance the recovery cursor past the unresolved row.
 
 **Lifecycle**:
 ```

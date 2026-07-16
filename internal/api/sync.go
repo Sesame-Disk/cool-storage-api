@@ -62,9 +62,8 @@ type SyncAccountStatusChecker func(userID, orgID string) error
 // These endpoints are used by the Seafile Desktop client for file synchronization
 type SyncHandler struct {
 	db             *db.DB
-	storage        *storage.S3Store    // Legacy single store
-	blockStore     *storage.BlockStore // Legacy single block store
-	storageManager *storage.Manager    // Multi-backend storage manager
+	storage        *storage.S3Store // Legacy single store
+	storageManager *storage.Manager // Multi-backend storage manager
 	config         *config.Config
 	tokenCreator   SyncTokenCreator   // Token creator for download-info
 	tokenValidator SyncTokenValidator // Validates per-repo tokens in locked-files bodies
@@ -96,11 +95,10 @@ type SyncHandler struct {
 }
 
 // NewSyncHandler creates a new sync protocol handler
-func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) *SyncHandler {
+func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) *SyncHandler {
 	return &SyncHandler{
 		db:                     database,
 		storage:                s3Store,
-		blockStore:             blockStore,
 		storageManager:         storageManager,
 		config:                 cfg,
 		permMiddleware:         permMiddleware,
