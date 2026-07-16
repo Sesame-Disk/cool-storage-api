@@ -11,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -59,6 +61,73 @@ func newVerificationBlockStore(t *testing.T, orgID string) *storage.BlockStore {
 	return blockStore
 }
 
+// isolatedTenant is a freshly created organization with an owner user and an
+// API-key-backed client, exclusively owned by one test. Because the org is
+// exclusive, its GC queue is private, so a scoped ProcessOrgOnce drains only this
+// test's work. The shared default org cannot offer that: its gc_queue accumulates
+// unrelated items across the full suite, so a private whole-org drain there trips
+// the safety guard (the exact failure this test hit before — see
+// ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01 test notes).
+type isolatedTenant struct {
+	orgID  string
+	userID string
+	email  string
+	client *testClient
+}
+
+// provisionIsolatedTenant creates a real tenant org + owner user via the superadmin
+// admin API, then mints a real API key for that owner and returns a client bound to
+// it. Admin key management is platform-org only, so the key is minted directly
+// against the same Cassandra: the key hash is a plain SHA-256 with no server pepper
+// (internal/apikeys), so a key created here validates in the running server exactly
+// like one issued through the API, and the auth middleware accepts the raw key as a
+// bearer token. It registers cleanup for the API key and a hard-delete of the
+// user+org so the run leaves zero canonical/projection residue.
+func provisionIsolatedTenant(t *testing.T, label string) *isolatedTenant {
+	t.Helper()
+
+	stamp := time.Now().UnixNano()
+	name := fmt.Sprintf("inttest-gc-iso-%s-%d", label, stamp)
+	email := fmt.Sprintf("inttest-gc-iso-%s-%d@sesamefs.local", label, stamp)
+
+	// Creates the org + owner user and registers its own soft-delete cleanup.
+	orgID := createAdminIdentityTestOrganization(t, name, email)
+
+	userID, found := lookupUserIDByEmail(t, email)
+	if !found {
+		t.Fatalf("owner user_id not found for %s", email)
+	}
+
+	orgUUID, err := gocql.ParseUUID(orgID)
+	if err != nil {
+		t.Fatalf("parse org uuid %s: %v", orgID, err)
+	}
+	userUUID, err := gocql.ParseUUID(userID)
+	if err != nil {
+		t.Fatalf("parse user uuid %s: %v", userID, err)
+	}
+
+	mgr := apikeys.NewManager(shareProjectionDBForTest(t))
+	rawToken, key, err := mgr.CreateKey(userUUID, orgUUID, "gc-iso-"+label, apikeys.ScopeReadWrite, nil)
+	if err != nil {
+		t.Fatalf("mint api key for %s: %v", email, err)
+	}
+
+	// The org+owner lifecycle is already cleaned by createAdminIdentityTestOrganization
+	// (soft-delete via the admin API, which the docker GC then cascade-purges) — the
+	// same pattern every admin-created test org uses. HardDeleteOrg is intentionally
+	// NOT called here: it requires the org to already be in the deleted state with no
+	// live children, which is not true at this point in the LIFO cleanup order. We only
+	// revoke the API key, which the org soft-delete does not cover.
+	t.Cleanup(func() {
+		if err := mgr.RevokeKey(orgUUID, userUUID, key.KeyHash); err != nil {
+			t.Logf("cleanup: revoke api key for %s: %v", email, err)
+		}
+	})
+
+	return &isolatedTenant{orgID: orgID, userID: userID, email: email, client: newTestClient(baseURL, rawToken)}
+}
+
 func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
 	requireCassandra(t)
 
@@ -67,54 +136,61 @@ func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
 	blockID := sha256hex(content)
 	externalSHA1 := sha1hex(content)
 	fileFSID := webFileFSID(t, []string{externalSHA1}, len(content))
-	defaultRepo := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-isolation-default-%d", time.Now().UnixNano()))
-	platformRepo := createDisposableTestLibrary(t, superadminClient, fmt.Sprintf("inttest-gc-isolation-platform-%d", time.Now().UnixNano()))
-	defaultStore := newVerificationBlockStore(t, defaultOrgID)
-	platformStore := newVerificationBlockStore(t, platformOrgID)
+
+	// Two fresh, test-exclusive tenant orgs: one we delete + privately drain, one we
+	// prove survives. Exclusive ownership is what makes the private drain of orgA's
+	// GC queue sound (unlike the shared default org).
+	orgA := provisionIsolatedTenant(t, "delete")
+	orgB := provisionIsolatedTenant(t, "keep")
+
+	repoA := createDisposableTestLibrary(t, orgA.client, fmt.Sprintf("inttest-gc-isolation-a-%d", time.Now().UnixNano()))
+	repoB := createDisposableTestLibrary(t, orgB.client, fmt.Sprintf("inttest-gc-isolation-b-%d", time.Now().UnixNano()))
+	storeA := newVerificationBlockStore(t, orgA.orgID)
+	storeB := newVerificationBlockStore(t, orgB.orgID)
 
 	t.Cleanup(func() {
 		session := shareProjectionDBForTest(t).Session()
-		removeTestLibraryFully(t, adminClient, session, defaultOrgID, defaultRepo)
-		removeTestLibraryFully(t, superadminClient, session, platformOrgID, platformRepo)
+		removeTestLibraryFully(t, orgA.client, session, orgA.orgID, repoA)
+		removeTestLibraryFully(t, orgB.client, session, orgB.orgID, repoB)
 	})
-	cleanupUploadedBlockArtifactsForTest(t, defaultOrgID, defaultRepo, blockID, externalSHA1,
-		db.BlockReferrerForFSObject(defaultRepo, fileFSID))
-	cleanupUploadedBlockArtifactsForTest(t, platformOrgID, platformRepo, blockID, externalSHA1,
-		db.BlockReferrerForFSObject(platformRepo, fileFSID))
+	cleanupUploadedBlockArtifactsForTest(t, orgA.orgID, repoA, blockID, externalSHA1,
+		db.BlockReferrerForFSObject(repoA, fileFSID))
+	cleanupUploadedBlockArtifactsForTest(t, orgB.orgID, repoB, blockID, externalSHA1,
+		db.BlockReferrerForFSObject(repoB, fileFSID))
 
 	for _, upload := range []struct {
-		client   *testClient
+		tenant   *isolatedTenant
 		repoID   string
 		filename string
 	}{
-		{client: adminClient, repoID: defaultRepo, filename: "delete-me.bin"},
-		{client: superadminClient, repoID: platformRepo, filename: "keep-me.bin"},
+		{tenant: orgA, repoID: repoA, filename: "delete-me.bin"},
+		{tenant: orgB, repoID: repoB, filename: "keep-me.bin"},
 	} {
-		resp := uploadFileViaBlocksFlow(t, upload.client, upload.repoID, "/", upload.filename, [][]byte{content}, false)
+		resp := uploadFileViaBlocksFlow(t, upload.tenant.client, upload.repoID, "/", upload.filename, [][]byte{content}, false)
 		expectStatus(t, resp, 200)
 		resp.Body.Close()
-		if got := downloadRepoFile(t, upload.client, upload.repoID, "/"+upload.filename); !bytes.Equal(got, content) {
+		if got := downloadRepoFile(t, upload.tenant.client, upload.repoID, "/"+upload.filename); !bytes.Equal(got, content) {
 			t.Fatalf("pre-delete download %s differs", upload.filename)
 		}
 	}
 
 	session := shareProjectionDBForTest(t).Session()
-	var defaultClass, platformClass string
-	if err := session.Query(`SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?`, defaultOrgID, blockID).Scan(&defaultClass); err != nil {
-		t.Fatalf("read default block class: %v", err)
+	var classA, classB string
+	if err := session.Query(`SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?`, orgA.orgID, blockID).Scan(&classA); err != nil {
+		t.Fatalf("read orgA block class: %v", err)
 	}
-	if err := session.Query(`SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?`, platformOrgID, blockID).Scan(&platformClass); err != nil {
-		t.Fatalf("read platform block class: %v", err)
+	if err := session.Query(`SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?`, orgB.orgID, blockID).Scan(&classB); err != nil {
+		t.Fatalf("read orgB block class: %v", err)
 	}
-	if defaultClass == "" || defaultClass != platformClass {
-		t.Fatalf("test requires one shared storage class, default=%q platform=%q", defaultClass, platformClass)
+	if classA == "" || classA != classB {
+		t.Fatalf("test requires one shared storage class, orgA=%q orgB=%q", classA, classB)
 	}
-	if defaultStore.StorageKeyForHash(blockID) == platformStore.StorageKeyForHash(blockID) {
+	if storeA.StorageKeyForHash(blockID) == storeB.StorageKeyForHash(blockID) {
 		t.Fatal("precondition failed: org-scoped physical keys are equal")
 	}
 	for label, blockStore := range map[string]*storage.BlockStore{
-		"default":  defaultStore,
-		"platform": platformStore,
+		"orgA": storeA,
+		"orgB": storeB,
 	} {
 		if exists, err := blockStore.BlockExists(ctx, blockID); err != nil || !exists {
 			t.Fatalf("%s physical object missing before GC: exists=%v err=%v", label, exists, err)
@@ -123,70 +199,72 @@ func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
 
 	database := shareProjectionDBForTest(t)
 	store := gcpkg.NewCassandraStore(database)
-	defaultUUID := uuid.MustParse(defaultOrgID)
-	queuedItems, err := store.DequeueBatch(defaultUUID, 1, time.Now().Add(24*time.Hour))
+	orgAUUID := mustParseUUID(t, orgA.orgID)
+	queuedItems, err := store.DequeueBatch(orgAUUID, 1, time.Now().Add(24*time.Hour))
 	if err != nil {
-		t.Fatalf("read canonical default-org GC queue: %v", err)
+		t.Fatalf("read canonical orgA GC queue: %v", err)
 	}
 	if len(queuedItems) != 0 {
-		t.Fatalf("refusing private default-org drain with unrelated queued item: %+v", queuedItems[0])
+		t.Fatalf("exclusive orgA queue unexpectedly non-empty before delete: %+v", queuedItems[0])
 	}
 
-	trash := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", defaultRepo))
+	trash := orgA.client.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoA))
 	expectStatus(t, trash, 200)
 	trash.Body.Close()
-	permanent := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", defaultRepo))
+	permanent := orgA.client.Delete(t, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", repoA))
 	expectStatus(t, permanent, 200)
 	permanent.Body.Close()
 
 	manager := storage.NewManager()
-	manager.RegisterBackend(defaultClass, newVerificationS3Store(t), "")
+	manager.RegisterBackend(classA, newVerificationS3Store(t), "")
 	worker := gcpkg.NewWorker(store, gcpkg.NewStorageManagerAdapter(manager), gcpkg.NewQueue(store), 1, 0, false, &gcpkg.Stats{})
-	defaultRepoUUID := uuid.MustParse(defaultRepo)
+	repoAUUID := mustParseUUID(t, repoA)
 
 	deleted := pollUntil(t, 90*time.Second, 250*time.Millisecond, func() bool {
-		items, err := store.DequeueBatch(defaultUUID, 1, time.Now())
+		// orgA is exclusive to this test, so every item in its queue is ours. The
+		// ownership check is defence-in-depth against a stray enqueue.
+		items, err := store.DequeueBatch(orgAUUID, 1, time.Now())
 		if err != nil {
-			t.Fatalf("peek canonical default-org GC queue: %v", err)
+			t.Fatalf("peek canonical orgA GC queue: %v", err)
 		}
 		if len(items) > 0 {
 			item := items[0]
-			owned := item.ItemID == defaultRepo || item.LibraryID == defaultRepoUUID || (item.ItemType == gcpkg.ItemBlock && item.ItemID == blockID)
+			owned := item.ItemID == repoA || item.LibraryID == repoAUUID || (item.ItemType == gcpkg.ItemBlock && item.ItemID == blockID)
 			if !owned {
-				t.Fatalf("refusing to process unrelated default-org GC item: %+v", item)
+				t.Fatalf("unexpected foreign item in exclusive orgA queue: %+v", item)
 			}
 		}
-		if _, err := worker.ProcessOrgOnce(ctx, defaultUUID); err != nil {
-			t.Fatalf("ProcessOrgOnce(default): %v", err)
+		if _, err := worker.ProcessOrgOnce(ctx, orgAUUID); err != nil {
+			t.Fatalf("ProcessOrgOnce(orgA): %v", err)
 		}
-		canonicalExists, err := store.BlockExists(defaultUUID, blockID)
+		canonicalExists, err := store.BlockExists(orgAUUID, blockID)
 		if err != nil {
-			t.Fatalf("default BlockExists: %v", err)
+			t.Fatalf("orgA BlockExists: %v", err)
 		}
-		physicalExists, err := defaultStore.BlockExists(ctx, blockID)
+		physicalExists, err := storeA.BlockExists(ctx, blockID)
 		if err != nil {
-			t.Fatalf("default S3 BlockExists: %v", err)
+			t.Fatalf("orgA S3 BlockExists: %v", err)
 		}
 		return !canonicalExists && !physicalExists
 	})
 	if !deleted {
-		t.Fatal("default-org canonical row or physical object survived scoped GC drain")
+		t.Fatal("orgA canonical row or physical object survived scoped GC drain")
 	}
 
-	platformUUID := uuid.MustParse(platformOrgID)
-	if exists, err := store.BlockExists(platformUUID, blockID); err != nil || !exists {
-		t.Fatalf("platform canonical block lost: exists=%v err=%v", exists, err)
+	orgBUUID := mustParseUUID(t, orgB.orgID)
+	if exists, err := store.BlockExists(orgBUUID, blockID); err != nil || !exists {
+		t.Fatalf("orgB canonical block lost: exists=%v err=%v", exists, err)
 	}
-	if exists, err := platformStore.BlockExists(ctx, blockID); err != nil || !exists {
-		t.Fatalf("platform physical block lost: exists=%v err=%v", exists, err)
+	if exists, err := storeB.BlockExists(ctx, blockID); err != nil || !exists {
+		t.Fatalf("orgB physical block lost: exists=%v err=%v", exists, err)
 	}
-	platformRef := db.BlockReferrerForFSObject(platformRepo, fileFSID)
+	orgBRef := db.BlockReferrerForFSObject(repoB, fileFSID)
 	var foundRef string
-	if err := session.Query(`SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`, platformOrgID, blockID, platformRef).Scan(&foundRef); err != nil {
-		t.Fatalf("platform block reference lost: %v", err)
+	if err := session.Query(`SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`, orgB.orgID, blockID, orgBRef).Scan(&foundRef); err != nil {
+		t.Fatalf("orgB block reference lost: %v", err)
 	}
-	if got := downloadRepoFile(t, superadminClient, platformRepo, "/keep-me.bin"); !bytes.Equal(got, content) {
-		t.Fatalf("platform download after default-org GC differs byte-for-byte")
+	if got := downloadRepoFile(t, orgB.client, repoB, "/keep-me.bin"); !bytes.Equal(got, content) {
+		t.Fatalf("orgB download after orgA GC differs byte-for-byte")
 	}
 }
 

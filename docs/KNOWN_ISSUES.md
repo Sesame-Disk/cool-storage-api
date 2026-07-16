@@ -4253,16 +4253,17 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
   count every bucket.
 
   **Teardown contract — a missing `blocks` row means STOP.** `releaseStagedBlockForTest`
-  deliberately does **not** delete the S3 object when the `blocks` row is gone. S3 keys are
-  content-addressed with no org in them (`hashToKey` ⇒ `blocks/<h0:2>/<h2:4>/<hash>`), so a single
-  object backs **every** org that ever stored those bytes, while `blocks` and `block_references`
-  are per-org. The zero-ref check therefore only proves *this* org is finished with it. The
-  `blocks` row is the fixture's only evidence that it materialized the object here, and it carries
-  the `storage_class` that says which of the five buckets the object is even in. Deleting without
-  it would mean removing a hash we cannot prove we created, from a bucket we are guessing — and
-  could take out a live block belonging to another org. If a future fixture needs "delete without
-  metadata", it must opt in explicitly and prove: a test-exclusive hash, the right bucket, and that
-  its own request could have physically created the object.
+  deliberately does **not** delete the S3 object when the `blocks` row is gone. S3 keys are now
+  org-scoped (`hashToKey` ⇒ `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`), so cross-org deletion is no
+  longer the hazard — P10 makes that impossible by construction. The reason to stop is different:
+  without the `blocks` row the helper knows neither the authoritative `storage_class`/bucket (one of
+  the five) the object lives in, nor can it prove the object belongs to *this* fixture. The zero-ref
+  check only proves *this* org is finished with the reference; the `blocks` row is the fixture's only
+  evidence that it materialized the object here. Deleting without it would mean removing a hash we
+  cannot prove we created, from a bucket we are guessing. So it must fail closed rather than delete
+  from S3 directly. If a future fixture needs "delete without metadata", it must opt in explicitly and
+  prove: a test-exclusive hash, the right bucket, and that its own request could have physically
+  created the object.
 
   **Still open (new, smaller):** one ~90-byte S3 object with **no `blocks` row** survives a run —
   an S3-only orphan that no GC phase can discover (blocks are found through candidates, and
