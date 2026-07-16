@@ -5,8 +5,9 @@
 **Goal:** Evaluate correctness, test coverage, identify potential data-loss bugs, and
 plan integration tests for long-running monitoring.
 
-> **See also (delete-path audit, refreshed 2026-07-15):** **no open known issue can delete live
-> content in the normal production delete flow.** The physical block-delete claim/recovery
+> **See also (delete-path audit, refreshed 2026-07-16):** ⛔ **P10 (open, proven) deletes live content across orgs** — GC's liveness check is org-scoped but the S3 object is shared by content hash, so one org's delete destroys another's still-referenced block. Greenfield deploy blocker. See `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`.
+> The previous "no open known issue can delete live content" verdict is **retracted**: it only ever
+> reasoned about liveness *within* an org. The physical block-delete claim/recovery
 > protocol is conservative. P6a (existence-read failures interpreted as "missing", enqueuing
 > destructive work for live libraries on a transient error) is **fixed** (branch 1D): existence
 > reads fail closed and Phases 3/4/9 surface the error. P6b is **fixed**: queued orphan work is
@@ -15,13 +16,13 @@ plan integration tests for long-running monitoring.
 > cascade on every wired permanent-delete path) are **fixed** on `main` (PR #129), and P9
 > (`gc_pending_items` block-row leak) is fixed for new work.
 >
-> Remaining debt is **storage retention in edge cases, observability, test hygiene, and scale** —
-> not live-data safety: P4 (`pub:` zero-ref transition), P5 (Phase 13 error visibility), P7
+> Apart from P10, the remaining debt is **storage retention in edge cases, observability, test
+> hygiene, and scale** — not live-data safety: P4 (`pub:` zero-ref transition), P5 (Phase 13 error visibility), P7
 > (markerless commit/fs_object partitions invisible to orphan discovery — reachable on any
 > cluster via terminal child-work loss/DLQ expiry, so 8D stays open), P8 (Phase 9
 > `shares_by_group` global scan). Reconcile/backfill (8A–8C) repairs *pre-existing* residue only
 > and is **out of scope for the planned greenfield prod deploy**.
-> Full audit (P1–P9, invariants, branch roadmap):
+> Full audit (P1–P10, invariants, branch roadmap):
 > [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md);
 > per-item issues: `ISSUE-GC-*` in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
@@ -229,7 +230,7 @@ partitions cannot be found by Phases 3/4. Observed in the dev-cluster audit snap
 and **not reproduced on the live delete path**, so it is not a normal-flow gap — but it is not
 brownfield-only either: the cascade enqueues children before `HardDeleteLibrary` drops canonical +
 marker, so terminal child-work loss (retry exhaustion → DLQ → DLQ expiry) strands artifacts on a
-fresh cluster too. Under-reclamation, never incorrect deletion. Not a launch blocker; 8D stays
+fresh cluster too. Under-reclamation, never incorrect deletion (unlike P10). Not a launch blocker; 8D stays
 open. See `ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`.
 
 ### RESOLVED: Hot exact recounts removed without Cassandra COUNTER

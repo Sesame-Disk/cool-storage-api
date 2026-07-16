@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🟢 Safe for prod (greenfield) | Normal delete path exercised end-to-end (~50 GB manual dev-cluster run, zero content residue — operator observation, not an automated test). P6a/P6b and P1/P2 closed on `main` (PR #129). Remaining GC debt is storage retention in edge cases (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and scale (P8) — not live-data deletion. Reconcile/backfill not required for empty prod deploy. See GC audit section below. |
+| Garbage Collection | ⛔ **BLOCKER — P10 deletes live content across orgs** | **P10 (open, proven 2026-07-16):** GC's liveness check is org-scoped but the S3 object is shared by content hash, so one org's delete destroys another org's still-referenced block. Reproduced end-to-end; reachable on a greenfield deploy from day one. See ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01. **Everything else stands:** the single-org delete path was exercised end-to-end (~50 GB manual dev-cluster run, zero content residue — operator observation, not an automated test); P6a/P6b and P1/P2 closed on `main` (PR #129); the rest of the debt is storage retention (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done) and scale (P8). Reconcile/backfill not required for an empty prod deploy. See GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -57,8 +57,10 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 
 ### 🟢 GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-15)
 
-Follow-up debt from the PR #123 audit. **Verdict (2026-07-15):** no open known issue can delete
-live content in the normal production delete flow. P6a/P6b safety guards and P1/P1b/P2 durable
+Follow-up debt from the PR #123 audit. **Verdict (2026-07-16): ⛔ P10 is an open, proven live-content
+deletion bug and a deploy blocker** — GC's org-scoped liveness check vs the content-hash-shared S3
+object. The previous "no open known issue can delete live content" verdict is **retracted**: it only
+ever reasoned about liveness within a single org. Within one org the delete path is still sound. P6a/P6b safety guards and P1/P1b/P2 durable
 purge + cascade are **fixed** on `main` (PR #129). The planned **greenfield prod deploy** starts
 from an empty cluster — reconcile/backfill (8A–8C) and pre-fix `gc_pending_items` orphans are
 **not required**. Note this depends on a **recreated keyspace + empty/new buckets, never written
@@ -2809,7 +2811,8 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 2026-07-10 audit found P1–P9 follow-ups. Refreshed 2026-07-15: the safety-classification gaps
 (P6a/P6b) and the normal permanent-delete path (P1/P1b/P2, PR #129) are **closed** on `main`.
 Remaining debt is reclamation edge cases (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and
-the Medium Phase 9 global-scan scale debt (P8) — not live-data deletion.
+the Medium Phase 9 global-scan scale debt (P8). **P10 (2026-07-16) IS live-data deletion: cross-org
+shared-object deletion, open and proven — a deploy blocker.**
 **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
 **Tests**: 55 Go unit tests + 21 bash integration tests
 **Admin API**: `GET /api/v2.1/admin/gc/status`, `POST /api/v2.1/admin/gc/run`
@@ -4324,6 +4327,70 @@ P6 issue above.
 
 - `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` (Engine-level review)
 - `docs/GC-SERVICE-ANALYSIS.md`
+
+---
+
+### ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01: GC deletes an S3 object still referenced by another org
+
+**Status**: ⛔ **OPEN — BLOCKER (found 2026-07-16, reproduced end-to-end)**
+**Severity**: **High — live-content deletion.** Not under-reclamation: committed data becomes unreadable.
+**Affected**: `internal/gc` block deletion, `internal/storage` block addressing. Any deploy with >1 org
+sharing a storage class — i.e. **greenfield from day one**.
+
+#### Problem
+
+Physical ownership and liveness are keyed differently:
+
+- **S3 objects are global per storage class.** `hashToKey` ([blocks.go:274](../internal/storage/blocks.go#L274))
+  takes **only** the hash — `blocks/<h0:2>/<h2:4>/<hash>` — and every production `NewBlockStore` passes
+  the literal `"blocks/"` prefix (`api/server.go`, `api/seafhttp.go`, `api/v2/files.go`,
+  `api/v2/onlyoffice.go`, `api/v2/storage_resolution.go`, `storage/storage.go`). There is no org in the
+  key, so **every org storing those bytes in that class shares one object**.
+- **Liveness is per-org.** `blocks` and `block_references` are partitioned by `org_id`.
+
+`processBlock` mixes the two: it decides with `BlockHasReferences(item.OrgID, item.ItemID)`
+([worker.go:412](../internal/gc/worker.go#L412), [store_cassandra.go:1849](../internal/gc/store_cassandra.go#L1849)),
+finalizes the org-scoped row ([store_cassandra.go:2118](../internal/gc/store_cassandra.go#L2118)), then
+deletes the **global** key ([worker.go:583](../internal/gc/worker.go#L583) →
+[blocks.go:251](../internal/storage/blocks.go#L251)). "No refs **in this org**" is treated as "nobody
+needs these bytes".
+
+The claim+verify fence does not help: it re-checks the same org-scoped partition.
+
+#### Reproduction (done, on a clean single-node docker stack)
+
+1. Org A uploads a file through the API → `blocks[(A,hash)]`, an `fs:` ref, one S3 object.
+2. Seed org B with `blocks[(B,hash)]` + an `fs:` ref for the **same hash** — the state B's own upload of
+   identical bytes produces. Verified precondition: **2 `blocks` rows, 1 S3 object**.
+3. Delete org A's library through the API; let GC drain.
+4. At ~210s: `objetoS3=0`, `blocks_rows=1`, **org B's `fs:` ref still live**.
+
+Org B keeps intact metadata pointing at content that no longer exists. Its file is unreadable.
+
+Ordinary multi-tenancy triggers this: identical READMEs, empty files, shared templates, any
+re-uploaded document.
+
+#### Fix direction (decide before the greenfield deploy)
+
+1. **Org-scope the physical key** — e.g. `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`. Aligns physical
+   ownership with the existing per-org tables, claims and references; no coordination needed. Costs
+   cross-org dedup (each org stores its own copy). **Simplest and safest for a greenfield deploy — the
+   store is empty, so there is no migration.**
+2. **Global liveness per `(storage_class, block_id)`** — a global ref/owner registry plus a global claim
+   before physical delete. Keeps cross-org dedup, but needs global coordination and is materially more
+   complex.
+
+Do **not** paper over it with a pre-delete `HEAD`/existence probe: that is a TOCTOU race, not a fix.
+
+#### Required regression test (cross-org)
+
+Two orgs upload identical bytes to the same storage class; delete one org's library and drain GC;
+assert the other org can still download the file **and** the physical object still exists. **This test
+fails on current `main`.**
+
+#### Related Docs
+
+- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) — P10 in the confirmed-gap table.
 
 ---
 
