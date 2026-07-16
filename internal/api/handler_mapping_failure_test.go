@@ -40,7 +40,7 @@ func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 	}
 
 	tokenStore := NewMockTokenStore()
-	if _, err := tokenStore.CreateUploadToken("org1", "repo1", "/", "user1"); err != nil {
+	if _, err := tokenStore.CreateUploadToken("00000000-0000-0000-0000-000000000001", "repo1", "/", "user1"); err != nil {
 		t.Fatalf("CreateUploadToken() error = %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	}
 
 	r := setupSyncTestRouter()
-	handler := &SyncHandler{blockStore: &storage.BlockStore{}, db: &db.DB{}}
+	handler := &SyncHandler{storage: &storage.S3Store{}, db: &db.DB{}}
 	r.PUT("/seafhttp/repo/:repo_id/block/:block_id", handler.PutBlock)
 
 	req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo-1/block/0123456789012345678901234567890123456789", bytes.NewBufferString("hello"))
@@ -182,7 +182,7 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 	}
 
 	r := setupSyncTestRouter()
-	handler := &SyncHandler{blockStore: &storage.BlockStore{}, db: &db.DB{}}
+	handler := &SyncHandler{storage: &storage.S3Store{}, db: &db.DB{}}
 	r.PUT("/seafhttp/repo/:repo_id/block/:block_id", handler.PutBlock)
 
 	req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo-1/block/0123456789012345678901234567890123456789", bytes.NewBufferString("hello"))
@@ -201,7 +201,7 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 	}
 }
 
-func TestSeafHTTPHandleUploadFallbackPreservesObjectStoreStorageClass(t *testing.T) {
+func TestSeafHTTPHandleUploadFailsClosedWithoutS3BlockBackend(t *testing.T) {
 	oldRegister := registerUploadedBlockAndMappingForUploadFn
 	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
 	oldEncrypted := lookupLibraryEncryptedForUploadFn
@@ -217,10 +217,10 @@ func TestSeafHTTPHandleUploadFallbackPreservesObjectStoreStorageClass(t *testing
 	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
 		return false, nil
 	}
-	var gotStorageClass string
+	registerCalled := false
 	registerUploadedBlockAndMappingForUploadFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
-		gotStorageClass = storageClass
-		return fmt.Errorf("stop after register")
+		registerCalled = true
+		return nil
 	}
 
 	manager := storage.NewManager()
@@ -228,7 +228,7 @@ func TestSeafHTTPHandleUploadFallbackPreservesObjectStoreStorageClass(t *testing
 	manager.SetDefaultClass("hot-fallback")
 
 	tokenStore := NewMockTokenStore()
-	if _, err := tokenStore.CreateUploadToken("org1", "repo1", "/", "user1"); err != nil {
+	if _, err := tokenStore.CreateUploadToken("00000000-0000-0000-0000-000000000001", "repo1", "/", "user1"); err != nil {
 		t.Fatalf("CreateUploadToken() error = %v", err)
 	}
 
@@ -240,13 +240,13 @@ func TestSeafHTTPHandleUploadFallbackPreservesObjectStoreStorageClass(t *testing
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if gotStorageClass != "hot-fallback" {
-		t.Fatalf("register storage_class = %q, want %q", gotStorageClass, "hot-fallback")
+	if registerCalled {
+		t.Fatal("block metadata must not be registered when no org-scoped S3 block backend is available")
 	}
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
 	}
-	if got := decodeJSONObject(t, w.Body)["error"]; got != "failed to store block metadata" {
-		t.Fatalf("error = %v, want failed to store block metadata", got)
+	if got := decodeJSONObject(t, w.Body)["error"]; got != "block storage not available" {
+		t.Fatalf("error = %v, want block storage not available", got)
 	}
 }

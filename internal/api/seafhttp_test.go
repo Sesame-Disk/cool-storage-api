@@ -1447,7 +1447,7 @@ func TestResolveLibraryBlockStoreUsesDefaultStorageClass(t *testing.T) {
 
 	h := &SeafHTTPHandler{storageManager: manager}
 
-	blockStore, storageClass, err := h.resolveLibraryBlockStore("", "org-id", "repo-id")
+	blockStore, storageClass, err := h.resolveLibraryBlockStore("", "00000000-0000-0000-0000-000000000001", "repo-id")
 	if err != nil {
 		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
 	}
@@ -1512,7 +1512,7 @@ func TestResolveLibraryBlockStoreUsesHostnameFallback(t *testing.T) {
 		storageManager: manager,
 	}
 
-	blockStore, storageClass, err := h.resolveLibraryBlockStore("eu.example.com", "org-id", "repo-id")
+	blockStore, storageClass, err := h.resolveLibraryBlockStore("eu.example.com", "00000000-0000-0000-0000-000000000001", "repo-id")
 	if err != nil {
 		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
 	}
@@ -2939,7 +2939,7 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 		storeCalls.Add(1)
 		return hash, nil
 	}
-	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string) (string, error) {
+	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string) (string, error) {
 		storeCalls.Add(1)
 		return "", nil
 	}
@@ -3029,7 +3029,7 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	expectedSHA1 := sha1.Sum([]byte("hello"))
 	expectedBlockID := hex.EncodeToString(expectedSHA1[:])
 	commitSeafHTTPUploadedFileMultiBlockFn = func(h *SeafHTTPHandler, ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
-		if orgID != "org1" || repoID != "repo1" || userID != "user1" {
+		if orgID != "00000000-0000-0000-0000-000000000001" || repoID != "repo1" || userID != "user1" {
 			return "", "", 0, 0, fmt.Errorf("unexpected commit identity %s/%s/%s", orgID, repoID, userID)
 		}
 		if parentDir != "/" || filename != "test.bin" || replace {
@@ -3048,7 +3048,7 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	}
 
 	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, nil, nil, nil)
-	token := &AccessToken{OrgID: "org1", RepoID: "repo1", UserID: "user1", Token: "token1"}
+	token := &AccessToken{OrgID: "00000000-0000-0000-0000-000000000001", RepoID: "repo1", UserID: "user1", Token: "token1"}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/token1", nil)
@@ -3170,7 +3170,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		directPuts.Add(1)
 		return hash, nil
 	}
-	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string) (string, error) {
+	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string) (string, error) {
 		reusableChecks.Add(1)
 		return "", nil
 	}
@@ -3183,7 +3183,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	}
 
 	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, nil, nil, nil)
-	token := &AccessToken{OrgID: "org1", RepoID: "repo1", UserID: "user1", Token: "token1"}
+	token := &AccessToken{OrgID: "00000000-0000-0000-0000-000000000001", RepoID: "repo1", UserID: "user1", Token: "token1"}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/token1", nil)
@@ -3265,7 +3265,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryWithoutDecryptSessionReturn
 
 func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAndSucceeds(t *testing.T) {
 	const (
-		orgID            = "org-encrypted-retry"
+		orgID            = "00000000-0000-0000-0000-000000000001"
 		repoID           = "repo-encrypted-retry"
 		userID           = "user-encrypted-retry"
 		uploadIdentifier = "resumable-retry-secret-bin"

@@ -125,23 +125,12 @@ blocks at different positions in one upload produce separate probes/PUTs. The
 Cassandra probe now provides cross-upload dedup (a previously-stored block is
 reused), which the old S3 HEAD also did — so no dedup regression.
 
-**Caveat 2 (separate debt — `storage_key` not adopted for reads):**
-`EnsureReusableBlockPresent` is the first code path that honors the canonical
-`storage_key` column (falling back to the hash-derived key only when it is empty).
-Every *read* path in `internal/storage/blocks.go` — `GetBlock`, `GetBlockReader`,
-`GetBlockSize`, etc. — still derives the object key purely from the content hash
-via `hashToKey(hash)` and never consults `storage_key`. GC deletes the same way.
-Today this is harmless because **`storage_key` is either empty or equal to the
-hash-derived key**: 4 of the 5 upload paths register the block with `storage_key=""`
-(only OnlyOffice persists a non-empty key, and it is the hash-derived one), so
-`hashToKey(hash)` is always a correct locator — and `EnsureReusableBlockPresent`'s
-fallback to `StorageKeyForHash(blockID)` when the column is empty is exactly what
-keeps the reuse path correct. The risk surfaces only if some future write persists a
-`storage_key` that *differs* from `hashToKey(hash)`: the read/GC paths (which ignore
-the column) and the verify/repair path (which honors it) would then disagree. Full
-adoption of `storage_key` as the primary read locator is a separate, pre-existing
-tech-debt item — see `docs/KNOWN_ISSUES.md` (ISSUE-BLOCK-STORAGE-KEY-READS-01) and
-`docs/TECHNICAL-DEBT.md`.
+**Caveat 2 (updated by P10 PR-2 — derived-key invariant):**
+API reads and `EnsureReusableBlockPresent` derive the deterministic org-scoped key
+through `BlockStore`. Reuse accepts `storage_key` only when empty or exactly equal to
+that derivation and otherwise fails closed before S3 access. Arbitrary relocated keys
+remain unsupported, and GC must adopt the same derivation in P10 PR-3. See
+`docs/KNOWN_ISSUES.md` (ISSUE-BLOCK-STORAGE-KEY-READS-01).
 
 **Caveat 3 (minor — new failure surface on reuse):** because the `Reusable` path now
 issues a canonical-verify HEAD, a transient S3 error on that HEAD now fails the

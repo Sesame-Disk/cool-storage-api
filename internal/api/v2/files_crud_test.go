@@ -178,17 +178,18 @@ func TestDeleteDirectory_InvalidPath(t *testing.T) {
 	}
 }
 
-func TestResolveLibraryBlockStoreFallsBackToLegacyBlockStore(t *testing.T) {
+func TestResolveLibraryBlockStoreBuildsOrgScopedS3Fallback(t *testing.T) {
+	const orgID = "00000000-0000-0000-0000-000000000001"
 	h := &FileHandler{
-		config:     &config.Config{Storage: config.StorageConfig{DefaultClass: "hot-minio-local"}},
-		blockStore: storage.NewBlockStore(nil, "blocks/"),
+		config:  &config.Config{Storage: config.StorageConfig{DefaultClass: "hot-minio-local"}},
+		storage: &storage.S3Store{},
 	}
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v2.1/repos/repo-id/file/", nil)
 	c.Request.Host = "localhost"
 
-	blockStore, storageClass, err := h.resolveLibraryBlockStore(c, "org-id", "repo-id")
+	blockStore, storageClass, err := h.resolveLibraryBlockStore(c, orgID, "repo-id")
 	if err != nil {
 		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
 	}
@@ -197,6 +198,9 @@ func TestResolveLibraryBlockStoreFallsBackToLegacyBlockStore(t *testing.T) {
 	}
 	if storageClass != "hot-minio-local" {
 		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-minio-local")
+	}
+	if got, want := blockStore.StorageKeyForHash("abcd1234"), "blocks/"+orgID+"/ab/cd/abcd1234"; got != want {
+		t.Fatalf("StorageKeyForHash() = %q, want %q", got, want)
 	}
 }
 
@@ -214,7 +218,7 @@ func TestResolveLibraryBlockStoreUsesStorageManager(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v2.1/repos/repo-id/file/", nil)
 	c.Request.Host = "files.example.com"
 
-	blockStore, storageClass, err := h.resolveLibraryBlockStore(c, "org-id", "repo-id")
+	blockStore, storageClass, err := h.resolveLibraryBlockStore(c, "00000000-0000-0000-0000-000000000001", "repo-id")
 	if err != nil {
 		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
 	}

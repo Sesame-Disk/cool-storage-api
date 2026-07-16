@@ -137,17 +137,16 @@ func TestCheckBlocks_NilBlockStore(t *testing.T) {
 	}
 }
 
-// Direct block reads by bare hash are deliberately NOT part of the API: S3
-// block keys are global content-addressed objects with no org scoping, and a
-// bare-hash read cannot be authorized against a library permission, so the
-// endpoint was a cross-tenant (and intra-org) content/existence oracle. Web
+// Direct block reads by bare hash are deliberately NOT part of the API: even
+// with org-scoped physical keys, a bare-hash read cannot be authorized against
+// a library permission, so the endpoint is an intra-org content/existence oracle. Web
 // downloads go through file paths; desktop sync uses the repo-scoped,
 // permission-checked seafhttp block route. This test locks the removal so the
 // routes cannot quietly come back without a repo-scoped design.
 func TestDirectBlockReadRoutesAreNotRegistered(t *testing.T) {
 	r := gin.New()
 	rg := r.Group("/api/v2")
-	RegisterBlockRoutes(rg, nil, nil, nil, nil, nil)
+	RegisterBlockRoutes(rg, nil, nil, nil, nil, nil, nil)
 
 	validHash := strings.Repeat("a", 64)
 	for _, method := range []string{"GET", "HEAD"} {
@@ -537,6 +536,7 @@ func TestGetBlockStoreDoesNotFallBackToLegacyWhenStorageManagerFails(t *testing.
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/api/v2/blocks/"+strings.Repeat("a", 64), nil)
 	c.Request.Host = "files.example.com"
+	c.Set("org_id", "00000000-0000-0000-0000-000000000001")
 
 	blockStore, storageClass := h.getBlockStore(c)
 	if blockStore != nil {
@@ -565,6 +565,7 @@ func TestGetBlockStoreUsesForwardedHostForRegionRouting(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodGet, "/api/v2/blocks/"+strings.Repeat("a", 64), nil)
 	c.Request.Host = "sesamefs:8080"
 	c.Request.Header.Set("X-Forwarded-Host", "eu.files.example.com")
+	c.Set("org_id", "00000000-0000-0000-0000-000000000001")
 
 	blockStore, storageClass := h.getBlockStore(c)
 	if blockStore == nil {
@@ -693,7 +694,7 @@ func TestUploadBlockResponse_JSONFormat(t *testing.T) {
 func TestRegisterBlockRoutes(t *testing.T) {
 	r := gin.New()
 	rg := r.Group("/api/v2")
-	RegisterBlockRoutes(rg, nil, nil, nil, nil, nil)
+	RegisterBlockRoutes(rg, nil, nil, nil, nil, nil, nil)
 
 	routes := []struct {
 		method string

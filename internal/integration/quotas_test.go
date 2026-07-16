@@ -831,8 +831,8 @@ func releaseSyncStagedBlockForTest(t *testing.T, repoID, blockID string) {
 	t.Helper()
 
 	// Built outside t.Cleanup so an unreachable object store degrades to a logged skip.
-	blockStore := blockStoreForCleanupOrNil(t)
 	orgID := resolveOrgID(t, repoID)
+	blockStore := blockStoreForCleanupOrNil(t, orgID)
 	// Mirrors internal/api.syncBlockUploadOperationID, which is unexported.
 	referrer := dbpkg.BlockReferrerForUpload("sync:" + repoID + ":" + blockID)
 

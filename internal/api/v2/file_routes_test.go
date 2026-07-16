@@ -8,16 +8,16 @@ import (
 )
 
 func TestNewRouteFileHandlerUsesStorageRoutingDependencies(t *testing.T) {
-	blockStore := storage.NewBlockStore(nil, "blocks/")
+	s3Store := &storage.S3Store{}
 	storageManager := storage.NewManager()
 
-	h := newRouteFileHandler(nil, &config.Config{}, nil, blockStore, storageManager, nil, "https://files.example.com")
+	h := newRouteFileHandler(nil, &config.Config{}, s3Store, nil, storageManager, nil, "https://files.example.com")
 
 	if h == nil {
 		t.Fatal("newRouteFileHandler returned nil")
 	}
-	if h.blockStore != blockStore {
-		t.Fatal("newRouteFileHandler did not preserve blockStore")
+	if h.storage != s3Store {
+		t.Fatal("newRouteFileHandler did not preserve raw S3 fallback")
 	}
 	if h.storageManager != storageManager {
 		t.Fatal("newRouteFileHandler did not preserve storageManager")

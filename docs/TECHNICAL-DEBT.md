@@ -434,13 +434,10 @@ larger hotpath optimization, not part of the namespace-safety change.
 
 ---
 
-- Only `EnsureReusableBlockPresent` (P-2) honors `storage_key`. Harmless today
-  because `storage_key` is either empty (4 of 5 upload paths write `""`) or equal to
-  the hash-derived key (OnlyOffice), so the hash-derived key is always correct. The
-  risk surfaces only if a future write persists a `storage_key` that differs from
-  `hashToKey(hash)` — reads/GC would then target a different object than verify/
-  repair. Fix: make `storage_key` the primary locator for reads + deletes, hash-
-  derived key as fallback. See KNOWN_ISSUES ISSUE-BLOCK-STORAGE-KEY-READS-01.
+- P10 PR-2 made `EnsureReusableBlockPresent` derive the org-scoped key and reject
+  any non-empty mismatched `storage_key` before S3 access. Arbitrary relocated keys
+  remain unsupported; GC must adopt the same org-scoped derivation in PR-3. See
+  KNOWN_ISSUES ISSUE-BLOCK-STORAGE-KEY-READS-01.
 - Pending-owner and publish-repair sweepers need explicit per-run limits and
   metrics for skipped, repaired, released, and failed rows.
 - The upload-finalize `gc_leases` role should include `orgID` for extra isolation.

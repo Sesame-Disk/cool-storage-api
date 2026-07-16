@@ -66,10 +66,14 @@ func resolveLibraryBlockStoreForRequest(c *gin.Context, database *db.DB, cfg *co
 
 	preferredClass := resolvePreferredLibraryStorageClassForRequest(c, cfg, storageManager, libraryClass, defaultClass)
 	if storageManager != nil {
-		return storageManager.GetHealthyBlockStore(preferredClass)
+		return storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
 	}
 	if s3Store != nil {
-		return storage.NewBlockStore(s3Store, "blocks/"), preferredClass, nil
+		bs, err := storage.NewOrgBlockStore(s3Store, "blocks/", orgID)
+		if err != nil {
+			return nil, preferredClass, err
+		}
+		return bs, preferredClass, nil
 	}
 
 	return nil, preferredClass, fmt.Errorf("block storage not available")

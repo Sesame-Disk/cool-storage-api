@@ -333,17 +333,21 @@ func (h *FileHandler) resolveLibraryBlockStore(c *gin.Context, orgID, repoID str
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	if h.storageManager != nil {
 		preferredClass := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
-		return h.storageManager.GetHealthyBlockStore(preferredClass)
+		return h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
 	}
 
 	if libraryClass == "" && h.config != nil {
 		libraryClass = h.config.Storage.DefaultClass
 	}
-	if h.blockStore != nil {
-		return h.blockStore, libraryClass, nil
-	}
+	// Fallback (no storage manager): build an org-scoped store from the raw S3
+	// store. The legacy org-less singleton is never served — that would recreate
+	// the cross-org block-delete hazard (P10).
 	if h.storage != nil {
-		return storage.NewBlockStore(h.storage, "blocks/"), libraryClass, nil
+		bs, err := storage.NewOrgBlockStore(h.storage, "blocks/", orgID)
+		if err != nil {
+			return nil, libraryClass, err
+		}
+		return bs, libraryClass, nil
 	}
 
 	return nil, libraryClass, fmt.Errorf("block storage not available")
@@ -1335,7 +1339,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				if probeErr == nil {
 					switch probe.Decision {
 					case db.BlockReuseReusable:
-						if _, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass); ensureErr != nil {
+						if _, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass, orgID); ensureErr != nil {
 							return fmt.Errorf("failed to verify reusable template block: %w", ensureErr)
 						}
 						templateBlockStored = true
@@ -2053,6 +2057,7 @@ func (h *FileHandler) resolveModifierIdentity(orgID, entryModifier, blameUID str
 //   - typical directories (few distinct uploaders): negligible, a handful of queries.
 //   - pathological directory (thousands of files each by a different user): up to one
 //     query per distinct user, issued serially on a hot listing path -> latency regression.
+//
 // If large multi-uploader directories become common, batch-resolve the distinct modifiers
 // (single IN/multi-key fetch) or paginate the listing before optimizing elsewhere.
 func (h *FileHandler) newPersistedModifierResolver(orgID string) func(entryModifier string) (email, name string) {
@@ -3433,7 +3438,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		if probeErr == nil {
 			switch probe.Decision {
 			case db.BlockReuseReusable:
-				_, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass)
+				_, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID)
 				return ensureErr
 			case db.BlockReuseNeedsPut:
 				if _, putErr := putUploadedBlockAutoDirectFn(c.Request.Context(), blockStore, sha256ID, storedContent); putErr != nil {

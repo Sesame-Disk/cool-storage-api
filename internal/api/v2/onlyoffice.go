@@ -178,16 +178,18 @@ func (h *OnlyOfficeHandler) resolveLibraryBlockStore(orgID, repoID string) (*sto
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	if h.storageManager != nil {
 		preferredClass := h.storageManager.ResolveStorageClass("", libraryClass, "hot")
-		return h.storageManager.GetHealthyBlockStore(preferredClass)
+		return h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
 	}
 	if libraryClass == "" && h.config != nil {
 		libraryClass = h.config.Storage.DefaultClass
 	}
-	if h.blockStore != nil {
-		return h.blockStore, libraryClass, nil
-	}
+	// Fallback: org-scoped store from the raw S3 store; never the org-less singleton.
 	if h.storage != nil {
-		return storage.NewBlockStore(h.storage, "blocks/"), libraryClass, nil
+		bs, err := storage.NewOrgBlockStore(h.storage, "blocks/", orgID)
+		if err != nil {
+			return nil, libraryClass, err
+		}
+		return bs, libraryClass, nil
 	}
 	return nil, libraryClass, fmt.Errorf("block storage not available")
 }
@@ -1215,7 +1217,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 			switch probe.Decision {
 			case db.BlockReuseReusable:
 				var ensureErr error
-				storageKey, ensureErr = EnsureReusableBlockPresent(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass)
+				storageKey, ensureErr = EnsureReusableBlockPresent(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID)
 				return ensureErr
 			case db.BlockReuseNeedsPut:
 				var putErr error

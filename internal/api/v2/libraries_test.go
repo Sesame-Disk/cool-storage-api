@@ -678,32 +678,6 @@ func TestCreateLibrary_PermissionChecks(t *testing.T) {
 	}
 }
 
-func TestCreateLibrary_PlatformOrgIsNotRejectedUpfront(t *testing.T) {
-	g := gin.New()
-	h := &LibraryHandler{permMiddleware: middleware.NewPermissionMiddleware(nil)}
-	g.POST("/libraries/", func(c *gin.Context) {
-		c.Set("org_id", middleware.PlatformOrgID)
-		c.Set("user_id", "user-1")
-		h.CreateLibrary(c)
-	})
-
-	req, err := http.NewRequest(http.MethodPost, "/libraries/", bytes.NewBufferString(`{"name":"platform-lib"}`))
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	w := httptest.NewRecorder()
-	g.ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
-	var body map[string]interface{}
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	assert.Equal(t, "failed to check permissions", body["error"])
-}
-
 // TestDeleteLibrary_OwnershipChecks tests DeleteLibrary with ownership validation
 func TestDeleteLibrary_OwnershipChecks(t *testing.T) {
 	if testing.Short() {

@@ -1457,10 +1457,15 @@ func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID strin
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	if h.storageManager != nil {
 		preferredClass := h.storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
-		return h.storageManager.GetHealthyBlockStore(preferredClass)
+		return h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
 	}
+	// Fallback: org-scoped store from the raw S3 store; never the org-less singleton.
 	if h.storage != nil {
-		return storage.NewBlockStore(h.storage, "blocks/"), libraryClass, nil
+		bs, err := storage.NewOrgBlockStore(h.storage, "blocks/", orgID)
+		if err != nil {
+			return nil, libraryClass, err
+		}
+		return bs, libraryClass, nil
 	}
 
 	return nil, libraryClass, fmt.Errorf("block storage not available")
@@ -2147,49 +2152,39 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// Store using PutAuto (automatically uses multipart for large files)
 	ctx := context.Background()
 	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
-	var storeUploadedBlock func() error
 	if err != nil {
-		log.Printf("[HandleUpload] Failed to get block store: %v, falling back to S3", err)
-		objectStore, objectStorageClass, resolveErr := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
-		if resolveErr != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-			return
-		}
-		actualStorageClass = objectStorageClass
-		storeUploadedBlock = func() error {
-			_, putErr := objectStore.Put(c.Request.Context(), storageKey, newBytesReader(storedContent), int64(len(storedContent)))
-			return putErr
-		}
-	} else {
-		storeUploadedBlock = func() error {
-			probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
-			if probeErr == nil {
-				switch probe.Decision {
-				case db.BlockReuseReusable:
-					if _, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass); ensureErr != nil {
-						return ensureErr
-					}
-					log.Printf("[HandleUpload] Reused canonical block %s (SHA-256: %s) after physical verification", fileID[:16], sha256ID[:16])
-					return nil
-				case db.BlockReuseNeedsPut:
-					_, putErr := putUploadedBlockAutoDirectForUploadFn(ctx, blockStore, sha256ID, storedContent)
-					if putErr == nil {
-						log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via direct PUT", fileID[:16], sha256ID[:16])
-					}
-					return putErr
-				case db.BlockReuseBlockedByGC:
-					return v2.ErrBlockDeleteInProgress
+		log.Printf("[HandleUpload] Failed to get org-scoped block store: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+	storeUploadedBlock := func() error {
+		probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
+		if probeErr == nil {
+			switch probe.Decision {
+			case db.BlockReuseReusable:
+				if _, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID); ensureErr != nil {
+					return ensureErr
 				}
-			} else {
-				log.Printf("[HandleUpload] Block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v", sha256ID[:16], probeErr)
+				log.Printf("[HandleUpload] Reused canonical block %s (SHA-256: %s) after physical verification", fileID[:16], sha256ID[:16])
+				return nil
+			case db.BlockReuseNeedsPut:
+				_, putErr := putUploadedBlockAutoDirectForUploadFn(ctx, blockStore, sha256ID, storedContent)
+				if putErr == nil {
+					log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via direct PUT", fileID[:16], sha256ID[:16])
+				}
+				return putErr
+			case db.BlockReuseBlockedByGC:
+				return v2.ErrBlockDeleteInProgress
 			}
-
-			_, putErr := putUploadedBlockAutoFn(ctx, blockStore, sha256ID, storedContent)
-			if putErr == nil {
-				log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via legacy Exists+PUT fallback", fileID[:16], sha256ID[:16])
-			}
-			return putErr
+		} else {
+			log.Printf("[HandleUpload] Block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v", sha256ID[:16], probeErr)
 		}
+
+		_, putErr := putUploadedBlockAutoFn(ctx, blockStore, sha256ID, storedContent)
+		if putErr == nil {
+			log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via legacy Exists+PUT fallback", fileID[:16], sha256ID[:16])
+		}
+		return putErr
 	}
 
 	// Register block metadata + a provisional reference (kept alive by TTL until
@@ -2665,7 +2660,7 @@ readLoop:
 					if probeErr == nil {
 						switch probe.Decision {
 						case db.BlockReuseReusable:
-							_, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass)
+							_, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID)
 							return ensureErr
 						case db.BlockReuseNeedsPut:
 							_, putErr := putUploadedBlockAutoDirectForUploadFn(egCtx, blockStore, sha256ID, storedBlock)

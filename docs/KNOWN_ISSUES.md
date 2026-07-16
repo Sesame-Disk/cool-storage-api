@@ -52,15 +52,17 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on the five server-side upload paths. NOT global: legacy `BlockStore` Exists+PUT methods remain for fallback + unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
-| **Read Paths Ignore `storage_key`** | 🟡 Pending | All block reads derive the S3 key from the content hash (`hashToKey`) and never consult the canonical `storage_key` column; only the new reuse verify/repair honors it. Harmless today (`storage_key` is empty or equal to the hash-derived key) but blocks any non-hash-derived key layout. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
+| **Read Paths Ignore `storage_key`** | 🟡 Closing with P10 | Reads and reuse/repair derive the deterministic org-scoped key; reuse fails closed if a non-empty `storage_key` differs. The column is not an arbitrary locator, so non-derived layouts remain unsupported. GC adopts the same derivation in P10 PR-3. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
 ### ⛔ GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 blocker)
 
-Follow-up debt from the PR #123 audit. **Verdict (2026-07-16): ⛔ P10 is an open, proven live-content
-deletion bug and a deploy blocker** — GC's org-scoped liveness check vs the content-hash-shared S3
-object. The previous "no open known issue can delete live content" verdict is **retracted**: it only
-ever reasoned about liveness within a single org. Within one org the delete path is still sound. P6a/P6b safety guards and P1/P1b/P2 durable
+Follow-up debt from the PR #123 audit. **Verdict (2026-07-16): ⛔ P10 remains a deploy blocker until
+the org-scoped-key series is complete.** The original pre-PR-2 bug was GC's org-scoped liveness check
+versus a content-hash-shared S3 object. PR-2 has moved API reads/writes to org-scoped keys, while GC
+still uses the legacy global locator; this intermediate schema mismatch must not be deployed with GC
+enabled. The previous "no open known issue can delete live content" verdict is **retracted**: it only
+ever reasoned about liveness within a single org. Within one key layout the delete path is still sound. P6a/P6b safety guards and P1/P1b/P2 durable
 purge + cascade are **fixed** on `main` (PR #129). The planned **greenfield prod deploy** starts
 from an empty cluster — reconcile/backfill (8A–8C) and pre-fix `gc_pending_items` orphans are
 **not required**. Note this depends on a **recreated keyspace + empty/new buckets, never written
@@ -995,34 +997,33 @@ lives. Every read path derives the S3 key purely from the content hash instead:
 `hashToKey(hash)` and never consult `storage_key`. GC's `DeleteBlock` deletes the
 hash-derived key too.
 
-As of `perf/p2-cassandra-first-hot-reuse`, `EnsureReusableBlockPresent`
-(`internal/api/v2/upload_reuse.go`) is the **first and only** code path that honors
-`storage_key` as the canonical locator (falling back to the hash-derived key only
-when it is empty).
+As of P10 PR-2, `EnsureReusableBlockPresent` (`internal/api/v2/upload_reuse.go`)
+always recomputes the deterministic org-scoped key. A non-empty `storage_key` is
+accepted only when it exactly matches that derived key; otherwise reuse fails closed
+before any S3 HEAD or repair PUT.
 
 #### Why it is not a live bug (yet)
 
-`storage_key` is **either empty or equal to `hashToKey(hash)`** today: 4 of the 5
+`storage_key` is **either empty or equal to the org-scoped `hashToKey(hash)`** today: 4 of the 5
 upload paths register the block with `storage_key=""` (`seafhttp.go` ×2, `sync.go`,
 `files.go`/`UploadFile`); only OnlyOffice persists a non-empty value, and that value
 is the hash-derived key. So `hashToKey(hash)` is always a correct locator, and
-`EnsureReusableBlockPresent` falls back to `StorageKeyForHash(blockID)` whenever the
-column is empty. Reads, GC, and the verify/repair path therefore resolve to the same
-object in every case that exists today.
+`EnsureReusableBlockPresent` always uses `StorageKeyForHash(blockID)` and validates a
+non-empty column against it. API reads and verify/repair therefore resolve to the same
+object; GC joins that contract in P10 PR-3.
 
 #### The latent risk
 
 The system cannot safely relocate a block to a key that *differs* from
 `hashToKey(hash)` (e.g. per-tenant prefixes, re-sharding, migration to a different
-layout). The moment any write persists such a `storage_key`, the verify/repair path
-(respects `storage_key`) and the read + GC paths (ignore it) would target different
-objects — reads would 404 and GC could delete the wrong (or no) object.
+layout). Any future write that persists such a `storage_key` now fails reuse closed
+instead of silently diverging. Supporting relocation to arbitrary keys would require
+a separate, explicit locator migration across reads, writes and GC.
 
 #### Proposed Fix
 
-Make `storage_key` the primary locator for reads and deletes, with `hashToKey(hash)`
-as the fallback only when the column is empty (mirroring `EnsureReusableBlockPresent`).
-This is a pre-existing, cross-cutting change; track it independently of P-2.
+Complete P10 PR-3 so GC derives the same org-scoped key as API reads/writes. Keep
+`storage_key` as an invariant check, not an arbitrary caller-controlled locator.
 
 **Resolution path (via P10):** the org-scoped-key fix resolves this **by construction** rather than
 by making `storage_key` authoritative. Once the key is `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`, the org
@@ -1031,7 +1032,7 @@ is baked into the `BlockStore` at construction (the method signature stays
 deterministic, and every path (read, GC delete, reuse/verify) recomputes the same locator — no
 divergence is possible, and no extra DB read is added on the
 download hot path. `storage_key` may only be empty or **exactly** the derived key; `EnsureReusableBlockPresent`
-always recomputes and **fails closed** (with a metric/log) if a stored `storage_key` differs from the
+always recomputes and **fails closed** if a stored `storage_key` differs from the
 derived one, and no block method accepts an arbitrary caller-supplied S3 key. Closed alongside P10.
 
 #### Related
@@ -4341,22 +4342,19 @@ P6 issue above.
 
 ---
 
-### ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01: GC deletes an S3 object still referenced by another org
+### ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01: complete org-scoped physical block isolation
 
-**Status**: ⛔ **OPEN — BLOCKER (found 2026-07-16, reproduced end-to-end)**
-**Severity**: **High — live-content deletion.** Not under-reclamation: committed data becomes unreadable.
-**Affected**: `internal/gc` block deletion, `internal/storage` block addressing. Any deploy with >1 org
-sharing a storage class — i.e. **greenfield from day one**.
+**Status**: ⛔ **OPEN — BLOCKER; PR-2 API funnels complete, PR-3 GC pending**
+**Severity**: **High — pre-PR-2 live-content deletion; current API/GC layout mismatch.**
+**Affected**: `internal/gc` block deletion and orphan recovery. Do not deploy the intermediate PR-2
+state with GC enabled.
 
 #### Problem
 
-Physical ownership and liveness are keyed differently:
+The reproduced pre-PR-2 root cause was:
 
-- **S3 objects are global per storage class.** `hashToKey` ([blocks.go:274](../internal/storage/blocks.go#L274))
-  takes **only** the hash — `blocks/<h0:2>/<h2:4>/<hash>` — and every production `NewBlockStore` passes
-  the literal `"blocks/"` prefix (`api/server.go`, `api/seafhttp.go`, `api/v2/files.go`,
-  `api/v2/onlyoffice.go`, `api/v2/storage_resolution.go`, `storage/storage.go`). There is no org in the
-  key, so **every org storing those bytes in that class shares one object**.
+- **S3 objects were global per storage class.** API funnels used
+  `blocks/<h0:2>/<h2:4>/<hash>`, so every org storing those bytes in one class shared an object.
 - **Liveness is per-org.** `blocks` and `block_references` are partitioned by `org_id`.
 
 `processBlock` mixes the two: it decides with `BlockHasReferences(item.OrgID, item.ItemID)`
@@ -4366,7 +4364,9 @@ deletes the **global** key ([worker.go:583](../internal/gc/worker.go#L583) →
 [blocks.go:251](../internal/storage/blocks.go#L251)). "No refs **in this org**" is treated as "nobody
 needs these bytes".
 
-The claim+verify fence does not help: it re-checks the same org-scoped partition.
+The claim+verify fence did not help: it re-checked the same org-scoped partition. PR-2 now writes and
+reads `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`; PR-3 must move GC delete and orphan recovery to that same
+locator and remove the legacy global APIs.
 
 #### Confirmation
 
@@ -4435,8 +4435,14 @@ The fix ships as a small, sequential series of branches (each its own PR):
   ([internal/storage/storage.go](../internal/storage/storage.go)). Legacy `NewBlockStore`/
   `GetBlockStore` kept **temporarily** (deprecated) so production is unchanged until callers migrate.
   Unit tests cover fail-closed validation, org-scoped keys, per-org cache separation, and pin the
-  legacy key (regression). ⚠️ **No production path is org-scoped yet** — that lands in PR-2/PR-3.
-- ⏳ **PR-2 — flip API funnels** (write/read/reuse/verify/fallback) to the org-scoped store.
+  legacy key (regression). This was plumbing only; production activation starts in PR-2.
+- ✅ **PR-2 — API funnels.** Write/read/reuse/verify/fallback paths in v2 files/blocks/OnlyOffice,
+  seafhttp, sync and shared file/share-link resolution now construct or resolve an org-scoped store.
+  Reuse always derives the canonical key from that store and fails closed if a persisted `storage_key`
+  differs. The process-wide org-less API singleton is no longer constructed. Integration coverage pins
+  same-org dedup across libraries and distinct physical keys plus byte-for-byte reads across the default
+  and platform orgs. ⚠️ **Do not deploy this intermediate state with GC enabled:** GC remains global-keyed
+  until PR-3 and cannot reclaim the new objects safely/correctly.
 - ⏳ **PR-3 — GC own branch:** delete + orphan recovery org-scoped, **remove** the legacy global
   APIs (compiler net), land the cross-org regression test above.
 - ⏳ **PR-4 — coverage + doc closure** (multiregion/buckets, per-org reclamation; mark P10 resolved).

@@ -196,11 +196,12 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 		slog.Info("Using in-memory token store (not distributed)")
 	}
 
-	// Initialize block store for content-addressable storage
+	// The legacy org-less singleton BlockStore is intentionally NOT built anymore:
+	// its global key layout (blocks/<hash>) let one org's GC delete another org's
+	// object (P10, ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01). Block stores are now resolved
+	// per request, org-scoped, from the raw S3 store (s.storage) via the funnels.
+	// The field stays until the constructor signatures are cleaned up in the GC branch.
 	var blockStore *storage.BlockStore
-	if s3Store != nil {
-		blockStore = storage.NewBlockStore(s3Store, "blocks/")
-	}
 
 	// Initialize permission middleware
 	permMiddleware := middleware.NewPermissionMiddleware(database)
