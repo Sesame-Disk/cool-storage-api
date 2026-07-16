@@ -55,7 +55,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Read Paths Ignore `storage_key`** | 🟡 Pending | All block reads derive the S3 key from the content hash (`hashToKey`) and never consult the canonical `storage_key` column; only the new reuse verify/repair honors it. Harmless today (`storage_key` is empty or equal to the hash-derived key) but blocks any non-hash-derived key layout. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
-### 🟢 GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-15)
+### ⛔ GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 blocker)
 
 Follow-up debt from the PR #123 audit. **Verdict (2026-07-16): ⛔ P10 is an open, proven live-content
 deletion bug and a deploy blocker** — GC's org-scoped liveness check vs the content-hash-shared S3
@@ -2808,7 +2808,7 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 
 ### Garbage Collection — IMPLEMENTED, SAFE FOR GREENFIELD PROD; OPEN RECLAMATION/OPS DEBT
 **Status**: Core engine implemented (2026-01-30), major overhaul (2026-03-17);
-2026-07-10 audit found P1–P9 follow-ups. Refreshed 2026-07-15: the safety-classification gaps
+2026-07-10 audit found P1–P10 follow-ups. Refreshed 2026-07-16: the safety-classification gaps
 (P6a/P6b) and the normal permanent-delete path (P1/P1b/P2, PR #129) are **closed** on `main`.
 Remaining debt is reclamation edge cases (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and
 the Medium Phase 9 global-scan scale debt (P8). **P10 (2026-07-16) IS live-data deletion: cross-org
@@ -4357,15 +4357,29 @@ needs these bytes".
 
 The claim+verify fence does not help: it re-checks the same org-scoped partition.
 
-#### Reproduction (done, on a clean single-node docker stack)
+#### Confirmation
 
-1. Org A uploads a file through the API → `blocks[(A,hash)]`, an `fs:` ref, one S3 object.
-2. Seed org B with `blocks[(B,hash)]` + an `fs:` ref for the **same hash** — the state B's own upload of
-   identical bytes produces. Verified precondition: **2 `blocks` rows, 1 S3 object**.
-3. Delete org A's library through the API; let GC drain.
-4. At ~210s: `objetoS3=0`, `blocks_rows=1`, **org B's `fs:` ref still live**.
+**Real two-org E2E (operator, 2026-07-16) — the definitive evidence.** ~2 GB of **identical** files
+uploaded through the API into **two** orgs. MinIO showed **2 GB**, not 4 — the upload path deduplicates
+globally by content hash, so both orgs' metadata pointed at one physical copy. Deleting **all** files
+in one org and draining GC left the MinIO volume **empty**, and the other org's files now 404:
 
-Org B keeps intact metadata pointing at content that no longer exists. Its file is unreadable.
+```
+[ServeRawFile] Failed to get block 0/1: ... GetObject ... StatusCode: 404 ... NoSuchKey
+GET /repo/3acb1e2b-…/raw/01.pdf status=200   (headers already sent, body truncated)
+```
+
+This is unambiguous live-content deletion from real uploads, and it also shows the 404 lands
+**mid-response** (status line already 200), so the download fails with a corrupt body, not a clean error.
+
+**Seeded repro (single-node docker stack) — the mechanism in isolation.** For a tighter loop, org A
+uploaded through the API and org B was **seeded to the equivalent post-upload state** (`blocks[(B,hash)]`
++ an `fs:` ref for the same hash — exactly what B's own upload produces; org B did **not** re-run the
+upload). Precondition verified: **2 `blocks` rows, 1 S3 object**. Deleting org A's library and draining
+GC left, at ~210s, `objetoS3=0`, `blocks_rows=1`, **org B's `fs:` ref still live** — metadata intact,
+content gone. (Because org B was seeded rather than re-uploaded, this is a "second org in the equivalent
+state" repro; the real E2E above is the full-upload proof. The committed regression test below must use
+two real uploads.)
 
 Ordinary multi-tenancy triggers this: identical READMEs, empty files, shared templates, any
 re-uploaded document.
@@ -4511,4 +4525,4 @@ apply. No reconcile/backfill pass is required before launch.
 - [API-REFERENCE.md](API-REFERENCE.md) - API endpoint documentation
 - [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md) - Architectural issues
 - [CURRENT_WORK.md](../CURRENT_WORK.md) - Active priorities
-- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (corrected verdict, P1–P9, invariants, branch roadmap; refreshed 2026-07-15 for greenfield prod)
+- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (P1–P10, invariants, branch roadmap; refreshed 2026-07-16 — P10 cross-org deletion is an open deploy blocker)
