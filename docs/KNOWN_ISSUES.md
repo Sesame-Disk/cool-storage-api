@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🟢 Safe for prod (greenfield) | Normal delete path exercised end-to-end (~50 GB manual dev-cluster run, zero content residue — operator observation, not an automated test). P6a/P6b and P1/P2 closed on `main` (PR #129). Remaining GC debt is storage retention in edge cases (P4/P7), observability (P5), test hygiene (1A–1C), and scale (P8) — not live-data deletion. Reconcile/backfill not required for empty prod deploy. See GC audit section below. |
+| Garbage Collection | 🟢 Safe for prod (greenfield) | Normal delete path exercised end-to-end (~50 GB manual dev-cluster run, zero content residue — operator observation, not an automated test). P6a/P6b and P1/P2 closed on `main` (PR #129). Remaining GC debt is storage retention in edge cases (P4/P7), observability (P5), test hygiene (1G; 1A–1C done), and scale (P8) — not live-data deletion. Reconcile/backfill not required for empty prod deploy. See GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -73,7 +73,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 | **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Low — transient for new deletes | `hardDeleteLibraryRowsFn` does not synchronously call `AddDeleteLibraryPolicyQuery`, but the durable cascade's `HardDeleteLibrary` clears both policy rows. At most a short stale window for new deletes; branch 2 is optional polish. Not a greenfield-prod blocker. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
 | **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. Storage retention, not incorrect deletion. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
-| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene | Shared keyspace/bucket, fake permanent `pub:foreign`, incomplete fixture teardown, explicit global `/admin/gc/run`, and one global `ProcessOnce(storage=nil)` create cross-test drift. Dev-cluster only; does not affect prod safety. See ISSUE-GC-TEST-RESIDUE-01 below (branches 1A–1C). |
+| **Integration Suite Leaves DB + MinIO Residue** | 🟡 Test hygiene — **1A/1B/1C fixed; 1G open** | The global `ProcessOnce(storage=nil)` fan-out (the only one that deleted other tests' DB rows while orphaning their S3 objects), the permanent `pub:foreign` ref, and the upload fixtures' stranded blocks are **fixed** and guarded. `-run TestWebBlockUpload` now drains to a zero residue delta. A **full** suite run still ends at **2** stranded blocks (1G): one `fs:`-pinned block whose library is gone from both indexes (eternal), one `up:sync:` provisional (self-heals in 2d). Shared keyspace/bucket and the global `/admin/gc/run` triggers remain as designed. Dev-cluster only; does not affect prod safety. See ISSUE-GC-TEST-RESIDUE-01 below. |
 | **Existence Checks Fail Open (transient errors, P6a)** | ✅ Fixed (2026-07-10) | `LibraryExists`/`GroupExists` now propagate non-`ErrNotFound` errors and scanner Phases 3/4/9 fail closed. Phase 9 scans `shares_by_group` directly and uses each projection row's `OrgID`, with unit and real-Cassandra regression coverage. See ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01 below. |
 | **Worker Canonical Revalidation of Orphan Work (P6b)** | ✅ Fixed (2026-07-10) | Durable `canonical_absent` work is point-read against `libraries[(org_id, library_id)]` under the existing library lock; presence/read/fence/unknown-mode paths fail closed. Retry/DLQ and legacy compatibility are covered. See ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01 below. |
 | **Cascade Deletes Counter Before Hard Delete** | ✅ Fixed (2026-07-11) | `cascadeDeleteLibrary` now hard-deletes the canonical row before removing the per-library storage counter, closing a crash+restore window that could reactivate an under-counted library. The reordering (the real fix) covers both cascade callers; the counter auto-reclaim is wired only into `processLibraryCascade`. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01 below. |
@@ -2808,7 +2808,7 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 **Status**: Core engine implemented (2026-01-30), major overhaul (2026-03-17);
 2026-07-10 audit found P1–P9 follow-ups. Refreshed 2026-07-15: the safety-classification gaps
 (P6a/P6b) and the normal permanent-delete path (P1/P1b/P2, PR #129) are **closed** on `main`.
-Remaining debt is reclamation edge cases (P4/P7), observability (P5), test hygiene (1A–1C), and
+Remaining debt is reclamation edge cases (P4/P7), observability (P5), test hygiene (1G; 1A–1C done), and
 the Medium Phase 9 global-scan scale debt (P8) — not live-data deletion.
 **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
 **Tests**: 55 Go unit tests + 21 bash integration tests
@@ -4152,9 +4152,77 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 #### Fix Direction (branches 1A/1B/1C)
 
 - **Branch 1A**: fix `TestWebBlockUploadForeignPubRefNotPermanent` — capture the referrer in a variable, add a `t.Cleanup` that deletes **all** rows/objects identified by the fixture's exact org/library/session/operation/block IDs (ref + block + mapping + S3 object **+ the provisional expiry projection** created by the real upload session), or insert the fake `pub:` with a TTL and still clean up; assert the fake ref is gone. Clean only exact-ID artifacts — never broad cleanup. Preserve the test's purpose (a foreign `pub:` must not count as a permanent ref).
-- **Branch 1B**: inventory the E2E upload fixtures that leave `blocks` rows + S3 objects and add fixture-scoped teardown; also repair the `library_projection_regression_test.go` failure-restore so it does not re-insert an unstamped marker. Measure **no-net-growth** vs the pre-suite baseline. Do not run a global GC over the shared keyspace (invariants #5/#6).
-- **Branch 1C**: replace the direct global `ProcessOnce(storage=nil)` with `ProcessOrgOnce`;
-  inventory admin GC triggers and isolate them or measure their exact baseline delta.
+- **Branch 1B** ✅ **DONE** *(root-caused and closed 2026-07-15)*
+
+  **Why upload fixtures leaked, precisely.** `cleanupBlockUploadSessionForTest` deleted the
+  session's `up:` reference with **raw CQL**. That drops the block's last referrer without going
+  through the production release path, so nothing calls `EnsureBlockGCCandidate` — and
+  `scanOrphanedBlocks` only walks candidates that already exist. The block was therefore
+  **zero-ref and undiscoverable**: the only thing that ever rescued it was Phase 0 firing on the
+  provisional expiry projection, **two days later** (the same shape as P4 for `pub:`). Every suite
+  run left its uploaded blocks + S3 objects parked for 48h, which is a large part of the drift the
+  audit had to untangle. Measured on a clean single-node docker stack (`configs/config.docker.yaml`:
+  `scan_interval 30s`, `grace_period 1m`, `trash_retention_days 0`), `-run TestWebBlockUpload`:
+
+  | | blocks | mappings | prov_refs | prov_by_day | MinIO |
+  | --- | --- | --- | --- | --- | --- |
+  | before fix, right after suite | 20 | 20 | 4 | 4 | 21 |
+  | before fix, after GC drained | **4** | **4** | **4** | **4** | **5** ← stuck 2 days, GC idle |
+  | after fix, right after suite | 15 | 15 | **0** | **0** | 16 |
+
+  The `fs:` refs of committed files are *not* leaks: the library cascade releases them through the
+  real GC path (15 of 15 released, 16 of 20 blocks reclaimed). Only the staged-but-uncommitted
+  blocks were stranded.
+
+  **Fix:** `releaseStagedBlockForTest` now drops the expiry projection and, when the block has no
+  referrer left, its `blocks` row, forward mapping and S3 object. A block that still has a referrer
+  (a committed `fs:`) belongs to a library and is left to that library's cascade. It hangs off
+  `cleanupBlockUploadSessionForTest`, which `webCreateBlockSession` already registers for every
+  session, so every upload fixture inherits it.
+
+  **Unstamped-marker restore, also fixed.** `registerLibraryBaseRowRestoreCleanup` re-inserted
+  `deleted_libraries` **without** `block_representation_id`, recreating the exact state PR #123
+  fixed: Phase 13 then has to recover the representation from the `libraries` row and counts it as
+  drift, and if that row is gone the library is stranded in trash forever. It also dropped
+  `purge_requested_at` (migration 012), losing the permanent-delete signal. The snapshot now
+  captures both and the restore writes them back. Verified on the real path by forcing the test to
+  fail: the restored marker carries `block_representation_id=plain:v1` (previously empty) and a
+  correctly-null `purge_requested_at`.
+
+  **Corrupting fixtures must restore what teardown reads.** `TestWebBlockUploadReuploadRepairsMissingBlockSHA1`
+  blanks `blocks.sha1` on purpose. On the happy path the re-upload repairs it, but this test is a
+  **known local flaky** (returns 200 instead of the expected 409 on a 1-node stack), so it
+  regularly aborts with the column still blank. `blocks.sha1` is the only way to name a block's
+  forward `block_id_mappings` row — the reverse index was dropped in migration 006 — so teardown
+  skipped the mapping and then deleted the block and its S3 object, stranding a mapping pointing at
+  nothing. Reproduced by forcing the failure: `mappings=1` with everything else 0; with the restore
+  in place, 0. The test now re-stamps the known sha1 in a `t.Cleanup` registered after the session's
+  (LIFO ⇒ runs first), using `IF EXISTS` so it cannot resurrect a row GC already reclaimed.
+
+  **Scope of the fix, measured honestly.** 1A/1B cover the `web_block_upload_test.go` fixtures.
+  A **full** suite run (`go test -tags integration ./internal/integration/`, 236s, all green)
+  drains from **122 blocks / 117 S3 objects** down to **2**, not 0:
+
+  - `fs:<lib>:<path>` pinning one block whose library is gone from **both** `libraries` and
+    `deleted_libraries`, with GC idle (`gc_queue=0`, `candidates=0`). This is the **F1/P7 shape and
+    is eternal** — no phase can rediscover it. Most likely source is a fixture that removes library
+    base rows with raw CQL (e.g. `removeLibraryBaseRowsForFallbackTest`), whose restore only fires
+    on failure, so a *passing* run strands whatever the library still referenced.
+  - `up:sync:<session>:<block>` from the sync-protocol fixtures — same class 1B fixed, different
+    upload path. It carries a provisional expiry projection, so Phase 0 reclaims it in ~2 days.
+
+  Tracked as **branch 1G**.
+
+  Do not run a global GC over the shared keyspace (invariants #5/#6).
+- **Branch 1C** ✅ **DONE**: the last direct global `ProcessOnce(storage=nil)`
+  (`admin_identity_projection_regression_test.go`, org-cascade hard-delete test) now calls
+  `ProcessOrgOnce(ctx, orgUUID)`, matching the pattern the rest of `gc_integration_test.go`
+  already used. `TestNoGlobalGCFanoutInIntegrationSuite` statically scans the package and fails if
+  any test reintroduces `.ProcessOnce(`; it carries **no** build tag, so it runs in the normal
+  `go test ./...` pass without Cassandra/MinIO. Admin GC triggers inventoried: `triggerGCWorker` /
+  `triggerGCScanner` (~20 call sites) drive the **real** backend worker with **real** storage —
+  globally noisy, but they cannot orphan S3 objects the way a `storage=nil` worker does, so
+  baselining them stays with 1B rather than blocking 1C.
 
 #### Related Docs
 

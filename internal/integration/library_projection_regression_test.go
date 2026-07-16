@@ -1961,6 +1961,14 @@ type libraryBaseRowSnapshot struct {
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	DeletedMarkerSet bool
+	// Captured so the restore below can put the marker back exactly as it was. A marker
+	// restored without its block_representation_id is the unstamped-marker bug PR #123
+	// fixed: Phase 13 then has to recover the representation from the libraries row and
+	// counts it as drift, and if that row is gone the library is stranded in trash
+	// forever. purge_requested_at (migration 012) likewise decides Phase 13 eligibility.
+	// See ISSUE-GC-TEST-RESIDUE-01 (branch 1B).
+	BlockRepresentationID string
+	PurgeRequestedAt      *time.Time
 }
 
 func registerAdminLibraryProjectionRestoreCleanup(t *testing.T, session *gocql.Session, orgID, repoID string) {
@@ -2027,11 +2035,12 @@ func snapshotLibraryBaseRowsForCleanup(t *testing.T, session *gocql.Session, org
 		snapshot.DeletedBy = &deletedByCopy
 	}
 
-	var markerOrgID, markerStorageClass string
-	var markerDeletedAt time.Time
+	var markerOrgID, markerStorageClass, markerBlockRepresentationID string
+	var markerDeletedAt, markerPurgeRequestedAt time.Time
 	if err := session.Query(`
-		SELECT org_id, deleted_at, storage_class FROM deleted_libraries WHERE library_id = ?
-	`, repoID).Scan(&markerOrgID, &markerDeletedAt, &markerStorageClass); err == nil {
+		SELECT org_id, deleted_at, storage_class, block_representation_id, purge_requested_at
+		FROM deleted_libraries WHERE library_id = ?
+	`, repoID).Scan(&markerOrgID, &markerDeletedAt, &markerStorageClass, &markerBlockRepresentationID, &markerPurgeRequestedAt); err == nil {
 		snapshot.DeletedMarkerSet = true
 		if snapshot.DeletedAt == nil && !markerDeletedAt.IsZero() {
 			deletedCopy := markerDeletedAt
@@ -2039,6 +2048,11 @@ func snapshotLibraryBaseRowsForCleanup(t *testing.T, session *gocql.Session, org
 		}
 		if snapshot.StorageClass == "" {
 			snapshot.StorageClass = markerStorageClass
+		}
+		snapshot.BlockRepresentationID = markerBlockRepresentationID
+		if !markerPurgeRequestedAt.IsZero() {
+			purgeCopy := markerPurgeRequestedAt
+			snapshot.PurgeRequestedAt = &purgeCopy
 		}
 	} else if err != gocql.ErrNotFound {
 		t.Fatalf("failed to snapshot deleted_libraries row for repo %s: %v", repoID, err)
@@ -2088,10 +2102,17 @@ func registerLibraryBaseRowRestoreCleanup(t *testing.T, session *gocql.Session, 
 			snapshot.MagicStrong, snapshot.RandomKeyStrong,
 		)
 		if snapshot.DeletedMarkerSet && snapshot.DeletedAt != nil {
+			// Restore the marker exactly as captured, including block_representation_id and
+			// purge_requested_at. Re-inserting it without them (the old behaviour) recreated
+			// the unstamped-marker state PR #123 fixed: Phase 13 would have to recover the
+			// representation from the libraries row and count it as drift, and would lose the
+			// permanent-delete purge signal — turning a test's failure path into GC residue
+			// that outlives the run. See ISSUE-GC-TEST-RESIDUE-01 (branch 1B).
 			batch.Query(`
-				INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class)
-				VALUES (?, ?, ?, ?)
-			`, snapshot.LibraryID, snapshot.OrgID, *snapshot.DeletedAt, snapshot.StorageClass)
+				INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id, purge_requested_at)
+				VALUES (?, ?, ?, ?, ?, ?)
+			`, snapshot.LibraryID, snapshot.OrgID, *snapshot.DeletedAt, snapshot.StorageClass,
+				snapshot.BlockRepresentationID, snapshot.PurgeRequestedAt)
 		}
 		if err := batch.Exec(); err != nil {
 			t.Errorf("cleanup restore base library rows for repo %s failed: %v", snapshot.LibraryID, err)
