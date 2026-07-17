@@ -27,7 +27,8 @@ their verified status.
 > delete failover, and the org-less constructors/resolvers are removed. A real
 > Cassandra+MinIO E2E deletes one of two dedicated, test-exclusive tenant orgs' copy of
 > identical bytes and proves the sibling tenant's row, reference, object, and byte-for-byte
-> download survive; orphan recovery has the same sibling-org isolation proof. An API-level
+> download survive; the orphan-recovery E2E proves the same sibling isolation using an
+> isolated target/sibling org-scoped object pair. An API-level
 > test proves identical bytes resolve to distinct physical keys across the default and
 > platform orgs, and an adapter unit test pins `PlatformOrgID` handling in GC.
 >
