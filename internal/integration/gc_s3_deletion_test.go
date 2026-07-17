@@ -81,8 +81,9 @@ type isolatedTenant struct {
 // against the same Cassandra: the key hash is a plain SHA-256 with no server pepper
 // (internal/apikeys), so a key created here validates in the running server exactly
 // like one issued through the API, and the auth middleware accepts the raw key as a
-// bearer token. It registers cleanup for the API key and a hard-delete of the
-// user+org so the run leaves zero canonical/projection residue.
+// bearer token. Cleanup revokes the API key; the org+owner are removed by
+// createAdminIdentityTestOrganization's soft-delete with eventual GC cascade
+// (not an immediate hard-delete).
 func provisionIsolatedTenant(t *testing.T, label string) *isolatedTenant {
 	t.Helper()
 
@@ -108,6 +109,9 @@ func provisionIsolatedTenant(t *testing.T, label string) *isolatedTenant {
 	}
 
 	mgr := apikeys.NewManager(shareProjectionDBForTest(t))
+	// NewManager starts a background cleanupLoop goroutine; stop it when the test
+	// ends (registered before CreateKey so it is cleaned up even if minting fails).
+	t.Cleanup(mgr.Stop)
 	rawToken, key, err := mgr.CreateKey(userUUID, orgUUID, "gc-iso-"+label, apikeys.ScopeReadWrite, nil)
 	if err != nil {
 		t.Fatalf("mint api key for %s: %v", email, err)

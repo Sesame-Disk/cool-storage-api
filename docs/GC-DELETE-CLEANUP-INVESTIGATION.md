@@ -25,9 +25,11 @@ their verified status.
 > liveness *within* an org. **Fixed:** storage keys are now org-scoped end to end;
 > normal deletion and orphan recovery bind to `(org_id, normalized canonical storage_class)` with no
 > delete failover, and the org-less constructors/resolvers are removed. A real
-> Cassandra+MinIO regression proves deleting the default-org copy of identical bytes
-> preserves the platform-org row, reference, object, and byte-for-byte download; orphan
-> recovery has the same sibling-org isolation proof.
+> Cassandra+MinIO E2E deletes one of two dedicated, test-exclusive tenant orgs' copy of
+> identical bytes and proves the sibling tenant's row, reference, object, and byte-for-byte
+> download survive; orphan recovery has the same sibling-org isolation proof. An API-level
+> test proves identical bytes resolve to distinct physical keys across the default and
+> platform orgs, and an adapter unit test pins `PlatformOrgID` handling in GC.
 >
 > Everything else below still holds. The single-org block-delete protocol is conservative;
 > P6a/P6b classification guards are fixed; P1/P1b/P2 (durable purge + cascade, PR #129) are fixed; the

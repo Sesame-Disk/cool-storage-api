@@ -9,9 +9,11 @@ plan integration tests for long-running monitoring.
 > cross-org live-content deletion bug is **fixed by the org-scoped-key series through PR-3**.
 > API reads/writes, normal GC deletion, and S3 orphan recovery now resolve
 > `blocks/<org_id>/...`; org-less block-store APIs have been removed. A real
-> Cassandra+MinIO regression uploads identical bytes in the default and platform orgs,
-> drains only one org, and proves the sibling row, reference, object, and byte-for-byte
-> download survive. See `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`.
+> Cassandra+MinIO E2E uploads identical bytes into two dedicated, test-exclusive tenant orgs,
+> drains only one, and proves the sibling row, reference, object, and byte-for-byte
+> download survive. An API-level test proves distinct physical keys across the default and
+> platform orgs, and an adapter unit test pins `PlatformOrgID` handling in GC.
+> See `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`.
 > The previous "no open known issue can delete live content" verdict is **retracted**: it only ever
 > reasoned about liveness *within* an org. The physical block-delete claim/recovery
 > protocol is conservative. P6a (existence-read failures interpreted as "missing", enqueuing

@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🟡 **P10 fixed; non-blocking debt remains** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped; delete resolution trims incidental whitespace and uses the canonical class without health failover; org-less storage APIs are removed. Real Cassandra+MinIO regressions prove delete/drain/download and orphan-recovery isolation across the default and platform orgs. **Remaining:** storage retention (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and scale (P8). The single-org delete path also has the ~50 GB manual dev-cluster observation (not an automated test). Reconcile/backfill is not required for an empty prod deploy. See GC audit section below. |
+| Garbage Collection | 🟡 **P10 fixed; non-blocking debt remains** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped; delete resolution trims incidental whitespace and uses the canonical class without health failover; org-less storage APIs are removed. Coverage: the delete/drain/download and orphan-recovery E2Es run against two dedicated, test-exclusive tenant orgs (so the private GC drain is sound); an API-level test proves identical bytes resolve to distinct physical keys across the default and platform orgs; and an adapter unit test pins `PlatformOrgID` handling in GC. **Remaining:** storage retention (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and scale (P8). The single-org delete path also has the ~50 GB manual dev-cluster observation (not an automated test). Reconcile/backfill is not required for an empty prod deploy. See GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -4415,8 +4415,21 @@ Do **not** paper over it with a pre-delete `HEAD`/existence probe: that is a TOC
 
 Two orgs upload identical bytes to the same storage class; delete one org's library and drain GC;
 assert the other org can still download the file **and** the physical object still exists. This is
-implemented by `TestGC_CrossOrgIdenticalBlockDeleteIsolation` against real Cassandra+MinIO. The S3
-orphan recovery E2E also seeds an identical sibling-org object and verifies it survives byte-for-byte.
+implemented by `TestGC_CrossOrgIdenticalBlockDeleteIsolation` against real Cassandra+MinIO. It uses
+**two dedicated, test-exclusive tenant orgs** (created at runtime via the superadmin admin API, each
+authenticated with a directly-minted API key) rather than the shared default/platform orgs, so the
+private per-org GC drain (`ProcessOrgOnce`) only ever touches this test's work. The S3 orphan recovery
+E2E also seeds an identical sibling-org object and verifies it survives byte-for-byte. Complementary
+coverage: the API-level `TestWebBlockUploadIdenticalBytesUseDistinctOrgKeys` proves identical bytes
+resolve to distinct physical keys across the default and platform orgs, and the adapter unit test
+`TestStorageManagerAdapterScopesPlatformAndTenantKeys` pins `PlatformOrgID` handling in GC.
+
+**Manual full-loop confirmation (2026-07-16), mirroring the original bug repro:** the same ~0.5 GB
+file was uploaded into **two orgs**; MinIO showed ~**1 GB** used (no cross-org dedup — each org holds
+its own `blocks/<org_id>/...` object). Deleting the library in one org and draining GC dropped MinIO
+back to ~**0.5 GB**, and the other org kept **streaming its file** with no interruption. This is the
+exact scenario that emptied the bucket and truncated the sibling org's download before the fix; it now
+closes end to end.
 
 #### Series progress (org-scoped-key)
 
