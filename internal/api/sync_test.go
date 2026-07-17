@@ -298,9 +298,8 @@ func TestResolveBlockStoreForLookupFallsBackThroughManager(t *testing.T) {
 func TestSyncHandlerWithoutDB(t *testing.T) {
 	r := setupSyncTestRouter()
 	h := &SyncHandler{
-		db:         nil,
-		storage:    nil,
-		blockStore: nil,
+		db:      nil,
+		storage: nil,
 	}
 
 	// Register a subset of routes for testing

@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-07-15
+**Last Updated**: 2026-07-16
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | ⛔ **BLOCKER — P10 deletes live content across orgs** | **P10 (open, proven 2026-07-16):** GC's liveness check is org-scoped but the S3 object is shared by content hash, so one org's delete destroys another org's still-referenced block. Reproduced end-to-end; reachable on a greenfield deploy from day one. See ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01. **Everything else stands:** the single-org delete path was exercised end-to-end (~50 GB manual dev-cluster run, zero content residue — operator observation, not an automated test); P6a/P6b and P1/P2 closed on `main` (PR #129); the rest of the debt is storage retention (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done) and scale (P8). Reconcile/backfill not required for an empty prod deploy. See GC audit section below. |
+| Garbage Collection | 🟡 **P10 fixed; non-blocking debt remains** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped; delete resolution trims incidental whitespace and uses the canonical class without health failover; org-less storage APIs are removed. Coverage: the delete/drain/download E2E runs against two dedicated, test-exclusive tenant orgs (so the private GC drain is sound); the orphan-recovery E2E uses an isolated target/sibling org-scoped object pair; an API-level test proves identical bytes resolve to distinct physical keys across the default and platform orgs; and an adapter unit test pins `PlatformOrgID` handling in GC. **Remaining:** storage retention (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and scale (P8). The single-org delete path also has the ~50 GB manual dev-cluster observation (not an automated test). Reconcile/backfill is not required for an empty prod deploy. See GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -52,16 +52,16 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on the five server-side upload paths. NOT global: legacy `BlockStore` Exists+PUT methods remain for fallback + unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
-| **Read Paths Ignore `storage_key`** | 🟡 Closing with P10 | Reads and reuse/repair derive the deterministic org-scoped key; reuse fails closed if a non-empty `storage_key` differs. The column is not an arbitrary locator, so non-derived layouts remain unsupported. GC adopts the same derivation in P10 PR-3. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
+| **Read Paths Ignore `storage_key`** | ✅ Fixed by derived-key invariant | Reads, reuse/repair, normal GC delete, and orphan recovery derive the deterministic org-scoped key; reuse fails closed if a non-empty `storage_key` differs. The column is not an arbitrary locator, so non-derived layouts remain unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
-### ⛔ GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 blocker)
+### GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 fixed)
 
-Follow-up debt from the PR #123 audit. **Verdict (2026-07-16): ⛔ P10 remains a deploy blocker until
-the org-scoped-key series is complete.** The original pre-PR-2 bug was GC's org-scoped liveness check
-versus a content-hash-shared S3 object. PR-2 has moved API reads/writes to org-scoped keys, while GC
-still uses the legacy global locator; this intermediate schema mismatch must not be deployed with GC
-enabled. The previous "no open known issue can delete live content" verdict is **retracted**: it only
+Follow-up debt from the PR #123 audit. **Verdict (2026-07-16): P10 is fixed through PR-3.** The
+original pre-PR-2 bug was GC's org-scoped liveness check versus a content-hash-shared S3 object.
+API reads/writes, normal GC deletion, and orphan recovery now use the same org-scoped locator; the
+legacy global APIs are removed. The previous "no open known issue can delete live content" verdict
+was **retracted** when P10 was found: it only
 ever reasoned about liveness within a single org. Within one key layout the delete path is still sound. P6a/P6b safety guards and P1/P1b/P2 durable
 purge + cascade are **fixed** on `main` (PR #129). The planned **greenfield prod deploy** starts
 from an empty cluster — reconcile/backfill (8A–8C) and pre-fix `gc_pending_items` orphans are
@@ -984,8 +984,7 @@ work begins.
 
 ### ISSUE-BLOCK-STORAGE-KEY-READS-01: Read Paths Ignore `storage_key` (key derived from hash)
 
-**Status**: 🟡 Pending — **will be resolved with P10** (`ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`);
-latent inconsistency, no live bug today
+**Status**: ✅ Fixed by P10 PR-3's derived-key invariant (2026-07-16)
 **Severity**: Low (becomes High the moment any block is stored at a non-hash-derived key)
 **Affected**: `internal/storage/blocks.go` read methods; GC delete path
 
@@ -1010,7 +1009,7 @@ upload paths register the block with `storage_key=""` (`seafhttp.go` ×2, `sync.
 is the hash-derived key. So `hashToKey(hash)` is always a correct locator, and
 `EnsureReusableBlockPresent` always uses `StorageKeyForHash(blockID)` and validates a
 non-empty column against it. API reads and verify/repair therefore resolve to the same
-object; GC joins that contract in P10 PR-3.
+object; GC joined that contract in P10 PR-3.
 
 #### The latent risk
 
@@ -1020,9 +1019,9 @@ layout). Any future write that persists such a `storage_key` now fails reuse clo
 instead of silently diverging. Supporting relocation to arbitrary keys would require
 a separate, explicit locator migration across reads, writes and GC.
 
-#### Proposed Fix
+#### Resolution
 
-Complete P10 PR-3 so GC derives the same org-scoped key as API reads/writes. Keep
+P10 PR-3 makes GC derive the same org-scoped key as API reads/writes. Keep
 `storage_key` as an invariant check, not an arbitrary caller-controlled locator.
 
 **Resolution path (via P10):** the org-scoped-key fix resolves this **by construction** rather than
@@ -2818,13 +2817,13 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 
 ## 🚧 BACKEND NOT IMPLEMENTED
 
-### Garbage Collection — IMPLEMENTED; ⛔ BLOCKED FOR GREENFIELD BY P10 (cross-org block delete)
+### Garbage Collection — IMPLEMENTED; P10 CROSS-ORG BLOCK DELETE FIXED
 **Status**: Core engine implemented (2026-01-30), major overhaul (2026-03-17);
 2026-07-10 audit found P1–P10 follow-ups. Refreshed 2026-07-16: the safety-classification gaps
 (P6a/P6b) and the normal permanent-delete path (P1/P1b/P2, PR #129) are **closed** on `main`.
 Remaining debt is reclamation edge cases (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and
-the Medium Phase 9 global-scan scale debt (P8). **P10 (2026-07-16) IS live-data deletion: cross-org
-shared-object deletion, open and proven — a deploy blocker.**
+the Medium Phase 9 global-scan scale debt (P8). **P10's proven pre-fix cross-org shared-object
+deletion is fixed through PR-3 with org-scoped physical keys and real Cassandra+MinIO regressions.**
 **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
 **Tests**: 55 Go unit tests + 21 bash integration tests
 **Admin API**: `GET /api/v2.1/admin/gc/status`, `POST /api/v2.1/admin/gc/run`
@@ -4254,16 +4253,17 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
   count every bucket.
 
   **Teardown contract — a missing `blocks` row means STOP.** `releaseStagedBlockForTest`
-  deliberately does **not** delete the S3 object when the `blocks` row is gone. S3 keys are
-  content-addressed with no org in them (`hashToKey` ⇒ `blocks/<h0:2>/<h2:4>/<hash>`), so a single
-  object backs **every** org that ever stored those bytes, while `blocks` and `block_references`
-  are per-org. The zero-ref check therefore only proves *this* org is finished with it. The
-  `blocks` row is the fixture's only evidence that it materialized the object here, and it carries
-  the `storage_class` that says which of the five buckets the object is even in. Deleting without
-  it would mean removing a hash we cannot prove we created, from a bucket we are guessing — and
-  could take out a live block belonging to another org. If a future fixture needs "delete without
-  metadata", it must opt in explicitly and prove: a test-exclusive hash, the right bucket, and that
-  its own request could have physically created the object.
+  deliberately does **not** delete the S3 object when the `blocks` row is gone. S3 keys are now
+  org-scoped (`hashToKey` ⇒ `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`), so cross-org deletion is no
+  longer the hazard — P10 makes that impossible by construction. The reason to stop is different:
+  without the `blocks` row the helper knows neither the authoritative `storage_class`/bucket (one of
+  the five) the object lives in, nor can it prove the object belongs to *this* fixture. The zero-ref
+  check only proves *this* org is finished with the reference; the `blocks` row is the fixture's only
+  evidence that it materialized the object here. Deleting without it would mean removing a hash we
+  cannot prove we created, from a bucket we are guessing. So it must fail closed rather than delete
+  from S3 directly. If a future fixture needs "delete without metadata", it must opt in explicitly and
+  prove: a test-exclusive hash, the right bucket, and that its own request could have physically
+  created the object.
 
   **Still open (new, smaller):** one ~90-byte S3 object with **no `blocks` row** survives a run —
   an S3-only orphan that no GC phase can discover (blocks are found through candidates, and
@@ -4344,10 +4344,9 @@ P6 issue above.
 
 ### ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01: complete org-scoped physical block isolation
 
-**Status**: ⛔ **OPEN — BLOCKER; PR-2 API funnels complete, PR-3 GC pending**
-**Severity**: **High — pre-PR-2 live-content deletion; current API/GC layout mismatch.**
-**Affected**: `internal/gc` block deletion and orphan recovery. Do not deploy the intermediate PR-2
-state with GC enabled.
+**Status**: ✅ **FIXED (2026-07-16); org-scoped-key series complete through PR-3**
+**Severity**: **High pre-fix; resolved by end-to-end org-scoped physical keys.**
+**Affected**: Historical pre-fix `internal/gc` block deletion and orphan recovery.
 
 #### Problem
 
@@ -4364,9 +4363,9 @@ deletes the **global** key ([worker.go:583](../internal/gc/worker.go#L583) →
 [blocks.go:251](../internal/storage/blocks.go#L251)). "No refs **in this org**" is treated as "nobody
 needs these bytes".
 
-The claim+verify fence did not help: it re-checked the same org-scoped partition. PR-2 now writes and
-reads `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`; PR-3 must move GC delete and orphan recovery to that same
-locator and remove the legacy global APIs.
+The claim+verify fence did not help: it re-checked the same org-scoped partition. PR-2 moved API
+writes/reads to `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`; PR-3 moved GC delete and orphan recovery to
+that same locator and removed the legacy global APIs.
 
 #### Confirmation
 
@@ -4397,16 +4396,15 @@ two real uploads.)
 Ordinary multi-tenancy triggers this: identical READMEs, empty files, shared templates, any
 re-uploaded document.
 
-#### Fix direction (decide before the greenfield deploy)
+#### Resolution design
 
-1. **Org-scope the physical key** — e.g. `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`. Aligns physical
+1. **Chosen: org-scope the physical key** — `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`. Aligns physical
    ownership with the existing per-org tables, claims and references; no coordination needed. Costs
    cross-org dedup (each org stores its own copy). **Migration-free on an empty (greenfield) store —
    but not trivial: it requires *all* storage paths (write, read, reuse, verify, GC delete + orphan
    recovery) to resolve the org-scoped locator, and the org must enter the `BlockStore` at
    construction with fail-closed validation so no path can ever produce a global key again.** This
-   is the chosen approach — see the org-scoped-key plan (docs-first, storage layer, API funnels, GC
-   own branch, coverage/closure).
+   is the implemented approach — see the org-scoped-key series below.
 2. **Global liveness per `(storage_class, block_id)`** — a global ref/owner registry plus a global claim
    before physical delete. Keeps cross-org dedup, but needs global coordination and is materially more
    complex.
@@ -4416,8 +4414,22 @@ Do **not** paper over it with a pre-delete `HEAD`/existence probe: that is a TOC
 #### Required regression test (cross-org)
 
 Two orgs upload identical bytes to the same storage class; delete one org's library and drain GC;
-assert the other org can still download the file **and** the physical object still exists. **This test
-fails on current `main`.**
+assert the other org can still download the file **and** the physical object still exists. This is
+implemented by `TestGC_CrossOrgIdenticalBlockDeleteIsolation` against real Cassandra+MinIO. It uses
+**two dedicated, test-exclusive tenant orgs** (created at runtime via the superadmin admin API, each
+authenticated with a directly-minted API key) rather than the shared default/platform orgs, so the
+private per-org GC drain (`ProcessOrgOnce`) only ever touches this test's work. The S3 orphan recovery
+E2E also seeds an identical sibling-org object and verifies it survives byte-for-byte. Complementary
+coverage: the API-level `TestWebBlockUploadIdenticalBytesUseDistinctOrgKeys` proves identical bytes
+resolve to distinct physical keys across the default and platform orgs, and the adapter unit test
+`TestStorageManagerAdapterScopesPlatformAndTenantKeys` pins `PlatformOrgID` handling in GC.
+
+**Manual full-loop confirmation (2026-07-16), mirroring the original bug repro:** the same ~0.5 GB
+file was uploaded into **two orgs**; MinIO showed ~**1 GB** used (no cross-org dedup — each org holds
+its own `blocks/<org_id>/...` object). Deleting the library in one org and draining GC dropped MinIO
+back to ~**0.5 GB**, and the other org kept **streaming its file** with no interruption. This is the
+exact scenario that emptied the bucket and truncated the sibling org's download before the fix; it now
+closes end to end.
 
 #### Series progress (org-scoped-key)
 
@@ -4433,7 +4445,7 @@ The fix ships as a small, sequential series of branches (each its own PR):
   `Manager.GetBlockStoreForOrg` /
   `GetHealthyBlockStoreForOrg` cache per `(org, class)` via a struct key
   ([internal/storage/storage.go](../internal/storage/storage.go)). Legacy `NewBlockStore`/
-  `GetBlockStore` kept **temporarily** (deprecated) so production is unchanged until callers migrate.
+  `GetBlockStore` were kept temporarily until caller migration and are removed by PR-3.
   Unit tests cover fail-closed validation, org-scoped keys, per-org cache separation, and pin the
   legacy key (regression). This was plumbing only; production activation starts in PR-2.
 - ✅ **PR-2 — API funnels.** Write/read/reuse/verify/fallback paths in v2 files/blocks/OnlyOffice,
@@ -4441,11 +4453,13 @@ The fix ships as a small, sequential series of branches (each its own PR):
   Reuse always derives the canonical key from that store and fails closed if a persisted `storage_key`
   differs. The process-wide org-less API singleton is no longer constructed. Integration coverage pins
   same-org dedup across libraries and distinct physical keys plus byte-for-byte reads across the default
-  and platform orgs. ⚠️ **Do not deploy this intermediate state with GC enabled:** GC remains global-keyed
-  until PR-3 and cannot reclaim the new objects safely/correctly.
-- ⏳ **PR-3 — GC own branch:** delete + orphan recovery org-scoped, **remove** the legacy global
-  APIs (compiler net), land the cross-org regression test above.
-- ⏳ **PR-4 — coverage + doc closure** (multiregion/buckets, per-org reclamation; mark P10 resolved).
+  and platform orgs. This intermediate state required GC to remain disabled until PR-3.
+- ✅ **PR-3 — GC own branch:** delete + orphan recovery resolve `(org_id, normalized canonical storage_class)`,
+  empty orphan classes fail closed, the legacy global APIs are removed as a compiler net, and the
+  cross-org Cassandra+MinIO regressions above pass.
+- Broader multiregion/bucket coverage remains useful follow-up coverage, but it is not required to
+  close P10's locator mismatch: the exact-class adapter contract and org-scoped physical isolation
+  are covered in PR-3.
 
 #### Related Docs
 
@@ -4570,4 +4584,4 @@ apply. No reconcile/backfill pass is required before launch.
 - [API-REFERENCE.md](API-REFERENCE.md) - API endpoint documentation
 - [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md) - Architectural issues
 - [CURRENT_WORK.md](../CURRENT_WORK.md) - Active priorities
-- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (P1–P10, invariants, branch roadmap; refreshed 2026-07-16 — P10 cross-org deletion is an open deploy blocker)
+- [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md) - Full GC delete-cleanup audit (P1–P10, invariants, branch roadmap; refreshed 2026-07-16 — P10 cross-org deletion fixed through PR-3)

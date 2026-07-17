@@ -11,7 +11,7 @@ func TestNewRouteFileHandlerUsesStorageRoutingDependencies(t *testing.T) {
 	s3Store := &storage.S3Store{}
 	storageManager := storage.NewManager()
 
-	h := newRouteFileHandler(nil, &config.Config{}, s3Store, nil, storageManager, nil, "https://files.example.com")
+	h := newRouteFileHandler(nil, &config.Config{}, s3Store, storageManager, nil, "https://files.example.com")
 
 	if h == nil {
 		t.Fatal("newRouteFileHandler returned nil")

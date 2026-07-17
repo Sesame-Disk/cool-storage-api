@@ -129,7 +129,8 @@ reused), which the old S3 HEAD also did — so no dedup regression.
 API reads and `EnsureReusableBlockPresent` derive the deterministic org-scoped key
 through `BlockStore`. Reuse accepts `storage_key` only when empty or exactly equal to
 that derivation and otherwise fails closed before S3 access. Arbitrary relocated keys
-remain unsupported, and GC must adopt the same derivation in P10 PR-3. See
+remain unsupported. P10 PR-3 moved GC delete and orphan recovery to the same
+org-scoped derivation and removed the org-less storage APIs. See
 `docs/KNOWN_ISSUES.md` (ISSUE-BLOCK-STORAGE-KEY-READS-01).
 
 **Caveat 3 (minor — new failure surface on reuse):** because the `Reusable` path now

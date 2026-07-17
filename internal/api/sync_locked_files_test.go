@@ -37,7 +37,7 @@ func (s *stubTokenValidator) GetToken(tokenStr string, expectedType TokenType) (
 }
 
 func newTestSyncHandler() *SyncHandler {
-	return NewSyncHandler(nil, nil, nil, nil, nil, nil)
+	return NewSyncHandler(nil, nil, nil, nil, nil)
 }
 
 func withAccountStatusStub(h *SyncHandler, stub SyncAccountStatusChecker) {

@@ -163,9 +163,6 @@ type blockStoreKey struct {
 // Manager manages multiple storage backends and policies
 type Manager struct {
 	backends map[string]Store
-	// blockStores caches the legacy global-key BlockStore per backend. Being retired
-	// as callers migrate to blockStoresByOrg; see NewBlockStore vs NewOrgBlockStore.
-	blockStores map[string]*BlockStore
 	// blockStoresByOrg caches the org-scoped BlockStore per (org, class).
 	blockStoresByOrg map[blockStoreKey]*BlockStore
 	blockStoresMu    sync.RWMutex
@@ -189,7 +186,6 @@ type RegionClassConfig struct {
 func NewManager() *Manager {
 	return &Manager{
 		backends:         make(map[string]Store),
-		blockStores:      make(map[string]*BlockStore),
 		blockStoresByOrg: make(map[blockStoreKey]*BlockStore),
 		health:           make(map[string]*BackendHealth),
 		policies:         []StoragePolicy{},
@@ -474,69 +470,6 @@ func (m *Manager) GetColdBackends() []string {
 	return result
 }
 
-// GetBlockStore returns a BlockStore for the given storage class
-// BlockStores are cached and reused for efficiency
-func (m *Manager) GetBlockStore(className string) (*BlockStore, error) {
-	// Check cache first
-	m.blockStoresMu.RLock()
-	if bs, ok := m.blockStores[className]; ok {
-		m.blockStoresMu.RUnlock()
-		return bs, nil
-	}
-	m.blockStoresMu.RUnlock()
-
-	// Get the backend store
-	store, ok := m.backends[className]
-	if !ok {
-		return nil, fmt.Errorf("storage class %s not found", className)
-	}
-
-	// Cast to S3Store (BlockStore requires S3Store)
-	s3Store, ok := store.(*S3Store)
-	if !ok {
-		return nil, fmt.Errorf("storage class %s is not an S3 backend", className)
-	}
-
-	// Create and cache the BlockStore
-	m.blockStoresMu.Lock()
-	defer m.blockStoresMu.Unlock()
-
-	// Double-check (another goroutine may have created it)
-	if bs, ok := m.blockStores[className]; ok {
-		return bs, nil
-	}
-
-	bs := NewBlockStore(s3Store, "blocks/")
-	m.blockStores[className] = bs
-	return bs, nil
-}
-
-// GetHealthyBlockStore returns a BlockStore for a healthy backend with failover
-func (m *Manager) GetHealthyBlockStore(preferredClass string) (*BlockStore, string, error) {
-	store, actualClass, err := m.GetHealthyBackend(preferredClass)
-	if err != nil {
-		return nil, "", err
-	}
-
-	// Cast to S3Store
-	s3Store, ok := store.(*S3Store)
-	if !ok {
-		return nil, "", fmt.Errorf("storage class %s is not an S3 backend", actualClass)
-	}
-
-	// Get or create BlockStore
-	m.blockStoresMu.Lock()
-	defer m.blockStoresMu.Unlock()
-
-	if bs, ok := m.blockStores[actualClass]; ok {
-		return bs, actualClass, nil
-	}
-
-	bs := NewBlockStore(s3Store, "blocks/")
-	m.blockStores[actualClass] = bs
-	return bs, actualClass, nil
-}
-
 // GetBlockStoreForOrg returns an org-scoped BlockStore for the given org and
 // storage class. The returned store writes/reads/deletes at org-scoped keys
 // (blocks/<org_id>/...), so one org's GC can never touch another org's object.
@@ -549,7 +482,7 @@ func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, err
 	}
 	key := blockStoreKey{orgID: normalizedOrgID, class: className}
 
-	// Check cache first
+	// Check cache first.
 	m.blockStoresMu.RLock()
 	if bs, ok := m.blockStoresByOrg[key]; ok {
 		m.blockStoresMu.RUnlock()
@@ -557,7 +490,6 @@ func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, err
 	}
 	m.blockStoresMu.RUnlock()
 
-	// Get the backend store
 	store, ok := m.backends[className]
 	if !ok {
 		return nil, fmt.Errorf("storage class %s not found", className)
@@ -569,8 +501,6 @@ func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, err
 		return nil, fmt.Errorf("storage class %s is not an S3 backend", className)
 	}
 
-	// Validate + build the org-scoped store before taking the write lock so an
-	// invalid org id fails without holding the mutex.
 	bs, err := NewOrgBlockStore(s3Store, "blocks/", normalizedOrgID)
 	if err != nil {
 		return nil, err
@@ -578,8 +508,6 @@ func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, err
 
 	m.blockStoresMu.Lock()
 	defer m.blockStoresMu.Unlock()
-
-	// Double-check (another goroutine may have created it)
 	if existing, ok := m.blockStoresByOrg[key]; ok {
 		return existing, nil
 	}
@@ -624,7 +552,6 @@ func (m *Manager) GetHealthyBlockStoreForOrg(orgID, preferredClass string) (*Blo
 
 	m.blockStoresMu.Lock()
 	defer m.blockStoresMu.Unlock()
-
 	if existing, ok := m.blockStoresByOrg[key]; ok {
 		return existing, actualClass, nil
 	}

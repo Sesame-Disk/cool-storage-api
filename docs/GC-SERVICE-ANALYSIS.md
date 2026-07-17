@@ -1,11 +1,19 @@
 # GC Service Analysis
 
-**Date:** 2026-04-14 · **Corrected against `main` 4333be1b3:** 2026-07-10 · **Status refresh against `main` 23f221ee9:** 2026-07-15
+**Date:** 2026-04-14 · **Corrected against `main` 4333be1b3:** 2026-07-10 · **Status refresh:** 2026-07-16
 **Scope:** `internal/gc/` — 9,940 lines across 9 files + 3,380 lines of tests.
 **Goal:** Evaluate correctness, test coverage, identify potential data-loss bugs, and
 plan integration tests for long-running monitoring.
 
-> **See also (delete-path audit, refreshed 2026-07-16):** ⛔ **P10 (open, proven) deletes live content across orgs** — GC's liveness check is org-scoped but the S3 object is shared by content hash, so one org's delete destroys another's still-referenced block. Greenfield deploy blocker. See `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`.
+> **See also (delete-path audit, refreshed 2026-07-16):** P10's proven pre-fix
+> cross-org live-content deletion bug is **fixed by the org-scoped-key series through PR-3**.
+> API reads/writes, normal GC deletion, and S3 orphan recovery now resolve
+> `blocks/<org_id>/...`; org-less block-store APIs have been removed. A real
+> Cassandra+MinIO E2E uploads identical bytes into two dedicated, test-exclusive tenant orgs,
+> drains only one, and proves the sibling row, reference, object, and byte-for-byte
+> download survive. An API-level test proves distinct physical keys across the default and
+> platform orgs, and an adapter unit test pins `PlatformOrgID` handling in GC.
+> See `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`.
 > The previous "no open known issue can delete live content" verdict is **retracted**: it only ever
 > reasoned about liveness *within* an org. The physical block-delete claim/recovery
 > protocol is conservative. P6a (existence-read failures interpreted as "missing", enqueuing
@@ -16,7 +24,7 @@ plan integration tests for long-running monitoring.
 > cascade on every wired permanent-delete path) are **fixed** on `main` (PR #129), and P9
 > (`gc_pending_items` block-row leak) is fixed for new work.
 >
-> Apart from P10, the remaining debt is **storage retention in edge cases, observability, test
+> The remaining debt is **storage retention in edge cases, observability, test
 > hygiene, and scale** — not live-data safety: P4 (`pub:` zero-ref transition), P5 (Phase 13 error visibility), P7
 > (markerless commit/fs_object partitions invisible to orphan discovery — reachable on any
 > cluster via terminal child-work loss/DLQ expiry, so 8D stays open), P8 (Phase 9
@@ -123,16 +131,21 @@ processBlock(item):
   3. Re-check live references after the claim
      └─ If any ref exists: release claim, skip.
   4. Record S3 orphan fence + DELETE block metadata/mappings
-  5. S3 DeleteBlock(blockID)
+  5. Resolve BlockStore by (item.org_id, canonical storage_class), without health failover
+  6. S3 DeleteBlock(blockID) at blocks/<org_id>/...
      └─ If S3 fails: LOG WARNING, return error → retry
-  6. Delete GC candidate record and clear the fence/claim state
-  7. Increment stats
+  7. Delete GC candidate record and clear the fence/claim state
+  8. Increment stats
 ```
 
 **The claim+verify fence is the core safety mechanism.** Even if a block is enqueued
 for deletion while simultaneously being referenced by a new upload, the worker
 point-reads live references before and after the LWT claim, and releases the
 claim if a concurrent writer reintroduces liveness before S3 deletion.
+The physical delete is bound to the same org partition used by those checks and to
+the block row's normalized canonical storage class. GC deliberately ignores backend
+health failover because deleting from a fallback backend would target a different
+physical location.
 
 ### FS Object deletion (cascade trigger)
 
@@ -207,6 +220,9 @@ recovery path:
 3. Scanner phase `s3_orphan_recovery` walks `gc_s3_orphans_by_day` from a
    persisted UTC-day cursor across all discovery buckets; on cold start it scans
    the full 90-day TTL horizon so old orphan rows are still recoverable.
+4. Recovery resolves the `BlockStore` from the orphan row's exact `(org_id,
+   storage_class)`. Empty classes and invalid org IDs fail closed; the orphan and
+   cursor position are retained rather than guessing a default backend.
 
 This turns the old permanent storage leak into an operational retry path. The
 remaining tradeoff is intentionally conservative cursor advancement: if the
@@ -230,7 +246,7 @@ partitions cannot be found by Phases 3/4. Observed in the dev-cluster audit snap
 and **not reproduced on the live delete path**, so it is not a normal-flow gap — but it is not
 brownfield-only either: the cascade enqueues children before `HardDeleteLibrary` drops canonical +
 marker, so terminal child-work loss (retry exhaustion → DLQ → DLQ expiry) strands artifacts on a
-fresh cluster too. Under-reclamation, never incorrect deletion (unlike P10). Not a launch blocker; 8D stays
+fresh cluster too. Under-reclamation, never incorrect deletion. Not a launch blocker; 8D stays
 open. See `ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`.
 
 ### RESOLVED: Hot exact recounts removed without Cassandra COUNTER
@@ -387,6 +403,8 @@ deleting referenced blocks.
 | Batch-delete → ref removal → GC candidate | 4 | Integration (real Cassandra) | Good |
 | **Block lifecycle end-to-end** | 1 | **Integration (real Cassandra + S3)** | **Done** |
 | **Deduplication safety** | 1 | **Integration (real Cassandra + S3)** | **Done** |
+| **Cross-org identical-block delete isolation** | 1 | **Integration (real Cassandra + S3)** | **Done** |
+| **Cross-org S3-orphan recovery isolation** | 1 | **Integration (real Cassandra + S3)** | **Done** |
 | **LWT guard with real Cassandra** | 1 | **Integration (real Cassandra + S3)** | **Done** |
 | **Library cascade (scanner → worker)** | 1 | **Integration (real Cassandra + S3)** | **Done** |
 | **Scanner orphan recovery** | 1 | **Integration (real Cassandra + S3)** | **Done** |
@@ -411,7 +429,7 @@ deleting referenced blocks.
 | **Soak test validation** | Medium | **Code written, needs run** | `TestGC_Soak` is implemented but hasn't been executed against the live stack yet. |
 | **Existence read failure → no live deletion (P6)** | **High** | **Done** | `TestScanner_ScanOrphaned{Commits,FSObjects}_FailClosedOnLibraryExistsError` and `TestScanner_ScanOrphanedGroupShares_FailClosedOnGroupExistsError` fault-inject `LibraryExists`/`GroupExists` and prove no live commit/fs_object is enqueued and no valid share is deleted. |
 | **Markerless artifact discovery (P7)** | Med | **Missing** | Remove both library indexes while retaining fixture commits/fs_objects; prove bounded discovery/reconcile. Also cover the fresh-cluster trigger: drive a cascade child to DLQ, expire it, assert the artifact stays discoverable. |
-| **No global cross-test GC** | Medium | **Broken** | Replace direct `ProcessOnce(storage=nil)` with `ProcessOrgOnce`; isolate admin GC triggers. |
+| **No global cross-test GC** | Medium | **Done** | Direct integration-worker fan-out uses `ProcessOrgOnce`; an untagged guard prevents reintroduction. |
 
 ---
 

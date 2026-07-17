@@ -38,7 +38,6 @@ func createTestServer() *Server {
 		config:     cfg,
 		db:         nil,
 		storage:    nil,
-		blockStore: nil,
 		tokenStore: nil,
 		router:     gin.New(),
 	}

@@ -286,7 +286,6 @@ type FileHandler struct {
 	db              *db.DB
 	config          *config.Config
 	storage         *storage.S3Store
-	blockStore      *storage.BlockStore
 	storageManager  *storage.Manager
 	tokenCreator    TokenCreator
 	zipTokenCreator LibraryTokenCreator // For zip-task endpoint (only needs CreateDownloadToken)
@@ -296,12 +295,11 @@ type FileHandler struct {
 }
 
 // NewFileHandler creates a new FileHandler instance
-func NewFileHandler(database *db.DB, cfg *config.Config, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string, permMiddleware *middleware.PermissionMiddleware) *FileHandler {
+func NewFileHandler(database *db.DB, cfg *config.Config, s3Store *storage.S3Store, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string, permMiddleware *middleware.PermissionMiddleware) *FileHandler {
 	return &FileHandler{
 		db:             database,
 		config:         cfg,
 		storage:        s3Store,
-		blockStore:     blockStore,
 		storageManager: storageManager,
 		tokenCreator:   tokenCreator,
 		serverURL:      serverURL,

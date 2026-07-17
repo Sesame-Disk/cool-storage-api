@@ -110,9 +110,8 @@ func (s *clientSSOStore) cleanupLoop() {
 type Server struct {
 	config               *config.Config
 	db                   *db.DB
-	storage              *storage.S3Store    // Legacy single S3 store
-	storageManager       *storage.Manager    // Multi-backend storage manager
-	blockStore           *storage.BlockStore // Legacy single block store
+	storage              *storage.S3Store // Legacy single S3 store
+	storageManager       *storage.Manager // Multi-backend storage manager
 	tokenStore           TokenStore
 	permMiddleware       *middleware.PermissionMiddleware
 	authHandler          *v2.AuthHandler         // OIDC authentication handler
@@ -196,13 +195,6 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 		slog.Info("Using in-memory token store (not distributed)")
 	}
 
-	// The legacy org-less singleton BlockStore is intentionally NOT built anymore:
-	// its global key layout (blocks/<hash>) let one org's GC delete another org's
-	// object (P10, ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01). Block stores are now resolved
-	// per request, org-scoped, from the raw S3 store (s.storage) via the funnels.
-	// The field stays until the constructor signatures are cleaned up in the GC branch.
-	var blockStore *storage.BlockStore
-
 	// Initialize permission middleware
 	permMiddleware := middleware.NewPermissionMiddleware(database)
 
@@ -246,7 +238,6 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 		db:                   database,
 		storage:              s3Store,
 		storageManager:       storageManager,
-		blockStore:           blockStore,
 		tokenStore:           tokenStore,
 		permMiddleware:       permMiddleware,
 		authHandler:          authHandler,

@@ -15,33 +15,9 @@ import (
 type BlockStore struct {
 	s3     *S3Store
 	prefix string // Prefix for block keys in S3 (e.g., "blocks/")
-	// orgID, when non-empty, org-scopes the physical S3 key so that identical
-	// content in different orgs maps to distinct objects
-	// (blocks/<org_id>/<h0:2>/<h2:4>/<hash>). It is always a canonical UUID string,
-	// validated at construction by NewOrgBlockStore, so it can never contain a path
-	// separator. Empty only for the legacy global-key constructor NewBlockStore,
-	// which is being retired as callers migrate to the org-scoped store.
+	// orgID org-scopes every physical S3 key. It is always a canonical UUID
+	// string validated by NewOrgBlockStore, so it cannot contain a path separator.
 	orgID string
-}
-
-// NewBlockStore creates a new block store backed by S3.
-//
-// Deprecated: this constructor yields the legacy GLOBAL key layout
-// (blocks/<h0:2>/<h2:4>/<hash>) with no org component, which lets one org's GC
-// delete an S3 object another org still references (ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01).
-// New code must use NewOrgBlockStore. This is kept only while callers migrate and
-// will be removed once every path threads the org through.
-func NewBlockStore(s3Store *S3Store, prefix string) *BlockStore {
-	if prefix == "" {
-		prefix = "blocks/"
-	}
-	if !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-	return &BlockStore{
-		s3:     s3Store,
-		prefix: prefix,
-	}
 }
 
 // normalizeOrgID trims and validates an org id, returning its canonical UUID
@@ -72,9 +48,13 @@ func NewOrgBlockStore(s3Store *S3Store, prefix, orgID string) (*BlockStore, erro
 	if err != nil {
 		return nil, err
 	}
-	bs := NewBlockStore(s3Store, prefix)
-	bs.orgID = normalizedOrgID
-	return bs, nil
+	if prefix == "" {
+		prefix = "blocks/"
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return &BlockStore{s3: s3Store, prefix: prefix, orgID: normalizedOrgID}, nil
 }
 
 // BlockInfo contains metadata about a stored block
@@ -316,16 +296,11 @@ func (bs *BlockStore) PutBlocks(ctx context.Context, blocks []chunker.Block) ([]
 }
 
 // hashToKey converts a block hash to an S3 key.
-// Uses a two-level directory structure for better S3 performance, org-scoped when
-// this store was built with an org id:
+// Uses a two-level directory structure for better S3 performance:
 //
-//	org-scoped: "blocks/<org_id>/ab/cd/abcdef123456..."
-//	legacy:     "blocks/ab/cd/abcdef123456..."  (NewBlockStore only, being retired)
+//	"blocks/<org_id>/ab/cd/abcdef123456..."
 func (bs *BlockStore) hashToKey(hash string) string {
-	prefix := bs.prefix
-	if bs.orgID != "" {
-		prefix = bs.prefix + bs.orgID + "/"
-	}
+	prefix := bs.prefix + bs.orgID + "/"
 	if len(hash) < 4 {
 		return prefix + hash
 	}

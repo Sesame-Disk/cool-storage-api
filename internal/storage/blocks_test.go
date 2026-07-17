@@ -2,6 +2,7 @@ package storage
 
 import (
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -9,8 +10,17 @@ import (
 // BlockStore Tests (pure Go, no external dependencies)
 // =============================================================================
 
-// TestNewBlockStore tests BlockStore creation
-func TestNewBlockStore(t *testing.T) {
+func mustNewTestOrgBlockStore(t *testing.T, prefix string) *BlockStore {
+	t.Helper()
+	bs, err := NewOrgBlockStore(nil, prefix, testOrgA)
+	if err != nil {
+		t.Fatalf("NewOrgBlockStore() error: %v", err)
+	}
+	return bs
+}
+
+// TestNewOrgBlockStorePrefix tests BlockStore prefix normalization.
+func TestNewOrgBlockStorePrefix(t *testing.T) {
 	tests := []struct {
 		name           string
 		prefix         string
@@ -41,10 +51,7 @@ func TestNewBlockStore(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// We pass nil for s3Store since we're only testing prefix handling
-			bs := NewBlockStore(nil, tt.prefix)
-			if bs == nil {
-				t.Fatal("NewBlockStore returned nil")
-			}
+			bs := mustNewTestOrgBlockStore(t, tt.prefix)
 			if bs.prefix != tt.expectedPrefix {
 				t.Errorf("prefix = %q, want %q", bs.prefix, tt.expectedPrefix)
 			}
@@ -54,7 +61,8 @@ func TestNewBlockStore(t *testing.T) {
 
 // TestBlockStoreHashToKey tests the hash to S3 key conversion
 func TestBlockStoreHashToKey(t *testing.T) {
-	bs := NewBlockStore(nil, "blocks/")
+	bs := mustNewTestOrgBlockStore(t, "blocks/")
+	orgPrefix := "blocks/" + testOrgA + "/"
 
 	tests := []struct {
 		name     string
@@ -64,27 +72,27 @@ func TestBlockStoreHashToKey(t *testing.T) {
 		{
 			name:     "SHA-256 hash (64 chars)",
 			hash:     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-			expected: "blocks/e3/b0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			expected: orgPrefix + "e3/b0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 		},
 		{
 			name:     "SHA-1 hash (40 chars)",
 			hash:     "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-			expected: "blocks/a1/b2/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			expected: orgPrefix + "a1/b2/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		},
 		{
 			name:     "short hash (less than 4 chars)",
 			hash:     "abc",
-			expected: "blocks/abc",
+			expected: orgPrefix + "abc",
 		},
 		{
 			name:     "exactly 4 chars",
 			hash:     "abcd",
-			expected: "blocks/ab/cd/abcd",
+			expected: orgPrefix + "ab/cd/abcd",
 		},
 		{
 			name:     "5 chars",
 			hash:     "abcde",
-			expected: "blocks/ab/cd/abcde",
+			expected: orgPrefix + "ab/cd/abcde",
 		},
 	}
 
@@ -108,17 +116,17 @@ func TestBlockStoreHashToKeyWithCustomPrefix(t *testing.T) {
 	}{
 		{
 			prefix:   "org-123/blocks/",
-			expected: "org-123/blocks/e3/b0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			expected: "org-123/blocks/" + testOrgA + "/e3/b0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 		},
 		{
 			prefix:   "data/",
-			expected: "data/e3/b0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			expected: "data/" + testOrgA + "/e3/b0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.prefix, func(t *testing.T) {
-			bs := NewBlockStore(nil, tt.prefix)
+			bs := mustNewTestOrgBlockStore(t, tt.prefix)
 			result := bs.hashToKey(hash)
 			if result != tt.expected {
 				t.Errorf("hashToKey with prefix %q = %q, want %q", tt.prefix, result, tt.expected)
@@ -362,22 +370,9 @@ func TestOrgBlockStoreHashToKey_IsOrgScoped(t *testing.T) {
 	}
 }
 
-// TestNewBlockStore_LegacyKeyUnchanged pins the legacy global layout so PR-1 is a
-// pure addition with no behavior change for existing (not-yet-migrated) callers.
-func TestNewBlockStore_LegacyKeyUnchanged(t *testing.T) {
-	bs := NewBlockStore(nil, "blocks/")
-	if bs.orgID != "" {
-		t.Fatalf("legacy NewBlockStore has orgID %q, want empty", bs.orgID)
-	}
-	want := "blocks/e3/b0/" + testHash64
-	if got := bs.hashToKey(testHash64); got != want {
-		t.Errorf("legacy hashToKey = %q, want %q", got, want)
-	}
-}
-
 // TestHashSharding tests that hash sharding produces expected structure
 func TestHashSharding(t *testing.T) {
-	bs := NewBlockStore(nil, "blocks/")
+	bs := mustNewTestOrgBlockStore(t, "blocks/")
 
 	// Test that similar hashes are grouped together
 	hash1 := "abcd1234567890"
@@ -389,12 +384,13 @@ func TestHashSharding(t *testing.T) {
 	key3 := bs.hashToKey(hash3)
 
 	// hash1 and hash2 should share the first two levels (ab/cd)
-	if key1[:15] != key2[:15] { // "blocks/ab/cd/"
+	wantSharedPrefix := "blocks/" + testOrgA + "/ab/cd/"
+	if !strings.HasPrefix(key1, wantSharedPrefix) || !strings.HasPrefix(key2, wantSharedPrefix) {
 		t.Errorf("Hashes starting with 'abcd' should share prefix, got %s and %s", key1, key2)
 	}
 
 	// hash3 should have different first level (ef)
-	if key1[:10] == key3[:10] { // "blocks/ab" vs "blocks/ef"
+	if strings.HasPrefix(key3, wantSharedPrefix) {
 		t.Errorf("Hashes starting with 'abcd' and 'efgh' should have different first level")
 	}
 }

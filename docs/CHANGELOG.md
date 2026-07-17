@@ -8,6 +8,26 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-07-16 - GC physical deletion is org-scoped end to end (P10 PR-3)
+
+- Normal block deletion and S3 orphan recovery now resolve `BlockStore` by
+  `(org_id, normalized canonical storage_class)`, matching API reads/writes at
+  `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`.
+- GC trims incidental whitespace before exact class lookup and intentionally ignores
+  backend health failover. Orphan rows
+  with an empty storage class fail closed and retain their recovery position rather
+  than guessing `hot`.
+- Removed the org-less `NewBlockStore`, `Manager.GetBlockStore`, and
+  `Manager.GetHealthyBlockStore` APIs and the process-wide API `BlockStore` plumbing,
+  making accidental global-key access a compile-time failure.
+- Added unit coverage for org/class propagation, platform-org handling, canonical
+  class selection, fail-closed orphan recovery, and no-failover deletion.
+- Added real Cassandra+MinIO regressions proving that deleting identical bytes from
+  one org preserves the sibling org's metadata, reference, physical object, and
+  byte-for-byte download, including the S3 orphan-recovery path.
+
+---
+
 ## 2026-07-11 - GC library cascade hard-deletes before removing the storage counter
 
 - Reordered `cascadeDeleteLibrary` so `HardDeleteLibrary` (canonical row + delete marker)

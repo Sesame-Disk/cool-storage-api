@@ -10,16 +10,16 @@ import (
 
 // RegisterFileRoutes registers file routes.
 
-func RegisterFileRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) {
-	h := newRouteFileHandler(database, cfg, s3Store, blockStore, storageManager, tokenCreator, serverURL)
+func RegisterFileRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) {
+	h := newRouteFileHandler(database, cfg, s3Store, storageManager, tokenCreator, serverURL)
 
 	registerRepoFileRoutes(rg.Group("/repos/:repo_id"), h)
 	registerFileRevisionRoutes(rg.Group("/repo"), h)
 }
 
-func newRouteFileHandler(database *db.DB, cfg *config.Config, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) *FileHandler {
+func newRouteFileHandler(database *db.DB, cfg *config.Config, s3Store *storage.S3Store, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) *FileHandler {
 	permMiddleware := middleware.NewPermissionMiddleware(database)
-	h := NewFileHandler(database, cfg, s3Store, blockStore, storageManager, tokenCreator, serverURL, permMiddleware)
+	h := NewFileHandler(database, cfg, s3Store, storageManager, tokenCreator, serverURL, permMiddleware)
 	h.SetGCEnqueuer(getBlockEnqueuer())
 	return h
 }

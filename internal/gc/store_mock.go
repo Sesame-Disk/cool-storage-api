@@ -3356,8 +3356,10 @@ func (m *MockStore) LoadGCStats(key string) (string, error) {
 
 // MockStorageProvider implements StorageProvider for testing.
 type MockStorageProvider struct {
-	mu          sync.Mutex
-	DeletedKeys []string
+	mu             sync.Mutex
+	DeletedKeys    []string
+	ScopedDeletes  []ScopedBlockDelete
+	ResolvedStores []ScopedBlockStoreRequest
 
 	// failTimes is the number of upcoming DeleteBlock calls that should
 	// return an error before the next call succeeds. Decremented per call.
@@ -3369,8 +3371,33 @@ type MockStorageProvider struct {
 	failErr error
 }
 
-func (p *MockStorageProvider) GetBlockStore(storageClass string) (BlockStoreDeleter, error) {
-	return &mockBlockDeleter{provider: p}, nil
+type ScopedBlockDelete struct {
+	OrgID        string
+	StorageClass string
+	BlockID      string
+}
+
+type ScopedBlockStoreRequest struct {
+	OrgID        string
+	StorageClass string
+}
+
+func (p *MockStorageProvider) GetBlockStoreForOrg(orgID, storageClass string) (BlockStoreDeleter, error) {
+	trimmedOrgID := strings.TrimSpace(orgID)
+	if trimmedOrgID == "" {
+		return nil, fmt.Errorf("org-scoped block store requires a non-empty org id")
+	}
+	parsedOrgID, err := uuid.Parse(trimmedOrgID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid org id %q: %w", orgID, err)
+	}
+	if strings.TrimSpace(storageClass) == "" {
+		return nil, fmt.Errorf("storage class is empty")
+	}
+	p.mu.Lock()
+	p.ResolvedStores = append(p.ResolvedStores, ScopedBlockStoreRequest{OrgID: parsedOrgID.String(), StorageClass: storageClass})
+	p.mu.Unlock()
+	return &mockBlockDeleter{provider: p, orgID: parsedOrgID.String(), storageClass: storageClass}, nil
 }
 
 // DeletedBlocks returns the list of block IDs that were deleted.
@@ -3378,6 +3405,18 @@ func (p *MockStorageProvider) DeletedBlocks() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]string{}, p.DeletedKeys...)
+}
+
+func (p *MockStorageProvider) ScopedBlockDeletes() []ScopedBlockDelete {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]ScopedBlockDelete{}, p.ScopedDeletes...)
+}
+
+func (p *MockStorageProvider) BlockStoreRequests() []ScopedBlockStoreRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]ScopedBlockStoreRequest{}, p.ResolvedStores...)
 }
 
 // FailNextN causes the next n DeleteBlock calls to return err. After that,
@@ -3408,7 +3447,9 @@ func (p *MockStorageProvider) ClearFailures() {
 }
 
 type mockBlockDeleter struct {
-	provider *MockStorageProvider
+	provider     *MockStorageProvider
+	orgID        string
+	storageClass string
 }
 
 func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) error {
@@ -3422,6 +3463,11 @@ func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) erro
 		return d.provider.failErr
 	}
 	d.provider.DeletedKeys = append(d.provider.DeletedKeys, blockID)
+	d.provider.ScopedDeletes = append(d.provider.ScopedDeletes, ScopedBlockDelete{
+		OrgID:        d.orgID,
+		StorageClass: d.storageClass,
+		BlockID:      blockID,
+	})
 	return nil
 }
 
