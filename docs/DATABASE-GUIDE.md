@@ -1265,41 +1265,70 @@ func CreateUser(user User) error {
 }
 ```
 
-### Phase 4: ~~Use Counters Properly~~ — SUPERSEDED
+### Phase 4: ~~Use Counters Properly~~ — HISTORICAL, SUPERSEDED 2026-05-27
 
 ~~Replace `ref_count INT` with Cassandra counter columns.~~
 
-**Decision (2026-04-10):** Counter columns are **not compatible with LWT (IF clauses)**. Since GC's two-phase delete requires `UPDATE SET ref_count = -999 IF ref_count <= 0`, and uploads require `UPDATE SET ref_count = ? IF ref_count = ?` for CAS, we must keep `ref_count` as a regular INT column with explicit SELECT→UPDATE→LWT cycles. This is now implemented with retry loops in `IncrementOrCreateBlock` and `decrementBlockRefCount`.
+> **Historical decision (2026-04-10 through 2026-05-27; not the current protocol):** counter
+> columns were rejected because they cannot use LWT `IF` clauses. That interim design kept a regular
+> `ref_count INT`, used `ref_count = -999` as the GC sentinel, and used SELECT -> CAS retry loops in
+> `IncrementOrCreateBlock` / `decrementBlockRefCount`. The row-per-reference migration superseded
+> this entire protocol: `blocks.ref_count`, the `-999` sentinel, and those mutation loops are no
+> longer the active liveness model.
 
-Cassandra counters (`ref_count COUNTER`) would provide atomic `ref_count = ref_count + 1` without read-before-write, but:
+Historically, Cassandra counters (`ref_count COUNTER`) would have provided atomic increment without
+read-before-write, but:
 - Cannot use `IF` conditions (LWT) with counter tables
 - Cannot set sentinel values for GC coordination
 - Cannot conditionally gate deletion on current value
-- Race between "increment counter" and "read counter for GC decision" is worse than the current LWT approach
+- Race between "increment counter" and "read counter for GC decision" was worse than that interim LWT approach
 
 ### Phase 5: Consistency Level Configuration
 
-Set appropriate consistency levels per operation:
+The application configures one regular session consistency and one serial consistency. Except for
+queries that explicitly override the driver setting, these session values apply across operations;
+there is no supported per-operation `reads/writes/critical` configuration map. The block-path rows
+below describe behavior under the committed production baseline, not independent knobs per row:
 
 | Operation | Consistency Level | Why |
 |-----------|-------------------|-----|
-| User login | `LOCAL_QUORUM` | Must be consistent |
-| File listing | `LOCAL_ONE` | Can be slightly stale |
-| Commit creation | `QUORUM` | Must be durable |
-| Block reference add/remove (`block_references`) | `LOCAL_QUORUM` | Idempotent INSERT/DELETE — no cross-DC Paxos in steady state |
-| GC block-delete claim (`gc_state` LWT) | `SERIAL` (default) | The ONLY block-path global Paxos — guards the irreversible S3 delete; do NOT change to `LOCAL_SERIAL` |
-| Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads must see latest state |
-| Share link validation | `LOCAL_QUORUM` | Security-critical |
+| Immutable block metadata first writer (`blocks`) | `LOCAL_QUORUM` + `SERIAL` serial phase | Existing per-`(org_id, block_id)` `INSERT IF NOT EXISTS` LWT pins size/class/key to one physical location |
+| GC block-delete claim/finalize (`gc_state`, `gc_claim_id`) | `LOCAL_QUORUM` + `SERIAL` serial phase | Existing per-block LWT guards the irreversible delete lifecycle; do not change the serial phase to `LOCAL_SERIAL` in a multi-DC topology |
+| S3 orphan lifecycle (`gc_s3_orphans`) | `LOCAL_QUORUM` + `SERIAL` serial phase | `StartBlockDeleteOrphan` uses `IF NOT EXISTS`/`IF EXISTS`, and phase advancement uses `IF EXISTS`; these existing LWTs persist and advance recovery state but do not yet provide shared worker/recovery lifecycle ownership |
+| Block reference add/remove (`block_references`) | `LOCAL_QUORUM` | Idempotent ordinary `INSERT`/`DELETE`; no Paxos and no new LWT for the upload-fence fix |
+| SHA-1 forward mapping (`block_id_mappings`) | `LOCAL_QUORUM` | Guarded read-before-write followed by an ordinary `INSERT`; intentionally no mapping LWT/Paxos |
+| Block reuse/fence reads | `LOCAL_QUORUM` | Reads metadata, references, `gc_state`, and `gc_s3_orphans`; the upload-fence fix adds no operation to the no-fence steady-state path |
 
-**Implementation in config.yaml:**
+**Current configuration schema:**
 ```yaml
 database:
-  consistency:
-    default: LOCAL_QUORUM
-    reads: LOCAL_ONE
-    writes: LOCAL_QUORUM
-    critical: QUORUM
+  consistency: LOCAL_QUORUM
+  serial_consistency: SERIAL
 ```
+
+The nested `consistency.default/reads/writes/critical` example was a design sketch and is not a
+supported schema. The application currently accepts one regular consistency scalar plus one serial
+consistency scalar, both of which may be overridden by environment variables.
+
+`configs/config.prod.yaml` commits `SERIAL`, while `config-usa.cluster.yaml` and
+`config-eu.cluster.yaml` currently commit `LOCAL_SERIAL`. Those files are baselines, not proof of
+runtime configuration. Until the serial-domain assumptions are validated or the destructive GC
+protocol is redesigned for those profiles, keep GC disabled in the `LOCAL_SERIAL` cluster profiles.
+Confirm the effective values from startup logs/environment and live keyspace topology before
+enabling destructive work.
+
+The GC claim is therefore not literally the only Paxos operation in the block path. Immutable
+block metadata already has a first-writer LWT; GC has separate delete-claim/finalize LWTs; and the
+orphan lifecycle uses conditional create/reset/phase-advance writes. Those orphan conditions prevent
+phantom recovery rows but do not currently fence one delete lifecycle across direct worker and
+scanner recovery. References and SHA-1 forward mappings deliberately remain ordinary writes. The selected
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` remediation repeats server-side physical storage after
+an observed fence; it does **not** add LWT to steady-state reference or mapping writes. Partial
+retry wrappers already exist for six upload funnels, but the inner registration wait currently
+absorbs fast-clear and the web `blocks.go` session path is unwrapped. The fix must propagate the
+observed fence and reuse those wrappers. For existing-metadata `NeedsPut`, it must also store through
+`probe.StorageClass` and the canonical key so first-writer metadata and physical placement cannot
+diverge.
 
 ---
 
@@ -1317,7 +1346,7 @@ database:
 ### Pending
 - [ ] Implement LWT for user creation
 - [ ] Implement LWT for `head_commit_id` updates (optimistic locking)
-- [x] ~~Convert `blocks.ref_count` to counter table~~ — SUPERSEDED: LWT (IF clauses) incompatible with counter columns. Solved with SELECT→CAS retry loops instead (2026-04-10)
+- [x] ~~Convert `blocks.ref_count` to counter table~~ — SUPERSEDED twice: counters were rejected in favor of interim SELECT -> CAS loops (2026-04-10), then `ref_count` itself was removed for row-per-reference liveness (2026-05-27)
 - [x] Retire decrement idempotency markers in favor of row-per-reference liveness — DONE: active GC no longer uses `gc_processed_items`; block liveness is derived from `block_references` plus delete-fence verification (2026-05-30)
 
 ---

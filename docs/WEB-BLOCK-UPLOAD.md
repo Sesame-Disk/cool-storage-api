@@ -1,7 +1,11 @@
 # Web content-addressed (block) upload flow
 
 **Date:** 2026-07-03
-**Status:** Phase 1 implemented (backend + frontend) + post-review hardening + retry/hash-cache hardening.
+**Status:** Phase 1 implemented (backend + frontend) + post-review hardening + retry/hash-cache
+hardening. **2026-07-20 pre-fix blocker:**
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` is documented but not yet fixed; an upload that
+observes a fast-clearing GC delete fence can currently materialize metadata without repeating its
+earlier physical PUT.
 Gated OFF by default by a **server-side** flag (`web_uploads.enable_web_block_upload`
 / `WEB_UPLOADS_ENABLE_WEB_BLOCK_UPLOAD`); the frontend flag (`enableBlockUpload`) is
 driven from it via bootstrap. Encrypted libraries and public share/upload links
@@ -128,25 +132,32 @@ the file must be hashed again before `/blocks/check`.
 
 ---
 
-## Design rules (R1–R11) and how they are enforced
+## Target contract (R1-R11) and current enforcement status
 
-These rules came out of a careful review of the existing block infrastructure.
-They are the reason the implementation is safe; do not relax them without
-re-reading this section.
+These rules define the target contract. Most are enforced, but R1/R3/R9 are **OPEN REQUIREMENTS**
+for the fast-clear GC race described below; do not cite this section as proof that the current web
+block-session implementation is end-to-end safe.
 
-- **R1 — Never publish a block just because it exists in S3.** `/blocks/check`
+- **R1 — OPEN REQUIREMENT: never publish a block just because it exists in S3.** `/blocks/check`
   (and `CheckBlocksParallel`) is only a *physical existence oracle*. The commit
   runs `db.ProbeBlockReuse` per block and only accepts `Reusable` (metadata +
   live reference + no GC fence). `NeedsPut`/`BlockedByGC` → returned in
-  `needs_upload`.
+  `needs_upload`. Conversely, an earlier successful PUT is not proof after the
+  server observes either GC delete fence (`blocks.gc_state='deleting'` or
+  `gc_s3_orphans`): that PUT is invalidated for purposes of returning success and
+  the server must repeat physical storage after the fence before publishing metadata.
 - **R2 — Anti-orphan is P0.** A block uploaded via the legacy `/blocks/upload`
   (no session) is an S3 object with **no Cassandra metadata/ref** and can leak.
   The session flow materializes a provisional reference with TTL
   (`gc_provisional_block_refs`), so an abandoned upload self-expires and the GC
   sweeper reclaims it.
-- **R3 — Session-aware check.** session-mode `/blocks/check` reports a block as
+- **R3 — OPEN REQUIREMENT for the upload race; session-aware check is otherwise implemented.**
+  Session-mode `/blocks/check` reports a block as
   `existing` only when `ProbeBlockReuse == Reusable`, not merely present in S3 —
-  avoiding the "exists in S3 but unmaterialized → commit says NeedsPut" trap.
+  avoiding the "exists in S3 but unmaterialized → commit says NeedsPut" trap. A
+  check result does not reserve the object against a later GC race. If the upload
+  path subsequently observes a delete fence, the server owns the exceptional retry
+  and must run `store -> materialize` again; it must not require a second client request.
 - **R5 — Quota in three planes.** Traffic is charged per block at
   `/blocks/upload`; the **logical** repo/user storage quota is decided once at
   commit from the file delta (`currentUploadStorageDelta`), never per block — the
@@ -182,9 +193,22 @@ re-reading this section.
   publish-attempt staging still pins every block under the commit *before* its
   HEAD CAS, so a concurrent rollback of another session's provisional ref cannot
   drop liveness for this file.
-- **R9 — session-mode `/blocks/upload` always materializes**, even when
-  `PutBlockData` was a no-op because the object already existed in S3. The point
-  is to *govern* the block, not just store bytes.
+- **R9 — OPEN REQUIREMENT: session-mode `/blocks/upload` must materialize as part of one
+  server-owned physical-store/materialization operation**, even when the physical
+  step discovers that the object already exists. The point is to *govern* the block,
+  not just store bytes.
+  If materialization observes either GC fence, every PUT/no-op check before that
+  observation is invalidated for success: after the fence clears, the server must
+  repeat the physical store callback while it still owns the request bytes, then
+  materialize metadata/reference state. This is an exceptional fence-observed retry;
+  the no-fence hot path adds no Cassandra operation.
+
+  Current `internal/api/v2/blocks.go` does not enforce that operation boundary. It calls
+  `BlockExists`, `PutBlockData`, and `RegisterWebUploadedBlockAndMapping` directly, without
+  `ProbeBlockReuse` plus the full retry wrapper. Six other funnels have partial wrappers:
+  SeafHTTP simple and streaming, sync `PutBlock`, V2 `UploadFile`, template `CreateFile`, and
+  OnlyOffice. They are still incomplete because `RegisterUploadedBlock` absorbs an active-to-clear
+  fence internally and returns `nil`, so the outer wrapper does not repeat its store callback.
 > **⚠️ Superseded (2026-06-30, PR1–PR5 merged to `main`):** the **SHA-256-canonical
 > block IDs** change has shipped. The current layout is **SHA-256 in
 > `fs_objects.block_ids`** (O(0) read/GC mapping lookups) plus a dedicated
@@ -230,12 +254,14 @@ re-reading this section.
   `manifestDigest`, so an idempotent replay with the same SHA-256s but a different
   SHA-1 is a different file (409), not a silent id/object mismatch.
 
-  **No Paxos on the hot path, and both writers share the same remap guard.** The forward mapping for
-  the web flow is written by a **web-only** helper, `WriteVerifiedWebBlockMapping`
+  **No mapping-specific additional Paxos for the SHA-1 forward mapping, and both mapping writers
+  share the same remap guard.** This statement is specifically about the forward mapping, not every
+  database operation in block upload. The forward mapping for the web flow is written by a
+  **web-only** helper, `WriteVerifiedWebBlockMapping`
   (via `RegisterWebUploadedBlockAndMapping`), which guards against remapping an
   existing SHA-1 to different content (a crafted SHA-1 collision could otherwise
   corrupt downloads of committed files) with a plain read-before-write, **not** a
-  Cassandra LWT. Per-block Paxos would cause latency/contention/timeouts in
+  Cassandra LWT. An additional mapping-specific Paxos round would cause latency/contention/timeouts in
   multi-DC/multi-node deployments; the only residual gap is two *colliding* blocks
   written concurrently in the tiny read→write window (astronomically unlikely), and
   the commit-side forward check is the integrity authority regardless.
@@ -245,6 +271,19 @@ re-reading this section.
   succeed when the row already points to the same SHA-256, and reject a
   same-domain remap to different content. The helpers still differ in trust
   boundary and call-site ergonomics, but not in conflict semantics.
+
+  Immutable `blocks` metadata separately uses first-writer-wins `INSERT IF NOT EXISTS`
+  per `(org_id, block_id)`, as it already does before the planned remediation. `AddBlockReference`
+  remains an idempotent ordinary `INSERT`, and forward mappings remain guarded ordinary
+  read-before-write operations. The fence remediation must not add LWT/Paxos to either
+  references or mappings and adds no steady-state LWT to the no-fence upload path.
+
+  For `NeedsPut` with an existing immutable metadata row, the store callback must resolve
+  `probe.StorageClass` and the canonical org-scoped key. Using the session's current preferred store
+  can place bytes in a different backend while the existing first-writer metadata continues to
+  point at the old backend. This canonical-store behavior is required by the fix and its
+  regressions; it is not implemented consistently today. `EnsureReusableBlockPresent` does not
+  close this case because its targeted HEAD/repair applies only to `Reusable`.
 - **R11 — Sizes validated against real metadata.** The commit checks
   `manifest.size == ProbeBlockReuse.SizeBytes` per block; a manifest cannot
   declare a size that disagrees with the stored block.
@@ -386,6 +425,25 @@ re-upload).
 
 ## Validation status
 
+**Fence-rematerialization status (2026-07-20): OPEN, docs pre-fix.**
+`TestUploadLink_ReuploadBlockedByS3OrphanFence` in
+`internal/integration/gc_integration_test.go` proves that a persistent
+`gc_s3_orphans` fence exhausts the bounded wait, prevents publication, and leaves the
+orphan recovery row in place on the **SeafHTTP/upload-link** path. It does not invoke this web
+block-session handler and does **not** reproduce the fast-clear case where GC
+deletes the just-uploaded object and clears the fence inside the 8-attempt/7-sleep
+registration window. `TestRetryUploadedBlockMaterializationRetriesStoreFence` is synthetic: the
+test store callback returns `ErrBlockDeleteInProgress` directly, without real
+`RegisterUploadedBlock` or a fast-clearing fence. This handler still needs its own persistent-fence
+and fast-clear web-session regressions. Until the production fix and those regressions land,
+R1/R3/R9 above describe the required contract, not current proof.
+
+Post-fence server rematerialization is necessary but not sufficient. Worker and scanner can run
+concurrently under the same leader: recovery may clear the orphan fence while the original worker
+is still able to delete S3, allowing that worker to remove the post-fence re-PUT. Stale/overlapping
+recoverers have the same ABA shape. The production fix therefore also needs shared per-delete-
+lifecycle ownership/generation (or equivalent fencing) across the direct worker and recovery.
+
 **Backend: validated live** (`internal/integration/web_block_upload_test.go`, all
 passing against real Cassandra + MinIO via `docker compose`):
 
@@ -396,7 +454,9 @@ passing against real Cassandra + MinIO via `docker compose`):
 - R6: manifest sum/size mismatch → 400
 - R6: same SHA-256 declared with conflicting sizes → 400
 - R11: block size disagrees with stored metadata → 422
-- GC fence (`blocks.gc_state='deleting'`) → commit refuses
+- GC claim fence (`blocks.gc_state='deleting'`) → commit refuses
+- web block-session persistent and fast-clear fence regressions: **missing** (the similarly named
+  upload-link test above exercises SeafHTTP, not this handler)
 - R7: idempotent sequential replay → no duplicate file
 - R7: **concurrent double commit → single file** (this caught a real read-then-act
   race, fixed with the LWT claim)
@@ -1208,10 +1268,10 @@ flag were on*.
 
 ## Security/performance review findings (2026-07-02)
 
-A full doc-vs-code review confirmed R1–R11 are enforced as documented and the flow
-is genuinely multi-node (state in Cassandra/S3, LWT commit claim, no sticky
-routing, per-repo storage-class resolution). It also surfaced findings NOT
-tracked above. Progress is tracked here; each fix ships as its own small PR.
+> **2026-07-20 correction:** this review confirmed the then-audited session and multi-node
+> mechanics, but its blanket statement that R1-R11 were enforced is superseded. R1/R3/R9 remain
+> open for fast-clear; `blocks.go` is unwrapped, and existing-metadata `NeedsPut` is not consistently
+> canonical-store aware. The findings below remain useful for their own scopes.
 
 11. **[High — FIXED by REMOVAL, PR `fix/block-endpoint-org-authorization`]
     `GET/HEAD /api/v2/blocks/:hash` had no authorization beyond authentication —

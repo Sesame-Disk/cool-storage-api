@@ -237,7 +237,8 @@ block look dead while retained metadata still points at it.
 ## 25. SeafHTTP Finalize Operational Hardening
 
 ### Current State
-Correctness blockers for merge have been handled in the writer path:
+Several earlier correctness blockers were handled in the writer path, but
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` remains open:
 - SeafHTTP upload refs use a per-attempt/session operation ID instead of a reusable
   access token.
 - S3 orphan fences are no longer cleared by writers; recovery/GC owns S3 deletes.
@@ -268,13 +269,14 @@ reusable / needs-put / blocked-by-GC / unknown-error. Needs-put blocks use
 `PutBlockAutoDirect` (no HEAD); reusable blocks run `EnsureReusableBlockPresent`
 (verify the canonical object via HEAD on the declared key, repair via direct PUT
 only if missing); blocked-by-GC returns `ErrBlockDeleteInProgress` to retry;
-unknown-error falls open to the legacy Exists+PUT. Wired into all five upload paths
+unknown-error falls open to the legacy Exists+PUT. Partially wired into six upload funnels
 (`seafhttp.go` ×2, `sync.go`, `files.go` ×2, `onlyoffice.go`). Per-block cost: a
 new block now pays ≤2 Cassandra reads (~1 ms each) + 1 direct PUT and no HEAD;
-dedup hits keep one canonical-verify HEAD. Safety is unchanged — it rests on the
-reference-first/fence-check protocol in `RegisterUploadedBlock`, not on the PUT
-(see KNOWN_ISSUES ISSUE-UPLOAD-S3-DOUBLE-RTT-01). The materialize retry loop now
-also retries `ErrBlockDeleteInProgress` from the `store` phase.
+dedup hits keep one canonical-verify HEAD. The materialize retry loop also retries
+`ErrBlockDeleteInProgress` from the `store` phase, but the end-to-end safety invariant remains open:
+`RegisterUploadedBlock` absorbs fast-clear and returns `nil`, preventing the outer store retry.
+Web block-session `v2/blocks.go` is unwrapped. Existing-metadata `NeedsPut` must also store through
+`probe.StorageClass` and the canonical key rather than the current preferred backend.
 
 **Scope (not global):** this fixes the server-side hot upload paths only. The
 `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData` still do
@@ -285,7 +287,8 @@ from `BlockStore` globally.
 Tests: `ProbeBlockReuse` decision matrix (`block_references_test.go`),
 reusable/needs-put `finalizeUploadStreaming` paths (`seafhttp_test.go`),
 `EnsureReusableBlockPresent` exists/repair paths and shared retry helper
-(`upload_reuse_test.go`).
+(`upload_reuse_test.go`). The helper's store-fence test is synthetic and does not exercise real
+`RegisterUploadedBlock` or fast-clear.
 
 **P-2b - Generic S3 multipart uploads still sent parts serially** - Fixed
 (2026-06-17, branch `perf/s3-multipart-parallel-parts`)
@@ -2079,28 +2082,29 @@ on that metric to bound leaked forward mappings.
 
 ## 31. GC Library-Delete Cleanup Audit Follow-ups (2026-07-10)
 
-A cross-agent audit after PR #123 (`fix/gc-block-representation-durability`) found the
-**physical block-delete protocol conservative**, but identified a High end-to-end fail-open
-existence check (P6) plus durability/discovery debt. GC is not safety-certified until P6 is
-fixed and fault-injection tested. Full audit and code citations:
+A cross-agent audit after PR #123 (`fix/gc-block-representation-durability`) documented the
+claim/recheck and durable orphan-recovery protocol. P6a/P6b were subsequently fixed, but the
+2026-07-20 refresh found the open fast-clear upload blocker
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`: partial retry wrappers exist, yet the inner
+registration wait absorbs the fence and web block session is unwrapped. Full audit and code citations:
 `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`. Per-item
 issues: `ISSUE-GC-*` in `docs/KNOWN_ISSUES.md`. This extends the earlier §10 (Library Deletion:
 Cleanup Paths) — those paths are functionally correct but leave the durability/optimality debt below.
 
-**Conservative physical protocol, unsafe upstream classification:** physical block delete
-uses claim-then-verify LWT, registers `gc_s3_orphans` recovery before deleting the canonical
-row, orders DB→S3→mapping, guards against resurrection, and validates the block representation
-fail-closed. However, `LibraryExists`/`GroupExists` swallow Cassandra errors as "missing";
-scanners can enqueue destructive work for live metadata without the delete guard
-(`ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01`). Physical fences cannot restore a legitimate
-reference after the GC itself removed it.
+**Current boundary:** physical block delete uses claim-then-verify LWT, registers
+`gc_s3_orphans` recovery before deleting the canonical row, and validates representation
+fail-closed. Existence reads and execution-time canonical revalidation are fixed. The remaining
+blocker is writer-side: a fast-clearing fence can be consumed without a post-fence store. The fix
+must use canonical metadata placement for existing-metadata `NeedsPut` and add no LWT to
+references/mappings or the no-fence path.
 
-**Engine-level robustness debt (E1/E2/E4/E5, low-severity,
+**Engine-level robustness debt (E1/E2/E4, low-severity,
 `ISSUE-GC-ENGINE-ROBUSTNESS-01`).** A
 worker/scanner review found: `postponeItem` re-queues lock-contended items without a bound or
 metric; `dryRun` has a Go race distinct from hard-cutover semantics; pending rows lack an
-independent drift reconcile (a blind TTL is unsafe); S3-orphan recovery relies on the leader
-lease with no per-row LWT. Former E3 is escalated to P6. Three louder-sounding claims
+independent drift reconcile (a blind TTL is unsafe). Former E3 is escalated to P6. Former E5 is no
+longer low-severity debt: the missing shared delete-lifecycle fence across direct worker and
+Phase-16 recovery is required by `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`. Three louder-sounding claims
 (mid-cascade DLQ loop, missing `pending_s3` resurrection
 guard, child/parent enqueue race) were reviewed and found NOT to be bugs — see the audit doc.
 
@@ -2110,10 +2114,9 @@ indexes are gone, artifacts are invisible (`ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-0
 
 ### Deferred / by-design debt
 
-- **Durable delete outbox (a).** Permanent-delete currently hands off via a fire-and-forget
-  `go fn()` enqueue (`ISSUE-GC-DELETE-HANDOFF-DURABILITY-01`). The durable fix is a
-  `deleted_libraries.purge_requested_at` marker that Phase 13 treats as immediately eligible, so
-  the goroutine becomes a mere accelerator. Intentionally **not** modeled as one atomic Cassandra
+- **Durable delete outbox (a) - resolved.** Permanent delete stamps
+  `deleted_libraries.purge_requested_at`, Phase 13 treats it as immediately eligible, and wired
+  handlers attempt an immediate best-effort full cascade enqueue. The durable handoff is intentionally **not** modeled as one atomic Cassandra
   batch — ref release, candidate promotion, policy-index deletion, and content enqueue are
   variable-size, multi-partition, and overlap the existing cascade; a single "atomic" batch is
   neither possible nor safe and would risk double zero-ref transitions. The delete entry point does

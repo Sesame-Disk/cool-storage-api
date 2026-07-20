@@ -1,6 +1,6 @@
 # GC Service Analysis
 
-**Date:** 2026-04-14 · **Corrected against `main` 4333be1b3:** 2026-07-10 · **Status refresh:** 2026-07-16
+**Date:** 2026-04-14 · **Corrected against `main` 4333be1b3:** 2026-07-10 · **Status refresh:** 2026-07-16 · **Upload-fence blocker:** 2026-07-20
 **Scope:** `internal/gc/` — 9,940 lines across 9 files + 3,380 lines of tests.
 **Goal:** Evaluate correctness, test coverage, identify potential data-loss bugs, and
 plan integration tests for long-running monitoring.
@@ -14,9 +14,10 @@ plan integration tests for long-running monitoring.
 > download survive. An API-level test proves distinct physical keys across the default and
 > platform orgs, and an adapter unit test pins `PlatformOrgID` handling in GC.
 > See `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`.
-> The previous "no open known issue can delete live content" verdict is **retracted**: it only ever
-> reasoned about liveness *within* an org. The physical block-delete claim/recovery
-> protocol is conservative. P6a (existence-read failures interpreted as "missing", enqueuing
+> The previous "no open known issue can delete live content" verdict is **retracted**. P10 fixed
+> its cross-org cause, but a same-org blocker is now open:
+> `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`. The physical block-delete claim/recovery
+> protocol has useful guards but is not an end-to-end upload safety proof. P6a (existence-read failures interpreted as "missing", enqueuing
 > destructive work for live libraries on a transient error) is **fixed** (branch 1D): existence
 > reads fail closed and Phases 3/4/9 surface the error. P6b is **fixed**: queued orphan work is
 > revalidated by canonical `(org_id, library_id)` point read under the existing library lock,
@@ -24,8 +25,16 @@ plan integration tests for long-running monitoring.
 > cascade on every wired permanent-delete path) are **fixed** on `main` (PR #129), and P9
 > (`gc_pending_items` block-row leak) is fixed for new work.
 >
-> The remaining debt is **storage retention in edge cases, observability, test
-> hygiene, and scale** — not live-data safety: P4 (`pub:` zero-ref transition), P5 (Phase 13 error visibility), P7
+> This is a **documentation pre-fix** status: an upload can PUT, add its provisional reference after
+> GC's second reference check, wait while GC writes the orphan fence/finalizes/deletes S3, and then
+> materialize metadata after that fence clears without repeating the PUT. A successful response can
+> have a live reference and no object. The selected contract is a server-owned post-fence
+> `store -> materialize` retry. Retry/probe/repair wrappers exist on six funnels, but the inner
+> registration wait absorbs fast-clear and the web block-session path is unwrapped; therefore the
+> end-to-end invariant remains open.
+>
+> Other remaining debt is storage retention in edge cases, observability, test
+> hygiene, and scale: P4 (`pub:` zero-ref transition), P5 (Phase 13 error visibility), P7
 > (markerless commit/fs_object partitions invisible to orphan discovery — reachable on any
 > cluster via terminal child-work loss/DLQ expiry, so 8D stays open), P8 (Phase 9
 > `shares_by_group` global scan). Reconcile/backfill (8A–8C) repairs *pre-existing* residue only
@@ -127,21 +136,32 @@ processBlock(item):
   1. Point-read live block_references / provisional refs
      └─ If any ref exists: skip, delete GC candidate, done.
   2. ClaimBlockDelete(blockID) via LWT delete fence
-     └─ If claim fails: another worker or a new live ref won; skip.
+     └─ If claim fails: gc_state/claim ownership was not acquired; another delete owner may hold it.
   3. Re-check live references after the claim
      └─ If any ref exists: release claim, skip.
-  4. Record S3 orphan fence + DELETE block metadata/mappings
-  5. Resolve BlockStore by (item.org_id, canonical storage_class), without health failover
-  6. S3 DeleteBlock(blockID) at blocks/<org_id>/...
-     └─ If S3 fails: LOG WARNING, return error → retry
-  7. Delete GC candidate record and clear the fence/claim state
-  8. Increment stats
+  4. StartBlockDeleteOrphan: record gc_s3_orphans fence before DB removal
+  5. FinalizeBlockDelete: conditionally DELETE canonical block metadata
+  6. Resolve BlockStore by (item.org_id, canonical storage_class), without health failover
+  7. S3 DeleteBlock(blockID) at blocks/<org_id>/...
+     └─ If S3 fails: log warning, keep orphan row for scanner recovery
+  8. Clean exact mapping, then clear orphan fence/candidate after S3 success
+  9. Increment stats
 ```
 
-**The claim+verify fence is the core safety mechanism.** Even if a block is enqueued
-for deletion while simultaneously being referenced by a new upload, the worker
-point-reads live references before and after the LWT claim, and releases the
-claim if a concurrent writer reintroduces liveness before S3 deletion.
+**The claim+verify check is necessary but not sufficient.** The worker catches a reference visible
+before its second point read and releases the claim. A provisional reference added after that read
+does not stop the already-authorized delete. `BlockDeleteFenceActive` therefore checks both the
+in-row `gc_state='deleting'` claim and `gc_s3_orphans`, whose row persists from before
+`FinalizeBlockDelete` through the S3 delete. The current blocker is on the writer side: if that
+orphan fence clears inside `RegisterUploadedBlock`'s wait, metadata can be written without a
+post-fence PUT.
+
+Six upload funnels already place store and materialize callbacks inside retry wrappers (SeafHTTP
+simple/streaming, sync `PutBlock`, V2 `UploadFile`, template `CreateFile`, and OnlyOffice). They do
+not close this race because the inner wait returns `nil` after fast-clear. The web block-session
+handler in `internal/api/v2/blocks.go` has no complete wrapper/probe path at all. For
+existing-metadata `NeedsPut`, the eventual store must also use `probe.StorageClass` and the
+canonical key rather than a newly preferred backend.
 The physical delete is bound to the same org partition used by those checks and to
 the block row's normalized canonical storage class. GC deliberately ignores backend
 health failover because deleting from a fallback backend would target a different
@@ -166,9 +186,10 @@ the fs_object cleanup deletes the same keyed `block_references` rows again, whic
 is safe, and zero-ref discovery is re-derived from current live references rather
 than replaying decrement markers.
 
-Block deletion also re-checks live `fs_object` references before claiming a
-zero-ref block. The worker caches the org's live block-reference set during a
-batch, so deleting N block items does not rescan every `fs_object` N times.
+Block deletion does not rescan `fs_objects`. It point-reads the target block's
+`block_references` partition before the claim and again after the claim. There is no
+org-wide live-reference cache in this protocol; each destructive block decision is
+derived from the current per-block reference rows visible at those two reads.
 
 ---
 
@@ -176,9 +197,10 @@ batch, so deleting N block items does not rescan every `fs_object` N times.
 
 These are deliberate safety mechanisms that are correctly implemented and tested:
 
-1. **Claim-then-verify block deletion** — Cassandra lightweight transactions only guard
+1. **Claim-then-verify block deletion** — Cassandra lightweight transactions guard
    the delete claim, and the worker re-checks live `block_references` before S3
-   deletion. That prevents live content from being removed even under concurrent upload.
+   deletion. This prevents deletion when the reference is visible by the recheck; it does not cover
+   a reference added just afterward. `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` remains blocking.
 2. **Grace period** (default 1h) — Recently enqueued items can't be processed. Gives
    time for concurrent operations to finish registering or promoting references.
 3. **Idempotent cleanup by liveness rows** — keyed `block_references` rows replace the
@@ -228,6 +250,14 @@ This turns the old permanent storage leak into an operational retry path. The
 remaining tradeoff is intentionally conservative cursor advancement: if the
 canonical block row still exists (for example claimed but not yet finalized),
 recovery defers that row to a later pass instead of touching S3 early.
+
+**2026-07-20 boundary:** the recovery row is also an upload-visible fence, but there is no
+per-delete-lifecycle claim/generation shared by the direct worker and recovery. Worker and scanner
+run concurrently under the same leader, so Phase 16 can clear an orphan while the original worker
+is still able to execute its S3 delete. An upload may rematerialize after the fence clears and then
+lose that new copy to the original worker. Stale/overlapping recoverers have the same ABA shape.
+Server-side rematerialization is necessary but not sufficient; lifecycle fencing is part of the
+current blocker rather than a separate optional hardening item.
 
 ### RESOLVED (High): Existence checks failed open before destructive orphan cleanup
 
@@ -336,16 +366,20 @@ double-decrement anything.
 
 ### Scenario 3: Re-upload races with block GC
 
-Writers probe `gc_state`/S3-orphan fences. The worker pre-checks references, claims the block via
-LWT, then re-checks references. If a writer registered liveness, the worker releases the claim and
-removes the stale candidate. Before removing the canonical block row it persists S3 recovery.
+Writers probe both `gc_state='deleting'` and `gc_s3_orphans`. The worker pre-checks references,
+claims the block via LWT, then re-checks references. If a writer registered liveness before that
+second check, the worker releases the claim and removes the stale candidate. Before removing the
+canonical block row it persists S3 recovery. If the reference appears after the second check,
+current `RegisterUploadedBlock` can observe the fence, wait for it to clear, and write metadata
+without repeating a PUT that GC deleted. This is the open fast-clear rematerialization blocker.
 
 ### Scenario 4: Library soft-delete and purge
 
-Soft-delete keeps the library row and stamps `deleted_libraries.block_representation_id`. Phase 13
-queues `ItemLibraryCascade` after retention. Direct permanent-delete paths have P1/P2 debt: some
-omit immediate content enqueue; others use a non-durable, content-only goroutine. The durable purge
-marker roadmap makes Phase 13 immediately eligible while keeping content cleanup idempotent.
+Soft-delete keeps the library row and stamps `deleted_libraries.block_representation_id`; Phase 13
+queues `ItemLibraryCascade` after retention. Permanent delete now stamps durable
+`purge_requested_at`, making Phase 13 immediately eligible, and wired handlers also attempt an
+immediate best-effort full cascade enqueue. A lost immediate enqueue delays reclamation but the
+durable Phase 13 recovery remains authoritative.
 
 ### Scenario 5: User/organization cascades
 
@@ -366,7 +400,8 @@ worker must never touch unrelated org work.
 
 ### Current safety statement
 
-The physical block claim/recheck/recovery sequence is conservative **given correct classification**.
+The physical block claim/recheck/recovery sequence is crash-recoverable but **not currently a
+complete end-to-end upload safety guarantee**.
 The transient-error fail-open existence read (P6a) and execution-time canonical revalidation gap
 (P6b) are fixed. P6b uses durable guard modes, the existing library lock, an O(1) canonical
 point read, and synchronous fences before destructive mutations. P8 tracks Phase 9's provisional
@@ -375,6 +410,12 @@ global Cassandra scan (streamed and cancellable, but not partition-bounded). P1/
 cascade's `HardDeleteLibrary` clears the policy rows the direct-delete batch leaves behind). The
 remaining P4/P5/P7 issues plus the P8 scale debt primarily retain or delay garbage rather than
 deleting referenced blocks.
+
+Separately, `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` can produce successful metadata/reference
+publication after GC has deleted the physical object. Required remediation has two inseparable
+parts: repeat canonical physical store after observing either fence, and fence the direct worker
+plus Phase-16 recovery under one delete-lifecycle generation so no authorized delete remains after
+that visible fence is cleared.
 
 ---
 
@@ -405,7 +446,7 @@ deleting referenced blocks.
 | **Deduplication safety** | 1 | **Integration (real Cassandra + S3)** | **Done** |
 | **Cross-org identical-block delete isolation** | 1 | **Integration (real Cassandra + S3)** | **Done** |
 | **Cross-org S3-orphan recovery isolation** | 1 | **Integration (real Cassandra + S3)** | **Done** |
-| **LWT guard with real Cassandra** | 1 | **Integration (real Cassandra + S3)** | **Done** |
+| **Reference-visible pre-check with real Cassandra** | 1 | **Integration (real Cassandra + S3)** | **Done; does not reach LWT claim** |
 | **Library cascade (scanner → worker)** | 1 | **Integration (real Cassandra + S3)** | **Done** |
 | **Scanner orphan recovery** | 1 | **Integration (real Cassandra + S3)** | **Done** |
 | **Grace period enforcement (real)** | 1 | **Integration (real Cassandra + S3)** | **Done** |
@@ -421,7 +462,8 @@ deleting referenced blocks.
 | **Queue recovery after service restart** | Medium | **Pending** | Needs to restart the sesamefs container mid-queue and verify items survive. |
 | **ShareLink/Share/RestoreJob worker processing** | Medium | **Pending** | Only enqueue is tested (unit). No integration test creates and deletes share links through GC. |
 | **Very deep directory cascade (100+ levels)** | Medium | **Pending** | `TestGC_LibraryCascade` tests 3 files (flat). No deep nesting test. |
-| **Real Cassandra LWT behavior** | Medium | **Done** | `TestGC_ConcurrentUploadDuringGC` validates the LWT guard against real Cassandra. |
+| **Real Cassandra block-delete LWT under a concurrent post-claim reference** | High | **Missing** | `TestGC_ConcurrentUploadDuringGC` waits for the re-reference before triggering GC, so the worker exits at its initial pre-check and never reaches the claim. |
+| **Fence clears after deleting the just-PUT object** | **Blocker** | **Missing (next deterministic regression)** | `TestRetryUploadedBlockMaterializationRetriesStoreFence` injects a sentinel from a synthetic store callback; it does not call real `RegisterUploadedBlock` or fast-clear. The persistent orphan test is SeafHTTP/upload-link, not web block session. |
 | **Cascade partial failure + retry** | Medium | **Pending** | No test simulates a mid-cascade failure (e.g., corrupt share record). |
 | **Scanner + concurrent writes** | Low | **Partially done** | Soak test exercises this implicitly (uploads happen while GC runs), but doesn't assert specifically on concurrent scanner behavior. |
 | **Grace period boundary (±1ms)** | Low | **Partially done** | `TestGC_GracePeriodEnforcement` tests the concept with real timing but not the exact ±1ms boundary. |
@@ -481,9 +523,11 @@ one → the other ref remains → no destructive candidate wins → second file 
 Validates that shared
 blocks are never deleted while referenced.
 
-**Test 3 — Concurrent upload during GC:** Delete file → re-upload same content → trigger
-GC → LWT guard prevents deletion → re-uploaded file intact. Validates the core safety
-mechanism against real Cassandra LWT behavior (not mocks).
+**Test 3 — Re-upload visible before GC starts:** Delete file → re-upload same content → wait for
+the reference → trigger GC → re-uploaded file remains intact. The worker exits at its initial
+reference pre-check, so this test does **not** exercise `ClaimBlockDelete` or a Cassandra LWT race.
+It also does not place the provisional reference after the second `BlockHasReferences`, delete the
+just-PUT object, and clear the orphan fence inside the writer retry budget.
 
 **Test 4 — Library cascade:** Upload files → soft-delete library → trigger scanner
 (finds expired library) → trigger worker (cascades through commits, fs_objects, blocks).
@@ -549,7 +593,9 @@ For a deployment with millions of blocks, this may not keep up with deletion rat
 **Scaling recommendations:**
 - Increase `batch_size` (e.g., 500) for faster processing
 - Reduce `worker_interval` (e.g., 10s) for more frequent ticks
-- For multi-node: only one node should run GC (no leader election exists yet)
+- For multi-node: keep a designated GC replica operationally. A Cassandra LWT leader lease in
+  `gc_leases` already coordinates enabled replicas, but designation reduces split-brain exposure and
+  does not replace the missing per-orphan recovery generation/claim.
 
 ---
 
@@ -557,10 +603,10 @@ For a deployment with millions of blocks, this may not keep up with deletion rat
 
 | Aspect | Rating | Notes |
 |--------|--------|-------|
-| **Safety mechanisms** | Excellent | LWT, grace period, idempotency, locks, scanner safety net |
+| **Safety mechanisms** | Blocking gap open | LWT, grace period, dual delete fence, idempotency and locks exist; post-fence rematerialization is not fixed yet |
 | **Cascade correctness** | Good | Ordering is correct; partial failure handling could improve |
 | **Test coverage** | Good | 107 unit + 4 integration; key gaps in S3 failure and concurrent access |
-| **Error handling** | Adequate | Retries with cap; S3 orphan is the main gap |
+| **Error handling** | Blocking gap open | Durable S3 orphan recovery exists, but fast-clear propagation and shared direct-worker/recovery lifecycle fencing remain open |
 | **Performance** | Adequate | 12K items/hour; may need tuning for large deployments |
 | **Monitoring** | Basic | Prometheus metrics exist; alerting rules not defined |
 | **Code quality** | Good | Clean interface (GCStore), well-documented, audit logging |

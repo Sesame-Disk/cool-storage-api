@@ -62,10 +62,12 @@ Cassandra probe — `DB.ProbeBlockReuse(orgID, blockID)` in
 | `BlockReuseUnknownError` | Cassandra read failed / corrupt metadata         | fall open to legacy Exists+PUT |
 
 `PutBlockAutoDirect` (`internal/storage/blocks.go`) issues a direct `PutAuto`
-without the prior HEAD. The probe is wired into all five upload paths:
-`HandleUpload` + `finalizeUploadStreaming` (`seafhttp.go`), `SyncHandler.PutBlock`
-(`sync.go`), `FileHandler.CreateFile` template + `UploadFile` (`files.go`), and
-`OnlyOffice.saveEditedDocument` (`onlyoffice.go`).
+without the prior HEAD. Probe/store/materialize wrappers are partially wired into six funnels:
+`HandleUpload` and `finalizeUploadStreaming` (`seafhttp.go`), `SyncHandler.PutBlock`
+(`sync.go`), `FileHandler.CreateFile` template and `UploadFile` (`files.go`), and
+`OnlyOffice.saveEditedDocument` (`onlyoffice.go`). The seventh audited funnel, web block-session
+`UploadBlock` in `internal/api/v2/blocks.go`, still uses direct `BlockExists`, `PutBlockData`, and
+materialization without the complete probe/retry wrapper.
 
 **Scope of the fix — read carefully:** this is fixed for the *server-side hot
 upload paths* listed above. It is **not** a global removal of the S3 HEAD:
@@ -79,7 +81,8 @@ upload paths* listed above. It is **not** a global removal of the S3 HEAD:
   deletion, eventual consistency, bugs), `EnsureReusableBlockPresent` does a
   targeted HEAD on the canonical key and repairs in place if the object is gone.
   This is a deliberate safety/perf trade: the HEAD is back on dedup hits, but the
-  upload can never publish a reference to a missing object.
+  point-in-time `Reusable` path does not knowingly publish a reference to an already-missing object.
+  It is not an atomic guarantee against a later GC delete.
 
 **Per-block cost change:**
 - New block (common case): was `1 S3 HEAD + 1 S3 PUT`; now `≤2 Cassandra reads (~1 ms each) + 1 direct PUT`, **no HEAD**.
@@ -88,16 +91,14 @@ upload paths* listed above. It is **not** a global removal of the S3 HEAD:
 Net effect: the main win is for *new* content (the dominant case), which loses the
 HEAD entirely. Dedup hits keep a HEAD but gain self-healing.
 
-**Correctness — why skipping the PUT is safe:** the GC-race safety never relied on
-the PUT. It derives from the *reference-first, then fence-check* protocol in
-`FSHelper.RegisterUploadedBlock` (`fs_helpers.go:1006–1034`) versus GC's
-*claim-then-verify-references* in `worker.go:processBlock` (L410–443) — a
-Dekker-style mutual flagging. The `gc_s3_orphans` fence is written *before* the S3
-`DeleteObject` and cleared only *after* it, so any in-flight delete is always
-visible to both the probe and the materialize step. The probe is an optimization
-layer that fails safe in all non-reusable directions (BlockedByGC → retry,
-UnknownError → legacy fallback, NeedsPut → direct PUT). See the audit thread for
-the full interleaving analysis.
+**Correctness status — fast-clear blocker open:** the probe and dual fence are necessary but do not
+currently form an end-to-end invariant. `RegisterUploadedBlock` can observe an active fence, wait
+until GC clears it after deleting the just-PUT object, run `UpsertBlockMetadata`, and return `nil`.
+The outer wrapper then does not repeat store. `EnsureReusableBlockPresent` is only a targeted
+HEAD/repair for `Reusable`, not an atomic exclusion mechanism. `NeedsPut` with existing metadata
+also must store through `probe.StorageClass` and the canonical key; several callers currently use
+the preferred store, while first-writer metadata can continue pointing at the old backend. See
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`.
 
 **Retry loop change:** `retrySeafHTTPBlockMaterialization` (and the shared
 `v2.RetryUploadedBlockMaterialization`) now treat `ErrBlockDeleteInProgress` from
@@ -116,6 +117,9 @@ a Cassandra-first probe can reject the block before any S3 work starts.
   (honors `probe.StorageKey`) and missing-repair (derives the key from the hash when
   `storage_key` is empty) paths.
 - `internal/api/v2/upload_reuse_test.go` — shared retry helper + fail-open probe.
+- `TestRetryUploadedBlockMaterializationRetriesStoreFence` is synthetic: the store callback returns
+  `ErrBlockDeleteInProgress` directly. It does not exercise real `RegisterUploadedBlock` or
+  fast-clear.
 - `internal/api/handler_mapping_failure_test.go` — sync needs-put uses direct PUT,
   not the legacy Exists+PUT.
 

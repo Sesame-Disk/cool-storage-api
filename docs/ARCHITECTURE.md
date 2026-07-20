@@ -469,7 +469,7 @@ Session 2 (China): Block abc123 → DB lookup finds it exists in hot-s3-usa
 
 ### Design Principle: Tolerate Before Doubt
 
-The GC system is designed around a single overriding principle: **it is always better to leave garbage and retry than to delete data that might still be referenced**. Every decision in the GC pipeline favors data safety over cleanup speed:
+The GC system is designed around a single overriding principle: **it is better to leave garbage and retry than to delete data that might still be referenced**. The implemented claim/recheck and recovery paths generally favor data safety, but `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` is an open exception to the end-to-end upload guarantee:
 
 - If block liveness is ambiguous during concurrent reference mutation, skip it — the next scanner sweep will re-enqueue it if it is truly orphaned.
 - If enqueueing a child item fails, do NOT delete the parent — let the worker retry the entire operation.
@@ -477,7 +477,8 @@ The GC system is designed around a single overriding principle: **it is always b
 - Grace periods (1h default) ensure that recently-enqueued items have time for in-flight operations to complete before processing.
 - The scanner runs every 24h — any item missed in one pass will be caught in the next.
 
-This principle applies to **all flows**: blocks, commits, fs_objects, cascades, and cross-region replication scenarios.
+This is the target contract across blocks, commits, fs_objects, cascades, and cross-region
+replication. It is not a claim that every interleaving is currently closed.
 
 ### Components
 
@@ -541,7 +542,9 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 **Audit logging**: Deletion events (library artifacts cleaned, blocks deleted, groups deleted) are written to the `audit_log` table (365-day TTL, partitioned by `org_id`).
 
 **Safety measures**:
-- **"Tolerate before doubt"**: GC always errs on the side of keeping data. If any check is ambiguous, the item stays in the queue for the next sweep rather than being deleted.
+- **"Tolerate before doubt"**: destructive GC checks fail closed where implemented. The open
+  upload fast-clear race is tracked separately because the delete can finish and the writer can
+  publish metadata without repeating the deleted PUT.
 - Never delete HEAD commit or its ancestors within TTL
 - Grace period: items wait 1h in queue before processing
 - `gc_queue` is durable in the baseline schema. Stuck items reach the
@@ -552,9 +555,12 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
   original queue row still exists: it escalates only when the old row is still
   present, treats the requeue as successful when the old row is already gone,
   and otherwise leaves the item untouched when the verification itself fails.
-- **Claim-then-verify block deletion**: before deleting, the worker (1) point-reads `BlockHasReferences` and skips if any reference row exists; (2) `ClaimBlockDelete` marks `gc_state='deleting'` via LWT (the single expensive Paxos op); (3) re-checks `BlockHasReferences` and, if a concurrent upload re-referenced the block, releases the claim (`gc_state=null`) and skips; only then deletes from DB and S3.
+- **Claim-then-verify block deletion**: before deleting, the worker (1) point-reads `BlockHasReferences` and skips if any reference row exists; (2) `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; (3) re-checks `BlockHasReferences` and, if a concurrent upload re-referenced the block, releases the claim (`gc_state=null`) and skips; only then writes the orphan fence and proceeds toward DB/S3 deletion. A reference added after the second check is handled by the upload-visible fence contract, whose fast-clear propagation is still open.
 - **Liveness via reference rows**: liveness is a single-partition point query on `block_references` (replacing the old per-org full scan of live fs_objects). SHA-1→SHA-256 resolution happens at write time, so the GC read needs no resolution.
-- **Sentinel protection for uploads**: `RegisterUploadedBlock` registers its reference first, then reads `gc_state`; if it sees `'deleting'` it backs off with exponential delay, waiting for GC to finish, then re-creates the metadata under its reference. This is the row-model analogue of the old `-999` backoff.
+- **Upload delete fences (partial enforcement)**: `RegisterUploadedBlock` registers its reference
+  first and checks both `gc_state='deleting'` and `gc_s3_orphans`. Six funnels have outer
+  store/materialize retry wrappers, but the inner wait can absorb a true-to-false fence and return
+  `nil`, so the outer store is not repeated. Web block-session `blocks.go` is unwrapped.
 - **Idempotent reference removal**: `RemoveBlockReference` is an idempotent `DELETE` of a single `(block, referrer)` row, so a retried fs_object GC pass or upload rollback cannot double-decrement. The entire class of decrement-idempotency bookkeeping (`gc_processed_items` markers, repair passes) is gone with the counter.
 - **Renewable hard-delete leases**: user, library, and org cascades use `lease_token` + heartbeat rows. Live cascades renew the lease, crashed workers can be taken over after stale heartbeat detection, and active lock contention is postponed without consuming retry budget.
 - **DLQ requeue identity preservation**: Failed items are requeued with their original `queued_at` and stable `identity_at` so cascade stale checks and semantic dedupe keep the same deletion identity when an operator retries a failed item.
@@ -576,11 +582,11 @@ A reference row is `((org_id, block_id), referrer)` where:
   committed). Abandoned rows are recovered through the canonical
   `gc_provisional_block_refs` expiry table plus its by-day discovery projection.
 
-**Operations** (steady state needs NO LWT — `INSERT`/`DELETE` are idempotent):
-- **File upload**: `RegisterUploadedBlock` — `UpsertBlockMetadata` (INSERT IF NOT EXISTS) + `AddBlockReference(up:…, TTL)`. Backs off if the row is mid-GC (`gc_state='deleting'`).
+**Operations** (`block_references` uses no LWT; immutable metadata separately uses first-writer LWT):
+- **File upload**: `RegisterUploadedBlock` — `UpsertBlockMetadata` (`INSERT IF NOT EXISTS`) + `AddBlockReference(up:…, TTL)`. It checks both delete fences, but fast-clear propagation to the outer store retry remains open.
 - **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block. These are the **permanent** refs, promoted only after the fs_object row is persisted (the publish race holds liveness via provisional publish-attempt refs); the call fails closed if the fs_object row is missing. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
 - **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
-- **GC block deletion (the only expensive Paxos)**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferences` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise `RecordS3Orphan` → `DELETE blocks` → delete `blocks/<org_id>/...` through a `BlockStore` bound to the queued org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend.
+- **GC block deletion**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferences` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise `StartBlockDeleteOrphan` -> `FinalizeBlockDelete` -> delete `blocks/<org_id>/...` through a `BlockStore` bound to the queued org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend. This is not the only Paxos in the block path: immutable metadata and orphan lifecycle transitions also use conditional writes.
 - **S3 orphan recovery**: reuses the orphan row's `(org_id, storage_class)` to resolve the same physical key. An empty class or invalid org fails closed, leaves the orphan row for operator repair/retry, and does not advance the recovery cursor past the unresolved row.
 
 **Lifecycle**:
@@ -589,16 +595,18 @@ Upload:        block_references += up:<operation>    (TTL)  + blocks row (metada
 Commit:        block_references += fs:<lib>:<fs_id>          (permanent)
 fs_object GC:  block_references -= fs:<lib>:<fs_id>  → if none left, enqueue block
 Block GC:      pre-check none → claim gc_state='deleting' (LWT) → re-verify none → DELETE + S3
-Upload race:   writer sees gc_state='deleting' → backs off → re-creates after GC finishes
+Upload race:   writer sees either fence -> outer store must repeat after clear (OPEN fast-clear propagation)
 ```
 
 **Multi-region considerations**: reference `INSERT`/`DELETE` use `LOCAL_QUORUM` (no
 cross-DC Paxos), so concurrent uploads/deletes no longer collide on a shared
-mutable counter. The single expensive `SERIAL` (global Paxos) operation is the GC
-worker's `gc_state` claim at the irreversible S3-delete gate. GC must be enabled in
+mutable counter. Immutable metadata first-writer and GC claim/finalize use LWT; the upload-fence
+fix adds no Paxos to references, mappings, or the no-fence hot path. GC must be enabled in
 only one DC (see `configs/config.prod.yaml` comments and KNOWN_ISSUES.md
-`ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period (>>200ms cross-DC replication lag)
-ensures a block's references are fully replicated before the gate runs.
+`ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period reduces exposure to ordinary replication lag,
+but it is not a consistency proof: `LOCAL_QUORUM` does not guarantee that a reference acknowledged
+in another DC is visible locally before destructive GC. Multi-DC activation therefore requires an
+explicit consistency/topology safety decision in addition to the grace period.
 
 #### Reverse Lookup Table — DROPPED (PR7, migration 006)
 

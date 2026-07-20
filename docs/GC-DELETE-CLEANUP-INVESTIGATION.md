@@ -1,20 +1,29 @@
 # GC Library-Delete Cleanup — Investigation & Follow-up Debt
 
-**Date:** 2026-07-09 (original) · **Audit verified and corrected:** 2026-07-10 · **Status refresh:** 2026-07-16 · **P10 cross-org deletion blocker added and fixed:** 2026-07-16
+**Date:** 2026-07-09 (original) · **Audit verified and corrected:** 2026-07-10 · **Status refresh:** 2026-07-16 · **P10 cross-org deletion blocker added and fixed:** 2026-07-16 · **Upload-fence blocker added:** 2026-07-20
 **Code audited at:** `23f221ee9` (merge of PR #129 into `main`)
 **Branch where found:** `fix/gc-block-representation-durability` (PR #123)
-**Status:** P1–P9 remain exactly as documented (safety-classification gaps and the normal
+**Status:** P1–P10 remain exactly as documented (safety-classification gaps and the normal
 permanent-delete path are **closed** on `main`, PRs #123–#129; what remains there is reclamation
 edge cases, observability, test hygiene, and scale). **P10's proven cross-org live-content
 deletion blocker is fixed by the org-scoped-key series through PR-3** — see the TL;DR immediately
-below. API and GC paths now use the same org-scoped physical layout. This
+below. API and GC paths now use the same org-scoped physical layout. A separate, **open pre-fix
+blocker**, `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, can still let an upload return success
+with a reference and block metadata but no S3 object. This
 document is the **canonical audit record**; the corrected verdict, the confirmed production-gap
 table (P1–P10), the architectural invariants, and the branch roadmap live in the
 [**"Cross-agent audit — verified verdict"**](#cross-agent-audit--verified-verdict-2026-07-10)
 section at the end. The `F1`–`F4` findings below are the original notes, now annotated with
 their verified status.
 
-> **TL;DR (current, 2026-07-16):** P10 was a **proven live-content deletion bug and
+> **TL;DR (current, 2026-07-20):** `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` is **OPEN**.
+> This is documentation before the behavior fix. If an upload PUT completes, then observes either
+> GC delete fence, the current internal fence wait may finish after GC has deleted that object and
+> cleared the fence. `RegisterUploadedBlock` can then create metadata without repeating the PUT.
+> A successful response can therefore publish a live reference plus metadata for an absent object.
+> Do not describe the single-org upload/delete protocol as universally conservative or fixed.
+>
+> P10 was a **proven live-content deletion bug and
 > greenfield deploy blocker** — GC deleted the shared, content-addressed S3 object using an
 > **org-scoped** liveness check, so one org's delete destroyed another org's still-referenced
 > block. Confirmed by a real two-org 2 GB upload (deleting one org emptied MinIO; the other org's
@@ -32,14 +41,19 @@ their verified status.
 > test proves identical bytes resolve to distinct physical keys across the default and
 > platform orgs, and an adapter unit test pins `PlatformOrgID` handling in GC.
 >
-> Everything else below still holds. The single-org block-delete protocol is conservative;
-> P6a/P6b classification guards are fixed; P1/P1b/P2 (durable purge + cascade, PR #129) are fixed; the
+> The historical P1–P10 findings below still hold with their recorded status. P6a/P6b
+> classification guards are fixed; P1/P1b/P2 (durable purge + cascade, PR #129) are fixed; the
 > [~50 GB live-path exercise](#live-path-verification-and-confirmed-gc_pending_items-leak-2026-07-13)
 > confirmed end-to-end reclamation (a **manual dev-cluster observation**, not an automated test —
 > see its provenance note before citing it). The initial audit residue was dominated by
 > integration-test fixtures, not production behavior.
 >
-> **Still open** (storage retention / ops / scale — not live-data safety):
+> **Still open:**
+> - **BLOCKER — `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`** — an upload that crossed a
+>   `gc_state='deleting'` or `gc_s3_orphans` fence must repeat physical storage before metadata can
+>   be published. Current code can succeed after a fast-clearing fence without that re-PUT, and the
+>   delete lifecycle is not fenced across the direct worker and Phase-16 recovery after the orphan
+>   row clears. Both writer rematerialization and lifecycle ownership are required.
 > - **P4** — `pub:` refs lack a discoverable zero-ref→candidate transition after TTL expiry.
 > - **P5** — Phase 13 logs enqueue failures but returns success.
 > - **P7** — markerless commit/fs_object partitions are undiscoverable once both library indexes
@@ -54,7 +68,8 @@ their verified status.
 >   `quotas_test.go`). One ~90-byte **S3-only orphan** (no `blocks` row) is still unattributed.
 > - **P3 (low)** — direct-delete omits policy-index delete, but the durable cascade's
 >   `HardDeleteLibrary` clears it; at most a short transient window for new deletes.
-> - **10A–10E, branch N+1** — engine robustness and bulk-cleaner N+1 (low priority).
+> - **10A–10D, branch N+1** — remaining engine robustness and bulk-cleaner N+1 (low priority).
+>   Former 10E/E5 lifecycle fencing is now part of the blocker above, not optional hardening.
 >
 > **Closed since the refresh:** **1A–1C**. No test runs the global `ProcessOnce(storage=nil)`
 > fan-out (a guard test keeps it that way), and `-run TestWebBlockUpload` now drains to a **zero**
@@ -65,6 +80,9 @@ their verified status.
 > artifacts. See [**Current open work**](#current-open-work-2026-07-16) below.
 
 ## Current open work (2026-07-16)
+
+**2026-07-20 blocker update:** the P1–P10 table remains historical and is not renumbered. The new
+upload-fence finding is tracked separately because it was discovered after that audit.
 
 **Deploy context:** production will start from an **empty** Cassandra keyspace and MinIO buckets with
 GC enabled. No reconcile/backfill pass is required before launch — there is no historical residue to
@@ -79,13 +97,16 @@ protocol owns physical deletion.
 > (see the residue table below). If the target cluster is not being recreated from scratch, treat
 > it as **brownfield** and 8A (read-only reconcile) is back on the launch path.
 
-**Verdict:** **P10 is fixed through PR-3.** Before PR-2, GC's org-scoped liveness check targeted an S3 object shared by content hash, so one org's delete could destroy another's live block. API reads/writes, normal GC deletion, and orphan recovery now derive the same `blocks/<org_id>/...` locator. See `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`. The remaining work
-below guarantees **complete reclamation
-in edge cases**, **honest monitoring**, **clean integration tests**, and **GC scale** as the system
-grows.
+**Verdict:** **P10 is fixed through PR-3**, but
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` is an open pre-fix blocker. Before PR-2, GC's
+org-scoped liveness check targeted an S3 object shared by content hash, so one org's delete could
+destroy another org's live block. API reads/writes, normal GC deletion, and orphan recovery now
+derive the same `blocks/<org_id>/...` locator. See `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`. That
+org-scoping does not close the same-org store/materialize race documented below.
 
 | Priority | Item | Issue / branch | Prod impact (greenfield) |
 | --- | --- | --- | --- |
+| **Blocker** | Post-fence canonical rematerialization + shared delete-lifecycle fencing | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` / `fix/gc-upload-fence-rematerialization` | **Open, docs pre-fix** — a request can succeed with a live ref + metadata while the object is absent, and an old worker/recoverer can delete a post-fence copy |
 | — | *(done)* Cross-org physical block isolation (GC delete + orphan recovery) | P10 / `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01` — org-scoped-key series through PR-3 | Closed — normalized `(org, class)` resolution, no delete failover, org-less APIs removed, and real Cassandra+MinIO delete/recovery isolation regressions pass |
 | — | *(done)* Normal permanent delete + cascade | P1/P1b/P2, PR #129 | Closed — [~50 GB live exercise](#live-path-verification-and-confirmed-gc_pending_items-leak-2026-07-13) showed zero content residue (manual observation) |
 | — | *(done)* Safety classification | P6a/P6b | Closed |
@@ -97,10 +118,152 @@ grows.
 | — | *(done)* Integration isolation + upload-fixture teardown | 1A/1B/1C | Closed — `TestWebBlockUpload` drains to a zero residue delta (was 4 blocks + 5 S3 objects stranded 2 days); global GC fan-out removed and guarded |
 | Low (tests) | Unattributed S3-only orphan | 1G follow-up | One ~90-byte object with **no `blocks` row** survives a run. No GC phase can discover it (blocks are found via candidates; S3-orphan recovery only replays `gc_s3_orphans`). The two stranded blocks 1G targeted are **fixed** — see the branch table. Dev-cluster only |
 | Low | Policy index on direct delete | P3 / branch 2 | Transient stale row until cascade runs `HardDeleteLibrary`; optional polish |
-| Low | Engine robustness | 10A–10E | `dryRun` race, postpone metrics, pending audit, S3-orphan LWT decision |
+| Low | Remaining engine robustness | 10A–10D | `dryRun` race, postpone metrics, and pending audit; E5 lifecycle fencing is promoted into the blocker |
 | Low | Bulk-cleaner N+1 | branch N+1 | Latency on mass permanent-delete only |
 | **Deferred** | Reconcile/backfill | 8A–8C | **Not needed** for greenfield prod — only for clusters with pre-fix residue |
 | **Deferred** | Pre-fix `gc_pending_items` orphans | 8B / 10D | **Not present** on a fresh deploy |
+
+### Blocking finding: upload fence clears without physical rematerialization (2026-07-20)
+
+**Issue:** `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`
+
+**Status:** **OPEN — the end-to-end invariant is not enforced; partial retry, probe, repair, and
+sentinel machinery already exists.**
+
+**Severity:** Blocker: false-success upload can leave referenced content physically absent.
+
+#### The dual fence and its lifetime
+
+`BlockDeleteFenceActive(orgID, blockID)` does not inspect only the canonical `blocks` row. It treats
+either of these as GC ownership of the physical object:
+
+1. `blocks.gc_state = 'deleting'`, set by the GC claim LWT; or
+2. any matching `gc_s3_orphans` row, including the `pending_s3` and mapping-cleanup lifecycle.
+
+The order matters. After GC's second `BlockHasReferences` returns false,
+`StartBlockDeleteOrphan` writes the durable `gc_s3_orphans` row **before**
+`FinalizeBlockDelete` conditionally removes the canonical `blocks` row. The orphan row therefore
+continues the writer-visible fence across metadata removal and remains present while the S3 delete
+runs. It is removed only after the S3 delete and mapping cleanup complete; on S3 failure it remains
+for scanner recovery. There is no intended unfenced gap between the in-row claim and this orphan
+fence.
+
+#### Exact vulnerable sequence
+
+1. The upload performs its physical PUT for block `B`.
+2. GC has already passed its second `BlockHasReferences(B)` check. The upload then writes its
+   provisional `up:` reference, too late for that GC check to observe it.
+3. GC calls `StartBlockDeleteOrphan(B)`, then `FinalizeBlockDelete(B)`, then deletes the org-scoped
+   S3 object. The orphan row keeps the dual fence active during this sequence.
+4. `RegisterUploadedBlock` observes that fence and waits internally. GC finishes the S3 delete and
+   clears `gc_s3_orphans` inside the registration retry budget.
+5. A later fence check returns inactive. `RegisterUploadedBlock` runs the metadata
+   `INSERT IF NOT EXISTS` and returns success **without repeating or verifying the earlier PUT**.
+6. The request can return success with a live provisional/permanent reference and immutable block
+   metadata, while the physical object is absent. Later download fails despite upload success.
+
+The retry budget is exact: **8 attempts and 7 sleeps**. The capped backoff is
+`50 + 100 + 200 + 400 + 400 + 400 + 400 ms = 1.95 s` before jitter. Current jitter adds a value
+strictly below 25 ms to each sleep, so the total wait is **less than approximately 2.125 s**. A
+normal delete or quick orphan recovery can complete inside that interval; a fence that remains
+active for the entire budget correctly returns a retryable error and is not this fast-clear case.
+
+#### Target invariant and partial enforcement status
+
+Observation of **either** fence invalidates every physical PUT performed earlier in that server
+operation as proof for success. The server must keep or regain ownership of the request bytes and
+internally repeat the complete **store -> materialize** cycle. Metadata/reference publication may
+succeed only after a post-fence store callback completes. This exceptional retry is triggered only
+after a fence was observed: the no-fence hot path gains no new Cassandra operation, and correctness
+must not depend on a client retry.
+
+This contract preserves the deliberate database model. Immutable block metadata already uses
+first-writer-wins `INSERT IF NOT EXISTS` per `(org_id, block_id)`. `block_references` remains an
+idempotent ordinary `INSERT`/`DELETE`, and the SHA-1 forward mapping remains an ordinary guarded
+read-before-write. The fix adds no steady-state LWT/Paxos to references or mappings.
+
+The branch is not starting from zero. `RetryUploadedBlockMaterialization`,
+`retrySeafHTTPBlockMaterialization`, and `retryCreateFileTemplateBlockMaterialization` can repeat a
+complete store callback when `ErrBlockDeleteInProgress` reaches them. `ProbeBlockReuse` classifies
+`Reusable`, `NeedsPut`, and `BlockedByGC`, while `EnsureReusableBlockPresent` performs a targeted
+HEAD/repair for the canonical object only in the `Reusable` case. This is useful partial machinery,
+not an atomic guarantee.
+
+The end-to-end invariant remains open because `RegisterUploadedBlock` has its own inner fence wait.
+If the fence changes from active to inactive inside that wait, it proceeds to
+`UpsertBlockMetadata` and returns `nil`; the outer wrapper never observes
+`ErrBlockDeleteInProgress`, so it does not invoke the store callback again. The web block-session
+handler in `internal/api/v2/blocks.go` has an additional gap: it uses `BlockExists`,
+`PutBlockData`, and materialization directly rather than the complete probe/retry wrapper.
+
+#### Upload-funnel inventory at the audited branch head
+
+| # | Funnel | Current fence/rematerialization wiring | Status |
+|---|---|---|---|
+| 1 | SeafHTTP simple `HandleUpload` | `retrySeafHTTPBlockMaterialization` | Partial: inner fast-clear is absorbed |
+| 2 | SeafHTTP streaming `finalizeUploadStreaming` | `retrySeafHTTPBlockMaterialization` | Partial: inner fast-clear is absorbed |
+| 3 | Sync `PutBlock` | `RetryUploadedBlockMaterialization` | Partial: inner fast-clear is absorbed |
+| 4 | V2 `UploadFile` | `RetryUploadedBlockMaterialization` | Partial: inner fast-clear is absorbed |
+| 5 | Template `CreateFile` | `retryCreateFileTemplateBlockMaterialization` | Partial: inner fast-clear is absorbed |
+| 6 | OnlyOffice save | `RetryUploadedBlockMaterialization` | Partial: inner fast-clear is absorbed |
+| 7 | Web block session `internal/api/v2/blocks.go` | Direct `BlockExists` / `PutBlockData` / materialize | Open: no complete probe/retry wrapper |
+
+There is a second required correction in every store callback. `NeedsPut` can mean that immutable
+metadata already exists but has no live references. In that case the callback must resolve
+`probe.StorageClass` and use the canonical org-scoped key, not blindly use the request's currently
+preferred store. Otherwise the direct PUT may land in a new backend while first-writer
+`UpsertBlockMetadata` keeps pointing reads and GC at the previous backend. Regression coverage must
+include existing-metadata `NeedsPut` with a preferred/canonical storage-class mismatch.
+
+#### Scope boundary: rematerialization alone is not a complete delete-lifecycle fence
+
+Propagating the observed fence and repeating store closes the writer-side false-success sequence
+only when no previously authorized deleter can still run after the fence disappears. The production
+service does not currently prove that condition. Worker and scanner loops run concurrently under the
+same leader: after the worker writes the orphan row and finalizes metadata, Phase 16 can process that
+row, delete S3, and clear the orphan while the original worker is still delayed before its own
+`DeleteBlock`. An upload can then observe no fence and rematerialize, after which that original
+worker deletes the new copy. This requires neither two recoverers nor lease split-brain.
+
+Therefore closing this blocker requires both sides:
+
+1. writer-side propagation plus canonical post-fence rematerialization; and
+2. per-delete-lifecycle ownership/generation (or equivalent fencing) shared by the direct worker and
+   orphan recovery, so clearing an orphan proves that no operation from that lifecycle can still
+   delete the key.
+
+Two stale/overlapping recoverers remain another manifestation of the same missing lifecycle fence.
+A final S3 HEAD is not proof against any already-authorized delete that can occur after that HEAD.
+
+#### Effective production scope
+
+`configs/config.prod.yaml`, **if mounted without environment or deployment overrides**, is the
+committed baseline: `serial_consistency: SERIAL`, one Cassandra DC (`datacenter1`) with
+`NetworkTopologyStrategy` RF=1, and `gc.enabled: false`. Deployment guidance sets
+`GC_ENABLED=true` only on the designated GC replica (the `gc_leases` lease remains a backstop).
+That file is not evidence of the effective runtime. Establish runtime behavior from startup logs,
+environment/compose values, and the live keyspace replication metadata. Under the committed
+baseline assumptions:
+
+- the audit concerns about cross-DC `LOCAL_QUORUM` visibility and a `LOCAL_SERIAL` split serial
+  domain are **not active**, because there is one configured DC and serial consistency is `SERIAL`;
+- RF=1 **is** an active durability and availability risk: there is no second Cassandra replica in
+  the DC; and
+- runtime `CASSANDRA_CONSISTENCY`, `CASSANDRA_SERIAL_CONSISTENCY`,
+  `CASSANDRA_REPLICATION_CLASS`, `CASSANDRA_REPLICATION_DCS`,
+  `CASSANDRA_REPLICATION_FACTOR`, and `GC_ENABLED` overrides can change the effective topology and
+  must be checked on the deployed replicas before relying on this scope statement.
+
+#### Current validation boundary
+
+`TestUploadLink_ReuploadBlockedByS3OrphanFence` proves that a **persistent** `gc_s3_orphans` fence
+exhausts the retry budget on the SeafHTTP/upload-link path, returns conflict, does not publish the
+retried file, and leaves recovery state intact. It is not a web block-session test and does **not**
+reproduce fast-clear. `TestRetryUploadedBlockMaterializationRetriesStoreFence` is a synthetic helper
+test: its store callback itself returns the sentinel; it does not call real `RegisterUploadedBlock`
+or exercise a true-to-false fence. Deterministic regressions must cover real registration plus
+fast-clear and the unwrapped web block-session path; until they fail before the fix and pass after
+it, this issue remains open.
 
 ### Audit scope and evidence
 
@@ -340,21 +503,19 @@ docker exec sesamefs-cassandra-1 cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PAS
 
 This section consolidates independent code-path reviews and direct Cassandra/MinIO
 inspection. Every confirmed claim below points to reproducible code or storage evidence at
-the cited `file:line`. The originating investigation asked two questions — *is the GC safe?*
-and *is it optimal?* — and the corrected answer is: **the physical block-delete protocol is
-conservative and the normal production delete path is safe.** P6a/P6b classification guards are
-fixed; P1/P1b/P2 durable purge + cascade are fixed (PR #129); the live ~50 GB delete left zero
-content residue. What remains open (P4/P5/P7/P8, test hygiene, low-sev engine debt) is **storage
-retention in edge cases, observability, and scale** — not live-data deletion risk **within a single
-org**. Cross-org, P10's proven bug is fixed by org-scoped physical keys. Reconcile/
-backfill (8A–8C) applies only to clusters with pre-fix historical drift and is **out of scope for
-the planned greenfield prod deploy.**
+the cited `file:line`. The P1–P10 statuses and the live ~50 GB reclamation observation remain
+historical evidence. **2026-07-20 correction:** their earlier conclusion that the physical
+block-delete protocol was conservative within one org is not a current universal verdict.
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` demonstrates an end-to-end store/materialize window
+that those reviews did not cover. P6a/P6b and P1/P1b/P2 remain fixed; cross-org P10 remains fixed;
+the new same-org upload-fence blocker remains open. Reconcile/backfill (8A–8C) still applies only to
+clusters with pre-fix historical drift.
 
-### Verdict 1 — physical block deletion is conservative; P6a and P6b classification guards are fixed
+### Verdict 1 — claim/recheck and dual recovery fences exist; upload rematerialization is open
 
-The protocol that deletes a physical block is conservative and crash-safe (no path in the
-reviewed sequence deletes a live block, though a code audit cannot prove a universal
-"never") — [worker.go:403-574](../internal/gc/worker.go#L403), `store_cassandra.go`:
+The worker's delete sequence is crash-recoverable, but it is not by itself an end-to-end proof that
+an upload cannot succeed without an object — [worker.go:403-574](../internal/gc/worker.go#L403),
+`store_cassandra.go`:
 
 1. Pre-check refs; skip if any exist.
 2. Claim via LWT (`gc_state='deleting'`, stable `claimID`).
@@ -364,6 +525,12 @@ reviewed sequence deletes a live block, though a code audit cannot prove a unive
 5. Delete the DB row (LWT-guarded) → delete S3 with exponential retry → clean the mapping.
 6. Resurrection guard: if the same `block_id` was re-uploaded, the live row owns the mapping
    and the recovery is discarded instead of deleting.
+
+Steps 1–3 only catch a reference visible by the second check. If an upload writes its provisional
+reference after step 3, steps 4–5 may delete the object while the upload waits on the dual fence.
+The current writer can then observe the fence clear and write metadata without a new PUT. See the
+blocking finding above. The selected fix is server-owned post-fence `store -> materialize`, not a
+claim that the current protocol is already safe.
 
 Representation is validated fail-closed (`CanonicalBlockRepresentationIDForLibrary` derives the
 one legal representation from identity + `encrypted` and rejects any stored value that would
@@ -394,7 +561,10 @@ re-discovered by scanner Phase 0.
 - No global `TRUNCATE`/teardown of keyspace or MinIO; cleanup is only by ephemeral library name.
   Blocks uploaded under synthetic `org_id`/`library_id` with no `t.Cleanup` persist forever.
 
-### Verdict 3 — confirmed production gaps (P1–P10)
+### Verdict 3 — confirmed historical production gaps (P1–P10)
+
+P1–P10 are preserved without renumbering. The 2026-07-20 upload-fence blocker is tracked separately
+as `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` in the current-work section above.
 
 | # | Verified finding | Sev | Evidence | Issue |
 |---|---|---|---|---|
@@ -448,19 +618,27 @@ correctly — it repairs legacy / partial-failure markers.
 1. The API **never** removes `fs:` refs. Sole owner: the `fs_object` cascade (`removeFSObjectBlockReferences`).
 2. The library cascade **never** removes `pub:` refs. Owner: publish / expiry scanner.
 3. Zero-ref does **not** mean delete directly → it means `EnsureBlockGCCandidate`.
-4. The worker keeps the LWT claim + final re-validation before any S3 delete.
+4. Keep the LWT claim, post-claim reference recheck, and write-ahead orphan fence. These authorize
+   the delete lifecycle but do not replace invariant 9's missing lifecycle ownership across worker
+   and recovery.
 5. Never truncate `block_references`/mappings to clean a cluster (it orphans MinIO).
 6. Tests **must not** run a global GC over the shared keyspace; current violations are tracked
    by `ISSUE-GC-TEST-RESIDUE-01`. Use fixture-scoped cleanup/`ProcessOrgOnce` only.
 7. PR #123 representation recovery is kept always.
+8. After either upload-visible GC fence is observed, a successful server operation must repeat
+   physical store before materializing metadata; do not delegate this retry to the client.
+9. Do not treat post-fence rematerialization as a complete production solution. The direct worker
+   and Phase-16 recovery can overlap under one leader, and stale/overlapping recoverers have the same
+   ABA shape; all require a shared per-delete-lifecycle claim/generation or equivalent fence.
 
 ### Engine-level review — worker/scanner robustness (2026-07-10)
 
 A second pass reviewed the worker/scanner engine (not the delete *paths*) for races,
-liveness, and crash recovery. Physical block crash recovery is **solid** (write-ahead
-`gc_s3_orphans` before finalize, persisted scanner cursors, grace period, LWT block claims,
-independent lease renewal, claim-then-verify, double stale-check for cascades). Most items
-below are fragility/observability; former E3 was escalated to P6 because the Cassandra store
+liveness, and crash recovery. Physical block crash recovery has a durable write-ahead
+`gc_s3_orphans` record before finalize, persisted scanner cursors, grace period, LWT block claims,
+independent lease renewal, claim-then-verify, and double stale-checks for cascades. It does not have
+a per-orphan recovery generation/claim, and the upload rematerialization gap above remains open.
+Most items below are fragility/observability; former E3 was escalated to P6 because the Cassandra store
 swallows existence-check errors and the resulting destructive work is unguarded.
 
 | # | Confirmed finding | Sev | Evidence |
@@ -469,7 +647,7 @@ swallows existence-check errors and the resulting destructive work is unguarded.
 | E2 | `dryRun` is accessed concurrently without synchronization, which is a Go data race. `atomic.Bool` fixes visibility/race-detector correctness, but does **not** provide hard cutover for work already past its dry-run check; that requires worker drain/serialization or destructive-step rechecks. | Low/Med | [gc.go:1191-1196](../internal/gc/gc.go#L1191), [worker.go:403-407](../internal/gc/worker.go#L403) |
 | E3 | **Escalated to P6a → ✅ fixed (1D).** Scanner code appeared to skip on `LibraryExists` errors, but the Cassandra implementation never returned them: it mapped every failure to "missing" (fail-open, not merely invisible accumulation). Closed by the P6a fix; the separate execution-time revalidation gap was subsequently closed by P6b/1E. | **High** | [store_cassandra.go:2357-2373](../internal/gc/store_cassandra.go#L2357) |
 | E4 | `gc_pending_items` has no TTL, but normal queue completion, DLQ deletion, and DLQ expiry explicitly remove the pending row in logged batches. The **live-path block leak** (two producers keying different `library_id`s) was confirmed and **fixed** (P9); pre-existing orphan rows on old clusters still need a sweep (8B/10D). Do **not** add a blind TTL, which could expire valid dedup protection while queue/DLQ work remains live. | Low (fixed for new work; audit optional) | [store_cassandra.go:448-464](../internal/gc/store_cassandra.go#L448), [001_initial_schema.cql:1199](../internal/db/migrations/001_initial_schema.cql#L1199) |
-| E5 | `RecoverS3Orphans` has no per-row LWT; mutual exclusion relies entirely on the leader lease. Real double-processing risk only under a lease split-brain (single-instance/dev: none). | Low (defense-in-depth) | [worker.go:616-789](../internal/gc/worker.go#L616) |
+| E5 | `RecoverS3Orphans` has no per-row lifecycle claim/generation. The leader lease does not serialize worker and scanner loops: Phase 16 can clear an orphan while the original worker from the same delete lifecycle is still able to call `DeleteBlock`, and stale/overlapping recoverers have the same ABA shape. Post-fence rematerialization alone is therefore insufficient. | **Blocker component** | [worker.go:514-561,616-789](../internal/gc/worker.go#L514) |
 
 **Reviewed and found NOT to be bugs** (recorded so they are not re-raised):
 
@@ -489,8 +667,9 @@ swallows existence-check errors and the resulting destructive work is unguarded.
   [worker.go:1729-1830](../internal/gc/worker.go#L1729). The parent delete runs under a held
   hard-delete lease on a soft-deleted library.
 
-E1/E2/E4/E5 remain in `ISSUE-GC-ENGINE-ROBUSTNESS-01`; E3 is superseded by P6. The old
-single branch 10 is split into 10A–10E so each semantic decision remains auditable.
+E1/E2/E4 remain in `ISSUE-GC-ENGINE-ROBUSTNESS-01`; E3 is superseded by P6. E5/10E is promoted
+into `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` because lease-only exclusion does not serialize
+worker and scanner under one leader. The remaining branch-10 work is split into 10A–10D.
 
 ### Branch roadmap (small, auditable PRs)
 
@@ -499,6 +678,7 @@ Subsequent branches, in recommended merge order:
 
 | Branch | Objective | Issue | Risk |
 |---|---|---|---|
+| `fix/gc-upload-fence-rematerialization` **OPEN** | Propagate an observed fast-clear out of `RegisterUploadedBlock`, reuse the existing retry wrappers, wrap the web `blocks.go` session path, and make existing-metadata `NeedsPut` use the canonical store. Add fast-clear/canonical-store regressions **and** fence each delete lifecycle across direct worker plus Phase-16 recovery so no old deleter can run after the orphan fence clears. Preserve the no-fence reference/mapping path without new Paxos. | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | **Blocker** |
 | 1D ✅ **DONE (P6a)** | Fail closed on existence reads and make Phase 9 scan `shares_by_group` directly using each projection row's `OrgID`, including stable orphan discovery without the groups N+1. Scanner tests plus a real-Cassandra store regression prove the behavior. Merged first (2026-07-10, branch `fix/gc-existence-check-failopen`). | `ISSUE-GC-EXISTENCE-CHECK-FAILOPEN-01` | **High** |
 | 1E ✅ **DONE (P6b)** | Durable guard modes plus execution-time canonical point read under the existing library lock; fail closed on presence/read/fence/unknown mode, preserve queue/retry/DLQ semantics, coordinate restore with the same lock, and cover scanner→worker plus historical-marker regressions. P7 discovery stays open. | `ISSUE-GC-ORPHAN-WORKER-REVALIDATION-01` | Med |
 | 1F (P8) | Replace Phase 9's provisional global `shares_by_group` stream with a bucketed active-partition discovery projection. Register on share creation, remove when empty, paginate buckets/partitions, and provide reconcile/backfill for drift. | `ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01` | Med |
@@ -522,9 +702,12 @@ Subsequent branches, in recommended merge order:
 | 10B | Make remaining scanner phase errors consistently visible; P5 covers Phase 13 and P6 covers fail-open existence checks. | `ISSUE-GC-ENGINE-ROBUSTNESS-01` | Low |
 | 10C | Meter/bound repeated `postponeItem` contention without turning normal lease contention into premature DLQ. | `ISSUE-GC-ENGINE-ROBUSTNESS-01` | Low |
 | 10D | Audit/reconcile `gc_pending_items` against queue + retained DLQ. Add no standalone TTL unless its lifetime is coordinated with both canonical work stores. | `ISSUE-GC-ENGINE-ROBUSTNESS-01` | Low |
-| 10E | Decide E5 explicitly: accept leader-lease exclusion as design (S3 delete/cleanup are largely idempotent) or add a per-orphan claim/LWT if split-brain tolerance is required. | `ISSUE-GC-ENGINE-ROBUSTNESS-01` | Low |
+| 10E **SUPERSEDED by blocker** | Add shared per-delete-lifecycle ownership/generation across direct worker and Phase-16 recovery. Leader-lease exclusion is insufficient because worker and scanner overlap under one leader. | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | **Blocker** |
 
 **Recommended merge order (greenfield prod, 2026-07-16):**
+
+**2026-07-20 override:** close `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` first with deterministic
+before/after evidence. The numbered list below is retained as the historical P1–P10 order.
 
 0. ✅ **P10 (`ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`) — DONE as an org-scoped-key
    series of small branches:** ✅ docs corrections (PR #133) → ✅ storage-layer org-aware `BlockStore`
@@ -547,7 +730,7 @@ Subsequent branches, in recommended merge order:
 6. **8D (P7)** — markerless artifact discovery (covers terminal child-work loss/DLQ expiry on a
    fresh cluster, plus drift/manual ops).
 7. **1F (P8)** — bucketed group-share discovery before share volume grows.
-8. **2, N+1, 10A–10E** — polish as capacity allows.
+8. **2, N+1, 10A–10D** — polish as capacity allows. 10E is superseded by the upload-fence blocker.
 
 Branches **8A–8C** remain documented for **brownfield** clusters only; they are **not** on the
 greenfield prod launch path.

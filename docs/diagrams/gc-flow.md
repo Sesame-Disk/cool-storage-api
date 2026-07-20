@@ -1,11 +1,12 @@
 # GC Service Flow Diagrams
 
-**Corrected:** 2026-07-10 · **Code:** `4333be1b3`
+**Corrected:** 2026-07-10 · **Upload-fence blocker:** 2026-07-20 · **Audited from code:** `69c25de81` plus this documentation branch
 
 > Current model: keyed `block_references`, durable candidates, LWT claim + live-ref recheck,
 > and write-ahead `gc_s3_orphans`. The retired `blocks.ref_count = -999` protocol is preserved
-> in Git history, not in this live diagram. The physical block-delete sequence is conservative,
-> and both the transient-error fail-open (P6a) and execution-time canonical revalidation gap
+> in Git history, not in this live diagram. The physical block-delete sequence has an **open
+> upload-fence rematerialization blocker**: an upload that observes a fence can currently succeed
+> after it clears without repeating a PUT deleted by GC. Both the transient-error fail-open (P6a) and execution-time canonical revalidation gap
 > (P6b) are fixed. Markerless artifact discovery remains P7. Full audit:
 > [../GC-DELETE-CLEANUP-INVESTIGATION.md](../GC-DELETE-CLEANUP-INVESTIGATION.md).
 
@@ -43,17 +44,43 @@ flowchart TD
     Won -->|no| Skip[Skip / retry owner]
     Won -->|yes| Recheck{Reference appeared after claim?}
     Recheck -->|yes| Release[Release claim; delete stale candidate]
-    Recheck -->|no| WAL[Persist gc_s3_orphans before DB removal]
+    Recheck -->|no| WAL[StartBlockDeleteOrphan<br/>gc_s3_orphans fence active before DB removal]
     WAL --> Finalize[LWT finalize canonical block delete]
-    Finalize --> S3[Delete S3 with bounded retry]
+    Finalize --> S3[Delete S3 with bounded retry<br/>orphan fence remains active]
     S3 -->|failure| Recover[Keep orphan row for scanner recovery]
     S3 -->|success| Mapping[Delete exact forward mapping]
     Mapping --> Clear[Clear orphan + candidate]
 ```
 
-The sequence above is safe **given correct upstream classification/reference ownership**. The P6
-fail-open path that could enqueue live fs_objects (causing GC itself to remove legitimate `fs:`
-refs before this block protocol runs) is now fixed: existence reads fail closed (1D).
+The dual writer-visible fence is `blocks.gc_state='deleting'` **or** `gc_s3_orphans`.
+`StartBlockDeleteOrphan` runs before `FinalizeBlockDelete`, and the orphan row remains until the S3
+delete and mapping cleanup finish (or remains for recovery after S3 failure). That closes the
+claim-to-orphan handoff gap, but the current writer behavior is still vulnerable:
+
+```text
+upload PUT
+  -> GC second BlockHasReferences returns false
+  -> upload adds provisional up: reference
+  -> GC writes orphan fence, finalizes metadata, deletes S3
+  -> orphan fence clears inside upload registration retry
+  -> RegisterUploadedBlock writes metadata without another PUT
+  -> success with reference + metadata, object absent
+```
+
+Required invariant, **open with partial machinery present**: observation of either fence invalidates
+every earlier PUT for success. Retry/probe/repair helpers already wrap SeafHTTP simple/streaming,
+sync `PutBlock`, V2 `UploadFile`, template `CreateFile`, and OnlyOffice, but the inner
+`RegisterUploadedBlock` wait absorbs fast-clear and returns `nil`, so those outer wrappers do not
+repeat store. The web block-session path in `internal/api/v2/blocks.go` remains direct and
+unwrapped. For existing-metadata `NeedsPut`, the repeated store must resolve `probe.StorageClass`
+and the canonical key rather than use the current preferred backend. Rematerialization alone is not
+enough: worker and scanner can overlap under one leader, so recovery can clear the visible fence
+while the original worker is still able to delete the post-fence store. A shared delete-lifecycle
+claim/generation must fence direct deletion and recovery; stale recoverers have the same ABA shape.
+
+The P6 fail-open path that could enqueue live fs_objects (causing GC itself to remove legitimate
+`fs:` refs before this block protocol runs) is fixed: existence reads fail closed (1D). That fix is
+independent of the open upload-fence issue.
 
 ## 3. FS object cleanup
 
@@ -86,22 +113,21 @@ flowchart TD
     Marker --> Retention[Phase 13 after retention]
     Retention --> LibCascade[Durable ItemLibraryCascade]
 
-    Permanent[Direct permanent delete] --> Resolve[Resolve/validate representation]
-    Resolve --> HardRows[Delete library/read models + stamp marker]
-    HardRows --> Route{caller}
-    Route -->|org-admin| NoImmediate[P1: no immediate content enqueue]
-    Route -->|superadmin| Async[P2: go fn content-only accelerator]
-    NoImmediate --> MarkerRescue[Marker retained; Phase 13 delayed]
-    Async --> MarkerRescue
-    MarkerRescue --> LibCascade
+    Permanent[Permanent delete] --> Resolve[Resolve/validate representation]
+    Resolve --> Purge[Stamp durable purge_requested_at]
+    Purge --> Immediate[Immediate best-effort full cascade enqueue where wired]
+    Immediate -->|success/dedup| LibCascade
+    Immediate -->|lost/failure| Recovery[Phase 13 durable recovery]
+    Purge -->|legacy route without immediate enqueue| Recovery
+    Recovery --> LibCascade
 
     LibCascade --> Enumerate[Enqueue commits/fs_objects/artifacts]
     Enumerate --> Counter[Delete library storage counter]
     Counter --> Final[Delete library marker + policy indexes]
 ```
 
-Roadmap 6A/6B adds `purge_requested_at` so permanent deletes become immediately Phase-13 eligible;
-the goroutine remains only an accelerator.
+P1/P1b/P2 are closed: `purge_requested_at` is the durable handoff, immediate enqueue is a
+best-effort latency accelerator on wired routes, and Phase 13 recovers a missed enqueue.
 
 ## 5. Scanner phases and known boundaries
 
@@ -146,3 +172,8 @@ Important limits:
 4. Keep claim + post-claim reference recheck + write-ahead S3 recovery.
 5. Tests must use exact fixture/org scope; never run a nil-storage global worker over shared data.
 6. Never truncate references/mappings as cleanup.
+7. After either upload-visible delete fence was observed, success requires a server-owned
+   post-fence physical store before metadata materialization; do not rely on the client.
+8. Existing-metadata `NeedsPut` stores through `probe.StorageClass` and the canonical key.
+9. Fence each delete lifecycle across direct worker and Phase-16 recovery; rematerialization does
+   not prove safety against any already-running delete after the visible fence clears.

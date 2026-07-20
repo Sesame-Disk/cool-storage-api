@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-07-16
+**Last Updated**: 2026-07-20
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🟡 **P10 fixed; non-blocking debt remains** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped; delete resolution trims incidental whitespace and uses the canonical class without health failover; org-less storage APIs are removed. Coverage: the delete/drain/download E2E runs against two dedicated, test-exclusive tenant orgs (so the private GC drain is sound); the orphan-recovery E2E uses an isolated target/sibling org-scoped object pair; an API-level test proves identical bytes resolve to distinct physical keys across the default and platform orgs; and an adapter unit test pins `PlatformOrgID` handling in GC. **Remaining:** storage retention (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and scale (P8). The single-org delete path also has the ~50 GB manual dev-cluster observation (not an automated test). Reconcile/backfill is not required for an empty prod deploy. See GC audit section below. |
+| Garbage Collection | 🔴 **Upload-fence blocker OPEN; P10 fixed** | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` can return upload success with metadata/reference but no object after a fast-clearing delete fence. Six funnels have partial retry wrappers; web block session is unwrapped, and the inner registration wait prevents outer store retry. P10 org isolation remains fixed. See GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -55,14 +55,15 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Read Paths Ignore `storage_key`** | ✅ Fixed by derived-key invariant | Reads, reuse/repair, normal GC delete, and orphan recovery derive the deterministic org-scoped key; reuse fails closed if a non-empty `storage_key` differs. The column is not an arbitrary locator, so non-derived layouts remain unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
-### GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 fixed)
+### GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-20)
 
 Follow-up debt from the PR #123 audit. **Verdict (2026-07-16): P10 is fixed through PR-3.** The
 original pre-PR-2 bug was GC's org-scoped liveness check versus a content-hash-shared S3 object.
 API reads/writes, normal GC deletion, and orphan recovery now use the same org-scoped locator; the
 legacy global APIs are removed. The previous "no open known issue can delete live content" verdict
 was **retracted** when P10 was found: it only
-ever reasoned about liveness within a single org. Within one key layout the delete path is still sound. P6a/P6b safety guards and P1/P1b/P2 durable
+ever reasoned about liveness within a single org. The same-org fast-clear blocker below means the
+delete/upload interaction is not yet an end-to-end invariant. P6a/P6b safety guards and P1/P1b/P2 durable
 purge + cascade are **fixed** on `main` (PR #129). The planned **greenfield prod deploy** starts
 from an empty cluster — reconcile/backfill (8A–8C) and pre-fix `gc_pending_items` orphans are
 **not required**. Note this depends on a **recreated keyspace + empty/new buckets, never written
@@ -72,6 +73,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 
 | Issue | Status | Details |
 |-------|--------|---------|
+| **Upload Fence Clears Before Rematerialization** | 🔴 **Blocker OPEN** | Six funnels have partial store/materialize wrappers, but `RegisterUploadedBlock` absorbs an active-to-clear fence and returns `nil`, so the outer wrapper does not repeat store. Web block-session `blocks.go` is direct/unwrapped. Existing-metadata `NeedsPut` must use `probe.StorageClass` and the canonical key. No new Paxos is planned for references/mappings or the no-fence hot path. See `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` below. |
 | **Org-Admin Trash Delete Defers Cleanup** | 🟢 Fixed (6A/6B + parity follow-up, 2026-07-14) | Permanent-delete now stamps a durable `deleted_libraries.purge_requested_at` (migration 012). The immediate Phase-13-deduplicated `library_cascade` enqueue is wired on the v2.1 owner path and the platform/org-admin delete paths; the legacy `/api2/repos/deleted/:repo_id` registration still falls back to marker + Phase 13 recovery. In the wired paths, reclamation normally lands around the grace period; if that best-effort enqueue is lost, Phase 13 adds up to one `ScanInterval` before recovery. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01 below. |
 | **Non-Durable, Content-Only Delete Handoff** | 🟢 Resolved (6A/6B + org-admin parity, 2026-07-14) | Correctness is durable via `deleted_libraries.purge_requested_at` + Phase 13; all wired permanent-delete paths (v2.1 owner + platform + org-admin single/bulk) now call `Service.EnqueueLibraryCascade` (identity-matched to Phase 13, a dedup no-op) as a best-effort accelerator, and a lost enqueue costs only latency. The legacy `/api2/repos/deleted/:repo_id` route mounts the handler with `libHandler=nil` and relies on marker + Phase 13. See ISSUE-GC-DELETE-HANDOFF-DURABILITY-01 below. |
 | **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Low — transient for new deletes | `hardDeleteLibraryRowsFn` does not synchronously call `AddDeleteLibraryPolicyQuery`, but the durable cascade's `HardDeleteLibrary` clears both policy rows. At most a short stale window for new deletes; branch 2 is optional polish. Not a greenfield-prod blocker. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
@@ -86,9 +88,37 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 | **Org Cascade Re-Soft-Deletes on Marker Drift** | 🟡 Confirmed, defense-in-depth (Low) | If `libraries.deleted_at` is set but the `deleted_libraries` marker is absent, the org cascade re-runs `SoftDeleteLibrary`, re-stamping `deleted_at` and re-subtracting aggregates (double-decrement, clamped). Unreachable under normal ops (marker + canonical are written/cleared atomically), so a corruption-only hardening. See ISSUE-GC-ORG-CASCADE-REMARK-01 below. |
 | **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. Drift/manual-ops edge case; not reproduced on the current live path. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
 | **Phase 9 Group-Share Discovery Is a Global Scan** | 🟠 Pending (Med) | The immediate fix streams `shares_by_group` in bounded driver pages with cancellation, but Cassandra still scans every partition. Replace with bucketed active-partition discovery. See ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01 below. |
-| **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Block pending leak (E4) fixed for new work (P9). See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
+| **GC Worker/Scanner Robustness (E1/E2/E4)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, and pending-projection drift audit. E5 lifecycle fencing is promoted into the upload-fence blocker and is no longer optional robustness debt. Block pending leak (E4) is fixed for new work (P9). See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
 | **No Reconcile/Backfill for Existing Orphans** | ⏸ Deferred (greenfield prod) | Brownfield clusters with pre-fix residue may need a read-only reconcile pass. **Not required** for the planned empty prod deploy. See ISSUE-GC-RECONCILE-BACKFILL-01 below. |
 | **Block `gc_pending_items` Rows Leak (library-scope mismatch)** | 🟢 Fixed (2026-07-13) | Confirmed live-path leak: `ItemBlock` enqueued with the real `library_id` while the pending key is library-scoped and dedup checks use `uuid.Nil`. Fixed by standardizing block enqueue on `uuid.Nil` + store backstop. Pre-existing orphans on brownfield clusters only. See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01 below. |
+
+### ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01: Fast-Clearing GC Fence Can Lose the Uploaded Object
+
+**Status**: 🔴 OPEN blocker (2026-07-20)
+**Severity**: Blocker - false-success upload can publish a live reference and immutable metadata for
+an absent physical object
+**Affected**: SeafHTTP simple/streaming, sync `PutBlock`, V2 `UploadFile`, template `CreateFile`,
+OnlyOffice, and web block-session upload
+
+`RetryUploadedBlockMaterialization`, `retrySeafHTTPBlockMaterialization`,
+`retryCreateFileTemplateBlockMaterialization`, `EnsureReusableBlockPresent`, and
+`ErrBlockDeleteInProgress` already provide partial machinery. The invariant still fails when
+`RegisterUploadedBlock` observes a fence, waits until GC deletes S3 and clears the fence, then runs
+`UpsertBlockMetadata` and returns `nil`; the outer wrapper never repeats store. Web block-session
+`internal/api/v2/blocks.go` additionally bypasses the complete wrapper/probe cycle.
+
+The fix must propagate that a fence was observed, reuse the existing wrappers, wrap `blocks.go`, and
+use `probe.StorageClass` plus the canonical key whenever `NeedsPut` has existing metadata. It must
+not add Paxos/LWT to `block_references` or mappings, nor coordination to the no-fence hot path.
+Rematerialization is necessary but not sufficient. Worker and scanner can overlap under the same
+leader: recovery may clear the orphan while the original worker remains able to delete the
+post-fence re-PUT. The fix therefore also requires per-delete-lifecycle ownership/generation across
+direct worker and recovery; stale/overlapping recoverers are another instance of the same ABA risk.
+
+Current tests do not close the blocker. `TestRetryUploadedBlockMaterializationRetriesStoreFence`
+injects a synthetic store sentinel. `TestUploadLink_ReuploadBlockedByS3OrphanFence` is a persistent
+SeafHTTP/upload-link fence test in `gc_integration_test.go`, not web block session and not
+fast-clear.
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -617,8 +647,9 @@ is gone. References are modeled as rows in `block_references` (one row per
 for in-flight uploads). Adding/removing a reference is an idempotent `INSERT`/`DELETE`
 with no LWT, so a client retry that re-registers the same content-addressed
 `(block, fs_id)` cannot inflate anything — the ambiguous-CAS leak class no longer
-exists. The only expensive Paxos left is the GC worker's `gc_state='deleting'` claim
-at the irreversible S3-delete gate (claim-then-verify). See
+exists. Reference add/remove uses no LWT. Immutable block metadata still uses
+`INSERT IF NOT EXISTS`, and the GC worker separately uses LWT for its
+`gc_state='deleting'` claim/finalize at the irreversible S3-delete gate. See
 `internal/db/block_references.go`, `FSHelper.RegisterUploadedBlock` /
 `RegisterFSObjectBlockReferences`, and the GC worker's `processBlock` /
 `removeFSObjectBlockReferences`. Original analysis kept below for context.
@@ -928,7 +959,8 @@ and the `gc_s3_orphans` fence to return one of:
 - `BlockReuseBlockedByGC` → `ErrBlockDeleteInProgress` (retry/back-off)
 - `BlockReuseUnknownError` → fall open to the legacy Exists+PUT path
 
-Wired into all five upload paths. New blocks now pay ≤2 Cassandra reads (~1 ms each)
+Partially wired into six upload funnels (`seafhttp.go` x2, `sync.go`, `files.go` x2,
+`onlyoffice.go`). New blocks now pay ≤2 Cassandra reads (~1 ms each)
 + 1 direct PUT, **no HEAD**; dedup hits pay 3 Cassandra reads + 1 canonical-verify
 HEAD (+ a repair PUT only when the object is actually missing).
 
@@ -941,20 +973,16 @@ This is fixed for the *server-side hot upload paths*, not across the whole repo:
   as the probe-error fallback inside the migrated paths and by unmigrated callers
   such as the `v2/blocks.go` `UploadBlock` handler (its own HEAD + `PutBlockData`).
 - The `Reusable` path does not skip S3: `EnsureReusableBlockPresent` adds a targeted
-  HEAD on the canonical key (with repair-on-miss) so the upload never publishes a
-  reference to a physically-missing object. This is a deliberate safety/perf trade —
-  the HEAD is back on dedup hits, but reuse is now self-healing.
+  HEAD on the canonical key (with repair-on-miss). This avoids knowingly reusing an
+  already-missing object at that instant, but is not an atomic guarantee against a later GC delete.
 
-#### Why skipping the legacy PUT is safe
+#### Correctness boundary after skipping the legacy PUT
 
-GC-race safety derives from the *reference-first, then fence-check* protocol in
-`FSHelper.RegisterUploadedBlock` (`fs_helpers.go:1006–1034`) versus GC's
-*claim-then-verify-references* in `worker.go:processBlock` (L410–443) — a
-Dekker-style mutual flagging — not from the S3 PUT. The `gc_s3_orphans` fence is
-written before the S3 `DeleteObject` and cleared only after it, so any in-flight
-delete is always visible to both the probe and the materialize step. The probe is
-an optimization that fails safe in every non-reusable direction. The canonical
-verify/repair on the reuse path is an extra physical guarantee on top of this.
+The probe and reference/fence protocol are partial safeguards, not a closed GC-race invariant.
+`RegisterUploadedBlock` can absorb fast-clear and return `nil`, preventing the outer wrapper from
+repeating store; web block-session `blocks.go` has no complete wrapper. For existing-metadata
+`NeedsPut`, store must also use `probe.StorageClass` and the canonical key rather than the currently
+preferred backend. `EnsureReusableBlockPresent` applies only to `Reusable`.
 
 The materialization retry loop (`retrySeafHTTPBlockMaterialization` and
 `v2.RetryUploadedBlockMaterialization`) now also retries when the `store` phase
@@ -1746,24 +1774,28 @@ This closed the missing-CAS and missing-parent-validation bug class. The remaini
 
 ### ISSUE-GC-MULTIINSTANCE-01: Multi-instance GC coordination and split-brain hardening
 
-**Status**: 🟡 Pending with temporary prod workaround
+**Status**: 🟡 Baseline lease implemented; split-brain/overlap hardening remains
 **Discovered**: 2026-03-17
 **Priority**: 🟡 High — required before scaling to multiple replicas
 **Affected**: `internal/gc/worker.go`, `internal/gc/scanner.go`, `internal/gc/gc.go`
 
-**Problem:**
-The GC (worker + scanner) has no coordination mechanism between instances. If multiple server replicas are running, all of them execute the worker and scanner in parallel, causing:
+**Original problem (superseded by the baseline lease):**
+Before `gc_leases`, enabled GC replicas could execute worker and scanner work in parallel, causing:
 
 1. **DequeueBatch without locking**: `SELECT ... LIMIT ?` returns the same items to all instances. Both process the same items simultaneously.
-2. **Scanner without leader election**: Multiple scanners enqueue the same orphans as duplicates (the PK includes `queued_at = time.Now()`, so each INSERT creates a distinct row).
+2. **Scanner without leader election (historical)**: Multiple scanners could enqueue the same orphans as duplicates (the PK includes `queued_at = time.Now()`, so each INSERT creates a distinct row).
 3. **Snapshot drift** (substantially resolved): the original `gc_queue_stats` counter table was retired from the baseline schema. Queue/DLQ totals now live in `gc_stats` and `gc_org_stats`, dirty orgs are exact-recalculated from canonical rows off the write path, hot `COUNT(*)` reads are gone, and DLQ expiry is explicit. Snapshots remain approximate until the background/admin refresh runs. See ARCHITECTURE.md / GC-SERVICE-ANALYSIS.md.
 
-**Is there data loss?** No. Destructive operations are protected:
+**Current safety boundary:** The lease and destructive guards prevent ordinary duplicate execution,
+but do not close every upload/recovery overlap:
 - `DeleteBlock` uses a claim-then-verify delete fence: only one instance can win the claim, and the winner re-checks live `block_references` before touching S3
 - `block_references` rows make fs_object cleanup idempotent; retrying the same delete removes the same keyed refs again instead of replaying a counter decrement
 - Cassandra DELETEs are idempotent
+- `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` remains open, and orphan recovery still lacks a
+  per-lifecycle generation/claim for stale or overlapping recoverers
 
-**Actual impact**: Wasted work (CPU/network overhead) and slightly incorrect admin counters. No risk of data loss.
+**Actual impact of ordinary duplicate work**: wasted CPU/network and temporary counter drift. Do not
+generalize that statement to fast-clear upload or stale-recoverer overlap.
 
 **Current operational decision (updated 2026-04-14):**
 - Keep `gc.enabled=false` in YAML and set `GC_ENABLED=true` only on the replicas that are allowed to run GC.
@@ -1787,7 +1819,11 @@ Running GC in a single DC is **critical** for multi-region deployments with Cass
 
 The existing `GC_ENABLED=true` on exactly one DC / `GC_ENABLED=false` on all others remains the correct topology for multi-region. The lease now provides automatic failover among enabled replicas, but you should still avoid enabling GC in multiple DCs at once.
 
-All block-level operations (`IncrementOrCreateBlock`, `decrementBlockRefCount`, `DeleteBlock` Phase 1) use LWT which defaults to `SERIAL` (global Paxos). Do NOT change to `LOCAL_SERIAL` — this would break cross-DC serialization and allow split-brain scenarios where GC in DC-A claims a block that an upload in DC-B is concurrently referencing.
+The old `IncrementOrCreateBlock` / `decrementBlockRefCount` LWT protocol was removed with
+`blocks.ref_count`. Current `block_references` and mappings use ordinary writes; immutable block
+metadata uses `INSERT IF NOT EXISTS`, and GC claim/finalize has its own LWT. Do not enable
+destructive GC under the committed `LOCAL_SERIAL` cluster profiles until their serial-domain
+assumptions are validated or the protocol is redesigned; `config.prod.yaml` commits `SERIAL`.
 
 **Alternative — Org partitioning:**
 Each instance processes `hash(orgID) % numInstances == myIndex`. No coordination needed but requires knowing the total number of instances.
@@ -4287,7 +4323,7 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 
 ---
 
-### ISSUE-GC-ENGINE-ROBUSTNESS-01: GC Worker/Scanner Robustness (E1/E2/E4/E5)
+### ISSUE-GC-ENGINE-ROBUSTNESS-01: GC Worker/Scanner Robustness (E1/E2/E4)
 
 **Status**: 🟡 Confirmed, low-severity (2026-07-10)
 **Severity**: Low / Low-Med — engine fragility and observability; former E3 is High P6
@@ -4295,9 +4331,10 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 
 #### Problem
 
-A worker/scanner engine review confirmed E1/E2/E4/E5 as low-severity. Former E3 was
-incorrectly described as fail-safe: the Cassandra store swallows the error, making it the High
-P6 issue above.
+A worker/scanner engine review confirmed E1/E2/E4 as low-severity. Former E3 was
+incorrectly described as fail-safe: the Cassandra store swallowed the error, making it the High
+P6 issue above. Former E5 is promoted into `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`: worker and
+scanner overlap under one leader, so accepting lease-only exclusion is not a valid safety decision.
 
 - **E1 — no postpone bound.** `postponeItem` re-queues a lock-contended (`hard_delete_in_progress`) item with `RetryCount` unchanged ([worker.go:361-376](../internal/gc/worker.go#L361)). Intentional (lock contention should not push toward the DLQ), but with no bound and no metric a permanently stuck hard-delete lock loops forever with no DLQ/alert.
 - **E2 — `dryRun` data race vs cutover semantics.** `dryRun` is read/written concurrently
@@ -4317,7 +4354,7 @@ P6 issue above.
   source of this drift was found, root-caused, and fixed — the block/library-scope mismatch.
   See `ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01` below.** The independent reconcile/backstop
   (10D) is still open for pre-existing orphans and other drift sources.
-- **E5 — S3-orphan recovery lease-only exclusion.** `RecoverS3Orphans` ([worker.go:616-789](../internal/gc/worker.go#L616)) has no per-row LWT; mutual exclusion relies on the leader lease. Real double-processing risk only under a lease split-brain.
+- **E5 — promoted to blocker.** `RecoverS3Orphans` ([worker.go:616-789](../internal/gc/worker.go#L616)) has no per-lifecycle generation/claim. The leader lease does not serialize the worker and scanner loops: Phase 16 can clear an orphan while the original worker from that same lifecycle remains able to call `DeleteBlock`. An upload can then re-PUT after the visible fence clears and lose the new copy to that worker. Stale handoff, split-brain, or overlapping recoverers produce the same ABA shape. Track and fix this under `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, not this low-severity issue.
 
 #### Reviewed and found NOT to be bugs
 
@@ -4325,15 +4362,15 @@ P6 issue above.
 - "Resurrection guard missing for the `pending_s3` phase" — **not a bug**: the branch checks `BlockExists` before the S3 delete and defers if the canonical row exists ([worker.go:712-725](../internal/gc/worker.go#L712)).
 - "Child-enqueue vs parent-delete race in `processCommit`/`processFSObject`" — **mitigated**: children carry `RequiresLibraryDeletedCheck` and their own `acquireLibraryDeleteGuard` catches restore/re-delete ([worker.go:1729-1830](../internal/gc/worker.go#L1729)).
 
-#### Fix Direction (branches 10A–10E)
+#### Fix Direction (branches 10A–10D)
 
 - 10A: `atomic.Bool` plus an explicit decision on hard-cutover semantics.
 - 10B: consistently surface remaining scanner errors; P5/P6 own their specific paths.
 - 10C: meter/bound repeated postpones without premature DLQ.
 - 10D: audit/reconcile pending rows against queue + retained DLQ; no standalone TTL unless
   lifetimes are coordinated.
-- 10E: decide E5 explicitly — accept leader-lease exclusion as design because operations are
-  largely idempotent, or add a per-row orphan claim/LWT if split-brain tolerance is required.
+- 10E is superseded by the blocker: shared delete-lifecycle ownership/generation is required across
+  direct worker and Phase-16 recovery; lease-only exclusion cannot be accepted as safe.
 
 #### Related Docs
 
