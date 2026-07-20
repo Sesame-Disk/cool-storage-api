@@ -47,9 +47,13 @@ flowchart TD
     Recheck -->|no| WAL[StartBlockDeleteOrphan<br/>gc_s3_orphans fence active before DB removal]
     WAL --> Finalize[LWT finalize canonical block delete]
     Finalize --> S3[Delete S3 with bounded retry<br/>orphan fence remains active]
-    S3 -->|failure| Recover[Keep orphan row for scanner recovery]
-    S3 -->|success| Mapping[Delete exact forward mapping]
-    Mapping --> Clear[Clear orphan + candidate]
+    S3 -->|failure| Mapping[Delete exact forward mapping<br/>runs on both branches]
+    S3 -->|success| Mapping
+    Mapping --> Orphan{S3 delete succeeded?}
+    Orphan -->|yes| Clear[Clear orphan row]
+    Orphan -->|no| Recover[Keep orphan row for scanner recovery]
+    Clear --> Candidate[Clear GC candidate<br/>runs on both branches]
+    Recover --> Candidate
 ```
 
 The dual writer-visible fence is `blocks.gc_state='deleting'` **or** `gc_s3_orphans`.

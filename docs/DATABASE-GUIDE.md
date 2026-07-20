@@ -1310,12 +1310,16 @@ The nested `consistency.default/reads/writes/critical` example was a design sket
 supported schema. The application currently accepts one regular consistency scalar plus one serial
 consistency scalar, both of which may be overridden by environment variables.
 
-`configs/config.prod.yaml` commits `SERIAL`, while `config-usa.cluster.yaml` and
-`config-eu.cluster.yaml` currently commit `LOCAL_SERIAL`. Those files are baselines, not proof of
-runtime configuration. Until the serial-domain assumptions are validated or the destructive GC
-protocol is redesigned for those profiles, keep GC disabled in the `LOCAL_SERIAL` cluster profiles.
-Confirm the effective values from startup logs/environment and live keyspace topology before
-enabling destructive work.
+**Production runs `configs/config.prod.yaml` only**, which commits `LOCAL_QUORUM` + `SERIAL` on a
+single DC (`datacenter1`, `NetworkTopologyStrategy` RF=1). The multi-region
+`config-usa.cluster.yaml` / `config-eu.cluster.yaml` profiles are **test/development artifacts**
+for the multi-DC compose stack; they commit `LOCAL_SERIAL` with `{usa:1, eu:1}` and already ship
+`gc.enabled: false`. Cross-DC serial-domain and `LOCAL_QUORUM` visibility concerns therefore do not
+describe the production deployment — the live risk in `config.prod.yaml` is RF=1, which is a
+durability and availability exposure, not a GC correctness one. Keep GC disabled in the
+`LOCAL_SERIAL` profiles, and if a multi-DC profile is ever promoted to production, the serial-domain
+assumptions must be validated first. Confirm effective values from startup logs/environment and live
+keyspace topology before enabling destructive work, since env overrides can change any of this.
 
 The GC claim is therefore not literally the only Paxos operation in the block path. Immutable
 block metadata already has a first-writer LWT; GC has separate delete-claim/finalize LWTs; and the

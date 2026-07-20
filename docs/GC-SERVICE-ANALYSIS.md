@@ -143,8 +143,11 @@ processBlock(item):
   5. FinalizeBlockDelete: conditionally DELETE canonical block metadata
   6. Resolve BlockStore by (item.org_id, canonical storage_class), without health failover
   7. S3 DeleteBlock(blockID) at blocks/<org_id>/...
-     └─ If S3 fails: log warning, keep orphan row for scanner recovery
-  8. Clean exact mapping, then clear orphan fence/candidate after S3 success
+     └─ If S3 fails: log warning, record the attempt, do NOT return an error
+  8. Clean exact mapping and clear the GC candidate — both run whether or not
+     step 7 succeeded, so the queue item always completes
+     └─ Clear the gc_s3_orphans row ONLY after a successful S3 delete; on
+        failure it stays as the sole recovery state
   9. Increment stats
 ```
 

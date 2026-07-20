@@ -237,13 +237,17 @@ A final S3 HEAD is not proof against any already-authorized delete that can occu
 
 #### Effective production scope
 
-`configs/config.prod.yaml`, **if mounted without environment or deployment overrides**, is the
-committed baseline: `serial_consistency: SERIAL`, one Cassandra DC (`datacenter1`) with
-`NetworkTopologyStrategy` RF=1, and `gc.enabled: false`. Deployment guidance sets
-`GC_ENABLED=true` only on the designated GC replica (the `gc_leases` lease remains a backstop).
-That file is not evidence of the effective runtime. Establish runtime behavior from startup logs,
-environment/compose values, and the live keyspace replication metadata. Under the committed
-baseline assumptions:
+**Production deploys `configs/config.prod.yaml` and only that file.** The `config-usa.cluster.yaml`
+/ `config-eu.cluster.yaml` multi-region profiles are test/development artifacts for the multi-DC
+compose stack and are never the production topology; both also ship `gc.enabled: false`. Any audit
+finding derived from those profiles is therefore not a production finding.
+
+The committed production baseline, **if mounted without environment or deployment overrides**, is:
+`serial_consistency: SERIAL`, one Cassandra DC (`datacenter1`) with `NetworkTopologyStrategy` RF=1,
+and `gc.enabled: false`. Deployment guidance sets `GC_ENABLED=true` only on the designated GC
+replica (the `gc_leases` lease remains a backstop). That file is not evidence of the effective
+runtime. Establish runtime behavior from startup logs, environment/compose values, and the live
+keyspace replication metadata. Under the committed baseline assumptions:
 
 - the audit concerns about cross-DC `LOCAL_QUORUM` visibility and a `LOCAL_SERIAL` split serial
   domain are **not active**, because there is one configured DC and serial consistency is `SERIAL`;
