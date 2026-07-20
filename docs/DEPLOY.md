@@ -813,7 +813,7 @@ Before pulling, on each existing node:
 
 1. Confirm the cluster's actual DC name (`docker compose -f docker-compose.prod.yml exec cassandra nodetool status`) and make sure `CASSANDRA_DC` in `.env` matches it. The bootstrap will refuse to apply a policy that does not include the local DC.
 2. Set `CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy` and `CASSANDRA_REPLICATION_DCS` to the full topology you want (single-region: `dc-name:1`; multi-region: `dc-na:1,dc-eu:1,...`).
-3. Keep `CASSANDRA_CONSISTENCY=LOCAL_QUORUM` and `CASSANDRA_SERIAL_CONSISTENCY=SERIAL` unless you are deliberately changing the Cassandra consistency contract. In multi-region, `SERIAL` is the safe default for LWT/CAS on shared rows such as library HEAD and block refcounts.
+3. Keep `CASSANDRA_CONSISTENCY=LOCAL_QUORUM` and `CASSANDRA_SERIAL_CONSISTENCY=SERIAL` unless you are deliberately changing the Cassandra consistency contract. In multi-region, `SERIAL` is the safe default for LWT/CAS on shared rows: library HEAD CAS, immutable block-metadata first-writer, and the GC delete claim/finalize. It does **not** cover `block_references`, which are ordinary writes at the non-serial level — see `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` in `docs/KNOWN_ISSUES.md` before enabling destructive GC multi-DC. (`blocks.ref_count` no longer exists; liveness is row-per-reference.)
 4. Pull and `docker compose up -d` as usual. The bootstrap container reapplies the policy idempotently.
 5. Single-region single-DC `SimpleStrategy{rf=1} → NetworkTopologyStrategy{dc:1}` places replicas identically; repair is a no-op but harmless. Multi-DC migrations or RF changes still require `nodetool repair sesamefs` and `nodetool repair system_auth` after the ALTER.
 

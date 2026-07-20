@@ -97,7 +97,11 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 
 **Status**: 🔴 OPEN gating condition for multi-DC deployments (2026-07-20)
 **Severity**: Gating — GC may read zero references for a block that is live in another DC
-**Affected**: any deployment with more than one Cassandra DC (the documented default production path)
+**Affected**: deployments where reference writes and GC liveness reads are **not guaranteed to
+intersect** — concretely, ≥2 Cassandra DCs with `LOCAL_QUORUM` reads/writes and RF 1 per DC, which
+is the committed default production posture. Being multi-DC is not sufficient to be affected: a
+multi-DC deployment whose GC liveness reads use an intersecting level (`EACH_QUORUM`/`ALL`), or one
+with enforced per-DC write ownership, is **not** affected. Nor is single-DC.
 
 **The posture.** `docs/DEPLOY.md` treats multi-region as the default production path and describes
 `configs/config.prod.yaml` as the shared multi-region structural config, with node-local values in
@@ -138,7 +142,9 @@ multi-DC):
    with a globally serialized read.
 
 Option 1 is the only one adoptable without new ownership machinery. Until one is implemented and
-verified, treat destructive GC as gated on multi-DC deployments.
+verified, treat destructive GC as gated on any deployment matching the **Affected** condition above
+— not on multi-DC as such. A deployment that already guarantees intersection (option 1 applied, or
+strict write ownership) clears this gate.
 
 **Validation gap**: no multi-DC test exercises GC against references written in another DC, so this
 is reasoned from the consistency contract and the committed configuration, not from a reproduction.
@@ -1888,8 +1894,14 @@ assumptions are validated or the protocol is redesigned; `config.prod.yaml` comm
 **Alternative — Org partitioning:**
 Each instance processes `hash(orgID) % numInstances == myIndex`. No coordination needed but requires knowing the total number of instances.
 
-**Alternative — Accept duplication:**
-If only 2-3 instances will run, overhead is minimal and all logic is already idempotent. Counters can be recalculated with a periodic scan.
+**Alternative — Accept duplication: ❌ rejected.**
+This previously read "all logic is already idempotent", which is **not true for destructive work**.
+Duplicate *ordinary* work (re-reading a queue item, re-enqueueing an orphan) is idempotent and only
+wastes CPU/network. But `RecoverS3Orphans` has no per-lifecycle claim or generation, so two
+overlapping recoverers can produce an ABA delete after a re-upload
+(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`), and duplicate GC also widens the fast-clear window.
+Do not adopt this alternative for destructive phases. The refcount recalculation this option used to
+rely on is also obsolete — `blocks.ref_count` was removed in favor of row-per-reference liveness.
 
 ---
 
