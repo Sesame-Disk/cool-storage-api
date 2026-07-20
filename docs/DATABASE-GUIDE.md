@@ -1328,8 +1328,12 @@ What that means for the block path:
   `LOCAL_QUORUM` with RF 1 per DC, a reference write is acknowledged by one local replica, so a
   reference confirmed in one DC is not guaranteed visible to a GC read in another. The 1h grace
   period reduces exposure to ordinary lag but is not a guarantee under prolonged lag or partition.
-  Enabling destructive GC multi-DC needs an explicit decision for those reference reads — raise the
-  GC liveness read consistency, or pin GC to the DC that owns the writes.
+  Enabling destructive GC multi-DC needs an explicit decision for those reference reads: raise the
+  GC liveness read so its quorum intersects every DC accepting reference writes — at RF 1/DC that
+  is an `EACH_QUORUM`-equivalent for `BlockHasReferences` and the post-claim recheck. Pinning GC to
+  the write-owning DC is not currently valid: that ownership is not enforced, including under
+  failover. Running GC in a single DC fixes coordination, not visibility. Tracked as
+  `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`.
 
 The `config-usa.cluster.yaml` / `config-eu.cluster.yaml` profiles are separate test/development
 artifacts for the multi-DC compose stack; they commit `LOCAL_SERIAL` with `{usa:1, eu:1}` and ship

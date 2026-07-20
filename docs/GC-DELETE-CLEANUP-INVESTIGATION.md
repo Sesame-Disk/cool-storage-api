@@ -57,8 +57,11 @@ their verified status.
 > - **GATING (multi-DC)** — `block_references` are ordinary `LOCAL_QUORUM` writes, so on the
 >   documented multi-region production posture (RF 1 per DC) a reference confirmed in one DC is not
 >   guaranteed visible to a GC liveness read in another. `SERIAL` covers the LWTs but not these
->   reads. Enabling destructive GC multi-DC needs an explicit decision — raise the GC liveness read
->   consistency, or pin GC to the DC that owns the writes. See
+>   reads. Enabling destructive GC multi-DC needs an explicit decision: raise the GC liveness read
+>   consistency so the read quorum intersects every DC (an `EACH_QUORUM`-equivalent for those reads
+>   at RF 1/DC). Pinning GC to "the DC that owns the writes" is **not** currently a valid
+>   alternative — that ownership is not established or enforced, including under failover. Tracked
+>   as `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`; see
 >   [Effective production scope](#effective-production-scope).
 > - **P4** — `pub:` refs lack a discoverable zero-ref→candidate transition after TTL expiry.
 > - **P5** — Phase 13 logs enqueue failures but returns success.
@@ -268,9 +271,13 @@ Consequences for this audit under the documented multi-region posture:
   single local replica. A reference confirmed in one DC is not guaranteed visible to a GC worker
   reading in another DC. The 1h grace period reduces exposure to ordinary replication lag but is
   **not** a consistency guarantee under prolonged lag or partition. Enabling destructive GC on a
-  multi-DC deployment requires an explicit consistency decision for the reference reads (for
-  example raising the GC liveness read, or pinning GC to the DC that owns the writes) — it is not
-  covered by `SERIAL`;
+  multi-DC deployment requires an explicit consistency decision for the reference reads: raise the
+  GC liveness read so its quorum intersects every DC accepting reference writes (at RF 1/DC that
+  means an `EACH_QUORUM`-equivalent for `BlockHasReferences` and the post-claim recheck). Pinning
+  GC to the write-owning DC only works if every reference mutation for that block/org is guaranteed
+  to execute there **including during failover**, which this codebase does not establish. Running
+  GC in one DC (`ISSUE-GC-MULTIINSTANCE-01`) fixes coordination, not visibility. Tracked as
+  `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`;
 - with a single-DC override the committed baseline is `NetworkTopologyStrategy` RF=1 on
   `datacenter1`, where RF=1 is an active durability and availability risk rather than a GC
   correctness one; and

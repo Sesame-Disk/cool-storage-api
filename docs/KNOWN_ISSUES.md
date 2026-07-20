@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🔴 **Upload-fence blocker OPEN; P10 fixed** | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` can return upload success with metadata/reference but no object after a fast-clearing delete fence. Six funnels have partial retry wrappers; web block session is unwrapped, and the inner registration wait prevents outer store retry. P10 org isolation remains fixed. See GC audit section below. |
+| Garbage Collection | 🔴 **Upload-fence blocker OPEN; multi-DC gating OPEN; P10 fixed** | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` can return upload success with metadata/reference but no object after a fast-clearing delete fence. Six funnels have partial retry wrappers; web block session is unwrapped, and the inner registration wait prevents outer store retry. Separately, `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` gates destructive GC on the multi-DC production posture: `block_references` are ordinary `LOCAL_QUORUM` writes that `SERIAL` does not cover. **Both must close before GC is deploy-ready** — fixing the fence alone is not sufficient. P10 org isolation remains fixed. See GC audit section below. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -76,6 +76,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 | **Upload Fence Clears Before Rematerialization** | 🔴 **Blocker OPEN** | Six funnels have partial store/materialize wrappers, but `RegisterUploadedBlock` absorbs an active-to-clear fence and returns `nil`, so the outer wrapper does not repeat store. Web block-session `blocks.go` is direct/unwrapped. Existing-metadata `NeedsPut` must use `probe.StorageClass` and the canonical key. No new Paxos is planned for references/mappings or the no-fence hot path. See `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` below. |
 | **Org-Admin Trash Delete Defers Cleanup** | 🟢 Fixed (6A/6B + parity follow-up, 2026-07-14) | Permanent-delete now stamps a durable `deleted_libraries.purge_requested_at` (migration 012). The immediate Phase-13-deduplicated `library_cascade` enqueue is wired on the v2.1 owner path and the platform/org-admin delete paths; the legacy `/api2/repos/deleted/:repo_id` registration still falls back to marker + Phase 13 recovery. In the wired paths, reclamation normally lands around the grace period; if that best-effort enqueue is lost, Phase 13 adds up to one `ScanInterval` before recovery. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01 below. |
 | **Non-Durable, Content-Only Delete Handoff** | 🟢 Resolved (6A/6B + org-admin parity, 2026-07-14) | Correctness is durable via `deleted_libraries.purge_requested_at` + Phase 13; all wired permanent-delete paths (v2.1 owner + platform + org-admin single/bulk) now call `Service.EnqueueLibraryCascade` (identity-matched to Phase 13, a dedup no-op) as a best-effort accelerator, and a lost enqueue costs only latency. The legacy `/api2/repos/deleted/:repo_id` route mounts the handler with `libHandler=nil` and relies on marker + Phase 13. See ISSUE-GC-DELETE-HANDOFF-DURABILITY-01 below. |
+| **Cross-DC Reference Visibility Gates Destructive GC** | 🔴 OPEN gating (multi-DC) | Production's documented posture is multi-DC with RF 1 per DC. `block_references` are ordinary `INSERT`/`DELETE` at `LOCAL_QUORUM`, which `SERIAL` does not cover, so a reference confirmed in one DC has no guaranteed intersection with a GC liveness read in another. Running GC in exactly one DC solves worker coordination, **not** visibility. See ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 below. |
 | **Stale `gc_libraries_by_policy` on Direct Delete** | 🟡 Low — transient for new deletes | `hardDeleteLibraryRowsFn` does not synchronously call `AddDeleteLibraryPolicyQuery`, but the durable cascade's `HardDeleteLibrary` clears both policy rows. At most a short stale window for new deletes; branch 2 is optional polish. Not a greenfield-prod blocker. See ISSUE-GC-POLICY-INDEX-STALE-01 below. |
 | **`pub:` Refs Lack Discoverable Zero-Ref Transition** | 🟡 Confirmed gap (Med) | `up:` refs have an expiry projection (`gc_provisional_block_refs` + Phase 0); `pub:` refs do not. When the last `pub:` expires by 35-day Cassandra TTL, nothing runs the zero-ref→candidate transition. Storage retention, not incorrect deletion. See ISSUE-GC-PUB-REF-ZERO-REF-01 below. |
 | **Phase 13 Logs But Does Not Propagate Enqueue Errors** | 🟡 Confirmed gap (Med) | `scanExpiredDeletedLibraries` logs `EnqueueBatch` failures but returns `nil`, and logs+`continue`s on per-library dedupe failure, so the failure is invisible to the phase result/health/metrics and the scan cycle can appear successful. See ISSUE-GC-PHASE13-ERROR-VISIBILITY-01 below. |
@@ -91,6 +92,58 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 | **GC Worker/Scanner Robustness (E1/E2/E4)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, and pending-projection drift audit. E5 lifecycle fencing is promoted into the upload-fence blocker and is no longer optional robustness debt. Block pending leak (E4) is fixed for new work (P9). See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
 | **No Reconcile/Backfill for Existing Orphans** | ⏸ Deferred (greenfield prod) | Brownfield clusters with pre-fix residue may need a read-only reconcile pass. **Not required** for the planned empty prod deploy. See ISSUE-GC-RECONCILE-BACKFILL-01 below. |
 | **Block `gc_pending_items` Rows Leak (library-scope mismatch)** | 🟢 Fixed (2026-07-13) | Confirmed live-path leak: `ItemBlock` enqueued with the real `library_id` while the pending key is library-scoped and dedup checks use `uuid.Nil`. Fixed by standardizing block enqueue on `uuid.Nil` + store backstop. Pre-existing orphans on brownfield clusters only. See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01 below. |
+
+### ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01: Cross-DC Reference Visibility Gates Destructive GC
+
+**Status**: 🔴 OPEN gating condition for multi-DC deployments (2026-07-20)
+**Severity**: Gating — GC may read zero references for a block that is live in another DC
+**Affected**: any deployment with more than one Cassandra DC (the documented default production path)
+
+**The posture.** `docs/DEPLOY.md` treats multi-region as the default production path and describes
+`configs/config.prod.yaml` as the shared multi-region structural config, with node-local values in
+`.env`. `.env.prod.example` ships `CASSANDRA_CONSISTENCY=LOCAL_QUORUM`,
+`CASSANDRA_SERIAL_CONSISTENCY=SERIAL`, and
+`CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1`. Production is therefore normally multi-DC
+with **RF 1 per DC**.
+
+**Why `SERIAL` does not cover this.** `SERIAL` makes the LWTs globally serialized — GC
+claim/finalize, immutable metadata first-writer, and `gc_leases`. But `block_references` liveness
+rows are ordinary `INSERT`/`DELETE`, not LWT. With RF 1 per DC, a `LOCAL_QUORUM` reference write is
+acknowledged by a single local replica, and a `LOCAL_QUORUM` read in a different DC is satisfied by
+that DC's single replica. **The write and read quorums need not intersect.** A reference confirmed
+in `dc-eu` can therefore be invisible to a GC worker reading in `dc-na` at the moment it evaluates
+liveness — including its post-claim recheck.
+
+**Relationship to `ISSUE-GC-MULTIINSTANCE-01`.** Enabling GC in exactly one DC is **necessary** for
+worker/scanner coordination and to avoid cross-DC Paxos contention. It is **not sufficient** here:
+the single GC DC is precisely the DC that may not yet see references written elsewhere. Do not read
+"one GC DC" as closing this issue.
+
+**The 1h grace period is mitigation, not a guarantee.** It makes ordinary replication lag very
+unlikely to matter, but it does not bound a network partition, a downed replica, or sustained
+hinted-handoff backlog.
+
+**Candidate resolutions** (an explicit decision is required before enabling destructive GC
+multi-DC):
+
+1. **Raise the GC liveness read consistency** so the read quorum intersects every DC that can
+   accept reference writes. With RF 1 per DC this means a level equivalent to `EACH_QUORUM` for
+   those specific reads (`BlockHasReferences`, and the post-claim recheck). This is the robust
+   option; cost is a cross-DC round trip on the GC read path only, not on upload.
+2. **Pin GC to the DC that owns the writes.** Only valid if the system *guarantees* that every
+   reference mutation for that block/org is executed in that DC, **including during failover and
+   routing changes**. That ownership property is **not currently established** in this codebase, so
+   this option cannot be adopted without first designing and enforcing write ownership.
+3. **Redesign liveness ownership** so a block's liveness is authoritative in exactly one partition
+   with a globally serialized read.
+
+Option 1 is the only one adoptable without new ownership machinery. Until one is implemented and
+verified, treat destructive GC as gated on multi-DC deployments.
+
+**Validation gap**: no multi-DC test exercises GC against references written in another DC, so this
+is reasoned from the consistency contract and the committed configuration, not from a reproduction.
+
+---
 
 ### ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01: Fast-Clearing GC Fence Can Lose the Uploaded Object
 
@@ -1811,13 +1864,20 @@ generalize that statement to fast-clear upload or stale-recoverer overlap.
 - Keep the explicit `GC_ENABLED=true` activation model so GC stays opt-in by replica.
 - Consider exposing lease state/owner in admin status if operators want clearer observability during failover drills.
 
-**Multi-region deployment note (2026-04-10):**
+**Multi-region deployment note (2026-04-10, scope corrected 2026-07-20):**
 Running GC in a single DC is **critical** for multi-region deployments with Cassandra replication. Even though LWT operations use `SERIAL` consistency (global Paxos) by default, running GC on multiple DCs would cause:
 - `DequeueBatch` (non-LWT SELECT) returning the same items to workers in different DCs
 - Scanner in both DCs enqueueing duplicate orphans
 - Unnecessary cross-DC Paxos contention on every LWT
 
-The existing `GC_ENABLED=true` on exactly one DC / `GC_ENABLED=false` on all others remains the correct topology for multi-region. The lease now provides automatic failover among enabled replicas, but you should still avoid enabling GC in multiple DCs at once.
+`GC_ENABLED=true` on exactly one DC / `GC_ENABLED=false` on all others remains the correct topology for **coordination**, and the lease provides automatic failover among enabled replicas.
+
+> ⚠️ **Necessary, not sufficient.** Single-DC GC solves *who runs* GC. It does **not** make that DC
+> see reference rows written in other DCs: `block_references` are ordinary `LOCAL_QUORUM` writes
+> that `SERIAL` does not cover, and with RF 1 per DC the write and read quorums need not intersect.
+> The one enabled GC DC is exactly the DC that may miss a live reference confirmed elsewhere.
+> Destructive GC on a multi-DC deployment is separately gated by
+> `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` and closing this issue does not close that one.
 
 The old `IncrementOrCreateBlock` / `decrementBlockRefCount` LWT protocol was removed with
 `blocks.ref_count`. Current `block_references` and mappings use ordinary writes; immutable block
