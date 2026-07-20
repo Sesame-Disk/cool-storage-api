@@ -54,6 +54,12 @@ their verified status.
 >   be published. Current code can succeed after a fast-clearing fence without that re-PUT, and the
 >   delete lifecycle is not fenced across the direct worker and Phase-16 recovery after the orphan
 >   row clears. Both writer rematerialization and lifecycle ownership are required.
+> - **GATING (multi-DC)** — `block_references` are ordinary `LOCAL_QUORUM` writes, so on the
+>   documented multi-region production posture (RF 1 per DC) a reference confirmed in one DC is not
+>   guaranteed visible to a GC liveness read in another. `SERIAL` covers the LWTs but not these
+>   reads. Enabling destructive GC multi-DC needs an explicit decision — raise the GC liveness read
+>   consistency, or pin GC to the DC that owns the writes. See
+>   [Effective production scope](#effective-production-scope).
 > - **P4** — `pub:` refs lack a discoverable zero-ref→candidate transition after TTL expiry.
 > - **P5** — Phase 13 logs enqueue failures but returns success.
 > - **P7** — markerless commit/fs_object partitions are undiscoverable once both library indexes
@@ -237,26 +243,42 @@ A final S3 HEAD is not proof against any already-authorized delete that can occu
 
 #### Effective production scope
 
-**Production deploys `configs/config.prod.yaml` and only that file.** The `config-usa.cluster.yaml`
-/ `config-eu.cluster.yaml` multi-region profiles are test/development artifacts for the multi-DC
-compose stack and are never the production topology; both also ship `gc.enabled: false`. Any audit
-finding derived from those profiles is therefore not a production finding.
+Production deploys `configs/config.prod.yaml` as its only config **file**, but that file is not the
+effective topology. `docs/DEPLOY.md` calls multi-region the repository's **default production path**
+(single-region is the legacy fallback), describes `config.prod.yaml` as "the shared multi-region
+structural config", and carries node-local differences in `.env`. `.env.prod.example` ships an
+active multi-DC posture: `CASSANDRA_CONSISTENCY=LOCAL_QUORUM`,
+`CASSANDRA_SERIAL_CONSISTENCY=SERIAL`, and
+`CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1`, with each node pointing
+`CASSANDRA_LOCAL_DC` at its own DC and its local Cassandra. **A production deployment is therefore
+normally multi-DC.**
 
-The committed production baseline, **if mounted without environment or deployment overrides**, is:
-`serial_consistency: SERIAL`, one Cassandra DC (`datacenter1`) with `NetworkTopologyStrategy` RF=1,
-and `gc.enabled: false`. Deployment guidance sets `GC_ENABLED=true` only on the designated GC
-replica (the `gc_leases` lease remains a backstop). That file is not evidence of the effective
-runtime. Establish runtime behavior from startup logs, environment/compose values, and the live
-keyspace replication metadata. Under the committed baseline assumptions:
+The `config-usa.cluster.yaml` / `config-eu.cluster.yaml` profiles remain test/development artifacts
+for the multi-DC compose stack (both ship `gc.enabled: false`), so findings derived *specifically
+from those files* are not production findings. That is a narrow statement about those two files —
+**not** a claim that production is single-DC.
 
-- the audit concerns about cross-DC `LOCAL_QUORUM` visibility and a `LOCAL_SERIAL` split serial
-  domain are **not active**, because there is one configured DC and serial consistency is `SERIAL`;
-- RF=1 **is** an active durability and availability risk: there is no second Cassandra replica in
-  the DC; and
+Consequences for this audit under the documented multi-region posture:
+
+- the **`LOCAL_SERIAL` split serial domain** concern is **not active**: production sets
+  `SERIAL`, so LWT/CAS (GC delete claim/finalize, immutable metadata first-writer, `gc_leases`)
+  serialize globally across DCs;
+- the **cross-DC `LOCAL_QUORUM` visibility** concern **is active**. `block_references` are ordinary
+  `INSERT`/`DELETE`, not LWT, and with RF 1 per DC a `LOCAL_QUORUM` write is acknowledged by a
+  single local replica. A reference confirmed in one DC is not guaranteed visible to a GC worker
+  reading in another DC. The 1h grace period reduces exposure to ordinary replication lag but is
+  **not** a consistency guarantee under prolonged lag or partition. Enabling destructive GC on a
+  multi-DC deployment requires an explicit consistency decision for the reference reads (for
+  example raising the GC liveness read, or pinning GC to the DC that owns the writes) — it is not
+  covered by `SERIAL`;
+- with a single-DC override the committed baseline is `NetworkTopologyStrategy` RF=1 on
+  `datacenter1`, where RF=1 is an active durability and availability risk rather than a GC
+  correctness one; and
 - runtime `CASSANDRA_CONSISTENCY`, `CASSANDRA_SERIAL_CONSISTENCY`,
   `CASSANDRA_REPLICATION_CLASS`, `CASSANDRA_REPLICATION_DCS`,
-  `CASSANDRA_REPLICATION_FACTOR`, and `GC_ENABLED` overrides can change the effective topology and
-  must be checked on the deployed replicas before relying on this scope statement.
+  `CASSANDRA_REPLICATION_FACTOR`, and `GC_ENABLED` overrides determine the effective topology and
+  must be read from startup logs, environment/compose values, and live keyspace replication
+  metadata before relying on any scope statement here.
 
 #### Current validation boundary
 

@@ -145,7 +145,8 @@ processBlock(item):
   7. S3 DeleteBlock(blockID) at blocks/<org_id>/...
      └─ If S3 fails: log warning, record the attempt, do NOT return an error
   8. Clean exact mapping and clear the GC candidate — both run whether or not
-     step 7 succeeded, so the queue item always completes
+     step 7 succeeded, so an S3 failure alone does not abort the item
+     └─ Either cleanup can still fail and return an error, which retries the item
      └─ Clear the gc_s3_orphans row ONLY after a successful S3 delete; on
         failure it stays as the sole recovery state
   9. Increment stats

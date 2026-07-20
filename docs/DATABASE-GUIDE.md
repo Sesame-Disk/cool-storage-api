@@ -1310,16 +1310,31 @@ The nested `consistency.default/reads/writes/critical` example was a design sket
 supported schema. The application currently accepts one regular consistency scalar plus one serial
 consistency scalar, both of which may be overridden by environment variables.
 
-**Production runs `configs/config.prod.yaml` only**, which commits `LOCAL_QUORUM` + `SERIAL` on a
-single DC (`datacenter1`, `NetworkTopologyStrategy` RF=1). The multi-region
-`config-usa.cluster.yaml` / `config-eu.cluster.yaml` profiles are **test/development artifacts**
-for the multi-DC compose stack; they commit `LOCAL_SERIAL` with `{usa:1, eu:1}` and already ship
-`gc.enabled: false`. Cross-DC serial-domain and `LOCAL_QUORUM` visibility concerns therefore do not
-describe the production deployment — the live risk in `config.prod.yaml` is RF=1, which is a
-durability and availability exposure, not a GC correctness one. Keep GC disabled in the
-`LOCAL_SERIAL` profiles, and if a multi-DC profile is ever promoted to production, the serial-domain
-assumptions must be validated first. Confirm effective values from startup logs/environment and live
-keyspace topology before enabling destructive work, since env overrides can change any of this.
+**Production runs `configs/config.prod.yaml` as its only config file, but that file is not the
+effective topology.** `docs/DEPLOY.md` treats multi-region as the default production path and calls
+this file "the shared multi-region structural config", with per-node differences in `.env`.
+`.env.prod.example` ships `CASSANDRA_CONSISTENCY=LOCAL_QUORUM`,
+`CASSANDRA_SERIAL_CONSISTENCY=SERIAL`, and
+`CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1`. Production is therefore normally **multi-DC**
+with RF 1 per DC; the committed single-DC `datacenter1` RF=1 baseline only applies when nothing
+overrides it.
+
+What that means for the block path:
+
+- `SERIAL` covers every LWT here — the GC delete claim/finalize, the immutable-metadata
+  first-writer, and `gc_leases` — so the serial domain is **not** split per DC. Do not switch to
+  `LOCAL_SERIAL`.
+- `SERIAL` does **not** cover `block_references`, which are ordinary `INSERT`/`DELETE`. At
+  `LOCAL_QUORUM` with RF 1 per DC, a reference write is acknowledged by one local replica, so a
+  reference confirmed in one DC is not guaranteed visible to a GC read in another. The 1h grace
+  period reduces exposure to ordinary lag but is not a guarantee under prolonged lag or partition.
+  Enabling destructive GC multi-DC needs an explicit decision for those reference reads — raise the
+  GC liveness read consistency, or pin GC to the DC that owns the writes.
+
+The `config-usa.cluster.yaml` / `config-eu.cluster.yaml` profiles are separate test/development
+artifacts for the multi-DC compose stack; they commit `LOCAL_SERIAL` with `{usa:1, eu:1}` and ship
+`gc.enabled: false`. Keep GC disabled there. Confirm effective values from startup logs/environment
+and live keyspace topology before enabling destructive work.
 
 The GC claim is therefore not literally the only Paxos operation in the block path. Immutable
 block metadata already has a first-writer LWT; GC has separate delete-claim/finalize LWTs; and the
