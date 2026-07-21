@@ -50,6 +50,13 @@ const (
 // closed instead of overwriting such a row.
 var ErrBlockIDMappingConflict = errors.New("block id mapping conflict")
 
+// ErrBlockStubRepairContended indicates a metadata upsert could not repair a
+// released claim stub because the row changed under it — another uploader
+// finished materializing, or GC re-fenced the block. It is a benign concurrency
+// loss, not corruption: callers should re-probe and retry rather than surface a
+// hard error. Upload funnels translate it into their retryable GC-fence signal.
+var ErrBlockStubRepairContended = errors.New("block stub repair contended")
+
 type BlockReuseDecision int
 
 const (
@@ -575,7 +582,10 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 				return fmt.Errorf("repair released block metadata stub for %s: %w", blockID, repairErr)
 			}
 			if !repaired {
-				return fmt.Errorf("block metadata for %s changed before stub repair", blockID)
+				// The stub changed under us (a concurrent uploader completed it, or a
+				// GC orphan fence reappeared). Both are transient: signal the retryable
+				// sentinel so the funnel re-probes instead of failing the upload.
+				return fmt.Errorf("%w: block %s changed before stub repair", ErrBlockStubRepairContended, blockID)
 			}
 			continue
 		}
@@ -691,7 +701,12 @@ func (db *DB) RepairReleasedBlockStub(orgID, blockID string) (bool, error) {
 		return false, fmt.Errorf("remove block stub repair claim: %w", deleteErr)
 	}
 	if !deleted {
-		return false, errors.New("block stub repair claim changed before delete")
+		// The row changed under us (another uploader finished materializing, or GC
+		// stole the claim with its `IF gc_state != 'deleting'` LWT). This is a benign
+		// concurrency loss, not corruption: nothing was deleted and the CAS stayed
+		// closed. Report it as retryable so the caller re-probes and converges to
+		// Reusable or BlockedByGC instead of surfacing a hard 500.
+		return false, nil
 	}
 	if orphanErr != nil {
 		return false, fmt.Errorf("recheck S3 orphan fence during stub repair: %w", orphanErr)

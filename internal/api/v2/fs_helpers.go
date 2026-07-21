@@ -1008,6 +1008,12 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 		}
 		if !deleteFenceActive {
 			if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
+				// A contended stub repair is a transient race (concurrent completion or
+				// a reappeared GC orphan fence), not a permanent failure. Surface it as
+				// the retryable GC-fence signal so the materialization wrapper re-probes.
+				if errors.Is(err, db.ErrBlockStubRepairContended) {
+					return fmt.Errorf("%w: block %s stub repair lost a race", ErrBlockDeleteInProgress, blockID)
+				}
 				return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
 			}
 			return nil

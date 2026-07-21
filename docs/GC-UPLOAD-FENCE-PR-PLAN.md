@@ -149,17 +149,28 @@ unreachable behind the probe.
    release or delete an active claim. Writers wait/retry or fail closed.
 5. Handle `RepairableStub` through one shared helper in all six existing upload probe
    switches. A completed repair continues through the exact existing `NeedsPut`
-   branch; a lost claim, observed orphan, or Cassandra error performs no PUT and
-   returns the existing
-   retryable fence error or fails closed. Do not add a read to the ordinary absent-row
-   path and do not import PR-3's new retry sentinels or metrics.
+   branch. A **lost CAS or a reappeared orphan fence is a benign concurrency loss,
+   not a hard error**: `RepairReleasedBlockStub` returns `(false, nil)`, the funnel
+   performs no PUT and returns the existing retryable `ErrBlockDeleteInProgress` so
+   the materialization wrapper re-probes and converges to `Reusable` (a concurrent
+   uploader finished) or `BlockedByGC` (GC re-fenced). Only a genuine Cassandra error
+   fails closed as `UnknownError`. The metadata-upsert backstop applies the same rule:
+   a contended stub repair surfaces the `db.ErrBlockStubRepairContended` sentinel,
+   which `RegisterUploadedBlock` translates into the retryable fence signal rather
+   than a 500 — matching the acceptance criterion that meeting a stub succeeds instead
+   of exhausting retries. Do not add a read to the ordinary absent-row path and do not
+   import PR-3's new retry sentinels or metrics. Note: `BlockDeleteFenceActive` is
+   deliberately **not** extended to fence on `repairing_stub` — the upsert path must
+   stay reachable to self-heal a stuck deterministic repair token.
 6. Unit-test the full decision and race matrix: absent row (with/without orphan
    fence), released PK-only and partially identity-backfilled stubs, released stub
    with an orphan fence (no deletion and no PUT), active stub, complete active row,
    malformed complete row, stale ownership, both successful deletions, lost CAS with
    no PUT, worker stub-delete versus complete-row release, all six probe switches,
-   web-session materialization, and pre-LWT class validation. Assert `/blocks/check`
-   and `file_from_blocks` never advertise a stub as reusable.
+   web-session materialization, and pre-LWT class validation. Include the retryable
+   convergence: a lost-CAS repair re-probes and finishes as `Reusable`, and a
+   contended metadata-upsert backstop translates to the retryable fence signal.
+   Assert `/blocks/check` and `file_from_blocks` never advertise a stub as reusable.
 7. Keep the engine-observation test, but add deterministic real-Cassandra fixtures
    using a primary-key-only INSERT for a released stub and explicit ownership columns
    for an active stub. Verify the rows are visible, prove the conditional CQL, and run
@@ -187,6 +198,15 @@ All six commands passed. The first integration run found one stale fixture that 
 only `gc_state='deleting'`; it was corrected to seed the full claim identity and the
 complete integration suite then passed. The race run also exposed an unsynchronized
 test counter in `blocks_test.go`; the counter is now atomic and the rerun passed.
+
+Re-verified 2026-07-21 after reclassifying the benign lost stub-repair race as
+retryable (`RepairReleasedBlockStub` returns `(false, nil)`; the metadata-upsert
+backstop returns `db.ErrBlockStubRepairContended`, which `RegisterUploadedBlock`
+maps to the retryable fence signal). Build, vet, vet -tags=integration,
+`go test -race` for `./internal/db ./internal/gc ./internal/api/...`, and the full
+integration suite were re-run in Docker; the integration suite passed twice
+consecutively (~257–266s each), so the single earlier failure was a one-node-stack
+flake, not a regression.
 
 ---
 

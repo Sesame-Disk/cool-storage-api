@@ -247,6 +247,45 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 	}
 }
 
+// TestRegisterUploadedBlock_TranslatesContendedStubRepairToRetryableFence proves
+// that a benign lost stub-repair race inside the metadata upsert (the backstop for
+// the unprobed web-session funnel) surfaces as the retryable ErrBlockDeleteInProgress
+// signal rather than a hard error, so the materialization wrapper re-probes.
+func TestRegisterUploadedBlock_TranslatesContendedStubRepairToRetryableFence(t *testing.T) {
+	helper := &FSHelper{}
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
+	oldRelease := registerUploadedBlockReleaseRefsFn
+	oldAttempts := registerUploadedBlockRetryAttemptsFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
+		registerUploadedBlockReleaseRefsFn = oldRelease
+		registerUploadedBlockRetryAttemptsFn = oldAttempts
+	})
+
+	registerUploadedBlockAddReferenceFn = func(*FSHelper, string, string, string, string, int) error { return nil }
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(*FSHelper, string, string, string, string, time.Time) error { return nil }
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
+	registerUploadedBlockRetryAttemptsFn = func() int { return 1 }
+	registerUploadedBlockReleaseRefsFn = func(*FSHelper, string, string, string, []string) []string {
+		t.Fatal("provisional ref must survive a transient contended-stub error for the retry")
+		return nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
+		return fmt.Errorf("%w: block block-1 changed before stub repair", db.ErrBlockStubRepairContended)
+	}
+
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
+	if !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want ErrBlockDeleteInProgress", err)
+	}
+}
+
 func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	helper := &FSHelper{}
 	oldAdd := registerUploadedBlockAddReferenceFn

@@ -326,8 +326,8 @@ func TestUpsertBlockMetadataStopsWhenReleasedStubDeleteLosesRace(t *testing.T) {
 	repairReleasedBlockStubForUpsertFn = func(*DB, string, string) (bool, error) { return false, nil }
 
 	err := database.UpsertBlockMetadata("org-1", "block-1", 1, "hot", "key")
-	if err == nil || !strings.Contains(err.Error(), "changed before stub repair") {
-		t.Fatalf("UpsertBlockMetadata() error = %v, want lost-race error", err)
+	if !errors.Is(err, ErrBlockStubRepairContended) {
+		t.Fatalf("UpsertBlockMetadata() error = %v, want ErrBlockStubRepairContended (retryable)", err)
 	}
 	if insertCalls != 1 {
 		t.Fatalf("insertCalls = %d, want 1", insertCalls)
@@ -471,9 +471,12 @@ func TestRepairReleasedBlockStubDoesNotSucceedWhenClaimedRowChanges(t *testing.T
 		return completeIdentityRepairRow(PlainBlockRepresentationID, strings.Repeat("a", 40)), true, nil
 	}
 
+	// The row was completed by another actor before our conditional delete. That is
+	// a benign lost race, so the repair reports (false, nil) — retryable, not a hard
+	// error — and the caller re-probes to converge on Reusable/BlockedByGC.
 	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
-	if err == nil || repaired {
-		t.Fatalf("RepairReleasedBlockStub() = %v, %v, want false/lost-race error", repaired, err)
+	if err != nil || repaired {
+		t.Fatalf("RepairReleasedBlockStub() = %v, %v, want false/nil (retryable lost race)", repaired, err)
 	}
 }
 
