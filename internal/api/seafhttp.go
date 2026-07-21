@@ -34,7 +34,6 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
-	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
@@ -3596,14 +3595,20 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string,
 }
 
 // classifyPathAbsence separates "the path read as absent" from "we could not tell".
-// Only a Cassandra ErrNotFound, or findEntryInDir reporting that a fully validated
-// directory has no such entry, count as absence. A timeout, an unavailable
-// coordinator, corrupt data or any other driver failure returns the fail-closed
-// sentinel, because "we could not read it" must never be reported to the client as
-// "file not found". See errFilePathAbsent for the cross-DC limit on what ErrNotFound
-// actually proves.
+//
+// ONLY errDirectoryEntryNotFound counts as absence: a directory that was read,
+// fully validated, and does not list the entry. That is the one signal that means
+// the file is gone rather than unreachable.
+//
+// A bare gocql.ErrNotFound deliberately does NOT qualify, even though it is a
+// definitive "no row". Every other lookup on this path reads a row that something
+// else already pointed at — the head commit named by the library, the commit's root
+// fs_object, the fs_object named by a dirent. A missing row there is dangling
+// metadata: premature GC, a partial write, or cross-DC replication lag. None of
+// those prove the path does not exist, and answering 404 would tell the client to
+// stop retrying a file that is very likely still there. They fail closed with 503.
 func classifyPathAbsence(err error) error {
-	if errors.Is(err, gocql.ErrNotFound) || errors.Is(err, errDirectoryEntryNotFound) {
+	if errors.Is(err, errDirectoryEntryNotFound) {
 		return errFilePathAbsent
 	}
 	return errBlockBackedFileUnresolvable
@@ -3840,6 +3845,52 @@ func isHex40(s string) bool {
 	return true
 }
 
+// rejectDuplicateJSONKeys walks the token stream and fails on any object that
+// repeats a key. encoding/json accepts duplicates and silently keeps the last one,
+// so `{"id":"<A>","id":"<B>"}` would decode to B and `{"name":"a","name":"b"}` would
+// hide entry "a" entirely. Either way the stored dirent is ambiguous: one could
+// serve the wrong FS object, the other could report a present file as absent.
+// Ambiguity is corruption here, not something to resolve by picking a winner.
+func rejectDuplicateJSONKeys(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil // scalar
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return fmt.Errorf("object key is not a string")
+			}
+			if _, dup := seen[key]; dup {
+				return fmt.Errorf("duplicate object key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := rejectDuplicateJSONKeys(dec); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for dec.More() {
+			if err := rejectDuplicateJSONKeys(dec); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = dec.Token() // consume the closing delimiter
+	return err
+}
+
 // parseDirEntries decodes a directory listing and refuses anything it cannot fully
 // validate. A caller may only report an entry as absent after this succeeds; every
 // error here means "we could not determine what is in this directory", which fails
@@ -3848,7 +3899,8 @@ func isHex40(s string) bool {
 // Validation covers the two fields this lookup is load-bearing on, and it is
 // semantic, not just structural: a `name` or `id` that is present but meaningless
 // would otherwise let a corrupt row resolve to a 404 (empty id → fs_object miss) or,
-// worse, to arbitrary bytes (duplicate names → silently pick the first).
+// worse, to arbitrary bytes (duplicate names, or a duplicated `id` key inside one
+// entry → silently pick a winner).
 //
 // `mode` and `mtime` are deliberately NOT required. Nothing in this path reads them,
 // and rejecting on a field we do not use would turn readable files into 503s for no
@@ -3858,6 +3910,10 @@ func parseDirEntries(raw string) ([]parsedDirEntry, error) {
 		// Not valid JSON and not an empty directory — an empty directory is stored
 		// as "[]". A blank value means the row is corrupt or was never written.
 		return nil, fmt.Errorf("%w: directory entries are empty", errBlockBackedFileUnresolvable)
+	}
+
+	if err := rejectDuplicateJSONKeys(json.NewDecoder(strings.NewReader(raw))); err != nil {
+		return nil, fmt.Errorf("%w: ambiguous directory entries: %v", errBlockBackedFileUnresolvable, err)
 	}
 
 	var decoded []*dirEntry

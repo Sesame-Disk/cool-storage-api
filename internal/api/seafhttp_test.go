@@ -41,12 +41,19 @@ func TestLegacyFallbackOnlyOnDefinitiveAbsence(t *testing.T) {
 		err        error
 		wantLegacy bool
 	}{
-		{"row genuinely absent", gocql.ErrNotFound, true},
-		{"wrapped absence", fmt.Errorf("file metadata not found: %w", gocql.ErrNotFound), true},
-		// A readable directory that simply has no such entry is a deleted or renamed
-		// file: logically absent, so 404. Before this was wired it fell through to
-		// the fail-closed branch and reported 503 for an ordinary missing file.
+		// The one signal that proves the file is gone: a directory that was read,
+		// fully validated, and does not list the entry.
 		{"directory read but entry missing", fmt.Errorf("%w: report.pdf", errDirectoryEntryNotFound), true},
+
+		// A bare ErrNotFound must NOT be absence. Every other lookup on this path
+		// reads a row something else already pointed at — the head commit, the
+		// commit's root fs_object, the fs_object a dirent names. A missing row there
+		// is dangling metadata (premature GC, partial write, cross-DC lag), not proof
+		// the path is gone, and a 404 would tell the client to stop retrying a file
+		// that is still there.
+		{"referenced row missing", gocql.ErrNotFound, false},
+		{"wrapped referenced row missing", fmt.Errorf("commit not found: %w", gocql.ErrNotFound), false},
+
 		{"read timeout", errors.New("gocql: no response received from cassandra within timeout period"), false},
 		{"coordinator unavailable", errors.New("gocql: unavailable"), false},
 		{"malformed directory entries", errors.New("malformed directory entries: invalid character"), false},
@@ -92,6 +99,15 @@ func TestParseDirEntriesRejectsStructurallyCorruptListings(t *testing.T) {
 		{"non-hex id", `[{"name": "report.pdf", "id": "` + strings.Repeat("z", 40) + `"}]`},
 		{"duplicate names", `[{"name":"report.pdf","id":"` + idA + `"},{"name":"report.pdf","id":"` + idB + `"}]`},
 		{"corrupt entry after a valid one", `[{"name":"a","id":"` + idA + `"},{"name":"b"}]`},
+		// encoding/json accepts repeated keys and silently keeps the last, so these
+		// would otherwise decode to a single unambiguous-looking entry: the first
+		// could serve FS object B while the dirent named both, and the second would
+		// hide "report.pdf" entirely and report it absent.
+		{"duplicate id key", `[{"name":"report.pdf","id":"` + idA + `","id":"` + idB + `"}]`},
+		{"duplicate name key", `[{"name":"report.pdf","name":"other.pdf","id":"` + idA + `"}]`},
+		{"duplicate name and id keys", `[{"name":"report.pdf","name":"x","id":"` + idA + `","id":"` + idB + `"}]`},
+		{"duplicate key in a later entry", `[{"name":"a","id":"` + idA + `"},{"name":"b","id":"` + idA + `","id":"` + idB + `"}]`},
+		{"duplicate unused key", `[{"name":"report.pdf","id":"` + idA + `","mode":1,"mode":2}]`},
 	}
 	for _, tt := range corrupt {
 		t.Run(tt.name, func(t *testing.T) {
