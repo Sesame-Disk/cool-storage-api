@@ -84,12 +84,18 @@ unreachable behind the probe.
 
 ### PR-3 — Store/materialize retry contract
 
-**Scope:** `internal/api/v2/upload_reuse.go` — `StoreUploadedBlockForProbe`,
-`ResolveNeedsPutBlockStore`, the cancellable retry wrapper, the three retry sentinels
-and their metric labels; `internal/metrics/metrics.go`;
+**Scope:** the cancellable retry wrapper, the three retry sentinels and their metric
+labels in `internal/api/v2/upload_reuse.go`; `internal/metrics/metrics.go`;
 `internal/db/block_references.go` (`ErrBlockMetadataPermanent`);
 `internal/api/v2/fs_helpers.go` (`RegisterUploadedBlock` stops waiting on the fence,
 tags transient Cassandra I/O, leaves permanent failures untagged).
+
+**Explicitly NOT in this PR:** `StoreUploadedBlockForProbe`'s canonical placement and
+`ResolveNeedsPutBlockStore`. An earlier draft put them here, which would have let
+PR-4 start writing to the canonical backend before any canonical reader existed —
+the exact hole that merging placement with readers was supposed to close. Placement
+stays with the readers in PR-4. If this PR introduces a store helper at all, it must
+preserve today's preferred-backend behaviour byte for byte.
 
 **⚠ This PR is NOT behaviour-neutral.** An earlier draft of this plan claimed it was,
 on the assumption that no funnel was wired yet. That is wrong: `main` already wraps
@@ -107,36 +113,19 @@ behaviour is what we want.
 
 ---
 
-### PR-4 — Cover the remaining funnel and normalise the wrappers
+### PR-4 — Canonical placement and canonical reads (single PR)
 
-**Scope:** the web block-session path in `v2/blocks.go`, which is the one funnel with
-no probe and no retry wrapper at all. Traffic accounting and the staged-block
-reservation hoisted so a retry cannot double-charge or double-reserve. Normalise the
-SeafHTTP wrapper's retry-reason labels against the generic one. Frontend: treat the
-new `409 block_delete_in_progress` as a soft retry honouring `Retry-After`.
-
-**Not** "the moment everything gets connected" — PR-3 already did that for six
-funnels. This closes the seventh and makes the wrappers consistent.
-
-**Why the frontend rides along:** this PR is what makes the 409 reachable from the
-web client. Splitting them would ship a user-visible upload failure for one release.
-
-**Acceptance:** the deterministic fast-clear regression (real GC worker paused at its
-post-claim liveness read) fails before this PR and passes after.
-
----
-
-### PR-5 — Canonical placement and canonical reads (single PR)
-
-**Scope:** existing-metadata `NeedsPut` stores through `probe.StorageClass` and the
-canonical key instead of the serving node's preferred backend, **together with**
+**Scope:** `StoreUploadedBlockForProbe` / `ResolveNeedsPutBlockStore` — existing-
+metadata `NeedsPut` stores through `probe.StorageClass` and the canonical key instead
+of the serving node's preferred backend — **together with**
 `internal/streaming/canonical_block_reader.go`,
-`internal/db/block_storage_location.go` and the read call sites (`fileview.go`,
-`sharelink_view.go`, `sync.go`, `seafhttp.go`, `v2/blocks.go` check).
+`internal/db/block_storage_location.go`, the read call sites (`fileview.go`,
+`sharelink_view.go`, `sync.go`, `seafhttp.go`) and the canonical `/blocks/check` in
+`v2/blocks.go`.
 
 **Why these are one PR and not two.** An earlier draft split them and papered over
-the gap with "ship in the same release", which contradicts rule 1 of this plan. They
-are not independently safe in either direction:
+the gap with "ship in the same release", which contradicts rule 1. They are not
+independently safe in either direction:
 
 - writer first → metadata points at bucket A, the writer repairs into A, an old
   reader still resolves by routing to B, and the block reads as missing;
@@ -148,10 +137,39 @@ transitional reader is more moving parts for a system with no production data ye
 so: one PR. It is the largest in the series and should be reviewed as the one that
 changes where bytes live.
 
+**Why it now comes before the web funnel.** A second draft had the web funnel here
+and canonical work after it. That was the same bug one step removed: the web funnel
+consumes `StoreUploadedBlockForProbe`, so wiring it first would start writing to the
+canonical backend while every reader still resolved by routing — newly published
+files unreadable. Canonical placement and canonical reads must both exist before any
+new caller of that helper lands.
+
 **Acceptance:** the two-bucket MinIO integration test proving the object lands in the
 canonical bucket and not the preferred one; exact-class routing, derived-key
 validation, cross-org key rejection and the bounded deduplicated lookup all covered;
 resolution fails before any response header is committed.
+
+---
+
+### PR-5 — Cover the remaining funnel and normalise the wrappers
+
+**Scope:** the web block-session path in `v2/blocks.go`, which is the one funnel with
+no probe and no retry wrapper at all. Traffic accounting and the staged-block
+reservation hoisted so a retry cannot double-charge or double-reserve. Normalise the
+SeafHTTP wrapper's retry-reason labels against the generic one. Frontend: treat the
+new `409 block_delete_in_progress` as a soft retry honouring `Retry-After`.
+
+**Not** "the moment everything gets connected" — PR-3 already did that for six
+funnels. This closes the seventh and makes the wrappers consistent.
+
+**Depends on PR-4**, not merely follows it: this funnel calls the canonical store
+helper, so the canonical readers have to be in place first.
+
+**Why the frontend rides along:** this PR is what makes the 409 reachable from the
+web client. Splitting them would ship a user-visible upload failure for one release.
+
+**Acceptance:** the deterministic fast-clear regression (real GC worker paused at its
+post-claim liveness read) fails before this PR and passes after.
 
 ---
 

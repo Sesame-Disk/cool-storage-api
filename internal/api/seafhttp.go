@@ -3823,14 +3823,43 @@ type dirEntry struct {
 	ID   *string `json:"id"`
 }
 
-// parseDirEntries decodes a directory listing and refuses anything it cannot fully
-// validate. A caller may only report an entry as absent after this succeeds; every
-// error here means "we could not determine what is in this directory", which must
-// fail closed rather than become a 404.
-func parseDirEntries(raw string) ([]struct {
+type parsedDirEntry struct {
 	Name string
 	ID   string
-}, error) {
+}
+
+func isHex40(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// parseDirEntries decodes a directory listing and refuses anything it cannot fully
+// validate. A caller may only report an entry as absent after this succeeds; every
+// error here means "we could not determine what is in this directory", which fails
+// closed rather than becoming a 404.
+//
+// Validation covers the two fields this lookup is load-bearing on, and it is
+// semantic, not just structural: a `name` or `id` that is present but meaningless
+// would otherwise let a corrupt row resolve to a 404 (empty id → fs_object miss) or,
+// worse, to arbitrary bytes (duplicate names → silently pick the first).
+//
+// `mode` and `mtime` are deliberately NOT required. Nothing in this path reads them,
+// and rejecting on a field we do not use would turn readable files into 503s for no
+// safety gain. Revisit if a caller starts depending on them.
+func parseDirEntries(raw string) ([]parsedDirEntry, error) {
+	if strings.TrimSpace(raw) == "" {
+		// Not valid JSON and not an empty directory — an empty directory is stored
+		// as "[]". A blank value means the row is corrupt or was never written.
+		return nil, fmt.Errorf("%w: directory entries are empty", errBlockBackedFileUnresolvable)
+	}
+
 	var decoded []*dirEntry
 	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
 		return nil, fmt.Errorf("%w: malformed directory entries: %v", errBlockBackedFileUnresolvable, err)
@@ -3842,10 +3871,8 @@ func parseDirEntries(raw string) ([]struct {
 		return nil, fmt.Errorf("%w: directory entries are JSON null", errBlockBackedFileUnresolvable)
 	}
 
-	parsed := make([]struct {
-		Name string
-		ID   string
-	}, 0, len(decoded))
+	parsed := make([]parsedDirEntry, 0, len(decoded))
+	seen := make(map[string]struct{}, len(decoded))
 	for i, entry := range decoded {
 		if entry == nil {
 			return nil, fmt.Errorf("%w: directory entry %d is null", errBlockBackedFileUnresolvable, i)
@@ -3853,15 +3880,44 @@ func parseDirEntries(raw string) ([]struct {
 		if entry.Name == nil {
 			return nil, fmt.Errorf("%w: directory entry %d has no string name", errBlockBackedFileUnresolvable, i)
 		}
+		if *entry.Name == "" {
+			return nil, fmt.Errorf("%w: directory entry %d has an empty name", errBlockBackedFileUnresolvable, i)
+		}
 		if entry.ID == nil {
 			return nil, fmt.Errorf("%w: directory entry %d (%q) has no string id", errBlockBackedFileUnresolvable, i, *entry.Name)
 		}
-		parsed = append(parsed, struct {
-			Name string
-			ID   string
-		}{Name: *entry.Name, ID: *entry.ID})
+		if !isHex40(*entry.ID) {
+			// An empty or malformed id would resolve to an fs_objects miss and be
+			// reported as a missing file, hiding the corruption behind a 404.
+			return nil, fmt.Errorf("%w: directory entry %d (%q) has a non-fsid id %q", errBlockBackedFileUnresolvable, i, *entry.Name, *entry.ID)
+		}
+		if _, dup := seen[*entry.Name]; dup {
+			// Two entries with the same name are ambiguous. Picking one silently
+			// could serve an arbitrary version of the file.
+			return nil, fmt.Errorf("%w: directory has duplicate entry name %q", errBlockBackedFileUnresolvable, *entry.Name)
+		}
+		seen[*entry.Name] = struct{}{}
+		parsed = append(parsed, parsedDirEntry{Name: *entry.Name, ID: *entry.ID})
 	}
 	return parsed, nil
+}
+
+// lookupEntryInParsedDir is the parse-and-match half of findEntryInDir, split out so
+// the absence contract can be tested without a Cassandra session.
+func lookupEntryInParsedDir(raw, entryName string) (string, error) {
+	if raw == "[]" {
+		return "", fmt.Errorf("%w: %s", errDirectoryEntryNotFound, entryName)
+	}
+	entries, err := parseDirEntries(raw)
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range entries {
+		if entry.Name == entryName {
+			return entry.ID, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %s", errDirectoryEntryNotFound, entryName)
 }
 
 func (h *SeafHTTPHandler) findEntryInDir(repoID, dirFSID, entryName string) (string, error) {
@@ -3884,34 +3940,22 @@ func (h *SeafHTTPHandler) findEntryInDir(repoID, dirFSID, entryName string) (str
 	// silently and then reporting absence would answer 404 for a file that may
 	// well exist behind a corrupt directory row. Decode strictly instead and treat
 	// any structural defect as unresolvable, which fails closed with 503.
-	if dirEntries == "" || dirEntries == "[]" {
-		log.Printf("[findEntryInDir] Directory is empty")
-		return "", fmt.Errorf("%w: %s", errDirectoryEntryNotFound, entryName)
-	}
-
-	entries, err := parseDirEntries(dirEntries)
+	id, err := lookupEntryInParsedDir(dirEntries, entryName)
 	if err != nil {
-		log.Printf("[findEntryInDir] ERROR: %v", err)
-		if len(dirEntries) > 500 {
-			log.Printf("[findEntryInDir] Dir entries (first 500 chars): %s", dirEntries[:500])
+		if errors.Is(err, errDirectoryEntryNotFound) {
+			log.Printf("[findEntryInDir] Entry '%s' not found in a well-formed directory", entryName)
 		} else {
-			log.Printf("[findEntryInDir] Dir entries: %s", dirEntries)
+			log.Printf("[findEntryInDir] ERROR: %v", err)
+			if len(dirEntries) > 500 {
+				log.Printf("[findEntryInDir] Dir entries (first 500 chars): %s", dirEntries[:500])
+			} else {
+				log.Printf("[findEntryInDir] Dir entries: %s", dirEntries)
+			}
 		}
 		return "", err
 	}
-
-	log.Printf("[findEntryInDir] Parsed %d entries from directory", len(entries))
-
-	for _, entry := range entries {
-		if entry.Name == entryName {
-			log.Printf("[findEntryInDir] Found entry '%s' with ID: %s", entryName, entry.ID)
-			return entry.ID, nil
-		}
-	}
-
-	// Every entry parsed cleanly and none matched: the file is genuinely gone.
-	log.Printf("[findEntryInDir] Entry '%s' not found among %d well-formed entries", entryName, len(entries))
-	return "", fmt.Errorf("%w: %s", errDirectoryEntryNotFound, entryName)
+	log.Printf("[findEntryInDir] Found entry '%s' with ID: %s", entryName, id)
+	return id, nil
 }
 
 // Helper function to generate a file ID

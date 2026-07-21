@@ -72,43 +72,72 @@ func TestLegacyFallbackOnlyOnDefinitiveAbsence(t *testing.T) {
 // These payloads are all valid JSON: parsing alone does not prove the file is gone.
 // Exercises the real parser rather than constructing the sentinel by hand.
 func TestParseDirEntriesRejectsStructurallyCorruptListings(t *testing.T) {
+	idA := strings.Repeat("a", 40)
+	idB := strings.Repeat("b", 40)
 	corrupt := []struct {
 		name string
 		raw  string
 	}{
+		{"blank value", ``},
+		{"whitespace only", `   `},
 		{"json null", `null`},
 		{"null element", `[null]`},
-		{"numeric name", `[{"name": 123, "id": "abc"}]`},
-		{"missing name", `[{"id": "abc"}]`},
+		{"numeric name", `[{"name": 123, "id": "` + idA + `"}]`},
+		{"missing name", `[{"id": "` + idA + `"}]`},
+		{"empty name", `[{"name": "", "id": "` + idA + `"}]`},
 		{"missing id", `[{"name": "report.pdf"}]`},
 		{"numeric id", `[{"name": "report.pdf", "id": 7}]`},
-		{"corrupt entry after a valid one", `[{"name":"a","id":"1"},{"name":"b"}]`},
+		{"empty id", `[{"name": "report.pdf", "id": ""}]`},
+		{"short id", `[{"name": "report.pdf", "id": "1"}]`},
+		{"non-hex id", `[{"name": "report.pdf", "id": "` + strings.Repeat("z", 40) + `"}]`},
+		{"duplicate names", `[{"name":"report.pdf","id":"` + idA + `"},{"name":"report.pdf","id":"` + idB + `"}]`},
+		{"corrupt entry after a valid one", `[{"name":"a","id":"` + idA + `"},{"name":"b"}]`},
 	}
 	for _, tt := range corrupt {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := parseDirEntries(tt.raw)
+			// Go through the same parse-and-match path findEntryInDir uses, so a
+			// corrupt listing cannot reach the absence verdict by any route.
+			_, err := lookupEntryInParsedDir(tt.raw, "report.pdf")
 			if err == nil {
-				t.Fatalf("parseDirEntries(%s) error = nil, want structural rejection", tt.raw)
+				t.Fatalf("lookupEntryInParsedDir(%q) error = nil, want rejection", tt.raw)
+			}
+			if errors.Is(err, errDirectoryEntryNotFound) {
+				t.Fatalf("corrupt listing %q reported the entry as absent", tt.raw)
 			}
 			// Must fail closed (503), never be classified as logical absence (404).
 			if errors.Is(classifyPathAbsence(err), errFilePathAbsent) {
-				t.Fatalf("corrupt listing %s was classified as absence", tt.raw)
+				t.Fatalf("corrupt listing %q was classified as absence", tt.raw)
 			}
 		})
 	}
 }
 
-func TestParseDirEntriesAcceptsWellFormedListings(t *testing.T) {
-	entries, err := parseDirEntries(`[{"name":"a.txt","id":"1"},{"name":"","id":"2"}]`)
+func TestLookupEntryInParsedDirWellFormedListings(t *testing.T) {
+	idA := strings.Repeat("a", 40)
+	idB := strings.Repeat("b", 40)
+	raw := `[{"name":"a.txt","id":"` + idA + `","mode":33188},{"name":"b.txt","id":"` + idB + `"}]`
+
+	id, err := lookupEntryInParsedDir(raw, "b.txt")
 	if err != nil {
-		t.Fatalf("parseDirEntries() error = %v, want nil", err)
+		t.Fatalf("lookupEntryInParsedDir() error = %v, want nil", err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("len(entries) = %d, want 2", len(entries))
+	if id != idB {
+		t.Fatalf("id = %q, want %q", id, idB)
 	}
-	// An entry legitimately named "" is data, not corruption: only a MISSING name is.
-	if entries[0].Name != "a.txt" || entries[0].ID != "1" || entries[1].Name != "" || entries[1].ID != "2" {
-		t.Fatalf("entries = %#v", entries)
+
+	// A readable directory that genuinely lacks the entry is the one case that may
+	// become a 404.
+	_, err = lookupEntryInParsedDir(raw, "gone.txt")
+	if !errors.Is(err, errDirectoryEntryNotFound) {
+		t.Fatalf("error = %v, want errDirectoryEntryNotFound", err)
+	}
+	if !errors.Is(classifyPathAbsence(err), errFilePathAbsent) {
+		t.Fatal("a genuinely missing entry must classify as absence")
+	}
+
+	// An empty directory is legitimate and also absence, not corruption.
+	if _, err := lookupEntryInParsedDir(`[]`, "anything"); !errors.Is(err, errDirectoryEntryNotFound) {
+		t.Fatalf("empty directory error = %v, want errDirectoryEntryNotFound", err)
 	}
 }
 

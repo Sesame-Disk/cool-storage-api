@@ -68,31 +68,50 @@ the usual "compare the value" trick is unavailable by construction.
 
 Candidate directions, none yet designed:
 
-1. **Two-phase physical delete (quarantine prefix).** GC never deletes directly: it
-   copies-or-moves the object to a quarantine key and only a later pass, after a
-   grace window, removes it from quarantine having re-verified zero references. An
-   ABA delete then destroys a quarantine copy, not live bytes, and a re-upload during
-   the window is trivially recoverable. Costs a copy per deleted block and a second
-   pass; needs the quarantine sweep to be safe against in-flight uploads. **This is
-   the most promising: it makes the race non-destructive instead of trying to win it.**
-2. **Fencing token with a bounded authorization window.** The recoverer takes an LWT
-   claim carrying a generation, and the delete is only valid while that claim is
-   unexpired; writers refuse to publish metadata until any outstanding claim has
-   expired. Rigorous, but it cannot revoke an S3 request already in flight — it
-   bounds the window rather than eliminating it, so it likely has to be combined
-   with (1).
-3. **Per-lifecycle claim/generation on `gc_s3_orphans`.** The minimum needed to stop
-   two recoverers from acting on the same lifecycle. Necessary regardless of which of
-   the above is chosen, and probably the first increment: it removes the overlapping-
-   recoverer case even though it does not remove the in-flight case.
-4. **Do not delete on the hot path at all.** Move physical deletion entirely to a
-   single serialized sweeper that owns the bucket and never runs concurrently with
-   itself, reducing the problem to that sweeper's own read-verify-delete window.
+1. **Generational physical keys — currently the only candidate that closes it.**
+   Never reuse a physical key for new bytes: derive it as
+   `blocks/<org>/<hash>.<generation>` (or any monotonic suffix) and record the live
+   generation in metadata. A stale delete then names a key nothing will ever write
+   again, so it is harmless by construction — the re-upload lives at a different key.
+   This is the one option that survives the byte-identical property, because it stops
+   depending on distinguishing content at all. Cost: readers must resolve the
+   generation from metadata (the canonical reader already does exactly this), and
+   dedup must key on hash while the physical key carries the generation.
+2. **Per-lifecycle claim/generation on `gc_s3_orphans`.** The minimum needed to stop
+   two recoverers acting on the same lifecycle. Necessary regardless of what else is
+   chosen and probably the first increment, but it does **not** close the in-flight
+   case: Cassandra cannot revoke an S3 request already on the wire.
+3. **Fencing token with a bounded authorization window.** The recoverer's delete is
+   valid only while its claim is unexpired, and writers refuse to publish until any
+   outstanding claim has expired. Bounds the window rather than eliminating it; only
+   useful combined with (1) or (2).
+4. **Do not delete on the hot path at all.** Move physical deletion to a single
+   serialized sweeper that owns the bucket, reducing the problem to that sweeper's
+   own read-verify-delete window. Does not eliminate the window either.
 
-Whichever is chosen, it must hold for a byte-identical re-upload, must not depend on
-storage-provider features that MinIO and S3 implement differently, and must be
-testable without a live multi-region cluster. Destructive GC stays disabled until
-one lands.
+**Two-phase delete via a quarantine prefix does NOT close this on its own** — an
+earlier revision of this document claimed it did, and that was wrong. S3 has no
+atomic rename, so "move to quarantine" is `Copy K → Q` followed by `Delete K`, and
+that `Delete K` carries the identical ABA:
+
+```
+GC copies K -> Q
+GC issues DELETE K, then stalls
+the claim is recovered or cleared
+an upload writes K again
+the old DELETE lands -> the new bytes are gone
+```
+
+The second phase only makes deleting `Q` safe; it does nothing for the live key.
+Quarantine is still worth having as a recovery affordance — the bytes survive
+somewhere, so the loss is repairable if detected — but it must be described as that,
+not as a fix, and it only becomes a fix combined with (1).
+
+Whichever is chosen, it must hold for a **byte-identical** re-upload (no ETag or
+`If-Match` conditional can distinguish new from old, because content-addressed blocks
+re-upload to the same bytes), must not depend on storage-provider features that MinIO
+and S3 implement differently, and must be testable without a live multi-region
+cluster. Destructive GC stays disabled until one lands.
 
 ## Verification debt
 
