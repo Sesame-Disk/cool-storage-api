@@ -144,11 +144,18 @@ fast-clear retry, but do not prove the physical GC delete lifecycle safe against
   server observes either GC delete fence (`blocks.gc_state='deleting'` or
   `gc_s3_orphans`): that PUT is invalidated for purposes of returning success and
   the server must repeat physical storage after the fence before publishing metadata.
-- **R2 — Anti-orphan is P0.** Both `/blocks/upload` modes are metadata-governed.
-  The legacy no-session path writes canonical `blocks` metadata and a deterministic
-  provisional `up:legacy-block:*` reference with TTL plus its canonical/by-day expiry
-  rows. The session flow uses its session-owned provisional reference. In either case,
-  an abandoned upload self-expires and the GC sweeper can reclaim it.
+- **R2 — Anti-orphan is P0 (success path closed; crash window still open).** Both
+  `/blocks/upload` modes are metadata-governed. The legacy no-session path writes
+  canonical `blocks` metadata and a deterministic provisional `up:legacy-block:*`
+  reference with TTL plus its canonical/by-day expiry rows. The session flow uses its
+  session-owned provisional reference. In either case an upload that *returns* leaves
+  the block governed, so an abandoned one self-expires and the GC sweeper reclaims it.
+  **Not yet closed:** the physical PUT still precedes materialization, so a process
+  death between the two leaves an S3 object with no `blocks` row, no pin and no expiry
+  projection — nothing discovers it, because GC finds blocks through candidates and S3
+  orphan recovery only replays its own in-flight deletes. Closing that window needs a
+  durable intent written *before* the PUT, or a safe physical sweeper. Tracked with
+  P-4 in [UPLOAD-PERFORMANCE-SECURITY-2026-06.md](./UPLOAD-PERFORMANCE-SECURITY-2026-06.md).
 - **R3 — session-aware check plus server-owned upload retry.**
   Session-mode `/blocks/check` reports a block as
   `existing` only when `ProbeBlockReuse == Reusable`, not merely present in S3 —
@@ -998,6 +1005,36 @@ None of these block merging the branch: the flow ships **disabled** in every pro
 config (`enable_web_block_upload: false`); they are the checklist to clear before
 flipping the flag on in production. Severity is the operator-facing risk *if the
 flag were on*.
+
+### Must clear before flipping the flag (2026-07-21 audit)
+
+- **One global Paxos round per block, plus three reads of the same `blocks` row.**
+  Every block ends in `UpsertBlockMetadata`, an `INSERT ... IF NOT EXISTS`. With
+  `serial_consistency: SERIAL` and a multi-DC posture that is a *global* consensus
+  round per block: ~128 cross-region rounds for a 1 GB file at the 8 MB CAS size,
+  which the legacy resumable path does not pay at all. **This is pre-existing on
+  `main` (commit `13e01263a`, 2026-07-08), not introduced by the GC upload-fence
+  work.** It is nevertheless the single biggest reason block upload may fail to beat
+  resumable, so it should be settled before the flag goes on. Full analysis, the
+  redundant-read breakdown and the proposed fix (make `storage_class` deterministic
+  per `(org_id, block_id)` so the LWT can be dropped outright) are in **P-4** of
+  [UPLOAD-PERFORMANCE-SECURITY-2026-06.md](./UPLOAD-PERFORMANCE-SECURITY-2026-06.md).
+- **Canonical read fan-out is unvalidated at scale.** `NewCanonicalBlockReader`
+  issues one Cassandra point read per unique SHA-256 before the first byte is sent
+  (bounded at concurrency 32). The unit benchmark replaces Cassandra with an
+  in-memory function, so it measures goroutines and allocations — not driver, pool,
+  latency or cluster load. Needs a measurement against real Cassandra at 1k/10k
+  blocks with concurrent downloads before the flag is flipped; the result decides
+  whether a request-scoped or global cache is required.
+- **Read-after-write across DCs is not covered by the 3×25 ms retry.** Canonical
+  metadata lookups retry a missing row three times at 25 ms. That absorbs local
+  replication lag, not cross-DC: a `LOCAL_QUORUM` write in `dc-eu` can still be
+  invisible to a `LOCAL_QUORUM` read in `dc-na` after 75 ms. The failure is *safe*
+  (fail closed, no wrong bytes) but it is an availability dependency: transient
+  404/503 right after a remote upload, `/check-blocks` reporting a block missing,
+  and needless re-uploads. Same root cause as
+  `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`; needs the same explicit
+  consistency/routing decision.
 
 1. **[RESOLVED, PR `feat/block-upload-staging-cap`] Staging-bytes cap.** Session
    staging skips the logical storage quota (R5); previously nothing capped

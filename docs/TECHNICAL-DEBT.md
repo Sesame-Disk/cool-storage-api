@@ -2078,6 +2078,40 @@ on that metric to bound leaked forward mappings.
 
 ---
 
+## 32. Per-Block Paxos In The Upload Hot Path (2026-07-21)
+
+**Pre-existing, not introduced by the GC upload-fence work.** Verified against
+`main` (`git show main:internal/db/block_references.go`); the LWT dates to
+`13e01263a`, 2026-07-08, and its own comment calls it *"the one LWT this path has
+always taken"*. Recorded here because it was found while auditing that branch.
+
+Every block upload — web session, seafhttp, sync `PutBlock`, template, OnlyOffice —
+ends in `UpsertBlockMetadata`, an `INSERT INTO blocks ... IF NOT EXISTS`: **one
+lightweight transaction per block**. It is load-bearing: `storage_class`/`storage_key`
+are not globally fixed per block, so first-writer-wins pins one canonical physical
+location; dropping it naively lets metadata point at a backend holding no copy.
+
+The cost is topology-dependent and currently worst-case. `config.prod.yaml` commits
+`serial_consistency: SERIAL` and the documented posture is multi-DC, so each of these
+is a **global** Paxos round. At the 8 MB CAS block size a 1 GB file is ~128
+cross-region consensus rounds that the legacy resumable path never pays. Separately,
+one new-block upload reads the same `blocks` row three times (probe, delete fence,
+stub check) and `gc_s3_orphans` twice.
+
+The fix is to make `storage_class` deterministic per `(org_id, block_id)` — derived
+from a stable routing function rather than the serving node's preferred backend — so
+all writers compute the same value and a plain INSERT is safe, letting the LWT be
+removed entirely. Do **not** downgrade the statement to `LOCAL_SERIAL`: that lets two
+DCs each win locally and diverge on placement, which is the corruption the LWT exists
+to prevent. Full analysis and the redundant-read breakdown: **P-4** in
+`docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. Operator-facing checklist entry:
+`docs/WEB-BLOCK-UPLOAD.md`.
+
+Measure before committing to the redesign: `block_upload_materialization_retries_total`
+exists, but there is no per-statement latency for that INSERT yet.
+
+---
+
 ## 31. GC Library-Delete Cleanup Audit Follow-ups (2026-07-10)
 
 A cross-agent audit after PR #123 (`fix/gc-block-representation-durability`) documented the

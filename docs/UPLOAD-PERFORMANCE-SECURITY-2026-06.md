@@ -159,6 +159,73 @@ external.
 
 ---
 
+## P-4 — One global Paxos round per block, plus three reads of the same `blocks` row (2026-07-21)
+
+**Severity: HIGH for the block-upload value proposition**
+**Branch: pending — `perf/deterministic-block-storage-class`**
+**Pre-existing: yes.** This is **not** introduced by the upload-fence work. The
+first-writer LWT is on `main` and dates to `13e01263a` (2026-07-08); the code
+comment there calls it *"the one LWT this path has always taken"*. Verified by
+`git show main:internal/db/block_references.go`. Recording it here because it was
+found while auditing that branch and would otherwise be lost.
+
+### The Paxos
+
+Every block upload — web session, seafhttp, sync `PutBlock`, OnlyOffice — ends in
+`UpsertBlockMetadata`, which is an `INSERT INTO blocks ... IF NOT EXISTS`
+([block_references.go:132](../internal/db/block_references.go#L132)): **one
+lightweight transaction per block**.
+
+It is load-bearing, not incidental. `storage_class`/`storage_key` are not globally
+fixed per block — uploads pick a class per library and per routing region — so
+first-writer-wins pins one canonical physical location. Without it a
+last-writer-wins INSERT could repoint metadata at a class holding no copy, which
+breaks reads and makes GC act on the wrong object.
+
+**Why it costs more than it looks.** `configs/config.prod.yaml` commits
+`serial_consistency: SERIAL`, and the documented production posture is multi-DC
+(`dc-na:1,dc-eu:1,dc-asia:1`). That makes each of these a **global** Paxos round,
+not a DC-local one. At the default 8 MB CAS block size a 1 GB file is ~128
+cross-region consensus rounds. They parallelize with client upload concurrency,
+but the legacy resumable path pays none of them. If block upload is meant to beat
+resumable, this is the first thing to remove.
+
+The LWT is scoped to the `(org_id, block_id)` partition, so writers of *different*
+blocks never contend. The cost is latency per block, not lock contention.
+
+### The redundant reads
+
+Independently of Paxos, a single new-block upload reads the **same `blocks` row
+three times**:
+
+1. `ProbeBlockReuse` → `probeBlockReuseMetadataFn`
+2. `BlockDeleteFenceActive` → `BlockGCState`
+3. `removeStaleUploadedBlockDeleteStub` → `GetBlockDeleteClaimInfo`
+
+`gc_s3_orphans` is likewise read twice (probe and fence). Rough per-block cost for
+a brand-new block in the web session flow: ~8–9 Cassandra reads/writes, one
+`LoggedBatch` (provisional ref + expiry + by-day projection), and one LWT.
+
+### Proposed fixes
+
+1. **Remove the Paxos: make `storage_class` deterministic per `(org_id, block_id)`.**
+   Derive it from a stable routing function instead of the serving node's preferred
+   backend. If every writer computes the same value, there is nothing to serialize:
+   a plain last-writer-wins INSERT always writes the same class/key and the LWT can
+   be dropped outright. This is a design change (routing must become a pure function
+   of org+block, and existing rows must keep resolving), not a mechanical edit.
+2. **Collapse the three `blocks` reads into one** request-scoped fetch shared by the
+   probe, the fence check and the stub check. Mechanical, no design risk.
+3. **Measure before choosing.** Instrument the latency of that specific INSERT so the
+   real production number replaces this estimate. `block_upload_materialization_retries_total`
+   already exists; per-statement latency does not.
+
+Do **not** attempt to fix this by switching the statement to `LOCAL_SERIAL`: with
+per-DC first writers that lets two DCs each "win" locally and diverge on placement,
+which is the exact corruption the LWT exists to prevent.
+
+---
+
 ## S-1 — Chunk state is node-local (multi-node blocker)
 
 **Severity: HIGH for multi-node topologies**
@@ -252,6 +319,7 @@ file-sharing protocols.
 | P-1 | Permit serialized S3 PUT                       | ✅ Confirmed   | CRITICAL   | **RESOLVED** |
 | P-2 | Double S3 RTT per block (Exists + PUT)         | ✅ Confirmed   | HIGH→MEDIUM| **RESOLVED** |
 | P-3 | Benchmarks 44–48 MB/s, no scaling              | ❓ Plausible   | —          | External     |
+| P-4 | 1 global Paxos/block + 3 reads of same `blocks` row | ✅ Confirmed | HIGH   | Pending (pre-existing, not from the fence branch) |
 | S-1 | Chunk state node-local (multi-node blocker)    | ✅ Confirmed   | HIGH       | Pending      |
 | S-2 | max_upload_mb not enforced on chunked uploads  | ✅ Fixed       | MEDIUM     | Complete     |
 | S-3 | Full /tmp staging, no disk admission limit     | ✅ Mitigated   | MEDIUM     | Guard added; config still required |
@@ -271,3 +339,4 @@ without a database connection.
 | 3 | S-1 | Sticky sessions at LB (immediate) or distributed chunk state (complete) | Required for multi-node topology |
 | 4 | S-2/S-3 | Roll out a real `chunked_staging_max_bytes` value per node | Operational hardening follow-through |
 | 5 | S-4 | Atomic quota reservation at upload start | Closes the concurrent over-quota window |
+| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT; collapse the triple `blocks` read | Removes one global Paxos round per block — the main cost block upload pays that resumable does not. Measure first. |

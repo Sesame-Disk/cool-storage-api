@@ -1040,26 +1040,35 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 	referrer := db.BlockReferrerForUpload(operationID)
 	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
 
+	// Cassandra I/O in this helper is transient: tag it so the outer
+	// store->materialize wrapper retries it inside its bounded budget instead of
+	// failing the request on the first timeout. Permanent metadata failures
+	// (violated invariant, malformed id, conflicting first-writer identity) carry
+	// db.ErrBlockMetadataPermanent and are deliberately NOT tagged — retrying them
+	// only burns the budget and would mislabel the retry metric.
 	if err := registerUploadedBlockAddProvisionalFn(h, orgID, blockID, referrer, libraryID, storageClass, expiresAt); err != nil {
-		return fmt.Errorf("add provisional block reference and expiry for %s: %w", blockID, err)
+		return fmt.Errorf("%w: add provisional block reference and expiry for %s: %w", ErrBlockMaterializationTransient, blockID, err)
 	}
 
 	deleteFenceActive, err := registerUploadedBlockFenceActiveFn(h, orgID, blockID)
 	if err != nil {
-		return fmt.Errorf("read block delete fence for %s: %w", blockID, err)
+		return fmt.Errorf("%w: read block delete fence for %s: %w", ErrBlockMaterializationTransient, blockID, err)
 	}
 	if deleteFenceActive {
 		if _, err := h.removeStaleUploadedBlockDeleteStub(orgID, blockID); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrBlockMaterializationTransient, err)
 		}
 		return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
 	}
 	if _, err := h.removeStaleUploadedBlockDeleteStub(orgID, blockID); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrBlockMaterializationTransient, err)
 	}
 
 	if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
-		return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
+		if errors.Is(err, db.ErrBlockMetadataPermanent) {
+			return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
+		}
+		return fmt.Errorf("%w: upsert block metadata for %s: %w", ErrBlockMaterializationTransient, blockID, err)
 	}
 	return nil
 }

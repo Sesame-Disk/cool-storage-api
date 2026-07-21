@@ -2264,6 +2264,12 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
+// errBlockBackedFileUnresolvable marks a download failure that happened AFTER the
+// file was proven to have block metadata. HandleDownload must fail closed on it
+// rather than falling back to the path-based object, which on a brownfield
+// library can still hold a stale pre-block version of the same path.
+var errBlockBackedFileUnresolvable = errors.New("block-backed file could not be resolved")
+
 var rollbackUploadedBlockRefsFn = v2.RollbackUploadedBlockRefs
 
 var releaseUploadedBlockRefsFn = v2.ReleaseUploadedBlockRefs
@@ -3530,7 +3536,17 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 			return
 		}
 		log.Printf("[HandleDownload] Block-based streaming FAILED: %v", err)
-		// If block-based retrieval fails, fall back to direct S3 path-based retrieval
+		// Fall back to the path-based object ONLY when the file was never proven
+		// block-backed. Once lookupFileBlocks has found its fs_object and block
+		// ids, a later resolution failure (Cassandra unavailable, metadata not yet
+		// visible, invalid storage class) must NOT serve the legacy object: on a
+		// brownfield library that object can still hold a stale pre-block version
+		// of the same path, so falling back would answer 200 with older content.
+		// Fail closed instead.
+		if errors.Is(err, errBlockBackedFileUnresolvable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block metadata temporarily unavailable"})
+			return
+		}
 	} else {
 		log.Printf("[HandleDownload] Block storage not available (db=%v, storageManager=%v)", h.db != nil, h.storageManager != nil)
 	}
@@ -3699,9 +3715,14 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	}
 
 	log.Printf("[streamFileFromBlocks] Streaming %d blocks, size=%d, encrypted=%v", len(blockIDs), fileSize, fileKey != nil)
+	// Past this point the file is proven block-backed: lookupFileBlocks found its
+	// fs_object and block ids. Every failure below therefore means "this file has
+	// blocks but we could not resolve them", NOT "this file is legacy". They are
+	// tagged so HandleDownload refuses to fall back to the path-based object,
+	// which could still hold a stale pre-block version of the same file.
 	representationID, err := h.resolveBlockRepresentationID(token.OrgID, token.RepoID)
 	if err != nil {
-		return fmt.Errorf("resolve block representation: %w", err)
+		return fmt.Errorf("%w: resolve block representation: %w", errBlockBackedFileUnresolvable, err)
 	}
 
 	// Batch resolve all block IDs upfront (avoids per-block Cassandra queries).
@@ -3710,11 +3731,11 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, token.OrgID, representationID, blockIDs)
 	if err != nil {
 		log.Printf("[streamFileFromBlocks] block ID resolution failed for org=%s: %v", token.OrgID, err)
-		return fmt.Errorf("resolve block IDs: %w", err)
+		return fmt.Errorf("%w: resolve block IDs: %w", errBlockBackedFileUnresolvable, err)
 	}
 	canonicalReader, err := streaming.NewCanonicalBlockReader(c.Request.Context(), h.db, h.storageManager, token.OrgID, resolvedIDs, blockStore, fallbackClass)
 	if err != nil {
-		return fmt.Errorf("resolve canonical block locations: %w", err)
+		return fmt.Errorf("%w: resolve canonical block locations: %w", errBlockBackedFileUnresolvable, err)
 	}
 
 	// Set headers before streaming — Content-Length lets clients show progress

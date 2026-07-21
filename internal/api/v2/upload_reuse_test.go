@@ -392,6 +392,80 @@ func TestRetryUploadedBlockMaterializationRepairsClaimedStubAndSucceeds(t *testi
 	}
 }
 
+// The retry budget is only useful if the production helper actually tags its
+// transient failures. Injecting the sentinel by hand proves the wrapper, not the
+// producer, so this drives RegisterUploadedBlock itself and asserts both
+// directions: Cassandra I/O is retryable, a violated invariant is not.
+func TestRegisterUploadedBlockTagsTransientButNotPermanentFailures(t *testing.T) {
+	oldProvisional := registerUploadedBlockAddProvisionalFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldClaimInfo := registerUploadedBlockClaimInfoFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddProvisionalFn = oldProvisional
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockClaimInfoFn = oldClaimInfo
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+	})
+
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
+	registerUploadedBlockClaimInfoFn = func(*FSHelper, string, string) (db.BlockDeleteClaimInfo, bool, error) {
+		return db.BlockDeleteClaimInfo{}, false, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
+		return nil
+	}
+	helper := &FSHelper{db: &db.DB{}}
+
+	t.Run("provisional write timeout is retryable", func(t *testing.T) {
+		registerUploadedBlockAddProvisionalFn = func(*FSHelper, string, string, string, string, string, time.Time) error {
+			return errors.New("gocql: no response received from cassandra within timeout period")
+		}
+		t.Cleanup(func() { registerUploadedBlockAddProvisionalFn = oldProvisional })
+		err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 4, "hot", "", "")
+		if !IsRetryableBlockMaterializationError(err) {
+			t.Fatalf("error = %v, want retryable", err)
+		}
+	})
+
+	t.Run("fence read timeout is retryable", func(t *testing.T) {
+		registerUploadedBlockAddProvisionalFn = func(*FSHelper, string, string, string, string, string, time.Time) error {
+			return nil
+		}
+		registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) {
+			return false, errors.New("gocql: connection closed")
+		}
+		t.Cleanup(func() {
+			registerUploadedBlockAddProvisionalFn = oldProvisional
+			registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
+		})
+		err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 4, "hot", "", "")
+		if !IsRetryableBlockMaterializationError(err) {
+			t.Fatalf("error = %v, want retryable", err)
+		}
+	})
+
+	t.Run("permanent metadata failure is not retryable", func(t *testing.T) {
+		registerUploadedBlockAddProvisionalFn = func(*FSHelper, string, string, string, string, string, time.Time) error {
+			return nil
+		}
+		registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
+			return fmt.Errorf("%w: storage_class must not be empty", db.ErrBlockMetadataPermanent)
+		}
+		t.Cleanup(func() {
+			registerUploadedBlockAddProvisionalFn = oldProvisional
+			registerUploadedBlockUpsertMetadataFn = oldUpsert
+		})
+		err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 4, "hot", "", "")
+		if err == nil {
+			t.Fatal("error = nil, want permanent failure")
+		}
+		if IsRetryableBlockMaterializationError(err) {
+			t.Fatalf("error = %v, want NOT retryable", err)
+		}
+	})
+}
+
 func TestProbeUploadedBlockReuseReturnsUnknownErrorWithoutSession(t *testing.T) {
 	probe, err := ProbeUploadedBlockReuse(nil, "org-1", "block-1")
 	if err == nil {

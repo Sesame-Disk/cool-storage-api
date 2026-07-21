@@ -64,6 +64,13 @@ type BlockReuseProbe struct {
 	StorageKey   string
 }
 
+// ErrBlockMetadataPermanent marks a block-metadata failure that retrying cannot
+// fix: a violated invariant, a malformed id, or a conflicting identity already
+// pinned by the first writer. Callers use it to keep those out of the bounded
+// store->materialize retry budget, so only genuine transient Cassandra failures
+// are retried.
+var ErrBlockMetadataPermanent = errors.New("block metadata permanent failure")
+
 type blockReuseMetadataRow struct {
 	Sha1         string
 	SizeBytes    int
@@ -458,14 +465,14 @@ func (db *DB) UpsertBlockMetadataWithSHA1(orgID, blockID, sha1 string, sizeBytes
 func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string) error {
 	storageClass = strings.TrimSpace(storageClass)
 	if storageClass == "" {
-		return fmt.Errorf("block metadata invariant violation: storage_class must not be empty")
+		return fmt.Errorf("%w: storage_class must not be empty", ErrBlockMetadataPermanent)
 	}
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrBlockMetadataPermanent, err)
 	}
 	sha1 = NormalizeBlockID(sha1)
 	if sha1 != "" && !isHexN(sha1, 40) {
-		return fmt.Errorf("invalid block sha1 for %s", blockID)
+		return fmt.Errorf("%w: invalid block sha1 for %s", ErrBlockMetadataPermanent, blockID)
 	}
 	now := time.Now().UTC()
 	insertFn := upsertBlockMetadataInsertWithRepresentationFn
@@ -504,10 +511,10 @@ func (db *DB) ensureBlockIdentity(orgID, blockID, representationID, sha1 string)
 	currentRepresentationID = strings.TrimSpace(currentRepresentationID)
 	currentSHA1 = strings.TrimSpace(currentSHA1)
 	if currentRepresentationID != "" && currentRepresentationID != representationID {
-		return fmt.Errorf("block %s already has conflicting representation id %s", blockID, currentRepresentationID)
+		return fmt.Errorf("%w: block %s already has conflicting representation id %s", ErrBlockMetadataPermanent, blockID, currentRepresentationID)
 	}
 	if sha1 != "" && currentSHA1 != "" && currentSHA1 != sha1 {
-		return fmt.Errorf("block %s already has conflicting sha1 %s", blockID, currentSHA1)
+		return fmt.Errorf("%w: block %s already has conflicting sha1 %s", ErrBlockMetadataPermanent, blockID, currentSHA1)
 	}
 	if currentRepresentationID == "" {
 		applied, err := backfillBlockRepresentationIDFn(db, orgID, blockID, representationID, currentRepresentationID)
