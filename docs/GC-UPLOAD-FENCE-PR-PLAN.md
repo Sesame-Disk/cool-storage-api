@@ -115,9 +115,13 @@ see X7.
 permanently break a block id, and it depends on nothing else.
 
 **Acceptance:** a stub left by a crashed or re-referenced claim is removed by either
-side, and an upload that meets one succeeds instead of exhausting its retries. Unit
-tests must drive the real `store -> materialize` loop, not call the repair directly —
-the direct-call tests on the research branch could not catch that the repair was
+side, and an upload that meets one on any of the six retry-wrapped funnels succeeds
+instead of exhausting its retries. The seventh (web-session) funnel is out of scope
+here: it stays fail-closed and returns `500` on a fence/contended-stub until PR-5
+gives it a re-probing `409` + `Retry-After` alongside the traffic/staging hoist — a
+characterization test pins that boundary so PR-5 must consciously flip it. Unit tests
+must drive the real `store -> materialize` loop, not call the repair directly — the
+direct-call tests on the research branch could not catch that the repair was
 unreachable behind the probe.
 
 **Execution checklist:**
@@ -171,7 +175,8 @@ unreachable behind the probe.
    stay reachable to self-heal a stuck deterministic repair token.
 6. Unit-test the full decision and race matrix: absent row (with/without orphan
    fence), released PK-only and partially identity-backfilled stubs, released stub
-   with an orphan fence (no deletion and no PUT), active stub, complete active row,
+   with an orphan fence (the repair removes its own `repairing_stub` token but leaves
+   the orphan fence intact and performs no PUT), active stub, complete active row,
    malformed complete row, stale ownership, both successful deletions, lost CAS with
    no PUT, worker stub-delete versus complete-row release, all six probe switches,
    web-session materialization, and pre-LWT class validation. Include the retryable

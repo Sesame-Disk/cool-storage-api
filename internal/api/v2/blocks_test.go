@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -597,6 +598,35 @@ func TestUploadBlock_NoContentLength(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+// TestUploadBlockMaterializeSurfacesFenceUntilPR5 pins the current PR-2 boundary of
+// the seventh (web-session) funnel. Unlike the six funnels wrapped in
+// RetryUploadedBlockMaterialization, UploadBlock calls materializeUploadedBlock
+// directly with no retry wrapper, so a GC fence / contended-stub signal
+// (ErrBlockDeleteInProgress, which the metadata-upsert backstop now produces on a
+// lost stub-repair race) propagates straight out and UploadBlock maps it to a 500 —
+// it is NOT reclassified as a mapping conflict and NOT retried here. Turning this
+// into a re-probing 409 + Retry-After is PR-5's job, together with hoisting traffic
+// accounting and the staged-block reservation so a retry cannot double-charge. If
+// this test changes, the PR-2/PR-5 scope notes in GC-UPLOAD-FENCE-PR-PLAN.md must
+// change with it.
+func TestUploadBlockMaterializeSurfacesFenceUntilPR5(t *testing.T) {
+	old := registerUploadedBlockForMaterializationFn
+	t.Cleanup(func() { registerUploadedBlockForMaterializationFn = old })
+	registerUploadedBlockForMaterializationFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+		return fmt.Errorf("%w: block fenced during web-session materialize", ErrBlockDeleteInProgress)
+	}
+
+	h := &BlockHandler{}
+	session := db.BlockUploadSession{SessionID: "sess-1", OrgID: "org-1", RepoID: "repo-1"}
+	err := h.materializeUploadedBlock(session, strings.Repeat("a", 64), strings.Repeat("b", 40), 5, "hot", true)
+	if !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("materializeUploadedBlock err = %v, want ErrBlockDeleteInProgress propagated", err)
+	}
+	if errors.Is(err, db.ErrBlockIDMappingConflict) {
+		t.Fatal("fence error must not masquerade as a mapping conflict (that would wrongly 409 today)")
 	}
 }
 
