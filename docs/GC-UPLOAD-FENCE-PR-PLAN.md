@@ -154,11 +154,18 @@ unreachable behind the probe.
    performs no PUT and returns the existing retryable `ErrBlockDeleteInProgress` so
    the materialization wrapper re-probes and converges to `Reusable` (a concurrent
    uploader finished) or `BlockedByGC` (GC re-fenced). Only a genuine Cassandra error
-   fails closed as `UnknownError`. The metadata-upsert backstop applies the same rule:
-   a contended stub repair surfaces the `db.ErrBlockStubRepairContended` sentinel,
-   which `RegisterUploadedBlock` translates into the retryable fence signal rather
-   than a 500 — matching the acceptance criterion that meeting a stub succeeds instead
-   of exhausting retries. Do not add a read to the ordinary absent-row path and do not
+   fails closed as `UnknownError`. The metadata-upsert backstop applies the same rule
+   at the helper boundary: a contended stub repair surfaces the
+   `db.ErrBlockStubRepairContended` sentinel, which `RegisterUploadedBlock` translates
+   into `ErrBlockDeleteInProgress`, so the six funnels wrapped in
+   `RetryUploadedBlockMaterialization` re-probe and converge instead of exhausting
+   retries. The unprobed web-session funnel (`v2/blocks.go UploadBlock`) still surfaces
+   that signal as a `500`: it has no retry wrapper and no `409` mapping yet, which is
+   **PR-5's job** (server `409 block_delete_in_progress` + `Retry-After`, landed with
+   the frontend soft-retry). This is pre-existing — `RegisterUploadedBlock` already
+   returned `ErrBlockDeleteInProgress` on a plain GC fence before PR-2 — so PR-2 only
+   makes the backstop's DB contract correct and does not change the web funnel's HTTP
+   surface. Do not add a read to the ordinary absent-row path and do not
    import PR-3's new retry sentinels or metrics. Note: `BlockDeleteFenceActive` is
    deliberately **not** extended to fence on `repairing_stub` — the upsert path must
    stay reachable to self-heal a stuck deterministic repair token.

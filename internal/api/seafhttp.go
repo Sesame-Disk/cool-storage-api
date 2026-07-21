@@ -1513,9 +1513,6 @@ const (
 
 var finalizeUploadBlockMetadataPermits = make(chan struct{}, finalizeUploadBlockMetadataConcurrency)
 var chunkedUploadLibraryFinalizePermits sync.Map
-var putUploadedBlockAutoFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
-	return blockStore.PutBlockAuto(ctx, hash, data)
-}
 var putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 	return blockStore.PutBlockAutoDirect(ctx, hash, data)
 }
