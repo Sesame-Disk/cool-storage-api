@@ -552,7 +552,7 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
   original queue row still exists: it escalates only when the old row is still
   present, treats the requeue as successful when the old row is already gone,
   and otherwise leaves the item untouched when the verification itself fails.
-- **Claim-then-verify block deletion**: before deleting, the worker (1) point-reads `BlockHasReferences` and skips if any reference row exists; (2) `ClaimBlockDelete` marks `gc_state='deleting'` via LWT (the single expensive Paxos op); (3) re-checks `BlockHasReferences` and, if a concurrent upload re-referenced the block, releases the claim (`gc_state=null`) and skips; only then deletes from DB and S3.
+- **Claim-then-verify block deletion**: before deleting, the worker (1) point-reads `BlockHasReferences` and skips if any reference row exists; (2) `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; (3) re-checks `BlockHasReferences` and, if a concurrent upload re-referenced the block, releases the claim (`gc_state=null`) and skips; only then deletes from DB and S3. This is one of several block-path conditional transitions; first-writer metadata creation is also an LWT.
 - **Liveness via reference rows**: liveness is a single-partition point query on `block_references` (replacing the old per-org full scan of live fs_objects). SHA-1→SHA-256 resolution happens at write time, so the GC read needs no resolution.
 - **Sentinel protection for uploads**: `RegisterUploadedBlock` registers its reference first, then reads `gc_state`; if it sees `'deleting'` it backs off with exponential delay, waiting for GC to finish, then re-creates the metadata under its reference. This is the row-model analogue of the old `-999` backoff.
 - **Idempotent reference removal**: `RemoveBlockReference` is an idempotent `DELETE` of a single `(block, referrer)` row, so a retried fs_object GC pass or upload rollback cannot double-decrement. The entire class of decrement-idempotency bookkeeping (`gc_processed_items` markers, repair passes) is gone with the counter.
@@ -576,11 +576,12 @@ A reference row is `((org_id, block_id), referrer)` where:
   committed). Abandoned rows are recovered through the canonical
   `gc_provisional_block_refs` expiry table plus its by-day discovery projection.
 
-**Operations** (steady state needs NO LWT — `INSERT`/`DELETE` are idempotent):
+**Operations** (`block_references` steady-state INSERT/DELETE is idempotent and
+non-LWT; canonical metadata creation and lifecycle state transitions are separate):
 - **File upload**: `RegisterUploadedBlock` — `UpsertBlockMetadata` (INSERT IF NOT EXISTS) + `AddBlockReference(up:…, TTL)`. Backs off if the row is mid-GC (`gc_state='deleting'`).
 - **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block. These are the **permanent** refs, promoted only after the fs_object row is persisted (the publish race holds liveness via provisional publish-attempt refs); the call fails closed if the fs_object row is missing. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
 - **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
-- **GC block deletion (the only expensive Paxos)**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferences` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise `RecordS3Orphan` → `DELETE blocks` → delete `blocks/<org_id>/...` through a `BlockStore` bound to the queued org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend.
+- **GC block deletion**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferences` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise `RecordS3Orphan` → `DELETE blocks` → delete `blocks/<org_id>/...` through a `BlockStore` bound to the queued org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend. Claim, release and finalize use conditional transitions; they are not the only block-path Paxos operations.
 - **S3 orphan recovery**: reuses the orphan row's `(org_id, storage_class)` to resolve the same physical key. An empty class or invalid org fails closed, leaves the orphan row for operator repair/retry, and does not advance the recovery cursor past the unresolved row.
 
 **Lifecycle**:
@@ -594,11 +595,15 @@ Upload race:   writer sees gc_state='deleting' → backs off → re-creates afte
 
 **Multi-region considerations**: reference `INSERT`/`DELETE` use `LOCAL_QUORUM` (no
 cross-DC Paxos), so concurrent uploads/deletes no longer collide on a shared
-mutable counter. The single expensive `SERIAL` (global Paxos) operation is the GC
-worker's `gc_state` claim at the irreversible S3-delete gate. GC must be enabled in
-only one DC (see `configs/config.prod.yaml` comments and KNOWN_ISSUES.md
-`ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period (>>200ms cross-DC replication lag)
-ensures a block's references are fully replicated before the gate runs.
+mutable counter. Block-path `SERIAL` operations include the first-writer
+`UpsertBlockMetadata` LWT, conditional identity backfills, GC candidate
+create/replacement, GC claim/release/finalize and orphan lifecycle transitions. GC
+must be enabled in only one DC (see `configs/config.prod.yaml` comments and
+KNOWN_ISSUES.md `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period is a mitigation
+for ordinary cross-DC lag, not a correctness bound: with RF 1 per DC,
+`LOCAL_QUORUM` reference writes and reads need not intersect. Destructive GC remains
+disabled pending `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` and the physical-delete
+ABA blocker.
 
 #### Reverse Lookup Table — DROPPED (PR7, migration 006)
 

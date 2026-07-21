@@ -1287,9 +1287,17 @@ Set appropriate consistency levels per operation:
 | File listing | `LOCAL_ONE` | Can be slightly stale |
 | Commit creation | `QUORUM` | Must be durable |
 | Block reference add/remove (`block_references`) | `LOCAL_QUORUM` | Idempotent INSERT/DELETE — no cross-DC Paxos in steady state |
-| GC block-delete claim (`gc_state` LWT) | `SERIAL` (default) | The ONLY block-path global Paxos — guards the irreversible S3 delete; do NOT change to `LOCAL_SERIAL` |
+| Block metadata first-writer (`INSERT ... IF NOT EXISTS`) | `SERIAL` (production default) | Pins one canonical storage class/key per `(org_id, block_id)`; one global Paxos round per metadata-registering uploaded block |
+| Block identity repair (`representation_id` / `sha1` backfill) | `SERIAL` (production default) | Conditional repair of pre-existing metadata; not taken by the successful first-writer hot path |
+| GC candidate lifecycle (`INSERT IF NOT EXISTS`, conditional replacement) | `SERIAL` (production default) | Preserves the canonical candidate timestamp under concurrent enqueue/replacement |
+| GC block lifecycle (`gc_state` claim/release/finalize and conditional orphan transitions) | `SERIAL` (production default) | Guards ownership and irreversible delete transitions; do NOT change production to `LOCAL_SERIAL` |
 | Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads must see latest state |
 | Share link validation | `LOCAL_QUORUM` | Security-critical |
+
+The dedicated `config-usa.cluster.yaml` and `config-eu.cluster.yaml` profiles are
+test/development harnesses and intentionally use `LOCAL_SERIAL`; they are not the
+production configuration. They therefore do not reproduce the production cross-DC
+`SERIAL` contract and cannot validate global first-writer serialization.
 
 **Implementation in config.yaml:**
 ```yaml

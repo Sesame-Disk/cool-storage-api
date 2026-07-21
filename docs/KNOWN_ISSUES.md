@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-07-16
+**Last Updated**: 2026-07-21
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🟡 **P10 fixed; non-blocking debt remains** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped; delete resolution trims incidental whitespace and uses the canonical class without health failover; org-less storage APIs are removed. Coverage: the delete/drain/download E2E runs against two dedicated, test-exclusive tenant orgs (so the private GC drain is sound); the orphan-recovery E2E uses an isolated target/sibling org-scoped object pair; an API-level test proves identical bytes resolve to distinct physical keys across the default and platform orgs; and an adapter unit test pins `PlatformOrgID` handling in GC. **Remaining:** storage retention (P4/P7), observability (P5), test hygiene (one unattributed S3-only orphan; 1A–1C/1G done), and scale (P8). The single-org delete path also has the ~50 GB manual dev-cluster observation (not an automated test). Reconcile/backfill is not required for an empty prod deploy. See GC audit section below. |
+| Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`), and `LOCAL_QUORUM` references can be invisible across RF-1 DCs (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`). Keep destructive GC disabled until both close. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -617,8 +617,9 @@ is gone. References are modeled as rows in `block_references` (one row per
 for in-flight uploads). Adding/removing a reference is an idempotent `INSERT`/`DELETE`
 with no LWT, so a client retry that re-registers the same content-addressed
 `(block, fs_id)` cannot inflate anything — the ambiguous-CAS leak class no longer
-exists. The only expensive Paxos left is the GC worker's `gc_state='deleting'` claim
-at the irreversible S3-delete gate (claim-then-verify). See
+exists. Block-path Paxos remains for first-writer metadata creation, GC
+claim/release/finalize, conditional identity repair and orphan lifecycle transitions;
+these operations do not mutate a shared reference counter. See
 `internal/db/block_references.go`, `FSHelper.RegisterUploadedBlock` /
 `RegisterFSObjectBlockReferences`, and the GC worker's `processBlock` /
 `removeFSObjectBlockReferences`. Original analysis kept below for context.
@@ -626,7 +627,7 @@ at the irreversible S3-delete gate (claim-then-verify). See
 **Severity (when active)**: Medium-High operational risk — preferred fail-closed and no unsafe rollback, but some retry paths could still inflate `blocks.ref_count`
 **Affected**: `IncrementOrCreateBlock`, sync `PUT /seafhttp/repo/:repo_id/block/:block_id`, seafhttp upload finalize paths, future block-ref accounting callers
 
-#### Current Behavior
+#### Historical Behavior Before The Row-Per-Reference Fix
 
 `resolveIncrementBlockMutationError()` and `resolveInsertBlockMutationError()` now treat a confirmation read that sees the "expected" post-LWT state as **unknown outcome**, not success, unless the mutation can be attributed unambiguously.
 
@@ -645,13 +646,16 @@ The flow is still not fully idempotent across client retries.
 - **Chunked upload finalize** now cleans up the tracker on `ErrBlockMutationOutcomeUnknown` and only rolls back the blocks that were already accounted before the ambiguous block. That is the safe choice against data loss, but a full re-upload can still increment the ambiguous block again.
 - **Single-shot/direct upload paths** also fail closed on ambiguous block registration, so they share the same leak-vs-false-success tradeoff.
 
-The current branch therefore fixes the production outage class better than `main`, but it does **not** yet provide a fully idempotent block-registration contract under ambiguous Paxos outcomes.
+The audited hotfix branch fixed the production outage class better than `main` at
+that time, but it did **not** provide a fully idempotent block-registration contract
+under ambiguous Paxos outcomes. The row-per-reference redesign subsequently removed
+that mutable-refcount contract.
 
 #### What Is Already Narrowed
 
 - Copy/move code paths that need rollback already use `IncrementBlockRefCountsTracked()` so they receive the exact list of confirmed increments to unwind on publish failure.
 - The older `IncrementBlockRefCounts()` helper now attempts rollback of previously confirmed increments before returning an error. That narrows the partial-progress footgun, but rollback is still best-effort because `DecrementBlockRefCountsOnce()` does not surface a rollback error back to the caller.
-- The new chunked-upload permit is intentionally only a **process-local** pressure valve. It lowers the chance of `blocks`-table Paxos storms from one finalize wave, but it is not cluster-wide serialization.
+- The former chunked-upload permit was intentionally only a **process-local** pressure valve. It lowered the chance of `blocks`-table Paxos storms from one finalize wave, but it was not cluster-wide serialization.
 - The current audit did **not** confirm a same-finalize self-deadlock from that permit: each block acquires/releases it inside its own block goroutine. The remaining gap is coverage, not a confirmed blocker — the suite still lacks a chunked upload test that forces `finalizeUploadStreaming()` through a file larger than `uploadBlockSize` while `finalizeUploadBlockMetadataConcurrency = 1`.
 
 #### What Would Fully Close It
@@ -668,7 +672,7 @@ Until then, treat this as accepted hotfix debt: safer than false-success/data lo
 
 - **Option B: keep a mutable `ref_count`, but mutate it only with CAS/LWT**. This is the classical optimistic-concurrency pattern already used here: read the current value, compute the next value, and `UPDATE ... IF ref_count = <value_read>`. It is correct and safe, but expensive in multiregion because every conflict resolution rides cross-DC Paxos on a shared row.
 - **Option C: stop storing a mutable counter and model references as rows**. Instead of one `blocks.ref_count` integer, store one row per `(block_id, referrer)` and make reference add/remove be `INSERT`/`DELETE` on distinct rows. That removes most writer-vs-writer collisions at the modeling level and makes the GC ask "do any reference rows still exist?" instead of trusting a hot mutable integer.
-- **Recommended direction for a future branch**: use row-per-reference where it is practical, and keep expensive LWT only for the irreversible moment when GC is about to delete from S3. In other words: design the steady state so concurrent writers stop colliding, and spend Paxos only at the final safety gate where a mistake would destroy data.
+- **Direction implemented later**: use row-per-reference for liveness so concurrent writers do not collide on a mutable counter. This did not remove the separate first-writer metadata LWT or the conditional GC/orphan lifecycle transitions.
 
 #### Related Docs
 
@@ -1744,6 +1748,57 @@ This closed the missing-CAS and missing-parent-validation bug class. The remaini
 
 ## 🔴 OPEN ISSUES
 
+### ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01: Physical-delete ABA can remove re-uploaded bytes
+
+**Status**: 🔴 Open — independently blocks destructive GC
+**Discovered**: 2026-07-21
+**Priority**: Blocker — potential loss of a live physical object
+**Affected**: `gc_s3_orphans`, S3 orphan recovery, upload rematerialization
+
+An S3 delete already authorized for `blocks/<org>/<hash>` can complete after its
+visible Cassandra fence clears and after a writer stores byte-identical content at
+the same key. Content addressing makes ETag/value comparison unable to distinguish
+the old lifecycle from the new one. Claim-stub repair does not close this in-flight
+physical-delete ABA. Keep destructive GC disabled until the physical key or delete
+authorization carries a lifecycle generation that a stale delete cannot target.
+Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1.
+
+---
+
+### ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01: GC can miss a live reference in another DC
+
+**Status**: 🔴 Open — independently blocks destructive GC in multi-DC
+**Discovered**: 2026-07-21
+**Priority**: Blocker — potential deletion of a live block
+**Affected**: `block_references`, GC claim-then-verify, RF 1 per DC deployments
+
+Reference writes and GC liveness reads use `LOCAL_QUORUM`; `SERIAL` applies to the
+conditional `blocks` transition, not to those ordinary reference rows. With RF 1 per
+DC, the write quorum in one DC and read quorum in another need not intersect. The
+one-hour grace period mitigates normal lag but is not a correctness bound. The local
+multi-region test profiles use `LOCAL_SERIAL` and do not reproduce production's
+`SERIAL` contract; they are not production configuration. Design evidence:
+`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2.
+
+---
+
+### ISSUE-UPLOAD-PUT-BEFORE-INTENT-01: Crash before metadata leaves undiscoverable S3 bytes
+
+**Status**: 🟡 Open
+**Discovered**: 2026-07-21
+**Priority**: Medium — storage leak, not live-data deletion
+**Affected**: block upload and legacy resumable upload
+
+The physical PUT precedes any GC-discoverable block metadata/reference or durable
+physical-object intent. A session may already have staged accounting state, but that
+state does not identify the stored object for reclamation. A crash after S3 accepts
+the object but before metadata/reference registration leaves an object that no GC
+phase can discover safely. Closing it requires durable physical-object intent before
+PUT or a sweeper with a safe ownership proof. Tracking:
+`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X3.
+
+---
+
 ### ISSUE-GC-MULTIINSTANCE-01: Multi-instance GC coordination and split-brain hardening
 
 **Status**: 🟡 Pending with temporary prod workaround
@@ -1758,12 +1813,16 @@ The GC (worker + scanner) has no coordination mechanism between instances. If mu
 2. **Scanner without leader election**: Multiple scanners enqueue the same orphans as duplicates (the PK includes `queued_at = time.Now()`, so each INSERT creates a distinct row).
 3. **Snapshot drift** (substantially resolved): the original `gc_queue_stats` counter table was retired from the baseline schema. Queue/DLQ totals now live in `gc_stats` and `gc_org_stats`, dirty orgs are exact-recalculated from canonical rows off the write path, hot `COUNT(*)` reads are gone, and DLQ expiry is explicit. Snapshots remain approximate until the background/admin refresh runs. See ARCHITECTURE.md / GC-SERVICE-ANALYSIS.md.
 
-**Is there data loss?** No. Destructive operations are protected:
+**Multi-instance duplication itself does not add a separate data-loss path**, but
+destructive GC is not currently safe to enable because the upload-fence audit found
+the independent physical-delete ABA and cross-DC visibility blockers above:
 - `DeleteBlock` uses a claim-then-verify delete fence: only one instance can win the claim, and the winner re-checks live `block_references` before touching S3
 - `block_references` rows make fs_object cleanup idempotent; retrying the same delete removes the same keyed refs again instead of replaying a counter decrement
 - Cassandra DELETEs are idempotent
 
-**Actual impact**: Wasted work (CPU/network overhead) and slightly incorrect admin counters. No risk of data loss.
+**Actual impact of this issue**: wasted work (CPU/network overhead) and slightly
+incorrect admin counters. This statement does not close or downgrade the independent
+destructive-GC blockers above.
 
 **Current operational decision (updated 2026-04-14):**
 - Keep `gc.enabled=false` in YAML and set `GC_ENABLED=true` only on the replicas that are allowed to run GC.
@@ -1787,7 +1846,11 @@ Running GC in a single DC is **critical** for multi-region deployments with Cass
 
 The existing `GC_ENABLED=true` on exactly one DC / `GC_ENABLED=false` on all others remains the correct topology for multi-region. The lease now provides automatic failover among enabled replicas, but you should still avoid enabling GC in multiple DCs at once.
 
-All block-level operations (`IncrementOrCreateBlock`, `decrementBlockRefCount`, `DeleteBlock` Phase 1) use LWT which defaults to `SERIAL` (global Paxos). Do NOT change to `LOCAL_SERIAL` — this would break cross-DC serialization and allow split-brain scenarios where GC in DC-A claims a block that an upload in DC-B is concurrently referencing.
+Block-level conditional operations include first-writer metadata creation, GC claim,
+claim release/finalize, and orphan lifecycle transitions; production defaults these
+LWTs to `SERIAL` (global Paxos). Do not change production to `LOCAL_SERIAL`. This
+still does not serialize ordinary `LOCAL_QUORUM` `block_references` writes, which is
+the separate visibility blocker documented above.
 
 **Alternative — Org partitioning:**
 Each instance processes `hash(orgID) % numInstances == myIndex`. No coordination needed but requires knowing the total number of instances.

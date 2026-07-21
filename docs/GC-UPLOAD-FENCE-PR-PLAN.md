@@ -1,21 +1,21 @@
 # Upload-Fence / Canonical-Storage Work — PR Split Plan
 
 **Date:** 2026-07-21
-**Reference branch:** `docs/gc-upload-fence-rematerialization` — **not for merge**
-**Status:** PR-1 proposed; no code PRs open yet.
+**Research branch:** `docs/gc-upload-fence-rematerialization` — **not for merge**
+**Status:** PR-1 is the documentation-only first step; no code PRs are open yet.
 
 ## Why this document exists
 
-The reference branch grew to 63 files across GC, upload funnels, the canonical read
-path, streaming, the frontend and 16 documents. It is correct as far as we can
-verify locally (build, vet, unit tests, integration compile all pass) but it is too
-large to review honestly in one pass — eight successive audits each found real defects
-in it, which is itself the argument against merging it whole.
+The research branch grew to 63 files across GC, upload funnels, the canonical read
+path, streaming, the frontend and 16 documents. It compiles and passes the local
+verification that was run, but it contains known design and implementation defects;
+eight successive audits each found real defects in it. It is therefore neither a
+merge candidate nor a normative description of the final state.
 
-So it stays as a **reference target**: the shape the code should end up in. We land
-the same work through small, individually reviewable PRs cut against `main`, and the
-last PR should leave the tree materially equivalent to the reference — unless a
-better idea appears along the way, which is the other reason for going slowly.
+It stays only as a **research prototype and evidence archive**: useful code, failed
+approaches and tests can be reconstructed from it, but every change must be derived
+and reviewed independently against `main`. The series is defined by the findings and
+safety contracts in this plan, not by material equivalence to that branch.
 
 ## Ground rules for the series
 
@@ -36,7 +36,7 @@ better idea appears along the way, which is the other reason for going slowly.
 ### Why PR-1 is not "all the documentation"
 
 The natural instinct is to land every doc change first. That does not work here: the
-docs on the reference branch describe the **fixed** state ("registration propagates
+docs on the research branch describe the **fixed** state ("registration propagates
 the fence", "all seven funnels retry", "the legacy fallback was removed"). Landing
 those against `main` would assert things that are not true yet, which is worse than
 no documentation — an operator reading `KNOWN_ISSUES.md` would believe a blocker is
@@ -53,7 +53,7 @@ PR that owns each row; the PR that lands moves its rows out of the open table.
 
 ### PR-1 — Findings registry and plan (docs only)
 
-**Scope:** three documents, no code.
+**Scope:** six documents, no code.
 
 1. this file;
 2. `UPLOAD-FENCE-FINDINGS-REGISTRY.md`, recording every open item with severity,
@@ -61,9 +61,13 @@ PR that owns each row; the PR that lands moves its rows out of the open table.
 3. a **selective** addition to `UPLOAD-PERFORMANCE-SECURITY-2026-06.md` — the P-4
    section, its summary row and its entry in the recommended order, and nothing
    else. Both documents above link to P-4, so without it they would carry dangling
-   references. The rest of that file is deliberately untouched: the reference branch
+   references. The rest of that file is deliberately untouched: the research branch
    also rewrites its claims about upload funnels and canonical readers, and those are
-   not true on `main` yet.
+   not true on `main` yet;
+4. corrections in `ARCHITECTURE.md` and `DATABASE-GUIDE.md` so their Paxos inventory
+   matches the current first-writer metadata LWT and conditional GC transitions;
+5. canonical entries in `KNOWN_ISSUES.md` for the three out-of-series findings that
+   already have stable issue identifiers.
 
 No status is claimed as fixed anywhere.
 
@@ -78,16 +82,22 @@ PR a row to close.
 
 **Scope:** `internal/gc/worker.go` (re-referenced stub deleted under its claim rather
 than released), `internal/db/block_references.go` (`DeleteClaimedBlockStub`,
-`DeleteReleasedBlockStub`, `storage_class` invariant on write, and a probe result
-that makes a metadata-free stub **distinguishable**), `internal/api/v2/fs_helpers.go`
-(writer-side stub repair). Tests for each.
+`DeleteReleasedBlockStub`, `storage_class` invariant on write, and an explicit
+`RepairableStub` probe decision), `internal/gc/store.go`,
+`internal/gc/store_cassandra.go` and `internal/gc/store_mock.go` (conditional-delete
+contract and adapters), plus the existing probe switches in `internal/api/sync.go`,
+`internal/api/seafhttp.go`, `internal/api/v2/files.go` and
+`internal/api/v2/onlyoffice.go`. Unit tests and a non-skipping production-engine
+lifecycle regression in `internal/integration/gc_integration_test.go` travel with it.
 
-**The stub must be an explicit state.** Classifying it as plain `NeedsPut` is not
+**The stub is an explicit store-phase state.** Classifying it as plain `NeedsPut` is not
 enough: `ProbeBlockReuse` returns `NeedsPut` with an empty `StorageClass` for a
 genuinely missing row too, and `BlockReuseProbe` carries no `Found`, `IsStub` or
-claim id to separate them. Add a distinct decision (e.g. `RepairableStub`) or carry
-the claim metadata the probe already read. Without that the repair either cannot
-target the stub, or fires an LWT on every brand-new block — see X7.
+claim id to separate them. PR-2 adds `RepairableStub` from the same metadata read;
+each funnel conditionally removes the released metadata-free row, then follows its
+ordinary `NeedsPut` store path. Active claims remain `BlockedByGC` and are handled by
+the worker/materialization fence. This avoids both an unconditional third read and
+an LWT on every brand-new block — see X7.
 
 **Why first among the code PRs:** it is the only one that fixes a state that can
 permanently break a block id, and it depends on nothing else.
@@ -95,7 +105,7 @@ permanently break a block id, and it depends on nothing else.
 **Acceptance:** a stub left by a crashed or re-referenced claim is removed by either
 side, and an upload that meets one succeeds instead of exhausting its retries. Unit
 tests must drive the real `store -> materialize` loop, not call the repair directly —
-the direct-call tests on the reference branch could not catch that the repair was
+the direct-call tests on the research branch could not catch that the repair was
 unreachable behind the probe.
 
 ---
@@ -296,15 +306,18 @@ publication.
 likely to be superseded by a better idea, and it is the one with real performance
 stakes: under `SERIAL` and a multi-DC posture the current LWT is one *global*
 consensus round per block, ~128 cross-region rounds per GB at the 8 MB block size.
-It is **pre-existing on `main`** (`13e01263a`, 2026-07-08), not introduced by this
-series.
+It is **pre-existing on `main`** (`e3883aa5d`, 2026-05-28), not introduced by this
+series. `13e01263a` later made the same write representation-aware; it did not
+introduce the LWT.
 
 **Correction worth carrying:** an earlier revision of this plan said the legacy
 resumable path "does not pay" this. That is false. `finalizeUploadStreaming` splits a
 resumable upload into 8 MB blocks and calls `RegisterUploadedBlock` per block, so it
-pays the same ~128 LWTs per GB. The cost is **shared by both upload paths**, which
-makes this a general optimization rather than something block upload has to fix to
-justify itself — and it means the win, if taken, applies to every upload surface.
+pays the same ~128 LWTs per GB. The cost is **shared by both governed upload modes**,
+which makes this a general optimization rather than something block upload has to
+fix to justify itself — and it means the win, if taken, applies to every
+metadata-registering upload surface. F8's no-session branch is the exception because
+it currently skips metadata registration.
 
 **Do not start this before measuring.** There is no per-statement latency metric for
 that INSERT yet; add it, get the production number, then decide. Full analysis: P-4
@@ -334,4 +347,8 @@ These stay open and keep destructive GC disabled:
   particular introduces the concurrent canonical reader and must not merge without it.
 - No end-to-end download tests against real Cassandra exist for the 404/503 contract.
 - No multi-DC test exercises any of the cross-DC reasoning; it is derived from the
-  consistency contract and the committed configuration, not from a reproduction.
+  production consistency contract, not from a reproduction. The dedicated
+  `config-usa.cluster.yaml` / `config-eu.cluster.yaml` test profiles use
+  `LOCAL_SERIAL`; their inline "multi-DC standard" wording describes the harness,
+  not production. That harness specifically does not reproduce production's
+  `SERIAL` cross-DC first-writer contract.
