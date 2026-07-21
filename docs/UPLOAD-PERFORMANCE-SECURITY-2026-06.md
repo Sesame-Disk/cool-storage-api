@@ -161,7 +161,7 @@ external.
 
 ## P-4 — One global Paxos round per block on every upload path (2026-07-21)
 
-**Severity: HIGH for the block-upload value proposition**
+**Severity: HIGH for general upload performance** (both upload paths, not block upload specifically)
 **Branch: pending — `perf/deterministic-block-storage-class`**
 **Pre-existing: yes.** This is **not** introduced by the upload-fence work. The
 first-writer LWT is on `main` and dates to `13e01263a` (2026-07-08); the code
@@ -219,9 +219,13 @@ a brand-new block in the web session flow: ~7–8 Cassandra reads/writes, one
 `main`, `GetBlockDeleteClaimInfo` (the stub-repair read) only runs when the delete
 fence is active. The reference branch calls `removeStaleUploadedBlockDeleteStub` on
 the unfenced path too, making it unconditional. That is avoidable and should not
-ship: `ProbeBlockReuse` already identifies a stub — it returns `NeedsPut` with an
-empty `StorageClass` — so the repair can be driven from the probe result instead of
-a fresh point read. Tracked as X7 in the findings registry.
+ship as-is. Note the obvious shortcut does **not** work: `ProbeBlockReuse` returns
+`NeedsPut` with an empty `StorageClass` both for a genuinely missing row and for a
+stub, and `BlockReuseProbe` carries no `Found`, `IsStub` or claim id to separate
+them, so keying a conditional delete off that signal would fire an LWT on every
+brand-new block — trading a read for a Paxos round, which is worse. The state has to
+become explicit in the probe (a distinct decision, or the claim metadata it already
+read). Tracked as X7 in the findings registry.
 
 ### Proposed fixes
 
@@ -231,8 +235,10 @@ a fresh point read. Tracked as X7 in the findings registry.
    a plain last-writer-wins INSERT always writes the same class/key and the LWT can
    be dropped outright. This is a design change (routing must become a pure function
    of org+block, and existing rows must keep resolving), not a mechanical edit.
-2. **Collapse the three `blocks` reads into one** request-scoped fetch shared by the
-   probe, the fence check and the stub check. Mechanical, no design risk.
+2. **Collapse the two `blocks` reads into one** request-scoped fetch shared by the
+   probe and the fence check. Mechanical, no design risk. Handle the third read the
+   fence work would add separately — see X7; it needs an explicit stub state in the
+   probe, not just a shared fetch.
 3. **Measure before choosing.** Instrument the latency of that specific INSERT so the
    real production number replaces this estimate. `block_upload_materialization_retries_total`
    already exists; per-statement latency does not.
