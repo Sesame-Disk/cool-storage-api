@@ -43,18 +43,23 @@ func TestLegacyFallbackOnlyOnDefinitiveAbsence(t *testing.T) {
 	}{
 		{"row genuinely absent", gocql.ErrNotFound, true},
 		{"wrapped absence", fmt.Errorf("file metadata not found: %w", gocql.ErrNotFound), true},
+		// A readable directory that simply has no such entry is a deleted or renamed
+		// file: logically absent, so 404. Before this was wired it fell through to
+		// the fail-closed branch and reported 503 for an ordinary missing file.
+		{"directory read but entry missing", fmt.Errorf("%w: report.pdf", errDirectoryEntryNotFound), true},
 		{"read timeout", errors.New("gocql: no response received from cassandra within timeout period"), false},
 		{"coordinator unavailable", errors.New("gocql: unavailable"), false},
+		{"malformed directory entries", errors.New("malformed directory entries: invalid character"), false},
 		{"unknown failure", errors.New("boom"), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := legacyFallbackIfDefinitelyAbsent(tt.err)
-			if errors.Is(got, errLegacyPathBackedFile) != tt.wantLegacy {
-				t.Fatalf("legacyFallbackIfDefinitelyAbsent(%v) = %v, wantLegacy=%v", tt.err, got, tt.wantLegacy)
+			got := classifyPathAbsence(tt.err)
+			if errors.Is(got, errFilePathAbsent) != tt.wantLegacy {
+				t.Fatalf("classifyPathAbsence(%v) = %v, wantLegacy=%v", tt.err, got, tt.wantLegacy)
 			}
 			// The two sentinels must stay mutually exclusive: HandleDownload keys the
-			// whole decision off errLegacyPathBackedFile being absent.
+			// whole decision off errFilePathAbsent being absent.
 			if !tt.wantLegacy && !errors.Is(got, errBlockBackedFileUnresolvable) {
 				t.Fatalf("non-absence error %v did not map to the fail-closed sentinel", tt.err)
 			}
@@ -66,7 +71,7 @@ func TestLegacyFallbackOnlyOnDefinitiveAbsence(t *testing.T) {
 // fallback: that object is plaintext.
 func TestEncryptedWithoutSessionIsNotLegacyFallback(t *testing.T) {
 	err := fmt.Errorf("%w: library is encrypted but not unlocked", errBlockBackedFileUnresolvable)
-	if errors.Is(err, errLegacyPathBackedFile) {
+	if errors.Is(err, errFilePathAbsent) {
 		t.Fatal("encrypted-without-session must not permit the legacy fallback")
 	}
 }

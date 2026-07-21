@@ -2252,15 +2252,21 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
-// errLegacyPathBackedFile means Cassandra answered definitively that this path has
-// no block metadata: a genuine ErrNotFound, never a timeout or a partial read. It
-// is the only download failure that may be reported to the client as 404.
+// errFilePathAbsent means the path is logically gone: Cassandra answered
+// definitively (a genuine ErrNotFound) or the directory listing simply has no such
+// entry. It is the only download failure that may be reported to the client as 404.
 //
-// Every other failure — Cassandra unavailable, head/commit read error, directory
-// walk error, block store unresolvable, canonical metadata not visible yet, or an
+// Every other failure — Cassandra unavailable, read timeout, malformed directory
+// entries, block store unresolvable, canonical metadata not visible yet, or an
 // encrypted library with no unlock session — leaves it unknown whether the file
-// exists, so it surfaces as 503 rather than "file not found".
-var errLegacyPathBackedFile = errors.New("file has no block metadata")
+// exists, so it surfaces as 503 rather than "file not found". Reporting "unknown"
+// as "not found" would tell a client to stop retrying a file that is still there.
+var errFilePathAbsent = errors.New("file path is absent")
+
+// errDirectoryEntryNotFound is the logical-absence signal from findEntryInDir: the
+// directory was read successfully and does not contain the entry. Distinct from a
+// read failure, which must never be mistaken for absence.
+var errDirectoryEntryNotFound = errors.New("directory entry not found")
 
 // errBlockBackedFileUnresolvable marks a download failure that happened AFTER the
 // file was proven to have block metadata. Kept distinct from the generic
@@ -3549,7 +3555,7 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 		// coordinator, read timeout, unresolvable block store, canonical metadata not
 		// visible yet, encrypted library with no unlock session — is unknown, not
 		// missing, and must not be reported to the client as "file not found".
-		if errors.Is(err, errLegacyPathBackedFile) {
+		if errors.Is(err, errFilePathAbsent) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
 			return
 		}
@@ -3582,15 +3588,15 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string,
 	return normalizeResolvedInternalBlockID(mappedID)
 }
 
-// legacyFallbackIfDefinitelyAbsent returns errLegacyPathBackedFile only when
-// Cassandra answered definitively that the row does not exist. A timeout, an
-// unavailable coordinator or any other driver failure returns the fail-closed
-// sentinel instead, because "we could not read it" must never be mistaken for
-// "it is not there" — that is what would let a stale path-based object be served
-// in place of a newer block-backed version.
-func legacyFallbackIfDefinitelyAbsent(err error) error {
-	if errors.Is(err, gocql.ErrNotFound) {
-		return errLegacyPathBackedFile
+// classifyPathAbsence separates "the path is not there" from "we could not tell".
+// Only a definitive Cassandra ErrNotFound, or findEntryInDir reporting that a
+// successfully-read directory has no such entry, count as absence. A timeout, an
+// unavailable coordinator, malformed data or any other driver failure returns the
+// fail-closed sentinel, because "we could not read it" must never be reported to
+// the client as "file not found".
+func classifyPathAbsence(err error) error {
+	if errors.Is(err, gocql.ErrNotFound) || errors.Is(err, errDirectoryEntryNotFound) {
+		return errFilePathAbsent
 	}
 	return errBlockBackedFileUnresolvable
 }
@@ -3622,7 +3628,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).Scan(&headCommit)
 	if err != nil {
-		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: library not found: %w", legacyFallbackIfDefinitelyAbsent(err), err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: library not found: %w", classifyPathAbsence(err), err)
 	}
 
 	var rootFSID string
@@ -3630,7 +3636,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
 	`, token.RepoID, headCommit).Scan(&rootFSID)
 	if err != nil {
-		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: commit not found: %w", legacyFallbackIfDefinitelyAbsent(err), err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: commit not found: %w", classifyPathAbsence(err), err)
 	}
 
 	// Navigate directory tree to the target file
@@ -3647,7 +3653,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	for i := 0; i < len(pathParts)-1; i++ {
 		nextFSID, err := h.findEntryInDir(token.RepoID, currentFSID, pathParts[i])
 		if err != nil {
-			return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: directory not found: %s: %w", legacyFallbackIfDefinitelyAbsent(err), pathParts[i], err)
+			return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: directory not found: %s: %w", classifyPathAbsence(err), pathParts[i], err)
 		}
 		currentFSID = nextFSID
 	}
@@ -3655,7 +3661,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	targetName := pathParts[len(pathParts)-1]
 	fileFSID, err := h.findEntryInDir(token.RepoID, currentFSID, targetName)
 	if err != nil {
-		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: file not found: %s: %w", legacyFallbackIfDefinitelyAbsent(err), targetName, err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: file not found: %s: %w", classifyPathAbsence(err), targetName, err)
 	}
 
 	// Get block IDs and file size from fs_object
@@ -3663,7 +3669,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, token.RepoID, fileFSID).Scan(&blockIDs, &fileSize)
 	if err != nil {
-		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: file metadata not found: %w", legacyFallbackIfDefinitelyAbsent(err), err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: file metadata not found: %w", classifyPathAbsence(err), err)
 	}
 
 	blockStore, fallbackClass, err = h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
@@ -3819,7 +3825,7 @@ func (h *SeafHTTPHandler) findEntryInDir(repoID, dirFSID, entryName string) (str
 	var entries []map[string]interface{}
 	if dirEntries == "" || dirEntries == "[]" {
 		log.Printf("[findEntryInDir] Directory is empty")
-		return "", fmt.Errorf("entry not found: %s", entryName)
+		return "", fmt.Errorf("%w: %s", errDirectoryEntryNotFound, entryName)
 	}
 
 	if err := json.Unmarshal([]byte(dirEntries), &entries); err != nil {
@@ -3863,7 +3869,7 @@ func (h *SeafHTTPHandler) findEntryInDir(repoID, dirFSID, entryName string) (str
 		log.Printf("[findEntryInDir]   ... and %d more entries", len(entries)-10)
 	}
 
-	return "", fmt.Errorf("entry not found: %s", entryName)
+	return "", fmt.Errorf("%w: %s", errDirectoryEntryNotFound, entryName)
 }
 
 // Helper function to generate a file ID
