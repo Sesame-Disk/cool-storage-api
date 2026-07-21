@@ -53,8 +53,19 @@ PR that owns each row; the PR that lands moves its rows out of the open table.
 
 ### PR-1 — Findings registry and plan (docs only)
 
-**Scope:** this file, plus a findings registry recording every open item with
-severity, evidence and current status. No code, no status claimed as fixed.
+**Scope:** three documents, no code.
+
+1. this file;
+2. `UPLOAD-FENCE-FINDINGS-REGISTRY.md`, recording every open item with severity,
+   evidence and the PR that closes it;
+3. a **selective** addition to `UPLOAD-PERFORMANCE-SECURITY-2026-06.md` — the P-4
+   section, its summary row and its entry in the recommended order, and nothing
+   else. Both documents above link to P-4, so without it they would carry dangling
+   references. The rest of that file is deliberately untouched: the reference branch
+   also rewrites its claims about upload funnels and canonical readers, and those are
+   not true on `main` yet.
+
+No status is claimed as fixed anywhere.
 
 **Rationale:** makes the work auditable before any of it lands, and gives every later
 PR a row to close.
@@ -67,9 +78,16 @@ PR a row to close.
 
 **Scope:** `internal/gc/worker.go` (re-referenced stub deleted under its claim rather
 than released), `internal/db/block_references.go` (`DeleteClaimedBlockStub`,
-`DeleteReleasedBlockStub`, `storage_class` invariant on write, `ProbeBlockReuse`
-classifying a metadata-free stub as `NeedsPut`), `internal/api/v2/fs_helpers.go`
+`DeleteReleasedBlockStub`, `storage_class` invariant on write, and a probe result
+that makes a metadata-free stub **distinguishable**), `internal/api/v2/fs_helpers.go`
 (writer-side stub repair). Tests for each.
+
+**The stub must be an explicit state.** Classifying it as plain `NeedsPut` is not
+enough: `ProbeBlockReuse` returns `NeedsPut` with an empty `StorageClass` for a
+genuinely missing row too, and `BlockReuseProbe` carries no `Found`, `IsStub` or
+claim id to separate them. Add a distinct decision (e.g. `RepairableStub`) or carry
+the claim metadata the probe already read. Without that the repair either cannot
+target the stub, or fires an LWT on every brand-new block — see X7.
 
 **Why first among the code PRs:** it is the only one that fixes a state that can
 permanently break a block id, and it depends on nothing else.
@@ -263,8 +281,16 @@ DoS bound share no code and no deploy dependency. Rule 1 applies to this series 
 ### PR-11 (deferred) — Remove the per-block Paxos
 
 **Scope:** make `storage_class` deterministic per `(org_id, block_id)` so the
-first-writer `INSERT ... IF NOT EXISTS` can be dropped, and collapse the repeated
-reads of the same `blocks` row per upload.
+first-writer `INSERT ... IF NOT EXISTS` can be dropped.
+
+**Not in scope: merging the two `blocks` reads.** An earlier draft listed that as a
+mechanical win. It is not — the probe reads before the PUT and the fence reads *after*
+the provisional reference is durable, and that ordering is the mutual exclusion that
+makes the whole protocol work. Serving the second from a cached first would let GC
+claim and authorize a delete in the window between them while the writer replays a
+stale "no fence" and publishes, which is F1 verbatim. Optimize inside a single
+observation point if useful; never reuse the pre-PUT observation to authorize
+publication.
 
 **Deliberately last, and deliberately not designed yet.** This is the item most
 likely to be superseded by a better idea, and it is the one with real performance

@@ -215,6 +215,10 @@ twice** on `main`:
 a brand-new block in the web session flow: ~7–8 Cassandra reads/writes, one
 `LoggedBatch` (provisional ref + expiry + by-day projection), and one LWT.
 
+**These two reads are not redundant** — see fix 2 below. They observe different
+moments, and the second one is what authorizes publication. Only the *third* read
+that the fence work would add is genuinely removable.
+
 **A third read is a cost the fence work would add, not one that exists today.** On
 `main`, `GetBlockDeleteClaimInfo` (the stub-repair read) only runs when the delete
 fence is active. The reference branch calls `removeStaleUploadedBlockDeleteStub` on
@@ -235,10 +239,33 @@ read). Tracked as X7 in the findings registry.
    a plain last-writer-wins INSERT always writes the same class/key and the LWT can
    be dropped outright. This is a design change (routing must become a pure function
    of org+block, and existing rows must keep resolving), not a mechanical edit.
-2. **Collapse the two `blocks` reads into one** request-scoped fetch shared by the
-   probe and the fence check. Mechanical, no design risk. Handle the third read the
+2. ~~**Collapse the two `blocks` reads into one** request-scoped fetch shared by the
+   probe and the fence check.~~ **Withdrawn — this would reintroduce F1.** The two
+   reads are not duplicated work; they are two points in time, and the second one is
+   load-bearing:
+
+   ```
+   ProbeBlockReuse        read #1  — before the PUT, decides whether to store
+   ...PUT...
+   AddBlockReference      write    — publish our flag
+   BlockDeleteFenceActive read #2  — AFTER the reference, decides whether to publish
+   UpsertBlockMetadata    write
+   ```
+
+   The ordering is the whole mutual-exclusion protocol: the writer publishes its
+   reference *before* reading the fence, so either GC's post-claim recheck sees the
+   reference and abandons, or the writer sees the fence and retries. Serving read #2
+   from a cached pre-PUT observation breaks that. GC could claim, recheck, find no
+   reference, and authorize its delete in the window between the two, while the
+   writer replays a stale "no fence" and publishes metadata for a block that is about
+   to be deleted — exactly F1 again.
+
+   Query-level work is still fair game (fewer columns, a single statement covering
+   `blocks` and `gc_s3_orphans` for the *same* observation point). What must not
+   change is that the fence observation used to authorize publication is **fresh and
+   taken after the provisional reference is durable**. Treat the third read that the
    fence work would add separately — see X7; it needs an explicit stub state in the
-   probe, not just a shared fetch.
+   probe, and it is genuinely avoidable in a way these two are not.
 3. **Measure before choosing.** Instrument the latency of that specific INSERT so the
    real production number replaces this estimate. `block_upload_materialization_retries_total`
    already exists; per-statement latency does not.
