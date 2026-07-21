@@ -10,10 +10,20 @@ fixes it merges.
 
 ## How to read severity
 
-- **Blocker** — can lose or corrupt user data, or serve wrong bytes.
-- **High** — breaks a documented guarantee, or a large performance regression.
+- **Blocker** — can lose or corrupt user data, or serve wrong bytes, **reachable from
+  a valid production state**. Nothing has to be broken first.
+- **High** — breaks a documented guarantee, causes a large performance regression, or
+  can serve wrong bytes **only once metadata is already corrupt or legacy**. The
+  damage is as bad, but it needs a precondition that should not exist.
 - **Medium** — wrong behaviour with a bounded blast radius, or a false claim in docs.
 - **Low** — semantics, hygiene, misleading names or metrics.
+
+The Blocker/High split was sharpened after F5 and F13 were filed: both can serve
+wrong bytes, which read as Blocker under the original wording, but neither is
+reachable without a pre-existing corrupt dirent or a legacy path-based object. Keeping
+them at High preserves the meaning of the Blocker list — the things that can bite a
+correct, healthy cluster. Both were explicitly considered for Blocker and are called
+out here so the decision is visible rather than implicit.
 
 ---
 
@@ -33,7 +43,7 @@ fixes it merges.
 | F10 | Medium | **Provisional reference and its expiry are written separately.** A failure between them leaves a reference with no discovery projection, so the zero-ref transition is never found. | `fs_helpers.go`; `provisional_block_ref_expiry.go` | PR-8 |
 | F11 | Medium | **Abandoned prefetch leaks an open S3 reader.** `PrefetchBlock` buffered its result, so a consumer that stopped early left the `io.ReadCloser` unclosed. | `streaming/streaming.go` | PR-9 |
 | F12 | Medium | **Unbounded request bodies.** `PutBlock` and `check-blocks` read the whole body with `io.ReadAll` and no size or id-count limit. | `sync.go` | PR-9 |
-| F13 | High | **Corrupt directory listings resolve, and 404/503 semantics are inverted for a deleted path.** Severity is High, not the Low it was first filed as: two of the cases below can serve bytes from the wrong FS object, which is the definition of High in this table. The 404/503 half on its own would be Low. `findEntryInDir` returns a plain error, so a renamed or deleted file surfaces as 503 while an absent commit row gives 404. Related, and worse: a JSON-valid but corrupt listing resolves anyway. Structural cases (`null`, `[null]`, non-string name, missing id) parse and the bad entries are skipped, reporting a false absence; semantic cases (empty name, empty or non-40-hex id, duplicate names) resolve to a wrong or missing FS object; and `encoding/json` silently keeps the **last** value for a repeated key, so `{"id":"A","id":"B"}` serves B and `{"name":"a","name":"b"}` hides `a` entirely. Both of the last two can serve arbitrary bytes or report a present file as absent. | `seafhttp.go` `findEntryInDir` | PR-6 |
+| F13 | High | **Corrupt directory listings resolve, and 404/503 semantics are inverted for a deleted path.** High, not the Low it was first filed as: two of the cases below serve bytes from the wrong FS object. Not Blocker only because it needs an already-corrupt dirent — see the severity note above. The 404/503 half on its own would be Low. `findEntryInDir` returns a plain error, so a renamed or deleted file surfaces as 503 while an absent commit row gives 404. Related, and worse: a JSON-valid but corrupt listing resolves anyway. Structural cases (`null`, `[null]`, non-string name, missing id) parse and the bad entries are skipped, reporting a false absence; semantic cases (empty name, empty or non-40-hex id, duplicate names) resolve to a wrong or missing FS object; and `encoding/json` silently keeps the **last** value for a repeated key, so `{"id":"A","id":"B"}` serves B and `{"name":"a","name":"b"}` hides `a` entirely. Both of the last two can serve arbitrary bytes or report a present file as absent. | `seafhttp.go` `findEntryInDir` | PR-6 |
 | F14 | Low | **Retry metric mislabels write failures.** The SeafHTTP wrapper defaults every non-fence retry to `reason="probe"`, attributing Cassandra write errors to the read path. | `seafhttp.go` retry wrapper | PR-3 |
 
 ## Open and out of scope for this series
@@ -46,7 +56,8 @@ the first two are resolved.
 | X1 | Blocker | **Physical delete ABA.** `gc_s3_orphans` has no per-lifecycle claim or generation, so a previously authorized key-only S3 delete can still run after the visible orphan fence clears and after a re-upload has stored new bytes. Rematerialization does not fence it. | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` |
 | X2 | Blocker (multi-DC) | **Cross-DC reference visibility.** `block_references` are ordinary `LOCAL_QUORUM` writes that `SERIAL` does not cover. With RF 1 per DC the write and read quorums need not intersect, so GC in one DC can read zero references for a block that is live in another. The 1h grace period is mitigation, not a bound. | `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` |
 | X3 | Medium | **PUT precedes durable intent.** Both upload modes write to S3 before recording any Cassandra state, so a crash between the two leaves an object nothing can discover. Closing it needs a durable intent before the PUT, or a safe physical sweeper. | `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` |
-| X4 | High (perf) | **One global Paxos round per block.** The first-writer `INSERT ... IF NOT EXISTS` is a per-block LWT; under `SERIAL` and multi-DC it is a global consensus round, ~128 cross-region rounds per GB at the 8 MB CAS size. Plus three reads of the same `blocks` row per upload. **Pre-existing on `main` since `13e01263a` (2026-07-08)** — not introduced by this work. | P-4 in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`; PR-10 (deferred) |
+| X4 | High (perf) | **One global Paxos round per block, on every upload path.** The first-writer `INSERT ... IF NOT EXISTS` is a per-block LWT; under `SERIAL` and multi-DC it is a global consensus round, ~128 cross-region rounds per GB at the 8 MB block size. **Correction:** an earlier revision said the legacy resumable path "does not pay this at all". That is false — `finalizeUploadStreaming` splits the file into 8 MB blocks and calls `RegisterUploadedBlock` → `UpsertBlockMetadata` per block, so resumable pays the same ~128 LWTs. This is a **shared** cost of both upload paths, not a block-upload disadvantage, and removing it benefits both. Also two reads of the same `blocks` row per upload on `main` (`ProbeBlockReuse`, `BlockDeleteFenceActive`). **Pre-existing since `13e01263a` (2026-07-08)** — not introduced by this work. | P-4 in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`; PR-11 (deferred) |
+| X7 | Medium (perf) | **PR-2/PR-3 add a third unconditional read of the `blocks` row.** On `main` the stub-repair read (`GetBlockDeleteClaimInfo`) only fires when the delete fence is active. The reference branch calls `removeStaleUploadedBlockDeleteStub` on the unfenced path too, so every block upload pays an extra point read. Avoidable: `ProbeBlockReuse` already identifies a stub (it returns `NeedsPut` with an empty `StorageClass`), so the repair can be driven from that signal instead of a fresh read. Fix while implementing, do not ship the extra read. | reference branch `fs_helpers.go` `RegisterUploadedBlock`; PR-2/PR-3 |
 | X5 | Medium | **Canonical read fan-out unvalidated.** One Cassandra point read per unique block before the first byte. The existing benchmark substitutes an in-memory function for Cassandra, so it measures goroutines and allocations, not driver, pool, latency or cluster load. | `WEB-BLOCK-UPLOAD.md` pre-flag checklist |
 | X6 | Medium | **Read-after-write across DCs.** Canonical lookups retry a missing row 3×25 ms, which covers local lag but not cross-DC. Safe (fails closed) but an availability dependency: transient 404/503 after a remote upload, `check-blocks` reporting a block missing, needless re-uploads. | same as X2 |
 

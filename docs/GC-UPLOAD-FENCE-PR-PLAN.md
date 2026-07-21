@@ -1,13 +1,13 @@
 # Upload-Fence / Canonical-Storage Work — PR Split Plan
 
 **Date:** 2026-07-21
-**Reference branch:** `docs/gc-upload-fence-rematerialization` (15 commits) — **not for merge**
-**Status:** planning. No PR from this series is open yet.
+**Reference branch:** `docs/gc-upload-fence-rematerialization` (16 commits) — **not for merge**
+**Status:** PR-1 proposed; no code PRs open yet.
 
 ## Why this document exists
 
-The reference branch grew to ~45 files across GC, upload funnels, the canonical read
-path, streaming, the frontend and ten documents. It is correct as far as we can
+The reference branch grew to 63 files across GC, upload funnels, the canonical read
+path, streaming, the frontend and 16 documents. It is correct as far as we can
 verify locally (build, vet, unit tests, integration compile all pass) but it is too
 large to review honestly in one pass — eight successive audits each found real defects
 in it, which is itself the argument against merging it whole.
@@ -240,32 +240,45 @@ because it is lower risk, not because it is blocked.
 
 ---
 
-### PR-9 — Streaming leak fix and request hardening
+### PR-9 — Streaming leak fix
 
 **Scope:** `PrefetchBlock` / `StreamBlocks` context-aware delivery closing an
-abandoned reader, `QueryBlockSizes` partial-cache reuse, body-size limits on
-`PutBlock` and `check-blocks`, and the check-blocks id cap.
-
-**Independent.** Bundled at the end because it is the least entangled; split further
-if review prefers (the leak fix and the DoS limits are unrelated to each other).
+abandoned reader, and `QueryBlockSizes` partial-cache reuse.
 
 **Must run `go test -race` in Docker** — this is the PR that changes goroutine and
 channel semantics.
 
 ---
 
-### PR-10 (deferred) — Remove the per-block Paxos
+### PR-10 — HTTP request hardening
+
+**Scope:** body-size limits on `PutBlock` and `check-blocks`, and the check-blocks id
+cap.
+
+**Split from PR-9** because nothing forces them to ship together: a reader leak and a
+DoS bound share no code and no deploy dependency. Rule 1 applies to this series too.
+
+---
+
+### PR-11 (deferred) — Remove the per-block Paxos
 
 **Scope:** make `storage_class` deterministic per `(org_id, block_id)` so the
-first-writer `INSERT ... IF NOT EXISTS` can be dropped, and collapse the three reads
-of the same `blocks` row per upload.
+first-writer `INSERT ... IF NOT EXISTS` can be dropped, and collapse the repeated
+reads of the same `blocks` row per upload.
 
 **Deliberately last, and deliberately not designed yet.** This is the item most
 likely to be superseded by a better idea, and it is the one with real performance
 stakes: under `SERIAL` and a multi-DC posture the current LWT is one *global*
-consensus round per block, ~128 cross-region rounds per GB at the 8 MB CAS size,
-which the legacy resumable path does not pay. It is **pre-existing on `main`**
-(`13e01263a`, 2026-07-08), not introduced by this series.
+consensus round per block, ~128 cross-region rounds per GB at the 8 MB block size.
+It is **pre-existing on `main`** (`13e01263a`, 2026-07-08), not introduced by this
+series.
+
+**Correction worth carrying:** an earlier revision of this plan said the legacy
+resumable path "does not pay" this. That is false. `finalizeUploadStreaming` splits a
+resumable upload into 8 MB blocks and calls `RegisterUploadedBlock` per block, so it
+pays the same ~128 LWTs per GB. The cost is **shared by both upload paths**, which
+makes this a general optimization rather than something block upload has to fix to
+justify itself — and it means the win, if taken, applies to every upload surface.
 
 **Do not start this before measuring.** There is no per-statement latency metric for
 that INSERT yet; add it, get the production number, then decide. Full analysis: P-4
