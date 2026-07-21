@@ -155,6 +155,135 @@ external.
 
 ---
 
+## P-4 — One global Paxos round per block on metadata-registering upload paths (2026-07-21)
+
+**Severity: HIGH for general upload performance** (both governed upload modes, not block upload specifically)
+**Branch: pending — `perf/deterministic-block-storage-class`**
+**Pre-existing: yes.** This is **not** introduced by the upload-fence work. The
+first-writer LWT is on `main` and dates to `e3883aa5d` (2026-05-28); the code
+comment calls it *"the one LWT this path has always taken"*. Commit `13e01263a`
+later made that write representation-aware but did not introduce the LWT. Verified
+from Git history and `main:internal/db/block_references.go`. Recording it here
+because it was found while auditing that branch and would otherwise be lost.
+
+### The Paxos
+
+Every upload path that registers canonical block metadata — web session, seafhttp,
+sync `PutBlock`, OnlyOffice — ends in `UpsertBlockMetadata`, which is an
+`INSERT INTO blocks ... IF NOT EXISTS`
+([block_references.go:131](../internal/db/block_references.go#L131)): **one
+lightweight transaction per block**. The defective no-session legacy path tracked
+as F8 is the exception: it writes only the S3 object and never reaches metadata
+registration.
+
+It is load-bearing, not incidental. `storage_class`/`storage_key` are not globally
+fixed per block — uploads pick a class per library and per routing region — so
+first-writer-wins pins one canonical physical location. Without it a
+last-writer-wins INSERT could repoint metadata at a class holding no copy, which
+breaks reads and makes GC act on the wrong object.
+
+**Why it costs more than it looks.** `configs/config.prod.yaml` commits
+`serial_consistency: SERIAL`, and the documented production posture is multi-DC
+(`dc-na:1,dc-eu:1,dc-asia:1`). That makes each of these a **global** Paxos round,
+not a DC-local one. At the default 8 MB CAS block size a 1 GB file is ~128
+cross-region consensus rounds. They parallelize with client upload concurrency.
+
+**Correction (2026-07-21): this is NOT specific to block upload.** An earlier
+revision of this section said "the legacy resumable path pays none of them". That is
+false. `finalizeUploadStreaming` splits a resumable upload into `uploadBlockSize`
+(8 MB) blocks and calls `registerUploadedBlockAndMappingForUploadFn` →
+`RegisterUploadedBlock` → `UpsertBlockMetadata` for each one, so a 1 GB resumable
+upload pays the same ~128 LWTs. Both governed upload modes carry the identical cost;
+F8's no-session branch remains the exception because it skips registration entirely.
+
+That changes what this finding means. It is **not** a reason block upload might lose
+to resumable — neither is cheaper. It is a general per-block cost on every upload
+surface that registers metadata, and removing it improves all of them at once, which
+strengthens rather than weakens the case for doing it. F8 remains outside that set
+until its missing governance is fixed.
+
+The LWT is scoped to the `(org_id, block_id)` partition, so writers of *different*
+blocks never contend. The cost is latency per block, not lock contention.
+
+### The two fence observations (not redundant reads)
+
+Independently of Paxos, a single new-block upload reads the **same `blocks` row
+twice** on `main`:
+
+1. `ProbeBlockReuse` → `probeBlockReuseMetadataFn`
+2. `BlockDeleteFenceActive` → `BlockGCState`
+
+`gc_s3_orphans` is likewise read twice (probe and fence). Rough per-block cost for
+a brand-new block in the web session flow: ~7–8 Cassandra reads/writes, one
+`LoggedBatch` (provisional ref + expiry + by-day projection), and one LWT.
+
+**These two reads are not redundant** — see fix 2 below. They observe different
+moments, and the second one is what authorizes publication. Only the *third* read
+that the fence work would add is genuinely removable.
+
+**A third read is a cost the fence work would add, not one that exists today.** On
+`main`, `GetBlockDeleteClaimInfo` (the stub-repair read) only runs when the delete
+fence is active. The research prototype calls `removeStaleUploadedBlockDeleteStub` on
+the unfenced path too, making it unconditional. That is avoidable and should not
+ship as-is. Note the obvious shortcut does **not** work: `ProbeBlockReuse` returns
+`NeedsPut` with an empty `StorageClass` both for a genuinely missing row and for a
+stub, and `BlockReuseProbe` carries no `Found`, `IsStub` or claim id to separate
+them, so keying a conditional delete off that signal would fire an LWT on every
+brand-new block — trading a read for a Paxos round, which is worse. The state has to
+become explicit in the probe (a distinct decision, or the claim metadata it already
+read). Tracked as X7 in the findings registry.
+
+### Proposed fixes
+
+1. **Remove the Paxos: make `storage_class` deterministic per `(org_id, block_id)`.**
+   Derive it from a stable routing function instead of the serving node's preferred
+   backend. If every writer computes the same value, there is nothing to serialize:
+   a plain last-writer-wins INSERT always writes the same class/key and the LWT can
+   be dropped outright. This is a design change (routing must become a pure function
+   of org+block, and existing rows must keep resolving), not a mechanical edit.
+2. ~~**Collapse the two `blocks` reads into one** request-scoped fetch shared by the
+   probe and the fence check.~~ **Withdrawn — this would reintroduce F1.** The two
+   reads are not duplicated work; they are two points in time, and the second one is
+   load-bearing:
+
+   ```
+   ProbeBlockReuse        read #1  — before the PUT, decides whether to store
+   ...PUT...
+   AddBlockReference      write    — publish our flag
+   BlockDeleteFenceActive read #2  — AFTER the reference, decides whether to publish
+   UpsertBlockMetadata    write
+   ```
+
+   The ordering is the whole mutual-exclusion protocol: the writer publishes its
+   reference *before* reading the fence, so either GC's post-claim recheck sees the
+   reference and abandons, or the writer sees the fence and retries. Serving read #2
+   from a cached pre-PUT observation breaks that. GC could claim, recheck, find no
+   reference, and authorize its delete in the window between the two, while the
+   writer replays a stale "no fence" and publishes metadata for a block that is about
+   to be deleted — exactly F1 again.
+
+   Query-level work is still fair game (fewer columns, a single statement covering
+   `blocks` and `gc_s3_orphans` for the *same* observation point). What must not
+   change is that the fence observation used to authorize publication is **fresh and
+   taken after the provisional reference is durable**. Treat the third read that the
+   fence work would add separately — see X7; it needs an explicit stub state in the
+   probe, and it is genuinely avoidable in a way these two are not.
+3. **Measure before choosing.** Instrument the latency of that specific INSERT so the
+   real production number replaces this estimate. `block_upload_materialization_retries_total`
+   already exists; per-statement latency does not.
+
+Do **not** attempt to fix production by switching the statement to `LOCAL_SERIAL`: with
+per-DC first writers that lets two DCs each "win" locally and diverge on placement,
+which is the exact corruption the LWT exists to prevent.
+
+The dedicated `config-usa.cluster.yaml` and `config-eu.cluster.yaml` profiles do use
+`LOCAL_SERIAL`, but they are test/development harnesses rather than production
+configuration. Their inline "multi-DC standard" wording describes that harness, not
+the production safety contract. Consequently, the harness does not reproduce
+production cross-DC `SERIAL` and cannot validate this part of P-4.
+
+---
+
 ## S-1 — Chunk state is node-local (multi-node blocker)
 
 **Severity: HIGH for multi-node topologies**
@@ -248,6 +377,7 @@ file-sharing protocols.
 | P-1 | Permit serialized S3 PUT                       | ✅ Confirmed   | CRITICAL   | **RESOLVED** |
 | P-2 | Double S3 RTT per block (Exists + PUT)         | ✅ Confirmed   | HIGH→MEDIUM| **RESOLVED** |
 | P-3 | Benchmarks 44–48 MB/s, no scaling              | ❓ Plausible   | —          | External     |
+| P-4 | 1 global Paxos/block on both governed upload modes; F8 no-session is the exception. (The 2 `blocks` reads are two required observation points, **not** part of the optimization.) | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
 | S-1 | Chunk state node-local (multi-node blocker)    | ✅ Confirmed   | HIGH       | Pending      |
 | S-2 | max_upload_mb not enforced on chunked uploads  | ✅ Fixed       | MEDIUM     | Complete     |
 | S-3 | Full /tmp staging, no disk admission limit     | ✅ Mitigated   | MEDIUM     | Guard added; config still required |
@@ -267,3 +397,4 @@ without a database connection.
 | 3 | S-1 | Sticky sessions at LB (immediate) or distributed chunk state (complete) | Required for multi-node topology |
 | 4 | S-2/S-3 | Roll out a real `chunked_staging_max_bytes` value per node | Operational hardening follow-through |
 | 5 | S-4 | Atomic quota reservation at upload start | Closes the concurrent over-quota window |
+| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT. **Preserve the fresh post-reference fence read** — do not merge it with the pre-PUT probe. | Removes one global Paxos round per block. Both governed upload modes pay it equally, so the win applies to every metadata-registering upload surface; F8's defective no-session path is the exception. Measure first. |
