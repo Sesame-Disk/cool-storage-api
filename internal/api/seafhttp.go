@@ -2251,21 +2251,24 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
-// errFilePathAbsent means the path read as absent: the coordinator returned
-// ErrNotFound, or a fully well-formed directory listing had no such entry. It is
-// the only download failure that may be reported to the client as 404.
+// errFilePathAbsent means the path is genuinely gone, and is the only download
+// failure that may be reported to the client as 404. It has exactly one source:
+// a directory that was read, fully validated, and does not list the entry.
 //
-// Every other failure — Cassandra unavailable, read timeout, structurally corrupt
-// directory entries, block store unresolvable, canonical metadata not visible yet,
-// or an encrypted library with no unlock session — leaves it unknown whether the
-// file exists, so it surfaces as 503. Reporting "unknown" as "not found" would tell
-// a client to stop retrying a file that is still there.
+// A bare ErrNotFound is NOT a source. Every other lookup on this path reads a row
+// something else already pointed at — the head commit, the commit's root fs_object,
+// the fs_object a dirent names — so a missing one is dangling metadata, not proof
+// the path is gone. Those, and every hard failure (Cassandra unavailable, read
+// timeout, corrupt directory entries, block store unresolvable, canonical metadata
+// not visible yet, encrypted library with no unlock session), surface as 503.
+// Reporting "unknown" as "not found" would tell a client to stop retrying a file
+// that is still there.
 //
-// KNOWN LIMIT (X6 in UPLOAD-FENCE-FINDINGS-REGISTRY.md): ErrNotFound proves absence
-// only within the replicas the read touched. Under LOCAL_QUORUM with RF 1 per DC a
-// row written in another DC can be temporarily invisible here, so this can be a
-// transient 404 shortly after a remote upload. That is an availability gap, not a
-// correctness one — no wrong bytes are served — and closing it needs the same
+// KNOWN LIMIT (X6 in UPLOAD-FENCE-FINDINGS-REGISTRY.md): even the directory read
+// only reflects the replicas it touched. Under LOCAL_QUORUM with RF 1 per DC a
+// directory updated in another DC can be temporarily stale here, so this can still
+// be a transient 404 shortly after a remote upload. That is an availability gap,
+// not a correctness one — no wrong bytes are served — and closing it needs the same
 // cross-DC consistency decision as the GC liveness read.
 var errFilePathAbsent = errors.New("file path is absent")
 

@@ -1,7 +1,7 @@
 # Upload-Fence / Canonical-Storage Work — PR Split Plan
 
 **Date:** 2026-07-21
-**Reference branch:** `docs/gc-upload-fence-rematerialization` (12 commits) — **not for merge**
+**Reference branch:** `docs/gc-upload-fence-rematerialization` (15 commits) — **not for merge**
 **Status:** planning. No PR from this series is open yet.
 
 ## Why this document exists
@@ -9,7 +9,7 @@
 The reference branch grew to ~45 files across GC, upload funnels, the canonical read
 path, streaming, the frontend and ten documents. It is correct as far as we can
 verify locally (build, vet, unit tests, integration compile all pass) but it is too
-large to review honestly in one pass — six successive audits each found real defects
+large to review honestly in one pass — eight successive audits each found real defects
 in it, which is itself the argument against merging it whole.
 
 So it stays as a **reference target**: the shape the code should end up in. We land
@@ -44,8 +44,8 @@ closed while the code still has it.
 
 So PR-1 lands the **findings and this plan** — content that is true on `main` today,
 because it describes problems and intent, not resolutions. Each later PR carries the
-doc edits that its own code makes true. The registry from PR-1 gets its status column
-updated by the PR that closes each row.
+doc edits that its own code makes true. The registry's **Closed by** column names the
+PR that owns each row; the PR that lands moves its rows out of the open table.
 
 ---
 
@@ -175,19 +175,38 @@ post-claim liveness read) fails before this PR and passes after.
 
 ### PR-6 — Download fail-closed and removal of the path-based fallback
 
-**Scope:** `seafhttp.go` `HandleDownload` and `lookupFileBlocks` — absence proven by
-Cassandra (or a readable directory with no such entry) is 404; everything else is
-503; the legacy `<org>/<repo><path>` fallback and `resolveLibraryObjectStore` are
-removed. Includes the 404/503 classification fix and the `errFilePathAbsent` /
-`classifyPathAbsence` naming.
+**Scope:** `seafhttp.go` `HandleDownload`, `lookupFileBlocks` and `findEntryInDir`.
+The legacy `<org>/<repo><path>` fallback and `resolveLibraryObjectStore` are removed,
+and the 404/503 contract is:
+
+- **404 only** when a directory was read, fully validated, and does not list the
+  entry. That is the single signal that proves the file is gone.
+- **503 for everything else**, including a bare `gocql.ErrNotFound` on a referenced
+  row. A missing head commit, root fs_object, or the fs_object a dirent names is
+  dangling metadata — premature GC, a partial write, cross-DC lag — not proof the
+  path does not exist. An earlier draft of this plan said "absence proven by
+  Cassandra is 404"; that was wrong and would tell a client to stop retrying a file
+  that is still there.
+
+Directory listings must be validated before absence can be claimed: reject blank or
+JSON-null values, null entries, empty names, non-40-hex ids, duplicate names, and
+duplicate JSON keys within an entry (`encoding/json` keeps the last silently, which
+can serve the wrong FS object or hide a present file).
 
 **Precondition:** confirmed with the product owner that production starts from empty
 buckets, so no path-based object exists. **If that ever stops being true this PR must
 be revisited**, because it removes the only way to read such an object.
 
-**Acceptance:** discriminator tests both ways; encrypted-without-session never
-reaches a plaintext object; end-to-end download tests against real Cassandra
+**Acceptance:** classifier tests both ways, including that a referenced-row
+`ErrNotFound` does *not* become 404; the full corrupt-listing matrix routed through
+the parse-and-match path rather than the parser alone; encrypted-without-session
+never reaches a plaintext object; end-to-end download tests against real Cassandra
 (4 cases) — these belong in `internal/integration` and do not exist yet.
+
+**Suggested additional acceptance:** a property-based test over the parse-and-match
+helper asserting that absence is *never* reported except for a well-formed listing
+with no match. Three separate audit rounds each found a new corrupt-listing shape
+that hand-written cases had missed; generated input is the way to stop that.
 
 ---
 
@@ -272,7 +291,8 @@ These stay open and keep destructive GC disabled:
 ## Verification debt carried by the whole series
 
 - `go test -race` has never run: the dev box has no gcc. Must run in Docker before
-  any PR that touches concurrency merges (PR-3, PR-5, PR-9 at minimum).
+  any PR that touches concurrency merges: **PR-3, PR-4, PR-5 and PR-9**. PR-4 in
+  particular introduces the concurrent canonical reader and must not merge without it.
 - No end-to-end download tests against real Cassandra exist for the 404/503 contract.
 - No multi-DC test exercises any of the cross-DC reasoning; it is derived from the
   consistency contract and the committed configuration, not from a reproduction.

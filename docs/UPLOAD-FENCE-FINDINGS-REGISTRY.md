@@ -1,10 +1,10 @@
 # Upload-Fence Audit — Findings Registry
 
 **Date:** 2026-07-21
-**Origin:** five successive audits of the GC upload-fence work, 2026-07-20/21.
+**Origin:** eight successive audits of the GC upload-fence work, 2026-07-20/21.
 **Companion:** [GC-UPLOAD-FENCE-PR-PLAN.md](./GC-UPLOAD-FENCE-PR-PLAN.md) — which PR closes what.
 
-Every row is verified against code at the cited location. `Status` is the state on
+Every row is verified against code at the cited location. Severity and `Closed by` are the state on
 `main`, not on the reference branch: a row only moves to Closed when the PR that
 fixes it merges.
 
@@ -33,7 +33,7 @@ fixes it merges.
 | F10 | Medium | **Provisional reference and its expiry are written separately.** A failure between them leaves a reference with no discovery projection, so the zero-ref transition is never found. | `fs_helpers.go`; `provisional_block_ref_expiry.go` | PR-8 |
 | F11 | Medium | **Abandoned prefetch leaks an open S3 reader.** `PrefetchBlock` buffered its result, so a consumer that stopped early left the `io.ReadCloser` unclosed. | `streaming/streaming.go` | PR-9 |
 | F12 | Medium | **Unbounded request bodies.** `PutBlock` and `check-blocks` read the whole body with `io.ReadAll` and no size or id-count limit. | `sync.go` | PR-9 |
-| F13 | Low | **404/503 semantics inverted for a deleted path.** `findEntryInDir` returns a plain error, so a renamed or deleted file surfaces as 503 while an absent commit row gives 404. Related, and worse: a JSON-valid but corrupt listing resolves anyway. Structural cases (`null`, `[null]`, non-string name, missing id) parse and the bad entries are skipped, reporting a false absence; semantic cases (empty name, empty or non-40-hex id, duplicate names) resolve to a wrong or missing FS object; and `encoding/json` silently keeps the **last** value for a repeated key, so `{"id":"A","id":"B"}` serves B and `{"name":"a","name":"b"}` hides `a` entirely. Both of the last two can serve arbitrary bytes or report a present file as absent. | `seafhttp.go` `findEntryInDir` | PR-6 |
+| F13 | High | **Corrupt directory listings resolve, and 404/503 semantics are inverted for a deleted path.** Severity is High, not the Low it was first filed as: two of the cases below can serve bytes from the wrong FS object, which is the definition of High in this table. The 404/503 half on its own would be Low. `findEntryInDir` returns a plain error, so a renamed or deleted file surfaces as 503 while an absent commit row gives 404. Related, and worse: a JSON-valid but corrupt listing resolves anyway. Structural cases (`null`, `[null]`, non-string name, missing id) parse and the bad entries are skipped, reporting a false absence; semantic cases (empty name, empty or non-40-hex id, duplicate names) resolve to a wrong or missing FS object; and `encoding/json` silently keeps the **last** value for a repeated key, so `{"id":"A","id":"B"}` serves B and `{"name":"a","name":"b"}` hides `a` entirely. Both of the last two can serve arbitrary bytes or report a present file as absent. | `seafhttp.go` `findEntryInDir` | PR-6 |
 | F14 | Low | **Retry metric mislabels write failures.** The SeafHTTP wrapper defaults every non-fence retry to `reason="probe"`, attributing Cassandra write errors to the read path. | `seafhttp.go` retry wrapper | PR-3 |
 
 ## Open and out of scope for this series
@@ -139,7 +139,7 @@ Applies to every PR in the series, not to any single finding.
 
 ## Audit provenance
 
-Five successive reviews between 2026-07-20 and 2026-07-21. Each found real defects in
+Eight successive reviews between 2026-07-20 and 2026-07-21. Each found real defects in
 the previous round's fix, including two cases where the fix was correct but
 unreachable in the production flow and the tests could not detect it because they
 called the helper directly. That pattern is the reason this work is being split
