@@ -1,7 +1,7 @@
 # Upload-Fence / Canonical-Storage Work — PR Split Plan
 
 **Date:** 2026-07-21
-**Reference branch:** `docs/gc-upload-fence-rematerialization` (16 commits) — **not for merge**
+**Reference branch:** `docs/gc-upload-fence-rematerialization` — **not for merge**
 **Status:** PR-1 proposed; no code PRs open yet.
 
 ## Why this document exists

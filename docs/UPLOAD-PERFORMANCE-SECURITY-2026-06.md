@@ -203,7 +203,7 @@ weakens the case for doing it.
 The LWT is scoped to the `(org_id, block_id)` partition, so writers of *different*
 blocks never contend. The cost is latency per block, not lock contention.
 
-### The redundant reads
+### The two fence observations (not redundant reads)
 
 Independently of Paxos, a single new-block upload reads the **same `blocks` row
 twice** on `main`:
@@ -369,7 +369,7 @@ file-sharing protocols.
 | P-1 | Permit serialized S3 PUT                       | ✅ Confirmed   | CRITICAL   | **RESOLVED** |
 | P-2 | Double S3 RTT per block (Exists + PUT)         | ✅ Confirmed   | HIGH→MEDIUM| **RESOLVED** |
 | P-3 | Benchmarks 44–48 MB/s, no scaling              | ❓ Plausible   | —          | External     |
-| P-4 | 1 global Paxos/block on BOTH upload paths + 2 reads of same `blocks` row | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
+| P-4 | 1 global Paxos/block on BOTH upload paths. (The 2 `blocks` reads are two required observation points, **not** part of the optimization.) | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
 | S-1 | Chunk state node-local (multi-node blocker)    | ✅ Confirmed   | HIGH       | Pending      |
 | S-2 | max_upload_mb not enforced on chunked uploads  | ✅ Fixed       | MEDIUM     | Complete     |
 | S-3 | Full /tmp staging, no disk admission limit     | ✅ Mitigated   | MEDIUM     | Guard added; config still required |
@@ -389,4 +389,4 @@ without a database connection.
 | 3 | S-1 | Sticky sessions at LB (immediate) or distributed chunk state (complete) | Required for multi-node topology |
 | 4 | S-2/S-3 | Roll out a real `chunked_staging_max_bytes` value per node | Operational hardening follow-through |
 | 5 | S-4 | Atomic quota reservation at upload start | Closes the concurrent over-quota window |
-| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT; collapse the repeated `blocks` reads | Removes one global Paxos round per block. Both upload paths pay it equally, so the win applies to every upload surface. Measure first. |
+| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT. **Preserve the fresh post-reference fence read** — do not merge it with the pre-PUT probe. | Removes one global Paxos round per block. Both upload paths pay it equally, so the win applies to every upload surface. Measure first. |
