@@ -2252,15 +2252,22 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
-// errFilePathAbsent means the path is logically gone: Cassandra answered
-// definitively (a genuine ErrNotFound) or the directory listing simply has no such
-// entry. It is the only download failure that may be reported to the client as 404.
+// errFilePathAbsent means the path read as absent: the coordinator returned
+// ErrNotFound, or a fully well-formed directory listing had no such entry. It is
+// the only download failure that may be reported to the client as 404.
 //
-// Every other failure — Cassandra unavailable, read timeout, malformed directory
-// entries, block store unresolvable, canonical metadata not visible yet, or an
-// encrypted library with no unlock session — leaves it unknown whether the file
-// exists, so it surfaces as 503 rather than "file not found". Reporting "unknown"
-// as "not found" would tell a client to stop retrying a file that is still there.
+// Every other failure — Cassandra unavailable, read timeout, structurally corrupt
+// directory entries, block store unresolvable, canonical metadata not visible yet,
+// or an encrypted library with no unlock session — leaves it unknown whether the
+// file exists, so it surfaces as 503. Reporting "unknown" as "not found" would tell
+// a client to stop retrying a file that is still there.
+//
+// KNOWN LIMIT (X6 in UPLOAD-FENCE-FINDINGS-REGISTRY.md): ErrNotFound proves absence
+// only within the replicas the read touched. Under LOCAL_QUORUM with RF 1 per DC a
+// row written in another DC can be temporarily invisible here, so this can be a
+// transient 404 shortly after a remote upload. That is an availability gap, not a
+// correctness one — no wrong bytes are served — and closing it needs the same
+// cross-DC consistency decision as the GC liveness read.
 var errFilePathAbsent = errors.New("file path is absent")
 
 // errDirectoryEntryNotFound is the logical-absence signal from findEntryInDir: the
@@ -3588,12 +3595,13 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string,
 	return normalizeResolvedInternalBlockID(mappedID)
 }
 
-// classifyPathAbsence separates "the path is not there" from "we could not tell".
-// Only a definitive Cassandra ErrNotFound, or findEntryInDir reporting that a
-// successfully-read directory has no such entry, count as absence. A timeout, an
-// unavailable coordinator, malformed data or any other driver failure returns the
-// fail-closed sentinel, because "we could not read it" must never be reported to
-// the client as "file not found".
+// classifyPathAbsence separates "the path read as absent" from "we could not tell".
+// Only a Cassandra ErrNotFound, or findEntryInDir reporting that a fully validated
+// directory has no such entry, count as absence. A timeout, an unavailable
+// coordinator, corrupt data or any other driver failure returns the fail-closed
+// sentinel, because "we could not read it" must never be reported to the client as
+// "file not found". See errFilePathAbsent for the cross-DC limit on what ErrNotFound
+// actually proves.
 func classifyPathAbsence(err error) error {
 	if errors.Is(err, gocql.ErrNotFound) || errors.Is(err, errDirectoryEntryNotFound) {
 		return errFilePathAbsent
@@ -3807,6 +3815,55 @@ func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) 
 }
 
 // findEntryInDir finds an entry (file or directory) within a directory FS object
+// dirEntry is the strict shape of one `fs_objects.dir_entries` element. Pointer
+// fields distinguish "absent" from "empty string", which matters because an entry
+// with no name is corruption, not an entry named "".
+type dirEntry struct {
+	Name *string `json:"name"`
+	ID   *string `json:"id"`
+}
+
+// parseDirEntries decodes a directory listing and refuses anything it cannot fully
+// validate. A caller may only report an entry as absent after this succeeds; every
+// error here means "we could not determine what is in this directory", which must
+// fail closed rather than become a 404.
+func parseDirEntries(raw string) ([]struct {
+	Name string
+	ID   string
+}, error) {
+	var decoded []*dirEntry
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return nil, fmt.Errorf("%w: malformed directory entries: %v", errBlockBackedFileUnresolvable, err)
+	}
+	// `null` decodes into a nil slice without error. An empty listing is legitimate
+	// and reaches here as a non-nil zero-length slice, so nil specifically means the
+	// stored value was JSON null: corrupt, not empty.
+	if decoded == nil {
+		return nil, fmt.Errorf("%w: directory entries are JSON null", errBlockBackedFileUnresolvable)
+	}
+
+	parsed := make([]struct {
+		Name string
+		ID   string
+	}, 0, len(decoded))
+	for i, entry := range decoded {
+		if entry == nil {
+			return nil, fmt.Errorf("%w: directory entry %d is null", errBlockBackedFileUnresolvable, i)
+		}
+		if entry.Name == nil {
+			return nil, fmt.Errorf("%w: directory entry %d has no string name", errBlockBackedFileUnresolvable, i)
+		}
+		if entry.ID == nil {
+			return nil, fmt.Errorf("%w: directory entry %d (%q) has no string id", errBlockBackedFileUnresolvable, i, *entry.Name)
+		}
+		parsed = append(parsed, struct {
+			Name string
+			ID   string
+		}{Name: *entry.Name, ID: *entry.ID})
+	}
+	return parsed, nil
+}
+
 func (h *SeafHTTPHandler) findEntryInDir(repoID, dirFSID, entryName string) (string, error) {
 	var dirEntries string
 	err := h.db.Session().Query(`
@@ -3820,55 +3877,40 @@ func (h *SeafHTTPHandler) findEntryInDir(repoID, dirFSID, entryName string) (str
 	log.Printf("[findEntryInDir] Looking for entry '%s' in dir %s", entryName, dirFSID)
 	log.Printf("[findEntryInDir] Dir entries length: %d", len(dirEntries))
 
-	// Parse dir_entries as JSON array - proper JSON parsing instead of string matching
-	// This handles any JSON formatting (with or without spaces)
-	var entries []map[string]interface{}
+	// Reporting "this entry is absent" is what turns into a client-visible 404, so
+	// the listing has to be fully well-formed before we are entitled to say it.
+	// json.Unmarshal succeeding is not enough: `null`, `[null]`, an entry with a
+	// non-string name, or one missing its id are all valid JSON. Skipping those
+	// silently and then reporting absence would answer 404 for a file that may
+	// well exist behind a corrupt directory row. Decode strictly instead and treat
+	// any structural defect as unresolvable, which fails closed with 503.
 	if dirEntries == "" || dirEntries == "[]" {
 		log.Printf("[findEntryInDir] Directory is empty")
 		return "", fmt.Errorf("%w: %s", errDirectoryEntryNotFound, entryName)
 	}
 
-	if err := json.Unmarshal([]byte(dirEntries), &entries); err != nil {
-		log.Printf("[findEntryInDir] ERROR: Failed to parse dir_entries JSON: %v", err)
-		// Log a snippet for debugging
+	entries, err := parseDirEntries(dirEntries)
+	if err != nil {
+		log.Printf("[findEntryInDir] ERROR: %v", err)
 		if len(dirEntries) > 500 {
 			log.Printf("[findEntryInDir] Dir entries (first 500 chars): %s", dirEntries[:500])
 		} else {
 			log.Printf("[findEntryInDir] Dir entries: %s", dirEntries)
 		}
-		return "", fmt.Errorf("malformed directory entries: %w", err)
+		return "", err
 	}
 
 	log.Printf("[findEntryInDir] Parsed %d entries from directory", len(entries))
 
-	// Search for the entry by name
 	for _, entry := range entries {
-		name, ok := entry["name"].(string)
-		if !ok {
-			continue
-		}
-		if name == entryName {
-			id, ok := entry["id"].(string)
-			if !ok {
-				log.Printf("[findEntryInDir] ERROR: Entry found but ID is not a string: %v", entry["id"])
-				return "", fmt.Errorf("malformed entry ID for: %s", entryName)
-			}
-			log.Printf("[findEntryInDir] Found entry '%s' with ID: %s", entryName, id)
-			return id, nil
+		if entry.Name == entryName {
+			log.Printf("[findEntryInDir] Found entry '%s' with ID: %s", entryName, entry.ID)
+			return entry.ID, nil
 		}
 	}
 
-	// Entry not found - log available entries for debugging
-	log.Printf("[findEntryInDir] Entry '%s' not found in directory. Available entries:", entryName)
-	for i, entry := range entries {
-		if i < 10 { // Log first 10 entries
-			log.Printf("[findEntryInDir]   - %v", entry["name"])
-		}
-	}
-	if len(entries) > 10 {
-		log.Printf("[findEntryInDir]   ... and %d more entries", len(entries)-10)
-	}
-
+	// Every entry parsed cleanly and none matched: the file is genuinely gone.
+	log.Printf("[findEntryInDir] Entry '%s' not found among %d well-formed entries", entryName, len(entries))
 	return "", fmt.Errorf("%w: %s", errDirectoryEntryNotFound, entryName)
 }
 

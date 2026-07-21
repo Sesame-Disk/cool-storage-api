@@ -67,6 +67,51 @@ func TestLegacyFallbackOnlyOnDefinitiveAbsence(t *testing.T) {
 	}
 }
 
+// Reporting absence is what becomes a client-visible 404, so a directory listing
+// must be fully well-formed before we are entitled to say a file is not in it.
+// These payloads are all valid JSON: parsing alone does not prove the file is gone.
+// Exercises the real parser rather than constructing the sentinel by hand.
+func TestParseDirEntriesRejectsStructurallyCorruptListings(t *testing.T) {
+	corrupt := []struct {
+		name string
+		raw  string
+	}{
+		{"json null", `null`},
+		{"null element", `[null]`},
+		{"numeric name", `[{"name": 123, "id": "abc"}]`},
+		{"missing name", `[{"id": "abc"}]`},
+		{"missing id", `[{"name": "report.pdf"}]`},
+		{"numeric id", `[{"name": "report.pdf", "id": 7}]`},
+		{"corrupt entry after a valid one", `[{"name":"a","id":"1"},{"name":"b"}]`},
+	}
+	for _, tt := range corrupt {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseDirEntries(tt.raw)
+			if err == nil {
+				t.Fatalf("parseDirEntries(%s) error = nil, want structural rejection", tt.raw)
+			}
+			// Must fail closed (503), never be classified as logical absence (404).
+			if errors.Is(classifyPathAbsence(err), errFilePathAbsent) {
+				t.Fatalf("corrupt listing %s was classified as absence", tt.raw)
+			}
+		})
+	}
+}
+
+func TestParseDirEntriesAcceptsWellFormedListings(t *testing.T) {
+	entries, err := parseDirEntries(`[{"name":"a.txt","id":"1"},{"name":"","id":"2"}]`)
+	if err != nil {
+		t.Fatalf("parseDirEntries() error = %v, want nil", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("len(entries) = %d, want 2", len(entries))
+	}
+	// An entry legitimately named "" is data, not corruption: only a MISSING name is.
+	if entries[0].Name != "a.txt" || entries[0].ID != "1" || entries[1].Name != "" || entries[1].ID != "2" {
+		t.Fatalf("entries = %#v", entries)
+	}
+}
+
 // An encrypted library with no unlock session must never reach the path-based
 // fallback: that object is plaintext.
 func TestEncryptedWithoutSessionIsNotLegacyFallback(t *testing.T) {

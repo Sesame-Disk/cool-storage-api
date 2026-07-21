@@ -1,7 +1,7 @@
 # Upload-Fence / Canonical-Storage Work — PR Split Plan
 
 **Date:** 2026-07-21
-**Reference branch:** `docs/gc-upload-fence-rematerialization` (11 commits) — **not for merge**
+**Reference branch:** `docs/gc-upload-fence-rematerialization` (12 commits) — **not for merge**
 **Status:** planning. No PR from this series is open yet.
 
 ## Why this document exists
@@ -9,7 +9,7 @@
 The reference branch grew to ~45 files across GC, upload funnels, the canonical read
 path, streaming, the frontend and ten documents. It is correct as far as we can
 verify locally (build, vet, unit tests, integration compile all pass) but it is too
-large to review honestly in one pass — four successive audits each found real defects
+large to review honestly in one pass — six successive audits each found real defects
 in it, which is itself the argument against merging it whole.
 
 So it stays as a **reference target**: the shape the code should end up in. We land
@@ -91,62 +91,71 @@ and their metric labels; `internal/metrics/metrics.go`;
 `internal/api/v2/fs_helpers.go` (`RegisterUploadedBlock` stops waiting on the fence,
 tags transient Cassandra I/O, leaves permanent failures untagged).
 
-**Note:** this PR introduces the contract but wires **no** funnel. It is behaviour-
-neutral until PR-4.
+**⚠ This PR is NOT behaviour-neutral.** An earlier draft of this plan claimed it was,
+on the assumption that no funnel was wired yet. That is wrong: `main` already wraps
+six funnels in a store→materialize retry (SeafHTTP simple and streaming, sync
+`PutBlock`, V2 `UploadFile`, template `CreateFile`, OnlyOffice). The moment
+`RegisterUploadedBlock` stops waiting internally and propagates the fence, all six
+begin repeating store→materialize in production. Review and test it as a live
+behaviour change, not as dormant plumbing.
 
 **Acceptance:** the sentinel is produced by the production helper, not only injected
 in tests; a permanent metadata failure is not retried; retry reasons are
-`gc_fence` / `probe` / `materialization` and never mislabel a write as a read.
+`gc_fence` / `probe` / `materialization` and never mislabel a write as a read; and
+the six already-wired funnels are exercised under a fence to confirm the new repeat
+behaviour is what we want.
 
 ---
 
-### PR-4 — Wire the upload funnels
+### PR-4 — Cover the remaining funnel and normalise the wrappers
 
-**Scope:** `seafhttp.go` (simple + streaming), `sync.go` `PutBlock`, `files.go`
-`UploadFile` + template, `onlyoffice.go`, and the web block-session path in
-`v2/blocks.go`. Traffic accounting and the staged-block reservation hoisted so a
-retry cannot double-charge or double-reserve. Frontend: treat the new
-`409 block_delete_in_progress` as a soft retry honouring `Retry-After`.
+**Scope:** the web block-session path in `v2/blocks.go`, which is the one funnel with
+no probe and no retry wrapper at all. Traffic accounting and the staged-block
+reservation hoisted so a retry cannot double-charge or double-reserve. Normalise the
+SeafHTTP wrapper's retry-reason labels against the generic one. Frontend: treat the
+new `409 block_delete_in_progress` as a soft retry honouring `Retry-After`.
 
-**Why the frontend rides along:** this PR is what makes the 409 reachable. Splitting
-them would ship a user-visible upload failure for one release.
+**Not** "the moment everything gets connected" — PR-3 already did that for six
+funnels. This closes the seventh and makes the wrappers consistent.
+
+**Why the frontend rides along:** this PR is what makes the 409 reachable from the
+web client. Splitting them would ship a user-visible upload failure for one release.
 
 **Acceptance:** the deterministic fast-clear regression (real GC worker paused at its
 post-claim liveness read) fails before this PR and passes after.
 
 ---
 
-### PR-5 — Canonical placement for `NeedsPut`
+### PR-5 — Canonical placement and canonical reads (single PR)
 
 **Scope:** existing-metadata `NeedsPut` stores through `probe.StorageClass` and the
-canonical key instead of the serving node's preferred backend.
-
-**Depends on PR-4.** Kept separate because it changes *where bytes land*, which is
-the single most consequential behaviour change in the series and deserves its own
-review and its own revert.
-
-**Acceptance:** the two-bucket MinIO integration test proving the object lands in the
-canonical bucket and not the preferred one.
-
----
-
-### PR-6 — Canonical read path
-
-**Scope:** `internal/streaming/canonical_block_reader.go`,
-`internal/db/block_storage_location.go`, and the read call sites (`fileview.go`,
+canonical key instead of the serving node's preferred backend, **together with**
+`internal/streaming/canonical_block_reader.go`,
+`internal/db/block_storage_location.go` and the read call sites (`fileview.go`,
 `sharelink_view.go`, `sync.go`, `seafhttp.go`, `v2/blocks.go` check).
 
-**Must not land before PR-5** in the reverse sense either: once bytes can follow
-metadata, readers that resolve by routing would look in the wrong bucket. Ship PR-5
-and PR-6 in the same release even if reviewed separately.
+**Why these are one PR and not two.** An earlier draft split them and papered over
+the gap with "ship in the same release", which contradicts rule 1 of this plan. They
+are not independently safe in either direction:
 
-**Acceptance:** exact-class routing, derived-key validation, cross-org key rejection,
-and the bounded deduplicated lookup are covered; resolution fails before any response
-header is committed.
+- writer first → metadata points at bucket A, the writer repairs into A, an old
+  reader still resolves by routing to B, and the block reads as missing;
+- reverting the reader after both landed reintroduces exactly the same break.
+
+The honest options were to merge them or to introduce a transitional reader that
+accepts both resolutions, flip the writer, then retire the compatibility. The
+transitional reader is more moving parts for a system with no production data yet,
+so: one PR. It is the largest in the series and should be reviewed as the one that
+changes where bytes live.
+
+**Acceptance:** the two-bucket MinIO integration test proving the object lands in the
+canonical bucket and not the preferred one; exact-class routing, derived-key
+validation, cross-org key rejection and the bounded deduplicated lookup all covered;
+resolution fails before any response header is committed.
 
 ---
 
-### PR-7 — Download fail-closed and removal of the path-based fallback
+### PR-6 — Download fail-closed and removal of the path-based fallback
 
 **Scope:** `seafhttp.go` `HandleDownload` and `lookupFileBlocks` — absence proven by
 Cassandra (or a readable directory with no such entry) is 404; everything else is
@@ -164,7 +173,7 @@ reaches a plaintext object; end-to-end download tests against real Cassandra
 
 ---
 
-### PR-8 — Legacy no-session upload governance
+### PR-7 — Legacy no-session upload governance
 
 **Scope:** `v2/blocks.go` legacy path writes canonical metadata plus a deterministic
 provisional pin; integration teardown extended to the `blocks` row, the provisional
@@ -182,7 +191,7 @@ regress.
 
 ---
 
-### PR-9 — GC scanner Phase 0 and provisional-ref durability
+### PR-8 — GC scanner Phase 0 and provisional-ref durability
 
 **Scope:** `internal/gc/scanner.go` (Phase 0 defers to the Cassandra TTL instead of
 deleting a possibly-renewed reference), `internal/db/provisional_block_ref_expiry.go`
@@ -194,7 +203,7 @@ because it is lower risk, not because it is blocked.
 
 ---
 
-### PR-10 — Streaming leak fix and request hardening
+### PR-9 — Streaming leak fix and request hardening
 
 **Scope:** `PrefetchBlock` / `StreamBlocks` context-aware delivery closing an
 abandoned reader, `QueryBlockSizes` partial-cache reuse, body-size limits on
@@ -208,7 +217,7 @@ channel semantics.
 
 ---
 
-### PR-11 (deferred) — Remove the per-block Paxos
+### PR-10 (deferred) — Remove the per-block Paxos
 
 **Scope:** make `storage_class` deterministic per `(org_id, block_id)` so the
 first-writer `INSERT ... IF NOT EXISTS` can be dropped, and collapse the three reads
@@ -245,7 +254,7 @@ These stay open and keep destructive GC disabled:
 ## Verification debt carried by the whole series
 
 - `go test -race` has never run: the dev box has no gcc. Must run in Docker before
-  any PR that touches concurrency merges (PR-4, PR-6, PR-10 at minimum).
+  any PR that touches concurrency merges (PR-3, PR-5, PR-9 at minimum).
 - No end-to-end download tests against real Cassandra exist for the 404/503 contract.
 - No multi-DC test exercises any of the cross-DC reasoning; it is derived from the
   consistency contract and the committed configuration, not from a reproduction.
