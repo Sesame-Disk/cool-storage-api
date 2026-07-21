@@ -25,10 +25,51 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/time/rate"
 )
+
+// HandleDownload may only serve the path-based object when Cassandra proved the
+// path has no block metadata. Everything else must fail closed, because on a
+// brownfield library that object can hold a stale pre-block version of the same
+// file and answering 200 with it is silent data corruption from the client's view.
+func TestLegacyFallbackOnlyOnDefinitiveAbsence(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantLegacy bool
+	}{
+		{"row genuinely absent", gocql.ErrNotFound, true},
+		{"wrapped absence", fmt.Errorf("file metadata not found: %w", gocql.ErrNotFound), true},
+		{"read timeout", errors.New("gocql: no response received from cassandra within timeout period"), false},
+		{"coordinator unavailable", errors.New("gocql: unavailable"), false},
+		{"unknown failure", errors.New("boom"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := legacyFallbackIfDefinitelyAbsent(tt.err)
+			if errors.Is(got, errLegacyPathBackedFile) != tt.wantLegacy {
+				t.Fatalf("legacyFallbackIfDefinitelyAbsent(%v) = %v, wantLegacy=%v", tt.err, got, tt.wantLegacy)
+			}
+			// The two sentinels must stay mutually exclusive: HandleDownload keys the
+			// whole decision off errLegacyPathBackedFile being absent.
+			if !tt.wantLegacy && !errors.Is(got, errBlockBackedFileUnresolvable) {
+				t.Fatalf("non-absence error %v did not map to the fail-closed sentinel", tt.err)
+			}
+		})
+	}
+}
+
+// An encrypted library with no unlock session must never reach the path-based
+// fallback: that object is plaintext.
+func TestEncryptedWithoutSessionIsNotLegacyFallback(t *testing.T) {
+	err := fmt.Errorf("%w: library is encrypted but not unlocked", errBlockBackedFileUnresolvable)
+	if errors.Is(err, errLegacyPathBackedFile) {
+		t.Fatal("encrypted-without-session must not permit the legacy fallback")
+	}
+}
 
 func TestResponseBodyBytesStartsAtZero(t *testing.T) {
 	w := httptest.NewRecorder()

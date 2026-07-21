@@ -34,6 +34,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
@@ -2264,10 +2265,22 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
+// errLegacyPathBackedFile marks the ONLY condition under which HandleDownload may
+// serve the path-based object: Cassandra answered definitively that this path has
+// no block metadata (a genuine ErrNotFound, not a timeout or a partial read).
+//
+// The fallback is opt-in on purpose. Every other failure — Cassandra unavailable,
+// head/commit read error, directory walk error, block store unresolvable, canonical
+// metadata not visible yet, or an encrypted library with no unlock session — leaves
+// it unknown whether the file is block-backed. On a brownfield library the
+// path-based object can still hold a stale pre-block version of the same path, so
+// treating "unknown" as "legacy" would answer 200 with older content. Those all
+// fail closed instead.
+var errLegacyPathBackedFile = errors.New("file has no block metadata (legacy path-backed)")
+
 // errBlockBackedFileUnresolvable marks a download failure that happened AFTER the
-// file was proven to have block metadata. HandleDownload must fail closed on it
-// rather than falling back to the path-based object, which on a brownfield
-// library can still hold a stale pre-block version of the same path.
+// file was proven to have block metadata. Kept distinct from the generic
+// fail-closed path so logs and tests can tell the two apart.
 var errBlockBackedFileUnresolvable = errors.New("block-backed file could not be resolved")
 
 var rollbackUploadedBlockRefsFn = v2.RollbackUploadedBlockRefs
@@ -2402,9 +2415,15 @@ func retrySeafHTTPBlockMaterializationWithContext(ctx context.Context, label, bl
 	}
 
 	retryBlocked := func(attempt int, retryErr error) error {
+		// Keep these labels in sync with v2.retryUploadedBlockMaterialization: a
+		// transient materialization failure must not be reported as a probe failure,
+		// or the metric attributes Cassandra write errors to the read path.
 		reason := "probe"
-		if errors.Is(retryErr, v2.ErrBlockDeleteInProgress) {
+		switch {
+		case errors.Is(retryErr, v2.ErrBlockDeleteInProgress):
 			reason = "gc_fence"
+		case errors.Is(retryErr, v2.ErrBlockMaterializationTransient):
+			reason = "materialization"
 		}
 		metrics.BlockUploadMaterializationRetriesTotal.WithLabelValues(label, reason).Inc()
 		if reason == "gc_fence" && resolveFence != nil {
@@ -3536,15 +3555,15 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 			return
 		}
 		log.Printf("[HandleDownload] Block-based streaming FAILED: %v", err)
-		// Fall back to the path-based object ONLY when the file was never proven
-		// block-backed. Once lookupFileBlocks has found its fs_object and block
-		// ids, a later resolution failure (Cassandra unavailable, metadata not yet
-		// visible, invalid storage class) must NOT serve the legacy object: on a
-		// brownfield library that object can still hold a stale pre-block version
-		// of the same path, so falling back would answer 200 with older content.
-		// Fail closed instead.
-		if errors.Is(err, errBlockBackedFileUnresolvable) {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block metadata temporarily unavailable"})
+		// The path-based fallback is OPT-IN: it runs only when Cassandra proved this
+		// path has no block metadata. Anything else — unavailable coordinator, read
+		// timeout, unresolvable block store, canonical metadata not visible yet, or
+		// an encrypted library with no unlock session — leaves it unknown whether the
+		// file is block-backed, and on a brownfield library the path-based object can
+		// still hold a stale pre-block version of the same path. Serving it would
+		// answer 200 with older content, so those fail closed.
+		if !errors.Is(err, errLegacyPathBackedFile) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "file metadata temporarily unavailable"})
 			return
 		}
 	} else {
@@ -3616,6 +3635,19 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string,
 	return normalizeResolvedInternalBlockID(mappedID)
 }
 
+// legacyFallbackIfDefinitelyAbsent returns errLegacyPathBackedFile only when
+// Cassandra answered definitively that the row does not exist. A timeout, an
+// unavailable coordinator or any other driver failure returns the fail-closed
+// sentinel instead, because "we could not read it" must never be mistaken for
+// "it is not there" — that is what would let a stale path-based object be served
+// in place of a newer block-backed version.
+func legacyFallbackIfDefinitelyAbsent(err error) error {
+	if errors.Is(err, gocql.ErrNotFound) {
+		return errLegacyPathBackedFile
+	}
+	return errBlockBackedFileUnresolvable
+}
+
 // lookupFileBlocks resolves a token's path to its block IDs, file size, encryption key, and block store.
 // This is the common metadata lookup used by both download and streaming paths.
 func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, fileIV []byte, blockStore *storage.BlockStore, fallbackClass string, err error) {
@@ -3625,13 +3657,15 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).Scan(&encrypted)
 	if err != nil {
-		return nil, 0, nil, nil, nil, "", fmt.Errorf("failed to check library encryption: %w", err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: failed to check library encryption: %w", errBlockBackedFileUnresolvable, err)
 	}
 
 	if encrypted {
 		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
-			return nil, 0, nil, nil, nil, "", fmt.Errorf("library is encrypted but not unlocked")
+			// Never fall back here: an encrypted library must not serve a plaintext
+			// path-based object just because this request has no unlock session.
+			return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: library is encrypted but not unlocked", errBlockBackedFileUnresolvable)
 		}
 	}
 
@@ -3641,7 +3675,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).Scan(&headCommit)
 	if err != nil {
-		return nil, 0, nil, nil, nil, "", fmt.Errorf("library not found: %w", err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: library not found: %w", legacyFallbackIfDefinitelyAbsent(err), err)
 	}
 
 	var rootFSID string
@@ -3649,7 +3683,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
 	`, token.RepoID, headCommit).Scan(&rootFSID)
 	if err != nil {
-		return nil, 0, nil, nil, nil, "", fmt.Errorf("commit not found: %w", err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: commit not found: %w", legacyFallbackIfDefinitelyAbsent(err), err)
 	}
 
 	// Navigate directory tree to the target file
@@ -3666,7 +3700,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	for i := 0; i < len(pathParts)-1; i++ {
 		nextFSID, err := h.findEntryInDir(token.RepoID, currentFSID, pathParts[i])
 		if err != nil {
-			return nil, 0, nil, nil, nil, "", fmt.Errorf("directory not found: %s: %w", pathParts[i], err)
+			return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: directory not found: %s: %w", legacyFallbackIfDefinitelyAbsent(err), pathParts[i], err)
 		}
 		currentFSID = nextFSID
 	}
@@ -3674,7 +3708,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	targetName := pathParts[len(pathParts)-1]
 	fileFSID, err := h.findEntryInDir(token.RepoID, currentFSID, targetName)
 	if err != nil {
-		return nil, 0, nil, nil, nil, "", fmt.Errorf("file not found: %s: %w", targetName, err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: file not found: %s: %w", legacyFallbackIfDefinitelyAbsent(err), targetName, err)
 	}
 
 	// Get block IDs and file size from fs_object
@@ -3682,12 +3716,14 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, token.RepoID, fileFSID).Scan(&blockIDs, &fileSize)
 	if err != nil {
-		return nil, 0, nil, nil, nil, "", fmt.Errorf("file metadata not found: %w", err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: file metadata not found: %w", legacyFallbackIfDefinitelyAbsent(err), err)
 	}
 
 	blockStore, fallbackClass, err = h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
 	if err != nil {
-		return nil, 0, nil, nil, nil, "", fmt.Errorf("block store not available: %w", err)
+		// The file IS block-backed at this point (fs_object resolved), so an
+		// unresolvable block store must never degrade to the path-based object.
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("%w: block store not available: %w", errBlockBackedFileUnresolvable, err)
 	}
 
 	return blockIDs, fileSize, fileKey, fileIV, blockStore, fallbackClass, nil

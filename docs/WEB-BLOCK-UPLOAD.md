@@ -154,8 +154,10 @@ fast-clear retry, but do not prove the physical GC delete lifecycle safe against
   death between the two leaves an S3 object with no `blocks` row, no pin and no expiry
   projection — nothing discovers it, because GC finds blocks through candidates and S3
   orphan recovery only replays its own in-flight deletes. Closing that window needs a
-  durable intent written *before* the PUT, or a safe physical sweeper. Tracked with
-  P-4 in [UPLOAD-PERFORMANCE-SECURITY-2026-06.md](./UPLOAD-PERFORMANCE-SECURITY-2026-06.md).
+  durable intent written *before* the PUT, or a safe physical sweeper. Tracked as
+  `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` in the
+  [known issues checklist](#must-clear-before-flipping-the-flag-2026-07-21-audit)
+  below — **not** by P-4, which covers the per-block Paxos and the redundant reads.
 - **R3 — session-aware check plus server-owned upload retry.**
   Session-mode `/blocks/check` reports a block as
   `existing` only when `ProbeBlockReuse == Reusable`, not merely present in S3 —
@@ -1026,6 +1028,15 @@ flag were on*.
   latency or cluster load. Needs a measurement against real Cassandra at 1k/10k
   blocks with concurrent downloads before the flag is flipped; the result decides
   whether a request-scoped or global cache is required.
+- **`ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` — the physical PUT precedes materialization.**
+  Both upload modes write the object to S3 before recording any Cassandra state, so a
+  process death between the two leaves an object with no `blocks` row, no provisional
+  pin and no expiry projection. Nothing can discover it: GC reaches blocks through
+  candidates, and S3 orphan recovery only replays deletes it already started. The
+  success path is fully governed (see R2) — this is strictly the crash window.
+  Closing it needs a durable intent row written *before* the PUT (and reconciled by a
+  scanner phase), or a physical bucket sweeper that is safe against in-flight uploads.
+  Low likelihood per upload, unbounded residue over time.
 - **Read-after-write across DCs is not covered by the 3×25 ms retry.** Canonical
   metadata lookups retry a missing row three times at 25 ms. That absorbs local
   replication lag, not cross-DC: a `LOCAL_QUORUM` write in `dc-eu` can still be
