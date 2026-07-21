@@ -39,13 +39,14 @@ flowchart TD
     SingleShot --> Process
     Finalize --> Process["Per block:<br/>SHA-1 plaintext<br/>Encrypt (if needed)<br/>SHA-256 stored content"]
 
-    Process --> Dedup{"Block exists<br/>in S3?"}
-    Dedup -->|Yes| SkipStore["Skip S3 write<br/>(dedup)"]
-    Dedup -->|No| S3Put["S3 PutBlock"]
+    Process --> Probe{"Canonical metadata<br/>+ GC fence probe"}
+    Probe -->|Reusable| Verify["Verify object in<br/>canonical backend"]
+    Probe -->|Needs PUT| S3Put["Direct PUT to<br/>canonical backend"]
+    Probe -->|GC deleting| Retry["Retry with<br/>bounded backoff"]
 
-    SkipStore --> RefCount["Increment ref_count<br/>(LWT)"]
-    S3Put --> RefCount
-    RefCount --> Mapping["Create SHA-1 ↔ SHA-256<br/>mapping (dual write)"]
+    Verify --> Pin["Create row-per-reference<br/>provisional upload pin"]
+    S3Put --> Pin
+    Pin --> Mapping["Persist server-derived SHA-1<br/>representation mapping"]
     Mapping --> FSObj["Create fs_object<br/>with block_ids"]
     FSObj --> Commit["Create commit<br/>Update library head"]
     Commit --> Traffic["Record traffic<br/>(fire-and-forget)"]
@@ -55,7 +56,7 @@ flowchart TD
     style ValidateToken fill:#28a745,color:#fff
     style Quota fill:#28a745,color:#fff
     style S3Put fill:#17a2b8,color:#fff
-    style RefCount fill:#17a2b8,color:#fff
+    style Pin fill:#17a2b8,color:#fff
     style Chunked fill:#ffc107,color:#000
     style R403 fill:#dc3545,color:#fff
     style R403b fill:#dc3545,color:#fff
@@ -80,11 +81,13 @@ flowchart TD
     Blocks --> Resolve["Resolve SHA-1 → SHA-256<br/>BatchResolveBlockIDs"]
 
     Resolve --> Type{"Video/audio?"}
-    Type -->|Yes| Seeker["BlockReadSeeker<br/>Supports Range (206)<br/>O(1 block) memory"]
+    Type -->|Yes, plaintext| Seeker["BlockReadSeeker<br/>Supports Range (206)<br/>O(1 block) memory"]
+    Type -->|Yes, encrypted| EncStream["Sequential decrypt stream<br/>Accept-Ranges: none<br/>plaintext offsets unavailable"]
     Type -->|No| Stream["StreamBlocks<br/>Prefetch pipeline<br/>O(2 blocks) memory"]
 
-    Seeker --> Enc{"Encrypted?"}
-    Stream --> Enc
+    Seeker --> Direct
+    Stream --> Enc{"Encrypted?"}
+    EncStream --> Decrypt
     Enc -->|Yes| Decrypt["Load block → decrypt<br/>AES-256-CBC"]
     Enc -->|No| Direct["Stream from S3<br/>4 MB buffer"]
 

@@ -7,6 +7,38 @@ import (
 	"time"
 )
 
+func TestUpsertBlockMetadataWithRepresentationAndSHA1_ValidatesStorageClassBeforeInsert(t *testing.T) {
+	database := &DB{}
+	oldInsert := upsertBlockMetadataInsertWithRepresentationFn
+	t.Cleanup(func() { upsertBlockMetadataInsertWithRepresentationFn = oldInsert })
+
+	insertCalls := 0
+	upsertBlockMetadataInsertWithRepresentationFn = func(database *DB, orgID, blockID, representationID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
+		insertCalls++
+		if storageClass != "archive" {
+			t.Fatalf("storageClass = %q, want trimmed archive", storageClass)
+		}
+		return true, nil
+	}
+
+	for _, storageClass := range []string{"", " \t\r\n "} {
+		err := database.UpsertBlockMetadataWithRepresentationAndSHA1("org-1", EncryptedLibraryBlockRepresentationID("lib-1"), "block-1", "", 123, storageClass, "key")
+		if err == nil || !strings.Contains(err.Error(), "storage_class must not be empty") {
+			t.Fatalf("storageClass %q error = %v, want storage_class invariant error", storageClass, err)
+		}
+	}
+	if insertCalls != 0 {
+		t.Fatalf("insertCalls = %d after invalid classes, want 0", insertCalls)
+	}
+
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1("org-1", EncryptedLibraryBlockRepresentationID("lib-1"), "block-1", "", 123, "  archive  ", "key"); err != nil {
+		t.Fatalf("valid storage class error = %v, want nil", err)
+	}
+	if insertCalls != 1 {
+		t.Fatalf("insertCalls = %d after valid class, want 1", insertCalls)
+	}
+}
+
 func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
@@ -659,6 +691,48 @@ func TestProbeBlockReuseReusable(t *testing.T) {
 	}
 }
 
+// A GC claim against a missing block upserts a row carrying neither
+// storage_class nor created_at. That stub must classify as NeedsPut: the probe
+// runs in the store phase, so returning an error would prevent materialize —
+// and therefore the stub repair — from ever running, dead-ending every upload
+// of that block.
+func TestProbeBlockReuseStubWithoutCreatedAtNeedsPut(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	t.Cleanup(func() { probeBlockReuseMetadataFn = oldMetadata })
+
+	for _, gcState := range []string{"", BlockGCStateDeleting} {
+		probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+			return blockReuseMetadataRow{GCState: gcState, CreatedAt: nil}, true, nil
+		}
+		probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+		if err != nil {
+			t.Fatalf("gc_state=%q: ProbeBlockReuse() error = %v, want nil", gcState, err)
+		}
+		if probe.Decision != BlockReuseNeedsPut {
+			t.Fatalf("gc_state=%q: decision = %v, want BlockReuseNeedsPut", gcState, probe.Decision)
+		}
+	}
+}
+
+// created_at set with an empty storage class is not a stub, it is corrupt
+// metadata, and must stay a hard error.
+func TestProbeBlockReuseEmptyStorageClassWithCreatedAtIsError(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	t.Cleanup(func() { probeBlockReuseMetadataFn = oldMetadata })
+
+	createdAt := time.Now().UTC()
+	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{CreatedAt: &createdAt}, true, nil
+	}
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err == nil {
+		t.Fatal("ProbeBlockReuse() error = nil, want empty storage class error")
+	}
+	if probe.Decision != BlockReuseUnknownError {
+		t.Fatalf("decision = %v, want BlockReuseUnknownError", probe.Decision)
+	}
+}
+
 func TestProbeBlockReuseNeedsPutWithoutMetadata(t *testing.T) {
 	oldMetadata := probeBlockReuseMetadataFn
 	oldOrphan := probeBlockReuseHasS3OrphanFn
@@ -711,8 +785,12 @@ func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageClass(t *testing.T) {
 	oldMetadata := probeBlockReuseMetadataFn
 	t.Cleanup(func() { probeBlockReuseMetadataFn = oldMetadata })
 
+	// created_at is what separates corrupt metadata from the transient GC-claim
+	// stub: without it this row would classify as NeedsPut so the writer can
+	// repair it (see TestProbeBlockReuseStubWithoutCreatedAtNeedsPut).
+	createdAt := time.Now().UTC()
 	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
-		return blockReuseMetadataRow{SizeBytes: 123, StorageClass: "   ", StorageKey: "", GCState: ""}, true, nil
+		return blockReuseMetadataRow{SizeBytes: 123, StorageClass: "   ", StorageKey: "", GCState: "", CreatedAt: &createdAt}, true, nil
 	}
 
 	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")

@@ -195,19 +195,28 @@ type PrefetchResult struct {
 
 // PrefetchBlock starts fetching a block in a goroutine and returns a channel with the result.
 func PrefetchBlock(ctx context.Context, blockStore BlockReader, blockID string, fileKey []byte, fileIV []byte) chan PrefetchResult {
-	ch := make(chan PrefetchResult, 1)
+	ch := make(chan PrefetchResult)
 	go func() {
+		deliver := func(result PrefetchResult) {
+			select {
+			case ch <- result:
+			case <-ctx.Done():
+				if result.Reader != nil {
+					_ = result.Reader.Close()
+				}
+			}
+		}
 		if fileKey != nil {
 			blockData, err := blockStore.GetBlock(ctx, blockID)
 			if err != nil {
-				ch <- PrefetchResult{Err: err}
+				deliver(PrefetchResult{Err: err})
 				return
 			}
 			decrypted, err := crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
-			ch <- PrefetchResult{Data: decrypted, Err: err}
+			deliver(PrefetchResult{Data: decrypted, Err: err})
 		} else {
 			reader, err := blockStore.GetBlockReader(ctx, blockID)
-			ch <- PrefetchResult{Reader: reader, Err: err}
+			deliver(PrefetchResult{Reader: reader, Err: err})
 		}
 	}()
 	return ch
@@ -220,23 +229,34 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 	if len(resolvedIDs) == 0 {
 		return nil
 	}
+	streamCtx, cancel := context.WithCancel(ctx)
 
 	buf := GetCopyBuf()
 	defer PutCopyBuf(buf)
 
 	// Start prefetching block 0
-	nextResult := PrefetchBlock(ctx, blockStore, resolvedIDs[0], fileKey, fileIV)
+	nextResult := PrefetchBlock(streamCtx, blockStore, resolvedIDs[0], fileKey, fileIV)
+	defer cancel()
 
 	for i := range resolvedIDs {
 		// Wait for the prefetched block
-		result := <-nextResult
+		var result PrefetchResult
+		select {
+		case result = <-nextResult:
+		case <-streamCtx.Done():
+			return streamCtx.Err()
+		}
+		nextResult = nil
 
 		// Start prefetching the NEXT block immediately
 		if i+1 < len(resolvedIDs) {
-			nextResult = PrefetchBlock(ctx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
+			nextResult = PrefetchBlock(streamCtx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
 		}
 
 		if result.Err != nil {
+			if result.Reader != nil {
+				_ = result.Reader.Close()
+			}
 			log.Printf("[%s] Failed to get block %d/%d: %v", logPrefix, i, len(resolvedIDs), result.Err)
 			return result.Err // headers already sent, but accounting can use the failure
 		}
@@ -249,8 +269,11 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 			}
 		} else {
 			// Unencrypted: stream with 4MB buffer
+			if result.Reader == nil {
+				return fmt.Errorf("block %d/%d returned no reader", i, len(resolvedIDs))
+			}
 			_, err := io.CopyBuffer(c.Writer, result.Reader, buf)
-			result.Reader.Close()
+			_ = result.Reader.Close()
 			if err != nil {
 				log.Printf("[%s] Stream copy error: %v", logPrefix, err)
 				return err

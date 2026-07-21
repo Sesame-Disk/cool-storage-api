@@ -144,11 +144,11 @@ fast-clear retry, but do not prove the physical GC delete lifecycle safe against
   server observes either GC delete fence (`blocks.gc_state='deleting'` or
   `gc_s3_orphans`): that PUT is invalidated for purposes of returning success and
   the server must repeat physical storage after the fence before publishing metadata.
-- **R2 — Anti-orphan is P0.** A block uploaded via the legacy `/blocks/upload`
-  (no session) is an S3 object with **no Cassandra metadata/ref** and can leak.
-  The session flow materializes a provisional reference with TTL
-  (`gc_provisional_block_refs`), so an abandoned upload self-expires and the GC
-  sweeper reclaims it.
+- **R2 — Anti-orphan is P0.** Both `/blocks/upload` modes are metadata-governed.
+  The legacy no-session path writes canonical `blocks` metadata and a deterministic
+  provisional `up:legacy-block:*` reference with TTL plus its canonical/by-day expiry
+  rows. The session flow uses its session-owned provisional reference. In either case,
+  an abandoned upload self-expires and the GC sweeper can reclaim it.
 - **R3 — session-aware check plus server-owned upload retry.**
   Session-mode `/blocks/check` reports a block as
   `existing` only when `ProbeBlockReuse == Reusable`, not merely present in S3 —
@@ -374,11 +374,11 @@ re-upload).
 
 ## Out-of-branch debts and limitations (do not lose this knowledge)
 
-- **Legacy `/blocks/upload` without a session does not materialize metadata.** It
-  is used by desktop/mobile via their own commit paths; for any *new* caller,
-  uploading without a session leaves an ungoverned S3 object. The web flow always
-  passes a session. If another non-sync caller is added, it must either use a
-  session or its own materialization + cleanup.
+- **Legacy `/blocks/upload` without a session is governed but not session-owned.**
+  It materializes canonical metadata and a deterministic provisional TTL pin with
+  expiry discovery rows. The web flow still always passes a session because commit
+  requires that session's ownership (or a permanent `fs:` reference); a legacy pin
+  does not make a block committable by an unrelated web session.
 - **No cross-method dedup (web ↔ desktop) — upload side only.** Download compat is
   solved (web files now carry SHA-1 block IDs, see the dual-hash section above).
   What remains unsolved is *dedup at upload*: web uses fixed 8 MB blocks while
@@ -447,7 +447,8 @@ passing against real Cassandra + MinIO via `docker compose`):
 - round-trip upload + download; dedup (re-check reports existing)
 - multi-block ordering + download (8 MB block + tail)
 - R1: manifest block never uploaded → `needs_upload`
-- R1/R3: S3-only block (legacy upload, no metadata) → reported missing + commit refuses
+- R1/R3: legacy-materialized block owned only by its legacy TTL pin → an unrelated
+  web session reports it missing and commit refuses
 - R6: manifest sum/size mismatch → 400
 - R6: same SHA-256 declared with conflicting sizes → 400
 - R11: block size disagrees with stored metadata → 422

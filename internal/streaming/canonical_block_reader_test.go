@@ -31,12 +31,15 @@ func resetCanonicalReaderHooks(t *testing.T) {
 	oldGet := canonicalBlockGet
 	oldGetReader := canonicalBlockGetReader
 	oldGetSize := canonicalBlockGetSize
+	oldRetryDelay := canonicalBlockLocationRetryDelay
+	canonicalBlockLocationRetryDelay = 0
 	t.Cleanup(func() {
 		canonicalBlockLocationLookup = oldLocationLookup
 		canonicalBlockStoreLookup = oldStoreLookup
 		canonicalBlockGet = oldGet
 		canonicalBlockGetReader = oldGetReader
 		canonicalBlockGetSize = oldGetSize
+		canonicalBlockLocationRetryDelay = oldRetryDelay
 	})
 }
 
@@ -169,7 +172,7 @@ func TestCanonicalBlockReaderExactClassFailureDoesNotFallback(t *testing.T) {
 	}
 }
 
-func TestCanonicalBlockReaderAbsentMetadataUsesFallback(t *testing.T) {
+func TestCanonicalBlockReaderAbsentMetadataFailsStrictReadsAndChecksMissing(t *testing.T) {
 	resetCanonicalReaderHooks(t)
 	ctx := context.Background()
 	blockID := sha256Hex(505)
@@ -181,49 +184,58 @@ func TestCanonicalBlockReaderAbsentMetadataUsesFallback(t *testing.T) {
 		t.Fatal("absent metadata must not resolve a manager class")
 		return nil, nil
 	}
-	wantKey := fallback.StorageKeyForHash(blockID)
 	canonicalBlockGet = func(_ context.Context, store *storage.BlockStore, key string) ([]byte, error) {
-		if store != fallback || key != wantKey {
-			t.Fatalf("fallback read routed to (%p, %q), want fallback and %q", store, key, wantKey)
-		}
-		return []byte("legacy"), nil
+		t.Fatal("missing canonical metadata must not probe fallback storage")
+		return nil, nil
 	}
 
-	reader, err := NewCanonicalBlockReader(ctx, nil, storage.NewManager(), canonicalReaderTestOrg, []string{blockID}, fallback, "fallback")
-	if err != nil {
-		t.Fatalf("NewCanonicalBlockReader() error = %v", err)
+	if reader, err := NewCanonicalBlockReader(ctx, nil, storage.NewManager(), canonicalReaderTestOrg, []string{blockID}, fallback, "fallback"); reader != nil || !errors.Is(err, ErrCanonicalBlockMetadataNotFound) {
+		t.Fatalf("strict reader = (%v, %v), want nil and ErrCanonicalBlockMetadataNotFound", reader, err)
 	}
-	if data, err := reader.GetBlock(ctx, blockID); err != nil || string(data) != "legacy" {
-		t.Fatalf("GetBlock() = %q, %v, want legacy, nil", data, err)
+	reader, err := NewCanonicalBlockCheckReader(ctx, nil, storage.NewManager(), canonicalReaderTestOrg, []string{blockID}, fallback, "fallback")
+	if err != nil {
+		t.Fatalf("NewCanonicalBlockCheckReader() error = %v", err)
+	}
+	exists, err := reader.CheckBlocksExist(ctx, []string{blockID}, 1)
+	if err != nil || exists[blockID] {
+		t.Fatalf("CheckBlocksExist() = %v, %v, want false, nil", exists, err)
 	}
 }
 
-func TestCanonicalBlockReaderEmptyMetadataClassUsesFallbackDerivedKey(t *testing.T) {
+func TestCanonicalBlockCheckReaderTreatsDeletingMetadataAsMissing(t *testing.T) {
+	resetCanonicalReaderHooks(t)
+	blockID := sha256Hex(304)
+	canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
+		return db.BlockStorageLocation{StorageClass: "canonical", GCState: db.BlockGCStateDeleting}, true, nil
+	}
+
+	reader, err := NewCanonicalBlockCheckReader(context.Background(), nil, storage.NewManager(), canonicalReaderTestOrg, []string{blockID}, canonicalReaderTestStore(t), "fallback")
+	if err != nil {
+		t.Fatalf("NewCanonicalBlockCheckReader() error = %v", err)
+	}
+	exists, err := reader.CheckBlocksExist(context.Background(), []string{blockID}, 1)
+	if err != nil {
+		t.Fatalf("CheckBlocksExist() error = %v", err)
+	}
+	if exists[blockID] {
+		t.Fatal("deleting block was reported as reusable")
+	}
+}
+
+func TestCanonicalBlockReaderRejectsEmptyMetadataClass(t *testing.T) {
 	resetCanonicalReaderHooks(t)
 	ctx := context.Background()
 	blockID := sha256Hex(555)
 	fallback := canonicalReaderTestStore(t)
-	wantKey := fallback.StorageKeyForHash(blockID)
 	canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
-		return db.BlockStorageLocation{StorageClass: "", StorageKey: wantKey}, true, nil
+		return db.BlockStorageLocation{StorageClass: "", StorageKey: fallback.StorageKeyForHash(blockID)}, true, nil
 	}
 	canonicalBlockStoreLookup = func(*storage.Manager, string, string) (*storage.BlockStore, error) {
 		t.Fatal("an empty metadata class must not resolve a manager class")
 		return nil, nil
 	}
-	canonicalBlockGet = func(_ context.Context, store *storage.BlockStore, key string) ([]byte, error) {
-		if store != fallback || key != wantKey {
-			t.Fatalf("fallback read routed to (%p, %q), want fallback and %q", store, key, wantKey)
-		}
-		return []byte("legacy"), nil
-	}
-
-	reader, err := NewCanonicalBlockReader(ctx, nil, storage.NewManager(), canonicalReaderTestOrg, []string{blockID}, fallback, "fallback")
-	if err != nil {
-		t.Fatalf("NewCanonicalBlockReader() error = %v", err)
-	}
-	if _, err := reader.GetBlock(ctx, blockID); err != nil {
-		t.Fatalf("GetBlock() error = %v", err)
+	if reader, err := NewCanonicalBlockReader(ctx, nil, storage.NewManager(), canonicalReaderTestOrg, []string{blockID}, fallback, "fallback"); reader != nil || err == nil {
+		t.Fatalf("NewCanonicalBlockReader() = (%v, %v), want nil, error", reader, err)
 	}
 }
 
@@ -285,5 +297,33 @@ func TestCanonicalBlockReaderNilManagerRequiresMatchingFallbackClass(t *testing.
 	}
 	if reader, err := NewCanonicalBlockReader(ctx, nil, nil, canonicalReaderTestOrg, []string{blockID}, fallback, "other"); reader != nil || err == nil {
 		t.Fatalf("mismatched fallback class = (%v, %v), want nil, error", reader, err)
+	}
+}
+
+func BenchmarkCanonicalBlockReaderResolution(b *testing.B) {
+	for _, count := range []int{1, 100, 1000, 10000} {
+		b.Run(fmt.Sprintf("blocks_%d", count), func(b *testing.B) {
+			blockIDs := make([]string, count)
+			for i := range blockIDs {
+				blockIDs[i] = fmt.Sprintf("%064x", i+1)
+			}
+			fallback, err := storage.NewOrgBlockStore(nil, "blocks/", canonicalReaderTestOrg)
+			if err != nil {
+				b.Fatal(err)
+			}
+			originalLookup := canonicalBlockLocationLookup
+			canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
+				return db.BlockStorageLocation{SizeBytes: 8 << 20, StorageClass: "fallback"}, true, nil
+			}
+			b.Cleanup(func() { canonicalBlockLocationLookup = originalLookup })
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				reader, err := NewCanonicalBlockReader(context.Background(), nil, nil, canonicalReaderTestOrg, blockIDs, fallback, "fallback")
+				if err != nil || reader == nil {
+					b.Fatalf("NewCanonicalBlockReader() = (%v, %v)", reader, err)
+				}
+			}
+		})
 	}
 }

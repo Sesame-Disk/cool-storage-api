@@ -14,6 +14,27 @@ import (
 	dto "github.com/prometheus/client_model/go"
 )
 
+func TestValidateManifestNormalizesUppercaseSHA256(t *testing.T) {
+	hash := strings.Repeat("AB", 32)
+	req := &fileFromBlocksRequest{
+		Filename: "case.bin",
+		Size:     4,
+		Blocks:   []fileFromBlocksBlock{{SHA256: hash, Size: 4}},
+	}
+	if err := validateManifest(req, 8); err != nil {
+		t.Fatalf("validateManifest() error = %v", err)
+	}
+	want := strings.ToLower(hash)
+	if req.Blocks[0].SHA256 != want {
+		t.Fatalf("normalized hash = %q, want %q", req.Blocks[0].SHA256, want)
+	}
+	digest := req.manifestDigest()
+	req.Blocks[0].SHA256 = hash
+	if err := validateManifest(req, 8); err != nil || req.manifestDigest() != digest {
+		t.Fatalf("case-only replay digest changed: err=%v got=%s want=%s", err, req.manifestDigest(), digest)
+	}
+}
+
 // histogramSampleCount reads the observation count off a single Histogram
 // series (a HistogramVec.WithLabelValues() result), used to assert a metric
 // gained an observation since Histogram values aren't comparable via

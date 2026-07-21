@@ -67,6 +67,7 @@ type GCStore interface {
 	// BlockHasReferences reports whether any block_references row still exists for
 	// the block. This is the liveness check that replaces reading ref_count.
 	BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error)
+	BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error)
 	GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error)
 	// RemoveBlockReference deletes one (block, referrer) reference row. Idempotent.
 	RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error
@@ -79,6 +80,9 @@ type GCStore interface {
 	// ReleaseBlockClaim clears gc_state only when the same claimID still owns the
 	// row. This prevents another attempt from releasing a claim it did not win.
 	ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error
+	// DeleteClaimedBlockStub removes a metadata-free row only when the same
+	// claimID still owns it. The bool reports whether the conditional delete applied.
+	DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID string) (bool, error)
 	// FinalizeBlockDelete removes the block row only when the same claimID still
 	// owns the row.
 	FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error

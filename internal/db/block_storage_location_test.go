@@ -13,13 +13,14 @@ func TestScanBlockStorageLocation(t *testing.T) {
 			*(dest[0].(*int64)) = 123
 			*(dest[1].(*string)) = "hot"
 			*(dest[2].(*string)) = "canonical/key"
+			*(dest[3].(*string)) = BlockGCStateDeleting
 			return nil
 		})
 		if err != nil || !found {
 			t.Fatalf("scanBlockStorageLocation() = (%+v, %t, %v), want found", location, found, err)
 		}
-		if location.SizeBytes != 123 || location.StorageClass != "hot" || location.StorageKey != "canonical/key" {
-			t.Fatalf("location = %+v, want size=123 class=hot key=canonical/key", location)
+		if location.SizeBytes != 123 || location.StorageClass != "hot" || location.StorageKey != "canonical/key" || location.GCState != BlockGCStateDeleting {
+			t.Fatalf("location = %+v, want size=123 class=hot key=canonical/key gc_state=deleting", location)
 		}
 	})
 

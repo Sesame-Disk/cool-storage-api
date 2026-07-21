@@ -412,7 +412,7 @@ func TestPutBlockWithoutQuotaCheckerDoesNotPanic(t *testing.T) {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
 	}
 	payload := decodeJSONObject(t, w.Body)
-	if payload["error"] != "block storage not available" {
-		t.Fatalf("error = %v, want block storage not available", payload["error"])
+	if payload["error"] != "block metadata unavailable" {
+		t.Fatalf("error = %v, want block metadata unavailable", payload["error"])
 	}
 }

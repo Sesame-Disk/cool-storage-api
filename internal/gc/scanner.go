@@ -264,11 +264,17 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 				if storageClass == "" {
 					storageClass = expiry.StorageClass
 				}
-				if err := s.store.RemoveBlockReference(canonical.OrgID, canonical.BlockID, canonical.Referrer); err != nil {
-					log.Printf("[GC Scanner] Phase 0: failed to remove expired provisional ref org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+				provisionalRefExists, err := s.store.BlockReferenceExists(canonical.OrgID, canonical.BlockID, canonical.Referrer)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to check provisional ref org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("remove expired provisional ref org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+						phaseErr = fmt.Errorf("check provisional ref org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					}
+					continue
+				}
+				if provisionalRefExists {
+					// Cassandra TTL remains authoritative. Retrying this projection is
+					// safe for legacy rows and cannot delete a concurrent renewal.
 					continue
 				}
 				hasRefs, err := s.store.BlockHasReferences(canonical.OrgID, canonical.BlockID)

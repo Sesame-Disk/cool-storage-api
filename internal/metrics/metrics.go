@@ -459,6 +459,32 @@ var (
 		},
 		[]string{"reason"},
 	)
+
+	BlockUploadMaterializationRetriesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "block_upload_materialization_retries_total",
+			Help: "Total bounded block upload materialization retries by surface and reason.",
+		},
+		[]string{"surface", "reason"},
+	)
+
+	CanonicalBlockResolutionDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "canonical_block_resolution_duration_seconds",
+			Help:    "Duration of request-scoped canonical block metadata resolution.",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		},
+		[]string{"mode", "result"},
+	)
+
+	CanonicalBlockResolutionBlocks = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "canonical_block_resolution_blocks",
+			Help:    "Requested block IDs per canonical metadata preflight.",
+			Buckets: []float64{1, 10, 100, 1000, 5000, 10000, 50000, 100000},
+		},
+		[]string{"mode"},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -509,5 +535,8 @@ func Register() {
 		BlockUploadStagedBlocksTotal,
 		BlockUploadConcurrencyRejectionsTotal,
 		BlockUploadSessionAdmissionRejectionsTotal,
+		BlockUploadMaterializationRetriesTotal,
+		CanonicalBlockResolutionDuration,
+		CanonicalBlockResolutionBlocks,
 	)
 }

@@ -1557,7 +1557,7 @@ func (s *CassandraStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UU
 }
 
 func (s *CassandraStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
-	return s.db.DeleteProvisionalBlockReferenceExpiry(orgID.String(), blockID, referrer, expiresAt)
+	return s.db.DeleteProvisionalBlockReferenceExpiryIfExpiresAt(orgID.String(), blockID, referrer, expiresAt)
 }
 
 // --- S3 orphan recovery ---
@@ -1850,6 +1850,18 @@ func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bo
 	return s.db.BlockHasReferences(orgID.String(), blockID)
 }
 
+func (s *CassandraStore) BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error) {
+	var existing string
+	err := s.db.Session().Query(`
+		SELECT referrer FROM block_references
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgID.String(), blockID, referrer).Scan(&existing)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
 	info := BlockInfo{BlockID: blockID}
 	var createdAt *time.Time
@@ -2112,6 +2124,10 @@ func (s *CassandraStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID str
 		return fmt.Errorf("block delete claim release not applied for %s", blockID)
 	}
 	return nil
+}
+
+func (s *CassandraStore) DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID string) (bool, error) {
+	return s.db.DeleteClaimedBlockStub(orgID.String(), blockID, claimID)
 }
 
 // FinalizeBlockDelete removes a block row that was previously claimed by GC.

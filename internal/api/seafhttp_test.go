@@ -30,6 +30,20 @@ import (
 	"golang.org/x/time/rate"
 )
 
+func TestResponseBodyBytesStartsAtZero(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	if got := responseBodyBytes(c.Writer); got != 0 {
+		t.Fatalf("responseBodyBytes(unwritten) = %d, want 0", got)
+	}
+	if _, err := c.Writer.Write([]byte("payload")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if got := responseBodyBytes(c.Writer); got != 7 {
+		t.Fatalf("responseBodyBytes(written) = %d, want 7", got)
+	}
+}
+
 func init() {
 	gin.SetMode(gin.TestMode)
 }
@@ -2927,7 +2941,6 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 
 	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
-	originalPut := putUploadedBlockAutoFn
 	originalPutDirect := putUploadedBlockAutoDirectForUploadFn
 	originalProbe := probeUploadedBlockReuseForUploadFn
 	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
@@ -2937,7 +2950,6 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 	t.Cleanup(func() {
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
-		putUploadedBlockAutoFn = originalPut
 		putUploadedBlockAutoDirectForUploadFn = originalPutDirect
 		probeUploadedBlockReuseForUploadFn = originalProbe
 		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
@@ -2954,10 +2966,6 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 	}
 
 	var storeCalls atomic.Int32
-	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
-		storeCalls.Add(1)
-		return hash, nil
-	}
 	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
 		storeCalls.Add(1)
 		return hash, nil
@@ -3017,14 +3025,16 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 		}
 	}()
 
-	originalPut := putUploadedBlockAutoFn
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	originalProbe := probeUploadedBlockReuseForUploadFn
+	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
 	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
 	t.Cleanup(func() {
-		putUploadedBlockAutoFn = originalPut
 		registerUploadedBlockAndMappingForUploadFn = originalRegister
+		probeUploadedBlockReuseForUploadFn = originalProbe
+		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
@@ -3134,11 +3144,8 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 }
 
 // finalizeUploadStreamingReuseFixture wires the common mocks for the
-// Cassandra-first reuse tests below and returns call counters. The legacy
-// Exists+PUT path (putUploadedBlockAutoFn) is the only one that issues the
-// old upload-backend HEAD, so a zero count there proves the reusable/needs-put
-// logic stayed off that legacy path.
-func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReuseProbe) (legacyPuts, directPuts, reusableChecks, registerCalls *atomic.Int32, run func() (string, error)) {
+// Cassandra-first reuse tests below and returns call counters.
+func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReuseProbe) (directPuts, reusableChecks, registerCalls *atomic.Int32, run func() (string, error)) {
 	t.Helper()
 
 	cm, _ := newTestChunkManager(t)
@@ -3155,7 +3162,6 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	}
 
 	originalProbe := probeUploadedBlockReuseForUploadFn
-	originalLegacyPut := putUploadedBlockAutoFn
 	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
 	originalEnsureReusable := ensureReusableBlockPresentForUploadFn
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
@@ -3164,7 +3170,6 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
 	t.Cleanup(func() {
 		probeUploadedBlockReuseForUploadFn = originalProbe
-		putUploadedBlockAutoFn = originalLegacyPut
 		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
 		ensureReusableBlockPresentForUploadFn = originalEnsureReusable
 		registerUploadedBlockAndMappingForUploadFn = originalRegister
@@ -3183,15 +3188,10 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		return decision, nil
 	}
 
-	legacyPuts = &atomic.Int32{}
 	directPuts = &atomic.Int32{}
 	reusableChecks = &atomic.Int32{}
 	registerCalls = &atomic.Int32{}
 
-	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
-		legacyPuts.Add(1)
-		return hash, nil
-	}
 	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
 		directPuts.Add(1)
 		return hash, nil
@@ -3218,7 +3218,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		fileID, _, _, _, err := handler.finalizeUploadStreaming(c, token, upload, "/", "test.bin", "", 5, false)
 		return fileID, err
 	}
-	return legacyPuts, directPuts, reusableChecks, registerCalls, run
+	return directPuts, reusableChecks, registerCalls, run
 }
 
 func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryWithoutDecryptSessionReturnsUnlockContract(t *testing.T) {
@@ -3315,7 +3315,6 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
 	originalProbe := probeUploadedBlockReuseForUploadFn
-	originalPut := putUploadedBlockAutoFn
 	originalPutDirect := putUploadedBlockAutoDirectForUploadFn
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
@@ -3324,7 +3323,6 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
 		probeUploadedBlockReuseForUploadFn = originalProbe
-		putUploadedBlockAutoFn = originalPut
 		putUploadedBlockAutoDirectForUploadFn = originalPutDirect
 		registerUploadedBlockAndMappingForUploadFn = originalRegister
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
@@ -3445,15 +3443,15 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	}
 }
 
-// TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut verifies that
+// TestFinalizeUploadStreamingReusableVerifiesCanonical verifies that
 // when the Cassandra probe reports a block reusable, finalization routes through
 // the canonical verify/repair step (EnsureReusableBlockPresent) exactly once and
-// never touches the legacy Exists+PUT path or the direct PUT, yet still registers
+// never performs a direct PUT, yet still registers
 // the block reference + mapping. The canonical verify itself (an S3 HEAD on the
 // declared canonical key, with repair-on-miss) is exercised by the unit tests in
 // internal/api/v2/upload_reuse_test.go.
 func TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut(t *testing.T) {
-	legacyPuts, directPuts, reusableChecks, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
+	directPuts, reusableChecks, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
 		db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot"})
 
 	expectedSHA1 := sha1.Sum([]byte("hello"))
@@ -3465,9 +3463,6 @@ func TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut(t *testing
 	}
 	if fileID != expectedBlockID {
 		t.Fatalf("fileID = %s, want %s", fileID, expectedBlockID)
-	}
-	if got := legacyPuts.Load(); got != 0 {
-		t.Errorf("legacy Exists+PUT (HEAD) calls = %d, want 0 for a reusable block", got)
 	}
 	if got := directPuts.Load(); got != 0 {
 		t.Errorf("direct PUT calls = %d, want 0 for a reusable block", got)
@@ -3482,9 +3477,9 @@ func TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut(t *testing
 
 // TestFinalizeUploadStreamingNeedsPutUsesDirectPut verifies that when the probe
 // reports the block needs storing, finalization performs exactly one direct PUT
-// (no S3 HEAD via the legacy path) and registers the block reference + mapping.
+// and registers the block reference + mapping.
 func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
-	legacyPuts, directPuts, reusableChecks, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
+	directPuts, reusableChecks, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
 		db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"})
 
 	expectedSHA1 := sha1.Sum([]byte("hello"))
@@ -3496,9 +3491,6 @@ func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
 	}
 	if fileID != expectedBlockID {
 		t.Fatalf("fileID = %s, want %s", fileID, expectedBlockID)
-	}
-	if got := legacyPuts.Load(); got != 0 {
-		t.Errorf("legacy Exists+PUT (HEAD) calls = %d, want 0 (needs_put must use the direct PUT)", got)
 	}
 	if got := directPuts.Load(); got != 1 {
 		t.Errorf("direct PUT calls = %d, want 1", got)
@@ -3521,13 +3513,11 @@ func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
 		t.Fatalf("failed to pre-acquire metadata permit: %v", err)
 	}
 
-	originalPut := putUploadedBlockAutoFn
 	putStarted := make(chan struct{})
-	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, _ string, _ []byte) (string, error) {
+	putFn := func(_ context.Context, _ *storage.BlockStore, _ string, _ []byte) (string, error) {
 		close(putStarted)
 		return "key", nil
 	}
-	t.Cleanup(func() { putUploadedBlockAutoFn = originalPut })
 
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
 	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
@@ -3539,7 +3529,7 @@ func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
 	go func() {
 		done <- retrySeafHTTPBlockMaterialization("test", "sha256-block",
 			func() error {
-				_, putErr := putUploadedBlockAutoFn(context.Background(), nil, "sha256-block", []byte("data"))
+				_, putErr := putFn(context.Background(), nil, "sha256-block", []byte("data"))
 				return putErr
 			},
 			func() error {
@@ -3582,12 +3572,10 @@ func TestFinalizeUploadS3PutPrecedesPermitRelease(t *testing.T) {
 	var seq atomic.Int64
 	var putSeq, permitReleaseSeq int64
 
-	originalPut := putUploadedBlockAutoFn
-	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, _ string, _ []byte) (string, error) {
+	putFn := func(_ context.Context, _ *storage.BlockStore, _ string, _ []byte) (string, error) {
 		putSeq = seq.Add(1)
 		return "key", nil
 	}
-	t.Cleanup(func() { putUploadedBlockAutoFn = originalPut })
 
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
 	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
@@ -3608,7 +3596,7 @@ func TestFinalizeUploadS3PutPrecedesPermitRelease(t *testing.T) {
 	go func() {
 		done <- retrySeafHTTPBlockMaterialization("test", "sha256-block",
 			func() error {
-				_, putErr := putUploadedBlockAutoFn(context.Background(), nil, "sha256-block", []byte("data"))
+				_, putErr := putFn(context.Background(), nil, "sha256-block", []byte("data"))
 				close(putInvoked)
 				return putErr
 			},

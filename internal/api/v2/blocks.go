@@ -37,11 +37,32 @@ var errSessionCheckBlockStoreUnavailable = errors.New("block storage not availab
 var errBlockUploadStagingCheck = errors.New("failed to check staged blocks")
 var errBlockUploadStagingReserve = errors.New("failed to reserve staged block")
 var errBlockUploadStagingCapReached = errors.New("session staging limit reached")
+var errLegacyBlockStorageQuotaExceeded = errors.New("legacy block storage quota exceeded")
 
 var uploadBlockProbeReuseFn = ProbeUploadedBlockReuse
 var uploadBlockStoreForProbeFn = StoreUploadedBlockForProbe
 var uploadBlockRetryMaterializationFn = RetryUploadedBlockMaterializationContext
 var registerWebUploadedBlockAndMappingFn = RegisterWebUploadedBlockAndMapping
+var legacyBlockRegisterProvisionalFn = func(database *db.DB, orgID, userID, blockID, storageClass string) error {
+	operationID := "legacy-block:" + userID + ":" + blockID
+	referrer := db.BlockReferrerForUpload(operationID)
+	ttlSeconds := db.ProvisionalBlockReferenceTTLSeconds
+	expiresAt := time.Now().UTC().Add(time.Duration(ttlSeconds) * time.Second)
+	if err := database.AddProvisionalBlockReferenceWithExpiry(orgID, blockID, referrer, "00000000-0000-0000-0000-000000000000", storageClass, expiresAt, ttlSeconds); err != nil {
+		return err
+	}
+	fenceActive, err := database.BlockDeleteFenceActive(orgID, blockID)
+	if err != nil {
+		return err
+	}
+	if !fenceActive {
+		return nil
+	}
+	if _, err := NewFSHelper(database).removeStaleUploadedBlockDeleteStub(orgID, blockID); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
+}
 
 var checkBlocksProbeReuseFn = func(database *db.DB, orgID, hash string) (db.BlockReuseProbe, error) {
 	return database.ProbeBlockReuse(orgID, hash)
@@ -777,10 +798,12 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 		return
 	}
 	for i, hash := range req.Hashes {
+		hash = db.NormalizeBlockID(hash)
 		if !isHex64(hash) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("hashes[%d]: invalid sha256", i)})
 			return
 		}
+		req.Hashes[i] = hash
 	}
 
 	session, resolution := h.resolveUploadSession(c)
@@ -821,16 +844,16 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 	uniqueHashes := dedupePreserveOrder(req.Hashes)
 	var existsMap map[string]bool
 	var err error
-	if h.db != nil && h.db.Session() != nil {
-		canonicalReader, resolveErr := streaming.NewCanonicalBlockReader(c.Request.Context(), h.db, h.storageManager, c.GetString("org_id"), uniqueHashes, blockStore, fallbackClass)
-		if resolveErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block locations"})
-			return
-		}
-		existsMap, err = canonicalReader.CheckBlocksExist(c.Request.Context(), uniqueHashes, 20)
-	} else {
-		existsMap, err = blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, 20)
+	if h.db == nil || h.db.Session() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block metadata unavailable"})
+		return
 	}
+	canonicalReader, resolveErr := streaming.NewCanonicalBlockCheckReader(c.Request.Context(), h.db, h.storageManager, c.GetString("org_id"), uniqueHashes, blockStore, fallbackClass)
+	if resolveErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block locations"})
+		return
+	}
+	existsMap, err = canonicalReader.CheckBlocksExist(c.Request.Context(), uniqueHashes, 20)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 		return
@@ -966,7 +989,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// longer client-asserted (PR5): the server derives it from the real bytes
 	// (sha1Hash above) and stores it in blocks.sha1, so there is no X-Block-Hash-SHA1
 	// to cross-check anymore.
-	clientHash := c.GetHeader("X-Block-Hash")
+	clientHash := db.NormalizeBlockID(c.GetHeader("X-Block-Hash"))
 	if clientHash != "" && clientHash != hash {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":         "hash mismatch",
@@ -1012,30 +1035,92 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// flow. Traffic is recorded only after successful storage/materialization.
 	// See docs/WEB-BLOCK-UPLOAD.md.
 	if resolution != uploadSessionValid {
-		exists, existsErr := blockStore.BlockExists(c.Request.Context(), hash)
-		if existsErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
+		if h.db == nil || h.db.Session() == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block metadata unavailable"})
 			return
 		}
-		if exists {
-			recordTraffic()
-			c.JSON(http.StatusOK, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: false})
-			return
-		}
-
-		if checker := traffic.GetChecker(); checker != nil {
-			if st, _ := checker.CheckStorageQuota(c.GetString("org_id"), c.GetString("user_id"), int64(len(data))); !st.Allowed {
-				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-				return
+		orgID := c.GetString("org_id")
+		didPut := false
+		materializeLegacyMetadata := false
+		legacyNeedsPin := false
+		legacyStorageClass := storageClass
+		legacyStorageKey := ""
+		checkStorageQuota := func() error {
+			if checker := traffic.GetChecker(); checker != nil {
+				if st, _ := checker.CheckStorageQuota(orgID, c.GetString("user_id"), int64(len(data))); !st.Allowed {
+					return errLegacyBlockStorageQuotaExceeded
+				}
 			}
+			return nil
 		}
-
-		if _, putErr := blockStore.PutBlockData(c.Request.Context(), &storage.BlockData{Hash: hash, Data: data, Size: int64(len(data))}); putErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
+		err = uploadBlockRetryMaterializationFn(c.Request.Context(), "UploadBlockLegacy", hash, func() error {
+			materializeLegacyMetadata = false
+			legacyNeedsPin = false
+			probe, probeErr := uploadBlockProbeReuseFn(h.db, orgID, hash)
+			if probeErr != nil {
+				return probeErr
+			}
+			legacyNeedsPin = probe.Decision == db.BlockReuseNeedsPut || probe.Decision == db.BlockReuseReusable
+			if probe.Decision == db.BlockReuseNeedsPut && strings.TrimSpace(probe.StorageClass) == "" {
+				legacyStorageClass = strings.TrimSpace(storageClass)
+				if legacyStorageClass == "" {
+					return fmt.Errorf("preferred storage class is empty for legacy block %s", hash)
+				}
+				legacyStorageKey = blockStore.StorageKeyForHash(hash)
+				materializeLegacyMetadata = true
+				exists, existsErr := blockStore.BlockExists(c.Request.Context(), hash)
+				if existsErr != nil {
+					return fmt.Errorf("check legacy block existence: %w", existsErr)
+				}
+				if exists {
+					return nil
+				}
+				if quotaErr := checkStorageQuota(); quotaErr != nil {
+					return quotaErr
+				}
+				if _, putErr := blockStore.PutBlockData(c.Request.Context(), &storage.BlockData{Hash: hash, Data: data, Size: int64(len(data))}); putErr != nil {
+					return fmt.Errorf("store legacy block: %w", putErr)
+				}
+				didPut = true
+				return nil
+			}
+			_, resolvedClass, wrote, storeErr := uploadBlockStoreForProbeFn(c.Request.Context(), hash, probe, data, h.storageManager, blockStore, storageClass, orgID, checkStorageQuota)
+			if strings.TrimSpace(resolvedClass) != "" {
+				legacyStorageClass = resolvedClass
+			}
+			didPut = didPut || wrote
+			return storeErr
+		}, func() error {
+			if legacyNeedsPin {
+				if pinErr := legacyBlockRegisterProvisionalFn(h.db, orgID, c.GetString("user_id"), hash, legacyStorageClass); pinErr != nil {
+					if errors.Is(pinErr, ErrBlockDeleteInProgress) {
+						return pinErr
+					}
+					return fmt.Errorf("%w: register legacy provisional block reference: %w", ErrBlockMaterializationTransient, pinErr)
+				}
+			}
+			if !materializeLegacyMetadata {
+				return nil
+			}
+			if metadataErr := h.db.UpsertBlockMetadataWithSHA1(orgID, hash, sha1Hash, len(data), legacyStorageClass, legacyStorageKey); metadataErr != nil {
+				return fmt.Errorf("%w: materialize legacy block metadata: %w", ErrBlockMaterializationTransient, metadataErr)
+			}
+			return nil
+		}, nil, nil)
+		if errors.Is(err, errLegacyBlockStorageQuotaExceeded) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+			return
+		}
+		if err != nil {
+			writeUploadBlockMaterializationError(c, err)
 			return
 		}
 		recordTraffic()
-		c.JSON(http.StatusCreated, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: true})
+		status := http.StatusOK
+		if didPut {
+			status = http.StatusCreated
+		}
+		c.JSON(status, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: didPut})
 		return
 	}
 

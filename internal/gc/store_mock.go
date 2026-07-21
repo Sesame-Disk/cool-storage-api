@@ -173,6 +173,7 @@ type MockStore struct {
 	groupExistsCalls               atomic.Int64
 	findOrgForLibraryErr           error
 	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
+	blockReferenceExistsHook       func(orgID uuid.UUID, blockID, referrer string, current bool) (bool, error)
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook     func(orgID uuid.UUID, size int)
@@ -1841,6 +1842,23 @@ func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, e
 	return current, nil
 }
 
+func (m *MockStore) BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error) {
+	m.mu.RLock()
+	_, current := m.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)][referrer]
+	hook := m.blockReferenceExistsHook
+	m.mu.RUnlock()
+	if hook != nil {
+		return hook(orgID, blockID, referrer, current)
+	}
+	return current, nil
+}
+
+func (m *MockStore) SetBlockReferenceExistsHookForTest(hook func(orgID uuid.UUID, blockID, referrer string, current bool) (bool, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blockReferenceExistsHook = hook
+}
+
 // SetBlockHasReferencesHookForTest installs a deterministic synchronization
 // point for worker tests that must pause between the post-claim liveness read
 // and physical deletion.
@@ -2070,7 +2088,9 @@ func (m *MockStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, re
 			expiresAt = existing.ExpiresAt
 		}
 	}
-	delete(m.provisionalBlockRefExpiries, key)
+	if existing, ok := m.provisionalBlockRefExpiries[key]; ok && (expiresAt.IsZero() || existing.ExpiresAt.UTC().Equal(expiresAt.UTC())) {
+		delete(m.provisionalBlockRefExpiries, key)
+	}
 	if !expiresAt.IsZero() {
 		delete(m.provisionalBlockRefExpiryProjections, newMockProvisionalBlockRefExpiryProjectionKey(orgID, blockID, referrer, expiresAt))
 	}
@@ -2107,6 +2127,19 @@ func (m *MockStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) 
 		return nil
 	}
 	return fmt.Errorf("block delete claim release not applied for %s", blockID)
+}
+
+func (m *MockStore) DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	b, ok := m.blocks[key]
+	if !ok || b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID || strings.TrimSpace(b.StorageClass) != "" || b.CreatedAt != nil {
+		return false, nil
+	}
+	delete(m.blocks, key)
+	return true, nil
 }
 
 func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error {

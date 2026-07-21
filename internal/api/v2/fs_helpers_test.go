@@ -12,6 +12,18 @@ import (
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
+func installSplitProvisionalReferenceHookForTest(t *testing.T) {
+	t.Helper()
+	original := registerUploadedBlockAddProvisionalFn
+	t.Cleanup(func() { registerUploadedBlockAddProvisionalFn = original })
+	registerUploadedBlockAddProvisionalFn = func(h *FSHelper, orgID, blockID, referrer, libraryID, storageClass string, expiresAt time.Time) error {
+		if err := registerUploadedBlockAddReferenceFn(h, orgID, blockID, referrer, libraryID, db.ProvisionalBlockReferenceTTLSeconds); err != nil {
+			return err
+		}
+		return registerUploadedBlockUpsertProvisionalExpiryFn(h, orgID, blockID, referrer, storageClass, expiresAt)
+	}
+}
+
 func TestGetCanonicalHeadCommit_LibraryStateErrorIsNotMaskedAsNotFound(t *testing.T) {
 	helper := &FSHelper{db: &db.DB{}}
 	original := resolveLiveLibraryStateByIDFn
@@ -159,6 +171,7 @@ func TestRegisterFSObjectBlockReferences_AddsReferencesForPersistedFSObject(t *t
 }
 
 func TestRegisterUploadedBlock_PropagatesObservedFenceWithoutSleeping(t *testing.T) {
+	installSplitProvisionalReferenceHookForTest(t)
 	helper := &FSHelper{}
 	oldAdd := registerUploadedBlockAddReferenceFn
 	oldFence := registerUploadedBlockFenceActiveFn
@@ -248,7 +261,10 @@ func TestRegisterUploadedBlock_PropagatesObservedFenceWithoutSleeping(t *testing
 }
 
 func TestRegisterUploadedBlock_ReleasesStaleDeleteClaimWithEmptyStorageClass(t *testing.T) {
+	installSplitProvisionalReferenceHookForTest(t)
 	helper := &FSHelper{db: &db.DB{}}
+	oldDeleteStub := registerUploadedBlockDeleteStubFn
+	t.Cleanup(func() { registerUploadedBlockDeleteStubFn = oldDeleteStub })
 	oldAdd := registerUploadedBlockAddReferenceFn
 	oldFence := registerUploadedBlockFenceActiveFn
 	oldClaimInfo := registerUploadedBlockClaimInfoFn
@@ -283,8 +299,8 @@ func TestRegisterUploadedBlock_ReleasesStaleDeleteClaimWithEmptyStorageClass(t *
 		calls = append(calls, "claim-info")
 		return db.BlockDeleteClaimInfo{GCState: db.BlockGCStateDeleting, GCClaimID: "claim-1"}, true, nil
 	}
-	registerUploadedBlockReleaseClaimFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
-		calls = append(calls, "release-claim")
+	registerUploadedBlockDeleteStubFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
+		calls = append(calls, "delete-stub")
 		if claimID != "claim-1" {
 			t.Fatalf("claimID = %q, want claim-1", claimID)
 		}
@@ -312,7 +328,7 @@ func TestRegisterUploadedBlock_ReleasesStaleDeleteClaimWithEmptyStorageClass(t *
 	if err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1"); !errors.Is(err, ErrBlockDeleteInProgress) {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want ErrBlockDeleteInProgress", err)
 	}
-	want := []string{"add", "expiry", "fence", "claim-info", "release-claim"}
+	want := []string{"add", "expiry", "fence", "claim-info", "delete-stub"}
 	if len(calls) != len(want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
 	}
@@ -323,7 +339,137 @@ func TestRegisterUploadedBlock_ReleasesStaleDeleteClaimWithEmptyStorageClass(t *
 	}
 }
 
+func TestRemoveStaleUploadedBlockDeleteStub_ReleasedStub(t *testing.T) {
+	helper := &FSHelper{db: &db.DB{}}
+	oldClaimInfo := registerUploadedBlockClaimInfoFn
+	oldDeleteClaimed := registerUploadedBlockDeleteStubFn
+	oldDeleteReleased := registerUploadedBlockDeleteReleasedStubFn
+	t.Cleanup(func() {
+		registerUploadedBlockClaimInfoFn = oldClaimInfo
+		registerUploadedBlockDeleteStubFn = oldDeleteClaimed
+		registerUploadedBlockDeleteReleasedStubFn = oldDeleteReleased
+	})
+
+	registerUploadedBlockClaimInfoFn = func(h *FSHelper, orgID, blockID string) (db.BlockDeleteClaimInfo, bool, error) {
+		return db.BlockDeleteClaimInfo{}, true, nil
+	}
+	registerUploadedBlockDeleteStubFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
+		t.Fatal("claimed-stub LWT must not run for a released stub")
+		return false, nil
+	}
+	registerUploadedBlockDeleteReleasedStubFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		if orgID != "org-1" || blockID != "block-1" {
+			t.Fatalf("released delete args = %s/%s, want org-1/block-1", orgID, blockID)
+		}
+		return true, nil
+	}
+
+	removed, err := helper.removeStaleUploadedBlockDeleteStub("org-1", "block-1")
+	if err != nil {
+		t.Fatalf("removeStaleUploadedBlockDeleteStub() error = %v, want nil", err)
+	}
+	if !removed {
+		t.Fatal("removeStaleUploadedBlockDeleteStub() removed = false, want true")
+	}
+}
+
+func TestRemoveStaleUploadedBlockDeleteStub_ReleasedLWTNotApplied(t *testing.T) {
+	helper := &FSHelper{db: &db.DB{}}
+	oldClaimInfo := registerUploadedBlockClaimInfoFn
+	oldDeleteReleased := registerUploadedBlockDeleteReleasedStubFn
+	t.Cleanup(func() {
+		registerUploadedBlockClaimInfoFn = oldClaimInfo
+		registerUploadedBlockDeleteReleasedStubFn = oldDeleteReleased
+	})
+
+	registerUploadedBlockClaimInfoFn = func(h *FSHelper, orgID, blockID string) (db.BlockDeleteClaimInfo, bool, error) {
+		return db.BlockDeleteClaimInfo{}, true, nil
+	}
+	registerUploadedBlockDeleteReleasedStubFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		return false, nil
+	}
+
+	removed, err := helper.removeStaleUploadedBlockDeleteStub("org-1", "block-1")
+	if err != nil {
+		t.Fatalf("removeStaleUploadedBlockDeleteStub() error = %v, want nil", err)
+	}
+	if removed {
+		t.Fatal("removeStaleUploadedBlockDeleteStub() removed = true, want false")
+	}
+}
+
+func TestRemoveStaleUploadedBlockDeleteStub_ActiveClaimUsesClaimedLWT(t *testing.T) {
+	helper := &FSHelper{db: &db.DB{}}
+	oldClaimInfo := registerUploadedBlockClaimInfoFn
+	oldDeleteClaimed := registerUploadedBlockDeleteStubFn
+	oldDeleteReleased := registerUploadedBlockDeleteReleasedStubFn
+	t.Cleanup(func() {
+		registerUploadedBlockClaimInfoFn = oldClaimInfo
+		registerUploadedBlockDeleteStubFn = oldDeleteClaimed
+		registerUploadedBlockDeleteReleasedStubFn = oldDeleteReleased
+	})
+
+	registerUploadedBlockClaimInfoFn = func(h *FSHelper, orgID, blockID string) (db.BlockDeleteClaimInfo, bool, error) {
+		return db.BlockDeleteClaimInfo{GCState: db.BlockGCStateDeleting, GCClaimID: " claim-1 "}, true, nil
+	}
+	registerUploadedBlockDeleteReleasedStubFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		t.Fatal("released-stub LWT must not run for an active claim")
+		return false, nil
+	}
+	registerUploadedBlockDeleteStubFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
+		if claimID != "claim-1" {
+			t.Fatalf("claimID = %q, want trimmed claim-1", claimID)
+		}
+		return true, nil
+	}
+
+	removed, err := helper.removeStaleUploadedBlockDeleteStub("org-1", "block-1")
+	if err != nil || !removed {
+		t.Fatalf("removeStaleUploadedBlockDeleteStub() = %v, %v; want true, nil", removed, err)
+	}
+}
+
+func TestRemoveStaleUploadedBlockDeleteStub_RealRowIsNotDeleted(t *testing.T) {
+	helper := &FSHelper{db: &db.DB{}}
+	oldClaimInfo := registerUploadedBlockClaimInfoFn
+	oldDeleteClaimed := registerUploadedBlockDeleteStubFn
+	oldDeleteReleased := registerUploadedBlockDeleteReleasedStubFn
+	t.Cleanup(func() {
+		registerUploadedBlockClaimInfoFn = oldClaimInfo
+		registerUploadedBlockDeleteStubFn = oldDeleteClaimed
+		registerUploadedBlockDeleteReleasedStubFn = oldDeleteReleased
+	})
+
+	deleteCalled := false
+	registerUploadedBlockDeleteStubFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
+		deleteCalled = true
+		return false, nil
+	}
+	registerUploadedBlockDeleteReleasedStubFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		deleteCalled = true
+		return false, nil
+	}
+
+	rows := []db.BlockDeleteClaimInfo{
+		{StorageClass: "hot"},
+		{CreatedAt: time.Now().UTC()},
+	}
+	for _, row := range rows {
+		registerUploadedBlockClaimInfoFn = func(h *FSHelper, orgID, blockID string) (db.BlockDeleteClaimInfo, bool, error) {
+			return row, true, nil
+		}
+		removed, err := helper.removeStaleUploadedBlockDeleteStub("org-1", "block-1")
+		if err != nil || removed {
+			t.Fatalf("row %+v result = %v, %v; want false, nil", row, removed, err)
+		}
+	}
+	if deleteCalled {
+		t.Fatal("a delete LWT ran for a real metadata row")
+	}
+}
+
 func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
+	installSplitProvisionalReferenceHookForTest(t)
 	helper := &FSHelper{}
 	oldAdd := registerUploadedBlockAddReferenceFn
 	oldFence := registerUploadedBlockFenceActiveFn
@@ -371,43 +517,37 @@ func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	}
 }
 
-func TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails(t *testing.T) {
+func TestRegisterUploadedBlock_FailsBeforeFenceWhenAtomicProvisionalWriteFails(t *testing.T) {
 	helper := &FSHelper{}
-	oldAdd := registerUploadedBlockAddReferenceFn
+	oldProvisional := registerUploadedBlockAddProvisionalFn
 	oldFence := registerUploadedBlockFenceActiveFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
-	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	oldRelease := registerUploadedBlockReleaseRefsFn
 	oldEnqueue := registerUploadedBlockEnqueueZeroRefFn
 	t.Cleanup(func() {
-		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockAddProvisionalFn = oldProvisional
 		registerUploadedBlockFenceActiveFn = oldFence
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
-		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
 		registerUploadedBlockReleaseRefsFn = oldRelease
 		registerUploadedBlockEnqueueZeroRefFn = oldEnqueue
 	})
 
 	var calls []string
-	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
-		calls = append(calls, "add")
-		return nil
-	}
 	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
-		t.Fatal("fence check should not run when expiry tracking fails")
+		t.Fatal("fence check should not run when atomic provisional write fails")
 		return false, nil
 	}
 	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
-		t.Fatal("metadata upsert should not run when expiry tracking fails")
+		t.Fatal("metadata upsert should not run when atomic provisional write fails")
 		return nil
 	}
-	expiryErr := errors.New("expiry write failed")
-	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
-		calls = append(calls, "expiry")
-		return expiryErr
+	writeErr := errors.New("logged batch failed")
+	registerUploadedBlockAddProvisionalFn = func(h *FSHelper, orgID, blockID, referrer, libraryID, storageClass string, expiresAt time.Time) error {
+		calls = append(calls, "atomic-provisional")
+		return writeErr
 	}
 	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
-		t.Fatal("expiry failure must not delete a pin shared by another attempt")
+		t.Fatal("failed atomic write must not run cleanup")
 		return nil
 	}
 	registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string, storageClass string) {
@@ -415,10 +555,10 @@ func TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails(t *testing.T) {
 	}
 
 	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
-	if !errors.Is(err, expiryErr) {
-		t.Fatalf("RegisterUploadedBlock() error = %v, want wrapped %v", err, expiryErr)
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want wrapped %v", err, writeErr)
 	}
-	want := []string{"add", "expiry"}
+	want := []string{"atomic-provisional"}
 	if len(calls) != len(want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
 	}
@@ -430,6 +570,7 @@ func TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails(t *testing.T) {
 }
 
 func TestRegisterUploadedBlock_ReenqueuesZeroRefWhenFenceNeverClears(t *testing.T) {
+	installSplitProvisionalReferenceHookForTest(t)
 	helper := &FSHelper{}
 	oldAdd := registerUploadedBlockAddReferenceFn
 	oldFence := registerUploadedBlockFenceActiveFn

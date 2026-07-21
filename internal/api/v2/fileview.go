@@ -466,11 +466,11 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	// Record traffic after the response is fully written (covers all return paths).
 	// downloadPeriod is set by the quota pre-check below and captured by the defer closure.
 	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true}
-	bytesBefore := int64(c.Writer.Size())
+	bytesBefore := responseBodyBytes(c.Writer)
 	defer func() {
 		if status := c.Writer.Status(); status >= http.StatusOK && status < http.StatusMultipleChoices {
 			if rec := traffic.Get(); rec != nil {
-				sent := int64(c.Writer.Size()) - bytesBefore
+				sent := responseBodyBytes(c.Writer) - bytesBefore
 				if sent > 0 {
 					traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, orgID, userID, traffic.WebDownload, sent)
 				}
@@ -672,7 +672,13 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 
 	// For video/audio files, use BlockReadSeeker so http.ServeContent can handle
 	// Range requests (HTTP 206) without buffering the entire file. Only O(1 block) RAM.
-	if !encrypted && (isVideoFile(ext) || isAudioFile(ext)) {
+	isMedia := isVideoFile(ext) || isAudioFile(ext)
+	if encrypted && isMedia {
+		// Persisted block sizes are ciphertext sizes, so random plaintext seeks
+		// cannot be mapped safely until plaintext sizes are stored per block.
+		c.Header("Accept-Ranges", "none")
+	}
+	if mediaRangeSupported(encrypted, ext) {
 		blockSizes, err := streaming.QueryBlockSizes(ctx, h.db, orgID, canonicalReader, resolvedIDs)
 		if err != nil {
 			log.Printf("[ServeRawFile] Failed to query block sizes: %v", err)
@@ -690,12 +696,24 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	// Non-video/audio: stream block-by-block, O(block_size) RAM
 	c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 	c.Header("Content-Type", mimeType)
-	if fileSize > 0 && !encrypted {
+	if fileSize > 0 {
 		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
 	}
 	c.Status(http.StatusOK)
 
 	_ = streaming.StreamBlocks(c, ctx, canonicalReader, resolvedIDs, fileKeyParam, fileIVParam, "ServeRawFile")
+}
+
+func responseBodyBytes(writer gin.ResponseWriter) int64 {
+	size := int64(writer.Size())
+	if size < 0 {
+		return 0
+	}
+	return size
+}
+
+func mediaRangeSupported(encrypted bool, ext string) bool {
+	return !encrypted && (isVideoFile(ext) || isAudioFile(ext))
 }
 
 // sanitizeFilename removes characters that could cause header injection in Content-Disposition.
@@ -1008,15 +1026,12 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	c.Header("Content-Type", "application/octet-stream")
 	c.Status(http.StatusOK)
 
-	bytesBefore := int64(c.Writer.Size())
+	bytesBefore := responseBodyBytes(c.Writer)
 	_ = streaming.StreamBlocks(c, c.Request.Context(), canonicalReader, resolvedIDs, fileKey, fileIV, "DownloadHistoricFile")
 
 	// Record download traffic using actual bytes written.
 	if rec := traffic.Get(); rec != nil {
-		bytesAfter := int64(c.Writer.Size())
-		if bytesAfter < 0 {
-			bytesAfter = 0
-		}
+		bytesAfter := responseBodyBytes(c.Writer)
 		if sent := bytesAfter - bytesBefore; sent > 0 {
 			traffic.RecordCheckedTransfer(rec, historicDownloadStatus, orgID, userID, traffic.WebDownload, sent)
 		}
@@ -1089,11 +1104,11 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	// Record traffic after the response is fully written (covers all return paths).
 	// rawDownloadPeriod is set by the quota pre-check below and captured by the defer closure.
 	rawDownloadStatus := traffic.QuotaStatus{Allowed: true}
-	bytesBefore := int64(c.Writer.Size())
+	bytesBefore := responseBodyBytes(c.Writer)
 	defer func() {
 		if status := c.Writer.Status(); status >= http.StatusOK && status < http.StatusMultipleChoices {
 			if rec := traffic.Get(); rec != nil {
-				sent := int64(c.Writer.Size()) - bytesBefore
+				sent := responseBodyBytes(c.Writer) - bytesBefore
 				if sent > 0 {
 					traffic.RecordCheckedTransfer(rec, rawDownloadStatus, orgID, userID, traffic.WebDownload, sent)
 				}

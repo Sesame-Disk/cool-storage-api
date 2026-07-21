@@ -176,7 +176,9 @@ func validateManifest(req *fileFromBlocksRequest, blockSize int64) error {
 	// cannot survive the later last-wins dedup in sizeByHash and corrupt the
 	// committed file's size/offsets.
 	sizeSeen := make(map[string]int64, len(req.Blocks))
-	for i, b := range req.Blocks {
+	for i := range req.Blocks {
+		req.Blocks[i].SHA256 = db.NormalizeBlockID(req.Blocks[i].SHA256)
+		b := req.Blocks[i]
 		if !isHex64(b.SHA256) {
 			return fmt.Errorf("block %d: invalid sha256", i)
 		}

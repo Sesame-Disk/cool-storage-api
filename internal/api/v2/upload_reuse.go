@@ -9,8 +9,12 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 )
+
+var ErrBlockReuseProbeFailed = errors.New("block reuse probe failed")
+var ErrBlockMaterializationTransient = errors.New("block materialization transient failure")
 
 var probeUploadedBlockReuseFn = ProbeUploadedBlockReuse
 
@@ -30,9 +34,19 @@ var repairCanonicalBlockDirectFn = func(ctx context.Context, blockStore *storage
 // trustworthy without the complete decision.
 func ProbeUploadedBlockReuse(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
 	if database == nil || database.Session() == nil {
-		return db.BlockReuseProbe{Decision: db.BlockReuseUnknownError}, fmt.Errorf("block reuse probe unavailable for %s: database session is nil", blockID)
+		return db.BlockReuseProbe{Decision: db.BlockReuseUnknownError}, fmt.Errorf("%w for %s: database session is nil", ErrBlockReuseProbeFailed, blockID)
 	}
-	return database.ProbeBlockReuse(orgID, blockID)
+	probe, err := database.ProbeBlockReuse(orgID, blockID)
+	if err != nil {
+		return probe, fmt.Errorf("%w: %v", ErrBlockReuseProbeFailed, err)
+	}
+	return probe, nil
+}
+
+func IsRetryableBlockMaterializationError(err error) bool {
+	return errors.Is(err, ErrBlockDeleteInProgress) ||
+		errors.Is(err, ErrBlockReuseProbeFailed) ||
+		errors.Is(err, ErrBlockMaterializationTransient)
 }
 
 // ResolveCanonicalBlockStore resolves the exact canonical backend for a block.
@@ -142,6 +156,15 @@ func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.Bl
 		if resolveErr != nil {
 			return "", "", false, resolveErr
 		}
+		if strings.TrimSpace(probe.StorageClass) != "" {
+			exists, existsErr := reusableCanonicalObjectExistsFn(ctx, putStore, resolvedKey)
+			if existsErr != nil {
+				return resolvedKey, resolvedClass, false, fmt.Errorf("check canonical block %s before repair: %w", blockID, existsErr)
+			}
+			if exists {
+				return resolvedKey, resolvedClass, false, nil
+			}
+		}
 		if beforePut != nil {
 			if beforeErr := beforePut(); beforeErr != nil {
 				return resolvedKey, resolvedClass, false, beforeErr
@@ -196,11 +219,19 @@ func retryUploadedBlockMaterialization(ctx context.Context, label, blockID strin
 		blockSuffix = fmt.Sprintf(" for block %s", blockID)
 	}
 
-	retryBlocked := func(attempt int) error {
+	retryBlocked := func(attempt int, retryErr error) error {
 		if onRetry != nil {
 			onRetry()
 		}
-		if resolveFence != nil {
+		reason := "probe"
+		switch {
+		case errors.Is(retryErr, ErrBlockDeleteInProgress):
+			reason = "gc_fence"
+		case errors.Is(retryErr, ErrBlockMaterializationTransient):
+			reason = "materialization"
+		}
+		metrics.BlockUploadMaterializationRetriesTotal.WithLabelValues(label, reason).Inc()
+		if reason == "gc_fence" && resolveFence != nil {
 			resolved, resolveErr := resolveFence()
 			if resolveErr != nil {
 				log.Printf("[%s] failed to inspect S3 orphan fence%s: %v", label, blockSuffix, resolveErr)
@@ -209,7 +240,7 @@ func retryUploadedBlockMaterialization(ctx context.Context, label, blockID strin
 			}
 		}
 		sleepFor := RetryBackoff(attempt)
-		log.Printf("[%s] block materialization fenced by GC%s; retrying (%d/%d) after %s", label, blockSuffix, attempt, attempts, sleepFor)
+		log.Printf("[%s] block materialization retry%s reason=%s (%d/%d) after %s", label, blockSuffix, reason, attempt, attempts, sleepFor)
 		if ctx != nil {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -232,19 +263,19 @@ func retryUploadedBlockMaterialization(ctx context.Context, label, blockID strin
 
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := store(); err != nil {
-			if !errors.Is(err, ErrBlockDeleteInProgress) || attempt == attempts {
+			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			if retryErr := retryBlocked(attempt); retryErr != nil {
+			if retryErr := retryBlocked(attempt, err); retryErr != nil {
 				return retryErr
 			}
 			continue
 		}
 		if err := materialize(); err != nil {
-			if !errors.Is(err, ErrBlockDeleteInProgress) || attempt == attempts {
+			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			if retryErr := retryBlocked(attempt); retryErr != nil {
+			if retryErr := retryBlocked(attempt, err); retryErr != nil {
 				return retryErr
 			}
 			continue

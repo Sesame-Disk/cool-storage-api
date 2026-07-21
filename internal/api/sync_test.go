@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
@@ -47,6 +48,30 @@ func setupSyncTestRouter() *gin.Engine {
 		c.Next()
 	})
 	return r
+}
+
+func TestPutBlockRejectsOversizedBody(t *testing.T) {
+	allowSyncDatabaseForTest(t)
+	setAPIQuotaChecker(t, nil)
+
+	cfg := config.DefaultConfig()
+	cfg.Chunking.Adaptive.AbsoluteMax = 4
+	handler := &SyncHandler{db: &db.DB{}, config: cfg}
+	r := setupSyncTestRouter()
+	r.PUT("/seafhttp/repo/:repo_id/block/:block_id", handler.PutBlock)
+
+	for _, contentLength := range []int64{5, -1} {
+		t.Run(fmt.Sprintf("content_length_%d", contentLength), func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo-1/block/0123456789012345678901234567890123456789", strings.NewReader("hello"))
+			req.ContentLength = contentLength
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d, want %d", w.Code, http.StatusRequestEntityTooLarge)
+			}
+		})
+	}
 }
 
 // TestCommitStruct tests the Commit struct JSON serialization

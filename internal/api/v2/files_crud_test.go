@@ -426,6 +426,32 @@ func TestRetryCreateFileTemplateBlockMaterializationContextStopsCanceledBackoff(
 	}
 }
 
+func TestRetryCreateFileTemplateBlockMaterializationUsesSharedBudget(t *testing.T) {
+	oldBackoff := createFileTemplateBlockRetryBackoffFn
+	oldSleep := createFileTemplateBlockSleepFn
+	createFileTemplateBlockRetryBackoffFn = func(int) time.Duration { return 0 }
+	createFileTemplateBlockSleepFn = func(time.Duration) {}
+	t.Cleanup(func() {
+		createFileTemplateBlockRetryBackoffFn = oldBackoff
+		createFileTemplateBlockSleepFn = oldSleep
+	})
+
+	storeCalls := 0
+	err := retryCreateFileTemplateBlockMaterialization(func() error {
+		storeCalls++
+		return ErrBlockDeleteInProgress
+	}, func() error {
+		t.Fatal("register must not run after a fenced store")
+		return nil
+	}, nil)
+	if !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("error = %v, want ErrBlockDeleteInProgress", err)
+	}
+	if storeCalls != RetryAttempts() {
+		t.Fatalf("store calls = %d, want shared budget %d", storeCalls, RetryAttempts())
+	}
+}
+
 // Test CreateDirectory root path
 func TestCreateDirectory_RootPath(t *testing.T) {
 	r := gin.New()

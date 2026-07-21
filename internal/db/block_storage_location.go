@@ -12,6 +12,7 @@ type BlockStorageLocation struct {
 	SizeBytes    int64
 	StorageClass string
 	StorageKey   string
+	GCState      string
 }
 
 // GetBlockStorageLocation reads one block's canonical physical location. The
@@ -20,7 +21,7 @@ type BlockStorageLocation struct {
 func (db *DB) GetBlockStorageLocation(ctx context.Context, orgID, blockID string) (BlockStorageLocation, bool, error) {
 	return scanBlockStorageLocation(func(dest ...interface{}) error {
 		return db.Session().Query(`
-			SELECT size_bytes, storage_class, storage_key
+			SELECT size_bytes, storage_class, storage_key, gc_state
 			FROM blocks
 			WHERE org_id = ? AND block_id = ?
 		`, orgID, blockID).WithContext(ctx).Scan(dest...)
@@ -29,7 +30,7 @@ func (db *DB) GetBlockStorageLocation(ctx context.Context, orgID, blockID string
 
 func scanBlockStorageLocation(scan func(dest ...interface{}) error) (BlockStorageLocation, bool, error) {
 	var location BlockStorageLocation
-	err := scan(&location.SizeBytes, &location.StorageClass, &location.StorageKey)
+	err := scan(&location.SizeBytes, &location.StorageClass, &location.StorageKey, &location.GCState)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return BlockStorageLocation{}, false, nil

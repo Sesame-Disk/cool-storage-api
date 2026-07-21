@@ -16,6 +16,32 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
+func TestResponseBodyBytesNormalizesUnwrittenGinWriter(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	if got := responseBodyBytes(c.Writer); got != 0 {
+		t.Fatalf("responseBodyBytes(unwritten) = %d, want 0", got)
+	}
+	if _, err := c.Writer.Write([]byte("abc")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if got := responseBodyBytes(c.Writer); got != 3 {
+		t.Fatalf("responseBodyBytes(written) = %d, want 3", got)
+	}
+}
+
+func TestMediaRangeSupportedRejectsEncryptedMedia(t *testing.T) {
+	if mediaRangeSupported(true, "mp4") || mediaRangeSupported(true, "mp3") {
+		t.Fatal("encrypted media must not advertise byte-range support without plaintext block sizes")
+	}
+	if !mediaRangeSupported(false, "mp4") {
+		t.Fatal("unencrypted video should support byte ranges")
+	}
+	if mediaRangeSupported(false, "pdf") {
+		t.Fatal("non-media preview should not use the media range path")
+	}
+}
+
 // mockTokenCreator implements TokenCreator interface for testing
 type mockTokenCreator struct{}
 

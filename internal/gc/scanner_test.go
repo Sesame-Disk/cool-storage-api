@@ -76,9 +76,6 @@ func TestScanner_ScanOnce_ExpiredProvisionalRefEnqueuesZeroRefBlock(t *testing.T
 
 	store.AddOrganization(orgID)
 	store.AddBlock(orgID, blockID, "hot", 0)
-	store.mu.Lock()
-	store.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)] = map[string]struct{}{referrer: {}}
-	store.mu.Unlock()
 	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", expiresAt)
 
 	if err := s.ScanOnce(context.Background()); err != nil {
@@ -130,8 +127,7 @@ func TestScanner_ScanExpiredProvisionalBlockRefs_PreservesLiveBlocks(t *testing.
 	store.AddBlock(orgID, blockID, "hot", 0)
 	store.mu.Lock()
 	store.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)] = map[string]struct{}{
-		expiredRef: {},
-		fsRef:      {},
+		fsRef: {},
 	}
 	store.mu.Unlock()
 	store.AddProvisionalBlockRefExpiry(orgID, blockID, expiredRef, "hot", expiresAt)
@@ -226,6 +222,49 @@ func TestScanner_ScanExpiredProvisionalBlockRefs_IgnoresStaleProjectionWhenCanon
 	}
 }
 
+func TestScanner_ScanExpiredProvisionalBlockRefs_PreservesConcurrentRenewal(t *testing.T) {
+	store := NewMockStore()
+	s := NewScanner(store, NewQueue(store), &Stats{}, config.GCConfig{})
+
+	orgID := uuid.New()
+	blockID := "block-concurrently-renewed-upload"
+	referrer := db.BlockReferrerForUpload("concurrent-renewal-op")
+	expiredAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	renewedExpiresAt := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", expiredAt)
+	store.SetBlockReferenceExistsHookForTest(func(hookOrgID uuid.UUID, hookBlockID, hookReferrer string, _ bool) (bool, error) {
+		store.SetBlockReferenceExistsHookForTest(nil)
+		store.AddBlockReferenceForTest(hookOrgID, hookBlockID, hookReferrer)
+		store.AddProvisionalBlockRefExpiry(hookOrgID, hookBlockID, hookReferrer, "hot", renewedExpiresAt)
+		return false, nil
+	})
+
+	cleaned, err := s.scanExpiredProvisionalBlockRefs(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() error = %v", err)
+	}
+	if cleaned != 1 {
+		t.Fatalf("cleaned = %d, want 1 stale generation", cleaned)
+	}
+	hasRefs, err := store.BlockHasReferences(orgID, blockID)
+	if err != nil {
+		t.Fatalf("BlockHasReferences() error = %v", err)
+	}
+	if !hasRefs {
+		t.Fatal("concurrently renewed provisional reference was removed")
+	}
+	canonical, found, err := store.GetProvisionalBlockRefExpiry(orgID, blockID, referrer)
+	if err != nil {
+		t.Fatalf("GetProvisionalBlockRefExpiry() error = %v", err)
+	}
+	if !found || !canonical.ExpiresAt.Equal(renewedExpiresAt) {
+		t.Fatalf("canonical expiry = %#v, found=%v; want %v", canonical, found, renewedExpiresAt)
+	}
+}
+
 func TestScanner_ScanExpiredProvisionalBlockRefs_DropsProjectionWhenCanonicalMissing(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -286,9 +325,6 @@ func TestScanner_ScanExpiredProvisionalBlockRefs_UsesScanTimeForCandidatePartiti
 
 	store.AddOrganization(orgID)
 	store.AddBlock(orgID, blockID, "hot", 0)
-	store.mu.Lock()
-	store.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)] = map[string]struct{}{referrer: {}}
-	store.mu.Unlock()
 	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", expiresAt)
 
 	cleaned, err := s.scanExpiredProvisionalBlockRefs(context.Background())

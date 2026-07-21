@@ -184,11 +184,6 @@ func rebuildTraversedDirectoryToRoot(fsHelper *FSHelper, repoID string, result *
 // delay (exponential with jitter, capped). Only the attempt count is local.
 const uploadMetadataRetryAttempts = 20
 
-// Office template creates can race with GC over the shared content-addressed
-// template block. When that happens, re-store the template and retry the block
-// registration instead of surfacing a transient 500 to the caller.
-const createFileTemplateBlockRetryAttempts = 3
-
 var createFileTemplateBlockRetryBackoffFn = RetryBackoff
 
 var createFileTemplateBlockSleepFn = time.Sleep
@@ -198,7 +193,7 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 }
 
 func retryCreateFileTemplateBlockMaterializationContext(ctx context.Context, store func() error, register func() error, resetStored func()) error {
-	attempts := createFileTemplateBlockRetryAttempts
+	attempts := RetryAttempts()
 	if attempts < 1 {
 		attempts = 1
 	}

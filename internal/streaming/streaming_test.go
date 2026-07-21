@@ -1,16 +1,80 @@
 package streaming
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/gin-gonic/gin"
 )
+
+type trackedReadCloser struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (r *trackedReadCloser) Close() error {
+	r.closed.Store(true)
+	return nil
+}
+
+type streamTestBlockReader struct {
+	mu      sync.Mutex
+	results map[string]struct {
+		reader io.ReadCloser
+		err    error
+	}
+}
+
+type blockingPrefetchBlockReader struct {
+	current    io.ReadCloser
+	prefetched io.ReadCloser
+	boom       error
+	started    chan struct{}
+	release    chan struct{}
+}
+
+func (r *blockingPrefetchBlockReader) GetBlock(context.Context, string) ([]byte, error) {
+	return nil, errors.New("unexpected encrypted block read")
+}
+
+func (r *blockingPrefetchBlockReader) GetBlockReader(_ context.Context, hash string) (io.ReadCloser, error) {
+	if hash == "block-1" {
+		return r.current, r.boom
+	}
+	close(r.started)
+	<-r.release
+	return r.prefetched, nil
+}
+
+func (r *blockingPrefetchBlockReader) GetBlockSize(context.Context, string) (int64, error) {
+	return 0, errors.New("unexpected size read")
+}
+
+func (r *streamTestBlockReader) GetBlock(context.Context, string) ([]byte, error) {
+	return nil, errors.New("unexpected encrypted block read")
+}
+
+func (r *streamTestBlockReader) GetBlockReader(_ context.Context, hash string) (io.ReadCloser, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := r.results[hash]
+	return result.reader, result.err
+}
+
+func (r *streamTestBlockReader) GetBlockSize(context.Context, string) (int64, error) {
+	return 0, errors.New("unexpected size read")
+}
 
 // sha1Hex / sha256Hex produce deterministic, unique hex IDs of the exact
 // lengths resolveBlockIDs keys off: 40 chars = SHA-1 (needs resolution),
@@ -257,6 +321,75 @@ func TestResolveBlockIDs_RejectsNonSHAInternalID(t *testing.T) {
 				t.Errorf("resolveBlockIDs() = %v, want nil slice on error", got)
 			}
 		})
+	}
+}
+
+func TestStreamBlocksClosesCurrentAndPrefetchedReadersOnFetchError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	current := &trackedReadCloser{Reader: strings.NewReader("current")}
+	prefetched := &trackedReadCloser{Reader: strings.NewReader("next")}
+	boom := errors.New("current fetch failed")
+	reader := &streamTestBlockReader{results: map[string]struct {
+		reader io.ReadCloser
+		err    error
+	}{
+		"block-1": {reader: current, err: boom},
+		"block-2": {reader: prefetched},
+	}}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	err := StreamBlocks(c, context.Background(), reader, []string{"block-1", "block-2"}, nil, nil, "test")
+	if !errors.Is(err, boom) {
+		t.Fatalf("StreamBlocks() error = %v, want %v", err, boom)
+	}
+	deadline := time.Now().Add(time.Second)
+	for !prefetched.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !current.closed.Load() || !prefetched.closed.Load() {
+		t.Fatalf("reader closed state = current:%v prefetched:%v, want both true", current.closed.Load(), prefetched.closed.Load())
+	}
+}
+
+func TestStreamBlocksDoesNotWaitForBlockedPrefetchCleanup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	current := &trackedReadCloser{Reader: strings.NewReader("current")}
+	prefetched := &trackedReadCloser{Reader: strings.NewReader("next")}
+	boom := errors.New("current fetch failed")
+	reader := &blockingPrefetchBlockReader{
+		current:    current,
+		prefetched: prefetched,
+		boom:       boom,
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	result := make(chan error, 1)
+	go func() {
+		result <- StreamBlocks(c, context.Background(), reader, []string{"block-1", "block-2"}, nil, nil, "test")
+	}()
+
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("prefetch did not start")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, boom) {
+			t.Fatalf("StreamBlocks() error = %v, want %v", err, boom)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("StreamBlocks waited for blocked prefetch cleanup")
+	}
+
+	close(reader.release)
+	deadline := time.Now().Add(time.Second)
+	for !prefetched.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !current.closed.Load() || !prefetched.closed.Load() {
+		t.Fatalf("reader closed state = current:%v prefetched:%v, want both true", current.closed.Load(), prefetched.closed.Load())
 	}
 }
 

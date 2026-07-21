@@ -467,6 +467,28 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
 	}
 	if hasRefs {
+		blockInfo, infoErr := w.store.GetBlockInfo(item.OrgID, item.ItemID)
+		if infoErr != nil {
+			return fmt.Errorf("failed to load re-referenced block info for %s: %w", item.ItemID, infoErr)
+		}
+		if strings.TrimSpace(blockInfo.StorageClass) == "" && blockInfo.CreatedAt == nil {
+			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, claimID)
+			if deleteErr != nil {
+				return fmt.Errorf("failed to conditionally delete re-referenced stub block %s: %w", item.ItemID, deleteErr)
+			}
+			if !deleted {
+				return fmt.Errorf("conditional delete of re-referenced stub block %s was not applied", item.ItemID)
+			}
+			if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.RepresentationID, blockInfo.Sha1); err != nil {
+				return err
+			}
+			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
+				return fmt.Errorf("failed to clear block GC candidate after referenced stub cleanup: %w", err)
+			}
+			log.Printf("[GC Worker] Block %s re-referenced after claim; removed metadata stub", item.ItemID)
+			metrics.GCItemsSkippedTotal.Inc()
+			return nil
+		}
 		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
 			return fmt.Errorf("failed to release claim on re-referenced block %s: %w", item.ItemID, relErr)
 		}

@@ -3,14 +3,17 @@ package v2
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type fastClearBlockDeleter struct {
@@ -96,6 +99,7 @@ func TestRetryUploadedBlockMaterializationContextStopsCanceledBackoff(t *testing
 }
 
 func TestRetryUploadedBlockMaterializationRestoresObjectAfterFastClearingFence(t *testing.T) {
+	installSplitProvisionalReferenceHookForTest(t)
 	oldAdd := registerUploadedBlockAddReferenceFn
 	oldExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	oldFence := registerUploadedBlockFenceActiveFn
@@ -172,6 +176,7 @@ func TestRetryUploadedBlockMaterializationRestoresObjectAfterFastClearingFence(t
 }
 
 func TestRetryUploadedBlockMaterializationWithWorkerPausedAfterPostClaimCheck(t *testing.T) {
+	installSplitProvisionalReferenceHookForTest(t)
 	oldAdd := registerUploadedBlockAddReferenceFn
 	oldExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	oldFence := registerUploadedBlockFenceActiveFn
@@ -298,6 +303,95 @@ func TestRetryUploadedBlockMaterializationWithWorkerPausedAfterPostClaimCheck(t 
 	}
 }
 
+// A crashed GC worker can leave a claimed metadata stub (no storage_class, no
+// created_at). The repair for it lives in RegisterUploadedBlock, which only runs
+// in the materialize phase, so this exercises the real store->materialize loop
+// rather than calling the repair helper directly: the upload must clear the stub
+// and then publish metadata instead of dead-ending.
+func TestRetryUploadedBlockMaterializationRepairsClaimedStubAndSucceeds(t *testing.T) {
+	oldProvisional := registerUploadedBlockAddProvisionalFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldClaimInfo := registerUploadedBlockClaimInfoFn
+	oldDeleteClaimed := registerUploadedBlockDeleteStubFn
+	oldDeleteReleased := registerUploadedBlockDeleteReleasedStubFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldDelay := libraryHeadMutationRetryDelay
+	oldMaxDelay := libraryHeadMutationRetryMaxDelay
+	oldJitter := libraryHeadMutationRetryJitter
+	oldSleep := registerUploadedBlockSleepFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddProvisionalFn = oldProvisional
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockClaimInfoFn = oldClaimInfo
+		registerUploadedBlockDeleteStubFn = oldDeleteClaimed
+		registerUploadedBlockDeleteReleasedStubFn = oldDeleteReleased
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		libraryHeadMutationRetryDelay = oldDelay
+		libraryHeadMutationRetryMaxDelay = oldMaxDelay
+		libraryHeadMutationRetryJitter = oldJitter
+		registerUploadedBlockSleepFn = oldSleep
+	})
+
+	libraryHeadMutationRetryDelay = 0
+	libraryHeadMutationRetryMaxDelay = 0
+	libraryHeadMutationRetryJitter = 0
+	registerUploadedBlockSleepFn = func(time.Duration) {}
+	registerUploadedBlockAddProvisionalFn = func(*FSHelper, string, string, string, string, string, time.Time) error {
+		return nil
+	}
+
+	stubPresent := true
+	storeCalls := 0
+	stubDeletes := 0
+	metadataWrites := 0
+
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) {
+		return stubPresent, nil
+	}
+	registerUploadedBlockClaimInfoFn = func(*FSHelper, string, string) (db.BlockDeleteClaimInfo, bool, error) {
+		if !stubPresent {
+			return db.BlockDeleteClaimInfo{}, false, nil
+		}
+		return db.BlockDeleteClaimInfo{GCState: db.BlockGCStateDeleting, GCClaimID: "claim-1"}, true, nil
+	}
+	registerUploadedBlockDeleteStubFn = func(_ *FSHelper, _, _, claimID string) (bool, error) {
+		if claimID != "claim-1" {
+			t.Fatalf("claimID = %q, want claim-1", claimID)
+		}
+		stubDeletes++
+		stubPresent = false
+		return true, nil
+	}
+	registerUploadedBlockDeleteReleasedStubFn = func(*FSHelper, string, string) (bool, error) {
+		t.Fatal("released-stub LWT must not run while the stub is still claimed")
+		return false, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
+		if stubPresent {
+			t.Fatal("metadata published while the GC stub still exists")
+		}
+		metadataWrites++
+		return nil
+	}
+
+	helper := &FSHelper{db: &db.DB{}}
+	err := RetryUploadedBlockMaterialization("stub-repair", "block-1", func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		return helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 4, "hot", "", "")
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("RetryUploadedBlockMaterialization() error = %v, want nil", err)
+	}
+	if storeCalls != 2 {
+		t.Fatalf("store calls = %d, want 2", storeCalls)
+	}
+	if stubDeletes != 1 || metadataWrites != 1 {
+		t.Fatalf("stubDeletes/metadataWrites = %d/%d, want 1/1", stubDeletes, metadataWrites)
+	}
+}
+
 func TestProbeUploadedBlockReuseReturnsUnknownErrorWithoutSession(t *testing.T) {
 	probe, err := ProbeUploadedBlockReuse(nil, "org-1", "block-1")
 	if err == nil {
@@ -318,6 +412,89 @@ func TestRetryUploadedBlockMaterializationReturnsNonRetryableStoreError(t *testi
 	}, nil, nil)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("RetryUploadedBlockMaterialization() error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationClassifiesRetryReason(t *testing.T) {
+	originalDelay := libraryHeadMutationRetryDelay
+	originalJitter := libraryHeadMutationRetryJitter
+	libraryHeadMutationRetryDelay = 0
+	libraryHeadMutationRetryJitter = 0
+	t.Cleanup(func() {
+		libraryHeadMutationRetryDelay = originalDelay
+		libraryHeadMutationRetryJitter = originalJitter
+	})
+
+	tests := []struct {
+		name          string
+		retryErr      error
+		retryPhase    string
+		reason        string
+		wantRetryable bool
+	}{
+		{name: "probe", retryErr: fmt.Errorf("%w: timeout", ErrBlockReuseProbeFailed), retryPhase: "store", reason: "probe", wantRetryable: true},
+		{name: "provisional materialization", retryErr: fmt.Errorf("%w: publish provisional reference: timeout", ErrBlockMaterializationTransient), retryPhase: "materialize", reason: "materialization", wantRetryable: true},
+		{name: "metadata materialization", retryErr: fmt.Errorf("%w: publish canonical metadata: timeout", ErrBlockMaterializationTransient), retryPhase: "materialize", reason: "materialization", wantRetryable: true},
+		{name: "GC fence", retryErr: ErrBlockDeleteInProgress, retryPhase: "store", reason: "gc_fence", wantRetryable: true},
+		{name: "non-retryable", retryErr: errors.New("permanent failure"), retryPhase: "store", wantRetryable: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			surface := "retry-reason-" + tt.reason
+			if tt.reason == "" {
+				surface = "retry-reason-non-retryable"
+			}
+			before := map[string]float64{}
+			for _, reason := range []string{"probe", "materialization", "gc_fence"} {
+				before[reason] = testutil.ToFloat64(metrics.BlockUploadMaterializationRetriesTotal.WithLabelValues(surface, reason))
+			}
+
+			storeCalls := 0
+			materializeCalls := 0
+			err := RetryUploadedBlockMaterialization(surface, "block-1", func() error {
+				storeCalls++
+				if tt.retryPhase == "store" && storeCalls == 1 {
+					return tt.retryErr
+				}
+				return nil
+			}, func() error {
+				materializeCalls++
+				if tt.retryPhase == "materialize" && materializeCalls == 1 {
+					return tt.retryErr
+				}
+				return nil
+			}, nil, nil)
+
+			if tt.wantRetryable {
+				if err != nil {
+					t.Fatalf("RetryUploadedBlockMaterialization() error = %v", err)
+				}
+			} else if !errors.Is(err, tt.retryErr) {
+				t.Fatalf("RetryUploadedBlockMaterialization() error = %v, want %v", err, tt.retryErr)
+			}
+			for _, reason := range []string{"probe", "materialization", "gc_fence"} {
+				want := before[reason]
+				if tt.wantRetryable && reason == tt.reason {
+					want++
+				}
+				if got := testutil.ToFloat64(metrics.BlockUploadMaterializationRetriesTotal.WithLabelValues(surface, reason)); got != want {
+					t.Errorf("reason %q counter = %v, want %v", reason, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestBlockMaterializationTransientPreservesCause(t *testing.T) {
+	cause := errors.New("database timeout")
+	err := fmt.Errorf("%w: register provisional reference: %w", ErrBlockMaterializationTransient, cause)
+
+	if !IsRetryableBlockMaterializationError(err) {
+		t.Fatal("transient materialization error should be retryable")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("transient materialization error should preserve its cause")
 	}
 }
 

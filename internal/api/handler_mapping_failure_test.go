@@ -15,15 +15,20 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func allowSyncDatabaseForTest(t *testing.T) {
+	t.Helper()
+	original := syncDatabaseAvailableFn
+	syncDatabaseAvailableFn = func(*db.DB) bool { return true }
+	t.Cleanup(func() { syncDatabaseAvailableFn = original })
+}
+
 func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
-	oldPutAuto := putUploadedBlockAutoFn
 	oldPutDirect := putUploadedBlockAutoDirectForUploadFn
 	oldProbe := probeUploadedBlockReuseForUploadFn
 	oldRegister := registerUploadedBlockAndMappingForUploadFn
 	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
 	oldEncrypted := lookupLibraryEncryptedForUploadFn
 	t.Cleanup(func() {
-		putUploadedBlockAutoFn = oldPutAuto
 		putUploadedBlockAutoDirectForUploadFn = oldPutDirect
 		probeUploadedBlockReuseForUploadFn = oldProbe
 		registerUploadedBlockAndMappingForUploadFn = oldRegister
@@ -31,9 +36,6 @@ func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 		lookupLibraryEncryptedForUploadFn = oldEncrypted
 	})
 
-	putUploadedBlockAutoFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
-		return hash, nil
-	}
 	putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 		return hash, nil
 	}
@@ -108,6 +110,7 @@ func TestSeafHTTPHandleUploadFailsClosedWhenEncryptionStatusLookupFails(t *testi
 }
 
 func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
+	allowSyncDatabaseForTest(t)
 	oldExists := syncBlockExistsFn
 	oldPut := syncPutBlockDataFn
 	oldPutDirect := syncPutBlockAutoDirectFn
@@ -160,6 +163,7 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 }
 
 func TestSyncPutBlockProbeFailureDoesNotWritePreferredBackend(t *testing.T) {
+	allowSyncDatabaseForTest(t)
 	oldExists := syncBlockExistsFn
 	oldPut := syncPutBlockDataFn
 	oldPutDirect := syncPutBlockAutoDirectFn
@@ -213,6 +217,7 @@ func TestSyncPutBlockProbeFailureDoesNotWritePreferredBackend(t *testing.T) {
 }
 
 func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
+	allowSyncDatabaseForTest(t)
 	oldExists := syncBlockExistsFn
 	oldPut := syncPutBlockDataFn
 	oldPutDirect := syncPutBlockAutoDirectFn

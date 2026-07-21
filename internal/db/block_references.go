@@ -70,6 +70,7 @@ type blockReuseMetadataRow struct {
 	StorageClass string
 	StorageKey   string
 	GCState      string
+	CreatedAt    *time.Time
 }
 
 // BlockReferrerForFSObject builds the permanent referrer for a block referenced
@@ -455,6 +456,10 @@ func (db *DB) UpsertBlockMetadataWithSHA1(orgID, blockID, sha1 string, sizeBytes
 }
 
 func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string) error {
+	storageClass = strings.TrimSpace(storageClass)
+	if storageClass == "" {
+		return fmt.Errorf("block metadata invariant violation: storage_class must not be empty")
+	}
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		return err
 	}
@@ -544,10 +549,10 @@ func isHexN(s string, n int) bool {
 var probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
 	var row blockReuseMetadataRow
 	err := database.Session().Query(`
-		SELECT sha1, size_bytes, storage_class, storage_key, gc_state
+		SELECT sha1, size_bytes, storage_class, storage_key, gc_state, created_at
 		FROM blocks
 		WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(&row.Sha1, &row.SizeBytes, &row.StorageClass, &row.StorageKey, &row.GCState)
+	`, orgID, blockID).Scan(&row.Sha1, &row.SizeBytes, &row.StorageClass, &row.StorageKey, &row.GCState, &row.CreatedAt)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return blockReuseMetadataRow{}, false, nil
@@ -600,6 +605,25 @@ func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
 		StorageKey:   strings.TrimSpace(metadata.StorageKey),
 	}
 	if probe.StorageClass == "" {
+		// A row with neither storage_class nor created_at is the transient stub a GC
+		// claim upserts against a missing block — not real metadata. Classify it as
+		// NeedsPut so the writer proceeds to store and then materialize, which is the
+		// only path that repairs the stub (RegisterUploadedBlock deletes it under an
+		// LWT before its first-writer INSERT). Returning an error here instead would
+		// dead-end every upload of this block: the probe runs in the store phase, so
+		// materialize — and therefore the repair — would never be reached.
+		//
+		// A stub carries no storage class, so GC can never have a physical delete
+		// pending for it, and storing is safe. If the stub is still claimed, the
+		// delete fence in RegisterUploadedBlock still rejects this attempt after the
+		// repair, and the outer wrapper repeats store->materialize.
+		//
+		// created_at set with an empty storage class is genuinely malformed metadata
+		// and stays a hard error; UpsertBlockMetadata now rejects writing that shape.
+		if metadata.CreatedAt == nil {
+			probe.Decision = BlockReuseNeedsPut
+			return probe, nil
+		}
 		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("block %s has empty canonical storage class", blockID)
 	}
 	if metadata.GCState == BlockGCStateDeleting {
@@ -694,6 +718,7 @@ type BlockDeleteClaimInfo struct {
 	StorageClass string
 	GCState      string
 	GCClaimID    string
+	CreatedAt    time.Time
 }
 
 // BlockDeleteFenceActive reports whether GC still owns the physical object for
@@ -740,9 +765,9 @@ func (db *DB) GetBlockS3OrphanInfo(orgID, blockID string) (BlockS3OrphanInfo, bo
 func (db *DB) GetBlockDeleteClaimInfo(orgID, blockID string) (BlockDeleteClaimInfo, bool, error) {
 	var info BlockDeleteClaimInfo
 	err := db.Session().Query(`
-		SELECT storage_class, gc_state, gc_claim_id FROM blocks
+		SELECT storage_class, gc_state, gc_claim_id, created_at FROM blocks
 		WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(&info.StorageClass, &info.GCState, &info.GCClaimID)
+	`, orgID, blockID).Scan(&info.StorageClass, &info.GCState, &info.GCClaimID, &info.CreatedAt)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return BlockDeleteClaimInfo{}, false, nil
@@ -750,6 +775,28 @@ func (db *DB) GetBlockDeleteClaimInfo(orgID, blockID string) (BlockDeleteClaimIn
 		return BlockDeleteClaimInfo{}, false, err
 	}
 	return info, true, nil
+}
+
+// DeleteClaimedBlockStub removes only the metadata-free row materialized by a
+// GC claim against a missing block. The claim identity fences this delete from
+// a concurrent real metadata writer or a newer GC lifecycle.
+func (db *DB) DeleteClaimedBlockStub(orgID, blockID, claimID string) (bool, error) {
+	return db.Session().Query(`
+		DELETE FROM blocks
+		WHERE org_id = ? AND block_id = ?
+		IF gc_state = ? AND gc_claim_id = ? AND storage_class = null AND created_at = null
+	`, orgID, blockID, BlockGCStateDeleting, claimID).MapScanCAS(map[string]interface{}{})
+}
+
+// DeleteReleasedBlockStub removes only a metadata-free transient claim row after
+// its GC ownership has been released. Every relevant column is compared by the
+// LWT so this cannot delete real metadata or a concurrently active claim.
+func (db *DB) DeleteReleasedBlockStub(orgID, blockID string) (bool, error) {
+	return db.Session().Query(`
+		DELETE FROM blocks
+		WHERE org_id = ? AND block_id = ?
+		IF gc_state = null AND gc_claim_id = null AND storage_class = null AND created_at = null
+	`, orgID, blockID).MapScanCAS(map[string]interface{}{})
 }
 
 func (db *DB) ReleaseBlockDeleteClaim(orgID, blockID, claimID string) (bool, error) {

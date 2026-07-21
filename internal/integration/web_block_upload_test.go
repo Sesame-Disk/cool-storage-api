@@ -82,8 +82,18 @@ func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, 
 
 	t.Cleanup(func() {
 		database := shareProjectionDBForTest(t)
+		expiresByReferrer := make(map[string]time.Time, len(referrers))
 
 		for _, referrer := range referrers {
+			var expiresAt time.Time
+			err := database.Session().Query(
+				`SELECT expires_at FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+				orgID, blockID, referrer).Scan(&expiresAt)
+			if err == nil {
+				expiresByReferrer[referrer] = expiresAt
+			} else if !errors.Is(err, gocql.ErrNotFound) {
+				t.Errorf("cleanup provisional expiry %s/%s/%s: read expiry: %v", orgID, blockID, referrer, err)
+			}
 			if err := database.Session().Query(
 				`DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
 				orgID, blockID, referrer).Exec(); err != nil {
@@ -115,9 +125,8 @@ func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, 
 			}
 		}
 
-		// Assert the teardown actually landed: a surviving referrer here is exactly the
-		// F1 leak this branch exists to close, and a silent cleanup failure would let it
-		// regress unnoticed.
+		// Assert every exact-key artifact the upload can leave behind is gone. These
+		// checks deliberately avoid partition scans because the keyspace is shared.
 		for _, referrer := range referrers {
 			var found string
 			err := database.Session().Query(
@@ -127,6 +136,57 @@ func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, 
 				t.Errorf("block reference %s/%s/%s survived teardown; it pins the block and its S3 object forever (ISSUE-GC-TEST-RESIDUE-01)", orgID, blockID, referrer)
 			} else if !errors.Is(err, gocql.ErrNotFound) {
 				t.Errorf("verify block reference %s/%s/%s removed: %v", orgID, blockID, referrer, err)
+			}
+
+			var expiresAt time.Time
+			err = database.Session().Query(
+				`SELECT expires_at FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+				orgID, blockID, referrer).Scan(&expiresAt)
+			if err == nil {
+				t.Errorf("provisional expiry %s/%s/%s survived teardown", orgID, blockID, referrer)
+			} else if !errors.Is(err, gocql.ErrNotFound) {
+				t.Errorf("verify provisional expiry %s/%s/%s removed: %v", orgID, blockID, referrer, err)
+			}
+
+			if projectedExpiry, ok := expiresByReferrer[referrer]; ok {
+				var projectedReferrer string
+				err = database.Session().Query(`
+					SELECT referrer FROM gc_provisional_block_refs_by_day
+					WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?
+				`, dbpkg.GCProjectionUTCDate(projectedExpiry), dbpkg.GCDiscoveryBucket(orgID, blockID, referrer), projectedExpiry.UTC(), orgID, blockID, referrer).Scan(&projectedReferrer)
+				if err == nil {
+					t.Errorf("provisional expiry projection %s/%s/%s survived teardown", orgID, blockID, referrer)
+				} else if !errors.Is(err, gocql.ErrNotFound) {
+					t.Errorf("verify provisional expiry projection %s/%s/%s removed: %v", orgID, blockID, referrer, err)
+				}
+			}
+		}
+
+		var foundBlockID string
+		err := database.Session().Query(
+			`SELECT block_id FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&foundBlockID)
+		if err == nil {
+			t.Errorf("canonical block metadata %s/%s survived teardown", orgID, blockID)
+		} else if !errors.Is(err, gocql.ErrNotFound) {
+			t.Errorf("verify canonical block metadata %s/%s removed: %v", orgID, blockID, err)
+		}
+
+		var mappedBlockID string
+		err = database.Session().Query(
+			`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`,
+			orgID, dbpkg.PlainBlockRepresentationID, externalSHA1).Scan(&mappedBlockID)
+		if err == nil {
+			t.Errorf("block mapping %s/%s survived teardown", orgID, externalSHA1)
+		} else if !errors.Is(err, gocql.ErrNotFound) {
+			t.Errorf("verify block mapping %s/%s removed: %v", orgID, externalSHA1, err)
+		}
+
+		if blockStore != nil {
+			exists, err := blockStore.BlockExists(context.Background(), blockID)
+			if err != nil {
+				t.Errorf("verify S3 object for block %s removed: %v", blockID, err)
+			} else if exists {
+				t.Errorf("S3 object for block %s survived teardown", blockID)
 			}
 		}
 	})
@@ -309,30 +369,21 @@ func webUploadBlock(t *testing.T, c *testClient, session string, data []byte) *h
 	return resp
 }
 
-// webUploadBlockLegacy POSTs raw block bytes WITHOUT a session (S3 only, no
-// materialization) — mirrors the desktop/mobile oracle path.
+// webUploadBlockLegacy POSTs raw block bytes without a web upload session. The
+// legacy path stores the object canonically, materializes blocks metadata (including
+// the server-derived SHA-1 used by the plain mapping), and creates a deterministic
+// provisional up:legacy-block ref with canonical and by-day expiry rows.
 //
-// Teardown is registered here rather than left to callers because this path writes an
-// object with NO `blocks` row and no reference: it is a pure S3 orphan by construction.
-// Nothing reclaims it — GC discovers blocks through candidates, and its S3-orphan recovery
-// only replays its own in-flight deletes from `gc_s3_orphans`. So an untorn-down legacy
-// upload lives in the bucket forever (ISSUE-GC-TEST-RESIDUE-01 / branch 1B).
-//
-// The delete is reported, not swallowed: S3 DELETE is idempotent, so callers that assert a
-// rejection (e.g. quota 403) and never created the object still succeed here. That means a
-// real error is a real teardown failure — silently dropping it would leave the exact eternal
-// S3 object this teardown exists to remove, with the test still green.
-func webUploadBlockLegacy(t *testing.T, c *testClient, orgID string, data []byte) *http.Response {
+// Register teardown here so accepted uploads cannot strand metadata, their TTL pin,
+// either expiry row, a plain SHA-1 mapping, or the S3 object. Every key is derived from
+// this test's exact org/user/block; rejected and partially completed requests are safe
+// because all deletes are idempotent.
+func webUploadBlockLegacy(t *testing.T, c *testClient, orgID, userID string, data []byte) *http.Response {
 	t.Helper()
 
-	if blockStore := blockStoreForCleanupOrNil(t, orgID); blockStore != nil {
-		hash := sha256hex(data)
-		t.Cleanup(func() {
-			if err := blockStore.DeleteBlock(context.Background(), hash); err != nil {
-				t.Errorf("cleanup legacy S3 block %s: %v", hash, err)
-			}
-		})
-	}
+	hash := sha256hex(data)
+	referrer := dbpkg.BlockReferrerForUpload("legacy-block:" + userID + ":" + hash)
+	cleanupUploadedBlockArtifactsForTest(t, orgID, "", hash, sha1hex(data), referrer)
 	url := c.baseURL + "/api/v2/blocks/upload"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
@@ -340,7 +391,7 @@ func webUploadBlockLegacy(t *testing.T, c *testClient, orgID string, data []byte
 	}
 	req.Header.Set("Authorization", "Token "+c.token)
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Block-Hash", sha256hex(data))
+	req.Header.Set("X-Block-Hash", hash)
 	req.ContentLength = int64(len(data))
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -1044,6 +1095,10 @@ func TestWebBlockUploadMultiBlockOrdering(t *testing.T) {
 
 func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-r1-%d", time.Now().UnixNano()))
+	adminUserID, ok := lookupUserIDByEmail(t, defaultAdminEmail)
+	if !ok {
+		t.Fatalf("expected user_id for %s", defaultAdminEmail)
+	}
 
 	t.Run("manifest block never uploaded -> needs_upload", func(t *testing.T) {
 		content := []byte("never uploaded " + fmt.Sprint(time.Now().UnixNano()))
@@ -1061,10 +1116,11 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 		}
 	})
 
-	t.Run("S3-only block (legacy upload, no metadata) -> needs_upload", func(t *testing.T) {
-		content := []byte("s3 only no metadata " + fmt.Sprint(time.Now().UnixNano()))
-		// Store physically in S3 but DO NOT materialize (no session).
-		legacy := webUploadBlockLegacy(t, adminClient, defaultOrgID, content)
+	t.Run("legacy-owned block -> needs_upload for unrelated session", func(t *testing.T) {
+		content := []byte("legacy owned block " + fmt.Sprint(time.Now().UnixNano()))
+		// The legacy path materializes metadata and its own TTL pin, but does not
+		// grant ownership to the unrelated web upload session below.
+		legacy := webUploadBlockLegacy(t, adminClient, defaultOrgID, adminUserID, content)
 		if legacy.StatusCode != http.StatusOK && legacy.StatusCode != http.StatusCreated {
 			body, _ := io.ReadAll(legacy.Body)
 			legacy.Body.Close()
@@ -1073,10 +1129,10 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 		legacy.Body.Close()
 
 		session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
-		// Session-aware check must report it MISSING despite S3 presence (R3).
+		// Session-aware check must report it missing despite canonical presence (R3).
 		_, missing := webCheckBlocks(t, adminClient, session, []string{sha256hex(content)})
 		if len(missing) != 1 {
-			t.Fatalf("expected S3-only block reported missing, got missing=%v", missing)
+			t.Fatalf("expected legacy-owned block reported missing, got missing=%v", missing)
 		}
 		// Commit without uploading under the session must refuse it (R1).
 		resp := webCommit(t, adminClient, repoID, map[string]interface{}{
@@ -1490,11 +1546,15 @@ func TestWebBlockUploadSessionStagingSkipsLogicalStorageQuota(t *testing.T) {
 	setDefaultUserQuota(t, int64(1))
 
 	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-wbu-quota-%d", time.Now().UnixNano()))
+	userID, ok := lookupUserIDByEmail(t, defaultUserEmail)
+	if !ok {
+		t.Fatalf("expected user_id for %s", defaultUserEmail)
+	}
 
 	// Legacy (no-session) upload of fresh content is still gated by the per-block
 	// physical admission check → 403 with the user pinned to 1 byte.
 	legacyContent := []byte("legacy block under tiny quota " + fmt.Sprint(time.Now().UnixNano()))
-	legacy := webUploadBlockLegacy(t, userClient, defaultOrgID, legacyContent)
+	legacy := webUploadBlockLegacy(t, userClient, defaultOrgID, userID, legacyContent)
 	if legacy.StatusCode != http.StatusForbidden {
 		body, _ := io.ReadAll(legacy.Body)
 		legacy.Body.Close()

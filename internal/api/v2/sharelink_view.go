@@ -828,11 +828,11 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	// Record traffic after the response is fully written (covers all return paths).
 	// shareLinkDownloadPeriod is set by the quota pre-check below and captured by the defer closure.
 	shareLinkDownloadStatus := traffic.QuotaStatus{Allowed: true}
-	bytesBefore := int64(c.Writer.Size())
+	bytesBefore := responseBodyBytes(c.Writer)
 	defer func() {
 		if status := c.Writer.Status(); status >= http.StatusOK && status < http.StatusMultipleChoices {
 			if rec := traffic.Get(); rec != nil {
-				sent := int64(c.Writer.Size()) - bytesBefore
+				sent := responseBodyBytes(c.Writer) - bytesBefore
 				if sent > 0 {
 					traffic.RecordCheckedTransfer(rec, shareLinkDownloadStatus, sl.orgID, sl.createdBy, traffic.LinkDownload, sent)
 				}
@@ -942,7 +942,13 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 
 	// For video/audio files, use BlockReadSeeker so http.ServeContent can handle
 	// Range requests (HTTP 206) without buffering the entire file. Only O(1 block) RAM.
-	if !encrypted && (isVideoFile(ext) || isAudioFile(ext)) {
+	isMedia := isVideoFile(ext) || isAudioFile(ext)
+	if encrypted && isMedia {
+		// Persisted block sizes are ciphertext sizes, so random plaintext seeks
+		// cannot be mapped safely until plaintext sizes are stored per block.
+		c.Header("Accept-Ranges", "none")
+	}
+	if mediaRangeSupported(encrypted, ext) {
 		blockSizes, err := streaming.QueryBlockSizes(ctx, h.db, sl.orgID, canonicalReader, resolvedIDs)
 		if err != nil {
 			slog.Error("Failed to query block sizes for share link", "error", err)
@@ -960,7 +966,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	// Non-video/audio: stream block-by-block, O(block_size) RAM
 	c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 	c.Header("Content-Type", mimeType)
-	if fileSize > 0 && !encrypted {
+	if fileSize > 0 {
 		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
 	}
 	c.Status(http.StatusOK)

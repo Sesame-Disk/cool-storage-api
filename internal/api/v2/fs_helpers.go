@@ -93,6 +93,14 @@ var registerUploadedBlockReleaseClaimFn = func(h *FSHelper, orgID, blockID, clai
 	return h.db.ReleaseBlockDeleteClaim(orgID, blockID, claimID)
 }
 
+var registerUploadedBlockDeleteStubFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
+	return h.db.DeleteClaimedBlockStub(orgID, blockID, claimID)
+}
+
+var registerUploadedBlockDeleteReleasedStubFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+	return h.db.DeleteReleasedBlockStub(orgID, blockID)
+}
+
 var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, libraryID)
 	if err != nil {
@@ -103,6 +111,10 @@ var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, 
 
 var registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
 	return h.db.UpsertProvisionalBlockReferenceExpiry(orgID, blockID, referrer, storageClass, expiresAt)
+}
+
+var registerUploadedBlockAddProvisionalFn = func(h *FSHelper, orgID, blockID, referrer, libraryID, storageClass string, expiresAt time.Time) error {
+	return h.db.AddProvisionalBlockReferenceWithExpiry(orgID, blockID, referrer, libraryID, storageClass, expiresAt, db.ProvisionalBlockReferenceTTLSeconds)
 }
 
 var registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
@@ -986,7 +998,7 @@ func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []str
 // pin here would race another request using the same session/operation referrer.
 // The outer store->materialize wrapper still owns the bytes and is the only
 // layer that may wait and retry safely.
-func (h *FSHelper) releaseStaleUploadedBlockDeleteClaim(orgID, blockID string) (bool, error) {
+func (h *FSHelper) removeStaleUploadedBlockDeleteStub(orgID, blockID string) (bool, error) {
 	if h == nil || h.db == nil {
 		return false, nil
 	}
@@ -994,32 +1006,42 @@ func (h *FSHelper) releaseStaleUploadedBlockDeleteClaim(orgID, blockID string) (
 	if err != nil {
 		return false, fmt.Errorf("load block delete claim for %s: %w", blockID, err)
 	}
-	if !found || claimInfo.GCState != db.BlockGCStateDeleting {
-		return false, nil
-	}
-	if strings.TrimSpace(claimInfo.StorageClass) != "" || strings.TrimSpace(claimInfo.GCClaimID) == "" {
+	if !found || strings.TrimSpace(claimInfo.StorageClass) != "" || !claimInfo.CreatedAt.IsZero() {
 		return false, nil
 	}
 
-	released, err := registerUploadedBlockReleaseClaimFn(h, orgID, blockID, claimInfo.GCClaimID)
+	gcState := strings.TrimSpace(claimInfo.GCState)
+	claimID := strings.TrimSpace(claimInfo.GCClaimID)
+	if gcState == "" && claimID == "" {
+		removed, err := registerUploadedBlockDeleteReleasedStubFn(h, orgID, blockID)
+		if err != nil {
+			return false, fmt.Errorf("delete stale released block stub for %s: %w", blockID, err)
+		}
+		if removed {
+			log.Printf("[RegisterUploadedBlock] deleted stale released metadata stub for block %s", blockID)
+		}
+		return removed, nil
+	}
+	if gcState != db.BlockGCStateDeleting || claimID == "" {
+		return false, nil
+	}
+
+	removed, err := registerUploadedBlockDeleteStubFn(h, orgID, blockID, claimID)
 	if err != nil {
-		return false, fmt.Errorf("release stale delete claim for %s: %w", blockID, err)
+		return false, fmt.Errorf("delete stale claimed block stub for %s: %w", blockID, err)
 	}
-	if released {
-		log.Printf("[RegisterUploadedBlock] released stale GC delete claim for block %s with empty storage class", blockID)
+	if removed {
+		log.Printf("[RegisterUploadedBlock] deleted stale GC-claimed metadata stub for block %s", blockID)
 	}
-	return released, nil
+	return removed, nil
 }
 
 func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
 	referrer := db.BlockReferrerForUpload(operationID)
 	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
 
-	if err := registerUploadedBlockAddReferenceFn(h, orgID, blockID, referrer, libraryID, db.ProvisionalBlockReferenceTTLSeconds); err != nil {
-		return fmt.Errorf("add provisional block reference for %s: %w", blockID, err)
-	}
-	if err := registerUploadedBlockUpsertProvisionalExpiryFn(h, orgID, blockID, referrer, storageClass, expiresAt); err != nil {
-		return fmt.Errorf("record provisional block expiry for %s: %w", blockID, err)
+	if err := registerUploadedBlockAddProvisionalFn(h, orgID, blockID, referrer, libraryID, storageClass, expiresAt); err != nil {
+		return fmt.Errorf("add provisional block reference and expiry for %s: %w", blockID, err)
 	}
 
 	deleteFenceActive, err := registerUploadedBlockFenceActiveFn(h, orgID, blockID)
@@ -1027,10 +1049,13 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 		return fmt.Errorf("read block delete fence for %s: %w", blockID, err)
 	}
 	if deleteFenceActive {
-		if _, err := h.releaseStaleUploadedBlockDeleteClaim(orgID, blockID); err != nil {
+		if _, err := h.removeStaleUploadedBlockDeleteStub(orgID, blockID); err != nil {
 			return err
 		}
 		return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
+	}
+	if _, err := h.removeStaleUploadedBlockDeleteStub(orgID, blockID); err != nil {
+		return err
 	}
 
 	if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {

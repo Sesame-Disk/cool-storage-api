@@ -23,6 +23,9 @@ Session-by-session development history for SesameFS.
 - Session, legacy V2, and sync block checks verify each block in that same canonical location and
   propagate backend errors. Download accounting records successful response bytes, not error bodies
   or the declared file size after a partial stream.
+- Legacy V2 block upload/check requires Cassandra metadata and intentionally returns `503` when it
+  is unavailable. S3-only operation is not a supported degraded mode because it would bypass
+  canonical placement, liveness pins, and GC discovery.
 - Deterministic coverage pauses the real GC worker after its post-claim liveness read and proves a
   second physical store before metadata. Two-bucket MinIO integration verifies metadata-first
   placement plus upload/check/commit/download across a preferred/canonical class mismatch.

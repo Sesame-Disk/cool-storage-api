@@ -1255,6 +1255,14 @@ type SeafHTTPHandler struct {
 	zipMaxBytes            int64
 }
 
+func responseBodyBytes(writer gin.ResponseWriter) int64 {
+	size := int64(writer.Size())
+	if size < 0 {
+		return 0
+	}
+	return size
+}
+
 const (
 	defaultZipMaxEntries = 100000
 	defaultZipMaxDepth   = 64
@@ -1513,9 +1521,6 @@ const (
 
 var finalizeUploadBlockMetadataPermits = make(chan struct{}, finalizeUploadBlockMetadataConcurrency)
 var chunkedUploadLibraryFinalizePermits sync.Map
-var putUploadedBlockAutoFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
-	return blockStore.PutBlockAuto(ctx, hash, data)
-}
 var putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 	return blockStore.PutBlockAutoDirect(ctx, hash, data)
 }
@@ -2390,8 +2395,13 @@ func retrySeafHTTPBlockMaterializationWithContext(ctx context.Context, label, bl
 		attempts = 1
 	}
 
-	retryBlocked := func(attempt int) error {
-		if resolveFence != nil {
+	retryBlocked := func(attempt int, retryErr error) error {
+		reason := "probe"
+		if errors.Is(retryErr, v2.ErrBlockDeleteInProgress) {
+			reason = "gc_fence"
+		}
+		metrics.BlockUploadMaterializationRetriesTotal.WithLabelValues(label, reason).Inc()
+		if reason == "gc_fence" && resolveFence != nil {
 			resolved, resolveErr := resolveFence()
 			if resolveErr != nil {
 				log.Printf("[%s] failed to inspect S3 orphan fence for block %s: %v", label, blockID, resolveErr)
@@ -2400,7 +2410,7 @@ func retrySeafHTTPBlockMaterializationWithContext(ctx context.Context, label, bl
 			}
 		}
 		sleepFor := seafHTTPBlockMaterializationRetryBackoffFn(attempt)
-		log.Printf("[%s] block %s is fenced by GC delete during materialization; retrying (%d/%d) after %s", label, blockID, attempt, attempts, sleepFor)
+		log.Printf("[%s] block %s materialization retry reason=%s (%d/%d) after %s", label, blockID, reason, attempt, attempts, sleepFor)
 		if ctx != nil {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -2423,19 +2433,19 @@ func retrySeafHTTPBlockMaterializationWithContext(ctx context.Context, label, bl
 
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := store(); err != nil {
-			if !errors.Is(err, v2.ErrBlockDeleteInProgress) || attempt == attempts {
+			if !v2.IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			if retryErr := retryBlocked(attempt); retryErr != nil {
+			if retryErr := retryBlocked(attempt, err); retryErr != nil {
 				return retryErr
 			}
 			continue
 		}
 		if err := materialize(); err != nil {
-			if !errors.Is(err, v2.ErrBlockDeleteInProgress) || attempt == attempts {
+			if !v2.IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			if retryErr := retryBlocked(attempt); retryErr != nil {
+			if retryErr := retryBlocked(attempt, err); retryErr != nil {
 				return retryErr
 			}
 			continue
@@ -3545,7 +3555,7 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Content-Type", "application/octet-stream")
 	c.Status(http.StatusOK)
-	bytesBefore := int64(c.Writer.Size())
+	bytesBefore := responseBodyBytes(c.Writer)
 	buf := streaming.GetCopyBuf()
 	defer streaming.PutCopyBuf(buf)
 	if _, err := io.CopyBuffer(c.Writer, reader, buf); err != nil {
@@ -3554,7 +3564,7 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 
 	// Record traffic for the S3 fallback path.
 	if rec := traffic.Get(); rec != nil {
-		sent := int64(c.Writer.Size()) - bytesBefore
+		sent := responseBodyBytes(c.Writer) - bytesBefore
 		if sent > 0 {
 			tt := traffic.WebDownload
 			if token.Source == "link" {
@@ -3721,7 +3731,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	// Stream with prefetching pipeline. Headers are already committed, so a
 	// mid-stream failure is logged/accounted by actual bytes and must not trigger
 	// the legacy path fallback in HandleDownload.
-	bytesBefore := int64(c.Writer.Size())
+	bytesBefore := responseBodyBytes(c.Writer)
 	streamErr := streaming.StreamBlocks(c, c.Request.Context(), canonicalReader, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks")
 
 	log.Printf("[streamFileFromBlocks] Streaming complete: %d blocks", len(blockIDs))
@@ -3732,13 +3742,13 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 		if token.Source == "link" {
 			tt = traffic.LinkDownload
 		}
-		sent := int64(c.Writer.Size()) - bytesBefore
+		sent := responseBodyBytes(c.Writer) - bytesBefore
 		if sent > 0 {
 			traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, token.OrgID, token.UserID, tt, sent)
 		}
 	}
 	if streamErr != nil {
-		log.Printf("[streamFileFromBlocks] stream ended early after %d bytes: %v", int64(c.Writer.Size())-bytesBefore, streamErr)
+		log.Printf("[streamFileFromBlocks] stream ended early after %d bytes: %v", responseBodyBytes(c.Writer)-bytesBefore, streamErr)
 	}
 
 	return nil
@@ -4043,22 +4053,22 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	c.Status(http.StatusOK)
 
 	zipWriter := zip.NewWriter(c.Writer)
-	defer zipWriter.Close()
 
 	// Snapshot writer size before streaming so we can calculate the delta afterward.
-	bytesBefore := int64(c.Writer.Size())
+	bytesBefore := responseBodyBytes(c.Writer)
 
-	if err := h.addDirToZip(c.Request.Context(), zipWriter, canonicalReader, preparedFiles, fileKey, fileIV); err != nil {
-		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", err)
-		return
+	streamErr := h.addDirToZip(c.Request.Context(), zipWriter, canonicalReader, preparedFiles, fileKey, fileIV)
+	closeErr := zipWriter.Close()
+	if streamErr != nil {
+		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", streamErr)
+	}
+	if closeErr != nil {
+		log.Printf("[HandleZipDownload] ZIP close failed: %v", closeErr)
 	}
 
 	// Record traffic for the bytes actually sent (zip overhead included is fine for billing granularity).
 	if rec := traffic.Get(); rec != nil {
-		bytesAfter := int64(c.Writer.Size())
-		if bytesAfter < 0 {
-			bytesAfter = 0
-		}
+		bytesAfter := responseBodyBytes(c.Writer)
 		sent := bytesAfter - bytesBefore
 		if sent < 0 {
 			sent = 0
@@ -4070,6 +4080,9 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 			}
 			traffic.RecordCheckedTransfer(rec, zipTrafficStatus, token.OrgID, token.UserID, tt, sent)
 		}
+	}
+	if streamErr != nil || closeErr != nil {
+		return
 	}
 }
 

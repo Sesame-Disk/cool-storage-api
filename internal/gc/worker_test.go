@@ -1084,6 +1084,97 @@ func TestWorker_ProcessBlock_ReReferencedClaimReleaseIsOwnedByCandidate(t *testi
 	}
 }
 
+func TestWorker_ProcessBlock_ReReferencedStubIsDeletedWithMappingAndCandidate(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	checks := 0
+	store.blockHasReferencesHook = func(hookOrgID uuid.UUID, hookBlockID string, current bool) (bool, error) {
+		checks++
+		if checks == 2 {
+			store.AddFSObjectReferenceForTest(hookOrgID, hookBlockID, libID, "fs-live")
+			return true, nil
+		}
+		return current, nil
+	}
+
+	store.AddStubBlockForTest(orgID, "blk-stub-rereferenced")
+	store.AddBlockMapping(orgID, "sha1-stub-rereferenced", "blk-stub-rereferenced")
+	store.AddBlockGCCandidate(orgID, "blk-stub-rereferenced", "hot", candidateAt)
+	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-stub-rereferenced", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem failed: %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("processed = %d, want 1", n)
+	}
+	if block := store.GetBlock(orgID, "blk-stub-rereferenced"); block != nil {
+		t.Fatalf("referenced metadata stub should be deleted, got %#v", block)
+	}
+	if store.ForwardBlockMappingExists(orgID, "sha1-stub-rereferenced") {
+		t.Fatal("referenced stub forward mapping should be deleted")
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 0 {
+		t.Fatalf("referenced stub candidate count = %d, want 0", got)
+	}
+	if got := len(store.QueueItems(orgID)); got != 0 {
+		t.Fatalf("referenced stub queue count = %d, want 0", got)
+	}
+}
+
+func TestWorker_ProcessBlock_ReReferencedStubConditionalDeleteFailureRetainsRetryState(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	checks := 0
+	store.blockHasReferencesHook = func(hookOrgID uuid.UUID, hookBlockID string, current bool) (bool, error) {
+		checks++
+		if checks == 2 {
+			store.AddFSObjectReferenceForTest(hookOrgID, hookBlockID, libID, "fs-live")
+			store.mu.Lock()
+			store.blocks[fmt.Sprintf("%s:%s", hookOrgID, hookBlockID)].GCClaimID = "new-owner"
+			store.mu.Unlock()
+			return true, nil
+		}
+		return current, nil
+	}
+
+	store.AddStubBlockForTest(orgID, "blk-stub-ownership-lost")
+	store.AddBlockGCCandidate(orgID, "blk-stub-ownership-lost", "hot", candidateAt)
+	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-stub-ownership-lost", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem failed: %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("processed = %d, want 0 after conditional delete failure", n)
+	}
+	block := store.GetBlock(orgID, "blk-stub-ownership-lost")
+	if block == nil || block.GCClaimID != "new-owner" {
+		t.Fatalf("new owner's stub claim should remain untouched, got %#v", block)
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 1 {
+		t.Fatalf("candidate count = %d, want 1 for retry", got)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 || items[0].RetryCount != 1 {
+		t.Fatalf("expected one retried queue item, got %#v", items)
+	}
+}
+
 func TestWorker_ProcessFSObject_CascadesDirEntries(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

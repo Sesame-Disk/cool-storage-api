@@ -171,12 +171,8 @@ leader: recovery may clear the orphan while the original worker remains able to 
 post-fence re-PUT. The fix therefore also requires per-delete-lifecycle ownership/generation across
 direct worker and recovery; stale/overlapping recoverers are another instance of the same ABA risk.
 
-**Retention-only failure edge:** if the provisional-expiry projection write fails after the TTL pin
-was inserted, registration fails closed and preserves that shared pin rather than risking deletion of
-a concurrent request's row. A later retry normally repairs the projection. If no retry arrives and
-the native TTL eventually expires, the already-written physical object can remain undiscoverable.
-This is a storage-retention gap, not a false-success/data-loss path; an ownership-safe compensating
-discovery record remains deferred.
+The former retention-only gap between writing the TTL pin and its expiry projection is closed:
+registration now writes the pin, canonical expiry, and by-day projection in one logged batch.
 
 Deterministic tests now compose real registration with the outer retry and pause the real worker
 after its post-claim reference check, proving a post-delete second store before metadata. A real
@@ -3881,7 +3877,7 @@ Fold both `AddDeleteLibraryPolicyQuery` calls (version_ttl + auto_delete) into t
 
 #### Problem
 
-Provisional upload refs (`up:<op>`) register a durable expiry projection (`gc_provisional_block_refs` + `_by_day`); scanner Phase 0 walks it, removes the ref on expiry, checks `BlockHasReferences`, and promotes the block to `gc_block_candidates` if it hit zero. Publish-attempt refs (`pub:<attempt>`) do **not** register any such projection — `AddPublishAttemptReferences` ([block_references.go:339](../internal/db/block_references.go#L339)) only writes the ref with a 35-day Cassandra TTL.
+Provisional upload refs (`up:<op>`) register a durable expiry projection (`gc_provisional_block_refs` + `_by_day`); scanner Phase 0 walks it, waits for Cassandra TTL to remove the exact referrer, checks `BlockHasReferences`, and promotes the block to `gc_block_candidates` if it hit zero. Publish-attempt refs (`pub:<attempt>`) do **not** register any such projection — `AddPublishAttemptReferences` ([block_references.go:339](../internal/db/block_references.go#L339)) only writes the ref with a 35-day Cassandra TTL.
 
 Scenario: a block is kept alive solely by a `pub:` ref from a dead publish attempt. The `up:` ref expires at 2 days; the scanner sees the `pub:` still present and does not create a candidate. At 35 days Cassandra silently expires the `pub:` ref. Now the block is at zero refs, but nothing runs the zero-ref → `EnsureBlockGCCandidate` transition, because `scanOrphanedBlocks` ([scanner.go:335](../internal/gc/scanner.go#L335)) only walks candidates that already exist. The `blocks` row, mapping, and S3 object can be retained indefinitely.
 

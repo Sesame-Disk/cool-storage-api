@@ -226,6 +226,7 @@ func (r *BlockReadSeeker) ensureBlock(idx int) error {
 // of `IN` resolved to its own partition.
 func QueryBlockSizes(ctx context.Context, database *db.DB, orgID string, blockStore BlockReader, blockIDs []string) ([]int64, error) {
 	sizes := make([]int64, len(blockIDs))
+	toLookup := make([]int, 0, len(blockIDs))
 
 	if len(blockIDs) == 0 {
 		return sizes, nil
@@ -233,14 +234,19 @@ func QueryBlockSizes(ctx context.Context, database *db.DB, orgID string, blockSt
 	if cached, ok := blockStore.(interface {
 		CachedBlockSize(string) (int64, bool)
 	}); ok {
-		complete := true
 		for i, blockID := range blockIDs {
 			var found bool
 			sizes[i], found = cached.CachedBlockSize(blockID)
-			complete = complete && found
+			if !found {
+				toLookup = append(toLookup, i)
+			}
 		}
-		if complete {
+		if len(toLookup) == 0 {
 			return sizes, nil
+		}
+	} else {
+		for i := range blockIDs {
+			toLookup = append(toLookup, i)
 		}
 	}
 
@@ -252,13 +258,14 @@ func QueryBlockSizes(ctx context.Context, database *db.DB, orgID string, blockSt
 	}
 
 	concurrency := blockSizesConcurrency
-	if concurrency > len(blockIDs) {
-		concurrency = len(blockIDs)
+	if concurrency > len(toLookup) {
+		concurrency = len(toLookup)
 	}
 	sem := make(chan struct{}, concurrency)
-	results := make(chan lookupResult, len(blockIDs))
+	results := make(chan lookupResult, len(toLookup))
 
-	for i, blockID := range blockIDs {
+	for _, i := range toLookup {
+		blockID := blockIDs[i]
 		sem <- struct{}{}
 		go func(idx int, bid string) {
 			defer func() { <-sem }()
@@ -278,7 +285,7 @@ func QueryBlockSizes(ctx context.Context, database *db.DB, orgID string, blockSt
 	}
 
 	var missing []int
-	for i := 0; i < len(blockIDs); i++ {
+	for range toLookup {
 		r := <-results
 		if r.ok {
 			sizes[r.idx] = r.size
