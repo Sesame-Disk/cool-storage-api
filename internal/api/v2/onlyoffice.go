@@ -1210,35 +1210,29 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	var storageKey string
 	if err := RetryUploadedBlockMaterialization("OnlyOffice", internalBlockID, func() error {
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, internalBlockID)
-		if probeErr == nil {
-			switch probe.Decision {
-			case db.BlockReuseReusable:
-				var ensureErr error
-				storageKey, ensureErr = EnsureReusableBlockPresent(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID)
-				return ensureErr
-			case db.BlockReuseNeedsPut:
-				var putErr error
-				storageKey, putErr = putUploadedBlockAutoDirectFn(ctx, blockStore, internalBlockID, content)
-				if putErr != nil {
-					return fmt.Errorf("failed to store block: %w", putErr)
-				}
-				return nil
-			case db.BlockReuseBlockedByGC:
-				return ErrBlockDeleteInProgress
+		if probeErr != nil {
+			return fmt.Errorf("probe block reuse for %s: %w", internalBlockID, probeErr)
+		}
+		probe, probeErr = prepareUploadedBlockProbeFn(h.db, orgID, internalBlockID, probe)
+		if probeErr != nil {
+			return probeErr
+		}
+		switch probe.Decision {
+		case db.BlockReuseReusable:
+			var ensureErr error
+			storageKey, ensureErr = EnsureReusableBlockPresent(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID)
+			return ensureErr
+		case db.BlockReuseNeedsPut:
+			var putErr error
+			storageKey, putErr = putUploadedBlockAutoDirectFn(ctx, blockStore, internalBlockID, content)
+			if putErr != nil {
+				return fmt.Errorf("failed to store block: %w", putErr)
 			}
-		} else {
-			log.Printf("OnlyOffice: block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v", internalBlockID[:16], probeErr)
+			return nil
+		case db.BlockReuseBlockedByGC:
+			return ErrBlockDeleteInProgress
 		}
-		blockKey, putErr := blockStore.PutBlockData(ctx, &storage.BlockData{
-			Hash: internalBlockID,
-			Data: content,
-			Size: int64(len(content)),
-		})
-		if putErr != nil {
-			return fmt.Errorf("failed to store block: %w", putErr)
-		}
-		storageKey = blockKey
-		return nil
+		return fmt.Errorf("unexpected block reuse decision %d for %s", probe.Decision, internalBlockID)
 	}, func() error {
 		// Materialize block metadata/provisional ref first and then the sync mapping.
 		// Keep the pending-cleanup row on mapping failure so the reconciler can finish

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -381,11 +382,14 @@ func TestCheckBlocksReusableCandidatesParallel_ProbesMetadataFirst(t *testing.T)
 		checkBlocksProbeReuseFn = origProbe
 	}()
 
-	var probeCalls int
+	var probeCalls atomic.Int32
 	checkBlocksProbeReuseFn = func(database *db.DB, orgID, hash string) (db.BlockReuseProbe, error) {
-		probeCalls++
+		probeCalls.Add(1)
 		if hash == "reusable" {
 			return db.BlockReuseProbe{Decision: db.BlockReuseReusable}, nil
+		}
+		if hash == "stub" {
+			return db.BlockReuseProbe{Decision: db.BlockReuseRepairableStub}, nil
 		}
 		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
 	}
@@ -394,17 +398,20 @@ func TestCheckBlocksReusableCandidatesParallel_ProbesMetadataFirst(t *testing.T)
 		context.Background(),
 		nil,
 		"org",
-		[]string{"new", "reusable"},
+		[]string{"new", "stub", "reusable"},
 		2,
 	)
 	if err != nil {
 		t.Fatalf("checkBlocksReusableCandidatesParallel returned error: %v", err)
 	}
-	if probeCalls != 2 {
-		t.Fatalf("probeCalls = %d, want 2 (probe all hashes in metadata plane first)", probeCalls)
+	if probeCalls.Load() != 3 {
+		t.Fatalf("probeCalls = %d, want 3 (probe all hashes in metadata plane first)", probeCalls.Load())
 	}
 	if reusableByHash["new"] {
 		t.Fatal("non-reusable block reported reusable")
+	}
+	if reusableByHash["stub"] {
+		t.Fatal("repairable stub reported reusable")
 	}
 	if !reusableByHash["reusable"] {
 		t.Fatal("reusable block not reported reusable")

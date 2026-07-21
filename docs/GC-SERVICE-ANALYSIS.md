@@ -33,6 +33,11 @@ plan integration tests for long-running monitoring.
 > Full audit (P1–P10, invariants, branch roadmap):
 > [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md);
 > per-item issues: `ISSUE-GC-*` in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+>
+> **Production activation gate (2026-07-21):** X1 physical-delete ABA and X2
+> cross-DC reference visibility remain open. Keep `GC_ENABLED=false` on every
+> replica in every DC. The leader lease does not close either blocker. Only after
+> both close may designated replicas in one DC participate under the lease.
 
 ---
 
@@ -178,7 +183,9 @@ These are deliberate safety mechanisms that are correctly implemented and tested
 
 1. **Claim-then-verify block deletion** — Cassandra lightweight transactions only guard
    the delete claim, and the worker re-checks live `block_references` before S3
-   deletion. That prevents live content from being removed even under concurrent upload.
+   deletion before authorization. It does not close X1: Cassandra claims/generations cannot
+   revoke an S3 DELETE already in flight; only never-reused generational physical keys close
+   that ABA. This mechanism must not be treated as production-safe activation while X1/X2 are open.
 2. **Grace period** (default 1h) — Recently enqueued items can't be processed. Gives
    time for concurrent operations to finish registering or promoting references.
 3. **Idempotent cleanup by liveness rows** — keyed `block_references` rows replace the
@@ -343,9 +350,9 @@ removes the stale candidate. Before removing the canonical block row it persists
 ### Scenario 4: Library soft-delete and purge
 
 Soft-delete keeps the library row and stamps `deleted_libraries.block_representation_id`. Phase 13
-queues `ItemLibraryCascade` after retention. Direct permanent-delete paths have P1/P2 debt: some
-omit immediate content enqueue; others use a non-durable, content-only goroutine. The durable purge
-marker roadmap makes Phase 13 immediately eligible while keeping content cleanup idempotent.
+queues `ItemLibraryCascade` after retention. Direct permanent-delete paths now stamp the durable
+`purge_requested_at` marker and wired paths also issue a best-effort immediate
+`ItemLibraryCascade` enqueue. Phase 13 remains the durable recovery path and cleanup is idempotent.
 
 ### Scenario 5: User/organization cascades
 
@@ -367,6 +374,10 @@ worker must never touch unrelated org work.
 ### Current safety statement
 
 The physical block claim/recheck/recovery sequence is conservative **given correct classification**.
+That statement ends at delete authorization: it does not close X1's in-flight S3 DELETE ABA, and
+the reference check does not close X2's cross-DC visibility gap. Cassandra authorization/claim
+generations alone cannot close X1; new materializations need never-reused generational physical
+keys. Consequently destructive GC remains disabled on every replica/DC.
 The transient-error fail-open existence read (P6a) and execution-time canonical revalidation gap
 (P6b) are fixed. P6b uses durable guard modes, the existing library lock, an O(1) canonical
 point read, and synchronous fences before destructive mutations. P8 tracks Phase 9's provisional
@@ -380,7 +391,7 @@ deleting referenced blocks.
 
 ## Test Coverage Assessment
 
-### Coverage snapshot (historical counts; re-run before using as a release gate)
+### Coverage snapshot (historical, non-production counts; re-run before using as a release gate)
 
 > These counts were recorded in the original 2026-04 audit and are not a current inventory.
 > The 2026-07 audit added P6 fault-injection coverage (done: `TestScanner_ScanOrphaned*_FailClosedOn*Error`)
@@ -439,14 +450,16 @@ Tests are in `internal/integration/gc_integration_test.go` (core) and
 `internal/integration/gc_soak_test.go` (soak). Run independently with:
 
 ```bash
-# Core GC tests only (7 tests, ~20s)
+# Core GC tests
 go test -tags integration -v -run "TestGC_" -timeout 10m ./internal/integration/...
 
 # Soak test (default 5 min, configure with GC_SOAK_DURATION)
 go test -tags 'integration gcsoak' -v -run "TestGC_Soak" -timeout 30m ./internal/integration/...
 ```
 
-### Implemented tests
+### Selected foundational tests
+
+This is a representative historical list, not the complete current `TestGC_` inventory.
 
 | # | Test | File | Status | Run time |
 |---|------|------|--------|----------|
@@ -481,9 +494,10 @@ one → the other ref remains → no destructive candidate wins → second file 
 Validates that shared
 blocks are never deleted while referenced.
 
-**Test 3 — Concurrent upload during GC:** Delete file → re-upload same content → trigger
-GC → LWT guard prevents deletion → re-uploaded file intact. Validates the core safety
-mechanism against real Cassandra LWT behavior (not mocks).
+**Historical non-production Test 3 — Concurrent upload during GC:** Delete file → re-upload
+same content → trigger GC → LWT guard prevents deletion → re-uploaded file intact. This validates
+the observed Cassandra LWT path (not mocks), but does not reproduce X1's delayed in-flight S3
+DELETE ABA or X2's multi-DC visibility gap and is not a production activation gate.
 
 **Test 4 — Library cascade:** Upload files → soft-delete library → trigger scanner
 (finds expired library) → trigger worker (cascades through commits, fs_objects, blocks).
@@ -549,7 +563,8 @@ For a deployment with millions of blocks, this may not keep up with deletion rat
 **Scaling recommendations:**
 - Increase `batch_size` (e.g., 500) for faster processing
 - Reduce `worker_interval` (e.g., 10s) for more frequent ticks
-- For multi-node: only one node should run GC (no leader election exists yet)
+- Production: keep GC disabled on every node/DC while X1/X2 remain open. After both
+  close, designated replicas in one DC may participate under the existing LWT lease.
 
 ---
 
@@ -557,9 +572,9 @@ For a deployment with millions of blocks, this may not keep up with deletion rat
 
 | Aspect | Rating | Notes |
 |--------|--------|-------|
-| **Safety mechanisms** | Excellent | LWT, grace period, idempotency, locks, scanner safety net |
+| **Safety mechanisms** | Production-blocked | LWT, grace period, idempotency, locks, and scanner safety nets exist; X1/X2 still block destructive GC |
 | **Cascade correctness** | Good | Ordering is correct; partial failure handling could improve |
-| **Test coverage** | Good | 107 unit + 4 integration; key gaps in S3 failure and concurrent access |
+| **Test coverage** | Good | Unit, race, and Docker integration suites cover the GC lifecycle; failure and concurrency coverage should continue expanding |
 | **Error handling** | Adequate | Retries with cap; S3 orphan is the main gap |
 | **Performance** | Adequate | 12K items/hour; may need tuning for large deployments |
 | **Monitoring** | Basic | Prometheus metrics exist; alerting rules not defined |

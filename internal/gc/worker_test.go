@@ -1084,6 +1084,64 @@ func TestWorker_ProcessBlock_ReReferencedClaimReleaseIsOwnedByCandidate(t *testi
 	}
 }
 
+func TestWorker_ProcessBlock_ReReferencedClaimedStubIsDeleted(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+	orgID := uuid.New()
+	libID := uuid.New()
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	checks := 0
+	store.blockHasReferencesHook = func(hookOrgID uuid.UUID, hookBlockID string, current bool) (bool, error) {
+		checks++
+		if checks == 1 {
+			return false, nil
+		}
+		store.AddFSObjectReferenceForTest(hookOrgID, hookBlockID, libID, "fs-live")
+		return true, nil
+	}
+	store.AddStubBlockForTest(orgID, "blk-stub-rereferenced")
+	store.AddBlockGCCandidate(orgID, "blk-stub-rereferenced", "hot", candidateAt)
+	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-stub-rereferenced", libID, "hot", 0)
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce() error = %v, want nil", err)
+	}
+	if n != 1 || store.GetBlock(orgID, "blk-stub-rereferenced") != nil {
+		t.Fatalf("processed/block = %d/%v, want 1/nil", n, store.GetBlock(orgID, "blk-stub-rereferenced"))
+	}
+	if len(store.AllBlockGCCandidates()) != 0 {
+		t.Fatal("candidate should be cleared after claimed stub deletion")
+	}
+}
+
+func TestWorker_ProcessBlock_ClaimedStubDeleteLostRaceFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+	orgID := uuid.New()
+	libID := uuid.New()
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	checks := 0
+	store.blockHasReferencesHook = func(uuid.UUID, string, bool) (bool, error) {
+		checks++
+		return checks > 1, nil
+	}
+	store.AddStubBlockForTest(orgID, "blk-stub-race")
+	store.AddBlockGCCandidate(orgID, "blk-stub-race", "hot", candidateAt)
+	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-stub-race", libID, "hot", 0)
+	store.deleteClaimedBlockStubForceFalse = true
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce() error = %v, want queue-level retry handling", err)
+	}
+	if store.GetBlock(orgID, "blk-stub-race") == nil {
+		t.Fatal("stub must remain when conditional delete loses the race")
+	}
+	if len(store.AllBlockGCCandidates()) != 1 {
+		t.Fatal("candidate must remain for retry when conditional delete loses the race")
+	}
+}
+
 func TestWorker_ProcessFSObject_CascadesDirEntries(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

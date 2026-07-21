@@ -2908,7 +2908,8 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 
 	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
-	originalPut := putUploadedBlockAutoFn
+	originalPut := putUploadedBlockAutoDirectForUploadFn
+	originalProbe := probeUploadedBlockReuseForUploadFn
 	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
 	originalEnsureReusable := ensureReusableBlockPresentForUploadFn
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
@@ -2916,7 +2917,8 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 	t.Cleanup(func() {
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
-		putUploadedBlockAutoFn = originalPut
+		putUploadedBlockAutoDirectForUploadFn = originalPut
+		probeUploadedBlockReuseForUploadFn = originalProbe
 		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
 		ensureReusableBlockPresentForUploadFn = originalEnsureReusable
 		registerUploadedBlockAndMappingForUploadFn = originalRegister
@@ -3015,7 +3017,10 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	}
 
 	putStarted := make(chan struct{})
-	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
+	probeUploadedBlockReuseForUploadFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+	}
+	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
 		close(putStarted)
 		return hash, nil
 	}
@@ -3112,7 +3117,7 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 // Exists+PUT path (putUploadedBlockAutoFn) is the only one that issues the
 // old upload-backend HEAD, so a zero count there proves the reusable/needs-put
 // logic stayed off that legacy path.
-func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReuseProbe) (legacyPuts, directPuts, reusableChecks, registerCalls *atomic.Int32, run func() (string, error)) {
+func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReuseProbe) (legacyPuts, directPuts, reusableChecks, repairCalls, registerCalls *atomic.Int32, run func() (string, error)) {
 	t.Helper()
 
 	cm, _ := newTestChunkManager(t)
@@ -3129,6 +3134,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	}
 
 	originalProbe := probeUploadedBlockReuseForUploadFn
+	originalPrepare := prepareUploadedBlockProbeForUploadFn
 	originalLegacyPut := putUploadedBlockAutoFn
 	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
 	originalEnsureReusable := ensureReusableBlockPresentForUploadFn
@@ -3138,6 +3144,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
 	t.Cleanup(func() {
 		probeUploadedBlockReuseForUploadFn = originalProbe
+		prepareUploadedBlockProbeForUploadFn = originalPrepare
 		putUploadedBlockAutoFn = originalLegacyPut
 		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
 		ensureReusableBlockPresentForUploadFn = originalEnsureReusable
@@ -3160,7 +3167,15 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	legacyPuts = &atomic.Int32{}
 	directPuts = &atomic.Int32{}
 	reusableChecks = &atomic.Int32{}
+	repairCalls = &atomic.Int32{}
 	registerCalls = &atomic.Int32{}
+	prepareUploadedBlockProbeForUploadFn = func(_ *db.DB, _, _ string, probe db.BlockReuseProbe) (db.BlockReuseProbe, error) {
+		if probe.Decision == db.BlockReuseRepairableStub {
+			repairCalls.Add(1)
+			probe.Decision = db.BlockReuseNeedsPut
+		}
+		return probe, nil
+	}
 
 	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, _ []byte) (string, error) {
 		legacyPuts.Add(1)
@@ -3192,7 +3207,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		fileID, _, _, _, err := handler.finalizeUploadStreaming(c, token, upload, "/", "test.bin", "", 5, false)
 		return fileID, err
 	}
-	return legacyPuts, directPuts, reusableChecks, registerCalls, run
+	return legacyPuts, directPuts, reusableChecks, repairCalls, registerCalls, run
 }
 
 func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryWithoutDecryptSessionReturnsUnlockContract(t *testing.T) {
@@ -3289,7 +3304,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
 	originalProbe := probeUploadedBlockReuseForUploadFn
-	originalPut := putUploadedBlockAutoFn
+	originalPut := putUploadedBlockAutoDirectForUploadFn
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
 	originalReleaseRefs := releaseUploadedBlockRefsFn
@@ -3297,7 +3312,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
 		probeUploadedBlockReuseForUploadFn = originalProbe
-		putUploadedBlockAutoFn = originalPut
+		putUploadedBlockAutoDirectForUploadFn = originalPut
 		registerUploadedBlockAndMappingForUploadFn = originalRegister
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
 		releaseUploadedBlockRefsFn = originalReleaseRefs
@@ -3310,11 +3325,11 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		return true, nil
 	}
 	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
-		return db.BlockReuseProbe{}, errors.New("probe unavailable in test")
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
 	}
 
 	var putCalls, registerCalls, commitCalls atomic.Int32
-	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
+	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
 		putCalls.Add(1)
 		return hash, nil
 	}
@@ -3425,7 +3440,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 // declared canonical key, with repair-on-miss) is exercised by the unit tests in
 // internal/api/v2/upload_reuse_test.go.
 func TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut(t *testing.T) {
-	legacyPuts, directPuts, reusableChecks, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
+	legacyPuts, directPuts, reusableChecks, _, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
 		db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot"})
 
 	expectedSHA1 := sha1.Sum([]byte("hello"))
@@ -3456,7 +3471,7 @@ func TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut(t *testing
 // reports the block needs storing, finalization performs exactly one direct PUT
 // (no S3 HEAD via the legacy path) and registers the block reference + mapping.
 func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
-	legacyPuts, directPuts, reusableChecks, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
+	legacyPuts, directPuts, reusableChecks, _, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
 		db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"})
 
 	expectedSHA1 := sha1.Sum([]byte("hello"))
@@ -3480,6 +3495,39 @@ func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
 	}
 	if got := registerCalls.Load(); got != 1 {
 		t.Errorf("register ref/mapping calls = %d, want 1", got)
+	}
+}
+
+func TestFinalizeUploadStreamingRepairableStubRepairsBeforeDirectPut(t *testing.T) {
+	legacyPuts, directPuts, reusableChecks, repairCalls, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
+		db.BlockReuseProbe{Decision: db.BlockReuseRepairableStub})
+
+	if _, err := run(); err != nil {
+		t.Fatalf("finalizeUploadStreaming error = %v, want nil", err)
+	}
+	if got := repairCalls.Load(); got != 1 {
+		t.Fatalf("stub repair calls = %d, want 1", got)
+	}
+	if got := directPuts.Load(); got != 1 {
+		t.Fatalf("direct PUT calls = %d, want 1 after repair", got)
+	}
+	if legacyPuts.Load() != 0 || reusableChecks.Load() != 0 || registerCalls.Load() != 1 {
+		t.Fatalf("legacy/reusable/register = %d/%d/%d, want 0/0/1", legacyPuts.Load(), reusableChecks.Load(), registerCalls.Load())
+	}
+}
+
+func TestFinalizeUploadStreamingRepairRaceDoesNotPut(t *testing.T) {
+	legacyPuts, directPuts, _, _, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
+		db.BlockReuseProbe{Decision: db.BlockReuseRepairableStub})
+	prepareUploadedBlockProbeForUploadFn = func(_ *db.DB, _, blockID string, _ db.BlockReuseProbe) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{Decision: db.BlockReuseBlockedByGC}, fmt.Errorf("%w: %s repair race", v2.ErrBlockDeleteInProgress, blockID)
+	}
+
+	if _, err := run(); !errors.Is(err, v2.ErrBlockDeleteInProgress) {
+		t.Fatalf("finalizeUploadStreaming error = %v, want ErrBlockDeleteInProgress", err)
+	}
+	if legacyPuts.Load() != 0 || directPuts.Load() != 0 || registerCalls.Load() != 0 {
+		t.Fatalf("legacy/direct/register = %d/%d/%d, want 0/0/0", legacyPuts.Load(), directPuts.Load(), registerCalls.Load())
 	}
 }
 

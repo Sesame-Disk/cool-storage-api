@@ -79,6 +79,10 @@ type GCStore interface {
 	// ReleaseBlockClaim clears gc_state only when the same claimID still owns the
 	// row. This prevents another attempt from releasing a claim it did not win.
 	ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error
+	// DeleteClaimedBlockStub removes only a metadata-free stub owned by claimID.
+	// applied=false means the row changed and callers must retry rather than
+	// treating the stale observation as success.
+	DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID string) (bool, error)
 	// FinalizeBlockDelete removes the block row only when the same claimID still
 	// owns the row.
 	FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error

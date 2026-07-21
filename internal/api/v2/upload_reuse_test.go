@@ -66,6 +66,55 @@ func TestProbeUploadedBlockReuseReturnsUnknownErrorWithoutSession(t *testing.T) 
 	}
 }
 
+func TestPrepareUploadedBlockProbeRepairsReleasedStub(t *testing.T) {
+	oldRepair := repairReleasedBlockStubForUploadFn
+	t.Cleanup(func() { repairReleasedBlockStubForUploadFn = oldRepair })
+	deleteCalls := 0
+	repairReleasedBlockStubForUploadFn = func(database *db.DB, orgID, blockID string) (bool, error) {
+		deleteCalls++
+		if orgID != "org-1" || blockID != "block-1" {
+			t.Fatalf("delete args = %s/%s", orgID, blockID)
+		}
+		return true, nil
+	}
+
+	probe, err := PrepareUploadedBlockProbe(&db.DB{}, "org-1", "block-1", db.BlockReuseProbe{Decision: db.BlockReuseRepairableStub})
+	if err != nil {
+		t.Fatalf("PrepareUploadedBlockProbe() error = %v, want nil", err)
+	}
+	if probe.Decision != db.BlockReuseNeedsPut || deleteCalls != 1 {
+		t.Fatalf("decision/deleteCalls = %v/%d, want NeedsPut/1", probe.Decision, deleteCalls)
+	}
+}
+
+func TestPrepareUploadedBlockProbeLostCASStopsStore(t *testing.T) {
+	oldRepair := repairReleasedBlockStubForUploadFn
+	t.Cleanup(func() { repairReleasedBlockStubForUploadFn = oldRepair })
+	repairReleasedBlockStubForUploadFn = func(*db.DB, string, string) (bool, error) { return false, nil }
+
+	probe, err := PrepareUploadedBlockProbe(&db.DB{}, "org-1", "block-1", db.BlockReuseProbe{Decision: db.BlockReuseRepairableStub})
+	if !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("PrepareUploadedBlockProbe() error = %v, want ErrBlockDeleteInProgress", err)
+	}
+	if probe.Decision != db.BlockReuseBlockedByGC {
+		t.Fatalf("decision = %v, want BlockReuseBlockedByGC", probe.Decision)
+	}
+}
+
+func TestPrepareUploadedBlockProbeLeavesOtherDecisionsUntouched(t *testing.T) {
+	oldRepair := repairReleasedBlockStubForUploadFn
+	t.Cleanup(func() { repairReleasedBlockStubForUploadFn = oldRepair })
+	repairReleasedBlockStubForUploadFn = func(*db.DB, string, string) (bool, error) {
+		t.Fatal("delete must not run for NeedsPut")
+		return false, nil
+	}
+
+	probe, err := PrepareUploadedBlockProbe(&db.DB{}, "org-1", "block-1", db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut})
+	if err != nil || probe.Decision != db.BlockReuseNeedsPut {
+		t.Fatalf("PrepareUploadedBlockProbe() = %v, %v", probe.Decision, err)
+	}
+}
+
 func TestRetryUploadedBlockMaterializationReturnsNonRetryableStoreError(t *testing.T) {
 	wantErr := errors.New("boom")
 	err := RetryUploadedBlockMaterialization("UploadFile", "block-1", func() error {

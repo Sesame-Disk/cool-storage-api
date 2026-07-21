@@ -3,7 +3,8 @@
 **Date:** 2026-07-21
 **Research branch:** `docs/gc-upload-fence-rematerialization` — **not for merge**
 **Status:** PR-1 merged as [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
-PR-2 is active on `fix/gc-claim-stub-lifecycle`, with implementation not started.
+PR-2 is implemented and verified on `fix/gc-claim-stub-lifecycle`, pending review
+and merge. F2/X7 remain open on `main` until that merge.
 
 ## Why this document exists
 
@@ -83,11 +84,12 @@ PR a row to close.
 
 **Scope:** `internal/gc/worker.go` (re-referenced stub deleted under its claim rather
 than released), `internal/db/block_references.go` (`DeleteClaimedBlockStub`,
-`DeleteReleasedBlockStub`, `storage_class` invariant on write, and an explicit
+`RepairReleasedBlockStub`, `storage_class` invariant on write, and an explicit
 `RepairableStub` probe decision), `internal/gc/store.go`,
 `internal/gc/store_cassandra.go` and `internal/gc/store_mock.go` (conditional-delete
 contract and adapters), `internal/api/v2/upload_reuse.go` (shared released-stub
-repair), plus the existing probe switches in `internal/api/sync.go`,
+repair), `internal/api/v2/fs_helpers.go` (remove writer-side active-claim release;
+writers must wait/retry or fail closed, never clear GC ownership), plus the existing probe switches in `internal/api/sync.go`,
 `internal/api/seafhttp.go`, `internal/api/v2/files.go` and
 `internal/api/v2/onlyoffice.go`. The metadata-upsert path also provides a race
 backstop for the unprobed web-session path in `internal/api/v2/blocks.go`. Unit/API
@@ -100,9 +102,12 @@ genuinely missing row too, and `BlockReuseProbe` carries no `Found`, `IsStub` or
 claim id to separate them. PR-2 adds `RepairableStub` from the same metadata read.
 `created_at IS NULL` is the lifecycle discriminator; incidental `sha1` or
 `representation_id` backfilled by an earlier failed materialization do not make the
-stub complete. Each funnel conditionally removes the released stub and follows its
-ordinary `NeedsPut` store path only when that CAS applies. Active claims remain
-`BlockedByGC`; unexpected ownership state and failed CAS application fail closed.
+stub complete. Each funnel claims the released stub with a deterministic per-block
+`repairing_stub` token, rechecks `gc_s3_orphans`, removes only that owned repair
+claim, and follows its ordinary `NeedsPut` store path only after the repair succeeds.
+Active claims remain `BlockedByGC`; unexpected ownership state, a new orphan fence,
+and failed CAS application all stop the PUT and retry/fail closed. The deterministic
+token also lets a retry confirm and resume an ambiguously-applied Cassandra LWT.
 This avoids both an unconditional third read and an LWT on every brand-new block —
 see X7.
 
@@ -124,23 +129,28 @@ unreachable behind the probe.
    unowned row with null `created_at` and blank class, check `gc_s3_orphans` before
    returning `RepairableStub`; an observed orphan remains `BlockedByGC`. Do not
    require `sha1` or `representation_id` to be empty on a stub.
-2. Add `db.DeleteReleasedBlockStub(...)(bool, error)`, fenced on null `created_at`,
-   blank/absent canonical class and absent ownership. Add the narrower worker-side
+2. Add `db.RepairReleasedBlockStub(...)(bool, error)`: acquire an upload-owned
+   `repairing_stub` token only from null `created_at`/`storage_class` and absent GC
+   ownership, recheck `gc_s3_orphans`, then delete only that token. This two-LWT
+   shape is required because Cassandra can report a null-only conditional DELETE as
+   applied for an already-absent row. Add the narrower worker-side
    `GCStore.DeleteClaimedBlockStub(...)(bool, error)`, fenced by claim id and the stub
-   lifecycle. Prove the exact null predicates against real Cassandra/Scylla rather
-   than relying only on mocks.
+   lifecycle. Prove all predicates against real Cassandra/Scylla, not only mocks.
 3. Reject whitespace-only `storage_class` before issuing a metadata LWT. When the
    first-writer insert does not apply, make metadata materialization recognize a
-   released stub, delete it conditionally and retry the insert. This is the race
+   released stub, claim/repair it and retry the insert. This is the race
    backstop for a stub appearing after a probe and for the unprobed web-session
    upload path; complete/malformed rows still fail closed.
 4. Extend the GC Store interface, Cassandra adapter and mock. In `processBlock`,
    delete a re-referenced stub under the owned claim instead of releasing it; retain
    the ordinary release behavior for a complete metadata row. A false CAS result is
-   a stale observation and must not be treated as success.
+   a stale observation and must not be treated as success. Remove the writer-side
+   active-claim release in `internal/api/v2/fs_helpers.go`; only the GC owner may
+   release or delete an active claim. Writers wait/retry or fail closed.
 5. Handle `RepairableStub` through one shared helper in all six existing upload probe
-   switches. `applied=true` continues through the exact existing `NeedsPut` branch;
-   `applied=false` or a Cassandra error performs no PUT and returns the existing
+   switches. A completed repair continues through the exact existing `NeedsPut`
+   branch; a lost claim, observed orphan, or Cassandra error performs no PUT and
+   returns the existing
    retryable fence error or fails closed. Do not add a read to the ordinary absent-row
    path and do not import PR-3's new retry sentinels or metrics.
 6. Unit-test the full decision and race matrix: absent row (with/without orphan
@@ -161,8 +171,8 @@ unreachable behind the probe.
    merges. X1/X2 remain open, later-PR behavior stays excluded and destructive GC
    remains disabled.
 
-Planned verification commands (the full integration service retains its built-in
-health waits; do not override its command with a focused test invocation):
+Verification completed 2026-07-21 (the full integration service retains its built-in
+health waits; its command was not overridden):
 
 ```bash
 docker compose --profile test run --rm --build gotest go test -count=1 ./internal/db ./internal/gc ./internal/api/...
@@ -172,6 +182,11 @@ docker compose --profile test run --rm --build gotest go vet ./...
 docker compose --profile test run --rm --build gotest go vet -tags=integration ./...
 docker compose --profile test run --rm --build go-integration-test
 ```
+
+All six commands passed. The first integration run found one stale fixture that set
+only `gc_state='deleting'`; it was corrected to seed the full claim identity and the
+complete integration suite then passed. The race run also exposed an unsynchronized
+test counter in `blocks_test.go`; the counter is now atomic and the rerun passed.
 
 ---
 
@@ -394,8 +409,9 @@ in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`.
 
 These stay open and keep destructive GC disabled:
 
-- **Physical delete ABA** — `gc_s3_orphans` has no per-lifecycle claim or generation,
-  so an already-authorized key-only S3 delete can run after the visible fence clears.
+- **Physical delete ABA** — an already-authorized key-only S3 delete can run after
+  the visible fence clears. Cassandra authorization/claim generations cannot revoke
+  a DELETE already in flight; only never-reused generational physical keys close X1.
 - **Cross-DC reference visibility** — `block_references` are ordinary `LOCAL_QUORUM`
   writes that `SERIAL` does not cover; with RF 1 per DC the write and read quorums
   need not intersect (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`).

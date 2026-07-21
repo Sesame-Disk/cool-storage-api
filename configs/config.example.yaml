@@ -263,7 +263,7 @@ seafhttp:
   chunked_staging_max_bytes: 0       # 0 = unlimited; set a node-local byte budget (for example 214748364800 for 200 GiB) to cap active chunked temp-file staging
 
 gc:
-  enabled: false                   # Safe default; enable explicitly with GC_ENABLED=true on the designated GC replica
+  enabled: false                   # Required everywhere while GC blockers X1/X2 remain open; only after closure may one DC designate participants under the lease
   worker_interval: 30s
   scan_interval: 24h
   batch_size: 100

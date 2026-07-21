@@ -85,14 +85,6 @@ var registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string
 	return h.db.BlockDeleteFenceActive(orgID, blockID)
 }
 
-var registerUploadedBlockClaimInfoFn = func(h *FSHelper, orgID, blockID string) (db.BlockDeleteClaimInfo, bool, error) {
-	return h.db.GetBlockDeleteClaimInfo(orgID, blockID)
-}
-
-var registerUploadedBlockReleaseClaimFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
-	return h.db.ReleaseBlockDeleteClaim(orgID, blockID, claimID)
-}
-
 var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, libraryID)
 	if err != nil {
@@ -991,31 +983,6 @@ func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []str
 // the current operation. Only if the fence never clears inside the bounded
 // retry budget do we roll back our own provisional ref and re-enqueue any
 // newly-zero-ref block for GC before returning a retryable error.
-func (h *FSHelper) releaseStaleUploadedBlockDeleteClaim(orgID, blockID string) (bool, error) {
-	if h == nil || h.db == nil {
-		return false, nil
-	}
-	claimInfo, found, err := registerUploadedBlockClaimInfoFn(h, orgID, blockID)
-	if err != nil {
-		return false, fmt.Errorf("load block delete claim for %s: %w", blockID, err)
-	}
-	if !found || claimInfo.GCState != db.BlockGCStateDeleting {
-		return false, nil
-	}
-	if strings.TrimSpace(claimInfo.StorageClass) != "" || strings.TrimSpace(claimInfo.GCClaimID) == "" {
-		return false, nil
-	}
-
-	released, err := registerUploadedBlockReleaseClaimFn(h, orgID, blockID, claimInfo.GCClaimID)
-	if err != nil {
-		return false, fmt.Errorf("release stale delete claim for %s: %w", blockID, err)
-	}
-	if released {
-		log.Printf("[RegisterUploadedBlock] released stale GC delete claim for block %s with empty storage class", blockID)
-	}
-	return released, nil
-}
-
 func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
 	referrer := db.BlockReferrerForUpload(operationID)
 	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
@@ -1045,12 +1012,6 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 			}
 			return nil
 		}
-		if released, err := h.releaseStaleUploadedBlockDeleteClaim(orgID, blockID); err != nil {
-			return err
-		} else if released {
-			continue
-		}
-
 		if attempt == attempts {
 			zeroRefBlocks := registerUploadedBlockReleaseRefsFn(h, orgID, libraryID, operationID, []string{blockID})
 			registerUploadedBlockEnqueueZeroRefFn(orgID, zeroRefBlocks, storageClass)

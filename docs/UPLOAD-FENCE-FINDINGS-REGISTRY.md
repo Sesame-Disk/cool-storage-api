@@ -4,7 +4,8 @@
 **Origin:** eight successive audits of the GC upload-fence work, 2026-07-20/21.
 **Companion:** [GC-UPLOAD-FENCE-PR-PLAN.md](./GC-UPLOAD-FENCE-PR-PLAN.md) — which PR closes what.
 **Series progress:** PR-1 merged as [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
-PR-2 is active on `fix/gc-claim-stub-lifecycle`. No finding is closed by PR-2 yet.
+PR-2 is implemented and verified on `fix/gc-claim-stub-lifecycle`, pending review
+and merge. No finding is closed by PR-2 on `main` yet.
 
 Every row is verified against code at the cited location, except where the row
 explicitly identifies engine-dependent behavior that still needs a non-skipping
@@ -55,15 +56,19 @@ X1-X3, X5 and X6 are not closed by the immediate code PRs; X4 is deferred to PR-
 X7 is a design constraint that PR-2 must close without adding hot-path cost.
 Destructive GC stays disabled until X1 and X2 are resolved.
 
+PR-2 also removes writer-side active-claim release from `internal/api/v2/fs_helpers.go`.
+Only the GC owner may release or delete an active claim; writers must wait/retry or
+fail closed. This is part of F2's lifecycle fix, not deferred to PR-3.
+
 | # | Severity | Finding | Tracked as |
 |---|---|---|---|
-| X1 | Blocker | **Physical delete ABA.** `gc_s3_orphans` has no per-lifecycle claim or generation, so a previously authorized key-only S3 delete can still run after the visible orphan fence clears and after a re-upload has stored new bytes. Rematerialization does not fence it. | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` |
+| X1 | Blocker | **Physical delete ABA.** A previously authorized key-only S3 delete can still run after the visible orphan fence clears and after a re-upload has stored new bytes. Rematerialization does not fence it. Cassandra authorization/claim generations alone cannot revoke a DELETE already in flight; X1 closes only with never-reused generational physical keys, so stale deletes can target only old keys. | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` |
 | X2 | Blocker (multi-DC) | **Cross-DC reference visibility.** `block_references` are ordinary `LOCAL_QUORUM` writes that `SERIAL` does not cover. With RF 1 per DC the write and read quorums need not intersect, so GC in one DC can read zero references for a block that is live in another. The 1h grace period is mitigation, not a bound. | `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` |
 | X3 | Medium | **PUT precedes durable physical-object intent.** Upload paths write to S3 before recording GC-discoverable block metadata/reference or another durable row that identifies the physical object for reclamation. Session-mode staged accounting can already exist, but it does not close this discovery gap. A crash between PUT and registration leaves an object nothing can discover safely. Closing it needs durable physical-object intent before the PUT, or a safe physical sweeper. | `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` |
 | X4 | High (perf) | **One global Paxos round per block on every metadata-registering upload path.** The first-writer `INSERT ... IF NOT EXISTS` is a per-block LWT; under production `SERIAL` and multi-DC it is a global consensus round, ~128 cross-region rounds per GB at the 8 MB block size. **Correction:** an earlier revision said the legacy resumable path "does not pay this at all". That is false — `finalizeUploadStreaming` splits the file into 8 MB blocks and calls `RegisterUploadedBlock` → `UpsertBlockMetadata` per block, so resumable pays the same ~128 LWTs. The defective no-session path in F8 is the exception: it leaves only an S3 object and never registers metadata. This is a **shared** cost of the governed upload paths, not a block-upload disadvantage, and removing it benefits all of them. `main` also reads the `blocks` row twice per upload (`ProbeBlockReuse`, `BlockDeleteFenceActive`), **but those two are not redundant and must not be merged**: the probe reads before the PUT, the fence reads after the provisional reference is durable, and that ordering is the mutual exclusion the protocol depends on. Reusing the pre-PUT observation to authorize publication reintroduces F1. Only the LWT is removable here. **Pre-existing since `e3883aa5d` (2026-05-28)** — not introduced by this work; `13e01263a` only made it representation-aware. | P-4 in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`; PR-11 (deferred) |
 | X5 | Medium | **Canonical read fan-out unvalidated.** One Cassandra point read per unique block before the first byte. The existing benchmark substitutes an in-memory function for Cassandra, so it measures goroutines and allocations, not driver, pool, latency or cluster load. | `WEB-BLOCK-UPLOAD.md` pre-flag checklist |
 | X6 | Medium | **Read-after-write across DCs.** Canonical lookups retry a missing row 3×25 ms, which covers local lag but not cross-DC. Safe (fails closed) but an availability dependency: transient 404/503 after a remote upload, `check-blocks` reporting a block missing, needless re-uploads. | same as X2 |
-| X7 | Medium (perf) | **The research prototype adds a third unconditional read of the `blocks` row.** On `main` the stub-repair read (`GetBlockDeleteClaimInfo`) only fires when the delete fence is active. The research prototype calls `removeStaleUploadedBlockDeleteStub` on the unfenced path too, so every block upload pays an extra point read. **The obvious shortcut does not work:** an earlier revision proposed keying repair off "`NeedsPut` with an empty `StorageClass`", but a genuinely missing row has that same result. PR-2 will expose `RepairableStub` from the existing probe read, require a successful released-stub CAS before PUT, and add an unapplied-metadata-LWT repair backstop for the unprobed web-session path and probe/delete races. An absent row incurs neither the repair read nor repair LWT. | research branch `fs_helpers.go` `RegisterUploadedBlock`; `db.BlockReuseProbe`; PR-2 |
+| X7 | Medium (perf) | **The research prototype adds a third unconditional read of the `blocks` row.** On `main` the stub-repair read (`GetBlockDeleteClaimInfo`) only fires when the delete fence is active. The research prototype calls `removeStaleUploadedBlockDeleteStub` on the unfenced path too, so every block upload pays an extra point read. **The obvious shortcut does not work:** an earlier revision proposed keying repair off "`NeedsPut` with an empty `StorageClass`", but a genuinely missing row has that same result. PR-2 exposes `RepairableStub` from the existing probe read, acquires an upload-owned `repairing_stub` token, rechecks the orphan fence, and adds an unapplied-metadata-LWT repair backstop for the unprobed web-session path and probe/delete races. An absent first-writer row still incurs neither an extra read nor repair LWT. | research branch `fs_helpers.go` `RegisterUploadedBlock`; `db.BlockReuseProbe`; PR-2 |
 
 ## X1 design space — closing the physical-delete ABA
 
@@ -105,7 +110,8 @@ Candidate directions, none yet designed:
 2. **Per-lifecycle claim/generation on `gc_s3_orphans`.** The minimum needed to stop
    two recoverers acting on the same lifecycle. Necessary regardless of what else is
    chosen and probably the first increment, but it does **not** close the in-flight
-   case: Cassandra cannot revoke an S3 request already on the wire.
+   case and therefore cannot close X1: Cassandra cannot revoke an S3 request already
+   on the wire. Only never-reused generational physical keys close that ABA.
 3. **Fencing token with a bounded authorization window.** The recoverer's delete is
    valid only while its claim is unexpired, and writers refuse to publish until any
    outstanding claim has expired. Bounds the window rather than eliminating it; only
@@ -142,9 +148,9 @@ cluster. Destructive GC stays disabled until one lands.
 
 Applies to every PR in the series, not to any single finding.
 
-- **`go test -race` has never run.** The Windows dev box has no gcc. It must run in
-  Docker before PR-2, PR-3, PR-4, PR-5 and PR-9 merge — those change conditional
-  lifecycle races, goroutine behavior or channel semantics.
+- **PR-2 race validation passed in Docker on 2026-07-21.** PR-3, PR-4, PR-5 and
+  PR-9 must still run their own `go test -race` validation because they change
+  separate goroutine/channel or lifecycle behavior.
 - **No end-to-end download tests against real Cassandra** exist for the 404/503
   contract (F5, F13). The unit tests cover the classifier, not the handler.
 - **No multi-DC test** exercises X2 or X6. Both are reasoned from the production

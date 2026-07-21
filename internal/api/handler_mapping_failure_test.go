@@ -15,18 +15,23 @@ import (
 )
 
 func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
-	oldPutAuto := putUploadedBlockAutoFn
+	oldPutDirect := putUploadedBlockAutoDirectForUploadFn
+	oldProbe := probeUploadedBlockReuseForUploadFn
 	oldRegister := registerUploadedBlockAndMappingForUploadFn
 	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
 	oldEncrypted := lookupLibraryEncryptedForUploadFn
 	t.Cleanup(func() {
-		putUploadedBlockAutoFn = oldPutAuto
+		putUploadedBlockAutoDirectForUploadFn = oldPutDirect
+		probeUploadedBlockReuseForUploadFn = oldProbe
 		registerUploadedBlockAndMappingForUploadFn = oldRegister
 		checkUploadStorageQuotaForCurrentHeadFn = oldQuota
 		lookupLibraryEncryptedForUploadFn = oldEncrypted
 	})
 
-	putUploadedBlockAutoFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+	probeUploadedBlockReuseForUploadFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+	}
+	putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 		return hash, nil
 	}
 	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
@@ -99,12 +104,14 @@ func TestSeafHTTPHandleUploadFailsClosedWhenEncryptionStatusLookupFails(t *testi
 func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	oldExists := syncBlockExistsFn
 	oldPut := syncPutBlockDataFn
+	oldPutDirect := syncPutBlockAutoDirectFn
 	oldProbe := syncProbeUploadedBlockReuseFn
 	oldRegister := registerUploadedBlockAndMappingForSyncFn
 	oldLookupClass := lookupLibraryStorageClassForSyncFn
 	t.Cleanup(func() {
 		syncBlockExistsFn = oldExists
 		syncPutBlockDataFn = oldPut
+		syncPutBlockAutoDirectFn = oldPutDirect
 		syncProbeUploadedBlockReuseFn = oldProbe
 		registerUploadedBlockAndMappingForSyncFn = oldRegister
 		lookupLibraryStorageClassForSyncFn = oldLookupClass
@@ -115,6 +122,12 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	}
 	syncPutBlockDataFn = func(ctx context.Context, blockStore *storage.BlockStore, block *storage.BlockData) (string, error) {
 		return block.Hash, nil
+	}
+	syncProbeUploadedBlockReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+	}
+	syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		return hash, nil
 	}
 	registerUploadedBlockAndMappingForSyncFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
 		return fmt.Errorf("mapping failed: %w", v2.ErrBlockMappingWriteFailed)
