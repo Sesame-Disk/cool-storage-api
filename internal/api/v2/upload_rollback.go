@@ -67,9 +67,9 @@ func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID, operationID strin
 
 // RegisterUploadedBlockAndMapping materializes an uploaded block in Cassandra by
 // creating the provisional upload reference + metadata first and only then
-// writing the optional external SHA-1 mapping. If the mapping write fails, the
-// provisional reference is rolled back so retries can restart from a clean
-// state instead of leaving a registered block without a usable mapping.
+// writing the optional external SHA-1 mapping. A mapping failure preserves the
+// TTL pin: operation referrers are shared by concurrent retries, so one request
+// cannot safely delete that row out from under another successful request.
 func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
 	if err := registerUploadedBlockForMaterializationFn(database, orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, externalBlockID); err != nil {
 		return err
@@ -78,7 +78,6 @@ func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlo
 		return nil
 	}
 	if err := writeBlockMappingForMaterializationFn(database, orgID, repoID, externalBlockID, internalBlockID); err != nil {
-		rollbackUploadedBlockRefsFn(database, orgID, repoID, operationID, []string{internalBlockID})
 		return fmt.Errorf("%w: %v", ErrBlockMappingWriteFailed, err)
 	}
 	return nil
@@ -103,7 +102,6 @@ func RegisterWebUploadedBlockAndMapping(database *db.DB, orgID, repoID, internal
 		return nil
 	}
 	if err := writeVerifiedWebBlockMappingFn(database, orgID, repoID, externalBlockID, internalBlockID); err != nil {
-		rollbackUploadedBlockRefsFn(database, orgID, repoID, operationID, []string{internalBlockID})
 		if errors.Is(err, db.ErrBlockIDMappingConflict) {
 			return err
 		}

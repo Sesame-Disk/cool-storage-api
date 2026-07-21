@@ -12,7 +12,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Issue | Status | See |
 |-------|--------|-----|
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🔴 **Upload-fence blocker OPEN; multi-DC gating OPEN; P10 fixed** | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` can return upload success with metadata/reference but no object after a fast-clearing delete fence. Six funnels have partial retry wrappers; web block session is unwrapped, and the inner registration wait prevents outer store retry. Separately, `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` gates destructive GC on the multi-DC production posture: `block_references` are ordinary `LOCAL_QUORUM` writes that `SERIAL` does not cover. **Both must close before GC is deploy-ready** — fixing the fence alone is not sufficient. P10 org isolation remains fixed. See GC audit section below. |
+| Garbage Collection | 🔴 **Delete-lifecycle blocker OPEN; writer fast-clear fixed; multi-DC gating OPEN; P10 fixed** | The writer-side slice of `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` now propagates every observed fence, wraps all seven funnels, and stores existing-metadata `NeedsPut` in its canonical backend. The issue remains open because worker/recovery still lack a physical fence against a stale key-only S3 delete. Separately, `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` gates destructive GC when reference-write/read quorums do not intersect. **Both open gates must close before GC is deploy-ready.** |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -73,7 +73,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 
 | Issue | Status | Details |
 |-------|--------|---------|
-| **Upload Fence Clears Before Rematerialization** | 🔴 **Blocker OPEN** | Six funnels have partial store/materialize wrappers, but `RegisterUploadedBlock` absorbs an active-to-clear fence and returns `nil`, so the outer wrapper does not repeat store. Web block-session `blocks.go` is direct/unwrapped. Existing-metadata `NeedsPut` must use `probe.StorageClass` and the canonical key. No new Paxos is planned for references/mappings or the no-fence hot path. See `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` below. |
+| **Upload Fence / Delete Lifecycle** | 🔴 **Blocker OPEN; writer side fixed** | `RegisterUploadedBlock` now propagates the fence immediately, all seven funnels repeat server-side store/materialize, and existing-metadata `NeedsPut` uses `probe.StorageClass` plus the canonical key. Still open: a stale direct worker/recoverer can issue a key-only delete after the visible fence clears. See `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` below. |
 | **Org-Admin Trash Delete Defers Cleanup** | 🟢 Fixed (6A/6B + parity follow-up, 2026-07-14) | Permanent-delete now stamps a durable `deleted_libraries.purge_requested_at` (migration 012). The immediate Phase-13-deduplicated `library_cascade` enqueue is wired on the v2.1 owner path and the platform/org-admin delete paths; the legacy `/api2/repos/deleted/:repo_id` registration still falls back to marker + Phase 13 recovery. In the wired paths, reclamation normally lands around the grace period; if that best-effort enqueue is lost, Phase 13 adds up to one `ScanInterval` before recovery. See ISSUE-GC-ORG-TRASH-NO-CASCADE-01 below. |
 | **Non-Durable, Content-Only Delete Handoff** | 🟢 Resolved (6A/6B + org-admin parity, 2026-07-14) | Correctness is durable via `deleted_libraries.purge_requested_at` + Phase 13; all wired permanent-delete paths (v2.1 owner + platform + org-admin single/bulk) now call `Service.EnqueueLibraryCascade` (identity-matched to Phase 13, a dedup no-op) as a best-effort accelerator, and a lost enqueue costs only latency. The legacy `/api2/repos/deleted/:repo_id` route mounts the handler with `libHandler=nil` and relies on marker + Phase 13. See ISSUE-GC-DELETE-HANDOFF-DURABILITY-01 below. |
 | **Cross-DC Reference Visibility Gates Destructive GC** | 🔴 OPEN gating (multi-DC) | Production's documented posture is multi-DC with RF 1 per DC. `block_references` are ordinary `INSERT`/`DELETE` at `LOCAL_QUORUM`, which `SERIAL` does not cover, so a reference confirmed in one DC has no guaranteed intersection with a GC liveness read in another. Running GC in exactly one DC solves worker coordination, **not** visibility. See ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 below. |
@@ -153,31 +153,35 @@ is reasoned from the consistency contract and the committed configuration, not f
 
 ### ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01: Fast-Clearing GC Fence Can Lose the Uploaded Object
 
-**Status**: 🔴 OPEN blocker (2026-07-20)
+**Status**: 🔴 OPEN blocker; writer-side fast-clear corrected (2026-07-20)
 **Severity**: Blocker - false-success upload can publish a live reference and immutable metadata for
 an absent physical object
 **Affected**: SeafHTTP simple/streaming, sync `PutBlock`, V2 `UploadFile`, template `CreateFile`,
 OnlyOffice, and web block-session upload
 
-`RetryUploadedBlockMaterialization`, `retrySeafHTTPBlockMaterialization`,
-`retryCreateFileTemplateBlockMaterialization`, `EnsureReusableBlockPresent`, and
-`ErrBlockDeleteInProgress` already provide partial machinery. The invariant still fails when
-`RegisterUploadedBlock` observes a fence, waits until GC deletes S3 and clears the fence, then runs
-`UpsertBlockMetadata` and returns `nil`; the outer wrapper never repeats store. Web block-session
-`internal/api/v2/blocks.go` additionally bypasses the complete wrapper/probe cycle.
+The writer-side failure is corrected. `RegisterUploadedBlock` performs one fence read and returns
+`ErrBlockDeleteInProgress` immediately while preserving the shared TTL pin. All seven
+funnels, including web block-session, retain the bytes and repeat `store -> materialize`; the web
+path returns a coded retryable `409` after exhaustion. Existing-metadata `NeedsPut` resolves its
+canonical class/key instead of the request's preferred backend.
 
-The fix must propagate that a fence was observed, reuse the existing wrappers, wrap `blocks.go`, and
-use `probe.StorageClass` plus the canonical key whenever `NeedsPut` has existing metadata. It must
-not add Paxos/LWT to `block_references` or mappings, nor coordination to the no-fence hot path.
+This slice adds no Paxos/LWT to `block_references`, mappings, or the no-fence hot path.
 Rematerialization is necessary but not sufficient. Worker and scanner can overlap under the same
 leader: recovery may clear the orphan while the original worker remains able to delete the
 post-fence re-PUT. The fix therefore also requires per-delete-lifecycle ownership/generation across
 direct worker and recovery; stale/overlapping recoverers are another instance of the same ABA risk.
 
-Current tests do not close the blocker. `TestRetryUploadedBlockMaterializationRetriesStoreFence`
-injects a synthetic store sentinel. `TestUploadLink_ReuploadBlockedByS3OrphanFence` is a persistent
-SeafHTTP/upload-link fence test in `gc_integration_test.go`, not web block session and not
-fast-clear.
+**Retention-only failure edge:** if the provisional-expiry projection write fails after the TTL pin
+was inserted, registration fails closed and preserves that shared pin rather than risking deletion of
+a concurrent request's row. A later retry normally repairs the projection. If no retry arrives and
+the native TTL eventually expires, the already-written physical object can remain undiscoverable.
+This is a storage-retention gap, not a false-success/data-loss path; an ownership-safe compensating
+discovery record remains deferred.
+
+Deterministic tests now compose real registration with the outer retry and pause the real worker
+after its post-claim reference check, proving a post-delete second store before metadata. A real
+two-bucket MinIO integration proves canonical `NeedsPut`. They intentionally do not claim to close
+the stale/overlapping deleter ABA, which remains the blocker component.
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -1014,12 +1018,13 @@ and the `gc_s3_orphans` fence to return one of:
 
 - `BlockReuseReusable` → `EnsureReusableBlockPresent`: verify the canonical object
   exists (HEAD on the declared key) and repair it (direct PUT) only if missing
-- `BlockReuseNeedsPut` → `PutBlockAutoDirect` (direct PUT, no HEAD)
+- `BlockReuseNeedsPut` → direct PUT without HEAD; first writers use the preferred backend and
+  existing metadata uses its canonical backend
 - `BlockReuseBlockedByGC` → `ErrBlockDeleteInProgress` (retry/back-off)
-- `BlockReuseUnknownError` → fall open to the legacy Exists+PUT path
+- `BlockReuseUnknownError` → fail closed without physical I/O
 
-Partially wired into six upload funnels (`seafhttp.go` x2, `sync.go`, `files.go` x2,
-`onlyoffice.go`). New blocks now pay ≤2 Cassandra reads (~1 ms each)
+Wired into all seven upload funnels (`seafhttp.go` x2, `sync.go`, `files.go` x2,
+`onlyoffice.go`, `blocks.go`). New blocks now pay ≤2 Cassandra reads (~1 ms each)
 + 1 direct PUT, **no HEAD**; dedup hits pay 3 Cassandra reads + 1 canonical-verify
 HEAD (+ a repair PUT only when the object is actually missing).
 
@@ -1029,19 +1034,17 @@ This is fixed for the *server-side hot upload paths*, not across the whole repo:
 
 - The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
   (`internal/storage/blocks.go`) still do `Exists` + `PutAuto`. They remain in use
-  as the probe-error fallback inside the migrated paths and by unmigrated callers
-  such as the `v2/blocks.go` `UploadBlock` handler (its own HEAD + `PutBlockData`).
+  by unmigrated callers, not as a probe-error fallback in metadata-governed funnels.
 - The `Reusable` path does not skip S3: `EnsureReusableBlockPresent` adds a targeted
   HEAD on the canonical key (with repair-on-miss). This avoids knowingly reusing an
   already-missing object at that instant, but is not an atomic guarantee against a later GC delete.
 
 #### Correctness boundary after skipping the legacy PUT
 
-The probe and reference/fence protocol are partial safeguards, not a closed GC-race invariant.
-`RegisterUploadedBlock` can absorb fast-clear and return `nil`, preventing the outer wrapper from
-repeating store; web block-session `blocks.go` has no complete wrapper. For existing-metadata
-`NeedsPut`, store must also use `probe.StorageClass` and the canonical key rather than the currently
-preferred backend. `EnsureReusableBlockPresent` applies only to `Reusable`.
+The writer-side probe/reference/fence protocol now propagates fast-clear to the outer store retry,
+wraps web block-session, and uses canonical placement for existing-metadata `NeedsPut`.
+`EnsureReusableBlockPresent` applies only to `Reusable`. The broader GC-race invariant remains open
+because stale key-only physical deleters are not fenced by these writer changes.
 
 The materialization retry loop (`retrySeafHTTPBlockMaterialization` and
 `v2.RetryUploadedBlockMaterialization`) now also retries when the `store` phase
@@ -1113,13 +1116,13 @@ P10 PR-3 makes GC derive the same org-scoped key as API reads/writes. Keep
 
 **Resolution path (via P10):** the org-scoped-key fix resolves this **by construction** rather than
 by making `storage_key` authoritative. Once the key is `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`, the org
-is baked into the `BlockStore` at construction (the method signature stays
-`blockStore.StorageKeyForHash(hash)` — the org is not passed per call), the derivation is
-deterministic, and every path (read, GC delete, reuse/verify) recomputes the same locator — no
-divergence is possible, and no extra DB read is added on the
-download hot path. `storage_key` may only be empty or **exactly** the derived key; `EnsureReusableBlockPresent`
-always recomputes and **fails closed** if a stored `storage_key` differs from the
-derived one, and no block method accepts an arbitrary caller-supplied S3 key. Closed alongside P10.
+is baked into the `BlockStore` at construction (the org is not passed per read), the derivation is
+deterministic, and every path (read, GC delete, reuse/verify) recomputes the same locator. Canonical
+file readers now point-read immutable location metadata per unique block so mixed storage classes
+remain readable. `storage_key` may only be empty or **exactly** the derived key;
+`EnsureReusableBlockPresent` and `NewCanonicalBlockReader` fail closed on a mismatch. The storage
+layer exposes explicit-key primitives to that adapter, but the adapter never trusts the persisted
+key as an arbitrary locator. Closed alongside P10.
 
 #### Related
 

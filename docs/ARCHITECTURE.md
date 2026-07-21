@@ -542,9 +542,9 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 **Audit logging**: Deletion events (library artifacts cleaned, blocks deleted, groups deleted) are written to the `audit_log` table (365-day TTL, partitioned by `org_id`).
 
 **Safety measures**:
-- **"Tolerate before doubt"**: destructive GC checks fail closed where implemented. The open
-  upload fast-clear race is tracked separately because the delete can finish and the writer can
-  publish metadata without repeating the deleted PUT.
+- **"Tolerate before doubt"**: destructive GC checks fail closed where implemented. Writer-side
+  fast-clear now forces a post-fence store. A stale key-only S3 deleter that can outlive the visible
+  lifecycle fence and cross-DC reference visibility remain open exceptions.
 - Never delete HEAD commit or its ancestors within TTL
 - Grace period: items wait 1h in queue before processing
 - `gc_queue` is durable in the baseline schema. Stuck items reach the
@@ -555,12 +555,17 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
   original queue row still exists: it escalates only when the old row is still
   present, treats the requeue as successful when the old row is already gone,
   and otherwise leaves the item untouched when the verification itself fails.
-- **Claim-then-verify block deletion**: before deleting, the worker (1) point-reads `BlockHasReferences` and skips if any reference row exists; (2) `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; (3) re-checks `BlockHasReferences` and, if a concurrent upload re-referenced the block, releases the claim (`gc_state=null`) and skips; only then writes the orphan fence and proceeds toward DB/S3 deletion. A reference added after the second check is handled by the upload-visible fence contract, whose fast-clear propagation is still open.
+- **Claim-then-verify block deletion**: before deleting, the worker (1) point-reads `BlockHasReferences` and skips if any reference row exists; (2) `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; (3) re-checks `BlockHasReferences` and, if a concurrent upload re-referenced the block, releases the claim (`gc_state=null`) and skips; only then writes the orphan fence and proceeds toward DB/S3 deletion. A reference added after the second check is handled by the upload-visible fence contract; stale physical deleters remain open.
 - **Liveness via reference rows**: liveness is a single-partition point query on `block_references` (replacing the old per-org full scan of live fs_objects). SHA-1→SHA-256 resolution happens at write time, so the GC read needs no resolution.
-- **Upload delete fences (partial enforcement)**: `RegisterUploadedBlock` registers its reference
-  first and checks both `gc_state='deleting'` and `gc_s3_orphans`. Six funnels have outer
-  store/materialize retry wrappers, but the inner wait can absorb a true-to-false fence and return
-  `nil`, so the outer store is not repeated. Web block-session `blocks.go` is unwrapped.
+- **Upload delete fences (writer-side enforced)**: `RegisterUploadedBlock` registers its reference
+  first and checks both `gc_state='deleting'` and `gc_s3_orphans`. An active fence preserves the
+  shared TTL pin and immediately returns the retry sentinel. All seven funnels retain their bytes
+  and repeat store/materialize; existing-metadata repairs use the canonical backend.
+- **Canonical physical reads**: after SHA-1 mapping resolution, file, historic, share-link, ZIP,
+  range/media, and sync readers pre-resolve each SHA-256 block's immutable storage class. Non-empty
+  classes use exact backend lookup without health failover. The org-scoped key is always derived from
+  the hash; non-empty persisted `storage_key` is an invariant check and mismatches fail closed.
+  Session, legacy V2, and sync existence checks use the same per-block resolution.
 - **Idempotent reference removal**: `RemoveBlockReference` is an idempotent `DELETE` of a single `(block, referrer)` row, so a retried fs_object GC pass or upload rollback cannot double-decrement. The entire class of decrement-idempotency bookkeeping (`gc_processed_items` markers, repair passes) is gone with the counter.
 - **Renewable hard-delete leases**: user, library, and org cascades use `lease_token` + heartbeat rows. Live cascades renew the lease, crashed workers can be taken over after stale heartbeat detection, and active lock contention is postponed without consuming retry budget.
 - **DLQ requeue identity preservation**: Failed items are requeued with their original `queued_at` and stable `identity_at` so cascade stale checks and semantic dedupe keep the same deletion identity when an operator retries a failed item.
@@ -583,7 +588,7 @@ A reference row is `((org_id, block_id), referrer)` where:
   `gc_provisional_block_refs` expiry table plus its by-day discovery projection.
 
 **Operations** (`block_references` uses no LWT; immutable metadata separately uses first-writer LWT):
-- **File upload**: `RegisterUploadedBlock`, in this order — `AddBlockReference(up:…, TTL)` → `gc_provisional_block_refs` expiry projection → delete-fence check (`gc_state='deleting'` or `gc_s3_orphans`) → `UpsertBlockMetadata` (`INSERT IF NOT EXISTS`). The order is the point: the reference is published *before* the fence is read, so a GC worker that claims the block afterwards can observe liveness and abandon its delete. Metadata is written last, only once the fence reads clear. Two limits on that guarantee: the worker only sees a reference that lands before its second `BlockHasReferences` read, and — multi-DC — `block_references` are ordinary `LOCAL_QUORUM` writes, so a reference acknowledged in one DC is not guaranteed visible to a GC read in another (see DATABASE-GUIDE). Fast-clear propagation to the outer store retry remains open.
+- **File upload**: `RegisterUploadedBlock`, in this order — `AddBlockReference(up:…, TTL)` → `gc_provisional_block_refs` expiry projection → delete-fence check (`gc_state='deleting'` or `gc_s3_orphans`) → `UpsertBlockMetadata` (`INSERT IF NOT EXISTS`). The order is the point: the reference is published *before* the fence is read, so a GC worker that claims the block afterwards can observe liveness and abandon its delete. Metadata is written last, only once the fence reads clear; an observed fence propagates to the outer store retry. Probe infrastructure errors fail closed rather than reverting to preferred-store I/O. Two limits remain: the worker only sees a reference that lands before its second `BlockHasReferences` read, and — multi-DC — `block_references` are ordinary `LOCAL_QUORUM` writes, so a reference acknowledged in one DC is not guaranteed visible to a GC read in another (see DATABASE-GUIDE).
 - **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block. These are the **permanent** refs, promoted only after the fs_object row is persisted (the publish race holds liveness via provisional publish-attempt refs); the call fails closed if the fs_object row is missing. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
 - **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
 - **GC block deletion**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferences` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise `StartBlockDeleteOrphan` -> `FinalizeBlockDelete` -> delete `blocks/<org_id>/...` through a `BlockStore` bound to the queued org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend. This is not the only Paxos in the block path: immutable metadata and orphan lifecycle transitions also use conditional writes.
@@ -595,7 +600,7 @@ Upload:        block_references += up:<operation>    (TTL)  + blocks row (metada
 Commit:        block_references += fs:<lib>:<fs_id>          (permanent)
 fs_object GC:  block_references -= fs:<lib>:<fs_id>  → if none left, enqueue block
 Block GC:      pre-check none → claim gc_state='deleting' (LWT) → re-verify none → DELETE + S3
-Upload race:   writer sees either fence -> outer store must repeat after clear (OPEN fast-clear propagation)
+Upload race:   writer sees either fence -> preserve TTL pin -> outer store repeats after clear (implemented)
 ```
 
 **Multi-region considerations**: reference `INSERT`/`DELETE` use `LOCAL_QUORUM` (no

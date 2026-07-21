@@ -113,10 +113,6 @@ var releaseUploadReferenceDeleteExpiryFn = func(h *FSHelper, orgID, blockID, ref
 	return h.db.DeleteProvisionalBlockReferenceExpiry(orgID, blockID, referrer, time.Time{})
 }
 
-var registerUploadedBlockRetryAttemptsFn = RetryAttempts
-
-var registerUploadedBlockRetryBackoffFn = RetryBackoff
-
 var registerUploadedBlockSleepFn = time.Sleep
 
 var registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string, storageClass string) {
@@ -981,16 +977,15 @@ func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []str
 // cannot leak the block forever. Liveness is row-based (no mutable counter), so
 // a client retry that re-uploads the same block is naturally idempotent.
 //
-// blockID must already be the internal (SHA-256) ID. operationID must identify
-// the specific upload/session/rollback flow that owns the provisional ref so a
-// rollback only removes its own pin. The reference is written BEFORE the
+// blockID must already be the internal (SHA-256) ID. operationID identifies the
+// logical upload/session flow that shares the provisional ref. Terminal cleanup
+// may remove that flow's pin; an individual retry must not. The reference is written BEFORE the
 // metadata read so that a concurrent GC claim-then-verify observes it. If the
-// GC worker has already claimed the block for deletion, the same provisional
-// ref is kept in place while the helper retries the fence. This lets the GC
-// worker observe the ref and abandon the delete without dropping liveness for
-// the current operation. Only if the fence never clears inside the bounded
-// retry budget do we roll back our own provisional ref and re-enqueue any
-// newly-zero-ref block for GC before returning a retryable error.
+// GC worker has already claimed the block for deletion, this attempt preserves
+// the shared TTL pin and returns a retryable sentinel immediately. Deleting the
+// pin here would race another request using the same session/operation referrer.
+// The outer store->materialize wrapper still owns the bytes and is the only
+// layer that may wait and retry safely.
 func (h *FSHelper) releaseStaleUploadedBlockDeleteClaim(orgID, blockID string) (bool, error) {
 	if h == nil || h.db == nil {
 		return false, nil
@@ -1024,47 +1019,24 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 		return fmt.Errorf("add provisional block reference for %s: %w", blockID, err)
 	}
 	if err := registerUploadedBlockUpsertProvisionalExpiryFn(h, orgID, blockID, referrer, storageClass, expiresAt); err != nil {
-		zeroRefBlocks := registerUploadedBlockReleaseRefsFn(h, orgID, libraryID, operationID, []string{blockID})
-		registerUploadedBlockEnqueueZeroRefFn(orgID, zeroRefBlocks, storageClass)
 		return fmt.Errorf("record provisional block expiry for %s: %w", blockID, err)
 	}
 
-	attempts := registerUploadedBlockRetryAttemptsFn()
-	if attempts < 1 {
-		attempts = 1
+	deleteFenceActive, err := registerUploadedBlockFenceActiveFn(h, orgID, blockID)
+	if err != nil {
+		return fmt.Errorf("read block delete fence for %s: %w", blockID, err)
 	}
-
-	for attempt := 1; attempt <= attempts; attempt++ {
-		deleteFenceActive, err := registerUploadedBlockFenceActiveFn(h, orgID, blockID)
-		if err != nil {
-			return fmt.Errorf("read block delete fence for %s: %w", blockID, err)
-		}
-		if !deleteFenceActive {
-			if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
-				return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
-			}
-			return nil
-		}
-		if released, err := h.releaseStaleUploadedBlockDeleteClaim(orgID, blockID); err != nil {
+	if deleteFenceActive {
+		if _, err := h.releaseStaleUploadedBlockDeleteClaim(orgID, blockID); err != nil {
 			return err
-		} else if released {
-			continue
 		}
-
-		if attempt == attempts {
-			zeroRefBlocks := registerUploadedBlockReleaseRefsFn(h, orgID, libraryID, operationID, []string{blockID})
-			registerUploadedBlockEnqueueZeroRefFn(orgID, zeroRefBlocks, storageClass)
-			return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
-		}
-
-		sleepFor := registerUploadedBlockRetryBackoffFn(attempt)
-		log.Printf("[RegisterUploadedBlock] block %s is fenced by GC delete; retrying (%d/%d) after %s", blockID, attempt, attempts, sleepFor)
-		if sleepFor > 0 {
-			registerUploadedBlockSleepFn(sleepFor)
-		}
+		return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
 	}
 
-	return fmt.Errorf("%w: exhausted upload block registration retry budget for block %s", ErrBlockDeleteInProgress, blockID)
+	if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
+		return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
+	}
+	return nil
 }
 
 // RegisterFSObjectBlockReferences creates the permanent reference rows for every

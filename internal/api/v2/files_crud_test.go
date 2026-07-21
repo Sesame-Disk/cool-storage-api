@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -403,6 +404,25 @@ func TestRetryCreateFileTemplateBlockMaterializationStopsOnNonRetryableError(t *
 	}
 	if registerCalls != 1 {
 		t.Fatalf("registerCalls = %d, want 1", registerCalls)
+	}
+}
+
+func TestRetryCreateFileTemplateBlockMaterializationContextStopsCanceledBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	storeCalls := 0
+	err := retryCreateFileTemplateBlockMaterializationContext(ctx, func() error {
+		storeCalls++
+		return ErrBlockDeleteInProgress
+	}, func() error {
+		t.Fatal("register must not run after a fenced store")
+		return nil
+	}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if storeCalls != 1 {
+		t.Fatalf("store calls = %d, want 1", storeCalls)
 	}
 }
 

@@ -678,6 +678,25 @@ func TestRetrySeafHTTPBlockMaterialization_RetriesStoreFence(t *testing.T) {
 	}
 }
 
+func TestRetrySeafHTTPBlockMaterializationContext_StopsCanceledBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var storeCalls atomic.Int32
+	err := retrySeafHTTPBlockMaterializationContext(ctx, "HandleUpload", "block-1", func() error {
+		storeCalls.Add(1)
+		return v2.ErrBlockDeleteInProgress
+	}, func() error {
+		t.Fatal("materialize must not run after a fenced store")
+		return nil
+	}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if storeCalls.Load() != 1 {
+		t.Fatalf("store calls = %d, want 1", storeCalls.Load())
+	}
+}
+
 func TestRetrySeafHTTPBlockMaterialization_StopsOnNonRetryableError(t *testing.T) {
 	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
 	oldSleep := seafHTTPBlockMaterializationSleepFn
@@ -2909,6 +2928,8 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
 	originalPut := putUploadedBlockAutoFn
+	originalPutDirect := putUploadedBlockAutoDirectForUploadFn
+	originalProbe := probeUploadedBlockReuseForUploadFn
 	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
 	originalEnsureReusable := ensureReusableBlockPresentForUploadFn
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
@@ -2917,6 +2938,8 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
 		putUploadedBlockAutoFn = originalPut
+		putUploadedBlockAutoDirectForUploadFn = originalPutDirect
+		probeUploadedBlockReuseForUploadFn = originalProbe
 		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
 		ensureReusableBlockPresentForUploadFn = originalEnsureReusable
 		registerUploadedBlockAndMappingForUploadFn = originalRegister
@@ -3015,7 +3038,10 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	}
 
 	putStarted := make(chan struct{})
-	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
+	probeUploadedBlockReuseForUploadFn = func(_ *db.DB, _, _ string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "legacy"}, nil
+	}
+	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
 		close(putStarted)
 		return hash, nil
 	}
@@ -3290,6 +3316,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
 	originalProbe := probeUploadedBlockReuseForUploadFn
 	originalPut := putUploadedBlockAutoFn
+	originalPutDirect := putUploadedBlockAutoDirectForUploadFn
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
 	originalReleaseRefs := releaseUploadedBlockRefsFn
@@ -3298,6 +3325,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
 		probeUploadedBlockReuseForUploadFn = originalProbe
 		putUploadedBlockAutoFn = originalPut
+		putUploadedBlockAutoDirectForUploadFn = originalPutDirect
 		registerUploadedBlockAndMappingForUploadFn = originalRegister
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
 		releaseUploadedBlockRefsFn = originalReleaseRefs
@@ -3310,11 +3338,11 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		return true, nil
 	}
 	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
-		return db.BlockReuseProbe{}, errors.New("probe unavailable in test")
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "legacy"}, nil
 	}
 
 	var putCalls, registerCalls, commitCalls atomic.Int32
-	putUploadedBlockAutoFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
+	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
 		putCalls.Add(1)
 		return hash, nil
 	}

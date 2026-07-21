@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/Sesame-Disk/sesamefs/internal/chunker"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 )
 
 // BlockStore provides content-addressable block storage
@@ -183,9 +185,13 @@ func (bs *BlockStore) StorageKeyForHash(hash string) string {
 
 // GetBlock retrieves a block by its hash
 func (bs *BlockStore) GetBlock(ctx context.Context, hash string) ([]byte, error) {
-	key := bs.hashToKey(hash)
+	return bs.GetBlockByStorageKey(ctx, bs.hashToKey(hash))
+}
 
-	reader, err := bs.s3.Get(ctx, key)
+// GetBlockByStorageKey retrieves a block from an explicit storage key. Callers
+// must validate the key against this org-scoped store before calling it.
+func (bs *BlockStore) GetBlockByStorageKey(ctx context.Context, storageKey string) ([]byte, error) {
+	reader, err := bs.GetBlockReaderByStorageKey(ctx, storageKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block: %w", err)
 	}
@@ -201,14 +207,22 @@ func (bs *BlockStore) GetBlock(ctx context.Context, hash string) ([]byte, error)
 
 // GetBlockReader returns a reader for a block (for streaming large blocks)
 func (bs *BlockStore) GetBlockReader(ctx context.Context, hash string) (io.ReadCloser, error) {
-	key := bs.hashToKey(hash)
-	return bs.s3.Get(ctx, key)
+	return bs.GetBlockReaderByStorageKey(ctx, bs.hashToKey(hash))
+}
+
+// GetBlockReaderByStorageKey returns a reader for a validated explicit storage key.
+func (bs *BlockStore) GetBlockReaderByStorageKey(ctx context.Context, storageKey string) (io.ReadCloser, error) {
+	return bs.s3.Get(ctx, storageKey)
 }
 
 // GetBlockSize returns the size in bytes of a block using S3 HEAD (no data transfer).
 func (bs *BlockStore) GetBlockSize(ctx context.Context, hash string) (int64, error) {
-	key := bs.hashToKey(hash)
-	return bs.s3.GetObjectSize(ctx, key)
+	return bs.GetBlockSizeByStorageKey(ctx, bs.hashToKey(hash))
+}
+
+// GetBlockSizeByStorageKey returns the size of a validated explicit storage key using S3 HEAD.
+func (bs *BlockStore) GetBlockSizeByStorageKey(ctx context.Context, storageKey string) (int64, error) {
+	return bs.s3.GetObjectSize(ctx, storageKey)
 }
 
 // BlockExists checks if a block exists
@@ -226,9 +240,7 @@ func (bs *BlockStore) CheckBlocks(ctx context.Context, hashes []string) (map[str
 	for _, hash := range hashes {
 		exists, err := bs.BlockExists(ctx, hash)
 		if err != nil {
-			// Log error but continue checking others
-			result[hash] = false
-			continue
+			return nil, fmt.Errorf("check block %s: %w", hash, err)
 		}
 		result[hash] = exists
 	}
@@ -243,31 +255,24 @@ func (bs *BlockStore) CheckBlocksParallel(ctx context.Context, hashes []string, 
 	}
 
 	result := make(map[string]bool, len(hashes))
-	resultChan := make(chan struct {
-		hash   string
-		exists bool
-	}, len(hashes))
-
-	// Semaphore for concurrency control
-	sem := make(chan struct{}, concurrency)
-
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
 	for _, hash := range hashes {
-		go func(h string) {
-			sem <- struct{}{}        // Acquire
-			defer func() { <-sem }() // Release
-
-			exists, _ := bs.BlockExists(ctx, h)
-			resultChan <- struct {
-				hash   string
-				exists bool
-			}{h, exists}
-		}(hash)
+		hash := hash
+		g.Go(func() error {
+			exists, err := bs.BlockExists(gctx, hash)
+			if err != nil {
+				return fmt.Errorf("check block %s: %w", hash, err)
+			}
+			mu.Lock()
+			result[hash] = exists
+			mu.Unlock()
+			return nil
+		})
 	}
-
-	// Collect results
-	for range hashes {
-		r := <-resultChan
-		result[r.hash] = r.exists
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 
 	return result, nil

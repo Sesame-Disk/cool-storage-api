@@ -49,7 +49,7 @@ func TestRegisterUploadedBlockAndMapping_WritesMappingAfterMetadata(t *testing.T
 	}
 }
 
-func TestRegisterUploadedBlockAndMapping_RollsBackOnMappingFailure(t *testing.T) {
+func TestRegisterUploadedBlockAndMapping_PreservesSharedPinOnMappingFailure(t *testing.T) {
 	oldRegister := registerUploadedBlockForMaterializationFn
 	oldWriteMapping := writeBlockMappingForMaterializationFn
 	oldRollback := rollbackUploadedBlockRefsFn
@@ -67,28 +67,16 @@ func TestRegisterUploadedBlockAndMapping_RollsBackOnMappingFailure(t *testing.T)
 		return wantErr
 	}
 	var rollbackCalled bool
-	var gotOrgID, gotRepoID, gotOperationID string
-	var gotBlockIDs []string
 	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
-		gotOrgID = orgID
-		gotRepoID = repoID
-		gotOperationID = operationID
-		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
 
 	err := RegisterUploadedBlockAndMapping(nil, "org-1", "repo-1", "int-1", "op-1", 123, "hot", "", "ext-1")
 	if !errors.Is(err, ErrBlockMappingWriteFailed) {
 		t.Fatalf("error = %v, want ErrBlockMappingWriteFailed", err)
 	}
-	if !rollbackCalled {
-		t.Fatal("expected rollback on mapping failure")
-	}
-	if gotOrgID != "org-1" || gotRepoID != "repo-1" || gotOperationID != "op-1" {
-		t.Fatalf("rollback org/repo/op = %s/%s/%s, want org-1/repo-1/op-1", gotOrgID, gotRepoID, gotOperationID)
-	}
-	if len(gotBlockIDs) != 1 || gotBlockIDs[0] != "int-1" {
-		t.Fatalf("rollback block IDs = %#v, want []string{\"int-1\"}", gotBlockIDs)
+	if rollbackCalled {
+		t.Fatal("mapping failure must not remove a pin shared by concurrent retries")
 	}
 }
 

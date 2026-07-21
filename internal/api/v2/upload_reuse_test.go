@@ -3,12 +3,32 @@ package v2
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/google/uuid"
 )
+
+type fastClearBlockDeleter struct {
+	objectPresent *atomic.Bool
+}
+
+func (d fastClearBlockDeleter) DeleteBlock(context.Context, string) error {
+	d.objectPresent.Store(false)
+	return nil
+}
+
+type fastClearStorageProvider struct {
+	objectPresent *atomic.Bool
+}
+
+func (p fastClearStorageProvider) GetBlockStoreForOrg(string, string) (gcpkg.BlockStoreDeleter, error) {
+	return fastClearBlockDeleter{objectPresent: p.objectPresent}, nil
+}
 
 func TestRetryUploadedBlockMaterializationRetriesStoreFence(t *testing.T) {
 	oldDelay := libraryHeadMutationRetryDelay
@@ -53,6 +73,228 @@ func TestRetryUploadedBlockMaterializationRetriesStoreFence(t *testing.T) {
 	}
 	if len(slept) != 1 || slept[0] != time.Millisecond {
 		t.Fatalf("slept = %#v, want []time.Duration{time.Millisecond}", slept)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationContextStopsCanceledBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var storeCalls atomic.Int32
+	err := RetryUploadedBlockMaterializationContext(ctx, "canceled", "block-1", func() error {
+		storeCalls.Add(1)
+		return ErrBlockDeleteInProgress
+	}, func() error {
+		t.Fatal("materialize must not run after a fenced store")
+		return nil
+	}, nil, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if storeCalls.Load() != 1 {
+		t.Fatalf("store calls = %d, want 1", storeCalls.Load())
+	}
+}
+
+func TestRetryUploadedBlockMaterializationRestoresObjectAfterFastClearingFence(t *testing.T) {
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRelease := registerUploadedBlockReleaseRefsFn
+	oldEnqueue := registerUploadedBlockEnqueueZeroRefFn
+	oldDelay := libraryHeadMutationRetryDelay
+	oldMaxDelay := libraryHeadMutationRetryMaxDelay
+	oldJitter := libraryHeadMutationRetryJitter
+	oldSleep := registerUploadedBlockSleepFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockUpsertProvisionalExpiryFn = oldExpiry
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockReleaseRefsFn = oldRelease
+		registerUploadedBlockEnqueueZeroRefFn = oldEnqueue
+		libraryHeadMutationRetryDelay = oldDelay
+		libraryHeadMutationRetryMaxDelay = oldMaxDelay
+		libraryHeadMutationRetryJitter = oldJitter
+		registerUploadedBlockSleepFn = oldSleep
+	})
+
+	libraryHeadMutationRetryDelay = 0
+	libraryHeadMutationRetryMaxDelay = 0
+	libraryHeadMutationRetryJitter = 0
+	registerUploadedBlockSleepFn = func(time.Duration) {}
+	registerUploadedBlockAddReferenceFn = func(*FSHelper, string, string, string, string, int) error { return nil }
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(*FSHelper, string, string, string, string, time.Time) error { return nil }
+	registerUploadedBlockReleaseRefsFn = func(*FSHelper, string, string, string, []string) []string { return nil }
+	registerUploadedBlockEnqueueZeroRefFn = func(string, []string, string) {}
+
+	objectPresent := false
+	storeCalls := 0
+	materializeCalls := 0
+	fenceChecks := 0
+	metadataWrites := 0
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) {
+		fenceChecks++
+		if fenceChecks == 1 {
+			// Model the GC delete that completed after the first PUT and before
+			// the writer observed its fence.
+			objectPresent = false
+			return true, nil
+		}
+		return false, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
+		if !objectPresent {
+			t.Fatal("metadata published without a post-fence physical store")
+		}
+		metadataWrites++
+		return nil
+	}
+
+	helper := &FSHelper{}
+	err := RetryUploadedBlockMaterialization("fast-clear", "block-1", func() error {
+		storeCalls++
+		objectPresent = true
+		return nil
+	}, func() error {
+		materializeCalls++
+		return helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 4, "hot", "", "")
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("RetryUploadedBlockMaterialization() error = %v", err)
+	}
+	if storeCalls != 2 || materializeCalls != 2 {
+		t.Fatalf("calls store/materialize = %d/%d, want 2/2", storeCalls, materializeCalls)
+	}
+	if !objectPresent || metadataWrites != 1 {
+		t.Fatalf("objectPresent/metadataWrites = %v/%d, want true/1", objectPresent, metadataWrites)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationWithWorkerPausedAfterPostClaimCheck(t *testing.T) {
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRelease := registerUploadedBlockReleaseRefsFn
+	oldEnqueue := registerUploadedBlockEnqueueZeroRefFn
+	oldDelay := libraryHeadMutationRetryDelay
+	oldMaxDelay := libraryHeadMutationRetryMaxDelay
+	oldJitter := libraryHeadMutationRetryJitter
+	oldSleep := registerUploadedBlockSleepFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockUpsertProvisionalExpiryFn = oldExpiry
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockReleaseRefsFn = oldRelease
+		registerUploadedBlockEnqueueZeroRefFn = oldEnqueue
+		libraryHeadMutationRetryDelay = oldDelay
+		libraryHeadMutationRetryMaxDelay = oldMaxDelay
+		libraryHeadMutationRetryJitter = oldJitter
+		registerUploadedBlockSleepFn = oldSleep
+	})
+
+	store := gcpkg.NewMockStore()
+	orgID := uuid.New()
+	blockID := "block-fast-clear-worker"
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC()
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddBlockGCCandidate(orgID, blockID, "hot", candidateAt)
+	if err := store.EnqueueItem(orgID, candidateAt, gcpkg.ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem(): %v", err)
+	}
+
+	postClaimReached := make(chan struct{})
+	releasePostClaim := make(chan struct{})
+	var referenceChecks atomic.Int32
+	store.SetBlockHasReferencesHookForTest(func(uuid.UUID, string, bool) (bool, error) {
+		if referenceChecks.Add(1) == 2 {
+			close(postClaimReached)
+			<-releasePostClaim
+		}
+		return false, nil
+	})
+
+	var objectPresent atomic.Bool
+	worker := gcpkg.NewWorker(store, fastClearStorageProvider{objectPresent: &objectPresent}, gcpkg.NewQueue(store), 1, 0, false, &gcpkg.Stats{})
+	workerDone := make(chan error, 1)
+
+	firstStoreDone := make(chan struct{})
+	releaseFirstStore := make(chan struct{})
+	fenceObserved := make(chan struct{})
+	gcDone := make(chan struct{})
+	var storeCalls atomic.Int32
+	var materializeCalls atomic.Int32
+	var metadataWrites atomic.Int32
+	var fenceSignaled atomic.Bool
+
+	libraryHeadMutationRetryDelay = time.Millisecond
+	libraryHeadMutationRetryMaxDelay = time.Millisecond
+	libraryHeadMutationRetryJitter = 0
+	registerUploadedBlockSleepFn = func(time.Duration) { <-gcDone }
+	registerUploadedBlockAddReferenceFn = func(*FSHelper, string, string, string, string, int) error { return nil }
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(*FSHelper, string, string, string, string, time.Time) error { return nil }
+	registerUploadedBlockReleaseRefsFn = func(*FSHelper, string, string, string, []string) []string { return nil }
+	registerUploadedBlockEnqueueZeroRefFn = func(string, []string, string) {}
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) {
+		block := store.GetBlock(orgID, blockID)
+		active := block != nil && block.GCState == db.BlockGCStateDeleting || store.S3OrphanCount() > 0
+		if active && fenceSignaled.CompareAndSwap(false, true) {
+			close(fenceObserved)
+		}
+		return active, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
+		if !objectPresent.Load() {
+			return errors.New("metadata published while the physical object is absent")
+		}
+		metadataWrites.Add(1)
+		return nil
+	}
+
+	helper := &FSHelper{}
+	uploadDone := make(chan error, 1)
+	go func() {
+		uploadDone <- RetryUploadedBlockMaterialization("worker-fast-clear", blockID, func() error {
+			call := storeCalls.Add(1)
+			objectPresent.Store(true)
+			if call == 1 {
+				close(firstStoreDone)
+				<-releaseFirstStore
+			}
+			return nil
+		}, func() error {
+			materializeCalls.Add(1)
+			return helper.RegisterUploadedBlock(orgID.String(), uuid.NewString(), blockID, "op-1", 7, "hot", "", "")
+		}, nil, nil)
+	}()
+
+	<-firstStoreDone
+	go func() {
+		_, err := worker.ProcessOnce(context.Background())
+		workerDone <- err
+	}()
+	<-postClaimReached
+	close(releaseFirstStore)
+	<-fenceObserved
+	close(releasePostClaim)
+	if err := <-workerDone; err != nil {
+		t.Fatalf("worker.ProcessOnce(): %v", err)
+	}
+	close(gcDone)
+	if err := <-uploadDone; err != nil {
+		t.Fatalf("RetryUploadedBlockMaterialization(): %v", err)
+	}
+
+	if got := storeCalls.Load(); got != 2 {
+		t.Fatalf("store calls = %d, want 2", got)
+	}
+	if got := materializeCalls.Load(); got != 2 {
+		t.Fatalf("materialize calls = %d, want 2", got)
+	}
+	if !objectPresent.Load() || metadataWrites.Load() != 1 {
+		t.Fatalf("objectPresent/metadataWrites = %v/%d, want true/1", objectPresent.Load(), metadataWrites.Load())
 	}
 }
 
@@ -237,5 +479,107 @@ func TestResolveCanonicalBlockStoreUsesExactOrgScopedClass(t *testing.T) {
 	}
 	if got, want := blockStore.StorageKeyForHash("abcd1234"), "blocks/"+orgID+"/ab/cd/abcd1234"; got != want {
 		t.Fatalf("StorageKeyForHash() = %q, want %q", got, want)
+	}
+}
+
+func TestResolveNeedsPutBlockStoreUsesExistingMetadataClass(t *testing.T) {
+	m := storage.NewManager()
+	m.RegisterBackend("preferred", &storage.S3Store{}, "")
+	m.RegisterBackend("canonical", &storage.S3Store{}, "")
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := m.GetBlockStoreForOrg(orgID, "preferred")
+	if err != nil {
+		t.Fatalf("GetBlockStoreForOrg(preferred): %v", err)
+	}
+	blockID := "abcd1234"
+	canonicalKey := "blocks/" + orgID + "/ab/cd/" + blockID
+	resolved, resolvedClass, resolvedKey, err := ResolveNeedsPutBlockStore(m, preferred, "preferred", db.BlockReuseProbe{
+		Decision:     db.BlockReuseNeedsPut,
+		StorageClass: "canonical",
+		StorageKey:   canonicalKey,
+	}, orgID, blockID)
+	if err != nil {
+		t.Fatalf("ResolveNeedsPutBlockStore() error = %v", err)
+	}
+	if resolvedClass != "canonical" || resolvedKey != canonicalKey {
+		t.Fatalf("class/key = %q/%q, want canonical/%q", resolvedClass, resolvedKey, canonicalKey)
+	}
+	if got := resolved.StorageKeyForHash(blockID); got != canonicalKey {
+		t.Fatalf("resolved store key = %q, want %q", got, canonicalKey)
+	}
+}
+
+func TestResolveNeedsPutBlockStoreUsesPreferredClassForFirstWriter(t *testing.T) {
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatalf("NewOrgBlockStore(): %v", err)
+	}
+	resolved, resolvedClass, resolvedKey, err := ResolveNeedsPutBlockStore(nil, preferred, "preferred", db.BlockReuseProbe{
+		Decision: db.BlockReuseNeedsPut,
+	}, orgID, "abcd1234")
+	if err != nil {
+		t.Fatalf("ResolveNeedsPutBlockStore() error = %v", err)
+	}
+	if resolved != preferred || resolvedClass != "preferred" || resolvedKey != preferred.StorageKeyForHash("abcd1234") {
+		t.Fatalf("resolved preferred target = %p/%q/%q", resolved, resolvedClass, resolvedKey)
+	}
+}
+
+func TestStoreUploadedBlockForProbeRunsAdmissionOnlyForPhysicalPut(t *testing.T) {
+	oldPut := repairCanonicalBlockDirectFn
+	t.Cleanup(func() { repairCanonicalBlockDirectFn = oldPut })
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatalf("NewOrgBlockStore(): %v", err)
+	}
+	putCalls := 0
+	repairCanonicalBlockDirectFn = func(_ context.Context, gotStore *storage.BlockStore, storageKey string, data []byte) (string, error) {
+		putCalls++
+		if gotStore != preferred || storageKey != preferred.StorageKeyForHash("abcd1234") || string(data) != "payload" {
+			t.Fatalf("put target/data = %p/%q/%q", gotStore, storageKey, data)
+		}
+		return storageKey, nil
+	}
+	admissionCalls := 0
+	key, class, didPut, err := StoreUploadedBlockForProbe(context.Background(), "abcd1234", db.BlockReuseProbe{
+		Decision: db.BlockReuseNeedsPut,
+	}, []byte("payload"), nil, preferred, "preferred", orgID, func() error {
+		admissionCalls++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StoreUploadedBlockForProbe() error = %v", err)
+	}
+	if key != preferred.StorageKeyForHash("abcd1234") || class != "preferred" || !didPut {
+		t.Fatalf("key/class/didPut = %q/%q/%v", key, class, didPut)
+	}
+	if admissionCalls != 1 || putCalls != 1 {
+		t.Fatalf("admission/put calls = %d/%d, want 1/1", admissionCalls, putCalls)
+	}
+}
+
+func TestStoreUploadedBlockForProbeBlockedByGCDoesNotAdmitOrPut(t *testing.T) {
+	oldPut := repairCanonicalBlockDirectFn
+	t.Cleanup(func() { repairCanonicalBlockDirectFn = oldPut })
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		t.Fatal("PUT must not run while GC fence is active")
+		return "", nil
+	}
+	admissionCalls := 0
+	_, _, _, err := StoreUploadedBlockForProbe(context.Background(), "block-1", db.BlockReuseProbe{
+		Decision: db.BlockReuseBlockedByGC,
+	}, []byte("payload"), nil, nil, "preferred", "org-1", func() error {
+		admissionCalls++
+		return nil
+	})
+	if !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("StoreUploadedBlockForProbe() error = %v, want ErrBlockDeleteInProgress", err)
+	}
+	if admissionCalls != 0 {
+		t.Fatalf("admissionCalls = %d, want 0", admissionCalls)
 	}
 }

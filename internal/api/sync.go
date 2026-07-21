@@ -1146,31 +1146,28 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 		internalID = classifiedID.normalized
 	}
 
-	// Look up storage class from database
-	var storageClass string
-	if h.db != nil {
-		err := h.db.Session().Query(`
-			SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?
-		`, orgID, internalID).Scan(&storageClass)
-
-		if err != nil || storageClass == "" {
-			storageClass = h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
-		}
-	} else {
-		storageClass = h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
-	}
-
-	blockStore, actualStorageClass, err := h.resolveBlockStoreForLookup(c, orgID, repoID, storageClass)
+	fallbackClass := h.resolveBlockLookupFallbackClass(c, orgID, repoID, "")
+	blockStore, actualStorageClass, err := h.resolveBlockStoreForLookup(c, orgID, repoID, fallbackClass)
 	if err != nil || blockStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
 	}
 
-	// Retrieve block from storage using internal ID
-	data, err := blockStore.GetBlock(c.Request.Context(), internalID)
+	var data []byte
+	if h.db != nil && h.db.Session() != nil {
+		canonicalReader, resolveErr := streaming.NewCanonicalBlockReader(c.Request.Context(), h.db, h.storageManager, orgID, []string{internalID}, blockStore, actualStorageClass)
+		if resolveErr != nil {
+			log.Printf("GetBlock: failed to resolve canonical location for %s: %v", internalID, resolveErr)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+			return
+		}
+		data, err = canonicalReader.GetBlock(c.Request.Context(), internalID)
+	} else {
+		data, err = blockStore.GetBlock(c.Request.Context(), internalID)
+	}
 	if err != nil {
-		log.Printf("GetBlock: block %s (internal: %s) not found in %s: %v\n",
-			externalID, internalID, actualStorageClass, err)
+		log.Printf("GetBlock: block %s (internal: %s) could not be read from its resolved location: %v\n",
+			externalID, internalID, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
 		return
 	}
@@ -1290,6 +1287,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		// later sync head publish can promote or release exactly this upload pin,
 		// then write the legacy SHA-1 mapping only if the client needs it.
 		operationID := syncBlockUploadOperationID(repoID, internalID)
+		materializedStorageClass := storageClass
 		externalMappingID := ""
 		if classifiedID.isLegacySHA1 {
 			externalMappingID = classifiedID.normalized
@@ -1304,49 +1302,40 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		// The only retryable return (ErrBlockDeleteInProgress) writes no response.
 		// If you add a new response-writing branch, it MUST return a non-retryable
 		// error or the response will be written twice on retry.
-		if err := v2.RetryUploadedBlockMaterialization("PutBlock", internalID, func() error {
+		if err := v2.RetryUploadedBlockMaterializationContext(c.Request.Context(), "PutBlock", internalID, func() error {
+			materializedStorageClass = storageClass
 			probe, probeErr := syncProbeUploadedBlockReuseFn(h.db, orgID, internalID)
-			if probeErr == nil {
-				switch probe.Decision {
-				case db.BlockReuseReusable:
-					_, ensureErr := v2.EnsureReusableBlockPresent(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
-					return ensureErr
-				case db.BlockReuseNeedsPut:
-					if checker := getAPIQuotaChecker(); checker != nil {
-						if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
-							c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-							return errSyncStorageQuotaExceeded
-						}
-					}
-					if _, putErr := syncPutBlockAutoDirectFn(c.Request.Context(), blockStore, internalID, data); putErr != nil {
-						return fmt.Errorf("%w: %v", errSyncStoreBackend, putErr)
-					}
-					return nil
-				case db.BlockReuseBlockedByGC:
-					return v2.ErrBlockDeleteInProgress
-				}
-			} else {
-				log.Printf("PutBlock: block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v\n", internalID, probeErr)
+			if probeErr != nil {
+				return fmt.Errorf("probe block reuse for %s: %w", internalID, probeErr)
 			}
-
-			exists, existsErr := syncBlockExistsFn(c.Request.Context(), blockStore, internalID)
-			if existsErr != nil {
-				return fmt.Errorf("%w: %v", errSyncBlockExistenceCheck, existsErr)
-			}
-			if !exists {
+			switch probe.Decision {
+			case db.BlockReuseReusable:
+				materializedStorageClass = probe.StorageClass
+				_, ensureErr := v2.EnsureReusableBlockPresent(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
+				return ensureErr
+			case db.BlockReuseNeedsPut:
 				if checker := getAPIQuotaChecker(); checker != nil {
 					if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
 						c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 						return errSyncStorageQuotaExceeded
 					}
 				}
-				if _, putErr := syncPutBlockDataFn(c.Request.Context(), blockStore, blockData); putErr != nil {
+				putStore, resolvedClass, _, resolveErr := v2.ResolveNeedsPutBlockStore(h.storageManager, blockStore, storageClass, probe, orgID, internalID)
+				if resolveErr != nil {
+					return resolveErr
+				}
+				materializedStorageClass = resolvedClass
+				if _, putErr := syncPutBlockAutoDirectFn(c.Request.Context(), putStore, internalID, data); putErr != nil {
 					return fmt.Errorf("%w: %v", errSyncStoreBackend, putErr)
 				}
+				return nil
+			case db.BlockReuseBlockedByGC:
+				return v2.ErrBlockDeleteInProgress
+			default:
+				return fmt.Errorf("unsupported block reuse decision %d for %s", probe.Decision, internalID)
 			}
-			return nil
 		}, func() error {
-			return registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), storageClass, "", externalMappingID)
+			return registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), materializedStorageClass, "", externalMappingID)
 		}, nil, nil); err != nil {
 			if errors.Is(err, v2.ErrBlockMappingWriteFailed) {
 				log.Printf("PutBlock: failed to store block mapping org=%s ext=%s int=%s: %v", orgID, externalID, internalID, err)
@@ -1508,14 +1497,24 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 		internalIDs = append(internalIDs, internalID)
 	}
 
-	blockStore, _, err := h.resolvePreferredBlockStore(c, orgID, repoID)
+	blockStore, fallbackClass, err := h.resolvePreferredBlockStore(c, orgID, repoID)
 	if err != nil || blockStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
 	}
 
-	// Check which blocks exist using internal IDs
-	existMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), internalIDs, 10)
+	// Check which blocks exist using their canonical metadata locations.
+	var existMap map[string]bool
+	if h.db != nil && h.db.Session() != nil {
+		canonicalReader, resolveErr := streaming.NewCanonicalBlockReader(c.Request.Context(), h.db, h.storageManager, orgID, internalIDs, blockStore, fallbackClass)
+		if resolveErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block locations"})
+			return
+		}
+		existMap, err = canonicalReader.CheckBlocksExist(c.Request.Context(), internalIDs, 10)
+	} else {
+		existMap, err = blockStore.CheckBlocksParallel(c.Request.Context(), internalIDs, 10)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 		return

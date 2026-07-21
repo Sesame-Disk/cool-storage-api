@@ -1,15 +1,16 @@
 # GC Library-Delete Cleanup — Investigation & Follow-up Debt
 
-**Date:** 2026-07-09 (original) · **Audit verified and corrected:** 2026-07-10 · **Status refresh:** 2026-07-16 · **P10 cross-org deletion blocker added and fixed:** 2026-07-16 · **Upload-fence blocker added:** 2026-07-20
+**Date:** 2026-07-09 (original) · **Audit verified and corrected:** 2026-07-10 · **Status refresh:** 2026-07-16 · **P10 cross-org deletion blocker added and fixed:** 2026-07-16 · **Upload-fence blocker added / writer side corrected:** 2026-07-20
 **Code audited at:** `23f221ee9` (merge of PR #129 into `main`)
 **Branch where found:** `fix/gc-block-representation-durability` (PR #123)
 **Status:** P1–P10 remain exactly as documented (safety-classification gaps and the normal
 permanent-delete path are **closed** on `main`, PRs #123–#129; what remains there is reclamation
 edge cases, observability, test hygiene, and scale). **P10's proven cross-org live-content
 deletion blocker is fixed by the org-scoped-key series through PR-3** — see the TL;DR immediately
-below. API and GC paths now use the same org-scoped physical layout. A separate, **open pre-fix
-blocker**, `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, can still let an upload return success
-with a reference and block metadata but no S3 object. This
+below. API and GC paths now use the same org-scoped physical layout. A separate **open blocker**,
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, retains an unfenced physical-delete ABA across direct
+worker/recovery. Its writer-side fast-clear propagation and canonical rematerialization slice is
+implemented, but that does not make physical block deletion safe. This
 document is the **canonical audit record**; the corrected verdict, the confirmed production-gap
 table (P1–P10), the architectural invariants, and the branch roadmap live in the
 [**"Cross-agent audit — verified verdict"**](#cross-agent-audit--verified-verdict-2026-07-10)
@@ -17,11 +18,13 @@ section at the end. The `F1`–`F4` findings below are the original notes, now a
 their verified status.
 
 > **TL;DR (current, 2026-07-20):** `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` is **OPEN**.
-> This is documentation before the behavior fix. If an upload PUT completes, then observes either
-> GC delete fence, the current internal fence wait may finish after GC has deleted that object and
-> cleared the fence. `RegisterUploadedBlock` can then create metadata without repeating the PUT.
-> A successful response can therefore publish a live reference plus metadata for an absent object.
-> Do not describe the single-org upload/delete protocol as universally conservative or fixed.
+> The writer-side false-success path is corrected: `RegisterUploadedBlock` no longer waits through a
+> fence, every audited funnel owns a bounded `store -> materialize` retry, and existing-metadata
+> `NeedsPut` resolves the canonical class/key. A deterministic component regression pauses the real
+> worker after its post-claim liveness check and proves a second store precedes metadata. The issue
+> remains **OPEN** because a previously authorized key-only S3 deleter can still run after the
+> visible orphan fence clears. Do not describe the single-org upload/delete protocol as universally
+> conservative or fixed.
 >
 > P10 was a **proven live-content deletion bug and
 > greenfield deploy blocker** — GC deleted the shared, content-addressed S3 object using an
@@ -49,11 +52,11 @@ their verified status.
 > integration-test fixtures, not production behavior.
 >
 > **Still open:**
-> - **BLOCKER — `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`** — an upload that crossed a
->   `gc_state='deleting'` or `gc_s3_orphans` fence must repeat physical storage before metadata can
->   be published. Current code can succeed after a fast-clearing fence without that re-PUT, and the
->   delete lifecycle is not fenced across the direct worker and Phase-16 recovery after the orphan
->   row clears. Both writer rematerialization and lifecycle ownership are required.
+> - **BLOCKER — `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`** — writer-side post-fence
+>   rematerialization is implemented, including web block sessions and canonical `NeedsPut`.
+>   Still open: the delete lifecycle is not physically fenced across direct worker and Phase-16
+>   recovery after the orphan row clears. Cassandra ownership alone cannot revoke an already-sent
+>   key-only S3 delete; further design work is required before calling this fixed.
 > - **GATING (multi-DC)** — `block_references` are ordinary `LOCAL_QUORUM` writes, so on the
 >   documented multi-region production posture (RF 1 per DC) a reference confirmed in one DC is not
 >   guaranteed visible to a GC liveness read in another. `SERIAL` covers the LWTs but not these
@@ -107,7 +110,7 @@ protocol owns physical deletion.
 > it as **brownfield** and 8A (read-only reconcile) is back on the launch path.
 
 **Verdict:** **P10 is fixed through PR-3**, but
-`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` is an open pre-fix blocker. Before PR-2, GC's
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` remains open after its writer-side partial fix. Before PR-2, GC's
 org-scoped liveness check targeted an S3 object shared by content hash, so one org's delete could
 destroy another org's live block. API reads/writes, normal GC deletion, and orphan recovery now
 derive the same `blocks/<org_id>/...` locator. See `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01`. That
@@ -115,7 +118,7 @@ org-scoping does not close the same-org store/materialize race documented below.
 
 | Priority | Item | Issue / branch | Prod impact (greenfield) |
 | --- | --- | --- | --- |
-| **Blocker** | Post-fence canonical rematerialization + shared delete-lifecycle fencing | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` / `fix/gc-upload-fence-rematerialization` | **Open, docs pre-fix** — a request can succeed with a live ref + metadata while the object is absent, and an old worker/recoverer can delete a post-fence copy |
+| **Blocker** | Post-fence canonical rematerialization + shared delete-lifecycle fencing | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` / `fix/gc-upload-fence-rematerialization` | **Open, writer side fixed** — observed fences now force a server-owned re-store and all seven funnels use canonical placement; an old worker/recoverer can still delete a post-fence copy |
 | — | *(done)* Cross-org physical block isolation (GC delete + orphan recovery) | P10 / `ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01` — org-scoped-key series through PR-3 | Closed — normalized `(org, class)` resolution, no delete failover, org-less APIs removed, and real Cassandra+MinIO delete/recovery isolation regressions pass |
 | — | *(done)* Normal permanent delete + cascade | P1/P1b/P2, PR #129 | Closed — [~50 GB live exercise](#live-path-verification-and-confirmed-gc_pending_items-leak-2026-07-13) showed zero content residue (manual observation) |
 | — | *(done)* Safety classification | P6a/P6b | Closed |
@@ -136,8 +139,8 @@ org-scoping does not close the same-org store/materialize race documented below.
 
 **Issue:** `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`
 
-**Status:** **OPEN — the end-to-end invariant is not enforced; partial retry, probe, repair, and
-sentinel machinery already exists.**
+**Status:** **OPEN — writer-side fast-clear propagation is fixed; physical delete-lifecycle
+fencing is not.**
 
 **Severity:** Blocker: false-success upload can leave referenced content physically absent.
 
@@ -157,7 +160,7 @@ runs. It is removed only after the S3 delete and mapping cleanup complete; on S3
 for scanner recovery. There is no intended unfenced gap between the in-row claim and this orphan
 fence.
 
-#### Exact vulnerable sequence
+#### Historical writer-side vulnerable sequence (fixed in this branch)
 
 1. The upload performs its physical PUT for block `B`.
 2. GC has already passed its second `BlockHasReferences(B)` check. The upload then writes its
@@ -171,13 +174,13 @@ fence.
 6. The request can return success with a live provisional/permanent reference and immutable block
    metadata, while the physical object is absent. Later download fails despite upload success.
 
-The retry budget is exact: **8 attempts and 7 sleeps**. The capped backoff is
+Before the writer-side fix, the inner retry budget was **8 attempts and 7 sleeps**. The capped backoff was
 `50 + 100 + 200 + 400 + 400 + 400 + 400 ms = 1.95 s` before jitter. Current jitter adds a value
 strictly below 25 ms to each sleep, so the total wait is **less than approximately 2.125 s**. A
 normal delete or quick orphan recovery can complete inside that interval; a fence that remains
 active for the entire budget correctly returns a retryable error and is not this fast-clear case.
 
-#### Target invariant and partial enforcement status
+#### Target invariant and current partial enforcement status
 
 Observation of **either** fence invalidates every physical PUT performed earlier in that server
 operation as proof for success. The server must keep or regain ownership of the request bytes and
@@ -191,38 +194,39 @@ first-writer-wins `INSERT IF NOT EXISTS` per `(org_id, block_id)`. `block_refere
 idempotent ordinary `INSERT`/`DELETE`, and the SHA-1 forward mapping remains an ordinary guarded
 read-before-write. The fix adds no steady-state LWT/Paxos to references or mappings.
 
-The branch is not starting from zero. `RetryUploadedBlockMaterialization`,
-`retrySeafHTTPBlockMaterialization`, and `retryCreateFileTemplateBlockMaterialization` can repeat a
-complete store callback when `ErrBlockDeleteInProgress` reaches them. `ProbeBlockReuse` classifies
+`RetryUploadedBlockMaterialization`, `retrySeafHTTPBlockMaterialization`, and
+`retryCreateFileTemplateBlockMaterialization` now receive an observed fence from registration and
+repeat the complete store callback. `ProbeBlockReuse` classifies
 `Reusable`, `NeedsPut`, and `BlockedByGC`, while `EnsureReusableBlockPresent` performs a targeted
-HEAD/repair for the canonical object only in the `Reusable` case. This is useful partial machinery,
-not an atomic guarantee.
+HEAD/repair for the canonical object only in the `Reusable` case. This closes the writer-side
+fast-clear path, not the physical delete-lifecycle ABA.
 
-The end-to-end invariant remains open because `RegisterUploadedBlock` has its own inner fence wait.
-If the fence changes from active to inactive inside that wait, it proceeds to
-`UpsertBlockMetadata` and returns `nil`; the outer wrapper never observes
-`ErrBlockDeleteInProgress`, so it does not invoke the store callback again. The web block-session
-handler in `internal/api/v2/blocks.go` has an additional gap: it uses `BlockExists`,
-`PutBlockData`, and materialization directly rather than the complete probe/retry wrapper.
+The writer-side gap is closed. `RegisterUploadedBlock` performs one dual-fence read, preserves the
+shared TTL pin, and immediately returns `ErrBlockDeleteInProgress`; it never sleeps through
+the fence. Web block-session upload now uses the same probe/store/materialize wrapper, keeps traffic
+and admission outside repeated work, and returns a coded retryable `409` only after bounded retries
+exhaust. Probe infrastructure errors fail closed; mapping failures also preserve the shared TTL pin.
 
 #### Upload-funnel inventory at the audited branch head
 
 | # | Funnel | Current fence/rematerialization wiring | Status |
 |---|---|---|---|
-| 1 | SeafHTTP simple `HandleUpload` | `retrySeafHTTPBlockMaterialization` | Partial: inner fast-clear is absorbed |
-| 2 | SeafHTTP streaming `finalizeUploadStreaming` | `retrySeafHTTPBlockMaterialization` | Partial: inner fast-clear is absorbed |
-| 3 | Sync `PutBlock` | `RetryUploadedBlockMaterialization` | Partial: inner fast-clear is absorbed |
-| 4 | V2 `UploadFile` | `RetryUploadedBlockMaterialization` | Partial: inner fast-clear is absorbed |
-| 5 | Template `CreateFile` | `retryCreateFileTemplateBlockMaterialization` | Partial: inner fast-clear is absorbed |
-| 6 | OnlyOffice save | `RetryUploadedBlockMaterialization` | Partial: inner fast-clear is absorbed |
-| 7 | Web block session `internal/api/v2/blocks.go` | Direct `BlockExists` / `PutBlockData` / materialize | Open: no complete probe/retry wrapper |
+| 1 | SeafHTTP simple `HandleUpload` | `retrySeafHTTPBlockMaterialization` | Writer-side fixed |
+| 2 | SeafHTTP streaming `finalizeUploadStreaming` | `retrySeafHTTPBlockMaterialization` | Writer-side fixed |
+| 3 | Sync `PutBlock` | `RetryUploadedBlockMaterialization` | Writer-side fixed |
+| 4 | V2 `UploadFile` | `RetryUploadedBlockMaterialization` | Writer-side fixed |
+| 5 | Template `CreateFile` | `retryCreateFileTemplateBlockMaterialization` | Writer-side fixed |
+| 6 | OnlyOffice save | `RetryUploadedBlockMaterialization` | Writer-side fixed |
+| 7 | Web block session `internal/api/v2/blocks.go` | `RetryUploadedBlockMaterialization` + probe | Writer-side fixed |
 
-There is a second required correction in every store callback. `NeedsPut` can mean that immutable
+The second writer-side correction is also implemented. `NeedsPut` can mean that immutable
 metadata already exists but has no live references. In that case the callback must resolve
 `probe.StorageClass` and use the canonical org-scoped key, not blindly use the request's currently
-preferred store. Otherwise the direct PUT may land in a new backend while first-writer
-`UpsertBlockMetadata` keeps pointing reads and GC at the previous backend. Regression coverage must
-include existing-metadata `NeedsPut` with a preferred/canonical storage-class mismatch.
+preferred store. The shared resolver prevents the direct PUT from landing in a new backend while first-writer
+`UpsertBlockMetadata` keeps pointing reads and GC at the previous backend. Canonical readers use that
+same immutable class and validate the derived key for every block, including mixed-class files. Regression coverage includes
+existing-metadata `NeedsPut` with a preferred/canonical storage-class mismatch and a real two-bucket
+MinIO upload/check/commit/download.
 
 #### Scope boundary: rematerialization alone is not a complete delete-lifecycle fence
 
@@ -292,11 +296,12 @@ Consequences for this audit under the documented multi-region posture:
 `TestUploadLink_ReuploadBlockedByS3OrphanFence` proves that a **persistent** `gc_s3_orphans` fence
 exhausts the retry budget on the SeafHTTP/upload-link path, returns conflict, does not publish the
 retried file, and leaves recovery state intact. It is not a web block-session test and does **not**
-reproduce fast-clear. `TestRetryUploadedBlockMaterializationRetriesStoreFence` is a synthetic helper
-test: its store callback itself returns the sentinel; it does not call real `RegisterUploadedBlock`
-or exercise a true-to-false fence. Deterministic regressions must cover real registration plus
-fast-clear and the unwrapped web block-session path; until they fail before the fix and pass after
-it, this issue remains open.
+reproduce fast-clear. New deterministic coverage composes the real `RegisterUploadedBlock` with the
+outer retry and also pauses the production `Worker` after its second `BlockHasReferences` call:
+first PUT -> observed fence -> physical delete -> second PUT -> metadata. Integration coverage uses
+two real MinIO buckets both for metadata-first `NeedsPut` placement and an end-to-end web
+upload/check/commit/download across a preferred/canonical mismatch. These close the writer-side
+evidence gap, not the stale-deleter ABA described below.
 
 ### Audit scope and evidence
 
@@ -544,7 +549,7 @@ that those reviews did not cover. P6a/P6b and P1/P1b/P2 remain fixed; cross-org 
 the new same-org upload-fence blocker remains open. Reconcile/backfill (8A–8C) still applies only to
 clusters with pre-fix historical drift.
 
-### Verdict 1 — claim/recheck and dual recovery fences exist; upload rematerialization is open
+### Verdict 1 — claim/recheck and writer rematerialization exist; physical lifecycle fencing is open
 
 The worker's delete sequence is crash-recoverable, but it is not by itself an end-to-end proof that
 an upload cannot succeed without an object — [worker.go:403-574](../internal/gc/worker.go#L403),
@@ -560,10 +565,9 @@ an upload cannot succeed without an object — [worker.go:403-574](../internal/g
    and the recovery is discarded instead of deleting.
 
 Steps 1–3 only catch a reference visible by the second check. If an upload writes its provisional
-reference after step 3, steps 4–5 may delete the object while the upload waits on the dual fence.
-The current writer can then observe the fence clear and write metadata without a new PUT. See the
-blocking finding above. The selected fix is server-owned post-fence `store -> materialize`, not a
-claim that the current protocol is already safe.
+reference after step 3, steps 4–5 may delete its earlier object. The writer now observes the dual
+fence, propagates a retry, and repeats `store -> materialize`. This does not make the physical
+protocol safe against a stale deleter that already escaped the visible lifecycle.
 
 Representation is validated fail-closed (`CanonicalBlockRepresentationIDForLibrary` derives the
 one legal representation from identity + `encrypted` and rejects any stored value that would

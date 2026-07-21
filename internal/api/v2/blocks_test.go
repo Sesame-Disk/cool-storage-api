@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -381,11 +382,11 @@ func TestCheckBlocksReusableCandidatesParallel_ProbesMetadataFirst(t *testing.T)
 		checkBlocksProbeReuseFn = origProbe
 	}()
 
-	var probeCalls int
+	var probeCalls atomic.Int32
 	checkBlocksProbeReuseFn = func(database *db.DB, orgID, hash string) (db.BlockReuseProbe, error) {
-		probeCalls++
+		probeCalls.Add(1)
 		if hash == "reusable" {
-			return db.BlockReuseProbe{Decision: db.BlockReuseReusable}, nil
+			return db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "canonical"}, nil
 		}
 		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
 	}
@@ -400,14 +401,17 @@ func TestCheckBlocksReusableCandidatesParallel_ProbesMetadataFirst(t *testing.T)
 	if err != nil {
 		t.Fatalf("checkBlocksReusableCandidatesParallel returned error: %v", err)
 	}
-	if probeCalls != 2 {
-		t.Fatalf("probeCalls = %d, want 2 (probe all hashes in metadata plane first)", probeCalls)
+	if probeCalls.Load() != 2 {
+		t.Fatalf("probeCalls = %d, want 2 (probe all hashes in metadata plane first)", probeCalls.Load())
 	}
-	if reusableByHash["new"] {
+	if reusableByHash["new"].Decision == db.BlockReuseReusable {
 		t.Fatal("non-reusable block reported reusable")
 	}
-	if !reusableByHash["reusable"] {
+	if reusableByHash["reusable"].Decision != db.BlockReuseReusable {
 		t.Fatal("reusable block not reported reusable")
+	}
+	if reusableByHash["reusable"].StorageClass != "canonical" {
+		t.Fatalf("reusable storage class = %q, want canonical", reusableByHash["reusable"].StorageClass)
 	}
 	if len(reusableHashes) != 1 || reusableHashes[0] != "reusable" {
 		t.Fatalf("reusableHashes = %v, want [reusable]", reusableHashes)
@@ -420,9 +424,9 @@ func TestCheckBlocksReadyParallel_OnlyChecksOwnershipForPhysicallyPresentCandida
 		checkBlocksClassifyOwnershipFn = origClassify
 	}()
 
-	var classifyCalls int
+	var classifyCalls atomic.Int32
 	checkBlocksClassifyOwnershipFn = func(database *db.DB, orgID, referrer, blockID string) (bool, error) {
-		classifyCalls++
+		classifyCalls.Add(1)
 		return blockID == "present", nil
 	}
 
@@ -438,14 +442,38 @@ func TestCheckBlocksReadyParallel_OnlyChecksOwnershipForPhysicallyPresentCandida
 	if err != nil {
 		t.Fatalf("checkBlocksReadyParallel returned error: %v", err)
 	}
-	if classifyCalls != 1 {
-		t.Fatalf("classifyCalls = %d, want 1 (missing physical object should skip ownership read)", classifyCalls)
+	if classifyCalls.Load() != 1 {
+		t.Fatalf("classifyCalls = %d, want 1 (missing physical object should skip ownership read)", classifyCalls.Load())
 	}
 	if ready["missing"] {
 		t.Fatal("missing block reported ready")
 	}
 	if !ready["present"] {
 		t.Fatal("present reusable block should be ready")
+	}
+}
+
+func TestCheckCanonicalBlocksExistParallel_UsesProbeStorageClass(t *testing.T) {
+	origExists := checkBlocksCanonicalExistsFn
+	t.Cleanup(func() { checkBlocksCanonicalExistsFn = origExists })
+
+	var calls atomic.Int32
+	checkBlocksCanonicalExistsFn = func(ctx context.Context, blockID string, probe db.BlockReuseProbe, manager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string) (bool, error) {
+		calls.Add(1)
+		if blockID != "block-1" || probe.StorageClass != "canonical" || fallbackClass != "preferred" || orgID != "org-1" {
+			t.Fatalf("canonical exists args = %q/%q/%q/%q", blockID, probe.StorageClass, fallbackClass, orgID)
+		}
+		return true, nil
+	}
+
+	exists, err := checkCanonicalBlocksExistParallel(context.Background(), []string{"block-1"}, map[string]db.BlockReuseProbe{
+		"block-1": {Decision: db.BlockReuseReusable, StorageClass: "canonical"},
+	}, nil, nil, "preferred", "org-1", 1)
+	if err != nil {
+		t.Fatalf("checkCanonicalBlocksExistParallel() error = %v", err)
+	}
+	if calls.Load() != 1 || !exists["block-1"] {
+		t.Fatalf("calls/existence = %d/%v, want 1/true", calls.Load(), exists["block-1"])
 	}
 }
 
@@ -688,6 +716,27 @@ func TestUploadBlockResponse_JSONFormat(t *testing.T) {
 	}
 	if decoded["new"] != true {
 		t.Errorf("new = %v, want true", decoded["new"])
+	}
+}
+
+func TestWriteUploadBlockMaterializationErrorDeleteFenceIsRetryableConflict(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	writeUploadBlockMaterializationError(c, fmt.Errorf("materialize: %w", ErrBlockDeleteInProgress))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+	if got := w.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["code"] != "block_delete_in_progress" {
+		t.Fatalf("code = %v, want block_delete_in_progress", response["code"])
 	}
 }
 

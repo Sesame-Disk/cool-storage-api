@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
@@ -193,20 +194,39 @@ var createFileTemplateBlockRetryBackoffFn = RetryBackoff
 var createFileTemplateBlockSleepFn = time.Sleep
 
 func retryCreateFileTemplateBlockMaterialization(store func() error, register func() error, resetStored func()) error {
+	return retryCreateFileTemplateBlockMaterializationContext(nil, store, register, resetStored)
+}
+
+func retryCreateFileTemplateBlockMaterializationContext(ctx context.Context, store func() error, register func() error, resetStored func()) error {
 	attempts := createFileTemplateBlockRetryAttempts
 	if attempts < 1 {
 		attempts = 1
 	}
 
-	retryBlocked := func(attempt int) {
+	retryBlocked := func(attempt int) error {
 		if resetStored != nil {
 			resetStored()
 		}
 		sleepFor := createFileTemplateBlockRetryBackoffFn(attempt)
 		log.Printf("[CreateFile] template block registration fenced by GC; retrying (%d/%d) after %s", attempt, attempts, sleepFor)
-		if sleepFor > 0 {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if sleepFor <= 0 {
+				return nil
+			}
+			timer := time.NewTimer(sleepFor)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		} else if sleepFor > 0 {
 			createFileTemplateBlockSleepFn(sleepFor)
 		}
+		return nil
 	}
 
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -214,14 +234,18 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 			if !errors.Is(err, ErrBlockDeleteInProgress) || attempt == attempts {
 				return err
 			}
-			retryBlocked(attempt)
+			if retryErr := retryBlocked(attempt); retryErr != nil {
+				return retryErr
+			}
 			continue
 		}
 		if err := register(); err != nil {
 			if !errors.Is(err, ErrBlockDeleteInProgress) || attempt == attempts {
 				return err
 			}
-			retryBlocked(attempt)
+			if retryErr := retryBlocked(attempt); retryErr != nil {
+				return retryErr
+			}
 			continue
 		}
 		return nil
@@ -1244,6 +1268,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	// same bytes on later CAS retries.
 	var templateBlockStore *storage.BlockStore
 	var templateStorageClass string
+	var templateMaterializedStorageClass string
 	var templateBlockStored bool
 
 	if len(templateContent) > 0 {
@@ -1329,38 +1354,43 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				templateBlockStore = blockStore
 				templateStorageClass = storageClass
 			}
-			if err := retryCreateFileTemplateBlockMaterialization(func() error {
+			if templateMaterializedStorageClass == "" {
+				templateMaterializedStorageClass = templateStorageClass
+			}
+			if err := retryCreateFileTemplateBlockMaterializationContext(c.Request.Context(), func() error {
 				if templateBlockStored {
 					return nil
 				}
+				templateMaterializedStorageClass = templateStorageClass
 				probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, templateBlockData.Hash)
-				if probeErr == nil {
-					switch probe.Decision {
-					case db.BlockReuseReusable:
-						if _, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass, orgID); ensureErr != nil {
-							return fmt.Errorf("failed to verify reusable template block: %w", ensureErr)
-						}
-						templateBlockStored = true
-						return nil
-					case db.BlockReuseNeedsPut:
-						if _, err := putUploadedBlockAutoDirectFn(c.Request.Context(), templateBlockStore, templateBlockData.Hash, templateBlockData.Data); err != nil {
-							return fmt.Errorf("failed to store file content: %w", err)
-						}
-						templateBlockStored = true
-						log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
-						return nil
-					case db.BlockReuseBlockedByGC:
-						return ErrBlockDeleteInProgress
+				if probeErr != nil {
+					return fmt.Errorf("probe template block reuse: %w", probeErr)
+				}
+				switch probe.Decision {
+				case db.BlockReuseReusable:
+					templateMaterializedStorageClass = probe.StorageClass
+					if _, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass, orgID); ensureErr != nil {
+						return fmt.Errorf("failed to verify reusable template block: %w", ensureErr)
 					}
-				} else {
-					log.Printf("[CreateFile] Block reuse probe unavailable for template block %s; falling back to legacy Exists+PUT path: %v", templateBlockData.Hash[:16], probeErr)
+					templateBlockStored = true
+					return nil
+				case db.BlockReuseNeedsPut:
+					putStore, resolvedClass, _, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, templateBlockStore, templateStorageClass, probe, orgID, templateBlockData.Hash)
+					if resolveErr != nil {
+						return resolveErr
+					}
+					templateMaterializedStorageClass = resolvedClass
+					if _, err := putUploadedBlockAutoDirectFn(c.Request.Context(), putStore, templateBlockData.Hash, templateBlockData.Data); err != nil {
+						return fmt.Errorf("failed to store file content: %w", err)
+					}
+					templateBlockStored = true
+					log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
+					return nil
+				case db.BlockReuseBlockedByGC:
+					return ErrBlockDeleteInProgress
+				default:
+					return fmt.Errorf("unsupported template block reuse decision %d", probe.Decision)
 				}
-				if _, err := templateBlockStore.PutBlockData(c.Request.Context(), templateBlockData); err != nil {
-					return fmt.Errorf("failed to store file content: %w", err)
-				}
-				templateBlockStored = true
-				log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
-				return nil
 			}, func() error {
 				// Keep the freshly stored template block alive and respect the GC
 				// delete fence until publish-attempt refs take over below. Use the
@@ -1368,7 +1398,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				// blocks.sha1 are written from the real bytes — required for desktop
 				// downloads (which fetch by SHA-1) and for staging to resolve the
 				// fs_object's SHA-1 block id back to its storage identity.
-				if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateStorageClass, "", externalBlockID); err != nil {
+				if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateMaterializedStorageClass, "", externalBlockID); err != nil {
 					return fmt.Errorf("failed to register template block metadata: %w", err)
 				}
 				templateBlockPinned = true
@@ -3431,33 +3461,38 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
 	}
-	if err := RetryUploadedBlockMaterialization("UploadFile", sha256ID, func() error {
+	materializedStorageClass := storageClass
+	if err := RetryUploadedBlockMaterializationContext(c.Request.Context(), "UploadFile", sha256ID, func() error {
+		materializedStorageClass = storageClass
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, sha256ID)
-		if probeErr == nil {
-			switch probe.Decision {
-			case db.BlockReuseReusable:
-				_, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID)
-				return ensureErr
-			case db.BlockReuseNeedsPut:
-				if _, putErr := putUploadedBlockAutoDirectFn(c.Request.Context(), blockStore, sha256ID, storedContent); putErr != nil {
-					return fmt.Errorf("failed to store block: %w", putErr)
-				}
-				return nil
-			case db.BlockReuseBlockedByGC:
-				return ErrBlockDeleteInProgress
+		if probeErr != nil {
+			return fmt.Errorf("probe block reuse for %s: %w", sha256ID, probeErr)
+		}
+		switch probe.Decision {
+		case db.BlockReuseReusable:
+			materializedStorageClass = probe.StorageClass
+			_, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID)
+			return ensureErr
+		case db.BlockReuseNeedsPut:
+			putStore, resolvedClass, _, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, blockStore, storageClass, probe, orgID, sha256ID)
+			if resolveErr != nil {
+				return resolveErr
 			}
-		} else {
-			log.Printf("[UploadFile] Block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v", sha256ID[:16], probeErr)
+			materializedStorageClass = resolvedClass
+			if _, putErr := putUploadedBlockAutoDirectFn(c.Request.Context(), putStore, sha256ID, storedContent); putErr != nil {
+				return fmt.Errorf("failed to store block: %w", putErr)
+			}
+			return nil
+		case db.BlockReuseBlockedByGC:
+			return ErrBlockDeleteInProgress
+		default:
+			return fmt.Errorf("unsupported block reuse decision %d for %s", probe.Decision, sha256ID)
 		}
-		if _, putErr := blockStore.PutBlockAuto(c.Request.Context(), sha256ID, storedContent); putErr != nil {
-			return fmt.Errorf("failed to store block: %w", putErr)
-		}
-		return nil
 	}, func() error {
 		// Register block metadata + a provisional reference (kept alive by TTL until
 		// the fs_object commit below creates the permanent reference), then write the
 		// external SHA-1 mapping only after the block is durable in Cassandra.
-		return RegisterUploadedBlockAndMapping(h.db, orgID, repoID, sha256ID, uploadOperationID, len(storedContent), storageClass, "", fileID)
+		return RegisterUploadedBlockAndMapping(h.db, orgID, repoID, sha256ID, uploadOperationID, len(storedContent), materializedStorageClass, "", fileID)
 	}, nil, nil); err != nil {
 		log.Printf("[UploadFile] CRITICAL: failed to materialize block org=%s block=%s ext=%s: %v", orgID, sha256ID[:16], fileID[:16], err)
 		if errors.Is(err, ErrBlockDeleteInProgress) {

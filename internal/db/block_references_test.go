@@ -808,8 +808,8 @@ func TestProbeBlockReuseBlockedByGCWhenGCStateDeleting(t *testing.T) {
 
 // TestProbeBlockReuseReturnsUnknownErrorWhenMetadataReadFails verifies a
 // Cassandra read failure surfaces as UnknownError with the underlying error
-// wrapped, so callers fall open to the legacy Exists+PUT path instead of
-// silently skipping the PUT.
+// wrapped, so metadata-governed upload callers fail closed instead of writing
+// to a preferred backend without a trustworthy fence/canonical decision.
 func TestProbeBlockReuseReturnsUnknownErrorWhenMetadataReadFails(t *testing.T) {
 	oldMetadata := probeBlockReuseMetadataFn
 	t.Cleanup(func() { probeBlockReuseMetadataFn = oldMetadata })

@@ -57,25 +57,23 @@ Cassandra probe — `DB.ProbeBlockReuse(orgID, blockID)` in
 | Decision             | Meaning                                              | Action in upload path        |
 |----------------------|------------------------------------------------------|------------------------------|
 | `BlockReuseReusable` | canonical metadata + live references, no GC fence    | `EnsureReusableBlockPresent`: verify the canonical object (HEAD on the declared key) and repair (direct PUT) only if missing |
-| `BlockReuseNeedsPut` | no metadata, or metadata with no live references     | `PutBlockAutoDirect` (no HEAD)|
+| `BlockReuseNeedsPut` | no metadata, or metadata with no live references     | direct PUT (preferred backend for first writer; canonical metadata backend otherwise) |
 | `BlockReuseBlockedByGC` | `gc_state='deleting'` or a `gc_s3_orphans` fence  | return `ErrBlockDeleteInProgress` → retry/back-off |
-| `BlockReuseUnknownError` | Cassandra read failed / corrupt metadata         | fall open to legacy Exists+PUT |
+| `BlockReuseUnknownError` | Cassandra read failed / corrupt metadata         | fail closed; no physical write |
 
 `PutBlockAutoDirect` (`internal/storage/blocks.go`) issues a direct `PutAuto`
-without the prior HEAD. Probe/store/materialize wrappers are partially wired into six funnels:
+without the prior HEAD. Probe/store/materialize wrappers are wired into all seven funnels:
 `HandleUpload` and `finalizeUploadStreaming` (`seafhttp.go`), `SyncHandler.PutBlock`
 (`sync.go`), `FileHandler.CreateFile` template and `UploadFile` (`files.go`), and
-`OnlyOffice.saveEditedDocument` (`onlyoffice.go`). The seventh audited funnel, web block-session
-`UploadBlock` in `internal/api/v2/blocks.go`, still uses direct `BlockExists`, `PutBlockData`, and
-materialization without the complete probe/retry wrapper.
+`OnlyOffice.saveEditedDocument` (`onlyoffice.go`), plus web block-session `UploadBlock` in
+`internal/api/v2/blocks.go`.
 
 **Scope of the fix — read carefully:** this is fixed for the *server-side hot
 upload paths* listed above. It is **not** a global removal of the S3 HEAD:
 - The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
   (`internal/storage/blocks.go`) still perform `Exists` + `PutAuto`. They remain
-  in use as the probe-error fallback inside the migrated paths and by unmigrated
-  callers such as the `v2/blocks.go` `UploadBlock` handler (which still does its
-  own HEAD + `PutBlockData`).
+  in use by unmigrated callers. Metadata-governed funnels never use them as a
+  probe-error fallback because canonical placement and delete fences are unknown.
 - The `Reusable` path no longer skips S3 entirely. To avoid trusting Cassandra
   metadata for a physical object that could be missing (partial GC, external
   deletion, eventual consistency, bugs), `EnsureReusableBlockPresent` does a
@@ -91,13 +89,11 @@ upload paths* listed above. It is **not** a global removal of the S3 HEAD:
 Net effect: the main win is for *new* content (the dominant case), which loses the
 HEAD entirely. Dedup hits keep a HEAD but gain self-healing.
 
-**Correctness status — fast-clear blocker open:** the probe and dual fence are necessary but do not
-currently form an end-to-end invariant. `RegisterUploadedBlock` can observe an active fence, wait
-until GC clears it after deleting the just-PUT object, run `UpsertBlockMetadata`, and return `nil`.
-The outer wrapper then does not repeat store. `EnsureReusableBlockPresent` is only a targeted
-HEAD/repair for `Reusable`, not an atomic exclusion mechanism. `NeedsPut` with existing metadata
-also must store through `probe.StorageClass` and the canonical key; several callers currently use
-the preferred store, while first-writer metadata can continue pointing at the old backend. See
+**Correctness status — writer-side fixed, lifecycle blocker open:** `RegisterUploadedBlock` now
+returns the retry sentinel immediately after observing either fence, so the outer wrapper repeats
+store before metadata. Web block-session uses the same operation boundary, and existing-metadata
+`NeedsPut` uses `probe.StorageClass` plus the canonical key. `EnsureReusableBlockPresent` remains a
+targeted HEAD/repair, not a physical fence against a stale key-only deleter. See
 `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`.
 
 **Retry loop change:** `retrySeafHTTPBlockMaterialization` (and the shared
@@ -114,12 +110,16 @@ a Cassandra-first probe can reject the block before any S3 work starts.
   through the canonical verify once, no legacy/direct PUT) and needs-put path (no
   legacy HEAD, 1 direct PUT, ref/mapping registered); plus `store`-phase fence retry.
 - `internal/api/v2/upload_reuse_test.go` — `EnsureReusableBlockPresent` exists-skip
-  (honors `probe.StorageKey`) and missing-repair (derives the key from the hash when
+  (validates `probe.StorageKey`) and missing-repair (derives the key from the hash when
   `storage_key` is empty) paths.
-- `internal/api/v2/upload_reuse_test.go` — shared retry helper + fail-open probe.
-- `TestRetryUploadedBlockMaterializationRetriesStoreFence` is synthetic: the store callback returns
-  `ErrBlockDeleteInProgress` directly. It does not exercise real `RegisterUploadedBlock` or
-  fast-clear.
+- `internal/api/v2/upload_reuse_test.go` — shared retry helper, fast-clear, and cancellable backoff.
+- `TestRetryUploadedBlockMaterializationRestoresObjectAfterFastClearingFence` composes real
+  registration with the outer retry; `TestRetryUploadedBlockMaterializationWithWorkerPausedAfterPostClaimCheck`
+  pauses the real worker at the destructive boundary and proves the second store.
+- `TestNeedsPutUsesCanonicalMinIOBucket` uses metadata/probes plus two real MinIO buckets; the web
+  canonical-mismatch round trip proves upload/check/commit/download against the same invariant.
+- `internal/streaming/canonical_block_reader_test.go` covers exact class routing, derived-key
+  validation, cross-org key rejection, missing legacy metadata, and bounded deduplicated lookup.
 - `internal/api/handler_mapping_failure_test.go` — sync needs-put uses direct PUT,
   not the legacy Exists+PUT.
 

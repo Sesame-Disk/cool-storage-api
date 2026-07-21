@@ -1841,6 +1841,15 @@ func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, e
 	return current, nil
 }
 
+// SetBlockHasReferencesHookForTest installs a deterministic synchronization
+// point for worker tests that must pause between the post-claim liveness read
+// and physical deletion.
+func (m *MockStore) SetBlockHasReferencesHookForTest(hook func(orgID uuid.UUID, blockID string, current bool) (bool, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blockHasReferencesHook = hook
+}
+
 func (m *MockStore) RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

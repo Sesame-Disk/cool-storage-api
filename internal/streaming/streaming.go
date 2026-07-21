@@ -216,9 +216,9 @@ func PrefetchBlock(ctx context.Context, blockStore BlockReader, blockID string, 
 // StreamBlocks streams resolved blocks to an HTTP response with prefetching.
 // Uses prefetch (overlap S3 fetch with HTTP write) and 4MB io.CopyBuffer
 // for maximum throughput. Only O(2 x block_size) RAM.
-func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, resolvedIDs []string, fileKey []byte, fileIV []byte, logPrefix string) {
+func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, resolvedIDs []string, fileKey []byte, fileIV []byte, logPrefix string) error {
 	if len(resolvedIDs) == 0 {
-		return
+		return nil
 	}
 
 	buf := GetCopyBuf()
@@ -238,14 +238,14 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 
 		if result.Err != nil {
 			log.Printf("[%s] Failed to get block %d/%d: %v", logPrefix, i, len(resolvedIDs), result.Err)
-			return // headers already sent, can't return error to client
+			return result.Err // headers already sent, but accounting can use the failure
 		}
 
 		if fileKey != nil {
 			// Encrypted: write decrypted data
 			if _, err := c.Writer.Write(result.Data); err != nil {
 				log.Printf("[%s] Write error: %v", logPrefix, err)
-				return
+				return err
 			}
 		} else {
 			// Unencrypted: stream with 4MB buffer
@@ -253,7 +253,7 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 			result.Reader.Close()
 			if err != nil {
 				log.Printf("[%s] Stream copy error: %v", logPrefix, err)
-				return
+				return err
 			}
 		}
 
@@ -262,4 +262,5 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 			c.Writer.Flush()
 		}
 	}
+	return nil
 }

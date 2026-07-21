@@ -4,6 +4,7 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -817,6 +818,17 @@ func uploadRawBlockStatus(t *testing.T, c *testClient, content []byte) (int, map
 		if err := json.Unmarshal(body, &payload); err != nil {
 			t.Fatalf("decoding block upload response failed: %v body=%s", err, string(body))
 		}
+	}
+	if resp.StatusCode == http.StatusCreated {
+		blockID := sha256hex(content)
+		blockStore := blockStoreForCleanupOrNil(t, defaultOrgID)
+		t.Cleanup(func() {
+			if blockStore != nil {
+				if err := blockStore.DeleteBlock(context.Background(), blockID); err != nil {
+					t.Errorf("cleanup raw block %s: %v", blockID, err)
+				}
+			}
+		})
 	}
 
 	return resp.StatusCode, payload

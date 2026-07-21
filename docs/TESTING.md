@@ -102,6 +102,30 @@ sensitive integration tests become nondeterministic because secondary nodes can
 refresh dirty GC snapshots, requeue failed items, or purge expired share links in
 parallel.
 
+### GC Upload-Fence Focused Coverage
+
+The writer-side fast-clear regression is deterministic and does not depend on sleeps:
+`TestRetryUploadedBlockMaterializationWithWorkerPausedAfterPostClaimCheck` pauses the production
+worker after its post-claim reference read and proves first store, observed fence, physical delete,
+second store, then metadata. `TestNeedsPutUsesCanonicalMinIOBucket` uses two real MinIO buckets to
+prove existing metadata is repaired in its canonical class.
+`TestWebBlockUploadCanonicalBackendMismatchRoundTrip` then exercises real upload, check, commit, and
+download with the library preference and canonical block backend in different MinIO buckets. It
+also covers session, legacy V2, and sync existence checks against that canonical bucket.
+
+```bash
+docker compose --profile test run --rm --build gotest \
+  go test -race -count=20 -run 'TestRetryUploadedBlockMaterialization.*(FastClearingFence|PostClaimCheck)|TestStoreUploadedBlockForProbe|TestResolveNeedsPutBlockStore' \
+  ./internal/api/v2
+
+docker compose --profile test run --rm --build go-integration-test \
+  go test -tags integration -count=1 -run '^(TestNeedsPutUsesCanonicalMinIOBucket|TestWebBlockUploadCanonicalBackendMismatchRoundTrip)$' \
+  ./internal/integration
+```
+
+These tests close only writer-side rematerialization and canonical placement. They do not close the
+open stale physical-deleter lifecycle or cross-DC reference-visibility gates.
+
 ### Current Multi-Instance Coverage Gaps
 
 - Multi-instance quota-race coverage now exists for concurrent per-user storage

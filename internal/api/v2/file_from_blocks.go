@@ -326,7 +326,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// ProbeBlockReuse proves liveness/governance but not that the S3 object still
 	// exists (metadata can outlive a lost object); a commit must require both, or
 	// it could publish a file pointing at a missing block.
-	blockStore, _, err := h.resolveLibraryBlockStore(c, orgID, repoID)
+	blockStore, storageClass, err := h.resolveLibraryBlockStore(c, orgID, repoID)
 	if err != nil || blockStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
@@ -339,7 +339,13 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		}
 		sizeByHash[b.SHA256] = b.Size
 	}
-	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, blockVerifyConcurrency)
+	probesByHash, reusableHashes, err := checkBlocksReusableCandidatesParallel(c.Request.Context(), h.db, orgID, uniqueHashes, blockVerifyConcurrency)
+	if err != nil {
+		metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("classify").Inc()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify blocks"})
+		return
+	}
+	existsMap, err := checkCanonicalBlocksExistParallel(c.Request.Context(), reusableHashes, probesByHash, h.storageManager, blockStore, storageClass, orgID, blockVerifyConcurrency)
 	if err != nil {
 		metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("presence").Inc()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify block presence"})
@@ -353,7 +359,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// blocks.sha1 (which UploadBlock wrote from the block's real bytes) via
 	// ProbeBlockReuse. The client no longer sends a SHA-1: the server owns it.
 	verifyStart := time.Now()
-	statuses, sha1ByHash256, err := h.verifyManifestBlocks(c.Request.Context(), orgID, referrer, uniqueHashes, sizeByHash, existsMap)
+	statuses, sha1ByHash256, err := h.verifyManifestBlocks(c.Request.Context(), orgID, referrer, uniqueHashes, sizeByHash, probesByHash, existsMap)
 	if err != nil {
 		metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("classify").Inc()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify blocks"})
@@ -441,7 +447,8 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		if relErr := h.db.ReleaseBlockUploadSessionCommit(session.SessionID); relErr != nil {
 			log.Printf("[CreateFileFromBlocks] WARNING: failed to release commit claim after finalize error: %v", relErr)
 		}
-		handleStoredUploadMetadataError(h.db, orgID, repoID, session.SessionID, blockIDs, err)
+		// Keep session-owned TTL pins for a retry. The session referrer is shared by
+		// concurrent block requests, so a failed commit cannot safely delete it.
 		writeUploadFileError(c, err)
 		return
 	}
@@ -554,7 +561,7 @@ func observeBlockVerification(start time.Time, uniqueHashes []string, statuses m
 // readiness with bounded concurrency (a large manifest is thousands of blocks,
 // so a sequential probe-per-block would be thousands of serial round-trips).
 // Returns a hard error only on infrastructure failure (caller should 500).
-func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer string, uniqueHashes []string, sizeByHash map[string]int64, existsMap map[string]bool) (map[string]int, map[string]string, error) {
+func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer string, uniqueHashes []string, sizeByHash map[string]int64, probesByHash map[string]db.BlockReuseProbe, existsMap map[string]bool) (map[string]int, map[string]string, error) {
 	result := make(map[string]int, len(uniqueHashes))
 	sha1ByHash := make(map[string]string, len(uniqueHashes))
 	var mu sync.Mutex
@@ -569,7 +576,7 @@ func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer 
 				return gctx.Err()
 			}
 			defer func() { <-sem }()
-			status, sha1, err := h.classifyBlockForCommit(orgID, referrer, hash, sizeByHash[hash], existsMap[hash])
+			status, sha1, err := h.classifyBlockForCommit(orgID, referrer, hash, sizeByHash[hash], probesByHash[hash], existsMap[hash])
 			if err != nil {
 				return err
 			}
@@ -635,11 +642,7 @@ func summarizeBlockVerification(start time.Time, blocks []fileFromBlocksBlock, u
 // classifyBlockForCommit decides whether one block is commit-ready (R1/R8/R11):
 // live (ProbeBlockReuse == Reusable), physically present, at the declared size,
 // and owned by this session OR kept alive by a committed file ("fs:") reference.
-func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, declaredSize int64, exists bool) (int, string, error) {
-	probe, err := h.db.ProbeBlockReuse(orgID, hash)
-	if err != nil {
-		return 0, "", err
-	}
+func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, declaredSize int64, probe db.BlockReuseProbe, exists bool) (int, string, error) {
 	sha1 := strings.TrimSpace(probe.Sha1)
 	if probe.Decision != db.BlockReuseReusable || !exists {
 		return blockStatusNeedsUpload, sha1, nil

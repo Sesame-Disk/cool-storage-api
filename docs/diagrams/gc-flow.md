@@ -4,9 +4,9 @@
 
 > Current model: keyed `block_references`, durable candidates, LWT claim + live-ref recheck,
 > and write-ahead `gc_s3_orphans`. The retired `blocks.ref_count = -999` protocol is preserved
-> in Git history, not in this live diagram. The physical block-delete sequence has an **open
-> upload-fence rematerialization blocker**: an upload that observes a fence can currently succeed
-> after it clears without repeating a PUT deleted by GC. Both the transient-error fail-open (P6a) and execution-time canonical revalidation gap
+> in Git history, not in this live diagram. Writer-side fence propagation and canonical
+> rematerialization are implemented; the physical block-delete sequence still has an **open
+> stale-deleter lifecycle blocker** after the visible orphan fence clears. Both the transient-error fail-open (P6a) and execution-time canonical revalidation gap
 > (P6b) are fixed. Markerless artifact discovery remains P7. Full audit:
 > [../GC-DELETE-CLEANUP-INVESTIGATION.md](../GC-DELETE-CLEANUP-INVESTIGATION.md).
 
@@ -59,7 +59,7 @@ flowchart TD
 The dual writer-visible fence is `blocks.gc_state='deleting'` **or** `gc_s3_orphans`.
 `StartBlockDeleteOrphan` runs before `FinalizeBlockDelete`, and the orphan row remains until the S3
 delete and mapping cleanup finish (or remains for recovery after S3 failure). That closes the
-claim-to-orphan handoff gap, but the current writer behavior is still vulnerable:
+claim-to-orphan handoff gap. The historical writer-side vulnerability was:
 
 ```text
 upload PUT
@@ -71,13 +71,10 @@ upload PUT
   -> success with reference + metadata, object absent
 ```
 
-Required invariant, **open with partial machinery present**: observation of either fence invalidates
-every earlier PUT for success. Retry/probe/repair helpers already wrap SeafHTTP simple/streaming,
-sync `PutBlock`, V2 `UploadFile`, template `CreateFile`, and OnlyOffice, but the inner
-`RegisterUploadedBlock` wait absorbs fast-clear and returns `nil`, so those outer wrappers do not
-repeat store. The web block-session path in `internal/api/v2/blocks.go` remains direct and
-unwrapped. For existing-metadata `NeedsPut`, the repeated store must resolve `probe.StorageClass`
-and the canonical key rather than use the current preferred backend. Rematerialization alone is not
+Writer-side invariant, **implemented**: observation of either fence invalidates every earlier PUT
+for success. `RegisterUploadedBlock` propagates immediately and all seven funnels, including web
+block session, repeat store/materialize. Existing-metadata `NeedsPut` resolves `probe.StorageClass`
+and the canonical key rather than the current preferred backend. Rematerialization alone is not
 enough: worker and scanner can overlap under one leader, so recovery can clear the visible fence
 while the original worker is still able to delete the post-fence store. A shared delete-lifecycle
 claim/generation must fence direct deletion and recovery; stale recoverers have the same ABA shape.

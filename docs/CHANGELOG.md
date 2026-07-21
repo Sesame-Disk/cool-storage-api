@@ -8,6 +8,30 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-07-20 - Upload fast-clear now rematerializes server-side
+
+- `RegisterUploadedBlock` no longer waits through a GC fence. It preserves the shared TTL pin and
+  immediately returns the retry sentinel to the layer that still owns the bytes.
+- All seven upload funnels, including web block-session, now use a bounded server-owned
+  `store -> materialize` retry. Web retries do not duplicate staged admission, traffic, or metrics.
+- Existing-metadata `NeedsPut` writes to `probe.StorageClass` and the canonical org-scoped key;
+  first writers continue using the preferred backend. Probe infrastructure errors fail closed.
+- Mapping failures preserve the shared operation/session TTL pin, and retry backoff is cancellable
+  from request contexts. Encrypted media uses sequential streaming rather than unsafe range offsets.
+- Canonical block readers route normal, historic, share-link, ZIP, range, and sync reads by immutable
+  storage class, while validating persisted keys against the derived org-scoped locator.
+- Session, legacy V2, and sync block checks verify each block in that same canonical location and
+  propagate backend errors. Download accounting records successful response bytes, not error bodies
+  or the declared file size after a partial stream.
+- Deterministic coverage pauses the real GC worker after its post-claim liveness read and proves a
+  second physical store before metadata. Two-bucket MinIO integration verifies metadata-first
+  placement plus upload/check/commit/download across a preferred/canonical class mismatch.
+- `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` remains open: this slice does not fence stale
+  key-only S3 deletes across direct worker/recovery, and it does not close the separate cross-DC
+  reference-visibility gate.
+
+---
+
 ## 2026-07-16 - GC physical deletion is org-scoped end to end (P10 PR-3)
 
 - Normal block deletion and S3 orphan recovery now resolve `BlockStore` by

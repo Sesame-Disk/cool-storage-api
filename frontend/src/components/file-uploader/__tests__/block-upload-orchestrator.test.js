@@ -734,6 +734,40 @@ describe('global concurrency limiter (shared across files)', () => {
     expect(res).toEqual([{ name: 'f', id: 'i', size: '1' }]);
   });
 
+  test('a block-delete 409 honors Retry-After without consuming the hard retry budget', async () => {
+    let attempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn(() => {
+        attempt += 1;
+        if (attempt === 1) {
+          const err = new Error('block is being deleted; retry the upload');
+          err.response = {
+            status: 409,
+            headers: { 'retry-after': '0.001' },
+            data: { code: 'block_delete_in_progress' },
+          };
+          return Promise.reject(err);
+        }
+        return Promise.resolve({ data: {} });
+      }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+    const limiter = {
+      acquire: jest.fn().mockResolvedValue(() => { }),
+      noteRetry: jest.fn(),
+      noteFailure: jest.fn(),
+      getMaxConcurrency: () => 1,
+    };
+
+    await uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 1 });
+
+    expect(attempt).toBe(2);
+    expect(limiter.noteRetry).toHaveBeenCalledTimes(1);
+    expect(limiter.noteFailure).not.toHaveBeenCalled();
+  });
+
   test('a terminal staging-cap 429 is surfaced immediately instead of being soft-retried', async () => {
     let attempt = 0;
     const api = {

@@ -475,6 +475,104 @@ func uploadFileViaBlocksFlow(t *testing.T, c *testClient, repoID, parentDir, fil
 	})
 }
 
+func TestWebBlockUploadCanonicalBackendMismatchRoundTrip(t *testing.T) {
+	content := []byte(fmt.Sprintf("canonical backend mismatch %d", time.Now().UnixNano()))
+	blockID := sha256hex(content)
+	externalSHA1 := sha1hex(content)
+	fileFSID := webFileFSID(t, []string{externalSHA1}, len(content))
+	repoID := createDisposableTestLibrary(t, adminClient, fmt.Sprintf("inttest-canonical-backend-%d", time.Now().UnixNano()))
+	orgID := resolveOrgID(t, repoID)
+	database := shareProjectionDBForTest(t)
+	t.Cleanup(func() {
+		removeTestLibraryFully(t, adminClient, database.Session(), orgID, repoID)
+	})
+
+	newStore := func(bucket string) *storage.BlockStore {
+		t.Helper()
+		s3Store, err := storage.NewS3Store(context.Background(), storage.S3Config{
+			Endpoint:        envOrDefault("S3_ENDPOINT", "http://minio:9000"),
+			Bucket:          bucket,
+			Region:          envOrDefault("S3_REGION", "us-east-1"),
+			AccessKeyID:     envOrDefault("S3_ACCESS_KEY_ID", "minioadmin"),
+			SecretAccessKey: envOrDefault("S3_SECRET_ACCESS_KEY", "minioadmin"),
+			UsePathStyle:    true,
+		})
+		if err != nil {
+			t.Fatalf("NewS3Store(%s): %v", bucket, err)
+		}
+		blockStore, err := storage.NewOrgBlockStore(s3Store, "blocks/", orgID)
+		if err != nil {
+			t.Fatalf("NewOrgBlockStore(%s): %v", bucket, err)
+		}
+		return blockStore
+	}
+	preferredStore := newStore(envOrDefault("S3_BUCKET", "sesamefs-blocks"))
+	canonicalStore := newStore(envOrDefault("S3_TEST_CANONICAL_BUCKET", "sesamefs-usa"))
+	canonicalKey := canonicalStore.StorageKeyForHash(blockID)
+	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, externalSHA1, len(content), "hot-s3-usa", canonicalKey); err != nil {
+		t.Fatalf("seed canonical metadata: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := canonicalStore.DeleteBlock(context.Background(), blockID); err != nil {
+			t.Errorf("cleanup canonical object: %v", err)
+		}
+	})
+	cleanupUploadedBlockArtifactsForTest(t, orgID, repoID, blockID, externalSHA1,
+		dbpkg.BlockReferrerForFSObject(repoID, fileFSID))
+
+	sessionID := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
+	uploadResp := webUploadBlock(t, adminClient, sessionID, content)
+	if uploadResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(uploadResp.Body)
+		uploadResp.Body.Close()
+		t.Fatalf("canonical repair upload status %d: %s", uploadResp.StatusCode, body)
+	}
+	uploadResp.Body.Close()
+
+	canonicalExists, err := canonicalStore.BlockExists(context.Background(), blockID)
+	if err != nil {
+		t.Fatalf("canonical BlockExists: %v", err)
+	}
+	preferredExists, err := preferredStore.BlockExists(context.Background(), blockID)
+	if err != nil {
+		t.Fatalf("preferred BlockExists: %v", err)
+	}
+	if !canonicalExists || preferredExists {
+		t.Fatalf("canonical/preferred existence = %v/%v, want true/false", canonicalExists, preferredExists)
+	}
+
+	existing, missing := webCheckBlocks(t, adminClient, sessionID, []string{blockID})
+	if len(existing) != 1 || existing[0] != blockID || len(missing) != 0 {
+		t.Fatalf("check existing/missing = %v/%v, want [%s]/[]", existing, missing, blockID)
+	}
+	legacyCheckResp := adminClient.PostJSON(t, "/api/v2/blocks/check", map[string]interface{}{"hashes": []string{blockID}})
+	expectStatus(t, legacyCheckResp, http.StatusOK)
+	var legacyCheck struct {
+		Existing []string `json:"existing"`
+		Missing  []string `json:"missing"`
+	}
+	decodeJSON(t, legacyCheckResp, &legacyCheck)
+	if len(legacyCheck.Existing) != 1 || legacyCheck.Existing[0] != blockID || len(legacyCheck.Missing) != 0 {
+		t.Fatalf("legacy check existing/missing = %v/%v, want [%s]/[]", legacyCheck.Existing, legacyCheck.Missing, blockID)
+	}
+	syncCheckResp := adminClient.PostJSON(t, fmt.Sprintf("/seafhttp/repo/%s/check-blocks", repoID), []string{blockID})
+	expectStatus(t, syncCheckResp, http.StatusOK)
+	var syncNeeded []string
+	decodeJSON(t, syncCheckResp, &syncNeeded)
+	if len(syncNeeded) != 0 {
+		t.Fatalf("sync check needed = %v, want []", syncNeeded)
+	}
+	commitResp := webCommit(t, adminClient, repoID, map[string]interface{}{
+		"session": sessionID, "parent_dir": "/", "filename": "canonical.bin", "replace": false,
+		"size": len(content), "blocks": blocksManifest([][]byte{content}),
+	})
+	expectStatus(t, commitResp, http.StatusOK)
+	commitResp.Body.Close()
+	if downloaded := downloadRepoFile(t, adminClient, repoID, "/canonical.bin"); !bytes.Equal(downloaded, content) {
+		t.Fatalf("downloaded content = %q, want %q", downloaded, content)
+	}
+}
+
 func TestWebBlockUploadDeduplicatesAcrossLibrariesInSameOrg(t *testing.T) {
 	content := []byte(fmt.Sprintf("org-scoped intra-org dedup %d", time.Now().UnixNano()))
 	blockID := sha256hex(content)

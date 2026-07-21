@@ -230,6 +230,19 @@ func QueryBlockSizes(ctx context.Context, database *db.DB, orgID string, blockSt
 	if len(blockIDs) == 0 {
 		return sizes, nil
 	}
+	if cached, ok := blockStore.(interface {
+		CachedBlockSize(string) (int64, bool)
+	}); ok {
+		complete := true
+		for i, blockID := range blockIDs {
+			var found bool
+			sizes[i], found = cached.CachedBlockSize(blockID)
+			complete = complete && found
+		}
+		if complete {
+			return sizes, nil
+		}
+	}
 
 	// Step 1: parallel single-row reads from Cassandra.
 	type lookupResult struct {

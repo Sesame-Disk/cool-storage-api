@@ -1345,13 +1345,15 @@ block metadata already has a first-writer LWT; GC has separate delete-claim/fina
 orphan lifecycle uses conditional create/reset/phase-advance writes. Those orphan conditions prevent
 phantom recovery rows but do not currently fence one delete lifecycle across direct worker and
 scanner recovery. References and SHA-1 forward mappings deliberately remain ordinary writes. The selected
-`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` remediation repeats server-side physical storage after
-an observed fence; it does **not** add LWT to steady-state reference or mapping writes. Partial
-retry wrappers already exist for six upload funnels, but the inner registration wait currently
-absorbs fast-clear and the web `blocks.go` session path is unwrapped. The fix must propagate the
-observed fence and reuse those wrappers. For existing-metadata `NeedsPut`, it must also store through
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` writer-side remediation repeats server-side physical
+storage after an observed fence; it adds no LWT to steady-state reference or mapping writes. All
+seven upload funnels now use the retry contract, and existing-metadata `NeedsPut` stores through
 `probe.StorageClass` and the canonical key so first-writer metadata and physical placement cannot
-diverge.
+diverge. Probe errors fail closed instead of falling back to preferred-store I/O. Reads pre-resolve
+the immutable storage class per SHA-256 block; non-empty classes use exact backend lookup without
+health failover, and persisted keys must be empty or match the derived org-scoped hash key. The issue
+remains open because this does not fence an already-authorized key-only S3
+delete across direct worker/recovery.
 
 ---
 

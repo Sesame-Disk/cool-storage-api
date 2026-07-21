@@ -269,26 +269,24 @@ reusable / needs-put / blocked-by-GC / unknown-error. Needs-put blocks use
 `PutBlockAutoDirect` (no HEAD); reusable blocks run `EnsureReusableBlockPresent`
 (verify the canonical object via HEAD on the declared key, repair via direct PUT
 only if missing); blocked-by-GC returns `ErrBlockDeleteInProgress` to retry;
-unknown-error falls open to the legacy Exists+PUT. Partially wired into six upload funnels
-(`seafhttp.go` ×2, `sync.go`, `files.go` ×2, `onlyoffice.go`). Per-block cost: a
+unknown-error fails closed without physical I/O. Wired into all seven upload funnels
+(`seafhttp.go` ×2, `sync.go`, `files.go` ×2, `onlyoffice.go`, `blocks.go`). Per-block cost: a
 new block now pays ≤2 Cassandra reads (~1 ms each) + 1 direct PUT and no HEAD;
-dedup hits keep one canonical-verify HEAD. The materialize retry loop also retries
-`ErrBlockDeleteInProgress` from the `store` phase, but the end-to-end safety invariant remains open:
-`RegisterUploadedBlock` absorbs fast-clear and returns `nil`, preventing the outer store retry.
-Web block-session `v2/blocks.go` is unwrapped. Existing-metadata `NeedsPut` must also store through
-`probe.StorageClass` and the canonical key rather than the current preferred backend.
+dedup hits keep one canonical-verify HEAD. Registration now propagates an observed fence immediately,
+the materialize retry reruns store, web block-session is wrapped, and existing-metadata `NeedsPut`
+uses `probe.StorageClass` plus the canonical key. The broader issue remains open only at the physical
+delete lifecycle: a stale key-only deleter is not fenced by these writer changes.
 
 **Scope (not global):** this fixes the server-side hot upload paths only. The
 `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData` still do
-`Exists` + `PutAuto` and remain in use as the probe-error fallback and by
-unmigrated callers (e.g. `v2/blocks.go` `UploadBlock`). The HEAD was not removed
+`Exists` + `PutAuto` and remain in use by unmigrated callers. The HEAD was not removed
 from `BlockStore` globally.
 
 Tests: `ProbeBlockReuse` decision matrix (`block_references_test.go`),
 reusable/needs-put `finalizeUploadStreaming` paths (`seafhttp_test.go`),
-`EnsureReusableBlockPresent` exists/repair paths and shared retry helper
-(`upload_reuse_test.go`). The helper's store-fence test is synthetic and does not exercise real
-`RegisterUploadedBlock` or fast-clear.
+`EnsureReusableBlockPresent` exists/repair paths, real registration fast-clear, a worker paused after
+its post-claim check, and canonical two-bucket MinIO placement (`upload_reuse_test.go` and
+`gc_upload_fence_test.go`).
 
 **P-2b - Generic S3 multipart uploads still sent parts serially** - Fixed
 (2026-06-17, branch `perf/s3-multipart-parallel-parts`)
@@ -2084,19 +2082,18 @@ on that metric to bound leaked forward mappings.
 
 A cross-agent audit after PR #123 (`fix/gc-block-representation-durability`) documented the
 claim/recheck and durable orphan-recovery protocol. P6a/P6b were subsequently fixed, but the
-2026-07-20 refresh found the open fast-clear upload blocker
-`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`: partial retry wrappers exist, yet the inner
-registration wait absorbs the fence and web block session is unwrapped. Full audit and code citations:
+2026-07-20 refresh found `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`. Its writer-side slice is now
+fixed: registration propagates the fence, all seven funnels retry store/materialize, and canonical
+placement is enforced. The physical delete-lifecycle ABA remains open. Full audit and code citations:
 `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`. Per-item
 issues: `ISSUE-GC-*` in `docs/KNOWN_ISSUES.md`. This extends the earlier §10 (Library Deletion:
 Cleanup Paths) — those paths are functionally correct but leave the durability/optimality debt below.
 
 **Current boundary:** physical block delete uses claim-then-verify LWT, registers
 `gc_s3_orphans` recovery before deleting the canonical row, and validates representation
-fail-closed. Existence reads and execution-time canonical revalidation are fixed. The remaining
-blocker is writer-side: a fast-clearing fence can be consumed without a post-fence store. The fix
-must use canonical metadata placement for existing-metadata `NeedsPut` and add no LWT to
-references/mappings or the no-fence path.
+fail-closed. Existence reads, execution-time canonical revalidation, writer-side rematerialization,
+and canonical `NeedsPut` placement are fixed without adding LWT to references/mappings or the
+no-fence path. The remaining blocker is physical lifecycle fencing across direct worker/recovery.
 
 **Engine-level robustness debt (E1/E2/E4, low-severity,
 `ISSUE-GC-ENGINE-ROBUSTNESS-01`).** A

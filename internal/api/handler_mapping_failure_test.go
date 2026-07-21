@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,11 +17,15 @@ import (
 
 func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 	oldPutAuto := putUploadedBlockAutoFn
+	oldPutDirect := putUploadedBlockAutoDirectForUploadFn
+	oldProbe := probeUploadedBlockReuseForUploadFn
 	oldRegister := registerUploadedBlockAndMappingForUploadFn
 	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
 	oldEncrypted := lookupLibraryEncryptedForUploadFn
 	t.Cleanup(func() {
 		putUploadedBlockAutoFn = oldPutAuto
+		putUploadedBlockAutoDirectForUploadFn = oldPutDirect
+		probeUploadedBlockReuseForUploadFn = oldProbe
 		registerUploadedBlockAndMappingForUploadFn = oldRegister
 		checkUploadStorageQuotaForCurrentHeadFn = oldQuota
 		lookupLibraryEncryptedForUploadFn = oldEncrypted
@@ -28,6 +33,12 @@ func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 
 	putUploadedBlockAutoFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 		return hash, nil
+	}
+	putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		return hash, nil
+	}
+	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "legacy"}, nil
 	}
 	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
 		return fileSize, 1, nil
@@ -99,12 +110,14 @@ func TestSeafHTTPHandleUploadFailsClosedWhenEncryptionStatusLookupFails(t *testi
 func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	oldExists := syncBlockExistsFn
 	oldPut := syncPutBlockDataFn
+	oldPutDirect := syncPutBlockAutoDirectFn
 	oldProbe := syncProbeUploadedBlockReuseFn
 	oldRegister := registerUploadedBlockAndMappingForSyncFn
 	oldLookupClass := lookupLibraryStorageClassForSyncFn
 	t.Cleanup(func() {
 		syncBlockExistsFn = oldExists
 		syncPutBlockDataFn = oldPut
+		syncPutBlockAutoDirectFn = oldPutDirect
 		syncProbeUploadedBlockReuseFn = oldProbe
 		registerUploadedBlockAndMappingForSyncFn = oldRegister
 		lookupLibraryStorageClassForSyncFn = oldLookupClass
@@ -115,6 +128,12 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	}
 	syncPutBlockDataFn = func(ctx context.Context, blockStore *storage.BlockStore, block *storage.BlockData) (string, error) {
 		return block.Hash, nil
+	}
+	syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		return hash, nil
+	}
+	syncProbeUploadedBlockReuseFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
 	}
 	registerUploadedBlockAndMappingForSyncFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
 		return fmt.Errorf("mapping failed: %w", v2.ErrBlockMappingWriteFailed)
@@ -137,6 +156,59 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	}
 	if got := decodeJSONObject(t, w.Body)["error"]; got != "failed to create block mapping" {
 		t.Fatalf("error = %v, want failed to create block mapping", got)
+	}
+}
+
+func TestSyncPutBlockProbeFailureDoesNotWritePreferredBackend(t *testing.T) {
+	oldExists := syncBlockExistsFn
+	oldPut := syncPutBlockDataFn
+	oldPutDirect := syncPutBlockAutoDirectFn
+	oldProbe := syncProbeUploadedBlockReuseFn
+	oldRegister := registerUploadedBlockAndMappingForSyncFn
+	oldLookupClass := lookupLibraryStorageClassForSyncFn
+	t.Cleanup(func() {
+		syncBlockExistsFn = oldExists
+		syncPutBlockDataFn = oldPut
+		syncPutBlockAutoDirectFn = oldPutDirect
+		syncProbeUploadedBlockReuseFn = oldProbe
+		registerUploadedBlockAndMappingForSyncFn = oldRegister
+		lookupLibraryStorageClassForSyncFn = oldLookupClass
+	})
+
+	syncProbeUploadedBlockReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{}, errors.New("cassandra timeout")
+	}
+	syncBlockExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		t.Fatal("probe failure must not run legacy existence fallback")
+		return false, nil
+	}
+	syncPutBlockDataFn = func(context.Context, *storage.BlockStore, *storage.BlockData) (string, error) {
+		t.Fatal("probe failure must not write the preferred backend")
+		return "", nil
+	}
+	syncPutBlockAutoDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		t.Fatal("probe failure must not perform a direct PUT")
+		return "", nil
+	}
+	registerUploadedBlockAndMappingForSyncFn = func(*db.DB, string, string, string, string, int, string, string, string) error {
+		t.Fatal("probe failure must not materialize metadata")
+		return nil
+	}
+	lookupLibraryStorageClassForSyncFn = func(*SyncHandler, string, string) string { return "" }
+
+	r := setupSyncTestRouter()
+	handler := &SyncHandler{storage: &storage.S3Store{}, db: &db.DB{}}
+	r.PUT("/seafhttp/repo/:repo_id/block/:block_id", handler.PutBlock)
+	req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo-1/block/0123456789012345678901234567890123456789", bytes.NewBufferString("hello"))
+	req.ContentLength = int64(len("hello"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+	if got := decodeJSONObject(t, w.Body)["error"]; got != "failed to store block metadata" {
+		t.Fatalf("error = %v, want failed to store block metadata", got)
 	}
 }
 

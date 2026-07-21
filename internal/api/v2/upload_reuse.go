@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
@@ -24,8 +25,9 @@ var repairCanonicalBlockDirectFn = func(ctx context.Context, blockStore *storage
 	return blockStore.PutObjectAutoDirect(ctx, storageKey, data)
 }
 
-// ProbeUploadedBlockReuse wraps the DB probe so callers can fail open to legacy
-// storage behavior when no Cassandra session is available.
+// ProbeUploadedBlockReuse wraps the DB probe. Metadata-governed callers fail
+// closed on an error because neither canonical placement nor delete fences are
+// trustworthy without the complete decision.
 func ProbeUploadedBlockReuse(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
 	if database == nil || database.Session() == nil {
 		return db.BlockReuseProbe{Decision: db.BlockReuseUnknownError}, fmt.Errorf("block reuse probe unavailable for %s: database session is nil", blockID)
@@ -57,6 +59,106 @@ func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *
 	return nil, fmt.Errorf("canonical storage class %s is not available", canonicalClass)
 }
 
+// ResolveNeedsPutBlockStore chooses the backend for a NeedsPut probe. Empty
+// probe metadata means this request is the first writer and may use its preferred
+// backend. Existing immutable metadata must always be repaired in its canonical
+// backend so reads and GC continue to address the same physical key.
+func ResolveNeedsPutBlockStore(storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass string, probe db.BlockReuseProbe, orgID, blockID string) (*storage.BlockStore, string, string, error) {
+	if probe.Decision != db.BlockReuseNeedsPut {
+		return nil, "", "", fmt.Errorf("block %s does not need a PUT", blockID)
+	}
+
+	canonicalClass := strings.TrimSpace(probe.StorageClass)
+	if canonicalClass == "" {
+		if fallbackStore == nil {
+			return nil, "", "", fmt.Errorf("preferred block store is unavailable for %s", blockID)
+		}
+		return fallbackStore, strings.TrimSpace(fallbackClass), fallbackStore.StorageKeyForHash(blockID), nil
+	}
+
+	canonicalStore, err := resolveCanonicalBlockStoreFn(storageManager, fallbackStore, fallbackClass, canonicalClass, orgID)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("resolve canonical block store for %s: %w", blockID, err)
+	}
+	storageKey := canonicalStore.StorageKeyForHash(blockID)
+	if storedKey := strings.TrimSpace(probe.StorageKey); storedKey != "" && storedKey != storageKey {
+		return nil, "", "", fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storedKey, storageKey)
+	}
+	return canonicalStore, canonicalClass, storageKey, nil
+}
+
+func canonicalBlockPresence(ctx context.Context, blockID string, probe db.BlockReuseProbe, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string) (*storage.BlockStore, string, bool, error) {
+	if probe.Decision != db.BlockReuseReusable {
+		return nil, "", false, fmt.Errorf("block %s is not reusable", blockID)
+	}
+	canonicalStore, err := resolveCanonicalBlockStoreFn(storageManager, fallbackStore, fallbackClass, probe.StorageClass, orgID)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("resolve canonical block store for %s: %w", blockID, err)
+	}
+	storageKey := canonicalStore.StorageKeyForHash(blockID)
+	if storedKey := strings.TrimSpace(probe.StorageKey); storedKey != "" && storedKey != storageKey {
+		return nil, "", false, fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storedKey, storageKey)
+	}
+	exists, err := reusableCanonicalObjectExistsFn(ctx, canonicalStore, storageKey)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("verify canonical block %s in %s: %w", blockID, probe.StorageClass, err)
+	}
+	return canonicalStore, storageKey, exists, nil
+}
+
+// CanonicalBlockExistsForProbe verifies a reusable block in the exact backend
+// and org-scoped key declared by its immutable metadata.
+func CanonicalBlockExistsForProbe(ctx context.Context, blockID string, probe db.BlockReuseProbe, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string) (bool, error) {
+	_, _, exists, err := canonicalBlockPresence(ctx, blockID, probe, storageManager, fallbackStore, fallbackClass, orgID)
+	return exists, err
+}
+
+// StoreUploadedBlockForProbe executes the physical part of a Cassandra-first
+// upload decision. beforePut runs immediately before a real write and can be
+// used for one-time admission or reservation work.
+func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string, beforePut func() error) (storageKey, storageClass string, didPut bool, err error) {
+	switch probe.Decision {
+	case db.BlockReuseReusable:
+		canonicalStore, canonicalKey, exists, existsErr := canonicalBlockPresence(ctx, blockID, probe, storageManager, fallbackStore, fallbackClass, orgID)
+		storageKey = canonicalKey
+		if existsErr != nil {
+			return storageKey, probe.StorageClass, false, existsErr
+		}
+		if exists {
+			return storageKey, probe.StorageClass, false, nil
+		}
+		if beforePut != nil {
+			if beforeErr := beforePut(); beforeErr != nil {
+				return storageKey, probe.StorageClass, false, beforeErr
+			}
+		}
+		if _, putErr := repairCanonicalBlockDirectFn(ctx, canonicalStore, storageKey, data); putErr != nil {
+			return storageKey, probe.StorageClass, false, fmt.Errorf("repair canonical block %s in %s: %w", blockID, probe.StorageClass, putErr)
+		}
+		return storageKey, probe.StorageClass, true, nil
+
+	case db.BlockReuseNeedsPut:
+		putStore, resolvedClass, resolvedKey, resolveErr := ResolveNeedsPutBlockStore(storageManager, fallbackStore, fallbackClass, probe, orgID, blockID)
+		if resolveErr != nil {
+			return "", "", false, resolveErr
+		}
+		if beforePut != nil {
+			if beforeErr := beforePut(); beforeErr != nil {
+				return resolvedKey, resolvedClass, false, beforeErr
+			}
+		}
+		if _, putErr := repairCanonicalBlockDirectFn(ctx, putStore, resolvedKey, data); putErr != nil {
+			return resolvedKey, resolvedClass, false, fmt.Errorf("store block %s in %s: %w", blockID, resolvedClass, putErr)
+		}
+		return resolvedKey, resolvedClass, true, nil
+
+	case db.BlockReuseBlockedByGC:
+		return "", "", false, ErrBlockDeleteInProgress
+	default:
+		return "", "", false, fmt.Errorf("unsupported block reuse decision %d for %s", probe.Decision, blockID)
+	}
+}
+
 // EnsureReusableBlockPresent verifies that the canonical physical copy exists for
 // a Cassandra-reusable block and repairs it in place when it is missing. orgID
 // org-scopes the canonical locator (see ResolveCanonicalBlockStore).
@@ -64,29 +166,8 @@ func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.Bl
 	if probe.Decision != db.BlockReuseReusable {
 		return "", fmt.Errorf("block %s is not reusable", blockID)
 	}
-
-	canonicalStore, err := resolveCanonicalBlockStoreFn(storageManager, fallbackStore, fallbackClass, probe.StorageClass, orgID)
-	if err != nil {
-		return "", fmt.Errorf("resolve canonical block store for %s: %w", blockID, err)
-	}
-
-	storageKey := canonicalStore.StorageKeyForHash(blockID)
-	if storedKey := strings.TrimSpace(probe.StorageKey); storedKey != "" && storedKey != storageKey {
-		return "", fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storedKey, storageKey)
-	}
-
-	exists, err := reusableCanonicalObjectExistsFn(ctx, canonicalStore, storageKey)
-	if err != nil {
-		return storageKey, fmt.Errorf("verify canonical block %s in %s: %w", blockID, probe.StorageClass, err)
-	}
-	if exists {
-		return storageKey, nil
-	}
-
-	if _, err := repairCanonicalBlockDirectFn(ctx, canonicalStore, storageKey, data); err != nil {
-		return storageKey, fmt.Errorf("repair canonical block %s in %s: %w", blockID, probe.StorageClass, err)
-	}
-	return storageKey, nil
+	storageKey, _, _, err := StoreUploadedBlockForProbe(ctx, blockID, probe, data, storageManager, fallbackStore, fallbackClass, orgID, nil)
+	return storageKey, err
 }
 
 // RetryUploadedBlockMaterialization retries the full store->materialize cycle
@@ -94,6 +175,17 @@ func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.Bl
 // from either phase because Cassandra-first probes may reject a PUT before S3
 // work starts.
 func RetryUploadedBlockMaterialization(label, blockID string, store func() error, materialize func() error, onRetry func(), resolveFence func() (bool, error)) error {
+	return retryUploadedBlockMaterialization(nil, label, blockID, store, materialize, onRetry, resolveFence)
+}
+
+// RetryUploadedBlockMaterializationContext is the request-cancellable variant
+// used by production handlers. The context aborts only retry backoff; store and
+// materialize callbacks remain responsible for propagating it to their I/O.
+func RetryUploadedBlockMaterializationContext(ctx context.Context, label, blockID string, store func() error, materialize func() error, onRetry func(), resolveFence func() (bool, error)) error {
+	return retryUploadedBlockMaterialization(ctx, label, blockID, store, materialize, onRetry, resolveFence)
+}
+
+func retryUploadedBlockMaterialization(ctx context.Context, label, blockID string, store func() error, materialize func() error, onRetry func(), resolveFence func() (bool, error)) error {
 	attempts := RetryAttempts()
 	if attempts < 1 {
 		attempts = 1
@@ -118,7 +210,21 @@ func RetryUploadedBlockMaterialization(label, blockID string, store func() error
 		}
 		sleepFor := RetryBackoff(attempt)
 		log.Printf("[%s] block materialization fenced by GC%s; retrying (%d/%d) after %s", label, blockSuffix, attempt, attempts, sleepFor)
-		if sleepFor > 0 {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if sleepFor <= 0 {
+				return nil
+			}
+			timer := time.NewTimer(sleepFor)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		} else if sleepFor > 0 {
 			registerUploadedBlockSleepFn(sleepFor)
 		}
 		return nil

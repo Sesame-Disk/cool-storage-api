@@ -25,13 +25,11 @@ plan integration tests for long-running monitoring.
 > cascade on every wired permanent-delete path) are **fixed** on `main` (PR #129), and P9
 > (`gc_pending_items` block-row leak) is fixed for new work.
 >
-> This is a **documentation pre-fix** status: an upload can PUT, add its provisional reference after
-> GC's second reference check, wait while GC writes the orphan fence/finalizes/deletes S3, and then
-> materialize metadata after that fence clears without repeating the PUT. A successful response can
-> have a live reference and no object. The selected contract is a server-owned post-fence
-> `store -> materialize` retry. Retry/probe/repair wrappers exist on six funnels, but the inner
-> registration wait absorbs fast-clear and the web block-session path is unwrapped; therefore the
-> end-to-end invariant remains open.
+> **Writer-side update:** an observed fence now leaves `RegisterUploadedBlock` immediately and is
+> handled by a server-owned `store -> materialize` retry. All seven funnels, including web block
+> session, use that contract; existing-metadata `NeedsPut` writes to the canonical backend. A
+> deterministic worker/component test proves the post-delete second store. The blocker remains open
+> because direct worker/recovery still lack a physical fence against a stale key-only S3 delete.
 >
 > Other remaining debt is storage retention in edge cases, observability, test
 > hygiene, and scale: P4 (`pub:` zero-ref transition), P5 (Phase 13 error visibility), P7
@@ -156,16 +154,14 @@ processBlock(item):
 before its second point read and releases the claim. A provisional reference added after that read
 does not stop the already-authorized delete. `BlockDeleteFenceActive` therefore checks both the
 in-row `gc_state='deleting'` claim and `gc_s3_orphans`, whose row persists from before
-`FinalizeBlockDelete` through the S3 delete. The current blocker is on the writer side: if that
-orphan fence clears inside `RegisterUploadedBlock`'s wait, metadata can be written without a
-post-fence PUT.
+`FinalizeBlockDelete` through the S3 delete. Registration now propagates an observed fence and forces
+a post-fence PUT before metadata; the remaining blocker is the physical delete-lifecycle ABA after
+the orphan fence clears.
 
-Six upload funnels already place store and materialize callbacks inside retry wrappers (SeafHTTP
-simple/streaming, sync `PutBlock`, V2 `UploadFile`, template `CreateFile`, and OnlyOffice). They do
-not close this race because the inner wait returns `nil` after fast-clear. The web block-session
-handler in `internal/api/v2/blocks.go` has no complete wrapper/probe path at all. For
-existing-metadata `NeedsPut`, the eventual store must also use `probe.StorageClass` and the
-canonical key rather than a newly preferred backend.
+All seven upload funnels place store and materialize callbacks inside retry wrappers (SeafHTTP
+simple/streaming, sync `PutBlock`, V2 `UploadFile`, template `CreateFile`, OnlyOffice, and web block
+session). Existing-metadata `NeedsPut` resolves `probe.StorageClass` and the canonical key rather
+than a newly preferred backend. These are writer-side guarantees only.
 The physical delete is bound to the same org partition used by those checks and to
 the block row's normalized canonical storage class. GC deliberately ignores backend
 health failover because deleting from a fallback backend would target a different
@@ -374,8 +370,8 @@ Writers probe both `gc_state='deleting'` and `gc_s3_orphans`. The worker pre-che
 claims the block via LWT, then re-checks references. If a writer registered liveness before that
 second check, the worker releases the claim and removes the stale candidate. Before removing the
 canonical block row it persists S3 recovery. If the reference appears after the second check,
-current `RegisterUploadedBlock` can observe the fence, wait for it to clear, and write metadata
-without repeating a PUT that GC deleted. This is the open fast-clear rematerialization blocker.
+`RegisterUploadedBlock` now propagates the fence and the outer wrapper repeats store before
+metadata. A stale key-only deleter that outlives the visible fence remains open.
 
 ### Scenario 4: Library soft-delete and purge
 
@@ -415,11 +411,9 @@ cascade's `HardDeleteLibrary` clears the policy rows the direct-delete batch lea
 remaining P4/P5/P7 issues plus the P8 scale debt primarily retain or delay garbage rather than
 deleting referenced blocks.
 
-Separately, `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` can produce successful metadata/reference
-publication after GC has deleted the physical object. Required remediation has two inseparable
-parts: repeat canonical physical store after observing either fence, and fence the direct worker
-plus Phase-16 recovery under one delete-lifecycle generation so no authorized delete remains after
-that visible fence is cleared.
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` had two parts. Canonical physical store is now repeated
+after observing either fence. Still required: fence the direct worker plus Phase-16 recovery with a
+physical mechanism so no key-only delete remains authorized after the visible fence is cleared.
 
 ---
 
@@ -467,7 +461,7 @@ that visible fence is cleared.
 | **ShareLink/Share/RestoreJob worker processing** | Medium | **Pending** | Only enqueue is tested (unit). No integration test creates and deletes share links through GC. |
 | **Very deep directory cascade (100+ levels)** | Medium | **Pending** | `TestGC_LibraryCascade` tests 3 files (flat). No deep nesting test. |
 | **Real Cassandra block-delete LWT under a concurrent post-claim reference** | High | **Missing** | `TestGC_ConcurrentUploadDuringGC` waits for the re-reference before triggering GC, so the worker exits at its initial pre-check and never reaches the claim. |
-| **Fence clears after deleting the just-PUT object** | **Blocker** | **Missing (next deterministic regression)** | `TestRetryUploadedBlockMaterializationRetriesStoreFence` injects a sentinel from a synthetic store callback; it does not call real `RegisterUploadedBlock` or fast-clear. The persistent orphan test is SeafHTTP/upload-link, not web block session. |
+| **Fence clears after deleting the just-PUT object** | **Blocker component** | **Done (deterministic component)** | `TestRetryUploadedBlockMaterializationWithWorkerPausedAfterPostClaimCheck` pauses the real worker after its second liveness read and proves first PUT -> fence -> delete -> second PUT -> metadata. Physical stale-deleter ABA remains open. |
 | **Cascade partial failure + retry** | Medium | **Pending** | No test simulates a mid-cascade failure (e.g., corrupt share record). |
 | **Scanner + concurrent writes** | Low | **Partially done** | Soak test exercises this implicitly (uploads happen while GC runs), but doesn't assert specifically on concurrent scanner behavior. |
 | **Grace period boundary (±1ms)** | Low | **Partially done** | `TestGC_GracePeriodEnforcement` tests the concept with real timing but not the exact ±1ms boundary. |
@@ -530,8 +524,9 @@ blocks are never deleted while referenced.
 **Test 3 — Re-upload visible before GC starts:** Delete file → re-upload same content → wait for
 the reference → trigger GC → re-uploaded file remains intact. The worker exits at its initial
 reference pre-check, so this test does **not** exercise `ClaimBlockDelete` or a Cassandra LWT race.
-It also does not place the provisional reference after the second `BlockHasReferences`, delete the
-just-PUT object, and clear the orphan fence inside the writer retry budget.
+It does not exercise the destructive interleaving. That writer-side sequence is now covered by
+`TestRetryUploadedBlockMaterializationWithWorkerPausedAfterPostClaimCheck`; stale-deleter E2E remains
+open.
 
 **Test 4 — Library cascade:** Upload files → soft-delete library → trigger scanner
 (finds expired library) → trigger worker (cascades through commits, fs_objects, blocks).
@@ -607,10 +602,10 @@ For a deployment with millions of blocks, this may not keep up with deletion rat
 
 | Aspect | Rating | Notes |
 |--------|--------|-------|
-| **Safety mechanisms** | Blocking gap open | LWT, grace period, dual delete fence, idempotency and locks exist; post-fence rematerialization is not fixed yet |
+| **Safety mechanisms** | Blocking gap open | LWT, grace period, dual delete fence, idempotency and locks exist; writer rematerialization is fixed, physical lifecycle fencing is not |
 | **Cascade correctness** | Good | Ordering is correct; partial failure handling could improve |
 | **Test coverage** | Good | 107 unit + 4 integration; key gaps in S3 failure and concurrent access |
-| **Error handling** | Blocking gap open | Durable S3 orphan recovery exists, but fast-clear propagation and shared direct-worker/recovery lifecycle fencing remain open |
+| **Error handling** | Blocking gap open | Durable S3 orphan recovery and fast-clear propagation exist, but shared physical direct-worker/recovery lifecycle fencing remains open |
 | **Performance** | Adequate | 12K items/hour; may need tuning for large deployments |
 | **Monitoring** | Basic | Prometheus metrics exist; alerting rules not defined |
 | **Code quality** | Good | Clean interface (GCStore), well-documented, audit logging |
