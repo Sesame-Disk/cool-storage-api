@@ -2006,12 +2006,16 @@ func TestSeafHTTPHandlerDownloadNoStorage(t *testing.T) {
 	}
 }
 
-func TestSeafHTTPHandlerDownloadWithStorageManagerObjectFallback(t *testing.T) {
+// The path-based download fallback was removed. Without Cassandra the server
+// cannot tell whether a path is block-backed, and the object at
+// `<org>/<repo><path>` may be an older version of the same file, so serving it
+// would answer 200 with stale content. This must fail closed instead.
+func TestSeafHTTPHandlerDownloadFailsClosedWithoutMetadata(t *testing.T) {
 	tokenStore := NewMockTokenStore()
 	tokenStore.CreateDownloadToken("org1", "repo1", "/file.txt", "user1")
 	manager := storage.NewManager()
 	manager.SetDefaultClass("hot-s3-eu")
-	manager.RegisterBackend("hot-s3-eu", &mockObjectStore{data: []byte("hello")}, "")
+	manager.RegisterBackend("hot-s3-eu", &mockObjectStore{data: []byte("stale-legacy-content")}, "")
 	handler := NewSeafHTTPHandler(nil, manager, nil, tokenStore, nil, nil)
 
 	r := gin.New()
@@ -2021,11 +2025,11 @@ func TestSeafHTTPHandlerDownloadWithStorageManagerObjectFallback(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
 	}
-	if w.Body.String() != "hello" {
-		t.Fatalf("body = %q, want %q", w.Body.String(), "hello")
+	if strings.Contains(w.Body.String(), "stale-legacy-content") {
+		t.Fatalf("served the path-based object: %q", w.Body.String())
 	}
 }
 

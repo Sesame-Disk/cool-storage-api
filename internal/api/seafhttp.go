@@ -1480,19 +1480,6 @@ func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID strin
 	return nil, libraryClass, fmt.Errorf("block storage not available")
 }
 
-func (h *SeafHTTPHandler) resolveLibraryObjectStore(hostname, orgID, repoID string) (storage.Store, string, error) {
-	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
-	if h.storageManager != nil {
-		preferredClass := h.storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
-		return h.storageManager.GetHealthyBackend(preferredClass)
-	}
-	if h.storage != nil {
-		return h.storage, libraryClass, nil
-	}
-
-	return nil, libraryClass, fmt.Errorf("storage not available")
-}
-
 // uploadBlockSize is the block size used when splitting large uploads into blocks.
 // 8 MB matches Seafile's default CDC block size for good deduplication compatibility.
 const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
@@ -2265,18 +2252,15 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
-// errLegacyPathBackedFile marks the ONLY condition under which HandleDownload may
-// serve the path-based object: Cassandra answered definitively that this path has
-// no block metadata (a genuine ErrNotFound, not a timeout or a partial read).
+// errLegacyPathBackedFile means Cassandra answered definitively that this path has
+// no block metadata: a genuine ErrNotFound, never a timeout or a partial read. It
+// is the only download failure that may be reported to the client as 404.
 //
-// The fallback is opt-in on purpose. Every other failure — Cassandra unavailable,
-// head/commit read error, directory walk error, block store unresolvable, canonical
-// metadata not visible yet, or an encrypted library with no unlock session — leaves
-// it unknown whether the file is block-backed. On a brownfield library the
-// path-based object can still hold a stale pre-block version of the same path, so
-// treating "unknown" as "legacy" would answer 200 with older content. Those all
-// fail closed instead.
-var errLegacyPathBackedFile = errors.New("file has no block metadata (legacy path-backed)")
+// Every other failure — Cassandra unavailable, head/commit read error, directory
+// walk error, block store unresolvable, canonical metadata not visible yet, or an
+// encrypted library with no unlock session — leaves it unknown whether the file
+// exists, so it surfaces as 503 rather than "file not found".
+var errLegacyPathBackedFile = errors.New("file has no block metadata")
 
 // errBlockBackedFileUnresolvable marks a download failure that happened AFTER the
 // file was proven to have block metadata. Kept distinct from the generic
@@ -3546,67 +3530,30 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 		}
 	}
 
-	// Try to stream file from block storage (content-addressed)
-	// This is the normal flow for SesameFS files
-	if h.db != nil && h.storageManager != nil {
-		log.Printf("[HandleDownload] Attempting block-based streaming download")
-		err := h.streamFileFromBlocks(c, token, filename, downloadTrafficStatus.PeriodStartedAt)
-		if err == nil {
-			return
-		}
-		log.Printf("[HandleDownload] Block-based streaming FAILED: %v", err)
-		// The path-based fallback is OPT-IN: it runs only when Cassandra proved this
-		// path has no block metadata. Anything else — unavailable coordinator, read
-		// timeout, unresolvable block store, canonical metadata not visible yet, or
-		// an encrypted library with no unlock session — leaves it unknown whether the
-		// file is block-backed, and on a brownfield library the path-based object can
-		// still hold a stale pre-block version of the same path. Serving it would
-		// answer 200 with older content, so those fail closed.
-		if !errors.Is(err, errLegacyPathBackedFile) {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "file metadata temporarily unavailable"})
-			return
-		}
-	} else {
+	// Block-based streaming is the ONLY download path. The legacy path-based
+	// fallback (reading `<org>/<repo><path>` straight from the object store) was
+	// removed: it predates content-addressed storage, and on a library since
+	// written through blocks that object can still hold an older version of the
+	// same path, so falling back on any block-resolution failure turned a transient
+	// Cassandra problem into a silent 200 with stale content. The deployment starts
+	// from empty buckets, so no such object exists and nothing is left to serve.
+	if h.db == nil || h.storageManager == nil {
 		log.Printf("[HandleDownload] Block storage not available (db=%v, storageManager=%v)", h.db != nil, h.storageManager != nil)
-	}
-
-	// Fallback: Stream directly from the resolved object store.
-	objectStore, _, err := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage not available"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "file metadata temporarily unavailable"})
 		return
 	}
 
-	storageKey := fmt.Sprintf("%s/%s%s", token.OrgID, token.RepoID, token.Path)
-
-	reader, err := objectStore.Get(c.Request.Context(), storageKey)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
-		return
-	}
-	defer reader.Close()
-
-	// Stream directly to response — never load full file into RAM
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
-	c.Header("Content-Type", "application/octet-stream")
-	c.Status(http.StatusOK)
-	bytesBefore := responseBodyBytes(c.Writer)
-	buf := streaming.GetCopyBuf()
-	defer streaming.PutCopyBuf(buf)
-	if _, err := io.CopyBuffer(c.Writer, reader, buf); err != nil {
-		log.Printf("[HandleDownload] Streaming error: %v", err)
-	}
-
-	// Record traffic for the S3 fallback path.
-	if rec := traffic.Get(); rec != nil {
-		sent := responseBodyBytes(c.Writer) - bytesBefore
-		if sent > 0 {
-			tt := traffic.WebDownload
-			if token.Source == "link" {
-				tt = traffic.LinkDownload
-			}
-			traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, token.OrgID, token.UserID, tt, sent)
+	if err := h.streamFileFromBlocks(c, token, filename, downloadTrafficStatus.PeriodStartedAt); err != nil {
+		log.Printf("[HandleDownload] Block-based streaming FAILED: %v", err)
+		// Absence proven by Cassandra is a real 404. Everything else — unavailable
+		// coordinator, read timeout, unresolvable block store, canonical metadata not
+		// visible yet, encrypted library with no unlock session — is unknown, not
+		// missing, and must not be reported to the client as "file not found".
+		if errors.Is(err, errLegacyPathBackedFile) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+			return
 		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "file metadata temporarily unavailable"})
 	}
 }
 
