@@ -102,6 +102,24 @@ func TestValidateManifest_RejectsConflictingSizeForSameSHA256(t *testing.T) {
 	}
 }
 
+func TestValidateManifest_NormalizesSHA256BeforeDuplicateValidation(t *testing.T) {
+	hash := hex64(7)
+	req := &fileFromBlocksRequest{
+		Filename: "f.bin",
+		Size:     WebUploadBlockSize * 2,
+		Blocks: []fileFromBlocksBlock{
+			{SHA256: strings.ToUpper(hash), Size: WebUploadBlockSize},
+			{SHA256: hash, Size: WebUploadBlockSize - 1},
+		},
+	}
+	if err := validateManifest(req, WebUploadBlockSize); err == nil {
+		t.Fatal("mixed-case duplicate with conflicting sizes must be rejected")
+	}
+	if req.Blocks[0].SHA256 != hash {
+		t.Fatalf("normalized sha256 = %q, want %q", req.Blocks[0].SHA256, hash)
+	}
+}
+
 func TestValidateManifest_HonorsConfiguredBlockSize(t *testing.T) {
 	// The non-final block size is validated against the CONFIGURED CAS block size,
 	// not a hardcoded 8 MB. With a 4 MB configured size, a 4 MB non-final block is

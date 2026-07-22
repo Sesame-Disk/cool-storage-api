@@ -21,6 +21,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/sync/errgroup"
@@ -39,6 +40,8 @@ var checkBlocksProbeReuseFn = func(database *db.DB, orgID, hash string) (db.Bloc
 }
 
 var checkBlocksClassifyOwnershipFn = classifyBlockOwnership
+
+var checkBlocksNewCanonicalReaderFn = streaming.NewCanonicalBlockCheckReader
 
 // checkBlocksReusableCandidatesParallel probes the metadata plane first and
 // returns only the hashes whose blocks are logically reusable
@@ -82,8 +85,8 @@ func checkBlocksReusableCandidatesParallel(ctx context.Context, database *db.DB,
 
 // checkBlocksReadyParallel classifies, per hash already known reusable in the
 // metadata plane, whether the block is truly commit-ready for session-mode
-// /blocks/check: physically present in S3 and owned by this session or
-// permanently referenced (classifyBlockOwnership — the same helper
+// /blocks/check: physically present in its canonical store and owned by this
+// session or permanently referenced (classifyBlockOwnership — the same helper
 // file_from_blocks.go's classifyBlockForCommit uses). This is the commit's
 // classifier minus the size check (check has no declared per-block sizes to
 // compare against; sizes only arrive in the commit manifest), so a block
@@ -647,7 +650,11 @@ func dedupePreserveOrder(values []string) []string {
 
 func (h *BlockHandler) checkBlocksForSession(c *gin.Context, session db.BlockUploadSession, hashes []string) (CheckBlocksResponse, error) {
 	orgID := c.GetString("org_id")
-	uniqueHashes := dedupePreserveOrder(hashes)
+	normalizedHashes := make([]string, len(hashes))
+	for i, hash := range hashes {
+		normalizedHashes[i] = db.NormalizeBlockID(hash)
+	}
+	uniqueHashes := dedupePreserveOrder(normalizedHashes)
 	reusableByHash, reusableHashes, err := checkBlocksReusableCandidatesParallel(c.Request.Context(), h.db, orgID, uniqueHashes, blockProbeConcurrency)
 	if err != nil {
 		return CheckBlocksResponse{}, err
@@ -657,12 +664,15 @@ func (h *BlockHandler) checkBlocksForSession(c *gin.Context, session db.BlockUpl
 		return CheckBlocksResponse{Existing: nil, Missing: append([]string(nil), hashes...)}, nil
 	}
 
-	blockStore, _ := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
+	blockStore, storageClass := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
 	if blockStore == nil {
 		return CheckBlocksResponse{}, errSessionCheckBlockStoreUnavailable
 	}
-
-	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), reusableHashes, blockProbeConcurrency)
+	reader, err := checkBlocksNewCanonicalReaderFn(c.Request.Context(), h.db, h.storageManager, orgID, reusableHashes, blockStore, storageClass)
+	if err != nil {
+		return CheckBlocksResponse{}, err
+	}
+	existsMap, err := reader.CheckBlocksExist(c.Request.Context(), reusableHashes, blockProbeConcurrency)
 	if err != nil {
 		return CheckBlocksResponse{}, err
 	}
@@ -674,8 +684,9 @@ func (h *BlockHandler) checkBlocksForSession(c *gin.Context, session db.BlockUpl
 	}
 
 	var existing, missing []string
-	for _, hash := range hashes {
-		if reusableByHash[hash] && ready[hash] {
+	for i, hash := range hashes {
+		normalizedHash := normalizedHashes[i]
+		if reusableByHash[normalizedHash] && ready[normalizedHash] {
 			existing = append(existing, hash)
 		} else {
 			missing = append(missing, hash)
@@ -696,8 +707,8 @@ func (h *BlockHandler) checkBlocksForSession(c *gin.Context, session db.BlockUpl
 // mapping path now uses the same fail-closed conflict contract. isNew labels the
 // staging metric (finding 8) by whether the underlying S3 PUT was a fresh
 // write or a dedup no-op — governance work happens either way (R9).
-func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, sha256ID, sha1ID string, size int, storageClass string, isNew bool) error {
-	if err := RegisterWebUploadedBlockAndMapping(h.db, session.OrgID, session.RepoID, sha256ID, session.SessionID, size, storageClass, "", sha1ID); err != nil {
+func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, sha256ID, sha1ID string, size int, storageClass, storageKey string, isNew bool) error {
+	if err := RegisterWebUploadedBlockAndMapping(h.db, session.OrgID, session.RepoID, sha256ID, session.SessionID, size, storageClass, storageKey, sha1ID); err != nil {
 		return err
 	}
 	metrics.BlockUploadStagedBlocksTotal.WithLabelValues(strconv.FormatBool(isNew)).Inc()
@@ -773,13 +784,6 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 		return
 	}
 
-	// Session mode (web flow, R3 + finding 3): a block counts as "existing" only
-	// when checkBlocksReadyParallel agrees it is truly commit-ready — live,
-	// physically present in S3, AND owned by this session or permanently
-	// referenced — the same classifier the commit uses (minus the size check,
-	// which check cannot evaluate without the manifest's declared sizes).
-	// Anything less is reported missing so the client (re)uploads it under the
-	// session and materializes its own reference.
 	if resolution == uploadSessionValid {
 		resp, err := h.checkBlocksForSession(c, session, req.Hashes)
 		if err != nil {
@@ -794,16 +798,19 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 		return
 	}
 
-	// Get appropriate BlockStore based on hostname routing
+	normalizedHashes := make([]string, len(req.Hashes))
+	for i, hash := range req.Hashes {
+		normalizedHashes[i] = db.NormalizeBlockID(hash)
+	}
+	uniqueHashes := dedupePreserveOrder(normalizedHashes)
+	// Keep the legacy no-session oracle paired with its metadata-free upload
+	// endpoint. PR-7 will govern and canonicalize both together.
 	blockStore, _ := h.getBlockStore(c)
 	if blockStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
 	}
-
-	// Legacy physical-existence oracle (desktop/mobile sync, no session).
-	uniqueHashes := dedupePreserveOrder(req.Hashes)
-	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, 20)
+	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, blockProbeConcurrency)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 		return
@@ -811,8 +818,8 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 
 	// Separate into existing and missing
 	var existing, missing []string
-	for _, hash := range req.Hashes {
-		if existsMap[hash] {
+	for i, hash := range req.Hashes {
+		if existsMap[normalizedHashes[i]] {
 			existing = append(existing, hash)
 		} else {
 			missing = append(missing, hash)
@@ -921,7 +928,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// (sha1Hash above) and stores it in blocks.sha1, so there is no X-Block-Hash-SHA1
 	// to cross-check anymore.
 	clientHash := c.GetHeader("X-Block-Hash")
-	if clientHash != "" && clientHash != hash {
+	if clientHash != "" && (!isHex64(clientHash) || db.NormalizeBlockID(clientHash) != hash) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":         "hash mismatch",
 			"algorithm":     "sha256",
@@ -931,109 +938,104 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
-	// Resolve the BlockStore. With a session, use the session repo's storage
-	// class so the block lands in the SAME backend file-from-blocks will verify
-	// for that repo (HIGH-2); otherwise use hostname/default routing.
-	var blockStore *storage.BlockStore
-	var storageClass string
+	// Session uploads probe metadata before storage so an existing placement is
+	// repaired in its canonical backend rather than the repo-preferred backend.
 	if resolution == uploadSessionValid {
-		blockStore, storageClass = h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
-	} else {
-		blockStore, storageClass = h.getBlockStore(c)
+		preferredStore, preferredClass := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
+		if preferredStore == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+			return
+		}
+		probe, probeErr := probeUploadedBlockReuseFn(h.db, session.OrgID, hash)
+		if probeErr == nil {
+			probe, probeErr = prepareUploadedBlockProbeFn(h.db, session.OrgID, hash, probe)
+		}
+		if probeErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to inspect block metadata"})
+			return
+		}
+
+		reservationResponded := false
+		beforePut := func() error {
+			// Per-session staged-block admission (item 1). This callback runs only
+			// when the canonical object actually needs to be written.
+			if bucketCount, bucketCap, enabled := h.stagedBlockBucketCap(session); enabled {
+				bucket := db.StagedBlockBucket(hash, bucketCount)
+				staged, reserveErr := h.db.CountSessionStagedBlocksInBucket(session.SessionID, bucket, bucketCap+1)
+				if reserveErr != nil {
+					reservationResponded = true
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
+					return reserveErr
+				}
+				if staged >= bucketCap {
+					reserved, reserveErr := h.db.SessionStagedBlockExists(session.SessionID, bucket, hash)
+					if reserveErr != nil {
+						reservationResponded = true
+						c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
+						return reserveErr
+					}
+					if !reserved {
+						metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
+						c.Header("Retry-After", "1")
+						reservationResponded = true
+						c.JSON(http.StatusTooManyRequests, gin.H{"error": "session staging limit reached; commit the file or start a new upload", "code": blockUploadStagingCapReachedCode})
+						return errors.New("session staging limit reached")
+					}
+				} else if reserveErr := h.db.ReserveSessionStagedBlock(session.SessionID, bucket, hash, int64(len(data))); reserveErr != nil {
+					reservationResponded = true
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reserve staged block"})
+					return reserveErr
+				}
+			}
+			return nil
+		}
+
+		storageKey, storageClass, didPut, storeErr := StoreUploadedBlockForProbe(c.Request.Context(), hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut)
+		if storeErr != nil {
+			if reservationResponded {
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
+			return
+		}
+		if rec := traffic.Get(); rec != nil {
+			traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
+		}
+		if respondBlockMaterializeError(c, h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, storageKey, didPut)) {
+			return
+		}
+		status := http.StatusOK
+		if didPut {
+			status = http.StatusCreated
+		}
+		c.JSON(status, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: didPut})
+		return
 	}
+
+	blockStore, _ := h.getBlockStore(c)
 	if blockStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
 	}
-
-	// Check if block already exists
 	exists, err := blockStore.BlockExists(c.Request.Context(), hash)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
 		return
 	}
-
 	if exists {
-		// Block already exists (deduplication) — data was still transferred over the network.
 		if rec := traffic.Get(); rec != nil {
 			traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
 		}
-		// R9: materialize even when S3 already has the object — the goal is to
-		// GOVERN the block (metadata + provisional ref) so the session can commit
-		// it and GC can reclaim it, not merely to store bytes.
-		if resolution == uploadSessionValid {
-			if respondBlockMaterializeError(c, h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, false)) {
-				return
-			}
-		}
-		c.JSON(http.StatusOK, UploadBlockResponse{
-			Hash: hash,
-			Size: int64(len(data)),
-			New:  false,
-		})
+		c.JSON(http.StatusOK, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: false})
 		return
 	}
 
-	// Session (web) flow: per-session staged-block admission (item 1). This block
-	// is NEW (it did not exist above), so reserve a ledger slot BEFORE storing it
-	// (reserve-before-PUT, fail-closed): if the session's bucket is already at its
-	// cap, reject; otherwise record the reservation and proceed. The reserve is
-	// idempotent by (session, bucket, block_id) — a retried block never
-	// double-counts — and self-expires with the session TTL (no Cassandra COUNTER).
-	// If the PUT below fails after the reserve, the row lingers and TTL reclaims it.
-	if resolution == uploadSessionValid {
-		if bucketCount, bucketCap, enabled := h.stagedBlockBucketCap(session); enabled {
-			bucket := db.StagedBlockBucket(hash, bucketCount)
-			staged, err := h.db.CountSessionStagedBlocksInBucket(session.SessionID, bucket, bucketCap+1)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
-				return
-			}
-			if staged >= bucketCap {
-				// The bucket is full — but let a RETRY of an already-reserved block
-				// through (its PUT may have failed): it is already counted, so
-				// admitting it does not grow the bound. Only a genuinely new block
-				// is rejected.
-				reserved, err := h.db.SessionStagedBlockExists(session.SessionID, bucket, hash)
-				if err != nil {
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
-					return
-				}
-				if !reserved {
-					metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
-					c.Header("Retry-After", "1")
-					c.JSON(http.StatusTooManyRequests, gin.H{
-						"error": "session staging limit reached; commit the file or start a new upload",
-						"code":  blockUploadStagingCapReachedCode,
-					})
-					return
-				}
-			} else if err := h.db.ReserveSessionStagedBlock(session.SessionID, bucket, hash, int64(len(data))); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reserve staged block"})
-				return
-			}
-		}
-	}
-
-	// Logical storage quota is NOT applied per block in the session (web) flow.
-	// R5: the user's repo/storage quota is a property of the FINAL file delta and
-	// is decided exactly once at file-from-blocks (finalizeStoredUploadMetadata) —
-	// a staged block is transient, governed by a provisional ref + TTL. Charging
-	// it here would wrongly reject e.g. a same-size overwrite (logical delta ≈ 0)
-	// at the first new block. Traffic is still charged per block (above).
-	//
-	// NOTE: this is NOT the LOGICAL quota. CheckStorageQuota reads
-	// storage_used/quota counters, not physical staging. Total uncommitted staged
-	// bytes ARE now bounded for the session flow by the per-session staged-block
-	// ledger above (item 1) plus the per-user session cap; the legacy no-session
-	// path below keeps its own per-block logical check because it predates this
-	// flow. See docs/WEB-BLOCK-UPLOAD.md.
-	if resolution != uploadSessionValid {
-		if checker := traffic.GetChecker(); checker != nil {
-			if st, _ := checker.CheckStorageQuota(c.GetString("org_id"), c.GetString("user_id"), int64(len(data))); !st.Allowed {
-				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-				return
-			}
+	// The legacy no-session path retains its per-block logical quota check. Session
+	// uploads returned above and charge the final file delta only at commit.
+	if checker := traffic.GetChecker(); checker != nil {
+		if st, _ := checker.CheckStorageQuota(c.GetString("org_id"), c.GetString("user_id"), int64(len(data))); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+			return
 		}
 	}
 
@@ -1053,13 +1055,6 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// Record traffic for newly stored block.
 	if rec := traffic.Get(); rec != nil {
 		traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
-	}
-
-	// R9: govern the freshly stored block under the session.
-	if resolution == uploadSessionValid {
-		if respondBlockMaterializeError(c, h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, true)) {
-			return
-		}
 	}
 
 	c.JSON(http.StatusCreated, UploadBlockResponse{

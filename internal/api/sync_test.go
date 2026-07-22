@@ -2,9 +2,11 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,8 +15,43 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/streaming"
+	"github.com/aws/smithy-go"
 	"github.com/gin-gonic/gin"
 )
+
+type syncCanonicalReaderStub struct {
+	data   map[string][]byte
+	exists map[string]bool
+	err    error
+}
+
+func (s *syncCanonicalReaderStub) GetBlock(_ context.Context, hash string) ([]byte, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.data[hash], nil
+}
+
+func (s *syncCanonicalReaderStub) GetBlockReader(ctx context.Context, hash string) (io.ReadCloser, error) {
+	data, err := s.GetBlock(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (s *syncCanonicalReaderStub) GetBlockSize(ctx context.Context, hash string) (int64, error) {
+	data, err := s.GetBlock(ctx, hash)
+	return int64(len(data)), err
+}
+
+func (s *syncCanonicalReaderStub) CheckBlocksExist(context.Context, []string, int) (map[string]bool, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.exists, nil
+}
 
 func init() {
 	gin.SetMode(gin.TestMode)
@@ -372,6 +409,116 @@ func TestSyncHandlerWithoutDB(t *testing.T) {
 				t.Errorf("status = %d, want %d, body: %s", w.Code, tt.wantStatus, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestGetBlockUsesCanonicalReaderAndMapsResolutionErrors(t *testing.T) {
+	blockID := strings.Repeat("a", 64)
+	tests := []struct {
+		name       string
+		resolveErr error
+		readErr    error
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "canonical read", wantStatus: http.StatusOK, wantBody: "canonical"},
+		{name: "missing metadata", resolveErr: streaming.ErrCanonicalBlockMetadataNotFound, wantStatus: http.StatusNotFound},
+		{name: "location failure", resolveErr: errors.New("location database unavailable"), wantStatus: http.StatusInternalServerError},
+		{name: "physical block missing", readErr: fmt.Errorf("get canonical object: %w", &smithy.GenericAPIError{Code: "NoSuchKey", Message: "missing"}), wantStatus: http.StatusNotFound},
+		{name: "backend GET failure", readErr: errors.New("storage backend unavailable"), wantStatus: http.StatusInternalServerError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			old := syncNewCanonicalBlockReaderFn
+			oldTouch := syncTouchBlockLastAccessFn
+			t.Cleanup(func() {
+				syncNewCanonicalBlockReaderFn = old
+				syncTouchBlockLastAccessFn = oldTouch
+			})
+			syncTouchBlockLastAccessFn = func(*db.DB, string, string, time.Time) {}
+			calls := 0
+			syncNewCanonicalBlockReaderFn = func(_ context.Context, _ *db.DB, _ *storage.Manager, orgID string, blockIDs []string, fallback *storage.BlockStore, fallbackClass string) (streaming.CanonicalBlockReader, error) {
+				calls++
+				if orgID == "" || len(blockIDs) != 1 || blockIDs[0] != blockID {
+					t.Fatalf("canonical resolution got org=%q blocks=%v", orgID, blockIDs)
+				}
+				if fallback != nil || fallbackClass != "" {
+					t.Fatalf("manager-backed canonical read got fallback=%v class=%q", fallback, fallbackClass)
+				}
+				if tt.resolveErr != nil {
+					return nil, tt.resolveErr
+				}
+				return &syncCanonicalReaderStub{
+					data: map[string][]byte{blockID: []byte("canonical")},
+					err:  tt.readErr,
+				}, nil
+			}
+
+			r := setupSyncTestRouter()
+			h := &SyncHandler{db: &db.DB{}, storageManager: storage.NewManager()}
+			r.GET("/seafhttp/repo/:repo_id/block/:block_id", h.GetBlock)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo/block/"+blockID, nil))
+
+			if calls != 1 {
+				t.Fatalf("canonical constructor calls = %d, want 1", calls)
+			}
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, tt.wantStatus, w.Body.String())
+			}
+			if tt.wantBody != "" && w.Body.String() != tt.wantBody {
+				t.Fatalf("body = %q, want %q", w.Body.String(), tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestCheckBlocksUsesCanonicalCheckReader(t *testing.T) {
+	presentID := strings.Repeat("b", 64)
+	missingID := strings.Repeat("c", 64)
+	old := syncNewCanonicalBlockCheckReaderFn
+	t.Cleanup(func() { syncNewCanonicalBlockCheckReaderFn = old })
+	calls := 0
+	syncNewCanonicalBlockCheckReaderFn = func(_ context.Context, _ *db.DB, _ *storage.Manager, _ string, blockIDs []string, _ *storage.BlockStore, _ string) (streaming.CanonicalBlockReader, error) {
+		calls++
+		if len(blockIDs) != 2 || blockIDs[0] != presentID || blockIDs[1] != missingID {
+			t.Fatalf("canonical check ids = %v", blockIDs)
+		}
+		return &syncCanonicalReaderStub{exists: map[string]bool{presentID: true, missingID: false}}, nil
+	}
+
+	r := setupSyncTestRouter()
+	h := &SyncHandler{db: &db.DB{}, storageManager: storage.NewManager()}
+	r.POST("/seafhttp/repo/:repo_id/check-blocks", h.CheckBlocks)
+	w := httptest.NewRecorder()
+	body := fmt.Sprintf(`["%s","%s"]`, presentID, missingID)
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo/check-blocks", strings.NewReader(body)))
+
+	if calls != 1 {
+		t.Fatalf("canonical check constructor calls = %d, want 1", calls)
+	}
+	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != fmt.Sprintf(`["%s"]`, missingID) {
+		t.Fatalf("response = %d %s, want missing block", w.Code, w.Body.String())
+	}
+}
+
+func TestCheckBlocksCanonicalResolutionFailureFailsClosed(t *testing.T) {
+	blockID := strings.Repeat("e", 64)
+	old := syncNewCanonicalBlockCheckReaderFn
+	t.Cleanup(func() { syncNewCanonicalBlockCheckReaderFn = old })
+	syncNewCanonicalBlockCheckReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
+		return nil, errors.New("canonical storage class unavailable")
+	}
+
+	r := setupSyncTestRouter()
+	h := &SyncHandler{db: &db.DB{}, storageManager: storage.NewManager()}
+	r.POST("/seafhttp/repo/:repo_id/check-blocks", h.CheckBlocks)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo/check-blocks", strings.NewReader(blockID)))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusInternalServerError, w.Body.String())
 	}
 }
 

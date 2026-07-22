@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,11 +18,36 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/gin-gonic/gin"
 )
 
 func init() {
 	gin.SetMode(gin.TestMode)
+}
+
+type checkBlocksTestCanonicalReader struct {
+	exists map[string]bool
+	err    error
+}
+
+func (r *checkBlocksTestCanonicalReader) CheckBlocksExist(context.Context, []string, int) (map[string]bool, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.exists, nil
+}
+
+func (*checkBlocksTestCanonicalReader) GetBlock(context.Context, string) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (*checkBlocksTestCanonicalReader) GetBlockReader(context.Context, string) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (*checkBlocksTestCanonicalReader) GetBlockSize(context.Context, string) (int64, error) {
+	return 0, errors.New("not implemented")
 }
 
 func TestCheckBlocks_InvalidJSON(t *testing.T) {
@@ -121,13 +148,14 @@ func TestCheckBlocks_InvalidSHA256(t *testing.T) {
 }
 
 func TestCheckBlocks_NilBlockStore(t *testing.T) {
+	hash := strings.Repeat("a", 64)
 	r := gin.New()
 	r.Use(gin.Recovery())
 
 	h := &BlockHandler{storageManager: nil, config: nil}
 	r.POST("/api/v2/blocks/check", h.CheckBlocks)
 
-	body := CheckBlocksRequest{Hashes: []string{strings.Repeat("a", 64)}}
+	body := CheckBlocksRequest{Hashes: []string{hash}}
 	jsonBody, _ := json.Marshal(body)
 	req, _ := http.NewRequest("POST", "/api/v2/blocks/check", bytes.NewBuffer(jsonBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -422,7 +450,132 @@ func TestCheckBlocksReusableCandidatesParallel_ProbesMetadataFirst(t *testing.T)
 	}
 }
 
-func TestCheckBlocksReadyParallel_OnlyChecksOwnershipForPhysicallyPresentCandidates(t *testing.T) {
+func TestCheckBlocks_NoSessionUsesLegacyStoreAndNormalizesHashes(t *testing.T) {
+	origNewReader := checkBlocksNewCanonicalReaderFn
+	t.Cleanup(func() { checkBlocksNewCanonicalReaderFn = origNewReader })
+	var canonicalReaderCalls atomic.Int32
+	checkBlocksNewCanonicalReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
+		canonicalReaderCalls.Add(1)
+		return nil, errors.New("no-session check must remain paired with legacy upload")
+	}
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	existingHash := strings.Repeat("a", 64)
+	uppercaseExistingHash := strings.ToUpper(existingHash)
+	missingHash := strings.Repeat("b", 64)
+	wantExistingPath := "/test-bucket/blocks/" + orgID + "/aa/aa/" + existingHash
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && r.URL.Path == wantExistingPath {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	s3Store, err := storage.NewS3Store(context.Background(), storage.S3Config{
+		Endpoint: server.URL, Bucket: "test-bucket", Region: "us-east-1",
+		AccessKeyID: "test", SecretAccessKey: "test", UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatalf("NewS3Store() error = %v", err)
+	}
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("org_id", orgID)
+		c.Next()
+	})
+	r.POST("/api/v2/blocks/check", (&BlockHandler{db: &db.DB{}, storage: s3Store}).CheckBlocks)
+	body, _ := json.Marshal(CheckBlocksRequest{Hashes: []string{uppercaseExistingHash, missingHash, existingHash, missingHash}})
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
+	}
+	if canonicalReaderCalls.Load() != 0 {
+		t.Fatalf("canonical reader calls = %d, want 0 for no-session flow", canonicalReaderCalls.Load())
+	}
+	var response CheckBlocksResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	wantExisting := []string{uppercaseExistingHash, existingHash}
+	wantMissing := []string{missingHash, missingHash}
+	if fmt.Sprint(response.Existing) != fmt.Sprint(wantExisting) {
+		t.Fatalf("existing = %v, want %v", response.Existing, wantExisting)
+	}
+	if fmt.Sprint(response.Missing) != fmt.Sprint(wantMissing) {
+		t.Fatalf("missing = %v, want %v", response.Missing, wantMissing)
+	}
+}
+
+func TestCheckBlocks_NoSessionNilDBUsesOrgScopedPreferredStore(t *testing.T) {
+	origNewReader := checkBlocksNewCanonicalReaderFn
+	t.Cleanup(func() { checkBlocksNewCanonicalReaderFn = origNewReader })
+	var canonicalReaderCalls atomic.Int32
+	checkBlocksNewCanonicalReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
+		canonicalReaderCalls.Add(1)
+		return nil, errors.New("canonical reader must not be constructed without a DB")
+	}
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	existingHash := strings.Repeat("a", 64)
+	missingHash := strings.Repeat("b", 64)
+	wantExistingPath := "/test-bucket/blocks/" + orgID + "/aa/aa/" + existingHash
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && r.URL.Path == wantExistingPath {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	s3Store, err := storage.NewS3Store(context.Background(), storage.S3Config{
+		Endpoint:        server.URL,
+		Bucket:          "test-bucket",
+		Region:          "us-east-1",
+		AccessKeyID:     "test",
+		SecretAccessKey: "test",
+		UsePathStyle:    true,
+	})
+	if err != nil {
+		t.Fatalf("NewS3Store() error = %v", err)
+	}
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("org_id", orgID)
+		c.Next()
+	})
+	r.POST("/api/v2/blocks/check", (&BlockHandler{storage: s3Store}).CheckBlocks)
+	body, _ := json.Marshal(CheckBlocksRequest{Hashes: []string{existingHash, missingHash, existingHash}})
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
+	}
+	if canonicalReaderCalls.Load() != 0 {
+		t.Fatalf("canonical reader calls = %d, want 0 without a DB", canonicalReaderCalls.Load())
+	}
+	var response CheckBlocksResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(response.Existing), fmt.Sprint([]string{existingHash, existingHash}); got != want {
+		t.Fatalf("existing = %v, want duplicates in request order", response.Existing)
+	}
+	if got, want := fmt.Sprint(response.Missing), fmt.Sprint([]string{missingHash}); got != want {
+		t.Fatalf("missing = %v, want %v", response.Missing, []string{missingHash})
+	}
+}
+
+func TestCheckBlocksReadyParallel_UsesCanonicalExistenceBeforeOwnership(t *testing.T) {
 	origClassify := checkBlocksClassifyOwnershipFn
 	defer func() {
 		checkBlocksClassifyOwnershipFn = origClassify
@@ -453,7 +606,75 @@ func TestCheckBlocksReadyParallel_OnlyChecksOwnershipForPhysicallyPresentCandida
 		t.Fatal("missing block reported ready")
 	}
 	if !ready["present"] {
-		t.Fatal("present reusable block should be ready")
+		t.Fatal("block present in the canonical store and owned by the session should be ready")
+	}
+}
+
+func TestCheckBlocksForSession_UsesCanonicalStoreBeforeOwnership(t *testing.T) {
+	origProbe := checkBlocksProbeReuseFn
+	origClassify := checkBlocksClassifyOwnershipFn
+	origNewReader := checkBlocksNewCanonicalReaderFn
+	t.Cleanup(func() {
+		checkBlocksProbeReuseFn = origProbe
+		checkBlocksClassifyOwnershipFn = origClassify
+		checkBlocksNewCanonicalReaderFn = origNewReader
+	})
+	checkBlocksProbeReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "canonical"}, nil
+	}
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	existingHash := strings.Repeat("a", 64)
+	missingHash := strings.Repeat("b", 64)
+	checkBlocksNewCanonicalReaderFn = func(_ context.Context, _ *db.DB, _ *storage.Manager, gotOrgID string, hashes []string, fallback *storage.BlockStore, fallbackClass string) (streaming.CanonicalBlockReader, error) {
+		if gotOrgID != orgID || fallback == nil || fallbackClass != "legacy" {
+			return nil, fmt.Errorf("unexpected canonical routing: org=%q fallback=%p class=%q", gotOrgID, fallback, fallbackClass)
+		}
+		if len(hashes) != 2 || !slices.Contains(hashes, existingHash) || !slices.Contains(hashes, missingHash) {
+			return nil, fmt.Errorf("canonical hashes = %v, want both reusable hashes", hashes)
+		}
+		return &checkBlocksTestCanonicalReader{exists: map[string]bool{existingHash: true, missingHash: false}}, nil
+	}
+
+	var ownershipCalls atomic.Int32
+	checkBlocksClassifyOwnershipFn = func(_ *db.DB, gotOrgID, referrer, blockID string) (bool, error) {
+		ownershipCalls.Add(1)
+		if gotOrgID != orgID || referrer != db.BlockReferrerForUpload("sess-1") || blockID != existingHash {
+			return false, fmt.Errorf("unexpected ownership classification: org=%q referrer=%q block=%q", gotOrgID, referrer, blockID)
+		}
+		return true, nil
+	}
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	s3Store, err := storage.NewS3Store(context.Background(), storage.S3Config{
+		Endpoint: server.URL, Bucket: "test-bucket", Region: "us-east-1",
+		AccessKeyID: "test", SecretAccessKey: "test", UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatalf("NewS3Store() error = %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", nil)
+	c.Set("org_id", orgID)
+	h := &BlockHandler{storage: s3Store, db: &db.DB{}}
+	response, err := h.checkBlocksForSession(c, db.BlockUploadSession{
+		SessionID: "sess-1",
+		OrgID:     orgID,
+		RepoID:    "repo-1",
+	}, []string{existingHash, missingHash, existingHash})
+	if err != nil {
+		t.Fatalf("checkBlocksForSession() error = %v", err)
+	}
+	if ownershipCalls.Load() != 1 {
+		t.Fatalf("ownership calls = %d, want 1 for the physically present canonical candidate", ownershipCalls.Load())
+	}
+	if got, want := fmt.Sprint(response.Existing), fmt.Sprint([]string{existingHash, existingHash}); got != want {
+		t.Fatalf("existing = %v, want %v", response.Existing, []string{existingHash, existingHash})
+	}
+	if got, want := fmt.Sprint(response.Missing), fmt.Sprint([]string{missingHash}); got != want {
+		t.Fatalf("missing = %v, want %v", response.Missing, []string{missingHash})
 	}
 }
 
@@ -671,7 +892,7 @@ func TestUploadBlockMaterializePropagatesFence(t *testing.T) {
 
 	h := &BlockHandler{}
 	session := db.BlockUploadSession{SessionID: "sess-1", OrgID: "org-1", RepoID: "repo-1"}
-	err := h.materializeUploadedBlock(session, strings.Repeat("a", 64), strings.Repeat("b", 40), 5, "hot", true)
+	err := h.materializeUploadedBlock(session, strings.Repeat("a", 64), strings.Repeat("b", 40), 5, "hot", "blocks/org/a", true)
 	if !errors.Is(err, ErrBlockDeleteInProgress) {
 		t.Fatalf("materializeUploadedBlock err = %v, want ErrBlockDeleteInProgress propagated", err)
 	}

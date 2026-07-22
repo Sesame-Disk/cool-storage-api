@@ -183,9 +183,12 @@ func (bs *BlockStore) StorageKeyForHash(hash string) string {
 
 // GetBlock retrieves a block by its hash
 func (bs *BlockStore) GetBlock(ctx context.Context, hash string) ([]byte, error) {
-	key := bs.hashToKey(hash)
+	return bs.GetBlockByStorageKey(ctx, bs.hashToKey(hash))
+}
 
-	reader, err := bs.s3.Get(ctx, key)
+// GetBlockByStorageKey retrieves a block from an explicit storage key.
+func (bs *BlockStore) GetBlockByStorageKey(ctx context.Context, storageKey string) ([]byte, error) {
+	reader, err := bs.GetBlockReaderByStorageKey(ctx, storageKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block: %w", err)
 	}
@@ -201,14 +204,22 @@ func (bs *BlockStore) GetBlock(ctx context.Context, hash string) ([]byte, error)
 
 // GetBlockReader returns a reader for a block (for streaming large blocks)
 func (bs *BlockStore) GetBlockReader(ctx context.Context, hash string) (io.ReadCloser, error) {
-	key := bs.hashToKey(hash)
-	return bs.s3.Get(ctx, key)
+	return bs.GetBlockReaderByStorageKey(ctx, bs.hashToKey(hash))
+}
+
+// GetBlockReaderByStorageKey returns a reader for an explicit storage key.
+func (bs *BlockStore) GetBlockReaderByStorageKey(ctx context.Context, storageKey string) (io.ReadCloser, error) {
+	return bs.s3.Get(ctx, storageKey)
 }
 
 // GetBlockSize returns the size in bytes of a block using S3 HEAD (no data transfer).
 func (bs *BlockStore) GetBlockSize(ctx context.Context, hash string) (int64, error) {
-	key := bs.hashToKey(hash)
-	return bs.s3.GetObjectSize(ctx, key)
+	return bs.GetBlockSizeByStorageKey(ctx, bs.hashToKey(hash))
+}
+
+// GetBlockSizeByStorageKey returns the size of an explicit storage key using S3 HEAD.
+func (bs *BlockStore) GetBlockSizeByStorageKey(ctx context.Context, storageKey string) (int64, error) {
+	return bs.s3.GetObjectSize(ctx, storageKey)
 }
 
 // BlockExists checks if a block exists

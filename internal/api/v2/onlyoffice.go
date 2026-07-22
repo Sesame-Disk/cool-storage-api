@@ -1208,7 +1208,10 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	}
 
 	var storageKey string
+	materializedStorageClass := storageClass
 	if err := RetryUploadedBlockMaterializationContext(ctx, "OnlyOffice", internalBlockID, func() error {
+		materializedStorageClass = storageClass
+		storageKey = ""
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, internalBlockID)
 		if probeErr != nil {
 			return fmt.Errorf("probe block reuse for %s: %w", internalBlockID, probeErr)
@@ -1219,12 +1222,18 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
+			materializedStorageClass = strings.TrimSpace(probe.StorageClass)
 			var ensureErr error
 			storageKey, ensureErr = EnsureReusableBlockPresent(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID)
 			return ensureErr
 		case db.BlockReuseNeedsPut:
+			putStore, resolvedClass, _, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, blockStore, storageClass, probe, orgID, internalBlockID)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			materializedStorageClass = resolvedClass
 			var putErr error
-			storageKey, putErr = putUploadedBlockAutoDirectFn(ctx, blockStore, internalBlockID, content)
+			storageKey, putErr = putUploadedBlockAutoDirectFn(ctx, putStore, internalBlockID, content)
 			if putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}
@@ -1237,7 +1246,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		// Materialize block metadata/provisional ref first and then the sync mapping.
 		// Keep the pending-cleanup row on mapping failure so the reconciler can finish
 		// cleanup even if the immediate rollback path was only partially successful.
-		return RegisterUploadedBlockAndMapping(h.db, orgID, repoID, internalBlockID, rollbackID, len(content), storageClass, storageKey, externalBlockID)
+		return RegisterUploadedBlockAndMapping(h.db, orgID, repoID, internalBlockID, rollbackID, len(content), materializedStorageClass, storageKey, externalBlockID)
 	}, nil, nil); err != nil {
 		if errors.Is(err, ErrBlockMappingWriteFailed) {
 			log.Printf("OnlyOffice: CRITICAL - failed to create block mapping org=%s ext=%s int=%s: %v", orgID, externalBlockID[:16], internalBlockID[:16], err)
