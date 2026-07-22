@@ -4700,11 +4700,16 @@ entry records the reversal and its price so it is not rediscovered as a bug.
 Only a read that can prove **global** absence may reintroduce 404. Options, none
 implemented:
 
-- Resolve the path at `QUORUM`/`ALL` (or `SERIAL`) before claiming absence, paying
-  the cross-DC latency only on the miss path, which is already the slow path.
 - Carry the commit id the token was minted against and treat "listing older than
-  that commit" as unproven rather than absent, which distinguishes replication lag
-  from a real delete without a global read.
+  that commit" as unproven rather than absent. This distinguishes replication lag
+  from a real delete without requiring a global read, and is the preferred path.
+- Resolve the path at `ALL` on the miss path only, paying the availability cost of
+  contacting every live replica. With ordinary `LOCAL_QUORUM` writes this is the
+  consistency that can observe or reconcile every replica; do **not** treat global
+  `QUORUM` or `SERIAL` as substitutes — `QUORUM` has no guaranteed intersection with
+  a local write quorum across DCs, and `SERIAL` only linearizes LWTs on the same
+  partition (it does not order `access_tokens`, `libraries`, `commits`, and
+  `fs_objects` relative to each other).
 - Restrict the 404 to single-DC deployments behind explicit configuration.
 
 Revisit alongside X2 (multi-DC reasoning is derived, never reproduced) in
@@ -4714,6 +4719,56 @@ Revisit alongside X2 (multi-DC reasoning is derived, never reproduced) in
 
 - `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-6 scope and contract)
 - `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (F5, F13, X2)
+
+---
+
+### ISSUE-ENCRYPTED-FLAG-UNCHECKED-01: An ignored `encrypted` probe error silently disables encryption
+
+**Status**: 🔴 Open (found 2026-07-22 while auditing PR-6) — two call sites remain
+**Severity**: High for the write path (stores plaintext into an encrypted library), Medium for the read path
+**Affected**: `internal/api/v2/files.go` `UploadFile`; `internal/api/v2/fileview.go` `ServeRawFile`
+
+#### Problem
+
+The library encryption flag is read as `Scan(&encrypted)` with the error **discarded**.
+Go leaves `encrypted` as its zero value on failure, so any transient Cassandra error —
+a timeout, a coordinator hiccup, cross-DC lag — is indistinguishable from "this library
+is not encrypted", and the caller proceeds down the plaintext branch.
+
+```go
+// The error is never checked; encrypted stays false on ANY failure.
+h.db.Session().Query(`SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?`,
+    orgID, repoID).Scan(&encrypted)
+if encrypted { /* ...load file key, encrypt/decrypt... */ }
+```
+
+Two consequences, of different severity:
+
+1. **`UploadFile` (write path, High).** The upload takes the un-encrypted branch and
+   **persists plaintext into a library the user believes is encrypted**. It also skips
+   the `403 lib_need_decrypt` gate, so it succeeds without a decrypt session. The bad
+   state is durable and is not detectable later from the stored object alone.
+2. **`ServeRawFile` (read path, Medium).** The response streams ciphertext bytes
+   labelled as the real content, so the viewer renders garbage. No confidentiality
+   loss, but a `200` carrying wrong content.
+
+PR-6 fixed exactly this defect in `HandleZipDownload`, which had the same discarded
+error and produced a `200` ZIP of ciphertext. `seafHTTPLookupLibraryEncryptedFn` is
+the corrected shape: probe, propagate the error, fail closed. These two v2 call sites
+were left untouched only because they are outside that PR's SeafHTTP scope.
+
+#### Fix Direction
+
+Check the error and fail closed, mirroring `seafHTTPLookupLibraryEncryptedFn`: a probe
+I/O failure is a retryable 503, never "not encrypted"; a confirmed encrypted library
+with no decrypt session stays `403 { lib_need_decrypt: true }`. Prefer one shared
+helper in v2 over repeating the probe, so a third caller cannot reintroduce it. Audit
+for other `Scan(&flag)` sites where a discarded error turns a security decision into
+its permissive default — the same shape guards `encrypted` in several handlers.
+
+#### Related Docs
+
+- `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-6 fixed the SeafHTTP ZIP instance)
 
 ---
 

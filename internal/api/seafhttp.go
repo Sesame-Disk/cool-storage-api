@@ -1298,6 +1298,17 @@ var seafHTTPResolveBlockRepresentationIDFn = func(h *SeafHTTPHandler, orgID, rep
 	return h.resolveBlockRepresentationID(orgID, repoID)
 }
 
+// seafHTTPLookupLibraryEncryptedFn is the shared encrypted-library probe for
+// file and ZIP download. Ignoring its error previously made ZIP treat a
+// Cassandra failure as "not encrypted" and stream ciphertext as a 200.
+var seafHTTPLookupLibraryEncryptedFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+	var encrypted bool
+	err := h.db.Session().Query(`
+		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&encrypted)
+	return encrypted, err
+}
+
 func (b *zipTraversalBudget) noteDirectory(depth int) error {
 	if depth > b.maxDepth {
 		return &zipLimitError{message: fmt.Sprintf("zip download exceeds maximum directory depth of %d", b.maxDepth)}
@@ -3533,7 +3544,7 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	// no path-based object exists to read.
 	if h.db == nil || h.storageManager == nil {
 		log.Printf("[HandleDownload] Block storage not available (db=%v, storageManager=%v)", h.db != nil, h.storageManager != nil)
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage not available"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("storage not available"))
 		return
 	}
 
@@ -3595,11 +3606,8 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string,
 // lookupFileBlocks resolves a token's path to its block IDs, file size, encryption key, and block store.
 // This is the common metadata lookup used by both download and streaming paths.
 func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, fileIV []byte, blockStore *storage.BlockStore, storageClass string, err error) {
-	// Check encryption
-	var encrypted bool
-	err = h.db.Session().Query(`
-		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, token.OrgID, token.RepoID).Scan(&encrypted)
+	// Check encryption. A read failure must NOT fall through as "not encrypted".
+	encrypted, err := seafHTTPLookupLibraryEncryptedFn(h, token.OrgID, token.RepoID)
 	if err != nil {
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("failed to check library encryption: %w", err)
 	}
@@ -3609,7 +3617,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		if fileKey == nil {
 			// Must stay a distinct sentinel: this is not a transient failure, and
 			// answering 503 would make the client retry forever instead of
-			// prompting for the password (the zip path already returns 403).
+			// prompting for the password.
 			return nil, 0, nil, nil, nil, "", v2.ErrLibraryEncryptedNotUnlocked
 		}
 	}
@@ -4053,7 +4061,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	}
 
 	if h.db == nil || h.storageManager == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage not available"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("storage not available"))
 		return
 	}
 
@@ -4071,14 +4079,33 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		}
 	}
 
-	// Get the library's root FS
+	// Encryption must be checked before any metadata walk or stream. Ignoring a
+	// Cassandra error here previously left encrypted=false and produced a 200 zip
+	// of ciphertext bytes treated as plaintext.
+	encrypted, err := seafHTTPLookupLibraryEncryptedFn(h, token.OrgID, token.RepoID)
+	if err != nil {
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("failed to check library encryption: %w", err))
+		return
+	}
+	var fileKey []byte
+	var fileIV []byte
+	if encrypted {
+		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
+		if fileKey == nil {
+			respondSeafHTTPDownloadError(c, token.RepoID, token.Path, v2.ErrLibraryEncryptedNotUnlocked)
+			return
+		}
+	}
+
+	// Get the library's root FS. Cross-DC lag can make a fresh download token
+	// observe a missing library/commit row; that is retryable 503, not 500.
 	var headCommit string
-	err := h.db.Session().Query(`
+	err = h.db.Session().Query(`
 		SELECT head_commit_id FROM libraries
 		WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).Scan(&headCommit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "library not found"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("library not found: %w", err))
 		return
 	}
 
@@ -4088,7 +4115,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		WHERE library_id = ? AND commit_id = ?
 	`, token.RepoID, headCommit).Scan(&rootFSID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "commit not found"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("commit not found: %w", err))
 		return
 	}
 
@@ -4148,26 +4175,11 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		dirName = "download"
 	}
 
-	// Check encryption
-	var encrypted bool
-	var fileKey []byte
-	var fileIV []byte
-	h.db.Session().Query(`
-		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, token.OrgID, token.RepoID).Scan(&encrypted)
-	if encrypted {
-		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
-		if fileKey == nil {
-			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted but not unlocked"})
-			return
-		}
-	}
-
 	hostname := httputil.GetRoutingHostname(c, h.configuredServerURL())
 	blockStore, storageClass, err := h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleZipDownload] Failed to resolve block store: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare zip download"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("block store not available: %w", err))
 		return
 	}
 
@@ -4189,7 +4201,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	canonicalReader, err := seafHTTPNewCanonicalBlockReaderFn(c.Request.Context(), h.db, h.storageManager, token.OrgID, allResolvedIDs, blockStore, storageClass)
 	if err != nil {
 		log.Printf("[HandleZipDownload] Failed to resolve canonical block locations: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare zip download"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("resolve canonical block locations: %w", err))
 		return
 	}
 

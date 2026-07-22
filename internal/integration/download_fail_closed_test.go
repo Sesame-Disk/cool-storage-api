@@ -185,6 +185,34 @@ func TestDownloadFailClosedContract(t *testing.T) {
 		}
 	})
 
+	t.Run("dirent mode and fs_objects.obj_type disagreement is retryable 503", func(t *testing.T) {
+		rootFSID := downloadTestRootFSID(t, database, repoID)
+		fileFSID := downloadTestDirEntryID(t, database, repoID, rootFSID, "corrupt.txt")
+		// Restore a well-formed listing that names the file, then flip the row's
+		// obj_type so mode (file) and object type (dir) disagree.
+		if err := database.Session().Query(`
+			UPDATE fs_objects SET dir_entries = ? WHERE library_id = ? AND fs_id = ?
+		`, fmt.Sprintf(`[{"name":"corrupt.txt","id":"%s","mode":33188}]`, fileFSID), repoID, rootFSID).Exec(); err != nil {
+			t.Fatalf("restore listing for type disagreement: %v", err)
+		}
+		if err := database.Session().Query(`
+			UPDATE fs_objects SET obj_type = ? WHERE library_id = ? AND fs_id = ?
+		`, "dir", repoID, fileFSID).Exec(); err != nil {
+			t.Fatalf("flip obj_type for type disagreement: %v", err)
+		}
+
+		status, body := getDownload(t, downloadTokenURL(t, repoID, "/corrupt.txt"))
+		if status == http.StatusOK {
+			t.Fatalf("mode/obj_type disagreement answered 200 (body=%s)", body)
+		}
+		if status == http.StatusNotFound {
+			t.Fatalf("mode/obj_type disagreement answered 404 (body=%s)", body)
+		}
+		if status != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 (body=%s)", status, body)
+		}
+	})
+
 	for _, tc := range []struct {
 		name       string
 		dirEntries string

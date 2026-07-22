@@ -536,8 +536,18 @@ name or id, and reading a blank listing as an empty directory — so a corrupt l
 could produce a `200` zip with wrong or missing content. Names must now be one safe
 path component (no `.`, `..`, slash, backslash or NUL); mode is required, exact and
 restricted to a regular file or directory; preflight also verifies mode against the
-referenced `fs_objects.obj_type`. Non-limit ZIP preflight failures use the same 503
-classifier and `Retry-After` as file downloads.
+referenced `fs_objects.obj_type`. ZIP encryption is probed through the same
+injectable helper as file download and **before** the head/commit walk: a probe
+I/O failure is 503 (never "not encrypted"), and a confirmed encrypted library
+without a decrypt session is 403 `lib_need_decrypt`. Head/commit misses, block-store
+resolution, canonical placement, and non-limit ZIP preflight failures all use the
+same 503 classifier and `Retry-After` as file downloads.
+
+The discarded-probe-error shape that made ZIP stream ciphertext as a 200 **also
+exists in `internal/api/v2`**, outside this PR's SeafHTTP scope: `UploadFile` can
+persist plaintext into an encrypted library, and `ServeRawFile` can serve ciphertext
+as content. Tracked as `ISSUE-ENCRYPTED-FLAG-UNCHECKED-01` in `docs/KNOWN_ISSUES.md`;
+`seafHTTPLookupLibraryEncryptedFn` is the corrected shape to copy.
 
 `findValidatedDirEntry` is the single parse-and-match path, shared by the production
 lookup and by the corrupt-listing matrix. An intermediate revision left a separate

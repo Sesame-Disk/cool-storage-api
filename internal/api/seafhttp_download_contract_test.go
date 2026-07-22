@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -256,20 +259,22 @@ func TestFindValidatedDirEntryNeverInventsAbsence(t *testing.T) {
 // cross-DC snapshot. Absence and dangling metadata must both remain retryable.
 func TestRespondSeafHTTPDownloadErrorNeverMapsLocalAbsenceTo404(t *testing.T) {
 	tests := []struct {
-		name       string
-		err        error
-		wantStatus int
+		name               string
+		err                error
+		wantStatus         int
+		wantLibNeedDecrypt bool
 	}{
 		{name: "local absence may be a stale cross-DC snapshot", err: fmt.Errorf("%w: wanted.txt", errDirEntryAbsent), wantStatus: 503},
 		{name: "wrapped local absence remains retryable", err: fmt.Errorf("file not found: %s: %w", "wanted.txt", fmt.Errorf("%w: wanted.txt", errDirEntryAbsent)), wantStatus: 503},
 		{name: "bare gocql not found on a referenced row", err: fmt.Errorf("commit not found: %w", gocql.ErrNotFound), wantStatus: 503},
 		// Retrying without a decrypt session can never succeed, so this must not
 		// join the retryable bucket; the zip path already answered 403.
-		{name: "encrypted library without a decrypt session", err: v2.ErrLibraryEncryptedNotUnlocked, wantStatus: 403},
-		{name: "wrapped encrypted library error", err: fmt.Errorf("lookup: %w", v2.ErrLibraryEncryptedNotUnlocked), wantStatus: 403},
+		{name: "encrypted library without a decrypt session", err: v2.ErrLibraryEncryptedNotUnlocked, wantStatus: 403, wantLibNeedDecrypt: true},
+		{name: "wrapped encrypted library error", err: fmt.Errorf("lookup: %w", v2.ErrLibraryEncryptedNotUnlocked), wantStatus: 403, wantLibNeedDecrypt: true},
 		{name: "corrupt listing", err: errors.New("directory abc: malformed directory listing"), wantStatus: 503},
 		{name: "cassandra timeout", err: errors.New("gocql: no response received from cassandra within timeout period"), wantStatus: 503},
 		{name: "block store unavailable", err: errors.New("block store not available"), wantStatus: 503},
+		{name: "encryption probe failure is retryable", err: fmt.Errorf("failed to check library encryption: %w", errors.New("cassandra timeout")), wantStatus: 503},
 	}
 
 	for _, tt := range tests {
@@ -285,6 +290,15 @@ func TestRespondSeafHTTPDownloadErrorNeverMapsLocalAbsenceTo404(t *testing.T) {
 			}
 			if tt.wantStatus == 503 && w.Header().Get("Retry-After") == "" {
 				t.Fatal("503 must carry Retry-After so the client knows to retry")
+			}
+			if tt.wantLibNeedDecrypt {
+				var body map[string]interface{}
+				if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+					t.Fatalf("decode 403 body: %v", err)
+				}
+				if body["lib_need_decrypt"] != true {
+					t.Fatalf("lib_need_decrypt = %v, want true (body=%s)", body["lib_need_decrypt"], w.Body.String())
+				}
 			}
 		})
 	}
@@ -369,6 +383,80 @@ func TestParseValidatedDirEntriesServesTheZipWalk(t *testing.T) {
 			if _, err := parseValidatedDirEntries(raw); err == nil {
 				t.Fatalf("invalid mode fragment %q must fail closed", mode)
 			}
+		}
+	})
+}
+
+// ZIP used to ignore the encrypted-probe error and stream ciphertext as a 200.
+// The probe runs before any Cassandra head/commit walk so these cases stay
+// unit-testable without a live session.
+func TestHandleZipDownloadEncryptionProbeFailsClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	newZipHandler := func(t *testing.T) (*SeafHTTPHandler, string) {
+		t.Helper()
+		tokenStore := NewMockTokenStore()
+		tok, err := tokenStore.CreateDownloadToken("org-1", "repo-1", "/", "user-1")
+		if err != nil {
+			t.Fatalf("CreateDownloadToken: %v", err)
+		}
+		return &SeafHTTPHandler{
+			tokenStore:     tokenStore,
+			db:             &db.DB{},
+			storageManager: &storage.Manager{},
+		}, tok
+	}
+
+	t.Run("cassandra failure on encrypted probe is retryable 503", func(t *testing.T) {
+		h, tok := newZipHandler(t)
+		old := seafHTTPLookupLibraryEncryptedFn
+		t.Cleanup(func() { seafHTTPLookupLibraryEncryptedFn = old })
+		seafHTTPLookupLibraryEncryptedFn = func(*SeafHTTPHandler, string, string) (bool, error) {
+			return false, errors.New("cassandra timeout")
+		}
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/zip/"+tok, nil)
+		c.Params = gin.Params{{Key: "token", Value: tok}}
+
+		h.HandleZipDownload(c)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 (body=%s)", w.Code, w.Body.String())
+		}
+		if w.Header().Get("Retry-After") == "" {
+			t.Fatal("503 must carry Retry-After")
+		}
+		if strings.Contains(w.Header().Get("Content-Type"), "application/zip") {
+			t.Fatalf("must not commit zip headers after encryption probe failure: %q", w.Header().Get("Content-Type"))
+		}
+	})
+
+	t.Run("encrypted library without decrypt session emits lib_need_decrypt", func(t *testing.T) {
+		h, tok := newZipHandler(t)
+		old := seafHTTPLookupLibraryEncryptedFn
+		t.Cleanup(func() { seafHTTPLookupLibraryEncryptedFn = old })
+		seafHTTPLookupLibraryEncryptedFn = func(*SeafHTTPHandler, string, string) (bool, error) {
+			return true, nil
+		}
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/zip/"+tok, nil)
+		c.Params = gin.Params{{Key: "token", Value: tok}}
+
+		h.HandleZipDownload(c)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403 (body=%s)", w.Code, w.Body.String())
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode 403 body: %v", err)
+		}
+		if body["lib_need_decrypt"] != true {
+			t.Fatalf("lib_need_decrypt = %v, want true (body=%s)", body["lib_need_decrypt"], w.Body.String())
 		}
 	})
 }
