@@ -3560,6 +3560,12 @@ func respondSeafHTTPDownloadError(c *gin.Context, repoID, path string, err error
 		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
 		return
 	}
+	if errors.Is(err, v2.ErrLibraryEncryptedNotUnlocked) {
+		// Not transient: retrying without a decrypt session can never succeed.
+		// Emit the app-wide 403 { lib_need_decrypt: true } the frontend keys off.
+		writeLibraryEncryptedNotUnlocked(c)
+		return
+	}
 	log.Printf("[HandleDownload] download unavailable repo=%s path=%s: %v", repoID, path, err)
 	c.Header("Retry-After", "1")
 	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "file is temporarily unavailable; retry"})
@@ -3605,7 +3611,10 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	if encrypted {
 		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
-			return nil, 0, nil, nil, nil, "", fmt.Errorf("library is encrypted but not unlocked")
+			// Must stay a distinct sentinel: this is not a transient failure, and
+			// answering 503 would make the client retry forever instead of
+			// prompting for the password (the zip path already returns 403).
+			return nil, 0, nil, nil, nil, "", v2.ErrLibraryEncryptedNotUnlocked
 		}
 	}
 
@@ -3787,119 +3796,133 @@ func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) 
 // local copy.
 var errDirEntryAbsent = errors.New("directory entry absent")
 
-// dirEntryNameAndID extracts the name and id of one directory entry, rejecting
-// anything that could resolve to the wrong FS object. encoding/json silently
-// keeps the LAST value for a repeated key, so {"id":"A","id":"B"} would serve B
-// and {"name":"a","name":"b"} would hide "a" entirely; both are rejected here by
+// validatedDirEntry is one directory entry that passed full validation.
+type validatedDirEntry struct {
+	name string
+	id   string
+	mode int
+}
+
+func (e validatedDirEntry) isDir() bool {
+	return e.mode == 16384 || e.mode&0170000 == 040000
+}
+
+// parseValidatedDirEntry validates one entry, rejecting anything that could
+// resolve to the wrong FS object. encoding/json silently keeps the LAST value
+// for a repeated key, so {"id":"A","id":"B"} would resolve to B and
+// {"name":"a","name":"b"} would hide "a" entirely; both are caught here by
 // walking the object's tokens instead of unmarshalling into a map.
-func dirEntryNameAndID(raw json.RawMessage) (string, string, error) {
+func parseValidatedDirEntry(raw json.RawMessage) (validatedDirEntry, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	token, err := decoder.Token()
 	if err != nil {
-		return "", "", fmt.Errorf("unreadable directory entry: %w", err)
+		return validatedDirEntry{}, fmt.Errorf("unreadable directory entry: %w", err)
 	}
 	if delim, ok := token.(json.Delim); !ok || delim != '{' {
-		return "", "", fmt.Errorf("directory entry is not a JSON object")
+		return validatedDirEntry{}, fmt.Errorf("directory entry is not a JSON object")
 	}
 
 	seen := make(map[string]struct{}, 4)
-	var name, id string
+	var entry validatedDirEntry
 	var nameFound, idFound bool
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
-			return "", "", fmt.Errorf("unreadable directory entry key: %w", err)
+			return validatedDirEntry{}, fmt.Errorf("unreadable directory entry key: %w", err)
 		}
 		key, ok := keyToken.(string)
 		if !ok {
-			return "", "", fmt.Errorf("directory entry key is not a string")
+			return validatedDirEntry{}, fmt.Errorf("directory entry key is not a string")
 		}
 		if _, duplicate := seen[key]; duplicate {
-			return "", "", fmt.Errorf("directory entry repeats key %q", key)
+			return validatedDirEntry{}, fmt.Errorf("directory entry repeats key %q", key)
 		}
 		seen[key] = struct{}{}
 
 		var value json.RawMessage
 		if err := decoder.Decode(&value); err != nil {
-			return "", "", fmt.Errorf("unreadable value for directory entry key %q: %w", key, err)
+			return validatedDirEntry{}, fmt.Errorf("unreadable value for directory entry key %q: %w", key, err)
 		}
 		switch key {
 		case "name":
-			if err := json.Unmarshal(value, &name); err != nil {
-				return "", "", fmt.Errorf("directory entry name is not a string: %w", err)
+			if err := json.Unmarshal(value, &entry.name); err != nil {
+				return validatedDirEntry{}, fmt.Errorf("directory entry name is not a string: %w", err)
 			}
 			nameFound = true
 		case "id":
-			if err := json.Unmarshal(value, &id); err != nil {
-				return "", "", fmt.Errorf("directory entry id is not a string: %w", err)
+			if err := json.Unmarshal(value, &entry.id); err != nil {
+				return validatedDirEntry{}, fmt.Errorf("directory entry id is not a string: %w", err)
 			}
 			idFound = true
+		case "mode":
+			var mode float64
+			if err := json.Unmarshal(value, &mode); err != nil {
+				return validatedDirEntry{}, fmt.Errorf("directory entry mode is not a number: %w", err)
+			}
+			entry.mode = int(mode)
 		}
 	}
 
-	if !nameFound || name == "" {
-		return "", "", fmt.Errorf("directory entry has no usable name")
+	if !nameFound || entry.name == "" {
+		return validatedDirEntry{}, fmt.Errorf("directory entry has no usable name")
 	}
 	if !idFound {
-		return "", "", fmt.Errorf("directory entry %q has no id", name)
+		return validatedDirEntry{}, fmt.Errorf("directory entry %q has no id", entry.name)
 	}
-	if len(id) != 40 || !isHexString([]byte(id)) {
-		return "", "", fmt.Errorf("directory entry %q has a non-40-hex id", name)
+	if len(entry.id) != 40 || !isHexString([]byte(entry.id)) {
+		return validatedDirEntry{}, fmt.Errorf("directory entry %q has a non-40-hex id", entry.name)
 	}
-	return name, id, nil
+	return entry, nil
 }
 
-// findDirEntryID resolves entryName against a raw dir_entries payload.
+// parseValidatedDirEntries validates an ENTIRE dir_entries payload, or fails.
 //
-// A match is returned as soon as it is unambiguous and well formed, so one bad
-// sibling never makes a healthy file unreadable. Absence is the strict case: it
-// is reported ONLY when every entry validated and none matched. If any entry was
-// malformed the listing cannot prove absence, and the caller gets a real error.
-func findDirEntryID(rawEntries, entryName string) (string, error) {
+// It is all-or-nothing on purpose. An earlier revision returned a valid match
+// even when a sibling was malformed, so that one bad dirent could not make a
+// healthy file unreadable. That exception was wrong: a corrupt entry may carry
+// the very name being resolved (or hide it behind a repeated "name" key), in
+// which case the listing is ambiguous about the requested path and returning
+// the other copy serves the wrong FS object. A corrupt dirent is an anomaly that
+// should be investigated, and 503 is retryable and destroys nothing, so every
+// consumer now fails closed on the whole listing.
+func parseValidatedDirEntries(rawEntries string) ([]validatedDirEntry, error) {
 	trimmed := strings.TrimSpace(rawEntries)
 	if trimmed == "" || trimmed == "null" {
-		return "", fmt.Errorf("directory listing is blank")
+		return nil, fmt.Errorf("directory listing is blank")
 	}
 
-	var entries []json.RawMessage
-	if err := json.Unmarshal([]byte(trimmed), &entries); err != nil {
-		return "", fmt.Errorf("malformed directory listing: %w", err)
+	var raws []json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &raws); err != nil {
+		return nil, fmt.Errorf("malformed directory listing: %w", err)
 	}
 
-	var match string
-	var matchFound bool
-	var firstErr error
-	seenNames := make(map[string]struct{}, len(entries))
-	for i, raw := range entries {
-		name, id, err := dirEntryNameAndID(raw)
+	entries := make([]validatedDirEntry, 0, len(raws))
+	seenNames := make(map[string]struct{}, len(raws))
+	for i, raw := range raws {
+		entry, err := parseValidatedDirEntry(raw)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("directory entry %d: %w", i, err)
-			}
-			continue
+			return nil, fmt.Errorf("directory entry %d: %w", i, err)
 		}
-		if _, duplicate := seenNames[name]; duplicate {
-			// A duplicate of the requested name is always fatal: the listing
-			// cannot say which FS object the path means.
-			if name == entryName {
-				return "", fmt.Errorf("directory lists %q more than once", name)
-			}
-			if firstErr == nil {
-				firstErr = fmt.Errorf("directory lists %q more than once", name)
-			}
-			continue
+		if _, duplicate := seenNames[entry.name]; duplicate {
+			return nil, fmt.Errorf("directory lists %q more than once", entry.name)
 		}
-		seenNames[name] = struct{}{}
-		if name == entryName {
-			match, matchFound = id, true
-		}
+		seenNames[entry.name] = struct{}{}
+		entries = append(entries, entry)
 	}
+	return entries, nil
+}
 
-	if matchFound {
-		return match, nil
+// findDirEntryID resolves entryName against a raw dir_entries payload. Absence
+// is reported ONLY when the whole listing validated and no entry matched.
+func findDirEntryID(rawEntries, entryName string) (string, error) {
+	entries, err := parseValidatedDirEntries(rawEntries)
+	if err != nil {
+		return "", err
 	}
-	if firstErr != nil {
-		return "", firstErr
+	for _, entry := range entries {
+		if entry.name == entryName {
+			return entry.id, nil
+		}
 	}
 	return "", fmt.Errorf("%w: %s", errDirEntryAbsent, entryName)
 }
@@ -4160,34 +4183,34 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 	}
 
 	var dirEntriesJSON string
-	err := h.db.Session().Query(`
+	if err := h.db.Session().Query(`
 		SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, repoID, dirFSID).Scan(&dirEntriesJSON)
-	if err != nil || dirEntriesJSON == "" || dirEntriesJSON == "[]" {
-		return nil, err
+	`, repoID, dirFSID).Scan(&dirEntriesJSON); err != nil {
+		return nil, fmt.Errorf("failed to read directory %s: %w", dirFSID, err)
+	}
+	if strings.TrimSpace(dirEntriesJSON) == "[]" {
+		return nil, nil
 	}
 
-	var entries []map[string]interface{}
-	if err := json.Unmarshal([]byte(dirEntriesJSON), &entries); err != nil {
-		return nil, fmt.Errorf("parse dir entries: %w", err)
+	// The zip walk validates exactly like the download path. It used to parse
+	// into a map — keeping the last value of a repeated key — and silently skip
+	// entries without a name or id, so a corrupt listing could produce a 200 zip
+	// with wrong or missing content instead of an error.
+	entries, err := parseValidatedDirEntries(dirEntriesJSON)
+	if err != nil {
+		return nil, fmt.Errorf("directory %s: %w", dirFSID, err)
 	}
 
 	prepared := make([]zipPreparedFile, 0, len(entries))
 	for _, entry := range entries {
-		name, _ := entry["name"].(string)
-		id, _ := entry["id"].(string)
-		if name == "" || id == "" {
-			continue
-		}
+		name, id := entry.name, entry.id
 
 		entryPath := name
 		if prefix != "" {
 			entryPath = prefix + "/" + name
 		}
 
-		modeFloat, _ := entry["mode"].(float64)
-		mode := int(modeFloat)
-		if mode == 16384 || mode&0170000 == 040000 {
+		if entry.isDir() {
 			childFiles, err := h.prepareZipDirectory(repoID, orgID, id, entryPath, depth+1, budget)
 			if err != nil {
 				return nil, err

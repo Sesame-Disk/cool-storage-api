@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -131,11 +132,29 @@ func TestFindDirEntryIDAbsenceRequiresAValidatedListing(t *testing.T) {
 			lookFor:    "wanted.txt",
 		},
 		{
-			// One bad sibling must not make a healthy file unreadable.
-			name:       "a corrupt sibling does not hide a valid match",
+			// Reported by review: the earlier "corrupt sibling" exception returned
+			// the valid copy here, even though the listing is ambiguous about the
+			// requested name and the other copy might be the real one.
+			name:       "a corrupt copy of the requested name fails closed",
+			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"%s"},{"name":"wanted.txt","id":"short"}]`, dirEntryIDA),
+			lookFor:    "wanted.txt",
+		},
+		{
+			name:       "a corrupt copy of the requested name fails closed in either order",
+			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"short"},{"name":"wanted.txt","id":"%s"}]`, dirEntryIDA),
+			lookFor:    "wanted.txt",
+		},
+		{
+			// A name hidden behind a repeated key could be the requested one.
+			name:       "a sibling hiding a name behind a repeated key fails closed",
+			rawEntries: fmt.Sprintf(`[{"name":"a","name":"b","id":"%s"},{"name":"wanted.txt","id":"%s"}]`, dirEntryIDA, dirEntryIDB),
+			lookFor:    "wanted.txt",
+		},
+		{
+			// All-or-nothing: any corrupt entry blocks resolution, not just absence.
+			name:       "a corrupt sibling fails the whole listing closed",
 			rawEntries: fmt.Sprintf(`[{"name":"bad.txt","id":"short"},{"name":"wanted.txt","id":"%s"}]`, dirEntryIDA),
 			lookFor:    "wanted.txt",
-			wantID:     dirEntryIDA,
 		},
 	}
 
@@ -211,12 +230,12 @@ func TestFindDirEntryIDNeverInventsAbsence(t *testing.T) {
 			t.Fatalf("absence claimed for unparseable listing %s", raw)
 		}
 		for _, entry := range entries {
-			name, entryID, entryErr := dirEntryNameAndID(entry)
+			parsed, entryErr := parseValidatedDirEntry(entry)
 			if entryErr != nil {
 				t.Fatalf("absence claimed despite invalid entry %s in %s: %v", entry, raw, entryErr)
 			}
-			if name == target {
-				t.Fatalf("absence claimed for listing %s that names %q (id %s)", raw, target, entryID)
+			if parsed.name == target {
+				t.Fatalf("absence claimed for listing %s that names %q (id %s)", raw, target, parsed.id)
 			}
 		}
 	}
@@ -233,6 +252,10 @@ func TestRespondSeafHTTPDownloadErrorMapsOnlyProvenAbsenceTo404(t *testing.T) {
 		{name: "proven absence", err: fmt.Errorf("%w: wanted.txt", errDirEntryAbsent), wantStatus: 404},
 		{name: "wrapped proven absence", err: fmt.Errorf("file not found: %s: %w", "wanted.txt", fmt.Errorf("%w: wanted.txt", errDirEntryAbsent)), wantStatus: 404},
 		{name: "bare gocql not found on a referenced row", err: fmt.Errorf("commit not found: %w", gocql.ErrNotFound), wantStatus: 503},
+		// Retrying without a decrypt session can never succeed, so this must not
+		// join the retryable bucket; the zip path already answered 403.
+		{name: "encrypted library without a decrypt session", err: v2.ErrLibraryEncryptedNotUnlocked, wantStatus: 403},
+		{name: "wrapped encrypted library error", err: fmt.Errorf("lookup: %w", v2.ErrLibraryEncryptedNotUnlocked), wantStatus: 403},
 		{name: "corrupt listing", err: errors.New("directory abc: malformed directory listing"), wantStatus: 503},
 		{name: "cassandra timeout", err: errors.New("gocql: no response received from cassandra within timeout period"), wantStatus: 503},
 		{name: "block store unavailable", err: errors.New("block store not available"), wantStatus: 503},
@@ -272,4 +295,53 @@ func TestRespondSeafHTTPDownloadErrorDoesNotRewriteACommittedResponse(t *testing
 	if w.Code != 200 || w.Body.String() != "partial" {
 		t.Fatalf("committed response was rewritten: status=%d body=%q", w.Code, w.Body.String())
 	}
+}
+
+// The zip walk shares this parser. It previously used a map-based parse that kept
+// the last value of a repeated key and silently skipped entries without a name or
+// id, so a corrupt listing produced a 200 zip with wrong or missing content.
+func TestParseValidatedDirEntriesServesTheZipWalk(t *testing.T) {
+	t.Run("directory mode is recognised", func(t *testing.T) {
+		entries, err := parseValidatedDirEntries(fmt.Sprintf(
+			`[{"name":"sub","id":"%s","mode":16384},{"name":"f.txt","id":"%s","mode":33188}]`,
+			dirEntryIDA, dirEntryIDB))
+		if err != nil {
+			t.Fatalf("parseValidatedDirEntries() error = %v", err)
+		}
+		if len(entries) != 2 {
+			t.Fatalf("len(entries) = %d, want 2", len(entries))
+		}
+		if !entries[0].isDir() {
+			t.Fatal("entry with mode 16384 must be a directory")
+		}
+		if entries[1].isDir() {
+			t.Fatal("entry with mode 33188 must not be a directory")
+		}
+	})
+
+	t.Run("a repeated id key is rejected instead of resolving to the last value", func(t *testing.T) {
+		if _, err := parseValidatedDirEntries(fmt.Sprintf(
+			`[{"name":"f.txt","id":"%s","id":"%s"}]`, dirEntryIDA, dirEntryIDB)); err == nil {
+			t.Fatal("repeated id key must fail closed")
+		}
+	})
+
+	t.Run("an entry without an id is rejected instead of skipped", func(t *testing.T) {
+		if _, err := parseValidatedDirEntries(`[{"name":"f.txt"}]`); err == nil {
+			t.Fatal("entry without an id must fail closed, not be silently dropped")
+		}
+	})
+
+	t.Run("a blank listing is rejected instead of read as empty", func(t *testing.T) {
+		if _, err := parseValidatedDirEntries(""); err == nil {
+			t.Fatal("blank listing must fail closed, not look like an empty directory")
+		}
+	})
+
+	t.Run("a non-numeric mode is rejected", func(t *testing.T) {
+		if _, err := parseValidatedDirEntries(fmt.Sprintf(
+			`[{"name":"f.txt","id":"%s","mode":"16384"}]`, dirEntryIDA)); err == nil {
+			t.Fatal("non-numeric mode must fail closed")
+		}
+	})
 }

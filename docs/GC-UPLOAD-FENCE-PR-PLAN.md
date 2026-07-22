@@ -506,29 +506,42 @@ helper asserting that absence is *never* reported except for a well-formed listi
 with no match. Three separate audit rounds each found a new corrupt-listing shape
 that hand-written cases had missed; generated input is the way to stop that.
 
-**Current implementation (pending review):** `findDirEntryID` and `dirEntryNameAndID`
-in `internal/api/seafhttp.go` validate a listing by walking each entry's JSON tokens
+**Current implementation (pending review):** `parseValidatedDirEntries` in
+`internal/api/seafhttp.go` validates a listing by walking each entry's JSON tokens
 instead of unmarshalling into a map, so a repeated `id` or `name` key is rejected
-rather than silently resolved to its last value. Absence is reported only through
-`errDirEntryAbsent`, and only when every entry validated and none matched; a valid
-match is still returned when a *sibling* is corrupt, so one bad dirent cannot make a
-healthy file unreadable. `findEntryInDir` no longer turns a read failure into
-absence. `respondSeafHTTPDownloadError` is the single place that applies the contract
-— `errDirEntryAbsent` to 404, everything else to 503 with `Retry-After` — and it
-writes nothing once streaming has committed headers. `HandleDownload` lost its
-path-based fallback and `resolveLibraryObjectStore` was deleted with its only caller.
-The zip directory walk shares the same classifier, which previously answered 404 for
-any `findEntryInDir` failure.
+rather than silently resolved to its last value. Validation is **all-or-nothing**:
+any malformed entry fails the whole listing. A first revision returned a valid match
+when only a *sibling* was corrupt, so one bad dirent could not make a healthy file
+unreadable; review showed that exception serves the wrong FS object when the corrupt
+entry carries the requested name (or hides it behind a repeated `name` key), so the
+listing is ambiguous exactly where it matters. Absence is reported only through
+`errDirEntryAbsent`, and only when the whole listing validated and nothing matched.
+
+`findEntryInDir` no longer turns a read failure into absence.
+`respondSeafHTTPDownloadError` is the single place that applies the contract —
+`errDirEntryAbsent` to 404, `v2.ErrLibraryEncryptedNotUnlocked` to the app-wide
+403 `lib_need_decrypt`, everything else to 503 with `Retry-After` — and it writes
+nothing once streaming has committed headers. `HandleDownload` lost its path-based
+fallback and `resolveLibraryObjectStore` was deleted with its only caller.
+
+Both zip paths share the validated parser: the directory walk previously answered
+404 for any `findEntryInDir` failure, and `prepareZipDirectory` still parsed into a
+map — keeping the last value of a repeated key, silently skipping entries with no
+name or id, and reading a blank listing as an empty directory — so a corrupt listing
+could produce a `200` zip with wrong or missing content.
 
 Coverage: the corrupt-listing matrix routed through parse-and-match rather than the
-parser alone; a seeded generative property test asserting absence is never claimed
-for a listing that is unparseable, holds an invalid entry, or names the target; the
-classifier both ways, including that a bare `gocql.ErrNotFound` on a referenced row
-does **not** become 404; that a committed response is never rewritten; that a present
-path-based object is *not* served; and `TestDownloadFailClosedContract` in
-`internal/integration`, which drives the four end-to-end cases against real Cassandra
-through the production endpoint — present file, deleted file, dangling `fs_object`,
-and corrupt listing.
+parser alone, including a corrupt copy of the requested name in both orders; a seeded
+generative property test asserting absence is never claimed for a listing that is
+unparseable, holds an invalid entry, or names the target; the classifier all three
+ways, including that a bare `gocql.ErrNotFound` on a referenced row does **not**
+become 404 and that an encrypted-without-session download is 403 rather than a
+retryable 503; that a committed response is never rewritten; that a present
+path-based object is *not* served; the zip walk's use of the validated parser
+(directory mode, repeated `id`, missing `id`, blank listing, non-numeric mode); and
+`TestDownloadFailClosedContract` in `internal/integration`, which drives the four
+end-to-end cases against real Cassandra through the production endpoint — present
+file, deleted file, dangling `fs_object`, and corrupt listing.
 
 ---
 
