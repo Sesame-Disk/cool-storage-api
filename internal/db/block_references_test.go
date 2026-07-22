@@ -680,6 +680,106 @@ func TestEnsureBlockIdentity_DoesNotBackfillRepresentationWhenSHA1Conflicts(t *t
 	}
 }
 
+func TestUpsertBlockMetadataClassifiesPermanentFailures(t *testing.T) {
+	// Entry-level invariant violations never reach the driver: they are
+	// deterministically irrecoverable and must carry ErrBlockMetadataPermanent so
+	// the upload materialization wrapper refuses to retry them.
+	t.Run("empty storage class is permanent", func(t *testing.T) {
+		err := (&DB{}).UpsertBlockMetadata("org-1", "block-1", 1, "   ", "key")
+		if !errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
+		}
+	})
+	t.Run("invalid sha1 is permanent", func(t *testing.T) {
+		err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", "block-1", "not-a-sha1", 1, "hot", "key")
+		if !errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
+		}
+	})
+
+	oldRead := readBlockIdentityForRepairFn
+	t.Cleanup(func() { readBlockIdentityForRepairFn = oldRead })
+
+	t.Run("conflicting representation id is permanent", func(t *testing.T) {
+		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+			return completeIdentityRepairRow(EncryptedLibraryBlockRepresentationID("library-1"), strings.Repeat("a", 40)), true, nil
+		}
+		err := (&DB{}).ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("a", 40))
+		if !errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
+		}
+	})
+	t.Run("conflicting sha1 is permanent", func(t *testing.T) {
+		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+			return completeIdentityRepairRow("", strings.Repeat("d", 40)), true, nil
+		}
+		err := (&DB{}).ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("e", 40))
+		if !errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
+		}
+	})
+	t.Run("malformed GC ownership is permanent", func(t *testing.T) {
+		createdAt := time.Now().UTC()
+		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+			// Claim identity present without a lifecycle state == row corruption.
+			return blockIdentityRepairRow{
+				RepresentationID:    PlainBlockRepresentationID,
+				StorageClass:        "hot",
+				StorageClassPresent: true,
+				CreatedAt:           &createdAt,
+				GCClaimID:           "claim-1",
+			}, true, nil
+		}
+		err := (&DB{}).ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, "")
+		if !errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
+		}
+	})
+}
+
+func TestUpsertBlockMetadataLeavesTransientFailuresUnmarked(t *testing.T) {
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockIdentityForRepairFn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockIdentityForRepairFn = oldRead
+	})
+
+	t.Run("raw driver insert error is transient", func(t *testing.T) {
+		wantErr := errors.New("cassandra timeout")
+		upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
+			return false, wantErr
+		}
+		err := (&DB{}).UpsertBlockMetadata("org-1", "block-1", 1, "hot", "key")
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("error = %v, want wrapped %v", err, wantErr)
+		}
+		if errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("driver I/O error must not be classified permanent: %v", err)
+		}
+	})
+
+	t.Run("incomplete metadata from an active claim is transient", func(t *testing.T) {
+		claimedAt := time.Now().UTC()
+		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+			// An active GC delete claim (deleting) can converge on a re-probe, so
+			// the caller must retry rather than fail closed.
+			return blockIdentityRepairRow{
+				GCState:     BlockGCStateDeleting,
+				GCClaimID:   "claim-1",
+				GCClaimedAt: &claimedAt,
+			}, true, nil
+		}
+		err := (&DB{}).ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, "")
+		if err == nil {
+			t.Fatal("ensureBlockIdentity() error = nil, want incomplete metadata error")
+		}
+		if errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("incomplete-metadata (active claim) must not be permanent: %v", err)
+		}
+	})
+}
+
 func TestPromotePublishAttemptReferences_RetriesRegisterFailure(t *testing.T) {
 	oldAttempts := publishAttemptPromotionRetryAttempts
 	oldDelay := publishAttemptPromotionRetryDelay

@@ -2375,8 +2375,17 @@ func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error
 		attempts = 1
 	}
 
-	retryBlocked := func(attempt int) {
-		if resolveFence != nil {
+	// retryBlocked records the retry under a reason derived from the failing PHASE
+	// (never the sentinel), so a materialize-phase write failure is never
+	// attributed to the probe read path (finding F14). The reason labels match the
+	// generic v2 wrapper's; PR-5 folds this duplicate wrapper into that one.
+	retryBlocked := func(attempt int, phaseReason string, retryErr error) {
+		reason := phaseReason
+		if errors.Is(retryErr, v2.ErrBlockDeleteInProgress) {
+			reason = "gc_fence"
+		}
+		metrics.BlockUploadMaterializationRetriesTotal.WithLabelValues(label, reason).Inc()
+		if reason == "gc_fence" && resolveFence != nil {
 			resolved, resolveErr := resolveFence()
 			if resolveErr != nil {
 				log.Printf("[%s] failed to inspect S3 orphan fence for block %s: %v", label, blockID, resolveErr)
@@ -2385,7 +2394,7 @@ func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error
 			}
 		}
 		sleepFor := seafHTTPBlockMaterializationRetryBackoffFn(attempt)
-		log.Printf("[%s] block %s is fenced by GC delete during materialization; retrying (%d/%d) after %s", label, blockID, attempt, attempts, sleepFor)
+		log.Printf("[%s] block %s materialization retry reason=%s (%d/%d) after %s", label, blockID, reason, attempt, attempts, sleepFor)
 		if sleepFor > 0 {
 			seafHTTPBlockMaterializationSleepFn(sleepFor)
 		}
@@ -2393,17 +2402,17 @@ func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error
 
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := store(); err != nil {
-			if !errors.Is(err, v2.ErrBlockDeleteInProgress) || attempt == attempts {
+			if !v2.IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			retryBlocked(attempt)
+			retryBlocked(attempt, "probe", err)
 			continue
 		}
 		if err := materialize(); err != nil {
-			if !errors.Is(err, v2.ErrBlockDeleteInProgress) || attempt == attempts {
+			if !v2.IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			retryBlocked(attempt)
+			retryBlocked(attempt, "materialization", err)
 			continue
 		}
 		return nil

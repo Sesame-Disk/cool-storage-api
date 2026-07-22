@@ -459,6 +459,28 @@ var (
 		},
 		[]string{"reason"},
 	)
+
+	// BlockUploadMaterializationRetriesTotal counts bounded store->materialize
+	// retries taken by the upload funnels, by surface and reason. The reason is
+	// derived from the retry PHASE (which callback failed), never the sentinel:
+	//   "gc_fence"       — the block is fenced by a GC delete claim, in either phase.
+	//   "probe"          — a retryable failure in the STORE phase (probe/HEAD/repair/PUT).
+	//                      The shipped store callbacks return only a fence (counted as
+	//                      gc_fence) or non-retryable raw errors, so in practice this
+	//                      label is reached only if a store callback opts into the
+	//                      transient sentinel; it is NOT a claim that every store error
+	//                      is retried.
+	//   "materialization"— a retryable failure in the metadata materialize phase
+	//                      (RegisterUploadedBlock / mapping write).
+	// The invariant that matters for F14: a materialize-phase failure is ALWAYS
+	// "materialization", never "probe" — a metadata write is never counted as a probe.
+	BlockUploadMaterializationRetriesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "block_upload_materialization_retries_total",
+			Help: "Total bounded block upload store->materialize retries by surface and reason.",
+		},
+		[]string{"surface", "reason"},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -509,5 +531,6 @@ func Register() {
 		BlockUploadStagedBlocksTotal,
 		BlockUploadConcurrencyRejectionsTotal,
 		BlockUploadSessionAdmissionRejectionsTotal,
+		BlockUploadMaterializationRetriesTotal,
 	)
 }

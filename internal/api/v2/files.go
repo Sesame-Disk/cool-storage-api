@@ -198,12 +198,20 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 		attempts = 1
 	}
 
-	retryBlocked := func(attempt int) {
+	// reason is derived from the failing PHASE (never the sentinel), matching the
+	// generic wrapper so a register-phase write failure is not mislabeled as a
+	// probe read (finding F14). PR-5 folds this duplicate wrapper into the generic one.
+	retryBlocked := func(attempt int, phaseReason string, retryErr error) {
 		if resetStored != nil {
 			resetStored()
 		}
+		reason := phaseReason
+		if errors.Is(retryErr, ErrBlockDeleteInProgress) {
+			reason = blockMaterializationReasonFence
+		}
+		metrics.BlockUploadMaterializationRetriesTotal.WithLabelValues("CreateFile", reason).Inc()
 		sleepFor := createFileTemplateBlockRetryBackoffFn(attempt)
-		log.Printf("[CreateFile] template block registration fenced by GC; retrying (%d/%d) after %s", attempt, attempts, sleepFor)
+		log.Printf("[CreateFile] template block materialization retry reason=%s (%d/%d) after %s", reason, attempt, attempts, sleepFor)
 		if sleepFor > 0 {
 			createFileTemplateBlockSleepFn(sleepFor)
 		}
@@ -211,17 +219,17 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := store(); err != nil {
-			if !errors.Is(err, ErrBlockDeleteInProgress) || attempt == attempts {
+			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			retryBlocked(attempt)
+			retryBlocked(attempt, blockMaterializationReasonProbe, err)
 			continue
 		}
 		if err := register(); err != nil {
-			if !errors.Is(err, ErrBlockDeleteInProgress) || attempt == attempts {
+			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			retryBlocked(attempt)
+			retryBlocked(attempt, blockMaterializationReasonMaterial, err)
 			continue
 		}
 		return nil
@@ -3429,7 +3437,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
 	}
-	if err := RetryUploadedBlockMaterialization("UploadFile", sha256ID, func() error {
+	if err := RetryUploadedBlockMaterializationContext(c.Request.Context(), "UploadFile", sha256ID, func() error {
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, sha256ID)
 		if probeErr != nil {
 			return fmt.Errorf("probe block reuse for %s: %w", sha256ID, probeErr)

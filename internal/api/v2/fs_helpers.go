@@ -97,19 +97,20 @@ var registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, bl
 	return h.db.UpsertProvisionalBlockReferenceExpiry(orgID, blockID, referrer, storageClass, expiresAt)
 }
 
-var registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
-	return h.ReleaseUploadReferences(orgID, libraryID, operationID, blockIDs)
-}
-
 var releaseUploadReferenceDeleteExpiryFn = func(h *FSHelper, orgID, blockID, referrer string) error {
 	return h.db.DeleteProvisionalBlockReferenceExpiry(orgID, blockID, referrer, time.Time{})
 }
 
-var registerUploadedBlockRetryAttemptsFn = RetryAttempts
-
-var registerUploadedBlockRetryBackoffFn = RetryBackoff
-
-var registerUploadedBlockSleepFn = time.Sleep
+// registerUploadedBlockReleaseRefsFn / registerUploadedBlockEnqueueZeroRefFn roll
+// back a provisional reference whose expiry projection could not be written. The
+// reference and its expiry projection must land together — a reference without a
+// projection is invisible to GC Phase 0 and would leak (F10). When the projection
+// write fails we therefore release the reference and enqueue any now-zero-ref
+// block for GC, rather than leaving the orphan behind. (The atomic
+// reference+projection write is F10's full fix, in PR-8.)
+var registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
+	return h.ReleaseUploadReferences(orgID, libraryID, operationID, blockIDs)
+}
 
 var registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string, storageClass string) {
 	if len(blockIDs) == 0 {
@@ -119,6 +120,11 @@ var registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string
 		blockEnqueuer.EnqueueBlocks(orgID, blockIDs, storageClass)
 	}
 }
+
+// registerUploadedBlockSleepFn is the overridable backoff sleep used by the
+// non-cancellable store->materialize retry path (see upload_reuse.go). Tests
+// swap it to avoid real sleeps.
+var registerUploadedBlockSleepFn = time.Sleep
 
 var registerFSObjectBlockReferencesFSObjectExistsFn = func(h *FSHelper, libraryID, fsID string) (bool, error) {
 	return h.fsObjectExists(libraryID, fsID)
@@ -976,62 +982,68 @@ func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []str
 // blockID must already be the internal (SHA-256) ID. operationID must identify
 // the specific upload/session/rollback flow that owns the provisional ref so a
 // rollback only removes its own pin. The reference is written BEFORE the
-// metadata read so that a concurrent GC claim-then-verify observes it. If the
-// GC worker has already claimed the block for deletion, the same provisional
-// ref is kept in place while the helper retries the fence. This lets the GC
-// worker observe the ref and abandon the delete without dropping liveness for
-// the current operation. Only if the fence never clears inside the bounded
-// retry budget do we roll back our own provisional ref and re-enqueue any
-// newly-zero-ref block for GC before returning a retryable error.
+// metadata read so that a concurrent GC claim-then-verify observes it.
+//
+// This helper does NOT wait out a GC delete fence. It reads the fence exactly
+// once and, when it is active, returns the retryable ErrBlockDeleteInProgress
+// immediately, leaving the provisional reference in place: the GC worker
+// observes that reference and abandons the delete, and the outer
+// store->materialize wrapper repeats the WHOLE cycle — re-PUTting the object
+// after the fence clears. Absorbing the fence here (the old inner wait) is the
+// F1 data-loss bug: GC could delete the physical object in the window while
+// this helper still reported success, leaving metadata that points at nothing.
+// No rollback is done on the fenced return; the provisional reference's TTL
+// bounds any genuinely abandoned upload.
+//
+// Cassandra I/O in this helper is transient and tagged ErrBlockMaterializationTransient
+// so the wrapper retries it inside its bounded budget instead of failing on the
+// first timeout — EXCEPT the provisional-expiry write: a reference already exists
+// at that point, so on its failure we roll the reference back (release + enqueue)
+// and fail closed rather than leave a reference with no GC-discovery projection
+// (F10). A permanent metadata failure (db.ErrBlockMetadataPermanent) is returned
+// untagged so it is not retried.
 func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
 	referrer := db.BlockReferrerForUpload(operationID)
 	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
 
 	if err := registerUploadedBlockAddReferenceFn(h, orgID, blockID, referrer, libraryID, db.ProvisionalBlockReferenceTTLSeconds); err != nil {
-		return fmt.Errorf("add provisional block reference for %s: %w", blockID, err)
+		// Nothing durable was written yet; a plain transient retry re-adds it.
+		return fmt.Errorf("%w: add provisional block reference for %s: %w", ErrBlockMaterializationTransient, blockID, err)
 	}
 	if err := registerUploadedBlockUpsertProvisionalExpiryFn(h, orgID, blockID, referrer, storageClass, expiresAt); err != nil {
+		// The reference landed but its expiry projection did not: release the
+		// reference so GC does not lose track of the (now unpinned) block, then
+		// fail closed. Not retried, because a wrapper retry would re-add the
+		// reference and could hit the same split write again.
 		zeroRefBlocks := registerUploadedBlockReleaseRefsFn(h, orgID, libraryID, operationID, []string{blockID})
 		registerUploadedBlockEnqueueZeroRefFn(orgID, zeroRefBlocks, storageClass)
 		return fmt.Errorf("record provisional block expiry for %s: %w", blockID, err)
 	}
 
-	attempts := registerUploadedBlockRetryAttemptsFn()
-	if attempts < 1 {
-		attempts = 1
+	deleteFenceActive, err := registerUploadedBlockFenceActiveFn(h, orgID, blockID)
+	if err != nil {
+		return fmt.Errorf("%w: read block delete fence for %s: %w", ErrBlockMaterializationTransient, blockID, err)
+	}
+	if deleteFenceActive {
+		return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
 	}
 
-	for attempt := 1; attempt <= attempts; attempt++ {
-		deleteFenceActive, err := registerUploadedBlockFenceActiveFn(h, orgID, blockID)
-		if err != nil {
-			return fmt.Errorf("read block delete fence for %s: %w", blockID, err)
-		}
-		if !deleteFenceActive {
-			if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
-				// A contended stub repair is a transient race (concurrent completion or
-				// a reappeared GC orphan fence), not a permanent failure. Surface it as
-				// the retryable GC-fence signal so the materialization wrapper re-probes.
-				if errors.Is(err, db.ErrBlockStubRepairContended) {
-					return fmt.Errorf("%w: block %s stub repair lost a race", ErrBlockDeleteInProgress, blockID)
-				}
-				return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
-			}
-			return nil
-		}
-		if attempt == attempts {
-			zeroRefBlocks := registerUploadedBlockReleaseRefsFn(h, orgID, libraryID, operationID, []string{blockID})
-			registerUploadedBlockEnqueueZeroRefFn(orgID, zeroRefBlocks, storageClass)
-			return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
-		}
-
-		sleepFor := registerUploadedBlockRetryBackoffFn(attempt)
-		log.Printf("[RegisterUploadedBlock] block %s is fenced by GC delete; retrying (%d/%d) after %s", blockID, attempt, attempts, sleepFor)
-		if sleepFor > 0 {
-			registerUploadedBlockSleepFn(sleepFor)
+	if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
+		switch {
+		case errors.Is(err, db.ErrBlockStubRepairContended):
+			// A contended stub repair is a transient race (concurrent completion or a
+			// reappeared GC orphan fence): surface the retryable GC-fence signal so the
+			// materialization wrapper re-probes.
+			return fmt.Errorf("%w: block %s stub repair lost a race", ErrBlockDeleteInProgress, blockID)
+		case errors.Is(err, db.ErrBlockMetadataPermanent):
+			// Deterministically irrecoverable (invariant/identity violation): return
+			// as-is so the wrapper does NOT retry it.
+			return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
+		default:
+			return fmt.Errorf("%w: upsert block metadata for %s: %w", ErrBlockMaterializationTransient, blockID, err)
 		}
 	}
-
-	return fmt.Errorf("%w: exhausted upload block registration retry budget for block %s", ErrBlockDeleteInProgress, blockID)
+	return nil
 }
 
 // RegisterFSObjectBlockReferences creates the permanent reference rows for every

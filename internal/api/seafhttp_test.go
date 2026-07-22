@@ -678,6 +678,85 @@ func TestRetrySeafHTTPBlockMaterialization_RetriesStoreFence(t *testing.T) {
 	}
 }
 
+// TestRetrySeafHTTPBlockMaterialization_LabelsReasonByPhase pins finding F14 for
+// the SeafHTTP wrapper: a materialize-phase transient is labeled "materialization"
+// (never "probe"), a store-phase transient is "probe", and a fence is "gc_fence".
+func TestRetrySeafHTTPBlockMaterialization_LabelsReasonByPhase(t *testing.T) {
+	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
+	oldSleep := seafHTTPBlockMaterializationSleepFn
+	t.Cleanup(func() {
+		seafHTTPBlockMaterializationRetryBackoffFn = oldBackoff
+		seafHTTPBlockMaterializationSleepFn = oldSleep
+	})
+	seafHTTPBlockMaterializationRetryBackoffFn = func(int) time.Duration { return 0 }
+	seafHTTPBlockMaterializationSleepFn = func(time.Duration) {}
+
+	reasonCount := func(surface, reason string) float64 {
+		return testutil.ToFloat64(metrics.BlockUploadMaterializationRetriesTotal.WithLabelValues(surface, reason))
+	}
+
+	t.Run("materialize-phase transient is materialization", func(t *testing.T) {
+		const surface = "TestSeafHTTPReasonMaterialize"
+		beforeMat := reasonCount(surface, "materialization")
+		beforeProbe := reasonCount(surface, "probe")
+		calls := 0
+		err := retrySeafHTTPBlockMaterialization(surface, "block-1", func() error { return nil }, func() error {
+			calls++
+			if calls == 1 {
+				return fmt.Errorf("metadata write: %w", v2.ErrBlockMaterializationTransient)
+			}
+			return nil
+		}, nil)
+		if err != nil {
+			t.Fatalf("error = %v, want nil", err)
+		}
+		if got := reasonCount(surface, "materialization") - beforeMat; got != 1 {
+			t.Fatalf("materialization retries = %v, want 1", got)
+		}
+		if got := reasonCount(surface, "probe") - beforeProbe; got != 0 {
+			t.Fatalf("probe retries = %v, want 0 (write must not be labeled as read)", got)
+		}
+	})
+
+	t.Run("store-phase transient is probe", func(t *testing.T) {
+		const surface = "TestSeafHTTPReasonProbe"
+		before := reasonCount(surface, "probe")
+		calls := 0
+		err := retrySeafHTTPBlockMaterialization(surface, "block-1", func() error {
+			calls++
+			if calls == 1 {
+				return fmt.Errorf("probe read: %w", v2.ErrBlockMaterializationTransient)
+			}
+			return nil
+		}, func() error { return nil }, nil)
+		if err != nil {
+			t.Fatalf("error = %v, want nil", err)
+		}
+		if got := reasonCount(surface, "probe") - before; got != 1 {
+			t.Fatalf("probe retries = %v, want 1", got)
+		}
+	})
+
+	t.Run("fence is gc_fence", func(t *testing.T) {
+		const surface = "TestSeafHTTPReasonFence"
+		before := reasonCount(surface, "gc_fence")
+		calls := 0
+		err := retrySeafHTTPBlockMaterialization(surface, "block-1", func() error { return nil }, func() error {
+			calls++
+			if calls == 1 {
+				return v2.ErrBlockDeleteInProgress
+			}
+			return nil
+		}, nil)
+		if err != nil {
+			t.Fatalf("error = %v, want nil", err)
+		}
+		if got := reasonCount(surface, "gc_fence") - before; got != 1 {
+			t.Fatalf("gc_fence retries = %v, want 1", got)
+		}
+	})
+}
+
 func TestRetrySeafHTTPBlockMaterialization_StopsOnNonRetryableError(t *testing.T) {
 	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
 	oldSleep := seafHTTPBlockMaterializationSleepFn

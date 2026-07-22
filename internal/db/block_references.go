@@ -57,6 +57,17 @@ var ErrBlockIDMappingConflict = errors.New("block id mapping conflict")
 // hard error. Upload funnels translate it into their retryable GC-fence signal.
 var ErrBlockStubRepairContended = errors.New("block stub repair contended")
 
+// ErrBlockMetadataPermanent marks a metadata-write failure that is
+// deterministically irrecoverable — an invalid argument (missing storage class,
+// malformed sha1/representation id), a conflicting first-writer identity, or a
+// corrupt row. Retrying only burns the caller's bounded budget, so the upload
+// materialization wrapper must NOT retry it. Everything left unmarked (raw
+// Cassandra driver I/O, lost CAS races, transient stub/fence states) is treated
+// as transient and retried. Keeping the permanent set small is the safe bias: a
+// transient mislabeled permanent fails a recoverable upload, while a permanent
+// mislabeled transient only wastes a bounded budget before failing.
+var ErrBlockMetadataPermanent = errors.New("block metadata write is permanently failed")
+
 type BlockReuseDecision int
 
 const (
@@ -539,15 +550,15 @@ func (db *DB) UpsertBlockMetadataWithSHA1(orgID, blockID, sha1 string, sizeBytes
 
 func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string) error {
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrBlockMetadataPermanent, err)
 	}
 	storageClass = strings.TrimSpace(storageClass)
 	if storageClass == "" {
-		return fmt.Errorf("missing canonical storage class for block %s", blockID)
+		return fmt.Errorf("%w: missing canonical storage class for block %s", ErrBlockMetadataPermanent, blockID)
 	}
 	sha1 = NormalizeBlockID(sha1)
 	if sha1 != "" && !isHexN(sha1, 40) {
-		return fmt.Errorf("invalid block sha1 for %s", blockID)
+		return fmt.Errorf("%w: invalid block sha1 for %s", ErrBlockMetadataPermanent, blockID)
 	}
 	now := time.Now().UTC()
 	insert := func() (bool, error) {
@@ -608,19 +619,25 @@ func (db *DB) ensureBlockIdentity(orgID, blockID, representationID, sha1 string)
 func (db *DB) ensureBlockIdentityRow(orgID, blockID, representationID, sha1 string, row blockIdentityRepairRow) error {
 	activeClaim, repairClaim, ownershipErr := classifyBlockClaimOwnership(row.GCState, row.GCClaimID, row.GCClaimedAt)
 	if ownershipErr != nil {
-		return fmt.Errorf("block %s has malformed GC ownership: %w", blockID, ownershipErr)
+		// A malformed lifecycle/ownership combination is row corruption, not a
+		// transient mid-write state (LWTs mutate the row atomically). Fail closed
+		// rather than retry into the same corrupt row or mask it.
+		return fmt.Errorf("%w: block %s has malformed GC ownership: %w", ErrBlockMetadataPermanent, blockID, ownershipErr)
 	}
 	if activeClaim || repairClaim || row.CreatedAt == nil || !row.StorageClassPresent || strings.TrimSpace(row.StorageClass) == "" {
+		// Deliberately transient (unmarked): an active/repair claim or a still-stub
+		// row can converge on a re-probe (GC abandons, or a concurrent uploader
+		// completes it), so the caller retries instead of failing the upload.
 		return fmt.Errorf("block %s has incomplete canonical metadata", blockID)
 	}
 
 	currentRepresentationID := strings.TrimSpace(row.RepresentationID)
 	currentSHA1 := strings.TrimSpace(row.Sha1)
 	if currentRepresentationID != "" && currentRepresentationID != representationID {
-		return fmt.Errorf("block %s already has conflicting representation id %s", blockID, currentRepresentationID)
+		return fmt.Errorf("%w: block %s already has conflicting representation id %s", ErrBlockMetadataPermanent, blockID, currentRepresentationID)
 	}
 	if sha1 != "" && currentSHA1 != "" && currentSHA1 != sha1 {
-		return fmt.Errorf("block %s already has conflicting sha1 %s", blockID, currentSHA1)
+		return fmt.Errorf("%w: block %s already has conflicting sha1 %s", ErrBlockMetadataPermanent, blockID, currentSHA1)
 	}
 	if currentRepresentationID == "" {
 		applied, err := backfillBlockRepresentationIDFn(db, orgID, blockID, representationID, currentRepresentationID)

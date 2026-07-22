@@ -3,8 +3,11 @@
 **Date:** 2026-07-21
 **Research branch:** `docs/gc-upload-fence-rematerialization` — **not for merge**
 **Status:** PR-1 merged as [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
-PR-2 is implemented and verified on `fix/gc-claim-stub-lifecycle`, pending review
-and merge. F2/X7 remain open on `main` until that merge.
+PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138) (closed F2/X7).
+PR-3 is implemented and verified on `fix/gc-store-materialize-retry-contract`, pending
+review and merge; it closes F6 and F14 and the **observed-fence half** of F1 — the F1
+fast-clear window (a full GC cycle completing between the single fence read and publish)
+stays with PR-5.
 
 ## Why this document exists
 
@@ -247,9 +250,76 @@ behaviour change, not as dormant plumbing.
 
 **Acceptance:** the sentinel is produced by the production helper, not only injected
 in tests; a permanent metadata failure is not retried; retry reasons are
-`gc_fence` / `probe` / `materialization` and never mislabel a write as a read; and
-the six already-wired funnels are exercised under a fence to confirm the new repeat
-behaviour is what we want.
+`gc_fence` / `probe` / `materialization` and never label a materialize-phase write as
+`probe`; and each of the three retry wrappers is exercised under a fence to confirm
+the repeat behaviour shared by the six wired funnels. Full six-call-site coverage and
+the deterministic fast-clear regression remain PR-5 acceptance.
+
+**Implementation notes (as landed):**
+
+- `RegisterUploadedBlock` is now linear: it reads the delete fence **once** and
+  returns `ErrBlockDeleteInProgress` immediately on an active fence, leaving the
+  provisional reference in place. The old inner wait loop is gone; the outer wrapper
+  owns retrying and re-PUTs the object on the next store pass. This closes the
+  **observed-fence half** of F1 — the store→materialize contract now re-PUTs whenever
+  the fence is seen. It does **not** close the F1 fast-clear window where a full GC
+  cycle completes before that single fence read (the fence is never observed); that is
+  PR-5's deterministic real-worker regression. Destructive GC stays disabled meanwhile.
+- Cassandra I/O in the helper (and the mapping write in
+  `RegisterUploadedBlockAndMapping`) is tagged `v2.ErrBlockMaterializationTransient`
+  with the cause preserved via `%w`; `db.ErrBlockMetadataPermanent` (empty class,
+  malformed sha1, conflicting representation/sha1, corrupt GC ownership) is returned
+  untagged and not retried. Default bias is transient — only deterministically
+  irrecoverable failures are permanent. This closes F6. **Exception:** the
+  provisional-expiry write fails closed — on its failure the helper releases the
+  reference and enqueues it rather than leaving a reference with no GC-discovery
+  projection (the F10 interim guard); it is not retried because a retry would re-add
+  the reference into the same split write.
+- The retry metric `block_upload_materialization_retries_total{surface,reason}` is
+  emitted by all three retry wrappers — the generic `RetryUploadedBlockMaterialization`,
+  the SeafHTTP `retrySeafHTTPBlockMaterialization`, and the template-CreateFile
+  `retryCreateFileTemplateBlockMaterialization`. The reason is derived from the failing
+  **phase** (store→`probe`, materialize→`materialization`), overridden to `gc_fence`
+  only when the block is fenced — so a materialize-phase metadata write is never
+  labeled `probe`. This closes F14. Note `probe` denotes the store phase (probe/HEAD/
+  PUT), not a "read side", and is reached only if a store callback opts into the
+  transient sentinel; the shipped store callbacks return only a fence or a
+  non-retryable raw error, so store-phase retries are otherwise `gc_fence`. All three
+  wrappers also retry on the transient sentinel and re-PUT on a fence. Structurally
+  collapsing the three wrappers into one stays with PR-5.
+- Added the cancellable `RetryUploadedBlockMaterializationContext`. Only the three
+  funnels that use the **generic** wrapper are wired to it — UploadFile
+  (`c.Request.Context()`), sync PutBlock (`c.Request.Context()`) and OnlyOffice (its
+  `ctx` arg) — so an aborted request there stops the retry backoff instead of burning
+  the budget. The two bespoke wrappers (SeafHTTP and template-CreateFile) keep their
+  own non-cancellable backoff; giving them a cancellable context is part of PR-5's
+  wrapper normalisation, not PR-3. The worst case they carry is a bounded ~2s of
+  backoff sleep on an already-aborted request, not a correctness gap.
+- **Test coverage note:** the retry behaviour is verified at the level of the three
+  retry wrappers (generic, SeafHTTP, template), which is the shared mechanism the six
+  funnels drive, plus the linear-helper (`RegisterUploadedBlock`) and mapping unit
+  tests. It does **not** yet drive all six production call sites under a live fence.
+  The full six-call-site + deterministic fast-clear regression (real GC worker paused
+  at its post-claim liveness read) is **PR-5's** acceptance; PR-3 lands the mechanism
+  and its wrapper/helper-level proofs.
+
+Verification completed 2026-07-21 (local, Windows dev box has no gcc so no `-race`
+locally; `-race` + integration run in Docker per the verification debt below):
+
+```bash
+go build ./...
+go vet ./internal/api/... ./internal/db/... ./internal/metrics/...
+go test ./internal/api/... ./internal/db/... ./internal/metrics/...
+go vet -tags=integration ./...
+docker compose --profile test run --rm --build gotest go test -race -count=1 ./internal/db ./internal/gc ./internal/api/...
+docker compose --profile test run --rm --build go-integration-test
+```
+
+Known pre-existing flake (not in PR-3's diff): a wider `-race ./internal/api/...` run
+can intermittently trip `TestAcquireSeafHTTPDistributedUploadFinalizeLeaseRenewsWhileHeld`
+(a distributed-lease renewal test, unrelated to the retry contract); an isolated rerun
+passes. It predates PR-3 and is tracked separately; do not read PR-3's `-race` result as
+covering it.
 
 ---
 

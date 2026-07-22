@@ -952,7 +952,7 @@ This is fixed for the *server-side hot upload paths*, not across the whole repo:
 #### Why skipping the legacy PUT is safe
 
 GC-race safety derives from the *reference-first, then fence-check* protocol in
-`FSHelper.RegisterUploadedBlock` (`fs_helpers.go:1006–1034`) versus GC's
+`FSHelper.RegisterUploadedBlock` (`fs_helpers.go`) versus GC's
 *claim-then-verify-references* in `worker.go:processBlock` (L410–443) — a
 Dekker-style mutual flagging — not from the S3 PUT. The `gc_s3_orphans` fence is
 written before the S3 `DeleteObject`, so probes can observe the normal in-flight
@@ -962,10 +962,22 @@ cannot revoke it. Only never-reused generational physical keys close that ABA. T
 canonical verify/repair on the reuse path is an additional check, not permission to
 enable destructive GC.
 
-The materialization retry loop (`retrySeafHTTPBlockMaterialization` and
-`v2.RetryUploadedBlockMaterialization`) now also retries when the `store` phase
-returns `ErrBlockDeleteInProgress`, since a probe can reject a block before any S3
-work begins.
+The materialization retry loop (`retrySeafHTTPBlockMaterialization`,
+`v2.RetryUploadedBlockMaterialization` and the template-CreateFile wrapper) retries on
+a GC delete fence (`ErrBlockDeleteInProgress`) in **either** phase, and on a transient
+failure that is **tagged** `v2.ErrBlockMaterializationTransient`. Only the materialize
+phase tags transients today — `RegisterUploadedBlock`'s Cassandra I/O and the mapping
+write — so a store-phase retry is otherwise fence-only (the shipped store callbacks
+return a fence or a non-retryable raw probe/PUT error). As of PR-3,
+`RegisterUploadedBlock` no longer waits out the fence internally: it reads the fence
+once and propagates `ErrBlockDeleteInProgress`, so the wrapper repeats store→materialize
+and **re-PUTs the object** when the fence is observed (closing the observed-fence half
+of F1; the fast-clear window where the fence is never seen stays with PR-5). A permanent
+metadata failure (`db.ErrBlockMetadataPermanent`) is returned untagged and not retried;
+the provisional-expiry write fails closed with a rollback (F10 guard). The retry metric
+`block_upload_materialization_retries_total{surface,reason}` labels the reason by the
+failing phase (`probe` = store phase, `materialization` = metadata materialize phase,
+`gc_fence`), so a metadata-write failure is never labeled `probe`.
 
 #### Caveats
 

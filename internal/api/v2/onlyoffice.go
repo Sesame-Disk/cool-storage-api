@@ -1208,7 +1208,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	}
 
 	var storageKey string
-	if err := RetryUploadedBlockMaterialization("OnlyOffice", internalBlockID, func() error {
+	if err := RetryUploadedBlockMaterializationContext(ctx, "OnlyOffice", internalBlockID, func() error {
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, internalBlockID)
 		if probeErr != nil {
 			return fmt.Errorf("probe block reuse for %s: %w", internalBlockID, probeErr)

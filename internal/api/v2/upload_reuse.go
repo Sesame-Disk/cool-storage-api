@@ -6,9 +6,39 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+)
+
+// ErrBlockMaterializationTransient marks a retryable transient failure surfaced
+// from the store or materialize phase — a Cassandra/S3 I/O error, a lost CAS
+// race, or a still-converging stub/fence row. The store->materialize wrapper
+// retries it inside its bounded budget instead of failing the upload on the
+// first timeout. Permanent metadata failures (db.ErrBlockMetadataPermanent) are
+// deliberately NOT wrapped with it, so they are not retried.
+var ErrBlockMaterializationTransient = errors.New("block materialization transient failure")
+
+// IsRetryableBlockMaterializationError reports whether the store->materialize
+// wrapper should retry err: a GC delete fence (ErrBlockDeleteInProgress) or a
+// tagged transient I/O failure (ErrBlockMaterializationTransient). Anything else —
+// including a permanent metadata failure and any untagged raw error — is returned
+// to the caller as-is. Note the store callbacks tag only their fence result; their
+// raw probe/HEAD/PUT errors are NOT transient-tagged, so a store-phase transient
+// retry (reason "probe") only occurs if a callback explicitly opts into it.
+func IsRetryableBlockMaterializationError(err error) bool {
+	return errors.Is(err, ErrBlockDeleteInProgress) || errors.Is(err, ErrBlockMaterializationTransient)
+}
+
+// Retry reasons for BlockUploadMaterializationRetriesTotal. The reason is chosen
+// by the PHASE that failed (which callback returned it), never the sentinel, so a
+// materialize-phase metadata write is never labeled "probe" (finding F14).
+const (
+	blockMaterializationReasonFence    = "gc_fence"
+	blockMaterializationReasonProbe    = "probe"          // store phase (probe/HEAD/PUT)
+	blockMaterializationReasonMaterial = "materialization" // metadata materialize phase
 )
 
 var probeUploadedBlockReuseFn = ProbeUploadedBlockReuse
@@ -115,10 +145,24 @@ func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.Bl
 }
 
 // RetryUploadedBlockMaterialization retries the full store->materialize cycle
-// when GC temporarily fences the block. The retryable sentinel can now surface
-// from either phase because Cassandra-first probes may reject a PUT before S3
-// work starts.
+// when GC temporarily fences the block or a transient I/O failure interrupts
+// either phase. The retryable sentinel can surface from either phase because
+// Cassandra-first probes may reject a PUT before S3 work starts, and the
+// materialize helper now propagates the fence instead of absorbing it (F1), so
+// a fence during materialize repeats the store phase and re-PUTs the object.
 func RetryUploadedBlockMaterialization(label, blockID string, store func() error, materialize func() error, onRetry func(), resolveFence func() (bool, error)) error {
+	return retryUploadedBlockMaterialization(nil, label, blockID, store, materialize, onRetry, resolveFence)
+}
+
+// RetryUploadedBlockMaterializationContext is the request-cancellable variant
+// used by production handlers. The context aborts only the retry backoff wait;
+// the store and materialize callbacks remain responsible for propagating it to
+// their own I/O.
+func RetryUploadedBlockMaterializationContext(ctx context.Context, label, blockID string, store func() error, materialize func() error, onRetry func(), resolveFence func() (bool, error)) error {
+	return retryUploadedBlockMaterialization(ctx, label, blockID, store, materialize, onRetry, resolveFence)
+}
+
+func retryUploadedBlockMaterialization(ctx context.Context, label, blockID string, store func() error, materialize func() error, onRetry func(), resolveFence func() (bool, error)) error {
 	attempts := RetryAttempts()
 	if attempts < 1 {
 		attempts = 1
@@ -129,11 +173,20 @@ func RetryUploadedBlockMaterialization(label, blockID string, store func() error
 		blockSuffix = fmt.Sprintf(" for block %s", blockID)
 	}
 
-	retryBlocked := func(attempt int) error {
+	// retryBlocked records the retry under a reason derived from the failing
+	// PHASE (phaseReason), overridden to gc_fence only when the block is fenced.
+	// It returns a non-nil error only when the backoff wait must abort the whole
+	// operation (context cancelled).
+	retryBlocked := func(attempt int, phaseReason string, retryErr error) error {
 		if onRetry != nil {
 			onRetry()
 		}
-		if resolveFence != nil {
+		reason := phaseReason
+		if errors.Is(retryErr, ErrBlockDeleteInProgress) {
+			reason = blockMaterializationReasonFence
+		}
+		metrics.BlockUploadMaterializationRetriesTotal.WithLabelValues(label, reason).Inc()
+		if reason == blockMaterializationReasonFence && resolveFence != nil {
 			resolved, resolveErr := resolveFence()
 			if resolveErr != nil {
 				log.Printf("[%s] failed to inspect S3 orphan fence%s: %v", label, blockSuffix, resolveErr)
@@ -142,29 +195,26 @@ func RetryUploadedBlockMaterialization(label, blockID string, store func() error
 			}
 		}
 		sleepFor := RetryBackoff(attempt)
-		log.Printf("[%s] block materialization fenced by GC%s; retrying (%d/%d) after %s", label, blockSuffix, attempt, attempts, sleepFor)
-		if sleepFor > 0 {
-			registerUploadedBlockSleepFn(sleepFor)
-		}
-		return nil
+		log.Printf("[%s] block materialization retry%s reason=%s (%d/%d) after %s", label, blockSuffix, reason, attempt, attempts, sleepFor)
+		return waitBeforeBlockMaterializationRetry(ctx, sleepFor)
 	}
 
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := store(); err != nil {
-			if !errors.Is(err, ErrBlockDeleteInProgress) || attempt == attempts {
+			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			if retryErr := retryBlocked(attempt); retryErr != nil {
-				return retryErr
+			if abortErr := retryBlocked(attempt, blockMaterializationReasonProbe, err); abortErr != nil {
+				return abortErr
 			}
 			continue
 		}
 		if err := materialize(); err != nil {
-			if !errors.Is(err, ErrBlockDeleteInProgress) || attempt == attempts {
+			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			if retryErr := retryBlocked(attempt); retryErr != nil {
-				return retryErr
+			if abortErr := retryBlocked(attempt, blockMaterializationReasonMaterial, err); abortErr != nil {
+				return abortErr
 			}
 			continue
 		}
@@ -172,4 +222,31 @@ func RetryUploadedBlockMaterialization(label, blockID string, store func() error
 	}
 
 	return fmt.Errorf("%w%s", ErrBlockDeleteInProgress, blockSuffix)
+}
+
+// waitBeforeBlockMaterializationRetry sleeps sleepFor before the next attempt.
+// With a non-nil context the wait is cancellable (an aborted request stops
+// retrying instead of burning the full budget); without one it uses the
+// overridable sleep hook so tests stay fast.
+func waitBeforeBlockMaterializationRetry(ctx context.Context, sleepFor time.Duration) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if sleepFor <= 0 {
+		return nil
+	}
+	if ctx == nil {
+		registerUploadedBlockSleepFn(sleepFor)
+		return nil
+	}
+	timer := time.NewTimer(sleepFor)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

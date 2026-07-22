@@ -70,6 +70,12 @@ func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID, operationID strin
 // writing the optional external SHA-1 mapping. If the mapping write fails, the
 // provisional reference is rolled back so retries can restart from a clean
 // state instead of leaving a registered block without a usable mapping.
+//
+// A transient mapping-write failure (Cassandra I/O) is tagged
+// ErrBlockMaterializationTransient — with the cause preserved via %w — so the
+// store->materialize wrapper retries the whole cycle (re-register + re-map are
+// idempotent) instead of failing the upload on the first timeout (F6). A
+// permanent id-mapping conflict is not tagged and not retried.
 func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
 	if err := registerUploadedBlockForMaterializationFn(database, orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, externalBlockID); err != nil {
 		return err
@@ -79,7 +85,10 @@ func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlo
 	}
 	if err := writeBlockMappingForMaterializationFn(database, orgID, repoID, externalBlockID, internalBlockID); err != nil {
 		rollbackUploadedBlockRefsFn(database, orgID, repoID, operationID, []string{internalBlockID})
-		return fmt.Errorf("%w: %v", ErrBlockMappingWriteFailed, err)
+		if errors.Is(err, db.ErrBlockIDMappingConflict) {
+			return fmt.Errorf("%w: %w", ErrBlockMappingWriteFailed, err)
+		}
+		return fmt.Errorf("%w: %w: %w", ErrBlockMaterializationTransient, ErrBlockMappingWriteFailed, err)
 	}
 	return nil
 }
@@ -107,7 +116,7 @@ func RegisterWebUploadedBlockAndMapping(database *db.DB, orgID, repoID, internal
 		if errors.Is(err, db.ErrBlockIDMappingConflict) {
 			return err
 		}
-		return fmt.Errorf("%w: %v", ErrBlockMappingWriteFailed, err)
+		return fmt.Errorf("%w: %w: %w", ErrBlockMaterializationTransient, ErrBlockMappingWriteFailed, err)
 	}
 	return nil
 }
