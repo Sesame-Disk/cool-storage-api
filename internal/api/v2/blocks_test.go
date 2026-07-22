@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -381,11 +383,14 @@ func TestCheckBlocksReusableCandidatesParallel_ProbesMetadataFirst(t *testing.T)
 		checkBlocksProbeReuseFn = origProbe
 	}()
 
-	var probeCalls int
+	var probeCalls atomic.Int32
 	checkBlocksProbeReuseFn = func(database *db.DB, orgID, hash string) (db.BlockReuseProbe, error) {
-		probeCalls++
+		probeCalls.Add(1)
 		if hash == "reusable" {
 			return db.BlockReuseProbe{Decision: db.BlockReuseReusable}, nil
+		}
+		if hash == "stub" {
+			return db.BlockReuseProbe{Decision: db.BlockReuseRepairableStub}, nil
 		}
 		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
 	}
@@ -394,17 +399,20 @@ func TestCheckBlocksReusableCandidatesParallel_ProbesMetadataFirst(t *testing.T)
 		context.Background(),
 		nil,
 		"org",
-		[]string{"new", "reusable"},
+		[]string{"new", "stub", "reusable"},
 		2,
 	)
 	if err != nil {
 		t.Fatalf("checkBlocksReusableCandidatesParallel returned error: %v", err)
 	}
-	if probeCalls != 2 {
-		t.Fatalf("probeCalls = %d, want 2 (probe all hashes in metadata plane first)", probeCalls)
+	if probeCalls.Load() != 3 {
+		t.Fatalf("probeCalls = %d, want 3 (probe all hashes in metadata plane first)", probeCalls.Load())
 	}
 	if reusableByHash["new"] {
 		t.Fatal("non-reusable block reported reusable")
+	}
+	if reusableByHash["stub"] {
+		t.Fatal("repairable stub reported reusable")
 	}
 	if !reusableByHash["reusable"] {
 		t.Fatal("reusable block not reported reusable")
@@ -590,6 +598,85 @@ func TestUploadBlock_NoContentLength(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+// TestRespondBlockMaterializeError_FenceIs500UntilPR5 pins the current PR-2 boundary
+// of the seventh (web-session) funnel through the exact error->status mapping the
+// UploadBlock handler uses. Both UploadBlock materialize sites route through
+// respondBlockMaterializeError, so this drives the real HTTP decision, not a stand-in.
+//
+// Unlike the six funnels wrapped in RetryUploadedBlockMaterialization, this funnel has
+// no bounded retry, so a GC fence / contended-stub signal (ErrBlockDeleteInProgress,
+// which the metadata-upsert backstop now raises on a lost stub-repair race) is a
+// fail-closed 500 — NOT reclassified as a 409 mapping conflict and NOT retried. PR-5
+// must consciously change this expectation to 409 + Retry-After once traffic and the
+// staged-block reservation are hoisted so a retry cannot double-charge. If this test
+// changes, the PR-2/PR-5 scope notes in GC-UPLOAD-FENCE-PR-PLAN.md must change with it.
+func TestRespondBlockMaterializeError_FenceIs500UntilPR5(t *testing.T) {
+	newCtx := func() (*gin.Context, *httptest.ResponseRecorder) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		return c, w
+	}
+
+	t.Run("nil error writes no response and does not stop the handler", func(t *testing.T) {
+		c, w := newCtx()
+		if respondBlockMaterializeError(c, nil) {
+			t.Fatal("respondBlockMaterializeError(nil) = true, want false")
+		}
+		if w.Code != http.StatusOK { // untouched recorder default
+			t.Fatalf("status = %d, want %d (no response written)", w.Code, http.StatusOK)
+		}
+	})
+
+	t.Run("GC fence / contended stub is a fail-closed 500 (PR-5 flips to 409)", func(t *testing.T) {
+		c, w := newCtx()
+		fenceErr := fmt.Errorf("%w: block fenced during web-session materialize", ErrBlockDeleteInProgress)
+		if !respondBlockMaterializeError(c, fenceErr) {
+			t.Fatal("respondBlockMaterializeError(fence) = false, want true (response written, caller returns)")
+		}
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d — PR-5 changes this to 409 + Retry-After", w.Code, http.StatusInternalServerError)
+		}
+		if strings.Contains(w.Body.String(), "block id mapping conflict") {
+			t.Fatalf("fence 500 must not read as a mapping conflict; body = %s", w.Body.String())
+		}
+	})
+
+	t.Run("verified mapping conflict is a permanent 409", func(t *testing.T) {
+		c, w := newCtx()
+		if !respondBlockMaterializeError(c, fmt.Errorf("remap: %w", db.ErrBlockIDMappingConflict)) {
+			t.Fatal("respondBlockMaterializeError(conflict) = false, want true")
+		}
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusConflict)
+		}
+		if !strings.Contains(w.Body.String(), "block id mapping conflict") {
+			t.Fatalf("409 body = %s, want block id mapping conflict", w.Body.String())
+		}
+	})
+}
+
+// TestUploadBlockMaterializePropagatesFence keeps the seam honest at the
+// materializeUploadedBlock boundary: it must propagate ErrBlockDeleteInProgress
+// unchanged (never swallow it or reshape it into a mapping conflict) so the handler
+// mapping above sees the real signal.
+func TestUploadBlockMaterializePropagatesFence(t *testing.T) {
+	old := registerUploadedBlockForMaterializationFn
+	t.Cleanup(func() { registerUploadedBlockForMaterializationFn = old })
+	registerUploadedBlockForMaterializationFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+		return fmt.Errorf("%w: block fenced during web-session materialize", ErrBlockDeleteInProgress)
+	}
+
+	h := &BlockHandler{}
+	session := db.BlockUploadSession{SessionID: "sess-1", OrgID: "org-1", RepoID: "repo-1"}
+	err := h.materializeUploadedBlock(session, strings.Repeat("a", 64), strings.Repeat("b", 40), 5, "hot", true)
+	if !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("materializeUploadedBlock err = %v, want ErrBlockDeleteInProgress propagated", err)
+	}
+	if errors.Is(err, db.ErrBlockIDMappingConflict) {
+		t.Fatal("fence error must not masquerade as a mapping conflict")
 	}
 }
 

@@ -268,7 +268,7 @@ reusable / needs-put / blocked-by-GC / unknown-error. Needs-put blocks use
 `PutBlockAutoDirect` (no HEAD); reusable blocks run `EnsureReusableBlockPresent`
 (verify the canonical object via HEAD on the declared key, repair via direct PUT
 only if missing); blocked-by-GC returns `ErrBlockDeleteInProgress` to retry;
-unknown-error falls open to the legacy Exists+PUT. Wired into all five upload paths
+unknown-error fails closed before S3 PUT. Wired into all six upload funnels
 (`seafhttp.go` ×2, `sync.go`, `files.go` ×2, `onlyoffice.go`). Per-block cost: a
 new block now pays ≤2 Cassandra reads (~1 ms each) + 1 direct PUT and no HEAD;
 dedup hits keep one canonical-verify HEAD. Safety is unchanged — it rests on the
@@ -278,8 +278,8 @@ also retries `ErrBlockDeleteInProgress` from the `store` phase.
 
 **Scope (not global):** this fixes the server-side hot upload paths only. The
 `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData` still do
-`Exists` + `PutAuto` and remain in use as the probe-error fallback and by
-unmigrated callers (e.g. `v2/blocks.go` `UploadBlock`). The HEAD was not removed
+`Exists` + `PutAuto` and remain in use by unmigrated callers (e.g.
+`v2/blocks.go` `UploadBlock`). The HEAD was not removed
 from `BlockStore` globally.
 
 Tests: `ProbeBlockReuse` decision matrix (`block_references_test.go`),

@@ -375,6 +375,7 @@ var syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.Blo
 	return blockStore.PutBlockAutoDirect(ctx, hash, data)
 }
 var syncProbeUploadedBlockReuseFn = v2.ProbeUploadedBlockReuse
+var syncPrepareUploadedBlockProbeFn = v2.PrepareUploadedBlockProbe
 var registerUploadedBlockAndMappingForSyncFn = v2.RegisterUploadedBlockAndMapping
 
 // formatRelativeTimeHTML delegates to httputil.FormatRelativeTimeHTML.
@@ -1306,45 +1307,32 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		// error or the response will be written twice on retry.
 		if err := v2.RetryUploadedBlockMaterialization("PutBlock", internalID, func() error {
 			probe, probeErr := syncProbeUploadedBlockReuseFn(h.db, orgID, internalID)
-			if probeErr == nil {
-				switch probe.Decision {
-				case db.BlockReuseReusable:
-					_, ensureErr := v2.EnsureReusableBlockPresent(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
-					return ensureErr
-				case db.BlockReuseNeedsPut:
-					if checker := getAPIQuotaChecker(); checker != nil {
-						if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
-							c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-							return errSyncStorageQuotaExceeded
-						}
-					}
-					if _, putErr := syncPutBlockAutoDirectFn(c.Request.Context(), blockStore, internalID, data); putErr != nil {
-						return fmt.Errorf("%w: %v", errSyncStoreBackend, putErr)
-					}
-					return nil
-				case db.BlockReuseBlockedByGC:
-					return v2.ErrBlockDeleteInProgress
-				}
-			} else {
-				log.Printf("PutBlock: block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v\n", internalID, probeErr)
+			if probeErr != nil {
+				return fmt.Errorf("probe block reuse for %s: %w", internalID, probeErr)
 			}
-
-			exists, existsErr := syncBlockExistsFn(c.Request.Context(), blockStore, internalID)
-			if existsErr != nil {
-				return fmt.Errorf("%w: %v", errSyncBlockExistenceCheck, existsErr)
+			probe, probeErr = syncPrepareUploadedBlockProbeFn(h.db, orgID, internalID, probe)
+			if probeErr != nil {
+				return probeErr
 			}
-			if !exists {
+			switch probe.Decision {
+			case db.BlockReuseReusable:
+				_, ensureErr := v2.EnsureReusableBlockPresent(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
+				return ensureErr
+			case db.BlockReuseNeedsPut:
 				if checker := getAPIQuotaChecker(); checker != nil {
 					if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
 						c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 						return errSyncStorageQuotaExceeded
 					}
 				}
-				if _, putErr := syncPutBlockDataFn(c.Request.Context(), blockStore, blockData); putErr != nil {
+				if _, putErr := syncPutBlockAutoDirectFn(c.Request.Context(), blockStore, internalID, data); putErr != nil {
 					return fmt.Errorf("%w: %v", errSyncStoreBackend, putErr)
 				}
+				return nil
+			case db.BlockReuseBlockedByGC:
+				return v2.ErrBlockDeleteInProgress
 			}
-			return nil
+			return fmt.Errorf("unexpected block reuse decision %d for %s", probe.Decision, internalID)
 		}, func() error {
 			return registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), storageClass, "", externalMappingID)
 		}, nil, nil); err != nil {

@@ -7,6 +7,26 @@ import (
 	"time"
 )
 
+func completeIdentityRepairRow(representationID, sha1 string) blockIdentityRepairRow {
+	createdAt := time.Now().UTC()
+	return blockIdentityRepairRow{
+		RepresentationID:    representationID,
+		Sha1:                sha1,
+		StorageClass:        "hot",
+		StorageClassPresent: true,
+		CreatedAt:           &createdAt,
+	}
+}
+
+func completeProbeMetadataRow(storageClass string) blockReuseMetadataRow {
+	createdAt := time.Now().UTC()
+	return blockReuseMetadataRow{
+		StorageClass:        storageClass,
+		StorageClassPresent: true,
+		CreatedAt:           &createdAt,
+	}
+}
+
 func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
@@ -26,9 +46,9 @@ func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
 		}
 		return false, nil // row already existed -> proceed to read + backfill
 	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
 		calls = append(calls, "read")
-		return PlainBlockRepresentationID, "", true, nil
+		return completeIdentityRepairRow(PlainBlockRepresentationID, ""), true, nil
 	}
 	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		calls = append(calls, "backfill")
@@ -71,9 +91,9 @@ func TestUpsertBlockMetadataWithSHA1_FirstWriterSkipsReadAndBackfill(t *testing.
 	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		return true, nil // first writer created the row with this sha1
 	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
 		t.Fatal("read should not run when the INSERT applied")
-		return "", "", false, nil
+		return blockIdentityRepairRow{}, false, nil
 	}
 	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		t.Fatal("backfill should not run when the INSERT applied")
@@ -99,8 +119,8 @@ func TestUpsertBlockMetadataWithSHA1_FailsWhenRowChangesBeforeBackfill(t *testin
 	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		return false, nil // row already existed -> proceed to read/ensure
 	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
-		return PlainBlockRepresentationID, "", true, nil
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
+		return completeIdentityRepairRow(PlainBlockRepresentationID, ""), true, nil
 	}
 	// The conditional backfill does not apply: another writer (or GC) changed the
 	// row between read and write. The CAS reports applied=false and the caller must
@@ -132,8 +152,8 @@ func TestUpsertBlockMetadataWithSHA1_LeavesMatchingSHA1Untouched(t *testing.T) {
 	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		return false, nil // row already existed -> proceed to read/ensure
 	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
-		return PlainBlockRepresentationID, strings.Repeat("b", 40), true, nil
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
+		return completeIdentityRepairRow(PlainBlockRepresentationID, strings.Repeat("b", 40)), true, nil
 	}
 	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		t.Fatal("backfill should not run when the stored sha1 already matches")
@@ -159,8 +179,8 @@ func TestUpsertBlockMetadataWithSHA1_RejectsConflictingExistingSHA1(t *testing.T
 	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		return false, nil // row already existed -> proceed to read/ensure
 	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
-		return PlainBlockRepresentationID, strings.Repeat("c", 40), true, nil
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
+		return completeIdentityRepairRow(PlainBlockRepresentationID, strings.Repeat("c", 40)), true, nil
 	}
 	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
 		t.Fatal("backfill should not run when the stored sha1 conflicts")
@@ -186,14 +206,277 @@ func TestUpsertBlockMetadataWithSHA1_RejectsMalformedInputSHA1(t *testing.T) {
 		t.Fatal("insert should not run for malformed sha1 input")
 		return false, nil
 	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
 		t.Fatal("read should not run for malformed sha1 input")
-		return "", "", false, nil
+		return blockIdentityRepairRow{}, false, nil
 	}
 
 	err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", "not-a-sha1", 123, "hot", "key")
 	if err == nil || !strings.Contains(err.Error(), "invalid block sha1") {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want invalid block sha1", err)
+	}
+}
+
+func TestUpsertBlockMetadataRejectsEmptyStorageClassBeforeInsert(t *testing.T) {
+	oldPlainInsert := upsertBlockMetadataInsertFn
+	oldRepresentationInsert := upsertBlockMetadataInsertWithRepresentationFn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldPlainInsert
+		upsertBlockMetadataInsertWithRepresentationFn = oldRepresentationInsert
+	})
+	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
+		t.Fatal("plain insert must not run with an empty storage class")
+		return false, nil
+	}
+	upsertBlockMetadataInsertWithRepresentationFn = func(*DB, string, string, string, string, int, string, string, time.Time) (bool, error) {
+		t.Fatal("representation insert must not run with an empty storage class")
+		return false, nil
+	}
+
+	if err := (&DB{}).UpsertBlockMetadata("org-1", "block-1", 1, "   ", "key"); err == nil {
+		t.Fatal("UpsertBlockMetadata() error = nil, want empty storage class error")
+	}
+}
+
+func TestUpsertBlockMetadataRepairsReleasedStubAndRetriesInsert(t *testing.T) {
+	database := &DB{}
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockIdentityForRepairFn
+	oldRepair := repairReleasedBlockStubForUpsertFn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockIdentityForRepairFn = oldRead
+		repairReleasedBlockStubForUpsertFn = oldRepair
+	})
+
+	insertCalls := 0
+	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
+		insertCalls++
+		return insertCalls == 2, nil
+	}
+	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+		return blockIdentityRepairRow{RepresentationID: PlainBlockRepresentationID, Sha1: strings.Repeat("a", 40)}, true, nil
+	}
+	repairCalls := 0
+	repairReleasedBlockStubForUpsertFn = func(*DB, string, string) (bool, error) {
+		repairCalls++
+		return true, nil
+	}
+
+	if err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 1, "hot", "key"); err != nil {
+		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
+	}
+	if insertCalls != 2 || repairCalls != 1 {
+		t.Fatalf("insert/repair calls = %d/%d, want 2/1", insertCalls, repairCalls)
+	}
+}
+
+func TestUpsertRepresentationMetadataRepairsReleasedStubAndRetriesInsert(t *testing.T) {
+	database := &DB{}
+	oldInsert := upsertBlockMetadataInsertWithRepresentationFn
+	oldRead := readBlockIdentityForRepairFn
+	oldRepair := repairReleasedBlockStubForUpsertFn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertWithRepresentationFn = oldInsert
+		readBlockIdentityForRepairFn = oldRead
+		repairReleasedBlockStubForUpsertFn = oldRepair
+	})
+	representationID := EncryptedLibraryBlockRepresentationID("library-1")
+	insertCalls := 0
+	upsertBlockMetadataInsertWithRepresentationFn = func(*DB, string, string, string, string, int, string, string, time.Time) (bool, error) {
+		insertCalls++
+		return insertCalls == 2, nil
+	}
+	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+		return blockIdentityRepairRow{RepresentationID: representationID}, true, nil
+	}
+	repairCalls := 0
+	repairReleasedBlockStubForUpsertFn = func(*DB, string, string) (bool, error) {
+		repairCalls++
+		return true, nil
+	}
+
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1("org-1", representationID, "block-1", "", 1, "hot", "key"); err != nil {
+		t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1() error = %v", err)
+	}
+	if insertCalls != 2 || repairCalls != 1 {
+		t.Fatalf("insert/repair calls = %d/%d, want 2/1", insertCalls, repairCalls)
+	}
+}
+
+func TestUpsertBlockMetadataStopsWhenReleasedStubDeleteLosesRace(t *testing.T) {
+	database := &DB{}
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockIdentityForRepairFn
+	oldRepair := repairReleasedBlockStubForUpsertFn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockIdentityForRepairFn = oldRead
+		repairReleasedBlockStubForUpsertFn = oldRepair
+	})
+
+	insertCalls := 0
+	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
+		insertCalls++
+		return false, nil
+	}
+	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+		return blockIdentityRepairRow{}, true, nil
+	}
+	repairReleasedBlockStubForUpsertFn = func(*DB, string, string) (bool, error) { return false, nil }
+
+	err := database.UpsertBlockMetadata("org-1", "block-1", 1, "hot", "key")
+	if !errors.Is(err, ErrBlockStubRepairContended) {
+		t.Fatalf("UpsertBlockMetadata() error = %v, want ErrBlockStubRepairContended (retryable)", err)
+	}
+	if insertCalls != 1 {
+		t.Fatalf("insertCalls = %d, want 1", insertCalls)
+	}
+}
+
+func TestRepairReleasedBlockStubClaimsRechecksOrphanAndDeletes(t *testing.T) {
+	oldClaim := claimReleasedBlockStubForRepairFn
+	oldDelete := deleteRepairClaimedBlockStubFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	oldID := blockStubRepairIDFn
+	t.Cleanup(func() {
+		claimReleasedBlockStubForRepairFn = oldClaim
+		deleteRepairClaimedBlockStubFn = oldDelete
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+		blockStubRepairIDFn = oldID
+	})
+	blockStubRepairIDFn = func(string, string) string { return "repair-1" }
+	claimReleasedBlockStubForRepairFn = func(_ *DB, orgID, blockID, repairID string, claimedAt time.Time) (bool, error) {
+		if orgID != "org-1" || blockID != "block-1" || repairID != "repair-1" || claimedAt.IsZero() {
+			t.Fatalf("claim args = %s/%s/%s/%v", orgID, blockID, repairID, claimedAt)
+		}
+		return true, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
+	deleteRepairClaimedBlockStubFn = func(_ *DB, orgID, blockID, repairID string) (bool, error) {
+		if repairID != "repair-1" {
+			t.Fatalf("repairID = %q", repairID)
+		}
+		return true, nil
+	}
+
+	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
+	if err != nil || !repaired {
+		t.Fatalf("RepairReleasedBlockStub() = %v, %v, want true/nil", repaired, err)
+	}
+}
+
+func TestRepairReleasedBlockStubStopsWhenOrphanFenceAppears(t *testing.T) {
+	oldClaim := claimReleasedBlockStubForRepairFn
+	oldDelete := deleteRepairClaimedBlockStubFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		claimReleasedBlockStubForRepairFn = oldClaim
+		deleteRepairClaimedBlockStubFn = oldDelete
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+	claimReleasedBlockStubForRepairFn = func(*DB, string, string, string, time.Time) (bool, error) { return true, nil }
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return true, nil }
+	deleteCalls := 0
+	deleteRepairClaimedBlockStubFn = func(*DB, string, string, string) (bool, error) {
+		deleteCalls++
+		return true, nil
+	}
+
+	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
+	if err != nil || repaired {
+		t.Fatalf("RepairReleasedBlockStub() = %v, %v, want false/nil", repaired, err)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("deleteCalls = %d, want repair claim cleanup", deleteCalls)
+	}
+}
+
+func TestRepairReleasedBlockStubResumesAmbiguousClaim(t *testing.T) {
+	oldClaim := claimReleasedBlockStubForRepairFn
+	oldDelete := deleteRepairClaimedBlockStubFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	oldRead := readBlockIdentityForRepairFn
+	t.Cleanup(func() {
+		claimReleasedBlockStubForRepairFn = oldClaim
+		deleteRepairClaimedBlockStubFn = oldDelete
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+		readBlockIdentityForRepairFn = oldRead
+	})
+	claimedAt := time.Now().UTC()
+	repairID := blockStubRepairIDFn("org-1", "block-1")
+	claimReleasedBlockStubForRepairFn = func(*DB, string, string, string, time.Time) (bool, error) {
+		return false, errors.New("ambiguous timeout")
+	}
+	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+		return blockIdentityRepairRow{GCState: BlockGCStateRepairingStub, GCClaimID: repairID, GCClaimedAt: &claimedAt}, true, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
+	deleteRepairClaimedBlockStubFn = func(*DB, string, string, string) (bool, error) { return true, nil }
+
+	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
+	if err != nil || !repaired {
+		t.Fatalf("RepairReleasedBlockStub() = %v, %v, want true/nil", repaired, err)
+	}
+}
+
+func TestRepairReleasedBlockStubRetriesAmbiguousDelete(t *testing.T) {
+	oldClaim := claimReleasedBlockStubForRepairFn
+	oldDelete := deleteRepairClaimedBlockStubFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	oldRead := readBlockIdentityForRepairFn
+	t.Cleanup(func() {
+		claimReleasedBlockStubForRepairFn = oldClaim
+		deleteRepairClaimedBlockStubFn = oldDelete
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+		readBlockIdentityForRepairFn = oldRead
+	})
+	claimedAt := time.Now().UTC()
+	repairID := blockStubRepairIDFn("org-1", "block-1")
+	claimReleasedBlockStubForRepairFn = func(*DB, string, string, string, time.Time) (bool, error) { return true, nil }
+	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+		return blockIdentityRepairRow{GCState: BlockGCStateRepairingStub, GCClaimID: repairID, GCClaimedAt: &claimedAt}, true, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
+	deleteCalls := 0
+	deleteRepairClaimedBlockStubFn = func(*DB, string, string, string) (bool, error) {
+		deleteCalls++
+		if deleteCalls == 1 {
+			return false, errors.New("ambiguous timeout")
+		}
+		return true, nil
+	}
+
+	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
+	if err != nil || !repaired || deleteCalls != 2 {
+		t.Fatalf("RepairReleasedBlockStub() = %v, %v with %d deletes, want true/nil with 2", repaired, err, deleteCalls)
+	}
+}
+
+func TestRepairReleasedBlockStubDoesNotSucceedWhenClaimedRowChanges(t *testing.T) {
+	oldClaim := claimReleasedBlockStubForRepairFn
+	oldDelete := deleteRepairClaimedBlockStubFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	oldRead := readBlockIdentityForRepairFn
+	t.Cleanup(func() {
+		claimReleasedBlockStubForRepairFn = oldClaim
+		deleteRepairClaimedBlockStubFn = oldDelete
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+		readBlockIdentityForRepairFn = oldRead
+	})
+	claimReleasedBlockStubForRepairFn = func(*DB, string, string, string, time.Time) (bool, error) { return true, nil }
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
+	deleteRepairClaimedBlockStubFn = func(*DB, string, string, string) (bool, error) { return false, nil }
+	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+		return completeIdentityRepairRow(PlainBlockRepresentationID, strings.Repeat("a", 40)), true, nil
+	}
+
+	// The row was completed by another actor before our conditional delete. That is
+	// a benign lost race, so the repair reports (false, nil) — retryable, not a hard
+	// error — and the caller re-probes to converge on Reusable/BlockedByGC.
+	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
+	if err != nil || repaired {
+		t.Fatalf("RepairReleasedBlockStub() = %v, %v, want false/nil (retryable lost race)", repaired, err)
 	}
 }
 
@@ -317,8 +600,8 @@ func TestEnsureBlockIdentity_PlaintextBackfillsMissingRepresentationID(t *testin
 		backfillBlockSHA1Fn = oldBackfillSHA1
 	})
 
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
-		return "", strings.Repeat("a", 40), true, nil
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
+		return completeIdentityRepairRow("", strings.Repeat("a", 40)), true, nil
 	}
 	backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
 		if representationID != PlainBlockRepresentationID {
@@ -350,8 +633,8 @@ func TestEnsureBlockIdentity_PlaintextRejectsStoredRepresentationConflict(t *tes
 		backfillBlockSHA1Fn = oldBackfillSHA1
 	})
 
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
-		return EncryptedLibraryBlockRepresentationID("library-1"), strings.Repeat("a", 40), true, nil
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
+		return completeIdentityRepairRow(EncryptedLibraryBlockRepresentationID("library-1"), strings.Repeat("a", 40)), true, nil
 	}
 	backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
 		t.Fatal("representation backfill should not run on a stored conflict")
@@ -379,8 +662,8 @@ func TestEnsureBlockIdentity_DoesNotBackfillRepresentationWhenSHA1Conflicts(t *t
 		backfillBlockSHA1Fn = oldBackfillSHA1
 	})
 
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (string, string, bool, error) {
-		return "", strings.Repeat("d", 40), true, nil
+	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
+		return completeIdentityRepairRow("", strings.Repeat("d", 40)), true, nil
 	}
 	backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
 		t.Fatal("representation backfill should not run when the stored sha1 already conflicts")
@@ -635,7 +918,10 @@ func TestProbeBlockReuseReusable(t *testing.T) {
 	})
 
 	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
-		return blockReuseMetadataRow{Sha1: "sha1-abc", SizeBytes: 123, StorageClass: "hot-s3", StorageKey: "", GCState: ""}, true, nil
+		row := completeProbeMetadataRow("hot-s3")
+		row.Sha1 = "sha1-abc"
+		row.SizeBytes = 123
+		return row, true, nil
 	}
 	probeBlockReuseHasReferencesFn = func(database *DB, orgID, blockID string) (bool, error) {
 		return true, nil
@@ -712,12 +998,142 @@ func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageClass(t *testing.T) {
 	t.Cleanup(func() { probeBlockReuseMetadataFn = oldMetadata })
 
 	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
-		return blockReuseMetadataRow{SizeBytes: 123, StorageClass: "   ", StorageKey: "", GCState: ""}, true, nil
+		row := completeProbeMetadataRow("   ")
+		row.SizeBytes = 123
+		return row, true, nil
 	}
 
 	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
 	if err == nil {
 		t.Fatal("ProbeBlockReuse() error = nil, want error")
+	}
+	if probe.Decision != BlockReuseUnknownError {
+		t.Fatalf("decision = %v, want BlockReuseUnknownError", probe.Decision)
+	}
+}
+
+func TestProbeBlockReuseReturnsRepairableStubForReleasedClaimRow(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+	probeBlockReuseMetadataFn = func(*DB, string, string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{Sha1: strings.Repeat("a", 40)}, true, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
+	}
+	if probe.Decision != BlockReuseRepairableStub {
+		t.Fatalf("decision = %v, want BlockReuseRepairableStub", probe.Decision)
+	}
+}
+
+func TestProbeBlockReuseBlocksReleasedStubWithS3Orphan(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+	probeBlockReuseMetadataFn = func(*DB, string, string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{}, true, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return true, nil }
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
+	}
+	if probe.Decision != BlockReuseBlockedByGC {
+		t.Fatalf("decision = %v, want BlockReuseBlockedByGC", probe.Decision)
+	}
+}
+
+func TestProbeBlockReuseBlocksActivelyClaimedStub(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+	claimedAt := time.Now().UTC()
+	probeBlockReuseMetadataFn = func(*DB, string, string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{GCState: BlockGCStateDeleting, GCClaimID: "claim-1", GCClaimedAt: &claimedAt}, true, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+		t.Fatal("orphan read must not run for an active claim")
+		return false, nil
+	}
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
+	}
+	if probe.Decision != BlockReuseBlockedByGC {
+		t.Fatalf("decision = %v, want BlockReuseBlockedByGC", probe.Decision)
+	}
+}
+
+func TestProbeBlockReuseResumesOwnedRepairingStub(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+	claimedAt := time.Now().UTC()
+	probeBlockReuseMetadataFn = func(*DB, string, string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{
+			GCState:     BlockGCStateRepairingStub,
+			GCClaimID:   blockStubRepairIDFn("org-1", "block-1"),
+			GCClaimedAt: &claimedAt,
+		}, true, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err != nil || probe.Decision != BlockReuseRepairableStub {
+		t.Fatalf("ProbeBlockReuse() = %v, %v, want repairable/nil", probe.Decision, err)
+	}
+}
+
+func TestProbeBlockReuseBlocksForeignRepairingStub(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+	claimedAt := time.Now().UTC()
+	probeBlockReuseMetadataFn = func(*DB, string, string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{GCState: BlockGCStateRepairingStub, GCClaimID: "foreign", GCClaimedAt: &claimedAt}, true, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+		t.Fatal("orphan read must not run for a foreign repair claim")
+		return false, nil
+	}
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err != nil || probe.Decision != BlockReuseBlockedByGC {
+		t.Fatalf("ProbeBlockReuse() = %v, %v, want blocked/nil", probe.Decision, err)
+	}
+}
+
+func TestProbeBlockReuseRejectsIncompleteClaimOwnership(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	t.Cleanup(func() { probeBlockReuseMetadataFn = oldMetadata })
+	probeBlockReuseMetadataFn = func(*DB, string, string) (blockReuseMetadataRow, bool, error) {
+		return blockReuseMetadataRow{GCState: BlockGCStateDeleting, GCClaimID: "claim-1"}, true, nil
+	}
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	if err == nil {
+		t.Fatal("ProbeBlockReuse() error = nil, want malformed ownership error")
 	}
 	if probe.Decision != BlockReuseUnknownError {
 		t.Fatalf("decision = %v, want BlockReuseUnknownError", probe.Decision)
@@ -741,7 +1157,11 @@ func TestProbeBlockReuseNeedsPutWhenMetadataPresentButNoReferences(t *testing.T)
 	})
 
 	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
-		return blockReuseMetadataRow{Sha1: "sha1-cold", SizeBytes: 4096, StorageClass: "cold-archive", StorageKey: "blocks/ab/cd", GCState: ""}, true, nil
+		row := completeProbeMetadataRow("cold-archive")
+		row.Sha1 = "sha1-cold"
+		row.SizeBytes = 4096
+		row.StorageKey = "blocks/ab/cd"
+		return row, true, nil
 	}
 	probeBlockReuseHasReferencesFn = func(database *DB, orgID, blockID string) (bool, error) {
 		return false, nil
@@ -783,7 +1203,13 @@ func TestProbeBlockReuseBlockedByGCWhenGCStateDeleting(t *testing.T) {
 	})
 
 	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
-		return blockReuseMetadataRow{SizeBytes: 10, StorageClass: "hot", GCState: BlockGCStateDeleting}, true, nil
+		row := completeProbeMetadataRow("hot")
+		claimedAt := time.Now().UTC()
+		row.SizeBytes = 10
+		row.GCState = BlockGCStateDeleting
+		row.GCClaimID = "claim-1"
+		row.GCClaimedAt = &claimedAt
+		return row, true, nil
 	}
 	refsCalled := false
 	probeBlockReuseHasReferencesFn = func(database *DB, orgID, blockID string) (bool, error) {

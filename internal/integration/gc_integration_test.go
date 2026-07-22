@@ -1551,15 +1551,119 @@ func TestGC_ClaimBlockDelete_StubRowMaterializationIsCleaned(t *testing.T) {
 		t.Fatalf("materialized stub should have nil created_at, got %v", info.CreatedAt)
 	}
 
-	// FinalizeBlockDelete (the worker's stub-cleanup primitive) must remove the
-	// stub we claimed, with the same claimID.
-	if err := store.FinalizeBlockDelete(orgUUID, blockID, claimID); err != nil {
-		t.Fatalf("FinalizeBlockDelete(stub): %v", err)
+	// The narrow claimed-stub primitive must remove the stub with the same claimID.
+	deleted, err := store.DeleteClaimedBlockStub(orgUUID, blockID, claimID)
+	if err != nil {
+		t.Fatalf("DeleteClaimedBlockStub(stub): %v", err)
+	}
+	if !deleted {
+		t.Fatal("DeleteClaimedBlockStub(stub) did not apply")
 	}
 	if exists, err := store.BlockExists(orgUUID, blockID); err != nil {
 		t.Fatalf("BlockExists(after finalize): %v", err)
 	} else if exists {
 		t.Fatal("stub row still present after FinalizeBlockDelete")
+	}
+}
+
+func TestGC_ReleasedBlockStub_ProbeRepairAndMaterialize(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	orgID := uuid.New().String()
+	blockID := strings.Repeat("a", 64)
+	sha1ID := strings.Repeat("b", 40)
+	t.Cleanup(func() {
+		if err := database.Session().Query(`DELETE FROM block_references WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+			t.Fatalf("cleanup block references: %v", err)
+		}
+		if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+			t.Fatalf("cleanup block row: %v", err)
+		}
+	})
+
+	if err := database.Session().Query(`
+		INSERT INTO blocks (org_id, block_id) VALUES (?, ?)
+	`, orgID, blockID).Exec(); err != nil {
+		t.Fatalf("seed released stub: %v", err)
+	}
+	probe, err := database.ProbeBlockReuse(orgID, blockID)
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse(released stub): %v", err)
+	}
+	if probe.Decision != db.BlockReuseRepairableStub {
+		t.Fatalf("released stub decision = %v, want RepairableStub", probe.Decision)
+	}
+
+	repaired, err := database.RepairReleasedBlockStub(orgID, blockID)
+	if err != nil {
+		t.Fatalf("RepairReleasedBlockStub: %v", err)
+	}
+	if !repaired {
+		t.Fatal("RepairReleasedBlockStub did not apply")
+	}
+
+	// Re-seed the stub and drive the unprobed materialization backstop.
+	if err := database.Session().Query(`INSERT INTO blocks (org_id, block_id) VALUES (?, ?)`, orgID, blockID).Exec(); err != nil {
+		t.Fatalf("reseed released stub: %v", err)
+	}
+	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, sha1ID, 123, "hot", "blocks/"+orgID+"/aa/aa/"+blockID); err != nil {
+		t.Fatalf("UpsertBlockMetadataWithSHA1(stub backstop): %v", err)
+	}
+	if err := database.AddBlockReference(orgID, blockID, "test:live", uuid.New().String(), 0); err != nil {
+		t.Fatalf("AddBlockReference: %v", err)
+	}
+	probe, err = database.ProbeBlockReuse(orgID, blockID)
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse(materialized): %v", err)
+	}
+	if probe.Decision != db.BlockReuseReusable || probe.StorageClass != "hot" {
+		t.Fatalf("materialized probe = %+v, want reusable hot block", probe)
+	}
+}
+
+func TestGC_ActiveBlockStub_RequiresOwningClaim(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	blockID := strings.Repeat("c", 64)
+	claimID := "claim-active-stub"
+	t.Cleanup(func() {
+		if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+			t.Fatalf("cleanup active stub: %v", err)
+		}
+	})
+
+	if err := database.Session().Query(`
+		INSERT INTO blocks (org_id, block_id, gc_state, gc_claim_id, gc_claimed_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, orgID, blockID, db.BlockGCStateDeleting, claimID, time.Now().UTC()).Exec(); err != nil {
+		t.Fatalf("seed active stub: %v", err)
+	}
+	probe, err := database.ProbeBlockReuse(orgID, blockID)
+	if err != nil {
+		t.Fatalf("ProbeBlockReuse(active stub): %v", err)
+	}
+	if probe.Decision != db.BlockReuseBlockedByGC {
+		t.Fatalf("active stub decision = %v, want BlockedByGC", probe.Decision)
+	}
+	if repaired, err := database.RepairReleasedBlockStub(orgID, blockID); err != nil {
+		t.Fatalf("RepairReleasedBlockStub(active): %v", err)
+	} else if repaired {
+		t.Fatal("released-stub repair applied to active claim")
+	}
+	if deleted, err := store.DeleteClaimedBlockStub(orgUUID, blockID, "wrong-claim"); err != nil {
+		t.Fatalf("DeleteClaimedBlockStub(wrong owner): %v", err)
+	} else if deleted {
+		t.Fatal("wrong owner deleted active stub")
+	}
+	if deleted, err := store.DeleteClaimedBlockStub(orgUUID, blockID, claimID); err != nil {
+		t.Fatalf("DeleteClaimedBlockStub(owner): %v", err)
+	} else if !deleted {
+		t.Fatal("owning claim did not delete active stub")
 	}
 }
 

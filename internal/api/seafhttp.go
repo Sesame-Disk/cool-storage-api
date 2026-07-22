@@ -1513,13 +1513,11 @@ const (
 
 var finalizeUploadBlockMetadataPermits = make(chan struct{}, finalizeUploadBlockMetadataConcurrency)
 var chunkedUploadLibraryFinalizePermits sync.Map
-var putUploadedBlockAutoFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
-	return blockStore.PutBlockAuto(ctx, hash, data)
-}
 var putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 	return blockStore.PutBlockAutoDirect(ctx, hash, data)
 }
 var probeUploadedBlockReuseForUploadFn = v2.ProbeUploadedBlockReuse
+var prepareUploadedBlockProbeForUploadFn = v2.PrepareUploadedBlockProbe
 var ensureReusableBlockPresentForUploadFn = v2.EnsureReusableBlockPresent
 var registerUploadedBlockAndMappingForUploadFn = v2.RegisterUploadedBlockAndMapping
 var resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID, repoID string, blockIDs []string) ([]string, error) {
@@ -2159,32 +2157,30 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	}
 	storeUploadedBlock := func() error {
 		probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
-		if probeErr == nil {
-			switch probe.Decision {
-			case db.BlockReuseReusable:
-				if _, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID); ensureErr != nil {
-					return ensureErr
-				}
-				log.Printf("[HandleUpload] Reused canonical block %s (SHA-256: %s) after physical verification", fileID[:16], sha256ID[:16])
-				return nil
-			case db.BlockReuseNeedsPut:
-				_, putErr := putUploadedBlockAutoDirectForUploadFn(ctx, blockStore, sha256ID, storedContent)
-				if putErr == nil {
-					log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via direct PUT", fileID[:16], sha256ID[:16])
-				}
-				return putErr
-			case db.BlockReuseBlockedByGC:
-				return v2.ErrBlockDeleteInProgress
+		if probeErr != nil {
+			return fmt.Errorf("probe block reuse for %s: %w", sha256ID, probeErr)
+		}
+		probe, probeErr = prepareUploadedBlockProbeForUploadFn(h.db, token.OrgID, sha256ID, probe)
+		if probeErr != nil {
+			return probeErr
+		}
+		switch probe.Decision {
+		case db.BlockReuseReusable:
+			if _, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID); ensureErr != nil {
+				return ensureErr
 			}
-		} else {
-			log.Printf("[HandleUpload] Block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v", sha256ID[:16], probeErr)
+			log.Printf("[HandleUpload] Reused canonical block %s (SHA-256: %s) after physical verification", fileID[:16], sha256ID[:16])
+			return nil
+		case db.BlockReuseNeedsPut:
+			_, putErr := putUploadedBlockAutoDirectForUploadFn(ctx, blockStore, sha256ID, storedContent)
+			if putErr == nil {
+				log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via direct PUT", fileID[:16], sha256ID[:16])
+			}
+			return putErr
+		case db.BlockReuseBlockedByGC:
+			return v2.ErrBlockDeleteInProgress
 		}
-
-		_, putErr := putUploadedBlockAutoFn(ctx, blockStore, sha256ID, storedContent)
-		if putErr == nil {
-			log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via legacy Exists+PUT fallback", fileID[:16], sha256ID[:16])
-		}
-		return putErr
+		return fmt.Errorf("unexpected block reuse decision %d for %s", probe.Decision, sha256ID)
 	}
 
 	// Register block metadata + a provisional reference (kept alive by TTL until
@@ -2657,29 +2653,27 @@ readLoop:
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
 				return retrySeafHTTPBlockMaterialization("finalizeUploadStreaming", sha256ID, func() error {
 					probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
-					if probeErr == nil {
-						switch probe.Decision {
-						case db.BlockReuseReusable:
-							_, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID)
-							return ensureErr
-						case db.BlockReuseNeedsPut:
-							_, putErr := putUploadedBlockAutoDirectForUploadFn(egCtx, blockStore, sha256ID, storedBlock)
-							if putErr != nil {
-								return fmt.Errorf("failed to store block: %w", putErr)
-							}
-							return nil
-						case db.BlockReuseBlockedByGC:
-							return v2.ErrBlockDeleteInProgress
+					if probeErr != nil {
+						return fmt.Errorf("probe block reuse for %s: %w", sha256ID, probeErr)
+					}
+					probe, probeErr = prepareUploadedBlockProbeForUploadFn(h.db, token.OrgID, sha256ID, probe)
+					if probeErr != nil {
+						return probeErr
+					}
+					switch probe.Decision {
+					case db.BlockReuseReusable:
+						_, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID)
+						return ensureErr
+					case db.BlockReuseNeedsPut:
+						_, putErr := putUploadedBlockAutoDirectForUploadFn(egCtx, blockStore, sha256ID, storedBlock)
+						if putErr != nil {
+							return fmt.Errorf("failed to store block: %w", putErr)
 						}
-					} else {
-						log.Printf("[finalizeUploadStreaming] Block reuse probe unavailable for block %s; falling back to legacy Exists+PUT path: %v", sha256ID[:16], probeErr)
+						return nil
+					case db.BlockReuseBlockedByGC:
+						return v2.ErrBlockDeleteInProgress
 					}
-
-					_, putErr := putUploadedBlockAutoFn(egCtx, blockStore, sha256ID, storedBlock)
-					if putErr != nil {
-						return fmt.Errorf("failed to store block: %w", putErr)
-					}
-					return nil
+					return fmt.Errorf("unexpected block reuse decision %d for %s", probe.Decision, sha256ID)
 				}, func() error {
 					// Cassandra materialization: serialized process-wide after the
 					// S3 PUT so provisional refs + metadata/mapping writes do not

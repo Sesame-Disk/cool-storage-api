@@ -2,7 +2,9 @@
 
 **Date:** 2026-07-21
 **Research branch:** `docs/gc-upload-fence-rematerialization` — **not for merge**
-**Status:** PR-1 is the documentation-only first step; no code PRs are open yet.
+**Status:** PR-1 merged as [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
+PR-2 is implemented and verified on `fix/gc-claim-stub-lifecycle`, pending review
+and merge. F2/X7 remain open on `main` until that merge.
 
 ## Why this document exists
 
@@ -82,31 +84,141 @@ PR a row to close.
 
 **Scope:** `internal/gc/worker.go` (re-referenced stub deleted under its claim rather
 than released), `internal/db/block_references.go` (`DeleteClaimedBlockStub`,
-`DeleteReleasedBlockStub`, `storage_class` invariant on write, and an explicit
+`RepairReleasedBlockStub`, `storage_class` invariant on write, and an explicit
 `RepairableStub` probe decision), `internal/gc/store.go`,
 `internal/gc/store_cassandra.go` and `internal/gc/store_mock.go` (conditional-delete
-contract and adapters), plus the existing probe switches in `internal/api/sync.go`,
+contract and adapters), `internal/api/v2/upload_reuse.go` (shared released-stub
+repair), `internal/api/v2/fs_helpers.go` (remove writer-side active-claim release;
+writers must wait/retry or fail closed, never clear GC ownership), plus the existing probe switches in `internal/api/sync.go`,
 `internal/api/seafhttp.go`, `internal/api/v2/files.go` and
-`internal/api/v2/onlyoffice.go`. Unit tests and a non-skipping production-engine
-lifecycle regression in `internal/integration/gc_integration_test.go` travel with it.
+`internal/api/v2/onlyoffice.go`. The metadata-upsert path also provides a race
+backstop for the unprobed web-session path in `internal/api/v2/blocks.go`. Unit/API
+tests and non-skipping production-engine lifecycle regressions in
+`internal/integration/gc_integration_test.go` travel with it.
 
 **The stub is an explicit store-phase state.** Classifying it as plain `NeedsPut` is not
 enough: `ProbeBlockReuse` returns `NeedsPut` with an empty `StorageClass` for a
 genuinely missing row too, and `BlockReuseProbe` carries no `Found`, `IsStub` or
-claim id to separate them. PR-2 adds `RepairableStub` from the same metadata read;
-each funnel conditionally removes the released metadata-free row, then follows its
-ordinary `NeedsPut` store path. Active claims remain `BlockedByGC` and are handled by
-the worker/materialization fence. This avoids both an unconditional third read and
-an LWT on every brand-new block — see X7.
+claim id to separate them. PR-2 adds `RepairableStub` from the same metadata read.
+`created_at IS NULL` is the lifecycle discriminator; incidental `sha1` or
+`representation_id` backfilled by an earlier failed materialization do not make the
+stub complete. Each funnel claims the released stub with a deterministic per-block
+`repairing_stub` token, rechecks `gc_s3_orphans`, removes only that owned repair
+claim, and follows its ordinary `NeedsPut` store path only after the repair succeeds.
+Active claims remain `BlockedByGC`; unexpected ownership state, a new orphan fence,
+and failed CAS application all stop the PUT and retry/fail closed. The deterministic
+token also lets a retry confirm and resume an ambiguously-applied Cassandra LWT.
+This avoids both an unconditional third read and an LWT on every brand-new block —
+see X7.
 
 **Why first among the code PRs:** it is the only one that fixes a state that can
 permanently break a block id, and it depends on nothing else.
 
 **Acceptance:** a stub left by a crashed or re-referenced claim is removed by either
-side, and an upload that meets one succeeds instead of exhausting its retries. Unit
-tests must drive the real `store -> materialize` loop, not call the repair directly —
-the direct-call tests on the research branch could not catch that the repair was
+side, and an upload that meets one on any of the six retry-wrapped funnels succeeds
+instead of exhausting its retries. The seventh (web-session) funnel is out of scope
+here: it stays fail-closed and returns `500` on a fence/contended-stub until PR-5
+gives it a re-probing `409` + `Retry-After` alongside the traffic/staging hoist — a
+characterization test pins that boundary so PR-5 must consciously flip it. Unit tests
+must drive the real `store -> materialize` loop, not call the repair directly — the
+direct-call tests on the research branch could not catch that the repair was
 unreachable behind the probe.
+
+**Execution checklist:**
+
+1. Extend the existing probe read with `created_at`, `gc_claim_id` and
+   `gc_claimed_at`. Classify in this order: absent row -> existing orphan-fence check,
+   then `NeedsPut`; active deleting owner -> `BlockedByGC`; unexpected/stale ownership
+   -> error; non-null `created_at` plus blank class -> malformed-row error. For an
+   unowned row with null `created_at` and blank class, check `gc_s3_orphans` before
+   returning `RepairableStub`; an observed orphan remains `BlockedByGC`. Do not
+   require `sha1` or `representation_id` to be empty on a stub.
+2. Add `db.RepairReleasedBlockStub(...)(bool, error)`: acquire an upload-owned
+   `repairing_stub` token only from null `created_at`/`storage_class` and absent GC
+   ownership, recheck `gc_s3_orphans`, then delete only that token. This two-LWT
+   shape is required because Cassandra can report a null-only conditional DELETE as
+   applied for an already-absent row. Add the narrower worker-side
+   `GCStore.DeleteClaimedBlockStub(...)(bool, error)`, fenced by claim id and the stub
+   lifecycle. Prove all predicates against real Cassandra/Scylla, not only mocks.
+3. Reject whitespace-only `storage_class` before issuing a metadata LWT. When the
+   first-writer insert does not apply, make metadata materialization recognize a
+   released stub, claim/repair it and retry the insert. This is the race
+   backstop for a stub appearing after a probe and for the unprobed web-session
+   upload path; complete/malformed rows still fail closed.
+4. Extend the GC Store interface, Cassandra adapter and mock. In `processBlock`,
+   delete a re-referenced stub under the owned claim instead of releasing it; retain
+   the ordinary release behavior for a complete metadata row. A false CAS result is
+   a stale observation and must not be treated as success. Remove the writer-side
+   active-claim release in `internal/api/v2/fs_helpers.go`; only the GC owner may
+   release or delete an active claim. Writers wait/retry or fail closed.
+5. Handle `RepairableStub` through one shared helper in all six existing upload probe
+   switches. A completed repair continues through the exact existing `NeedsPut`
+   branch. A **lost CAS or a reappeared orphan fence is a benign concurrency loss,
+   not a hard error**: `RepairReleasedBlockStub` returns `(false, nil)`, the funnel
+   performs no PUT and returns the existing retryable `ErrBlockDeleteInProgress` so
+   the materialization wrapper re-probes and converges to `Reusable` (a concurrent
+   uploader finished) or `BlockedByGC` (GC re-fenced). Only a genuine Cassandra error
+   fails closed as `UnknownError`. The metadata-upsert backstop applies the same rule
+   at the helper boundary: a contended stub repair surfaces the
+   `db.ErrBlockStubRepairContended` sentinel, which `RegisterUploadedBlock` translates
+   into `ErrBlockDeleteInProgress`, so the six funnels wrapped in
+   `RetryUploadedBlockMaterialization` re-probe and converge instead of exhausting
+   retries. The unprobed web-session funnel (`v2/blocks.go UploadBlock`) still surfaces
+   that signal as a `500`: it has no retry wrapper and no `409` mapping yet, which is
+   **PR-5's job** (server `409 block_delete_in_progress` + `Retry-After`, landed with
+   the frontend soft-retry). This is pre-existing — `RegisterUploadedBlock` already
+   returned `ErrBlockDeleteInProgress` on a plain GC fence before PR-2 — so PR-2 only
+   makes the backstop's DB contract correct and does not change the web funnel's HTTP
+   surface. Do not add a read to the ordinary absent-row path and do not
+   import PR-3's new retry sentinels or metrics. Note: `BlockDeleteFenceActive` is
+   deliberately **not** extended to fence on `repairing_stub` — the upsert path must
+   stay reachable to self-heal a stuck deterministic repair token.
+6. Unit-test the full decision and race matrix: absent row (with/without orphan
+   fence), released PK-only and partially identity-backfilled stubs, released stub
+   with an orphan fence (the repair removes its own `repairing_stub` token but leaves
+   the orphan fence intact and performs no PUT), active stub, complete active row,
+   malformed complete row, stale ownership, both successful deletions, lost CAS with
+   no PUT, worker stub-delete versus complete-row release, all six probe switches,
+   web-session materialization, and pre-LWT class validation. Include the retryable
+   convergence: a lost-CAS repair re-probes and finishes as `Reusable`, and a
+   contended metadata-upsert backstop translates to the retryable fence signal.
+   Assert `/blocks/check` and `file_from_blocks` never advertise a stub as reusable.
+7. Keep the engine-observation test, but add deterministic real-Cassandra fixtures
+   using a primary-key-only INSERT for a released stub and explicit ownership columns
+   for an active stub. Verify the rows are visible, prove the conditional CQL, and run
+   a real probe -> repair -> store -> materialize -> reusable lifecycle that cannot
+   skip based on engine behavior.
+8. Run focused unit tests, `go test -race` for affected packages in Docker, build,
+   vet, integration-tag vet, and focused Cassandra integration regressions. Record
+   exact commands/results in the PR, but move only F2 and X7 to closed after PR-2
+   merges. X1/X2 remain open, later-PR behavior stays excluded and destructive GC
+   remains disabled.
+
+Verification completed 2026-07-21 (the full integration service retains its built-in
+health waits; its command was not overridden):
+
+```bash
+docker compose --profile test run --rm --build gotest go test -count=1 ./internal/db ./internal/gc ./internal/api/...
+docker compose --profile test run --rm --build gotest go test -race -count=1 ./internal/db ./internal/gc ./internal/api/...
+docker compose --profile test run --rm --build gotest go build ./...
+docker compose --profile test run --rm --build gotest go vet ./...
+docker compose --profile test run --rm --build gotest go vet -tags=integration ./...
+docker compose --profile test run --rm --build go-integration-test
+```
+
+All six commands passed. The first integration run found one stale fixture that set
+only `gc_state='deleting'`; it was corrected to seed the full claim identity and the
+complete integration suite then passed. The race run also exposed an unsynchronized
+test counter in `blocks_test.go`; the counter is now atomic and the rerun passed.
+
+Re-verified 2026-07-21 after reclassifying the benign lost stub-repair race as
+retryable (`RepairReleasedBlockStub` returns `(false, nil)`; the metadata-upsert
+backstop returns `db.ErrBlockStubRepairContended`, which `RegisterUploadedBlock`
+maps to the retryable fence signal). Build, vet, vet -tags=integration,
+`go test -race` for `./internal/db ./internal/gc ./internal/api/...`, and the full
+integration suite were re-run in Docker; the integration suite passed twice
+consecutively (~257–266s each), so the single earlier failure was a one-node-stack
+flake, not a regression.
 
 ---
 
@@ -329,8 +441,9 @@ in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`.
 
 These stay open and keep destructive GC disabled:
 
-- **Physical delete ABA** — `gc_s3_orphans` has no per-lifecycle claim or generation,
-  so an already-authorized key-only S3 delete can run after the visible fence clears.
+- **Physical delete ABA** — an already-authorized key-only S3 delete can run after
+  the visible fence clears. Cassandra authorization/claim generations cannot revoke
+  a DELETE already in flight; only never-reused generational physical keys close X1.
 - **Cross-DC reference visibility** — `block_references` are ordinary `LOCAL_QUORUM`
   writes that `SERIAL` does not cover; with RF 1 per DC the write and read quorums
   need not intersect (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`).
@@ -343,8 +456,9 @@ These stay open and keep destructive GC disabled:
 ## Verification debt carried by the whole series
 
 - `go test -race` has never run: the dev box has no gcc. Must run in Docker before
-  any PR that touches concurrency merges: **PR-3, PR-4, PR-5 and PR-9**. PR-4 in
-  particular introduces the concurrent canonical reader and must not merge without it.
+  any PR that touches concurrency or conditional lifecycle races merges: **PR-2,
+  PR-3, PR-4, PR-5 and PR-9**. PR-4 in particular introduces the concurrent
+  canonical reader and must not merge without it.
 - No end-to-end download tests against real Cassandra exist for the 404/503 contract.
 - No multi-DC test exercises any of the cross-DC reasoning; it is derived from the
   production consistency contract, not from a reproduction. The dedicated

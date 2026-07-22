@@ -162,8 +162,6 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 	helper := &FSHelper{}
 	oldAdd := registerUploadedBlockAddReferenceFn
 	oldFence := registerUploadedBlockFenceActiveFn
-	oldClaimInfo := registerUploadedBlockClaimInfoFn
-	oldReleaseClaim := registerUploadedBlockReleaseClaimFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
 	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	oldRelease := registerUploadedBlockReleaseRefsFn
@@ -173,8 +171,6 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 	t.Cleanup(func() {
 		registerUploadedBlockAddReferenceFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
-		registerUploadedBlockClaimInfoFn = oldClaimInfo
-		registerUploadedBlockReleaseClaimFn = oldReleaseClaim
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
 		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
 		registerUploadedBlockReleaseRefsFn = oldRelease
@@ -202,14 +198,6 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 		fenceChecks++
 		calls = append(calls, fmt.Sprintf("fence-%d", fenceChecks))
 		return fenceChecks == 1, nil
-	}
-	registerUploadedBlockClaimInfoFn = func(h *FSHelper, orgID, blockID string) (db.BlockDeleteClaimInfo, bool, error) {
-		t.Fatal("stale claim lookup should not run for a normal retrying fence")
-		return db.BlockDeleteClaimInfo{}, false, nil
-	}
-	registerUploadedBlockReleaseClaimFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
-		t.Fatal("stale claim release should not run for a normal retrying fence")
-		return false, nil
 	}
 	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
 		calls = append(calls, "upsert")
@@ -259,88 +247,42 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 	}
 }
 
-func TestRegisterUploadedBlock_ReleasesStaleDeleteClaimWithEmptyStorageClass(t *testing.T) {
-	helper := &FSHelper{db: &db.DB{}}
+// TestRegisterUploadedBlock_TranslatesContendedStubRepairToRetryableFence proves
+// that a benign lost stub-repair race inside the metadata upsert (the backstop for
+// the unprobed web-session funnel) surfaces as the retryable ErrBlockDeleteInProgress
+// signal rather than a hard error, so the materialization wrapper re-probes.
+func TestRegisterUploadedBlock_TranslatesContendedStubRepairToRetryableFence(t *testing.T) {
+	helper := &FSHelper{}
 	oldAdd := registerUploadedBlockAddReferenceFn
 	oldFence := registerUploadedBlockFenceActiveFn
-	oldClaimInfo := registerUploadedBlockClaimInfoFn
-	oldReleaseClaim := registerUploadedBlockReleaseClaimFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
 	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	oldRelease := registerUploadedBlockReleaseRefsFn
-	oldBackoff := registerUploadedBlockRetryBackoffFn
-	oldSleep := registerUploadedBlockSleepFn
+	oldAttempts := registerUploadedBlockRetryAttemptsFn
 	t.Cleanup(func() {
 		registerUploadedBlockAddReferenceFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
-		registerUploadedBlockClaimInfoFn = oldClaimInfo
-		registerUploadedBlockReleaseClaimFn = oldReleaseClaim
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
 		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
 		registerUploadedBlockReleaseRefsFn = oldRelease
-		registerUploadedBlockRetryBackoffFn = oldBackoff
-		registerUploadedBlockSleepFn = oldSleep
+		registerUploadedBlockRetryAttemptsFn = oldAttempts
 	})
 
-	var calls []string
-	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
-		calls = append(calls, "add")
+	registerUploadedBlockAddReferenceFn = func(*FSHelper, string, string, string, string, int) error { return nil }
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(*FSHelper, string, string, string, string, time.Time) error { return nil }
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
+	registerUploadedBlockRetryAttemptsFn = func() int { return 1 }
+	registerUploadedBlockReleaseRefsFn = func(*FSHelper, string, string, string, []string) []string {
+		t.Fatal("provisional ref must survive a transient contended-stub error for the retry")
 		return nil
 	}
-	fenceChecks := 0
-	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
-		fenceChecks++
-		calls = append(calls, fmt.Sprintf("fence-%d", fenceChecks))
-		return fenceChecks == 1, nil
-	}
-	registerUploadedBlockClaimInfoFn = func(h *FSHelper, orgID, blockID string) (db.BlockDeleteClaimInfo, bool, error) {
-		calls = append(calls, "claim-info")
-		return db.BlockDeleteClaimInfo{GCState: db.BlockGCStateDeleting, GCClaimID: "claim-1"}, true, nil
-	}
-	registerUploadedBlockReleaseClaimFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
-		calls = append(calls, "release-claim")
-		if claimID != "claim-1" {
-			t.Fatalf("claimID = %q, want claim-1", claimID)
-		}
-		return true, nil
-	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
-		calls = append(calls, "upsert")
-		if libraryID != "lib-1" {
-			t.Fatalf("libraryID = %q, want lib-1", libraryID)
-		}
-		if sha1ID != "sha1-1" {
-			t.Fatalf("sha1ID = %q, want sha1-1", sha1ID)
-		}
-		return nil
-	}
-	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
-		calls = append(calls, "expiry")
-		return nil
-	}
-	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
-		t.Fatal("release refs should not run when stale claim release succeeds")
-		return nil
-	}
-	registerUploadedBlockRetryBackoffFn = func(attempt int) time.Duration {
-		t.Fatal("backoff should not run when stale claim release succeeds")
-		return 0
-	}
-	registerUploadedBlockSleepFn = func(delay time.Duration) {
-		t.Fatalf("sleep should not run when stale claim release succeeds, got %s", delay)
+	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
+		return fmt.Errorf("%w: block block-1 changed before stub repair", db.ErrBlockStubRepairContended)
 	}
 
-	if err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1"); err != nil {
-		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
-	}
-	want := []string{"add", "expiry", "fence-1", "claim-info", "release-claim", "fence-2", "upsert"}
-	if len(calls) != len(want) {
-		t.Fatalf("calls = %#v, want %#v", calls, want)
-	}
-	for i := range want {
-		if calls[i] != want[i] {
-			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
-		}
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
+	if !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want ErrBlockDeleteInProgress", err)
 	}
 }
 

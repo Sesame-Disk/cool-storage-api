@@ -12,9 +12,13 @@ import (
 )
 
 var probeUploadedBlockReuseFn = ProbeUploadedBlockReuse
+var prepareUploadedBlockProbeFn = PrepareUploadedBlockProbe
 
 var putUploadedBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 	return blockStore.PutBlockAutoDirect(ctx, hash, data)
+}
+var repairReleasedBlockStubForUploadFn = func(database *db.DB, orgID, blockID string) (bool, error) {
+	return database.RepairReleasedBlockStub(orgID, blockID)
 }
 var resolveCanonicalBlockStoreFn = ResolveCanonicalBlockStore
 var reusableCanonicalObjectExistsFn = func(ctx context.Context, blockStore *storage.BlockStore, storageKey string) (bool, error) {
@@ -24,13 +28,34 @@ var repairCanonicalBlockDirectFn = func(ctx context.Context, blockStore *storage
 	return blockStore.PutObjectAutoDirect(ctx, storageKey, data)
 }
 
-// ProbeUploadedBlockReuse wraps the DB probe so callers can fail open to legacy
-// storage behavior when no Cassandra session is available.
+// ProbeUploadedBlockReuse wraps the DB probe. Upload callers fail closed when
+// Cassandra cannot establish whether GC owns the physical object.
 func ProbeUploadedBlockReuse(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
 	if database == nil || database.Session() == nil {
 		return db.BlockReuseProbe{Decision: db.BlockReuseUnknownError}, fmt.Errorf("block reuse probe unavailable for %s: database session is nil", blockID)
 	}
 	return database.ProbeBlockReuse(orgID, blockID)
+}
+
+// PrepareUploadedBlockProbe repairs a released GC claim stub before the caller
+// enters its existing NeedsPut branch. A lost CAS is retryable, but the caller
+// must not PUT based on the stale probe.
+func PrepareUploadedBlockProbe(database *db.DB, orgID, blockID string, probe db.BlockReuseProbe) (db.BlockReuseProbe, error) {
+	if probe.Decision != db.BlockReuseRepairableStub {
+		return probe, nil
+	}
+	if database == nil {
+		return db.BlockReuseProbe{Decision: db.BlockReuseUnknownError}, fmt.Errorf("block stub repair unavailable for %s: database is nil", blockID)
+	}
+	repaired, err := repairReleasedBlockStubForUploadFn(database, orgID, blockID)
+	if err != nil {
+		return db.BlockReuseProbe{Decision: db.BlockReuseUnknownError}, fmt.Errorf("repair released block stub for %s: %w", blockID, err)
+	}
+	if !repaired {
+		return db.BlockReuseProbe{Decision: db.BlockReuseBlockedByGC}, fmt.Errorf("%w: block %s changed before stub repair", ErrBlockDeleteInProgress, blockID)
+	}
+	probe.Decision = db.BlockReuseNeedsPut
+	return probe, nil
 }
 
 // ResolveCanonicalBlockStore resolves the exact canonical backend for a block.

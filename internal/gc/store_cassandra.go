@@ -2114,6 +2114,10 @@ func (s *CassandraStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID str
 	return nil
 }
 
+func (s *CassandraStore) DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID string) (bool, error) {
+	return s.db.DeleteClaimedBlockStub(orgID.String(), blockID, claimID)
+}
+
 // FinalizeBlockDelete removes a block row that was previously claimed by GC.
 func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error {
 	applied, err := s.db.Session().Query(`

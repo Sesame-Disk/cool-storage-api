@@ -8,6 +8,11 @@
 > and both the transient-error fail-open (P6a) and execution-time canonical revalidation gap
 > (P6b) are fixed. Markerless artifact discovery remains P7. Full audit:
 > [../GC-DELETE-CLEANUP-INVESTIGATION.md](../GC-DELETE-CLEANUP-INVESTIGATION.md).
+>
+> **Operator gate:** keep `GC_ENABLED=false` on every replica in every DC while X1
+> physical-delete ABA or X2 cross-DC reference visibility remains open. The lease
+> does not close either blocker. Only after both close may designated replicas in
+> one DC participate under the lease.
 
 ## 1. Worker loop
 
@@ -51,7 +56,7 @@ flowchart TD
     Mapping --> Clear[Clear orphan + candidate]
 ```
 
-The sequence above is safe **given correct upstream classification/reference ownership**. The P6
+The sequence above is conservative **up to S3 delete authorization**, given correct upstream classification/reference ownership. It does not close X1: Cassandra authorization/claim generations cannot revoke an S3 DELETE already in flight; only never-reused generational physical keys prevent a stale delete from targeting re-uploaded bytes. The P6
 fail-open path that could enqueue live fs_objects (causing GC itself to remove legitimate `fs:`
 refs before this block protocol runs) is now fixed: existence reads fail closed (1D).
 
@@ -88,11 +93,8 @@ flowchart TD
 
     Permanent[Direct permanent delete] --> Resolve[Resolve/validate representation]
     Resolve --> HardRows[Delete library/read models + stamp marker]
-    HardRows --> Route{caller}
-    Route -->|org-admin| NoImmediate[P1: no immediate content enqueue]
-    Route -->|superadmin| Async[P2: go fn content-only accelerator]
-    NoImmediate --> MarkerRescue[Marker retained; Phase 13 delayed]
-    Async --> MarkerRescue
+    HardRows --> Immediate[Best-effort immediate ItemLibraryCascade enqueue]
+    Immediate --> MarkerRescue[Durable purge marker retained for Phase 13 recovery]
     MarkerRescue --> LibCascade
 
     LibCascade --> Enumerate[Enqueue commits/fs_objects/artifacts]
@@ -100,8 +102,8 @@ flowchart TD
     Counter --> Final[Delete library marker + policy indexes]
 ```
 
-Roadmap 6A/6B adds `purge_requested_at` so permanent deletes become immediately Phase-13 eligible;
-the goroutine remains only an accelerator.
+Current code stamps `purge_requested_at` so permanent deletes are immediately Phase-13 eligible;
+the immediate enqueue is only an accelerator and the durable marker is the recovery path.
 
 ## 5. Scanner phases and known boundaries
 

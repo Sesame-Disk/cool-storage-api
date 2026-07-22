@@ -59,10 +59,10 @@ Cassandra probe — `DB.ProbeBlockReuse(orgID, blockID)` in
 | `BlockReuseReusable` | canonical metadata + live references, no GC fence    | `EnsureReusableBlockPresent`: verify the canonical object (HEAD on the declared key) and repair (direct PUT) only if missing |
 | `BlockReuseNeedsPut` | no metadata, or metadata with no live references     | `PutBlockAutoDirect` (no HEAD)|
 | `BlockReuseBlockedByGC` | `gc_state='deleting'` or a `gc_s3_orphans` fence  | return `ErrBlockDeleteInProgress` → retry/back-off |
-| `BlockReuseUnknownError` | Cassandra read failed / corrupt metadata         | fall open to legacy Exists+PUT |
+| `BlockReuseUnknownError` | Cassandra read failed / corrupt metadata         | fail closed before S3 PUT |
 
 `PutBlockAutoDirect` (`internal/storage/blocks.go`) issues a direct `PutAuto`
-without the prior HEAD. The probe is wired into all five upload paths:
+without the prior HEAD. The probe is wired into all six upload funnels:
 `HandleUpload` + `finalizeUploadStreaming` (`seafhttp.go`), `SyncHandler.PutBlock`
 (`sync.go`), `FileHandler.CreateFile` template + `UploadFile` (`files.go`), and
 `OnlyOffice.saveEditedDocument` (`onlyoffice.go`).
@@ -71,9 +71,9 @@ without the prior HEAD. The probe is wired into all five upload paths:
 upload paths* listed above. It is **not** a global removal of the S3 HEAD:
 - The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
   (`internal/storage/blocks.go`) still perform `Exists` + `PutAuto`. They remain
-  in use as the probe-error fallback inside the migrated paths and by unmigrated
-  callers such as the `v2/blocks.go` `UploadBlock` handler (which still does its
-  own HEAD + `PutBlockData`).
+  in use by unmigrated callers such as the `v2/blocks.go` `UploadBlock` handler
+  (which still does its own HEAD + `PutBlockData`); migrated funnels fail closed
+  when the Cassandra probe is unavailable.
 - The `Reusable` path no longer skips S3 entirely. To avoid trusting Cassandra
   metadata for a physical object that could be missing (partial GC, external
   deletion, eventual consistency, bugs), `EnsureReusableBlockPresent` does a
@@ -93,11 +93,13 @@ the PUT. It derives from the *reference-first, then fence-check* protocol in
 `FSHelper.RegisterUploadedBlock` (`fs_helpers.go:1006–1034`) versus GC's
 *claim-then-verify-references* in `worker.go:processBlock` (L410–443) — a
 Dekker-style mutual flagging. The `gc_s3_orphans` fence is written *before* the S3
-`DeleteObject` and cleared only *after* it, so any in-flight delete is always
-visible to both the probe and the materialize step. The probe is an optimization
-layer that fails safe in all non-reusable directions (BlockedByGC → retry,
-UnknownError → legacy fallback, NeedsPut → direct PUT). See the audit thread for
-the full interleaving analysis.
+`DeleteObject` and cleared only *after* it, so deletes inside the durable orphan
+lifecycle are visible to both the probe and materialize step. The probe fails
+closed when ownership cannot be established (BlockedByGC → retry, UnknownError →
+error, NeedsPut → direct PUT). This does not close X1: a delayed same-key S3 delete
+can outlive its Cassandra authorization state. Keep GC disabled fleet-wide until
+generational physical keys close X1. See the audit thread for the full interleaving
+analysis.
 
 **Retry loop change:** `retrySeafHTTPBlockMaterialization` (and the shared
 `v2.RetryUploadedBlockMaterialization`) now treat `ErrBlockDeleteInProgress` from
@@ -115,7 +117,7 @@ a Cassandra-first probe can reject the block before any S3 work starts.
 - `internal/api/v2/upload_reuse_test.go` — `EnsureReusableBlockPresent` exists-skip
   (honors `probe.StorageKey`) and missing-repair (derives the key from the hash when
   `storage_key` is empty) paths.
-- `internal/api/v2/upload_reuse_test.go` — shared retry helper + fail-open probe.
+- `internal/api/v2/upload_reuse_test.go` — shared retry helper and probe errors.
 - `internal/api/handler_mapping_failure_test.go` — sync needs-put uses direct PUT,
   not the legacy Exists+PUT.
 

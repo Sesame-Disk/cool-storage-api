@@ -1149,10 +1149,16 @@ func TestWebBlockUploadGCFenceRejected(t *testing.T) {
 
 	// Simulate the GC worker claiming the block for deletion.
 	db := shareProjectionDBForTest(t).Session()
-	if err := db.Query(`UPDATE blocks SET gc_state = 'deleting' WHERE org_id = ? AND block_id = ?`, orgID, hash).Exec(); err != nil {
+	if err := db.Query(`
+		UPDATE blocks SET gc_state = 'deleting', gc_claim_id = ?, gc_claimed_at = ?
+		WHERE org_id = ? AND block_id = ?
+	`, "integration-fence-claim", time.Now().UTC(), orgID, hash).Exec(); err != nil {
 		t.Fatalf("set gc_state: %v", err)
 	}
-	defer db.Query(`UPDATE blocks SET gc_state = '' WHERE org_id = ? AND block_id = ?`, orgID, hash).Exec()
+	defer db.Query(`
+		UPDATE blocks SET gc_state = null, gc_claim_id = null, gc_claimed_at = null
+		WHERE org_id = ? AND block_id = ?
+	`, orgID, hash).Exec()
 
 	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
 		"session": session, "parent_dir": "/", "filename": "fenced.txt",

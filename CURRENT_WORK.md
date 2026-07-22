@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-05-21
-**Session**: Session 60 — Desktop Sync Conflict Hardening + Sync Test Runner/cleanup + PR61 Closeout
+**Last Updated**: 2026-07-21
+**Session**: Upload-fence / GC safety PR series
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -17,7 +17,7 @@
 
 **🔴 PRODUCTION BLOCKERS** (Must complete before deploy):
 1. ~~**OIDC Authentication**~~ - ✅ **COMPLETE** (Phase 1 - Basic Login)
-2. ~~**Garbage Collection**~~ - ✅ **COMPLETE** (Queue worker + 12-phase scanner + 3 cascade types + admin API + audit log + health metrics)
+2. **Destructive Garbage Collection** - 🔴 **BLOCKED** by X1 physical-delete ABA and X2 cross-DC reference visibility. Keep `GC_ENABLED=false` everywhere; the implementation and lease exist but are not permission to activate deletion.
 3. ~~**Monitoring/Health Checks**~~ - ✅ **COMPLETE** (Structured logging, `/health`, `/ready`, `/metrics`)
 
 **Then review**:
@@ -27,10 +27,10 @@
 
 ### Quick Context
 1. **Sync Protocol**: Baseline-verified for the current desktop sync hardening scope. Do not treat it as frozen; compatibility-sensitive follow-up coverage still exists.
-2. **Backend API**: ~98% complete - OIDC ✅, GC ✅, Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
+2. **Backend API**: ~98% complete - OIDC ✅, GC implementation present but destructive activation blocked by X1/X2, Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
-5. **Current risk shape**: No confirmed production bug remains in the current sync hardening slice; the open items are narrower follow-up coverage and cleanup debt, not known correctness regressions.
+5. **Current risk shape**: destructive GC has two confirmed live-data safety blockers (X1/X2) and must remain disabled fleet-wide. The upload-fence PR series addresses separate writer/GC races but does not close those activation gates.
 
 ### Inter-session Update (2026-05-21)
 
@@ -397,11 +397,11 @@ Detail sidebar now has Info | History tabs for files. Full-page history also wor
 
 ### 📊 Current State (Updated 2026-03-05)
 - **Sync Protocol**: 100% working, desktop clients fully compatible 🔒 FROZEN
-- **Backend API**: ~98% implemented — OIDC ✅, GC ✅, Library Settings ✅, OnlyOffice ✅, Tags cascade ✅, Org Admin Panel ✅, Superadmin Departments ✅
+- **Backend API**: ~98% implemented — OIDC ✅, GC implementation present but destructive activation blocked by X1/X2, Library Settings ✅, OnlyOffice ✅, Tags cascade ✅, Org Admin Panel ✅, Superadmin Departments ✅
 - **Frontend UI**: ~83% functional (all modals migrated, folder icons ✅, ~51 ModalPortal wrappers to clean up)
-- **Production Ready**: All production blockers complete — OIDC ✅, GC ✅, Monitoring ✅
+- **Production Ready**: blocked for destructive GC until X1/X2 close; keep `GC_ENABLED=false` on every replica/DC
 - **Admin Panels**: Both superadmin and org admin at feature parity
-- **Active Bugs**: 0 open (all 5 resolved Session 32)
+- **Active Bugs**: tracked canonically in `docs/KNOWN_ISSUES.md`; X1/X2 are current GC blockers
 
 ### Critical Facts to Remember
 

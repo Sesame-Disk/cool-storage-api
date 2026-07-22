@@ -1,6 +1,6 @@
 # Implementation Status - SesameFS
 
-**Last Updated**: 2026-05-20
+**Last Updated**: 2026-07-21
 
 ---
 
@@ -11,20 +11,20 @@
 | Area | Completeness | Notes |
 |------|--------------|-------|
 | Sync Protocol (Desktop) | ~90% | Functional sync scenarios pass, and the current hardening scope is baseline-verified for active-active HEAD-conflict recovery. Broader scenario coverage remains follow-up test debt. |
-| Core Backend API | ~98% | GC ✅, OIDC ✅, Library Settings ✅, Monitoring ✅, Quotas ✅, Plans/Permissions Phase 1+2 ✅, org storage policy backend base ✅ |
+| Core Backend API | ~98% | GC implementation exists but destructive GC is production-disabled pending X1/X2; OIDC ✅, Library Settings ✅, Monitoring ✅, Quotas ✅, Plans/Permissions Phase 1+2 ✅, org storage policy backend base ✅ |
 | Admin Panels | ~95% | Superadmin ✅, Org Admin ✅, both at parity. Audit logs pending |
 | Frontend UI | ~85% | All 122 modals migrated ✅, File History UI ✅, permission UI (~75% with granular flags), ~51 ModalPortal wrappers to clean up, Phase 3 quota/plan UI in progress |
 | Authentication | ~90% | OIDC Phase 1 complete, JWT revocation hardened (2026-03-31), and user API keys now cover desktop/CLI/automation auth in OIDC-only deployments. Device Flow and service-account flows remain future enhancements. |
-| Production Infrastructure | ✅ ~97% | GC ✅, Monitoring ✅, Health checks ✅, Structured logging ✅, Frontend/Backend separation ✅, Nginx production hardening ✅ |
+| Production Infrastructure | ~95% | Destructive GC blocked by X1/X2; Monitoring ✅, Health checks ✅, Structured logging ✅, Frontend/Backend separation ✅, Nginx production hardening ✅ |
 
 **Production Blockers (verified against code 2026-05-20)**:
 1. ~~OIDC Authentication~~ - ✅ COMPLETE (Phase 1 - Basic Login)
-2. ~~Garbage Collection~~ - ✅ COMPLETE (Queue worker + scanner + admin API)
+2. **Garbage Collection activation** - 🔴 BLOCKED: keep `GC_ENABLED=false` on every replica/DC until X1 physical-delete ABA and X2 cross-DC reference visibility both close
 3. ~~Monitoring/Health Checks~~ - ✅ COMPLETE (slog logging, `/health`, `/ready`, `/metrics`)
 4. ~~Frontend/Backend Separation~~ - ✅ COMPLETE (2026-03-30/31) — separate React/nginx container, bootstrap API, nginx production hardening
 5. ~~Programmatic Auth (PATs)~~ - ✅ COMPLETE — user API keys ship via `/api/v2.1/api-keys/`, and `/api2/auth-token/` now exchanges `email + API key` for desktop/CLI tokens. Device Flow remains optional future work.
 6. ~~Desktop sync active-active conflict recovery~~ - ✅ BASELINE VERIFIED for the current hardening scope. `PUT /seafhttp/repo/:repo_id/commit/HEAD` and `POST /seafhttp/repo/:repo_id/update-branch` now use parent-chain validation, CAS, bounded retry, ancestry-gated server-side auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. `scripts/test-sync-active-active.sh` now proves both the non-overlapping concurrent-write race with observed `parent mismatch` plus `auto-merge`, and the same-path unsafe-conflict path with observed retry-budget `503` while both desktop clients preserve their divergent local edits. Broader scenario coverage remains follow-up test debt rather than a current blocker.
-7. **GC Multi-Instance Safety** - ✅ BASELINE HARDENED — GC now defaults off in YAML, activates explicitly via `GC_ENABLED=true`, and enabled replicas coordinate through a Cassandra LWT lease. Multi-region guidance still remains: enable GC in exactly one DC.
+7. **GC Multi-Instance Coordination** - ✅ Lease implemented, but activation remains 🔴 BLOCKED — the lease coordinates enabled replicas but cannot close X1/X2. Keep `GC_ENABLED=false` on every replica in every DC. Only after both close may designated replicas in one DC participate under the lease.
 8. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
 9. **Production Multi-Region Topology** - ⚠️ PARTIAL — region-aware library selection/read/write routing is implemented and covered by focused integration tests, and org-level create-time residency policy now exists in the backend. The stock production config/compose files still ship as single-region examples, and per-region `classes`, `endpoint_regions`, ingress host preservation, rollout, migration, and frontend policy controls remain operator work.
 
@@ -76,7 +76,7 @@
 | **Search** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-22 | Cassandra SASI implementation |
 | **OIDC Authentication** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-03 | Phase 1 complete - SSO login working. JWT revocation hardened: revoked JWT tokens now checked against DB on cache miss (prevents re-authentication after logout/deactivation when `OIDC_JWT_SIGNING_KEY` is set). User API keys now cover non-browser auth and `/api2/auth-token/` exchange for desktop/CLI clients. |
 | **OIDC Group/Dept Sync** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | Claims extraction, sync on login, full sync mode |
-| **Garbage Collection** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-18 | 9 item types (incl. `user_cascade`, `library_cascade`, `org_cascade`), 12 scanner phases, soft-delete cascades for users (7-day grace), libraries (30-day trash), orgs (30-day grace). Full artifact cleanup, atomic group deletion, audit log, health metrics |
+| **Garbage Collection** | 🟡 IMPLEMENTED / PROD DISABLED | Blocked by X1/X2 | ❌ No | 2026-07-21 | Worker/scanner/lease exist, but keep `GC_ENABLED=false` on every replica/DC until physical-delete ABA and cross-DC reference visibility both close. Afterward, only designated replicas in one DC may participate under the lease. |
 | **Admin Panel (Groups/Users)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | 16 admin endpoints + OIDC group/dept sync, 29 tests |
 | **Admin Dashboard KPIs** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-02 | Sysadmin and org-admin overview KPIs use real storage, file, active-user, and traffic data. Storage time-series uses `storage_daily_delta` for historical charts. Traffic stats use `traffic_counters` with per-type desglose. Remaining gaps: device counts unavailable, sysadmin license metadata stubbed. |
 | **Admin Library Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 12 endpoints in admin.go + seafile-api.js methods + trash libraries |
@@ -497,11 +497,11 @@ These MUST be completed before production deployment:
 - **Provider**: https://t-accounts.sesamedisk.com/openid (test environment)
 - **Remaining (Phase 2-3)**: Org/tenant mapping, role synchronization
 
-### 2. ~~Garbage Collection~~ ✅ COMPLETE (2026-01-30)
-- **Impact**: ~~Storage costs grow forever~~ Now automatically cleaned up
-- **Status**: Fully implemented — queue worker + safety scanner + admin API
+### 2. Garbage Collection — implementation complete, production activation blocked
+- **Impact**: Reclamation is unavailable in production while the safety gate is active
+- **Status**: Worker, scanner, admin API, and LWT lease are implemented. Keep `GC_ENABLED=false` on every replica in every DC until X1/X2 both close; only then may designated replicas in one DC participate under the lease.
 - **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_mock.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
-- **Tests**: 88 Go unit tests + 21 bash integration tests
+- **Tests**: Unit, race, and Docker integration coverage exists under `internal/gc/`, `internal/db/`, `internal/api/`, and `internal/integration/`
 - **Admin API**: `GET /api/v2.1/admin/gc/status`, `POST /api/v2.1/admin/gc/run`
 
 ### 3. ~~Monitoring/Health Checks~~ ✅ COMPLETE (2026-01-30)
@@ -585,7 +585,7 @@ These MUST be completed before production deployment:
 
 ## Metrics
 
-**Last Updated**: 2026-05-20
+**Last Updated**: 2026-07-21
 
 | Metric | Value | Notes |
 |--------|-------|-------|
@@ -607,8 +607,8 @@ These MUST be completed before production deployment:
 - ❌ TODO: ~2 components (audit logs, monitored-repos)
 
 **Production Readiness**:
-- Backend: ~98% for web/API surfaces (core auth blocker complete, both admin panels implemented; GC multi-instance safety still needs a real distributed lease beyond the temporary `GC_ENABLED` guard)
+- Backend: ~98% for web/API surfaces, but destructive GC is production-disabled pending X1/X2. The distributed lease exists; it coordinates designated participants only after both blockers close.
 - Desktop sync: not yet ready to call fully production-safe for active-active multi-node deployments until HEAD-conflict recovery is explicitly proven or hardened
 - Frontend: ~85% (modals done, granular permission flags enforced, missing: some permission UI edge cases, ~51 ModalPortal wrapper cleanup)
-- Infrastructure: ~95% (monitoring ✅, health checks ✅, GC ✅)
+- Infrastructure: ~95% (monitoring ✅, health checks ✅, GC implementation present but production activation blocked by X1/X2)
 - Documentation: ~85% (deployment, migration, testing, API, architecture, and feature docs exist; missing: end-user guides and operational admin runbooks)

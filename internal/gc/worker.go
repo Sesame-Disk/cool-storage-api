@@ -467,6 +467,34 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
 	}
 	if hasRefs {
+		blockInfo, infoErr := w.store.GetBlockInfo(item.OrgID, item.ItemID)
+		if infoErr != nil {
+			return fmt.Errorf("failed to load re-referenced block info for %s: %w", item.ItemID, infoErr)
+		}
+		if blockInfo.CreatedAt == nil {
+			if strings.TrimSpace(blockInfo.StorageClass) != "" {
+				return fmt.Errorf("stub block %s has storage class without creation timestamp", item.ItemID)
+			}
+			// The owned claim fences writers. Remove any partially backfilled mapping
+			// before deleting the only row that carries its identity; retries are
+			// idempotent if the subsequent conditional stub delete fails.
+			if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.RepresentationID, blockInfo.Sha1); err != nil {
+				return err
+			}
+			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, claimID)
+			if deleteErr != nil {
+				return fmt.Errorf("failed to delete re-referenced claimed stub %s: %w", item.ItemID, deleteErr)
+			}
+			if !deleted {
+				return fmt.Errorf("claimed stub %s changed before conditional delete", item.ItemID)
+			}
+			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
+				return fmt.Errorf("failed to clear block GC candidate after re-referenced stub cleanup: %w", err)
+			}
+			log.Printf("[GC Worker] Block %s re-referenced after a stub claim; removed the owned stub", item.ItemID)
+			metrics.GCItemsSkippedTotal.Inc()
+			return nil
+		}
 		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
 			return fmt.Errorf("failed to release claim on re-referenced block %s: %w", item.ItemID, relErr)
 		}
@@ -488,14 +516,19 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	storageClass := strings.TrimSpace(blockInfo.StorageClass)
 	if storageClass == "" {
 		if blockInfo.CreatedAt == nil {
-			if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, claimID); err != nil {
-				return fmt.Errorf("failed to remove stub block row for %s: %w", item.ItemID, err)
-			}
-			// Stub row carries no metadata; blockInfo.Sha1 is captured before the
-			// FinalizeBlockDelete above and is normally empty for a stub.
 			if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.RepresentationID, blockInfo.Sha1); err != nil {
 				return err
 			}
+			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, claimID)
+			if deleteErr != nil {
+				return fmt.Errorf("failed to remove stub block row for %s: %w", item.ItemID, deleteErr)
+			}
+			if !deleted {
+				return fmt.Errorf("claimed stub %s changed before conditional delete", item.ItemID)
+			}
+			// Stub row carries no canonical metadata; blockInfo.Sha1 is captured
+			// before deletion and is normally empty, but may have been backfilled by
+			// an interrupted materialization attempt.
 			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 				return fmt.Errorf("failed to clear block GC candidate after stub cleanup: %w", err)
 			}

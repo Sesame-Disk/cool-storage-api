@@ -1,7 +1,7 @@
 # SesameFS v1.0 — Production Readiness Roadmap
 
-**Last updated:** 2026-03-31
-**Current status:** ~82% production-ready (per `IMPLEMENTATION_STATUS.md`)
+**Last updated:** 2026-07-21
+**Current status:** GC production activation is blocked by X1/X2; see `IMPLEMENTATION_STATUS.md`
 
 This document identifies every blocker, high-priority item, and fast-follow task required before
 the v1.0 production launch. Items are classified by priority and include current state analysis,
@@ -92,7 +92,7 @@ handler files. `internal/models/` has only ~550 lines and only defines basic str
 The code is functional and all features work correctly. The large files create operational risk
 for incident response (harder to locate and fix bugs quickly), but this is a code quality issue,
 not a functional blocker. The real remaining launch-critical gaps are Accounts M2M provisioning,
-GC multi-instance safety, and the general security-hardening checklist.
+GC destructive-delete safety (X1/X2), and the general security-hardening checklist.
 Reorganization should happen post-launch when stability allows for large refactors.
 
 **Proposed structure (move code, do not rewrite):**
@@ -547,7 +547,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 | 12 | Cursor-based pagination | **P2** | Admin links done; library/group admin lists still pending | 2-4 days |
 | 13 | Cold storage / Glacier | **P2** | ~30% | 2–3 weeks |
 | **14** | **User-scoped programmatic auth (API keys)** | **✅ DONE** | **User API keys + `/api2/auth-token/` are live. 2026-04-04 hardening now propagates scope to derived sessions, caps effective role, and enforces central library/sync scope checks. Accounts can reuse the same API key system through a dedicated platform service account; the remaining work belongs to item #1.** | — |
-| **15** | **GC multi-instance safety** | **P0** | **Baseline landed: GC now defaults off in YAML, activates explicitly via `GC_ENABLED=true`, and enabled replicas coordinate through a Cassandra LWT lease (`gc_leases`). For multi-region: GC MUST still run in exactly one DC. LWT operations use `SERIAL` (global Paxos) — do NOT change to `LOCAL_SERIAL`. Two-phase block deletion now persists S3-pending recovery state before removing the canonical DB row.** | **follow-up: observability / crash-drill coverage** |
+| **15** | **GC destructive-delete safety and activation** | **P0** | **The LWT lease (`gc_leases`) is implemented, but X1 physical-delete ABA and X2 cross-DC reference visibility remain open. Keep `GC_ENABLED=false` on every replica in every DC. Only after both close may designated replicas in one DC participate under the lease; all other DCs remain disabled. `SERIAL` does not make ordinary `LOCAL_QUORUM` reference writes globally visible.** | **blockers: X1/X2; then observability / crash drills** |
 | 16 | Frontend Phase 3 cleanup | **P1** | Mostly done. Legacy `personalfree/business/pay_restricted*` removed. Remaining: pageOptions placeholders and minor cleanup | 2–3 days |
 
 ---
@@ -560,7 +560,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 - [#7] ✅ Enforcement Phase 2 wire-up — DONE (2026-03-28)
 
 ### Sprint 2 — Hard Blockers (CURRENT)
-- [#15] GC multi-instance safety — temporary `GC_ENABLED` guard is available; Cassandra LWT leader lease still pending
+- [#15] GC destructive-delete safety — lease coordination is implemented, but keep `GC_ENABLED=false` fleet-wide until X1/X2 both close; then activate designated replicas in one DC under the lease
 - [#9] Security hardening — small effort, high impact
 - [#1] Remaining Accounts integration — formalize service-account API key auth, provisioning endpoint, idempotency/audit
 

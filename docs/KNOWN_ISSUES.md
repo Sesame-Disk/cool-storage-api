@@ -51,7 +51,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **`blocks` Hot Partition by `org_id`** | ✅ Fixed (2026-05-26) | `blocks`, `gc_block_candidates`, `gc_s3_orphans`, and the block-id mapping tables now use per-block partitioning so no single org concentrates LWT traffic into one Cassandra partition. The GC scan and S3 orphan recovery paths walk per-day discovery projections instead of partition-scanning by org. See ISSUE-BLOCKS-HOT-PARTITION-01 below. |
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
-| **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on the five server-side upload paths. NOT global: legacy `BlockStore` Exists+PUT methods remain for fallback + unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
+| **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Read Paths Ignore `storage_key`** | ✅ Fixed by derived-key invariant | Reads, reuse/repair, normal GC delete, and orphan recovery derive the deterministic org-scoped key; reuse fails closed if a non-empty `storage_key` differs. The column is not an arbitrary locator, so non-derived layouts remain unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
@@ -930,9 +930,9 @@ and the `gc_s3_orphans` fence to return one of:
   exists (HEAD on the declared key) and repair it (direct PUT) only if missing
 - `BlockReuseNeedsPut` → `PutBlockAutoDirect` (direct PUT, no HEAD)
 - `BlockReuseBlockedByGC` → `ErrBlockDeleteInProgress` (retry/back-off)
-- `BlockReuseUnknownError` → fall open to the legacy Exists+PUT path
+- `BlockReuseUnknownError` → fail closed before S3 PUT
 
-Wired into all five upload paths. New blocks now pay ≤2 Cassandra reads (~1 ms each)
+Wired into all six upload funnels. New blocks now pay ≤2 Cassandra reads (~1 ms each)
 + 1 direct PUT, **no HEAD**; dedup hits pay 3 Cassandra reads + 1 canonical-verify
 HEAD (+ a repair PUT only when the object is actually missing).
 
@@ -942,8 +942,8 @@ This is fixed for the *server-side hot upload paths*, not across the whole repo:
 
 - The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
   (`internal/storage/blocks.go`) still do `Exists` + `PutAuto`. They remain in use
-  as the probe-error fallback inside the migrated paths and by unmigrated callers
-  such as the `v2/blocks.go` `UploadBlock` handler (its own HEAD + `PutBlockData`).
+  by unmigrated callers such as the `v2/blocks.go` `UploadBlock` handler (its own
+  HEAD + `PutBlockData`); migrated funnels fail closed on probe errors.
 - The `Reusable` path does not skip S3: `EnsureReusableBlockPresent` adds a targeted
   HEAD on the canonical key (with repair-on-miss) so the upload never publishes a
   reference to a physically-missing object. This is a deliberate safety/perf trade —
@@ -955,10 +955,12 @@ GC-race safety derives from the *reference-first, then fence-check* protocol in
 `FSHelper.RegisterUploadedBlock` (`fs_helpers.go:1006–1034`) versus GC's
 *claim-then-verify-references* in `worker.go:processBlock` (L410–443) — a
 Dekker-style mutual flagging — not from the S3 PUT. The `gc_s3_orphans` fence is
-written before the S3 `DeleteObject` and cleared only after it, so any in-flight
-delete is always visible to both the probe and the materialize step. The probe is
-an optimization that fails safe in every non-reusable direction. The canonical
-verify/repair on the reuse path is an extra physical guarantee on top of this.
+written before the S3 `DeleteObject`, so probes can observe the normal in-flight
+delete window. This does **not** close X1: after a recoverer clears Cassandra state,
+an already-issued S3 DELETE can still arrive late, and Cassandra claim generations
+cannot revoke it. Only never-reused generational physical keys close that ABA. The
+canonical verify/repair on the reuse path is an additional check, not permission to
+enable destructive GC.
 
 The materialization retry loop (`retrySeafHTTPBlockMaterialization` and
 `v2.RetryUploadedBlockMaterialization`) now also retries when the `store` phase
@@ -1759,8 +1761,10 @@ An S3 delete already authorized for `blocks/<org>/<hash>` can complete after its
 visible Cassandra fence clears and after a writer stores byte-identical content at
 the same key. Content addressing makes ETag/value comparison unable to distinguish
 the old lifecycle from the new one. Claim-stub repair does not close this in-flight
-physical-delete ABA. Keep destructive GC disabled until the physical key or delete
-authorization carries a lifecycle generation that a stale delete cannot target.
+physical-delete ABA. Cassandra authorization generations or claim generations alone
+cannot revoke an S3 DELETE already in flight. X1 closes only when new bytes use
+never-reused generational physical keys, so a stale delete can target only the old
+key. Keep destructive GC disabled until that physical-key invariant is implemented.
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1.
 
 ---
@@ -1801,13 +1805,13 @@ PUT or a sweeper with a safe ownership proof. Tracking:
 
 ### ISSUE-GC-MULTIINSTANCE-01: Multi-instance GC coordination and split-brain hardening
 
-**Status**: 🟡 Pending with temporary prod workaround
+**Status**: 🟡 Lease implemented; destructive activation blocked independently by X1/X2
 **Discovered**: 2026-03-17
 **Priority**: 🟡 High — required before scaling to multiple replicas
 **Affected**: `internal/gc/worker.go`, `internal/gc/scanner.go`, `internal/gc/gc.go`
 
-**Problem:**
-The GC (worker + scanner) has no coordination mechanism between instances. If multiple server replicas are running, all of them execute the worker and scanner in parallel, causing:
+**Original problem (now coordinated by `gc_leases`):**
+Before the LWT lease, multiple server replicas could execute worker and scanner work in parallel, causing:
 
 1. **DequeueBatch without locking**: `SELECT ... LIMIT ?` returns the same items to all instances. Both process the same items simultaneously.
 2. **Scanner without leader election**: Multiple scanners enqueue the same orphans as duplicates (the PK includes `queued_at = time.Now()`, so each INSERT creates a distinct row).
@@ -1824,10 +1828,10 @@ the independent physical-delete ABA and cross-DC visibility blockers above:
 incorrect admin counters. This statement does not close or downgrade the independent
 destructive-GC blockers above.
 
-**Current operational decision (updated 2026-04-14):**
-- Keep `gc.enabled=false` in YAML and set `GC_ENABLED=true` only on the replicas that are allowed to run GC.
-- SesameFS now uses a Cassandra LWT lease (`gc_leases`) so if more than one enabled replica is up, only one runs worker/scanner/rollover work at a time.
-- In multi-region, still enable GC in exactly one DC. The lease protects overlap; it does not remove the cross-DC Paxos cost of competing leaders.
+**Current operational decision (updated 2026-07-21):**
+- Keep `gc.enabled=false` and `GC_ENABLED=false` on every replica in every DC while X1 or X2 remains open.
+- The Cassandra LWT lease (`gc_leases`) coordinates participants but does not close either blocker and is not permission to enable GC.
+- Only after both X1 and X2 close may designated replicas in one DC set `GC_ENABLED=true` and participate under the lease. Every replica in every other DC remains false.
 
 **Leader Election via LWT:**
 - Implemented with `gc_leases` and TTL-backed heartbeats.
@@ -1835,16 +1839,16 @@ destructive-GC blockers above.
 - If the leader dies or loses its lease, another enabled replica can take over automatically after lease expiry.
 
 **Recommended future direction:**
-- Keep the explicit `GC_ENABLED=true` activation model so GC stays opt-in by replica.
+- After X1/X2 close, keep the explicit `GC_ENABLED=true` activation model so only designated replicas in one DC opt in.
 - Consider exposing lease state/owner in admin status if operators want clearer observability during failover drills.
 
-**Multi-region deployment note (2026-04-10):**
-Running GC in a single DC is **critical** for multi-region deployments with Cassandra replication. Even though LWT operations use `SERIAL` consistency (global Paxos) by default, running GC on multiple DCs would cause:
+**Multi-region deployment note (updated 2026-07-21):**
+While X1/X2 remain open, running GC in even one DC is unsafe: keep it disabled in all DCs. After both close, restricting participants to a single DC is **critical**. Even though LWT operations use `SERIAL` consistency (global Paxos) by default, running GC on multiple DCs would cause:
 - `DequeueBatch` (non-LWT SELECT) returning the same items to workers in different DCs
 - Scanner in both DCs enqueueing duplicate orphans
 - Unnecessary cross-DC Paxos contention on every LWT
 
-The existing `GC_ENABLED=true` on exactly one DC / `GC_ENABLED=false` on all others remains the correct topology for multi-region. The lease now provides automatic failover among enabled replicas, but you should still avoid enabling GC in multiple DCs at once.
+Post-X1/X2 topology is `GC_ENABLED=true` only on designated replicas in one DC and `GC_ENABLED=false` everywhere else. Until both close, the topology is `GC_ENABLED=false` everywhere. The lease provides failover only among designated replicas in that one DC.
 
 Block-level conditional operations include first-writer metadata creation, GC claim,
 claim release/finalize, and orphan lifecycle transitions; production defaults these
@@ -4069,11 +4073,12 @@ canonical presence is expected.
 
 Per project posture (pre-production, empty server, no legacy-data preservation) there is no
 production orphan backlog to inherit, and the stop-the-world GC upgrade (see `docs/DEPLOY.md`)
-plus a queue/DLQ drain before re-enabling GC removes any transient rows.
+plus a queue/DLQ drain removes any transient rows. Re-enabling remains prohibited
+while X1/X2 are open; after both close, the backlog preflight is an additional gate.
 
 #### Options if a real backlog ever exists
 
-- A fail-closed preflight that refuses to re-enable GC while commit/fs_object rows exist with
+- After X1/X2 close, a fail-closed preflight that also refuses activation while commit/fs_object rows exist with
   `library_guard_mode IS NULL AND requires_library_deleted_check=false`.
 - A `legacy_unclassified` mode that is quarantined (never auto-executed) for operator triage.
 - A `work_source` / `queue_protocol_version` column so this ambiguity cannot recur.
@@ -4210,10 +4215,10 @@ genuinely open rather than brownfield-only.
 
 #### Problem
 
-The integration suite runs against a **shared** dev keyspace and MinIO bucket with no global
+**Historical non-production observation:** the integration suite ran against a **shared** dev keyspace and MinIO bucket with no global
 truncate/teardown; cleanup is only by ephemeral library name. Confirmed residue/interference:
 
-1. `TestMain` does not start/own the external `Service`, but the dev backend has GC enabled and
+1. `TestMain` did not start/own the external `Service`, but the dev backend had GC enabled and
    normal tests call global `/api/v2.1/admin/gc/run`; therefore "nothing drains" is false.
 2. `TestAdminIdentityProjectionRegression_HardDeleteOrganization` constructs a worker with
    `storage=nil` and calls global `ProcessOnce()`

@@ -200,7 +200,8 @@ type MockStore struct {
 	dlqOpHook func(orgID uuid.UUID, op string)
 	// force the "row disappeared between CAS read and repair update" path in
 	// RecordS3Orphan so tests can verify we do not resurrect partial phantom rows.
-	recordS3OrphanRepairRace bool
+	recordS3OrphanRepairRace         bool
+	deleteClaimedBlockStubForceFalse bool
 
 	// audit_log entries
 	auditLog []AuditLogEntry
@@ -212,14 +213,16 @@ type MockStore struct {
 }
 
 type mockBlock struct {
-	OrgID            uuid.UUID
-	BlockID          string
-	StorageClass     string
-	CreatedAt        *time.Time
-	GCState          string
-	GCClaimID        string
-	RepresentationID string
-	Sha1             string
+	OrgID               uuid.UUID
+	BlockID             string
+	StorageClass        string
+	StorageClassPresent bool
+	CreatedAt           *time.Time
+	GCState             string
+	GCClaimID           string
+	GCClaimedAt         *time.Time
+	RepresentationID    string
+	Sha1                string
 }
 
 type mockPendingItemKey struct {
@@ -582,11 +585,12 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	createdAt := time.Now().UTC()
 	m.blocks[key] = &mockBlock{
-		OrgID:            orgID,
-		BlockID:          blockID,
-		StorageClass:     storageClass,
-		RepresentationID: db.PlainBlockRepresentationID,
-		CreatedAt:        &createdAt,
+		OrgID:               orgID,
+		BlockID:             blockID,
+		StorageClass:        storageClass,
+		StorageClassPresent: true,
+		RepresentationID:    db.PlainBlockRepresentationID,
+		CreatedAt:           &createdAt,
 	}
 	// Model the legacy refCount as that many distinct reference rows so existing
 	// tests keep their "block is alive with N refs" intent under the row model.
@@ -2075,13 +2079,23 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	b, ok := m.blocks[key]
 	if !ok {
-		return false, nil
+		claimedAt := time.Now().UTC()
+		m.blocks[key] = &mockBlock{
+			OrgID:       orgID,
+			BlockID:     blockID,
+			GCState:     db.BlockGCStateDeleting,
+			GCClaimID:   claimID,
+			GCClaimedAt: &claimedAt,
+		}
+		return true, nil
 	}
 	if b.GCState == db.BlockGCStateDeleting {
 		return b.GCClaimID == claimID, nil
 	}
 	b.GCState = db.BlockGCStateDeleting
 	b.GCClaimID = claimID
+	claimedAt := time.Now().UTC()
+	b.GCClaimedAt = &claimedAt
 	return true, nil
 }
 
@@ -2095,9 +2109,26 @@ func (m *MockStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) 
 		}
 		b.GCState = ""
 		b.GCClaimID = ""
+		b.GCClaimedAt = nil
 		return nil
 	}
 	return fmt.Errorf("block delete claim release not applied for %s", blockID)
+}
+
+func (m *MockStore) DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.deleteClaimedBlockStubForceFalse {
+		return false, nil
+	}
+
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	b, ok := m.blocks[key]
+	if !ok || b.CreatedAt != nil || b.StorageClassPresent || b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID || b.GCClaimedAt == nil {
+		return false, nil
+	}
+	delete(m.blocks, key)
+	return true, nil
 }
 
 func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error {
