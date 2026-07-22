@@ -101,10 +101,18 @@ can outlive its Cassandra authorization state. Keep GC disabled fleet-wide until
 generational physical keys close X1. See the audit thread for the full interleaving
 analysis.
 
-**Retry loop change:** `retrySeafHTTPBlockMaterialization` (and the shared
-`v2.RetryUploadedBlockMaterialization`) now treat `ErrBlockDeleteInProgress` from
-the `store` phase as retryable (previously only the `materialize` phase was), since
-a Cassandra-first probe can reject the block before any S3 work starts.
+**Retry loop change:** `retrySeafHTTPBlockMaterialization`, the shared
+`v2.RetryUploadedBlockMaterialization`, and the template-CreateFile wrapper treat a GC
+delete fence (`ErrBlockDeleteInProgress`) in **either** phase as retryable, plus any
+failure **tagged** `v2.ErrBlockMaterializationTransient` (produced today by the
+materialize phase — `RegisterUploadedBlock` Cassandra I/O and the mapping write). As of
+PR-3, `RegisterUploadedBlock` no longer waits out the fence internally — it propagates
+it, so the wrapper re-PUTs the object when the fence is observed (closes the
+observed-fence half of F1; the fast-clear window stays with PR-5). A permanent metadata
+failure (`db.ErrBlockMetadataPermanent`) is not retried, and the retry metric
+`block_upload_materialization_retries_total{surface,reason}` labels the reason by the
+failing phase (`probe` = store phase, `materialization` = metadata materialize phase),
+so a metadata write is never counted as `probe` (closes F14).
 
 **Tests:**
 - `internal/db/block_references_test.go` — full `ProbeBlockReuse` decision matrix

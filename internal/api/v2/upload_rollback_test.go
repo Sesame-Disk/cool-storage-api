@@ -92,6 +92,67 @@ func TestRegisterUploadedBlockAndMapping_RollsBackOnMappingFailure(t *testing.T)
 	}
 }
 
+// TestRegisterUploadedBlockAndMapping_TransientMappingFailureIsRetryable is the
+// F6 mapping regression: a transient mapping-write failure is tagged
+// ErrBlockMaterializationTransient (so the wrapper retries) and preserves the
+// underlying cause via %w, while still carrying ErrBlockMappingWriteFailed.
+func TestRegisterUploadedBlockAndMapping_TransientMappingFailureIsRetryable(t *testing.T) {
+	oldRegister := registerUploadedBlockForMaterializationFn
+	oldWriteMapping := writeBlockMappingForMaterializationFn
+	oldRollback := rollbackUploadedBlockRefsFn
+	defer func() {
+		registerUploadedBlockForMaterializationFn = oldRegister
+		writeBlockMappingForMaterializationFn = oldWriteMapping
+		rollbackUploadedBlockRefsFn = oldRollback
+	}()
+
+	registerUploadedBlockForMaterializationFn = func(*db.DB, string, string, string, string, int, string, string, string) error {
+		return nil
+	}
+	wantCause := errors.New("cassandra timeout")
+	writeBlockMappingForMaterializationFn = func(*db.DB, string, string, string, string) error { return wantCause }
+	rollbackUploadedBlockRefsFn = func(*db.DB, string, string, string, []string) {}
+
+	err := RegisterUploadedBlockAndMapping(nil, "org-1", "repo-1", "int-1", "op-1", 123, "hot", "", "ext-1")
+	if !IsRetryableBlockMaterializationError(err) {
+		t.Fatalf("error = %v, want retryable (ErrBlockMaterializationTransient)", err)
+	}
+	if !errors.Is(err, ErrBlockMappingWriteFailed) {
+		t.Fatalf("error = %v, want ErrBlockMappingWriteFailed preserved", err)
+	}
+	if !errors.Is(err, wantCause) {
+		t.Fatalf("error = %v, want underlying cause preserved via %%w", err)
+	}
+}
+
+// A permanent id-mapping conflict must NOT become retryable.
+func TestRegisterWebUploadedBlockAndMapping_ConflictIsNotRetryable(t *testing.T) {
+	oldRegister := registerUploadedBlockForMaterializationFn
+	oldWriteMapping := writeVerifiedWebBlockMappingFn
+	oldRollback := rollbackUploadedBlockRefsFn
+	defer func() {
+		registerUploadedBlockForMaterializationFn = oldRegister
+		writeVerifiedWebBlockMappingFn = oldWriteMapping
+		rollbackUploadedBlockRefsFn = oldRollback
+	}()
+
+	registerUploadedBlockForMaterializationFn = func(*db.DB, string, string, string, string, int, string, string, string) error {
+		return nil
+	}
+	writeVerifiedWebBlockMappingFn = func(*db.DB, string, string, string, string) error {
+		return db.ErrBlockIDMappingConflict
+	}
+	rollbackUploadedBlockRefsFn = func(*db.DB, string, string, string, []string) {}
+
+	err := RegisterWebUploadedBlockAndMapping(nil, "org-1", "repo-1", "int-1", "op-1", 123, "hot", "", "ext-1")
+	if !errors.Is(err, db.ErrBlockIDMappingConflict) {
+		t.Fatalf("error = %v, want db.ErrBlockIDMappingConflict", err)
+	}
+	if IsRetryableBlockMaterializationError(err) {
+		t.Fatalf("a permanent mapping conflict must not be retryable: %v", err)
+	}
+}
+
 func TestRegisterUploadedBlockAndMapping_SkipsMappingWithoutExternalID(t *testing.T) {
 	oldRegister := registerUploadedBlockForMaterializationFn
 	oldWriteMapping := writeBlockMappingForMaterializationFn

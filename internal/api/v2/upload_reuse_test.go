@@ -3,12 +3,41 @@ package v2
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+// fastBlockMaterializationRetries shrinks the shared retry backoff to keep tests
+// fast and returns the recorded sleeps captured through the overridable hook.
+func fastBlockMaterializationRetries(t *testing.T) *[]time.Duration {
+	t.Helper()
+	oldDelay := libraryHeadMutationRetryDelay
+	oldMaxDelay := libraryHeadMutationRetryMaxDelay
+	oldJitter := libraryHeadMutationRetryJitter
+	oldSleep := registerUploadedBlockSleepFn
+	t.Cleanup(func() {
+		libraryHeadMutationRetryDelay = oldDelay
+		libraryHeadMutationRetryMaxDelay = oldMaxDelay
+		libraryHeadMutationRetryJitter = oldJitter
+		registerUploadedBlockSleepFn = oldSleep
+	})
+	libraryHeadMutationRetryDelay = time.Millisecond
+	libraryHeadMutationRetryMaxDelay = time.Millisecond
+	libraryHeadMutationRetryJitter = 0
+	slept := &[]time.Duration{}
+	registerUploadedBlockSleepFn = func(delay time.Duration) { *slept = append(*slept, delay) }
+	return slept
+}
+
+func retryReasonCount(surface, reason string) float64 {
+	return testutil.ToFloat64(metrics.BlockUploadMaterializationRetriesTotal.WithLabelValues(surface, reason))
+}
 
 func TestRetryUploadedBlockMaterializationRetriesStoreFence(t *testing.T) {
 	oldDelay := libraryHeadMutationRetryDelay
@@ -205,6 +234,188 @@ func TestRetryUploadedBlockMaterializationReturnsNonRetryableStoreError(t *testi
 	}, nil, nil)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("RetryUploadedBlockMaterialization() error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationRetriesTransientMaterialize(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	storeCalls := 0
+	materializeCalls := 0
+	err := RetryUploadedBlockMaterialization("UploadFile", "block-1", func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		materializeCalls++
+		if materializeCalls == 1 {
+			return fmt.Errorf("cassandra timeout: %w", ErrBlockMaterializationTransient)
+		}
+		return nil
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("error = %v, want nil", err)
+	}
+	// A transient materialize failure re-runs the WHOLE cycle, so store re-PUTs
+	// before the second materialize.
+	if storeCalls != 2 || materializeCalls != 2 {
+		t.Fatalf("store/materialize calls = %d/%d, want 2/2", storeCalls, materializeCalls)
+	}
+}
+
+// TestRetryUploadedBlockMaterializationRePutsAfterMaterializeFence is the F1
+// regression for the generic wrapper: when the materialize phase
+// (RegisterUploadedBlock) reports a GC delete fence — the exact case where GC may
+// have physically deleted the object — the wrapper repeats the WHOLE cycle so the
+// store phase re-PUTs the object before the second materialize succeeds. Three of
+// the six funnels use this generic wrapper (UploadFile, PutBlock, OnlyOffice); the
+// SeafHTTP and template-CreateFile wrappers are separate copies with the same
+// re-PUT-on-fence shape, exercised by their own tests
+// (TestRetrySeafHTTP... and TestRetryCreateFileTemplate...). This F1 coverage is at
+// the wrapper level; the deterministic fast-clear window (a full GC cycle between
+// the single fence read and publish) is closed with PR-5's real-worker regression.
+func TestRetryUploadedBlockMaterializationRePutsAfterMaterializeFence(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	puts := 0
+	materializeCalls := 0
+	// store models a NeedsPut branch: each invocation is a physical re-PUT.
+	store := func() error {
+		puts++
+		return nil
+	}
+	materialize := func() error {
+		materializeCalls++
+		if materializeCalls == 1 {
+			// GC fenced the block during materialize; the object may be gone.
+			return ErrBlockDeleteInProgress
+		}
+		return nil
+	}
+	if err := RetryUploadedBlockMaterialization("UploadFile", "block-1", store, materialize, nil, nil); err != nil {
+		t.Fatalf("error = %v, want nil", err)
+	}
+	if puts != 2 {
+		t.Fatalf("store(re-PUT) calls = %d, want 2 (object re-PUT after the fence cleared)", puts)
+	}
+	if materializeCalls != 2 {
+		t.Fatalf("materialize calls = %d, want 2", materializeCalls)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationDoesNotRetryPermanentFailure(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	storeCalls := 0
+	materializeCalls := 0
+	err := RetryUploadedBlockMaterialization("UploadFile", "block-1", func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		materializeCalls++
+		return fmt.Errorf("upsert block metadata: %w", db.ErrBlockMetadataPermanent)
+	}, nil, nil)
+	if !errors.Is(err, db.ErrBlockMetadataPermanent) {
+		t.Fatalf("error = %v, want db.ErrBlockMetadataPermanent", err)
+	}
+	if storeCalls != 1 || materializeCalls != 1 {
+		t.Fatalf("store/materialize calls = %d/%d, want 1/1 (no retry)", storeCalls, materializeCalls)
+	}
+}
+
+// TestRetryUploadedBlockMaterializationLabelsReasonByPhase is the direct F14
+// regression: a write failure in the materialize phase is labeled
+// "materialization", never "probe"; a store-phase transient is "probe"; and a
+// fence in either phase is "gc_fence".
+func TestRetryUploadedBlockMaterializationLabelsReasonByPhase(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	t.Run("store-phase transient is probe", func(t *testing.T) {
+		const surface = "TestReasonProbe"
+		before := retryReasonCount(surface, blockMaterializationReasonProbe)
+		calls := 0
+		err := RetryUploadedBlockMaterialization(surface, "block-1", func() error {
+			calls++
+			if calls == 1 {
+				return fmt.Errorf("probe read: %w", ErrBlockMaterializationTransient)
+			}
+			return nil
+		}, func() error { return nil }, nil, nil)
+		if err != nil {
+			t.Fatalf("error = %v, want nil", err)
+		}
+		if got := retryReasonCount(surface, blockMaterializationReasonProbe) - before; got != 1 {
+			t.Fatalf("probe retries = %v, want 1", got)
+		}
+		if got := retryReasonCount(surface, blockMaterializationReasonMaterial); got != 0 {
+			t.Fatalf("materialization retries = %v, want 0 (write not mislabeled as read)", got)
+		}
+	})
+
+	t.Run("materialize-phase transient is materialization", func(t *testing.T) {
+		const surface = "TestReasonMaterialize"
+		beforeMat := retryReasonCount(surface, blockMaterializationReasonMaterial)
+		beforeProbe := retryReasonCount(surface, blockMaterializationReasonProbe)
+		calls := 0
+		err := RetryUploadedBlockMaterialization(surface, "block-1", func() error { return nil }, func() error {
+			calls++
+			if calls == 1 {
+				return fmt.Errorf("metadata write: %w", ErrBlockMaterializationTransient)
+			}
+			return nil
+		}, nil, nil)
+		if err != nil {
+			t.Fatalf("error = %v, want nil", err)
+		}
+		if got := retryReasonCount(surface, blockMaterializationReasonMaterial) - beforeMat; got != 1 {
+			t.Fatalf("materialization retries = %v, want 1", got)
+		}
+		if got := retryReasonCount(surface, blockMaterializationReasonProbe) - beforeProbe; got != 0 {
+			t.Fatalf("probe retries = %v, want 0 (write must not be labeled as read)", got)
+		}
+	})
+
+	t.Run("fence in materialize phase is gc_fence", func(t *testing.T) {
+		const surface = "TestReasonFence"
+		before := retryReasonCount(surface, blockMaterializationReasonFence)
+		calls := 0
+		err := RetryUploadedBlockMaterialization(surface, "block-1", func() error { return nil }, func() error {
+			calls++
+			if calls == 1 {
+				return ErrBlockDeleteInProgress
+			}
+			return nil
+		}, nil, nil)
+		if err != nil {
+			t.Fatalf("error = %v, want nil", err)
+		}
+		if got := retryReasonCount(surface, blockMaterializationReasonFence) - before; got != 1 {
+			t.Fatalf("gc_fence retries = %v, want 1", got)
+		}
+		if got := retryReasonCount(surface, blockMaterializationReasonMaterial); got != 0 {
+			t.Fatalf("materialization retries = %v, want 0 (fence is not a plain transient)", got)
+		}
+	})
+}
+
+func TestRetryUploadedBlockMaterializationContextAbortsBackoff(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled: the first backoff wait must abort immediately.
+
+	storeCalls := 0
+	err := RetryUploadedBlockMaterializationContext(ctx, "UploadFile", "block-1", func() error {
+		storeCalls++
+		return ErrBlockMaterializationTransient
+	}, func() error {
+		t.Fatal("materialize must not run when store keeps failing")
+		return nil
+	}, nil, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if storeCalls != 1 {
+		t.Fatalf("storeCalls = %d, want 1 (budget not exhausted after cancel)", storeCalls)
 	}
 }
 

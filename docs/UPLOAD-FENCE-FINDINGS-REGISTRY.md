@@ -4,8 +4,11 @@
 **Origin:** eight successive audits of the GC upload-fence work, 2026-07-20/21.
 **Companion:** [GC-UPLOAD-FENCE-PR-PLAN.md](./GC-UPLOAD-FENCE-PR-PLAN.md) — which PR closes what.
 **Series progress:** PR-1 merged as [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
-PR-2 is implemented and verified on `fix/gc-claim-stub-lifecycle`, pending review
-and merge. No finding is closed by PR-2 on `main` yet.
+PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138), closing F2 and
+X7. PR-3 (store/materialize retry contract) is implemented on
+`fix/gc-store-materialize-retry-contract`, **pending merge**: it closes F6 and F14 and
+the observed-fence half of F1 (the F1 fast-clear window stays with PR-5). Rows stay in
+**## Open** until PR-3 merges.
 
 Every row is verified against code at the cited location, except where the row
 explicitly identifies engine-dependent behavior that still needs a non-skipping
@@ -33,32 +36,46 @@ out here so the decision is visible rather than implicit.
 
 ## Open on `main`
 
+Rows whose **Closed by** names PR-3 have their code landed on
+`fix/gc-store-materialize-retry-contract` but stay **open** here until that branch
+merges (a row only moves to **## Closed** on merge — see the note at the top).
+
 | # | Severity | Finding | Evidence | Closed by |
 |---|---|---|---|---|
-| F1 | Blocker | **Fast-clearing GC fence loses the uploaded object.** An upload can PUT, add its provisional reference after GC's post-claim liveness read, wait for the fence, then publish metadata without repeating the PUT GC deleted — returning success for an absent object. The store→materialize contract exists but `RegisterUploadedBlock`'s inner wait absorbs the fence and returns `nil`, so the outer wrapper never repeats the store. | `fs_helpers.go` `RegisterUploadedBlock`; `upload_reuse.go` `RetryUploadedBlockMaterialization` | PR-3, PR-5 |
-| F2 | Blocker where the deployed Cassandra/Scylla engine materializes the row | **A materialized GC-claim stub permanently breaks a block id.** A conditional claim against a row that vanishes between the existence check and claim can, depending on engine behavior, materialize a stub with no `storage_class`/`created_at`. If the post-claim recheck finds a reference, the claim is released and the stub survives; `ProbeBlockReuse` then hard-errors on it forever, and because the probe runs in the store phase the writer-side repair in materialize is unreachable. | `worker.go` `processBlock` hasRefs branch; `block_references.go` `ProbeBlockReuse` empty-class branch; `gc_integration_test.go` explicitly records the engine-dependent missing-row LWT behavior | PR-2 |
+| F1 | Blocker | **Fast-clearing GC fence loses the uploaded object.** An upload can PUT, add its provisional reference after GC's post-claim liveness read, then publish metadata without repeating the PUT GC deleted. PR-3 fixes the **observed-fence** half: `RegisterUploadedBlock` no longer absorbs the fence — it reads it once and propagates `ErrBlockDeleteInProgress`, leaving the provisional reference in place, so the wrapper repeats store→materialize and re-PUTs the object. The **fast-clear window** — a whole GC claim→verify→delete→clear cycle completing between the single fence read and publish, so the fence is never observed — is NOT closed by PR-3; that needs PR-5's deterministic real-worker regression and the web-funnel half. Destructive GC stays disabled meanwhile. | `fs_helpers.go` `RegisterUploadedBlock`; `upload_reuse.go` `RetryUploadedBlockMaterialization` | PR-3 (observed-fence half) + PR-5 (fast-clear window) |
 | F3 | High | **Web block-session upload funnel is unwrapped.** `v2/blocks.go` uses raw `BlockExists` + `PutBlockData` + materialize with no probe and no store retry, so it cannot honour the fence contract at all. | `v2/blocks.go` `UploadBlock` | PR-5 |
 | F4 | High | **`NeedsPut` with existing metadata stores to the wrong backend.** The PUT targets the serving node's preferred store while first-writer metadata may point elsewhere, so physical placement and metadata diverge. | `sync.go`, `seafhttp.go` NeedsPut branches | PR-4 |
 | F5 | High | **Download can serve stale legacy bytes.** `HandleDownload` falls back to the path-based object on *any* streaming failure, including a Cassandra timeout. On a library since written through blocks that object can hold an older version of the same path, so a transient failure answers 200 with stale content. | `seafhttp.go` `HandleDownload` fallback | PR-6 |
-| F6 | Medium | **Transient retry sentinel is not produced by the production helper.** `RegisterUploadedBlock` returns plain errors, so a Cassandra timeout during materialize fails the request immediately with no retry and no metric. | `fs_helpers.go`; `upload_rollback.go` | PR-3 |
+| F6 | Medium | **Transient retry sentinel is not produced by the production helper.** PR-3 tags transient Cassandra I/O in `RegisterUploadedBlock` and the mapping write in `RegisterUploadedBlockAndMapping` with `ErrBlockMaterializationTransient` (retried, cause preserved via `%w`), and returns `db.ErrBlockMetadataPermanent` untagged (not retried). The provisional-expiry write is the one exception: it fails closed with a rollback rather than retry (see F10). | `fs_helpers.go`; `upload_rollback.go` | PR-3 |
 | F7 | Medium | **Readers resolve by routing, not by metadata.** Once bytes follow canonical metadata (F4), a reader that picks the backend by request routing looks in the wrong bucket. | read call sites in `fileview.go`, `sharelink_view.go`, `sync.go`, `seafhttp.go` | PR-4 |
 | F8 | Medium | **Legacy no-session upload leaks S3 objects (R2).** `/api/v2/blocks/upload` without a session writes an object with no `blocks` row and no reference. Reachable by any authenticated user regardless of the block-upload feature flag. | `v2/blocks.go` legacy path | PR-7 |
 | F9 | Medium | **GC Phase 0 can delete a renewed provisional reference.** The scanner removed the reference based on a stale expiry projection, which could drop liveness for a live upload that renewed the same referrer. | `gc/scanner.go` `scanExpiredProvisionalBlockRefs` | PR-8 |
-| F10 | Medium | **Provisional reference and its expiry are written separately.** A failure between them leaves a reference with no discovery projection, so the zero-ref transition is never found. | `fs_helpers.go`; `provisional_block_ref_expiry.go` | PR-8 |
+| F10 | Medium | **Provisional reference and its expiry are written separately.** A failure between them leaves a reference with no discovery projection, so the zero-ref transition is never found. The atomic single-batch write is PR-8; PR-3 keeps the interim guard (on an expiry-write failure `RegisterUploadedBlock` releases the reference and enqueues it, rather than leaving the orphan) so it does not widen this window. | `fs_helpers.go`; `provisional_block_ref_expiry.go` | PR-8 |
 | F11 | Medium | **Abandoned prefetch leaks an open S3 reader.** `PrefetchBlock` buffered its result, so a consumer that stopped early left the `io.ReadCloser` unclosed. | `streaming/streaming.go` | PR-9 |
 | F12 | Medium | **Unbounded request bodies.** `PutBlock` and `check-blocks` read the whole body with `io.ReadAll` and no size or id-count limit. | `sync.go` | PR-10 |
 | F13 | High | **Corrupt directory listings resolve, and 404/503 semantics are inverted for a deleted path.** High, not the Low it was first filed as: two of the cases below serve bytes from the wrong FS object. Not Blocker only because it needs an already-corrupt dirent — see the severity note above. The 404/503 half on its own would be Low. `findEntryInDir` returns a plain error, so a renamed or deleted file surfaces as 503 while an absent commit row gives 404. Related, and worse: a JSON-valid but corrupt listing resolves anyway. Structural cases (`null`, `[null]`, non-string name, missing id) parse and the bad entries are skipped, reporting a false absence; semantic cases (empty name, empty or non-40-hex id, duplicate names) resolve to a wrong or missing FS object; and `encoding/json` silently keeps the **last** value for a repeated key, so `{"id":"A","id":"B"}` serves B and `{"name":"a","name":"b"}` hides `a` entirely. Both of the last two can serve arbitrary bytes or report a present file as absent. | `seafhttp.go` `findEntryInDir` | PR-6 |
-| F14 | Low | **Retry metric mislabels write failures.** The SeafHTTP wrapper defaults every non-fence retry to `reason="probe"`, attributing Cassandra write errors to the read path. | `seafhttp.go` retry wrapper | PR-3 |
+| F14 | Low | **Retry metric mislabels write failures.** A retry metric must not attribute a metadata-write failure to the read path. PR-3 emits `block_upload_materialization_retries_total{surface,reason}` from all three wrappers with the reason derived from the failing **phase** (materialize→`materialization`, never `probe`; fence→`gc_fence`). The `probe` label denotes the store phase (not "read side") and is reached only if a store callback opts into the transient sentinel. | `seafhttp.go` retry wrapper; `metrics.go` | PR-3 |
+
+## Closed
+
+Rows move here only once the PR that fixes them **merges**.
+
+| # | Severity | Finding | Closed by |
+|---|---|---|---|
+| F2 | Blocker (engine-dependent) | A materialized GC-claim stub permanently breaks a block id. | PR-2 ([#138](https://github.com/Sesame-Disk/sesamefs/pull/138)) |
+| X7 | Medium (perf) | Design constraint: stub repair must not add a hot-path `blocks` read. Closed by exposing `RepairableStub` from the existing probe plus a metadata-LWT backstop — no extra read on the absent-row path. | PR-2 ([#138](https://github.com/Sesame-Disk/sesamefs/pull/138)) |
 
 ## Open, deferred, or constraining the series
 
 X1-X3, X5 and X6 are not closed by the immediate code PRs; X4 is deferred to PR-11;
-X7 is a design constraint that PR-2 must close without adding hot-path cost.
-Destructive GC stays disabled until X1 and X2 are resolved.
+X7 was closed by PR-2 (see **## Closed**). Destructive GC stays disabled until X1 and
+X2 are resolved.
 
-PR-2 also removes writer-side active-claim release from `internal/api/v2/fs_helpers.go`.
+PR-2 also removed writer-side active-claim release from `internal/api/v2/fs_helpers.go`.
 Only the GC owner may release or delete an active claim; writers must wait/retry or
-fail closed. This is part of F2's lifecycle fix, not deferred to PR-3.
+fail closed. This is part of F2's lifecycle fix. PR-3 goes further on the writer side:
+`RegisterUploadedBlock` no longer waits internally at all — it propagates the fence to
+the outer store→materialize wrapper.
 
 | # | Severity | Finding | Tracked as |
 |---|---|---|---|
@@ -68,7 +85,6 @@ fail closed. This is part of F2's lifecycle fix, not deferred to PR-3.
 | X4 | High (perf) | **One global Paxos round per block on every metadata-registering upload path.** The first-writer `INSERT ... IF NOT EXISTS` is a per-block LWT; under production `SERIAL` and multi-DC it is a global consensus round, ~128 cross-region rounds per GB at the 8 MB block size. **Correction:** an earlier revision said the legacy resumable path "does not pay this at all". That is false — `finalizeUploadStreaming` splits the file into 8 MB blocks and calls `RegisterUploadedBlock` → `UpsertBlockMetadata` per block, so resumable pays the same ~128 LWTs. The defective no-session path in F8 is the exception: it leaves only an S3 object and never registers metadata. This is a **shared** cost of the governed upload paths, not a block-upload disadvantage, and removing it benefits all of them. `main` also reads the `blocks` row twice per upload (`ProbeBlockReuse`, `BlockDeleteFenceActive`), **but those two are not redundant and must not be merged**: the probe reads before the PUT, the fence reads after the provisional reference is durable, and that ordering is the mutual exclusion the protocol depends on. Reusing the pre-PUT observation to authorize publication reintroduces F1. Only the LWT is removable here. **Pre-existing since `e3883aa5d` (2026-05-28)** — not introduced by this work; `13e01263a` only made it representation-aware. | P-4 in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`; PR-11 (deferred) |
 | X5 | Medium | **Canonical read fan-out unvalidated.** One Cassandra point read per unique block before the first byte. The existing benchmark substitutes an in-memory function for Cassandra, so it measures goroutines and allocations, not driver, pool, latency or cluster load. | `WEB-BLOCK-UPLOAD.md` pre-flag checklist |
 | X6 | Medium | **Read-after-write across DCs.** Canonical lookups retry a missing row 3×25 ms, which covers local lag but not cross-DC. Safe (fails closed) but an availability dependency: transient 404/503 after a remote upload, `check-blocks` reporting a block missing, needless re-uploads. | same as X2 |
-| X7 | Medium (perf) | **The research prototype adds a third unconditional read of the `blocks` row.** On `main` the stub-repair read (`GetBlockDeleteClaimInfo`) only fires when the delete fence is active. The research prototype calls `removeStaleUploadedBlockDeleteStub` on the unfenced path too, so every block upload pays an extra point read. **The obvious shortcut does not work:** an earlier revision proposed keying repair off "`NeedsPut` with an empty `StorageClass`", but a genuinely missing row has that same result. PR-2 exposes `RepairableStub` from the existing probe read, acquires an upload-owned `repairing_stub` token, rechecks the orphan fence, and adds an unapplied-metadata-LWT repair backstop for the unprobed web-session path and probe/delete races. An absent first-writer row still incurs neither an extra read nor repair LWT. | research branch `fs_helpers.go` `RegisterUploadedBlock`; `db.BlockReuseProbe`; PR-2 |
 
 ## X1 design space — closing the physical-delete ABA
 
