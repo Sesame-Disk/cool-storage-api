@@ -5,10 +5,10 @@
 **Status:** PR-1 merged as [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
 PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138) (closed F2/X7).
 PR-3 merged as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), closing F6,
-F14 and the **observed-fence half** of F1. PR-4 is implemented on
-`fix/gc-canonical-placement-reads` and pending review; F4 and F7 remain open on
-`main` until it merges. The F1 fast-clear window (a full GC cycle completing between
-the single fence read and publish) stays with PR-5, and X1/X2 remain open.
+F14 and the **observed-fence half** of F1. PR-4 merged as
+[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4 and F7. PR-5 is
+implemented on `fix/gc-web-session-retry-contract` and pending review. X1/X2 remain
+open and keep destructive GC disabled.
 
 ## Why this document exists
 
@@ -284,25 +284,30 @@ the deterministic fast-clear regression remain PR-5 acceptance.
   only when the block is fenced — so a materialize-phase metadata write is never
   labeled `probe`. This closes F14. Note `probe` denotes the store phase (probe/HEAD/
   PUT), not a "read side", and is reached only if a store callback opts into the
-  transient sentinel; the shipped store callbacks return only a fence or a
-  non-retryable raw error, so store-phase retries are otherwise `gc_fence`. All three
-  wrappers also retry on the transient sentinel and re-PUT on a fence. Structurally
-  collapsing the three wrappers into one stays with PR-5.
+  transient sentinel. PR-5 later made canonical HEAD/repair failures transient in all
+  funnels and the web-session direct PUT transient through
+  `StoreUploadedBlockForProbe`; raw probe errors and the six older manual direct-PUT
+  branches remain non-retryable. All three wrappers retry on the transient sentinel
+  and re-PUT on a fence. The planned structural consolidation did not land in PR-5
+  and remains explicit debt in `TECHNICAL-DEBT.md` section 32.
 - Added the cancellable `RetryUploadedBlockMaterializationContext`. Only the three
   funnels that use the **generic** wrapper are wired to it — UploadFile
   (`c.Request.Context()`), sync PutBlock (`c.Request.Context()`) and OnlyOffice (its
   `ctx` arg) — so an aborted request there stops the retry backoff instead of burning
   the budget. The two bespoke wrappers (SeafHTTP and template-CreateFile) keep their
-  own non-cancellable backoff; giving them a cancellable context is part of PR-5's
-  wrapper normalisation, not PR-3. The worst case they carry is a bounded ~2s of
-  backoff sleep on an already-aborted request, not a correctness gap.
+  own non-cancellable backoff in PR-3. PR-5 made the SeafHTTP wrapper context-aware,
+  but only `HandleUpload` passes its request context; `finalizeUploadStreaming` starts
+  its worker group from `context.Background()`. Template CreateFile also retains
+  non-cancellable bounded backoff. Those sleep-on-abort cases are debt, not a
+  correctness gap.
 - **Test coverage note:** the retry behaviour is verified at the level of the three
   retry wrappers (generic, SeafHTTP, template), which is the shared mechanism the six
   funnels drive, plus the linear-helper (`RegisterUploadedBlock`) and mapping unit
   tests. It does **not** yet drive all six production call sites under a live fence.
-  The full six-call-site + deterministic fast-clear regression (real GC worker paused
-  at its post-claim liveness read) is **PR-5's** acceptance; PR-3 lands the mechanism
-  and its wrapper/helper-level proofs.
+  PR-5 added the deterministic fast-clear regression with a real GC worker, wrapper
+  coverage for all three implementations and web-session handler coverage. It did
+  not independently drive all six pre-existing production call sites through a live
+  fence; that per-handler matrix remains test debt rather than completed acceptance.
 
 Verification completed 2026-07-21 (local, Windows dev box has no gcc so no `-race`
 locally; `-race` + integration run in Docker per the verification debt below):
@@ -363,7 +368,7 @@ canonical resolution fails before a block-stream body is committed. The legacy
 path-based object fallback remains an explicit F5/PR-6 issue; conditional `304` cache
 validation remains an intentional no-body short circuit.
 
-**Current implementation (pending review):** existing-metadata `NeedsPut` writes use
+**Merged implementation:** existing-metadata `NeedsPut` writes use
 the immutable `storage_class` and derived org-scoped key through
 `internal/api/v2/upload_reuse.go`; `internal/db/block_storage_location.go` supplies
 bounded canonical metadata lookups; and
@@ -418,6 +423,50 @@ web client. Splitting them would ship a user-visible upload failure for one rele
 
 **Acceptance:** the deterministic fast-clear regression (real GC worker paused at its
 post-claim liveness read) fails before this PR and passes after.
+
+**Current implementation (pending review):** every materialization wrapper now runs
+`store -> materialize -> canonical store confirmation`. The confirmation executes
+after the provisional reference is durable and repairs bytes when a complete GC cycle
+deleted them and cleared its fence before materialization could observe it. The web
+session funnel uses the same bounded cycle; staged admission, traffic accounting and
+staged metrics remain single-shot. An exhausted fence returns coded
+`409 block_delete_in_progress` with `Retry-After: 1`, and the browser treats only that
+explicit conflict as a bounded soft retry. The deterministic component regression
+drives a real `gc.Worker` paused after its post-claim zero-reference read and proves
+the fence is already clear before publication and confirmation repair.
+
+**Deferred from the original PR-5 acceptance:** the generic, SeafHTTP and template
+CreateFile wrappers remain separate. `HandleUpload` backoff is request-cancellable;
+streaming SeafHTTP currently roots its worker context at `context.Background()`, and
+template CreateFile backoff is also not request-cancellable. Coverage proves the three
+wrapper mechanisms, the web-session handler and the real-worker fast-clear
+interleaving, but does not execute all six older handlers independently under a live
+fence. These are documented debts; they do not weaken the
+`store -> materialize -> confirm` safety contract that landed.
+
+PR-5 verification completed on 2026-07-22:
+
+```bash
+# completed: PASS
+go test ./internal/db ./internal/storage ./internal/streaming ./internal/gc ./internal/api/...
+go build ./...
+go vet ./...
+go vet -tags=integration ./...
+
+# completed: PASS
+docker compose --profile test run --rm --build gotest go test -race -count=1 ./internal/db ./internal/storage ./internal/streaming ./internal/gc ./internal/api/...
+
+# completed: PASS (265.648s final rerun; 228.669s initial run)
+docker compose --profile test run --rm --build go-integration-test
+
+# completed: PASS
+npx jest --runInBand src/components/file-uploader/__tests__/block-upload-orchestrator.test.js
+npx eslint src/components/file-uploader/block-upload-orchestrator.js src/components/file-uploader/__tests__/block-upload-orchestrator.test.js
+```
+
+The first full race run exposed an unsynchronized counter in an existing SeafHTTP
+lease-renewal test. The counter is now mutex-protected; both the isolated regression
+and the complete Docker race rerun passed.
 
 ---
 
@@ -513,14 +562,13 @@ DoS bound share no code and no deploy dependency. Rule 1 applies to this series 
 **Scope:** make `storage_class` deterministic per `(org_id, block_id)` so the
 first-writer `INSERT ... IF NOT EXISTS` can be dropped.
 
-**Not in scope: merging the two `blocks` reads.** An earlier draft listed that as a
-mechanical win. It is not — the probe reads before the PUT and the fence reads *after*
-the provisional reference is durable, and that ordering is the mutual exclusion that
-makes the whole protocol work. Serving the second from a cached first would let GC
-claim and authorize a delete in the window between them while the writer replays a
-stale "no fence" and publishes, which is F1 verbatim. Optimize inside a single
-observation point if useful; never reuse the pre-PUT observation to authorize
-publication.
+**Not in scope: merging the lifecycle observations.** An earlier draft proposed
+merging the pre-store probe and post-reference fence reads. That ordering is the mutual
+exclusion that makes the protocol work: serving the fence result from the cached probe
+would let GC authorize a delete while the writer publishes from stale state. PR-5's
+third, post-materialization confirmation is also distinct; it repairs the fast-clear
+case after the fence has disappeared. Optimize inside one observation point if useful,
+but never reuse one point to answer another.
 
 **Deliberately last, and deliberately not designed yet.** This is the item most
 likely to be superseded by a better idea, and it is the one with real performance
@@ -563,8 +611,8 @@ These stay open and keep destructive GC disabled:
 
 ## Verification debt carried by the whole series
 
-- PR-2, PR-3, and PR-4 ran `go test -race` in Docker. PR-5 and PR-9 must still run
-  their own race validation because they change separate lifecycle or channel behavior.
+- PR-2 through PR-5 ran `go test -race` in Docker. PR-9 must still run its own race
+  validation because it changes separate channel behavior.
 - No end-to-end download tests against real Cassandra exist for the 404/503 contract.
 - No multi-DC test exercises any of the cross-DC reasoning; it is derived from the
   production consistency contract, not from a reproduction. The dedicated

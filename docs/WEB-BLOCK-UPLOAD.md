@@ -82,6 +82,11 @@ the destination library's `representation_id` domain (`plain:v1` or
   client, but the per-session staged-block ceiling now tags its `429` with
   `code=staging_cap_reached` so the client surfaces it immediately instead of
   consuming its soft-wait budget on a condition that waiting cannot clear.
+- **GC conflicts are explicit soft retries:** session block materialization runs a
+  bounded canonical `store -> materialize -> confirm` cycle. An exhausted GC fence
+  returns `409`, `code=block_delete_in_progress`, and `Retry-After: 1`; the client
+  soft-retries only that explicit conflict. Staged admission, traffic charging and
+  staged-block metrics execute once for the overall request, not once per attempt.
 
 This is the implementation of **Option B** from
 [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md): the web
@@ -1045,6 +1050,9 @@ flag were on*.
      fail-fast + `expected_size` commit guard already bound the real size), so this
      only makes a misbehaving client fail fast and clearly. Guarded by the "terminal
      staging-cap 429 is surfaced immediately" Jest test.
+   - The **`block_delete_in_progress` 409** on `/blocks/upload` is transient. It
+     shares the bounded soft-wait budget and honors `Retry-After` without consuming
+     the hard network retry budget. Other 409 responses remain hard failures.
 
    **Residual note — slot-claim cost (audit 2026-07-04).** `claimBlockUploadSessionSlot`
    probes slots `0..cap-1` with sequential LWTs, so a user already at the cap costs up

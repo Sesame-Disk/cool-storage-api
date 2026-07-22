@@ -194,7 +194,10 @@ func TestAcquireSeafHTTPDistributedUploadFinalizeLeaseRenewsWhileHeld(t *testing
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("second acquire error = %v, want context deadline exceeded while the renewed lease is held", err)
 	}
-	if renewCount == 0 {
+	mu.Lock()
+	gotRenewCount := renewCount
+	mu.Unlock()
+	if gotRenewCount == 0 {
 		t.Fatal("expected distributed upload finalize lease to renew before TTL expiry")
 	}
 
@@ -546,6 +549,14 @@ func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
 	}
 }
 
+// retrySeafHTTPBlockMaterialization drives the wrapper with a nil context so the
+// backoff wait goes through seafHTTPBlockMaterializationSleepFn, which these tests
+// stub to record delays instead of sleeping. Production callers always pass a real
+// request context, so this shim belongs here rather than in seafhttp.go.
+func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error, materialize func() error, resolveFence func() (bool, error)) error {
+	return retrySeafHTTPBlockMaterializationContext(nil, label, blockID, store, materialize, resolveFence)
+}
+
 func TestRetrySeafHTTPBlockMaterialization_RetriesFencedBlock(t *testing.T) {
 	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
 	oldSleep := seafHTTPBlockMaterializationSleepFn
@@ -577,8 +588,8 @@ func TestRetrySeafHTTPBlockMaterialization_RetriesFencedBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retrySeafHTTPBlockMaterialization() error = %v, want nil", err)
 	}
-	if storeCalls != 3 {
-		t.Fatalf("storeCalls = %d, want 3", storeCalls)
+	if storeCalls != 4 {
+		t.Fatalf("storeCalls = %d, want 4 (three attempts plus confirmation)", storeCalls)
 	}
 	if materializeCalls != 3 {
 		t.Fatalf("materializeCalls = %d, want 3", materializeCalls)
@@ -623,8 +634,8 @@ func TestRetrySeafHTTPBlockMaterialization_ClearsFenceWithoutSleeping(t *testing
 	if err != nil {
 		t.Fatalf("retrySeafHTTPBlockMaterialization() error = %v, want nil", err)
 	}
-	if storeCalls != 2 {
-		t.Fatalf("storeCalls = %d, want 2", storeCalls)
+	if storeCalls != 3 {
+		t.Fatalf("storeCalls = %d, want 3 (two attempts plus confirmation)", storeCalls)
 	}
 	if materializeCalls != 2 {
 		t.Fatalf("materializeCalls = %d, want 2", materializeCalls)
@@ -668,8 +679,8 @@ func TestRetrySeafHTTPBlockMaterialization_RetriesStoreFence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retrySeafHTTPBlockMaterialization() error = %v, want nil", err)
 	}
-	if storeCalls != 2 {
-		t.Fatalf("storeCalls = %d, want 2", storeCalls)
+	if storeCalls != 3 {
+		t.Fatalf("storeCalls = %d, want 3 (failed store, retry store, confirmation)", storeCalls)
 	}
 	if materializeCalls != 1 {
 		t.Fatalf("materializeCalls = %d, want 1", materializeCalls)
@@ -795,6 +806,29 @@ func TestRetrySeafHTTPBlockMaterialization_StopsOnNonRetryableError(t *testing.T
 	}
 	if sleepCalls != 0 {
 		t.Fatalf("sleepCalls = %d, want 0", sleepCalls)
+	}
+}
+
+func TestRetrySeafHTTPBlockMaterializationContext_CancelsBackoff(t *testing.T) {
+	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
+	t.Cleanup(func() { seafHTTPBlockMaterializationRetryBackoffFn = oldBackoff })
+	seafHTTPBlockMaterializationRetryBackoffFn = func(int) time.Duration { return time.Hour }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	storeCalls := 0
+	err := retrySeafHTTPBlockMaterializationContext(ctx, "HandleUpload", "block-1", func() error {
+		storeCalls++
+		return fmt.Errorf("temporary store failure: %w", v2.ErrBlockMaterializationTransient)
+	}, func() error {
+		t.Fatal("materialize must not run")
+		return nil
+	}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if storeCalls != 1 {
+		t.Fatalf("storeCalls = %d, want 1", storeCalls)
 	}
 }
 
@@ -3149,11 +3183,12 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	}
 
 	putStarted := make(chan struct{})
+	var putStartedOnce sync.Once
 	probeUploadedBlockReuseForUploadFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
 		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
 	}
 	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
-		close(putStarted)
+		putStartedOnce.Do(func() { close(putStarted) })
 		return hash, nil
 	}
 
@@ -3292,8 +3327,12 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
 		return false, nil
 	}
+	var probeCalls atomic.Int32
 	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
-		return decision, nil
+		if probeCalls.Add(1) == 1 || decision.Decision == db.BlockReuseReusable {
+			return decision, nil
+		}
+		return db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot"}, nil
 	}
 
 	directPuts = &atomic.Int32{}
@@ -3541,8 +3580,8 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	if got := strings.TrimSpace(w2.Body.String()); got != expectedFileID {
 		t.Fatalf("retry body = %q, want file id %q", got, expectedFileID)
 	}
-	if got := putCalls.Load(); got != 1 {
-		t.Fatalf("putCalls after unlock retry = %d, want 1", got)
+	if got := putCalls.Load(); got != 2 {
+		t.Fatalf("putCalls after unlock retry = %d, want 2 including confirmation", got)
 	}
 	if got := registerCalls.Load(); got != 1 {
 		t.Fatalf("registerCalls after unlock retry = %d, want 1", got)
@@ -3567,7 +3606,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 
 // TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut verifies that
 // when the Cassandra probe reports a block reusable, finalization routes through
-// the canonical verify/repair step (EnsureReusableBlockPresent) exactly once and
+// the canonical verify/repair step (EnsureReusableBlockPresent) before and after
 // never touches the legacy Exists+PUT path or the direct PUT, yet still registers
 // the block reference + mapping. The canonical verify itself (an S3 HEAD on the
 // declared canonical key, with repair-on-miss) is exercised by the unit tests in
@@ -3589,8 +3628,8 @@ func TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut(t *testing
 	if got := directPuts.Load(); got != 0 {
 		t.Errorf("direct PUT calls = %d, want 0 for a reusable block", got)
 	}
-	if got := reusableChecks.Load(); got != 1 {
-		t.Errorf("reusable canonical checks = %d, want 1", got)
+	if got := reusableChecks.Load(); got != 2 {
+		t.Errorf("reusable canonical checks = %d, want 2 including confirmation", got)
 	}
 	if got := registerCalls.Load(); got != 1 {
 		t.Errorf("register ref/mapping calls = %d, want 1", got)
@@ -3598,8 +3637,8 @@ func TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut(t *testing
 }
 
 // TestFinalizeUploadStreamingNeedsPutUsesDirectPut verifies that when the probe
-// reports the block needs storing, finalization performs exactly one direct PUT
-// and registers the block reference + mapping.
+// reports the block needs storing, finalization stores and confirms it around the
+// block reference + mapping registration.
 func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
 	directPuts, reusableChecks, _, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
 		db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"})
@@ -3617,8 +3656,8 @@ func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
 	if got := directPuts.Load(); got != 1 {
 		t.Errorf("direct PUT calls = %d, want 1", got)
 	}
-	if got := reusableChecks.Load(); got != 0 {
-		t.Errorf("reusable canonical checks = %d, want 0", got)
+	if got := reusableChecks.Load(); got != 1 {
+		t.Errorf("reusable canonical checks = %d, want 1 confirmation", got)
 	}
 	if got := registerCalls.Load(); got != 1 {
 		t.Errorf("register ref/mapping calls = %d, want 1", got)
@@ -3638,8 +3677,8 @@ func TestFinalizeUploadStreamingRepairableStubRepairsBeforeDirectPut(t *testing.
 	if got := directPuts.Load(); got != 1 {
 		t.Fatalf("direct PUT calls = %d, want 1 after repair", got)
 	}
-	if reusableChecks.Load() != 0 || registerCalls.Load() != 1 {
-		t.Fatalf("reusable/register = %d/%d, want 0/1", reusableChecks.Load(), registerCalls.Load())
+	if reusableChecks.Load() != 1 || registerCalls.Load() != 1 {
+		t.Fatalf("reusable/register = %d/%d, want 1/1", reusableChecks.Load(), registerCalls.Load())
 	}
 }
 
@@ -3670,8 +3709,9 @@ func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
 
 	originalPut := putUploadedBlockAutoDirectForUploadFn
 	putStarted := make(chan struct{})
+	var putStartedOnce sync.Once
 	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, _ string, _ []byte) (string, error) {
-		close(putStarted)
+		putStartedOnce.Do(func() { close(putStarted) })
 		return "key", nil
 	}
 	t.Cleanup(func() { putUploadedBlockAutoDirectForUploadFn = originalPut })
@@ -3728,10 +3768,11 @@ func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
 func TestFinalizeUploadS3PutPrecedesPermitRelease(t *testing.T) {
 	var seq atomic.Int64
 	var putSeq, permitReleaseSeq int64
+	var putSeqOnce sync.Once
 
 	originalPut := putUploadedBlockAutoDirectForUploadFn
 	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, _ string, _ []byte) (string, error) {
-		putSeq = seq.Add(1)
+		putSeqOnce.Do(func() { putSeq = seq.Add(1) })
 		return "key", nil
 	}
 	t.Cleanup(func() { putUploadedBlockAutoDirectForUploadFn = originalPut })
@@ -3750,13 +3791,14 @@ func TestFinalizeUploadS3PutPrecedesPermitRelease(t *testing.T) {
 	}
 
 	putInvoked := make(chan struct{})
+	var firstPutOnce sync.Once
 	done := make(chan error, 1)
 
 	go func() {
 		done <- retrySeafHTTPBlockMaterialization("test", "sha256-block",
 			func() error {
 				_, putErr := putUploadedBlockAutoDirectForUploadFn(context.Background(), nil, "sha256-block", []byte("data"))
-				close(putInvoked)
+				firstPutOnce.Do(func() { close(putInvoked) })
 				return putErr
 			},
 			func() error {

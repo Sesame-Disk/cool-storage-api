@@ -378,6 +378,7 @@ var syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.Blo
 var syncProbeUploadedBlockReuseFn = v2.ProbeUploadedBlockReuse
 var syncPrepareUploadedBlockProbeFn = v2.PrepareUploadedBlockProbe
 var syncResolveNeedsPutBlockStoreFn = v2.ResolveNeedsPutBlockStore
+var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresent
 var registerUploadedBlockAndMappingForSyncFn = v2.RegisterUploadedBlockAndMapping
 var syncNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
 var syncNewCanonicalBlockCheckReaderFn = streaming.NewCanonicalBlockCheckReader
@@ -1358,7 +1359,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			switch probe.Decision {
 			case db.BlockReuseReusable:
 				materializedStorageClass = strings.TrimSpace(probe.StorageClass)
-				_, ensureErr := v2.EnsureReusableBlockPresent(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
+				_, ensureErr := syncEnsureReusableBlockPresentFn(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
 				return ensureErr
 			case db.BlockReuseNeedsPut:
 				if checker := getAPIQuotaChecker(); checker != nil {

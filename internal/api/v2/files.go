@@ -200,7 +200,7 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 
 	// reason is derived from the failing PHASE (never the sentinel), matching the
 	// generic wrapper so a register-phase write failure is not mislabeled as a
-	// probe read (finding F14). PR-5 folds this duplicate wrapper into the generic one.
+	// probe read (finding F14).
 	retryBlocked := func(attempt int, phaseReason string, retryErr error) {
 		if resetStored != nil {
 			resetStored()
@@ -230,6 +230,18 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 				return err
 			}
 			retryBlocked(attempt, blockMaterializationReasonMaterial, err)
+			continue
+		}
+		// Re-probe after the provisional reference is durable. Clearing the cached
+		// store state makes this a real canonical HEAD/repair, not a no-op.
+		if resetStored != nil {
+			resetStored()
+		}
+		if err := store(); err != nil {
+			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
+				return err
+			}
+			retryBlocked(attempt, blockMaterializationReasonProbe, err)
 			continue
 		}
 		return nil

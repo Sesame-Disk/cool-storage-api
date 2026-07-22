@@ -109,6 +109,7 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	oldPut := syncPutBlockDataFn
 	oldPutDirect := syncPutBlockAutoDirectFn
 	oldProbe := syncProbeUploadedBlockReuseFn
+	oldEnsureReusable := syncEnsureReusableBlockPresentFn
 	oldRegister := registerUploadedBlockAndMappingForSyncFn
 	oldLookupClass := lookupLibraryStorageClassForSyncFn
 	t.Cleanup(func() {
@@ -116,6 +117,7 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 		syncPutBlockDataFn = oldPut
 		syncPutBlockAutoDirectFn = oldPutDirect
 		syncProbeUploadedBlockReuseFn = oldProbe
+		syncEnsureReusableBlockPresentFn = oldEnsureReusable
 		registerUploadedBlockAndMappingForSyncFn = oldRegister
 		lookupLibraryStorageClassForSyncFn = oldLookupClass
 	})
@@ -185,8 +187,18 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 		directPutCalls++
 		return hash, nil
 	}
+	probeCalls := 0
 	syncProbeUploadedBlockReuseFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
-		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
+		probeCalls++
+		if probeCalls == 1 {
+			return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
+		}
+		return db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot"}, nil
+	}
+	ensureCalls := 0
+	syncEnsureReusableBlockPresentFn = func(context.Context, string, db.BlockReuseProbe, []byte, *storage.Manager, *storage.BlockStore, string, string) (string, error) {
+		ensureCalls++
+		return "", nil
 	}
 	registerCalls := 0
 	registerUploadedBlockAndMappingForSyncFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
@@ -209,8 +221,8 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
-	if directPutCalls != 1 {
-		t.Fatalf("directPutCalls = %d, want 1", directPutCalls)
+	if directPutCalls != 1 || ensureCalls != 1 {
+		t.Fatalf("directPut/confirmation calls = %d/%d, want 1/1", directPutCalls, ensureCalls)
 	}
 	if registerCalls != 1 {
 		t.Fatalf("registerCalls = %d, want 1", registerCalls)

@@ -268,19 +268,16 @@ reusable / needs-put / blocked-by-GC / unknown-error. Needs-put blocks use
 `PutBlockAutoDirect` (no HEAD); reusable blocks run `EnsureReusableBlockPresent`
 (verify the canonical object via HEAD on the declared key, repair via direct PUT
 only if missing); blocked-by-GC returns `ErrBlockDeleteInProgress` to retry;
-unknown-error fails closed before S3 PUT. Wired into all six upload funnels
-(`seafhttp.go` ×2, `sync.go`, `files.go` ×2, `onlyoffice.go`). Per-block cost: a
-new block now pays ≤2 Cassandra reads (~1 ms each) + 1 direct PUT and no HEAD;
-dedup hits keep one canonical-verify HEAD. Safety is unchanged — it rests on the
-reference-first/fence-check protocol in `RegisterUploadedBlock`, not on the PUT
-(see KNOWN_ISSUES ISSUE-UPLOAD-S3-DOUBLE-RTT-01). The materialize retry loop now
-also retries `ErrBlockDeleteInProgress` from the `store` phase.
+unknown-error fails closed before S3 PUT. Wired into all seven governed upload funnels
+(`seafhttp.go` ×2, `sync.go`, `files.go` ×2, `onlyoffice.go`, session-mode
+`v2/blocks.go`). PR-5 adds one post-reference canonical HEAD for every newly
+materialized block: the pre-PUT HEAD remains removed, but the confirmation is required
+to repair a block deleted by a GC cycle whose fence cleared before publication.
 
 **Scope (not global):** this fixes the server-side hot upload paths only. The
 `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData` still do
-`Exists` + `PutAuto` and remain in use by unmigrated callers (e.g.
-`v2/blocks.go` `UploadBlock`). The HEAD was not removed
-from `BlockStore` globally.
+`Exists` + `PutAuto` and remain in use by legacy callers. The no-session branch of
+`v2/blocks.go` remains deferred to PR-7. The HEAD was not removed globally.
 
 Tests: `ProbeBlockReuse` decision matrix (`block_references_test.go`),
 reusable/needs-put `finalizeUploadStreaming` paths (`seafhttp_test.go`),
@@ -2147,4 +2144,62 @@ indexes are gone, artifacts are invisible (`ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-0
 
 ---
 
-*Last updated: 2026-07-10*
+## 32. Three Duplicate Block-Materialization Retry Wrappers (2026-07-22)
+
+### Current State
+
+The bounded `store -> materialize -> confirm` cycle exists in **three** near-identical
+implementations:
+
+| Wrapper | Location | Used by |
+|---|---|---|
+| Generic | `internal/api/v2/upload_reuse.go` `retryUploadedBlockMaterialization` | `sync.go` PutBlock, `files.go` UploadFile, `onlyoffice.go`, session-mode `v2/blocks.go` UploadBlock |
+| SeafHTTP | `internal/api/seafhttp.go` `retrySeafHTTPBlockMaterializationContext` | `HandleUpload`, `finalizeUploadStreaming` |
+| CreateFile template | `internal/api/v2/files.go` `retryCreateFileTemplateBlockMaterialization` | `CreateFile` template block |
+
+They differ only in incidentals: the SeafHTTP one carries its own backoff/sleep hooks
+and a string-literal reason vocabulary instead of the `blockMaterializationReason*`
+constants; only `HandleUpload` supplies a request-cancellable context, while streaming
+starts from `context.Background()`. The CreateFile one adds a `resetStored()` callback
+because its store phase caches `templateBlockStored` and would otherwise no-op, and its
+backoff is not request-cancellable.
+
+### Why It Is Debt
+
+PR-5's post-reference confirmation had to be written **three separate times**, once per
+wrapper, and each copy needed its own regression test. This is the third PR in the
+GC-upload-fence series to modify all three in lockstep (PR-3 added the phase-derived
+retry labels, PR-4 the canonical placement, PR-5 the confirmation). A fourth change
+that updates only two of them produces a funnel that silently loses the guarantee —
+the failure mode is data loss under a GC race, which no unit test catches unless
+someone remembers to add it to all three.
+
+PR-3 and PR-4 carried inline comments marking this ("PR-5 folds this duplicate wrapper
+into the generic one"), and the authoritative plan assigned structural consolidation
+to PR-5. PR-5 normalised the reason labels and added confirmation to all three wrappers
+but did not consolidate them. This entry records that explicitly instead of silently
+treating the incomplete acceptance item as delivered.
+
+### Follow-Up Plan
+
+1. Fold the SeafHTTP wrapper into the generic one: it needs the sleep/backoff hooks
+   parameterised (already effectively the case via `RetryBackoff`/
+   `waitBeforeBlockMaterializationRetry`) and its `"probe"`/`"gc_fence"` literals
+   swapped for the shared constants. Its tests already assert the same call counts.
+2. Fold the CreateFile template wrapper in by passing its `resetStored` as the
+   existing `onRetry` callback, which the generic wrapper already invokes, plus one
+   pre-confirmation reset.
+3. Delete both duplicates and keep one regression suite.
+
+Best done in PR-6, which already reopens these files for the download fail-closed work.
+
+### Regression Tests To Keep
+
+`TestRetryUploadedBlockMaterializationRepairsUnobservedFastClear` and
+`TestRetryUploadedBlockMaterializationWithWorkerFastClear`
+(`internal/api/v2/upload_reuse_test.go`) must keep passing against whatever single
+wrapper survives — they are the only proof the fast-clear window stays closed.
+
+---
+
+*Last updated: 2026-07-22*

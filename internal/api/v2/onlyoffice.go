@@ -195,6 +195,10 @@ func shouldRollbackOnlyOfficeMaterializedBlock(blockMetadataRegistered bool, pub
 	return blockMetadataRegistered && publishErr != nil
 }
 
+func shouldRetainOnlyOfficePendingBlock(blockMetadataRegistered bool, materializeErr error) bool {
+	return blockMetadataRegistered || errors.Is(materializeErr, ErrBlockMappingWriteFailed)
+}
+
 func onlyOfficeRollbackOperationKey(rollbackID string) string {
 	return "onlyoffice-publish-failed:" + strings.TrimSpace(rollbackID)
 }
@@ -1246,11 +1250,18 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		// Materialize block metadata/provisional ref first and then the sync mapping.
 		// Keep the pending-cleanup row on mapping failure so the reconciler can finish
 		// cleanup even if the immediate rollback path was only partially successful.
-		return RegisterUploadedBlockAndMapping(h.db, orgID, repoID, internalBlockID, rollbackID, len(content), materializedStorageClass, storageKey, externalBlockID)
+		materializeErr := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, internalBlockID, rollbackID, len(content), materializedStorageClass, storageKey, externalBlockID)
+		if materializeErr == nil {
+			blockMetadataRegistered = true
+		}
+		return materializeErr
 	}, nil, nil); err != nil {
-		if errors.Is(err, ErrBlockMappingWriteFailed) {
-			log.Printf("OnlyOffice: CRITICAL - failed to create block mapping org=%s ext=%s int=%s: %v", orgID, externalBlockID[:16], internalBlockID[:16], err)
-			return fmt.Errorf("failed to create block mapping: %w", err)
+		if shouldRetainOnlyOfficePendingBlock(blockMetadataRegistered, err) {
+			if errors.Is(err, ErrBlockMappingWriteFailed) {
+				log.Printf("OnlyOffice: CRITICAL - failed to create block mapping org=%s ext=%s int=%s: %v", orgID, externalBlockID[:16], internalBlockID[:16], err)
+				return fmt.Errorf("failed to create block mapping: %w", err)
+			}
+			return fmt.Errorf("failed to confirm stored block after metadata registration: %w", err)
 		}
 		if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
 			log.Printf("OnlyOffice: failed to clear pending block cleanup %s after block-metadata failure: %v", rollbackID, deleteErr)
@@ -1258,7 +1269,6 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return fmt.Errorf("failed to store block metadata: %w", err)
 	}
 	log.Printf("OnlyOffice: Created block mapping: %s → %s", externalBlockID[:16], internalBlockID[:16])
-	blockMetadataRegistered = true
 
 	storageDeltaBytes, storageDeltaFiles, newCommitID, err := h.publishEditedDocumentMetadata(fsHelper, orgID, repoID, filePath, filename, userID, originalFileSize, externalBlockID, rollbackID)
 	if err != nil {

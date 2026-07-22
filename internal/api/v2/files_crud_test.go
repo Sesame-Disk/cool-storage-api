@@ -371,14 +371,14 @@ func TestRetryCreateFileTemplateBlockMaterializationRetriesFencedBlock(t *testin
 	if err != nil {
 		t.Fatalf("retryCreateFileTemplateBlockMaterialization() error = %v, want nil", err)
 	}
-	if storeCalls != 2 {
-		t.Fatalf("storeCalls = %d, want 2", storeCalls)
+	if storeCalls != 3 {
+		t.Fatalf("storeCalls = %d, want 3 (retry plus confirmation)", storeCalls)
 	}
 	if registerCalls != 2 {
 		t.Fatalf("registerCalls = %d, want 2", registerCalls)
 	}
-	if resetCalls != 1 {
-		t.Fatalf("resetCalls = %d, want 1", resetCalls)
+	if resetCalls != 2 {
+		t.Fatalf("resetCalls = %d, want 2 (retry plus confirmation)", resetCalls)
 	}
 }
 

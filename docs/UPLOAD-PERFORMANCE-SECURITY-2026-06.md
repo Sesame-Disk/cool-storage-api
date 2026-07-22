@@ -62,18 +62,17 @@ Cassandra probe — `DB.ProbeBlockReuse(orgID, blockID)` in
 | `BlockReuseUnknownError` | Cassandra read failed / corrupt metadata         | fail closed before S3 PUT |
 
 `PutBlockAutoDirect` (`internal/storage/blocks.go`) issues a direct `PutAuto`
-without the prior HEAD. The probe is wired into all six upload funnels:
+without the prior HEAD. The probe is wired into all seven governed upload funnels:
 `HandleUpload` + `finalizeUploadStreaming` (`seafhttp.go`), `SyncHandler.PutBlock`
 (`sync.go`), `FileHandler.CreateFile` template + `UploadFile` (`files.go`), and
-`OnlyOffice.saveEditedDocument` (`onlyoffice.go`).
+`OnlyOffice.saveEditedDocument` (`onlyoffice.go`), plus session-mode
+`BlockHandler.UploadBlock` (`v2/blocks.go`).
 
 **Scope of the fix — read carefully:** this is fixed for the *server-side hot
 upload paths* listed above. It is **not** a global removal of the S3 HEAD:
 - The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
-  (`internal/storage/blocks.go`) still perform `Exists` + `PutAuto`. They remain
-  in use by unmigrated callers such as the `v2/blocks.go` `UploadBlock` handler
-  (which still does its own HEAD + `PutBlockData`); migrated funnels fail closed
-  when the Cassandra probe is unavailable.
+  (`internal/storage/blocks.go`) remain for legacy callers. Session-mode
+  `v2/blocks.go` is migrated; its metadata-free no-session branch is deferred to PR-7.
 - The `Reusable` path no longer skips S3 entirely. To avoid trusting Cassandra
   metadata for a physical object that could be missing (partial GC, external
   deletion, eventual consistency, bugs), `EnsureReusableBlockPresent` does a
@@ -81,12 +80,28 @@ upload paths* listed above. It is **not** a global removal of the S3 HEAD:
   This is a deliberate safety/perf trade: the HEAD is back on dedup hits, but the
   upload can never publish a reference to a missing object.
 
-**Per-block cost change:**
-- New block (common case): was `1 S3 HEAD + 1 S3 PUT`; now `≤2 Cassandra reads (~1 ms each) + 1 direct PUT`, **no HEAD**.
-- Dedup hit (reusable): was `1 S3 HEAD`; now `3 Cassandra reads + 1 canonical-verify HEAD` (+ 1 repair PUT only if the object is missing).
+**Per-block cost change (web session, successful no-retry cycle):** the narrow GC
+protocol accounts for 7 Cassandra point reads on a new block and 8 on a dedup hit:
+2/3 initial classification reads, 2 materialization fence reads and 3 confirmation
+classification reads. Those are not the complete materialization cost. Including the
+expiry lookup, two representation resolutions, mapping lookup and the dedup path's
+post-non-applied-LWT identity read, the full `store -> materialize -> confirm` cycle is:
 
-Net effect: the main win is for *new* content (the dominant case), which loses the
-HEAD entirely. Dedup hits keep a HEAD but gain self-healing.
+- New block: 11 plain Cassandra point reads, one applied metadata LWT, ordinary
+  reference/mapping writes, one expiry logged batch, one direct S3 PUT and one
+  post-materialization canonical HEAD.
+- Dedup hit: 13 plain Cassandra point reads, one non-applied metadata LWT, the
+  ordinary provisional-reference write, one expiry logged batch and two canonical
+  HEADs (plus a repair PUT only if the object is missing).
+
+These cycle totals exclude request-level session, library-routing, permission, quota
+and staging-admission reads. Other funnels can omit mapping reads or carry additional
+handler-specific work, so these numbers must not be presented as a universal endpoint
+total.
+
+The pre-PUT HEAD remains removed, preserving PUT pipeline latency, but PR-5
+deliberately restores a post-reference HEAD to close the fast-clear data-loss window.
+This is a correctness cost of one object-store RTT per newly materialized block.
 
 **Correctness — why skipping the PUT is safe:** the GC-race safety never relied on
 the PUT. It derives from the *reference-first, then fence-check* protocol in
@@ -105,10 +120,14 @@ analysis.
 `v2.RetryUploadedBlockMaterialization`, and the template-CreateFile wrapper treat a GC
 delete fence (`ErrBlockDeleteInProgress`) in **either** phase as retryable, plus any
 failure **tagged** `v2.ErrBlockMaterializationTransient` (produced today by the
-materialize phase — `RegisterUploadedBlock` Cassandra I/O and the mapping write). As of
+materialize phase — `RegisterUploadedBlock` Cassandra I/O and the mapping write — and
+by canonical HEAD/repair failures in `StoreUploadedBlockForProbe`, which also tags the
+web-session funnel's direct PUT). As of
 PR-3, `RegisterUploadedBlock` no longer waits out the fence internally — it propagates
-it, so the wrapper re-PUTs the object when the fence is observed (closes the
-observed-fence half of F1; the fast-clear window stays with PR-5). A permanent metadata
+it, so the wrapper re-PUTs the object when the fence is observed. PR-5 adds a second
+canonical store observation after materialization; because the provisional reference
+is then durable, it repairs an object removed by an already-completed GC cycle and
+closes the never-observed fast-clear window. A permanent metadata
 failure (`db.ErrBlockMetadataPermanent`) is not retried, and the retry metric
 `block_upload_materialization_retries_total{surface,reason}` labels the reason by the
 failing phase (`probe` = store phase, `materialization` = metadata materialize phase),
@@ -119,15 +138,16 @@ so a metadata write is never counted as `probe` (closes F14).
   (reusable, needs-put without metadata, needs-put with metadata + no refs + distinct
   storage class, blocked by orphan fence, blocked by `gc_state='deleting'` short-circuit,
   empty-storage-class error, metadata read-error propagation).
-- `internal/api/seafhttp_test.go` — `finalizeUploadStreaming` reusable path (routes
-  through the canonical verify once, no legacy/direct PUT) and needs-put path (no
-  legacy HEAD, 1 direct PUT, ref/mapping registered); plus `store`-phase fence retry.
+- `internal/api/seafhttp_test.go` — `finalizeUploadStreaming` reusable path (initial
+  canonical HEAD plus post-materialization confirmation, no legacy/direct PUT) and
+  needs-put path (no pre-PUT legacy HEAD, 1 direct PUT, ref/mapping registered, then
+  canonical confirmation); plus `store`-phase fence retry.
 - `internal/api/v2/upload_reuse_test.go` — `EnsureReusableBlockPresent` exists-skip
   (honors `probe.StorageKey`) and missing-repair (derives the key from the hash when
   `storage_key` is empty) paths.
 - `internal/api/v2/upload_reuse_test.go` — shared retry helper and probe errors.
-- `internal/api/handler_mapping_failure_test.go` — sync needs-put uses direct PUT,
-  not the legacy Exists+PUT.
+- `internal/api/handler_mapping_failure_test.go` — sync needs-put uses a direct PUT,
+  not the legacy Exists+PUT, and then performs the required canonical confirmation.
 
 **Caveat 1 (minor — dedup granularity):** `AccountBlockOnce` (`seafhttp.go:1988–1995`)
 still deduplicates by *block position* (index), not by SHA-256, so same-content
@@ -144,14 +164,12 @@ org-scoped derivation and removed the org-less storage APIs. See
 `docs/KNOWN_ISSUES.md` (ISSUE-BLOCK-STORAGE-KEY-READS-01).
 
 **Caveat 3 (minor — new failure surface on reuse):** because the `Reusable` path now
-issues a canonical-verify HEAD, a transient S3 error on that HEAD now fails the
-upload (it is not an `ErrBlockDeleteInProgress`, so it is not retried by the
-materialization loop). Previously a reusable block touched no S3 and could not fail
-there. This is acceptable — refusing to publish a reference we cannot verify is the
-safer behavior — but it is a behavioral change worth knowing during incident triage.
-Follow-up if real S3 shows transient HEAD errors: add a small retry/backoff
-specifically around `ObjectExists` in `EnsureReusableBlockPresent` so a flaky HEAD
-self-heals instead of failing the upload.
+issues canonical-verify HEADs, storage failure can fail the upload where reuse
+previously touched no S3. Canonical HEAD and repair-PUT failures are tagged
+`ErrBlockMaterializationTransient` and consume the bounded materialization retry
+budget. Raw Cassandra probe errors and direct new-block PUTs in the six older manual
+store callbacks remain untagged/non-retryable; the web-session callback uses
+`StoreUploadedBlockForProbe`, which tags its direct PUT too.
 
 ---
 
@@ -215,33 +233,26 @@ until its missing governance is fixed.
 The LWT is scoped to the `(org_id, block_id)` partition, so writers of *different*
 blocks never contend. The cost is latency per block, not lock contention.
 
-### The two fence observations (not redundant reads)
+### The three lifecycle observations (not redundant reads)
 
-Independently of Paxos, a single new-block upload reads the **same `blocks` row
-twice** on `main`:
+Independently of Paxos, PR-5's successful cycle has three ordered observation points:
 
-1. `ProbeBlockReuse` → `probeBlockReuseMetadataFn`
-2. `BlockDeleteFenceActive` → `BlockGCState`
+1. `ProbeBlockReuse` classifies the block before storage.
+2. `BlockDeleteFenceActive` checks the fence after the provisional reference is durable.
+3. The confirmation store callback classifies again after materialization and verifies
+   or repairs the canonical object.
 
-`gc_s3_orphans` is likewise read twice (probe and fence). Rough per-block cost for
-a brand-new block in the web session flow: ~7–8 Cassandra reads/writes, one
-`LoggedBatch` (provisional ref + expiry + by-day projection), and one LWT.
+The first two observations form the mutual-exclusion protocol: they deliberately
+observe different moments, and the second authorizes publication. The third closes
+the fast-clear window where GC deleted the object and cleared its fence before the
+materializer could observe it. Reusing or caching an earlier observation for either
+later step would reintroduce F1.
 
-**These two reads are not redundant** — see fix 2 below. They observe different
-moments, and the second one is what authorizes publication. Only the *third* read
-that the fence work would add is genuinely removable.
-
-**A third read is a cost the fence work would add, not one that exists today.** On
-`main`, `GetBlockDeleteClaimInfo` (the stub-repair read) only runs when the delete
-fence is active. The research prototype calls `removeStaleUploadedBlockDeleteStub` on
-the unfenced path too, making it unconditional. That is avoidable and should not
-ship as-is. Note the obvious shortcut does **not** work: `ProbeBlockReuse` returns
-`NeedsPut` with an empty `StorageClass` both for a genuinely missing row and for a
-stub, and `BlockReuseProbe` carries no `Found`, `IsStub` or claim id to separate
-them, so keying a conditional delete off that signal would fire an LWT on every
-brand-new block — trading a read for a Paxos round, which is worse. The state has to
-become explicit in the probe (a distinct decision, or the claim metadata it already
-read). Tracked as X7 in the findings registry.
+For a new web-session block, these lifecycle checks account for 7 point reads; the
+full cycle is 11 point reads plus one metadata LWT and its writes, as itemized above.
+The provisional reference is an ordinary write; expiry and its by-day projection use
+a separate logged batch. PR-2's explicit `RepairableStub` decision closed X7 without
+adding an unconditional stub-repair LWT to every new block.
 
 ### Proposed fixes
 
@@ -251,10 +262,10 @@ read). Tracked as X7 in the findings registry.
    a plain last-writer-wins INSERT always writes the same class/key and the LWT can
    be dropped outright. This is a design change (routing must become a pure function
    of org+block, and existing rows must keep resolving), not a mechanical edit.
-2. ~~**Collapse the two `blocks` reads into one** request-scoped fetch shared by the
-   probe and the fence check.~~ **Withdrawn — this would reintroduce F1.** The two
-   reads are not duplicated work; they are two points in time, and the second one is
-   load-bearing:
+2. ~~**Collapse the pre-store probe and post-reference fence reads into one**
+   request-scoped fetch.~~ **Withdrawn — this would reintroduce F1.** These first two
+   observations are not duplicated work; they occur at different times, and the
+   second one is load-bearing:
 
    ```
    ProbeBlockReuse        read #1  — before the PUT, decides whether to store
@@ -262,6 +273,7 @@ read). Tracked as X7 in the findings registry.
    AddBlockReference      write    — publish our flag
    BlockDeleteFenceActive read #2  — AFTER the reference, decides whether to publish
    UpsertBlockMetadata    write
+   ProbeBlockReuse        read #3  — confirmation after materialization
    ```
 
    The ordering is the whole mutual-exclusion protocol: the writer publishes its
@@ -275,9 +287,11 @@ read). Tracked as X7 in the findings registry.
    Query-level work is still fair game (fewer columns, a single statement covering
    `blocks` and `gc_s3_orphans` for the *same* observation point). What must not
    change is that the fence observation used to authorize publication is **fresh and
-   taken after the provisional reference is durable**. Treat the third read that the
-   fence work would add separately — see X7; it needs an explicit stub state in the
-   probe, and it is genuinely avoidable in a way these two are not.
+   taken after the provisional reference is durable**. PR-5's later confirmation is
+   independently required: it closes the fast-clear window by reclassifying and
+   verifying/repairing the canonical object after materialization. X7's separate
+   unconditional stub-repair read was avoided by PR-2's explicit `RepairableStub`
+   state; it is not this confirmation observation.
 3. **Measure before choosing.** Instrument the latency of that specific INSERT so the
    real production number replaces this estimate. `block_upload_materialization_retries_total`
    already exists; per-statement latency does not.
@@ -387,7 +401,7 @@ file-sharing protocols.
 | P-1 | Permit serialized S3 PUT                       | ✅ Confirmed   | CRITICAL   | **RESOLVED** |
 | P-2 | Double S3 RTT per block (Exists + PUT)         | ✅ Confirmed   | HIGH→MEDIUM| **RESOLVED** |
 | P-3 | Benchmarks 44–48 MB/s, no scaling              | ❓ Plausible   | —          | External     |
-| P-4 | 1 global Paxos/block on both governed upload modes; F8 no-session is the exception. (The 2 `blocks` reads are two required observation points, **not** part of the optimization.) | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
+| P-4 | 1 global Paxos/block on both governed upload modes; F8 no-session is the exception. (The pre-store and post-reference `blocks` reads are required observation points, and PR-5 adds a required post-materialization confirmation; none is part of the Paxos optimization.) | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
 | S-1 | Chunk state node-local (multi-node blocker)    | ✅ Confirmed   | HIGH       | Pending      |
 | S-2 | max_upload_mb not enforced on chunked uploads  | ✅ Fixed       | MEDIUM     | Complete     |
 | S-3 | Full /tmp staging, no disk admission limit     | ✅ Mitigated   | MEDIUM     | Guard added; config still required |
@@ -403,7 +417,7 @@ without a database connection.
 | Order | ID | Change | Rationale |
 |---|---|---|---|
 | 1 | P-1 | Unwrap S3 PUT from metadata permit | Max impact, minimal change — **done** |
-| 2 | P-2 | Cassandra-first probe; direct PUT, no HEAD | Eliminates the S3 HEAD per block — **done** (`perf/p2-cassandra-first-hot-reuse`) |
+| 2 | P-2 | Cassandra-first probe; direct PUT without a pre-PUT HEAD | Eliminates the legacy pre-PUT existence HEAD; PR-5's required post-materialization confirmation remains — **done** (`perf/p2-cassandra-first-hot-reuse`) |
 | 3 | S-1 | Sticky sessions at LB (immediate) or distributed chunk state (complete) | Required for multi-node topology |
 | 4 | S-2/S-3 | Roll out a real `chunked_staging_max_bytes` value per node | Operational hardening follow-through |
 | 5 | S-4 | Atomic quota reservation at upload start | Closes the concurrent over-quota window |

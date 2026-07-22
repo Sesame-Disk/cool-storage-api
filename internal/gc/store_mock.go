@@ -1845,6 +1845,14 @@ func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, e
 	return current, nil
 }
 
+// SetBlockHasReferencesHookForTest installs a deterministic concurrency hook for
+// component tests that drive the real worker against MockStore.
+func (m *MockStore) SetBlockHasReferencesHookForTest(hook func(orgID uuid.UUID, blockID string, current bool) (bool, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blockHasReferencesHook = hook
+}
+
 func (m *MockStore) RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

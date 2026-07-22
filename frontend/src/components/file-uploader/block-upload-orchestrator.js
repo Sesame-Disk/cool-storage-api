@@ -389,7 +389,15 @@ function isTerminal429Error(error) {
   return String(data.code || '').toLowerCase() === 'staging_cap_reached';
 }
 
-// retryAfterMs reads the server's Retry-After hint (seconds) from a 429 response,
+function isBlockDeleteInProgressError(error) {
+  const response = error && error.response;
+  const data = (response && response.data) || {};
+  return Boolean(response
+    && response.status === 409
+    && String(data.code || '').toLowerCase() === 'block_delete_in_progress');
+}
+
+// retryAfterMs reads the server's Retry-After hint (seconds) from a soft-retry response,
 // clamped to a sane range, so the client waits as long as the server asked
 // instead of the much shorter default exponential backoff (which could exhaust
 // the retry budget before a slot frees). Falls back to fallbackMs when absent.
@@ -403,13 +411,13 @@ export function retryAfterMs(error, fallbackMs = 1000) {
   return fallbackMs;
 }
 
-// Cap how many times a single block waits out 429 backpressure so a permanently
+// Cap how many times a single block waits out server backpressure so a permanently
 // saturated cap cannot loop forever; well above what a healthy link needs (a
 // slot frees as soon as any of the user's in-flight blocks completes).
 const MAX_BACKPRESSURE_WAITS = 8;
 
-// withRetry runs fn up to `attempts` times with exponential backoff. A 429
-// (per-user concurrency backpressure) is treated as SOFT: it is retried honoring
+// withRetry runs fn up to `attempts` times with exponential backoff. A retryable
+// 429 or block-delete 409 is treated as SOFT: it is retried honoring
 // the server's Retry-After (with jitter) and does NOT consume the hard retry
 // budget — bounded by MAX_BACKPRESSURE_WAITS — so legitimate throttling
 // self-recovers instead of surfacing as an upload failure. The caller's
@@ -430,7 +438,8 @@ async function withRetry(fn, attempts, { signal } = {}) {
       if (isAbortError(err) || (signal && signal.aborted)) {
         throw err;
       }
-      if (is429Error(err) && !isTerminal429Error(err) && softWaits < MAX_BACKPRESSURE_WAITS) {
+      const softRetry = (is429Error(err) && !isTerminal429Error(err)) || isBlockDeleteInProgressError(err);
+      if (softRetry && softWaits < MAX_BACKPRESSURE_WAITS) {
         softWaits += 1;
         const jitter = Math.floor(Math.random() * 250);
         await waitWithAbort(retryAfterMs(err) + jitter, signal);
@@ -441,6 +450,12 @@ async function withRetry(fn, attempts, { signal } = {}) {
       // surface it immediately instead of burning hard retries (and re-uploading
       // the block body) on a doomed request.
       if (isTerminal429Error(err)) {
+        throw err;
+      }
+      // Other HTTP 4xx responses are permanent request/session conflicts. Retrying
+      // the same block body cannot fix them and can repeat mapping conflicts.
+      const status = err && err.response && err.response.status;
+      if (Number.isFinite(status) && status >= 400 && status < 500) {
         throw err;
       }
       hardAttempt += 1;
