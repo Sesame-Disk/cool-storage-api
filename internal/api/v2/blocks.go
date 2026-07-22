@@ -704,6 +704,29 @@ func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, s
 	return nil
 }
 
+// respondBlockMaterializeError maps a materializeUploadedBlock failure to the web
+// funnel's HTTP response and reports whether it wrote one (the caller must return
+// when it did). It is the single place the two UploadBlock materialize sites share.
+//
+// A verified external→different-internal mapping conflict is a permanent 409. Every
+// other error — including ErrBlockDeleteInProgress, which the metadata-upsert backstop
+// now raises on a lost stub-repair race — is a fail-closed 500. This is the deliberate
+// PR-2 boundary: unlike the six funnels wrapped in RetryUploadedBlockMaterialization,
+// this unprobed web-session funnel has no bounded retry yet. PR-5 must consciously
+// change ErrBlockDeleteInProgress here to a 409 + Retry-After once traffic accounting
+// and the staged-block reservation are hoisted so a retry cannot double-charge.
+func respondBlockMaterializeError(c *gin.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, db.ErrBlockIDMappingConflict) {
+		c.JSON(http.StatusConflict, gin.H{"error": "block id mapping conflict"})
+		return true
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register block"})
+	return true
+}
+
 // CheckBlocksRequest is the request body for checking blocks
 type CheckBlocksRequest struct {
 	Hashes []string `json:"hashes" binding:"required"`
@@ -939,12 +962,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		// GOVERN the block (metadata + provisional ref) so the session can commit
 		// it and GC can reclaim it, not merely to store bytes.
 		if resolution == uploadSessionValid {
-			if err := h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, false); err != nil {
-				if errors.Is(err, db.ErrBlockIDMappingConflict) {
-					c.JSON(http.StatusConflict, gin.H{"error": "block id mapping conflict"})
-					return
-				}
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register block"})
+			if respondBlockMaterializeError(c, h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, false)) {
 				return
 			}
 		}
@@ -1039,12 +1057,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 
 	// R9: govern the freshly stored block under the session.
 	if resolution == uploadSessionValid {
-		if err := h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, true); err != nil {
-			if errors.Is(err, db.ErrBlockIDMappingConflict) {
-				c.JSON(http.StatusConflict, gin.H{"error": "block id mapping conflict"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register block"})
+		if respondBlockMaterializeError(c, h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, true)) {
 			return
 		}
 	}
