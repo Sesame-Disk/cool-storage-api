@@ -18,7 +18,9 @@ func TestFileViewCanonicalReadRouting(t *testing.T) {
 		},
 		"sharelink_view.go": {
 			"handleShareLinkRaw":    {constructors: 1, batchResolutions: 1, sizeQueries: 1, readSeekers: 1, streams: 1},
-			"readFileContentAsText": {constructors: 1, batchResolutions: 1, directBlockCalls: 2},
+			// One GetBlock, not two: the encrypted and plaintext branches used to
+			// duplicate the same read and differ only in the decrypt step.
+			"readFileContentAsText": {constructors: 1, batchResolutions: 1, directBlockCalls: 1},
 		},
 	}
 

@@ -539,10 +539,36 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		return
 	}
 
+	// Check if library is encrypted. Failing open would stream ciphertext bytes
+	// to the viewer labelled as the real content.
+	//
+	// This MUST run before the ETag revalidation below. `Cache-Control:
+	// private, no-cache` lets the browser keep the decrypted bytes and only
+	// forces revalidation, so answering 304 first would re-authorise a cached
+	// plaintext copy after the decrypt session expired, and would also hide the
+	// probe-failure 503 from any request that carries an ETag.
+	// ServeHistoricFileRaw already gates in this order.
+	encrypted, err := libraryIsEncrypted(h.db, orgID, repoID)
+	if err != nil {
+		respondEncryptionProbeUnavailable(c)
+		return
+	}
+
+	var fileKey []byte
+	var fileIV []byte
+	if encrypted {
+		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(userID, repoID)
+		if fileKey == nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted but not unlocked"})
+			return
+		}
+	}
+
 	// ETag-based cache validation: fs_id changes on every file update
 	if setCacheHeaders(c, result.TargetEntry.ID) {
 		return
 	}
+
 
 	// Guard against loading very large files - use appropriate limit based on file type
 	maxSize := h.getMaxFileSizeForPreview(ext)
@@ -558,24 +584,6 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
-	}
-
-	// Check if library is encrypted. Failing open would stream ciphertext bytes
-	// to the viewer labelled as the real content.
-	encrypted, err := libraryIsEncrypted(h.db, orgID, repoID)
-	if err != nil {
-		respondEncryptionProbeUnavailable(c)
-		return
-	}
-
-	var fileKey []byte
-	var fileIV []byte
-	if encrypted {
-		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(userID, repoID)
-		if fileKey == nil {
-			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted but not unlocked"})
-			return
-		}
 	}
 
 	ctx := c.Request.Context()

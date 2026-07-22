@@ -985,12 +985,18 @@ func buildZippedPath(rootName, relativePath string) string {
 	return string(data)
 }
 
-// readFileContentAsText reads the file content from block storage and returns it as a string.
-// Used for embedding text file content directly in page options (for the text/markdown React views).
-// Returns empty string on any error. Limited to 1MB to avoid huge page payloads.
-func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
+// readFileContentAsText reads the file content from block storage and returns it
+// as a string. Used for embedding text/markdown content directly in page options.
+// Limited to 1MB to avoid huge page payloads.
+//
+// It returns ("", nil) only where there is legitimately nothing to inline — no
+// target entry, a file past the size limit, or an encrypted library a share link
+// cannot decrypt — and an error for every TRANSIENT failure. Returning "" for
+// those made a non-empty file render as a silently empty 200 that the client had
+// no way to distinguish from a genuinely empty file, and no reason to retry.
+func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) (string, error) {
 	if sl.targetEntry == nil {
-		return ""
+		return "", nil
 	}
 
 	const maxTextSize = 1 * 1024 * 1024 // 1MB limit for inline text content
@@ -1001,26 +1007,23 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, sl.libraryID, sl.targetEntry.ID).Scan(&blockIDs, &fileSize)
 	if err != nil {
-		slog.Error("Failed to get file block IDs for text content", "error", err)
-		return ""
+		return "", fmt.Errorf("read file block ids for inline text: %w", err)
 	}
 
 	if fileSize > maxTextSize {
-		return ""
+		return "", nil
 	}
 
 	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequest(nil, h.db, h.config, h.storageManager, h.storage, sl.orgID, sl.libraryID)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("resolve block store for inline text: %w", err)
 	}
 
-	// Check if library is encrypted. This helper returns a string, so it cannot
-	// emit a 503; failing closed here means rendering no preview rather than
-	// embedding ciphertext as if it were the file's text.
+	// A probe failure must not fall through as "not encrypted": that would embed
+	// ciphertext into the page as if it were the file's text.
 	encrypted, err := libraryIsEncrypted(h.db, sl.orgID, sl.libraryID)
 	if err != nil {
-		slog.Error("encryption probe failed for inline text content", "org", sl.orgID, "error", err)
-		return ""
+		return "", fmt.Errorf("encryption probe for inline text: %w", err)
 	}
 
 	var fileKey []byte
@@ -1028,7 +1031,8 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 	if encrypted {
 		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(sl.createdBy, sl.libraryID)
 		if fileKey == nil {
-			return ""
+			// Stable, not transient: no session exists and none is coming.
+			return "", nil
 		}
 	}
 
@@ -1037,45 +1041,36 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 	if streaming.ContainsLegacySHA1(blockIDs) {
 		resolved, err := db.ResolveBlockRepresentationID(h.db.Session(), sl.orgID, sl.libraryID)
 		if err != nil {
-			slog.Error("failed to resolve block representation for inline text content", "org", sl.orgID, "library", sl.libraryID, "error", err)
-			return ""
+			return "", fmt.Errorf("resolve block representation for inline text: %w", err)
 		}
 		representationID = resolved
 	}
 	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, sl.orgID, representationID, blockIDs)
 	if err != nil {
-		slog.Error("block ID resolution failed for inline text content", "org", sl.orgID, "error", err)
-		return ""
+		return "", fmt.Errorf("resolve block ids for inline text: %w", err)
 	}
 	canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, sl.orgID, resolvedIDs, blockStore, blockStoreClass)
 	if err != nil {
-		slog.Error("canonical block reader construction failed for inline text content", "org", sl.orgID, "error", err)
-		return ""
+		return "", fmt.Errorf("canonical block reader for inline text: %w", err)
 	}
 	var buf strings.Builder
 	for idx := range blockIDs {
 		internalID := resolvedIDs[idx]
 
+		blockData, err := canonicalReader.GetBlock(ctx, internalID)
+		if err != nil {
+			return "", fmt.Errorf("read block %s for inline text: %w", internalID, err)
+		}
 		if encrypted && fileKey != nil {
-			blockData, err := canonicalReader.GetBlock(ctx, internalID)
-			if err != nil {
-				return ""
-			}
 			blockData, err = crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 			if err != nil {
-				return ""
+				return "", fmt.Errorf("decrypt block %s for inline text: %w", internalID, err)
 			}
-			buf.Write(blockData)
-		} else {
-			blockData, err := canonicalReader.GetBlock(ctx, internalID)
-			if err != nil {
-				return ""
-			}
-			buf.Write(blockData)
 		}
+		buf.Write(blockData)
 	}
 
-	return buf.String()
+	return buf.String(), nil
 }
 
 // serveSharedFilePage renders the shared file view
@@ -1106,7 +1101,14 @@ func (h *ShareLinkViewHandler) buildShareFileBootstrapResponse(c *gin.Context, s
 	fileContent := ""
 	var smartLinkMap map[string]sharedMarkdownSmartLinkTarget
 	if bundleName == "sharedFileViewText" || bundleName == "sharedFileViewMarkdown" {
-		fileContent = h.readFileContentAsText(sl)
+		var contentErr error
+		fileContent, contentErr = h.readFileContentAsText(sl)
+		if contentErr != nil {
+			// A transient read failure must not render as an empty file. Surface
+			// it so the client retries instead of showing the document as blank.
+			slog.Error("inline text content unavailable for share link", "org", sl.orgID, "file", filename, "error", contentErr)
+			return pageBootstrapResponse{}, http.StatusServiceUnavailable, contentErr
+		}
 		if bundleName == "sharedFileViewMarkdown" {
 			smartLinkMap = h.buildSharedMarkdownSmartLinkMap(sl, fileContent)
 		}

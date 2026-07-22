@@ -4780,6 +4780,15 @@ uniform response:
 Three further probes (`block_upload_session.go`, and the two historic-file paths in
 `fileview.go`) already failed closed and were left as they were.
 
+**Gate ordering is part of the contract, not just the probe.** `ServeRawFile`
+originally ran its ETag revalidation *before* the probe. `Cache-Control: private,
+no-cache` lets a browser keep the decrypted bytes and only forces revalidation, so a
+`304` re-authorised a cached plaintext copy after the decrypt session expired, and
+also hid the probe-failure `503` from any request carrying `If-None-Match`. The gate
+now precedes every short circuit and every write in all four handlers, pinned by
+`TestEncryptionGateRunsBeforeShortCircuitsAndWrites`, which compares the source
+positions of the two calls — a helper-level unit test cannot observe ordering.
+
 **Watch for recurrence:** the general shape is a discarded `Scan` error on a flag
 whose zero value is the permissive answer. A new probe that bypasses
 `libraryIsEncrypted` reintroduces it.
