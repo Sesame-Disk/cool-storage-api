@@ -2996,11 +2996,15 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
+	originalProbe := probeUploadedBlockReuseForUploadFn
+	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
 	t.Cleanup(func() {
 		registerUploadedBlockAndMappingForUploadFn = originalRegister
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
+		probeUploadedBlockReuseForUploadFn = originalProbe
+		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
 	})
 
 	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
