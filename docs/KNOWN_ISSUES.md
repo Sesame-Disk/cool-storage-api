@@ -4722,53 +4722,71 @@ Revisit alongside X2 (multi-DC reasoning is derived, never reproduced) in
 
 ---
 
-### ISSUE-ENCRYPTED-FLAG-UNCHECKED-01: An ignored `encrypted` probe error silently disables encryption
+### ISSUE-ENCRYPTED-FLAG-UNCHECKED-01: A failed `encrypted` probe defaulted to "not encrypted"
 
-**Status**: 🔴 Open (found 2026-07-22 while auditing PR-6) — two call sites remain
-**Severity**: High for the write path (stores plaintext into an encrypted library), Medium for the read path
-**Affected**: `internal/api/v2/files.go` `UploadFile`; `internal/api/v2/fileview.go` `ServeRawFile`
+**Status**: ✅ Fixed (2026-07-22) — all six fail-open sites closed; kept as the rationale record
+**Severity**: was High (durable plaintext in an encrypted library; two authorization gates opened by a timeout)
+**Affected**: `internal/api/v2` — `files.go`, `batch_operations.go`, `fileview.go`, `sharelink_view.go`
 
 #### Problem
 
-The library encryption flag is read as `Scan(&encrypted)` with the error **discarded**.
-Go leaves `encrypted` as its zero value on failure, so any transient Cassandra error —
-a timeout, a coordinator hiccup, cross-DC lag — is indistinguishable from "this library
-is not encrypted", and the caller proceeds down the plaintext branch.
+The library encryption flag was read as `Scan(&encrypted)` with the error either
+**discarded** or explicitly turned into "allow". Go leaves `encrypted` false on
+failure, so any transient Cassandra error — a timeout, a coordinator hiccup,
+cross-DC lag — was indistinguishable from "this library is not encrypted", and the
+caller took the plaintext branch.
 
-```go
-// The error is never checked; encrypted stays false on ANY failure.
-h.db.Session().Query(`SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?`,
-    orgID, repoID).Scan(&encrypted)
-if encrypted { /* ...load file key, encrypt/decrypt... */ }
-```
+Six sites, in two classes. The distinction matters: the first class corrupts or
+exposes data, the second bypasses an authorization gate.
 
-Two consequences, of different severity:
+**Class A — error discarded, plaintext branch taken:**
 
-1. **`UploadFile` (write path, High).** The upload takes the un-encrypted branch and
-   **persists plaintext into a library the user believes is encrypted**. It also skips
-   the `403 lib_need_decrypt` gate, so it succeeds without a decrypt session. The bad
-   state is durable and is not detectable later from the stored object alone.
-2. **`ServeRawFile` (read path, Medium).** The response streams ciphertext bytes
-   labelled as the real content, so the viewer renders garbage. No confidentiality
-   loss, but a `200` carrying wrong content.
+| Site | Consequence |
+|---|---|
+| `files.go` `UploadFile` | **Persisted plaintext into a library the user believes is encrypted.** Durable, and not detectable afterwards from the stored object. The worst of the six. |
+| `fileview.go` `ServeRawFile` | Streamed ciphertext to the viewer labelled as the real content. |
+| `sharelink_view.go` `handleShareLinkRaw` | Served ciphertext as a `200` on a **public, unauthenticated** surface. |
+| `sharelink_view.go` `readFileContentAsText` | Embedded ciphertext into a share-link preview as if it were the file's text. |
 
-PR-6 fixed exactly this defect in `HandleZipDownload`, which had the same discarded
-error and produced a `200` ZIP of ciphertext. `seafHTTPLookupLibraryEncryptedFn` is
-the corrected shape: probe, propagate the error, fail closed. These two v2 call sites
-were left untouched only because they are outside that PR's SeafHTTP scope.
+**Class B — error converted into permission (`return true`):**
 
-#### Fix Direction
+| Site | Consequence |
+|---|---|
+| `files.go` `requireDecryptSession` | A probe failure granted access to an encrypted library with no decrypt session. Guards **20 call sites**. |
+| `batch_operations.go` `checkDecryptSession` | Same, guarding 2 call sites. |
 
-Check the error and fail closed, mirroring `seafHTTPLookupLibraryEncryptedFn`: a probe
-I/O failure is a retryable 503, never "not encrypted"; a confirmed encrypted library
-with no decrypt session stays `403 { lib_need_decrypt: true }`. Prefer one shared
-helper in v2 over repeating the probe, so a third caller cannot reintroduce it. Audit
-for other `Scan(&flag)` sites where a discarded error turns a security decision into
-its permissive default — the same shape guards `encrypted` in several handlers.
+Both Class B comments read "Library not found - let the caller handle it", which is
+the reasoning error: `err != nil` covers a timeout as well as a missing row, and only
+one of those is safe to treat as "no library, no encryption".
+
+PR-6 found and fixed this shape first in SeafHTTP's `HandleZipDownload`, which had the
+same discarded error and produced a `200` ZIP of ciphertext.
+
+#### Fix
+
+`libraryIsEncrypted` in `internal/api/v2/encryption.go` is now the single probe and
+propagates its error; `seafHTTPLookupLibraryEncryptedFn` is its SeafHTTP twin. Each
+caller fails closed **in whatever way its own contract allows**, which is not one
+uniform response:
+
+- handlers with a `gin.Context` emit `respondEncryptionProbeUnavailable` — a
+  retryable `503` + `Retry-After`, deliberately **not** `403 lib_need_decrypt`,
+  because a failed probe means we do not know whether the library is encrypted and
+  the client must retry rather than be told to prompt for a password;
+- `readFileContentAsText` returns a string and cannot emit a status, so it renders
+  no preview instead;
+- the two guards return `false` after writing the 503, so the gate closes.
+
+Three further probes (`block_upload_session.go`, and the two historic-file paths in
+`fileview.go`) already failed closed and were left as they were.
+
+**Watch for recurrence:** the general shape is a discarded `Scan` error on a flag
+whose zero value is the permissive answer. A new probe that bypasses
+`libraryIsEncrypted` reintroduces it.
 
 #### Related Docs
 
-- `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-6 fixed the SeafHTTP ZIP instance)
+- `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-6 fixed the SeafHTTP ZIP instance first)
 
 ---
 

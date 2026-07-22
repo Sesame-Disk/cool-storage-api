@@ -187,7 +187,14 @@ func TestDownloadFailClosedContract(t *testing.T) {
 
 	t.Run("dirent mode and fs_objects.obj_type disagreement is retryable 503", func(t *testing.T) {
 		rootFSID := downloadTestRootFSID(t, database, repoID)
-		fileFSID := downloadTestDirEntryID(t, database, repoID, rootFSID, "corrupt.txt")
+		// Use the id captured BEFORE the previous subtest corrupted the listing.
+		// Re-reading it here would return "nothex", and the parser would reject
+		// the non-40-hex id before any type comparison ran — the assertion below
+		// would then pass even with the mode/obj_type check deleted entirely.
+		fileFSID := corruptFileFSID
+		if fileFSID == "" {
+			t.Fatal("corrupt.txt fs_id was not captured by the corrupt-listing subtest")
+		}
 		// Restore a well-formed listing that names the file, then flip the row's
 		// obj_type so mode (file) and object type (dir) disagree.
 		if err := database.Session().Query(`

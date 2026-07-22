@@ -878,10 +878,14 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 		return
 	}
 
-	// Check if library is encrypted
-	var encrypted bool
-	h.db.Session().Query(`SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?`,
-		sl.orgID, sl.libraryID).Scan(&encrypted)
+	// Check if library is encrypted. This is a public surface: failing open
+	// would serve ciphertext to an anonymous visitor as a 200.
+	encrypted, err := libraryIsEncrypted(h.db, sl.orgID, sl.libraryID)
+	if err != nil {
+		slog.Error("encryption probe failed for share link raw", "org", sl.orgID, "error", err)
+		respondEncryptionProbeUnavailable(c)
+		return
+	}
 
 	var fileKey []byte
 	var fileIV []byte
@@ -1010,10 +1014,14 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 		return ""
 	}
 
-	// Check if library is encrypted
-	var encrypted bool
-	h.db.Session().Query(`SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?`,
-		sl.orgID, sl.libraryID).Scan(&encrypted)
+	// Check if library is encrypted. This helper returns a string, so it cannot
+	// emit a 503; failing closed here means rendering no preview rather than
+	// embedding ciphertext as if it were the file's text.
+	encrypted, err := libraryIsEncrypted(h.db, sl.orgID, sl.libraryID)
+	if err != nil {
+		slog.Error("encryption probe failed for inline text content", "org", sl.orgID, "error", err)
+		return ""
+	}
 
 	var fileKey []byte
 	var fileIV []byte

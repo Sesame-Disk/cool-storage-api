@@ -560,10 +560,13 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		return
 	}
 
-	// Check if library is encrypted
-	var encrypted bool
-	h.db.Session().Query(`SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?`,
-		orgID, repoID).Scan(&encrypted)
+	// Check if library is encrypted. Failing open would stream ciphertext bytes
+	// to the viewer labelled as the real content.
+	encrypted, err := libraryIsEncrypted(h.db, orgID, repoID)
+	if err != nil {
+		respondEncryptionProbeUnavailable(c)
+		return
+	}
 
 	var fileKey []byte
 	var fileIV []byte

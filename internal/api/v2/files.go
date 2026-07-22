@@ -381,14 +381,14 @@ func (h *FileHandler) requireDecryptSession(c *gin.Context, orgID, userID, repoI
 		return true // No database, allow access (for testing)
 	}
 
-	// Check if library is encrypted
-	var encrypted bool
-	err := h.db.Session().Query(`
-		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&encrypted)
+	// Check if library is encrypted. A probe failure must NOT open this gate:
+	// err covers a Cassandra timeout as well as a missing row, and returning
+	// true there would let a transient fault grant access to an encrypted
+	// library with no decrypt session.
+	encrypted, err := libraryIsEncrypted(h.db, orgID, repoID)
 	if err != nil {
-		// Library not found - let the caller handle it
-		return true
+		respondEncryptionProbeUnavailable(c)
+		return false
 	}
 
 	if !encrypted {
@@ -3427,13 +3427,15 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	sha1Hash := sha1.Sum(content)
 	fileID := hex.EncodeToString(sha1Hash[:])
 
-	// Check encryption and encrypt content if needed
+	// Check encryption and encrypt content if needed. Failing open here would
+	// persist PLAINTEXT into a library the user believes is encrypted, and the
+	// stored object gives no way to detect it afterwards.
 	storedContent := content
-	var encrypted bool
-	h.db.Session().Query(
-		`SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?`,
-		orgID, repoID,
-	).Scan(&encrypted)
+	encrypted, err := libraryIsEncrypted(h.db, orgID, repoID)
+	if err != nil {
+		respondEncryptionProbeUnavailable(c)
+		return
+	}
 	if encrypted {
 		fileKey, fileIV := GetDecryptSessions().GetFileKeyAndIV(userID, repoID)
 		if fileKey == nil {

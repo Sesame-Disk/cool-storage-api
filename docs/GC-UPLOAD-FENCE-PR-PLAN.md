@@ -543,11 +543,14 @@ without a decrypt session is 403 `lib_need_decrypt`. Head/commit misses, block-s
 resolution, canonical placement, and non-limit ZIP preflight failures all use the
 same 503 classifier and `Retry-After` as file downloads.
 
-The discarded-probe-error shape that made ZIP stream ciphertext as a 200 **also
-exists in `internal/api/v2`**, outside this PR's SeafHTTP scope: `UploadFile` can
-persist plaintext into an encrypted library, and `ServeRawFile` can serve ciphertext
-as content. Tracked as `ISSUE-ENCRYPTED-FLAG-UNCHECKED-01` in `docs/KNOWN_ISSUES.md`;
-`seafHTTPLookupLibraryEncryptedFn` is the corrected shape to copy.
+The discarded-probe-error shape that made ZIP stream ciphertext as a 200 turned out
+to exist at **six** more sites in `internal/api/v2`, in two classes: four that took
+the plaintext branch (`UploadFile` persisting plaintext into an encrypted library,
+`ServeRawFile`, and both share-link readers) and two that converted the error into
+permission outright (`requireDecryptSession`, guarding 20 call sites, and
+`checkDecryptSession`). All six are fixed here behind a single `libraryIsEncrypted`
+probe, each failing closed as its own contract allows. Recorded with the full
+inventory and the per-surface reasoning in `ISSUE-ENCRYPTED-FLAG-UNCHECKED-01`.
 
 `findValidatedDirEntry` is the single parse-and-match path, shared by the production
 lookup and by the corrupt-listing matrix. An intermediate revision left a separate
