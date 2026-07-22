@@ -1480,19 +1480,6 @@ func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID strin
 	return nil, libraryClass, fmt.Errorf("block storage not available")
 }
 
-func (h *SeafHTTPHandler) resolveLibraryObjectStore(hostname, orgID, repoID string) (storage.Store, string, error) {
-	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
-	if h.storageManager != nil {
-		preferredClass := h.storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
-		return h.storageManager.GetHealthyBackend(preferredClass)
-	}
-	if h.storage != nil {
-		return h.storage, libraryClass, nil
-	}
-
-	return nil, libraryClass, fmt.Errorf("storage not available")
-}
-
 // uploadBlockSize is the block size used when splitting large uploads into blocks.
 // 8 MB matches Seafile's default CDC block size for good deduplication compatibility.
 const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
@@ -3538,58 +3525,44 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 		}
 	}
 
-	// Try to stream file from block storage (content-addressed)
-	// This is the normal flow for SesameFS files
-	if h.db != nil && h.storageManager != nil {
-		log.Printf("[HandleDownload] Attempting block-based streaming download")
-		err := h.streamFileFromBlocks(c, token, filename, downloadTrafficStatus.PeriodStartedAt)
-		if err == nil {
-			return
-		}
-		log.Printf("[HandleDownload] Block-based streaming FAILED: %v", err)
-		// If block-based retrieval fails, fall back to direct S3 path-based retrieval
-	} else {
+	// Block storage is the ONLY download path. The legacy <org>/<repo><path>
+	// object fallback was removed with PR-6: it fired on ANY streaming failure,
+	// including a Cassandra timeout, so on a library since written through blocks
+	// it could answer 200 with an older version of the same path, and answered 404
+	// when the object was simply absent. Production starts from empty buckets, so
+	// no path-based object exists to read.
+	if h.db == nil || h.storageManager == nil {
 		log.Printf("[HandleDownload] Block storage not available (db=%v, storageManager=%v)", h.db != nil, h.storageManager != nil)
-	}
-
-	// Fallback: Stream directly from the resolved object store.
-	objectStore, _, err := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
-	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage not available"})
 		return
 	}
 
-	storageKey := fmt.Sprintf("%s/%s%s", token.OrgID, token.RepoID, token.Path)
+	if err := h.streamFileFromBlocks(c, token, filename, downloadTrafficStatus.PeriodStartedAt); err != nil {
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, err)
+		return
+	}
+}
 
-	reader, err := objectStore.Get(c.Request.Context(), storageKey)
-	if err != nil {
+// respondSeafHTTPDownloadError applies the download 404/503 contract. Absence has
+// to be PROVEN — a validated directory listing that does not name the entry — and
+// only then is 404 correct. Everything else, a dangling row included, is reported
+// as retryable 503: a wrong 404 tells a sync client the file is deleted.
+//
+// It writes nothing once the response has been committed, because streaming may
+// have already sent headers and part of the body.
+func respondSeafHTTPDownloadError(c *gin.Context, repoID, path string, err error) {
+	if c.Writer.Written() {
+		log.Printf("[HandleDownload] streaming aborted after headers repo=%s path=%s: %v", repoID, path, err)
+		return
+	}
+	if errors.Is(err, errDirEntryAbsent) {
+		log.Printf("[HandleDownload] file absent repo=%s path=%s: %v", repoID, path, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
 		return
 	}
-	defer reader.Close()
-
-	// Stream directly to response — never load full file into RAM
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
-	c.Header("Content-Type", "application/octet-stream")
-	c.Status(http.StatusOK)
-	bytesBefore := int64(c.Writer.Size())
-	buf := streaming.GetCopyBuf()
-	defer streaming.PutCopyBuf(buf)
-	if _, err := io.CopyBuffer(c.Writer, reader, buf); err != nil {
-		log.Printf("[HandleDownload] Streaming error: %v", err)
-	}
-
-	// Record traffic for the S3 fallback path.
-	if rec := traffic.Get(); rec != nil {
-		sent := int64(c.Writer.Size()) - bytesBefore
-		if sent > 0 {
-			tt := traffic.WebDownload
-			if token.Source == "link" {
-				tt = traffic.LinkDownload
-			}
-			traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, token.OrgID, token.UserID, tt, sent)
-		}
-	}
+	log.Printf("[HandleDownload] download unavailable repo=%s path=%s: %v", repoID, path, err)
+	c.Header("Retry-After", "1")
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "file is temporarily unavailable; retry"})
 }
 
 // resolveBlockID translates a client-facing block id to the internal SHA-256
@@ -3805,70 +3778,155 @@ func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) 
 	return content.Bytes(), nil
 }
 
-// findEntryInDir finds an entry (file or directory) within a directory FS object
-func (h *SeafHTTPHandler) findEntryInDir(repoID, dirFSID, entryName string) (string, error) {
-	var dirEntries string
-	err := h.db.Session().Query(`
-		SELECT dir_entries FROM fs_objects
-		WHERE library_id = ? AND fs_id = ?
-	`, repoID, dirFSID).Scan(&dirEntries)
+// errDirEntryAbsent is the ONLY signal that proves a path does not exist: a
+// directory listing that was read, fully validated, and does not contain the
+// requested name. Every other failure — a dangling row, a blank or corrupt
+// listing, a Cassandra error, even a bare gocql.ErrNotFound — is unproven
+// absence and must surface as 503, never 404. Telling a client 404 for a file
+// that is still there makes it stop retrying and, for a sync client, delete its
+// local copy.
+var errDirEntryAbsent = errors.New("directory entry absent")
+
+// dirEntryNameAndID extracts the name and id of one directory entry, rejecting
+// anything that could resolve to the wrong FS object. encoding/json silently
+// keeps the LAST value for a repeated key, so {"id":"A","id":"B"} would serve B
+// and {"name":"a","name":"b"} would hide "a" entirely; both are rejected here by
+// walking the object's tokens instead of unmarshalling into a map.
+func dirEntryNameAndID(raw json.RawMessage) (string, string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
 	if err != nil {
-		return "", fmt.Errorf("directory not found: %w", err)
+		return "", "", fmt.Errorf("unreadable directory entry: %w", err)
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return "", "", fmt.Errorf("directory entry is not a JSON object")
 	}
 
-	log.Printf("[findEntryInDir] Looking for entry '%s' in dir %s", entryName, dirFSID)
-	log.Printf("[findEntryInDir] Dir entries length: %d", len(dirEntries))
-
-	// Parse dir_entries as JSON array - proper JSON parsing instead of string matching
-	// This handles any JSON formatting (with or without spaces)
-	var entries []map[string]interface{}
-	if dirEntries == "" || dirEntries == "[]" {
-		log.Printf("[findEntryInDir] Directory is empty")
-		return "", fmt.Errorf("entry not found: %s", entryName)
-	}
-
-	if err := json.Unmarshal([]byte(dirEntries), &entries); err != nil {
-		log.Printf("[findEntryInDir] ERROR: Failed to parse dir_entries JSON: %v", err)
-		// Log a snippet for debugging
-		if len(dirEntries) > 500 {
-			log.Printf("[findEntryInDir] Dir entries (first 500 chars): %s", dirEntries[:500])
-		} else {
-			log.Printf("[findEntryInDir] Dir entries: %s", dirEntries)
+	seen := make(map[string]struct{}, 4)
+	var name, id string
+	var nameFound, idFound bool
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return "", "", fmt.Errorf("unreadable directory entry key: %w", err)
 		}
-		return "", fmt.Errorf("malformed directory entries: %w", err)
+		key, ok := keyToken.(string)
+		if !ok {
+			return "", "", fmt.Errorf("directory entry key is not a string")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return "", "", fmt.Errorf("directory entry repeats key %q", key)
+		}
+		seen[key] = struct{}{}
+
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return "", "", fmt.Errorf("unreadable value for directory entry key %q: %w", key, err)
+		}
+		switch key {
+		case "name":
+			if err := json.Unmarshal(value, &name); err != nil {
+				return "", "", fmt.Errorf("directory entry name is not a string: %w", err)
+			}
+			nameFound = true
+		case "id":
+			if err := json.Unmarshal(value, &id); err != nil {
+				return "", "", fmt.Errorf("directory entry id is not a string: %w", err)
+			}
+			idFound = true
+		}
 	}
 
-	log.Printf("[findEntryInDir] Parsed %d entries from directory", len(entries))
+	if !nameFound || name == "" {
+		return "", "", fmt.Errorf("directory entry has no usable name")
+	}
+	if !idFound {
+		return "", "", fmt.Errorf("directory entry %q has no id", name)
+	}
+	if len(id) != 40 || !isHexString([]byte(id)) {
+		return "", "", fmt.Errorf("directory entry %q has a non-40-hex id", name)
+	}
+	return name, id, nil
+}
 
-	// Search for the entry by name
-	for _, entry := range entries {
-		name, ok := entry["name"].(string)
-		if !ok {
+// findDirEntryID resolves entryName against a raw dir_entries payload.
+//
+// A match is returned as soon as it is unambiguous and well formed, so one bad
+// sibling never makes a healthy file unreadable. Absence is the strict case: it
+// is reported ONLY when every entry validated and none matched. If any entry was
+// malformed the listing cannot prove absence, and the caller gets a real error.
+func findDirEntryID(rawEntries, entryName string) (string, error) {
+	trimmed := strings.TrimSpace(rawEntries)
+	if trimmed == "" || trimmed == "null" {
+		return "", fmt.Errorf("directory listing is blank")
+	}
+
+	var entries []json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &entries); err != nil {
+		return "", fmt.Errorf("malformed directory listing: %w", err)
+	}
+
+	var match string
+	var matchFound bool
+	var firstErr error
+	seenNames := make(map[string]struct{}, len(entries))
+	for i, raw := range entries {
+		name, id, err := dirEntryNameAndID(raw)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("directory entry %d: %w", i, err)
+			}
 			continue
 		}
-		if name == entryName {
-			id, ok := entry["id"].(string)
-			if !ok {
-				log.Printf("[findEntryInDir] ERROR: Entry found but ID is not a string: %v", entry["id"])
-				return "", fmt.Errorf("malformed entry ID for: %s", entryName)
+		if _, duplicate := seenNames[name]; duplicate {
+			// A duplicate of the requested name is always fatal: the listing
+			// cannot say which FS object the path means.
+			if name == entryName {
+				return "", fmt.Errorf("directory lists %q more than once", name)
 			}
-			log.Printf("[findEntryInDir] Found entry '%s' with ID: %s", entryName, id)
-			return id, nil
+			if firstErr == nil {
+				firstErr = fmt.Errorf("directory lists %q more than once", name)
+			}
+			continue
+		}
+		seenNames[name] = struct{}{}
+		if name == entryName {
+			match, matchFound = id, true
 		}
 	}
 
-	// Entry not found - log available entries for debugging
-	log.Printf("[findEntryInDir] Entry '%s' not found in directory. Available entries:", entryName)
-	for i, entry := range entries {
-		if i < 10 { // Log first 10 entries
-			log.Printf("[findEntryInDir]   - %v", entry["name"])
-		}
+	if matchFound {
+		return match, nil
 	}
-	if len(entries) > 10 {
-		log.Printf("[findEntryInDir]   ... and %d more entries", len(entries)-10)
+	if firstErr != nil {
+		return "", firstErr
+	}
+	return "", fmt.Errorf("%w: %s", errDirEntryAbsent, entryName)
+}
+
+// findEntryInDir resolves entryName inside a directory FS object.
+//
+// A read failure is NOT absence: a bare gocql.ErrNotFound on the directory row
+// means the dirent that named it points at a row that is missing — premature GC,
+// a partial write, cross-DC lag — which is dangling metadata, not proof the path
+// is gone. Only findDirEntryID may report absence, via errDirEntryAbsent.
+func (h *SeafHTTPHandler) findEntryInDir(repoID, dirFSID, entryName string) (string, error) {
+	var dirEntries string
+	if err := h.db.Session().Query(`
+		SELECT dir_entries FROM fs_objects
+		WHERE library_id = ? AND fs_id = ?
+	`, repoID, dirFSID).Scan(&dirEntries); err != nil {
+		return "", fmt.Errorf("failed to read directory %s: %w", dirFSID, err)
 	}
 
-	return "", fmt.Errorf("entry not found: %s", entryName)
+	id, err := findDirEntryID(dirEntries, entryName)
+	if err != nil {
+		if errors.Is(err, errDirEntryAbsent) {
+			return "", err
+		}
+		return "", fmt.Errorf("directory %s: %w", dirFSID, err)
+	}
+	return id, nil
 }
 
 // Helper function to generate a file ID
@@ -3997,7 +4055,9 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 			}
 			nextFSID, err := h.findEntryInDir(token.RepoID, currentFSID, part)
 			if err != nil {
-				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("directory not found: %s", part)})
+				// Same contract as HandleDownload: only a validated listing that
+				// does not name the entry proves the directory is gone.
+				respondSeafHTTPDownloadError(c, token.RepoID, part, err)
 				return
 			}
 			currentFSID = nextFSID

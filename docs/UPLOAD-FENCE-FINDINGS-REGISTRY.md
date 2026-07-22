@@ -7,9 +7,10 @@
 PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138), closing F2 and
 X7. PR-3 merged as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), closing
 F6, F14 and the observed-fence half of F1. PR-4 merged as
-[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4/F7. PR-5 is
-implemented on `fix/gc-web-session-retry-contract` and pending review; F1/F3 remain
-open on `main` until it merges. X1/X2 remain open.
+[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4/F7. PR-5 merged as
+[#141](https://github.com/Sesame-Disk/sesamefs/pull/141), closing F1 and F3. PR-6 is
+implemented on `fix/gc-download-fail-closed` and pending review; F5/F13 remain open on
+`main` until it merges. X1/X2 remain open.
 
 Every row is verified against code at the cited location, except where the row
 explicitly identifies engine-dependent behavior that still needs a non-skipping
@@ -37,13 +38,11 @@ out here so the decision is visible rather than implicit.
 
 ## Open on `main`
 
-F1 and F3 have implementations on `fix/gc-web-session-retry-contract` but stay open
-until PR-5 merges.
+F5 and F13 have implementations on `fix/gc-download-fail-closed` but stay open until
+PR-6 merges.
 
 | # | Severity | Finding | Evidence | Closed by |
 |---|---|---|---|---|
-| F1 | Blocker | **Fast-clearing GC fence loses the uploaded object.** An upload can PUT, add its provisional reference after GC's post-claim liveness read, then publish metadata without repeating the PUT GC deleted. PR-3 fixes the **observed-fence** half: `RegisterUploadedBlock` no longer absorbs the fence — it reads it once and propagates `ErrBlockDeleteInProgress`, leaving the provisional reference in place, so the wrapper repeats store→materialize and re-PUTs the object. The **fast-clear window** — a whole GC claim→verify→delete→clear cycle completing between the single fence read and publish, so the fence is never observed — is NOT closed by PR-3; that needs PR-5's deterministic real-worker regression and the web-funnel half. Destructive GC stays disabled meanwhile. | `fs_helpers.go` `RegisterUploadedBlock`; `upload_reuse.go` `RetryUploadedBlockMaterialization` | PR-3 (observed-fence half) + PR-5 (fast-clear window) |
-| F3 | High | **Web block-session upload funnel is unwrapped.** PR-4 probes and routes this funnel canonically, but `v2/blocks.go` still performs only one store→materialize attempt, so it cannot recover when the post-reference fence read observes GC ownership. | `v2/blocks.go` `UploadBlock` | PR-5 |
 | F5 | High | **Download can serve stale legacy bytes.** `HandleDownload` falls back to the path-based object on *any* streaming failure, including a Cassandra timeout. On a library since written through blocks that object can hold an older version of the same path, so a transient failure answers 200 with stale content. | `seafhttp.go` `HandleDownload` fallback | PR-6 |
 | F8 | Medium | **Legacy no-session upload leaks S3 objects (R2).** `/api/v2/blocks/upload` without a session writes an object with no `blocks` row and no reference. Reachable by any authenticated user regardless of the block-upload feature flag. | `v2/blocks.go` legacy path | PR-7 |
 | F9 | Medium | **GC Phase 0 can delete a renewed provisional reference.** The scanner removed the reference based on a stale expiry projection, which could drop liveness for a live upload that renewed the same referrer. | `gc/scanner.go` `scanExpiredProvisionalBlockRefs` | PR-8 |
@@ -64,6 +63,8 @@ Rows move here only once the PR that fixes them **merges**.
 | F14 | Low | Retry metrics mislabeled materialization failures as probe failures. PR-3 derives the label from the failing phase. | PR-3 ([#139](https://github.com/Sesame-Disk/sesamefs/pull/139)) |
 | F4 | High | `NeedsPut` with existing metadata stored to the preferred backend instead of immutable canonical placement. | PR-4 ([#140](https://github.com/Sesame-Disk/sesamefs/pull/140)) |
 | F7 | Medium | Readers resolved storage by request routing instead of canonical block metadata. | PR-4 ([#140](https://github.com/Sesame-Disk/sesamefs/pull/140)) |
+| F1 | Blocker | Fast-clearing GC fence lost the uploaded object. PR-3 closed the observed-fence half; PR-5 added the mandatory post-reference canonical confirmation that repairs bytes when a whole GC cycle cleared its fence before the writer could observe it, proven by a deterministic regression against a real `gc.Worker`. | PR-3 + PR-5 ([#141](https://github.com/Sesame-Disk/sesamefs/pull/141)) |
+| F3 | High | Web block-session upload funnel was unwrapped. PR-5 wrapped it in the bounded store→materialize→confirm cycle with single-shot admission, traffic and metrics, and a retryable coded `409 block_delete_in_progress`. | PR-5 ([#141](https://github.com/Sesame-Disk/sesamefs/pull/141)) |
 
 ## Open, deferred, or constraining the series
 

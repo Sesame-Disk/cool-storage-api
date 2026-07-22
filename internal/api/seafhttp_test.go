@@ -2100,12 +2100,16 @@ func TestSeafHTTPHandlerDownloadNoStorage(t *testing.T) {
 	}
 }
 
-func TestSeafHTTPHandlerDownloadWithStorageManagerObjectFallback(t *testing.T) {
+// PR-6 removed the <org>/<repo><path> object fallback. Even when such an object
+// is sitting in the store and readable, it must never be served: on a library
+// since written through blocks it can hold an OLDER version of the same path, so
+// answering 200 from it turns a transient failure into silent stale content.
+func TestSeafHTTPHandlerDownloadNeverServesThePathBasedObject(t *testing.T) {
 	tokenStore := NewMockTokenStore()
 	tokenStore.CreateDownloadToken("org1", "repo1", "/file.txt", "user1")
 	manager := storage.NewManager()
 	manager.SetDefaultClass("hot-s3-eu")
-	manager.RegisterBackend("hot-s3-eu", &mockObjectStore{data: []byte("hello")}, "")
+	manager.RegisterBackend("hot-s3-eu", &mockObjectStore{data: []byte("stale-legacy-bytes")}, "")
 	handler := NewSeafHTTPHandler(nil, manager, nil, tokenStore, nil, nil)
 
 	r := gin.New()
@@ -2115,11 +2119,11 @@ func TestSeafHTTPHandlerDownloadWithStorageManagerObjectFallback(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d (the legacy object must not be reachable)", w.Code, http.StatusServiceUnavailable)
 	}
-	if w.Body.String() != "hello" {
-		t.Fatalf("body = %q, want %q", w.Body.String(), "hello")
+	if strings.Contains(w.Body.String(), "stale-legacy-bytes") {
+		t.Fatalf("path-based object was served: %q", w.Body.String())
 	}
 }
 

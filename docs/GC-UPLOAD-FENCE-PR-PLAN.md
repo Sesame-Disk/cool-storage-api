@@ -6,9 +6,10 @@
 PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138) (closed F2/X7).
 PR-3 merged as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), closing F6,
 F14 and the **observed-fence half** of F1. PR-4 merged as
-[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4 and F7. PR-5 is
-implemented on `fix/gc-web-session-retry-contract` and pending review. X1/X2 remain
-open and keep destructive GC disabled.
+[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4 and F7. PR-5 merged
+as [#141](https://github.com/Sesame-Disk/sesamefs/pull/141), closing F1 and F3. PR-6 is
+implemented on `fix/gc-download-fail-closed` and pending review. X1/X2 remain open and
+keep destructive GC disabled.
 
 ## Why this document exists
 
@@ -504,6 +505,30 @@ never reaches a plaintext object; end-to-end download tests against real Cassand
 helper asserting that absence is *never* reported except for a well-formed listing
 with no match. Three separate audit rounds each found a new corrupt-listing shape
 that hand-written cases had missed; generated input is the way to stop that.
+
+**Current implementation (pending review):** `findDirEntryID` and `dirEntryNameAndID`
+in `internal/api/seafhttp.go` validate a listing by walking each entry's JSON tokens
+instead of unmarshalling into a map, so a repeated `id` or `name` key is rejected
+rather than silently resolved to its last value. Absence is reported only through
+`errDirEntryAbsent`, and only when every entry validated and none matched; a valid
+match is still returned when a *sibling* is corrupt, so one bad dirent cannot make a
+healthy file unreadable. `findEntryInDir` no longer turns a read failure into
+absence. `respondSeafHTTPDownloadError` is the single place that applies the contract
+— `errDirEntryAbsent` to 404, everything else to 503 with `Retry-After` — and it
+writes nothing once streaming has committed headers. `HandleDownload` lost its
+path-based fallback and `resolveLibraryObjectStore` was deleted with its only caller.
+The zip directory walk shares the same classifier, which previously answered 404 for
+any `findEntryInDir` failure.
+
+Coverage: the corrupt-listing matrix routed through parse-and-match rather than the
+parser alone; a seeded generative property test asserting absence is never claimed
+for a listing that is unparseable, holds an invalid entry, or names the target; the
+classifier both ways, including that a bare `gocql.ErrNotFound` on a referenced row
+does **not** become 404; that a committed response is never rewritten; that a present
+path-based object is *not* served; and `TestDownloadFailClosedContract` in
+`internal/integration`, which drives the four end-to-end cases against real Cassandra
+through the production endpoint — present file, deleted file, dangling `fs_object`,
+and corrupt listing.
 
 ---
 
