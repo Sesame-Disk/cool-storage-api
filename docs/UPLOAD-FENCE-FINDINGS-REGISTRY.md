@@ -49,7 +49,7 @@ PR-6 merges.
 | F10 | Medium | **Provisional reference and its expiry are written separately.** A failure between them leaves a reference with no discovery projection, so the zero-ref transition is never found. The atomic single-batch write is PR-8; PR-3 keeps the interim guard (on an expiry-write failure `RegisterUploadedBlock` releases the reference and enqueues it, rather than leaving the orphan) so it does not widen this window. | `fs_helpers.go`; `provisional_block_ref_expiry.go` | PR-8 |
 | F11 | Medium | **Abandoned prefetch leaks an open S3 reader.** `PrefetchBlock` buffered its result, so a consumer that stopped early left the `io.ReadCloser` unclosed. | `streaming/streaming.go` | PR-9 |
 | F12 | Medium | **Unbounded request bodies.** `PutBlock` and `check-blocks` read the whole body with `io.ReadAll` and no size or id-count limit. | `sync.go` | PR-10 |
-| F13 | High | **Corrupt directory listings resolve, and 404/503 semantics are inverted for a deleted path.** High, not the Low it was first filed as: two of the cases below serve bytes from the wrong FS object. Not Blocker only because it needs an already-corrupt dirent — see the severity note above. The 404/503 half on its own would be Low. `findEntryInDir` returns a plain error, so a renamed or deleted file surfaces as 503 while an absent commit row gives 404. Related, and worse: a JSON-valid but corrupt listing resolves anyway. Structural cases (`null`, `[null]`, non-string name, missing id) parse and the bad entries are skipped, reporting a false absence; semantic cases (empty name, empty or non-40-hex id, duplicate names) resolve to a wrong or missing FS object; and `encoding/json` silently keeps the **last** value for a repeated key, so `{"id":"A","id":"B"}` serves B and `{"name":"a","name":"b"}` hides `a` entirely. Both of the last two can serve arbitrary bytes or report a present file as absent. | `seafhttp.go` `findEntryInDir` | PR-6 |
+| F13 | High | **Corrupt directory listings resolve, and unproven absence can become 404.** High because corrupt entries can serve bytes from the wrong FS object; the HTTP-classification half alone is lower severity. A missing referenced row is dangling metadata, and even a valid local listing without an entry may be an older `LOCAL_QUORUM` cross-DC snapshot, so neither proves global absence. Related, and worse: a JSON-valid but corrupt listing resolves anyway. Structural cases (`null`, `[null]`, non-string name, missing id/mode) are skipped or misclassified; unsafe names can create traversal entries in ZIPs; semantic cases (empty or non-40-hex id, duplicate names/keys, invalid mode) can resolve the wrong object. `encoding/json` silently keeps the **last** repeated key, so `{"id":"A","id":"B"}` serves B and `{"name":"a","name":"b"}` hides `a` entirely. | `seafhttp.go` directory lookup and ZIP preflight | PR-6 |
 
 ## Closed
 
@@ -69,8 +69,8 @@ Rows move here only once the PR that fixes them **merges**.
 ## Open, deferred, or constraining the series
 
 X1-X3, X5 and X6 are not closed by the immediate code PRs; X4 is deferred to PR-11;
-X7 was closed by PR-2 (see **## Closed**). Destructive GC stays disabled until X1 and
-X2 are resolved.
+X7 was closed by PR-2 (see **## Closed**); X8 is a cost PR-6 accepts knowingly rather
+than a defect to fix. Destructive GC stays disabled until X1 and X2 are resolved.
 
 PR-2 also removed writer-side active-claim release from `internal/api/v2/fs_helpers.go`.
 Only the GC owner may release or delete an active claim; writers must wait/retry or
@@ -82,6 +82,7 @@ the outer store→materialize wrapper.
 |---|---|---|---|
 | X1 | Blocker | **Physical delete ABA.** A previously authorized key-only S3 delete can still run after the visible orphan fence clears and after a re-upload has stored new bytes. Rematerialization does not fence it. Cassandra authorization/claim generations alone cannot revoke a DELETE already in flight; X1 closes only with never-reused generational physical keys, so stale deletes can target only old keys. | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` |
 | X2 | Blocker (multi-DC) | **Cross-DC reference visibility.** `block_references` are ordinary `LOCAL_QUORUM` writes that `SERIAL` does not cover. With RF 1 per DC the write and read quorums need not intersect, so GC in one DC can read zero references for a block that is live in another. The 1h grace period is mitigation, not a bound. | `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` |
+| X8 | Medium (accepted) | **Download can never report a file as gone.** The same `LOCAL_QUORUM` cross-DC reasoning that forces PR-6 to drop 404 leaves the SeafHTTP download surface with no absence answer at all: a genuinely deleted file returns 503 forever, so clients retry a request that cannot succeed, and `internal/api/v2` still answers 404 for the same missing path. Accepted in PR-6 because a wrong 404 makes a sync client delete its local copy; reintroducing 404 needs a read that proves *global* absence. | `ISSUE-DOWNLOAD-NO-404-01` |
 | X3 | Medium | **PUT precedes durable physical-object intent.** Upload paths write to S3 before recording GC-discoverable block metadata/reference or another durable row that identifies the physical object for reclamation. Session-mode staged accounting can already exist, but it does not close this discovery gap. A crash between PUT and registration leaves an object nothing can discover safely. Closing it needs durable physical-object intent before the PUT, or a safe physical sweeper. | `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` |
 | X4 | High (perf) | **One global Paxos round per block on every metadata-registering upload path.** The first-writer `INSERT ... IF NOT EXISTS` is a per-block LWT; under production `SERIAL` and multi-DC it is a global consensus round, ~128 cross-region rounds per GB at the 8 MB block size. **Correction:** an earlier revision said the legacy resumable path "does not pay this at all". That is false — `finalizeUploadStreaming` splits the file into 8 MB blocks and calls `RegisterUploadedBlock` → `UpsertBlockMetadata` per block, so resumable pays the same ~128 LWTs. The defective no-session path in F8 is the exception: it leaves only an S3 object and never registers metadata. This is a **shared** cost of the governed upload paths, not a block-upload disadvantage, and removing it benefits all of them. The pre-store `ProbeBlockReuse` and post-reference `BlockDeleteFenceActive` observations are not redundant and must not be merged: their ordering is the mutual exclusion the protocol depends on. PR-5 adds a third post-materialization confirmation observation to close fast-clear; it is also required and must not be served from either earlier result. Only the LWT is removable here. **Pre-existing since `e3883aa5d` (2026-05-28)** — not introduced by this work; `13e01263a` only made it representation-aware. | P-4 in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`; PR-11 (deferred) |
 | X5 | Medium | **Canonical read fan-out unvalidated.** One Cassandra point read per unique block before the first byte. The existing benchmark substitutes an in-memory function for Cassandra, so it measures goroutines and allocations, not driver, pool, latency or cluster load. | `WEB-BLOCK-UPLOAD.md` pre-flag checklist |
@@ -171,10 +172,11 @@ Applies to every PR in the series, not to any single finding.
   PR-9 must still run its own validation because it changes channel behavior. PR-4's
   focused real-Cassandra/two-bucket-MinIO acceptance and full integration suite passed
   in Compose on 2026-07-21; PR-5's full integration rerun passed on 2026-07-22.
-- **No end-to-end download tests against real Cassandra** exist for the 404/503
-  contract (F5, F13). The unit tests cover the classifier, not the handler.
+- **PR-6 adds an end-to-end download contract test against real Cassandra** for
+  present, deleted, dangling and corrupt metadata, in addition to classifier tests.
 - **No multi-DC test** exercises X2 or X6. Both are reasoned from the production
-  consistency contract, not reproduced. The dedicated USA/EU cluster test profiles
+  consistency contract, not reproduced. PR-6 therefore maps even a validated local
+  absence to 503 rather than assuming cross-DC freshness. The dedicated USA/EU cluster test profiles
   use `LOCAL_SERIAL`, so they do not model production's `SERIAL` cross-DC LWT
   behavior; they are test profiles, not production configuration.
 - **No production latency measurement** for the per-block LWT (X4). Decide PR-11 on

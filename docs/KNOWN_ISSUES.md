@@ -4660,6 +4660,63 @@ apply. No reconcile/backfill pass is required before launch.
 
 ---
 
+### ISSUE-DOWNLOAD-NO-404-01: SeafHTTP download can never report a file as gone
+
+**Status**: 🟡 Accepted trade-off (PR-6, 2026-07-22) — revisit if the deployment is single-DC
+**Severity**: Medium — operational cost and a cross-layer inconsistency, not data loss
+**Affected**: `GET /seafhttp/files/:token/*filepath` and the ZIP directory walk
+
+#### Problem
+
+PR-6 made download fail closed. Absence is never reported: a validated directory
+listing that does not name the entry produces the internal `errDirEntryAbsent`
+sentinel, but the HTTP classifier maps it to **503 + `Retry-After`**, exactly like
+dangling metadata and corruption. The endpoint therefore has **no 404 at all**.
+
+The reason absence cannot be trusted: production metadata reads use `LOCAL_QUORUM`,
+and `access_tokens` and `libraries`/`fs_objects` are independent partitions with no
+global replication order. A node can serve a freshly minted download token while
+reading a directory listing that has not replicated yet, so "the listing does not
+name it" may simply mean "this DC has not seen the create". Answering 404 there
+tells a sync client the file was deleted, and it may drop its local copy — the
+failure mode PR-6 exists to prevent.
+
+**Accepted costs:**
+
+1. **A genuinely deleted file never says so.** It answers 503 forever, so clients
+   retry until their own budget runs out. Reaching this state requires the file to
+   be deleted between token issuance and use, so the window is narrow, but the
+   retries are unbounded work for a request that can never succeed.
+2. **The layers disagree.** `internal/api/v2` still answers 404 for a missing file
+   or directory; only the SeafHTTP download surface is 503-only. A client that talks
+   to both sees two different answers for the same missing path.
+
+An earlier draft of the PR-6 plan specified "404 only when a directory was read,
+fully validated, and does not list the entry". That was reversed deliberately; this
+entry records the reversal and its price so it is not rediscovered as a bug.
+
+#### Fix Direction
+
+Only a read that can prove **global** absence may reintroduce 404. Options, none
+implemented:
+
+- Resolve the path at `QUORUM`/`ALL` (or `SERIAL`) before claiming absence, paying
+  the cross-DC latency only on the miss path, which is already the slow path.
+- Carry the commit id the token was minted against and treat "listing older than
+  that commit" as unproven rather than absent, which distinguishes replication lag
+  from a real delete without a global read.
+- Restrict the 404 to single-DC deployments behind explicit configuration.
+
+Revisit alongside X2 (multi-DC reasoning is derived, never reproduced) in
+`docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`.
+
+#### Related Docs
+
+- `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-6 scope and contract)
+- `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (F5, F13, X2)
+
+---
+
 ## See Also
 
 - [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) - Component completion status

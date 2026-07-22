@@ -99,12 +99,11 @@ func downloadTestDirEntryID(t *testing.T, database *dbpkg.DB, repoID, dirFSID, e
 }
 
 // TestDownloadFailClosedContract drives the four end-to-end cases of the PR-6
-// 404/503 contract against real Cassandra through the production endpoint.
+// fail-closed contract against real Cassandra through the production endpoint.
 //
-// The distinction that matters: a 404 tells a sync client the file is gone and
-// that it may drop its local copy. Only a directory listing that was read,
-// validated and does not name the entry proves that. Dangling metadata and
-// corruption must answer 503 so the client retries instead.
+// A 404 tells a sync client the file is gone and that it may drop its local copy.
+// LOCAL_QUORUM cannot prove global absence because a valid listing may be an older
+// cross-DC snapshot, so absence, dangling metadata and corruption all answer 503.
 func TestDownloadFailClosedContract(t *testing.T) {
 	name := fmt.Sprintf("inttest-download-failclosed-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
@@ -116,6 +115,7 @@ func TestDownloadFailClosedContract(t *testing.T) {
 	uploadFileThroughLink(t, adminClient, uploadURL, "victim.txt", "/", "victim payload")
 	uploadFileThroughLink(t, adminClient, uploadURL, "dangling.txt", "/", "dangling payload")
 	uploadFileThroughLink(t, adminClient, uploadURL, "corrupt.txt", "/", "corrupt payload")
+	var corruptFileFSID string
 
 	t.Run("present file downloads", func(t *testing.T) {
 		status, body := getDownload(t, downloadTokenURL(t, repoID, "/present.txt"))
@@ -127,15 +127,15 @@ func TestDownloadFailClosedContract(t *testing.T) {
 		}
 	})
 
-	t.Run("deleted file is a proven 404", func(t *testing.T) {
+	t.Run("deleted file remains retryable because local absence is not global proof", func(t *testing.T) {
 		url := downloadTokenURL(t, repoID, "/victim.txt")
 
 		resp := adminClient.Delete(t, fmt.Sprintf("/api2/repos/%s/file/?p=/victim.txt", repoID))
 		resp.Body.Close()
 
 		status, body := getDownload(t, url)
-		if status != http.StatusNotFound {
-			t.Fatalf("status = %d, want 404 for a validated listing without the entry (body=%s)", status, body)
+		if status != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 because LOCAL_QUORUM absence may be stale (body=%s)", status, body)
 		}
 	})
 
@@ -169,6 +169,7 @@ func TestDownloadFailClosedContract(t *testing.T) {
 		// names carries a non-40-hex id, so the listing cannot be trusted to
 		// prove anything — least of all absence.
 		rootFSID := downloadTestRootFSID(t, database, repoID)
+		corruptFileFSID = downloadTestDirEntryID(t, database, repoID, rootFSID, "corrupt.txt")
 		if err := database.Session().Query(`
 			UPDATE fs_objects SET dir_entries = ? WHERE library_id = ? AND fs_id = ?
 		`, `[{"name":"corrupt.txt","id":"nothex"}]`, repoID, rootFSID).Exec(); err != nil {
@@ -183,4 +184,45 @@ func TestDownloadFailClosedContract(t *testing.T) {
 			t.Fatalf("status = %d, want 503 (body=%s)", status, body)
 		}
 	})
+
+	for _, tc := range []struct {
+		name       string
+		dirEntries string
+	}{
+		{
+			name: "zip rejects traversal names with retryable 503",
+			dirEntries: fmt.Sprintf(`[{"name":"../escape.txt","id":"%s","mode":33188}]`,
+				corruptFileFSID),
+		},
+		{
+			name: "zip rejects fractional mode with retryable 503",
+			dirEntries: fmt.Sprintf(`[{"name":"corrupt.txt","id":"%s","mode":16384.5}]`,
+				corruptFileFSID),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rootFSID := downloadTestRootFSID(t, database, repoID)
+			if err := database.Session().Query(`
+				UPDATE fs_objects SET dir_entries = ? WHERE library_id = ? AND fs_id = ?
+			`, tc.dirEntries, repoID, rootFSID).Exec(); err != nil {
+				t.Fatalf("corrupt root listing for zip: %v", err)
+			}
+
+			zipTaskResp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2.1/repos/%s/zip-task/?p=/", repoID), map[string]string{})
+			expectStatus(t, zipTaskResp, http.StatusOK)
+			zipToken, _ := responseJSON(t, zipTaskResp)["zip_token"].(string)
+			if zipToken == "" {
+				t.Fatal("zip task returned no token")
+			}
+
+			zipResp := adminClient.Get(t, fmt.Sprintf("/seafhttp/zip/%s", zipToken))
+			defer zipResp.Body.Close()
+			if zipResp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("zip status = %d, want 503 (body=%s)", zipResp.StatusCode, responseBody(t, zipResp))
+			}
+			if got := zipResp.Header.Get("Retry-After"); got == "" {
+				t.Fatal("zip 503 must carry Retry-After")
+			}
+		})
+	}
 }

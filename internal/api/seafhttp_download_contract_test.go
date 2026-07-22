@@ -19,11 +19,10 @@ const (
 	dirEntryIDB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
-// A validated listing that does not name the entry is the ONLY thing that may
-// report absence. Every corrupt shape below must fail closed instead, because
-// reporting absence from an unvalidated listing is what makes a sync client
-// delete a file that is still there.
-func TestFindDirEntryIDAbsenceRequiresAValidatedListing(t *testing.T) {
+// A validated listing may distinguish a missing entry internally, but HTTP still
+// maps that observation to 503 because LOCAL_QUORUM may have returned an older
+// cross-DC snapshot. Every corrupt shape below must also fail closed.
+func TestFindValidatedDirEntryAbsenceRequiresAValidatedListing(t *testing.T) {
 	tests := []struct {
 		name       string
 		rawEntries string
@@ -32,8 +31,8 @@ func TestFindDirEntryIDAbsenceRequiresAValidatedListing(t *testing.T) {
 		wantID     string
 	}{
 		{
-			name:       "well-formed listing without the entry is the only absence",
-			rawEntries: fmt.Sprintf(`[{"name":"other.txt","id":"%s"}]`, dirEntryIDA),
+			name:       "well-formed listing without the entry is an internal absence",
+			rawEntries: fmt.Sprintf(`[{"name":"other.txt","id":"%s","mode":33188}]`, dirEntryIDA),
 			lookFor:    "wanted.txt",
 			wantAbsent: true,
 		},
@@ -45,7 +44,7 @@ func TestFindDirEntryIDAbsenceRequiresAValidatedListing(t *testing.T) {
 		},
 		{
 			name:       "match resolves",
-			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"%s"}]`, dirEntryIDA),
+			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"%s","mode":33188}]`, dirEntryIDA),
 			lookFor:    "wanted.txt",
 			wantID:     dirEntryIDA,
 		},
@@ -81,54 +80,54 @@ func TestFindDirEntryIDAbsenceRequiresAValidatedListing(t *testing.T) {
 		},
 		{
 			name:       "non-string name is not absence",
-			rawEntries: fmt.Sprintf(`[{"name":42,"id":"%s"}]`, dirEntryIDA),
+			rawEntries: fmt.Sprintf(`[{"name":42,"id":"%s","mode":33188}]`, dirEntryIDA),
 			lookFor:    "wanted.txt",
 		},
 		{
 			name:       "empty name is not absence",
-			rawEntries: fmt.Sprintf(`[{"name":"","id":"%s"}]`, dirEntryIDA),
+			rawEntries: fmt.Sprintf(`[{"name":"","id":"%s","mode":33188}]`, dirEntryIDA),
 			lookFor:    "wanted.txt",
 		},
 		{
 			name:       "missing id is not absence",
-			rawEntries: `[{"name":"other.txt"}]`,
+			rawEntries: `[{"name":"other.txt","mode":33188}]`,
 			lookFor:    "wanted.txt",
 		},
 		{
 			name:       "non-40-hex id is not absence",
-			rawEntries: `[{"name":"other.txt","id":"nothex"}]`,
+			rawEntries: `[{"name":"other.txt","id":"nothex","mode":33188}]`,
 			lookFor:    "wanted.txt",
 		},
 		{
 			name:       "non-string id is not absence",
-			rawEntries: `[{"name":"other.txt","id":null}]`,
+			rawEntries: `[{"name":"other.txt","id":null,"mode":33188}]`,
 			lookFor:    "wanted.txt",
 		},
 		{
 			// encoding/json silently keeps the LAST value, which would serve B.
 			name:       "duplicate id key on the requested entry fails closed",
-			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"%s","id":"%s"}]`, dirEntryIDA, dirEntryIDB),
+			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"%s","id":"%s","mode":33188}]`, dirEntryIDA, dirEntryIDB),
 			lookFor:    "wanted.txt",
 		},
 		{
 			// encoding/json would hide "wanted.txt" entirely and report absence.
 			name:       "duplicate name key hiding the requested entry fails closed",
-			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","name":"other.txt","id":"%s"}]`, dirEntryIDA),
+			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","name":"other.txt","id":"%s","mode":33188}]`, dirEntryIDA),
 			lookFor:    "wanted.txt",
 		},
 		{
 			name:       "duplicate names for the requested entry fail closed",
-			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"%s"},{"name":"wanted.txt","id":"%s"}]`, dirEntryIDA, dirEntryIDB),
+			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"%s","mode":33188},{"name":"wanted.txt","id":"%s","mode":33188}]`, dirEntryIDA, dirEntryIDB),
 			lookFor:    "wanted.txt",
 		},
 		{
 			name:       "duplicate names elsewhere block an absence claim",
-			rawEntries: fmt.Sprintf(`[{"name":"dup","id":"%s"},{"name":"dup","id":"%s"}]`, dirEntryIDA, dirEntryIDB),
+			rawEntries: fmt.Sprintf(`[{"name":"dup","id":"%s","mode":33188},{"name":"dup","id":"%s","mode":33188}]`, dirEntryIDA, dirEntryIDB),
 			lookFor:    "wanted.txt",
 		},
 		{
 			name:       "a corrupt sibling blocks an absence claim",
-			rawEntries: fmt.Sprintf(`[{"name":"other.txt","id":"%s"},{"name":"bad.txt","id":"short"}]`, dirEntryIDA),
+			rawEntries: fmt.Sprintf(`[{"name":"other.txt","id":"%s","mode":33188},{"name":"bad.txt","id":"short","mode":33188}]`, dirEntryIDA),
 			lookFor:    "wanted.txt",
 		},
 		{
@@ -136,46 +135,46 @@ func TestFindDirEntryIDAbsenceRequiresAValidatedListing(t *testing.T) {
 			// the valid copy here, even though the listing is ambiguous about the
 			// requested name and the other copy might be the real one.
 			name:       "a corrupt copy of the requested name fails closed",
-			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"%s"},{"name":"wanted.txt","id":"short"}]`, dirEntryIDA),
+			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"%s","mode":33188},{"name":"wanted.txt","id":"short","mode":33188}]`, dirEntryIDA),
 			lookFor:    "wanted.txt",
 		},
 		{
 			name:       "a corrupt copy of the requested name fails closed in either order",
-			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"short"},{"name":"wanted.txt","id":"%s"}]`, dirEntryIDA),
+			rawEntries: fmt.Sprintf(`[{"name":"wanted.txt","id":"short","mode":33188},{"name":"wanted.txt","id":"%s","mode":33188}]`, dirEntryIDA),
 			lookFor:    "wanted.txt",
 		},
 		{
 			// A name hidden behind a repeated key could be the requested one.
 			name:       "a sibling hiding a name behind a repeated key fails closed",
-			rawEntries: fmt.Sprintf(`[{"name":"a","name":"b","id":"%s"},{"name":"wanted.txt","id":"%s"}]`, dirEntryIDA, dirEntryIDB),
+			rawEntries: fmt.Sprintf(`[{"name":"a","name":"b","id":"%s","mode":33188},{"name":"wanted.txt","id":"%s","mode":33188}]`, dirEntryIDA, dirEntryIDB),
 			lookFor:    "wanted.txt",
 		},
 		{
 			// All-or-nothing: any corrupt entry blocks resolution, not just absence.
 			name:       "a corrupt sibling fails the whole listing closed",
-			rawEntries: fmt.Sprintf(`[{"name":"bad.txt","id":"short"},{"name":"wanted.txt","id":"%s"}]`, dirEntryIDA),
+			rawEntries: fmt.Sprintf(`[{"name":"bad.txt","id":"short","mode":33188},{"name":"wanted.txt","id":"%s","mode":33188}]`, dirEntryIDA),
 			lookFor:    "wanted.txt",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			id, err := findDirEntryID(tt.rawEntries, tt.lookFor)
+			entry, err := findValidatedDirEntry(tt.rawEntries, tt.lookFor)
 			switch {
 			case tt.wantID != "":
-				if err != nil || id != tt.wantID {
-					t.Fatalf("findDirEntryID() = (%q, %v), want (%q, nil)", id, err, tt.wantID)
+				if err != nil || entry.id != tt.wantID {
+					t.Fatalf("findValidatedDirEntry() = (%q, %v), want (%q, nil)", entry.id, err, tt.wantID)
 				}
 			case tt.wantAbsent:
 				if !errors.Is(err, errDirEntryAbsent) {
-					t.Fatalf("findDirEntryID() error = %v, want errDirEntryAbsent", err)
+					t.Fatalf("findValidatedDirEntry() error = %v, want errDirEntryAbsent", err)
 				}
 			default:
 				if err == nil {
-					t.Fatalf("findDirEntryID() = (%q, nil), want a non-absence error", id)
+					t.Fatalf("findValidatedDirEntry() = (%q, nil), want a non-absence error", entry.id)
 				}
 				if errors.Is(err, errDirEntryAbsent) {
-					t.Fatalf("findDirEntryID() reported absence from an unvalidated listing: %v", err)
+					t.Fatalf("findValidatedDirEntry() reported absence from an unvalidated listing: %v", err)
 				}
 			}
 		})
@@ -185,7 +184,7 @@ func TestFindDirEntryIDAbsenceRequiresAValidatedListing(t *testing.T) {
 // Property: absence is never reported unless the listing is well formed AND
 // contains no matching name. Three separate audit rounds each found a corrupt
 // shape hand-written cases had missed, so the shapes here are generated.
-func TestFindDirEntryIDNeverInventsAbsence(t *testing.T) {
+func TestFindValidatedDirEntryNeverInventsAbsence(t *testing.T) {
 	rng := rand.New(rand.NewSource(20260722))
 	ids := []string{dirEntryIDA, dirEntryIDB, "short", "", "NOTHEXNOTHEXNOTHEXNOTHEXNOTHEXNOTHEXNOTH"}
 	names := []string{"wanted.txt", "other.txt", "", "dup"}
@@ -195,30 +194,42 @@ func TestFindDirEntryIDNeverInventsAbsence(t *testing.T) {
 		entryCount := rng.Intn(4)
 		rawParts := make([]string, 0, entryCount)
 		for j := 0; j < entryCount; j++ {
-			switch rng.Intn(6) {
+			switch rng.Intn(10) {
 			case 0:
 				rawParts = append(rawParts, "null")
 			case 1:
 				rawParts = append(rawParts, `"scalar"`)
 			case 2: // duplicate name key
-				rawParts = append(rawParts, fmt.Sprintf(`{"name":%q,"name":%q,"id":%q}`,
+				rawParts = append(rawParts, fmt.Sprintf(`{"name":%q,"name":%q,"id":%q,"mode":33188}`,
 					names[rng.Intn(len(names))], names[rng.Intn(len(names))], ids[rng.Intn(len(ids))]))
 			case 3: // duplicate id key
-				rawParts = append(rawParts, fmt.Sprintf(`{"name":%q,"id":%q,"id":%q}`,
+				rawParts = append(rawParts, fmt.Sprintf(`{"name":%q,"id":%q,"id":%q,"mode":33188}`,
 					names[rng.Intn(len(names))], ids[rng.Intn(len(ids))], ids[rng.Intn(len(ids))]))
 			case 4: // missing id
-				rawParts = append(rawParts, fmt.Sprintf(`{"name":%q}`, names[rng.Intn(len(names))]))
-			default:
+				rawParts = append(rawParts, fmt.Sprintf(`{"name":%q,"mode":33188}`, names[rng.Intn(len(names))]))
+			case 5: // missing mode
 				rawParts = append(rawParts, fmt.Sprintf(`{"name":%q,"id":%q}`,
+					names[rng.Intn(len(names))], ids[rng.Intn(len(ids))]))
+			case 6: // null or fractional mode
+				modes := []string{"null", "16384.5", "0", "999999"}
+				rawParts = append(rawParts, fmt.Sprintf(`{"name":%q,"id":%q,"mode":%s}`,
+					names[rng.Intn(len(names))], ids[rng.Intn(len(ids))], modes[rng.Intn(len(modes))]))
+			case 7: // unsafe archive path component
+				unsafeNames := []string{".", "..", "../escape", `dir\escape`, "nul\x00name"}
+				encodedName, _ := json.Marshal(unsafeNames[rng.Intn(len(unsafeNames))])
+				rawParts = append(rawParts, fmt.Sprintf(`{"name":%s,"id":%q,"mode":33188}`,
+					encodedName, ids[rng.Intn(len(ids))]))
+			default: // potentially valid entry
+				rawParts = append(rawParts, fmt.Sprintf(`{"name":%q,"id":%q,"mode":33188}`,
 					names[rng.Intn(len(names))], ids[rng.Intn(len(ids))]))
 			}
 		}
 		raw := "[" + strings.Join(rawParts, ",") + "]"
 
-		id, err := findDirEntryID(raw, target)
+		entry, err := findValidatedDirEntry(raw, target)
 		if !errors.Is(err, errDirEntryAbsent) {
-			if err == nil && id == "" {
-				t.Fatalf("findDirEntryID(%s) returned an empty id with no error", raw)
+			if err == nil && entry.id == "" {
+				t.Fatalf("findValidatedDirEntry(%s) returned an empty id with no error", raw)
 			}
 			continue
 		}
@@ -241,16 +252,16 @@ func TestFindDirEntryIDNeverInventsAbsence(t *testing.T) {
 	}
 }
 
-// A referenced row that is simply missing is dangling metadata, not proof the
-// path is gone. It must never become a 404.
-func TestRespondSeafHTTPDownloadErrorMapsOnlyProvenAbsenceTo404(t *testing.T) {
+// LOCAL_QUORUM cannot prove global absence: a valid listing may be an older
+// cross-DC snapshot. Absence and dangling metadata must both remain retryable.
+func TestRespondSeafHTTPDownloadErrorNeverMapsLocalAbsenceTo404(t *testing.T) {
 	tests := []struct {
 		name       string
 		err        error
 		wantStatus int
 	}{
-		{name: "proven absence", err: fmt.Errorf("%w: wanted.txt", errDirEntryAbsent), wantStatus: 404},
-		{name: "wrapped proven absence", err: fmt.Errorf("file not found: %s: %w", "wanted.txt", fmt.Errorf("%w: wanted.txt", errDirEntryAbsent)), wantStatus: 404},
+		{name: "local absence may be a stale cross-DC snapshot", err: fmt.Errorf("%w: wanted.txt", errDirEntryAbsent), wantStatus: 503},
+		{name: "wrapped local absence remains retryable", err: fmt.Errorf("file not found: %s: %w", "wanted.txt", fmt.Errorf("%w: wanted.txt", errDirEntryAbsent)), wantStatus: 503},
 		{name: "bare gocql not found on a referenced row", err: fmt.Errorf("commit not found: %w", gocql.ErrNotFound), wantStatus: 503},
 		// Retrying without a decrypt session can never succeed, so this must not
 		// join the retryable bucket; the zip path already answered 403.
@@ -327,7 +338,7 @@ func TestParseValidatedDirEntriesServesTheZipWalk(t *testing.T) {
 	})
 
 	t.Run("an entry without an id is rejected instead of skipped", func(t *testing.T) {
-		if _, err := parseValidatedDirEntries(`[{"name":"f.txt"}]`); err == nil {
+		if _, err := parseValidatedDirEntries(`[{"name":"f.txt","mode":33188}]`); err == nil {
 			t.Fatal("entry without an id must fail closed, not be silently dropped")
 		}
 	})
@@ -338,10 +349,26 @@ func TestParseValidatedDirEntriesServesTheZipWalk(t *testing.T) {
 		}
 	})
 
-	t.Run("a non-numeric mode is rejected", func(t *testing.T) {
-		if _, err := parseValidatedDirEntries(fmt.Sprintf(
-			`[{"name":"f.txt","id":"%s","mode":"16384"}]`, dirEntryIDA)); err == nil {
-			t.Fatal("non-numeric mode must fail closed")
+	t.Run("unsafe archive path components are rejected", func(t *testing.T) {
+		for _, name := range []string{".", "..", "../escape.txt", `dir\escape.txt`, "nul\x00name"} {
+			encodedName, err := json.Marshal(name)
+			if err != nil {
+				t.Fatalf("marshal unsafe name %q: %v", name, err)
+			}
+			raw := fmt.Sprintf(`[{"name":%s,"id":"%s","mode":33188}]`, encodedName, dirEntryIDA)
+			if _, err := parseValidatedDirEntries(raw); err == nil {
+				t.Fatalf("unsafe name %q must fail closed", name)
+			}
+		}
+	})
+
+	t.Run("mode must be present and an exact recognised integer", func(t *testing.T) {
+		modes := []string{"", `,"mode":null`, `,"mode":"16384"`, `,"mode":16384.5`, `,"mode":0`, `,"mode":999999`}
+		for _, mode := range modes {
+			raw := fmt.Sprintf(`[{"name":"f.txt","id":"%s"%s}]`, dirEntryIDA, mode)
+			if _, err := parseValidatedDirEntries(raw); err == nil {
+				t.Fatalf("invalid mode fragment %q must fail closed", mode)
+			}
 		}
 	})
 }
