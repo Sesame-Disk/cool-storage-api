@@ -966,10 +966,12 @@ enable destructive GC.
 The materialization retry loop (`retrySeafHTTPBlockMaterialization`,
 `v2.RetryUploadedBlockMaterialization` and the template-CreateFile wrapper) retries on
 a GC delete fence (`ErrBlockDeleteInProgress`) in **either** phase, and on a transient
-failure that is **tagged** `v2.ErrBlockMaterializationTransient`. Only the materialize
-phase tags transients today — `RegisterUploadedBlock`'s Cassandra I/O and the mapping
-write — so a store-phase retry is otherwise fence-only (the shipped store callbacks
-return a fence or a non-retryable raw probe/PUT error). As of PR-3,
+failure that is **tagged** `v2.ErrBlockMaterializationTransient`. The materialize phase
+tags `RegisterUploadedBlock` Cassandra I/O and mapping writes. The shared store helper
+also tags canonical HEAD, repair PUT and direct PUT failures; the web-session funnel
+uses it directly, while all reusable paths reach its tagged HEAD/repair logic through
+`EnsureReusableBlockPresent`. Raw probe errors and the six older manual direct-PUT
+branches remain non-retryable. As of PR-3,
 `RegisterUploadedBlock` no longer waits out the fence internally: it reads the fence
 once and propagates `ErrBlockDeleteInProgress`, so the wrapper repeats store→materialize
 when the fence is observed. PR-5 adds a mandatory canonical confirmation after

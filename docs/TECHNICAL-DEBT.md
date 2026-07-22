@@ -2159,8 +2159,10 @@ implementations:
 
 They differ only in incidentals: the SeafHTTP one carries its own backoff/sleep hooks
 and a string-literal reason vocabulary instead of the `blockMaterializationReason*`
-constants; the CreateFile one adds a `resetStored()` callback because its store phase
-caches `templateBlockStored` and would otherwise no-op.
+constants; only `HandleUpload` supplies a request-cancellable context, while streaming
+starts from `context.Background()`. The CreateFile one adds a `resetStored()` callback
+because its store phase caches `templateBlockStored` and would otherwise no-op, and its
+backoff is not request-cancellable.
 
 ### Why It Is Debt
 
@@ -2173,9 +2175,10 @@ the failure mode is data loss under a GC race, which no unit test catches unless
 someone remembers to add it to all three.
 
 PR-3 and PR-4 carried inline comments marking this ("PR-5 folds this duplicate wrapper
-into the generic one"). PR-5 only normalised the reason labels — which is all the plan
-promised — and removed those comments, so the debt lost its in-code marker. This entry
-replaces it.
+into the generic one"), and the authoritative plan assigned structural consolidation
+to PR-5. PR-5 normalised the reason labels and added confirmation to all three wrappers
+but did not consolidate them. This entry records that explicitly instead of silently
+treating the incomplete acceptance item as delivered.
 
 ### Follow-Up Plan
 

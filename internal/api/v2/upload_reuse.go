@@ -25,9 +25,9 @@ var ErrBlockMaterializationTransient = errors.New("block materialization transie
 // wrapper should retry err: a GC delete fence (ErrBlockDeleteInProgress) or a
 // tagged transient I/O failure (ErrBlockMaterializationTransient). Anything else —
 // including a permanent metadata failure and any untagged raw error — is returned
-// to the caller as-is. Note the store callbacks tag only their fence result; their
-// raw probe/HEAD/PUT errors are NOT transient-tagged, so a store-phase transient
-// retry (reason "probe") only occurs if a callback explicitly opts into it.
+// to the caller as-is. Store callback behavior is intentionally explicit: the shared
+// store helper tags canonical HEAD/repair/direct-PUT failures, while raw probe errors
+// and older manual direct-PUT branches remain untagged.
 func IsRetryableBlockMaterializationError(err error) bool {
 	return errors.Is(err, ErrBlockDeleteInProgress) || errors.Is(err, ErrBlockMaterializationTransient)
 }

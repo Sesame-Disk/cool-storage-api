@@ -284,25 +284,30 @@ the deterministic fast-clear regression remain PR-5 acceptance.
   only when the block is fenced — so a materialize-phase metadata write is never
   labeled `probe`. This closes F14. Note `probe` denotes the store phase (probe/HEAD/
   PUT), not a "read side", and is reached only if a store callback opts into the
-  transient sentinel; the shipped store callbacks return only a fence or a
-  non-retryable raw error, so store-phase retries are otherwise `gc_fence`. All three
-  wrappers also retry on the transient sentinel and re-PUT on a fence. Structurally
-  collapsing the three wrappers into one stays with PR-5.
+  transient sentinel. PR-5 later made canonical HEAD/repair failures transient in all
+  funnels and the web-session direct PUT transient through
+  `StoreUploadedBlockForProbe`; raw probe errors and the six older manual direct-PUT
+  branches remain non-retryable. All three wrappers retry on the transient sentinel
+  and re-PUT on a fence. The planned structural consolidation did not land in PR-5
+  and remains explicit debt in `TECHNICAL-DEBT.md` section 32.
 - Added the cancellable `RetryUploadedBlockMaterializationContext`. Only the three
   funnels that use the **generic** wrapper are wired to it — UploadFile
   (`c.Request.Context()`), sync PutBlock (`c.Request.Context()`) and OnlyOffice (its
   `ctx` arg) — so an aborted request there stops the retry backoff instead of burning
   the budget. The two bespoke wrappers (SeafHTTP and template-CreateFile) keep their
-  own non-cancellable backoff; giving them a cancellable context is part of PR-5's
-  wrapper normalisation, not PR-3. The worst case they carry is a bounded ~2s of
-  backoff sleep on an already-aborted request, not a correctness gap.
+  own non-cancellable backoff in PR-3. PR-5 made the SeafHTTP wrapper context-aware,
+  but only `HandleUpload` passes its request context; `finalizeUploadStreaming` starts
+  its worker group from `context.Background()`. Template CreateFile also retains
+  non-cancellable bounded backoff. Those sleep-on-abort cases are debt, not a
+  correctness gap.
 - **Test coverage note:** the retry behaviour is verified at the level of the three
   retry wrappers (generic, SeafHTTP, template), which is the shared mechanism the six
   funnels drive, plus the linear-helper (`RegisterUploadedBlock`) and mapping unit
   tests. It does **not** yet drive all six production call sites under a live fence.
-  The full six-call-site + deterministic fast-clear regression (real GC worker paused
-  at its post-claim liveness read) is **PR-5's** acceptance; PR-3 lands the mechanism
-  and its wrapper/helper-level proofs.
+  PR-5 added the deterministic fast-clear regression with a real GC worker, wrapper
+  coverage for all three implementations and web-session handler coverage. It did
+  not independently drive all six pre-existing production call sites through a live
+  fence; that per-handler matrix remains test debt rather than completed acceptance.
 
 Verification completed 2026-07-21 (local, Windows dev box has no gcc so no `-race`
 locally; `-race` + integration run in Docker per the verification debt below):
@@ -430,6 +435,15 @@ explicit conflict as a bounded soft retry. The deterministic component regressio
 drives a real `gc.Worker` paused after its post-claim zero-reference read and proves
 the fence is already clear before publication and confirmation repair.
 
+**Deferred from the original PR-5 acceptance:** the generic, SeafHTTP and template
+CreateFile wrappers remain separate. `HandleUpload` backoff is request-cancellable;
+streaming SeafHTTP currently roots its worker context at `context.Background()`, and
+template CreateFile backoff is also not request-cancellable. Coverage proves the three
+wrapper mechanisms, the web-session handler and the real-worker fast-clear
+interleaving, but does not execute all six older handlers independently under a live
+fence. These are documented debts; they do not weaken the
+`store -> materialize -> confirm` safety contract that landed.
+
 PR-5 verification completed on 2026-07-22:
 
 ```bash
@@ -548,14 +562,13 @@ DoS bound share no code and no deploy dependency. Rule 1 applies to this series 
 **Scope:** make `storage_class` deterministic per `(org_id, block_id)` so the
 first-writer `INSERT ... IF NOT EXISTS` can be dropped.
 
-**Not in scope: merging the two `blocks` reads.** An earlier draft listed that as a
-mechanical win. It is not — the probe reads before the PUT and the fence reads *after*
-the provisional reference is durable, and that ordering is the mutual exclusion that
-makes the whole protocol work. Serving the second from a cached first would let GC
-claim and authorize a delete in the window between them while the writer replays a
-stale "no fence" and publishes, which is F1 verbatim. Optimize inside a single
-observation point if useful; never reuse the pre-PUT observation to authorize
-publication.
+**Not in scope: merging the lifecycle observations.** An earlier draft proposed
+merging the pre-store probe and post-reference fence reads. That ordering is the mutual
+exclusion that makes the protocol work: serving the fence result from the cached probe
+would let GC authorize a delete while the writer publishes from stale state. PR-5's
+third, post-materialization confirmation is also distinct; it repairs the fast-clear
+case after the fence has disappeared. Optimize inside one observation point if useful,
+but never reuse one point to answer another.
 
 **Deliberately last, and deliberately not designed yet.** This is the item most
 likely to be superseded by a better idea, and it is the one with real performance
