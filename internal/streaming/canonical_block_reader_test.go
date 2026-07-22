@@ -133,7 +133,9 @@ func TestCanonicalBlockReaderRoutesCanonicalLocationsAndDeduplicates(t *testing.
 	}
 }
 
-func TestCanonicalBlockReaderStrictMissingRetriesThreeTimes(t *testing.T) {
+// A persistently missing row is looked up 3 times in total (1 attempt + 2
+// retries), not retried 3 times.
+func TestCanonicalBlockReaderStrictMissingUsesThreeTotalAttempts(t *testing.T) {
 	resetCanonicalReaderHooks(t)
 	blockID := canonicalReaderTestID(303)
 	var calls atomic.Int32
@@ -157,7 +159,8 @@ func TestCanonicalBlockReaderStrictRetryCanObserveMetadata(t *testing.T) {
 	store := canonicalReaderTestStore(t)
 	var calls atomic.Int32
 	canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
-		if calls.Add(1) < 3 {
+		// Fail every attempt but the last one the budget allows.
+		if calls.Add(1) < canonicalBlockLocationLookupAttempts {
 			return db.BlockStorageLocation{}, false, nil
 		}
 		return db.BlockStorageLocation{StorageClass: "fallback", StorageKey: store.StorageKeyForHash(blockID), CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
@@ -167,8 +170,8 @@ func TestCanonicalBlockReaderStrictRetryCanObserveMetadata(t *testing.T) {
 	if err != nil || reader == nil {
 		t.Fatalf("NewCanonicalBlockReader() = (%v, %v), want reader", reader, err)
 	}
-	if calls.Load() != 3 {
-		t.Fatalf("lookup calls = %d, want 3", calls.Load())
+	if calls.Load() != canonicalBlockLocationLookupAttempts {
+		t.Fatalf("lookup calls = %d, want %d", calls.Load(), canonicalBlockLocationLookupAttempts)
 	}
 }
 

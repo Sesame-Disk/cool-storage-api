@@ -15,7 +15,10 @@ import (
 )
 
 const (
-	canonicalBlockLocationConcurrency    = 32
+	canonicalBlockLocationConcurrency = 32
+	// canonicalBlockLocationLookupAttempts counts TOTAL attempts, not retries:
+	// 3 attempts means the first lookup plus 2 retries, and therefore only 2
+	// waits of canonicalBlockLocationRetryDelay.
 	canonicalBlockLocationLookupAttempts = 3
 )
 
@@ -70,7 +73,10 @@ type canonicalBlockLocation struct {
 var _ BlockReader = (*canonicalBlockReader)(nil)
 
 // NewCanonicalBlockReader resolves every unique block's canonical location.
-// Missing metadata is retried three times to tolerate a short publication race.
+// Missing metadata is looked up canonicalBlockLocationLookupAttempts times in
+// total — 3 attempts, so 2 retries separated by 2 waits of
+// canonicalBlockLocationRetryDelay (~50ms overall) — to tolerate a short
+// publication race.
 func NewCanonicalBlockReader(
 	ctx context.Context,
 	database *db.DB,
