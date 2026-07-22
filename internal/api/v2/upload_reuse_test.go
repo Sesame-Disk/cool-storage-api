@@ -579,3 +579,218 @@ func TestResolveCanonicalBlockStoreUsesExactOrgScopedClass(t *testing.T) {
 		t.Fatalf("StorageKeyForHash() = %q, want %q", got, want)
 	}
 }
+
+func TestResolveCanonicalBlockStoreRejectsInexactFallbackClass(t *testing.T) {
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	fallback, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, fallbackClass := range []string{"", "   ", "CANONICAL"} {
+		t.Run(fmt.Sprintf("class_%q", fallbackClass), func(t *testing.T) {
+			got, err := ResolveCanonicalBlockStore(nil, fallback, fallbackClass, "canonical", orgID)
+			if got != nil || err == nil {
+				t.Fatalf("ResolveCanonicalBlockStore() = (%p, %v), want nil and error", got, err)
+			}
+		})
+	}
+}
+
+func TestResolveNeedsPutBlockStoreUsesPreferredPlacementForFirstWriter(t *testing.T) {
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gotStore, gotClass, gotKey, err := ResolveNeedsPutBlockStore(nil, preferred, "preferred", db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, orgID, "abcd1234")
+	if err != nil {
+		t.Fatalf("ResolveNeedsPutBlockStore() error = %v", err)
+	}
+	if gotStore != preferred || gotClass != "preferred" || gotKey != preferred.StorageKeyForHash("abcd1234") {
+		t.Fatalf("placement = %p/%q/%q, want preferred/%q/%q", gotStore, gotClass, gotKey, "preferred", preferred.StorageKeyForHash("abcd1234"))
+	}
+}
+
+func TestResolveNeedsPutBlockStoreUsesExistingCanonicalPlacement(t *testing.T) {
+	oldResolve := resolveCanonicalBlockStoreFn
+	t.Cleanup(func() { resolveCanonicalBlockStoreFn = oldResolve })
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKey := canonical.StorageKeyForHash("abcd1234")
+	resolveCanonicalBlockStoreFn = func(_ *storage.Manager, fallback *storage.BlockStore, fallbackClass, canonicalClass, gotOrgID string) (*storage.BlockStore, error) {
+		if fallback != preferred || fallbackClass != "preferred" || canonicalClass != "archive" || gotOrgID != orgID {
+			t.Fatalf("resolve args = %p/%q/%q/%q", fallback, fallbackClass, canonicalClass, gotOrgID)
+		}
+		return canonical, nil
+	}
+
+	gotStore, gotClass, gotKey, err := ResolveNeedsPutBlockStore(nil, preferred, "preferred", db.BlockReuseProbe{
+		Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: wantKey,
+	}, orgID, "abcd1234")
+	if err != nil {
+		t.Fatalf("ResolveNeedsPutBlockStore() error = %v", err)
+	}
+	if gotStore != canonical || gotClass != "archive" || gotKey != wantKey {
+		t.Fatalf("placement = %p/%q/%q, want canonical/archive/%q", gotStore, gotClass, gotKey, wantKey)
+	}
+}
+
+func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldPut := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		resolveCanonicalBlockStoreFn = oldResolve
+		repairCanonicalBlockDirectFn = oldPut
+	})
+
+	putCalls := 0
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		putCalls++
+		return "", nil
+	}
+
+	t.Run("first writer empty preferred class", func(t *testing.T) {
+		_, _, _, err := StoreUploadedBlockForProbe(context.Background(), "block-1", db.BlockReuseProbe{
+			Decision: db.BlockReuseNeedsPut,
+		}, []byte("data"), nil, &storage.BlockStore{}, "  ", "org-1", nil)
+		if err == nil || putCalls != 0 {
+			t.Fatalf("error/putCalls = %v/%d, want error/0", err, putCalls)
+		}
+	})
+
+	t.Run("unavailable canonical class has no fallback", func(t *testing.T) {
+		resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+			return nil, errors.New("class unavailable")
+		}
+		_, _, _, err := StoreUploadedBlockForProbe(context.Background(), "block-1", db.BlockReuseProbe{
+			Decision: db.BlockReuseNeedsPut, StorageClass: "archive",
+		}, []byte("data"), nil, &storage.BlockStore{}, "preferred", "org-1", nil)
+		if err == nil || putCalls != 0 {
+			t.Fatalf("error/putCalls = %v/%d, want error/0", err, putCalls)
+		}
+	})
+
+	t.Run("cross-org key mismatch", func(t *testing.T) {
+		const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+		canonical, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+			return canonical, nil
+		}
+		_, _, _, err = StoreUploadedBlockForProbe(context.Background(), "abcd1234", db.BlockReuseProbe{
+			Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: "blocks/00000000-0000-0000-0000-000000000001/ab/cd/abcd1234",
+		}, []byte("data"), nil, canonical, "preferred", orgID, nil)
+		if err == nil || putCalls != 0 {
+			t.Fatalf("error/putCalls = %v/%d, want mismatch error/0", err, putCalls)
+		}
+	})
+}
+
+func TestStoreUploadedBlockForProbeReturnsCanonicalPlacementAndFence(t *testing.T) {
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldPut := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		resolveCanonicalBlockStoreFn = oldResolve
+		repairCanonicalBlockDirectFn = oldPut
+	})
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonical, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKey := canonical.StorageKeyForHash("abcd1234")
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonical, nil
+	}
+	putCalls := 0
+	admissionCalls := 0
+	repairCanonicalBlockDirectFn = func(_ context.Context, gotStore *storage.BlockStore, gotKey string, data []byte) (string, error) {
+		putCalls++
+		if gotStore != canonical || gotKey != wantKey || string(data) != "data" {
+			t.Fatalf("PUT = %p/%q/%q", gotStore, gotKey, data)
+		}
+		return gotKey, nil
+	}
+
+	gotKey, gotClass, didPut, err := StoreUploadedBlockForProbe(context.Background(), "abcd1234", db.BlockReuseProbe{
+		Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: wantKey,
+	}, []byte("data"), nil, canonical, "preferred", orgID, func() error {
+		admissionCalls++
+		return nil
+	})
+	if err != nil || gotKey != wantKey || gotClass != "archive" || !didPut || putCalls != 1 || admissionCalls != 1 {
+		t.Fatalf("result = %q/%q/%v/%v puts=%d admission=%d", gotKey, gotClass, didPut, err, putCalls, admissionCalls)
+	}
+
+	_, _, _, err = StoreUploadedBlockForProbe(context.Background(), "abcd1234", db.BlockReuseProbe{Decision: db.BlockReuseBlockedByGC}, []byte("data"), nil, canonical, "preferred", orgID, nil)
+	if !errors.Is(err, ErrBlockDeleteInProgress) || putCalls != 1 || admissionCalls != 1 {
+		t.Fatalf("fence error/put/admission = %v/%d/%d, want ErrBlockDeleteInProgress/1/1", err, putCalls, admissionCalls)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationResetsPlacementPerAttempt(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldResolve := resolveCanonicalBlockStoreFn
+	t.Cleanup(func() { resolveCanonicalBlockStoreFn = oldResolve })
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonical, nil
+	}
+
+	placementClass := "preferred"
+	attempt := 0
+	materializeCalls := 0
+	err = RetryUploadedBlockMaterialization("PlacementReset", "abcd1234", func() error {
+		attempt++
+		placementClass = "preferred"
+		probe := db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}
+		if attempt == 1 {
+			probe.StorageClass = "archive"
+		}
+		_, resolvedClass, _, resolveErr := ResolveNeedsPutBlockStore(nil, preferred, "preferred", probe, orgID, "abcd1234")
+		if resolveErr == nil {
+			placementClass = resolvedClass
+		}
+		return resolveErr
+	}, func() error {
+		materializeCalls++
+		if materializeCalls == 1 {
+			if placementClass != "archive" {
+				t.Fatalf("first attempt class = %q, want archive", placementClass)
+			}
+			return ErrBlockMaterializationTransient
+		}
+		if placementClass != "preferred" {
+			t.Fatalf("second attempt class = %q, want preferred (no stale canonical class)", placementClass)
+		}
+		return nil
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("RetryUploadedBlockMaterialization() error = %v", err)
+	}
+	if attempt != 2 || materializeCalls != 2 {
+		t.Fatalf("store/materialize calls = %d/%d, want 2/2", attempt, materializeCalls)
+	}
+}

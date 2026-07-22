@@ -871,7 +871,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 		return
 	}
 
-	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, sl.orgID, sl.libraryID)
+	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, sl.orgID, sl.libraryID)
 	if err != nil {
 		slog.Error("Block store not available for share link raw", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
@@ -922,6 +922,12 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
 	}
+	canonicalReader, err := streaming.NewCanonicalBlockReader(c.Request.Context(), h.db, h.storageManager, sl.orgID, resolvedIDs, blockStore, blockStoreClass)
+	if err != nil {
+		slog.Error("canonical block reader construction failed for share link", "org", sl.orgID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
 
 	var fileKeyParam []byte
 	var fileIVParam []byte
@@ -935,14 +941,14 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	// For video/audio files, use BlockReadSeeker so http.ServeContent can handle
 	// Range requests (HTTP 206) without buffering the entire file. Only O(1 block) RAM.
 	if isVideoFile(ext) || isAudioFile(ext) {
-		blockSizes, err := streaming.QueryBlockSizes(ctx, h.db, sl.orgID, blockStore, resolvedIDs)
+		blockSizes, err := streaming.QueryBlockSizes(ctx, h.db, sl.orgID, canonicalReader, resolvedIDs)
 		if err != nil {
 			slog.Error("Failed to query block sizes for share link", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file metadata"})
 			return
 		}
 
-		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam, fileIVParam)
+		rs := streaming.NewBlockReadSeeker(ctx, canonicalReader, resolvedIDs, blockSizes, fileSize, fileKeyParam, fileIVParam)
 		c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 		c.Header("Content-Type", mimeType)
 		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
@@ -957,7 +963,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	}
 	c.Status(http.StatusOK)
 
-	streaming.StreamBlocks(c, ctx, blockStore, resolvedIDs, fileKeyParam, fileIVParam, "ShareLinkRaw")
+	streaming.StreamBlocks(c, ctx, canonicalReader, resolvedIDs, fileKeyParam, fileIVParam, "ShareLinkRaw")
 }
 
 // serveSharedDirPage renders the shared directory view
@@ -999,7 +1005,7 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 		return ""
 	}
 
-	blockStore, _, err := resolveLibraryBlockStoreForRequest(nil, h.db, h.config, h.storageManager, h.storage, sl.orgID, sl.libraryID)
+	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequest(nil, h.db, h.config, h.storageManager, h.storage, sl.orgID, sl.libraryID)
 	if err != nil {
 		return ""
 	}
@@ -1033,12 +1039,17 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 		slog.Error("block ID resolution failed for inline text content", "org", sl.orgID, "error", err)
 		return ""
 	}
+	canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, sl.orgID, resolvedIDs, blockStore, blockStoreClass)
+	if err != nil {
+		slog.Error("canonical block reader construction failed for inline text content", "org", sl.orgID, "error", err)
+		return ""
+	}
 	var buf strings.Builder
 	for idx := range blockIDs {
 		internalID := resolvedIDs[idx]
 
 		if encrypted && fileKey != nil {
-			blockData, err := blockStore.GetBlock(ctx, internalID)
+			blockData, err := canonicalReader.GetBlock(ctx, internalID)
 			if err != nil {
 				return ""
 			}
@@ -1048,7 +1059,7 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 			}
 			buf.Write(blockData)
 		} else {
-			blockData, err := blockStore.GetBlock(ctx, internalID)
+			blockData, err := canonicalReader.GetBlock(ctx, internalID)
 			if err != nil {
 				return ""
 			}

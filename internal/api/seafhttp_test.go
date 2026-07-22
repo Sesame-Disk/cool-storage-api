@@ -25,6 +25,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/time/rate"
@@ -1577,6 +1578,60 @@ func TestZipTraversalBudgetRejectsByteLimit(t *testing.T) {
 	}
 }
 
+func TestStreamFileFromBlocksResolvesCanonicalReaderBeforeSuccessResponse(t *testing.T) {
+	blockID := strings.Repeat("d", 64)
+	oldLookup := seafHTTPLookupFileBlocksFn
+	oldRepresentation := seafHTTPResolveBlockRepresentationIDFn
+	oldBatch := seafHTTPBatchResolveBlockIDsFn
+	oldCanonical := seafHTTPNewCanonicalBlockReaderFn
+	t.Cleanup(func() {
+		seafHTTPLookupFileBlocksFn = oldLookup
+		seafHTTPResolveBlockRepresentationIDFn = oldRepresentation
+		seafHTTPBatchResolveBlockIDsFn = oldBatch
+		seafHTTPNewCanonicalBlockReaderFn = oldCanonical
+	})
+
+	seafHTTPLookupFileBlocksFn = func(*SeafHTTPHandler, string, *AccessToken) ([]string, int64, []byte, []byte, *storage.BlockStore, string, error) {
+		return []string{blockID, blockID}, 18, nil, nil, nil, "hot", nil
+	}
+	seafHTTPResolveBlockRepresentationIDFn = func(*SeafHTTPHandler, string, string) (string, error) {
+		return db.PlainBlockRepresentationID, nil
+	}
+	seafHTTPBatchResolveBlockIDsFn = func(_ *db.DB, _, _ string, blockIDs []string) ([]string, error) {
+		return append([]string(nil), blockIDs...), nil
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/download", nil)
+	constructorCalls := 0
+	seafHTTPNewCanonicalBlockReaderFn = func(_ context.Context, _ *db.DB, _ *storage.Manager, _ string, blockIDs []string, _ *storage.BlockStore, class string) (streaming.CanonicalBlockReader, error) {
+		constructorCalls++
+		if c.Writer.Written() {
+			t.Fatal("success response was committed before canonical resolution")
+		}
+		if got := c.Writer.Header().Get("Content-Disposition"); got != "" {
+			t.Fatalf("Content-Disposition = %q before canonical resolution", got)
+		}
+		if len(blockIDs) != 2 || blockIDs[0] != blockID || blockIDs[1] != blockID || class != "hot" {
+			t.Fatalf("canonical constructor got ids=%v class=%q", blockIDs, class)
+		}
+		return nil, errors.New("canonical location failure")
+	}
+
+	h := &SeafHTTPHandler{db: &db.DB{}, storageManager: storage.NewManager()}
+	err := h.streamFileFromBlocks(c, &AccessToken{OrgID: "org", RepoID: "repo"}, "file.txt", time.Time{})
+	if err == nil || !strings.Contains(err.Error(), "canonical") {
+		t.Fatalf("streamFileFromBlocks error = %v, want canonical resolution error", err)
+	}
+	if constructorCalls != 1 {
+		t.Fatalf("canonical constructor calls = %d, want 1", constructorCalls)
+	}
+	if c.Writer.Written() {
+		t.Fatalf("response committed after canonical failure: status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestResolveLibraryBlockStoreUsesHostnameFallback(t *testing.T) {
 	manager := storage.NewManager()
 	manager.SetDefaultClass("hot-minio-local")
@@ -3095,7 +3150,7 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 
 	putStarted := make(chan struct{})
 	probeUploadedBlockReuseForUploadFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
-		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
 	}
 	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
 		close(putStarted)
@@ -3129,7 +3184,10 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 		return "commit-1", filename, 0, 0, nil
 	}
 
-	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, nil, nil, nil)
+	s3Store := &storage.S3Store{}
+	storageManager := storage.NewManager()
+	storageManager.RegisterBackend("hot", s3Store, "")
+	handler := NewSeafHTTPHandler(s3Store, storageManager, nil, nil, nil, nil)
 	token := &AccessToken{OrgID: "00000000-0000-0000-0000-000000000001", RepoID: "repo1", UserID: "user1", Token: "token1"}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -3266,7 +3324,10 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		return "commit-1", filename, 0, 0, nil
 	}
 
-	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, nil, nil, nil)
+	s3Store := &storage.S3Store{}
+	storageManager := storage.NewManager()
+	storageManager.RegisterBackend("hot", s3Store, "")
+	handler := NewSeafHTTPHandler(s3Store, storageManager, nil, nil, nil, nil)
 	token := &AccessToken{OrgID: "00000000-0000-0000-0000-000000000001", RepoID: "repo1", UserID: "user1", Token: "token1"}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -3394,7 +3455,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		return true, nil
 	}
 	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
-		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
 	}
 
 	var putCalls, registerCalls, commitCalls atomic.Int32
@@ -3430,7 +3491,10 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	}
 	upload.MarkQuotaPrecheck("/", 5, false)
 
-	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, tokenStore, nil, nil)
+	s3Store := &storage.S3Store{}
+	storageManager := storage.NewManager()
+	storageManager.RegisterBackend("hot", s3Store, "")
+	handler := NewSeafHTTPHandler(s3Store, storageManager, nil, tokenStore, nil, nil)
 	r := gin.New()
 	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
 
@@ -3563,7 +3627,7 @@ func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
 
 func TestFinalizeUploadStreamingRepairableStubRepairsBeforeDirectPut(t *testing.T) {
 	directPuts, reusableChecks, repairCalls, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
-		db.BlockReuseProbe{Decision: db.BlockReuseRepairableStub})
+		db.BlockReuseProbe{Decision: db.BlockReuseRepairableStub, StorageClass: "hot"})
 
 	if _, err := run(); err != nil {
 		t.Fatalf("finalizeUploadStreaming error = %v, want nil", err)

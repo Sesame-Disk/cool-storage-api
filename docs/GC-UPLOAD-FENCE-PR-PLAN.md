@@ -4,10 +4,11 @@
 **Research branch:** `docs/gc-upload-fence-rematerialization` — **not for merge**
 **Status:** PR-1 merged as [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
 PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138) (closed F2/X7).
-PR-3 is implemented and verified on `fix/gc-store-materialize-retry-contract`, pending
-review and merge; it closes F6 and F14 and the **observed-fence half** of F1 — the F1
-fast-clear window (a full GC cycle completing between the single fence read and publish)
-stays with PR-5.
+PR-3 merged as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), closing F6,
+F14 and the **observed-fence half** of F1. PR-4 is implemented on
+`fix/gc-canonical-placement-reads` and pending review; F4 and F7 remain open on
+`main` until it merges. The F1 fast-clear window (a full GC cycle completing between
+the single fence read and publish) stays with PR-5, and X1/X2 remain open.
 
 ## Why this document exists
 
@@ -330,8 +331,9 @@ metadata `NeedsPut` stores through `probe.StorageClass` and the canonical key in
 of the serving node's preferred backend — **together with**
 `internal/streaming/canonical_block_reader.go`,
 `internal/db/block_storage_location.go`, the read call sites (`fileview.go`,
-`sharelink_view.go`, `sync.go`, `seafhttp.go`) and the canonical `/blocks/check` in
-`v2/blocks.go`.
+`sharelink_view.go`, `sync.go`, `seafhttp.go`) and canonical placement checks in the
+session upload/check/commit funnel. The metadata-free no-session check/upload pair
+remains on preferred-store routing until PR-7 governs and canonicalizes both together.
 
 **Why these are one PR and not two.** An earlier draft split them and papered over
 the gap with "ship in the same release", which contradicts rule 1. They are not
@@ -357,23 +359,59 @@ new caller of that helper lands.
 **Acceptance:** the two-bucket MinIO integration test proving the object lands in the
 canonical bucket and not the preferred one; exact-class routing, derived-key
 validation, cross-org key rejection and the bounded deduplicated lookup all covered;
-resolution fails before any response header is committed.
+canonical resolution fails before a block-stream body is committed. The legacy
+path-based object fallback remains an explicit F5/PR-6 issue; conditional `304` cache
+validation remains an intentional no-body short circuit.
+
+**Current implementation (pending review):** existing-metadata `NeedsPut` writes use
+the immutable `storage_class` and derived org-scoped key through
+`internal/api/v2/upload_reuse.go`; `internal/db/block_storage_location.go` supplies
+bounded canonical metadata lookups; and
+`internal/streaming/canonical_block_reader.go` resolves reads before response headers.
+The session upload, check, and commit paths resolve the same metadata placement, so a
+repair cannot be committed in a preferred bucket that canonical readers will ignore.
+The API/SeafHTTP read surfaces in `internal/api/seafhttp.go`, `internal/api/sync.go`,
+`internal/api/v2/blocks.go`, `internal/api/v2/fileview.go`,
+`internal/api/v2/sharelink_view.go`, and related V2 readers consume that canonical
+location rather than request routing. `internal/integration/gc_upload_fence_test.go`
+creates a bucket-B-pinned library, seeds zero-reference metadata in bucket A, drives
+the production Sync PUT endpoint, proves bytes exist only in A while metadata and the
+SHA-1 mapping remain canonical, then reads the bytes back through the production Sync
+GET endpoint from that B-preferring library. It then removes A's object and drives the
+real web session check/upload/commit/download flow, including uppercase hash inputs,
+to prove the session repairs and verifies A without writing B.
+
+PR-4 verification completed on 2026-07-21:
+
+```bash
+# completed: PASS
+go test ./internal/db ./internal/storage ./internal/streaming ./internal/api/...
+
+# completed: PASS (real Cassandra + two MinIO buckets)
+docker compose --profile test run --rm --build go-integration-test go test -tags=integration -v -count=1 -timeout 3m -run '^TestNeedsPutUsesCanonicalMinIOBucket$' ./internal/integration
+
+# completed: PASS
+docker compose --profile test run --rm --build gotest go test -race -count=1 ./internal/db ./internal/storage ./internal/streaming ./internal/api/...
+
+# completed: PASS (230.573s)
+docker compose --profile test run --rm --build go-integration-test
+```
 
 ---
 
 ### PR-5 — Cover the remaining funnel and normalise the wrappers
 
-**Scope:** the web block-session path in `v2/blocks.go`, which is the one funnel with
-no probe and no retry wrapper at all. Traffic accounting and the staged-block
-reservation hoisted so a retry cannot double-charge or double-reserve. Normalise the
-SeafHTTP wrapper's retry-reason labels against the generic one. Frontend: treat the
-new `409 block_delete_in_progress` as a soft retry honouring `Retry-After`.
+**Scope:** wrap the web block-session path in `v2/blocks.go`, which PR-4 now probes and
+routes canonically but which still has no bounded store-to-materialize retry. Traffic
+accounting and staged-block reservation remain single-shot across retries. Normalise
+the SeafHTTP wrapper's retry-reason labels against the generic one. Frontend: treat
+the new `409 block_delete_in_progress` as a soft retry honouring `Retry-After`.
 
 **Not** "the moment everything gets connected" — PR-3 already did that for six
 funnels. This closes the seventh and makes the wrappers consistent.
 
-**Depends on PR-4**, not merely follows it: this funnel calls the canonical store
-helper, so the canonical readers have to be in place first.
+**Depends on PR-4**, not merely follows it: this funnel already calls the canonical
+store helper, so its retry contract must preserve that placement.
 
 **Why the frontend rides along:** this PR is what makes the 409 reachable from the
 web client. Splitting them would ship a user-visible upload failure for one release.
@@ -525,10 +563,8 @@ These stay open and keep destructive GC disabled:
 
 ## Verification debt carried by the whole series
 
-- `go test -race` has never run: the dev box has no gcc. Must run in Docker before
-  any PR that touches concurrency or conditional lifecycle races merges: **PR-2,
-  PR-3, PR-4, PR-5 and PR-9**. PR-4 in particular introduces the concurrent
-  canonical reader and must not merge without it.
+- PR-2, PR-3, and PR-4 ran `go test -race` in Docker. PR-5 and PR-9 must still run
+  their own race validation because they change separate lifecycle or channel behavior.
 - No end-to-end download tests against real Cassandra exist for the 404/503 contract.
 - No multi-DC test exercises any of the cross-DC reasoning; it is derived from the
   production consistency contract, not from a reproduction. The dedicated

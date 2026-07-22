@@ -554,7 +554,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	}
 
 	// Get block store
-	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
+	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
@@ -601,9 +601,15 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 			return
 		}
+		canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, orgID, iworkResolvedIDs, blockStore, blockStoreClass)
+		if err != nil {
+			log.Printf("[ServeRawFile] canonical block reader construction failed for org=%s: %v", orgID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+			return
+		}
 		for idx, _ := range blockIDs {
 			internalID := iworkResolvedIDs[idx]
-			reader, err := blockStore.GetBlockReader(ctx, internalID)
+			reader, err := canonicalReader.GetBlockReader(ctx, internalID)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 				return
@@ -664,6 +670,12 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
 	}
+	canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, orgID, resolvedIDs, blockStore, blockStoreClass)
+	if err != nil {
+		log.Printf("[ServeRawFile] canonical block reader construction failed for org=%s: %v", orgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
 
 	var fileKeyParam []byte
 	var fileIVParam []byte
@@ -675,14 +687,14 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	// For video/audio files, use BlockReadSeeker so http.ServeContent can handle
 	// Range requests (HTTP 206) without buffering the entire file. Only O(1 block) RAM.
 	if isVideoFile(ext) || isAudioFile(ext) {
-		blockSizes, err := streaming.QueryBlockSizes(ctx, h.db, orgID, blockStore, resolvedIDs)
+		blockSizes, err := streaming.QueryBlockSizes(ctx, h.db, orgID, canonicalReader, resolvedIDs)
 		if err != nil {
 			log.Printf("[ServeRawFile] Failed to query block sizes: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file metadata"})
 			return
 		}
 
-		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam, fileIVParam)
+		rs := streaming.NewBlockReadSeeker(ctx, canonicalReader, resolvedIDs, blockSizes, fileSize, fileKeyParam, fileIVParam)
 		c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 		c.Header("Content-Type", mimeType)
 		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
@@ -697,7 +709,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	}
 	c.Status(http.StatusOK)
 
-	streaming.StreamBlocks(c, ctx, blockStore, resolvedIDs, fileKeyParam, fileIVParam, "ServeRawFile")
+	streaming.StreamBlocks(c, ctx, canonicalReader, resolvedIDs, fileKeyParam, fileIVParam, "ServeRawFile")
 }
 
 // sanitizeFilename removes characters that could cause header injection in Content-Disposition.
@@ -974,7 +986,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 		return
 	}
 
-	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
+	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
 		log.Printf("[DownloadHistoricFile] Block store not available: %v", err)
 		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Block storage not available.")
@@ -998,6 +1010,12 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Could not read the requested file revision.")
 		return
 	}
+	canonicalReader, err := streaming.NewCanonicalBlockReader(c.Request.Context(), h.db, h.storageManager, orgID, resolvedIDs, blockStore, blockStoreClass)
+	if err != nil {
+		log.Printf("[DownloadHistoricFile] canonical block reader construction failed for org=%s: %v", orgID, err)
+		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Could not read the requested file revision.")
+		return
+	}
 
 	// Stream blocks directly to HTTP response
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeFilename(filename)))
@@ -1005,7 +1023,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	c.Status(http.StatusOK)
 
 	bytesBefore := int64(c.Writer.Size())
-	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, fileIV, "DownloadHistoricFile")
+	streaming.StreamBlocks(c, c.Request.Context(), canonicalReader, resolvedIDs, fileKey, fileIV, "DownloadHistoricFile")
 
 	// Record download traffic using actual bytes written.
 	if rec := traffic.Get(); rec != nil {
@@ -1155,7 +1173,7 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 		return
 	}
 
-	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
+	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
@@ -1181,6 +1199,12 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
 	}
+	canonicalReader, err := streaming.NewCanonicalBlockReader(c.Request.Context(), h.db, h.storageManager, orgID, resolvedIDs, blockStore, blockStoreClass)
+	if err != nil {
+		log.Printf("[ServeHistoricFileRaw] canonical block reader construction failed for org=%s: %v", orgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
 
 	// Determine MIME type
 	mimeType := resolveInlineContentType(ext)
@@ -1192,5 +1216,5 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	}
 	c.Status(http.StatusOK)
 
-	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, fileIV, "ServeHistoricFileRaw")
+	streaming.StreamBlocks(c, c.Request.Context(), canonicalReader, resolvedIDs, fileKey, fileIV, "ServeHistoricFileRaw")
 }

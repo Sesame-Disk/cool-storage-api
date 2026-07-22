@@ -1289,6 +1289,15 @@ type zipPreparedFile struct {
 	sizeBytes   int64
 }
 
+var seafHTTPNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
+var seafHTTPBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDs
+var seafHTTPLookupFileBlocksFn = func(h *SeafHTTPHandler, hostname string, token *AccessToken) ([]string, int64, []byte, []byte, *storage.BlockStore, string, error) {
+	return h.lookupFileBlocks(hostname, token)
+}
+var seafHTTPResolveBlockRepresentationIDFn = func(h *SeafHTTPHandler, orgID, repoID string) (string, error) {
+	return h.resolveBlockRepresentationID(orgID, repoID)
+}
+
 func (b *zipTraversalBudget) noteDirectory(depth int) error {
 	if depth > b.maxDepth {
 		return &zipLimitError{message: fmt.Sprintf("zip download exceeds maximum directory depth of %d", b.maxDepth)}
@@ -1519,6 +1528,7 @@ var putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore
 var probeUploadedBlockReuseForUploadFn = v2.ProbeUploadedBlockReuse
 var prepareUploadedBlockProbeForUploadFn = v2.PrepareUploadedBlockProbe
 var ensureReusableBlockPresentForUploadFn = v2.EnsureReusableBlockPresent
+var resolveNeedsPutBlockStoreForUploadFn = v2.ResolveNeedsPutBlockStore
 var registerUploadedBlockAndMappingForUploadFn = v2.RegisterUploadedBlockAndMapping
 var resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID, repoID string, blockIDs []string) ([]string, error) {
 	return fsHelper.ResolveStoredBlockIDs(orgID, repoID, blockIDs)
@@ -2155,7 +2165,9 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
 	}
+	materializedStorageClass := actualStorageClass
 	storeUploadedBlock := func() error {
+		materializedStorageClass = actualStorageClass
 		probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
 		if probeErr != nil {
 			return fmt.Errorf("probe block reuse for %s: %w", sha256ID, probeErr)
@@ -2166,13 +2178,20 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			if _, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID); ensureErr != nil {
+			materializedStorageClass = strings.TrimSpace(probe.StorageClass)
+			_, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID)
+			if ensureErr != nil {
 				return ensureErr
 			}
 			log.Printf("[HandleUpload] Reused canonical block %s (SHA-256: %s) after physical verification", fileID[:16], sha256ID[:16])
 			return nil
 		case db.BlockReuseNeedsPut:
-			_, putErr := putUploadedBlockAutoDirectForUploadFn(ctx, blockStore, sha256ID, storedContent)
+			putStore, resolvedClass, _, resolveErr := resolveNeedsPutBlockStoreForUploadFn(h.storageManager, blockStore, actualStorageClass, probe, token.OrgID, sha256ID)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			materializedStorageClass = resolvedClass
+			_, putErr := putUploadedBlockAutoDirectForUploadFn(ctx, putStore, sha256ID, storedContent)
 			if putErr == nil {
 				log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via direct PUT", fileID[:16], sha256ID[:16])
 			}
@@ -2192,7 +2211,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 		return nil
 	}, func() error {
-		return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedContent), actualStorageClass, "", fileID)
+		return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedContent), materializedStorageClass, "", fileID)
 	}, func() (bool, error) {
 		return clearSeafHTTPS3OrphanFenceFn(c.Request.Context(), h.db, h.storageManager, "HandleUpload", token.OrgID, sha256ID)
 	}); err != nil {
@@ -2660,7 +2679,9 @@ readLoop:
 
 			uploadOperationID := upload.UploadOperationID()
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
+				materializedStorageClass := actualStorageClass
 				return retrySeafHTTPBlockMaterialization("finalizeUploadStreaming", sha256ID, func() error {
+					materializedStorageClass = actualStorageClass
 					probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
 					if probeErr != nil {
 						return fmt.Errorf("probe block reuse for %s: %w", sha256ID, probeErr)
@@ -2671,10 +2692,16 @@ readLoop:
 					}
 					switch probe.Decision {
 					case db.BlockReuseReusable:
+						materializedStorageClass = strings.TrimSpace(probe.StorageClass)
 						_, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID)
 						return ensureErr
 					case db.BlockReuseNeedsPut:
-						_, putErr := putUploadedBlockAutoDirectForUploadFn(egCtx, blockStore, sha256ID, storedBlock)
+						putStore, resolvedClass, _, resolveErr := resolveNeedsPutBlockStoreForUploadFn(h.storageManager, blockStore, actualStorageClass, probe, token.OrgID, sha256ID)
+						if resolveErr != nil {
+							return resolveErr
+						}
+						materializedStorageClass = resolvedClass
+						_, putErr := putUploadedBlockAutoDirectForUploadFn(egCtx, putStore, sha256ID, storedBlock)
 						if putErr != nil {
 							return fmt.Errorf("failed to store block: %w", putErr)
 						}
@@ -2692,7 +2719,7 @@ readLoop:
 						return permitErr
 					}
 					defer releaseMetadataPermit()
-					return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedBlock), actualStorageClass, "", blockSHA1IDLocal)
+					return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedBlock), materializedStorageClass, "", blockSHA1IDLocal)
 				}, func() (bool, error) {
 					return clearSeafHTTPS3OrphanFenceFn(egCtx, h.db, h.storageManager, "finalizeUploadStreaming", token.OrgID, sha256ID)
 				})
@@ -3562,20 +3589,20 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string,
 
 // lookupFileBlocks resolves a token's path to its block IDs, file size, encryption key, and block store.
 // This is the common metadata lookup used by both download and streaming paths.
-func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, fileIV []byte, blockStore *storage.BlockStore, err error) {
+func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, fileIV []byte, blockStore *storage.BlockStore, storageClass string, err error) {
 	// Check encryption
 	var encrypted bool
 	err = h.db.Session().Query(`
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).Scan(&encrypted)
 	if err != nil {
-		return nil, 0, nil, nil, nil, fmt.Errorf("failed to check library encryption: %w", err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("failed to check library encryption: %w", err)
 	}
 
 	if encrypted {
 		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
-			return nil, 0, nil, nil, nil, fmt.Errorf("library is encrypted but not unlocked")
+			return nil, 0, nil, nil, nil, "", fmt.Errorf("library is encrypted but not unlocked")
 		}
 	}
 
@@ -3585,7 +3612,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).Scan(&headCommit)
 	if err != nil {
-		return nil, 0, nil, nil, nil, fmt.Errorf("library not found: %w", err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("library not found: %w", err)
 	}
 
 	var rootFSID string
@@ -3593,7 +3620,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
 	`, token.RepoID, headCommit).Scan(&rootFSID)
 	if err != nil {
-		return nil, 0, nil, nil, nil, fmt.Errorf("commit not found: %w", err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("commit not found: %w", err)
 	}
 
 	// Navigate directory tree to the target file
@@ -3603,14 +3630,14 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	}
 	pathParts := strings.Split(strings.Trim(filePath, "/"), "/")
 	if len(pathParts) == 0 || (len(pathParts) == 1 && pathParts[0] == "") {
-		return nil, 0, nil, nil, nil, fmt.Errorf("invalid file path")
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("invalid file path")
 	}
 
 	currentFSID := rootFSID
 	for i := 0; i < len(pathParts)-1; i++ {
 		nextFSID, err := h.findEntryInDir(token.RepoID, currentFSID, pathParts[i])
 		if err != nil {
-			return nil, 0, nil, nil, nil, fmt.Errorf("directory not found: %s: %w", pathParts[i], err)
+			return nil, 0, nil, nil, nil, "", fmt.Errorf("directory not found: %s: %w", pathParts[i], err)
 		}
 		currentFSID = nextFSID
 	}
@@ -3618,7 +3645,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	targetName := pathParts[len(pathParts)-1]
 	fileFSID, err := h.findEntryInDir(token.RepoID, currentFSID, targetName)
 	if err != nil {
-		return nil, 0, nil, nil, nil, fmt.Errorf("file not found: %s: %w", targetName, err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("file not found: %s: %w", targetName, err)
 	}
 
 	// Get block IDs and file size from fs_object
@@ -3626,22 +3653,22 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, token.RepoID, fileFSID).Scan(&blockIDs, &fileSize)
 	if err != nil {
-		return nil, 0, nil, nil, nil, fmt.Errorf("file metadata not found: %w", err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("file metadata not found: %w", err)
 	}
 
-	blockStore, _, err = h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
+	blockStore, storageClass, err = h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
 	if err != nil {
-		return nil, 0, nil, nil, nil, fmt.Errorf("block store not available: %w", err)
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("block store not available: %w", err)
 	}
 
-	return blockIDs, fileSize, fileKey, fileIV, blockStore, nil
+	return blockIDs, fileSize, fileKey, fileIV, blockStore, storageClass, nil
 }
 
 // streamFileFromBlocks streams a file's blocks directly to the HTTP response.
 // Uses prefetching (overlap S3 fetch with HTTP write) and 4MB io.CopyBuffer
 // for maximum throughput. Only O(2 × block_size) RAM.
 func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToken, filename string, periodStartedAt time.Time) error {
-	blockIDs, fileSize, fileKey, fileIV, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
+	blockIDs, fileSize, fileKey, fileIV, blockStore, storageClass, err := seafHTTPLookupFileBlocksFn(h, httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
 	if err != nil {
 		return err
 	}
@@ -3659,7 +3686,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	}
 
 	log.Printf("[streamFileFromBlocks] Streaming %d blocks, size=%d, encrypted=%v", len(blockIDs), fileSize, fileKey != nil)
-	representationID, err := h.resolveBlockRepresentationID(token.OrgID, token.RepoID)
+	representationID, err := seafHTTPResolveBlockRepresentationIDFn(h, token.OrgID, token.RepoID)
 	if err != nil {
 		return fmt.Errorf("resolve block representation: %w", err)
 	}
@@ -3667,10 +3694,14 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	// Batch resolve all block IDs upfront (avoids per-block Cassandra queries).
 	// Strict: a stale SHA-1 sent to SHA-256 storage would truncate the stream
 	// mid-download, so we resolve BEFORE committing any headers and fail clean.
-	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, token.OrgID, representationID, blockIDs)
+	resolvedIDs, err := seafHTTPBatchResolveBlockIDsFn(h.db, token.OrgID, representationID, blockIDs)
 	if err != nil {
 		log.Printf("[streamFileFromBlocks] block ID resolution failed for org=%s: %v", token.OrgID, err)
 		return fmt.Errorf("resolve block IDs: %w", err)
+	}
+	canonicalReader, err := seafHTTPNewCanonicalBlockReaderFn(c.Request.Context(), h.db, h.storageManager, token.OrgID, resolvedIDs, blockStore, storageClass)
+	if err != nil {
+		return fmt.Errorf("resolve canonical block locations: %w", err)
 	}
 
 	// Set headers before streaming — Content-Length lets clients show progress
@@ -3685,7 +3716,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	c.Status(http.StatusOK)
 
 	// Stream with prefetching pipeline
-	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks")
+	streaming.StreamBlocks(c, c.Request.Context(), canonicalReader, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks")
 
 	log.Printf("[streamFileFromBlocks] Streaming complete: %d blocks", len(blockIDs))
 
@@ -3705,20 +3736,28 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 // DEPRECATED: Use streamFileFromBlocks for downloads. This is kept only for
 // upload metadata (commitUploadedFile) where the full content is already in memory.
 func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) ([]byte, error) {
-	blockIDs, _, fileKey, fileIV, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
+	blockIDs, _, fileKey, fileIV, blockStore, storageClass, err := seafHTTPLookupFileBlocksFn(h, httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx := c.Request.Context()
-	var content bytes.Buffer
-	for _, blockID := range blockIDs {
-		internalID, err := h.resolveBlockID(token.OrgID, token.RepoID, blockID)
-		if err != nil {
-			return nil, err
-		}
+	representationID, err := seafHTTPResolveBlockRepresentationIDFn(h, token.OrgID, token.RepoID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve block representation: %w", err)
+	}
+	resolvedIDs, err := seafHTTPBatchResolveBlockIDsFn(h.db, token.OrgID, representationID, blockIDs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve block IDs: %w", err)
+	}
+	canonicalReader, err := seafHTTPNewCanonicalBlockReaderFn(ctx, h.db, h.storageManager, token.OrgID, resolvedIDs, blockStore, storageClass)
+	if err != nil {
+		return nil, fmt.Errorf("resolve canonical block locations: %w", err)
+	}
 
-		blockData, err := blockStore.GetBlock(ctx, internalID)
+	var content bytes.Buffer
+	for i, blockID := range blockIDs {
+		blockData, err := canonicalReader.GetBlock(ctx, resolvedIDs[i])
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve block %s: %w", blockID, err)
 		}
@@ -3957,7 +3996,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	}
 
 	hostname := httputil.GetRoutingHostname(c, h.configuredServerURL())
-	blockStore, _, err := h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
+	blockStore, storageClass, err := h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleZipDownload] Failed to resolve block store: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare zip download"})
@@ -3975,6 +4014,16 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare zip download"})
 		return
 	}
+	allResolvedIDs := make([]string, 0)
+	for _, file := range preparedFiles {
+		allResolvedIDs = append(allResolvedIDs, file.resolvedIDs...)
+	}
+	canonicalReader, err := seafHTTPNewCanonicalBlockReaderFn(c.Request.Context(), h.db, h.storageManager, token.OrgID, allResolvedIDs, blockStore, storageClass)
+	if err != nil {
+		log.Printf("[HandleZipDownload] Failed to resolve canonical block locations: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare zip download"})
+		return
+	}
 
 	// Stream ZIP to response
 	zipFilename := dirName + ".zip"
@@ -3988,7 +4037,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	// Snapshot writer size before streaming so we can calculate the delta afterward.
 	bytesBefore := int64(c.Writer.Size())
 
-	if err := h.addDirToZip(c.Request.Context(), zipWriter, blockStore, preparedFiles, fileKey, fileIV); err != nil {
+	if err := h.addDirToZip(c.Request.Context(), zipWriter, canonicalReader, preparedFiles, fileKey, fileIV); err != nil {
 		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", err)
 		return
 	}
@@ -4091,7 +4140,7 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 	return prepared, nil
 }
 
-func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, zw *zip.Writer, blockStore *storage.BlockStore, files []zipPreparedFile, fileKey []byte, fileIV []byte) error {
+func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, zw *zip.Writer, blockStore streaming.BlockReader, files []zipPreparedFile, fileKey []byte, fileIV []byte) error {
 	for _, file := range files {
 		if err := h.addFileToZip(ctx, zw, blockStore, file, fileKey, fileIV); err != nil {
 			return err
@@ -4104,7 +4153,7 @@ func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, zw *zip.Writer, block
 // Uses zip.Store (no compression) for maximum throughput — the data is already
 // compressed by S3/MinIO or is binary data where deflate adds CPU cost for minimal gain.
 // For encrypted files, one block at a time is loaded, decrypted, and written.
-func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, zw *zip.Writer, blockStore *storage.BlockStore, file zipPreparedFile, fileKey []byte, fileIV []byte) error {
+func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, zw *zip.Writer, blockStore streaming.BlockReader, file zipPreparedFile, fileKey []byte, fileIV []byte) error {
 	header := &zip.FileHeader{
 		Name:   file.path,
 		Method: zip.Store,

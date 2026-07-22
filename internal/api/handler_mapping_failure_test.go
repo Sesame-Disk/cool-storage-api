@@ -29,7 +29,7 @@ func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 	})
 
 	probeUploadedBlockReuseForUploadFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
-		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
 	}
 	putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 		return hash, nil
@@ -49,7 +49,10 @@ func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 		t.Fatalf("CreateUploadToken() error = %v", err)
 	}
 
-	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, tokenStore, nil, nil)
+	s3Store := &storage.S3Store{}
+	storageManager := storage.NewManager()
+	storageManager.RegisterBackend("hot", s3Store, "")
+	handler := NewSeafHTTPHandler(s3Store, storageManager, nil, tokenStore, nil, nil)
 	r := gin.New()
 	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
 

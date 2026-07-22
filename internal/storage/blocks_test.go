@@ -1,8 +1,12 @@
 package storage
 
 import (
+	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -367,6 +371,74 @@ func TestOrgBlockStoreHashToKey_IsOrgScoped(t *testing.T) {
 	// StorageKeyForHash (the public locator) must agree with the internal key.
 	if a.StorageKeyForHash(testHash64) != keyA {
 		t.Errorf("StorageKeyForHash disagrees with hashToKey for org A")
+	}
+}
+
+func TestBlockStoreExplicitStorageKeyReads(t *testing.T) {
+	var mu sync.Mutex
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Length", "7")
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, "payload")
+		}
+	}))
+	defer server.Close()
+
+	s3Store, err := NewS3Store(context.Background(), S3Config{
+		Endpoint:        server.URL,
+		Bucket:          "test-bucket",
+		Region:          "us-east-1",
+		AccessKeyID:     "test",
+		SecretAccessKey: "test",
+		UsePathStyle:    true,
+	})
+	if err != nil {
+		t.Fatalf("NewS3Store() error = %v", err)
+	}
+	blockStore, err := NewOrgBlockStore(s3Store, "blocks/", testOrgA)
+	if err != nil {
+		t.Fatalf("NewOrgBlockStore() error = %v", err)
+	}
+	ctx := context.Background()
+	const key = "explicit/canonical/key"
+
+	data, err := blockStore.GetBlockByStorageKey(ctx, key)
+	if err != nil || string(data) != "payload" {
+		t.Fatalf("GetBlockByStorageKey() = %q, %v", data, err)
+	}
+	reader, err := blockStore.GetBlockReaderByStorageKey(ctx, key)
+	if err != nil {
+		t.Fatalf("GetBlockReaderByStorageKey() error = %v", err)
+	}
+	readerData, readErr := io.ReadAll(reader)
+	_ = reader.Close()
+	if readErr != nil || string(readerData) != "payload" {
+		t.Fatalf("explicit reader = %q, %v", readerData, readErr)
+	}
+	size, err := blockStore.GetBlockSizeByStorageKey(ctx, key)
+	if err != nil || size != 7 {
+		t.Fatalf("GetBlockSizeByStorageKey() = %d, %v, want 7, nil", size, err)
+	}
+	exists, err := blockStore.ObjectExists(ctx, key)
+	if err != nil || !exists {
+		t.Fatalf("ObjectExists() = %t, %v, want true, nil", exists, err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	wantPath := "/test-bucket/explicit/canonical/key"
+	want := []string{"GET " + wantPath, "GET " + wantPath, "HEAD " + wantPath, "HEAD " + wantPath}
+	if len(requests) != len(want) {
+		t.Fatalf("requests = %v, want %v", requests, want)
+	}
+	for i := range want {
+		if requests[i] != want[i] {
+			t.Fatalf("requests = %v, want %v", requests, want)
+		}
 	}
 }
 

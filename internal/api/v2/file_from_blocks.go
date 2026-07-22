@@ -14,6 +14,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
+	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/sync/errgroup"
@@ -180,6 +181,8 @@ func validateManifest(req *fileFromBlocksRequest, blockSize int64) error {
 		if !isHex64(b.SHA256) {
 			return fmt.Errorf("block %d: invalid sha256", i)
 		}
+		b.SHA256 = db.NormalizeBlockID(b.SHA256)
+		req.Blocks[i].SHA256 = b.SHA256
 		if prev, ok := sizeSeen[b.SHA256]; ok && prev != b.Size {
 			return fmt.Errorf("block %d: sha256 %s declared with conflicting sizes (%d and %d)", i, b.SHA256, prev, b.Size)
 		}
@@ -322,11 +325,12 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		return
 	}
 
-	// Resolve the block store so we can confirm PHYSICAL presence per block.
+	// Resolve the preferred block store only as the single-store fallback. Each
+	// block's metadata determines the canonical backend checked below.
 	// ProbeBlockReuse proves liveness/governance but not that the S3 object still
 	// exists (metadata can outlive a lost object); a commit must require both, or
 	// it could publish a file pointing at a missing block.
-	blockStore, _, err := h.resolveLibraryBlockStore(c, orgID, repoID)
+	blockStore, blockStoreClass, err := h.resolveLibraryBlockStore(c, orgID, repoID)
 	if err != nil || blockStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
@@ -339,7 +343,13 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		}
 		sizeByHash[b.SHA256] = b.Size
 	}
-	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, blockVerifyConcurrency)
+	canonicalReader, err := streaming.NewCanonicalBlockCheckReader(c.Request.Context(), h.db, h.storageManager, orgID, uniqueHashes, blockStore, blockStoreClass)
+	if err != nil {
+		metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("presence").Inc()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block placement"})
+		return
+	}
+	existsMap, err := canonicalReader.CheckBlocksExist(c.Request.Context(), uniqueHashes, blockVerifyConcurrency)
 	if err != nil {
 		metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("presence").Inc()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify block presence"})
