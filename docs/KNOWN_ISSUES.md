@@ -932,18 +932,19 @@ and the `gc_s3_orphans` fence to return one of:
 - `BlockReuseBlockedByGC` → `ErrBlockDeleteInProgress` (retry/back-off)
 - `BlockReuseUnknownError` → fail closed before S3 PUT
 
-Wired into all six upload funnels. New blocks now pay ≤2 Cassandra reads (~1 ms each)
-+ 1 direct PUT, **no HEAD**; dedup hits pay 3 Cassandra reads + 1 canonical-verify
-HEAD (+ a repair PUT only when the object is actually missing).
+Wired into all seven governed upload funnels. Each successful materialization performs
+a post-reference canonical confirmation, so new blocks pay a second probe plus a
+canonical HEAD after metadata publication; dedup hits are confirmed the same way and
+repair only when the object is actually missing.
 
 #### Scope — NOT a global removal of the HEAD
 
 This is fixed for the *server-side hot upload paths*, not across the whole repo:
 
 - The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
-  (`internal/storage/blocks.go`) still do `Exists` + `PutAuto`. They remain in use
-  by unmigrated callers such as the `v2/blocks.go` `UploadBlock` handler (its own
-  HEAD + `PutBlockData`); migrated funnels fail closed on probe errors.
+  (`internal/storage/blocks.go`) still do `Exists` + `PutAuto` for legacy callers;
+  the session-mode `v2/blocks.go` handler is migrated, while its intentionally
+  metadata-free no-session branch remains deferred to PR-7.
 - The `Reusable` path does not skip S3: `EnsureReusableBlockPresent` adds a targeted
   HEAD on the canonical key (with repair-on-miss) so the upload never publishes a
   reference to a physically-missing object. This is a deliberate safety/perf trade —
@@ -971,8 +972,9 @@ write — so a store-phase retry is otherwise fence-only (the shipped store call
 return a fence or a non-retryable raw probe/PUT error). As of PR-3,
 `RegisterUploadedBlock` no longer waits out the fence internally: it reads the fence
 once and propagates `ErrBlockDeleteInProgress`, so the wrapper repeats store→materialize
-and **re-PUTs the object** when the fence is observed (closing the observed-fence half
-of F1; the fast-clear window where the fence is never seen stays with PR-5). A permanent
+when the fence is observed. PR-5 adds a mandatory canonical confirmation after
+materialization, repairing bytes even when a complete GC cycle cleared its fence before
+the writer observed it. A permanent
 metadata failure (`db.ErrBlockMetadataPermanent`) is returned untagged and not retried;
 the provisional-expiry write fails closed with a rollback (F10 guard). The retry metric
 `block_upload_materialization_retries_total{surface,reason}` labels the reason by the
@@ -985,12 +987,10 @@ failing phase (`probe` = store phase, `materialization` = metadata materialize p
   same-content blocks at different positions within one upload produce separate
   probes/PUTs. The Cassandra probe provides cross-upload dedup, matching what the
   old S3 HEAD did — no dedup regression.
-- A transient S3 error on the reuse-path verify HEAD now fails the upload (it is not
-  `ErrBlockDeleteInProgress`, so it is not retried). Reusable blocks previously
-  touched no S3 and could not fail there. Refusing to publish an unverifiable
-  reference is the safer behavior, but it is a behavioral change for incident triage.
-  Follow-up: if real S3 shows transient HEAD errors, add a small retry/backoff
-  around `ObjectExists` in `EnsureReusableBlockPresent` so a flaky HEAD self-heals.
+- S3 HEAD and repair-PUT failures from `EnsureReusableBlockPresent` are tagged
+  `ErrBlockMaterializationTransient`, so the bounded whole-cycle retry handles a
+  flaky confirmation. Exhaustion still fails closed after metadata/reference writes;
+  a later idempotent upload resumes from the authoritative metadata state.
 
 #### Related
 

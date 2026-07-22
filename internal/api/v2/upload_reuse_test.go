@@ -4,14 +4,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+type fastClearTestBlockStore struct {
+	objectPresent *atomic.Bool
+}
+
+func (s fastClearTestBlockStore) DeleteBlock(context.Context, string) error {
+	s.objectPresent.Store(false)
+	return nil
+}
+
+type fastClearTestStorageProvider struct {
+	store fastClearTestBlockStore
+}
+
+func (p fastClearTestStorageProvider) GetBlockStoreForOrg(string, string) (gc.BlockStoreDeleter, error) {
+	return p.store, nil
+}
 
 // fastBlockMaterializationRetries shrinks the shared retry backoff to keep tests
 // fast and returns the recorded sleeps captured through the overridable hook.
@@ -74,8 +94,8 @@ func TestRetryUploadedBlockMaterializationRetriesStoreFence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RetryUploadedBlockMaterialization() error = %v, want nil", err)
 	}
-	if storeCalls != 2 {
-		t.Fatalf("storeCalls = %d, want 2", storeCalls)
+	if storeCalls != 3 {
+		t.Fatalf("storeCalls = %d, want 3 (failed store, retry store, confirmation)", storeCalls)
 	}
 	if materializeCalls != 1 {
 		t.Fatalf("materializeCalls = %d, want 1", materializeCalls)
@@ -213,11 +233,11 @@ func TestRetryUploadedBlockMaterializationConvergesAfterLostStubRepairCAS(t *tes
 	if err != nil {
 		t.Fatalf("RetryUploadedBlockMaterialization() error = %v, want nil", err)
 	}
-	if probeCalls != 2 {
-		t.Fatalf("probeCalls = %d, want 2 (retry re-probes)", probeCalls)
+	if probeCalls != 3 {
+		t.Fatalf("probeCalls = %d, want 3 (retry and confirmation re-probe)", probeCalls)
 	}
-	if reuseChecks != 1 || puts != 0 {
-		t.Fatalf("reuseChecks/puts = %d/%d, want 1/0 (converged to reusable, no PUT)", reuseChecks, puts)
+	if reuseChecks != 2 || puts != 0 {
+		t.Fatalf("reuseChecks/puts = %d/%d, want 2/0 (retry plus confirmation reusable, no PUT)", reuseChecks, puts)
 	}
 	if materializeCalls != 1 {
 		t.Fatalf("materializeCalls = %d, want 1", materializeCalls)
@@ -257,8 +277,31 @@ func TestRetryUploadedBlockMaterializationRetriesTransientMaterialize(t *testing
 	}
 	// A transient materialize failure re-runs the WHOLE cycle, so store re-PUTs
 	// before the second materialize.
-	if storeCalls != 2 || materializeCalls != 2 {
-		t.Fatalf("store/materialize calls = %d/%d, want 2/2", storeCalls, materializeCalls)
+	if storeCalls != 3 || materializeCalls != 2 {
+		t.Fatalf("store/materialize calls = %d/%d, want 3/2", storeCalls, materializeCalls)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationRetriesTransientConfirmation(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	storeCalls := 0
+	materializeCalls := 0
+	err := RetryUploadedBlockMaterialization("Confirmation", "block-1", func() error {
+		storeCalls++
+		if storeCalls == 2 {
+			return fmt.Errorf("HEAD timeout: %w", ErrBlockMaterializationTransient)
+		}
+		return nil
+	}, func() error {
+		materializeCalls++
+		return nil
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("error = %v, want nil", err)
+	}
+	if storeCalls != 4 || materializeCalls != 2 {
+		t.Fatalf("store/materialize calls = %d/%d, want 4/2", storeCalls, materializeCalls)
 	}
 }
 
@@ -294,11 +337,134 @@ func TestRetryUploadedBlockMaterializationRePutsAfterMaterializeFence(t *testing
 	if err := RetryUploadedBlockMaterialization("UploadFile", "block-1", store, materialize, nil, nil); err != nil {
 		t.Fatalf("error = %v, want nil", err)
 	}
-	if puts != 2 {
-		t.Fatalf("store(re-PUT) calls = %d, want 2 (object re-PUT after the fence cleared)", puts)
+	if puts != 3 {
+		t.Fatalf("store observations = %d, want 3 (retry plus post-materialization confirmation)", puts)
 	}
 	if materializeCalls != 2 {
 		t.Fatalf("materialize calls = %d, want 2", materializeCalls)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationRepairsUnobservedFastClear(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	objectPresent := false
+	storeCalls := 0
+	materializeCalls := 0
+	err := RetryUploadedBlockMaterialization("FastClear", "block-1", func() error {
+		storeCalls++
+		objectPresent = true
+		return nil
+	}, func() error {
+		materializeCalls++
+		// Model a full GC delete cycle that already cleared its fence. The
+		// materializer therefore succeeds without emitting a retry sentinel.
+		objectPresent = false
+		return nil
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("error = %v, want nil", err)
+	}
+	if !objectPresent {
+		t.Fatal("post-materialization confirmation did not repair the deleted object")
+	}
+	if storeCalls != 2 || materializeCalls != 1 {
+		t.Fatalf("store/materialize calls = %d/%d, want 2/1", storeCalls, materializeCalls)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationWithWorkerFastClear(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	store := gc.NewMockStore()
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	const blockID = "fast-clear-block"
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC()
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddBlockGCCandidate(orgID, blockID, "hot", candidateAt)
+	if err := store.EnqueueItem(orgID, candidateAt, gc.ItemBlock, blockID, libraryID, "hot", 0); err != nil {
+		t.Fatalf("enqueue block: %v", err)
+	}
+
+	postClaimRead := make(chan struct{})
+	releasePostClaimRead := make(chan struct{})
+	var referenceChecks atomic.Int32
+	store.SetBlockHasReferencesHookForTest(func(hookOrgID uuid.UUID, hookBlockID string, current bool) (bool, error) {
+		if hookOrgID != orgID || hookBlockID != blockID {
+			return current, nil
+		}
+		if referenceChecks.Add(1) == 2 {
+			close(postClaimRead)
+			<-releasePostClaimRead
+			// Return the captured pre-reference result. This is the destructive
+			// decision the upload races after the worker has already observed zero.
+			return false, nil
+		}
+		return current, nil
+	})
+
+	var objectPresent atomic.Bool
+	provider := fastClearTestStorageProvider{store: fastClearTestBlockStore{objectPresent: &objectPresent}}
+	worker := gc.NewWorker(store, provider, gc.NewQueue(store), 1, 0, false, &gc.Stats{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	workerDone := make(chan error, 1)
+	storeCalls := 0
+	materializeCalls := 0
+
+	err := RetryUploadedBlockMaterialization("FastClearWorker", blockID, func() error {
+		storeCalls++
+		objectPresent.Store(true)
+		if storeCalls == 1 {
+			go func() {
+				processed, workerErr := worker.ProcessOrgOnce(ctx, orgID)
+				if workerErr == nil && processed != 1 {
+					workerErr = fmt.Errorf("processed = %d, want 1", processed)
+				}
+				workerDone <- workerErr
+			}()
+			select {
+			case <-postClaimRead:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}, func() error {
+		materializeCalls++
+		store.AddBlockReferenceForTest(orgID, blockID, "up:test")
+		close(releasePostClaimRead)
+		select {
+		case workerErr := <-workerDone:
+			if workerErr != nil {
+				return workerErr
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if objectPresent.Load() {
+			return errors.New("worker did not delete the physical object")
+		}
+		if len(store.AllS3Orphans()) != 0 {
+			return errors.New("worker fence did not clear before publication")
+		}
+		// Publish after the complete GC cycle. No fence remains to trigger a
+		// retry, so only the mandatory confirmation can repair the bytes.
+		store.AddBlock(orgID, blockID, "hot", 0)
+		return nil
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("RetryUploadedBlockMaterialization() error = %v", err)
+	}
+	if !objectPresent.Load() {
+		t.Fatal("confirmation did not restore bytes after unobserved fast clear")
+	}
+	if storeCalls != 2 || materializeCalls != 1 {
+		t.Fatalf("store/materialize calls = %d/%d, want 2/1", storeCalls, materializeCalls)
+	}
+	if got := store.BlockReferenceCount(orgID, blockID); got != 1 {
+		t.Fatalf("block references = %d, want 1", got)
 	}
 }
 
@@ -741,6 +907,30 @@ func TestStoreUploadedBlockForProbeReturnsCanonicalPlacementAndFence(t *testing.
 	}
 }
 
+func TestStoreUploadedBlockForProbePreservesTransientStorageCause(t *testing.T) {
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldExists := reusableCanonicalObjectExistsFn
+	t.Cleanup(func() {
+		resolveCanonicalBlockStoreFn = oldResolve
+		reusableCanonicalObjectExistsFn = oldExists
+	})
+
+	canonical := &storage.BlockStore{}
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonical, nil
+	}
+	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		return false, context.Canceled
+	}
+
+	_, _, _, err := StoreUploadedBlockForProbe(context.Background(), "abcd1234", db.BlockReuseProbe{
+		Decision: db.BlockReuseReusable, StorageClass: "archive",
+	}, []byte("data"), nil, canonical, "preferred", "org-1", nil)
+	if !errors.Is(err, ErrBlockMaterializationTransient) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want transient sentinel and context cancellation cause", err)
+	}
+}
+
 func TestRetryUploadedBlockMaterializationResetsPlacementPerAttempt(t *testing.T) {
 	fastBlockMaterializationRetries(t)
 
@@ -790,7 +980,7 @@ func TestRetryUploadedBlockMaterializationResetsPlacementPerAttempt(t *testing.T
 	if err != nil {
 		t.Fatalf("RetryUploadedBlockMaterialization() error = %v", err)
 	}
-	if attempt != 2 || materializeCalls != 2 {
-		t.Fatalf("store/materialize calls = %d/%d, want 2/2", attempt, materializeCalls)
+	if attempt != 3 || materializeCalls != 2 {
+		t.Fatalf("store/materialize calls = %d/%d, want 3/2", attempt, materializeCalls)
 	}
 }

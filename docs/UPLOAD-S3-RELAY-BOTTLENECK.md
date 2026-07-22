@@ -80,8 +80,9 @@ only the Cassandra LWT; S3 operations run in parallel across all 8 workers.
 The double S3 round-trip per block (Exists + PUT) was the next relay cost. It was
 resolved in branch `perf/p2-cassandra-first-hot-reuse` (2026-06-15, P-2 in the
 audit doc): the pre-PUT S3 HEAD is replaced by a Cassandra `ProbeBlockReuse` that
-decides reuse / direct-PUT / GC-fence before any S3 call. Reusable blocks now touch
-S3 zero times; new blocks pay one direct PUT and no HEAD.
+decides reuse / direct-PUT / GC-fence before any S3 call. PR-5 later added one
+post-reference canonical HEAD after successful materialization to close the GC
+fast-clear data-loss window; the pre-PUT HEAD remains removed.
 
 The remaining relay concern is the store-and-forward staging itself (full `/tmp`
 buffering before blocks reach S3) and node-local chunk state — see S-1/S-3 in the

@@ -5,10 +5,10 @@
 **Status:** PR-1 merged as [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
 PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138) (closed F2/X7).
 PR-3 merged as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), closing F6,
-F14 and the **observed-fence half** of F1. PR-4 is implemented on
-`fix/gc-canonical-placement-reads` and pending review; F4 and F7 remain open on
-`main` until it merges. The F1 fast-clear window (a full GC cycle completing between
-the single fence read and publish) stays with PR-5, and X1/X2 remain open.
+F14 and the **observed-fence half** of F1. PR-4 merged as
+[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4 and F7. PR-5 is
+implemented on `fix/gc-web-session-retry-contract` and pending review. X1/X2 remain
+open and keep destructive GC disabled.
 
 ## Why this document exists
 
@@ -363,7 +363,7 @@ canonical resolution fails before a block-stream body is committed. The legacy
 path-based object fallback remains an explicit F5/PR-6 issue; conditional `304` cache
 validation remains an intentional no-body short circuit.
 
-**Current implementation (pending review):** existing-metadata `NeedsPut` writes use
+**Merged implementation:** existing-metadata `NeedsPut` writes use
 the immutable `storage_class` and derived org-scoped key through
 `internal/api/v2/upload_reuse.go`; `internal/db/block_storage_location.go` supplies
 bounded canonical metadata lookups; and
@@ -418,6 +418,41 @@ web client. Splitting them would ship a user-visible upload failure for one rele
 
 **Acceptance:** the deterministic fast-clear regression (real GC worker paused at its
 post-claim liveness read) fails before this PR and passes after.
+
+**Current implementation (pending review):** every materialization wrapper now runs
+`store -> materialize -> canonical store confirmation`. The confirmation executes
+after the provisional reference is durable and repairs bytes when a complete GC cycle
+deleted them and cleared its fence before materialization could observe it. The web
+session funnel uses the same bounded cycle; staged admission, traffic accounting and
+staged metrics remain single-shot. An exhausted fence returns coded
+`409 block_delete_in_progress` with `Retry-After: 1`, and the browser treats only that
+explicit conflict as a bounded soft retry. The deterministic component regression
+drives a real `gc.Worker` paused after its post-claim zero-reference read and proves
+the fence is already clear before publication and confirmation repair.
+
+PR-5 verification completed on 2026-07-22:
+
+```bash
+# completed: PASS
+go test ./internal/db ./internal/storage ./internal/streaming ./internal/gc ./internal/api/...
+go build ./...
+go vet ./...
+go vet -tags=integration ./...
+
+# completed: PASS
+docker compose --profile test run --rm --build gotest go test -race -count=1 ./internal/db ./internal/storage ./internal/streaming ./internal/gc ./internal/api/...
+
+# completed: PASS (265.648s final rerun; 228.669s initial run)
+docker compose --profile test run --rm --build go-integration-test
+
+# completed: PASS
+npx jest --runInBand src/components/file-uploader/__tests__/block-upload-orchestrator.test.js
+npx eslint src/components/file-uploader/block-upload-orchestrator.js src/components/file-uploader/__tests__/block-upload-orchestrator.test.js
+```
+
+The first full race run exposed an unsynchronized counter in an existing SeafHTTP
+lease-renewal test. The counter is now mutex-protected; both the isolated regression
+and the complete Docker race rerun passed.
 
 ---
 
@@ -563,8 +598,8 @@ These stay open and keep destructive GC disabled:
 
 ## Verification debt carried by the whole series
 
-- PR-2, PR-3, and PR-4 ran `go test -race` in Docker. PR-5 and PR-9 must still run
-  their own race validation because they change separate lifecycle or channel behavior.
+- PR-2 through PR-5 ran `go test -race` in Docker. PR-9 must still run its own race
+  validation because it changes separate channel behavior.
 - No end-to-end download tests against real Cassandra exist for the 404/503 contract.
 - No multi-DC test exercises any of the cross-DC reasoning; it is derived from the
   production consistency contract, not from a reproduction. The dedicated

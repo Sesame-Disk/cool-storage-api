@@ -687,6 +687,27 @@ func TestShouldRollbackOnlyOfficeMaterializedBlock(t *testing.T) {
 	}
 }
 
+func TestShouldRetainOnlyOfficePendingBlock(t *testing.T) {
+	tests := []struct {
+		name                    string
+		blockMetadataRegistered bool
+		materializeErr          error
+		want                    bool
+	}{
+		{name: "confirmation failed after registration", blockMetadataRegistered: true, materializeErr: ErrBlockMaterializationTransient, want: true},
+		{name: "mapping failed after registration", materializeErr: ErrBlockMappingWriteFailed, want: true},
+		{name: "store failed before registration", materializeErr: ErrBlockMaterializationTransient, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRetainOnlyOfficePendingBlock(tt.blockMetadataRegistered, tt.materializeErr); got != tt.want {
+				t.Fatalf("shouldRetainOnlyOfficePendingBlock() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestEncryptOnlyOfficeContentUsesSeafileFormatWhenIVPresent(t *testing.T) {
 	userID := "user-onlyoffice-seafile"
 	repoID := "repo-onlyoffice-seafile"

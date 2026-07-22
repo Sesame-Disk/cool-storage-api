@@ -2158,7 +2158,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	sha256ID := hex.EncodeToString(sha256Hash[:])
 
 	// Store using PutAuto (automatically uses multipart for large files)
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to get org-scoped block store: %v", err)
@@ -2205,7 +2205,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// Register block metadata + a provisional reference (kept alive by TTL until
 	// the fs_object commit creates the permanent reference), then write the
 	// external SHA-1 mapping only after the block is durable in Cassandra.
-	if err := retrySeafHTTPBlockMaterialization("HandleUpload", sha256ID, func() error {
+	if err := retrySeafHTTPBlockMaterializationContext(c.Request.Context(), "HandleUpload", sha256ID, func() error {
 		if putErr := storeUploadedBlock(); putErr != nil {
 			return fmt.Errorf("failed to store block: %w", putErr)
 		}
@@ -2388,7 +2388,11 @@ func clearSeafHTTPS3OrphanFence(ctx context.Context, database *db.DB, storageMan
 	return false, nil
 }
 
-func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error, materialize func() error, resolveFence func() (bool, error)) error {
+// retrySeafHTTPBlockMaterializationContext runs the bounded
+// store -> materialize -> confirm cycle. A nil ctx makes the backoff wait
+// uncancellable and routes it through seafHTTPBlockMaterializationSleepFn; every
+// production caller passes a real request context, so only tests rely on that.
+func retrySeafHTTPBlockMaterializationContext(ctx context.Context, label, blockID string, store func() error, materialize func() error, resolveFence func() (bool, error)) error {
 	attempts := v2.RetryAttempts()
 	if attempts < 1 {
 		attempts = 1
@@ -2397,8 +2401,8 @@ func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error
 	// retryBlocked records the retry under a reason derived from the failing PHASE
 	// (never the sentinel), so a materialize-phase write failure is never
 	// attributed to the probe read path (finding F14). The reason labels match the
-	// generic v2 wrapper's; PR-5 folds this duplicate wrapper into that one.
-	retryBlocked := func(attempt int, phaseReason string, retryErr error) {
+	// generic v2 wrapper's so all upload surfaces expose one label vocabulary.
+	retryBlocked := func(attempt int, phaseReason string, retryErr error) error {
 		reason := phaseReason
 		if errors.Is(retryErr, v2.ErrBlockDeleteInProgress) {
 			reason = "gc_fence"
@@ -2409,14 +2413,25 @@ func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error
 			if resolveErr != nil {
 				log.Printf("[%s] failed to inspect S3 orphan fence for block %s: %v", label, blockID, resolveErr)
 			} else if resolved {
-				return
+				return nil
 			}
 		}
 		sleepFor := seafHTTPBlockMaterializationRetryBackoffFn(attempt)
 		log.Printf("[%s] block %s materialization retry reason=%s (%d/%d) after %s", label, blockID, reason, attempt, attempts, sleepFor)
 		if sleepFor > 0 {
-			seafHTTPBlockMaterializationSleepFn(sleepFor)
+			if ctx == nil {
+				seafHTTPBlockMaterializationSleepFn(sleepFor)
+			} else {
+				timer := time.NewTimer(sleepFor)
+				defer timer.Stop()
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-timer.C:
+				}
+			}
 		}
+		return nil
 	}
 
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -2424,14 +2439,29 @@ func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error
 			if !v2.IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			retryBlocked(attempt, "probe", err)
+			if abortErr := retryBlocked(attempt, "probe", err); abortErr != nil {
+				return abortErr
+			}
 			continue
 		}
 		if err := materialize(); err != nil {
 			if !v2.IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
-			retryBlocked(attempt, "materialization", err)
+			if abortErr := retryBlocked(attempt, "materialization", err); abortErr != nil {
+				return abortErr
+			}
+			continue
+		}
+		// Confirm physical presence after the provisional reference is durable.
+		// This repairs a fast GC cycle whose fence cleared before materialization.
+		if err := store(); err != nil {
+			if !v2.IsRetryableBlockMaterializationError(err) || attempt == attempts {
+				return err
+			}
+			if abortErr := retryBlocked(attempt, "probe", err); abortErr != nil {
+				return abortErr
+			}
 			continue
 		}
 		return nil
@@ -2680,7 +2710,7 @@ readLoop:
 			uploadOperationID := upload.UploadOperationID()
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
 				materializedStorageClass := actualStorageClass
-				return retrySeafHTTPBlockMaterialization("finalizeUploadStreaming", sha256ID, func() error {
+				return retrySeafHTTPBlockMaterializationContext(egCtx, "finalizeUploadStreaming", sha256ID, func() error {
 					materializedStorageClass = actualStorageClass
 					probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
 					if probeErr != nil {

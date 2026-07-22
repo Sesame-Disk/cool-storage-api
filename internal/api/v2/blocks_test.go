@@ -17,9 +17,12 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func init() {
@@ -822,19 +825,169 @@ func TestUploadBlock_NoContentLength(t *testing.T) {
 	}
 }
 
-// TestRespondBlockMaterializeError_FenceIs500UntilPR5 pins the current PR-2 boundary
-// of the seventh (web-session) funnel through the exact error->status mapping the
-// UploadBlock handler uses. Both UploadBlock materialize sites route through
-// respondBlockMaterializeError, so this drives the real HTTP decision, not a stand-in.
-//
-// Unlike the six funnels wrapped in RetryUploadedBlockMaterialization, this funnel has
-// no bounded retry, so a GC fence / contended-stub signal (ErrBlockDeleteInProgress,
-// which the metadata-upsert backstop now raises on a lost stub-repair race) is a
-// fail-closed 500 — NOT reclassified as a 409 mapping conflict and NOT retried. PR-5
-// must consciously change this expectation to 409 + Retry-After once traffic and the
-// staged-block reservation are hoisted so a retry cannot double-charge. If this test
-// changes, the PR-2/PR-5 scope notes in GC-UPLOAD-FENCE-PR-PLAN.md must change with it.
-func TestRespondBlockMaterializeError_FenceIs500UntilPR5(t *testing.T) {
+func TestUploadBlockSessionRetriesWithSingleShotAccounting(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+	oldGetSession := getBlockUploadSessionFn
+	oldCount := countSessionStagedBlocksFn
+	oldReserve := reserveSessionStagedBlockFn
+	oldProbe := probeUploadedBlockReuseFn
+	oldPut := repairCanonicalBlockDirectFn
+	oldExists := reusableCanonicalObjectExistsFn
+	oldRegister := registerUploadedBlockForMaterializationFn
+	oldMapping := writeVerifiedWebBlockMappingFn
+	oldTraffic := recordBlockUploadTrafficFn
+	t.Cleanup(func() {
+		getBlockUploadSessionFn = oldGetSession
+		countSessionStagedBlocksFn = oldCount
+		reserveSessionStagedBlockFn = oldReserve
+		probeUploadedBlockReuseFn = oldProbe
+		repairCanonicalBlockDirectFn = oldPut
+		reusableCanonicalObjectExistsFn = oldExists
+		registerUploadedBlockForMaterializationFn = oldRegister
+		writeVerifiedWebBlockMappingFn = oldMapping
+		recordBlockUploadTrafficFn = oldTraffic
+	})
+
+	const (
+		orgID     = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+		userID    = "4fa85f64-5717-4562-b3fc-2c963f66afa6"
+		sessionID = "sess-1"
+	)
+	getBlockUploadSessionFn = func(*db.DB, string) (db.BlockUploadSession, bool, error) {
+		return db.BlockUploadSession{
+			SessionID: sessionID, OrgID: orgID, UserID: userID, RepoID: "repo-1",
+			BlockSizeBytes: 1024, StagedBucketCount: 1, StagedBucketCap: 10,
+		}, true, nil
+	}
+	countCalls := 0
+	countSessionStagedBlocksFn = func(*db.DB, string, int, int) (int, error) {
+		countCalls++
+		return 0, nil
+	}
+	reserveCalls := 0
+	reserveSessionStagedBlockFn = func(*db.DB, string, int, string, int64) error {
+		reserveCalls++
+		return nil
+	}
+	probeCalls := 0
+	probeUploadedBlockReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+		probeCalls++
+		if probeCalls < 3 {
+			return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+		}
+		return db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "legacy"}, nil
+	}
+	putCalls := 0
+	repairCanonicalBlockDirectFn = func(_ context.Context, _ *storage.BlockStore, key string, _ []byte) (string, error) {
+		putCalls++
+		return key, nil
+	}
+	existsCalls := 0
+	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		existsCalls++
+		return true, nil
+	}
+	registerCalls := 0
+	registerUploadedBlockForMaterializationFn = func(*db.DB, string, string, string, string, int, string, string, string) error {
+		registerCalls++
+		if registerCalls == 1 {
+			return ErrBlockDeleteInProgress
+		}
+		return nil
+	}
+	writeVerifiedWebBlockMappingFn = func(*db.DB, string, string, string, string) error { return nil }
+	trafficCalls := 0
+	recordBlockUploadTrafficFn = func(traffic.TrafficPeriodRecorder, traffic.QuotaStatus, string, string, string, int64) {
+		trafficCalls++
+	}
+	beforeMetric := testutil.ToFloat64(metrics.BlockUploadStagedBlocksTotal.WithLabelValues("true"))
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("org_id", orgID)
+		c.Set("user_id", userID)
+		c.Next()
+	})
+	h := &BlockHandler{
+		storage: &storage.S3Store{}, db: &db.DB{},
+		config: &config.Config{WebUploads: config.WebUploadsConfig{EnableWebBlockUpload: true}},
+	}
+	r.POST("/api/v2/blocks/upload", h.UploadBlock)
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/upload", bytes.NewBufferString("hello"))
+	req.ContentLength = 5
+	req.Header.Set("X-Block-Upload-Session", sessionID)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body=%s", w.Code, w.Body.String())
+	}
+	if probeCalls != 3 || putCalls != 2 || existsCalls != 1 || registerCalls != 2 {
+		t.Fatalf("probe/put/confirm/register = %d/%d/%d/%d, want 3/2/1/2", probeCalls, putCalls, existsCalls, registerCalls)
+	}
+	if countCalls != 1 || reserveCalls != 1 {
+		t.Fatalf("staging count/reserve = %d/%d, want 1/1", countCalls, reserveCalls)
+	}
+	if trafficCalls != 1 {
+		t.Fatalf("traffic calls = %d, want 1", trafficCalls)
+	}
+	if got := testutil.ToFloat64(metrics.BlockUploadStagedBlocksTotal.WithLabelValues("true")); got != beforeMetric+1 {
+		t.Fatalf("staged metric = %v, want %v", got, beforeMetric+1)
+	}
+}
+
+func TestUploadBlockSessionExhaustedFenceReturnsRetryable409(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+	oldGetSession := getBlockUploadSessionFn
+	oldProbe := probeUploadedBlockReuseFn
+	t.Cleanup(func() {
+		getBlockUploadSessionFn = oldGetSession
+		probeUploadedBlockReuseFn = oldProbe
+	})
+
+	const (
+		orgID     = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+		userID    = "4fa85f64-5717-4562-b3fc-2c963f66afa6"
+		sessionID = "sess-fenced"
+	)
+	getBlockUploadSessionFn = func(*db.DB, string) (db.BlockUploadSession, bool, error) {
+		return db.BlockUploadSession{SessionID: sessionID, OrgID: orgID, UserID: userID, RepoID: "repo-1", BlockSizeBytes: 1024}, true, nil
+	}
+	probeCalls := 0
+	probeUploadedBlockReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+		probeCalls++
+		return db.BlockReuseProbe{Decision: db.BlockReuseBlockedByGC}, nil
+	}
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("org_id", orgID)
+		c.Set("user_id", userID)
+		c.Next()
+	})
+	h := &BlockHandler{
+		storage: &storage.S3Store{}, db: &db.DB{},
+		config: &config.Config{WebUploads: config.WebUploadsConfig{EnableWebBlockUpload: true}},
+	}
+	r.POST("/api/v2/blocks/upload", h.UploadBlock)
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/upload", bytes.NewBufferString("hello"))
+	req.ContentLength = 5
+	req.Header.Set("X-Block-Upload-Session", sessionID)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict || w.Header().Get("Retry-After") != "1" {
+		t.Fatalf("status/Retry-After = %d/%q, want 409/1, body=%s", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"code":"block_delete_in_progress"`) {
+		t.Fatalf("body = %s, want block_delete_in_progress", w.Body.String())
+	}
+	if probeCalls != RetryAttempts() {
+		t.Fatalf("probeCalls = %d, want retry budget %d", probeCalls, RetryAttempts())
+	}
+}
+
+func TestRespondBlockMaterializeError(t *testing.T) {
 	newCtx := func() (*gin.Context, *httptest.ResponseRecorder) {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
@@ -851,17 +1004,20 @@ func TestRespondBlockMaterializeError_FenceIs500UntilPR5(t *testing.T) {
 		}
 	})
 
-	t.Run("GC fence / contended stub is a fail-closed 500 (PR-5 flips to 409)", func(t *testing.T) {
+	t.Run("exhausted GC fence is a retryable coded 409", func(t *testing.T) {
 		c, w := newCtx()
 		fenceErr := fmt.Errorf("%w: block fenced during web-session materialize", ErrBlockDeleteInProgress)
 		if !respondBlockMaterializeError(c, fenceErr) {
 			t.Fatal("respondBlockMaterializeError(fence) = false, want true (response written, caller returns)")
 		}
-		if w.Code != http.StatusInternalServerError {
-			t.Fatalf("status = %d, want %d — PR-5 changes this to 409 + Retry-After", w.Code, http.StatusInternalServerError)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusConflict)
 		}
-		if strings.Contains(w.Body.String(), "block id mapping conflict") {
-			t.Fatalf("fence 500 must not read as a mapping conflict; body = %s", w.Body.String())
+		if got := w.Header().Get("Retry-After"); got != "1" {
+			t.Fatalf("Retry-After = %q, want 1", got)
+		}
+		if !strings.Contains(w.Body.String(), `"code":"block_delete_in_progress"`) {
+			t.Fatalf("409 body = %s, want block_delete_in_progress", w.Body.String())
 		}
 	})
 
@@ -875,6 +1031,9 @@ func TestRespondBlockMaterializeError_FenceIs500UntilPR5(t *testing.T) {
 		}
 		if !strings.Contains(w.Body.String(), "block id mapping conflict") {
 			t.Fatalf("409 body = %s, want block id mapping conflict", w.Body.String())
+		}
+		if got := w.Header().Get("Retry-After"); got != "" {
+			t.Fatalf("Retry-After = %q, want no retry hint for permanent conflict", got)
 		}
 	})
 }
@@ -892,7 +1051,7 @@ func TestUploadBlockMaterializePropagatesFence(t *testing.T) {
 
 	h := &BlockHandler{}
 	session := db.BlockUploadSession{SessionID: "sess-1", OrgID: "org-1", RepoID: "repo-1"}
-	err := h.materializeUploadedBlock(session, strings.Repeat("a", 64), strings.Repeat("b", 40), 5, "hot", "blocks/org/a", true)
+	err := h.materializeUploadedBlock(session, strings.Repeat("a", 64), strings.Repeat("b", 40), 5, "hot", "blocks/org/a")
 	if !errors.Is(err, ErrBlockDeleteInProgress) {
 		t.Fatalf("materializeUploadedBlock err = %v, want ErrBlockDeleteInProgress propagated", err)
 	}

@@ -62,18 +62,17 @@ Cassandra probe — `DB.ProbeBlockReuse(orgID, blockID)` in
 | `BlockReuseUnknownError` | Cassandra read failed / corrupt metadata         | fail closed before S3 PUT |
 
 `PutBlockAutoDirect` (`internal/storage/blocks.go`) issues a direct `PutAuto`
-without the prior HEAD. The probe is wired into all six upload funnels:
+without the prior HEAD. The probe is wired into all seven governed upload funnels:
 `HandleUpload` + `finalizeUploadStreaming` (`seafhttp.go`), `SyncHandler.PutBlock`
 (`sync.go`), `FileHandler.CreateFile` template + `UploadFile` (`files.go`), and
-`OnlyOffice.saveEditedDocument` (`onlyoffice.go`).
+`OnlyOffice.saveEditedDocument` (`onlyoffice.go`), plus session-mode
+`BlockHandler.UploadBlock` (`v2/blocks.go`).
 
 **Scope of the fix — read carefully:** this is fixed for the *server-side hot
 upload paths* listed above. It is **not** a global removal of the S3 HEAD:
 - The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
-  (`internal/storage/blocks.go`) still perform `Exists` + `PutAuto`. They remain
-  in use by unmigrated callers such as the `v2/blocks.go` `UploadBlock` handler
-  (which still does its own HEAD + `PutBlockData`); migrated funnels fail closed
-  when the Cassandra probe is unavailable.
+  (`internal/storage/blocks.go`) remain for legacy callers. Session-mode
+  `v2/blocks.go` is migrated; its metadata-free no-session branch is deferred to PR-7.
 - The `Reusable` path no longer skips S3 entirely. To avoid trusting Cassandra
   metadata for a physical object that could be missing (partial GC, external
   deletion, eventual consistency, bugs), `EnsureReusableBlockPresent` does a
@@ -82,11 +81,14 @@ upload paths* listed above. It is **not** a global removal of the S3 HEAD:
   upload can never publish a reference to a missing object.
 
 **Per-block cost change:**
-- New block (common case): was `1 S3 HEAD + 1 S3 PUT`; now `≤2 Cassandra reads (~1 ms each) + 1 direct PUT`, **no HEAD**.
-- Dedup hit (reusable): was `1 S3 HEAD`; now `3 Cassandra reads + 1 canonical-verify HEAD` (+ 1 repair PUT only if the object is missing).
+- New block (common case): was `1 S3 HEAD + 1 S3 PUT`; after PR-5 it is up to
+  `5 Cassandra point reads + 1 direct PUT + 1 post-materialization canonical HEAD`.
+- Dedup hit (reusable): was `1 S3 HEAD`; after PR-5 it is up to `6 Cassandra point
+  reads + 2 canonical HEADs` (+ a repair PUT only if the object is missing).
 
-Net effect: the main win is for *new* content (the dominant case), which loses the
-HEAD entirely. Dedup hits keep a HEAD but gain self-healing.
+The pre-PUT HEAD remains removed, preserving PUT pipeline latency, but PR-5
+deliberately restores a post-reference HEAD to close the fast-clear data-loss window.
+This is a correctness cost of one object-store RTT per newly materialized block.
 
 **Correctness — why skipping the PUT is safe:** the GC-race safety never relied on
 the PUT. It derives from the *reference-first, then fence-check* protocol in
@@ -107,8 +109,10 @@ delete fence (`ErrBlockDeleteInProgress`) in **either** phase as retryable, plus
 failure **tagged** `v2.ErrBlockMaterializationTransient` (produced today by the
 materialize phase — `RegisterUploadedBlock` Cassandra I/O and the mapping write). As of
 PR-3, `RegisterUploadedBlock` no longer waits out the fence internally — it propagates
-it, so the wrapper re-PUTs the object when the fence is observed (closes the
-observed-fence half of F1; the fast-clear window stays with PR-5). A permanent metadata
+it, so the wrapper re-PUTs the object when the fence is observed. PR-5 adds a second
+canonical store observation after materialization; because the provisional reference
+is then durable, it repairs an object removed by an already-completed GC cycle and
+closes the never-observed fast-clear window. A permanent metadata
 failure (`db.ErrBlockMetadataPermanent`) is not retried, and the retry metric
 `block_upload_materialization_retries_total{surface,reason}` labels the reason by the
 failing phase (`probe` = store phase, `materialization` = metadata materialize phase),

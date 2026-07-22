@@ -160,7 +160,7 @@ func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.Bl
 		}
 		exists, existsErr := reusableCanonicalObjectExistsFn(ctx, canonicalStore, storageKey)
 		if existsErr != nil {
-			return storageKey, strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("verify canonical block %s in %s: %w", blockID, probe.StorageClass, existsErr)
+			return storageKey, strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("%w: verify canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, probe.StorageClass, existsErr)
 		}
 		if exists {
 			return storageKey, strings.TrimSpace(probe.StorageClass), false, nil
@@ -171,7 +171,7 @@ func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.Bl
 			}
 		}
 		if _, putErr := repairCanonicalBlockDirectFn(ctx, canonicalStore, storageKey, data); putErr != nil {
-			return storageKey, strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("repair canonical block %s in %s: %w", blockID, probe.StorageClass, putErr)
+			return storageKey, strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("%w: repair canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, probe.StorageClass, putErr)
 		}
 		return storageKey, strings.TrimSpace(probe.StorageClass), true, nil
 	case db.BlockReuseNeedsPut:
@@ -185,7 +185,7 @@ func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.Bl
 			}
 		}
 		if _, putErr := repairCanonicalBlockDirectFn(ctx, putStore, resolvedKey, data); putErr != nil {
-			return resolvedKey, resolvedClass, false, fmt.Errorf("store block %s in %s: %w", blockID, resolvedClass, putErr)
+			return resolvedKey, resolvedClass, false, fmt.Errorf("%w: store block %s in %s: %w", ErrBlockMaterializationTransient, blockID, resolvedClass, putErr)
 		}
 		return resolvedKey, resolvedClass, true, nil
 	case db.BlockReuseBlockedByGC:
@@ -206,7 +206,10 @@ func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.Bl
 	return storageKey, err
 }
 
-// RetryUploadedBlockMaterialization retries the full store->materialize cycle
+// RetryUploadedBlockMaterialization retries the full store->materialize->confirm
+// cycle. The second store observation runs after the provisional reference is
+// durable, repairing an object deleted by a GC cycle that cleared its fence before
+// materialization observed it.
 // when GC temporarily fences the block or a transient I/O failure interrupts
 // either phase. The retryable sentinel can surface from either phase because
 // Cassandra-first probes may reject a PUT before S3 work starts, and the
@@ -276,6 +279,15 @@ func retryUploadedBlockMaterialization(ctx context.Context, label, blockID strin
 				return err
 			}
 			if abortErr := retryBlocked(attempt, blockMaterializationReasonMaterial, err); abortErr != nil {
+				return abortErr
+			}
+			continue
+		}
+		if err := store(); err != nil {
+			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
+				return err
+			}
+			if abortErr := retryBlocked(attempt, blockMaterializationReasonProbe, err); abortErr != nil {
 				return abortErr
 			}
 			continue

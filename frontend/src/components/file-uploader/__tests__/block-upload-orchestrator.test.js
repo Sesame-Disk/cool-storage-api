@@ -706,6 +706,58 @@ describe('global concurrency limiter (shared across files)', () => {
     expect(limiter.noteFailure).not.toHaveBeenCalled(); // backpressure is never a hard failure
   });
 
+  test('block_delete_in_progress is a soft retry that honors Retry-After', async () => {
+    let attempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn(() => {
+        attempt += 1;
+        if (attempt <= 2) {
+          const err = new Error('block is being deleted');
+          err.response = {
+            status: 409,
+            headers: { 'retry-after': '0.01' },
+            data: { code: 'block_delete_in_progress' },
+          };
+          return Promise.reject(err);
+        }
+        return Promise.resolve({ data: {} });
+      }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+    const limiter = {
+      acquire: jest.fn().mockResolvedValue(() => { }),
+      noteRetry: jest.fn(),
+      noteFailure: jest.fn(),
+      getMaxConcurrency: () => 1,
+    };
+
+    await uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 1 });
+
+    expect(attempt).toBe(3);
+    expect(limiter.noteRetry).toHaveBeenCalledTimes(2);
+    expect(limiter.noteFailure).not.toHaveBeenCalled();
+  });
+
+  test('an unrelated 409 is not treated as a soft retry', async () => {
+    let attempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn(() => {
+        attempt += 1;
+        const err = new Error('mapping conflict');
+        err.response = { status: 409, data: { code: 'mapping_conflict' } };
+        return Promise.reject(err);
+      }),
+      createFileFromBlocks: jest.fn(),
+    };
+
+    await expect(uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, retries: 3 })).rejects.toThrow('mapping conflict');
+    expect(attempt).toBe(1);
+  });
+
   test('a 429 on session creation (per-user session cap) is waited out, not a hard failure', async () => {
     let sessionAttempt = 0;
     const api = {
