@@ -692,6 +692,36 @@ PR-3 interim guard — on an expiry-write failure, release the reference and enq
 now-zero-ref block — is deleted along with the split write it compensated for: with an
 all-or-nothing batch there is no half-written state, so the failure is simply retryable.
 
+A logged batch buys **atomicity** (the batchlog is replicated before anything applies and
+replayed if the coordinator dies), not **isolation**. The lack of isolation is harmless
+here in both directions: Phase 0 discovers only through the projection, and a projection
+this batch just wrote points ~48h into the future, so nothing acts on it until long after
+every statement has landed.
+
+**F10 had a second half, on the release side** (found in review of the first pass). Creation
+was atomic, but `ReleaseUploadReferences` still did: drop the reference → re-read the tracker
+→ delete it unconditionally. A renewal landing between the first two steps writes a fresh
+reference and moves the tracker forward; the release then reads *that* tracker and deletes
+it, leaving a live TTL'd reference with no tracking at all. Since Phase 0 discovers
+provisional refs only through the tracker's projection, that reference is invisible: when
+its TTL retires it, nothing runs the zero-ref transition and the block, its metadata and its
+S3 object are retained indefinitely. Reachable because `up:` referrers are per session — a
+retry of the same block, or a request admitted just before a commit began releasing, renews
+the very pair being released. The scanner's CAS did not cover this; it only guards Phase 0's
+own release.
+
+The fix is the same generation identity, applied to the writer:
+`ReleaseProvisionalBlockReference` **observes** `expires_at`, drops the reference, then
+retires the tracker **conditionally on that observation**. A renewal simply wins the compare
+and keeps its pair intact.
+
+**The ordering rule this exposed, worth stating once:** a *reference without a tracker* is
+unrecoverable (invisible to every GC phase), while a *tracker without a reference* recovers
+itself (Phase 0 sees the reference gone, judges liveness, retires the tracker). Every step
+in both the create and release paths is ordered so that a crash or a lost race lands on the
+recoverable side. That is why release drops the reference **before** the tracker, and why a
+failed reference delete must not go on to touch the tracker.
+
 **On the new LWT (in the shadow of X4).** The CAS delete is a Paxos round, and this
 series is otherwise trying to *remove* per-block LWTs. It is deliberately accepted here
 and does not have X4's shape: it runs in the GC scanner, not the upload hot path; it
@@ -716,6 +746,16 @@ two rollback hooks in `fs_helpers.go`.
   the test fails.
 - `TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically` — one call, nothing runs
   after its failure, nothing is compensated, and the error is retryable.
+- `TestReleaseProvisionalBlockReference_*` (4) — a renewal injected at the reference delete
+  keeps its tracker; the observed pair is retired when there is no renewal; the reference is
+  dropped before the tracker; a failed reference delete never touches the tracker. Verified
+  by restoring the re-read: the renewal test fails.
+- `TestWebBlockUploadWritesReferenceAndExpiryTogether` (integration, real Cassandra) — after
+  a session upload, all three rows exist, the reference's TTL horizon brackets its tracked
+  deadline (within Cassandra's one-second TTL reporting granularity), and a renewal retracts
+  the superseded projection. The mocked unit test proves one *call* is made; only this proves
+  the write actually produces the rows Phase 0 depends on — it caught the TTL-truncation
+  detail the unit level cannot see.
 - Existing Phase 0 tests were retargeted rather than deleted: they now stage the state the
   TTL actually produces (reference already gone) instead of the state only the old
   self-deleting scanner produced.

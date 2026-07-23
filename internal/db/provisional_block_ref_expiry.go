@@ -41,13 +41,20 @@ func addProvisionalBlockRefExpiryQueries(batch *gocql.Batch, orgID, blockID, ref
 }
 
 // AddProvisionalBlockReferenceWithExpiry writes an in-flight upload's block
-// reference AND its GC expiry tracking in ONE logged batch, so the two can never
-// exist apart (F10). Written separately, a failure between them left a reference
-// with no discovery projection: GC Phase 0 enumerates provisional refs through
+// reference AND its GC expiry tracking in ONE logged batch (F10). Written as two
+// statements, a failure between them left a reference with no discovery
+// projection: GC Phase 0 enumerates provisional refs through
 // `gc_provisional_block_refs_by_day`, so an unprojected reference pins the block
-// forever with nothing able to find it. A logged batch either applies every
-// statement or none, which removes the split state instead of compensating for
-// it afterwards.
+// forever with nothing able to find it.
+//
+// What a logged batch does and does not buy, precisely: it gives **atomicity** —
+// the batchlog is replicated before anything is applied and replayed if the
+// coordinator dies, so a permanently half-applied batch is not an ordinary failure
+// mode the way a split write is. It does NOT give **isolation**: a concurrent
+// reader can observe one statement before the other. That is harmless here in both
+// directions — Phase 0 only ever discovers through the projection, and a projection
+// this batch has just written points ~48h into the future, so nothing acts on it
+// until long after every statement has landed.
 //
 // The Cassandra TTL on the reference row is DERIVED from expiresAt rather than
 // passed in, which is load-bearing beyond tidiness: GC Phase 0 no longer deletes
@@ -99,8 +106,74 @@ func (db *DB) AddProvisionalBlockReferenceWithExpiry(orgID, blockID, referrer, l
 // serves renewal (an existing deadline is read and its projection retracted in the
 // same batch).
 
+var releaseProvisionalReadExpiryFn = func(database *DB, orgID, blockID, referrer string) (time.Time, error) {
+	return database.readProvisionalBlockRefExpiry(orgID, blockID, referrer)
+}
+
+var releaseProvisionalRemoveReferenceFn = func(database *DB, orgID, blockID, referrer string) error {
+	return database.RemoveBlockReference(orgID, blockID, referrer)
+}
+
+var releaseProvisionalDeleteTrackerFn = func(database *DB, orgID, blockID, referrer string, expiresAt time.Time) (bool, error) {
+	return database.DeleteProvisionalBlockReferenceExpiryIfExpiresAt(orgID, blockID, referrer, expiresAt)
+}
+
+// ReleaseProvisionalBlockReference retires one provisional (reference, tracker)
+// pair when its upload finishes or is rolled back — and only the pair the caller
+// observed.
+//
+// The asymmetry that dictates everything here: a **reference without a tracker is
+// unrecoverable**, while a **tracker without a reference recovers itself**. GC
+// Phase 0 discovers provisional refs only through the tracker's by-day projection,
+// so an untracked reference is invisible: when its TTL retires it, nothing runs the
+// zero-ref transition and the block, its metadata and its S3 object are retained
+// forever. The reverse is routine — Phase 0 sees the reference gone, judges liveness
+// and retires the tracker. Every step below is ordered to fail onto that side.
+//
+// Hence: observe the deadline FIRST, drop the reference, then retire the tracker
+// **conditionally on the observation**. Reading the tracker after dropping the
+// reference (what this replaced) reads whatever is there by then — including a
+// tracker a concurrent renewal just wrote — and deleting that unconditionally
+// strands the renewal's live reference with no tracking at all. Concurrency is real
+// here: `up:` referrers are per session, so a retry of the same block, or an upload
+// admitted before a commit began releasing, renews the very pair being released.
+//
+// A renewal that lands mid-release simply wins: the compare fails, its pair stays
+// intact, and its own release or expiry deals with it later.
+func (db *DB) ReleaseProvisionalBlockReference(orgID, blockID, referrer string) error {
+	if db == nil {
+		return nil
+	}
+
+	// Observed before anything is mutated: this is the generation identity the
+	// conditional delete below is allowed to retire.
+	observed, err := releaseProvisionalReadExpiryFn(db, orgID, blockID, referrer)
+	if err != nil {
+		return err
+	}
+
+	if err := releaseProvisionalRemoveReferenceFn(db, orgID, blockID, referrer); err != nil {
+		return fmt.Errorf("remove provisional block reference for org=%s block=%s referrer=%s: %w", orgID, blockID, referrer, err)
+	}
+
+	if observed.IsZero() {
+		// No tracker existed when we looked. Anything present now belongs to a
+		// renewal, and retiring it would be the exact bug this ordering prevents.
+		return nil
+	}
+	if _, err := releaseProvisionalDeleteTrackerFn(db, orgID, blockID, referrer, observed); err != nil {
+		return err
+	}
+	return nil
+}
+
 // DeleteProvisionalBlockReferenceExpiry removes the canonical expiry row and,
-// when available, its by-day discovery projection.
+// when available, its by-day discovery projection, with no regard for what the
+// caller last observed.
+//
+// Production release goes through ReleaseProvisionalBlockReference instead — an
+// unconditional delete cannot tell a renewal's tracker from the one it meant to
+// retire. This remains for test fixtures tearing down state they fully control.
 func (db *DB) DeleteProvisionalBlockReferenceExpiry(orgID, blockID, referrer string, expiresAt time.Time) error {
 	if db == nil {
 		return nil

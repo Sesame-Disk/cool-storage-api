@@ -97,8 +97,12 @@ var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, 
 	return h.db.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1ID, sizeBytes, storageClass, storageKey)
 }
 
-var releaseUploadReferenceDeleteExpiryFn = func(h *FSHelper, orgID, blockID, referrer string) error {
-	return h.db.DeleteProvisionalBlockReferenceExpiry(orgID, blockID, referrer, time.Time{})
+// releaseUploadReferenceFn retires a provisional reference together with the
+// tracker the release observed. It is one call for the same reason creation is
+// (F10): split across two statements, a renewal landing between them ends up with
+// a live reference and no tracking, which no GC phase can ever discover.
+var releaseUploadReferenceFn = func(h *FSHelper, orgID, blockID, referrer string) error {
+	return h.db.ReleaseProvisionalBlockReference(orgID, blockID, referrer)
 }
 
 // registerUploadedBlockSleepFn is the overridable backoff sleep used by the
@@ -1080,16 +1084,20 @@ func (h *FSHelper) fsObjectExists(repoID, fsID string) (bool, error) {
 // same IDs used when the provisional reference was created). operationID must be
 // the same upload/session identity used at registration time. Idempotent:
 // removing a missing reference is a no-op, so a retried rollback is safe.
+//
+// Each block goes through db.ReleaseProvisionalBlockReference, which retires the
+// reference together with the tracker it observed. That conditionality matters
+// here specifically: `up:` referrers are per session, so this can run concurrently
+// with an upload renewing the very same pair — a retry of the same block, or a
+// request admitted just before a commit started releasing. Retiring the renewal's
+// tracker would leave its live reference undiscoverable by GC (F10).
 func (h *FSHelper) ReleaseUploadReferences(orgID, libraryID, operationID string, blockIDs []string) []string {
 	referrer := db.BlockReferrerForUpload(operationID)
 	var zeroRefBlocks []string
 	for _, blockID := range blockIDs {
-		if err := h.db.RemoveBlockReference(orgID, blockID, referrer); err != nil {
-			log.Printf("[ReleaseUploadReferences] WARNING: failed to remove provisional reference for block %s: %v", blockID, err)
+		if err := releaseUploadReferenceFn(h, orgID, blockID, referrer); err != nil {
+			log.Printf("[ReleaseUploadReferences] WARNING: failed to release provisional reference for block %s: %v", blockID, err)
 			continue
-		}
-		if err := releaseUploadReferenceDeleteExpiryFn(h, orgID, blockID, referrer); err != nil {
-			log.Printf("[ReleaseUploadReferences] WARNING: failed to delete provisional expiry tracker for block %s: %v", blockID, err)
 		}
 		hasRefs, err := h.db.BlockHasReferences(orgID, blockID)
 		if err != nil {

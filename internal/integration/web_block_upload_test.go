@@ -163,6 +163,115 @@ func blockStoreForCleanupOrNil(t *testing.T, orgID string) *storage.BlockStore {
 	return blockStore
 }
 
+// TestWebBlockUploadWritesReferenceAndExpiryTogether checks F10's contract against
+// real Cassandra rather than a mocked call boundary. The unit test proves
+// RegisterUploadedBlock issues one write; only this proves that write actually
+// produces all three rows, with the TTL relationship GC Phase 0 now depends on.
+//
+// The TTL assertion is the load-bearing one. Phase 0 stopped deleting provisional
+// references and waits for this TTL instead (F9), so a reference whose TTL outlived
+// its tracker would strand the scanner deferring forever, and one that expired well
+// before its deadline would unpin an upload still in flight.
+func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-f10-%d", time.Now().UnixNano()))
+	content := []byte("provisional ref and expiry must land together " + fmt.Sprint(time.Now().UnixNano()))
+	blockID := sha256hex(content)
+
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
+	uploadReferrer := dbpkg.BlockReferrerForUpload(session)
+	cleanupUploadedBlockArtifactsForTest(t, defaultOrgID, repoID, blockID, sha1hex(content), uploadReferrer)
+
+	resp := webUploadBlock(t, adminClient, session, content)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body := responseBody(t, resp)
+		resp.Body.Close()
+		t.Fatalf("block upload status = %d; body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	database := shareProjectionDBForTest(t)
+
+	var refTTL int
+	if err := database.Session().Query(
+		`SELECT TTL(library_id) FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&refTTL); err != nil {
+		t.Fatalf("read provisional block reference: %v", err)
+	}
+	if refTTL <= 0 {
+		t.Fatalf("provisional reference TTL = %d, want a positive TTL (an untracked permanent ref would never be reclaimed)", refTTL)
+	}
+
+	var canonicalExpiresAt time.Time
+	var canonicalStorageClass string
+	if err := database.Session().Query(
+		`SELECT expires_at, storage_class FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&canonicalExpiresAt, &canonicalStorageClass); err != nil {
+		t.Fatalf("read canonical provisional expiry (the reference landed without its tracker — F10): %v", err)
+	}
+
+	// Cassandra reports the REMAINING TTL truncated to whole seconds, so the horizon
+	// computed here understates the true expiry by up to one second. Both bounds
+	// carry that slack explicitly rather than being loosened until they pass.
+	const ttlReportGranularity = time.Second
+	ttlHorizon := time.Now().UTC().Add(time.Duration(refTTL) * time.Second)
+
+	// The reference must not die before the deadline its tracker advertises, or the
+	// block is unpinned while its upload is still in flight.
+	if ttlHorizon.Add(ttlReportGranularity).Before(canonicalExpiresAt.UTC()) {
+		t.Fatalf("reference TTL horizon %v expires before its tracked deadline %v: the block would be unpinned while still in flight", ttlHorizon, canonicalExpiresAt.UTC())
+	}
+	// ...nor outlive it by more than the derivation's rounding, or Phase 0 would
+	// defer this record indefinitely and hold its day cursor back with it.
+	if ttlHorizon.After(canonicalExpiresAt.UTC().Add(2 * time.Second)) {
+		t.Fatalf("reference TTL horizon %v outlives its tracked deadline %v: Phase 0 would wait on a row that is not going away", ttlHorizon, canonicalExpiresAt.UTC())
+	}
+
+	var projectedExpiresAt time.Time
+	if err := database.Session().Query(
+		`SELECT expires_at FROM gc_provisional_block_refs_by_day
+		 WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?`,
+		dbpkg.GCProjectionUTCDate(canonicalExpiresAt),
+		dbpkg.GCDiscoveryBucket(defaultOrgID, blockID, uploadReferrer),
+		canonicalExpiresAt.UTC(), defaultOrgID, blockID, uploadReferrer,
+	).Scan(&projectedExpiresAt); err != nil {
+		t.Fatalf("read by-day discovery projection (Phase 0 finds provisional refs only through this row): %v", err)
+	}
+	if !projectedExpiresAt.UTC().Equal(canonicalExpiresAt.UTC()) {
+		t.Fatalf("projection expires_at = %v, want the canonical %v", projectedExpiresAt.UTC(), canonicalExpiresAt.UTC())
+	}
+
+	// A re-upload of the same block under the same session renews the pair. The
+	// superseded projection must be retracted in the same batch, or Phase 0 keeps
+	// walking a row whose deadline no longer exists.
+	renewResp := webUploadBlock(t, adminClient, session, content)
+	renewResp.Body.Close()
+
+	var renewedExpiresAt time.Time
+	if err := database.Session().Query(
+		`SELECT expires_at FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&renewedExpiresAt); err != nil {
+		t.Fatalf("read renewed provisional expiry: %v", err)
+	}
+	if renewedExpiresAt.UTC().Equal(canonicalExpiresAt.UTC()) {
+		// Same deadline: nothing to retract, so the stale-projection check does not apply.
+		return
+	}
+	var staleProjection time.Time
+	err := database.Session().Query(
+		`SELECT expires_at FROM gc_provisional_block_refs_by_day
+		 WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?`,
+		dbpkg.GCProjectionUTCDate(canonicalExpiresAt),
+		dbpkg.GCDiscoveryBucket(defaultOrgID, blockID, uploadReferrer),
+		canonicalExpiresAt.UTC(), defaultOrgID, blockID, uploadReferrer,
+	).Scan(&staleProjection)
+	if err == nil {
+		t.Fatalf("renewal left the superseded projection at %v in place", canonicalExpiresAt.UTC())
+	}
+	if !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("check superseded projection: %v", err)
+	}
+}
+
 // releaseStagedBlockForTest finishes tearing down one block staged by an upload session
 // whose `up:` reference the caller has just deleted.
 //
