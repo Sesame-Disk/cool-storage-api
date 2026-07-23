@@ -191,12 +191,17 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 
 	database := shareProjectionDBForTest(t)
 
+	// The clock is sampled tightly around the TTL read: the remaining TTL is only
+	// meaningful relative to when it was read, and letting later queries inflate that
+	// gap is what would make the bounds below flaky rather than meaningful.
+	beforeTTLRead := time.Now().UTC()
 	var refTTL int
 	if err := database.Session().Query(
 		`SELECT TTL(library_id) FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
 		defaultOrgID, blockID, uploadReferrer).Scan(&refTTL); err != nil {
 		t.Fatalf("read provisional block reference: %v", err)
 	}
+	afterTTLRead := time.Now().UTC()
 	if refTTL <= 0 {
 		t.Fatalf("provisional reference TTL = %d, want a positive TTL (an untracked permanent ref would never be reclaimed)", refTTL)
 	}
@@ -209,21 +214,23 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 		t.Fatalf("read canonical provisional expiry (the reference landed without its tracker — F10): %v", err)
 	}
 
-	// Cassandra reports the REMAINING TTL truncated to whole seconds, so the horizon
-	// computed here understates the true expiry by up to one second. Both bounds
-	// carry that slack explicitly rather than being loosened until they pass.
+	// Cassandra reports the REMAINING TTL truncated to whole seconds, so the true
+	// expiry lies within [beforeTTLRead+refTTL, afterTTLRead+refTTL+1s). Both bounds
+	// are stated against that interval rather than a point estimate, so the slack is
+	// the measurement's, not a fudge factor chosen until the test passed.
 	const ttlReportGranularity = time.Second
-	ttlHorizon := time.Now().UTC().Add(time.Duration(refTTL) * time.Second)
+	earliestTTLExpiry := beforeTTLRead.Add(time.Duration(refTTL) * time.Second)
+	latestTTLExpiry := afterTTLRead.Add(time.Duration(refTTL)*time.Second + ttlReportGranularity)
 
 	// The reference must not die before the deadline its tracker advertises, or the
 	// block is unpinned while its upload is still in flight.
-	if ttlHorizon.Add(ttlReportGranularity).Before(canonicalExpiresAt.UTC()) {
-		t.Fatalf("reference TTL horizon %v expires before its tracked deadline %v: the block would be unpinned while still in flight", ttlHorizon, canonicalExpiresAt.UTC())
+	if latestTTLExpiry.Before(canonicalExpiresAt.UTC()) {
+		t.Fatalf("reference TTL expires by %v, before its tracked deadline %v: the block would be unpinned while still in flight", latestTTLExpiry, canonicalExpiresAt.UTC())
 	}
 	// ...nor outlive it by more than the derivation's rounding, or Phase 0 would
 	// defer this record indefinitely and hold its day cursor back with it.
-	if ttlHorizon.After(canonicalExpiresAt.UTC().Add(2 * time.Second)) {
-		t.Fatalf("reference TTL horizon %v outlives its tracked deadline %v: Phase 0 would wait on a row that is not going away", ttlHorizon, canonicalExpiresAt.UTC())
+	if earliestTTLExpiry.After(canonicalExpiresAt.UTC().Add(2 * time.Second)) {
+		t.Fatalf("reference TTL outlives its tracked deadline %v (earliest expiry %v): Phase 0 would wait on a row that is not going away", canonicalExpiresAt.UTC(), earliestTTLExpiry)
 	}
 
 	var projectedExpiresAt time.Time
@@ -243,6 +250,13 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 	// A re-upload of the same block under the same session renews the pair. The
 	// superseded projection must be retracted in the same batch, or Phase 0 keeps
 	// walking a row whose deadline no longer exists.
+	//
+	// The deadline is derived from wall-clock time at millisecond resolution, so a
+	// re-upload in the same millisecond would produce an identical deadline and
+	// silently skip the retraction check. Sleep past that boundary and then REQUIRE
+	// the deadline to have moved: returning early would let this acceptance criterion
+	// pass without ever exercising it.
+	time.Sleep(50 * time.Millisecond)
 	renewResp := webUploadBlock(t, adminClient, session, content)
 	renewResp.Body.Close()
 
@@ -253,8 +267,7 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 		t.Fatalf("read renewed provisional expiry: %v", err)
 	}
 	if renewedExpiresAt.UTC().Equal(canonicalExpiresAt.UTC()) {
-		// Same deadline: nothing to retract, so the stale-projection check does not apply.
-		return
+		t.Fatalf("re-upload did not move the deadline off %v, so the projection-retraction path was never exercised", canonicalExpiresAt.UTC())
 	}
 	var staleProjection time.Time
 	err := database.Session().Query(
@@ -269,6 +282,72 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 	}
 	if !errors.Is(err, gocql.ErrNotFound) {
 		t.Fatalf("check superseded projection: %v", err)
+	}
+}
+
+// TestProvisionalReferenceReleaseIsGenerationGuarded exercises the reference-side
+// compare against real Cassandra. The unit tests around
+// ReleaseProvisionalBlockReference drive an injected hook, so they pin the
+// orchestration — that the observed generation is what gets passed down and that a
+// "renewed" outcome stops the release — but not the LWT itself. This does.
+//
+// The scenario is the race in miniature: a release observes a reference, a renewal
+// rewrites it (fresh created_at, fresh TTL), and the release's delete arrives late.
+// It must not apply. Without the compare it removes a reference a live upload owns,
+// and the caller then reads zero references and promotes the block to a GC candidate.
+func TestProvisionalReferenceReleaseIsGenerationGuarded(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-gen-%d", time.Now().UnixNano()))
+	content := []byte("generation guarded release " + fmt.Sprint(time.Now().UnixNano()))
+	blockID := sha256hex(content)
+
+	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
+	uploadReferrer := dbpkg.BlockReferrerForUpload(session)
+	cleanupUploadedBlockArtifactsForTest(t, defaultOrgID, repoID, blockID, sha1hex(content), uploadReferrer)
+
+	resp := webUploadBlock(t, adminClient, session, content)
+	resp.Body.Close()
+
+	database := shareProjectionDBForTest(t)
+
+	staleCreatedAt, found, err := database.BlockReferenceCreatedAt(defaultOrgID, blockID, uploadReferrer)
+	if err != nil || !found {
+		t.Fatalf("read provisional reference generation: found=%v err=%v", found, err)
+	}
+
+	// Renew: a retry of the same block under the same session rewrites the pair with
+	// a new created_at. Sleep past millisecond resolution so the generation really moves.
+	time.Sleep(50 * time.Millisecond)
+	renewResp := webUploadBlock(t, adminClient, session, content)
+	renewResp.Body.Close()
+
+	renewedCreatedAt, found, err := database.BlockReferenceCreatedAt(defaultOrgID, blockID, uploadReferrer)
+	if err != nil || !found {
+		t.Fatalf("read renewed provisional reference: found=%v err=%v", found, err)
+	}
+	if renewedCreatedAt.Equal(staleCreatedAt) {
+		t.Fatalf("re-upload did not move the reference generation off %v, so the guard was never exercised", staleCreatedAt)
+	}
+
+	// The late release, carrying its stale observation.
+	applied, rowPresent, err := database.RemoveBlockReferenceIfCreatedAt(defaultOrgID, blockID, uploadReferrer, staleCreatedAt)
+	if err != nil {
+		t.Fatalf("conditional reference delete: %v", err)
+	}
+	if applied {
+		t.Fatal("a stale release deleted a renewed provisional reference: the live upload is unpinned and its block can be promoted to a GC candidate")
+	}
+	if !rowPresent {
+		t.Fatal("the renewed reference must still be there; reporting it absent would let the caller retire the tracker too")
+	}
+
+	// And the current generation still releases cleanly, so the guard has not simply
+	// made release impossible.
+	applied, _, err = database.RemoveBlockReferenceIfCreatedAt(defaultOrgID, blockID, uploadReferrer, renewedCreatedAt)
+	if err != nil {
+		t.Fatalf("conditional reference delete with the current generation: %v", err)
+	}
+	if !applied {
+		t.Fatal("the observed generation must be releasable")
 	}
 }
 

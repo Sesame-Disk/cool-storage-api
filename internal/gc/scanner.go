@@ -195,6 +195,24 @@ func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (
 // to zero references and GC is free to delete data the uploader is still writing.
 // Records whose reference has not yet gone are deferred to a later cycle, and the
 // day cursor is held back so a deferred record stays discoverable.
+// promoteBlockIfUnreferenced runs the zero-reference transition for a block whose
+// provisional pin is provably gone. Both Phase 0 paths that reach that conclusion
+// use it, so neither can quietly skip the promotion — the transition has exactly one
+// discovery window and nothing re-opens it once the tracking rows are swept.
+func (s *Scanner) promoteBlockIfUnreferenced(orgID uuid.UUID, blockID, storageClass string, now time.Time) error {
+	hasRefs, err := s.store.BlockHasReferences(orgID, blockID)
+	if err != nil {
+		return fmt.Errorf("check refs after provisional expiry org=%s block=%s: %w", orgID, blockID, err)
+	}
+	if hasRefs {
+		return nil
+	}
+	if _, err := s.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, now); err != nil {
+		return fmt.Errorf("promote expired provisional ref org=%s block=%s into gc candidate: %w", orgID, blockID, err)
+	}
+	return nil
+}
+
 func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 0: Scanning for expired provisional upload refs...")
 
@@ -249,6 +267,20 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 				}
 
 				if !found {
+					// An expired projection whose canonical row is gone is the LAST
+					// trace of this provisional ref, so this branch is a recovery path,
+					// not just a sweep. A release that retired the tracker but failed to
+					// clean up here leaves exactly this state with the block already at
+					// zero references and no candidate; dropping the projection without
+					// looking would erase the only remaining way to discover that.
+					// Promote first, then sweep.
+					if err := s.promoteBlockIfUnreferenced(expiry.OrgID, expiry.BlockID, expiry.StorageClass, now); err != nil {
+						log.Printf("[GC Scanner] Phase 0: failed to promote block behind orphaned provisional expiry org=%s block=%s: %v", expiry.OrgID, expiry.BlockID, err)
+						if phaseErr == nil {
+							phaseErr = err
+						}
+						continue
+					}
 					if err := s.store.DeleteProvisionalBlockRefExpiryProjection(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt); err != nil {
 						log.Printf("[GC Scanner] Phase 0: failed to delete orphaned provisional expiry projection org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
 						if phaseErr == nil {
@@ -302,22 +334,12 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 					continue
 				}
 
-				hasRefs, err := s.store.BlockHasReferences(canonical.OrgID, canonical.BlockID)
-				if err != nil {
-					log.Printf("[GC Scanner] Phase 0: failed to check block refs after provisional expiry org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+				if err := s.promoteBlockIfUnreferenced(canonical.OrgID, canonical.BlockID, storageClass, now); err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to promote expired provisional ref org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("check refs after provisional expiry org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+						phaseErr = err
 					}
 					continue
-				}
-				if !hasRefs {
-					if _, err := s.store.EnsureBlockGCCandidate(canonical.OrgID, canonical.BlockID, storageClass, now); err != nil {
-						log.Printf("[GC Scanner] Phase 0: failed to promote expired provisional ref org=%s block=%s into gc candidate: %v", canonical.OrgID, canonical.BlockID, err)
-						if phaseErr == nil {
-							phaseErr = fmt.Errorf("promote expired provisional ref org=%s block=%s into gc candidate: %w", canonical.OrgID, canonical.BlockID, err)
-						}
-						continue
-					}
 				}
 				// Retire the tracker only while it still carries the deadline this
 				// pass acted on. A renewal that landed after the presence check must

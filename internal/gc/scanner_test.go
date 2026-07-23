@@ -275,6 +275,50 @@ func TestScanner_ScanExpiredProvisionalBlockRefs_DropsProjectionWhenCanonicalMis
 	}
 }
 
+// TestScanner_ScanExpiredProvisionalBlockRefs_PromotesUnreferencedBlockBehindOrphanedProjection
+// covers the last-chance path. A release that retired the tracker but failed before
+// cleaning up its projection leaves exactly this state: no canonical row, no
+// reference, no candidate — and an expired projection that is the only remaining
+// trace of the block. Sweeping that projection without running the zero-reference
+// transition erases the final discovery window, and nothing re-opens it:
+// scanOrphanedBlocks only walks candidates that already exist. The block, its
+// metadata and its S3 object would be retained forever.
+func TestScanner_ScanExpiredProvisionalBlockRefs_PromotesUnreferencedBlockBehindOrphanedProjection(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	blockID := "block-orphaned-projection"
+	referrer := db.BlockReferrerForUpload("released-op")
+	expiresAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	// Canonical tracker and reference both gone; only the projection survives.
+	store.AddProvisionalBlockRefExpiryProjectionForTest(orgID, blockID, referrer, "hot", expiresAt)
+
+	cleaned, err := s.scanExpiredProvisionalBlockRefs(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() error = %v", err)
+	}
+	if cleaned != 1 {
+		t.Fatalf("cleaned = %d, want 1", cleaned)
+	}
+
+	candidates, err := store.ListBlockGCCandidatesByDay(time.Now().UTC(), db.GCDiscoveryBucket(orgID.String(), blockID))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay() error = %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("expected the unreferenced block to be promoted before its last trace was swept, got %#v", candidates)
+	}
+	if candidates[0].BlockID != blockID {
+		t.Fatalf("candidate = %q, want %q", candidates[0].BlockID, blockID)
+	}
+}
+
 func TestScanner_ScanExpiredProvisionalBlockRefs_UsesScanTimeForCandidatePartition(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

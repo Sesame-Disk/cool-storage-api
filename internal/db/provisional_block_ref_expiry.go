@@ -110,8 +110,38 @@ var releaseProvisionalReadExpiryFn = func(database *DB, orgID, blockID, referrer
 	return database.readProvisionalBlockRefExpiry(orgID, blockID, referrer)
 }
 
-var releaseProvisionalRemoveReferenceFn = func(database *DB, orgID, blockID, referrer string) error {
-	return database.RemoveBlockReference(orgID, blockID, referrer)
+// provisionalReferenceReleaseOutcome distinguishes the three ways a conditional
+// reference delete can end, because the caller must act differently on each.
+type provisionalReferenceReleaseOutcome int
+
+const (
+	// provisionalReferenceRemoved: the observed reference was deleted.
+	provisionalReferenceRemoved provisionalReferenceReleaseOutcome = iota
+	// provisionalReferenceAbsent: there was no reference left to delete. Nothing is
+	// pinning the block through this referrer, so the release proceeds.
+	provisionalReferenceAbsent
+	// provisionalReferenceRenewed: a newer reference exists. It belongs to a live
+	// upload; neither it nor its tracker may be touched.
+	provisionalReferenceRenewed
+)
+
+var releaseProvisionalReadReferenceFn = func(database *DB, orgID, blockID, referrer string) (time.Time, bool, error) {
+	return database.BlockReferenceCreatedAt(orgID, blockID, referrer)
+}
+
+var releaseProvisionalRemoveReferenceFn = func(database *DB, orgID, blockID, referrer string, createdAt time.Time) (provisionalReferenceReleaseOutcome, error) {
+	applied, rowPresent, err := database.RemoveBlockReferenceIfCreatedAt(orgID, blockID, referrer, createdAt)
+	if err != nil {
+		return provisionalReferenceRenewed, err
+	}
+	switch {
+	case applied:
+		return provisionalReferenceRemoved, nil
+	case rowPresent:
+		return provisionalReferenceRenewed, nil
+	default:
+		return provisionalReferenceAbsent, nil
+	}
 }
 
 var releaseProvisionalDeleteTrackerFn = func(database *DB, orgID, blockID, referrer string, expiresAt time.Time) (bool, error) {
@@ -130,41 +160,73 @@ var releaseProvisionalDeleteTrackerFn = func(database *DB, orgID, blockID, refer
 // forever. The reverse is routine — Phase 0 sees the reference gone, judges liveness
 // and retires the tracker. Every step below is ordered to fail onto that side.
 //
-// Hence: observe the deadline FIRST, drop the reference, then retire the tracker
-// **conditionally on the observation**. Reading the tracker after dropping the
-// reference (what this replaced) reads whatever is there by then — including a
-// tracker a concurrent renewal just wrote — and deleting that unconditionally
-// strands the renewal's live reference with no tracking at all. Concurrency is real
-// here: `up:` referrers are per session, so a retry of the same block, or an upload
-// admitted before a commit began releasing, renews the very pair being released.
+// Concurrency here is not theoretical: `up:` referrers are per session, so a retry
+// of the same block, or a request admitted just before a commit began releasing,
+// renews the very pair being released.
 //
-// A renewal that lands mid-release simply wins: the compare fails, its pair stays
-// intact, and its own release or expiry deals with it later.
-func (db *DB) ReleaseProvisionalBlockReference(orgID, blockID, referrer string) error {
+// BOTH deletes are therefore tied to what the release observed — the reference to
+// its `created_at`, the tracker to its `expires_at`:
+//
+//   - Conditioning only the tracker leaves the renewal's *reference* exposed: the
+//     release would delete a reference written after its observation, unpinning a
+//     live upload, and the caller would then see zero references and promote the
+//     block to a GC candidate. That is F9's failure mode arriving by another route.
+//   - Conditioning only the reference leaves the renewal's *tracker* exposed, which
+//     strands a live reference with no discovery projection (the original F10).
+//
+// A renewal that lands in either window simply wins both compares and keeps its
+// pair whole; its own release or expiry deals with it later.
+//
+// referenceRemoved reports whether this call actually retired a reference. Callers
+// use it to decide whether to run their zero-reference check, and it stays true even
+// if tracker cleanup fails afterwards — swallowing it there would leave a block at
+// zero references with no candidate and, once the orphaned projection is swept, no
+// discovery path at all.
+func (db *DB) ReleaseProvisionalBlockReference(orgID, blockID, referrer string) (referenceRemoved bool, err error) {
 	if db == nil {
-		return nil
+		return false, nil
 	}
 
-	// Observed before anything is mutated: this is the generation identity the
-	// conditional delete below is allowed to retire.
-	observed, err := releaseProvisionalReadExpiryFn(db, orgID, blockID, referrer)
+	// Both identities are captured before anything is mutated. These are the only
+	// generations the conditional deletes below are allowed to retire.
+	observedExpiry, err := releaseProvisionalReadExpiryFn(db, orgID, blockID, referrer)
 	if err != nil {
-		return err
+		return false, err
+	}
+	observedCreatedAt, referencePresent, err := releaseProvisionalReadReferenceFn(db, orgID, blockID, referrer)
+	if err != nil {
+		return false, err
 	}
 
-	if err := releaseProvisionalRemoveReferenceFn(db, orgID, blockID, referrer); err != nil {
-		return fmt.Errorf("remove provisional block reference for org=%s block=%s referrer=%s: %w", orgID, blockID, referrer, err)
+	outcome := provisionalReferenceAbsent
+	if referencePresent {
+		// The compare is a Paxos round, so it is spent only when there is actually a
+		// reference to guard. Rollback paths routinely release blocks that were never
+		// referenced, and skipping the round there is safe: a reference appearing after
+		// this observation arrives with a renewed tracker, which the compare below
+		// refuses to retire.
+		outcome, err = releaseProvisionalRemoveReferenceFn(db, orgID, blockID, referrer, observedCreatedAt)
+		if err != nil {
+			return false, fmt.Errorf("remove provisional block reference for org=%s block=%s referrer=%s: %w", orgID, blockID, referrer, err)
+		}
+	}
+	if outcome == provisionalReferenceRenewed {
+		// A newer reference owns this referrer now, and the tracker it arrived with
+		// is the one keeping it discoverable. Touch neither.
+		return false, nil
 	}
 
-	if observed.IsZero() {
+	if observedExpiry.IsZero() {
 		// No tracker existed when we looked. Anything present now belongs to a
 		// renewal, and retiring it would be the exact bug this ordering prevents.
-		return nil
+		return true, nil
 	}
-	if _, err := releaseProvisionalDeleteTrackerFn(db, orgID, blockID, referrer, observed); err != nil {
-		return err
+	if _, err := releaseProvisionalDeleteTrackerFn(db, orgID, blockID, referrer, observedExpiry); err != nil {
+		// The reference is gone regardless, and the caller needs to know that to
+		// promote a now-unreferenced block.
+		return true, err
 	}
-	return nil
+	return true, nil
 }
 
 // DeleteProvisionalBlockReferenceExpiry removes the canonical expiry row and,

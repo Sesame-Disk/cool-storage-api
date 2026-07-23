@@ -101,7 +101,7 @@ var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, 
 // tracker the release observed. It is one call for the same reason creation is
 // (F10): split across two statements, a renewal landing between them ends up with
 // a live reference and no tracking, which no GC phase can ever discover.
-var releaseUploadReferenceFn = func(h *FSHelper, orgID, blockID, referrer string) error {
+var releaseUploadReferenceFn = func(h *FSHelper, orgID, blockID, referrer string) (bool, error) {
 	return h.db.ReleaseProvisionalBlockReference(orgID, blockID, referrer)
 }
 
@@ -1095,10 +1095,20 @@ func (h *FSHelper) ReleaseUploadReferences(orgID, libraryID, operationID string,
 	referrer := db.BlockReferrerForUpload(operationID)
 	var zeroRefBlocks []string
 	for _, blockID := range blockIDs {
-		if err := releaseUploadReferenceFn(h, orgID, blockID, referrer); err != nil {
+		removed, err := releaseUploadReferenceFn(h, orgID, blockID, referrer)
+		if err != nil {
 			log.Printf("[ReleaseUploadReferences] WARNING: failed to release provisional reference for block %s: %v", blockID, err)
+		}
+		if !removed {
+			// Either the release failed outright or a renewal now owns the referrer.
+			// Both mean this block is still pinned, so evaluating liveness here could
+			// enqueue a block a live upload is using.
 			continue
 		}
+		// Deliberately reached even when err != nil: the reference IS gone, and a
+		// tracker/projection cleanup failure must not cost the zero-reference
+		// transition. The tracker is the only thing that would rediscover it, and
+		// the scanner's orphaned-projection sweep would then drop the last trace.
 		hasRefs, err := h.db.BlockHasReferences(orgID, blockID)
 		if err != nil {
 			log.Printf("[ReleaseUploadReferences] WARNING: failed to check references for block %s: %v", blockID, err)

@@ -711,9 +711,27 @@ the very pair being released. The scanner's CAS did not cover this; it only guar
 own release.
 
 The fix is the same generation identity, applied to the writer:
-`ReleaseProvisionalBlockReference` **observes** `expires_at`, drops the reference, then
-retires the tracker **conditionally on that observation**. A renewal simply wins the compare
-and keeps its pair intact.
+`ReleaseProvisionalBlockReference` **observes** both identities up front and makes **both**
+deletes conditional — the reference on its `created_at`, the tracker on its `expires_at`.
+
+A first pass conditioned only the tracker, which a second review round showed still leaves
+the mirror window open: a renewal landing between the observation and the reference delete
+loses its *reference* (the unconditional delete removes it) while keeping its tracker, and
+`ReleaseUploadReferences` then reads zero references and promotes a block whose upload is
+still running to a GC candidate — F9's failure mode arriving through the release path.
+`created_at` already exists on `block_references` and is rewritten by every renewal, so it
+serves as the generation identity with no schema change.
+
+**Preserving the zero-reference transition on partial failure.** The tracker retirement is a
+CAS followed by a projection delete, so the projection delete can fail after the CAS applied.
+Returning that as a plain error made `ReleaseUploadReferences` skip its liveness check, and
+the resulting state — reference gone, canonical tracker gone, projection orphaned, no
+candidate — used to be terminal: Phase 0's canonical-missing branch simply swept the
+projection, erasing the last trace. Two changes close it: the release reports
+`referenceRemoved` independently of cleanup errors so the caller still runs its check, and
+that scanner branch became a recovery path (`promoteBlockIfUnreferenced`) that promotes an
+unreferenced block *before* sweeping its projection. Both Phase 0 paths now share that
+helper, so neither can quietly skip the promotion.
 
 **The ordering rule this exposed, worth stating once:** a *reference without a tracker* is
 unrecoverable (invisible to every GC phase), while a *tracker without a reference* recovers
@@ -722,13 +740,27 @@ in both the create and release paths is ordered so that a crash or a lost race l
 recoverable side. That is why release drops the reference **before** the tracker, and why a
 failed reference delete must not go on to touch the tracker.
 
-**On the new LWT (in the shadow of X4).** The CAS delete is a Paxos round, and this
-series is otherwise trying to *remove* per-block LWTs. It is deliberately accepted here
-and does not have X4's shape: it runs in the GC scanner, not the upload hot path; it
-fires once per *abandoned* provisional ref (the normal path releases its own tracker
-without a compare), not per block per upload; and it replaces no cheaper alternative —
-an unconditional delete is what loses a renewal's tracking. One background round per
-abandoned upload is not the ~128 cross-region rounds per GB that X4 is about.
+**On the new LWTs (in the shadow of X4).** Three compares were added, and this series is
+otherwise trying to *remove* per-block LWTs, so the cost is worth stating plainly rather
+than discovering later.
+
+- **Phase 0's tracker retirement** runs in the GC scanner, once per *abandoned* provisional
+  ref. Background, low volume, no cheaper alternative — an unconditional delete is what
+  loses a renewal's tracking.
+- **The release path's two compares** (reference, then tracker) are the expensive ones:
+  `releaseSyncUploadReferences` runs on the **success** path of a sync commit, per added
+  block. Under production `SERIAL` and multi-DC that is up to two extra global rounds per
+  block — the same shape as X4, on a path that previously used plain deletes. The reference
+  compare is skipped when the observation shows no reference to guard (the common rollback
+  case), but a successful sync commit does pay it.
+
+Accepted here because the alternative is a correctness bug — an unconditional delete
+unpins live uploads and strands untracked references — and because the safe way to avoid
+the rounds entirely is a **separate** change with its own risk: on the success path the
+provisional pair need not be released eagerly at all. The block has just gained its
+permanent `fs:` reference, so letting the TTL retire the pair and Phase 0 clean up costs
+nothing but tracker rows living out their 48h. That is a behaviour change to the sync
+commit path, not a refactor, so it is recorded as follow-up rather than folded in here.
 
 **Dead code removed with the paths that used them:** `UpsertProvisionalBlockReferenceExpiry`
 (tracking-only write, no caller once the atomic entry point exists — and reintroducing one
@@ -746,16 +778,25 @@ two rollback hooks in `fs_helpers.go`.
   the test fails.
 - `TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically` — one call, nothing runs
   after its failure, nothing is compensated, and the error is retryable.
-- `TestReleaseProvisionalBlockReference_*` (4) — a renewal injected at the reference delete
-  keeps its tracker; the observed pair is retired when there is no renewal; the reference is
-  dropped before the tracker; a failed reference delete never touches the tracker. Verified
-  by restoring the re-read: the renewal test fails.
+- `TestReleaseProvisionalBlockReference_*` (6) — renewals injected in **both** windows (before
+  the reference delete and after it) leave the renewal's pair whole; the observed pair is
+  retired when there is no renewal; ordering is reference-then-tracker; a failed reference
+  delete never touches the tracker; and a tracker-cleanup failure still reports the removal.
+  These pin the orchestration — they drive an injected delete — so the LWT itself is covered
+  separately, below.
+- `TestScanner_ScanExpiredProvisionalBlockRefs_PromotesUnreferencedBlockBehindOrphanedProjection`
+  — the recovery path: an orphaned projection over an unreferenced block yields a candidate
+  before the projection is swept. Verified by removing the promotion: the test fails.
+- `TestProvisionalReferenceReleaseIsGenerationGuarded` (integration, real Cassandra) — a stale
+  release cannot delete a renewed reference (and reports it present, so the caller does not go
+  on to retire the tracker), while the current generation still releases. This is what covers
+  the LWT the unit tests stub out.
 - `TestWebBlockUploadWritesReferenceAndExpiryTogether` (integration, real Cassandra) — after
-  a session upload, all three rows exist, the reference's TTL horizon brackets its tracked
-  deadline (within Cassandra's one-second TTL reporting granularity), and a renewal retracts
-  the superseded projection. The mocked unit test proves one *call* is made; only this proves
-  the write actually produces the rows Phase 0 depends on — it caught the TTL-truncation
-  detail the unit level cannot see.
+  a session upload, all three rows exist, the reference's TTL expiry interval brackets its
+  tracked deadline, and a renewal retracts the superseded projection (the test now *requires*
+  the deadline to move rather than returning early if it did not). The mocked unit test proves
+  one *call* is made; only this proves the write produces the rows Phase 0 depends on — it
+  caught that Cassandra reports remaining TTL truncated to whole seconds.
 - Existing Phase 0 tests were retargeted rather than deleted: they now stage the state the
   TTL actually produces (reference already gone) instead of the state only the old
   self-deleting scanner produced.
