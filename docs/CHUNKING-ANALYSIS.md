@@ -70,10 +70,12 @@ the trade-off and documenting it.
 
 ### Debts recorded from the web block-upload work (2026-06-22)
 
-- **Legacy `/blocks/upload` without a session does not materialize Cassandra
-  metadata/refs** — only `PutBlockData` (S3). Any *new* (non-sync) caller that
-  uploads without a session leaves an ungoverned S3 object that GC cannot see.
-  The web flow always passes a `session` (provisional ref + TTL). See R2/R9 in
+- ~~**Legacy `/blocks/upload` without a session does not materialize Cassandra
+  metadata/refs**~~ — **closed by PR-7 (finding F8, 2026-07-23).** The no-session
+  branch was removed rather than governed: `/blocks/upload` and its paired
+  `/blocks/check` oracle now answer 400 `block_upload_session_required` before any
+  store I/O, so the ungoverned S3 object can no longer be created. Every upload
+  passes a `session` (provisional ref + TTL). See R2/R9 in
   [WEB-BLOCK-UPLOAD.md](./WEB-BLOCK-UPLOAD.md).
 - **Encrypted libraries** are rejected by the block flow (SHA-256 over plaintext
   vs server-side block encryption). Deferred.
