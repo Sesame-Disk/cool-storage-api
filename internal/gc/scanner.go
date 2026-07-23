@@ -183,10 +183,18 @@ func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (
 	return 0, nil
 }
 
-// scanExpiredProvisionalBlockRefs expires abandoned provisional upload refs by
-// specific referrer. If removing the expired ref drops the block to zero refs,
-// the block is promoted into gc_block_candidates; otherwise only the expiry
-// tracker is removed.
+// scanExpiredProvisionalBlockRefs retires the tracking of abandoned provisional
+// upload refs, by specific referrer, and promotes any block their expiry left at
+// zero references into gc_block_candidates.
+//
+// It does NOT delete the reference row. That row carries a Cassandra TTL derived
+// from the very deadline being tracked, so it expires on its own; the phase waits
+// for that and acts only on what it observes afterwards. Deleting it here was F9:
+// an upload can renew a reference between this scan's read and its delete, and
+// removing a renewed reference unpins a live upload — after which the block goes
+// to zero references and GC is free to delete data the uploader is still writing.
+// Records whose reference has not yet gone are deferred to a later cycle, and the
+// day cursor is held back so a deferred record stays discoverable.
 func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 0: Scanning for expired provisional upload refs...")
 
@@ -203,6 +211,11 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 	}
 
 	cleaned := 0
+	// deferred counts records this pass deliberately left in place because their
+	// provisional reference is still live; oldestDeferredDay keeps the cursor from
+	// stepping past the day that holds one, which would make it undiscoverable.
+	deferred := 0
+	var oldestDeferredDay time.Time
 	var phaseErr error
 	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
 		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
@@ -264,13 +277,31 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 				if storageClass == "" {
 					storageClass = expiry.StorageClass
 				}
-				if err := s.store.RemoveBlockReference(canonical.OrgID, canonical.BlockID, canonical.Referrer); err != nil {
-					log.Printf("[GC Scanner] Phase 0: failed to remove expired provisional ref org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+
+				// The provisional reference carries a Cassandra TTL derived from this
+				// same deadline (AddProvisionalBlockReferenceWithExpiry), so it retires
+				// itself. Phase 0 waits for that instead of deleting the row, because
+				// between the read above and any delete here an upload can renew the
+				// reference — and deleting a renewed reference unpins a live upload,
+				// which is exactly F9. While the row is still present we have learned
+				// nothing about liveness: the block is legitimately pinned right now.
+				// Defer the record to a later cycle rather than guess.
+				refPresent, err := s.store.BlockReferenceExists(canonical.OrgID, canonical.BlockID, canonical.Referrer)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to check provisional ref presence org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("remove expired provisional ref org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+						phaseErr = fmt.Errorf("check provisional ref presence org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					}
 					continue
 				}
+				if refPresent {
+					deferred++
+					if oldestDeferredDay.IsZero() || day.Before(oldestDeferredDay) {
+						oldestDeferredDay = day
+					}
+					continue
+				}
+
 				hasRefs, err := s.store.BlockHasReferences(canonical.OrgID, canonical.BlockID)
 				if err != nil {
 					log.Printf("[GC Scanner] Phase 0: failed to check block refs after provisional expiry org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
@@ -288,11 +319,23 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 						continue
 					}
 				}
-				if err := s.store.DeleteProvisionalBlockRefExpiry(canonical.OrgID, canonical.BlockID, canonical.Referrer, canonical.ExpiresAt); err != nil {
+				// Retire the tracker only while it still carries the deadline this
+				// pass acted on. A renewal that landed after the presence check must
+				// keep its tracking, or its reference would later expire with nothing
+				// left to notice the block reached zero references.
+				applied, err := s.store.DeleteProvisionalBlockRefExpiryIfExpiresAt(canonical.OrgID, canonical.BlockID, canonical.Referrer, canonical.ExpiresAt)
+				if err != nil {
 					log.Printf("[GC Scanner] Phase 0: failed to delete provisional expiry tracker org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("delete provisional expiry tracker org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					}
+					continue
+				}
+				if !applied {
+					// Renewed underneath us. The renewal rewrote the discovery
+					// projection onto its own day and retracted this one, so there is
+					// nothing left to clean up here.
+					deferred++
 					continue
 				}
 				if !canonical.ExpiresAt.Equal(expiry.ExpiresAt.UTC()) {
@@ -311,6 +354,12 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 
 	if phaseErr == nil {
 		newCursor := cutoffDay.AddDate(0, 0, -1)
+		// Never advance past a day still holding a deferred record. The cursor is
+		// what bounds future scans, so moving beyond an unprocessed day would drop
+		// that record out of every later pass — a leak with no discovery path left.
+		if !oldestDeferredDay.IsZero() && oldestDeferredDay.Before(newCursor) {
+			newCursor = oldestDeferredDay
+		}
 		if !newCursor.Before(startDay) {
 			if err := s.store.SaveGCStats(gcProvisionalBlockRefsCursorKey, db.GCProjectionDateString(newCursor)); err != nil {
 				log.Printf("[GC Scanner] Phase 0: failed to persist provisional block ref cursor: %v", err)
@@ -319,8 +368,13 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 		}
 	}
 
-	log.Printf("[GC Scanner] Phase 0 complete: cleaned %d provisional upload refs", cleaned)
+	log.Printf("[GC Scanner] Phase 0 complete: cleaned %d provisional upload refs, deferred %d still-pinned", cleaned, deferred)
 	recordScannerAction("expired_provisional_block_refs", "cleaned", cleaned)
+	// Deferrals are normal in small numbers (the rounding window between a
+	// reference's TTL and its deadline). A count that stays high means references
+	// are outliving their trackers, which also pins the day cursor — worth an
+	// alert, and invisible without this counter.
+	recordScannerAction("expired_provisional_block_refs", "deferred", deferred)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_provisional_block_refs").SetToCurrentTime()
 	return cleaned, phaseErr
 }

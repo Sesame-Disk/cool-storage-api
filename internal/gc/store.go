@@ -107,7 +107,17 @@ type GCStore interface {
 	// It intentionally leaves the canonical row untouched for stale projection
 	// cleanup when an upload ref was renewed or already finalized elsewhere.
 	DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error
-	DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error
+	// DeleteProvisionalBlockRefExpiryIfExpiresAt retires the tracker only while it
+	// still holds the deadline the scanner acted on. applied=false means an upload
+	// renewed (or finalized) it in the meantime and the scanner must not touch it.
+	// There is no unconditional variant on purpose: GC only ever retires a tracker
+	// it has just observed, so the compare costs nothing it does not already know
+	// and removes the renewal race by construction.
+	DeleteProvisionalBlockRefExpiryIfExpiresAt(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) (bool, error)
+	// BlockReferenceExists reports whether one specific reference row survives.
+	// Phase 0 uses it to confirm a provisional reference has actually been retired
+	// by its Cassandra TTL before drawing any conclusion about block liveness.
+	BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error)
 
 	// S3 orphan recovery / pending delete tracking for blocks claimed by GC.
 	// StartBlockDeleteOrphan records the durable recovery row for a NEW block

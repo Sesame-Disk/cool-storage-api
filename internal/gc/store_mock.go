@@ -1845,6 +1845,17 @@ func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, e
 	return current, nil
 }
 
+func (m *MockStore) BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	refs, ok := m.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return false, nil
+	}
+	_, exists := refs[referrer]
+	return exists, nil
+}
+
 // SetBlockHasReferencesHookForTest installs a deterministic concurrency hook for
 // component tests that drive the real worker against MockStore.
 func (m *MockStore) SetBlockHasReferencesHookForTest(hook func(orgID uuid.UUID, blockID string, current bool) (bool, error)) {
@@ -2064,20 +2075,20 @@ func (m *MockStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, b
 	return nil
 }
 
-func (m *MockStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
+// DeleteProvisionalBlockRefExpiryIfExpiresAt mirrors the Cassandra LWT: it only
+// retires the tracker while it still carries the observed deadline, so a test can
+// reproduce a renewal landing between the scanner's read and its delete.
+func (m *MockStore) DeleteProvisionalBlockRefExpiryIfExpiresAt(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s:%s", orgID, blockID, referrer)
-	if expiresAt.IsZero() {
-		if existing, ok := m.provisionalBlockRefExpiries[key]; ok {
-			expiresAt = existing.ExpiresAt
-		}
+	existing, ok := m.provisionalBlockRefExpiries[key]
+	if !ok || expiresAt.IsZero() || !existing.ExpiresAt.Equal(expiresAt.UTC()) {
+		return false, nil
 	}
 	delete(m.provisionalBlockRefExpiries, key)
-	if !expiresAt.IsZero() {
-		delete(m.provisionalBlockRefExpiryProjections, newMockProvisionalBlockRefExpiryProjectionKey(orgID, blockID, referrer, expiresAt))
-	}
-	return nil
+	delete(m.provisionalBlockRefExpiryProjections, newMockProvisionalBlockRefExpiryProjectionKey(orgID, blockID, referrer, expiresAt.UTC()))
+	return true, nil
 }
 
 func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error) {

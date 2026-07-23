@@ -63,6 +63,11 @@ func TestScanner_LoadFailedItemsExpiryStartDay_ColdStartUsesFailedItemLookback(t
 	}
 }
 
+// The provisional reference is absent here because that is the state Phase 0 acts
+// on: the reference carries a Cassandra TTL derived from the same deadline as its
+// tracker, so by the time the tracker is due the reference has retired itself. The
+// scanner no longer deletes it (F9) — it observes that it is gone and only then
+// concludes the block reached zero references.
 func TestScanner_ScanOnce_ExpiredProvisionalRefEnqueuesZeroRefBlock(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -76,9 +81,6 @@ func TestScanner_ScanOnce_ExpiredProvisionalRefEnqueuesZeroRefBlock(t *testing.T
 
 	store.AddOrganization(orgID)
 	store.AddBlock(orgID, blockID, "hot", 0)
-	store.mu.Lock()
-	store.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)] = map[string]struct{}{referrer: {}}
-	store.mu.Unlock()
 	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", expiresAt)
 
 	if err := s.ScanOnce(context.Background()); err != nil {
@@ -89,7 +91,7 @@ func TestScanner_ScanOnce_ExpiredProvisionalRefEnqueuesZeroRefBlock(t *testing.T
 		t.Fatalf("BlockHasReferences() error = %v", err)
 	}
 	if hasRefs {
-		t.Fatal("expected expired provisional ref to be removed")
+		t.Fatal("expected the TTL-retired provisional ref to leave the block unreferenced")
 	}
 	items := store.QueueItems(orgID)
 	if len(items) != 1 {
@@ -128,10 +130,11 @@ func TestScanner_ScanExpiredProvisionalBlockRefs_PreservesLiveBlocks(t *testing.
 
 	store.AddOrganization(orgID)
 	store.AddBlock(orgID, blockID, "hot", 0)
+	// The upload ref is already gone (retired by its TTL); the permanent fs: ref
+	// from the committed file is what must keep the block out of GC.
 	store.mu.Lock()
 	store.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)] = map[string]struct{}{
-		expiredRef: {},
-		fsRef:      {},
+		fsRef: {},
 	}
 	store.mu.Unlock()
 	store.AddProvisionalBlockRefExpiry(orgID, blockID, expiredRef, "hot", expiresAt)
@@ -286,9 +289,7 @@ func TestScanner_ScanExpiredProvisionalBlockRefs_UsesScanTimeForCandidatePartiti
 
 	store.AddOrganization(orgID)
 	store.AddBlock(orgID, blockID, "hot", 0)
-	store.mu.Lock()
-	store.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)] = map[string]struct{}{referrer: {}}
-	store.mu.Unlock()
+	// Long past its deadline: the TTL retired the reference days ago.
 	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", expiresAt)
 
 	cleaned, err := s.scanExpiredProvisionalBlockRefs(context.Background())
@@ -317,6 +318,124 @@ func TestScanner_ScanExpiredProvisionalBlockRefs_UsesScanTimeForCandidatePartiti
 	}
 	if newCandidates[0].CandidateAt.Before(beforeScan) || newCandidates[0].CandidateAt.After(afterScan) {
 		t.Fatalf("candidate_at = %v, want between %v and %v", newCandidates[0].CandidateAt, beforeScan, afterScan)
+	}
+}
+
+// TestScanner_ScanExpiredProvisionalBlockRefs_NeverDeletesALiveReference is F9's
+// core. The reference row is still present when the tracker comes due — the state
+// a renewal produces, and also the ordinary rounding window between the row's TTL
+// and its deadline. The old scanner deleted the reference here, which could unpin
+// an upload still in flight and hand its block to GC. The reference must survive
+// untouched, the block must not become a candidate, and the tracker must stay so a
+// later cycle can finish the job once the TTL really has retired the row.
+func TestScanner_ScanExpiredProvisionalBlockRefs_NeverDeletesALiveReference(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	blockID := "block-still-pinned"
+	referrer := db.BlockReferrerForUpload("in-flight-op")
+	expiresAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddBlockReferenceForTest(orgID, blockID, referrer)
+	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", expiresAt)
+
+	cleaned, err := s.scanExpiredProvisionalBlockRefs(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() error = %v", err)
+	}
+	if cleaned != 0 {
+		t.Fatalf("cleaned = %d, want 0 (the record was deferred, not processed)", cleaned)
+	}
+
+	exists, err := store.BlockReferenceExists(orgID, blockID, referrer)
+	if err != nil {
+		t.Fatalf("BlockReferenceExists() error = %v", err)
+	}
+	if !exists {
+		t.Fatal("scanner deleted a still-live provisional reference (F9 regression)")
+	}
+	candidates, err := store.ListBlockGCCandidatesByDay(time.Now().UTC(), db.GCDiscoveryBucket(orgID.String(), blockID))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay() error = %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("expected no GC candidate for a still-pinned block, got %#v", candidates)
+	}
+	if _, found, err := store.GetProvisionalBlockRefExpiry(orgID, blockID, referrer); err != nil || !found {
+		t.Fatalf("expected the tracker to survive for a later cycle (found=%v, err=%v)", found, err)
+	}
+	// Losing the tracker's day from the cursor would make the deferred record
+	// undiscoverable, which is the leak the deferral must not trade the fix for.
+	cursor, err := store.LoadGCStats(gcProvisionalBlockRefsCursorKey)
+	if err != nil {
+		t.Fatalf("LoadGCStats() error = %v", err)
+	}
+	if cursor != "" {
+		cursorDay, parseErr := db.ParseGCProjectionDate(cursor)
+		if parseErr != nil {
+			t.Fatalf("ParseGCProjectionDate(%q) error = %v", cursor, parseErr)
+		}
+		if cursorDay.After(db.GCProjectionUTCDate(expiresAt)) {
+			t.Fatalf("cursor %s advanced past the deferred record's day %s", cursor, db.GCProjectionDateString(db.GCProjectionUTCDate(expiresAt)))
+		}
+	}
+}
+
+// TestScanner_ScanExpiredProvisionalBlockRefs_KeepsTrackerWhenRenewedMidPass covers
+// the other half of F9: a renewal that lands after the scanner decided the block
+// was unpinned. Retiring the tracker then would leave the renewed reference with no
+// discovery projection, so when its TTL finally expired nothing would notice the
+// block had reached zero references — a silent leak. The conditional delete must
+// not apply, leaving the renewed tracker intact.
+func TestScanner_ScanExpiredProvisionalBlockRefs_KeepsTrackerWhenRenewedMidPass(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	blockID := "block-renewed-mid-pass"
+	referrer := db.BlockReferrerForUpload("renewing-op")
+	expiresAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond)
+	renewedExpiresAt := time.Now().Add(48 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", expiresAt)
+
+	// The liveness read is the last point before the tracker is retired, so the
+	// renewal is injected there to land inside the exact window the CAS protects.
+	store.SetBlockHasReferencesHookForTest(func(_ uuid.UUID, _ string, current bool) (bool, error) {
+		store.AddBlockReferenceForTest(orgID, blockID, referrer)
+		store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", renewedExpiresAt)
+		return current, nil
+	})
+
+	if _, err := s.scanExpiredProvisionalBlockRefs(context.Background()); err != nil {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() error = %v", err)
+	}
+
+	canonical, found, err := store.GetProvisionalBlockRefExpiry(orgID, blockID, referrer)
+	if err != nil {
+		t.Fatalf("GetProvisionalBlockRefExpiry() error = %v", err)
+	}
+	if !found {
+		t.Fatal("scanner retired the tracker of a renewed provisional reference (F9 regression)")
+	}
+	if !canonical.ExpiresAt.Equal(renewedExpiresAt) {
+		t.Fatalf("canonical expires_at = %v, want the renewed %v", canonical.ExpiresAt, renewedExpiresAt)
+	}
+	exists, err := store.BlockReferenceExists(orgID, blockID, referrer)
+	if err != nil {
+		t.Fatalf("BlockReferenceExists() error = %v", err)
+	}
+	if !exists {
+		t.Fatal("expected the renewed reference to remain")
 	}
 }
 

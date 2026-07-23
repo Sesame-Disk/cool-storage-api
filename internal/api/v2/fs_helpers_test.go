@@ -165,26 +165,20 @@ func TestRegisterFSObjectBlockReferences_AddsReferencesForPersistedFSObject(t *t
 // store->materialize (re-PUT). It must NOT upsert metadata over a fenced block.
 func TestRegisterUploadedBlock_PropagatesFenceWithoutWaitingOrDroppingRef(t *testing.T) {
 	helper := &FSHelper{}
-	oldAdd := registerUploadedBlockAddReferenceFn
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
-	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	oldSleep := registerUploadedBlockSleepFn
 	t.Cleanup(func() {
-		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
-		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
 		registerUploadedBlockSleepFn = oldSleep
 	})
 
 	var calls []string
-	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+	registerUploadedBlockAddProvisionalRefFn = func(h *FSHelper, orgID, blockID, referrer, libraryID, storageClass string, expiresAt time.Time) error {
 		calls = append(calls, "add")
-		return nil
-	}
-	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
-		calls = append(calls, "expiry")
 		return nil
 	}
 	fenceChecks := 0
@@ -208,7 +202,7 @@ func TestRegisterUploadedBlock_PropagatesFenceWithoutWaitingOrDroppingRef(t *tes
 	if fenceChecks != 1 {
 		t.Fatalf("fenceChecks = %d, want 1 (single read, no wait loop)", fenceChecks)
 	}
-	want := []string{"add", "expiry", "fence"}
+	want := []string{"add", "fence"}
 	if len(calls) != len(want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
 	}
@@ -221,26 +215,23 @@ func TestRegisterUploadedBlock_PropagatesFenceWithoutWaitingOrDroppingRef(t *tes
 
 // TestRegisterUploadedBlock_TagsTransientCassandraIO proves the retryable
 // Cassandra I/O failures in the helper carry ErrBlockMaterializationTransient so
-// the wrapper retries them, and none is mislabeled permanent. The
-// provisional-expiry write is deliberately excluded — it fails closed with a
-// rollback (see TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails).
+// the wrapper retries them, and none is mislabeled permanent. The provisional
+// reference+expiry write is now included: it is a single logged batch, so its
+// failure leaves nothing half-written and is plainly retryable (F10).
 func TestRegisterUploadedBlock_TagsTransientCassandraIO(t *testing.T) {
-	oldAdd := registerUploadedBlockAddReferenceFn
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
-	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	t.Cleanup(func() {
-		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
-		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
 	})
 
 	boom := errors.New("cassandra timeout")
 	// Neutral defaults; each subtest injects a failure at one stage.
 	reset := func() {
-		registerUploadedBlockAddReferenceFn = func(*FSHelper, string, string, string, string, int) error { return nil }
-		registerUploadedBlockUpsertProvisionalExpiryFn = func(*FSHelper, string, string, string, string, time.Time) error { return nil }
+		registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
 		registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
 		registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error { return nil }
 	}
@@ -249,7 +240,9 @@ func TestRegisterUploadedBlock_TagsTransientCassandraIO(t *testing.T) {
 		name  string
 		setup func()
 	}{
-		{"add reference", func() { registerUploadedBlockAddReferenceFn = func(*FSHelper, string, string, string, string, int) error { return boom } }},
+		{"provisional reference + expiry batch", func() {
+			registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return boom }
+		}},
 		{"fence read", func() {
 			registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, boom }
 		}},
@@ -276,19 +269,16 @@ func TestRegisterUploadedBlock_TagsTransientCassandraIO(t *testing.T) {
 // deterministically irrecoverable metadata failure is returned as-is so the
 // wrapper does NOT retry it.
 func TestRegisterUploadedBlock_ReturnsPermanentMetadataFailureUntagged(t *testing.T) {
-	oldAdd := registerUploadedBlockAddReferenceFn
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
-	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	t.Cleanup(func() {
-		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
-		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
 	})
 
-	registerUploadedBlockAddReferenceFn = func(*FSHelper, string, string, string, string, int) error { return nil }
-	registerUploadedBlockUpsertProvisionalExpiryFn = func(*FSHelper, string, string, string, string, time.Time) error { return nil }
+	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
 	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
 	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
 		return fmt.Errorf("upsert: %w", db.ErrBlockMetadataPermanent)
@@ -312,19 +302,16 @@ func TestRegisterUploadedBlock_ReturnsPermanentMetadataFailureUntagged(t *testin
 // signal rather than a hard error, so the materialization wrapper re-probes.
 func TestRegisterUploadedBlock_TranslatesContendedStubRepairToRetryableFence(t *testing.T) {
 	helper := &FSHelper{}
-	oldAdd := registerUploadedBlockAddReferenceFn
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
-	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	t.Cleanup(func() {
-		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
-		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
 	})
 
-	registerUploadedBlockAddReferenceFn = func(*FSHelper, string, string, string, string, int) error { return nil }
-	registerUploadedBlockUpsertProvisionalExpiryFn = func(*FSHelper, string, string, string, string, time.Time) error { return nil }
+	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
 	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
 	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
 		return fmt.Errorf("%w: block block-1 changed before stub repair", db.ErrBlockStubRepairContended)
@@ -338,20 +325,15 @@ func TestRegisterUploadedBlock_TranslatesContendedStubRepairToRetryableFence(t *
 
 func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	helper := &FSHelper{}
-	oldAdd := registerUploadedBlockAddReferenceFn
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
-	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	t.Cleanup(func() {
-		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
-		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
 	})
 
-	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
-		return nil
-	}
 	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
 		return false, nil
 	}
@@ -360,9 +342,9 @@ func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	}
 
 	var expiresAt time.Time
-	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, value time.Time) error {
-		if orgID != "org-1" || blockID != "block-1" || referrer != db.BlockReferrerForUpload("op-1") || storageClass != "hot" {
-			t.Fatalf("expiry args = %s/%s/%s/%s", orgID, blockID, referrer, storageClass)
+	registerUploadedBlockAddProvisionalRefFn = func(h *FSHelper, orgID, blockID, referrer, libraryID, storageClass string, value time.Time) error {
+		if orgID != "org-1" || blockID != "block-1" || referrer != db.BlockReferrerForUpload("op-1") || libraryID != "lib-1" || storageClass != "hot" {
+			t.Fatalf("provisional ref args = %s/%s/%s/%s/%s", orgID, blockID, referrer, libraryID, storageClass)
 		}
 		expiresAt = value
 		return nil
@@ -384,73 +366,57 @@ func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	}
 }
 
-// TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails proves the F10
-// guard: a reference and its expiry projection must land together, so if the
-// projection write fails after the reference was added, the helper releases the
-// reference (and enqueues any now-zero-ref block) instead of leaving an orphan
-// reference that GC Phase 0 cannot discover. It fails closed and does not tag the
-// error transient (a retry would re-add the reference and risk the same split).
-func TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails(t *testing.T) {
+// TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically is F10's closing
+// contract. The reference and its GC expiry tracking used to be two writes with a
+// compensating rollback between them; now they are one logged batch, so the
+// half-written state the rollback existed to repair cannot occur.
+//
+// The regression this guards is a future split back into two calls: that would
+// reopen the window where a reference exists with no discovery projection, which
+// pins the block forever because GC Phase 0 only ever finds provisional refs
+// through that projection. Asserting the batch fails as one unit — nothing runs
+// after it, nothing is compensated, and the error is retryable — is what makes a
+// re-split visible.
+func TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically(t *testing.T) {
 	helper := &FSHelper{}
-	oldAdd := registerUploadedBlockAddReferenceFn
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
-	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
-	oldRelease := registerUploadedBlockReleaseRefsFn
-	oldEnqueue := registerUploadedBlockEnqueueZeroRefFn
 	t.Cleanup(func() {
-		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
-		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
-		registerUploadedBlockReleaseRefsFn = oldRelease
-		registerUploadedBlockEnqueueZeroRefFn = oldEnqueue
 	})
 
-	var calls []string
-	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
-		calls = append(calls, "add")
-		return nil
+	batchErr := errors.New("batch write failed")
+	addCalls := 0
+	registerUploadedBlockAddProvisionalRefFn = func(h *FSHelper, orgID, blockID, referrer, libraryID, storageClass string, expiresAt time.Time) error {
+		addCalls++
+		if expiresAt.IsZero() {
+			t.Fatal("provisional reference must be written with its expiry, never without")
+		}
+		return batchErr
 	}
 	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
-		t.Fatal("fence check should not run when expiry tracking fails")
+		t.Fatal("fence check must not run once the provisional write failed")
 		return false, nil
 	}
 	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
-		t.Fatal("metadata upsert should not run when expiry tracking fails")
+		t.Fatal("metadata upsert must not run once the provisional write failed")
 		return nil
-	}
-	expiryErr := errors.New("expiry write failed")
-	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
-		calls = append(calls, "expiry")
-		return expiryErr
-	}
-	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
-		calls = append(calls, "release")
-		if len(blockIDs) != 1 || blockIDs[0] != "block-1" {
-			t.Fatalf("release blockIDs = %#v, want []string{\"block-1\"}", blockIDs)
-		}
-		return []string{"block-1"}
-	}
-	registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string, storageClass string) {
-		calls = append(calls, "enqueue")
 	}
 
 	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
-	if !errors.Is(err, expiryErr) {
-		t.Fatalf("RegisterUploadedBlock() error = %v, want wrapped %v", err, expiryErr)
+	if !errors.Is(err, batchErr) {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want wrapped %v", err, batchErr)
 	}
-	if errors.Is(err, ErrBlockMaterializationTransient) {
-		t.Fatalf("expiry-write failure must fail closed, not be retried: %v", err)
+	// Retryable: an all-or-nothing batch leaves nothing behind, so re-running it is
+	// safe — unlike the old split write, whose retry could re-add a reference.
+	if !errors.Is(err, ErrBlockMaterializationTransient) {
+		t.Fatalf("atomic provisional write failure must be retryable: %v", err)
 	}
-	want := []string{"add", "expiry", "release", "enqueue"}
-	if len(calls) != len(want) {
-		t.Fatalf("calls = %#v, want %#v", calls, want)
-	}
-	for i := range want {
-		if calls[i] != want[i] {
-			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
-		}
+	if addCalls != 1 {
+		t.Fatalf("provisional write calls = %d, want exactly 1 (reference and expiry are one write)", addCalls)
 	}
 }
 

@@ -955,6 +955,25 @@ func (db *DB) BlockHasReferences(orgID, blockID string) (bool, error) {
 	return true, nil
 }
 
+// BlockReferenceExists reports whether one specific (block, referrer) reference
+// row is still present. GC Phase 0 uses it to tell "this provisional reference
+// has been retired by its Cassandra TTL" from "the row is still there", which is
+// what lets the scanner wait for the TTL instead of deleting a reference an
+// upload may have just renewed (F9).
+func (db *DB) BlockReferenceExists(orgID, blockID, referrer string) (bool, error) {
+	var existing string
+	err := db.Session().Query(`
+		SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgID, blockID, referrer).Scan(&existing)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // BlockGCState returns the block's gc_state ("" when unset or the block row is
 // absent). Writers consult it to back off while the GC worker is mid-delete.
 func (db *DB) BlockGCState(orgID, blockID string) (string, error) {

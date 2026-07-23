@@ -613,9 +613,9 @@ benchmark script that already documented it as "not a correctness benchmark".
   `block_upload_session_required`** before the body is read, so it can neither
   allocate the block buffer nor leave an unreferenced S3 object (F8). The whole
   legacy branch — `getBlockStore` → `BlockExists` → per-block quota → `PutBlockData`
-  — is deleted. Past the guard, `resolution` is provably `uploadSessionValid`; a
-  defensive `respondBlockUploadSessionRequired` stands where the dead branch was so
-  a future regression fails loudly instead of leaking again.
+  — is deleted. Past the guard, `resolution` is provably `uploadSessionValid`, so the
+  session branch was unwrapped and the unreachable tail removed rather than kept as a
+  defensive assertion: a 400 no request can reach asserts nothing.
 - `v2/blocks.go` `CheckBlocks`: the paired no-session existence oracle is removed the
   same way. A code comment had explicitly tied it to the no-session upload it served
   ("PR-7 will govern and canonicalize both together"); with the writer gone it is a
@@ -663,6 +663,62 @@ deleting a possibly-renewed reference), `internal/db/provisional_block_ref_expir
 
 **Independent of the upload series** — could land at any point. Listed late only
 because it is lower risk, not because it is blocked.
+
+**The two findings turned out to be one mechanism.** F10 (write the reference and its
+tracking atomically) is what makes F9's fix possible: the batch derives the reference's
+Cassandra TTL from the very `expires_at` it records, so "the reference cannot outlive
+its tracker" stops being a convention two call sites happen to honour and becomes true
+by construction. Phase 0 can then *wait* for that TTL instead of deleting anything.
+
+**F9 — the scanner stops deleting references.** The old flow read the canonical expiry,
+saw it due, and deleted the `up:` reference. Between those two steps an upload can renew
+the same referrer, and deleting a renewed reference unpins a live upload — after which
+the block reaches zero references and GC may delete data still being written. The new
+flow asks a different question: *is the reference still there?*
+- **Still present** → the TTL has not retired it (or a renewal just re-added it). Nothing
+  is known about liveness, so the record is deferred to a later cycle and **the day
+  cursor is held back to its day**. Without that, a deferred record on a day the cursor
+  passed would never be scanned again — trading the premature delete for a silent leak.
+- **Gone** → the reference provably expired. Only now is `BlockHasReferences` meaningful,
+  and a zero-ref block is promoted to a candidate.
+- The tracker is then retired with **CAS on `expires_at`**, closing the mirror-image race:
+  a renewal landing after the liveness read must keep its tracking, or its reference would
+  later expire with nothing left to notice the block went to zero.
+
+**F10 — one logged batch, no compensating rollback.** `AddProvisionalBlockReferenceWithExpiry`
+writes `block_references` (with the derived TTL), the canonical expiry row and its by-day
+discovery projection together, retracting a superseded projection in the same batch. The
+PR-3 interim guard — on an expiry-write failure, release the reference and enqueue any
+now-zero-ref block — is deleted along with the split write it compensated for: with an
+all-or-nothing batch there is no half-written state, so the failure is simply retryable.
+
+**On the new LWT (in the shadow of X4).** The CAS delete is a Paxos round, and this
+series is otherwise trying to *remove* per-block LWTs. It is deliberately accepted here
+and does not have X4's shape: it runs in the GC scanner, not the upload hot path; it
+fires once per *abandoned* provisional ref (the normal path releases its own tracker
+without a compare), not per block per upload; and it replaces no cheaper alternative —
+an unconditional delete is what loses a renewal's tracking. One background round per
+abandoned upload is not the ~128 cross-region rounds per GB that X4 is about.
+
+**Dead code removed with the paths that used them:** `UpsertProvisionalBlockReferenceExpiry`
+(tracking-only write, no caller once the atomic entry point exists — and reintroducing one
+would be F10 again), the GC store's unconditional `DeleteProvisionalBlockRefExpiry`, and the
+two rollback hooks in `fs_helpers.go`.
+
+**Acceptance (met):**
+- `TestScanner_ScanExpiredProvisionalBlockRefs_NeverDeletesALiveReference` — reference still
+  present at deadline: it survives, no candidate is created, the tracker stays, and the
+  cursor does not advance past its day. Verified by reintroducing the old
+  `RemoveBlockReference` call: the test fails.
+- `TestScanner_ScanExpiredProvisionalBlockRefs_KeepsTrackerWhenRenewedMidPass` — a renewal
+  injected at the liveness read (the last point before the tracker is retired) must leave
+  the renewed tracker intact. Verified by swapping the CAS for the unconditional delete:
+  the test fails.
+- `TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically` — one call, nothing runs
+  after its failure, nothing is compensated, and the error is retryable.
+- Existing Phase 0 tests were retargeted rather than deleted: they now stage the state the
+  TTL actually produces (reference already gone) instead of the state only the old
+  self-deleting scanner produced.
 
 ---
 
