@@ -277,7 +277,8 @@ to repair a block deleted by a GC cycle whose fence cleared before publication.
 **Scope (not global):** this fixes the server-side hot upload paths only. The
 `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData` still do
 `Exists` + `PutAuto` and remain in use by legacy callers. The no-session branch of
-`v2/blocks.go` remains deferred to PR-7. The HEAD was not removed globally.
+`v2/blocks.go` was removed in PR-7 (finding F8), so it is no longer a pending
+migration. The HEAD was not removed globally.
 
 Tests: `ProbeBlockReuse` decision matrix (`block_references_test.go`),
 reusable/needs-put `finalizeUploadStreaming` paths (`seafhttp_test.go`),

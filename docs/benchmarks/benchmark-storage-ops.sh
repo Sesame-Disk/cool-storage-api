@@ -42,38 +42,13 @@ echo "=========================================="
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
-# --- Block Upload ---
-# NOTE: this intentionally exercises the legacy no-session POST /api/v2/blocks/upload
-# path for raw storage timing. That path stores bytes but does NOT materialize the
-# block metadata/reference rows used by the web session flow, so it must not be
-# treated as a correctness benchmark for resumable web uploads.
-echo
-echo "--- Block Upload (POST /api/v2/blocks/upload) ---"
-for size_kb in 64 256 1024 4096; do
-  dd if=/dev/urandom of="$TMPDIR/block.bin" bs=1K count="$size_kb" 2>/dev/null
-
-  start=$(date +%s%N)
-  result=$(curl -sS $INSECURE -w "\n%{http_code}" \
-    -X POST "$HOST/api/v2/blocks/upload" \
-    "${AUTH[@]}" \
-    -H "Content-Type: application/octet-stream" \
-    --data-binary "@$TMPDIR/block.bin" \
-    --max-time 30 2>/dev/null)
-  end=$(date +%s%N)
-
-  code=$(echo "$result" | tail -1)
-  body=$(echo "$result" | head -1)
-  ms=$(( (end - start) / 1000000 ))
-
-  hash=""
-  if echo "$body" | grep -q '"hash"'; then
-    hash=$(echo "$body" | grep -o '"hash":"[^"]*"' | cut -d'"' -f4 | head -c 16)
-  fi
-
-  printf "  %5dKB -> HTTP %s  %5dms" "$size_kb" "$code" "$ms"
-  [ -n "$hash" ] && printf "  hash=%s..." "$hash"
-  echo
-done
+# NOTE: the "Block Upload (POST /api/v2/blocks/upload)" benchmark was removed.
+# It timed the legacy no-session upload path, which was removed (it stored bytes
+# with no metadata/reference — an unreferenced S3 orphan, finding F8 — and had no
+# real client). The endpoint now requires an X-Block-Upload-Session and rejects a
+# session-less POST with 400 block_upload_session_required, so this loop only
+# measured a doomed request. Raw storage timing has no standalone endpoint anymore;
+# the resumable/session upload path is measured by the file upload benchmark below.
 
 # NOTE: the "Block Download (GET /api/v2/blocks/:hash)" benchmark was removed:
 # the bare-hash block read endpoint no longer exists (it was an unauthorized

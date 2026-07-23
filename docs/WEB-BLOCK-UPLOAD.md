@@ -62,9 +62,9 @@ the destination library's `representation_id` domain (`plain:v1` or
   no longer applies the user's *logical* storage quota per block. That quota is a
   property of the final file delta and is decided once at `file-from-blocks`;
   charging it per staged block wrongly rejected valid cases like a same-size
-  overwrite (delta ≈ 0). Traffic is still charged per block, and the legacy
-  no-session path keeps its per-block admission check (covered by an integration
-  test).
+  overwrite (delta ≈ 0). Traffic is still charged per block. (PR-7 removed the
+  legacy no-session upload path entirely — see R2 — so a session is now the only
+  way to upload a block.)
 - **Retry no longer re-hashes a large file inside the same tab/session:** a
   failed block upload still retries with a **fresh server session** and a fresh
   authoritative `/blocks/check`, but the frontend now keeps the computed local
@@ -144,11 +144,13 @@ re-reading this section.
   runs `db.ProbeBlockReuse` per block and only accepts `Reusable` (metadata +
   live reference + no GC fence). `NeedsPut`/`BlockedByGC` → returned in
   `needs_upload`.
-- **R2 — Anti-orphan is P0.** A block uploaded via the legacy `/blocks/upload`
-  (no session) is an S3 object with **no Cassandra metadata/ref** and can leak.
-  The session flow materializes a provisional reference with TTL
-  (`gc_provisional_block_refs`), so an abandoned upload self-expires and the GC
-  sweeper reclaims it.
+- **R2 — Anti-orphan is P0.** The legacy no-session `/blocks/upload` used to write
+  an S3 object with **no Cassandra metadata/ref**, which could leak (finding F8).
+  PR-7 removed that path: a session-less `/blocks/upload` (and `/blocks/check`) now
+  returns 400 `block_upload_session_required` before any store I/O, so the orphan
+  can no longer be created. The session flow — the only upload path now —
+  materializes a provisional reference with TTL (`gc_provisional_block_refs`), so an
+  abandoned upload self-expires and the GC sweeper reclaims it.
 - **R3 — Session-aware check.** session-mode `/blocks/check` reports a block as
   `existing` only when `ProbeBlockReuse == Reusable`, not merely present in S3 —
   avoiding the "exists in S3 but unmaterialized → commit says NeedsPut" trap.
