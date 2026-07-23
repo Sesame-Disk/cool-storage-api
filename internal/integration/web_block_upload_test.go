@@ -299,6 +299,23 @@ func TestNoSessionBlockEndpointsRejected(t *testing.T) {
 	hash := sha256hex(content)
 
 	t.Run("upload without a session is rejected and stores nothing", func(t *testing.T) {
+		// The store is resolved and the teardown registered BEFORE the request,
+		// not after. If a regression restored the old behaviour and stored the
+		// block, asserting the 400 first would t.Fatalf and skip a cleanup
+		// registered later — leaking into MinIO the exact orphan this test guards
+		// against. The store is also mandatory: without it the physical check
+		// cannot run, and a silent skip would let this pass without proving the
+		// end-to-end property it exists for.
+		store := blockStoreForCleanupOrNil(t, defaultOrgID)
+		if store == nil {
+			t.Fatal("cannot verify the anti-orphan property: block store unavailable")
+		}
+		t.Cleanup(func() {
+			if err := store.DeleteBlock(context.Background(), hash); err != nil {
+				t.Errorf("cleanup rejected-upload block %s: %v", hash, err)
+			}
+		})
+
 		req, err := http.NewRequest(http.MethodPost, adminClient.baseURL+"/api/v2/blocks/upload", bytes.NewReader(content))
 		if err != nil {
 			t.Fatalf("new upload request: %v", err)
@@ -313,17 +330,12 @@ func TestNoSessionBlockEndpointsRejected(t *testing.T) {
 		}
 		assertBlockUploadSessionRequired(t, resp)
 
-		if store := blockStoreForCleanupOrNil(t, defaultOrgID); store != nil {
-			// Best-effort teardown in case a regression DID store it, so this test
-			// cannot itself leak the orphan it exists to guard against.
-			t.Cleanup(func() { _ = store.DeleteBlock(context.Background(), hash) })
-			exists, err := store.BlockExists(context.Background(), hash)
-			if err != nil {
-				t.Fatalf("check S3 object: %v", err)
-			}
-			if exists {
-				t.Fatal("a rejected no-session upload still stored an S3 object (F8 regression)")
-			}
+		exists, err := store.BlockExists(context.Background(), hash)
+		if err != nil {
+			t.Fatalf("check S3 object: %v", err)
+		}
+		if exists {
+			t.Fatal("a rejected no-session upload still stored an S3 object (F8 regression)")
 		}
 	})
 
