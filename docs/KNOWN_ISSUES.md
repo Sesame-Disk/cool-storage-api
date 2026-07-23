@@ -4660,6 +4660,194 @@ apply. No reconcile/backfill pass is required before launch.
 
 ---
 
+### ISSUE-DOWNLOAD-NO-404-01: SeafHTTP download can never report a file as gone
+
+**Status**: 🟡 Accepted trade-off (PR-6) — **decision deferred**, see Fix Direction
+**Severity**: Medium — operational cost and a cross-layer inconsistency, not data loss
+**Affected**: `GET /seafhttp/files/:token/*filepath` and the ZIP directory walk
+
+#### Problem
+
+PR-6 made download fail closed. Absence is never reported: a validated directory
+listing that does not name the entry produces the internal `errDirEntryAbsent`
+sentinel, but the HTTP classifier maps it to **503 + `Retry-After`**, exactly like
+dangling metadata and corruption. The endpoint therefore has **no 404 at all**.
+
+The reason absence cannot be trusted: production metadata reads use `LOCAL_QUORUM`,
+and `access_tokens` and `libraries`/`fs_objects` are independent partitions with no
+global replication order. A node can serve a freshly minted download token while
+reading a directory listing that has not replicated yet, so "the listing does not
+name it" may simply mean "this DC has not seen the create". Answering 404 there
+tells a sync client the file was deleted, and it may drop its local copy — the
+failure mode PR-6 exists to prevent.
+
+**Accepted costs:**
+
+1. **A genuinely deleted file never says so.** It answers 503 forever, so clients
+   retry until their own budget runs out. Reaching this state requires the file to
+   be deleted between token issuance and use, so the window is narrow, but the
+   retries are unbounded work for a request that can never succeed.
+2. **The layers disagree.** `internal/api/v2` still answers 404 for a missing file
+   or directory; only the SeafHTTP download surface is 503-only. A client that talks
+   to both sees two different answers for the same missing path.
+
+An earlier draft of the PR-6 plan specified "404 only when a directory was read,
+fully validated, and does not list the entry". That was reversed deliberately; this
+entry records the reversal and its price so it is not rediscovered as a bug.
+
+#### Fix Direction
+
+**Deployment context (confirmed 2026-07-23).** Production is multi-DC with one
+region each in the Americas, Asia and Europe, and measured cross-DC latency of
+**several seconds**. That settles two things:
+
+1. The stale-snapshot window this issue exists for is real and wide, not
+   theoretical. A local listing can trail another region by seconds, so a local
+   miss is a weak signal for absence. Keeping 404 out of the download surface is
+   the right default for this topology.
+2. Any fix that adds a global consensus read to the hot path is rejected on
+   principle — the project already avoids Paxos in hot paths for this reason.
+   `ALL`, global `QUORUM` and `SERIAL` are all off the table, and not only
+   because two of them are unsound here (`QUORUM` has no guaranteed intersection
+   with a local write quorum across DCs; `SERIAL` only linearizes LWTs on one
+   partition and does not order `access_tokens`, `libraries`, `commits` and
+   `fs_objects` relative to each other).
+
+**Deferred decision.** Whether to reintroduce a 404 at all, and at what cost, is
+an open product decision. It is NOT blocking PR-6: the current behaviour is the
+safe direction, and the cost is retries plus a cross-layer inconsistency, not
+data loss. Revisit when someone owns the client-retry budget question.
+
+The only viable direction identified so far, because it needs no global read:
+
+- Carry the commit id the token was minted against, and treat "listing older than
+  that commit" as unproven rather than absent. It separates replication lag from a
+  real delete using only local reads, so it costs nothing on the hot path.
+
+Rejected, recorded so they are not re-proposed:
+
+- **Read at `ALL` on the miss path.** It is the only consistency that can observe
+  every replica under ordinary `LOCAL_QUORUM` writes, but with several seconds of
+  cross-DC latency it turns every miss into a multi-second request, and one
+  unreachable replica turns it into an error. Unacceptable on a download path.
+- **Global `QUORUM` or `SERIAL`.** Unsound here regardless of cost: `QUORUM` has no
+  guaranteed intersection with a local write quorum across DCs, and `SERIAL` only
+  linearizes LWTs on a single partition — it does not order `access_tokens`,
+  `libraries`, `commits` and `fs_objects` relative to each other.
+- **Restrict the 404 to single-DC deployments.** Production is multi-DC in all
+  regions, so this would be dead configuration.
+
+Revisit alongside X2 (multi-DC reasoning is derived, never reproduced) in
+`docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`.
+
+#### Related Docs
+
+- `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-6 scope and contract)
+- `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (F5, F13, X2)
+
+---
+
+### ISSUE-ENCRYPTED-FLAG-UNCHECKED-01: A failed `encrypted` probe defaulted to "not encrypted"
+
+**Status**: ✅ Fixed (2026-07-22) — all six fail-open sites closed; kept as the rationale record
+**Severity**: was High (durable plaintext in an encrypted library; two authorization gates opened by a timeout)
+**Affected**: `internal/api/v2` — `files.go`, `batch_operations.go`, `fileview.go`, `sharelink_view.go`
+
+#### Problem
+
+The library encryption flag was read as `Scan(&encrypted)` with the error either
+**discarded** or explicitly turned into "allow". Go leaves `encrypted` false on
+failure, so any transient Cassandra error — a timeout, a coordinator hiccup,
+cross-DC lag — was indistinguishable from "this library is not encrypted", and the
+caller took the plaintext branch.
+
+Six sites, in two classes. The distinction matters: the first class corrupts or
+exposes data, the second bypasses an authorization gate.
+
+**Class A — error discarded, plaintext branch taken:**
+
+| Site | Consequence |
+|---|---|
+| `files.go` `UploadFile` | **Persisted plaintext into a library the user believes is encrypted.** Durable, and not detectable afterwards from the stored object. The worst of the six. |
+| `fileview.go` `ServeRawFile` | Streamed ciphertext to the viewer labelled as the real content. |
+| `sharelink_view.go` `handleShareLinkRaw` | Served ciphertext as a `200` on a **public, unauthenticated** surface. |
+| `sharelink_view.go` `readFileContentAsText` | Embedded ciphertext into a share-link preview as if it were the file's text. |
+
+**Class B — error converted into permission (`return true`):**
+
+| Site | Consequence |
+|---|---|
+| `files.go` `requireDecryptSession` | A probe failure granted access to an encrypted library with no decrypt session. Guards **20 call sites**. |
+| `batch_operations.go` `checkDecryptSession` | Same, guarding 2 call sites. |
+
+Both Class B comments read "Library not found - let the caller handle it", which is
+the reasoning error: `err != nil` covers a timeout as well as a missing row, and only
+one of those is safe to treat as "no library, no encryption".
+
+PR-6 found and fixed this shape first in SeafHTTP's `HandleZipDownload`, which had the
+same discarded error and produced a `200` ZIP of ciphertext.
+
+#### Fix
+
+`libraryIsEncrypted` in `internal/api/v2/encryption.go` is now the single probe and
+propagates its error; `seafHTTPLookupLibraryEncryptedFn` is its SeafHTTP twin. Each
+caller fails closed **in whatever way its own contract allows**, which is not one
+uniform response:
+
+- handlers with a `gin.Context` emit `respondEncryptionProbeUnavailable` — a
+  retryable `503` + `Retry-After`, deliberately **not** `403 lib_need_decrypt`,
+  because a failed probe means we do not know whether the library is encrypted and
+  the client must retry rather than be told to prompt for a password;
+- `readFileContentAsText` now returns `(string, error)`. It reports `("", nil)`
+  only where there is genuinely nothing to inline (no target entry, over the 1MB
+  limit) and an error otherwise, which the share bootstrap turns into 503 for a
+  transient failure and 403 for a locked encrypted library — matching what the raw
+  share-link surface already answered for that state. Returning `""` for either
+  case rendered a non-empty document as a silently blank 200;
+- the two guards return `false` after writing the 503, so the gate closes.
+
+Three further probes (`block_upload_session.go`, and the two historic-file paths in
+`fileview.go`) already failed closed and were left as they were.
+
+**A missing library row now answers 503 too, and that is deliberate.**
+`libraryIsEncrypted` propagates `gocql.ErrNotFound` like any other error, so a
+library that has no row for `(org_id, library_id)` produces the retryable 503
+rather than falling through to the handler's own not-found handling. The two
+Class B comments justified their `return true` as "library not found", but a
+`LOCAL_QUORUM` read cannot tell a genuinely absent library from one this DC has
+not replicated yet — the same reasoning as `ISSUE-DOWNLOAD-NO-404-01`, and
+treating the missing row as "not encrypted" is exactly the permissive default
+this issue exists to remove.
+
+The reachability is narrow, which is why it is recorded rather than mitigated:
+`orgID` always comes from the caller's own context (`c.GetString("org_id")`), so
+libraries are org-scoped with no cross-org read pattern, and every handler runs
+its permission check first — `HasLibraryAccessCtx` fails for a library that does
+not exist and `respondIfLibraryMissing` answers the proper 404 there. What is
+left is the race where the library is deleted between the permission check and
+the probe, where 503 is the honest answer. If a surface ever needs to
+distinguish the two, it must resolve absence explicitly before the probe, not by
+reading a failed probe as permission.
+
+**Gate ordering is part of the contract, not just the probe.** `ServeRawFile`
+originally ran its ETag revalidation *before* the probe. `Cache-Control: private,
+no-cache` lets a browser keep the decrypted bytes and only forces revalidation, so a
+`304` re-authorised a cached plaintext copy after the decrypt session expired, and
+also hid the probe-failure `503` from any request carrying `If-None-Match`. The gate
+now precedes every short circuit and every write in all four handlers, pinned by
+`TestEncryptionGateRunsBeforeShortCircuitsAndWrites`, which compares the source
+positions of the two calls — a helper-level unit test cannot observe ordering.
+
+**Watch for recurrence:** the general shape is a discarded `Scan` error on a flag
+whose zero value is the permissive answer. A new probe that bypasses
+`libraryIsEncrypted` reintroduces it.
+
+#### Related Docs
+
+- `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-6 fixed the SeafHTTP ZIP instance first)
+
+---
+
 ## See Also
 
 - [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) - Component completion status

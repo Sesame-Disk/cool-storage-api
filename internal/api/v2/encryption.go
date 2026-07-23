@@ -25,6 +25,36 @@ import (
 // frontend/src/utils/upload-finalization.js) instead of a generic 500.
 var ErrLibraryEncryptedNotUnlocked = errors.New("library is encrypted and not unlocked")
 
+// libraryIsEncrypted probes the library encryption flag and PROPAGATES the error.
+//
+// The bug this exists to prevent: `Scan(&encrypted)` with the error discarded (or
+// turned into "allow") leaves encrypted=false on any transient Cassandra failure,
+// which is indistinguishable from "this library is not encrypted". Callers then
+// take the plaintext branch — storing plaintext into an encrypted library, serving
+// ciphertext as content, or skipping the decrypt-session gate entirely. Every
+// caller must fail closed in whatever way its own contract allows; see
+// ISSUE-ENCRYPTED-FLAG-UNCHECKED-01.
+// It is a var so tests can drive the probe-failure branch directly; there is no
+// other way to make a real session fail on demand.
+var libraryIsEncrypted = func(database *db.DB, orgID, repoID string) (bool, error) {
+	var encrypted bool
+	err := database.Session().Query(`
+		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&encrypted)
+	return encrypted, err
+}
+
+// respondEncryptionProbeUnavailable emits the retryable answer for a failed
+// encryption probe. It is deliberately NOT the 403 lib_need_decrypt contract:
+// we do not know whether the library is encrypted, so the client must retry
+// rather than be told to prompt for a password.
+func respondEncryptionProbeUnavailable(c *gin.Context) {
+	c.Header("Retry-After", "1")
+	c.JSON(http.StatusServiceUnavailable, gin.H{
+		"error": "library encryption state is temporarily unavailable; retry",
+	})
+}
+
 // DecryptSession tracks which libraries a user has unlocked and their file keys
 type DecryptSession struct {
 	UnlockedAt        time.Time

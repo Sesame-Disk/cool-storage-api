@@ -1298,6 +1298,17 @@ var seafHTTPResolveBlockRepresentationIDFn = func(h *SeafHTTPHandler, orgID, rep
 	return h.resolveBlockRepresentationID(orgID, repoID)
 }
 
+// seafHTTPLookupLibraryEncryptedFn is the shared encrypted-library probe for
+// file and ZIP download. Ignoring its error previously made ZIP treat a
+// Cassandra failure as "not encrypted" and stream ciphertext as a 200.
+var seafHTTPLookupLibraryEncryptedFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+	var encrypted bool
+	err := h.db.Session().Query(`
+		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&encrypted)
+	return encrypted, err
+}
+
 func (b *zipTraversalBudget) noteDirectory(depth int) error {
 	if depth > b.maxDepth {
 		return &zipLimitError{message: fmt.Sprintf("zip download exceeds maximum directory depth of %d", b.maxDepth)}
@@ -1478,19 +1489,6 @@ func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID strin
 	}
 
 	return nil, libraryClass, fmt.Errorf("block storage not available")
-}
-
-func (h *SeafHTTPHandler) resolveLibraryObjectStore(hostname, orgID, repoID string) (storage.Store, string, error) {
-	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
-	if h.storageManager != nil {
-		preferredClass := h.storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
-		return h.storageManager.GetHealthyBackend(preferredClass)
-	}
-	if h.storage != nil {
-		return h.storage, libraryClass, nil
-	}
-
-	return nil, libraryClass, fmt.Errorf("storage not available")
 }
 
 // uploadBlockSize is the block size used when splitting large uploads into blocks.
@@ -3479,6 +3477,54 @@ func (h *SeafHTTPHandler) createDirectoryFSObject(repoID string, entries []map[s
 
 // HandleDownload handles file downloads via the download token.
 // Streams content block-by-block to avoid loading entire files into RAM.
+// downloadPermissionChecker is the slice of the permission middleware the
+// download gate needs. It exists so the gate's real decision logic can be driven
+// against a revoked permission in a test: asserting only that the handlers call
+// a hook, or that the source mentions the right method names, would still pass
+// for an implementation that ignores what those methods return.
+type downloadPermissionChecker interface {
+	HasLibraryAccess(orgID, userID, repoID string, required middleware.LibraryPermission) (bool, error)
+	RequirePermFlagForRepo(c *gin.Context, repoID string, flag string) bool
+}
+
+// authorizeSeafHTTPDownload is the ONE download gate, shared by the single-file
+// and ZIP endpoints. They previously carried separate copies and drifted: ZIP
+// checked read access but not the granular "download" flag, so after an admin
+// revoked download while leaving read intact, /seafhttp/files/:token answered
+// 403 while /seafhttp/zip/:token still handed over the whole directory with the
+// same still-valid token (they live up to an hour). One gate, one contract.
+//
+// It writes the response and returns false when access is denied.
+func authorizeSeafHTTPDownload(h *SeafHTTPHandler, c *gin.Context, token *AccessToken) bool {
+	if h.permMiddleware == nil {
+		return true
+	}
+	return authorizeDownloadWithChecker(h.permMiddleware, c, token)
+}
+
+func authorizeDownloadWithChecker(perms downloadPermissionChecker, c *gin.Context, token *AccessToken) bool {
+	hasRead, err := perms.HasLibraryAccess(token.OrgID, token.UserID, token.RepoID, middleware.PermissionR)
+	if err != nil {
+		log.Printf("[seafhttp] Failed to check permissions repo=%s: %v", token.RepoID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
+		return false
+	}
+	if !hasRead {
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have read access to this library"})
+		return false
+	}
+
+	c.Set("org_id", token.OrgID)
+	c.Set("user_id", token.UserID)
+	if !perms.RequirePermFlagForRepo(c, token.RepoID, "download") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "download is not allowed by your permission"})
+		return false
+	}
+	return true
+}
+
+var seafHTTPAuthorizeDownloadFn = authorizeSeafHTTPDownload
+
 func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	tokenStr := c.Param("token")
 	requestedPath := c.Param("filepath")
@@ -3495,26 +3541,8 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 
 	log.Printf("[HandleDownload] Token valid: OrgID=%s, RepoID=%s, Path=%s", token.OrgID, token.RepoID, token.Path)
 
-	// Permission check: user must have read access to the library
-	if h.permMiddleware != nil {
-		hasRead, err := h.permMiddleware.HasLibraryAccess(token.OrgID, token.UserID, token.RepoID, middleware.PermissionR)
-		if err != nil {
-			log.Printf("[HandleDownload] Failed to check permissions: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
-			return
-		}
-		if !hasRead {
-			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have read access to this library"})
-			return
-		}
-
-		// Granular flag check: download must be allowed
-		c.Set("org_id", token.OrgID)
-		c.Set("user_id", token.UserID)
-		if !h.permMiddleware.RequirePermFlagForRepo(c, token.RepoID, "download") {
-			c.JSON(http.StatusForbidden, gin.H{"error": "download is not allowed by your permission"})
-			return
-		}
+	if !seafHTTPAuthorizeDownloadFn(h, c, token) {
+		return
 	}
 
 	// Get filename from path
@@ -3538,58 +3566,46 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 		}
 	}
 
-	// Try to stream file from block storage (content-addressed)
-	// This is the normal flow for SesameFS files
-	if h.db != nil && h.storageManager != nil {
-		log.Printf("[HandleDownload] Attempting block-based streaming download")
-		err := h.streamFileFromBlocks(c, token, filename, downloadTrafficStatus.PeriodStartedAt)
-		if err == nil {
-			return
-		}
-		log.Printf("[HandleDownload] Block-based streaming FAILED: %v", err)
-		// If block-based retrieval fails, fall back to direct S3 path-based retrieval
-	} else {
+	// Block storage is the ONLY download path. The legacy <org>/<repo><path>
+	// object fallback was removed with PR-6: it fired on ANY streaming failure,
+	// including a Cassandra timeout, so on a library since written through blocks
+	// it could answer 200 with an older version of the same path, and answered 404
+	// when the object was simply absent. Production starts from empty buckets, so
+	// no path-based object exists to read.
+	if h.db == nil || h.storageManager == nil {
 		log.Printf("[HandleDownload] Block storage not available (db=%v, storageManager=%v)", h.db != nil, h.storageManager != nil)
-	}
-
-	// Fallback: Stream directly from the resolved object store.
-	objectStore, _, err := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage not available"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("storage not available"))
 		return
 	}
 
-	storageKey := fmt.Sprintf("%s/%s%s", token.OrgID, token.RepoID, token.Path)
-
-	reader, err := objectStore.Get(c.Request.Context(), storageKey)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+	if err := h.streamFileFromBlocks(c, token, filename, downloadTrafficStatus.PeriodStartedAt); err != nil {
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, err)
 		return
 	}
-	defer reader.Close()
+}
 
-	// Stream directly to response — never load full file into RAM
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
-	c.Header("Content-Type", "application/octet-stream")
-	c.Status(http.StatusOK)
-	bytesBefore := int64(c.Writer.Size())
-	buf := streaming.GetCopyBuf()
-	defer streaming.PutCopyBuf(buf)
-	if _, err := io.CopyBuffer(c.Writer, reader, buf); err != nil {
-		log.Printf("[HandleDownload] Streaming error: %v", err)
+// respondSeafHTTPDownloadError applies the fail-closed download contract. Metadata
+// reads use LOCAL_QUORUM, so even a valid directory listing without an entry may be
+// an older cross-DC snapshot. No local absence observation is strong enough to tell
+// a sync client that the file was deleted; all metadata/read failures are retryable
+// 503s unless they have a distinct non-retryable application contract.
+//
+// It writes nothing once the response has been committed, because streaming may
+// have already sent headers and part of the body.
+func respondSeafHTTPDownloadError(c *gin.Context, repoID, path string, err error) {
+	if c.Writer.Written() {
+		log.Printf("[HandleDownload] streaming aborted after headers repo=%s path=%s: %v", repoID, path, err)
+		return
 	}
-
-	// Record traffic for the S3 fallback path.
-	if rec := traffic.Get(); rec != nil {
-		sent := int64(c.Writer.Size()) - bytesBefore
-		if sent > 0 {
-			tt := traffic.WebDownload
-			if token.Source == "link" {
-				tt = traffic.LinkDownload
-			}
-			traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, token.OrgID, token.UserID, tt, sent)
-		}
+	if errors.Is(err, v2.ErrLibraryEncryptedNotUnlocked) {
+		// Not transient: retrying without a decrypt session can never succeed.
+		// Emit the app-wide 403 { lib_need_decrypt: true } the frontend keys off.
+		writeLibraryEncryptedNotUnlocked(c)
+		return
 	}
+	log.Printf("[HandleDownload] download unavailable repo=%s path=%s: %v", repoID, path, err)
+	c.Header("Retry-After", "1")
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "file is temporarily unavailable; retry"})
 }
 
 // resolveBlockID translates a client-facing block id to the internal SHA-256
@@ -3620,11 +3636,8 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string,
 // lookupFileBlocks resolves a token's path to its block IDs, file size, encryption key, and block store.
 // This is the common metadata lookup used by both download and streaming paths.
 func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, fileIV []byte, blockStore *storage.BlockStore, storageClass string, err error) {
-	// Check encryption
-	var encrypted bool
-	err = h.db.Session().Query(`
-		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, token.OrgID, token.RepoID).Scan(&encrypted)
+	// Check encryption. A read failure must NOT fall through as "not encrypted".
+	encrypted, err := seafHTTPLookupLibraryEncryptedFn(h, token.OrgID, token.RepoID)
 	if err != nil {
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("failed to check library encryption: %w", err)
 	}
@@ -3632,7 +3645,10 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	if encrypted {
 		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
-			return nil, 0, nil, nil, nil, "", fmt.Errorf("library is encrypted but not unlocked")
+			// Must stay a distinct sentinel: this is not a transient failure, and
+			// answering 503 would make the client retry forever instead of
+			// prompting for the password.
+			return nil, 0, nil, nil, nil, "", v2.ErrLibraryEncryptedNotUnlocked
 		}
 	}
 
@@ -3665,25 +3681,38 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 
 	currentFSID := rootFSID
 	for i := 0; i < len(pathParts)-1; i++ {
-		nextFSID, err := h.findEntryInDir(token.RepoID, currentFSID, pathParts[i])
+		entry, err := h.findValidatedEntryInDir(token.RepoID, currentFSID, pathParts[i])
 		if err != nil {
 			return nil, 0, nil, nil, nil, "", fmt.Errorf("directory not found: %s: %w", pathParts[i], err)
 		}
-		currentFSID = nextFSID
+		if !entry.isDir() {
+			return nil, 0, nil, nil, nil, "", fmt.Errorf("path component %s is not a directory", pathParts[i])
+		}
+		currentFSID = entry.id
 	}
 
 	targetName := pathParts[len(pathParts)-1]
-	fileFSID, err := h.findEntryInDir(token.RepoID, currentFSID, targetName)
+	targetEntry, err := h.findValidatedEntryInDir(token.RepoID, currentFSID, targetName)
 	if err != nil {
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("file not found: %s: %w", targetName, err)
 	}
+	if targetEntry.isDir() {
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("target %s is not a regular file", targetName)
+	}
+	fileFSID := targetEntry.id
 
-	// Get block IDs and file size from fs_object
+	// Get block IDs and file size from fs_object. The dirent mode and target row
+	// must agree; otherwise corrupt metadata could turn a directory into an empty
+	// file response.
+	var objType string
 	err = h.db.Session().Query(`
-		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, token.RepoID, fileFSID).Scan(&blockIDs, &fileSize)
+		SELECT obj_type, block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, token.RepoID, fileFSID).Scan(&objType, &blockIDs, &fileSize)
 	if err != nil {
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("file metadata not found: %w", err)
+	}
+	if objType != "file" {
+		return nil, 0, nil, nil, nil, "", fmt.Errorf("file metadata has unexpected object type %q", objType)
 	}
 
 	blockStore, storageClass, err = h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
@@ -3805,70 +3834,210 @@ func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) 
 	return content.Bytes(), nil
 }
 
-// findEntryInDir finds an entry (file or directory) within a directory FS object
-func (h *SeafHTTPHandler) findEntryInDir(repoID, dirFSID, entryName string) (string, error) {
-	var dirEntries string
-	err := h.db.Session().Query(`
-		SELECT dir_entries FROM fs_objects
-		WHERE library_id = ? AND fs_id = ?
-	`, repoID, dirFSID).Scan(&dirEntries)
+// errDirEntryAbsent distinguishes a validated listing without the requested name
+// from malformed metadata. It is still NOT proof of global absence: LOCAL_QUORUM
+// may return an older cross-DC snapshot, so the HTTP classifier maps it to 503.
+var errDirEntryAbsent = errors.New("directory entry absent")
+
+// validatedDirEntry is one directory entry that passed full validation.
+type validatedDirEntry struct {
+	name string
+	id   string
+	mode int
+}
+
+func (e validatedDirEntry) isDir() bool {
+	return e.mode&0170000 == 040000
+}
+
+func validateDirEntryName(name string) error {
+	if name == "" {
+		return fmt.Errorf("directory entry has no usable name")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("directory entry name %q is not a safe path component", name)
+	}
+	if strings.ContainsAny(name, `/\\`) || strings.IndexByte(name, 0) >= 0 {
+		return fmt.Errorf("directory entry name %q is not a safe path component", name)
+	}
+	return nil
+}
+
+// parseValidatedDirEntry validates one entry, rejecting anything that could
+// resolve to the wrong FS object. encoding/json silently keeps the LAST value
+// for a repeated key, so {"id":"A","id":"B"} would resolve to B and
+// {"name":"a","name":"b"} would hide "a" entirely; both are caught here by
+// walking the object's tokens instead of unmarshalling into a map.
+func parseValidatedDirEntry(raw json.RawMessage) (validatedDirEntry, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
 	if err != nil {
-		return "", fmt.Errorf("directory not found: %w", err)
+		return validatedDirEntry{}, fmt.Errorf("unreadable directory entry: %w", err)
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return validatedDirEntry{}, fmt.Errorf("directory entry is not a JSON object")
 	}
 
-	log.Printf("[findEntryInDir] Looking for entry '%s' in dir %s", entryName, dirFSID)
-	log.Printf("[findEntryInDir] Dir entries length: %d", len(dirEntries))
-
-	// Parse dir_entries as JSON array - proper JSON parsing instead of string matching
-	// This handles any JSON formatting (with or without spaces)
-	var entries []map[string]interface{}
-	if dirEntries == "" || dirEntries == "[]" {
-		log.Printf("[findEntryInDir] Directory is empty")
-		return "", fmt.Errorf("entry not found: %s", entryName)
-	}
-
-	if err := json.Unmarshal([]byte(dirEntries), &entries); err != nil {
-		log.Printf("[findEntryInDir] ERROR: Failed to parse dir_entries JSON: %v", err)
-		// Log a snippet for debugging
-		if len(dirEntries) > 500 {
-			log.Printf("[findEntryInDir] Dir entries (first 500 chars): %s", dirEntries[:500])
-		} else {
-			log.Printf("[findEntryInDir] Dir entries: %s", dirEntries)
+	seen := make(map[string]struct{}, 4)
+	var entry validatedDirEntry
+	var nameFound, idFound, modeFound bool
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return validatedDirEntry{}, fmt.Errorf("unreadable directory entry key: %w", err)
 		}
-		return "", fmt.Errorf("malformed directory entries: %w", err)
-	}
-
-	log.Printf("[findEntryInDir] Parsed %d entries from directory", len(entries))
-
-	// Search for the entry by name
-	for _, entry := range entries {
-		name, ok := entry["name"].(string)
+		key, ok := keyToken.(string)
 		if !ok {
-			continue
+			return validatedDirEntry{}, fmt.Errorf("directory entry key is not a string")
 		}
-		if name == entryName {
-			id, ok := entry["id"].(string)
-			if !ok {
-				log.Printf("[findEntryInDir] ERROR: Entry found but ID is not a string: %v", entry["id"])
-				return "", fmt.Errorf("malformed entry ID for: %s", entryName)
+		if _, duplicate := seen[key]; duplicate {
+			return validatedDirEntry{}, fmt.Errorf("directory entry repeats key %q", key)
+		}
+		seen[key] = struct{}{}
+
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return validatedDirEntry{}, fmt.Errorf("unreadable value for directory entry key %q: %w", key, err)
+		}
+		switch key {
+		case "name":
+			if err := json.Unmarshal(value, &entry.name); err != nil {
+				return validatedDirEntry{}, fmt.Errorf("directory entry name is not a string: %w", err)
 			}
-			log.Printf("[findEntryInDir] Found entry '%s' with ID: %s", entryName, id)
-			return id, nil
+			nameFound = true
+		case "id":
+			if err := json.Unmarshal(value, &entry.id); err != nil {
+				return validatedDirEntry{}, fmt.Errorf("directory entry id is not a string: %w", err)
+			}
+			idFound = true
+		case "mode":
+			modeDecoder := json.NewDecoder(bytes.NewReader(value))
+			modeDecoder.UseNumber()
+			var modeValue interface{}
+			if err := modeDecoder.Decode(&modeValue); err != nil {
+				return validatedDirEntry{}, fmt.Errorf("directory entry mode is not an integer: %w", err)
+			}
+			modeNumber, ok := modeValue.(json.Number)
+			if !ok {
+				return validatedDirEntry{}, fmt.Errorf("directory entry mode is not a number")
+			}
+			mode, err := modeNumber.Int64()
+			if err != nil {
+				return validatedDirEntry{}, fmt.Errorf("directory entry mode is not an integer: %w", err)
+			}
+			if mode < 0 || mode > 0177777 {
+				return validatedDirEntry{}, fmt.Errorf("directory entry mode %d is out of range", mode)
+			}
+			modeType := mode & 0170000
+			if modeType != 0100000 && modeType != 040000 {
+				return validatedDirEntry{}, fmt.Errorf("directory entry mode %d is neither a regular file nor a directory", mode)
+			}
+			entry.mode = int(mode)
+			modeFound = true
 		}
 	}
 
-	// Entry not found - log available entries for debugging
-	log.Printf("[findEntryInDir] Entry '%s' not found in directory. Available entries:", entryName)
-	for i, entry := range entries {
-		if i < 10 { // Log first 10 entries
-			log.Printf("[findEntryInDir]   - %v", entry["name"])
-		}
+	if !nameFound {
+		return validatedDirEntry{}, fmt.Errorf("directory entry has no name")
 	}
-	if len(entries) > 10 {
-		log.Printf("[findEntryInDir]   ... and %d more entries", len(entries)-10)
+	if err := validateDirEntryName(entry.name); err != nil {
+		return validatedDirEntry{}, err
+	}
+	if !idFound {
+		return validatedDirEntry{}, fmt.Errorf("directory entry %q has no id", entry.name)
+	}
+	if len(entry.id) != 40 || !isHexString([]byte(entry.id)) {
+		return validatedDirEntry{}, fmt.Errorf("directory entry %q has a non-40-hex id", entry.name)
+	}
+	if !modeFound {
+		return validatedDirEntry{}, fmt.Errorf("directory entry %q has no mode", entry.name)
+	}
+	return entry, nil
+}
+
+// parseValidatedDirEntries validates an ENTIRE dir_entries payload, or fails.
+//
+// It is all-or-nothing on purpose. An earlier revision returned a valid match
+// even when a sibling was malformed, so that one bad dirent could not make a
+// healthy file unreadable. That exception was wrong: a corrupt entry may carry
+// the very name being resolved (or hide it behind a repeated "name" key), in
+// which case the listing is ambiguous about the requested path and returning
+// the other copy serves the wrong FS object. A corrupt dirent is an anomaly that
+// should be investigated, and 503 is retryable and destroys nothing, so every
+// consumer now fails closed on the whole listing.
+func parseValidatedDirEntries(rawEntries string) ([]validatedDirEntry, error) {
+	trimmed := strings.TrimSpace(rawEntries)
+	if trimmed == "" || trimmed == "null" {
+		return nil, fmt.Errorf("directory listing is blank")
 	}
 
-	return "", fmt.Errorf("entry not found: %s", entryName)
+	var raws []json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &raws); err != nil {
+		return nil, fmt.Errorf("malformed directory listing: %w", err)
+	}
+
+	entries := make([]validatedDirEntry, 0, len(raws))
+	seenNames := make(map[string]struct{}, len(raws))
+	for i, raw := range raws {
+		entry, err := parseValidatedDirEntry(raw)
+		if err != nil {
+			return nil, fmt.Errorf("directory entry %d: %w", i, err)
+		}
+		if _, duplicate := seenNames[entry.name]; duplicate {
+			return nil, fmt.Errorf("directory lists %q more than once", entry.name)
+		}
+		seenNames[entry.name] = struct{}{}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// findValidatedDirEntry resolves entryName against a raw dir_entries payload.
+// The internal absence sentinel is produced ONLY when the whole listing validated
+// and no entry matched. This is the single parse-and-match path: the production
+// lookup and the corrupt-listing test matrix both go through it, so a change to
+// the matching rule cannot keep the tests green while breaking the real caller.
+func findValidatedDirEntry(rawEntries, entryName string) (validatedDirEntry, error) {
+	entries, err := parseValidatedDirEntries(rawEntries)
+	if err != nil {
+		return validatedDirEntry{}, err
+	}
+	for _, entry := range entries {
+		if entry.name == entryName {
+			return entry, nil
+		}
+	}
+	return validatedDirEntry{}, fmt.Errorf("%w: %s", errDirEntryAbsent, entryName)
+}
+
+// findValidatedEntryInDir resolves entryName inside a directory FS object while
+// preserving its validated mode for callers that must enforce file/directory type.
+//
+// A read failure is NOT absence: a bare gocql.ErrNotFound on the directory row
+// means the dirent that named it points at a row that is missing — premature GC,
+// a partial write, cross-DC lag — which is dangling metadata, not proof the path
+// is gone. A validated listing miss returns errDirEntryAbsent, which remains a
+// retryable 503 at the HTTP boundary.
+func (h *SeafHTTPHandler) findValidatedEntryInDir(repoID, dirFSID, entryName string) (validatedDirEntry, error) {
+	var objType, dirEntries string
+	if err := h.db.Session().Query(`
+		SELECT obj_type, dir_entries FROM fs_objects
+		WHERE library_id = ? AND fs_id = ?
+	`, repoID, dirFSID).Scan(&objType, &dirEntries); err != nil {
+		return validatedDirEntry{}, fmt.Errorf("failed to read directory %s: %w", dirFSID, err)
+	}
+	if objType != "dir" {
+		return validatedDirEntry{}, fmt.Errorf("directory %s has unexpected object type %q", dirFSID, objType)
+	}
+
+	entry, err := findValidatedDirEntry(dirEntries, entryName)
+	if err != nil {
+		if errors.Is(err, errDirEntryAbsent) {
+			return validatedDirEntry{}, err
+		}
+		return validatedDirEntry{}, fmt.Errorf("directory %s: %w", dirFSID, err)
+	}
+	return entry, nil
 }
 
 // Helper function to generate a file ID
@@ -3908,21 +4077,12 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		return
 	}
 
-	// Permission check
-	if h.permMiddleware != nil {
-		hasRead, err := h.permMiddleware.HasLibraryAccess(token.OrgID, token.UserID, token.RepoID, middleware.PermissionR)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
-			return
-		}
-		if !hasRead {
-			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have read access to this library"})
-			return
-		}
+	if !seafHTTPAuthorizeDownloadFn(h, c, token) {
+		return
 	}
 
 	if h.db == nil || h.storageManager == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage not available"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("storage not available"))
 		return
 	}
 
@@ -3940,14 +4100,33 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		}
 	}
 
-	// Get the library's root FS
+	// Encryption must be checked before any metadata walk or stream. Ignoring a
+	// Cassandra error here previously left encrypted=false and produced a 200 zip
+	// of ciphertext bytes treated as plaintext.
+	encrypted, err := seafHTTPLookupLibraryEncryptedFn(h, token.OrgID, token.RepoID)
+	if err != nil {
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("failed to check library encryption: %w", err))
+		return
+	}
+	var fileKey []byte
+	var fileIV []byte
+	if encrypted {
+		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
+		if fileKey == nil {
+			respondSeafHTTPDownloadError(c, token.RepoID, token.Path, v2.ErrLibraryEncryptedNotUnlocked)
+			return
+		}
+	}
+
+	// Get the library's root FS. Cross-DC lag can make a fresh download token
+	// observe a missing library/commit row; that is retryable 503, not 500.
 	var headCommit string
-	err := h.db.Session().Query(`
+	err = h.db.Session().Query(`
 		SELECT head_commit_id FROM libraries
 		WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).Scan(&headCommit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "library not found"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("library not found: %w", err))
 		return
 	}
 
@@ -3957,7 +4136,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		WHERE library_id = ? AND commit_id = ?
 	`, token.RepoID, headCommit).Scan(&rootFSID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "commit not found"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("commit not found: %w", err))
 		return
 	}
 
@@ -3995,12 +4174,19 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 			if part == "" {
 				continue
 			}
-			nextFSID, err := h.findEntryInDir(token.RepoID, currentFSID, part)
+			entry, err := h.findValidatedEntryInDir(token.RepoID, currentFSID, part)
 			if err != nil {
-				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("directory not found: %s", part)})
+				// Same contract as HandleDownload: only a validated listing that
+				// does not name the entry distinguishes local absence; HTTP still
+				// maps it to 503 because the snapshot may be stale across DCs.
+				respondSeafHTTPDownloadError(c, token.RepoID, part, err)
 				return
 			}
-			currentFSID = nextFSID
+			if !entry.isDir() {
+				respondSeafHTTPDownloadError(c, token.RepoID, part, fmt.Errorf("path component %s is not a directory", part))
+				return
+			}
+			currentFSID = entry.id
 		}
 		targetFSID = currentFSID
 	}
@@ -4010,26 +4196,11 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		dirName = "download"
 	}
 
-	// Check encryption
-	var encrypted bool
-	var fileKey []byte
-	var fileIV []byte
-	h.db.Session().Query(`
-		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, token.OrgID, token.RepoID).Scan(&encrypted)
-	if encrypted {
-		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
-		if fileKey == nil {
-			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted but not unlocked"})
-			return
-		}
-	}
-
 	hostname := httputil.GetRoutingHostname(c, h.configuredServerURL())
 	blockStore, storageClass, err := h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleZipDownload] Failed to resolve block store: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare zip download"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("block store not available: %w", err))
 		return
 	}
 
@@ -4041,7 +4212,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 			return
 		}
 		log.Printf("[HandleZipDownload] Failed to validate ZIP directory: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare zip download"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, err)
 		return
 	}
 	allResolvedIDs := make([]string, 0)
@@ -4051,7 +4222,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	canonicalReader, err := seafHTTPNewCanonicalBlockReaderFn(c.Request.Context(), h.db, h.storageManager, token.OrgID, allResolvedIDs, blockStore, storageClass)
 	if err != nil {
 		log.Printf("[HandleZipDownload] Failed to resolve canonical block locations: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare zip download"})
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("resolve canonical block locations: %w", err))
 		return
 	}
 
@@ -4099,35 +4270,38 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 		}
 	}
 
-	var dirEntriesJSON string
-	err := h.db.Session().Query(`
-		SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, repoID, dirFSID).Scan(&dirEntriesJSON)
-	if err != nil || dirEntriesJSON == "" || dirEntriesJSON == "[]" {
-		return nil, err
+	var objType, dirEntriesJSON string
+	if err := h.db.Session().Query(`
+		SELECT obj_type, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, dirFSID).Scan(&objType, &dirEntriesJSON); err != nil {
+		return nil, fmt.Errorf("failed to read directory %s: %w", dirFSID, err)
+	}
+	if objType != "dir" {
+		return nil, fmt.Errorf("directory %s has unexpected object type %q", dirFSID, objType)
+	}
+	if strings.TrimSpace(dirEntriesJSON) == "[]" {
+		return nil, nil
 	}
 
-	var entries []map[string]interface{}
-	if err := json.Unmarshal([]byte(dirEntriesJSON), &entries); err != nil {
-		return nil, fmt.Errorf("parse dir entries: %w", err)
+	// The zip walk validates exactly like the download path. It used to parse
+	// into a map — keeping the last value of a repeated key — and silently skip
+	// entries without a name or id, so a corrupt listing could produce a 200 zip
+	// with wrong or missing content instead of an error.
+	entries, err := parseValidatedDirEntries(dirEntriesJSON)
+	if err != nil {
+		return nil, fmt.Errorf("directory %s: %w", dirFSID, err)
 	}
 
 	prepared := make([]zipPreparedFile, 0, len(entries))
 	for _, entry := range entries {
-		name, _ := entry["name"].(string)
-		id, _ := entry["id"].(string)
-		if name == "" || id == "" {
-			continue
-		}
+		name, id := entry.name, entry.id
 
 		entryPath := name
 		if prefix != "" {
 			entryPath = prefix + "/" + name
 		}
 
-		modeFloat, _ := entry["mode"].(float64)
-		mode := int(modeFloat)
-		if mode == 16384 || mode&0170000 == 040000 {
+		if entry.isDir() {
 			childFiles, err := h.prepareZipDirectory(repoID, orgID, id, entryPath, depth+1, budget)
 			if err != nil {
 				return nil, err
@@ -4136,13 +4310,17 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 			continue
 		}
 
+		var fileObjType string
 		var blockIDs []string
 		var fileSize int64
 		err := h.db.Session().Query(`
-			SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
-		`, repoID, id).Scan(&blockIDs, &fileSize)
+			SELECT obj_type, block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
+		`, repoID, id).Scan(&fileObjType, &blockIDs, &fileSize)
 		if err != nil {
 			return nil, fmt.Errorf("load blocks for %s: %w", entryPath, err)
+		}
+		if fileObjType != "file" {
+			return nil, fmt.Errorf("file %s has unexpected object type %q", entryPath, fileObjType)
 		}
 		if budget != nil {
 			if err := budget.noteFile(fileSize); err != nil {

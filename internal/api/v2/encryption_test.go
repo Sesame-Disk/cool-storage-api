@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
@@ -921,4 +922,69 @@ func TestDecryptSessionManager_ResolverSkippedForLegacyUnlock(t *testing.T) {
 	if !m.IsUnlocked("user-1", "repo-1") {
 		t.Fatal("legacy session should remain valid")
 	}
+}
+
+// A failed encryption probe must never resolve to "not encrypted". The response
+// is deliberately a retryable 503 and NOT 403 lib_need_decrypt: a failed probe
+// means the encryption state is unknown, so telling the client to prompt for a
+// password would be asserting something we did not learn.
+func TestRespondEncryptionProbeUnavailableIsRetryableNotADecryptPrompt(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v2.1/repos/r/file/", nil)
+
+	respondEncryptionProbeUnavailable(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body=%s)", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Retry-After"); got == "" {
+		t.Fatal("a retryable encryption-probe failure must carry Retry-After")
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if _, present := body["lib_need_decrypt"]; present {
+		t.Fatalf("probe failure must not claim the library needs decrypting: %v", body)
+	}
+}
+
+// The guards must close on a probe failure, not open. Their previous
+// "return true // Library not found, let the caller handle it" treated a
+// Cassandra timeout as proof that no encrypted library existed.
+func TestDecryptSessionGuardsFailClosedWhenTheProbeErrors(t *testing.T) {
+	original := libraryIsEncrypted
+	t.Cleanup(func() { libraryIsEncrypted = original })
+	libraryIsEncrypted = func(*db.DB, string, string) (bool, error) {
+		return false, errors.New("gocql: no response received from cassandra within timeout period")
+	}
+
+	t.Run("requireDecryptSession", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/v2.1/repos/r/file/", nil)
+		h := &FileHandler{db: &db.DB{}}
+
+		if h.requireDecryptSession(c, "org", "user", "repo") {
+			t.Fatal("requireDecryptSession allowed access after a failed encryption probe")
+		}
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 (body=%s)", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("checkDecryptSession", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/v2.1/repos/r/batch/", nil)
+		h := &BatchOperationHandler{db: &db.DB{}}
+
+		if h.checkDecryptSession(c, "org", "user", "repo") {
+			t.Fatal("checkDecryptSession allowed access after a failed encryption probe")
+		}
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 (body=%s)", w.Code, w.Body.String())
+		}
+	})
 }

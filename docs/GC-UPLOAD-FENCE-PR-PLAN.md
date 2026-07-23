@@ -6,9 +6,10 @@
 PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138) (closed F2/X7).
 PR-3 merged as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), closing F6,
 F14 and the **observed-fence half** of F1. PR-4 merged as
-[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4 and F7. PR-5 is
-implemented on `fix/gc-web-session-retry-contract` and pending review. X1/X2 remain
-open and keep destructive GC disabled.
+[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4 and F7. PR-5 merged
+as [#141](https://github.com/Sesame-Disk/sesamefs/pull/141), closing F1 and F3. PR-6 is
+implemented on `fix/gc-download-fail-closed` and pending review. X1/X2 remain open and
+keep destructive GC disabled.
 
 ## Why this document exists
 
@@ -472,38 +473,119 @@ and the complete Docker race rerun passed.
 
 ### PR-6 — Download fail-closed and removal of the path-based fallback
 
-**Scope:** `seafhttp.go` `HandleDownload`, `lookupFileBlocks` and `findEntryInDir`.
-The legacy `<org>/<repo><path>` fallback and `resolveLibraryObjectStore` are removed,
-and the 404/503 contract is:
+**Scope:** `seafhttp.go` `HandleDownload`, `lookupFileBlocks`, directory resolution
+and ZIP preflight.
+The legacy `<org>/<repo><path>` fallback and `resolveLibraryObjectStore` are removed.
+The fail-closed HTTP contract is:
 
-- **404 only** when a directory was read, fully validated, and does not list the
-  entry. That is the single signal that proves the file is gone.
-- **503 for everything else**, including a bare `gocql.ErrNotFound` on a referenced
-  row. A missing head commit, root fs_object, or the fs_object a dirent names is
-  dangling metadata — premature GC, a partial write, cross-DC lag — not proof the
-  path does not exist. An earlier draft of this plan said "absence proven by
-  Cassandra is 404"; that was wrong and would tell a client to stop retrying a file
-  that is still there.
+- **503 with `Retry-After` for every metadata/read failure, including a validated
+  local listing without the entry.** Production reads use `LOCAL_QUORUM`; a valid
+  listing can still be an older cross-DC snapshot because `access_tokens` and
+  `libraries` are independent partitions with no global replication order. A local
+  absence observation therefore cannot safely produce 404.
+- **403 `lib_need_decrypt`** when an encrypted library has no decrypt session.
+- ZIP traversal limits remain **413**.
 
-Directory listings must be validated before absence can be claimed: reject blank or
-JSON-null values, null entries, empty names, non-40-hex ids, duplicate names, and
-duplicate JSON keys within an entry (`encoding/json` keeps the last silently, which
-can serve the wrong FS object or hide a present file).
+Directory listings are validated all-or-nothing before they may resolve anything:
+reject blank or JSON-null values, null entries, empty or unsafe path-component names,
+non-40-hex ids, duplicate names, duplicate JSON keys, missing/null/fractional or
+unknown modes, and disagreement between a dirent's mode and `fs_objects.obj_type`.
+`encoding/json` otherwise keeps the last duplicate key silently, which can serve the
+wrong FS object or hide a present file.
 
 **Precondition:** confirmed with the product owner that production starts from empty
 buckets, so no path-based object exists. **If that ever stops being true this PR must
 be revisited**, because it removes the only way to read such an object.
 
-**Acceptance:** classifier tests both ways, including that a referenced-row
-`ErrNotFound` does *not* become 404; the full corrupt-listing matrix routed through
-the parse-and-match path rather than the parser alone; encrypted-without-session
-never reaches a plaintext object; end-to-end download tests against real Cassandra
-(4 cases) — these belong in `internal/integration` and do not exist yet.
+**Acceptance:** classifier tests including that neither a validated local absence nor
+a referenced-row `ErrNotFound` becomes 404; the full corrupt-listing matrix routed
+through the parse-and-match path rather than the parser alone;
+encrypted-without-session never reaches a plaintext object; and end-to-end download
+tests against real Cassandra for present, deleted, dangling and corrupt metadata.
 
 **Suggested additional acceptance:** a property-based test over the parse-and-match
-helper asserting that absence is *never* reported except for a well-formed listing
-with no match. Three separate audit rounds each found a new corrupt-listing shape
-that hand-written cases had missed; generated input is the way to stop that.
+helper asserting that its internal absence sentinel is *never* reported except for a
+well-formed listing with no match. The HTTP layer must still map that sentinel to 503.
+Successive audits found corrupt shapes hand-written cases missed, so generated input
+also covers unsafe names and invalid mode variants.
+
+**Current implementation (pending review):** `parseValidatedDirEntries` in
+`internal/api/seafhttp.go` validates a listing by walking each entry's JSON tokens
+instead of unmarshalling into a map, so a repeated `id` or `name` key is rejected
+rather than silently resolved to its last value. Validation is **all-or-nothing**:
+any malformed entry fails the whole listing. A first revision returned a valid match
+when only a *sibling* was corrupt, so one bad dirent could not make a healthy file
+unreadable; review showed that exception serves the wrong FS object when the corrupt
+entry carries the requested name (or hides it behind a repeated `name` key), so the
+listing is ambiguous exactly where it matters. The internal `errDirEntryAbsent`
+sentinel is produced only when the whole listing validated and nothing matched, but
+it maps to HTTP 503 because a `LOCAL_QUORUM` snapshot may be stale across DCs.
+
+`findValidatedEntryInDir` no longer turns a read failure into absence and preserves
+the validated mode so callers can enforce file/directory type.
+`respondSeafHTTPDownloadError` is the single place that applies the contract —
+`v2.ErrLibraryEncryptedNotUnlocked` to the app-wide 403 `lib_need_decrypt`, and every
+metadata/read failure (including `errDirEntryAbsent`) to 503 with `Retry-After` — and
+it writes nothing once streaming has committed headers. `HandleDownload` lost its
+path-based fallback and `resolveLibraryObjectStore` was deleted with its only caller.
+
+Both zip paths share the validated parser: the directory walk previously answered
+404 for any directory-resolution failure, and `prepareZipDirectory` still parsed into a
+map — keeping the last value of a repeated key, silently skipping entries with no
+name or id, and reading a blank listing as an empty directory — so a corrupt listing
+could produce a `200` zip with wrong or missing content. Names must now be one safe
+path component (no `.`, `..`, slash, backslash or NUL); mode is required, exact and
+restricted to a regular file or directory; preflight also verifies mode against the
+referenced `fs_objects.obj_type`. ZIP encryption is probed through the same
+injectable helper as file download and **before** the head/commit walk: a probe
+I/O failure is 503 (never "not encrypted"), and a confirmed encrypted library
+without a decrypt session is 403 `lib_need_decrypt`. Head/commit misses, block-store
+resolution, canonical placement, and non-limit ZIP preflight failures all use the
+same 503 classifier and `Retry-After` as file downloads.
+
+The discarded-probe-error shape that made ZIP stream ciphertext as a 200 turned out
+to exist at **six** more sites in `internal/api/v2`, in two classes: four that took
+the plaintext branch (`UploadFile` persisting plaintext into an encrypted library,
+`ServeRawFile`, and both share-link readers) and two that converted the error into
+permission outright (`requireDecryptSession`, guarding 20 call sites, and
+`checkDecryptSession`). All six are fixed here behind a single `libraryIsEncrypted`
+probe, each failing closed as its own contract allows. Recorded with the full
+inventory and the per-surface reasoning in `ISSUE-ENCRYPTED-FLAG-UNCHECKED-01`.
+
+`findValidatedDirEntry` is the single parse-and-match path, shared by the production
+lookup and by the corrupt-listing matrix. An intermediate revision left a separate
+`findDirEntryID` that only the tests still called, which would have let a change to
+the matching rule keep the matrix green while breaking the real caller.
+
+**Accepted cost, tracked as `ISSUE-DOWNLOAD-NO-404-01` in `docs/KNOWN_ISSUES.md`:**
+dropping 404 entirely means a genuinely deleted file answers 503 forever, so clients
+retry a request that can never succeed, and the SeafHTTP surface now disagrees with
+`internal/api/v2`, which still answers 404. Reintroducing 404 needs a read that can
+prove *global* absence; that issue lists the options.
+
+Coverage: the corrupt-listing matrix routed through parse-and-match rather than the
+parser alone, including a corrupt copy of the requested name in both orders; a seeded
+generative property test asserting the internal absence sentinel is never produced
+for a listing that is unparseable, holds an invalid entry, or names the target; the
+classifier all three ways, including that local absence and a bare
+`gocql.ErrNotFound` are 503 and that encrypted-without-session is 403; that a
+committed response is never rewritten; that a present path-based object is *not*
+served; the zip walk's use of the validated parser (safe names, required exact mode,
+repeated `id`, missing `id`, blank listing) and the shared retry classifier; and
+`TestDownloadFailClosedContract` in `internal/integration`, which drives the four
+end-to-end cases against real Cassandra through the production endpoint — present
+file, deleted file, dangling `fs_object`, and corrupt listing.
+
+**Both** public share-link bootstrap endpoints are pinned by behavioural
+integration tests, not only the first. `/share-links/:token/bootstrap/` and
+`/share-links/:token/files/bootstrap/?p=` each get a healthy 200 first and then a
+deterministic canonical-reference failure, asserting 503 + `Retry-After` and a body
+free of block ids, bucket names and Cassandra/S3 detail. The second endpoint needed
+its own test because neither the first test nor the AST check constrains it: the AST
+check only proves no *other* method calls `respondShareBootstrapError`, so
+`GetShareLinkFileBootstrap` could have gone back to `c.JSON(status, err.Error())`
+with every test still green. Verified by injecting exactly that regression: the new
+test fails, the sibling test does not.
 
 ---
 
@@ -613,9 +695,12 @@ These stay open and keep destructive GC disabled:
 
 - PR-2 through PR-5 ran `go test -race` in Docker. PR-9 must still run its own race
   validation because it changes separate channel behavior.
-- No end-to-end download tests against real Cassandra exist for the 404/503 contract.
+- PR-6 adds `TestDownloadFailClosedContract` against real Cassandra for present,
+  deleted, dangling and corrupt metadata; the full Compose integration suite remains
+  part of its merge verification.
 - No multi-DC test exercises any of the cross-DC reasoning; it is derived from the
-  production consistency contract, not from a reproduction. The dedicated
+  production consistency contract, not from a reproduction. PR-6 therefore never
+  converts a local absence observation into 404. The dedicated
   `config-usa.cluster.yaml` / `config-eu.cluster.yaml` test profiles use
   `LOCAL_SERIAL`; their inline "multi-DC standard" wording describes the harness,
   not production. That harness specifically does not reproduce production's

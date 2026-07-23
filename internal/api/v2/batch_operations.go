@@ -1195,13 +1195,12 @@ func (h *BatchOperationHandler) checkDecryptSession(c *gin.Context, orgID, userI
 		return true
 	}
 
-	// Check if library is encrypted
-	var encrypted bool
-	err := h.db.Session().Query(`
-		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&encrypted)
+	// Check if library is encrypted. A probe failure must NOT open this gate —
+	// err covers a Cassandra timeout, not just a missing row.
+	encrypted, err := libraryIsEncrypted(h.db, orgID, repoID)
 	if err != nil {
-		return true // Library not found, let the caller handle it
+		respondEncryptionProbeUnavailable(c)
+		return false
 	}
 
 	if !encrypted {

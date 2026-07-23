@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -715,18 +716,7 @@ func (h *ShareLinkViewHandler) GetShareLinkBootstrap(c *gin.Context) {
 		return
 	}
 
-	bootstrap, status, err := h.buildShareFileBootstrapResponse(c, sl)
-	if err != nil {
-		c.JSON(status, gin.H{"error": err.Error()})
-		return
-	}
-	if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
-		if noPassword, _ := pageOptions["noPassword"].(bool); noPassword {
-			h.incrementViewCount(sl.token)
-		}
-	}
-
-	c.JSON(http.StatusOK, bootstrap)
+	h.emitShareFileBootstrap(c, sl)
 }
 
 // GetShareLinkFileBootstrap returns the frontend bootstrap payload for GET /d/:token/files/?p=...
@@ -774,18 +764,7 @@ func (h *ShareLinkViewHandler) GetShareLinkFileBootstrap(c *gin.Context) {
 	sl.targetEntry = result.TargetEntry
 	sl.isDir = false
 
-	bootstrap, status, err := h.buildShareFileBootstrapResponse(c, sl)
-	if err != nil {
-		c.JSON(status, gin.H{"error": err.Error()})
-		return
-	}
-	if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
-		if noPassword, _ := pageOptions["noPassword"].(bool); noPassword {
-			h.incrementViewCount(sl.token)
-		}
-	}
-
-	c.JSON(http.StatusOK, bootstrap)
+	h.emitShareFileBootstrap(c, sl)
 }
 
 // handleShareLinkDownload handles ?dl=1 for file share links
@@ -878,10 +857,14 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 		return
 	}
 
-	// Check if library is encrypted
-	var encrypted bool
-	h.db.Session().Query(`SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?`,
-		sl.orgID, sl.libraryID).Scan(&encrypted)
+	// Check if library is encrypted. This is a public surface: failing open
+	// would serve ciphertext to an anonymous visitor as a 200.
+	encrypted, err := libraryIsEncrypted(h.db, sl.orgID, sl.libraryID)
+	if err != nil {
+		slog.Error("encryption probe failed for share link raw", "org", sl.orgID, "error", err)
+		respondEncryptionProbeUnavailable(c)
+		return
+	}
 
 	var fileKey []byte
 	var fileIV []byte
@@ -981,12 +964,47 @@ func buildZippedPath(rootName, relativePath string) string {
 	return string(data)
 }
 
-// readFileContentAsText reads the file content from block storage and returns it as a string.
-// Used for embedding text file content directly in page options (for the text/markdown React views).
-// Returns empty string on any error. Limited to 1MB to avoid huge page payloads.
-func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
+// errShareLinkLibraryLocked marks an encrypted library that a share link cannot
+// decrypt. It is stable rather than transient, so it maps to 403 like the raw
+// share-link surface, never to a retryable 503 and never to an empty 200.
+var errShareLinkLibraryLocked = errors.New("share link library is encrypted and locked")
+
+// respondShareBootstrapError answers the PUBLIC share-link surface. It logs the
+// real cause and returns a generic message, because the wrapped errors carry
+// internal SHA-256 block ids, storage classes and Cassandra/S3 detail that an
+// anonymous visitor must not see. Retryable answers carry Retry-After so the
+// client honours the documented contract.
+func respondShareBootstrapError(c *gin.Context, sl *shareLinkData, status int, err error) {
+	slog.Error("share link bootstrap failed", "org", sl.orgID, "library", sl.libraryID, "status", status, "error", err)
+	switch status {
+	case http.StatusForbidden:
+		c.JSON(status, gin.H{"error": "this file is in an encrypted library and cannot be previewed"})
+	case http.StatusServiceUnavailable:
+		c.Header("Retry-After", "1")
+		c.JSON(status, gin.H{"error": "file is temporarily unavailable; retry"})
+	default:
+		c.JSON(status, gin.H{"error": "failed to load file"})
+	}
+}
+
+var shareInlineTextFn = func(h *ShareLinkViewHandler, sl *shareLinkData) (string, error) {
+	return h.readFileContentAsText(sl)
+}
+
+// readFileContentAsText reads the file content from block storage and returns it
+// as a string. Used for embedding text/markdown content directly in page options.
+// Limited to 1MB to avoid huge page payloads.
+//
+// It returns ("", nil) only where there is legitimately nothing to inline — no
+// target entry, or a file past the size limit. Everything else is an error: a
+// transient failure so the caller can answer 503, and errShareLinkLibraryLocked
+// for an encrypted library this link cannot decrypt so the caller answers 403,
+// matching the raw share-link surface. Returning "" for those rendered a
+// non-empty file as a silently empty 200 the client could neither distinguish
+// from a genuinely empty file nor retry.
+func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) (string, error) {
 	if sl.targetEntry == nil {
-		return ""
+		return "", nil
 	}
 
 	const maxTextSize = 1 * 1024 * 1024 // 1MB limit for inline text content
@@ -997,30 +1015,35 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, sl.libraryID, sl.targetEntry.ID).Scan(&blockIDs, &fileSize)
 	if err != nil {
-		slog.Error("Failed to get file block IDs for text content", "error", err)
-		return ""
+		return "", fmt.Errorf("read file block ids for inline text: %w", err)
 	}
 
 	if fileSize > maxTextSize {
-		return ""
+		return "", nil
 	}
 
 	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequest(nil, h.db, h.config, h.storageManager, h.storage, sl.orgID, sl.libraryID)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("resolve block store for inline text: %w", err)
 	}
 
-	// Check if library is encrypted
-	var encrypted bool
-	h.db.Session().Query(`SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?`,
-		sl.orgID, sl.libraryID).Scan(&encrypted)
+	// A probe failure must not fall through as "not encrypted": that would embed
+	// ciphertext into the page as if it were the file's text.
+	encrypted, err := libraryIsEncrypted(h.db, sl.orgID, sl.libraryID)
+	if err != nil {
+		return "", fmt.Errorf("encryption probe for inline text: %w", err)
+	}
 
 	var fileKey []byte
 	var fileIV []byte
 	if encrypted {
 		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(sl.createdBy, sl.libraryID)
 		if fileKey == nil {
-			return ""
+			// Stable rather than transient, but still not success: rendering a
+			// non-empty document as blank would misrepresent the file. The raw
+			// share-link surface answers 403 for this exact state, so the text
+			// preview must not silently disagree with it.
+			return "", errShareLinkLibraryLocked
 		}
 	}
 
@@ -1029,45 +1052,59 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 	if streaming.ContainsLegacySHA1(blockIDs) {
 		resolved, err := db.ResolveBlockRepresentationID(h.db.Session(), sl.orgID, sl.libraryID)
 		if err != nil {
-			slog.Error("failed to resolve block representation for inline text content", "org", sl.orgID, "library", sl.libraryID, "error", err)
-			return ""
+			return "", fmt.Errorf("resolve block representation for inline text: %w", err)
 		}
 		representationID = resolved
 	}
 	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, sl.orgID, representationID, blockIDs)
 	if err != nil {
-		slog.Error("block ID resolution failed for inline text content", "org", sl.orgID, "error", err)
-		return ""
+		return "", fmt.Errorf("resolve block ids for inline text: %w", err)
 	}
 	canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, sl.orgID, resolvedIDs, blockStore, blockStoreClass)
 	if err != nil {
-		slog.Error("canonical block reader construction failed for inline text content", "org", sl.orgID, "error", err)
-		return ""
+		return "", fmt.Errorf("canonical block reader for inline text: %w", err)
 	}
 	var buf strings.Builder
 	for idx := range blockIDs {
 		internalID := resolvedIDs[idx]
 
+		blockData, err := canonicalReader.GetBlock(ctx, internalID)
+		if err != nil {
+			return "", fmt.Errorf("read block %s for inline text: %w", internalID, err)
+		}
 		if encrypted && fileKey != nil {
-			blockData, err := canonicalReader.GetBlock(ctx, internalID)
-			if err != nil {
-				return ""
-			}
 			blockData, err = crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 			if err != nil {
-				return ""
+				return "", fmt.Errorf("decrypt block %s for inline text: %w", internalID, err)
 			}
-			buf.Write(blockData)
-		} else {
-			blockData, err := canonicalReader.GetBlock(ctx, internalID)
-			if err != nil {
-				return ""
-			}
-			buf.Write(blockData)
+		}
+		buf.Write(blockData)
+	}
+
+	return buf.String(), nil
+}
+
+// emitShareFileBootstrap is the single place the file bootstrap becomes an HTTP
+// response, shared by both public endpoints. They previously carried identical
+// copies of this block; keeping one means an endpoint cannot quietly go back to
+// exposing err.Error() or to treating a locked library as a success.
+func (h *ShareLinkViewHandler) emitShareFileBootstrap(c *gin.Context, sl *shareLinkData) {
+	bootstrap, status, err := shareFileBootstrapFn(h, c, sl)
+	if err != nil {
+		respondShareBootstrapError(c, sl, status, err)
+		return
+	}
+	if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
+		if noPassword, _ := pageOptions["noPassword"].(bool); noPassword {
+			h.incrementViewCount(sl.token)
 		}
 	}
 
-	return buf.String()
+	c.JSON(http.StatusOK, bootstrap)
+}
+
+var shareFileBootstrapFn = func(h *ShareLinkViewHandler, c *gin.Context, sl *shareLinkData) (pageBootstrapResponse, int, error) {
+	return h.buildShareFileBootstrapResponse(c, sl)
 }
 
 // serveSharedFilePage renders the shared file view
@@ -1098,7 +1135,17 @@ func (h *ShareLinkViewHandler) buildShareFileBootstrapResponse(c *gin.Context, s
 	fileContent := ""
 	var smartLinkMap map[string]sharedMarkdownSmartLinkTarget
 	if bundleName == "sharedFileViewText" || bundleName == "sharedFileViewMarkdown" {
-		fileContent = h.readFileContentAsText(sl)
+		var contentErr error
+		fileContent, contentErr = shareInlineTextFn(h, sl)
+		if contentErr != nil {
+			// Neither a transient failure nor a locked library may render as an
+			// empty file: both would misrepresent a non-empty document as blank.
+			slog.Error("inline text content unavailable for share link", "org", sl.orgID, "file", filename, "error", contentErr)
+			if errors.Is(contentErr, errShareLinkLibraryLocked) {
+				return pageBootstrapResponse{}, http.StatusForbidden, contentErr
+			}
+			return pageBootstrapResponse{}, http.StatusServiceUnavailable, contentErr
+		}
 		if bundleName == "sharedFileViewMarkdown" {
 			smartLinkMap = h.buildSharedMarkdownSmartLinkMap(sl, fileContent)
 		}

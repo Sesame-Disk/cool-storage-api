@@ -245,14 +245,18 @@ func TestZipDownloadFailsBeforeHeadersWhenLegacyMappingIsMissing(t *testing.T) {
 	}
 
 	zipResp := adminClient.GetWithHost(t, fmt.Sprintf("/seafhttp/zip/%s", zipToken), requestHost)
-	expectStatus(t, zipResp, http.StatusInternalServerError)
+	expectStatus(t, zipResp, http.StatusServiceUnavailable)
+	if got := zipResp.Header.Get("Retry-After"); got == "" {
+		zipResp.Body.Close()
+		t.Fatal("expected Retry-After on retryable zip preparation failure")
+	}
 	if got := zipResp.Header.Get("Content-Type"); strings.Contains(got, "application/zip") {
 		zipResp.Body.Close()
 		t.Fatalf("expected JSON error response before zip headers, got Content-Type %q", got)
 	}
 	zipBody := responseBody(t, zipResp)
-	if !strings.Contains(zipBody, "failed to prepare zip download") {
-		t.Fatalf("zip error body = %q, want prepare failure", zipBody)
+	if !strings.Contains(zipBody, "temporarily unavailable") {
+		t.Fatalf("zip error body = %q, want retryable failure", zipBody)
 	}
 	if strings.Contains(zipBody, brokenMapping) {
 		t.Fatalf("zip error body leaked internal block mapping details: %q", zipBody)
