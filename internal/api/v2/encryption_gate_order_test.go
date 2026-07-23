@@ -17,11 +17,11 @@ import (
 // the relative position of the two calls inside the handler can.
 func TestEncryptionGateRunsBeforeShortCircuitsAndWrites(t *testing.T) {
 	cases := []struct {
-		file     string
-		function string
-		gate     string
+		file       string
+		function   string
+		gate       string
 		mustFollow string
-		why      string
+		why        string
 	}{
 		{
 			file: "fileview.go", function: "ServeRawFile",

@@ -569,7 +569,6 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		return
 	}
 
-
 	// Guard against loading very large files - use appropriate limit based on file type
 	maxSize := h.getMaxFileSizeForPreview(ext)
 	if fileSize > maxSize {
