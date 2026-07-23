@@ -2,11 +2,11 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	goast "go/ast"
 	goparser "go/parser"
 	gotoken "go/token"
-	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"

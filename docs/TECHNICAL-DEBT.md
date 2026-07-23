@@ -2202,4 +2202,50 @@ wrapper survives — they are the only proof the fast-clear window stays closed.
 
 ---
 
-*Last updated: 2026-07-22*
+## 33. SeafHTTP Download Authorization Is Not Covered End To End (2026-07-23)
+
+### Current State
+
+`authorizeSeafHTTPDownload` is the single gate both download surfaces use, and
+its decision logic is covered against a real permission state (read granted,
+`download` revoked) through the `downloadPermissionChecker` interface, plus a
+mutation check proving the flag's return value actually decides the outcome.
+
+What is **not** covered is the seam between the handlers and that gate. The two
+handler tests substitute `seafHTTPAuthorizeDownloadFn` wholesale, so they prove
+the handlers consult a gate and honour its answer — but changing
+`authorizeSeafHTTPDownload` itself to `return true` would leave every test green.
+
+### Why It Was Deferred
+
+`SeafHTTPHandler.permMiddleware` is the concrete `*middleware.PermissionMiddleware`,
+and `HasLibraryAccess` panics without a live backend, so driving the production
+gate through an HTTP handler needs either an interface-typed field or a real
+permission backend in an integration test.
+
+Narrowing the field to an interface touches every construction site of the
+handler, which is a wider change than PR-6's scope and unrelated to the
+fail-closed download work it carries. The risk left open is small and bounded:
+the gate's own logic IS tested, and both handlers demonstrably route through it.
+
+### Follow-Up Plan
+
+1. Narrow `permMiddleware` to an interface covering the methods SeafHTTP
+   actually uses (`HasLibraryAccess`, `RequirePermFlagForRepo`), so a handler
+   test can supply a permission state instead of a stubbed verdict.
+2. Then drive both `/seafhttp/files/:token` and `/seafhttp/zip/:token` with
+   `download` revoked and assert 403 plus the absence of any ZIP header or body
+   bytes — the regression originally requested for this defect.
+3. Alternatively, cover it in `internal/integration` against real Cassandra,
+   which also exercises token issuance and revocation ordering.
+
+### Regression Tests To Keep
+
+`TestAuthorizeDownloadDeniesWhenTheDownloadFlagIsRevoked` and
+`TestBothDownloadSurfacesShareOneAuthorizationGate`
+(`internal/api/seafhttp_download_contract_test.go`) — the first is the one that
+fails if the granular flag result stops being honoured.
+
+---
+
+*Last updated: 2026-07-23*
