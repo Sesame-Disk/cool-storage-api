@@ -141,57 +141,6 @@ func TestPerUserStorageQuotaBlocksUploadBeforeOrgQuota(t *testing.T) {
 	}
 }
 
-func TestDeduplicatedBlockUploadSkipsStorageQuota(t *testing.T) {
-	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
-	originalUser := getAdminUserByEmail(t, defaultUserEmail)
-	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
-
-	blockContent := []byte(fmt.Sprintf("deduplicated block uploads should not consume additional storage quota %d", time.Now().UnixNano()))
-
-	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
-		"storage_quota": int64(1 << 50),
-		"quota_policy":  "hard",
-	})
-
-	baselineUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
-	updateResp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
-		// These integration tests share the default user, so quota_usage may
-		// already be non-zero from earlier tests even when cleanup is working.
-		// Budget relative to the live baseline instead of assuming an empty user.
-		"quota_total": baselineUsage + int64(len(blockContent)) + 16,
-	})
-	expectStatus(t, updateResp, http.StatusOK)
-	updateResp.Body.Close()
-
-	firstStatus, firstBody := uploadRawBlockStatus(t, userClient, blockContent)
-	if firstStatus != http.StatusCreated {
-		t.Fatalf("first block upload status = %d, want %d; body=%s", firstStatus, http.StatusCreated, firstBody)
-	}
-	if got, ok := firstBody["new"].(bool); !ok || !got {
-		t.Fatalf("first block upload new = %v, want true; body=%v", firstBody["new"], firstBody)
-	}
-
-	updateResp = superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
-		"quota_total": int64(1),
-	})
-	expectStatus(t, updateResp, http.StatusOK)
-	updateResp.Body.Close()
-
-	secondStatus, secondBody := uploadRawBlockStatus(t, userClient, blockContent)
-	if secondStatus != http.StatusOK {
-		t.Fatalf("deduplicated block upload status = %d, want %d; body=%v", secondStatus, http.StatusOK, secondBody)
-	}
-	if got, ok := secondBody["new"].(bool); !ok || got {
-		t.Fatalf("deduplicated block upload new = %v, want false; body=%v", secondBody["new"], secondBody)
-	}
-	if got, ok := secondBody["size"].(float64); !ok || int64(got) != int64(len(blockContent)) {
-		t.Fatalf("deduplicated block upload size = %v, want %d; body=%v", secondBody["size"], len(blockContent), secondBody)
-	}
-	if _, hasError := secondBody["error"]; hasError {
-		t.Fatalf("deduplicated block upload returned error payload: %v", secondBody)
-	}
-}
-
 func TestDeduplicatedSyncBlockUploadSkipsStorageQuota(t *testing.T) {
 	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
 	originalUser := getAdminUserByEmail(t, defaultUserEmail)
@@ -475,15 +424,26 @@ func TestV2BlockUploadTrafficQuotaExceeded(t *testing.T) {
 		"quota_policy":           "hard",
 	})
 
-	status, payload := uploadRawBlockStatus(t, userClient, []byte("hello"))
-	if status != http.StatusForbidden {
-		t.Fatalf("v2 block upload traffic status = %d, want %d; body=%v", status, http.StatusForbidden, payload)
+	// The traffic-quota check runs before session admission, so a session upload
+	// hits it exactly as the removed no-session path did. Since the no-session
+	// route is now rejected outright, the session upload is where this coverage
+	// has to live.
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-block-traffic-%d", time.Now().UnixNano()))
+	content := []byte("hello traffic " + fmt.Sprint(time.Now().UnixNano()))
+	session := webCreateBlockSession(t, userClient, repoID, "/", int64(len(content)))
+	resp := webUploadBlock(t, userClient, session, content)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		body := responseBody(t, resp)
+		t.Fatalf("block upload traffic status = %d, want %d; body=%s", resp.StatusCode, http.StatusForbidden, body)
 	}
+	var payload map[string]interface{}
+	decodeJSON(t, resp, &payload)
 	if payload["error"] != "traffic quota exceeded" {
-		t.Fatalf("v2 block upload error = %v, want traffic quota exceeded", payload["error"])
+		t.Fatalf("block upload error = %v, want traffic quota exceeded", payload["error"])
 	}
 	if payload["reason"] != "traffic-upload" {
-		t.Fatalf("v2 block upload reason = %v, want traffic-upload", payload["reason"])
+		t.Fatalf("block upload reason = %v, want traffic-upload", payload["reason"])
 	}
 }
 
@@ -788,38 +748,6 @@ func uploadChunkThroughLinkStatus(t *testing.T, c *testClient, uploadURL, fileNa
 		t.Fatalf("reading chunk upload response failed: %v", err)
 	}
 	return resp.StatusCode, string(body)
-}
-
-func uploadRawBlockStatus(t *testing.T, c *testClient, content []byte) (int, map[string]interface{}) {
-	t.Helper()
-
-	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/v2/blocks/upload", bytes.NewReader(content))
-	if err != nil {
-		t.Fatalf("creating block upload request failed: %v", err)
-	}
-	req.Header.Set("Authorization", "Token "+c.token)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = int64(len(content))
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		t.Fatalf("block upload request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("reading block upload response failed: %v", err)
-	}
-
-	payload := map[string]interface{}{}
-	if len(bytes.TrimSpace(body)) > 0 {
-		if err := json.Unmarshal(body, &payload); err != nil {
-			t.Fatalf("decoding block upload response failed: %v body=%s", err, string(body))
-		}
-	}
-
-	return resp.StatusCode, payload
 }
 
 // releaseSyncStagedBlockForTest tears down one block staged by the sync/seafhttp upload
