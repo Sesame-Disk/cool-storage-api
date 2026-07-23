@@ -72,7 +72,9 @@ without the prior HEAD. The probe is wired into all seven governed upload funnel
 upload paths* listed above. It is **not** a global removal of the S3 HEAD:
 - The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
   (`internal/storage/blocks.go`) remain for legacy callers. Session-mode
-  `v2/blocks.go` is migrated; its metadata-free no-session branch is deferred to PR-7.
+  `v2/blocks.go` is migrated; its metadata-free no-session branch was removed in
+  PR-7 (finding F8) — a session-less `/blocks/upload` now returns 400 before any
+  store I/O.
 - The `Reusable` path no longer skips S3 entirely. To avoid trusting Cassandra
   metadata for a physical object that could be missing (partial GC, external
   deletion, eventual consistency, bugs), `EnsureReusableBlockPresent` does a
@@ -201,8 +203,9 @@ sync `PutBlock`, OnlyOffice — ends in `UpsertBlockMetadata`, which is an
 `INSERT INTO blocks ... IF NOT EXISTS`
 ([block_references.go:131](../internal/db/block_references.go#L131)): **one
 lightweight transaction per block**. The defective no-session legacy path tracked
-as F8 is the exception: it writes only the S3 object and never reaches metadata
-registration.
+as F8 used to be the production exception: it wrote only the S3 object and never
+reached metadata registration. PR-7 removed that path, so every remaining
+supported production upload surface registers metadata.
 
 It is load-bearing, not incidental. `storage_class`/`storage_key` are not globally
 fixed per block — uploads pick a class per library and per routing region — so
@@ -221,14 +224,15 @@ revision of this section said "the legacy resumable path pays none of them". Tha
 false. `finalizeUploadStreaming` splits a resumable upload into `uploadBlockSize`
 (8 MB) blocks and calls `registerUploadedBlockAndMappingForUploadFn` →
 `RegisterUploadedBlock` → `UpsertBlockMetadata` for each one, so a 1 GB resumable
-upload pays the same ~128 LWTs. Both governed upload modes carry the identical cost;
-F8's no-session branch remains the exception because it skips registration entirely.
+upload pays the same ~128 LWTs. Both governed upload modes carry the identical cost.
+The F8 no-session branch used to skip registration entirely; PR-7 removed it, so
+there is no longer a supported public upload path that stores block bytes without
+metadata.
 
 That changes what this finding means. It is **not** a reason block upload might lose
 to resumable — neither is cheaper. It is a general per-block cost on every upload
 surface that registers metadata, and removing it improves all of them at once, which
-strengthens rather than weakens the case for doing it. F8 remains outside that set
-until its missing governance is fixed.
+strengthens rather than weakens the case for doing it.
 
 The LWT is scoped to the `(org_id, block_id)` partition, so writers of *different*
 blocks never contend. The cost is latency per block, not lock contention.
@@ -401,7 +405,7 @@ file-sharing protocols.
 | P-1 | Permit serialized S3 PUT                       | ✅ Confirmed   | CRITICAL   | **RESOLVED** |
 | P-2 | Double S3 RTT per block (Exists + PUT)         | ✅ Confirmed   | HIGH→MEDIUM| **RESOLVED** |
 | P-3 | Benchmarks 44–48 MB/s, no scaling              | ❓ Plausible   | —          | External     |
-| P-4 | 1 global Paxos/block on both governed upload modes; F8 no-session is the exception. (The pre-store and post-reference `blocks` reads are required observation points, and PR-5 adds a required post-materialization confirmation; none is part of the Paxos optimization.) | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
+| P-4 | 1 global Paxos/block on every governed production upload surface (F8 no-session exception removed in PR-7). (The pre-store and post-reference `blocks` reads are required observation points, and PR-5 adds a required post-materialization confirmation; none is part of the Paxos optimization.) | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
 | S-1 | Chunk state node-local (multi-node blocker)    | ✅ Confirmed   | HIGH       | Pending      |
 | S-2 | max_upload_mb not enforced on chunked uploads  | ✅ Fixed       | MEDIUM     | Complete     |
 | S-3 | Full /tmp staging, no disk admission limit     | ✅ Mitigated   | MEDIUM     | Guard added; config still required |
@@ -421,4 +425,4 @@ without a database connection.
 | 3 | S-1 | Sticky sessions at LB (immediate) or distributed chunk state (complete) | Required for multi-node topology |
 | 4 | S-2/S-3 | Roll out a real `chunked_staging_max_bytes` value per node | Operational hardening follow-through |
 | 5 | S-4 | Atomic quota reservation at upload start | Closes the concurrent over-quota window |
-| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT. **Preserve the fresh post-reference fence read** — do not merge it with the pre-PUT probe. | Removes one global Paxos round per block. Both governed upload modes pay it equally, so the win applies to every metadata-registering upload surface; F8's defective no-session path is the exception. Measure first. |
+| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT. **Preserve the fresh post-reference fence read** — do not merge it with the pre-PUT probe. | Removes one global Paxos round per block. Both governed upload modes pay it equally, so the win applies to every governed production upload surface (the F8 no-session exception was removed in PR-7). Measure first. |

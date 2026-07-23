@@ -65,4 +65,14 @@ describe('seafileAPI block-upload session id transport', () => {
     expect(helperBody).toMatch(/Object\.assign\(\{\}, requestConfig/);
     expect(helperBody).not.toMatch(/requestConfig\.headers\[/);
   });
+
+  test('withBlockUploadSessionHeader throws on a missing session instead of dropping the header', () => {
+    // A falsy session must fail loudly, not return a header-less config. The
+    // server removed the no-session path (400 block_upload_session_required), so
+    // silently dropping the header would fire a doomed request whose bytes leak as
+    // an S3 orphan and whose commit is later refused — with no error surfaced.
+    const helperBody = apiContent.match(/function withBlockUploadSessionHeader[\s\S]*?\n}/)[0];
+    expect(helperBody).toMatch(/if\s*\(!session\)\s*\{[\s\S]*?throw /);
+    expect(helperBody).not.toMatch(/if\s*\(!session\)\s*\{[\s\S]*?return requestConfig/);
+  });
 });

@@ -943,8 +943,9 @@ This is fixed for the *server-side hot upload paths*, not across the whole repo:
 
 - The `BlockStore` methods `PutBlockAuto` / `PutBlock` / `PutBlockData`
   (`internal/storage/blocks.go`) still do `Exists` + `PutAuto` for legacy callers;
-  the session-mode `v2/blocks.go` handler is migrated, while its intentionally
-  metadata-free no-session branch remains deferred to PR-7.
+  the session-mode `v2/blocks.go` handler is migrated, and its intentionally
+  metadata-free no-session branch was removed outright in PR-7 (finding F8), so
+  there is no longer a no-session handler path to migrate.
 - The `Reusable` path does not skip S3: `EnsureReusableBlockPresent` adds a targeted
   HEAD on the canonical key (with repair-on-miss) so the upload never publishes a
   reference to a physically-missing object. This is a deliberate safety/perf trade —

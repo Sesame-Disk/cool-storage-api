@@ -150,7 +150,11 @@ func TestCheckBlocks_InvalidSHA256(t *testing.T) {
 	}
 }
 
-func TestCheckBlocks_NilBlockStore(t *testing.T) {
+// The no-session /blocks/check oracle was removed with the no-session upload path
+// it was paired with. A session-less check is now rejected with 400 before it can
+// touch any store, so this replaces the old "nil block store -> 503" test whose
+// scenario (a session-less request reaching the store) no longer exists.
+func TestCheckBlocks_NoSessionIsRejected(t *testing.T) {
 	hash := strings.Repeat("a", 64)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -165,8 +169,15 @@ func TestCheckBlocks_NilBlockStore(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if resp["code"] != blockUploadSessionRequiredCode {
+		t.Fatalf("code = %v, want %q", resp["code"], blockUploadSessionRequiredCode)
 	}
 }
 
@@ -453,131 +464,6 @@ func TestCheckBlocksReusableCandidatesParallel_ProbesMetadataFirst(t *testing.T)
 	}
 }
 
-func TestCheckBlocks_NoSessionUsesLegacyStoreAndNormalizesHashes(t *testing.T) {
-	origNewReader := checkBlocksNewCanonicalReaderFn
-	t.Cleanup(func() { checkBlocksNewCanonicalReaderFn = origNewReader })
-	var canonicalReaderCalls atomic.Int32
-	checkBlocksNewCanonicalReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
-		canonicalReaderCalls.Add(1)
-		return nil, errors.New("no-session check must remain paired with legacy upload")
-	}
-
-	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
-	existingHash := strings.Repeat("a", 64)
-	uppercaseExistingHash := strings.ToUpper(existingHash)
-	missingHash := strings.Repeat("b", 64)
-	wantExistingPath := "/test-bucket/blocks/" + orgID + "/aa/aa/" + existingHash
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead && r.URL.Path == wantExistingPath {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-	s3Store, err := storage.NewS3Store(context.Background(), storage.S3Config{
-		Endpoint: server.URL, Bucket: "test-bucket", Region: "us-east-1",
-		AccessKeyID: "test", SecretAccessKey: "test", UsePathStyle: true,
-	})
-	if err != nil {
-		t.Fatalf("NewS3Store() error = %v", err)
-	}
-
-	r := gin.New()
-	r.Use(func(c *gin.Context) {
-		c.Set("org_id", orgID)
-		c.Next()
-	})
-	r.POST("/api/v2/blocks/check", (&BlockHandler{db: &db.DB{}, storage: s3Store}).CheckBlocks)
-	body, _ := json.Marshal(CheckBlocksRequest{Hashes: []string{uppercaseExistingHash, missingHash, existingHash, missingHash}})
-	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
-	}
-	if canonicalReaderCalls.Load() != 0 {
-		t.Fatalf("canonical reader calls = %d, want 0 for no-session flow", canonicalReaderCalls.Load())
-	}
-	var response CheckBlocksResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-	wantExisting := []string{uppercaseExistingHash, existingHash}
-	wantMissing := []string{missingHash, missingHash}
-	if fmt.Sprint(response.Existing) != fmt.Sprint(wantExisting) {
-		t.Fatalf("existing = %v, want %v", response.Existing, wantExisting)
-	}
-	if fmt.Sprint(response.Missing) != fmt.Sprint(wantMissing) {
-		t.Fatalf("missing = %v, want %v", response.Missing, wantMissing)
-	}
-}
-
-func TestCheckBlocks_NoSessionNilDBUsesOrgScopedPreferredStore(t *testing.T) {
-	origNewReader := checkBlocksNewCanonicalReaderFn
-	t.Cleanup(func() { checkBlocksNewCanonicalReaderFn = origNewReader })
-	var canonicalReaderCalls atomic.Int32
-	checkBlocksNewCanonicalReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
-		canonicalReaderCalls.Add(1)
-		return nil, errors.New("canonical reader must not be constructed without a DB")
-	}
-
-	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
-	existingHash := strings.Repeat("a", 64)
-	missingHash := strings.Repeat("b", 64)
-	wantExistingPath := "/test-bucket/blocks/" + orgID + "/aa/aa/" + existingHash
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead && r.URL.Path == wantExistingPath {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	s3Store, err := storage.NewS3Store(context.Background(), storage.S3Config{
-		Endpoint:        server.URL,
-		Bucket:          "test-bucket",
-		Region:          "us-east-1",
-		AccessKeyID:     "test",
-		SecretAccessKey: "test",
-		UsePathStyle:    true,
-	})
-	if err != nil {
-		t.Fatalf("NewS3Store() error = %v", err)
-	}
-
-	r := gin.New()
-	r.Use(func(c *gin.Context) {
-		c.Set("org_id", orgID)
-		c.Next()
-	})
-	r.POST("/api/v2/blocks/check", (&BlockHandler{storage: s3Store}).CheckBlocks)
-	body, _ := json.Marshal(CheckBlocksRequest{Hashes: []string{existingHash, missingHash, existingHash}})
-	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
-	}
-	if canonicalReaderCalls.Load() != 0 {
-		t.Fatalf("canonical reader calls = %d, want 0 without a DB", canonicalReaderCalls.Load())
-	}
-	var response CheckBlocksResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := fmt.Sprint(response.Existing), fmt.Sprint([]string{existingHash, existingHash}); got != want {
-		t.Fatalf("existing = %v, want duplicates in request order", response.Existing)
-	}
-	if got, want := fmt.Sprint(response.Missing), fmt.Sprint([]string{missingHash}); got != want {
-		t.Fatalf("missing = %v, want %v", response.Missing, []string{missingHash})
-	}
-}
-
 func TestCheckBlocksReadyParallel_UsesCanonicalExistenceBeforeOwnership(t *testing.T) {
 	origClassify := checkBlocksClassifyOwnershipFn
 	defer func() {
@@ -808,20 +694,30 @@ func TestGetBlockStoreUsesForwardedHostForRegionRouting(t *testing.T) {
 	}
 }
 
-func TestUploadBlock_NoContentLength(t *testing.T) {
+// A session-less upload is rejected with 400 block_upload_session_required before
+// the body is read, so it can never leave an unreferenced S3 object behind (F8).
+// The per-session content-length and size guards below it run only for a valid
+// session and are exercised end to end in internal/integration/web_block_upload_test.go.
+func TestUploadBlock_NoSessionIsRejected(t *testing.T) {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
 	h := &BlockHandler{storageManager: nil, config: nil}
 	r.POST("/api/v2/blocks/upload", h.UploadBlock)
 
-	req, _ := http.NewRequest("POST", "/api/v2/blocks/upload", nil)
-	req.ContentLength = 0
+	req, _ := http.NewRequest("POST", "/api/v2/blocks/upload", bytes.NewReader([]byte("some block bytes")))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if resp["code"] != blockUploadSessionRequiredCode {
+		t.Fatalf("code = %v, want %q", resp["code"], blockUploadSessionRequiredCode)
 	}
 }
 
@@ -1341,34 +1237,30 @@ func TestStagedBlockBucketCap(t *testing.T) {
 	})
 }
 
-// TestBlockBodyLimit covers that a session-mode upload is bounded to the CAS
-// block size (not chunking.absolute_max), so the per-user concurrency cap is a
-// meaningful RAM bound (cap × block_size), while the legacy no-session path keeps
-// the larger absolute_max bound (variable FastCDC sync blocks).
+// TestBlockBodyLimit covers that a session upload is bounded to the CAS block
+// size (not chunking.absolute_max), so the per-user concurrency cap is a
+// meaningful RAM bound (cap × block_size). There is no no-session branch: that
+// path is rejected in UploadBlock before the body is read (F8).
 func TestBlockBodyLimit(t *testing.T) {
 	const blockSizeMB = 8
-	const absoluteMax = 256 * 1024 * 1024
 	cfg := &config.Config{}
 	cfg.WebUploads.WebBlockUploadBlockSizeMB = blockSizeMB
-	cfg.Chunking.Adaptive.AbsoluteMax = absoluteMax
+	cfg.Chunking.Adaptive.AbsoluteMax = 256 * 1024 * 1024
 	h := &BlockHandler{config: cfg}
 
-	if got := h.blockBodyLimit(uploadSessionValid, db.BlockUploadSession{}); got != int64(blockSizeMB)*1024*1024 {
-		t.Fatalf("session-mode body limit = %d, want %d (the CAS block size, not absolute_max)", got, int64(blockSizeMB)*1024*1024)
-	}
-	if got := h.blockBodyLimit(uploadSessionAbsent, db.BlockUploadSession{}); got != absoluteMax {
-		t.Fatalf("legacy body limit = %d, want %d (chunking.absolute_max)", got, absoluteMax)
+	if got := h.blockBodyLimit(db.BlockUploadSession{}); got != int64(blockSizeMB)*1024*1024 {
+		t.Fatalf("body limit = %d, want %d (the configured CAS block size, never absolute_max)", got, int64(blockSizeMB)*1024*1024)
 	}
 
 	session := db.BlockUploadSession{BlockSizeBytes: 4 * 1024 * 1024}
-	if got := h.blockBodyLimit(uploadSessionValid, session); got != session.BlockSizeBytes {
-		t.Fatalf("session-mode body limit = %d, want persisted session block size %d", got, session.BlockSizeBytes)
+	if got := h.blockBodyLimit(session); got != session.BlockSizeBytes {
+		t.Fatalf("body limit = %d, want persisted session block size %d", got, session.BlockSizeBytes)
 	}
 }
 
-// TestUploadBlockPerUserConcurrencyCap covers the handler wiring: a session-mode
+// TestUploadBlockPerUserConcurrencyCap covers the handler wiring: a session
 // upload is admitted until the user's cap is full, then rejected with 429 +
-// Retry-After, while a non-session (legacy) request is never capped.
+// Retry-After.
 func TestUploadBlockPerUserConcurrencyCap(t *testing.T) {
 	newCtx := func() (*gin.Context, *httptest.ResponseRecorder) {
 		w := httptest.NewRecorder()
@@ -1379,46 +1271,30 @@ func TestUploadBlockPerUserConcurrencyCap(t *testing.T) {
 		return c, w
 	}
 
-	t.Run("session mode rejects over the cap with 429 + Retry-After", func(t *testing.T) {
-		h := &BlockHandler{uploadLimiter: newBlockUploadConcurrencyLimiter(1)}
+	h := &BlockHandler{uploadLimiter: newBlockUploadConcurrencyLimiter(1)}
 
-		c1, _ := newCtx()
-		release, ok := h.tryAdmitSessionUpload(c1, uploadSessionValid)
-		if !ok {
-			t.Fatal("first session upload should be admitted")
-		}
+	c1, _ := newCtx()
+	release, ok := h.tryAdmitSessionUpload(c1)
+	if !ok {
+		t.Fatal("first session upload should be admitted")
+	}
 
-		c2, w2 := newCtx()
-		_, ok = h.tryAdmitSessionUpload(c2, uploadSessionValid)
-		if ok {
-			t.Fatal("second concurrent session upload should be rejected at the cap")
-		}
-		if w2.Code != http.StatusTooManyRequests {
-			t.Fatalf("status = %d, want %d", w2.Code, http.StatusTooManyRequests)
-		}
-		if got := w2.Header().Get("Retry-After"); got == "" {
-			t.Fatal("expected a Retry-After header on the 429")
-		}
+	c2, w2 := newCtx()
+	_, ok = h.tryAdmitSessionUpload(c2)
+	if ok {
+		t.Fatal("second concurrent session upload should be rejected at the cap")
+	}
+	if w2.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", w2.Code, http.StatusTooManyRequests)
+	}
+	if got := w2.Header().Get("Retry-After"); got == "" {
+		t.Fatal("expected a Retry-After header on the 429")
+	}
 
-		// Releasing the first slot lets a later upload through again.
-		release()
-		c3, _ := newCtx()
-		if _, ok := h.tryAdmitSessionUpload(c3, uploadSessionValid); !ok {
-			t.Fatal("upload after release should be admitted")
-		}
-	})
-
-	t.Run("non-session (legacy) uploads are never capped", func(t *testing.T) {
-		h := &BlockHandler{uploadLimiter: newBlockUploadConcurrencyLimiter(1)}
-		for i := 0; i < 5; i++ {
-			c, w := newCtx()
-			_, ok := h.tryAdmitSessionUpload(c, uploadSessionAbsent)
-			if !ok {
-				t.Fatalf("legacy no-session upload %d should never be capped", i)
-			}
-			if w.Code != http.StatusOK {
-				t.Fatalf("legacy path should not write an error status, got %d", w.Code)
-			}
-		}
-	})
+	// Releasing the first slot lets a later upload through again.
+	release()
+	c3, _ := newCtx()
+	if _, ok := h.tryAdmitSessionUpload(c3); !ok {
+		t.Fatal("upload after release should be admitted")
+	}
 }

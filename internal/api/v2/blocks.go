@@ -459,22 +459,19 @@ func (l *blockUploadConcurrencyLimiter) release(userKey string) {
 }
 
 // blockBodyLimit is the maximum request body a /blocks/upload call may buffer in
-// memory (io.ReadAll). For the web (session) flow every block is exactly the
-// CAS block size frozen onto the session at creation time (the last block is ≤
-// it), so a session request is bounded to THAT size — NOT
-// chunking.adaptive.absolute_max, which can be 256 MB and would let one
-// authenticated user force a 256 MB allocation per request, making the per-user
-// concurrency cap (item 18) almost useless for RAM protection (cap × 256 MB =
-// GBs). The legacy no-session path (desktop/mobile sync, variable FastCDC blocks
-// up to absolute_max) keeps the larger bound.
-func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution, session db.BlockUploadSession) int64 {
-	if resolution == uploadSessionValid {
-		if session.BlockSizeBytes > 0 {
-			return session.BlockSizeBytes
-		}
-		return h.config.WebBlockUploadBlockSize()
+// memory (io.ReadAll). Every block is exactly the CAS block size frozen onto the
+// session at creation time (the last block is ≤ it), so a request is bounded to
+// THAT size — NOT chunking.adaptive.absolute_max, which can be 256 MB and would
+// let one authenticated user force a 256 MB allocation per request, making the
+// per-user concurrency cap (item 18) almost useless for RAM protection
+// (cap × 256 MB = GBs). Only a valid session reaches here; the no-session path is
+// rejected in UploadBlock before the body is touched (F8), so there is no longer
+// an absolute_max branch.
+func (h *BlockHandler) blockBodyLimit(session db.BlockUploadSession) int64 {
+	if session.BlockSizeBytes > 0 {
+		return session.BlockSizeBytes
 	}
-	return h.config.Chunking.Adaptive.AbsoluteMax
+	return h.config.WebBlockUploadBlockSize()
 }
 
 // staged-block bucket cap headroom. The per-bucket cap is
@@ -489,6 +486,25 @@ const stagedBlockBucketCapFactor = 2
 const stagedBlockBucketSlack = 3
 
 const blockUploadStagingCapReachedCode = "staging_cap_reached"
+
+// blockUploadSessionRequiredCode is returned when /blocks/upload or /blocks/check
+// is called without an upload session. The legacy no-session branch was removed:
+// on upload it wrote an S3 object with no `blocks` row and no reference (F8) — an
+// eternal orphan nothing reclaims, since GC discovers blocks through candidates —
+// and its paired no-session /blocks/check was a bare-hash existence oracle with no
+// writer left to justify it. Every real client sends a session (web sends
+// X-Block-Upload-Session; desktop/mobile use /seafhttp/), so this rejects only
+// malformed callers and fails them loudly instead of leaking.
+const blockUploadSessionRequiredCode = "block_upload_session_required"
+
+// respondBlockUploadSessionRequired is the single 400 both endpoints emit for a
+// missing session, so the two cannot drift on status or code.
+func respondBlockUploadSessionRequired(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error": "block upload requires an active upload session",
+		"code":  blockUploadSessionRequiredCode,
+	})
+}
 
 // blockUploadStagingAdmissionFromConfig derives the immutable staging-admission
 // contract for a NEW session from the then-current config. The result is frozen
@@ -535,17 +551,14 @@ func (h *BlockHandler) stagedBlockBucketCap(session db.BlockUploadSession) (buck
 }
 
 // tryAdmitSessionUpload enforces the per-user concurrency cap for the web
-// (session) flow. For a valid session it reserves a slot keyed by
-// "org_id:user_id"; if the user is already at the cap it emits 429 + Retry-After
-// (counted by BlockUploadConcurrencyRejectionsTotal) and returns ok=false. When
-// ok is true the caller MUST defer the returned release. Non-session requests
-// (legacy sync path) are never capped — release is a no-op and ok is always
-// true. A 429 is retryable: the web client's withRetry loop backs off and
-// re-sends, so legitimate bursts self-throttle instead of failing.
-func (h *BlockHandler) tryAdmitSessionUpload(c *gin.Context, resolution uploadSessionResolution) (release func(), ok bool) {
-	if resolution != uploadSessionValid {
-		return func() {}, true
-	}
+// (session) upload flow. It reserves a slot keyed by "org_id:user_id"; if the
+// user is already at the cap it emits 429 + Retry-After (counted by
+// BlockUploadConcurrencyRejectionsTotal) and returns ok=false. When ok is true
+// the caller MUST defer the returned release. A 429 is retryable: the web
+// client's withRetry loop backs off and re-sends, so legitimate bursts
+// self-throttle instead of failing. Only reached for a valid session — the
+// no-session path is rejected in UploadBlock before this (F8).
+func (h *BlockHandler) tryAdmitSessionUpload(c *gin.Context) (release func(), ok bool) {
 	userKey := c.GetString("org_id") + ":" + c.GetString("user_id")
 	if !h.uploadLimiter.tryAcquire(userKey) {
 		metrics.BlockUploadConcurrencyRejectionsTotal.Inc()
@@ -793,57 +806,29 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 	}
 
 	session, resolution := h.resolveUploadSession(c)
-	if resolution != uploadSessionAbsent && resolution != uploadSessionValid {
+	if resolution == uploadSessionAbsent {
+		// The paired no-session oracle went with the no-session upload path it
+		// existed to serve (see blockUploadSessionRequiredCode). Without a
+		// session this is a bare-hash existence probe and nothing legitimate
+		// reaches it, so it fails closed rather than answering.
+		respondBlockUploadSessionRequired(c)
+		return
+	}
+	if resolution != uploadSessionValid {
 		c.JSON(resolution.deniedStatus(), gin.H{"error": resolution.deniedMessage()})
 		return
 	}
 
-	if resolution == uploadSessionValid {
-		resp, err := h.checkBlocksForSession(c, session, req.Hashes)
-		if err != nil {
-			if errors.Is(err, errSessionCheckBlockStoreUnavailable) {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
+	resp, err := h.checkBlocksForSession(c, session, req.Hashes)
+	if err != nil {
+		if errors.Is(err, errSessionCheckBlockStoreUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 			return
 		}
-		c.JSON(http.StatusOK, resp)
-		return
-	}
-
-	normalizedHashes := make([]string, len(req.Hashes))
-	for i, hash := range req.Hashes {
-		normalizedHashes[i] = db.NormalizeBlockID(hash)
-	}
-	uniqueHashes := dedupePreserveOrder(normalizedHashes)
-	// Keep the legacy no-session oracle paired with its metadata-free upload
-	// endpoint. PR-7 will govern and canonicalize both together.
-	blockStore, _ := h.getBlockStore(c)
-	if blockStore == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-		return
-	}
-	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, blockProbeConcurrency)
-	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 		return
 	}
-
-	// Separate into existing and missing
-	var existing, missing []string
-	for i, hash := range req.Hashes {
-		if existsMap[normalizedHashes[i]] {
-			existing = append(existing, hash)
-		} else {
-			missing = append(missing, hash)
-		}
-	}
-
-	c.JSON(http.StatusOK, CheckBlocksResponse{
-		Existing: existing,
-		Missing:  missing,
-	})
+	c.JSON(http.StatusOK, resp)
 }
 
 // UploadBlockResponse is the response after uploading a block
@@ -858,11 +843,19 @@ type UploadBlockResponse struct {
 // The block content is sent in the request body
 // The hash is computed server-side and verified
 func (h *BlockHandler) UploadBlock(c *gin.Context) {
-	// Optional web-flow session: when present, the block is materialized
-	// (metadata + provisional ref owned by the session) after storage, so an
-	// abandoned upload self-expires and a later commit can publish it (R9).
+	// A web-flow session is REQUIRED. The block is materialized (metadata +
+	// provisional ref owned by the session) after storage, so an abandoned upload
+	// self-expires and a later commit can publish it (R9). A session-less request
+	// is rejected below (F8) — there is no metadata-free upload path anymore.
 	session, resolution := h.resolveUploadSession(c)
-	if resolution != uploadSessionAbsent && resolution != uploadSessionValid {
+	if resolution == uploadSessionAbsent {
+		// No-session upload is rejected before the body is read, so a malformed
+		// client cannot even allocate the block buffer, let alone leave an
+		// unreferenced S3 object behind (F8).
+		respondBlockUploadSessionRequired(c)
+		return
+	}
+	if resolution != uploadSessionValid {
 		c.JSON(resolution.deniedStatus(), gin.H{"error": resolution.deniedMessage()})
 		return
 	}
@@ -871,7 +864,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// block body is read into RAM (io.ReadAll below), so a rejected request never
 	// allocates the ~8–16 MB buffer — this is what bounds a single user's
 	// instantaneous memory footprint under a burst (item 18).
-	release, ok := h.tryAdmitSessionUpload(c, resolution)
+	release, ok := h.tryAdmitSessionUpload(c)
 	if !ok {
 		return
 	}
@@ -883,11 +876,10 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
-	// Check against maximum block size. For the session (web) flow this is the
-	// configured CAS block size, not chunking.absolute_max — so one authenticated
-	// user cannot force a 256 MB buffer per request and defeat the per-user
-	// concurrency cap (item 18). Legacy sync keeps the larger absolute_max bound.
-	maxSize := h.blockBodyLimit(resolution, session)
+	// Check against maximum block size: the configured CAS block size, not
+	// chunking.absolute_max — so one authenticated user cannot force a 256 MB
+	// buffer per request and defeat the per-user concurrency cap (item 18).
+	maxSize := h.blockBodyLimit(session)
 	if c.Request.ContentLength > maxSize {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":    "block too large",
@@ -952,137 +944,87 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
-	// Session uploads probe metadata before storage so an existing placement is
+	// The upload probes metadata before storage so an existing placement is
 	// repaired in its canonical backend rather than the repo-preferred backend.
-	if resolution == uploadSessionValid {
-		preferredStore, preferredClass := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
-		if preferredStore == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-			return
-		}
-		var admissionOnce sync.Once
-		var admissionErr error
-		beforePut := func() error {
-			admissionOnce.Do(func() {
-				// Admission runs only for the first physical PUT. Retries and the
-				// post-materialization confirmation reuse its result.
-				if bucketCount, bucketCap, enabled := h.stagedBlockBucketCap(session); enabled {
-					bucket := db.StagedBlockBucket(hash, bucketCount)
-					staged, reserveErr := countSessionStagedBlocksFn(h.db, session.SessionID, bucket, bucketCap+1)
+	preferredStore, preferredClass := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
+	if preferredStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+	var admissionOnce sync.Once
+	var admissionErr error
+	beforePut := func() error {
+		admissionOnce.Do(func() {
+			// Admission runs only for the first physical PUT. Retries and the
+			// post-materialization confirmation reuse its result.
+			if bucketCount, bucketCap, enabled := h.stagedBlockBucketCap(session); enabled {
+				bucket := db.StagedBlockBucket(hash, bucketCount)
+				staged, reserveErr := countSessionStagedBlocksFn(h.db, session.SessionID, bucket, bucketCap+1)
+				if reserveErr != nil {
+					admissionErr = fmt.Errorf("%w: %v", errSessionStagingCheck, reserveErr)
+					return
+				}
+				if staged >= bucketCap {
+					reserved, reserveErr := sessionStagedBlockExistsFn(h.db, session.SessionID, bucket, hash)
 					if reserveErr != nil {
 						admissionErr = fmt.Errorf("%w: %v", errSessionStagingCheck, reserveErr)
 						return
 					}
-					if staged >= bucketCap {
-						reserved, reserveErr := sessionStagedBlockExistsFn(h.db, session.SessionID, bucket, hash)
-						if reserveErr != nil {
-							admissionErr = fmt.Errorf("%w: %v", errSessionStagingCheck, reserveErr)
-							return
-						}
-						if !reserved {
-							admissionErr = errSessionStagingCapReached
-						}
-						return
+					if !reserved {
+						admissionErr = errSessionStagingCapReached
 					}
-					if reserveErr := reserveSessionStagedBlockFn(h.db, session.SessionID, bucket, hash, int64(len(data))); reserveErr != nil {
-						admissionErr = fmt.Errorf("%w: %v", errSessionStagingReserve, reserveErr)
-					}
+					return
 				}
-			})
-			return admissionErr
-		}
-
-		var storageKey, storageClass string
-		var didPutAny bool
-		storeErr := RetryUploadedBlockMaterializationContext(c.Request.Context(), "UploadBlock", hash, func() error {
-			probe, probeErr := probeUploadedBlockReuseFn(h.db, session.OrgID, hash)
-			if probeErr == nil {
-				probe, probeErr = prepareUploadedBlockProbeFn(h.db, session.OrgID, hash, probe)
+				if reserveErr := reserveSessionStagedBlockFn(h.db, session.SessionID, bucket, hash, int64(len(data))); reserveErr != nil {
+					admissionErr = fmt.Errorf("%w: %v", errSessionStagingReserve, reserveErr)
+				}
 			}
-			if probeErr != nil {
-				return probeErr
-			}
-			resolvedKey, resolvedClass, didPut, putErr := StoreUploadedBlockForProbe(c.Request.Context(), hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut)
-			if putErr != nil {
-				return putErr
-			}
-			storageKey, storageClass = resolvedKey, resolvedClass
-			didPutAny = didPutAny || didPut
-			return nil
-		}, func() error {
-			return h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, storageKey)
-		}, nil, nil)
-		if errors.Is(storeErr, errSessionStagingCapReached) {
-			metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
-			c.Header("Retry-After", "1")
-			c.JSON(http.StatusTooManyRequests, gin.H{"error": "session staging limit reached; commit the file or start a new upload", "code": blockUploadStagingCapReachedCode})
-			return
-		}
-		if errors.Is(storeErr, errSessionStagingCheck) {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
-			return
-		}
-		if errors.Is(storeErr, errSessionStagingReserve) {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reserve staged block"})
-			return
-		}
-		if respondBlockMaterializeError(c, storeErr) {
-			return
-		}
-		recordBlockUploadTrafficFn(traffic.Get(), uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
-		metrics.BlockUploadStagedBlocksTotal.WithLabelValues(strconv.FormatBool(didPutAny)).Inc()
-		status := http.StatusOK
-		if didPutAny {
-			status = http.StatusCreated
-		}
-		c.JSON(status, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: didPutAny})
-		return
+		})
+		return admissionErr
 	}
 
-	blockStore, _ := h.getBlockStore(c)
-	if blockStore == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-		return
-	}
-	exists, err := blockStore.BlockExists(c.Request.Context(), hash)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
-		return
-	}
-	if exists {
-		recordBlockUploadTrafficFn(traffic.Get(), uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
-		c.JSON(http.StatusOK, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: false})
-		return
-	}
-
-	// The legacy no-session path retains its per-block logical quota check. Session
-	// uploads returned above and charge the final file delta only at commit.
-	if checker := traffic.GetChecker(); checker != nil {
-		if st, _ := checker.CheckStorageQuota(c.GetString("org_id"), c.GetString("user_id"), int64(len(data))); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-			return
+	var storageKey, storageClass string
+	var didPutAny bool
+	storeErr := RetryUploadedBlockMaterializationContext(c.Request.Context(), "UploadBlock", hash, func() error {
+		probe, probeErr := probeUploadedBlockReuseFn(h.db, session.OrgID, hash)
+		if probeErr == nil {
+			probe, probeErr = prepareUploadedBlockProbeFn(h.db, session.OrgID, hash, probe)
 		}
-	}
-
-	// Store the block
-	block := &storage.BlockData{
-		Hash: hash,
-		Data: data,
-		Size: int64(len(data)),
-	}
-
-	_, err = blockStore.PutBlockData(c.Request.Context(), block)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
+		if probeErr != nil {
+			return probeErr
+		}
+		resolvedKey, resolvedClass, didPut, putErr := StoreUploadedBlockForProbe(c.Request.Context(), hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut)
+		if putErr != nil {
+			return putErr
+		}
+		storageKey, storageClass = resolvedKey, resolvedClass
+		didPutAny = didPutAny || didPut
+		return nil
+	}, func() error {
+		return h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, storageKey)
+	}, nil, nil)
+	if errors.Is(storeErr, errSessionStagingCapReached) {
+		metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "session staging limit reached; commit the file or start a new upload", "code": blockUploadStagingCapReachedCode})
 		return
 	}
-
-	// Record traffic for newly stored block.
+	if errors.Is(storeErr, errSessionStagingCheck) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check staged blocks"})
+		return
+	}
+	if errors.Is(storeErr, errSessionStagingReserve) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reserve staged block"})
+		return
+	}
+	if respondBlockMaterializeError(c, storeErr) {
+		return
+	}
 	recordBlockUploadTrafficFn(traffic.Get(), uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
-
-	c.JSON(http.StatusCreated, UploadBlockResponse{
-		Hash: hash,
-		Size: int64(len(data)),
-		New:  true,
-	})
+	metrics.BlockUploadStagedBlocksTotal.WithLabelValues(strconv.FormatBool(didPutAny)).Inc()
+	status := http.StatusOK
+	if didPutAny {
+		status = http.StatusCreated
+	}
+	c.JSON(status, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: didPutAny})
 }

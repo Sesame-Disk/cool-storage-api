@@ -7,9 +7,10 @@ PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138) (closed 
 PR-3 merged as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), closing F6,
 F14 and the **observed-fence half** of F1. PR-4 merged as
 [#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4 and F7. PR-5 merged
-as [#141](https://github.com/Sesame-Disk/sesamefs/pull/141), closing F1 and F3. PR-6 is
-implemented on `fix/gc-download-fail-closed` and pending review. X1/X2 remain open and
-keep destructive GC disabled.
+as [#141](https://github.com/Sesame-Disk/sesamefs/pull/141), closing F1 and F3. PR-6 merged
+as [#142](https://github.com/Sesame-Disk/sesamefs/pull/142), closing F5 and F13. PR-7 is
+implemented on `feat/legacy-block-upload-governance` and pending review, closing F8.
+X1/X2 remain open and keep destructive GC disabled.
 
 ## Why this document exists
 
@@ -339,7 +340,8 @@ of the serving node's preferred backend — **together with**
 `internal/db/block_storage_location.go`, the read call sites (`fileview.go`,
 `sharelink_view.go`, `sync.go`, `seafhttp.go`) and canonical placement checks in the
 session upload/check/commit funnel. The metadata-free no-session check/upload pair
-remains on preferred-store routing until PR-7 governs and canonicalizes both together.
+remained on preferred-store routing until PR-7, which removed it outright (reject,
+not govern) rather than canonicalizing it.
 
 **Why these are one PR and not two.** An earlier draft split them and papered over
 the gap with "ship in the same release", which contradicts rule 1. They are not
@@ -589,21 +591,66 @@ test fails, the sibling test does not.
 
 ---
 
-### PR-7 — Legacy no-session upload governance
+### PR-7 — Legacy no-session upload removed (F8)
 
-**Scope:** `v2/blocks.go` legacy path writes canonical metadata plus a deterministic
-provisional pin; integration teardown extended to the `blocks` row, the provisional
-expiry and its by-day projection.
+**Decision (taken in review): reject, do not govern.** The plan offered two options
+for the no-session branch of `/api/v2/blocks/upload` — govern it (write canonical
+metadata + a deterministic provisional pin so GC can reclaim the object) or delete
+it. Deletion won, because governing would have invented a third class of
+provisional reference — one with no session to own it and no natural expiry — right
+before PR-8 hardens provisional-ref durability and while X3 (PUT-before-durable-intent)
+is still open. Rejecting removes the leak by construction instead of adding
+machinery to clean up after it, and it matches the project's "hard errors over
+fallbacks that mask corruption" stance.
 
-**Note:** the no-session branch of `/api/v2/blocks/upload` has no legitimate client —
-desktop and mobile use `/seafhttp/` — but it is reachable by any authenticated user
-regardless of the block-upload feature flag, which is why it is worth governing
-rather than deleting outright. Deleting it is a defensible alternative; decide in
-review.
+**Evidence it has no client.** The web frontend always sends `X-Block-Upload-Session`
+(`frontend/src/utils/seafile-api.js`); mobile-frontend never references the endpoint;
+desktop/mobile sync use `/seafhttp/`. The only callers were integration tests and a
+benchmark script that already documented it as "not a correctness benchmark".
 
-**Acceptance:** `-run TestWebBlockUpload` drains to a zero delta on
-blocks/mappings/refs/provisional rows/S3 objects, the property this work must not
-regress.
+**Scope:**
+- `v2/blocks.go` `UploadBlock`: a session-less request is rejected with **400
+  `block_upload_session_required`** before the body is read, so it can neither
+  allocate the block buffer nor leave an unreferenced S3 object (F8). The whole
+  legacy branch — `getBlockStore` → `BlockExists` → per-block quota → `PutBlockData`
+  — is deleted. Past the guard, `resolution` is provably `uploadSessionValid`; a
+  defensive `respondBlockUploadSessionRequired` stands where the dead branch was so
+  a future regression fails loudly instead of leaking again.
+- `v2/blocks.go` `CheckBlocks`: the paired no-session existence oracle is removed the
+  same way. A code comment had explicitly tied it to the no-session upload it served
+  ("PR-7 will govern and canonicalize both together"); with the writer gone it is a
+  bare-hash intra-org content oracle with nothing to justify it, so it too returns
+  400. `respondBlockUploadSessionRequired` is the single 400 both endpoints emit.
+- `frontend/src/utils/seafile-api.js` `withBlockUploadSessionHeader`: previously
+  dropped the header silently when `session` was falsy, so a frontend bug that left
+  `session` undefined fell through to the legacy path — bytes uploaded, orphaned,
+  and the later commit refused, all with no error surfaced. It now throws, turning
+  that silent failure into a visible one at its source.
+- `getBlockStore` (the generic hostname-routed store) is left in place though it now
+  has no production caller: its two unit tests pin the fail-closed P10 routing
+  contract (never serve an org-less global store), and the routes comment reserves
+  it for a future repo-scoped block-read flow. Removing it would delete
+  security-relevant regression coverage for no tidiness gain.
+
+**Acceptance (met):**
+- `TestNoSessionBlockEndpointsRejected` (integration) drives both endpoints without
+  a session, asserts 400 `block_upload_session_required`, and — the property that
+  mattered — asserts the rejected upload stored **no** S3 object, proving F8 closed
+  end to end.
+- `TestUploadBlock_NoSessionIsRejected` and `TestCheckBlocks_NoSessionIsRejected`
+  (unit) pin the same contract at the handler.
+- Legacy-path quota tests were retired with the path: the two per-block
+  storage-quota dedup tests were legacy-only semantics (session uploads charge the
+  file delta at commit, not per block) and were removed; `TestV2BlockUploadTrafficQuotaExceeded`
+  was converted to a session upload, since the traffic-quota check runs before
+  session admission and is now the only block-upload path. Session storage-quota
+  behaviour stays covered by `TestWebBlockUploadSessionStagingSkipsLogicalStorageQuota`
+  and `TestWebBlockUploadCommitEnforcesLogicalDelta`.
+- The S3-only-block fixture (`TestWebBlockUploadRejectsUncommittableBlocks`) now
+  writes straight to the store via `stageS3OnlyBlock` instead of through the deleted
+  endpoint — a more honest way to fabricate the "physically present, metadata-absent"
+  state it needs.
+- Full Compose integration suite green.
 
 ---
 
@@ -666,8 +713,9 @@ resumable upload into 8 MB blocks and calls `RegisterUploadedBlock` per block, s
 pays the same ~128 LWTs per GB. The cost is **shared by both governed upload modes**,
 which makes this a general optimization rather than something block upload has to
 fix to justify itself — and it means the win, if taken, applies to every
-metadata-registering upload surface. F8's no-session branch is the exception because
-it currently skips metadata registration.
+metadata-registering upload surface. F8's no-session branch was the exception because
+it skipped metadata registration — but PR-7 removed that branch, so every remaining
+upload path registers metadata and pays this cost.
 
 **Do not start this before measuring.** There is no per-statement latency metric for
 that INSERT yet; add it, get the production number, then decide. Full analysis: P-4

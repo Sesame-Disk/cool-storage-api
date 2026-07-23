@@ -289,6 +289,88 @@ func cleanupBlockUploadSessionForTest(t *testing.T, sessionID string) {
 	}
 }
 
+// TestNoSessionBlockEndpointsRejected proves the F8 fix end to end. Both block
+// endpoints reject a session-less request with 400 block_upload_session_required,
+// and — the property that actually mattered — the rejected upload leaves NO S3
+// object behind. Before PR-7 this exact request stored an orphan with no `blocks`
+// row and no reference that nothing could ever reclaim.
+func TestNoSessionBlockEndpointsRejected(t *testing.T) {
+	content := []byte("no session block " + fmt.Sprint(time.Now().UnixNano()))
+	hash := sha256hex(content)
+
+	t.Run("upload without a session is rejected and stores nothing", func(t *testing.T) {
+		// The store is resolved and the teardown registered BEFORE the request,
+		// not after. If a regression restored the old behaviour and stored the
+		// block, asserting the 400 first would t.Fatalf and skip a cleanup
+		// registered later — leaking into MinIO the exact orphan this test guards
+		// against. The store is also mandatory: without it the physical check
+		// cannot run, and a silent skip would let this pass without proving the
+		// end-to-end property it exists for.
+		store := blockStoreForCleanupOrNil(t, defaultOrgID)
+		if store == nil {
+			t.Fatal("cannot verify the anti-orphan property: block store unavailable")
+		}
+		t.Cleanup(func() {
+			if err := store.DeleteBlock(context.Background(), hash); err != nil {
+				t.Errorf("cleanup rejected-upload block %s: %v", hash, err)
+			}
+		})
+
+		req, err := http.NewRequest(http.MethodPost, adminClient.baseURL+"/api/v2/blocks/upload", bytes.NewReader(content))
+		if err != nil {
+			t.Fatalf("new upload request: %v", err)
+		}
+		req.Header.Set("Authorization", "Token "+adminClient.token)
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("X-Block-Hash", hash)
+		req.ContentLength = int64(len(content))
+		resp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("upload request failed: %v", err)
+		}
+		assertBlockUploadSessionRequired(t, resp)
+
+		exists, err := store.BlockExists(context.Background(), hash)
+		if err != nil {
+			t.Fatalf("check S3 object: %v", err)
+		}
+		if exists {
+			t.Fatal("a rejected no-session upload still stored an S3 object (F8 regression)")
+		}
+	})
+
+	t.Run("check without a session is rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"hashes":[%q]}`, hash)
+		req, err := http.NewRequest(http.MethodPost, adminClient.baseURL+"/api/v2/blocks/check", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("new check request: %v", err)
+		}
+		req.Header.Set("Authorization", "Token "+adminClient.token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("check request failed: %v", err)
+		}
+		assertBlockUploadSessionRequired(t, resp)
+	})
+}
+
+// assertBlockUploadSessionRequired checks the shared 400 contract both block
+// endpoints emit for a missing session.
+func assertBlockUploadSessionRequired(t *testing.T, resp *http.Response) {
+	t.Helper()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body := responseBody(t, resp)
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+	}
+	var payload map[string]interface{}
+	decodeJSON(t, resp, &payload)
+	if payload["code"] != "block_upload_session_required" {
+		t.Fatalf("code = %v, want block_upload_session_required; body=%v", payload["code"], payload)
+	}
+}
+
 // webUploadBlock POSTs raw block bytes under a session. Returns the response.
 func webUploadBlock(t *testing.T, c *testClient, session string, data []byte) *http.Response {
 	t.Helper()
@@ -309,44 +391,39 @@ func webUploadBlock(t *testing.T, c *testClient, session string, data []byte) *h
 	return resp
 }
 
-// webUploadBlockLegacy POSTs raw block bytes WITHOUT a session (S3 only, no
-// materialization) — mirrors the desktop/mobile oracle path.
+// stageS3OnlyBlock writes a block straight to the org's S3 store with NO `blocks`
+// row and no reference — a pure S3 orphan by construction. It replaces the old
+// no-session POST /api/v2/blocks/upload fixture: that endpoint used to be the way
+// to produce this exact "physically present, metadata-absent" state, but the
+// no-session path was removed (it was the F8 leak and had no real client). Writing
+// through the store directly is the honest fixture — it fabricates the corrupt
+// state the test needs without depending on a route that no longer exists.
 //
-// Teardown is registered here rather than left to callers because this path writes an
-// object with NO `blocks` row and no reference: it is a pure S3 orphan by construction.
-// Nothing reclaims it — GC discovers blocks through candidates, and its S3-orphan recovery
-// only replays its own in-flight deletes from `gc_s3_orphans`. So an untorn-down legacy
-// upload lives in the bucket forever (ISSUE-GC-TEST-RESIDUE-01 / branch 1B).
-//
-// The delete is reported, not swallowed: S3 DELETE is idempotent, so callers that assert a
-// rejection (e.g. quota 403) and never created the object still succeed here. That means a
-// real error is a real teardown failure — silently dropping it would leave the exact eternal
-// S3 object this teardown exists to remove, with the test still green.
-func webUploadBlockLegacy(t *testing.T, c *testClient, orgID string, data []byte) *http.Response {
+// Teardown is registered here because nothing reclaims such an object: GC discovers
+// blocks through candidates, and its S3-orphan recovery only replays its own
+// in-flight deletes from `gc_s3_orphans`, so an untorn-down orphan lives in the
+// bucket forever (ISSUE-GC-TEST-RESIDUE-01 / branch 1B). S3 DELETE is idempotent, so
+// a real cleanup error is a real teardown failure and must not be swallowed.
+func stageS3OnlyBlock(t *testing.T, orgID string, data []byte) {
 	t.Helper()
 
-	if blockStore := blockStoreForCleanupOrNil(t, orgID); blockStore != nil {
-		hash := sha256hex(data)
-		t.Cleanup(func() {
-			if err := blockStore.DeleteBlock(context.Background(), hash); err != nil {
-				t.Errorf("cleanup legacy S3 block %s: %v", hash, err)
-			}
-		})
+	blockStore := blockStoreForCleanupOrNil(t, orgID)
+	if blockStore == nil {
+		t.Fatal("cannot stage an S3-only block: block store unavailable")
 	}
-	url := c.baseURL + "/api/v2/blocks/upload"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
-	if err != nil {
-		t.Fatalf("new legacy block upload request: %v", err)
+	hash := sha256hex(data)
+	if _, err := blockStore.PutBlockData(context.Background(), &storage.BlockData{
+		Hash: hash,
+		Data: data,
+		Size: int64(len(data)),
+	}); err != nil {
+		t.Fatalf("stage S3-only block %s: %v", hash, err)
 	}
-	req.Header.Set("Authorization", "Token "+c.token)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Block-Hash", sha256hex(data))
-	req.ContentLength = int64(len(data))
-	resp, err := c.http.Do(req)
-	if err != nil {
-		t.Fatalf("legacy block upload request failed: %v", err)
-	}
-	return resp
+	t.Cleanup(func() {
+		if err := blockStore.DeleteBlock(context.Background(), hash); err != nil {
+			t.Errorf("cleanup S3-only block %s: %v", hash, err)
+		}
+	})
 }
 
 func webCheckBlocks(t *testing.T, c *testClient, session string, hashes []string) (existing, missing []string) {
@@ -963,16 +1040,10 @@ func TestWebBlockUploadRejectsUncommittableBlocks(t *testing.T) {
 		}
 	})
 
-	t.Run("S3-only block (legacy upload, no metadata) -> needs_upload", func(t *testing.T) {
+	t.Run("S3-only block (no metadata) -> needs_upload", func(t *testing.T) {
 		content := []byte("s3 only no metadata " + fmt.Sprint(time.Now().UnixNano()))
-		// Store physically in S3 but DO NOT materialize (no session).
-		legacy := webUploadBlockLegacy(t, adminClient, defaultOrgID, content)
-		if legacy.StatusCode != http.StatusOK && legacy.StatusCode != http.StatusCreated {
-			body, _ := io.ReadAll(legacy.Body)
-			legacy.Body.Close()
-			t.Fatalf("legacy block upload status %d: %s", legacy.StatusCode, body)
-		}
-		legacy.Body.Close()
+		// Physically present in S3 but never materialized (no `blocks` row, no ref).
+		stageS3OnlyBlock(t, defaultOrgID, content)
 
 		session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 		// Session-aware check must report it MISSING despite S3 presence (R3).
@@ -1384,8 +1455,7 @@ func TestWebBlockUploadSessionRoutesRejectRevokedSharedRepoPermission(t *testing
 // file-from-blocks. Charging it during staging would wrongly reject valid cases
 // like a same-size overwrite (delta ≈ 0) at the first new block. We pin the user
 // quota to 1 byte and upload a genuinely NEW block (so it hits the store path,
-// not the dedup path): under a session it must succeed; the legacy no-session
-// path on the same content is still rejected by the per-block admission check.
+// not the dedup path): under a session it must succeed.
 func TestWebBlockUploadSessionStagingSkipsLogicalStorageQuota(t *testing.T) {
 	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
 	originalUser := getAdminUserByEmail(t, defaultUserEmail)
@@ -1398,17 +1468,6 @@ func TestWebBlockUploadSessionStagingSkipsLogicalStorageQuota(t *testing.T) {
 	setDefaultUserQuota(t, int64(1))
 
 	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-wbu-quota-%d", time.Now().UnixNano()))
-
-	// Legacy (no-session) upload of fresh content is still gated by the per-block
-	// physical admission check → 403 with the user pinned to 1 byte.
-	legacyContent := []byte("legacy block under tiny quota " + fmt.Sprint(time.Now().UnixNano()))
-	legacy := webUploadBlockLegacy(t, userClient, defaultOrgID, legacyContent)
-	if legacy.StatusCode != http.StatusForbidden {
-		body, _ := io.ReadAll(legacy.Body)
-		legacy.Body.Close()
-		t.Fatalf("legacy block upload status = %d, want 403 under 1-byte quota; body=%s", legacy.StatusCode, body)
-	}
-	legacy.Body.Close()
 
 	// Session staging of fresh content must succeed despite the same 1-byte quota.
 	sessionContent := []byte("session block under tiny quota " + fmt.Sprint(time.Now().UnixNano()))
