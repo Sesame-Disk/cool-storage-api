@@ -459,22 +459,19 @@ func (l *blockUploadConcurrencyLimiter) release(userKey string) {
 }
 
 // blockBodyLimit is the maximum request body a /blocks/upload call may buffer in
-// memory (io.ReadAll). For the web (session) flow every block is exactly the
-// CAS block size frozen onto the session at creation time (the last block is ≤
-// it), so a session request is bounded to THAT size — NOT
-// chunking.adaptive.absolute_max, which can be 256 MB and would let one
-// authenticated user force a 256 MB allocation per request, making the per-user
-// concurrency cap (item 18) almost useless for RAM protection (cap × 256 MB =
-// GBs). The legacy no-session path (desktop/mobile sync, variable FastCDC blocks
-// up to absolute_max) keeps the larger bound.
-func (h *BlockHandler) blockBodyLimit(resolution uploadSessionResolution, session db.BlockUploadSession) int64 {
-	if resolution == uploadSessionValid {
-		if session.BlockSizeBytes > 0 {
-			return session.BlockSizeBytes
-		}
-		return h.config.WebBlockUploadBlockSize()
+// memory (io.ReadAll). Every block is exactly the CAS block size frozen onto the
+// session at creation time (the last block is ≤ it), so a request is bounded to
+// THAT size — NOT chunking.adaptive.absolute_max, which can be 256 MB and would
+// let one authenticated user force a 256 MB allocation per request, making the
+// per-user concurrency cap (item 18) almost useless for RAM protection
+// (cap × 256 MB = GBs). Only a valid session reaches here; the no-session path is
+// rejected in UploadBlock before the body is touched (F8), so there is no longer
+// an absolute_max branch.
+func (h *BlockHandler) blockBodyLimit(session db.BlockUploadSession) int64 {
+	if session.BlockSizeBytes > 0 {
+		return session.BlockSizeBytes
 	}
-	return h.config.Chunking.Adaptive.AbsoluteMax
+	return h.config.WebBlockUploadBlockSize()
 }
 
 // staged-block bucket cap headroom. The per-bucket cap is
@@ -554,17 +551,14 @@ func (h *BlockHandler) stagedBlockBucketCap(session db.BlockUploadSession) (buck
 }
 
 // tryAdmitSessionUpload enforces the per-user concurrency cap for the web
-// (session) flow. For a valid session it reserves a slot keyed by
-// "org_id:user_id"; if the user is already at the cap it emits 429 + Retry-After
-// (counted by BlockUploadConcurrencyRejectionsTotal) and returns ok=false. When
-// ok is true the caller MUST defer the returned release. Non-session requests
-// (legacy sync path) are never capped — release is a no-op and ok is always
-// true. A 429 is retryable: the web client's withRetry loop backs off and
-// re-sends, so legitimate bursts self-throttle instead of failing.
-func (h *BlockHandler) tryAdmitSessionUpload(c *gin.Context, resolution uploadSessionResolution) (release func(), ok bool) {
-	if resolution != uploadSessionValid {
-		return func() {}, true
-	}
+// (session) upload flow. It reserves a slot keyed by "org_id:user_id"; if the
+// user is already at the cap it emits 429 + Retry-After (counted by
+// BlockUploadConcurrencyRejectionsTotal) and returns ok=false. When ok is true
+// the caller MUST defer the returned release. A 429 is retryable: the web
+// client's withRetry loop backs off and re-sends, so legitimate bursts
+// self-throttle instead of failing. Only reached for a valid session — the
+// no-session path is rejected in UploadBlock before this (F8).
+func (h *BlockHandler) tryAdmitSessionUpload(c *gin.Context) (release func(), ok bool) {
 	userKey := c.GetString("org_id") + ":" + c.GetString("user_id")
 	if !h.uploadLimiter.tryAcquire(userKey) {
 		metrics.BlockUploadConcurrencyRejectionsTotal.Inc()
@@ -849,9 +843,10 @@ type UploadBlockResponse struct {
 // The block content is sent in the request body
 // The hash is computed server-side and verified
 func (h *BlockHandler) UploadBlock(c *gin.Context) {
-	// Optional web-flow session: when present, the block is materialized
-	// (metadata + provisional ref owned by the session) after storage, so an
-	// abandoned upload self-expires and a later commit can publish it (R9).
+	// A web-flow session is REQUIRED. The block is materialized (metadata +
+	// provisional ref owned by the session) after storage, so an abandoned upload
+	// self-expires and a later commit can publish it (R9). A session-less request
+	// is rejected below (F8) — there is no metadata-free upload path anymore.
 	session, resolution := h.resolveUploadSession(c)
 	if resolution == uploadSessionAbsent {
 		// No-session upload is rejected before the body is read, so a malformed
@@ -869,7 +864,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// block body is read into RAM (io.ReadAll below), so a rejected request never
 	// allocates the ~8–16 MB buffer — this is what bounds a single user's
 	// instantaneous memory footprint under a burst (item 18).
-	release, ok := h.tryAdmitSessionUpload(c, resolution)
+	release, ok := h.tryAdmitSessionUpload(c)
 	if !ok {
 		return
 	}
@@ -881,11 +876,10 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
-	// Check against maximum block size. For the session (web) flow this is the
-	// configured CAS block size, not chunking.absolute_max — so one authenticated
-	// user cannot force a 256 MB buffer per request and defeat the per-user
-	// concurrency cap (item 18). Legacy sync keeps the larger absolute_max bound.
-	maxSize := h.blockBodyLimit(resolution, session)
+	// Check against maximum block size: the configured CAS block size, not
+	// chunking.absolute_max — so one authenticated user cannot force a 256 MB
+	// buffer per request and defeat the per-user concurrency cap (item 18).
+	maxSize := h.blockBodyLimit(session)
 	if c.Request.ContentLength > maxSize {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":    "block too large",

@@ -154,14 +154,14 @@ re-reading this section.
 - **R3 — Session-aware check.** session-mode `/blocks/check` reports a block as
   `existing` only when `ProbeBlockReuse == Reusable`, not merely present in S3 —
   avoiding the "exists in S3 but unmaterialized → commit says NeedsPut" trap.
-- **R5 — Quota in three planes.** Traffic is charged per block at
-  `/blocks/upload`; the **logical** repo/user storage quota is decided once at
-  commit from the file delta (`currentUploadStorageDelta`), never per block — the
-  session staging path does NOT apply it (a staged block is transient, governed
-  by a provisional ref + TTL, and the final delta may be ≈ 0 for an overwrite).
-  The legacy no-session path still runs the same *logical* `CheckStorageQuota`
-  per block (it predates this flow; it is not a separate physical/staging cap).
-  No double counting. See the staging-cap limitation below.
+- **R5 — Quota in two planes.** Traffic is charged per block at `/blocks/upload`;
+  the **logical** repo/user storage quota is decided once at commit from the file
+  delta (`currentUploadStorageDelta`), never per block — the session staging path
+  does NOT apply it (a staged block is transient, governed by a provisional ref +
+  TTL, and the final delta may be ≈ 0 for an overwrite). No double counting. (The
+  legacy no-session path used to run a per-block logical `CheckStorageQuota`, but
+  that path was removed with F8 — a session is now the only way to upload a block.)
+  See the staging-cap limitation below.
 - **R6 — Manifest validation.** Fixed 8 MB blocks except the last (`0 < last ≤ 8 MB`),
   `sum(sizes) == size`, 64-hex hashes, bounded block count/total size. Repeated
   blocks are allowed **only when every occurrence of a SHA-256 declares the same
@@ -1316,9 +1316,9 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
       configs. Without this, one user could force a 256 MB allocation per request
       and the concurrency cap below would bound RAM to `cap × 256 MB` (GBs), making
       it almost useless. Every session block is exactly the block size (last block
-      ≤ it), so this rejects nothing legitimate (`blockBodyLimit`). The legacy
-      no-session path (desktop/mobile sync, variable FastCDC blocks) keeps the
-      larger `absolute_max` bound.
+      ≤ it), so this rejects nothing legitimate (`blockBodyLimit`). This is now the
+      only bound: the no-session upload path (which kept the larger `absolute_max`)
+      was removed with F8, so `blockBodyLimit` no longer takes a resolution.
     - **Per-user concurrency cap.** A per-process `blockUploadConcurrencyLimiter`
       (keyed by `org_id:user_id`, self-cleaning map, same pattern as
       `sessionPermissionCache`) caps how many concurrent **session-mode**
@@ -1326,7 +1326,8 @@ tracked above. Progress is tracked here; each fix ships as its own small PR.
       `io.ReadAll`, so a rejected request never allocates the buffer. The limit is
       `web_uploads.max_concurrent_block_uploads_per_user`
       (env `WEB_UPLOADS_MAX_CONCURRENT_BLOCK_UPLOADS_PER_USER`, default `8`;
-      `<= 0` disables). The legacy no-session path is intentionally **not** capped.
+      `<= 0` disables). Every `/blocks/upload` now carries a session, so the cap
+      applies to all of them (the uncapped no-session path was removed with F8).
 
     Together the worst-case resident memory per user is `cap × block_size`
     (default `8 × 8 MB = 64 MB`). Over the cap returns `429 Too Many Requests` +

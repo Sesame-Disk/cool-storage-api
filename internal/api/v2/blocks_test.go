@@ -1237,34 +1237,30 @@ func TestStagedBlockBucketCap(t *testing.T) {
 	})
 }
 
-// TestBlockBodyLimit covers that a session-mode upload is bounded to the CAS
-// block size (not chunking.absolute_max), so the per-user concurrency cap is a
-// meaningful RAM bound (cap × block_size), while the legacy no-session path keeps
-// the larger absolute_max bound (variable FastCDC sync blocks).
+// TestBlockBodyLimit covers that a session upload is bounded to the CAS block
+// size (not chunking.absolute_max), so the per-user concurrency cap is a
+// meaningful RAM bound (cap × block_size). There is no no-session branch: that
+// path is rejected in UploadBlock before the body is read (F8).
 func TestBlockBodyLimit(t *testing.T) {
 	const blockSizeMB = 8
-	const absoluteMax = 256 * 1024 * 1024
 	cfg := &config.Config{}
 	cfg.WebUploads.WebBlockUploadBlockSizeMB = blockSizeMB
-	cfg.Chunking.Adaptive.AbsoluteMax = absoluteMax
+	cfg.Chunking.Adaptive.AbsoluteMax = 256 * 1024 * 1024
 	h := &BlockHandler{config: cfg}
 
-	if got := h.blockBodyLimit(uploadSessionValid, db.BlockUploadSession{}); got != int64(blockSizeMB)*1024*1024 {
-		t.Fatalf("session-mode body limit = %d, want %d (the CAS block size, not absolute_max)", got, int64(blockSizeMB)*1024*1024)
-	}
-	if got := h.blockBodyLimit(uploadSessionAbsent, db.BlockUploadSession{}); got != absoluteMax {
-		t.Fatalf("legacy body limit = %d, want %d (chunking.absolute_max)", got, absoluteMax)
+	if got := h.blockBodyLimit(db.BlockUploadSession{}); got != int64(blockSizeMB)*1024*1024 {
+		t.Fatalf("body limit = %d, want %d (the configured CAS block size, never absolute_max)", got, int64(blockSizeMB)*1024*1024)
 	}
 
 	session := db.BlockUploadSession{BlockSizeBytes: 4 * 1024 * 1024}
-	if got := h.blockBodyLimit(uploadSessionValid, session); got != session.BlockSizeBytes {
-		t.Fatalf("session-mode body limit = %d, want persisted session block size %d", got, session.BlockSizeBytes)
+	if got := h.blockBodyLimit(session); got != session.BlockSizeBytes {
+		t.Fatalf("body limit = %d, want persisted session block size %d", got, session.BlockSizeBytes)
 	}
 }
 
-// TestUploadBlockPerUserConcurrencyCap covers the handler wiring: a session-mode
+// TestUploadBlockPerUserConcurrencyCap covers the handler wiring: a session
 // upload is admitted until the user's cap is full, then rejected with 429 +
-// Retry-After, while a non-session (legacy) request is never capped.
+// Retry-After.
 func TestUploadBlockPerUserConcurrencyCap(t *testing.T) {
 	newCtx := func() (*gin.Context, *httptest.ResponseRecorder) {
 		w := httptest.NewRecorder()
@@ -1275,46 +1271,30 @@ func TestUploadBlockPerUserConcurrencyCap(t *testing.T) {
 		return c, w
 	}
 
-	t.Run("session mode rejects over the cap with 429 + Retry-After", func(t *testing.T) {
-		h := &BlockHandler{uploadLimiter: newBlockUploadConcurrencyLimiter(1)}
+	h := &BlockHandler{uploadLimiter: newBlockUploadConcurrencyLimiter(1)}
 
-		c1, _ := newCtx()
-		release, ok := h.tryAdmitSessionUpload(c1, uploadSessionValid)
-		if !ok {
-			t.Fatal("first session upload should be admitted")
-		}
+	c1, _ := newCtx()
+	release, ok := h.tryAdmitSessionUpload(c1)
+	if !ok {
+		t.Fatal("first session upload should be admitted")
+	}
 
-		c2, w2 := newCtx()
-		_, ok = h.tryAdmitSessionUpload(c2, uploadSessionValid)
-		if ok {
-			t.Fatal("second concurrent session upload should be rejected at the cap")
-		}
-		if w2.Code != http.StatusTooManyRequests {
-			t.Fatalf("status = %d, want %d", w2.Code, http.StatusTooManyRequests)
-		}
-		if got := w2.Header().Get("Retry-After"); got == "" {
-			t.Fatal("expected a Retry-After header on the 429")
-		}
+	c2, w2 := newCtx()
+	_, ok = h.tryAdmitSessionUpload(c2)
+	if ok {
+		t.Fatal("second concurrent session upload should be rejected at the cap")
+	}
+	if w2.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", w2.Code, http.StatusTooManyRequests)
+	}
+	if got := w2.Header().Get("Retry-After"); got == "" {
+		t.Fatal("expected a Retry-After header on the 429")
+	}
 
-		// Releasing the first slot lets a later upload through again.
-		release()
-		c3, _ := newCtx()
-		if _, ok := h.tryAdmitSessionUpload(c3, uploadSessionValid); !ok {
-			t.Fatal("upload after release should be admitted")
-		}
-	})
-
-	t.Run("non-session (legacy) uploads are never capped", func(t *testing.T) {
-		h := &BlockHandler{uploadLimiter: newBlockUploadConcurrencyLimiter(1)}
-		for i := 0; i < 5; i++ {
-			c, w := newCtx()
-			_, ok := h.tryAdmitSessionUpload(c, uploadSessionAbsent)
-			if !ok {
-				t.Fatalf("legacy no-session upload %d should never be capped", i)
-			}
-			if w.Code != http.StatusOK {
-				t.Fatalf("legacy path should not write an error status, got %d", w.Code)
-			}
-		}
-	})
+	// Releasing the first slot lets a later upload through again.
+	release()
+	c3, _ := newCtx()
+	if _, ok := h.tryAdmitSessionUpload(c3); !ok {
+		t.Fatal("upload after release should be admitted")
+	}
 }
