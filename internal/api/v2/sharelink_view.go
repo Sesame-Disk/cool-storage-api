@@ -1014,10 +1014,12 @@ func respondShareBootstrapError(c *gin.Context, sl *shareLinkData, status int, e
 // Limited to 1MB to avoid huge page payloads.
 //
 // It returns ("", nil) only where there is legitimately nothing to inline — no
-// target entry, a file past the size limit, or an encrypted library a share link
-// cannot decrypt — and an error for every TRANSIENT failure. Returning "" for
-// those made a non-empty file render as a silently empty 200 that the client had
-// no way to distinguish from a genuinely empty file, and no reason to retry.
+// target entry, or a file past the size limit. Everything else is an error: a
+// transient failure so the caller can answer 503, and errShareLinkLibraryLocked
+// for an encrypted library this link cannot decrypt so the caller answers 403,
+// matching the raw share-link surface. Returning "" for those rendered a
+// non-empty file as a silently empty 200 the client could neither distinguish
+// from a genuinely empty file nor retry.
 func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) (string, error) {
 	if sl.targetEntry == nil {
 		return "", nil

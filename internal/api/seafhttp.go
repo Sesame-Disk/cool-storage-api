@@ -3477,6 +3477,16 @@ func (h *SeafHTTPHandler) createDirectoryFSObject(repoID string, entries []map[s
 
 // HandleDownload handles file downloads via the download token.
 // Streams content block-by-block to avoid loading entire files into RAM.
+// downloadPermissionChecker is the slice of the permission middleware the
+// download gate needs. It exists so the gate's real decision logic can be driven
+// against a revoked permission in a test: asserting only that the handlers call
+// a hook, or that the source mentions the right method names, would still pass
+// for an implementation that ignores what those methods return.
+type downloadPermissionChecker interface {
+	HasLibraryAccess(orgID, userID, repoID string, required middleware.LibraryPermission) (bool, error)
+	RequirePermFlagForRepo(c *gin.Context, repoID string, flag string) bool
+}
+
 // authorizeSeafHTTPDownload is the ONE download gate, shared by the single-file
 // and ZIP endpoints. They previously carried separate copies and drifted: ZIP
 // checked read access but not the granular "download" flag, so after an admin
@@ -3489,7 +3499,11 @@ func authorizeSeafHTTPDownload(h *SeafHTTPHandler, c *gin.Context, token *Access
 	if h.permMiddleware == nil {
 		return true
 	}
-	hasRead, err := h.permMiddleware.HasLibraryAccess(token.OrgID, token.UserID, token.RepoID, middleware.PermissionR)
+	return authorizeDownloadWithChecker(h.permMiddleware, c, token)
+}
+
+func authorizeDownloadWithChecker(perms downloadPermissionChecker, c *gin.Context, token *AccessToken) bool {
+	hasRead, err := perms.HasLibraryAccess(token.OrgID, token.UserID, token.RepoID, middleware.PermissionR)
 	if err != nil {
 		log.Printf("[seafhttp] Failed to check permissions repo=%s: %v", token.RepoID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
@@ -3502,7 +3516,7 @@ func authorizeSeafHTTPDownload(h *SeafHTTPHandler, c *gin.Context, token *Access
 
 	c.Set("org_id", token.OrgID)
 	c.Set("user_id", token.UserID)
-	if !h.permMiddleware.RequirePermFlagForRepo(c, token.RepoID, "download") {
+	if !perms.RequirePermFlagForRepo(c, token.RepoID, "download") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "download is not allowed by your permission"})
 		return false
 	}

@@ -2,20 +2,16 @@ package api
 
 import (
 	"encoding/json"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -528,46 +524,85 @@ func TestBothDownloadSurfacesShareOneAuthorizationGate(t *testing.T) {
 	}
 }
 
-// The gate itself must require the granular flag, not just read access. Driving
-// it end to end needs a live permission backend, and a test that skips when the
-// backend is absent asserts nothing — so this checks the source directly.
-func TestAuthorizeSeafHTTPDownloadChecksBothReadAndTheGranularFlag(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("failed to resolve current file path")
+// fakeDownloadPermissions models a real permission state rather than stubbing
+// the gate's answer, so the gate's own logic is what gets exercised.
+type fakeDownloadPermissions struct {
+	read         bool
+	readErr      error
+	downloadFlag bool
+	flagAsked    bool
+}
+
+func (f *fakeDownloadPermissions) HasLibraryAccess(_, _, _ string, _ middleware.LibraryPermission) (bool, error) {
+	return f.read, f.readErr
+}
+
+func (f *fakeDownloadPermissions) RequirePermFlagForRepo(_ *gin.Context, _ string, flag string) bool {
+	if flag == "download" {
+		f.flagAsked = true
 	}
-	fset := token.NewFileSet()
-	fileNode, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "seafhttp.go"), nil, 0)
-	if err != nil {
-		t.Fatalf("parse seafhttp.go: %v", err)
+	return f.downloadFlag
+}
+
+// The revocation regression: read access survives, the granular download flag is
+// taken away, and the gate must deny. A stubbed gate or an AST name check would
+// both pass an implementation that calls RequirePermFlagForRepo and then ignores
+// its result; this fails unless the returned value actually decides the outcome.
+func TestAuthorizeDownloadDeniesWhenTheDownloadFlagIsRevoked(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name          string
+		perms         *fakeDownloadPermissions
+		wantAllowed   bool
+		wantStatus    int
+		wantFlagAsked bool
+	}{
+		{
+			name:          "download revoked, read intact",
+			perms:         &fakeDownloadPermissions{read: true, downloadFlag: false},
+			wantStatus:    http.StatusForbidden,
+			wantFlagAsked: true,
+		},
+		{
+			name:          "both granted",
+			perms:         &fakeDownloadPermissions{read: true, downloadFlag: true},
+			wantAllowed:   true,
+			wantStatus:    http.StatusOK,
+			wantFlagAsked: true,
+		},
+		{
+			name:       "read revoked short circuits before the flag",
+			perms:      &fakeDownloadPermissions{read: false, downloadFlag: true},
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "permission lookup failure fails closed",
+			perms:      &fakeDownloadPermissions{read: true, readErr: errors.New("cassandra timeout"), downloadFlag: true},
+			wantStatus: http.StatusInternalServerError,
+		},
 	}
 
-	var fn *ast.FuncDecl
-	for _, decl := range fileNode.Decls {
-		if candidate, ok := decl.(*ast.FuncDecl); ok && candidate.Name.Name == "authorizeSeafHTTPDownload" {
-			fn = candidate
-			break
-		}
-	}
-	if fn == nil {
-		t.Fatal("authorizeSeafHTTPDownload not found")
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/zip/tok", nil)
+			token := &AccessToken{OrgID: "org-1", UserID: "user-1", RepoID: "repo-1"}
 
-	seen := map[string]bool{}
-	ast.Inspect(fn, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-			seen[sel.Sel.Name] = true
-		}
-		return true
-	})
+			allowed := authorizeDownloadWithChecker(tt.perms, c, token)
 
-	for _, required := range []string{"HasLibraryAccess", "RequirePermFlagForRepo"} {
-		if !seen[required] {
-			t.Fatalf("authorizeSeafHTTPDownload does not call %s; both download surfaces depend on it", required)
-		}
+			if allowed != tt.wantAllowed {
+				t.Fatalf("allowed = %v, want %v (body=%s)", allowed, tt.wantAllowed, w.Body.String())
+			}
+			if !tt.wantAllowed && w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body=%s)", w.Code, tt.wantStatus, w.Body.String())
+			}
+			if tt.perms.flagAsked != tt.wantFlagAsked {
+				t.Fatalf("download flag consulted = %v, want %v", tt.perms.flagAsked, tt.wantFlagAsked)
+			}
+			if strings.Contains(w.Header().Get("Content-Type"), "application/zip") {
+				t.Fatalf("denied request must not begin a zip: %q", w.Header().Get("Content-Type"))
+			}
+		})
 	}
 }
