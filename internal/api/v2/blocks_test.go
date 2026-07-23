@@ -150,7 +150,11 @@ func TestCheckBlocks_InvalidSHA256(t *testing.T) {
 	}
 }
 
-func TestCheckBlocks_NilBlockStore(t *testing.T) {
+// The no-session /blocks/check oracle was removed with the no-session upload path
+// it was paired with. A session-less check is now rejected with 400 before it can
+// touch any store, so this replaces the old "nil block store -> 503" test whose
+// scenario (a session-less request reaching the store) no longer exists.
+func TestCheckBlocks_NoSessionIsRejected(t *testing.T) {
 	hash := strings.Repeat("a", 64)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -165,8 +169,15 @@ func TestCheckBlocks_NilBlockStore(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if resp["code"] != blockUploadSessionRequiredCode {
+		t.Fatalf("code = %v, want %q", resp["code"], blockUploadSessionRequiredCode)
 	}
 }
 
@@ -453,131 +464,6 @@ func TestCheckBlocksReusableCandidatesParallel_ProbesMetadataFirst(t *testing.T)
 	}
 }
 
-func TestCheckBlocks_NoSessionUsesLegacyStoreAndNormalizesHashes(t *testing.T) {
-	origNewReader := checkBlocksNewCanonicalReaderFn
-	t.Cleanup(func() { checkBlocksNewCanonicalReaderFn = origNewReader })
-	var canonicalReaderCalls atomic.Int32
-	checkBlocksNewCanonicalReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
-		canonicalReaderCalls.Add(1)
-		return nil, errors.New("no-session check must remain paired with legacy upload")
-	}
-
-	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
-	existingHash := strings.Repeat("a", 64)
-	uppercaseExistingHash := strings.ToUpper(existingHash)
-	missingHash := strings.Repeat("b", 64)
-	wantExistingPath := "/test-bucket/blocks/" + orgID + "/aa/aa/" + existingHash
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead && r.URL.Path == wantExistingPath {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-	s3Store, err := storage.NewS3Store(context.Background(), storage.S3Config{
-		Endpoint: server.URL, Bucket: "test-bucket", Region: "us-east-1",
-		AccessKeyID: "test", SecretAccessKey: "test", UsePathStyle: true,
-	})
-	if err != nil {
-		t.Fatalf("NewS3Store() error = %v", err)
-	}
-
-	r := gin.New()
-	r.Use(func(c *gin.Context) {
-		c.Set("org_id", orgID)
-		c.Next()
-	})
-	r.POST("/api/v2/blocks/check", (&BlockHandler{db: &db.DB{}, storage: s3Store}).CheckBlocks)
-	body, _ := json.Marshal(CheckBlocksRequest{Hashes: []string{uppercaseExistingHash, missingHash, existingHash, missingHash}})
-	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
-	}
-	if canonicalReaderCalls.Load() != 0 {
-		t.Fatalf("canonical reader calls = %d, want 0 for no-session flow", canonicalReaderCalls.Load())
-	}
-	var response CheckBlocksResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-	wantExisting := []string{uppercaseExistingHash, existingHash}
-	wantMissing := []string{missingHash, missingHash}
-	if fmt.Sprint(response.Existing) != fmt.Sprint(wantExisting) {
-		t.Fatalf("existing = %v, want %v", response.Existing, wantExisting)
-	}
-	if fmt.Sprint(response.Missing) != fmt.Sprint(wantMissing) {
-		t.Fatalf("missing = %v, want %v", response.Missing, wantMissing)
-	}
-}
-
-func TestCheckBlocks_NoSessionNilDBUsesOrgScopedPreferredStore(t *testing.T) {
-	origNewReader := checkBlocksNewCanonicalReaderFn
-	t.Cleanup(func() { checkBlocksNewCanonicalReaderFn = origNewReader })
-	var canonicalReaderCalls atomic.Int32
-	checkBlocksNewCanonicalReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
-		canonicalReaderCalls.Add(1)
-		return nil, errors.New("canonical reader must not be constructed without a DB")
-	}
-
-	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
-	existingHash := strings.Repeat("a", 64)
-	missingHash := strings.Repeat("b", 64)
-	wantExistingPath := "/test-bucket/blocks/" + orgID + "/aa/aa/" + existingHash
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead && r.URL.Path == wantExistingPath {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	s3Store, err := storage.NewS3Store(context.Background(), storage.S3Config{
-		Endpoint:        server.URL,
-		Bucket:          "test-bucket",
-		Region:          "us-east-1",
-		AccessKeyID:     "test",
-		SecretAccessKey: "test",
-		UsePathStyle:    true,
-	})
-	if err != nil {
-		t.Fatalf("NewS3Store() error = %v", err)
-	}
-
-	r := gin.New()
-	r.Use(func(c *gin.Context) {
-		c.Set("org_id", orgID)
-		c.Next()
-	})
-	r.POST("/api/v2/blocks/check", (&BlockHandler{storage: s3Store}).CheckBlocks)
-	body, _ := json.Marshal(CheckBlocksRequest{Hashes: []string{existingHash, missingHash, existingHash}})
-	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
-	}
-	if canonicalReaderCalls.Load() != 0 {
-		t.Fatalf("canonical reader calls = %d, want 0 without a DB", canonicalReaderCalls.Load())
-	}
-	var response CheckBlocksResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := fmt.Sprint(response.Existing), fmt.Sprint([]string{existingHash, existingHash}); got != want {
-		t.Fatalf("existing = %v, want duplicates in request order", response.Existing)
-	}
-	if got, want := fmt.Sprint(response.Missing), fmt.Sprint([]string{missingHash}); got != want {
-		t.Fatalf("missing = %v, want %v", response.Missing, []string{missingHash})
-	}
-}
-
 func TestCheckBlocksReadyParallel_UsesCanonicalExistenceBeforeOwnership(t *testing.T) {
 	origClassify := checkBlocksClassifyOwnershipFn
 	defer func() {
@@ -808,20 +694,30 @@ func TestGetBlockStoreUsesForwardedHostForRegionRouting(t *testing.T) {
 	}
 }
 
-func TestUploadBlock_NoContentLength(t *testing.T) {
+// A session-less upload is rejected with 400 block_upload_session_required before
+// the body is read, so it can never leave an unreferenced S3 object behind (F8).
+// The per-session content-length and size guards below it run only for a valid
+// session and are exercised end to end in internal/integration/web_block_upload_test.go.
+func TestUploadBlock_NoSessionIsRejected(t *testing.T) {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
 	h := &BlockHandler{storageManager: nil, config: nil}
 	r.POST("/api/v2/blocks/upload", h.UploadBlock)
 
-	req, _ := http.NewRequest("POST", "/api/v2/blocks/upload", nil)
-	req.ContentLength = 0
+	req, _ := http.NewRequest("POST", "/api/v2/blocks/upload", bytes.NewReader([]byte("some block bytes")))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if resp["code"] != blockUploadSessionRequiredCode {
+		t.Fatalf("code = %v, want %q", resp["code"], blockUploadSessionRequiredCode)
 	}
 }
 

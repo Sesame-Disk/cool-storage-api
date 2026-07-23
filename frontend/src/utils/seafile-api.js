@@ -1493,10 +1493,17 @@ function withBlockUploadAuthHandling(config) {
 
 // withBlockUploadSessionHeader merges the X-Block-Upload-Session header into an
 // axios config without mutating the caller's object.
+//
+// A missing session throws instead of silently dropping the header. The server
+// now rejects a no-session /blocks/upload or /blocks/check with 400
+// block_upload_session_required, so a bug that let `session` reach here undefined
+// used to fire a doomed request whose bytes became an unreferenced S3 orphan and
+// whose commit was later refused — a silent failure. Failing here surfaces that
+// bug at its source instead.
 function withBlockUploadSessionHeader(config, session) {
   const requestConfig = config || {};
   if (!session) {
-    return requestConfig;
+    throw new Error('block upload requires an upload session; refusing to send a session-less block request');
   }
   return Object.assign({}, requestConfig, {
     headers: Object.assign({}, requestConfig.headers || {}, {

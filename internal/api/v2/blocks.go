@@ -490,6 +490,25 @@ const stagedBlockBucketSlack = 3
 
 const blockUploadStagingCapReachedCode = "staging_cap_reached"
 
+// blockUploadSessionRequiredCode is returned when /blocks/upload or /blocks/check
+// is called without an upload session. The legacy no-session branch was removed:
+// on upload it wrote an S3 object with no `blocks` row and no reference (F8) — an
+// eternal orphan nothing reclaims, since GC discovers blocks through candidates —
+// and its paired no-session /blocks/check was a bare-hash existence oracle with no
+// writer left to justify it. Every real client sends a session (web sends
+// X-Block-Upload-Session; desktop/mobile use /seafhttp/), so this rejects only
+// malformed callers and fails them loudly instead of leaking.
+const blockUploadSessionRequiredCode = "block_upload_session_required"
+
+// respondBlockUploadSessionRequired is the single 400 both endpoints emit for a
+// missing session, so the two cannot drift on status or code.
+func respondBlockUploadSessionRequired(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error": "block upload requires an active upload session",
+		"code":  blockUploadSessionRequiredCode,
+	})
+}
+
 // blockUploadStagingAdmissionFromConfig derives the immutable staging-admission
 // contract for a NEW session from the then-current config. The result is frozen
 // onto block_upload_sessions so live config changes cannot move a retry to a
@@ -793,57 +812,29 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 	}
 
 	session, resolution := h.resolveUploadSession(c)
-	if resolution != uploadSessionAbsent && resolution != uploadSessionValid {
+	if resolution == uploadSessionAbsent {
+		// The paired no-session oracle went with the no-session upload path it
+		// existed to serve (see blockUploadSessionRequiredCode). Without a
+		// session this is a bare-hash existence probe and nothing legitimate
+		// reaches it, so it fails closed rather than answering.
+		respondBlockUploadSessionRequired(c)
+		return
+	}
+	if resolution != uploadSessionValid {
 		c.JSON(resolution.deniedStatus(), gin.H{"error": resolution.deniedMessage()})
 		return
 	}
 
-	if resolution == uploadSessionValid {
-		resp, err := h.checkBlocksForSession(c, session, req.Hashes)
-		if err != nil {
-			if errors.Is(err, errSessionCheckBlockStoreUnavailable) {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
+	resp, err := h.checkBlocksForSession(c, session, req.Hashes)
+	if err != nil {
+		if errors.Is(err, errSessionCheckBlockStoreUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 			return
 		}
-		c.JSON(http.StatusOK, resp)
-		return
-	}
-
-	normalizedHashes := make([]string, len(req.Hashes))
-	for i, hash := range req.Hashes {
-		normalizedHashes[i] = db.NormalizeBlockID(hash)
-	}
-	uniqueHashes := dedupePreserveOrder(normalizedHashes)
-	// Keep the legacy no-session oracle paired with its metadata-free upload
-	// endpoint. PR-7 will govern and canonicalize both together.
-	blockStore, _ := h.getBlockStore(c)
-	if blockStore == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-		return
-	}
-	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), uniqueHashes, blockProbeConcurrency)
-	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 		return
 	}
-
-	// Separate into existing and missing
-	var existing, missing []string
-	for i, hash := range req.Hashes {
-		if existsMap[normalizedHashes[i]] {
-			existing = append(existing, hash)
-		} else {
-			missing = append(missing, hash)
-		}
-	}
-
-	c.JSON(http.StatusOK, CheckBlocksResponse{
-		Existing: existing,
-		Missing:  missing,
-	})
+	c.JSON(http.StatusOK, resp)
 }
 
 // UploadBlockResponse is the response after uploading a block
@@ -862,7 +853,14 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	// (metadata + provisional ref owned by the session) after storage, so an
 	// abandoned upload self-expires and a later commit can publish it (R9).
 	session, resolution := h.resolveUploadSession(c)
-	if resolution != uploadSessionAbsent && resolution != uploadSessionValid {
+	if resolution == uploadSessionAbsent {
+		// No-session upload is rejected before the body is read, so a malformed
+		// client cannot even allocate the block buffer, let alone leave an
+		// unreferenced S3 object behind (F8).
+		respondBlockUploadSessionRequired(c)
+		return
+	}
+	if resolution != uploadSessionValid {
 		c.JSON(resolution.deniedStatus(), gin.H{"error": resolution.deniedMessage()})
 		return
 	}
@@ -1039,50 +1037,8 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
-	blockStore, _ := h.getBlockStore(c)
-	if blockStore == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-		return
-	}
-	exists, err := blockStore.BlockExists(c.Request.Context(), hash)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
-		return
-	}
-	if exists {
-		recordBlockUploadTrafficFn(traffic.Get(), uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
-		c.JSON(http.StatusOK, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: false})
-		return
-	}
-
-	// The legacy no-session path retains its per-block logical quota check. Session
-	// uploads returned above and charge the final file delta only at commit.
-	if checker := traffic.GetChecker(); checker != nil {
-		if st, _ := checker.CheckStorageQuota(c.GetString("org_id"), c.GetString("user_id"), int64(len(data))); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-			return
-		}
-	}
-
-	// Store the block
-	block := &storage.BlockData{
-		Hash: hash,
-		Data: data,
-		Size: int64(len(data)),
-	}
-
-	_, err = blockStore.PutBlockData(c.Request.Context(), block)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
-		return
-	}
-
-	// Record traffic for newly stored block.
-	recordBlockUploadTrafficFn(traffic.Get(), uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
-
-	c.JSON(http.StatusCreated, UploadBlockResponse{
-		Hash: hash,
-		Size: int64(len(data)),
-		New:  true,
-	})
+	// Unreachable: resolution is guaranteed uploadSessionValid past the guard
+	// above. Kept as a defensive assertion so a future change that reintroduces a
+	// non-session branch fails loudly instead of silently leaking again.
+	respondBlockUploadSessionRequired(c)
 }
