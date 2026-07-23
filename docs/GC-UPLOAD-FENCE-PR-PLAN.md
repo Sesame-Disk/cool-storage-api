@@ -576,6 +576,17 @@ repeated `id`, missing `id`, blank listing) and the shared retry classifier; and
 end-to-end cases against real Cassandra through the production endpoint — present
 file, deleted file, dangling `fs_object`, and corrupt listing.
 
+**Both** public share-link bootstrap endpoints are pinned by behavioural
+integration tests, not only the first. `/share-links/:token/bootstrap/` and
+`/share-links/:token/files/bootstrap/?p=` each get a healthy 200 first and then a
+deterministic canonical-reference failure, asserting 503 + `Retry-After` and a body
+free of block ids, bucket names and Cassandra/S3 detail. The second endpoint needed
+its own test because neither the first test nor the AST check constrains it: the AST
+check only proves no *other* method calls `respondShareBootstrapError`, so
+`GetShareLinkFileBootstrap` could have gone back to `c.JSON(status, err.Error())`
+with every test still green. Verified by injecting exactly that regression: the new
+test fails, the sibling test does not.
+
 ---
 
 ### PR-7 — Legacy no-session upload governance

@@ -5,6 +5,7 @@ package integration
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -56,8 +57,68 @@ func TestShareLinkBootstrapFailsClosedOnTheRealEndpoint(t *testing.T) {
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 for a transient inline-read failure: %s", status, body)
 	}
+	assertShareBootstrapBodyIsPublic(t, body, missingBlock)
+}
+
+// TestShareLinkFileBootstrapFailsClosedOnTheRealEndpoint covers the SECOND public
+// bootstrap endpoint. Both endpoints delegate to emitShareFileBootstrap today, but
+// nothing pinned that for this one: the sibling test above drives only
+// /bootstrap/, and the AST test only proves no OTHER method calls
+// respondShareBootstrapError. So a GetShareLinkFileBootstrap that went back to
+//
+//	bootstrap, status, err := h.buildShareFileBootstrapResponse(c, sl)
+//	if err != nil { c.JSON(status, gin.H{"error": err.Error()}) ; return }
+//
+// would keep every existing test green while leaking internal block ids, bucket
+// names and Cassandra/S3 detail to anonymous visitors. This is the behavioural
+// regression that closes that hole.
+//
+// It differs from the sibling in the shape of the link, not just the URL: this
+// one is a DIRECTORY share link resolved down to a file through ?p=, which is
+// the only way to reach this handler.
+func TestShareLinkFileBootstrapFailsClosedOnTheRealEndpoint(t *testing.T) {
+	name := fmt.Sprintf("inttest-sharelink-file-bootstrap-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+
+	uploadURL := getUploadLink(t, adminClient, repoID, "/")
+	uploadFileThroughLink(t, adminClient, uploadURL, "notes.md", "/", "# heading\n\nbody text\n")
+
+	// A directory share link: this endpoint exists to resolve ?p= underneath one.
+	token := createShareLinkForTest(t, adminClient, repoID, "/")
+
+	// Sanity first, so the assertion below cannot pass because the link, the
+	// path resolution or the endpoint were broken to begin with.
+	if status, body := getShareFileBootstrap(t, token, "/notes.md"); status != http.StatusOK {
+		t.Fatalf("healthy file bootstrap status = %d, want 200: %s", status, body)
+	}
+
+	rootFSID := downloadTestRootFSID(t, database, repoID)
+	fileFSID := downloadTestDirEntryID(t, database, repoID, rootFSID, "notes.md")
+	const missingBlock = "9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b"
+	if err := database.Session().Query(`
+		UPDATE fs_objects SET block_ids = ? WHERE library_id = ? AND fs_id = ?
+	`, []string{missingBlock}, repoID, fileFSID).Exec(); err != nil {
+		t.Fatalf("point file at a missing block: %v", err)
+	}
+
+	status, body := getShareFileBootstrap(t, token, "/notes.md")
+
+	if status == http.StatusOK {
+		t.Fatalf("a failed inline read answered 200; the document would render as empty: %s", body)
+	}
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for a transient inline-read failure: %s", status, body)
+	}
+	assertShareBootstrapBodyIsPublic(t, body, missingBlock)
+}
+
+// assertShareBootstrapBodyIsPublic rejects any internal detail the read path's
+// wrapped errors carry. Both bootstrap endpoints are anonymous surfaces.
+func assertShareBootstrapBodyIsPublic(t *testing.T, body, secretBlockID string) {
+	t.Helper()
 	lowered := strings.ToLower(body)
-	for _, leaked := range []string{missingBlock, "block", "bucket", "cassandra", "gocql", "s3"} {
+	for _, leaked := range []string{secretBlockID, "block", "bucket", "cassandra", "gocql", "s3"} {
 		if strings.Contains(lowered, strings.ToLower(leaked)) {
 			t.Fatalf("public bootstrap body leaked %q: %s", leaked, body)
 		}
@@ -66,7 +127,20 @@ func TestShareLinkBootstrapFailsClosedOnTheRealEndpoint(t *testing.T) {
 
 func getShareBootstrap(t *testing.T, token string) (int, string) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, adminClient.baseURL+"/api/v2.1/share-links/"+token+"/bootstrap/", nil)
+	return getShareBootstrapURL(t, adminClient.baseURL+"/api/v2.1/share-links/"+token+"/bootstrap/")
+}
+
+// getShareFileBootstrap drives GET /api/v2.1/share-links/:token/files/bootstrap/?p=…,
+// the endpoint a directory share link uses to open one file inside it.
+func getShareFileBootstrap(t *testing.T, token, subPath string) (int, string) {
+	t.Helper()
+	return getShareBootstrapURL(t, fmt.Sprintf("%s/api/v2.1/share-links/%s/files/bootstrap/?p=%s",
+		adminClient.baseURL, token, url.QueryEscape(subPath)))
+}
+
+func getShareBootstrapURL(t *testing.T, requestURL string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
 	if err != nil {
 		t.Fatalf("build bootstrap request: %v", err)
 	}

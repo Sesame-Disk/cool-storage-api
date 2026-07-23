@@ -4809,6 +4809,26 @@ uniform response:
 Three further probes (`block_upload_session.go`, and the two historic-file paths in
 `fileview.go`) already failed closed and were left as they were.
 
+**A missing library row now answers 503 too, and that is deliberate.**
+`libraryIsEncrypted` propagates `gocql.ErrNotFound` like any other error, so a
+library that has no row for `(org_id, library_id)` produces the retryable 503
+rather than falling through to the handler's own not-found handling. The two
+Class B comments justified their `return true` as "library not found", but a
+`LOCAL_QUORUM` read cannot tell a genuinely absent library from one this DC has
+not replicated yet — the same reasoning as `ISSUE-DOWNLOAD-NO-404-01`, and
+treating the missing row as "not encrypted" is exactly the permissive default
+this issue exists to remove.
+
+The reachability is narrow, which is why it is recorded rather than mitigated:
+`orgID` always comes from the caller's own context (`c.GetString("org_id")`), so
+libraries are org-scoped with no cross-org read pattern, and every handler runs
+its permission check first — `HasLibraryAccessCtx` fails for a library that does
+not exist and `respondIfLibraryMissing` answers the proper 404 there. What is
+left is the race where the library is deleted between the permission check and
+the probe, where 503 is the honest answer. If a surface ever needs to
+distinguish the two, it must resolve absence explicitly before the probe, not by
+reading a failed probe as permission.
+
 **Gate ordering is part of the contract, not just the probe.** `ServeRawFile`
 originally ran its ETag revalidation *before* the probe. `Cache-Control: private,
 no-cache` lets a browser keep the decrypted bytes and only forces revalidation, so a
