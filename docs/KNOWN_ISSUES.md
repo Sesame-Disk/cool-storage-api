@@ -4662,7 +4662,7 @@ apply. No reconcile/backfill pass is required before launch.
 
 ### ISSUE-DOWNLOAD-NO-404-01: SeafHTTP download can never report a file as gone
 
-**Status**: 🟡 Accepted trade-off (PR-6, 2026-07-22) — revisit if the deployment is single-DC
+**Status**: 🟡 Accepted trade-off (PR-6) — **decision deferred**, see Fix Direction
 **Severity**: Medium — operational cost and a cross-layer inconsistency, not data loss
 **Affected**: `GET /seafhttp/files/:token/*filepath` and the ZIP directory walk
 
@@ -4697,20 +4697,45 @@ entry records the reversal and its price so it is not rediscovered as a bug.
 
 #### Fix Direction
 
-Only a read that can prove **global** absence may reintroduce 404. Options, none
-implemented:
+**Deployment context (confirmed 2026-07-23).** Production is multi-DC with one
+region each in the Americas, Asia and Europe, and measured cross-DC latency of
+**several seconds**. That settles two things:
 
-- Carry the commit id the token was minted against and treat "listing older than
-  that commit" as unproven rather than absent. This distinguishes replication lag
-  from a real delete without requiring a global read, and is the preferred path.
-- Resolve the path at `ALL` on the miss path only, paying the availability cost of
-  contacting every live replica. With ordinary `LOCAL_QUORUM` writes this is the
-  consistency that can observe or reconcile every replica; do **not** treat global
-  `QUORUM` or `SERIAL` as substitutes — `QUORUM` has no guaranteed intersection with
-  a local write quorum across DCs, and `SERIAL` only linearizes LWTs on the same
-  partition (it does not order `access_tokens`, `libraries`, `commits`, and
-  `fs_objects` relative to each other).
-- Restrict the 404 to single-DC deployments behind explicit configuration.
+1. The stale-snapshot window this issue exists for is real and wide, not
+   theoretical. A local listing can trail another region by seconds, so a local
+   miss is a weak signal for absence. Keeping 404 out of the download surface is
+   the right default for this topology.
+2. Any fix that adds a global consensus read to the hot path is rejected on
+   principle — the project already avoids Paxos in hot paths for this reason.
+   `ALL`, global `QUORUM` and `SERIAL` are all off the table, and not only
+   because two of them are unsound here (`QUORUM` has no guaranteed intersection
+   with a local write quorum across DCs; `SERIAL` only linearizes LWTs on one
+   partition and does not order `access_tokens`, `libraries`, `commits` and
+   `fs_objects` relative to each other).
+
+**Deferred decision.** Whether to reintroduce a 404 at all, and at what cost, is
+an open product decision. It is NOT blocking PR-6: the current behaviour is the
+safe direction, and the cost is retries plus a cross-layer inconsistency, not
+data loss. Revisit when someone owns the client-retry budget question.
+
+The only viable direction identified so far, because it needs no global read:
+
+- Carry the commit id the token was minted against, and treat "listing older than
+  that commit" as unproven rather than absent. It separates replication lag from a
+  real delete using only local reads, so it costs nothing on the hot path.
+
+Rejected, recorded so they are not re-proposed:
+
+- **Read at `ALL` on the miss path.** It is the only consistency that can observe
+  every replica under ordinary `LOCAL_QUORUM` writes, but with several seconds of
+  cross-DC latency it turns every miss into a multi-second request, and one
+  unreachable replica turns it into an error. Unacceptable on a download path.
+- **Global `QUORUM` or `SERIAL`.** Unsound here regardless of cost: `QUORUM` has no
+  guaranteed intersection with a local write quorum across DCs, and `SERIAL` only
+  linearizes LWTs on a single partition — it does not order `access_tokens`,
+  `libraries`, `commits` and `fs_objects` relative to each other.
+- **Restrict the 404 to single-DC deployments.** Production is multi-DC in all
+  regions, so this would be dead configuration.
 
 Revisit alongside X2 (multi-DC reasoning is derived, never reproduced) in
 `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`.

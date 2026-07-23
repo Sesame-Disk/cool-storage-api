@@ -716,18 +716,7 @@ func (h *ShareLinkViewHandler) GetShareLinkBootstrap(c *gin.Context) {
 		return
 	}
 
-	bootstrap, status, err := h.buildShareFileBootstrapResponse(c, sl)
-	if err != nil {
-		respondShareBootstrapError(c, sl, status, err)
-		return
-	}
-	if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
-		if noPassword, _ := pageOptions["noPassword"].(bool); noPassword {
-			h.incrementViewCount(sl.token)
-		}
-	}
-
-	c.JSON(http.StatusOK, bootstrap)
+	h.emitShareFileBootstrap(c, sl)
 }
 
 // GetShareLinkFileBootstrap returns the frontend bootstrap payload for GET /d/:token/files/?p=...
@@ -775,18 +764,7 @@ func (h *ShareLinkViewHandler) GetShareLinkFileBootstrap(c *gin.Context) {
 	sl.targetEntry = result.TargetEntry
 	sl.isDir = false
 
-	bootstrap, status, err := h.buildShareFileBootstrapResponse(c, sl)
-	if err != nil {
-		respondShareBootstrapError(c, sl, status, err)
-		return
-	}
-	if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
-		if noPassword, _ := pageOptions["noPassword"].(bool); noPassword {
-			h.incrementViewCount(sl.token)
-		}
-	}
-
-	c.JSON(http.StatusOK, bootstrap)
+	h.emitShareFileBootstrap(c, sl)
 }
 
 // handleShareLinkDownload handles ?dl=1 for file share links
@@ -1009,6 +987,10 @@ func respondShareBootstrapError(c *gin.Context, sl *shareLinkData, status int, e
 	}
 }
 
+var shareInlineTextFn = func(h *ShareLinkViewHandler, sl *shareLinkData) (string, error) {
+	return h.readFileContentAsText(sl)
+}
+
 // readFileContentAsText reads the file content from block storage and returns it
 // as a string. Used for embedding text/markdown content directly in page options.
 // Limited to 1MB to avoid huge page payloads.
@@ -1102,6 +1084,29 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) (string,
 	return buf.String(), nil
 }
 
+// emitShareFileBootstrap is the single place the file bootstrap becomes an HTTP
+// response, shared by both public endpoints. They previously carried identical
+// copies of this block; keeping one means an endpoint cannot quietly go back to
+// exposing err.Error() or to treating a locked library as a success.
+func (h *ShareLinkViewHandler) emitShareFileBootstrap(c *gin.Context, sl *shareLinkData) {
+	bootstrap, status, err := shareFileBootstrapFn(h, c, sl)
+	if err != nil {
+		respondShareBootstrapError(c, sl, status, err)
+		return
+	}
+	if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
+		if noPassword, _ := pageOptions["noPassword"].(bool); noPassword {
+			h.incrementViewCount(sl.token)
+		}
+	}
+
+	c.JSON(http.StatusOK, bootstrap)
+}
+
+var shareFileBootstrapFn = func(h *ShareLinkViewHandler, c *gin.Context, sl *shareLinkData) (pageBootstrapResponse, int, error) {
+	return h.buildShareFileBootstrapResponse(c, sl)
+}
+
 // serveSharedFilePage renders the shared file view
 func (h *ShareLinkViewHandler) serveSharedFilePage(c *gin.Context, sl *shareLinkData) {
 	c.JSON(http.StatusNotFound, gin.H{"error": "public share pages are served by the frontend shell"})
@@ -1131,7 +1136,7 @@ func (h *ShareLinkViewHandler) buildShareFileBootstrapResponse(c *gin.Context, s
 	var smartLinkMap map[string]sharedMarkdownSmartLinkTarget
 	if bundleName == "sharedFileViewText" || bundleName == "sharedFileViewMarkdown" {
 		var contentErr error
-		fileContent, contentErr = h.readFileContentAsText(sl)
+		fileContent, contentErr = shareInlineTextFn(h, sl)
 		if contentErr != nil {
 			// Neither a transient failure nor a locked library may render as an
 			// empty file: both would misrepresent a non-empty document as blank.
