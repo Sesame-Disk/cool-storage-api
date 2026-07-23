@@ -3477,6 +3477,40 @@ func (h *SeafHTTPHandler) createDirectoryFSObject(repoID string, entries []map[s
 
 // HandleDownload handles file downloads via the download token.
 // Streams content block-by-block to avoid loading entire files into RAM.
+// authorizeSeafHTTPDownload is the ONE download gate, shared by the single-file
+// and ZIP endpoints. They previously carried separate copies and drifted: ZIP
+// checked read access but not the granular "download" flag, so after an admin
+// revoked download while leaving read intact, /seafhttp/files/:token answered
+// 403 while /seafhttp/zip/:token still handed over the whole directory with the
+// same still-valid token (they live up to an hour). One gate, one contract.
+//
+// It writes the response and returns false when access is denied.
+func authorizeSeafHTTPDownload(h *SeafHTTPHandler, c *gin.Context, token *AccessToken) bool {
+	if h.permMiddleware == nil {
+		return true
+	}
+	hasRead, err := h.permMiddleware.HasLibraryAccess(token.OrgID, token.UserID, token.RepoID, middleware.PermissionR)
+	if err != nil {
+		log.Printf("[seafhttp] Failed to check permissions repo=%s: %v", token.RepoID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
+		return false
+	}
+	if !hasRead {
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have read access to this library"})
+		return false
+	}
+
+	c.Set("org_id", token.OrgID)
+	c.Set("user_id", token.UserID)
+	if !h.permMiddleware.RequirePermFlagForRepo(c, token.RepoID, "download") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "download is not allowed by your permission"})
+		return false
+	}
+	return true
+}
+
+var seafHTTPAuthorizeDownloadFn = authorizeSeafHTTPDownload
+
 func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	tokenStr := c.Param("token")
 	requestedPath := c.Param("filepath")
@@ -3493,26 +3527,8 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 
 	log.Printf("[HandleDownload] Token valid: OrgID=%s, RepoID=%s, Path=%s", token.OrgID, token.RepoID, token.Path)
 
-	// Permission check: user must have read access to the library
-	if h.permMiddleware != nil {
-		hasRead, err := h.permMiddleware.HasLibraryAccess(token.OrgID, token.UserID, token.RepoID, middleware.PermissionR)
-		if err != nil {
-			log.Printf("[HandleDownload] Failed to check permissions: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
-			return
-		}
-		if !hasRead {
-			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have read access to this library"})
-			return
-		}
-
-		// Granular flag check: download must be allowed
-		c.Set("org_id", token.OrgID)
-		c.Set("user_id", token.UserID)
-		if !h.permMiddleware.RequirePermFlagForRepo(c, token.RepoID, "download") {
-			c.JSON(http.StatusForbidden, gin.H{"error": "download is not allowed by your permission"})
-			return
-		}
+	if !seafHTTPAuthorizeDownloadFn(h, c, token) {
+		return
 	}
 
 	// Get filename from path
@@ -4047,17 +4063,8 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		return
 	}
 
-	// Permission check
-	if h.permMiddleware != nil {
-		hasRead, err := h.permMiddleware.HasLibraryAccess(token.OrgID, token.UserID, token.RepoID, middleware.PermissionR)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
-			return
-		}
-		if !hasRead {
-			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have read access to this library"})
-			return
-		}
+	if !seafHTTPAuthorizeDownloadFn(h, c, token) {
+		return
 	}
 
 	if h.db == nil || h.storageManager == nil {

@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -717,7 +718,7 @@ func (h *ShareLinkViewHandler) GetShareLinkBootstrap(c *gin.Context) {
 
 	bootstrap, status, err := h.buildShareFileBootstrapResponse(c, sl)
 	if err != nil {
-		c.JSON(status, gin.H{"error": err.Error()})
+		respondShareBootstrapError(c, sl, status, err)
 		return
 	}
 	if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
@@ -776,7 +777,7 @@ func (h *ShareLinkViewHandler) GetShareLinkFileBootstrap(c *gin.Context) {
 
 	bootstrap, status, err := h.buildShareFileBootstrapResponse(c, sl)
 	if err != nil {
-		c.JSON(status, gin.H{"error": err.Error()})
+		respondShareBootstrapError(c, sl, status, err)
 		return
 	}
 	if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
@@ -985,6 +986,29 @@ func buildZippedPath(rootName, relativePath string) string {
 	return string(data)
 }
 
+// errShareLinkLibraryLocked marks an encrypted library that a share link cannot
+// decrypt. It is stable rather than transient, so it maps to 403 like the raw
+// share-link surface, never to a retryable 503 and never to an empty 200.
+var errShareLinkLibraryLocked = errors.New("share link library is encrypted and locked")
+
+// respondShareBootstrapError answers the PUBLIC share-link surface. It logs the
+// real cause and returns a generic message, because the wrapped errors carry
+// internal SHA-256 block ids, storage classes and Cassandra/S3 detail that an
+// anonymous visitor must not see. Retryable answers carry Retry-After so the
+// client honours the documented contract.
+func respondShareBootstrapError(c *gin.Context, sl *shareLinkData, status int, err error) {
+	slog.Error("share link bootstrap failed", "org", sl.orgID, "library", sl.libraryID, "status", status, "error", err)
+	switch status {
+	case http.StatusForbidden:
+		c.JSON(status, gin.H{"error": "this file is in an encrypted library and cannot be previewed"})
+	case http.StatusServiceUnavailable:
+		c.Header("Retry-After", "1")
+		c.JSON(status, gin.H{"error": "file is temporarily unavailable; retry"})
+	default:
+		c.JSON(status, gin.H{"error": "failed to load file"})
+	}
+}
+
 // readFileContentAsText reads the file content from block storage and returns it
 // as a string. Used for embedding text/markdown content directly in page options.
 // Limited to 1MB to avoid huge page payloads.
@@ -1031,8 +1055,11 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) (string,
 	if encrypted {
 		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(sl.createdBy, sl.libraryID)
 		if fileKey == nil {
-			// Stable, not transient: no session exists and none is coming.
-			return "", nil
+			// Stable rather than transient, but still not success: rendering a
+			// non-empty document as blank would misrepresent the file. The raw
+			// share-link surface answers 403 for this exact state, so the text
+			// preview must not silently disagree with it.
+			return "", errShareLinkLibraryLocked
 		}
 	}
 
@@ -1104,9 +1131,12 @@ func (h *ShareLinkViewHandler) buildShareFileBootstrapResponse(c *gin.Context, s
 		var contentErr error
 		fileContent, contentErr = h.readFileContentAsText(sl)
 		if contentErr != nil {
-			// A transient read failure must not render as an empty file. Surface
-			// it so the client retries instead of showing the document as blank.
+			// Neither a transient failure nor a locked library may render as an
+			// empty file: both would misrepresent a non-empty document as blank.
 			slog.Error("inline text content unavailable for share link", "org", sl.orgID, "file", filename, "error", contentErr)
+			if errors.Is(contentErr, errShareLinkLibraryLocked) {
+				return pageBootstrapResponse{}, http.StatusForbidden, contentErr
+			}
 			return pageBootstrapResponse{}, http.StatusServiceUnavailable, contentErr
 		}
 		if bundleName == "sharedFileViewMarkdown" {

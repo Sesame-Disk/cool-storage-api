@@ -4773,8 +4773,12 @@ uniform response:
   retryable `503` + `Retry-After`, deliberately **not** `403 lib_need_decrypt`,
   because a failed probe means we do not know whether the library is encrypted and
   the client must retry rather than be told to prompt for a password;
-- `readFileContentAsText` returns a string and cannot emit a status, so it renders
-  no preview instead;
+- `readFileContentAsText` now returns `(string, error)`. It reports `("", nil)`
+  only where there is genuinely nothing to inline (no target entry, over the 1MB
+  limit) and an error otherwise, which the share bootstrap turns into 503 for a
+  transient failure and 403 for a locked encrypted library — matching what the raw
+  share-link surface already answered for that state. Returning `""` for either
+  case rendered a non-empty document as a silently blank 200;
 - the two guards return `false` after writing the 503, so the gate closes.
 
 Three further probes (`block_upload_session.go`, and the two historic-file paths in

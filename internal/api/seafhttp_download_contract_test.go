@@ -2,11 +2,16 @@ package api
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -459,4 +464,110 @@ func TestHandleZipDownloadEncryptionProbeFailsClosed(t *testing.T) {
 			t.Fatalf("lib_need_decrypt = %v, want true (body=%s)", body["lib_need_decrypt"], w.Body.String())
 		}
 	})
+}
+
+// A download token stays valid for up to an hour, so an admin can revoke the
+// granular "download" flag while leaving read access intact. The two endpoints
+// used to carry separate copies of the gate and drifted: HandleDownload
+// re-checked the flag, HandleZipDownload did not, so the same revoked user could
+// still pull the whole directory as a ZIP. Both now share one gate.
+func TestBothDownloadSurfacesShareOneAuthorizationGate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	newHandler := func(t *testing.T) (*SeafHTTPHandler, string) {
+		t.Helper()
+		tokenStore := NewMockTokenStore()
+		tok, err := tokenStore.CreateDownloadToken("org-1", "repo-1", "/f.txt", "user-1")
+		if err != nil {
+			t.Fatalf("CreateDownloadToken: %v", err)
+		}
+		return &SeafHTTPHandler{
+			tokenStore:     tokenStore,
+			db:             &db.DB{},
+			storageManager: &storage.Manager{},
+		}, tok
+	}
+
+	surfaces := map[string]struct {
+		path   string
+		invoke func(*SeafHTTPHandler, *gin.Context)
+	}{
+		"single file": {path: "/seafhttp/files/", invoke: (*SeafHTTPHandler).HandleDownload},
+		"zip":         {path: "/seafhttp/zip/", invoke: (*SeafHTTPHandler).HandleZipDownload},
+	}
+
+	for name, surface := range surfaces {
+		t.Run(name+" denies a revoked download permission", func(t *testing.T) {
+			h, tok := newHandler(t)
+			old := seafHTTPAuthorizeDownloadFn
+			t.Cleanup(func() { seafHTTPAuthorizeDownloadFn = old })
+			called := false
+			seafHTTPAuthorizeDownloadFn = func(_ *SeafHTTPHandler, c *gin.Context, _ *AccessToken) bool {
+				called = true
+				c.JSON(http.StatusForbidden, gin.H{"error": "download is not allowed by your permission"})
+				return false
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodGet, surface.path+tok, nil)
+			c.Params = gin.Params{{Key: "token", Value: tok}, {Key: "filepath", Value: "/f.txt"}}
+
+			surface.invoke(h, c)
+
+			if !called {
+				t.Fatal("handler did not consult the shared download gate")
+			}
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (body=%s)", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Header().Get("Content-Type"), "application/zip") {
+				t.Fatalf("must not start a zip for a revoked download permission: %q", w.Header().Get("Content-Type"))
+			}
+		})
+	}
+}
+
+// The gate itself must require the granular flag, not just read access. Driving
+// it end to end needs a live permission backend, and a test that skips when the
+// backend is absent asserts nothing — so this checks the source directly.
+func TestAuthorizeSeafHTTPDownloadChecksBothReadAndTheGranularFlag(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve current file path")
+	}
+	fset := token.NewFileSet()
+	fileNode, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "seafhttp.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse seafhttp.go: %v", err)
+	}
+
+	var fn *ast.FuncDecl
+	for _, decl := range fileNode.Decls {
+		if candidate, ok := decl.(*ast.FuncDecl); ok && candidate.Name.Name == "authorizeSeafHTTPDownload" {
+			fn = candidate
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatal("authorizeSeafHTTPDownload not found")
+	}
+
+	seen := map[string]bool{}
+	ast.Inspect(fn, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+			seen[sel.Sel.Name] = true
+		}
+		return true
+	})
+
+	for _, required := range []string{"HasLibraryAccess", "RequirePermFlagForRepo"} {
+		if !seen[required] {
+			t.Fatalf("authorizeSeafHTTPDownload does not call %s; both download surfaces depend on it", required)
+		}
+	}
 }
