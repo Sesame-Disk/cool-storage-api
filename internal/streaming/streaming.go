@@ -255,41 +255,57 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 	pending = PrefetchBlock(ctx, blockStore, resolvedIDs[0], fileKey, fileIV)
 
 	for i := range resolvedIDs {
-		// Wait for the prefetched block, then mark nothing in flight until the
-		// next prefetch starts.
+		// Consume the block whose fetch we started last iteration, then mark
+		// nothing pending until the next prefetch begins.
 		result := <-pending
 		pending = nil
 
-		// Start prefetching the NEXT block immediately; it becomes the new pending
-		// block the defer is responsible for reclaiming.
+		// Start prefetching the NEXT block immediately so its fetch overlaps this
+		// block's write; it becomes the new pending block the defer reclaims.
 		if i+1 < len(resolvedIDs) {
 			pending = PrefetchBlock(ctx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
 		}
 
-		if result.Err != nil {
-			log.Printf("[%s] Failed to get block %d/%d: %v", logPrefix, i, len(resolvedIDs), result.Err)
-			return // headers already sent, can't return error to client
-		}
-
-		if fileKey != nil {
-			// Encrypted: write decrypted data
-			if _, err := c.Writer.Write(result.Data); err != nil {
-				log.Printf("[%s] Write error: %v", logPrefix, err)
-				return
-			}
-		} else {
-			// Unencrypted: stream with 4MB buffer
-			_, err := io.CopyBuffer(c.Writer, result.Reader, buf)
-			result.Reader.Close()
-			if err != nil {
-				log.Printf("[%s] Stream copy error: %v", logPrefix, err)
-				return
-			}
-		}
-
-		// Flush every 4 blocks instead of every block to reduce overhead
-		if (i+1)%4 == 0 || i == len(resolvedIDs)-1 {
-			c.Writer.Flush()
+		if !streamOneBlock(c, buf, result, fileKey, logPrefix, i, len(resolvedIDs)) {
+			return
 		}
 	}
+}
+
+// streamOneBlock writes one prefetched block to the response and ALWAYS closes
+// that block's reader — including if the write or copy panics — so the reader this
+// call owns is closed exactly once on every path. It returns false when streaming
+// must stop (a fetch error, a write error, or a copy error); the response headers
+// are already committed by then, so the failure can only be logged. The block
+// prefetched one ahead is owned and closed by StreamBlocks' own defer, not here, so
+// the two never target the same reader.
+func streamOneBlock(c *gin.Context, buf []byte, result PrefetchResult, fileKey []byte, logPrefix string, i, total int) bool {
+	if result.Reader != nil {
+		defer result.Reader.Close()
+	}
+
+	if result.Err != nil {
+		log.Printf("[%s] Failed to get block %d/%d: %v", logPrefix, i, total, result.Err)
+		return false // headers already sent, can't return error to client
+	}
+
+	if fileKey != nil {
+		// Encrypted: write the already-decrypted bytes (there is no reader to own).
+		if _, err := c.Writer.Write(result.Data); err != nil {
+			log.Printf("[%s] Write error: %v", logPrefix, err)
+			return false
+		}
+	} else {
+		// Unencrypted: stream with the 4MB buffer.
+		if _, err := io.CopyBuffer(c.Writer, result.Reader, buf); err != nil {
+			log.Printf("[%s] Stream copy error: %v", logPrefix, err)
+			return false
+		}
+	}
+
+	// Flush every 4 blocks instead of every block to reduce overhead.
+	if (i+1)%4 == 0 || i == total-1 {
+		c.Writer.Flush()
+	}
+	return true
 }
