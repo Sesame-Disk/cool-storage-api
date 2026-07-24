@@ -1250,6 +1250,38 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 // PUT /seafhttp/repo/:repo_id/block/:block_id
 // Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
 // Internally always stores blocks using SHA-256 for consistency
+// Body-size bounds for the legacy/sync seafhttp routes. Before these, PutBlock and
+// CheckBlocks read the whole request body with an unbounded io.ReadAll, so a client
+// could drive memory use arbitrarily high with one oversized body or a huge id list
+// (F12). The block cap sits just above the 256 MiB adaptive-chunk ceiling (plus a
+// margin for cipher padding); the check-blocks caps bound both the raw body and the
+// number of ids parsed from it.
+const (
+	maxSyncBlockBytes       = 256*1024*1024 + 1024*1024 // 257 MiB
+	maxCheckBlocksBodyBytes = 16 * 1024 * 1024          // 16 MiB
+	maxCheckBlockIDs        = 100_000
+)
+
+// readLimitedRequestBody reads the request body with a hard byte cap. It swaps the
+// body for an http.MaxBytesReader so an oversized body is never fully buffered in
+// memory: on overflow it writes a 413 and returns ok=false; a plain read error
+// becomes a 400. The caller MUST return immediately when ok is false — the response
+// has already been written.
+func readLimitedRequestBody(c *gin.Context, maxBytes int64) ([]byte, bool) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+	data, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large", "max_bytes": maxBytes})
+			return nil, false
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		return nil, false
+	}
+	return data, true
+}
+
 func (h *SyncHandler) PutBlock(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	externalID := c.Param("block_id")
@@ -1284,11 +1316,18 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		return
 	}
 
-	// Read block data
-	data, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		log.Printf("PutBlock: failed to read body: %v\n", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read block data"})
+	// Reject an oversized block before reading it. The declared length is a fast
+	// path for honest clients; the MaxBytesReader in readLimitedRequestBody is the
+	// hard enforcement for a chunked or lying ContentLength.
+	if c.Request.ContentLength > maxSyncBlockBytes {
+		log.Printf("PutBlock: declared body %d exceeds max %d for block %s\n", c.Request.ContentLength, maxSyncBlockBytes, externalID)
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "block too large", "max_bytes": maxSyncBlockBytes})
+		return
+	}
+
+	// Read block data (bounded)
+	data, ok := readLimitedRequestBody(c, maxSyncBlockBytes)
+	if !ok {
 		return
 	}
 
@@ -1457,12 +1496,12 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 		return
 	}
 
-	// Read block IDs from body
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+	// Read block IDs from body (bounded)
+	body, ok := readLimitedRequestBody(c, maxCheckBlocksBodyBytes)
+	if !ok {
 		return
 	}
+	var err error
 
 	// Parse the body - can be JSON array or newline-separated
 	var externalIDs []string
@@ -1477,6 +1516,13 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 	} else {
 		// Newline-separated format
 		externalIDs = strings.Split(bodyStr, "\n")
+	}
+
+	// Bound the number of ids so a body under the byte cap still cannot force an
+	// unbounded parse/allocation and per-id work.
+	if len(externalIDs) > maxCheckBlockIDs {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "too many block ids", "max_block_ids": maxCheckBlockIDs})
+		return
 	}
 
 	type requestedBlock struct {
