@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
+	apiv2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
-	"github.com/google/uuid"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -209,10 +209,17 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 
 	var canonicalExpiresAt time.Time
 	var canonicalStorageClass string
+	var trackerTTL int
 	if err := database.Session().Query(
-		`SELECT expires_at, storage_class FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
-		defaultOrgID, blockID, uploadReferrer).Scan(&canonicalExpiresAt, &canonicalStorageClass); err != nil {
+		`SELECT expires_at, storage_class, TTL(expires_at) FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&canonicalExpiresAt, &canonicalStorageClass, &trackerTTL); err != nil {
 		t.Fatalf("read canonical provisional expiry (the reference landed without its tracker — F10): %v", err)
+	}
+	if trackerTTL <= refTTL {
+		t.Fatalf("canonical tracker TTL = %d, reference TTL = %d; tracker must outlive the reference", trackerTTL, refTTL)
+	}
+	if trackerTTL-refTTL < dbpkg.ProvisionalBlockRefTrackerTTLGraceSeconds-5 {
+		t.Fatalf("canonical tracker TTL margin = %ds, want approximately %ds", trackerTTL-refTTL, dbpkg.ProvisionalBlockRefTrackerTTLGraceSeconds)
 	}
 
 	// Cassandra reports the REMAINING TTL truncated to whole seconds, so the true
@@ -248,6 +255,25 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 		t.Fatalf("projection expires_at = %v, want the canonical %v", projectedExpiresAt.UTC(), canonicalExpiresAt.UTC())
 	}
 
+	// Force both TTL-bound rows near expiry, then re-upload through the production
+	// endpoint. This makes renewal observable immediately: merely sleeping between
+	// two 48-hour writes can leave the integer TTL unchanged and would not prove the
+	// write refreshed either horizon.
+	if err := database.Session().Query(`
+		UPDATE block_references USING TTL 5
+		SET library_id = ?, created_at = ?
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, repoID, time.Now().UTC(), defaultOrgID, blockID, uploadReferrer).Exec(); err != nil {
+		t.Fatalf("shorten provisional reference TTL before renewal: %v", err)
+	}
+	if err := database.Session().Query(`
+		UPDATE gc_provisional_block_refs USING TTL 5
+		SET storage_class = ?, expires_at = ?
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, canonicalStorageClass, canonicalExpiresAt.UTC(), defaultOrgID, blockID, uploadReferrer).Exec(); err != nil {
+		t.Fatalf("shorten canonical tracker TTL before renewal: %v", err)
+	}
+
 	// A re-upload of the same block under the same session renews the pair. The
 	// superseded projection must be retracted in the same batch, or Phase 0 keeps
 	// walking a row whose deadline no longer exists.
@@ -259,16 +285,34 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 	// pass without ever exercising it.
 	time.Sleep(50 * time.Millisecond)
 	renewResp := webUploadBlock(t, adminClient, session, content)
+	if renewResp.StatusCode != http.StatusOK && renewResp.StatusCode != http.StatusCreated {
+		body := responseBody(t, renewResp)
+		renewResp.Body.Close()
+		t.Fatalf("renewal upload status = %d; body=%s", renewResp.StatusCode, body)
+	}
 	renewResp.Body.Close()
 
 	var renewedExpiresAt time.Time
+	var renewedTrackerTTL int
 	if err := database.Session().Query(
-		`SELECT expires_at FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
-		defaultOrgID, blockID, uploadReferrer).Scan(&renewedExpiresAt); err != nil {
+		`SELECT expires_at, TTL(expires_at) FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&renewedExpiresAt, &renewedTrackerTTL); err != nil {
 		t.Fatalf("read renewed provisional expiry: %v", err)
 	}
 	if renewedExpiresAt.UTC().Equal(canonicalExpiresAt.UTC()) {
 		t.Fatalf("re-upload did not move the deadline off %v, so the projection-retraction path was never exercised", canonicalExpiresAt.UTC())
+	}
+	var renewedRefTTL int
+	if err := database.Session().Query(
+		`SELECT TTL(library_id) FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&renewedRefTTL); err != nil {
+		t.Fatalf("read renewed provisional reference TTL: %v", err)
+	}
+	if renewedRefTTL < dbpkg.ProvisionalBlockReferenceTTLSeconds-10 {
+		t.Fatalf("renewed reference TTL = %d, want a refreshed ~%ds horizon", renewedRefTTL, dbpkg.ProvisionalBlockReferenceTTLSeconds)
+	}
+	if renewedTrackerTTL-renewedRefTTL < dbpkg.ProvisionalBlockRefTrackerTTLGraceSeconds-5 {
+		t.Fatalf("renewed tracker TTL margin = %ds, want approximately %ds", renewedTrackerTTL-renewedRefTTL, dbpkg.ProvisionalBlockRefTrackerTTLGraceSeconds)
 	}
 	var staleProjection time.Time
 	err := database.Session().Query(
@@ -284,86 +328,152 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 	if !errors.Is(err, gocql.ErrNotFound) {
 		t.Fatalf("check superseded projection: %v", err)
 	}
+
+	var renewedProjection time.Time
+	if err := database.Session().Query(
+		`SELECT expires_at FROM gc_provisional_block_refs_by_day
+		 WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?`,
+		dbpkg.GCProjectionUTCDate(renewedExpiresAt),
+		dbpkg.GCDiscoveryBucket(defaultOrgID, blockID, uploadReferrer),
+		renewedExpiresAt.UTC(), defaultOrgID, blockID, uploadReferrer,
+	).Scan(&renewedProjection); err != nil {
+		t.Fatalf("read renewed durable projection: %v", err)
+	}
+
+	// Successful publication creates permanent fs: liveness, releases only the
+	// session admission slot, and deliberately leaves the up: row, canonical
+	// tracker, durable projection, and staged ledger to their TTL policies.
+	sessionBeforeCommit, ok, err := database.GetBlockUploadSession(session)
+	if err != nil || !ok {
+		t.Fatalf("read session before commit: ok=%v err=%v", ok, err)
+	}
+	commit := webCommit(t, adminClient, repoID, map[string]interface{}{
+		"session":    session,
+		"parent_dir": "/",
+		"filename":   "ttl-protocol.bin",
+		"replace":    false,
+		"size":       len(content),
+		"blocks":     blocksManifest([][]byte{content}),
+	})
+	expectStatus(t, commit, http.StatusOK)
+	commit.Body.Close()
+
+	if err := database.Session().Query(
+		`SELECT TTL(library_id) FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&renewedRefTTL); err != nil || renewedRefTTL <= 0 {
+		t.Fatalf("successful commit eagerly removed provisional reference: ttl=%d err=%v", renewedRefTTL, err)
+	}
+	if err := database.Session().Query(
+		`SELECT TTL(expires_at) FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&renewedTrackerTTL); err != nil || renewedTrackerTTL <= 0 {
+		t.Fatalf("successful commit eagerly removed canonical tracker: ttl=%d err=%v", renewedTrackerTTL, err)
+	}
+	if err := database.Session().Query(
+		`SELECT expires_at FROM gc_provisional_block_refs_by_day
+		 WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?`,
+		dbpkg.GCProjectionUTCDate(renewedExpiresAt),
+		dbpkg.GCDiscoveryBucket(defaultOrgID, blockID, uploadReferrer),
+		renewedExpiresAt.UTC(), defaultOrgID, blockID, uploadReferrer,
+	).Scan(&renewedProjection); err != nil {
+		t.Fatalf("successful commit eagerly removed durable projection: %v", err)
+	}
+	sessionAfterCommit, ok, err := database.GetBlockUploadSession(session)
+	if err != nil || !ok || !sessionAfterCommit.Committed {
+		t.Fatalf("committed session record = %#v, ok=%v err=%v", sessionAfterCommit, ok, err)
+	}
+	if sessionBeforeCommit.Slot >= 0 {
+		var slotSessionID string
+		err := database.Session().Query(`
+			SELECT session_id FROM block_upload_session_slots_by_user
+			WHERE org_id = ? AND user_id = ? AND slot = ?
+		`, sessionBeforeCommit.OrgID, sessionBeforeCommit.UserID, sessionBeforeCommit.Slot).Scan(&slotSessionID)
+		if err == nil {
+			t.Fatalf("commit left admission slot %d owned by %s", sessionBeforeCommit.Slot, slotSessionID)
+		}
+		if !errors.Is(err, gocql.ErrNotFound) {
+			t.Fatalf("check committed session slot cleanup: %v", err)
+		}
+	}
+	if sessionBeforeCommit.StagedBucketCount > 0 && sessionBeforeCommit.StagedBucketCap > 0 {
+		bucket := dbpkg.StagedBlockBucket(blockID, sessionBeforeCommit.StagedBucketCount)
+		var stagedBlockID string
+		if err := database.Session().Query(`
+			SELECT block_id FROM block_upload_session_staged_blocks
+			WHERE session_id = ? AND bucket = ? AND block_id = ?
+		`, session, bucket, blockID).Scan(&stagedBlockID); err != nil {
+			t.Fatalf("commit eagerly removed TTL-bound staged ledger row: %v", err)
+		}
+	}
 }
 
-// TestProvisionalReferenceReleaseIsGenerationGuarded exercises the reference-side
-// compare against real Cassandra. The unit tests around
-// ReleaseProvisionalBlockReference drive an injected hook, so they pin the
-// orchestration — that a single observed generation is what gets passed down and
-// that a "renewed" outcome stops the release — but not the LWT itself. This does.
-//
-// The scenario is the race in miniature: a release observes a pair, a renewal
-// rewrites both rows under a fresh generation, and the release's delete arrives
-// late. It must not apply. Without the compare it removes a reference a live upload
-// owns, and the caller then reads zero references and promotes the block to a GC
-// candidate.
-//
-// It also pins the property that makes the generation trustworthy: the reference and
-// its tracker carry the SAME id, so an identity read from one row is valid for the
-// other. Deriving it from each row's own timestamps is what allowed a mixed
-// observation.
-func TestProvisionalReferenceReleaseIsGenerationGuarded(t *testing.T) {
-	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-gen-%d", time.Now().UnixNano()))
-	content := []byte("generation guarded release " + fmt.Sprint(time.Now().UnixNano()))
-	blockID := sha256hex(content)
-
-	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
-	uploadReferrer := dbpkg.BlockReferrerForUpload(session)
-	cleanupUploadedBlockArtifactsForTest(t, defaultOrgID, repoID, blockID, sha1hex(content), uploadReferrer)
-
-	resp := webUploadBlock(t, adminClient, session, content)
-	resp.Body.Close()
+// TestProvisionalRollbackPreservesTTLRows exercises the production materialize
+// rollback boundary against Cassandra. A verified mapping conflict happens after
+// metadata + provisional liveness are durable; the error must not eagerly delete
+// the up: reference, its longer-lived canonical tracker, or durable projection.
+func TestProvisionalRollbackPreservesTTLRows(t *testing.T) {
+	requireCassandra(t)
 
 	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-provisional-rollback-%d", time.Now().UnixNano()))
+	orgID := resolveOrgID(t, repoID)
+	content := []byte("mapping rollback preserves provisional rows " + fmt.Sprint(time.Now().UnixNano()))
+	blockID := sha256hex(content)
+	externalID := sha1hex(content)
+	conflictingInternalID := strings.Repeat("f", 64)
+	if conflictingInternalID == blockID {
+		conflictingInternalID = strings.Repeat("e", 64)
+	}
+	operationID := "rollback-" + fmt.Sprint(time.Now().UnixNano())
+	referrer := dbpkg.BlockReferrerForUpload(operationID)
 
-	staleGeneration, found, err := database.BlockReferenceGeneration(defaultOrgID, blockID, uploadReferrer)
-	if err != nil || !found {
-		t.Fatalf("read provisional reference generation: found=%v err=%v", found, err)
+	if err := session.Query(`
+		INSERT INTO block_id_mappings (org_id, representation_id, external_id, internal_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, orgID, dbpkg.PlainBlockRepresentationID, externalID, conflictingInternalID, time.Now().UTC()).Exec(); err != nil {
+		t.Fatalf("seed verified mapping conflict: %v", err)
 	}
-	var trackerGenerationRaw gocql.UUID
-	if err := database.Session().Query(
-		`SELECT generation_id FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
-		defaultOrgID, blockID, uploadReferrer).Scan(&trackerGenerationRaw); err != nil {
-		t.Fatalf("read tracker generation: %v", err)
-	}
-	trackerGeneration := uuid.UUID(trackerGenerationRaw)
-	if trackerGeneration != staleGeneration {
-		t.Fatalf("reference generation %v and tracker generation %v differ: one read could not speak for the other", staleGeneration, trackerGeneration)
-	}
+	t.Cleanup(func() {
+		_ = database.DeleteProvisionalBlockReferenceExpiry(orgID, blockID, referrer, time.Time{})
+		_ = session.Query(`DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`, orgID, blockID, referrer).Exec()
+		_ = session.Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec()
+		_ = session.Query(`
+			DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?
+		`, orgID, dbpkg.PlainBlockRepresentationID, externalID).Exec()
+	})
 
-	// Renew: a retry of the same block under the same session rewrites both rows
-	// under a new generation.
-	renewResp := webUploadBlock(t, adminClient, session, content)
-	renewResp.Body.Close()
-
-	renewedGeneration, found, err := database.BlockReferenceGeneration(defaultOrgID, blockID, uploadReferrer)
-	if err != nil || !found {
-		t.Fatalf("read renewed provisional reference: found=%v err=%v", found, err)
-	}
-	if renewedGeneration == staleGeneration {
-		t.Fatalf("re-upload did not mint a new generation (still %v), so the guard was never exercised", staleGeneration)
-	}
-
-	// The late release, carrying its stale observation.
-	applied, rowPresent, err := database.RemoveBlockReferenceIfGeneration(defaultOrgID, blockID, uploadReferrer, staleGeneration)
-	if err != nil {
-		t.Fatalf("conditional reference delete: %v", err)
-	}
-	if applied {
-		t.Fatal("a stale release deleted a renewed provisional reference: the live upload is unpinned and its block can be promoted to a GC candidate")
-	}
-	if !rowPresent {
-		t.Fatal("the renewed reference must still be there; reporting it absent would let the caller run a liveness check on a pinned block")
+	err := apiv2.RegisterWebUploadedBlockAndMapping(
+		database, orgID, repoID, blockID, operationID, len(content), "hot", "blocks/"+blockID, externalID,
+	)
+	if !errors.Is(err, dbpkg.ErrBlockIDMappingConflict) {
+		t.Fatalf("materialization error = %v, want mapping conflict", err)
 	}
 
-	// And the current generation still releases cleanly, so the guard has not simply
-	// made release impossible.
-	applied, _, err = database.RemoveBlockReferenceIfGeneration(defaultOrgID, blockID, uploadReferrer, renewedGeneration)
-	if err != nil {
-		t.Fatalf("conditional reference delete with the current generation: %v", err)
+	var refTTL int
+	if err := session.Query(`
+		SELECT TTL(library_id) FROM block_references
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgID, blockID, referrer).Scan(&refTTL); err != nil || refTTL <= 0 {
+		t.Fatalf("rollback eagerly removed provisional reference: ttl=%d err=%v", refTTL, err)
 	}
-	if !applied {
-		t.Fatal("the observed generation must be releasable")
+	var expiresAt time.Time
+	var trackerTTL int
+	if err := session.Query(`
+		SELECT expires_at, TTL(expires_at) FROM gc_provisional_block_refs
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgID, blockID, referrer).Scan(&expiresAt, &trackerTTL); err != nil {
+		t.Fatalf("rollback eagerly removed canonical tracker: %v", err)
+	}
+	if trackerTTL-refTTL < dbpkg.ProvisionalBlockRefTrackerTTLGraceSeconds-5 {
+		t.Fatalf("rollback tracker TTL margin = %ds, want approximately %ds", trackerTTL-refTTL, dbpkg.ProvisionalBlockRefTrackerTTLGraceSeconds)
+	}
+	var projected time.Time
+	if err := session.Query(`
+		SELECT expires_at FROM gc_provisional_block_refs_by_day
+		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?
+	`, dbpkg.GCProjectionUTCDate(expiresAt), dbpkg.GCDiscoveryBucket(orgID, blockID, referrer),
+		expiresAt.UTC(), orgID, blockID, referrer).Scan(&projected); err != nil {
+		t.Fatalf("rollback eagerly removed durable projection: %v", err)
 	}
 }
 
@@ -964,8 +1074,9 @@ func TestWebBlockUploadRoundTripAndDedup(t *testing.T) {
 		t.Fatalf("downloaded content mismatch: got %q want %q", got, content)
 	}
 
-	// R2: no provisional upload referrers leak after commit.
-	assertNoUploadReferrers(t, repoID, "/", "wbu.txt")
+	// The successful commit creates permanent fs: liveness but deliberately keeps
+	// the provisional up: reference until Cassandra TTL.
+	assertHasTTLBoundUploadReferrer(t, repoID, "/", "wbu.txt")
 
 	// Dedup/resume: a session over the same hash reports it as already existing.
 	session := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))

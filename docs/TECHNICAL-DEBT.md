@@ -184,11 +184,11 @@ The code path is corrected, but the current tree still lacks a real Cassandra re
 The direct SeafHTTP finalize paths still call `db.StagePublishAttemptReferences(..., nil)` and queue durable publish-repair rows with external SHA-1 block IDs. Block liveness itself lives on internal SHA-256 IDs.
 
 The current code is not in the highest-risk state anymore because:
-- successful provisional-ref writers (direct uploads, SeafHTTP, sync, and OnlyOffice edits) keep the `up:` ref alive until publish finishes, then release it on success while the GC scanner recovers abandoned refs by per-referrer expiry;
+- successful provisional-ref writers (direct uploads, SeafHTTP, sync, and OnlyOffice edits) keep the `up:` ref alive until publish finishes. Since PR-8 it is **not** released on success: no path deletes provisional rows, so the `up:` ref stays until its Cassandra TTL and GC scanner Phase 0 recovers refs by per-referrer expiry. Eager release was removed because deleting a provisional row concurrently with a same-referrer renewal could either unpin a live upload or strand an untracked reference;
 - permanent `fs:` refs are still added through `RegisterFSObjectBlockReferences`, which resolves external IDs before writing liveness rows.
 
 ### Why It Was Deferred
-This mismatch is now a contract / cleanup gap, not the top merge blocker. The main correctness blockers in this branch were the destructive mapping rollback, partial `pub:` stage leak, and abandoned-upload recovery gap. Those are now addressed via forward-mapping preservation, partial-stage rollback cleanup, and per-referrer provisional-expiry tracking plus success-path `up:` ref release.
+This mismatch is now a contract / cleanup gap, not the top merge blocker. The main correctness blockers in this branch were the destructive mapping rollback, partial `pub:` stage leak, and abandoned-upload recovery gap. Those are now addressed via forward-mapping preservation, partial-stage rollback cleanup, and per-referrer provisional-expiry tracking. (The success-path `up:` ref release that originally completed this list was removed in PR-8; TTL expiry plus Phase 0 recovery replaced it.)
 
 ### Follow-Up Plan
 1. Resolve SeafHTTP single-shot and multiblock finalize inputs to internal SHA-256 IDs before calling `StagePublishAttemptReferences`.

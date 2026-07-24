@@ -3198,40 +3198,11 @@ func (h *SyncHandler) stageSyncCommitBlockDelta(orgID, repoID, targetCommitID st
 	return delta, nil
 }
 
-func (h *SyncHandler) releaseSyncUploadReferences(orgID, repoID string, blockIDs []string) {
-	fsHelper := v2.NewFSHelper(h.db)
-	var zeroRefBlocks []string
-	for _, blockID := range db.NormalizeBlockIDs(blockIDs) {
-		zeroRefBlocks = append(zeroRefBlocks, fsHelper.ReleaseUploadReferences(orgID, repoID, syncBlockUploadOperationID(repoID, blockID), []string{blockID})...)
-	}
-	h.enqueueSyncZeroRefBlocks(orgID, repoID, zeroRefBlocks)
-}
-
 func (h *SyncHandler) removeSyncCommitFileReferences(orgID, repoID string, removedFiles []syncCommitFileReference) error {
 	// fs:* references track persisted fs_objects, not membership in the current
 	// HEAD. The retention/reachability GC owns removing these rows after the
 	// fs_object itself is no longer retained.
 	return nil
-}
-
-func (h *SyncHandler) enqueueSyncZeroRefBlocks(orgID, repoID string, blockIDs []string) {
-	blockIDs = db.NormalizeBlockIDs(blockIDs)
-	if h.db == nil || len(blockIDs) == 0 {
-		return
-	}
-	blockEnqueuer := v2.GetBlockEnqueuerFunc()
-	if blockEnqueuer == nil {
-		return
-	}
-
-	var storageClass string
-	if err := h.db.Session().Query(`
-		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&storageClass); err != nil {
-		log.Printf("[enqueueSyncZeroRefBlocks] failed to load storage class for repo %s: %v", repoID, err)
-		return
-	}
-	blockEnqueuer.EnqueueBlocks(orgID, blockIDs, storageClass)
 }
 
 func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID string, delta syncCommitBlockDelta) error {
@@ -3257,7 +3228,8 @@ func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID
 	if err := h.removeSyncCommitFileReferences(orgID, repoID, delta.removedFiles); err != nil {
 		return err
 	}
-	h.releaseSyncUploadReferences(orgID, repoID, delta.resolvedAddedBlockIDs)
+	// Sync upload up: references remain until Cassandra TTL. Phase 0 discovers
+	// their trackers after expiry; permanent fs: refs now own published liveness.
 	h.finalizedBlockDeltas.mark(repoID, targetCommitID)
 	return nil
 }

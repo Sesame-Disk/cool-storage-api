@@ -8,7 +8,6 @@ import (
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
-	"github.com/google/uuid"
 )
 
 // Row-per-reference block liveness model (replaces blocks.ref_count).
@@ -25,10 +24,11 @@ const (
 	blockReferrerUploadPrefix   = "up:"
 
 	// ProvisionalBlockReferenceTTLSeconds bounds how long an in-flight upload's
-	// provisional reference survives before being promoted to a permanent
-	// fs_object reference. It must exceed the longest realistic gap between
-	// uploading blocks and committing the fs_object (large resumable/chunked
-	// uploads). An abandoned upload's rows expire on their own — no permanent leak.
+	// provisional reference survives. A committed fs_object gets a separate
+	// permanent reference; the up: row still expires only by TTL. The duration must
+	// exceed the longest realistic gap between uploading blocks and committing the
+	// fs_object (large resumable/chunked uploads). Abandoned rows expire on their
+	// own — no permanent leak.
 	ProvisionalBlockReferenceTTLSeconds = 48 * 60 * 60 // 48h
 
 	// PublishAttemptReferenceTTLSeconds bounds how long a pub:<attempt> crash
@@ -127,8 +127,8 @@ func BlockReferrerForPublishAttempt(attemptID string) string {
 }
 
 // BlockReferrerForUpload builds the provisional referrer for an in-flight upload:
-// "up:<operation_id>". Written with a TTL; superseded by the permanent fs_object
-// reference once the upload is committed.
+// "up:<operation_id>". It is written with a TTL and remains until that TTL even
+// after the upload creates a separate permanent fs_object reference.
 func BlockReferrerForUpload(operationID string) string {
 	return blockReferrerUploadPrefix + operationID
 }
@@ -916,7 +916,7 @@ func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
 
 // AddBlockReference registers a reference to a block. Idempotent: re-adding the
 // same (block, referrer) overwrites a row with identical key. ttlSeconds > 0 makes
-// the row expire (provisional upload references); 0 means permanent.
+// the row expire (for example publish-attempt references); 0 means permanent.
 func (db *DB) AddBlockReference(orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
 	now := time.Now().UTC()
 	if ttlSeconds > 0 {
@@ -932,8 +932,8 @@ func (db *DB) AddBlockReference(orgID, blockID, referrer, libraryID string, ttlS
 }
 
 // RemoveBlockReference deletes a single (block, referrer) reference. Idempotent:
-// deleting a non-existent row is a no-op, so a retried GC pass or upload rollback
-// is always safe.
+// deleting a non-existent row is a no-op, so a retried GC pass or publish-attempt
+// cleanup is always safe. Upload up: references are not removed through this API.
 func (db *DB) RemoveBlockReference(orgID, blockID, referrer string) error {
 	return db.Session().Query(`
 		DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
@@ -954,58 +954,6 @@ func (db *DB) BlockHasReferences(orgID, blockID string) (bool, error) {
 		return false, err
 	}
 	return true, nil
-}
-
-// BlockReferenceGeneration returns the reference row's generation_id — the identity
-// it shares with its provisional expiry tracker. found=false means no row.
-func (db *DB) BlockReferenceGeneration(orgID, blockID, referrer string) (uuid.UUID, bool, error) {
-	// The driver unmarshals into its own gocql.UUID; both are [16]byte, so the
-	// conversion at this boundary is free.
-	var generationID gocql.UUID
-	err := db.Session().Query(`
-		SELECT generation_id FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
-	`, orgID, blockID, referrer).Scan(&generationID)
-	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return uuid.Nil, false, nil
-		}
-		return uuid.Nil, false, err
-	}
-	return uuid.UUID(generationID), true, nil
-}
-
-// RemoveBlockReferenceIfGeneration deletes one reference only while it still carries
-// the generation the caller observed, so a release cannot delete a reference that a
-// renewal wrote after the observation. Deleting that reference would unpin an upload
-// that is still running, and the caller would then see zero references and promote
-// the block to a GC candidate.
-//
-// applied=false with rowPresent=true means it was renewed and must be left alone;
-// applied=false with rowPresent=false means it was already gone, which is a
-// successful outcome for an idempotent release.
-//
-// A nil generation is refused rather than compared: `IF generation_id = null` is not
-// a meaningful compare, and a row without one predates migration 013 — the safe
-// reading is "someone else owns this", not "delete it".
-func (db *DB) RemoveBlockReferenceIfGeneration(orgID, blockID, referrer string, generationID uuid.UUID) (applied bool, rowPresent bool, err error) {
-	if generationID == uuid.Nil {
-		return false, true, nil
-	}
-	existing := map[string]interface{}{}
-	applied, err = db.Session().Query(`
-		DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
-		IF generation_id = ?
-	`, orgID, blockID, referrer, generationID.String()).MapScanCAS(existing)
-	if err != nil {
-		return false, false, fmt.Errorf("conditionally remove block reference for org=%s block=%s referrer=%s: %w", orgID, blockID, referrer, err)
-	}
-	if applied {
-		return true, true, nil
-	}
-	// On a failed compare Cassandra returns the row's current values; an empty
-	// result means there is no row at all rather than a differing one.
-	_, rowPresent = existing["generation_id"]
-	return false, rowPresent, nil
 }
 
 // BlockReferenceExists reports whether one specific (block, referrer) reference

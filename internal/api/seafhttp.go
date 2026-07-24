@@ -2064,7 +2064,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		if err != nil {
 			upload.PublishFinalizeFailure(err)
 			finalizePublished = true
-			h.handleChunkedFinalizeError(token, tokenStr, filename, upload, err)
+			h.handleChunkedFinalizeError(upload, err)
 			log.Printf("[HandleUpload] Finalization failed: %v", err)
 			writeSeafHTTPUploadError(c, err, "failed to finalize upload")
 			return
@@ -2234,12 +2234,10 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFile(leaseCtx, token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
-		h.handleSingleShotMetadataError(token, uploadOperationID, sha256ID, err)
 		log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
 		writeSeafHTTPUploadError(c, err, "file stored but metadata update failed")
 		return
 	}
-	releaseUploadedBlockRefsFn(h.db, token.OrgID, token.RepoID, uploadOperationID, []string{sha256ID})
 	log.Printf("[HandleUpload] Filesystem updated, commit=%s", commitID)
 
 	log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, finalSize, fileID[:16])
@@ -2269,24 +2267,19 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
-var rollbackUploadedBlockRefsFn = v2.RollbackUploadedBlockRefs
-
-var releaseUploadedBlockRefsFn = v2.ReleaseUploadedBlockRefs
-
 var zipBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDs
 
 var cleanupChunkUploadFn = func(upload *ChunkUpload) {
 	chunkManager.CleanupTrackedUpload(upload)
 }
 
-func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenStr, filename string, upload *ChunkUpload, err error) {
+func (h *SeafHTTPHandler) handleChunkedFinalizeError(upload *ChunkUpload, err error) {
 	// HeadConflict and quota_exceeded are both unrecoverable on the same
-	// tracker: the client cannot finalize this session again (head moved past
-	// the retry budget, or quota check will keep rejecting). Drop the tracker
-	// and roll back the block refs we promoted. A block-mutation outcome that
-	// stayed unknown must also stop same-tracker retries. Previously accounted
-	// block refs are safe to roll back because they were recorded only after a
-	// confirmed success; the ambiguous current block is not in that set yet.
+	// tracker: the client cannot finalize this session again (head moved past the
+	// retry budget, or quota check will keep rejecting). Drop the tracker, but
+	// leave every provisional up: reference to Cassandra TTL and Phase 0. A
+	// block-mutation outcome that stayed unknown must also stop same-tracker
+	// retries.
 	// Other errors (transient DB / block-store failures) leave the tracker alive
 	// so a retried finalize on the same temp file can reuse the per-tracker
 	// accounting and avoid a double increment.
@@ -2302,36 +2295,10 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 		scope = ""
 	}
 	if scope != "" {
-		accountedBlockIDs := upload.AccountedBlockIDs()
-		if len(accountedBlockIDs) > 0 {
-			rollbackUploadedBlockRefsFn(
-				h.db,
-				token.OrgID,
-				token.RepoID,
-				upload.UploadOperationID(),
-				accountedBlockIDs,
-			)
-		}
 		cleanupChunkUploadFn(upload)
 		return
 	}
 	upload.ResetFinalization()
-}
-
-func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, operationID, internalBlockID string, err error) {
-	if err == nil || strings.TrimSpace(internalBlockID) == "" {
-		return
-	}
-	if errors.Is(err, v2.ErrLibraryHeadPublicationUnknown) {
-		return
-	}
-	rollbackUploadedBlockRefsFn(
-		h.db,
-		token.OrgID,
-		token.RepoID,
-		operationID,
-		[]string{internalBlockID},
-	)
 }
 
 func writeSeafHTTPUploadError(c *gin.Context, err error, genericMsg string) {
@@ -2789,7 +2756,6 @@ readLoop:
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update filesystem metadata: %w", err)
 	}
-	releaseUploadedBlockRefsFn(h.db, token.OrgID, token.RepoID, upload.UploadOperationID(), upload.AccountedBlockIDs())
 	log.Printf("[finalizeUploadStreaming] Filesystem updated, commit=%s", commitID)
 
 	return fileID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil

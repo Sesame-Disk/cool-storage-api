@@ -370,7 +370,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		return
 	}
 
-	blockIDs, needsUpload, sizeMismatchHash := summarizeBlockVerification(verifyStart, req.Blocks, uniqueHashes, statuses, sha1ByHash256)
+	_, needsUpload, sizeMismatchHash := summarizeBlockVerification(verifyStart, req.Blocks, uniqueHashes, statuses, sha1ByHash256)
 
 	if sizeMismatchHash != "" {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "block size mismatch", "sha256": sizeMismatchHash})
@@ -451,7 +451,8 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		if relErr := h.db.ReleaseBlockUploadSessionCommit(session.SessionID); relErr != nil {
 			log.Printf("[CreateFileFromBlocks] WARNING: failed to release commit claim after finalize error: %v", relErr)
 		}
-		handleStoredUploadMetadataError(h.db, orgID, repoID, session.SessionID, blockIDs, err)
+		// The session's provisional up: references remain until their Cassandra
+		// TTL; Phase 0 handles delayed cleanup after failed publication.
 		writeUploadFileError(c, err)
 		return
 	}
@@ -497,8 +498,8 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		log.Printf("[CreateFileFromBlocks] WARNING: committed but failed to release session staging slot (self-expires at TTL): %v", err)
 	}
 
-	// Release the session's provisional refs now that permanent fs: refs exist.
-	ReleaseUploadedBlockRefs(h.db, orgID, repoID, session.SessionID, blockIDs)
+	// The session's provisional up: refs deliberately remain until Cassandra TTL.
+	// Permanent fs: refs now carry published liveness independently.
 
 	// R5: traffic was already charged per block at /blocks/upload; only the
 	// logical storage delta is accounted here. Best-effort: the file is already

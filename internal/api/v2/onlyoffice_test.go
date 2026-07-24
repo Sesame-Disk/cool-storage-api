@@ -204,27 +204,16 @@ func TestCleanupOnlyOfficeFailedPublishAttempt_JoinsRepairCleanupAndQueueClear(t
 	}
 }
 
-func TestFinalizeSuccessfulOnlyOfficeEdit_ReleasesProvisionalRefBeforeCleanup(t *testing.T) {
-	oldRelease := onlyOfficeReleaseUploadedBlockRefsFn
+func TestFinalizeSuccessfulOnlyOfficeEdit_CleansBookkeepingAndAccountsStorage(t *testing.T) {
 	oldDelete := onlyOfficeDeletePendingBlockFn
 	oldAdjust := onlyOfficeAdjustStorageCountersFn
 	t.Cleanup(func() {
-		onlyOfficeReleaseUploadedBlockRefsFn = oldRelease
 		onlyOfficeDeletePendingBlockFn = oldDelete
 		onlyOfficeAdjustStorageCountersFn = oldAdjust
 	})
 
 	h := &OnlyOfficeHandler{}
 	var calls []string
-	onlyOfficeReleaseUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
-		calls = append(calls, "release")
-		if orgID != "org-1" || repoID != "repo-1" || operationID != "rollback-1" {
-			t.Fatalf("release args = %s/%s/%s, want org-1/repo-1/rollback-1", orgID, repoID, operationID)
-		}
-		if len(blockIDs) != 1 || blockIDs[0] != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
-			t.Fatalf("release blockIDs = %#v, want the internal block id", blockIDs)
-		}
-	}
 	onlyOfficeDeletePendingBlockFn = func(handler *OnlyOfficeHandler, orgID, operationID string) error {
 		calls = append(calls, "delete")
 		if handler != h {
@@ -259,7 +248,7 @@ func TestFinalizeSuccessfulOnlyOfficeEdit_ReleasesProvisionalRefBeforeCleanup(t 
 		1,
 	)
 
-	want := []string{"release", "delete", "traffic"}
+	want := []string{"delete", "traffic"}
 	if len(calls) != len(want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
 	}

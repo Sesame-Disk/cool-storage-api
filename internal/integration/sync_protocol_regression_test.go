@@ -119,8 +119,9 @@ func TestSyncRecvFSBeforePutBlockPublishesDownloadableFile(t *testing.T) {
 	if containsStringForTest(referrers, db.BlockReferrerForPublishAttempt(commitID)) {
 		t.Fatalf("block referrers leaked publish-attempt ref: %v", referrers)
 	}
-	if containsStringForTest(referrers, db.BlockReferrerForUpload("sync:"+repoID+":"+internalBlockID)) {
-		t.Fatalf("block referrers leaked sync upload ref: %v", referrers)
+	syncUploadRef := db.BlockReferrerForUpload("sync:" + repoID + ":" + internalBlockID)
+	if !containsStringForTest(referrers, syncUploadRef) {
+		t.Fatalf("block referrers = %v, want retained TTL-bound sync upload ref %q", referrers, syncUploadRef)
 	}
 }
 

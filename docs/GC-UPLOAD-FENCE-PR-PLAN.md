@@ -273,11 +273,13 @@ the deterministic fast-clear regression remain PR-5 acceptance.
   with the cause preserved via `%w`; `db.ErrBlockMetadataPermanent` (empty class,
   malformed sha1, conflicting representation/sha1, corrupt GC ownership) is returned
   untagged and not retried. Default bias is transient — only deterministically
-  irrecoverable failures are permanent. This closes F6. **Exception:** the
-  provisional-expiry write fails closed — on its failure the helper releases the
-  reference and enqueues it rather than leaving a reference with no GC-discovery
-  projection (the F10 interim guard); it is not retried because a retry would re-add
-  the reference into the same split write.
+  irrecoverable failures are permanent. This closes F6. **Exception (superseded by
+  PR-8 — describes PR-3 as shipped):** the provisional-expiry write failed closed —
+  on its failure the helper released the reference and enqueued it rather than
+  leaving a reference with no GC-discovery projection (the F10 interim guard); it
+  was not retried because a retry would re-add the reference into the same split
+  write. PR-8 writes both rows in one batch, so there is no split to compensate and
+  that failure is now plainly retryable.
 - The retry metric `block_upload_materialization_retries_total{surface,reason}` is
   emitted by all three retry wrappers — the generic `RetryUploadedBlockMaterialization`,
   the SeafHTTP `retrySeafHTTPBlockMaterialization`, and the template-CreateFile
@@ -658,127 +660,81 @@ benchmark script that already documented it as "not a correctness benchmark".
 
 **Scope:** `internal/gc/scanner.go` (Phase 0 defers to the Cassandra TTL instead of
 deleting a possibly-renewed reference), `internal/db/provisional_block_ref_expiry.go`
-(`AddProvisionalBlockReferenceWithExpiry` in one logged batch,
-`DeleteProvisionalBlockReferenceExpiryIfGeneration` CAS on the shared `generation_id`),
-plus migration `013` adding that column to `block_references` and `gc_provisional_block_refs`.
+(`AddProvisionalBlockReferenceWithExpiry` in one normal logged batch with TTL-bound
+reference and canonical tracker rows), the GC store adapters, and the upload success
+and rollback paths that previously released provisional rows eagerly. The unmerged
+generation migration was deleted; the final provisional protocol has no generation
+identity and no conditional mutation on `block_references` or
+`gc_provisional_block_refs`.
 
 **Independent of the upload series** — could land at any point. Listed late only
 because it is lower risk, not because it is blocked.
 
-**The two findings turned out to be one mechanism.** F10 (write the reference and its
-tracking atomically) is what makes F9's fix possible: the batch derives the reference's
-Cassandra TTL from the very `expires_at` it records, so "the reference cannot outlive
-its tracker" stops being a convention two call sites happen to honour and becomes true
-by construction. Phase 0 can then *wait* for that TTL instead of deleting anything.
+**The final protocol deliberately uses TTL instead of ownership compares.**
 
-**F9 — the scanner stops deleting references.** The old flow read the canonical expiry,
-saw it due, and deleted the `up:` reference. Between those two steps an upload can renew
-the same referrer, and deleting a renewed reference unpins a live upload — after which
-the block reaches zero references and GC may delete data still being written. The new
-flow asks a different question: *is the reference still there?*
-- **Still present** → the TTL has not retired it (or a renewal just re-added it). Nothing
-  is known about liveness, so the record is deferred to a later cycle and **the day
-  cursor is held back to its day**. Without that, a deferred record on a day the cursor
-  passed would never be scanned again — trading the premature delete for a silent leak.
-- **Gone** → the reference provably expired. Only now is `BlockHasReferences` meaningful,
-  and a zero-ref block is promoted to a candidate.
-- The tracker is then retired with **CAS on `expires_at`**, closing the mirror-image race:
-  a renewal landing after the liveness read must keep its tracking, or its reference would
-  later expire with nothing left to notice the block went to zero.
+1. **Creation and renewal use one normal logged batch.**
+   `AddProvisionalBlockReferenceWithExpiry` writes the `block_references` `up:` row
+   with a TTL derived from `expires_at`, writes the canonical
+   `gc_provisional_block_refs` row with the same deadline and a longer TTL, writes
+   the current by-day discovery projection, and retracts the previously observed
+   projection when the deadline moves. There is no `IF`, serial consistency,
+   generation column or Paxos operation on either provisional row.
+2. **The discovery projection is durable.** The by-day row has no TTL. The
+   canonical tracker normally outlives the reference by the default 24-hour scanner
+   interval, but correctness does not require a scan inside that margin: after the
+   canonical row expires, the projection still drives the canonical-missing recovery
+   path.
+3. **Success and rollback never release provisional rows eagerly.** Upload publish,
+   materialization rollback and retry cleanup leave the `up:` reference, canonical
+   tracker and projection to their TTL/scanner lifecycle. This removes the race
+   rather than trying to win it with a compare. Session admission slots, committed
+   session state, staged-block ledgers, traffic charging, logical-storage accounting
+   and their idempotency markers are independent and continue to follow their own
+   cleanup rules.
+4. **Phase 0 never mutates the reference or canonical tracker.** For every due
+   projection it first checks the exact provisional reference. If that row is still
+   present, Phase 0 defers the record, preserves the projection and holds the day
+   cursor back. If it is absent, Phase 0 checks all block references, durably
+   persists a GC candidate only when the block is at zero references through
+   `EnsureBlockGCCandidate`, and only then deletes the processed projection. This
+   keeps every candidate producer on the same LWT protocol, preserves the earliest
+   candidate identity, and repairs a missing by-day projection. The
+   canonical-present and canonical-missing paths use the same ordering.
+5. **Failures remain retryable.** A reference read, liveness read, candidate write
+   or projection delete failure leaves the projection and cursor available for a
+   later scan. A logged batch provides atomic application/replay, not isolation;
+   stale renewal projections are therefore expected and safe because Phase 0 checks
+   the exact live reference before sweeping any projection.
 
-**F10 — one logged batch, no compensating rollback.** `AddProvisionalBlockReferenceWithExpiry`
-writes `block_references` (with the derived TTL), the canonical expiry row and its by-day
-discovery projection together, retracting a superseded projection in the same batch. The
-PR-3 interim guard — on an expiry-write failure, release the reference and enqueue any
-now-zero-ref block — is deleted along with the split write it compensated for: with an
-all-or-nothing batch there is no half-written state, so the failure is simply retryable.
+**Operational trade-off:** successful and rolled-back `up:` references can remain
+for up to the 48-hour provisional TTL instead of disappearing at request completion.
+The canonical tracker carries an additional 24-hour scanner margin, while the
+projection remains until Phase 0 resolves it. This temporarily retains rows and can
+delay reclaiming an abandoned block, but it removes provisional-row Paxos from hot
+upload paths and keeps every unresolved zero-reference transition discoverable.
 
-A logged batch buys **atomicity** (the batchlog is replicated before anything applies and
-replayed if the coordinator dies), not **isolation**. The lack of isolation is harmless
-here in both directions: Phase 0 discovers only through the projection, and a projection
-this batch just wrote points ~48h into the future, so nothing acts on it until long after
-every statement has landed.
+**The user-visible half of that trade-off, stated explicitly.** It is not only
+*abandoned* blocks. A file **deleted shortly after it was uploaded** does not free
+its physical space until the same TTL elapses: the library cascade removes the
+permanent `fs:` reference, but `BlockHasReferences`
+([`worker.go`](../internal/gc/worker.go) `removeFSObjectBlockReferences`) still sees
+the surviving `up:` row, so the block is never enqueued as a zero-ref candidate.
+Reclamation happens later, when the `up:` reference expires and Phase 0 resolves its
+projection — correct and convergent, but up to ~48h after the delete. Before PR-8 the
+success path released `up:` at commit, so this delete freed space immediately.
 
-**F10 had a second half, on the release side** (found in review of the first pass). Creation
-was atomic, but `ReleaseUploadReferences` still did: drop the reference → re-read the tracker
-→ delete it unconditionally. A renewal landing between the first two steps writes a fresh
-reference and moves the tracker forward; the release then reads *that* tracker and deletes
-it, leaving a live TTL'd reference with no tracking at all. Since Phase 0 discovers
-provisional refs only through the tracker's projection, that reference is invisible: when
-its TTL retires it, nothing runs the zero-ref transition and the block, its metadata and its
-S3 object are retained indefinitely. Reachable because `up:` referrers are per session — a
-retry of the same block, or a request admitted just before a commit began releasing, renews
-the very pair being released. The scanner's CAS did not cover this; it only guards Phase 0's
-own release.
+Anyone reading physical-usage counters, S3 spend, or "I deleted it and my quota did
+not drop" reports should expect that lag. The lever if it proves unacceptable is
+`ProvisionalBlockReferenceTTLSeconds` (currently 48h, sized for long resumable
+uploads) — **not** reinstating eager release, which is where all three release-side
+races came from.
 
-It took three rounds of review to get the release right, and the intermediate attempts are
-worth recording because each was defeated by a *narrower* window than the last.
-
-**Attempt 1 — condition the tracker only.** A renewal landing between the observation and
-the *reference* delete loses its reference (the delete was unconditional) while keeping its
-tracker; `ReleaseUploadReferences` then reads zero references and promotes a block whose
-upload is still running. F9's failure mode through the release path.
-
-**Attempt 2 — condition both, using each row's own timestamp** (`created_at` on the
-reference, `expires_at` on the tracker). Two problems, both fatal:
-- The two values live in different tables and were read separately, so a renewal landing
-  *between the reads* produced a **mixed observation** — the old deadline paired with the
-  new reference stamp — under which the reference compare *succeeds* and deletes the live
-  upload's reference. A narrower window, same outcome.
-- Both are wall-clock values at millisecond resolution, so two renewals inside the same
-  millisecond are indistinguishable and a stale release can satisfy the compare outright.
-
-**What actually holds — one identity, read once.** Migration 013 adds `generation_id`, a
-UUID minted per write and stamped on **both** rows inside the existing batch. The release
-reads it from the tracker in a **single** query and compares the reference against it. One
-read cannot mix two generations, and a UUID cannot collide.
-
-**And the release no longer retires tracking at all.** This is what makes the
-zero-reference transition durable. Retiring the tracker — even successfully — ends the
-block's discoverability the instant anything downstream fails: a crash, a failed liveness
-check or a failed enqueue right afterwards leaves the block at zero references with no
-candidate and nothing left to notice. So the release deletes only its reference; Phase 0
-remains the sole path that retires tracking, and it does so only after resolving liveness
-(`promoteBlockIfUnreferenced` first, sweep second). A release that dies mid-way is simply
-redone by the scanner.
-
-That also collapses the earlier partial-failure patch: with no tracker cleanup in the
-release there is no "CAS applied but projection delete failed" state to carry a flag
-through. What remains from it — Phase 0's canonical-missing branch promoting before
-sweeping — stays, since an orphaned projection can still arrive by other routes.
-
-**The asymmetry this exposed, worth stating once:** a *reference without a tracker* is
-unrecoverable (invisible to every GC phase), while a *tracker without a reference* recovers
-itself (Phase 0 sees the reference gone, judges liveness, retires the tracker). Every path
-is arranged so that a crash or a lost race lands on the recoverable side, and the final
-shape follows directly from it: **creation** writes both in one batch, **release** touches
-only the reference, and **only Phase 0** — which resolves liveness first — ever retires
-tracking. No path can produce the unrecoverable state, in any interleaving.
-
-**On the new LWTs (in the shadow of X4).** Two compares were added, and this series is
-otherwise trying to *remove* per-block LWTs, so the cost is worth stating plainly.
-
-- **Phase 0's tracker retirement** runs in the GC scanner, once per *abandoned* provisional
-  ref. Background, low volume, no cheaper alternative — an unconditional delete is what
-  loses a renewal's tracking.
-- **The release's reference compare** is the one on a hot path: `releaseSyncUploadReferences`
-  runs on the **success** path of a sync commit, per added block, so under production
-  `SERIAL` and multi-DC that is one extra global round per block. Dropping the tracker
-  retirement from the release (above) already halved what an earlier attempt would have
-  cost, and the compare is skipped entirely when no tracker was observed.
-
-Accepted because the alternative is a correctness bug — an unconditional delete unpins live
-uploads. The way to remove the round altogether is a **separate** change with its own risk:
-on the success path the provisional pair need not be released eagerly at all. The block has
-just gained its permanent `fs:` reference, so letting the TTL retire the reference and
-Phase 0 clean up costs nothing but tracker rows living out their 48h — and it is now a
-small change, since the release already leaves tracking alone. Recorded as follow-up rather
-than folded in here, because it changes when abandoned blocks become reclaimable.
-
-**Dead code removed with the paths that used them:** `UpsertProvisionalBlockReferenceExpiry`
-(tracking-only write, no caller once the atomic entry point exists — and reintroducing one
-would be F10 again), the GC store's unconditional `DeleteProvisionalBlockRefExpiry`, and the
-two rollback hooks in `fs_helpers.go`.
+**Dead code removed with the superseded designs:** eager provisional release helpers
+and hooks, generation-aware reference/tracker deletes, release-CAS tests, generation
+fields and migration `013`, tracking-only writes, Phase 0 tracker deletion, and the
+alternate normal-write candidate helper. The test-only controlled teardown helper
+remains an unconditional normal batch solely to clean fixtures; production creation,
+renewal and recovery do not call it.
 
 **Acceptance (met):**
 - `TestScanner_ScanExpiredProvisionalBlockRefs_NeverDeletesALiveReference` — reference still
@@ -786,38 +742,29 @@ two rollback hooks in `fs_helpers.go`.
   cursor does not advance past its day. Verified by reintroducing the old
   `RemoveBlockReference` call: the test fails.
 - `TestScanner_ScanExpiredProvisionalBlockRefs_KeepsTrackerWhenRenewedMidPass` — a renewal
-  injected at the liveness read (the last point before the tracker is retired) must leave
-  the renewed tracker intact. Verified by swapping the CAS for the unconditional delete:
-  the test fails.
+  injected during the liveness decision leaves the renewed tracker and reference intact;
+  Phase 0 has no tracker mutation to race.
 - `TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically` — one call, nothing runs
   after its failure, nothing is compensated, and the error is retryable.
-- `TestReleaseProvisionalBlockReference_*` (7) — a renewal landing mid-release keeps both its
-  rows and the caller is told nothing was removed; the identity comes from **exactly one**
-  read (the regression for the mixed observation); the tracker is never retired by a release;
-  a missing tracker means the reference is left alone rather than deleted unguarded; an
-  already-absent reference still lets the caller check liveness; a failed delete is never
-  reported as a removal. These pin the orchestration — they drive an injected delete — so the
-  LWT itself is covered separately, below.
 - `TestScanner_ScanExpiredProvisionalBlockRefs_PromotesUnreferencedBlockBehindOrphanedProjection`
   — the recovery path: an orphaned projection over an unreferenced block yields a candidate
   before the projection is swept. Verified by removing the promotion: the test fails.
-- `TestProvisionalReferenceReleaseIsGenerationGuarded` (integration, real Cassandra) — the
-  reference and its tracker carry the SAME generation (so one read speaks for both), a stale
-  release cannot delete a renewed reference and reports it present, and the current
-  generation still releases. This covers the LWT the unit tests stub out.
-
-**Why the integration tests are not optional here.** Every unit test above passed against a
-build that could not write a single block: `google/uuid.UUID` is not a type the gocql driver
-marshals, so all three new statements failed at runtime with "can not marshal uuid.UUID into
-UUID". Mocked boundaries cannot see driver-level type contracts. The same pass also produced
-the TTL-truncation finding. Anything in this area that is only unit-tested should be assumed
-unverified.
 - `TestWebBlockUploadWritesReferenceAndExpiryTogether` (integration, real Cassandra) — after
   a session upload, all three rows exist, the reference's TTL expiry interval brackets its
-  tracked deadline, and a renewal retracts the superseded projection (the test now *requires*
-  the deadline to move rather than returning early if it did not). The mocked unit test proves
-  one *call* is made; only this proves the write produces the rows Phase 0 depends on — it
-  caught that Cassandra reports remaining TTL truncated to whole seconds.
+  tracked deadline, the canonical tracker has its scanner margin, renewal refreshes both
+  horizons and retracts the superseded projection, and successful commit leaves all three
+  rows intact while cleaning the independent session admission state.
+- `TestProvisionalRollbackPreservesTTLRows` (integration, real Cassandra) — a
+  post-materialization mapping conflict drives the production rollback boundary and leaves
+  the provisional reference, longer-lived tracker and durable projection intact.
+- `TestProvisionalProductionCQLDoesNotUseLWT` (integration) — the production provisional
+  source contains no generation state, CAS API or conditional CQL against
+  `block_references` / `gc_provisional_block_refs`; the audit intentionally does not
+  prohibit the established `gc_block_candidates` LWT.
+- `TestProvisionalPhase0CanonicalPresentAndMissingRecovery` and
+  `TestProvisionalPhase0FailuresPreserveProjectionForRetry` (integration, real Cassandra)
+  cover live-reference deferral, promotion-before-sweep with and without the canonical
+  tracker, and retry after a failed liveness/candidate decision.
 - Existing Phase 0 tests were retargeted rather than deleted: they now stage the state the
   TTL actually produces (reference already gone) instead of the state only the old
   self-deleting scanner produced.

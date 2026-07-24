@@ -47,7 +47,8 @@ var ErrBlockDeleteInProgress = errors.New("block delete is in progress")
 
 // ErrBlockMappingWriteFailed indicates the block metadata/provisional ref was
 // materialized but the external<->internal block mapping could not be written.
-// Callers should treat this as a failed upload and rely on rollback cleanup.
+// Callers should treat this as a failed upload; the provisional ref remains
+// protected by its Cassandra TTL and Phase 0 discovery tracking.
 var ErrBlockMappingWriteFailed = errors.New("block mapping write failed")
 
 // errFSObjectNotPersistedForBlockReferences means a caller tried to attach
@@ -95,14 +96,6 @@ var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, 
 		return err
 	}
 	return h.db.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1ID, sizeBytes, storageClass, storageKey)
-}
-
-// releaseUploadReferenceFn retires a provisional reference together with the
-// tracker the release observed. It is one call for the same reason creation is
-// (F10): split across two statements, a renewal landing between them ends up with
-// a live reference and no tracking, which no GC phase can ever discover.
-var releaseUploadReferenceFn = func(h *FSHelper, orgID, blockID, referrer string) (bool, error) {
-	return h.db.ReleaseProvisionalBlockReference(orgID, blockID, referrer)
 }
 
 // registerUploadedBlockSleepFn is the overridable backoff sleep used by the
@@ -958,15 +951,16 @@ func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []str
 }
 
 // RegisterUploadedBlock records freshly-uploaded block metadata plus a
-// provisional reference that keeps the block alive until its fs_object is
-// committed. The provisional reference carries a TTL, so an abandoned upload
-// cannot leak the block forever. Liveness is row-based (no mutable counter), so
-// a client retry that re-uploads the same block is naturally idempotent.
+// provisional reference that keeps the block alive through fs_object commit.
+// The provisional reference remains until its TTL even after a permanent fs:
+// reference is created, so an abandoned upload cannot leak the block forever.
+// Liveness is row-based (no mutable counter), so a client retry that re-uploads
+// the same block is naturally idempotent.
 //
 // blockID must already be the internal (SHA-256) ID. operationID must identify
-// the specific upload/session/rollback flow that owns the provisional ref so a
-// rollback only removes its own pin. The reference is written BEFORE the
-// metadata read so that a concurrent GC claim-then-verify observes it.
+// the specific upload/session flow that owns the provisional ref. The reference
+// is written BEFORE the metadata read so that a concurrent GC
+// claim-then-verify observes it.
 //
 // This helper does NOT wait out a GC delete fence. It reads the fence exactly
 // once and, when it is active, returns the retryable ErrBlockDeleteInProgress
@@ -1076,50 +1070,6 @@ func (h *FSHelper) fsObjectExists(repoID, fsID string) (bool, error) {
 		return false, err
 	}
 	return existingFSID != "", nil
-}
-
-// ReleaseUploadReferences removes the provisional upload references for blocks of
-// an aborted upload and returns the block IDs that are now unreferenced, so the
-// caller can enqueue them for GC. blockIDs must be internal (SHA-256) IDs (the
-// same IDs used when the provisional reference was created). operationID must be
-// the same upload/session identity used at registration time. Idempotent:
-// removing a missing reference is a no-op, so a retried rollback is safe.
-//
-// Each block goes through db.ReleaseProvisionalBlockReference, which deletes only
-// the reference of the generation it observed and leaves the expiry tracker to GC
-// Phase 0. That matters here specifically: `up:` referrers are per session, so this
-// can run concurrently with an upload renewing the very same pair — a retry of the
-// same block, or a request admitted just before a commit started releasing.
-// Deleting a renewed reference would unpin a live upload; retiring its tracker
-// would make it undiscoverable to GC (F9/F10 respectively).
-func (h *FSHelper) ReleaseUploadReferences(orgID, libraryID, operationID string, blockIDs []string) []string {
-	referrer := db.BlockReferrerForUpload(operationID)
-	var zeroRefBlocks []string
-	for _, blockID := range blockIDs {
-		removed, err := releaseUploadReferenceFn(h, orgID, blockID, referrer)
-		if err != nil {
-			log.Printf("[ReleaseUploadReferences] WARNING: failed to release provisional reference for block %s: %v", blockID, err)
-		}
-		if !removed {
-			// Either the release failed outright or a renewal now owns the referrer.
-			// Both mean this block is still pinned, so evaluating liveness here could
-			// enqueue a block a live upload is using.
-			continue
-		}
-		// If anything below fails — this read, or the caller's enqueue — the block is
-		// not lost: the release deliberately left the expiry tracker in place, so GC
-		// Phase 0 reaches the same conclusion later. That is why the release does not
-		// retire tracking itself.
-		hasRefs, err := h.db.BlockHasReferences(orgID, blockID)
-		if err != nil {
-			log.Printf("[ReleaseUploadReferences] WARNING: failed to check references for block %s: %v", blockID, err)
-			continue
-		}
-		if !hasRefs {
-			zeroRefBlocks = append(zeroRefBlocks, blockID)
-		}
-	}
-	return zeroRefBlocks
 }
 
 // collectDirStats recursively collects block IDs, total size in bytes, and file count
