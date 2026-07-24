@@ -194,9 +194,19 @@ type PrefetchResult struct {
 }
 
 // PrefetchBlock starts fetching a block in a goroutine and returns a channel with the result.
+//
+// It is context-aware: if ctx is already canceled when the goroutine runs — the
+// stream was abandoned before this block's turn — it delivers ctx.Err() instead
+// of opening a new S3 request that would only have to be closed again. Whenever it
+// does open a reader, ownership passes to the receiver (StreamBlocks), which closes
+// it on both the streamed and the abandoned-prefetch paths (F11).
 func PrefetchBlock(ctx context.Context, blockStore BlockReader, blockID string, fileKey []byte, fileIV []byte) chan PrefetchResult {
 	ch := make(chan PrefetchResult, 1)
 	go func() {
+		if err := ctx.Err(); err != nil {
+			ch <- PrefetchResult{Err: err}
+			return
+		}
 		if fileKey != nil {
 			blockData, err := blockStore.GetBlock(ctx, blockID)
 			if err != nil {
@@ -224,16 +234,36 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 	buf := GetCopyBuf()
 	defer PutCopyBuf(buf)
 
+	// pending holds the channel for the block prefetched one ahead but not yet
+	// consumed. Because StreamBlocks always runs a block ahead, ANY early exit
+	// (block error, write error, copy error, panic) would otherwise drop that
+	// prefetched block with its S3 reader still open — the F11 leak. This defer
+	// drains it and closes the reader on every exit path; pending is nil whenever
+	// nothing is in flight, so the normal completion path does not block on an
+	// already-consumed channel.
+	var pending chan PrefetchResult
+	defer func() {
+		if pending == nil {
+			return
+		}
+		if res := <-pending; res.Reader != nil {
+			res.Reader.Close()
+		}
+	}()
+
 	// Start prefetching block 0
-	nextResult := PrefetchBlock(ctx, blockStore, resolvedIDs[0], fileKey, fileIV)
+	pending = PrefetchBlock(ctx, blockStore, resolvedIDs[0], fileKey, fileIV)
 
 	for i := range resolvedIDs {
-		// Wait for the prefetched block
-		result := <-nextResult
+		// Wait for the prefetched block, then mark nothing in flight until the
+		// next prefetch starts.
+		result := <-pending
+		pending = nil
 
-		// Start prefetching the NEXT block immediately
+		// Start prefetching the NEXT block immediately; it becomes the new pending
+		// block the defer is responsible for reclaiming.
 		if i+1 < len(resolvedIDs) {
-			nextResult = PrefetchBlock(ctx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
+			pending = PrefetchBlock(ctx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
 		}
 
 		if result.Err != nil {
