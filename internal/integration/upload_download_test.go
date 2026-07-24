@@ -63,6 +63,11 @@ func uploadFileThroughLinkWithReplaceField(t *testing.T, c *testClient, uploadUR
 	}
 }
 
+// assertHasTTLBoundUploadReferrer asserts only that the provisional up: reference
+// was RETAINED after the upload/commit (PR-8 no longer releases it eagerly). It
+// checks presence of the up: prefix, not the TTL value itself: the concrete TTL
+// horizon — that the reference's expiry brackets its tracked deadline — is verified
+// against real Cassandra in TestWebBlockUploadWritesReferenceAndExpiryTogether.
 func assertHasTTLBoundUploadReferrer(t *testing.T, repoID, dirPath, fileName string) {
 	t.Helper()
 	referrers := uploadedFileBlockReferrers(t, repoID, dirPath, fileName)

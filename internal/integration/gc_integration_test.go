@@ -265,6 +265,24 @@ func seedProvisionalPhase0Fixture(t *testing.T, canonicalPresent, referencePrese
 	return fixture
 }
 
+// provisionalRowExists collapses a point-read result to presence for the
+// provisional Phase 0 assertions. It returns false ONLY for a genuine
+// gocql.ErrNotFound; any other error (timeout, unavailable, read failure) fails
+// the test instead of being read as absence. Without this, an assertion that
+// expects a row to be gone would pass on a transient Cassandra error and hide a
+// real regression.
+func provisionalRowExists(t *testing.T, err error, table string) bool {
+	t.Helper()
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, gocql.ErrNotFound) {
+		return false
+	}
+	t.Fatalf("provisional existence check against %s failed (not a clean absence): %v", table, err)
+	return false
+}
+
 func provisionalProjectionExists(t *testing.T, fixture provisionalPhase0Fixture) bool {
 	t.Helper()
 	var expiresAt time.Time
@@ -274,7 +292,7 @@ func provisionalProjectionExists(t *testing.T, fixture provisionalPhase0Fixture)
 	`, db.GCProjectionUTCDate(fixture.expiresAt),
 		db.GCDiscoveryBucket(fixture.orgID.String(), fixture.blockID, fixture.referrer),
 		fixture.expiresAt, fixture.orgID.String(), fixture.blockID, fixture.referrer).Scan(&expiresAt)
-	return err == nil
+	return provisionalRowExists(t, err, "gc_provisional_block_refs_by_day")
 }
 
 func provisionalCanonicalExists(t *testing.T, fixture provisionalPhase0Fixture) bool {
@@ -284,7 +302,7 @@ func provisionalCanonicalExists(t *testing.T, fixture provisionalPhase0Fixture) 
 		SELECT expires_at FROM gc_provisional_block_refs
 		WHERE org_id = ? AND block_id = ? AND referrer = ?
 	`, fixture.orgID.String(), fixture.blockID, fixture.referrer).Scan(&expiresAt)
-	return err == nil
+	return provisionalRowExists(t, err, "gc_provisional_block_refs")
 }
 
 func provisionalReferenceExists(t *testing.T, fixture provisionalPhase0Fixture) bool {
@@ -294,7 +312,7 @@ func provisionalReferenceExists(t *testing.T, fixture provisionalPhase0Fixture) 
 		SELECT referrer FROM block_references
 		WHERE org_id = ? AND block_id = ? AND referrer = ?
 	`, fixture.orgID.String(), fixture.blockID, fixture.referrer).Scan(&referrer)
-	return err == nil
+	return provisionalRowExists(t, err, "block_references")
 }
 
 func provisionalCandidateExists(t *testing.T, fixture provisionalPhase0Fixture) bool {
@@ -303,7 +321,7 @@ func provisionalCandidateExists(t *testing.T, fixture provisionalPhase0Fixture) 
 	err := shareProjectionDBForTest(t).Session().Query(`
 		SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
 	`, fixture.orgID.String(), fixture.blockID).Scan(&candidateAt)
-	if err != nil {
+	if !provisionalRowExists(t, err, "gc_block_candidates") {
 		return false
 	}
 	return gcCandidateProjectionExists(t, fixture.orgID.String(), fixture.blockID, candidateAt)
@@ -319,8 +337,20 @@ func TestProvisionalProductionCQLDoesNotUseLWT(t *testing.T) {
 		t.Fatal("locate integration test source")
 	}
 	internalDir := filepath.Dir(filepath.Dir(testFile))
+	// Every production file that emits CQL against the provisional tables must be
+	// audited, not only the two that originally held the protocol. The last LWT to
+	// be removed (RemoveBlockReferenceIfGeneration) lived in block_references.go,
+	// which the earlier two-file list did not inspect, so a reintroduction there
+	// would not have failed this test. block_upload_sessions.go reads
+	// block_references and gc_projection_write_helpers.go writes the by-day
+	// projection; both are included so the audit covers the whole surface.
+	// provisional_block_ref_expiry.go stays first: the generation check below
+	// reads sourceFiles[0] as the canonical protocol file.
 	sourceFiles := []string{
 		filepath.Join(internalDir, "db", "provisional_block_ref_expiry.go"),
+		filepath.Join(internalDir, "db", "block_references.go"),
+		filepath.Join(internalDir, "db", "block_upload_sessions.go"),
+		filepath.Join(internalDir, "db", "gc_projection_write_helpers.go"),
 		filepath.Join(internalDir, "gc", "store_cassandra.go"),
 	}
 	targetTables := []string{

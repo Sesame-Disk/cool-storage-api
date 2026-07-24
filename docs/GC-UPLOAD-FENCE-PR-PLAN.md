@@ -723,8 +723,12 @@ Reclamation happens later, when the `up:` reference expires and Phase 0 resolves
 projection — correct and convergent, but up to ~48h after the delete. Before PR-8 the
 success path released `up:` at commit, so this delete freed space immediately.
 
-Anyone reading physical-usage counters, S3 spend, or "I deleted it and my quota did
-not drop" reports should expect that lag. The lever if it proves unacceptable is
+Anyone reading physical-usage counters or S3 spend should expect that lag. Logical
+library/user quota accounting stays governed by filesystem deltas and is **not**
+intentionally delayed by the surviving provisional reference — the independence note
+above covers exactly this — so a "I deleted it and my quota did not drop" report is a
+separate bug, not this lag, unless a specific test proves that quota depends on the
+block's physical reclamation. The lever if the physical lag proves unacceptable is
 `ProvisionalBlockReferenceTTLSeconds` (currently 48h, sized for long resumable
 uploads) — **not** reinstating eager release, which is where all three release-side
 races came from.

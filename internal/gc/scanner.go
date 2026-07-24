@@ -191,19 +191,6 @@ func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (
 	return 0, nil
 }
 
-// scanExpiredProvisionalBlockRefs processes abandoned provisional upload refs by
-// specific referrer and promotes any block their expiry left at zero references
-// into gc_block_candidates. Canonical trackers retire only through their TTL;
-// this phase never mutates them and sweeps only resolved discovery projections.
-//
-// It does NOT delete the reference row. That row carries a Cassandra TTL derived
-// from the very deadline being tracked, so it expires on its own; the phase waits
-// for that and acts only on what it observes afterwards. Deleting it here was F9:
-// an upload can renew a reference between this scan's read and its delete, and
-// removing a renewed reference unpins a live upload — after which the block goes
-// to zero references and GC is free to delete data the uploader is still writing.
-// Records whose reference has not yet gone are deferred to a later cycle, and the
-// day cursor is held back so a deferred record stays discoverable.
 // promoteBlockIfUnreferenced runs the zero-reference transition for a block whose
 // provisional pin is provably gone. Both Phase 0 paths that reach that conclusion
 // use it, so neither can quietly skip the promotion — the transition has exactly one
@@ -222,6 +209,19 @@ func (s *Scanner) promoteBlockIfUnreferenced(orgID uuid.UUID, blockID, storageCl
 	return nil
 }
 
+// scanExpiredProvisionalBlockRefs processes abandoned provisional upload refs by
+// specific referrer and promotes any block their expiry left at zero references
+// into gc_block_candidates. Canonical trackers retire only through their TTL;
+// this phase never mutates them and sweeps only resolved discovery projections.
+//
+// It does NOT delete the reference row. That row carries a Cassandra TTL derived
+// from the very deadline being tracked, so it expires on its own; the phase waits
+// for that and acts only on what it observes afterwards. Deleting it here was F9:
+// an upload can renew a reference between this scan's read and its delete, and
+// removing a renewed reference unpins a live upload — after which the block goes
+// to zero references and GC is free to delete data the uploader is still writing.
+// Records whose reference has not yet gone are deferred to a later cycle, and the
+// day cursor is held back so a deferred record stays discoverable.
 func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 0: Scanning for expired provisional upload refs...")
 
