@@ -783,6 +783,39 @@ abandoned reader, and `QueryBlockSizes` partial-cache reuse.
 **Must run `go test -race` in Docker** — this is the PR that changes goroutine and
 channel semantics.
 
+**Implemented on `fix/streaming-prefetch-reader-leak`.** `StreamBlocks` runs one
+block ahead, so on any early exit it dropped the prefetched next block with its S3
+`io.ReadCloser` still open (F11). The reader of the block being streamed is closed by
+`streamOneBlock` via `defer`, so it is released even if the write/copy panics; the
+block prefetched one ahead is owned by `StreamBlocks`, which tracks it and, in a
+defer, closes any reader on every exit path (block error, write error, copy error,
+panic) — the handle is nil whenever nothing is in flight, so normal completion never
+blocks. Prefetches run under a **child context** that the cleanup cancels *before*
+draining, so an abandonment whose cause does not cancel `ctx` (a write error) cannot
+block the handler for a whole S3 fetch/timeout; a ctx-respecting `GetBlockReader`
+returns at once and its reader, if any, is still drained and closed. The next block
+is prefetched only once the current one is known good (a failed current block ends
+the stream, so opening its successor is wasted S3). `PrefetchBlock` also delivers
+`ctx.Err()` without opening an S3 request when its context is already canceled.
+`QueryBlockSizes` was reviewed for the audited partial-cache concern and left
+unchanged: the reuse is correct (cached sizes kept, the rest fall through to DB then
+S3) and its bounded fan-outs are buffered to capacity, so an early return leaks no
+goroutine and it holds no readers.
+
+**Acceptance (met):** `internal/streaming/stream_blocks_test.go` uses an instrumented
+`io.ReadCloser` counting opens and closes and proves opens==closes (no leak, no
+double-close) on a mid-stream write error, a write **panic**, a current-block fetch
+error (the next block is never opened), and the happy path (every reader once,
+without hanging); a prefetch that blocks until its context is canceled proves the
+cleanup cancels in-flight work before draining and returns promptly rather than
+waiting out the fetch (that test hangs to timeout against the unpatched drain); and
+`PrefetchBlock` skips the fetch on a pre-canceled context. Streaming unit tests pass
+under `go test -race` in Docker; `internal/api` and `internal/api/v2` pass in Docker.
+All download-related integration tests passed (round-trip, chunked, encrypted, zip,
+region-pinned, share-link); the full suite had one unrelated pre-existing
+eventual-consistency flake (`TestShareLinkGCProjection_UpdateExpirationRekeysProjection`)
+that passed in isolation.
+
 ---
 
 ### PR-10 — HTTP request hardening

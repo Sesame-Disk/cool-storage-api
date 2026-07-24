@@ -18,6 +18,10 @@ import (
 // Satisfied by *storage.BlockStore.
 type BlockReader interface {
 	GetBlock(ctx context.Context, hash string) ([]byte, error)
+	// GetBlockReader must abort promptly when ctx is canceled. StreamBlocks cancels a
+	// prefetch's context on abandonment and then waits for that fetch to return before
+	// closing its reader, so an implementation that ignores ctx would hold the handler
+	// until the underlying call completes on its own (defeating the fast cleanup).
 	GetBlockReader(ctx context.Context, hash string) (io.ReadCloser, error)
 	GetBlockSize(ctx context.Context, hash string) (int64, error)
 }
@@ -194,9 +198,19 @@ type PrefetchResult struct {
 }
 
 // PrefetchBlock starts fetching a block in a goroutine and returns a channel with the result.
+//
+// It is context-aware: if ctx is already canceled when the goroutine runs — the
+// stream was abandoned before this block's turn — it delivers ctx.Err() instead
+// of opening a new S3 request that would only have to be closed again. Whenever it
+// does open a reader, ownership passes to the receiver (StreamBlocks), which closes
+// it on both the streamed and the abandoned-prefetch paths (F11).
 func PrefetchBlock(ctx context.Context, blockStore BlockReader, blockID string, fileKey []byte, fileIV []byte) chan PrefetchResult {
 	ch := make(chan PrefetchResult, 1)
 	go func() {
+		if err := ctx.Err(); err != nil {
+			ch <- PrefetchResult{Err: err}
+			return
+		}
 		if fileKey != nil {
 			blockData, err := blockStore.GetBlock(ctx, blockID)
 			if err != nil {
@@ -224,42 +238,88 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 	buf := GetCopyBuf()
 	defer PutCopyBuf(buf)
 
-	// Start prefetching block 0
-	nextResult := PrefetchBlock(ctx, blockStore, resolvedIDs[0], fileKey, fileIV)
+	// Prefetches run under a child context so an early exit can cancel a fetch still
+	// in flight BEFORE the cleanup below waits on it. Without that, draining a
+	// prefetch whose GetBlockReader is mid-S3-request blocks StreamBlocks for a whole
+	// fetch/timeout whenever the stream is abandoned for a reason that does not cancel
+	// ctx (a write error, or a current-block error) — turning a would-be reader leak
+	// into a handler held open. cancelPrefetch also releases the context on the
+	// normal-completion path.
+	prefetchCtx, cancelPrefetch := context.WithCancel(ctx)
+
+	// pending holds the channel for the block prefetched one ahead but not yet
+	// consumed. StreamBlocks always runs a block ahead, so on ANY early exit (block
+	// error, write error, copy error, panic) that prefetched block would otherwise be
+	// dropped with its S3 reader still open — the F11 leak. The defer cancels the
+	// in-flight fetch, then drains the channel and closes any reader, on every exit
+	// path; pending is nil whenever nothing is in flight.
+	var pending chan PrefetchResult
+	defer func() {
+		cancelPrefetch()
+		if pending == nil {
+			return
+		}
+		if res := <-pending; res.Reader != nil {
+			res.Reader.Close()
+		}
+	}()
+
+	// Start prefetching block 0.
+	pending = PrefetchBlock(prefetchCtx, blockStore, resolvedIDs[0], fileKey, fileIV)
 
 	for i := range resolvedIDs {
-		// Wait for the prefetched block
-		result := <-nextResult
+		// Consume the block whose fetch we started last iteration, then mark nothing
+		// pending until the next prefetch begins.
+		result := <-pending
+		pending = nil
 
-		// Start prefetching the NEXT block immediately
-		if i+1 < len(resolvedIDs) {
-			nextResult = PrefetchBlock(ctx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
+		// Only prefetch the next block once the current one is known good: a failed
+		// current block ends the stream, so opening its successor is wasted S3 work
+		// and one more reader to cancel and drain.
+		if result.Err == nil && i+1 < len(resolvedIDs) {
+			pending = PrefetchBlock(prefetchCtx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
 		}
 
-		if result.Err != nil {
-			log.Printf("[%s] Failed to get block %d/%d: %v", logPrefix, i, len(resolvedIDs), result.Err)
-			return // headers already sent, can't return error to client
-		}
-
-		if fileKey != nil {
-			// Encrypted: write decrypted data
-			if _, err := c.Writer.Write(result.Data); err != nil {
-				log.Printf("[%s] Write error: %v", logPrefix, err)
-				return
-			}
-		} else {
-			// Unencrypted: stream with 4MB buffer
-			_, err := io.CopyBuffer(c.Writer, result.Reader, buf)
-			result.Reader.Close()
-			if err != nil {
-				log.Printf("[%s] Stream copy error: %v", logPrefix, err)
-				return
-			}
-		}
-
-		// Flush every 4 blocks instead of every block to reduce overhead
-		if (i+1)%4 == 0 || i == len(resolvedIDs)-1 {
-			c.Writer.Flush()
+		if !streamOneBlock(c, buf, result, fileKey, logPrefix, i, len(resolvedIDs)) {
+			return
 		}
 	}
+}
+
+// streamOneBlock writes one prefetched block to the response and ALWAYS closes
+// that block's reader — including if the write or copy panics — so the reader this
+// call owns is closed exactly once on every path. It returns false when streaming
+// must stop (a fetch error, a write error, or a copy error); the response headers
+// are already committed by then, so the failure can only be logged. The block
+// prefetched one ahead is owned and closed by StreamBlocks' own defer, not here, so
+// the two never target the same reader.
+func streamOneBlock(c *gin.Context, buf []byte, result PrefetchResult, fileKey []byte, logPrefix string, i, total int) bool {
+	if result.Reader != nil {
+		defer result.Reader.Close()
+	}
+
+	if result.Err != nil {
+		log.Printf("[%s] Failed to get block %d/%d: %v", logPrefix, i, total, result.Err)
+		return false // headers already sent, can't return error to client
+	}
+
+	if fileKey != nil {
+		// Encrypted: write the already-decrypted bytes (there is no reader to own).
+		if _, err := c.Writer.Write(result.Data); err != nil {
+			log.Printf("[%s] Write error: %v", logPrefix, err)
+			return false
+		}
+	} else {
+		// Unencrypted: stream with the 4MB buffer.
+		if _, err := io.CopyBuffer(c.Writer, result.Reader, buf); err != nil {
+			log.Printf("[%s] Stream copy error: %v", logPrefix, err)
+			return false
+		}
+	}
+
+	// Flush every 4 blocks instead of every block to reduce overhead.
+	if (i+1)%4 == 0 || i == total-1 {
+		c.Writer.Flush()
+	}
+	return true
 }
