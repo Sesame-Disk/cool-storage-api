@@ -88,33 +88,26 @@ func (s *stubBlockReader) GetBlockSize(context.Context, string) (int64, error) {
 	return 0, errors.New("not implemented")
 }
 
-// failingWriter is an http.ResponseWriter whose Write always errors, used to
-// drive StreamBlocks' mid-stream copy-failure exit path.
-type failingWriter struct{ header http.Header }
+// gatedPanicWriter panics on its first Write, but only after `gate` is closed, so a
+// test can guarantee the next block was already prefetched and open before the copy
+// path panics — proving the prefetched reader is drained and closed during a panic.
+type gatedPanicWriter struct {
+	header http.Header
+	gate   <-chan struct{}
+}
 
-func (w *failingWriter) Header() http.Header {
+func (w *gatedPanicWriter) Header() http.Header {
 	if w.header == nil {
 		w.header = http.Header{}
 	}
 	return w.header
 }
-func (w *failingWriter) WriteHeader(int)          {}
-func (w *failingWriter) Write([]byte) (int, error) { return 0, errors.New("client gone: write failed") }
-func (w *failingWriter) Flush()                   {}
-
-// panicWriter panics on Write, used to prove StreamBlocks closes the reader it is
-// actively streaming even when the copy path panics rather than returning an error.
-type panicWriter struct{ header http.Header }
-
-func (w *panicWriter) Header() http.Header {
-	if w.header == nil {
-		w.header = http.Header{}
-	}
-	return w.header
+func (w *gatedPanicWriter) WriteHeader(int) {}
+func (w *gatedPanicWriter) Write([]byte) (int, error) {
+	<-w.gate
+	panic("client gone: write panicked after prefetch")
 }
-func (w *panicWriter) WriteHeader(int)           {}
-func (w *panicWriter) Write([]byte) (int, error) { panic("client gone: write panicked") }
-func (w *panicWriter) Flush()                    {}
+func (w *gatedPanicWriter) Flush() {}
 
 // gatedFailingWriter fails its first Write, but only after `gate` is closed, so a
 // test can guarantee the next block was already prefetched (and is sitting open in
@@ -177,9 +170,21 @@ func TestStreamBlocks_ClosesPrefetchedReaderOnWriteError(t *testing.T) {
 func TestStreamBlocks_ClosesReadersEvenIfWritePanics(t *testing.T) {
 	b0 := newTrackingReader("block-zero-bytes")
 	b1 := newTrackingReader("block-one-bytes")
-	stub := &stubBlockReader{readers: map[string]*trackingReader{"b0": b0, "b1": b1}}
+	b1Opened := make(chan struct{})
+	stub := &stubBlockReader{
+		readers: map[string]*trackingReader{"b0": b0},
+		readerFuncs: map[string]func(context.Context) (io.ReadCloser, error){
+			"b1": func(context.Context) (io.ReadCloser, error) {
+				b1.opens.Add(1)
+				close(b1Opened)
+				return b1, nil
+			},
+		},
+	}
 
-	c, _ := gin.CreateTestContext(&panicWriter{})
+	// Panic only after block 1 is prefetched and open, so the test proves the
+	// prefetched reader is drained and closed during a panic — not only the current.
+	c, _ := gin.CreateTestContext(&gatedPanicWriter{gate: b1Opened})
 	func() {
 		defer func() {
 			if r := recover(); r == nil {
@@ -192,8 +197,8 @@ func TestStreamBlocks_ClosesReadersEvenIfWritePanics(t *testing.T) {
 	if b0.opens.Load() != 1 || b0.closes.Load() != 1 {
 		t.Errorf("streamed reader on panic: open=%d close=%d, want 1/1", b0.opens.Load(), b0.closes.Load())
 	}
-	if !b1.balanced() {
-		t.Errorf("prefetched reader on panic leaked: open=%d close=%d", b1.opens.Load(), b1.closes.Load())
+	if b1.opens.Load() != 1 || b1.closes.Load() != 1 {
+		t.Errorf("prefetched reader on panic: open=%d close=%d, want 1/1", b1.opens.Load(), b1.closes.Load())
 	}
 }
 
@@ -226,20 +231,24 @@ func TestStreamBlocks_BlockFetchErrorDoesNotPrefetchOrLeakNext(t *testing.T) {
 // With an uncancelable drain this hangs, since the test's context is never canceled.
 func TestStreamBlocks_DoesNotBlockOnAbandonedInFlightPrefetch(t *testing.T) {
 	b0 := newTrackingReader("block-zero-bytes")
-	var b1Opened, b1Canceled atomic.Bool
+	b1Started := make(chan struct{})
+	var b1Canceled atomic.Bool
 	stub := &stubBlockReader{
 		readers: map[string]*trackingReader{"b0": b0},
 		readerFuncs: map[string]func(context.Context) (io.ReadCloser, error){
 			"b1": func(ctx context.Context) (io.ReadCloser, error) {
-				b1Opened.Store(true)
-				<-ctx.Done() // hang until StreamBlocks cancels the prefetch
+				close(b1Started) // block 1's fetch is now genuinely in flight
+				<-ctx.Done()     // hang until StreamBlocks cancels the prefetch
 				b1Canceled.Store(true)
 				return nil, ctx.Err()
 			},
 		},
 	}
 
-	c, _ := gin.CreateTestContext(&failingWriter{}) // block 0's write fails -> abandon
+	// Block 0's write fails only once block 1's fetch has entered GetBlockReader, so
+	// the abandonment deterministically happens with a fetch genuinely in flight —
+	// otherwise a fast cancel could skip opening block 1 and the test would be racy.
+	c, _ := gin.CreateTestContext(&gatedFailingWriter{gate: b1Started})
 
 	done := make(chan struct{})
 	go func() {
@@ -253,9 +262,6 @@ func TestStreamBlocks_DoesNotBlockOnAbandonedInFlightPrefetch(t *testing.T) {
 		t.Fatal("StreamBlocks hung draining a prefetch it never canceled")
 	}
 
-	if !b1Opened.Load() {
-		t.Fatal("block 1 prefetch never started; test did not exercise the in-flight path")
-	}
 	if !b1Canceled.Load() {
 		t.Error("block 1 prefetch was not canceled on abandonment")
 	}

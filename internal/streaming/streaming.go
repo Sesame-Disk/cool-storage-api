@@ -18,6 +18,10 @@ import (
 // Satisfied by *storage.BlockStore.
 type BlockReader interface {
 	GetBlock(ctx context.Context, hash string) ([]byte, error)
+	// GetBlockReader must abort promptly when ctx is canceled. StreamBlocks cancels a
+	// prefetch's context on abandonment and then waits for that fetch to return before
+	// closing its reader, so an implementation that ignores ctx would hold the handler
+	// until the underlying call completes on its own (defeating the fast cleanup).
 	GetBlockReader(ctx context.Context, hash string) (io.ReadCloser, error)
 	GetBlockSize(ctx context.Context, hash string) (int64, error)
 }
