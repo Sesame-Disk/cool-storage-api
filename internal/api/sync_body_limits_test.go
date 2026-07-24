@@ -165,6 +165,14 @@ func TestParseCheckBlockIDsJSONStrictness(t *testing.T) {
 // into millions of ids, and the cap used to be checked only after the whole list
 // had been built. TotalAlloc is cumulative and unaffected by GC, so this asserts
 // deterministically that the pathological bodies are cut during the parse.
+//
+// This is the allocation *canary*, not the cardinality contract — that contract is
+// TestCheckBlocksBoundsBlockIDCount and TestParseCheckBlockIDsJSONBoundary, which
+// pin the boundary functionally and hold regardless of allocator behavior. Keep it
+// that way: TotalAlloc is process-global, so this test must never be made parallel,
+// and a failure here under a new Go version or an instrumented runner should be
+// read as "re-measure the headroom" before "the cap regressed". Measured cost is
+// 16 MB / 34 MB against a 96 MB threshold; a materializing parse cost 272 MB/198 MB.
 func TestParseCheckBlockIDsRejectsBeforeMaterializing(t *testing.T) {
 	// Bodies at the byte cap that maximize id count. The newline case cannot be
 	// collapsed by TrimSpace because both ends are non-space, so it reaches ~1

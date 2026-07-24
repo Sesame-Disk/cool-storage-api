@@ -1285,7 +1285,6 @@ const (
 // PUT /seafhttp/repo/:repo_id/block/:block_id
 // Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
 // Internally always stores blocks using SHA-256 for consistency
-
 func (h *SyncHandler) PutBlock(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	externalID := c.Param("block_id")
@@ -1565,8 +1564,6 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var err error
-
 	// Parse the body - can be JSON array or newline-separated
 	externalIDs, ok := parseCheckBlockIDs(c, body)
 	if !ok {
@@ -1584,6 +1581,10 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 	externalToInternal := make(map[string]string)
 	var internalIDs []string
 	var representationID string
+	// Declared in the outer scope because the resolution steps below assign it
+	// alongside an already-declared result (representationID, existMap), so a := in
+	// those blocks would shadow the outer value rather than fill it.
+	var err error
 	requestedBlocks := make([]requestedBlock, 0, len(externalIDs))
 	needsRepresentationID := false
 	for _, extID := range externalIDs {

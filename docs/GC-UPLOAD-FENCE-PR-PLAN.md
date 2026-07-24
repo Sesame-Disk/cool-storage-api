@@ -861,6 +861,17 @@ its payload profile. Tracked as **X9** in the findings registry rather than as a
 narrative note, so PR-10 is not mistaken for the end of HTTP body hardening. The
 shared helper makes each a one-line change once those caps are chosen.
 
+**What a per-request cap is not.** Review raised two limits of the fix that are real
+but out of scope, now tracked as **X10** and **X11**. X10: the seafhttp block routes
+carry only `authMiddleware` — no concurrency or rate limit — so N concurrent uploads
+still cost N × 257 MiB, where the web block path already has both a per-user
+concurrency limiter and a per-IP rate limiter. Pre-sizing the read buffer from
+`Content-Length` is *not* the fix: that length is attacker-controlled, so pre-sizing
+would let an empty body allocate the full cap. X11: the 100k id cap bounds the
+parser's memory, not the work an accepted request triggers — 100k ids can still drive
+~100k sequential Cassandra point reads in the `CheckBlocks` loop. Both are bounds
+worth choosing from load data; neither reopens F12, whose defect was *unbounded*.
+
 **Acceptance (met):** `internal/api/sync_body_limits_test.go` covers the helper's
 byte boundary directly (a body up to and including the cap returns intact with no
 response written; one byte over is `413` via `MaxBytesReader` without allocating a
