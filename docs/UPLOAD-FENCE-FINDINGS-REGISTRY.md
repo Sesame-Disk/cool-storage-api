@@ -11,8 +11,9 @@ F6, F14 and the observed-fence half of F1. PR-4 merged as
 [#141](https://github.com/Sesame-Disk/sesamefs/pull/141), closing F1 and F3. PR-6 merged as
 [#142](https://github.com/Sesame-Disk/sesamefs/pull/142), closing F5 and F13. PR-7 merged as
 [#143](https://github.com/Sesame-Disk/sesamefs/pull/143), closing F8. PR-8 merged as
-[#144](https://github.com/Sesame-Disk/sesamefs/pull/144), closing F9 and F10. PR-9 is
-implemented on `fix/streaming-prefetch-reader-leak` and pending review; F11 remains open
+[#144](https://github.com/Sesame-Disk/sesamefs/pull/144), closing F9 and F10. PR-9 merged
+as [#145](https://github.com/Sesame-Disk/sesamefs/pull/145), closing F11. PR-10 is
+implemented on `fix/sync-unbounded-request-bodies` and pending review; F12 remains open
 on `main` until it merges. X1/X2 remain open.
 
 Every row is verified against code at the cited location, except where the row
@@ -41,13 +42,12 @@ out here so the decision is visible rather than implicit.
 
 ## Open on `main`
 
-F11 has an implementation on `fix/streaming-prefetch-reader-leak` but stays open until
-PR-9 merges.
+F12 has an implementation on `fix/sync-unbounded-request-bodies` but stays open until
+PR-10 merges.
 
 | # | Severity | Finding | Evidence | Closed by |
 |---|---|---|---|---|
-| F11 | Medium | **Abandoned prefetch leaks an open S3 reader.** `PrefetchBlock` buffered its result, so a consumer that stopped early left the `io.ReadCloser` unclosed. **PR-9 makes `StreamBlocks` track the block prefetched one ahead and, via a defer, drain and close its reader on every early exit — block error, write error, copy error, panic; `PrefetchBlock` now delivers `ctx.Err()` without opening an S3 request when its context is already canceled. `QueryBlockSizes` was reviewed for the audited partial-cache concern and left unchanged (the reuse is correct and its bounded fan-outs are buffered to capacity, so an early return leaks no goroutine and it holds no readers).** | `streaming/streaming.go` | PR-9 |
-| F12 | Medium | **Unbounded request bodies.** `PutBlock` and `check-blocks` read the whole body with `io.ReadAll` and no size or id-count limit. | `sync.go` | PR-10 |
+| F12 | Medium | **Unbounded request bodies.** `PutBlock` and `check-blocks` read the whole body with `io.ReadAll` and no size or id-count limit. **PR-10 adds a shared `readLimitedRequestBody` helper that swaps the body for an `http.MaxBytesReader` and answers 413 on overflow; `PutBlock` also fast-rejects an oversized declared `ContentLength` before reading, capped just above the 256 MiB adaptive-chunk ceiling; `check-blocks` bounds both the raw body and the number of ids parsed (413 before any per-id work).** The paired `PutCommit`, `PackFS`, `RecvFS` and `CheckFS` sync handlers share the same unbounded read and are noted as a follow-up (out of F12's scope; the helper makes each a one-line change). | `sync.go` | PR-10 |
 | F13 | High | **Corrupt directory listings resolve, and unproven absence can become 404.** High because corrupt entries can serve bytes from the wrong FS object; the HTTP-classification half alone is lower severity. A missing referenced row is dangling metadata, and even a valid local listing without an entry may be an older `LOCAL_QUORUM` cross-DC snapshot, so neither proves global absence. Related, and worse: a JSON-valid but corrupt listing resolves anyway. Structural cases (`null`, `[null]`, non-string name, missing id/mode) are skipped or misclassified; unsafe names can create traversal entries in ZIPs; semantic cases (empty or non-40-hex id, duplicate names/keys, invalid mode) can resolve the wrong object. `encoding/json` silently keeps the **last** repeated key, so `{"id":"A","id":"B"}` serves B and `{"name":"a","name":"b"}` hides `a` entirely. | `seafhttp.go` directory lookup and ZIP preflight | PR-6 |
 
 ## Closed
@@ -69,6 +69,7 @@ Rows move here only once the PR that fixes them **merges**.
 | F8 | Medium | Legacy no-session upload leaked S3 objects (R2): `/api/v2/blocks/upload` without a session wrote an object with no `blocks` row and no reference. PR-7 removed the path outright — both `/blocks/upload` and its paired `/blocks/check` oracle answer 400 `block_upload_session_required` before any store I/O, and the frontend throws instead of silently dropping the session header. | PR-7 ([#143](https://github.com/Sesame-Disk/sesamefs/pull/143)) |
 | F9 | Medium | GC Phase 0 could delete a provisional reference a live upload had just renewed. PR-8 makes the `up:` reference and canonical tracker retire only through their derived Cassandra TTL; Phase 0 never mutates them, checks the exact reference before resolving liveness, defers a still-present row (holding the day cursor), and sweeps only resolved projections. | PR-8 ([#144](https://github.com/Sesame-Disk/sesamefs/pull/144)) |
 | F10 | Medium | Provisional reference and its expiry were written separately, so a failure between them left an undiscoverable reference. PR-8 writes the TTL-bound reference, longer-lived tracker and durable by-day projection in one logged batch and removes eager provisional release entirely, so every failure is retryable and there is no provisional-row LWT/CAS. | PR-8 ([#144](https://github.com/Sesame-Disk/sesamefs/pull/144)) |
+| F11 | Medium | Abandoned streaming prefetch leaked an open S3 reader. PR-9 makes `streamOneBlock` close the streamed block's reader via defer (panic-safe) and `StreamBlocks` cancel a child prefetch context and drain/close the block prefetched one ahead on every exit; the next block is prefetched only when the current one succeeds, and `PrefetchBlock` skips the fetch when its context is already canceled. | PR-9 ([#145](https://github.com/Sesame-Disk/sesamefs/pull/145)) |
 
 ## Open, deferred, or constraining the series
 

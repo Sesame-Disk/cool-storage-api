@@ -826,6 +826,30 @@ cap.
 **Split from PR-9** because nothing forces them to ship together: a reader leak and a
 DoS bound share no code and no deploy dependency. Rule 1 applies to this series too.
 
+**Implemented on `fix/sync-unbounded-request-bodies`.** A shared
+`readLimitedRequestBody(c, maxBytes)` swaps the request body for an
+`http.MaxBytesReader` before `io.ReadAll`, so an oversized body is never fully
+buffered; on overflow it answers `413` and the caller returns. `PutBlock` also fast-
+rejects an oversized declared `ContentLength` before reading, with the cap
+(`maxSyncBlockBytes`, 257 MiB) sitting just above the 256 MiB adaptive-chunk ceiling
+plus a cipher-padding margin. `check-blocks` reads under `maxCheckBlocksBodyBytes`
+(16 MiB) and, after parsing, rejects a list longer than `maxCheckBlockIDs` (100k)
+with `413` before any per-id classification or DB lookup.
+
+**Deliberately scoped to F12.** `PutCommit`, `PackFS`, `RecvFS` and `CheckFS` on the
+same sync handler share the identical unbounded `io.ReadAll(c.Request.Body)` pattern.
+They are the same class but are **not** part of F12; each needs its own safe cap from
+its payload profile, so they are left as a follow-up. The shared helper makes each a
+one-line change once those caps are chosen.
+
+**Acceptance (met):** `internal/api/sync_body_limits_test.go` covers the helper's
+byte boundary directly (a body up to and including the cap returns intact with no
+response written; one byte over is `413` via `MaxBytesReader` without allocating a
+real 257 MiB body), `PutBlock` rejecting an oversized declared `ContentLength` while
+letting a block declared exactly at the cap through the size gate, and `check-blocks`
+rejecting one id over the cap while letting a list exactly at the cap through. The
+`internal/api`, `internal/api/v2` and `internal/streaming` suites pass in Docker.
+
 ---
 
 ### PR-11 (deferred) — Remove the per-block Paxos
