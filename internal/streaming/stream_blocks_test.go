@@ -130,6 +130,25 @@ func (w *gatedFailingWriter) Write([]byte) (int, error) {
 }
 func (w *gatedFailingWriter) Flush() {}
 
+// runStreamBlocksWithin runs fn (a StreamBlocks call, optionally wrapping its own
+// recover) in a goroutine and fails fast if it does not return within 5s. The gated
+// writers block their Write on a channel the next block's prefetch is expected to
+// open; a regression that stops that prefetch would otherwise hang the test to the
+// global go test timeout instead of failing here.
+func runStreamBlocksWithin(t *testing.T, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StreamBlocks did not return within 5s (a gated write or drain likely stalled)")
+	}
+}
+
 // TestStreamBlocks_ClosesPrefetchedReaderOnWriteError is the F11 regression: when
 // a write fails while streaming block i, the block i+1 already prefetched a block
 // ahead must not be dropped with its S3 reader still open.
@@ -152,7 +171,9 @@ func TestStreamBlocks_ClosesPrefetchedReaderOnWriteError(t *testing.T) {
 	// abandonment deterministically leaves block 1's reader open in the buffer —
 	// exactly the F11 leak the drain must reclaim.
 	c, _ := gin.CreateTestContext(&gatedFailingWriter{gate: b1Opened})
-	StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
+	runStreamBlocksWithin(t, func() {
+		StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
+	})
 
 	if b0.opens.Load() != 1 || b0.closes.Load() != 1 {
 		t.Errorf("streamed reader: open=%d close=%d, want 1/1", b0.opens.Load(), b0.closes.Load())
@@ -185,14 +206,14 @@ func TestStreamBlocks_ClosesReadersEvenIfWritePanics(t *testing.T) {
 	// Panic only after block 1 is prefetched and open, so the test proves the
 	// prefetched reader is drained and closed during a panic — not only the current.
 	c, _ := gin.CreateTestContext(&gatedPanicWriter{gate: b1Opened})
-	func() {
+	runStreamBlocksWithin(t, func() {
 		defer func() {
 			if r := recover(); r == nil {
 				t.Error("expected StreamBlocks to propagate the writer panic")
 			}
 		}()
 		StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
-	}()
+	})
 
 	if b0.opens.Load() != 1 || b0.closes.Load() != 1 {
 		t.Errorf("streamed reader on panic: open=%d close=%d, want 1/1", b0.opens.Load(), b0.closes.Load())

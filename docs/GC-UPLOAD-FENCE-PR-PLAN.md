@@ -826,6 +826,65 @@ cap.
 **Split from PR-9** because nothing forces them to ship together: a reader leak and a
 DoS bound share no code and no deploy dependency. Rule 1 applies to this series too.
 
+**Implemented on `fix/sync-unbounded-request-bodies`.** A shared
+`readLimitedRequestBody(c, maxBytes)` swaps the request body for an
+`http.MaxBytesReader` before `io.ReadAll`, so an oversized body is never fully
+buffered; on overflow it answers `413` and the caller returns. `PutBlock` also fast-
+rejects an oversized declared `ContentLength` before reading, with the cap
+(`maxSyncBlockBytes`, 257 MiB) sitting just above the 256 MiB adaptive-chunk ceiling
+plus a cipher-padding margin. `check-blocks` reads under `maxCheckBlocksBodyBytes`
+(16 MiB) and, after parsing, rejects a list longer than `maxCheckBlockIDs` (100k)
+with `413` before any per-id classification or DB lookup.
+
+**The id cap is enforced during the parse, not after it.** An audit of the first
+revision found the cardinality bound applied *after* `strings.Split` /
+`json.Unmarshal` had already materialized the list — allocating precisely what the
+cap exists to bound. The 16 MiB body cap does not constrain this: `TrimSpace` cannot
+collapse `"a" + "\n"*n + "a"`, so a body at the cap still reaches ~16.7M ids
+(**272 MB** of string headers from `strings.Split`'s single pre-sized `make`), and a
+JSON array of empty strings reaches ~5.6M ids (**198 MB**, since `json.Unmarshal`
+grows the slice to completion first). Both measured. The newline path now counts
+delimiters before splitting, and the JSON path decodes element by element through a
+`json.Decoder`, stopping at the cap — while still requiring the closing bracket and
+rejecting trailing content, so it is no laxer than the `json.Unmarshal` it replaced.
+The same bodies now cost **16 MB** and **34 MB**.
+
+**DRY.** `GetLockedFiles` had grown the same `MaxBytesReader` + count-cap pattern
+independently; it now shares `readLimitedRequestBody`, which moves its oversized-body
+answer from `400` to the semantically correct `413` (an abusive-caller path only — the
+desktop client sends one entry per synced library and never approaches 256 KiB).
+
+**Deliberately scoped to F12.** `PutCommit`, `PackFS`, `RecvFS` and `CheckFS` on the
+same sync handler share the identical unbounded `io.ReadAll(c.Request.Body)` pattern.
+They are the same class but are **not** part of F12; each needs its own safe cap from
+its payload profile. Tracked as **X9** in the findings registry rather than as a
+narrative note, so PR-10 is not mistaken for the end of HTTP body hardening. The
+shared helper makes each a one-line change once those caps are chosen.
+
+**What a per-request cap is not.** Review raised two limits of the fix that are real
+but out of scope, now tracked as **X10** and **X11**. X10: the seafhttp block routes
+carry only `authMiddleware` — no concurrency or rate limit — so N concurrent uploads
+still cost N × 257 MiB, where the web block path already has both a per-user
+concurrency limiter and a per-IP rate limiter. Pre-sizing the read buffer from
+`Content-Length` is *not* the fix: that length is attacker-controlled, so pre-sizing
+would let an empty body allocate the full cap. X11: the 100k id cap bounds the
+parser's memory, not the work an accepted request triggers — 100k ids can still drive
+~100k sequential Cassandra point reads in the `CheckBlocks` loop. Both are bounds
+worth choosing from load data; neither reopens F12, whose defect was *unbounded*.
+
+**Acceptance (met):** `internal/api/sync_body_limits_test.go` covers the helper's
+byte boundary directly (a body up to and including the cap returns intact with no
+response written; one byte over is `413` via `MaxBytesReader` without allocating a
+real 257 MiB body), a plain read error staying `400` so it is distinguishable from an
+overflow, a chunked body with no declared length still cut at the cap by the endpoint,
+`PutBlock` rejecting an oversized declared `ContentLength` while letting a block
+declared exactly at the cap through the size gate, the id cap on **both** body formats
+at and one over the boundary, the JSON decoder's strictness (unterminated array,
+trailing content, a second array, non-string element), and a `TotalAlloc` assertion —
+cumulative and therefore GC-independent — that the two pathological bodies are cut
+during the parse rather than after materialization. The `internal/api`,
+`internal/api/v2` and `internal/streaming` suites pass.
+
 ---
 
 ### PR-11 (deferred) — Remove the per-block Paxos
