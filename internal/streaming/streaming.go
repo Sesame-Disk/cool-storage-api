@@ -234,15 +234,24 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 	buf := GetCopyBuf()
 	defer PutCopyBuf(buf)
 
+	// Prefetches run under a child context so an early exit can cancel a fetch still
+	// in flight BEFORE the cleanup below waits on it. Without that, draining a
+	// prefetch whose GetBlockReader is mid-S3-request blocks StreamBlocks for a whole
+	// fetch/timeout whenever the stream is abandoned for a reason that does not cancel
+	// ctx (a write error, or a current-block error) — turning a would-be reader leak
+	// into a handler held open. cancelPrefetch also releases the context on the
+	// normal-completion path.
+	prefetchCtx, cancelPrefetch := context.WithCancel(ctx)
+
 	// pending holds the channel for the block prefetched one ahead but not yet
-	// consumed. Because StreamBlocks always runs a block ahead, ANY early exit
-	// (block error, write error, copy error, panic) would otherwise drop that
-	// prefetched block with its S3 reader still open — the F11 leak. This defer
-	// drains it and closes the reader on every exit path; pending is nil whenever
-	// nothing is in flight, so the normal completion path does not block on an
-	// already-consumed channel.
+	// consumed. StreamBlocks always runs a block ahead, so on ANY early exit (block
+	// error, write error, copy error, panic) that prefetched block would otherwise be
+	// dropped with its S3 reader still open — the F11 leak. The defer cancels the
+	// in-flight fetch, then drains the channel and closes any reader, on every exit
+	// path; pending is nil whenever nothing is in flight.
 	var pending chan PrefetchResult
 	defer func() {
+		cancelPrefetch()
 		if pending == nil {
 			return
 		}
@@ -251,19 +260,20 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 		}
 	}()
 
-	// Start prefetching block 0
-	pending = PrefetchBlock(ctx, blockStore, resolvedIDs[0], fileKey, fileIV)
+	// Start prefetching block 0.
+	pending = PrefetchBlock(prefetchCtx, blockStore, resolvedIDs[0], fileKey, fileIV)
 
 	for i := range resolvedIDs {
-		// Consume the block whose fetch we started last iteration, then mark
-		// nothing pending until the next prefetch begins.
+		// Consume the block whose fetch we started last iteration, then mark nothing
+		// pending until the next prefetch begins.
 		result := <-pending
 		pending = nil
 
-		// Start prefetching the NEXT block immediately so its fetch overlaps this
-		// block's write; it becomes the new pending block the defer reclaims.
-		if i+1 < len(resolvedIDs) {
-			pending = PrefetchBlock(ctx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
+		// Only prefetch the next block once the current one is known good: a failed
+		// current block ends the stream, so opening its successor is wasted S3 work
+		// and one more reader to cancel and drain.
+		if result.Err == nil && i+1 < len(resolvedIDs) {
+			pending = PrefetchBlock(prefetchCtx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
 		}
 
 		if !streamOneBlock(c, buf, result, fileKey, logPrefix, i, len(resolvedIDs)) {

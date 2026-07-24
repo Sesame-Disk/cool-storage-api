@@ -36,19 +36,23 @@ func newTrackingReader(data string) *trackingReader {
 	return &trackingReader{Reader: bytes.NewReader([]byte(data))}
 }
 
-// balanced reports whether the reader was opened and closed the same number of
-// times (and at least once), i.e. no leak and no double-close.
+// balanced reports whether the reader was closed exactly as many times as it was
+// opened — no leak and no double-close. A reader that was never opened (0 == 0) is
+// balanced: with a cancelable prefetch, an abandoned block may legitimately never be
+// opened, and that is not a leak.
 func (r *trackingReader) balanced() bool {
-	o, c := r.opens.Load(), r.closes.Load()
-	return o >= 1 && o == c
+	return r.opens.Load() == r.closes.Load()
 }
 
 // stubBlockReader serves a per-block reader/data/error from maps and records the
-// readers it handed out so a test can assert each one was closed.
+// readers it handed out so a test can assert each one was closed. readerFuncs lets
+// a test install ctx-aware behavior for a specific block (e.g. block until the fetch
+// context is canceled), which the static maps cannot express.
 type stubBlockReader struct {
 	mu             sync.Mutex
 	readers        map[string]*trackingReader
 	readerErr      map[string]error
+	readerFuncs    map[string]func(context.Context) (io.ReadCloser, error)
 	data           map[string][]byte
 	getReaderCalls atomic.Int32
 }
@@ -60,8 +64,14 @@ func (s *stubBlockReader) GetBlock(_ context.Context, hash string) ([]byte, erro
 	return nil, errors.New("no data for " + hash)
 }
 
-func (s *stubBlockReader) GetBlockReader(_ context.Context, hash string) (io.ReadCloser, error) {
+func (s *stubBlockReader) GetBlockReader(ctx context.Context, hash string) (io.ReadCloser, error) {
 	s.getReaderCalls.Add(1)
+	s.mu.Lock()
+	fn := s.readerFuncs[hash]
+	s.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.readerErr[hash]; err != nil {
@@ -106,29 +116,56 @@ func (w *panicWriter) WriteHeader(int)           {}
 func (w *panicWriter) Write([]byte) (int, error) { panic("client gone: write panicked") }
 func (w *panicWriter) Flush()                    {}
 
+// gatedFailingWriter fails its first Write, but only after `gate` is closed, so a
+// test can guarantee the next block was already prefetched (and is sitting open in
+// the buffer) before the stream is abandoned.
+type gatedFailingWriter struct {
+	header http.Header
+	gate   <-chan struct{}
+}
+
+func (w *gatedFailingWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = http.Header{}
+	}
+	return w.header
+}
+func (w *gatedFailingWriter) WriteHeader(int) {}
+func (w *gatedFailingWriter) Write([]byte) (int, error) {
+	<-w.gate
+	return 0, errors.New("client gone: write failed after prefetch")
+}
+func (w *gatedFailingWriter) Flush() {}
+
 // TestStreamBlocks_ClosesPrefetchedReaderOnWriteError is the F11 regression: when
 // a write fails while streaming block i, the block i+1 already prefetched a block
 // ahead must not be dropped with its S3 reader still open.
 func TestStreamBlocks_ClosesPrefetchedReaderOnWriteError(t *testing.T) {
 	b0 := newTrackingReader("block-zero-bytes")
 	b1 := newTrackingReader("block-one-bytes")
-	stub := &stubBlockReader{readers: map[string]*trackingReader{
-		"b0": b0,
-		"b1": b1,
-	}}
+	b1Opened := make(chan struct{})
+	stub := &stubBlockReader{
+		readers: map[string]*trackingReader{"b0": b0},
+		readerFuncs: map[string]func(context.Context) (io.ReadCloser, error){
+			"b1": func(context.Context) (io.ReadCloser, error) {
+				b1.opens.Add(1)
+				close(b1Opened)
+				return b1, nil
+			},
+		},
+	}
 
-	c, _ := gin.CreateTestContext(&failingWriter{})
+	// Block 0's write fails only after block 1 has been prefetched, so the
+	// abandonment deterministically leaves block 1's reader open in the buffer —
+	// exactly the F11 leak the drain must reclaim.
+	c, _ := gin.CreateTestContext(&gatedFailingWriter{gate: b1Opened})
 	StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
 
-	if got := b0.closes.Load(); got != 1 {
-		t.Errorf("streamed block reader closed %d times, want 1", got)
+	if b0.opens.Load() != 1 || b0.closes.Load() != 1 {
+		t.Errorf("streamed reader: open=%d close=%d, want 1/1", b0.opens.Load(), b0.closes.Load())
 	}
-	if got := b1.closes.Load(); got != 1 {
-		t.Errorf("prefetched-but-abandoned block reader closed %d times, want 1 (F11 leak)", got)
-	}
-	if !b0.balanced() || !b1.balanced() {
-		t.Errorf("opens!=closes: b0(open=%d close=%d) b1(open=%d close=%d)",
-			b0.opens.Load(), b0.closes.Load(), b1.opens.Load(), b1.closes.Load())
+	if b1.opens.Load() != 1 || b1.closes.Load() != 1 {
+		t.Errorf("prefetched-but-abandoned reader: open=%d close=%d, want 1/1 (F11 leak)", b1.opens.Load(), b1.closes.Load())
 	}
 }
 
@@ -152,18 +189,18 @@ func TestStreamBlocks_ClosesReadersEvenIfWritePanics(t *testing.T) {
 		StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
 	}()
 
-	if !b0.balanced() {
-		t.Errorf("streamed reader on panic: open=%d close=%d, want equal and >=1", b0.opens.Load(), b0.closes.Load())
+	if b0.opens.Load() != 1 || b0.closes.Load() != 1 {
+		t.Errorf("streamed reader on panic: open=%d close=%d, want 1/1", b0.opens.Load(), b0.closes.Load())
 	}
 	if !b1.balanced() {
-		t.Errorf("prefetched reader on panic: open=%d close=%d, want equal and >=1", b1.opens.Load(), b1.closes.Load())
+		t.Errorf("prefetched reader on panic leaked: open=%d close=%d", b1.opens.Load(), b1.closes.Load())
 	}
 }
 
-// TestStreamBlocks_ClosesPrefetchedReaderOnBlockError covers the other early exit:
-// block i fails to fetch, so its result carries an error, but block i+1 was
-// already prefetched and its reader must still be closed.
-func TestStreamBlocks_ClosesPrefetchedReaderOnBlockError(t *testing.T) {
+// TestStreamBlocks_BlockFetchErrorDoesNotPrefetchOrLeakNext covers a current-block
+// fetch error: the stream ends there, so the next block must never be prefetched (no
+// wasted S3 open, nothing to cancel or drain) and nothing is leaked.
+func TestStreamBlocks_BlockFetchErrorDoesNotPrefetchOrLeakNext(t *testing.T) {
 	b1 := newTrackingReader("block-one-bytes")
 	stub := &stubBlockReader{
 		readers:   map[string]*trackingReader{"b1": b1},
@@ -173,8 +210,57 @@ func TestStreamBlocks_ClosesPrefetchedReaderOnBlockError(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
 
-	if got := b1.closes.Load(); got != 1 {
-		t.Errorf("prefetched reader after a block error closed %d times, want 1 (F11 leak)", got)
+	if b1.opens.Load() != 0 {
+		t.Errorf("next block prefetched %d times after a current-block error, want 0", b1.opens.Load())
+	}
+	if !b1.balanced() {
+		t.Errorf("next block reader leaked: open=%d close=%d", b1.opens.Load(), b1.closes.Load())
+	}
+}
+
+// TestStreamBlocks_DoesNotBlockOnAbandonedInFlightPrefetch proves the cleanup
+// cancels a prefetch still in flight BEFORE draining it. Block 1's fetch blocks
+// until its context is canceled (modeling a slow/hung S3 GetObject); block 0's write
+// then fails, abandoning the stream. StreamBlocks must return promptly — the drain
+// must not wait out the fetch — and the canceled fetch must leave no open reader.
+// With an uncancelable drain this hangs, since the test's context is never canceled.
+func TestStreamBlocks_DoesNotBlockOnAbandonedInFlightPrefetch(t *testing.T) {
+	b0 := newTrackingReader("block-zero-bytes")
+	var b1Opened, b1Canceled atomic.Bool
+	stub := &stubBlockReader{
+		readers: map[string]*trackingReader{"b0": b0},
+		readerFuncs: map[string]func(context.Context) (io.ReadCloser, error){
+			"b1": func(ctx context.Context) (io.ReadCloser, error) {
+				b1Opened.Store(true)
+				<-ctx.Done() // hang until StreamBlocks cancels the prefetch
+				b1Canceled.Store(true)
+				return nil, ctx.Err()
+			},
+		},
+	}
+
+	c, _ := gin.CreateTestContext(&failingWriter{}) // block 0's write fails -> abandon
+
+	done := make(chan struct{})
+	go func() {
+		StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StreamBlocks hung draining a prefetch it never canceled")
+	}
+
+	if !b1Opened.Load() {
+		t.Fatal("block 1 prefetch never started; test did not exercise the in-flight path")
+	}
+	if !b1Canceled.Load() {
+		t.Error("block 1 prefetch was not canceled on abandonment")
+	}
+	if got := b0.closes.Load(); got != 1 {
+		t.Errorf("streamed reader closed %d times, want 1", got)
 	}
 }
 
