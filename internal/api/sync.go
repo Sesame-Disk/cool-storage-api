@@ -524,6 +524,26 @@ const maxLockedFilesRepos = 500
 // on a route that carries no middleware limits.
 const maxLockedFilesBodyBytes = 256 * 1024
 
+// readLimitedRequestBody reads the request body with a hard byte cap. It swaps the
+// body for an http.MaxBytesReader so an oversized body is never fully buffered in
+// memory: on overflow it writes a 413 and returns ok=false; a plain read error
+// becomes a 400. The caller MUST return immediately when ok is false — the response
+// has already been written.
+func readLimitedRequestBody(c *gin.Context, maxBytes int64) ([]byte, bool) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+	data, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large", "max_bytes": maxBytes})
+			return nil, false
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		return nil, false
+	}
+	return data, true
+}
+
 const emptySyncFSID40 = "0000000000000000000000000000000000000000"
 
 // lockedFileEntry is one locked path within a repo's response entry.
@@ -582,10 +602,13 @@ var loadSyncFileBlockIDsFn = func(h *SyncHandler, repoID string, fileIDs []strin
 // "by_me" compares the lock holder against the user the entry's token was
 // issued to.
 func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxLockedFilesBodyBytes)
+	body, ok := readLimitedRequestBody(c, maxLockedFilesBodyBytes)
+	if !ok {
+		return
+	}
 
 	var reqs []lockedFilesRequestEntry
-	if err := c.ShouldBindJSON(&reqs); err != nil {
+	if err := json.Unmarshal(body, &reqs); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON array"})
 		return
 	}
@@ -1246,10 +1269,6 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	}
 }
 
-// PutBlock stores a block
-// PUT /seafhttp/repo/:repo_id/block/:block_id
-// Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
-// Internally always stores blocks using SHA-256 for consistency
 // Body-size bounds for the legacy/sync seafhttp routes. Before these, PutBlock and
 // CheckBlocks read the whole request body with an unbounded io.ReadAll, so a client
 // could drive memory use arbitrarily high with one oversized body or a huge id list
@@ -1262,25 +1281,10 @@ const (
 	maxCheckBlockIDs        = 100_000
 )
 
-// readLimitedRequestBody reads the request body with a hard byte cap. It swaps the
-// body for an http.MaxBytesReader so an oversized body is never fully buffered in
-// memory: on overflow it writes a 413 and returns ok=false; a plain read error
-// becomes a 400. The caller MUST return immediately when ok is false — the response
-// has already been written.
-func readLimitedRequestBody(c *gin.Context, maxBytes int64) ([]byte, bool) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
-	data, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large", "max_bytes": maxBytes})
-			return nil, false
-		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
-		return nil, false
-	}
-	return data, true
-}
+// PutBlock stores a block
+// PUT /seafhttp/repo/:repo_id/block/:block_id
+// Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
+// Internally always stores blocks using SHA-256 for consistency
 
 func (h *SyncHandler) PutBlock(c *gin.Context) {
 	repoID := c.Param("repo_id")
@@ -1484,6 +1488,66 @@ type CheckBlocksRequest struct {
 	BlockIDs []string `json:"block_ids"`
 }
 
+// parseCheckBlockIDs parses a check-blocks body into block ids, bounding the id
+// count *before* the list is materialized. Checking the count after the parse
+// would allocate exactly what the cap exists to bound: within the 16 MiB body cap
+// a caller can still reach ~16.7M ids via one-byte entries ("a\n\n\n…\na", which
+// TrimSpace cannot collapse because both ends are non-space), and strings.Split
+// pre-sizes the slice in a single make — ~272 MB of string headers. The JSON path
+// is the same class (~5.6M empty strings, ~198 MB) because json.Unmarshal grows
+// the slice to completion first.
+//
+// Returns ok=false after writing the response; the caller must return immediately.
+func parseCheckBlockIDs(c *gin.Context, body []byte) ([]string, bool) {
+	tooMany := func() ([]string, bool) {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "too many block ids", "max_block_ids": maxCheckBlockIDs})
+		return nil, false
+	}
+	invalid := func(err error) ([]string, bool) {
+		log.Printf("check-blocks: failed to parse JSON array: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON array"})
+		return nil, false
+	}
+
+	bodyStr := strings.TrimSpace(string(body))
+
+	// Newline-separated format: count the delimiters first, since strings.Split
+	// allocates one slice entry per id up front.
+	if !strings.HasPrefix(bodyStr, "[") {
+		if strings.Count(bodyStr, "\n")+1 > maxCheckBlockIDs {
+			return tooMany()
+		}
+		return strings.Split(bodyStr, "\n"), true
+	}
+
+	// JSON array format: decode element by element so an oversized array is
+	// rejected without ever materializing it.
+	dec := json.NewDecoder(strings.NewReader(bodyStr))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
+		return invalid(err)
+	}
+	externalIDs := make([]string, 0, 64)
+	for dec.More() {
+		if len(externalIDs) >= maxCheckBlockIDs {
+			return tooMany()
+		}
+		var id string
+		if err := dec.Decode(&id); err != nil {
+			return invalid(err)
+		}
+		externalIDs = append(externalIDs, id)
+	}
+	// Require the closing bracket and reject trailing content, preserving the
+	// strictness json.Unmarshal enforced before.
+	if tok, err := dec.Token(); err != nil || tok != json.Delim(']') {
+		return invalid(err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return invalid(err)
+	}
+	return externalIDs, true
+}
+
 // CheckBlocks checks which blocks already exist (for deduplication)
 // POST /seafhttp/repo/:repo_id/check-blocks
 // Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
@@ -1504,24 +1568,8 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 	var err error
 
 	// Parse the body - can be JSON array or newline-separated
-	var externalIDs []string
-	bodyStr := strings.TrimSpace(string(body))
-	if strings.HasPrefix(bodyStr, "[") {
-		// JSON array format
-		if err := json.Unmarshal(body, &externalIDs); err != nil {
-			log.Printf("check-blocks: failed to parse JSON array: %v", err)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON array"})
-			return
-		}
-	} else {
-		// Newline-separated format
-		externalIDs = strings.Split(bodyStr, "\n")
-	}
-
-	// Bound the number of ids so a body under the byte cap still cannot force an
-	// unbounded parse/allocation and per-id work.
-	if len(externalIDs) > maxCheckBlockIDs {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "too many block ids", "max_block_ids": maxCheckBlockIDs})
+	externalIDs, ok := parseCheckBlockIDs(c, body)
+	if !ok {
 		return
 	}
 

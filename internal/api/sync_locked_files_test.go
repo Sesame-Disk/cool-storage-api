@@ -197,7 +197,11 @@ func TestGetLockedFiles_RejectsNarrowerDownloadTokens(t *testing.T) {
 	}
 }
 
-func TestGetLockedFiles_OversizedBodyReturns400(t *testing.T) {
+// The oversized body is now answered 413 rather than 400: the route shares
+// readLimitedRequestBody with the other bounded sync handlers, which reports an
+// overflow as StatusRequestEntityTooLarge instead of letting it surface as a
+// generic JSON-decode failure.
+func TestGetLockedFiles_OversizedBodyReturns413(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{}
 
@@ -205,8 +209,8 @@ func TestGetLockedFiles_OversizedBodyReturns400(t *testing.T) {
 	// before entry-count or token checks ever run.
 	body := `[{"repo_id":"repo-1","token":"` + strings.Repeat("x", maxLockedFilesBodyBytes) + `","ts":0}]`
 	w := postLockedFiles(newLockedFilesRouter(handler), body)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", w.Code)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", w.Code)
 	}
 }
 
