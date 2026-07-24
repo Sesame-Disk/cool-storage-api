@@ -783,6 +783,28 @@ abandoned reader, and `QueryBlockSizes` partial-cache reuse.
 **Must run `go test -race` in Docker** — this is the PR that changes goroutine and
 channel semantics.
 
+**Implemented on `fix/streaming-prefetch-reader-leak`.** `StreamBlocks` runs one
+block ahead, so on any early exit it dropped the prefetched next block with its S3
+`io.ReadCloser` still open (F11). It now tracks the pending prefetched channel and a
+defer drains it and closes any reader on every exit path (block error, write error,
+copy error, panic); the handle is nil whenever nothing is in flight, so normal
+completion does not block on an already-consumed channel. `PrefetchBlock` delivers
+`ctx.Err()` without opening an S3 request when its context is already canceled.
+`QueryBlockSizes` was reviewed for the audited partial-cache concern and left
+unchanged: the reuse is correct (cached sizes kept, the rest fall through to DB then
+S3) and its bounded fan-outs are buffered to capacity, so an early return leaks no
+goroutine and it holds no readers.
+
+**Acceptance (met):** `internal/streaming/stream_blocks_test.go` proves the
+prefetched reader is closed exactly once on a mid-stream write error and on a
+block-fetch error, the happy path closes every reader once without hanging, and
+`PrefetchBlock` skips the fetch on a pre-canceled context — all four fail against the
+unpatched code. Streaming unit tests pass under `go test -race` in Docker;
+`internal/api` and `internal/api/v2` pass in Docker; the full integration suite is
+green on every download path (round-trip, chunked, encrypted, zip, region-pinned,
+share-link). The sole integration failure was a pre-existing share-link projection
+eventual-consistency flake that passes in isolation, unrelated to this change.
+
 ---
 
 ### PR-10 — HTTP request hardening
