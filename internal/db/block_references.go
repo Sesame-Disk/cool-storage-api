@@ -8,6 +8,7 @@ import (
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 )
 
 // Row-per-reference block liveness model (replaces blocks.ref_count).
@@ -955,25 +956,26 @@ func (db *DB) BlockHasReferences(orgID, blockID string) (bool, error) {
 	return true, nil
 }
 
-// BlockReferenceCreatedAt returns the reference row's created_at, which doubles as
-// its generation identity: every write of a provisional reference (including a
-// renewal of the same referrer) stamps a fresh one. found=false means no row.
-func (db *DB) BlockReferenceCreatedAt(orgID, blockID, referrer string) (time.Time, bool, error) {
-	var createdAt time.Time
+// BlockReferenceGeneration returns the reference row's generation_id — the identity
+// it shares with its provisional expiry tracker. found=false means no row.
+func (db *DB) BlockReferenceGeneration(orgID, blockID, referrer string) (uuid.UUID, bool, error) {
+	// The driver unmarshals into its own gocql.UUID; both are [16]byte, so the
+	// conversion at this boundary is free.
+	var generationID gocql.UUID
 	err := db.Session().Query(`
-		SELECT created_at FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
-	`, orgID, blockID, referrer).Scan(&createdAt)
+		SELECT generation_id FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgID, blockID, referrer).Scan(&generationID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
-			return time.Time{}, false, nil
+			return uuid.Nil, false, nil
 		}
-		return time.Time{}, false, err
+		return uuid.Nil, false, err
 	}
-	return createdAt, true, nil
+	return uuid.UUID(generationID), true, nil
 }
 
-// RemoveBlockReferenceIfCreatedAt deletes one reference only while it still carries
-// the created_at the caller observed, so a release cannot delete a reference that a
+// RemoveBlockReferenceIfGeneration deletes one reference only while it still carries
+// the generation the caller observed, so a release cannot delete a reference that a
 // renewal wrote after the observation. Deleting that reference would unpin an upload
 // that is still running, and the caller would then see zero references and promote
 // the block to a GC candidate.
@@ -981,12 +983,19 @@ func (db *DB) BlockReferenceCreatedAt(orgID, blockID, referrer string) (time.Tim
 // applied=false with rowPresent=true means it was renewed and must be left alone;
 // applied=false with rowPresent=false means it was already gone, which is a
 // successful outcome for an idempotent release.
-func (db *DB) RemoveBlockReferenceIfCreatedAt(orgID, blockID, referrer string, createdAt time.Time) (applied bool, rowPresent bool, err error) {
+//
+// A nil generation is refused rather than compared: `IF generation_id = null` is not
+// a meaningful compare, and a row without one predates migration 013 — the safe
+// reading is "someone else owns this", not "delete it".
+func (db *DB) RemoveBlockReferenceIfGeneration(orgID, blockID, referrer string, generationID uuid.UUID) (applied bool, rowPresent bool, err error) {
+	if generationID == uuid.Nil {
+		return false, true, nil
+	}
 	existing := map[string]interface{}{}
 	applied, err = db.Session().Query(`
 		DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
-		IF created_at = ?
-	`, orgID, blockID, referrer, createdAt.UTC()).MapScanCAS(existing)
+		IF generation_id = ?
+	`, orgID, blockID, referrer, generationID.String()).MapScanCAS(existing)
 	if err != nil {
 		return false, false, fmt.Errorf("conditionally remove block reference for org=%s block=%s referrer=%s: %w", orgID, blockID, referrer, err)
 	}
@@ -995,7 +1004,7 @@ func (db *DB) RemoveBlockReferenceIfCreatedAt(orgID, blockID, referrer string, c
 	}
 	// On a failed compare Cassandra returns the row's current values; an empty
 	// result means there is no row at all rather than a differing one.
-	_, rowPresent = existing["created_at"]
+	_, rowPresent = existing["generation_id"]
 	return false, rowPresent, nil
 }
 

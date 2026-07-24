@@ -262,6 +262,7 @@ type mockProvisionalBlockRefExpiry struct {
 	Referrer     string
 	StorageClass string
 	ExpiresAt    time.Time
+	GenerationID uuid.UUID
 }
 
 type mockProvisionalBlockRefExpiryProjectionKey struct {
@@ -641,6 +642,9 @@ func (m *MockStore) AddProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, refer
 		Referrer:     referrer,
 		StorageClass: storageClass,
 		ExpiresAt:    expiresAt.UTC(),
+		// Each write mints its own generation, exactly like the production batch, so
+		// a test that "renews" a tracker gets a genuinely different identity.
+		GenerationID: uuid.New(),
 	}
 	m.provisionalBlockRefExpiries[key] = expiry
 	m.upsertProvisionalBlockRefExpiryProjection(expiry)
@@ -2065,6 +2069,7 @@ func (m *MockStore) GetProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, refer
 		Referrer:     expiry.Referrer,
 		StorageClass: expiry.StorageClass,
 		ExpiresAt:    expiry.ExpiresAt.UTC(),
+		GenerationID: expiry.GenerationID,
 	}, true, nil
 }
 
@@ -2075,15 +2080,15 @@ func (m *MockStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, b
 	return nil
 }
 
-// DeleteProvisionalBlockRefExpiryIfExpiresAt mirrors the Cassandra LWT: it only
-// retires the tracker while it still carries the observed deadline, so a test can
+// DeleteProvisionalBlockRefExpiryIfGeneration mirrors the Cassandra LWT: it only
+// retires the tracker while it still carries the observed generation, so a test can
 // reproduce a renewal landing between the scanner's read and its delete.
-func (m *MockStore) DeleteProvisionalBlockRefExpiryIfExpiresAt(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) (bool, error) {
+func (m *MockStore) DeleteProvisionalBlockRefExpiryIfGeneration(orgID uuid.UUID, blockID, referrer string, generationID uuid.UUID, expiresAt time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s:%s", orgID, blockID, referrer)
 	existing, ok := m.provisionalBlockRefExpiries[key]
-	if !ok || expiresAt.IsZero() || !existing.ExpiresAt.Equal(expiresAt.UTC()) {
+	if !ok || expiresAt.IsZero() || existing.GenerationID != generationID {
 		return false, nil
 	}
 	delete(m.provisionalBlockRefExpiries, key)

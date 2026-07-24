@@ -4,165 +4,134 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-// provisionalPairFixture models the two rows a release mutates — the reference
-// (identified by created_at) and its tracker (identified by expires_at) — so a
-// renewal can be injected at any step and the surviving state inspected.
+// provisionalPairFixture models the two rows a release looks at — the reference and
+// its tracker, both stamped with the same generation — so a renewal can be injected
+// at any step and the surviving state inspected.
 type provisionalPairFixture struct {
-	refCreatedAt   time.Time
-	refPresent     bool
-	trackerExpires time.Time
+	generationID uuid.UUID
+	expiresAt    time.Time
+	trackerFound bool
+	refPresent   bool
 }
 
-func (f *provisionalPairFixture) renew(createdAt, expiresAt time.Time) {
-	f.refCreatedAt = createdAt
+func newProvisionalPairFixture() *provisionalPairFixture {
+	return &provisionalPairFixture{
+		generationID: uuid.New(),
+		expiresAt:    time.Now().UTC().Add(2 * time.Hour).Truncate(time.Millisecond),
+		trackerFound: true,
+		refPresent:   true,
+	}
+}
+
+// renew models AddProvisionalBlockReferenceWithExpiry: one new generation stamped on
+// both rows in a single batch.
+func (f *provisionalPairFixture) renew() uuid.UUID {
+	f.generationID = uuid.New()
+	f.expiresAt = time.Now().UTC().Add(48 * time.Hour).Truncate(time.Millisecond)
+	f.trackerFound = true
 	f.refPresent = true
-	f.trackerExpires = expiresAt
+	return f.generationID
 }
 
 func (f *provisionalPairFixture) install(t *testing.T) {
 	t.Helper()
-	oldReadExpiry := releaseProvisionalReadExpiryFn
-	oldReadRef := releaseProvisionalReadReferenceFn
+	oldRead := releaseProvisionalReadGenerationFn
 	oldRemove := releaseProvisionalRemoveReferenceFn
-	oldDelete := releaseProvisionalDeleteTrackerFn
 	t.Cleanup(func() {
-		releaseProvisionalReadExpiryFn = oldReadExpiry
-		releaseProvisionalReadReferenceFn = oldReadRef
+		releaseProvisionalReadGenerationFn = oldRead
 		releaseProvisionalRemoveReferenceFn = oldRemove
-		releaseProvisionalDeleteTrackerFn = oldDelete
 	})
 
-	releaseProvisionalReadExpiryFn = func(*DB, string, string, string) (time.Time, error) {
-		return f.trackerExpires, nil
+	releaseProvisionalReadGenerationFn = func(*DB, string, string, string) (ProvisionalBlockRefGeneration, error) {
+		return ProvisionalBlockRefGeneration{
+			GenerationID: f.generationID,
+			ExpiresAt:    f.expiresAt,
+			Found:        f.trackerFound,
+		}, nil
 	}
-	releaseProvisionalReadReferenceFn = func(*DB, string, string, string) (time.Time, bool, error) {
-		return f.refCreatedAt, f.refPresent, nil
-	}
-	releaseProvisionalRemoveReferenceFn = func(_ *DB, _, _, _ string, createdAt time.Time) (provisionalReferenceReleaseOutcome, error) {
+	releaseProvisionalRemoveReferenceFn = func(_ *DB, _, _, _ string, generationID uuid.UUID) (provisionalReferenceReleaseOutcome, error) {
 		if !f.refPresent {
 			return provisionalReferenceAbsent, nil
 		}
-		if !f.refCreatedAt.Equal(createdAt) {
+		if f.generationID != generationID {
 			return provisionalReferenceRenewed, nil
 		}
 		f.refPresent = false
 		return provisionalReferenceRemoved, nil
 	}
-	releaseProvisionalDeleteTrackerFn = func(_ *DB, _, _, _ string, expiresAt time.Time) (bool, error) {
-		if f.trackerExpires.IsZero() || !f.trackerExpires.Equal(expiresAt) {
-			return false, nil
-		}
-		f.trackerExpires = time.Time{}
-		return true, nil
-	}
 }
 
-// The release path is the second half of F10. Creation is atomic now, but a
-// release that reads the tracker AFTER dropping the reference reads whatever is
-// there at that moment — including a tracker a concurrent renewal just wrote —
-// and an unconditional delete then removes it while the renewal's reference lives
-// on. That leaves a reference with no tracker, the one state nothing recovers
-// from: GC Phase 0 discovers provisional refs only through the tracker's by-day
-// projection, so when the TTL finally retires that reference nothing runs the
-// zero-ref transition and the block, its metadata and its S3 object are retained
-// forever.
-//
-// The release must therefore retire only the pair it observed.
+// A renewal landing after the release observed the pair must keep BOTH its rows: the
+// compare refuses the delete, and the caller is told nothing was removed so it cannot
+// run a liveness check on a block a live upload still owns.
 func TestReleaseProvisionalBlockReference_KeepsARenewalThatLandsMidRelease(t *testing.T) {
-	oldRemove := releaseProvisionalRemoveReferenceFn
-
-	observedCreated := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
-	observedExpiry := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Millisecond)
-	renewedCreated := time.Now().UTC().Truncate(time.Millisecond)
-	renewedExpiry := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Millisecond)
-
-	fixture := &provisionalPairFixture{refCreatedAt: observedCreated, refPresent: true, trackerExpires: observedExpiry}
+	fixture := newProvisionalPairFixture()
 	fixture.install(t)
 
-	// The renewal lands after the reference delete: a retry of the same block under
-	// the same session writes a fresh reference and moves the tracker forward.
-	inner := releaseProvisionalRemoveReferenceFn
-	releaseProvisionalRemoveReferenceFn = func(d *DB, orgID, blockID, referrer string, createdAt time.Time) (provisionalReferenceReleaseOutcome, error) {
-		outcome, err := inner(d, orgID, blockID, referrer, createdAt)
-		fixture.renew(renewedCreated, renewedExpiry)
-		return outcome, err
+	// Renew between the observation and the delete — the window that previously
+	// produced a mixed identity and let the delete through.
+	inner := releaseProvisionalReadGenerationFn
+	releaseProvisionalReadGenerationFn = func(d *DB, orgID, blockID, referrer string) (ProvisionalBlockRefGeneration, error) {
+		observed, err := inner(d, orgID, blockID, referrer)
+		fixture.renew()
+		return observed, err
 	}
-	t.Cleanup(func() { releaseProvisionalRemoveReferenceFn = oldRemove })
 
 	removed, err := (&DB{}).ReleaseProvisionalBlockReference("org-1", "block-1", "up:session-1")
 	if err != nil {
 		t.Fatalf("ReleaseProvisionalBlockReference() error = %v, want nil", err)
 	}
-	if !removed {
-		t.Fatal("the observed reference was removed, so the caller must be told so")
-	}
-
-	if fixture.trackerExpires.IsZero() {
-		t.Fatal("release deleted the tracker of a reference renewed mid-release: that reference is now undiscoverable by GC (F10)")
-	}
-	if !fixture.trackerExpires.Equal(renewedExpiry) {
-		t.Fatalf("tracker = %v, want the renewed %v", fixture.trackerExpires, renewedExpiry)
-	}
 	if !fixture.refPresent {
-		t.Fatal("the renewal's reference must survive")
+		t.Fatal("release deleted a reference that had already been renewed: the live upload is unpinned")
 	}
-}
-
-// TestReleaseProvisionalBlockReference_KeepsARenewalThatLandsBeforeTheDelete is the
-// mirror window: the renewal completes between the release's observation and its
-// delete. Deleting the reference unconditionally there destroys the renewal's
-// reference while the CAS keeps its tracker — and worse, the caller then sees zero
-// references and promotes a block whose upload is still running to a GC candidate.
-// That is F9's failure mode arriving through the release path, so the reference
-// delete has to be tied to the observed generation too.
-func TestReleaseProvisionalBlockReference_KeepsARenewalThatLandsBeforeTheDelete(t *testing.T) {
-	oldRead := releaseProvisionalReadReferenceFn
-
-	observedCreated := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
-	observedExpiry := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Millisecond)
-	renewedCreated := time.Now().UTC().Truncate(time.Millisecond)
-	renewedExpiry := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Millisecond)
-
-	fixture := &provisionalPairFixture{refCreatedAt: observedCreated, refPresent: true, trackerExpires: observedExpiry}
-	fixture.install(t)
-
-	// Renew right after the release observes the reference, before it deletes.
-	inner := releaseProvisionalReadReferenceFn
-	releaseProvisionalReadReferenceFn = func(d *DB, orgID, blockID, referrer string) (time.Time, bool, error) {
-		createdAt, present, err := inner(d, orgID, blockID, referrer)
-		fixture.renew(renewedCreated, renewedExpiry)
-		return createdAt, present, err
-	}
-	t.Cleanup(func() { releaseProvisionalReadReferenceFn = oldRead })
-
-	removed, err := (&DB{}).ReleaseProvisionalBlockReference("org-1", "block-1", "up:session-1")
-	if err != nil {
-		t.Fatalf("ReleaseProvisionalBlockReference() error = %v, want nil", err)
-	}
-
-	if !fixture.refPresent {
-		t.Fatal("release deleted a reference that had already been renewed: the live upload is unpinned (F9 through the release path)")
-	}
-	if !fixture.trackerExpires.Equal(renewedExpiry) {
-		t.Fatalf("tracker = %v, want the renewed %v (the pair must survive together)", fixture.trackerExpires, renewedExpiry)
-	}
-	// Reporting "removed" here would make the caller run its liveness check and
-	// enqueue a block that a live upload still owns.
 	if removed {
 		t.Fatal("a release that removed nothing must not report a removal: the caller would promote a still-pinned block to a GC candidate")
 	}
 }
 
-// With no renewal the release must still fully clean up, or every completed upload
-// would leave a tracker behind for the scanner to walk until its deadline.
-func TestReleaseProvisionalBlockReference_RetiresTheObservedPair(t *testing.T) {
-	fixture := &provisionalPairFixture{
-		refCreatedAt:   time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond),
-		refPresent:     true,
-		trackerExpires: time.Now().UTC().Add(2 * time.Hour).Truncate(time.Millisecond),
+// TestReleaseProvisionalBlockReference_TakesTheIdentityFromASingleRead is the
+// regression for the mixed-observation bug. The identity used to be composed from two
+// reads — the tracker's expires_at and the reference's created_at — so a renewal
+// landing between them produced an identity that matched the NEW reference, and the
+// compare deleted a reference belonging to a live upload. One read cannot mix.
+func TestReleaseProvisionalBlockReference_TakesTheIdentityFromASingleRead(t *testing.T) {
+	fixture := newProvisionalPairFixture()
+	fixture.install(t)
+
+	reads := 0
+	inner := releaseProvisionalReadGenerationFn
+	releaseProvisionalReadGenerationFn = func(d *DB, orgID, blockID, referrer string) (ProvisionalBlockRefGeneration, error) {
+		reads++
+		return inner(d, orgID, blockID, referrer)
 	}
+
+	var comparedWith uuid.UUID
+	innerRemove := releaseProvisionalRemoveReferenceFn
+	releaseProvisionalRemoveReferenceFn = func(d *DB, orgID, blockID, referrer string, generationID uuid.UUID) (provisionalReferenceReleaseOutcome, error) {
+		comparedWith = generationID
+		return innerRemove(d, orgID, blockID, referrer, generationID)
+	}
+
+	observedGeneration := fixture.generationID
+	if _, err := (&DB{}).ReleaseProvisionalBlockReference("org-1", "block-1", "up:session-1"); err != nil {
+		t.Fatalf("ReleaseProvisionalBlockReference() error = %v", err)
+	}
+
+	if reads != 1 {
+		t.Fatalf("identity reads = %d, want exactly 1 (a second read can observe a different generation and mix the two)", reads)
+	}
+	if comparedWith != observedGeneration {
+		t.Fatalf("compared with %v, want the single observed generation %v", comparedWith, observedGeneration)
+	}
+}
+
+// With no renewal the observed reference is released and reported.
+func TestReleaseProvisionalBlockReference_RemovesTheObservedReference(t *testing.T) {
+	fixture := newProvisionalPairFixture()
 	fixture.install(t)
 
 	removed, err := (&DB{}).ReleaseProvisionalBlockReference("org-1", "block-1", "up:session-1")
@@ -175,102 +144,76 @@ func TestReleaseProvisionalBlockReference_RetiresTheObservedPair(t *testing.T) {
 	if fixture.refPresent {
 		t.Fatal("expected the provisional reference to be removed")
 	}
-	if !fixture.trackerExpires.IsZero() {
-		t.Fatalf("expected the observed tracker to be retired, got %v", fixture.trackerExpires)
-	}
 }
 
-// A tracker-cleanup failure must not hide the fact that the reference is gone. The
-// caller uses that signal to run its liveness check; swallowing it leaves a block
-// at zero references with no candidate and — once the orphaned projection is swept —
-// no discovery path at all.
-func TestReleaseProvisionalBlockReference_ReportsRemovalEvenIfTrackerCleanupFails(t *testing.T) {
-	fixture := &provisionalPairFixture{
-		refCreatedAt:   time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond),
-		refPresent:     true,
-		trackerExpires: time.Now().UTC().Add(2 * time.Hour).Truncate(time.Millisecond),
-	}
+// TestReleaseProvisionalBlockReference_NeverRetiresTheTracker pins the property that
+// makes the zero-reference transition durable. Phase 0 is the only path allowed to
+// retire tracking, and it does so only after resolving liveness. If the release
+// retired the tracker — even successfully — then a crash, a failed liveness check or
+// a failed enqueue immediately afterwards would leave the block at zero references
+// with no candidate and no tracking left to rediscover it.
+func TestReleaseProvisionalBlockReference_NeverRetiresTheTracker(t *testing.T) {
+	fixture := newProvisionalPairFixture()
 	fixture.install(t)
-
-	boom := errors.New("projection delete failed")
-	releaseProvisionalDeleteTrackerFn = func(*DB, string, string, string, time.Time) (bool, error) {
-		return true, boom
-	}
-
-	removed, err := (&DB{}).ReleaseProvisionalBlockReference("org-1", "block-1", "up:session-1")
-	if !errors.Is(err, boom) {
-		t.Fatalf("error = %v, want wrapped %v", err, boom)
-	}
-	if !removed {
-		t.Fatal("reference removal must still be reported so the caller can promote a now-zero-ref block")
-	}
-}
-
-// Ordering is not a style choice: the reference must go first. A tracker without a
-// reference is recoverable — Phase 0 sees the reference is gone, judges liveness and
-// retires the tracker — while a reference without a tracker is invisible forever. A
-// crash between the two steps must therefore land on the recoverable side.
-func TestReleaseProvisionalBlockReference_DropsTheReferenceBeforeTheTracker(t *testing.T) {
-	oldReadExpiry := releaseProvisionalReadExpiryFn
-	oldReadRef := releaseProvisionalReadReferenceFn
-	oldRemove := releaseProvisionalRemoveReferenceFn
-	oldDelete := releaseProvisionalDeleteTrackerFn
-	t.Cleanup(func() {
-		releaseProvisionalReadExpiryFn = oldReadExpiry
-		releaseProvisionalReadReferenceFn = oldReadRef
-		releaseProvisionalRemoveReferenceFn = oldRemove
-		releaseProvisionalDeleteTrackerFn = oldDelete
-	})
-
-	var order []string
-	releaseProvisionalReadExpiryFn = func(*DB, string, string, string) (time.Time, error) {
-		order = append(order, "read_tracker")
-		return time.Now().UTC().Add(time.Hour), nil
-	}
-	releaseProvisionalReadReferenceFn = func(*DB, string, string, string) (time.Time, bool, error) {
-		order = append(order, "read_reference")
-		return time.Now().UTC(), true, nil
-	}
-	releaseProvisionalRemoveReferenceFn = func(*DB, string, string, string, time.Time) (provisionalReferenceReleaseOutcome, error) {
-		order = append(order, "remove_reference")
-		return provisionalReferenceRemoved, nil
-	}
-	releaseProvisionalDeleteTrackerFn = func(*DB, string, string, string, time.Time) (bool, error) {
-		order = append(order, "delete_tracker")
-		return true, nil
-	}
 
 	if _, err := (&DB{}).ReleaseProvisionalBlockReference("org-1", "block-1", "up:session-1"); err != nil {
 		t.Fatalf("ReleaseProvisionalBlockReference() error = %v", err)
 	}
-	want := []string{"read_tracker", "read_reference", "remove_reference", "delete_tracker"}
-	if len(order) != len(want) {
-		t.Fatalf("order = %#v, want %#v", order, want)
+
+	if !fixture.trackerFound {
+		t.Fatal("the release retired the tracker: a downstream failure would now leave the block undiscoverable")
 	}
-	for i := range want {
-		if order[i] != want[i] {
-			t.Fatalf("order[%d] = %q, want %q (full=%#v)", i, order[i], want[i], order)
-		}
+	if !fixture.expiresAt.Equal(fixture.expiresAt) || fixture.generationID == uuid.Nil {
+		t.Fatal("the tracker must be left exactly as observed")
 	}
 }
 
-// A failed reference delete must not go on to retire the tracker: that would
-// manufacture the forbidden state directly.
-func TestReleaseProvisionalBlockReference_KeepsTrackerWhenReferenceDeleteFails(t *testing.T) {
-	fixture := &provisionalPairFixture{
-		refCreatedAt:   time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond),
-		refPresent:     true,
-		trackerExpires: time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond),
+// Without a tracker there is no generation to compare against, so the reference is
+// left alone rather than deleted unguarded.
+func TestReleaseProvisionalBlockReference_LeavesReferenceWhenTrackerIsMissing(t *testing.T) {
+	fixture := newProvisionalPairFixture()
+	fixture.trackerFound = false
+	fixture.install(t)
+
+	releaseProvisionalRemoveReferenceFn = func(*DB, string, string, string, uuid.UUID) (provisionalReferenceReleaseOutcome, error) {
+		t.Fatal("no tracker means no observed generation: deleting the reference here would be the unguarded delete")
+		return provisionalReferenceAbsent, nil
 	}
+
+	removed, err := (&DB{}).ReleaseProvisionalBlockReference("org-1", "block-1", "up:session-1")
+	if err != nil {
+		t.Fatalf("ReleaseProvisionalBlockReference() error = %v", err)
+	}
+	if removed {
+		t.Fatal("nothing was removed, so nothing may be reported")
+	}
+}
+
+// An already-absent reference is a successful idempotent release: the caller may go
+// on to check liveness, because no reference of this referrer is pinning the block.
+func TestReleaseProvisionalBlockReference_ReportsAbsentReferenceAsReleased(t *testing.T) {
+	fixture := newProvisionalPairFixture()
+	fixture.refPresent = false
+	fixture.install(t)
+
+	removed, err := (&DB{}).ReleaseProvisionalBlockReference("org-1", "block-1", "up:session-1")
+	if err != nil {
+		t.Fatalf("ReleaseProvisionalBlockReference() error = %v", err)
+	}
+	if !removed {
+		t.Fatal("an already-absent reference must not block the caller's liveness check")
+	}
+}
+
+// A failed delete must not be reported as a removal, or the caller would run its
+// liveness check while the reference is still there.
+func TestReleaseProvisionalBlockReference_DoesNotReportRemovalOnError(t *testing.T) {
+	fixture := newProvisionalPairFixture()
 	fixture.install(t)
 
 	boom := errors.New("cassandra timeout")
-	releaseProvisionalRemoveReferenceFn = func(*DB, string, string, string, time.Time) (provisionalReferenceReleaseOutcome, error) {
+	releaseProvisionalRemoveReferenceFn = func(*DB, string, string, string, uuid.UUID) (provisionalReferenceReleaseOutcome, error) {
 		return provisionalReferenceRenewed, boom
-	}
-	releaseProvisionalDeleteTrackerFn = func(*DB, string, string, string, time.Time) (bool, error) {
-		t.Fatal("tracker must not be retired when the reference is still there")
-		return false, nil
 	}
 
 	removed, err := (&DB{}).ReleaseProvisionalBlockReference("org-1", "block-1", "up:session-1")

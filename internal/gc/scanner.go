@@ -345,7 +345,7 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 				// pass acted on. A renewal that landed after the presence check must
 				// keep its tracking, or its reference would later expire with nothing
 				// left to notice the block reached zero references.
-				applied, err := s.store.DeleteProvisionalBlockRefExpiryIfExpiresAt(canonical.OrgID, canonical.BlockID, canonical.Referrer, canonical.ExpiresAt)
+				applied, err := s.store.DeleteProvisionalBlockRefExpiryIfGeneration(canonical.OrgID, canonical.BlockID, canonical.Referrer, canonical.GenerationID, canonical.ExpiresAt)
 				if err != nil {
 					log.Printf("[GC Scanner] Phase 0: failed to delete provisional expiry tracker org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					if phaseErr == nil {
@@ -354,10 +354,16 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 					continue
 				}
 				if !applied {
-					// Renewed underneath us. The renewal rewrote the discovery
-					// projection onto its own day and retracted this one, so there is
-					// nothing left to clean up here.
+					// The tracker moved on. Usually that is a renewal, which rewrote the
+					// discovery projection onto its own day and retracted this one. But it
+					// can also mean another pass retired the tracker and then failed before
+					// clearing this projection, leaving this row on a day the cursor is
+					// about to step over. Hold the cursor here too; the next pass resolves
+					// it through the canonical-missing recovery path.
 					deferred++
+					if oldestDeferredDay.IsZero() || day.Before(oldestDeferredDay) {
+						oldestDeferredDay = day
+					}
 					continue
 				}
 				if !canonical.ExpiresAt.Equal(expiry.ExpiresAt.UTC()) {

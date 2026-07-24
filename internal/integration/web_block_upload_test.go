@@ -22,6 +22,7 @@ import (
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -288,13 +289,19 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 // TestProvisionalReferenceReleaseIsGenerationGuarded exercises the reference-side
 // compare against real Cassandra. The unit tests around
 // ReleaseProvisionalBlockReference drive an injected hook, so they pin the
-// orchestration — that the observed generation is what gets passed down and that a
-// "renewed" outcome stops the release — but not the LWT itself. This does.
+// orchestration — that a single observed generation is what gets passed down and
+// that a "renewed" outcome stops the release — but not the LWT itself. This does.
 //
-// The scenario is the race in miniature: a release observes a reference, a renewal
-// rewrites it (fresh created_at, fresh TTL), and the release's delete arrives late.
-// It must not apply. Without the compare it removes a reference a live upload owns,
-// and the caller then reads zero references and promotes the block to a GC candidate.
+// The scenario is the race in miniature: a release observes a pair, a renewal
+// rewrites both rows under a fresh generation, and the release's delete arrives
+// late. It must not apply. Without the compare it removes a reference a live upload
+// owns, and the caller then reads zero references and promotes the block to a GC
+// candidate.
+//
+// It also pins the property that makes the generation trustworthy: the reference and
+// its tracker carry the SAME id, so an identity read from one row is valid for the
+// other. Deriving it from each row's own timestamps is what allowed a mixed
+// observation.
 func TestProvisionalReferenceReleaseIsGenerationGuarded(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-wbu-gen-%d", time.Now().UnixNano()))
 	content := []byte("generation guarded release " + fmt.Sprint(time.Now().UnixNano()))
@@ -309,27 +316,36 @@ func TestProvisionalReferenceReleaseIsGenerationGuarded(t *testing.T) {
 
 	database := shareProjectionDBForTest(t)
 
-	staleCreatedAt, found, err := database.BlockReferenceCreatedAt(defaultOrgID, blockID, uploadReferrer)
+	staleGeneration, found, err := database.BlockReferenceGeneration(defaultOrgID, blockID, uploadReferrer)
 	if err != nil || !found {
 		t.Fatalf("read provisional reference generation: found=%v err=%v", found, err)
 	}
+	var trackerGenerationRaw gocql.UUID
+	if err := database.Session().Query(
+		`SELECT generation_id FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&trackerGenerationRaw); err != nil {
+		t.Fatalf("read tracker generation: %v", err)
+	}
+	trackerGeneration := uuid.UUID(trackerGenerationRaw)
+	if trackerGeneration != staleGeneration {
+		t.Fatalf("reference generation %v and tracker generation %v differ: one read could not speak for the other", staleGeneration, trackerGeneration)
+	}
 
-	// Renew: a retry of the same block under the same session rewrites the pair with
-	// a new created_at. Sleep past millisecond resolution so the generation really moves.
-	time.Sleep(50 * time.Millisecond)
+	// Renew: a retry of the same block under the same session rewrites both rows
+	// under a new generation.
 	renewResp := webUploadBlock(t, adminClient, session, content)
 	renewResp.Body.Close()
 
-	renewedCreatedAt, found, err := database.BlockReferenceCreatedAt(defaultOrgID, blockID, uploadReferrer)
+	renewedGeneration, found, err := database.BlockReferenceGeneration(defaultOrgID, blockID, uploadReferrer)
 	if err != nil || !found {
 		t.Fatalf("read renewed provisional reference: found=%v err=%v", found, err)
 	}
-	if renewedCreatedAt.Equal(staleCreatedAt) {
-		t.Fatalf("re-upload did not move the reference generation off %v, so the guard was never exercised", staleCreatedAt)
+	if renewedGeneration == staleGeneration {
+		t.Fatalf("re-upload did not mint a new generation (still %v), so the guard was never exercised", staleGeneration)
 	}
 
 	// The late release, carrying its stale observation.
-	applied, rowPresent, err := database.RemoveBlockReferenceIfCreatedAt(defaultOrgID, blockID, uploadReferrer, staleCreatedAt)
+	applied, rowPresent, err := database.RemoveBlockReferenceIfGeneration(defaultOrgID, blockID, uploadReferrer, staleGeneration)
 	if err != nil {
 		t.Fatalf("conditional reference delete: %v", err)
 	}
@@ -337,12 +353,12 @@ func TestProvisionalReferenceReleaseIsGenerationGuarded(t *testing.T) {
 		t.Fatal("a stale release deleted a renewed provisional reference: the live upload is unpinned and its block can be promoted to a GC candidate")
 	}
 	if !rowPresent {
-		t.Fatal("the renewed reference must still be there; reporting it absent would let the caller retire the tracker too")
+		t.Fatal("the renewed reference must still be there; reporting it absent would let the caller run a liveness check on a pinned block")
 	}
 
 	// And the current generation still releases cleanly, so the guard has not simply
 	// made release impossible.
-	applied, _, err = database.RemoveBlockReferenceIfCreatedAt(defaultOrgID, blockID, uploadReferrer, renewedCreatedAt)
+	applied, _, err = database.RemoveBlockReferenceIfGeneration(defaultOrgID, blockID, uploadReferrer, renewedGeneration)
 	if err != nil {
 		t.Fatalf("conditional reference delete with the current generation: %v", err)
 	}

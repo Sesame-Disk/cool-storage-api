@@ -1085,12 +1085,13 @@ func (h *FSHelper) fsObjectExists(repoID, fsID string) (bool, error) {
 // the same upload/session identity used at registration time. Idempotent:
 // removing a missing reference is a no-op, so a retried rollback is safe.
 //
-// Each block goes through db.ReleaseProvisionalBlockReference, which retires the
-// reference together with the tracker it observed. That conditionality matters
-// here specifically: `up:` referrers are per session, so this can run concurrently
-// with an upload renewing the very same pair — a retry of the same block, or a
-// request admitted just before a commit started releasing. Retiring the renewal's
-// tracker would leave its live reference undiscoverable by GC (F10).
+// Each block goes through db.ReleaseProvisionalBlockReference, which deletes only
+// the reference of the generation it observed and leaves the expiry tracker to GC
+// Phase 0. That matters here specifically: `up:` referrers are per session, so this
+// can run concurrently with an upload renewing the very same pair — a retry of the
+// same block, or a request admitted just before a commit started releasing.
+// Deleting a renewed reference would unpin a live upload; retiring its tracker
+// would make it undiscoverable to GC (F9/F10 respectively).
 func (h *FSHelper) ReleaseUploadReferences(orgID, libraryID, operationID string, blockIDs []string) []string {
 	referrer := db.BlockReferrerForUpload(operationID)
 	var zeroRefBlocks []string
@@ -1105,10 +1106,10 @@ func (h *FSHelper) ReleaseUploadReferences(orgID, libraryID, operationID string,
 			// enqueue a block a live upload is using.
 			continue
 		}
-		// Deliberately reached even when err != nil: the reference IS gone, and a
-		// tracker/projection cleanup failure must not cost the zero-reference
-		// transition. The tracker is the only thing that would rediscover it, and
-		// the scanner's orphaned-projection sweep would then drop the last trace.
+		// If anything below fails — this read, or the caller's enqueue — the block is
+		// not lost: the release deliberately left the expiry tracker in place, so GC
+		// Phase 0 reaches the same conclusion later. That is why the release does not
+		// retire tracking itself.
 		hasRefs, err := h.db.BlockHasReferences(orgID, blockID)
 		if err != nil {
 			log.Printf("[ReleaseUploadReferences] WARNING: failed to check references for block %s: %v", blockID, err)

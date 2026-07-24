@@ -107,13 +107,17 @@ type GCStore interface {
 	// It intentionally leaves the canonical row untouched for stale projection
 	// cleanup when an upload ref was renewed or already finalized elsewhere.
 	DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error
-	// DeleteProvisionalBlockRefExpiryIfExpiresAt retires the tracker only while it
-	// still holds the deadline the scanner acted on. applied=false means an upload
+	// DeleteProvisionalBlockRefExpiryIfGeneration retires the tracker only while it
+	// still holds the generation the scanner acted on. applied=false means an upload
 	// renewed (or finalized) it in the meantime and the scanner must not touch it.
-	// There is no unconditional variant on purpose: GC only ever retires a tracker
-	// it has just observed, so the compare costs nothing it does not already know
-	// and removes the renewal race by construction.
-	DeleteProvisionalBlockRefExpiryIfExpiresAt(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) (bool, error)
+	// Comparing the generation rather than the deadline matters: two renewals landing
+	// in the same millisecond share a deadline, and retiring the wrong one strands a
+	// live reference with no discovery projection.
+	//
+	// Phase 0 is the ONLY path that retires tracking. Releases delete just their
+	// reference, so the tracker always outlives the liveness decision and a crash
+	// anywhere downstream leaves the block rediscoverable.
+	DeleteProvisionalBlockRefExpiryIfGeneration(orgID uuid.UUID, blockID, referrer string, generationID uuid.UUID, expiresAt time.Time) (bool, error)
 	// BlockReferenceExists reports whether one specific reference row survives.
 	// Phase 0 uses it to confirm a provisional reference has actually been retired
 	// by its Cassandra TTL before drawing any conclusion about block liveness.
@@ -335,6 +339,11 @@ type ProvisionalBlockRefExpiryInfo struct {
 	Referrer     string
 	StorageClass string
 	ExpiresAt    time.Time
+	// GenerationID identifies the (reference, tracker) pair this row belongs to.
+	// Phase 0 retires a tracker by generation rather than by deadline: two renewals
+	// landing in the same millisecond share a deadline, and retiring the wrong one
+	// would strand a live reference with no discovery projection.
+	GenerationID uuid.UUID
 }
 
 // GCOrgStats stores reconciled queue state for a single org.

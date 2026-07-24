@@ -1529,11 +1529,14 @@ func (s *CassandraStore) ListProvisionalBlockRefExpiriesByDay(day time.Time, buc
 func (s *CassandraStore) GetProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string) (ProvisionalBlockRefExpiryInfo, bool, error) {
 	var storageClass string
 	var expiresAt time.Time
+	// The driver unmarshals into gocql.UUID; both are [16]byte, so converting at
+	// this boundary is free.
+	var generationID gocql.UUID
 	if err := s.db.Session().Query(`
-		SELECT storage_class, expires_at
+		SELECT storage_class, expires_at, generation_id
 		FROM gc_provisional_block_refs
 		WHERE org_id = ? AND block_id = ? AND referrer = ?
-	`, orgID.String(), blockID, referrer).Scan(&storageClass, &expiresAt); err != nil {
+	`, orgID.String(), blockID, referrer).Scan(&storageClass, &expiresAt, &generationID); err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return ProvisionalBlockRefExpiryInfo{}, false, nil
 		}
@@ -1545,6 +1548,7 @@ func (s *CassandraStore) GetProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, 
 		Referrer:     referrer,
 		StorageClass: storageClass,
 		ExpiresAt:    expiresAt.UTC(),
+		GenerationID: uuid.UUID(generationID),
 	}, true, nil
 }
 
@@ -1556,8 +1560,8 @@ func (s *CassandraStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UU
 	`, db.GCProjectionUTCDate(expiresAt), db.GCDiscoveryBucket(orgID.String(), blockID, referrer), expiresAt, orgID.String(), blockID, referrer).Exec()
 }
 
-func (s *CassandraStore) DeleteProvisionalBlockRefExpiryIfExpiresAt(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) (bool, error) {
-	return s.db.DeleteProvisionalBlockReferenceExpiryIfExpiresAt(orgID.String(), blockID, referrer, expiresAt)
+func (s *CassandraStore) DeleteProvisionalBlockRefExpiryIfGeneration(orgID uuid.UUID, blockID, referrer string, generationID uuid.UUID, expiresAt time.Time) (bool, error) {
+	return s.db.DeleteProvisionalBlockReferenceExpiryIfGeneration(orgID.String(), blockID, referrer, generationID, expiresAt)
 }
 
 // --- S3 orphan recovery ---
