@@ -1556,10 +1556,6 @@ func (s *CassandraStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UU
 	`, db.GCProjectionUTCDate(expiresAt), db.GCDiscoveryBucket(orgID.String(), blockID, referrer), expiresAt, orgID.String(), blockID, referrer).Exec()
 }
 
-func (s *CassandraStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
-	return s.db.DeleteProvisionalBlockReferenceExpiry(orgID.String(), blockID, referrer, expiresAt)
-}
-
 // --- S3 orphan recovery ---
 
 func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1, recoveryPhase string, firstSeenAt time.Time) error {
@@ -1848,6 +1844,10 @@ func (s *CassandraStore) BlockExists(orgID uuid.UUID, blockID string) (bool, err
 // BlockHasReferences reports whether any block_references row still exists.
 func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
 	return s.db.BlockHasReferences(orgID.String(), blockID)
+}
+
+func (s *CassandraStore) BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error) {
+	return s.db.BlockReferenceExists(orgID.String(), blockID, referrer)
 }
 
 func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {

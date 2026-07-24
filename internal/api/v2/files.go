@@ -1294,20 +1294,6 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 
 	err = retryLibraryHeadMutation("CreateFile", func() error {
 		uploadOperationID := uuid.NewString()
-		templateBlockPinned := false
-		releaseTemplateBlockPin := func(enqueueIfZero bool) {
-			if !templateBlockPinned || templateBlockData == nil {
-				return
-			}
-			templateBlockPinned = false
-			zeroRefBlocks := fsHelper.ReleaseUploadReferences(orgID, repoID, uploadOperationID, []string{templateBlockData.Hash})
-			if enqueueIfZero && len(zeroRefBlocks) > 0 {
-				enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
-			}
-		}
-		defer func() {
-			releaseTemplateBlockPin(true)
-		}()
 
 		snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 		if err != nil {
@@ -1390,15 +1376,15 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				return fmt.Errorf("unexpected template block reuse decision %d for %s", probe.Decision, templateBlockData.Hash)
 			}, func() error {
 				// Keep the freshly stored template block alive and respect the GC
-				// delete fence until publish-attempt refs take over below. Use the
-				// mapping variant so the SHA-1 (external) -> SHA-256 (internal) row and
-				// blocks.sha1 are written from the real bytes — required for desktop
-				// downloads (which fetch by SHA-1) and for staging to resolve the
-				// fs_object's SHA-1 block id back to its storage identity.
+				// delete fence. The up: ref remains TTL-bound after publish-attempt
+				// and permanent refs are added below. Use the mapping variant so the
+				// SHA-1 (external) -> SHA-256 (internal) row and blocks.sha1 are
+				// written from the real bytes — required for desktop downloads (which
+				// fetch by SHA-1) and for staging to resolve the fs_object's SHA-1
+				// block id back to its storage identity.
 				if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateMaterializedStorageClass, "", externalBlockID); err != nil {
 					return fmt.Errorf("failed to register template block metadata: %w", err)
 				}
-				templateBlockPinned = true
 				return nil
 			}, func() {
 				templateBlockStored = false
@@ -1481,7 +1467,6 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				clearErr,
 			)
 		}
-		releaseTemplateBlockPin(false)
 		if err := fsHelper.insertCommit(repoID, commitID, userID, newRootFSID, snapshot.HeadCommitID, description, commitCreatedAt); err != nil {
 			cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFiles)
 			clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles)
@@ -3509,11 +3494,11 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, []string{fileID}, fileSize, replace)
 	if err != nil {
-		handleStoredUploadMetadataError(h.db, orgID, repoID, uploadOperationID, []string{sha256ID}, err)
+		// Failed publication leaves the provisional up: reference to Cassandra
+		// TTL and Phase 0 instead of deleting from block_references.
 		writeUploadFileError(c, err)
 		return
 	}
-	ReleaseUploadedBlockRefs(h.db, orgID, repoID, uploadOperationID, []string{sha256ID})
 
 	// Record traffic (fire-and-forget)
 	if rec := traffic.Get(); rec != nil {

@@ -24,10 +24,11 @@ const (
 	blockReferrerUploadPrefix   = "up:"
 
 	// ProvisionalBlockReferenceTTLSeconds bounds how long an in-flight upload's
-	// provisional reference survives before being promoted to a permanent
-	// fs_object reference. It must exceed the longest realistic gap between
-	// uploading blocks and committing the fs_object (large resumable/chunked
-	// uploads). An abandoned upload's rows expire on their own — no permanent leak.
+	// provisional reference survives. A committed fs_object gets a separate
+	// permanent reference; the up: row still expires only by TTL. The duration must
+	// exceed the longest realistic gap between uploading blocks and committing the
+	// fs_object (large resumable/chunked uploads). Abandoned rows expire on their
+	// own — no permanent leak.
 	ProvisionalBlockReferenceTTLSeconds = 48 * 60 * 60 // 48h
 
 	// PublishAttemptReferenceTTLSeconds bounds how long a pub:<attempt> crash
@@ -126,8 +127,8 @@ func BlockReferrerForPublishAttempt(attemptID string) string {
 }
 
 // BlockReferrerForUpload builds the provisional referrer for an in-flight upload:
-// "up:<operation_id>". Written with a TTL; superseded by the permanent fs_object
-// reference once the upload is committed.
+// "up:<operation_id>". It is written with a TTL and remains until that TTL even
+// after the upload creates a separate permanent fs_object reference.
 func BlockReferrerForUpload(operationID string) string {
 	return blockReferrerUploadPrefix + operationID
 }
@@ -915,7 +916,7 @@ func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
 
 // AddBlockReference registers a reference to a block. Idempotent: re-adding the
 // same (block, referrer) overwrites a row with identical key. ttlSeconds > 0 makes
-// the row expire (provisional upload references); 0 means permanent.
+// the row expire (for example publish-attempt references); 0 means permanent.
 func (db *DB) AddBlockReference(orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
 	now := time.Now().UTC()
 	if ttlSeconds > 0 {
@@ -931,8 +932,8 @@ func (db *DB) AddBlockReference(orgID, blockID, referrer, libraryID string, ttlS
 }
 
 // RemoveBlockReference deletes a single (block, referrer) reference. Idempotent:
-// deleting a non-existent row is a no-op, so a retried GC pass or upload rollback
-// is always safe.
+// deleting a non-existent row is a no-op, so a retried GC pass or publish-attempt
+// cleanup is always safe. Upload up: references are not removed through this API.
 func (db *DB) RemoveBlockReference(orgID, blockID, referrer string) error {
 	return db.Session().Query(`
 		DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
@@ -946,6 +947,25 @@ func (db *DB) BlockHasReferences(orgID, blockID string) (bool, error) {
 	err := db.Session().Query(`
 		SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? LIMIT 1
 	`, orgID, blockID).Scan(&referrer)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// BlockReferenceExists reports whether one specific (block, referrer) reference
+// row is still present. GC Phase 0 uses it to tell "this provisional reference
+// has been retired by its Cassandra TTL" from "the row is still there", which is
+// what lets the scanner wait for the TTL instead of deleting a reference an
+// upload may have just renewed (F9).
+func (db *DB) BlockReferenceExists(orgID, blockID, referrer string) (bool, error) {
+	var existing string
+	err := db.Session().Query(`
+		SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgID, blockID, referrer).Scan(&existing)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil

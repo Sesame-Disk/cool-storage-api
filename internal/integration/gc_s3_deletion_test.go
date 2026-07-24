@@ -203,6 +203,51 @@ func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
 
 	database := shareProjectionDBForTest(t)
 	store := gcpkg.NewCassandraStore(database)
+	// Successful publication deliberately leaves the session's up: reference to
+	// Cassandra TTL. Prove that new contract, then stage the state Cassandra will
+	// produce after that TTL retires the row before testing permanent-delete GC.
+	// The raw delete below is test-only clock advancement after the TTL assertion;
+	// no production success or rollback path releases the provisional row.
+	var provisionalReferrer string
+	iter := session.Query(`
+		SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ?
+	`, orgA.orgID, blockID).Iter()
+	var referrer string
+	for iter.Scan(&referrer) {
+		if len(referrer) >= len("up:") && referrer[:len("up:")] == "up:" {
+			if provisionalReferrer != "" {
+				t.Fatalf("orgA upload created multiple provisional refs: %q and %q", provisionalReferrer, referrer)
+			}
+			provisionalReferrer = referrer
+		}
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("list orgA block references: %v", err)
+	}
+	if provisionalReferrer == "" {
+		t.Fatal("successful orgA upload did not retain its TTL-bound provisional reference")
+	}
+	var provisionalTTL int
+	if err := session.Query(`
+		SELECT TTL(library_id) FROM block_references
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgA.orgID, blockID, provisionalReferrer).Scan(&provisionalTTL); err != nil || provisionalTTL <= 0 {
+		t.Fatalf("orgA provisional reference TTL = %d, err=%v; want a retained TTL-bound row", provisionalTTL, err)
+	}
+	if err := session.Query(`
+		DELETE FROM block_references
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgA.orgID, blockID, provisionalReferrer).Exec(); err != nil {
+		t.Fatalf("stage orgA provisional reference after TTL retirement: %v", err)
+	}
+	var retiredLibraryID string
+	if err := session.Query(`
+		SELECT library_id FROM block_references
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgA.orgID, blockID, provisionalReferrer).Scan(&retiredLibraryID); err != gocql.ErrNotFound {
+		t.Fatalf("provisional reference after staged TTL retirement: library=%q err=%v", retiredLibraryID, err)
+	}
+
 	orgAUUID := mustParseUUID(t, orgA.orgID)
 	queuedItems, err := store.DequeueBatch(orgAUUID, 1, time.Now().Add(24*time.Hour))
 	if err != nil {

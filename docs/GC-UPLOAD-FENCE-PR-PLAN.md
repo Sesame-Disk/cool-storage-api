@@ -273,11 +273,13 @@ the deterministic fast-clear regression remain PR-5 acceptance.
   with the cause preserved via `%w`; `db.ErrBlockMetadataPermanent` (empty class,
   malformed sha1, conflicting representation/sha1, corrupt GC ownership) is returned
   untagged and not retried. Default bias is transient — only deterministically
-  irrecoverable failures are permanent. This closes F6. **Exception:** the
-  provisional-expiry write fails closed — on its failure the helper releases the
-  reference and enqueues it rather than leaving a reference with no GC-discovery
-  projection (the F10 interim guard); it is not retried because a retry would re-add
-  the reference into the same split write.
+  irrecoverable failures are permanent. This closes F6. **Exception (superseded by
+  PR-8 — describes PR-3 as shipped):** the provisional-expiry write failed closed —
+  on its failure the helper released the reference and enqueued it rather than
+  leaving a reference with no GC-discovery projection (the F10 interim guard); it
+  was not retried because a retry would re-add the reference into the same split
+  write. PR-8 writes both rows in one batch, so there is no split to compensate and
+  that failure is now plainly retryable.
 - The retry metric `block_upload_materialization_retries_total{surface,reason}` is
   emitted by all three retry wrappers — the generic `RetryUploadedBlockMaterialization`,
   the SeafHTTP `retrySeafHTTPBlockMaterialization`, and the template-CreateFile
@@ -613,9 +615,9 @@ benchmark script that already documented it as "not a correctness benchmark".
   `block_upload_session_required`** before the body is read, so it can neither
   allocate the block buffer nor leave an unreferenced S3 object (F8). The whole
   legacy branch — `getBlockStore` → `BlockExists` → per-block quota → `PutBlockData`
-  — is deleted. Past the guard, `resolution` is provably `uploadSessionValid`; a
-  defensive `respondBlockUploadSessionRequired` stands where the dead branch was so
-  a future regression fails loudly instead of leaking again.
+  — is deleted. Past the guard, `resolution` is provably `uploadSessionValid`, so the
+  session branch was unwrapped and the unreachable tail removed rather than kept as a
+  defensive assertion: a 400 no request can reach asserts nothing.
 - `v2/blocks.go` `CheckBlocks`: the paired no-session existence oracle is removed the
   same way. A code comment had explicitly tied it to the no-session upload it served
   ("PR-7 will govern and canonicalize both together"); with the writer gone it is a
@@ -658,11 +660,118 @@ benchmark script that already documented it as "not a correctness benchmark".
 
 **Scope:** `internal/gc/scanner.go` (Phase 0 defers to the Cassandra TTL instead of
 deleting a possibly-renewed reference), `internal/db/provisional_block_ref_expiry.go`
-(`AddProvisionalBlockReferenceWithExpiry` in one logged batch,
-`DeleteProvisionalBlockReferenceExpiryIfExpiresAt` CAS on `expires_at`).
+(`AddProvisionalBlockReferenceWithExpiry` in one normal logged batch with TTL-bound
+reference and canonical tracker rows), the GC store adapters, and the upload success
+and rollback paths that previously released provisional rows eagerly. The unmerged
+generation migration was deleted; the final provisional protocol has no generation
+identity and no conditional mutation on `block_references` or
+`gc_provisional_block_refs`.
 
 **Independent of the upload series** — could land at any point. Listed late only
 because it is lower risk, not because it is blocked.
+
+**The final protocol deliberately uses TTL instead of ownership compares.**
+
+1. **Creation and renewal use one normal logged batch.**
+   `AddProvisionalBlockReferenceWithExpiry` writes the `block_references` `up:` row
+   with a TTL derived from `expires_at`, writes the canonical
+   `gc_provisional_block_refs` row with the same deadline and a longer TTL, writes
+   the current by-day discovery projection, and retracts the previously observed
+   projection when the deadline moves. There is no `IF`, serial consistency,
+   generation column or Paxos operation on either provisional row.
+2. **The discovery projection is durable.** The by-day row has no TTL. The
+   canonical tracker normally outlives the reference by the default 24-hour scanner
+   interval, but correctness does not require a scan inside that margin: after the
+   canonical row expires, the projection still drives the canonical-missing recovery
+   path.
+3. **Success and rollback never release provisional rows eagerly.** Upload publish,
+   materialization rollback and retry cleanup leave the `up:` reference, canonical
+   tracker and projection to their TTL/scanner lifecycle. This removes the race
+   rather than trying to win it with a compare. Session admission slots, committed
+   session state, staged-block ledgers, traffic charging, logical-storage accounting
+   and their idempotency markers are independent and continue to follow their own
+   cleanup rules.
+4. **Phase 0 never mutates the reference or canonical tracker.** For every due
+   projection it first checks the exact provisional reference. If that row is still
+   present, Phase 0 defers the record, preserves the projection and holds the day
+   cursor back. If it is absent, Phase 0 checks all block references, durably
+   persists a GC candidate only when the block is at zero references through
+   `EnsureBlockGCCandidate`, and only then deletes the processed projection. This
+   keeps every candidate producer on the same LWT protocol, preserves the earliest
+   candidate identity, and repairs a missing by-day projection. The
+   canonical-present and canonical-missing paths use the same ordering.
+5. **Failures remain retryable.** A reference read, liveness read, candidate write
+   or projection delete failure leaves the projection and cursor available for a
+   later scan. A logged batch provides atomic application/replay, not isolation;
+   stale renewal projections are therefore expected and safe because Phase 0 checks
+   the exact live reference before sweeping any projection.
+
+**Operational trade-off:** successful and rolled-back `up:` references can remain
+for up to the 48-hour provisional TTL instead of disappearing at request completion.
+The canonical tracker carries an additional 24-hour scanner margin, while the
+projection remains until Phase 0 resolves it. This temporarily retains rows and can
+delay reclaiming an abandoned block, but it removes provisional-row Paxos from hot
+upload paths and keeps every unresolved zero-reference transition discoverable.
+
+**The user-visible half of that trade-off, stated explicitly.** It is not only
+*abandoned* blocks. A file **deleted shortly after it was uploaded** does not free
+its physical space until the same TTL elapses: the library cascade removes the
+permanent `fs:` reference, but `BlockHasReferences`
+([`worker.go`](../internal/gc/worker.go) `removeFSObjectBlockReferences`) still sees
+the surviving `up:` row, so the block is never enqueued as a zero-ref candidate.
+Reclamation happens later, when the `up:` reference expires and Phase 0 resolves its
+projection — correct and convergent, but up to ~48h after the delete. Before PR-8 the
+success path released `up:` at commit, so this delete freed space immediately.
+
+Anyone reading physical-usage counters or S3 spend should expect that lag. Logical
+library/user quota accounting stays governed by filesystem deltas and is **not**
+intentionally delayed by the surviving provisional reference — the independence note
+above covers exactly this — so a "I deleted it and my quota did not drop" report is a
+separate bug, not this lag, unless a specific test proves that quota depends on the
+block's physical reclamation. The lever if the physical lag proves unacceptable is
+`ProvisionalBlockReferenceTTLSeconds` (currently 48h, sized for long resumable
+uploads) — **not** reinstating eager release, which is where all three release-side
+races came from.
+
+**Dead code removed with the superseded designs:** eager provisional release helpers
+and hooks, generation-aware reference/tracker deletes, release-CAS tests, generation
+fields and migration `013`, tracking-only writes, Phase 0 tracker deletion, and the
+alternate normal-write candidate helper. The test-only controlled teardown helper
+remains an unconditional normal batch solely to clean fixtures; production creation,
+renewal and recovery do not call it.
+
+**Acceptance (met):**
+- `TestScanner_ScanExpiredProvisionalBlockRefs_NeverDeletesALiveReference` — reference still
+  present at deadline: it survives, no candidate is created, the tracker stays, and the
+  cursor does not advance past its day. Verified by reintroducing the old
+  `RemoveBlockReference` call: the test fails.
+- `TestScanner_ScanExpiredProvisionalBlockRefs_KeepsTrackerWhenRenewedMidPass` — a renewal
+  injected during the liveness decision leaves the renewed tracker and reference intact;
+  Phase 0 has no tracker mutation to race.
+- `TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically` — one call, nothing runs
+  after its failure, nothing is compensated, and the error is retryable.
+- `TestScanner_ScanExpiredProvisionalBlockRefs_PromotesUnreferencedBlockBehindOrphanedProjection`
+  — the recovery path: an orphaned projection over an unreferenced block yields a candidate
+  before the projection is swept. Verified by removing the promotion: the test fails.
+- `TestWebBlockUploadWritesReferenceAndExpiryTogether` (integration, real Cassandra) — after
+  a session upload, all three rows exist, the reference's TTL expiry interval brackets its
+  tracked deadline, the canonical tracker has its scanner margin, renewal refreshes both
+  horizons and retracts the superseded projection, and successful commit leaves all three
+  rows intact while cleaning the independent session admission state.
+- `TestProvisionalRollbackPreservesTTLRows` (integration, real Cassandra) — a
+  post-materialization mapping conflict drives the production rollback boundary and leaves
+  the provisional reference, longer-lived tracker and durable projection intact.
+- `TestProvisionalProductionCQLDoesNotUseLWT` (integration) — the production provisional
+  source contains no generation state, CAS API or conditional CQL against
+  `block_references` / `gc_provisional_block_refs`; the audit intentionally does not
+  prohibit the established `gc_block_candidates` LWT.
+- `TestProvisionalPhase0CanonicalPresentAndMissingRecovery` and
+  `TestProvisionalPhase0FailuresPreserveProjectionForRetry` (integration, real Cassandra)
+  cover live-reference deferral, promotion-before-sweep with and without the canonical
+  tracker, and retry after a failed liveness/candidate decision.
+- Existing Phase 0 tests were retargeted rather than deleted: they now stage the state the
+  TTL actually produces (reference already gone) instead of the state only the old
+  self-deleting scanner produced.
 
 ---
 

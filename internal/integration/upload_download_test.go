@@ -63,14 +63,20 @@ func uploadFileThroughLinkWithReplaceField(t *testing.T, c *testClient, uploadUR
 	}
 }
 
-func assertNoUploadReferrers(t *testing.T, repoID, dirPath, fileName string) {
+// assertHasTTLBoundUploadReferrer asserts only that the provisional up: reference
+// was RETAINED after the upload/commit (PR-8 no longer releases it eagerly). It
+// checks presence of the up: prefix, not the TTL value itself: the concrete TTL
+// horizon — that the reference's expiry brackets its tracked deadline — is verified
+// against real Cassandra in TestWebBlockUploadWritesReferenceAndExpiryTogether.
+func assertHasTTLBoundUploadReferrer(t *testing.T, repoID, dirPath, fileName string) {
 	t.Helper()
 	referrers := uploadedFileBlockReferrers(t, repoID, dirPath, fileName)
 	for _, referrer := range referrers {
 		if strings.HasPrefix(referrer, "up:") {
-			t.Fatalf("block referrers leaked provisional upload ref: %v", referrers)
+			return
 		}
 	}
+	t.Fatalf("block referrers = %v, want retained TTL-bound up: reference", referrers)
 }
 
 // TestUploadAndDownloadRoundTrip simulates the full frontend upload/download flow:
@@ -207,7 +213,7 @@ func TestUploadAndDownloadRoundTrip(t *testing.T) {
 		}
 	})
 
-	assertNoUploadReferrers(t, repoID, "/", fileName)
+	assertHasTTLBoundUploadReferrer(t, repoID, "/", fileName)
 }
 
 func TestChunkedUploadAndDownloadRoundTrip(t *testing.T) {
@@ -275,7 +281,7 @@ func TestChunkedUploadAndDownloadRoundTrip(t *testing.T) {
 		t.Fatalf("chunked downloaded content mismatch: got %d bytes, want %d", len(downloadedContent), len(fileContent))
 	}
 
-	assertNoUploadReferrers(t, repoID, "/", fileName)
+	assertHasTTLBoundUploadReferrer(t, repoID, "/", fileName)
 }
 
 func TestEncryptedUploadAndDownloadRoundTrip(t *testing.T) {
@@ -791,5 +797,5 @@ func TestV2DirectUploadRoundTrip(t *testing.T) {
 	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
 		t.Fatalf("references after v2 upload = %d, want 1", refCount)
 	}
-	assertNoUploadReferrers(t, repoID, "/", fileName)
+	assertHasTTLBoundUploadReferrer(t, repoID, "/", fileName)
 }

@@ -173,6 +173,10 @@ type MockStore struct {
 	groupExistsCalls               atomic.Int64
 	findOrgForLibraryErr           error
 	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
+	blockHasReferencesErr          error
+	blockReferenceExistsErr        error
+	ensureBlockGCCandidateErr      error
+	deleteProvisionalProjectionErr error
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook     func(orgID uuid.UUID, size int)
@@ -1838,11 +1842,29 @@ func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, e
 	m.mu.RLock()
 	current := len(m.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)]) > 0
 	hook := m.blockHasReferencesHook
+	err := m.blockHasReferencesErr
 	m.mu.RUnlock()
+	if err != nil {
+		return false, err
+	}
 	if hook != nil {
 		return hook(orgID, blockID, current)
 	}
 	return current, nil
+}
+
+func (m *MockStore) BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.blockReferenceExistsErr != nil {
+		return false, m.blockReferenceExistsErr
+	}
+	refs, ok := m.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return false, nil
+	}
+	_, exists := refs[referrer]
+	return exists, nil
 }
 
 // SetBlockHasReferencesHookForTest installs a deterministic concurrency hook for
@@ -1949,6 +1971,9 @@ func (m *MockStore) ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentat
 func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.ensureBlockGCCandidateErr != nil {
+		return time.Time{}, m.ensureBlockGCCandidateErr
+	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.blockGCCandidates[key]; ok {
 		if candidateAt = candidateAt.UTC(); !candidateAt.IsZero() && candidateAt.Before(existing.CandidateAt) {
@@ -2048,6 +2073,11 @@ func (m *MockStore) GetProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, refer
 	if !ok {
 		return ProvisionalBlockRefExpiryInfo{}, false, nil
 	}
+	// Mirror the production canonical row's TTL. The projection intentionally
+	// remains durable, so callers can exercise canonical-missing recovery.
+	if !expiry.ExpiresAt.Add(time.Duration(db.ProvisionalBlockRefTrackerTTLGraceSeconds) * time.Second).After(time.Now().UTC()) {
+		return ProvisionalBlockRefExpiryInfo{}, false, nil
+	}
 	return ProvisionalBlockRefExpiryInfo{
 		OrgID:        expiry.OrgID,
 		BlockID:      expiry.BlockID,
@@ -2060,23 +2090,10 @@ func (m *MockStore) GetProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, refer
 func (m *MockStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.deleteProvisionalProjectionErr != nil {
+		return m.deleteProvisionalProjectionErr
+	}
 	delete(m.provisionalBlockRefExpiryProjections, newMockProvisionalBlockRefExpiryProjectionKey(orgID, blockID, referrer, expiresAt))
-	return nil
-}
-
-func (m *MockStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := fmt.Sprintf("%s:%s:%s", orgID, blockID, referrer)
-	if expiresAt.IsZero() {
-		if existing, ok := m.provisionalBlockRefExpiries[key]; ok {
-			expiresAt = existing.ExpiresAt
-		}
-	}
-	delete(m.provisionalBlockRefExpiries, key)
-	if !expiresAt.IsZero() {
-		delete(m.provisionalBlockRefExpiryProjections, newMockProvisionalBlockRefExpiryProjectionKey(orgID, blockID, referrer, expiresAt))
-	}
 	return nil
 }
 

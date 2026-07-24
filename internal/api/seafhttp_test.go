@@ -1020,32 +1020,18 @@ func TestCleanupSeafHTTPFailedPublishAttempt_JoinsArtifactCleanupAndQueueClear(t
 	}
 }
 
-func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
-	oldRollback := rollbackUploadedBlockRefsFn
+func TestHandleChunkedFinalizeError_CleansUpConflict(t *testing.T) {
 	oldCleanup := cleanupChunkUploadFn
 	defer func() {
-		rollbackUploadedBlockRefsFn = oldRollback
 		cleanupChunkUploadFn = oldCleanup
 	}()
 
-	var rollbackCalled bool
-	var gotOrgID, gotRepoID string
-	var gotBlockIDs []string
 	var cleanedUpload *ChunkUpload
-	var gotOperationID string
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
-		rollbackCalled = true
-		gotOrgID = orgID
-		gotRepoID = repoID
-		gotOperationID = operationID
-		gotBlockIDs = append([]string(nil), blockIDs...)
-	}
 	cleanupChunkUploadFn = func(upload *ChunkUpload) {
 		cleanedUpload = upload
 	}
 
 	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 	upload := &ChunkUpload{
 		Token:       "upload-token",
 		Filename:    "file.bin",
@@ -1058,20 +1044,8 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 		},
 	}
 
-	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, fmt.Errorf("%w: failed to finalize upload metadata after 20 attempts", v2.ErrLibraryHeadConflict))
+	h.handleChunkedFinalizeError(upload, fmt.Errorf("%w: failed to finalize upload metadata after 20 attempts", v2.ErrLibraryHeadConflict))
 
-	if !rollbackCalled {
-		t.Fatal("expected conflict finalize error to roll back accounted blocks")
-	}
-	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
-		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
-	}
-	if gotOperationID != "chunk-op-conflict" {
-		t.Fatalf("rollback operation ID = %s, want chunk-op-conflict", gotOperationID)
-	}
-	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b", "block-a"}) {
-		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b", "block-a"})
-	}
 	if cleanedUpload != upload {
 		t.Fatal("cleanup should target the tracked upload instance")
 	}
@@ -1080,32 +1054,18 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	}
 }
 
-func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing.T) {
-	oldRollback := rollbackUploadedBlockRefsFn
+func TestHandleChunkedFinalizeError_CleansUpQuotaExceeded(t *testing.T) {
 	oldCleanup := cleanupChunkUploadFn
 	defer func() {
-		rollbackUploadedBlockRefsFn = oldRollback
 		cleanupChunkUploadFn = oldCleanup
 	}()
 
-	var rollbackCalled bool
-	var gotOrgID, gotRepoID string
-	var gotBlockIDs []string
 	var cleanupCalled bool
-	var gotOperationID string
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
-		rollbackCalled = true
-		gotOrgID = orgID
-		gotRepoID = repoID
-		gotOperationID = operationID
-		gotBlockIDs = append([]string(nil), blockIDs...)
-	}
 	cleanupChunkUploadFn = func(upload *ChunkUpload) {
 		cleanupCalled = true
 	}
 
 	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-2", RepoID: "repo-2"}
 	upload := &ChunkUpload{
 		Finalizing:  true,
 		OperationID: "chunk-op-quota",
@@ -1115,51 +1075,29 @@ func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing
 		},
 	}
 
-	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, fmt.Errorf("inner finalize failure: %w", errStorageQuotaExceeded))
+	h.handleChunkedFinalizeError(upload, fmt.Errorf("inner finalize failure: %w", errStorageQuotaExceeded))
 
-	if !rollbackCalled {
-		t.Fatal("expected quota_exceeded finalize error to roll back accounted blocks")
-	}
 	if !cleanupCalled {
 		t.Fatal("expected quota_exceeded finalize error to clean up the tracker")
-	}
-	if gotOrgID != "org-2" || gotRepoID != "repo-2" {
-		t.Fatalf("rollback org/repo = %s/%s, want org-2/repo-2", gotOrgID, gotRepoID)
-	}
-	if gotOperationID != "chunk-op-quota" {
-		t.Fatalf("rollback operation ID = %s, want chunk-op-quota", gotOperationID)
-	}
-	if !reflect.DeepEqual(gotBlockIDs, []string{"block-x", "block-y"}) {
-		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-x", "block-y"})
 	}
 }
 
 func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
-	oldRollback := rollbackUploadedBlockRefsFn
 	oldCleanup := cleanupChunkUploadFn
 	defer func() {
-		rollbackUploadedBlockRefsFn = oldRollback
 		cleanupChunkUploadFn = oldCleanup
 	}()
 
-	rollbackCalled := false
 	cleanupCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
-		rollbackCalled = true
-	}
 	cleanupChunkUploadFn = func(upload *ChunkUpload) {
 		cleanupCalled = true
 	}
 
 	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 	upload := &ChunkUpload{Finalizing: true}
 
-	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, errors.New("boom"))
+	h.handleChunkedFinalizeError(upload, errors.New("boom"))
 
-	if rollbackCalled {
-		t.Fatal("non-conflict finalize error should not roll back accounted blocks here")
-	}
 	if cleanupCalled {
 		t.Fatal("non-conflict finalize error should keep the tracker for retry")
 	}
@@ -1169,128 +1107,26 @@ func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
 }
 
 func TestHandleChunkedFinalizeError_CleansUpUnknownBlockMutationOutcome(t *testing.T) {
-	oldRollback := rollbackUploadedBlockRefsFn
 	oldCleanup := cleanupChunkUploadFn
 	defer func() {
-		rollbackUploadedBlockRefsFn = oldRollback
 		cleanupChunkUploadFn = oldCleanup
 	}()
 
-	rollbackCalled := false
-	var gotBlockIDs []string
 	cleanupCalled := false
-	var gotOperationID string
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
-		rollbackCalled = true
-		gotOperationID = operationID
-		gotBlockIDs = append([]string(nil), blockIDs...)
-	}
 	cleanupChunkUploadFn = func(upload *ChunkUpload) {
 		cleanupCalled = true
 	}
 
 	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
 	upload := &ChunkUpload{Finalizing: true, OperationID: "chunk-op-unknown", accountedBlockPosition: map[int]string{0: "block-a", 1: "block-b"}}
 
-	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, fmt.Errorf("block mutation ambiguous: %w", v2.ErrBlockMutationOutcomeUnknown))
+	h.handleChunkedFinalizeError(upload, fmt.Errorf("block mutation ambiguous: %w", v2.ErrBlockMutationOutcomeUnknown))
 
-	if !rollbackCalled {
-		t.Fatal("unknown block mutation outcome should roll back previously accounted blocks")
-	}
-	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b"}) {
-		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b"})
-	}
-	if gotOperationID != "chunk-op-unknown" {
-		t.Fatalf("rollback operation ID = %s, want chunk-op-unknown", gotOperationID)
-	}
 	if !cleanupCalled {
 		t.Fatal("unknown block mutation outcome should clean up the tracker")
 	}
 	if !upload.Finalizing {
 		t.Fatal("unknown block mutation outcome should not reset tracker state before cleanup")
-	}
-}
-
-func TestHandleSingleShotMetadataError_RollsBackOnError(t *testing.T) {
-	oldRollback := rollbackUploadedBlockRefsFn
-	defer func() {
-		rollbackUploadedBlockRefsFn = oldRollback
-	}()
-
-	var rollbackCalled bool
-	var gotOrgID, gotRepoID string
-	var gotBlockIDs []string
-	var gotOperationID string
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
-		rollbackCalled = true
-		gotOrgID = orgID
-		gotRepoID = repoID
-		gotOperationID = operationID
-		gotBlockIDs = append([]string(nil), blockIDs...)
-	}
-
-	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
-
-	h.handleSingleShotMetadataError(token, "single-op", "block-internal", errors.New("boom"))
-
-	if !rollbackCalled {
-		t.Fatal("expected single-shot metadata error to roll back the promoted block")
-	}
-	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
-		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
-	}
-	if gotOperationID != "single-op" {
-		t.Fatalf("rollback operation ID = %s, want single-op", gotOperationID)
-	}
-	if !reflect.DeepEqual(gotBlockIDs, []string{"block-internal"}) {
-		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-internal"})
-	}
-}
-
-func TestHandleSingleShotMetadataError_SkipsSuccessAndEmptyBlockID(t *testing.T) {
-	oldRollback := rollbackUploadedBlockRefsFn
-	defer func() {
-		rollbackUploadedBlockRefsFn = oldRollback
-	}()
-
-	rollbackCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
-		rollbackCalled = true
-	}
-
-	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
-
-	h.handleSingleShotMetadataError(token, "single-op", "block-internal", nil)
-	if rollbackCalled {
-		t.Fatal("successful finalize should not roll back the promoted block")
-	}
-
-	h.handleSingleShotMetadataError(token, "single-op", "   ", errors.New("boom"))
-	if rollbackCalled {
-		t.Fatal("missing internal block ID should not roll back anything")
-	}
-}
-
-func TestHandleSingleShotMetadataError_SkipsUnknownPublicationOutcome(t *testing.T) {
-	oldRollback := rollbackUploadedBlockRefsFn
-	defer func() {
-		rollbackUploadedBlockRefsFn = oldRollback
-	}()
-
-	rollbackCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
-		rollbackCalled = true
-	}
-
-	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
-
-	h.handleSingleShotMetadataError(token, "single-op", "block-internal", v2.ErrLibraryHeadPublicationUnknown)
-	if rollbackCalled {
-		t.Fatal("unknown publication outcome should not roll back the promoted block")
 	}
 }
 
@@ -3480,7 +3316,6 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	originalPut := putUploadedBlockAutoDirectForUploadFn
 	originalRegister := registerUploadedBlockAndMappingForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
-	originalReleaseRefs := releaseUploadedBlockRefsFn
 	t.Cleanup(func() {
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
@@ -3488,7 +3323,6 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		putUploadedBlockAutoDirectForUploadFn = originalPut
 		registerUploadedBlockAndMappingForUploadFn = originalRegister
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
-		releaseUploadedBlockRefsFn = originalReleaseRefs
 	})
 
 	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
@@ -3510,7 +3344,6 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		registerCalls.Add(1)
 		return nil
 	}
-	releaseUploadedBlockRefsFn = func(_ *db.DB, _, _, _ string, _ []string) {}
 
 	expectedSHA1 := sha1.Sum([]byte("hello"))
 	expectedFileID := hex.EncodeToString(expectedSHA1[:])

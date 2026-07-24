@@ -9,8 +9,9 @@ X7. PR-3 merged as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), clo
 F6, F14 and the observed-fence half of F1. PR-4 merged as
 [#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4/F7. PR-5 merged as
 [#141](https://github.com/Sesame-Disk/sesamefs/pull/141), closing F1 and F3. PR-6 merged as
-[#142](https://github.com/Sesame-Disk/sesamefs/pull/142), closing F5 and F13. PR-7 is
-implemented on `feat/legacy-block-upload-governance` and pending review; F8 remains open on
+[#142](https://github.com/Sesame-Disk/sesamefs/pull/142), closing F5 and F13. PR-7 merged as
+[#143](https://github.com/Sesame-Disk/sesamefs/pull/143), closing F8. PR-8 is implemented on
+`fix/gc-phase0-provisional-ref-durability` and pending review; F9 and F10 remain open on
 `main` until it merges. X1/X2 remain open.
 
 Every row is verified against code at the cited location, except where the row
@@ -39,14 +40,13 @@ out here so the decision is visible rather than implicit.
 
 ## Open on `main`
 
-F8 has an implementation on `feat/legacy-block-upload-governance` but stays open until
-PR-7 merges.
+F9 and F10 have implementations on `fix/gc-phase0-provisional-ref-durability` but stay
+open until PR-8 merges.
 
 | # | Severity | Finding | Evidence | Closed by |
 |---|---|---|---|---|
-| F8 | Medium | **Legacy no-session upload leaks S3 objects (R2).** `/api/v2/blocks/upload` without a session writes an object with no `blocks` row and no reference. Reachable by any authenticated user regardless of the block-upload feature flag. **PR-7 resolves this by removing the no-session path entirely (reject, not govern):** both `/blocks/upload` and its paired `/blocks/check` oracle answer 400 `block_upload_session_required` before any store I/O, so the orphan can no longer be created, and the frontend `withBlockUploadSessionHeader` throws instead of silently dropping the session header. | `v2/blocks.go` legacy path | PR-7 |
-| F9 | Medium | **GC Phase 0 can delete a renewed provisional reference.** The scanner removed the reference based on a stale expiry projection, which could drop liveness for a live upload that renewed the same referrer. | `gc/scanner.go` `scanExpiredProvisionalBlockRefs` | PR-8 |
-| F10 | Medium | **Provisional reference and its expiry are written separately.** A failure between them leaves a reference with no discovery projection, so the zero-ref transition is never found. The atomic single-batch write is PR-8; PR-3 keeps the interim guard (on an expiry-write failure `RegisterUploadedBlock` releases the reference and enqueues it, rather than leaving the orphan) so it does not widen this window. | `fs_helpers.go`; `provisional_block_ref_expiry.go` | PR-8 |
+| F9 | Medium | **GC Phase 0 can delete a renewed provisional reference.** The scanner removed the reference based on a stale expiry projection, which could drop liveness for a live upload that renewed the same referrer. **PR-8 resolves this without a conditional mutation on the provisional rows:** the `up:` reference carries a Cassandra TTL derived from the tracked deadline, and Phase 0 never deletes either the reference or canonical tracker. It checks the exact reference first; a present row is deferred with its projection and day cursor preserved. Once absent, Phase 0 resolves whole-block liveness, uses the established `EnsureBlockGCCandidate` LWT if zero references remain (preserving the earliest candidate identity and repairing its projection), and only then removes the processed provisional projection. The canonical tracker expires through its own longer TTL, while the durable projection also supports canonical-missing recovery. | `gc/scanner.go` `scanExpiredProvisionalBlockRefs` | PR-8 |
+| F10 | Medium | **Provisional reference and its expiry are written separately.** A failure between them leaves a reference with no discovery projection, so the zero-ref transition is never found. **PR-8 writes the TTL-bound reference, longer-lived TTL-bound canonical tracker and durable by-day projection in one normal logged batch** (`AddProvisionalBlockReferenceWithExpiry`), retracting the previously observed projection when renewal moves the deadline. The interim split-write compensation is gone; a batch failure is retryable. Review also found the release side could recreate the same undiscoverable state by deleting rows while a same-referrer renewal raced it. The final design removes eager provisional release entirely: successful publication and rollback leave the `up:` reference and tracker to TTL, and only Phase 0 removes a projection after liveness resolution and any required candidate persistence. There is no provisional generation identity, release CAS, tracker CAS or provisional-row LWT. | `upload_rollback.go`; `fs_helpers.go`; `provisional_block_ref_expiry.go`; `gc/scanner.go` | PR-8 |
 | F11 | Medium | **Abandoned prefetch leaks an open S3 reader.** `PrefetchBlock` buffered its result, so a consumer that stopped early left the `io.ReadCloser` unclosed. | `streaming/streaming.go` | PR-9 |
 | F12 | Medium | **Unbounded request bodies.** `PutBlock` and `check-blocks` read the whole body with `io.ReadAll` and no size or id-count limit. | `sync.go` | PR-10 |
 | F13 | High | **Corrupt directory listings resolve, and unproven absence can become 404.** High because corrupt entries can serve bytes from the wrong FS object; the HTTP-classification half alone is lower severity. A missing referenced row is dangling metadata, and even a valid local listing without an entry may be an older `LOCAL_QUORUM` cross-DC snapshot, so neither proves global absence. Related, and worse: a JSON-valid but corrupt listing resolves anyway. Structural cases (`null`, `[null]`, non-string name, missing id/mode) are skipped or misclassified; unsafe names can create traversal entries in ZIPs; semantic cases (empty or non-40-hex id, duplicate names/keys, invalid mode) can resolve the wrong object. `encoding/json` silently keeps the **last** repeated key, so `{"id":"A","id":"B"}` serves B and `{"name":"a","name":"b"}` hides `a` entirely. | `seafhttp.go` directory lookup and ZIP preflight | PR-6 |
@@ -67,6 +67,7 @@ Rows move here only once the PR that fixes them **merges**.
 | F3 | High | Web block-session upload funnel was unwrapped. PR-5 wrapped it in the bounded store→materialize→confirm cycle with single-shot admission, traffic and metrics, and a retryable coded `409 block_delete_in_progress`. | PR-5 ([#141](https://github.com/Sesame-Disk/sesamefs/pull/141)) |
 | F5 | High | Download served stale legacy bytes: `HandleDownload` fell back to the path-based object on any streaming failure. PR-6 removed the fallback and `resolveLibraryObjectStore`; block storage is the only download path and every metadata/read failure is a retryable 503. | PR-6 ([#142](https://github.com/Sesame-Disk/sesamefs/pull/142)) |
 | F13 | High | Corrupt directory listings resolved and unproven absence could become 404. PR-6 validates listings all-or-nothing (duplicate keys, unsafe names, invalid modes, mode↔obj_type disagreement all fail closed) and maps even a validated local miss to 503, since a LOCAL_QUORUM snapshot cannot prove global absence. Accepted cost recorded as X8 / ISSUE-DOWNLOAD-NO-404-01. | PR-6 ([#142](https://github.com/Sesame-Disk/sesamefs/pull/142)) |
+| F8 | Medium | Legacy no-session upload leaked S3 objects (R2): `/api/v2/blocks/upload` without a session wrote an object with no `blocks` row and no reference. PR-7 removed the path outright — both `/blocks/upload` and its paired `/blocks/check` oracle answer 400 `block_upload_session_required` before any store I/O, and the frontend throws instead of silently dropping the session header. | PR-7 ([#143](https://github.com/Sesame-Disk/sesamefs/pull/143)) |
 
 ## Open, deferred, or constraining the series
 
@@ -79,6 +80,13 @@ Only the GC owner may release or delete an active claim; writers must wait/retry
 fail closed. This is part of F2's lifecycle fix. PR-3 goes further on the writer side:
 `RegisterUploadedBlock` no longer waits internally at all — it propagates the fence to
 the outer store→materialize wrapper.
+
+PR-8's provisional protocol intentionally accepts delayed cleanup: successful and
+rolled-back `up:` references can remain for up to 48 hours, the canonical tracker TTL
+adds the default 24-hour scanner margin, and the by-day projection stays durable until
+Phase 0 resolves it. Session admission, committed-session state, staging limits,
+traffic charging and logical-storage accounting are independent of provisional-row
+retirement and keep their existing cleanup/idempotency behavior.
 
 | # | Severity | Finding | Tracked as |
 |---|---|---|---|

@@ -49,8 +49,6 @@ var onlyOfficeCleanupFailedPublishAttemptFn = func(database *db.DB, orgID, repoI
 
 var onlyOfficeClearPendingPublishedFileRepairsFn = clearPendingPublishedFileRepairs
 
-var onlyOfficeReleaseUploadedBlockRefsFn = ReleaseUploadedBlockRefs
-
 var onlyOfficeDeletePendingBlockFn = func(h *OnlyOfficeHandler, orgID, operationID string) error {
 	return h.deleteOnlyOfficePendingBlock(orgID, operationID)
 }
@@ -395,7 +393,6 @@ func (h *OnlyOfficeHandler) ReconcileOnlyOfficePendingBlocks(orgID string) error
 	}
 
 	cutoff := time.Now().Add(-onlyOfficePendingBlockStaleAfter)
-	fsHelper := NewFSHelper(h.db)
 	var firstErr error
 	for _, pending := range pendingBlocks {
 		if !pending.CreatedAt.IsZero() && pending.CreatedAt.After(cutoff) {
@@ -424,12 +421,10 @@ func (h *OnlyOfficeHandler) ReconcileOnlyOfficePendingBlocks(orgID string) error
 			continue
 		}
 
-		if strings.TrimSpace(pending.InternalBlockID) != "" {
-			zeroRefBlocks := fsHelper.ReleaseUploadReferences(orgID, pending.RepoID, pending.OperationID, []string{pending.InternalBlockID})
-			enqueueZeroRefBlocks(h.db, orgID, pending.RepoID, zeroRefBlocks)
-		}
+		// The provisional up: reference is intentionally left for Cassandra TTL;
+		// deleting this pending cleanup row does not alter block liveness.
 		if err := h.deleteOnlyOfficePendingBlock(orgID, pending.OperationID); err != nil {
-			log.Printf("OnlyOffice: failed to delete rolled back pending block %s: %v", pending.OperationID, err)
+			log.Printf("OnlyOffice: failed to delete TTL-deferred pending block %s: %v", pending.OperationID, err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -1248,8 +1243,8 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return fmt.Errorf("unexpected block reuse decision %d for %s", probe.Decision, internalBlockID)
 	}, func() error {
 		// Materialize block metadata/provisional ref first and then the sync mapping.
-		// Keep the pending-cleanup row on mapping failure so the reconciler can finish
-		// cleanup even if the immediate rollback path was only partially successful.
+		// Keep the pending-cleanup row on mapping failure so the reconciler can clear
+		// bookkeeping while the provisional reference expires by Cassandra TTL.
 		materializeErr := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, internalBlockID, rollbackID, len(content), materializedStorageClass, storageKey, externalBlockID)
 		if materializeErr == nil {
 			blockMetadataRegistered = true
@@ -1273,12 +1268,10 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	storageDeltaBytes, storageDeltaFiles, newCommitID, err := h.publishEditedDocumentMetadata(fsHelper, orgID, repoID, filePath, filename, userID, originalFileSize, externalBlockID, rollbackID)
 	if err != nil {
 		if shouldRollbackOnlyOfficeMaterializedBlock(blockMetadataRegistered, err) {
-			zeroRefBlocks := fsHelper.ReleaseUploadReferences(orgID, repoID, rollbackID, []string{internalBlockID})
-			enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
 			if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
-				log.Printf("OnlyOffice: failed to clear pending block cleanup %s after rollback: %v", rollbackID, deleteErr)
+				log.Printf("OnlyOffice: failed to clear pending block cleanup %s after TTL-deferred rollback: %v", rollbackID, deleteErr)
 			}
-			log.Printf("OnlyOffice: rolled back materialized block %s after metadata publish failure: %v", internalBlockID[:16], err)
+			log.Printf("OnlyOffice: left materialized block %s for provisional TTL cleanup after metadata publish failure: %v", internalBlockID[:16], err)
 		}
 		return err
 	}
@@ -1288,8 +1281,6 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 }
 
 func (h *OnlyOfficeHandler) finalizeSuccessfulOnlyOfficeEdit(orgID, repoID, userID, rollbackID, internalBlockID, filePath, externalBlockID, newCommitID string, storageDeltaBytes, storageDeltaFiles int64) {
-	onlyOfficeReleaseUploadedBlockRefsFn(h.db, orgID, repoID, rollbackID, []string{internalBlockID})
-
 	if err := onlyOfficeDeletePendingBlockFn(h, orgID, rollbackID); err != nil {
 		log.Printf("OnlyOffice: failed to clear pending block cleanup %s after publish success: %v", rollbackID, err)
 	}

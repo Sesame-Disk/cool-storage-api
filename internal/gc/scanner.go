@@ -50,6 +50,14 @@ func NewScanner(store GCStore, queue *Queue, stats *Stats, cfg config.GCConfig) 
 	}
 }
 
+// ScanExpiredProvisionalBlockRefsOnce runs only the provisional-reference
+// recovery phase. Integration tests use this narrow entry point so they can
+// exercise the production Cassandra store without advancing unrelated scanner
+// cursors or mutating unrelated GC state.
+func (s *Scanner) ScanExpiredProvisionalBlockRefsOnce(ctx context.Context) (int, error) {
+	return s.scanExpiredProvisionalBlockRefs(ctx)
+}
+
 // ScanExpiredDeletedLibrariesOnce runs only the deleted-library expiry phase.
 // Integration tests use this narrow entry point to avoid mutating unrelated
 // scanner cursors/global state via a full ScanOnce pass.
@@ -183,10 +191,37 @@ func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (
 	return 0, nil
 }
 
-// scanExpiredProvisionalBlockRefs expires abandoned provisional upload refs by
-// specific referrer. If removing the expired ref drops the block to zero refs,
-// the block is promoted into gc_block_candidates; otherwise only the expiry
-// tracker is removed.
+// promoteBlockIfUnreferenced runs the zero-reference transition for a block whose
+// provisional pin is provably gone. Both Phase 0 paths that reach that conclusion
+// use it, so neither can quietly skip the promotion — the transition has exactly one
+// discovery window and nothing re-opens it once the tracking rows are swept.
+func (s *Scanner) promoteBlockIfUnreferenced(orgID uuid.UUID, blockID, storageClass string, now time.Time) error {
+	hasRefs, err := s.store.BlockHasReferences(orgID, blockID)
+	if err != nil {
+		return fmt.Errorf("check refs after provisional expiry org=%s block=%s: %w", orgID, blockID, err)
+	}
+	if hasRefs {
+		return nil
+	}
+	if _, err := s.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, now); err != nil {
+		return fmt.Errorf("promote expired provisional ref org=%s block=%s into gc candidate: %w", orgID, blockID, err)
+	}
+	return nil
+}
+
+// scanExpiredProvisionalBlockRefs processes abandoned provisional upload refs by
+// specific referrer and promotes any block their expiry left at zero references
+// into gc_block_candidates. Canonical trackers retire only through their TTL;
+// this phase never mutates them and sweeps only resolved discovery projections.
+//
+// It does NOT delete the reference row. That row carries a Cassandra TTL derived
+// from the very deadline being tracked, so it expires on its own; the phase waits
+// for that and acts only on what it observes afterwards. Deleting it here was F9:
+// an upload can renew a reference between this scan's read and its delete, and
+// removing a renewed reference unpins a live upload — after which the block goes
+// to zero references and GC is free to delete data the uploader is still writing.
+// Records whose reference has not yet gone are deferred to a later cycle, and the
+// day cursor is held back so a deferred record stays discoverable.
 func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 0: Scanning for expired provisional upload refs...")
 
@@ -203,6 +238,12 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 	}
 
 	cleaned := 0
+	// deferred counts records this pass deliberately left in place because their
+	// specific provisional reference is still live; oldestDeferredDay keeps the
+	// cursor from stepping past the day that holds one, which would make it
+	// undiscoverable.
+	deferred := 0
+	var oldestDeferredDay time.Time
 	var phaseErr error
 	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
 		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
@@ -235,74 +276,54 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 					continue
 				}
 
-				if !found {
-					if err := s.store.DeleteProvisionalBlockRefExpiryProjection(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt); err != nil {
-						log.Printf("[GC Scanner] Phase 0: failed to delete orphaned provisional expiry projection org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
-						if phaseErr == nil {
-							phaseErr = fmt.Errorf("delete orphaned provisional expiry projection org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
-						}
-						continue
-					}
-					cleaned++
-					continue
-				}
-
-				canonical.ExpiresAt = canonical.ExpiresAt.UTC()
-				if canonical.ExpiresAt.After(now) {
-					if err := s.store.DeleteProvisionalBlockRefExpiryProjection(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt); err != nil {
-						log.Printf("[GC Scanner] Phase 0: failed to delete stale provisional expiry projection org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
-						if phaseErr == nil {
-							phaseErr = fmt.Errorf("delete stale provisional expiry projection org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
-						}
-						continue
-					}
-					cleaned++
-					continue
-				}
-
-				storageClass := canonical.StorageClass
-				if storageClass == "" {
-					storageClass = expiry.StorageClass
-				}
-				if err := s.store.RemoveBlockReference(canonical.OrgID, canonical.BlockID, canonical.Referrer); err != nil {
-					log.Printf("[GC Scanner] Phase 0: failed to remove expired provisional ref org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
-					if phaseErr == nil {
-						phaseErr = fmt.Errorf("remove expired provisional ref org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
-					}
-					continue
-				}
-				hasRefs, err := s.store.BlockHasReferences(canonical.OrgID, canonical.BlockID)
+				// Check the exact provisional reference before classifying either a
+				// canonical-present or canonical-missing projection. This must also run
+				// for stale projections left by renewal: a logged batch is atomic but
+				// not isolated, and sweeping a projection while its live reference is
+				// visible can erase the upload's only durable retry anchor.
+				refPresent, err := s.store.BlockReferenceExists(expiry.OrgID, expiry.BlockID, expiry.Referrer)
 				if err != nil {
-					log.Printf("[GC Scanner] Phase 0: failed to check block refs after provisional expiry org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+					log.Printf("[GC Scanner] Phase 0: failed to check provisional ref presence org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("check refs after provisional expiry org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+						phaseErr = fmt.Errorf("check provisional ref presence org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
 					}
 					continue
 				}
-				if !hasRefs {
-					if _, err := s.store.EnsureBlockGCCandidate(canonical.OrgID, canonical.BlockID, storageClass, now); err != nil {
-						log.Printf("[GC Scanner] Phase 0: failed to promote expired provisional ref org=%s block=%s into gc candidate: %v", canonical.OrgID, canonical.BlockID, err)
-						if phaseErr == nil {
-							phaseErr = fmt.Errorf("promote expired provisional ref org=%s block=%s into gc candidate: %w", canonical.OrgID, canonical.BlockID, err)
-						}
-						continue
-					}
-				}
-				if err := s.store.DeleteProvisionalBlockRefExpiry(canonical.OrgID, canonical.BlockID, canonical.Referrer, canonical.ExpiresAt); err != nil {
-					log.Printf("[GC Scanner] Phase 0: failed to delete provisional expiry tracker org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
-					if phaseErr == nil {
-						phaseErr = fmt.Errorf("delete provisional expiry tracker org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+				if refPresent {
+					deferred++
+					if oldestDeferredDay.IsZero() || day.Before(oldestDeferredDay) {
+						oldestDeferredDay = day
 					}
 					continue
 				}
-				if !canonical.ExpiresAt.Equal(expiry.ExpiresAt.UTC()) {
-					if err := s.store.DeleteProvisionalBlockRefExpiryProjection(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt); err != nil {
-						log.Printf("[GC Scanner] Phase 0: failed to delete stale provisional expiry projection after canonical expiry org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
-						if phaseErr == nil {
-							phaseErr = fmt.Errorf("delete stale provisional expiry projection after canonical expiry org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
-						}
-						continue
+
+				storageClass := expiry.StorageClass
+				if found && canonical.StorageClass != "" {
+					storageClass = canonical.StorageClass
+				}
+
+				// The specific provisional pin is gone, so resolve whole-block
+				// liveness through the shared helper. If no references remain, the GC
+				// candidate is durably persisted before the projection is removed.
+				// Any read/write failure leaves the projection and cursor untouched for
+				// a later scan.
+				if err := s.promoteBlockIfUnreferenced(expiry.OrgID, expiry.BlockID, storageClass, now); err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to resolve expired provisional ref org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+					if phaseErr == nil {
+						phaseErr = err
 					}
+					continue
+				}
+
+				// Delete only the processed discovery row. The canonical tracker is
+				// never mutated by Phase 0; it retires exclusively through Cassandra
+				// TTL, avoiding tracker LWT/CAS races with renewal.
+				if err := s.store.DeleteProvisionalBlockRefExpiryProjection(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt); err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to delete resolved provisional expiry projection org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("delete resolved provisional expiry projection org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+					}
+					continue
 				}
 				cleaned++
 			}
@@ -311,6 +332,12 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 
 	if phaseErr == nil {
 		newCursor := cutoffDay.AddDate(0, 0, -1)
+		// Never advance past a day still holding a deferred record. The cursor is
+		// what bounds future scans, so moving beyond an unprocessed day would drop
+		// that record out of every later pass — a leak with no discovery path left.
+		if !oldestDeferredDay.IsZero() && oldestDeferredDay.Before(newCursor) {
+			newCursor = oldestDeferredDay
+		}
 		if !newCursor.Before(startDay) {
 			if err := s.store.SaveGCStats(gcProvisionalBlockRefsCursorKey, db.GCProjectionDateString(newCursor)); err != nil {
 				log.Printf("[GC Scanner] Phase 0: failed to persist provisional block ref cursor: %v", err)
@@ -319,8 +346,12 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 		}
 	}
 
-	log.Printf("[GC Scanner] Phase 0 complete: cleaned %d provisional upload refs", cleaned)
+	log.Printf("[GC Scanner] Phase 0 complete: cleaned %d provisional upload refs, deferred %d tracked", cleaned, deferred)
 	recordScannerAction("expired_provisional_block_refs", "cleaned", cleaned)
+	// Deferrals are expected during the bounded interval in which the canonical
+	// tracker deliberately outlives the reference. A count that stays high beyond
+	// that margin means cleanup is not converging and the day cursor remains pinned.
+	recordScannerAction("expired_provisional_block_refs", "deferred", deferred)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_provisional_block_refs").SetToCurrentTime()
 	return cleaned, phaseErr
 }

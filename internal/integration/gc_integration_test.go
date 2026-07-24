@@ -8,11 +8,19 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -144,6 +152,366 @@ func requireCassandra(t *testing.T) {
 	var result string
 	if err := session.Query(`SELECT release_version FROM system.local`).Scan(&result); err != nil {
 		t.Skipf("Cassandra not reachable: %v; skipping", err)
+	}
+}
+
+type provisionalPhase0FailureStore struct {
+	gcpkg.GCStore
+	livenessFailureBlock   string
+	candidateFailureBlock  string
+	projectionFailureBlock string
+	fail                   bool
+}
+
+func (s *provisionalPhase0FailureStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
+	if s.fail && blockID == s.livenessFailureBlock {
+		return false, errors.New("injected provisional liveness failure")
+	}
+	return s.GCStore.BlockHasReferences(orgID, blockID)
+}
+
+func (s *provisionalPhase0FailureStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
+	if s.fail && blockID == s.candidateFailureBlock {
+		return time.Time{}, errors.New("injected provisional candidate persistence failure")
+	}
+	return s.GCStore.EnsureBlockGCCandidate(orgID, blockID, storageClass, candidateAt)
+}
+
+func (s *provisionalPhase0FailureStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
+	if s.fail && blockID == s.projectionFailureBlock {
+		return errors.New("injected provisional projection delete failure")
+	}
+	return s.GCStore.DeleteProvisionalBlockRefExpiryProjection(orgID, blockID, referrer, expiresAt)
+}
+
+type provisionalPhase0Fixture struct {
+	orgID     uuid.UUID
+	blockID   string
+	referrer  string
+	expiresAt time.Time
+}
+
+func seedProvisionalPhase0Fixture(t *testing.T, canonicalPresent, referencePresent bool) provisionalPhase0Fixture {
+	t.Helper()
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	fixture := provisionalPhase0Fixture{
+		orgID:     uuid.New(),
+		blockID:   fmt.Sprintf("%064x", time.Now().UnixNano()),
+		referrer:  "up:phase0-" + uuid.NewString(),
+		expiresAt: time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond),
+	}
+	sha1ID := fmt.Sprintf("%040x", time.Now().UnixNano())
+
+	if err := session.Query(`
+		INSERT INTO blocks (org_id, block_id, representation_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, fixture.orgID.String(), fixture.blockID, db.PlainBlockRepresentationID, sha1ID, int64(1), "hot",
+		"blocks/"+fixture.blockID, time.Now().UTC(), time.Now().UTC()).Exec(); err != nil {
+		t.Fatalf("seed provisional Phase 0 block: %v", err)
+	}
+	if referencePresent {
+		if err := session.Query(`
+			INSERT INTO block_references (org_id, block_id, referrer, library_id, created_at)
+			VALUES (?, ?, ?, ?, ?) USING TTL 300
+		`, fixture.orgID.String(), fixture.blockID, fixture.referrer, uuid.NewString(), time.Now().UTC()).Exec(); err != nil {
+			t.Fatalf("seed live provisional reference: %v", err)
+		}
+	}
+	if canonicalPresent {
+		if err := session.Query(`
+			INSERT INTO gc_provisional_block_refs (org_id, block_id, referrer, storage_class, expires_at)
+			VALUES (?, ?, ?, ?, ?) USING TTL 300
+		`, fixture.orgID.String(), fixture.blockID, fixture.referrer, "hot", fixture.expiresAt).Exec(); err != nil {
+			t.Fatalf("seed canonical provisional tracker: %v", err)
+		}
+	}
+	if err := session.Query(`
+		INSERT INTO gc_provisional_block_refs_by_day
+			(expiry_day, bucket, expires_at, org_id, block_id, referrer, storage_class)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(fixture.expiresAt),
+		db.GCDiscoveryBucket(fixture.orgID.String(), fixture.blockID, fixture.referrer),
+		fixture.expiresAt, fixture.orgID.String(), fixture.blockID, fixture.referrer, "hot").Exec(); err != nil {
+		t.Fatalf("seed durable provisional projection: %v", err)
+	}
+
+	t.Cleanup(func() {
+		var candidateAt time.Time
+		if err := session.Query(`
+			SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
+		`, fixture.orgID.String(), fixture.blockID).Scan(&candidateAt); err == nil {
+			_ = session.Query(`
+				DELETE FROM gc_block_candidates_by_day
+				WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
+			`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(fixture.orgID.String(), fixture.blockID),
+				candidateAt.UTC(), fixture.orgID.String(), fixture.blockID).Exec()
+		}
+		_ = session.Query(`DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`, fixture.orgID.String(), fixture.blockID).Exec()
+		_ = session.Query(`
+			DELETE FROM gc_provisional_block_refs_by_day
+			WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?
+		`, db.GCProjectionUTCDate(fixture.expiresAt),
+			db.GCDiscoveryBucket(fixture.orgID.String(), fixture.blockID, fixture.referrer),
+			fixture.expiresAt, fixture.orgID.String(), fixture.blockID, fixture.referrer).Exec()
+		_ = session.Query(`
+			DELETE FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?
+		`, fixture.orgID.String(), fixture.blockID, fixture.referrer).Exec()
+		_ = session.Query(`
+			DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
+		`, fixture.orgID.String(), fixture.blockID, fixture.referrer).Exec()
+		_ = session.Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, fixture.orgID.String(), fixture.blockID).Exec()
+	})
+	return fixture
+}
+
+// provisionalRowExists collapses a point-read result to presence for the
+// provisional Phase 0 assertions. It returns false ONLY for a genuine
+// gocql.ErrNotFound; any other error (timeout, unavailable, read failure) fails
+// the test instead of being read as absence. Without this, an assertion that
+// expects a row to be gone would pass on a transient Cassandra error and hide a
+// real regression.
+func provisionalRowExists(t *testing.T, err error, table string) bool {
+	t.Helper()
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, gocql.ErrNotFound) {
+		return false
+	}
+	t.Fatalf("provisional existence check against %s failed (not a clean absence): %v", table, err)
+	return false
+}
+
+func provisionalProjectionExists(t *testing.T, fixture provisionalPhase0Fixture) bool {
+	t.Helper()
+	var expiresAt time.Time
+	err := shareProjectionDBForTest(t).Session().Query(`
+		SELECT expires_at FROM gc_provisional_block_refs_by_day
+		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?
+	`, db.GCProjectionUTCDate(fixture.expiresAt),
+		db.GCDiscoveryBucket(fixture.orgID.String(), fixture.blockID, fixture.referrer),
+		fixture.expiresAt, fixture.orgID.String(), fixture.blockID, fixture.referrer).Scan(&expiresAt)
+	return provisionalRowExists(t, err, "gc_provisional_block_refs_by_day")
+}
+
+func provisionalCanonicalExists(t *testing.T, fixture provisionalPhase0Fixture) bool {
+	t.Helper()
+	var expiresAt time.Time
+	err := shareProjectionDBForTest(t).Session().Query(`
+		SELECT expires_at FROM gc_provisional_block_refs
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, fixture.orgID.String(), fixture.blockID, fixture.referrer).Scan(&expiresAt)
+	return provisionalRowExists(t, err, "gc_provisional_block_refs")
+}
+
+func provisionalReferenceExists(t *testing.T, fixture provisionalPhase0Fixture) bool {
+	t.Helper()
+	var referrer string
+	err := shareProjectionDBForTest(t).Session().Query(`
+		SELECT referrer FROM block_references
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, fixture.orgID.String(), fixture.blockID, fixture.referrer).Scan(&referrer)
+	return provisionalRowExists(t, err, "block_references")
+}
+
+func provisionalCandidateExists(t *testing.T, fixture provisionalPhase0Fixture) bool {
+	t.Helper()
+	var candidateAt time.Time
+	err := shareProjectionDBForTest(t).Session().Query(`
+		SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
+	`, fixture.orgID.String(), fixture.blockID).Scan(&candidateAt)
+	if !provisionalRowExists(t, err, "gc_block_candidates") {
+		return false
+	}
+	return gcCandidateProjectionExists(t, fixture.orgID.String(), fixture.blockID, candidateAt)
+}
+
+func newProvisionalPhase0Scanner(store gcpkg.GCStore) *gcpkg.Scanner {
+	return gcpkg.NewScanner(store, gcpkg.NewQueue(store), &gcpkg.Stats{}, config.GCConfig{})
+}
+
+func TestProvisionalProductionCQLDoesNotUseLWT(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate integration test source")
+	}
+	internalDir := filepath.Dir(filepath.Dir(testFile))
+	// Every production file that emits CQL against the provisional tables must be
+	// audited, not only the two that originally held the protocol. The last LWT to
+	// be removed (RemoveBlockReferenceIfGeneration) lived in block_references.go,
+	// which the earlier two-file list did not inspect, so a reintroduction there
+	// would not have failed this test. block_upload_sessions.go reads
+	// block_references and gc_projection_write_helpers.go writes the by-day
+	// projection; both are included so the audit covers the whole surface.
+	// provisional_block_ref_expiry.go stays first: the generation check below
+	// reads sourceFiles[0] as the canonical protocol file.
+	sourceFiles := []string{
+		filepath.Join(internalDir, "db", "provisional_block_ref_expiry.go"),
+		filepath.Join(internalDir, "db", "block_references.go"),
+		filepath.Join(internalDir, "db", "block_upload_sessions.go"),
+		filepath.Join(internalDir, "db", "gc_projection_write_helpers.go"),
+		filepath.Join(internalDir, "gc", "store_cassandra.go"),
+	}
+	targetTables := []string{
+		"block_references",
+		"gc_provisional_block_refs",
+		"gc_provisional_block_refs_by_day",
+	}
+	seen := make(map[string]bool, len(targetTables))
+
+	for _, sourceFile := range sourceFiles {
+		source, err := os.ReadFile(sourceFile)
+		if err != nil {
+			t.Fatalf("read production CQL source %s: %v", sourceFile, err)
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), sourceFile, source, 0)
+		if err != nil {
+			t.Fatalf("parse production CQL source %s: %v", sourceFile, err)
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			literal, ok := node.(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
+			}
+			query, err := strconv.Unquote(literal.Value)
+			if err != nil {
+				return true
+			}
+			normalized := strings.ToUpper(strings.Join(strings.Fields(query), " "))
+			for _, table := range targetTables {
+				if !strings.Contains(normalized, strings.ToUpper(table)) {
+					continue
+				}
+				seen[table] = true
+				if strings.Contains(normalized, " IF ") {
+					t.Errorf("provisional-table CQL in %s uses a conditional/LWT: %s", sourceFile, normalized)
+				}
+			}
+			return true
+		})
+	}
+	for _, table := range targetTables {
+		if !seen[table] {
+			t.Fatalf("source audit did not inspect any CQL targeting %s", table)
+		}
+	}
+
+	protocolSource, err := os.ReadFile(sourceFiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(string(protocolSource)), "generation") {
+		t.Fatal("provisional reference protocol reintroduced generation state")
+	}
+}
+
+func TestProvisionalPhase0CanonicalPresentAndMissingRecovery(t *testing.T) {
+	requireCassandra(t)
+
+	canonicalLive := seedProvisionalPhase0Fixture(t, true, true)
+	canonicalExpired := seedProvisionalPhase0Fixture(t, true, false)
+	missingLive := seedProvisionalPhase0Fixture(t, false, true)
+	missingExpired := seedProvisionalPhase0Fixture(t, false, false)
+
+	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+	cleaned, err := newProvisionalPhase0Scanner(store).ScanExpiredProvisionalBlockRefsOnce(context.Background())
+	if err != nil {
+		t.Fatalf("Phase 0 Cassandra scan: %v", err)
+	}
+	if cleaned < 2 {
+		t.Fatalf("Phase 0 cleaned = %d, want at least the two zero-ref fixtures", cleaned)
+	}
+
+	for name, fixture := range map[string]provisionalPhase0Fixture{
+		"canonical-present live reference": canonicalLive,
+		"canonical-missing live reference": missingLive,
+	} {
+		if !provisionalReferenceExists(t, fixture) {
+			t.Fatalf("%s: scanner deleted a live provisional reference", name)
+		}
+		if !provisionalProjectionExists(t, fixture) {
+			t.Fatalf("%s: scanner removed the retry projection while reference remains", name)
+		}
+		if provisionalCandidateExists(t, fixture) {
+			t.Fatalf("%s: scanner persisted a candidate for a referenced block", name)
+		}
+	}
+	if !provisionalCanonicalExists(t, canonicalLive) {
+		t.Fatal("Phase 0 deleted a live canonical tracker instead of relying on TTL")
+	}
+	if !provisionalCanonicalExists(t, canonicalExpired) {
+		t.Fatal("Phase 0 deleted the canonical tracker for an expired reference instead of relying on TTL")
+	}
+	if provisionalCanonicalExists(t, missingLive) || provisionalCanonicalExists(t, missingExpired) {
+		t.Fatal("canonical-missing fixture unexpectedly acquired a canonical row")
+	}
+
+	for name, fixture := range map[string]provisionalPhase0Fixture{
+		"canonical-present expired reference": canonicalExpired,
+		"canonical-missing expired reference": missingExpired,
+	} {
+		if !provisionalCandidateExists(t, fixture) {
+			t.Fatalf("%s: zero-ref block was not durably projected as a GC candidate", name)
+		}
+		if provisionalProjectionExists(t, fixture) {
+			t.Fatalf("%s: resolved provisional projection was not removed", name)
+		}
+	}
+}
+
+func TestProvisionalPhase0FailuresPreserveProjectionForRetry(t *testing.T) {
+	requireCassandra(t)
+
+	livenessFailure := seedProvisionalPhase0Fixture(t, true, false)
+	candidateFailure := seedProvisionalPhase0Fixture(t, true, false)
+	projectionFailure := seedProvisionalPhase0Fixture(t, true, false)
+	realStore := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+	failingStore := &provisionalPhase0FailureStore{
+		GCStore:                realStore,
+		livenessFailureBlock:   livenessFailure.blockID,
+		candidateFailureBlock:  candidateFailure.blockID,
+		projectionFailureBlock: projectionFailure.blockID,
+		fail:                   true,
+	}
+
+	if _, err := newProvisionalPhase0Scanner(failingStore).ScanExpiredProvisionalBlockRefsOnce(context.Background()); err == nil {
+		t.Fatal("Phase 0 scan error = nil, want injected failures")
+	}
+	for name, fixture := range map[string]provisionalPhase0Fixture{
+		"liveness read failure":         livenessFailure,
+		"candidate persistence failure": candidateFailure,
+		"projection delete failure":     projectionFailure,
+	} {
+		if !provisionalProjectionExists(t, fixture) {
+			t.Fatalf("%s: projection was lost instead of remaining discoverable for retry", name)
+		}
+	}
+	if provisionalCandidateExists(t, livenessFailure) {
+		t.Fatal("liveness failure advanced to candidate persistence")
+	}
+	if provisionalCandidateExists(t, candidateFailure) {
+		t.Fatal("failed candidate persistence unexpectedly produced a durable candidate")
+	}
+	if !provisionalCandidateExists(t, projectionFailure) {
+		t.Fatal("candidate was not durable before the injected projection-delete failure")
+	}
+
+	failingStore.fail = false
+	if _, err := newProvisionalPhase0Scanner(failingStore).ScanExpiredProvisionalBlockRefsOnce(context.Background()); err != nil {
+		t.Fatalf("Phase 0 retry after injected failures: %v", err)
+	}
+	for name, fixture := range map[string]provisionalPhase0Fixture{
+		"liveness read failure":         livenessFailure,
+		"candidate persistence failure": candidateFailure,
+		"projection delete failure":     projectionFailure,
+	} {
+		if !provisionalCandidateExists(t, fixture) {
+			t.Fatalf("%s: retry did not durably persist/repair candidate", name)
+		}
+		if provisionalProjectionExists(t, fixture) {
+			t.Fatalf("%s: retry did not remove resolved projection", name)
+		}
 	}
 }
 
@@ -1006,7 +1374,7 @@ func TestUploadLink_ReuploadBlockedByS3OrphanFence(t *testing.T) {
 	if rc := readBlockRefCount(t, orgID, blockID); rc != 1 {
 		t.Fatalf("permanent refs after blocked reupload = %d, want 1", rc)
 	}
-	assertNoUploadReferrers(t, repoID, "/", "seed.txt")
+	assertHasTTLBoundUploadReferrer(t, repoID, "/", "seed.txt")
 
 	orphanInfo, found, err := database.GetBlockS3OrphanInfo(orgID, blockID)
 	if err != nil {
