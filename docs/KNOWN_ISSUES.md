@@ -1,8 +1,15 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-07-21
+**Last Updated**: 2026-07-25
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
+
+**This file is the issue registry of record.** Every open finding from an audit
+or readiness review gets an `ISSUE-*` id here, and the audit document links to
+that id instead of restating the finding. Audit documents keep the reasoning,
+severity rationale and evidence; this file keeps the identity and the current
+status. If the two disagree, this file is right about status and the audit doc
+is right about why.
 
 ---
 
@@ -11,6 +18,9 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 ### 🔴 Production Blockers (Must Fix Before Deploy)
 | Issue | Status | See |
 |-------|--------|-----|
+| **Share-link password bypass** | 🔴 **Open — go/no-go blocker (2026-07-24)** | Password-protected share links serve file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. Single-node reachable. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | No rate or concurrency limit on the seafhttp upload, download and block routes. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (= B4 = X10). |
+| **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`), and `LOCAL_QUORUM` references can be invisible across RF-1 DCs (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`). Keep destructive GC disabled until both close. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
@@ -4851,8 +4861,429 @@ whose zero value is the permissive answer. A new probe that bypasses
 
 ---
 
+### ISSUE-SHARELINK-PASSWORD-BYPASS-01: Password-protected share links serve content to anonymous callers
+
+**Status**: 🔴 Open — go/no-go security blocker (filed 2026-07-24, re-verified against code 2026-07-25)
+**Severity**: High — authentication-control bypass with content disclosure; single-node reachable, no hash or credential needed beyond the public link token
+**Affected**: `GET /api/v2.1/share-links/:token/bootstrap[/]` and `GET /api/v2.1/share-links/:token/files/bootstrap[/]`
+**Source of record**: NF-1 / SH-6 in `docs/PROD-SECURITY-READINESS-20260724.md`
+
+#### Problem
+
+Both public bootstrap endpoints build their payload through
+`emitShareFileBootstrap` → `buildShareFileBootstrapResponse`
+(`internal/api/v2/sharelink_view.go`), and **neither handler checks the link
+password first**. `GetShareLinkBootstrap` and `GetShareLinkFileBootstrap` verify
+only that the link resolves and is neither expired nor disabled.
+
+Two distinct disclosures follow from that one missing gate:
+
+1. **Inline text/markdown content.** For a `sharedFileViewText` or
+   `sharedFileViewMarkdown` bundle, `buildShareFileBootstrapResponse` calls
+   `readFileContentAsText` (1 MB ceiling) and
+   `buildSharedFileBundleBootstrap` puts the result in `pageOptions.fileContent`
+   unconditionally. The same payload also sets `needPassword: true`, so the
+   server tells the client to prompt for a password **while shipping the bytes
+   the password protects**. The password prompt is decorative; the content is
+   already in the JSON body.
+
+2. **OnlyOffice download token** — *not recorded in the original report, found
+   during the 2026-07-25 code validation*. When `onlyoffice.enabled` is true and
+   the shared file is OnlyOffice-viewable (`doc/docx/odt/xls/xlsx/ods/ppt/pptx/odp`
+   and friends), `buildShareFileBootstrapResponse` takes the OnlyOffice branch
+   **before** the text branch and calls `buildOnlyOfficeShareBootstrap`, which
+   mints a real `CreateLinkDownloadToken` and embeds the resulting download URL in
+   the response. An anonymous caller therefore receives a working download
+   credential for a password-protected office document. This path has no 1 MB
+   ceiling and is not limited to text, so it is broader than (1); it is narrower
+   only in requiring OnlyOffice to be configured with a JWT secret.
+
+The raw/download surface is **correctly gated** — `handleShareLinkRawOrDownload`
+answers 403 `Password required` before serving — which is why the gap survived:
+the obvious exploit path is closed and the bootstrap JSON was assumed to be
+metadata.
+
+`buildSharedDirPageBootstrap` (directory links) is a lesser case: it computes
+`passwordVerified` and does not embed file content, and the dirent listing
+endpoints (`ListShareLinkDirents` and the download/raw/zip paths) each verify the
+password. Directory links leak only link metadata (library name, sharer name).
+
+#### Fix Direction
+
+Gate the content read, not just the response. In
+`buildShareFileBootstrapResponse`, verify
+`sl.passwordHash == "" || h.verifyShareLinkPasswordCookie(c, sl.token, sl.passwordHash)`
+**before** the OnlyOffice branch, and on failure return a bundle whose
+`needPassword` is true and whose `fileContent` is empty and whose OnlyOffice
+config is absent. Putting the check inside the builder rather than in the two
+handlers is what makes it hold: the two endpoints already share this builder, so
+one gate covers both, and a third caller cannot forget it.
+
+Regression coverage must assert the **body**, not the status: a 200 whose
+`pageOptions.fileContent` is empty and that carries no `onlyOfficeConfig` is the
+contract. Cover both endpoints and both branches (text/markdown and an
+OnlyOffice-viewable extension with OnlyOffice enabled) — a test that only drives
+`.md` will not see the download-token leak.
+
+#### Related Docs
+
+- `docs/PROD-SECURITY-READINESS-20260724.md` (NF-1 / SH-6, checklist item 0)
+- `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` (same file, adjacent share-link enforcement gap)
+
+---
+
+### ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01: Download cap and `single_use` are race-bypassable
+
+**Status**: 🟡 Open — accepted-as-best-effort until fixed, but the docs must stop calling it enforced
+**Severity**: Medium
+**Affected**: `handleShareLinkDownload` in `internal/api/v2/sharelink_view.go`
+**Source of record**: NF-2 in `docs/PROD-SECURITY-READINESS-20260724.md`
+
+#### Problem
+
+`max_downloads` and `single_use` are checked against a counter whose update is
+fire-and-forget: after the download token is minted, the handler spawns
+`go func()` that either deletes the consumed single-use link or increments
+`download_count`. The check has already passed by then, so N concurrent requests
+all observe the pre-increment count. A cap of 1 admits N downloads and a
+single-use link can be consumed repeatedly.
+
+This contradicts the "expiry, caps, scopes — verified good" framing that appears
+in the readiness summary and in older share-link documentation. The tokens,
+constant-time password compare and scope re-checks are sound; the **counting** is
+not.
+
+#### Fix Direction
+
+The cap is a mutual-exclusion problem, not a counting problem. Either make the
+consume-and-check a conditional update (LWT on the link row, admitting only the
+writer that applied), or accept it explicitly as best-effort and say so in the
+UI and the API docs. Do not fix it by making the goroutine synchronous — that
+narrows the window without closing it.
+
+#### Related Docs
+
+- `docs/PROD-SECURITY-READINESS-20260724.md` (NF-2, §4 correction)
+
+---
+
+### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: No rate or concurrency limit on the seafhttp upload/download/block surfaces
+
+**Status**: 🔴 Open — production blocker (B4)
+**Severity**: High — abuse/DoS control gap on the highest-cost endpoints
+**Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
+**Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`
+
+#### Problem
+
+This issue is the single record for what was previously filed twice: B4 in the
+readiness report and X10 in the upload-fence registry are the **same defect**
+seen from two audits. Both say the seafhttp write/read surfaces carry no abuse
+control.
+
+Verified state of the router (2026-07-25):
+
+| Surface | Limiter |
+|---|---|
+| `/seafhttp/upload-api/:token` | **none** |
+| `/seafhttp/files/:token/*filepath` | **none** |
+| `/seafhttp/repo/:repo_id/block/:block_id` (PUT/GET) | **none** — group carries only `authMiddleware` |
+| `/seafhttp/repo/:repo_id/check-blocks` | **none** |
+| `/seafhttp/zip/:token` | optional `zipRL`, passed in at registration |
+| `/api/v2/blocks/check` | per-IP limiter, 60 req/min burst 120 |
+| `/api/v2/blocks/upload` | per-user concurrency limiter (`MaxConcurrentBlockUploadsPerUser`, default 8) |
+| `/api/v2.1/share-links/*`, `/api/v2.1/upload-links/*`, `/d/:token` | per-IP `slRL` |
+
+So the original B4 wording — "no dedicated rate limit on upload / download /
+blocks / share-link paths" — is **partly stale**: the share-link and web-block
+paths do have limiters. The accurate residual gap is the seafhttp group, which
+is exactly X10's point, plus the asymmetry that the web block path is protected
+and the desktop-sync block path serving the same storage is not.
+
+X10 adds the interaction with PR-10's body caps: bounding one `PutBlock` to
+~257 MiB is not an aggregate bound while N concurrent uploads are unbounded, and
+the body is still fully buffered by `io.ReadAll` before hashing. Pre-sizing the
+read buffer from `Content-Length` is **not** the fix — that value is
+attacker-controlled, so an empty body would allocate the full cap.
+
+#### Fix Direction
+
+Per-user concurrency on the seafhttp block group (mirroring
+`blockUploadConcurrencyLimiter`) and a per-IP limiter on the anonymous
+upload-link write path. Independently, revisit the 257 MiB cap: it derives from
+the 256 MiB adaptive-chunk ceiling of the *web* path, while the desktop client
+this route serves sends CDC blocks of ≤8 MiB — roughly 32× its real traffic
+profile. Streaming the block to storage instead of buffering it removes the
+memory question entirely and is the better long-term shape.
+
+#### Related Docs
+
+- `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X10 — same defect, upload-fence view)
+- `docs/PROD-SECURITY-READINESS-20260724.md` (B4, SEC-2, SH-1, checklist item 3)
+- `docs/SECURITY-ASSESSMENT-2026-04.md` (H-5 — the original 2026-04 filing)
+
+---
+
+### ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01: Desktop-client SSO pending-token store is in-memory
+
+**Status**: 🔴 Open — multi-instance blocker (B5)
+**Severity**: High for any multi-instance rollout; **no single-node impact**
+**Affected**: `clientSSOStore` in `internal/api/server.go`; the desktop SSO poll and OIDC callback routes
+**Source of record**: B5 in `docs/PROD-SECURITY-READINESS-20260724.md`
+
+#### Problem
+
+`clientSSOStore` is a per-process `map[string]*clientSSOEntry` behind a mutex.
+The OIDC callback writes the successful `apiToken` into that map on whichever
+instance served the callback; the desktop client polls for the token on
+whichever instance the load balancer picks. When those differ, the poll returns
+`status: waiting` forever and the client never receives its token.
+
+Live-confirmed 2026-07-24 on the two-instance multiregion stack: a full OIDC
+flow (mock IdP, RS256 signature + nonce + issuer all validated) completed its
+callback on `usa`; polling `usa` returned `status:success` with the token, and
+polling `eu` returned `status:waiting`. "SSO works in the desktop client" only
+exercises the same-instance happy path.
+
+Distinct from `ISSUE-SSO-01`, which was about the browser confirmation page UX
+and is fixed. This one is about where the pending token lives.
+
+#### Fix Direction
+
+Move the pending-token store to Cassandra with the same TTL the in-memory
+cleanup loop applies, mirroring how upload tokens were already made multi-node
+safe. Sticky routing at the LB is a workaround for B1 that also happens to hide
+this, but it is not a fix: the token is short-lived and the poll is a separate
+connection, so any rebalance during the flow reopens it.
+
+#### Related Docs
+
+- `docs/PROD-SECURITY-READINESS-20260724.md` (B5, checklist item 1)
+- `docs/OIDC.md` (self-documents the gap)
+- `ISSUE-UPLOAD-CHUNK-MULTINODE-01` (the other node-local-state blocker; same deploy precondition)
+
+---
+
+### ISSUE-AUTOLOGIN-COOKIE-INSECURE-01: `handleAutoLogin` hardcodes `Secure=false` on the session cookie
+
+**Status**: 🟡 Open
+**Severity**: Low–Medium — depends on whether `/client-login` is reachable in production
+**Affected**: `handleAutoLogin` in `internal/api/server.go`; routes `GET /client-login[/]`
+**Source of record**: NF-4 in `docs/PROD-SECURITY-READINESS-20260724.md`
+
+#### Problem
+
+`handleAutoLogin` sets the `sesamefs_auth` cookie with `secure` hardcoded to
+`false` (commented "false for localhost"), while the OIDC callback path derives
+it from `c.Request.TLS`. Behind external TLS termination the auto-login cookie
+therefore ships without the `Secure` attribute and can be sent over a plaintext
+downgrade.
+
+The two paths are inconsistent in the other direction too, which is worth fixing
+together: auto-login sets `httpOnly=true`, the callback sets `httpOnly=false`
+(see `ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01`). Neither path is the intended
+contract; they are two independent guesses at the same cookie.
+
+#### Fix Direction
+
+One helper that sets `sesamefs_auth` for every path, deriving `Secure` from
+`Request.TLS` or a trusted forwarded-proto, with a single decision on
+`httpOnly`. Confirm whether `/client-login` is exposed in production at all — if
+it is a dev-only affordance it should be gated behind `auth.dev_mode` rather
+than hardened.
+
+#### Related Docs
+
+- `docs/PROD-SECURITY-READINESS-20260724.md` (NF-4, checklist item 6)
+
+---
+
+### ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01: `sesamefs_auth` is a replayable bearer token in a JS-readable cookie
+
+**Status**: 🟡 Open — "by design" (seahub compatibility), flagged for reassessment
+**Severity**: High — an XSS yields full session-token theft, not merely a read surface
+**Affected**: `internal/api/server.go` — the OIDC callback cookie write and the auth resolution order
+**Source of record**: SEC-3 / NF-3 in `docs/PROD-SECURITY-READINESS-20260724.md`
+
+#### Problem
+
+The OIDC callback sets `sesamefs_auth` with `httpOnly=false` to match the seahub
+convention. That cookie's value is not a display artifact: the auth middleware
+accepts it as a credential (it sits in the resolution order between dev tokens
+and the `Authorization` header), so it is a live, replayable session/API bearer.
+Sync-client sessions can carry a TTL up to 180 days.
+
+Consequence: any XSS anywhere on the origin reads `document.cookie` and walks
+away with a long-lived credential. The original SEC-3 rating of Medium
+understated this by treating the cookie as an information leak rather than as
+the credential it is.
+
+#### Fix Direction
+
+Either stop accepting the cookie as a credential (make it a non-authoritative
+hint and require the `Authorization` header), or set `httpOnly=true` and give
+the frontend whatever non-secret signal it actually needs. Establish first what
+reads it client-side — if nothing does, this is a one-line change.
+
+#### Related Docs
+
+- `docs/PROD-SECURITY-READINESS-20260724.md` (SEC-3, NF-3, checklist item 6)
+- `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01` (the same cookie, set inconsistently elsewhere)
+
+---
+
+### ISSUE-AUDIT-TRAIL-INCOMPLETE-01: `audit_log` records deletions but not grants
+
+**Status**: 🟡 Open — compliance gap under IOCD
+**Severity**: Low–Medium (compliance/forensics, not correctness)
+**Affected**: `audit_log` writers across `internal/api/v2`; table defined in `internal/db/migrations/001_initial_schema.cql`
+**Source of record**: NF-6 in `docs/PROD-SECURITY-READINESS-20260724.md`; compounds RB-3
+
+#### Problem
+
+An `audit_log` table exists and is written by exactly six sites, verified
+2026-07-25:
+
+| Writer | Action logged |
+|---|---|
+| `admin.go` | `organization.update` |
+| `admin_extra.go` | `delete_address_book_group` |
+| `admin_groups.go` | `delete_group` |
+| `groups.go` | `delete_group` |
+| `departments.go` | `delete_department` |
+| `internal/gc/store_cassandra.go` | GC cascade actions |
+
+Nothing writes an entry for share-link creation, group-member **adds**,
+permission grants, role changes, or logins. The trail is therefore one-sided:
+it can show that access was removed but never that it was granted, which under
+IOCD is arguably worse than no trail, because it looks complete.
+
+The original NF-6 wording said "delete-only"; `organization.update` is the one
+non-delete writer, so the precise statement is "deletes plus one org-update
+path".
+
+#### Fix Direction
+
+Decide the event set first (grant, revoke, share create/delete, membership
+add/remove, role change, login), then write them through one helper rather than
+six inline `INSERT`s — the current copies already drift in their `details`
+shape and in whether the error is checked. Pairs with RB-3
+(`permission_audit_logs`) rather than being separate work.
+
+#### Related Docs
+
+- `docs/PROD-SECURITY-READINESS-20260724.md` (NF-6, RB-3, checklist item 5)
+- `docs/ADMIN-FEATURES.md`
+
+---
+
+### ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01: Both chunked-upload size guards can be disabled together
+
+**Status**: 🟡 Open — latent in shipped configs, no config invariant prevents it
+**Severity**: Low (config), but the failure mode is an unbounded node-local `Truncate`
+**Affected**: `internal/config/config.go` validation; `chunked_staging_max_bytes` and `server.max_upload_mb`
+**Source of record**: NF-7 in `docs/PROD-SECURITY-READINESS-20260724.md`; overlaps UP-4
+
+#### Problem
+
+`max_upload_mb: 0` is documented as "unlimited" and
+`chunked_staging_max_bytes: 0` is documented as "guard disabled". Set both and
+the first chunk of a chunked upload performs `Truncate(attacker_declared_total)`
+against node-local `/tmp` with nothing bounding it. `Validate()` rejects a
+*negative* `chunked_staging_max_bytes` but has no invariant against the
+both-zero combination.
+
+Two facts sharpen this beyond the original NF-7 note (verified 2026-07-25):
+
+1. **Every shipped config sets `chunked_staging_max_bytes: 0`** — including
+   `config.prod.yaml`. So the staging guard is off by default everywhere, and
+   UP-4's "operator must set a real per-node value" is not an omission in one
+   file, it is the shipped default in all of them.
+2. The only thing standing between that and an unbounded truncate is
+   `max_upload_mb`, which prod sets to `102400` (100 GiB). That is a bound, but
+   a single chunked upload may still reserve 100 GiB of `/tmp` on one node.
+
+#### Fix Direction
+
+Add a `Validate()` invariant rejecting `max_upload_mb == 0 && chunked_staging_max_bytes == 0`,
+and give `chunked_staging_max_bytes` a non-zero default sized to a plausible node
+rather than shipping the guard off. Both are cheap; the second is what actually
+changes the deployed posture.
+
+#### Related Docs
+
+- `docs/PROD-SECURITY-READINESS-20260724.md` (NF-7, UP-4, UP-6, checklist item 4)
+
+---
+
+### ISSUE-ORG-SCOPE-CHECK-PER-HANDLER-01: Cross-tenant authorization is copy-pasted, not middleware
+
+**Status**: 🟡 Open — latent; no current gap, verified and live-tested
+**Severity**: Low today, High the day someone forgets it
+**Affected**: the `/org/:org_id/admin` route group; `requireOrgAccess` call sites in `internal/api/v2`
+**Source of record**: NF-5 / RB-6 in `docs/PROD-SECURITY-READINESS-20260724.md`
+
+#### Problem
+
+The `/org/:org_id/admin` group's middleware checks the caller's JWT org *role*,
+not that the `:org_id` in the path equals the caller's own org. The actual
+cross-tenant gate is `requireOrgAccess`, called individually inside roughly 50
+handlers. An audit of every admin route registration found **no handler missing
+it** and live testing confirmed a tenant admin gets 403 on other orgs' admin
+routes — so this is not an open hole. It is a structural fragility: the safety
+property depends on every future handler author remembering one call, and the
+failure mode is a silent cross-tenant BOLA that no test would catch unless it
+specifically targets the new handler.
+
+#### Fix Direction
+
+Hoist the `:org_id` == caller-org check into the sub-group middleware and leave
+`requireOrgAccess` in place as defense in depth. The migration is mechanical and
+turns "every author must remember" into "an author must actively opt out".
+
+#### Related Docs
+
+- `docs/PROD-SECURITY-READINESS-20260724.md` (NF-5, RB-6, checklist item 6)
+
+---
+
+### ISSUE-SYNC-UNBOUNDED-BODIES-01: Four sync handlers still read the request body unbounded
+
+**Status**: 🟡 Open — PR-10 closed the two block routes, not the class
+**Severity**: Medium — authenticated memory-pressure DoS
+**Affected**: `PutCommit`, `PackFS`, `RecvFS`, `CheckFS` in `internal/api/sync.go`
+**Source of record**: **X9** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`
+
+#### Problem
+
+PR-10 (#146) bounded `PutBlock` and `check-blocks` behind the shared
+`readLimitedRequestBody` helper, closing F12. Four sibling handlers on the same
+`SyncHandler` keep the identical unbounded `io.ReadAll(c.Request.Body)` — verified
+present 2026-07-25. F12 was scoped to the two block routes, so an authenticated
+client can drive the same memory-pressure DoS through any of the four.
+
+This entry exists because X9 previously named an issue ID that had never been
+created, leaving the registry with a dangling reference.
+
+#### Fix Direction
+
+Each handler needs a cap derived from its own payload profile — a commit object,
+a packed FS batch, a received FS batch and an FS existence query have nothing in
+common, so a single shared constant would be wrong. Once each cap is chosen the
+change is one line per handler through `readLimitedRequestBody`. Note the same
+caveat as X10/X11: a per-request cap bounds one request, not the aggregate, and
+does not bound the work an accepted request triggers downstream.
+
+#### Related Docs
+
+- `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X9, and X10/X11 for what a cap is not)
+- `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-10 scope)
+
+---
+
 ## See Also
 
+- [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md) - **Start here**: one-screen list of everything open, with the doc-layer rules
 - [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) - Component completion status
 - [API-REFERENCE.md](API-REFERENCE.md) - API endpoint documentation
 - [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md) - Architectural issues
