@@ -1,16 +1,36 @@
 # Upload-Fence / Canonical-Storage Work — PR Split Plan
 
-**Date:** 2026-07-21
+**Date:** 2026-07-21 · **Last updated:** 2026-07-25
 **Research branch:** `docs/gc-upload-fence-rematerialization` — **not for merge**
-**Status:** PR-1 merged as [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
-PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138) (closed F2/X7).
-PR-3 merged as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), closing F6,
-F14 and the **observed-fence half** of F1. PR-4 merged as
-[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4 and F7. PR-5 merged
-as [#141](https://github.com/Sesame-Disk/sesamefs/pull/141), closing F1 and F3. PR-6 merged
-as [#142](https://github.com/Sesame-Disk/sesamefs/pull/142), closing F5 and F13. PR-7 is
-implemented on `feat/legacy-block-upload-governance` and pending review, closing F8.
-X1/X2 remain open and keep destructive GC disabled.
+
+**Status: PR-1 through PR-10 have all merged. The code series is complete and
+every F finding is closed.** The table below is **authoritative for PR merge
+progress only**. Live defect status lives in
+[KNOWN_ISSUES.md](./KNOWN_ISSUES.md); this plan does not compete as a second
+status tracker.
+
+| PR | Merged as | Closes |
+|----|-----------|--------|
+| PR-1 | [#137](https://github.com/Sesame-Disk/sesamefs/pull/137) | docs only (registry + this plan) |
+| PR-2 | [#138](https://github.com/Sesame-Disk/sesamefs/pull/138) | F2, X7 |
+| PR-3 | [#139](https://github.com/Sesame-Disk/sesamefs/pull/139) | F6, F14, observed-fence half of F1 |
+| PR-4 | [#140](https://github.com/Sesame-Disk/sesamefs/pull/140) | F4, F7 |
+| PR-5 | [#141](https://github.com/Sesame-Disk/sesamefs/pull/141) | F1, F3 |
+| PR-6 | [#142](https://github.com/Sesame-Disk/sesamefs/pull/142) | F5, F13 |
+| PR-7 | [#143](https://github.com/Sesame-Disk/sesamefs/pull/143) | F8 |
+| PR-8 | [#144](https://github.com/Sesame-Disk/sesamefs/pull/144) | F9, F10 |
+| PR-9 | [#145](https://github.com/Sesame-Disk/sesamefs/pull/145) | F11 |
+| PR-10 | [#146](https://github.com/Sesame-Disk/sesamefs/pull/146) | F12 |
+| PR-11 | **deferred** | X4 — do not start before measuring |
+
+**What is left:** the X list in
+[UPLOAD-FENCE-FINDINGS-REGISTRY.md](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) —
+items this series never scoped, deferred, or knowingly accepted.
+**X1/X2 remain open and keep destructive GC disabled fleet-wide.**
+
+Per-PR sections below are kept as the design and verification record of what
+landed. They are history, not a plan; the PR merge table above is authoritative
+for *which PR merged*, not for whether an X/ISSUE row is still open.
 
 ## Why this document exists
 
@@ -429,7 +449,7 @@ web client. Splitting them would ship a user-visible upload failure for one rele
 **Acceptance:** the deterministic fast-clear regression (real GC worker paused at its
 post-claim liveness read) fails before this PR and passes after.
 
-**Current implementation (pending review):** every materialization wrapper now runs
+**Implementation as merged (#141):** every materialization wrapper now runs
 `store -> materialize -> canonical store confirmation`. The confirmation executes
 after the provisional reference is durable and repairs bytes when a complete GC cycle
 deleted them and cleared its fence before materialization could observe it. The web
@@ -513,7 +533,7 @@ well-formed listing with no match. The HTTP layer must still map that sentinel t
 Successive audits found corrupt shapes hand-written cases missed, so generated input
 also covers unsafe names and invalid mode variants.
 
-**Current implementation (pending review):** `parseValidatedDirEntries` in
+**Implementation as merged (#142):** `parseValidatedDirEntries` in
 `internal/api/seafhttp.go` validates a listing by walking each entry's JSON tokens
 instead of unmarshalling into a map, so a repeated `id` or `name` key is rejected
 rather than silently resolved to its last value. Validation is **all-or-nothing**:

@@ -1,20 +1,27 @@
 # Upload-Fence Audit — Findings Registry
 
-**Date:** 2026-07-21
+**Date:** 2026-07-21 · **Last updated:** 2026-07-25
 **Origin:** eight successive audits of the GC upload-fence work, 2026-07-20/21.
 **Companion:** [GC-UPLOAD-FENCE-PR-PLAN.md](./GC-UPLOAD-FENCE-PR-PLAN.md) — which PR closes what.
-**Series progress:** PR-1 merged as [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
-PR-2 merged as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138), closing F2 and
-X7. PR-3 merged as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), closing
-F6, F14 and the observed-fence half of F1. PR-4 merged as
-[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4/F7. PR-5 merged as
-[#141](https://github.com/Sesame-Disk/sesamefs/pull/141), closing F1 and F3. PR-6 merged as
-[#142](https://github.com/Sesame-Disk/sesamefs/pull/142), closing F5 and F13. PR-7 merged as
-[#143](https://github.com/Sesame-Disk/sesamefs/pull/143), closing F8. PR-8 merged as
-[#144](https://github.com/Sesame-Disk/sesamefs/pull/144), closing F9 and F10. PR-9 merged
-as [#145](https://github.com/Sesame-Disk/sesamefs/pull/145), closing F11. PR-10 is
-implemented on `fix/sync-unbounded-request-bodies` and pending review; F12 remains open
-on `main` until it merges. X1/X2 remain open.
+**Index:** [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — scoped open-work screen + migration table (not the entire backlog).
+**Status of record:** [KNOWN_ISSUES.md](./KNOWN_ISSUES.md). This file owns reasoning and evidence; Open/Closed tables below are a **dated snapshot of the upload-fence series**, not a second live status tracker. When status changes, update `KNOWN_ISSUES.md` and add a dated note here if needed.
+**Series progress: the code series is complete.** PR-1 merged as
+[#137](https://github.com/Sesame-Disk/sesamefs/pull/137);
+PR-2 as [#138](https://github.com/Sesame-Disk/sesamefs/pull/138), closing F2 and
+X7. PR-3 as [#139](https://github.com/Sesame-Disk/sesamefs/pull/139), closing
+F6, F14 and the observed-fence half of F1. PR-4 as
+[#140](https://github.com/Sesame-Disk/sesamefs/pull/140), closing F4/F7. PR-5 as
+[#141](https://github.com/Sesame-Disk/sesamefs/pull/141), closing F1 and F3. PR-6 as
+[#142](https://github.com/Sesame-Disk/sesamefs/pull/142), closing F5 and F13. PR-7 as
+[#143](https://github.com/Sesame-Disk/sesamefs/pull/143), closing F8. PR-8 as
+[#144](https://github.com/Sesame-Disk/sesamefs/pull/144), closing F9 and F10. PR-9 as
+[#145](https://github.com/Sesame-Disk/sesamefs/pull/145), closing F11. PR-10 as
+[#146](https://github.com/Sesame-Disk/sesamefs/pull/146), closing F12.
+
+**Every F row is now closed.** What remains is the X list — items the series
+never scoped, deferred, or knowingly accepted. PR-11 (remove the per-block Paxos,
+X4) is deferred pending a production latency measurement. **X1/X2 remain open and
+destructive GC stays disabled fleet-wide.**
 
 Every row is verified against code at the cited location, except where the row
 explicitly identifies engine-dependent behavior that still needs a non-skipping
@@ -38,17 +45,36 @@ them at High preserves the meaning of the Blocker list — the things that can b
 correct, healthy cluster. Both were explicitly considered for Blocker and are called
 out here so the decision is visible rather than implicit.
 
+**This scale measures data correctness, not availability** (added 2026-07-25).
+Every level above is phrased in terms of losing, corrupting or misrepresenting
+bytes, because that is what the upload-fence series was auditing. Abuse and
+resource-exhaustion findings — X10 (no concurrency bound on the block routes) and
+X11 (work amplification) — have no natural slot on it: they never serve a wrong
+byte, so a literal reading of *this* scale alone would file them at Medium
+regardless of damage.
+
+**X10 canonical severity is High for its own impact**, not by inheritance from
+B4: authenticated `PutBlock` still fully buffers up to ~257 MiB, the route group
+has no concurrency bound (unlike the web path's `blockUploadConcurrencyLimiter`),
+and N concurrent uploads cost N × the cap — a memory/DoS availability defect on
+the highest-cost sync write surface. The umbrella
+`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` is also High because it covers additional
+anonymous upload and download surfaces (subcontracts A/D); X10 is only
+subcontract B. Read availability severities from `KNOWN_ISSUES.md`; do not
+re-derive them from the upload-fence correctness wording above.
+
 ---
 
 ## Open on `main`
 
-F12 has an implementation on `fix/sync-unbounded-request-bodies` but stays open until
-PR-10 merges.
+**None — every F row has merged.** The remaining work is in
+**## Open, deferred, or constraining the series** below, which is the X list.
 
-| # | Severity | Finding | Evidence | Closed by |
-|---|---|---|---|---|
-| F12 | Medium | **Unbounded request bodies.** `PutBlock` and `check-blocks` read the whole body with `io.ReadAll` and no size or id-count limit. **PR-10 adds a shared `readLimitedRequestBody` helper that swaps the body for an `http.MaxBytesReader` and answers 413 on overflow; `PutBlock` also fast-rejects an oversized declared `ContentLength` before reading, capped just above the 256 MiB adaptive-chunk ceiling; `check-blocks` bounds both the raw body and the number of ids, rejecting an oversized id list *during* the parse rather than after it.** The paired `PutCommit`, `PackFS`, `RecvFS` and `CheckFS` sync handlers share the same unbounded read and are tracked separately as X9 — F12 closes, the class does not. | `sync.go` | PR-10 |
-| F13 | High | **Corrupt directory listings resolve, and unproven absence can become 404.** High because corrupt entries can serve bytes from the wrong FS object; the HTTP-classification half alone is lower severity. A missing referenced row is dangling metadata, and even a valid local listing without an entry may be an older `LOCAL_QUORUM` cross-DC snapshot, so neither proves global absence. Related, and worse: a JSON-valid but corrupt listing resolves anyway. Structural cases (`null`, `[null]`, non-string name, missing id/mode) are skipped or misclassified; unsafe names can create traversal entries in ZIPs; semantic cases (empty or non-40-hex id, duplicate names/keys, invalid mode) can resolve the wrong object. `encoding/json` silently keeps the **last** repeated key, so `{"id":"A","id":"B"}` serves B and `{"name":"a","name":"b"}` hides `a` entirely. | `seafhttp.go` directory lookup and ZIP preflight | PR-6 |
+This section previously held F12, closed by PR-10 ([#146](https://github.com/Sesame-Disk/sesamefs/pull/146)),
+and a stale duplicate of F13, which PR-6 had already closed and moved to
+**## Closed** — the row was left behind in both tables at once. A finding lives
+in exactly one table; carrying it in two is how a registry starts contradicting
+itself.
 
 ## Closed
 
@@ -69,7 +95,8 @@ Rows move here only once the PR that fixes them **merges**.
 | F8 | Medium | Legacy no-session upload leaked S3 objects (R2): `/api/v2/blocks/upload` without a session wrote an object with no `blocks` row and no reference. PR-7 removed the path outright — both `/blocks/upload` and its paired `/blocks/check` oracle answer 400 `block_upload_session_required` before any store I/O, and the frontend throws instead of silently dropping the session header. | PR-7 ([#143](https://github.com/Sesame-Disk/sesamefs/pull/143)) |
 | F9 | Medium | GC Phase 0 could delete a provisional reference a live upload had just renewed. PR-8 makes the `up:` reference and canonical tracker retire only through their derived Cassandra TTL; Phase 0 never mutates them, checks the exact reference before resolving liveness, defers a still-present row (holding the day cursor), and sweeps only resolved projections. | PR-8 ([#144](https://github.com/Sesame-Disk/sesamefs/pull/144)) |
 | F10 | Medium | Provisional reference and its expiry were written separately, so a failure between them left an undiscoverable reference. PR-8 writes the TTL-bound reference, longer-lived tracker and durable by-day projection in one logged batch and removes eager provisional release entirely, so every failure is retryable and there is no provisional-row LWT/CAS. | PR-8 ([#144](https://github.com/Sesame-Disk/sesamefs/pull/144)) |
-| F11 | Medium | Abandoned streaming prefetch leaked an open S3 reader. PR-9 makes `streamOneBlock` close the streamed block's reader via defer (panic-safe) and `StreamBlocks` cancel a child prefetch context and drain/close the block prefetched one ahead on every exit; the next block is prefetched only when the current one succeeds, and `PrefetchBlock` skips the fetch when its context is already canceled. | PR-9 ([#145](https://github.com/Sesame-Disk/sesamefs/pull/145)) |
+| F11 | Medium | Abandoned streaming prefetch leaked an open S3 reader. PR-9 makes `streamOneBlock` close the streamed block's reader via defer (panic-safe) and `StreamBlocks` cancel a child prefetch context and drain/close the block prefetched one ahead on every exit; the next block is prefetched only when the current one succeeds, and `PrefetchBlock` skips the fetch when its context is already canceled. **Note:** PR-9 deliberately did not change `StreamBlocks`' void return, so the separate false-success/over-billing defect (`ISSUE-STREAMBLOCKS-VOID-01`, DL-1 in the readiness report) is still open in the same function. | PR-9 ([#145](https://github.com/Sesame-Disk/sesamefs/pull/145)) |
+| F12 | Medium | Unbounded request bodies on `PutBlock` and `check-blocks`. PR-10 adds the shared `readLimitedRequestBody` helper (swaps the body for an `http.MaxBytesReader`, answers 413 on overflow); `PutBlock` fast-rejects an oversized declared `ContentLength` before reading, capped just above the 256 MiB adaptive-chunk ceiling; `check-blocks` bounds the raw body and rejects an oversized id list **during** the parse rather than after it. `GetLockedFiles` was folded onto the same helper. **F12 closes; the class does not** — the four sibling sync handlers are X9, and what a per-request cap cannot do is X10/X11. | PR-10 ([#146](https://github.com/Sesame-Disk/sesamefs/pull/146)) |
 
 ## Open, deferred, or constraining the series
 
@@ -96,12 +123,12 @@ retirement and keep their existing cleanup/idempotency behavior.
 | X2 | Blocker (multi-DC) | **Cross-DC reference visibility.** `block_references` are ordinary `LOCAL_QUORUM` writes that `SERIAL` does not cover. With RF 1 per DC the write and read quorums need not intersect, so GC in one DC can read zero references for a block that is live in another. The 1h grace period is mitigation, not a bound. | `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` |
 | X8 | Medium (accepted) | **Download can never report a file as gone.** The same `LOCAL_QUORUM` cross-DC reasoning that forces PR-6 to drop 404 leaves the SeafHTTP download surface with no absence answer at all: a genuinely deleted file returns 503 forever, so clients retry a request that cannot succeed, and `internal/api/v2` still answers 404 for the same missing path. Accepted in PR-6 because a wrong 404 makes a sync client delete its local copy; reintroducing 404 needs a read that proves *global* absence. | `ISSUE-DOWNLOAD-NO-404-01` |
 | X3 | Medium | **PUT precedes durable physical-object intent.** Upload paths write to S3 before recording GC-discoverable block metadata/reference or another durable row that identifies the physical object for reclamation. Session-mode staged accounting can already exist, but it does not close this discovery gap. A crash between PUT and registration leaves an object nothing can discover safely. Closing it needs durable physical-object intent before the PUT, or a safe physical sweeper. | `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` |
-| X4 | High (perf) | **One global Paxos round per block on every metadata-registering upload path.** The first-writer `INSERT ... IF NOT EXISTS` is a per-block LWT; under production `SERIAL` and multi-DC it is a global consensus round, ~128 cross-region rounds per GB at the 8 MB block size. **Correction:** an earlier revision said the legacy resumable path "does not pay this at all". That is false — `finalizeUploadStreaming` splits the file into 8 MB blocks and calls `RegisterUploadedBlock` → `UpsertBlockMetadata` per block, so resumable pays the same ~128 LWTs. The defective no-session path in F8 was the exception: it left only an S3 object and never registered metadata — but PR-7 removed that path, so every remaining upload path registers metadata. This is a **shared** cost of the governed upload paths, not a block-upload disadvantage, and removing it benefits all of them. The pre-store `ProbeBlockReuse` and post-reference `BlockDeleteFenceActive` observations are not redundant and must not be merged: their ordering is the mutual exclusion the protocol depends on. PR-5 adds a third post-materialization confirmation observation to close fast-clear; it is also required and must not be served from either earlier result. Only the LWT is removable here. **Pre-existing since `e3883aa5d` (2026-05-28)** — not introduced by this work; `13e01263a` only made it representation-aware. | P-4 in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`; PR-11 (deferred) |
-| X5 | Medium | **Canonical read fan-out unvalidated.** One Cassandra point read per unique block before the first byte. The existing benchmark substitutes an in-memory function for Cassandra, so it measures goroutines and allocations, not driver, pool, latency or cluster load. | `WEB-BLOCK-UPLOAD.md` pre-flag checklist |
-| X9 | Medium | **Unbounded request bodies on the remaining sync handlers.** `PutCommit`, `PackFS`, `RecvFS` and `CheckFS` in `sync.go` still read the whole body with an unbounded `io.ReadAll(c.Request.Body)`, the same defect PR-10 fixed for `PutBlock` and `check-blocks`. F12 was scoped to the two block routes, so PR-10 closes F12 but **not** the class: an authenticated client can drive the identical memory-pressure DoS through any of the four. Each needs a cap derived from its own payload profile; `readLimitedRequestBody` makes each a one-line change once the caps are chosen. Recorded as a row rather than a narrative note so PR-10 is not mistaken for the end of HTTP body hardening. | `ISSUE-SYNC-UNBOUNDED-BODIES-01` |
-| X10 | Medium | **The sync block routes have no concurrency or rate limit, so PR-10's per-request cap is not an aggregate bound.** PR-10 makes one `PutBlock` cost at most ~257 MiB instead of unbounded, which is what closes F12 — but the body is still fully buffered by `io.ReadAll` before hashing, and the route group at `sync.go:439` carries only `authMiddleware`. N concurrent uploads therefore still cost N × the cap. The asymmetry is explicit: the web block path already has both a per-user concurrency limiter (`blockUploadConcurrencyLimiter`, default 8) and a per-IP rate limiter on its check oracle (`blocks.go:173`, `blocks.go:179`); the seafhttp path has neither. Note the cap cannot simply pre-size the read buffer from `Content-Length` — that length is attacker-controlled and unverified, so pre-sizing would let an empty body allocate the full cap. The real fixes are a concurrency bound on the route and/or streaming the block to storage instead of buffering it. Also worth revisiting: 257 MiB is derived from the 256 MiB **adaptive-chunk ceiling**, which belongs to the web upload path — the desktop client this route serves sends CDC blocks of ≤8 MiB, so the cap is ~32× its actual traffic profile. | `sync.go:439`, `sync.go:1279` |
-| X11 | Medium | **`maxCheckBlockIDs` (100k) bounds the parser, not the work an accepted request triggers.** PR-10's cap is a memory bound on parsing and is correct as such. Downstream, an accepted list still drives one `GetBlockIDMapping` Cassandra point read **per legacy SHA-1 id, sequentially** in the `CheckBlocks` loop, then `CheckBlocksExist` at fan-out 10 — so a single accepted 100k-id request can issue ~100k serial reads while holding the handler. That is a request-amplification and latency concern, not a memory one, and the 100k figure was chosen as a safe parse bound rather than validated against Cassandra, the S3 pool, response size or client cancellation. Related to X5, which flags the same unvalidated fan-out on the canonical read path. | `sync.go` `CheckBlocks` loop; X5 |
-| X6 | Medium | **Read-after-write across DCs.** Canonical lookups retry a missing row 3×25 ms, which covers local lag but not cross-DC. Safe (fails closed) but an availability dependency: transient 404/503 after a remote upload, `check-blocks` reporting a block missing, needless re-uploads. | same as X2 |
+| X4 | High (perf) | **One global Paxos round per block on every metadata-registering upload path.** The first-writer `INSERT ... IF NOT EXISTS` is a per-block LWT; under production `SERIAL` and multi-DC it is a global consensus round, ~128 cross-region rounds per GB at the 8 MB block size. **Correction:** an earlier revision said the legacy resumable path "does not pay this at all". That is false — `finalizeUploadStreaming` splits the file into 8 MB blocks and calls `RegisterUploadedBlock` → `UpsertBlockMetadata` per block, so resumable pays the same ~128 LWTs. The defective no-session path in F8 was the exception: it left only an S3 object and never registered metadata — but PR-7 removed that path, so every remaining upload path registers metadata. This is a **shared** cost of the governed upload paths, not a block-upload disadvantage, and removing it benefits all of them. The pre-store `ProbeBlockReuse` and post-reference `BlockDeleteFenceActive` observations are not redundant and must not be merged: their ordering is the mutual exclusion the protocol depends on. PR-5 adds a third post-materialization confirmation observation to close fast-clear; it is also required and must not be served from either earlier result. Only the LWT is removable here. **Pre-existing since `e3883aa5d` (2026-05-28)** — not introduced by this work; `13e01263a` only made it representation-aware. | `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`; P-4 in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`; PR-11 (deferred) |
+| X5 | Medium | **Canonical read fan-out unvalidated.** One Cassandra point read per unique block before the first byte. The existing benchmark substitutes an in-memory function for Cassandra, so it measures goroutines and allocations, not driver, pool, latency or cluster load. | `ISSUE-CANONICAL-READ-FANOUT-01` |
+| X9 | Medium | **Unbounded request bodies on the remaining sync handlers.** `PutCommit`, `PackFS`, `RecvFS` and `CheckFS` in `sync.go` still read the whole body with an unbounded `io.ReadAll(c.Request.Body)`, the same defect PR-10 fixed for `PutBlock` and `check-blocks` — re-verified present 2026-07-25. F12 was scoped to the two block routes, so PR-10 closes F12 but **not** the class: an authenticated client can drive the identical memory-pressure DoS through any of the four. Each needs a cap derived from its own payload profile; `readLimitedRequestBody` makes each a one-line change once the caps are chosen. | `ISSUE-SYNC-UNBOUNDED-BODIES-01` (filed 2026-07-25 — this row previously named an id that had never been created) |
+| X10 | High | **The sync block routes have no concurrency or rate limit, so PR-10's per-request cap is not an aggregate bound.** PR-10 makes one `PutBlock` cost at most ~257 MiB instead of unbounded, which is what closes F12 — but the body is still fully buffered by `io.ReadAll` before hashing, and the route group carries only `authMiddleware`. N concurrent uploads therefore still cost N × the cap. The asymmetry is explicit: the web block path already has both a per-user concurrency limiter (`blockUploadConcurrencyLimiter`, default 8) and a per-IP rate limiter on its check oracle; the seafhttp path has neither. Note the cap cannot simply pre-size the read buffer from `Content-Length` — that length is attacker-controlled and unverified, so pre-sizing would let an empty body allocate the full cap. The real fixes are a concurrency bound on the route and/or streaming the block to storage instead of buffering it. Also worth revisiting: 257 MiB is derived from the 256 MiB **adaptive-chunk ceiling**, which belongs to the web upload path — the desktop client this route serves sends CDC blocks of ≤8 MiB, so the cap is ~32× its actual traffic profile. **X10 is subcontract B of readiness B4** under `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` — same umbrella, narrower surface (authenticated block PUT / aggregate memory). **Availability: High** on its own impact (`N × ~257 MiB` full-buffer + no concurrency bound); the upload-fence correctness scale does not apply. | `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` subcontract B; `sync.go` block route group, `PutBlock` |
+| X11 | Medium | **`maxCheckBlockIDs` (100k) bounds the parser, not the work an accepted request triggers.** PR-10's cap is a memory bound on parsing and is correct as such. Downstream, an accepted list still drives one `GetBlockIDMapping` Cassandra point read **per legacy SHA-1 id, sequentially** in the `CheckBlocks` loop, then `CheckBlocksExist` at fan-out 10 — so a single accepted 100k-id request can issue ~100k serial reads while holding the handler. That is a request-amplification and latency concern, not a memory one, and the 100k figure was chosen as a safe parse bound rather than validated against Cassandra, the S3 pool, response size or client cancellation. Related to X5, which flags the same unvalidated fan-out on the canonical read path. | `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01`; also subcontract C of `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` |
+| X6 | Medium | **Read-after-write across DCs.** Canonical lookups retry a missing row 3×25 ms, which covers local lag but not cross-DC. Safe (fails closed) but an availability dependency: transient 404/503 after a remote upload, `check-blocks` reporting a block missing, needless re-uploads. | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (related to X2) |
 
 ## X1 design space — closing the physical-delete ABA
 

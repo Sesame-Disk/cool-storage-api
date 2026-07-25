@@ -353,7 +353,7 @@ materialization.
 - `internal/storage/s3.go`
 - `internal/storage/s3_test.go`
 - `docs/TECHNICAL-DEBT.md`
-- `docs/UPLOAD-S3-RELAY-BOTTLENECK.md`
+- `docs/UPLOAD-PR58-RESEARCH-ARCHIVE.md`
 
 ---
 

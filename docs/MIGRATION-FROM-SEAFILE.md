@@ -653,7 +653,7 @@ storage:
 
 ## Related Documentation
 
-- [Storage Architecture](STORAGE_ARCHITECTURE.md) - Multi-region storage design
+- [Storage Multiregion Analysis](STORAGE-MULTIREGION-ANALYSIS.md) - Multi-region storage design
 - [Multi-Region Testing](MULTIREGION-TESTING.md) - Testing the multi-region setup
-- [API Roadmap](API-ROADMAP.md) - Pending API endpoints
-- [Seafile Compatibility](SEAFILE_COMPATIBILITY.md) - Protocol compatibility details
+- [Endpoint Registry](ENDPOINT-REGISTRY.md) - Implemented and pending API endpoints
+- [Seafile Sync Protocol](SEAFILE-SYNC-PROTOCOL.md) - Protocol compatibility details

@@ -56,7 +56,7 @@ checks on share links, upload links, library creation, and group creation.
 - Plan upgrades still need the formal Accounts provisioning path and runbook to avoid ad-hoc manual operations.
 
 Operational reference:
-- [ACCOUNTS-PROVISIONING-RUNBOOK.md](ACCOUNTS-PROVISIONING-RUNBOOK.md) — bootstrap and rotation procedure for the dedicated platform service account API key.
+- ⚠️ **Missing doc:** a bootstrap/rotation runbook for the dedicated platform service-account API key. `ACCOUNTS-PROVISIONING-RUNBOOK.md` was never written — tracked as [`ISSUE-ACCOUNTS-PROVISIONING-RUNBOOK-01`](./KNOWN_ISSUES.md). The admin API-key channel itself already works (Accounts can provision users/orgs today); see also [`ISSUE-ACCOUNTS-M2M-PATH-01`](./KNOWN_ISSUES.md) for remaining M2M hygiene.
 
 **Key files:**
 - `internal/plans/resolver.go` — `ResolveCapabilities()` ready to use, do not duplicate
@@ -91,8 +91,15 @@ handler files. `internal/models/` has only ~550 lines and only defines basic str
 **Reclassified from P0 to P2 (2026-04-02):**
 The code is functional and all features work correctly. The large files create operational risk
 for incident response (harder to locate and fix bugs quickly), but this is a code quality issue,
-not a functional blocker. The real remaining launch-critical gaps are Accounts M2M provisioning,
-GC destructive-delete safety (X1/X2), and the general security-hardening checklist.
+not a functional blocker. Important **pre-operational follow-ups** (not
+go/no-go blockers equivalent to readiness NF-1 / B4) include Accounts M2M
+hygiene and its runbook (`ISSUE-ACCOUNTS-M2M-PATH-01`,
+`ISSUE-ACCOUNTS-PROVISIONING-RUNBOOK-01` — the admin API-key channel itself
+already works). X1/X2 constrain **enabling destructive GC** but do not block
+deployment while `GC_ENABLED=false` remains fleet-wide. The actual
+go/no-go security blockers are tracked in `KNOWN_ISSUES.md` Production Blockers
+(share-link password bypass, seafhttp abuse-control umbrella, plus multi-instance
+chunk/SSO state).
 Reorganization should happen post-launch when stability allows for large refactors.
 
 **Proposed structure (move code, do not rewrite):**
