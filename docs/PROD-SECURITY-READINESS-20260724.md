@@ -69,7 +69,7 @@ Accepted-but-track for this release: **GC stays disabled** on every replica/DC (
 | UP-1 | Chunk-upload state node-local → multi-region blocker without sticky-by-token — **B1** | HIGH | OPEN | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | `seafhttp.go` `var chunkManager` |
 | UP-2 | 1 global Paxos LWT **per block** under multi-DC `SERIAL` (~128 cross-region rounds / 1 GB). Pre-existing, both governed upload modes pay it. Latency cost, not a blocker. **Same finding as X4 / P-4** — deferred PR-11. | HIGH (perf) | OPEN | `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4) | `UPLOAD-PERFORMANCE-SECURITY-2026-06.md` P-4 |
 | UP-3 | TOCTOU quota check across concurrent same-org uploads to different repos | MEDIUM | OPEN | `ISSUE-QUOTA-RESERVATION-01` | UPLOAD-… S-4 |
-| UP-4 | `/tmp` staging admission budget (`chunked_staging_max_bytes`) defaults to `0` = disabled. ⚠️ **Sharpened 2026-07-25:** *every* shipped config sets it to `0`, `config.prod.yaml` included, **and this field has no `.env` override** — unlike most prod settings it can only be changed by editing the YAML. | MEDIUM | GUARD ADDED, **YAML EDIT REQUIRED IN ALL PROFILES** | `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01` | `configs/*.yaml`; `config.go` `Validate()` + `os.Getenv` block |
+| UP-4 | `/tmp` staging admission budget (`chunked_staging_max_bytes`) defaults to `0` = disabled. ⚠️ **Sharpened 2026-07-25:** *every* shipped config sets it to `0`, `config.prod.yaml` included, **and this field has no `.env` override** — unlike most prod settings it can only be changed by editing the YAML. | MEDIUM | GUARD ADDED, **YAML EDIT REQUIRED IN ALL PROFILES** | `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01` | `configs/*.yaml`; `config.go` `applyEnvOverrides()` (absent) + `Validate()` |
 | UP-5 | Permission not re-checked during long chunked uploads (authorized at session start only) | MEDIUM | OPEN | `ISSUE-MID-OPERATION-REVOCATION-01` | UPLOAD-DOWNLOAD-ANALYSIS |
 | UP-6 | `max_upload_mb` now enforced on chunked uploads (413 fail-closed) — **config-dependent**, see NF-7 | MEDIUM | ✅ FIXED (with caveat) | `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01` | UPLOAD-… S-2 |
 | UP-7 | Resumable `file-uploaded-bytes` is a safe stub (`0`); true resume not wired. Safe, not a blocker. | LOW | BY DESIGN | — (accepted stub) | UPLOAD-RESUME-ANALYSIS-20260619 |
@@ -121,25 +121,41 @@ Accepted-but-track for this release: **GC stays disabled** on every replica/DC (
 ## 6. Multi-region / operational notes
 
 - **GC disabled fleet-wide** (X1 physical-delete ABA, X2 cross-DC reference visibility). Safe (no data loss) but **no space reclamation** — plan capacity accordingly. See `gc.enabled` in `configs/config.prod.yaml`.
-- **Multi-DC `SERIAL` Paxos is the production posture** (`dc-na:1, dc-eu:1, dc-asia:1`); do **not** switch block-metadata LWTs to `LOCAL_SERIAL` (diverges placement). `UPLOAD-… P-4` / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`.
-  **Where that comes from, since it has now been mis-corrected twice
-  (re-verified 2026-07-25):** production runs `configs/config.prod.yaml` **plus
-  the prod `.env`**, and the environment layer is what sets the topology —
-  `CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1`,
-  `CASSANDRA_LOCAL_DC=dc-na`, `CASSANDRA_CONSISTENCY=LOCAL_QUORUM`,
-  `CASSANDRA_SERIAL_CONSISTENCY=SERIAL` (`.env.prod.example`). `config.Validate()`
-  applies those overrides on top of the YAML, replacing `Database.ReplicationDCs`
-  outright. The `replication_dcs: {datacenter1: 1}` in `config.prod.yaml` is an
-  inert placeholder that never survives a real prod boot — the file even says so
-  in a comment naming the two override variables.
-  **So the effective prod topology is three DCs at RF 1 each**, which is exactly
-  what X2, X6 and the no-404 decision are reasoned against, and it matches the
-  independently confirmed deployment context (one region each in the Americas,
-  Asia and Europe, multi-second cross-DC latency — 2026-07-23, recorded in
-  `ISSUE-DOWNLOAD-NO-404-01`).
-  **Do not "fix" this line by reading only the YAML.** A `configs/*.yaml` value
-  is a default, not the effective configuration; the env layer is part of the
-  config and has to be read with it.
+- **Multi-DC `SERIAL` Paxos is the production posture** (`dc-na` / `dc-eu` /
+  `dc-asia`, RF 1 each); do **not** switch block-metadata LWTs to `LOCAL_SERIAL`
+  (diverges placement). `UPLOAD-… P-4` / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`.
+
+  **Three layers — do not conflate them** (this line was mis-corrected twice by
+  reading only one layer):
+
+  1. **YAML defaults** in `configs/config.prod.yaml`: `local_dc` /
+     `replication_dcs: {datacenter1: 1}` — a single-DC placeholder. The file
+     documents that env may replace these.
+  2. **Shipped prod template** `.env.prod.example` (active lines, not commented):
+     `CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1`,
+     `CASSANDRA_LOCAL_DC=dc-na`, `CASSANDRA_DC=dc-na`,
+     `CASSANDRA_CONSISTENCY=LOCAL_QUORUM`,
+     `CASSANDRA_SERIAL_CONSISTENCY=SERIAL`.
+     ⚠️ **These two DC variables are not interchangeable**, they only happen to
+     hold the same value in the template. `applyEnvOverrides()` reads **only
+     `CASSANDRA_LOCAL_DC`**; the binary never looks at `CASSANDRA_DC`, which is a
+     compose-side variable naming the Cassandra container's own DC (and, in the
+     multiregion compose files, the value `CASSANDRA_LOCAL_DC` is *derived* from).
+     Changing only `CASSANDRA_DC` on a node moves the database's DC while leaving
+     the app's `local_dc` pointing at the old one.
+  3. **Real SesameFS production** is multi-DC **NA / EU / Asia** (operator-
+     confirmed deployment posture). Operators copy `.env.prod.example` → `.env`
+     and adjust the per-node DC; the topology list stays the triple. Per the
+     warning above, set **both** DC variables together on each node.
+
+  **How the binary applies it:** `Config.Load()` parses YAML, then
+  `applyEnvOverrides()` replaces `Database.ReplicationDCs` / consistency fields
+  from the environment, then `Validate()` checks the result. `Validate()` does
+  **not** apply overrides. With a prod `.env` derived from the template, the
+  YAML `datacenter1: 1` value does not survive boot.
+  X2, X6 and the no-404 decision are reasoned against this three-DC RF-1
+  topology (also recorded in `ISSUE-DOWNLOAD-NO-404-01`).
+  **Do not "fix" topology by reading only the YAML.**
 - **No pre-serve replication validation gate** — verify `nodetool status` / keyspace RF across all DCs before cutover. `DEPLOY.md`.
 - **Sticky-by-upload-token routing** must be added at the external LB in front of nginx (B1/B5); nginx-multiregion.conf does not provide it.
 
@@ -154,7 +170,7 @@ Each item names the issue id that tracks it. Status lives in
 1. **Abuse control** (`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` = B4 umbrella; X10 is subcontract B): close all four subcontracts (anonymous seafhttp upload; authenticated block PUT concurrency; check-blocks rate/work amplification; download/GET abuse control) — **blocks go-live**. Closing only block-PUT concurrency does **not** close the umbrella.
 2. **Routing** (`ISSUE-UPLOAD-CHUNK-MULTINODE-01`, `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01`): external LB sticky sessions keyed on upload token; migrate the desktop-SSO pending-token store to Cassandra before any multi-instance rollout. *(Both live-confirmed 2026-07-24.)*
 3. **AuthZ** (`ISSUE-BLOCK-CROSS-LIBRARY-READ-01`, Medium): add library-scoped read authorization to `SyncHandler.GetBlock` — verify block↔repo membership, not just URL-repo access.
-4. **Config** (`ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01`): set `chunked_staging_max_bytes` to a real per-node value **in every profile** (all of them currently ship `0`); add a `Validate()` invariant rejecting `max_upload_mb=0` together with staging=0; confirm `CORS_ALLOWED_ORIGINS`, `SHARE_LINK_HMAC_KEY`, external TLS + HSTS.
+4. **Config** (`ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01`): set `chunked_staging_max_bytes` to a real per-node value **in every YAML profile** (all currently ship `0`); there is **no** env override for this field or for `server.max_upload_mb` today — add `SEAFHTTP_CHUNKED_STAGING_MAX_BYTES` / `SERVER_MAX_UPLOAD_MB` (or equivalent) in `applyEnvOverrides()`, plus a `Validate()` invariant rejecting `max_upload_mb=0` together with staging=0; confirm `CORS_ALLOWED_ORIGINS`, `SHARE_LINK_HMAC_KEY`, external TLS + HSTS.
 5. **Compliance** (`ISSUE-AUDIT-TRAIL-INCOMPLETE-01`, RB-3): stand up permission/login audit logging and close the one-sided trail (grants and membership adds are unlogged) before go-live under IOCD.
 6. **Harden** (`ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01`, `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01`, `ISSUE-ORG-SCOPE-CHECK-PER-HANDLER-01`): reassess the `httpOnly=false` session cookie (token-theft surface); unify the two `sesamefs_auth` cookie writers, which currently disagree on both `Secure` and `httpOnly`; hoist the org-match into `/org/:org_id/admin` middleware.
 7. **Accept + document:** GC stays off (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`); 503-not-404 on deletes (`ISSUE-DOWNLOAD-NO-404-01`); resume is a safe stub; download-cap/`single_use` are best-effort (`ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01`); Accounts M2M uses admin API key by design (`ISSUE-ACCOUNTS-M2M-REQUEST-SIGNING-01` deferred).
@@ -218,7 +234,7 @@ The whole document's remaining assertions (Sections 1–6) were re-checked again
 | DL-5 | "not re-checked per request" | **Overstated** — per-request re-auth exists; real gap is mid-stream only. |
 | DL-6 | "encrypted omit Content-Length" | **Partly stale** — main SeafHTTP path sets it; only v2 view/share surfaces omit. |
 | §5 role hierarchy | "owner(4)…" | Omits **superadmin(5)**; the cited line range was also wrong. |
-| ~~§6 multi-DC layout~~ | ~~`dc-na:1,dc-eu:1,dc-asia:1`~~ | ❌ **This "correction" was itself wrong — withdrawn 2026-07-25.** It claimed the triple was stale because `config.prod.yaml` ships `datacenter1: 1`. That reads only the YAML. Prod boots that file **with the prod `.env`**, which sets `CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1` and `CASSANDRA_LOCAL_DC=dc-na`; `config.Validate()` replaces `ReplicationDCs` from the env, so the YAML value never survives. **The original document was right.** See §6. |
+| ~~§6 multi-DC layout~~ | ~~`dc-na:1,dc-eu:1,dc-asia:1`~~ | ❌ **This "correction" was itself wrong — withdrawn 2026-07-25.** It claimed the triple was stale because `config.prod.yaml` ships `datacenter1: 1`. That reads only the YAML. The shipped prod template `.env.prod.example` sets `CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1` (and LOCAL_QUORUM/SERIAL) as **active** lines; `Config.Load()` → `applyEnvOverrides()` replaces `ReplicationDCs` before `Validate()`. Real production is multi-DC NA/EU/Asia. **The original document was right.** See §6. |
 | Secrets (§1) | HMAC key "required if empty" | Stronger — also rejects the shipped **default** value in prod. |
 | CORS / SEC-4 refs | `server.go:264–293` / "§4.3" | Ref drift — CORS fail-fast is in `config.go` `Validate()`; M2M route is `PUT …/admin/organizations/:org_id`. |
 | Verdict | Conditional-go single-region | **No-go as-is** — NF-1 and B4 are single-node blockers. |
@@ -244,19 +260,19 @@ withdrawn.** Shape changes:
 | NF-6 | **Made precise** | Six `audit_log` writers, not zero-plus-deletes: one `organization.update`, four deletes, one GC cascade. |
 | Verdict | **Corrected** | Conditional-go → **no-go as-is** (NF-1 + B4 are single-node). |
 | SEC-4 | **Reframed** | Accounts admin API-key channel already works; not an auth gap. |
-| §6 multi-DC | **A prior "correction" withdrawn** | The addendum had marked `dc-na:1,dc-eu:1,dc-asia:1` stale on the strength of `config.prod.yaml` saying `datacenter1: 1`. That was a YAML-only reading; the prod `.env` sets the triple and the env wins. **The original claim was correct** and is restored. Nothing about X2/X6/no-404 changes — they were always reasoned against the three-DC topology. |
+| §6 multi-DC | **A prior "correction" withdrawn** | The addendum had marked `dc-na:1,dc-eu:1,dc-asia:1` stale on the strength of `config.prod.yaml` saying `datacenter1: 1`. That was a YAML-only reading. `.env.prod.example` ships the triple as **active** lines; `applyEnvOverrides()` applies them before `Validate()`; real production is NA/EU/Asia. **The original claim was correct.** |
 | UP-4 / NF-7 | **Extended** | Neither `chunked_staging_max_bytes` nor `server.max_upload_mb` has an env override, so for these the YAML *is* the effective config and an operator configuring through `.env` cannot enable the guard at all. |
 
 **Citation policy.** Prefer symbol names over `file.go:NNNN`. PR-10 (#146) shifted
 `sync.go` and invalidated several line cites (e.g. `SyncHandler.GetBlock`).
 
-**Config-reading policy (added after the §6 mistake).** The effective
-configuration is `configs/*.yaml` **plus** the environment; `config.Validate()`
-lets env values replace YAML ones outright. Never call a config value stale from
-the YAML alone — check `.env.prod.example` and the `os.Getenv` block in
-`internal/config/config.go` first. Both directions bite: replication settings are
-env-driven and the YAML is a placeholder, while the upload-size guards have no
-env override at all.
+**Config-reading policy (added after the §6 mistake).** Effective configuration is
+`configs/*.yaml` **plus** the environment. `Config.Load()` parses YAML, then
+`applyEnvOverrides()` replaces selected fields, then `Validate()` checks the
+result — `Validate()` does **not** apply overrides. Never call a config value
+stale from the YAML alone — check `.env.prod.example` and `applyEnvOverrides()`
+first. Both directions bite: replication settings are env-driven (YAML is a
+placeholder), while the upload-size guards have no env override at all.
 
 **Not re-verified live.** This pass was a code read against `main`, not a rerun
 of the multiregion stack. The 2026-07-24 empirical results for B1/B2/B5 stand as

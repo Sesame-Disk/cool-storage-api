@@ -33,22 +33,25 @@ of them updated.
    Open/Closed tables and the PR-plan status table are **historical / PR-progress**
    views, not competing live trackers.
 3. Cite code by **symbol name**, not `file.go:1234`. Line numbers rot.
-4. A finding lives in exactly one table within a document. Duplicating a row into
-   "open" and "closed" is how F13 ended up recorded as both.
+4. A finding must not appear in multiple status tables with independently
+   maintained or contradictory states. An executive summary may **reference** the
+   canonical row (e.g. "also listed under Production Blockers"); do not maintain
+   two competing status columns for the same id.
 5. Do not claim this index lists "everything open in the repo". It lists the
    scope in the header. Use the migration table for deleted-tracker provenance.
 6. **Effective config = `configs/*.yaml` + the environment. Never conclude
-   anything from the YAML alone.** Prod runs `config.prod.yaml` *with* the prod
-   `.env`, and `config.Validate()` lets env values replace YAML ones outright, so
-   a YAML entry may be an inert placeholder. This rule exists because the
-   multi-DC replication line got "corrected" twice on a YAML-only reading —
-   `config.prod.yaml` says `datacenter1: 1`, the prod `.env` says
-   `dc-na:1,dc-eu:1,dc-asia:1`, and the env is what runs. Before calling a config
-   value stale, grep `.env.prod.example` **and** the `os.Getenv` block in
-   `internal/config/config.go`. The inverse also matters: some fields
-   (`chunked_staging_max_bytes`, `server.max_upload_mb`) have **no** env override,
-   so for those the YAML really is the whole story — see
-   `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01`.
+   anything from the YAML alone.** `Config.Load()` parses YAML, then
+   `applyEnvOverrides()` replaces selected fields from the environment, then
+   `Validate()` checks the result — `Validate()` does **not** apply overrides.
+   Prod runs `config.prod.yaml` *with* a prod `.env` derived from
+   `.env.prod.example`. The YAML may hold inert placeholders (e.g.
+   `replication_dcs: {datacenter1: 1}`) while the env template ships the real
+   multi-DC posture (`CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1`).
+   Before calling a config value stale, read **both** the YAML and
+   `.env.prod.example`, and confirm the symbol path in `applyEnvOverrides()`.
+   The inverse also matters: some fields (`chunked_staging_max_bytes`,
+   `server.max_upload_mb`) have **no** env override, so for those the YAML
+   really is the whole story — see `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01`.
 
 ---
 
@@ -104,6 +107,7 @@ on every replica in every DC until both close.
 | `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01` | LOW–MED | `handleAutoLogin` hardcodes cookie `Secure=false` |
 | `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01` | LOW (config) | Both chunked-upload size guards can be disabled together; staging guard is `0` in **every** shipped config |
 | `ISSUE-ACCOUNTS-PROVISIONING-RUNBOOK-01` | LOW (docs) | Bootstrap/rotation/smoke/revoke runbook for the Accounts platform API key was never written |
+| `ISSUE-ORG-ADMIN-DELETION-BANNER-01` | LOW (UX) | Org-admin dashboard has no banner when the org is soft-deleted / in grace |
 | `ISSUE-ACCOUNTS-M2M-REQUEST-SIGNING-01` | LOW (hardening) | Optional HMAC/JWT request signing beyond admin API key — **not required for v1**; channel is API key by design |
 | `ISSUE-SHARELINK-BCRYPT-COST-01` | LOW | Share-link passwords use `bcrypt.DefaultCost` (10), not Argon2id |
 | `ISSUE-ENCRYPTED-VIEW-CONTENT-LENGTH-01` | LOW | v2 inline-view/share-raw omit `Content-Length` on encrypted downloads |
@@ -164,13 +168,16 @@ upload/download/sharing specifically.
 
 ---
 
-## Tracker migration table (exhaustive)
+## Tracker migration table — all unique items
 
-Every open or noteworthy item from the three deleted trackers. Status verified
-against **code** on 2026-07-25 where marked. Disposition codes: **DONE** =
-implemented; **OPEN** = still work; **DECISION** = product choice, not a defect;
-**ROADMAP** = owned by roadmap/PLANS, not this index's defect list;
-**DUPLICATE** = already had an ISSUE.
+Every **unique** open or noteworthy item from the three deleted trackers is
+mapped below. Duplicate rows that only restated the same work are not repeated;
+see the `sesamefs-pending-issues.txt` note at the end. Status verified against
+**code** on 2026-07-25 where marked. Disposition codes: **DONE** =
+implemented (with concrete symbol/evidence); **OPEN** = still work; **PARTIAL** =
+usable mechanism exists but the original tracker’s full contract is unfinished;
+**DECISION** = product choice, not a defect; **ROADMAP** = owned by
+roadmap/PLANS, not this index's defect list; **DUPLICATE** = already had an ISSUE.
 
 ### From `quotas-pending-issues.txt`
 
@@ -180,13 +187,13 @@ implemented; **OPEN** = still work; **DECISION** = product choice, not a defect;
 | 1. Per-user storage quota on uploads | DONE | `ISSUE-USER-STORAGE-ENFORCE-01` | Fixed 2026-05-14 |
 | 2. Formalizar path M2M Accounts → SesameFS | OPEN (partial) | `ISSUE-ACCOUNTS-M2M-PATH-01` | **Channel works today:** `RequireSuperAdmin` + `apikeys.ScopeAdmin` on `/admin`; `UpdateOrganization`, `AdminAddOrgUser` / update / delete exist. Still missing: `source=accounts` audit tag (hardcoded `manual-superadmin`), idempotency |
 | 3. preview/evaluate plan change | DONE | `PreviewOrganizationPlanChange` | Route live |
-| 4. Invite/create users vía Accounts | DONE (SesameFS API) / ROADMAP (invite UX) | `PLANS-AND-PERMISSIONS.md` Phase 4.5 | Admin user CRUD usable by Accounts; org-local writes gated by `Accounts.DisableOrgUserWrites`. Invite-token product story stays in PLANS |
+| 4. Invite/create users vía Accounts | PARTIAL / OPEN | `PLANS-AND-PERMISSIONS.md` Phase 4.5; `ISSUE-ACCOUNTS-M2M-PATH-01` | **Mechanism exists:** `AdminAddOrgUser` / update / delete / `AdminCreateUser`; org-local writes gated by `Accounts.DisableOrgUserWrites` (default true); `max_users` enforced in `AddOrgUser` and OIDC provision. **Contract unfinished:** SoT for invite vs direct provision, owner/org-admin UX, and M2M audit/idempotency remain open — not "DONE" as an Accounts integration flow |
 | 5. External org identifier | DECISION | `PLANS-AND-PERMISSIONS.md` | No `external_org_id` in schema — wait for Accounts contract |
 | 6. External billing IDs | DECISION | `PLANS-AND-PERMISSIONS.md` | No billing columns yet |
 | 7. Snapshot pre-downgrade users | DECISION / ROADMAP | `PLANS-AND-PERMISSIONS.md` | Preview computes counts; no persisted activation snapshot |
-| 8. Quota error messages | DONE (mostly) | traffic helpers + upload UI | Residual inconsistency is polish, not a tracker row |
-| 9. Quota user → org visualization | DONE | sysadmin user-info + `AdminGetOrgUser` | Shows inherited quotas |
-| 10. Traffic quotas admin UI | DONE | `set-org-traffic-quota` dialog + `UpdateOrganization` | |
+| 8. Quota error messages | PARTIAL | `traffic.TrafficQuotaExceededResponse` + `file-uploader.js` `getQuotaErrorMessage` | Upload UI maps `storage` / `traffic-*` reasons. Residual: some handlers pass `includeReason=false`; sync still uses plain strings — polish, not a new ISSUE |
+| 9. Quota user → org visualization | DONE | `frontend/.../sys-admin/users/user-info.js` + `AdminGetOrgUser` | Shows effective + `(inherited)` for storage/upload/download |
+| 10. Traffic quotas admin UI | DONE | `set-org-traffic-quotas.js` + `UpdateOrganization` traffic fields | Sysadmin can view/edit org traffic quotas |
 | 11. Audit log quotas/provisioning | OPEN (partial) | `ISSUE-AUDIT-TRAIL-INCOMPLETE-01` + `ISSUE-ACCOUNTS-M2M-PATH-01` | Org updates write `audit_log` but always `manual-superadmin`; user CRUD writes nothing |
 | 12. Recorder drop metrics | OPEN | `ISSUE-TRAFFIC-RECORDER-DROPS-01` | `Recorder.recordAsync` silent drop |
 | 13. Risk dashboard / notifications | ROADMAP | `PLANS-AND-PERMISSIONS.md` Phase 3 | Soft `X-Quota-Warning` exists; no dashboard |
@@ -218,9 +225,12 @@ implemented; **OPEN** = still work; **DECISION** = product choice, not a defect;
 
 ### From `sesamefs-pending-issues.txt`
 
-Header already deferred to the four canonical docs. Hard-blocker GC multi-instance
-item is superseded by the upload-fence X1/X2 + `gc.enabled: false` posture.
-Accounts pointer redirected here via the quotas migration rows above.
+Every **unique** item from this tracker is already mapped above (via the quotas
+table or the May audit table). Duplicate rows that only pointed at those same
+canonical docs are not repeated here. Hard-blocker GC multi-instance wording is
+superseded by the upload-fence X1/X2 + `gc.enabled: false` posture. Accounts
+work is covered by the quotas migration rows (`ISSUE-ACCOUNTS-M2M-PATH-01`,
+runbook, invite PARTIAL).
 
 ---
 

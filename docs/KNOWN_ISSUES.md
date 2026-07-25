@@ -64,7 +64,7 @@ is right about why.
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Read Paths Ignore `storage_key`** | ✅ Fixed by derived-key invariant | Reads, reuse/repair, normal GC delete, and orphan recovery derive the deterministic org-scoped key; reuse fails closed if a non-empty `storage_key` differs. The column is not an arbitrary locator, so non-derived layouts remain unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
-| **Chunked Upload Chunk State Is Node-Local** | 🔴 Open — multi-instance blocker (also listed above) | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
+| **Chunked Upload Chunk State Is Node-Local** | 🔴 See Production Blockers | Canonical status is in the Production Blockers table above (`ISSUE-UPLOAD-CHUNK-MULTINODE-01`). Listed here only as a cross-reference for the upload-debt cluster — do not maintain a second status. |
 
 ### GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 fixed)
 
@@ -127,7 +127,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 |-------|--------|---------|
 | **Superadmin: Org Soft-Delete/Restore UI** | ✅ Fixed (2026-03-25) | Status column with color-coded badges and separate Deactivate / Delete / Reactivate / Restore actions are implemented in `frontend/src/pages/sys-admin/orgs/orgs-content.js`. **This row said "frontend TODO" until 2026-07-25** while the detail section below already recorded it resolved on 2026-03-25 — a summary/detail contradiction inside this same file. Re-verified against the frontend 2026-07-25. See ISSUE-FRONTEND-ORG-DELETE-01 below. |
 | **Superadmin: Deleted Orgs List/Filter** | ✅ Fixed (2026-03-25) | Status filter support landed with the same change; search results carry the lifecycle actions too. Same stale-row correction as above. |
-| **Org Admin: Org Deletion Awareness** | 🟡 Backend ready, frontend TODO | Org admin dashboard should show a banner/warning if their org is in "deleted" state with days remaining before permanent cascade. |
+| **Org Admin: Org Deletion Awareness** | 🟡 Backend ready, frontend TODO | Org admin dashboard should show a banner/warning if their org is in "deleted" state with days remaining before permanent cascade. See `ISSUE-ORG-ADMIN-DELETION-BANNER-01`. |
 
 ### 🟢 Lower Priority (Polish/UX)
 | Issue | Status | Notes |
@@ -5270,6 +5270,34 @@ turns "every author must remember" into "an author must actively opt out".
 #### Related Docs
 
 - `docs/PROD-SECURITY-READINESS-20260724.md` (NF-5, RB-6, checklist item 6)
+
+---
+
+### ISSUE-ORG-ADMIN-DELETION-BANNER-01: Org-admin UI has no soft-delete grace banner
+
+**Status**: 🟡 Open — backend ready, frontend TODO
+**Severity**: Low (UX / operator awareness)
+**Affected**: org-admin dashboard frontend; org soft-delete / grace period already exists server-side
+**Source of record**: `KNOWN_ISSUES.md` Frontend Pending summary row (left without an id until 2026-07-25)
+
+#### Problem
+
+When an organization is soft-deleted and sitting in the grace window before
+cascade, the **org-admin** dashboard does not show a banner/warning with days
+remaining. Superadmin soft-delete/restore UI and the deleted-orgs filter are
+already fixed (`ISSUE-FRONTEND-ORG-DELETE-01`); this tenant-facing awareness
+gap is the remaining row from that group.
+
+#### Fix Direction
+
+Surface org `deleted_at` / grace remaining on the org-admin shell (banner or
+dashboard card). Reuse the same retention messaging helpers the sysadmin orgs
+page already uses where possible.
+
+#### Related Docs
+
+- [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md)
+- `ISSUE-FRONTEND-ORG-DELETE-01` (resolved superadmin counterpart)
 
 ---
 
