@@ -63,10 +63,19 @@ the open single-node blocker**, and multi-instance adds B1 and B5. See
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| ~~`ISSUE-SHARELINK-PASSWORD-BYPASS-01`~~ | ~~HIGH~~ | ✅ **Fixed 2026-07-25** — gate now runs before the content read and the OnlyOffice token mint | Readiness NF-1 |
 | `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | No rate/concurrency limit on the seafhttp upload, download and block routes (umbrella; four closable subcontracts) | Readiness B4 ⊇ registry X10 — **the remaining single-node blocker** |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
+
+### Recently closed
+
+Kept briefly so a reader who arrives with the old blocker list can see it moved
+rather than vanished. Drop rows once they stop being recent; status of record
+stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
+
+- `ISSUE-SHARELINK-PASSWORD-BYPASS-01` — **Fixed 2026-07-25** (readiness NF-1 /
+  SH-6). Gate runs before the inline read and the OnlyOffice token mint; the
+  bundle builder drops protected content; the OnlyOffice helper fails closed.
 
 ## Blockers that keep destructive GC disabled
 

@@ -124,8 +124,12 @@ func marshalPageOptionsJSON(pageOptions any) string {
 //
 // The nil check is not decoration: the write happens in a bare goroutine, so a
 // nil dereference there panics the whole process rather than failing one request.
+// It logs rather than returning quietly, because a handler reaching here without
+// a DB is an invalid construction, not a supported mode — swallowing it would
+// turn a wiring bug into silently missing view counts.
 func (h *ShareLinkViewHandler) incrementViewCount(token string) {
 	if h == nil || h.db == nil {
+		log.Printf("[incrementViewCount] handler has no database; view_count not recorded for token %s (handler misconfigured)", token)
 		return
 	}
 	go func() {

@@ -8,6 +8,7 @@ import (
 	gotoken "go/token"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -257,15 +258,32 @@ func TestShareFileBootstrapServesContentWhenLinkHasNoPassword(t *testing.T) {
 // *error* path; this pins the success path, which is the one that carries the
 // content. Without it, a refactor could give one endpoint its own builder call and
 // every test above would stay green while half the surface reopened.
+//
+// Scope, stated honestly so the guarantee is not read wider than it is: this walks
+// every non-test .go file in package v2, not just sharelink_view.go — an earlier
+// revision parsed the one file, which would have missed a new minting call site
+// added anywhere else in the package. It is still a *syntactic* check. It does not
+// execute the handlers, and it cannot see a call reached through a function value,
+// an interface, or another package. It is a cheap tripwire on the call graph, not
+// a proof; the behavioural guarantees come from the tests above and from
+// TestShareLinkBootstrapPasswordGateOnBothEndpoints in internal/integration, which
+// drives the real HTTP endpoints.
 func TestBothShareBootstrapEndpointsGoThroughTheGatedEmitter(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("failed to resolve current file path")
 	}
+	pkgDir := filepath.Dir(thisFile)
+
 	fset := gotoken.NewFileSet()
-	fileNode, err := goparser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "sharelink_view.go"), nil, 0)
+	pkgs, err := goparser.ParseDir(fset, pkgDir, func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
 	if err != nil {
-		t.Fatalf("parse sharelink_view.go: %v", err)
+		t.Fatalf("parse package dir %s: %v", pkgDir, err)
+	}
+	if len(pkgs) == 0 {
+		t.Fatalf("no non-test packages parsed from %s", pkgDir)
 	}
 
 	wantEmitter := map[string]bool{
@@ -274,50 +292,61 @@ func TestBothShareBootstrapEndpointsGoThroughTheGatedEmitter(t *testing.T) {
 	}
 	// Nothing outside the emitter may call the builder directly, or it would skip
 	// nothing today but could skip the gate after any future edit to the emitter.
-	directBuilderCalls := 0
+	directBuilderCalls := map[string]int{}
 	// The OnlyOffice helper mints credentials; only the gated builder may call it.
 	onlyOfficeCallers := map[string]int{}
+	filesWalked := 0
 
-	goast.Inspect(fileNode, func(node goast.Node) bool {
-		fn, ok := node.(*goast.FuncDecl)
-		if !ok {
-			return true
+	for _, pkg := range pkgs {
+		for _, fileNode := range pkg.Files {
+			filesWalked++
+			goast.Inspect(fileNode, func(node goast.Node) bool {
+				fn, ok := node.(*goast.FuncDecl)
+				if !ok {
+					return true
+				}
+				goast.Inspect(fn, func(inner goast.Node) bool {
+					call, ok := inner.(*goast.CallExpr)
+					if !ok {
+						return true
+					}
+					sel, ok := call.Fun.(*goast.SelectorExpr)
+					if !ok {
+						return true
+					}
+					switch sel.Sel.Name {
+					case "emitShareFileBootstrap":
+						if _, tracked := wantEmitter[fn.Name.Name]; tracked {
+							wantEmitter[fn.Name.Name] = true
+						}
+					case "buildShareFileBootstrapResponse":
+						// shareFileBootstrapFn is the single indirection the emitter
+						// uses and the seam tests substitute; anything else bypasses.
+						if fn.Name.Name != "emitShareFileBootstrap" {
+							directBuilderCalls[fn.Name.Name]++
+						}
+					case "buildOnlyOfficeShareBootstrap":
+						onlyOfficeCallers[fn.Name.Name]++
+					}
+					return true
+				})
+				return true
+			})
 		}
-		goast.Inspect(fn, func(inner goast.Node) bool {
-			call, ok := inner.(*goast.CallExpr)
-			if !ok {
-				return true
-			}
-			sel, ok := call.Fun.(*goast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			switch sel.Sel.Name {
-			case "emitShareFileBootstrap":
-				if _, tracked := wantEmitter[fn.Name.Name]; tracked {
-					wantEmitter[fn.Name.Name] = true
-				}
-			case "buildShareFileBootstrapResponse":
-				// shareFileBootstrapFn is the single indirection the emitter uses
-				// and the seam tests substitute; anything else is a bypass.
-				if fn.Name.Name != "emitShareFileBootstrap" {
-					directBuilderCalls++
-				}
-			case "buildOnlyOfficeShareBootstrap":
-				onlyOfficeCallers[fn.Name.Name]++
-			}
-			return true
-		})
-		return true
-	})
+	}
 
+	// Guard the guard: if the walk silently stopped finding files, every assertion
+	// below would pass vacuously.
+	if filesWalked < 2 {
+		t.Fatalf("walked %d file(s); the package scan is not running", filesWalked)
+	}
 	for handler, found := range wantEmitter {
 		if !found {
 			t.Fatalf("%s does not call emitShareFileBootstrap; it would bypass the password gate", handler)
 		}
 	}
-	if directBuilderCalls != 0 {
-		t.Fatalf("buildShareFileBootstrapResponse is called directly from %d place(s) outside the emitter", directBuilderCalls)
+	for caller, n := range directBuilderCalls {
+		t.Fatalf("%s calls buildShareFileBootstrapResponse directly %d time(s), outside the emitter", caller, n)
 	}
 	if n := onlyOfficeCallers["buildShareFileBootstrapResponse"]; n != 1 {
 		t.Fatalf("buildShareFileBootstrapResponse calls buildOnlyOfficeShareBootstrap %d time(s), want 1", n)
