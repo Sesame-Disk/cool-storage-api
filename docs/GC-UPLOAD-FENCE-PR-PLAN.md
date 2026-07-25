@@ -4,7 +4,10 @@
 **Research branch:** `docs/gc-upload-fence-rematerialization` — **not for merge**
 
 **Status: PR-1 through PR-10 have all merged. The code series is complete and
-every F finding is closed.**
+every F finding is closed.** The table below is **authoritative for PR merge
+progress only**. Live defect status lives in
+[KNOWN_ISSUES.md](./KNOWN_ISSUES.md); this plan does not compete as a second
+status tracker.
 
 | PR | Merged as | Closes |
 |----|-----------|--------|
@@ -26,7 +29,8 @@ items this series never scoped, deferred, or knowingly accepted.
 **X1/X2 remain open and keep destructive GC disabled fleet-wide.**
 
 Per-PR sections below are kept as the design and verification record of what
-landed. They are history, not a plan; the status table above is authoritative.
+landed. They are history, not a plan; the PR merge table above is authoritative
+for *which PR merged*, not for whether an X/ISSUE row is still open.
 
 ## Why this document exists
 

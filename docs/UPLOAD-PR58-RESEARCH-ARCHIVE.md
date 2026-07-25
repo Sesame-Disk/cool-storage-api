@@ -5,14 +5,15 @@ be merged as-is. This file preserves what that branch proved.
 
 **Consolidated 2026-07-25** from `UPLOAD-PERFORMANCE-PR58-AUDIT.md` and
 `UPLOAD-S3-RELAY-BOTTLENECK.md`, which were two halves of the same PR58 research
-with the same status and overlapping conclusions. Nothing was dropped in the
-merge; the 2026-06 updates from the relay note are kept as the "What has since
-landed" section.
+with the same status and overlapping conclusions. No unique design conclusion
+was intentionally dropped; narrative was merged and the archival "Current
+Outcome" section from the PR58 audit is restored below. The 2026-06 updates from
+the relay note are kept as the "What has since landed" section.
 
 **Live status of anything here lives elsewhere:** current findings are in
 [UPLOAD-PERFORMANCE-SECURITY-2026-06.md](./UPLOAD-PERFORMANCE-SECURITY-2026-06.md)
 and [KNOWN_ISSUES.md](./KNOWN_ISSUES.md); see
-[OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) for what is still open. This document
+[OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) for what is still open in scope. This document
 is history and design input, not a tracker.
 
 ---
@@ -117,6 +118,18 @@ finalize latency without changing correctness.
   user-visible upload failures.
 - Reintroduce performance work only after correctness is proven under
   contention.
+
+## Outcome at the time of archival (from PR58 audit)
+
+The main-based branch follows the safer subset of these conclusions:
+
+- canonical HEAD compare-and-set publication
+- canonical HEAD readers for functional behavior
+- server-side retry and rebuild for upload metadata publication
+- regression coverage for concurrent upload commit loss
+
+Further recovery, staging, or projection repair work should be added as smaller,
+separate slices.
 
 ## What has since landed
 

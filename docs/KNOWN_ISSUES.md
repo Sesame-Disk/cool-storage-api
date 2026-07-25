@@ -19,7 +19,8 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | 🔴 **Open — go/no-go blocker (2026-07-24)** | Password-protected share links serve file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. Single-node reachable. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | No rate or concurrency limit on the seafhttp upload, download and block routes. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (= B4 = X10). |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | No rate or concurrency limit on the seafhttp upload, download and block routes. Umbrella with four closable subcontracts — see ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (B4; X10 is subcontract B). |
+| **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`), and `LOCAL_QUORUM` references can be invisible across RF-1 DCs (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`). Keep destructive GC disabled until both close. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
@@ -63,7 +64,7 @@ is right about why.
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Read Paths Ignore `storage_key`** | ✅ Fixed by derived-key invariant | Reads, reuse/repair, normal GC delete, and orphan recovery derive the deterministic org-scoped key; reuse fails closed if a non-empty `storage_key` differs. The column is not an arbitrary locator, so non-derived layouts remain unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
-| **Chunked Upload Chunk State Is Node-Local** | 🟡 Pending — multi-node blocker | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
+| **Chunked Upload Chunk State Is Node-Local** | 🔴 Open — multi-instance blocker (also listed above) | `chunkManager` stores upload state in a process-global in-memory map + temp files in `os.TempDir()`. Upload tokens are Cassandra-backed and multi-node safe; chunk state is not. Requires sticky sessions at LB or distributed chunk state. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 below. |
 
 ### GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 fixed)
 
@@ -124,8 +125,8 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 ### 🟡 Frontend Pending — New Backend Features (2026-03-18)
 | Issue | Status | Details |
 |-------|--------|---------|
-| **Superadmin: Org Soft-Delete/Restore UI** | 🟡 Backend ready, frontend TODO | Backend has `POST /admin/organizations/:org_id/delete/` and `POST .../restore/`. Frontend superadmin dashboard needs: "Delete" button (distinct from "Deactivate"), "Restore" button for deleted orgs, status column showing active/deactivated/deleted with grace period countdown. See ISSUE-FRONTEND-ORG-DELETE-01 below. |
-| **Superadmin: Deleted Orgs List/Filter** | 🟡 Backend ready, frontend TODO | `ListOrganizations` should filter/tab by status (active, deactivated, deleted). Currently shows all orgs with no status differentiation. |
+| **Superadmin: Org Soft-Delete/Restore UI** | ✅ Fixed (2026-03-25) | Status column with color-coded badges and separate Deactivate / Delete / Reactivate / Restore actions are implemented in `frontend/src/pages/sys-admin/orgs/orgs-content.js`. **This row said "frontend TODO" until 2026-07-25** while the detail section below already recorded it resolved on 2026-03-25 — a summary/detail contradiction inside this same file. Re-verified against the frontend 2026-07-25. See ISSUE-FRONTEND-ORG-DELETE-01 below. |
+| **Superadmin: Deleted Orgs List/Filter** | ✅ Fixed (2026-03-25) | Status filter support landed with the same change; search results carry the lifecycle actions too. Same stale-row correction as above. |
 | **Org Admin: Org Deletion Awareness** | 🟡 Backend ready, frontend TODO | Org admin dashboard should show a banner/warning if their org is in "deleted" state with days remaining before permanent cascade. |
 
 ### 🟢 Lower Priority (Polish/UX)
@@ -1076,20 +1077,21 @@ derived one, and no block method accepts an arbitrary caller-supplied S3 key. Cl
 
 ### ISSUE-UPLOAD-CHUNK-MULTINODE-01: Chunked Upload Chunk State Is Node-Local
 
-**Status**: 🟡 Pending — multi-node deployment blocker
+**Status**: 🔴 Open — multi-instance production blocker (B1)
 **Severity**: High for multi-node topologies; no impact on single-node
-**Affected**: `chunkManager` global in `internal/api/seafhttp.go`
+**Affected**: `var chunkManager` in `internal/api/seafhttp.go`
+**Source of record**: B1 / UP-1 in `docs/PROD-SECURITY-READINESS-20260724.md`
 
 #### Problem
 
-`chunkManager` (seafhttp.go:375) is a process-global variable backed by
+`chunkManager` is a process-global variable backed by
 `map[string]*ChunkUpload` plus temp files in `os.TempDir()`. Upload state
 is entirely node-local. If a load balancer routes chunks from the same upload
-to different nodes, node B creates an empty tracker and finalization fails.
+to different nodes, node B creates an empty tracker and finalization fails
+(live-confirmed 2026-07-24: HTTP 200 `success:true` with no dirent).
 
 Note: upload *tokens* are Cassandra-backed and multi-node safe
-(`server.go:190–192`, `db.NewTokenStore` via `NewCassandraTokenAdapter`).
-The problem is chunk state only.
+(`NewCassandraTokenAdapter`). The problem is chunk state only.
 
 #### Mitigations
 
@@ -1101,8 +1103,10 @@ The problem is chunk state only.
 
 #### Related
 
+- `docs/PROD-SECURITY-READINESS-20260724.md` — B1 / UP-1
 - `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md` — S-1
 - `docs/TECHNICAL-DEBT.md` §25
+- `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` (the other node-local multi-instance blocker)
 
 ---
 
@@ -3351,7 +3355,7 @@ The client also sends `replace=1` in both cases, so the form parameter doesn't h
 
 ---
 
-## ~~ISSUE-FRONTEND-ORG-DELETE-01~~: Superadmin Org Soft-Delete/Restore UI — ✅ RESOLVED
+### ~~ISSUE-FRONTEND-ORG-DELETE-01~~: Superadmin Org Soft-Delete/Restore UI — ✅ RESOLVED
 
 **Status**: ✅ Complete (2026-03-25)
 **Date identified**: 2026-03-18 | **Date resolved**: 2026-03-25
@@ -4969,17 +4973,18 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: No rate or concurrency limit on the seafhttp upload/download/block surfaces
 
-**Status**: 🔴 Open — production blocker (B4)
+**Status**: 🔴 Open — production blocker (B4 umbrella)
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
-**Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
-**Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`
+**Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
+**Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
 
 #### Problem
 
 This issue is the single record for what was previously filed twice: B4 in the
-readiness report and X10 in the upload-fence registry are the **same defect**
-seen from two audits. Both say the seafhttp write/read surfaces carry no abuse
-control.
+readiness report and X10 in the upload-fence registry. They **overlap** but are
+not identical in scope — B4 covers the full seafhttp abuse surface; X10 focuses
+on authenticated block PUT concurrency / aggregate memory after PR-10's
+per-request body cap.
 
 Verified state of the router (2026-07-25):
 
@@ -4990,15 +4995,13 @@ Verified state of the router (2026-07-25):
 | `/seafhttp/repo/:repo_id/block/:block_id` (PUT/GET) | **none** — group carries only `authMiddleware` |
 | `/seafhttp/repo/:repo_id/check-blocks` | **none** |
 | `/seafhttp/zip/:token` | optional `zipRL`, passed in at registration |
-| `/api/v2/blocks/check` | per-IP limiter, 60 req/min burst 120 |
+| `/api/v2/blocks/check` | per-IP limiter (`rate.Every(time.Second)`, burst 120 ≈ 60/min sustained) |
 | `/api/v2/blocks/upload` | per-user concurrency limiter (`MaxConcurrentBlockUploadsPerUser`, default 8) |
 | `/api/v2.1/share-links/*`, `/api/v2.1/upload-links/*`, `/d/:token` | per-IP `slRL` |
 
 So the original B4 wording — "no dedicated rate limit on upload / download /
 blocks / share-link paths" — is **partly stale**: the share-link and web-block
-paths do have limiters. The accurate residual gap is the seafhttp group, which
-is exactly X10's point, plus the asymmetry that the web block path is protected
-and the desktop-sync block path serving the same storage is not.
+paths do have limiters. The accurate residual gap is the seafhttp group.
 
 X10 adds the interaction with PR-10's body caps: bounding one `PutBlock` to
 ~257 MiB is not an aggregate bound while N concurrent uploads are unbounded, and
@@ -5006,21 +5009,31 @@ the body is still fully buffered by `io.ReadAll` before hashing. Pre-sizing the
 read buffer from `Content-Length` is **not** the fix — that value is
 attacker-controlled, so an empty body would allocate the full cap.
 
+#### Closable subcontracts
+
+Closing any one row is **not** enough to close this umbrella. Each needs its
+own fix + regression.
+
+| ID | Surface | Close when | Notes |
+|---|---|---|---|
+| **A** | Anonymous / token seafhttp **upload** (`HandleUpload` / upload-api) | Per-IP (or per-token) rate + concurrency limit on the write path that upload-links hand off to | SH-1 residual; routes already have `slRL`, the handoff does not |
+| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | Per-user concurrency on the seafhttp block group mirroring `blockUploadConcurrencyLimiter`; optionally stream instead of full-buffer | Also revisit the 257 MiB cap (~32× desktop CDC size) |
+| **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
+| **D** | seafhttp **download** / block **GET** abuse control | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
+
 #### Fix Direction
 
-Per-user concurrency on the seafhttp block group (mirroring
-`blockUploadConcurrencyLimiter`) and a per-IP limiter on the anonymous
-upload-link write path. Independently, revisit the 257 MiB cap: it derives from
-the 256 MiB adaptive-chunk ceiling of the *web* path, while the desktop client
-this route serves sends CDC blocks of ≤8 MiB — roughly 32× its real traffic
-profile. Streaming the block to storage instead of buffering it removes the
-memory question entirely and is the better long-term shape.
+Implement A–D independently. Do not mark this issue closed until all four
+subcontracts have criteria met and tests. Independently, revisit the 257 MiB
+`PutBlock` cap: it derives from the 256 MiB adaptive-chunk ceiling of the *web*
+path, while the desktop client this route serves sends CDC blocks of ≤8 MiB.
 
 #### Related Docs
 
-- `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X10 — same defect, upload-fence view)
-- `docs/PROD-SECURITY-READINESS-20260724.md` (B4, SEC-2, SH-1, checklist item 3)
-- `docs/SECURITY-ASSESSMENT-2026-04.md` **H-7** — the original 2026-04 filing. (The readiness report cited H-5 for this; H-5 is share-link token enumeration. H-7 is the rate-limit finding, and its line "Upload, download, and `/api/v2/blocks/upload` have no rate limit at all" is the origin of B4.)
+- `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X10 = subcontract B; X11 = related to C)
+- `docs/PROD-SECURITY-READINESS-20260724.md` (B4, SEC-2, SH-1, checklist item 1)
+- `docs/SECURITY-ASSESSMENT-2026-04.md` **H-7** — the original 2026-04 filing. (The readiness report cited H-5 for this; H-5 is share-link token enumeration. H-7 is the rate-limit finding.)
+- `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` (subcontract C detail)
 
 ---
 
@@ -5058,7 +5071,7 @@ connection, so any rebalance during the flow reopens it.
 
 #### Related Docs
 
-- `docs/PROD-SECURITY-READINESS-20260724.md` (B5, checklist item 1)
+- `docs/PROD-SECURITY-READINESS-20260724.md` (B5, checklist item 2 — "Routing")
 - `docs/OIDC.md` (self-documents the gap)
 - `ISSUE-UPLOAD-CHUNK-MULTINODE-01` (the other node-local-state blocker; same deploy precondition)
 
@@ -5189,9 +5202,9 @@ shape and in whether the error is checked. Pairs with RB-3
 `max_upload_mb: 0` is documented as "unlimited" and
 `chunked_staging_max_bytes: 0` is documented as "guard disabled". Set both and
 the first chunk of a chunked upload performs `Truncate(attacker_declared_total)`
-against node-local `/tmp` with nothing bounding it. `Validate()` rejects a
-*negative* `chunked_staging_max_bytes` but has no invariant against the
-both-zero combination.
+against a node-local temp file with nothing bounding the **logical** size.
+`Validate()` rejects a *negative* `chunked_staging_max_bytes` but has no
+invariant against the both-zero combination.
 
 Two facts sharpen this beyond the original NF-7 note (verified 2026-07-25):
 
@@ -5199,16 +5212,29 @@ Two facts sharpen this beyond the original NF-7 note (verified 2026-07-25):
    `config.prod.yaml`. So the staging guard is off by default everywhere, and
    UP-4's "operator must set a real per-node value" is not an omission in one
    file, it is the shipped default in all of them.
-2. The only thing standing between that and an unbounded truncate is
-   `max_upload_mb`, which prod sets to `102400` (100 GiB). That is a bound, but
-   a single chunked upload may still reserve 100 GiB of `/tmp` on one node.
+   **And unlike most prod settings, there is no `.env` escape hatch**
+   (verified 2026-07-25): `config.go` has env overrides for `SEAFHTTP_TOKEN_TTL`
+   and the three `SEAFHTTP_ZIP_*` limits, and a full `WEB_UPLOADS_*` set, but
+   **none for `seafhttp.chunked_staging_max_bytes` and none for
+   `server.max_upload_mb`**. Both can only be changed by editing the YAML. An
+   operator following the usual "configure prod through the environment" pattern
+   therefore cannot turn this guard on at all, which is why it should get a
+   non-zero default rather than a deployment note.
+2. The only bound in prod is `max_upload_mb: 102400` (100 GiB). A single upload
+   may therefore declare a **logical** size of up to 100 GiB. On sparse-file-
+   capable filesystems (ext4/xfs) `Truncate` does **not** allocate that much
+   immediately; physical pressure grows as chunks are written. Concurrent
+   sessions can still exhaust `/tmp` because no aggregate staging budget is
+   enabled.
 
 #### Fix Direction
 
 Add a `Validate()` invariant rejecting `max_upload_mb == 0 && chunked_staging_max_bytes == 0`,
 and give `chunked_staging_max_bytes` a non-zero default sized to a plausible node
 rather than shipping the guard off. Both are cheap; the second is what actually
-changes the deployed posture.
+changes the deployed posture. Add `SEAFHTTP_CHUNKED_STAGING_MAX_BYTES` (and
+arguably `SERVER_MAX_UPLOAD_MB`) to the env-override set at the same time, so the
+value is reachable the way every other prod setting is.
 
 #### Related Docs
 
@@ -5281,9 +5307,373 @@ does not bound the work an accepted request triggers downstream.
 
 ---
 
+### ISSUE-BATCH-MOVE-FALSE-SUCCESS-01: Legacy `moveBatchFiles` returns success without moving
+
+**Status**: 🟡 Open — API footgun; primary UI path is safe
+**Severity**: Medium — false-success on a still-reachable handler
+**Affected**: `FileHandler.moveBatchFiles` in `internal/api/v2/files.go` (reached when `MoveFile` gets `len(srcPaths) > 1`)
+**Source of record**: PENDING-ISSUES-AUDIT-2026-05-14 item 4; code-verified 2026-07-25
+
+#### Problem
+
+`moveBatchFiles` still contains `// TODO: Implement actual batch move logic`
+and returns `{"success": true, "moved": N}` for same-repo multi-file moves
+without updating the FS tree. Cross-repo batch move correctly returns 501.
+
+The **UI** path does not use this: `seafileAPI.moveDirWithPolicy` goes through
+`SyncBatchMove` / `AsyncBatchMove` → `processSingleItem` in
+`batch_operations.go` (integration-tested). The defect is an API client that
+posts multiple `src` paths to the legacy `MoveFile` endpoint.
+
+#### Fix Direction
+
+Return `501 Not Implemented` (or wire to `processSingleItem`) until the batch
+path is real. Do not leave a success response on a no-op.
+
+#### Related Docs
+
+- [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md) migration table
+- `ISSUE-BLOCK-REPRESENTATION-COPY-01` (adjacent batch move/copy constraints)
+
+---
+
+### ISSUE-ACCOUNTS-M2M-PATH-01: Accounts M2M path lacks source tagging and idempotency
+
+**Status**: 🟡 Open — channel works; hygiene incomplete
+**Severity**: Medium — operability / audit provenance, not an auth hole
+**Affected**: `AdminHandler.UpdateOrganization` and admin user CRUD under `/admin`
+**Source of record**: former `quotas-pending-issues.txt` item 2; code-verified 2026-07-25
+
+#### Problem
+
+**What already works (do not re-open as "Accounts cannot provision"):**
+
+- `/admin` requires `RequireSuperAdmin` + `apikeys.RequireScope(ScopeAdmin)`
+- `UpdateOrganization`, `AdminAddOrgUser` / update / delete, `AdminCreateUser`,
+  and `PreviewOrganizationPlanChange` exist and are usable by Accounts today
+- Org-local user writes are gated by `Accounts.DisableOrgUserWrites` (default true)
+
+**What is still open:**
+
+- Audit rows from `UpdateOrganization` hardcode
+  `override_source: "manual-superadmin"` even when the caller is an Accounts
+  service key — no `source=accounts` distinction
+- No version / `updated_at` idempotency for M2M retries
+- User create/update/delete paths do not write `audit_log` at all (compounds
+  `ISSUE-AUDIT-TRAIL-INCOMPLETE-01`)
+
+#### Fix Direction
+
+Tag Accounts-originated mutations (`source=accounts` or equivalent), add an
+idempotency key / conditional update for org plan/quota PUTs, and emit
+`audit_log` for admin user CRUD. Optional request signing is a separate deferred
+item (`ISSUE-ACCOUNTS-M2M-REQUEST-SIGNING-01`).
+
+#### Related Docs
+
+- `docs/PLANS-AND-PERMISSIONS.md` §Accounts Provisioning
+- `docs/ACCOUNTS-DASHBOARD-INTEGRATION.md`
+- `ISSUE-ACCOUNTS-PROVISIONING-RUNBOOK-01`
+- `ISSUE-AUDIT-TRAIL-INCOMPLETE-01`
+
+---
+
+### ISSUE-ACCOUNTS-PROVISIONING-RUNBOOK-01: Accounts platform API-key runbook was never written
+
+**Status**: 🟡 Open — docs/ops debt
+**Severity**: Low (documentation) — high operational value before go-live
+**Affected**: docs only; auth mechanics already exist
+**Source of record**: `PLANS-AND-PERMISSIONS.md`, `V1-PRODUCTION-ROADMAP.md`
+
+#### Problem
+
+`ACCOUNTS-PROVISIONING-RUNBOOK.md` has been referenced for bootstrap, rotation,
+smoke-test and revocation of the dedicated platform service-account API key, but
+the file was never created. The channel itself works (see
+`ISSUE-ACCOUNTS-M2M-PATH-01`).
+
+#### Fix Direction
+
+Write the runbook (create platform user, mint `ScopeAdmin` key, rotate, revoke,
+smoke against `PUT /admin/organizations/:org_id/` and user CRUD). Link it from
+PLANS and the roadmap.
+
+#### Related Docs
+
+- [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md)
+- `docs/PLANS-AND-PERMISSIONS.md`
+- `docs/V1-PRODUCTION-ROADMAP.md`
+
+---
+
+### ISSUE-ACCOUNTS-M2M-REQUEST-SIGNING-01: Optional request signing beyond admin API key
+
+**Status**: 🟡 Accepted deferred for v1 — not a go-live blocker
+**Severity**: Low (defense-in-depth hardening)
+**Affected**: Accounts → SesameFS admin M2M routes
+**Source of record**: readiness SEC-4 (reframed 2026-07-25)
+
+#### Problem
+
+M2M calls authenticate with a platform admin API key only. There is no
+per-request HMAC/JWT signing. That is **by design for v1**: the admin API-key
+channel is the intended Accounts integration and already works. Signing would be
+extra theft-resistance if a key leaks, not a missing auth path.
+
+#### Fix Direction
+
+Post-v1: optional request signing (HMAC or short-lived JWT) on top of the
+existing API key. Do not block go-live on this.
+
+#### Related Docs
+
+- `ISSUE-ACCOUNTS-M2M-PATH-01`
+- `docs/PROD-SECURITY-READINESS-20260724.md` SEC-4
+
+---
+
+### ISSUE-TRAFFIC-RECORDER-DROPS-01: Saturated traffic recorder drops events silently
+
+**Status**: 🟡 Open
+**Severity**: Medium — observability / billing undercount under load
+**Affected**: `traffic.Recorder.recordAsync` in `internal/traffic/recorder.go`
+**Source of record**: quotas-pending item 12; PENDING-ISSUES-AUDIT item 16
+
+#### Problem
+
+When `maxInflight` is full, `recordAsync` hits a silent `default:` drop — no
+counter, no log. Traffic can be under-counted without an operator signal.
+
+#### Fix Direction
+
+Export a drop counter + log-at-most-once / metric; optionally block or sample
+instead of silent discard.
+
+#### Related Docs
+
+- [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md)
+- `docs/QUOTAS-AND-TRAFFIC-PLAN.md`
+
+---
+
+### ISSUE-MID-OPERATION-REVOCATION-01: Permission not re-checked mid long-running op
+
+**Status**: 🟡 Open
+**Severity**: Medium (upload/ZIP) / Low (mid-stream download only)
+**Affected**: chunked upload session start auth; mid-stream download; ZIP/bulk
+**Source of record**: readiness UP-5 / DL-5 / RB-4
+
+#### Problem
+
+Chunked uploads authorize at session start only. New download requests
+re-check `HasLibraryAccess`, but an already-streaming download has no in-flight
+re-check. ZIP/bulk revoke-during-op continues to completion.
+
+#### Fix Direction
+
+Decide per surface: re-check on each chunk / periodic mid-stream check / accept
+as documented best-effort for streams already committed. One issue tracks the
+class so the three readiness rows do not drift.
+
+#### Related Docs
+
+- `docs/PROD-SECURITY-READINESS-20260724.md` UP-5, DL-5, RB-4
+
+---
+
+### ISSUE-SHARELINK-NO-ORG-SCOPE-01: No org-internal share-link scope
+
+**Status**: 🟡 Open / BY DESIGN option
+**Severity**: Medium (product)
+**Affected**: share-link create + `resolveShareLink`
+**Source of record**: readiness SH-2; `BUG-SHARE-LINK-NO-INTERNAL-SCOPE-20260618.md`
+
+#### Problem
+
+Every public link is token-only and anonymously reachable; there is no
+"org members only" scope.
+
+#### Fix Direction
+
+Product decision: add an org-internal scope, or document as intentional.
+
+---
+
+### ISSUE-SHARELINK-CREATOR-KEY-01: Encrypted share links use creator's decrypt key
+
+**Status**: 🟡 Open
+**Severity**: Medium
+**Affected**: encrypted share-link decrypt path in `sharelink_view.go`
+**Source of record**: readiness SH-3
+
+#### Problem
+
+Encrypted library share links decrypt using the **creator's** key/session model,
+not receiver auth. Revoking the creator's decrypt session can break receivers;
+create-time does not reject encrypted libraries (serve-time 403 only).
+
+#### Fix Direction
+
+Document the model and/or require creator decrypt session / reject create for
+encrypted libs until a receiver-auth design exists.
+
+---
+
+### ISSUE-SHARELINK-BCRYPT-COST-01: Share-link passwords use bcrypt cost 10
+
+**Status**: 🟡 Open (low)
+**Severity**: Low
+**Affected**: `share_links.go` `bcrypt.GenerateFromPassword` ×3
+**Source of record**: readiness SH-4
+
+#### Problem
+
+Passwords use `bcrypt.DefaultCost` (10), not Argon2id / higher bcrypt cost.
+Earlier docs claimed cost 12.
+
+#### Fix Direction
+
+Raise cost or migrate to Argon2id; keep constant-time compare.
+
+---
+
+### ISSUE-ENCRYPTED-VIEW-CONTENT-LENGTH-01: Encrypted v2 view/share omit Content-Length
+
+**Status**: 🟡 Open (scoped)
+**Severity**: Low
+**Affected**: `fileview.go`, `sharelink_view.go` inline/share-raw surfaces
+**Source of record**: readiness DL-6
+
+#### Problem
+
+Primary SeafHTTP download sets `Content-Length` from plaintext `size_bytes`;
+v2 inline-view / share-raw encrypted surfaces omit it.
+
+#### Fix Direction
+
+Set length from known plaintext size on those surfaces, or document the omission.
+
+---
+
+### ISSUE-DOWNLOAD-NO-REHASH-01: Download does not re-hash block bytes
+
+**Status**: 🟡 Open — defense-in-depth
+**Severity**: Medium (defense-in-depth)
+**Affected**: download / streaming paths
+**Source of record**: readiness DL-7
+
+#### Problem
+
+Block integrity on download relies on the object store; bytes are not re-hashed
+before serve.
+
+#### Fix Direction
+
+Optional verify-on-read for high-assurance deployments; not a correctness bug
+given content-addressed storage + store checksums.
+
+---
+
+### ISSUE-OIDC-ROLE-RECONCILIATION-01: OIDC claims vs manual role overrides undefined
+
+**Status**: 🟡 Open — design debt
+**Severity**: Medium (design)
+**Affected**: OIDC login role sync vs admin overrides
+**Source of record**: readiness RB-2
+
+#### Problem
+
+Authoritative-source rule for OIDC role claims versus manual admin role
+overrides is undefined; re-sync on login can conflict with admin changes.
+
+#### Fix Direction
+
+Decide SoT (IdP wins / admin wins / last-write-wins with audit) in
+`PLANS-AND-PERMISSIONS.md` / `ROLES-AND-PERMISSIONS.md` and implement.
+
+---
+
+### ISSUE-UPLOAD-PER-BLOCK-PAXOS-01: One global Paxos LWT per block on upload
+
+**Status**: 🟡 Open — deferred PR-11 pending measurement
+**Severity**: High (perf), not a correctness blocker
+**Affected**: metadata-registering upload paths (`UpsertBlockMetadata` / LWT)
+**Source of record**: registry **X4**; readiness UP-2; P-4
+
+#### Problem
+
+Each block pays one global Paxos round under multi-DC `SERIAL` (~128
+cross-region rounds per GB at 8 MB). Shared cost of governed upload paths.
+
+#### Fix Direction
+
+Do not start PR-11 until a per-statement production latency metric exists.
+See registry X4 design notes.
+
+---
+
+### ISSUE-CANONICAL-READ-FANOUT-01: Canonical read fan-out unvalidated
+
+**Status**: 🟡 Open
+**Severity**: Medium (perf / capacity)
+**Affected**: canonical block read path
+**Source of record**: registry **X5**
+
+#### Problem
+
+One Cassandra point read per unique block before the first byte. Existing
+benchmark substitutes an in-memory function for Cassandra.
+
+#### Fix Direction
+
+Validate against a real cluster (driver, pool, latency, load) before claiming
+hot-path readiness.
+
+---
+
+### ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01: check-blocks work unbounded after parse
+
+**Status**: 🟡 Open — subcontract C of rate-limit umbrella
+**Severity**: Medium
+**Affected**: `SyncHandler.CheckBlocks` / seafhttp check-blocks
+**Source of record**: registry **X11**
+
+#### Problem
+
+`maxCheckBlockIDs` (100k) bounds the parser, not the ~100k sequential Cassandra
+reads an accepted request can trigger.
+
+#### Fix Direction
+
+Bound downstream work (batching, concurrency cap, lower accepted cardinality, or
+cancel-aware paging). Closing this is required to close
+`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` subcontract C.
+
+---
+
+### ISSUE-READ-AFTER-WRITE-CROSS-DC-01: Read-after-write across DCs
+
+**Status**: 🟡 Open
+**Severity**: Medium (availability)
+**Affected**: canonical lookups after remote upload
+**Source of record**: registry **X6**
+
+#### Problem
+
+Missing-row retry is 3×25 ms (local lag). Cross-DC visibility can yield
+transient 404/503, false-missing `check-blocks`, needless re-uploads. Safe
+(fail-closed) but an availability dependency. Related to X2's consistency model.
+
+#### Fix Direction
+
+Document as expected under RF-1-per-DC, or extend retry / use a stronger read
+for hot post-upload paths. Multi-DC tests still missing.
+
+---
+
 ## See Also
 
-- [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md) - **Start here**: one-screen list of everything open, with the doc-layer rules
+- [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md) - **Start here**: scoped open-work screen + tracker migration table
 - [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) - Component completion status
 - [API-REFERENCE.md](API-REFERENCE.md) - API endpoint documentation
 - [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md) - Architectural issues

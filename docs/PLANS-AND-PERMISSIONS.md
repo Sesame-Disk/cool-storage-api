@@ -639,7 +639,14 @@ If the M2M flow needs a dedicated endpoint later, the handler internals are alre
 Accounts will authenticate with a dedicated technical user in the platform org, not with a human session.
 
 Runbook:
-- ⚠️ The bootstrap, rotation, smoke-test and revocation procedure is **not written yet** — `ACCOUNTS-PROVISIONING-RUNBOOK.md` has been referenced here since before this file was split, but never existed. Tracked in [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md).
+- ⚠️ The bootstrap, rotation, smoke-test and revocation procedure is **not written yet** — `ACCOUNTS-PROVISIONING-RUNBOOK.md` has been referenced here since before this file was split, but never existed. Tracked as [`ISSUE-ACCOUNTS-PROVISIONING-RUNBOOK-01`](./KNOWN_ISSUES.md) (also listed in [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md)).
+
+**Code-verified 2026-07-25:** Accounts can already create/edit/delete orgs and
+users via the platform admin API key (`RequireSuperAdmin` +
+`apikeys.ScopeAdmin`). Remaining SesameFS work is M2M hygiene
+([`ISSUE-ACCOUNTS-M2M-PATH-01`](./KNOWN_ISSUES.md): `source=accounts` audit tag +
+idempotency), not inventing the channel. Optional request signing is deferred
+([`ISSUE-ACCOUNTS-M2M-REQUEST-SIGNING-01`](./KNOWN_ISSUES.md)).
 
 Operational contract:
 - create a non-human platform user such as `accounts-provisioner`
@@ -889,4 +896,4 @@ For developers migrating frontend code, here's the complete translation:
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Multi-tenancy model, org_id partitioning
 - [OIDC.md](OIDC.md) — OIDC provider config, login flow
 - [ADMIN-FEATURES.md](ADMIN-FEATURES.md) — Admin API endpoints
-- [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — open quota/plan work (replaced `quotas-pending-issues.txt`, removed 2026-07-25)
+- [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — scoped open-work index + migration table from removed `quotas-pending-issues.txt` (2026-07-25). Quota/Accounts item dispositions were **code-verified**; many former "pending" items are DONE (preview-plan-change, traffic quota UI, user→org quota display, admin user CRUD).
