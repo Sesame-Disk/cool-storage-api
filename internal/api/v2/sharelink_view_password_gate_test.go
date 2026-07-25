@@ -2,6 +2,7 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
 	goast "go/ast"
 	goparser "go/parser"
 	gotoken "go/token"
@@ -185,6 +186,45 @@ func TestShareFileBootstrapServesContentOncePasswordIsVerified(t *testing.T) {
 	}
 }
 
+func TestShareFileBootstrapServesOnlyOfficeOncePasswordIsVerified(t *testing.T) {
+	h, tc := newGateHandler(t, true)
+	status, opts, _ := emitGate(t, h, gateShareLink("/quarterly.docx", "bcrypt-hash"), true)
+
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if tc.linkDownloadCalls != 1 {
+		t.Fatalf("CreateLinkDownloadToken calls = %d, want 1 once the password cookie verifies", tc.linkDownloadCalls)
+	}
+	if _, present := opts["onlyOfficeConfig"]; !present {
+		t.Fatal("onlyOfficeConfig must be produced once the password cookie verifies")
+	}
+	if needPassword, _ := opts["needPassword"].(bool); needPassword {
+		// OnlyOffice bootstrap does not set needPassword; if it ever appears, a
+		// verified cookie must not leave it true.
+		t.Fatal("needPassword must not be true after a verified OnlyOffice bootstrap")
+	}
+}
+
+func TestBuildOnlyOfficeShareBootstrapFailsClosedWithoutPassword(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h, tc := newGateHandler(t, true)
+	sl := gateShareLink("/quarterly.docx", "bcrypt-hash")
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/d/"+sl.token, nil)
+
+	_, err := h.buildOnlyOfficeShareBootstrap(c, sl, "quarterly.docx", "docx", 42)
+	if !errors.Is(err, errShareLinkPasswordRequired) {
+		t.Fatalf("err = %v, want errShareLinkPasswordRequired", err)
+	}
+	if tc.linkDownloadCalls != 0 {
+		t.Fatalf("CreateLinkDownloadToken called %d time(s); the helper must fail before minting", tc.linkDownloadCalls)
+	}
+}
+
 func TestShareFileBootstrapServesContentWhenLinkHasNoPassword(t *testing.T) {
 	const secret = "PUBLIC-MARKDOWN-BODY"
 
@@ -235,6 +275,8 @@ func TestBothShareBootstrapEndpointsGoThroughTheGatedEmitter(t *testing.T) {
 	// Nothing outside the emitter may call the builder directly, or it would skip
 	// nothing today but could skip the gate after any future edit to the emitter.
 	directBuilderCalls := 0
+	// The OnlyOffice helper mints credentials; only the gated builder may call it.
+	onlyOfficeCallers := map[string]int{}
 
 	goast.Inspect(fileNode, func(node goast.Node) bool {
 		fn, ok := node.(*goast.FuncDecl)
@@ -261,6 +303,8 @@ func TestBothShareBootstrapEndpointsGoThroughTheGatedEmitter(t *testing.T) {
 				if fn.Name.Name != "emitShareFileBootstrap" {
 					directBuilderCalls++
 				}
+			case "buildOnlyOfficeShareBootstrap":
+				onlyOfficeCallers[fn.Name.Name]++
 			}
 			return true
 		})
@@ -274,6 +318,14 @@ func TestBothShareBootstrapEndpointsGoThroughTheGatedEmitter(t *testing.T) {
 	}
 	if directBuilderCalls != 0 {
 		t.Fatalf("buildShareFileBootstrapResponse is called directly from %d place(s) outside the emitter", directBuilderCalls)
+	}
+	if n := onlyOfficeCallers["buildShareFileBootstrapResponse"]; n != 1 {
+		t.Fatalf("buildShareFileBootstrapResponse calls buildOnlyOfficeShareBootstrap %d time(s), want 1", n)
+	}
+	for caller, n := range onlyOfficeCallers {
+		if caller != "buildShareFileBootstrapResponse" {
+			t.Fatalf("%s calls buildOnlyOfficeShareBootstrap %d time(s); only the gated builder may mint the download token", caller, n)
+		}
 	}
 }
 

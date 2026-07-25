@@ -4931,7 +4931,7 @@ OnlyOffice-viewable extension with OnlyOffice enabled) — a test that only driv
 
 #### Fix as shipped (2026-07-25)
 
-Two layers, because they fail differently:
+Three layers, because they fail differently:
 
 1. **`buildShareFileBootstrapResponse` resolves the password once, before either
    branch can do protected work.** The OnlyOffice branch is skipped outright, so
@@ -4943,6 +4943,9 @@ Two layers, because they fail differently:
    whenever `needPassword` is true.** It already computed `passwordVerified` for
    the flag; now the flag and the data cannot disagree. This is the layer that
    survives a future caller assembling content itself.
+3. **`buildOnlyOfficeShareBootstrap` fails closed on an unverified password**
+   (`errShareLinkPasswordRequired`) before minting, so a future direct call of
+   the helper cannot reopen the token half even if it bypasses the builder gate.
 
 `needPassword` still ships as `true` and the frontend still renders the password
 dialog, so the UX is unchanged: `SharedLinkPasswordDialog` posts to
@@ -4952,10 +4955,12 @@ re-fetches the bootstrap with the cookie set and gets the content.
 Coverage in `internal/api/v2/sharelink_view_password_gate_test.go`: both branches
 withheld without a cookie (asserting the body and that the token was never
 minted), both served with a valid HMAC cookie and on unprotected links, the
-bundle builder dropping content handed to it directly, and an AST check that both
-endpoints reach the gate through the one emitter. Each assertion was verified by
-mutation — reverting either layer, or letting one endpoint bypass the emitter,
-fails a test.
+bundle builder dropping content handed to it directly, the OnlyOffice helper
+failing closed when called without a cookie, and an AST check that both
+endpoints reach the gate through the one emitter (and that only the gated
+builder calls the OnlyOffice helper). Each assertion was verified by mutation —
+reverting either layer, or letting one endpoint bypass the emitter, fails a
+test.
 
 #### Related Docs
 

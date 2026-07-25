@@ -350,6 +350,13 @@ func (h *ShareLinkViewHandler) buildSharedMarkdownSmartLinkMap(sl *shareLinkData
 }
 
 func (h *ShareLinkViewHandler) buildOnlyOfficeShareBootstrap(c *gin.Context, sl *shareLinkData, filename, ext string, fileSize int64) (pageBootstrapResponse, error) {
+	// Fail closed here too: the caller's passwordVerified gate is the primary
+	// control, but this helper mints a real download credential. A future direct
+	// call must not be able to skip the check and reopen ISSUE-SHARELINK-PASSWORD-BYPASS-01.
+	if sl.passwordHash != "" && !h.verifyShareLinkPasswordCookie(c, sl.token, sl.passwordHash) {
+		return pageBootstrapResponse{}, errShareLinkPasswordRequired
+	}
+
 	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
 	if err != nil {
 		return pageBootstrapResponse{}, fmt.Errorf("failed to create download token: %w", err)
@@ -986,6 +993,12 @@ func buildZippedPath(rootName, relativePath string) string {
 // decrypt. It is stable rather than transient, so it maps to 403 like the raw
 // share-link surface, never to a retryable 503 and never to an empty 200.
 var errShareLinkLibraryLocked = errors.New("share link library is encrypted and locked")
+
+// errShareLinkPasswordRequired is returned when a helper that mints protected
+// credentials (OnlyOffice download token) is invoked without a verified password
+// cookie. Callers that already gate on passwordVerified should never see it;
+// it exists so a direct call cannot reopen the NF-1 token leak.
+var errShareLinkPasswordRequired = errors.New("share link password required")
 
 // respondShareBootstrapError answers the PUBLIC share-link surface. It logs the
 // real cause and returns a generic message, because the wrapped errors carry
