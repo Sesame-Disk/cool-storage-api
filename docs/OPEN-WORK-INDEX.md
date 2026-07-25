@@ -57,14 +57,14 @@ of them updated.
 
 ## Production blockers — must close before go-live
 
-**Readiness verdict is no-go as-is.** Single-node deployments are blocked by
-NF-1 and B4; multi-instance adds B1 and B5. See
+**Readiness verdict is still no-go as-is.** NF-1 closed 2026-07-25; **B4 remains
+the open single-node blocker**, and multi-instance adds B1 and B5. See
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-SHARELINK-PASSWORD-BYPASS-01` | HIGH | Password-protected share links serve file content **and an OnlyOffice download token** to anonymous callers | Readiness NF-1 — **single-node** |
-| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | No rate/concurrency limit on the seafhttp upload, download and block routes (umbrella; four closable subcontracts) | Readiness B4 ⊇ registry X10 |
+| ~~`ISSUE-SHARELINK-PASSWORD-BYPASS-01`~~ | ~~HIGH~~ | ✅ **Fixed 2026-07-25** — gate now runs before the content read and the OnlyOffice token mint | Readiness NF-1 |
+| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | No rate/concurrency limit on the seafhttp upload, download and block routes (umbrella; four closable subcontracts) | Readiness B4 ⊇ registry X10 — **the remaining single-node blocker** |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
 

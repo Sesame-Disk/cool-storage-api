@@ -18,7 +18,7 @@ is right about why.
 ### 🔴 Production Blockers (Must Fix Before Deploy)
 | Issue | Status | See |
 |-------|--------|-----|
-| **Share-link password bypass** | 🔴 **Open — go/no-go blocker (2026-07-24)** | Password-protected share links serve file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. Single-node reachable. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
+| **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
 | **Rate limiting on upload/download/blocks** | 🔴 Open | No rate or concurrency limit on the seafhttp upload, download and block routes. Umbrella with four closable subcontracts — see ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (B4; X10 is subcontract B). |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
@@ -4867,8 +4867,8 @@ whose zero value is the permissive answer. A new probe that bypasses
 
 ### ISSUE-SHARELINK-PASSWORD-BYPASS-01: Password-protected share links serve content to anonymous callers
 
-**Status**: 🔴 Open — go/no-go security blocker (filed 2026-07-24, re-verified against code 2026-07-25)
-**Severity**: High — authentication-control bypass with content disclosure; single-node reachable, no hash or credential needed beyond the public link token
+**Status**: ✅ Fixed (2026-07-25) — kept as the rationale record; filed 2026-07-24, re-verified against code 2026-07-25
+**Severity**: was High — authentication-control bypass with content disclosure; single-node reachable, no hash or credential needed beyond the public link token
 **Affected**: `GET /api/v2.1/share-links/:token/bootstrap[/]` and `GET /api/v2.1/share-links/:token/files/bootstrap[/]`
 **Source of record**: NF-1 / SH-6 in `docs/PROD-SECURITY-READINESS-20260724.md`
 
@@ -4928,6 +4928,34 @@ Regression coverage must assert the **body**, not the status: a 200 whose
 contract. Cover both endpoints and both branches (text/markdown and an
 OnlyOffice-viewable extension with OnlyOffice enabled) — a test that only drives
 `.md` will not see the download-token leak.
+
+#### Fix as shipped (2026-07-25)
+
+Two layers, because they fail differently:
+
+1. **`buildShareFileBootstrapResponse` resolves the password once, before either
+   branch can do protected work.** The OnlyOffice branch is skipped outright, so
+   `CreateLinkDownloadToken` is never reached for an unverified caller, and the
+   inline-text read is skipped rather than performed-and-discarded — that read is
+   a Cassandra lookup plus an S3 fetch plus a decrypt, so serving it would have
+   let anyone holding the token drive that work on every request.
+2. **`buildSharedFileBundleBootstrap` drops `fileContent` and `smartLinkMap`
+   whenever `needPassword` is true.** It already computed `passwordVerified` for
+   the flag; now the flag and the data cannot disagree. This is the layer that
+   survives a future caller assembling content itself.
+
+`needPassword` still ships as `true` and the frontend still renders the password
+dialog, so the UX is unchanged: `SharedLinkPasswordDialog` posts to
+`/api/v2.1/public-links/:token/check-password` and reloads, and the reload
+re-fetches the bootstrap with the cookie set and gets the content.
+
+Coverage in `internal/api/v2/sharelink_view_password_gate_test.go`: both branches
+withheld without a cookie (asserting the body and that the token was never
+minted), both served with a valid HMAC cookie and on unprotected links, the
+bundle builder dropping content handed to it directly, and an AST check that both
+endpoints reach the gate through the one emitter. Each assertion was verified by
+mutation — reverting either layer, or letting one endpoint bypass the emitter,
+fails a test.
 
 #### Related Docs
 

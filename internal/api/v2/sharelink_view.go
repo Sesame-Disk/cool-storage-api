@@ -121,7 +121,13 @@ func marshalPageOptionsJSON(pageOptions any) string {
 
 // incrementViewCount increments the view_count for a share link asynchronously.
 // Call this AFTER verifying the link is active, not expired, and password-verified.
+//
+// The nil check is not decoration: the write happens in a bare goroutine, so a
+// nil dereference there panics the whole process rather than failing one request.
 func (h *ShareLinkViewHandler) incrementViewCount(token string) {
+	if h == nil || h.db == nil {
+		return
+	}
 	go func() {
 		if err := incrementShareLinkCounterDualWrite(h.db, token, "view_count", time.Now()); err != nil {
 			log.Printf("[incrementViewCount] failed to update view_count for token %s: %v", token, err)
@@ -224,6 +230,18 @@ func (h *ShareLinkViewHandler) buildSharedFileBundleBootstrap(c *gin.Context, sl
 	noPassword := sl.passwordHash == "" || passwordVerified
 	needPassword := sl.passwordHash != "" && !passwordVerified
 	rawContentType := resolveInlineContentType(ext)
+
+	// The password gate lives here, at the point of emission, and not only in the
+	// caller that happens to exist today. `needPassword` alone protected nothing:
+	// the frontend short-circuits to the password dialog, so a browser looked
+	// correct while the JSON still carried the bytes to anyone reading the raw
+	// response. Callers are expected to skip the read entirely (see
+	// buildShareFileBootstrapResponse); this drops whatever reaches us anyway, so
+	// a future caller that assembles content itself cannot reopen the hole.
+	if needPassword {
+		fileContent = ""
+		smartLinkMap = nil
+	}
 
 	pageOptions := map[string]any{
 		"sharedToken":                sl.token,
@@ -1122,7 +1140,13 @@ func (h *ShareLinkViewHandler) buildShareFileBootstrapResponse(c *gin.Context, s
 		fileSize = sl.targetEntry.Size
 	}
 
-	if ext != "pdf" && h.config.OnlyOffice.Enabled && isOnlyOfficeViewable(ext) {
+	// Resolve the password once, before either branch below can do protected work.
+	// Both branches leak without it, in different currencies: the OnlyOffice branch
+	// mints a real download credential, and the text branch reads and returns the
+	// file. Neither is reachable for an unverified caller.
+	passwordVerified := sl.passwordHash == "" || h.verifyShareLinkPasswordCookie(c, sl.token, sl.passwordHash)
+
+	if passwordVerified && ext != "pdf" && h.config.OnlyOffice.Enabled && isOnlyOfficeViewable(ext) {
 		bootstrap, err := h.buildOnlyOfficeShareBootstrap(c, sl, filename, ext, fileSize)
 		if err == nil {
 			return bootstrap, http.StatusOK, nil
@@ -1134,7 +1158,11 @@ func (h *ShareLinkViewHandler) buildShareFileBootstrapResponse(c *gin.Context, s
 
 	fileContent := ""
 	var smartLinkMap map[string]sharedMarkdownSmartLinkTarget
-	if bundleName == "sharedFileViewText" || bundleName == "sharedFileViewMarkdown" {
+	// Skipping the read is not just belt-and-braces over the drop in
+	// buildSharedFileBundleBootstrap: the read is a Cassandra lookup plus an S3
+	// fetch plus a decrypt, so serving it to an unverified caller would let anyone
+	// holding the token drive that work on every request.
+	if passwordVerified && (bundleName == "sharedFileViewText" || bundleName == "sharedFileViewMarkdown") {
 		var contentErr error
 		fileContent, contentErr = shareInlineTextFn(h, sl)
 		if contentErr != nil {
