@@ -107,7 +107,7 @@ on every replica in every DC until both close.
 | `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01` | LOW–MED | `handleAutoLogin` hardcodes cookie `Secure=false` |
 | `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01` | LOW (config) | Both chunked-upload size guards can be disabled together; staging guard is `0` in **every** shipped config |
 | `ISSUE-ACCOUNTS-PROVISIONING-RUNBOOK-01` | LOW (docs) | Bootstrap/rotation/smoke/revoke runbook for the Accounts platform API key was never written |
-| `ISSUE-ORG-ADMIN-DELETION-BANNER-01` | LOW (UX) | Org-admin dashboard has no banner when the org is soft-deleted / in grace |
+| `ISSUE-ORG-ADMIN-DELETION-BANNER-01` | LOW (UX) | Soft-delete lifecycle exists; org bootstrap omits `deleted_at`/grace + frontend banner TODO |
 | `ISSUE-ACCOUNTS-M2M-REQUEST-SIGNING-01` | LOW (hardening) | Optional HMAC/JWT request signing beyond admin API key — **not required for v1**; channel is API key by design |
 | `ISSUE-SHARELINK-BCRYPT-COST-01` | LOW | Share-link passwords use `bcrypt.DefaultCost` (10), not Argon2id |
 | `ISSUE-ENCRYPTED-VIEW-CONTENT-LENGTH-01` | LOW | v2 inline-view/share-raw omit `Content-Length` on encrypted downloads |
@@ -187,7 +187,7 @@ roadmap/PLANS, not this index's defect list; **DUPLICATE** = already had an ISSU
 | 1. Per-user storage quota on uploads | DONE | `ISSUE-USER-STORAGE-ENFORCE-01` | Fixed 2026-05-14 |
 | 2. Formalizar path M2M Accounts → SesameFS | OPEN (partial) | `ISSUE-ACCOUNTS-M2M-PATH-01` | **Channel works today:** `RequireSuperAdmin` + `apikeys.ScopeAdmin` on `/admin`; `UpdateOrganization`, `AdminAddOrgUser` / update / delete exist. Still missing: `source=accounts` audit tag (hardcoded `manual-superadmin`), idempotency |
 | 3. preview/evaluate plan change | DONE | `PreviewOrganizationPlanChange` | Route live |
-| 4. Invite/create users vía Accounts | PARTIAL / OPEN | `PLANS-AND-PERMISSIONS.md` Phase 4.5; `ISSUE-ACCOUNTS-M2M-PATH-01` | **Mechanism exists:** `AdminAddOrgUser` / update / delete / `AdminCreateUser`; org-local writes gated by `Accounts.DisableOrgUserWrites` (default true); `max_users` enforced in `AddOrgUser` and OIDC provision. **Contract unfinished:** SoT for invite vs direct provision, owner/org-admin UX, and M2M audit/idempotency remain open — not "DONE" as an Accounts integration flow |
+| 4. Invite/create users vía Accounts | DONE (operational) | Admin user CRUD + Accounts remote | **Live today:** Accounts provisions/invites users via a dedicated superadmin API key calling `AdminCreateUser` / `AdminAddOrgUser` (org-local writes gated by `Accounts.DisableOrgUserWrites`, default true; `max_users` enforced). Residual hygiene is tracked separately as `ISSUE-ACCOUNTS-M2M-PATH-01` (audit source + idempotency), not as missing invite/provisioning. Optional Phase 4.5 UX polish in `PLANS-AND-PERMISSIONS.md` is roadmap, not a blocker for this item. |
 | 5. External org identifier | DECISION | `PLANS-AND-PERMISSIONS.md` | No `external_org_id` in schema — wait for Accounts contract |
 | 6. External billing IDs | DECISION | `PLANS-AND-PERMISSIONS.md` | No billing columns yet |
 | 7. Snapshot pre-downgrade users | DECISION / ROADMAP | `PLANS-AND-PERMISSIONS.md` | Preview computes counts; no persisted activation snapshot |
@@ -230,7 +230,7 @@ table or the May audit table). Duplicate rows that only pointed at those same
 canonical docs are not repeated here. Hard-blocker GC multi-instance wording is
 superseded by the upload-fence X1/X2 + `gc.enabled: false` posture. Accounts
 work is covered by the quotas migration rows (`ISSUE-ACCOUNTS-M2M-PATH-01`,
-runbook, invite PARTIAL).
+runbook; invite/create via Accounts is DONE operationally).
 
 ---
 

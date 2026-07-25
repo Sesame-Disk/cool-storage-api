@@ -127,7 +127,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 |-------|--------|---------|
 | **Superadmin: Org Soft-Delete/Restore UI** | ✅ Fixed (2026-03-25) | Status column with color-coded badges and separate Deactivate / Delete / Reactivate / Restore actions are implemented in `frontend/src/pages/sys-admin/orgs/orgs-content.js`. **This row said "frontend TODO" until 2026-07-25** while the detail section below already recorded it resolved on 2026-03-25 — a summary/detail contradiction inside this same file. Re-verified against the frontend 2026-07-25. See ISSUE-FRONTEND-ORG-DELETE-01 below. |
 | **Superadmin: Deleted Orgs List/Filter** | ✅ Fixed (2026-03-25) | Status filter support landed with the same change; search results carry the lifecycle actions too. Same stale-row correction as above. |
-| **Org Admin: Org Deletion Awareness** | 🟡 Backend ready, frontend TODO | Org admin dashboard should show a banner/warning if their org is in "deleted" state with days remaining before permanent cascade. See `ISSUE-ORG-ADMIN-DELETION-BANNER-01`. |
+| **Org Admin: Org Deletion Awareness** | 🟡 Soft-delete lifecycle ready; bootstrap + frontend TODO | Soft-delete / grace exists server-side, but org-admin bootstrap does not expose `deleted_at` or grace remaining, and the dashboard has no banner. See `ISSUE-ORG-ADMIN-DELETION-BANNER-01`. |
 
 ### 🟢 Lower Priority (Polish/UX)
 | Issue | Status | Notes |
@@ -5275,9 +5275,9 @@ turns "every author must remember" into "an author must actively opt out".
 
 ### ISSUE-ORG-ADMIN-DELETION-BANNER-01: Org-admin UI has no soft-delete grace banner
 
-**Status**: 🟡 Open — backend ready, frontend TODO
+**Status**: 🟡 Open — backend bootstrap exposure + frontend banner required
 **Severity**: Low (UX / operator awareness)
-**Affected**: org-admin dashboard frontend; org soft-delete / grace period already exists server-side
+**Affected**: org bootstrap payload (`loadBootstrapOrgData` / `buildOrgBootstrapPageOptions`) and org-admin dashboard frontend; org soft-delete / grace lifecycle already exists server-side
 **Source of record**: `KNOWN_ISSUES.md` Frontend Pending summary row (left without an id until 2026-07-25)
 
 #### Problem
@@ -5288,16 +5288,29 @@ remaining. Superadmin soft-delete/restore UI and the deleted-orgs filter are
 already fixed (`ISSUE-FRONTEND-ORG-DELETE-01`); this tenant-facing awareness
 gap is the remaining row from that group.
 
+This is **not** frontend-only. `loadBootstrapOrgData` selects name, settings,
+plan, quotas, and period fields from `organizations` but **not** `deleted_at`
+(or status lifecycle). `buildOrgBootstrapPageOptions` then exposes `orgID`,
+name, members, and settings flags — still without deletion state or grace
+remaining — so the SPA has nothing to render even if a banner component were
+added.
+
 #### Fix Direction
 
-Surface org `deleted_at` / grace remaining on the org-admin shell (banner or
-dashboard card). Reuse the same retention messaging helpers the sysadmin orgs
-page already uses where possible.
+Three edits, in order: add the field to the `bootstrapOrgData` struct, add
+`deleted_at` (and status) to the `loadBootstrapOrgData` SELECT — it currently
+reads name, settings, max_users, plan, billing_cycle, quota_policy,
+storage_config, the quota columns and the period columns, and nothing about
+lifecycle — then expose status and grace remaining (from `deleted_at` +
+`GC.OrgGraceDays`, default 30) in `buildOrgBootstrapPageOptions`. Only then
+reuse the sysadmin retention messaging helpers on the org-admin frontend shell
+(banner or dashboard card).
 
 #### Related Docs
 
 - [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md)
 - `ISSUE-FRONTEND-ORG-DELETE-01` (resolved superadmin counterpart)
+- `internal/api/bootstrap.go` (`loadBootstrapOrgData`, `buildOrgBootstrapPageOptions`)
 
 ---
 
