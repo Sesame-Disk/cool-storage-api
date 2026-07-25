@@ -1,5 +1,17 @@
 # Security Assessment v3 — 2026-04-14
 
+> **⚠️ HISTORICAL SNAPSHOT — do not read status from this file.** This is a dated
+> point-in-time audit, superseded by
+> [SECURITY-ASSESSMENT-2026-04-v4.md](./SECURITY-ASSESSMENT-2026-04-v4.md)
+> (2026-04-16) and, for the upload/download/sharing surfaces, by
+> [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
+> Verdicts here ("FIXED", "IMPROVED", "OPEN") were true on its own date and were
+> **not** updated afterwards. For what is actually still open, read
+> [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) and
+> [KNOWN_ISSUES.md](./KNOWN_ISSUES.md). Keep this file for its evidence,
+> reproduction scripts and reasoning — not for its status column.
+
+
 **Date:** 2026-04-14
 **Previous:** [v2 (2026-04-13)](./SECURITY-ASSESSMENT-2026-04-v2.md) |
 [v1 (2026-04-09)](./SECURITY-ASSESSMENT-2026-04.md)

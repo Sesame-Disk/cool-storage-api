@@ -56,7 +56,7 @@ checks on share links, upload links, library creation, and group creation.
 - Plan upgrades still need the formal Accounts provisioning path and runbook to avoid ad-hoc manual operations.
 
 Operational reference:
-- [ACCOUNTS-PROVISIONING-RUNBOOK.md](ACCOUNTS-PROVISIONING-RUNBOOK.md) — bootstrap and rotation procedure for the dedicated platform service account API key.
+- ⚠️ **Missing doc:** a bootstrap/rotation runbook for the dedicated platform service-account API key. `ACCOUNTS-PROVISIONING-RUNBOOK.md` is referenced in two places but was never written.
 
 **Key files:**
 - `internal/plans/resolver.go` — `ResolveCapabilities()` ready to use, do not duplicate

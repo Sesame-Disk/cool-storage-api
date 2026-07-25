@@ -5020,7 +5020,7 @@ memory question entirely and is the better long-term shape.
 
 - `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X10 — same defect, upload-fence view)
 - `docs/PROD-SECURITY-READINESS-20260724.md` (B4, SEC-2, SH-1, checklist item 3)
-- `docs/SECURITY-ASSESSMENT-2026-04.md` (H-5 — the original 2026-04 filing)
+- `docs/SECURITY-ASSESSMENT-2026-04.md` **H-7** — the original 2026-04 filing. (The readiness report cited H-5 for this; H-5 is share-link token enumeration. H-7 is the rate-limit finding, and its line "Upload, download, and `/api/v2/blocks/upload` have no rate limit at all" is the origin of B4.)
 
 ---
 

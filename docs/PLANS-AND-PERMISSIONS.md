@@ -639,7 +639,7 @@ If the M2M flow needs a dedicated endpoint later, the handler internals are alre
 Accounts will authenticate with a dedicated technical user in the platform org, not with a human session.
 
 Runbook:
-- See [ACCOUNTS-PROVISIONING-RUNBOOK.md](ACCOUNTS-PROVISIONING-RUNBOOK.md) for the exact bootstrap, rotation, smoke-test, and revocation procedure.
+- ⚠️ The bootstrap, rotation, smoke-test and revocation procedure is **not written yet** — `ACCOUNTS-PROVISIONING-RUNBOOK.md` has been referenced here since before this file was split, but never existed. Tracked in [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md).
 
 Operational contract:
 - create a non-human platform user such as `accounts-provisioner`
@@ -889,4 +889,4 @@ For developers migrating frontend code, here's the complete translation:
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Multi-tenancy model, org_id partitioning
 - [OIDC.md](OIDC.md) — OIDC provider config, login flow
 - [ADMIN-FEATURES.md](ADMIN-FEATURES.md) — Admin API endpoints
-- `quotas-pending-issues.txt` — Tracking document for quota/plan work
+- [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — open quota/plan work (replaced `quotas-pending-issues.txt`, removed 2026-07-25)

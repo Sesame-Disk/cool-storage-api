@@ -301,7 +301,7 @@ SeafHTTP web finalize path because that flow still splits uploads into 8 MB
 blocks before storing them, so those block PUTs normally stay below the generic
 multipart threshold. The main web-upload relay limits therefore remain S-1/S-3
 below plus the broader store-and-forward finalize shape documented in
-`docs/UPLOAD-S3-RELAY-BOTTLENECK.md`.
+`docs/UPLOAD-PR58-RESEARCH-ARCHIVE.md`.
 
 Operational note: the abort path now uses a fresh bounded context so cleanup can
 still run after the caller context is cancelled, but that does not eliminate the
@@ -1674,7 +1674,7 @@ Mitigation: pipe these through a small `cleanupQueue` (durable or in-memory boun
 
 ### 19.j. Upload Saving-Phase Performance Speedup Deferred
 
-The work in `feat/library-write-coordinator` (block pipeline + local mutex coordinator, 17-55× speedup on the "Saving..." phase) was intentionally left out of `feat/multiregion-head-safety` per the [PR58 audit](UPLOAD-PERFORMANCE-PR58-AUDIT.md). The performance baseline of the current branch is the same as `main`; the speedup work lives in branches `feat/library-write-coordinator` and `feat/uploadperformance` and must be re-evaluated separately under contention before merge.
+The work in `feat/library-write-coordinator` (block pipeline + local mutex coordinator, 17-55× speedup on the "Saving..." phase) was intentionally left out of `feat/multiregion-head-safety` per the [PR58 audit](UPLOAD-PR58-RESEARCH-ARCHIVE.md). The performance baseline of the current branch is the same as `main`; the speedup work lives in branches `feat/library-write-coordinator` and `feat/uploadperformance` and must be re-evaluated separately under contention before merge.
 
 This is intentional debt, tracked here for completeness with section 5 (Web Upload Pipeline Follow-Ups).
 

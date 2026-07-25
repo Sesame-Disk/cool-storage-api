@@ -110,6 +110,43 @@ Not findings — things nobody has proven either way.
 
 ---
 
+## Document consolidation (2026-07-25)
+
+The contradictions this index exists to prevent came from **seven** places all
+claiming to say what was pending. Consolidated as follows.
+
+**Removed** (content verified to exist elsewhere before deleting):
+
+| File | Why | Where its content lives now |
+|---|---|---|
+| `PENDING-ISSUES-AUDIT-2026-05-14.md` | Orphan — linked from nothing, 2.5 months stale, a fifth parallel pending-work tracker. All 18 items verified present elsewhere. | `V1-PRODUCTION-ROADMAP.md` (backup/DR, antivirus, cold storage), `KNOWN_ISSUES.md`, `TECHNICAL-DEBT.md` |
+| `sesamefs-pending-issues.txt` (root) | Last updated 2026-04-04. Its own header already named the four docs as canonical. | the four docs it pointed at |
+| `quotas-pending-issues.txt` (root) | Last updated 2026-05-14, same shape. | `QUOTAS-AND-TRAFFIC-PLAN.md`, `KNOWN_ISSUES.md` |
+| `UPLOAD-PERFORMANCE-PR58-AUDIT.md` | Two halves of one PR58 research archive, same status, overlapping conclusions. | merged into `UPLOAD-PR58-RESEARCH-ARCHIVE.md` |
+| `UPLOAD-S3-RELAY-BOTTLENECK.md` | (same) | (same) |
+
+**Marked historical, kept for evidence:** `SECURITY-ASSESSMENT-2026-04.md`,
+`-v2`, `-v3`. Each now carries a banner saying its status column is a dated
+snapshot that was never updated. They keep real value — reproduction scripts,
+probe results, reasoning — but were being cited as if live. That is how the
+readiness report ended up citing **H-5** (share-link token enumeration) for the
+rate-limiting finding, which is actually **H-7**.
+
+`-v4` stays current-ish as the last full assessment; the readiness report
+supersedes it for upload/download/sharing specifically.
+
+**Still to decide** — these overlap but each has a distinct audience, so they
+were left alone rather than merged blindly:
+
+- `KNOWN_ISSUES.md` (4.9k lines) vs `TECHNICAL-DEBT.md` (2.2k) — the boundary
+  "defect vs. architectural debt" is real but not consistently applied. Several
+  items appear in both.
+- `V1-PRODUCTION-ROADMAP.md` vs `IMPLEMENTATION_STATUS.md` vs `CURRENT_WORK.md`
+  — three answers to "how ready are we", with three different percentages and
+  three different blocker lists. Candidate for one file.
+
+---
+
 ## Completed series (for context, not work)
 
 - **Upload-fence / canonical-storage series, PR-1..PR-10** (#137–#146): all
