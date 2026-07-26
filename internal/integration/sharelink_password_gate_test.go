@@ -29,9 +29,9 @@ import (
 // Scope, stated honestly: this fixture is notes.md. It proves both endpoints and
 // the inline-content half end-to-end (withhold without cookie; serve after the
 // real check-password exchange). It does not exercise the OnlyOffice branch —
-// that credential half is covered by the guarded-helper and countingTokenCreator
-// unit tests. A future .docx + OnlyOffice-enabled integration would strengthen
-// that half but is not required to keep NF-1 closed.
+// that credential half is covered by
+// TestShareLinkBootstrapWithholdsOnlyOfficeCredentialWithoutPassword below,
+// which needs a .docx fixture because Markdown never enters the minting path.
 //
 // It asserts on the BODY, never on the status: the vulnerable response was a
 // perfectly ordinary 200. A status-only test passes against the bug.
@@ -165,8 +165,9 @@ func TestShareLinkBootstrapWithholdsOnlyOfficeCredentialWithoutPassword(t *testi
 //
 // onlyOfficeConfig is asserted absent as belt-and-braces on this Markdown
 // fixture, not as proof of the OnlyOffice credential half — that config is
-// absent for .md even against the vulnerable code. The OnlyOffice half is pinned
-// by the unit suite (countingTokenCreator + helper fail-closed).
+// absent for .md even against the vulnerable code. The credential half is
+// pinned live by TestShareLinkBootstrapWithholdsOnlyOfficeCredentialWithoutPassword
+// (and by the countingTokenCreator / helper fail-closed unit tests).
 func assertBootstrapWithholdsProtectedPayload(t *testing.T, body, secret string) {
 	t.Helper()
 
