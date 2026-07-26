@@ -18,7 +18,7 @@ is right about why.
 ### 🔴 Production Blockers (Must Fix Before Deploy)
 | Issue | Status | See |
 |-------|--------|-----|
-| **Share-link password bypass** | 🔴 **Open — go/no-go blocker (2026-07-24)** | Password-protected share links serve file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. Single-node reachable. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
+| **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
 | **Rate limiting on upload/download/blocks** | 🔴 Open | No rate or concurrency limit on the seafhttp upload, download and block routes. Umbrella with four closable subcontracts — see ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (B4; X10 is subcontract B). |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
@@ -4867,8 +4867,8 @@ whose zero value is the permissive answer. A new probe that bypasses
 
 ### ISSUE-SHARELINK-PASSWORD-BYPASS-01: Password-protected share links serve content to anonymous callers
 
-**Status**: 🔴 Open — go/no-go security blocker (filed 2026-07-24, re-verified against code 2026-07-25)
-**Severity**: High — authentication-control bypass with content disclosure; single-node reachable, no hash or credential needed beyond the public link token
+**Status**: ✅ Fixed (2026-07-25) — kept as the rationale record; filed 2026-07-24, re-verified against code 2026-07-25
+**Severity**: was High — authentication-control bypass with content disclosure; single-node reachable, no hash or credential needed beyond the public link token
 **Affected**: `GET /api/v2.1/share-links/:token/bootstrap[/]` and `GET /api/v2.1/share-links/:token/files/bootstrap[/]`
 **Source of record**: NF-1 / SH-6 in `docs/PROD-SECURITY-READINESS-20260724.md`
 
@@ -4928,6 +4928,80 @@ Regression coverage must assert the **body**, not the status: a 200 whose
 contract. Cover both endpoints and both branches (text/markdown and an
 OnlyOffice-viewable extension with OnlyOffice enabled) — a test that only drives
 `.md` will not see the download-token leak.
+
+#### Fix as shipped (2026-07-25)
+
+Three layers, because they fail differently:
+
+1. **`buildShareFileBootstrapResponse` resolves the password once, before either
+   branch can do protected work.** The OnlyOffice branch is skipped outright, so
+   `CreateLinkDownloadToken` is never reached for an unverified caller, and the
+   inline-text read is skipped rather than performed-and-discarded — that read is
+   a Cassandra lookup plus an S3 fetch plus a decrypt, so serving it would have
+   let anyone holding the token drive that work on every request.
+2. **`buildSharedFileBundleBootstrap` drops `fileContent` and `smartLinkMap`
+   whenever `needPassword` is true.** It already computed `passwordVerified` for
+   the flag; now the flag and the data cannot disagree. This is the layer that
+   survives a future caller assembling content itself.
+3. **`buildOnlyOfficeShareBootstrap` fails closed on an unverified password**
+   (`errShareLinkPasswordRequired`) before minting, so a future direct call of
+   the helper cannot reopen the token half even if it bypasses the builder gate.
+
+`needPassword` still ships as `true` and the frontend still renders the password
+dialog, so the UX is unchanged: `SharedLinkPasswordDialog` posts to
+`/api/v2.1/public-links/:token/check-password` and reloads, and the reload
+re-fetches the bootstrap with the cookie set and gets the content.
+
+Coverage, in two tiers:
+
+**Unit** (`internal/api/v2/sharelink_view_password_gate_test.go`): both branches
+withheld without a cookie (asserting the body and that the token was never
+minted), both served with a valid HMAC cookie and on unprotected links, the
+bundle builder dropping content handed to it directly, the OnlyOffice helper
+failing closed when called without a cookie, and an AST check over **every
+non-test file in package `v2`** that both endpoints reach the gate through the
+one emitter and that only the gated builder calls the OnlyOffice helper.
+
+**Integration** (`internal/integration/sharelink_password_gate_test.go`), two
+tests because one fixture cannot reach both halves:
+
+- `TestShareLinkBootstrapPasswordGateOnBothEndpoints` — the **inline-content**
+  half across **both public endpoints**. Anonymous HTTP against the live cluster,
+  no auth header and no cookie, asserting the body withholds `fileContent` while
+  keeping `needPassword: true`; then the real `check-password` exchange and a
+  re-request with the returned cookie, asserting the content *is* served. That
+  second half matters as much as the first: a gate that always denied would pass
+  the exploit assertion and silently break the feature.
+- `TestShareLinkBootstrapWithholdsOnlyOfficeCredentialWithoutPassword` — the
+  **credential** half. It needs a separate test because the fixture above is
+  `notes.md` and `isOnlyOfficeViewable("md")` is **false**: Markdown never enters
+  the branch that mints the token, so asserting `onlyOfficeConfig` absent there
+  would pass against the vulnerable code. Only an OnlyOffice-viewable extension
+  reaches it. Its verified half doubles as a guard against a vacuous pass — if
+  OnlyOffice were disabled or its JWT secret unset, the helper would error, the
+  builder would fall back to the plain bundle, and `onlyOfficeConfig` would be
+  absent in *both* directions; requiring it present after the password exchange
+  turns that misconfiguration into a failure rather than a false green.
+
+The AST check earns its keep but is deliberately described as a tripwire, not a
+proof — it is syntactic, never executes a handler, and cannot see a call reached
+through a function value or another package. The two integration tests are what
+close the runtime gap, now for both halves.
+
+Every assertion was verified by mutation rather than trusted green. At unit
+level: reverting any one layer, or letting an endpoint bypass the emitter, or
+adding a second caller of the OnlyOffice helper, fails a named test. At
+integration level, against the rebuilt live cluster:
+
+- Reverting all three layers reproduced the **content** exploit verbatim — both
+  endpoints answered `200` with `"fileContent":"SECRET-…"` next to
+  `"needPassword":true`.
+- Reverting only the two OnlyOffice guards reproduced the **credential** exploit
+  verbatim — an anonymous caller received a signed OnlyOffice config carrying a
+  live download URL (`/seafhttp/files/<token>/quarterly.docx`) and its JWT.
+
+That second mutation is the one the earlier `.md`-only coverage could not have
+caught, which is exactly why the split fixture exists.
 
 #### Related Docs
 

@@ -8,6 +8,8 @@
 
 > **Code validation (2026-07-25):** every finding below was re-checked against `main` at `0dac50993`. **All findings hold.** One new disclosure was found inside NF-1's blast radius (an OnlyOffice download token minted with no password check — see NF-1), one claim was narrowed (B4 is partly stale: several surfaces *do* have limiters), one was sharpened (NF-7: the staging guard is disabled in *every* shipped config, prod included), and one was made precise (NF-6 is delete-plus-org-update, not delete-only). Prefer **symbol names** over `file.go:NNNN` — PR-10 shifted `sync.go` by ~30 lines and invalidated several cites. Validation deltas are tabulated in the "Code validation" section at the end.
 
+> **Post-snapshot status changes are in one place: the "Status changes after the audit snapshot" section at the end.** Everything else below — the verdict callout, the blockers table, the per-area tables, the checklist, the summary and the empirical results — is the **2026-07-24/25 audit snapshot and is deliberately not retro-edited**, even where a finding has since been fixed. An earlier revision of this update did edit those rows in place; that turned this document back into a second live tracker competing with `KNOWN_ISSUES.md`, which is exactly what the consolidation was for. Reverted.
+
 > **Status of record is [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).** Every open defect row below links to an `ISSUE-*` id. Columns labelled **Status as of 2026-07-25** are a snapshot for this audit; do not treat them as a second live tracker. For the scoped open-work screen, see [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md).
 
 > Companion depth docs: [UPLOAD-PERFORMANCE-SECURITY-2026-06.md](./UPLOAD-PERFORMANCE-SECURITY-2026-06.md), [UPLOAD-RESUME-ANALYSIS-20260619.md](./UPLOAD-RESUME-ANALYSIS-20260619.md), `KNOWN_ISSUES.md`. This doc is the short readiness view, not a replacement for them.
@@ -278,3 +280,29 @@ placeholder), while the upload-size guards have no env override at all.
 of the multiregion stack. The 2026-07-24 empirical results for B1/B2/B5 stand as
 recorded; the OnlyOffice half of NF-1 is confirmed by reading only and should be
 driven live when the fix is written.
+
+---
+
+## Status changes after the audit snapshot
+
+Everything above is the audit as written on its date. This is the only section
+that moves. It records **what changed and when** — not a second status column;
+the authoritative state is always `KNOWN_ISSUES.md`.
+
+| Audit id | Issue id | Change | Date |
+|---|---|---|---|
+| NF-1 / SH-6 | `ISSUE-SHARELINK-PASSWORD-BYPASS-01` | **Fixed.** Password resolved before the inline read and before the OnlyOffice token mint; the bundle builder drops protected content it is handed; the OnlyOffice helper fails closed on its own. Coverage: integration proves both halves live — both public endpoints for inline content, and a `.docx` fixture for the OnlyOffice credential, since `.md` never enters that branch. Both mutation-verified by reverting the guards and rebuilding the server. | 2026-07-25 |
+
+**Effect on the verdict: none.** It stays **no-go as-is**. B4
+(`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`) is also single-node reachable and remains
+open, so closing NF-1 removes one of the two single-node blockers, not the
+condition.
+
+**A taxonomy wrinkle worth naming rather than silently fixing.** The summary
+table lists SH-1 under *High* for Sharing while listing B4 as a *blocker* under
+Security posture — but SH-1 **is** subcontract A of B4 (the anonymous
+upload-link write path). So "Sharing" inherits a blocker through SH-1 no matter
+what its own row says, and with NF-1 fixed that is now the only blocker Sharing
+carries. The table is left as written because it is snapshot prose; read the
+blocker set from the blockers table and from `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`'s
+subcontracts, not from the per-area summary.
