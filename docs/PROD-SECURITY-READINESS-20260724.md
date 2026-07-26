@@ -291,7 +291,7 @@ the authoritative state is always `KNOWN_ISSUES.md`.
 
 | Audit id | Issue id | Change | Date |
 |---|---|---|---|
-| NF-1 / SH-6 | `ISSUE-SHARELINK-PASSWORD-BYPASS-01` | **Fixed.** Password resolved before the inline read and before the OnlyOffice token mint; the bundle builder drops protected content it is handed; the OnlyOffice helper fails closed on its own. | 2026-07-25 |
+| NF-1 / SH-6 | `ISSUE-SHARELINK-PASSWORD-BYPASS-01` | **Fixed.** Password resolved before the inline read and before the OnlyOffice token mint; the bundle builder drops protected content it is handed; the OnlyOffice helper fails closed on its own. Coverage: integration proves both halves live — both public endpoints for inline content, and a `.docx` fixture for the OnlyOffice credential, since `.md` never enters that branch. Both mutation-verified by reverting the guards and rebuilding the server. | 2026-07-25 |
 
 **Effect on the verdict: none.** It stays **no-go as-is**. B4
 (`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`) is also single-node reachable and remains

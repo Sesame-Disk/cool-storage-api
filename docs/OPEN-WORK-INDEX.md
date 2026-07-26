@@ -76,6 +76,9 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 - `ISSUE-SHARELINK-PASSWORD-BYPASS-01` — **Fixed 2026-07-25** (readiness NF-1 /
   SH-6). Gate runs before the inline read and the OnlyOffice token mint; the
   bundle builder drops protected content; the OnlyOffice helper fails closed.
+  Live integration covers both halves: both public endpoints for inline
+  content, and a `.docx` fixture for the OnlyOffice credential (a `.md` fixture
+  cannot reach that branch). Both mutation-verified against the cluster.
 
 ## Blockers that keep destructive GC disabled
 

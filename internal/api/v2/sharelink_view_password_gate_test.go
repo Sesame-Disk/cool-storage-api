@@ -265,9 +265,13 @@ func TestShareFileBootstrapServesContentWhenLinkHasNoPassword(t *testing.T) {
 // added anywhere else in the package. It is still a *syntactic* check. It does not
 // execute the handlers, and it cannot see a call reached through a function value,
 // an interface, or another package. It is a cheap tripwire on the call graph, not
-// a proof; the behavioural guarantees come from the tests above and from
-// TestShareLinkBootstrapPasswordGateOnBothEndpoints in internal/integration, which
-// drives the real HTTP endpoints.
+// a proof; the behavioural guarantees come from the unit tests above and, at
+// runtime, from internal/integration —
+// TestShareLinkBootstrapPasswordGateOnBothEndpoints for the inline-content half
+// across both endpoints, and
+// TestShareLinkBootstrapWithholdsOnlyOfficeCredentialWithoutPassword for the
+// credential half, which needs a .docx fixture because .md never reaches that
+// branch.
 func TestBothShareBootstrapEndpointsGoThroughTheGatedEmitter(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {

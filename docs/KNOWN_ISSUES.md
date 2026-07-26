@@ -4962,27 +4962,46 @@ failing closed when called without a cookie, and an AST check over **every
 non-test file in package `v2`** that both endpoints reach the gate through the
 one emitter and that only the gated builder calls the OnlyOffice helper.
 
-**Integration** (`internal/integration/sharelink_password_gate_test.go`,
-`TestShareLinkBootstrapPasswordGateOnBothEndpoints`): the behavioural proof.
-Anonymous HTTP against both real endpoints on a real cluster — no auth header,
-no cookie — asserting the body withholds content and `onlyOfficeConfig` while
-keeping `needPassword: true`; then the real `check-password` exchange and a
-re-request with the returned cookie, asserting the content *is* served. That
-second half matters as much as the first: a gate that always denied would pass
-the exploit assertion and silently break the feature.
+**Integration** (`internal/integration/sharelink_password_gate_test.go`), two
+tests because one fixture cannot reach both halves:
+
+- `TestShareLinkBootstrapPasswordGateOnBothEndpoints` — the **inline-content**
+  half across **both public endpoints**. Anonymous HTTP against the live cluster,
+  no auth header and no cookie, asserting the body withholds `fileContent` while
+  keeping `needPassword: true`; then the real `check-password` exchange and a
+  re-request with the returned cookie, asserting the content *is* served. That
+  second half matters as much as the first: a gate that always denied would pass
+  the exploit assertion and silently break the feature.
+- `TestShareLinkBootstrapWithholdsOnlyOfficeCredentialWithoutPassword` — the
+  **credential** half. It needs a separate test because the fixture above is
+  `notes.md` and `isOnlyOfficeViewable("md")` is **false**: Markdown never enters
+  the branch that mints the token, so asserting `onlyOfficeConfig` absent there
+  would pass against the vulnerable code. Only an OnlyOffice-viewable extension
+  reaches it. Its verified half doubles as a guard against a vacuous pass — if
+  OnlyOffice were disabled or its JWT secret unset, the helper would error, the
+  builder would fall back to the plain bundle, and `onlyOfficeConfig` would be
+  absent in *both* directions; requiring it present after the password exchange
+  turns that misconfiguration into a failure rather than a false green.
 
 The AST check earns its keep but is deliberately described as a tripwire, not a
 proof — it is syntactic, never executes a handler, and cannot see a call reached
-through a function value or another package. The integration test is what closes
-that gap.
+through a function value or another package. The two integration tests are what
+close the runtime gap, now for both halves.
 
 Every assertion was verified by mutation rather than trusted green. At unit
 level: reverting any one layer, or letting an endpoint bypass the emitter, or
 adding a second caller of the OnlyOffice helper, fails a named test. At
-integration level: reverting all three layers and rebuilding the server
-reproduced the exploit verbatim against the live cluster — both endpoints
-returned `200` with `"fileContent":"SECRET-…"` sitting next to
-`"needPassword":true`, which is the vulnerability in its literal form.
+integration level, against the rebuilt live cluster:
+
+- Reverting all three layers reproduced the **content** exploit verbatim — both
+  endpoints answered `200` with `"fileContent":"SECRET-…"` next to
+  `"needPassword":true`.
+- Reverting only the two OnlyOffice guards reproduced the **credential** exploit
+  verbatim — an anonymous caller received a signed OnlyOffice config carrying a
+  live download URL (`/seafhttp/files/<token>/quarterly.docx`) and its JWT.
+
+That second mutation is the one the earlier `.md`-only coverage could not have
+caught, which is exactly why the split fixture exists.
 
 #### Related Docs
 

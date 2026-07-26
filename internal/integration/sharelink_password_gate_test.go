@@ -14,7 +14,8 @@ import (
 )
 
 // TestShareLinkBootstrapPasswordGateOnBothEndpoints is the behavioural proof for
-// ISSUE-SHARELINK-PASSWORD-BYPASS-01, driven through the REAL public endpoints
+// the two public bootstrap endpoints and the inline-content half of
+// ISSUE-SHARELINK-PASSWORD-BYPASS-01, driven through the REAL HTTP surfaces
 // against a real cluster.
 //
 // Why it exists on top of the unit tests: those substitute the block read and
@@ -22,7 +23,15 @@ import (
 // package's call graph but never executes a handler, so it cannot see a gate that
 // is present in source and ineffective at runtime. The bypass was an anonymous
 // HTTP request returning a 200 whose body carried the file, so the only assertion
-// that truly closes it is an anonymous HTTP request whose body does not.
+// that truly closes the inline half is an anonymous HTTP request whose body does
+// not.
+//
+// Scope, stated honestly: this fixture is notes.md. It proves both endpoints and
+// the inline-content half end-to-end (withhold without cookie; serve after the
+// real check-password exchange). It does not exercise the OnlyOffice branch —
+// that credential half is covered by the guarded-helper and countingTokenCreator
+// unit tests. A future .docx + OnlyOffice-enabled integration would strengthen
+// that half but is not required to keep NF-1 closed.
 //
 // It asserts on the BODY, never on the status: the vulnerable response was a
 // perfectly ordinary 200. A status-only test passes against the bug.
@@ -93,8 +102,71 @@ func TestShareLinkBootstrapPasswordGateOnBothEndpoints(t *testing.T) {
 	}
 }
 
-// assertBootstrapWithholdsProtectedPayload checks the two things the bypass
-// leaked, plus the flag that must survive so the SPA still prompts.
+// TestShareLinkBootstrapWithholdsOnlyOfficeCredentialWithoutPassword covers the
+// OTHER half of the bypass at runtime: not a content leak but a real
+// CreateLinkDownloadToken handed to an anonymous caller.
+//
+// It needs its own test because the sibling above cannot reach it. That fixture
+// is notes.md, and isOnlyOfficeViewable("md") is false — the OnlyOffice branch is
+// never taken for Markdown, so asserting onlyOfficeConfig absent there passes
+// against the vulnerable code too. Only an OnlyOffice-viewable extension enters
+// the branch that mints the credential.
+//
+// The verified half doubles as the guard against this test passing vacuously: if
+// OnlyOffice were disabled, or its JWT secret unset, the helper would error and
+// the builder would fall back to the plain bundle — onlyOfficeConfig would be
+// absent in BOTH directions and the anonymous assertion would prove nothing.
+// Requiring it present after the password exchange makes that
+// misconfiguration a failure instead of a false pass.
+func TestShareLinkBootstrapWithholdsOnlyOfficeCredentialWithoutPassword(t *testing.T) {
+	const password = "correct horse battery staple"
+
+	name := fmt.Sprintf("inttest-sharelink-oo-pwgate-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+
+	uploadURL := getUploadLink(t, adminClient, repoID, "/")
+	// Content is irrelevant: the OnlyOffice branch is selected by extension, and
+	// nothing parses the bytes before the token is minted.
+	uploadFileThroughLink(t, adminClient, uploadURL, "quarterly.docx", "/", "not-a-real-docx-body")
+
+	token := createPasswordShareLinkForTest(t, adminClient, repoID, "/quarterly.docx", password)
+	bootstrapURL := adminClient.baseURL + "/api/v2.1/share-links/" + token + "/bootstrap/"
+
+	// 1. Anonymous: no credential may be minted or returned.
+	status, body := getAnonymousBootstrap(t, nil, bootstrapURL)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	anon := decodeBootstrapPageOptions(t, body)
+	if len(anon.OnlyOfficeConfig) != 0 {
+		t.Fatalf("anonymous bootstrap returned an OnlyOffice config, which carries a download token: %s", anon.OnlyOfficeConfig)
+	}
+	if !anon.NeedPassword {
+		t.Fatal("needPassword must stay true on the OnlyOffice branch too")
+	}
+
+	// 2. After the real password exchange the credential is issued again.
+	jar := verifyShareLinkPasswordForTest(t, token, password)
+	status, body = getAnonymousBootstrap(t, jar, bootstrapURL)
+	if status != http.StatusOK {
+		t.Fatalf("verified status = %d, want 200: %s", status, body)
+	}
+	verified := decodeBootstrapPageOptions(t, body)
+	if len(verified.OnlyOfficeConfig) == 0 {
+		t.Fatal("verified bootstrap produced no OnlyOffice config; either the gate withholds too much, or OnlyOffice is disabled in this stack and the assertion above proved nothing")
+	}
+	if !strings.Contains(string(verified.OnlyOfficeConfig), "url") {
+		t.Fatalf("verified OnlyOffice config carries no document URL: %s", verified.OnlyOfficeConfig)
+	}
+}
+
+// assertBootstrapWithholdsProtectedPayload checks the inline-content half of the
+// bypass plus the flag that must survive so the SPA still prompts.
+//
+// onlyOfficeConfig is asserted absent as belt-and-braces on this Markdown
+// fixture, not as proof of the OnlyOffice credential half — that config is
+// absent for .md even against the vulnerable code. The OnlyOffice half is pinned
+// by the unit suite (countingTokenCreator + helper fail-closed).
 func assertBootstrapWithholdsProtectedPayload(t *testing.T, body, secret string) {
 	t.Helper()
 
@@ -102,30 +174,41 @@ func assertBootstrapWithholdsProtectedPayload(t *testing.T, body, secret string)
 		t.Fatalf("anonymous bootstrap leaked the protected file content: %s", body)
 	}
 
+	opts := decodeBootstrapPageOptions(t, body)
+	if opts.FileContent != "" {
+		t.Fatalf("fileContent is non-empty for an unverified password link: %q", opts.FileContent)
+	}
+	if len(opts.OnlyOfficeConfig) != 0 {
+		t.Fatalf("onlyOfficeConfig present for an unverified password link: %s", opts.OnlyOfficeConfig)
+	}
+	if !opts.NeedPassword {
+		t.Fatal("needPassword must stay true, or the SPA stops showing the password dialog")
+	}
+	if opts.NoPassword {
+		t.Fatal("noPassword must be false while the password is unverified")
+	}
+}
+
+// bootstrapPageOptions is the slice of the bootstrap payload these tests judge.
+// Only fields the password gate governs are decoded; everything else in the
+// response is deliberately not asserted on.
+type bootstrapPageOptions struct {
+	FileContent      string          `json:"fileContent"`
+	NeedPassword     bool            `json:"needPassword"`
+	NoPassword       bool            `json:"noPassword"`
+	OnlyOfficeConfig json.RawMessage `json:"onlyOfficeConfig"`
+}
+
+func decodeBootstrapPageOptions(t *testing.T, body string) bootstrapPageOptions {
+	t.Helper()
+
 	var decoded struct {
-		PageOptions struct {
-			FileContent      string          `json:"fileContent"`
-			NeedPassword     bool            `json:"needPassword"`
-			NoPassword       bool            `json:"noPassword"`
-			OnlyOfficeConfig json.RawMessage `json:"onlyOfficeConfig"`
-		} `json:"page_options"`
+		PageOptions bootstrapPageOptions `json:"page_options"`
 	}
 	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
 		t.Fatalf("decode bootstrap body: %v (body=%s)", err, body)
 	}
-
-	if decoded.PageOptions.FileContent != "" {
-		t.Fatalf("fileContent is non-empty for an unverified password link: %q", decoded.PageOptions.FileContent)
-	}
-	if len(decoded.PageOptions.OnlyOfficeConfig) != 0 {
-		t.Fatalf("onlyOfficeConfig present for an unverified password link: %s", decoded.PageOptions.OnlyOfficeConfig)
-	}
-	if !decoded.PageOptions.NeedPassword {
-		t.Fatal("needPassword must stay true, or the SPA stops showing the password dialog")
-	}
-	if decoded.PageOptions.NoPassword {
-		t.Fatal("noPassword must be false while the password is unverified")
-	}
+	return decoded.PageOptions
 }
 
 // verifyShareLinkPasswordForTest performs the real password exchange and returns
