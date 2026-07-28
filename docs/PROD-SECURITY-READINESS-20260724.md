@@ -292,6 +292,7 @@ the authoritative state is always `KNOWN_ISSUES.md`.
 | Audit id | Issue id | Change | Date |
 |---|---|---|---|
 | NF-1 / SH-6 | `ISSUE-SHARELINK-PASSWORD-BYPASS-01` | **Fixed.** Password resolved before the inline read and before the OnlyOffice token mint; the bundle builder drops protected content it is handed; the OnlyOffice helper fails closed on its own. Coverage: integration proves both halves live — both public endpoints for inline content, and a `.docx` fixture for the OnlyOffice credential, since `.md` never enters that branch. Both mutation-verified by reverting the guards and rebuilding the server. | 2026-07-25 |
+| B4 (subcontract B) / X10 | `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | **Reduced, not closed.** The `PutBlock` per-request body cap was right-sized 257 MiB → configurable 16 MiB default (ceiling 64 MiB); the old figure came from the web uploader's adaptive-chunk ceiling, which never governed this route. Per-request RAM drops 16×. **The aggregate bound — the actual defect — is untouched:** N concurrent uploads still cost N × the cap. B4 remains a blocker; A, C and D are unchanged. | 2026-07-28 |
 
 **Effect on the verdict: none.** It stays **no-go as-is**. B4
 (`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`) is also single-node reachable and remains

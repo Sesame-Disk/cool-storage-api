@@ -26,6 +26,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
@@ -1272,14 +1273,31 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 // Body-size bounds for the legacy/sync seafhttp routes. Before these, PutBlock and
 // CheckBlocks read the whole request body with an unbounded io.ReadAll, so a client
 // could drive memory use arbitrarily high with one oversized body or a huge id list
-// (F12). The block cap sits just above the 256 MiB adaptive-chunk ceiling (plus a
-// margin for cipher padding); the check-blocks caps bound both the raw body and the
-// number of ids parsed from it.
+// (F12). The check-blocks caps bound both the raw body and the number of ids parsed
+// from it; the block cap is now configuration, see syncBlockMaxBytes below.
 const (
-	maxSyncBlockBytes       = 256*1024*1024 + 1024*1024 // 257 MiB
-	maxCheckBlocksBodyBytes = 16 * 1024 * 1024          // 16 MiB
+	maxCheckBlocksBodyBytes = 16 * 1024 * 1024 // 16 MiB
 	maxCheckBlockIDs        = 100_000
 )
+
+// syncBlockMaxBytes resolves the per-request body cap for PutBlock.
+//
+// It used to be a 257 MiB constant derived from the web uploader's 256 MiB
+// adaptive-chunk ceiling — the wrong domain: that ceiling governs browser
+// chunking and never applied to this route, whose traffic is 8 MiB blocks
+// (`uploadBlockSize`, matching Seafile's default CDC block; the official
+// client's CDC maximum is smaller). The default is now 16 MiB, sized from that
+// traffic, and operators can raise it up to the validated ceiling.
+//
+// The nil-config fallback is the package default rather than something
+// permissive: a handler without config is a wiring bug, and failing open here
+// would restore the unbounded read F12 exists to prevent.
+func (h *SyncHandler) syncBlockMaxBytes() int64 {
+	if h == nil || h.config == nil || h.config.SeafHTTP.SyncBlockMaxBytes <= 0 {
+		return config.DefaultSyncBlockMaxBytes
+	}
+	return h.config.SeafHTTP.SyncBlockMaxBytes
+}
 
 // PutBlock stores a block
 // PUT /seafhttp/repo/:repo_id/block/:block_id
@@ -1319,20 +1337,36 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		return
 	}
 
+	maxBlockBytes := h.syncBlockMaxBytes()
+
 	// Reject an oversized block before reading it. The declared length is a fast
 	// path for honest clients; the MaxBytesReader in readLimitedRequestBody is the
 	// hard enforcement for a chunked or lying ContentLength.
-	if c.Request.ContentLength > maxSyncBlockBytes {
-		log.Printf("PutBlock: declared body %d exceeds max %d for block %s\n", c.Request.ContentLength, maxSyncBlockBytes, externalID)
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "block too large", "max_bytes": maxSyncBlockBytes})
+	if c.Request.ContentLength > maxBlockBytes {
+		metrics.SyncPutBlockRejectedTotal.WithLabelValues("too_large").Inc()
+		log.Printf("PutBlock: declared body %d exceeds max %d for block %s\n", c.Request.ContentLength, maxBlockBytes, externalID)
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "block too large", "max_bytes": maxBlockBytes})
 		return
 	}
 
 	// Read block data (bounded)
-	data, ok := readLimitedRequestBody(c, maxSyncBlockBytes)
+	data, ok := readLimitedRequestBody(c, maxBlockBytes)
 	if !ok {
+		// readLimitedRequestBody has already written 413 (over the cap) or 400 (a
+		// read failure). Only the former is a cap rejection, so the reason is
+		// derived from the status it chose rather than assumed.
+		reason := "read_error"
+		if c.Writer.Status() == http.StatusRequestEntityTooLarge {
+			reason = "too_large"
+		}
+		metrics.SyncPutBlockRejectedTotal.WithLabelValues(reason).Inc()
 		return
 	}
+
+	// Observed after the read succeeds, so the histogram describes accepted
+	// traffic. Rejected oversize attempts are counted separately above; mixing
+	// them in would bias the distribution the cap is meant to be sized against.
+	metrics.SyncPutBlockBodyBytes.Observe(float64(len(data)))
 
 	log.Printf("PutBlock: received %d bytes for block %s\n", len(data), externalID)
 

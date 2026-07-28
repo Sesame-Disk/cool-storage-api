@@ -525,7 +525,37 @@ type SeafHTTPConfig struct {
 	ZipMaxDepth            int           `yaml:"zip_max_depth"`             // Maximum directory nesting allowed in a streamed ZIP download
 	ZipMaxBytes            int64         `yaml:"zip_max_bytes"`             // Maximum total uncompressed bytes allowed in a streamed ZIP download
 	ChunkedStagingMaxBytes int64         `yaml:"chunked_staging_max_bytes"` // Maximum declared bytes reserved across active chunked uploads on this node; 0 disables the guard
+
+	// SyncBlockMaxBytes bounds one PUT /seafhttp/repo/:repo_id/block/:block_id
+	// body. PutBlock buffers the whole body in memory before hashing, so this is
+	// the per-request buffered-body bound for the desktop-sync block route — the
+	// dominant term in its memory cost, not a hard ceiling on it: io.ReadAll can
+	// over-allocate while growing, and hashing plus HTTP machinery add their own.
+	//
+	// The default is sized from the traffic this route is expected to carry, not
+	// from the web uploader's adaptive ceiling: SesameFS splits at 8 MiB
+	// (`uploadBlockSize`, matching Seafile's default CDC block) and the official
+	// client's CDC maximum is smaller still. 16 MiB leaves 2x headroom over the
+	// 8 MiB block plus room for cipher padding, while cutting the previous
+	// 257 MiB bound by 16x. That 8 MiB figure is what the code splits at, not a
+	// production measurement — `sync_put_block_body_bytes` exists to measure it.
+	//
+	// It is NOT an aggregate bound. N concurrent uploads still cost N x this
+	// value; capping total in-flight readers is X10 / subcontract B of
+	// ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and is still open.
+	//
+	// Zero is rejected rather than meaning "unlimited": an unbounded body on this
+	// route is the defect (F12), so there is no configuration that restores it.
+	SyncBlockMaxBytes int64 `yaml:"sync_block_max_bytes"`
 }
+
+// Sync block body bounds. MaxSyncBlockMaxBytes is a validation ceiling, not a
+// default: a value above it is almost certainly derived from the web uploader's
+// chunk ceiling by mistake, which is exactly how the 257 MiB bound arose.
+const (
+	DefaultSyncBlockMaxBytes int64 = 16 * 1024 * 1024
+	MaxSyncBlockMaxBytes     int64 = 64 * 1024 * 1024
+)
 
 // ServerConfig holds HTTP server settings
 type ServerConfig struct {
@@ -896,6 +926,7 @@ func DefaultConfig() *Config {
 			ZipMaxDepth:            64,
 			ZipMaxBytes:            10 * 1024 * 1024 * 1024,
 			ChunkedStagingMaxBytes: 0,
+			SyncBlockMaxBytes:      DefaultSyncBlockMaxBytes,
 		},
 		OnlyOffice: OnlyOfficeConfig{
 			Enabled:           false,
@@ -1182,6 +1213,17 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("SEAFHTTP_ZIP_MAX_BYTES"); v != "" {
 		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.SeafHTTP.ZipMaxBytes = i
+		}
+	}
+	// Unlike the neighbours above, a malformed value is reported rather than
+	// silently dropped: falling back to the default would leave an operator who
+	// deliberately raised the cap running the lower one with no signal.
+	if v := os.Getenv("SEAFHTTP_SYNC_BLOCK_MAX_BYTES"); v != "" {
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			c.addEnvOverrideError("SEAFHTTP_SYNC_BLOCK_MAX_BYTES is invalid: %v", err)
+		} else {
+			c.SeafHTTP.SyncBlockMaxBytes = i
 		}
 	}
 	// OIDC settings
@@ -1639,6 +1681,17 @@ func (c *Config) Validate() error {
 	}
 	if c.SeafHTTP.ChunkedStagingMaxBytes < 0 {
 		return fmt.Errorf("seafhttp.chunked_staging_max_bytes must be greater than or equal to zero")
+	}
+	// Zero is rejected here rather than treated as "unlimited". An unbounded
+	// PutBlock body is the defect this cap exists for, so no configuration may
+	// restore it — which is the opposite of chunked_staging_max_bytes above,
+	// where zero legitimately means "guard disabled".
+	if c.SeafHTTP.SyncBlockMaxBytes <= 0 {
+		return fmt.Errorf("seafhttp.sync_block_max_bytes must be greater than zero (an unbounded sync block body is not a supported configuration)")
+	}
+	if c.SeafHTTP.SyncBlockMaxBytes > MaxSyncBlockMaxBytes {
+		return fmt.Errorf("seafhttp.sync_block_max_bytes is %d, above the %d ceiling; this route carries %d-byte blocks, so a larger value is almost certainly derived from the web uploader's chunk ceiling by mistake",
+			c.SeafHTTP.SyncBlockMaxBytes, MaxSyncBlockMaxBytes, 8*1024*1024)
 	}
 	normalizedPreviewExtensions, err := normalizeFileViewPreviewExtensions(c.FileView.PreviewExtensions)
 	if err != nil {
