@@ -5047,7 +5047,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: No rate or concurrency limit on the seafhttp upload/download/block surfaces
 
-**Status**: 🔴 Open — production blocker (B4 umbrella)
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **B reduced 2026-07-28** (per-request cap right-sized; the aggregate bound that actually closes it is still missing); **A, C and D open**. The umbrella does not close until all four do.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5088,12 +5088,66 @@ attacker-controlled, so an empty body would allocate the full cap.
 Closing any one row is **not** enough to close this umbrella. Each needs its
 own fix + regression.
 
-| ID | Surface | Close when | Notes |
-|---|---|---|---|
-| **A** | Anonymous / token seafhttp **upload** (`HandleUpload` / upload-api) | Per-IP (or per-token) rate + concurrency limit on the write path that upload-links hand off to | SH-1 residual; routes already have `slRL`, the handoff does not |
-| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | Per-user concurrency on the seafhttp block group mirroring `blockUploadConcurrencyLimiter`; optionally stream instead of full-buffer | Also revisit the 257 MiB cap (~32× desktop CDC size) |
-| **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
-| **D** | seafhttp **download** / block **GET** abuse control | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
+| ID | Surface | Status | Close when | Notes |
+|---|---|---|---|---|
+| **A** | Anonymous / token seafhttp **upload** (`HandleUpload` / upload-api) | 🔴 Open | Per-IP (or per-token) rate **and** concurrency limit on the write path that upload-links hand off to | SH-1 residual; routes already have `slRL`, the handoff does not |
+| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Reduced, still open** | Aggregate bound on concurrent in-flight block readers | Per-request cap right-sized 257 MiB → 16 MiB (16× less RAM per request), but N concurrent uploads still cost N × the cap. The aggregate bound is what closes it |
+| **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | 🔴 Open | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
+| **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
+
+#### Subcontract B: what the right-sized cap does and does not do (2026-07-28)
+
+The old 257 MiB bound came from the **wrong domain**: it was derived from
+`chunking.adaptive.absolute_max` (the web uploader's 256 MiB chunk ceiling),
+which never governed this route — and the adaptive chunker has no production
+caller at all. This route is fed by desktop sync, where SesameFS splits at 8 MiB
+(`uploadBlockSize`, matching Seafile's default CDC block; the official client's
+CDC maximum is smaller still).
+
+`seafhttp.sync_block_max_bytes` now defaults to **16 MiB** — 2× headroom over the
+8 MiB block, with a validated ceiling of 64 MiB and `SEAFHTTP_SYNC_BLOCK_MAX_BYTES`
+to override. Unlike `chunked_staging_max_bytes`, **`0` is rejected rather than
+meaning unlimited**: an unbounded body on this route is the F12 defect, so no
+configuration restores it.
+
+Note what the 8 MiB figure is and is not: it is **the size this code splits at**,
+not a production measurement. `sync_put_block_body_bytes` was added precisely
+because the previous cap was set from an inherited constant rather than from
+observed traffic, and the next adjustment should come from that histogram.
+
+Read both metrics for what they actually observe, which is less than it is
+tempting to claim:
+
+- `sync_put_block_body_bytes` measures **request bodies that passed the size
+  gate**. It is observed right after the read, before the block id is checked and
+  before anything is stored, so it is not a distribution of *successful* uploads
+  and not evidence about client behaviour on its own. Correlate it with
+  successful block validation before moving the cap.
+- `sync_put_block_rejected_total{reason="too_large"}` reports **over-cap
+  attempts**. A non-zero value is where the failure mode of lowering a cap would
+  first appear, but it does not by itself prove legitimate traffic was rejected —
+  an authenticated client sending deliberately oversized bodies moves the same
+  counter. It is a prompt to investigate, not a verdict on the cap.
+
+A tighter signal — the histogram observed after hash validation, or a
+labelled outcome counter — is worth having before the next adjustment, and is
+not in this change.
+
+**This does not close B.** It cuts the per-request ceiling 16×; it does not bound
+the aggregate, because N concurrent uploads still cost N × the configured cap.
+Closing B needs a cap on total in-flight block readers, acquired **before**
+`io.ReadAll` — the point is to bound simultaneous memory, not the number of S3
+PUTs.
+
+**Why the aggregate bound was deliberately not attempted alongside it.** The
+official client runs up to 5 simultaneous sync tasks × 3 block threads, so **one
+legitimate desktop can have ~15 concurrent `PutBlock` requests**. A limiter set
+at, say, 8 that rejects immediately would punish a single honest client. It also
+classifies 502/503/504 as network errors and retries, but has no special handling
+for 429 — so the overload response on this route must be **503 + `Retry-After`**,
+never 429, and the design must be *bounded wait, then* 503 rather than immediate
+rejection. Those values need to come from a fault-injection run against the real
+client, not from a guess.
 
 #### Fix Direction
 

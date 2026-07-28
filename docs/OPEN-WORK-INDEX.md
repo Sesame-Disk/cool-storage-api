@@ -63,7 +63,7 @@ the open single-node blocker**, and multi-instance adds B1 and B5. See
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | No rate/concurrency limit on the seafhttp upload, download and block routes (umbrella; four closable subcontracts) | Readiness B4 ⊇ registry X10 — **the remaining single-node blocker** |
+| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella, four subcontracts: **B reduced** (block cap 257→16 MiB; aggregate bound still missing), **A/C/D open** | Readiness B4 ⊇ registry X10 — **still the single-node blocker until all four close** |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
 

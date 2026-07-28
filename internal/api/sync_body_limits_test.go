@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -9,12 +11,15 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 )
 
 // TestReadLimitedRequestBody exercises the shared bounded-read helper directly, so
-// the byte boundary is covered without allocating a real 257 MiB body: a body up to
-// and including the cap is returned intact with no response written, and one byte
-// over the cap is rejected 413 by the MaxBytesReader before it is fully buffered.
+// the byte boundary is covered without allocating a body anywhere near the real
+// cap: a body up to and including the cap is returned intact with no response
+// written, and one byte over the cap is rejected 413 by the MaxBytesReader before
+// it is fully buffered.
 func TestReadLimitedRequestBody(t *testing.T) {
 	const max = 16
 	cases := []struct {
@@ -53,31 +58,126 @@ func TestReadLimitedRequestBody(t *testing.T) {
 	}
 }
 
+// putBlockRequest drives PutBlock with an explicit body and an explicit declared
+// length, because the two are different enforcement paths and the test must be
+// able to disagree with itself about them: ContentLength is the attacker-
+// controlled fast path, the body is what MaxBytesReader actually measures.
+// declaredLen of -1 leaves the length unknown (chunked), which is precisely the
+// case the fast path cannot cover.
+func putBlockRequest(t *testing.T, h *SyncHandler, body io.Reader, declaredLen int64) int {
+	t.Helper()
+	r := setupSyncTestRouter()
+	r.POST("/seafhttp/repo/:repo_id/block/:block_id", h.PutBlock)
+
+	blockID := strings.Repeat("a", 64) // valid 64-hex SHA-256 id
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo/block/"+blockID, body)
+	req.ContentLength = declaredLen
+	if declaredLen < 0 {
+		req.TransferEncoding = []string{"chunked"}
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w.Code
+}
+
 // TestPutBlockBoundsBodySize verifies PutBlock rejects an oversized block before
 // reading it and lets a block declared exactly at the cap through the size gate.
+//
+// These subtests spoof ContentLength over a tiny body on purpose: they pin the
+// cheap pre-read rejection, which is the only thing a declared length can prove.
+// That a real body is measured — and that a client which declares nothing is
+// still bounded — is TestPutBlockBoundsRealBody below; neither test substitutes
+// for the other.
 func TestPutBlockBoundsBodySize(t *testing.T) {
-	putBlock := func(t *testing.T, declaredLen int64) int {
+	putBlockDeclaring := func(t *testing.T, h *SyncHandler, declaredLen int64) int {
 		t.Helper()
-		r := setupSyncTestRouter()
+		return putBlockRequest(t, h, strings.NewReader("small"), declaredLen)
+	}
+
+	// A handler with no config falls back to the package default rather than to
+	// something permissive: failing open here would restore the unbounded read.
+	t.Run("nil config uses the default cap", func(t *testing.T) {
 		h := &SyncHandler{}
-		r.POST("/seafhttp/repo/:repo_id/block/:block_id", h.PutBlock)
+		if got := h.syncBlockMaxBytes(); got != config.DefaultSyncBlockMaxBytes {
+			t.Fatalf("cap = %d, want the %d default", got, config.DefaultSyncBlockMaxBytes)
+		}
+		if code := putBlockDeclaring(t, h, config.DefaultSyncBlockMaxBytes+1); code != http.StatusRequestEntityTooLarge {
+			t.Errorf("oversized block = %d, want 413", code)
+		}
+		// Exactly at the cap must pass the size gate (it fails later — 503 with no
+		// storage configured — but never 413).
+		if code := putBlockDeclaring(t, h, config.DefaultSyncBlockMaxBytes); code == http.StatusRequestEntityTooLarge {
+			t.Errorf("block at the size cap was rejected 413, want it through the size gate")
+		}
+	})
 
-		blockID := strings.Repeat("a", 64) // valid 64-hex SHA-256 id
-		req := httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo/block/"+blockID, strings.NewReader("small"))
-		req.ContentLength = declaredLen
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		return w.Code
-	}
+	// The cap is configuration, not a constant. Without this, the default could be
+	// changed and the operator lever silently stop being wired.
+	t.Run("configured cap overrides the default", func(t *testing.T) {
+		const configured = 4 * 1024 * 1024
+		h := &SyncHandler{config: &config.Config{}}
+		h.config.SeafHTTP.SyncBlockMaxBytes = configured
 
-	if code := putBlock(t, maxSyncBlockBytes+1); code != http.StatusRequestEntityTooLarge {
-		t.Errorf("oversized block = %d, want 413", code)
-	}
-	// Exactly at the cap must pass the size gate (it fails later — 503 with no
-	// storage configured — but never 413).
-	if code := putBlock(t, maxSyncBlockBytes); code == http.StatusRequestEntityTooLarge {
-		t.Errorf("block at the size cap was rejected 413, want it through the size gate")
-	}
+		if got := h.syncBlockMaxBytes(); got != configured {
+			t.Fatalf("cap = %d, want the configured %d", got, configured)
+		}
+		if code := putBlockDeclaring(t, h, configured+1); code != http.StatusRequestEntityTooLarge {
+			t.Errorf("block over the configured cap = %d, want 413", code)
+		}
+		// Sized between the configured cap and the default: proves the rejection
+		// follows configuration rather than the default constant.
+		if code := putBlockDeclaring(t, h, config.DefaultSyncBlockMaxBytes); code != http.StatusRequestEntityTooLarge {
+			t.Errorf("block above the configured cap but under the default = %d, want 413", code)
+		}
+	})
+}
+
+// TestPutBlockBoundsRealBody sends bytes rather than a declared length, which is
+// what the declared-length subtests above cannot do.
+//
+// Right-sizing the cap from 257 MiB to 16 MiB has exactly one failure mode:
+// cutting traffic this route legitimately carries. So the 8 MiB block — the size
+// SesameFS splits at — is uploaded for real, through MaxBytesReader and the full
+// buffering read, not merely declared in a header. The mirror case sends more
+// than the cap with the length withheld, the shape a lying or chunked client
+// uses to walk past the fast path.
+func TestPutBlockBoundsRealBody(t *testing.T) {
+	t.Run("a real 8 MiB body passes under the default cap", func(t *testing.T) {
+		h := &SyncHandler{}
+		body := bytes.Repeat([]byte("a"), 8*1024*1024)
+
+		code := putBlockRequest(t, h, bytes.NewReader(body), int64(len(body)))
+		if code == http.StatusRequestEntityTooLarge {
+			t.Fatalf("an 8 MiB block — the size this route splits at — was rejected 413 by the %d-byte default cap",
+				config.DefaultSyncBlockMaxBytes)
+		}
+	})
+
+	// A small configured cap keeps this cheap while exercising the same code: the
+	// point is the unknown length, not the number of bytes.
+	t.Run("an oversized body with no declared length is still cut", func(t *testing.T) {
+		const configured = 64 * 1024
+		h := &SyncHandler{config: &config.Config{}}
+		h.config.SeafHTTP.SyncBlockMaxBytes = configured
+
+		body := bytes.Repeat([]byte("a"), configured+1)
+		if code := putBlockRequest(t, h, bytes.NewReader(body), -1); code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("chunked body over the configured cap = %d, want 413; a client that declares no length must still be bounded", code)
+		}
+	})
+
+	// The same client shape, this time under the cap: proves the case above is the
+	// cap firing and not chunked requests being rejected wholesale.
+	t.Run("a body under the cap with no declared length is accepted", func(t *testing.T) {
+		const configured = 64 * 1024
+		h := &SyncHandler{config: &config.Config{}}
+		h.config.SeafHTTP.SyncBlockMaxBytes = configured
+
+		body := bytes.Repeat([]byte("a"), configured)
+		if code := putBlockRequest(t, h, bytes.NewReader(body), -1); code == http.StatusRequestEntityTooLarge {
+			t.Fatal("chunked body exactly at the configured cap was rejected 413")
+		}
+	})
 }
 
 // TestCheckBlocksBoundsBlockIDCount verifies the id-count cap: a list one over the

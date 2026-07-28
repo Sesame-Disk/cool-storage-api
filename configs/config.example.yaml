@@ -261,6 +261,16 @@ seafhttp:
   zip_max_depth: 64                  # max directory nesting when traversing a ZIP download
   zip_max_bytes: 10737418240         # 10 GiB max total uncompressed bytes in a ZIP download
   chunked_staging_max_bytes: 0       # 0 = unlimited; set a node-local byte budget (for example 214748364800 for 200 GiB) to cap active chunked temp-file staging
+  # Per-request body cap for PUT /seafhttp/repo/:repo_id/block/:block_id. PutBlock
+  # buffers the whole body before hashing, so this is the per-request buffered-body
+  # bound on the desktop-sync block route — the dominant term in its memory cost,
+  # not a hard ceiling on it. Sized from the traffic this route carries
+  # (8 MiB blocks), NOT from the web uploader's chunk ceiling — that mismatch is
+  # how the previous 257 MiB bound arose. Rejected values: 0 or negative (an
+  # unbounded body is the defect) and anything above 64 MiB.
+  # Override: SEAFHTTP_SYNC_BLOCK_MAX_BYTES
+  # NOT an aggregate bound: N concurrent uploads still cost N x this value.
+  sync_block_max_bytes: 16777216 # 16 MiB
 
 gc:
   enabled: false                   # Required everywhere while GC blockers X1/X2 remain open; only after closure may one DC designate participants under the lease

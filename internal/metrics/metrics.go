@@ -481,6 +481,43 @@ var (
 		},
 		[]string{"surface", "reason"},
 	)
+
+	// SyncPutBlockBodyBytes measures request bodies on the desktop-sync block
+	// route that passed the size gate. The cap on that route was originally
+	// derived from the web uploader's chunk ceiling rather than from observed
+	// traffic, which is how it ended up 16x oversized; this histogram is what
+	// makes the next adjustment evidence-based instead of another inherited
+	// constant.
+	//
+	// It is observed right after the read, before the block id is checked and
+	// before anything is stored, so it describes *accepted request bodies*, not
+	// successful uploads and not necessarily well-behaved clients. Correlate it
+	// with successful block validation before moving the cap.
+	//
+	// Buckets run 64 KiB to 64 MiB so both the expected ~8 MiB block and anything
+	// approaching the validation ceiling are visible.
+	SyncPutBlockBodyBytes = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "sync_put_block_body_bytes",
+			Help:    "Observed PUT /seafhttp/repo/:repo_id/block/:block_id body size in bytes.",
+			Buckets: prometheus.ExponentialBuckets(65536, 2, 11),
+		},
+	)
+
+	// SyncPutBlockRejectedTotal counts blocks refused before or during the read.
+	//
+	// A non-zero "too_large" reports over-cap *attempts* and is the first place
+	// the failure mode of lowering a cap would show up. It does not by itself
+	// prove legitimate traffic was rejected: an authenticated client sending
+	// deliberately oversized bodies moves the same counter. Treat it as a
+	// prompt to investigate, not as evidence the cap is wrong.
+	SyncPutBlockRejectedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sync_put_block_rejected_total",
+			Help: "Total PUT block requests rejected, by reason.",
+		},
+		[]string{"reason"},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -532,5 +569,7 @@ func Register() {
 		BlockUploadConcurrencyRejectionsTotal,
 		BlockUploadSessionAdmissionRejectionsTotal,
 		BlockUploadMaterializationRetriesTotal,
+		SyncPutBlockBodyBytes,
+		SyncPutBlockRejectedTotal,
 	)
 }

@@ -918,6 +918,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `ONLYOFFICE_JWT_SECRET` | `onlyoffice.jwt_secret` | Secret |
 | `SERVER_URL` | — (runtime env) | Optional explicit fallback for absolute links and relay metadata. Leave unset to use the current request host. |
 | `ONLYOFFICE_API_JS_URL` | `onlyoffice.api_js_url` | Public OnlyOffice JS loader URL. |
+| `SEAFHTTP_SYNC_BLOCK_MAX_BYTES` | `seafhttp.sync_block_max_bytes` | Per-request body cap for the desktop-sync block PUT route. Default `16777216` (16 MiB). Must be `1`–`67108864`; **zero is rejected**, it does not mean unlimited. |
 | `METRICS_ENABLED` | `monitoring.metrics_enabled` | |
 | `DESKTOP_CUSTOM_BRAND` | — (server-info response) | Brand name shown in desktop client (default: `Sesame Disk`) |
 | `DESKTOP_CUSTOM_LOGO` | — (server-info response) | Full URL to logo image shown in desktop client (optional) |

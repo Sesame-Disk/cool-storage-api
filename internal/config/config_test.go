@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // clearLoadEnvOverrides blanks out the env vars that Load()/applyEnvOverrides
@@ -431,6 +433,42 @@ func TestConfigValidate(t *testing.T) {
 			wantErrContain: "seafhttp.chunked_staging_max_bytes",
 		},
 		{
+			// Deliberately unlike chunked_staging_max_bytes above, where zero means
+			// "guard disabled". An unbounded PutBlock body is the defect the cap
+			// exists for, so zero must not be a way back to it.
+			name: "sync block max bytes rejects zero rather than meaning unlimited",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxBytes = 0
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_max_bytes",
+		},
+		{
+			name: "sync block max bytes rejects a negative value",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxBytes = -1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_max_bytes",
+		},
+		{
+			// The ceiling exists to catch a value copied from the web uploader's
+			// 256 MiB chunk ceiling, which is where the old 257 MiB bound came from.
+			name: "sync block max bytes rejects a value above the ceiling",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxBytes = MaxSyncBlockMaxBytes + 1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_max_bytes",
+		},
+		{
+			name: "sync block max bytes accepts a value at the ceiling",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxBytes = MaxSyncBlockMaxBytes
+			},
+			wantErr: false,
+		},
+		{
 			name: "storage backend rejects unsupported sse mode",
 			modify: func(c *Config) {
 				hot := c.Storage.Backends["hot"]
@@ -678,6 +716,64 @@ func TestEnvOverrideOnlyOfficeMaxDocumentBytes(t *testing.T) {
 
 	if cfg.OnlyOffice.MaxDocumentBytes != 1048576 {
 		t.Fatalf("OnlyOffice.MaxDocumentBytes = %d, want %d", cfg.OnlyOffice.MaxDocumentBytes, int64(1048576))
+	}
+}
+
+// TestEnvOverrideSyncBlockMaxBytes covers the operator lever end to end: a valid
+// value wins over the default, and a malformed one is reported instead of being
+// silently dropped back to the default — an operator who deliberately raised the
+// cap must not end up running the lower one with no signal.
+func TestEnvOverrideSyncBlockMaxBytes(t *testing.T) {
+	t.Run("valid value overrides the default", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_BYTES", "33554432")
+
+		cfg.applyEnvOverrides()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() error = %v", err)
+		}
+		if cfg.SeafHTTP.SyncBlockMaxBytes != 32*1024*1024 {
+			t.Fatalf("SyncBlockMaxBytes = %d, want %d", cfg.SeafHTTP.SyncBlockMaxBytes, 32*1024*1024)
+		}
+	})
+
+	t.Run("malformed value is reported, not dropped", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_BYTES", "16MiB")
+
+		cfg.applyEnvOverrides()
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() = nil; a malformed override must not fall back to the default silently")
+		}
+		if !strings.Contains(err.Error(), "SEAFHTTP_SYNC_BLOCK_MAX_BYTES") {
+			t.Fatalf("Validate() error = %v, want it to name SEAFHTTP_SYNC_BLOCK_MAX_BYTES", err)
+		}
+	})
+
+	// The env lever is subject to the same bounds as the YAML knob; it is not a
+	// back door around the ceiling or around the "zero is not unlimited" rule.
+	for _, tc := range []struct{ name, value string }{
+		{"zero", "0"},
+		{"negative", "-1"},
+		{"above the ceiling", "67108865"},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_BYTES", tc.value)
+
+			cfg.applyEnvOverrides()
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("Validate() = nil for %s; the env lever must obey the same bounds as the YAML knob", tc.value)
+			}
+			if !strings.Contains(err.Error(), "seafhttp.sync_block_max_bytes") {
+				t.Fatalf("Validate() error = %v, want it to name seafhttp.sync_block_max_bytes", err)
+			}
+		})
 	}
 }
 
@@ -1509,4 +1605,46 @@ func TestEffectiveMaxStagedBytesPerSession(t *testing.T) {
 			t.Fatalf("got %d, want 0 (disabled)", got)
 		}
 	})
+}
+
+// TestShippedConfigsSyncBlockCapIsValid loads every config file we ship the way
+// Load() does — defaults first, YAML on top — and checks the resulting sync block
+// cap against the same bounds Validate() enforces.
+//
+// This exists because this knob rejects zero, unlike every other seafhttp bound,
+// where zero means "unset". Omission is still safe — the YAML loads on top of
+// DefaultConfig(), so a file that never mentions the key inherits 16 MiB — but a
+// file that sets it *explicitly* to zero, a negative, or a value above the
+// ceiling would refuse to boot, and that is what this checks. The test asserts
+// the property directly rather than calling Validate(), which would also demand
+// deployment secrets these files deliberately leave to .env.
+func TestShippedConfigsSyncBlockCapIsValid(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "configs", "*.yaml"))
+	if err != nil {
+		t.Fatalf("glob configs: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no shipped configs found; this test would pass vacuously")
+	}
+
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			cfg := DefaultConfig()
+			if err := yaml.Unmarshal(data, cfg); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+
+			got := cfg.SeafHTTP.SyncBlockMaxBytes
+			if got <= 0 {
+				t.Fatalf("sync_block_max_bytes = %d; zero is rejected by Validate(), so this config would refuse to boot", got)
+			}
+			if got > MaxSyncBlockMaxBytes {
+				t.Fatalf("sync_block_max_bytes = %d, above the %d ceiling; this config would refuse to boot", got, MaxSyncBlockMaxBytes)
+			}
+		})
+	}
 }
