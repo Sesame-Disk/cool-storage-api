@@ -14,7 +14,7 @@ import UploadProgressDialog from './upload-progress-dialog';
 import UploadRemindDialog from '../dialog/upload-remind-dialog';
 import toaster from '../toast';
 import { isAbortError, shouldUseBlockUpload, uploadFileViaBlocks, BLOCK_SIZE } from './block-upload-orchestrator';
-import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, noteUploadRetry } from './upload-throttle-backoff';
+import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, clearChunkThrottleState, noteUploadRetry } from './upload-throttle-backoff';
 import '../../css/file-uploader.css';
 
 const propTypes = {
@@ -383,6 +383,7 @@ class FileUploader extends React.Component {
     this.resumable.on('complete', this.onComplete.bind(this));
     this.resumable.on('pause', this.onPause.bind(this));
     this.resumable.on('fileRetry', this.onFileRetry.bind(this));
+    this.resumable.on('fileChunkSuccess', (resumableFile, chunk) => clearChunkThrottleState(resumableFile, chunk));
     this.resumable.on('fileError', this.onFileError.bind(this));
     this.resumable.on('error', this.onError.bind(this));
     this.resumable.on('beforeCancel', this.onBeforeCancel.bind(this));

@@ -27,6 +27,19 @@ type RateLimiter struct {
 	stopOnce sync.Once
 }
 
+// RateReservation is one immediate token-bucket admission. Cancel restores the
+// token when a later guard rejects the same request. A nil inner reservation
+// represents a disabled limiter and is intentionally a no-op.
+type RateReservation struct {
+	reservation *rate.Reservation
+}
+
+func (r *RateReservation) CancelAt(now time.Time) {
+	if r != nil && r.reservation != nil {
+		r.reservation.CancelAt(now)
+	}
+}
+
 // NewRateLimiter creates a per-IP rate limiter.
 // r controls how often tokens are replenished; burst is the max burst size.
 // Example: rate.Every(6*time.Second), 10 → ~10 requests per minute per IP.
@@ -68,10 +81,25 @@ func (rl *RateLimiter) Limit() gin.HandlerFunc {
 // A nil receiver allows the request, so a disabled limiter is expressed by
 // holding no limiter at all rather than by branching at every call site.
 func (rl *RateLimiter) Allow(key string) bool {
+	return rl.TryReserve(key, time.Now()) != nil
+}
+
+// TryReserve consumes one token only when it is available immediately. The
+// returned reservation can be cancelled if another limiter in the same
+// admission decision rejects the request.
+func (rl *RateLimiter) TryReserve(key string, now time.Time) *RateReservation {
 	if rl == nil {
-		return true
+		return &RateReservation{}
 	}
-	return rl.getVisitor(key).Allow()
+	reservation := rl.getVisitor(key).ReserveN(now, 1)
+	if !reservation.OK() {
+		return nil
+	}
+	if reservation.DelayFrom(now) > 0 {
+		reservation.CancelAt(now)
+		return nil
+	}
+	return &RateReservation{reservation: reservation}
 }
 
 // RetryAfterSeconds is the whole-second Retry-After value implied by the

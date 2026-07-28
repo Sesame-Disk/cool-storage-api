@@ -2,11 +2,13 @@ import {
   BASE_MAX_CHUNK_RETRIES,
   THROTTLED_MAX_CHUNK_RETRIES,
   backoffMs,
+  clearChunkThrottleState,
   clearThrottleState,
   noteUploadRetry,
   parseRetryAfterMs,
 } from '../upload-throttle-backoff';
 import fs from 'fs';
+import Resumablejs from '@seafile/resumablejs';
 
 // The defect this guards: resumable.js retries a 429 immediately (its
 // chunkRetryInterval is unset) and counts those attempts against
@@ -27,9 +29,12 @@ const makeChunk = ({ retries = 0 }) => ({
 const makeRetryInfo = (status, retryAfter = null) => ({ status, retryAfter });
 
 describe('resumable.js retry contract', () => {
+  const OriginalXMLHttpRequest = global.XMLHttpRequest;
+
   it('captures response metadata before abort and makes delayed retries cancelable', () => {
     const source = fs.readFileSync(require.resolve('@seafile/resumablejs'), 'utf8');
     expect(source).toContain("$.resumableObj.fire('fileRetry', $, chunk, retryInfo)");
+    expect(source).toContain("$.resumableObj.fire('fileChunkSuccess', $, chunk)");
     expect(source).toContain("retryInfo.retryAfter = $.xhr ? $.xhr.getResponseHeader('Retry-After') : null");
     expect(source).toContain("$.getOpt('throttledMaxChunkRetries')");
     expect(source).toContain('$.retryTimer = setTimeout(function()');
@@ -38,6 +43,123 @@ describe('resumable.js retry contract', () => {
     // is present" is not enough: a superseded copy left above it would run
     // first, and it reads the response header without the guard below.
     expect(source.match(/var retryInfo/g)).toHaveLength(1);
+  });
+
+  class ControlledXHR {
+    static instances = [];
+
+    constructor() {
+      this.listeners = {};
+      this.upload = { addEventListener: jest.fn() };
+      this.readyState = 0;
+      this.status = 0;
+      this.responseText = '';
+      this.retryAfter = null;
+      ControlledXHR.instances.push(this);
+    }
+
+    addEventListener = (event, listener) => {
+      this.listeners[event] = listener;
+    };
+
+    open = () => {
+      this.readyState = 1;
+    };
+
+    setRequestHeader = jest.fn();
+
+    send = jest.fn();
+
+    abort = jest.fn();
+
+    getResponseHeader = (name) => (name === 'Retry-After' ? this.retryAfter : null);
+
+    respond(status, retryAfter = null) {
+      this.status = status;
+      this.retryAfter = retryAfter;
+      this.readyState = 4;
+      this.listeners.load({ target: this });
+    }
+  }
+
+  const startUpload = () => {
+    const resumable = new Resumablejs({
+      target: '/upload',
+      chunkSize: 4,
+      forceChunkSize: true,
+      simultaneousUploads: 1,
+      maxChunkRetries: BASE_MAX_CHUNK_RETRIES,
+      throttledMaxChunkRetries: THROTTLED_MAX_CHUNK_RETRIES,
+      testChunks: false,
+    });
+    const retries = [];
+    const errors = [];
+    resumable.on('fileRetry', (file, chunk, retryInfo) => {
+      retries.push({ file, chunk, retryInfo });
+      noteUploadRetry(resumable, file, chunk, retryInfo);
+    });
+    resumable.on('fileChunkSuccess', (file, chunk) => clearChunkThrottleState(file, chunk));
+    resumable.on('fileError', (...args) => errors.push(args));
+    resumable.on('fileAdded', () => resumable.upload());
+    resumable.addFile(new File(['data'], 'data.bin', { type: 'application/octet-stream' }));
+    jest.runOnlyPendingTimers();
+    return { resumable, retries, errors };
+  };
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.spyOn(Math, 'random').mockReturnValue(0);
+    ControlledXHR.instances = [];
+    global.XMLHttpRequest = ControlledXHR;
+  });
+
+  afterEach(() => {
+    global.XMLHttpRequest = OriginalXMLHttpRequest;
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  it('delays a real 429 retry until Retry-After has elapsed', () => {
+    const { resumable, retries } = startUpload();
+    expect(ControlledXHR.instances).toHaveLength(1);
+    expect(ControlledXHR.instances[0].send).toHaveBeenCalledTimes(1);
+
+    ControlledXHR.instances[0].respond(429, '2');
+
+    expect(retries).toHaveLength(1);
+    expect(retries[0].chunk).toBeDefined();
+    expect(retries[0].retryInfo).toEqual({ status: 429, retryAfter: '2' });
+    expect(ControlledXHR.instances).toHaveLength(1);
+
+    jest.advanceTimersByTime(1999);
+    expect(ControlledXHR.instances).toHaveLength(1);
+    jest.advanceTimersByTime(1);
+    expect(ControlledXHR.instances).toHaveLength(2);
+    expect(ControlledXHR.instances[1].send).toHaveBeenCalledTimes(1);
+    ControlledXHR.instances[1].respond(200);
+    expect(resumable.files[0].isThrottled).toBe(false);
+  });
+
+  it('keeps a fourth 429 retryable instead of emitting fileError', () => {
+    const { resumable, retries, errors } = startUpload();
+    resumable.files[0].chunks[0].retries = BASE_MAX_CHUNK_RETRIES;
+
+    ControlledXHR.instances[0].respond(429, '2');
+
+    expect(retries).toHaveLength(1);
+    expect(errors).toHaveLength(0);
+    expect(resumable.files[0].chunks[0].opts.maxChunkRetries).toBe(THROTTLED_MAX_CHUNK_RETRIES);
+  });
+
+  it('cancels a delayed retry when the file is cancelled', () => {
+    const { resumable } = startUpload();
+    ControlledXHR.instances[0].respond(429, '2');
+    expect(ControlledXHR.instances).toHaveLength(1);
+
+    resumable.files[0].cancel();
+    jest.advanceTimersByTime(10000);
+
+    expect(ControlledXHR.instances).toHaveLength(1);
   });
 });
 
@@ -138,6 +260,23 @@ describe('noteUploadRetry', () => {
     expect(networkChunk.opts.maxChunkRetries).toBeUndefined();
     expect(networkChunk.opts.chunkRetryInterval).toBeUndefined();
     expect(resumable.opts.maxChunkRetries).toBe(BASE_MAX_CHUNK_RETRIES);
+    expect(file.isThrottled).toBe(true);
+    expect(clearChunkThrottleState(file, throttledChunk)).toBe(true);
+    expect(file.isThrottled).toBe(false);
+  });
+
+  it('keeps the busy state until every throttled chunk recovers', () => {
+    const resumable = makeResumable();
+    const first = makeChunk({});
+    const second = makeChunk({});
+    const file = makeFile([first, second]);
+
+    noteUploadRetry(resumable, file, first, makeRetryInfo(429, '2'));
+    noteUploadRetry(resumable, file, second, makeRetryInfo(429, '2'));
+    expect(clearChunkThrottleState(file, first)).toBe(false);
+    expect(file.isThrottled).toBe(true);
+    expect(clearChunkThrottleState(file, second)).toBe(true);
+    expect(file.isThrottled).toBe(false);
   });
 
   it('falls back to exponential backoff when the server sends no Retry-After', () => {

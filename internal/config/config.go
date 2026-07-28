@@ -574,8 +574,8 @@ type SeafHTTPConfig struct {
 	UploadLinkWriteBurst int `yaml:"upload_link_write_burst"`
 
 	// UploadLinkTokenWritesPerMinute bounds writes against a single upload token
-	// across *all* client IPs. The (IP, token) bucket above cannot see a leaked
-	// upload URL being hit from many addresses at once; this one can.
+	// across *all* client IPs on this node. The (IP, token) bucket above cannot
+	// see a leaked upload URL being hit from many addresses at once; this one can.
 	//
 	// It is deliberately far above any plausible legitimate figure, because a
 	// shared link legitimately serves many people at once — a classroom uploading
@@ -584,6 +584,10 @@ type SeafHTTPConfig struct {
 	// Note the limit of this defence: an attacker who re-mints a fresh upload
 	// token per request gets a fresh bucket. That path is bounded instead by the
 	// per-IP limiter already on /api/v2.1/upload-links/:token/upload/.
+	//
+	// Both upload-link limiters are process-local capacity guards, not
+	// cluster-global quotas: each node holds its own buckets, so aggregate
+	// admission across the fleet scales with the number of nodes.
 	UploadLinkTokenWritesPerMinute int `yaml:"upload_link_token_writes_per_minute"`
 
 	// UploadLinkTokenWriteBurst is the token-bucket burst for the per-token limit.
@@ -613,10 +617,9 @@ const (
 	DefaultUploadLinkTokenWritesPerMinute = 12000
 	DefaultUploadLinkTokenWriteBurst      = 24000
 
-	// MaxUploadLinkWritesPerMinute keeps the configured rate in a range where the
-	// per-request interval stays meaningful: `time.Minute / rate` collapses to a
-	// zero duration for absurd values, which silently turns the limiter into a
-	// no-op instead of a very permissive bound.
+	// MaxUploadLinkWritesPerMinute is an operational configuration ceiling. Rates
+	// above it are not useful protection and are more likely to be a unit mistake;
+	// this is policy, not the mathematical overflow point of time.Duration.
 	MaxUploadLinkWritesPerMinute = 600000
 )
 
@@ -626,9 +629,9 @@ const (
 // tokens come back, burst is how many may be spent at once. There is no rule
 // requiring one to exceed the other — 600/min with a burst of 1 is a coherent
 // (if unfriendly) configuration. So the only things rejected here are values
-// that cannot mean anything: a negative rate or burst, a rate so large the
-// refill interval degenerates, and a burst of zero while the limiter is on,
-// which would refuse every request.
+// that cannot mean anything: a negative rate or burst, and a burst of zero while
+// the limiter is on, which would refuse every request. The ceiling on a positive
+// rate is operational policy rather than a value that cannot mean anything.
 //
 // A zero burst is an error rather than being quietly filled in from the rate.
 // Deriving it would make `burst: 0` mean something different from what an
@@ -639,7 +642,7 @@ func validateUploadLinkWriteLimit(rateKey, burstKey string, perMinute, burst int
 		return fmt.Errorf("seafhttp.%s must be greater than or equal to zero (zero disables the limiter)", rateKey)
 	}
 	if perMinute > MaxUploadLinkWritesPerMinute {
-		return fmt.Errorf("seafhttp.%s is %d, above the %d ceiling, where the refill interval degenerates and the limiter stops bounding anything",
+		return fmt.Errorf("seafhttp.%s is %d, above the operational configuration ceiling of %d requests per minute",
 			rateKey, perMinute, MaxUploadLinkWritesPerMinute)
 	}
 	if burst < 0 {
@@ -895,16 +898,14 @@ func Load() (*Config, error) {
 			"fallback_bytes", DefaultMaxStagedBytesPerSession)
 	}
 
-	// A per-IP limiter is only per-IP if the IP is real. With no trusted proxies,
-	// ClientIP() is the socket peer, which behind a reverse proxy is the proxy
-	// itself — every anonymous uploader then shares one bucket and throttles the
-	// others. This is a warning and not a validation error on purpose: running Go
-	// directly with no proxy in front is a legitimate deployment, and there is no
-	// way to tell the two apart from configuration alone.
+	// A per-IP limiter is only per-IP if the IP is real. Behind an untrusted proxy,
+	// ClientIP() is the proxy: clients using the same upload token then share its
+	// (proxy IP, token) bucket, while different tokens remain isolated. This is a
+	// warning rather than a validation error because direct deployments are valid.
 	if cfg.SeafHTTP.UploadLinkWritesPerMinute > 0 && len(cfg.Server.TrustedProxies) == 0 {
 		slog.Warn("upload-link write limiter is enabled but server.trusted_proxies is empty; "+
-			"client IPs will be the direct socket peer. Behind a reverse proxy that collapses every "+
-			"anonymous uploader into a single shared bucket — set SERVER_TRUSTED_PROXIES to the proxy CIDR",
+			"behind a reverse proxy, clients using the same upload token are attributed to the proxy IP "+
+			"and share one per-client bucket (different tokens remain isolated) — set SERVER_TRUSTED_PROXIES to the proxy CIDR",
 			"upload_link_writes_per_minute", cfg.SeafHTTP.UploadLinkWritesPerMinute)
 	}
 

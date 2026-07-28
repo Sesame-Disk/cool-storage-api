@@ -3,6 +3,7 @@ const path = require('path');
 
 const resumablePath = path.join(__dirname, '..', 'node_modules', '@seafile', 'resumablejs', 'resumable.js');
 let source = fs.readFileSync(resumablePath, 'utf8');
+const originalSource = source;
 
 const replacements = [
   {
@@ -18,6 +19,10 @@ const replacements = [
     after: "$.resumableObj.fire('fileRetry', $, chunk, retryInfo);",
   },
   {
+    before: "case 'success':\n          if(_error) return;\n          $.resumableObj.fire('fileProgress', $, message);",
+    after: "case 'success':\n          if(_error) return;\n          $.resumableObj.fire('fileChunkSuccess', $, chunk);\n          $.resumableObj.fire('fileProgress', $, message);",
+  },
+  {
     before: [
       "var status = $.status();\n          if(status=='success'||status=='error') {",
       "var retryInfo = $.xhr ? {\n            status: $.xhr.status,\n            retryAfter: $.xhr.getResponseHeader('Retry-After')\n          } : {status: 0, retryAfter: null};\n          var status = $.status();\n          if(status=='success'||status=='error') {",
@@ -27,6 +32,10 @@ const replacements = [
   {
     before: "$.callback('retry', $.message());",
     after: "$.callback('retry', $.message(), $, retryInfo);",
+  },
+  {
+    before: "if(status=='success'||status=='error') {\n            $.callback(status, $.message());\n            $.resumableObj.uploadNextChunk();",
+    after: "if(status=='success'||status=='error') {\n            $.callback(status, $.message(), $);\n            $.resumableObj.uploadNextChunk();",
   },
   {
     before: "} else if($h.contains($.getOpt('permanentErrors'), $.xhr.status) || $.retries >= $.getOpt('maxChunkRetries')) {",
@@ -59,4 +68,6 @@ for (const { before, after } of replacements) {
   source = source.replace(target, after);
 }
 
-fs.writeFileSync(resumablePath, source);
+if (source !== originalSource) {
+  fs.writeFileSync(resumablePath, source);
+}

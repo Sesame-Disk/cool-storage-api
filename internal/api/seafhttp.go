@@ -1310,12 +1310,17 @@ func (h *SeafHTTPHandler) allowUploadLinkWrite(c *gin.Context, tokenStr string, 
 
 	fingerprint := uploadLinkTokenFingerprint(tokenStr)
 	clientIP := c.ClientIP()
+	now := time.Now()
 
-	if !limits.perClient.Allow(clientIP + "|" + fingerprint) {
+	clientAdmission := limits.perClient.TryReserve(clientIP+"|"+fingerprint, now)
+	if clientAdmission == nil {
 		limits.reject(c, "client", clientIP, token.RepoID)
 		return false
 	}
-	if !limits.perToken.Allow(fingerprint) {
+	if limits.perToken.TryReserve(fingerprint, now) == nil {
+		// The request was not admitted, so it must not consume the independent
+		// per-client budget merely because that guard ran first.
+		clientAdmission.CancelAt(now)
 		limits.reject(c, "token", clientIP, token.RepoID)
 		return false
 	}

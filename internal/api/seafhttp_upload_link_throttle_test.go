@@ -82,7 +82,7 @@ func upload(t *testing.T, r *gin.Engine, tokenStr, clientIP string) *httptest.Re
 
 func TestUploadLinkWriteThrottleAppliesOnlyToLinkTokens(t *testing.T) {
 	// A burst of 1 makes the second request in a row the one that trips.
-	h, r := newThrottleTestHandler(t, throttleTestConfig(60, 1, 0, 0), map[string]string{
+	h, r := newThrottleTestHandler(t, throttleTestConfig(1, 1, 0, 0), map[string]string{
 		"link-token": "link",
 		"web-token":  "web",
 		"bare-token": "",
@@ -125,7 +125,7 @@ func TestUploadLinkWriteThrottleAppliesOnlyToLinkTokens(t *testing.T) {
 // using a different one — a limiter that produces exactly the outage it exists to
 // prevent.
 func TestUploadLinkWriteThrottleIsolatesLinksBehindOneAddress(t *testing.T) {
-	_, r := newThrottleTestHandler(t, throttleTestConfig(60, 1, 0, 0), map[string]string{
+	_, r := newThrottleTestHandler(t, throttleTestConfig(1, 1, 0, 0), map[string]string{
 		"link-a": "link",
 		"link-b": "link",
 	})
@@ -147,7 +147,7 @@ func TestUploadLinkWriteThrottleIsolatesLinksBehindOneAddress(t *testing.T) {
 // bucket structurally cannot see: one leaked upload URL hit from many addresses.
 func TestUploadLinkWriteThrottlePerTokenBucket(t *testing.T) {
 	// Per-client generous, per-token tight, so only the per-token bound can fire.
-	_, r := newThrottleTestHandler(t, throttleTestConfig(6000, 100, 60, 2), map[string]string{
+	_, r := newThrottleTestHandler(t, throttleTestConfig(6000, 100, 1, 2), map[string]string{
 		"leaked-link": "link",
 	})
 
@@ -170,7 +170,7 @@ func TestUploadLinkWriteThrottlePerTokenBucket(t *testing.T) {
 // bucket must not accidentally remove the per-token defence against one leaked
 // link being used from many addresses.
 func TestUploadLinkWriteThrottlePerTokenOnly(t *testing.T) {
-	h, r := newThrottleTestHandler(t, throttleTestConfig(0, 0, 60, 1), map[string]string{
+	h, r := newThrottleTestHandler(t, throttleTestConfig(0, 0, 1, 1), map[string]string{
 		"leaked-link": "link",
 	})
 	if h.uploadLinkWriteLimits == nil || h.uploadLinkWriteLimits.perToken == nil {
@@ -186,6 +186,25 @@ func TestUploadLinkWriteThrottlePerTokenOnly(t *testing.T) {
 	if w := upload(t, r, "leaked-link", "203.0.113.2"); w.Code != http.StatusTooManyRequests {
 		t.Fatalf("second address = %d, want 429 from the independently enabled per-token bucket", w.Code)
 	}
+}
+
+func TestUploadLinkWriteThrottleTokenRejectionRestoresClientAdmission(t *testing.T) {
+	h, r := newThrottleTestHandler(t, throttleTestConfig(1, 1, 1, 1), map[string]string{
+		"shared-link": "link",
+	})
+
+	upload(t, r, "shared-link", "203.0.113.1") // Spend the token-wide burst.
+	if w := upload(t, r, "shared-link", "203.0.113.2"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("second address = %d, want token-wide 429", w.Code)
+	}
+
+	key := "203.0.113.2|" + uploadLinkTokenFingerprint("shared-link")
+	now := time.Now()
+	admission := h.uploadLinkWriteLimits.perClient.TryReserve(key, now)
+	if admission == nil {
+		t.Fatal("token-wide rejection consumed the independent per-client admission")
+	}
+	admission.CancelAt(now)
 }
 
 func TestUploadLinkWriteThrottleDisabledByConfig(t *testing.T) {
@@ -233,7 +252,7 @@ func TestUploadLinkWriteThrottleZeroBurstDoesNotBuildAnEmptyBucket(t *testing.T)
 // answer rather than relying on its caller's ordering staying as it is.
 func TestUploadLinkWriteThrottleNilTokenIsAllowed(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	h, _ := newThrottleTestHandler(t, throttleTestConfig(60, 1, 0, 0), nil)
+	h, _ := newThrottleTestHandler(t, throttleTestConfig(1, 1, 0, 0), nil)
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

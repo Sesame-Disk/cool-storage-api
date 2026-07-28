@@ -5116,8 +5116,8 @@ noticed. The regression asserts the negative too: with the bucket exhausted,
 
 | Bucket | Key | What only it can see |
 |---|---|---|
-| per-client | (client IP, upload token) | one uploader going too fast |
-| per-token | upload token, all IPs | one leaked upload URL hit from many addresses |
+| per-client | (client IP, upload token), per node | one uploader going too fast |
+| per-token | upload token, all IPs on one node | one leaked upload URL hit from many addresses |
 
 Keyed on IP alone, one person uploading through one link would throttle every
 colleague behind the same NAT using a *different* link — the limiter would cause
@@ -5125,6 +5125,10 @@ the outage it exists to prevent. That isolation is its own regression, also
 mutation-verified. The per-token bucket has a known limit: an attacker who
 re-mints a fresh upload token per request gets a fresh bucket, and is bounded
 instead by the existing per-IP limiter on the mint route.
+
+The two buckets form one admission decision: the per-client token is reserved
+first and cancelled if the per-token bucket rejects, so refused work does not
+consume an unrelated client's allowance.
 
 **The client had to be fixed for the server bound to be safe at all.**
 `@seafile/resumablejs` does not list 429 in `permanentErrors`, so it retries —
@@ -5154,13 +5158,13 @@ Two details there are load-bearing and were not obvious:
   server just described as empty had refilled. Around our own exponential guess
   there is no such floor, so jitter goes both ways there.
 
-**Attribution depends on deployment.** These are per-IP buckets, and `ClientIP()`
-is only the real client when `server.trusted_proxies` names the proxy in front of
-Go. That is the documented production topology (see `docs/DEPLOY.md`), where the
-internal nginx preserves the central nginx's canonicalized client IP. Left unset
-behind a proxy, every anonymous uploader collapses into one bucket; the server
-logs a warning at startup on that combination rather than failing, because
-running with no proxy at all is legitimate.
+**Attribution and capacity depend on deployment.** These buckets are node-local,
+so aggregate fleet admission can approach the configured values multiplied by
+the number of nodes. `ClientIP()` is only the real client when
+`server.trusted_proxies` names the proxy in front of Go. Left unset behind a
+proxy, clients using the same upload token are attributed to the proxy IP and
+share one per-client bucket; different tokens remain isolated. The server warns
+rather than failing because running with no proxy is legitimate.
 
 Config: `seafhttp.upload_link_writes_per_minute` (600) / `upload_link_write_burst`
 (1200), `upload_link_token_writes_per_minute` (12000) /

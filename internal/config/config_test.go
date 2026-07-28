@@ -520,8 +520,8 @@ func TestConfigValidate(t *testing.T) {
 			wantErrContain: "seafhttp.upload_link_write_burst",
 		},
 		{
-			// Above this the refill interval collapses to zero and the limiter
-			// silently stops bounding anything, which is worse than a loose bound.
+			// The ceiling is operational policy: values above it are ineffective
+			// protection and likely indicate a unit mistake.
 			name: "upload link rate rejects a value above the ceiling",
 			modify: func(c *Config) {
 				c.SeafHTTP.UploadLinkWritesPerMinute = MaxUploadLinkWritesPerMinute + 1

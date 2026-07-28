@@ -273,13 +273,13 @@ seafhttp:
   # These are generous starting values, not measured ones: the failure mode of a
   # rate limit on a data path is a real person's upload dying, so tighten them
   # from upload_link_write_throttled_total rather than guessing downward.
-  # Requires server.trusted_proxies to be set when running behind a reverse proxy,
-  # otherwise every client shares the proxy's address and therefore one bucket.
+  # Behind an untrusted proxy, clients using the same token share the proxy-IP
+  # bucket; different tokens remain isolated. Limits are per node, not cluster-wide.
   # Overrides: SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE, SEAFHTTP_UPLOAD_LINK_WRITE_BURST
   upload_link_writes_per_minute: 600
   upload_link_write_burst: 1200
 
-  # Bound on writes against ONE upload token across all client IPs — the only
+  # Per-node bound on writes against ONE upload token across all client IPs — the only
   # bucket that sees a leaked upload URL hit from many addresses at once. Set far
   # above the per-client bound because a shared link legitimately serves many
   # people at once. 0 disables.

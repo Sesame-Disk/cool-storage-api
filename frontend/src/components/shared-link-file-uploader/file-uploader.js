@@ -10,7 +10,7 @@ import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitial
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
-import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, clearThrottleState, noteUploadRetry } from '../file-uploader/upload-throttle-backoff';
+import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, clearChunkThrottleState, clearThrottleState, noteUploadRetry } from '../file-uploader/upload-throttle-backoff';
 import UploadProgressDialog from './upload-progress-dialog';
 import toaster from '../toast';
 import '../../css/file-uploader.css';
@@ -153,6 +153,7 @@ class FileUploader extends React.Component {
     this.resumable.on('complete', this.onComplete.bind(this));
     this.resumable.on('pause', this.onPause.bind(this));
     this.resumable.on('fileRetry', this.onFileRetry.bind(this));
+    this.resumable.on('fileChunkSuccess', this.onChunkUploadSuccess.bind(this));
     this.resumable.on('fileError', this.onFileError.bind(this));
     this.resumable.on('error', this.onError.bind(this));
     this.resumable.on('beforeCancel', this.onBeforeCancel.bind(this));
@@ -545,7 +546,15 @@ class FileUploader extends React.Component {
     // carrying a link token, exactly what the server-side limiter refuses. Left
     // without backoff, a throttled chunk here dies after three immediate retries.
     if (noteUploadRetry(this.resumable, resumableFile, chunk, retryInfo)) {
-      this.setState({ uploadFileList: [...this.state.uploadFileList] });
+      this.setState((prevState) => ({
+        uploadFileList: [...prevState.uploadFileList],
+      }));
+    }
+  };
+
+  onChunkUploadSuccess = (resumableFile, chunk) => {
+    if (clearChunkThrottleState(resumableFile, chunk)) {
+      this.setState((prevState) => ({ uploadFileList: [...prevState.uploadFileList] }));
     }
   };
 

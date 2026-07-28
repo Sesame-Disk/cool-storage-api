@@ -27,6 +27,7 @@ export const THROTTLED_MAX_CHUNK_RETRIES = 12;
 const MIN_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 16000;
 const JITTER_RATIO = 0.25;
+const throttledChunks = new WeakMap();
 
 // parseRetryAfterMs reads the server's Retry-After. Only delta-seconds is
 // accepted: it is the form SesameFS sends, and guessing at an HTTP-date would
@@ -72,17 +73,43 @@ export function noteUploadRetry(resumable, resumableFile, chunk, retryInfo) {
   chunk.opts = chunk.opts || {};
   if (!retryInfo || retryInfo.status !== THROTTLED_STATUS) {
     delete chunk.opts.chunkRetryInterval;
+    clearChunkThrottleState(resumableFile, chunk);
     return false;
   }
 
   chunk.opts.chunkRetryInterval = backoffMs(retryInfo.retryAfter, chunk.retries || 0);
   chunk.opts.maxChunkRetries = THROTTLED_MAX_CHUNK_RETRIES;
-  if (resumableFile) resumableFile.isThrottled = true;
+  if (resumableFile) {
+    let chunks = throttledChunks.get(resumableFile);
+    if (!chunks) {
+      chunks = new Set();
+      throttledChunks.set(resumableFile, chunks);
+    }
+    chunks.add(chunk);
+    resumableFile.isThrottled = true;
+  }
   return true;
+}
+
+// clearChunkThrottleState resolves one chunk's backoff without hiding the busy
+// state while another chunk from the same file is still waiting.
+export function clearChunkThrottleState(resumableFile, chunk) {
+  if (!resumableFile) return false;
+  const chunks = throttledChunks.get(resumableFile);
+  const wasThrottled = Boolean(resumableFile.isThrottled);
+  if (chunks && chunk) chunks.delete(chunk);
+  if (!chunks || chunks.size === 0) {
+    throttledChunks.delete(resumableFile);
+    resumableFile.isThrottled = false;
+  }
+  return wasThrottled !== Boolean(resumableFile.isThrottled);
 }
 
 // clearThrottleState is called when a file finishes or fails for good, so a
 // stale "server is busy" hint does not outlive the condition.
 export function clearThrottleState(resumableFile) {
-  if (resumableFile) resumableFile.isThrottled = false;
+  if (resumableFile) {
+    throttledChunks.delete(resumableFile);
+    resumableFile.isThrottled = false;
+  }
 }

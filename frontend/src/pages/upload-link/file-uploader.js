@@ -10,7 +10,7 @@ import { clearFileUploadRuntimeState, consumeSuppressedUploadErrorToast, getBase
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
-import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, clearThrottleState, noteUploadRetry } from '../../components/file-uploader/upload-throttle-backoff';
+import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, clearChunkThrottleState, clearThrottleState, noteUploadRetry } from '../../components/file-uploader/upload-throttle-backoff';
 import UploadProgressDialog from './upload-progress-dialog';
 import toaster from '../../components/toast';
 
@@ -149,6 +149,7 @@ class FileUploader extends React.Component {
     this.resumable.on('fileSuccess', this.onFileUploadSuccess.bind(this));
     this.resumable.on('fileError', this.onFileError.bind(this));
     this.resumable.on('fileRetry', this.onFileRetry.bind(this));
+    this.resumable.on('fileChunkSuccess', this.onChunkUploadSuccess.bind(this));
     this.resumable.on('uploadStart', this.onUploadStart.bind(this));
     this.resumable.on('progress', this.onProgress.bind(this));
     this.resumable.on('complete', this.onComplete.bind(this));
@@ -676,7 +677,15 @@ class FileUploader extends React.Component {
     // refills a couple of times a second and gives up on the file.
     if (noteUploadRetry(this.resumable, resumableFile, chunk, retryInfo)) {
       // No progress events arrive while waiting, so nudge a render to show it.
-      this.setState({ uploadFileList: [...this.state.uploadFileList] });
+      this.setState((prevState) => ({
+        uploadFileList: [...prevState.uploadFileList],
+      }));
+    }
+  };
+
+  onChunkUploadSuccess = (resumableFile, chunk) => {
+    if (clearChunkThrottleState(resumableFile, chunk)) {
+      this.setState((prevState) => ({ uploadFileList: [...prevState.uploadFileList] }));
     }
   };
 
