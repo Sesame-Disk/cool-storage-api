@@ -249,9 +249,9 @@ seafhttp:
   # Per-request body cap for PUT /seafhttp/repo/:repo_id/block/:block_id. PutBlock
   # buffers the whole body before hashing, so this is the per-request buffered-body
   # bound on the desktop-sync block route — the dominant term in its memory cost,
-  # not a hard ceiling on it. Sized from the traffic this route carries
-  # (8 MiB blocks), NOT from the web uploader's chunk ceiling — that mismatch is
-  # how the previous 257 MiB bound arose. Rejected values: 0 or negative (an
+  # not a hard ceiling on it. Sized with ample headroom over the official client
+  # CDC maximum and SesameFS's related 8 MiB split, not the web uploader; using
+  # that unrelated ceiling is how the previous 257 MiB bound arose. Rejected values: 0 or negative (an
   # unbounded body is the defect) and anything above 64 MiB.
   # Override: SEAFHTTP_SYNC_BLOCK_MAX_BYTES
   # NOT an aggregate bound: N concurrent uploads still cost N x this value.

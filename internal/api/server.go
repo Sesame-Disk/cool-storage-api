@@ -279,7 +279,7 @@ func buildCORSConfig(cfg *config.Config) cors.Config {
 			"X-Block-Upload-Session",
 			"X-Requested-With", // Common AJAX header
 		},
-		ExposeHeaders:    []string{"Content-Length", "Content-Type", "X-Quota-Warning"},
+		ExposeHeaders:    []string{"Content-Length", "Content-Type", "Retry-After", "X-Quota-Warning"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}

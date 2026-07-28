@@ -10,7 +10,7 @@ import { clearFileUploadRuntimeState, consumeSuppressedUploadErrorToast, getBase
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
-import { BASE_MAX_CHUNK_RETRIES, clearThrottleState, noteUploadRetry } from '../../components/file-uploader/upload-throttle-backoff';
+import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, clearThrottleState, noteUploadRetry } from '../../components/file-uploader/upload-throttle-backoff';
 import UploadProgressDialog from './upload-progress-dialog';
 import toaster from '../../components/toast';
 
@@ -82,6 +82,7 @@ class FileUploader extends React.Component {
       generateUniqueIdentifier: this.generateUniqueIdentifier,
       forceChunkSize: true,
       maxChunkRetries: BASE_MAX_CHUNK_RETRIES,
+      throttledMaxChunkRetries: THROTTLED_MAX_CHUNK_RETRIES,
       minFileSize: 0,
     });
 
@@ -667,13 +668,13 @@ class FileUploader extends React.Component {
     this.restoreConcurrencyIfIdle();
   };
 
-  onFileRetry = (resumableFile) => {
+  onFileRetry = (resumableFile, chunk, retryInfo) => {
     noteAdaptiveUploadRetry(this.resumable);
     // A 429 here is the server asking us to slow down, not a failure. Space the
     // retry out (honouring Retry-After) and raise the retry ceiling, otherwise
     // resumable.js burns its three immediate attempts against a bucket that
     // refills a couple of times a second and gives up on the file.
-    if (noteUploadRetry(this.resumable, resumableFile)) {
+    if (noteUploadRetry(this.resumable, resumableFile, chunk, retryInfo)) {
       // No progress events arrive while waiting, so nudge a render to show it.
       this.setState({ uploadFileList: [...this.state.uploadFileList] });
     }

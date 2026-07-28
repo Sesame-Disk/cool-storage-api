@@ -166,6 +166,28 @@ func TestUploadLinkWriteThrottlePerTokenBucket(t *testing.T) {
 	}
 }
 
+// The two bounds are independently configurable. Disabling the per-client
+// bucket must not accidentally remove the per-token defence against one leaked
+// link being used from many addresses.
+func TestUploadLinkWriteThrottlePerTokenOnly(t *testing.T) {
+	h, r := newThrottleTestHandler(t, throttleTestConfig(0, 0, 60, 1), map[string]string{
+		"leaked-link": "link",
+	})
+	if h.uploadLinkWriteLimits == nil || h.uploadLinkWriteLimits.perToken == nil {
+		t.Fatal("per-token limiter was not constructed when the per-client limiter was disabled")
+	}
+	if h.uploadLinkWriteLimits.perClient != nil {
+		t.Fatal("per-client limiter was constructed while disabled")
+	}
+
+	if w := upload(t, r, "leaked-link", "203.0.113.1"); w.Code == http.StatusTooManyRequests {
+		t.Fatal("first write was refused; the per-token burst must admit it")
+	}
+	if w := upload(t, r, "leaked-link", "203.0.113.2"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("second address = %d, want 429 from the independently enabled per-token bucket", w.Code)
+	}
+}
+
 func TestUploadLinkWriteThrottleDisabledByConfig(t *testing.T) {
 	h, r := newThrottleTestHandler(t, throttleTestConfig(0, 0, 0, 0), map[string]string{"link-token": "link"})
 	if h.uploadLinkWriteLimits != nil {

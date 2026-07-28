@@ -532,13 +532,11 @@ type SeafHTTPConfig struct {
 	// dominant term in its memory cost, not a hard ceiling on it: io.ReadAll can
 	// over-allocate while growing, and hashing plus HTTP machinery add their own.
 	//
-	// The default is sized from the traffic this route is expected to carry, not
-	// from the web uploader's adaptive ceiling: SesameFS splits at 8 MiB
-	// (`uploadBlockSize`, matching Seafile's default CDC block) and the official
-	// client's CDC maximum is smaller still. 16 MiB leaves 2x headroom over the
-	// 8 MiB block plus room for cipher padding, while cutting the previous
-	// 257 MiB bound by 16x. That 8 MiB figure is what the code splits at, not a
-	// production measurement — `sync_put_block_body_bytes` exists to measure it.
+	// The default is sized with ample headroom over the official client's 4 MiB
+	// CDC maximum and SesameFS's related 8 MiB server-side split, not from the web
+	// uploader's adaptive ceiling. 16 MiB also leaves room for cipher padding while
+	// cutting the previous 257 MiB buffered-body bound by approximately 16x.
+	// `sync_put_block_body_bytes` exists to validate the choice with real traffic.
 	//
 	// It is NOT an aggregate bound. N concurrent uploads still cost N x this
 	// value; capping total in-flight readers is X10 / subcontract B of
@@ -1825,8 +1823,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("seafhttp.sync_block_max_bytes must be greater than zero (an unbounded sync block body is not a supported configuration)")
 	}
 	if c.SeafHTTP.SyncBlockMaxBytes > MaxSyncBlockMaxBytes {
-		return fmt.Errorf("seafhttp.sync_block_max_bytes is %d, above the %d ceiling; this route carries %d-byte blocks, so a larger value is almost certainly derived from the web uploader's chunk ceiling by mistake",
-			c.SeafHTTP.SyncBlockMaxBytes, MaxSyncBlockMaxBytes, 8*1024*1024)
+		return fmt.Errorf("seafhttp.sync_block_max_bytes is %d, above the %d ceiling; the official client CDC maximum is 4 MiB and SesameFS's related server-side split is 8 MiB, so a larger value is likely derived from the unrelated web uploader ceiling",
+			c.SeafHTTP.SyncBlockMaxBytes, MaxSyncBlockMaxBytes)
 	}
 	if err := validateUploadLinkWriteLimit(
 		"upload_link_writes_per_minute", "upload_link_write_burst",

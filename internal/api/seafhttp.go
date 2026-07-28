@@ -1438,19 +1438,19 @@ func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manage
 	}
 }
 
-// newUploadLinkWriteLimits builds the anonymous upload-link buckets, or nil when
-// configuration disables the per-client bound. Returning nil rather than a
-// permissive limiter keeps "disabled" a single check in allowUploadLinkWrite.
-//
-// The per-token bound is optional on its own: zeroing it leaves the per-client
-// bucket in place, and RateLimiter.Allow admits everything on a nil receiver.
+// newUploadLinkWriteLimits builds the enabled anonymous upload-link buckets.
+// Either bound can be disabled independently; the container is nil only when
+// both are off. RateLimiter.Allow and Stop are nil-safe for the missing member.
 func newUploadLinkWriteLimits(cfg *config.Config) *uploadLinkWriteLimits {
-	if cfg == nil || cfg.SeafHTTP.UploadLinkWritesPerMinute <= 0 {
+	if cfg == nil {
 		return nil
 	}
 	limits := &uploadLinkWriteLimits{
 		perClient: newPerMinuteRateLimiter(cfg.SeafHTTP.UploadLinkWritesPerMinute, cfg.SeafHTTP.UploadLinkWriteBurst),
 		perToken:  newPerMinuteRateLimiter(cfg.SeafHTTP.UploadLinkTokenWritesPerMinute, cfg.SeafHTTP.UploadLinkTokenWriteBurst),
+	}
+	if limits.perClient == nil && limits.perToken == nil {
+		return nil
 	}
 	limits.logSample.Interval = time.Minute
 	return limits

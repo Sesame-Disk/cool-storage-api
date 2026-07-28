@@ -10,7 +10,7 @@ import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitial
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
-import { BASE_MAX_CHUNK_RETRIES, clearThrottleState, noteUploadRetry } from '../file-uploader/upload-throttle-backoff';
+import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, clearThrottleState, noteUploadRetry } from '../file-uploader/upload-throttle-backoff';
 import UploadProgressDialog from './upload-progress-dialog';
 import toaster from '../toast';
 import '../../css/file-uploader.css';
@@ -82,6 +82,7 @@ class FileUploader extends React.Component {
       generateUniqueIdentifier: this.generateUniqueIdentifier,
       forceChunkSize: true,
       maxChunkRetries: BASE_MAX_CHUNK_RETRIES,
+      throttledMaxChunkRetries: THROTTLED_MAX_CHUNK_RETRIES,
       minFileSize: 0,
     });
 
@@ -538,12 +539,12 @@ class FileUploader extends React.Component {
     // After the error, the user can switch windows
   };
 
-  onFileRetry = (resumableFile) => {
+  onFileRetry = (resumableFile, chunk, retryInfo) => {
     noteAdaptiveUploadRetry(this.resumable);
     // This uploader serves share links that allow upload — anonymous writes
     // carrying a link token, exactly what the server-side limiter refuses. Left
     // without backoff, a throttled chunk here dies after three immediate retries.
-    if (noteUploadRetry(this.resumable, resumableFile)) {
+    if (noteUploadRetry(this.resumable, resumableFile, chunk, retryInfo)) {
       this.setState({ uploadFileList: [...this.state.uploadFileList] });
     }
   };

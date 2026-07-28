@@ -635,6 +635,16 @@ func TestBuildCORSConfig(t *testing.T) {
 		if !foundBlockHashHeader {
 			t.Fatal("expected X-Block-Hash to be allowed for cross-origin block uploads")
 		}
+		foundRetryAfter := false
+		for _, h := range corsConfig.ExposeHeaders {
+			if h == "Retry-After" {
+				foundRetryAfter = true
+				break
+			}
+		}
+		if !foundRetryAfter {
+			t.Fatal("expected Retry-After to be exposed for cross-origin throttled uploads")
+		}
 	})
 
 	t.Run("production without allowlist fails closed", func(t *testing.T) {

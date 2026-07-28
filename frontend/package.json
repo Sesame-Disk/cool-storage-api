@@ -50,6 +50,11 @@
     "watermark-dom": "^1.0.0"
   },
   "scripts": {
+    "postinstall": "node scripts/patch-resumablejs.js",
+    "prestart": "node scripts/patch-resumablejs.js",
+    "prebuild": "node scripts/patch-resumablejs.js",
+    "pretest": "node scripts/patch-resumablejs.js",
+    "predev": "node scripts/patch-resumablejs.js",
     "lint": "export NODE_ENV=development && ./node_modules/.bin/eslint ./src/",
     "lint-fix": "export NODE_ENV=development && ./node_modules/.bin/eslint ./src/ --fix",
     "start": "node scripts/start.js",

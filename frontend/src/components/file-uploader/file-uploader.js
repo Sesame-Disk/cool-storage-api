@@ -14,7 +14,7 @@ import UploadProgressDialog from './upload-progress-dialog';
 import UploadRemindDialog from '../dialog/upload-remind-dialog';
 import toaster from '../toast';
 import { isAbortError, shouldUseBlockUpload, uploadFileViaBlocks, BLOCK_SIZE } from './block-upload-orchestrator';
-import { BASE_MAX_CHUNK_RETRIES, noteUploadRetry } from './upload-throttle-backoff';
+import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, noteUploadRetry } from './upload-throttle-backoff';
 import '../../css/file-uploader.css';
 
 const propTypes = {
@@ -189,6 +189,7 @@ class FileUploader extends React.Component {
       generateUniqueIdentifier: this.generateUniqueIdentifier,
       forceChunkSize: true,
       maxChunkRetries: BASE_MAX_CHUNK_RETRIES,
+      throttledMaxChunkRetries: THROTTLED_MAX_CHUNK_RETRIES,
       minFileSize: 0,
     });
 
@@ -1760,12 +1761,12 @@ class FileUploader extends React.Component {
     }
   };
 
-  onFileRetry = (resumableFile) => {
+  onFileRetry = (resumableFile, chunk, retryInfo) => {
     noteAdaptiveUploadRetry(this.resumable);
     // Same backoff as the upload-link page. The anonymous limiter cannot refuse
     // an authenticated web upload, but any 429 reaching resumable.js has the
     // same destructive retry behaviour, so the policy belongs on both.
-    noteUploadRetry(this.resumable, resumableFile);
+    noteUploadRetry(this.resumable, resumableFile, chunk, retryInfo);
   };
 
   onBeforeCancel = () => {

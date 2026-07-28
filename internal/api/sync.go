@@ -1284,10 +1284,9 @@ const (
 //
 // It used to be a 257 MiB constant derived from the web uploader's 256 MiB
 // adaptive-chunk ceiling — the wrong domain: that ceiling governs browser
-// chunking and never applied to this route, whose traffic is 8 MiB blocks
-// (`uploadBlockSize`, matching Seafile's default CDC block; the official
-// client's CDC maximum is smaller). The default is now 16 MiB, sized from that
-// traffic, and operators can raise it up to the validated ceiling.
+// chunking and never applied to this route. The 16 MiB default leaves ample
+// headroom over the official client's 4 MiB CDC maximum and SesameFS's related
+// 8 MiB server-side split; operators can raise it up to the validated ceiling.
 //
 // The nil-config fallback is the package default rather than something
 // permissive: a handler without config is a wiring bug, and failing open here
@@ -1363,9 +1362,9 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		return
 	}
 
-	// Observed after the read succeeds, so the histogram describes accepted
-	// traffic. Rejected oversize attempts are counted separately above; mixing
-	// them in would bias the distribution the cap is meant to be sized against.
+	// Observed after the read succeeds, so the histogram describes request bodies
+	// that passed the size gate. Rejected oversize attempts are counted separately
+	// above; mixing them in would bias the distribution used to size the cap.
 	metrics.SyncPutBlockBodyBytes.Observe(float64(len(data)))
 
 	log.Printf("PutBlock: received %d bytes for block %s\n", len(data), externalID)

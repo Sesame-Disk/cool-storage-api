@@ -40,6 +40,9 @@ func clearLoadEnvOverrides(t *testing.T) {
 		"WEB_UPLOADS_MAX_STAGED_BYTES_PER_SESSION_MB",
 		"SEAFHTTP_TOKEN_TTL", "SEAFHTTP_ZIP_MAX_ENTRIES",
 		"SEAFHTTP_ZIP_MAX_DEPTH", "SEAFHTTP_ZIP_MAX_BYTES",
+		"SEAFHTTP_SYNC_BLOCK_MAX_BYTES",
+		"SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE", "SEAFHTTP_UPLOAD_LINK_WRITE_BURST",
+		"SEAFHTTP_UPLOAD_LINK_TOKEN_WRITES_PER_MINUTE", "SEAFHTTP_UPLOAD_LINK_TOKEN_WRITE_BURST",
 	} {
 		t.Setenv(k, "")
 	}
@@ -801,6 +804,8 @@ func TestEnvOverrideOnlyOfficeMaxDocumentBytes(t *testing.T) {
 // silently dropped back to the default — an operator who deliberately raised the
 // cap must not end up running the lower one with no signal.
 func TestEnvOverrideSyncBlockMaxBytes(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
 	t.Run("valid value overrides the default", func(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Auth.DevMode = true
@@ -859,6 +864,8 @@ func TestEnvOverrideSyncBlockMaxBytes(t *testing.T) {
 // dropped when malformed: an operator who deliberately loosened a limit and
 // typo'd the value must not end up running the stricter default unaware.
 func TestEnvOverrideUploadLinkWriteLimits(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
 	cfg := DefaultConfig()
 	cfg.Auth.DevMode = true
 	t.Setenv("SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE", "900")
@@ -887,6 +894,8 @@ func TestEnvOverrideUploadLinkWriteLimits(t *testing.T) {
 }
 
 func TestEnvOverrideUploadLinkWriteLimitsRejectMalformedValues(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
 	for _, env := range []string{
 		"SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE",
 		"SEAFHTTP_UPLOAD_LINK_WRITE_BURST",

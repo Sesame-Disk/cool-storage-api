@@ -6,6 +6,7 @@ import {
   noteUploadRetry,
   parseRetryAfterMs,
 } from '../upload-throttle-backoff';
+import fs from 'fs';
 
 // The defect this guards: resumable.js retries a 429 immediately (its
 // chunkRetryInterval is unset) and counts those attempts against
@@ -18,12 +19,26 @@ const makeResumable = () => ({ opts: { chunkRetryInterval: undefined, maxChunkRe
 
 const makeFile = (chunks) => ({ chunks });
 
-const makeChunk = ({ status, retryAfter = null, retries = 0 }) => ({
+const makeChunk = ({ retries = 0 }) => ({
   retries,
-  xhr: {
-    status,
-    getResponseHeader: (name) => (name === 'Retry-After' ? retryAfter : null),
-  },
+  opts: {},
+});
+
+const makeRetryInfo = (status, retryAfter = null) => ({ status, retryAfter });
+
+describe('resumable.js retry contract', () => {
+  it('captures response metadata before abort and makes delayed retries cancelable', () => {
+    const source = fs.readFileSync(require.resolve('@seafile/resumablejs'), 'utf8');
+    expect(source).toContain("$.resumableObj.fire('fileRetry', $, chunk, retryInfo)");
+    expect(source).toContain("retryInfo.retryAfter = $.xhr ? $.xhr.getResponseHeader('Retry-After') : null");
+    expect(source).toContain("$.getOpt('throttledMaxChunkRetries')");
+    expect(source).toContain('$.retryTimer = setTimeout(function()');
+    expect(source).toContain('clearTimeout($.retryTimer)');
+    // The patch rewrites a file it may have already rewritten, so "the new code
+    // is present" is not enough: a superseded copy left above it would run
+    // first, and it reads the response header without the guard below.
+    expect(source.match(/var retryInfo/g)).toHaveLength(1);
+  });
 });
 
 describe('parseRetryAfterMs', () => {
@@ -87,11 +102,12 @@ describe('backoffMs', () => {
 describe('noteUploadRetry', () => {
   it('spaces out the retry and raises the ceiling on a 429', () => {
     const resumable = makeResumable();
-    const file = makeFile([makeChunk({ status: 429, retryAfter: '3' })]);
+    const chunk = makeChunk({ retries: 0 });
+    const file = makeFile([chunk]);
 
-    expect(noteUploadRetry(resumable, file)).toBe(true);
-    expect(resumable.opts.chunkRetryInterval).toBeGreaterThanOrEqual(1000);
-    expect(resumable.opts.maxChunkRetries).toBe(THROTTLED_MAX_CHUNK_RETRIES);
+    expect(noteUploadRetry(resumable, file, chunk, makeRetryInfo(429, '3'))).toBe(true);
+    expect(chunk.opts.chunkRetryInterval).toBeGreaterThanOrEqual(3000);
+    expect(chunk.opts.maxChunkRetries).toBe(THROTTLED_MAX_CHUNK_RETRIES);
     expect(file.isThrottled).toBe(true);
   });
 
@@ -99,118 +115,58 @@ describe('noteUploadRetry', () => {
   // attempts is all a throttled chunk gets.
   it('leaves room for the bucket to refill', () => {
     const resumable = makeResumable();
-    const file = makeFile([makeChunk({ status: 429, retryAfter: '5' })]);
+    const chunk = makeChunk({ retries: 0 });
+    const file = makeFile([chunk]);
 
-    noteUploadRetry(resumable, file);
+    noteUploadRetry(resumable, file, chunk, makeRetryInfo(429, '5'));
 
-    const totalWait = resumable.opts.chunkRetryInterval * resumable.opts.maxChunkRetries;
+    const totalWait = chunk.opts.chunkRetryInterval * chunk.opts.maxChunkRetries;
     expect(totalWait).toBeGreaterThan(5000);
   });
 
-  // A network blip must not inherit multi-second waits from an earlier
-  // throttled stretch; undefined is the library's "retry immediately".
-  it('restores the retry interval immediately on a retry that is not throttling', () => {
+  it('keeps retry policy isolated between concurrent chunks', () => {
     const resumable = makeResumable();
-    let clock = 1_000_000;
-    const now = () => clock;
-    noteUploadRetry(resumable, makeFile([makeChunk({ status: 429, retryAfter: '5' })]), now);
+    const throttledChunk = makeChunk({ retries: 3 });
+    const networkChunk = makeChunk({ retries: 0 });
+    const file = makeFile([throttledChunk, networkChunk]);
 
-    const file = makeFile([makeChunk({ status: 0 })]);
-    expect(noteUploadRetry(resumable, file, now)).toBe(false);
-    expect(resumable.opts.chunkRetryInterval).toBeUndefined();
-    expect(file.isThrottled).toBe(false);
-  });
+    expect(noteUploadRetry(resumable, file, throttledChunk, makeRetryInfo(429, '5'))).toBe(true);
+    expect(noteUploadRetry(resumable, file, networkChunk, makeRetryInfo(0))).toBe(false);
 
-  // The regression for the shared-options hazard. The options live on the
-  // resumable instance, but the events that set them are per-chunk: one chunk
-  // holding sustained 429s while another hits a network error. resumable.js
-  // reads maxChunkRetries in status() BEFORE emitting the retry event, so if the
-  // network error lowers the ceiling, the throttled chunk — which has already
-  // spent the baseline attempts — is failed outright and this module never gets
-  // an event to raise it back.
-  it('keeps the raised ceiling while a throttled retry is still pending', () => {
-    const resumable = makeResumable();
-    let clock = 1_000_000;
-    const now = () => clock;
-
-    // Chunk A is throttled and has already burned the baseline attempts.
-    const throttledFile = makeFile([makeChunk({ status: 429, retryAfter: '5', retries: 3 })]);
-    expect(noteUploadRetry(resumable, throttledFile, now)).toBe(true);
-    expect(resumable.opts.maxChunkRetries).toBe(THROTTLED_MAX_CHUNK_RETRIES);
-
-    // Chunk B, on an unrelated file, fails with a network error a moment later.
-    clock += 100;
-    const networkFile = makeFile([makeChunk({ status: 0 })]);
-    expect(noteUploadRetry(resumable, networkFile, now)).toBe(false);
-
-    expect(resumable.opts.maxChunkRetries).toBe(THROTTLED_MAX_CHUNK_RETRIES);
-    // The interval is still restored, so the network retry is not slowed down.
-    expect(resumable.opts.chunkRetryInterval).toBeUndefined();
-  });
-
-  it('restores the ceiling once the throttled retry can no longer be pending', () => {
-    const resumable = makeResumable();
-    let clock = 1_000_000;
-    const now = () => clock;
-
-    noteUploadRetry(resumable, makeFile([makeChunk({ status: 429, retryAfter: '5' })]), now);
-
-    // Well past the scheduled wait (5s plus jitter) and the grace covering its
-    // round trip. Deliberately not the exact boundary: the jitter makes the wait
-    // itself non-deterministic, and a test that straddles it would be flaky.
-    clock += 60000;
-    noteUploadRetry(resumable, makeFile([makeChunk({ status: 0 })]), now);
-
+    expect(throttledChunk.opts.maxChunkRetries).toBe(THROTTLED_MAX_CHUNK_RETRIES);
+    expect(throttledChunk.opts.chunkRetryInterval).toBeGreaterThanOrEqual(5000);
+    expect(networkChunk.opts.maxChunkRetries).toBeUndefined();
+    expect(networkChunk.opts.chunkRetryInterval).toBeUndefined();
     expect(resumable.opts.maxChunkRetries).toBe(BASE_MAX_CHUNK_RETRIES);
-  });
-
-  // Two uploaders can exist on one page; neither may inherit the other's window.
-  it('keeps the sticky window per resumable instance', () => {
-    const throttledInstance = makeResumable();
-    const otherInstance = makeResumable();
-    let clock = 1_000_000;
-    const now = () => clock;
-
-    noteUploadRetry(throttledInstance, makeFile([makeChunk({ status: 429, retryAfter: '5' })]), now);
-    noteUploadRetry(otherInstance, makeFile([makeChunk({ status: 0 })]), now);
-
-    expect(throttledInstance.opts.maxChunkRetries).toBe(THROTTLED_MAX_CHUNK_RETRIES);
-    expect(otherInstance.opts.maxChunkRetries).toBe(BASE_MAX_CHUNK_RETRIES);
   });
 
   it('falls back to exponential backoff when the server sends no Retry-After', () => {
     const resumable = makeResumable();
-    const file = makeFile([makeChunk({ status: 429, retryAfter: null, retries: 2 })]);
+    const chunk = makeChunk({ retries: 2 });
+    const file = makeFile([chunk]);
 
-    expect(noteUploadRetry(resumable, file)).toBe(true);
-    expect(resumable.opts.chunkRetryInterval).toBeGreaterThanOrEqual(1000);
+    expect(noteUploadRetry(resumable, file, chunk, makeRetryInfo(429))).toBe(true);
+    expect(chunk.opts.chunkRetryInterval).toBeGreaterThanOrEqual(1000);
   });
 
-  // Some browsers throw reading a header off an aborted xhr. That must degrade
-  // to the exponential path, not take the upload down with it.
-  it('survives a header read that throws', () => {
+  it('uses the response metadata captured before resumable clears the XHR', () => {
     const resumable = makeResumable();
-    const file = makeFile([{
-      retries: 0,
-      xhr: {
-        status: 429,
-        getResponseHeader: () => { throw new Error('InvalidStateError'); },
-      },
-    }]);
+    const chunk = makeChunk({ retries: 0 });
+    const file = makeFile([chunk]);
 
-    expect(noteUploadRetry(resumable, file)).toBe(true);
-    expect(resumable.opts.chunkRetryInterval).toBeGreaterThanOrEqual(1000);
+    expect(noteUploadRetry(resumable, file, chunk, makeRetryInfo(429, '7'))).toBe(true);
+    expect(chunk.opts.chunkRetryInterval).toBeGreaterThanOrEqual(7000);
   });
 
   it('is inert without a resumable instance', () => {
-    expect(noteUploadRetry(null, makeFile([makeChunk({ status: 429 })]))).toBe(false);
-    expect(noteUploadRetry({}, makeFile([makeChunk({ status: 429 })]))).toBe(false);
+    const chunk = makeChunk({});
+    expect(noteUploadRetry(null, makeFile([chunk]), chunk, makeRetryInfo(429))).toBe(false);
+    expect(noteUploadRetry({}, makeFile([chunk]), chunk, makeRetryInfo(429))).toBe(false);
   });
 
-  it('handles a file with no chunks', () => {
+  it('handles a retry with no triggering chunk', () => {
     const resumable = makeResumable();
-    expect(noteUploadRetry(resumable, makeFile(undefined))).toBe(false);
-    expect(noteUploadRetry(resumable, undefined)).toBe(false);
+    expect(noteUploadRetry(resumable, makeFile(undefined), null, makeRetryInfo(429))).toBe(false);
   });
 });
 

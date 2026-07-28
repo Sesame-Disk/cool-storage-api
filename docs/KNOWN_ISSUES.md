@@ -5092,7 +5092,7 @@ own fix + regression.
 |---|---|---|---|---|
 | **A1** | Anonymous upload **request rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-28** | — | Per-(IP, token) and per-token limiters on link-token writes, plus client backoff; see "Subcontract A" below |
 | **A2** | Anonymous upload **in-flight concurrency** | 🔴 Open | A bound on simultaneous anonymous writes, acquired before the multipart read | A request-rate bound does not cap how many uploads are *inside* the handler at once, nor their cost: a 20 KiB photo and an 8 MiB chunk each spend one token |
-| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Reduced, still open** | Aggregate bound on concurrent in-flight block readers | Per-request cap right-sized 257 MiB → 16 MiB (16× less RAM per request), but N concurrent uploads still cost N × the cap. The aggregate bound is what closes it |
+| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Reduced, still open** | Aggregate bound on concurrent in-flight block readers | Per-request cap right-sized 257 MiB → 16 MiB (the buffered-body bound drops approximately 16×), but N concurrent uploads still cost N × the cap. The aggregate bound is what closes it |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | 🔴 Open | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
 | **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
 
@@ -5132,23 +5132,23 @@ but with `chunkRetryInterval` unset it retries *immediately*, and those attempts
 count against `maxChunkRetries: 3`. Four attempts inside a few milliseconds
 against a bucket that refills a couple of times a second means the file is
 reported permanently failed. A limiter meant to slow an upload down would instead
-kill it. `upload-throttle-backoff.js` hooks `fileRetry` — which fires
-synchronously before resumable.js reads its retry options — to honour
-`Retry-After`, fall back to exponential backoff with jitter, and raise the retry
-ceiling while throttled. All three anonymous-capable uploaders are wired to it
-(upload-link page, shared-link uploader, main uploader).
+kill it. The pinned library is patched at install time to capture status and
+`Retry-After` before it clears the XHR, pass them with the triggering chunk to
+`fileRetry`, and make its delayed-retry timer cancelable. The application then
+honours `Retry-After`, falls back to exponential backoff with jitter, and raises
+the retry ceiling for that chunk. All three anonymous-capable uploaders are wired
+to it (upload-link page, shared-link uploader, main uploader).
 
 Two details there are load-bearing and were not obvious:
 
-- **The raised ceiling is sticky; the interval is not.** Both options live on the
-  resumable *instance* and are shared by every chunk of every file, while the
-  events that set them are per-chunk. `maxChunkRetries` is read inside `status()`
-  **before** the retry event fires, so a network error on an unrelated file that
-  restored the baseline would fail an already-throttled chunk outright, with no
-  event left to raise it back. The ceiling therefore stays raised until a short
-  window past the scheduled retry lapses. `chunkRetryInterval` is restored
-  immediately, so ordinary network retries stay fast — a throttled chunk re-sets
-  it on its next 429 anyway.
+- **Retry policy is per chunk, not per uploader instance.** Instance options are
+  shared by every concurrent chunk, so one network retry could otherwise erase
+  another chunk's throttling policy. The patch also gives 429 its own retry
+  ceiling inside `status()`, where the library decides whether to emit the event;
+  this keeps a late first 429 observable even after ordinary retries.
+- **Delayed retries are cancelable.** The upstream library did not retain its
+  timeout handle, so canceling a file during backoff could still send it later.
+  The patch stores and clears that timer from the chunk's existing abort path.
 - **Jitter is one-sided when the server named a time.** `Retry-After` is a floor,
   not an estimate. Symmetric jitter would sometimes retry before the bucket the
   server just described as empty had refilled. Around our own exponential guess
@@ -5185,12 +5185,12 @@ multipart read.
 The old 257 MiB bound came from the **wrong domain**: it was derived from
 `chunking.adaptive.absolute_max` (the web uploader's 256 MiB chunk ceiling),
 which never governed this route — and the adaptive chunker has no production
-caller at all. This route is fed by desktop sync, where SesameFS splits at 8 MiB
-(`uploadBlockSize`, matching Seafile's default CDC block; the official client's
-CDC maximum is smaller still).
+caller at all. The 16 MiB replacement leaves ample headroom over both the current
+official client's 4 MiB CDC maximum and SesameFS's related 8 MiB server-side
+split (`uploadBlockSize`); those are different producers and are not conflated.
 
-`seafhttp.sync_block_max_bytes` now defaults to **16 MiB** — 2× headroom over the
-8 MiB block, with a validated ceiling of 64 MiB and `SEAFHTTP_SYNC_BLOCK_MAX_BYTES`
+`seafhttp.sync_block_max_bytes` now defaults to **16 MiB**, with a validated
+ceiling of 64 MiB and `SEAFHTTP_SYNC_BLOCK_MAX_BYTES`
 to override. Unlike `chunked_staging_max_bytes`, **`0` is rejected rather than
 meaning unlimited**: an unbounded body on this route is the F12 defect, so no
 configuration restores it.
