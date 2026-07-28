@@ -518,6 +518,21 @@ var (
 		},
 		[]string{"reason"},
 	)
+
+	// UploadLinkWriteThrottledTotal counts anonymous upload-link writes refused by
+	// the rate limiters. The reason distinguishes which bucket fired:
+	//   "client" — the (IP, token) bucket: one uploader going too fast
+	//   "token"  — the per-token bucket: one link being hit from many addresses
+	// Those call for opposite responses, so they must not be summed. The token
+	// itself is never a label — it is a bearer credential and would be unbounded
+	// cardinality besides.
+	UploadLinkWriteThrottledTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "upload_link_write_throttled_total",
+			Help: "Total anonymous upload-link write requests throttled, by which bucket refused them.",
+		},
+		[]string{"reason"},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -571,5 +586,6 @@ func Register() {
 		BlockUploadMaterializationRetriesTotal,
 		SyncPutBlockBodyBytes,
 		SyncPutBlockRejectedTotal,
+		UploadLinkWriteThrottledTotal,
 	)
 }

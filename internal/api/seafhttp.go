@@ -37,6 +37,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/time/rate"
 )
 
 var checkSeafHTTPFileLockedByOther = func(h *SeafHTTPHandler, repoID, filePath, userID string) (bool, string, error) {
@@ -1253,6 +1254,95 @@ type SeafHTTPHandler struct {
 	zipMaxEntries          int
 	zipMaxDepth            int
 	zipMaxBytes            int64
+
+	// uploadLinkWriteLimits bounds anonymous writes arriving through a public
+	// upload link. Nil when disabled by configuration.
+	uploadLinkWriteLimits *uploadLinkWriteLimits
+}
+
+// uploadLinkWriteLimits holds the two buckets that bound anonymous upload-link
+// writes, plus the sampler that keeps the rejection path from becoming its own
+// amplifier.
+type uploadLinkWriteLimits struct {
+	// perClient is keyed on (client IP, upload token). Keying on IP alone would
+	// make one uploader behind a NAT throttle everyone else behind it who is
+	// using a different link.
+	perClient *middleware.RateLimiter
+	// perToken is keyed on the upload token across every IP, which is the only
+	// bucket that can see a leaked upload URL being hit from many addresses at
+	// once. Nil when that bound is disabled separately.
+	perToken *middleware.RateLimiter
+	// logSample keeps at most one throttle log per interval. A rejected request
+	// is cheap by design, and an attacker who keeps sending after the bucket
+	// empties would otherwise turn the defence into a log-volume amplifier: the
+	// counter still moves per rejection, the log line does not.
+	logSample rate.Sometimes
+}
+
+// uploadLinkTokenFingerprint derives the limiter key for an upload token.
+//
+// The raw token is a bearer credential and the limiter map is long-lived, so it
+// is hashed rather than stored — a truncated digest is a stable key and is
+// useless if it leaks into a heap dump.
+func uploadLinkTokenFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:8])
+}
+
+// allowUploadLinkWrite decides whether an upload may proceed, and is deliberately
+// keyed on the token's origin rather than on the route.
+//
+// /seafhttp/upload-api/:token serves BOTH the anonymous public-upload-link flow
+// and authenticated web uploads; only the former is the unbounded anonymous
+// surface (subcontract A). A limiter installed as route middleware would have
+// throttled the authenticated path too, which is traffic this bound has no
+// business touching. AccessToken.Source is what separates them: "link" is a
+// share/upload link, "" and "web" are regular users.
+//
+// It returns true (allowing the request) whenever the limiter is disabled or the
+// token is not a link token, so the only requests it can ever refuse are
+// anonymous link writes.
+func (h *SeafHTTPHandler) allowUploadLinkWrite(c *gin.Context, tokenStr string, token *AccessToken) bool {
+	if h == nil || h.uploadLinkWriteLimits == nil || token == nil || token.Source != "link" {
+		return true
+	}
+	limits := h.uploadLinkWriteLimits
+
+	fingerprint := uploadLinkTokenFingerprint(tokenStr)
+	clientIP := c.ClientIP()
+
+	if !limits.perClient.Allow(clientIP + "|" + fingerprint) {
+		limits.reject(c, "client", clientIP, token.RepoID)
+		return false
+	}
+	if !limits.perToken.Allow(fingerprint) {
+		limits.reject(c, "token", clientIP, token.RepoID)
+		return false
+	}
+	return true
+}
+
+// reject answers a throttled write. 429 is right for this surface specifically
+// because it is browser traffic: the sync protocol is elsewhere, and its client
+// does not treat 429 as retryable.
+func (l *uploadLinkWriteLimits) reject(c *gin.Context, reason, clientIP, repoID string) {
+	limiter := l.perClient
+	if reason == "token" {
+		limiter = l.perToken
+	}
+	retryAfter := limiter.RetryAfterSeconds()
+
+	metrics.UploadLinkWriteThrottledTotal.WithLabelValues(reason).Inc()
+	l.logSample.Do(func() {
+		log.Printf("[HandleUpload] throttling anonymous upload-link writes (reason=%s, most recent from %s, repo %s); sampled, see upload_link_write_throttled_total",
+			reason, clientIP, repoID)
+	})
+
+	c.Header("Retry-After", strconv.Itoa(retryAfter))
+	c.JSON(http.StatusTooManyRequests, gin.H{
+		"error":       "too many upload requests, please try again shortly",
+		"retry_after": retryAfter,
+	})
 }
 
 const (
@@ -1344,7 +1434,48 @@ func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manage
 		zipMaxEntries:          defaultZipMaxEntries,
 		zipMaxDepth:            defaultZipMaxDepth,
 		zipMaxBytes:            defaultZipMaxBytes,
+		uploadLinkWriteLimits:  newUploadLinkWriteLimits(cfg),
 	}
+}
+
+// newUploadLinkWriteLimits builds the anonymous upload-link buckets, or nil when
+// configuration disables the per-client bound. Returning nil rather than a
+// permissive limiter keeps "disabled" a single check in allowUploadLinkWrite.
+//
+// The per-token bound is optional on its own: zeroing it leaves the per-client
+// bucket in place, and RateLimiter.Allow admits everything on a nil receiver.
+func newUploadLinkWriteLimits(cfg *config.Config) *uploadLinkWriteLimits {
+	if cfg == nil || cfg.SeafHTTP.UploadLinkWritesPerMinute <= 0 {
+		return nil
+	}
+	limits := &uploadLinkWriteLimits{
+		perClient: newPerMinuteRateLimiter(cfg.SeafHTTP.UploadLinkWritesPerMinute, cfg.SeafHTTP.UploadLinkWriteBurst),
+		perToken:  newPerMinuteRateLimiter(cfg.SeafHTTP.UploadLinkTokenWritesPerMinute, cfg.SeafHTTP.UploadLinkTokenWriteBurst),
+	}
+	limits.logSample.Interval = time.Minute
+	return limits
+}
+
+// newPerMinuteRateLimiter converts a per-minute rate into a token bucket, or nil
+// when the rate disables it. Validate() has already rejected a zero burst paired
+// with a live rate; the guard here is for handlers built in tests from a config
+// that never went through it.
+func newPerMinuteRateLimiter(perMinute, burst int) *middleware.RateLimiter {
+	if perMinute <= 0 || burst <= 0 {
+		return nil
+	}
+	return middleware.NewRateLimiter(rate.Every(time.Minute/time.Duration(perMinute)), burst)
+}
+
+// Close releases the handler's background workers. The limiters each run a
+// cleanup goroutine, so a handler that outlives its server — or one built per
+// test — must be able to stop them.
+func (h *SeafHTTPHandler) Close() {
+	if h == nil || h.uploadLinkWriteLimits == nil {
+		return
+	}
+	h.uploadLinkWriteLimits.perClient.Stop()
+	h.uploadLinkWriteLimits.perToken.Stop()
 }
 
 func (h *SeafHTTPHandler) resolveBlockRepresentationID(orgID, repoID string) (string, error) {
@@ -1749,6 +1880,16 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	token, valid := h.tokenStore.GetToken(tokenStr, TokenTypeUpload)
 	if !valid {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired upload token"})
+		return
+	}
+
+	// Throttle anonymous link writes here — after the token resolves, because
+	// Source is what the decision keys on, and before the permission lookup, the
+	// body read and any storage work. It does NOT save the token lookup above:
+	// that read has already happened by the time we can tell a link token from a
+	// web one. It can only refuse Source=="link" tokens; authenticated web
+	// uploads on this same route are unaffected.
+	if !h.allowUploadLinkWrite(c, tokenStr, token) {
 		return
 	}
 

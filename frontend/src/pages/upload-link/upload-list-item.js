@@ -134,6 +134,9 @@ class UploadListItem extends React.Component {
                   )}
                 </>
               )}
+              {resumableFile.isThrottled && (
+                <p className="progress-text mb-0">{gettext('Server is busy, retrying automatically...')}</p>
+              )}
             </Fragment>
           }
           {this.state.uploadState === UPLOAD_UPLOADED && (

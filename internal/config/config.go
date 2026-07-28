@@ -547,6 +547,49 @@ type SeafHTTPConfig struct {
 	// Zero is rejected rather than meaning "unlimited": an unbounded body on this
 	// route is the defect (F12), so there is no configuration that restores it.
 	SyncBlockMaxBytes int64 `yaml:"sync_block_max_bytes"`
+
+	// UploadLinkWritesPerMinute bounds anonymous writes through a public upload
+	// link, keyed on client IP *and* upload token. This is subcontract A1 of
+	// ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: the upload-link *routes* under
+	// /api/v2.1 already carry a per-IP limiter, but the seafhttp upload endpoint
+	// they hand off to carries none, so the actual write was unbounded.
+	//
+	// It applies ONLY to tokens whose Source is "link". The same endpoint serves
+	// authenticated web uploads, and a limiter applied by URL rather than by token
+	// origin would throttle those too — they are not the anonymous surface this
+	// bounds. Zero disables it.
+	//
+	// Keyed on (IP, token) rather than IP alone because a single address is
+	// routinely a whole office, school or mobile carrier NAT. Keyed on IP alone,
+	// one person uploading through one link would throttle everyone else behind
+	// that address who is using a *different* link.
+	//
+	// This is a request-rate bound, not a cost bound: a 20 KiB photo and an 8 MiB
+	// chunk each spend one token. Bounding simultaneous in-flight work is A2 and
+	// is still open.
+	UploadLinkWritesPerMinute int `yaml:"upload_link_writes_per_minute"`
+
+	// UploadLinkWriteBurst is the token-bucket burst for the limiter above. A
+	// browser uploading one file issues several requests back to back (chunks),
+	// and a dropped folder issues one per small file, so the burst is what decides
+	// whether ordinary use ever meets the limiter at all.
+	UploadLinkWriteBurst int `yaml:"upload_link_write_burst"`
+
+	// UploadLinkTokenWritesPerMinute bounds writes against a single upload token
+	// across *all* client IPs. The (IP, token) bucket above cannot see a leaked
+	// upload URL being hit from many addresses at once; this one can.
+	//
+	// It is deliberately far above any plausible legitimate figure, because a
+	// shared link legitimately serves many people at once — a classroom uploading
+	// to one link is normal traffic, not abuse. Zero disables it.
+	//
+	// Note the limit of this defence: an attacker who re-mints a fresh upload
+	// token per request gets a fresh bucket. That path is bounded instead by the
+	// per-IP limiter already on /api/v2.1/upload-links/:token/upload/.
+	UploadLinkTokenWritesPerMinute int `yaml:"upload_link_token_writes_per_minute"`
+
+	// UploadLinkTokenWriteBurst is the token-bucket burst for the per-token limit.
+	UploadLinkTokenWriteBurst int `yaml:"upload_link_token_write_burst"`
 }
 
 // Sync block body bounds. MaxSyncBlockMaxBytes is a validation ceiling, not a
@@ -555,7 +598,61 @@ type SeafHTTPConfig struct {
 const (
 	DefaultSyncBlockMaxBytes int64 = 16 * 1024 * 1024
 	MaxSyncBlockMaxBytes     int64 = 64 * 1024 * 1024
+
+	// Anonymous upload-link write limits.
+	//
+	// These are starting values, not measured ones, and they are deliberately
+	// generous. The failure mode of a rate limit on a data path is not "an
+	// attacker gets through" — it is a real person's upload dying — so the
+	// defaults are set well above plausible browser behaviour and left to be
+	// tightened from `upload_link_write_throttled_total`. At 8 MiB chunks, 600/min
+	// sustains ~80 MiB/s per (IP, token) after a burst covering ~9 GiB or 1200
+	// small files.
+	//
+	// The real bound on this surface is concurrency (A2), not request rate.
+	DefaultUploadLinkWritesPerMinute      = 600
+	DefaultUploadLinkWriteBurst           = 1200
+	DefaultUploadLinkTokenWritesPerMinute = 12000
+	DefaultUploadLinkTokenWriteBurst      = 24000
+
+	// MaxUploadLinkWritesPerMinute keeps the configured rate in a range where the
+	// per-request interval stays meaningful: `time.Minute / rate` collapses to a
+	// zero duration for absurd values, which silently turns the limiter into a
+	// no-op instead of a very permissive bound.
+	MaxUploadLinkWritesPerMinute = 600000
 )
+
+// validateUploadLinkWriteLimit checks one rate/burst pair.
+//
+// Rate and burst are independent dimensions of a token bucket: rate is how fast
+// tokens come back, burst is how many may be spent at once. There is no rule
+// requiring one to exceed the other — 600/min with a burst of 1 is a coherent
+// (if unfriendly) configuration. So the only things rejected here are values
+// that cannot mean anything: a negative rate or burst, a rate so large the
+// refill interval degenerates, and a burst of zero while the limiter is on,
+// which would refuse every request.
+//
+// A zero burst is an error rather than being quietly filled in from the rate.
+// Deriving it would make `burst: 0` mean something different from what an
+// operator writing it plainly intends, and the two readings — "no burst" and
+// "burst equal to the rate" — are far apart.
+func validateUploadLinkWriteLimit(rateKey, burstKey string, perMinute, burst int) error {
+	if perMinute < 0 {
+		return fmt.Errorf("seafhttp.%s must be greater than or equal to zero (zero disables the limiter)", rateKey)
+	}
+	if perMinute > MaxUploadLinkWritesPerMinute {
+		return fmt.Errorf("seafhttp.%s is %d, above the %d ceiling, where the refill interval degenerates and the limiter stops bounding anything",
+			rateKey, perMinute, MaxUploadLinkWritesPerMinute)
+	}
+	if burst < 0 {
+		return fmt.Errorf("seafhttp.%s must be greater than or equal to zero", burstKey)
+	}
+	if perMinute > 0 && burst == 0 {
+		return fmt.Errorf("seafhttp.%s is zero while seafhttp.%s is %d; a bucket with no capacity refuses every request. Set a burst, or set the rate to zero to disable the limiter",
+			burstKey, rateKey, perMinute)
+	}
+	return nil
+}
 
 // ServerConfig holds HTTP server settings
 type ServerConfig struct {
@@ -800,6 +897,19 @@ func Load() (*Config, error) {
 			"fallback_bytes", DefaultMaxStagedBytesPerSession)
 	}
 
+	// A per-IP limiter is only per-IP if the IP is real. With no trusted proxies,
+	// ClientIP() is the socket peer, which behind a reverse proxy is the proxy
+	// itself — every anonymous uploader then shares one bucket and throttles the
+	// others. This is a warning and not a validation error on purpose: running Go
+	// directly with no proxy in front is a legitimate deployment, and there is no
+	// way to tell the two apart from configuration alone.
+	if cfg.SeafHTTP.UploadLinkWritesPerMinute > 0 && len(cfg.Server.TrustedProxies) == 0 {
+		slog.Warn("upload-link write limiter is enabled but server.trusted_proxies is empty; "+
+			"client IPs will be the direct socket peer. Behind a reverse proxy that collapses every "+
+			"anonymous uploader into a single shared bucket — set SERVER_TRUSTED_PROXIES to the proxy CIDR",
+			"upload_link_writes_per_minute", cfg.SeafHTTP.UploadLinkWritesPerMinute)
+	}
+
 	return cfg, nil
 }
 
@@ -927,6 +1037,11 @@ func DefaultConfig() *Config {
 			ZipMaxBytes:            10 * 1024 * 1024 * 1024,
 			ChunkedStagingMaxBytes: 0,
 			SyncBlockMaxBytes:      DefaultSyncBlockMaxBytes,
+
+			UploadLinkWritesPerMinute:      DefaultUploadLinkWritesPerMinute,
+			UploadLinkWriteBurst:           DefaultUploadLinkWriteBurst,
+			UploadLinkTokenWritesPerMinute: DefaultUploadLinkTokenWritesPerMinute,
+			UploadLinkTokenWriteBurst:      DefaultUploadLinkTokenWriteBurst,
 		},
 		OnlyOffice: OnlyOfficeConfig{
 			Enabled:           false,
@@ -1225,6 +1340,26 @@ func (c *Config) applyEnvOverrides() {
 		} else {
 			c.SeafHTTP.SyncBlockMaxBytes = i
 		}
+	}
+	for _, override := range []struct {
+		env    string
+		target *int
+	}{
+		{"SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE", &c.SeafHTTP.UploadLinkWritesPerMinute},
+		{"SEAFHTTP_UPLOAD_LINK_WRITE_BURST", &c.SeafHTTP.UploadLinkWriteBurst},
+		{"SEAFHTTP_UPLOAD_LINK_TOKEN_WRITES_PER_MINUTE", &c.SeafHTTP.UploadLinkTokenWritesPerMinute},
+		{"SEAFHTTP_UPLOAD_LINK_TOKEN_WRITE_BURST", &c.SeafHTTP.UploadLinkTokenWriteBurst},
+	} {
+		v := os.Getenv(override.env)
+		if v == "" {
+			continue
+		}
+		i, err := strconv.Atoi(v)
+		if err != nil {
+			c.addEnvOverrideError("%s is invalid: %v", override.env, err)
+			continue
+		}
+		*override.target = i
 	}
 	// OIDC settings
 	if v := os.Getenv("OIDC_ENABLED"); v != "" {
@@ -1692,6 +1827,18 @@ func (c *Config) Validate() error {
 	if c.SeafHTTP.SyncBlockMaxBytes > MaxSyncBlockMaxBytes {
 		return fmt.Errorf("seafhttp.sync_block_max_bytes is %d, above the %d ceiling; this route carries %d-byte blocks, so a larger value is almost certainly derived from the web uploader's chunk ceiling by mistake",
 			c.SeafHTTP.SyncBlockMaxBytes, MaxSyncBlockMaxBytes, 8*1024*1024)
+	}
+	if err := validateUploadLinkWriteLimit(
+		"upload_link_writes_per_minute", "upload_link_write_burst",
+		c.SeafHTTP.UploadLinkWritesPerMinute, c.SeafHTTP.UploadLinkWriteBurst,
+	); err != nil {
+		return err
+	}
+	if err := validateUploadLinkWriteLimit(
+		"upload_link_token_writes_per_minute", "upload_link_token_write_burst",
+		c.SeafHTTP.UploadLinkTokenWritesPerMinute, c.SeafHTTP.UploadLinkTokenWriteBurst,
+	); err != nil {
+		return err
 	}
 	normalizedPreviewExtensions, err := normalizeFileViewPreviewExtensions(c.FileView.PreviewExtensions)
 	if err != nil {

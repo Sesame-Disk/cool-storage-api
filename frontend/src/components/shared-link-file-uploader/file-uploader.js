@@ -10,6 +10,7 @@ import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, getInitial
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
+import { BASE_MAX_CHUNK_RETRIES, clearThrottleState, noteUploadRetry } from '../file-uploader/upload-throttle-backoff';
 import UploadProgressDialog from './upload-progress-dialog';
 import toaster from '../toast';
 import '../../css/file-uploader.css';
@@ -80,7 +81,7 @@ class FileUploader extends React.Component {
       fileParameterName: this.props.fileParameterName,
       generateUniqueIdentifier: this.generateUniqueIdentifier,
       forceChunkSize: true,
-      maxChunkRetries: 3,
+      maxChunkRetries: BASE_MAX_CHUNK_RETRIES,
       minFileSize: 0,
     });
 
@@ -337,6 +338,7 @@ class FileUploader extends React.Component {
   };
 
   onFileUploadSuccess = (resumableFile, message) => {
+    clearThrottleState(resumableFile);
     let formData = resumableFile.formData;
     let currentTime = new Date().getTime() / 1000;
 
@@ -443,6 +445,7 @@ class FileUploader extends React.Component {
   };
 
   onFileError = (resumableFile, message) => {
+    clearThrottleState(resumableFile);
     if (shouldAutoRetryUploadConflict(resumableFile, message)) {
       markUploadConflictAutoRetry(resumableFile);
       this.retryUploadWithFreshLink(resumableFile, { resetAutoRetry: false });
@@ -535,8 +538,14 @@ class FileUploader extends React.Component {
     // After the error, the user can switch windows
   };
 
-  onFileRetry = () => {
+  onFileRetry = (resumableFile) => {
     noteAdaptiveUploadRetry(this.resumable);
+    // This uploader serves share links that allow upload — anonymous writes
+    // carrying a link token, exactly what the server-side limiter refuses. Left
+    // without backoff, a throttled chunk here dies after three immediate retries.
+    if (noteUploadRetry(this.resumable, resumableFile)) {
+      this.setState({ uploadFileList: [...this.state.uploadFileList] });
+    }
   };
 
   onBeforeCancel = () => {

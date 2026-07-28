@@ -919,6 +919,10 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `SERVER_URL` | — (runtime env) | Optional explicit fallback for absolute links and relay metadata. Leave unset to use the current request host. |
 | `ONLYOFFICE_API_JS_URL` | `onlyoffice.api_js_url` | Public OnlyOffice JS loader URL. |
 | `SEAFHTTP_SYNC_BLOCK_MAX_BYTES` | `seafhttp.sync_block_max_bytes` | Per-request body cap for the desktop-sync block PUT route. Default `16777216` (16 MiB). Must be `1`–`67108864`; **zero is rejected**, it does not mean unlimited. |
+| `SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE` | `seafhttp.upload_link_writes_per_minute` | Anonymous upload-link writes allowed per (client IP, upload token). Default `600`. `0` disables. Requires `SERVER_TRUSTED_PROXIES` behind a proxy, otherwise every client shares one bucket. |
+| `SEAFHTTP_UPLOAD_LINK_WRITE_BURST` | `seafhttp.upload_link_write_burst` | Burst for the above. Default `1200`. Must be `> 0` while the rate is non-zero. |
+| `SEAFHTTP_UPLOAD_LINK_TOKEN_WRITES_PER_MINUTE` | `seafhttp.upload_link_token_writes_per_minute` | Writes allowed against one upload token across all IPs — the bound on a leaked upload URL. Default `12000`. `0` disables. |
+| `SEAFHTTP_UPLOAD_LINK_TOKEN_WRITE_BURST` | `seafhttp.upload_link_token_write_burst` | Burst for the per-token bound. Default `24000`. Must be `> 0` while that rate is non-zero. |
 | `METRICS_ENABLED` | `monitoring.metrics_enabled` | |
 | `DESKTOP_CUSTOM_BRAND` | — (server-info response) | Brand name shown in desktop client (default: `Sesame Disk`) |
 | `DESKTOP_CUSTOM_LOGO` | — (server-info response) | Full URL to logo image shown in desktop client (optional) |

@@ -120,6 +120,7 @@ type Server struct {
 	authRateLimiter      *middleware.RateLimiter // Per-IP rate limiter for auth endpoints
 	shareLinkRateLimiter *middleware.RateLimiter // Per-IP rate limiter for public share-link endpoints
 	zipRateLimiter       *middleware.RateLimiter // Per-IP rate limiter for streamed ZIP downloads
+	seafHTTPHandler      *SeafHTTPHandler        // Held only so Shutdown can stop the limiters it owns
 	apiKeyManager        *apikeys.Manager        // API key manager for programmatic auth
 	version              string                  // Build version string
 	router               *gin.Engine
@@ -1972,6 +1973,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.zipRateLimiter != nil {
 		s.zipRateLimiter.Stop()
 	}
+	s.seafHTTPHandler.Close()
 	if s.apiKeyManager != nil {
 		s.apiKeyManager.Stop()
 	}

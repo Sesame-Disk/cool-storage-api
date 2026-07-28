@@ -5047,7 +5047,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: No rate or concurrency limit on the seafhttp upload/download/block surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **B reduced 2026-07-28** (per-request cap right-sized; the aggregate bound that actually closes it is still missing); **A, C and D open**. The umbrella does not close until all four do.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1 closed and A2 open 2026-07-28** (anonymous upload-link request rate bounded; in-flight concurrency still unbounded); **B reduced** (per-request cap right-sized; the aggregate bound that actually closes it is still missing); **C and D open**. The umbrella does not close until all four do.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5090,10 +5090,95 @@ own fix + regression.
 
 | ID | Surface | Status | Close when | Notes |
 |---|---|---|---|---|
-| **A** | Anonymous / token seafhttp **upload** (`HandleUpload` / upload-api) | 🔴 Open | Per-IP (or per-token) rate **and** concurrency limit on the write path that upload-links hand off to | SH-1 residual; routes already have `slRL`, the handoff does not |
+| **A1** | Anonymous upload **request rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-28** | — | Per-(IP, token) and per-token limiters on link-token writes, plus client backoff; see "Subcontract A" below |
+| **A2** | Anonymous upload **in-flight concurrency** | 🔴 Open | A bound on simultaneous anonymous writes, acquired before the multipart read | A request-rate bound does not cap how many uploads are *inside* the handler at once, nor their cost: a 20 KiB photo and an 8 MiB chunk each spend one token |
 | **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Reduced, still open** | Aggregate bound on concurrent in-flight block readers | Per-request cap right-sized 257 MiB → 16 MiB (16× less RAM per request), but N concurrent uploads still cost N × the cap. The aggregate bound is what closes it |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | 🔴 Open | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
 | **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
+
+#### Subcontract A: the request-rate half (A1), and why A is not closed (2026-07-28)
+
+`HandleUpload` consults `allowUploadLinkWrite` immediately after the token
+resolves, before the permission lookup, the body read and any storage work. Over
+budget it answers **429 with `Retry-After`**, which is appropriate here because
+this is browser traffic — the sync protocol is a different route with a client
+that does *not* treat 429 as retryable.
+
+**The gate keys on `AccessToken.Source == "link"`, not on the route, and that
+distinction is the whole design.** `/seafhttp/upload-api/:token` serves *both* the
+anonymous upload-link flow and authenticated web uploads. A limiter installed as
+route middleware — the obvious implementation — would have throttled ordinary
+signed-in users, and a test asserting only "link tokens get 429" would not have
+noticed. The regression asserts the negative too: with the bucket exhausted,
+`Source` of `""` and `"web"` still pass. Mutation-verified.
+
+**Two buckets, because one address is not one user.**
+
+| Bucket | Key | What only it can see |
+|---|---|---|
+| per-client | (client IP, upload token) | one uploader going too fast |
+| per-token | upload token, all IPs | one leaked upload URL hit from many addresses |
+
+Keyed on IP alone, one person uploading through one link would throttle every
+colleague behind the same NAT using a *different* link — the limiter would cause
+the outage it exists to prevent. That isolation is its own regression, also
+mutation-verified. The per-token bucket has a known limit: an attacker who
+re-mints a fresh upload token per request gets a fresh bucket, and is bounded
+instead by the existing per-IP limiter on the mint route.
+
+**The client had to be fixed for the server bound to be safe at all.**
+`@seafile/resumablejs` does not list 429 in `permanentErrors`, so it retries —
+but with `chunkRetryInterval` unset it retries *immediately*, and those attempts
+count against `maxChunkRetries: 3`. Four attempts inside a few milliseconds
+against a bucket that refills a couple of times a second means the file is
+reported permanently failed. A limiter meant to slow an upload down would instead
+kill it. `upload-throttle-backoff.js` hooks `fileRetry` — which fires
+synchronously before resumable.js reads its retry options — to honour
+`Retry-After`, fall back to exponential backoff with jitter, and raise the retry
+ceiling while throttled. All three anonymous-capable uploaders are wired to it
+(upload-link page, shared-link uploader, main uploader).
+
+Two details there are load-bearing and were not obvious:
+
+- **The raised ceiling is sticky; the interval is not.** Both options live on the
+  resumable *instance* and are shared by every chunk of every file, while the
+  events that set them are per-chunk. `maxChunkRetries` is read inside `status()`
+  **before** the retry event fires, so a network error on an unrelated file that
+  restored the baseline would fail an already-throttled chunk outright, with no
+  event left to raise it back. The ceiling therefore stays raised until a short
+  window past the scheduled retry lapses. `chunkRetryInterval` is restored
+  immediately, so ordinary network retries stay fast — a throttled chunk re-sets
+  it on its next 429 anyway.
+- **Jitter is one-sided when the server named a time.** `Retry-After` is a floor,
+  not an estimate. Symmetric jitter would sometimes retry before the bucket the
+  server just described as empty had refilled. Around our own exponential guess
+  there is no such floor, so jitter goes both ways there.
+
+**Attribution depends on deployment.** These are per-IP buckets, and `ClientIP()`
+is only the real client when `server.trusted_proxies` names the proxy in front of
+Go. That is the documented production topology (see `docs/DEPLOY.md`), where the
+internal nginx preserves the central nginx's canonicalized client IP. Left unset
+behind a proxy, every anonymous uploader collapses into one bucket; the server
+logs a warning at startup on that combination rather than failing, because
+running with no proxy at all is legitimate.
+
+Config: `seafhttp.upload_link_writes_per_minute` (600) / `upload_link_write_burst`
+(1200), `upload_link_token_writes_per_minute` (12000) /
+`upload_link_token_write_burst` (24000), each with a `SEAFHTTP_*` env override;
+`0` disables either bucket. The values are deliberately generous starting points,
+not measured ones — the failure mode of a rate limit on a data path is a real
+person's upload dying, so they should be tightened from
+`upload_link_write_throttled_total{reason}` rather than guessed downward.
+`Validate()` rejects a live rate with a zero burst (a bucket with no capacity
+refuses everything) but does *not* require the burst to exceed the rate: those
+are independent dimensions of a token bucket.
+
+**Why A is still open.** A1 bounds how many requests *start* per unit time. It
+does not bound how many are inside the handler at once, nor what they cost — a
+20 KiB photo and an 8 MiB chunk each spend one token, and the bucket refills
+while earlier requests are still running, so there is no ceiling on simultaneous
+work. That is A2: a bound on in-flight anonymous writes, acquired before the
+multipart read.
 
 #### Subcontract B: what the right-sized cap does and does not do (2026-07-28)
 
