@@ -1307,6 +1307,15 @@ func TestTokenManagerCreateLinkUploadTokenPreservesSourceID(t *testing.T) {
 	}
 }
 
+func TestTokenManagerCreateLinkUploadTokenRejectsBlankSourceID(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	for _, sourceID := range []string{"", " ", "\t\r\n"} {
+		if _, err := tm.CreateLinkUploadToken("org1", "repo1", "/upload/path", "user1", sourceID); err == nil {
+			t.Fatalf("CreateLinkUploadToken(%q) succeeded, want error", sourceID)
+		}
+	}
+}
+
 func TestTokenManagerCreateUpdateToken(t *testing.T) {
 	tm := NewTokenManager(1 * time.Hour)
 

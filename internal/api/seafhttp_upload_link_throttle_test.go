@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
@@ -255,20 +256,6 @@ func TestUploadLinkWriteThrottleRemintsShareAggregateBucket(t *testing.T) {
 	}
 }
 
-func TestUploadLinkWriteThrottleLegacyTokensFallBackToTokenIdentity(t *testing.T) {
-	h, r := newThrottleTestHandler(t, throttleTestConfig(1, 1, 0, 0), map[string]string{
-		"legacy-a": "link",
-		"legacy-b": "link",
-	})
-	setThrottleTestSourceID(h, "legacy-a", "")
-	setThrottleTestSourceID(h, "legacy-b", "")
-
-	upload(t, r, "legacy-a", "203.0.113.13")
-	if w := upload(t, r, "legacy-b", "203.0.113.13"); w.Code == http.StatusTooManyRequests {
-		t.Fatal("distinct legacy seafhttp tokens unexpectedly shared the fallback bucket")
-	}
-}
-
 func TestUploadLinkWriteThrottleDisabledByConfig(t *testing.T) {
 	h, r := newThrottleTestHandler(t, throttleTestConfig(0, 0, 0, 0), map[string]string{"link-token": "link"})
 	if h.uploadLinkWriteLimits != nil {
@@ -321,7 +308,7 @@ func TestUploadLinkWriteThrottleNilTokenIsAllowed(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/tok", nil)
 
 	for i := 0; i < 5; i++ {
-		if _, admitted := h.allowUploadLinkWrite(c, "tok", nil); !admitted {
+		if admitted := h.allowUploadLinkWrite(c, nil); !admitted {
 			t.Fatalf("nil token refused at attempt %d", i+1)
 		}
 	}
@@ -405,7 +392,7 @@ func waitUpload(t *testing.T, done <-chan *httptest.ResponseRecorder) *httptest.
 	}
 }
 
-func TestUploadLinkInflightRejectionRefundsRateAdmission(t *testing.T) {
+func TestUploadLinkInflightRejectionConsumesRateAdmission(t *testing.T) {
 	tests := []struct {
 		name      string
 		perClient int
@@ -421,33 +408,60 @@ func TestUploadLinkInflightRejectionRefundsRateAdmission(t *testing.T) {
 			cfg := throttleTestConfig(tt.perClient, tt.perClient, tt.perSource, tt.perSource)
 			cfg.SeafHTTP.UploadLinkMaxInflightPerSource = 1
 			h, r := newThrottleTestHandler(t, cfg, map[string]string{"link": "link"})
+			setThrottleTestSourceID(h, "link", "stable-source")
 
-			release, reason := h.uploadLinkInflight.tryAcquire("link")
+			release, reason := h.uploadLinkInflight.tryAcquire("stable-source")
 			if release == nil {
 				t.Fatalf("failed to fill in-flight guard: %s", reason)
 			}
 			defer release()
 
 			body := &observedEOFReader{read: make(chan struct{})}
-			if w := uploadWithReader(r, "link", body); w.Code != http.StatusTooManyRequests {
+			req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/link", body)
+			req.Header.Set("Content-Type", "multipart/form-data; boundary=inflight-test")
+			req.RemoteAddr = "198.51.100.77:4321"
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusTooManyRequests {
 				t.Fatalf("upload with full in-flight guard = %d, want 429", w.Code)
 			}
 			requireBodyUnread(t, body.read)
 
 			now := time.Now()
-			clientAdmission := h.uploadLinkWriteLimits.perClient.TryReserve("192.0.2.1|link", now)
-			if clientAdmission == nil {
-				t.Fatal("in-flight rejection consumed the per-client rate budget")
+			if tt.perClient > 0 {
+				if admission := h.uploadLinkWriteLimits.perClient.TryReserve("198.51.100.77|stable-source", now); admission != nil {
+					t.Fatal("A2 rejection did not consume the A1 per-client budget keyed by RemoteAddr and SourceID")
+				}
+				wrongKey := h.uploadLinkWriteLimits.perClient.TryReserve("198.51.100.77|link", now)
+				if wrongKey == nil {
+					t.Fatal("token bearer was used instead of SourceID in the per-client key")
+				}
+				wrongKey.CancelAt(now)
 			}
-			clientAdmission.CancelAt(now)
 
-			sourceAdmission := h.uploadLinkWriteLimits.perSource.TryReserve("link", now)
-			if sourceAdmission == nil {
-				t.Fatal("in-flight rejection consumed the per-source rate budget")
+			if tt.perSource > 0 {
+				if admission := h.uploadLinkWriteLimits.perSource.TryReserve("stable-source", now); admission != nil {
+					t.Fatal("A2 rejection did not consume the A1 per-source budget")
+				}
+				wrongKey := h.uploadLinkWriteLimits.perSource.TryReserve("link", now)
+				if wrongKey == nil {
+					t.Fatal("token bearer was used instead of SourceID in the per-source key")
+				}
+				wrongKey.CancelAt(now)
 			}
-			sourceAdmission.CancelAt(now)
 		})
 	}
+}
+
+func TestUploadLinkWithBlankSourceIDFailsClosed(t *testing.T) {
+	h, r := newThrottleTestHandler(t, throttleTestConfig(0, 0, 0, 0), map[string]string{"link": "link"})
+	setThrottleTestSourceID(h, "link", " \t")
+	body := &observedEOFReader{read: make(chan struct{})}
+	w := uploadWithReader(r, "link", body)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("blank-SourceID link upload = %d, want 401", w.Code)
+	}
+	requireBodyUnread(t, body.read)
 }
 
 func TestUploadLinkInflightPerSourceRejectsBeforeBodyAndReleases(t *testing.T) {
@@ -609,5 +623,39 @@ func TestUploadLinkInflightLimiterConcurrentRelease(t *testing.T) {
 	defer l.mu.Unlock()
 	if l.inflight != 0 || len(l.perSource) != 0 {
 		t.Fatalf("after concurrent release: inflight=%d perSource=%v", l.inflight, l.perSource)
+	}
+}
+
+func TestUploadLinkInflightMetricsTrackAdmissions(t *testing.T) {
+	l := newUploadLinkInflightLimiter(inflightTestConfig(2, 4))
+	beforeGauge := testutil.ToFloat64(metrics.UploadLinkInflightCurrent)
+	beforeHistogram := &dto.Metric{}
+	if err := metrics.UploadLinkSourceInflightOccupancy.Write(beforeHistogram); err != nil {
+		t.Fatalf("write histogram before admission: %v", err)
+	}
+
+	releaseA, _ := l.tryAcquire("source")
+	releaseB, _ := l.tryAcquire("source")
+	if releaseA == nil || releaseB == nil {
+		t.Fatal("expected two metric test admissions")
+	}
+	if got := testutil.ToFloat64(metrics.UploadLinkInflightCurrent); got != beforeGauge+2 {
+		t.Fatalf("current in-flight gauge = %v, want %v", got, beforeGauge+2)
+	}
+	afterHistogram := &dto.Metric{}
+	if err := metrics.UploadLinkSourceInflightOccupancy.Write(afterHistogram); err != nil {
+		t.Fatalf("write histogram after admission: %v", err)
+	}
+	if got, want := afterHistogram.GetHistogram().GetSampleCount(), beforeHistogram.GetHistogram().GetSampleCount()+2; got != want {
+		t.Fatalf("occupancy histogram sample count = %d, want %d", got, want)
+	}
+	if got, want := afterHistogram.GetHistogram().GetSampleSum(), beforeHistogram.GetHistogram().GetSampleSum()+3; got != want {
+		t.Fatalf("occupancy histogram sample sum = %v, want %v", got, want)
+	}
+
+	releaseA()
+	releaseB()
+	if got := testutil.ToFloat64(metrics.UploadLinkInflightCurrent); got != beforeGauge {
+		t.Fatalf("current in-flight gauge after release = %v, want %v", got, beforeGauge)
 	}
 }

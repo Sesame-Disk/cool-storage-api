@@ -44,3 +44,12 @@ func TestResolveSourceID(t *testing.T) {
 		}
 	})
 }
+
+func TestTokenStoreCreateLinkUploadTokenRejectsBlankSourceID(t *testing.T) {
+	store := &TokenStore{}
+	for _, sourceID := range []string{"", " ", "\t\r\n"} {
+		if _, err := store.CreateLinkUploadToken("org", "repo", "/", "user", sourceID); err == nil {
+			t.Fatalf("CreateLinkUploadToken(%q) succeeded, want error", sourceID)
+		}
+	}
+}

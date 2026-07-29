@@ -7,8 +7,11 @@ const originalSource = source;
 
 const replacements = [
   {
-    before: "maxChunkRetries:100,\n      chunkRetryInterval:undefined,",
-    after: "maxChunkRetries:100,\n      throttledErrors:[429],\n      throttledMaxChunkRetries:12,\n      chunkRetryInterval:undefined,",
+    before: [
+      "maxChunkRetries:100,\n      chunkRetryInterval:undefined,",
+      "maxChunkRetries:100,\n      throttledErrors:[429],\n      throttledMaxChunkRetries:12,\n      chunkRetryInterval:undefined,",
+    ],
+    after: "maxChunkRetries:100,\n      throttledErrors:[429],\n      throttledMaxChunkRetries:30,\n      chunkRetryInterval:undefined,",
   },
   {
     before: "var chunkEvent = function(event, message){",

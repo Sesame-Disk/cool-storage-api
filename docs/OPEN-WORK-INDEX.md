@@ -1,6 +1,6 @@
 # Open Work Index
 
-**Last updated:** 2026-07-25
+**Last updated:** 2026-07-29
 **Scope (narrowed 2026-07-25):** production blockers, recent readiness /
 upload-fence audit follow-ups, and leftovers from consolidating the parallel
 pending-work trackers. **This is not the entire product backlog.** Roadmap /
@@ -63,7 +63,7 @@ the open single-node blocker**, and multi-instance adds B1 and B5. See
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed** for admission to permission/body/storage work after valid link-token resolution (stable-link rate budgets plus process-local per-source `16` / per-node `128` in-flight defaults); token lookup and arbitrary invalid-token traffic are outside these guards. **B reduced** (block cap 257→16 MiB; aggregate bound still missing), **C/D open** | Readiness B4 ⊇ registry X10 — **still the single-node blocker until B/C/D close** |
+| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29** after valid link-token resolution (stable-source attempt-rate budgets plus process-local per-source `16` / per-node `128` in-flight defaults). A2 429s consume successful A1 reservations; only client admission is rolled back when the per-source A1 bucket rejects. Token lookup, arbitrary invalid-token traffic, and fleet-wide aggregation remain outside these process-local guards. **B reduced**, **C/D open** | Readiness B4 ⊇ registry X10 — **still the single-node blocker until B/C/D close** |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
 

@@ -173,6 +173,9 @@ func (tm *TokenManager) CreateDownloadToken(orgID, repoID, path, userID string) 
 
 // CreateLinkUploadToken creates an upload token tagged as a share/upload link.
 func (tm *TokenManager) CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
+	if strings.TrimSpace(sourceID) == "" {
+		return "", errors.New("source ID is required for link upload tokens")
+	}
 	token, err := tm.createToken(TokenTypeUpload, orgID, repoID, path, userID, "link", sourceID, false, tm.tokenTTL)
 	if err != nil {
 		return "", err
@@ -1303,6 +1306,9 @@ func (l *uploadLinkInflightLimiter) tryAcquire(sourceID string) (func(), string)
 	}
 	l.inflight++
 	l.perSource[sourceID]++
+	sourceInflight := l.perSource[sourceID]
+	metrics.UploadLinkInflightCurrent.Inc()
+	metrics.UploadLinkSourceInflightOccupancy.Observe(float64(sourceInflight))
 	l.mu.Unlock()
 
 	var once sync.Once
@@ -1310,6 +1316,7 @@ func (l *uploadLinkInflightLimiter) tryAcquire(sourceID string) (func(), string)
 		once.Do(func() {
 			l.mu.Lock()
 			l.inflight--
+			metrics.UploadLinkInflightCurrent.Dec()
 			if l.perSource[sourceID] == 1 {
 				delete(l.perSource, sourceID)
 			} else {
@@ -1333,11 +1340,11 @@ func (l *uploadLinkInflightLimiter) reject(c *gin.Context, reason string) {
 	})
 }
 
-func (h *SeafHTTPHandler) acquireUploadLinkInflight(c *gin.Context, tokenStr string, token *AccessToken) (func(), bool) {
+func (h *SeafHTTPHandler) acquireUploadLinkInflight(c *gin.Context, token *AccessToken) (func(), bool) {
 	if h == nil || h.uploadLinkInflight == nil || token == nil || token.Source != "link" {
 		return func() {}, true
 	}
-	release, reason := h.uploadLinkInflight.tryAcquire(uploadLinkLimiterSourceID(tokenStr, token))
+	release, reason := h.uploadLinkInflight.tryAcquire(token.SourceID)
 	if release == nil {
 		h.uploadLinkInflight.reject(c, reason)
 		return nil, false
@@ -1364,30 +1371,8 @@ type uploadLinkWriteLimits struct {
 	logSample rate.Sometimes
 }
 
-// uploadLinkTokenFingerprint derives the temporary limiter key for a legacy
-// token that predates stable SourceID persistence.
-//
-// The raw token is a bearer credential and the limiter map is long-lived, so it
-// is hashed rather than stored — a truncated digest is a stable key and is
-// useless if it leaks into a heap dump.
-func uploadLinkTokenFingerprint(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:8])
-}
-
-// uploadLinkLimiterSourceID provides rolling-deploy compatibility for tokens
-// minted before migration 013. New public-link tokens always carry SourceID, so
-// reminting does not reset per-source admission state on this process.
-func uploadLinkLimiterSourceID(tokenStr string, token *AccessToken) string {
-	if token.SourceID != "" {
-		return token.SourceID
-	}
-	return uploadLinkTokenFingerprint(tokenStr)
-}
-
 // allowUploadLinkWrite decides whether an upload may proceed, and is deliberately
-// keyed on the token's origin rather than on the route. A successful admission
-// includes an idempotent refund for a later guard to use before work begins.
+// keyed on the token's origin rather than on the route.
 //
 // /seafhttp/upload-api/:token serves BOTH the anonymous public-upload-link flow
 // and authenticated web uploads; only the former is the unbounded anonymous
@@ -1398,37 +1383,31 @@ func uploadLinkLimiterSourceID(tokenStr string, token *AccessToken) string {
 //
 // It admits the request whenever the limiter is disabled or the token is not a
 // link token, so the only requests it can ever refuse are anonymous link writes.
-func (h *SeafHTTPHandler) allowUploadLinkWrite(c *gin.Context, tokenStr string, token *AccessToken) (func(), bool) {
+func (h *SeafHTTPHandler) allowUploadLinkWrite(c *gin.Context, token *AccessToken) bool {
 	if h == nil || h.uploadLinkWriteLimits == nil || token == nil || token.Source != "link" {
-		return func() {}, true
+		return true
 	}
 	limits := h.uploadLinkWriteLimits
 
-	sourceID := uploadLinkLimiterSourceID(tokenStr, token)
+	sourceID := token.SourceID
 	clientIP := c.ClientIP()
 	now := time.Now()
 
 	clientAdmission := limits.perClient.TryReserve(clientIP+"|"+sourceID, now)
 	if clientAdmission == nil {
 		limits.reject(c, "client", clientIP, token.RepoID)
-		return nil, false
+		return false
 	}
 	sourceAdmission := limits.perSource.TryReserve(sourceID, now)
 	if sourceAdmission == nil {
-		// The request was not admitted, so it must not consume the independent
-		// per-client budget merely because that guard ran first.
+		// Use the original captured now: cancelling at a later time can fail to
+		// restore the token after the reservation's refill interval has elapsed.
 		clientAdmission.CancelAt(now)
 		limits.reject(c, "source", clientIP, token.RepoID)
-		return nil, false
+		return false
 	}
 
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			clientAdmission.CancelAt(now)
-			sourceAdmission.CancelAt(now)
-		})
-	}, true
+	return true
 }
 
 // reject answers a throttled write. 429 is right for this surface specifically
@@ -1992,6 +1971,10 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired upload token"})
 		return
 	}
+	if token.Source == "link" && strings.TrimSpace(token.SourceID) == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid upload token"})
+		return
+	}
 
 	// Throttle anonymous link writes here — after the token resolves, because
 	// Source is what the decision keys on, and before the permission lookup, the
@@ -1999,13 +1982,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// that read has already happened by the time we can tell a link token from a
 	// web one. It can only refuse Source=="link" tokens; authenticated web
 	// uploads on this same route are unaffected.
-	refundRateAdmission, rateAdmitted := h.allowUploadLinkWrite(c, tokenStr, token)
-	if !rateAdmitted {
+	if !h.allowUploadLinkWrite(c, token) {
 		return
 	}
-	releaseInflight, admitted := h.acquireUploadLinkInflight(c, tokenStr, token)
+	releaseInflight, admitted := h.acquireUploadLinkInflight(c, token)
 	if !admitted {
-		refundRateAdmission()
 		return
 	}
 	defer releaseInflight()

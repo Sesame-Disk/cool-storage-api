@@ -5090,7 +5090,7 @@ own fix + regression.
 
 | ID | Surface | Status | Close when | Notes |
 |---|---|---|---|---|
-| **A1** | Anonymous upload **post-token work admission rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-28** | — | Per-(IP, stable link identity) and per-link limiters bound admission to permission/body/storage work after valid token resolution, plus client backoff; see "Subcontract A" below |
+| **A1** | Anonymous upload **post-token attempt rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-29** | — | Initial guard landed 2026-07-28; stable remint identity and the final fail-closed contract completed A1 on 2026-07-29. Per-(IP, stable link identity) and per-link limiters run after valid token resolution; see "Subcontract A" below |
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
 | **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Reduced, still open** | Aggregate bound on concurrent in-flight block readers | Per-request cap right-sized 257 MiB → 16 MiB (the buffered-body bound drops approximately 16×), but N concurrent uploads still cost N × the cap. The aggregate bound is what closes it |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | 🔴 Open | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
@@ -5129,13 +5129,19 @@ noticed. The regression asserts the negative too: with the bucket exhausted,
 Keyed on IP alone, one person uploading through one link would throttle every
 colleague behind the same NAT using a *different* link — the limiter would cause
 the outage it exists to prevent. That isolation is its own regression, also
-mutation-verified. Both buckets survive seafhttp token remints because the
-short-lived credential carries a stable, non-secret identity derived from the
-public link bearer at mint time.
+mutation-verified. Both buckets survive seafhttp token remints because every
+newly written short-lived link credential carries a non-empty, stable, non-secret
+identity derived from the public link bearer at mint time. Writers reject a
+blank `SourceID`, and `HandleUpload` fails closed if one is nevertheless read.
+This is a greenfield contract with no legacy-token fallback. The live Cassandra
+integration test verifies the migration 013 column, two distinct remints
+preserving the exact `SourceID`, and blank writer rejection.
 
-The two buckets form one admission decision: the per-client token is reserved
-first and cancelled if the per-link bucket rejects, so refused work does not
-consume an unrelated client's allowance.
+The two A1 buckets form one attempt-rate decision: the per-client token is
+reserved first. Only that client reservation is cancelled when the per-source
+A1 bucket rejects. Once both A1 reservations succeed they remain consumed even
+if A2 subsequently rejects the request with 429; A1 is not an
+accepted-heavy-work-only accounting scheme.
 
 **The client had to be fixed for the server bound to be safe at all.**
 `@seafile/resumablejs` does not list 429 in `permanentErrors`, so it retries —
@@ -5145,9 +5151,11 @@ against a bucket that refills a couple of times a second means the file is
 reported permanently failed. A limiter meant to slow an upload down would instead
 kill it. The pinned library is patched at install time to capture status and
 `Retry-After` before it clears the XHR, pass them with the triggering chunk to
-`fileRetry`, and make its delayed-retry timer cancelable. The application then
-honours `Retry-After`, falls back to exponential backoff with jitter, and raises
-the retry ceiling for that chunk. All three anonymous-capable uploaders are wired
+`fileRetry`, and make its delayed-retry timer cancelable. The application waits
+for `max(Retry-After, capped exponential backoff)`: its exponential interval caps
+at 16 seconds, jitter is one-sided when the server supplied the floor, and the
+per-chunk throttled retry ceiling is 30. A behavioral test drives 13 consecutive
+429 responses and then a success. All three anonymous-capable uploaders are wired
 to it (upload-link page, shared-link uploader, main uploader).
 
 Two details there are load-bearing and were not obvious:
@@ -5185,6 +5193,13 @@ person's upload dying, so they should be tightened from
 refuses everything) but does *not* require the burst to exceed the rate: those
 are independent dimensions of a token bucket.
 
+Prometheus exposes `upload_link_write_throttled_total{reason}` for A1 rejection,
+plus `upload_link_inflight_rejected_total{reason}`,
+`upload_link_inflight_current`, and
+`upload_link_source_inflight_occupancy`. The latter two report current node
+in-flight work and sampled per-source occupancy respectively; the occupancy
+histogram deliberately has no source label.
+
 **A2 closes the simultaneous-work gap.** `HandleUpload` acquires a non-blocking
 slot after token and rate admission but before permission checks, multipart/body
 reads, staging, or storage. The built-in and shipped defaults are `16` concurrent
@@ -5197,10 +5212,12 @@ all admitted exits.
 The A2 keys are `seafhttp.upload_link_max_inflight_per_source` and
 `seafhttp.upload_link_max_inflight_per_node`, with env overrides
 `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE` and
-`SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE`. Like A1, these counters are
-process-local: adding nodes increases aggregate fleet capacity. This closes
-subcontract A only; B, C, and D remain open, so the B4 umbrella remains a
-production blocker.
+`SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE`. Validation ceilings are `4096` per
+source and `65536` per node; when both caps are enabled, the per-source cap must
+not exceed the per-node cap. Like A1, these counters are process-local: adding
+nodes increases aggregate fleet capacity. This closes subcontract A only; the
+pre-token lookup and process-local residuals remain, and B, C, and D remain open,
+so the B4 umbrella remains a production blocker.
 
 #### Subcontract B: what the right-sized cap does and does not do (2026-07-28)
 

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -137,6 +138,9 @@ func (ts *TokenStore) CreateUpdateToken(orgID, repoID, path, userID string) (str
 
 // CreateLinkUploadToken creates an upload token for a share/upload link — tagged as source="link".
 func (ts *TokenStore) CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
+	if strings.TrimSpace(sourceID) == "" {
+		return "", fmt.Errorf("source ID is required for link upload tokens")
+	}
 	token, err := ts.createToken(TokenTypeUpload, orgID, repoID, path, userID, "link", sourceID, false)
 	if err != nil {
 		return "", err

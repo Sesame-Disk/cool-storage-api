@@ -40,7 +40,7 @@ type ShareLinkViewHandler struct {
 	tokenCreator       TokenCreator
 	serverURL          string
 	uploadLinkResolver func(string) (*uploadLinkData, error)
-	shareLinkResolver  func(string, bool) (*shareLinkData, error)
+	shareLinkResolver  func(string) (*shareLinkData, error)
 }
 
 type pageBootstrapResponse struct {
@@ -589,11 +589,11 @@ func (h *ShareLinkViewHandler) loadUploadLink(token string) (*uploadLinkData, er
 	return h.resolveUploadLink(token)
 }
 
-func (h *ShareLinkViewHandler) loadShareLink(token string, countView bool) (*shareLinkData, error) {
+func (h *ShareLinkViewHandler) loadShareLink(token string) (*shareLinkData, error) {
 	if h.shareLinkResolver != nil {
-		return h.shareLinkResolver(token, countView)
+		return h.shareLinkResolver(token)
 	}
-	return h.resolveShareLink(token, countView)
+	return h.resolveShareLink(token, false)
 }
 
 func (h *ShareLinkViewHandler) resolveUploadLink(token string) (*uploadLinkData, error) {
@@ -1671,7 +1671,7 @@ func (h *ShareLinkViewHandler) GetShareLinkUploadURL(c *gin.Context) {
 	token := c.Param("token")
 	path := c.DefaultQuery("path", "/")
 
-	sl, err := h.loadShareLink(token, false)
+	sl, err := h.loadShareLink(token)
 	if err != nil {
 		respondShareLinkUnavailable(c)
 		return

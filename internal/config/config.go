@@ -629,6 +629,11 @@ const (
 	// above it are not useful protection and are more likely to be a unit mistake;
 	// this is policy, not the mathematical overflow point of time.Duration.
 	MaxUploadLinkWritesPerMinute = 600000
+	// MaxUploadLinkMaxInflightPerSource and MaxUploadLinkMaxInflightPerNode
+	// reject likely unit mistakes before they allocate unrealistic process-local
+	// concurrency budgets.
+	MaxUploadLinkMaxInflightPerSource = 4096
+	MaxUploadLinkMaxInflightPerNode   = 65536
 )
 
 // validateUploadLinkWriteLimit checks one rate/burst pair.
@@ -1850,6 +1855,15 @@ func (c *Config) Validate() error {
 	}
 	if c.SeafHTTP.UploadLinkMaxInflightPerNode < 0 {
 		return fmt.Errorf("seafhttp.upload_link_max_inflight_per_node must be greater than or equal to zero (zero disables the cap)")
+	}
+	if c.SeafHTTP.UploadLinkMaxInflightPerSource > MaxUploadLinkMaxInflightPerSource {
+		return fmt.Errorf("seafhttp.upload_link_max_inflight_per_source is %d, above the %d ceiling", c.SeafHTTP.UploadLinkMaxInflightPerSource, MaxUploadLinkMaxInflightPerSource)
+	}
+	if c.SeafHTTP.UploadLinkMaxInflightPerNode > MaxUploadLinkMaxInflightPerNode {
+		return fmt.Errorf("seafhttp.upload_link_max_inflight_per_node is %d, above the %d ceiling", c.SeafHTTP.UploadLinkMaxInflightPerNode, MaxUploadLinkMaxInflightPerNode)
+	}
+	if c.SeafHTTP.UploadLinkMaxInflightPerSource > 0 && c.SeafHTTP.UploadLinkMaxInflightPerNode > 0 && c.SeafHTTP.UploadLinkMaxInflightPerSource > c.SeafHTTP.UploadLinkMaxInflightPerNode {
+		return fmt.Errorf("seafhttp.upload_link_max_inflight_per_source must not exceed seafhttp.upload_link_max_inflight_per_node when both caps are enabled")
 	}
 	if err := validateUploadLinkWriteLimit(
 		"upload_link_source_writes_per_minute", "upload_link_source_write_burst",

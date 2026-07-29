@@ -102,9 +102,9 @@ func TestGetShareLinkUploadURLRemintsWithStableOpaqueSourceID(t *testing.T) {
 	h := &ShareLinkViewHandler{
 		tokenCreator: tokens,
 		serverURL:    "https://files.example",
-		shareLinkResolver: func(got string, countView bool) (*shareLinkData, error) {
-			if got != bearer || countView {
-				t.Fatalf("resolver args = (%q, %t), want (%q, false)", got, countView, bearer)
+		shareLinkResolver: func(got string) (*shareLinkData, error) {
+			if got != bearer {
+				t.Fatalf("resolver token = %q, want %q", got, bearer)
 			}
 			return &shareLinkData{orgID: "org", libraryID: "repo", filePath: "/shared", createdBy: "user", canUpload: true}, nil
 		},

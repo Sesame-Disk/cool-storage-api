@@ -574,6 +574,31 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "upload link per-source inflight cap rejects above maximum",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkMaxInflightPerSource = MaxUploadLinkMaxInflightPerSource + 1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_max_inflight_per_source",
+		},
+		{
+			name: "upload link node inflight cap rejects above maximum",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkMaxInflightPerNode = MaxUploadLinkMaxInflightPerNode + 1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_max_inflight_per_node",
+		},
+		{
+			name: "upload link per-source cap cannot exceed enabled node cap",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkMaxInflightPerSource = 9
+				c.SeafHTTP.UploadLinkMaxInflightPerNode = 8
+			},
+			wantErr:        true,
+			wantErrContain: "must not exceed",
+		},
+		{
 			name: "storage backend rejects unsupported sse mode",
 			modify: func(c *Config) {
 				hot := c.Storage.Backends["hot"]
@@ -1845,8 +1870,11 @@ func TestShippedConfigsSeafHTTPBoundsAreValid(t *testing.T) {
 			); err != nil {
 				t.Fatalf("this config would refuse to boot: %v", err)
 			}
-			if cfg.SeafHTTP.UploadLinkMaxInflightPerSource < 0 || cfg.SeafHTTP.UploadLinkMaxInflightPerNode < 0 {
-				t.Fatal("shipped config contains a negative upload-link in-flight cap")
+			if got := cfg.SeafHTTP.UploadLinkMaxInflightPerSource; got != 16 {
+				t.Fatalf("upload_link_max_inflight_per_source = %d, want shipped value 16", got)
+			}
+			if got := cfg.SeafHTTP.UploadLinkMaxInflightPerNode; got != 128 {
+				t.Fatalf("upload_link_max_inflight_per_node = %d, want shipped value 128", got)
 			}
 		})
 	}

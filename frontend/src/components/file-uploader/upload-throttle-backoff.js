@@ -19,10 +19,11 @@ const THROTTLED_STATUS = 429;
 // the ceiling raised while throttled must be restored to the same value.
 export const BASE_MAX_CHUNK_RETRIES = 3;
 
-// While throttled, retries are cheap (the request is refused before any work) and
-// spaced out, so a much higher ceiling is what turns a burst of 429s into a pause
-// instead of a failure.
-export const THROTTLED_MAX_CHUNK_RETRIES = 12;
+// While throttled, retries are refused before permission, body, and storage work
+// and are spaced out. A2-generated 429s still consume the successful post-token
+// A1 attempt-rate reservations, so the bounded ceiling turns sustained 429s into
+// a pause without retrying indefinitely.
+export const THROTTLED_MAX_CHUNK_RETRIES = 30;
 
 const MIN_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 16000;
@@ -39,10 +40,11 @@ export function parseRetryAfterMs(headerValue) {
   return seconds * 1000;
 }
 
-// backoffMs is the wait before the next attempt: the server's own figure when it
-// gave one, otherwise exponential from the attempt count. Jitter is applied in
-// both cases — several chunks of the same file are throttled at once, and without
-// it they would retry in lockstep and re-collide on the same empty bucket.
+// backoffMs is the wait before the next attempt: exponential from the attempt
+// count, with the server's own figure used as a floor when it gave one. Jitter is
+// applied in both cases — several chunks of the same file are throttled at once,
+// and without it they would retry in lockstep and re-collide on the same empty
+// bucket.
 //
 // The jitter is one-sided when the server named a time. Retry-After is a floor,
 // not an estimate: spreading below it would retry into a bucket the server has
@@ -50,9 +52,8 @@ export function parseRetryAfterMs(headerValue) {
 // floor, so jitter goes both ways there.
 export function backoffMs(retryAfterHeader, attempt, random = Math.random) {
   const fromHeader = parseRetryAfterMs(retryAfterHeader);
-  const base = fromHeader === null
-    ? Math.min(MIN_BACKOFF_MS * Math.pow(2, Math.max(0, attempt)), MAX_BACKOFF_MS)
-    : Math.max(fromHeader, MIN_BACKOFF_MS);
+  const exponential = Math.min(MIN_BACKOFF_MS * Math.pow(2, Math.max(0, attempt)), MAX_BACKOFF_MS);
+  const base = fromHeader === null ? exponential : Math.max(fromHeader, exponential);
 
   const spread = fromHeader === null ? random() * 2 - 1 : random();
   const jitter = base * JITTER_RATIO * spread;

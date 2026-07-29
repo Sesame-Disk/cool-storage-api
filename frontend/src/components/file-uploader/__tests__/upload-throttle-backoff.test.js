@@ -37,6 +37,8 @@ describe('resumable.js retry contract', () => {
     expect(source).toContain("$.resumableObj.fire('fileChunkSuccess', $, chunk)");
     expect(source).toContain("retryInfo.retryAfter = $.xhr ? $.xhr.getResponseHeader('Retry-After') : null");
     expect(source).toContain("$.getOpt('throttledMaxChunkRetries')");
+    expect(source).toContain('throttledMaxChunkRetries:30');
+    expect(THROTTLED_MAX_CHUNK_RETRIES).toBe(30);
     expect(source).toContain('$.retryTimer = setTimeout(function()');
     expect(source).toContain('clearTimeout($.retryTimer)');
     // The patch rewrites a file it may have already rewritten, so "the new code
@@ -94,16 +96,18 @@ describe('resumable.js retry contract', () => {
     });
     const retries = [];
     const errors = [];
+    const successes = [];
     resumable.on('fileRetry', (file, chunk, retryInfo) => {
       retries.push({ file, chunk, retryInfo });
       noteUploadRetry(resumable, file, chunk, retryInfo);
     });
     resumable.on('fileChunkSuccess', (file, chunk) => clearChunkThrottleState(file, chunk));
     resumable.on('fileError', (...args) => errors.push(args));
+    resumable.on('fileSuccess', (...args) => successes.push(args));
     resumable.on('fileAdded', () => resumable.upload());
     resumable.addFile(new File(['data'], 'data.bin', { type: 'application/octet-stream' }));
     jest.runOnlyPendingTimers();
-    return { resumable, retries, errors };
+    return { resumable, retries, errors, successes };
   };
 
   beforeEach(() => {
@@ -151,6 +155,29 @@ describe('resumable.js retry contract', () => {
     expect(resumable.files[0].chunks[0].opts.maxChunkRetries).toBe(THROTTLED_MAX_CHUNK_RETRIES);
   });
 
+  it('survives sustained 429 saturation and continues after the server recovers', () => {
+    const { resumable, retries, errors, successes } = startUpload();
+    const file = resumable.files[0];
+
+    for (let attempt = 0; attempt < 13; attempt++) {
+      ControlledXHR.instances[attempt].respond(429, '1');
+      expect(errors).toHaveLength(0);
+      expect(file.isThrottled).toBe(true);
+
+      jest.advanceTimersByTime(file.chunks[0].opts.chunkRetryInterval);
+      expect(ControlledXHR.instances).toHaveLength(attempt + 2);
+    }
+
+    expect(retries).toHaveLength(13);
+    expect(file.chunks[0].retries).toBe(13);
+    ControlledXHR.instances[13].respond(200);
+
+    expect(errors).toHaveLength(0);
+    expect(successes).toHaveLength(1);
+    expect(file.isThrottled).toBe(false);
+    expect(file.isComplete()).toBe(true);
+  });
+
   it('cancels a delayed retry when the file is cancelled', () => {
     const { resumable } = startUpload();
     ControlledXHR.instances[0].respond(429, '2');
@@ -186,8 +213,15 @@ describe('backoffMs', () => {
   const midExponential = () => 0.5;
   const noAddedJitter = () => 0;
 
-  it('honours the server figure over its own guess', () => {
+  it('uses the server figure when it is higher than its own guess', () => {
     expect(backoffMs('5', 0, noAddedJitter)).toBe(5000);
+  });
+
+  it('keeps exponential growth when the server floor is lower', () => {
+    expect(backoffMs('1', 0, noAddedJitter)).toBe(1000);
+    expect(backoffMs('1', 1, noAddedJitter)).toBe(2000);
+    expect(backoffMs('1', 4, noAddedJitter)).toBe(16000);
+    expect(backoffMs('1', 13, noAddedJitter)).toBe(16000);
   });
 
   it('never waits less than a second, even when told zero', () => {

@@ -544,6 +544,25 @@ var (
 		},
 		[]string{"reason"},
 	)
+
+	// UploadLinkInflightCurrent reports active anonymous upload-link writes in
+	// this process. It intentionally has no labels.
+	UploadLinkInflightCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "upload_link_inflight_current",
+			Help: "Current anonymous upload-link writes admitted in this process.",
+		},
+	)
+
+	// UploadLinkSourceInflightOccupancy samples the admitted source's occupancy
+	// without exposing source identities as labels.
+	UploadLinkSourceInflightOccupancy = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "upload_link_source_inflight_occupancy",
+			Help:    "Per-source in-flight occupancy observed when an anonymous upload-link write is admitted.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 13),
+		},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -599,5 +618,7 @@ func Register() {
 		SyncPutBlockRejectedTotal,
 		UploadLinkWriteThrottledTotal,
 		UploadLinkInflightRejectedTotal,
+		UploadLinkInflightCurrent,
+		UploadLinkSourceInflightOccupancy,
 	)
 }
