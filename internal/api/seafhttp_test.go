@@ -1287,6 +1287,26 @@ func TestTokenManagerCreateUploadToken(t *testing.T) {
 	}
 }
 
+func TestTokenManagerCreateLinkUploadTokenPreservesSourceID(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	sourceID := "stable-link-fingerprint"
+
+	tokenStr, err := tm.CreateLinkUploadToken("org1", "repo1", "/upload/path", "user1", sourceID)
+	if err != nil {
+		t.Fatalf("CreateLinkUploadToken failed: %v", err)
+	}
+	token, ok := tm.GetToken(tokenStr, TokenTypeUpload)
+	if !ok {
+		t.Fatal("link upload token should be retrievable")
+	}
+	if token.Source != "link" {
+		t.Fatalf("Source = %q, want link", token.Source)
+	}
+	if token.SourceID != sourceID {
+		t.Fatalf("SourceID = %q, want %q", token.SourceID, sourceID)
+	}
+}
+
 func TestTokenManagerCreateUpdateToken(t *testing.T) {
 	tm := NewTokenManager(1 * time.Hour)
 
@@ -1725,11 +1745,12 @@ func (m *MockTokenStore) ConsumeOneTimeLoginToken(oneTimeToken string) (string, 
 	return "mock-auth-token", nil
 }
 
-func (m *MockTokenStore) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
+func (m *MockTokenStore) CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
 	token := &AccessToken{
 		Token:     "mock-link-upload-token",
 		Type:      TokenTypeUpload,
 		Source:    "link",
+		SourceID:  sourceID,
 		OrgID:     orgID,
 		RepoID:    repoID,
 		Path:      path,

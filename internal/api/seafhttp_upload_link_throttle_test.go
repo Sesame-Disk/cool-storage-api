@@ -1,8 +1,10 @@
 package api
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 )
 
 // Subcontract A1 of ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: the anonymous
@@ -23,19 +26,26 @@ import (
 //   - /seafhttp/upload-api/:token also serves authenticated web uploads, so the
 //     bound must key on the token's origin, not on the route. A limiter installed
 //     as route middleware would have throttled ordinary users.
-//   - The bound keys on (IP, token), not IP alone, so two people behind one NAT
+//   - The bound keys on (IP, stable link source), not IP alone, so two people behind one NAT
 //     using two different links do not share a bucket.
 //
 // A test asserting only "link tokens get 429" would have missed both. These go
 // through HandleUpload rather than the decision helper, so they also pin that the
 // handler actually consults it, after the token resolves.
 
-func throttleTestConfig(perMinute, burst, tokenPerMinute, tokenBurst int) *config.Config {
+func throttleTestConfig(perMinute, burst, sourcePerMinute, sourceBurst int) *config.Config {
 	cfg := &config.Config{}
 	cfg.SeafHTTP.UploadLinkWritesPerMinute = perMinute
 	cfg.SeafHTTP.UploadLinkWriteBurst = burst
-	cfg.SeafHTTP.UploadLinkTokenWritesPerMinute = tokenPerMinute
-	cfg.SeafHTTP.UploadLinkTokenWriteBurst = tokenBurst
+	cfg.SeafHTTP.UploadLinkSourceWritesPerMinute = sourcePerMinute
+	cfg.SeafHTTP.UploadLinkSourceWriteBurst = sourceBurst
+	return cfg
+}
+
+func inflightTestConfig(perSource, perNode int) *config.Config {
+	cfg := throttleTestConfig(0, 0, 0, 0)
+	cfg.SeafHTTP.UploadLinkMaxInflightPerSource = perSource
+	cfg.SeafHTTP.UploadLinkMaxInflightPerNode = perNode
 	return cfg
 }
 
@@ -47,6 +57,10 @@ func newThrottleTestHandler(t *testing.T, cfg *config.Config, tokens map[string]
 
 	store := NewMockTokenStore()
 	for tokenStr, source := range tokens {
+		sourceID := ""
+		if source == "link" {
+			sourceID = tokenStr
+		}
 		store.tokens[tokenStr] = &AccessToken{
 			Token:     tokenStr,
 			Type:      TokenTypeUpload,
@@ -55,6 +69,7 @@ func newThrottleTestHandler(t *testing.T, cfg *config.Config, tokens map[string]
 			Path:      "/",
 			UserID:    "user-1",
 			Source:    source,
+			SourceID:  sourceID,
 			ExpiresAt: time.Now().Add(time.Hour),
 			CreatedAt: time.Now(),
 		}
@@ -66,6 +81,11 @@ func newThrottleTestHandler(t *testing.T, cfg *config.Config, tokens map[string]
 	r := gin.New()
 	r.POST("/seafhttp/upload-api/:token", h.HandleUpload)
 	return h, r
+}
+
+func setThrottleTestSourceID(h *SeafHTTPHandler, tokenStr, sourceID string) {
+	store := h.tokenStore.(*MockTokenStore)
+	store.tokens[tokenStr].SourceID = sourceID
 }
 
 // upload drives one request from a given client address. Everything past the
@@ -139,21 +159,21 @@ func TestUploadLinkWriteThrottleIsolatesLinksBehindOneAddress(t *testing.T) {
 
 	// Link B from the same address must be untouched by that.
 	if w := upload(t, r, "link-b", sharedIP); w.Code == http.StatusTooManyRequests {
-		t.Fatal("a second link from the same address was throttled; the key must be (IP, token), not IP alone")
+		t.Fatal("a second link from the same address was throttled; the key must be (IP, source), not IP alone")
 	}
 }
 
-// TestUploadLinkWriteThrottlePerTokenBucket covers the case the (IP, token)
+// TestUploadLinkWriteThrottlePerSourceBucket covers the case the per-client
 // bucket structurally cannot see: one leaked upload URL hit from many addresses.
-func TestUploadLinkWriteThrottlePerTokenBucket(t *testing.T) {
-	// Per-client generous, per-token tight, so only the per-token bound can fire.
+func TestUploadLinkWriteThrottlePerSourceBucket(t *testing.T) {
+	// Per-client generous, per-source tight, so only the per-link bound can fire.
 	_, r := newThrottleTestHandler(t, throttleTestConfig(6000, 100, 1, 2), map[string]string{
 		"leaked-link": "link",
 	})
 
-	before := testutil.ToFloat64(metrics.UploadLinkWriteThrottledTotal.WithLabelValues("token"))
+	before := testutil.ToFloat64(metrics.UploadLinkWriteThrottledTotal.WithLabelValues("source"))
 
-	// Two different addresses spend the per-token burst, a third finds it empty.
+	// Two different addresses spend the per-link burst, a third finds it empty.
 	upload(t, r, "leaked-link", "203.0.113.1")
 	upload(t, r, "leaked-link", "203.0.113.2")
 	w := upload(t, r, "leaked-link", "203.0.113.3")
@@ -161,50 +181,92 @@ func TestUploadLinkWriteThrottlePerTokenBucket(t *testing.T) {
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("third address = %d, want 429; a leaked link is unbounded across IPs without this bucket", w.Code)
 	}
-	if after := testutil.ToFloat64(metrics.UploadLinkWriteThrottledTotal.WithLabelValues("token")); after <= before {
-		t.Errorf("token-bucket rejections did not move (%v -> %v); the two buckets must be distinguishable, they call for opposite responses", before, after)
+	if after := testutil.ToFloat64(metrics.UploadLinkWriteThrottledTotal.WithLabelValues("source")); after <= before {
+		t.Errorf("source-bucket rejections did not move (%v -> %v); the two buckets must be distinguishable, they call for opposite responses", before, after)
 	}
 }
 
 // The two bounds are independently configurable. Disabling the per-client
-// bucket must not accidentally remove the per-token defence against one leaked
+// bucket must not accidentally remove the per-link defence against one leaked
 // link being used from many addresses.
-func TestUploadLinkWriteThrottlePerTokenOnly(t *testing.T) {
+func TestUploadLinkWriteThrottlePerSourceOnly(t *testing.T) {
 	h, r := newThrottleTestHandler(t, throttleTestConfig(0, 0, 1, 1), map[string]string{
 		"leaked-link": "link",
 	})
-	if h.uploadLinkWriteLimits == nil || h.uploadLinkWriteLimits.perToken == nil {
-		t.Fatal("per-token limiter was not constructed when the per-client limiter was disabled")
+	if h.uploadLinkWriteLimits == nil || h.uploadLinkWriteLimits.perSource == nil {
+		t.Fatal("per-source limiter was not constructed when the per-client limiter was disabled")
 	}
 	if h.uploadLinkWriteLimits.perClient != nil {
 		t.Fatal("per-client limiter was constructed while disabled")
 	}
 
 	if w := upload(t, r, "leaked-link", "203.0.113.1"); w.Code == http.StatusTooManyRequests {
-		t.Fatal("first write was refused; the per-token burst must admit it")
+		t.Fatal("first write was refused; the per-source burst must admit it")
 	}
 	if w := upload(t, r, "leaked-link", "203.0.113.2"); w.Code != http.StatusTooManyRequests {
-		t.Fatalf("second address = %d, want 429 from the independently enabled per-token bucket", w.Code)
+		t.Fatalf("second address = %d, want 429 from the independently enabled per-source bucket", w.Code)
 	}
 }
 
-func TestUploadLinkWriteThrottleTokenRejectionRestoresClientAdmission(t *testing.T) {
+func TestUploadLinkWriteThrottleSourceRejectionRestoresClientAdmission(t *testing.T) {
 	h, r := newThrottleTestHandler(t, throttleTestConfig(1, 1, 1, 1), map[string]string{
 		"shared-link": "link",
 	})
 
-	upload(t, r, "shared-link", "203.0.113.1") // Spend the token-wide burst.
+	upload(t, r, "shared-link", "203.0.113.1") // Spend the source-wide burst.
 	if w := upload(t, r, "shared-link", "203.0.113.2"); w.Code != http.StatusTooManyRequests {
-		t.Fatalf("second address = %d, want token-wide 429", w.Code)
+		t.Fatalf("second address = %d, want source-wide 429", w.Code)
 	}
 
-	key := "203.0.113.2|" + uploadLinkTokenFingerprint("shared-link")
+	key := "203.0.113.2|shared-link"
 	now := time.Now()
 	admission := h.uploadLinkWriteLimits.perClient.TryReserve(key, now)
 	if admission == nil {
-		t.Fatal("token-wide rejection consumed the independent per-client admission")
+		t.Fatal("source-wide rejection consumed the independent per-client admission")
 	}
 	admission.CancelAt(now)
+}
+
+func TestUploadLinkWriteThrottleRemintsSharePerClientBucket(t *testing.T) {
+	h, r := newThrottleTestHandler(t, throttleTestConfig(1, 1, 0, 0), map[string]string{
+		"mint-a": "link",
+		"mint-b": "link",
+	})
+	setThrottleTestSourceID(h, "mint-a", "same-public-link")
+	setThrottleTestSourceID(h, "mint-b", "same-public-link")
+
+	upload(t, r, "mint-a", "203.0.113.10")
+	if w := upload(t, r, "mint-b", "203.0.113.10"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("reminted token write = %d, want 429 from the shared (client, source) bucket", w.Code)
+	}
+}
+
+func TestUploadLinkWriteThrottleRemintsShareAggregateBucket(t *testing.T) {
+	h, r := newThrottleTestHandler(t, throttleTestConfig(6000, 100, 1, 1), map[string]string{
+		"mint-a": "link",
+		"mint-b": "link",
+	})
+	setThrottleTestSourceID(h, "mint-a", "same-public-link")
+	setThrottleTestSourceID(h, "mint-b", "same-public-link")
+
+	upload(t, r, "mint-a", "203.0.113.11")
+	if w := upload(t, r, "mint-b", "203.0.113.12"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("reminted token from another client = %d, want 429 from the shared source bucket", w.Code)
+	}
+}
+
+func TestUploadLinkWriteThrottleLegacyTokensFallBackToTokenIdentity(t *testing.T) {
+	h, r := newThrottleTestHandler(t, throttleTestConfig(1, 1, 0, 0), map[string]string{
+		"legacy-a": "link",
+		"legacy-b": "link",
+	})
+	setThrottleTestSourceID(h, "legacy-a", "")
+	setThrottleTestSourceID(h, "legacy-b", "")
+
+	upload(t, r, "legacy-a", "203.0.113.13")
+	if w := upload(t, r, "legacy-b", "203.0.113.13"); w.Code == http.StatusTooManyRequests {
+		t.Fatal("distinct legacy seafhttp tokens unexpectedly shared the fallback bucket")
+	}
 }
 
 func TestUploadLinkWriteThrottleDisabledByConfig(t *testing.T) {
@@ -259,7 +321,7 @@ func TestUploadLinkWriteThrottleNilTokenIsAllowed(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/tok", nil)
 
 	for i := 0; i < 5; i++ {
-		if !h.allowUploadLinkWrite(c, "tok", nil) {
+		if _, admitted := h.allowUploadLinkWrite(c, "tok", nil); !admitted {
 			t.Fatalf("nil token refused at attempt %d", i+1)
 		}
 	}
@@ -278,4 +340,274 @@ func TestSeafHTTPHandlerCloseIsSafeToRepeat(t *testing.T) {
 
 	var nilHandler *SeafHTTPHandler
 	nilHandler.Close()
+}
+
+type gatedEOFReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *gatedEOFReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return 0, io.EOF
+}
+
+type observedEOFReader struct {
+	read chan struct{}
+	once sync.Once
+}
+
+func (r *observedEOFReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.read) })
+	return 0, io.EOF
+}
+
+func uploadWithReader(r *gin.Engine, tokenStr string, body io.Reader) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr, body)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=inflight-test")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func startBlockedUpload(t *testing.T, r *gin.Engine, tokenStr string) (func(), <-chan *httptest.ResponseRecorder) {
+	t.Helper()
+	body := &gatedEOFReader{started: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- uploadWithReader(r, tokenStr, body) }()
+	select {
+	case <-body.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upload did not reach its body read")
+	}
+	return func() { close(body.release) }, done
+}
+
+func requireBodyUnread(t *testing.T, read <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-read:
+		t.Fatal("rejected upload reached its body read")
+	default:
+	}
+}
+
+func waitUpload(t *testing.T, done <-chan *httptest.ResponseRecorder) *httptest.ResponseRecorder {
+	t.Helper()
+	select {
+	case w := <-done:
+		return w
+	case <-time.After(2 * time.Second):
+		t.Fatal("upload did not finish")
+		return nil
+	}
+}
+
+func TestUploadLinkInflightRejectionRefundsRateAdmission(t *testing.T) {
+	tests := []struct {
+		name      string
+		perClient int
+		perSource int
+	}{
+		{name: "both buckets enabled", perClient: 1, perSource: 1},
+		{name: "per-client bucket only", perClient: 1},
+		{name: "per-source bucket only", perSource: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := throttleTestConfig(tt.perClient, tt.perClient, tt.perSource, tt.perSource)
+			cfg.SeafHTTP.UploadLinkMaxInflightPerSource = 1
+			h, r := newThrottleTestHandler(t, cfg, map[string]string{"link": "link"})
+
+			release, reason := h.uploadLinkInflight.tryAcquire("link")
+			if release == nil {
+				t.Fatalf("failed to fill in-flight guard: %s", reason)
+			}
+			defer release()
+
+			body := &observedEOFReader{read: make(chan struct{})}
+			if w := uploadWithReader(r, "link", body); w.Code != http.StatusTooManyRequests {
+				t.Fatalf("upload with full in-flight guard = %d, want 429", w.Code)
+			}
+			requireBodyUnread(t, body.read)
+
+			now := time.Now()
+			clientAdmission := h.uploadLinkWriteLimits.perClient.TryReserve("192.0.2.1|link", now)
+			if clientAdmission == nil {
+				t.Fatal("in-flight rejection consumed the per-client rate budget")
+			}
+			clientAdmission.CancelAt(now)
+
+			sourceAdmission := h.uploadLinkWriteLimits.perSource.TryReserve("link", now)
+			if sourceAdmission == nil {
+				t.Fatal("in-flight rejection consumed the per-source rate budget")
+			}
+			sourceAdmission.CancelAt(now)
+		})
+	}
+}
+
+func TestUploadLinkInflightPerSourceRejectsBeforeBodyAndReleases(t *testing.T) {
+	h, r := newThrottleTestHandler(t, inflightTestConfig(1, 4), map[string]string{
+		"link-a": "link",
+		"link-b": "link",
+	})
+	setThrottleTestSourceID(h, "link-a", "same-public-link")
+	setThrottleTestSourceID(h, "link-b", "same-public-link")
+	h.storageManager = storage.NewManager()
+	release, done := startBlockedUpload(t, r, "link-a")
+
+	before := testutil.ToFloat64(metrics.UploadLinkInflightRejectedTotal.WithLabelValues("source"))
+	rejectedBody := &observedEOFReader{read: make(chan struct{})}
+	w := uploadWithReader(r, "link-b", rejectedBody)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("concurrent write = %d, want 429", w.Code)
+	}
+	if got := w.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
+	}
+	requireBodyUnread(t, rejectedBody.read)
+	if after := testutil.ToFloat64(metrics.UploadLinkInflightRejectedTotal.WithLabelValues("source")); after != before+1 {
+		t.Fatalf("source rejection metric = %v, want %v", after, before+1)
+	}
+
+	release()
+	if first := waitUpload(t, done); first.Code != http.StatusBadRequest {
+		t.Fatalf("released malformed upload = %d, want 400", first.Code)
+	}
+	laterBody := &observedEOFReader{read: make(chan struct{})}
+	if later := uploadWithReader(r, "link-b", laterBody); later.Code != http.StatusBadRequest {
+		t.Fatalf("later upload = %d, want admission followed by 400", later.Code)
+	}
+	select {
+	case <-laterBody.read:
+	default:
+		t.Fatal("later upload was not admitted after release")
+	}
+}
+
+func TestUploadLinkInflightNodeCapSpansLinks(t *testing.T) {
+	h, r := newThrottleTestHandler(t, inflightTestConfig(2, 1), map[string]string{
+		"link-a": "link",
+		"link-b": "link",
+	})
+	h.storageManager = storage.NewManager()
+	release, done := startBlockedUpload(t, r, "link-a")
+
+	before := testutil.ToFloat64(metrics.UploadLinkInflightRejectedTotal.WithLabelValues("node"))
+	rejectedBody := &observedEOFReader{read: make(chan struct{})}
+	w := uploadWithReader(r, "link-b", rejectedBody)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("second link while node full = %d, want 429", w.Code)
+	}
+	requireBodyUnread(t, rejectedBody.read)
+	if after := testutil.ToFloat64(metrics.UploadLinkInflightRejectedTotal.WithLabelValues("node")); after != before+1 {
+		t.Fatalf("node rejection metric = %v, want %v", after, before+1)
+	}
+
+	release()
+	waitUpload(t, done)
+	laterBody := &observedEOFReader{read: make(chan struct{})}
+	if later := uploadWithReader(r, "link-b", laterBody); later.Code != http.StatusBadRequest {
+		t.Fatalf("second link after release = %d, want admission followed by 400", later.Code)
+	}
+}
+
+func TestUploadLinkInflightReleasesAfterEarlyStorageError(t *testing.T) {
+	_, r := newThrottleTestHandler(t, inflightTestConfig(1, 1), map[string]string{"link": "link"})
+	for i := 0; i < 2; i++ {
+		w := uploadWithReader(r, "link", &observedEOFReader{read: make(chan struct{})})
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("request %d = %d, want 503; a 429 means the prior early return leaked its slot", i+1, w.Code)
+		}
+	}
+}
+
+func TestUploadLinkInflightWebTokenBypassesFullCap(t *testing.T) {
+	h, r := newThrottleTestHandler(t, inflightTestConfig(1, 1), map[string]string{
+		"link": "link",
+		"web":  "web",
+	})
+	h.storageManager = storage.NewManager()
+	release, done := startBlockedUpload(t, r, "link")
+	webBody := &observedEOFReader{read: make(chan struct{})}
+	if w := uploadWithReader(r, "web", webBody); w.Code != http.StatusBadRequest {
+		t.Fatalf("web upload while link cap full = %d, want bypass followed by 400", w.Code)
+	}
+	select {
+	case <-webBody.read:
+	default:
+		t.Fatal("web upload did not bypass the anonymous cap")
+	}
+	release()
+	waitUpload(t, done)
+}
+
+func TestUploadLinkInflightDisabled(t *testing.T) {
+	h, r := newThrottleTestHandler(t, inflightTestConfig(0, 0), map[string]string{"link": "link"})
+	if h.uploadLinkInflight != nil {
+		t.Fatal("in-flight limiter constructed while both caps are disabled")
+	}
+	h.storageManager = storage.NewManager()
+	body := &observedEOFReader{read: make(chan struct{})}
+	if w := uploadWithReader(r, "link", body); w.Code != http.StatusBadRequest {
+		t.Fatalf("disabled-cap upload = %d, want body parsing 400", w.Code)
+	}
+}
+
+func TestUploadLinkInflightCapsDisableIndependently(t *testing.T) {
+	t.Run("source cap disabled", func(t *testing.T) {
+		l := newUploadLinkInflightLimiter(inflightTestConfig(0, 1))
+		release, reason := l.tryAcquire("source-a")
+		if release == nil {
+			t.Fatalf("first admission rejected: %s", reason)
+		}
+		defer release()
+		if second, reason := l.tryAcquire("source-b"); second != nil || reason != "node" {
+			t.Fatalf("second admission = (%v, %q), want node rejection", second != nil, reason)
+		}
+	})
+
+	t.Run("node cap disabled", func(t *testing.T) {
+		l := newUploadLinkInflightLimiter(inflightTestConfig(1, 0))
+		releaseA, reason := l.tryAcquire("source-a")
+		if releaseA == nil {
+			t.Fatalf("first admission rejected: %s", reason)
+		}
+		defer releaseA()
+		if second, reason := l.tryAcquire("source-a"); second != nil || reason != "source" {
+			t.Fatalf("same-source admission = (%v, %q), want source rejection", second != nil, reason)
+		}
+		releaseB, reason := l.tryAcquire("source-b")
+		if releaseB == nil {
+			t.Fatalf("different source rejected with node cap disabled: %s", reason)
+		}
+		releaseB()
+	})
+}
+
+func TestUploadLinkInflightLimiterConcurrentRelease(t *testing.T) {
+	l := &uploadLinkInflightLimiter{maxPerSource: 4, maxPerNode: 16, perSource: make(map[string]int)}
+	var wg sync.WaitGroup
+	for worker := 0; worker < 32; worker++ {
+		wg.Add(1)
+		go func(source string) {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				if release, _ := l.tryAcquire(source); release != nil {
+					release()
+					release()
+				}
+			}
+		}(string(rune('a' + worker%8)))
+	}
+	wg.Wait()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.inflight != 0 || len(l.perSource) != 0 {
+		t.Fatalf("after concurrent release: inflight=%d perSource=%v", l.inflight, l.perSource)
+	}
 }

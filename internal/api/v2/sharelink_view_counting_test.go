@@ -39,7 +39,6 @@ func TestShareLinkViewCountingCallSites(t *testing.T) {
 		"ListShareLinkDirents",
 		"GetShareLinkRepoTags",
 		"GetShareLinkZipTask",
-		"GetShareLinkUploadURL",
 		"PostShareLinkUploadDone",
 	}
 

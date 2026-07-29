@@ -43,7 +43,7 @@ func (m *countingTokenCreator) CreateUpdateToken(string, string, string, string)
 func (m *countingTokenCreator) CreateDownloadToken(string, string, string, string) (string, error) {
 	return "download-token", nil
 }
-func (m *countingTokenCreator) CreateLinkUploadToken(string, string, string, string) (string, error) {
+func (m *countingTokenCreator) CreateLinkUploadToken(string, string, string, string, string) (string, error) {
 	return "link-upload-token", nil
 }
 func (m *countingTokenCreator) CreateLinkDownloadToken(string, string, string, string) (string, error) {

@@ -27,6 +27,7 @@ type AccessToken struct {
 	Replace   bool   // Default overwrite behavior for upload tokens
 	UserID    string
 	Source    string // "" or "web" = regular user; "link" = share/upload link
+	SourceID  string // Stable non-secret identity for the originating public link
 	CreatedAt time.Time
 }
 
@@ -50,10 +51,10 @@ func NewTokenStore(db *DB, ttl time.Duration) *TokenStore {
 
 // CreateToken creates a new access token and stores it in Cassandra
 func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, userID, source string) (*AccessToken, error) {
-	return ts.createToken(tokenType, orgID, repoID, path, userID, source, false)
+	return ts.createToken(tokenType, orgID, repoID, path, userID, source, "", false)
 }
 
-func (ts *TokenStore) createToken(tokenType TokenType, orgID, repoID, path, userID, source string, replace bool) (*AccessToken, error) {
+func (ts *TokenStore) createToken(tokenType TokenType, orgID, repoID, path, userID, source, sourceID string, replace bool) (*AccessToken, error) {
 	// Generate random token
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
@@ -70,14 +71,15 @@ func (ts *TokenStore) createToken(tokenType TokenType, orgID, repoID, path, user
 		Replace:   replace,
 		UserID:    userID,
 		Source:    source,
+		SourceID:  sourceID,
 		CreatedAt: time.Now(),
 	}
 
 	// Insert with TTL for automatic expiration
 	// Note: "token" is quoted because it's a reserved keyword in CQL
 	ttlSeconds := int(ts.ttl.Seconds())
-	query := `INSERT INTO access_tokens ("token", token_type, org_id, repo_id, file_path, user_id, source, created_at, replace_existing)
-	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`
+	query := `INSERT INTO access_tokens ("token", token_type, org_id, repo_id, file_path, user_id, source, source_id, created_at, replace_existing)
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`
 
 	orgUUID, err := gocql.ParseUUID(orgID)
 	if err != nil {
@@ -102,6 +104,7 @@ func (ts *TokenStore) createToken(tokenType TokenType, orgID, repoID, path, user
 		path,
 		userUUID,
 		source,
+		sourceID,
 		token.CreatedAt,
 		replace,
 		ttlSeconds,
@@ -116,7 +119,7 @@ func (ts *TokenStore) createToken(tokenType TokenType, orgID, repoID, path, user
 
 // CreateUploadToken creates an upload token for a regular (web) user.
 func (ts *TokenStore) CreateUploadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := ts.createToken(TokenTypeUpload, orgID, repoID, path, userID, "", false)
+	token, err := ts.createToken(TokenTypeUpload, orgID, repoID, path, userID, "", "", false)
 	if err != nil {
 		return "", err
 	}
@@ -125,7 +128,7 @@ func (ts *TokenStore) CreateUploadToken(orgID, repoID, path, userID string) (str
 
 // CreateUpdateToken creates an upload token that overwrites the target path by default.
 func (ts *TokenStore) CreateUpdateToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := ts.createToken(TokenTypeUpload, orgID, repoID, path, userID, "", true)
+	token, err := ts.createToken(TokenTypeUpload, orgID, repoID, path, userID, "", "", true)
 	if err != nil {
 		return "", err
 	}
@@ -133,8 +136,8 @@ func (ts *TokenStore) CreateUpdateToken(orgID, repoID, path, userID string) (str
 }
 
 // CreateLinkUploadToken creates an upload token for a share/upload link — tagged as source="link".
-func (ts *TokenStore) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := ts.createToken(TokenTypeUpload, orgID, repoID, path, userID, "link", false)
+func (ts *TokenStore) CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
+	token, err := ts.createToken(TokenTypeUpload, orgID, repoID, path, userID, "link", sourceID, false)
 	if err != nil {
 		return "", err
 	}
@@ -170,15 +173,23 @@ func resolveReplaceDefault(tokenType TokenType, replaceExisting *bool) bool {
 	return tokenType == TokenTypeUpload
 }
 
+func resolveSourceID(sourceID *string) string {
+	if sourceID == nil {
+		return ""
+	}
+	return *sourceID
+}
+
 // GetToken retrieves and validates a token
 func (ts *TokenStore) GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool) {
-	query := `SELECT "token", token_type, org_id, repo_id, file_path, user_id, source, created_at, replace_existing
+	query := `SELECT "token", token_type, org_id, repo_id, file_path, user_id, source, source_id, created_at, replace_existing
 	          FROM access_tokens WHERE "token" = ?`
 
 	var token AccessToken
 	var tokenType string
 	var orgUUID, repoUUID, userUUID gocql.UUID
 	var replaceExisting *bool
+	var sourceID *string
 
 	err := ts.session.Query(query, tokenStr).Scan(
 		&token.Token,
@@ -188,6 +199,7 @@ func (ts *TokenStore) GetToken(tokenStr string, expectedType TokenType) (*Access
 		&token.Path,
 		&userUUID,
 		&token.Source,
+		&sourceID,
 		&token.CreatedAt,
 		&replaceExisting,
 	)
@@ -202,6 +214,7 @@ func (ts *TokenStore) GetToken(tokenStr string, expectedType TokenType) (*Access
 	token.RepoID = repoUUID.String()
 	token.UserID = userUUID.String()
 	token.Replace = resolveReplaceDefault(token.Type, replaceExisting)
+	token.SourceID = resolveSourceID(sourceID)
 
 	// Check type
 	if token.Type != expectedType {
@@ -222,7 +235,7 @@ type TokenCreator interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
-	CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
 }
 

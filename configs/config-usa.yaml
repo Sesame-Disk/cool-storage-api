@@ -251,26 +251,33 @@ seafhttp:
   # Override: SEAFHTTP_SYNC_BLOCK_MAX_BYTES
   # NOT an aggregate bound: N concurrent uploads still cost N x this value.
   sync_block_max_bytes: 16777216 # 16 MiB
-  # Per-IP-AND-token bound on ANONYMOUS writes through a public upload link (only
+  # Per-IP-and-stable-link bound on ANONYMOUS writes through a public upload link (only
   # tokens whose source is "link"; authenticated web uploads on the same endpoint
   # are untouched). Keyed on both so one uploader behind a NAT does not throttle
   # everyone else behind that address using a different link. 0 disables.
   # These are generous starting values, not measured ones: the failure mode of a
   # rate limit on a data path is a real person's upload dying, so tighten them
   # from upload_link_write_throttled_total rather than guessing downward.
-  # Behind an untrusted proxy, clients using the same token share the proxy-IP
-  # bucket; different tokens remain isolated. Limits are per node, not cluster-wide.
+  # Behind an untrusted proxy, clients using the same link share the proxy-IP
+  # bucket; different links remain isolated. Limits are per node, not cluster-wide.
   # Overrides: SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE, SEAFHTTP_UPLOAD_LINK_WRITE_BURST
   upload_link_writes_per_minute: 600
   upload_link_write_burst: 1200
 
-  # Per-node bound on writes against ONE upload token across all client IPs — the only
-  # bucket that sees a leaked upload URL hit from many addresses at once. Set far
+  # Process-local bound on writes against ONE stable public-link identity across
+  # all client IPs. The identity survives seafhttp token remints, so this bucket
+  # sees a leaked upload URL hit from many addresses at once. Set far
   # above the per-client bound because a shared link legitimately serves many
   # people at once. 0 disables.
-  # Overrides: SEAFHTTP_UPLOAD_LINK_TOKEN_WRITES_PER_MINUTE, SEAFHTTP_UPLOAD_LINK_TOKEN_WRITE_BURST
-  upload_link_token_writes_per_minute: 12000
-  upload_link_token_write_burst: 24000
+  # Overrides: SEAFHTTP_UPLOAD_LINK_SOURCE_WRITES_PER_MINUTE, SEAFHTTP_UPLOAD_LINK_SOURCE_WRITE_BURST
+  upload_link_source_writes_per_minute: 12000
+  upload_link_source_write_burst: 24000
+
+  # Process-local concurrency caps keyed by the same stable source; remints do
+  # not reset them. Fleet capacity scales with nodes. 0 disables either cap.
+  # Overrides: SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE, SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE
+  upload_link_max_inflight_per_source: 16
+  upload_link_max_inflight_per_node: 128
 
 cors:
   allowed_origins:

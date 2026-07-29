@@ -521,15 +521,26 @@ var (
 
 	// UploadLinkWriteThrottledTotal counts anonymous upload-link writes refused by
 	// the rate limiters. The reason distinguishes which bucket fired:
-	//   "client" — the (IP, token) bucket: one uploader going too fast
-	//   "token"  — the per-token bucket: one link being hit from many addresses
-	// Those call for opposite responses, so they must not be summed. The token
+	//   "client" — the (IP, stable source) bucket: one uploader going too fast
+	//   "source" — the per-link bucket: one link being hit from many addresses
+	// Those call for opposite responses, so they must not be summed. The bearer
 	// itself is never a label — it is a bearer credential and would be unbounded
 	// cardinality besides.
 	UploadLinkWriteThrottledTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "upload_link_write_throttled_total",
-			Help: "Total anonymous upload-link write requests throttled, by which bucket refused them.",
+			Help: "Total anonymous upload-link writes rejected by process-local stable-source rate budgets, by refusing bucket.",
+		},
+		[]string{"reason"},
+	)
+
+	// UploadLinkInflightRejectedTotal counts non-blocking concurrency admission
+	// failures. The fixed reason set ("source" or "node") deliberately excludes
+	// link, token, repository, client, and user identifiers.
+	UploadLinkInflightRejectedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "upload_link_inflight_rejected_total",
+			Help: "Total anonymous upload-link writes rejected by process-local per-source or per-node in-flight caps.",
 		},
 		[]string{"reason"},
 	)
@@ -587,5 +598,6 @@ func Register() {
 		SyncPutBlockBodyBytes,
 		SyncPutBlockRejectedTotal,
 		UploadLinkWriteThrottledTotal,
+		UploadLinkInflightRejectedTotal,
 	)
 }

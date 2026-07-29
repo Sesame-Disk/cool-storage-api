@@ -33,12 +33,14 @@ import (
 
 // ShareLinkViewHandler serves the public share link pages and APIs
 type ShareLinkViewHandler struct {
-	db             *db.DB
-	config         *config.Config
-	storage        *storage.S3Store
-	storageManager *storage.Manager
-	tokenCreator   TokenCreator
-	serverURL      string
+	db                 *db.DB
+	config             *config.Config
+	storage            *storage.S3Store
+	storageManager     *storage.Manager
+	tokenCreator       TokenCreator
+	serverURL          string
+	uploadLinkResolver func(string) (*uploadLinkData, error)
+	shareLinkResolver  func(string, bool) (*shareLinkData, error)
 }
 
 type pageBootstrapResponse struct {
@@ -573,6 +575,25 @@ type uploadLinkData struct {
 	active       bool
 	singleUse    bool
 	createdAt    time.Time
+}
+
+func publicLinkSourceID(linkType, token string) string {
+	sum := sha256.Sum256([]byte(linkType + "\x00" + token))
+	return hex.EncodeToString(sum[:])
+}
+
+func (h *ShareLinkViewHandler) loadUploadLink(token string) (*uploadLinkData, error) {
+	if h.uploadLinkResolver != nil {
+		return h.uploadLinkResolver(token)
+	}
+	return h.resolveUploadLink(token)
+}
+
+func (h *ShareLinkViewHandler) loadShareLink(token string, countView bool) (*shareLinkData, error) {
+	if h.shareLinkResolver != nil {
+		return h.shareLinkResolver(token, countView)
+	}
+	return h.resolveShareLink(token, countView)
 }
 
 func (h *ShareLinkViewHandler) resolveUploadLink(token string) (*uploadLinkData, error) {
@@ -1539,7 +1560,7 @@ func (h *ShareLinkViewHandler) ServeUploadLinkPage(c *gin.Context) {
 func (h *ShareLinkViewHandler) GetUploadLinkBootstrap(c *gin.Context) {
 	token := c.Param("token")
 
-	ul, err := h.resolveUploadLink(token)
+	ul, err := h.loadUploadLink(token)
 	if err != nil {
 		respondUploadLinkUnavailable(c)
 		return
@@ -1580,7 +1601,7 @@ func (h *ShareLinkViewHandler) GetUploadLinkBootstrap(c *gin.Context) {
 func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 	token := c.Param("token")
 
-	ul, err := h.resolveUploadLink(token)
+	ul, err := h.loadUploadLink(token)
 	if err != nil {
 		respondUploadLinkUnavailable(c)
 		return
@@ -1597,7 +1618,7 @@ func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 
 	// Generate an upload URL using the seafhttp upload mechanism
 	// Create a token that the file-upload handler will accept
-	uploadToken, err := h.tokenCreator.CreateLinkUploadToken(ul.orgID, ul.libraryID, ul.filePath, ul.createdBy)
+	uploadToken, err := h.tokenCreator.CreateLinkUploadToken(ul.orgID, ul.libraryID, ul.filePath, ul.createdBy, publicLinkSourceID("upload-link", token))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate upload URL"})
 		return
@@ -1650,7 +1671,7 @@ func (h *ShareLinkViewHandler) GetShareLinkUploadURL(c *gin.Context) {
 	token := c.Param("token")
 	path := c.DefaultQuery("path", "/")
 
-	sl, err := h.resolveShareLink(token, false)
+	sl, err := h.loadShareLink(token, false)
 	if err != nil {
 		respondShareLinkUnavailable(c)
 		return
@@ -1681,7 +1702,7 @@ func (h *ShareLinkViewHandler) GetShareLinkUploadURL(c *gin.Context) {
 
 	// Generate an upload URL using the seafhttp upload mechanism
 	// Create a token that the file-upload handler will accept
-	uploadToken, err := h.tokenCreator.CreateLinkUploadToken(sl.orgID, sl.libraryID, fullPath, sl.createdBy)
+	uploadToken, err := h.tokenCreator.CreateLinkUploadToken(sl.orgID, sl.libraryID, fullPath, sl.createdBy, publicLinkSourceID("share-link", token))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate upload URL"})
 		return

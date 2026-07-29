@@ -63,7 +63,7 @@ the open single-node blocker**, and multi-instance adds B1 and B5. See
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1 closed** (anonymous upload-link request rate bounded, client backoff added), **A2 open** (in-flight concurrency), **B reduced** (block cap 257→16 MiB; aggregate bound still missing), **C/D open** | Readiness B4 ⊇ registry X10 — **still the single-node blocker until all close** |
+| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed** for admission to permission/body/storage work after valid link-token resolution (stable-link rate budgets plus process-local per-source `16` / per-node `128` in-flight defaults); token lookup and arbitrary invalid-token traffic are outside these guards. **B reduced** (block cap 257→16 MiB; aggregate bound still missing), **C/D open** | Readiness B4 ⊇ registry X10 — **still the single-node blocker until B/C/D close** |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
 
