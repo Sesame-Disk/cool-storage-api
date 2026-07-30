@@ -14,6 +14,7 @@ import UploadProgressDialog from './upload-progress-dialog';
 import UploadRemindDialog from '../dialog/upload-remind-dialog';
 import toaster from '../toast';
 import { isAbortError, shouldUseBlockUpload, uploadFileViaBlocks, BLOCK_SIZE } from './block-upload-orchestrator';
+import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, clearChunkThrottleState, noteUploadRetry } from './upload-throttle-backoff';
 import '../../css/file-uploader.css';
 
 const propTypes = {
@@ -187,7 +188,8 @@ class FileUploader extends React.Component {
       fileParameterName: this.props.fileParameterName,
       generateUniqueIdentifier: this.generateUniqueIdentifier,
       forceChunkSize: true,
-      maxChunkRetries: 3,
+      maxChunkRetries: BASE_MAX_CHUNK_RETRIES,
+      throttledMaxChunkRetries: THROTTLED_MAX_CHUNK_RETRIES,
       minFileSize: 0,
     });
 
@@ -381,6 +383,7 @@ class FileUploader extends React.Component {
     this.resumable.on('complete', this.onComplete.bind(this));
     this.resumable.on('pause', this.onPause.bind(this));
     this.resumable.on('fileRetry', this.onFileRetry.bind(this));
+    this.resumable.on('fileChunkSuccess', (resumableFile, chunk) => clearChunkThrottleState(resumableFile, chunk));
     this.resumable.on('fileError', this.onFileError.bind(this));
     this.resumable.on('error', this.onError.bind(this));
     this.resumable.on('beforeCancel', this.onBeforeCancel.bind(this));
@@ -1759,8 +1762,12 @@ class FileUploader extends React.Component {
     }
   };
 
-  onFileRetry = () => {
+  onFileRetry = (resumableFile, chunk, retryInfo) => {
     noteAdaptiveUploadRetry(this.resumable);
+    // Same backoff as the upload-link page. The anonymous limiter cannot refuse
+    // an authenticated web upload, but any 429 reaching resumable.js has the
+    // same destructive retry behaviour, so the policy belongs on both.
+    noteUploadRetry(this.resumable, resumableFile, chunk, retryInfo);
   };
 
   onBeforeCancel = () => {

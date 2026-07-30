@@ -10,6 +10,7 @@ import { clearFileUploadRuntimeState, consumeSuppressedUploadErrorToast, getBase
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadNavigationGuard from '../../utils/upload-navigation-guard';
+import { BASE_MAX_CHUNK_RETRIES, THROTTLED_MAX_CHUNK_RETRIES, clearChunkThrottleState, clearThrottleState, noteUploadRetry } from '../../components/file-uploader/upload-throttle-backoff';
 import UploadProgressDialog from './upload-progress-dialog';
 import toaster from '../../components/toast';
 
@@ -80,7 +81,8 @@ class FileUploader extends React.Component {
       fileParameterName: this.props.fileParameterName,
       generateUniqueIdentifier: this.generateUniqueIdentifier,
       forceChunkSize: true,
-      maxChunkRetries: 3,
+      maxChunkRetries: BASE_MAX_CHUNK_RETRIES,
+      throttledMaxChunkRetries: THROTTLED_MAX_CHUNK_RETRIES,
       minFileSize: 0,
     });
 
@@ -147,6 +149,7 @@ class FileUploader extends React.Component {
     this.resumable.on('fileSuccess', this.onFileUploadSuccess.bind(this));
     this.resumable.on('fileError', this.onFileError.bind(this));
     this.resumable.on('fileRetry', this.onFileRetry.bind(this));
+    this.resumable.on('fileChunkSuccess', this.onChunkUploadSuccess.bind(this));
     this.resumable.on('uploadStart', this.onUploadStart.bind(this));
     this.resumable.on('progress', this.onProgress.bind(this));
     this.resumable.on('complete', this.onComplete.bind(this));
@@ -363,6 +366,7 @@ class FileUploader extends React.Component {
   };
 
   onFileUploadSuccess = (resumableFile, message) => {
+    clearThrottleState(resumableFile);
     let formData = resumableFile.formData;
     let currentTime = new Date().getTime() / 1000;
 
@@ -430,6 +434,7 @@ class FileUploader extends React.Component {
   };
 
   onFileError = (resumableFile, message) => {
+    clearThrottleState(resumableFile);
     if (shouldAutoRetryUploadConflict(resumableFile, message)) {
       markUploadConflictAutoRetry(resumableFile);
       this.retryUploadWithFreshLink(resumableFile, { resetAutoRetry: false });
@@ -664,8 +669,24 @@ class FileUploader extends React.Component {
     this.restoreConcurrencyIfIdle();
   };
 
-  onFileRetry = () => {
+  onFileRetry = (resumableFile, chunk, retryInfo) => {
     noteAdaptiveUploadRetry(this.resumable);
+    // A 429 here is the server asking us to slow down, not a failure. Space the
+    // retry out (honouring Retry-After) and raise the retry ceiling, otherwise
+    // resumable.js burns its three immediate attempts against a bucket that
+    // refills a couple of times a second and gives up on the file.
+    if (noteUploadRetry(this.resumable, resumableFile, chunk, retryInfo)) {
+      // No progress events arrive while waiting, so nudge a render to show it.
+      this.setState((prevState) => ({
+        uploadFileList: [...prevState.uploadFileList],
+      }));
+    }
+  };
+
+  onChunkUploadSuccess = (resumableFile, chunk) => {
+    if (clearChunkThrottleState(resumableFile, chunk)) {
+      this.setState((prevState) => ({ uploadFileList: [...prevState.uploadFileList] }));
+    }
   };
 
   retryUploadFile = (resumableFile) => {

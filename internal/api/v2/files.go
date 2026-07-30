@@ -36,7 +36,7 @@ type TokenCreator interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
-	CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
 }
 

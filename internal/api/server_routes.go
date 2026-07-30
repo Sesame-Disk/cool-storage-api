@@ -357,6 +357,8 @@ func (s *Server) registerCompatibilityRoutes(serverURL string) {
 	v2.RegisterFileViewRoutes(s.router, s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL, s.authMiddleware(), s.permMiddleware)
 
 	seafHTTPHandler := NewSeafHTTPHandler(s.storage, s.storageManager, s.db, s.tokenStore, s.config, s.permMiddleware)
+	// Held so Shutdown can stop the limiter cleanup goroutines it owns.
+	s.seafHTTPHandler = seafHTTPHandler
 	seafHTTPHandler.SetZipLimits(s.config.SeafHTTP.ZipMaxEntries, s.config.SeafHTTP.ZipMaxDepth, s.config.SeafHTTP.ZipMaxBytes)
 	if s.zipRateLimiter != nil {
 		seafHTTPHandler.RegisterSeafHTTPRoutes(s.router, s.zipRateLimiter.Limit())

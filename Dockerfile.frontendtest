@@ -4,6 +4,7 @@ WORKDIR /app
 ENV CI=true
 
 COPY frontend/package*.json ./
+COPY frontend/scripts/patch-resumablejs.js ./scripts/patch-resumablejs.js
 RUN npm ci --legacy-peer-deps
 
 COPY frontend/ ./

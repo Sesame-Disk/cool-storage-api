@@ -518,6 +518,51 @@ var (
 		},
 		[]string{"reason"},
 	)
+
+	// UploadLinkWriteThrottledTotal counts anonymous upload-link writes refused by
+	// the rate limiters. The reason distinguishes which bucket fired:
+	//   "client" — the (IP, stable source) bucket: one uploader going too fast
+	//   "source" — the per-link bucket: one link being hit from many addresses
+	// Those call for opposite responses, so they must not be summed. The bearer
+	// itself is never a label — it is a bearer credential and would be unbounded
+	// cardinality besides.
+	UploadLinkWriteThrottledTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "upload_link_write_throttled_total",
+			Help: "Total anonymous upload-link writes rejected by process-local stable-source rate budgets, by refusing bucket.",
+		},
+		[]string{"reason"},
+	)
+
+	// UploadLinkInflightRejectedTotal counts non-blocking concurrency admission
+	// failures. The fixed reason set ("source" or "node") deliberately excludes
+	// link, token, repository, client, and user identifiers.
+	UploadLinkInflightRejectedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "upload_link_inflight_rejected_total",
+			Help: "Total anonymous upload-link writes rejected by process-local per-source or per-node in-flight caps.",
+		},
+		[]string{"reason"},
+	)
+
+	// UploadLinkInflightCurrent reports active anonymous upload-link writes in
+	// this process. It intentionally has no labels.
+	UploadLinkInflightCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "upload_link_inflight_current",
+			Help: "Current anonymous upload-link writes admitted in this process.",
+		},
+	)
+
+	// UploadLinkSourceInflightOccupancy samples the admitted source's occupancy
+	// without exposing source identities as labels.
+	UploadLinkSourceInflightOccupancy = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "upload_link_source_inflight_occupancy",
+			Help:    "Per-source in-flight occupancy observed when an anonymous upload-link write is admitted.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 13),
+		},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -571,5 +616,9 @@ func Register() {
 		BlockUploadMaterializationRetriesTotal,
 		SyncPutBlockBodyBytes,
 		SyncPutBlockRejectedTotal,
+		UploadLinkWriteThrottledTotal,
+		UploadLinkInflightRejectedTotal,
+		UploadLinkInflightCurrent,
+		UploadLinkSourceInflightOccupancy,
 	)
 }

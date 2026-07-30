@@ -4,6 +4,7 @@ FROM node:22-bookworm AS builder
 WORKDIR /app
 
 COPY package*.json ./
+COPY scripts/patch-resumablejs.js ./scripts/patch-resumablejs.js
 RUN npm ci --legacy-peer-deps
 
 COPY . .

@@ -27,8 +27,8 @@ func (a *CassandraTokenAdapter) CreateUpdateToken(orgID, repoID, path, userID st
 }
 
 // CreateLinkUploadToken creates an upload token tagged as a share/upload link.
-func (a *CassandraTokenAdapter) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
-	return a.store.CreateLinkUploadToken(orgID, repoID, path, userID)
+func (a *CassandraTokenAdapter) CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
+	return a.store.CreateLinkUploadToken(orgID, repoID, path, userID, sourceID)
 }
 
 // CreateDownloadToken creates a download token
@@ -52,6 +52,10 @@ func (a *CassandraTokenAdapter) GetToken(tokenStr string, expectedType TokenType
 	}
 
 	// Convert db.AccessToken to api.AccessToken
+	return adaptDBAccessToken(dbToken), true
+}
+
+func adaptDBAccessToken(dbToken *db.AccessToken) *AccessToken {
 	return &AccessToken{
 		Token:     dbToken.Token,
 		Type:      TokenType(dbToken.Type),
@@ -61,8 +65,9 @@ func (a *CassandraTokenAdapter) GetToken(tokenStr string, expectedType TokenType
 		Replace:   dbToken.Replace,
 		UserID:    dbToken.UserID,
 		Source:    dbToken.Source,
+		SourceID:  dbToken.SourceID,
 		CreatedAt: dbToken.CreatedAt,
-	}, true
+	}
 }
 
 // DeleteToken removes a token

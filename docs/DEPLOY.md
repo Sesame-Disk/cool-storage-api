@@ -754,6 +754,40 @@ docker compose -f docker-compose.prod.yml up -d frontend
 
 Do not use `--build` for the normal prod path. The production compose consumes published images, not local Docker builds.
 
+### Stable upload-link source IDs on a clean deployment (migration 013)
+
+SesameFS currently supports this schema contract for greenfield deployments
+only. Apply all Cassandra migrations before serving traffic, and verify
+`schema_migrations` contains version 13 and `access_tokens` exposes `source_id`.
+Do not start the application against a schema where migration 013 has not
+completed.
+
+Every newly minted public-link upload token must carry a non-empty, stable,
+non-secret source ID. Token writers reject a blank source ID, and `HandleUpload`
+fails closed if a link-origin token without one is read. There is no rolling or
+legacy-token fallback. Reminting a short-lived seafhttp URL preserves the exact
+source ID, so it does not reset the A1 attempt-rate keys or A2 in-flight source
+key on that node.
+
+The live Cassandra integration test
+`TestAccessTokenSourceIDPersistsAcrossLinkUploadTokenRemints` verifies that
+migration 013 installed the column, two distinct remints read back the exact same
+source ID, and the Cassandra token writer rejects a blank source ID.
+
+The upload-link rate buckets and concurrency counters remain process-local. They
+bound admission to permission, body and storage work only after a valid token has
+resolved as link-origin; they are not a total request-rate guard for the endpoint.
+Rate admission reserves the stable source before creating or consulting the
+per-client (IP, source) key. Once a link's source budget is exhausted, requests
+from attacker-controlled IPs therefore cannot grow the per-client limiter's
+retained key cardinality. If the later per-client check rejects, only the source
+reservation is rolled back; successful A1 admissions remain consumed even when
+the subsequent A2 in-flight guard rejects.
+Token lookup occurs first because `Source` is not known beforehand, so arbitrary
+invalid-token requests remain outside these guards and Cassandra token lookup is
+not protected by A1. The guards protect later node capacity, not a cluster-global
+quota; aggregate fleet admission can scale with node count.
+
 ### Upgrading GC to the library guard-mode build (migration 011) — stop-the-world
 
 > **Not applicable to a greenfield deploy.** This procedure exists for clusters that already ran
@@ -919,6 +953,12 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `SERVER_URL` | — (runtime env) | Optional explicit fallback for absolute links and relay metadata. Leave unset to use the current request host. |
 | `ONLYOFFICE_API_JS_URL` | `onlyoffice.api_js_url` | Public OnlyOffice JS loader URL. |
 | `SEAFHTTP_SYNC_BLOCK_MAX_BYTES` | `seafhttp.sync_block_max_bytes` | Per-request body cap for the desktop-sync block PUT route. Default `16777216` (16 MiB). Must be `1`–`67108864`; **zero is rejected**, it does not mean unlimited. |
+| `SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE` | `seafhttp.upload_link_writes_per_minute` | Anonymous upload-link writes allowed per (client IP, stable public-link identity), per process. Default `600`. `0` disables. Seafhttp token remints share this budget. Behind an untrusted proxy, clients using the same link share the proxy-IP bucket; different links remain isolated. |
+| `SEAFHTTP_UPLOAD_LINK_WRITE_BURST` | `seafhttp.upload_link_write_burst` | Burst for the above. Default `1200`. Must be `> 0` while the rate is non-zero. |
+| `SEAFHTTP_UPLOAD_LINK_SOURCE_WRITES_PER_MINUTE` | `seafhttp.upload_link_source_writes_per_minute` | Writes allowed against one stable public-link identity across all IPs on one node. Default `12000`. `0` disables; aggregate fleet capacity scales with the number of nodes. |
+| `SEAFHTTP_UPLOAD_LINK_SOURCE_WRITE_BURST` | `seafhttp.upload_link_source_write_burst` | Burst for the per-link bound. Default `24000`. Must be `> 0` while that rate is non-zero. |
+| `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE` | `seafhttp.upload_link_max_inflight_per_source` | Non-blocking concurrent anonymous-write cap per stable public-link identity on one process. Default `16`; ceiling `4096`; `0` disables. Remints share the same source count. When both in-flight caps are enabled, this value must not exceed the per-node value. |
+| `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE` | `seafhttp.upload_link_max_inflight_per_node` | Non-blocking concurrent anonymous-write cap across one process/node. Default `128`; ceiling `65536`; `0` disables. This is not cluster-global; aggregate fleet capacity scales with node count. |
 | `METRICS_ENABLED` | `monitoring.metrics_enabled` | |
 | `DESKTOP_CUSTOM_BRAND` | — (server-info response) | Brand name shown in desktop client (default: `Sesame Disk`) |
 | `DESKTOP_CUSTOM_LOGO` | — (server-info response) | Full URL to logo image shown in desktop client (optional) |

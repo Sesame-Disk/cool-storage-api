@@ -11,7 +11,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// visitor tracks a rate limiter and last-seen time for a single IP.
+// visitor tracks a rate limiter and last-seen time for a single key.
 type visitor struct {
 	limiter  *rate.Limiter
 	lastSeen time.Time
@@ -25,6 +25,19 @@ type RateLimiter struct {
 	burst    int
 	done     chan struct{}
 	stopOnce sync.Once
+}
+
+// RateReservation is one immediate token-bucket admission. Cancel restores the
+// token when a later guard rejects the same request. A nil inner reservation
+// represents a disabled limiter and is intentionally a no-op.
+type RateReservation struct {
+	reservation *rate.Reservation
+}
+
+func (r *RateReservation) CancelAt(now time.Time) {
+	if r != nil && r.reservation != nil {
+		r.reservation.CancelAt(now)
+	}
 }
 
 // NewRateLimiter creates a per-IP rate limiter.
@@ -44,17 +57,8 @@ func NewRateLimiter(r rate.Limit, burst int) *RateLimiter {
 // Limit returns a Gin middleware that rejects requests over the rate limit with 429.
 func (rl *RateLimiter) Limit() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ip := c.ClientIP()
-		limiter := rl.getVisitor(ip)
-		if !limiter.Allow() {
-			retryAfter := time.Second
-			if rl.rate > 0 {
-				retryAfter = time.Duration(float64(time.Second) / float64(rl.rate))
-				if retryAfter < time.Second {
-					retryAfter = time.Second
-				}
-			}
-			c.Header("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
+		if !rl.Allow(c.ClientIP()) {
+			c.Header("Retry-After", strconv.Itoa(rl.RetryAfterSeconds()))
 			c.JSON(http.StatusTooManyRequests, gin.H{
 				"error": "too many requests, please try again later",
 			})
@@ -65,14 +69,76 @@ func (rl *RateLimiter) Limit() gin.HandlerFunc {
 	}
 }
 
-func (rl *RateLimiter) getVisitor(ip string) *rate.Limiter {
+// Allow consumes a token for key and reports whether the request may proceed.
+//
+// It exists for callers that cannot use Limit() as route middleware because the
+// decision depends on something only the handler knows — the upload endpoint,
+// for instance, must throttle anonymous link tokens while leaving authenticated
+// web uploads on the same route untouched. Those callers own the response, and
+// choose their own key: Limit() keys on the client IP, but a caller that must
+// isolate two clients sharing one NAT address can key on more than that.
+//
+// A nil receiver allows the request, so a disabled limiter is expressed by
+// holding no limiter at all rather than by branching at every call site.
+func (rl *RateLimiter) Allow(key string) bool {
+	return rl.TryReserve(key, time.Now()) != nil
+}
+
+// TryReserve consumes one token only when it is available immediately. The
+// returned reservation can be cancelled if another limiter in the same
+// admission decision rejects the request.
+func (rl *RateLimiter) TryReserve(key string, now time.Time) *RateReservation {
+	if rl == nil {
+		return &RateReservation{}
+	}
+	reservation := rl.getVisitor(key).ReserveN(now, 1)
+	if !reservation.OK() {
+		return nil
+	}
+	if reservation.DelayFrom(now) > 0 {
+		reservation.CancelAt(now)
+		return nil
+	}
+	return &RateReservation{reservation: reservation}
+}
+
+// RetryAfterSeconds is the whole-second Retry-After value implied by the
+// configured refill rate, floored at 1 — a `Retry-After: 0` invites the
+// immediate retry the header exists to prevent.
+//
+// It is exported because a caller using Allow() writes its own 429 and must be
+// able to answer with the same delay Limit() would have, without duplicating
+// the arithmetic or reaching for the unexported rate.
+func (rl *RateLimiter) RetryAfterSeconds() int {
+	retryAfter := time.Second
+	if rl != nil && rl.rate > 0 {
+		retryAfter = time.Duration(float64(time.Second) / float64(rl.rate))
+		if retryAfter < time.Second {
+			retryAfter = time.Second
+		}
+	}
+	return int(math.Ceil(retryAfter.Seconds()))
+}
+
+// TrackedKeyCount returns the number of keys currently retained by the limiter.
+// It is nil-safe so optional limiters can be inspected without branching.
+func (rl *RateLimiter) TrackedKeyCount() int {
+	if rl == nil {
+		return 0
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return len(rl.visitors)
+}
+
+func (rl *RateLimiter) getVisitor(key string) *rate.Limiter {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	v, exists := rl.visitors[ip]
+	v, exists := rl.visitors[key]
 	if !exists {
 		limiter := rate.NewLimiter(rl.rate, rl.burst)
-		rl.visitors[ip] = &visitor{limiter: limiter, lastSeen: time.Now()}
+		rl.visitors[key] = &visitor{limiter: limiter, lastSeen: time.Now()}
 		return limiter
 	}
 	v.lastSeen = time.Now()
@@ -99,8 +165,12 @@ func (rl *RateLimiter) cleanupLoop() {
 	}
 }
 
-// Stop shuts down the background cleanup goroutine.
+// Stop shuts down the background cleanup goroutine. Nil-safe, matching Allow, so
+// a caller holding an optional limiter can stop it unconditionally.
 func (rl *RateLimiter) Stop() {
+	if rl == nil {
+		return
+	}
 	rl.stopOnce.Do(func() {
 		close(rl.done)
 	})

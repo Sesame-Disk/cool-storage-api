@@ -29,3 +29,27 @@ func TestResolveReplaceDefault(t *testing.T) {
 		}
 	})
 }
+
+func TestResolveSourceID(t *testing.T) {
+	t.Run("legacy token without source ID", func(t *testing.T) {
+		if got := resolveSourceID(nil); got != "" {
+			t.Fatalf("resolveSourceID(nil) = %q, want empty", got)
+		}
+	})
+
+	t.Run("persisted source ID", func(t *testing.T) {
+		sourceID := "sha256:stable-link-id"
+		if got := resolveSourceID(&sourceID); got != sourceID {
+			t.Fatalf("resolveSourceID() = %q, want %q", got, sourceID)
+		}
+	})
+}
+
+func TestTokenStoreCreateLinkUploadTokenRejectsBlankSourceID(t *testing.T) {
+	store := &TokenStore{}
+	for _, sourceID := range []string{"", " ", "\t\r\n"} {
+		if _, err := store.CreateLinkUploadToken("org", "repo", "/", "user", sourceID); err == nil {
+			t.Fatalf("CreateLinkUploadToken(%q) succeeded, want error", sourceID)
+		}
+	}
+}

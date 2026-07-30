@@ -19,7 +19,7 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | No rate or concurrency limit on the seafhttp upload, download and block routes. Umbrella with four closable subcontracts — see ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (B4; X10 is subcontract B). |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: anonymous upload-link guards A1/A2 are closed, while authenticated block PUT (B), check-blocks (C), and download/GET (D) remain open. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (X10 is subcontract B). |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
@@ -5045,9 +5045,9 @@ narrows the window without closing it.
 
 ---
 
-### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: No rate or concurrency limit on the seafhttp upload/download/block surfaces
+### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **B reduced 2026-07-28** (per-request cap right-sized; the aggregate bound that actually closes it is still missing); **A, C and D open**. The umbrella does not close until all four do.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1 and A2 closed 2026-07-29** (anonymous upload-link admission to permission/body/storage work is rate- and concurrency-bounded on each process after valid token resolution); **B reduced** (per-request cap right-sized; the aggregate bound that actually closes it is still missing); **C and D open**. Closing A does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5060,11 +5060,11 @@ not identical in scope — B4 covers the full seafhttp abuse surface; X10 focuse
 on authenticated block PUT concurrency / aggregate memory after PR-10's
 per-request body cap.
 
-Verified state of the router (2026-07-25):
+Current guard state (2026-07-29; the other rows retain the 2026-07-25 verification):
 
 | Surface | Limiter |
 |---|---|
-| `/seafhttp/upload-api/:token` | **none** |
+| `/seafhttp/upload-api/:token` | After a valid token resolves as link-origin, admission to permission/body/storage work has stable-source rate budgets and non-blocking per-source/per-node in-flight caps; token lookup and arbitrary invalid-token traffic are outside these guards |
 | `/seafhttp/files/:token/*filepath` | **none** |
 | `/seafhttp/repo/:repo_id/block/:block_id` (PUT/GET) | **none** — group carries only `authMiddleware` |
 | `/seafhttp/repo/:repo_id/check-blocks` | **none** |
@@ -5090,22 +5090,148 @@ own fix + regression.
 
 | ID | Surface | Status | Close when | Notes |
 |---|---|---|---|---|
-| **A** | Anonymous / token seafhttp **upload** (`HandleUpload` / upload-api) | 🔴 Open | Per-IP (or per-token) rate **and** concurrency limit on the write path that upload-links hand off to | SH-1 residual; routes already have `slRL`, the handoff does not |
-| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Reduced, still open** | Aggregate bound on concurrent in-flight block readers | Per-request cap right-sized 257 MiB → 16 MiB (16× less RAM per request), but N concurrent uploads still cost N × the cap. The aggregate bound is what closes it |
+| **A1** | Anonymous upload **post-token attempt rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-29** | — | Initial guard landed 2026-07-28; stable remint identity and the final fail-closed contract completed A1 on 2026-07-29. Per-(IP, stable link identity) and per-link limiters run after valid token resolution; see "Subcontract A" below |
+| **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
+| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Reduced, still open** | Aggregate bound on concurrent in-flight block readers | Per-request cap right-sized 257 MiB → 16 MiB (the buffered-body bound drops approximately 16×), but N concurrent uploads still cost N × the cap. The aggregate bound is what closes it |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | 🔴 Open | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
 | **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
+
+#### Subcontract A: stable-link request and concurrency admission (A1/A2 closed 2026-07-29)
+
+`HandleUpload` consults `allowUploadLinkWrite` immediately after the token
+resolves, before the permission lookup, the body read and any storage work. Over
+budget it answers **429 with `Retry-After`**, which is appropriate here because
+this is browser traffic — the sync protocol is a different route with a client
+that does *not* treat 429 as retryable.
+
+This is deliberately not a total endpoint request-rate guard. `Source` is not
+known until token resolution completes, so the token-store lookup occurs first.
+Arbitrary invalid-token requests never reach A1/A2 and remain outside these
+guards; A1 therefore makes no claim to protect Cassandra token lookups. It stays
+closed under the narrower subcontract of bounding admission to the subsequent
+permission, body and storage work for valid link-origin tokens.
+
+**The gate keys on `AccessToken.Source == "link"`, not on the route, and that
+distinction is the whole design.** `/seafhttp/upload-api/:token` serves *both* the
+anonymous upload-link flow and authenticated web uploads. A limiter installed as
+route middleware — the obvious implementation — would have throttled ordinary
+signed-in users, and a test asserting only "link tokens get 429" would not have
+noticed. The regression asserts the negative too: with the bucket exhausted,
+`Source` of `""` and `"web"` still pass. Mutation-verified.
+
+**Two buckets, because one address is not one user.**
+
+| Bucket | Key | What only it can see |
+|---|---|---|
+| per-client | (client IP, stable public-link identity), per node | one uploader going too fast |
+| per-link | stable public-link identity, all IPs on one node | one leaked upload URL hit from many addresses or repeatedly reminted |
+
+Keyed on IP alone, one person uploading through one link would throttle every
+colleague behind the same NAT using a *different* link — the limiter would cause
+the outage it exists to prevent. That isolation is its own regression, also
+mutation-verified. Both buckets survive seafhttp token remints because every
+newly written short-lived link credential carries a non-empty, stable, non-secret
+identity derived from the public link bearer at mint time. Writers reject a
+blank `SourceID`, and `HandleUpload` fails closed if one is nevertheless read.
+This is a greenfield contract with no legacy-token fallback. The live Cassandra
+integration test verifies the migration 013 column, two distinct remints
+preserving the exact `SourceID`, and blank writer rejection.
+
+The two A1 buckets form one attempt-rate decision: the stable-source token is
+reserved first. If that bucket rejects, the request returns 429 without touching
+the per-client map, so traffic for an exhausted leaked link cannot grow retained
+state with attacker-controlled IP keys. If the later per-client bucket rejects,
+only the accepted source reservation is cancelled. Once both A1 reservations
+succeed they remain consumed even if A2 subsequently rejects the request with
+429; A1 is not an accepted-heavy-work-only accounting scheme.
+
+**The client had to be fixed for the server bound to be safe at all.**
+`@seafile/resumablejs` does not list 429 in `permanentErrors`, so it retries —
+but with `chunkRetryInterval` unset it retries *immediately*, and those attempts
+count against `maxChunkRetries: 3`. Four attempts inside a few milliseconds
+against a bucket that refills a couple of times a second means the file is
+reported permanently failed. A limiter meant to slow an upload down would instead
+kill it. The pinned library is patched at install time to capture status and
+`Retry-After` before it clears the XHR, pass them with the triggering chunk to
+`fileRetry`, and make its delayed-retry timer cancelable. The application waits
+for `max(Retry-After, capped exponential backoff)`: its exponential interval caps
+at 16 seconds, jitter is one-sided when the server supplied the floor, and the
+per-chunk throttled retry ceiling is 30. A behavioral test drives 13 consecutive
+429 responses and then a success. All three anonymous-capable uploaders are wired
+to it (upload-link page, shared-link uploader, main uploader).
+
+Two details there are load-bearing and were not obvious:
+
+- **Retry policy is per chunk, not per uploader instance.** Instance options are
+  shared by every concurrent chunk, so one network retry could otherwise erase
+  another chunk's throttling policy. The patch also gives 429 its own retry
+  ceiling inside `status()`, where the library decides whether to emit the event;
+  this keeps a late first 429 observable even after ordinary retries.
+- **Delayed retries are cancelable.** The upstream library did not retain its
+  timeout handle, so canceling a file during backoff could still send it later.
+  The patch stores and clears that timer from the chunk's existing abort path.
+- **Jitter is one-sided when the server named a time.** `Retry-After` is a floor,
+  not an estimate. Symmetric jitter would sometimes retry before the bucket the
+  server just described as empty had refilled. Around our own exponential guess
+  there is no such floor, so jitter goes both ways there.
+
+**Attribution and capacity depend on deployment.** The rate buckets and in-flight
+counters are process-local node-capacity guards, not cluster-global quotas, so
+aggregate fleet admission can approach the configured values multiplied by the
+number of nodes. `ClientIP()` is only the real client when
+`server.trusted_proxies` names the proxy in front of Go. Left unset behind a
+proxy, clients using the same public link are attributed to the proxy IP and
+share one per-client bucket; different links remain isolated. The server warns
+rather than failing because running with no proxy is legitimate.
+
+Config: `seafhttp.upload_link_writes_per_minute` (600) / `upload_link_write_burst`
+(1200), `upload_link_source_writes_per_minute` (12000) /
+`upload_link_source_write_burst` (24000), each with a `SEAFHTTP_*` env override;
+`0` disables either bucket. The values are deliberately generous starting points,
+not measured ones — the failure mode of a rate limit on a data path is a real
+person's upload dying, so they should be tightened from
+`upload_link_write_throttled_total{reason}` rather than guessed downward.
+`Validate()` rejects a live rate with a zero burst (a bucket with no capacity
+refuses everything) but does *not* require the burst to exceed the rate: those
+are independent dimensions of a token bucket.
+
+Prometheus exposes `upload_link_write_throttled_total{reason}` for A1 rejection,
+plus `upload_link_inflight_rejected_total{reason}`,
+`upload_link_inflight_current`, and
+`upload_link_source_inflight_occupancy`. The latter two report current node
+in-flight work and sampled per-source occupancy respectively; the occupancy
+histogram deliberately has no source label.
+
+**A2 closes the simultaneous-work gap.** `HandleUpload` acquires a non-blocking
+slot after token and rate admission but before permission checks, multipart/body
+reads, staging, or storage. The built-in and shipped defaults are `16` concurrent
+writes per stable source and `128` across the node; either cap can be disabled
+independently with `0`. The source key survives seafhttp token remints, so minting
+a new short-lived upload URL does not reset either A1 or A2 on that node. A
+rejection is `429` with `Retry-After`, and a deferred idempotent release covers
+all admitted exits.
+
+The A2 keys are `seafhttp.upload_link_max_inflight_per_source` and
+`seafhttp.upload_link_max_inflight_per_node`, with env overrides
+`SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE` and
+`SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE`. Validation ceilings are `4096` per
+source and `65536` per node; when both caps are enabled, the per-source cap must
+not exceed the per-node cap. Like A1, these counters are process-local: adding
+nodes increases aggregate fleet capacity. This closes subcontract A only; the
+pre-token lookup and process-local residuals remain, and B, C, and D remain open,
+so the B4 umbrella remains a production blocker.
 
 #### Subcontract B: what the right-sized cap does and does not do (2026-07-28)
 
 The old 257 MiB bound came from the **wrong domain**: it was derived from
 `chunking.adaptive.absolute_max` (the web uploader's 256 MiB chunk ceiling),
 which never governed this route — and the adaptive chunker has no production
-caller at all. This route is fed by desktop sync, where SesameFS splits at 8 MiB
-(`uploadBlockSize`, matching Seafile's default CDC block; the official client's
-CDC maximum is smaller still).
+caller at all. The 16 MiB replacement leaves ample headroom over both the current
+official client's 4 MiB CDC maximum and SesameFS's related 8 MiB server-side
+split (`uploadBlockSize`); those are different producers and are not conflated.
 
-`seafhttp.sync_block_max_bytes` now defaults to **16 MiB** — 2× headroom over the
-8 MiB block, with a validated ceiling of 64 MiB and `SEAFHTTP_SYNC_BLOCK_MAX_BYTES`
+`seafhttp.sync_block_max_bytes` now defaults to **16 MiB**, with a validated
+ceiling of 64 MiB and `SEAFHTTP_SYNC_BLOCK_MAX_BYTES`
 to override. Unlike `chunked_staging_max_bytes`, **`0` is rejected rather than
 meaning unlimited**: an unbounded body on this route is the F12 defect, so no
 configuration restores it.

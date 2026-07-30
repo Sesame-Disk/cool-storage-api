@@ -40,6 +40,10 @@ func clearLoadEnvOverrides(t *testing.T) {
 		"WEB_UPLOADS_MAX_STAGED_BYTES_PER_SESSION_MB",
 		"SEAFHTTP_TOKEN_TTL", "SEAFHTTP_ZIP_MAX_ENTRIES",
 		"SEAFHTTP_ZIP_MAX_DEPTH", "SEAFHTTP_ZIP_MAX_BYTES",
+		"SEAFHTTP_SYNC_BLOCK_MAX_BYTES",
+		"SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE", "SEAFHTTP_UPLOAD_LINK_WRITE_BURST",
+		"SEAFHTTP_UPLOAD_LINK_SOURCE_WRITES_PER_MINUTE", "SEAFHTTP_UPLOAD_LINK_SOURCE_WRITE_BURST",
+		"SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE", "SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE",
 	} {
 		t.Setenv(k, "")
 	}
@@ -469,6 +473,132 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			// Rate and burst are independent dimensions of a token bucket, so a
+			// burst below the per-second rate is a valid (if unfriendly) choice and
+			// must NOT be rejected. An earlier revision rejected it, which would
+			// have refused a coherent configuration on a made-up rule.
+			name: "upload link burst below the per-second rate is accepted",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkWritesPerMinute = 600
+				c.SeafHTTP.UploadLinkWriteBurst = 1
+			},
+			wantErr: false,
+		},
+		{
+			// The one combination that cannot mean anything: a live rate with no
+			// capacity refuses every request. Not silently filled in from the rate,
+			// because "no burst" and "burst equal to the rate" are far apart.
+			name: "upload link zero burst with a live rate is rejected",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkWritesPerMinute = 600
+				c.SeafHTTP.UploadLinkWriteBurst = 0
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_write_burst",
+		},
+		{
+			name: "upload link rate zero disables the limiter and ignores the burst",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkWritesPerMinute = 0
+				c.SeafHTTP.UploadLinkWriteBurst = 0
+			},
+			wantErr: false,
+		},
+		{
+			name: "upload link rate rejects a negative value",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkWritesPerMinute = -1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_writes_per_minute",
+		},
+		{
+			name: "upload link burst rejects a negative value",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkWriteBurst = -1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_write_burst",
+		},
+		{
+			// The ceiling is operational policy: values above it are ineffective
+			// protection and likely indicate a unit mistake.
+			name: "upload link rate rejects a value above the ceiling",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkWritesPerMinute = MaxUploadLinkWritesPerMinute + 1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_writes_per_minute",
+		},
+		{
+			// The per-source bound is a separate pair and gets the same rules; a
+			// shared helper is only correct if both call sites are actually wired.
+			name: "upload link per-source zero burst with a live rate is rejected",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkSourceWritesPerMinute = 600
+				c.SeafHTTP.UploadLinkSourceWriteBurst = 0
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_source_write_burst",
+		},
+		{
+			name: "upload link per-source rate can be disabled while the per-client bound stays on",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkSourceWritesPerMinute = 0
+				c.SeafHTTP.UploadLinkSourceWriteBurst = 0
+			},
+			wantErr: false,
+		},
+		{
+			name: "upload link per-source inflight cap rejects a negative value",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkMaxInflightPerSource = -1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_max_inflight_per_source",
+		},
+		{
+			name: "upload link node inflight cap rejects a negative value",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkMaxInflightPerNode = -1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_max_inflight_per_node",
+		},
+		{
+			name: "upload link inflight caps accept zero as disabled",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkMaxInflightPerSource = 0
+				c.SeafHTTP.UploadLinkMaxInflightPerNode = 0
+			},
+			wantErr: false,
+		},
+		{
+			name: "upload link per-source inflight cap rejects above maximum",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkMaxInflightPerSource = MaxUploadLinkMaxInflightPerSource + 1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_max_inflight_per_source",
+		},
+		{
+			name: "upload link node inflight cap rejects above maximum",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkMaxInflightPerNode = MaxUploadLinkMaxInflightPerNode + 1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.upload_link_max_inflight_per_node",
+		},
+		{
+			name: "upload link per-source cap cannot exceed enabled node cap",
+			modify: func(c *Config) {
+				c.SeafHTTP.UploadLinkMaxInflightPerSource = 9
+				c.SeafHTTP.UploadLinkMaxInflightPerNode = 8
+			},
+			wantErr:        true,
+			wantErrContain: "must not exceed",
+		},
+		{
 			name: "storage backend rejects unsupported sse mode",
 			modify: func(c *Config) {
 				hot := c.Storage.Backends["hot"]
@@ -724,6 +854,8 @@ func TestEnvOverrideOnlyOfficeMaxDocumentBytes(t *testing.T) {
 // silently dropped back to the default — an operator who deliberately raised the
 // cap must not end up running the lower one with no signal.
 func TestEnvOverrideSyncBlockMaxBytes(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
 	t.Run("valid value overrides the default", func(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Auth.DevMode = true
@@ -772,6 +904,82 @@ func TestEnvOverrideSyncBlockMaxBytes(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "seafhttp.sync_block_max_bytes") {
 				t.Fatalf("Validate() error = %v, want it to name seafhttp.sync_block_max_bytes", err)
+			}
+		})
+	}
+}
+
+// TestEnvOverrideUploadLinkWriteLimits pins the four operator levers for the
+// anonymous upload-link bounds. All four are reported rather than silently
+// dropped when malformed: an operator who deliberately loosened a limit and
+// typo'd the value must not end up running the stricter default unaware.
+func TestEnvOverrideUploadLinkWriteLimits(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	t.Setenv("SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE", "900")
+	t.Setenv("SEAFHTTP_UPLOAD_LINK_WRITE_BURST", "1800")
+	t.Setenv("SEAFHTTP_UPLOAD_LINK_SOURCE_WRITES_PER_MINUTE", "9000")
+	t.Setenv("SEAFHTTP_UPLOAD_LINK_SOURCE_WRITE_BURST", "18000")
+	t.Setenv("SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE", "12")
+	t.Setenv("SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE", "96")
+
+	cfg.applyEnvOverrides()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"UploadLinkWritesPerMinute", cfg.SeafHTTP.UploadLinkWritesPerMinute, 900},
+		{"UploadLinkWriteBurst", cfg.SeafHTTP.UploadLinkWriteBurst, 1800},
+		{"UploadLinkSourceWritesPerMinute", cfg.SeafHTTP.UploadLinkSourceWritesPerMinute, 9000},
+		{"UploadLinkSourceWriteBurst", cfg.SeafHTTP.UploadLinkSourceWriteBurst, 18000},
+		{"UploadLinkMaxInflightPerSource", cfg.SeafHTTP.UploadLinkMaxInflightPerSource, 12},
+		{"UploadLinkMaxInflightPerNode", cfg.SeafHTTP.UploadLinkMaxInflightPerNode, 96},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+func TestDefaultUploadLinkInflightCaps(t *testing.T) {
+	cfg := DefaultConfig()
+	if got := cfg.SeafHTTP.UploadLinkMaxInflightPerSource; got != DefaultUploadLinkMaxInflightPerSource {
+		t.Fatalf("UploadLinkMaxInflightPerSource = %d, want %d", got, DefaultUploadLinkMaxInflightPerSource)
+	}
+	if got := cfg.SeafHTTP.UploadLinkMaxInflightPerNode; got != DefaultUploadLinkMaxInflightPerNode {
+		t.Fatalf("UploadLinkMaxInflightPerNode = %d, want %d", got, DefaultUploadLinkMaxInflightPerNode)
+	}
+}
+
+func TestEnvOverrideUploadLinkWriteLimitsRejectMalformedValues(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
+	for _, env := range []string{
+		"SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE",
+		"SEAFHTTP_UPLOAD_LINK_WRITE_BURST",
+		"SEAFHTTP_UPLOAD_LINK_SOURCE_WRITES_PER_MINUTE",
+		"SEAFHTTP_UPLOAD_LINK_SOURCE_WRITE_BURST",
+		"SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE",
+		"SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE",
+	} {
+		t.Run(env, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			t.Setenv(env, "lots")
+
+			cfg.applyEnvOverrides()
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate() = nil; a malformed override must not fall back to the default silently")
+			}
+			if !strings.Contains(err.Error(), env) {
+				t.Fatalf("Validate() error = %v, want it to name %s", err, env)
 			}
 		})
 	}
@@ -1607,18 +1815,19 @@ func TestEffectiveMaxStagedBytesPerSession(t *testing.T) {
 	})
 }
 
-// TestShippedConfigsSyncBlockCapIsValid loads every config file we ship the way
-// Load() does — defaults first, YAML on top — and checks the resulting sync block
-// cap against the same bounds Validate() enforces.
+// TestShippedConfigsSeafHTTPBoundsAreValid loads every config file we ship the way
+// Load() does — defaults first, YAML on top — and checks the resulting seafhttp
+// bounds against what Validate() enforces.
 //
-// This exists because this knob rejects zero, unlike every other seafhttp bound,
-// where zero means "unset". Omission is still safe — the YAML loads on top of
-// DefaultConfig(), so a file that never mentions the key inherits 16 MiB — but a
-// file that sets it *explicitly* to zero, a negative, or a value above the
-// ceiling would refuse to boot, and that is what this checks. The test asserts
-// the property directly rather than calling Validate(), which would also demand
-// deployment secrets these files deliberately leave to .env.
-func TestShippedConfigsSyncBlockCapIsValid(t *testing.T) {
+// This exists because these knobs reject values other seafhttp bounds accept:
+// zero for the sync block cap, and a zero burst paired with a live rate for the
+// upload-link limiters. Omission is still safe — the YAML loads on top of
+// DefaultConfig(), so a file that never mentions a key inherits its default —
+// but a file that sets one *explicitly* to an out-of-range value, or sets a rate
+// and forgets its burst, would refuse to boot, and that is what this checks. The
+// test asserts the properties directly rather than calling Validate(), which
+// would also demand deployment secrets these files deliberately leave to .env.
+func TestShippedConfigsSeafHTTPBoundsAreValid(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join("..", "..", "configs", "*.yaml"))
 	if err != nil {
 		t.Fatalf("glob configs: %v", err)
@@ -1644,6 +1853,28 @@ func TestShippedConfigsSyncBlockCapIsValid(t *testing.T) {
 			}
 			if got > MaxSyncBlockMaxBytes {
 				t.Fatalf("sync_block_max_bytes = %d, above the %d ceiling; this config would refuse to boot", got, MaxSyncBlockMaxBytes)
+			}
+
+			// The upload-link bounds have the same property: a live rate paired
+			// with a zero burst is a boot failure, and a YAML file that sets one
+			// and forgets the other is exactly how that happens.
+			if err := validateUploadLinkWriteLimit(
+				"upload_link_writes_per_minute", "upload_link_write_burst",
+				cfg.SeafHTTP.UploadLinkWritesPerMinute, cfg.SeafHTTP.UploadLinkWriteBurst,
+			); err != nil {
+				t.Fatalf("this config would refuse to boot: %v", err)
+			}
+			if err := validateUploadLinkWriteLimit(
+				"upload_link_source_writes_per_minute", "upload_link_source_write_burst",
+				cfg.SeafHTTP.UploadLinkSourceWritesPerMinute, cfg.SeafHTTP.UploadLinkSourceWriteBurst,
+			); err != nil {
+				t.Fatalf("this config would refuse to boot: %v", err)
+			}
+			if got := cfg.SeafHTTP.UploadLinkMaxInflightPerSource; got != 16 {
+				t.Fatalf("upload_link_max_inflight_per_source = %d, want shipped value 16", got)
+			}
+			if got := cfg.SeafHTTP.UploadLinkMaxInflightPerNode; got != 128 {
+				t.Fatalf("upload_link_max_inflight_per_node = %d, want shipped value 128", got)
 			}
 		})
 	}
