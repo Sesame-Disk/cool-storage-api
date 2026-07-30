@@ -160,6 +160,25 @@ seafhttp:
   # Override: SEAFHTTP_SYNC_BLOCK_MAX_BYTES
   # NOT an aggregate bound: N concurrent uploads still cost N x this value.
   sync_block_max_bytes: 16777216 # 16 MiB
+  # Aggregate bound on concurrent block uploads (subcontract B / X10). Without
+  # these, sync_block_max_bytes above bounds ONE request while N concurrent
+  # uploads still cost N x the cap.
+  #
+  # The node cap is a memory budget divided by a measured cost, not a throughput
+  # setting: 2 GiB allowed for block PUT / ~73 MiB heap per concurrent admission
+  # = 28. The divisor is measured end to end (16 concurrent 16 MiB PUTs took a
+  # real node's heap to ~1.17 GiB), not extrapolated from a single request --
+  # that understates it by nearly half. Re-derive it if you change
+  # sync_block_max_bytes; the two multiply.
+  sync_block_max_inflight_per_node: 28
+  # Fairness split, not memory: just above the ~15 concurrent PUTs one official
+  # client issues (5 sync tasks x 3 block threads), so a single honest desktop is
+  # never queued by its own budget. All of a user's devices share it.
+  sync_block_max_inflight_per_user: 16
+  # Requests over a cap wait this long for a slot before being answered
+  # 503 + Retry-After — never 429, which the sync client does not retry. Must
+  # stay below the client's own request timeout. 0 refuses immediately.
+  sync_block_admission_wait: 10s
   # Per-IP-and-stable-link bound on ANONYMOUS writes through a public upload link (only
   # tokens whose source is "link"; authenticated web uploads on the same endpoint
   # are untouched). Keyed on both so one uploader behind a NAT does not throttle

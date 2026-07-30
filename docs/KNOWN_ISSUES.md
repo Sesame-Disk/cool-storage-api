@@ -19,7 +19,7 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: anonymous upload-link guards A1/A2 are closed, while authenticated block PUT (B), check-blocks (C), and download/GET (D) remain open. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (X10 is subcontract B). |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2 closed, B has its aggregate bound as of 2026-07-30 but awaits a reproducible client-recovery run, and check-blocks (C) and download/GET (D) remain untouched. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (X10 is subcontract B). |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
@@ -5047,7 +5047,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1 and A2 closed 2026-07-29** (anonymous upload-link admission to permission/body/storage work is rate- and concurrency-bounded on each process after valid token resolution); **B reduced** (per-request cap right-sized; the aggregate bound that actually closes it is still missing); **C and D open**. Closing A does not close the B4 umbrella.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1 and A2 closed 2026-07-29** (anonymous upload-link admission to permission/body/storage work is rate- and concurrency-bounded on each process after valid token resolution); **B has its aggregate bound as of 2026-07-30** (per-user and per-node in-flight gates acquired before `io.ReadAll`, bounded wait then 503 + `Retry-After`) but is **not closed**: client recovery under saturation is observed, not yet reproducible; **C and D open**. Closing A does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5092,7 +5092,7 @@ own fix + regression.
 |---|---|---|---|---|
 | **A1** | Anonymous upload **post-token attempt rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-29** | — | Initial guard landed 2026-07-28; stable remint identity and the final fail-closed contract completed A1 on 2026-07-29. Per-(IP, stable link identity) and per-link limiters run after valid token resolution; see "Subcontract A" below |
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
-| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Reduced, still open** | Aggregate bound on concurrent in-flight block readers | Per-request cap right-sized 257 MiB → 16 MiB (the buffered-body bound drops approximately 16×), but N concurrent uploads still cost N × the cap. The aggregate bound is what closes it |
+| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Aggregate bound landed 2026-07-30, not yet closed** | Aggregate bound on concurrent in-flight block readers | The bound now exists: per-user and per-node in-flight gates acquired before `io.ReadAll`, bounded wait then 503 + `Retry-After`. Six of the seven closure criteria are met; client-recovery under saturation is observed but not yet reproducible. See "Subcontract B: the aggregate bound" below |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | 🔴 Open | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
 | **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
 
@@ -5274,6 +5274,100 @@ for 429 — so the overload response on this route must be **503 + `Retry-After`
 never 429, and the design must be *bounded wait, then* 503 rather than immediate
 rejection. Those values need to come from a fault-injection run against the real
 client, not from a guess.
+
+#### Subcontract B: the aggregate bound (2026-07-30)
+
+The bound the section above says is missing now exists. `PutBlock` acquires an
+admission from `syncBlockInflightLimiter` before `readLimitedRequestBody`, and
+holds it until the handler returns — through hashing and the storage write, not
+just the read, because that whole span is what the buffered body costs.
+
+**Shape of the guard.**
+
+- Two gates: per `(org, user)` first, per node second. Both are held before any
+  body is read, so the memory ceiling does not depend on the order; fairness
+  does. Acquiring the node slot first would let one identity park every node slot
+  while its own requests queue on the per-user gate — capacity consumed without
+  memory consumed — which defeats the "one user cannot monopolise the node"
+  property. Waiting on your own gate holds nothing global.
+- One deadline for both gates, derived from the request context, so total wait is
+  bounded by `sync_block_admission_wait` rather than twice it, and a client that
+  disconnects mid-wait cancels immediately. No timer or goroutine outlives the
+  request.
+- Overload answers **503 + `Retry-After`**, never 429, after a bounded wait — the
+  contract this section already specified. Rejections carry a fixed reason set
+  (`user`, `node`, `client_gone`); `client_gone` is counted separately so
+  ordinary client churn does not read as overload.
+- Cheap rejections stay ahead of the gate: a missing permission, an unparseable
+  block id, or an over-cap declared length is refused without spending or waiting
+  for a slot.
+
+**Where the defaults come from.** `sync_block_max_inflight_per_node` is a memory
+budget divided by a measured cost, not a throughput setting:
+
+    2 GiB budget for block PUT on an 8 GiB node / ~73 MiB per admission = 28
+
+The divisor was measured twice, and the two disagree in a way worth recording.
+`BenchmarkPutBlockBodyMemory` (isolated, `internal/api`) reports ~19.7 MiB
+retained for a 16 MiB body — `io.ReadAll` overshoots the wire size while growing
+— which with GOGC=100 suggests ~40 MiB and a cap of 48.
+`TestSyncBlockMemoryUnderSaturation` (end to end, `internal/integration`) drives
+a real node and reads its own heap gauge: 16 concurrent admissions took the heap
+to ~1.17 GiB, i.e. **~73 MiB each**. The isolated figure understates the real
+cost by nearly half, because it covers only `MaxBytesReader`, `io.ReadAll` and
+the hash — not the storage path, the HTTP machinery, or the read-growth garbage
+of every concurrent request pending collection. **The end-to-end measurement is
+the authoritative one**, and re-running it is how to re-derive the cap after any
+change to `sync_block_max_bytes`, the storage backend, or the Go version.
+
+`sync_block_max_inflight_per_user` (16) is a fairness split, not a memory one: it
+sits just above the ~15 concurrent `PutBlock` requests one official client can
+issue, so a single honest desktop is never queued by its own budget, while it
+still takes three saturating users to fill the node. All of a user's devices
+share it.
+
+**What the bounded wait actually does**, which was not obvious before measuring:
+a burst well over the cap is normally *absorbed*, not refused. Against local
+MinIO a block clears in tens of milliseconds, so at the 10s production wait a
+burst of any size a test can practically issue simply queues and drains with zero
+503s. Reaching the refusal path at all required squeezing the wait to 250ms in
+the compose fixture. That is the design working, and it is why a limiter near the
+honest-client concurrency is safe here.
+
+**Closure criteria — six of seven met.**
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | No body is read without a slot | ✅ unit + mutation-verified: moving the acquisition after the read fails 7 tests |
+| 2 | An aggregate per-node bound exists | ✅ node gate; integration burst of 64 against a cap of 2 → 12 admitted, 52 refused 503 |
+| 3 | One user cannot monopolise the node | ✅ per-user gate acquired first; isolation test |
+| 4 | No unbounded wait, no leaked slots | ✅ shared deadline, context cancellation, leak tests under `-race`, drain assertions |
+| 5 | Peak RAM quantified | ✅ ~19.7 MiB retained per request, ~73 MiB heap per concurrent admission |
+| 6 | The real client recovers under saturation | 🟡 **observed once, not reproducible** — see below |
+| 7 | Defaults from measurement, not guesswork | ✅ the division above; the first candidate (48) was wrong and the measurement corrected it |
+
+**Why B is not closed.** Criterion 6 has one good observation and no harness.
+Driving real seaf-cli against node 3 squeezed to `1/1/0s`, the client took **22 ×
+503**, was admitted 26 times, reached `synchronized`, and left
+`sync_put_block_inflight_current` at 0 — exactly the recovery the 503 contract
+predicts. But `scripts/fault-inject-block-admission.sh`, written to make that
+repeatable, does not yet reliably get the client onto the block route from a cold
+container: it commonly registers the sync and then sits in "waiting for sync"
+with zero block PUTs. It reports that as a failure rather than a pass, which is
+the right failure mode, but it is not yet a push-button regression. Note also
+that `scripts/test-sync.sh` cannot substitute: its whole suite issues about two
+block PUTs and never concurrently, so it passes against any cap and proves
+nothing.
+
+Closing B needs that harness made reliable, and a re-run confirming client
+recovery on demand.
+
+**Unrelated defect found while measuring.** `/metrics` is served
+double-gzipped when the client negotiates compression: `promhttp` gzips, and the
+engine's gzip middleware does not exclude the path. Go's transport strips one
+layer and leaves the other, so a Prometheus scraper gets a body it cannot parse.
+Both measurement harnesses request `Accept-Encoding: identity` to work around it.
+This needs its own issue and fix; it is not part of subcontract B.
 
 #### Fix Direction
 

@@ -519,6 +519,65 @@ var (
 		[]string{"reason"},
 	)
 
+	// SyncPutBlockInflightCurrent reports block uploads admitted past the
+	// in-flight gates in this process. Multiplied by seafhttp.sync_block_max_bytes
+	// it is the buffered-body term of the memory bound subcontract B exists to
+	// establish, which is why it is a gauge rather than only a counter of
+	// admissions: the question it answers is "how much is resident right now".
+	// It intentionally has no labels.
+	SyncPutBlockInflightCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sync_put_block_inflight_current",
+			Help: "Current block uploads holding an in-flight admission in this process.",
+		},
+	)
+
+	// SyncPutBlockAdmissionRejectedTotal counts uploads refused before the body
+	// was read. The reason set is fixed and excludes user, org, repo and block
+	// identifiers:
+	//   "user"         — the per-user gate: one identity over its own budget
+	//   "node"         — the process-wide gate: the node is genuinely saturated
+	//   "client_gone"  — the client disconnected while queued
+	// Only the first two are capacity signals. Summing "client_gone" into them
+	// would read as overload during ordinary client churn.
+	SyncPutBlockAdmissionRejectedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sync_put_block_admission_rejected_total",
+			Help: "Total block uploads refused by the process-local per-user or per-node in-flight gates, by reason.",
+		},
+		[]string{"reason"},
+	)
+
+	// SyncPutBlockAdmissionWaitSeconds measures how long a request queued for an
+	// admission, split by whether it eventually got one.
+	//
+	// This is the tuning instrument for the caps, and it is the one to read
+	// before moving them: an "admitted" distribution pinned near zero means the
+	// gates are never contended and the caps are not the constraint, while a
+	// growing "rejected" mass means either too little capacity or too short a
+	// wait — and the two are told apart by whether admitted waits are also
+	// climbing. Buckets run 1 ms to ~16 s to cover both a free gate and a wait
+	// budget in the tens of seconds.
+	SyncPutBlockAdmissionWaitSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sync_put_block_admission_wait_seconds",
+			Help:    "Time spent waiting for a block-upload in-flight admission, by outcome.",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 15),
+		},
+		[]string{"outcome"},
+	)
+
+	// SyncPutBlockUserInflightOccupancy samples the admitted user's own occupancy
+	// without exposing user identities as labels. It is what distinguishes "one
+	// client is saturating the node" from "many clients are each behaving".
+	SyncPutBlockUserInflightOccupancy = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "sync_put_block_user_inflight_occupancy",
+			Help:    "Per-user in-flight occupancy observed when a block upload is admitted.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 13),
+		},
+	)
+
 	// UploadLinkWriteThrottledTotal counts anonymous upload-link writes refused by
 	// the rate limiters. The reason distinguishes which bucket fired:
 	//   "client" — the (IP, stable source) bucket: one uploader going too fast
@@ -616,6 +675,10 @@ func Register() {
 		BlockUploadMaterializationRetriesTotal,
 		SyncPutBlockBodyBytes,
 		SyncPutBlockRejectedTotal,
+		SyncPutBlockInflightCurrent,
+		SyncPutBlockAdmissionRejectedTotal,
+		SyncPutBlockAdmissionWaitSeconds,
+		SyncPutBlockUserInflightOccupancy,
 		UploadLinkWriteThrottledTotal,
 		UploadLinkInflightRejectedTotal,
 		UploadLinkInflightCurrent,

@@ -94,6 +94,11 @@ type SyncHandler struct {
 	// legacy SHA-1 sync reads do not re-read the libraries row on every block
 	// request. A miss only falls back to the authoritative DB read.
 	blockRepresentationIDs *syncBlockRepresentationIDCache
+
+	// blockInflight bounds how many block uploads may hold a buffered body at
+	// once, per user and across this process. Nil when disabled by configuration,
+	// in which case sync_block_max_bytes is again only a per-request bound.
+	blockInflight *syncBlockInflightLimiter
 }
 
 // NewSyncHandler creates a new sync protocol handler
@@ -106,6 +111,7 @@ func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, storageManager *s
 		permMiddleware:         permMiddleware,
 		finalizedBlockDeltas:   newSyncFinalizedDeltaSet(),
 		blockRepresentationIDs: newSyncBlockRepresentationIDCache(),
+		blockInflight:          newSyncBlockInflightLimiter(cfg),
 	}
 }
 
@@ -1348,7 +1354,22 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		return
 	}
 
-	// Read block data (bounded)
+	// Take an in-flight admission before anything buffers the body. Everything
+	// above this point is a cheap rejection — no permission, an unparseable id,
+	// an over-cap declared length — and none of it should wait for a slot or
+	// consume one.
+	//
+	// The admission is held until the handler returns, not until the read
+	// finishes: `data` stays live through hashing and the storage write, and that
+	// whole span is what the memory bound covers.
+	releaseInflight, admitted := h.acquireSyncBlockInflight(c, orgID, userID)
+	if !admitted {
+		return
+	}
+	defer releaseInflight()
+
+	// Read block data (bounded per request; bounded in aggregate by the
+	// admission above)
 	data, ok := readLimitedRequestBody(c, maxBlockBytes)
 	if !ok {
 		// readLimitedRequestBody has already written 413 (over the cap) or 400 (a

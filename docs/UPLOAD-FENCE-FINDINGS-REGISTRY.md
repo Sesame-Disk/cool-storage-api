@@ -130,6 +130,28 @@ retirement and keep their existing cleanup/idempotency behavior.
 | X11 | Medium | **`maxCheckBlockIDs` (100k) bounds the parser, not the work an accepted request triggers.** PR-10's cap is a memory bound on parsing and is correct as such. Downstream, an accepted list still drives one `GetBlockIDMapping` Cassandra point read **per legacy SHA-1 id, sequentially** in the `CheckBlocks` loop, then `CheckBlocksExist` at fan-out 10 — so a single accepted 100k-id request can issue ~100k serial reads while holding the handler. That is a request-amplification and latency concern, not a memory one, and the 100k figure was chosen as a safe parse bound rather than validated against Cassandra, the S3 pool, response size or client cancellation. Related to X5, which flags the same unvalidated fan-out on the canonical read path. | `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01`; also subcontract C of `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` |
 | X6 | Medium | **Read-after-write across DCs.** Canonical lookups retry a missing row 3×25 ms, which covers local lag but not cross-DC. Safe (fails closed) but an availability dependency: transient 404/503 after a remote upload, `check-blocks` reporting a block missing, needless re-uploads. | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (related to X2) |
 
+### Dated note — X10, 2026-07-30
+
+The aggregate bound X10 asks for now exists, and X10 stays **open** anyway.
+
+`PutBlock` acquires a per-`(org, user)` and a per-node in-flight admission before
+`readLimitedRequestBody`, holds it until the handler returns, and answers
+**503 + `Retry-After`** — never 429 — after a bounded wait. The node default of
+`28` is a 2 GiB budget divided by a **measured** ~73 MiB per concurrent
+admission; the isolated per-request benchmark suggested ~40 MiB and would have
+produced a cap nearly twice too permissive, so the end-to-end measurement is the
+one that governs.
+
+Six of the seven closure criteria are met (no body read without a slot,
+per-node bound, per-user fairness, no unbounded wait or leaked slots, RAM
+quantified, defaults measured). The seventh — the real desktop client recovering
+under saturation — has been observed once (22 × 503 absorbed, sync reached
+`synchronized`, no stranded admissions) but has no reliable harness yet, so the
+finding is not closed. Full detail, including why `scripts/test-sync.sh` cannot
+substitute for that harness, is under subcontract B of
+`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` in `docs/KNOWN_ISSUES.md`.
+
+
 ## X1 design space — closing the physical-delete ABA
 
 Bucket versioning was floated as the fix (a delete becomes a marker, the new bytes

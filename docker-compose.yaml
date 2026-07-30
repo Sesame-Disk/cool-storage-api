@@ -156,6 +156,20 @@ services:
       - ONLYOFFICE_JWT_SECRET=${ONLYOFFICE_JWT_SECRET:-change-me-to-a-random-string}
       - FRONTEND_URL=${FRONTEND_URL:-http://frontend:80}
       - GC_ENABLED=false
+      # Squeezed block-PUT admission (subcontract B / X10). Node 3 is the only
+      # instance configured this way on purpose: saturating the shared node would
+      # make every other integration test flaky, and the guard needs a node small
+      # enough that a modest burst actually meets the cap.
+      #
+      # The wait is far below the 10s default because the bounded wait works: a
+      # block against local MinIO clears in tens of milliseconds, so at the
+      # production wait a burst of any size a test can practically issue just
+      # queues and drains without a single refusal. Shrinking the wait is what
+      # makes the overflow path reachable in a test at all.
+      # internal/integration/sync_block_admission_test.go mirrors these values.
+      - SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_NODE=2
+      - SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_USER=2
+      - SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT=250ms
     depends_on:
       cassandra:
         condition: service_healthy
@@ -555,6 +569,48 @@ services:
       - seafile_sync_test_config:/home/seafuser/.ccnet
     depends_on:
       - sesamefs
+    profiles:
+      - test
+
+  # Fault injection for subcontract B / X10: drives the real seaf-cli against
+  # node 3, whose block-PUT admission caps are squeezed until refusal is
+  # unavoidable, and checks that the client absorbs the 503s and still completes
+  # the sync. The script fails the run if the client was never actually refused,
+  # so a configuration that stops saturating cannot pass silently.
+  #
+  #   docker compose --profile test run --rm --build block-admission-fault-test
+  block-admission-fault-test:
+    build:
+      context: ./docker/seafile-cli
+      dockerfile: Dockerfile
+    entrypoint:
+      - /bin/bash
+      - -lc
+      # The repo is mounted from a Windows host in some setups, so the script is
+      # normalised before running rather than executed in place.
+      - >-
+        /workspace/scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3 &&
+        sed 's/\r$//' /workspace/scripts/fault-inject-block-admission.sh > /tmp/fault-inject.sh &&
+        chmod +x /tmp/fault-inject.sh &&
+        /tmp/fault-inject.sh
+    environment:
+      - SESAMEFS_URL=http://sesamefs-node-3:8080
+      - SESAMEFS_URL_LOCAL=http://sesamefs-node-3:8080
+      - DEV_API_TOKEN=dev-token-admin
+      - DEV_PASSWORD=dev-token-123
+      - DEV_USER=00000000-0000-0000-0000-000000000001
+      - SYNC_DATA_DIR=/seafile-data
+      - SYNC_TEST_IN_CONTAINER=1
+    volumes:
+      - .:/workspace
+      # Reuse the sync-test client volumes rather than fresh ones: they carry a
+      # client config the daemon actually syncs with. A hand-written seafile.ini
+      # on an empty volume starts the daemon but never uploads, which this
+      # script would then report as "the client was never refused".
+      - seafile_sync_test_data:/seafile-data
+      - seafile_sync_test_config:/home/seafuser/.ccnet
+    depends_on:
+      - sesamefs-node-3
     profiles:
       - test
 

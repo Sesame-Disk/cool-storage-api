@@ -599,6 +599,77 @@ func TestConfigValidate(t *testing.T) {
 			wantErrContain: "must not exceed",
 		},
 		{
+			name: "sync block node inflight cap rejects a negative value",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxInflightPerNode = -1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_max_inflight_per_node",
+		},
+		{
+			name: "sync block per-user inflight cap rejects a negative value",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxInflightPerUser = -1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_max_inflight_per_user",
+		},
+		{
+			name: "sync block node inflight cap rejects above maximum",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxInflightPerNode = MaxSyncBlockMaxInflightPerNode + 1
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_max_inflight_per_node",
+		},
+		{
+			name: "sync block per-user inflight cap rejects above maximum",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxInflightPerUser = MaxSyncBlockMaxInflightPerUser + 1
+				c.SeafHTTP.SyncBlockMaxInflightPerNode = MaxSyncBlockMaxInflightPerNode
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_max_inflight_per_user",
+		},
+		{
+			// A per-user cap above the node cap reads as fairness protection that
+			// can never bind, since the node gate would refuse first.
+			name: "sync block per-user cap cannot exceed enabled node cap",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxInflightPerUser = 9
+				c.SeafHTTP.SyncBlockMaxInflightPerNode = 8
+			},
+			wantErr:        true,
+			wantErrContain: "must not exceed",
+		},
+		{
+			// Unlike sync_block_max_bytes, zero is a coherent choice here: an
+			// operator fronting this route with an external admission controller
+			// can legitimately turn the process-local gate off.
+			name: "sync block inflight caps accept zero as disabled",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxInflightPerNode = 0
+				c.SeafHTTP.SyncBlockMaxInflightPerUser = 0
+			},
+			wantErr: false,
+		},
+		{
+			name: "sync block admission wait rejects a negative value",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockAdmissionWait = -time.Second
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_admission_wait",
+		},
+		{
+			name: "sync block admission wait rejects above the ceiling",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockAdmissionWait = MaxSyncBlockAdmissionWait + time.Second
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_admission_wait",
+		},
+		{
 			name: "storage backend rejects unsupported sse mode",
 			modify: func(c *Config) {
 				hot := c.Storage.Backends["hot"]
@@ -1876,6 +1947,99 @@ func TestShippedConfigsSeafHTTPBoundsAreValid(t *testing.T) {
 			if got := cfg.SeafHTTP.UploadLinkMaxInflightPerNode; got != 128 {
 				t.Fatalf("upload_link_max_inflight_per_node = %d, want shipped value 128", got)
 			}
+
+			// The block-PUT in-flight caps are what turn sync_block_max_bytes into
+			// an aggregate bound. A shipped file that quietly omits them would boot
+			// fine and give the bound back up, so their presence is asserted by
+			// value rather than merely being validated as in-range.
+			if got := cfg.SeafHTTP.SyncBlockMaxInflightPerNode; got != DefaultSyncBlockMaxInflightPerNode {
+				t.Fatalf("sync_block_max_inflight_per_node = %d, want shipped value %d; without it this config has no aggregate bound on buffered block bodies",
+					got, DefaultSyncBlockMaxInflightPerNode)
+			}
+			if got := cfg.SeafHTTP.SyncBlockMaxInflightPerUser; got != DefaultSyncBlockMaxInflightPerUser {
+				t.Fatalf("sync_block_max_inflight_per_user = %d, want shipped value %d", got, DefaultSyncBlockMaxInflightPerUser)
+			}
+			if got := cfg.SeafHTTP.SyncBlockAdmissionWait; got != DefaultSyncBlockAdmissionWait {
+				t.Fatalf("sync_block_admission_wait = %s, want shipped value %s", got, DefaultSyncBlockAdmissionWait)
+			}
 		})
+	}
+}
+
+// TestDefaultSyncBlockInflightCaps pins the derived defaults. They are not free
+// parameters: the node cap is a memory budget divided by a measured per-request
+// cost, and the per-user cap has to stay above the concurrency one honest
+// desktop client produces. Changing either without redoing that arithmetic is
+// the mistake this guards.
+func TestDefaultSyncBlockInflightCaps(t *testing.T) {
+	cfg := DefaultConfig()
+	if got := cfg.SeafHTTP.SyncBlockMaxInflightPerNode; got != DefaultSyncBlockMaxInflightPerNode {
+		t.Fatalf("SyncBlockMaxInflightPerNode = %d, want %d", got, DefaultSyncBlockMaxInflightPerNode)
+	}
+	if got := cfg.SeafHTTP.SyncBlockMaxInflightPerUser; got != DefaultSyncBlockMaxInflightPerUser {
+		t.Fatalf("SyncBlockMaxInflightPerUser = %d, want %d", got, DefaultSyncBlockMaxInflightPerUser)
+	}
+	if got := cfg.SeafHTTP.SyncBlockAdmissionWait; got != DefaultSyncBlockAdmissionWait {
+		t.Fatalf("SyncBlockAdmissionWait = %s, want %s", got, DefaultSyncBlockAdmissionWait)
+	}
+
+	// One official client can have ~15 concurrent PutBlock requests in flight
+	// (5 sync tasks x 3 block threads). A per-user cap at or below that queues a
+	// single well-behaved desktop against its own budget on every block.
+	const officialClientConcurrency = 15
+	if DefaultSyncBlockMaxInflightPerUser <= officialClientConcurrency {
+		t.Fatalf("per-user default %d does not clear the %d concurrent PUTs one official client issues",
+			DefaultSyncBlockMaxInflightPerUser, officialClientConcurrency)
+	}
+	if DefaultSyncBlockMaxInflightPerUser > DefaultSyncBlockMaxInflightPerNode {
+		t.Fatal("per-user default exceeds the node default, so the fairness cap could never bind")
+	}
+	if err := DefaultConfig().Validate(); err != nil && strings.Contains(err.Error(), "sync_block_") {
+		t.Fatalf("shipped defaults fail their own validation: %v", err)
+	}
+}
+
+// TestEnvOverrideSyncBlockAdmissionWaitRejectsMalformedValues covers the
+// duration override specifically: it is reported rather than dropped, so an
+// operator who deliberately shortened the wait cannot end up silently running
+// the default one.
+func TestEnvOverrideSyncBlockAdmissionWaitRejectsMalformedValues(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	t.Setenv("SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT", "ten seconds")
+
+	cfg.applyEnvOverrides()
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() = nil; a malformed duration must not fall back to the default silently")
+	}
+	if !strings.Contains(err.Error(), "SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT") {
+		t.Fatalf("Validate() error = %v, want it to name the offending variable", err)
+	}
+}
+
+// TestEnvOverrideSyncBlockInflightCaps confirms the caps are reachable without a
+// config file rebuild, which is how the fault-injection and integration runs
+// force them low.
+func TestEnvOverrideSyncBlockInflightCaps(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
+	cfg := DefaultConfig()
+	t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_NODE", "2")
+	t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_USER", "1")
+	t.Setenv("SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT", "250ms")
+
+	cfg.applyEnvOverrides()
+
+	if got := cfg.SeafHTTP.SyncBlockMaxInflightPerNode; got != 2 {
+		t.Fatalf("SyncBlockMaxInflightPerNode = %d, want 2", got)
+	}
+	if got := cfg.SeafHTTP.SyncBlockMaxInflightPerUser; got != 1 {
+		t.Fatalf("SyncBlockMaxInflightPerUser = %d, want 1", got)
+	}
+	if got := cfg.SeafHTTP.SyncBlockAdmissionWait; got != 250*time.Millisecond {
+		t.Fatalf("SyncBlockAdmissionWait = %s, want 250ms", got)
 	}
 }
