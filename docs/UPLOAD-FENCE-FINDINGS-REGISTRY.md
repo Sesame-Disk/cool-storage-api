@@ -132,7 +132,8 @@ retirement and keep their existing cleanup/idempotency behavior.
 
 ### Dated note — X10, 2026-07-30
 
-The aggregate bound X10 asks for now exists, and X10 stays **open** anyway.
+The aggregate bound X10 asks for now exists. Its original real-client recovery
+gap is closed, while post-implementation hardening findings keep X10 **open**.
 
 `PutBlock` acquires a per-`(org, user)` and a per-node in-flight admission before
 `readLimitedRequestBody`, holds it until the handler returns, and answers
@@ -142,14 +143,16 @@ admission; the isolated per-request benchmark suggested ~40 MiB and would have
 produced a cap nearly twice too permissive, so the end-to-end measurement is the
 one that governs.
 
-Six of the seven closure criteria are met (no body read without a slot,
-per-node bound, per-user fairness, no unbounded wait or leaked slots, RAM
-quantified, defaults measured). The seventh — the real desktop client recovering
-under saturation — has been observed once (22 × 503 absorbed, sync reached
-`synchronized`, no stranded admissions) but has no reliable harness yet, so the
-finding is not closed. Full detail, including why `scripts/test-sync.sh` cannot
-substitute for that harness, is under subcontract B of
-`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` in `docs/KNOWN_ISSUES.md`.
+All seven original criteria are now met. The real-client harness uses disposable
+state and controlled slow PUT holders, checks an explicit 503 with positive
+`Retry-After`, proves the subsequent rejections came from real `seaf-cli`, then
+requires post-fault admission, stable sync, byte-for-byte remote payloads, and
+zero stranded admissions. It passed twice consecutively on 2026-07-30.
+
+The same-day implementation audit found remaining admitted-request lifetime,
+unbounded waiter, unsafe configuration-combination, and proof-quality gaps, so
+X10 is not yet certified as fully DoS-hardened. Full detail is under subcontract
+B of `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` in `docs/KNOWN_ISSUES.md`.
 
 
 ## X1 design space — closing the physical-delete ABA

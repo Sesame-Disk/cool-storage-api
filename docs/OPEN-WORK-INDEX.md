@@ -1,6 +1,6 @@
 # Open Work Index
 
-**Last updated:** 2026-07-29
+**Last updated:** 2026-07-30
 **Scope (narrowed 2026-07-25):** production blockers, recent readiness /
 upload-fence audit follow-ups, and leftovers from consolidating the parallel
 pending-work trackers. **This is not the entire product backlog.** Roadmap /
@@ -63,7 +63,7 @@ the open single-node blocker**, and multi-instance adds B1 and B5. See
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29** after valid link-token resolution (stable-source attempt-rate budgets plus process-local per-source `16` / per-node `128` in-flight defaults). A1 reserves the stable source first, preventing attacker-controlled IP cardinality growth once that link budget is exhausted; a later per-client rejection rolls back only the source reservation. A2 429s still consume successful A1 reservations. Token lookup, arbitrary invalid-token traffic, and fleet-wide aggregation remain outside these process-local guards. **B bounded 2026-07-30, awaiting a reproducible client-recovery run**, **C/D open** | Readiness B4 ⊇ registry X10 — **still the single-node blocker until B/C/D close** |
+| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29** after valid link-token resolution. **B's original seven criteria, including deterministic real-client recovery, are met 2026-07-30; implementation-audit hardening remains** (admitted-request lifetime, waiter bound, config memory-budget validation, and stronger node/memory evidence). **C/D open.** | Readiness B4 ⊇ registry X10 — **still the single-node blocker until B/C/D and B hardening close** |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
 

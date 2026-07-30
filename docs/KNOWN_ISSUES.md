@@ -19,7 +19,7 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2 closed, B has its aggregate bound as of 2026-07-30 but awaits a reproducible client-recovery run, and check-blocks (C) and download/GET (D) remain untouched. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (X10 is subcontract B). |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2 closed; B's aggregate bound and reproducible real-client recovery harness landed 2026-07-30, but the implementation audit found remaining admitted-request lifetime, waiter, configuration-budget, and proof gaps before B can be called hardened; check-blocks (C) and download/GET (D) remain untouched. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (X10 is subcontract B). |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
@@ -5092,7 +5092,7 @@ own fix + regression.
 |---|---|---|---|---|
 | **A1** | Anonymous upload **post-token attempt rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-29** | — | Initial guard landed 2026-07-28; stable remint identity and the final fail-closed contract completed A1 on 2026-07-29. Per-(IP, stable link identity) and per-link limiters run after valid token resolution; see "Subcontract A" below |
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
-| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Aggregate bound landed 2026-07-30, not yet closed** | Aggregate bound on concurrent in-flight block readers | The bound now exists: per-user and per-node in-flight gates acquired before `io.ReadAll`, bounded wait then 503 + `Retry-After`. Six of the seven closure criteria are met; client-recovery under saturation is observed but not yet reproducible. See "Subcontract B: the aggregate bound" below |
+| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Original seven criteria met 2026-07-30; hardening findings remain** | Aggregate bound on concurrent in-flight block readers | Per-user and per-node gates are acquired before `io.ReadAll`; the deterministic real-client harness proves 503 + `Retry-After`, retry, publication integrity, and drain. The implementation audit still blocks a broad safety claim: admitted slow/stalled requests have no lifetime bound, waiters are unbounded, validation does not enforce the stated memory budget, and parts of the integration/memory evidence overstate what they prove. See "Subcontract B: the aggregate bound" below |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | 🔴 Open | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
 | **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
 
@@ -5334,7 +5334,7 @@ burst of any size a test can practically issue simply queues and drains with zer
 the compose fixture. That is the design working, and it is why a limiter near the
 honest-client concurrency is safe here.
 
-**Closure criteria — six of seven met.**
+**Original closure criteria — seven of seven met.**
 
 | # | Criterion | Status |
 |---|---|---|
@@ -5343,31 +5343,39 @@ honest-client concurrency is safe here.
 | 3 | One user cannot monopolise the node | ✅ per-user gate acquired first; isolation test |
 | 4 | No unbounded wait, no leaked slots | ✅ shared deadline, context cancellation, leak tests under `-race`, drain assertions |
 | 5 | Peak RAM quantified | ✅ ~19.7 MiB retained per request, ~73 MiB heap per concurrent admission |
-| 6 | The real client recovers under saturation | 🟡 **observed once, not reproducible** — see below |
+| 6 | The real client recovers under saturation | ✅ deterministic Compose harness passed twice consecutively from disposable client state: controlled saturation, explicit 503 + positive `Retry-After`, real-client rejection, post-fault admission, stable sync, byte-for-byte remote payload verification, and zero stranded slots |
 | 7 | Defaults from measurement, not guesswork | ✅ the division above; the first candidate (48) was wrong and the measurement corrected it |
 
-**Why B is not closed.** Criterion 6 has one good observation and no harness.
-Driving real seaf-cli against node 3 squeezed to `1/1/0s`, the client took **22 ×
-503**, was admitted 26 times, reached `synchronized`, and left
-`sync_put_block_inflight_current` at 0 — exactly the recovery the 503 contract
-predicts. But `scripts/fault-inject-block-admission.sh`, written to make that
-repeatable, does not yet reliably get the client onto the block route from a cold
-container: it commonly registers the sync and then sits in "waiting for sync"
-with zero block PUTs. It reports that as a failure rather than a pass, which is
-the right failure mode, but it is not yet a push-button regression. Note also
-that `scripts/test-sync.sh` cannot substitute: its whole suite issues about two
-block PUTs and never concurrently, so it passes against any cap and proves
-nothing.
+**Criterion 6 closure.** `scripts/fault-inject-block-admission.sh` now starts
+from disposable client state, initializes `seaf-cli` normally, synchronizes an
+empty watched worktree, and then occupies both node-3 admissions with controlled
+slow PUTs. An independent sentinel pins 503 + positive `Retry-After`; only then
+does the script create payloads and use the rejection counter to prove the real
+client reached the saturated route. After releasing the fault it requires a new
+admission, stable `synchronized`, byte-for-byte API downloads of every payload,
+and a zero in-flight gauge. It passed twice consecutively from cold containers
+on 2026-07-30 (4 and 3 client rejections). The client reports
+`error Network error` transiently after the injected 503; that is its expected
+retryable classification, not a terminal test failure.
 
-Closing B needs that harness made reliable, and a re-run confirming client
-recovery on demand.
+**Post-implementation audit: why B is still not called hardened.** The harness
+closes the previously pending criterion, but review found four follow-ups in the
+guard itself. An admitted client can trickle a body or stall downstream storage
+without a request-lifetime deadline and hold capacity indefinitely. The bounded
+admission wait has no waiter cap, so connection/goroutine/timer and live-user-key
+cost remains burst-unbounded. Config validation permits combinations up to
+64 MiB x 4096 admissions without enforcing the documented 2 GiB derivation.
+Finally, the process-level node test uses one user with equal user/node caps, and
+the memory probe divides total rather than baseline-subtracted correlated heap,
+so those two claims need stronger evidence. These do not reopen criterion 6 or
+the fact that admitted buffered bodies are capped, but they prevent certifying
+the overall control as fully DoS-hardened.
 
-**Unrelated defect found while measuring.** `/metrics` is served
-double-gzipped when the client negotiates compression: `promhttp` gzips, and the
-engine's gzip middleware does not exclude the path. Go's transport strips one
-layer and leaves the other, so a Prometheus scraper gets a body it cannot parse.
-Both measurement harnesses request `Accept-Encoding: identity` to work around it.
-This needs its own issue and fix; it is not part of subcontract B.
+**Unrelated defect found while measuring, fixed 2026-07-30.** `/metrics` was
+served double-gzipped when the client negotiated compression. The configured
+metrics path is now excluded from the engine gzip middleware, leaving
+compression to `promhttp`; a regression test decompresses exactly once and
+requires Prometheus text rather than a second gzip stream.
 
 #### Fix Direction
 

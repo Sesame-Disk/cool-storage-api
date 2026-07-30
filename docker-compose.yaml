@@ -603,12 +603,6 @@ services:
       - SYNC_TEST_IN_CONTAINER=1
     volumes:
       - .:/workspace
-      # Reuse the sync-test client volumes rather than fresh ones: they carry a
-      # client config the daemon actually syncs with. A hand-written seafile.ini
-      # on an empty volume starts the daemon but never uploads, which this
-      # script would then report as "the client was never refused".
-      - seafile_sync_test_data:/seafile-data
-      - seafile_sync_test_config:/home/seafuser/.ccnet
     depends_on:
       - sesamefs-node-3
     profiles:
