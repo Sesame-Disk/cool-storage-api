@@ -5137,11 +5137,13 @@ This is a greenfield contract with no legacy-token fallback. The live Cassandra
 integration test verifies the migration 013 column, two distinct remints
 preserving the exact `SourceID`, and blank writer rejection.
 
-The two A1 buckets form one attempt-rate decision: the per-client token is
-reserved first. Only that client reservation is cancelled when the per-source
-A1 bucket rejects. Once both A1 reservations succeed they remain consumed even
-if A2 subsequently rejects the request with 429; A1 is not an
-accepted-heavy-work-only accounting scheme.
+The two A1 buckets form one attempt-rate decision: the stable-source token is
+reserved first. If that bucket rejects, the request returns 429 without touching
+the per-client map, so traffic for an exhausted leaked link cannot grow retained
+state with attacker-controlled IP keys. If the later per-client bucket rejects,
+only the accepted source reservation is cancelled. Once both A1 reservations
+succeed they remain consumed even if A2 subsequently rejects the request with
+429; A1 is not an accepted-heavy-work-only accounting scheme.
 
 **The client had to be fixed for the server bound to be safe at all.**
 `@seafile/resumablejs` does not list 429 in `permanentErrors`, so it retries —

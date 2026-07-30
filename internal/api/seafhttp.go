@@ -1393,17 +1393,17 @@ func (h *SeafHTTPHandler) allowUploadLinkWrite(c *gin.Context, token *AccessToke
 	clientIP := c.ClientIP()
 	now := time.Now()
 
-	clientAdmission := limits.perClient.TryReserve(clientIP+"|"+sourceID, now)
-	if clientAdmission == nil {
-		limits.reject(c, "client", clientIP, token.RepoID)
-		return false
-	}
 	sourceAdmission := limits.perSource.TryReserve(sourceID, now)
 	if sourceAdmission == nil {
+		limits.reject(c, "source", clientIP, token.RepoID)
+		return false
+	}
+	clientAdmission := limits.perClient.TryReserve(clientIP+"|"+sourceID, now)
+	if clientAdmission == nil {
 		// Use the original captured now: cancelling at a later time can fail to
 		// restore the token after the reservation's refill interval has elapsed.
-		clientAdmission.CancelAt(now)
-		limits.reject(c, "source", clientIP, token.RepoID)
+		sourceAdmission.CancelAt(now)
+		limits.reject(c, "client", clientIP, token.RepoID)
 		return false
 	}
 

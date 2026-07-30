@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -209,21 +210,56 @@ func TestUploadLinkWriteThrottlePerSourceOnly(t *testing.T) {
 	}
 }
 
-func TestUploadLinkWriteThrottleSourceRejectionRestoresClientAdmission(t *testing.T) {
-	h, r := newThrottleTestHandler(t, throttleTestConfig(1, 1, 1, 1), map[string]string{
+func TestUploadLinkWriteThrottleExhaustedSourceDoesNotTrackNewClientKeys(t *testing.T) {
+	h, r := newThrottleTestHandler(t, throttleTestConfig(6000, 100, 1, 1), map[string]string{
 		"shared-link": "link",
 	})
 
 	upload(t, r, "shared-link", "203.0.113.1") // Spend the source-wide burst.
-	if w := upload(t, r, "shared-link", "203.0.113.2"); w.Code != http.StatusTooManyRequests {
-		t.Fatalf("second address = %d, want source-wide 429", w.Code)
+	before := h.uploadLinkWriteLimits.perClient.TrackedKeyCount()
+	beforeSourceRejections := testutil.ToFloat64(metrics.UploadLinkWriteThrottledTotal.WithLabelValues("source"))
+	beforeClientRejections := testutil.ToFloat64(metrics.UploadLinkWriteThrottledTotal.WithLabelValues("client"))
+
+	const attempts = 1000
+	for i := 0; i < attempts; i++ {
+		clientIP := fmt.Sprintf("198.18.%d.%d", i/256, i%256)
+		if w := upload(t, r, "shared-link", clientIP); w.Code != http.StatusTooManyRequests {
+			t.Fatalf("source-exhausted request %d from %s = %d, want 429", i+1, clientIP, w.Code)
+		}
+	}
+	if after := h.uploadLinkWriteLimits.perClient.TrackedKeyCount(); after != before {
+		t.Fatalf("per-client tracked keys grew from %d to %d after %d source rejections", before, after, attempts)
+	}
+	if got := testutil.ToFloat64(metrics.UploadLinkWriteThrottledTotal.WithLabelValues("source")) - beforeSourceRejections; got != attempts {
+		t.Fatalf("source rejection metric increased by %v, want %d", got, attempts)
+	}
+	if got := testutil.ToFloat64(metrics.UploadLinkWriteThrottledTotal.WithLabelValues("client")); got != beforeClientRejections {
+		t.Fatalf("client rejection metric changed from %v to %v during source-exhausted requests", beforeClientRejections, got)
+	}
+}
+
+func TestUploadLinkWriteThrottleClientRejectionRefundsSourceAdmission(t *testing.T) {
+	h, r := newThrottleTestHandler(t, throttleTestConfig(1, 1, 1, 1), map[string]string{
+		"shared-link": "link",
+	})
+	const clientIP = "203.0.113.2"
+	key := clientIP + "|shared-link"
+	now := time.Now()
+	if admission := h.uploadLinkWriteLimits.perClient.TryReserve(key, now); admission == nil {
+		t.Fatal("failed to exhaust the per-client bucket")
 	}
 
-	key := "203.0.113.2|shared-link"
-	now := time.Now()
-	admission := h.uploadLinkWriteLimits.perClient.TryReserve(key, now)
+	if w := upload(t, r, "shared-link", clientIP); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("request with exhausted client bucket = %d, want 429", w.Code)
+	}
+	if got := h.uploadLinkWriteLimits.perSource.TrackedKeyCount(); got != 1 {
+		t.Fatalf("per-source tracked keys = %d, want 1 proving source admission ran first", got)
+	}
+
+	now = time.Now()
+	admission := h.uploadLinkWriteLimits.perSource.TryReserve("shared-link", now)
 	if admission == nil {
-		t.Fatal("source-wide rejection consumed the independent per-client admission")
+		t.Fatal("per-client rejection did not refund the accepted source admission")
 	}
 	admission.CancelAt(now)
 }

@@ -777,6 +777,12 @@ source ID, and the Cassandra token writer rejects a blank source ID.
 The upload-link rate buckets and concurrency counters remain process-local. They
 bound admission to permission, body and storage work only after a valid token has
 resolved as link-origin; they are not a total request-rate guard for the endpoint.
+Rate admission reserves the stable source before creating or consulting the
+per-client (IP, source) key. Once a link's source budget is exhausted, requests
+from attacker-controlled IPs therefore cannot grow the per-client limiter's
+retained key cardinality. If the later per-client check rejects, only the source
+reservation is rolled back; successful A1 admissions remain consumed even when
+the subsequent A2 in-flight guard rejects.
 Token lookup occurs first because `Source` is not known beforehand, so arbitrary
 invalid-token requests remain outside these guards and Cassandra token lookup is
 not protected by A1. The guards protect later node capacity, not a cluster-global

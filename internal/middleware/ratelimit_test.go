@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,4 +45,48 @@ func TestNilRateLimiterReservationIsNoOp(t *testing.T) {
 		t.Fatal("disabled limiter refused admission")
 	}
 	reservation.CancelAt(time.Now())
+}
+
+func TestRateLimiterTrackedKeyCount(t *testing.T) {
+	limiter := NewRateLimiter(rate.Every(time.Minute), 1)
+	t.Cleanup(limiter.Stop)
+	now := time.Now()
+
+	if got := limiter.TrackedKeyCount(); got != 0 {
+		t.Fatalf("initial tracked key count = %d, want 0", got)
+	}
+	limiter.TryReserve("client-a", now)
+	limiter.TryReserve("client-a", now)
+	limiter.TryReserve("client-b", now)
+	if got := limiter.TrackedKeyCount(); got != 2 {
+		t.Fatalf("tracked key count = %d, want 2 distinct keys", got)
+	}
+}
+
+func TestRateLimiterTrackedKeyCountIsNilSafe(t *testing.T) {
+	var limiter *RateLimiter
+	if got := limiter.TrackedKeyCount(); got != 0 {
+		t.Fatalf("nil limiter tracked key count = %d, want 0", got)
+	}
+}
+
+func TestRateLimiterTrackedKeyCountConcurrentWithAdmissions(t *testing.T) {
+	limiter := NewRateLimiter(rate.Every(time.Minute), 1)
+	t.Cleanup(limiter.Stop)
+
+	const keys = 100
+	var wg sync.WaitGroup
+	for i := 0; i < keys; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			limiter.Allow(fmt.Sprintf("client-%d", i))
+			_ = limiter.TrackedKeyCount()
+		}(i)
+	}
+	wg.Wait()
+
+	if got := limiter.TrackedKeyCount(); got != keys {
+		t.Fatalf("tracked key count after concurrent admissions = %d, want %d", got, keys)
+	}
 }

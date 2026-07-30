@@ -11,7 +11,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// visitor tracks a rate limiter and last-seen time for a single IP.
+// visitor tracks a rate limiter and last-seen time for a single key.
 type visitor struct {
 	limiter  *rate.Limiter
 	lastSeen time.Time
@@ -120,14 +120,25 @@ func (rl *RateLimiter) RetryAfterSeconds() int {
 	return int(math.Ceil(retryAfter.Seconds()))
 }
 
-func (rl *RateLimiter) getVisitor(ip string) *rate.Limiter {
+// TrackedKeyCount returns the number of keys currently retained by the limiter.
+// It is nil-safe so optional limiters can be inspected without branching.
+func (rl *RateLimiter) TrackedKeyCount() int {
+	if rl == nil {
+		return 0
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return len(rl.visitors)
+}
+
+func (rl *RateLimiter) getVisitor(key string) *rate.Limiter {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	v, exists := rl.visitors[ip]
+	v, exists := rl.visitors[key]
 	if !exists {
 		limiter := rate.NewLimiter(rl.rate, rl.burst)
-		rl.visitors[ip] = &visitor{limiter: limiter, lastSeen: time.Now()}
+		rl.visitors[key] = &visitor{limiter: limiter, lastSeen: time.Now()}
 		return limiter
 	}
 	v.lastSeen = time.Now()
