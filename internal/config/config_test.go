@@ -2124,10 +2124,15 @@ func TestValidateCheckBlocksBounds(t *testing.T) {
 		{
 			name: "product of node cap and fan-out is bounded",
 			modify: func(c *Config) {
-				c.SeafHTTP.CheckBlocksMaxInflightPerNode = 64
-				c.SeafHTTP.CheckBlocksLookupFanout = 64
+				c.SeafHTTP.CheckBlocksMaxInflightPerNode = 9
+				c.SeafHTTP.CheckBlocksLookupFanout = MaxCheckBlocksLookupFanout
 			},
 			wantErr: "concurrent metadata lookups",
+		},
+		{
+			name:    "fan-out cannot exceed the reader ceiling",
+			modify:  func(c *Config) { c.SeafHTTP.CheckBlocksLookupFanout = MaxCheckBlocksLookupFanout + 1 },
+			wantErr: "check_blocks_lookup_fanout",
 		},
 		{
 			name: "per-user cap must not exceed per-node cap",
@@ -2144,6 +2149,14 @@ func TestValidateCheckBlocksBounds(t *testing.T) {
 				c.SeafHTTP.CheckBlocksMaxWaitersPerNode = 64
 			},
 			wantErr: "check_blocks_max_waiters_per_user",
+		},
+		{
+			name: "per-user cap requires a node cap",
+			modify: func(c *Config) {
+				c.SeafHTTP.CheckBlocksMaxInflightPerNode = 0
+				c.SeafHTTP.CheckBlocksMaxInflightPerUser = 1
+			},
+			wantErr: "requires seafhttp.check_blocks_max_inflight_per_node",
 		},
 		{
 			name:    "fan-out must be positive",
@@ -2169,8 +2182,11 @@ func TestValidateCheckBlocksBounds(t *testing.T) {
 			wantErr: "server.read_timeout",
 		},
 		{
-			name:    "caps may be disabled",
-			modify:  func(c *Config) { c.SeafHTTP.CheckBlocksMaxInflightPerNode = 0; c.SeafHTTP.CheckBlocksMaxInflightPerUser = 0 },
+			name: "caps may be disabled",
+			modify: func(c *Config) {
+				c.SeafHTTP.CheckBlocksMaxInflightPerNode = 0
+				c.SeafHTTP.CheckBlocksMaxInflightPerUser = 0
+			},
 			wantErr: "",
 		},
 	}

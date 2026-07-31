@@ -14,13 +14,10 @@
 #   2. the sync still reaches 'synchronized' with verified remote payloads, and
 #   3. no admission is left stranded afterwards.
 #
-# It also does something the block-route drill does not: it *measures*. The
+# It also performs a clean cardinality measurement before fault injection. The
 # accepted id cap of 100000 is inherited compatibility, never a captured number.
-# This run reports the sync client's real check-blocks cardinality from
-# sync_check_blocks_ids_per_request, which is the evidence any future decision to
-# lower that cap has to rest on. The measurement is reported, not asserted: a
-# threshold invented here would be exactly the guess the histogram exists to
-# replace.
+# The measurement is a before/after delta from a client-only sync phase; the
+# slow holders used later for saturation are deliberately excluded from it.
 #
 # Run it through compose (the service pins the squeezed node and uses disposable
 # client state):
@@ -45,6 +42,8 @@ SYNC_DATA_DIR="${SYNC_DATA_DIR:-/seafile-data}"
 # request with a non-trivial id list, small enough to finish quickly.
 FILE_COUNT="${FILE_COUNT:-3}"
 FILE_MIB="${FILE_MIB:-8}"
+MEASUREMENT_FILE_COUNT="${MEASUREMENT_FILE_COUNT:-1}"
+MEASUREMENT_FILE_MIB="${MEASUREMENT_FILE_MIB:-1}"
 SYNC_TIMEOUT="${SYNC_TIMEOUT:-240}"
 # One holder request occupies a slot for roughly HOLDER_IDS x 43 bytes at
 # HOLDER_RATE — about 13 seconds at these values — and each holder loops, so the
@@ -218,6 +217,51 @@ inflight=$(metric 'sync_check_blocks_inflight_current') || fail "could not read 
 [ "$(awk -v v="${inflight}" 'BEGIN{print (v == 0) ? 1 : 0}')" -eq 1 ] \
   || fail "fixture is not idle before saturation: inflight=${inflight}"
 
+# Measure the real client without holders. The histogram is process-global, so
+# only the before/after delta is evidence for this client; absolute values would
+# include previous integration traffic.
+cardinality_before_count=$(metric 'sync_check_blocks_ids_per_request_count') || fail "could not read cardinality baseline count"
+cardinality_before_sum=$(metric 'sync_check_blocks_ids_per_request_sum') || fail "could not read cardinality baseline sum"
+cardinality_before_256=$(metric 'sync_check_blocks_ids_per_request_bucket{le="256"}') || fail "could not read cardinality baseline bucket"
+
+log "measuring clean client check-blocks cardinality (${MEASUREMENT_FILE_COUNT} x ${MEASUREMENT_FILE_MIB} MiB)"
+i=0
+while [ "${i}" -lt "${MEASUREMENT_FILE_COUNT}" ]; do
+  dd if=/dev/urandom of="${sync_dir}/measurement-${i}.bin" bs=1M count="${MEASUREMENT_FILE_MIB}" 2>/dev/null \
+    || fail "could not create measurement payload ${i}"
+  i=$((i + 1))
+done
+
+stable=0
+waited=0
+while [ "${waited}" -lt 120 ]; do
+  state=$(sync_state)
+  case "${state}" in
+    synchronized)
+      stable=$((stable + 1))
+      [ "${stable}" -ge 3 ] && break
+      ;;
+    "error Network error") stable=0 ;;
+    *error*) fail "client reported measurement sync state '${state}'" ;;
+    *) stable=0 ;;
+  esac
+  sleep 2
+  waited=$((waited + 2))
+done
+[ "${stable}" -ge 3 ] || fail "clean cardinality sync did not stabilize (last '${state}')"
+
+cardinality_after_count=$(metric 'sync_check_blocks_ids_per_request_count') || fail "could not read cardinality result count"
+cardinality_after_sum=$(metric 'sync_check_blocks_ids_per_request_sum') || fail "could not read cardinality result sum"
+cardinality_after_256=$(metric 'sync_check_blocks_ids_per_request_bucket{le="256"}') || fail "could not read cardinality result bucket"
+cardinality_delta_count=$(awk -v a="${cardinality_after_count}" -v b="${cardinality_before_count}" 'BEGIN{print a-b}')
+cardinality_delta_sum=$(awk -v a="${cardinality_after_sum}" -v b="${cardinality_before_sum}" 'BEGIN{print a-b}')
+cardinality_delta_256=$(awk -v a="${cardinality_after_256}" -v b="${cardinality_before_256}" 'BEGIN{print a-b}')
+[ "$(awk -v v="${cardinality_delta_count}" 'BEGIN{print (v > 0) ? 1 : 0}')" -eq 1 ] \
+  || fail "clean client produced no check-blocks cardinality observations"
+[ "${cardinality_delta_256}" = "${cardinality_delta_count}" ] \
+  || fail "clean client emitted a check-blocks request above 256 ids (count=${cardinality_delta_count}, <=256=${cardinality_delta_256})"
+log "clean client cardinality delta: count=${cardinality_delta_count}, sum=${cardinality_delta_sum}, all requests <=256 ids"
+
 # Hold both node-3 check-blocks admissions open with slow bodies. An admitted
 # request spends its slot in the body read before any lookup, so a rate-limited
 # upload of a valid id list occupies a slot for as long as it takes to arrive.
@@ -276,10 +320,10 @@ log "saturated sentinel returned 503 with Retry-After=${retry_after}"
 refused_before=$(metric 'sync_check_blocks_admission_rejected_total{reason="user"}') || fail "could not read user rejection baseline"
 node_refused_before=$(metric 'sync_check_blocks_admission_rejected_total{reason="node"}') || fail "could not read node rejection baseline"
 
-log "generating ${FILE_COUNT} x ${FILE_MIB} MiB in the watched worktree"
+log "generating ${FILE_COUNT} x ${FILE_MIB} MiB in the watched worktree for fault recovery"
 i=0
 while [ "${i}" -lt "${FILE_COUNT}" ]; do
-  dd if=/dev/urandom of="${sync_dir}/payload-${i}.bin" bs=1M count="${FILE_MIB}" 2>/dev/null \
+  dd if=/dev/urandom of="${sync_dir}/fault-payload-${i}.bin" bs=1M count="${FILE_MIB}" 2>/dev/null \
     || fail "could not create payload ${i}"
   i=$((i + 1))
 done
@@ -341,16 +385,16 @@ while [ "${waited}" -lt "${SYNC_TIMEOUT}" ]; do
 done
 [ "${stable}" -ge 3 ] || fail "sync did not recover within ${SYNC_TIMEOUT}s (last '${state}')"
 
-# A synchronized status alone can precede publication. Download every payload and
-# compare bytes to prove the retried work became the committed remote files.
+# A synchronized status alone can precede publication. Download every fault
+# payload and compare bytes to prove the retried work became committed remotely.
 i=0
 while [ "${i}" -lt "${FILE_COUNT}" ]; do
-  local_file="${sync_dir}/payload-${i}.bin"
-  downloaded="/tmp/payload-${i}.downloaded"
+  local_file="${sync_dir}/fault-payload-${i}.bin"
+  downloaded="/tmp/fault-payload-${i}.downloaded"
   verified=0
   attempts=0
   while [ "${attempts}" -lt 20 ]; do
-    download_link=$(curl -sS "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/file/?p=/payload-${i}.bin" \
+    download_link=$(curl -sS "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/file/?p=/fault-payload-${i}.bin" \
       -H "Authorization: Token ${DEV_API_TOKEN}" | tr -d '"')
     if [ -n "${download_link}" ] && [ "${download_link}" != "null" ]; then
       if curl -sS "${download_link}" -H "Authorization: Token ${DEV_API_TOKEN}" -o "${downloaded}" \
@@ -362,7 +406,7 @@ while [ "${i}" -lt "${FILE_COUNT}" ]; do
     sleep 2
     attempts=$((attempts + 1))
   done
-  [ "${verified}" -eq 1 ] || fail "remote payload-${i}.bin is missing or differs"
+  [ "${verified}" -eq 1 ] || fail "remote fault-payload-${i}.bin is missing or differs"
   i=$((i + 1))
 done
 
@@ -378,15 +422,4 @@ if [ "$(awk -v v="${inflight}" 'BEGIN{print (v == 0) ? 1 : 0}')" -ne 1 ]; then
   fail "sync_check_blocks_inflight_current is ${inflight} after the run; admissions leaked"
 fi
 
-# The measurement. Reported, never asserted: the point is to replace a guess with
-# a number, and a threshold chosen here would just be another guess.
-log "observed check-blocks cardinality from this run (sync_check_blocks_ids_per_request):"
-curl -fsS -H 'Accept-Encoding: identity' "${SESAMEFS_URL}/metrics" 2>/dev/null \
-  | grep -E '^sync_check_blocks_ids_per_request(_bucket|_sum|_count)' \
-  | sed 's/^/[fault-inject]   /'
-log "and the lookups those requests issued (sync_check_blocks_lookups_total):"
-curl -fsS -H 'Accept-Encoding: identity' "${SESAMEFS_URL}/metrics" 2>/dev/null \
-  | grep -E '^sync_check_blocks_lookups_total' \
-  | sed 's/^/[fault-inject]   /'
-
-log "PASS: real client absorbed ${total_refused} capacity 503(s), retried, published verified payloads, and drained all slots"
+log "PASS: clean cardinality delta was isolated from holders; real client absorbed ${total_refused} capacity 503(s), retried, published verified payloads, and drained all slots"

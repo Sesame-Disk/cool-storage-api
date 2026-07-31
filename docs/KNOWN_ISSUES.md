@@ -19,7 +19,7 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B and C are closed; download/block GET (D) remains untouched. C (2026-07-31) gives check-blocks its own admission capacity, deduplicated and fan-out-bounded metadata lookups, cancellation that actually stops Cassandra work, and the gzip exclusion its admitted lifetime needs. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01. |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B and C are closed; download/block GET (D) remains untouched. C (2026-07-31) gives check-blocks its own admission capacity, deduplicated and fan-out-bounded metadata lookups, cancellation that prevents new work and cancels context-aware reads, and the gzip exclusion its admitted lifetime needs. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
@@ -5475,8 +5475,11 @@ nothing bounded how many such requests ran at once.
   with subcontract B (gates, waiter accounting, entry ring, single deadline); the
   *capacity* is not. The two routes exhaust different resources — buffered body
   memory there, Cassandra and object-store metadata work here — so one storming
-  must not be able to spend the other's admissions. Two regressions assert both
-  directions; pointing the check-blocks handler at `blockInflight` fails them.
+  must not be able to spend the other's admissions. The check-blocks parser and
+  per-request maps also consume memory proportional to the accepted id cap; that
+  memory is bounded by admission and `check_blocks_max_ids`, but has not been
+  assigned a B-style measured byte budget. Two regressions assert both directions;
+  pointing the check-blocks handler at `blockInflight` fails them.
 - **Deduplication.** Ids are deduplicated before any lookup, so cost tracks
   unique ids. `sync_check_blocks_lookups_total` against
   `sync_check_blocks_ids_per_request` is what makes that visible;
@@ -5485,8 +5488,9 @@ nothing bounded how many such requests ran at once.
   metadata phases — the new ctx-aware `GetBlockIDMappingContext` resolution and
   the canonical existence check, which previously ran at a hardcoded 32 and 10
   regardless of configuration. Every worker checks the group context before
-  issuing a read, so a disconnect or an expired lifetime stops the remaining
-  lookups instead of running them out.
+  issuing a read, so a disconnect or an expired lifetime stops dispatching new
+  lookups and cancels context-aware reads already in flight. The Cassandra
+  driver's finite query timeout remains the bound for a query already issued.
 
 **The node budget is the product, and validation enforces it as such:**
 
@@ -5506,7 +5510,8 @@ a large initial sync posts the block list of one commit, and the desktop client
 does not re-batch after a 413, so lowering it on a guess trades a bounded
 amplification for an unbounded risk of breaking a legitimate sync.
 `sync_check_blocks_ids_per_request` is the instrument that will justify a lower
-value, and the fault drill reports it from a real client run.
+value. The fault drill measures it in a client-only phase using a before/after
+delta; its slow holders are excluded from that measurement.
 
 **The gzip trap from subcontract B was still live on this route.** The admitted
 lifetime is what makes an admission recoverable and what stops the metadata work
@@ -5526,7 +5531,7 @@ real-TCP regression over the shipped middleware fails if the exclusion is remove
 | 1 | Rate/concurrency on the route | ✅ per-user and per-node admission with bounded waiters and an entry ring; 503 + `Retry-After`, never 429 |
 | 2 | No body is read without a slot | ✅ unit regression asserts a refused request never touches its body |
 | 3 | Per-accepted-request work is bounded | ✅ dedup + configured fan-out on both phases; mutation-verified (removing either fails) |
-| 4 | Cancellation actually stops the Cassandra work | ✅ ctx-aware mapping read; regression counts lookups after a disconnect and fails at the old behaviour |
+| 4 | Cancellation bounds Cassandra work | ✅ ctx-aware mapping read; dispatch stops on cancellation, no new lookups are scheduled, and already-issued queries remain bounded by the driver timeout |
 | 5 | An admission is always recoverable | ✅ admitted lifetime with a connection read deadline, plus the gzip exclusion that lets it reach the socket |
 | 6 | One route cannot spend the other's budget | ✅ separate instances, asserted in both directions at unit and integration level |
 | 7 | The real client recovers under saturation | ✅ `scripts/fault-inject-check-blocks-admission.sh`: saturate, prove refusal from server counters *and* the client log, release, require stable `synchronized`, byte-for-byte payload verification and a zero in-flight gauge |
@@ -5546,15 +5551,30 @@ wait and again at the shipped 10-second wait; `seaf-cli` reported the injected
 503 as `error Network error`, which is its retryable classification, and finished
 the sync.
 
-**The first real measurement of this route's cardinality.** The drill reports
-`sync_check_blocks_ids_per_request` rather than asserting on it. For a 3 × 8 MiB
-worktree the client's requests all landed at **≤256 ids** (most at ≤4; 34
-requests summing 814 ids), which is four orders of magnitude below the 100k cap.
-That is a small-library sample and explicitly **not** grounds to lower the cap
-yet — the case that matters is the initial sync of a large library, whose commit
-carries the whole block list. It is the first datum in the series that will
-eventually justify a lower default, and it is why the cap moved to configuration
-now and stayed at 100k.
+**Real-client cardinality evidence.** The drill first synchronizes a clean
+worktree without holders, snapshots the histogram, and then reports only the
+before/after delta. The later 20k-id holders cannot contaminate that result. This
+is still a small-library sample and is **not** grounds to lower the 100k cap by
+itself; the compatibility ceiling remains until the opt-in large-cardinality
+probe below is considered alongside production traffic.
+
+For the lifetime boundary, run the real Cassandra probe in Docker:
+
+```bash
+docker compose --profile test run --rm --build \
+  -e CHECK_BLOCKS_LARGE_PROBE=1 go-integration-test \
+  go test -tags integration -run '^TestCheckBlocksLargeCardinalityLifetime$' \
+  -v -count=1 -timeout 12m ./internal/integration
+```
+
+That probe sends 100000 unique legacy ids and 100000 unique canonical ids to
+the real node-3 route, exercising the mapping phase separately and then the
+canonical location plus real object-store existence phases. On the merge
+candidate it completed in **59.72s** for legacy mappings and **116.22s** for
+canonical location/existence, well below the shipped 5-minute lifetime. The
+canonical metadata rows are temporary and cleaned in bounded batches. These
+results are evidence for the shipped lifetime, not evidence that 100k-id
+existence requests are cheap or that the cap should be lowered.
 
 **What this does not claim.** The accepted cardinality is still a compatibility
 bound rather than a measured one — criterion 3 bounds the *work per id* and the

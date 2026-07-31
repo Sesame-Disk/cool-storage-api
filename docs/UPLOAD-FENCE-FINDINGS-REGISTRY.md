@@ -200,7 +200,10 @@ body is read, deduplicates ids before any lookup, resolves them through the new
 `db.GetBlockIDMappingContext` at a configured fan-out that also replaces the
 hardcoded 32/10 of the existence phase, and holds an admitted lifetime. The
 node's exposure is the stated product `check_blocks_max_inflight_per_node ×
-check_blocks_lookup_fanout` (8 × 8, ceiling 256), enforced at boot.
+check_blocks_lookup_fanout` (8 × 8, ceiling 256), enforced at boot. The
+validated fan-out ceiling is 32, matching the canonical reader's actual maximum.
+Cancellation stops dispatching new work; a query already issued remains bounded
+by the driver's finite timeout.
 
 The accepted cardinality was deliberately **not** lowered: 100k stays the default
 and becomes the validation ceiling, so `check_blocks_max_ids` can only be

@@ -1368,10 +1368,11 @@ func (h *SyncHandler) checkBlocksAdmittedLifetime() time.Duration {
 // between the block and check-blocks routes while the numbers and the series
 // stay separate, so an operator can always tell which route ran out of time.
 type syncAdmittedLifetime struct {
-	duration            time.Duration
-	timeouts            *prometheus.CounterVec
-	deadlineUnsupported prometheus.Counter
-	logPrefix           string
+	duration             time.Duration
+	timeouts             *prometheus.CounterVec
+	deadlineUnsupported  prometheus.Counter
+	unprotectedLogSample *rate.Sometimes
+	logPrefix            string
 	// noun names the work in client-facing messages ("block upload"), so a
 	// timeout says which request died rather than "the request".
 	// downstreamNoun names what timed out when the deadline came from a backend
@@ -1383,23 +1384,25 @@ type syncAdmittedLifetime struct {
 
 func (h *SyncHandler) syncBlockLifetime() syncAdmittedLifetime {
 	return syncAdmittedLifetime{
-		duration:            h.syncBlockAdmittedLifetime(),
-		timeouts:            metrics.SyncPutBlockTimeoutsTotal,
-		deadlineUnsupported: metrics.SyncPutBlockReadDeadlineUnsupportedTotal,
-		logPrefix:           "[PutBlock]",
-		noun:                "block upload",
-		downstreamNoun:      "block storage",
+		duration:             h.syncBlockAdmittedLifetime(),
+		timeouts:             metrics.SyncPutBlockTimeoutsTotal,
+		deadlineUnsupported:  metrics.SyncPutBlockReadDeadlineUnsupportedTotal,
+		unprotectedLogSample: &syncPutBlockUnprotectedLogSample,
+		logPrefix:            "[PutBlock]",
+		noun:                 "block upload",
+		downstreamNoun:       "block storage",
 	}
 }
 
 func (h *SyncHandler) checkBlocksLifetime() syncAdmittedLifetime {
 	return syncAdmittedLifetime{
-		duration:            h.checkBlocksAdmittedLifetime(),
-		timeouts:            metrics.SyncCheckBlocksTimeoutsTotal,
-		deadlineUnsupported: metrics.SyncCheckBlocksReadDeadlineUnsupportedTotal,
-		logPrefix:           "[CheckBlocks]",
-		noun:                "check-blocks request",
-		downstreamNoun:      "check-blocks metadata lookup",
+		duration:             h.checkBlocksAdmittedLifetime(),
+		timeouts:             metrics.SyncCheckBlocksTimeoutsTotal,
+		deadlineUnsupported:  metrics.SyncCheckBlocksReadDeadlineUnsupportedTotal,
+		unprotectedLogSample: &syncCheckBlocksUnprotectedLogSample,
+		logPrefix:            "[CheckBlocks]",
+		noun:                 "check-blocks request",
+		downstreamNoun:       "check-blocks metadata lookup",
 	}
 }
 
@@ -1506,10 +1509,10 @@ func isServerHandledRequest(r *http.Request) bool {
 // which is the same contract the unreachable 503 would have carried.
 //
 // The log is sampled: a middleware that broke the unwrap chain would otherwise
-// make every block upload write a line.
+// make every affected request write a line.
 func rejectAdmittedUnprotected(c *gin.Context, lt syncAdmittedLifetime) {
 	lt.deadlineUnsupported.Inc()
-	syncBlockUnprotectedLogSample.Do(func() {
+	lt.unprotectedLogSample.Do(func() {
 		log.Printf("%s dropping %s: the admitted-lifetime read deadline could not be installed on the connection, so a stalled body could hold this admission forever. A middleware is wrapping the response writer without implementing Unwrap(); sampled, see the read_deadline_unsupported_total series for this route", lt.logPrefix, lt.noun)
 	})
 	c.Abort()
@@ -1528,7 +1531,10 @@ func rejectAdmittedUnprotected(c *gin.Context, lt syncAdmittedLifetime) {
 	c.JSON(http.StatusServiceUnavailable, gin.H{"error": lt.noun + " cannot be time-bounded on this connection; retry"})
 }
 
-var syncBlockUnprotectedLogSample = rate.Sometimes{Interval: time.Minute}
+var (
+	syncPutBlockUnprotectedLogSample    = rate.Sometimes{Interval: time.Minute}
+	syncCheckBlocksUnprotectedLogSample = rate.Sometimes{Interval: time.Minute}
+)
 
 func rejectAdmittedTimeout(c *gin.Context, lt syncAdmittedLifetime, phase string, err error) bool {
 	ctxErr := c.Request.Context().Err()
@@ -2012,6 +2018,9 @@ func (h *SyncHandler) resolveCheckBlockMappings(ctx context.Context, orgID, repr
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(fanout)
 	for _, id := range externalIDs {
+		if err := gctx.Err(); err != nil {
+			break
+		}
 		externalID := id
 		g.Go(func() error {
 			if err := gctx.Err(); err != nil {
@@ -2037,6 +2046,9 @@ func (h *SyncHandler) resolveCheckBlockMappings(ctx context.Context, orgID, repr
 		})
 	}
 	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return resolved, nil
@@ -2096,12 +2108,16 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 	if !ok {
 		return
 	}
+	// Observe the parsed cardinality even when classification later rejects a
+	// malformed id. This series is operational evidence for lowering the cap;
+	// excluding rejected bodies would hide precisely the traffic most likely to
+	// exercise that cap.
+	metrics.SyncCheckBlocksIDsPerRequest.Observe(float64(len(externalIDs)))
 
 	requestedBlocks, uniqueLegacyIDs, ok := classifyCheckBlockIDs(c, externalIDs)
 	if !ok {
 		return
 	}
-	metrics.SyncCheckBlocksIDsPerRequest.Observe(float64(len(requestedBlocks)))
 
 	fanout := h.checkBlocksLookupFanout()
 
@@ -2148,11 +2164,6 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 
 	var existMap map[string]bool
 	var err error
-	// Both later phases are counted per unique internal id, which is what they are
-	// dispatched with. They are upper bounds rather than issued counts: the
-	// existence check skips a block whose metadata is absent.
-	metrics.SyncCheckBlocksLookupsTotal.WithLabelValues("location").Add(float64(len(internalIDs)))
-	metrics.SyncCheckBlocksLookupsTotal.WithLabelValues("existence").Add(float64(len(internalIDs)))
 	if h.db != nil {
 		var fallbackStore *storage.BlockStore
 		var fallbackClass string
@@ -2163,6 +2174,9 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 				return
 			}
 		}
+		// The location phase is dispatched by the canonical reader below. Count
+		// this branch only; the legacy fallback has no location phase.
+		metrics.SyncCheckBlocksLookupsTotal.WithLabelValues("location").Add(float64(len(internalIDs)))
 		reader, resolveErr := syncNewCanonicalBlockCheckReaderFn(c.Request.Context(), h.db, h.storageManager, orgID, internalIDs, fallbackStore, fallbackClass, fanout)
 		if resolveErr != nil {
 			if rejectAdmittedTimeout(c, lifetime, "location", resolveErr) {
@@ -2172,6 +2186,7 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 			return
 		}
+		metrics.SyncCheckBlocksLookupsTotal.WithLabelValues("existence").Add(float64(len(internalIDs)))
 		existMap, err = reader.CheckBlocksExist(c.Request.Context(), internalIDs, fanout)
 	} else {
 		// Preserve the legacy no-metadata routed fallback.
@@ -2180,6 +2195,7 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 			return
 		}
+		metrics.SyncCheckBlocksLookupsTotal.WithLabelValues("existence").Add(float64(len(internalIDs)))
 		existMap, err = blockStore.CheckBlocksParallel(c.Request.Context(), internalIDs, fanout)
 	}
 	if err != nil {

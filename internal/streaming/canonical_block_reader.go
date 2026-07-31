@@ -309,6 +309,9 @@ func (r *canonicalBlockReader) CheckBlocksExist(ctx context.Context, blockIDs []
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 	for _, id := range unique {
+		if err := gctx.Err(); err != nil {
+			break
+		}
 		blockID := id
 		g.Go(func() error {
 			location, ok := r.locations[blockID]
@@ -329,6 +332,9 @@ func (r *canonicalBlockReader) CheckBlocksExist(ctx context.Context, blockIDs []
 		})
 	}
 	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return result, nil

@@ -642,7 +642,9 @@ type SeafHTTPConfig struct {
 	//	concurrent metadata lookups from this route
 	//		<= CheckBlocksMaxInflightPerNode x CheckBlocksLookupFanout
 	//
-	// Zero disables either cap, which gives the aggregate bound back up.
+	// A zero node cap disables the aggregate guard and is only valid when the
+	// per-user cap is also zero. A node cap may be used without a per-user cap,
+	// but a per-user cap alone cannot claim to bound aggregate work.
 	CheckBlocksMaxInflightPerNode int `yaml:"check_blocks_max_inflight_per_node"`
 	CheckBlocksMaxInflightPerUser int `yaml:"check_blocks_max_inflight_per_user"`
 
@@ -824,7 +826,10 @@ const (
 	MaxCheckBlocksMaxWaitersPerUser  = 4096
 	MaxCheckBlocksAdmissionWait      = 2 * time.Minute
 	MaxCheckBlocksAdmittedLifetime   = 30 * time.Minute
-	MaxCheckBlocksLookupFanout       = 64
+	// Keep this aligned with the canonical reader's actual maximum. A larger
+	// value would be accepted here but silently reduced by the reader, while
+	// the mapping phase would still use the larger value.
+	MaxCheckBlocksLookupFanout = 32
 
 	// MaxCheckBlocksConcurrentLookups is the ceiling on the product
 	// (node cap x fan-out): the real quantity being budgeted is how many metadata
@@ -866,11 +871,12 @@ const (
 
 // validateCheckBlocksBounds checks the subcontract C knobs.
 //
-// The shape mirrors the sync-block validation deliberately: same "zero disables"
-// convention, same per-user-must-not-exceed-per-node rules, same explanatory
-// error text. The one rule with no counterpart there is the product ceiling,
-// because the resource being budgeted is not per-request memory but concurrent
-// metadata lookups, and neither factor states that on its own.
+// The shape mirrors the sync-block validation deliberately: same bounds and
+// per-user-must-not-exceed-per-node rules, with both caps allowed to be zero as
+// an explicit full disable. Unlike the block route, a per-user-only mode is not
+// valid here because it leaves aggregate metadata work unbounded. The other rule
+// with no counterpart there is the product ceiling, because neither factor
+// states concurrent metadata lookups on its own.
 func (c *Config) validateCheckBlocksBounds() error {
 	if c.SeafHTTP.CheckBlocksMaxIDs <= 0 {
 		return fmt.Errorf("seafhttp.check_blocks_max_ids must be greater than zero (an unbounded id list is the defect this cap exists to prevent)")
@@ -892,6 +898,9 @@ func (c *Config) validateCheckBlocksBounds() error {
 	if c.SeafHTTP.CheckBlocksMaxInflightPerUser > MaxCheckBlocksMaxInflightPerUser {
 		return fmt.Errorf("seafhttp.check_blocks_max_inflight_per_user is %d, above the %d ceiling",
 			c.SeafHTTP.CheckBlocksMaxInflightPerUser, MaxCheckBlocksMaxInflightPerUser)
+	}
+	if c.SeafHTTP.CheckBlocksMaxInflightPerUser > 0 && c.SeafHTTP.CheckBlocksMaxInflightPerNode == 0 {
+		return fmt.Errorf("seafhttp.check_blocks_max_inflight_per_user requires seafhttp.check_blocks_max_inflight_per_node; enable both caps or set both to zero")
 	}
 	if c.SeafHTTP.CheckBlocksMaxInflightPerUser > 0 && c.SeafHTTP.CheckBlocksMaxInflightPerNode > 0 &&
 		c.SeafHTTP.CheckBlocksMaxInflightPerUser > c.SeafHTTP.CheckBlocksMaxInflightPerNode {

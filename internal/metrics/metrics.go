@@ -714,12 +714,13 @@ var (
 	// posts. Lowering that cap without this histogram would be trading a known
 	// amplification for an unknown risk of 413-ing a legitimate initial sync.
 	//
-	// Observed after the parse and before any lookup, so it describes accepted
-	// lists rather than successful responses. Buckets run 1 to ~16k ids.
+	// Observed after the parse and before classification or lookup, so it describes
+	// parsed request lists, including malformed traffic that reached the parser.
+	// Buckets run 1 to ~16k ids.
 	SyncCheckBlocksIDsPerRequest = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "sync_check_blocks_ids_per_request",
-			Help:    "Block ids carried by an accepted check-blocks request.",
+			Help:    "Block ids carried by a parsed check-blocks request.",
 			Buckets: prometheus.ExponentialBuckets(1, 4, 8),
 		},
 	)

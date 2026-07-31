@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 // Subcontract C (= registry X11) of ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01, at the
@@ -323,5 +326,110 @@ func TestCheckBlocksReleasesSlotsAfterBurst(t *testing.T) {
 		if waited := time.Since(started); waited > checkBlocksTestWait {
 			t.Fatalf("probe %d waited %s for admission on an idle node; slots are leaking", i, waited)
 		}
+	}
+}
+
+// TestCheckBlocksLargeCardinalityLifetime is an opt-in Docker probe for the
+// compatibility ceiling. It stays out of the default suite because two
+// 100k-id requests deliberately put sustained load on real Cassandra. The
+// legacy case exercises the mapping phase; the canonical case seeds temporary
+// metadata and exercises both location and real object-store existence checks.
+// Rows are removed in bounded cleanup batches.
+func TestCheckBlocksLargeCardinalityLifetime(t *testing.T) {
+	if os.Getenv("CHECK_BLOCKS_LARGE_PROBE") != "1" {
+		t.Skip("set CHECK_BLOCKS_LARGE_PROBE=1 for the real 100k-id lifetime probe")
+	}
+	requireCassandra(t)
+	client := admissionTestClient(t)
+	client.http.Timeout = 6 * time.Minute
+	repoID := createTestLibrary(t, client, fmt.Sprintf("inttest-check-blocks-large-lifetime-%d", time.Now().UnixNano()))
+
+	for _, width := range []int{40, 64} {
+		t.Run(fmt.Sprintf("%d-character-ids", width), func(t *testing.T) {
+			const count = 100000
+			ids := make([]string, count)
+			var body strings.Builder
+			body.Grow(count * (width + 1))
+			for i := 0; i < count; i++ {
+				ids[i] = fmt.Sprintf("%0*x", width, i)
+				if i > 0 {
+					body.WriteByte('\n')
+				}
+				body.WriteString(ids[i])
+			}
+
+			if width == 64 {
+				orgID := resolveOrgID(t, repoID)
+				_, sampleBlockID := uploadUniqueFile(t, client, repoID, "large-lifetime-storage-class.txt", "/")
+				var storageClass string
+				session := shareProjectionDBForTest(t).Session()
+				if err := session.Query(
+					`SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?`,
+					orgID, sampleBlockID,
+				).Scan(&storageClass); err != nil || storageClass == "" {
+					t.Fatalf("read storage class for existence probe: %v", err)
+				}
+				seedCanonicalCheckRows(t, orgID, ids, storageClass)
+			}
+
+			started := time.Now()
+			code, _, err := postCheckBlocks(client, repoID, strings.NewReader(body.String()))
+			elapsed := time.Since(started)
+			if err != nil {
+				t.Fatalf("100k-id check-blocks request: %v", err)
+			}
+			if code != http.StatusOK {
+				t.Fatalf("100k-id check-blocks request = %d after %s, want 200 before the shipped 5m lifetime", code, elapsed)
+			}
+			if elapsed >= 5*time.Minute {
+				t.Fatalf("100k-id check-blocks request took %s, which exceeds the shipped 5m admitted lifetime", elapsed)
+			}
+			t.Logf("100k %d-character ids completed in %s", width, elapsed)
+		})
+	}
+}
+
+// seedCanonicalCheckRows creates metadata without physical objects so the
+// 100k canonical probe exercises the real MinIO existence phase. Rows are
+// cleaned in bounded unlogged batches when the subtest exits.
+func seedCanonicalCheckRows(t *testing.T, orgID string, ids []string, storageClass string) {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	const batchSize = 50
+	insert := `INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, created_at) VALUES (?, ?, ?, ?, ?)`
+	delete := `DELETE FROM blocks WHERE org_id = ? AND block_id = ?`
+	createdAt := time.Now().UTC()
+	t.Cleanup(func() {
+		for start := 0; start < len(ids); start += batchSize {
+			end := start + batchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			batch := session.Batch(gocql.UnloggedBatch)
+			for _, id := range ids[start:end] {
+				batch.Query(delete, orgID, id)
+			}
+			if err := session.ExecuteBatch(batch); err != nil {
+				t.Errorf("cleanup canonical check rows: %v", err)
+				return
+			}
+		}
+	})
+
+	flush := func(batch *gocql.Batch, operation string) {
+		if err := session.ExecuteBatch(batch); err != nil {
+			t.Fatalf("%s canonical check rows: %v", operation, err)
+		}
+	}
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := session.Batch(gocql.UnloggedBatch)
+		for _, id := range ids[start:end] {
+			batch.Query(insert, orgID, id, 1, storageClass, createdAt)
+		}
+		flush(batch, "insert")
 	}
 }
