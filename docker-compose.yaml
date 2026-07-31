@@ -161,15 +161,15 @@ services:
       # make every other integration test flaky, and the guard needs a node small
       # enough that a modest burst actually meets the cap.
       #
-      # The wait is far below the 10s default because the bounded wait works: a
-      # block against local MinIO clears in tens of milliseconds, so at the
-      # production wait a burst of any size a test can practically issue just
-      # queues and drains without a single refusal. Shrinking the wait is what
-      # makes the overflow path reachable in a test at all.
+      # 250ms keeps ordinary integration tests fast. The controlled holder
+      # fixture is deterministic at any wait; set BLOCK_ADMISSION_FAULT_WAIT=10s
+      # for the production-default client-compatibility drill.
       # internal/integration/sync_block_admission_test.go mirrors these values.
       - SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_NODE=2
       - SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_USER=2
-      - SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT=250ms
+      - SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_NODE=2
+      - SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_USER=2
+      - SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT=${BLOCK_ADMISSION_FAULT_WAIT:-250ms}
     depends_on:
       cassandra:
         condition: service_healthy
@@ -601,6 +601,7 @@ services:
       - DEV_USER=00000000-0000-0000-0000-000000000001
       - SYNC_DATA_DIR=/seafile-data
       - SYNC_TEST_IN_CONTAINER=1
+      - HOLDER_RATE=${HOLDER_RATE:-8k}
     volumes:
       - .:/workspace
     depends_on:

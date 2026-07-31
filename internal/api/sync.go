@@ -1304,6 +1304,81 @@ func (h *SyncHandler) syncBlockMaxBytes() int64 {
 	return h.config.SeafHTTP.SyncBlockMaxBytes
 }
 
+func (h *SyncHandler) syncBlockAdmittedLifetime() time.Duration {
+	if h == nil || h.config == nil || h.config.SeafHTTP.SyncBlockAdmittedLifetime <= 0 {
+		return config.DefaultSyncBlockAdmittedLifetime
+	}
+	return h.config.SeafHTTP.SyncBlockAdmittedLifetime
+}
+
+var errSyncBlockAdmittedLifetime = errors.New("sync block admitted lifetime exceeded")
+
+// beginSyncBlockAdmittedLifetime starts after admission so queue time does not
+// consume the processing budget. Replacing the request context propagates the
+// deadline to body and object-storage I/O; Cassandra callback boundaries also
+// check it, while each already-running query remains bounded by the driver's
+// required positive timeout. Closing the body on cancellation releases a handler
+// blocked in a slow or stalled request-body read.
+func (h *SyncHandler) beginSyncBlockAdmittedLifetime(c *gin.Context) func() {
+	ctx, cancel := context.WithTimeoutCause(c.Request.Context(), h.syncBlockAdmittedLifetime(), errSyncBlockAdmittedLifetime)
+	body := c.Request.Body
+	c.Request = c.Request.WithContext(ctx)
+	stopClose := context.AfterFunc(ctx, func() {
+		if body != nil {
+			_ = body.Close()
+		}
+	})
+	return func() {
+		stopClose()
+		cancel()
+	}
+}
+
+func rejectSyncBlockTimeout(c *gin.Context, phase string, err error) bool {
+	ctxErr := c.Request.Context().Err()
+	if errors.Is(context.Cause(c.Request.Context()), errSyncBlockAdmittedLifetime) {
+		metrics.SyncPutBlockTimeoutsTotal.WithLabelValues(phase).Inc()
+		c.Header("Retry-After", "1")
+		c.Header("Connection", "close")
+		c.Request.Close = true
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block upload timed out; retry"})
+		return true
+	}
+	// An inherited client deadline/disconnect gets no response: the peer has
+	// already abandoned the request. Do not infer that from err alone because
+	// storage transports have independent deadlines that can return the same
+	// sentinel while the request itself is still healthy.
+	if ctxErr != nil {
+		c.Abort()
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		metrics.SyncPutBlockTimeoutsTotal.WithLabelValues(phase).Inc()
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage timed out; retry"})
+		return true
+	}
+	return false
+}
+
+func readLimitedSyncBlockRequestBody(c *gin.Context, maxBytes int64) ([]byte, bool) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+	data, err := io.ReadAll(c.Request.Body)
+	if err == nil {
+		return data, true
+	}
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large", "max_bytes": maxBytes})
+		return nil, false
+	}
+	if rejectSyncBlockTimeout(c, "body", err) {
+		return nil, false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+	return nil, false
+}
+
 // PutBlock stores a block
 // PUT /seafhttp/repo/:repo_id/block/:block_id
 // Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
@@ -1367,14 +1442,16 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		return
 	}
 	defer releaseInflight()
+	endLifetime := h.beginSyncBlockAdmittedLifetime(c)
+	defer endLifetime()
 
 	// Read block data (bounded per request; bounded in aggregate by the
 	// admission above)
-	data, ok := readLimitedRequestBody(c, maxBlockBytes)
+	data, ok := readLimitedSyncBlockRequestBody(c, maxBlockBytes)
 	if !ok {
-		// readLimitedRequestBody has already written 413 (over the cap) or 400 (a
-		// read failure). Only the former is a cap rejection, so the reason is
-		// derived from the status it chose rather than assumed.
+		// The body reader has already written 413 (over the cap), 503 (admitted
+		// lifetime), or 400 (another read failure). Only 413 is a size-cap
+		// rejection, so the reason is derived from the status rather than assumed.
 		reason := "read_error"
 		if c.Writer.Status() == http.StatusRequestEntityTooLarge {
 			reason = "too_large"
@@ -1389,10 +1466,16 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	metrics.SyncPutBlockBodyBytes.Observe(float64(len(data)))
 
 	log.Printf("PutBlock: received %d bytes for block %s\n", len(data), externalID)
+	if rejectSyncBlockTimeout(c, "hash", c.Request.Context().Err()) {
+		return
+	}
 
 	// Always compute SHA-256 as the internal storage ID
 	sha256Hash := sha256.Sum256(data)
 	internalID := hex.EncodeToString(sha256Hash[:])
+	if rejectSyncBlockTimeout(c, "hash", c.Request.Context().Err()) {
+		return
+	}
 
 	// Verify hash for SHA-256 clients
 	if classifiedID.isDirectSHA256 && classifiedID.normalized != internalID {
@@ -1443,14 +1526,23 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		// branch, it MUST return a non-retryable error or the response will be
 		// written twice on retry.
 		if err := v2.RetryUploadedBlockMaterializationContext(c.Request.Context(), "PutBlock", internalID, func() error {
+			if err := c.Request.Context().Err(); err != nil {
+				return err
+			}
 			materializedStorageClass = storageClass
 			probe, probeErr := syncProbeUploadedBlockReuseFn(h.db, orgID, internalID)
 			if probeErr != nil {
 				return fmt.Errorf("probe block reuse for %s: %w", internalID, probeErr)
 			}
+			if err := c.Request.Context().Err(); err != nil {
+				return err
+			}
 			probe, probeErr = syncPrepareUploadedBlockProbeFn(h.db, orgID, internalID, probe)
 			if probeErr != nil {
 				return probeErr
+			}
+			if err := c.Request.Context().Err(); err != nil {
+				return err
 			}
 			switch probe.Decision {
 			case db.BlockReuseReusable:
@@ -1470,7 +1562,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 				}
 				materializedStorageClass = resolvedClass
 				if _, putErr := syncPutBlockAutoDirectFn(c.Request.Context(), putStore, internalID, data); putErr != nil {
-					return fmt.Errorf("%w: %v", errSyncStoreBackend, putErr)
+					return fmt.Errorf("%w: %w", errSyncStoreBackend, putErr)
 				}
 				return nil
 			case db.BlockReuseBlockedByGC:
@@ -1478,8 +1570,18 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			}
 			return fmt.Errorf("unexpected block reuse decision %d for %s", probe.Decision, internalID)
 		}, func() error {
-			return registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), materializedStorageClass, "", externalMappingID)
+			if err := c.Request.Context().Err(); err != nil {
+				return err
+			}
+			err := registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), materializedStorageClass, "", externalMappingID)
+			if err != nil {
+				return err
+			}
+			return c.Request.Context().Err()
 		}, nil, nil); err != nil {
+			if rejectSyncBlockTimeout(c, "storage", err) {
+				return
+			}
 			if errors.Is(err, v2.ErrBlockMappingWriteFailed) {
 				log.Printf("PutBlock: failed to store block mapping org=%s ext=%s int=%s: %v", orgID, externalID, internalID, err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
@@ -1509,6 +1611,9 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		exists, err := syncBlockExistsFn(c.Request.Context(), blockStore, internalID)
 		if err != nil {
 			log.Printf("PutBlock: failed to check block existence: %v\n", err)
+			if rejectSyncBlockTimeout(c, "storage", err) {
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
 			return
 		}
@@ -1522,12 +1627,18 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			_, err = syncPutBlockDataFn(c.Request.Context(), blockStore, blockData)
 			if err != nil {
 				log.Printf("PutBlock: failed to store in backend: %v\n", err)
+				if rejectSyncBlockTimeout(c, "storage", err) {
+					return
+				}
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
 				return
 			}
 		}
 	}
 
+	if rejectSyncBlockTimeout(c, "storage", c.Request.Context().Err()) {
+		return
+	}
 	c.Status(http.StatusOK)
 
 	// Record sync upload traffic — fire-and-forget.

@@ -33,6 +33,9 @@ func syncInflightConfig(perUser, perNode int, wait time.Duration) *config.Config
 	cfg.SeafHTTP.SyncBlockMaxInflightPerUser = perUser
 	cfg.SeafHTTP.SyncBlockMaxInflightPerNode = perNode
 	cfg.SeafHTTP.SyncBlockAdmissionWait = wait
+	cfg.SeafHTTP.SyncBlockMaxWaitersPerUser = config.DefaultSyncBlockMaxWaitersPerUser
+	cfg.SeafHTTP.SyncBlockMaxWaitersPerNode = config.DefaultSyncBlockMaxWaitersPerNode
+	cfg.SeafHTTP.SyncBlockAdmittedLifetime = config.DefaultSyncBlockAdmittedLifetime
 	return cfg
 }
 
@@ -278,6 +281,115 @@ func TestPutBlockNodeGateSpansUsers(t *testing.T) {
 	requireBodyUnread(t, bodyRead)
 }
 
+func TestPutBlockPerUserWaiterQueueFullRejectsBeforeBodyAndTimer(t *testing.T) {
+	cfg := syncInflightConfig(1, 4, 5*time.Second)
+	cfg.SeafHTTP.SyncBlockMaxWaitersPerUser = 1
+	h := newInflightTestHandler(t, cfg)
+	r := putBlockRouterFor(h, "org", "user")
+
+	free, heldDone := startHeldBlockUpload(t, r)
+	queuedDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w, _ := putBlockObservingBody(r)
+		queuedDone <- w
+	}()
+	requireWaiterCount(t, h.blockInflight, "user", 1)
+
+	start := time.Now()
+	w, bodyRead := putBlockObservingBody(r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("queue-full upload = %d, want 503", w.Code)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("queue-full rejection took %s; it parked or allocated the admission wait", elapsed)
+	}
+	requireBodyUnread(t, bodyRead)
+
+	free()
+	<-heldDone
+	<-queuedDone
+	if err := requireDrainedLimiter(h.blockInflight); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPutBlockNodeWaiterQueueFullRejectsBeforeBody(t *testing.T) {
+	cfg := syncInflightConfig(1, 1, 5*time.Second)
+	cfg.SeafHTTP.SyncBlockMaxWaitersPerNode = 1
+	h := newInflightTestHandler(t, cfg)
+	holder := putBlockRouterFor(h, "org", "holder")
+	waiter := putBlockRouterFor(h, "org", "waiter")
+	rejected := putBlockRouterFor(h, "org", "rejected")
+
+	free, heldDone := startHeldBlockUpload(t, holder)
+	queuedDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w, _ := putBlockObservingBody(waiter)
+		queuedDone <- w
+	}()
+	requireWaiterCount(t, h.blockInflight, "node", 1)
+
+	w, bodyRead := putBlockObservingBody(rejected)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("node queue-full upload = %d, want 503", w.Code)
+	}
+	requireBodyUnread(t, bodyRead)
+
+	free()
+	<-heldDone
+	<-queuedDone
+	if err := requireDrainedLimiter(h.blockInflight); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPutBlockGlobalWaiterCapIncludesPerUserQueues(t *testing.T) {
+	cfg := syncInflightConfig(1, 10, 5*time.Second)
+	cfg.SeafHTTP.SyncBlockMaxWaitersPerUser = 2
+	cfg.SeafHTTP.SyncBlockMaxWaitersPerNode = 2
+	h := newInflightTestHandler(t, cfg)
+	routers := []*gin.Engine{
+		putBlockRouterFor(h, "org", "user-a"),
+		putBlockRouterFor(h, "org", "user-b"),
+		putBlockRouterFor(h, "org", "user-c"),
+	}
+
+	var frees []func()
+	var holders []<-chan *httptest.ResponseRecorder
+	for _, router := range routers {
+		free, done := startHeldBlockUpload(t, router)
+		frees = append(frees, free)
+		holders = append(holders, done)
+	}
+
+	waiters := make(chan *httptest.ResponseRecorder, 2)
+	for _, router := range routers[:2] {
+		go func(router *gin.Engine) {
+			w, _ := putBlockObservingBody(router)
+			waiters <- w
+		}(router)
+	}
+	requireWaiterCount(t, h.blockInflight, "node", 2)
+
+	w, bodyRead := putBlockObservingBody(routers[2])
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("global queue overflow = %d, want 503", w.Code)
+	}
+	requireBodyUnread(t, bodyRead)
+
+	for _, free := range frees {
+		free()
+	}
+	for _, done := range holders {
+		<-done
+	}
+	<-waiters
+	<-waiters
+	if err := requireDrainedLimiter(h.blockInflight); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestPutBlockDisconnectDuringWaitReleasesEverything covers the path where a
 // client gives up while queued. Nothing may be read, no slot may be stranded,
 // and the outcome must not be counted as a capacity rejection — that would make
@@ -356,6 +468,46 @@ func TestSyncBlockInflightLimiterConcurrentReleaseDoesNotLeak(t *testing.T) {
 
 	if err := requireDrainedLimiter(l); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSyncBlockInflightGatesShareOneWaitDeadline(t *testing.T) {
+	const waitBudget = 200 * time.Millisecond
+	l := newSyncBlockInflightLimiter(syncInflightConfig(1, 1, waitBudget))
+
+	setupWait := newSyncBlockAdmissionWait(context.Background(), time.Second)
+	releaseUser, reason := l.acquireUser(setupWait, "org|user")
+	if releaseUser == nil {
+		t.Fatalf("occupy user gate: %s", reason)
+	}
+	releaseNode, reason := l.acquireNode(setupWait)
+	if releaseNode == nil {
+		t.Fatalf("occupy node gate: %s", reason)
+	}
+	setupWait.close()
+	defer releaseNode()
+
+	wait := newSyncBlockAdmissionWait(context.Background(), waitBudget)
+	defer wait.close()
+	time.AfterFunc(120*time.Millisecond, releaseUser)
+	start := time.Now()
+	targetUserRelease, reason := l.acquireUser(wait, "org|user")
+	if targetUserRelease == nil {
+		t.Fatalf("user gate did not free within budget: %s", reason)
+	}
+	defer targetUserRelease()
+	if targetNodeRelease, reason := l.acquireNode(wait); targetNodeRelease != nil {
+		targetNodeRelease()
+		t.Fatal("node gate unexpectedly admitted while its slot was held")
+	} else if reason != syncBlockRejectNode {
+		t.Fatalf("node rejection reason = %q, want %q", reason, syncBlockRejectNode)
+	}
+	elapsed := time.Since(start)
+	if elapsed < waitBudget {
+		t.Fatalf("both gates returned after %s, before shared budget %s", elapsed, waitBudget)
+	}
+	if elapsed > waitBudget+100*time.Millisecond {
+		t.Fatalf("both gates took %s; deadline appears to restart at the node gate", elapsed)
 	}
 }
 
@@ -478,8 +630,32 @@ func requireDrainedLimiter(l *syncBlockInflightLimiter) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.nodeWaiters != 0 {
+		return fmt.Errorf("in-flight admission leak: node gate still has %d waiters", l.nodeWaiters)
+	}
 	for key, gate := range l.perUser {
-		return fmt.Errorf("in-flight admission leak: per-user gate for %q survived with refs=%d, held=%d", key, gate.refs, len(gate.sem))
+		return fmt.Errorf("in-flight admission leak: per-user gate for %q survived with refs=%d, held=%d, waiters=%d", key, gate.refs, len(gate.sem), gate.waiters)
 	}
 	return nil
+}
+
+func requireWaiterCount(t *testing.T, l *syncBlockInflightLimiter, gateName string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		l.mu.Lock()
+		got := l.nodeWaiters
+		if gateName == "user" {
+			got = 0
+			for _, gate := range l.perUser {
+				got += gate.waiters
+			}
+		}
+		l.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("%s waiter count did not reach %d", gateName, want)
 }

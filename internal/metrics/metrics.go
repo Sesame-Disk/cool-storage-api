@@ -3,6 +3,8 @@ package metrics
 import "github.com/prometheus/client_golang/prometheus"
 
 var (
+	CgroupMemoryCurrent = newCgroupMemoryCollector()
+
 	// HTTPRequestsTotal counts total HTTP requests by method, path pattern, and status.
 	HTTPRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -537,6 +539,8 @@ var (
 	// identifiers:
 	//   "user"         — the per-user gate: one identity over its own budget
 	//   "node"         — the process-wide gate: the node is genuinely saturated
+	//   "user_queue_full" — the bounded per-user waiter queue was already full
+	//   "node_queue_full" — the bounded process waiter queue was already full
 	//   "client_gone"  — the client disconnected while queued
 	// Only the first two are capacity signals. Summing "client_gone" into them
 	// would read as overload during ordinary client churn.
@@ -576,6 +580,22 @@ var (
 			Help:    "Per-user in-flight occupancy observed when a block upload is admitted.",
 			Buckets: prometheus.ExponentialBuckets(1, 2, 13),
 		},
+	)
+
+	SyncPutBlockWaitersCurrent = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sync_put_block_waiters_current",
+			Help: "Current block-upload requests parked for admission, by gate.",
+		},
+		[]string{"gate"},
+	)
+
+	SyncPutBlockTimeoutsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sync_put_block_timeouts_total",
+			Help: "Total admitted block uploads ended by a body or storage timeout.",
+		},
+		[]string{"phase"},
 	)
 
 	// UploadLinkWriteThrottledTotal counts anonymous upload-link writes refused by
@@ -627,6 +647,7 @@ var (
 // Register registers all custom metrics with the default Prometheus registry.
 func Register() {
 	prometheus.MustRegister(
+		CgroupMemoryCurrent,
 		HTTPRequestsTotal,
 		HTTPRequestDuration,
 		StorageOperationsTotal,
@@ -679,6 +700,8 @@ func Register() {
 		SyncPutBlockAdmissionRejectedTotal,
 		SyncPutBlockAdmissionWaitSeconds,
 		SyncPutBlockUserInflightOccupancy,
+		SyncPutBlockWaitersCurrent,
+		SyncPutBlockTimeoutsTotal,
 		UploadLinkWriteThrottledTotal,
 		UploadLinkInflightRejectedTotal,
 		UploadLinkInflightCurrent,

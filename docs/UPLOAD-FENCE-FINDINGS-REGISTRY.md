@@ -117,6 +117,10 @@ Phase 0 resolves it. Session admission, committed-session state, staging limits,
 traffic charging and logical-storage accounting are independent of provisional-row
 retirement and keep their existing cleanup/idempotency behavior.
 
+The table preserves each finding's discovery-time wording. X10's row is
+historical and is superseded by the dated 2026-07-30 closure note immediately
+below the table.
+
 | # | Severity | Finding | Tracked as |
 |---|---|---|---|
 | X1 | Blocker | **Physical delete ABA.** A previously authorized key-only S3 delete can still run after the visible orphan fence clears and after a re-upload has stored new bytes. Rematerialization does not fence it. Cassandra authorization/claim generations alone cannot revoke a DELETE already in flight; X1 closes only with never-reused generational physical keys, so stale deletes can target only old keys. | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` |
@@ -132,27 +136,29 @@ retirement and keep their existing cleanup/idempotency behavior.
 
 ### Dated note — X10, 2026-07-30
 
-The aggregate bound X10 asks for now exists. Its original real-client recovery
-gap is closed, while post-implementation hardening findings keep X10 **open**.
+The aggregate bound and its post-implementation hardening are complete; X10 is
+**closed**.
 
 `PutBlock` acquires a per-`(org, user)` and a per-node in-flight admission before
 `readLimitedRequestBody`, holds it until the handler returns, and answers
-**503 + `Retry-After`** — never 429 — after a bounded wait. The node default of
-`28` is a 2 GiB budget divided by a **measured** ~73 MiB per concurrent
-admission; the isolated per-request benchmark suggested ~40 MiB and would have
-produced a cap nearly twice too permissive, so the end-to-end measurement is the
-one that governs.
+**503 + `Retry-After`** — never 429 — after a bounded wait. Per-user/node waiter
+queues and admitted processing are also bounded. The deadline cancels body and
+object-storage I/O immediately; Cassandra phases stop at callback boundaries and
+each in-progress query has the driver's required finite timeout. Three clean-process
+trials at all 28 slots measured a worst correlated RSS/cgroup increment of
+49.9 MiB per admission; after a 1.25 safety factor the 64 MiB design cost places
+28 slots at 1.75 GiB inside an explicit, validation-enforced 2 GiB budget.
 
 All seven original criteria are now met. The real-client harness uses disposable
 state and controlled slow PUT holders, checks an explicit 503 with positive
 `Retry-After`, proves the subsequent rejections came from real `seaf-cli`, then
 requires post-fault admission, stable sync, byte-for-byte remote payloads, and
-zero stranded admissions. It passed twice consecutively on 2026-07-30.
+zero stranded admissions. It passed twice consecutively in fast mode and again
+at the shipped 10-second wait with `Retry-After: 10`.
 
-The same-day implementation audit found remaining admitted-request lifetime,
-unbounded waiter, unsafe configuration-combination, and proof-quality gaps, so
-X10 is not yet certified as fully DoS-hardened. Full detail is under subcontract
-B of `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` in `docs/KNOWN_ISSUES.md`.
+The implementation audit's lifetime, waiter, unsafe configuration-combination,
+timing-dependent integration and memory-proof findings are resolved. Full detail
+is under subcontract B in `docs/KNOWN_ISSUES.md`.
 
 
 ## X1 design space — closing the physical-delete ABA

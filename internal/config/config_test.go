@@ -40,7 +40,10 @@ func clearLoadEnvOverrides(t *testing.T) {
 		"WEB_UPLOADS_MAX_STAGED_BYTES_PER_SESSION_MB",
 		"SEAFHTTP_TOKEN_TTL", "SEAFHTTP_ZIP_MAX_ENTRIES",
 		"SEAFHTTP_ZIP_MAX_DEPTH", "SEAFHTTP_ZIP_MAX_BYTES",
-		"SEAFHTTP_SYNC_BLOCK_MAX_BYTES",
+		"SEAFHTTP_SYNC_BLOCK_MAX_BYTES", "SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_NODE",
+		"SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_USER", "SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT",
+		"SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_NODE", "SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_USER",
+		"SEAFHTTP_SYNC_BLOCK_ADMITTED_LIFETIME", "SEAFHTTP_SYNC_BLOCK_MEMORY_BUDGET_BYTES",
 		"SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE", "SEAFHTTP_UPLOAD_LINK_WRITE_BURST",
 		"SEAFHTTP_UPLOAD_LINK_SOURCE_WRITES_PER_MINUTE", "SEAFHTTP_UPLOAD_LINK_SOURCE_WRITE_BURST",
 		"SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE", "SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE",
@@ -469,6 +472,8 @@ func TestConfigValidate(t *testing.T) {
 			name: "sync block max bytes accepts a value at the ceiling",
 			modify: func(c *Config) {
 				c.SeafHTTP.SyncBlockMaxBytes = MaxSyncBlockMaxBytes
+				c.SeafHTTP.SyncBlockMaxInflightPerNode = 8
+				c.SeafHTTP.SyncBlockMaxInflightPerUser = 8
 			},
 			wantErr: false,
 		},
@@ -668,6 +673,51 @@ func TestConfigValidate(t *testing.T) {
 			},
 			wantErr:        true,
 			wantErrContain: "seafhttp.sync_block_admission_wait",
+		},
+		{
+			name:           "sync block per-user waiters reject a negative value",
+			modify:         func(c *Config) { c.SeafHTTP.SyncBlockMaxWaitersPerUser = -1 },
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_max_waiters_per_user",
+		},
+		{
+			name:           "sync block node waiters reject above maximum",
+			modify:         func(c *Config) { c.SeafHTTP.SyncBlockMaxWaitersPerNode = MaxSyncBlockMaxWaitersPerNode + 1 },
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_max_waiters_per_node",
+		},
+		{
+			name:           "sync block admitted lifetime rejects zero",
+			modify:         func(c *Config) { c.SeafHTTP.SyncBlockAdmittedLifetime = 0 },
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_admitted_lifetime",
+		},
+		{
+			name:           "sync block memory budget rejects zero",
+			modify:         func(c *Config) { c.SeafHTTP.SyncBlockMemoryBudgetBytes = 0 },
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_memory_budget_bytes",
+		},
+		{
+			name: "sync block memory budget rejects unsafe cap combination",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxBytes = 64 * 1024 * 1024
+				c.SeafHTTP.SyncBlockMaxInflightPerNode = 28
+				c.SeafHTTP.SyncBlockMemoryBudgetBytes = 2 * 1024 * 1024 * 1024
+			},
+			wantErr:        true,
+			wantErrContain: "estimated design cost",
+		},
+		{
+			name: "sync block memory budget retains fixed overhead for tiny bodies",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxBytes = 1
+				c.SeafHTTP.SyncBlockMaxInflightPerNode = 2
+				c.SeafHTTP.SyncBlockMaxInflightPerUser = 2
+				c.SeafHTTP.SyncBlockMemoryBudgetBytes = DefaultSyncBlockDesignBytes
+			},
+			wantErr:        true,
+			wantErrContain: "estimated design cost",
 		},
 		{
 			name: "storage backend rejects unsupported sse mode",
@@ -931,6 +981,7 @@ func TestEnvOverrideSyncBlockMaxBytes(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Auth.DevMode = true
 		t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_BYTES", "33554432")
+		t.Setenv("SEAFHTTP_SYNC_BLOCK_MEMORY_BUDGET_BYTES", "4294967296")
 
 		cfg.applyEnvOverrides()
 		if err := cfg.Validate(); err != nil {
@@ -1962,6 +2013,18 @@ func TestShippedConfigsSeafHTTPBoundsAreValid(t *testing.T) {
 			if got := cfg.SeafHTTP.SyncBlockAdmissionWait; got != DefaultSyncBlockAdmissionWait {
 				t.Fatalf("sync_block_admission_wait = %s, want shipped value %s", got, DefaultSyncBlockAdmissionWait)
 			}
+			if got := cfg.SeafHTTP.SyncBlockMaxWaitersPerUser; got != DefaultSyncBlockMaxWaitersPerUser {
+				t.Fatalf("sync_block_max_waiters_per_user = %d, want shipped value %d", got, DefaultSyncBlockMaxWaitersPerUser)
+			}
+			if got := cfg.SeafHTTP.SyncBlockMaxWaitersPerNode; got != DefaultSyncBlockMaxWaitersPerNode {
+				t.Fatalf("sync_block_max_waiters_per_node = %d, want shipped value %d", got, DefaultSyncBlockMaxWaitersPerNode)
+			}
+			if got := cfg.SeafHTTP.SyncBlockAdmittedLifetime; got != DefaultSyncBlockAdmittedLifetime {
+				t.Fatalf("sync_block_admitted_lifetime = %s, want shipped value %s", got, DefaultSyncBlockAdmittedLifetime)
+			}
+			if got := cfg.SeafHTTP.SyncBlockMemoryBudgetBytes; got != DefaultSyncBlockMemoryBudgetBytes {
+				t.Fatalf("sync_block_memory_budget_bytes = %d, want shipped value %d", got, DefaultSyncBlockMemoryBudgetBytes)
+			}
 		})
 	}
 }
@@ -1981,6 +2044,18 @@ func TestDefaultSyncBlockInflightCaps(t *testing.T) {
 	}
 	if got := cfg.SeafHTTP.SyncBlockAdmissionWait; got != DefaultSyncBlockAdmissionWait {
 		t.Fatalf("SyncBlockAdmissionWait = %s, want %s", got, DefaultSyncBlockAdmissionWait)
+	}
+	if got := cfg.SeafHTTP.SyncBlockMaxWaitersPerUser; got != 16 {
+		t.Fatalf("SyncBlockMaxWaitersPerUser = %d, want 16", got)
+	}
+	if got := cfg.SeafHTTP.SyncBlockMaxWaitersPerNode; got != 128 {
+		t.Fatalf("SyncBlockMaxWaitersPerNode = %d, want 128", got)
+	}
+	if got := cfg.SeafHTTP.SyncBlockAdmittedLifetime; got != 5*time.Minute {
+		t.Fatalf("SyncBlockAdmittedLifetime = %s, want 5m", got)
+	}
+	if got := cfg.SeafHTTP.SyncBlockMemoryBudgetBytes; got != 2*1024*1024*1024 {
+		t.Fatalf("SyncBlockMemoryBudgetBytes = %d, want 2 GiB", got)
 	}
 
 	// One official client can have ~15 concurrent PutBlock requests in flight
@@ -2020,6 +2095,30 @@ func TestEnvOverrideSyncBlockAdmissionWaitRejectsMalformedValues(t *testing.T) {
 	}
 }
 
+func TestEnvOverrideSyncBlockHardeningRejectsMalformedValues(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{"per-user waiters", "SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_USER", "many"},
+		{"node waiters", "SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_NODE", "many"},
+		{"admitted lifetime", "SEAFHTTP_SYNC_BLOCK_ADMITTED_LIFETIME", "five minutes"},
+		{"memory budget", "SEAFHTTP_SYNC_BLOCK_MEMORY_BUDGET_BYTES", "two gib"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearLoadEnvOverrides(t)
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			t.Setenv(tc.env, tc.value)
+			cfg.applyEnvOverrides()
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tc.env) {
+				t.Fatalf("Validate() error = %v, want malformed %s error", err, tc.env)
+			}
+		})
+	}
+}
+
 // TestEnvOverrideSyncBlockInflightCaps confirms the caps are reachable without a
 // config file rebuild, which is how the fault-injection and integration runs
 // force them low.
@@ -2027,9 +2126,14 @@ func TestEnvOverrideSyncBlockInflightCaps(t *testing.T) {
 	clearLoadEnvOverrides(t)
 
 	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
 	t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_NODE", "2")
 	t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_USER", "1")
 	t.Setenv("SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT", "250ms")
+	t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_NODE", "12")
+	t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_USER", "3")
+	t.Setenv("SEAFHTTP_SYNC_BLOCK_ADMITTED_LIFETIME", "45s")
+	t.Setenv("SEAFHTTP_SYNC_BLOCK_MEMORY_BUDGET_BYTES", "1073741824")
 
 	cfg.applyEnvOverrides()
 
@@ -2041,5 +2145,20 @@ func TestEnvOverrideSyncBlockInflightCaps(t *testing.T) {
 	}
 	if got := cfg.SeafHTTP.SyncBlockAdmissionWait; got != 250*time.Millisecond {
 		t.Fatalf("SyncBlockAdmissionWait = %s, want 250ms", got)
+	}
+	if got := cfg.SeafHTTP.SyncBlockMaxWaitersPerNode; got != 12 {
+		t.Fatalf("SyncBlockMaxWaitersPerNode = %d, want 12", got)
+	}
+	if got := cfg.SeafHTTP.SyncBlockMaxWaitersPerUser; got != 3 {
+		t.Fatalf("SyncBlockMaxWaitersPerUser = %d, want 3", got)
+	}
+	if got := cfg.SeafHTTP.SyncBlockAdmittedLifetime; got != 45*time.Second {
+		t.Fatalf("SyncBlockAdmittedLifetime = %s, want 45s", got)
+	}
+	if got := cfg.SeafHTTP.SyncBlockMemoryBudgetBytes; got != 1073741824 {
+		t.Fatalf("SyncBlockMemoryBudgetBytes = %d, want 1 GiB", got)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() with safe overrides: %v", err)
 	}
 }

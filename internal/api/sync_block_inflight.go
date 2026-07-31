@@ -54,7 +54,8 @@ import (
 // cluster-global quota: each node holds its own gates, so fleet-wide admission
 // scales with the number of nodes.
 type syncBlockInflightLimiter struct {
-	// mu guards perUser only. The node gate is a channel and needs no lock.
+	// mu guards perUser and both waiter counters. The semaphore channels remain
+	// the source of truth for active admissions.
 	mu      sync.Mutex
 	perUser map[string]*syncBlockUserGate
 
@@ -62,9 +63,12 @@ type syncBlockInflightLimiter struct {
 	// and a receive returns one. Nil when the node cap is disabled.
 	node chan struct{}
 
-	maxPerUser  int
-	maxPerNode  int
-	waitTimeout time.Duration
+	maxPerUser        int
+	maxPerNode        int
+	maxWaitersPerUser int
+	maxWaitersPerNode int
+	nodeWaiters       int
+	waitTimeout       time.Duration
 
 	// logSample keeps at most one rejection log per interval. A rejected request
 	// is cheap by design; logging every one would turn the defence into a
@@ -79,16 +83,19 @@ type syncBlockInflightLimiter struct {
 // entry can only be removed when nobody holds a slot and nobody is queued for
 // one, so a waiter can never have its gate deleted out from under it.
 type syncBlockUserGate struct {
-	sem  chan struct{}
-	refs int
+	sem     chan struct{}
+	refs    int
+	waiters int
 }
 
 // Rejection reasons. These are metric label values, so the set is fixed and
 // deliberately excludes user, org, repo and block identifiers.
 const (
-	syncBlockRejectUser       = "user"
-	syncBlockRejectNode       = "node"
-	syncBlockRejectClientGone = "client_gone"
+	syncBlockRejectUser          = "user"
+	syncBlockRejectNode          = "node"
+	syncBlockRejectClientGone    = "client_gone"
+	syncBlockRejectUserQueueFull = "user_queue_full"
+	syncBlockRejectNodeQueueFull = "node_queue_full"
 )
 
 // newSyncBlockInflightLimiter returns nil when every bound is disabled, which
@@ -109,11 +116,13 @@ func newSyncBlockInflightLimiter(cfg *config.Config) *syncBlockInflightLimiter {
 		return nil
 	}
 	l := &syncBlockInflightLimiter{
-		perUser:     make(map[string]*syncBlockUserGate),
-		maxPerUser:  maxPerUser,
-		maxPerNode:  maxPerNode,
-		waitTimeout: cfg.SeafHTTP.SyncBlockAdmissionWait,
-		logSample:   rate.Sometimes{Interval: time.Minute},
+		perUser:           make(map[string]*syncBlockUserGate),
+		maxPerUser:        maxPerUser,
+		maxPerNode:        maxPerNode,
+		maxWaitersPerUser: cfg.SeafHTTP.SyncBlockMaxWaitersPerUser,
+		maxWaitersPerNode: cfg.SeafHTTP.SyncBlockMaxWaitersPerNode,
+		waitTimeout:       cfg.SeafHTTP.SyncBlockAdmissionWait,
+		logSample:         rate.Sometimes{Interval: time.Minute},
 	}
 	if maxPerNode > 0 {
 		l.node = make(chan struct{}, maxPerNode)
@@ -148,6 +157,9 @@ func (l *syncBlockInflightLimiter) acquire(ctx context.Context, key string) (fun
 	if l == nil {
 		return func() {}, ""
 	}
+	if ctx != nil && ctx.Err() != nil {
+		return nil, syncBlockRejectClientGone
+	}
 
 	start := time.Now()
 	// One deadline for both gates: the caller waits waitTimeout in total, not
@@ -158,26 +170,33 @@ func (l *syncBlockInflightLimiter) acquire(ctx context.Context, key string) (fun
 	// A zero wait is not a special case: WithTimeout(ctx, 0) is already expired,
 	// so the non-blocking attempt still admits when capacity is free and a full
 	// gate refuses immediately. That is exactly what waitTimeout: 0 means.
-	base := ctx
-	if base == nil {
-		base = context.Background()
-	}
-	waitCtx, cancel := context.WithTimeout(base, l.waitTimeout)
-	defer cancel()
+	wait := newSyncBlockAdmissionWait(ctx, l.waitTimeout)
+	defer wait.close()
 
-	releaseUser, reason := l.acquireUser(waitCtx, key)
+	releaseUser, reason := l.acquireUser(wait, key)
 	if reason != "" {
 		l.observeWait(start, false)
 		return nil, reason
 	}
+	if wait.parent.Err() != nil {
+		releaseUser()
+		l.observeWait(start, false)
+		return nil, syncBlockRejectClientGone
+	}
 
-	releaseNode, reason := l.acquireNode(waitCtx)
+	releaseNode, reason := l.acquireNode(wait)
 	if reason != "" {
 		// Hand back the gate we already hold before answering. Leaving it taken
 		// would leak one slot of this user's budget per refused request.
 		releaseUser()
 		l.observeWait(start, false)
 		return nil, reason
+	}
+	if wait.parent.Err() != nil {
+		releaseNode()
+		releaseUser()
+		l.observeWait(start, false)
+		return nil, syncBlockRejectClientGone
 	}
 
 	l.observeWait(start, true)
@@ -193,9 +212,39 @@ func (l *syncBlockInflightLimiter) acquire(ctx context.Context, key string) (fun
 	}, ""
 }
 
+// syncBlockAdmissionWait creates its deadline lazily. Queue-full requests are
+// therefore rejected before allocating a timer, while both gates still share
+// one deadline measured from the start of admission.
+type syncBlockAdmissionWait struct {
+	parent   context.Context
+	deadline time.Time
+	ctx      context.Context
+	cancel   context.CancelFunc
+}
+
+func newSyncBlockAdmissionWait(parent context.Context, timeout time.Duration) *syncBlockAdmissionWait {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return &syncBlockAdmissionWait{parent: parent, deadline: time.Now().Add(timeout)}
+}
+
+func (w *syncBlockAdmissionWait) context() context.Context {
+	if w.ctx == nil {
+		w.ctx, w.cancel = context.WithDeadline(w.parent, w.deadline)
+	}
+	return w.ctx
+}
+
+func (w *syncBlockAdmissionWait) close() {
+	if w.cancel != nil {
+		w.cancel()
+	}
+}
+
 // acquireUser blocks on the calling user's own gate. Because refs is bumped
 // before the wait, the gate cannot be evicted while somebody is queued on it.
-func (l *syncBlockInflightLimiter) acquireUser(ctx context.Context, key string) (func(), string) {
+func (l *syncBlockInflightLimiter) acquireUser(wait *syncBlockAdmissionWait, key string) (func(), string) {
 	if l.maxPerUser <= 0 {
 		return func() {}, ""
 	}
@@ -206,32 +255,62 @@ func (l *syncBlockInflightLimiter) acquireUser(ctx context.Context, key string) 
 		gate = &syncBlockUserGate{sem: make(chan struct{}, l.maxPerUser)}
 		l.perUser[key] = gate
 	}
-	gate.refs++
-	l.mu.Unlock()
-
-	// dropRef undoes the bookkeeping above and is the only place a gate is
-	// evicted, which keeps the map bounded by the number of users with a live
-	// holder or waiter rather than by every user ever seen.
-	dropRef := func() {
-		l.mu.Lock()
+	dropRefLocked := func() {
 		gate.refs--
 		if gate.refs == 0 && l.perUser[key] == gate {
 			delete(l.perUser, key)
 		}
+	}
+	dropRef := func() {
+		l.mu.Lock()
+		dropRefLocked()
 		l.mu.Unlock()
 	}
 
 	select {
 	case gate.sem <- struct{}{}:
+		gate.refs++
+		l.mu.Unlock()
 	default:
-		// No free slot right now: fall through to the waiting select. Split out
-		// so the common uncontended case never touches ctx.Done().
+		if gate.waiters >= l.maxWaitersPerUser {
+			if gate.refs == 0 {
+				delete(l.perUser, key)
+			}
+			l.mu.Unlock()
+			return nil, syncBlockRejectUserQueueFull
+		}
+		if l.nodeWaiters >= l.maxWaitersPerNode {
+			if gate.refs == 0 {
+				delete(l.perUser, key)
+			}
+			l.mu.Unlock()
+			return nil, syncBlockRejectNodeQueueFull
+		}
+		gate.refs++
+		gate.waiters++
+		l.nodeWaiters++
+		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("user").Inc()
+		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Inc()
+		l.mu.Unlock()
+		ctx := wait.context()
 		select {
 		case gate.sem <- struct{}{}:
 		case <-ctx.Done():
-			dropRef()
-			return nil, ctxRejectReason(ctx, syncBlockRejectUser)
+			l.mu.Lock()
+			gate.waiters--
+			l.nodeWaiters--
+			metrics.SyncPutBlockWaitersCurrent.WithLabelValues("user").Dec()
+			metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Dec()
+			dropRefLocked()
+			l.mu.Unlock()
+			return nil, wait.rejectReason(syncBlockRejectUser)
 		}
+		l.mu.Lock()
+		gate.waiters--
+		l.nodeWaiters--
+		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("user").Dec()
+		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Dec()
+		l.mu.Unlock()
 	}
 
 	metrics.SyncPutBlockUserInflightOccupancy.Observe(float64(len(gate.sem)))
@@ -245,33 +324,55 @@ func (l *syncBlockInflightLimiter) acquireUser(ctx context.Context, key string) 
 // acquireNode blocks on the process-wide gate. This is the one that fixes the
 // memory ceiling, and it is taken last so a user queued on their own cap never
 // occupies node capacity while waiting.
-func (l *syncBlockInflightLimiter) acquireNode(ctx context.Context) (func(), string) {
+func (l *syncBlockInflightLimiter) acquireNode(wait *syncBlockAdmissionWait) (func(), string) {
 	if l.node == nil {
 		return func() {}, ""
 	}
 
+	l.mu.Lock()
 	select {
 	case l.node <- struct{}{}:
+		l.mu.Unlock()
 	default:
+		if l.nodeWaiters >= l.maxWaitersPerNode {
+			l.mu.Unlock()
+			return nil, syncBlockRejectNodeQueueFull
+		}
+		l.nodeWaiters++
+		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Inc()
+		l.mu.Unlock()
+		ctx := wait.context()
 		select {
 		case l.node <- struct{}{}:
 		case <-ctx.Done():
-			return nil, ctxRejectReason(ctx, syncBlockRejectNode)
+			l.mu.Lock()
+			l.nodeWaiters--
+			metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Dec()
+			l.mu.Unlock()
+			return nil, wait.rejectReason(syncBlockRejectNode)
 		}
+		l.mu.Lock()
+		l.nodeWaiters--
+		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Dec()
+		l.mu.Unlock()
 	}
 
-	return func() { <-l.node }, ""
+	return func() {
+		l.mu.Lock()
+		<-l.node
+		l.mu.Unlock()
+	}, ""
 }
 
 // ctxRejectReason distinguishes "we ran out of admission budget" from "the
 // client went away while queued". Only the former is a capacity signal; counting
 // abandoned requests as capacity rejections would make the metric read as
 // overload during ordinary client churn.
-func ctxRejectReason(ctx context.Context, capacityReason string) string {
-	if ctx.Err() == context.DeadlineExceeded {
-		return capacityReason
+func (w *syncBlockAdmissionWait) rejectReason(capacityReason string) string {
+	if w.parent.Err() != nil {
+		return syncBlockRejectClientGone
 	}
-	return syncBlockRejectClientGone
+	return capacityReason
 }
 
 func (l *syncBlockInflightLimiter) observeWait(start time.Time, admitted bool) {

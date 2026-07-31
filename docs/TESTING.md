@@ -96,6 +96,12 @@ profile: `go-integration-test` and `go-all-test` wait for `sesamefs`,
 `SESAMEFS_URL_2`, and `SESAMEFS_URL_3` so integration tests can exercise real
 cross-process races by default.
 
+`sesamefs-node-3` is specialized for block-admission tests: its in-flight caps
+are `2/2`, waiter caps `2/2`, and wait defaults to `250ms`. Set
+`BLOCK_ADMISSION_FAULT_WAIT=10s`, recreate node 3, and run
+`block-admission-fault-test` for the shipped-wait compatibility drill. Node 2
+keeps shipped admission defaults and is the target of the opt-in memory probe.
+
 Keep background GC isolated to the primary `sesamefs` service in that profile.
 `sesamefs-node-2` and `sesamefs-node-3` must keep `GC_ENABLED=false`, or GC-
 sensitive integration tests become nondeterministic because secondary nodes can

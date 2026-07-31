@@ -563,6 +563,11 @@ type SeafHTTPConfig struct {
 	// controller has a legitimate reason to turn the process-local one off.
 	SyncBlockMaxInflightPerNode int `yaml:"sync_block_max_inflight_per_node"`
 
+	// SyncBlockMemoryBudgetBytes is the process memory budget assigned to admitted
+	// block PUTs. Validation rejects a node cap whose measured design cost exceeds
+	// this budget, including when SyncBlockMaxBytes is raised.
+	SyncBlockMemoryBudgetBytes int64 `yaml:"sync_block_memory_budget_bytes"`
+
 	// SyncBlockMaxInflightPerUser caps concurrent block uploads for one
 	// (org, user) on this process. It exists for fairness, not for memory: the
 	// node cap above already bounds total memory, and this one stops a single
@@ -591,6 +596,17 @@ type SeafHTTPConfig struct {
 	// when full", which is the behaviour the bounded wait exists to avoid; it is
 	// allowed but is not the recommended setting.
 	SyncBlockAdmissionWait time.Duration `yaml:"sync_block_admission_wait"`
+
+	// SyncBlockMaxWaitersPerUser and SyncBlockMaxWaitersPerNode bound requests
+	// parked for the gates above. Zero permits no waiting: a request that cannot
+	// acquire immediately is rejected with 503 before a timer is allocated.
+	SyncBlockMaxWaitersPerUser int `yaml:"sync_block_max_waiters_per_user"`
+	SyncBlockMaxWaitersPerNode int `yaml:"sync_block_max_waiters_per_node"`
+
+	// SyncBlockAdmittedLifetime bounds the complete lifetime of an admitted
+	// request, including body read, hashing, and storage. It must be positive so
+	// an admitted slow reader or stalled backend cannot hold capacity forever.
+	SyncBlockAdmittedLifetime time.Duration `yaml:"sync_block_admitted_lifetime"`
 
 	// UploadLinkWritesPerMinute bounds anonymous writes through a public upload
 	// link, keyed on client IP *and* stable public-link source. This is
@@ -662,28 +678,21 @@ const (
 	MaxSyncBlockMaxInflightPerNode = 4096
 	MaxSyncBlockMaxInflightPerUser = 4096
 	MaxSyncBlockAdmissionWait      = 2 * time.Minute
+	MaxSyncBlockMaxWaitersPerNode  = 65536
+	MaxSyncBlockMaxWaitersPerUser  = 4096
+	MaxSyncBlockMemoryBudgetBytes  = int64(1 << 40) // 1 TiB operator ceiling
 
-	// The node default is derived, not chosen:
+	// The node default is derived, not chosen. Three clean-process trials at 28
+	// concurrent 16 MiB bodies measured a worst correlated RSS/cgroup increment
+	// of 49.9 MiB per admission. A 1.25 safety factor gives 59.6 MiB, rounded up
+	// to a 64 MiB design cost. 28 admissions therefore reserve 1.75 GiB of the
+	// explicit 2 GiB route budget.
 	//
-	//	2 GiB budget for block PUT on an 8 GiB node
-	//	/ ~73 MiB heap per concurrent admission, measured end to end
-	//	= 28
-	//
-	// The divisor comes from TestSyncBlockMemoryUnderSaturation in
-	// internal/integration, which drives a real node with 16 MiB bodies and reads
-	// its own heap gauge: 16 concurrent admissions took the heap to ~1.17 GiB.
-	//
-	// Do not re-derive this from the isolated benchmark alone.
-	// BenchmarkPutBlockBodyMemory reports ~19.7 MiB retained per request, and
-	// doubling that for GOGC=100 suggests ~40 MiB — which understates the real
-	// cost by nearly half, because it measures only MaxBytesReader, io.ReadAll
-	// and the hash. The storage path, the HTTP machinery and the read-growth
-	// garbage of every concurrent request pending collection are all real and all
-	// missing from it. The end-to-end measurement is the authoritative one.
-	//
-	// Re-run that measurement and redo this division before changing
-	// sync_block_max_bytes: the two settings multiply.
+	// Validation scales the design cost linearly when SyncBlockMaxBytes changes,
+	// so the cap and body size cannot silently outgrow the configured budget.
 	DefaultSyncBlockMaxInflightPerNode = 28
+	DefaultSyncBlockMemoryBudgetBytes  = int64(2 * 1024 * 1024 * 1024)
+	DefaultSyncBlockDesignBytes        = int64(64 * 1024 * 1024)
 
 	// The per-user default is a fairness split, not a memory one. It sits just
 	// above the ~15 concurrent PutBlock requests one official client can issue
@@ -695,7 +704,10 @@ const (
 	// The wait has to be long enough to absorb a burst and short enough that the
 	// client is still listening when the 503 arrives. See the dated subcontract B
 	// note in docs/KNOWN_ISSUES.md for the fault-injection run behind this value.
-	DefaultSyncBlockAdmissionWait = 10 * time.Second
+	DefaultSyncBlockAdmissionWait     = 10 * time.Second
+	DefaultSyncBlockMaxWaitersPerUser = 16
+	DefaultSyncBlockMaxWaitersPerNode = 128
+	DefaultSyncBlockAdmittedLifetime  = 5 * time.Minute
 
 	// Anonymous upload-link write limits.
 	//
@@ -1143,8 +1155,12 @@ func DefaultConfig() *Config {
 			SyncBlockMaxBytes:      DefaultSyncBlockMaxBytes,
 
 			SyncBlockMaxInflightPerNode: DefaultSyncBlockMaxInflightPerNode,
+			SyncBlockMemoryBudgetBytes:  DefaultSyncBlockMemoryBudgetBytes,
 			SyncBlockMaxInflightPerUser: DefaultSyncBlockMaxInflightPerUser,
 			SyncBlockAdmissionWait:      DefaultSyncBlockAdmissionWait,
+			SyncBlockMaxWaitersPerUser:  DefaultSyncBlockMaxWaitersPerUser,
+			SyncBlockMaxWaitersPerNode:  DefaultSyncBlockMaxWaitersPerNode,
+			SyncBlockAdmittedLifetime:   DefaultSyncBlockAdmittedLifetime,
 
 			UploadLinkWritesPerMinute:       DefaultUploadLinkWritesPerMinute,
 			UploadLinkWriteBurst:            DefaultUploadLinkWriteBurst,
@@ -1462,12 +1478,30 @@ func (c *Config) applyEnvOverrides() {
 			c.SeafHTTP.SyncBlockAdmissionWait = d
 		}
 	}
+	if v := os.Getenv("SEAFHTTP_SYNC_BLOCK_ADMITTED_LIFETIME"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			c.addEnvOverrideError("SEAFHTTP_SYNC_BLOCK_ADMITTED_LIFETIME is invalid: %v", err)
+		} else {
+			c.SeafHTTP.SyncBlockAdmittedLifetime = d
+		}
+	}
+	if v := os.Getenv("SEAFHTTP_SYNC_BLOCK_MEMORY_BUDGET_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			c.addEnvOverrideError("SEAFHTTP_SYNC_BLOCK_MEMORY_BUDGET_BYTES is invalid: %v", err)
+		} else {
+			c.SeafHTTP.SyncBlockMemoryBudgetBytes = n
+		}
+	}
 	for _, override := range []struct {
 		env    string
 		target *int
 	}{
 		{"SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_NODE", &c.SeafHTTP.SyncBlockMaxInflightPerNode},
 		{"SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_USER", &c.SeafHTTP.SyncBlockMaxInflightPerUser},
+		{"SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_NODE", &c.SeafHTTP.SyncBlockMaxWaitersPerNode},
+		{"SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_USER", &c.SeafHTTP.SyncBlockMaxWaitersPerUser},
 		{"SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE", &c.SeafHTTP.UploadLinkWritesPerMinute},
 		{"SEAFHTTP_UPLOAD_LINK_WRITE_BURST", &c.SeafHTTP.UploadLinkWriteBurst},
 		{"SEAFHTTP_UPLOAD_LINK_SOURCE_WRITES_PER_MINUTE", &c.SeafHTTP.UploadLinkSourceWritesPerMinute},
@@ -1972,6 +2006,20 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("seafhttp.sync_block_max_inflight_per_user is %d, above the %d ceiling",
 			c.SeafHTTP.SyncBlockMaxInflightPerUser, MaxSyncBlockMaxInflightPerUser)
 	}
+	if c.SeafHTTP.SyncBlockMemoryBudgetBytes <= 0 || c.SeafHTTP.SyncBlockMemoryBudgetBytes > MaxSyncBlockMemoryBudgetBytes {
+		return fmt.Errorf("seafhttp.sync_block_memory_budget_bytes must be between 1 and %d", MaxSyncBlockMemoryBudgetBytes)
+	}
+	if c.SeafHTTP.SyncBlockMaxInflightPerNode > 0 {
+		designBytes := (DefaultSyncBlockDesignBytes*c.SeafHTTP.SyncBlockMaxBytes + DefaultSyncBlockMaxBytes - 1) / DefaultSyncBlockMaxBytes
+		// The measurement includes fixed HTTP, goroutine, hashing and storage
+		// overhead. A smaller body cap cannot scale that fixed cost toward zero.
+		if designBytes < DefaultSyncBlockDesignBytes {
+			designBytes = DefaultSyncBlockDesignBytes
+		}
+		if int64(c.SeafHTTP.SyncBlockMaxInflightPerNode) > c.SeafHTTP.SyncBlockMemoryBudgetBytes/designBytes {
+			return fmt.Errorf("seafhttp.sync_block_max_inflight_per_node=%d exceeds sync_block_memory_budget_bytes=%d at estimated design cost %d bytes per admission", c.SeafHTTP.SyncBlockMaxInflightPerNode, c.SeafHTTP.SyncBlockMemoryBudgetBytes, designBytes)
+		}
+	}
 	// A per-user cap above the node cap cannot bind: the node gate is acquired
 	// second and would refuse first, so the configuration reads as fairness
 	// protection that silently does nothing.
@@ -1985,6 +2033,21 @@ func (c *Config) Validate() error {
 	if c.SeafHTTP.SyncBlockAdmissionWait > MaxSyncBlockAdmissionWait {
 		return fmt.Errorf("seafhttp.sync_block_admission_wait is %s, above the %s ceiling; a wait longer than the sync client's own request timeout means the client gives up before the server answers",
 			c.SeafHTTP.SyncBlockAdmissionWait, MaxSyncBlockAdmissionWait)
+	}
+	if c.SeafHTTP.SyncBlockMaxWaitersPerNode < 0 {
+		return fmt.Errorf("seafhttp.sync_block_max_waiters_per_node must be greater than or equal to zero (zero rejects immediately when the node gate is full)")
+	}
+	if c.SeafHTTP.SyncBlockMaxWaitersPerUser < 0 {
+		return fmt.Errorf("seafhttp.sync_block_max_waiters_per_user must be greater than or equal to zero (zero rejects immediately when the user gate is full)")
+	}
+	if c.SeafHTTP.SyncBlockMaxWaitersPerNode > MaxSyncBlockMaxWaitersPerNode {
+		return fmt.Errorf("seafhttp.sync_block_max_waiters_per_node is %d, above the %d ceiling", c.SeafHTTP.SyncBlockMaxWaitersPerNode, MaxSyncBlockMaxWaitersPerNode)
+	}
+	if c.SeafHTTP.SyncBlockMaxWaitersPerUser > MaxSyncBlockMaxWaitersPerUser {
+		return fmt.Errorf("seafhttp.sync_block_max_waiters_per_user is %d, above the %d ceiling", c.SeafHTTP.SyncBlockMaxWaitersPerUser, MaxSyncBlockMaxWaitersPerUser)
+	}
+	if c.SeafHTTP.SyncBlockAdmittedLifetime <= 0 {
+		return fmt.Errorf("seafhttp.sync_block_admitted_lifetime must be greater than zero")
 	}
 	if err := validateUploadLinkWriteLimit(
 		"upload_link_writes_per_minute", "upload_link_write_burst",

@@ -44,6 +44,7 @@ SYNC_DATA_DIR="${SYNC_DATA_DIR:-/seafile-data}"
 FILE_COUNT="${FILE_COUNT:-3}"
 FILE_MIB="${FILE_MIB:-8}"
 SYNC_TIMEOUT="${SYNC_TIMEOUT:-240}"
+HOLDER_RATE="${HOLDER_RATE:-8k}"
 
 LIBRARY_PREFIX="fault-inject-block-admission"
 
@@ -227,7 +228,7 @@ for n in 1 2; do
     "${SESAMEFS_URL}/seafhttp/repo/${repo_id}/block/${holder_hash}" \
     -H "Authorization: Token ${DEV_API_TOKEN}" \
     -H "Content-Type: application/octet-stream" \
-    --limit-rate 8k --upload-file "${holder_file}" >"/tmp/block-holder-${n}.status" &
+    --limit-rate "${HOLDER_RATE}" --upload-file "${holder_file}" >"/tmp/block-holder-${n}.status" &
   HOLDER_PIDS="${HOLDER_PIDS} $!"
 done
 

@@ -78,84 +78,164 @@ func putBlockOnNode(c *testClient, repoID, blockID string, payload []byte) (int,
 	return resp.StatusCode, resp.Header.Get("Retry-After"), nil
 }
 
+type admissionHeldBody struct {
+	started chan<- struct{}
+	release <-chan struct{}
+	value   byte
+	once    sync.Once
+}
+
+func (b *admissionHeldBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { b.started <- struct{}{} })
+	<-b.release
+	if len(p) == 0 {
+		return 0, io.EOF
+	}
+	p[0] = b.value
+	return 1, io.EOF
+}
+
+func putHeldAdmissionBlock(c *testClient, repoID, blockID string, body io.Reader) (int, error) {
+	req, err := http.NewRequest(http.MethodPut,
+		fmt.Sprintf("%s/seafhttp/repo/%s/block/%s", c.baseURL, repoID, blockID), body)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
+}
+
+func waitForAdmissionInflight(t *testing.T, c *testClient, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		gauges, err := scrapeNodeMemoryGauges(c)
+		if err == nil && int(gauges.inflight) == want {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	gauges, err := scrapeNodeMemoryGauges(c)
+	if err != nil {
+		t.Fatalf("scrape admission gauge: %v", err)
+	}
+	t.Fatalf("inflight = %.0f, want %d", gauges.inflight, want)
+}
+
+func runHeldAdmissions(t *testing.T, holders []struct {
+	client *testClient
+	repoID string
+}) func() {
+	t.Helper()
+	started := make(chan struct{}, len(holders))
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, len(holders))
+	for i, holder := range holders {
+		wg.Add(1)
+		go func(i int, holder struct {
+			client *testClient
+			repoID string
+		}) {
+			defer wg.Done()
+			value := byte(i + 1)
+			body := &admissionHeldBody{started: started, release: release, value: value}
+			code, err := putHeldAdmissionBlock(holder.client, holder.repoID, syncSHA256HexForTest([]byte{value}), body)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if code != http.StatusOK {
+				errs <- fmt.Errorf("holder %d returned %d", i, code)
+			}
+		}(i, holder)
+	}
+	for range holders {
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+			close(release)
+			wg.Wait()
+			t.Fatal("holder did not reach the server body read")
+		}
+	}
+	return func() {
+		close(release)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Errorf("held admission: %v", err)
+			}
+		}
+	}
+}
+
 // TestSyncBlockAdmissionRefusesWith503UnderSaturation drives more concurrent
 // block PUTs than the node will admit and pins the contract the desktop sync
 // client depends on: the overflow is refused 503 with a Retry-After, and never
 // 429, which that client does not treat as retryable.
 func TestSyncBlockAdmissionRefusesWith503UnderSaturation(t *testing.T) {
 	requireCassandra(t)
-	client := admissionTestClient(t)
-
-	repoID := createTestLibrary(t, client, fmt.Sprintf("inttest-block-admission-%d", time.Now().UnixNano()))
-
-	// Enough concurrency that the queue cannot drain within the admission wait.
-	// Each admission costs a real storage round trip, so 64 requests through 2
-	// slots is far more work than 250ms of waiting can cover.
-	const concurrency = 64
-
-	var wg sync.WaitGroup
-	codes := make([]int, concurrency)
-	retryAfters := make([]string, concurrency)
-	errs := make([]error, concurrency)
-
-	payloads := make([][]byte, concurrency)
-	for i := range payloads {
-		// Distinct payloads so dedup cannot short-circuit the work and free slots
-		// faster than the burst arrives.
-		payloads[i] = bytes.Repeat([]byte{byte(i + 1)}, admissionTestBlockLen)
+	admin := admissionTestClient(t)
+	user := newTestClient(admin.baseURL, "dev-token-user")
+	if err := verifyIntegrationAuth(admin.baseURL, user.token); err != nil {
+		t.Fatalf("secondary user auth probe: %v", err)
 	}
+	adminRepo := createTestLibrary(t, admin, fmt.Sprintf("inttest-block-admission-admin-%d", time.Now().UnixNano()))
+	userRepo := createTestLibrary(t, user, fmt.Sprintf("inttest-block-admission-user-%d", time.Now().UnixNano()))
 
-	start := make(chan struct{})
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			<-start
-			blockID := syncSHA256HexForTest(payloads[i])
-			codes[i], retryAfters[i], errs[i] = putBlockOnNode(client, repoID, blockID, payloads[i])
-		}(i)
-	}
-	close(start)
-	wg.Wait()
-
-	var ok, refused, other int
-	for i := 0; i < concurrency; i++ {
-		if errs[i] != nil {
-			t.Fatalf("request %d failed at the transport level: %v", i, errs[i])
+	assertOverflow := func(t *testing.T, client *testClient, repoID string) {
+		t.Helper()
+		payload := []byte("deterministic overflow")
+		started := time.Now()
+		code, retryAfter, err := putBlockOnNode(client, repoID, syncSHA256HexForTest(payload), payload)
+		if err != nil {
+			t.Fatalf("overflow request: %v", err)
 		}
-		switch codes[i] {
-		case http.StatusOK:
-			ok++
-		case http.StatusServiceUnavailable:
-			refused++
-			// A refusal the client cannot act on is not a working contract.
-			seconds, err := strconv.Atoi(retryAfters[i])
-			if err != nil || seconds < 1 {
-				t.Errorf("request %d refused 503 with Retry-After=%q, want a positive integer", i, retryAfters[i])
-			}
-		case http.StatusTooManyRequests:
-			t.Fatalf("request %d answered 429; the desktop sync client does not retry 429, this route must answer 503", i)
-		default:
-			other++
-			t.Errorf("request %d = %d, want 200 or 503", i, codes[i])
+		if code == http.StatusTooManyRequests {
+			t.Fatal("overflow returned 429; desktop client only retries 503")
+		}
+		if code != http.StatusServiceUnavailable {
+			t.Fatalf("overflow returned %d, want 503", code)
+		}
+		seconds, err := strconv.Atoi(retryAfter)
+		if err != nil || seconds < 1 {
+			t.Fatalf("Retry-After = %q, want positive integer", retryAfter)
+		}
+		if elapsed := time.Since(started); elapsed < admissionTestWait/2 {
+			t.Fatalf("overflow rejected after %s, want bounded wait near %s", elapsed, admissionTestWait)
 		}
 	}
 
-	if ok == 0 {
-		t.Fatalf("no request succeeded (%d refused, %d other); the gate is refusing traffic it should admit", refused, other)
-	}
-	// Without the guard every request would be admitted and the process would
-	// buffer all of them at once, which is the defect subcontract B closes. With
-	// it, a burst that cannot drain inside the wait has to shed load.
-	//
-	// If this fails, check the drain time before concluding the gate is missing:
-	// admissions that complete quickly enough for the whole queue to clear within
-	// SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT are supposed to all succeed.
-	if refused == 0 {
-		t.Fatalf("all %d concurrent block PUTs were admitted against a node cap of %d with a %s wait; either the in-flight gate is not wired into this route, or the burst drained inside the wait and this fixture is no longer saturating",
-			concurrency, admissionTestNodeCap, admissionTestWait)
-	}
-	t.Logf("burst of %d against node cap %d: %d admitted, %d refused 503", concurrency, admissionTestNodeCap, ok, refused)
+	t.Run("per-user gate", func(t *testing.T) {
+		release := runHeldAdmissions(t, []struct {
+			client *testClient
+			repoID string
+		}{{admin, adminRepo}, {admin, adminRepo}})
+		waitForAdmissionInflight(t, admin, admissionTestNodeCap)
+		assertOverflow(t, admin, adminRepo)
+		release()
+		waitForAdmissionInflight(t, admin, 0)
+	})
+
+	t.Run("node gate across users", func(t *testing.T) {
+		release := runHeldAdmissions(t, []struct {
+			client *testClient
+			repoID string
+		}{{admin, adminRepo}, {user, userRepo}})
+		waitForAdmissionInflight(t, admin, admissionTestNodeCap)
+		assertOverflow(t, admin, adminRepo)
+		release()
+		waitForAdmissionInflight(t, admin, 0)
+	})
 }
 
 // TestSyncBlockAdmissionWaitAbsorbsBurstAtCap is the other half of the contract
