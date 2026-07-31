@@ -541,6 +541,13 @@ var (
 	//   "node"         — the process-wide gate: the node is genuinely saturated
 	//   "user_queue_full" — the bounded per-user waiter queue was already full
 	//   "node_queue_full" — the bounded process waiter queue was already full
+	//   "entry_queue_full" — the pre-gate entry ring was full, so admission was
+	//                        refused before any per-user state could be created
+	// "node_queue_full" and "entry_queue_full" are kept apart on purpose. The
+	// first says the node is genuinely saturated with parked requests and wants
+	// more capacity; the second is a high-cardinality burst exhausting the entry
+	// ring for an instant and is usually transient. Read either against
+	// sync_put_block_entries_current.
 	//   "client_gone"  — the client disconnected while queued
 	// The first four are all capacity signals, and they say different things: the
 	// gate reasons mean a request waited out its budget, the queue_full ones mean
@@ -599,6 +606,35 @@ var (
 			Help: "Total admitted block uploads ended by a body or storage timeout.",
 		},
 		[]string{"phase"},
+	)
+
+	// SyncPutBlockEntriesCurrent reports requests holding the pre-gate entry
+	// ticket: admitted uploads plus everything parked on either gate. It is the
+	// occupancy counterpart to sync_put_block_admission_rejected_total{reason=
+	// "entry_queue_full"} — without it, an operator seeing that reason cannot
+	// tell a genuinely full node from a brief high-cardinality burst.
+	SyncPutBlockEntriesCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sync_put_block_entries_current",
+			Help: "Current block uploads holding an admission entry ticket (admitted plus parked) in this process.",
+		},
+	)
+
+	// SyncPutBlockReadDeadlineUnsupportedTotal counts block uploads refused
+	// because the admitted-lifetime deadline could not be installed on the
+	// connection.
+	//
+	// This should be flat at zero forever. A non-zero value means some
+	// ResponseWriter in the chain does not implement Unwrap(), so
+	// http.NewResponseController cannot reach the socket — the failure mode that
+	// would otherwise leave a stalled body holding an admission indefinitely.
+	// It is a counter rather than a silent fallback precisely because the
+	// fallback cannot interrupt a parked read.
+	SyncPutBlockReadDeadlineUnsupportedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sync_put_block_read_deadline_unsupported_total",
+			Help: "Total block uploads refused because the admitted-lifetime read deadline could not be installed on the connection. Any non-zero value is a wiring defect.",
+		},
 	)
 
 	// UploadLinkWriteThrottledTotal counts anonymous upload-link writes refused by
@@ -705,6 +741,8 @@ func Register() {
 		SyncPutBlockUserInflightOccupancy,
 		SyncPutBlockWaitersCurrent,
 		SyncPutBlockTimeoutsTotal,
+		SyncPutBlockEntriesCurrent,
+		SyncPutBlockReadDeadlineUnsupportedTotal,
 		UploadLinkWriteThrottledTotal,
 		UploadLinkInflightRejectedTotal,
 		UploadLinkInflightCurrent,

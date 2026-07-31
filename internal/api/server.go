@@ -54,11 +54,21 @@ type clientSSOEntry struct {
 func gzipExcludedPathsRegexs(metricsPath string) []string {
 	return []string{
 		"^" + regexp.QuoteMeta(metricsPath) + "$", // promhttp handles compression itself
-		"/seafhttp/files/.*",                      // file downloads
-		"/seafhttp/zip/.*",                        // zip downloads
-		"/seafhttp/upload/.*",                     // file uploads
-		"/api/v2.1/.*raw/.*",                      // raw file serving (inline preview)
-		"/api/v2.1/.*history/.*",                  // historic file downloads
+		// Sync block PUT/GET. Blocks are opaque binary and a PUT's response is a
+		// few bytes, so there is nothing to gain here — and something to lose:
+		// gin-contrib/gzip replaces c.Writer with a gzipWriter that embeds the
+		// gin.ResponseWriter *interface*, which does not declare Unwrap(). The
+		// wrapper therefore exposes neither SetReadDeadline nor Unwrap, so
+		// http.NewResponseController cannot reach the connection and PutBlock's
+		// admitted-lifetime read deadline silently degrades to the body-close
+		// fallback that cannot interrupt a parked read. A client sending
+		// Accept-Encoding: gzip could then hold an admission open indefinitely.
+		"/seafhttp/repo/.*/block/.*",
+		"/seafhttp/files/.*",     // file downloads
+		"/seafhttp/zip/.*",       // zip downloads
+		"/seafhttp/upload/.*",    // file uploads
+		"/api/v2.1/.*raw/.*",     // raw file serving (inline preview)
+		"/api/v2.1/.*history/.*", // historic file downloads
 	}
 }
 

@@ -437,13 +437,19 @@ func TestBlockAdmissionEntryCapBoundsDistinctUserCardinality(t *testing.T) {
 
 	cancel()
 	releaseHolder()
-	queueFull := 0
+	// The entry ring reports entry_queue_full, not node_queue_full: this burst is
+	// high cardinality exhausting the pre-gate ring, which is a different
+	// operational signal from a saturated node waiter queue.
+	entryFull := 0
 	for i := 0; i < contenders; i++ {
-		if reason := <-results; reason == syncBlockRejectNodeQueueFull {
-			queueFull++
+		switch reason := <-results; reason {
+		case syncBlockRejectEntryQueueFull:
+			entryFull++
+		case syncBlockRejectNodeQueueFull:
+			t.Errorf("entry-ring rejection reported itself as %q; the two must stay distinguishable", reason)
 		}
 	}
-	if queueFull == 0 {
+	if entryFull == 0 {
 		t.Fatal("high-cardinality burst never reached the global entry cap")
 	}
 	if err := requireDrainedLimiter(l); err != nil {
@@ -725,4 +731,51 @@ func requireWaiterCount(t *testing.T, l *syncBlockInflightLimiter, gateName stri
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("%s waiter count did not reach %d", gateName, want)
+}
+
+// TestEntryRingExhaustionHasItsOwnReason keeps the pre-gate entry ring
+// distinguishable from the node waiter queue. Both mean "no room", but they ask
+// the operator for opposite responses: a full waiter queue is a saturated node
+// that wants capacity, while a full entry ring is a momentary high-cardinality
+// burst that clears itself. Folding them into one label would make the only
+// signal an operator has ambiguous.
+func TestEntryRingExhaustionHasItsOwnReason(t *testing.T) {
+	cfg := syncInflightConfig(1, 1, time.Second)
+	cfg.SeafHTTP.SyncBlockMaxWaitersPerNode = 1
+	cfg.SeafHTTP.SyncBlockMaxWaitersPerUser = 1
+	l := newSyncBlockInflightLimiter(cfg)
+	if l == nil {
+		t.Fatal("limiter not constructed")
+	}
+
+	// Entry ring capacity is node cap + node waiters = 2. Fill it with holders
+	// that never release, then confirm the gauge sees them.
+	var releases []func()
+	for i := 0; i < 2; i++ {
+		release, reason := l.acquireEntry(context.Background())
+		if release == nil {
+			t.Fatalf("entry %d refused with %q while the ring still had room", i, reason)
+		}
+		releases = append(releases, release)
+	}
+	if got := testutil.ToFloat64(metrics.SyncPutBlockEntriesCurrent); got < 2 {
+		t.Fatalf("entries gauge = %v while 2 tickets are held, want at least 2", got)
+	}
+
+	release, reason := l.acquireEntry(context.Background())
+	if release != nil {
+		t.Fatal("entry ring admitted past its capacity")
+	}
+	if reason != syncBlockRejectEntryQueueFull {
+		t.Fatalf("reason = %q, want %q; the entry ring must not report itself as the node waiter queue",
+			reason, syncBlockRejectEntryQueueFull)
+	}
+
+	for _, r := range releases {
+		r()
+		r() // idempotent
+	}
+	if len(l.entries) != 0 {
+		t.Fatalf("entry ring still holds %d tickets after release", len(l.entries))
+	}
 }

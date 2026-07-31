@@ -167,6 +167,17 @@ requires post-fault admission, stable sync, byte-for-byte remote payloads, and
 zero stranded admissions. It passed twice consecutively in fast mode and again
 at the shipped 10-second wait with `Retry-After: 10`.
 
+A follow-up review on 2026-07-31 found the connection deadline itself was
+bypassable: `gin-contrib/gzip` wraps `c.Writer` in a type that embeds the
+`gin.ResponseWriter` interface, which does not declare `Unwrap()`, so
+`http.NewResponseController` could not reach the socket and the deadline
+silently degraded to the ineffective body-close fallback. One request header
+(`Accept-Encoding: gzip`) was enough to hold an admission indefinitely. The
+block route is now excluded from gzip, and a deadline that cannot be installed
+on a server-handled request drops the connection and increments
+`sync_put_block_read_deadline_unsupported_total` instead of proceeding
+unprotected.
+
 The implementation audit's lifetime, waiter, unsafe configuration-combination,
 timing-dependent integration and memory-proof findings are resolved. Full detail
 is under subcontract B in `docs/KNOWN_ISSUES.md`.

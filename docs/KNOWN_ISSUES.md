@@ -5303,6 +5303,12 @@ just the read, because that whole span is what the buffered body costs.
   This closes the distinct-identity transition between `acquireUser` and
   `acquireNode`; a regression launches 1,000 identities and requires both ticket
   occupancy and `perUser` cardinality to remain within the configured bound.
+  Exhausting that ring reports its own `entry_queue_full` reason, kept separate
+  from `node_queue_full` on purpose: a full waiter queue is a saturated node that
+  wants capacity, while a full entry ring is a momentary high-cardinality burst
+  that usually clears itself, and one label for both would leave an operator
+  unable to tell them apart. `sync_put_block_entries_current` is the occupancy
+  counterpart to read either against.
 - Once admitted, one 5-minute processing deadline (ceiling 30 minutes) covers body
   read, hashing and storage. Expiry
   sets the effective request deadline as a **read deadline on the connection**
@@ -5324,6 +5330,38 @@ just the read, because that whole span is what the buffered body costs.
   connection** that goes silent mid-body; reverting to the body-close path fails
   it. Separate real-TCP regressions cover the admitted deadline, an earlier
   inherited request deadline, and an earlier `server.read_timeout`.
+
+  **That deadline was itself bypassable, found and fixed 2026-07-31.** Reaching
+  the connection depends on `http.NewResponseController` walking the writer chain,
+  and that walk follows `Unwrap()`. gin's concrete `*responseWriter` implements
+  `Unwrap`, but the `gin.ResponseWriter` **interface** does not declare it — so a
+  middleware that embeds the interface exposes neither `SetReadDeadline` nor
+  `Unwrap` and terminates the walk. `gin-contrib/gzip` is exactly such a wrapper,
+  it is installed globally, it replaces `c.Writer` before `c.Next()`, and it does
+  not filter by method. The block route was not in its exclusion list, so an
+  authenticated client sending `Accept-Encoding: gzip`, announcing a body, writing
+  a few bytes and going silent got an admission whose deadline never reached the
+  socket — the exact capacity leak the deadline exists to prevent, reachable with
+  one request header. A reproduction differing from the passing regression only by
+  that header was never answered at all.
+
+  Two changes close it. The block route is excluded from gzip (blocks are opaque
+  binary and a PUT's response is a few bytes, so compression buys nothing there
+  anyway), and a failure to install the deadline on a server-handled request is
+  now fail-closed and counted rather than silently degraded:
+  `sync_put_block_read_deadline_unsupported_total` must stay at zero, and any
+  non-zero value is a wiring defect. The refusal **drops the connection** instead
+  of answering 503, because a 503 is not deliverable there: net/http drains the
+  body the peer never finished sending before the response reaches the socket, and
+  with no deadline installed that drain is the unbounded wait being refused. A
+  dropped connection is what the sync client already classifies as transient.
+  Requests with no connection at all — test recorders, non-net/http writers — keep
+  the body-close fallback, which genuinely does end their ordinary readers.
+
+  Regressions cover all three paths: the shipped gzip middleware plus a real
+  stalled TCP connection, a writer wrapper that hides `Unwrap` (must drop and
+  count), and a synthetic writer (must keep the fallback and not count). Removing
+  the gzip exclusion fails the first.
 
   The last phase is deliberately exempt: once the bytes are stored and the mapping
   registered there is nothing left for a timeout to prevent, so an expiry there

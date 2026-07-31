@@ -34,6 +34,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/aws/smithy-go"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/time/rate"
 )
 
 // ErrHeadConflict indicates that the HEAD was modified concurrently (CAS failure)
@@ -1335,7 +1336,7 @@ var errSyncBlockAdmittedLifetime = errors.New("sync block admitted lifetime exce
 //
 // The server rearms its own read deadline at the start of every request on a
 // keep-alive connection, so the deadline set here cannot leak into the next one.
-func (h *SyncHandler) beginSyncBlockAdmittedLifetime(c *gin.Context) func() {
+func (h *SyncHandler) beginSyncBlockAdmittedLifetime(c *gin.Context) (func(), bool) {
 	startedAt := time.Now()
 	admittedDeadline := startedAt.Add(h.syncBlockAdmittedLifetime())
 	ctx, cancel := context.WithDeadlineCause(c.Request.Context(), admittedDeadline, errSyncBlockAdmittedLifetime)
@@ -1349,14 +1350,35 @@ func (h *SyncHandler) beginSyncBlockAdmittedLifetime(c *gin.Context) func() {
 	serverDeadlineIsStronger := h != nil && h.config != nil && h.config.Server.ReadTimeout > 0 &&
 		h.config.Server.ReadTimeout <= effectiveDeadline.Sub(startedAt)
 	if !serverDeadlineIsStronger {
-		if err := http.NewResponseController(c.Writer).SetReadDeadline(effectiveDeadline); err == nil {
-			return cancel
+		if err := http.NewResponseController(c.Writer).SetReadDeadline(effectiveDeadline); err != nil {
+			// On a real connection this is the whole guard failing, not a
+			// degraded mode: without a socket deadline nothing can interrupt a
+			// parked body read, so a stalled peer would hold its admission until
+			// the process restarts. That is how a middleware wrapping c.Writer
+			// without Unwrap() — gin-contrib/gzip is exactly such a wrapper —
+			// would silently disarm subcontract B. Refuse the request instead,
+			// loudly, so the failure is a visible 503 and a counter rather than
+			// a capacity leak nobody notices.
+			if isServerHandledRequest(c.Request) {
+				cancel()
+				h.rejectSyncBlockUnprotected(c)
+				return nil, false
+			}
+			// Synthetic writers (test recorders, exotic ResponseWriters) never
+			// had a connection to begin with. Their bodies are ordinary readers
+			// whose Close is not bound to net/http's read mutex, so closing on
+			// cancellation genuinely does end them.
+			return h.closeBodyOnCancel(c, ctx, cancel), true
 		}
+		return cancel, true
 	}
-	// No connection to put a deadline on (test recorders, exotic writers). The
-	// same fallback is useful when an earlier server deadline already owns the
-	// socket. Closing the body is strictly weaker, but still ends synthetic or
-	// non-net/http bodies whose Close is not bound to the read mutex.
+	// An earlier server read timeout already owns the socket and is stricter, so
+	// overwriting it would weaken the bound. Keep the body-close fallback for the
+	// non-connection cases that still reach here.
+	return h.closeBodyOnCancel(c, ctx, cancel), true
+}
+
+func (h *SyncHandler) closeBodyOnCancel(c *gin.Context, ctx context.Context, cancel context.CancelFunc) func() {
 	body := c.Request.Body
 	stopClose := context.AfterFunc(ctx, func() {
 		if body != nil {
@@ -1368,6 +1390,55 @@ func (h *SyncHandler) beginSyncBlockAdmittedLifetime(c *gin.Context) func() {
 		cancel()
 	}
 }
+
+// isServerHandledRequest reports whether the request was dispatched by net/http's
+// server, which is the only case that has a connection to put a deadline on.
+// net/http sets LocalAddrContextKey on every served request; httptest recorders
+// and hand-built contexts do not.
+func isServerHandledRequest(r *http.Request) bool {
+	if r == nil || r.Context() == nil {
+		return false
+	}
+	return r.Context().Value(http.LocalAddrContextKey) != nil
+}
+
+// rejectSyncBlockUnprotected ends a request whose admitted lifetime could not be
+// installed on the connection.
+//
+// It drops the connection instead of answering 503, because a 503 here is not
+// deliverable: the peer announced a body it has not finished sending, and
+// net/http drains the unread remainder before the response reaches the socket.
+// With no deadline installed, that drain is precisely the unbounded wait being
+// refused — the handler would return, the admission would be released, and the
+// server goroutine would still sit in the drain forever. Closing the connection
+// is the only action that actually ends the situation, and the sync client
+// classifies a dropped connection as a transient network error and retries,
+// which is the same contract the unreachable 503 would have carried.
+//
+// The log is sampled: a middleware that broke the unwrap chain would otherwise
+// make every block upload write a line.
+func (h *SyncHandler) rejectSyncBlockUnprotected(c *gin.Context) {
+	metrics.SyncPutBlockReadDeadlineUnsupportedTotal.Inc()
+	syncBlockUnprotectedLogSample.Do(func() {
+		log.Printf("[PutBlock] dropping block upload: the admitted-lifetime read deadline could not be installed on the connection, so a stalled body could hold this admission forever. A middleware is wrapping the response writer without implementing Unwrap(); sampled, see sync_put_block_read_deadline_unsupported_total")
+	})
+	c.Abort()
+	// gin.ResponseWriter embeds http.Hijacker, so this works even through a
+	// wrapper that hid SetReadDeadline from us.
+	if conn, _, err := c.Writer.Hijack(); err == nil {
+		_ = conn.Close()
+		return
+	}
+	// Nothing to hijack. Say something rather than nothing; if the peer has
+	// already sent its whole body this is deliverable, and if it has not, this
+	// is no worse than the silence.
+	c.Header("Retry-After", "1")
+	c.Header("Connection", "close")
+	c.Request.Close = true
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block upload cannot be time-bounded on this connection; retry"})
+}
+
+var syncBlockUnprotectedLogSample = rate.Sometimes{Interval: time.Minute}
 
 func rejectSyncBlockTimeout(c *gin.Context, phase string, err error) bool {
 	ctxErr := c.Request.Context().Err()
@@ -1496,7 +1567,10 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		return
 	}
 	defer releaseInflight()
-	endLifetime := h.beginSyncBlockAdmittedLifetime(c)
+	endLifetime, protected := h.beginSyncBlockAdmittedLifetime(c)
+	if !protected {
+		return
+	}
 	defer endLifetime()
 
 	// Read block data (bounded per request; bounded in aggregate by the

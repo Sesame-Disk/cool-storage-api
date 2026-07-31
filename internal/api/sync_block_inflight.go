@@ -102,6 +102,13 @@ const (
 	syncBlockRejectClientGone    = "client_gone"
 	syncBlockRejectUserQueueFull = "user_queue_full"
 	syncBlockRejectNodeQueueFull = "node_queue_full"
+	// syncBlockRejectEntryQueueFull is deliberately distinct from
+	// node_queue_full. Both mean "no room", but they call for opposite
+	// responses: a full waiter queue is a saturated node that wants capacity,
+	// while a full entry ring is a momentary high-cardinality burst that
+	// usually clears itself. Reusing one label would make them
+	// indistinguishable in the only place an operator looks.
+	syncBlockRejectEntryQueueFull = "entry_queue_full"
 )
 
 // newSyncBlockInflightLimiter returns nil when every bound is disabled, which
@@ -245,10 +252,16 @@ func (l *syncBlockInflightLimiter) acquireEntry(ctx context.Context) (func(), st
 	}
 	select {
 	case l.entries <- struct{}{}:
+		metrics.SyncPutBlockEntriesCurrent.Inc()
 		var once sync.Once
-		return func() { once.Do(func() { <-l.entries }) }, ""
+		return func() {
+			once.Do(func() {
+				<-l.entries
+				metrics.SyncPutBlockEntriesCurrent.Dec()
+			})
+		}, ""
 	default:
-		return nil, syncBlockRejectNodeQueueFull
+		return nil, syncBlockRejectEntryQueueFull
 	}
 }
 
