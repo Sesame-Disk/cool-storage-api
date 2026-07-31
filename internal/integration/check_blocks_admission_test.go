@@ -4,9 +4,13 @@ package integration
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
@@ -33,6 +38,90 @@ const (
 	checkBlocksTestNodeCap = 2
 	checkBlocksTestWait    = 250 * time.Millisecond
 )
+
+type checkBlocksTenant struct {
+	admin *testClient
+	user  *testClient
+}
+
+// provisionCheckBlocksTenant keeps the admission suite's storage and traffic
+// accounting out of the shared dev organization. The second identity is used
+// only where the node-level gate must span distinct users.
+func provisionCheckBlocksTenant(t *testing.T, label string) checkBlocksTenant {
+	t.Helper()
+
+	tenant := provisionIsolatedTenant(t, "check-blocks-"+label)
+	adminProbe := admissionTestClient(t)
+	admin := newTestClient(adminProbe.baseURL, exchangeAPIKeyForSyncToken(t, adminProbe.baseURL, tenant.email, tenant.client.token))
+
+	stamp := time.Now().UnixNano()
+	email := fmt.Sprintf("inttest-check-blocks-%s-user-%d@sesamefs.local", label, stamp)
+	resp := superadminClient.PostJSON(t, "/api/v2.1/admin/organizations/"+tenant.orgID+"/users/", map[string]string{
+		"email": email,
+		"name":  "check-blocks-user",
+	})
+	expectStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	userID, found := lookupUserIDByEmail(t, email)
+	if !found {
+		t.Fatalf("isolated check-blocks user %s was not created", email)
+	}
+	orgUUID, err := gocql.ParseUUID(tenant.orgID)
+	if err != nil {
+		t.Fatalf("parse isolated organization id %s: %v", tenant.orgID, err)
+	}
+	userUUID, err := gocql.ParseUUID(userID)
+	if err != nil {
+		t.Fatalf("parse isolated user id %s: %v", userID, err)
+	}
+
+	mgr := apikeys.NewManager(shareProjectionDBForTest(t))
+	t.Cleanup(mgr.Stop)
+	rawToken, key, err := mgr.CreateKey(userUUID, orgUUID, "check-blocks-"+label, apikeys.ScopeReadWrite, nil)
+	if err != nil {
+		t.Fatalf("mint API key for isolated check-blocks user: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := mgr.RevokeKey(orgUUID, userUUID, key.KeyHash); err != nil {
+			t.Logf("cleanup: revoke isolated check-blocks API key: %v", err)
+		}
+	})
+
+	return checkBlocksTenant{
+		admin: admin,
+		user:  newTestClient(adminProbe.baseURL, exchangeAPIKeyForSyncToken(t, adminProbe.baseURL, email, rawToken)),
+	}
+}
+
+// syncAuthMiddleware accepts server-issued sessions rather than raw API keys.
+// Exchange each disposable key through the same endpoint the desktop client uses.
+func exchangeAPIKeyForSyncToken(t *testing.T, baseURL, email, apiKey string) string {
+	t.Helper()
+
+	resp, err := http.PostForm(baseURL+"/api2/auth-token/", url.Values{
+		"username": {email},
+		"password": {apiKey},
+	})
+	if err != nil {
+		t.Fatalf("exchange disposable API key for sync token: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("exchange disposable API key for sync token = %d: %s", resp.StatusCode, body)
+	}
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode disposable sync token: %v", err)
+	}
+	if result.Token == "" {
+		t.Fatal("disposable API key exchange returned an empty sync token")
+	}
+	return result.Token
+}
 
 // postCheckBlocks issues one authenticated check-blocks request and reports the
 // status plus any Retry-After it advertised.
@@ -169,11 +258,9 @@ func runHeldCheckBlocks(t *testing.T, holders []struct {
 // never 429, and only after the bounded wait rather than immediately.
 func TestCheckBlocksAdmissionRefusesWith503UnderSaturation(t *testing.T) {
 	requireCassandra(t)
-	admin := admissionTestClient(t)
-	user := newTestClient(admin.baseURL, "dev-token-user")
-	if err := verifyIntegrationAuth(admin.baseURL, user.token); err != nil {
-		t.Fatalf("secondary user auth probe: %v", err)
-	}
+	tenant := provisionCheckBlocksTenant(t, "refusal")
+	admin := tenant.admin
+	user := tenant.user
 	adminRepo := createTestLibrary(t, admin, fmt.Sprintf("inttest-check-blocks-admin-%d", time.Now().UnixNano()))
 	userRepo := createTestLibrary(t, user, fmt.Sprintf("inttest-check-blocks-user-%d", time.Now().UnixNano()))
 
@@ -228,7 +315,7 @@ func TestCheckBlocksAdmissionRefusesWith503UnderSaturation(t *testing.T) {
 // would turn a burst of cheap metadata requests into an upload outage.
 func TestCheckBlocksAdmissionIsSeparateFromBlockUploads(t *testing.T) {
 	requireCassandra(t)
-	client := admissionTestClient(t)
+	client := provisionCheckBlocksTenant(t, "cross-route").admin
 	repoID := createTestLibrary(t, client, fmt.Sprintf("inttest-check-blocks-isolation-%d", time.Now().UnixNano()))
 
 	release := runHeldCheckBlocks(t, []struct {
@@ -255,7 +342,7 @@ func TestCheckBlocksAdmissionIsSeparateFromBlockUploads(t *testing.T) {
 // work.
 func TestCheckBlocksDeduplicatesLookups(t *testing.T) {
 	requireCassandra(t)
-	client := admissionTestClient(t)
+	client := provisionCheckBlocksTenant(t, "dedup").admin
 	repoID := createTestLibrary(t, client, fmt.Sprintf("inttest-check-blocks-dedup-%d", time.Now().UnixNano()))
 
 	const repeats = 200
@@ -297,7 +384,7 @@ func TestCheckBlocksDeduplicatesLookups(t *testing.T) {
 // node's capacity after every spike.
 func TestCheckBlocksReleasesSlotsAfterBurst(t *testing.T) {
 	requireCassandra(t)
-	client := admissionTestClient(t)
+	client := provisionCheckBlocksTenant(t, "drain").admin
 	repoID := createTestLibrary(t, client, fmt.Sprintf("inttest-check-blocks-drain-%d", time.Now().UnixNano()))
 
 	const concurrency = 16
@@ -340,18 +427,19 @@ func TestCheckBlocksLargeCardinalityLifetime(t *testing.T) {
 		t.Skip("set CHECK_BLOCKS_LARGE_PROBE=1 for the real 100k-id lifetime probe")
 	}
 	requireCassandra(t)
-	client := admissionTestClient(t)
+	client := provisionCheckBlocksTenant(t, "large-lifetime").admin
 	client.http.Timeout = 6 * time.Minute
 	repoID := createTestLibrary(t, client, fmt.Sprintf("inttest-check-blocks-large-lifetime-%d", time.Now().UnixNano()))
 
 	for _, width := range []int{40, 64} {
 		t.Run(fmt.Sprintf("%d-character-ids", width), func(t *testing.T) {
 			const count = 100000
+			prefix := randomCheckBlocksProbePrefix(t, width)
 			ids := make([]string, count)
 			var body strings.Builder
 			body.Grow(count * (width + 1))
 			for i := 0; i < count; i++ {
-				ids[i] = fmt.Sprintf("%0*x", width, i)
+				ids[i] = prefix + fmt.Sprintf("%016x", i)
 				if i > 0 {
 					body.WriteByte('\n')
 				}
@@ -387,6 +475,20 @@ func TestCheckBlocksLargeCardinalityLifetime(t *testing.T) {
 			t.Logf("100k %d-character ids completed in %s", width, elapsed)
 		})
 	}
+}
+
+// randomCheckBlocksProbePrefix makes temporary probe rows unique within the
+// disposable organization, so cleanup targets only this invocation's rows.
+func randomCheckBlocksProbePrefix(t *testing.T, width int) string {
+	t.Helper()
+	if width <= 16 || (width-16)%2 != 0 {
+		t.Fatalf("invalid check-blocks probe id width %d", width)
+	}
+	prefix := make([]byte, (width-16)/2)
+	if _, err := rand.Read(prefix); err != nil {
+		t.Fatalf("random check-blocks probe prefix: %v", err)
+	}
+	return hex.EncodeToString(prefix)
 }
 
 // seedCanonicalCheckRows creates metadata without physical objects so the

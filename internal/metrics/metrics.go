@@ -716,12 +716,12 @@ var (
 	//
 	// Observed after the parse and before classification or lookup, so it describes
 	// parsed request lists, including malformed traffic that reached the parser.
-	// Buckets run 1 to ~16k ids.
+	// Buckets cover the full configurable range through the 100k ceiling.
 	SyncCheckBlocksIDsPerRequest = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "sync_check_blocks_ids_per_request",
 			Help:    "Block ids carried by a parsed check-blocks request.",
-			Buckets: prometheus.ExponentialBuckets(1, 4, 8),
+			Buckets: []float64{1, 4, 16, 64, 256, 1024, 4096, 16384, 32768, 65536, 100000},
 		},
 	)
 

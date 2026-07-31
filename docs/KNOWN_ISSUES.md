@@ -5511,7 +5511,9 @@ does not re-batch after a 413, so lowering it on a guess trades a bounded
 amplification for an unbounded risk of breaking a legitimate sync.
 `sync_check_blocks_ids_per_request` is the instrument that will justify a lower
 value. The fault drill measures it in a client-only phase using a before/after
-delta; its slow holders are excluded from that measurement.
+delta; its slow holders are excluded from that measurement. It reports the
+observed distribution, including requests above 256 ids, rather than treating a
+small-worktree sample as a client contract.
 
 **The gzip trap from subcontract B was still live on this route.** The admitted
 lifetime is what makes an admission recoverable and what stops the metadata work
@@ -5536,12 +5538,15 @@ real-TCP regression over the shipped middleware fails if the exclusion is remove
 | 6 | One route cannot spend the other's budget | ✅ separate instances, asserted in both directions at unit and integration level |
 | 7 | The real client recovers under saturation | ✅ `scripts/fault-inject-check-blocks-admission.sh`: saturate, prove refusal from server counters *and* the client log, release, require stable `synchronized`, byte-for-byte payload verification and a zero in-flight gauge |
 
-**Criterion 7 closure.** `scripts/fault-inject-check-blocks-admission.sh` starts
-from disposable client state, synchronizes an empty watched worktree, then holds
-both node-3 admissions with looping rate-limited bodies. (The holder body has to
-be large: curl rate-limits per transfer buffer, so a payload that fits in one
-buffer is written in a single go and occupies nothing — the first attempt failed
-for exactly that reason.) An independent sentinel pins 503 + positive
+**Criterion 7 closure.** `scripts/fault-inject-check-blocks-admission.sh` creates
+a disposable organization, owner, and API key for every run, then starts from
+disposable client state and synchronizes an empty watched worktree. Its cleanup
+deletes the library and organization; interrupted leftovers are swept by their
+organization prefix, so drill traffic never consumes the shared dev quota. It
+then holds both node-3 admissions with looping rate-limited bodies. (The holder
+body has to be large: curl rate-limits per transfer buffer, so a payload that
+fits in one buffer is written in a single go and occupies nothing — the first
+attempt failed for exactly that reason.) An independent sentinel pins 503 + positive
 `Retry-After` before the client baseline is taken, so the drill cannot mistake
 its own request for the desktop's. It then requires the server's rejection
 counter **and** the client's own log to show the refusal, and only afterwards
@@ -5570,7 +5575,7 @@ docker compose --profile test run --rm --build \
 That probe sends 100000 unique legacy ids and 100000 unique canonical ids to
 the real node-3 route, exercising the mapping phase separately and then the
 canonical location plus real object-store existence phases. On the merge
-candidate it completed in **59.72s** for legacy mappings and **116.22s** for
+candidate it completed in **57.62s** for legacy mappings and **2m10.30s** for
 canonical location/existence, well below the shipped 5-minute lifetime. The
 canonical metadata rows are temporary and cleaned in bounded batches. These
 results are evidence for the shipped lifetime, not evidence that 100k-id

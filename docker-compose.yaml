@@ -630,6 +630,10 @@ services:
     build:
       context: ./docker/seafile-cli
       dockerfile: Dockerfile
+      args:
+        INSTALL_CASSANDRA_CLIENT: "true"
+    env_file:
+      - ${ENV_FILE:-.env}
     entrypoint:
       - /bin/bash
       - -lc
@@ -643,9 +647,7 @@ services:
     environment:
       - SESAMEFS_URL=http://sesamefs-node-3:8080
       - SESAMEFS_URL_LOCAL=http://sesamefs-node-3:8080
-      - DEV_API_TOKEN=dev-token-admin
-      - DEV_PASSWORD=dev-token-123
-      - DEV_USER=00000000-0000-0000-0000-000000000001
+      - SUPERADMIN_TOKEN=dev-token-superadmin
       - SYNC_DATA_DIR=/seafile-data
       - SYNC_TEST_IN_CONTAINER=1
       - HOLDER_RATE=${CHECK_BLOCKS_HOLDER_RATE:-64k}

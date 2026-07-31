@@ -32,9 +32,10 @@ set -u
 
 SESAMEFS_URL="${SESAMEFS_URL:-http://sesamefs:8080}"
 SESAMEFS_URL_LOCAL="${SESAMEFS_URL_LOCAL:-${SESAMEFS_URL}}"
-DEV_API_TOKEN="${DEV_API_TOKEN:-dev-token-admin}"
-DEV_PASSWORD="${DEV_PASSWORD:-dev-token-123}"
-DEV_USER="${DEV_USER:-00000000-0000-0000-0000-000000000001}"
+SUPERADMIN_TOKEN="${SUPERADMIN_TOKEN:-dev-token-superadmin}"
+CASSANDRA_HOSTS="${CASSANDRA_HOSTS:-cassandra:9042}"
+CASSANDRA_USERNAME="${CASSANDRA_USERNAME:?set CASSANDRA_USERNAME for the disposable test organization}"
+CASSANDRA_PASSWORD="${CASSANDRA_PASSWORD:?set CASSANDRA_PASSWORD for the disposable test organization}"
 SYNC_CONFIG_DIR="${SYNC_CONFIG_DIR:-/home/seafuser/.ccnet}"
 SYNC_DATA_DIR="${SYNC_DATA_DIR:-/seafile-data}"
 
@@ -52,6 +53,7 @@ HOLDER_RATE="${HOLDER_RATE:-64k}"
 HOLDER_IDS="${HOLDER_IDS:-20000}"
 
 LIBRARY_PREFIX="fault-inject-check-blocks"
+ORG_PREFIX="inttest-fault-check-blocks"
 
 log()  { printf '[fault-inject] %s\n' "$*"; }
 fail() { printf '[fault-inject] FAIL: %s\n' "$*"; exit 1; }
@@ -73,8 +75,51 @@ delete_library() {
     -H "Authorization: Token ${DEV_API_TOKEN}"
 }
 
+delete_organization() {
+  [ -n "${1:-}" ] || return 0
+  curl -s -o /dev/null -X DELETE "${SESAMEFS_URL_LOCAL}/api/v2.1/admin/organizations/${1}/" \
+    -H "Authorization: Token ${SUPERADMIN_TOKEN}"
+}
+
+mint_owner_api_key() {
+  python3 - "${CASSANDRA_HOSTS}" "${CASSANDRA_USERNAME}" "${CASSANDRA_PASSWORD}" "${1}" "${2}" <<'PY'
+import datetime
+import hashlib
+import secrets
+import sys
+
+from cassandra.auth import PlainTextAuthProvider
+from cassandra.cluster import Cluster
+
+hosts, username, password, org_id, email = sys.argv[1:]
+host, _, port = hosts.split(',', 1)[0].partition(':')
+cluster = Cluster([host], port=int(port or 9042), auth_provider=PlainTextAuthProvider(username, password))
+session = cluster.connect('sesamefs')
+try:
+    row = session.execute('SELECT user_id, org_id FROM users_by_email WHERE email = %s', [email]).one()
+    if row is None or str(row.org_id) != org_id:
+        raise RuntimeError('created owner was not found in the disposable organization')
+    raw = 'sk_' + secrets.token_hex(32)
+    key_hash = hashlib.sha256(raw.encode()).hexdigest()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    key_prefix = raw[:11] + '...'
+    session.execute(
+        'INSERT INTO api_keys (key_hash, key_prefix, user_id, org_id, label, scope, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)',
+        [key_hash, key_prefix, row.user_id, row.org_id, 'check-blocks-fault', 'read-write', now],
+    )
+    session.execute(
+        'INSERT INTO api_keys_by_user (org_id, user_id, key_hash, key_prefix, label, scope, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)',
+        [row.org_id, row.user_id, key_hash, key_prefix, 'check-blocks-fault', 'read-write', now],
+    )
+    print(raw)
+finally:
+    cluster.shutdown()
+PY
+}
+
 CURRENT_REPO_ID=""
 CURRENT_SYNC_DIR=""
+CURRENT_ORG_ID=""
 HOLDER_PIDS=""
 HOLDER_STOP=/tmp/check-blocks-holders.stop
 stop_holders() {
@@ -107,8 +152,9 @@ cleanup() {
     log "last seafile.log lines:"
     tail -80 "${SYNC_CONFIG_DIR}/logs/seafile.log" 2>/dev/null || true
   fi
-  rm -rf "${CURRENT_SYNC_DIR}" "${SYNC_CONFIG_DIR}" "${SYNC_DATA_DIR}/seafile-data" >/dev/null 2>&1
   delete_library "${CURRENT_REPO_ID}"
+  delete_organization "${CURRENT_ORG_ID}"
+  rm -rf "${CURRENT_SYNC_DIR}" "${SYNC_CONFIG_DIR}" "${SYNC_DATA_DIR}/seafile-data" >/dev/null 2>&1
   exit "${status}"
 }
 trap cleanup EXIT INT TERM
@@ -117,16 +163,14 @@ trap cleanup EXIT INT TERM
 # free. Without it the next run fails to create a library and the failure
 # surfaces as a bogus "the client was never refused".
 sweep_previous_runs() {
-  log "sweeping libraries left by previous runs"
-  curl -s "${SESAMEFS_URL_LOCAL}/api/v2.1/repos/" -H "Authorization: Token ${DEV_API_TOKEN}" \
-    | tr '{' '\n' \
-    | grep -F "${LIBRARY_PREFIX}" \
-    | sed -n 's/.*"repo_id":"\([^"]*\)".*/\1/p' \
-    | sort -u \
-    | while read -r stale_repo; do
-        [ -n "${stale_repo}" ] || continue
-        log "  deleting stale library ${stale_repo}"
-        delete_library "${stale_repo}"
+  log "sweeping organizations left by previous runs"
+  curl -s "${SESAMEFS_URL_LOCAL}/api/v2.1/admin/organizations/?per_page=1000" \
+    -H "Authorization: Token ${SUPERADMIN_TOKEN}" \
+    | jq -r --arg prefix "${ORG_PREFIX}" '.organizations[]? | select((.org_name // .name // "") | startswith($prefix)) | .org_id' \
+    | while read -r stale_org; do
+        [ -n "${stale_org}" ] || continue
+        log "  deleting stale organization ${stale_org}"
+        delete_organization "${stale_org}"
       done
 }
 
@@ -142,15 +186,39 @@ seaf-cli init -c "${SYNC_CONFIG_DIR}" -d "${SYNC_DATA_DIR}" \
 [ -s "${SYNC_CONFIG_DIR}/seafile.ini" ] \
   || fail "seaf-cli init did not create seafile.ini"
 
-repo_name="${LIBRARY_PREFIX}-$(date +%s)"
+stamp="$(date +%s)-$$"
+owner_email="${ORG_PREFIX}-${stamp}@sesamefs.local"
+create_org_response=$(curl -s -X POST "${SESAMEFS_URL_LOCAL}/api/v2.1/admin/organizations/" \
+  -H "Authorization: Token ${SUPERADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\":\"${ORG_PREFIX}-${stamp}\",\"owner_email\":\"${owner_email}\",\"storage_quota\":1099511627776}")
+CURRENT_ORG_ID=$(printf '%s' "${create_org_response}" | jq -r '.org_id // empty')
+
+# Check the shape, not just non-emptiness: a failed create returns a JSON error
+# body that a bare -n test would accept as an id.
+case "${CURRENT_ORG_ID}" in
+  ????????-????-????-????-????????????) ;;
+  *) fail "could not create disposable organization: ${create_org_response}" ;;
+esac
+log "organization ${CURRENT_ORG_ID}"
+
+DEV_API_TOKEN="$(mint_owner_api_key "${CURRENT_ORG_ID}" "${owner_email}")" \
+  || fail "could not mint disposable owner API key"
+[ -n "${DEV_API_TOKEN}" ] || fail "disposable owner API key was empty"
+DEV_USER="${owner_email}"
+DEV_PASSWORD="${DEV_API_TOKEN}"
+SYNC_TOKEN=$(curl -fsS -X POST "${SESAMEFS_URL_LOCAL}/api2/auth-token/" \
+  -d "username=${DEV_USER}" \
+  -d "password=${DEV_PASSWORD}" | jq -r '.token // empty') \
+  || fail "could not exchange disposable owner API key for a sync token"
+[ -n "${SYNC_TOKEN}" ] || fail "disposable owner API key exchange returned an empty sync token"
+
+repo_name="${LIBRARY_PREFIX}-${stamp}"
 create_response=$(curl -s -X POST "${SESAMEFS_URL_LOCAL}/api/v2.1/repos/" \
   -H "Authorization: Token ${DEV_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d "{\"name\":\"${repo_name}\"}")
-repo_id=$(printf '%s' "${create_response}" | sed -n 's/.*"repo_id":"\([^"]*\)".*/\1/p')
-
-# Check the shape, not just non-emptiness: a failed create returns a JSON error
-# body that a bare -n test would accept as an id.
+repo_id=$(printf '%s' "${create_response}" | jq -r '.repo_id // empty')
 case "${repo_id}" in
   ????????-????-????-????-????????????) ;;
   *) fail "could not create library: ${create_response}" ;;
@@ -233,13 +301,21 @@ while [ "${i}" -lt "${MEASUREMENT_FILE_COUNT}" ]; do
 done
 
 stable=0
+cardinality_seen=0
 waited=0
 while [ "${waited}" -lt 120 ]; do
+  cardinality_current_count=$(metric 'sync_check_blocks_ids_per_request_count') || fail "could not observe cardinality during clean sync"
+  cardinality_current_delta=$(awk -v a="${cardinality_current_count}" -v b="${cardinality_before_count}" 'BEGIN{print a-b}')
+  if [ "$(awk -v v="${cardinality_current_delta}" 'BEGIN{print (v > 0) ? 1 : 0}')" -eq 1 ]; then
+    cardinality_seen=1
+  fi
   state=$(sync_state)
   case "${state}" in
     synchronized)
-      stable=$((stable + 1))
-      [ "${stable}" -ge 3 ] && break
+      if [ "${cardinality_seen}" -eq 1 ]; then
+        stable=$((stable + 1))
+        [ "${stable}" -ge 3 ] && break
+      fi
       ;;
     "error Network error") stable=0 ;;
     *error*) fail "client reported measurement sync state '${state}'" ;;
@@ -248,7 +324,8 @@ while [ "${waited}" -lt 120 ]; do
   sleep 2
   waited=$((waited + 2))
 done
-[ "${stable}" -ge 3 ] || fail "clean cardinality sync did not stabilize (last '${state}')"
+[ "${cardinality_seen}" -eq 1 ] || fail "clean client produced no check-blocks cardinality observations within 120s"
+[ "${stable}" -ge 3 ] || fail "clean cardinality sync did not stabilize after check-blocks observation (last '${state}')"
 
 cardinality_after_count=$(metric 'sync_check_blocks_ids_per_request_count') || fail "could not read cardinality result count"
 cardinality_after_sum=$(metric 'sync_check_blocks_ids_per_request_sum') || fail "could not read cardinality result sum"
@@ -256,11 +333,8 @@ cardinality_after_256=$(metric 'sync_check_blocks_ids_per_request_bucket{le="256
 cardinality_delta_count=$(awk -v a="${cardinality_after_count}" -v b="${cardinality_before_count}" 'BEGIN{print a-b}')
 cardinality_delta_sum=$(awk -v a="${cardinality_after_sum}" -v b="${cardinality_before_sum}" 'BEGIN{print a-b}')
 cardinality_delta_256=$(awk -v a="${cardinality_after_256}" -v b="${cardinality_before_256}" 'BEGIN{print a-b}')
-[ "$(awk -v v="${cardinality_delta_count}" 'BEGIN{print (v > 0) ? 1 : 0}')" -eq 1 ] \
-  || fail "clean client produced no check-blocks cardinality observations"
-[ "${cardinality_delta_256}" = "${cardinality_delta_count}" ] \
-  || fail "clean client emitted a check-blocks request above 256 ids (count=${cardinality_delta_count}, <=256=${cardinality_delta_256})"
-log "clean client cardinality delta: count=${cardinality_delta_count}, sum=${cardinality_delta_sum}, all requests <=256 ids"
+cardinality_delta_over_256=$(awk -v n="${cardinality_delta_count}" -v l="${cardinality_delta_256}" 'BEGIN{print n-l}')
+log "clean client cardinality delta: count=${cardinality_delta_count}, sum=${cardinality_delta_sum}, <=256=${cardinality_delta_256}, >256=${cardinality_delta_over_256}"
 
 # Hold both node-3 check-blocks admissions open with slow bodies. An admitted
 # request spends its slot in the body read before any lookup, so a rate-limited
@@ -284,7 +358,7 @@ for n in 1 2; do
     while [ ! -f "${HOLDER_STOP}" ]; do
       curl -sS -o /dev/null -X POST \
         "${SESAMEFS_URL}/seafhttp/repo/${repo_id}/check-blocks" \
-        -H "Authorization: Token ${DEV_API_TOKEN}" \
+        -H "Authorization: Token ${SYNC_TOKEN}" \
         -H "Content-Type: application/json" \
         --limit-rate "${HOLDER_RATE}" --data-binary "@${holder_body}" >/dev/null 2>&1
     done
@@ -307,7 +381,7 @@ done
 sentinel_status=$(curl -sS -D /tmp/check-blocks-sentinel.headers \
   -o /tmp/check-blocks-sentinel.out -w '%{http_code}' -X POST \
   "${SESAMEFS_URL}/seafhttp/repo/${repo_id}/check-blocks" \
-  -H "Authorization: Token ${DEV_API_TOKEN}" \
+  -H "Authorization: Token ${SYNC_TOKEN}" \
   -H "Content-Type: application/json" \
   --data-binary '[]')
 retry_after=$(awk 'tolower($1) == "retry-after:" {gsub(/\r/, "", $2); print $2; exit}' /tmp/check-blocks-sentinel.headers)
