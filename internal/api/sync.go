@@ -1357,8 +1357,9 @@ func (h *SyncHandler) beginSyncBlockAdmittedLifetime(c *gin.Context) (func(), bo
 			// the process restarts. That is how a middleware wrapping c.Writer
 			// without Unwrap() — gin-contrib/gzip is exactly such a wrapper —
 			// would silently disarm subcontract B. Refuse the request instead,
-			// loudly, so the failure is a visible 503 and a counter rather than
-			// a capacity leak nobody notices.
+			// loudly — drop the connection and increment a counter — rather than
+			// a capacity leak nobody notices. A 503 is not deliverable here while
+			// the unread body remains undrained without a socket deadline.
 			if isServerHandledRequest(c.Request) {
 				cancel()
 				h.rejectSyncBlockUnprotected(c)

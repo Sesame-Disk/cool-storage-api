@@ -5305,8 +5305,9 @@ just the read, because that whole span is what the buffered body costs.
   occupancy and `perUser` cardinality to remain within the configured bound.
   Exhausting that ring reports its own `entry_queue_full` reason, kept separate
   from `node_queue_full` on purpose: a full waiter queue is a saturated node that
-  wants capacity, while a full entry ring is a momentary high-cardinality burst
-  that usually clears itself, and one label for both would leave an operator
+  wants capacity, while a full entry ring means the global admission envelope is
+  full before any further per-user state can be created (a brief cardinality
+  spike or sustained pressure), and one label for both would leave an operator
   unable to tell them apart. `sync_put_block_entries_current` is the occupancy
   counterpart to read either against.
 - Once admitted, one 5-minute processing deadline (ceiling 30 minutes) covers body

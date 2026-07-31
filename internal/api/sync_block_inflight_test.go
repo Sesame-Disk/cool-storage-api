@@ -736,9 +736,9 @@ func requireWaiterCount(t *testing.T, l *syncBlockInflightLimiter, gateName stri
 // TestEntryRingExhaustionHasItsOwnReason keeps the pre-gate entry ring
 // distinguishable from the node waiter queue. Both mean "no room", but they ask
 // the operator for opposite responses: a full waiter queue is a saturated node
-// that wants capacity, while a full entry ring is a momentary high-cardinality
-// burst that clears itself. Folding them into one label would make the only
-// signal an operator has ambiguous.
+// that wants capacity, while a full entry ring means the global admission
+// envelope is full before further per-user state can be created. Folding them
+// into one label would make the only signal an operator has ambiguous.
 func TestEntryRingExhaustionHasItsOwnReason(t *testing.T) {
 	cfg := syncInflightConfig(1, 1, time.Second)
 	cfg.SeafHTTP.SyncBlockMaxWaitersPerNode = 1

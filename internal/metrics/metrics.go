@@ -544,12 +544,12 @@ var (
 	//   "entry_queue_full" — the pre-gate entry ring was full, so admission was
 	//                        refused before any per-user state could be created
 	// "node_queue_full" and "entry_queue_full" are kept apart on purpose. The
-	// first says the node is genuinely saturated with parked requests and wants
-	// more capacity; the second is a high-cardinality burst exhausting the entry
-	// ring for an instant and is usually transient. Read either against
-	// sync_put_block_entries_current.
+	// first says parked waiters already fill the node budget and wants capacity;
+	// the second says the global admission envelope is full before any further
+	// per-user state can be created — that can be a brief cardinality spike or
+	// sustained pressure. Read either against sync_put_block_entries_current.
 	//   "client_gone"  — the client disconnected while queued
-	// The first four are all capacity signals, and they say different things: the
+	// The first five are all capacity signals, and they say different things: the
 	// gate reasons mean a request waited out its budget, the queue_full ones mean
 	// it was turned away before it could even wait, which is the more severe
 	// reading. "client_gone" is the only one that is not: summing it into the

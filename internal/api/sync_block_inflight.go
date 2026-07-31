@@ -105,9 +105,9 @@ const (
 	// syncBlockRejectEntryQueueFull is deliberately distinct from
 	// node_queue_full. Both mean "no room", but they call for opposite
 	// responses: a full waiter queue is a saturated node that wants capacity,
-	// while a full entry ring is a momentary high-cardinality burst that
-	// usually clears itself. Reusing one label would make them
-	// indistinguishable in the only place an operator looks.
+	// while a full entry ring means the global admission envelope is full
+	// before any further per-user state can be created. Reusing one label
+	// would make them indistinguishable in the only place an operator looks.
 	syncBlockRejectEntryQueueFull = "entry_queue_full"
 )
 
