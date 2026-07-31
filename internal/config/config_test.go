@@ -472,8 +472,8 @@ func TestConfigValidate(t *testing.T) {
 			name: "sync block max bytes accepts a value at the ceiling",
 			modify: func(c *Config) {
 				c.SeafHTTP.SyncBlockMaxBytes = MaxSyncBlockMaxBytes
-				c.SeafHTTP.SyncBlockMaxInflightPerNode = 8
-				c.SeafHTTP.SyncBlockMaxInflightPerUser = 8
+				c.SeafHTTP.SyncBlockMaxInflightPerNode = 6
+				c.SeafHTTP.SyncBlockMaxInflightPerUser = 6
 			},
 			wantErr: false,
 		},
@@ -691,6 +691,43 @@ func TestConfigValidate(t *testing.T) {
 			modify:         func(c *Config) { c.SeafHTTP.SyncBlockAdmittedLifetime = 0 },
 			wantErr:        true,
 			wantErrContain: "seafhttp.sync_block_admitted_lifetime",
+		},
+		{
+			// An override in hours would pass "greater than zero" while making
+			// the admitted processing guard ineffective in practice.
+			name:           "sync block admitted lifetime rejects above the ceiling",
+			modify:         func(c *Config) { c.SeafHTTP.SyncBlockAdmittedLifetime = MaxSyncBlockAdmittedLifetime + time.Second },
+			wantErr:        true,
+			wantErrContain: "seafhttp.sync_block_admitted_lifetime",
+		},
+		{
+			name: "server read timeout cannot outlive admitted block lifetime",
+			modify: func(c *Config) {
+				c.Server.ReadTimeout = c.SeafHTTP.SyncBlockAdmittedLifetime + time.Second
+			},
+			wantErr:        true,
+			wantErrContain: "server.read_timeout",
+		},
+		{
+			// Per-user waiters also reserve node waiter capacity, so a per-user
+			// budget above the node one is a number that can never bind — the
+			// same silently-inert configuration the in-flight caps already reject.
+			name: "sync block per-user waiters may not exceed node waiters",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxWaitersPerNode = 4
+				c.SeafHTTP.SyncBlockMaxWaitersPerUser = 8
+			},
+			wantErr:        true,
+			wantErrContain: "sync_block_max_waiters_per_user",
+		},
+		{
+			name: "sync block disabled per-user gate ignores inert waiter relationship",
+			modify: func(c *Config) {
+				c.SeafHTTP.SyncBlockMaxInflightPerUser = 0
+				c.SeafHTTP.SyncBlockMaxWaitersPerNode = 4
+				c.SeafHTTP.SyncBlockMaxWaitersPerUser = 8
+			},
+			wantErr: false,
 		},
 		{
 			name:           "sync block memory budget rejects zero",

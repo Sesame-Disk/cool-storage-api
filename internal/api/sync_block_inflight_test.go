@@ -390,6 +390,70 @@ func TestPutBlockGlobalWaiterCapIncludesPerUserQueues(t *testing.T) {
 	}
 }
 
+func TestBlockAdmissionEntryCapBoundsDistinctUserCardinality(t *testing.T) {
+	cfg := syncInflightConfig(1, 1, 30*time.Second)
+	cfg.SeafHTTP.SyncBlockMaxWaitersPerUser = 1
+	cfg.SeafHTTP.SyncBlockMaxWaitersPerNode = 4
+	l := newSyncBlockInflightLimiter(cfg)
+
+	releaseHolder, reason := l.acquire(context.Background(), "holder")
+	if reason != "" {
+		t.Fatalf("holder rejected: %s", reason)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	const contenders = 1000
+	results := make(chan string, contenders)
+	for i := 0; i < contenders; i++ {
+		go func(i int) {
+			release, reason := l.acquire(ctx, fmt.Sprintf("user-%d", i))
+			if release != nil {
+				release()
+			}
+			results <- reason
+		}(i)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(l.entries) == cap(l.entries) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got, want := len(l.entries), cap(l.entries); got != want {
+		cancel()
+		releaseHolder()
+		t.Fatalf("entry occupancy = %d, want bounded capacity %d", got, want)
+	}
+	l.mu.Lock()
+	users := len(l.perUser)
+	l.mu.Unlock()
+	if users > cap(l.entries) {
+		cancel()
+		releaseHolder()
+		t.Fatalf("per-user gate cardinality = %d, exceeds global entry cap %d", users, cap(l.entries))
+	}
+
+	cancel()
+	releaseHolder()
+	queueFull := 0
+	for i := 0; i < contenders; i++ {
+		if reason := <-results; reason == syncBlockRejectNodeQueueFull {
+			queueFull++
+		}
+	}
+	if queueFull == 0 {
+		t.Fatal("high-cardinality burst never reached the global entry cap")
+	}
+	if err := requireDrainedLimiter(l); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(l.entries); got != 0 {
+		t.Fatalf("global entries after drain = %d, want 0", got)
+	}
+}
+
 // TestPutBlockDisconnectDuringWaitReleasesEverything covers the path where a
 // client gives up while queued. Nothing may be read, no slot may be stranded,
 // and the outcome must not be counted as a capacity rejection — that would make
@@ -623,10 +687,13 @@ func TestPutBlockCheapRejectionsSkipAdmission(t *testing.T) {
 }
 
 // requireDrainedLimiter asserts no admission survived its request: the node
-// semaphore is empty and no per-user gate is still registered.
+// semaphore and global entry bound are empty and no per-user gate is registered.
 func requireDrainedLimiter(l *syncBlockInflightLimiter) error {
 	if l.node != nil && len(l.node) != 0 {
 		return fmt.Errorf("in-flight admission leak: node gate still holds %d admissions", len(l.node))
+	}
+	if l.entries != nil && len(l.entries) != 0 {
+		return fmt.Errorf("in-flight admission leak: global entry gate still holds %d requests", len(l.entries))
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()

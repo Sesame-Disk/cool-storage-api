@@ -101,6 +101,19 @@ are `2/2`, waiter caps `2/2`, and wait defaults to `250ms`. Set
 `BLOCK_ADMISSION_FAULT_WAIT=10s`, recreate node 3, and run
 `block-admission-fault-test` for the shipped-wait compatibility drill. Node 2
 keeps shipped admission defaults and is the target of the opt-in memory probe.
+The probe sends 24 exact-cap bodies, samples correlated RSS/heap/cgroup every
+50ms from request ramp through the held-body plateau and post-release drain, and
+fails if the 1.25-adjusted full-lifetime cost exceeds the 80 MiB design value:
+
+```bash
+docker compose --profile test run --rm --build \
+  -e SESAMEFS_MEMORY_PROBE=1 go-integration-test \
+  go test -tags integration -run '^TestSyncBlockMemoryUnderSaturation$' \
+  -v -count=1 -timeout 5m ./internal/integration
+```
+
+Recreate `sesamefs-node-2` between evidence trials so each baseline starts from
+a clean process.
 
 Keep background GC isolated to the primary `sesamefs` service in that profile.
 `sesamefs-node-2` and `sesamefs-node-3` must keep `GC_ENABLED=false`, or GC-

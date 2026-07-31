@@ -139,15 +139,26 @@ below the table.
 The aggregate bound and its post-implementation hardening are complete; X10 is
 **closed**.
 
-`PutBlock` acquires a per-`(org, user)` and a per-node in-flight admission before
+`PutBlock` acquires a bounded global entry ticket, then per-`(org, user)` and
+per-node in-flight admissions before
 `readLimitedRequestBody`, holds it until the handler returns, and answers
 **503 + `Retry-After`** — never 429 — after a bounded wait. Per-user/node waiter
-queues and admitted processing are also bounded. The deadline cancels body and
-object-storage I/O immediately; Cassandra phases stop at callback boundaries and
-each in-progress query has the driver's required finite timeout. Three clean-process
-trials at all 28 slots measured a worst correlated RSS/cgroup increment of
-49.9 MiB per admission; after a 1.25 safety factor the 64 MiB design cost places
-28 slots at 1.75 GiB inside an explicit, validation-enforced 2 GiB budget.
+queues and admitted processing are also bounded. The deadline sets a read deadline
+on the connection — the only mechanism that can interrupt a stalled body read,
+since net/http's body `Read` and `Close` share a mutex and `server.read_timeout` is
+deliberately `0` — and cancels object-storage I/O; Cassandra phases stop at callback
+boundaries and each in-progress query has the driver's required finite timeout. A
+real-TCP regression drives a connection that goes silent mid-body and fails if the
+admission is not returned; companion regressions cover an earlier parent deadline
+and configured server read timeout. A 1,000-identity burst proves the pre-gate
+ticket bounds transient user-gate cardinality.
+
+The original plateau-only 64 MiB design failed the stronger full-lifetime probe.
+Three clean-process trials at the revised 24-slot default sampled request ramp,
+held-body plateau and post-release drain; every worst RSS/cgroup sample occurred
+post-release, with a worst 59.5 MiB raw / 74.4 MiB after the 1.25 factor. The
+rounded 80 MiB design places 24 slots at 1.875 GiB inside an explicit,
+validation-enforced 2 GiB budget.
 
 All seven original criteria are now met. The real-client harness uses disposable
 state and controlled slow PUT holders, checks an explicit 503 with positive

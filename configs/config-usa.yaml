@@ -256,12 +256,11 @@ seafhttp:
   # uploads still cost N x the cap.
   #
   # The node cap is a memory budget divided by a measured cost, not a throughput
-  # setting: 2 GiB budget / 64 MiB design cost = 32; default 28 leaves headroom.
-  # Three clean 28-admission trials observed a worst correlated RSS/cgroup
-  # increment of 49.9 MiB per admission; 1.25 safety factor rounds to 64 MiB.
+  # setting: 2 GiB budget / 80 MiB full-lifetime design cost = 25; default 24
+  # reserves 1.875 GiB and leaves 128 MiB headroom.
   # Re-derive it if you change
   # sync_block_max_bytes; the two multiply.
-  sync_block_max_inflight_per_node: 28
+  sync_block_max_inflight_per_node: 24
   sync_block_memory_budget_bytes: 2147483648
   # Fairness split, not memory: just above the ~15 concurrent PUTs one official
   # client issues (5 sync tasks x 3 block threads), so a single honest desktop is
@@ -273,7 +272,7 @@ seafhttp:
   sync_block_admission_wait: 10s
   sync_block_max_waiters_per_user: 16
   sync_block_max_waiters_per_node: 128
-  sync_block_admitted_lifetime: 5m
+  sync_block_admitted_lifetime: 5m # effective TCP body deadline through storage; max 30m
   # Per-IP-and-stable-link bound on ANONYMOUS writes through a public upload link (only
   # tokens whose source is "link"; authenticated web uploads on the same endpoint
   # are untouched). Keyed on both so one uploader behind a NAT does not throttle

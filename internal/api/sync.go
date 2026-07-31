@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -387,6 +388,7 @@ var syncPrepareUploadedBlockProbeFn = v2.PrepareUploadedBlockProbe
 var syncResolveNeedsPutBlockStoreFn = v2.ResolveNeedsPutBlockStore
 var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresent
 var registerUploadedBlockAndMappingForSyncFn = v2.RegisterUploadedBlockAndMapping
+var syncRetryUploadedBlockMaterializationFn = v2.RetryUploadedBlockMaterializationContext
 var syncNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
 var syncNewCanonicalBlockCheckReaderFn = streaming.NewCanonicalBlockCheckReader
 var syncTouchBlockLastAccessFn = func(database *db.DB, orgID, blockID string, accessedAt time.Time) {
@@ -1315,14 +1317,47 @@ var errSyncBlockAdmittedLifetime = errors.New("sync block admitted lifetime exce
 
 // beginSyncBlockAdmittedLifetime starts after admission so queue time does not
 // consume the processing budget. Replacing the request context propagates the
-// deadline to body and object-storage I/O; Cassandra callback boundaries also
-// check it, while each already-running query remains bounded by the driver's
-// required positive timeout. Closing the body on cancellation releases a handler
-// blocked in a slow or stalled request-body read.
+// deadline to object-storage I/O; Cassandra callback boundaries also check it,
+// while each already-running query remains bounded by the driver's required
+// positive timeout.
+//
+// The request body needs a *connection* deadline, not only a context. Cancelling
+// the context cannot interrupt a handler already parked inside a body read:
+// net/http's body Read and Close share one mutex, so the reader holds it while
+// waiting on the socket and any Close from another goroutine blocks behind it
+// rather than unblocking it — and with server.read_timeout deliberately 0 (large
+// uploads legitimately take minutes) nothing else would ever break the park. A
+// stalled peer would hold its admission indefinitely, which is far more damaging
+// now that the admission is a scarce resource: a handful of stalled but
+// authenticated connections would deny block upload to every other client on the
+// node. SetReadDeadline reaches the connection and makes the pending read fail,
+// which is the only mechanism that actually bounds this.
+//
+// The server rearms its own read deadline at the start of every request on a
+// keep-alive connection, so the deadline set here cannot leak into the next one.
 func (h *SyncHandler) beginSyncBlockAdmittedLifetime(c *gin.Context) func() {
-	ctx, cancel := context.WithTimeoutCause(c.Request.Context(), h.syncBlockAdmittedLifetime(), errSyncBlockAdmittedLifetime)
-	body := c.Request.Body
+	startedAt := time.Now()
+	admittedDeadline := startedAt.Add(h.syncBlockAdmittedLifetime())
+	ctx, cancel := context.WithDeadlineCause(c.Request.Context(), admittedDeadline, errSyncBlockAdmittedLifetime)
 	c.Request = c.Request.WithContext(ctx)
+	effectiveDeadline, _ := ctx.Deadline()
+
+	// Preserve a configured server deadline when its duration is already no
+	// greater than the effective request budget. Otherwise an earlier inherited
+	// request deadline must reach the socket; context cancellation alone cannot
+	// interrupt net/http's blocked body read.
+	serverDeadlineIsStronger := h != nil && h.config != nil && h.config.Server.ReadTimeout > 0 &&
+		h.config.Server.ReadTimeout <= effectiveDeadline.Sub(startedAt)
+	if !serverDeadlineIsStronger {
+		if err := http.NewResponseController(c.Writer).SetReadDeadline(effectiveDeadline); err == nil {
+			return cancel
+		}
+	}
+	// No connection to put a deadline on (test recorders, exotic writers). The
+	// same fallback is useful when an earlier server deadline already owns the
+	// socket. Closing the body is strictly weaker, but still ends synthetic or
+	// non-net/http bodies whose Close is not bound to the read mutex.
+	body := c.Request.Body
 	stopClose := context.AfterFunc(ctx, func() {
 		if body != nil {
 			_ = body.Close()
@@ -1344,6 +1379,19 @@ func rejectSyncBlockTimeout(c *gin.Context, phase string, err error) bool {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block upload timed out; retry"})
 		return true
 	}
+	// netpoll may report the socket deadline just before the context timer runs.
+	// net/http can also cancel the parent request context from that read error
+	// before our child timer installs its cause, so this must precede ctxErr.
+	// Limit it to body reads: storage transports have independent socket deadlines
+	// and can return the same os sentinel while this request is otherwise healthy.
+	if phase == "body" && errors.Is(err, os.ErrDeadlineExceeded) {
+		metrics.SyncPutBlockTimeoutsTotal.WithLabelValues(phase).Inc()
+		c.Header("Retry-After", "1")
+		c.Header("Connection", "close")
+		c.Request.Close = true
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block upload read timed out; retry"})
+		return true
+	}
 	// An inherited client deadline/disconnect gets no response: the peer has
 	// already abandoned the request. Do not infer that from err alone because
 	// storage transports have independent deadlines that can return the same
@@ -1352,7 +1400,7 @@ func rejectSyncBlockTimeout(c *gin.Context, phase string, err error) bool {
 		c.Abort()
 		return true
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 		metrics.SyncPutBlockTimeoutsTotal.WithLabelValues(phase).Inc()
 		c.Header("Retry-After", "1")
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage timed out; retry"})
@@ -1361,22 +1409,28 @@ func rejectSyncBlockTimeout(c *gin.Context, phase string, err error) bool {
 	return false
 }
 
-func readLimitedSyncBlockRequestBody(c *gin.Context, maxBytes int64) ([]byte, bool) {
+// readLimitedSyncBlockRequestBody reads an admitted body and, on failure,
+// returns the SyncPutBlockRejectedTotal reason the caller should record. That
+// reason is empty when the failure was already accounted elsewhere — a timeout
+// counted under sync_put_block_timeouts_total, or a client that vanished and got
+// no response — because folding those into "read_error" would make the size-cap
+// versus read-failure dial read as malformed traffic during ordinary timeouts.
+func readLimitedSyncBlockRequestBody(c *gin.Context, maxBytes int64) ([]byte, string, bool) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
 	data, err := io.ReadAll(c.Request.Body)
 	if err == nil {
-		return data, true
+		return data, "", true
 	}
 	var tooLarge *http.MaxBytesError
 	if errors.As(err, &tooLarge) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large", "max_bytes": maxBytes})
-		return nil, false
+		return nil, "too_large", false
 	}
 	if rejectSyncBlockTimeout(c, "body", err) {
-		return nil, false
+		return nil, "", false
 	}
 	c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
-	return nil, false
+	return nil, "read_error", false
 }
 
 // PutBlock stores a block
@@ -1447,16 +1501,15 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 
 	// Read block data (bounded per request; bounded in aggregate by the
 	// admission above)
-	data, ok := readLimitedSyncBlockRequestBody(c, maxBlockBytes)
+	data, rejectReason, ok := readLimitedSyncBlockRequestBody(c, maxBlockBytes)
 	if !ok {
 		// The body reader has already written 413 (over the cap), 503 (admitted
-		// lifetime), or 400 (another read failure). Only 413 is a size-cap
-		// rejection, so the reason is derived from the status rather than assumed.
-		reason := "read_error"
-		if c.Writer.Status() == http.StatusRequestEntityTooLarge {
-			reason = "too_large"
+		// lifetime), or 400 (another read failure), and reports which of those is
+		// a SyncPutBlockRejectedTotal reason. An empty reason means it was
+		// already counted under a metric that fits it better.
+		if rejectReason != "" {
+			metrics.SyncPutBlockRejectedTotal.WithLabelValues(rejectReason).Inc()
 		}
-		metrics.SyncPutBlockRejectedTotal.WithLabelValues(reason).Inc()
 		return
 	}
 
@@ -1525,7 +1578,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		// The retryable returns write no response. If you add a new response-writing
 		// branch, it MUST return a non-retryable error or the response will be
 		// written twice on retry.
-		if err := v2.RetryUploadedBlockMaterializationContext(c.Request.Context(), "PutBlock", internalID, func() error {
+		if err := syncRetryUploadedBlockMaterializationFn(c.Request.Context(), "PutBlock", internalID, func() error {
 			if err := c.Request.Context().Err(); err != nil {
 				return err
 			}
@@ -1570,14 +1623,21 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			}
 			return fmt.Errorf("unexpected block reuse decision %d for %s", probe.Decision, internalID)
 		}, func() error {
+			// Checked before the write, never after it. The register is not
+			// cancellable once issued, so a deadline that expires mid-flight
+			// leaves it durable, and re-reporting that as this callback's failure
+			// only obscures where the request actually stopped.
+			//
+			// It does NOT make the outcome a 200: the reconfirming store() phase
+			// of store→materialize→store still refuses to run on a dead context,
+			// so the request ends 503. That is deliberate — the second store is
+			// the GC-race reconfirmation, and reporting success without it would
+			// fail open. A committed register plus a 503 costs a redundant
+			// re-upload; the alternative costs correctness.
 			if err := c.Request.Context().Err(); err != nil {
 				return err
 			}
-			err := registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), materializedStorageClass, "", externalMappingID)
-			if err != nil {
-				return err
-			}
-			return c.Request.Context().Err()
+			return registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), materializedStorageClass, "", externalMappingID)
 		}, nil, nil); err != nil {
 			if rejectSyncBlockTimeout(c, "storage", err) {
 				return
@@ -1636,9 +1696,11 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		}
 	}
 
-	if rejectSyncBlockTimeout(c, "storage", c.Request.Context().Err()) {
-		return
-	}
+	// No timeout check here on purpose. Every phase above stops work that has not
+	// happened yet; by this point the bytes are stored and the mapping is
+	// registered, so a deadline that expired during the last of them has nothing
+	// left to prevent. Answering 503 for committed work would only buy a needless
+	// re-upload of the whole block.
 	c.Status(http.StatusOK)
 
 	// Record sync upload traffic — fire-and-forget.

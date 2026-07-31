@@ -36,10 +36,11 @@ const (
 
 // TestSyncBlockMemoryUnderSaturation is an opt-in measurement for the default
 // sync block node cap. It samples complete metric tuples at a fixed cadence,
-// subtracts a stable idle baseline, and holds cap-sized request bodies resident
-// long enough to observe a deterministic full-node plateau.
+// subtracts a stable idle baseline, holds cap-sized request bodies resident for
+// a deterministic full-node plateau, then keeps sampling hashing, Cassandra and
+// object storage until the admitted work drains.
 //
-// Run deliberately; this sends more than 500 MiB to a real node:
+// Run deliberately; this sends 384 MiB to a real node:
 //
 //	docker compose --profile test run --rm --build --entrypoint sh go-integration-test \
 //	  -c 'export PATH=$PATH:/usr/local/go/bin && SESAMEFS_MEMORY_PROBE=1 \
@@ -87,10 +88,11 @@ func TestSyncBlockMemoryUnderSaturation(t *testing.T) {
 		"cgroup_bytes":     optionalMetricValue(baseline.cgroupAvailable, baseline.cgroup),
 	})
 
-	// Two identities can fill the node cap without either identity exceeding the
-	// per-user cap. Extra requests prove that the observed plateau is the node
-	// gate, rather than the amount of work the client happened to issue.
-	requestCount := memoryProbeNodeCap + len(clients)
+	// Two identities fill the exact node cap without either exceeding its user
+	// cap. Gate/refusal behavior has a separate deterministic integration test;
+	// extra 10-second waiters here only make this expensive measurement flaky on
+	// hosts that take longer to upload and settle the 384 MiB plateau.
+	requestCount := memoryProbeNodeCap
 	releaseBodies := make(chan struct{})
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseBodies) }) })
@@ -114,6 +116,7 @@ func TestSyncBlockMemoryUnderSaturation(t *testing.T) {
 
 	sampler := startMemoryProbeSampler(clients[0], int64(len(baselineSamples)))
 	t.Cleanup(func() { _, _ = sampler.stop() })
+	loadStart := time.Now()
 	close(startRequests)
 
 	waitForFullNodePlateau(t, sampler, fullBodies, memoryProbeNodeCap, 45*time.Second)
@@ -134,6 +137,7 @@ func TestSyncBlockMemoryUnderSaturation(t *testing.T) {
 	time.Sleep(40 * memoryProbeSamplePeriod)
 	plateauEnd := time.Now()
 	releaseOnce.Do(func() { close(releaseBodies) })
+	releaseAt := time.Now()
 
 	requestsDone := make(chan struct{})
 	go func() {
@@ -145,6 +149,7 @@ func TestSyncBlockMemoryUnderSaturation(t *testing.T) {
 	case <-time.After(90 * time.Second):
 		t.Fatal("memory probe requests did not drain after releasing held bodies")
 	}
+	drainEnd := time.Now()
 	allSamples, sampleErrors := sampler.stop()
 	if len(sampleErrors) > 0 {
 		for _, err := range sampleErrors {
@@ -175,22 +180,29 @@ func TestSyncBlockMemoryUnderSaturation(t *testing.T) {
 			t.Fatalf("plateau sample %d observed inflight=%.0f, want node cap %d", sample.sequence, sample.inflight, memoryProbeNodeCap)
 		}
 	}
-	validateOptionalCgroupSeries(t, baselineSamples, plateauSamples)
+	lifetimeSamples := samplesDuringAdmittedLifetime(allSamples, loadStart, plateauStart, releaseAt, drainEnd)
+	if len(lifetimeSamples) < len(plateauSamples) {
+		t.Fatalf("lifetime window has %d samples, fewer than its %d-sample plateau", len(lifetimeSamples), len(plateauSamples))
+	}
+	if !hasPostReleaseInflightSample(lifetimeSamples) {
+		t.Fatal("no post-release sample observed admitted work; decrease the sample period or slow the backend")
+	}
+	validateOptionalCgroupSeries(t, baselineSamples, lifetimeSamples)
 
 	if os.Getenv("SESAMEFS_MEMORY_PROBE_SAMPLES") == "1" {
-		for _, sample := range append(append([]memoryProbeSample(nil), baselineSamples...), plateauSamples...) {
+		for _, sample := range append(append([]memoryProbeSample(nil), baselineSamples...), lifetimeSamples...) {
 			logMemoryProbeSample(t, runID, sample)
 		}
 	}
 
-	rssPeak := peakCorrelatedSample(plateauSamples, func(sample memoryProbeSample) int64 { return sample.rss })
-	heapPeak := peakCorrelatedSample(plateauSamples, func(sample memoryProbeSample) int64 { return sample.heap })
-	logDerivedMemoryResult(t, runID, "process_rss", rssPeak, baseline.rss, memoryProbeBudgetBytes)
-	logDerivedMemoryResult(t, runID, "go_heap_inuse", heapPeak, baseline.heap, memoryProbeBudgetBytes)
+	rssPeak := peakCorrelatedSample(lifetimeSamples, func(sample memoryProbeSample) int64 { return sample.rss })
+	heapPeak := peakCorrelatedSample(lifetimeSamples, func(sample memoryProbeSample) int64 { return sample.heap })
+	logDerivedMemoryResult(t, runID, "process_rss", rssPeak, baseline.rss, memoryProbeBudgetBytes, memoryProbeNodeCap)
+	logDerivedMemoryResult(t, runID, "go_heap_inuse", heapPeak, baseline.heap, memoryProbeBudgetBytes, memoryProbeNodeCap)
 
 	if baseline.cgroupAvailable {
-		cgroupPeak := peakCorrelatedSample(plateauSamples, func(sample memoryProbeSample) int64 { return sample.cgroup })
-		logDerivedMemoryResult(t, runID, "cgroup_memory_current", cgroupPeak, baseline.cgroup, memoryProbeBudgetBytes)
+		cgroupPeak := peakCorrelatedSample(lifetimeSamples, func(sample memoryProbeSample) int64 { return sample.cgroup })
+		logDerivedMemoryResult(t, runID, "cgroup_memory_current", cgroupPeak, baseline.cgroup, memoryProbeBudgetBytes, memoryProbeNodeCap)
 	} else {
 		logMemoryProbeEvent(t, map[string]any{
 			"event":    "metric_unavailable",
@@ -476,6 +488,33 @@ func samplesBetween(samples []memoryProbeSample, start, end time.Time) []memoryP
 	return selected
 }
 
+func samplesDuringAdmittedLifetime(samples []memoryProbeSample, start, plateau, released, end time.Time) []memoryProbeSample {
+	var selected []memoryProbeSample
+	for _, sample := range samples {
+		if sample.at.Before(start) || sample.at.After(end) || sample.inflight <= 0 {
+			continue
+		}
+		if sample.at.Before(plateau) {
+			sample.phase = "ramp"
+		} else if sample.at.Before(released) {
+			sample.phase = "plateau"
+		} else {
+			sample.phase = "post_release"
+		}
+		selected = append(selected, sample)
+	}
+	return selected
+}
+
+func hasPostReleaseInflightSample(samples []memoryProbeSample) bool {
+	for _, sample := range samples {
+		if sample.phase == "post_release" && sample.inflight > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func peakCorrelatedSample(samples []memoryProbeSample, metric func(memoryProbeSample) int64) memoryProbeSample {
 	peak := samples[0]
 	for _, sample := range samples[1:] {
@@ -496,16 +535,24 @@ func validateOptionalCgroupSeries(t *testing.T, baseline, plateau []memoryProbeS
 	}
 }
 
-func logDerivedMemoryResult(t *testing.T, runID, metric string, peak memoryProbeSample, baseline, budget int64) {
+func logDerivedMemoryResult(t *testing.T, runID, metric string, peak memoryProbeSample, baseline, budget int64, admittedCount int) {
 	t.Helper()
 	delta := peakMetricValue(metric, peak) - baseline
-	if delta <= 0 || peak.inflight <= 0 {
+	if delta <= 0 || admittedCount <= 0 {
 		t.Fatalf("%s did not grow over baseline: baseline=%d peak=%d inflight=%.0f", metric, baseline, peakMetricValue(metric, peak), peak.inflight)
 	}
-	inflight := int64(peak.inflight)
-	perAdmission := ceilDiv(delta, inflight)
+	// Memory allocated by completed requests can remain resident while correlated
+	// inflight falls. Divide the run's worst total delta by the number originally
+	// admitted, not by the lower gauge at the peak sample.
+	perAdmission := ceilDiv(delta, int64(admittedCount))
 	withSafety := ceilDiv(perAdmission*memoryProbeSafetyNum, memoryProbeSafetyDen)
 	safeCap := budget / withSafety
+	if withSafety > config.DefaultSyncBlockDesignBytes {
+		t.Fatalf("%s full-lifetime design cost %d exceeds configured %d bytes per admission", metric, withSafety, config.DefaultSyncBlockDesignBytes)
+	}
+	if safeCap < int64(memoryProbeNodeCap) {
+		t.Fatalf("%s full-lifetime safe cap %d is below configured node cap %d", metric, safeCap, memoryProbeNodeCap)
+	}
 	logMemoryProbeEvent(t, map[string]any{
 		"event":                         "derived_result",
 		"run_id":                        runID,
@@ -513,10 +560,12 @@ func logDerivedMemoryResult(t *testing.T, runID, metric string, peak memoryProbe
 		"baseline_bytes":                baseline,
 		"peak_bytes":                    peakMetricValue(metric, peak),
 		"peak_sample_sequence":          peak.sequence,
+		"peak_phase":                    peak.phase,
 		"correlated_rss_bytes":          peak.rss,
 		"correlated_go_heap_bytes":      peak.heap,
 		"correlated_cgroup_bytes":       optionalMetricValue(peak.cgroupAvailable, peak.cgroup),
 		"correlated_inflight":           peak.inflight,
+		"admitted_count_divisor":        admittedCount,
 		"baseline_subtracted_bytes":     delta,
 		"bytes_per_admission_ceiling":   perAdmission,
 		"safety_factor_numerator":       memoryProbeSafetyNum,

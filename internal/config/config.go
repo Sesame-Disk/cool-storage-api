@@ -603,9 +603,10 @@ type SeafHTTPConfig struct {
 	SyncBlockMaxWaitersPerUser int `yaml:"sync_block_max_waiters_per_user"`
 	SyncBlockMaxWaitersPerNode int `yaml:"sync_block_max_waiters_per_node"`
 
-	// SyncBlockAdmittedLifetime bounds the complete lifetime of an admitted
-	// request, including body read, hashing, and storage. It must be positive so
-	// an admitted slow reader or stalled backend cannot hold capacity forever.
+	// SyncBlockAdmittedLifetime is the processing deadline for body read, hashing,
+	// and storage. The connection deadline is a hard body-read bound. Context-aware
+	// backends cancel immediately; an already-running contextless Cassandra query
+	// can finish within the separately required finite DB timeout.
 	SyncBlockAdmittedLifetime time.Duration `yaml:"sync_block_admitted_lifetime"`
 
 	// UploadLinkWritesPerMinute bounds anonymous writes through a public upload
@@ -682,23 +683,30 @@ const (
 	MaxSyncBlockMaxWaitersPerUser  = 4096
 	MaxSyncBlockMemoryBudgetBytes  = int64(1 << 40) // 1 TiB operator ceiling
 
-	// The node default is derived, not chosen. Three clean-process trials at 28
-	// concurrent 16 MiB bodies measured a worst correlated RSS/cgroup increment
-	// of 49.9 MiB per admission. A 1.25 safety factor gives 59.6 MiB, rounded up
-	// to a 64 MiB design cost. 28 admissions therefore reserve 1.75 GiB of the
-	// explicit 2 GiB route budget.
+	// The admitted processing deadline needs a ceiling for the same reason it needs
+	// a floor. An override of hours or days would satisfy "greater than zero" while
+	// making the guard ineffective in practice. 30 minutes is far above any legitimate
+	// single-block PUT (a 64 MiB body plus storage) and far below "effectively
+	// forever".
+	MaxSyncBlockAdmittedLifetime = 30 * time.Minute
+
+	// The node default is derived from the complete admitted lifetime, not just
+	// the buffered-body plateau. Clean-process trials sample correlated RSS,
+	// cgroup and heap from all bodies resident through hash, Cassandra and object
+	// storage drain. The earlier 64 MiB design failed that stronger probe; 80 MiB
+	// is the rounded design cost. 24 admissions reserve 1.875 GiB of the explicit
+	// 2 GiB route budget and leave 128 MiB headroom.
 	//
 	// Validation scales the design cost linearly when SyncBlockMaxBytes changes,
 	// so the cap and body size cannot silently outgrow the configured budget.
-	DefaultSyncBlockMaxInflightPerNode = 28
+	DefaultSyncBlockMaxInflightPerNode = 24
 	DefaultSyncBlockMemoryBudgetBytes  = int64(2 * 1024 * 1024 * 1024)
-	DefaultSyncBlockDesignBytes        = int64(64 * 1024 * 1024)
+	DefaultSyncBlockDesignBytes        = int64(80 * 1024 * 1024)
 
 	// The per-user default is a fairness split, not a memory one. It sits just
 	// above the ~15 concurrent PutBlock requests one official client can issue
 	// (5 sync tasks x 3 block threads) so a single honest desktop is never
-	// queued by its own budget, while still taking three saturating users to
-	// fill the node.
+	// queued by its own budget, while two identities can still fill the node.
 	DefaultSyncBlockMaxInflightPerUser = 16
 
 	// The wait has to be long enough to absorb a burst and short enough that the
@@ -2046,8 +2054,24 @@ func (c *Config) Validate() error {
 	if c.SeafHTTP.SyncBlockMaxWaitersPerUser > MaxSyncBlockMaxWaitersPerUser {
 		return fmt.Errorf("seafhttp.sync_block_max_waiters_per_user is %d, above the %d ceiling", c.SeafHTTP.SyncBlockMaxWaitersPerUser, MaxSyncBlockMaxWaitersPerUser)
 	}
+	// A per-user waiter budget above the per-node one cannot bind: a request
+	// parked on its own gate also reserves node waiter capacity, so the node
+	// queue refuses first and the per-user number silently does nothing. Same
+	// reasoning as the in-flight caps above.
+	if c.SeafHTTP.SyncBlockMaxInflightPerUser > 0 && c.SeafHTTP.SyncBlockMaxWaitersPerUser > c.SeafHTTP.SyncBlockMaxWaitersPerNode {
+		return fmt.Errorf("seafhttp.sync_block_max_waiters_per_user=%d must not exceed seafhttp.sync_block_max_waiters_per_node=%d; per-user waiters also reserve node waiter capacity, so the larger value would never bind",
+			c.SeafHTTP.SyncBlockMaxWaitersPerUser, c.SeafHTTP.SyncBlockMaxWaitersPerNode)
+	}
 	if c.SeafHTTP.SyncBlockAdmittedLifetime <= 0 {
 		return fmt.Errorf("seafhttp.sync_block_admitted_lifetime must be greater than zero")
+	}
+	if c.SeafHTTP.SyncBlockAdmittedLifetime > MaxSyncBlockAdmittedLifetime {
+		return fmt.Errorf("seafhttp.sync_block_admitted_lifetime is %s, above the %s ceiling; a larger processing deadline is indistinguishable from disabling the guard in practice",
+			c.SeafHTTP.SyncBlockAdmittedLifetime, MaxSyncBlockAdmittedLifetime)
+	}
+	if c.Server.ReadTimeout > 0 && c.Server.ReadTimeout > c.SeafHTTP.SyncBlockAdmittedLifetime {
+		return fmt.Errorf("server.read_timeout=%s must not exceed seafhttp.sync_block_admitted_lifetime=%s when enabled; the server deadline starts earlier and is preserved rather than overwritten by block admission",
+			c.Server.ReadTimeout, c.SeafHTTP.SyncBlockAdmittedLifetime)
 	}
 	if err := validateUploadLinkWriteLimit(
 		"upload_link_writes_per_minute", "upload_link_write_burst",

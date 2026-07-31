@@ -5092,7 +5092,7 @@ own fix + regression.
 |---|---|---|---|---|
 | **A1** | Anonymous upload **post-token attempt rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-29** | — | Initial guard landed 2026-07-28; stable remint identity and the final fail-closed contract completed A1 on 2026-07-29. Per-(IP, stable link identity) and per-link limiters run after valid token resolution; see "Subcontract A" below |
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
-| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | ✅ **Closed 2026-07-30** | — | Per-user/node admissions and waiters are bounded before body reads; an admitted deadline cancels body/object-storage work and stops Cassandra phases at bounded-query boundaries; configuration enforces the measured memory budget; deterministic integration proves both gates; corrected correlated RSS/cgroup trials reached all 28 slots; real `seaf-cli` recovered from the shipped 10s wait and `Retry-After: 10` |
+| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | ✅ **Closed 2026-07-30** | — | A pre-gate global ticket plus per-user/node admissions bound active, transitioning and parked requests before body reads; real-TCP deadlines cover stalled bodies; complete-lifetime memory trials support 24 slots at an 80 MiB design cost; real `seaf-cli` recovered from the shipped 10s wait and `Retry-After: 10` |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | 🔴 Open | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
 | **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
 
@@ -5218,7 +5218,7 @@ The A2 keys are `seafhttp.upload_link_max_inflight_per_source` and
 source and `65536` per node; when both caps are enabled, the per-source cap must
 not exceed the per-node cap. Like A1, these counters are process-local: adding
 nodes increases aggregate fleet capacity. This closes subcontract A only; the
-pre-token lookup and process-local residuals remain, and B, C, and D remain open,
+  pre-token lookup and process-local residuals remain, and C and D remain open,
 so the B4 umbrella remains a production blocker.
 
 #### Subcontract B: what the right-sized cap does and does not do (2026-07-28)
@@ -5289,7 +5289,8 @@ just the read, because that whole span is what the buffered body costs.
   does. Acquiring the node slot first would let one identity park every node slot
   while its own requests queue on the per-user gate — capacity consumed without
   memory consumed — which defeats the "one user cannot monopolise the node"
-  property. Waiting on your own gate holds nothing global.
+  property. Waiting on your own gate holds no node admission, but does hold one
+  bounded global entry ticket.
 - One deadline for both gates, derived from the request context, so total wait is
   bounded by `sync_block_admission_wait` rather than twice it, and a client that
   disconnects mid-wait cancels immediately. No timer or goroutine outlives the
@@ -5297,38 +5298,76 @@ just the read, because that whole span is what the buffered body costs.
 - Per-user and per-node waiter caps (`16` / `128` by default) are reserved before
   parking. A full queue answers 503 immediately without allocating another
   admission timer or adding another gate reference.
-- Once admitted, one 5-minute deadline covers body read, hashing and storage.
-  Expiry closes the request body, cancels object-storage I/O, stops Cassandra
-  phases at callback boundaries, returns 503 + `Retry-After`, and closes the HTTP
-  connection. Both slots release when the handler returns; an already-running
-  Cassandra query remains bounded by the separately required finite DB timeout,
-  so no work path can retain capacity indefinitely.
+- Before any user gate is created, a global entry ticket bounds the complete
+  admission mechanism at active-node capacity plus the global waiter budget.
+  This closes the distinct-identity transition between `acquireUser` and
+  `acquireNode`; a regression launches 1,000 identities and requires both ticket
+  occupancy and `perUser` cardinality to remain within the configured bound.
+- Once admitted, one 5-minute processing deadline (ceiling 30 minutes) covers body
+  read, hashing and storage. Expiry
+  sets the effective request deadline as a **read deadline on the connection**
+  without replacing an earlier configured server read timeout, cancels object-storage I/O, stops
+  Cassandra phases at callback boundaries, returns 503 + `Retry-After`, and closes
+  the HTTP connection. Both slots release when the handler returns; an
+  already-running Cassandra query remains bounded by the separately required
+  finite DB timeout, so no work path can retain capacity indefinitely.
+
+  The connection deadline is load-bearing and replaced an earlier
+  `context.AfterFunc` + `Body.Close()` that could not work: net/http's body `Read`
+  and `Close` share one mutex, so a handler parked in `Read` holds it and the
+  `Close` queues behind it instead of interrupting it. With `server.read_timeout`
+  deliberately `0`, a stalled-but-connected peer would then hold its admission
+  indefinitely — a much sharper failure than the memory one this subcontract
+  fixes, since a handful of stalled authenticated connections would deny block
+  upload to the whole node. The fake-body unit tests could not see this (their
+  `Close` unblocks their `Read`), so the closure test drives a **real TCP
+  connection** that goes silent mid-body; reverting to the body-close path fails
+  it. Separate real-TCP regressions cover the admitted deadline, an earlier
+  inherited request deadline, and an earlier `server.read_timeout`.
+
+  The last phase is deliberately exempt: once the bytes are stored and the mapping
+  registered there is nothing left for a timeout to prevent, so an expiry there
+  returns 200 rather than buying a redundant re-upload. Earlier phases still fail
+  closed — in particular the reconfirming `store()` of store→materialize→store
+  refuses to run on a dead context, so a register that commits as the deadline
+  expires still ends 503. That costs one redundant re-upload and keeps the GC-race
+  reconfirmation mandatory; the alternative would fail open.
 - Overload answers **503 + `Retry-After`**, never 429, after a bounded wait — the
   contract this section already specified. Rejections carry a fixed reason set
-  (`user`, `node`, `client_gone`); `client_gone` is counted separately so
-  ordinary client churn does not read as overload.
+  (`user`, `node`, `user_queue_full`, `node_queue_full`, `client_gone`). The first
+  four are capacity signals reading different things — the gate reasons mean a
+  request waited out its budget, the `queue_full` ones mean it was turned away
+  before it could wait at all. `client_gone` is counted separately so ordinary
+  client churn does not read as overload.
 - Cheap rejections stay ahead of the gate: a missing permission, an unparseable
   block id, or an over-cap declared length is refused without spending or waiting
   for a slot.
 
 **Where the defaults come from.** The corrected opt-in probe uses two identities,
-fills all 28 node slots with exact-cap bodies whose EOF is held, samples one
-correlated RSS/heap/cgroup tuple every 50ms, subtracts a stable idle baseline, and
-restarts the node between trials. Three clean-process trials measured worst raw
-RSS/cgroup increments of 44.6, 45.0 and **49.9 MiB per admission**. Applying a
-1.25 safety factor gives 62.4 MB (59.6 MiB), rounded up to a **64 MiB design
-cost**. Thus 28 slots reserve 1.75 GiB of the explicit 2 GiB
-`sync_block_memory_budget_bytes`, leaving 256 MiB route-budget headroom.
+fills the exact node cap with unique 16 MiB bodies, samples one correlated
+RSS/heap/cgroup tuple every 50ms from request ramp onward, subtracts a stable idle
+baseline, and restarts the node between trials. It holds every completed body at
+EOF to establish the plateau, then releases all readers and continues sampling
+while `inflight > 0` through downstream drain. The result is the worse sample from
+that complete observed window, with retained memory divided by the original
+admitted count rather than a lower drain-time gauge.
+
+That stronger probe **invalidated the previous 64 MiB design**: a clean 28-slot
+trial needed about 68.6 MiB per admission after the 1.25 factor. The defaults were
+therefore revised rather than grandfathered. Three clean-process trials at the new
+24-slot cap all peaked post-release; the worst correlated cgroup result was
+59.5 MiB raw and 74.4 MiB after the factor. This is rounded conservatively to an
+**80 MiB design cost**. Thus 24 slots reserve 1.875 GiB of the explicit 2 GiB
+`sync_block_memory_budget_bytes`, leaving 128 MiB route-budget headroom.
 `Validate()` keeps that design cost as a floor, scales it upward when
 `sync_block_max_bytes` exceeds 16 MiB, and rejects any node-cap/budget combination
-that exceeds it. Smaller bodies cannot scale fixed request overhead toward zero,
-and raising the body cap cannot silently invalidate the aggregate bound.
+that exceeds it. The probe itself fails if the measured full-lifetime cost exceeds
+the design or if the calculated safe cap falls below the configured cap.
 
 `sync_block_max_inflight_per_user` (16) is a fairness split, not a memory one: it
 sits just above the ~15 concurrent `PutBlock` requests one official client can
-issue, so a single honest desktop is never queued by its own budget, while it
-still takes three saturating users to fill the node. All of a user's devices
-share it.
+issue, so a single honest desktop is never queued by its own budget, while two
+identities can fill the 24-slot node. All of a user's devices share it.
 
 The integration fixture uses 250ms only to keep CI fast. It holds request bodies
 open, observes `inflight == 2`, and deterministically proves both the same-user
@@ -5344,10 +5383,10 @@ byte, reached stable synchronized state, and drained every slot.
 | 1 | No body is read without a slot | ✅ unit + mutation-verified: moving the acquisition after the read fails 7 tests |
 | 2 | An aggregate per-node bound exists | ✅ deterministic held-body integration proves the node gate across two identities |
 | 3 | One user cannot monopolise the node | ✅ per-user gate acquired first; isolation test |
-| 4 | No unbounded wait, no leaked slots | ✅ bounded waiter queues, shared wait deadline, admitted processing deadline, body close, object-storage cancellation, finite Cassandra query timeout, race/leak/drain tests |
-| 5 | Peak RAM quantified | ✅ three clean-process, baseline-subtracted, correlated RSS/cgroup trials at the actual node cap |
+| 4 | No unbounded wait, no leaked slots | ✅ bounded waiter queues, shared wait deadline, admitted processing deadline with a ceiling, **connection read deadline** proven on a real stalled TCP connection, object-storage cancellation, finite Cassandra query timeout, race/leak/drain tests |
+| 5 | Peak RAM quantified | ✅ three clean-process, baseline-subtracted, correlated RSS/cgroup trials from request ramp through post-release drain at the actual 24-slot cap |
 | 6 | The real client recovers under saturation | ✅ deterministic disposable-state harness, including the shipped `10s → 503 → Retry-After: 10` cycle, publication integrity and drain |
-| 7 | Defaults from measurement, not guesswork | ✅ 64 MiB design cost includes 1.25 safety factor; explicit 2 GiB budget is validation-enforced |
+| 7 | Defaults from measurement, not guesswork | ✅ old 64 MiB design rejected by full-lifetime evidence; revised 80 MiB cost includes 1.25 factor and explicit 2 GiB validation |
 
 **Criterion 6 closure.** `scripts/fault-inject-block-admission.sh` now starts
 from disposable client state, initializes `seaf-cli` normally, synchronizes an
@@ -5362,11 +5401,12 @@ wait (2 client rejections and `Retry-After: 10`). The client reports
 `error Network error` transiently after the injected 503; that is its expected
 retryable classification, not a terminal test failure.
 
-**Post-implementation audit resolved.** Waiter state is bounded per user and per
-node; admitted work has a body-to-storage lifetime; the budget is enforced; the
-process test no longer depends on throughput and distinguishes both gates; and
-the memory probe now measures correlated baseline-subtracted RSS and cgroup at
-all 28 admissions. These were closure blockers, not deferred hardening.
+**Post-implementation audit resolved.** A pre-gate ticket bounds distinct-user
+transition cardinality; waiter state remains bounded per user and per node;
+admitted work has a real connection body deadline plus bounded downstream phases;
+the process test distinguishes both gates; and the memory probe measures correlated
+baseline-subtracted RSS, heap and cgroup across the complete observed admitted window at
+all 24 admissions. These were closure blockers, not deferred hardening.
 
 **Unrelated defect found while measuring, fixed 2026-07-30.** `/metrics` was
 served double-gzipped when the client negotiated compression. The configured

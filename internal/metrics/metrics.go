@@ -542,8 +542,11 @@ var (
 	//   "user_queue_full" — the bounded per-user waiter queue was already full
 	//   "node_queue_full" — the bounded process waiter queue was already full
 	//   "client_gone"  — the client disconnected while queued
-	// Only the first two are capacity signals. Summing "client_gone" into them
-	// would read as overload during ordinary client churn.
+	// The first four are all capacity signals, and they say different things: the
+	// gate reasons mean a request waited out its budget, the queue_full ones mean
+	// it was turned away before it could even wait, which is the more severe
+	// reading. "client_gone" is the only one that is not: summing it into the
+	// others would read as overload during ordinary client churn.
 	SyncPutBlockAdmissionRejectedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "sync_put_block_admission_rejected_total",

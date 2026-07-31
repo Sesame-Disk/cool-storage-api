@@ -42,8 +42,9 @@ import (
 //     does: acquiring the node slot first would let one user park every node
 //     slot while their own requests wait on the per-user gate — capacity
 //     consumed without memory consumed, starving everyone else. Waiting on your
-//     own gate holds nothing global, so the blast radius of one noisy user stays
-//     inside their own budget.
+//     own gate holds no node admission. It does hold one bounded global entry
+//     ticket, so distinct identities cannot create unbounded transient gates;
+//     one user's active+waiter cap still keeps its blast radius local.
 //
 //  3. One deadline for both gates, derived from the request context. Total wait
 //     is bounded by waitTimeout rather than 2x it, and a client that disconnects
@@ -62,6 +63,11 @@ type syncBlockInflightLimiter struct {
 	// node is a counting semaphore: capacity is maxPerNode, a send takes a slot
 	// and a receive returns one. Nil when the node cap is disabled.
 	node chan struct{}
+	// entries is acquired before the per-user gate. It bounds every request that
+	// has entered admission, including the otherwise-unaccounted transition where
+	// a distinct user owns its user slot but has not reached acquireNode yet.
+	// Capacity includes active node slots plus globally allowed waiters.
+	entries chan struct{}
 
 	maxPerUser        int
 	maxPerNode        int
@@ -126,6 +132,7 @@ func newSyncBlockInflightLimiter(cfg *config.Config) *syncBlockInflightLimiter {
 	}
 	if maxPerNode > 0 {
 		l.node = make(chan struct{}, maxPerNode)
+		l.entries = make(chan struct{}, maxPerNode+cfg.SeafHTTP.SyncBlockMaxWaitersPerNode)
 	}
 	return l
 }
@@ -162,6 +169,17 @@ func (l *syncBlockInflightLimiter) acquire(ctx context.Context, key string) (fun
 	}
 
 	start := time.Now()
+	releaseEntry, reason := l.acquireEntry(ctx)
+	if reason != "" {
+		l.observeWait(start, false)
+		return nil, reason
+	}
+	entryHeld := true
+	defer func() {
+		if entryHeld {
+			releaseEntry()
+		}
+	}()
 	// One deadline for both gates: the caller waits waitTimeout in total, not
 	// once per gate. Deriving from the request context means a client
 	// disconnect aborts the wait at once, and cancel() releases the timer on
@@ -201,6 +219,7 @@ func (l *syncBlockInflightLimiter) acquire(ctx context.Context, key string) (fun
 
 	l.observeWait(start, true)
 	metrics.SyncPutBlockInflightCurrent.Inc()
+	entryHeld = false
 
 	var once sync.Once
 	return func() {
@@ -208,8 +227,29 @@ func (l *syncBlockInflightLimiter) acquire(ctx context.Context, key string) (fun
 			metrics.SyncPutBlockInflightCurrent.Dec()
 			releaseNode()
 			releaseUser()
+			releaseEntry()
 		})
 	}, ""
+}
+
+// acquireEntry places a hard bound around the entire admission mechanism before
+// a user-specific map entry can be created. It is intentionally non-blocking:
+// entries already include every active node slot and every configured global
+// waiter, so another request has no bounded place to park.
+func (l *syncBlockInflightLimiter) acquireEntry(ctx context.Context) (func(), string) {
+	if l.entries == nil {
+		return func() {}, ""
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return nil, syncBlockRejectClientGone
+	}
+	select {
+	case l.entries <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-l.entries }) }, ""
+	default:
+		return nil, syncBlockRejectNodeQueueFull
+	}
 }
 
 // syncBlockAdmissionWait creates its deadline lazily. Queue-full requests are
@@ -357,10 +397,13 @@ func (l *syncBlockInflightLimiter) acquireNode(wait *syncBlockAdmissionWait) (fu
 		l.mu.Unlock()
 	}
 
+	// Released without the mutex, like any counting semaphore. Holding mu across
+	// the receive would be a needless footgun: a release that ran without a slot
+	// to give back would block forever *with mu held* and freeze the whole
+	// limiter, turning a local bug into a node-wide stall. The receive needs no
+	// mutual exclusion — waiters send without it too.
 	return func() {
-		l.mu.Lock()
 		<-l.node
-		l.mu.Unlock()
 	}, ""
 }
 
