@@ -3,6 +3,8 @@ package metrics
 import "github.com/prometheus/client_golang/prometheus"
 
 var (
+	CgroupMemoryCurrent = newCgroupMemoryCollector()
+
 	// HTTPRequestsTotal counts total HTTP requests by method, path pattern, and status.
 	HTTPRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -519,6 +521,122 @@ var (
 		[]string{"reason"},
 	)
 
+	// SyncPutBlockInflightCurrent reports block uploads admitted past the
+	// in-flight gates in this process. Multiplied by seafhttp.sync_block_max_bytes
+	// it is the buffered-body term of the memory bound subcontract B exists to
+	// establish, which is why it is a gauge rather than only a counter of
+	// admissions: the question it answers is "how much is resident right now".
+	// It intentionally has no labels.
+	SyncPutBlockInflightCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sync_put_block_inflight_current",
+			Help: "Current block uploads holding an in-flight admission in this process.",
+		},
+	)
+
+	// SyncPutBlockAdmissionRejectedTotal counts uploads refused before the body
+	// was read. The reason set is fixed and excludes user, org, repo and block
+	// identifiers:
+	//   "user"         — the per-user gate: one identity over its own budget
+	//   "node"         — the process-wide gate: the node is genuinely saturated
+	//   "user_queue_full" — the bounded per-user waiter queue was already full
+	//   "node_queue_full" — the bounded process waiter queue was already full
+	//   "entry_queue_full" — the pre-gate entry ring was full, so admission was
+	//                        refused before any per-user state could be created
+	// "node_queue_full" and "entry_queue_full" are kept apart on purpose. The
+	// first says parked waiters already fill the node budget and wants capacity;
+	// the second says the global admission envelope is full before any further
+	// per-user state can be created — that can be a brief cardinality spike or
+	// sustained pressure. Read either against sync_put_block_entries_current.
+	//   "client_gone"  — the client disconnected while queued
+	// The first five are all capacity signals, and they say different things: the
+	// gate reasons mean a request waited out its budget, the queue_full ones mean
+	// it was turned away before it could even wait, which is the more severe
+	// reading. "client_gone" is the only one that is not: summing it into the
+	// others would read as overload during ordinary client churn.
+	SyncPutBlockAdmissionRejectedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sync_put_block_admission_rejected_total",
+			Help: "Total block uploads refused by the process-local per-user or per-node in-flight gates, by reason.",
+		},
+		[]string{"reason"},
+	)
+
+	// SyncPutBlockAdmissionWaitSeconds measures how long a request queued for an
+	// admission, split by whether it eventually got one.
+	//
+	// This is the tuning instrument for the caps, and it is the one to read
+	// before moving them: an "admitted" distribution pinned near zero means the
+	// gates are never contended and the caps are not the constraint, while a
+	// growing "rejected" mass means either too little capacity or too short a
+	// wait — and the two are told apart by whether admitted waits are also
+	// climbing. Buckets run 1 ms to ~16 s to cover both a free gate and a wait
+	// budget in the tens of seconds.
+	SyncPutBlockAdmissionWaitSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sync_put_block_admission_wait_seconds",
+			Help:    "Time spent waiting for a block-upload in-flight admission, by outcome.",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 15),
+		},
+		[]string{"outcome"},
+	)
+
+	// SyncPutBlockUserInflightOccupancy samples the admitted user's own occupancy
+	// without exposing user identities as labels. It is what distinguishes "one
+	// client is saturating the node" from "many clients are each behaving".
+	SyncPutBlockUserInflightOccupancy = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "sync_put_block_user_inflight_occupancy",
+			Help:    "Per-user in-flight occupancy observed when a block upload is admitted.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 13),
+		},
+	)
+
+	SyncPutBlockWaitersCurrent = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sync_put_block_waiters_current",
+			Help: "Current block-upload requests parked for admission, by gate.",
+		},
+		[]string{"gate"},
+	)
+
+	SyncPutBlockTimeoutsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sync_put_block_timeouts_total",
+			Help: "Total admitted block uploads ended by a body or storage timeout.",
+		},
+		[]string{"phase"},
+	)
+
+	// SyncPutBlockEntriesCurrent reports requests holding the pre-gate entry
+	// ticket: admitted uploads plus everything parked on either gate. It is the
+	// occupancy counterpart to sync_put_block_admission_rejected_total{reason=
+	// "entry_queue_full"} — without it, an operator seeing that reason cannot
+	// tell a genuinely full node from a brief high-cardinality burst.
+	SyncPutBlockEntriesCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sync_put_block_entries_current",
+			Help: "Current block uploads holding an admission entry ticket (admitted plus parked) in this process.",
+		},
+	)
+
+	// SyncPutBlockReadDeadlineUnsupportedTotal counts block uploads refused
+	// because the admitted-lifetime deadline could not be installed on the
+	// connection.
+	//
+	// This should be flat at zero forever. A non-zero value means some
+	// ResponseWriter in the chain does not implement Unwrap(), so
+	// http.NewResponseController cannot reach the socket — the failure mode that
+	// would otherwise leave a stalled body holding an admission indefinitely.
+	// It is a counter rather than a silent fallback precisely because the
+	// fallback cannot interrupt a parked read.
+	SyncPutBlockReadDeadlineUnsupportedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sync_put_block_read_deadline_unsupported_total",
+			Help: "Total block uploads refused because the admitted-lifetime read deadline could not be installed on the connection. Any non-zero value is a wiring defect.",
+		},
+	)
+
 	// UploadLinkWriteThrottledTotal counts anonymous upload-link writes refused by
 	// the rate limiters. The reason distinguishes which bucket fired:
 	//   "client" — the (IP, stable source) bucket: one uploader going too fast
@@ -568,6 +686,7 @@ var (
 // Register registers all custom metrics with the default Prometheus registry.
 func Register() {
 	prometheus.MustRegister(
+		CgroupMemoryCurrent,
 		HTTPRequestsTotal,
 		HTTPRequestDuration,
 		StorageOperationsTotal,
@@ -616,6 +735,14 @@ func Register() {
 		BlockUploadMaterializationRetriesTotal,
 		SyncPutBlockBodyBytes,
 		SyncPutBlockRejectedTotal,
+		SyncPutBlockInflightCurrent,
+		SyncPutBlockAdmissionRejectedTotal,
+		SyncPutBlockAdmissionWaitSeconds,
+		SyncPutBlockUserInflightOccupancy,
+		SyncPutBlockWaitersCurrent,
+		SyncPutBlockTimeoutsTotal,
+		SyncPutBlockEntriesCurrent,
+		SyncPutBlockReadDeadlineUnsupportedTotal,
 		UploadLinkWriteThrottledTotal,
 		UploadLinkInflightRejectedTotal,
 		UploadLinkInflightCurrent,

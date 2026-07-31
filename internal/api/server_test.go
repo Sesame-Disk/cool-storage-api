@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	stdgzip "compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,9 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/health"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	gingzip "github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
 )
 
@@ -384,6 +387,44 @@ func TestRegisterCoreRoutes_InternalOnlyReadyAndMetrics(t *testing.T) {
 			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 		}
 	})
+}
+
+func TestMetricsResponseIsCompressedOnlyOnce(t *testing.T) {
+	router := gin.New()
+	metricsPath := "/metrics.custom"
+	router.Use(gingzip.Gzip(gingzip.DefaultCompression,
+		gingzip.WithExcludedPathsRegexs(gzipExcludedPathsRegexs(metricsPath)),
+	))
+	router.GET(metricsPath, gin.WrapH(promhttp.Handler()))
+
+	req := httptest.NewRequest(http.MethodGet, metricsPath, nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	zr, err := stdgzip.NewReader(w.Body)
+	if err != nil {
+		t.Fatalf("open gzip response: %v", err)
+	}
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read gzip response: %v", err)
+	}
+	if err := zr.Close(); err != nil {
+		t.Fatalf("close gzip response: %v", err)
+	}
+	if bytes.HasPrefix(body, []byte{0x1f, 0x8b}) {
+		t.Fatal("metrics body remains gzip-encoded after one decompression")
+	}
+	if !bytes.Contains(body, []byte("# HELP")) {
+		t.Fatalf("decompressed metrics body is not Prometheus text: %.80q", body)
+	}
 }
 
 func TestRegisterCoreRoutes_ReadyUsesStorageManagerHealth(t *testing.T) {

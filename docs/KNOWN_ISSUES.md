@@ -19,7 +19,7 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: anonymous upload-link guards A1/A2 are closed, while authenticated block PUT (B), check-blocks (C), and download/GET (D) remain open. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 (X10 is subcontract B). |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2 and B are closed; check-blocks (C) and download/GET (D) remain untouched. B now has bounded admitted work, bounded waiters, an enforced memory budget, deterministic process tests, corrected RSS/cgroup measurement, and real-client recovery at the shipped 10s wait. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
@@ -5047,7 +5047,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1 and A2 closed 2026-07-29** (anonymous upload-link admission to permission/body/storage work is rate- and concurrency-bounded on each process after valid token resolution); **B reduced** (per-request cap right-sized; the aggregate bound that actually closes it is still missing); **C and D open**. Closing A does not close the B4 umbrella.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2 and B are closed**; **C and D remain open**. B now bounds admissions, global/per-user waiters and admitted lifetime, enforces its measured memory budget, and has deterministic process plus shipped-10s real-client evidence. Closing A/B does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5092,7 +5092,7 @@ own fix + regression.
 |---|---|---|---|---|
 | **A1** | Anonymous upload **post-token attempt rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-29** | — | Initial guard landed 2026-07-28; stable remint identity and the final fail-closed contract completed A1 on 2026-07-29. Per-(IP, stable link identity) and per-link limiters run after valid token resolution; see "Subcontract A" below |
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
-| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | 🟡 **Reduced, still open** | Aggregate bound on concurrent in-flight block readers | Per-request cap right-sized 257 MiB → 16 MiB (the buffered-body bound drops approximately 16×), but N concurrent uploads still cost N × the cap. The aggregate bound is what closes it |
+| **B** | Authenticated block **PUT** concurrency (= registry **X10**) | ✅ **Closed 2026-07-30** | — | A pre-gate global ticket plus per-user/node admissions bound active, transitioning and parked requests before body reads; real-TCP deadlines cover stalled bodies; complete-lifetime memory trials support 24 slots at an 80 MiB design cost; real `seaf-cli` recovered from the shipped 10s wait and `Retry-After: 10` |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | 🔴 Open | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
 | **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
 
@@ -5218,7 +5218,7 @@ The A2 keys are `seafhttp.upload_link_max_inflight_per_source` and
 source and `65536` per node; when both caps are enabled, the per-source cap must
 not exceed the per-node cap. Like A1, these counters are process-local: adding
 nodes increases aggregate fleet capacity. This closes subcontract A only; the
-pre-token lookup and process-local residuals remain, and B, C, and D remain open,
+  pre-token lookup and process-local residuals remain, and C and D remain open,
 so the B4 umbrella remains a production blocker.
 
 #### Subcontract B: what the right-sized cap does and does not do (2026-07-28)
@@ -5274,6 +5274,184 @@ for 429 — so the overload response on this route must be **503 + `Retry-After`
 never 429, and the design must be *bounded wait, then* 503 rather than immediate
 rejection. Those values need to come from a fault-injection run against the real
 client, not from a guess.
+
+#### Subcontract B: the aggregate bound (2026-07-30)
+
+The bound the section above says is missing now exists. `PutBlock` acquires an
+admission from `syncBlockInflightLimiter` before `readLimitedRequestBody`, and
+holds it until the handler returns — through hashing and the storage write, not
+just the read, because that whole span is what the buffered body costs.
+
+**Shape of the guard.**
+
+- Two gates: per `(org, user)` first, per node second. Both are held before any
+  body is read, so the memory ceiling does not depend on the order; fairness
+  does. Acquiring the node slot first would let one identity park every node slot
+  while its own requests queue on the per-user gate — capacity consumed without
+  memory consumed — which defeats the "one user cannot monopolise the node"
+  property. Waiting on your own gate holds no node admission, but does hold one
+  bounded global entry ticket.
+- One deadline for both gates, derived from the request context, so total wait is
+  bounded by `sync_block_admission_wait` rather than twice it, and a client that
+  disconnects mid-wait cancels immediately. No timer or goroutine outlives the
+  request.
+- Per-user and per-node waiter caps (`16` / `128` by default) are reserved before
+  parking. A full queue answers 503 immediately without allocating another
+  admission timer or adding another gate reference.
+- Before any user gate is created, a global entry ticket bounds the complete
+  admission mechanism at active-node capacity plus the global waiter budget.
+  This closes the distinct-identity transition between `acquireUser` and
+  `acquireNode`; a regression launches 1,000 identities and requires both ticket
+  occupancy and `perUser` cardinality to remain within the configured bound.
+  Exhausting that ring reports its own `entry_queue_full` reason, kept separate
+  from `node_queue_full` on purpose: a full waiter queue is a saturated node that
+  wants capacity, while a full entry ring means the global admission envelope is
+  full before any further per-user state can be created (a brief cardinality
+  spike or sustained pressure), and one label for both would leave an operator
+  unable to tell them apart. `sync_put_block_entries_current` is the occupancy
+  counterpart to read either against.
+- Once admitted, one 5-minute processing deadline (ceiling 30 minutes) covers body
+  read, hashing and storage. Expiry
+  sets the effective request deadline as a **read deadline on the connection**
+  without replacing an earlier configured server read timeout, cancels object-storage I/O, stops
+  Cassandra phases at callback boundaries, returns 503 + `Retry-After`, and closes
+  the HTTP connection. Both slots release when the handler returns; an
+  already-running Cassandra query remains bounded by the separately required
+  finite DB timeout, so no work path can retain capacity indefinitely.
+
+  The connection deadline is load-bearing and replaced an earlier
+  `context.AfterFunc` + `Body.Close()` that could not work: net/http's body `Read`
+  and `Close` share one mutex, so a handler parked in `Read` holds it and the
+  `Close` queues behind it instead of interrupting it. With `server.read_timeout`
+  deliberately `0`, a stalled-but-connected peer would then hold its admission
+  indefinitely — a much sharper failure than the memory one this subcontract
+  fixes, since a handful of stalled authenticated connections would deny block
+  upload to the whole node. The fake-body unit tests could not see this (their
+  `Close` unblocks their `Read`), so the closure test drives a **real TCP
+  connection** that goes silent mid-body; reverting to the body-close path fails
+  it. Separate real-TCP regressions cover the admitted deadline, an earlier
+  inherited request deadline, and an earlier `server.read_timeout`.
+
+  **That deadline was itself bypassable, found and fixed 2026-07-31.** Reaching
+  the connection depends on `http.NewResponseController` walking the writer chain,
+  and that walk follows `Unwrap()`. gin's concrete `*responseWriter` implements
+  `Unwrap`, but the `gin.ResponseWriter` **interface** does not declare it — so a
+  middleware that embeds the interface exposes neither `SetReadDeadline` nor
+  `Unwrap` and terminates the walk. `gin-contrib/gzip` is exactly such a wrapper,
+  it is installed globally, it replaces `c.Writer` before `c.Next()`, and it does
+  not filter by method. The block route was not in its exclusion list, so an
+  authenticated client sending `Accept-Encoding: gzip`, announcing a body, writing
+  a few bytes and going silent got an admission whose deadline never reached the
+  socket — the exact capacity leak the deadline exists to prevent, reachable with
+  one request header. A reproduction differing from the passing regression only by
+  that header was never answered at all.
+
+  Two changes close it. The block route is excluded from gzip (blocks are opaque
+  binary and a PUT's response is a few bytes, so compression buys nothing there
+  anyway), and a failure to install the deadline on a server-handled request is
+  now fail-closed and counted rather than silently degraded:
+  `sync_put_block_read_deadline_unsupported_total` must stay at zero, and any
+  non-zero value is a wiring defect. The refusal **drops the connection** instead
+  of answering 503, because a 503 is not deliverable there: net/http drains the
+  body the peer never finished sending before the response reaches the socket, and
+  with no deadline installed that drain is the unbounded wait being refused. A
+  dropped connection is what the sync client already classifies as transient.
+  Requests with no connection at all — test recorders, non-net/http writers — keep
+  the body-close fallback, which genuinely does end their ordinary readers.
+
+  Regressions cover all three paths: the shipped gzip middleware plus a real
+  stalled TCP connection, a writer wrapper that hides `Unwrap` (must drop and
+  count), and a synthetic writer (must keep the fallback and not count). Removing
+  the gzip exclusion fails the first.
+
+  The last phase is deliberately exempt: once the bytes are stored and the mapping
+  registered there is nothing left for a timeout to prevent, so an expiry there
+  returns 200 rather than buying a redundant re-upload. Earlier phases still fail
+  closed — in particular the reconfirming `store()` of store→materialize→store
+  refuses to run on a dead context, so a register that commits as the deadline
+  expires still ends 503. That costs one redundant re-upload and keeps the GC-race
+  reconfirmation mandatory; the alternative would fail open.
+- Overload answers **503 + `Retry-After`**, never 429, after a bounded wait — the
+  contract this section already specified. Rejections carry a fixed reason set
+  (`user`, `node`, `user_queue_full`, `node_queue_full`, `client_gone`). The first
+  four are capacity signals reading different things — the gate reasons mean a
+  request waited out its budget, the `queue_full` ones mean it was turned away
+  before it could wait at all. `client_gone` is counted separately so ordinary
+  client churn does not read as overload.
+- Cheap rejections stay ahead of the gate: a missing permission, an unparseable
+  block id, or an over-cap declared length is refused without spending or waiting
+  for a slot.
+
+**Where the defaults come from.** The corrected opt-in probe uses two identities,
+fills the exact node cap with unique 16 MiB bodies, samples one correlated
+RSS/heap/cgroup tuple every 50ms from request ramp onward, subtracts a stable idle
+baseline, and restarts the node between trials. It holds every completed body at
+EOF to establish the plateau, then releases all readers and continues sampling
+while `inflight > 0` through downstream drain. The result is the worse sample from
+that complete observed window, with retained memory divided by the original
+admitted count rather than a lower drain-time gauge.
+
+That stronger probe **invalidated the previous 64 MiB design**: a clean 28-slot
+trial needed about 68.6 MiB per admission after the 1.25 factor. The defaults were
+therefore revised rather than grandfathered. Three clean-process trials at the new
+24-slot cap all peaked post-release; the worst correlated cgroup result was
+59.5 MiB raw and 74.4 MiB after the factor. This is rounded conservatively to an
+**80 MiB design cost**. Thus 24 slots reserve 1.875 GiB of the explicit 2 GiB
+`sync_block_memory_budget_bytes`, leaving 128 MiB route-budget headroom.
+`Validate()` keeps that design cost as a floor, scales it upward when
+`sync_block_max_bytes` exceeds 16 MiB, and rejects any node-cap/budget combination
+that exceeds it. The probe itself fails if the measured full-lifetime cost exceeds
+the design or if the calculated safe cap falls below the configured cap.
+
+`sync_block_max_inflight_per_user` (16) is a fairness split, not a memory one: it
+sits just above the ~15 concurrent `PutBlock` requests one official client can
+issue, so a single honest desktop is never queued by its own budget, while two
+identities can fill the 24-slot node. All of a user's devices share it.
+
+The integration fixture uses 250ms only to keep CI fast. It holds request bodies
+open, observes `inflight == 2`, and deterministically proves both the same-user
+gate and the cross-user node gate, independent of MinIO throughput. The same
+fault harness was also run against the shipped 10s wait: real `seaf-cli` received
+two 503 responses with `Retry-After: 10`, retried, published all payloads byte for
+byte, reached stable synchronized state, and drained every slot.
+
+**Original closure criteria — seven of seven met.**
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | No body is read without a slot | ✅ unit + mutation-verified: moving the acquisition after the read fails 7 tests |
+| 2 | An aggregate per-node bound exists | ✅ deterministic held-body integration proves the node gate across two identities |
+| 3 | One user cannot monopolise the node | ✅ per-user gate acquired first; isolation test |
+| 4 | No unbounded wait, no leaked slots | ✅ bounded waiter queues, shared wait deadline, admitted processing deadline with a ceiling, **connection read deadline** proven on a real stalled TCP connection, object-storage cancellation, finite Cassandra query timeout, race/leak/drain tests |
+| 5 | Peak RAM quantified | ✅ three clean-process, baseline-subtracted, correlated RSS/cgroup trials from request ramp through post-release drain at the actual 24-slot cap |
+| 6 | The real client recovers under saturation | ✅ deterministic disposable-state harness, including the shipped `10s → 503 → Retry-After: 10` cycle, publication integrity and drain |
+| 7 | Defaults from measurement, not guesswork | ✅ old 64 MiB design rejected by full-lifetime evidence; revised 80 MiB cost includes 1.25 factor and explicit 2 GiB validation |
+
+**Criterion 6 closure.** `scripts/fault-inject-block-admission.sh` now starts
+from disposable client state, initializes `seaf-cli` normally, synchronizes an
+empty watched worktree, and then occupies both node-3 admissions with controlled
+slow PUTs. An independent sentinel pins 503 + positive `Retry-After`; only then
+does the script create payloads and use the rejection counter to prove the real
+client reached the saturated route. After releasing the fault it requires a new
+admission, stable `synchronized`, byte-for-byte API downloads of every payload,
+and a zero in-flight gauge. It passed twice consecutively in fast mode from cold
+containers (4 and 3 client rejections), then passed with the shipped 10-second
+wait (2 client rejections and `Retry-After: 10`). The client reports
+`error Network error` transiently after the injected 503; that is its expected
+retryable classification, not a terminal test failure.
+
+**Post-implementation audit resolved.** A pre-gate ticket bounds distinct-user
+transition cardinality; waiter state remains bounded per user and per node;
+admitted work has a real connection body deadline plus bounded downstream phases;
+the process test distinguishes both gates; and the memory probe measures correlated
+baseline-subtracted RSS, heap and cgroup across the complete observed admitted window at
+all 24 admissions. These were closure blockers, not deferred hardening.
+
+**Unrelated defect found while measuring, fixed 2026-07-30.** `/metrics` was
+served double-gzipped when the client negotiated compression. The configured
+metrics path is now excluded from the engine gzip middleware, leaving
+compression to `promhttp`; a regression test decompresses exactly once and
+requires Prometheus text rather than a second gzip stream.
 
 #### Fix Direction
 

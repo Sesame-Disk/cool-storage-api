@@ -117,6 +117,10 @@ Phase 0 resolves it. Session admission, committed-session state, staging limits,
 traffic charging and logical-storage accounting are independent of provisional-row
 retirement and keep their existing cleanup/idempotency behavior.
 
+The table preserves each finding's discovery-time wording. X10's row is
+historical and is superseded by the dated 2026-07-30 closure note immediately
+below the table.
+
 | # | Severity | Finding | Tracked as |
 |---|---|---|---|
 | X1 | Blocker | **Physical delete ABA.** A previously authorized key-only S3 delete can still run after the visible orphan fence clears and after a re-upload has stored new bytes. Rematerialization does not fence it. Cassandra authorization/claim generations alone cannot revoke a DELETE already in flight; X1 closes only with never-reused generational physical keys, so stale deletes can target only old keys. | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` |
@@ -129,6 +133,55 @@ retirement and keep their existing cleanup/idempotency behavior.
 | X10 | High | **The sync block routes have no concurrency or rate limit, so PR-10's per-request cap is not an aggregate bound.** PR-10 makes one `PutBlock` cost at most ~257 MiB instead of unbounded, which is what closes F12 — but the body is still fully buffered by `io.ReadAll` before hashing, and the route group carries only `authMiddleware`. N concurrent uploads therefore still cost N × the cap. The asymmetry is explicit: the web block path already has both a per-user concurrency limiter (`blockUploadConcurrencyLimiter`, default 8) and a per-IP rate limiter on its check oracle; the seafhttp path has neither. Note the cap cannot simply pre-size the read buffer from `Content-Length` — that length is attacker-controlled and unverified, so pre-sizing would let an empty body allocate the full cap. The real fixes are a concurrency bound on the route and/or streaming the block to storage instead of buffering it. **Partly addressed 2026-07-28:** the per-request cap was right-sized from 257 MiB to a configurable 16 MiB default (`seafhttp.sync_block_max_bytes`, ceiling 64 MiB), since the 257 MiB figure came from the web uploader's adaptive-chunk ceiling — a path that never governed this route, and whose chunker has no production caller. That cuts the per-request ceiling 16× but **does not close X10**: N concurrent uploads still cost N × the cap, and the aggregate bound is the actual defect. The remaining work is a cap on in-flight block readers acquired before `io.ReadAll`, answering **503 + Retry-After after a bounded wait** — never 429, which the official client does not classify as retryable, and never immediate rejection, since one legitimate desktop can run ~15 concurrent PutBlocks (5 sync tasks × 3 block threads). **X10 is subcontract B of readiness B4** under `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` — same umbrella, narrower surface (authenticated block PUT / aggregate memory). **Availability: High** on its own impact (`N × the configured cap` full-buffer + no concurrency bound); the upload-fence correctness scale does not apply. | `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` subcontract B; `sync.go` block route group, `PutBlock` |
 | X11 | Medium | **`maxCheckBlockIDs` (100k) bounds the parser, not the work an accepted request triggers.** PR-10's cap is a memory bound on parsing and is correct as such. Downstream, an accepted list still drives one `GetBlockIDMapping` Cassandra point read **per legacy SHA-1 id, sequentially** in the `CheckBlocks` loop, then `CheckBlocksExist` at fan-out 10 — so a single accepted 100k-id request can issue ~100k serial reads while holding the handler. That is a request-amplification and latency concern, not a memory one, and the 100k figure was chosen as a safe parse bound rather than validated against Cassandra, the S3 pool, response size or client cancellation. Related to X5, which flags the same unvalidated fan-out on the canonical read path. | `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01`; also subcontract C of `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` |
 | X6 | Medium | **Read-after-write across DCs.** Canonical lookups retry a missing row 3×25 ms, which covers local lag but not cross-DC. Safe (fails closed) but an availability dependency: transient 404/503 after a remote upload, `check-blocks` reporting a block missing, needless re-uploads. | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (related to X2) |
+
+### Dated note — X10, 2026-07-30
+
+The aggregate bound and its post-implementation hardening are complete; X10 is
+**closed**.
+
+`PutBlock` acquires a bounded global entry ticket, then per-`(org, user)` and
+per-node in-flight admissions before
+`readLimitedRequestBody`, holds it until the handler returns, and answers
+**503 + `Retry-After`** — never 429 — after a bounded wait. Per-user/node waiter
+queues and admitted processing are also bounded. The deadline sets a read deadline
+on the connection — the only mechanism that can interrupt a stalled body read,
+since net/http's body `Read` and `Close` share a mutex and `server.read_timeout` is
+deliberately `0` — and cancels object-storage I/O; Cassandra phases stop at callback
+boundaries and each in-progress query has the driver's required finite timeout. A
+real-TCP regression drives a connection that goes silent mid-body and fails if the
+admission is not returned; companion regressions cover an earlier parent deadline
+and configured server read timeout. A 1,000-identity burst proves the pre-gate
+ticket bounds transient user-gate cardinality.
+
+The original plateau-only 64 MiB design failed the stronger full-lifetime probe.
+Three clean-process trials at the revised 24-slot default sampled request ramp,
+held-body plateau and post-release drain; every worst RSS/cgroup sample occurred
+post-release, with a worst 59.5 MiB raw / 74.4 MiB after the 1.25 factor. The
+rounded 80 MiB design places 24 slots at 1.875 GiB inside an explicit,
+validation-enforced 2 GiB budget.
+
+All seven original criteria are now met. The real-client harness uses disposable
+state and controlled slow PUT holders, checks an explicit 503 with positive
+`Retry-After`, proves the subsequent rejections came from real `seaf-cli`, then
+requires post-fault admission, stable sync, byte-for-byte remote payloads, and
+zero stranded admissions. It passed twice consecutively in fast mode and again
+at the shipped 10-second wait with `Retry-After: 10`.
+
+A follow-up review on 2026-07-31 found the connection deadline itself was
+bypassable: `gin-contrib/gzip` wraps `c.Writer` in a type that embeds the
+`gin.ResponseWriter` interface, which does not declare `Unwrap()`, so
+`http.NewResponseController` could not reach the socket and the deadline
+silently degraded to the ineffective body-close fallback. One request header
+(`Accept-Encoding: gzip`) was enough to hold an admission indefinitely. The
+block route is now excluded from gzip, and a deadline that cannot be installed
+on a server-handled request drops the connection and increments
+`sync_put_block_read_deadline_unsupported_total` instead of proceeding
+unprotected.
+
+The implementation audit's lifetime, waiter, unsafe configuration-combination,
+timing-dependent integration and memory-proof findings are resolved. Full detail
+is under subcontract B in `docs/KNOWN_ISSUES.md`.
+
 
 ## X1 design space — closing the physical-delete ABA
 

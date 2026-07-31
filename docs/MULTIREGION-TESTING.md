@@ -187,6 +187,8 @@ purposes:
   runs `sesamefs`, `sesamefs-node-2`, and `sesamefs-node-3`, exports
   `SESAMEFS_URL`, `SESAMEFS_URL_2`, and `SESAMEFS_URL_3`, and is where broad
   multi-instance mutation races should live.
+  Node 3 has deliberately squeezed block-PUT admission settings for deterministic
+  refusal tests; use node 2 for shipped-default admission and memory measurements.
 - The dedicated `docker-compose-multiregion.yaml` stack remains the right place
   for region-sensitive scenarios: hostname routing through nginx, persisted
   region/storage-class behavior, and failover between region-pinned backends.

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +49,27 @@ type clientSSOEntry struct {
 	apiToken  string // session token, filled on success
 	email     string // user email, filled on success
 	createdAt time.Time
+}
+
+func gzipExcludedPathsRegexs(metricsPath string) []string {
+	return []string{
+		"^" + regexp.QuoteMeta(metricsPath) + "$", // promhttp handles compression itself
+		// Sync block PUT/GET. Blocks are opaque binary and a PUT's response is a
+		// few bytes, so there is nothing to gain here — and something to lose:
+		// gin-contrib/gzip replaces c.Writer with a gzipWriter that embeds the
+		// gin.ResponseWriter *interface*, which does not declare Unwrap(). The
+		// wrapper therefore exposes neither SetReadDeadline nor Unwrap, so
+		// http.NewResponseController cannot reach the connection and PutBlock's
+		// admitted-lifetime read deadline silently degrades to the body-close
+		// fallback that cannot interrupt a parked read. A client sending
+		// Accept-Encoding: gzip could then hold an admission open indefinitely.
+		"/seafhttp/repo/.*/block/.*",
+		"/seafhttp/files/.*",     // file downloads
+		"/seafhttp/zip/.*",       // zip downloads
+		"/seafhttp/upload/.*",    // file uploads
+		"/api/v2.1/.*raw/.*",     // raw file serving (inline preview)
+		"/api/v2.1/.*history/.*", // historic file downloads
+	}
 }
 
 // clientSSOStore is a thread-safe in-memory store for pending SSO tokens.
@@ -153,13 +175,7 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	// These paths stream large files and gzip would buffer them entirely,
 	// waste CPU on already-compressed content, and break streaming.
 	router.Use(gzip.Gzip(gzip.DefaultCompression,
-		gzip.WithExcludedPathsRegexs([]string{
-			"/seafhttp/files/.*",     // file downloads
-			"/seafhttp/zip/.*",       // zip downloads
-			"/seafhttp/upload/.*",    // file uploads
-			"/api/v2.1/.*raw/.*",     // raw file serving (inline preview)
-			"/api/v2.1/.*history/.*", // historic file downloads
-		}),
+		gzip.WithExcludedPathsRegexs(gzipExcludedPathsRegexs(cfg.Monitoring.MetricsPath)),
 	))
 
 	// Register Prometheus metrics and add metrics middleware

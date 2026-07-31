@@ -156,6 +156,20 @@ services:
       - ONLYOFFICE_JWT_SECRET=${ONLYOFFICE_JWT_SECRET:-change-me-to-a-random-string}
       - FRONTEND_URL=${FRONTEND_URL:-http://frontend:80}
       - GC_ENABLED=false
+      # Squeezed block-PUT admission (subcontract B / X10). Node 3 is the only
+      # instance configured this way on purpose: saturating the shared node would
+      # make every other integration test flaky, and the guard needs a node small
+      # enough that a modest burst actually meets the cap.
+      #
+      # 250ms keeps ordinary integration tests fast. The controlled holder
+      # fixture is deterministic at any wait; set BLOCK_ADMISSION_FAULT_WAIT=10s
+      # for the production-default client-compatibility drill.
+      # internal/integration/sync_block_admission_test.go mirrors these values.
+      - SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_NODE=2
+      - SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_USER=2
+      - SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_NODE=2
+      - SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_USER=2
+      - SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT=${BLOCK_ADMISSION_FAULT_WAIT:-250ms}
     depends_on:
       cassandra:
         condition: service_healthy
@@ -555,6 +569,43 @@ services:
       - seafile_sync_test_config:/home/seafuser/.ccnet
     depends_on:
       - sesamefs
+    profiles:
+      - test
+
+  # Fault injection for subcontract B / X10: drives the real seaf-cli against
+  # node 3, whose block-PUT admission caps are squeezed until refusal is
+  # unavoidable, and checks that the client absorbs the 503s and still completes
+  # the sync. The script fails the run if the client was never actually refused,
+  # so a configuration that stops saturating cannot pass silently.
+  #
+  #   docker compose --profile test run --rm --build block-admission-fault-test
+  block-admission-fault-test:
+    build:
+      context: ./docker/seafile-cli
+      dockerfile: Dockerfile
+    entrypoint:
+      - /bin/bash
+      - -lc
+      # The repo is mounted from a Windows host in some setups, so the script is
+      # normalised before running rather than executed in place.
+      - >-
+        /workspace/scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3 &&
+        sed 's/\r$//' /workspace/scripts/fault-inject-block-admission.sh > /tmp/fault-inject.sh &&
+        chmod +x /tmp/fault-inject.sh &&
+        /tmp/fault-inject.sh
+    environment:
+      - SESAMEFS_URL=http://sesamefs-node-3:8080
+      - SESAMEFS_URL_LOCAL=http://sesamefs-node-3:8080
+      - DEV_API_TOKEN=dev-token-admin
+      - DEV_PASSWORD=dev-token-123
+      - DEV_USER=00000000-0000-0000-0000-000000000001
+      - SYNC_DATA_DIR=/seafile-data
+      - SYNC_TEST_IN_CONTAINER=1
+      - HOLDER_RATE=${HOLDER_RATE:-8k}
+    volumes:
+      - .:/workspace
+    depends_on:
+      - sesamefs-node-3
     profiles:
       - test
 
