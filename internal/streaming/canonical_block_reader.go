@@ -86,7 +86,7 @@ func NewCanonicalBlockReader(
 	fallback *storage.BlockStore,
 	fallbackClass string,
 ) (CanonicalBlockReader, error) {
-	return newCanonicalBlockReader(ctx, database, manager, orgID, blockIDs, fallback, fallbackClass, true)
+	return newCanonicalBlockReader(ctx, database, manager, orgID, blockIDs, fallback, fallbackClass, true, canonicalBlockLocationConcurrency)
 }
 
 // NewCanonicalBlockCheckReader resolves locations for existence checks. Missing
@@ -100,7 +100,29 @@ func NewCanonicalBlockCheckReader(
 	fallback *storage.BlockStore,
 	fallbackClass string,
 ) (CanonicalBlockReader, error) {
-	return newCanonicalBlockReader(ctx, database, manager, orgID, blockIDs, fallback, fallbackClass, false)
+	return NewCanonicalBlockCheckReaderWithFanout(ctx, database, manager, orgID, blockIDs, fallback, fallbackClass, canonicalBlockLocationConcurrency)
+}
+
+// NewCanonicalBlockCheckReaderWithFanout is NewCanonicalBlockCheckReader with a
+// caller-supplied resolution concurrency.
+//
+// check-blocks needs this because its per-node admission cap and its per-request
+// fan-out multiply: a location phase that always ran at 32 would make the node's
+// stated metadata-work budget wrong no matter what the caller configured
+// (subcontract C of ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01). A non-positive value
+// falls back to the package default, so no caller can accidentally serialise the
+// whole resolution.
+func NewCanonicalBlockCheckReaderWithFanout(
+	ctx context.Context,
+	database *db.DB,
+	manager *storage.Manager,
+	orgID string,
+	blockIDs []string,
+	fallback *storage.BlockStore,
+	fallbackClass string,
+	fanout int,
+) (CanonicalBlockReader, error) {
+	return newCanonicalBlockReader(ctx, database, manager, orgID, blockIDs, fallback, fallbackClass, false, fanout)
 }
 
 func newCanonicalBlockReader(
@@ -112,7 +134,11 @@ func newCanonicalBlockReader(
 	fallback *storage.BlockStore,
 	fallbackClass string,
 	strictRead bool,
+	fanout int,
 ) (CanonicalBlockReader, error) {
+	if fanout < 1 || fanout > canonicalBlockLocationConcurrency {
+		fanout = canonicalBlockLocationConcurrency
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -133,7 +159,7 @@ func newCanonicalBlockReader(
 
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(canonicalBlockLocationConcurrency)
+	g.SetLimit(fanout)
 	for _, id := range uniqueBlockIDs {
 		if err := gctx.Err(); err != nil {
 			if waitErr := g.Wait(); waitErr != nil {

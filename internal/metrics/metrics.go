@@ -637,6 +637,111 @@ var (
 		},
 	)
 
+	// check-blocks admission (subcontract C / X11).
+	//
+	// The set mirrors the block-PUT one because the limiter is the same
+	// implementation, but the series are deliberately separate: the two routes
+	// hold separate budgets protecting different resources — buffered body memory
+	// there, Cassandra and object-store metadata work here — and a shared series
+	// would make a check-blocks storm indistinguishable from an upload one in the
+	// only place an operator looks. Reason and gate label sets are identical, and
+	// carry no user, org, repo or block identifiers.
+	SyncCheckBlocksInflightCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sync_check_blocks_inflight_current",
+			Help: "Current check-blocks requests holding an in-flight admission in this process.",
+		},
+	)
+
+	SyncCheckBlocksEntriesCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sync_check_blocks_entries_current",
+			Help: "Current check-blocks requests holding an admission entry ticket (admitted plus parked) in this process.",
+		},
+	)
+
+	SyncCheckBlocksAdmissionRejectedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sync_check_blocks_admission_rejected_total",
+			Help: "Total check-blocks requests refused by the process-local per-user or per-node in-flight gates, by reason.",
+		},
+		[]string{"reason"},
+	)
+
+	SyncCheckBlocksAdmissionWaitSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sync_check_blocks_admission_wait_seconds",
+			Help:    "Time spent waiting for a check-blocks in-flight admission, by outcome.",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 15),
+		},
+		[]string{"outcome"},
+	)
+
+	SyncCheckBlocksUserInflightOccupancy = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "sync_check_blocks_user_inflight_occupancy",
+			Help:    "Per-user in-flight occupancy observed when a check-blocks request is admitted.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 13),
+		},
+	)
+
+	SyncCheckBlocksWaitersCurrent = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sync_check_blocks_waiters_current",
+			Help: "Current check-blocks requests parked for admission, by gate.",
+		},
+		[]string{"gate"},
+	)
+
+	SyncCheckBlocksTimeoutsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sync_check_blocks_timeouts_total",
+			Help: "Total admitted check-blocks requests ended by a body or lookup timeout.",
+		},
+		[]string{"phase"},
+	)
+
+	SyncCheckBlocksReadDeadlineUnsupportedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sync_check_blocks_read_deadline_unsupported_total",
+			Help: "Total check-blocks requests refused because the admitted-lifetime read deadline could not be installed on the connection. Any non-zero value is a wiring defect.",
+		},
+	)
+
+	// SyncCheckBlocksIDsPerRequest is the evidence instrument for the accepted
+	// cardinality. The 100k cap is a compatibility bound inherited from the parser,
+	// never a measured one: nobody has captured what a real desktop sync actually
+	// posts. Lowering that cap without this histogram would be trading a known
+	// amplification for an unknown risk of 413-ing a legitimate initial sync.
+	//
+	// Observed after the parse and before any lookup, so it describes accepted
+	// lists rather than successful responses. Buckets run 1 to ~16k ids.
+	SyncCheckBlocksIDsPerRequest = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "sync_check_blocks_ids_per_request",
+			Help:    "Block ids carried by an accepted check-blocks request.",
+			Buckets: prometheus.ExponentialBuckets(1, 4, 8),
+		},
+	)
+
+	// SyncCheckBlocksLookupsTotal counts the metadata lookups an admitted request
+	// dispatches, by phase:
+	//   "mapping"   — legacy SHA-1 resolution, counted per read actually issued
+	//   "location"  — canonical location resolution, per unique internal id
+	//   "existence" — object-store existence check, per unique internal id
+	// The last two are upper bounds rather than issued counts: the existence check
+	// skips a block whose canonical metadata is absent. Read against
+	// sync_check_blocks_ids_per_request, this is what makes deduplication visible —
+	// before it, a list of one id repeated 100k times and a list of 100k distinct
+	// ids cost the same and looked the same.
+	SyncCheckBlocksLookupsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sync_check_blocks_lookups_total",
+			Help: "Metadata lookups dispatched by admitted check-blocks requests, by phase. mapping is issued reads; location and existence are per unique internal id and are upper bounds.",
+		},
+		[]string{"phase"},
+	)
+
 	// UploadLinkWriteThrottledTotal counts anonymous upload-link writes refused by
 	// the rate limiters. The reason distinguishes which bucket fired:
 	//   "client" — the (IP, stable source) bucket: one uploader going too fast
@@ -743,6 +848,16 @@ func Register() {
 		SyncPutBlockTimeoutsTotal,
 		SyncPutBlockEntriesCurrent,
 		SyncPutBlockReadDeadlineUnsupportedTotal,
+		SyncCheckBlocksInflightCurrent,
+		SyncCheckBlocksEntriesCurrent,
+		SyncCheckBlocksAdmissionRejectedTotal,
+		SyncCheckBlocksAdmissionWaitSeconds,
+		SyncCheckBlocksUserInflightOccupancy,
+		SyncCheckBlocksWaitersCurrent,
+		SyncCheckBlocksTimeoutsTotal,
+		SyncCheckBlocksReadDeadlineUnsupportedTotal,
+		SyncCheckBlocksIDsPerRequest,
+		SyncCheckBlocksLookupsTotal,
 		UploadLinkWriteThrottledTotal,
 		UploadLinkInflightRejectedTotal,
 		UploadLinkInflightCurrent,

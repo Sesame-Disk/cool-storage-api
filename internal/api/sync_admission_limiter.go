@@ -12,18 +12,28 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/time/rate"
 )
 
-// Subcontract B (= registry X10) of ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: the
-// aggregate bound on concurrent in-flight block readers.
+// syncAdmissionLimiter is the shared admission core behind subcontracts B and C
+// of ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01.
 //
-// seafhttp.sync_block_max_bytes bounds ONE PutBlock body. It is not an aggregate
-// bound: N concurrent uploads still cost N x the cap, so a few hundred
-// authenticated PUTs could drive the process to gigabytes of buffered bodies.
-// This limiter is the missing term. Admission is acquired *before*
-// readLimitedRequestBody, so a request that never gets a slot never reaches
-// io.ReadAll and costs nothing but a parked goroutine.
+// It was written for subcontract B (= registry X10): the aggregate bound on
+// concurrent in-flight block readers. seafhttp.sync_block_max_bytes bounds ONE
+// PutBlock body. It is not an aggregate bound: N concurrent uploads still cost
+// N x the cap, so a few hundred authenticated PUTs could drive the process to
+// gigabytes of buffered bodies. This limiter is the missing term. Admission is
+// acquired *before* readLimitedRequestBody, so a request that never gets a slot
+// never reaches io.ReadAll and costs nothing but a parked goroutine.
+//
+// Subcontract C (= registry X11) needs the same shape for check-blocks, where
+// the scarce resource is metadata work rather than buffered memory, so the type
+// carries its metrics, log prefix and refusal text as a profile instead of
+// wiring them to one route. Each route builds its OWN instance: the budgets
+// protect different resources and must not be able to consume one another. What
+// is shared is the mechanism — gates, waiter accounting, the entry ring and the
+// single deadline — not the capacity.
 //
 // Three properties this design is built around, and which the tests assert:
 //
@@ -54,7 +64,13 @@ import (
 // Like the upload-link caps, this is a process-local capacity guard, not a
 // cluster-global quota: each node holds its own gates, so fleet-wide admission
 // scales with the number of nodes.
-type syncBlockInflightLimiter struct {
+type syncAdmissionLimiter struct {
+	// m and the two message fields are what make one mechanism serve two routes.
+	// They are set once at construction and never mutated, so no locking.
+	m             syncAdmissionMetrics
+	logPrefix     string
+	rejectMessage string
+
 	// mu guards perUser and both waiter counters. The semaphore channels remain
 	// the source of truth for active admissions.
 	mu      sync.Mutex
@@ -80,6 +96,30 @@ type syncBlockInflightLimiter struct {
 	// is cheap by design; logging every one would turn the defence into a
 	// log-volume amplifier. The counters still move per rejection.
 	logSample rate.Sometimes
+}
+
+// syncBlockInflightLimiter is the block-PUT spelling of the type above.
+//
+// It is an alias, not a second type: subcontract B's test suite is the evidence
+// that generalising this limiter for subcontract C did not weaken it, and that
+// argument only holds while those tests are byte-identical to the ones that
+// closed B. Keeping the old name resolvable is what let the refactor land
+// without editing a single line of them.
+type syncBlockInflightLimiter = syncAdmissionLimiter
+
+// syncAdmissionMetrics is one route's admission series. Every field is required:
+// a nil handle here would panic on the first admission rather than silently stop
+// reporting, which is the correct failure for a wiring mistake in a guard whose
+// only visibility is these series. The admitted-lifetime series live on
+// syncAdmittedLifetime instead, because that guard applies whether or not the
+// caps are enabled.
+type syncAdmissionMetrics struct {
+	inflight      prometheus.Gauge
+	entries       prometheus.Gauge
+	waiters       *prometheus.GaugeVec
+	rejected      *prometheus.CounterVec
+	waitSeconds   *prometheus.HistogramVec
+	userOccupancy prometheus.Histogram
 }
 
 // syncBlockUserGate is one user's slice of the per-user cap.
@@ -111,9 +151,44 @@ const (
 	syncBlockRejectEntryQueueFull = "entry_queue_full"
 )
 
-// newSyncBlockInflightLimiter returns nil when every bound is disabled, which
-// makes the whole limiter a no-op through the nil receiver rather than through a
+// syncAdmissionBounds is one route's capacity, read out of config before any
+// limiter is built. Separating it from the construction is what keeps the two
+// constructors below honest about sharing a mechanism and nothing else.
+type syncAdmissionBounds struct {
+	maxPerUser        int
+	maxPerNode        int
+	maxWaitersPerUser int
+	maxWaitersPerNode int
+	waitTimeout       time.Duration
+}
+
+// newSyncAdmissionLimiter returns nil when every bound is disabled, which makes
+// the whole limiter a no-op through the nil receiver rather than through a
 // branch at each call site.
+func newSyncAdmissionLimiter(bounds syncAdmissionBounds, m syncAdmissionMetrics, logPrefix, rejectMessage string) *syncAdmissionLimiter {
+	if bounds.maxPerUser <= 0 && bounds.maxPerNode <= 0 {
+		return nil
+	}
+	l := &syncAdmissionLimiter{
+		m:                 m,
+		logPrefix:         logPrefix,
+		rejectMessage:     rejectMessage,
+		perUser:           make(map[string]*syncBlockUserGate),
+		maxPerUser:        bounds.maxPerUser,
+		maxPerNode:        bounds.maxPerNode,
+		maxWaitersPerUser: bounds.maxWaitersPerUser,
+		maxWaitersPerNode: bounds.maxWaitersPerNode,
+		waitTimeout:       bounds.waitTimeout,
+		logSample:         rate.Sometimes{Interval: time.Minute},
+	}
+	if bounds.maxPerNode > 0 {
+		l.node = make(chan struct{}, bounds.maxPerNode)
+		l.entries = make(chan struct{}, bounds.maxPerNode+bounds.maxWaitersPerNode)
+	}
+	return l
+}
+
+// newSyncBlockInflightLimiter builds the block-PUT instance (subcontract B).
 //
 // A nil config yields a nil limiter rather than a default one: unlike
 // syncBlockMaxBytes, failing open here does not restore an unbounded read (the
@@ -123,25 +198,55 @@ func newSyncBlockInflightLimiter(cfg *config.Config) *syncBlockInflightLimiter {
 	if cfg == nil {
 		return nil
 	}
-	maxPerUser := cfg.SeafHTTP.SyncBlockMaxInflightPerUser
-	maxPerNode := cfg.SeafHTTP.SyncBlockMaxInflightPerNode
-	if maxPerUser <= 0 && maxPerNode <= 0 {
+	return newSyncAdmissionLimiter(
+		syncAdmissionBounds{
+			maxPerUser:        cfg.SeafHTTP.SyncBlockMaxInflightPerUser,
+			maxPerNode:        cfg.SeafHTTP.SyncBlockMaxInflightPerNode,
+			maxWaitersPerUser: cfg.SeafHTTP.SyncBlockMaxWaitersPerUser,
+			maxWaitersPerNode: cfg.SeafHTTP.SyncBlockMaxWaitersPerNode,
+			waitTimeout:       cfg.SeafHTTP.SyncBlockAdmissionWait,
+		},
+		syncAdmissionMetrics{
+			inflight:      metrics.SyncPutBlockInflightCurrent,
+			entries:       metrics.SyncPutBlockEntriesCurrent,
+			waiters:       metrics.SyncPutBlockWaitersCurrent,
+			rejected:      metrics.SyncPutBlockAdmissionRejectedTotal,
+			waitSeconds:   metrics.SyncPutBlockAdmissionWaitSeconds,
+			userOccupancy: metrics.SyncPutBlockUserInflightOccupancy,
+		},
+		"[PutBlock]",
+		"too many block uploads in progress, please try again shortly",
+	)
+}
+
+// newCheckBlocksInflightLimiter builds the check-blocks instance (subcontract C).
+//
+// Separate capacity from the block route on purpose: this one bounds Cassandra
+// and object-store metadata work, and a check-blocks storm must not be able to
+// spend the slots that bound block-upload memory.
+func newCheckBlocksInflightLimiter(cfg *config.Config) *syncAdmissionLimiter {
+	if cfg == nil {
 		return nil
 	}
-	l := &syncBlockInflightLimiter{
-		perUser:           make(map[string]*syncBlockUserGate),
-		maxPerUser:        maxPerUser,
-		maxPerNode:        maxPerNode,
-		maxWaitersPerUser: cfg.SeafHTTP.SyncBlockMaxWaitersPerUser,
-		maxWaitersPerNode: cfg.SeafHTTP.SyncBlockMaxWaitersPerNode,
-		waitTimeout:       cfg.SeafHTTP.SyncBlockAdmissionWait,
-		logSample:         rate.Sometimes{Interval: time.Minute},
-	}
-	if maxPerNode > 0 {
-		l.node = make(chan struct{}, maxPerNode)
-		l.entries = make(chan struct{}, maxPerNode+cfg.SeafHTTP.SyncBlockMaxWaitersPerNode)
-	}
-	return l
+	return newSyncAdmissionLimiter(
+		syncAdmissionBounds{
+			maxPerUser:        cfg.SeafHTTP.CheckBlocksMaxInflightPerUser,
+			maxPerNode:        cfg.SeafHTTP.CheckBlocksMaxInflightPerNode,
+			maxWaitersPerUser: cfg.SeafHTTP.CheckBlocksMaxWaitersPerUser,
+			maxWaitersPerNode: cfg.SeafHTTP.CheckBlocksMaxWaitersPerNode,
+			waitTimeout:       cfg.SeafHTTP.CheckBlocksAdmissionWait,
+		},
+		syncAdmissionMetrics{
+			inflight:      metrics.SyncCheckBlocksInflightCurrent,
+			entries:       metrics.SyncCheckBlocksEntriesCurrent,
+			waiters:       metrics.SyncCheckBlocksWaitersCurrent,
+			rejected:      metrics.SyncCheckBlocksAdmissionRejectedTotal,
+			waitSeconds:   metrics.SyncCheckBlocksAdmissionWaitSeconds,
+			userOccupancy: metrics.SyncCheckBlocksUserInflightOccupancy,
+		},
+		"[CheckBlocks]",
+		"too many check-blocks requests in progress, please try again shortly",
+	)
 }
 
 // retryAfterSeconds is what a refused client is told to wait. It tracks the
@@ -150,7 +255,7 @@ func newSyncBlockInflightLimiter(cfg *config.Config) *syncBlockInflightLimiter {
 // a slot plausibly frees up on. Floored at 1 because Retry-After has
 // second granularity and 0 would mean "retry immediately", which is the churn
 // this is meant to avoid.
-func (l *syncBlockInflightLimiter) retryAfterSeconds() int {
+func (l *syncAdmissionLimiter) retryAfterSeconds() int {
 	if l == nil || l.waitTimeout <= 0 {
 		return 1
 	}
@@ -167,7 +272,7 @@ func (l *syncBlockInflightLimiter) retryAfterSeconds() int {
 // non-empty reason. The caller must hold the admission until the buffered body
 // is no longer referenced — through hashing and the storage write, not just the
 // read — because that whole span is what the memory bound covers.
-func (l *syncBlockInflightLimiter) acquire(ctx context.Context, key string) (func(), string) {
+func (l *syncAdmissionLimiter) acquire(ctx context.Context, key string) (func(), string) {
 	if l == nil {
 		return func() {}, ""
 	}
@@ -225,13 +330,13 @@ func (l *syncBlockInflightLimiter) acquire(ctx context.Context, key string) (fun
 	}
 
 	l.observeWait(start, true)
-	metrics.SyncPutBlockInflightCurrent.Inc()
+	l.m.inflight.Inc()
 	entryHeld = false
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			metrics.SyncPutBlockInflightCurrent.Dec()
+			l.m.inflight.Dec()
 			releaseNode()
 			releaseUser()
 			releaseEntry()
@@ -243,7 +348,7 @@ func (l *syncBlockInflightLimiter) acquire(ctx context.Context, key string) (fun
 // a user-specific map entry can be created. It is intentionally non-blocking:
 // entries already include every active node slot and every configured global
 // waiter, so another request has no bounded place to park.
-func (l *syncBlockInflightLimiter) acquireEntry(ctx context.Context) (func(), string) {
+func (l *syncAdmissionLimiter) acquireEntry(ctx context.Context) (func(), string) {
 	if l.entries == nil {
 		return func() {}, ""
 	}
@@ -252,12 +357,12 @@ func (l *syncBlockInflightLimiter) acquireEntry(ctx context.Context) (func(), st
 	}
 	select {
 	case l.entries <- struct{}{}:
-		metrics.SyncPutBlockEntriesCurrent.Inc()
+		l.m.entries.Inc()
 		var once sync.Once
 		return func() {
 			once.Do(func() {
 				<-l.entries
-				metrics.SyncPutBlockEntriesCurrent.Dec()
+				l.m.entries.Dec()
 			})
 		}, ""
 	default:
@@ -297,7 +402,7 @@ func (w *syncBlockAdmissionWait) close() {
 
 // acquireUser blocks on the calling user's own gate. Because refs is bumped
 // before the wait, the gate cannot be evicted while somebody is queued on it.
-func (l *syncBlockInflightLimiter) acquireUser(wait *syncBlockAdmissionWait, key string) (func(), string) {
+func (l *syncAdmissionLimiter) acquireUser(wait *syncBlockAdmissionWait, key string) (func(), string) {
 	if l.maxPerUser <= 0 {
 		return func() {}, ""
 	}
@@ -342,8 +447,8 @@ func (l *syncBlockInflightLimiter) acquireUser(wait *syncBlockAdmissionWait, key
 		gate.refs++
 		gate.waiters++
 		l.nodeWaiters++
-		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("user").Inc()
-		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Inc()
+		l.m.waiters.WithLabelValues("user").Inc()
+		l.m.waiters.WithLabelValues("node").Inc()
 		l.mu.Unlock()
 		ctx := wait.context()
 		select {
@@ -352,8 +457,8 @@ func (l *syncBlockInflightLimiter) acquireUser(wait *syncBlockAdmissionWait, key
 			l.mu.Lock()
 			gate.waiters--
 			l.nodeWaiters--
-			metrics.SyncPutBlockWaitersCurrent.WithLabelValues("user").Dec()
-			metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Dec()
+			l.m.waiters.WithLabelValues("user").Dec()
+			l.m.waiters.WithLabelValues("node").Dec()
 			dropRefLocked()
 			l.mu.Unlock()
 			return nil, wait.rejectReason(syncBlockRejectUser)
@@ -361,12 +466,12 @@ func (l *syncBlockInflightLimiter) acquireUser(wait *syncBlockAdmissionWait, key
 		l.mu.Lock()
 		gate.waiters--
 		l.nodeWaiters--
-		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("user").Dec()
-		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Dec()
+		l.m.waiters.WithLabelValues("user").Dec()
+		l.m.waiters.WithLabelValues("node").Dec()
 		l.mu.Unlock()
 	}
 
-	metrics.SyncPutBlockUserInflightOccupancy.Observe(float64(len(gate.sem)))
+	l.m.userOccupancy.Observe(float64(len(gate.sem)))
 
 	return func() {
 		<-gate.sem
@@ -377,7 +482,7 @@ func (l *syncBlockInflightLimiter) acquireUser(wait *syncBlockAdmissionWait, key
 // acquireNode blocks on the process-wide gate. This is the one that fixes the
 // memory ceiling, and it is taken last so a user queued on their own cap never
 // occupies node capacity while waiting.
-func (l *syncBlockInflightLimiter) acquireNode(wait *syncBlockAdmissionWait) (func(), string) {
+func (l *syncAdmissionLimiter) acquireNode(wait *syncBlockAdmissionWait) (func(), string) {
 	if l.node == nil {
 		return func() {}, ""
 	}
@@ -392,7 +497,7 @@ func (l *syncBlockInflightLimiter) acquireNode(wait *syncBlockAdmissionWait) (fu
 			return nil, syncBlockRejectNodeQueueFull
 		}
 		l.nodeWaiters++
-		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Inc()
+		l.m.waiters.WithLabelValues("node").Inc()
 		l.mu.Unlock()
 		ctx := wait.context()
 		select {
@@ -400,13 +505,13 @@ func (l *syncBlockInflightLimiter) acquireNode(wait *syncBlockAdmissionWait) (fu
 		case <-ctx.Done():
 			l.mu.Lock()
 			l.nodeWaiters--
-			metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Dec()
+			l.m.waiters.WithLabelValues("node").Dec()
 			l.mu.Unlock()
 			return nil, wait.rejectReason(syncBlockRejectNode)
 		}
 		l.mu.Lock()
 		l.nodeWaiters--
-		metrics.SyncPutBlockWaitersCurrent.WithLabelValues("node").Dec()
+		l.m.waiters.WithLabelValues("node").Dec()
 		l.mu.Unlock()
 	}
 
@@ -431,12 +536,12 @@ func (w *syncBlockAdmissionWait) rejectReason(capacityReason string) string {
 	return capacityReason
 }
 
-func (l *syncBlockInflightLimiter) observeWait(start time.Time, admitted bool) {
+func (l *syncAdmissionLimiter) observeWait(start time.Time, admitted bool) {
 	outcome := "rejected"
 	if admitted {
 		outcome = "admitted"
 	}
-	metrics.SyncPutBlockAdmissionWaitSeconds.WithLabelValues(outcome).Observe(time.Since(start).Seconds())
+	l.m.waitSeconds.WithLabelValues(outcome).Observe(time.Since(start).Seconds())
 }
 
 // reject answers a request that could not be admitted.
@@ -449,8 +554,8 @@ func (l *syncBlockInflightLimiter) observeWait(start time.Time, admitted bool) {
 // A client that disconnected while queued gets no response at all — there is
 // nobody left to read it, and writing one would only be a way to log a status
 // code that never travelled.
-func (l *syncBlockInflightLimiter) reject(c *gin.Context, reason string) {
-	metrics.SyncPutBlockAdmissionRejectedTotal.WithLabelValues(reason).Inc()
+func (l *syncAdmissionLimiter) reject(c *gin.Context, reason string) {
+	l.m.rejected.WithLabelValues(reason).Inc()
 
 	if reason == syncBlockRejectClientGone {
 		c.Abort()
@@ -459,28 +564,46 @@ func (l *syncBlockInflightLimiter) reject(c *gin.Context, reason string) {
 
 	retryAfter := l.retryAfterSeconds()
 	l.logSample.Do(func() {
-		log.Printf("[PutBlock] refusing block upload at process-local in-flight cap (reason=%s); sampled, see sync_put_block_admission_rejected_total", reason)
+		log.Printf("%s refusing request at process-local in-flight cap (reason=%s); sampled, see the admission_rejected_total series for this route", l.logPrefix, reason)
 	})
 
 	c.Header("Retry-After", strconv.Itoa(retryAfter))
 	c.JSON(http.StatusServiceUnavailable, gin.H{
-		"error":       "too many block uploads in progress, please try again shortly",
+		"error":       l.rejectMessage,
 		"retry_after": retryAfter,
 	})
 }
 
-// acquireSyncBlockInflight adapts the limiter to the handler. It returns a
-// release closure and true when the request may proceed; when it returns false
-// the response has already been written (or deliberately not written, for a
-// vanished client) and the handler must return without touching the body.
-func (h *SyncHandler) acquireSyncBlockInflight(c *gin.Context, orgID, userID string) (func(), bool) {
-	if h == nil || h.blockInflight == nil {
+// acquireSyncAdmission adapts a limiter to a handler. It returns a release
+// closure and true when the request may proceed; when it returns false the
+// response has already been written (or deliberately not written, for a vanished
+// client) and the handler must return without touching the body.
+//
+// The key is (org, user) rather than the token or the device: sync auth resolves
+// every device token of one person to the same user, and a per-token key would
+// let one identity multiply its budget by adding devices.
+func acquireSyncAdmission(c *gin.Context, l *syncAdmissionLimiter, orgID, userID string) (func(), bool) {
+	if l == nil {
 		return func() {}, true
 	}
-	release, reason := h.blockInflight.acquire(c.Request.Context(), orgID+"|"+userID)
+	release, reason := l.acquire(c.Request.Context(), orgID+"|"+userID)
 	if release == nil {
-		h.blockInflight.reject(c, reason)
+		l.reject(c, reason)
 		return nil, false
 	}
 	return release, true
+}
+
+func (h *SyncHandler) acquireSyncBlockInflight(c *gin.Context, orgID, userID string) (func(), bool) {
+	if h == nil {
+		return func() {}, true
+	}
+	return acquireSyncAdmission(c, h.blockInflight, orgID, userID)
+}
+
+func (h *SyncHandler) acquireCheckBlocksInflight(c *gin.Context, orgID, userID string) (func(), bool) {
+	if h == nil {
+		return func() {}, true
+	}
+	return acquireSyncAdmission(c, h.checkBlocksInflight, orgID, userID)
 }

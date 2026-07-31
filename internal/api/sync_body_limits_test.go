@@ -201,10 +201,10 @@ func TestCheckBlocksBoundsBlockIDCount(t *testing.T) {
 		return w.Code
 	}
 
-	if code := postCheckBlocks(t, newlineBody(maxCheckBlockIDs+1)); code != http.StatusRequestEntityTooLarge {
+	if code := postCheckBlocks(t, newlineBody(config.DefaultCheckBlocksMaxIDs+1)); code != http.StatusRequestEntityTooLarge {
 		t.Errorf("check-blocks over id cap = %d, want 413", code)
 	}
-	if code := postCheckBlocks(t, newlineBody(maxCheckBlockIDs)); code == http.StatusRequestEntityTooLarge {
+	if code := postCheckBlocks(t, newlineBody(config.DefaultCheckBlocksMaxIDs)); code == http.StatusRequestEntityTooLarge {
 		t.Errorf("check-blocks at id cap was rejected 413, want it through the size gate")
 	}
 }
@@ -215,7 +215,7 @@ func parseCheckBlockIDsForTest(body string) ([]string, bool, int) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
-	ids, ok := parseCheckBlockIDs(c, []byte(body))
+	ids, ok := parseCheckBlockIDs(c, []byte(body), config.DefaultCheckBlocksMaxIDs)
 	return ids, ok, w.Code
 }
 
@@ -227,14 +227,14 @@ func TestParseCheckBlockIDsJSONBoundary(t *testing.T) {
 		return "[" + strings.TrimSuffix(strings.Repeat(`"a",`, n), ",") + "]"
 	}
 
-	ids, ok, code := parseCheckBlockIDsForTest(jsonBody(maxCheckBlockIDs))
+	ids, ok, code := parseCheckBlockIDsForTest(jsonBody(config.DefaultCheckBlocksMaxIDs))
 	if !ok {
 		t.Fatalf("JSON at id cap rejected with %d, want accepted", code)
 	}
-	if len(ids) != maxCheckBlockIDs {
-		t.Fatalf("JSON at id cap parsed %d ids, want %d", len(ids), maxCheckBlockIDs)
+	if len(ids) != config.DefaultCheckBlocksMaxIDs {
+		t.Fatalf("JSON at id cap parsed %d ids, want %d", len(ids), config.DefaultCheckBlocksMaxIDs)
 	}
-	if _, ok, code := parseCheckBlockIDsForTest(jsonBody(maxCheckBlockIDs + 1)); ok || code != http.StatusRequestEntityTooLarge {
+	if _, ok, code := parseCheckBlockIDsForTest(jsonBody(config.DefaultCheckBlocksMaxIDs + 1)); ok || code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("JSON over id cap: ok=%v code=%d, want rejected 413", ok, code)
 	}
 }

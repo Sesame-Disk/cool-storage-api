@@ -273,6 +273,30 @@ seafhttp:
   sync_block_max_waiters_per_user: 16
   sync_block_max_waiters_per_node: 128
   sync_block_admitted_lifetime: 5m # effective TCP body deadline through storage; max 30m
+  # check-blocks admission and work bounds (subcontract C / X11). The id cap
+  # bounds the parse; these bound the work an accepted list triggers. The node
+  # cap and the fan-out MULTIPLY: at most
+  # check_blocks_max_inflight_per_node x check_blocks_lookup_fanout metadata
+  # lookups (Cassandra point reads, object-store existence checks) are in flight
+  # from this route at once. Validation rejects a product above 256.
+  # Overrides: SEAFHTTP_CHECK_BLOCKS_*
+  check_blocks_max_inflight_per_node: 8
+  check_blocks_max_inflight_per_user: 4
+  check_blocks_max_waiters_per_node: 64
+  check_blocks_max_waiters_per_user: 8
+  # Over-cap requests wait this long, then get 503 + Retry-After — never 429,
+  # which the sync client does not retry. Same value as the block route, which is
+  # the one validated against the real client.
+  check_blocks_admission_wait: 10s
+  # Processing deadline for the body read and every metadata lookup. This is what
+  # makes an admission recoverable and what stops the Cassandra work when a
+  # client disconnects.
+  check_blocks_admitted_lifetime: 5m
+  # Accepted ids per request. 100000 is the inherited compatibility bound, not a
+  # measured one, and it is also the validation ceiling: lower it from
+  # sync_check_blocks_ids_per_request, never raise it.
+  check_blocks_max_ids: 100000
+  check_blocks_lookup_fanout: 8
   # Per-IP-and-stable-link bound on ANONYMOUS writes through a public upload link (only
   # tokens whose source is "link"; authenticated web uploads on the same endpoint
   # are untouched). Keyed on both so one uploader behind a NAT does not throttle

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -355,7 +356,21 @@ var insertBlockIDMappingForWriteCheckFn = func(database *DB, orgID, representati
 // GetBlockIDMapping resolves one external SHA-1 block ID to its internal SHA-256
 // storage identity using the forward row scoped to one representation domain.
 // ok == false means no mapping row exists.
+//
+// This contextless form is for callers that resolve a single mapping as part of
+// a write, where there is no per-request budget to respect and the driver's own
+// timeout is the bound. Anything that resolves mappings in bulk must use
+// GetBlockIDMappingContext instead: a loop of contextless reads cannot be
+// stopped by a client disconnect or a request deadline, which is precisely the
+// unbounded work subcontract C exists to close.
 func (db *DB) GetBlockIDMapping(orgID, representationID, externalID string) (internalID string, ok bool, err error) {
+	return db.GetBlockIDMappingContext(context.Background(), orgID, representationID, externalID)
+}
+
+// GetBlockIDMappingContext is GetBlockIDMapping bound to a context, so an
+// in-flight read is abandoned when the caller's deadline expires or its client
+// goes away.
+func (db *DB) GetBlockIDMappingContext(ctx context.Context, orgID, representationID, externalID string) (internalID string, ok bool, err error) {
 	if db == nil {
 		return "", false, nil
 	}
@@ -366,9 +381,15 @@ func (db *DB) GetBlockIDMapping(orgID, representationID, externalID string) (int
 	if externalID == "" {
 		return "", false, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
 	err = db.Session().Query(`
 		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?
-	`, orgID, representationID, externalID).Scan(&internalID)
+	`, orgID, representationID, externalID).WithContext(ctx).Scan(&internalID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return "", false, nil

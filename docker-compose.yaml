@@ -170,6 +170,17 @@ services:
       - SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_NODE=2
       - SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_USER=2
       - SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT=${BLOCK_ADMISSION_FAULT_WAIT:-250ms}
+      # Squeezed check-blocks admission (subcontract C / X11), on the same node
+      # and for the same reason. The fan-out is squeezed too: it is half of the
+      # per-request work bound, and a test that only pinned the admission cap
+      # would not notice it going unbounded.
+      # internal/integration/check_blocks_admission_test.go mirrors these values.
+      - SEAFHTTP_CHECK_BLOCKS_MAX_INFLIGHT_PER_NODE=2
+      - SEAFHTTP_CHECK_BLOCKS_MAX_INFLIGHT_PER_USER=2
+      - SEAFHTTP_CHECK_BLOCKS_MAX_WAITERS_PER_NODE=2
+      - SEAFHTTP_CHECK_BLOCKS_MAX_WAITERS_PER_USER=2
+      - SEAFHTTP_CHECK_BLOCKS_LOOKUP_FANOUT=2
+      - SEAFHTTP_CHECK_BLOCKS_ADMISSION_WAIT=${CHECK_BLOCKS_ADMISSION_FAULT_WAIT:-250ms}
     depends_on:
       cassandra:
         condition: service_healthy
@@ -602,6 +613,43 @@ services:
       - SYNC_DATA_DIR=/seafile-data
       - SYNC_TEST_IN_CONTAINER=1
       - HOLDER_RATE=${HOLDER_RATE:-8k}
+    volumes:
+      - .:/workspace
+    depends_on:
+      - sesamefs-node-3
+    profiles:
+      - test
+
+  # Fault injection for subcontract C / X11: same idea as the block drill above,
+  # against the check-blocks route. It additionally reports the real client's
+  # observed id cardinality, which is the evidence any future decision to lower
+  # check_blocks_max_ids has to rest on.
+  #
+  #   docker compose --profile test run --rm --build check-blocks-admission-fault-test
+  check-blocks-admission-fault-test:
+    build:
+      context: ./docker/seafile-cli
+      dockerfile: Dockerfile
+    entrypoint:
+      - /bin/bash
+      - -lc
+      # The repo is mounted from a Windows host in some setups, so the script is
+      # normalised before running rather than executed in place.
+      - >-
+        /workspace/scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3 &&
+        sed 's/\r$//' /workspace/scripts/fault-inject-check-blocks-admission.sh > /tmp/fault-inject.sh &&
+        chmod +x /tmp/fault-inject.sh &&
+        /tmp/fault-inject.sh
+    environment:
+      - SESAMEFS_URL=http://sesamefs-node-3:8080
+      - SESAMEFS_URL_LOCAL=http://sesamefs-node-3:8080
+      - DEV_API_TOKEN=dev-token-admin
+      - DEV_PASSWORD=dev-token-123
+      - DEV_USER=00000000-0000-0000-0000-000000000001
+      - SYNC_DATA_DIR=/seafile-data
+      - SYNC_TEST_IN_CONTAINER=1
+      - HOLDER_RATE=${CHECK_BLOCKS_HOLDER_RATE:-64k}
+      - HOLDER_IDS=${CHECK_BLOCKS_HOLDER_IDS:-20000}
     volumes:
       - .:/workspace
     depends_on:
