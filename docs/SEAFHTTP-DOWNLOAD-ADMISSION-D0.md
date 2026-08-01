@@ -214,7 +214,9 @@ counted once in `node_active`.
 
 The coordinator is bounded by construction:
 
-- Global maximum for active entries and waiters before creating identity state.
+- Global maxima on active transfers and on parked requests, checked before
+  identity state is created. These two are the whole global envelope: because
+  admission is atomic, D needs no separate pre-gate entry ring of its own.
 - Per-identity active and waiter limits.
 - Entry removal when `active == 0 && waiters == 0` and no reservation remains.
 - No timer or goroutine permanently allocated per identity.
@@ -258,11 +260,31 @@ putting this producer in scope was for. The preparation deadline covers the
 storage read; the idle-write deadline covers the response write; both run under
 one admission.
 
-`zip` is held until `zipWriter.Close()` returns. The ZIP handler builds its
-writer with `defer zipWriter.Close()`, so a release registered as a later
-`defer` would unwind **before** the close that flushes the central directory —
-a slot returned while the response is still being written. Acquiring before
-`zip.NewWriter` makes the LIFO order correct by construction.
+`zip` is held until `zipWriter.Close()` returns, because that close is what
+flushes the central directory: releasing earlier returns the slot while the
+response is still being written. Acquiring before `zip.NewWriter` is necessary
+but not sufficient — what matters is the `defer` registration order, which is
+what actually decides the unwind. The frozen shape is one cleanup that owns
+both, so the order cannot be broken by a later edit:
+
+```go
+lease, ok := admission.Acquire(...)   // before zip.NewWriter
+if !ok {
+    return
+}
+zipWriter := zip.NewWriter(c.Writer)
+defer func() {
+    closeErr := zipWriter.Close()
+    lease.Release()
+    // record closeErr — see below
+}()
+```
+
+The current handler uses a bare `defer zipWriter.Close()`, which discards the
+error, so a failed central-directory flush is invisible today. D4 must record
+it: a ZIP that fails to close is a truncated archive the client may accept as
+complete. The regression must prove both the ordering and that the close error
+is recorded.
 
 All profiles consume the shared node ceiling. Profile caps must not create
 independent escape hatches that allow the aggregate node limit to be exceeded.
@@ -475,7 +497,10 @@ shape is frozen here so `applyEnvOverrides()` has something to implement:
 
 ```yaml
 download_admission:
-  enabled: true
+  # Shipped disabled with zero placeholders so this block is a valid
+  # configuration today. D1 measures the defaults and flips it on; with
+  # enabled: true these zeros would refuse to start, by the rule below.
+  enabled: false
   max_active_per_node: 0
   max_active_per_auth_user: 0
   max_active_per_link_source: 0
@@ -542,7 +567,9 @@ not. With a short or disabled queue — which §6 expects for long streams —
 `ceil(admission_wait)` would tell every refused client to come back in one
 second while transfers hold capacity for minutes, turning the refusal into a
 retry storm. The floor is one second, since `Retry-After` has second
-granularity and zero means "retry now".
+granularity and zero means "retry now". The header is serialised as
+`ceil(retry_after / 1s)`, minimum `1`, so a sub-second or fractional value such
+as `1500ms` becomes `2` rather than being truncated to `1`.
 
 Every `configs/*.yaml`, `.env.example`, `.env.prod.example` and
 `applyEnvOverrides()` must carry the new keys. A key that exists in the struct
@@ -555,9 +582,9 @@ but in only some config files is a defect B and C both had to fix.
 |---|---|---|
 | `download_admission_active_current` | Gauge | none — the node total |
 | `download_admission_active_by_profile` | Gauge | `profile`, fixed exclusive enum |
-| `download_admission_entries_current` | Gauge | none — requests holding a global entry ticket, admitted plus parked |
+| `download_admission_entries_current` | Gauge | none — requests inside admission: active plus parked |
 | `download_admission_waiters_current` | Gauge | none — **unique** requests currently parked |
-| `download_admission_waiters_by_dimension` | Gauge | `dimension` — which gates those requests are blocked on |
+| `download_admission_waiters_by_gate` | Gauge | `gate` — which gates those requests are blocked on |
 | `download_admission_tracked_identities` | Gauge | `dimension` — identity gates currently materialised |
 | `download_admission_rejected_total` | Counter | `reason`, fixed set |
 | `download_admission_released_total` | Counter | `cause`, fixed set |
@@ -567,36 +594,57 @@ but in only some config files is a defect B and C both had to fix.
 | `download_admission_occupancy` | Histogram | `dimension` |
 
 Waiters need two series for the same reason active does. A parked public request
-blocks on `link_source` and `client_link` at once, so a per-dimension gauge
-cannot answer "how many requests are queued" — which is precisely what
+blocks on `link_source` and `client_link` at once, so a per-gate gauge cannot
+answer "how many requests are queued" — which is precisely what
 `max_waiters_per_node` bounds. `waiters_current` is that unlabelled count;
-`waiters_by_dimension` shows which gate they are stuck behind. Summing the
-latter against the former is the same double-count error as summing identity
-dimensions against the node total.
+`waiters_by_gate` shows which gates they are stuck behind, and its label set
+covers `node` and `profile` too, because a request can be parked on the node
+ceiling or a profile cap with every identity gate free. Summing
+`waiters_by_gate` against `waiters_current` is the same double-count error as
+summing identity dimensions against the node total: one parked request can be
+blocked on several gates at once.
 
 "Fixed set" means enumerated here, not decided in D1, because these values end
 up in dashboards and alert rules:
 
 ```text
 dimension: auth_user | link_source | client_link
+gate:      node | profile | auth_user | link_source | client_link
 profile:   block | file | raw | history | link_raw | zip | link_inline
 phase:     preparation | idle_write
 outcome:   admitted | refused | timeout | cancelled
 
 reason:    node_full | identity_full | profile_full
-           | node_queue_full | identity_queue_full | entry_queue_full
+           | node_queue_full | identity_queue_full
            | admission_timeout | client_gone
 
 cause:     completed | client_disconnect | preparation_timeout
            | idle_write_timeout | storage_error | response_error | panic
 ```
 
-`reason` keeps B/C's distinction between a full queue and a full entry ring:
-both mean "no room", but one is a saturated node that wants capacity and the
-other is the global envelope filling before any identity state can be created,
-and an operator needs to tell them apart. `cause` must account for every way a
-slot disappears, so a release that is not `completed` is visible rather than
-looking like ordinary traffic.
+There is deliberately **no** `entry_queue_full`, and no `max_entries_per_node`
+to go with it. B/C carry a global entry ring because they acquire gates
+sequentially: a request can hold its per-user slot while it has not yet reached
+the node gate, a transitional state that is neither active nor parked, so
+without the ring it would be unaccounted. Its capacity there is exactly
+`maxPerNode + maxWaitersPerNode` — not an independent third budget. D admits
+atomically and reserves nothing while waiting (§4), so that transitional state
+does not exist and a third ring would be mechanism copied from B/C into a design
+that removed the need for it. When there is no room, the reason is a full node
+or a full queue. The identity is therefore frozen:
+
+```text
+download_admission_entries_current == active_current + waiters_current
+```
+
+with the same snapshot caveat as the profile invariant below.
+
+`cause` must account for every way a slot disappears, so a release that is not
+`completed` is visible rather than looking like ordinary traffic. `client_gone`
+stays inside `rejected_total` rather than becoming a separate series, keeping
+B/C's vocabulary, but it is explicitly **not** a capacity signal: counting
+abandoned requests as capacity rejections would make the metric read as overload
+during ordinary client churn, so any saturation alert must exclude it.
 
 The occupancy invariant is:
 
@@ -659,7 +707,7 @@ and the relevant integration/fault drill:
 | 11 | Client recovery | `seaf-cli`, browser/download behavior and OnlyOffice retrieval recover or fail clearly under saturation |
 | 12 | Configuration evidence | Defaults, ceilings and long-transfer capacities are measured, validated and documented as process-local; egress throughput is measured and the byte-rate residual is explicit |
 | 13 | No false storage claim | MinIO/direct-object exposure remains separately tracked and is not silently treated as closed by D |
-| 14 | Observability and configuration contract | Every key ships in all `configs/*.yaml`, both `.env` examples and `applyEnvOverrides()` with enforced ceilings; the metric series and their fixed label sets exist as specified; `active_current == sum(active_by_profile)` holds under mixed authenticated and public load; no identity value appears in any label |
+| 14 | Observability and configuration contract | Every key ships in all `configs/*.yaml`, both `.env` examples and `applyEnvOverrides()` with enforced ceilings and the per-key zero policy; startup refuses an enabled-but-unbounded configuration and a non-zero `server.write_timeout`; the metric series and their fixed label sets exist as specified; `active_current == sum(active_by_profile)` and `entries_current == active_current + waiters_current` hold under mixed authenticated and public load; `Retry-After` is `ceil(retry_after)` with a floor of 1; no identity value appears in any label |
 
 ## D0-D6 PR Sequence
 
