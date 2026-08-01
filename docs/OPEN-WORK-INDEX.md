@@ -1,6 +1,6 @@
 # Open Work Index
 
-**Last updated:** 2026-07-30
+**Last updated:** 2026-08-01
 **Scope (narrowed 2026-07-25):** production blockers, recent readiness /
 upload-fence audit follow-ups, and leftovers from consolidating the parallel
 pending-work trackers. **This is not the entire product backlog.** Roadmap /
@@ -58,12 +58,14 @@ of them updated.
 ## Production blockers — must close before go-live
 
 **Readiness verdict is still no-go as-is.** NF-1 closed 2026-07-25; **B4 remains
-the open single-node blocker**, and multi-instance adds B1 and B5. See
+the open single-node blocker** and anonymous object-storage downloads are a
+separate production-posture blocker; multi-instance adds B1 and B5. See
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29; B closed 2026-07-30; C closed 2026-07-31** — check-blocks now has its own admission capacity, deduplicated and fan-out-bounded metadata lookups, cancellation that prevents new work and cancels context-aware reads, and the gzip exclusion its admitted lifetime needs. **D (download / block GET) remains open.** | Readiness B4 ⊇ registry X10/X11 — **still the single-node blocker until D closes** |
+| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29; B closed 2026-07-30; C closed 2026-07-31** — D0 now freezes the broader storage-backed byte-production scope, atomic multidimensional admission, stable link identity, writer lifetime and the D1-D6 PR sequence. **D remains open; no runtime change has landed.** | Readiness B4 ⊇ registry X10/X11 — **still the single-node blocker until D closes**; see [`SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md) |
+| `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` | Blocker | Supported Compose policies grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known | Production posture — private buckets and effective endpoint policy must be verified before go-live; see `KNOWN_ISSUES.md` |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
 

@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-07-25
+**Last Updated**: 2026-08-01
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -19,7 +19,8 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B and C are closed; download/block GET (D) remains untouched. C (2026-07-31) gives check-blocks its own admission capacity, deduplicated and fan-out-bounded metadata lookups, cancellation that prevents new work and cancels context-aware reads, and the gzip exclusion its admitted lifetime needs. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01. |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B and C are closed; download/block GET (D) remains open with no runtime implementation yet. D0 freezes the broader byte-producing download scope, atomic multidimensional admission, stable public-link identity and the D1-D6 PR sequence. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
+| **Anonymous object-storage downloads** | 🔴 Open — production posture blocker | Supported Compose storage policies currently grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
@@ -5047,7 +5048,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B and C are closed**; **D remains open**. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C does not close the B4 umbrella.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B and C are closed**; **D remains open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; no D runtime behavior has landed. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5066,16 +5067,23 @@ Current guard state (2026-08-01; the other rows retain their original verificati
 |---|---|
 | `/seafhttp/upload-api/:token` | After a valid token resolves as link-origin, admission to permission/body/storage work has stable-source rate budgets and non-blocking per-source/per-node in-flight caps; token lookup and arbitrary invalid-token traffic are outside these guards |
 | `/seafhttp/files/:token/*filepath` | **none** |
-| `/seafhttp/repo/:repo_id/block/:block_id` (PUT/GET) | **none** — group carries only `authMiddleware` |
+| `/seafhttp/repo/:repo_id/block/:block_id` PUT | per-(org, user) and per-node admitted lifetime before the request body, with bounded waiters and a real connection deadline (B, closed 2026-07-30) |
+| `/seafhttp/repo/:repo_id/block/:block_id` GET | **none** — D is open; the route is authenticated but has no download admission |
 | `/seafhttp/repo/:repo_id/check-blocks` | per-(org, user) and per-node admission before the body read, with bounded waiters, an admitted lifetime, and a bounded cancellable metadata fan-out (2026-07-31) |
 | `/seafhttp/zip/:token` | optional `zipRL`, passed in at registration |
 | `/api/v2/blocks/check` | per-IP limiter (`rate.Every(time.Second)`, burst 120 ≈ 60/min sustained) |
 | `/api/v2/blocks/upload` | per-user concurrency limiter (`MaxConcurrentBlockUploadsPerUser`, default 8) |
 | `/api/v2.1/share-links/*`, `/api/v2.1/upload-links/*`, `/d/:token` | per-IP `slRL` |
+| `/repo/:repo_id/raw/*filepath`, `/repo/:repo_id/history/*` | **none** — authentication/traffic checks exist, but no D admission |
+| `/d/:token` or `/d/:token/files[/]` with `raw=1` | per-IP `slRL` on route starts; no active-transfer admission |
+| Share-file bootstrap inline text | per-IP `slRL` on the public route; storage read has no D admission and uses a background context |
 
 So the original B4 wording — "no dedicated rate limit on upload / download /
 blocks / share-link paths" — is **partly stale**: the share-link and web-block
-paths do have limiters. The accurate residual gap is the seafhttp group.
+paths do have some limiters. The accurate residual gap is the unbounded
+storage-backed read work, including seafhttp downloads/block GET and the raw,
+history, ZIP, share-raw and inline-content paths listed by D0. A request-start
+limiter on a public route is not an active-transfer bound.
 
 X10 adds the interaction with PR-10's body caps: bounding one `PutBlock` to
 ~257 MiB is not an aggregate bound while N concurrent uploads are unbounded, and
@@ -5094,7 +5102,7 @@ own fix + regression.
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
 | **B** | Authenticated block **PUT** concurrency (= registry **X10**) | ✅ **Closed 2026-07-30** | — | A pre-gate global ticket plus per-user/node admissions bound active, transitioning and parked requests before body reads; real-TCP deadlines cover stalled bodies; complete-lifetime memory trials support 24 slots at an 80 MiB design cost; real `seaf-cli` recovered from the shipped 10s wait and `Retry-After: 10` |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | ✅ **Closed 2026-07-31** | — | Own admission instance (separate capacity from B) before the body read, deduplicated lookups, configured fan-out and cancellation coverage for both canonical metadata phases, and an admitted lifetime that now reaches the socket. Cancellation stops new dispatch; already-issued Cassandra queries remain bounded by the driver's finite timeout. Id cap is configurable and capped at its inherited 100k; see "Subcontract C" below |
-| **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
+| **D** | All storage-backed download/inline-content reads, including seafhttp download, block GET, ZIP, raw/history and share raw | 🔴 Open | One process-local, bounded and atomic download admission shared by all byte-producing paths; per-user or stable-link/client fairness; recoverable lifetime | The original row named seafhttp download/block GET. D0 expands closure by flow so raw/history/share/ZIP cannot bypass the same bandwidth/resource exhaustion control |
 
 #### Subcontract A: stable-link request and concurrency admission (A1/A2 closed 2026-07-29)
 
@@ -5218,8 +5226,9 @@ The A2 keys are `seafhttp.upload_link_max_inflight_per_source` and
 source and `65536` per node; when both caps are enabled, the per-source cap must
 not exceed the per-node cap. Like A1, these counters are process-local: adding
 nodes increases aggregate fleet capacity. This closes subcontract A only; the
-  pre-token lookup and process-local residuals remain, and C and D remain open,
-so the B4 umbrella remains a production blocker.
+  pre-token lookup and process-local residuals remain. At the time of this A
+  closure, B, C and D were still open, so the B4 umbrella remained a production
+  blocker.
 
 #### Subcontract B: what the right-sized cap does and does not do (2026-07-28)
 
@@ -5600,23 +5609,162 @@ the C closure criteria.
 **What this does not claim.** The accepted cardinality is still a compatibility
 bound rather than a measured one — criterion 3 bounds the *work per id* and the
 *concurrent requests*, not the list length. Process-local, like every other guard
-here: fleet capacity scales with node count. And closing C does not close the
+here: fleet capacity scales with node count. Closing C did not close the
 umbrella; **D (download / block GET) remains open**, so B4 remains a production
 blocker.
 
+#### Subcontract D: download admission contract and inventory (D0, 2026-08-01)
+
+D0 is documentation only. It freezes the scope and criteria for the final open
+subcontract in [`docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md).
+No D runtime behavior is claimed here.
+
+The original D row named the seafhttp file download and authenticated block GET.
+The closure scope is intentionally defined by **storage-backed byte production**
+so an attacker cannot evade the shared node ceiling by switching to an equivalent
+route. It includes:
+
+- `HandleDownload` / `streamFileFromBlocks` (`/seafhttp/files`);
+- `HandleZipDownload` (`/seafhttp/zip`);
+- `SyncHandler.GetBlock` (block GET);
+- `ServeRawFile`, `DownloadHistoricFile` and `ServeHistoricFileRaw`;
+- `handleShareLinkRaw` for `raw=1`;
+- `readFileContentAsText`, the public inline text/Markdown storage read.
+
+Redirects, bootstrap JSON without inline content, OnlyOffice configuration and
+the share-link `dl=1` mint step do not consume a long-lived slot. OnlyOffice's
+final `/seafhttp/files` request does. There is no implicit HEAD contract; Range
+and multi-range operations remain inside the admission for their complete
+response lifetime.
+
+The D coordinator must grant all applicable dimensions atomically or none:
+
+```text
+authenticated: node + authenticated-user
+public link:   node + stable-link-source + client-link
+```
+
+Public link traffic must never consume the admission budget of the link owner's
+authenticated user. `AccessToken.UserID` remains the authorization/decryption
+principal; `SourceID` is the remint-resistant admission identity. Migration 013
+already provides `access_tokens.source_id`, but `CreateLinkDownloadToken` still
+needs the source-ID parameter and wiring for normal download, public OnlyOffice
+and public ZIP minting. New link tokens fail closed without a non-blank source
+ID; the clean deployment requires no legacy fallback or backfill.
+
+The node ceiling is shared across profiles, while block, file, raw, history,
+link-raw, ZIP and inline-text capacities are measured separately. D does not
+reuse B/C's short-work defaults or move B/C's white-box limiter implementation.
+Long downloads use a short or disabled queue plus a sliding idle-write deadline,
+not a short absolute transfer lifetime. The coordinator has bounded entries and
+waiters, removes idle identities, creates no per-identity goroutines/timers and
+must drain to zero after sustained churn.
+
+The current block gzip exclusion already covers both block methods through
+`/seafhttp/repo/.*/block/.*`. The stale `/api/v2.1/...raw` and
+`/api/v2.1/...history` patterns do not cover the registered `/repo/...` routes,
+and `/d/...` cannot be selectively excluded by `raw=1` through the current
+path-regex API. D3 will exclude the compatible `/repo/...` and `/d/...` families
+before relying on `http.ResponseController` for write deadlines. The deadline
+is installed immediately before each underlying write/flush, cleared after the
+stream and fail-closed before headers if the connection is unreachable.
+
+`GetBlockReader` and `GetBlockSize` already exist. D5 wires them into
+`SyncHandler.GetBlock` so the block is streamed opaquely with authoritative size,
+context cancellation and preserved response states. D5 deliberately changes
+`last_accessed`: today `GetBlock` writes it before the response body is sent;
+the new behavior writes it only after a complete successful stream. This is safe
+because no current reader uses `blocks.last_accessed` for retention or deletion,
+but any future GC/cold-storage consumer must revisit that contract.
+
+`GetBlockSize` may be used for the preflight quota decision and
+`Content-Length`, but it must not become the recorded transfer amount. The
+current buffered implementation accounts `len(data)`, which is exact for the
+completed block. After streaming, D5 must count bytes successfully written and
+pass that actual count to `traffic.RecordCheckedTransfer`; a partial transfer
+must not regress to nominal-size overbilling. The broader `StreamBlocks` false
+success/over-counting issue remains separately tracked as
+`ISSUE-STREAMBLOCKS-VOID-01`.
+
+D0-D6 is the implementation order: contract/inventory, coordinator, public-link
+identity, writer lifetime/gzip, existing stream integration, block GET streaming,
+then evidence and closure documentation. The object-storage Compose policy
+`mc anonymous set download` is separately tracked as
+`ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01`; D must not silently claim that
+direct bucket access is protected by application admission.
+
 #### Fix Direction
 
-Implement A–D independently. Do not mark this issue closed until all four
-subcontracts have criteria met and tests. Independently, revisit the 257 MiB
-`PutBlock` cap: it derives from the 256 MiB adaptive-chunk ceiling of the *web*
-path, while the desktop client this route serves sends CDC blocks of ≤8 MiB.
+Implement D through the D0-D6 sequence. Do not mark this issue closed until the
+criteria in the D0 contract are met with focused, real-middleware and integration
+evidence. B4 remains open until D closes. The old 257 MiB `PutBlock` cap note is
+historical: B right-sized and bounded that path; it is not remaining D work.
 
 #### Related Docs
 
 - `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X10 = subcontract B; X11 = related to C)
 - `docs/PROD-SECURITY-READINESS-20260724.md` (B4, SEC-2, SH-1, checklist item 1)
+- `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md` (D0 contract, inventory and PR sequence)
 - `docs/SECURITY-ASSESSMENT-2026-04.md` **H-7** — the original 2026-04 filing. (The readiness report cited H-5 for this; H-5 is share-link token enumeration. H-7 is the rate-limit finding.)
 - `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` (subcontract C detail)
+
+---
+
+### ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01: Supported storage policies bypass application download controls
+
+**Status**: 🔴 **Open** — production posture blocker
+**Severity**: Blocker for any production deployment where the configured object
+storage endpoint is publicly reachable with anonymous read access
+**Affected**: Compose storage initialization and any deployed bucket policy
+that grants anonymous `download` access
+**Source of record**: D0 contract in
+`docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; production posture follow-up to
+`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`
+
+#### Problem
+
+The supported Compose definitions currently execute `mc anonymous set download`
+for application storage buckets. The commands are present in:
+
+- `docker-compose.yaml`;
+- `docker-compose.mr.yaml`;
+- `docker-compose.mr-cluster.yaml`;
+- `docker-compose-multiregion.yaml`.
+
+An actor who knows or obtains a bucket/key can fetch the object directly from
+MinIO or the object-storage endpoint without traversing SesameFS
+authentication, authorization, traffic quota checks, traffic recording,
+admission limits or application metrics. This is an independent bypass of
+application-layer D. A public share token is not required for the direct read.
+
+This issue is not evidence that every production deployment currently exposes
+the endpoint. It is a defect in the supported posture unless deployment proves
+the buckets are private and the object-storage network endpoint is not directly
+reachable by untrusted clients.
+
+#### Greenfield Fix Direction
+
+The clean production deployment must:
+
+1. remove anonymous-read initialization from production-supported Compose paths;
+2. use private buckets and application-owned credentials for all storage reads;
+3. verify that an unauthenticated object GET receives `403` (or the provider's
+   equivalent private-bucket response);
+4. verify application downloads continue to work through the canonical reader;
+5. inspect all storage endpoints and signed-URL paths for another direct public
+   bypass;
+6. document any deliberately local-only anonymous policy in a test-only Compose
+   profile rather than in the production deployment path.
+
+No legacy object migration or data backfill is needed for the clean deployment.
+The issue remains open until the effective production policy is tested, not only
+until the YAML commands are edited.
+
+#### Related Docs
+
+- `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md` (D boundary and separate blocker)
+- `docs/OPEN-WORK-INDEX.md` (production blocker row)
+- `docs/PROD-SECURITY-READINESS-20260724.md` (dated posture note)
 
 ---
 
