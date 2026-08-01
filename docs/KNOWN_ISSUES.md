@@ -5633,10 +5633,18 @@ route. It includes:
 
 Within `raw`, the `preview=1` iWork branch of `ServeRawFile` is the worst memory
 case in D: it buffers the entire source file into one `bytes.Buffer` before
-parsing it as a ZIP. `FileView.MaxIWorkPreviewBytes` caps the *extracted*
-preview, not that buffer, and nothing gates the source size, so
-`max_active_raw` alone does not bound `raw` memory. D4 must add a source-size
-gate and D6 must measure the per-request peak.
+parsing it as a ZIP. The source file **is** gated by the existing
+`getMaxFileSizeForPreview` check, which returns `413` before the block store is
+resolved and before buffering — but an iWork file is neither video nor text, so
+that gate is the general `FileView.MaxPreviewBytes`, 1 GiB in every shipped
+config and twenty times the 50 MB `MaxIWorkPreviewBytes` that caps only the
+extracted preview. The path is bounded, at a value never chosen for a fully
+buffered producer. D4 must prove the existing gate still precedes admission and
+buffering, and decide whether `raw` can keep one cap for both streaming and
+buffered work; D6 must measure the real per-request peak (buffer capacity,
+in-flight encrypted and decrypted block, extracted preview, ZIP overhead) so
+`max_active_raw` and `MaxPreviewBytes` can be set against a stated memory
+budget.
 
 Redirects, bootstrap JSON without inline content, OnlyOffice configuration and
 the share-link `dl=1` mint step do not consume a long-lived slot. OnlyOffice's

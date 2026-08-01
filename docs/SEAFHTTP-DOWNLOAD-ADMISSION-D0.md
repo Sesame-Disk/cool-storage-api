@@ -92,14 +92,20 @@ keeps it that way, not a D4 investigation. Other redirect/bootstrap endpoints
 must still be verified during D4. Redirects and control-plane JSON do not
 reserve a long-lived transfer slot.
 
-Two helpers materialize whole files but have **no callers** today and are
-therefore outside the runtime scope: `SeafHTTPHandler.getFileFromBlocks`, which
-loads every block into one buffer, and the unused
-`GetPresignedDownloadURL` / `GetPresignedUploadURL` pair in `internal/storage`,
-which would hand a client a direct object-storage URL. Neither is a current
-bypass. Both are traps: wiring either one during D4 would produce a byte
-producer that never passes admission. D4 must delete them or mark them
-deprecated with an explicit reference to this contract.
+Two unused helpers would become bypasses if wired: `getFileFromBlocks`, which
+loads every block of a file into one buffer, and `GetPresignedDownloadURL` in
+`internal/storage`, which would hand a client a direct object-storage URL that
+never reaches the application at all. Neither has callers, so neither is a
+current bypass, and D does not inherit their cleanup. The frozen rule is
+narrow:
+
+> D4 must not introduce a call to either helper, and must leave a call-site
+> regression or an explicit deprecation warning that says why.
+
+Deleting them may land as separate work. `GetPresignedUploadURL` is not a
+download producer and is out of D's scope entirely; if the presigned pair is
+ever revisited it belongs with `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01`,
+which already owns direct object access.
 
 Generated exports that do not read block/object storage are outside this D0
 scope. They require a separate inventory before being described as protected by
@@ -281,16 +287,20 @@ putting this producer in scope was for. The preparation deadline covers the
 storage read; the idle-write deadline covers the response write; both run under
 one admission.
 
-One global `preparation_deadline` serves every profile, which leaves a tension
-D1 must close with measurement rather than wording. A profile cap bounds how
-many requests of a kind run concurrently, not how long each may sit in
-preparation, so a deadline sized for a large ZIP's traversal and metadata work
-is inherited unchanged by a 1 MB inline text read. If D1's measurements show the
-two need materially different eviction speeds, the answer is per-profile
-deadline keys, not a compromise value; if one finite deadline demonstrably
-serves both, the single key stands and the evidence is recorded. What the
-contract does not allow is describing `link_inline` as short-work bounded while
-its only duration bound is a ZIP-sized deadline.
+A **single global `preparation_deadline` is frozen here**, and the configuration
+schema in §12 has no per-profile deadline keys. The residual tension is
+acknowledged rather than left implicit: a profile cap bounds how many requests
+of a kind run concurrently, not how long each may sit in preparation, so a
+deadline sized for a large ZIP's traversal is inherited unchanged by a 1 MB
+inline text read.
+
+The verification belongs to **D4 and D6, not D1**. D1 ships the coordinator
+without connecting it to any producer, so it has no ZIP traversal or inline read
+to time; a measurement requirement placed there could not be met. D4 wires the
+producers and D6 measures whether one finite deadline genuinely serves both ends
+of the range. If it does not, the contract and the configuration schema change
+before D closes — adding per-profile deadline keys is a contract amendment with
+evidence, not an implementation detail D1 may improvise.
 
 `zip` is held until `zipWriter.Close()` returns, because that close is what
 flushes the central directory: releasing earlier returns the slot while the
@@ -340,23 +350,47 @@ as a ZIP to extract a preview. Admission must therefore be taken before the
 first reader is opened and held until the extracted PDF/JPEG/PNG has been
 written, exactly as for the streaming branches.
 
-Concurrency alone does not bound this. `h.config.FileView.MaxIWorkPreviewBytes`
-(default 50 MB) is passed to the extractor and caps the **extracted preview**;
-the source file is already fully buffered by the time it is consulted, and
-nothing upstream gates the source size, even though `fileSize` has been read
-from `fs_objects` a few lines earlier. The node memory envelope is therefore:
+The source size **is** already gated. `ServeRawFile` rejects with `413` when
+`fileSize > getMaxFileSizeForPreview(ext)`, and that check runs before the block
+store is resolved and before the buffering loop. The problem is the value, not
+its absence: an iWork file is neither video nor text, so it falls through to the
+general `FileView.MaxPreviewBytes`, which is **1 GiB** in every shipped config —
+a limit chosen for ordinary inline previews, not for a path that materialises
+the whole file. `MaxIWorkPreviewBytes` (50 MB) caps only the *extracted*
+preview, twenty times lower, and is consulted after the source is already in
+memory.
+
+So `raw` is bounded, but at a value that makes a small `max_active_raw` the only
+thing standing between the node and multiple gigabytes of buffered previews. The
+per-request peak is more than the source file:
 
 ```text
-max_active_raw × (largest iWork file in any served library)
+peak_iwork_request ≈ source buffer capacity        (may exceed fileSize;
+                                                    bytes.Buffer grows in steps)
+                   + current encrypted block
+                   + current decrypted block
+                   + extracted preview             (≤ MaxIWorkPreviewBytes)
+                   + ZIP parsing and runtime overhead
 ```
 
-with the second factor currently unbounded. A profile cap bounds how many such
-requests run, not how large each one is, so D cannot claim a memory bound for
-`raw` on `max_active_raw` alone. D4 must add a source-size gate for this branch
-— rejecting before the buffering loop when the recorded `fileSize` exceeds a
-configured maximum — and D6 must measure the resulting per-request peak. Until
-that gate exists, the relationship between `max_active_raw` and a worst-case
-`raw` request is not expressible.
+and the node budget is `max_active_iwork × measured_peak_iwork_request`. D6 must
+measure that peak rather than deriving it from `fileSize`, and the shipped
+`max_active_raw` and `MaxPreviewBytes` defaults must together satisfy a stated
+memory budget. If 1 GiB stays, an iWork-specific source cap — a
+`max_iwork_source_bytes` well below the general preview limit — is the cheaper
+lever than shrinking `max_active_raw` for every raw stream.
+
+That last point is a genuine profile question D4 must answer rather than
+inherit: `raw` currently mixes O(one block) streams with a fully buffered
+producer, so one `max_active_raw` sized for iWork would throttle ordinary raw
+streaming far below what it needs. D4 may keep the shared cap if measurement
+shows it works, or split the buffered branch into its own fixed profile
+(`iwork_preview`) or internal sub-cap. The contract does not mandate the split;
+it forbids assuming the shared cap is adequate without evidence.
+
+D4 must also prove the existing `413` gate still precedes admission and
+buffering after the handler is restructured — an ordering regression that moved
+it after the buffering loop would remove the only source bound there is.
 
 All profiles consume the shared node ceiling. Profile caps must not create
 independent escape hatches that allow the aggregate node limit to be exceeded.
