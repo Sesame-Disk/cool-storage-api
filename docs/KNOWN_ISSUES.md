@@ -5046,11 +5046,11 @@ narrows the window without closing it.
 
 ---
 
-### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces
+### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces and equivalent storage-backed read surfaces
 
 **Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B and C are closed**; **D remains open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; no D runtime behavior has landed. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
-**Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
+**Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`, `GET /seafhttp/zip/:token`, `GET /repo/:repo_id/raw/*filepath`, `GET /repo/:repo_id/history/download`, `GET /repo/:repo_id/history/raw`, share-link raw under `/d/:token`, and the share-file bootstrap inline-content read. D's authoritative producer inventory is the D0 contract, not this list
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
 
 #### Problem
@@ -5662,13 +5662,23 @@ must drain to zero after sustained churn. A refusal is `503` with `Retry-After`
 on every profile, not only the desktop block route.
 
 The D0 contract also freezes the configuration keys and metric series so D1 does
-not improvise them: validated caps and the three deadlines in their own
-top-level section, present in every `configs/*.yaml`, both `.env` examples and
-`applyEnvOverrides()`; and `download_admission_*` series whose occupancy
-invariant is `active_current == sum(active_by_profile)`. It is deliberately not
-a sum over identity dimensions — a public transfer occupies `link_source` and
-`client_link` at once, so that sum double-counts every public byte. No label
-carries a bearer, IP, user, org, repo or source identity.
+not improvise them. Configuration is a `download_admission` section with an
+`enabled` flag, flat per-profile caps rather than a map so environment overrides
+are possible, and a per-key zero policy: zero is a legitimate "no queue" for the
+wait and waiter keys, but the node ceiling, the three identity caps, the
+preparation and idle-write deadlines and `retry_after` must be positive when
+enabled, or startup fails. `retry_after` is its own key rather than derived from
+the wait as B and C derive it, because a download slot does not free on the
+timescale of the queue.
+
+The `download_admission_*` series carry the occupancy invariant
+`active_current == sum(active_by_profile)`, deliberately not a sum over identity
+dimensions — a public transfer occupies `link_source` and `client_link` at once,
+so that sum double-counts every public byte. Waiters need the same treatment:
+an unlabelled gauge counts parked requests, a second one shows which gate they
+are blocked on. The invariant is over coordinator state and stable snapshots,
+not over every concurrent scrape. No label carries a bearer, IP, user, org, repo
+or source identity, and every label value set is enumerated in the contract.
 
 The current block gzip exclusion already covers both block methods through
 `/seafhttp/repo/.*/block/.*`. The stale `/api/v2.1/...raw` and

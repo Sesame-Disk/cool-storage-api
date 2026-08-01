@@ -245,6 +245,25 @@ The profiles are separate for measurement and fairness:
 - `zip`: generated ZIP streams, with a separately measured route cap.
 - `link_inline`: short public inline-content reads, with a short-work bound.
 
+Two profiles have an admission lifetime that is easy to get wrong, so it is
+stated rather than left to criterion 6.
+
+`link_inline` is acquired in the outer bootstrap handler and held until the JSON
+response carrying the inline content has been written or has failed. It is
+**not** acquired and released inside `readFileContentAsText`. Releasing when the
+storage read returns would free the slot while the content is still buffered in
+memory, still unserialised and still unwritten — so unbounded inline responses
+could accumulate after admission was given back, which is the opposite of what
+putting this producer in scope was for. The preparation deadline covers the
+storage read; the idle-write deadline covers the response write; both run under
+one admission.
+
+`zip` is held until `zipWriter.Close()` returns. The ZIP handler builds its
+writer with `defer zipWriter.Close()`, so a release registered as a later
+`defer` would unwind **before** the close that flushes the central directory —
+a slot returned while the response is still being written. Acquiring before
+`zip.NewWriter` makes the LIFO order correct by construction.
+
 All profiles consume the shared node ceiling. Profile caps must not create
 independent escape hatches that allow the aggregate node limit to be exceeded.
 Initial capacities and wait policies are measurement outputs, not copied values
@@ -386,9 +405,11 @@ non-zero `write_timeout` without risking extending it. A non-zero global
 `server.write_timeout` is therefore unsupported while D is enabled, unless a
 future implementation derives the absolute deadline from configuration plus
 request start and always applies `min(absoluteDeadline, now + idleTimeout)` —
-computable, but deliberately outside this contract. D3 must add configuration
-validation or a regression guard so that setting a non-zero `write_timeout`
-cannot silently truncate long transfers.
+computable, but deliberately outside this contract. Since D declares a non-zero
+value unsupported, D3 makes startup **fail** when `download_admission.enabled`
+is true and `server.write_timeout != 0`. A warning or a regression test does not
+prevent an invalid production configuration from running; a refusal to start
+does.
 
 If the D writer cannot install the required deadline before headers, the contract
 is fail closed rather than a metric-only degradation.
@@ -448,31 +469,80 @@ the shape is decided here rather than improvised in the implementation PR.
 
 **Configuration.** The coordinator spans `internal/api`, `internal/api/v2` and
 the share-link handlers, so its keys belong in their own top-level section
-rather than under `seafhttp`, which is route-scoped:
+rather than under `seafhttp`, which is route-scoped. The section is
+`download_admission`, the environment prefix is `DOWNLOAD_ADMISSION_`, and the
+shape is frozen here so `applyEnvOverrides()` has something to implement:
 
-| Key | Bounds |
-|---|---|
-| `max_active_per_node` | The shared node ceiling, across every profile |
-| `max_active_per_auth_user` | Per `(orgID, userID)` |
-| `max_active_per_link_source` | Per stable `SourceID`, aggregated across client IPs |
-| `max_active_per_client_link` | Per `(normalizedClientIP, SourceID)` |
-| `max_active_per_profile` | Optional per-profile cap, one value per profile |
-| `max_waiters_per_identity` | Parked requests per identity dimension |
-| `max_waiters_per_node` | Parked requests process-wide |
-| `admission_wait` | Deadline 1 — time allowed to obtain every dimension |
-| `preparation_deadline` | Deadline 2 — post-admission metadata, reader construction and inline reads |
-| `idle_write_timeout` | Deadline 3 — maximum interval without write progress |
+```yaml
+download_admission:
+  enabled: true
+  max_active_per_node: 0
+  max_active_per_auth_user: 0
+  max_active_per_link_source: 0
+  max_active_per_client_link: 0
+  max_waiters_per_identity: 0
+  max_waiters_per_node: 0
+  admission_wait: 0s
+  preparation_deadline: 0s
+  idle_write_timeout: 0s
+  retry_after: 0s
+  # Per-profile caps are flat, explicit keys — not a YAML map.
+  max_active_block: 0
+  max_active_file: 0
+  max_active_raw: 0
+  max_active_history: 0
+  max_active_link_raw: 0
+  max_active_zip: 0
+  max_active_link_inline: 0
+```
 
-Validation is real validation, in the shape B and C already use, not a comment:
+Values above are placeholders; D1 measures the real ones. The per-profile caps
+are **flat keys rather than a map** on purpose: the profile set is a fixed,
+closed enum, and a map cannot be overridden per entry by an environment variable
+without inventing JSON-in-env. Each maps to
+`DOWNLOAD_ADMISSION_MAX_ACTIVE_ZIP` and so on, one variable per key.
+
+Zero does not mean the same thing everywhere, and a uniform "0 disables it"
+rule would let a configuration claim D while disabling the ceiling D exists to
+enforce. When `enabled: true`, these must be greater than zero and startup fails
+otherwise:
+
+```text
+max_active_per_node
+max_active_per_auth_user
+max_active_per_link_source
+max_active_per_client_link
+preparation_deadline
+idle_write_timeout
+retry_after
+```
+
+These may legitimately be zero:
+
+```text
+admission_wait      -> refuse immediately instead of queueing
+max_waiters_*       -> no queue at all
+max_active_<profile> -> no additional cap for that profile
+```
+
+Remaining validation, in the shape B and C already use, enforced rather than
+commented:
 
 - no identity cap and no profile cap may exceed `max_active_per_node`, so a
   profile cannot become an escape hatch around the aggregate bound;
 - `max_active_per_client_link` may not exceed `max_active_per_link_source`;
 - a validated ceiling exists for every cap and every deadline;
-- `0` means disabled and must be stated per key, since disabling the node cap
-  and disabling a per-identity cap have very different consequences;
-- the coordinator is process-local, and every default must be documented as
-  such: fleet capacity scales with node count.
+- the coordinator is process-local, and every default is documented as such:
+  fleet capacity scales with node count.
+
+`retry_after` is a key of its own rather than being derived from
+`admission_wait` the way B and C derive it. Their derivation works because a
+refused `PutBlock` slot frees on the timescale of the wait; a download slot does
+not. With a short or disabled queue — which §6 expects for long streams —
+`ceil(admission_wait)` would tell every refused client to come back in one
+second while transfers hold capacity for minutes, turning the refusal into a
+retry storm. The floor is one second, since `Retry-After` has second
+granularity and zero means "retry now".
 
 Every `configs/*.yaml`, `.env.example`, `.env.prod.example` and
 `applyEnvOverrides()` must carry the new keys. A key that exists in the struct
@@ -485,9 +555,10 @@ but in only some config files is a defect B and C both had to fix.
 |---|---|---|
 | `download_admission_active_current` | Gauge | none — the node total |
 | `download_admission_active_by_profile` | Gauge | `profile`, fixed exclusive enum |
-| `download_admission_entries_current` | Gauge | none |
-| `download_admission_waiters_current` | Gauge | `dimension` |
-| `download_admission_tracked_identities` | Gauge | `dimension` |
+| `download_admission_entries_current` | Gauge | none — requests holding a global entry ticket, admitted plus parked |
+| `download_admission_waiters_current` | Gauge | none — **unique** requests currently parked |
+| `download_admission_waiters_by_dimension` | Gauge | `dimension` — which gates those requests are blocked on |
+| `download_admission_tracked_identities` | Gauge | `dimension` — identity gates currently materialised |
 | `download_admission_rejected_total` | Counter | `reason`, fixed set |
 | `download_admission_released_total` | Counter | `cause`, fixed set |
 | `download_admission_deadline_expired_total` | Counter | `phase` = `preparation` or `idle_write` |
@@ -495,9 +566,37 @@ but in only some config files is a defect B and C both had to fix.
 | `download_admission_wait_seconds` | Histogram | `outcome` |
 | `download_admission_occupancy` | Histogram | `dimension` |
 
-`dimension` is the fixed set `auth_user`, `link_source`, `client_link`. `cause`
-covers at least completion, client disconnect, timeout, error and panic, so a
-slot that disappears without a stream completing is visible.
+Waiters need two series for the same reason active does. A parked public request
+blocks on `link_source` and `client_link` at once, so a per-dimension gauge
+cannot answer "how many requests are queued" — which is precisely what
+`max_waiters_per_node` bounds. `waiters_current` is that unlabelled count;
+`waiters_by_dimension` shows which gate they are stuck behind. Summing the
+latter against the former is the same double-count error as summing identity
+dimensions against the node total.
+
+"Fixed set" means enumerated here, not decided in D1, because these values end
+up in dashboards and alert rules:
+
+```text
+dimension: auth_user | link_source | client_link
+profile:   block | file | raw | history | link_raw | zip | link_inline
+phase:     preparation | idle_write
+outcome:   admitted | refused | timeout | cancelled
+
+reason:    node_full | identity_full | profile_full
+           | node_queue_full | identity_queue_full | entry_queue_full
+           | admission_timeout | client_gone
+
+cause:     completed | client_disconnect | preparation_timeout
+           | idle_write_timeout | storage_error | response_error | panic
+```
+
+`reason` keeps B/C's distinction between a full queue and a full entry ring:
+both mean "no room", but one is a saturated node that wants capacity and the
+other is the global envelope filling before any identity state can be created,
+and an operator needs to tell them apart. `cause` must account for every way a
+slot disappears, so a release that is not `completed` is visible rather than
+looking like ordinary traffic.
 
 The occupancy invariant is:
 
@@ -510,6 +609,16 @@ occupies `link_source` and `client_link` simultaneously, so summing those
 against the node gauge double-counts every public byte and would make a healthy
 node look over-subscribed. That is the whole reason `active_by_profile` exists
 as a separate, mutually exclusive series.
+
+The invariant holds over internal coordinator state and over stable test
+snapshots. It is **not** promised for every concurrent Prometheus scrape:
+independent gauges are gathered one at a time, so an admission or release
+between two reads can make a single scrape disagree by a small amount even when
+the coordinator updates both under one lock. D1 either documents that and no
+alert rule is written on strict equality, or it registers a custom collector
+that captures the node total and the per-profile values in one snapshot. Either
+is acceptable; leaving it unstated is not, because the obvious alert rule would
+then fire on healthy nodes.
 
 No label value may carry a bearer token, client IP, user, organization,
 repository or source identity. `tracked_identities` is how identity growth is
@@ -542,7 +651,7 @@ and the relevant integration/fault drill:
 | 3 | One node ceiling | Files, raw, history, share raw, ZIP, inline text and block GET share one aggregate node bound |
 | 4 | Fair identities | Authenticated user, link source and client-link limits are isolated; public link traffic cannot consume owner-user capacity |
 | 5 | Bounded state | Active entries, waiters, identity maps, timers and goroutines remain bounded and drain to zero after sustained churn |
-| 6 | Correct placement | Rejection happens before expensive metadata/S3 work; admission remains held through the protected response lifetime |
+| 6 | Correct placement | Rejection happens before expensive metadata/S3 work; admission is held through the protected response lifetime, explicitly including until `zipWriter.Close()` returns and until the inline-content JSON response is written |
 | 7 | Recoverable lifetime | Context cancellation, idle-write timeout, writer reachability, storage cancellation and idempotent release are proven |
 | 8 | Correct HTTP behavior | 503/Retry-After contract, Range behavior, post-header failure, 304/416/redirect handling and byte integrity are preserved |
 | 9 | Block GET safety | Block GET streams through the canonical reader with authoritative size and no full-block materialization |
