@@ -312,9 +312,9 @@ seafhttp:
   # which the sync client does not retry. Same value as the block route, which is
   # the one validated against the real client.
   check_blocks_admission_wait: 10s
-  # Processing deadline for the body read and every metadata lookup. This is what
-  # makes an admission recoverable and what stops the Cassandra work when a
-  # client disconnects.
+  # Processing deadline for the body read and every metadata lookup. This makes
+  # an admission recoverable; cancellation stops new dispatch while already-issued
+  # Cassandra work remains bounded by the driver's finite timeout.
   check_blocks_admitted_lifetime: 5m
   # Accepted ids per request. 100000 is the inherited compatibility bound, not a
   # measured one, and it is also the validation ceiling: lower it from

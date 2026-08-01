@@ -159,16 +159,24 @@ func newCanonicalBlockReader(
 
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(fanout)
+	slots := make(chan struct{}, fanout)
+dispatchLocations:
 	for _, id := range uniqueBlockIDs {
 		if err := gctx.Err(); err != nil {
-			if waitErr := g.Wait(); waitErr != nil {
-				return nil, waitErr
-			}
-			return nil, err
+			break
+		}
+		select {
+		case slots <- struct{}{}:
+		case <-gctx.Done():
+			break dispatchLocations
+		}
+		if err := gctx.Err(); err != nil {
+			<-slots
+			break
 		}
 		blockID := id
 		g.Go(func() error {
+			defer func() { <-slots }()
 			metadata, found, err := lookupCanonicalBlockLocation(gctx, database, orgID, blockID, strictRead)
 			if err != nil {
 				return fmt.Errorf("read canonical location for block %s: %w", blockID, err)
@@ -307,13 +315,24 @@ func (r *canonicalBlockReader) CheckBlocksExist(ctx context.Context, blockIDs []
 
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(concurrency)
+	slots := make(chan struct{}, concurrency)
+dispatchExistence:
 	for _, id := range unique {
 		if err := gctx.Err(); err != nil {
 			break
 		}
+		select {
+		case slots <- struct{}{}:
+		case <-gctx.Done():
+			break dispatchExistence
+		}
+		if err := gctx.Err(); err != nil {
+			<-slots
+			break
+		}
 		blockID := id
 		g.Go(func() error {
+			defer func() { <-slots }()
 			location, ok := r.locations[blockID]
 			if !ok {
 				return fmt.Errorf("block %q was not pre-resolved", blockID)

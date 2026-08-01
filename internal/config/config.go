@@ -620,7 +620,8 @@ type SeafHTTPConfig struct {
 	// bound, not a measured one: a large initial sync posts the block list of one
 	// commit, the desktop client does not re-batch after a 413, and no capture of
 	// real traffic exists yet to justify a lower number.
-	// `sync_check_blocks_ids_per_request` is the instrument that will justify one.
+	// `sync_check_blocks_ids_per_request` is the instrument that will justify one;
+	// it measures parsed lists, including malformed traffic that reached the parser.
 	//
 	// The validation ceiling is that same 100k, so this knob can only be lowered.
 	// Raising it would re-open the amplification the cap exists to bound.

@@ -372,6 +372,208 @@ func TestCanonicalBlockReaderBoundsUniqueLocationLookups(t *testing.T) {
 	}
 }
 
+func TestCanonicalBlockCheckReaderBoundsConfiguredFanoutAcrossPhases(t *testing.T) {
+	resetCanonicalReaderHooks(t)
+	const (
+		fanout     = 3
+		blockCount = 32
+	)
+	blockIDs := make([]string, blockCount)
+	for i := range blockIDs {
+		blockIDs[i] = canonicalReaderTestID(i + 1000)
+	}
+	store := canonicalReaderTestStore(t)
+
+	locationRelease := make(chan struct{})
+	locationReached := make(chan struct{})
+	var locationActive, locationPeak atomic.Int32
+	var locationOnce sync.Once
+	canonicalBlockLocationLookup = func(_ context.Context, _ *db.DB, _ string, blockID string) (db.BlockStorageLocation, bool, error) {
+		current := locationActive.Add(1)
+		for {
+			old := locationPeak.Load()
+			if current <= old || locationPeak.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		if current == fanout {
+			locationOnce.Do(func() { close(locationReached) })
+		}
+		<-locationRelease
+		locationActive.Add(-1)
+		return db.BlockStorageLocation{StorageClass: "fallback", CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+	}
+
+	readerDone := make(chan error, 1)
+	go func() {
+		_, err := NewCanonicalBlockCheckReaderWithFanout(context.Background(), nil, nil, canonicalReaderTestOrg, blockIDs, store, "fallback", fanout)
+		readerDone <- err
+	}()
+	select {
+	case <-locationReached:
+	case <-time.After(time.Second):
+		close(locationRelease)
+		t.Fatal("canonical location lookups did not reach configured fan-out")
+	}
+	select {
+	case <-time.After(100 * time.Millisecond):
+	case <-readerDone:
+		t.Fatal("canonical location phase completed before its blocked fan-out was released")
+	}
+	if got := locationPeak.Load(); got > fanout {
+		close(locationRelease)
+		<-readerDone
+		t.Fatalf("canonical location peak = %d, above configured fan-out %d", got, fanout)
+	}
+	close(locationRelease)
+	if err := <-readerDone; err != nil {
+		t.Fatalf("canonical location phase error = %v", err)
+	}
+
+	existenceRelease := make(chan struct{})
+	existenceReached := make(chan struct{})
+	var existenceActive, existencePeak atomic.Int32
+	var existenceOnce sync.Once
+	canonicalBlockExists = func(_ context.Context, _ *storage.BlockStore, _ string) (bool, error) {
+		current := existenceActive.Add(1)
+		for {
+			old := existencePeak.Load()
+			if current <= old || existencePeak.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		if current == fanout {
+			existenceOnce.Do(func() { close(existenceReached) })
+		}
+		<-existenceRelease
+		existenceActive.Add(-1)
+		return true, nil
+	}
+
+	reader, err := NewCanonicalBlockCheckReaderWithFanout(context.Background(), nil, nil, canonicalReaderTestOrg, blockIDs, store, "fallback", fanout)
+	if err != nil {
+		t.Fatalf("second canonical reader construction error = %v", err)
+	}
+	existenceDone := make(chan error, 1)
+	go func() {
+		_, err := reader.CheckBlocksExist(context.Background(), blockIDs, fanout)
+		existenceDone <- err
+	}()
+	select {
+	case <-existenceReached:
+	case <-time.After(time.Second):
+		close(existenceRelease)
+		t.Fatal("canonical existence checks did not reach configured fan-out")
+	}
+	select {
+	case <-time.After(100 * time.Millisecond):
+	case <-existenceDone:
+		t.Fatal("canonical existence phase completed before its blocked fan-out was released")
+	}
+	if got := existencePeak.Load(); got > fanout {
+		close(existenceRelease)
+		<-existenceDone
+		t.Fatalf("canonical existence peak = %d, above configured fan-out %d", got, fanout)
+	}
+	close(existenceRelease)
+	if err := <-existenceDone; err != nil {
+		t.Fatalf("canonical existence phase error = %v", err)
+	}
+}
+
+func TestCanonicalBlockCheckReaderCancellationStopsBothPhases(t *testing.T) {
+	resetCanonicalReaderHooks(t)
+	const fanout = 3
+	blockIDs := make([]string, 32)
+	for i := range blockIDs {
+		blockIDs[i] = canonicalReaderTestID(i + 2000)
+	}
+	store := canonicalReaderTestStore(t)
+
+	t.Run("location", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		started := make(chan struct{})
+		var calls atomic.Int32
+		var once sync.Once
+		canonicalBlockLocationLookup = func(ctx context.Context, _ *db.DB, _ string, _ string) (db.BlockStorageLocation, bool, error) {
+			if calls.Add(1) == fanout {
+				once.Do(func() { close(started) })
+			}
+			<-ctx.Done()
+			return db.BlockStorageLocation{}, false, ctx.Err()
+		}
+		result := make(chan error, 1)
+		go func() {
+			_, err := NewCanonicalBlockCheckReaderWithFanout(ctx, nil, nil, canonicalReaderTestOrg, blockIDs, store, "fallback", fanout)
+			result <- err
+		}()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("canonical location phase did not reach configured fan-out")
+		}
+		cancel()
+		select {
+		case err := <-result:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("location cancellation error = %v, want context.Canceled", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("canonical location phase did not stop after cancellation")
+		}
+		if got := calls.Load(); got > fanout {
+			t.Fatalf("canonical location calls = %d after cancellation, above fan-out %d", got, fanout)
+		}
+	})
+
+	t.Run("existence", func(t *testing.T) {
+		var locationCalls atomic.Int32
+		canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
+			locationCalls.Add(1)
+			return db.BlockStorageLocation{StorageClass: "fallback", CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+		}
+		reader, err := NewCanonicalBlockCheckReaderWithFanout(context.Background(), nil, nil, canonicalReaderTestOrg, blockIDs, store, "fallback", fanout)
+		if err != nil {
+			t.Fatalf("canonical reader construction error = %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		started := make(chan struct{})
+		var calls atomic.Int32
+		var once sync.Once
+		canonicalBlockExists = func(ctx context.Context, _ *storage.BlockStore, _ string) (bool, error) {
+			if calls.Add(1) == fanout {
+				once.Do(func() { close(started) })
+			}
+			<-ctx.Done()
+			return false, ctx.Err()
+		}
+		result := make(chan error, 1)
+		go func() {
+			_, err := reader.CheckBlocksExist(ctx, blockIDs, fanout)
+			result <- err
+		}()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("canonical existence phase did not reach configured fan-out")
+		}
+		cancel()
+		select {
+		case err := <-result:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("existence cancellation error = %v, want context.Canceled", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("canonical existence phase did not stop after cancellation")
+		}
+		if got := calls.Load(); got > fanout {
+			t.Fatalf("canonical existence calls = %d after cancellation, above fan-out %d", got, fanout)
+		}
+	})
+}
+
 func TestCanonicalBlockReaderRejectsInvalidIDAndMismatchedKey(t *testing.T) {
 	resetCanonicalReaderHooks(t)
 	if reader, err := NewCanonicalBlockReader(context.Background(), nil, nil, canonicalReaderTestOrg, []string{strings.Repeat("z", 64)}, canonicalReaderTestStore(t), "fallback"); reader != nil || err == nil {

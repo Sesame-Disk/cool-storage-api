@@ -2016,13 +2016,24 @@ func (h *SyncHandler) resolveCheckBlockMappings(ctx context.Context, orgID, repr
 
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(fanout)
+	slots := make(chan struct{}, fanout)
+dispatchMappings:
 	for _, id := range externalIDs {
 		if err := gctx.Err(); err != nil {
 			break
 		}
+		select {
+		case slots <- struct{}{}:
+		case <-gctx.Done():
+			break dispatchMappings
+		}
+		if err := gctx.Err(); err != nil {
+			<-slots
+			break
+		}
 		externalID := id
 		g.Go(func() error {
+			defer func() { <-slots }()
 			if err := gctx.Err(); err != nil {
 				return err
 			}

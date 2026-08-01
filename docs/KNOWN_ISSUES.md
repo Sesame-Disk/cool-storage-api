@@ -5060,7 +5060,7 @@ not identical in scope — B4 covers the full seafhttp abuse surface; X10 focuse
 on authenticated block PUT concurrency / aggregate memory after PR-10's
 per-request body cap.
 
-Current guard state (2026-07-29; the other rows retain the 2026-07-25 verification):
+Current guard state (2026-08-01; the other rows retain their original verification dates):
 
 | Surface | Limiter |
 |---|---|
@@ -5093,7 +5093,7 @@ own fix + regression.
 | **A1** | Anonymous upload **post-token attempt rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-29** | — | Initial guard landed 2026-07-28; stable remint identity and the final fail-closed contract completed A1 on 2026-07-29. Per-(IP, stable link identity) and per-link limiters run after valid token resolution; see "Subcontract A" below |
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
 | **B** | Authenticated block **PUT** concurrency (= registry **X10**) | ✅ **Closed 2026-07-30** | — | A pre-gate global ticket plus per-user/node admissions bound active, transitioning and parked requests before body reads; real-TCP deadlines cover stalled bodies; complete-lifetime memory trials support 24 slots at an 80 MiB design cost; real `seaf-cli` recovered from the shipped 10s wait and `Retry-After: 10` |
-| **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | ✅ **Closed 2026-07-31** | — | Own admission instance (separate capacity from B) before the body read, deduplicated lookups, a configured fan-out bounding both metadata phases, a ctx-aware mapping read that a disconnect actually stops, and an admitted lifetime that now reaches the socket — the route was still inside gzip. Id cap is configurable and capped at its inherited 100k; see "Subcontract C" below |
+| **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | ✅ **Closed 2026-07-31** | — | Own admission instance (separate capacity from B) before the body read, deduplicated lookups, configured fan-out and cancellation coverage for both canonical metadata phases, and an admitted lifetime that now reaches the socket. Cancellation stops new dispatch; already-issued Cassandra queries remain bounded by the driver's finite timeout. Id cap is configurable and capped at its inherited 100k; see "Subcontract C" below |
 | **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
 
 #### Subcontract A: stable-link request and concurrency admission (A1/A2 closed 2026-07-29)
@@ -5559,9 +5559,12 @@ the sync.
 **Real-client cardinality evidence.** The drill first synchronizes a clean
 worktree without holders, snapshots the histogram, and then reports only the
 before/after delta. The later 20k-id holders cannot contaminate that result. This
-is still a small-library sample and is **not** grounds to lower the 100k cap by
-itself; the compatibility ceiling remains until the opt-in large-cardinality
-probe below is considered alongside production traffic.
+is still a small-library sample. The histogram is observed after parsing and
+before ID classification, so it includes malformed traffic that reached the
+parser; it is not by itself a distribution of legitimate client requests and is
+**not** grounds to lower the 100k cap. The compatibility ceiling remains until
+the opt-in large-cardinality probe below is considered alongside production
+traffic.
 
 For the lifetime boundary, run the real Cassandra probe in Docker:
 

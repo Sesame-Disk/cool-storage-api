@@ -171,7 +171,10 @@ cleanup() {
     tail -80 "${SYNC_CONFIG_DIR}/logs/seafile.log" 2>/dev/null || true
   fi
   delete_library "${CURRENT_REPO_ID}"
-  delete_organization "${CURRENT_ORG_ID}"
+  if ! delete_organization "${CURRENT_ORG_ID}"; then
+    log "cleanup: could not delete organization ${CURRENT_ORG_ID}"
+    [ "${status}" -ne 0 ] || status=1
+  fi
   rm -rf "${CURRENT_SYNC_DIR}" "${SYNC_CONFIG_DIR}" "${SYNC_DATA_DIR}/seafile-data" >/dev/null 2>&1
   exit "${status}"
 }

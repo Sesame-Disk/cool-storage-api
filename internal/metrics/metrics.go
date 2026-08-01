@@ -714,13 +714,13 @@ var (
 	// posts. Lowering that cap without this histogram would be trading a known
 	// amplification for an unknown risk of 413-ing a legitimate initial sync.
 	//
-	// Observed after the parse and before classification or lookup, so it describes
+	// Observed after parsing and before ID classification or lookup, so it describes
 	// parsed request lists, including malformed traffic that reached the parser.
 	// Buckets cover the full configurable range through the 100k ceiling.
 	SyncCheckBlocksIDsPerRequest = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "sync_check_blocks_ids_per_request",
-			Help:    "Block ids carried by a parsed check-blocks request.",
+			Help:    "Block ids carried by a parsed check-blocks request, including malformed lists that reached parsing.",
 			Buckets: []float64{1, 4, 16, 64, 256, 1024, 4096, 16384, 32768, 65536, 100000},
 		},
 	)

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -240,6 +241,57 @@ func stubCheckBlocksCanonicalReader(t *testing.T, exists map[string]bool) {
 	t.Cleanup(func() { syncNewCanonicalBlockCheckReaderFn = old })
 	syncNewCanonicalBlockCheckReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string, int) (streaming.CanonicalBlockReader, error) {
 		return &syncCanonicalReaderStub{exists: exists}, nil
+	}
+}
+
+type checkBlocksFanoutReader struct {
+	syncCanonicalReaderStub
+	exists func(context.Context, []string, int) (map[string]bool, error)
+}
+
+func (r *checkBlocksFanoutReader) CheckBlocksExist(ctx context.Context, blockIDs []string, concurrency int) (map[string]bool, error) {
+	return r.exists(ctx, blockIDs, concurrency)
+}
+
+// TestCheckBlocksPassesConfiguredFanoutToBothCanonicalPhases pins the handler
+// wiring: the same configured limit must reach canonical location resolution
+// and the subsequent physical-existence phase.
+func TestCheckBlocksPassesConfiguredFanoutToBothCanonicalPhases(t *testing.T) {
+	const fanout = 3
+	presentID := strings.Repeat("b", 64)
+	missingID := strings.Repeat("c", 64)
+	var locationFanout atomic.Int64
+	var existenceFanout atomic.Int64
+
+	old := syncNewCanonicalBlockCheckReaderFn
+	t.Cleanup(func() { syncNewCanonicalBlockCheckReaderFn = old })
+	syncNewCanonicalBlockCheckReaderFn = func(_ context.Context, _ *db.DB, _ *storage.Manager, _ string, blockIDs []string, _ *storage.BlockStore, _ string, configured int) (streaming.CanonicalBlockReader, error) {
+		locationFanout.Store(int64(configured))
+		if len(blockIDs) != 2 || blockIDs[0] != presentID || blockIDs[1] != missingID {
+			t.Fatalf("canonical check ids = %v", blockIDs)
+		}
+		return &checkBlocksFanoutReader{exists: func(_ context.Context, _ []string, concurrency int) (map[string]bool, error) {
+			existenceFanout.Store(int64(concurrency))
+			return map[string]bool{presentID: true, missingID: false}, nil
+		}}, nil
+	}
+
+	cfg := checkBlocksTestConfig(4, 8, 0)
+	cfg.SeafHTTP.CheckBlocksLookupFanout = fanout
+	h := newMappingTestHandler(t, cfg)
+	r := checkBlocksRouterFor(h, "org", "user")
+	body := fmt.Sprintf(`["%s","%s"]`, presentID, missingID)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo/check-blocks", strings.NewReader(body)))
+
+	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != fmt.Sprintf(`["%s"]`, missingID) {
+		t.Fatalf("response = %d %s, want missing block", w.Code, w.Body.String())
+	}
+	if got := locationFanout.Load(); got != fanout {
+		t.Fatalf("canonical location fanout = %d, want %d", got, fanout)
+	}
+	if got := existenceFanout.Load(); got != fanout {
+		t.Fatalf("canonical existence fanout = %d, want %d", got, fanout)
 	}
 }
 
