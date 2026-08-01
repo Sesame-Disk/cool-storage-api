@@ -574,6 +574,63 @@ func TestCanonicalBlockCheckReaderCancellationStopsBothPhases(t *testing.T) {
 	})
 }
 
+func TestCanonicalBlockReaderRejectsCancellationAfterLookupsFinish(t *testing.T) {
+	resetCanonicalReaderHooks(t)
+	const (
+		fanout     = 3
+		blockCount = 8
+	)
+	blockIDs := make([]string, blockCount)
+	for i := range blockIDs {
+		blockIDs[i] = canonicalReaderTestID(i + 3000)
+	}
+	store := canonicalReaderTestStore(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var calls atomic.Int32
+	var once sync.Once
+	canonicalBlockLocationLookup = func(_ context.Context, _ *db.DB, _ string, _ string) (db.BlockStorageLocation, bool, error) {
+		if calls.Add(1) == fanout {
+			once.Do(func() { close(started) })
+		}
+		// Deliberately ignore cancellation to isolate the constructor's final check.
+		<-release
+		return db.BlockStorageLocation{StorageClass: "fallback", CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+	}
+
+	type result struct {
+		reader CanonicalBlockReader
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		reader, err := NewCanonicalBlockCheckReaderWithFanout(ctx, nil, nil, canonicalReaderTestOrg, blockIDs, store, "fallback", fanout)
+		done <- result{reader: reader, err: err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("canonical location phase did not reach configured fan-out")
+	}
+
+	cancel()
+	close(release)
+	select {
+	case got := <-done:
+		if got.reader != nil {
+			t.Fatal("constructor returned a partial reader after cancellation")
+		}
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("constructor error = %v, want context.Canceled", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canonical location phase did not finish after releasing lookups")
+	}
+}
+
 func TestCanonicalBlockReaderRejectsInvalidIDAndMismatchedKey(t *testing.T) {
 	resetCanonicalReaderHooks(t)
 	if reader, err := NewCanonicalBlockReader(context.Background(), nil, nil, canonicalReaderTestOrg, []string{strings.Repeat("z", 64)}, canonicalReaderTestStore(t), "fallback"); reader != nil || err == nil {
