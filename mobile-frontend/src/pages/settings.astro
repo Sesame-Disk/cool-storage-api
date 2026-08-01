@@ -1,0 +1,8 @@
+---
+import AuthenticatedLayout from '../layouts/AuthenticatedLayout.astro';
+import SettingsPage from '../components/pages/SettingsPage';
+---
+
+<AuthenticatedLayout title="Settings" pageTitle="Settings">
+  <SettingsPage client:load />
+</AuthenticatedLayout>

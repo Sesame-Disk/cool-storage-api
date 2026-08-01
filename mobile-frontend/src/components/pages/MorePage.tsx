@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Sun, Moon, Monitor, Link2, ChevronRight, Activity, ArrowUpDown, LogOut, Info, HelpCircle } from 'lucide-react';
+import { Sun, Moon, Monitor, Link2, ChevronRight, Activity, ArrowUpDown, LogOut, Info, HelpCircle, SlidersHorizontal, Trash2, Building2, FolderSync } from 'lucide-react';
 import { useTheme } from '../../lib/hooks/useTheme';
 import type { ThemeOption } from '../../lib/hooks/useTheme';
 import { getAccountInfo, logout } from '../../lib/api';
@@ -23,6 +23,10 @@ export default function MorePage() {
   useEffect(() => {
     getAccountInfo().then(setAccount).catch(() => {});
   }, []);
+
+  // Show the Org Admin entry only for org admins (account info `is_org_staff`,
+  // which the backend returns as 0/1). Truthy for either 1 or true.
+  const isOrgAdmin = Boolean(account?.is_org_staff);
 
   const handleLogout = async () => {
     setLoggingOut(true);
@@ -58,6 +62,53 @@ export default function MorePage() {
           </div>
         </div>
       )}
+
+      {/* Features */}
+      <div>
+        <h2 className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-2">Features</h2>
+        <div className="bg-white dark:bg-dark-surface rounded-lg border border-gray-200 dark:border-dark-border overflow-hidden" data-testid="more-features">
+          <a
+            href="/settings/"
+            className="w-full flex items-center gap-3 px-4 py-3 min-h-[44px] text-text dark:text-dark-text border-b border-gray-200 dark:border-dark-border"
+            data-testid="more-link-settings"
+          >
+            <SlidersHorizontal size={20} />
+            <span className="flex-1">Settings</span>
+            <ChevronRight size={16} className="text-gray-400" />
+          </a>
+          <a
+            href="/deleted-libraries/"
+            className="w-full flex items-center gap-3 px-4 py-3 min-h-[44px] text-text dark:text-dark-text border-b border-gray-200 dark:border-dark-border"
+            data-testid="more-link-deleted-libraries"
+          >
+            <Trash2 size={20} />
+            <span className="flex-1">Deleted Libraries</span>
+            <ChevronRight size={16} className="text-gray-400" />
+          </a>
+          <a
+            href="/sync/"
+            className={`w-full flex items-center gap-3 px-4 py-3 min-h-[44px] text-text dark:text-dark-text ${
+              isOrgAdmin ? 'border-b border-gray-200 dark:border-dark-border' : ''
+            }`}
+            data-testid="more-link-sync"
+          >
+            <FolderSync size={20} />
+            <span className="flex-1">Folder Sync</span>
+            <ChevronRight size={16} className="text-gray-400" />
+          </a>
+          {isOrgAdmin && (
+            <a
+              href="/org/"
+              className="w-full flex items-center gap-3 px-4 py-3 min-h-[44px] text-text dark:text-dark-text"
+              data-testid="more-link-org-admin"
+            >
+              <Building2 size={20} />
+              <span className="flex-1">Org Admin</span>
+              <ChevronRight size={16} className="text-gray-400" />
+            </a>
+          )}
+        </div>
+      </div>
 
       {/* Navigation */}
       <div>

@@ -18,6 +18,14 @@ services:
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
       - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      # Local (username/password) auth — off by default; enable for local accounts.
+      - AUTH_LOCAL_ENABLED=${AUTH_LOCAL_ENABLED:-false}
+      - AUTH_LOCAL_MIN_PASSWORD_LENGTH=${AUTH_LOCAL_MIN_PASSWORD_LENGTH:-8}
+      - AUTH_LOCAL_MAX_FAILED_ATTEMPTS=${AUTH_LOCAL_MAX_FAILED_ATTEMPTS:-5}
+      - AUTH_LOCAL_LOCKOUT_DURATION=${AUTH_LOCAL_LOCKOUT_DURATION:-15m}
+      # First-run local admin (seeded only if the email maps to a seeded user).
+      - BOOTSTRAP_ADMIN_EMAIL=${BOOTSTRAP_ADMIN_EMAIL}
+      - BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD}
       - OIDC_ENABLED=${OIDC_ENABLED:-false}
       - OIDC_ISSUER=${OIDC_ISSUER}
       - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
@@ -55,6 +63,72 @@ services:
     # Config is baked into the image - no volume mount needed
     restart: unless-stopped
 
+  # Optional standalone local-authentication service. It is NOT started by a
+  # plain `docker compose up` — bring it up explicitly with:
+  #   docker compose --profile auth up -d sesameauth
+  # OIDC-only or dev-token-only deployments simply never start it.
+  sesameauth:
+    build:
+      context: .
+      dockerfile: Dockerfile.sesameauth
+    ports:
+      - "${SESAMEAUTH_HOST_PORT:-8091}:8080"
+    env_file:
+      - ${ENV_FILE:-.env}
+    environment:
+      - PORT=8080
+      - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}
+      - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
+      - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
+      # Local auth is the whole point of this container — enable it here.
+      - AUTH_LOCAL_ENABLED=${AUTH_LOCAL_ENABLED:-true}
+      - AUTH_LOCAL_MIN_PASSWORD_LENGTH=${AUTH_LOCAL_MIN_PASSWORD_LENGTH:-8}
+      - AUTH_LOCAL_MAX_FAILED_ATTEMPTS=${AUTH_LOCAL_MAX_FAILED_ATTEMPTS:-5}
+      - AUTH_LOCAL_LOCKOUT_DURATION=${AUTH_LOCAL_LOCKOUT_DURATION:-15m}
+      # Share the session signing key with the storage service so sessions this
+      # service mints are validated identically. Empty = random opaque tokens
+      # (still valid; validated via the shared sessions table).
+      - OIDC_JWT_SIGNING_KEY=${OIDC_JWT_SIGNING_KEY}
+      - OIDC_SESSION_TTL=${OIDC_SESSION_TTL:-24h}
+      - OIDC_API_TOKEN_TTL=${OIDC_API_TOKEN_TTL:-4320h}
+      # This service never renders documents; disable OnlyOffice so config
+      # validation doesn't require an OnlyOffice JWT secret.
+      - ONLYOFFICE_ENABLED=false
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      # Storage service owns schema migrations + seeding; wait for it so the
+      # user_credentials table and seeded users exist before we serve logins.
+      sesamefs:
+        condition: service_healthy
+    profiles:
+      - auth
+    restart: unless-stopped
+
+  # End-to-end tests for local auth, driving the real sesameauth + storage
+  # containers over the compose network. Run once with:
+  #   docker compose --profile auth-test run --rm localauth-e2e
+  localauth-e2e:
+    build:
+      context: .
+      dockerfile: tests/e2e-localauth/Dockerfile
+    environment:
+      - AUTH_URL=http://sesameauth:8080
+      - API_URL=http://sesamefs:8080
+      - FRONTEND_URL=http://frontend:80
+      - ADMIN_EMAIL=${BOOTSTRAP_ADMIN_EMAIL:-superadmin@sesamefs.local}
+      - ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD:-BootstrapAdmin123}
+      - TEST_ORG_ID=${TEST_ORG_ID:-00000000-0000-0000-0000-000000000000}
+      - AUTH_LOCAL_MAX_FAILED_ATTEMPTS=${AUTH_LOCAL_MAX_FAILED_ATTEMPTS:-5}
+    depends_on:
+      sesameauth:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    profiles:
+      - auth-test
+    restart: "no"
+
   sesamefs-node-2:
     build:
       context: .
@@ -72,6 +146,14 @@ services:
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
       - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      # Local (username/password) auth — off by default; enable for local accounts.
+      - AUTH_LOCAL_ENABLED=${AUTH_LOCAL_ENABLED:-false}
+      - AUTH_LOCAL_MIN_PASSWORD_LENGTH=${AUTH_LOCAL_MIN_PASSWORD_LENGTH:-8}
+      - AUTH_LOCAL_MAX_FAILED_ATTEMPTS=${AUTH_LOCAL_MAX_FAILED_ATTEMPTS:-5}
+      - AUTH_LOCAL_LOCKOUT_DURATION=${AUTH_LOCAL_LOCKOUT_DURATION:-15m}
+      # First-run local admin (seeded only if the email maps to a seeded user).
+      - BOOTSTRAP_ADMIN_EMAIL=${BOOTSTRAP_ADMIN_EMAIL}
+      - BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD}
       - OIDC_ENABLED=${OIDC_ENABLED:-false}
       - OIDC_ISSUER=${OIDC_ISSUER}
       - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
@@ -128,6 +210,14 @@ services:
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
       - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      # Local (username/password) auth — off by default; enable for local accounts.
+      - AUTH_LOCAL_ENABLED=${AUTH_LOCAL_ENABLED:-false}
+      - AUTH_LOCAL_MIN_PASSWORD_LENGTH=${AUTH_LOCAL_MIN_PASSWORD_LENGTH:-8}
+      - AUTH_LOCAL_MAX_FAILED_ATTEMPTS=${AUTH_LOCAL_MAX_FAILED_ATTEMPTS:-5}
+      - AUTH_LOCAL_LOCKOUT_DURATION=${AUTH_LOCAL_LOCKOUT_DURATION:-15m}
+      # First-run local admin (seeded only if the email maps to a seeded user).
+      - BOOTSTRAP_ADMIN_EMAIL=${BOOTSTRAP_ADMIN_EMAIL}
+      - BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD}
       - OIDC_ENABLED=${OIDC_ENABLED:-false}
       - OIDC_ISSUER=${OIDC_ISSUER}
       - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}

@@ -1058,11 +1058,21 @@ seafileAPI.sysAdminRestoreUser = function (email) {
 };
 
 // Admin: add new user
-seafileAPI.sysAdminAddUser = function (email, name, role) {
+seafileAPI.sysAdminAddUser = function (email, name, role, password) {
   let url = this.server + '/api/v2.1/admin/users/';
   let data = { email, name };
   if (role) data.role = role;
+  if (password) data.password = password;
   return this.req.post(url, data);
+};
+
+// Admin: set/reset a local user's password. Omit password to have the server
+// generate a one-time temporary password (returned in the response).
+seafileAPI.sysAdminSetUserPassword = function (email, password) {
+  let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/set-password/';
+  let data = {};
+  if (password) data.password = password;
+  return this.req.put(url, data);
 };
 
 // Admin: search users

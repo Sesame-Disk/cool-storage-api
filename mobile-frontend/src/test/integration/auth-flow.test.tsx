@@ -10,6 +10,8 @@ const mockClearAuthToken = vi.fn();
 
 vi.mock('../../lib/api', () => ({
   login: (...args: unknown[]) => mockLogin(...args),
+  localLogin: (...args: unknown[]) => mockLogin(...args),
+  getAuthMethods: vi.fn().mockResolvedValue({ local: false, oidc: true }),
   getAuthToken: vi.fn().mockReturnValue('mock-token'),
   setAuthToken: vi.fn(),
   clearAuthToken: (...args: unknown[]) => mockClearAuthToken(...args),
@@ -38,6 +40,12 @@ vi.mock('../../lib/config', () => ({
     username: 'dev@sesamefs.local',
   }),
   serviceURL: () => 'http://localhost:8080',
+  // Getter exports the <Logo> component (rendered inside LoginForm) reads.
+  siteRoot: () => '/',
+  mediaUrl: () => '/static/',
+  logoPath: () => 'img/logo.png',
+  logoHeight: () => 64,
+  siteTitle: () => 'Sesame Disk',
 }));
 
 describe('Auth Flow', () => {

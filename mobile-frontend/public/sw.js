@@ -1,4 +1,4 @@
-const CACHE_NAME = 'sesamefs-mobile-v2';
+const CACHE_NAME = 'sesamefs-mobile-v3';
 const API_CACHE_NAME = 'sesamefs-api-v1';
 const MAX_API_CACHE_ENTRIES = 100;
 
@@ -17,7 +17,16 @@ self.addEventListener('install', (event) => {
       return cache.addAll(APP_SHELL);
     })
   );
-  self.skipWaiting();
+  // NOTE: intentionally NOT calling skipWaiting() here. A new worker stays in
+  // "waiting" so the app can surface a "new version — reload" prompt and hand
+  // control to the user (see SKIP_WAITING message handler below).
+});
+
+// Allow the page to activate a waiting worker on demand (update-reload flow).
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
 });
 
 // Activate: clean old caches

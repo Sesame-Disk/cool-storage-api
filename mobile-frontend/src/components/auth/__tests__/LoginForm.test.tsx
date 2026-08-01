@@ -5,6 +5,10 @@ import LoginForm from '../LoginForm';
 
 vi.mock('../../../lib/api', () => ({
   login: vi.fn(),
+  localLogin: vi.fn(),
+  // Default: advertise OIDC (keeps the SSO button rendered) but not local, so
+  // the legacy dev/password login() path these tests assert stays in effect.
+  getAuthMethods: vi.fn(() => Promise.resolve({ local: false, oidc: true })),
 }));
 
 vi.mock('../../../lib/oidc', () => ({
@@ -18,6 +22,12 @@ vi.mock('../../../lib/config', () => ({
     mediaUrl: '/static/',
     logoPath: 'img/logo.png',
   }),
+  // Getter exports the <Logo> component reads directly.
+  siteRoot: () => '/',
+  mediaUrl: () => '/static/',
+  logoPath: () => 'img/logo.png',
+  logoHeight: () => 64,
+  siteTitle: () => 'Test App',
 }));
 
 import { login } from '../../../lib/api';

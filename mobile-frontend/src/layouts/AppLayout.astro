@@ -1,5 +1,6 @@
 ---
 import '../styles/global.css';
+import PwaManager from '../components/pwa/PwaManager.tsx';
 
 interface Props {
   title?: string;
@@ -27,9 +28,14 @@ const { title = 'SesameFS' } = Astro.props;
   </head>
   <body>
     <slot />
+    <PwaManager client:load />
     <script>
       if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.register('/sw.js');
+        navigator.serviceWorker.register('/sw.js').then((reg) => {
+          // Poll for updates so the waiting-worker "reload" prompt can appear
+          // without a full app restart.
+          setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
+        });
       }
 
       // Apply theme before paint to avoid flash

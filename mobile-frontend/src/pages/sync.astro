@@ -1,0 +1,8 @@
+---
+import AuthenticatedLayout from '../layouts/AuthenticatedLayout.astro';
+import SyncStatusPage from '../components/pages/SyncStatusPage';
+---
+
+<AuthenticatedLayout title="Folder Sync" pageTitle="Folder Sync">
+  <SyncStatusPage client:load />
+</AuthenticatedLayout>

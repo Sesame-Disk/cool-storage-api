@@ -1,0 +1,11 @@
+---
+// App shell for client-rendered dynamic routes (file browser, trash, group
+// detail) and genuine 404s. Astro serves this for any unmatched route in dev;
+// nginx falls back to /404.html in production (see nginx.conf try_files).
+import AuthenticatedLayout from '../layouts/AuthenticatedLayout.astro';
+import AppRouter from '../components/AppRouter';
+---
+
+<AuthenticatedLayout title="Sesame Disk" pageTitle="Sesame Disk">
+  <AppRouter client:load />
+</AuthenticatedLayout>

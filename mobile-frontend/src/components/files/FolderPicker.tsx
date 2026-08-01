@@ -161,6 +161,8 @@ export default function FolderPicker({ isOpen, onClose, items, srcRepoId, srcPat
               key={repo.repo_id}
               onClick={() => navigateToRepo(repo)}
               className="flex items-center gap-3 w-full px-4 py-3 min-h-[44px] hover:bg-gray-50 text-left"
+              data-testid="folder-picker-repo"
+              data-repo-id={repo.repo_id}
             >
               <Folder className="w-5 h-5 text-primary flex-shrink-0" />
               <span className="text-base text-text truncate">{repo.repo_name}</span>
@@ -176,6 +178,8 @@ export default function FolderPicker({ isOpen, onClose, items, srcRepoId, srcPat
               key={dir.name}
               onClick={() => navigateToDir(dir)}
               className="flex items-center gap-3 w-full px-4 py-3 min-h-[44px] hover:bg-gray-50 text-left"
+              data-testid="folder-picker-dir"
+              data-name={dir.name}
             >
               <Folder className="w-5 h-5 text-primary flex-shrink-0" />
               <span className="text-base text-text truncate">{dir.name}</span>
@@ -191,6 +195,7 @@ export default function FolderPicker({ isOpen, onClose, items, srcRepoId, srcPat
               onClick={handleExecute}
               disabled={executing}
               className="w-full bg-primary-button text-white rounded-lg py-3 min-h-[44px] font-medium disabled:opacity-50"
+              data-testid="folder-picker-confirm"
             >
               {executing ? 'Processing...' : actionLabel}
             </button>

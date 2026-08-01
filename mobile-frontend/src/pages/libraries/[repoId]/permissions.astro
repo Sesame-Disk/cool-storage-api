@@ -1,0 +1,12 @@
+---
+import AuthenticatedLayout from '../../../layouts/AuthenticatedLayout.astro';
+import CustomPermissionsPage from '../../../components/pages/CustomPermissionsPage';
+
+export function getStaticPaths() {
+  return [];
+}
+---
+
+<AuthenticatedLayout title="Permissions" pageTitle="Permissions">
+  <CustomPermissionsPage client:load />
+</AuthenticatedLayout>

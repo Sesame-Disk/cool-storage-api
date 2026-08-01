@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { FolderOpen, File, Folder, MoreVertical, ChevronRight, Star, Upload as UploadIcon } from 'lucide-react';
+import { FolderOpen, File, Folder, MoreVertical, ChevronRight, Star, Upload as UploadIcon, History as HistoryIcon, Trash2, Tag as TagIcon, Shield } from 'lucide-react';
 import { listDir, starFile, unstarFile } from '../../lib/api';
 import { bytesToSize, formatDate } from '../../lib/models';
 import type { Dirent } from '../../lib/models';
@@ -293,6 +293,42 @@ export default function FileBrowser({ repoId, repoName, encrypted, initialPath =
             </React.Fragment>
           );
         })}
+        {repoId && (
+          <div className="ml-auto flex items-center gap-4 pl-3 flex-shrink-0">
+            <a
+              href={`/libraries/${repoId}/tags`}
+              aria-label="Library tags"
+              data-testid="library-tags-link"
+              className="text-gray-500 min-h-[32px] flex items-center"
+            >
+              <TagIcon className="w-5 h-5" />
+            </a>
+            <a
+              href={`/libraries/${repoId}/permissions`}
+              aria-label="Library custom permissions"
+              data-testid="library-permissions-link"
+              className="text-gray-500 min-h-[32px] flex items-center"
+            >
+              <Shield className="w-5 h-5" />
+            </a>
+            <a
+              href={`/libraries/${repoId}/history`}
+              aria-label="Library history"
+              data-testid="library-history-link"
+              className="text-gray-500 min-h-[32px] flex items-center"
+            >
+              <HistoryIcon className="w-5 h-5" />
+            </a>
+            <a
+              href={`/libraries/${repoId}/trash`}
+              aria-label="Library trash"
+              data-testid="library-trash-link"
+              className="text-gray-500 min-h-[32px] flex items-center"
+            >
+              <Trash2 className="w-5 h-5" />
+            </a>
+          </div>
+        )}
       </div>
 
       {/* Loading / Error */}
@@ -307,13 +343,15 @@ export default function FileBrowser({ repoId, repoName, encrypted, initialPath =
         </div>
       )}
 
-      <div className="flex-1 overflow-auto">
+      <div className="flex-1 overflow-auto" data-testid="file-list">
         {items.map(item => {
           const Icon = item.type === 'dir' ? Folder : File;
           const isSelected = selectedIds.has(item.id);
           return (
             <div
               key={item.id}
+              data-testid="file-item"
+              data-name={item.name}
               className={`flex items-center gap-3 px-4 py-3 min-h-[44px] hover:bg-gray-50 cursor-pointer ${isSelected ? 'bg-primary/10' : ''}`}
               onClick={() => handleItemTap(item)}
               onPointerDown={() => handlePointerDown(item)}

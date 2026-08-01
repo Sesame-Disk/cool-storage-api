@@ -1,0 +1,8 @@
+---
+import AuthenticatedLayout from '../layouts/AuthenticatedLayout.astro';
+import DeletedLibrariesPage from '../components/pages/DeletedLibrariesPage';
+---
+
+<AuthenticatedLayout title="Deleted Libraries" pageTitle="Deleted Libraries">
+  <DeletedLibrariesPage client:load />
+</AuthenticatedLayout>

@@ -1,0 +1,13 @@
+---
+import AuthenticatedLayout from '../../layouts/AuthenticatedLayout.astro';
+import OpenInDesktop from '../../components/org-admin/OpenInDesktop';
+---
+
+<AuthenticatedLayout title="Audit Logs" pageTitle="Audit Logs">
+  <OpenInDesktop
+    client:load
+    screen="logs"
+    title="Audit Logs"
+    description="File-access, update and permission audit logs are available in the desktop version."
+  />
+</AuthenticatedLayout>

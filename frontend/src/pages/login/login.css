@@ -242,3 +242,66 @@
     padding-right: 24px;
   }
 }
+
+/* ── Local (username/password) login form ─────────────────────────────── */
+.login-local {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-top: 8px;
+}
+
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.login-field__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(26, 38, 31, 0.72);
+}
+
+.login-field input {
+  width: 100%;
+  padding: 11px 13px;
+  border: 1px solid rgba(26, 38, 31, 0.18);
+  border-radius: 12px;
+  font-size: 15px;
+  background: rgba(255, 255, 255, 0.9);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.login-field input:focus {
+  outline: none;
+  border-color: #d88b2d;
+  box-shadow: 0 0 0 3px rgba(216, 139, 45, 0.18);
+}
+
+.login-submit--secondary {
+  background: transparent;
+  color: #d88b2d;
+  border: 1px solid rgba(216, 139, 45, 0.5);
+}
+
+.login-divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  margin: 20px 0 4px;
+  color: rgba(26, 38, 31, 0.45);
+  font-size: 13px;
+}
+
+.login-divider::before,
+.login-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: rgba(26, 38, 31, 0.12);
+}
+
+.login-divider span {
+  padding: 0 12px;
+}

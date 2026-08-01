@@ -207,7 +207,8 @@ class Item extends Component {
 
       isRevokeAdminDialogOpen: false,
       isConfirmInactiveDialogOpen: false,
-      isRestoreUserDialogOpen: false
+      isRestoreUserDialogOpen: false,
+      isResetPasswordDialogOpen: false
     };
   }
 
@@ -257,6 +258,29 @@ class Item extends Component {
 
   toggleRestoreUserDialog = () => {
     this.setState({ isRestoreUserDialogOpen: !this.state.isRestoreUserDialogOpen });
+  };
+
+  toggleResetPasswordDialog = () => {
+    this.setState({ isResetPasswordDialogOpen: !this.state.isResetPasswordDialogOpen });
+  };
+
+  resetPassword = () => {
+    const email = this.props.item.email;
+    // No body → the server generates and returns a one-time temporary password.
+    seafileAPI.sysAdminSetUserPassword(email).then((res) => {
+      if (res.data && res.data.temp_password) {
+        toaster.success(
+          gettext('Temporary password for {user}: {password}')
+            .replace('{user}', email)
+            .replace('{password}', res.data.temp_password),
+          { duration: 30 }
+        );
+      } else {
+        toaster.success(res.data && res.data.detail ? res.data.detail : gettext('Password reset.'));
+      }
+    }).catch((error) => {
+      toaster.danger(Utils.getErrorMsg(error));
+    });
   };
 
   onUserSelected = () => {
@@ -353,10 +377,10 @@ class Item extends Component {
     if (item.status === 'deleted') {
       return ['Restore'];
     }
-    let list = ['Delete'];
+    let list = ['Reset Password', 'Delete'];
 
     if (isAdmin) {
-      list = ['Revoke Admin'];
+      list = ['Reset Password', 'Revoke Admin'];
     }
     return list;
   };
@@ -373,6 +397,9 @@ class Item extends Component {
         break;
       case 'Restore':
         translateResult = gettext('Restore');
+        break;
+      case 'Reset Password':
+        translateResult = gettext('Reset Password');
         break;
     }
 
@@ -391,6 +418,9 @@ class Item extends Component {
       case 'Restore':
         this.toggleRestoreUserDialog();
         break;
+      case 'Reset Password':
+        this.toggleResetPasswordDialog();
+        break;
       default:
         break;
     }
@@ -406,7 +436,8 @@ class Item extends Component {
 
       isRevokeAdminDialogOpen,
       isConfirmInactiveDialogOpen,
-      isRestoreUserDialogOpen
+      isRestoreUserDialogOpen,
+      isResetPasswordDialogOpen
     } = this.state;
 
     const itemName = '<span class="op-target">' + Utils.HTMLescape(item.name) + '</span>';
@@ -603,6 +634,15 @@ class Item extends Component {
             executeOperation={this.setUserInactive}
             confirmBtnText={gettext('Set')}
             toggleDialog={this.toggleConfirmInactiveDialog}
+          />
+        }
+        {isResetPasswordDialogOpen &&
+          <CommonOperationConfirmationDialog
+            title={gettext('Reset Password')}
+            message={gettext('Are you sure you want to reset the password for %s? A one-time temporary password will be generated.').replace('%s', item.email)}
+            executeOperation={this.resetPassword}
+            confirmBtnText={gettext('Reset')}
+            toggleDialog={this.toggleResetPasswordDialog}
           />
         }
         {isRestoreUserDialogOpen &&

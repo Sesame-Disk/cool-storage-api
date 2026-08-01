@@ -1,0 +1,8 @@
+---
+import AuthenticatedLayout from '../../layouts/AuthenticatedLayout.astro';
+import OrgAdminHome from '../../components/org-admin/OrgAdminHome';
+---
+
+<AuthenticatedLayout title="Org Admin" pageTitle="Org Admin">
+  <OrgAdminHome client:load />
+</AuthenticatedLayout>

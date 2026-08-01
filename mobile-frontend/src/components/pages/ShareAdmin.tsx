@@ -97,7 +97,7 @@ export default function ShareAdmin() {
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full" data-testid="share-admin-page">
       <div className="px-4 pt-2 pb-1 flex items-center justify-between">
         <h1 className="text-xl font-semibold text-text dark:text-dark-text">My Shares</h1>
         <button
@@ -113,6 +113,7 @@ export default function ShareAdmin() {
       <div className="flex border-b border-gray-200 dark:border-dark-border px-4">
         <button
           onClick={() => setActiveTab('share')}
+          data-testid="share-admin-tab-share"
           className={`flex-1 py-3 text-sm font-medium text-center min-h-[44px] border-b-2 ${
             activeTab === 'share'
               ? 'border-primary text-primary'
@@ -123,6 +124,7 @@ export default function ShareAdmin() {
         </button>
         <button
           onClick={() => setActiveTab('upload')}
+          data-testid="share-admin-tab-upload"
           className={`flex-1 py-3 text-sm font-medium text-center min-h-[44px] border-b-2 ${
             activeTab === 'upload'
               ? 'border-primary text-primary'
@@ -145,7 +147,7 @@ export default function ShareAdmin() {
               description="Create share links from the file browser to share files with others."
             />
           ) : (
-            <div className="flex flex-col pb-20">
+            <div className="flex flex-col pb-20" data-testid="share-links-list">
               {shareLinks.map((link) => (
                 <SwipeableListItem
                   key={link.token}
@@ -158,7 +160,11 @@ export default function ShareAdmin() {
                     },
                   ]}
                 >
-                  <div className="flex items-center gap-3 px-4 py-3 min-h-[56px] border-b border-gray-100 dark:border-dark-border">
+                  <div
+                    className="flex items-center gap-3 px-4 py-3 min-h-[56px] border-b border-gray-100 dark:border-dark-border"
+                    data-testid="share-link-item"
+                    data-token={link.token}
+                  >
                     <Link2 className="w-10 h-10 text-primary flex-shrink-0" />
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium text-text dark:text-dark-text truncate">
@@ -171,6 +177,13 @@ export default function ShareAdmin() {
                         Created {formatDate(new Date(link.ctime).getTime() / 1000)} &middot; {link.view_cnt} views
                       </p>
                     </div>
+                    <button
+                      onClick={() => setDeleteConfirm({ type: 'share', token: link.token })}
+                      aria-label={`Delete share link ${getFileName(link.path)}`}
+                      className="text-red-500 text-sm font-medium px-2 min-h-[44px]"
+                    >
+                      Delete
+                    </button>
                   </div>
                 </SwipeableListItem>
               ))}
@@ -184,7 +197,7 @@ export default function ShareAdmin() {
               description="Create upload links to let others upload files to your libraries."
             />
           ) : (
-            <div className="flex flex-col pb-20">
+            <div className="flex flex-col pb-20" data-testid="upload-links-list">
               {uploadLinks.map((link) => (
                 <SwipeableListItem
                   key={link.token}
@@ -197,7 +210,11 @@ export default function ShareAdmin() {
                     },
                   ]}
                 >
-                  <div className="flex items-center gap-3 px-4 py-3 min-h-[56px] border-b border-gray-100 dark:border-dark-border">
+                  <div
+                    className="flex items-center gap-3 px-4 py-3 min-h-[56px] border-b border-gray-100 dark:border-dark-border"
+                    data-testid="upload-link-item"
+                    data-token={link.token}
+                  >
                     <Upload className="w-10 h-10 text-green-500 flex-shrink-0" />
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium text-text dark:text-dark-text truncate">
@@ -210,6 +227,13 @@ export default function ShareAdmin() {
                         Created {formatDate(new Date(link.ctime).getTime() / 1000)} &middot; {link.view_cnt} views
                       </p>
                     </div>
+                    <button
+                      onClick={() => setDeleteConfirm({ type: 'upload', token: link.token })}
+                      aria-label={`Delete upload link ${getFileName(link.path)}`}
+                      className="text-red-500 text-sm font-medium px-2 min-h-[44px]"
+                    >
+                      Delete
+                    </button>
                   </div>
                 </SwipeableListItem>
               ))}
@@ -220,7 +244,7 @@ export default function ShareAdmin() {
 
       {/* Delete confirmation dialog */}
       {deleteConfirm && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" data-testid="share-admin-delete-dialog">
           <div className="bg-white dark:bg-dark-surface rounded-lg p-6 max-w-sm w-full shadow-xl">
             <h3 className="text-lg font-semibold text-text dark:text-dark-text mb-2">
               Delete Link
@@ -231,12 +255,14 @@ export default function ShareAdmin() {
             <div className="flex gap-3 justify-end">
               <button
                 onClick={() => setDeleteConfirm(null)}
+                data-testid="share-admin-delete-cancel"
                 className="px-4 py-2 text-sm font-medium text-gray-600 dark:text-gray-400 min-h-[44px]"
               >
                 Cancel
               </button>
               <button
                 onClick={confirmDelete}
+                data-testid="share-admin-delete-confirm"
                 className="px-4 py-2 text-sm font-medium text-white bg-red-500 rounded-lg min-h-[44px]"
               >
                 Delete

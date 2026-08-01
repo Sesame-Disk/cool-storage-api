@@ -1,0 +1,12 @@
+---
+import AuthenticatedLayout from '../../../layouts/AuthenticatedLayout.astro';
+import TagsPage from '../../../components/pages/TagsPage';
+
+export function getStaticPaths() {
+  return [];
+}
+---
+
+<AuthenticatedLayout title="Tags" pageTitle="Tags">
+  <TagsPage client:load />
+</AuthenticatedLayout>

@@ -1,6 +1,8 @@
 package v2
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/csv"
 	"fmt"
 	"io"
@@ -10,7 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/localauth"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
@@ -109,8 +113,9 @@ func (h *OrgAdminHandler) AddOrgUser(c *gin.Context) {
 	}
 
 	var body struct {
-		Email string `json:"email"`
-		Name  string `json:"name"`
+		Email    string `json:"email"`
+		Name     string `json:"name"`
+		Password string `json:"password"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -153,7 +158,36 @@ func (h *OrgAdminHandler) AddOrgUser(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, buildOrgUserRow(email, name, "user", StatusActive, targetOrgID, -2, 0, now, time.Time{}))
+	row := buildOrgUserRow(email, name, "user", StatusActive, targetOrgID, -2, 0, now, time.Time{})
+
+	// If local auth is enabled, attach a credential so the new user can log in.
+	// An explicit admin-supplied password is usable as-is; otherwise generate a
+	// temporary one and return it once so the admin can share it out-of-band.
+	if svc := h.localAuthService(); svc != nil {
+		password := strings.TrimSpace(body.Password)
+		mustChange := false
+		var tempPassword string
+		if password == "" {
+			tempPassword = generateTempPassword()
+			password = tempPassword
+			mustChange = true
+		}
+		if err := svc.SetPassword(email, userID, targetOrgID, password, mustChange, now); err != nil {
+			// The user row already exists; surface the credential problem clearly
+			// rather than silently leaving them unable to log in.
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		resp := gin.H{"user": row}
+		if tempPassword != "" {
+			resp["temp_password"] = tempPassword
+			resp["must_change_password"] = true
+		}
+		c.JSON(http.StatusCreated, resp)
+		return
+	}
+
+	c.JSON(http.StatusCreated, row)
 }
 
 // GetOrgUser returns details for a single user identified by email within the target org.
@@ -424,21 +458,61 @@ func (h *OrgAdminHandler) RestoreOrgUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// ResetOrgUserPassword is a no-op because SesameFS authenticates exclusively
-// via OIDC — there are no local passwords to reset.
+// ResetOrgUserPassword sets or resets a local user's password.
+// If local auth is disabled, it remains a graceful no-op (OIDC-only deployment).
+// Body (optional): { "password": "..." }. When password is omitted a temporary
+// one is generated and returned once so the admin can share it out-of-band.
 // PUT /org/:org_id/admin/users/:email/set-password/
 func (h *OrgAdminHandler) ResetOrgUserPassword(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
+	email := c.Param("email")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
 		return
 	}
 	if h.rejectOrgUserWriteIfDisabled(c) {
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"detail":  "SesameFS uses OIDC authentication; local password management is not supported",
-	})
+
+	svc := h.localAuthService()
+	if svc == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"detail":  "local authentication is not enabled; password management is a no-op",
+		})
+		return
+	}
+
+	userID, err := h.lookupOrgUserByEmail(targetOrgID, email)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	var body struct {
+		Password string `json:"password"`
+	}
+	_ = c.ShouldBindJSON(&body) // body is optional
+
+	password := strings.TrimSpace(body.Password)
+	mustChange := false
+	var tempPassword string
+	if password == "" {
+		tempPassword = generateTempPassword()
+		password = tempPassword
+		mustChange = true
+	}
+
+	if err := svc.SetPassword(email, userID, targetOrgID, password, mustChange, time.Now()); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	resp := gin.H{"success": true}
+	if tempPassword != "" {
+		resp["temp_password"] = tempPassword
+		resp["must_change_password"] = true
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // GetOrgUserOwnedRepos returns libraries owned by a user in the target org.
@@ -783,6 +857,39 @@ func (h *OrgAdminHandler) InviteOrgUsers(c *gin.Context) {
 		"invited_count": len(body.Emails),
 		"detail":        "SesameFS uses OIDC; users will be created on first login",
 	})
+}
+
+// buildLocalAuthService returns a localauth.Service bound to the given DB and
+// the configured password policy, or nil when local auth is disabled. Shared by
+// the org-admin and platform-admin handlers.
+func buildLocalAuthService(cfg *config.Config, database *dbpkg.DB) *localauth.Service {
+	if cfg == nil || !cfg.Auth.Local.Enabled || database == nil {
+		return nil
+	}
+	return localauth.NewService(database.Session(), localauth.Policy{
+		MinPasswordLength: cfg.Auth.Local.MinPasswordLength,
+		MaxFailedAttempts: cfg.Auth.Local.MaxFailedAttempts,
+		LockoutDuration:   cfg.Auth.Local.LockoutDuration,
+	})
+}
+
+// localAuthService returns a localauth.Service bound to this handler's DB and
+// the configured password policy, or nil when local auth is disabled.
+func (h *OrgAdminHandler) localAuthService() *localauth.Service {
+	return buildLocalAuthService(h.config, h.db)
+}
+
+// generateTempPassword returns a random, URL-safe temporary password. It always
+// satisfies the default policy length and is only ever returned to the admin
+// once (never persisted in plaintext).
+func generateTempPassword() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		// rand.Read failing is catastrophic; fall back to a timestamp-derived
+		// value so we never emit an empty/guessable password.
+		return "Temp-" + base64.RawURLEncoding.EncodeToString([]byte(time.Now().UTC().String()))[:16]
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // ============================================================================

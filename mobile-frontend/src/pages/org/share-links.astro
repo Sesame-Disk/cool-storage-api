@@ -1,0 +1,8 @@
+---
+import AuthenticatedLayout from '../../layouts/AuthenticatedLayout.astro';
+import OrgShareLinksPage from '../../components/org-admin/OrgShareLinksPage';
+---
+
+<AuthenticatedLayout title="Org Share Links" pageTitle="Org Share Links">
+  <OrgShareLinksPage client:load />
+</AuthenticatedLayout>

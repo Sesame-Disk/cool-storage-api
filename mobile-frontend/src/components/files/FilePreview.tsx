@@ -4,9 +4,12 @@ import { getViewerType, isImageFile } from '../../lib/utils';
 import type { Dirent } from '../../lib/models';
 import ImageViewer from './ImageViewer';
 import VideoPlayer from './VideoPlayer';
+import AudioPlayer from './AudioPlayer';
 import TextViewer from './TextViewer';
+import MarkdownViewer from './MarkdownViewer';
 import CodeViewer from './CodeViewer';
 import PDFViewer from './PDFViewer';
+import OnlyOfficeViewer from './OnlyOfficeViewer';
 import GenericFileView from './GenericFileView';
 
 interface FilePreviewProps {
@@ -106,6 +109,23 @@ export default function FilePreview({
           onClose={onClose}
         />
       );
+    case 'audio':
+      return (
+        <AudioPlayer
+          url={downloadUrl}
+          fileName={file.name}
+          onClose={onClose}
+        />
+      );
+    case 'markdown':
+      return (
+        <MarkdownViewer
+          url={downloadUrl}
+          fileName={file.name}
+          onClose={onClose}
+          onToast={onToast}
+        />
+      );
     case 'text':
       return (
         <TextViewer
@@ -130,6 +150,16 @@ export default function FilePreview({
           url={downloadUrl}
           fileName={file.name}
           onClose={onClose}
+        />
+      );
+    case 'office':
+      return (
+        <OnlyOfficeViewer
+          repoId={repoId}
+          filePath={fullPath}
+          fileName={file.name}
+          onClose={onClose}
+          onToast={onToast}
         />
       );
     default:
