@@ -67,9 +67,9 @@ The following producers are in scope:
 | Producer | Route or entry point | Current behavior | D profile |
 |---|---|---|---|
 | `SeafHTTPHandler.HandleDownload` / `streamFileFromBlocks` | `GET /seafhttp/files/:token/*filepath` | Token-authorized full-file stream | `file` |
-| `SeafHTTPHandler.HandleZipDownload` | `GET /seafhttp/zip/:token` | Token-authorized generated ZIP stream | `zip` |
+| `SeafHTTPHandler.HandleZipDownload` | `GET /seafhttp/zip/:token` | Token-authorized generated ZIP stream, behind an optional request-start `zipRL` (`rate.Every(15s)`, burst 3) that is not an active-transfer bound | `zip` |
 | `SyncHandler.GetBlock` | `GET /seafhttp/repo/:repo_id/block/:block_id` | Authenticated block GET currently buffers `[]byte` | `block` |
-| `FileViewHandler.ServeRawFile` | `GET /repo/:repo_id/raw/*filepath` | Authenticated raw stream; AV media uses `http.ServeContent` and Range | `raw` |
+| `FileViewHandler.ServeRawFile` | `GET /repo/:repo_id/raw/*filepath` | Authenticated raw stream; AV media uses `http.ServeContent` and Range; the `preview=1` iWork branch fully buffers the source file (see §6) | `raw` |
 | `FileViewHandler.DownloadHistoricFile` | `GET /repo/:repo_id/history/download` | Authenticated historic full-file stream | `history` |
 | `FileViewHandler.ServeHistoricFileRaw` | `GET /repo/:repo_id/history/raw` | Authenticated historic raw stream | `history` |
 | `ShareLinkViewHandler.handleShareLinkRaw` | `/d/:token` or `/d/:token/files[/]` with `raw=1` | Public share raw stream; AV media may use Range | `link_raw` |
@@ -85,9 +85,21 @@ OnlyOffice document retrieval ultimately uses
 enforcement point. Editor HTML, configuration JSON and callbacks are not D
 document-byte transfers.
 
-`/history/view` and other redirect/bootstrap endpoints must be verified during
-D4 to ensure they do not independently open a storage reader. Redirects and
-control-plane JSON do not reserve a long-lived transfer slot.
+`/history/view` is already resolved as a non-producer: `ViewHistoricFile` only
+issues redirects — to `/repo/:repo_id/history/download` or to the frontend
+preview URL — and never opens a storage reader. It needs a D4 regression that
+keeps it that way, not a D4 investigation. Other redirect/bootstrap endpoints
+must still be verified during D4. Redirects and control-plane JSON do not
+reserve a long-lived transfer slot.
+
+Two helpers materialize whole files but have **no callers** today and are
+therefore outside the runtime scope: `SeafHTTPHandler.getFileFromBlocks`, which
+loads every block into one buffer, and the unused
+`GetPresignedDownloadURL` / `GetPresignedUploadURL` pair in `internal/storage`,
+which would hand a client a direct object-storage URL. Neither is a current
+bypass. Both are traps: wiring either one during D4 would produce a byte
+producer that never passes admission. D4 must delete them or mark them
+deprecated with an explicit reference to this contract.
 
 Generated exports that do not read block/object storage are outside this D0
 scope. They require a separate inventory before being described as protected by
@@ -134,15 +146,20 @@ The coordinator should represent these as typed dimensions, for example
 `DimensionKey{Kind, ID}`, so a user ID, source ID and IP with equal textual
 representations cannot collide. `orgID` is mandatory in `auth-user`; two users
 with the same user identifier in different organizations never share a gate.
-`normalizedClientIP` must come from the repository's trusted-proxy-aware client
-IP resolver, not directly from an untrusted `X-Forwarded-For` value. The D1
-contract must use the same trusted-proxy configuration and attribution rules as
-the existing abuse controls.
+`normalizedClientIP` must come from `c.ClientIP()` on an engine already
+configured through `configureTrustedProxies` / `SetTrustedProxies`, never from a
+directly parsed `X-Forwarded-For` value. There is no bespoke resolver to call:
+this is exactly how the existing abuse controls attribute a client, and D1 must
+use the same trusted-proxy configuration and attribution rules rather than
+introducing a second one.
 
 For `Source == "link"`:
 
+The list below is the contract D2 must establish, not a description of today.
+Only the upload-token path carries a source identity right now.
+
 - New tokens require a non-empty, non-whitespace `SourceID`.
-- All three public mint flows use
+- D2 must update all three public mint flows to pass
   `publicLinkSourceID("share-link", sl.token)`:
   normal download, public OnlyOffice and public ZIP token creation.
 - A token remint retains the same source identity while changing the bearer.
@@ -238,14 +255,18 @@ metadata cost.
 
 The profiles are separate for measurement and fairness:
 
-- `block`: authenticated desktop block GET; must preserve desktop-compatible
-  `503 + Retry-After` behavior.
+- `block`: authenticated desktop block GET. It has no admission today, so there
+  is no behavior to preserve: it *adopts* the desktop-compatible
+  `503 + Retry-After` contract already proven against real `seaf-cli` by
+  subcontract B on the PUT side of the same route.
 - `file`: full-file and OnlyOffice file streams.
 - `raw`: current authenticated raw streams and Range operations.
 - `history`: historic file streams.
 - `link_raw`: public link raw streams.
 - `zip`: generated ZIP streams, with a separately measured route cap.
-- `link_inline`: short public inline-content reads, with a short-work bound.
+- `link_inline`: short public inline-content reads. "Short work" here means the
+  1 MB inline-content limit plus a low `max_active_link_inline`, not a deadline
+  of its own — it shares the global `preparation_deadline`.
 
 Two profiles have an admission lifetime that is easy to get wrong, so it is
 stated rather than left to criterion 6.
@@ -259,6 +280,17 @@ could accumulate after admission was given back, which is the opposite of what
 putting this producer in scope was for. The preparation deadline covers the
 storage read; the idle-write deadline covers the response write; both run under
 one admission.
+
+One global `preparation_deadline` serves every profile, which leaves a tension
+D1 must close with measurement rather than wording. A profile cap bounds how
+many requests of a kind run concurrently, not how long each may sit in
+preparation, so a deadline sized for a large ZIP's traversal and metadata work
+is inherited unchanged by a 1 MB inline text read. If D1's measurements show the
+two need materially different eviction speeds, the answer is per-profile
+deadline keys, not a compromise value; if one finite deadline demonstrably
+serves both, the single key stands and the evidence is recorded. What the
+contract does not allow is describing `link_inline` as short-work bounded while
+its only duration bound is a ZIP-sized deadline.
 
 `zip` is held until `zipWriter.Close()` returns, because that close is what
 flushes the central directory: releasing earlier returns the slot while the
@@ -298,6 +330,33 @@ error, so a failed central-directory flush is invisible today. D4 must record
 it: a ZIP that fails to close is a truncated archive the client may accept as
 complete. The regression must prove both the ordering and that the close error
 is recorded.
+
+`raw` contains a third case, and it is the worst memory profile in D. The
+`preview=1` iWork branch of `ServeRawFile` is not a stream: it opens its own
+canonical reader, copies **every block of the source file** into a single
+`bytes.Buffer` — reading each block fully into memory first when the library is
+encrypted, so decryption can run — and only then parses the assembled document
+as a ZIP to extract a preview. Admission must therefore be taken before the
+first reader is opened and held until the extracted PDF/JPEG/PNG has been
+written, exactly as for the streaming branches.
+
+Concurrency alone does not bound this. `h.config.FileView.MaxIWorkPreviewBytes`
+(default 50 MB) is passed to the extractor and caps the **extracted preview**;
+the source file is already fully buffered by the time it is consulted, and
+nothing upstream gates the source size, even though `fileSize` has been read
+from `fs_objects` a few lines earlier. The node memory envelope is therefore:
+
+```text
+max_active_raw × (largest iWork file in any served library)
+```
+
+with the second factor currently unbounded. A profile cap bounds how many such
+requests run, not how large each one is, so D cannot claim a memory bound for
+`raw` on `max_active_raw` alone. D4 must add a source-size gate for this branch
+— rejecting before the buffering loop when the recorded `fileSize` exceeds a
+configured maximum — and D6 must measure the resulting per-request peak. Until
+that gate exists, the relationship between `max_active_raw` and a worst-case
+`raw` request is not expressible.
 
 All profiles consume the shared node ceiling. Profile caps must not create
 independent escape hatches that allow the aggregate node limit to be exceeded.
@@ -368,14 +427,53 @@ They do not cover `/repo/:repo_id/raw`, `/repo/:repo_id/history/download`, or
 not distinguishable by query through the path-regex API.
 
 D3 must ensure that raw/history and share-raw writers are not hidden behind the
-current gzip wrapper when they need a connection deadline. The contract does
-not freeze blanket exclusion of all `/d/...` responses as the ideal solution:
-`/d/...` also carries compressible public bootstrap responses with inline text.
-D3 must either add route/query-aware gzip bypass for `raw=1`, or fix the gzip
-writer chain to expose the required response-controller interfaces while keeping
-compression for non-streaming/bootstrap responses. A temporary blanket `/d/...`
-exclusion is acceptable only with measured egress impact and must not be treated
-as the final design.
+current gzip wrapper when they need a connection deadline.
+
+**A blanket `/d/...` exclusion is an acceptable final design, not a temporary
+compromise.** Under the SPA-API-only architecture those two routes serve almost
+nothing else: `ServeShareLinkPage` and `ServeShareLinkFilePage` answer only
+`dl=1` (mint plus redirect) and `raw=1` (the protected byte stream), and every
+other query returns a short `404` JSON. There is no large compressible response
+under `/d/...` to protect, so excluding the prefix costs approximately nothing
+and removes the need for query-aware gzip logic on the share-raw path. D3 may
+still choose route/query-aware bypass or a corrected writer chain, but it must
+not reject the blanket exclusion on egress grounds without measuring what is
+actually served there.
+
+The compressible public bootstrap responses live on **different routes**:
+
+```text
+/api/v2.1/share-links/:token/bootstrap
+/api/v2.1/share-links/:token/files/bootstrap
+```
+
+These are where the `link_inline` producer's response is written, and **no
+current exclusion pattern matches them** — they sit inside gzip today. That is
+the same configuration that made subcontract C's admitted lifetime unenforceable:
+
+```text
+admission acquired
+→ storage read completes
+→ response write begins
+→ idle-write deadline cannot reach the socket
+→ a slow client holds the slot indefinitely
+```
+
+Because §6 holds the `link_inline` admission until the inline-content JSON has
+been written, and §9 requires that write to carry an idle deadline, D3 must make
+these two routes writer-reachable by one of:
+
+- a gzip writer chain that correctly exposes `Unwrap` and the response-controller
+  interfaces (preferred: the bootstrap payload is text/Markdown and compresses
+  well);
+- selective bypass when the response actually carries inline content;
+- outright exclusion of the two routes, with the egress increase measured and
+  recorded.
+
+The blanket-`/d/...` reasoning does **not** transfer here. These responses can
+carry up to the full inline-content limit of highly compressible text, so
+dropping compression on them is a real cost that must be measured rather than
+assumed away.
 
 Every writer that needs an idle-write deadline must make the underlying network
 connection reachable through `http.ResponseController` or an equivalent
@@ -429,9 +527,11 @@ the preparation deadline because it may never write a response while waiting for
 storage.
 
 `server.write_timeout` is a process-wide `http.Server` setting, not a per-route
-one, and every shipped configuration already sets it to `0s` with the comment
-"No write timeout — large downloads/zips can take minutes". D therefore depends
-on an existing deployment property rather than introducing a new constraint:
+one, and all seven shipped configurations already set it to `0s` — two of them
+explaining it as "No write timeout — large downloads/zips can take minutes",
+`config.prod.yaml` with a similar note, and the four regional files without a
+comment. D therefore depends on an existing deployment property rather than
+introducing a new constraint:
 with it at zero, the application-controlled idle deadline is the only write
 deadline on the connection and is authoritative by construction.
 
@@ -569,6 +669,10 @@ commented:
 - no identity cap and no profile cap may exceed `max_active_per_node`, so a
   profile cannot become an escape hatch around the aggregate bound;
 - `max_active_per_client_link` may not exceed `max_active_per_link_source`;
+- `max_waiters_per_identity` may not exceed `max_waiters_per_node`. The global
+  bound would dominate anyway, so this is not a safety hole — it rejects a
+  configuration whose per-identity queue can never be reached, and keeps the
+  waiter keys under the same rigor as the active caps;
 - a validated ceiling exists for every cap and every deadline;
 - the coordinator is process-local, and every default is documented as such:
   fleet capacity scales with node count.
@@ -627,13 +731,24 @@ profile:   block | file | raw | history | link_raw | zip | link_inline
 phase:     preparation | idle_write
 outcome:   admitted | refused | timeout | cancelled
 
-reason:    node_full | identity_full | profile_full
-           | node_queue_full | identity_queue_full
+reason:    node_full | profile_full
+           | auth_user_full | link_source_full | client_link_full
+           | node_queue_full
+           | auth_user_queue_full | link_source_queue_full
+           | client_link_queue_full
            | admission_timeout | client_gone
 
 cause:     completed | client_disconnect | preparation_timeout
            | idle_write_timeout | storage_error | response_error | panic
 ```
+
+`reason` names the identity dimension that refused the request rather than
+collapsing all three into one `identity_full`. `waiters_by_gate` already
+distinguishes `auth_user`, `link_source` and `client_link`, so a collapsed
+reject reason would let an operator see which gate requests are parked behind
+but not which one is turning them away — and those are different questions with
+different responses, since a saturated `client_link` suggests one abusive
+client while a saturated `link_source` suggests one hot link.
 
 There is deliberately **no** `entry_queue_full`, and no `max_entries_per_node`
 to go with it. B/C carry a global entry ring because they acquire gates
@@ -716,7 +831,7 @@ and the relevant integration/fault drill:
 | 7 | Recoverable lifetime | Context cancellation, idle-write timeout, writer reachability, storage cancellation and idempotent release are proven; release also survives a panic raised inside the response cleanup, and that unwind is attributable as `cause="panic"` |
 | 8 | Correct HTTP behavior | 503/Retry-After contract, Range behavior, post-header failure, 304/416/redirect handling and byte integrity are preserved |
 | 9 | Block GET safety | Block GET streams through the canonical reader with authoritative size and no full-block materialization |
-| 10 | Middleware and proxy wiring | Actual gzip stack, real TCP tests and the supported nginx topology cover block, files, ZIP, raw, history and `/d/...`; buffering, timeout and H2 behavior are verified |
+| 10 | Middleware and proxy wiring | Actual gzip stack, real TCP tests and the supported nginx topology cover block, files, ZIP, raw, history, `/d/...` **and the two `/api/v2.1/share-links/:token[/files]/bootstrap` routes that carry the `link_inline` response**; buffering, timeout and H2 behavior are verified |
 | 11 | Client recovery | `seaf-cli`, browser/download behavior and OnlyOffice retrieval recover or fail clearly under saturation |
 | 12 | Configuration evidence | Defaults, ceilings and long-transfer capacities are measured, validated and documented as process-local; egress throughput is measured and the byte-rate residual is explicit |
 | 13 | No false storage claim | MinIO/direct-object exposure remains separately tracked and is not silently treated as closed by D |

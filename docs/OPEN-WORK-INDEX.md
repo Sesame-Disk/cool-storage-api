@@ -65,7 +65,7 @@ separate production-posture blocker; multi-instance adds B1 and B5. See
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29; B closed 2026-07-30; C closed 2026-07-31** — D0 now freezes the broader storage-backed byte-production scope, atomic multidimensional admission, stable link identity, writer lifetime and the D1-D6 PR sequence. **D remains open; no runtime change has landed.** | Readiness B4 ⊇ registry X10/X11 — **still the single-node blocker until D closes**; see [`SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md) |
-| `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` | Blocker | Supported Compose policies grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known | Production posture — private buckets and effective endpoint policy must be verified before go-live; see `KNOWN_ISSUES.md` |
+| `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` | HIGH | Supported Compose policies grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known | Production posture — private buckets and effective endpoint policy must be verified before go-live; see `KNOWN_ISSUES.md` |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
 
@@ -134,7 +134,6 @@ on every replica in every DC until both close.
 |---|---|---|
 | `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One global Paxos round per block. **PR-11, not started** — need a per-statement latency metric first. |
 | `ISSUE-CANONICAL-READ-FANOUT-01` (= X5) | MEDIUM | Canonical read fan-out never validated against a real cluster |
-| `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` (= X11) | MEDIUM | 100k id cap bounds the parser, not the ~100k sequential Cassandra reads |
 | `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` | MEDIUM (deferred) | D bounds aggregate accepted work, not bytes per second; measure node egress at D6 before choosing shaping |
 | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (= X6) | MEDIUM | Read-after-write across DCs; 3×25 ms retry covers local lag only |
 

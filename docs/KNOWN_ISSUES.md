@@ -5076,7 +5076,7 @@ Current guard state (2026-08-01; the other rows retain their original verificati
 | `/api/v2.1/share-links/*`, `/api/v2.1/upload-links/*`, `/d/:token` | per-IP `slRL` |
 | `/repo/:repo_id/raw/*filepath`, `/repo/:repo_id/history/*` | **none** — authentication/traffic checks exist, but no D admission |
 | `/d/:token` or `/d/:token/files[/]` with `raw=1` | per-IP `slRL` on route starts; no active-transfer admission |
-| Share-file bootstrap inline text | per-IP `slRL` on the public route; storage read has no D admission and uses a background context |
+| `/api/v2.1/share-links/:token[/files]/bootstrap` (inline text) | per-IP `slRL` on the public route; storage read has no D admission, uses a background context, and its response is written from inside gzip |
 
 So the original B4 wording — "no dedicated rate limit on upload / download /
 blocks / share-link paths" — is **partly stale**: the share-link and web-block
@@ -5631,6 +5631,13 @@ route. It includes:
 - `handleShareLinkRaw` for `raw=1`;
 - `readFileContentAsText`, the public inline text/Markdown storage read.
 
+Within `raw`, the `preview=1` iWork branch of `ServeRawFile` is the worst memory
+case in D: it buffers the entire source file into one `bytes.Buffer` before
+parsing it as a ZIP. `FileView.MaxIWorkPreviewBytes` caps the *extracted*
+preview, not that buffer, and nothing gates the source size, so
+`max_active_raw` alone does not bound `raw` memory. D4 must add a source-size
+gate and D6 must measure the per-request peak.
+
 Redirects, bootstrap JSON without inline content, OnlyOffice configuration and
 the share-link `dl=1` mint step do not consume a long-lived slot. OnlyOffice's
 final `/seafhttp/files` request does. There is no implicit HEAD contract; Range
@@ -5686,9 +5693,18 @@ The current block gzip exclusion already covers both block methods through
 and `/d/...` cannot be selectively excluded by `raw=1` through the current
 path-regex API. D3 must ensure that raw/history and share-raw writers can reach
 the connection deadline, either through route/query-aware gzip bypass or a
-writer chain that correctly exposes the response-controller interfaces. A
-temporary blanket `/d/...` exclusion is not the frozen ideal because it also
-disables compression for public bootstrap responses. The deadline is installed
+writer chain that correctly exposes the response-controller interfaces. For
+`/d/...` a blanket exclusion is an acceptable final answer rather than a
+compromise: those two routes serve only `dl=1` and `raw=1` plus a short `404`
+JSON, so there is no large compressible payload there to protect.
+
+The compressible inline-text bootstrap is on **different** routes —
+`/api/v2.1/share-links/:token/bootstrap` and `.../files/bootstrap` — and no
+current exclusion pattern matches them, so the `link_inline` producer writes its
+response from inside gzip today. That is the configuration that made C's
+admitted lifetime unenforceable, so D3 must make those two routes
+writer-reachable, preferably by fixing the writer chain rather than dropping
+compression on a highly compressible payload. The deadline is installed
 immediately before each underlying write/flush, cleared after the stream and
 fail-closed before headers if the connection is unreachable.
 
