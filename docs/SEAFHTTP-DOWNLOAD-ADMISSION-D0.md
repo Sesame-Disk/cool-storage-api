@@ -274,11 +274,24 @@ if !ok {
 }
 zipWriter := zip.NewWriter(c.Writer)
 defer func() {
-    closeErr := zipWriter.Close()
-    lease.Release()
-    // record closeErr — see below
+    defer lease.Release()             // runs even if Close panics
+
+    if err := zipWriter.Close(); err != nil {
+        // record the close/response failure — see below
+    }
 }()
 ```
+
+The inner `defer` is not a stylistic choice. A release that runs as a plain
+statement after `zipWriter.Close()` is skipped entirely if that close panics,
+which would strand a node slot for the life of the process — and D lists `panic`
+as a release `cause`, so the frozen pattern has to survive one. Two separate
+defers are equally acceptable, provided `lease.Release()` is registered
+immediately after the acquire and the close defer immediately after
+`zip.NewWriter`: LIFO then closes before releasing, and a panic in the close
+still unwinds into the earlier release. Either shape must also let the release
+path attribute a panic unwind, otherwise `cause="panic"` is a label that can
+never be emitted.
 
 The current handler uses a bare `defer zipWriter.Close()`, which discards the
 error, so a failed central-directory flush is invisible today. D4 must record
@@ -700,14 +713,14 @@ and the relevant integration/fault drill:
 | 4 | Fair identities | Authenticated user, link source and client-link limits are isolated; public link traffic cannot consume owner-user capacity |
 | 5 | Bounded state | Active entries, waiters, identity maps, timers and goroutines remain bounded and drain to zero after sustained churn |
 | 6 | Correct placement | Rejection happens before expensive metadata/S3 work; admission is held through the protected response lifetime, explicitly including until `zipWriter.Close()` returns and until the inline-content JSON response is written |
-| 7 | Recoverable lifetime | Context cancellation, idle-write timeout, writer reachability, storage cancellation and idempotent release are proven |
+| 7 | Recoverable lifetime | Context cancellation, idle-write timeout, writer reachability, storage cancellation and idempotent release are proven; release also survives a panic raised inside the response cleanup, and that unwind is attributable as `cause="panic"` |
 | 8 | Correct HTTP behavior | 503/Retry-After contract, Range behavior, post-header failure, 304/416/redirect handling and byte integrity are preserved |
 | 9 | Block GET safety | Block GET streams through the canonical reader with authoritative size and no full-block materialization |
 | 10 | Middleware and proxy wiring | Actual gzip stack, real TCP tests and the supported nginx topology cover block, files, ZIP, raw, history and `/d/...`; buffering, timeout and H2 behavior are verified |
 | 11 | Client recovery | `seaf-cli`, browser/download behavior and OnlyOffice retrieval recover or fail clearly under saturation |
 | 12 | Configuration evidence | Defaults, ceilings and long-transfer capacities are measured, validated and documented as process-local; egress throughput is measured and the byte-rate residual is explicit |
 | 13 | No false storage claim | MinIO/direct-object exposure remains separately tracked and is not silently treated as closed by D |
-| 14 | Observability and configuration contract | Every key ships in all `configs/*.yaml`, both `.env` examples and `applyEnvOverrides()` with enforced ceilings and the per-key zero policy; startup refuses an enabled-but-unbounded configuration and a non-zero `server.write_timeout`; the metric series and their fixed label sets exist as specified; `active_current == sum(active_by_profile)` and `entries_current == active_current + waiters_current` hold under mixed authenticated and public load; `Retry-After` is `ceil(retry_after)` with a floor of 1; no identity value appears in any label |
+| 14 | Observability and configuration contract | Every key ships in all `configs/*.yaml`, both `.env` examples and `applyEnvOverrides()` with enforced ceilings and the per-key zero policy; startup refuses an enabled-but-unbounded configuration and a non-zero `server.write_timeout`; the metric series and their fixed label sets exist as specified; `active_current == sum(active_by_profile)` and `entries_current == active_current + waiters_current` hold under mixed authenticated and public load; `Retry-After` is `ceil(retry_after / 1s)` with a floor of 1; no identity value appears in any label |
 
 ## D0-D6 PR Sequence
 
