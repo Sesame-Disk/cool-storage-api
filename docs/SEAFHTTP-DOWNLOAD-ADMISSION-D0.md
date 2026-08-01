@@ -355,10 +355,10 @@ The source size **is** already gated. `ServeRawFile` rejects with `413` when
 store is resolved and before the buffering loop. The problem is the value, not
 its absence: an iWork file is neither video nor text, so it falls through to the
 general `FileView.MaxPreviewBytes`, which is **1 GiB** in every shipped config —
-a limit chosen for ordinary inline previews, not for a path that materialises
-the whole file. `MaxIWorkPreviewBytes` (50 MB) caps only the *extracted*
-preview, twenty times lower, and is consulted after the source is already in
-memory.
+a general preview limit, not an iWork-specific in-memory budget, and never
+validated as one for a path that materialises the whole file.
+`MaxIWorkPreviewBytes` (50 MB) caps only the *extracted* preview, twenty times
+lower, and is consulted after the source is already in memory.
 
 So `raw` is bounded, but at a value that makes a small `max_active_raw` the only
 thing standing between the node and multiple gigabytes of buffered previews. The
@@ -373,24 +373,54 @@ peak_iwork_request ≈ source buffer capacity        (may exceed fileSize;
                    + ZIP parsing and runtime overhead
 ```
 
-and the node budget is `max_active_iwork × measured_peak_iwork_request`. D6 must
-measure that peak rather than deriving it from `fileSize`, and the shipped
-`max_active_raw` and `MaxPreviewBytes` defaults must together satisfy a stated
-memory budget. If 1 GiB stays, an iWork-specific source cap — a
-`max_iwork_source_bytes` well below the general preview limit — is the cheaper
-lever than shrinking `max_active_raw` for every raw stream.
+iWork runs under the `raw` profile, so while that holds the node budget is:
 
-That last point is a genuine profile question D4 must answer rather than
-inherit: `raw` currently mixes O(one block) streams with a fully buffered
-producer, so one `max_active_raw` sized for iWork would throttle ordinary raw
-streaming far below what it needs. D4 may keep the shared cap if measurement
-shows it works, or split the buffered branch into its own fixed profile
-(`iwork_preview`) or internal sub-cap. The contract does not mandate the split;
-it forbids assuming the shared cap is adequate without evidence.
+```text
+iWork node memory budget ≈ max_active_raw × measured_peak_iwork_request
+```
 
-D4 must also prove the existing `413` gate still precedes admission and
-buffering after the handler is restructured — an ordering regression that moved
-it after the buffering loop would remove the only source bound there is.
+D6 must measure that peak rather than deriving it from `fileSize`, and the
+shipped `max_active_raw` and `MaxPreviewBytes` defaults must together satisfy a
+stated memory budget. If 1 GiB stays, an iWork-specific source cap under
+`FileView` — well below the general preview limit — is the cheaper lever than
+shrinking `max_active_raw` for every raw stream. That is a `FileView` key and
+does not touch the `download_admission` schema frozen in §12.
+
+Whether `raw` should keep carrying both is a real question, because it mixes
+O(one block) streams with a fully buffered producer, and one cap sized for iWork
+would throttle ordinary raw streaming far below what it needs. But splitting is
+**not** an implementation choice available to D4. §12 freezes a closed profile
+enum, flat `max_active_<profile>` keys, one environment variable per key, and
+the `profile` metric label set; there is no `iwork_preview` in any of them, and
+adding one silently would break the sets this document exists to fix. So:
+
+> If D4/D6 evidence shows the shared `raw` cap either leaves iWork memory unsafe
+> or needlessly throttles ordinary raw streams, D4 must amend this contract, the
+> configuration schema, the environment variables, the profile enum and the
+> metric label set **before** introducing an `iwork_preview` profile or sub-cap.
+
+Freezing `iwork_preview` now would be premature in the other direction: there
+are no measurements yet to size it. It stays in `raw`, and the split is an
+explicit amendment if evidence calls for it.
+
+Placement is part of this. The order D4 must implement and regress is:
+
+```text
+authenticate and authorize
+→ resolve fileSize (bounded metadata lookups)
+→ apply the 413 preview-size gate
+→ acquire D
+→ resolve block store and canonical reader
+→ buffer / stream
+→ write the response
+→ release D
+```
+
+The gate preceding admission is not licence to do more before acquiring D: the
+metadata reads above are the bounded lookups needed to decide the `413` itself,
+and D4 must not add traversals, storage reads or other expensive work ahead of
+the acquire. An ordering regression that moved the `413` after the buffering
+loop would remove the only source bound there is.
 
 All profiles consume the shared node ceiling. Profile caps must not create
 independent escape hatches that allow the aggregate node limit to be exceeded.

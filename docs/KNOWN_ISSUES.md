@@ -5638,13 +5638,15 @@ parsing it as a ZIP. The source file **is** gated by the existing
 resolved and before buffering — but an iWork file is neither video nor text, so
 that gate is the general `FileView.MaxPreviewBytes`, 1 GiB in every shipped
 config and twenty times the 50 MB `MaxIWorkPreviewBytes` that caps only the
-extracted preview. The path is bounded, at a value never chosen for a fully
-buffered producer. D4 must prove the existing gate still precedes admission and
-buffering, and decide whether `raw` can keep one cap for both streaming and
-buffered work; D6 must measure the real per-request peak (buffer capacity,
-in-flight encrypted and decrypted block, extracted preview, ZIP overhead) so
-`max_active_raw` and `MaxPreviewBytes` can be set against a stated memory
-budget.
+extracted preview. The path is bounded, by a general preview limit rather than
+an in-memory budget validated for a fully buffered producer. D4 must prove the
+existing gate still precedes admission and buffering; D6 must measure the real
+per-request peak (buffer capacity, in-flight encrypted and decrypted block,
+extracted preview, ZIP overhead) so `max_active_raw` and `MaxPreviewBytes` can
+be set against a stated memory budget. iWork stays inside the `raw` profile:
+the D0 profile enum, configuration keys, environment variables and metric
+labels are closed sets, so giving the buffered branch its own cap would be a
+contract amendment, not a D4 implementation choice.
 
 Redirects, bootstrap JSON without inline content, OnlyOffice configuration and
 the share-link `dl=1` mint step do not consume a long-lived slot. OnlyOffice's
