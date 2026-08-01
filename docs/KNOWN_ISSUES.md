@@ -19,7 +19,7 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2 and B are closed; check-blocks (C) and download/GET (D) remain untouched. B now has bounded admitted work, bounded waiters, an enforced memory budget, deterministic process tests, corrected RSS/cgroup measurement, and real-client recovery at the shipped 10s wait. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01. |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B and C are closed; download/block GET (D) remains untouched. C (2026-07-31) gives check-blocks its own admission capacity, deduplicated and fan-out-bounded metadata lookups, cancellation that prevents new work and cancels context-aware reads, and the gzip exclusion its admitted lifetime needs. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
@@ -5047,7 +5047,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2 and B are closed**; **C and D remain open**. B now bounds admissions, global/per-user waiters and admitted lifetime, enforces its measured memory budget, and has deterministic process plus shipped-10s real-client evidence. Closing A/B does not close the B4 umbrella.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B and C are closed**; **D remains open**. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5060,14 +5060,14 @@ not identical in scope — B4 covers the full seafhttp abuse surface; X10 focuse
 on authenticated block PUT concurrency / aggregate memory after PR-10's
 per-request body cap.
 
-Current guard state (2026-07-29; the other rows retain the 2026-07-25 verification):
+Current guard state (2026-08-01; the other rows retain their original verification dates):
 
 | Surface | Limiter |
 |---|---|
 | `/seafhttp/upload-api/:token` | After a valid token resolves as link-origin, admission to permission/body/storage work has stable-source rate budgets and non-blocking per-source/per-node in-flight caps; token lookup and arbitrary invalid-token traffic are outside these guards |
 | `/seafhttp/files/:token/*filepath` | **none** |
 | `/seafhttp/repo/:repo_id/block/:block_id` (PUT/GET) | **none** — group carries only `authMiddleware` |
-| `/seafhttp/repo/:repo_id/check-blocks` | **none** |
+| `/seafhttp/repo/:repo_id/check-blocks` | per-(org, user) and per-node admission before the body read, with bounded waiters, an admitted lifetime, and a bounded cancellable metadata fan-out (2026-07-31) |
 | `/seafhttp/zip/:token` | optional `zipRL`, passed in at registration |
 | `/api/v2/blocks/check` | per-IP limiter (`rate.Every(time.Second)`, burst 120 ≈ 60/min sustained) |
 | `/api/v2/blocks/upload` | per-user concurrency limiter (`MaxConcurrentBlockUploadsPerUser`, default 8) |
@@ -5093,7 +5093,7 @@ own fix + regression.
 | **A1** | Anonymous upload **post-token attempt rate** (`HandleUpload` / upload-api) | ✅ **Closed 2026-07-29** | — | Initial guard landed 2026-07-28; stable remint identity and the final fail-closed contract completed A1 on 2026-07-29. Per-(IP, stable link identity) and per-link limiters run after valid token resolution; see "Subcontract A" below |
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
 | **B** | Authenticated block **PUT** concurrency (= registry **X10**) | ✅ **Closed 2026-07-30** | — | A pre-gate global ticket plus per-user/node admissions bound active, transitioning and parked requests before body reads; real-TCP deadlines cover stalled bodies; complete-lifetime memory trials support 24 slots at an 80 MiB design cost; real `seaf-cli` recovered from the shipped 10s wait and `Retry-After: 10` |
-| **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | 🔴 Open | Rate/concurrency on the route **and** a bound on sequential Cassandra work per accepted request | Parser cap alone is not enough — see `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` |
+| **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | ✅ **Closed 2026-07-31** | — | Own admission instance (separate capacity from B) before the body read, deduplicated lookups, configured fan-out and cancellation coverage for both canonical metadata phases, and an admitted lifetime that now reaches the socket. Cancellation stops new dispatch; already-issued Cassandra queries remain bounded by the driver's finite timeout. Id cap is configurable and capped at its inherited 100k; see "Subcontract C" below |
 | **D** | seafhttp **download** / block **GET** abuse control | 🔴 Open | Per-IP or per-token rate/concurrency on read paths | Distinct from write limits; bandwidth exhaustion vector |
 
 #### Subcontract A: stable-link request and concurrency admission (A1/A2 closed 2026-07-29)
@@ -5452,6 +5452,157 @@ served double-gzipped when the client negotiated compression. The configured
 metrics path is now excluded from the engine gzip middleware, leaving
 compression to `promhttp`; a regression test decompresses exactly once and
 requires Prometheus text rather than a second gzip stream.
+
+#### Subcontract C: bounding accepted check-blocks work (2026-07-31)
+
+`maxCheckBlockIDs` bounded the **parse**, and that is all it ever bounded. An
+accepted list still drove one Cassandra point read per legacy SHA-1 id — the
+shape the desktop client actually sends — **sequentially**, through a
+`db.GetBlockIDMapping` that took no `context` at all. So a client that
+disconnected mid-request paid nothing and the server ran the remaining reads to
+completion for nobody. There was no deduplication either: one id repeated to the
+cap cost the same as a list of distinct ids while being far cheaper to send. And
+nothing bounded how many such requests ran at once.
+
+**Four bounds, because the cap was only ever the first one.**
+
+- **Admission before the body read.** `CheckBlocks` acquires from its own
+  `syncAdmissionLimiter` instance before `readLimitedAdmittedRequestBody`, so an
+  over-capacity node refuses at the cost of one parked goroutine rather than
+  buffering 16 MiB and then resolving the list. Cheap rejections — a missing
+  permission — stay ahead of the gate.
+- **A separate instance, deliberately.** The limiter *mechanism* is now shared
+  with subcontract B (gates, waiter accounting, entry ring, single deadline); the
+  *capacity* is not. The two routes exhaust different resources — buffered body
+  memory there, Cassandra and object-store metadata work here — so one storming
+  must not be able to spend the other's admissions. The check-blocks parser and
+  per-request maps also consume memory proportional to the accepted id cap; that
+  memory is bounded by admission and `check_blocks_max_ids`, but has not been
+  assigned a B-style measured byte budget. Two regressions assert both directions;
+  pointing the check-blocks handler at `blockInflight` fails them.
+- **Deduplication.** Ids are deduplicated before any lookup, so cost tracks
+  unique ids. `sync_check_blocks_lookups_total` against
+  `sync_check_blocks_ids_per_request` is what makes that visible;
+  before, the two lists above were indistinguishable in both cost and telemetry.
+- **A bounded, cancellable fan-out.** `check_blocks_lookup_fanout` (8) bounds both
+  metadata phases — the new ctx-aware `GetBlockIDMappingContext` resolution and
+  the canonical existence check, which previously ran at a hardcoded 32 and 10
+  regardless of configuration. Every worker checks the group context before
+  issuing a read, so a disconnect or an expired lifetime stops dispatching new
+  lookups and cancels context-aware reads already in flight. The Cassandra
+  driver's finite query timeout remains the bound for a query already issued.
+
+**The node budget is the product, and validation enforces it as such:**
+
+```
+concurrent metadata lookups from this route
+    <= check_blocks_max_inflight_per_node x check_blocks_lookup_fanout
+     = 8 x 8 = 64          (ceiling 256)
+```
+
+Either factor alone says nothing about that quantity, which is how a "harmless"
+fan-out bump would quietly multiply what one node puts on Cassandra.
+
+**The id cap is now configuration, and was deliberately not lowered.** 100000
+remains the default *and* the validation ceiling: `check_blocks_max_ids` can only
+be lowered. That number is inherited client compatibility, never a measured one —
+a large initial sync posts the block list of one commit, and the desktop client
+does not re-batch after a 413, so lowering it on a guess trades a bounded
+amplification for an unbounded risk of breaking a legitimate sync.
+`sync_check_blocks_ids_per_request` is the instrument that will justify a lower
+value. The fault drill measures it in a client-only phase using a before/after
+delta; its slow holders are excluded from that measurement. It reports the
+observed distribution, including requests above 256 ids, rather than treating a
+small-worktree sample as a client contract.
+
+**The gzip trap from subcontract B was still live on this route.** The admitted
+lifetime is what makes an admission recoverable and what stops the metadata work
+when a client goes away, and it only reaches the socket while nothing in the
+writer chain hides `Unwrap()`. B excluded the block route from `gin-contrib/gzip`
+and left check-blocks inside it, which was harmless while check-blocks had no
+lifetime — and became a **total outage** the moment it got one: with the deadline
+uninstallable, the fail-closed path dropped the connection on *every* request. A
+plain-router unit test cannot see this; the integration suite against the real
+stack caught it on its first run, before merge. The route is now excluded, and a
+real-TCP regression over the shipped middleware fails if the exclusion is removed.
+
+**Closure criteria.**
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | Rate/concurrency on the route | ✅ per-user and per-node admission with bounded waiters and an entry ring; 503 + `Retry-After`, never 429 |
+| 2 | No body is read without a slot | ✅ unit regression asserts a refused request never touches its body |
+| 3 | Per-accepted-request work is bounded | ✅ dedup + configured fan-out on both phases; mutation-verified (removing either fails) |
+| 4 | Cancellation bounds Cassandra work | ✅ ctx-aware mapping read; dispatch stops on cancellation, no new lookups are scheduled, and already-issued queries remain bounded by the driver timeout |
+| 5 | An admission is always recoverable | ✅ admitted lifetime with a connection read deadline, plus the gzip exclusion that lets it reach the socket |
+| 6 | One route cannot spend the other's budget | ✅ separate instances, asserted in both directions at unit and integration level |
+| 7 | The real client recovers under saturation | ✅ `scripts/fault-inject-check-blocks-admission.sh`: saturate, prove refusal from server counters *and* the client log, release, require stable `synchronized`, byte-for-byte payload verification and a zero in-flight gauge |
+
+**Criterion 7 closure.** `scripts/fault-inject-check-blocks-admission.sh` creates
+a disposable organization, owner, and API key for every run, then starts from
+disposable client state and synchronizes an empty watched worktree. Its cleanup
+deletes the library and organization; interrupted leftovers are swept by their
+organization prefix, so drill traffic never consumes the shared dev quota. It
+then holds both node-3 admissions with looping rate-limited bodies. (The holder
+body has to be large: curl rate-limits per transfer buffer, so a payload that
+fits in one buffer is written in a single go and occupies nothing — the first
+attempt failed for exactly that reason.) An independent sentinel pins 503 + positive
+`Retry-After` before the client baseline is taken, so the drill cannot mistake
+its own request for the desktop's. It then requires the server's rejection
+counter **and** the client's own log to show the refusal, and only afterwards
+releases the fault and demands stable `synchronized`, byte-for-byte API downloads
+of every payload, and a zero in-flight gauge. It passed at the squeezed 250ms
+wait and again at the shipped 10-second wait; `seaf-cli` reported the injected
+503 as `error Network error`, which is its retryable classification, and finished
+the sync.
+
+**Real-client cardinality evidence.** The drill first synchronizes a clean
+worktree without holders, snapshots the histogram, and then reports only the
+before/after delta. The later 20k-id holders cannot contaminate that result. This
+is still a small-library sample. The histogram is observed after parsing and
+before ID classification, so it includes malformed traffic that reached the
+parser; it is not by itself a distribution of legitimate client requests and is
+**not** grounds to lower the 100k cap. The compatibility ceiling remains until
+the opt-in large-cardinality probe below is considered alongside production
+traffic.
+
+For the lifetime boundary, run the real Cassandra probe in Docker:
+
+```bash
+docker compose --profile test run --rm --build \
+  -e CHECK_BLOCKS_LARGE_PROBE=1 go-integration-test \
+  go test -tags integration -run '^TestCheckBlocksLargeCardinalityLifetime$' \
+  -v -count=1 -timeout 12m ./internal/integration
+```
+
+That probe sends 100000 unique legacy ids and 100000 unique canonical ids to
+the real node-3 route, exercising the mapping phase separately and then the
+canonical location plus real object-store existence phases. On the merge
+candidate it completed in **57.62s** for legacy mappings and **2m10.30s** for
+canonical location/existence, well below the shipped 5-minute lifetime. The
+canonical metadata rows are temporary and cleaned in bounded batches. These
+results are evidence for the shipped lifetime, not evidence that 100k-id
+existence requests are cheap or that the cap should be lowered.
+
+The fault drill's disposable owner API key is a test-only Cassandra fixture.
+The public self-service key endpoint requires an already authenticated owner,
+while administrative key issuance is intentionally limited to platform users.
+The fixture therefore mirrors `apikeys.Manager.CreateKey` by writing both
+`api_keys` and `api_keys_by_user`, then exchanges the raw key through the real
+`/api2/auth-token/` endpoint. If the production key schema changes, this fixture
+must be updated with it.
+
+The lifetime probe bounds request work and admitted concurrency, but does not
+measure process RSS or cgroup memory under eight concurrent 100k-id requests.
+That remains follow-up evidence for choosing the node cap; it does not reopen
+the C closure criteria.
+
+**What this does not claim.** The accepted cardinality is still a compatibility
+bound rather than a measured one — criterion 3 bounds the *work per id* and the
+*concurrent requests*, not the list length. Process-local, like every other guard
+here: fleet capacity scales with node count. And closing C does not close the
+umbrella; **D (download / block GET) remains open**, so B4 remains a production
+blocker.
 
 #### Fix Direction
 
@@ -6106,7 +6257,7 @@ hot-path readiness.
 
 ### ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01: check-blocks work unbounded after parse
 
-**Status**: 🟡 Open — subcontract C of rate-limit umbrella
+**Status**: ✅ **Fixed 2026-07-31** — closed with subcontract C of the rate-limit umbrella
 **Severity**: Medium
 **Affected**: `SyncHandler.CheckBlocks` / seafhttp check-blocks
 **Source of record**: registry **X11**
@@ -6116,11 +6267,18 @@ hot-path readiness.
 `maxCheckBlockIDs` (100k) bounds the parser, not the ~100k sequential Cassandra
 reads an accepted request can trigger.
 
-#### Fix Direction
+#### Resolution
 
-Bound downstream work (batching, concurrency cap, lower accepted cardinality, or
-cancel-aware paging). Closing this is required to close
-`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` subcontract C.
+The reads are now deduplicated, issued at a configured fan-out rather than
+serially, and cancellable: `db.GetBlockIDMappingContext` replaces the contextless
+read whose loop a client disconnect could not stop. An admission gate bounds how
+many such requests run at once, so the node's exposure is the product
+(`check_blocks_max_inflight_per_node` × `check_blocks_lookup_fanout`) rather than
+unbounded, and an admitted lifetime bounds each one in time. The accepted
+cardinality is now configuration capped at its inherited 100k, with
+`sync_check_blocks_ids_per_request` as the evidence for lowering it later. Full
+detail, closure criteria and what it does not claim are in the "Subcontract C"
+section of `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`.
 
 ---
 

@@ -609,6 +609,75 @@ type SeafHTTPConfig struct {
 	// can finish within the separately required finite DB timeout.
 	SyncBlockAdmittedLifetime time.Duration `yaml:"sync_block_admitted_lifetime"`
 
+	// CheckBlocksMaxIDs bounds how many block ids one
+	// POST /seafhttp/repo/:repo_id/check-blocks may carry. It used to be a
+	// hardcoded 100k chosen as a safe *parse* bound, and that is all it ever was:
+	// the parser stops allocating, while the accepted list still drives one
+	// Cassandra mapping read per legacy SHA-1 id plus one object-store existence
+	// check per unique block (X11 / subcontract C).
+	//
+	// The default keeps the historical value because it is a client-compatibility
+	// bound, not a measured one: a large initial sync posts the block list of one
+	// commit, the desktop client does not re-batch after a 413, and no capture of
+	// real traffic exists yet to justify a lower number.
+	// `sync_check_blocks_ids_per_request` is the instrument that will justify one;
+	// it measures parsed lists, including malformed traffic that reached the parser.
+	//
+	// The validation ceiling is that same 100k, so this knob can only be lowered.
+	// Raising it would re-open the amplification the cap exists to bound.
+	CheckBlocksMaxIDs int `yaml:"check_blocks_max_ids"`
+
+	// CheckBlocksMaxInflightPerNode and CheckBlocksMaxInflightPerUser cap
+	// concurrently admitted check-blocks requests on this process.
+	//
+	// They are deliberately NOT the block-PUT caps and NOT the same limiter
+	// instance. The scarce resource here is metadata work — Cassandra point
+	// reads and object-store existence checks — not buffered body memory, so the
+	// budget is different in kind and in size. Sharing one instance would let a
+	// check-blocks storm consume the slots that bound block-upload memory, and
+	// vice versa.
+	//
+	// The node cap is the term that turns the per-request work bound into an
+	// aggregate one:
+	//
+	//	concurrent metadata lookups from this route
+	//		<= CheckBlocksMaxInflightPerNode x CheckBlocksLookupFanout
+	//
+	// A zero node cap disables the aggregate guard and is only valid when the
+	// per-user cap is also zero. A node cap may be used without a per-user cap,
+	// but a per-user cap alone cannot claim to bound aggregate work.
+	CheckBlocksMaxInflightPerNode int `yaml:"check_blocks_max_inflight_per_node"`
+	CheckBlocksMaxInflightPerUser int `yaml:"check_blocks_max_inflight_per_user"`
+
+	// CheckBlocksMaxWaitersPerUser and CheckBlocksMaxWaitersPerNode bound
+	// requests parked for the gates above, exactly as their block-PUT
+	// counterparts do. Zero permits no waiting.
+	CheckBlocksMaxWaitersPerUser int `yaml:"check_blocks_max_waiters_per_user"`
+	CheckBlocksMaxWaitersPerNode int `yaml:"check_blocks_max_waiters_per_node"`
+
+	// CheckBlocksAdmissionWait is how long a check-blocks request may queue for
+	// an admission before being answered 503 + Retry-After — never 429, for the
+	// same client-contract reason as the block route: this is the same desktop
+	// sync client, which retries 502/503/504 and has no 429 handling.
+	CheckBlocksAdmissionWait time.Duration `yaml:"check_blocks_admission_wait"`
+
+	// CheckBlocksAdmittedLifetime is the processing deadline for the body read,
+	// the id parse and every metadata lookup an admitted request performs. It is
+	// what makes a slot recoverable: without it a large accepted list would hold
+	// its admission for as long as the lookups take, and a client that vanished
+	// mid-request would keep driving Cassandra to completion.
+	CheckBlocksAdmittedLifetime time.Duration `yaml:"check_blocks_admitted_lifetime"`
+
+	// CheckBlocksLookupFanout bounds the per-request concurrency of both metadata
+	// phases: the legacy SHA-1 mapping resolution and the canonical existence
+	// check.
+	//
+	// It is a two-sided knob, which is why it is small. Raising it shortens how
+	// long one request holds its admission, and raises the instantaneous load one
+	// request can put on Cassandra and the object store. Validation therefore
+	// bounds the *product* with the node cap rather than this value alone.
+	CheckBlocksLookupFanout int `yaml:"check_blocks_lookup_fanout"`
+
 	// UploadLinkWritesPerMinute bounds anonymous writes through a public upload
 	// link, keyed on client IP *and* stable public-link source. This is
 	// subcontract A1 of
@@ -717,6 +786,59 @@ const (
 	DefaultSyncBlockMaxWaitersPerNode = 128
 	DefaultSyncBlockAdmittedLifetime  = 5 * time.Minute
 
+	// check-blocks admission and work bounds (subcontract C / X11).
+	//
+	// The node default is a metadata-work budget, not a memory one. Eight
+	// admitted requests at a fan-out of eight is at most 64 concurrent Cassandra
+	// point reads (or object-store existence checks) from this route — a figure
+	// chosen to stay well inside a single node's driver pool while leaving the
+	// rest of it for the request paths users actually wait on. The per-user cap
+	// is the fairness split: one desktop issues check-blocks serially per sync
+	// task, so 4 leaves an honest client unqueued while two identities can still
+	// fill the node.
+	DefaultCheckBlocksMaxInflightPerNode = 8
+	DefaultCheckBlocksMaxInflightPerUser = 4
+	DefaultCheckBlocksMaxWaitersPerUser  = 8
+	DefaultCheckBlocksMaxWaitersPerNode  = 64
+
+	// The wait matches the block route's, and for the same reason: it is long
+	// enough to absorb a burst and short enough that the sync client is still
+	// listening when the 503 arrives. That value was validated against the real
+	// client for subcontract B; reusing it means one number to re-validate, not
+	// two.
+	DefaultCheckBlocksAdmissionWait = 10 * time.Second
+
+	// The lifetime must cover a legitimate worst case, not a typical one: a
+	// 100k-id list at fan-out 8 is ~12.5k sequential rounds of mapping reads plus
+	// the same order of existence checks. 5 minutes covers that with headroom
+	// while still bounding a stalled request to something a slot recovers from.
+	DefaultCheckBlocksAdmittedLifetime = 5 * time.Minute
+
+	DefaultCheckBlocksLookupFanout = 8
+
+	// The historical parse cap, kept as both the default and the ceiling: this
+	// knob exists to be lowered once real traffic is measured, never raised.
+	DefaultCheckBlocksMaxIDs = 100_000
+	MaxCheckBlocksMaxIDs     = 100_000
+
+	MaxCheckBlocksMaxInflightPerNode = 4096
+	MaxCheckBlocksMaxInflightPerUser = 4096
+	MaxCheckBlocksMaxWaitersPerNode  = 65536
+	MaxCheckBlocksMaxWaitersPerUser  = 4096
+	MaxCheckBlocksAdmissionWait      = 2 * time.Minute
+	MaxCheckBlocksAdmittedLifetime   = 30 * time.Minute
+	// Keep this aligned with the canonical reader's actual maximum. A larger
+	// value would be accepted here but silently reduced by the reader, while
+	// the mapping phase would still use the larger value.
+	MaxCheckBlocksLookupFanout = 32
+
+	// MaxCheckBlocksConcurrentLookups is the ceiling on the product
+	// (node cap x fan-out): the real quantity being budgeted is how many metadata
+	// lookups this one route may have outstanding at once. Either factor alone
+	// says nothing about that, which is how a "harmless" fan-out bump would
+	// quietly multiply the node's load on Cassandra.
+	MaxCheckBlocksConcurrentLookups = 256
+
 	// Anonymous upload-link write limits.
 	//
 	// These are starting values, not measured ones, and they are deliberately
@@ -747,6 +869,96 @@ const (
 	MaxUploadLinkMaxInflightPerSource = 4096
 	MaxUploadLinkMaxInflightPerNode   = 65536
 )
+
+// validateCheckBlocksBounds checks the subcontract C knobs.
+//
+// The shape mirrors the sync-block validation deliberately: same bounds and
+// per-user-must-not-exceed-per-node rules, with both caps allowed to be zero as
+// an explicit full disable. Unlike the block route, a per-user-only mode is not
+// valid here because it leaves aggregate metadata work unbounded. The other rule
+// with no counterpart there is the product ceiling, because neither factor
+// states concurrent metadata lookups on its own.
+func (c *Config) validateCheckBlocksBounds() error {
+	if c.SeafHTTP.CheckBlocksMaxIDs <= 0 {
+		return fmt.Errorf("seafhttp.check_blocks_max_ids must be greater than zero (an unbounded id list is the defect this cap exists to prevent)")
+	}
+	if c.SeafHTTP.CheckBlocksMaxIDs > MaxCheckBlocksMaxIDs {
+		return fmt.Errorf("seafhttp.check_blocks_max_ids is %d, above the %d ceiling; this knob exists to be lowered from real traffic, and raising it re-opens the per-request work amplification it bounds",
+			c.SeafHTTP.CheckBlocksMaxIDs, MaxCheckBlocksMaxIDs)
+	}
+	if c.SeafHTTP.CheckBlocksMaxInflightPerNode < 0 {
+		return fmt.Errorf("seafhttp.check_blocks_max_inflight_per_node must be greater than or equal to zero (zero disables the cap)")
+	}
+	if c.SeafHTTP.CheckBlocksMaxInflightPerUser < 0 {
+		return fmt.Errorf("seafhttp.check_blocks_max_inflight_per_user must be greater than or equal to zero (zero disables the cap)")
+	}
+	if c.SeafHTTP.CheckBlocksMaxInflightPerNode > MaxCheckBlocksMaxInflightPerNode {
+		return fmt.Errorf("seafhttp.check_blocks_max_inflight_per_node is %d, above the %d ceiling; this cap is a metadata-work budget, not a throughput setting",
+			c.SeafHTTP.CheckBlocksMaxInflightPerNode, MaxCheckBlocksMaxInflightPerNode)
+	}
+	if c.SeafHTTP.CheckBlocksMaxInflightPerUser > MaxCheckBlocksMaxInflightPerUser {
+		return fmt.Errorf("seafhttp.check_blocks_max_inflight_per_user is %d, above the %d ceiling",
+			c.SeafHTTP.CheckBlocksMaxInflightPerUser, MaxCheckBlocksMaxInflightPerUser)
+	}
+	if c.SeafHTTP.CheckBlocksMaxInflightPerUser > 0 && c.SeafHTTP.CheckBlocksMaxInflightPerNode == 0 {
+		return fmt.Errorf("seafhttp.check_blocks_max_inflight_per_user requires seafhttp.check_blocks_max_inflight_per_node; enable both caps or set both to zero")
+	}
+	if c.SeafHTTP.CheckBlocksMaxInflightPerUser > 0 && c.SeafHTTP.CheckBlocksMaxInflightPerNode > 0 &&
+		c.SeafHTTP.CheckBlocksMaxInflightPerUser > c.SeafHTTP.CheckBlocksMaxInflightPerNode {
+		return fmt.Errorf("seafhttp.check_blocks_max_inflight_per_user must not exceed seafhttp.check_blocks_max_inflight_per_node when both caps are enabled")
+	}
+	if c.SeafHTTP.CheckBlocksMaxWaitersPerNode < 0 {
+		return fmt.Errorf("seafhttp.check_blocks_max_waiters_per_node must be greater than or equal to zero (zero rejects immediately when the node gate is full)")
+	}
+	if c.SeafHTTP.CheckBlocksMaxWaitersPerUser < 0 {
+		return fmt.Errorf("seafhttp.check_blocks_max_waiters_per_user must be greater than or equal to zero (zero rejects immediately when the user gate is full)")
+	}
+	if c.SeafHTTP.CheckBlocksMaxWaitersPerNode > MaxCheckBlocksMaxWaitersPerNode {
+		return fmt.Errorf("seafhttp.check_blocks_max_waiters_per_node is %d, above the %d ceiling", c.SeafHTTP.CheckBlocksMaxWaitersPerNode, MaxCheckBlocksMaxWaitersPerNode)
+	}
+	if c.SeafHTTP.CheckBlocksMaxWaitersPerUser > MaxCheckBlocksMaxWaitersPerUser {
+		return fmt.Errorf("seafhttp.check_blocks_max_waiters_per_user is %d, above the %d ceiling", c.SeafHTTP.CheckBlocksMaxWaitersPerUser, MaxCheckBlocksMaxWaitersPerUser)
+	}
+	if c.SeafHTTP.CheckBlocksMaxInflightPerUser > 0 && c.SeafHTTP.CheckBlocksMaxWaitersPerUser > c.SeafHTTP.CheckBlocksMaxWaitersPerNode {
+		return fmt.Errorf("seafhttp.check_blocks_max_waiters_per_user=%d must not exceed seafhttp.check_blocks_max_waiters_per_node=%d; per-user waiters also reserve node waiter capacity, so the larger value would never bind",
+			c.SeafHTTP.CheckBlocksMaxWaitersPerUser, c.SeafHTTP.CheckBlocksMaxWaitersPerNode)
+	}
+	if c.SeafHTTP.CheckBlocksAdmissionWait < 0 {
+		return fmt.Errorf("seafhttp.check_blocks_admission_wait must be greater than or equal to zero (zero refuses immediately instead of waiting)")
+	}
+	if c.SeafHTTP.CheckBlocksAdmissionWait > MaxCheckBlocksAdmissionWait {
+		return fmt.Errorf("seafhttp.check_blocks_admission_wait is %s, above the %s ceiling; a wait longer than the sync client's own request timeout means the client gives up before the server answers",
+			c.SeafHTTP.CheckBlocksAdmissionWait, MaxCheckBlocksAdmissionWait)
+	}
+	if c.SeafHTTP.CheckBlocksAdmittedLifetime <= 0 {
+		return fmt.Errorf("seafhttp.check_blocks_admitted_lifetime must be greater than zero")
+	}
+	if c.SeafHTTP.CheckBlocksAdmittedLifetime > MaxCheckBlocksAdmittedLifetime {
+		return fmt.Errorf("seafhttp.check_blocks_admitted_lifetime is %s, above the %s ceiling; a larger processing deadline is indistinguishable from disabling the guard in practice",
+			c.SeafHTTP.CheckBlocksAdmittedLifetime, MaxCheckBlocksAdmittedLifetime)
+	}
+	// Same reasoning as the block route: the admitted lifetime installs a
+	// connection read deadline, and an earlier server deadline is preserved
+	// rather than overwritten, so a server timeout above this value would leave
+	// the stricter-looking number never taking effect.
+	if c.Server.ReadTimeout > 0 && c.Server.ReadTimeout > c.SeafHTTP.CheckBlocksAdmittedLifetime {
+		return fmt.Errorf("server.read_timeout=%s must not exceed seafhttp.check_blocks_admitted_lifetime=%s when enabled; the server deadline starts earlier and is preserved rather than overwritten by check-blocks admission",
+			c.Server.ReadTimeout, c.SeafHTTP.CheckBlocksAdmittedLifetime)
+	}
+	if c.SeafHTTP.CheckBlocksLookupFanout <= 0 {
+		return fmt.Errorf("seafhttp.check_blocks_lookup_fanout must be greater than zero (a request must be able to make at least one lookup)")
+	}
+	if c.SeafHTTP.CheckBlocksLookupFanout > MaxCheckBlocksLookupFanout {
+		return fmt.Errorf("seafhttp.check_blocks_lookup_fanout is %d, above the %d ceiling", c.SeafHTTP.CheckBlocksLookupFanout, MaxCheckBlocksLookupFanout)
+	}
+	if c.SeafHTTP.CheckBlocksMaxInflightPerNode > 0 &&
+		c.SeafHTTP.CheckBlocksMaxInflightPerNode*c.SeafHTTP.CheckBlocksLookupFanout > MaxCheckBlocksConcurrentLookups {
+		return fmt.Errorf("seafhttp.check_blocks_max_inflight_per_node=%d x seafhttp.check_blocks_lookup_fanout=%d is %d concurrent metadata lookups, above the %d ceiling; the two multiply, so raising either one alone still raises what this route can put on Cassandra and object storage at once",
+			c.SeafHTTP.CheckBlocksMaxInflightPerNode, c.SeafHTTP.CheckBlocksLookupFanout,
+			c.SeafHTTP.CheckBlocksMaxInflightPerNode*c.SeafHTTP.CheckBlocksLookupFanout, MaxCheckBlocksConcurrentLookups)
+	}
+	return nil
+}
 
 // validateUploadLinkWriteLimit checks one rate/burst pair.
 //
@@ -1170,6 +1382,15 @@ func DefaultConfig() *Config {
 			SyncBlockMaxWaitersPerNode:  DefaultSyncBlockMaxWaitersPerNode,
 			SyncBlockAdmittedLifetime:   DefaultSyncBlockAdmittedLifetime,
 
+			CheckBlocksMaxIDs:             DefaultCheckBlocksMaxIDs,
+			CheckBlocksMaxInflightPerNode: DefaultCheckBlocksMaxInflightPerNode,
+			CheckBlocksMaxInflightPerUser: DefaultCheckBlocksMaxInflightPerUser,
+			CheckBlocksMaxWaitersPerUser:  DefaultCheckBlocksMaxWaitersPerUser,
+			CheckBlocksMaxWaitersPerNode:  DefaultCheckBlocksMaxWaitersPerNode,
+			CheckBlocksAdmissionWait:      DefaultCheckBlocksAdmissionWait,
+			CheckBlocksAdmittedLifetime:   DefaultCheckBlocksAdmittedLifetime,
+			CheckBlocksLookupFanout:       DefaultCheckBlocksLookupFanout,
+
 			UploadLinkWritesPerMinute:       DefaultUploadLinkWritesPerMinute,
 			UploadLinkWriteBurst:            DefaultUploadLinkWriteBurst,
 			UploadLinkSourceWritesPerMinute: DefaultUploadLinkSourceWritesPerMinute,
@@ -1504,12 +1725,36 @@ func (c *Config) applyEnvOverrides() {
 	}
 	for _, override := range []struct {
 		env    string
+		target *time.Duration
+	}{
+		{"SEAFHTTP_CHECK_BLOCKS_ADMISSION_WAIT", &c.SeafHTTP.CheckBlocksAdmissionWait},
+		{"SEAFHTTP_CHECK_BLOCKS_ADMITTED_LIFETIME", &c.SeafHTTP.CheckBlocksAdmittedLifetime},
+	} {
+		v := os.Getenv(override.env)
+		if v == "" {
+			continue
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			c.addEnvOverrideError("%s is invalid: %v", override.env, err)
+			continue
+		}
+		*override.target = d
+	}
+	for _, override := range []struct {
+		env    string
 		target *int
 	}{
 		{"SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_NODE", &c.SeafHTTP.SyncBlockMaxInflightPerNode},
 		{"SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_USER", &c.SeafHTTP.SyncBlockMaxInflightPerUser},
 		{"SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_NODE", &c.SeafHTTP.SyncBlockMaxWaitersPerNode},
 		{"SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_USER", &c.SeafHTTP.SyncBlockMaxWaitersPerUser},
+		{"SEAFHTTP_CHECK_BLOCKS_MAX_IDS", &c.SeafHTTP.CheckBlocksMaxIDs},
+		{"SEAFHTTP_CHECK_BLOCKS_MAX_INFLIGHT_PER_NODE", &c.SeafHTTP.CheckBlocksMaxInflightPerNode},
+		{"SEAFHTTP_CHECK_BLOCKS_MAX_INFLIGHT_PER_USER", &c.SeafHTTP.CheckBlocksMaxInflightPerUser},
+		{"SEAFHTTP_CHECK_BLOCKS_MAX_WAITERS_PER_NODE", &c.SeafHTTP.CheckBlocksMaxWaitersPerNode},
+		{"SEAFHTTP_CHECK_BLOCKS_MAX_WAITERS_PER_USER", &c.SeafHTTP.CheckBlocksMaxWaitersPerUser},
+		{"SEAFHTTP_CHECK_BLOCKS_LOOKUP_FANOUT", &c.SeafHTTP.CheckBlocksLookupFanout},
 		{"SEAFHTTP_UPLOAD_LINK_WRITES_PER_MINUTE", &c.SeafHTTP.UploadLinkWritesPerMinute},
 		{"SEAFHTTP_UPLOAD_LINK_WRITE_BURST", &c.SeafHTTP.UploadLinkWriteBurst},
 		{"SEAFHTTP_UPLOAD_LINK_SOURCE_WRITES_PER_MINUTE", &c.SeafHTTP.UploadLinkSourceWritesPerMinute},
@@ -2072,6 +2317,9 @@ func (c *Config) Validate() error {
 	if c.Server.ReadTimeout > 0 && c.Server.ReadTimeout > c.SeafHTTP.SyncBlockAdmittedLifetime {
 		return fmt.Errorf("server.read_timeout=%s must not exceed seafhttp.sync_block_admitted_lifetime=%s when enabled; the server deadline starts earlier and is preserved rather than overwritten by block admission",
 			c.Server.ReadTimeout, c.SeafHTTP.SyncBlockAdmittedLifetime)
+	}
+	if err := c.validateCheckBlocksBounds(); err != nil {
+		return err
 	}
 	if err := validateUploadLinkWriteLimit(
 		"upload_link_writes_per_minute", "upload_link_write_burst",

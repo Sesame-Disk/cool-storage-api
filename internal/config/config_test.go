@@ -2062,6 +2062,149 @@ func TestShippedConfigsSeafHTTPBoundsAreValid(t *testing.T) {
 			if got := cfg.SeafHTTP.SyncBlockMemoryBudgetBytes; got != DefaultSyncBlockMemoryBudgetBytes {
 				t.Fatalf("sync_block_memory_budget_bytes = %d, want shipped value %d", got, DefaultSyncBlockMemoryBudgetBytes)
 			}
+
+			// The check-blocks bounds are asserted by value for the same reason as
+			// the block caps above: a shipped file that quietly omits them still
+			// boots, and the omission is invisible until this route is the one
+			// being abused.
+			for _, bound := range []struct {
+				key  string
+				got  int
+				want int
+			}{
+				{"check_blocks_max_inflight_per_node", cfg.SeafHTTP.CheckBlocksMaxInflightPerNode, DefaultCheckBlocksMaxInflightPerNode},
+				{"check_blocks_max_inflight_per_user", cfg.SeafHTTP.CheckBlocksMaxInflightPerUser, DefaultCheckBlocksMaxInflightPerUser},
+				{"check_blocks_max_waiters_per_node", cfg.SeafHTTP.CheckBlocksMaxWaitersPerNode, DefaultCheckBlocksMaxWaitersPerNode},
+				{"check_blocks_max_waiters_per_user", cfg.SeafHTTP.CheckBlocksMaxWaitersPerUser, DefaultCheckBlocksMaxWaitersPerUser},
+				{"check_blocks_lookup_fanout", cfg.SeafHTTP.CheckBlocksLookupFanout, DefaultCheckBlocksLookupFanout},
+				{"check_blocks_max_ids", cfg.SeafHTTP.CheckBlocksMaxIDs, DefaultCheckBlocksMaxIDs},
+			} {
+				if bound.got != bound.want {
+					t.Fatalf("%s = %d, want shipped value %d", bound.key, bound.got, bound.want)
+				}
+			}
+			if got := cfg.SeafHTTP.CheckBlocksAdmissionWait; got != DefaultCheckBlocksAdmissionWait {
+				t.Fatalf("check_blocks_admission_wait = %s, want shipped value %s", got, DefaultCheckBlocksAdmissionWait)
+			}
+			if got := cfg.SeafHTTP.CheckBlocksAdmittedLifetime; got != DefaultCheckBlocksAdmittedLifetime {
+				t.Fatalf("check_blocks_admitted_lifetime = %s, want shipped value %s", got, DefaultCheckBlocksAdmittedLifetime)
+			}
+			if err := cfg.validateCheckBlocksBounds(); err != nil {
+				t.Fatalf("this config would refuse to boot: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateCheckBlocksBounds covers the rules that are specific to subcontract
+// C. The product rule is the one worth having: either factor alone looks
+// harmless, and it is their product that decides how much work this route can put
+// on Cassandra and object storage at one moment.
+func TestValidateCheckBlocksBounds(t *testing.T) {
+	tests := []struct {
+		name    string
+		modify  func(*Config)
+		wantErr string
+	}{
+		{
+			name:    "id cap cannot be raised above the ceiling",
+			modify:  func(c *Config) { c.SeafHTTP.CheckBlocksMaxIDs = MaxCheckBlocksMaxIDs + 1 },
+			wantErr: "check_blocks_max_ids",
+		},
+		{
+			name:    "id cap cannot be zero",
+			modify:  func(c *Config) { c.SeafHTTP.CheckBlocksMaxIDs = 0 },
+			wantErr: "check_blocks_max_ids",
+		},
+		{
+			name:    "id cap may be lowered",
+			modify:  func(c *Config) { c.SeafHTTP.CheckBlocksMaxIDs = 1000 },
+			wantErr: "",
+		},
+		{
+			name: "product of node cap and fan-out is bounded",
+			modify: func(c *Config) {
+				c.SeafHTTP.CheckBlocksMaxInflightPerNode = 9
+				c.SeafHTTP.CheckBlocksLookupFanout = MaxCheckBlocksLookupFanout
+			},
+			wantErr: "concurrent metadata lookups",
+		},
+		{
+			name:    "fan-out cannot exceed the reader ceiling",
+			modify:  func(c *Config) { c.SeafHTTP.CheckBlocksLookupFanout = MaxCheckBlocksLookupFanout + 1 },
+			wantErr: "check_blocks_lookup_fanout",
+		},
+		{
+			name: "per-user cap must not exceed per-node cap",
+			modify: func(c *Config) {
+				c.SeafHTTP.CheckBlocksMaxInflightPerUser = 9
+				c.SeafHTTP.CheckBlocksMaxInflightPerNode = 8
+			},
+			wantErr: "check_blocks_max_inflight_per_user",
+		},
+		{
+			name: "per-user waiters must not exceed per-node waiters",
+			modify: func(c *Config) {
+				c.SeafHTTP.CheckBlocksMaxWaitersPerUser = 65
+				c.SeafHTTP.CheckBlocksMaxWaitersPerNode = 64
+			},
+			wantErr: "check_blocks_max_waiters_per_user",
+		},
+		{
+			name: "per-user cap requires a node cap",
+			modify: func(c *Config) {
+				c.SeafHTTP.CheckBlocksMaxInflightPerNode = 0
+				c.SeafHTTP.CheckBlocksMaxInflightPerUser = 1
+			},
+			wantErr: "requires seafhttp.check_blocks_max_inflight_per_node",
+		},
+		{
+			name:    "fan-out must be positive",
+			modify:  func(c *Config) { c.SeafHTTP.CheckBlocksLookupFanout = 0 },
+			wantErr: "check_blocks_lookup_fanout",
+		},
+		{
+			name:    "admission wait has a ceiling",
+			modify:  func(c *Config) { c.SeafHTTP.CheckBlocksAdmissionWait = MaxCheckBlocksAdmissionWait + time.Second },
+			wantErr: "check_blocks_admission_wait",
+		},
+		{
+			name:    "admitted lifetime has a ceiling",
+			modify:  func(c *Config) { c.SeafHTTP.CheckBlocksAdmittedLifetime = MaxCheckBlocksAdmittedLifetime + time.Second },
+			wantErr: "check_blocks_admitted_lifetime",
+		},
+		{
+			name: "server read timeout must not exceed the admitted lifetime",
+			modify: func(c *Config) {
+				c.Server.ReadTimeout = 10 * time.Minute
+				c.SeafHTTP.CheckBlocksAdmittedLifetime = 5 * time.Minute
+			},
+			wantErr: "server.read_timeout",
+		},
+		{
+			name: "caps may be disabled",
+			modify: func(c *Config) {
+				c.SeafHTTP.CheckBlocksMaxInflightPerNode = 0
+				c.SeafHTTP.CheckBlocksMaxInflightPerUser = 0
+			},
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			tt.modify(cfg)
+			err := cfg.validateCheckBlocksBounds()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateCheckBlocksBounds() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateCheckBlocksBounds() = %v, want an error mentioning %q", err, tt.wantErr)
+			}
 		})
 	}
 }

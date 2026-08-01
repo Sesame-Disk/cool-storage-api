@@ -1,0 +1,528 @@
+#!/bin/bash
+#
+# Fault injection for subcontract C (= registry X11) of
+# ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: does the real desktop sync client survive
+# the check-blocks admission gate refusing it?
+#
+# The gate answers 503 + Retry-After — deliberately not 429, which the official
+# client does not treat as retryable. That choice is only worth anything if the
+# client actually recovers, and no unit test can establish it. This drives real
+# seaf-cli against a node whose caps are squeezed to the point where refusal is
+# unavoidable, and checks that:
+#
+#   1. the client really was refused (server counters plus its own log), and
+#   2. the sync still reaches 'synchronized' with verified remote payloads, and
+#   3. no admission is left stranded afterwards.
+#
+# It also performs a clean cardinality measurement before fault injection. The
+# accepted id cap of 100000 is inherited compatibility, never a captured number.
+# The measurement is a before/after delta from a client-only sync phase; the
+# slow holders used later for saturation are deliberately excluded from it.
+#
+# Run it through compose (the service pins the squeezed node and uses disposable
+# client state):
+#
+#   docker compose --profile test run --rm --build check-blocks-admission-fault-test
+#
+# Node 3 ships at 2/2/250ms for this route. Two authenticated slow-body
+# check-blocks requests occupy those slots before the watched worktree is
+# changed, so the test controls the refusal window instead of hoping for one.
+#
+set -uo pipefail
+
+SESAMEFS_URL="${SESAMEFS_URL:-http://sesamefs:8080}"
+SESAMEFS_URL_LOCAL="${SESAMEFS_URL_LOCAL:-${SESAMEFS_URL}}"
+SUPERADMIN_TOKEN="${SUPERADMIN_TOKEN:-dev-token-superadmin}"
+CASSANDRA_HOSTS="${CASSANDRA_HOSTS:-cassandra:9042}"
+CASSANDRA_USERNAME="${CASSANDRA_USERNAME:?set CASSANDRA_USERNAME for the disposable test organization}"
+CASSANDRA_PASSWORD="${CASSANDRA_PASSWORD:?set CASSANDRA_PASSWORD for the disposable test organization}"
+SYNC_CONFIG_DIR="${SYNC_CONFIG_DIR:-/home/seafuser/.ccnet}"
+SYNC_DATA_DIR="${SYNC_DATA_DIR:-/seafile-data}"
+
+# Big enough that the client indexes several blocks and issues a check-blocks
+# request with a non-trivial id list, small enough to finish quickly.
+FILE_COUNT="${FILE_COUNT:-3}"
+FILE_MIB="${FILE_MIB:-8}"
+MEASUREMENT_FILE_COUNT="${MEASUREMENT_FILE_COUNT:-1}"
+MEASUREMENT_FILE_MIB="${MEASUREMENT_FILE_MIB:-1}"
+SYNC_TIMEOUT="${SYNC_TIMEOUT:-240}"
+# One holder request occupies a slot for roughly HOLDER_IDS x 43 bytes at
+# HOLDER_RATE — about 13 seconds at these values — and each holder loops, so the
+# window stays open for as long as the drill needs it.
+HOLDER_RATE="${HOLDER_RATE:-64k}"
+HOLDER_IDS="${HOLDER_IDS:-20000}"
+
+LIBRARY_PREFIX="fault-inject-check-blocks"
+ORG_PREFIX="inttest-fault-check-blocks"
+
+log()  { printf '[fault-inject] %s\n' "$*"; }
+fail() { printf '[fault-inject] FAIL: %s\n' "$*"; exit 1; }
+
+metric() {
+  # $1 = exact metric line prefix. Scrape failures are fatal to the caller;
+  # CounterVec/Histogram series that have never been touched are legitimately
+  # absent and read as zero only after a successful scrape.
+  local body value
+  body=$(curl -fsS -H 'Accept-Encoding: identity' "${SESAMEFS_URL}/metrics" 2>/dev/null) \
+    || return 1
+  value=$(printf '%s\n' "${body}" | awk -v p="$1" 'index($0, p) == 1 { print $2; exit }')
+  printf '%s\n' "${value:-0}"
+}
+
+delete_library() {
+  [ -n "${1:-}" ] || return 0
+  curl -s -o /dev/null -X DELETE "${SESAMEFS_URL_LOCAL}/api/v2.1/repos/${1}/" \
+    -H "Authorization: Token ${DEV_API_TOKEN}"
+}
+
+delete_organization() {
+  [ -n "${1:-}" ] || return 0
+  local status
+  status=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+    "${SESAMEFS_URL_LOCAL}/api/v2.1/admin/organizations/${1}/" \
+    -H "Authorization: Token ${SUPERADMIN_TOKEN}") || return 1
+  case "${status}" in
+    200|202|204|404) return 0 ;;
+    *) log "organization delete ${1} returned HTTP ${status}"; return 1 ;;
+  esac
+}
+
+mint_owner_api_key() {
+  python3 - "${CASSANDRA_HOSTS}" "${CASSANDRA_USERNAME}" "${CASSANDRA_PASSWORD}" "${1}" "${2}" <<'PY'
+import datetime
+import hashlib
+import secrets
+import sys
+import time
+
+from cassandra.auth import PlainTextAuthProvider
+from cassandra.cluster import Cluster
+
+hosts, username, password, org_id, email = sys.argv[1:]
+host, _, port = hosts.split(',', 1)[0].partition(':')
+cluster = Cluster([host], port=int(port or 9042), auth_provider=PlainTextAuthProvider(username, password))
+session = cluster.connect('sesamefs')
+try:
+    # Organization creation and the users_by_email projection are separate
+    # writes. Allow the projection a short bounded window to become visible.
+    deadline = time.time() + 15
+    row = None
+    while time.time() < deadline:
+        row = session.execute('SELECT user_id, org_id FROM users_by_email WHERE email = %s', [email]).one()
+        if row is not None and str(row.org_id) == org_id:
+            break
+        time.sleep(0.25)
+    if row is None or str(row.org_id) != org_id:
+        raise RuntimeError('created owner was not found in the disposable organization')
+    # This test-only fixture mirrors apikeys.Manager.CreateKey: both the primary
+    # row and the reverse user index are required before /api2/auth-token can
+    # exchange the key. Keep these columns aligned with that production method.
+    raw = 'sk_' + secrets.token_hex(32)
+    key_hash = hashlib.sha256(raw.encode()).hexdigest()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    key_prefix = raw[:11] + '...'
+    session.execute(
+        'INSERT INTO api_keys (key_hash, key_prefix, user_id, org_id, label, scope, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)',
+        [key_hash, key_prefix, row.user_id, row.org_id, 'check-blocks-fault', 'read-write', now],
+    )
+    session.execute(
+        'INSERT INTO api_keys_by_user (org_id, user_id, key_hash, key_prefix, label, scope, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)',
+        [row.org_id, row.user_id, key_hash, key_prefix, 'check-blocks-fault', 'read-write', now],
+    )
+    print(raw)
+finally:
+    cluster.shutdown()
+PY
+}
+
+CURRENT_REPO_ID=""
+CURRENT_SYNC_DIR=""
+CURRENT_ORG_ID=""
+HOLDER_PIDS=""
+HOLDER_STOP=/tmp/check-blocks-holders.stop
+stop_holders() {
+  # The stop file ends the loops; the kills end whatever curl is mid-transfer.
+  touch "${HOLDER_STOP}" 2>/dev/null || true
+  for pid in ${HOLDER_PIDS}; do
+    kill "${pid}" >/dev/null 2>&1 || true
+  done
+  for pid in ${HOLDER_PIDS}; do
+    wait "${pid}" >/dev/null 2>&1 || true
+  done
+  pkill -f 'check-blocks-holder.json' >/dev/null 2>&1 || true
+  HOLDER_PIDS=""
+}
+cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  touch "${HOLDER_STOP}" 2>/dev/null || true
+  for pid in ${HOLDER_PIDS}; do
+    kill "${pid}" >/dev/null 2>&1 || true
+  done
+  for pid in ${HOLDER_PIDS}; do
+    wait "${pid}" >/dev/null 2>&1 || true
+  done
+  if [ -n "${CURRENT_SYNC_DIR}" ]; then
+    seaf-cli desync -c "${SYNC_CONFIG_DIR}" -d "${CURRENT_SYNC_DIR}" >/dev/null 2>&1
+  fi
+  seaf-cli stop -c "${SYNC_CONFIG_DIR}" >/dev/null 2>&1 || true
+  if [ "${status}" -ne 0 ] && [ -f "${SYNC_CONFIG_DIR}/logs/seafile.log" ]; then
+    log "last seafile.log lines:"
+    tail -80 "${SYNC_CONFIG_DIR}/logs/seafile.log" 2>/dev/null || true
+  fi
+  delete_library "${CURRENT_REPO_ID}"
+  if ! delete_organization "${CURRENT_ORG_ID}"; then
+    log "cleanup: could not delete organization ${CURRENT_ORG_ID}"
+    [ "${status}" -ne 0 ] || status=1
+  fi
+  rm -rf "${CURRENT_SYNC_DIR}" "${SYNC_CONFIG_DIR}" "${SYNC_DATA_DIR}/seafile-data" >/dev/null 2>&1
+  exit "${status}"
+}
+trap cleanup EXIT INT TERM
+
+# Sweep anything a previous interrupted run left behind, so the library quota is
+# free. Without it the next run fails to create a library and the failure
+# surfaces as a bogus "the client was never refused".
+sweep_previous_runs() {
+  local organizations_json stale_orgs
+  log "sweeping organizations left by previous runs"
+  organizations_json=$(curl -fsS "${SESAMEFS_URL_LOCAL}/api/v2.1/admin/organizations/?per_page=1000" \
+    -H "Authorization: Token ${SUPERADMIN_TOKEN}" \
+    ) || fail "could not list organizations for stale-run cleanup"
+  printf '%s\n' "${organizations_json}" \
+    | jq -e '(.organizations | type) == "array"' >/dev/null \
+    || fail "organization list response was not a valid organizations array"
+  stale_orgs=$(printf '%s\n' "${organizations_json}" \
+    | jq -r --arg prefix "${ORG_PREFIX}" '.organizations[]? | select((.org_name // .name // "") | startswith($prefix)) | .org_id') \
+    || fail "could not parse stale organizations"
+  while read -r stale_org; do
+    [ -n "${stale_org}" ] || continue
+    log "  deleting stale organization ${stale_org}"
+    delete_organization "${stale_org}" \
+      || fail "could not delete stale organization ${stale_org}"
+  done <<< "${stale_orgs}"
+}
+
+log "target ${SESAMEFS_URL}"
+sweep_previous_runs
+
+rm -rf "${SYNC_CONFIG_DIR}" "${SYNC_DATA_DIR:?}/"*
+mkdir -p "${SYNC_DATA_DIR}" || fail "could not create ${SYNC_DATA_DIR}"
+log "initialising seafile client config at ${SYNC_CONFIG_DIR}"
+seaf-cli init -c "${SYNC_CONFIG_DIR}" -d "${SYNC_DATA_DIR}" \
+  >/tmp/seaf-cli-init.log 2>&1 \
+  || fail "seaf-cli init failed: $(cat /tmp/seaf-cli-init.log)"
+[ -s "${SYNC_CONFIG_DIR}/seafile.ini" ] \
+  || fail "seaf-cli init did not create seafile.ini"
+
+stamp="$(date +%s)-$$"
+owner_email="${ORG_PREFIX}-${stamp}@sesamefs.local"
+create_org_response=$(curl -s -X POST "${SESAMEFS_URL_LOCAL}/api/v2.1/admin/organizations/" \
+  -H "Authorization: Token ${SUPERADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\":\"${ORG_PREFIX}-${stamp}\",\"owner_email\":\"${owner_email}\",\"storage_quota\":1099511627776}")
+CURRENT_ORG_ID=$(printf '%s' "${create_org_response}" | jq -r '.org_id // empty')
+
+# Check the shape, not just non-emptiness: a failed create returns a JSON error
+# body that a bare -n test would accept as an id.
+case "${CURRENT_ORG_ID}" in
+  ????????-????-????-????-????????????) ;;
+  *) fail "could not create disposable organization: ${create_org_response}" ;;
+esac
+log "organization ${CURRENT_ORG_ID}"
+
+DEV_API_TOKEN="$(mint_owner_api_key "${CURRENT_ORG_ID}" "${owner_email}")" \
+  || fail "could not mint disposable owner API key"
+[ -n "${DEV_API_TOKEN}" ] || fail "disposable owner API key was empty"
+DEV_USER="${owner_email}"
+DEV_PASSWORD="${DEV_API_TOKEN}"
+SYNC_TOKEN=$(curl -fsS -X POST "${SESAMEFS_URL_LOCAL}/api2/auth-token/" \
+  -d "username=${DEV_USER}" \
+  -d "password=${DEV_PASSWORD}" | jq -r '.token // empty') \
+  || fail "could not exchange disposable owner API key for a sync token"
+[ -n "${SYNC_TOKEN}" ] || fail "disposable owner API key exchange returned an empty sync token"
+
+repo_name="${LIBRARY_PREFIX}-${stamp}"
+create_response=$(curl -s -X POST "${SESAMEFS_URL_LOCAL}/api/v2.1/repos/" \
+  -H "Authorization: Token ${DEV_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\":\"${repo_name}\"}")
+repo_id=$(printf '%s' "${create_response}" | jq -r '.repo_id // empty')
+case "${repo_id}" in
+  ????????-????-????-????-????????????) ;;
+  *) fail "could not create library: ${create_response}" ;;
+esac
+CURRENT_REPO_ID="${repo_id}"
+log "library ${repo_id}"
+
+sync_dir="${SYNC_DATA_DIR}/${repo_name}"
+CURRENT_SYNC_DIR="${sync_dir}"
+mkdir -p "${sync_dir}" || fail "could not create ${sync_dir}"
+
+seaf-cli start -c "${SYNC_CONFIG_DIR}" >/dev/null 2>&1
+daemon_up=0
+waited=0
+while [ "${waited}" -lt 60 ]; do
+  if seaf-cli status -c "${SYNC_CONFIG_DIR}" >/dev/null 2>&1; then
+    daemon_up=1
+    break
+  fi
+  sleep 2
+  waited=$((waited + 2))
+done
+[ "${daemon_up}" -eq 1 ] || fail "seafile daemon did not come up within 60s"
+
+sync_state() {
+  seaf-cli status -c "${SYNC_CONFIG_DIR}" 2>/dev/null \
+    | awk -v name="${repo_name}" '$1 == name {$1=""; sub(/^[[:space:]]+/, ""); print; exit}'
+}
+
+log "syncing"
+seaf-cli sync -c "${SYNC_CONFIG_DIR}" -l "${repo_id}" -s "${SESAMEFS_URL}" \
+  -d "${sync_dir}" -u "${DEV_USER}" -p "${DEV_PASSWORD}" \
+  || fail "seaf-cli sync command rejected"
+
+registered=0
+waited=0
+while [ "${waited}" -lt 60 ]; do
+  [ -n "$(sync_state)" ] && { registered=1; break; }
+  sleep 2
+  waited=$((waited + 2))
+done
+[ "${registered}" -eq 1 ] || fail "seaf-cli accepted the sync but never registered it; nothing would have been uploaded"
+
+log "waiting for the empty worktree to synchronize"
+stable=0
+waited=0
+state=""
+while [ "${waited}" -lt 90 ]; do
+  state=$(sync_state)
+  case "${state}" in
+    synchronized)
+      stable=$((stable + 1))
+      [ "${stable}" -ge 3 ] && break
+      ;;
+    *error*) fail "client reported initial sync state '${state}'" ;;
+    *) stable=0 ;;
+  esac
+  sleep 2
+  waited=$((waited + 2))
+done
+[ "${stable}" -ge 3 ] || fail "empty worktree did not reach stable synchronized state (last '${state}')"
+
+inflight=$(metric 'sync_check_blocks_inflight_current') || fail "could not read initial in-flight metric"
+[ "$(awk -v v="${inflight}" 'BEGIN{print (v == 0) ? 1 : 0}')" -eq 1 ] \
+  || fail "fixture is not idle before saturation: inflight=${inflight}"
+
+# Measure the real client without holders. The histogram is process-global, so
+# only the before/after delta is evidence for this client; absolute values would
+# include previous integration traffic.
+cardinality_before_count=$(metric 'sync_check_blocks_ids_per_request_count') || fail "could not read cardinality baseline count"
+cardinality_before_sum=$(metric 'sync_check_blocks_ids_per_request_sum') || fail "could not read cardinality baseline sum"
+cardinality_before_256=$(metric 'sync_check_blocks_ids_per_request_bucket{le="256"}') || fail "could not read cardinality baseline bucket"
+
+log "measuring clean client check-blocks cardinality (${MEASUREMENT_FILE_COUNT} x ${MEASUREMENT_FILE_MIB} MiB)"
+i=0
+while [ "${i}" -lt "${MEASUREMENT_FILE_COUNT}" ]; do
+  dd if=/dev/urandom of="${sync_dir}/measurement-${i}.bin" bs=1M count="${MEASUREMENT_FILE_MIB}" 2>/dev/null \
+    || fail "could not create measurement payload ${i}"
+  i=$((i + 1))
+done
+
+stable=0
+cardinality_seen=0
+waited=0
+while [ "${waited}" -lt 120 ]; do
+  cardinality_current_count=$(metric 'sync_check_blocks_ids_per_request_count') || fail "could not observe cardinality during clean sync"
+  cardinality_current_delta=$(awk -v a="${cardinality_current_count}" -v b="${cardinality_before_count}" 'BEGIN{print a-b}')
+  if [ "$(awk -v v="${cardinality_current_delta}" 'BEGIN{print (v > 0) ? 1 : 0}')" -eq 1 ]; then
+    cardinality_seen=1
+  fi
+  state=$(sync_state)
+  case "${state}" in
+    synchronized)
+      if [ "${cardinality_seen}" -eq 1 ]; then
+        stable=$((stable + 1))
+        [ "${stable}" -ge 3 ] && break
+      fi
+      ;;
+    "error Network error") stable=0 ;;
+    *error*) fail "client reported measurement sync state '${state}'" ;;
+    *) stable=0 ;;
+  esac
+  sleep 2
+  waited=$((waited + 2))
+done
+[ "${cardinality_seen}" -eq 1 ] || fail "clean client produced no check-blocks cardinality observations within 120s"
+[ "${stable}" -ge 3 ] || fail "clean cardinality sync did not stabilize after check-blocks observation (last '${state}')"
+
+cardinality_after_count=$(metric 'sync_check_blocks_ids_per_request_count') || fail "could not read cardinality result count"
+cardinality_after_sum=$(metric 'sync_check_blocks_ids_per_request_sum') || fail "could not read cardinality result sum"
+cardinality_after_256=$(metric 'sync_check_blocks_ids_per_request_bucket{le="256"}') || fail "could not read cardinality result bucket"
+cardinality_delta_count=$(awk -v a="${cardinality_after_count}" -v b="${cardinality_before_count}" 'BEGIN{print a-b}')
+cardinality_delta_sum=$(awk -v a="${cardinality_after_sum}" -v b="${cardinality_before_sum}" 'BEGIN{print a-b}')
+cardinality_delta_256=$(awk -v a="${cardinality_after_256}" -v b="${cardinality_before_256}" 'BEGIN{print a-b}')
+cardinality_delta_over_256=$(awk -v n="${cardinality_delta_count}" -v l="${cardinality_delta_256}" 'BEGIN{print n-l}')
+log "clean client cardinality delta: count=${cardinality_delta_count}, sum=${cardinality_delta_sum}, <=256=${cardinality_delta_256}, >256=${cardinality_delta_over_256}"
+
+# Hold both node-3 check-blocks admissions open with slow bodies. An admitted
+# request spends its slot in the body read before any lookup, so a rate-limited
+# upload of a valid id list occupies a slot for as long as it takes to arrive.
+#
+# The body has to be large: curl's rate limiting works on its transfer buffer, so
+# a payload that fits in one buffer is written in a single go and --limit-rate
+# never bites. HOLDER_IDS x ~43 bytes at HOLDER_RATE is the occupancy per
+# request, and each holder loops so the slot is not released between requests.
+holder_body=/tmp/check-blocks-holder.json
+awk -v n="${HOLDER_IDS}" 'BEGIN{
+  printf "[";
+  for (i = 0; i < n; i++) { if (i) printf ","; printf "\"%040x\"", i }
+  printf "]"
+}' >"${holder_body}" || fail "could not build holder body"
+
+rm -f "${HOLDER_STOP}"
+log "occupying both check-blocks admissions"
+for n in 1 2; do
+  (
+    while [ ! -f "${HOLDER_STOP}" ]; do
+      curl -sS -o /dev/null -X POST \
+        "${SESAMEFS_URL}/seafhttp/repo/${repo_id}/check-blocks" \
+        -H "Authorization: Token ${SYNC_TOKEN}" \
+        -H "Content-Type: application/json" \
+        --limit-rate "${HOLDER_RATE}" --data-binary "@${holder_body}" >/dev/null 2>&1
+    done
+  ) &
+  HOLDER_PIDS="${HOLDER_PIDS} $!"
+done
+
+waited=0
+while [ "${waited}" -lt 30 ]; do
+  inflight=$(metric 'sync_check_blocks_inflight_current') || fail "could not read in-flight metric while saturating"
+  [ "$(awk -v v="${inflight}" 'BEGIN{print (v == 2) ? 1 : 0}')" -eq 1 ] && break
+  sleep 1
+  waited=$((waited + 1))
+done
+[ "$(awk -v v="${inflight}" 'BEGIN{print (v == 2) ? 1 : 0}')" -eq 1 ] \
+  || fail "could not deterministically occupy both admissions (inflight=${inflight}); the holder bodies may be finishing faster than the poll — raise HOLDER_IDS or lower HOLDER_RATE"
+
+# Pin the HTTP response contract independently, before taking the client
+# baseline, so this sentinel cannot be mistaken for desktop activity.
+sentinel_status=$(curl -sS -D /tmp/check-blocks-sentinel.headers \
+  -o /tmp/check-blocks-sentinel.out -w '%{http_code}' -X POST \
+  "${SESAMEFS_URL}/seafhttp/repo/${repo_id}/check-blocks" \
+  -H "Authorization: Token ${SYNC_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data-binary '[]')
+retry_after=$(awk 'tolower($1) == "retry-after:" {gsub(/\r/, "", $2); print $2; exit}' /tmp/check-blocks-sentinel.headers)
+[ "${sentinel_status}" = "503" ] || fail "saturated sentinel returned ${sentinel_status}, want 503"
+case "${retry_after}" in
+  ''|*[!0-9]*|0) fail "saturated 503 has invalid Retry-After '${retry_after}'" ;;
+esac
+log "saturated sentinel returned 503 with Retry-After=${retry_after}"
+
+refused_before=$(metric 'sync_check_blocks_admission_rejected_total{reason="user"}') || fail "could not read user rejection baseline"
+node_refused_before=$(metric 'sync_check_blocks_admission_rejected_total{reason="node"}') || fail "could not read node rejection baseline"
+
+log "generating ${FILE_COUNT} x ${FILE_MIB} MiB in the watched worktree for fault recovery"
+i=0
+while [ "${i}" -lt "${FILE_COUNT}" ]; do
+  dd if=/dev/urandom of="${sync_dir}/fault-payload-${i}.bin" bs=1M count="${FILE_MIB}" 2>/dev/null \
+    || fail "could not create payload ${i}"
+  i=$((i + 1))
+done
+
+# Do not release the holders until the server proves the real client reached the
+# saturated route. No other request is issued after the baseline above.
+waited=0
+total_refused=0
+client_503_seen=0
+while [ "${waited}" -lt 120 ]; do
+  refused_after=$(metric 'sync_check_blocks_admission_rejected_total{reason="user"}') || fail "could not read user rejection counter"
+  node_refused_after=$(metric 'sync_check_blocks_admission_rejected_total{reason="node"}') || fail "could not read node rejection counter"
+  refused_delta=$(awk -v a="${refused_after}" -v b="${refused_before}" 'BEGIN{print a-b}')
+  node_delta=$(awk -v a="${node_refused_after}" -v b="${node_refused_before}" 'BEGIN{print a+0-b}')
+  total_refused=$(awk -v a="${refused_delta}" -v b="${node_delta}" 'BEGIN{print a+b}')
+  if grep -F "${repo_id}/check-blocks" "${SYNC_CONFIG_DIR}/logs/seafile.log" 2>/dev/null | grep -qF '503'; then
+    client_503_seen=1
+  fi
+  if [ "${client_503_seen}" -eq 1 ] \
+      && [ "$(awk -v v="${total_refused}" 'BEGIN{print (v > 0) ? 1 : 0}')" -eq 1 ]; then
+    break
+  fi
+  case "$(sync_state)" in
+    "error Network error") ;;
+    *error*) fail "client reported an error before reaching the saturated check-blocks route" ;;
+  esac
+  sleep 2
+  waited=$((waited + 2))
+done
+[ "$(awk -v v="${total_refused}" 'BEGIN{print (v > 0) ? 1 : 0}')" -eq 1 ] \
+  || fail "server rejection counter did not move for the client's check-blocks request"
+[ "${client_503_seen}" -eq 1 ] \
+  || fail "seaf-cli log contains no 503 for this repository's check-blocks request"
+log "real client was refused: user=${refused_delta} node=${node_delta}"
+
+stop_holders
+log "released fault; waiting for client retry and recovery"
+
+stable=0
+state=""
+waited=0
+while [ "${waited}" -lt "${SYNC_TIMEOUT}" ]; do
+  state=$(sync_state)
+  case "${state}" in
+    synchronized)
+      stable=$((stable + 1))
+      [ "${stable}" -ge 3 ] && break
+      ;;
+    "error Network error")
+      # The client's transient classification for the injected 503. It stays
+      # visible until its network-error retry timer starts the next task.
+      stable=0
+      ;;
+    *error*) fail "client reported sync state '${state}' after fault release" ;;
+    *) stable=0 ;;
+  esac
+  sleep 3
+  waited=$((waited + 3))
+done
+[ "${stable}" -ge 3 ] || fail "sync did not recover within ${SYNC_TIMEOUT}s (last '${state}')"
+
+# A synchronized status alone can precede publication. Download every fault
+# payload and compare bytes to prove the retried work became committed remotely.
+i=0
+while [ "${i}" -lt "${FILE_COUNT}" ]; do
+  local_file="${sync_dir}/fault-payload-${i}.bin"
+  downloaded="/tmp/fault-payload-${i}.downloaded"
+  verified=0
+  attempts=0
+  while [ "${attempts}" -lt 20 ]; do
+    download_link=$(curl -sS "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/file/?p=/fault-payload-${i}.bin" \
+      -H "Authorization: Token ${DEV_API_TOKEN}" | tr -d '"')
+    if [ -n "${download_link}" ] && [ "${download_link}" != "null" ]; then
+      if curl -sS "${download_link}" -H "Authorization: Token ${DEV_API_TOKEN}" -o "${downloaded}" \
+        && cmp -s "${local_file}" "${downloaded}"; then
+        verified=1
+        break
+      fi
+    fi
+    sleep 2
+    attempts=$((attempts + 1))
+  done
+  [ "${verified}" -eq 1 ] || fail "remote fault-payload-${i}.bin is missing or differs"
+  i=$((i + 1))
+done
+
+# A stranded admission would quietly cost the node capacity after every spike.
+waited=0
+while [ "${waited}" -lt 60 ]; do
+  inflight=$(metric 'sync_check_blocks_inflight_current') || fail "could not read final in-flight metric"
+  [ "$(awk -v v="${inflight}" 'BEGIN{print (v == 0) ? 1 : 0}')" -eq 1 ] && break
+  sleep 1
+  waited=$((waited + 1))
+done
+if [ "$(awk -v v="${inflight}" 'BEGIN{print (v == 0) ? 1 : 0}')" -ne 1 ]; then
+  fail "sync_check_blocks_inflight_current is ${inflight} after the run; admissions leaked"
+fi
+
+log "PASS: clean cardinality delta was isolated from holders; real client absorbed ${total_refused} capacity 503(s), retried, published verified payloads, and drained all slots"

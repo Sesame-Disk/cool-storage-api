@@ -63,7 +63,7 @@ the open single-node blocker**, and multi-instance adds B1 and B5. See
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29; B closed 2026-07-30** with a pre-gate global ticket, real-TCP admitted deadline, full-lifetime 80 MiB design cost at 24 slots, deterministic gate/cardinality tests, and real-client recovery at the shipped 10s wait. **C/D remain open.** | Readiness B4 ⊇ registry X10 — **still the single-node blocker until C/D close** |
+| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29; B closed 2026-07-30; C closed 2026-07-31** — check-blocks now has its own admission capacity, deduplicated and fan-out-bounded metadata lookups, cancellation that prevents new work and cancels context-aware reads, and the gzip exclusion its admitted lifetime needs. **D (download / block GET) remains open.** | Readiness B4 ⊇ registry X10/X11 — **still the single-node blocker until D closes** |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
 

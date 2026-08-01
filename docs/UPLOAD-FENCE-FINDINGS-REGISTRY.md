@@ -182,6 +182,42 @@ The implementation audit's lifetime, waiter, unsafe configuration-combination,
 timing-dependent integration and memory-proof findings are resolved. Full detail
 is under subcontract B in `docs/KNOWN_ISSUES.md`.
 
+### Dated note — X11, 2026-07-31
+
+The work an accepted `check-blocks` request triggers is now bounded; X11 is
+**closed**.
+
+The row above is right that the 100k cap is a parse bound. Two things it did not
+name turned out to matter as much as the fan-out: the mapping read took no
+`context` at all, so a client disconnect could not stop the loop, and identical
+ids were resolved once per occurrence rather than once. So the cheapest possible
+request — one id repeated, then abandoned — was also among the most expensive to
+serve.
+
+The route now takes an admission from its **own** limiter instance (separate
+capacity from X10's; one storming must not spend the other's slots) before the
+body is read, deduplicates ids before any lookup, resolves them through the new
+`db.GetBlockIDMappingContext` at a configured fan-out that also replaces the
+hardcoded 32/10 of the existence phase, and holds an admitted lifetime. The
+node's exposure is the stated product `check_blocks_max_inflight_per_node ×
+check_blocks_lookup_fanout` (8 × 8, ceiling 256), enforced at boot. The
+validated fan-out ceiling is 32, matching the canonical reader's actual maximum.
+Cancellation stops dispatching new work; a query already issued remains bounded
+by the driver's finite timeout.
+
+The accepted cardinality was deliberately **not** lowered: 100k stays the default
+and becomes the validation ceiling, so `check_blocks_max_ids` can only be
+lowered, and `sync_check_blocks_ids_per_request` was added as the evidence a
+future reduction needs. Lowering it on a guess would trade a bounded amplification
+for an unbounded risk of 413-ing a legitimate initial sync.
+
+X10's gzip finding was still live here: the route was not in the exclusion list,
+so this route's new admitted lifetime could not reach the socket and the
+fail-closed path dropped every request. The integration suite against the real
+stack caught it before merge; the route is excluded and a real-TCP regression over
+the shipped middleware covers it. Full detail is under subcontract C in
+`docs/KNOWN_ISSUES.md`.
+
 
 ## X1 design space — closing the physical-delete ABA
 

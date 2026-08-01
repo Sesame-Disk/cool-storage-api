@@ -480,7 +480,7 @@ func TestCheckBlocksUsesCanonicalCheckReader(t *testing.T) {
 	old := syncNewCanonicalBlockCheckReaderFn
 	t.Cleanup(func() { syncNewCanonicalBlockCheckReaderFn = old })
 	calls := 0
-	syncNewCanonicalBlockCheckReaderFn = func(_ context.Context, _ *db.DB, _ *storage.Manager, _ string, blockIDs []string, _ *storage.BlockStore, _ string) (streaming.CanonicalBlockReader, error) {
+	syncNewCanonicalBlockCheckReaderFn = func(_ context.Context, _ *db.DB, _ *storage.Manager, _ string, blockIDs []string, _ *storage.BlockStore, _ string, _ int) (streaming.CanonicalBlockReader, error) {
 		calls++
 		if len(blockIDs) != 2 || blockIDs[0] != presentID || blockIDs[1] != missingID {
 			t.Fatalf("canonical check ids = %v", blockIDs)
@@ -507,7 +507,7 @@ func TestCheckBlocksCanonicalResolutionFailureFailsClosed(t *testing.T) {
 	blockID := strings.Repeat("e", 64)
 	old := syncNewCanonicalBlockCheckReaderFn
 	t.Cleanup(func() { syncNewCanonicalBlockCheckReaderFn = old })
-	syncNewCanonicalBlockCheckReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
+	syncNewCanonicalBlockCheckReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string, int) (streaming.CanonicalBlockReader, error) {
 		return nil, errors.New("canonical storage class unavailable")
 	}
 

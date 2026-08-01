@@ -64,6 +64,19 @@ func gzipExcludedPathsRegexs(metricsPath string) []string {
 		// fallback that cannot interrupt a parked read. A client sending
 		// Accept-Encoding: gzip could then hold an admission open indefinitely.
 		"/seafhttp/repo/.*/block/.*",
+		// check-blocks, for the same reason (subcontract C / X11). Its admitted
+		// lifetime is what makes an admission recoverable and what stops the
+		// metadata work when a client goes away, and that only holds if the
+		// deadline reaches the socket. With the route inside gzip it cannot, and
+		// the fail-closed path answers every request by dropping the connection —
+		// which is how an integration test against the real stack caught this, and
+		// a unit test against a plain router never could.
+		//
+		// The response is a JSON array of ids that would compress well, so this
+		// exclusion does cost something. It is still the right trade: an
+		// unbounded, uncancellable admission is a availability defect, and a
+		// compressed response is a bandwidth optimisation.
+		"/seafhttp/repo/.*/check-blocks.*",
 		"/seafhttp/files/.*",     // file downloads
 		"/seafhttp/zip/.*",       // zip downloads
 		"/seafhttp/upload/.*",    // file uploads

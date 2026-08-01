@@ -113,6 +113,15 @@ which leaks information about stored content.
 
 **Tested:** The 10k limit is tested. Rate limiting is not.
 
+**Dated note (2026-07-31):** this item is about the **web v2** route
+(`/api/v2/blocks/check`), which does carry a per-IP limiter — see the guard table
+in `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`. The *sync* route
+(`/seafhttp/repo/:repo_id/check-blocks`) is a different handler and was the one
+with no guard at all; it was closed as subcontract C on 2026-07-31 with
+admission, deduplication, a bounded cancellable lookup fan-out and an admitted
+lifetime. The existence-oracle framing above is not what C closes: C bounds
+resource consumption, not what a caller can learn from an answer.
+
 ---
 
 ### LOW: Adaptive chunking speed probe not tested in real network

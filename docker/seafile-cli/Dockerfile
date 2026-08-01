@@ -5,15 +5,12 @@
 FROM debian:bullseye-slim
 
 ARG SEAFILE_CLI_VERSION=v9.0.18
+ARG INSTALL_CASSANDRA_CLIENT=false
 
 # Install dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    jq \
-    sqlite3 \
-    ca-certificates \
-    procps \
-    lsb-release \
+RUN packages="curl jq sqlite3 ca-certificates procps lsb-release" \
+    && if [ "${INSTALL_CASSANDRA_CLIENT}" = "true" ]; then packages="${packages} python3 python3-cassandra"; fi \
+    && apt-get update && apt-get install -y --no-install-recommends ${packages} \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the upstream Seafile CLI AppImage from GitHub releases.

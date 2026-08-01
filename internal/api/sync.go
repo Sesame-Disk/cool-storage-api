@@ -34,6 +34,8 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/aws/smithy-go"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 )
 
@@ -101,6 +103,14 @@ type SyncHandler struct {
 	// once, per user and across this process. Nil when disabled by configuration,
 	// in which case sync_block_max_bytes is again only a per-request bound.
 	blockInflight *syncBlockInflightLimiter
+
+	// checkBlocksInflight bounds how many check-blocks requests may be resolving
+	// metadata at once, per user and across this process (subcontract C / X11).
+	// It is a separate instance from blockInflight, with its own capacity: the
+	// two routes exhaust different resources, and one storming must not spend the
+	// other's budget. Nil when disabled by configuration, in which case
+	// check_blocks_max_ids is again only a per-request bound.
+	checkBlocksInflight *syncAdmissionLimiter
 }
 
 // NewSyncHandler creates a new sync protocol handler
@@ -114,6 +124,7 @@ func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, storageManager *s
 		finalizedBlockDeltas:   newSyncFinalizedDeltaSet(),
 		blockRepresentationIDs: newSyncBlockRepresentationIDCache(),
 		blockInflight:          newSyncBlockInflightLimiter(cfg),
+		checkBlocksInflight:    newCheckBlocksInflightLimiter(cfg),
 	}
 }
 
@@ -391,7 +402,15 @@ var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresent
 var registerUploadedBlockAndMappingForSyncFn = v2.RegisterUploadedBlockAndMapping
 var syncRetryUploadedBlockMaterializationFn = v2.RetryUploadedBlockMaterializationContext
 var syncNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
-var syncNewCanonicalBlockCheckReaderFn = streaming.NewCanonicalBlockCheckReader
+var syncNewCanonicalBlockCheckReaderFn = streaming.NewCanonicalBlockCheckReaderWithFanout
+
+// syncGetBlockIDMappingFn is the legacy SHA-1 -> internal SHA-256 resolution
+// used by check-blocks. It is a variable both for testing and because the
+// context argument is the point: bulk resolution must be abandonable, and the
+// contextless db.GetBlockIDMapping cannot be.
+var syncGetBlockIDMappingFn = func(ctx context.Context, database *db.DB, orgID, representationID, externalID string) (string, bool, error) {
+	return database.GetBlockIDMappingContext(ctx, orgID, representationID, externalID)
+}
 var syncTouchBlockLastAccessFn = func(database *db.DB, orgID, blockID string, accessedAt time.Time) {
 	_ = database.Session().Query(`
 		UPDATE blocks SET last_accessed = ? WHERE org_id = ? AND block_id = ?
@@ -1286,8 +1305,31 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 // from it; the block cap is now configuration, see syncBlockMaxBytes below.
 const (
 	maxCheckBlocksBodyBytes = 16 * 1024 * 1024 // 16 MiB
-	maxCheckBlockIDs        = 100_000
 )
+
+// checkBlocksMaxIDs resolves the accepted id-count cap.
+//
+// The nil-config fallback is the package default rather than "unlimited", for
+// the same reason as syncBlockMaxBytes: a handler without config is a wiring
+// bug, and failing open here would restore the unbounded list the cap exists to
+// prevent.
+func (h *SyncHandler) checkBlocksMaxIDs() int {
+	if h == nil || h.config == nil || h.config.SeafHTTP.CheckBlocksMaxIDs <= 0 {
+		return config.DefaultCheckBlocksMaxIDs
+	}
+	return h.config.SeafHTTP.CheckBlocksMaxIDs
+}
+
+// checkBlocksLookupFanout resolves the per-request metadata concurrency. It
+// bounds both lookup phases, so the node's aggregate budget is
+// (check_blocks_max_inflight_per_node x this value) — the product validation
+// enforces at boot.
+func (h *SyncHandler) checkBlocksLookupFanout() int {
+	if h == nil || h.config == nil || h.config.SeafHTTP.CheckBlocksLookupFanout <= 0 {
+		return config.DefaultCheckBlocksLookupFanout
+	}
+	return h.config.SeafHTTP.CheckBlocksLookupFanout
+}
 
 // syncBlockMaxBytes resolves the per-request body cap for PutBlock.
 //
@@ -1314,6 +1356,56 @@ func (h *SyncHandler) syncBlockAdmittedLifetime() time.Duration {
 	return h.config.SeafHTTP.SyncBlockAdmittedLifetime
 }
 
+func (h *SyncHandler) checkBlocksAdmittedLifetime() time.Duration {
+	if h == nil || h.config == nil || h.config.SeafHTTP.CheckBlocksAdmittedLifetime <= 0 {
+		return config.DefaultCheckBlocksAdmittedLifetime
+	}
+	return h.config.SeafHTTP.CheckBlocksAdmittedLifetime
+}
+
+// syncAdmittedLifetime is one route's processing budget plus everything needed
+// to report exceeding it. Like the admission limiter, the mechanism is shared
+// between the block and check-blocks routes while the numbers and the series
+// stay separate, so an operator can always tell which route ran out of time.
+type syncAdmittedLifetime struct {
+	duration             time.Duration
+	timeouts             *prometheus.CounterVec
+	deadlineUnsupported  prometheus.Counter
+	unprotectedLogSample *rate.Sometimes
+	logPrefix            string
+	// noun names the work in client-facing messages ("block upload"), so a
+	// timeout says which request died rather than "the request".
+	// downstreamNoun names what timed out when the deadline came from a backend
+	// rather than from this request's own budget, which is a different thing to
+	// tell an operator reading a client log.
+	noun           string
+	downstreamNoun string
+}
+
+func (h *SyncHandler) syncBlockLifetime() syncAdmittedLifetime {
+	return syncAdmittedLifetime{
+		duration:             h.syncBlockAdmittedLifetime(),
+		timeouts:             metrics.SyncPutBlockTimeoutsTotal,
+		deadlineUnsupported:  metrics.SyncPutBlockReadDeadlineUnsupportedTotal,
+		unprotectedLogSample: &syncPutBlockUnprotectedLogSample,
+		logPrefix:            "[PutBlock]",
+		noun:                 "block upload",
+		downstreamNoun:       "block storage",
+	}
+}
+
+func (h *SyncHandler) checkBlocksLifetime() syncAdmittedLifetime {
+	return syncAdmittedLifetime{
+		duration:             h.checkBlocksAdmittedLifetime(),
+		timeouts:             metrics.SyncCheckBlocksTimeoutsTotal,
+		deadlineUnsupported:  metrics.SyncCheckBlocksReadDeadlineUnsupportedTotal,
+		unprotectedLogSample: &syncCheckBlocksUnprotectedLogSample,
+		logPrefix:            "[CheckBlocks]",
+		noun:                 "check-blocks request",
+		downstreamNoun:       "check-blocks metadata lookup",
+	}
+}
+
 var errSyncBlockAdmittedLifetime = errors.New("sync block admitted lifetime exceeded")
 
 // beginSyncBlockAdmittedLifetime starts after admission so queue time does not
@@ -1336,9 +1428,9 @@ var errSyncBlockAdmittedLifetime = errors.New("sync block admitted lifetime exce
 //
 // The server rearms its own read deadline at the start of every request on a
 // keep-alive connection, so the deadline set here cannot leak into the next one.
-func (h *SyncHandler) beginSyncBlockAdmittedLifetime(c *gin.Context) (func(), bool) {
+func (h *SyncHandler) beginAdmittedLifetime(c *gin.Context, lt syncAdmittedLifetime) (func(), bool) {
 	startedAt := time.Now()
-	admittedDeadline := startedAt.Add(h.syncBlockAdmittedLifetime())
+	admittedDeadline := startedAt.Add(lt.duration)
 	ctx, cancel := context.WithDeadlineCause(c.Request.Context(), admittedDeadline, errSyncBlockAdmittedLifetime)
 	c.Request = c.Request.WithContext(ctx)
 	effectiveDeadline, _ := ctx.Deadline()
@@ -1362,7 +1454,7 @@ func (h *SyncHandler) beginSyncBlockAdmittedLifetime(c *gin.Context) (func(), bo
 			// the unread body remains undrained without a socket deadline.
 			if isServerHandledRequest(c.Request) {
 				cancel()
-				h.rejectSyncBlockUnprotected(c)
+				rejectAdmittedUnprotected(c, lt)
 				return nil, false
 			}
 			// Synthetic writers (test recorders, exotic ResponseWriters) never
@@ -1403,7 +1495,7 @@ func isServerHandledRequest(r *http.Request) bool {
 	return r.Context().Value(http.LocalAddrContextKey) != nil
 }
 
-// rejectSyncBlockUnprotected ends a request whose admitted lifetime could not be
+// rejectAdmittedUnprotected ends a request whose admitted lifetime could not be
 // installed on the connection.
 //
 // It drops the connection instead of answering 503, because a 503 here is not
@@ -1417,11 +1509,11 @@ func isServerHandledRequest(r *http.Request) bool {
 // which is the same contract the unreachable 503 would have carried.
 //
 // The log is sampled: a middleware that broke the unwrap chain would otherwise
-// make every block upload write a line.
-func (h *SyncHandler) rejectSyncBlockUnprotected(c *gin.Context) {
-	metrics.SyncPutBlockReadDeadlineUnsupportedTotal.Inc()
-	syncBlockUnprotectedLogSample.Do(func() {
-		log.Printf("[PutBlock] dropping block upload: the admitted-lifetime read deadline could not be installed on the connection, so a stalled body could hold this admission forever. A middleware is wrapping the response writer without implementing Unwrap(); sampled, see sync_put_block_read_deadline_unsupported_total")
+// make every affected request write a line.
+func rejectAdmittedUnprotected(c *gin.Context, lt syncAdmittedLifetime) {
+	lt.deadlineUnsupported.Inc()
+	lt.unprotectedLogSample.Do(func() {
+		log.Printf("%s dropping %s: the admitted-lifetime read deadline could not be installed on the connection, so a stalled body could hold this admission forever. A middleware is wrapping the response writer without implementing Unwrap(); sampled, see the read_deadline_unsupported_total series for this route", lt.logPrefix, lt.noun)
 	})
 	c.Abort()
 	// gin.ResponseWriter embeds http.Hijacker, so this works even through a
@@ -1436,19 +1528,22 @@ func (h *SyncHandler) rejectSyncBlockUnprotected(c *gin.Context) {
 	c.Header("Retry-After", "1")
 	c.Header("Connection", "close")
 	c.Request.Close = true
-	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block upload cannot be time-bounded on this connection; retry"})
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": lt.noun + " cannot be time-bounded on this connection; retry"})
 }
 
-var syncBlockUnprotectedLogSample = rate.Sometimes{Interval: time.Minute}
+var (
+	syncPutBlockUnprotectedLogSample    = rate.Sometimes{Interval: time.Minute}
+	syncCheckBlocksUnprotectedLogSample = rate.Sometimes{Interval: time.Minute}
+)
 
-func rejectSyncBlockTimeout(c *gin.Context, phase string, err error) bool {
+func rejectAdmittedTimeout(c *gin.Context, lt syncAdmittedLifetime, phase string, err error) bool {
 	ctxErr := c.Request.Context().Err()
 	if errors.Is(context.Cause(c.Request.Context()), errSyncBlockAdmittedLifetime) {
-		metrics.SyncPutBlockTimeoutsTotal.WithLabelValues(phase).Inc()
+		lt.timeouts.WithLabelValues(phase).Inc()
 		c.Header("Retry-After", "1")
 		c.Header("Connection", "close")
 		c.Request.Close = true
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block upload timed out; retry"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": lt.noun + " timed out; retry"})
 		return true
 	}
 	// netpoll may report the socket deadline just before the context timer runs.
@@ -1457,11 +1552,11 @@ func rejectSyncBlockTimeout(c *gin.Context, phase string, err error) bool {
 	// Limit it to body reads: storage transports have independent socket deadlines
 	// and can return the same os sentinel while this request is otherwise healthy.
 	if phase == "body" && errors.Is(err, os.ErrDeadlineExceeded) {
-		metrics.SyncPutBlockTimeoutsTotal.WithLabelValues(phase).Inc()
+		lt.timeouts.WithLabelValues(phase).Inc()
 		c.Header("Retry-After", "1")
 		c.Header("Connection", "close")
 		c.Request.Close = true
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block upload read timed out; retry"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": lt.noun + " read timed out; retry"})
 		return true
 	}
 	// An inherited client deadline/disconnect gets no response: the peer has
@@ -1473,9 +1568,9 @@ func rejectSyncBlockTimeout(c *gin.Context, phase string, err error) bool {
 		return true
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
-		metrics.SyncPutBlockTimeoutsTotal.WithLabelValues(phase).Inc()
+		lt.timeouts.WithLabelValues(phase).Inc()
 		c.Header("Retry-After", "1")
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage timed out; retry"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": lt.downstreamNoun + " timed out; retry"})
 		return true
 	}
 	return false
@@ -1487,7 +1582,7 @@ func rejectSyncBlockTimeout(c *gin.Context, phase string, err error) bool {
 // counted under sync_put_block_timeouts_total, or a client that vanished and got
 // no response — because folding those into "read_error" would make the size-cap
 // versus read-failure dial read as malformed traffic during ordinary timeouts.
-func readLimitedSyncBlockRequestBody(c *gin.Context, maxBytes int64) ([]byte, string, bool) {
+func readLimitedAdmittedRequestBody(c *gin.Context, lt syncAdmittedLifetime, maxBytes int64) ([]byte, string, bool) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
 	data, err := io.ReadAll(c.Request.Body)
 	if err == nil {
@@ -1498,7 +1593,7 @@ func readLimitedSyncBlockRequestBody(c *gin.Context, maxBytes int64) ([]byte, st
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large", "max_bytes": maxBytes})
 		return nil, "too_large", false
 	}
-	if rejectSyncBlockTimeout(c, "body", err) {
+	if rejectAdmittedTimeout(c, lt, "body", err) {
 		return nil, "", false
 	}
 	c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
@@ -1568,7 +1663,8 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		return
 	}
 	defer releaseInflight()
-	endLifetime, protected := h.beginSyncBlockAdmittedLifetime(c)
+	lifetime := h.syncBlockLifetime()
+	endLifetime, protected := h.beginAdmittedLifetime(c, lifetime)
 	if !protected {
 		return
 	}
@@ -1576,7 +1672,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 
 	// Read block data (bounded per request; bounded in aggregate by the
 	// admission above)
-	data, rejectReason, ok := readLimitedSyncBlockRequestBody(c, maxBlockBytes)
+	data, rejectReason, ok := readLimitedAdmittedRequestBody(c, lifetime, maxBlockBytes)
 	if !ok {
 		// The body reader has already written 413 (over the cap), 503 (admitted
 		// lifetime), or 400 (another read failure), and reports which of those is
@@ -1594,14 +1690,14 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	metrics.SyncPutBlockBodyBytes.Observe(float64(len(data)))
 
 	log.Printf("PutBlock: received %d bytes for block %s\n", len(data), externalID)
-	if rejectSyncBlockTimeout(c, "hash", c.Request.Context().Err()) {
+	if rejectAdmittedTimeout(c, lifetime, "hash", c.Request.Context().Err()) {
 		return
 	}
 
 	// Always compute SHA-256 as the internal storage ID
 	sha256Hash := sha256.Sum256(data)
 	internalID := hex.EncodeToString(sha256Hash[:])
-	if rejectSyncBlockTimeout(c, "hash", c.Request.Context().Err()) {
+	if rejectAdmittedTimeout(c, lifetime, "hash", c.Request.Context().Err()) {
 		return
 	}
 
@@ -1714,7 +1810,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			}
 			return registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), materializedStorageClass, "", externalMappingID)
 		}, nil, nil); err != nil {
-			if rejectSyncBlockTimeout(c, "storage", err) {
+			if rejectAdmittedTimeout(c, lifetime, "storage", err) {
 				return
 			}
 			if errors.Is(err, v2.ErrBlockMappingWriteFailed) {
@@ -1746,7 +1842,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		exists, err := syncBlockExistsFn(c.Request.Context(), blockStore, internalID)
 		if err != nil {
 			log.Printf("PutBlock: failed to check block existence: %v\n", err)
-			if rejectSyncBlockTimeout(c, "storage", err) {
+			if rejectAdmittedTimeout(c, lifetime, "storage", err) {
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
@@ -1762,7 +1858,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			_, err = syncPutBlockDataFn(c.Request.Context(), blockStore, blockData)
 			if err != nil {
 				log.Printf("PutBlock: failed to store in backend: %v\n", err)
-				if rejectSyncBlockTimeout(c, "storage", err) {
+				if rejectAdmittedTimeout(c, lifetime, "storage", err) {
 					return
 				}
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
@@ -1799,7 +1895,7 @@ type CheckBlocksRequest struct {
 // the slice to completion first.
 //
 // Returns ok=false after writing the response; the caller must return immediately.
-func parseCheckBlockIDs(c *gin.Context, body []byte) ([]string, bool) {
+func parseCheckBlockIDs(c *gin.Context, body []byte, maxCheckBlockIDs int) ([]string, bool) {
 	tooMany := func() ([]string, bool) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "too many block ids", "max_block_ids": maxCheckBlockIDs})
 		return nil, false
@@ -1849,46 +1945,28 @@ func parseCheckBlockIDs(c *gin.Context, body []byte) ([]string, bool) {
 	return externalIDs, true
 }
 
-// CheckBlocks checks which blocks already exist (for deduplication)
-// POST /seafhttp/repo/:repo_id/check-blocks
-// Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
-// Translates SHA-1 external IDs to internal SHA-256 IDs for storage lookup
-func (h *SyncHandler) CheckBlocks(c *gin.Context) {
-	repoID := c.Param("repo_id")
-	orgID := c.GetString("org_id")
+// checkBlocksRequestedBlock keeps one requested id next to its classification so
+// the response can be built in request order without re-classifying.
+type checkBlocksRequestedBlock struct {
+	external   string
+	classified classifiedClientBlockID
+}
 
-	if !h.checkSyncPermission(c, repoID, middleware.PermissionR) {
-		return
-	}
+// classifyCheckBlockIDs validates every requested id and reports the distinct
+// legacy SHA-1 ids among them.
+//
+// The distinct set is the whole point: the request list is client-supplied and
+// nothing stops it from being one id repeated to the cap. Resolving per
+// occurrence made that list cost as much as a list of distinct ids while being
+// far cheaper to send.
+//
+// Returns ok=false after writing the response; the caller must return
+// immediately.
+func classifyCheckBlockIDs(c *gin.Context, externalIDs []string) ([]checkBlocksRequestedBlock, []string, bool) {
+	requestedBlocks := make([]checkBlocksRequestedBlock, 0, len(externalIDs))
+	uniqueLegacyIDs := make([]string, 0, 16)
+	seenLegacy := make(map[string]struct{}, 16)
 
-	// Read block IDs from body (bounded)
-	body, ok := readLimitedRequestBody(c, maxCheckBlocksBodyBytes)
-	if !ok {
-		return
-	}
-	// Parse the body - can be JSON array or newline-separated
-	externalIDs, ok := parseCheckBlockIDs(c, body)
-	if !ok {
-		return
-	}
-
-	type requestedBlock struct {
-		external   string
-		classified classifiedClientBlockID
-	}
-
-	// Build mapping from external IDs to internal IDs
-	// For SHA-1 IDs, look up the internal SHA-256 from the mapping table.
-	// For SHA-256 IDs, use the normalized value directly.
-	externalToInternal := make(map[string]string)
-	var internalIDs []string
-	var representationID string
-	// Declared in the outer scope because the resolution steps below assign it
-	// alongside an already-declared result (representationID, existMap), so a := in
-	// those blocks would shadow the outer value rather than fill it.
-	var err error
-	requestedBlocks := make([]requestedBlock, 0, len(externalIDs))
-	needsRepresentationID := false
 	for _, extID := range externalIDs {
 		if strings.TrimSpace(extID) == "" {
 			continue
@@ -1896,52 +1974,207 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 		classifiedID, classifyErr := classifyClientReadableBlockID(extID)
 		if classifyErr != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block id"})
-			return
+			return nil, nil, false
 		}
-		requestedBlocks = append(requestedBlocks, requestedBlock{
+		requestedBlocks = append(requestedBlocks, checkBlocksRequestedBlock{
 			external:   extID,
 			classified: classifiedID,
 		})
-		if h.db != nil && classifiedID.isLegacySHA1 {
-			needsRepresentationID = true
+		if !classifiedID.isLegacySHA1 {
+			continue
 		}
+		if _, seen := seenLegacy[classifiedID.normalized]; seen {
+			continue
+		}
+		seenLegacy[classifiedID.normalized] = struct{}{}
+		uniqueLegacyIDs = append(uniqueLegacyIDs, classifiedID.normalized)
 	}
-	if h.db != nil && needsRepresentationID {
-		representationID, err = h.resolveSyncBlockRepresentationID(orgID, repoID)
+	return requestedBlocks, uniqueLegacyIDs, true
+}
+
+// resolveCheckBlockMappings resolves distinct legacy SHA-1 ids to their internal
+// SHA-256 identities, at most fanout reads at a time.
+//
+// Absent mappings are recorded as an empty internal id rather than as an error:
+// "we have never seen this block" is the ordinary answer for an id the client is
+// about to upload. A malformed *stored* id is an error, because that is
+// corruption rather than absence and the fail-closed contract of this route says
+// so.
+//
+// Cancellation is the property that matters as much as the bound. Every worker
+// checks the group context before issuing a read, so a client that disconnects
+// or a request that exceeds its admitted lifetime stops the remaining lookups
+// instead of driving them to completion for nobody.
+func (h *SyncHandler) resolveCheckBlockMappings(ctx context.Context, orgID, representationID string, externalIDs []string, fanout int) (map[string]string, error) {
+	resolved := make(map[string]string, len(externalIDs))
+	if len(externalIDs) == 0 {
+		return resolved, nil
+	}
+	if fanout < 1 {
+		fanout = 1
+	}
+
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	slots := make(chan struct{}, fanout)
+dispatchMappings:
+	for _, id := range externalIDs {
+		if err := gctx.Err(); err != nil {
+			break
+		}
+		select {
+		case slots <- struct{}{}:
+		case <-gctx.Done():
+			break dispatchMappings
+		}
+		if err := gctx.Err(); err != nil {
+			<-slots
+			break
+		}
+		externalID := id
+		g.Go(func() error {
+			defer func() { <-slots }()
+			if err := gctx.Err(); err != nil {
+				return err
+			}
+			metrics.SyncCheckBlocksLookupsTotal.WithLabelValues("mapping").Inc()
+			mappedID, ok, err := syncGetBlockIDMappingFn(gctx, h.db, orgID, representationID, externalID)
+			if err != nil {
+				return fmt.Errorf("read block id mapping for %s: %w", externalID, err)
+			}
+			internalID := ""
+			if ok && strings.TrimSpace(mappedID) != "" {
+				internalID, err = normalizeResolvedInternalBlockID(mappedID)
+				if err != nil {
+					log.Printf("CheckBlocks: invalid mapped internal id for %s: %q", externalID, mappedID)
+					return fmt.Errorf("invalid mapped internal id for %s: %w", externalID, err)
+				}
+			}
+			mu.Lock()
+			resolved[externalID] = internalID
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return resolved, nil
+}
+
+// CheckBlocks checks which blocks already exist (for deduplication)
+// POST /seafhttp/repo/:repo_id/check-blocks
+// Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
+// Translates SHA-1 external IDs to internal SHA-256 IDs for storage lookup
+//
+// Subcontract C (= registry X11) of ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 is what
+// gives this handler its shape. The id cap bounds the *parse*; it never bounded
+// the work an accepted list triggers. Four things do, and they are all here:
+//
+//  1. Admission before the body read, so an over-capacity node refuses at a cost
+//     of one parked goroutine instead of buffering 16 MiB and then resolving
+//     100k ids.
+//  2. An admitted lifetime, so a slot is always recoverable and the metadata
+//     work stops when the deadline passes.
+//  3. Deduplication, so the cost tracks *unique* ids. A list of one id repeated
+//     100k times used to cost 100k Cassandra reads.
+//  4. A bounded fan-out on both lookup phases, so per-request latency improves
+//     without handing one request an unbounded slice of the driver pool. With
+//     the node cap this is the aggregate bound: node cap x fan-out.
+func (h *SyncHandler) CheckBlocks(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
+
+	if !h.checkSyncPermission(c, repoID, middleware.PermissionR) {
+		return
+	}
+
+	// Everything above is a cheap rejection and must not wait for a slot or
+	// consume one. Everything below is the work being bounded.
+	releaseInflight, admitted := h.acquireCheckBlocksInflight(c, orgID, userID)
+	if !admitted {
+		return
+	}
+	defer releaseInflight()
+
+	lifetime := h.checkBlocksLifetime()
+	endLifetime, protected := h.beginAdmittedLifetime(c, lifetime)
+	if !protected {
+		return
+	}
+	defer endLifetime()
+
+	// Read block IDs from body (bounded per request; bounded in aggregate by the
+	// admission above)
+	body, _, ok := readLimitedAdmittedRequestBody(c, lifetime, maxCheckBlocksBodyBytes)
+	if !ok {
+		return
+	}
+	// Parse the body - can be JSON array or newline-separated
+	externalIDs, ok := parseCheckBlockIDs(c, body, h.checkBlocksMaxIDs())
+	if !ok {
+		return
+	}
+	// Observe the parsed cardinality even when classification later rejects a
+	// malformed id. This series is operational evidence for lowering the cap;
+	// excluding rejected bodies would hide precisely the traffic most likely to
+	// exercise that cap.
+	metrics.SyncCheckBlocksIDsPerRequest.Observe(float64(len(externalIDs)))
+
+	requestedBlocks, uniqueLegacyIDs, ok := classifyCheckBlockIDs(c, externalIDs)
+	if !ok {
+		return
+	}
+
+	fanout := h.checkBlocksLookupFanout()
+
+	// Resolve the legacy SHA-1 domain first, once per unique id.
+	legacyToInternal := map[string]string{}
+	if h.db != nil && len(uniqueLegacyIDs) > 0 {
+		representationID, err := h.resolveSyncBlockRepresentationID(orgID, repoID)
 		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
+			return
+		}
+		legacyToInternal, err = h.resolveCheckBlockMappings(c.Request.Context(), orgID, representationID, uniqueLegacyIDs, fanout)
+		if err != nil {
+			if rejectAdmittedTimeout(c, lifetime, "mapping", err) {
+				return
+			}
+			log.Printf("CheckBlocks: failed to resolve block id mappings: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
 			return
 		}
 	}
 
+	// Project the resolution back onto every requested id, and collect the unique
+	// internal ids the existence phase has to look at. An id that resolves to
+	// nothing is already known to be needed and is not looked up at all.
+	externalToInternal := make(map[string]string, len(requestedBlocks))
+	internalIDs := make([]string, 0, len(requestedBlocks))
+	seenInternal := make(map[string]struct{}, len(requestedBlocks))
 	for _, reqBlock := range requestedBlocks {
-		var internalID string
-
+		internalID := reqBlock.classified.normalized
 		if h.db != nil && reqBlock.classified.isLegacySHA1 {
-			mappedID, ok, err := h.db.GetBlockIDMapping(orgID, representationID, reqBlock.classified.normalized)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
-				return
-			}
-			if !ok || strings.TrimSpace(mappedID) == "" {
-				externalToInternal[reqBlock.external] = ""
-				continue
-			}
-			internalID, err = normalizeResolvedInternalBlockID(mappedID)
-			if err != nil {
-				log.Printf("CheckBlocks: invalid mapped internal id for %s: %q", reqBlock.external, mappedID)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve block mapping"})
-				return
-			}
-		} else {
-			internalID = reqBlock.classified.normalized
+			internalID = legacyToInternal[reqBlock.classified.normalized]
 		}
-
 		externalToInternal[reqBlock.external] = internalID
+		if internalID == "" {
+			continue
+		}
+		if _, seen := seenInternal[internalID]; seen {
+			continue
+		}
+		seenInternal[internalID] = struct{}{}
 		internalIDs = append(internalIDs, internalID)
 	}
 
 	var existMap map[string]bool
+	var err error
 	if h.db != nil {
 		var fallbackStore *storage.BlockStore
 		var fallbackClass string
@@ -1952,13 +2185,20 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 				return
 			}
 		}
-		reader, resolveErr := syncNewCanonicalBlockCheckReaderFn(c.Request.Context(), h.db, h.storageManager, orgID, internalIDs, fallbackStore, fallbackClass)
+		// The location phase is dispatched by the canonical reader below. Count
+		// this branch only; the legacy fallback has no location phase.
+		metrics.SyncCheckBlocksLookupsTotal.WithLabelValues("location").Add(float64(len(internalIDs)))
+		reader, resolveErr := syncNewCanonicalBlockCheckReaderFn(c.Request.Context(), h.db, h.storageManager, orgID, internalIDs, fallbackStore, fallbackClass, fanout)
 		if resolveErr != nil {
+			if rejectAdmittedTimeout(c, lifetime, "location", resolveErr) {
+				return
+			}
 			log.Printf("CheckBlocks: failed to resolve canonical block locations: %v", resolveErr)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 			return
 		}
-		existMap, err = reader.CheckBlocksExist(c.Request.Context(), internalIDs, 10)
+		metrics.SyncCheckBlocksLookupsTotal.WithLabelValues("existence").Add(float64(len(internalIDs)))
+		existMap, err = reader.CheckBlocksExist(c.Request.Context(), internalIDs, fanout)
 	} else {
 		// Preserve the legacy no-metadata routed fallback.
 		blockStore, _, resolveErr := h.resolvePreferredBlockStore(c, orgID, repoID)
@@ -1966,9 +2206,13 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 			return
 		}
-		existMap, err = blockStore.CheckBlocksParallel(c.Request.Context(), internalIDs, 10)
+		metrics.SyncCheckBlocksLookupsTotal.WithLabelValues("existence").Add(float64(len(internalIDs)))
+		existMap, err = blockStore.CheckBlocksParallel(c.Request.Context(), internalIDs, fanout)
 	}
 	if err != nil {
+		if rejectAdmittedTimeout(c, lifetime, "existence", err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 		return
 	}
