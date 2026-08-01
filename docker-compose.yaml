@@ -632,8 +632,6 @@ services:
       dockerfile: Dockerfile
       args:
         INSTALL_CASSANDRA_CLIENT: "true"
-    env_file:
-      - ${ENV_FILE:-.env}
     entrypoint:
       - /bin/bash
       - -lc
@@ -648,6 +646,9 @@ services:
       - SESAMEFS_URL=http://sesamefs-node-3:8080
       - SESAMEFS_URL_LOCAL=http://sesamefs-node-3:8080
       - SUPERADMIN_TOKEN=dev-token-superadmin
+      - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}
+      - CASSANDRA_USERNAME=${CASSANDRA_USERNAME}
+      - CASSANDRA_PASSWORD=${CASSANDRA_PASSWORD}
       - SYNC_DATA_DIR=/seafile-data
       - SYNC_TEST_IN_CONTAINER=1
       - HOLDER_RATE=${CHECK_BLOCKS_HOLDER_RATE:-64k}

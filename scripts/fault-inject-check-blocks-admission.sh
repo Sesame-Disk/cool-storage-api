@@ -28,7 +28,7 @@
 # check-blocks requests occupy those slots before the watched worktree is
 # changed, so the test controls the refusal window instead of hoping for one.
 #
-set -u
+set -uo pipefail
 
 SESAMEFS_URL="${SESAMEFS_URL:-http://sesamefs:8080}"
 SESAMEFS_URL_LOCAL="${SESAMEFS_URL_LOCAL:-${SESAMEFS_URL}}"
@@ -77,8 +77,14 @@ delete_library() {
 
 delete_organization() {
   [ -n "${1:-}" ] || return 0
-  curl -s -o /dev/null -X DELETE "${SESAMEFS_URL_LOCAL}/api/v2.1/admin/organizations/${1}/" \
-    -H "Authorization: Token ${SUPERADMIN_TOKEN}"
+  local status
+  status=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+    "${SESAMEFS_URL_LOCAL}/api/v2.1/admin/organizations/${1}/" \
+    -H "Authorization: Token ${SUPERADMIN_TOKEN}") || return 1
+  case "${status}" in
+    200|202|204|404) return 0 ;;
+    *) log "organization delete ${1} returned HTTP ${status}"; return 1 ;;
+  esac
 }
 
 mint_owner_api_key() {
@@ -87,6 +93,7 @@ import datetime
 import hashlib
 import secrets
 import sys
+import time
 
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.cluster import Cluster
@@ -96,9 +103,20 @@ host, _, port = hosts.split(',', 1)[0].partition(':')
 cluster = Cluster([host], port=int(port or 9042), auth_provider=PlainTextAuthProvider(username, password))
 session = cluster.connect('sesamefs')
 try:
-    row = session.execute('SELECT user_id, org_id FROM users_by_email WHERE email = %s', [email]).one()
+    # Organization creation and the users_by_email projection are separate
+    # writes. Allow the projection a short bounded window to become visible.
+    deadline = time.time() + 15
+    row = None
+    while time.time() < deadline:
+        row = session.execute('SELECT user_id, org_id FROM users_by_email WHERE email = %s', [email]).one()
+        if row is not None and str(row.org_id) == org_id:
+            break
+        time.sleep(0.25)
     if row is None or str(row.org_id) != org_id:
         raise RuntimeError('created owner was not found in the disposable organization')
+    # This test-only fixture mirrors apikeys.Manager.CreateKey: both the primary
+    # row and the reverse user index are required before /api2/auth-token can
+    # exchange the key. Keep these columns aligned with that production method.
     raw = 'sk_' + secrets.token_hex(32)
     key_hash = hashlib.sha256(raw.encode()).hexdigest()
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -163,15 +181,23 @@ trap cleanup EXIT INT TERM
 # free. Without it the next run fails to create a library and the failure
 # surfaces as a bogus "the client was never refused".
 sweep_previous_runs() {
+  local organizations_json stale_orgs
   log "sweeping organizations left by previous runs"
-  curl -s "${SESAMEFS_URL_LOCAL}/api/v2.1/admin/organizations/?per_page=1000" \
+  organizations_json=$(curl -fsS "${SESAMEFS_URL_LOCAL}/api/v2.1/admin/organizations/?per_page=1000" \
     -H "Authorization: Token ${SUPERADMIN_TOKEN}" \
-    | jq -r --arg prefix "${ORG_PREFIX}" '.organizations[]? | select((.org_name // .name // "") | startswith($prefix)) | .org_id' \
-    | while read -r stale_org; do
-        [ -n "${stale_org}" ] || continue
-        log "  deleting stale organization ${stale_org}"
-        delete_organization "${stale_org}"
-      done
+    ) || fail "could not list organizations for stale-run cleanup"
+  printf '%s\n' "${organizations_json}" \
+    | jq -e '(.organizations | type) == "array"' >/dev/null \
+    || fail "organization list response was not a valid organizations array"
+  stale_orgs=$(printf '%s\n' "${organizations_json}" \
+    | jq -r --arg prefix "${ORG_PREFIX}" '.organizations[]? | select((.org_name // .name // "") | startswith($prefix)) | .org_id') \
+    || fail "could not parse stale organizations"
+  while read -r stale_org; do
+    [ -n "${stale_org}" ] || continue
+    log "  deleting stale organization ${stale_org}"
+    delete_organization "${stale_org}" \
+      || fail "could not delete stale organization ${stale_org}"
+  done <<< "${stale_orgs}"
 }
 
 log "target ${SESAMEFS_URL}"

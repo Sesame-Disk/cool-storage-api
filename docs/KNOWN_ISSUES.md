@@ -5581,6 +5581,19 @@ canonical metadata rows are temporary and cleaned in bounded batches. These
 results are evidence for the shipped lifetime, not evidence that 100k-id
 existence requests are cheap or that the cap should be lowered.
 
+The fault drill's disposable owner API key is a test-only Cassandra fixture.
+The public self-service key endpoint requires an already authenticated owner,
+while administrative key issuance is intentionally limited to platform users.
+The fixture therefore mirrors `apikeys.Manager.CreateKey` by writing both
+`api_keys` and `api_keys_by_user`, then exchanges the raw key through the real
+`/api2/auth-token/` endpoint. If the production key schema changes, this fixture
+must be updated with it.
+
+The lifetime probe bounds request work and admitted concurrency, but does not
+measure process RSS or cgroup memory under eight concurrent 100k-id requests.
+That remains follow-up evidence for choosing the node cap; it does not reopen
+the C closure criteria.
+
 **What this does not claim.** The accepted cardinality is still a compatibility
 bound rather than a measured one — criterion 3 bounds the *work per id* and the
 *concurrent requests*, not the list length. Process-local, like every other guard
