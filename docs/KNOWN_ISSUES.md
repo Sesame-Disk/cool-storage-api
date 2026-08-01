@@ -5658,24 +5658,38 @@ reuse B/C's short-work defaults or move B/C's white-box limiter implementation.
 Long downloads use a short or disabled queue plus a sliding idle-write deadline,
 not a short absolute transfer lifetime. The coordinator has bounded entries and
 waiters, removes idle identities, creates no per-identity goroutines/timers and
-must drain to zero after sustained churn.
+must drain to zero after sustained churn. A refusal is `503` with `Retry-After`
+on every profile, not only the desktop block route.
+
+The D0 contract also freezes the configuration keys and metric series so D1 does
+not improvise them: validated caps and the three deadlines in their own
+top-level section, present in every `configs/*.yaml`, both `.env` examples and
+`applyEnvOverrides()`; and `download_admission_*` series whose occupancy
+invariant is `active_current == sum(active_by_profile)`. It is deliberately not
+a sum over identity dimensions — a public transfer occupies `link_source` and
+`client_link` at once, so that sum double-counts every public byte. No label
+carries a bearer, IP, user, org, repo or source identity.
 
 The current block gzip exclusion already covers both block methods through
 `/seafhttp/repo/.*/block/.*`. The stale `/api/v2.1/...raw` and
 `/api/v2.1/...history` patterns do not cover the registered `/repo/...` routes,
 and `/d/...` cannot be selectively excluded by `raw=1` through the current
-path-regex API. D3 will exclude the compatible `/repo/...` and `/d/...` families
-before relying on `http.ResponseController` for write deadlines. The deadline
-is installed immediately before each underlying write/flush, cleared after the
-stream and fail-closed before headers if the connection is unreachable.
+path-regex API. D3 must ensure that raw/history and share-raw writers can reach
+the connection deadline, either through route/query-aware gzip bypass or a
+writer chain that correctly exposes the response-controller interfaces. A
+temporary blanket `/d/...` exclusion is not the frozen ideal because it also
+disables compression for public bootstrap responses. The deadline is installed
+immediately before each underlying write/flush, cleared after the stream and
+fail-closed before headers if the connection is unreachable.
 
 `GetBlockReader` and `GetBlockSize` already exist. D5 wires them into
 `SyncHandler.GetBlock` so the block is streamed opaquely with authoritative size,
-context cancellation and preserved response states. D5 deliberately changes
-`last_accessed`: today `GetBlock` writes it before the response body is sent;
-the new behavior writes it only after a complete successful stream. This is safe
-because no current reader uses `blocks.last_accessed` for retention or deletion,
-but any future GC/cold-storage consumer must revisit that contract.
+context cancellation and preserved response states. D5 preserves the current
+`last_accessed` placement: `GetBlock` writes it after the quota pre-check and
+before the response body is sent. Redefining it as post-complete-delivery is
+outside D5 and requires its own issue and evidence. No current reader uses
+`blocks.last_accessed` for retention or deletion, but any future GC/cold-storage
+consumer must revisit that contract.
 
 `GetBlockSize` may be used for the preflight quota decision and
 `Content-Length`, but it must not become the recorded transfer amount. The
@@ -6400,6 +6414,37 @@ benchmark substitutes an in-memory function for Cassandra.
 
 Validate against a real cluster (driver, pool, latency, load) before claiming
 hot-path readiness.
+
+---
+
+### ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01: Download concurrency does not cap byte rate
+
+**Status**: 🟡 **Open — deferred pending D6 measurement**
+**Severity**: Medium (capacity hardening), not a D correctness blocker by itself
+**Affected**: process/node egress for file, raw, history, ZIP, share and block
+downloads
+**Source of record**: D0 contract in
+`docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`
+
+#### Problem
+
+Subcontract D bounds accepted concurrent transfers, storage readers, response
+writers and aggregate work. It does not by itself bound bytes per second. One
+admitted transfer can consume most or all of a node's available egress, and a
+generous node concurrency cap can still create an unacceptable bandwidth
+plateau.
+
+This residual is intentionally not hidden inside D's closure claim. D6 must
+measure aggregate throughput, per-transfer throughput, duration and the node's
+egress budget under the measured D defaults. If the result is unacceptable,
+implement byte-rate shaping or an equivalent trusted ingress/network QoS policy.
+
+#### Fix Direction
+
+Do not copy a byte-rate value from B/C or guess one from request counts. Use the
+D6 measurements to choose between application shaping, ingress shaping and an
+explicit accepted network budget. Keep this issue separate from D's admission
+correctness and from the production object-storage privacy issue.
 
 ---
 

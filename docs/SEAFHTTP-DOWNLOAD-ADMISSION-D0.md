@@ -16,6 +16,8 @@ status tracker.
 - [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md), `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`
 - [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md),
   `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01`
+- [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md),
+  `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` residual
 - [`OPEN-WORK-INDEX.md`](./OPEN-WORK-INDEX.md)
 - [`PROD-SECURITY-READINESS-20260724.md`](./PROD-SECURITY-READINESS-20260724.md)
 - [`UPLOAD-FENCE-FINDINGS-REGISTRY.md`](./UPLOAD-FENCE-FINDINGS-REGISTRY.md),
@@ -119,6 +121,24 @@ The implementation must never use one field for all three meanings:
 013 and the upload-token path already support `access_tokens.source_id`. D2
 must add the missing download-token wiring.
 
+Admission keys are structured and namespaced; they are not untyped concatenated
+strings:
+
+```text
+auth-user   = namespace + orgID + userID
+link-source = namespace + SourceID
+client-link = namespace + normalizedClientIP + SourceID
+```
+
+The coordinator should represent these as typed dimensions, for example
+`DimensionKey{Kind, ID}`, so a user ID, source ID and IP with equal textual
+representations cannot collide. `orgID` is mandatory in `auth-user`; two users
+with the same user identifier in different organizations never share a gate.
+`normalizedClientIP` must come from the repository's trusted-proxy-aware client
+IP resolver, not directly from an untrusted `X-Forwarded-For` value. The D1
+contract must use the same trusted-proxy configuration and attribution rules as
+the existing abuse controls.
+
 For `Source == "link"`:
 
 - New tokens require a non-empty, non-whitespace `SourceID`.
@@ -127,7 +147,9 @@ For `Source == "link"`:
   normal download, public OnlyOffice and public ZIP token creation.
 - A token remint retains the same source identity while changing the bearer.
 - A link token with a blank source identity fails closed before protected bytes
-  or inline content are produced.
+  are produced. Inline text does not necessarily use a download token: for
+  `readFileContentAsText`, derive the admission source directly from the
+  resolved share link with `publicLinkSourceID("share-link", sl.token)`.
 - No fallback uses the temporary bearer, owner user ID, repo/path or a shared
   `unknown` key. Production is being deployed greenfield; no historical token
   compatibility path is required.
@@ -152,7 +174,7 @@ applicable dimensions before waiting:
 Authenticated transfer:
 
 ```text
-node + authenticated-user (+ fixed profile dimension where configured)
+node + auth-user (+ fixed profile dimension where configured)
 ```
 
 Public-link transfer:
@@ -161,13 +183,19 @@ Public-link transfer:
 node + link-source + client-link (+ fixed profile dimension where configured)
 ```
 
-The exact operation is all-or-none:
+The exact operation is all-or-none over the request's **complete** dimension
+set, not over the public-link subset alone:
 
 ```text
-node.active < nodeMax
-AND source.active < sourceMax
-AND clientSource.active < clientSourceMax
+grant iff, for every d in dimensions(request): d.active < d.max
+
+dimensions(authenticated) = { node, auth-user }    (+ profile where configured)
+dimensions(public link)   = { node, link-source,
+                              client-link }        (+ profile where configured)
 ```
+
+An implementation that checks only the link dimensions silently drops
+authenticated-user fairness, which is half of closure criterion 4.
 
 No dimension is reserved while the request waits for another dimension. A
 single bounded waiter entry represents the request. Cancellation, timeout and
@@ -227,7 +255,20 @@ For long streams, waiting is intentionally small or disabled unless real client
 testing demonstrates that a queue is useful. A ten-second wait copied from B/C
 is not automatically meaningful when a legitimate transfer may hold capacity
 for minutes. The primary recovery control is write-progress timeout and context
-cancellation, not a short absolute transfer lifetime.
+cancellation, not a short absolute transfer lifetime. D6 must measure byte
+throughput against the node's egress budget; concurrency alone is not a byte-rate
+shaper. Residual shaping work is tracked separately as
+`ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01`.
+
+A refused request answers `503` with `Retry-After` on **every** profile, not
+only `block`. The desktop client classifies 502/503/504 as retryable network
+errors and has no 429 handling, and a single coordinator that answered
+differently per surface would make the refusal contract depend on which URL a
+client happened to use. 429 remains reserved for the existing non-blocking
+upload-link limiter, which serves browser traffic under a different contract. D
+does not claim that browsers or OnlyOffice retry automatically on 503: the
+status communicates transient unavailability, and real client behavior is
+closure criterion 11 evidence rather than an assumption.
 
 ### 7. Stable Public-Link Source Wiring
 
@@ -245,7 +286,10 @@ D2 must update the download-token contract across:
 
 The existing nullable scan behavior may remain as defensive schema handling, but
 new link-token writers and consumers must be strict. No backfill or legacy
-fallback is required for the clean deployment.
+fallback is required for the clean deployment. D2 is not a mixed-version rolling
+deployment contract: the clean release deploys all token writers and consumers
+as one coordinated version, and disposable pre-release tokens may be invalidated.
+No production data or token continuity is being preserved.
 
 ### 8. Gzip And Writer Reachability
 
@@ -269,18 +313,36 @@ They do not cover `/repo/:repo_id/raw`, `/repo/:repo_id/history/download`, or
 `/repo/:repo_id/history/raw`. The public raw response under `/d/:token` is also
 not distinguishable by query through the path-regex API.
 
-D3 will exclude the compatible `/repo/...` and `/d/...` byte-serving families.
-Excluding all `/d/...` responses is intentional: redirects and small error/page
-responses lose negligible compression, while query-based exclusion cannot
-protect `raw=1` selectively.
+D3 must ensure that raw/history and share-raw writers are not hidden behind the
+current gzip wrapper when they need a connection deadline. The contract does
+not freeze blanket exclusion of all `/d/...` responses as the ideal solution:
+`/d/...` also carries compressible public bootstrap responses with inline text.
+D3 must either add route/query-aware gzip bypass for `raw=1`, or fix the gzip
+writer chain to expose the required response-controller interfaces while keeping
+compression for non-streaming/bootstrap responses. A temporary blanket `/d/...`
+exclusion is acceptable only with measured egress impact and must not be treated
+as the final design.
 
 Every writer that needs an idle-write deadline must make the underlying network
 connection reachable through `http.ResponseController` or an equivalent
-mechanism. Required writer capabilities include `Unwrap`, `Flush`, and any
-`ReaderFrom`/server interfaces used by the streaming path. HTTP/1.1 is the
-backend protocol in the supported nginx topology. Public HTTP/2 terminates at
-the external proxy and requires end-to-end deployment validation rather than a
-claim that the Go listener directly supports HTTP/2.
+mechanism. Required writer capabilities include `Unwrap` and `Flush`. The D
+wrapper must **not** expose `ReaderFrom` unless it implements its own chunked
+`ReadFrom` that renews deadlines, counts bytes and propagates cancellation; a
+transparent delegation to an underlying `ReaderFrom` is forbidden. The same
+rule applies to a source `WriterTo` fast path: `io.Copy` must not bypass the D
+wrapper's accounting and lifetime hooks. HTTP/1.1 is the backend protocol in the
+supported nginx topology. Public HTTP/2 terminates at the external proxy and
+requires end-to-end deployment validation rather than a claim that the Go
+listener directly supports HTTP/2.
+
+The proxy is part of the lifetime contract. D3/D6 must verify the effective
+configuration for every protected route, including `proxy_buffering`, any
+buffering-to-disk behavior, `proxy_read_timeout` and `send_timeout`. The
+supported transfer path must use backpressure-compatible settings (currently
+`proxy_buffering off` in the supported frontend transfer locations) or document
+that D protects only the Go-to-proxy hop. A slow-client test must run through
+the real nginx topology as well as directly against Go; a backend TCP test alone
+does not prove that the browser/client is controlling admission lifetime.
 
 ### 9. Write-Progress Lifetime
 
@@ -298,11 +360,38 @@ write failure:
 - release all D dimensions exactly once;
 - do not append JSON after headers are committed.
 
-The preparation wait deadline is cancelled or replaced once streaming starts; it
-must not accidentally become a total download timeout. A configured stricter
-server write timeout is not lengthened. If the D writer cannot install the
-required deadline before headers, the contract is fail closed rather than a
-metric-only degradation.
+Three deadlines are independent:
+
+1. **Admission wait:** time allowed to obtain all dimensions.
+2. **Preparation deadline:** time allowed after admission for metadata, mappings,
+   canonical-reader construction and initial storage work, including inline
+   text. Its context reaches Cassandra and S3.
+3. **Idle-write timeout:** maximum interval without successful response progress
+   once output starts.
+
+The preparation context is cancelled or replaced when streaming starts; it must
+not accidentally become a total download timeout. `readFileContentAsText` keeps
+the preparation deadline because it may never write a response while waiting for
+storage.
+
+`server.write_timeout` is a process-wide `http.Server` setting, not a per-route
+one, and every shipped configuration already sets it to `0s` with the comment
+"No write timeout — large downloads/zips can take minutes". D therefore depends
+on an existing deployment property rather than introducing a new constraint:
+with it at zero, the application-controlled idle deadline is the only write
+deadline on the connection and is authoritative by construction.
+
+`http.Server` does not expose the deadline it installed, so D cannot refresh a
+non-zero `write_timeout` without risking extending it. A non-zero global
+`server.write_timeout` is therefore unsupported while D is enabled, unless a
+future implementation derives the absolute deadline from configuration plus
+request start and always applies `min(absoluteDeadline, now + idleTimeout)` —
+computable, but deliberately outside this contract. D3 must add configuration
+validation or a regression guard so that setting a non-zero `write_timeout`
+cannot silently truncate long transfers.
+
+If the D writer cannot install the required deadline before headers, the contract
+is fail closed rather than a metric-only degradation.
 
 ### 10. Block GET Refactor Contract
 
@@ -317,12 +406,13 @@ The refactor must:
 - bind the reader to `c.Request.Context()`;
 - stream bytes without decrypting, reinterpreting or reserializing them;
 - preserve existing auth, permission and response states;
-- deliberately move `last_accessed` from its current pre-body update to a
-  post-body update after a complete successful block stream. This is a behavior
-  change, not preservation: current code writes it before the response body is
-  sent. It is safe for the clean deployment because no current reader uses
-  `blocks.last_accessed` for retention or deletion; any future GC or cold-storage
-  consumer must revisit the contract;
+- preserve the current `last_accessed` placement and semantics during D5. The
+  current handler writes it after the quota pre-check and before the response
+  body is sent. Redefining it as post-complete-delivery is outside D5; if that
+  semantic change is wanted later, it needs its own issue and evidence. No
+  current reader uses `blocks.last_accessed` for retention or deletion, but any
+  future GC or cold-storage consumer must still treat its current meaning as
+  part of the contract;
 - preserve exact block-GET traffic accounting: `GetBlockSize` may drive the
   preflight quota decision and `Content-Length`, but the recorded transfer must
   use bytes successfully written. D5 must not regress the current exact
@@ -351,19 +441,94 @@ over-counting issue is already tracked as `ISSUE-STREAMBLOCKS-VOID-01`.
 A future traffic-accounting change beyond that D5 non-regression requires its
 own explicit product and issue decision.
 
-### 12. Direct Object Storage Is Separate
+### 12. Configuration And Metrics
+
+D1 ships configuration and metrics. This section is what they must satisfy, so
+the shape is decided here rather than improvised in the implementation PR.
+
+**Configuration.** The coordinator spans `internal/api`, `internal/api/v2` and
+the share-link handlers, so its keys belong in their own top-level section
+rather than under `seafhttp`, which is route-scoped:
+
+| Key | Bounds |
+|---|---|
+| `max_active_per_node` | The shared node ceiling, across every profile |
+| `max_active_per_auth_user` | Per `(orgID, userID)` |
+| `max_active_per_link_source` | Per stable `SourceID`, aggregated across client IPs |
+| `max_active_per_client_link` | Per `(normalizedClientIP, SourceID)` |
+| `max_active_per_profile` | Optional per-profile cap, one value per profile |
+| `max_waiters_per_identity` | Parked requests per identity dimension |
+| `max_waiters_per_node` | Parked requests process-wide |
+| `admission_wait` | Deadline 1 — time allowed to obtain every dimension |
+| `preparation_deadline` | Deadline 2 — post-admission metadata, reader construction and inline reads |
+| `idle_write_timeout` | Deadline 3 — maximum interval without write progress |
+
+Validation is real validation, in the shape B and C already use, not a comment:
+
+- no identity cap and no profile cap may exceed `max_active_per_node`, so a
+  profile cannot become an escape hatch around the aggregate bound;
+- `max_active_per_client_link` may not exceed `max_active_per_link_source`;
+- a validated ceiling exists for every cap and every deadline;
+- `0` means disabled and must be stated per key, since disabling the node cap
+  and disabling a per-identity cap have very different consequences;
+- the coordinator is process-local, and every default must be documented as
+  such: fleet capacity scales with node count.
+
+Every `configs/*.yaml`, `.env.example`, `.env.prod.example` and
+`applyEnvOverrides()` must carry the new keys. A key that exists in the struct
+but in only some config files is a defect B and C both had to fix.
+
+**Metrics.** Naming follows the existing admission series
+(`sync_check_blocks_*`), with `download_admission_` as the prefix:
+
+| Series | Type | Labels |
+|---|---|---|
+| `download_admission_active_current` | Gauge | none — the node total |
+| `download_admission_active_by_profile` | Gauge | `profile`, fixed exclusive enum |
+| `download_admission_entries_current` | Gauge | none |
+| `download_admission_waiters_current` | Gauge | `dimension` |
+| `download_admission_tracked_identities` | Gauge | `dimension` |
+| `download_admission_rejected_total` | Counter | `reason`, fixed set |
+| `download_admission_released_total` | Counter | `cause`, fixed set |
+| `download_admission_deadline_expired_total` | Counter | `phase` = `preparation` or `idle_write` |
+| `download_admission_writer_unreachable_total` | Counter | none — deadline could not be installed |
+| `download_admission_wait_seconds` | Histogram | `outcome` |
+| `download_admission_occupancy` | Histogram | `dimension` |
+
+`dimension` is the fixed set `auth_user`, `link_source`, `client_link`. `cause`
+covers at least completion, client disconnect, timeout, error and panic, so a
+slot that disappears without a stream completing is visible.
+
+The occupancy invariant is:
+
+```text
+download_admission_active_current == sum(download_admission_active_by_profile)
+```
+
+It must **not** be written as a sum over identity dimensions. A public transfer
+occupies `link_source` and `client_link` simultaneously, so summing those
+against the node gauge double-counts every public byte and would make a healthy
+node look over-subscribed. That is the whole reason `active_by_profile` exists
+as a separate, mutually exclusive series.
+
+No label value may carry a bearer token, client IP, user, organization,
+repository or source identity. `tracked_identities` is how identity growth is
+observed — a bounded count per dimension, never one series per identity — and it
+is the metric that makes the criterion 5 churn evidence readable in production
+rather than only in tests.
+
+### 13. Direct Object Storage Is Separate
 
 The Compose files currently execute `mc anonymous set download` for storage
 buckets. A caller who knows a bucket/key can bypass application authentication,
 quota checks, traffic recording and D admission.
 
 This is `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01`, a separate object-storage
-exposure finding, not an undocumented part of D implementation. It remains a
-production-posture blocker until clean deploy verification proves production
-buckets are private and no direct signed/public download path bypasses the
-application. D may be technically closed while this separate production
-condition remains open; B4 production readiness must not be described as
-enabled while that bypass is unresolved.
+exposure finding, not an undocumented part of D implementation. Once D closes,
+`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` and its B4 umbrella may be marked closed;
+the object-storage issue remains independently open. The overall production
+verdict stays no-go while the object-storage issue is open, and production
+readiness must not be described as enabled while that bypass is unresolved.
 
 ## Closure Criteria
 
@@ -381,22 +546,26 @@ and the relevant integration/fault drill:
 | 7 | Recoverable lifetime | Context cancellation, idle-write timeout, writer reachability, storage cancellation and idempotent release are proven |
 | 8 | Correct HTTP behavior | 503/Retry-After contract, Range behavior, post-header failure, 304/416/redirect handling and byte integrity are preserved |
 | 9 | Block GET safety | Block GET streams through the canonical reader with authoritative size and no full-block materialization |
-| 10 | Middleware wiring | Actual gzip stack and real TCP tests cover block, files, ZIP, raw, history and `/d/...`; H2 is validated through supported proxy topology |
+| 10 | Middleware and proxy wiring | Actual gzip stack, real TCP tests and the supported nginx topology cover block, files, ZIP, raw, history and `/d/...`; buffering, timeout and H2 behavior are verified |
 | 11 | Client recovery | `seaf-cli`, browser/download behavior and OnlyOffice retrieval recover or fail clearly under saturation |
-| 12 | Configuration evidence | Defaults, ceilings and long-transfer capacities are measured, validated and documented as process-local |
+| 12 | Configuration evidence | Defaults, ceilings and long-transfer capacities are measured, validated and documented as process-local; egress throughput is measured and the byte-rate residual is explicit |
 | 13 | No false storage claim | MinIO/direct-object exposure remains separately tracked and is not silently treated as closed by D |
+| 14 | Observability and configuration contract | Every key ships in all `configs/*.yaml`, both `.env` examples and `applyEnvOverrides()` with enforced ceilings; the metric series and their fixed label sets exist as specified; `active_current == sum(active_by_profile)` holds under mixed authenticated and public load; no identity value appears in any label |
 
 ## D0-D6 PR Sequence
 
-Each PR is independently reviewable, safe to stop after review and must not
-claim a later PR's behavior.
+Each PR is independently reviewable and safe to stop during development; none
+may claim a later PR's behavior. Runtime rollout constraints are explicit: D2's
+strict token contract is deployed as one coordinated greenfield version across
+all writers and consumers. This series does not promise mixed-version rolling
+deployment for token issuance.
 
 | PR | Purpose | Runtime behavior |
 |---|---|---|
 | D0 | Contract, inventory, identity and evidence record | None; docs only |
 | D1 | Neutral D coordinator, atomic dimensions, bounded state, config and metrics | Coordinator not yet connected to producers |
-| D2 | Stable `SourceID` for all public download-token mint paths | New link tokens become strict; no legacy compatibility |
-| D3 | Writer lifetime, idle-write deadline and actual gzip exclusions | Writer safety exercised before broad admission activation |
+| D2 | Stable `SourceID` for all public download-token mint paths | New link tokens become strict; no legacy compatibility; coordinated greenfield rollout |
+| D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Writer safety exercised before broad admission activation |
 | D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | All listed storage-backed producers use D |
 | D5 | Stream sync block GET through existing canonical reader APIs | Block GET no longer materializes the block |
 | D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass |

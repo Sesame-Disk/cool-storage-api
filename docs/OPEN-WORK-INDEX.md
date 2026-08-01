@@ -135,6 +135,7 @@ on every replica in every DC until both close.
 | `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One global Paxos round per block. **PR-11, not started** — need a per-statement latency metric first. |
 | `ISSUE-CANONICAL-READ-FANOUT-01` (= X5) | MEDIUM | Canonical read fan-out never validated against a real cluster |
 | `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` (= X11) | MEDIUM | 100k id cap bounds the parser, not the ~100k sequential Cassandra reads |
+| `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` | MEDIUM (deferred) | D bounds aggregate accepted work, not bytes per second; measure node egress at D6 before choosing shaping |
 | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (= X6) | MEDIUM | Read-after-write across DCs; 3×25 ms retry covers local lag only |
 
 ## Verification debt
