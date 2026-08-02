@@ -1,9 +1,10 @@
 # B4 Subcontract D — Download Admission Contract
 
 **Date:** 2026-08-01  
-**Branch:** `docs/b4-subcontract-d0-contract`  
-**Status:** D0 documentation only. No production code or runtime behavior is
-changed by this document.
+**Branch:** `fix/b4-subcontract-d1-download-admission`
+**Status:** D0 contract; D1 coordinator/configuration implementation complete
+in this branch. Producer wiring remains deferred to D4, and positive operating
+values remain deferred to D6.
 
 This document freezes the contract and inventory for subcontract D of
 `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`. It is the design record for the D1-D6
@@ -31,6 +32,20 @@ The original row remains the canonical finding:
 
 The implementation must not satisfy that sentence only by protecting two URLs
 while leaving equivalent storage-read paths unbounded.
+
+## D1 Implementation Boundary
+
+D1 supplies the process-local coordinator, structured identity constructors,
+bounded waiter/identity state, configuration validation, fixed-label metrics and
+unit/race-test coverage. It intentionally does not call the coordinator from a
+download producer, mint or propagate public-link source IDs, install response
+deadlines, or select positive capacity values. Those are D2-D6 deliverables.
+
+The repository templates remain safe during this staged rollout: every
+`download_admission` block is present with `enabled: false` and zero values.
+D6, not D1, is the first phase allowed to replace those placeholders with
+measured positive defaults. Enabling the section before D4 wiring would provide
+no producer protection and is therefore a configuration error.
 
 ## Why D Exists
 
@@ -228,6 +243,14 @@ The coordinator must not hold its mutex while waiting, accessing Cassandra/S3
 or writing a response. A waiter that cannot currently satisfy all dimensions
 must not consume active capacity. Scheduling must avoid an exhausted identity
 head-of-line blocking unrelated identities.
+
+D1 uses a close-and-replace broadcast notification for parked waiters. This is
+intentional: the bounded waiter set is rechecked as a whole so an exhausted
+identity cannot block unrelated identities. It is not FIFO and new arrivals may
+barge when capacity opens; the configured waiter ceiling bounds the resulting
+thundering-herd work. D1 includes a contended acquire/release test; D6 should
+benchmark the wake-up cost at the measured queue ceiling before selecting a
+positive queue size.
 
 The shared node capacity is one invariant, not one independent node cap per
 profile. A public transfer occupies both source dimensions for fairness but is
@@ -805,6 +828,12 @@ reason:    node_full | profile_full
 cause:     completed | client_disconnect | preparation_timeout
            | idle_write_timeout | storage_error | response_error | panic
 ```
+
+An impossible package-level `AdmissionRequest` returns `invalid_request` to its
+caller but is outside this capacity-reason metric set and does not increment
+`download_admission_rejected_total`. The public constructors reject those
+inputs before a producer can call the coordinator; this path exists only as a
+defensive package boundary.
 
 `reason` names the identity dimension that refused the request rather than
 collapsing all three into one `identity_full`. `waiters_by_gate` already

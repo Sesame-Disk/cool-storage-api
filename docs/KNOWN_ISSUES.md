@@ -19,7 +19,7 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B and C are closed; download/block GET (D) remains open with no runtime implementation yet. D0 freezes the broader byte-producing download scope, atomic multidimensional admission, stable public-link identity and the D1-D6 PR sequence. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B and C are closed; download/block GET (D) remains open because no producer route is wired yet. D1's isolated coordinator, config, metrics and bounded-state evidence are present on the implementation branch; D0 freezes the broader byte-producing download scope, atomic multidimensional admission, stable public-link identity and the D1-D6 PR sequence. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
 | **Anonymous object-storage downloads** | 🔴 Open — production posture blocker | Supported Compose storage policies currently grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
@@ -5048,7 +5048,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces and equivalent storage-backed read surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B and C are closed**; **D remains open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; no D runtime behavior has landed. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C does not close the B4 umbrella.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B and C are closed**; **D remains open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 now adds the isolated coordinator, schema and metrics, but no producer route is wired and no positive capacity has been measured. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`, `GET /seafhttp/zip/:token`, `GET /repo/:repo_id/raw/*filepath`, `GET /repo/:repo_id/history/download`, `GET /repo/:repo_id/history/raw`, share-link raw under `/d/:token`, and the share-file bootstrap inline-content read. D's authoritative producer inventory is the D0 contract, not this list
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5613,11 +5613,13 @@ here: fleet capacity scales with node count. Closing C did not close the
 umbrella; **D (download / block GET) remains open**, so B4 remains a production
 blocker.
 
-#### Subcontract D: download admission contract and inventory (D0, 2026-08-01)
+#### Subcontract D: download admission contract and inventory (D0/D1, 2026-08-01)
 
-D0 is documentation only. It freezes the scope and criteria for the final open
+D0 was documentation only and froze the scope and criteria for the final open
 subcontract in [`docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md).
-No D runtime behavior is claimed here.
+D1 now provides the isolated coordinator, configuration, fixed-label metrics and
+bounded-state tests on the implementation branch. No producer route is wired,
+so D remains open and no application download is protected yet.
 
 The original D row named the seafhttp file download and authenticated block GET.
 The closure scope is intentionally defined by **storage-backed byte production**

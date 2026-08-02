@@ -59,6 +59,7 @@ func clearLoadEnvOverrides(t *testing.T) {
 		"HEALTH_",
 		"FILEVIEW_",
 		"GC_",
+		"DOWNLOAD_ADMISSION_",
 		"S3_CLASS_",
 	} {
 		for _, entry := range os.Environ() {
