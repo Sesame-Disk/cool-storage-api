@@ -19,7 +19,7 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B, C and D2 are complete; download/block GET admission (D3-D6) remains open because no producer route is wired yet. D1's isolated coordinator and D2's strict stable public-link token identity are implemented; D0 freezes the broader byte-producing download scope, atomic multidimensional admission and the D1-D6 PR sequence. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B, C, D2 and D3 are complete; download/block GET admission (D4-D6) remains open because no producer route is wired yet. D1's coordinator, D2's stable public-link token identity and D3's writer lifetime/reachability layer are implemented; D0 freezes the broader byte-producing download scope, atomic multidimensional admission and the D1-D6 PR sequence. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
 | **Anonymous object-storage downloads** | 🔴 Open — production posture blocker | Supported Compose storage policies currently grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
@@ -5110,7 +5110,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces and equivalent storage-backed read surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B, C and D2 are closed**; **D3-D6 remain open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, and D2 now gives every public download-token mint flow a stable `SourceID` with strict writer and consumer validation. No admission producer route is wired and no positive capacity has been measured. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C/D2 does not close the B4 umbrella.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B, C, D2 and D3 are closed**; **D4-D6 remain open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, and D3 supplies the idle-write writer plus actual-route gzip/proxy reachability. No admission producer route is wired and no positive capacity has been measured. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C/D2/D3 does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`, `GET /seafhttp/zip/:token`, `GET /repo/:repo_id/raw/*filepath`, `GET /repo/:repo_id/history/download`, `GET /repo/:repo_id/history/raw`, share-link raw under `/d/:token`, and the share-file bootstrap inline-content read. D's authoritative producer inventory is the D0 contract, not this list
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5675,7 +5675,7 @@ here: fleet capacity scales with node count. Closing C did not close the
 umbrella; **D (download / block GET) remains open**, so B4 remains a production
 blocker.
 
-#### Subcontract D: download admission contract and inventory (D0/D1/D2, 2026-08-01)
+#### Subcontract D: download admission contract and inventory (D0/D1/D2/D3, 2026-08-02)
 
 D0 was documentation only and froze the scope and criteria for the final open
 subcontract in [`docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md).
@@ -5683,8 +5683,10 @@ D1 now provides the isolated coordinator, configuration, fixed-label metrics and
 bounded-state tests on the implementation branch. D2 now wires the stable
 public-link `SourceID` through normal download, public OnlyOffice and public ZIP
 token minting, and rejects blank link identities in token writers and download
-consumers. No admission producer route is wired, so D remains open and no
-application download is protected yet.
+consumers. D3 now supplies the reusable idle-write writer, fail-closed writer
+reachability checks, actual-route gzip exclusions and frontend proxy buffering
+for the public bootstrap routes. No admission producer route is wired, so D
+remains open and no application download is protected yet.
 
 The original D row named the seafhttp file download and authenticated block GET.
 The closure scope is intentionally defined by **storage-backed byte production**
@@ -5765,25 +5767,19 @@ not over every concurrent scrape. No label carries a bearer, IP, user, org, repo
 or source identity, and every label value set is enumerated in the contract.
 
 The current block gzip exclusion already covers both block methods through
-`/seafhttp/repo/.*/block/.*`. The stale `/api/v2.1/...raw` and
-`/api/v2.1/...history` patterns do not cover the registered `/repo/...` routes,
-and `/d/...` cannot be selectively excluded by `raw=1` through the current
-path-regex API. D3 must ensure that raw/history and share-raw writers can reach
-the connection deadline, either through route/query-aware gzip bypass or a
-writer chain that correctly exposes the response-controller interfaces. For
-`/d/...` a blanket exclusion is an acceptable final answer rather than a
-compromise: those two routes serve only `dl=1` and `raw=1` plus a short `404`
-JSON, so there is no large compressible payload there to protect.
+`/seafhttp/repo/.*/block/.*`. D3 replaces the stale API raw/history patterns
+with actual `/repo/...` route exclusions, adds a blanket `/d/...` exclusion and
+excludes both inline bootstrap routes. The supported frontend nginx topology
+also disables proxy buffering for those bootstrap routes, while egress cost
+remains a D6 measurement. The D3 writer tests prove that the connection deadline
+is reachable and that an unsupported writer fails closed.
 
 The compressible inline-text bootstrap is on **different** routes —
-`/api/v2.1/share-links/:token/bootstrap` and `.../files/bootstrap` — and no
-current exclusion pattern matches them, so the `link_inline` producer writes its
-response from inside gzip today. That is the configuration that made C's
-admitted lifetime unenforceable, so D3 must make those two routes
-writer-reachable, preferably by fixing the writer chain rather than dropping
-compression on a highly compressible payload. The deadline is installed
-immediately before each underlying write/flush, cleared after the stream and
-fail-closed before headers if the connection is unreachable.
+`/api/v2.1/share-links/:token/bootstrap` and `.../files/bootstrap` — and D3 now
+excludes them from Go gzip and proxy buffering. The deadline writer is installed
+by D4 immediately before the inline response is produced; it is installed
+before each underlying write/flush, cleared after the stream and fail-closed
+before headers if the connection is unreachable.
 
 `GetBlockReader` and `GetBlockSize` already exist. D5 wires them into
 `SyncHandler.GetBlock` so the block is streamed opaquely with authoritative size,
