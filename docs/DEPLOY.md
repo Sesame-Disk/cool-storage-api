@@ -107,13 +107,15 @@ Why this is the supported deploy model:
 
 If you use a different proxy chain and do not preserve the canonicalized client IP at the last nginx hop, adjust `SERVER_TRUSTED_PROXIES` for that topology instead.
 
-### Download admission (D1)
+### Download admission (D1/D2)
 
 D1 adds the process-local coordinator, bounded state, configuration schema and
-Prometheus series for storage-backed downloads. It does not wire any producer
-route yet, and it does not choose measured operating capacity. Every shipped
-YAML and env template therefore keeps `download_admission.enabled=false` and
-all D1 values at zero.
+Prometheus series for storage-backed downloads. D2 makes the public download-
+link token contract strict: every newly minted link token carries the stable
+source identity derived from the share-link token, and remints preserve it. D2
+does not wire any admission producer route yet, and it does not choose measured
+operating capacity. Every shipped YAML and env template therefore keeps
+`download_admission.enabled=false` and all D1 values at zero.
 
 Do not enable this section in production before D4 wiring and D6 measurement.
 When D6 selects positive values, the following startup rules still apply:
@@ -780,7 +782,7 @@ docker compose -f docker-compose.prod.yml up -d frontend
 
 Do not use `--build` for the normal prod path. The production compose consumes published images, not local Docker builds.
 
-### Stable upload-link source IDs on a clean deployment (migration 013)
+### Stable public-link source IDs on a clean deployment (migration 013)
 
 SesameFS currently supports this schema contract for greenfield deployments
 only. Apply all Cassandra migrations before serving traffic, and verify
@@ -788,16 +790,18 @@ only. Apply all Cassandra migrations before serving traffic, and verify
 Do not start the application against a schema where migration 013 has not
 completed.
 
-Every newly minted public-link upload token must carry a non-empty, stable,
-non-secret source ID. Token writers reject a blank source ID, and `HandleUpload`
-fails closed if a link-origin token without one is read. There is no rolling or
-legacy-token fallback. Reminting a short-lived seafhttp URL preserves the exact
-source ID, so it does not reset the A1 attempt-rate keys or A2 in-flight source
-key on that node.
+Every newly minted public-link upload or download token must carry a non-empty,
+stable, non-secret source ID. Token writers reject a blank source ID, and
+`HandleUpload`, `HandleDownload` and `HandleZipDownload` fail closed if a
+link-origin token without one is read. There is no rolling or legacy-token
+fallback. Reminting a short-lived seafhttp URL preserves the exact source ID,
+so it does not reset the A1 attempt-rate keys or A2 in-flight source key on that
+node.
 
-The live Cassandra integration test
-`TestAccessTokenSourceIDPersistsAcrossLinkUploadTokenRemints` verifies that
-migration 013 installed the column, two distinct remints read back the exact same
+The live Cassandra integration tests
+`TestAccessTokenSourceIDPersistsAcrossLinkUploadTokenRemints` and
+`TestAccessTokenSourceIDPersistsAcrossLinkDownloadTokenRemints` verify that
+migration 013 installed the column, distinct remints read back the exact same
 source ID, and the Cassandra token writer rejects a blank source ID.
 
 The upload-link rate buckets and concurrency counters remain process-local. They

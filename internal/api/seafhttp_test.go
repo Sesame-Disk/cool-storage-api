@@ -1316,6 +1316,41 @@ func TestTokenManagerCreateLinkUploadTokenRejectsBlankSourceID(t *testing.T) {
 	}
 }
 
+func TestTokenManagerCreateLinkDownloadTokenPreservesSourceID(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	sourceID := "stable-download-link-fingerprint"
+
+	firstToken, err := tm.CreateLinkDownloadToken("org1", "repo1", "/file.txt", "user1", sourceID)
+	if err != nil {
+		t.Fatalf("first CreateLinkDownloadToken failed: %v", err)
+	}
+	secondToken, err := tm.CreateLinkDownloadToken("org1", "repo1", "/file.txt", "user1", sourceID)
+	if err != nil {
+		t.Fatalf("second CreateLinkDownloadToken failed: %v", err)
+	}
+	if firstToken == secondToken {
+		t.Fatal("reminted link download token strings must differ")
+	}
+	for label, tokenString := range map[string]string{"first": firstToken, "second": secondToken} {
+		token, ok := tm.GetToken(tokenString, TokenTypeDownload)
+		if !ok {
+			t.Fatalf("%s link download token should be retrievable", label)
+		}
+		if token.Source != "link" || token.SourceID != sourceID {
+			t.Fatalf("%s token source = (%q, %q), want (link, %q)", label, token.Source, token.SourceID, sourceID)
+		}
+	}
+}
+
+func TestTokenManagerCreateLinkDownloadTokenRejectsBlankSourceID(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	for _, sourceID := range []string{"", " ", "\t\r\n"} {
+		if _, err := tm.CreateLinkDownloadToken("org1", "repo1", "/file.txt", "user1", sourceID); err == nil {
+			t.Fatalf("CreateLinkDownloadToken(%q) succeeded, want error", sourceID)
+		}
+	}
+}
+
 func TestTokenManagerCreateUpdateToken(t *testing.T) {
 	tm := NewTokenManager(1 * time.Hour)
 
@@ -1772,11 +1807,15 @@ func (m *MockTokenStore) CreateLinkUploadToken(orgID, repoID, path, userID, sour
 	return token.Token, nil
 }
 
-func (m *MockTokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
+func (m *MockTokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
+	if strings.TrimSpace(sourceID) == "" {
+		return "", errors.New("source ID is required for link download tokens")
+	}
 	token := &AccessToken{
 		Token:     "mock-link-download-token",
 		Type:      TokenTypeDownload,
 		Source:    "link",
+		SourceID:  sourceID,
 		OrgID:     orgID,
 		RepoID:    repoID,
 		Path:      path,

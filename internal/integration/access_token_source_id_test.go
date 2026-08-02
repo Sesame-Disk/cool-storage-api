@@ -74,3 +74,52 @@ func TestAccessTokenSourceIDPersistsAcrossLinkUploadTokenRemints(t *testing.T) {
 		t.Fatal("CreateLinkUploadToken with empty SourceID succeeded, want rejection")
 	}
 }
+
+func TestAccessTokenSourceIDPersistsAcrossLinkDownloadTokenRemints(t *testing.T) {
+	requireCassandra(t)
+	database := shareProjectionDBForTest(t)
+	store := dbpkg.NewTokenStore(database, 5*time.Minute)
+	orgID := uuid.NewString()
+	repoID := uuid.NewString()
+	userID := uuid.NewString()
+	sourceID := "download-link-source-id"
+
+	var createdTokens []string
+	t.Cleanup(func() {
+		for _, token := range createdTokens {
+			if err := store.DeleteToken(token); err != nil {
+				t.Errorf("clean up access token %q: %v", token, err)
+			}
+		}
+	})
+
+	firstToken, err := store.CreateLinkDownloadToken(orgID, repoID, "/shared/file.txt", userID, sourceID)
+	if err != nil {
+		t.Fatalf("create first link download token: %v", err)
+	}
+	createdTokens = append(createdTokens, firstToken)
+	secondToken, err := store.CreateLinkDownloadToken(orgID, repoID, "/shared/file.txt", userID, sourceID)
+	if err != nil {
+		t.Fatalf("create second link download token: %v", err)
+	}
+	createdTokens = append(createdTokens, secondToken)
+	if firstToken == secondToken {
+		t.Fatalf("reminted link download token strings are equal: %q", firstToken)
+	}
+
+	for label, tokenString := range map[string]string{"first": firstToken, "second": secondToken} {
+		token, ok := store.GetToken(tokenString, dbpkg.TokenTypeDownload)
+		if !ok {
+			t.Fatalf("get %s link download token %q: not found", label, tokenString)
+		}
+		if token.Source != "link" || token.SourceID != sourceID {
+			t.Errorf("%s token source = (%q, %q), want (link, %q)", label, token.Source, token.SourceID, sourceID)
+		}
+	}
+
+	for _, blank := range []string{"", " ", "\t\r\n"} {
+		if token, err := store.CreateLinkDownloadToken(orgID, repoID, "/shared/file.txt", userID, blank); err == nil || token != "" {
+			t.Fatalf("CreateLinkDownloadToken(%q) = (%q, %v), want empty token and error", blank, token, err)
+		}
+	}
+}

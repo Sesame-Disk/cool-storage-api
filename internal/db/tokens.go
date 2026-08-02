@@ -158,8 +158,11 @@ func (ts *TokenStore) CreateDownloadToken(orgID, repoID, path, userID string) (s
 }
 
 // CreateLinkDownloadToken creates a download token for a share link — tagged as source="link".
-func (ts *TokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := ts.CreateToken(TokenTypeDownload, orgID, repoID, path, userID, "link")
+func (ts *TokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
+	if strings.TrimSpace(sourceID) == "" {
+		return "", fmt.Errorf("source ID is required for link download tokens")
+	}
+	token, err := ts.createToken(TokenTypeDownload, orgID, repoID, path, userID, "link", sourceID, false)
 	if err != nil {
 		return "", err
 	}
@@ -240,7 +243,7 @@ type TokenCreator interface {
 	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
 	CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error)
-	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 }
 
 // Ensure TokenStore implements TokenCreator

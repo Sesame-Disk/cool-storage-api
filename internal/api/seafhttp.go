@@ -79,7 +79,7 @@ type TokenStore interface {
 	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
 	CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error)
-	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 	GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool)
 	DeleteToken(tokenStr string) error
 	CreateOneTimeLoginToken(userID, orgID, authToken string) (string, error)
@@ -184,8 +184,11 @@ func (tm *TokenManager) CreateLinkUploadToken(orgID, repoID, path, userID, sourc
 }
 
 // CreateLinkDownloadToken creates a download token tagged as a share link.
-func (tm *TokenManager) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := tm.CreateToken(TokenTypeDownload, orgID, repoID, path, userID, "link", tm.tokenTTL)
+func (tm *TokenManager) CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
+	if strings.TrimSpace(sourceID) == "" {
+		return "", errors.New("source ID is required for link download tokens")
+	}
+	token, err := tm.createToken(TokenTypeDownload, orgID, repoID, path, userID, "link", sourceID, false, tm.tokenTTL)
 	if err != nil {
 		return "", err
 	}
@@ -3743,6 +3746,10 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired download token"})
 		return
 	}
+	if token.Source == "link" && strings.TrimSpace(token.SourceID) == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid download token"})
+		return
+	}
 
 	log.Printf("[HandleDownload] Token valid: OrgID=%s, RepoID=%s, Path=%s", token.OrgID, token.RepoID, token.Path)
 
@@ -4279,6 +4286,10 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	token, valid := h.tokenStore.GetToken(tokenStr, TokenTypeDownload)
 	if !valid {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired download token"})
+		return
+	}
+	if token.Source == "link" && strings.TrimSpace(token.SourceID) == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid download token"})
 		return
 	}
 

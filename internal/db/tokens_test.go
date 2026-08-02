@@ -53,3 +53,12 @@ func TestTokenStoreCreateLinkUploadTokenRejectsBlankSourceID(t *testing.T) {
 		}
 	}
 }
+
+func TestTokenStoreCreateLinkDownloadTokenRejectsBlankSourceID(t *testing.T) {
+	store := &TokenStore{}
+	for _, sourceID := range []string{"", " ", "\t\r\n"} {
+		if _, err := store.CreateLinkDownloadToken("org", "repo", "/file.txt", "user", sourceID); err == nil {
+			t.Fatalf("CreateLinkDownloadToken(%q) succeeded, want error", sourceID)
+		}
+	}
+}

@@ -37,8 +37,8 @@ func (a *CassandraTokenAdapter) CreateDownloadToken(orgID, repoID, path, userID 
 }
 
 // CreateLinkDownloadToken creates a download token tagged as a share link.
-func (a *CassandraTokenAdapter) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
-	return a.store.CreateLinkDownloadToken(orgID, repoID, path, userID)
+func (a *CassandraTokenAdapter) CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
+	return a.store.CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID)
 }
 
 // GetToken retrieves and validates a token
