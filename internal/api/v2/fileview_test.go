@@ -10,8 +10,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/downloadadmission"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/gin-gonic/gin"
 )
 
@@ -61,6 +64,46 @@ func TestExtractIWorkPreviewPDFContextStopsAfterCancellation(t *testing.T) {
 	case <-ctx.done:
 	default:
 		t.Fatal("test context was not canceled during archive traversal")
+	}
+}
+
+func TestRespondIWorkPreparationFailureDeadlineReturns503(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/file", nil)
+	lifecycle, reason, err := httputil.AcquireDownloadAdmission(c, nil, config.DownloadAdmissionConfig{}, downloadadmission.AdmissionRequest{})
+	if err != nil || reason != "" || lifecycle == nil {
+		t.Fatalf("AcquireDownloadAdmission = (%v, %q, %v)", lifecycle, reason, err)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancel()
+
+	respondIWorkPreparationFailure(c, lifecycle, ctx, context.DeadlineExceeded, "failed to read file")
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if recorder.Body.Len() == 0 {
+		t.Fatal("deadline response body is empty")
+	}
+}
+
+func TestRespondIWorkPreparationFailureDisconnectDoesNotWrite(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/file", nil)
+	lifecycle, reason, err := httputil.AcquireDownloadAdmission(c, nil, config.DownloadAdmissionConfig{}, downloadadmission.AdmissionRequest{})
+	if err != nil || reason != "" || lifecycle == nil {
+		t.Fatalf("AcquireDownloadAdmission = (%v, %q, %v)", lifecycle, reason, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	respondIWorkPreparationFailure(c, lifecycle, ctx, context.Canceled, "failed to read file")
+	if c.Writer.Written() {
+		t.Fatal("disconnect wrote an HTTP response")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("disconnect response body = %q, want empty", recorder.Body.String())
 	}
 }
 

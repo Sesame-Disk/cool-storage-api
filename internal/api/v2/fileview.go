@@ -125,6 +125,19 @@ func respondFileViewDownloadAdmissionFailure(c *gin.Context, err error) {
 	}
 }
 
+func respondIWorkPreparationFailure(c *gin.Context, lifecycle *httputil.DownloadAdmission, ctx context.Context, err error, message string) {
+	contextErr := ctx.Err()
+	lifecycle.ReleasePreparationError(err)
+	if errors.Is(contextErr, context.DeadlineExceeded) {
+		respondFileViewDownloadAdmissionFailure(c, fmt.Errorf("iWork preview preparation: %w", err))
+		return
+	}
+	if errors.Is(contextErr, context.Canceled) {
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": message})
+}
+
 func releaseFileViewDownloadPreparationFailure(lifecycle *httputil.DownloadAdmission, err error) {
 	if lifecycle != nil {
 		lifecycle.ReleasePreparationError(err)
@@ -136,10 +149,10 @@ func releaseFileViewDownloadStreamFailure(lifecycle *httputil.DownloadAdmission,
 		return
 	}
 	if errors.Is(err, streaming.ErrStreamResponse) {
-		lifecycle.Release(downloadadmission.ReleaseResponseError)
+		lifecycle.FailStreamError(downloadadmission.ReleaseResponseError)
 		return
 	}
-	lifecycle.Release(downloadadmission.ReleaseStorageError)
+	lifecycle.FailStreamError(downloadadmission.ReleaseStorageError)
 }
 
 // fileViewAuthWrapper wraps the server's standard auth middleware to also accept
@@ -682,52 +695,45 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		var content bytes.Buffer
 		iworkResolvedIDs, err := streaming.BatchResolveBlockIDsContext(ctx, h.db, orgID, representationID, blockIDs)
 		if err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle, err)
 			log.Printf("[ServeRawFile] block ID resolution failed for org=%s: %v", orgID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+			respondIWorkPreparationFailure(c, lifecycle, ctx, err, "failed to read file")
 			return
 		}
 		canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, orgID, iworkResolvedIDs, blockStore, blockStoreClass)
 		if err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle, err)
 			log.Printf("[ServeRawFile] canonical block reader construction failed for org=%s: %v", orgID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+			respondIWorkPreparationFailure(c, lifecycle, ctx, err, "failed to read file")
 			return
 		}
 		for idx := range blockIDs {
 			if err := ctx.Err(); err != nil {
-				releaseFileViewDownloadPreparationFailure(lifecycle, err)
+				respondIWorkPreparationFailure(c, lifecycle, ctx, err, "failed to read file")
 				return
 			}
 			internalID := iworkResolvedIDs[idx]
 			reader, err := canonicalReader.GetBlockReader(ctx, internalID)
 			if err != nil {
-				releaseFileViewDownloadPreparationFailure(lifecycle, err)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+				respondIWorkPreparationFailure(c, lifecycle, ctx, err, "failed to read file")
 				return
 			}
 			if encrypted && fileKey != nil {
 				blockData, err := readAllContext(ctx, reader)
 				closeErr := reader.Close()
 				if err != nil {
-					releaseFileViewDownloadPreparationFailure(lifecycle, err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+					respondIWorkPreparationFailure(c, lifecycle, ctx, err, "failed to read file")
 					return
 				}
 				if closeErr != nil {
-					releaseFileViewDownloadPreparationFailure(lifecycle, closeErr)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+					respondIWorkPreparationFailure(c, lifecycle, ctx, closeErr, "failed to read file")
 					return
 				}
 				blockData, err = crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 				if err != nil {
-					releaseFileViewDownloadPreparationFailure(lifecycle, err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "decryption failed"})
+					respondIWorkPreparationFailure(c, lifecycle, ctx, err, "decryption failed")
 					return
 				}
 				if err := ctx.Err(); err != nil {
-					releaseFileViewDownloadPreparationFailure(lifecycle, err)
-					respondFileViewDownloadAdmissionFailure(c, fmt.Errorf("iWork preview preparation: %w", err))
+					respondIWorkPreparationFailure(c, lifecycle, ctx, err, "failed to read file")
 					return
 				}
 				content.Write(blockData)
@@ -735,37 +741,28 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 				_, err = copyContext(ctx, &content, reader)
 				closeErr := reader.Close()
 				if err != nil {
-					releaseFileViewDownloadPreparationFailure(lifecycle, err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+					respondIWorkPreparationFailure(c, lifecycle, ctx, err, "failed to read file")
 					return
 				}
 				if closeErr != nil {
-					releaseFileViewDownloadPreparationFailure(lifecycle, closeErr)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+					respondIWorkPreparationFailure(c, lifecycle, ctx, closeErr, "failed to read file")
 					return
 				}
 			}
 		}
 
 		if err := ctx.Err(); err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle, err)
-			respondFileViewDownloadAdmissionFailure(c, fmt.Errorf("iWork preview preparation: %w", err))
+			respondIWorkPreparationFailure(c, lifecycle, ctx, err, "failed to read file")
 			return
 		}
 		previewData, err := extractIWorkPreviewPDFContext(ctx, content.Bytes(), h.config.FileView.MaxIWorkPreviewBytes)
 		if err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle, err)
 			log.Printf("[ServeRawFile] Failed to extract iWork preview: %v", err)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				respondFileViewDownloadAdmissionFailure(c, fmt.Errorf("iWork preview preparation: %w", err))
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "no preview available for this file"})
+			respondIWorkPreparationFailure(c, lifecycle, ctx, err, "no preview available for this file")
 			return
 		}
 		if err := ctx.Err(); err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle, err)
-			respondFileViewDownloadAdmissionFailure(c, fmt.Errorf("iWork preview preparation: %w", err))
+			respondIWorkPreparationFailure(c, lifecycle, ctx, err, "failed to read file")
 			return
 		}
 		previewMIME := "application/pdf"
@@ -835,7 +832,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		}
 		rs := streaming.NewBlockReadSeeker(streamCtx, canonicalReader, resolvedIDs, blockSizes, fileSize, fileKeyParam, fileIVParam)
 		rs.SetReadErrorHandler(func(error) {
-			lifecycle.Release(downloadadmission.ReleaseStorageError)
+			lifecycle.FailStreamError(downloadadmission.ReleaseStorageError)
 		})
 		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
 		return

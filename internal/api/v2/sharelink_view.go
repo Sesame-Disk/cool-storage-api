@@ -1041,7 +1041,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 
 		rs := streaming.NewBlockReadSeeker(streamCtx, canonicalReader, resolvedIDs, blockSizes, fileSize, fileKeyParam, fileIVParam)
 		rs.SetReadErrorHandler(func(error) {
-			lifecycle.Release(downloadadmission.ReleaseStorageError)
+			lifecycle.FailStreamError(downloadadmission.ReleaseStorageError)
 		})
 		c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 		c.Header("Content-Type", mimeType)
@@ -1066,9 +1066,9 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 
 	if err := streaming.StreamBlocks(c, streamCtx, canonicalReader, resolvedIDs, fileKeyParam, fileIVParam, "ShareLinkRaw"); err != nil {
 		if errors.Is(err, streaming.ErrStreamResponse) {
-			lifecycle.Release(downloadadmission.ReleaseResponseError)
+			lifecycle.FailStreamError(downloadadmission.ReleaseResponseError)
 		} else {
-			lifecycle.Release(downloadadmission.ReleaseStorageError)
+			lifecycle.FailStreamError(downloadadmission.ReleaseStorageError)
 		}
 	}
 }

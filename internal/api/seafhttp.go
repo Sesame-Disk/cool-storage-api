@@ -3901,7 +3901,7 @@ func releaseSeafHTTPDownloadStreamFailure(lifecycle *httputil.DownloadAdmission,
 	if lifecycle == nil {
 		return
 	}
-	lifecycle.Release(seafHTTPDownloadStreamCause(err))
+	lifecycle.FailStreamError(seafHTTPDownloadStreamCause(err))
 }
 
 func seafHTTPDownloadStreamCause(err error) downloadadmission.ReleaseCause {

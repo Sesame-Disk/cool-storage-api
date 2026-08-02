@@ -17,21 +17,20 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-type zipCloseGateWriter struct {
+type zipCloseGateResponseWriter struct {
+	gin.ResponseWriter
 	started chan struct{}
 	allow   chan struct{}
 	once    sync.Once
-	err     error
 }
 
-func (w *zipCloseGateWriter) Write(p []byte) (int, error) {
+func (w *zipCloseGateResponseWriter) Write(p []byte) (int, error) {
 	w.once.Do(func() { close(w.started) })
 	<-w.allow
-	if w.err != nil {
-		return 0, w.err
-	}
 	return len(p), nil
 }
+
+func (*zipCloseGateResponseWriter) SetWriteDeadline(time.Time) error { return nil }
 
 func zipAdmissionConfig() config.DownloadAdmissionConfig {
 	return config.DownloadAdmissionConfig{
@@ -49,6 +48,11 @@ func zipAdmissionConfig() config.DownloadAdmissionConfig {
 }
 
 func newZipAdmissionLifecycle(t *testing.T) (*httputil.DownloadAdmission, *downloadadmission.Coordinator) {
+	lifecycle, coordinator, _ := newZipAdmissionLifecycleWithWriter(t, nil)
+	return lifecycle, coordinator
+}
+
+func newZipAdmissionLifecycleWithWriter(t *testing.T, writer gin.ResponseWriter) (*httputil.DownloadAdmission, *downloadadmission.Coordinator, *gin.Context) {
 	t.Helper()
 	cfg := zipAdmissionConfig()
 	coordinator, err := downloadadmission.New(&cfg)
@@ -57,6 +61,9 @@ func newZipAdmissionLifecycle(t *testing.T) (*httputil.DownloadAdmission, *downl
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
+	if writer != nil {
+		c.Writer = writer
+	}
 	c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/zip/token", nil)
 	request, err := downloadadmission.NewAuthenticatedRequest(downloadadmission.ProfileZIP, "org-1", "zip-user")
 	if err != nil {
@@ -66,13 +73,22 @@ func newZipAdmissionLifecycle(t *testing.T) (*httputil.DownloadAdmission, *downl
 	if err != nil || reason != "" || lifecycle == nil {
 		t.Fatalf("AcquireDownloadAdmission = (%v, %q, %v)", lifecycle, reason, err)
 	}
-	return lifecycle, coordinator
+	return lifecycle, coordinator, c
 }
 
 func TestFinishSeafHTTPZipDownloadHoldsLeaseThroughClose(t *testing.T) {
-	lifecycle, coordinator := newZipAdmissionLifecycle(t)
-	gated := &zipCloseGateWriter{started: make(chan struct{}), allow: make(chan struct{})}
-	zipWriter := zip.NewWriter(gated)
+	baseRecorder := httptest.NewRecorder()
+	baseContext, _ := gin.CreateTestContext(baseRecorder)
+	gated := &zipCloseGateResponseWriter{
+		ResponseWriter: baseContext.Writer,
+		started:        make(chan struct{}),
+		allow:          make(chan struct{}),
+	}
+	lifecycle, coordinator, c := newZipAdmissionLifecycleWithWriter(t, gated)
+	if _, err := lifecycle.StartStreaming(); err != nil {
+		t.Fatalf("StartStreaming = %v", err)
+	}
+	zipWriter := zip.NewWriter(c.Writer)
 	cause := downloadadmission.ReleaseStorageError
 	done := make(chan struct{})
 	go func() {
