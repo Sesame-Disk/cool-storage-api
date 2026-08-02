@@ -489,7 +489,7 @@ func TestDownloadAdmissionIdleTimeoutClaimsCauseBeforeCancellation(t *testing.T)
 	waitForMetric(t, func() float64 { return releaseCount(downloadadmission.ReleaseIdleWriteTimeout) }, beforeIdle+1)
 }
 
-func TestDownloadAdmissionReleaseUsesFirstCauseExactlyOnce(t *testing.T) {
+func TestDownloadAdmissionFailUsesFirstCauseExactlyOnce(t *testing.T) {
 	cfg := admissionLifecycleConfig()
 	coordinator := newAdmissionLifecycleCoordinator(t, cfg)
 	beforeStorage := releaseCount(downloadadmission.ReleaseStorageError)
@@ -500,8 +500,8 @@ func TestDownloadAdmissionReleaseUsesFirstCauseExactlyOnce(t *testing.T) {
 		t.Fatalf("AcquireDownloadAdmission = (%q, %v)", reason, err)
 	}
 
-	lifecycle.Release(downloadadmission.ReleaseStorageError)
-	lifecycle.Release(downloadadmission.ReleaseCompleted)
+	lifecycle.Fail(downloadadmission.ReleaseStorageError)
+	lifecycle.Fail(downloadadmission.ReleaseCompleted)
 	if err := lifecycle.Finish(downloadadmission.ReleaseCompleted); err != nil {
 		t.Fatalf("Finish = %v", err)
 	}
@@ -513,7 +513,7 @@ func TestDownloadAdmissionReleaseUsesFirstCauseExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestDownloadAdmissionConcurrentReleaseIsIdempotent(t *testing.T) {
+func TestDownloadAdmissionConcurrentFailIsIdempotent(t *testing.T) {
 	cfg := admissionLifecycleConfig()
 	coordinator := newAdmissionLifecycleCoordinator(t, cfg)
 	causes := []downloadadmission.ReleaseCause{
@@ -538,10 +538,13 @@ func TestDownloadAdmissionConcurrentReleaseIsIdempotent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lifecycle.Release(cause)
+			lifecycle.Fail(cause)
 		}()
 	}
 	wg.Wait()
+	if err := lifecycle.Finish(downloadadmission.ReleaseCompleted); err != nil {
+		t.Fatalf("Finish = %v", err)
+	}
 	after := 0.0
 	for _, cause := range causes {
 		after += releaseCount(cause)

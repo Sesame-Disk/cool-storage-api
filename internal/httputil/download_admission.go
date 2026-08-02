@@ -332,17 +332,6 @@ func (l *DownloadAdmission) finishCause(cause downloadadmission.ReleaseCause) {
 	}
 }
 
-// Release is the explicit immediate-release escape hatch for callers that do
-// not own a deferred producer cleanup. HTTP download producers should use Fail
-// on terminal errors and let Finish release after their cleanup.
-func (l *DownloadAdmission) Release(cause downloadadmission.ReleaseCause) {
-	if l == nil || !l.enabled {
-		return
-	}
-	l.Fail(cause)
-	l.releaseLease()
-}
-
 // ReleasePreparationError attributes a preparation failure to the request's
 // cancellation or preparation deadline when either one caused the error. It
 // claims the lease under the same mutex as the deadline callback, so the

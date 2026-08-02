@@ -4602,6 +4602,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 
 	if err := h.addDirToZip(streamCtx, zipWriter, canonicalReader, preparedFiles, fileKey, fileIV); err != nil {
 		zipCause = seafHTTPDownloadStreamCause(err)
+		lifecycle.FailStreamError(zipCause)
 		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", err)
 		return
 	}
@@ -4729,6 +4730,13 @@ func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter 
 	}
 	if originalPanic != nil {
 		finalCause = downloadadmission.ReleasePanic
+	}
+	if finalCause != downloadadmission.ReleaseCompleted {
+		if finalCause == downloadadmission.ReleasePanic {
+			lifecycle.Fail(finalCause)
+		} else {
+			lifecycle.FailStreamError(finalCause)
+		}
 	}
 
 	var closeErr error

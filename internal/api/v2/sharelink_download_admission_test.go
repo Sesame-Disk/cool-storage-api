@@ -2,6 +2,7 @@ package v2
 
 import (
 	"context"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"net/http"
@@ -117,6 +118,54 @@ func TestShareLinkRawAdmissionFollowsCheapGates(t *testing.T) {
 		}
 		previous = position
 	}
+}
+
+func TestShareLinkDownloadAdmissionProducersDeferCleanup(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve current file path")
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "sharelink_view.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse sharelink_view.go: %v", err)
+	}
+	for _, tt := range []struct {
+		name      string
+		deferCall string
+	}{
+		{name: "handleShareLinkRaw", deferCall: "FinishHandler"},
+		{name: "emitShareFileBootstrap", deferCall: "Finish"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if !shareLinkDefersCall(findFunction(t, file, tt.name), tt.deferCall) {
+				t.Fatalf("%s does not defer %s", tt.name, tt.deferCall)
+			}
+		})
+	}
+}
+
+func shareLinkDefersCall(fn *ast.FuncDecl, name string) bool {
+	found := false
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		deferStmt, ok := node.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+		ast.Inspect(deferStmt.Call, func(child ast.Node) bool {
+			call, ok := child.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if ok && selector.Sel.Name == name {
+				found = true
+			}
+			return true
+		})
+		return true
+	})
+	return found
 }
 
 func TestShareFileBootstrapSkipsAdmissionForNonProducers(t *testing.T) {

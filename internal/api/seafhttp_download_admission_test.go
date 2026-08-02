@@ -2,8 +2,13 @@ package api
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -106,6 +111,64 @@ func TestSeafHTTPDownloadAdmissionRefusesFullFileAndZIPProfiles(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSeafHTTPDownloadAdmissionProducersDeferCleanup(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve current file path")
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "seafhttp.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse seafhttp.go: %v", err)
+	}
+
+	tests := []struct {
+		function  string
+		deferCall string
+	}{
+		{function: "HandleDownload", deferCall: "FinishHandler"},
+		{function: "HandleZipDownload", deferCall: "finishSeafHTTPZipDownload"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.function, func(t *testing.T) {
+			fn := seafHTTPFindFunction(t, file, tt.function)
+			if !seafHTTPDefersCall(fn, tt.deferCall) {
+				t.Fatalf("%s does not defer %s", tt.function, tt.deferCall)
+			}
+		})
+	}
+}
+
+func seafHTTPFindFunction(t *testing.T, file *ast.File, name string) *ast.FuncDecl {
+	t.Helper()
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name.Name == name {
+			return fn
+		}
+	}
+	t.Fatalf("function %s not found", name)
+	return nil
+}
+
+func seafHTTPDefersCall(fn *ast.FuncDecl, name string) bool {
+	found := false
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		deferStmt, ok := node.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+		switch call := deferStmt.Call.Fun.(type) {
+		case *ast.Ident:
+			found = found || call.Name == name
+		case *ast.SelectorExpr:
+			found = found || call.Sel.Name == name
+		}
+		return true
+	})
+	return found
 }
 
 func TestSeafHTTPDownloadAdmissionUsesLinkSourceIdentity(t *testing.T) {

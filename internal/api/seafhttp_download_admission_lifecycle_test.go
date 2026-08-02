@@ -90,6 +90,8 @@ func TestFinishSeafHTTPZipDownloadHoldsLeaseThroughClose(t *testing.T) {
 	}
 	zipWriter := zip.NewWriter(c.Writer)
 	cause := downloadadmission.ReleaseStorageError
+	beforeRelease := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(cause)))
+	lifecycle.FailStreamError(cause)
 	done := make(chan struct{})
 	go func() {
 		finishSeafHTTPZipDownload(lifecycle, &zipWriter, &cause)
@@ -100,6 +102,9 @@ func TestFinishSeafHTTPZipDownloadHoldsLeaseThroughClose(t *testing.T) {
 	case <-gated.started:
 	case <-time.After(time.Second):
 		t.Fatal("ZIP close did not reach the response writer")
+	}
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(cause))); got != beforeRelease {
+		t.Fatalf("release count during ZIP close = %v, want %v", got, beforeRelease)
 	}
 	request, err := downloadadmission.NewAuthenticatedRequest(downloadadmission.ProfileFile, "org-1", "other-user")
 	if err != nil {
@@ -115,6 +120,9 @@ func TestFinishSeafHTTPZipDownloadHoldsLeaseThroughClose(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("ZIP lifecycle did not finish after Close returned")
+	}
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(cause))); got != beforeRelease+1 {
+		t.Fatalf("release count after ZIP close = %v, want %v", got, beforeRelease+1)
 	}
 
 	available, reason := coordinator.Acquire(context.Background(), request)
