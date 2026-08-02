@@ -24,6 +24,7 @@ type idleWriteTestWriter struct {
 	flushes      int
 	writeErr     error
 	flushErr     error
+	shortWrite   bool
 	status       int
 	written      bool
 	closed       chan bool
@@ -39,6 +40,12 @@ func (w *idleWriteTestWriter) Header() http.Header { return w.header }
 func (w *idleWriteTestWriter) Write(p []byte) (int, error) {
 	if w.writeErr != nil {
 		return 0, w.writeErr
+	}
+	if w.shortWrite && len(p) > 0 {
+		n := len(p) - 1
+		_, _ = w.body.Write(p[:n])
+		w.written = true
+		return n, nil
 	}
 	w.written = true
 	return w.body.Write(p)
@@ -90,9 +97,19 @@ func (w *idleWriteTestWriter) SetWriteDeadline(deadline time.Time) error {
 	return nil
 }
 
+func idleWriteOptions(timeout time.Duration) IdleWriteOptions {
+	return IdleWriteOptions{Timeout: timeout, Cancel: func() {}}
+}
+
+func (w *IdleWriteWriter) testGeneration() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.timerGeneration
+}
+
 func TestIdleWriteWriterTracksProgressAndClearsDeadline(t *testing.T) {
 	underlying := newIdleWriteTestWriter()
-	writer, err := NewIdleWriteWriter(underlying, IdleWriteOptions{Timeout: 100 * time.Millisecond})
+	writer, err := NewIdleWriteWriter(underlying, idleWriteOptions(100*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +201,7 @@ func TestIdleWriteWriterReportsWriteError(t *testing.T) {
 	errorSeen := make(chan error, 1)
 	writer, err := NewIdleWriteWriter(underlying, IdleWriteOptions{
 		Timeout:      time.Second,
+		Cancel:       func() {},
 		OnWriteError: func(err error) { errorSeen <- err },
 	})
 	if err != nil {
@@ -214,7 +232,7 @@ func (writerToSource) WriteTo(dst io.Writer) (int64, error) {
 
 func TestIdleWriteWriterDoesNotBypassWriteWithWriterTo(t *testing.T) {
 	underlying := newIdleWriteTestWriter()
-	writer, err := NewIdleWriteWriter(underlying, IdleWriteOptions{Timeout: time.Second})
+	writer, err := NewIdleWriteWriter(underlying, idleWriteOptions(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,9 +249,196 @@ func TestIdleWriteWriterRejectsUnreachableResponseWriter(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	_, err := NewIdleWriteWriter(c.Writer, IdleWriteOptions{Timeout: time.Second})
+	_, err := NewIdleWriteWriter(c.Writer, idleWriteOptions(time.Second))
 	if !errors.Is(err, ErrIdleWriteWriterUnreachable) {
 		t.Fatalf("NewIdleWriteWriter error = %v, want unreachable writer", err)
+	}
+}
+
+func TestIdleWriteWriterRequiresCancellation(t *testing.T) {
+	_, err := NewIdleWriteWriter(newIdleWriteTestWriter(), IdleWriteOptions{Timeout: time.Second})
+	if !errors.Is(err, ErrIdleWriteCancelRequired) {
+		t.Fatalf("NewIdleWriteWriter error = %v, want cancel-required error", err)
+	}
+}
+
+func TestIdleWriteWriterRejectsShortWrites(t *testing.T) {
+	for name, write := range map[string]func(*IdleWriteWriter) (int, error){
+		"bytes":  func(w *IdleWriteWriter) (int, error) { return w.Write([]byte("short")) },
+		"string": func(w *IdleWriteWriter) (int, error) { return w.WriteString("short") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			underlying := newIdleWriteTestWriter()
+			underlying.shortWrite = true
+			errorSeen := make(chan error, 1)
+			writer, err := NewIdleWriteWriter(underlying, IdleWriteOptions{
+				Timeout:      time.Second,
+				Cancel:       func() {},
+				OnWriteError: func(err error) { errorSeen <- err },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, err := write(writer); n != 4 || !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("Write = (%d, %v), want (4, io.ErrShortWrite)", n, err)
+			}
+			select {
+			case err := <-errorSeen:
+				if !errors.Is(err, io.ErrShortWrite) {
+					t.Fatalf("write callback error = %v, want io.ErrShortWrite", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("short write callback did not run")
+			}
+			if !errors.Is(writer.Err(), io.ErrShortWrite) {
+				t.Fatalf("writer error = %v, want io.ErrShortWrite", writer.Err())
+			}
+		})
+	}
+}
+
+func TestIdleWriteWriterTreatsEmptyWriteAsProgress(t *testing.T) {
+	writer, err := NewIdleWriteWriter(newIdleWriteTestWriter(), idleWriteOptions(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := writer.Write(nil); n != 0 || err != nil {
+		t.Fatalf("empty Write = (%d, %v), want (0, nil)", n, err)
+	}
+	writer.mu.Lock()
+	timerStarted := writer.timer != nil
+	writer.mu.Unlock()
+	if !timerStarted {
+		t.Fatal("empty successful write did not start the idle-progress timer")
+	}
+	if err := writer.Finish(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIdleWriteWriterIgnoresStaleTimerCallbacks(t *testing.T) {
+	timedOut := 0
+	writer, err := NewIdleWriteWriter(newIdleWriteTestWriter(), IdleWriteOptions{
+		Timeout: time.Hour,
+		Cancel:  func() {},
+		OnTimeout: func() {
+			timedOut++
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	firstGeneration := writer.testGeneration()
+	if _, err := writer.Write([]byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	secondGeneration := writer.testGeneration()
+	if secondGeneration == firstGeneration {
+		t.Fatal("successful progress did not advance timer generation")
+	}
+
+	writer.expire(firstGeneration)
+	if err := writer.Err(); err != nil {
+		t.Fatalf("stale timer callback failed healthy writer: %v", err)
+	}
+	if timedOut != 0 {
+		t.Fatalf("stale timer callback ran timeout callback %d time(s)", timedOut)
+	}
+
+	writer.expire(secondGeneration)
+	if !errors.Is(writer.Err(), ErrIdleWriteTimeout) {
+		t.Fatalf("current timer callback error = %v, want idle timeout", writer.Err())
+	}
+	if timedOut != 1 {
+		t.Fatalf("current timer callback ran %d time(s), want 1", timedOut)
+	}
+}
+
+func TestIdleWriteWriterFinishInvalidatesTimerCallbacks(t *testing.T) {
+	timedOut := 0
+	writer, err := NewIdleWriteWriter(newIdleWriteTestWriter(), IdleWriteOptions{
+		Timeout: time.Hour,
+		Cancel:  func() {},
+		OnTimeout: func() {
+			timedOut++
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("complete")); err != nil {
+		t.Fatal(err)
+	}
+	generation := writer.testGeneration()
+	if err := writer.Finish(); err != nil {
+		t.Fatalf("Finish = %v, want nil", err)
+	}
+	writer.expire(generation)
+	if err := writer.Err(); err != nil {
+		t.Fatalf("late timer callback changed completed writer error to %v", err)
+	}
+	if timedOut != 0 {
+		t.Fatalf("late timer callback ran timeout callback %d time(s)", timedOut)
+	}
+}
+
+func TestIdleWriteWriterFinishClearsDeadlineWithoutHoldingLifecycleLock(t *testing.T) {
+	underlying := newIdleWriteTestWriter()
+	var writer *IdleWriteWriter
+	underlying.deadlineHook = func(deadline time.Time) {
+		if deadline.IsZero() && writer != nil {
+			_ = writer.Err()
+		}
+	}
+	var err error
+	writer, err = NewIdleWriteWriter(underlying, idleWriteOptions(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan error, 1)
+	go func() { finished <- writer.Finish() }()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("Finish = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Finish held the lifecycle lock while clearing the deadline")
+	}
+}
+
+type deadlineGinWriter struct {
+	gin.ResponseWriter
+}
+
+func (deadlineGinWriter) SetWriteDeadline(time.Time) error { return nil }
+
+func TestIdleWriteWriterFlushCommitsGinStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	writer, err := NewIdleWriteWriter(deadlineGinWriter{ResponseWriter: c.Writer}, idleWriteOptions(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.WriteHeader(http.StatusPartialContent)
+	if c.Writer.Written() {
+		t.Fatal("Gin committed headers before Flush")
+	}
+	if err := writer.FlushError(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Writer.Written() {
+		t.Fatal("FlushError did not commit Gin headers")
+	}
+	if recorder.Code != http.StatusPartialContent {
+		t.Fatalf("wire status = %d, want %d", recorder.Code, http.StatusPartialContent)
+	}
+	if err := writer.Finish(); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -119,9 +119,10 @@ operating capacity. Every shipped YAML and env template therefore keeps
 
 D3 adds the reusable idle-write writer and makes the actual raw/history, share
 raw and public bootstrap paths bypass the Go gzip wrapper. The supported frontend
-nginx configuration also disables proxy buffering for the public bootstrap
-routes. D3 does not connect the writer or coordinator to a producer yet; that is
-the D4 boundary.
+nginx configuration disables both proxy buffering and gzip for all protected
+transfer locations, including `/seafhttp/`. D3 does not connect the writer or
+coordinator to a producer yet; that is the D4 boundary. D6 must still prove the
+end-to-end slow-client behavior through the deployed nginx topology.
 
 Do not enable this section in production before D4 wiring and D6 measurement.
 When D6 selects positive values, the following startup rules still apply:

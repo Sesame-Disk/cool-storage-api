@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -15,6 +16,7 @@ import (
 var (
 	ErrIdleWriteTimeout           = errors.New("idle write timeout")
 	ErrIdleWriteWriterUnreachable = errors.New("idle write writer cannot reach connection")
+	ErrIdleWriteCancelRequired    = errors.New("idle write cancel function is required")
 )
 
 // IdleWriteOptions controls the lifetime callbacks owned by a response writer.
@@ -38,11 +40,12 @@ type IdleWriteWriter struct {
 	onTimeout  func()
 	onError    func(error)
 
-	mu       sync.Mutex
-	timer    *time.Timer
-	finished bool
-	failed   bool
-	err      error
+	mu              sync.Mutex
+	timer           *time.Timer
+	timerGeneration uint64
+	finished        bool
+	failed          bool
+	err             error
 }
 
 var _ gin.ResponseWriter = (*IdleWriteWriter)(nil)
@@ -55,6 +58,9 @@ func NewIdleWriteWriter(w gin.ResponseWriter, opts IdleWriteOptions) (*IdleWrite
 	}
 	if opts.Timeout <= 0 {
 		return nil, fmt.Errorf("idle write timeout must be positive")
+	}
+	if opts.Cancel == nil {
+		return nil, ErrIdleWriteCancelRequired
 	}
 
 	writer := &IdleWriteWriter{
@@ -92,14 +98,15 @@ func (w *IdleWriteWriter) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	n, err := w.ResponseWriter.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		w.fail(err)
 		return n, err
 	}
-	if n > 0 {
-		if err := w.progress(); err != nil {
-			return n, err
-		}
+	if err := w.progress(); err != nil {
+		return n, err
 	}
 	return n, nil
 }
@@ -109,16 +116,28 @@ func (w *IdleWriteWriter) WriteString(s string) (int, error) {
 		return 0, err
 	}
 	n, err := w.ResponseWriter.WriteString(s)
+	if err == nil && n != len(s) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		w.fail(err)
 		return n, err
 	}
-	if n > 0 {
-		if err := w.progress(); err != nil {
-			return n, err
-		}
+	if err := w.progress(); err != nil {
+		return n, err
 	}
 	return n, nil
+}
+
+// WriteHeader preserves Gin's deferred-header behavior while protecting custom
+// writers that commit a status immediately. The actual progress timer starts
+// here and is refreshed when a later Write or Flush makes more progress.
+func (w *IdleWriteWriter) WriteHeader(status int) {
+	if err := w.beforeWrite(); err != nil {
+		return
+	}
+	w.ResponseWriter.WriteHeader(status)
+	_ = w.progress()
 }
 
 func (w *IdleWriteWriter) WriteHeaderNow() {
@@ -135,6 +154,10 @@ func (w *IdleWriteWriter) FlushError() error {
 	if err := w.beforeWrite(); err != nil {
 		return err
 	}
+	// ResponseController may unwrap past Gin and flush the underlying net/http
+	// writer directly. Commit Gin's pending status first so Written and Status
+	// remain truthful after a flush-before-first-body-write.
+	w.ResponseWriter.WriteHeaderNow()
 	if err := w.controller.Flush(); err != nil {
 		w.fail(err)
 		return err
@@ -156,23 +179,27 @@ func (w *IdleWriteWriter) Finish() error {
 		return err
 	}
 	w.finished = true
+	w.timerGeneration++
 	if w.timer != nil {
 		w.timer.Stop()
 	}
 	err := w.err
+	onError := w.onError
 	w.mu.Unlock()
 
 	clearErr := w.SetWriteDeadline(time.Time{})
-	if clearErr != nil && err == nil {
-		err = clearErr
+	notifyError := false
+	if clearErr != nil {
 		w.mu.Lock()
 		if w.err == nil {
 			w.err = clearErr
+			err = clearErr
+			notifyError = true
 		}
 		w.mu.Unlock()
-		if w.onError != nil {
-			w.onError(clearErr)
-		}
+	}
+	if notifyError && onError != nil {
+		onError(clearErr)
 	}
 	return err
 }
@@ -194,69 +221,95 @@ func (w *IdleWriteWriter) beforeWrite() error {
 		w.mu.Unlock()
 		return err
 	}
-	w.mu.Unlock()
-
+	// A socket deadline, rather than the progress timer, bounds the write that
+	// is about to begin. Invalidating the prior timer avoids a stale callback
+	// cancelling a write that just made progress at its boundary.
+	w.timerGeneration++
+	if w.timer != nil {
+		w.timer.Stop()
+	}
 	if err := w.SetWriteDeadline(time.Now().Add(w.timeout)); err != nil {
-		w.fail(err)
+		cancel, onTimeout, onError := w.failLocked(err)
+		w.mu.Unlock()
+		w.notifyFailure(err, cancel, onTimeout, onError)
 		return err
 	}
+	w.mu.Unlock()
 	return nil
 }
 
 func (w *IdleWriteWriter) progress() error {
-	if err := w.SetWriteDeadline(time.Time{}); err != nil {
-		w.fail(err)
-		return err
-	}
-
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.finished || w.failed {
 		if w.err != nil {
+			w.mu.Unlock()
 			return w.err
 		}
+		w.mu.Unlock()
 		return ErrIdleWriteTimeout
 	}
-	if w.timer == nil {
-		w.timer = time.AfterFunc(w.timeout, w.expire)
-	} else {
-		w.timer.Reset(w.timeout)
+	w.timerGeneration++
+	generation := w.timerGeneration
+	if w.timer != nil {
+		w.timer.Stop()
 	}
+	if err := w.SetWriteDeadline(time.Time{}); err != nil {
+		cancel, onTimeout, onError := w.failLocked(err)
+		w.mu.Unlock()
+		w.notifyFailure(err, cancel, onTimeout, onError)
+		return err
+	}
+	w.timer = time.AfterFunc(w.timeout, func() { w.expire(generation) })
+	w.mu.Unlock()
 	return nil
 }
 
-func (w *IdleWriteWriter) expire() {
-	w.fail(ErrIdleWriteTimeout)
+func (w *IdleWriteWriter) expire(generation uint64) {
+	w.mu.Lock()
+	if w.finished || w.failed || generation != w.timerGeneration {
+		w.mu.Unlock()
+		return
+	}
+	cancel, onTimeout, onError := w.failLocked(ErrIdleWriteTimeout)
+	w.mu.Unlock()
+	w.notifyFailure(ErrIdleWriteTimeout, cancel, onTimeout, onError)
 }
 
 func (w *IdleWriteWriter) fail(err error) {
 	if err == nil {
 		return
 	}
-
 	w.mu.Lock()
-	if w.err == nil {
-		w.err = err
-	}
-	if w.failed || w.finished {
-		w.mu.Unlock()
-		return
+	cancel, onTimeout, onError := w.failLocked(err)
+	w.mu.Unlock()
+	w.notifyFailure(err, cancel, onTimeout, onError)
+}
+
+func (w *IdleWriteWriter) failLocked(err error) (context.CancelFunc, func(), func(error)) {
+	if w.finished || w.failed {
+		return nil, nil, nil
 	}
 	w.failed = true
-	if w.timer != nil {
-		w.timer.Stop()
+	w.err = err
+	w.timerGeneration++
+	if w.timer == nil {
+		return w.cancel, w.onTimeout, w.onError
 	}
-	w.mu.Unlock()
+	w.timer.Stop()
+	return w.cancel, w.onTimeout, w.onError
+}
 
-	if w.cancel != nil {
-		w.cancel()
+func (w *IdleWriteWriter) notifyFailure(err error, cancel context.CancelFunc, onTimeout func(), onError func(error)) {
+	if cancel == nil {
+		return
 	}
+	cancel()
 	if isTimeoutError(err) {
-		if w.onTimeout != nil {
-			w.onTimeout()
+		if onTimeout != nil {
+			onTimeout()
 		}
-	} else if w.onError != nil {
-		w.onError(err)
+	} else if onError != nil {
+		onError(err)
 	}
 }
 

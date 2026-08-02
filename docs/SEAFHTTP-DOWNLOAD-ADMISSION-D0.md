@@ -555,9 +555,10 @@ The compressible public bootstrap responses live on **different routes**:
 ```
 
 These are where the `link_inline` producer's response is written. D3 excludes
-both routes from the current gzip wrapper and adds matching `proxy_buffering off`
-locations in the supported frontend nginx topology. This removes the writer
-boundary that made subcontract C's admitted lifetime unenforceable:
+both routes from the current Go gzip wrapper and adds matching
+`proxy_buffering off` and `gzip off` locations in the supported frontend nginx
+topology. This removes the writer boundary that made subcontract C's admitted
+lifetime unenforceable:
 
 ```text
 admission acquired
@@ -568,10 +569,12 @@ admission acquired
 ```
 
 D3 uses outright exclusion for these two routes. The supported frontend nginx
-configuration also disables proxy buffering for them so browser backpressure is
-not hidden at the proxy. These responses can carry up to the full inline-content
-limit of highly compressible text, so the egress cost remains a D6 measurement,
-not a claim that compression is free.
+configuration also disables both proxy buffering and gzip for every D transfer
+location: raw/history, share raw, public bootstrap and `/seafhttp/`. Browser
+backpressure is therefore not hidden by buffering or response compression in
+that proxy. These responses can carry up to the full inline-content limit of
+highly compressible text, so the egress cost remains a D6 measurement, not a
+claim that compression is free.
 
 Every writer that needs an idle-write deadline must make the underlying network
 connection reachable through `http.ResponseController` or an equivalent
@@ -586,12 +589,14 @@ requires end-to-end deployment validation rather than a claim that the Go
 listener directly supports HTTP/2.
 
 The proxy is part of the lifetime contract. D3/D6 must verify the effective
-configuration for every protected route, including `proxy_buffering`, any
-buffering-to-disk behavior, `proxy_read_timeout` and `send_timeout`. The
-supported transfer path must use backpressure-compatible settings (currently
-`proxy_buffering off` in the supported frontend transfer locations) or document
-that D protects only the Go-to-proxy hop. A slow-client test must run through
-the real nginx topology as well as directly against Go; a backend TCP test alone
+configuration for every protected route, including `proxy_buffering`, gzip or
+another response transformation, buffering-to-disk behavior,
+`proxy_read_timeout` and `send_timeout`. The supported transfer path must use
+backpressure-compatible settings (currently `proxy_buffering off` and
+`gzip off` in the supported frontend transfer locations) or document that D
+protects only the Go-to-proxy hop. D3's configuration regression and nginx
+syntax check protect that setting; D6 must run a slow-client test through the
+real nginx topology as well as directly against Go. A backend TCP test alone
 does not prove that the browser/client is controlling admission lifetime.
 
 ### 9. Write-Progress Lifetime
@@ -646,10 +651,14 @@ does.
 
 If the D writer cannot install the required deadline before headers, the contract
 is fail closed rather than a metric-only degradation. D3 now supplies
-`httputil.IdleWriteWriter`, which probes reachability before headers, refreshes
-the socket deadline before writes and flushes, cancels after an idle-progress
-timeout, and clears the deadline in `Finish()`. D4 supplies the admission lease
-callbacks and installs this writer around each protected producer.
+`httputil.IdleWriteWriter`, which probes reachability before headers, requires a
+non-nil cancellation callback, refreshes the socket deadline before writes and
+flushes, rejects short writes, invalidates stale timer callbacks, cancels after
+an idle-progress timeout, and clears the deadline in `Finish()`. A plain
+`httptest.ResponseRecorder` cannot expose the connection deadline and is
+therefore intentionally rejected; D4 producer tests must use a connection-
+capable writer or a real server. D4 supplies the admission lease callbacks and
+installs this writer around each protected producer.
 
 ### 10. Block GET Refactor Contract
 
@@ -963,7 +972,7 @@ deployment for token issuance.
 | D0 | Contract, inventory, identity and evidence record | None; docs only |
 | D1 | Neutral D coordinator, atomic dimensions, bounded state, config and metrics | Coordinator not yet connected to producers |
 | D2 | Stable `SourceID` for all public download-token mint paths | Merged in `main`; new link tokens are strict; no legacy compatibility; coordinated greenfield rollout |
-| D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Implemented in this branch; writer safety exercised before broad admission activation |
+| D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Implemented in this branch; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
 | D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | All listed storage-backed producers use D |
 | D5 | Stream sync block GET through existing canonical reader APIs | Block GET no longer materializes the block |
 | D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass |
