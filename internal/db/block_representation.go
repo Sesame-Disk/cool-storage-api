@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -92,7 +93,13 @@ func parseCanonicalLibraryBlockRepresentationID(representationID string) (uuid.U
 }
 
 func ResolveBlockRepresentationID(session *gocql.Session, orgID, libraryID string) (string, error) {
-	state, err := ReadLiveLibraryState(session, orgID, libraryID)
+	return ResolveBlockRepresentationIDContext(context.Background(), session, orgID, libraryID)
+}
+
+// ResolveBlockRepresentationIDContext is ResolveBlockRepresentationID bound to
+// ctx for request-scoped mapping preparation.
+func ResolveBlockRepresentationIDContext(ctx context.Context, session *gocql.Session, orgID, libraryID string) (string, error) {
+	state, err := ReadLiveLibraryStateContext(ctx, session, orgID, libraryID)
 	if err != nil {
 		return "", err
 	}

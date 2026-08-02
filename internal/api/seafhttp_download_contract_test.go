@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -412,7 +413,7 @@ func TestHandleZipDownloadEncryptionProbeFailsClosed(t *testing.T) {
 		h, tok := newZipHandler(t)
 		old := seafHTTPLookupLibraryEncryptedFn
 		t.Cleanup(func() { seafHTTPLookupLibraryEncryptedFn = old })
-		seafHTTPLookupLibraryEncryptedFn = func(*SeafHTTPHandler, string, string) (bool, error) {
+		seafHTTPLookupLibraryEncryptedFn = func(context.Context, *SeafHTTPHandler, string, string) (bool, error) {
 			return false, errors.New("cassandra timeout")
 		}
 
@@ -438,7 +439,7 @@ func TestHandleZipDownloadEncryptionProbeFailsClosed(t *testing.T) {
 		h, tok := newZipHandler(t)
 		old := seafHTTPLookupLibraryEncryptedFn
 		t.Cleanup(func() { seafHTTPLookupLibraryEncryptedFn = old })
-		seafHTTPLookupLibraryEncryptedFn = func(*SeafHTTPHandler, string, string) (bool, error) {
+		seafHTTPLookupLibraryEncryptedFn = func(context.Context, *SeafHTTPHandler, string, string) (bool, error) {
 			return true, nil
 		}
 

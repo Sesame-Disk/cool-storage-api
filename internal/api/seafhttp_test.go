@@ -1547,13 +1547,13 @@ func TestStreamFileFromBlocksResolvesCanonicalReaderBeforeSuccessResponse(t *tes
 		seafHTTPNewCanonicalBlockReaderFn = oldCanonical
 	})
 
-	seafHTTPLookupFileBlocksFn = func(*SeafHTTPHandler, string, *AccessToken) ([]string, int64, []byte, []byte, *storage.BlockStore, string, error) {
+	seafHTTPLookupFileBlocksFn = func(context.Context, *SeafHTTPHandler, string, *AccessToken) ([]string, int64, []byte, []byte, *storage.BlockStore, string, error) {
 		return []string{blockID, blockID}, 18, nil, nil, nil, "hot", nil
 	}
-	seafHTTPResolveBlockRepresentationIDFn = func(*SeafHTTPHandler, string, string) (string, error) {
+	seafHTTPResolveBlockRepresentationIDFn = func(context.Context, *SeafHTTPHandler, string, string) (string, error) {
 		return db.PlainBlockRepresentationID, nil
 	}
-	seafHTTPBatchResolveBlockIDsFn = func(_ *db.DB, _, _ string, blockIDs []string) ([]string, error) {
+	seafHTTPBatchResolveBlockIDsFn = func(_ context.Context, _ *db.DB, _, _ string, blockIDs []string) ([]string, error) {
 		return append([]string(nil), blockIDs...), nil
 	}
 
@@ -1576,7 +1576,7 @@ func TestStreamFileFromBlocksResolvesCanonicalReaderBeforeSuccessResponse(t *tes
 	}
 
 	h := &SeafHTTPHandler{db: &db.DB{}, storageManager: storage.NewManager()}
-	err := h.streamFileFromBlocks(c, &AccessToken{OrgID: "org", RepoID: "repo"}, "file.txt", time.Time{})
+	err := h.streamFileFromBlocks(c, &AccessToken{OrgID: "org", RepoID: "repo"}, "file.txt", time.Time{}, nil)
 	if err == nil || !strings.Contains(err.Error(), "canonical") {
 		t.Fatalf("streamFileFromBlocks error = %v, want canonical resolution error", err)
 	}

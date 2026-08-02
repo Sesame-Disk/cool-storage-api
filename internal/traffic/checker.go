@@ -1,6 +1,7 @@
 package traffic
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sync"
@@ -116,6 +117,15 @@ func evaluateStorageQuota(used, limit, additionalBytes int64, quotaPolicy string
 // All three checks (combined, per-direction org, per-user) are evaluated; the
 // most restrictive result is returned.
 func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalBytes int64) (QuotaStatus, error) {
+	return c.CheckTrafficQuotaContext(context.Background(), orgID, userID, direction, additionalBytes)
+}
+
+// CheckTrafficQuotaContext is CheckTrafficQuota bound to ctx for request paths
+// that have a finite preparation budget.
+func (c *Checker) CheckTrafficQuotaContext(ctx context.Context, orgID, userID, direction string, additionalBytes int64) (QuotaStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// 1. Load org quota config.
 	var trafficQuota, uploadQuota, downloadQuota int64
 	var quotaPolicy string
@@ -125,7 +135,7 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 		       current_period_started_at
 		FROM organizations WHERE org_id = ?`,
 		mustParseUUID(orgID),
-	).Scan(&trafficQuota, &uploadQuota, &downloadQuota, &quotaPolicy, &currentPeriodStartedAt)
+	).WithContext(ctx).Scan(&trafficQuota, &uploadQuota, &downloadQuota, &quotaPolicy, &currentPeriodStartedAt)
 	if err != nil {
 		// If row doesn't exist, allow by default (migration may not have run).
 		return QuotaStatus{Allowed: true}, nil
@@ -136,7 +146,7 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 
 	// 2. Check combined quota.
 	if trafficQuota > 0 {
-		used, _ := c.readTrafficPeriod(orgID, periodStartedAt, "org:combined")
+		used, _ := c.readTrafficPeriodContext(ctx, orgID, periodStartedAt, "org:combined")
 		projected := used + additionalBytes
 		if projected > trafficQuota {
 			s := QuotaStatus{
@@ -165,7 +175,7 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 	}
 	if dirQuota > 0 {
 		scope := fmt.Sprintf("org:%s", direction)
-		used, _ := c.readTrafficPeriod(orgID, periodStartedAt, scope)
+		used, _ := c.readTrafficPeriodContext(ctx, orgID, periodStartedAt, scope)
 		projected := used + additionalBytes
 		reason := "traffic-" + direction
 		if projected > dirQuota {
@@ -193,7 +203,7 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 			SELECT traffic_upload_quota, traffic_download_quota
 			FROM users WHERE org_id = ? AND user_id = ?`,
 			mustParseUUID(orgID), mustParseUUID(userID),
-		).Scan(&userUpload, &userDownload)
+		).WithContext(ctx).Scan(&userUpload, &userDownload)
 		if userErr == nil {
 			var userDirQuota int64
 			if direction == "upload" {
@@ -203,7 +213,7 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 			}
 			if userDirQuota > 0 {
 				scope := fmt.Sprintf("%s:%s", userID, direction)
-				used, _ := c.readTrafficPeriod(orgID, periodStartedAt, scope)
+				used, _ := c.readTrafficPeriodContext(ctx, orgID, periodStartedAt, scope)
 				projected := used + additionalBytes
 				reason := "traffic-" + direction
 				if projected > userDirQuota {
@@ -275,12 +285,19 @@ func (c *Checker) CheckMaxUsers(orgID string) (QuotaStatus, error) {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func (c *Checker) readTrafficPeriod(orgID string, periodStartedAt time.Time, scope string) (int64, error) {
+	return c.readTrafficPeriodContext(context.Background(), orgID, periodStartedAt, scope)
+}
+
+func (c *Checker) readTrafficPeriodContext(ctx context.Context, orgID string, periodStartedAt time.Time, scope string) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var bytes int64
 	err := c.session.Query(`
 		SELECT bytes_transferred FROM traffic_period_usage
 		WHERE org_id = ? AND period_started_at = ? AND scope = ?`,
 		mustParseUUID(orgID), periodStartedAt.UTC(), scope,
-	).Scan(&bytes)
+	).WithContext(ctx).Scan(&bytes)
 	if err != nil {
 		// Log explicitly: a read error causes fail-open (used=0), which could allow
 		// traffic past the quota limit without the operator noticing.

@@ -37,8 +37,15 @@ type BlockReadSeeker struct {
 	pos int64 // current read position in the virtual file
 
 	// Block cache: holds at most one block in memory
-	cachedIdx  int    // index of cached block (-1 = none)
-	cachedData []byte // decrypted/raw block data
+	cachedIdx   int    // index of cached block (-1 = none)
+	cachedData  []byte // decrypted/raw block data
+	onReadError func(error)
+}
+
+// SetReadErrorHandler receives storage or decrypt failures that io.ReadSeeker
+// consumers such as http.ServeContent otherwise cannot return to their caller.
+func (r *BlockReadSeeker) SetReadErrorHandler(handler func(error)) {
+	r.onReadError = handler
 }
 
 // NewBlockReadSeeker creates a ReadSeeker that reads from block storage on demand.
@@ -89,6 +96,9 @@ func (r *BlockReadSeeker) Read(p []byte) (int, error) {
 
 		// Load block if not cached
 		if err := r.ensureBlock(blockIdx); err != nil {
+			if r.onReadError != nil {
+				r.onReadError(err)
+			}
 			return totalRead, err
 		}
 

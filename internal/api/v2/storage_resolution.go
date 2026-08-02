@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -30,14 +31,21 @@ func relayPortFromRequest(c *gin.Context, cfg *config.Config) string {
 }
 
 func lookupLibraryStorageClass(database *db.DB, orgID, repoID string) string {
+	return lookupLibraryStorageClassContext(context.Background(), database, orgID, repoID)
+}
+
+func lookupLibraryStorageClassContext(ctx context.Context, database *db.DB, orgID, repoID string) string {
 	if database == nil || orgID == "" || repoID == "" {
 		return ""
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	var storageClass string
 	if err := database.Session().Query(`
 		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&storageClass); err != nil {
+	`, orgID, repoID).WithContext(ctx).Scan(&storageClass); err != nil {
 		return ""
 	}
 
@@ -58,7 +66,11 @@ func resolvePreferredLibraryStorageClassForRequest(c *gin.Context, cfg *config.C
 }
 
 func resolveLibraryBlockStoreForRequest(c *gin.Context, database *db.DB, cfg *config.Config, storageManager *storage.Manager, s3Store *storage.S3Store, orgID, repoID string) (*storage.BlockStore, string, error) {
-	libraryClass := lookupLibraryStorageClass(database, orgID, repoID)
+	return resolveLibraryBlockStoreForRequestContext(context.Background(), c, database, cfg, storageManager, s3Store, orgID, repoID)
+}
+
+func resolveLibraryBlockStoreForRequestContext(ctx context.Context, c *gin.Context, database *db.DB, cfg *config.Config, storageManager *storage.Manager, s3Store *storage.S3Store, orgID, repoID string) (*storage.BlockStore, string, error) {
+	libraryClass := lookupLibraryStorageClassContext(ctx, database, orgID, repoID)
 	defaultClass := ""
 	if cfg != nil {
 		defaultClass = cfg.Storage.DefaultClass

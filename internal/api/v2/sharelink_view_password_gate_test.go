@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	goast "go/ast"
@@ -113,7 +114,7 @@ func TestShareFileBootstrapWithholdsInlineContentWithoutPassword(t *testing.T) {
 	original := shareInlineTextFn
 	t.Cleanup(func() { shareInlineTextFn = original })
 	readCalls := 0
-	shareInlineTextFn = func(*ShareLinkViewHandler, *shareLinkData) (string, error) {
+	shareInlineTextFn = func(*ShareLinkViewHandler, context.Context, *shareLinkData) (string, error) {
 		readCalls++
 		return secret, nil
 	}
@@ -169,7 +170,7 @@ func TestShareFileBootstrapServesContentOncePasswordIsVerified(t *testing.T) {
 
 	original := shareInlineTextFn
 	t.Cleanup(func() { shareInlineTextFn = original })
-	shareInlineTextFn = func(*ShareLinkViewHandler, *shareLinkData) (string, error) {
+	shareInlineTextFn = func(*ShareLinkViewHandler, context.Context, *shareLinkData) (string, error) {
 		return secret, nil
 	}
 
@@ -231,7 +232,7 @@ func TestShareFileBootstrapServesContentWhenLinkHasNoPassword(t *testing.T) {
 
 	original := shareInlineTextFn
 	t.Cleanup(func() { shareInlineTextFn = original })
-	shareInlineTextFn = func(*ShareLinkViewHandler, *shareLinkData) (string, error) {
+	shareInlineTextFn = func(*ShareLinkViewHandler, context.Context, *shareLinkData) (string, error) {
 		return secret, nil
 	}
 

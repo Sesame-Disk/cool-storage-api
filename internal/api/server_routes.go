@@ -299,6 +299,7 @@ func (s *Server) registerPublicRoutes(serverURL string) {
 	s.router.GET("/billing/", s.handleBillingRedirect)
 
 	slv := v2.NewShareLinkViewHandler(s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL)
+	slv.SetDownloadAdmissionCoordinator(s.downloadAdmission)
 	// Per-IP limiter on every public share-link route. These are unauth
 	// endpoints keyed only by an opaque token; without this they're an
 	// enumeration oracle (H-5).
@@ -354,9 +355,11 @@ func (s *Server) registerPublicRoutes(serverURL string) {
 }
 
 func (s *Server) registerCompatibilityRoutes(serverURL string) {
-	v2.RegisterFileViewRoutes(s.router, s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL, s.authMiddleware(), s.permMiddleware)
+	fileViewHandler := v2.RegisterFileViewRoutes(s.router, s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL, s.authMiddleware(), s.permMiddleware)
+	fileViewHandler.SetDownloadAdmissionCoordinator(s.downloadAdmission)
 
 	seafHTTPHandler := NewSeafHTTPHandler(s.storage, s.storageManager, s.db, s.tokenStore, s.config, s.permMiddleware)
+	seafHTTPHandler.SetDownloadAdmissionCoordinator(s.downloadAdmission)
 	// Held so Shutdown can stop the limiter cleanup goroutines it owns.
 	s.seafHTTPHandler = seafHTTPHandler
 	seafHTTPHandler.SetZipLimits(s.config.SeafHTTP.ZipMaxEntries, s.config.SeafHTTP.ZipMaxDepth, s.config.SeafHTTP.ZipMaxBytes)

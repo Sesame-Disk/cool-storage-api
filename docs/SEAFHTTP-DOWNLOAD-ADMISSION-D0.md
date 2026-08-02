@@ -2,12 +2,11 @@
 
 **Date:** 2026-08-01 (original contract freeze)  
 **Last updated:** 2026-08-02  
-**Branch:** `feat/b4-subcontract-d3-download-writer-lifetime`
-**Status:** D0 contract; D1 coordinator/configuration and D2 stable public
-download-token `SourceID` implementation are merged in `main`. D3 writer
-lifetime and gzip/proxy reachability are complete in this branch. Admission
-producer wiring remains deferred to D4, and positive operating values remain
-deferred to D6.
+**Branch:** `feat/b4-subcontract-d4-download-admission`
+**Status:** D0-D4 are complete. D1 coordinator/configuration, D2 stable public
+download-token `SourceID` wiring and D3 writer lifetime/gzip-proxy reachability
+are merged in `main`; D4 connects the listed non-block producers in this branch.
+Block GET streaming remains D5 and positive operating values remain D6 work.
 
 This document freezes the contract and inventory for subcontract D of
 `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`. It is the design record for the D1-D6
@@ -47,20 +46,19 @@ deadlines, or select positive capacity values. Those are D2-D6 deliverables.
 The repository templates remain safe during this staged rollout: every
 `download_admission` block is present with `enabled: false` and zero values.
 D6, not D1, is the first phase allowed to replace those placeholders with
-measured positive defaults. Enabling the section before D4 wiring is an
-unsupported deployment configuration rather than a configuration error: startup
-cannot detect it. A positive, internally consistent block passes validation and
-the process starts normally — it simply protects nothing, because no producer
-calls the coordinator yet, while the metrics suggest a guard is in place.
+measured positive defaults. Enabling the section before D4 wiring was an
+unsupported deployment configuration rather than a configuration error. D4 now
+connects the listed non-block producers; D6 still supplies the capacity evidence
+required before production enablement.
 
 ### D coordinator ownership
 
-D4 must create exactly one enabled `Coordinator` during server bootstrap and
-share that pointer with every protected producer, including `internal/api`,
-`internal/api/v2` and share-link handlers. `New` deliberately does not enforce a
-process-global singleton in D1 so unit tests can create isolated coordinators;
-multiple enabled instances in production would multiply the process-local node
-cap and make the global metrics meaningless.
+D4 creates exactly one `Coordinator` during server bootstrap and shares that
+pointer with every protected producer, including `internal/api`, `internal/api/v2`
+and share-link handlers. `New` deliberately does not enforce a process-global
+singleton in D1 so unit tests can create isolated coordinators; multiple enabled
+instances in production would multiply the process-local node cap and make the
+global metrics meaningless.
 
 ## Why D Exists
 
@@ -978,8 +976,8 @@ deployment for token issuance.
 | D0 | Contract, inventory, identity and evidence record | None; docs only |
 | D1 | Neutral D coordinator, atomic dimensions, bounded state, config and metrics | Coordinator not yet connected to producers |
 | D2 | Stable `SourceID` for all public download-token mint paths | Merged in `main`; new link tokens are strict; no legacy compatibility; coordinated greenfield rollout |
-| D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Implemented in this branch; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
-| D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | All listed storage-backed producers use D |
+| D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Merged in `main`; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
+| D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | Complete: one bootstrapped coordinator covers all listed non-block producers through preparation and response lifetime; D5 remains block GET. |
 | D5 | Stream sync block GET through existing canonical reader APIs | Block GET no longer materializes the block |
 | D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass |
 

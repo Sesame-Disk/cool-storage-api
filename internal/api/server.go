@@ -23,6 +23,7 @@ import (
 	authpkg "github.com/Sesame-Disk/sesamefs/internal/auth"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/downloadadmission"
 	"github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/logging"
@@ -152,6 +153,7 @@ func (s *clientSSOStore) cleanupLoop() {
 // Server represents the HTTP API server
 type Server struct {
 	config               *config.Config
+	downloadAdmission    *downloadadmission.Coordinator
 	db                   *db.DB
 	storage              *storage.S3Store // Legacy single S3 store
 	storageManager       *storage.Manager // Multi-backend storage manager
@@ -288,6 +290,7 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 		version:              version,
 		router:               router,
 	}
+	s.initializeDownloadAdmissionCoordinator()
 
 	s.setupRoutes()
 
@@ -297,6 +300,14 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	}
 
 	return s
+}
+
+func (s *Server) initializeDownloadAdmissionCoordinator() {
+	coordinator, err := downloadadmission.New(&s.config.DownloadAdmission)
+	if err != nil {
+		panic(fmt.Errorf("initialize download admission coordinator: %w", err))
+	}
+	s.downloadAdmission = coordinator
 }
 
 func buildCORSConfig(cfg *config.Config) cors.Config {

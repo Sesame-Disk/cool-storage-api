@@ -28,6 +28,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/downloadadmission"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
@@ -1272,6 +1273,7 @@ type SeafHTTPHandler struct {
 	tokenStore             TokenStore
 	config                 *config.Config
 	permMiddleware         *middleware.PermissionMiddleware
+	downloadAdmission      *downloadadmission.Coordinator
 	blockRepresentationIDs *syncBlockRepresentationIDCache
 	zipMaxEntries          int
 	zipMaxDepth            int
@@ -1485,22 +1487,25 @@ type zipPreparedFile struct {
 }
 
 var seafHTTPNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
-var seafHTTPBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDs
-var seafHTTPLookupFileBlocksFn = func(h *SeafHTTPHandler, hostname string, token *AccessToken) ([]string, int64, []byte, []byte, *storage.BlockStore, string, error) {
-	return h.lookupFileBlocks(hostname, token)
+var seafHTTPBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDsContext
+var seafHTTPLookupFileBlocksFn = func(ctx context.Context, h *SeafHTTPHandler, hostname string, token *AccessToken) ([]string, int64, []byte, []byte, *storage.BlockStore, string, error) {
+	return h.lookupFileBlocksContext(ctx, hostname, token)
 }
-var seafHTTPResolveBlockRepresentationIDFn = func(h *SeafHTTPHandler, orgID, repoID string) (string, error) {
-	return h.resolveBlockRepresentationID(orgID, repoID)
+var seafHTTPResolveBlockRepresentationIDFn = func(ctx context.Context, h *SeafHTTPHandler, orgID, repoID string) (string, error) {
+	return db.ResolveBlockRepresentationIDContext(ctx, h.db.Session(), orgID, repoID)
 }
 
 // seafHTTPLookupLibraryEncryptedFn is the shared encrypted-library probe for
 // file and ZIP download. Ignoring its error previously made ZIP treat a
 // Cassandra failure as "not encrypted" and stream ciphertext as a 200.
-var seafHTTPLookupLibraryEncryptedFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+var seafHTTPLookupLibraryEncryptedFn = func(ctx context.Context, h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var encrypted bool
 	err := h.db.Session().Query(`
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&encrypted)
+	`, orgID, repoID).WithContext(ctx).Scan(&encrypted)
 	return encrypted, err
 }
 
@@ -1542,6 +1547,12 @@ func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manage
 		uploadLinkWriteLimits:  newUploadLinkWriteLimits(cfg),
 		uploadLinkInflight:     newUploadLinkInflightLimiter(cfg),
 	}
+}
+
+// SetDownloadAdmissionCoordinator makes the process-wide coordinator available
+// for download producers added in later D phases.
+func (h *SeafHTTPHandler) SetDownloadAdmissionCoordinator(coordinator *downloadadmission.Coordinator) {
+	h.downloadAdmission = coordinator
 }
 
 // newUploadLinkWriteLimits builds the enabled anonymous upload-link buckets.
@@ -1696,14 +1707,21 @@ func (h *SeafHTTPHandler) RegisterSeafHTTPRoutes(router *gin.Engine, zipRL ...gi
 }
 
 func (h *SeafHTTPHandler) lookupLibraryStorageClass(orgID, repoID string) string {
+	return h.lookupLibraryStorageClassContext(context.Background(), orgID, repoID)
+}
+
+func (h *SeafHTTPHandler) lookupLibraryStorageClassContext(ctx context.Context, orgID, repoID string) string {
 	if h == nil || h.db == nil || orgID == "" || repoID == "" {
 		return ""
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	var storageClass string
 	if err := h.db.Session().Query(`
 		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&storageClass); err != nil {
+	`, orgID, repoID).WithContext(ctx).Scan(&storageClass); err != nil {
 		return ""
 	}
 
@@ -1711,7 +1729,11 @@ func (h *SeafHTTPHandler) lookupLibraryStorageClass(orgID, repoID string) string
 }
 
 func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID string) (*storage.BlockStore, string, error) {
-	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
+	return h.resolveLibraryBlockStoreContext(context.Background(), hostname, orgID, repoID)
+}
+
+func (h *SeafHTTPHandler) resolveLibraryBlockStoreContext(ctx context.Context, hostname, orgID, repoID string) (*storage.BlockStore, string, error) {
+	libraryClass := h.lookupLibraryStorageClassContext(ctx, orgID, repoID)
 	if h.storageManager != nil {
 		preferredClass := h.storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
 		return h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
@@ -2523,7 +2545,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
-var zipBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDs
+var zipBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDsContext
 
 var cleanupChunkUploadFn = func(upload *ChunkUpload) {
 	chunkManager.CleanupTrackedUpload(upload)
@@ -3785,10 +3807,6 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 		if !downloadTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(downloadTrafficStatus, "traffic quota exceeded", true))
 			return
-		} else {
-			if warning, ok := traffic.TrafficQuotaWarningHeader(downloadTrafficStatus); ok {
-				c.Header("X-Quota-Warning", warning)
-			}
 		}
 	}
 
@@ -3804,7 +3822,18 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 		return
 	}
 
-	if err := h.streamFileFromBlocks(c, token, filename, downloadTrafficStatus.PeriodStartedAt); err != nil {
+	lifecycle, ok := h.acquireDownloadAdmission(c, token, downloadadmission.ProfileFile)
+	if !ok {
+		return
+	}
+	defer lifecycle.FinishHandler()
+
+	if err := h.streamFileFromBlocks(c, token, filename, downloadTrafficStatus.PeriodStartedAt, lifecycle); err != nil {
+		// StartStreaming records writer setup failures itself. All other errors at
+		// this point occurred during protected preparation and are storage failures.
+		if !errors.Is(err, v2.ErrLibraryEncryptedNotUnlocked) {
+			lifecycle.Release(downloadadmission.ReleaseStorageError)
+		}
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, err)
 		return
 	}
@@ -3832,6 +3861,51 @@ func respondSeafHTTPDownloadError(c *gin.Context, repoID, path string, err error
 	log.Printf("[HandleDownload] download unavailable repo=%s path=%s: %v", repoID, path, err)
 	c.Header("Retry-After", "1")
 	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "file is temporarily unavailable; retry"})
+}
+
+// acquireDownloadAdmission starts the shared D4 lifecycle after the endpoint's
+// authentication, quota, and storage-availability gates have passed.
+func (h *SeafHTTPHandler) acquireDownloadAdmission(c *gin.Context, token *AccessToken, profile downloadadmission.Profile) (*httputil.DownloadAdmission, bool) {
+	cfg := config.DownloadAdmissionConfig{}
+	if h != nil && h.config != nil {
+		cfg = h.config.DownloadAdmission
+	}
+
+	request := downloadadmission.AdmissionRequest{}
+	if cfg.Enabled {
+		var err error
+		if token.Source == "link" {
+			request, err = downloadadmission.NewPublicLinkRequest(profile, token.SourceID, c.ClientIP())
+		} else {
+			request, err = downloadadmission.NewAuthenticatedRequest(profile, token.OrgID, token.UserID)
+		}
+		if err != nil {
+			respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("build download admission request: %w", err))
+			return nil, false
+		}
+	}
+
+	lifecycle, reason, err := httputil.AcquireDownloadAdmission(c, h.downloadAdmission, cfg, request)
+	if err != nil {
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("acquire download admission: %w", err))
+		return nil, false
+	}
+	if reason != "" {
+		httputil.RenderDownloadAdmissionRefusal(c, h.downloadAdmission)
+		return nil, false
+	}
+	return lifecycle, true
+}
+
+func releaseSeafHTTPDownloadStreamFailure(lifecycle *httputil.DownloadAdmission, err error) {
+	if lifecycle == nil {
+		return
+	}
+	if errors.Is(err, streaming.ErrStreamResponse) {
+		lifecycle.Release(downloadadmission.ReleaseResponseError)
+		return
+	}
+	lifecycle.Release(downloadadmission.ReleaseStorageError)
 }
 
 // resolveBlockID translates a client-facing block id to the internal SHA-256
@@ -3862,14 +3936,21 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, repoID, blockID string) (string,
 // lookupFileBlocks resolves a token's path to its block IDs, file size, encryption key, and block store.
 // This is the common metadata lookup used by both download and streaming paths.
 func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, fileIV []byte, blockStore *storage.BlockStore, storageClass string, err error) {
+	return h.lookupFileBlocksContext(context.Background(), hostname, token)
+}
+
+func (h *SeafHTTPHandler) lookupFileBlocksContext(ctx context.Context, hostname string, token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, fileIV []byte, blockStore *storage.BlockStore, storageClass string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Check encryption. A read failure must NOT fall through as "not encrypted".
-	encrypted, err := seafHTTPLookupLibraryEncryptedFn(h, token.OrgID, token.RepoID)
+	encrypted, err := seafHTTPLookupLibraryEncryptedFn(ctx, h, token.OrgID, token.RepoID)
 	if err != nil {
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("failed to check library encryption: %w", err)
 	}
 
 	if encrypted {
-		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
+		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIVContext(ctx, token.UserID, token.RepoID)
 		if fileKey == nil {
 			// Must stay a distinct sentinel: this is not a transient failure, and
 			// answering 503 would make the client retry forever instead of
@@ -3882,7 +3963,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	var headCommit string
 	err = h.db.Session().Query(`
 		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, token.OrgID, token.RepoID).Scan(&headCommit)
+	`, token.OrgID, token.RepoID).WithContext(ctx).Scan(&headCommit)
 	if err != nil {
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("library not found: %w", err)
 	}
@@ -3890,7 +3971,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	var rootFSID string
 	err = h.db.Session().Query(`
 		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, token.RepoID, headCommit).Scan(&rootFSID)
+	`, token.RepoID, headCommit).WithContext(ctx).Scan(&rootFSID)
 	if err != nil {
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("commit not found: %w", err)
 	}
@@ -3907,7 +3988,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 
 	currentFSID := rootFSID
 	for i := 0; i < len(pathParts)-1; i++ {
-		entry, err := h.findValidatedEntryInDir(token.RepoID, currentFSID, pathParts[i])
+		entry, err := h.findValidatedEntryInDirContext(ctx, token.RepoID, currentFSID, pathParts[i])
 		if err != nil {
 			return nil, 0, nil, nil, nil, "", fmt.Errorf("directory not found: %s: %w", pathParts[i], err)
 		}
@@ -3918,7 +3999,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	}
 
 	targetName := pathParts[len(pathParts)-1]
-	targetEntry, err := h.findValidatedEntryInDir(token.RepoID, currentFSID, targetName)
+	targetEntry, err := h.findValidatedEntryInDirContext(ctx, token.RepoID, currentFSID, targetName)
 	if err != nil {
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("file not found: %s: %w", targetName, err)
 	}
@@ -3933,7 +4014,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	var objType string
 	err = h.db.Session().Query(`
 		SELECT obj_type, block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, token.RepoID, fileFSID).Scan(&objType, &blockIDs, &fileSize)
+	`, token.RepoID, fileFSID).WithContext(ctx).Scan(&objType, &blockIDs, &fileSize)
 	if err != nil {
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("file metadata not found: %w", err)
 	}
@@ -3941,7 +4022,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("file metadata has unexpected object type %q", objType)
 	}
 
-	blockStore, storageClass, err = h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
+	blockStore, storageClass, err = h.resolveLibraryBlockStoreContext(ctx, hostname, token.OrgID, token.RepoID)
 	if err != nil {
 		return nil, 0, nil, nil, nil, "", fmt.Errorf("block store not available: %w", err)
 	}
@@ -3952,26 +4033,28 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 // streamFileFromBlocks streams a file's blocks directly to the HTTP response.
 // Uses prefetching (overlap S3 fetch with HTTP write) and 4MB io.CopyBuffer
 // for maximum throughput. Only O(2 × block_size) RAM.
-func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToken, filename string, periodStartedAt time.Time) error {
-	blockIDs, fileSize, fileKey, fileIV, blockStore, storageClass, err := seafHTTPLookupFileBlocksFn(h, httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
+func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToken, filename string, periodStartedAt time.Time, lifecycle *httputil.DownloadAdmission) error {
+	preparationCtx := c.Request.Context()
+	blockIDs, fileSize, fileKey, fileIV, blockStore, storageClass, err := seafHTTPLookupFileBlocksFn(preparationCtx, h, httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
 	if err != nil {
 		return err
 	}
 
 	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true, PeriodStartedAt: periodStartedAt}
+	quotaWarning := ""
 	if checker := traffic.GetChecker(); checker != nil {
-		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "download", fileSize)
+		downloadTrafficStatus, _ = checker.CheckTrafficQuotaContext(preparationCtx, token.OrgID, token.UserID, "download", fileSize)
 		if !downloadTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(downloadTrafficStatus, "traffic quota exceeded", true))
 			return nil
 		}
 		if warning, ok := traffic.TrafficQuotaWarningHeader(downloadTrafficStatus); ok {
-			c.Header("X-Quota-Warning", warning)
+			quotaWarning = warning
 		}
 	}
 
 	log.Printf("[streamFileFromBlocks] Streaming %d blocks, size=%d, encrypted=%v", len(blockIDs), fileSize, fileKey != nil)
-	representationID, err := seafHTTPResolveBlockRepresentationIDFn(h, token.OrgID, token.RepoID)
+	representationID, err := seafHTTPResolveBlockRepresentationIDFn(preparationCtx, h, token.OrgID, token.RepoID)
 	if err != nil {
 		return fmt.Errorf("resolve block representation: %w", err)
 	}
@@ -3979,17 +4062,28 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	// Batch resolve all block IDs upfront (avoids per-block Cassandra queries).
 	// Strict: a stale SHA-1 sent to SHA-256 storage would truncate the stream
 	// mid-download, so we resolve BEFORE committing any headers and fail clean.
-	resolvedIDs, err := seafHTTPBatchResolveBlockIDsFn(h.db, token.OrgID, representationID, blockIDs)
+	resolvedIDs, err := seafHTTPBatchResolveBlockIDsFn(preparationCtx, h.db, token.OrgID, representationID, blockIDs)
 	if err != nil {
 		log.Printf("[streamFileFromBlocks] block ID resolution failed for org=%s: %v", token.OrgID, err)
 		return fmt.Errorf("resolve block IDs: %w", err)
 	}
-	canonicalReader, err := seafHTTPNewCanonicalBlockReaderFn(c.Request.Context(), h.db, h.storageManager, token.OrgID, resolvedIDs, blockStore, storageClass)
+	canonicalReader, err := seafHTTPNewCanonicalBlockReaderFn(preparationCtx, h.db, h.storageManager, token.OrgID, resolvedIDs, blockStore, storageClass)
 	if err != nil {
 		return fmt.Errorf("resolve canonical block locations: %w", err)
 	}
 
+	streamCtx := c.Request.Context()
+	if lifecycle != nil {
+		streamCtx, err = lifecycle.StartStreaming()
+		if err != nil {
+			return fmt.Errorf("start download stream: %w", err)
+		}
+	}
+
 	// Set headers before streaming — Content-Length lets clients show progress
+	if quotaWarning != "" {
+		c.Header("X-Quota-Warning", quotaWarning)
+	}
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Content-Type", "application/octet-stream")
 	if fileSize > 0 {
@@ -4001,7 +4095,10 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	c.Status(http.StatusOK)
 
 	// Stream with prefetching pipeline
-	streaming.StreamBlocks(c, c.Request.Context(), canonicalReader, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks")
+	if err := streaming.StreamBlocks(c, streamCtx, canonicalReader, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks"); err != nil {
+		releaseSeafHTTPDownloadStreamFailure(lifecycle, err)
+		return err
+	}
 
 	log.Printf("[streamFileFromBlocks] Streaming complete: %d blocks", len(blockIDs))
 
@@ -4021,17 +4118,17 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 // DEPRECATED: Use streamFileFromBlocks for downloads. This is kept only for
 // upload metadata (commitUploadedFile) where the full content is already in memory.
 func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) ([]byte, error) {
-	blockIDs, _, fileKey, fileIV, blockStore, storageClass, err := seafHTTPLookupFileBlocksFn(h, httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
+	blockIDs, _, fileKey, fileIV, blockStore, storageClass, err := seafHTTPLookupFileBlocksFn(c.Request.Context(), h, httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx := c.Request.Context()
-	representationID, err := seafHTTPResolveBlockRepresentationIDFn(h, token.OrgID, token.RepoID)
+	representationID, err := seafHTTPResolveBlockRepresentationIDFn(ctx, h, token.OrgID, token.RepoID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve block representation: %w", err)
 	}
-	resolvedIDs, err := seafHTTPBatchResolveBlockIDsFn(h.db, token.OrgID, representationID, blockIDs)
+	resolvedIDs, err := seafHTTPBatchResolveBlockIDsFn(ctx, h.db, token.OrgID, representationID, blockIDs)
 	if err != nil {
 		return nil, fmt.Errorf("resolve block IDs: %w", err)
 	}
@@ -4245,11 +4342,18 @@ func findValidatedDirEntry(rawEntries, entryName string) (validatedDirEntry, err
 // is gone. A validated listing miss returns errDirEntryAbsent, which remains a
 // retryable 503 at the HTTP boundary.
 func (h *SeafHTTPHandler) findValidatedEntryInDir(repoID, dirFSID, entryName string) (validatedDirEntry, error) {
+	return h.findValidatedEntryInDirContext(context.Background(), repoID, dirFSID, entryName)
+}
+
+func (h *SeafHTTPHandler) findValidatedEntryInDirContext(ctx context.Context, repoID, dirFSID, entryName string) (validatedDirEntry, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var objType, dirEntries string
 	if err := h.db.Session().Query(`
 		SELECT obj_type, dir_entries FROM fs_objects
 		WHERE library_id = ? AND fs_id = ?
-	`, repoID, dirFSID).Scan(&objType, &dirEntries); err != nil {
+	`, repoID, dirFSID).WithContext(ctx).Scan(&objType, &dirEntries); err != nil {
 		return validatedDirEntry{}, fmt.Errorf("failed to read directory %s: %w", dirFSID, err)
 	}
 	if objType != "dir" {
@@ -4318,30 +4422,38 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 
 	// Quota pre-check — reject early if traffic quota is already exhausted.
 	zipTrafficStatus := traffic.QuotaStatus{Allowed: true}
+	zipQuotaWarning := ""
 	if checker := traffic.GetChecker(); checker != nil {
 		zipTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "download", 0)
 		if !zipTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(zipTrafficStatus, "traffic quota exceeded", true))
 			return
-		} else {
-			if warning, ok := traffic.TrafficQuotaWarningHeader(zipTrafficStatus); ok {
-				c.Header("X-Quota-Warning", warning)
-			}
+		}
+		if warning, ok := traffic.TrafficQuotaWarningHeader(zipTrafficStatus); ok {
+			zipQuotaWarning = warning
 		}
 	}
+
+	lifecycle, ok := h.acquireDownloadAdmission(c, token, downloadadmission.ProfileZIP)
+	if !ok {
+		return
+	}
+	defer lifecycle.FinishHandler()
+	preparationCtx := lifecycle.PreparationContext()
 
 	// Encryption must be checked before any metadata walk or stream. Ignoring a
 	// Cassandra error here previously left encrypted=false and produced a 200 zip
 	// of ciphertext bytes treated as plaintext.
-	encrypted, err := seafHTTPLookupLibraryEncryptedFn(h, token.OrgID, token.RepoID)
+	encrypted, err := seafHTTPLookupLibraryEncryptedFn(preparationCtx, h, token.OrgID, token.RepoID)
 	if err != nil {
+		lifecycle.Release(downloadadmission.ReleaseStorageError)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("failed to check library encryption: %w", err))
 		return
 	}
 	var fileKey []byte
 	var fileIV []byte
 	if encrypted {
-		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
+		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIVContext(preparationCtx, token.UserID, token.RepoID)
 		if fileKey == nil {
 			respondSeafHTTPDownloadError(c, token.RepoID, token.Path, v2.ErrLibraryEncryptedNotUnlocked)
 			return
@@ -4354,8 +4466,9 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	err = h.db.Session().Query(`
 		SELECT head_commit_id FROM libraries
 		WHERE org_id = ? AND library_id = ?
-	`, token.OrgID, token.RepoID).Scan(&headCommit)
+	`, token.OrgID, token.RepoID).WithContext(preparationCtx).Scan(&headCommit)
 	if err != nil {
+		lifecycle.Release(downloadadmission.ReleaseStorageError)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("library not found: %w", err))
 		return
 	}
@@ -4364,8 +4477,9 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	err = h.db.Session().Query(`
 		SELECT root_fs_id FROM commits
 		WHERE library_id = ? AND commit_id = ?
-	`, token.RepoID, headCommit).Scan(&rootFSID)
+	`, token.RepoID, headCommit).WithContext(preparationCtx).Scan(&rootFSID)
 	if err != nil {
+		lifecycle.Release(downloadadmission.ReleaseStorageError)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("commit not found: %w", err))
 		return
 	}
@@ -4385,7 +4499,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		var libraryName string
 		err = h.db.Session().Query(`
 			SELECT name FROM libraries WHERE org_id = ? AND library_id = ?
-		`, token.OrgID, token.RepoID).Scan(&libraryName)
+		`, token.OrgID, token.RepoID).WithContext(preparationCtx).Scan(&libraryName)
 		if err != nil || libraryName == "" {
 			dirName = "library"
 		} else {
@@ -4404,15 +4518,17 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 			if part == "" {
 				continue
 			}
-			entry, err := h.findValidatedEntryInDir(token.RepoID, currentFSID, part)
+			entry, err := h.findValidatedEntryInDirContext(preparationCtx, token.RepoID, currentFSID, part)
 			if err != nil {
 				// Same contract as HandleDownload: only a validated listing that
 				// does not name the entry distinguishes local absence; HTTP still
 				// maps it to 503 because the snapshot may be stale across DCs.
+				lifecycle.Release(downloadadmission.ReleaseStorageError)
 				respondSeafHTTPDownloadError(c, token.RepoID, part, err)
 				return
 			}
 			if !entry.isDir() {
+				lifecycle.Release(downloadadmission.ReleaseStorageError)
 				respondSeafHTTPDownloadError(c, token.RepoID, part, fmt.Errorf("path component %s is not a directory", part))
 				return
 			}
@@ -4427,21 +4543,23 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	}
 
 	hostname := httputil.GetRoutingHostname(c, h.configuredServerURL())
-	blockStore, storageClass, err := h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
+	blockStore, storageClass, err := h.resolveLibraryBlockStoreContext(preparationCtx, hostname, token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleZipDownload] Failed to resolve block store: %v", err)
+		lifecycle.Release(downloadadmission.ReleaseStorageError)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("block store not available: %w", err))
 		return
 	}
 
 	preflightBudget := h.newZipTraversalBudget()
-	preparedFiles, err := h.prepareZipDirectory(token.RepoID, token.OrgID, targetFSID, "", 0, preflightBudget)
+	preparedFiles, err := h.prepareZipDirectoryContext(preparationCtx, token.RepoID, token.OrgID, targetFSID, "", 0, preflightBudget)
 	if err != nil {
 		if isZipLimitError(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
 			return
 		}
 		log.Printf("[HandleZipDownload] Failed to validate ZIP directory: %v", err)
+		lifecycle.Release(downloadadmission.ReleaseStorageError)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, err)
 		return
 	}
@@ -4449,26 +4567,37 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	for _, file := range preparedFiles {
 		allResolvedIDs = append(allResolvedIDs, file.resolvedIDs...)
 	}
-	canonicalReader, err := seafHTTPNewCanonicalBlockReaderFn(c.Request.Context(), h.db, h.storageManager, token.OrgID, allResolvedIDs, blockStore, storageClass)
+	canonicalReader, err := seafHTTPNewCanonicalBlockReaderFn(preparationCtx, h.db, h.storageManager, token.OrgID, allResolvedIDs, blockStore, storageClass)
 	if err != nil {
 		log.Printf("[HandleZipDownload] Failed to resolve canonical block locations: %v", err)
+		lifecycle.Release(downloadadmission.ReleaseStorageError)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("resolve canonical block locations: %w", err))
+		return
+	}
+
+	streamCtx, err := lifecycle.StartStreaming()
+	if err != nil {
+		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("start zip stream: %w", err))
 		return
 	}
 
 	// Stream ZIP to response
 	zipFilename := dirName + ".zip"
+	if zipQuotaWarning != "" {
+		c.Header("X-Quota-Warning", zipQuotaWarning)
+	}
 	c.Header("Content-Type", "application/zip")
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, zipFilename))
 	c.Status(http.StatusOK)
 
 	zipWriter := zip.NewWriter(c.Writer)
-	defer zipWriter.Close()
+	defer finishSeafHTTPZipDownload(lifecycle, zipWriter)
 
 	// Snapshot writer size before streaming so we can calculate the delta afterward.
 	bytesBefore := int64(c.Writer.Size())
 
-	if err := h.addDirToZip(c.Request.Context(), zipWriter, canonicalReader, preparedFiles, fileKey, fileIV); err != nil {
+	if err := h.addDirToZip(streamCtx, zipWriter, canonicalReader, preparedFiles, fileKey, fileIV); err != nil {
+		releaseSeafHTTPDownloadStreamFailure(lifecycle, err)
 		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", err)
 		return
 	}
@@ -4494,6 +4623,13 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 }
 
 func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix string, depth int, budget *zipTraversalBudget) ([]zipPreparedFile, error) {
+	return h.prepareZipDirectoryContext(context.Background(), repoID, orgID, dirFSID, prefix, depth, budget)
+}
+
+func (h *SeafHTTPHandler) prepareZipDirectoryContext(ctx context.Context, repoID, orgID, dirFSID, prefix string, depth int, budget *zipTraversalBudget) ([]zipPreparedFile, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if budget != nil {
 		if err := budget.noteDirectory(depth); err != nil {
 			return nil, err
@@ -4503,7 +4639,7 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 	var objType, dirEntriesJSON string
 	if err := h.db.Session().Query(`
 		SELECT obj_type, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, repoID, dirFSID).Scan(&objType, &dirEntriesJSON); err != nil {
+	`, repoID, dirFSID).WithContext(ctx).Scan(&objType, &dirEntriesJSON); err != nil {
 		return nil, fmt.Errorf("failed to read directory %s: %w", dirFSID, err)
 	}
 	if objType != "dir" {
@@ -4532,7 +4668,7 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 		}
 
 		if entry.isDir() {
-			childFiles, err := h.prepareZipDirectory(repoID, orgID, id, entryPath, depth+1, budget)
+			childFiles, err := h.prepareZipDirectoryContext(ctx, repoID, orgID, id, entryPath, depth+1, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -4545,7 +4681,7 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 		var fileSize int64
 		err := h.db.Session().Query(`
 			SELECT obj_type, block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
-		`, repoID, id).Scan(&fileObjType, &blockIDs, &fileSize)
+		`, repoID, id).WithContext(ctx).Scan(&fileObjType, &blockIDs, &fileSize)
 		if err != nil {
 			return nil, fmt.Errorf("load blocks for %s: %w", entryPath, err)
 		}
@@ -4558,11 +4694,11 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 			}
 		}
 
-		representationID, err := h.resolveBlockRepresentationID(orgID, repoID)
+		representationID, err := db.ResolveBlockRepresentationIDContext(ctx, h.db.Session(), orgID, repoID)
 		if err != nil {
 			return nil, fmt.Errorf("resolve block representation for %s: %w", entryPath, err)
 		}
-		resolvedIDs, err := zipBatchResolveBlockIDsFn(h.db, orgID, representationID, blockIDs)
+		resolvedIDs, err := zipBatchResolveBlockIDsFn(ctx, h.db, orgID, representationID, blockIDs)
 		if err != nil {
 			return nil, fmt.Errorf("resolve block IDs for %s: %w", entryPath, err)
 		}
@@ -4576,6 +4712,37 @@ func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix str
 	}
 
 	return prepared, nil
+}
+
+// finishSeafHTTPZipDownload closes the archive while its admission lease is
+// still active. It preserves a handler panic while also releasing the lease if
+// Close itself panics.
+func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter *zip.Writer) {
+	originalPanic := recover()
+	if originalPanic != nil {
+		lifecycle.Release(downloadadmission.ReleasePanic)
+	}
+
+	var closeErr error
+	var closePanic any
+	func() {
+		defer func() { closePanic = recover() }()
+		closeErr = zipWriter.Close()
+	}()
+	if closeErr != nil {
+		lifecycle.Release(downloadadmission.ReleaseResponseError)
+		log.Printf("[HandleZipDownload] ZIP close failed: %v", closeErr)
+	}
+	if closePanic != nil {
+		lifecycle.Release(downloadadmission.ReleasePanic)
+		log.Printf("[HandleZipDownload] ZIP close panicked: %v", closePanic)
+	}
+	if originalPanic != nil {
+		panic(originalPanic)
+	}
+	if closePanic != nil {
+		panic(closePanic)
+	}
 }
 
 func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, zw *zip.Writer, blockStore streaming.BlockReader, files []zipPreparedFile, fileKey []byte, fileIV []byte) error {
@@ -4601,7 +4768,7 @@ func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, zw *zip.Writer, bloc
 	}
 	w, err := zw.CreateHeader(header)
 	if err != nil {
-		return fmt.Errorf("create zip entry %s: %w", file.path, err)
+		return fmt.Errorf("%w: create zip entry %s: %w", streaming.ErrStreamResponse, file.path, err)
 	}
 
 	buf := streaming.GetCopyBuf()
@@ -4614,28 +4781,51 @@ func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, zw *zip.Writer, bloc
 		if fileKey != nil {
 			blockData, err := blockStore.GetBlock(ctx, internalID)
 			if err != nil {
-				return fmt.Errorf("get block %s for %s: %w", file.blockIDs[i], file.path, err)
+				return fmt.Errorf("%w: get block %s for %s: %w", streaming.ErrStreamStorage, file.blockIDs[i], file.path, err)
 			}
 			decrypted, err := crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 			if err != nil {
-				return fmt.Errorf("decrypt block for %s: %w", file.path, err)
+				return fmt.Errorf("%w: decrypt block for %s: %w", streaming.ErrStreamStorage, file.path, err)
 			}
 			if _, err := w.Write(decrypted); err != nil {
-				return fmt.Errorf("write decrypted block for %s: %w", file.path, err)
+				return fmt.Errorf("%w: write decrypted block for %s: %w", streaming.ErrStreamResponse, file.path, err)
 			}
 			continue
 		}
 
 		reader, err := blockStore.GetBlockReader(ctx, internalID)
 		if err != nil {
-			return fmt.Errorf("get block reader %s for %s: %w", file.blockIDs[i], file.path, err)
+			return fmt.Errorf("%w: get block reader %s for %s: %w", streaming.ErrStreamStorage, file.blockIDs[i], file.path, err)
 		}
-		_, err = io.CopyBuffer(w, reader, buf)
-		reader.Close()
+		writer := &zipResponseWriteTracker{Writer: w}
+		_, err = io.CopyBuffer(writer, reader, buf)
+		closeErr := reader.Close()
 		if err != nil {
-			return fmt.Errorf("stream block %s for %s: %w", file.blockIDs[i], file.path, err)
+			if writer.err != nil {
+				return fmt.Errorf("%w: stream block %s for %s: %w", streaming.ErrStreamResponse, file.blockIDs[i], file.path, err)
+			}
+			return fmt.Errorf("%w: stream block %s for %s: %w", streaming.ErrStreamStorage, file.blockIDs[i], file.path, err)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("%w: close block reader %s for %s: %w", streaming.ErrStreamStorage, file.blockIDs[i], file.path, closeErr)
 		}
 	}
 
 	return nil
+}
+
+type zipResponseWriteTracker struct {
+	io.Writer
+	err error
+}
+
+func (w *zipResponseWriteTracker) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.err = err
+	}
+	return n, err
 }

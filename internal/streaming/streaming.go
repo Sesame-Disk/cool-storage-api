@@ -26,6 +26,13 @@ type BlockReader interface {
 	GetBlockSize(ctx context.Context, hash string) (int64, error)
 }
 
+var (
+	// ErrStreamStorage wraps block prefetch, fetch, decrypt, and reader failures.
+	ErrStreamStorage = errors.New("stream storage failure")
+	// ErrStreamResponse wraps response write and flush failures.
+	ErrStreamResponse = errors.New("stream response failure")
+)
+
 // copyBufPool provides reusable 4MB buffers for io.CopyBuffer to avoid
 // the default 32KB buffer and reduce syscall overhead by ~128x.
 var copyBufPool = sync.Pool{
@@ -74,16 +81,31 @@ func ContainsLegacySHA1(blockIDs []string) bool {
 // send a stale SHA-1 to SHA-256 storage, truncating the download mid-stream after
 // the headers are already committed (see StreamBlocks: "headers already sent").
 func BatchResolveBlockIDs(database *db.DB, orgID, representationID string, blockIDs []string) ([]string, error) {
+	return BatchResolveBlockIDsContext(context.Background(), database, orgID, representationID, blockIDs)
+}
+
+// BatchResolveBlockIDsContext is BatchResolveBlockIDs bound to ctx, including
+// every Cassandra mapping read. It stops dispatching work once the request is
+// cancelled and waits for already-issued context-aware reads to return.
+func BatchResolveBlockIDsContext(ctx context.Context, database *db.DB, orgID, representationID string, blockIDs []string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := db.ValidateBlockRepresentationID(representationID); err != nil {
 		return nil, err
 	}
-	return resolveBlockIDs(orgID, blockIDs, mappingResolveConcurrency, func(idx int) (string, error) {
-		var internalID string
-		err := database.Session().Query(`
-			SELECT internal_id FROM block_id_mappings
-			WHERE org_id = ? AND representation_id = ? AND external_id = ?
-		`, orgID, representationID, db.NormalizeBlockID(blockIDs[idx])).Scan(&internalID)
-		return internalID, err
+	return resolveBlockIDsContext(ctx, orgID, blockIDs, mappingResolveConcurrency, func(idx int) (string, error) {
+		internalID, found, err := database.GetBlockIDMappingContext(ctx, orgID, representationID, blockIDs[idx])
+		if err != nil {
+			return "", err
+		}
+		if !found {
+			return "", gocql.ErrNotFound
+		}
+		return internalID, nil
 	})
 }
 
@@ -104,6 +126,13 @@ func BatchResolveBlockIDs(database *db.DB, orgID, representationID string, block
 // concurrency/ordering/error semantics stay unit-testable without a live
 // Cassandra (block_id_mappings has no in-process fake).
 func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) ([]string, error) {
+	return resolveBlockIDsContext(context.Background(), orgID, blockIDs, maxConcurrency, lookup)
+}
+
+func resolveBlockIDsContext(ctx context.Context, orgID string, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	resolved := make([]string, len(blockIDs))
 
 	// Canonicalize first, THEN classify. 64-char SHA-256 IDs land canonicalized
@@ -145,19 +174,26 @@ func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup
 	sem := make(chan struct{}, concurrency)
 	results := make(chan lookupResult, len(toResolve))
 
+	launched := 0
 	for _, idx := range toResolve {
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			goto collect
+		}
 		go func(idx int) {
 			defer func() { <-sem }()
 			internalID, err := lookup(idx)
 			results <- lookupResult{idx: idx, internalID: internalID, err: err}
 		}(idx)
+		launched++
 	}
 
+collect:
 	var resolveErr error
 	queryFailures := 0
 	missingMappings := 0
-	for range toResolve {
+	for range launched {
 		result := <-results
 		if result.err != nil {
 			if errors.Is(result.err, gocql.ErrNotFound) {
@@ -180,6 +216,9 @@ func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup
 			continue
 		}
 		resolved[result.idx] = internalID
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if resolveErr != nil {
 		log.Printf("[BatchResolveBlockIDs] ERROR: aborting resolution for org=%s: %d/%d blocks unresolved (query_failures=%d, missing_mappings=%d)",
@@ -229,10 +268,12 @@ func PrefetchBlock(ctx context.Context, blockStore BlockReader, blockID string, 
 
 // StreamBlocks streams resolved blocks to an HTTP response with prefetching.
 // Uses prefetch (overlap S3 fetch with HTTP write) and 4MB io.CopyBuffer
-// for maximum throughput. Only O(2 x block_size) RAM.
-func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, resolvedIDs []string, fileKey []byte, fileIV []byte, logPrefix string) {
+// for maximum throughput. Only O(2 x block_size) RAM. It returns errors wrapped
+// with ErrStreamStorage or ErrStreamResponse; callers that cannot act after the
+// response is committed may ignore the result.
+func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, resolvedIDs []string, fileKey []byte, fileIV []byte, logPrefix string) error {
 	if len(resolvedIDs) == 0 {
-		return
+		return nil
 	}
 
 	buf := GetCopyBuf()
@@ -280,46 +321,82 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 			pending = PrefetchBlock(prefetchCtx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
 		}
 
-		if !streamOneBlock(c, buf, result, fileKey, logPrefix, i, len(resolvedIDs)) {
-			return
+		if err := streamOneBlock(c, buf, result, fileKey, logPrefix, i, len(resolvedIDs)); err != nil {
+			return err
 		}
 	}
+
+	return nil
 }
 
 // streamOneBlock writes one prefetched block to the response and ALWAYS closes
 // that block's reader — including if the write or copy panics — so the reader this
-// call owns is closed exactly once on every path. It returns false when streaming
-// must stop (a fetch error, a write error, or a copy error); the response headers
-// are already committed by then, so the failure can only be logged. The block
+// call owns is closed exactly once on every path. Its errors are categorized for
+// callers even though response headers may already be committed. The block
 // prefetched one ahead is owned and closed by StreamBlocks' own defer, not here, so
 // the two never target the same reader.
-func streamOneBlock(c *gin.Context, buf []byte, result PrefetchResult, fileKey []byte, logPrefix string, i, total int) bool {
+func streamOneBlock(c *gin.Context, buf []byte, result PrefetchResult, fileKey []byte, logPrefix string, i, total int) error {
 	if result.Reader != nil {
 		defer result.Reader.Close()
 	}
 
 	if result.Err != nil {
 		log.Printf("[%s] Failed to get block %d/%d: %v", logPrefix, i, total, result.Err)
-		return false // headers already sent, can't return error to client
+		return fmt.Errorf("%w: get block %d/%d: %w", ErrStreamStorage, i, total, result.Err)
 	}
 
 	if fileKey != nil {
 		// Encrypted: write the already-decrypted bytes (there is no reader to own).
-		if _, err := c.Writer.Write(result.Data); err != nil {
+		if _, err := writeResponse(c.Writer, result.Data); err != nil {
 			log.Printf("[%s] Write error: %v", logPrefix, err)
-			return false
+			return fmt.Errorf("%w: write block %d/%d: %w", ErrStreamResponse, i, total, err)
 		}
 	} else {
 		// Unencrypted: stream with the 4MB buffer.
-		if _, err := io.CopyBuffer(c.Writer, result.Reader, buf); err != nil {
-			log.Printf("[%s] Stream copy error: %v", logPrefix, err)
-			return false
+		writer := &responseWriteTracker{Writer: c.Writer}
+		if _, err := io.CopyBuffer(writer, result.Reader, buf); err != nil {
+			if writer.err != nil {
+				log.Printf("[%s] Write error: %v", logPrefix, err)
+				return fmt.Errorf("%w: write block %d/%d: %w", ErrStreamResponse, i, total, err)
+			}
+			log.Printf("[%s] Block read error: %v", logPrefix, err)
+			return fmt.Errorf("%w: read block %d/%d: %w", ErrStreamStorage, i, total, err)
 		}
 	}
 
 	// Flush every 4 blocks instead of every block to reduce overhead.
 	if (i+1)%4 == 0 || i == total-1 {
-		c.Writer.Flush()
+		if writer, ok := c.Writer.(interface{ FlushError() error }); ok {
+			if err := writer.FlushError(); err != nil {
+				log.Printf("[%s] Flush error: %v", logPrefix, err)
+				return fmt.Errorf("%w: flush response: %w", ErrStreamResponse, err)
+			}
+		} else {
+			c.Writer.Flush()
+		}
 	}
-	return true
+	return nil
+}
+
+// responseWriteTracker identifies errors returned by the response writer when
+// io.CopyBuffer otherwise cannot distinguish them from source-reader errors.
+type responseWriteTracker struct {
+	io.Writer
+	err error
+}
+
+func (w *responseWriteTracker) Write(p []byte) (int, error) {
+	n, err := writeResponse(w.Writer, p)
+	if err != nil {
+		w.err = err
+	}
+	return n, err
+}
+
+func writeResponse(w io.Writer, p []byte) (int, error) {
+	n, err := w.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	return n, err
 }

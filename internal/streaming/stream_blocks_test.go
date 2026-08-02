@@ -17,6 +17,47 @@ import (
 
 func init() { gin.SetMode(gin.TestMode) }
 
+func TestResolveBlockIDsContextStopsDispatchAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	blockIDs := []string{
+		"1111111111111111111111111111111111111111",
+		"2222222222222222222222222222222222222222",
+		"3333333333333333333333333333333333333333",
+	}
+	var calls atomic.Int32
+	_, err := resolveBlockIDsContext(ctx, "org-1", blockIDs, 1, func(int) (string, error) {
+		calls.Add(1)
+		cancel()
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("resolveBlockIDsContext error = %v, want context canceled", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("mapping lookups dispatched = %d, want 1 after cancellation", got)
+	}
+}
+
+func TestBlockReadSeekerReportsStorageReadError(t *testing.T) {
+	readErr := errors.New("block read failed")
+	blockID := "1111111111111111111111111111111111111111111111111111111111111111"
+	reader := &stubBlockReader{readerErr: map[string]error{blockID: readErr}}
+	seeker := NewBlockReadSeeker(context.Background(), reader, []string{blockID}, []int64{1}, 1, nil, nil)
+	var reported error
+	seeker.SetReadErrorHandler(func(err error) { reported = err })
+
+	_, err := seeker.Read(make([]byte, 1))
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Read error = %v, want %v", err, readErr)
+	}
+	if !errors.Is(reported, readErr) {
+		t.Fatalf("reported error = %v, want %v", reported, readErr)
+	}
+}
+
 // trackingReader is an io.ReadCloser that counts how many times it was opened
 // (handed out by the stub) and closed, so a test can assert the two balance —
 // every reader StreamBlocks opens is closed exactly once, including one prefetched
@@ -117,6 +158,8 @@ type gatedFailingWriter struct {
 	gate   <-chan struct{}
 }
 
+var errWriterFailedAfterPrefetch = errors.New("client gone: write failed after prefetch")
+
 func (w *gatedFailingWriter) Header() http.Header {
 	if w.header == nil {
 		w.header = http.Header{}
@@ -126,9 +169,34 @@ func (w *gatedFailingWriter) Header() http.Header {
 func (w *gatedFailingWriter) WriteHeader(int) {}
 func (w *gatedFailingWriter) Write([]byte) (int, error) {
 	<-w.gate
-	return 0, errors.New("client gone: write failed after prefetch")
+	return 0, errWriterFailedAfterPrefetch
 }
 func (w *gatedFailingWriter) Flush() {}
+
+type flushErrorResponseWriter struct {
+	gin.ResponseWriter
+	err     error
+	flushes int
+}
+
+func (w *flushErrorResponseWriter) FlushError() error {
+	w.flushes++
+	return w.err
+}
+
+func (w *flushErrorResponseWriter) Flush() {
+	w.ResponseWriter.Flush()
+}
+
+type countingFlushResponseWriter struct {
+	gin.ResponseWriter
+	flushes int
+}
+
+func (w *countingFlushResponseWriter) Flush() {
+	w.flushes++
+	w.ResponseWriter.Flush()
+}
 
 // runStreamBlocksWithin runs fn (a StreamBlocks call, optionally wrapping its own
 // recover) in a goroutine and fails fast if it does not return within 5s. The gated
@@ -171,10 +239,17 @@ func TestStreamBlocks_ClosesPrefetchedReaderOnWriteError(t *testing.T) {
 	// abandonment deterministically leaves block 1's reader open in the buffer —
 	// exactly the F11 leak the drain must reclaim.
 	c, _ := gin.CreateTestContext(&gatedFailingWriter{gate: b1Opened})
+	var streamErr error
 	runStreamBlocksWithin(t, func() {
-		StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
+		streamErr = StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
 	})
 
+	if !errors.Is(streamErr, ErrStreamResponse) {
+		t.Errorf("StreamBlocks() error = %v, want ErrStreamResponse", streamErr)
+	}
+	if !errors.Is(streamErr, errWriterFailedAfterPrefetch) {
+		t.Errorf("StreamBlocks() error = %v, want wrapped writer error", streamErr)
+	}
 	if b0.opens.Load() != 1 || b0.closes.Load() != 1 {
 		t.Errorf("streamed reader: open=%d close=%d, want 1/1", b0.opens.Load(), b0.closes.Load())
 	}
@@ -228,14 +303,24 @@ func TestStreamBlocks_ClosesReadersEvenIfWritePanics(t *testing.T) {
 // wasted S3 open, nothing to cancel or drain) and nothing is leaked.
 func TestStreamBlocks_BlockFetchErrorDoesNotPrefetchOrLeakNext(t *testing.T) {
 	b1 := newTrackingReader("block-one-bytes")
+	storageErr := errors.New("s3 get failed")
 	stub := &stubBlockReader{
 		readers:   map[string]*trackingReader{"b1": b1},
-		readerErr: map[string]error{"b0": errors.New("s3 get failed")},
+		readerErr: map[string]error{"b0": storageErr},
 	}
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
+	err := StreamBlocks(c, context.Background(), stub, []string{"b0", "b1"}, nil, nil, "test")
 
+	if !errors.Is(err, ErrStreamStorage) {
+		t.Errorf("StreamBlocks() error = %v, want ErrStreamStorage", err)
+	}
+	if !errors.Is(err, storageErr) {
+		t.Errorf("StreamBlocks() error = %v, want wrapped storage error", err)
+	}
+	if errors.Is(err, ErrStreamResponse) {
+		t.Errorf("StreamBlocks() error = %v, must not wrap ErrStreamResponse", err)
+	}
 	if b1.opens.Load() != 0 {
 		t.Errorf("next block prefetched %d times after a current-block error, want 0", b1.opens.Load())
 	}
@@ -304,10 +389,13 @@ func TestStreamBlocks_HappyPathClosesEveryReaderOnce(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
+	writer := &countingFlushResponseWriter{ResponseWriter: c.Writer}
+	c.Writer = writer
 
 	done := make(chan struct{})
+	var streamErr error
 	go func() {
-		StreamBlocks(c, context.Background(), stub, []string{"b0", "b1", "b2"}, nil, nil, "test")
+		streamErr = StreamBlocks(c, context.Background(), stub, []string{"b0", "b1", "b2"}, nil, nil, "test")
 		close(done)
 	}()
 	select {
@@ -326,6 +414,41 @@ func TestStreamBlocks_HappyPathClosesEveryReaderOnce(t *testing.T) {
 	}
 	if body := rec.Body.String(); body != "AAAABBBBCCCC" {
 		t.Errorf("streamed body = %q, want %q", body, "AAAABBBBCCCC")
+	}
+	if streamErr != nil {
+		t.Errorf("StreamBlocks() error = %v, want nil", streamErr)
+	}
+	if writer.flushes != 1 {
+		t.Errorf("Flush called %d times, want 1 when FlushError is unavailable", writer.flushes)
+	}
+}
+
+func TestStreamBlocks_ReturnsResponseErrorOnFlushError(t *testing.T) {
+	reader := newTrackingReader("block-bytes")
+	stub := &stubBlockReader{readers: map[string]*trackingReader{"b0": reader}}
+	flushErr := errors.New("write deadline exceeded")
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	writer := &flushErrorResponseWriter{ResponseWriter: c.Writer, err: flushErr}
+	c.Writer = writer
+
+	err := StreamBlocks(c, context.Background(), stub, []string{"b0"}, nil, nil, "test")
+
+	if !errors.Is(err, ErrStreamResponse) {
+		t.Errorf("StreamBlocks() error = %v, want ErrStreamResponse", err)
+	}
+	if !errors.Is(err, flushErr) {
+		t.Errorf("StreamBlocks() error = %v, want wrapped FlushError error", err)
+	}
+	if writer.flushes != 1 {
+		t.Errorf("FlushError called %d times, want 1", writer.flushes)
+	}
+	if body := rec.Body.String(); body != "block-bytes" {
+		t.Errorf("streamed body = %q, want %q", body, "block-bytes")
+	}
+	if reader.opens.Load() != 1 || reader.closes.Load() != 1 {
+		t.Errorf("reader open=%d close=%d, want 1/1", reader.opens.Load(), reader.closes.Load())
 	}
 }
 
