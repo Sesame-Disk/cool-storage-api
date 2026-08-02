@@ -46,7 +46,7 @@ func (m *countingTokenCreator) CreateDownloadToken(string, string, string, strin
 func (m *countingTokenCreator) CreateLinkUploadToken(string, string, string, string, string) (string, error) {
 	return "link-upload-token", nil
 }
-func (m *countingTokenCreator) CreateLinkDownloadToken(string, string, string, string) (string, error) {
+func (m *countingTokenCreator) CreateLinkDownloadToken(string, string, string, string, string) (string, error) {
 	m.linkDownloadCalls++
 	return "link-download-token", nil
 }

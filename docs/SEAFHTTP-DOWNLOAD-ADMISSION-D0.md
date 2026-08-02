@@ -1,10 +1,12 @@
 # B4 Subcontract D — Download Admission Contract
 
-**Date:** 2026-08-01  
-**Branch:** `fix/b4-subcontract-d1-download-admission`
-**Status:** D0 contract; D1 coordinator/configuration implementation complete
-in this branch. Producer wiring remains deferred to D4, and positive operating
-values remain deferred to D6.
+**Date:** 2026-08-01 (original contract freeze)  
+**Last updated:** 2026-08-02  
+**Branch:** `feat/b4-subcontract-d2-download-source-id`
+**Status:** D0 contract; D1 coordinator/configuration is merged in `main`, and
+D2 stable public download-token `SourceID` implementation is complete in this
+branch. Admission producer wiring remains deferred to D4, and positive
+operating values remain deferred to D6.
 
 This document freezes the contract and inventory for subcontract D of
 `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`. It is the design record for the D1-D6
@@ -162,9 +164,9 @@ The implementation must never use one field for all three meanings:
 | Admission source | Stable public-link `SourceID` | Per-link capacity and remint-resistant fairness | 
 | Traffic subject | Authenticated user or anonymous link traffic | Existing traffic/quota policy; not silently changed by D | 
 
-`CreateLinkDownloadToken` currently accepts no `sourceID`, although migration
-013 and the upload-token path already support `access_tokens.source_id`. D2
-must add the missing download-token wiring.
+`CreateLinkDownloadToken` now accepts `sourceID`; migration 013 and the
+upload-token path already support `access_tokens.source_id`. D2 adds the
+download-token wiring.
 
 Admission keys are structured and namespaced; they are not untyped concatenated
 strings:
@@ -188,16 +190,18 @@ introducing a second one.
 
 For `Source == "link"`:
 
-The list below is the contract D2 must establish, not a description of today.
-Only the upload-token path carries a source identity right now.
+The list below is the D2 contract and implementation result. Upload and public
+download-token paths carry a source identity; admission itself remains deferred
+to D4.
 
 - New tokens require a non-empty, non-whitespace `SourceID`.
-- D2 must update all three public mint flows to pass
+- All three public mint flows pass
   `publicLinkSourceID("share-link", sl.token)`:
   normal download, public OnlyOffice and public ZIP token creation.
 - A token remint retains the same source identity while changing the bearer.
 - A link token with a blank source identity fails closed before protected bytes
-  are produced. Inline text does not necessarily use a download token: for
+  are produced by the download consumers. Inline text does not necessarily use
+  a download token: for
   `readFileContentAsText`, derive the admission source directly from the
   resolved share link with `publicLinkSourceID("share-link", sl.token)`.
 - No fallback uses the temporary bearer, owner user ID, repo/path or a shared
@@ -488,7 +492,7 @@ Migration 013 already adds nullable `source_id` to `access_tokens`, and the
 database model, Cassandra scan and upload-token path already carry it. No new
 migration is planned for D2.
 
-D2 must update the download-token contract across:
+D2 updates the download-token contract across:
 
 - `TokenStore` and `TokenManager` interfaces/implementations;
 - `CassandraTokenAdapter`;
@@ -959,7 +963,7 @@ deployment for token issuance.
 |---|---|---|
 | D0 | Contract, inventory, identity and evidence record | None; docs only |
 | D1 | Neutral D coordinator, atomic dimensions, bounded state, config and metrics | Coordinator not yet connected to producers |
-| D2 | Stable `SourceID` for all public download-token mint paths | New link tokens become strict; no legacy compatibility; coordinated greenfield rollout |
+| D2 | Stable `SourceID` for all public download-token mint paths | Implemented in this branch; new link tokens are strict; no legacy compatibility; coordinated greenfield rollout |
 | D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Writer safety exercised before broad admission activation |
 | D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | All listed storage-backed producers use D |
 | D5 | Stream sync block GET through existing canonical reader APIs | Block GET no longer materializes the block |

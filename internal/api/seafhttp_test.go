@@ -1262,6 +1262,13 @@ func TestTokenManagerCreateToken(t *testing.T) {
 	}
 }
 
+func TestTokenManagerCreateTokenRejectsGenericLinkWithoutSourceID(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	if _, err := tm.CreateToken(TokenTypeDownload, "org1", "repo1", "/file.txt", "user1", "link", time.Hour); err == nil {
+		t.Fatal("generic CreateToken accepted a link token without SourceID")
+	}
+}
+
 func TestTokenManagerCreateUploadToken(t *testing.T) {
 	tm := NewTokenManager(1 * time.Hour)
 
@@ -1312,6 +1319,56 @@ func TestTokenManagerCreateLinkUploadTokenRejectsBlankSourceID(t *testing.T) {
 	for _, sourceID := range []string{"", " ", "\t\r\n"} {
 		if _, err := tm.CreateLinkUploadToken("org1", "repo1", "/upload/path", "user1", sourceID); err == nil {
 			t.Fatalf("CreateLinkUploadToken(%q) succeeded, want error", sourceID)
+		}
+	}
+}
+
+func TestTokenManagerCreateLinkDownloadTokenPreservesSourceID(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	sourceID := "stable-download-link-fingerprint"
+
+	firstToken, err := tm.CreateLinkDownloadToken("org1", "repo1", "/file.txt", "user1", sourceID)
+	if err != nil {
+		t.Fatalf("first CreateLinkDownloadToken failed: %v", err)
+	}
+	secondToken, err := tm.CreateLinkDownloadToken("org1", "repo1", "/file.txt", "user1", sourceID)
+	if err != nil {
+		t.Fatalf("second CreateLinkDownloadToken failed: %v", err)
+	}
+	if firstToken == secondToken {
+		t.Fatal("reminted link download token strings must differ")
+	}
+	for label, tokenString := range map[string]string{"first": firstToken, "second": secondToken} {
+		token, ok := tm.GetToken(tokenString, TokenTypeDownload)
+		if !ok {
+			t.Fatalf("%s link download token should be retrievable", label)
+		}
+		if token.Source != "link" || token.SourceID != sourceID {
+			t.Fatalf("%s token source = (%q, %q), want (link, %q)", label, token.Source, token.SourceID, sourceID)
+		}
+	}
+}
+
+func TestTokenManagerCreateLinkDownloadTokenTrimsSourceID(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenString, err := tm.CreateLinkDownloadToken("org1", "repo1", "/file.txt", "user1", " stable-download-link ")
+	if err != nil {
+		t.Fatalf("CreateLinkDownloadToken failed: %v", err)
+	}
+	token, ok := tm.GetToken(tokenString, TokenTypeDownload)
+	if !ok {
+		t.Fatal("trimmed link download token should be retrievable")
+	}
+	if token.SourceID != "stable-download-link" {
+		t.Fatalf("SourceID = %q, want trimmed value", token.SourceID)
+	}
+}
+
+func TestTokenManagerCreateLinkDownloadTokenRejectsBlankSourceID(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	for _, sourceID := range []string{"", " ", "\t\r\n"} {
+		if _, err := tm.CreateLinkDownloadToken("org1", "repo1", "/file.txt", "user1", sourceID); err == nil {
+			t.Fatalf("CreateLinkDownloadToken(%q) succeeded, want error", sourceID)
 		}
 	}
 }
@@ -1772,11 +1829,15 @@ func (m *MockTokenStore) CreateLinkUploadToken(orgID, repoID, path, userID, sour
 	return token.Token, nil
 }
 
-func (m *MockTokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
+func (m *MockTokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
+	if strings.TrimSpace(sourceID) == "" {
+		return "", errors.New("source ID is required for link download tokens")
+	}
 	token := &AccessToken{
 		Token:     "mock-link-download-token",
 		Type:      TokenTypeDownload,
 		Source:    "link",
+		SourceID:  sourceID,
 		OrgID:     orgID,
 		RepoID:    repoID,
 		Path:      path,
@@ -3823,5 +3884,33 @@ func TestRegisterSeafHTTPRoutesZipRateLimit(t *testing.T) {
 	r.ServeHTTP(w2, req2)
 	if w2.Code != http.StatusTooManyRequests {
 		t.Fatalf("second status = %d, want %d", w2.Code, http.StatusTooManyRequests)
+	}
+}
+
+// A non-canonical source must be canonicalised before the link check, otherwise
+// it skips the source-ID requirement here and the link-only guards downstream.
+func TestTokenManagerCreateTokenNormalisesSourceBeforeTheLinkCheck(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	for _, source := range []string{"LINK", "Link", " link ", "\tLINK\n"} {
+		if _, err := tm.CreateToken(TokenTypeDownload, "org1", "repo1", "/file.txt", "user1", source, time.Hour); err == nil {
+			t.Fatalf("CreateToken(source=%q) succeeded without a source ID; a non-canonical source must still be treated as a link", source)
+		}
+	}
+}
+
+// The stored Source must be canonical so the exact-comparison readers and the
+// EqualFold reader cannot disagree about the same token.
+func TestTokenManagerCreateLinkTokenStoresCanonicalSource(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenString, err := tm.CreateLinkDownloadToken("org1", "repo1", "/file.txt", "user1", "stable-source")
+	if err != nil {
+		t.Fatalf("CreateLinkDownloadToken failed: %v", err)
+	}
+	token, ok := tm.GetToken(tokenString, TokenTypeDownload)
+	if !ok {
+		t.Fatal("link download token should be retrievable")
+	}
+	if token.Source != "link" {
+		t.Fatalf("stored Source = %q, want %q", token.Source, "link")
 	}
 }

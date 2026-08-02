@@ -40,7 +40,8 @@ type ShareLinkViewHandler struct {
 	tokenCreator       TokenCreator
 	serverURL          string
 	uploadLinkResolver func(string) (*uploadLinkData, error)
-	shareLinkResolver  func(string) (*shareLinkData, error)
+	// shareLinkResolver is a test seam; production construction leaves it nil.
+	shareLinkResolver func(string) (*shareLinkData, error)
 }
 
 type pageBootstrapResponse struct {
@@ -363,7 +364,7 @@ func (h *ShareLinkViewHandler) buildOnlyOfficeShareBootstrap(c *gin.Context, sl 
 		return pageBootstrapResponse{}, errShareLinkPasswordRequired
 	}
 
-	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
+	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy, publicLinkSourceID("share-link", sl.token))
 	if err != nil {
 		return pageBootstrapResponse{}, fmt.Errorf("failed to create download token: %w", err)
 	}
@@ -460,6 +461,10 @@ func (h *ShareLinkViewHandler) buildUploadLinkPageBootstrap(token, libraryID, fi
 // resolveShareLink looks up and validates a share link token from the unified share_links table.
 // When countView is true, it increments the view counter.
 func (h *ShareLinkViewHandler) resolveShareLink(token string, countView bool) (*shareLinkData, error) {
+	if !countView && h.shareLinkResolver != nil {
+		return h.shareLinkResolver(token)
+	}
+
 	var orgID, libraryID, filePath, permission, createdBy, passwordHash string
 	var expiresAt *time.Time
 	var createdAt time.Time
@@ -828,25 +833,28 @@ func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *share
 	filename := filepath.Base(sl.filePath)
 
 	// Generate download token using the share link creator's user ID
-	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
+	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy, publicLinkSourceID("share-link", sl.token))
 	if err != nil {
 		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Download Error", "Failed to generate download link.")
 		return
 	}
 
-	// Increment download_count or, for single-use links, delete from all tables (fire-and-forget)
-	go func() {
-		if sl.singleUse {
-			// Single-use link consumed: delete from all tables so the row doesn't linger.
-			// Future accesses return 404 (link not found).
-			deleteConsumedShareLink(h.db, sl.token, sl.orgID, sl.libraryID, sl.createdBy, sl.createdAt)
-		} else {
-			now := time.Now()
-			if err := incrementShareLinkCounterDualWrite(h.db, sl.token, "download_count", now); err != nil {
-				log.Printf("[handleShareLinkDownload] failed to update download_count for token %s: %v", sl.token, err)
+	// Increment download_count or, for single-use links, delete from all tables (fire-and-forget).
+	// Unit-level callers may omit the database because token minting is the behavior under test.
+	if h.db != nil {
+		go func() {
+			if sl.singleUse {
+				// Single-use link consumed: delete from all tables so the row doesn't linger.
+				// Future accesses return 404 (link not found).
+				deleteConsumedShareLink(h.db, sl.token, sl.orgID, sl.libraryID, sl.createdBy, sl.createdAt)
+			} else {
+				now := time.Now()
+				if err := incrementShareLinkCounterDualWrite(h.db, sl.token, "download_count", now); err != nil {
+					log.Printf("[handleShareLinkDownload] failed to update download_count for token %s: %v", sl.token, err)
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	downloadURL := buildOnlyOfficeDownloadURL(httputil.GetBrowserURL(c, h.serverURL), downloadToken, filename)
 	c.Redirect(http.StatusFound, downloadURL)
@@ -1532,7 +1540,7 @@ func (h *ShareLinkViewHandler) GetShareLinkZipTask(c *gin.Context) {
 
 	// Generate a download token for the zip
 	// We reuse the download token mechanism — the zip will be created on-the-fly
-	zipToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, fullPath, sl.createdBy)
+	zipToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, fullPath, sl.createdBy, publicLinkSourceID("share-link", sl.token))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create zip download token"})
 		return

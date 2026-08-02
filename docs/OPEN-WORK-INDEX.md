@@ -1,6 +1,6 @@
 # Open Work Index
 
-**Last updated:** 2026-08-01
+**Last updated:** 2026-08-02
 **Scope (narrowed 2026-07-25):** production blockers, recent readiness /
 upload-fence audit follow-ups, and leftovers from consolidating the parallel
 pending-work trackers. **This is not the entire product backlog.** Roadmap /
@@ -57,14 +57,16 @@ of them updated.
 
 ## Production blockers — must close before go-live
 
-**Readiness verdict is still no-go as-is.** NF-1 closed 2026-07-25; **B4 remains
-the open single-node blocker** and anonymous object-storage downloads are a
-separate production-posture blocker; multi-instance adds B1 and B5. See
+**Readiness verdict is still no-go as-is.** NF-1 closed 2026-07-25; **B4 and the
+sync public-link token auth gap remain open single-node blockers** and anonymous
+object-storage downloads are a separate production-posture blocker;
+multi-instance adds B1 and B5. See
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29; B closed 2026-07-30; C closed 2026-07-31** — D0 freezes the broader storage-backed byte-production scope, atomic multidimensional admission, stable link identity, writer lifetime and the D1-D6 PR sequence. **D remains open; D1 now has isolated coordinator/schema/metrics code, but no producer route is wired and no positive capacity has been measured.** | Readiness B4 ⊇ registry X10/X11 — **still the single-node blocker until D closes**; see [`SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md) |
+| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29; B closed 2026-07-30; C closed 2026-07-31; D2 closed 2026-08-02** — D0 freezes the broader storage-backed byte-production scope, atomic multidimensional admission, stable link identity, writer lifetime and the D1-D6 PR sequence. **D3-D6 remain open; D1 coordinator/schema/metrics and D2 stable public-link download identity are complete, but no producer route is wired and no positive capacity has been measured.** | Readiness B4 ⊇ registry X10/X11 — **still the single-node blocker until D closes**; see [`SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md) |
+| `ISSUE-SYNC-LINK-TOKEN-AUTH-01` | HIGH | Public share-link download tokens are accepted by `syncAuthMiddleware` as repository credentials, so a bearer issued for a shared file can reach the repo sync surface as the link creator | Pre-existing authorization gap in `internal/api/server.go`; see `KNOWN_ISSUES.md` |
 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` | HIGH | Supported Compose policies grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known | Production posture — private buckets and effective endpoint policy must be verified before go-live; see `KNOWN_ISSUES.md` |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |

@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-01
+**Last Updated**: 2026-08-02
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -19,14 +19,14 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B and C are closed; download/block GET (D) remains open because no producer route is wired yet. D1's isolated coordinator, config, metrics and bounded-state evidence are present on the implementation branch; D0 freezes the broader byte-producing download scope, atomic multidimensional admission, stable public-link identity and the D1-D6 PR sequence. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B, C and D2 are complete; download/block GET admission (D3-D6) remains open because no producer route is wired yet. D1's isolated coordinator and D2's strict stable public-link token identity are implemented; D0 freezes the broader byte-producing download scope, atomic multidimensional admission and the D1-D6 PR sequence. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
 | **Anonymous object-storage downloads** | 🔴 Open — production posture blocker | Supported Compose storage policies currently grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`), and `LOCAL_QUORUM` references can be invisible across RF-1 DCs (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`). Keep destructive GC disabled until both close. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
-| Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
+| **Sync Protocol Permissions** | 🔴 Open — public-link token auth gap | Most sync endpoints enforce library permissions, but `syncAuthMiddleware` accepts public share-link download tokens as repository credentials. See ISSUE-SYNC-LINK-TOKEN-AUTH-01. |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
 | Secrets/Env Management | ✅ Complete (2026-02-11) | All docker-compose vars from `.env`; no hardcoded credentials; JWT secret externalized |
 | **Programmatic Auth (API keys)** | ✅ Fixed (2026-04-03) | User API keys now support desktop client, CLI, and automation auth in OIDC-only prod |
@@ -791,6 +791,68 @@ Some of those scenarios are already handler-covered, but they are not yet exerci
 
 - `docs/TECHNICAL-DEBT.md` §19.a — duplicated retry orchestration across sync, upload, and v2 mutation helpers.
 - `docs/IMPLEMENTATION_STATUS.md` — desktop sync status now reflects verified baseline proof plus remaining follow-up coverage debt.
+
+---
+
+### ISSUE-SYNC-LINK-TOKEN-AUTH-01: Sync Auth Accepts Public Share-Link Download Tokens
+
+**Status**: 🔴 **Open** — pre-existing authorization gap, not introduced by D2
+**Severity**: High — a public bearer can become a repository sync credential
+**Affected**: `syncAuthMiddleware` and the authenticated `/seafhttp/repo/:repo_id/*` routes
+**Source of record**: Code-verified 2026-08-02; report reviewed during D2 audit
+
+#### Problem
+
+`syncAuthMiddleware` accepts any valid `TokenTypeDownload` token from the
+`Seafile-Repo-Token` header, query parameter, form body or `Authorization`
+header. It sets `user_id`, `org_id` and `repo_id` from the token without
+rejecting `Source == "link"`, requiring the repository-root token shape, or
+binding the token's repository to the `:repo_id` route parameter.
+
+A public share-link download token has exactly that accepted type, carries
+`Source == "link"`, `RepoID` for the shared library, `Path` for the shared file,
+and `UserID` equal to the share-link creator. The public `dl=1` redirect exposes
+the temporary download bearer to the anonymous link visitor. Replaying that
+bearer as a sync credential reaches the repository sync surface as the creator;
+the downstream `checkSyncPermission` check evaluates the creator's library
+permissions rather than the share-link's narrower permission. Read and write
+sync handlers can therefore be reached when the creator has the corresponding
+library permission, and the token is not limited to the shared file path.
+
+The locked-files body path has a narrower, separate defense: its validator
+rejects path-scoped and `Source == "link"` download tokens before querying lock
+data. That defense does not protect the route-level sync middleware.
+
+This is not a D2 regression. D2 changes download-token `SourceID` wiring but
+does not change `syncAuthMiddleware`; the existing `Source` field was already
+available to reject this token class.
+
+#### Evidence
+
+- `internal/api/server.go` — `syncAuthMiddleware` accepts `TokenTypeDownload`
+  without a source, path or route-repository restriction.
+- `internal/api/sync.go` — `RegisterSyncRoutes` applies that middleware to the
+  repository sync group, while `checkSyncPermission` authorizes using the
+  identity installed by the middleware.
+- `internal/api/sync_locked_files_test.go` — existing tests explicitly reject
+  share-link tokens for locked-files enumeration, confirming that narrower
+  download grants must not widen into repository-wide sync permissions.
+
+#### Fix Direction
+
+Make route-level sync authentication accept only the repository-root sync token
+shape issued by `GetDownloadInfo`: reject `Source == "link"`, reject non-root
+download-token paths, and require the token `RepoID` to match the route's
+`:repo_id` before setting the sync identity. Add regression coverage proving
+that public share-link download tokens cannot authenticate any read or write
+sync route, while ordinary repository sync tokens continue to work.
+
+#### Related Docs
+
+- [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md)
+- `internal/api/server.go` (`syncAuthMiddleware`)
+- `internal/api/sync.go` (`RegisterSyncRoutes`, `checkSyncPermission`)
+- `internal/api/sync_locked_files_test.go` (narrow-token defense)
 
 ---
 
@@ -5048,7 +5110,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces and equivalent storage-backed read surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B and C are closed**; **D remains open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 now adds the isolated coordinator, schema and metrics, but no producer route is wired and no positive capacity has been measured. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C does not close the B4 umbrella.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B, C and D2 are closed**; **D3-D6 remain open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, and D2 now gives every public download-token mint flow a stable `SourceID` with strict writer and consumer validation. No admission producer route is wired and no positive capacity has been measured. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C/D2 does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`, `GET /seafhttp/zip/:token`, `GET /repo/:repo_id/raw/*filepath`, `GET /repo/:repo_id/history/download`, `GET /repo/:repo_id/history/raw`, share-link raw under `/d/:token`, and the share-file bootstrap inline-content read. D's authoritative producer inventory is the D0 contract, not this list
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5613,13 +5675,16 @@ here: fleet capacity scales with node count. Closing C did not close the
 umbrella; **D (download / block GET) remains open**, so B4 remains a production
 blocker.
 
-#### Subcontract D: download admission contract and inventory (D0/D1, 2026-08-01)
+#### Subcontract D: download admission contract and inventory (D0/D1/D2, 2026-08-01)
 
 D0 was documentation only and froze the scope and criteria for the final open
 subcontract in [`docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md).
 D1 now provides the isolated coordinator, configuration, fixed-label metrics and
-bounded-state tests on the implementation branch. No producer route is wired,
-so D remains open and no application download is protected yet.
+bounded-state tests on the implementation branch. D2 now wires the stable
+public-link `SourceID` through normal download, public OnlyOffice and public ZIP
+token minting, and rejects blank link identities in token writers and download
+consumers. No admission producer route is wired, so D remains open and no
+application download is protected yet.
 
 The original D row named the seafhttp file download and authenticated block GET.
 The closure scope is intentionally defined by **storage-backed byte production**
@@ -5666,10 +5731,10 @@ public link:   node + stable-link-source + client-link
 Public link traffic must never consume the admission budget of the link owner's
 authenticated user. `AccessToken.UserID` remains the authorization/decryption
 principal; `SourceID` is the remint-resistant admission identity. Migration 013
-already provides `access_tokens.source_id`, but `CreateLinkDownloadToken` still
-needs the source-ID parameter and wiring for normal download, public OnlyOffice
-and public ZIP minting. New link tokens fail closed without a non-blank source
-ID; the clean deployment requires no legacy fallback or backfill.
+already provides `access_tokens.source_id`; D2 adds the source-ID parameter to
+`CreateLinkDownloadToken` and wires normal download, public OnlyOffice and
+public ZIP minting. New link tokens fail closed without a non-blank source ID;
+the clean deployment requires no legacy fallback or backfill.
 
 The node ceiling is shared across profiles, while block, file, raw, history,
 link-raw, ZIP and inline-text capacities are measured separately. D does not

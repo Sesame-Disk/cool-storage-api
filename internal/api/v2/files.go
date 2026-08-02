@@ -37,7 +37,7 @@ type TokenCreator interface {
 	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
 	CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error)
-	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 }
 
 // formatSizeSeafile delegates to httputil.FormatSizeSeafile.

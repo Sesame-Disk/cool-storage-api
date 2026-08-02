@@ -56,6 +56,21 @@ func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, user
 }
 
 func (ts *TokenStore) createToken(tokenType TokenType, orgID, repoID, path, userID, source, sourceID string, replace bool) (*AccessToken, error) {
+	// Canonicalise source before it is stored and before the link check reads it.
+	// Nine consumers compare Source with == or != and one uses EqualFold, so a
+	// non-canonical value like "LINK" would be a link token to one of them and a
+	// regular web token to the rest: it would skip the source-ID requirement
+	// here, skip the blank-source rejection on the download surfaces, and skip
+	// the upload-link rate and concurrency limiters. Normalising at the writer
+	// is what keeps every reader agreeing on what a link token is.
+	source = strings.ToLower(strings.TrimSpace(source))
+	if source == "link" {
+		sourceID = strings.TrimSpace(sourceID)
+		if sourceID == "" {
+			return nil, fmt.Errorf("source ID is required for link tokens")
+		}
+	}
+
 	// Generate random token
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
@@ -158,8 +173,11 @@ func (ts *TokenStore) CreateDownloadToken(orgID, repoID, path, userID string) (s
 }
 
 // CreateLinkDownloadToken creates a download token for a share link — tagged as source="link".
-func (ts *TokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := ts.CreateToken(TokenTypeDownload, orgID, repoID, path, userID, "link")
+func (ts *TokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
+	if strings.TrimSpace(sourceID) == "" {
+		return "", fmt.Errorf("source ID is required for link download tokens")
+	}
+	token, err := ts.createToken(TokenTypeDownload, orgID, repoID, path, userID, "link", sourceID, false)
 	if err != nil {
 		return "", err
 	}
@@ -240,7 +258,7 @@ type TokenCreator interface {
 	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
 	CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error)
-	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 }
 
 // Ensure TokenStore implements TokenCreator

@@ -524,6 +524,59 @@ func TestBothDownloadSurfacesShareOneAuthorizationGate(t *testing.T) {
 	}
 }
 
+func TestDownloadSurfacesRejectLinkTokensWithoutSourceID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tokenStore := NewMockTokenStore()
+	const tokenString = "blank-source-download-token"
+	tokenStore.tokens[tokenString] = &AccessToken{
+		Token:  tokenString,
+		Type:   TokenTypeDownload,
+		Source: "link",
+		OrgID:  "org-1",
+		RepoID: "repo-1",
+		Path:   "/f.txt",
+		UserID: "user-1",
+	}
+	h := &SeafHTTPHandler{
+		tokenStore:     tokenStore,
+		db:             &db.DB{},
+		storageManager: &storage.Manager{},
+	}
+
+	old := seafHTTPAuthorizeDownloadFn
+	t.Cleanup(func() { seafHTTPAuthorizeDownloadFn = old })
+	called := false
+	seafHTTPAuthorizeDownloadFn = func(_ *SeafHTTPHandler, _ *gin.Context, _ *AccessToken) bool {
+		called = true
+		return true
+	}
+
+	surfaces := map[string]struct {
+		path   string
+		invoke func(*SeafHTTPHandler, *gin.Context)
+	}{
+		"single file": {path: "/seafhttp/files/", invoke: (*SeafHTTPHandler).HandleDownload},
+		"zip":         {path: "/seafhttp/zip/", invoke: (*SeafHTTPHandler).HandleZipDownload},
+	}
+	for name, surface := range surfaces {
+		t.Run(name, func(t *testing.T) {
+			called = false
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodGet, surface.path+tokenString, nil)
+			c.Params = gin.Params{{Key: "token", Value: tokenString}, {Key: "filepath", Value: "/f.txt"}}
+
+			surface.invoke(h, c)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401 (body=%s)", w.Code, w.Body.String())
+			}
+			if called {
+				t.Fatal("authorization ran before blank-source token rejection")
+			}
+		})
+	}
+}
+
 // fakeDownloadPermissions models a real permission state rather than stubbing
 // the gate's answer, so the gate's own logic is what gets exercised.
 type fakeDownloadPermissions struct {
