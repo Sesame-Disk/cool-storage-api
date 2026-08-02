@@ -44,8 +44,11 @@ deadlines, or select positive capacity values. Those are D2-D6 deliverables.
 The repository templates remain safe during this staged rollout: every
 `download_admission` block is present with `enabled: false` and zero values.
 D6, not D1, is the first phase allowed to replace those placeholders with
-measured positive defaults. Enabling the section before D4 wiring would provide
-no producer protection and is therefore a configuration error.
+measured positive defaults. Enabling the section before D4 wiring is an
+unsupported deployment configuration rather than a configuration error: startup
+cannot detect it. A positive, internally consistent block passes validation and
+the process starts normally — it simply protects nothing, because no producer
+calls the coordinator yet, while the metrics suggest a guard is in place.
 
 ### D coordinator ownership
 

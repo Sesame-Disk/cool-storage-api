@@ -856,9 +856,13 @@ var (
 	)
 	DownloadAdmissionWaitSeconds = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "download_admission_wait_seconds",
-			Help:    "Time spent entering download admission by fixed outcome.",
-			Buckets: prometheus.DefBuckets,
+			Name: "download_admission_wait_seconds",
+			Help: "Time spent entering download admission by fixed outcome.",
+			// Same family as the sync admission series, extended to D's range:
+			// admission_wait is validated up to 5m, so DefBuckets would put every
+			// wait above 10s into +Inf and leave D6 without percentiles exactly
+			// where a long download queue matters. Top finite bucket is ~524s.
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 20),
 		},
 		[]string{"outcome"},
 	)

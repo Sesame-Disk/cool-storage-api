@@ -258,6 +258,19 @@ func (c *Coordinator) Acquire(ctx context.Context, request AdmissionRequest) (*L
 	}
 	started := time.Now()
 	c.mu.Lock()
+	// Re-check under the lock. The check above happened before the mutex wait,
+	// and that wait is unbounded under contention, so a client can disconnect
+	// while this request is queued for the lock. Granting then would hand a slot
+	// to a request that is already gone and record it as an admission. Parked
+	// waiters already revalidate this way in waitForLease; the invariant is that
+	// no grant is issued for a context observed cancelled at decision time, and
+	// it has to hold on both paths.
+	if err := ctx.Err(); err != nil {
+		c.mu.Unlock()
+		c.observeWait(started, "cancelled")
+		c.observeRejected(RejectClientGone)
+		return nil, RejectClientGone
+	}
 	if granted, blocked := c.tryGrantLocked(request); granted {
 		lease := c.grantLocked(request)
 		c.mu.Unlock()

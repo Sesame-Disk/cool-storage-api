@@ -655,3 +655,91 @@ func TestRequestConstructorsRejectMissingIdentity(t *testing.T) {
 		t.Fatal("auth-user plus client-link request was accepted")
 	}
 }
+
+// lateCancelContext reports a live context to the first Err() caller and a
+// cancelled one to every caller after that.
+//
+// Acquire checks Err() once before taking the coordinator mutex and once after
+// holding it, so this reproduces a client that disconnects while its request is
+// queued for the lock. A plain cancelled context cannot reach that window: the
+// pre-lock check would refuse first and the test would pass even without the
+// second check. Driving it off the call itself keeps the regression
+// deterministic, with no sleep and no test hook in production code.
+type lateCancelContext struct {
+	context.Context
+	mu    sync.Mutex
+	calls int
+	done  chan struct{}
+}
+
+func (l *lateCancelContext) Err() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls++
+	if l.calls <= 1 {
+		return nil
+	}
+	select {
+	case <-l.done:
+	default:
+		close(l.done)
+	}
+	return context.Canceled
+}
+
+func (l *lateCancelContext) Done() <-chan struct{} { return l.done }
+
+func TestRequestCancelledBeforeGrantDecisionIsNotAdmitted(t *testing.T) {
+	cfg := enabledTestConfig()
+	cfg.MaxActivePerNode = 4
+	cfg.AdmissionWait = 0
+	c, err := New(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Capacity is entirely free, so the only thing that can refuse this request
+	// is the cancellation observed at decision time.
+	ctx := &lateCancelContext{Context: context.Background(), done: make(chan struct{})}
+	lease, reason := c.Acquire(ctx, authenticatedRequest(t, "late-cancel"))
+	if lease != nil {
+		lease.Release(ReleaseClientDisconnect)
+		t.Fatalf("a request cancelled before the grant decision was admitted (reason %q)", reason)
+	}
+	if reason != RejectClientGone {
+		t.Fatalf("late-cancel reason = %q, want %q", reason, RejectClientGone)
+	}
+
+	c.mu.Lock()
+	active, waiters, identities := c.active, len(c.waiters), len(c.identities)
+	c.mu.Unlock()
+	if active != 0 || waiters != 0 || identities != 0 {
+		t.Fatalf("state after late cancellation = active %d, waiters %d, identities %d; want zero", active, waiters, identities)
+	}
+}
+
+func TestRequestCancelledBeforeAcquireIsRefused(t *testing.T) {
+	cfg := enabledTestConfig()
+	cfg.MaxActivePerNode = 4
+	cfg.AdmissionWait = 0
+	c, err := New(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	lease, reason := c.Acquire(ctx, authenticatedRequest(t, "pre-cancelled"))
+	if lease != nil {
+		lease.Release(ReleaseClientDisconnect)
+		t.Fatal("an already-cancelled request was admitted")
+	}
+	if reason != RejectClientGone {
+		t.Fatalf("pre-cancelled reason = %q, want %q", reason, RejectClientGone)
+	}
+	c.mu.Lock()
+	identities := len(c.identities)
+	c.mu.Unlock()
+	if identities != 0 {
+		t.Fatalf("identity entries after pre-cancelled request = %d, want zero", identities)
+	}
+}
