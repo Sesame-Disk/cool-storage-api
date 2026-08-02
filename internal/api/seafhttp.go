@@ -116,6 +116,13 @@ func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, us
 }
 
 func (tm *TokenManager) createToken(tokenType TokenType, orgID, repoID, path, userID, source, sourceID string, replace bool, ttl time.Duration) (*AccessToken, error) {
+	// Canonicalise source before it is stored and before the link check reads it.
+	// See the matching comment in db.TokenStore.createToken: a non-canonical
+	// value would be a link token to the one EqualFold reader and a regular web
+	// token to the nine exact-comparison readers, skipping the source-ID
+	// requirement, the blank-source download rejections and the upload-link
+	// limiters.
+	source = strings.ToLower(strings.TrimSpace(source))
 	if source == "link" {
 		sourceID = strings.TrimSpace(sourceID)
 		if sourceID == "" {

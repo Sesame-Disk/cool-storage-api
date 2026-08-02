@@ -3886,3 +3886,31 @@ func TestRegisterSeafHTTPRoutesZipRateLimit(t *testing.T) {
 		t.Fatalf("second status = %d, want %d", w2.Code, http.StatusTooManyRequests)
 	}
 }
+
+// A non-canonical source must be canonicalised before the link check, otherwise
+// it skips the source-ID requirement here and the link-only guards downstream.
+func TestTokenManagerCreateTokenNormalisesSourceBeforeTheLinkCheck(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	for _, source := range []string{"LINK", "Link", " link ", "\tLINK\n"} {
+		if _, err := tm.CreateToken(TokenTypeDownload, "org1", "repo1", "/file.txt", "user1", source, time.Hour); err == nil {
+			t.Fatalf("CreateToken(source=%q) succeeded without a source ID; a non-canonical source must still be treated as a link", source)
+		}
+	}
+}
+
+// The stored Source must be canonical so the exact-comparison readers and the
+// EqualFold reader cannot disagree about the same token.
+func TestTokenManagerCreateLinkTokenStoresCanonicalSource(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenString, err := tm.CreateLinkDownloadToken("org1", "repo1", "/file.txt", "user1", "stable-source")
+	if err != nil {
+		t.Fatalf("CreateLinkDownloadToken failed: %v", err)
+	}
+	token, ok := tm.GetToken(tokenString, TokenTypeDownload)
+	if !ok {
+		t.Fatal("link download token should be retrievable")
+	}
+	if token.Source != "link" {
+		t.Fatalf("stored Source = %q, want %q", token.Source, "link")
+	}
+}

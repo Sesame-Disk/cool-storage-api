@@ -1,6 +1,7 @@
 # B4 Subcontract D — Download Admission Contract
 
-**Date:** 2026-08-01  
+**Date:** 2026-08-01 (original contract freeze)  
+**Last updated:** 2026-08-02  
 **Branch:** `feat/b4-subcontract-d2-download-source-id`
 **Status:** D0 contract; D1 coordinator/configuration is merged in `main`, and
 D2 stable public download-token `SourceID` implementation is complete in this

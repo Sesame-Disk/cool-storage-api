@@ -301,11 +301,18 @@ the authoritative state is always `KNOWN_ISSUES.md`.
 | B4 (subcontract D) | `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | **D0 contract recorded; no runtime status change.** The contract expands D from two named GETs to every storage-backed byte/inline-content producer: seafhttp files, ZIP, block GET, current/history raw, share raw and public inline text. It freezes one atomic process-local node admission with namespaced authenticated-user and stable-link/client dimensions, bounded identity state, strict download-token `SourceID` wiring in D2, actual-route gzip/writer reachability, independent preparation and idle-write lifetimes, and block GET streaming without nominal-size accounting regression. D1-D6 is the reviewable PR sequence. The Compose anonymous-object-storage policy is separately tracked as `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01`; byte-rate shaping remains a separate deferred residual. See `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. | 2026-08-01 |
 | B4 (subcontract D2) | `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | **D2 closed.** All public download-token mint paths now derive the same stable non-secret `SourceID` from the share-link token: normal download, public OnlyOffice and public ZIP. Token writers reject blank identities, remints preserve the exact identity, and `HandleDownload` / `HandleZipDownload` fail closed before protected work when a link token lacks one. Focused unit tests cover the three flows, strict consumers and the token stores; a live Cassandra test covers download-token remints and migration 013. Admission producer wiring remains deferred to D4. | 2026-08-01 |
 | Object-storage posture | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` | **Recorded open.** Supported Compose definitions currently grant anonymous bucket downloads, which bypass application auth, quotas, traffic recording and D admission when a bucket/key is known. The clean production deployment must prove effective private-bucket policy and reject unauthenticated object GETs. | 2026-08-01 |
+| Sync authentication | `ISSUE-SYNC-LINK-TOKEN-AUTH-01` | **New single-node blocker, recorded open.** `syncAuthMiddleware` accepts any valid `TokenTypeDownload` token as a repository credential without rejecting `Source == "link"`, requiring the repository-root token shape, or binding the token's `RepoID` to the route's `:repo_id`. A public share-link download bearer — which the `dl=1` redirect hands to the anonymous visitor — therefore authenticates to the `/seafhttp/repo/:repo_id/*` sync surface as the link creator, and `checkSyncPermission` then evaluates the creator's library permissions rather than the link's narrower grant. Found during the D2 audit and **pre-existing**: D2 changes download-token `SourceID` wiring and does not touch this middleware. This supersedes the "Sync Protocol Permissions ✅ Complete / `syncAuthMiddleware` hardened" status recorded on 2026-02-11, which is now open in `KNOWN_ISSUES.md`. | 2026-08-02 |
 
 **Effect on the verdict: none.** It stays **no-go as-is**. B4
 (`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`) is also single-node reachable and remains
 open, so closing NF-1 removes one of the two single-node blockers, not the
 condition.
+
+> **Dated note, 2026-08-02.** The sentence above counts the single-node blockers
+> as they stood when NF-1 closed. `ISSUE-SYNC-LINK-TOKEN-AUTH-01` has since been
+> recorded as a third one; see its row above. The verdict is unchanged — still
+> **no-go as-is** — but the blocker set is now B4, the sync public-link token
+> auth gap, and the separately tracked object-storage posture issue.
 
 **A taxonomy wrinkle worth naming rather than silently fixing.** The summary
 table lists SH-1 under *High* for Sharing while listing B4 as a *blocker* under

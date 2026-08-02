@@ -56,6 +56,14 @@ func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, user
 }
 
 func (ts *TokenStore) createToken(tokenType TokenType, orgID, repoID, path, userID, source, sourceID string, replace bool) (*AccessToken, error) {
+	// Canonicalise source before it is stored and before the link check reads it.
+	// Nine consumers compare Source with == or != and one uses EqualFold, so a
+	// non-canonical value like "LINK" would be a link token to one of them and a
+	// regular web token to the rest: it would skip the source-ID requirement
+	// here, skip the blank-source rejection on the download surfaces, and skip
+	// the upload-link rate and concurrency limiters. Normalising at the writer
+	// is what keeps every reader agreeing on what a link token is.
+	source = strings.ToLower(strings.TrimSpace(source))
 	if source == "link" {
 		sourceID = strings.TrimSpace(sourceID)
 		if sourceID == "" {
