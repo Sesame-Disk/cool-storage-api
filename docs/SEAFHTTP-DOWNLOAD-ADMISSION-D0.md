@@ -2,11 +2,12 @@
 
 **Date:** 2026-08-01 (original contract freeze)  
 **Last updated:** 2026-08-02  
-**Branch:** `feat/b4-subcontract-d2-download-source-id`
-**Status:** D0 contract; D1 coordinator/configuration is merged in `main`, and
-D2 stable public download-token `SourceID` implementation is complete in this
-branch. Admission producer wiring remains deferred to D4, and positive
-operating values remain deferred to D6.
+**Branch:** `feat/b4-subcontract-d3-download-writer-lifetime`
+**Status:** D0 contract; D1 coordinator/configuration and D2 stable public
+download-token `SourceID` implementation are merged in `main`. D3 writer
+lifetime and gzip/proxy reachability are complete in this branch. Admission
+producer wiring remains deferred to D4, and positive operating values remain
+deferred to D6.
 
 This document freezes the contract and inventory for subcontract D of
 `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`. It is the design record for the D1-D6
@@ -518,19 +519,23 @@ The current gzip exclusion already covers the sync block path through:
 That protects both block GET and PUT. It also covers `/seafhttp/files` and
 `/seafhttp/zip`.
 
-The following current patterns are stale for the registered routes:
+The old `/api/v2.1/.*raw/.*` and `/api/v2.1/.*history/.*` patterns were stale for
+the registered routes. D3 replaces them with exclusions for the actual `/repo`
+raw/history paths, the blanket `/d/...` public stream prefix, and both public
+inline bootstrap routes:
 
 ```text
-/api/v2.1/.*raw/.*
-/api/v2.1/.*history/.*
+^/repo/[^/]+/raw(?:/.*)?$
+^/repo/[^/]+/history/(?:download|raw)/?$
+^/d/.*$
+^/api/v2\.1/share-links/[^/]+/(?:files/)?bootstrap/?$
 ```
 
-They do not cover `/repo/:repo_id/raw`, `/repo/:repo_id/history/download`, or
-`/repo/:repo_id/history/raw`. The public raw response under `/d/:token` is also
-not distinguishable by query through the path-regex API.
-
-D3 must ensure that raw/history and share-raw writers are not hidden behind the
-current gzip wrapper when they need a connection deadline.
+The `/d/...` exclusion is safe because the route serves only redirects, short
+errors and the public raw stream. The bootstrap exclusion is explicit because
+those responses can contain compressible inline content; D6 must measure the
+egress tradeoff before selecting production capacities. The Go writer tests
+also assert that the old patterns cannot silently return.
 
 **A blanket `/d/...` exclusion is an acceptable final design, not a temporary
 compromise.** Under the SPA-API-only architecture those two routes serve almost
@@ -538,10 +543,9 @@ nothing else: `ServeShareLinkPage` and `ServeShareLinkFilePage` answer only
 `dl=1` (mint plus redirect) and `raw=1` (the protected byte stream), and every
 other query returns a short `404` JSON. There is no large compressible response
 under `/d/...` to protect, so excluding the prefix costs approximately nothing
-and removes the need for query-aware gzip logic on the share-raw path. D3 may
-still choose route/query-aware bypass or a corrected writer chain, but it must
-not reject the blanket exclusion on egress grounds without measuring what is
-actually served there.
+and removes the need for query-aware gzip logic on the share-raw path. D3 uses
+this blanket exclusion; D6 still measures the effective egress before selecting
+production capacities.
 
 The compressible public bootstrap responses live on **different routes**:
 
@@ -550,9 +554,11 @@ The compressible public bootstrap responses live on **different routes**:
 /api/v2.1/share-links/:token/files/bootstrap
 ```
 
-These are where the `link_inline` producer's response is written, and **no
-current exclusion pattern matches them** — they sit inside gzip today. That is
-the same configuration that made subcontract C's admitted lifetime unenforceable:
+These are where the `link_inline` producer's response is written. D3 excludes
+both routes from the current Go gzip wrapper and adds matching
+`proxy_buffering off` and `gzip off` locations in the supported frontend nginx
+topology. This removes the writer boundary that made subcontract C's admitted
+lifetime unenforceable:
 
 ```text
 admission acquired
@@ -562,21 +568,13 @@ admission acquired
 → a slow client holds the slot indefinitely
 ```
 
-Because §6 holds the `link_inline` admission until the inline-content JSON has
-been written, and §9 requires that write to carry an idle deadline, D3 must make
-these two routes writer-reachable by one of:
-
-- a gzip writer chain that correctly exposes `Unwrap` and the response-controller
-  interfaces (preferred: the bootstrap payload is text/Markdown and compresses
-  well);
-- selective bypass when the response actually carries inline content;
-- outright exclusion of the two routes, with the egress increase measured and
-  recorded.
-
-The blanket-`/d/...` reasoning does **not** transfer here. These responses can
-carry up to the full inline-content limit of highly compressible text, so
-dropping compression on them is a real cost that must be measured rather than
-assumed away.
+D3 uses outright exclusion for these two routes. The supported frontend nginx
+configuration also disables both proxy buffering and gzip for every D transfer
+location: raw/history, share raw, public bootstrap and `/seafhttp/`. Browser
+backpressure is therefore not hidden by buffering or response compression in
+that proxy. These responses can carry up to the full inline-content limit of
+highly compressible text, so the egress cost remains a D6 measurement, not a
+claim that compression is free.
 
 Every writer that needs an idle-write deadline must make the underlying network
 connection reachable through `http.ResponseController` or an equivalent
@@ -591,24 +589,30 @@ requires end-to-end deployment validation rather than a claim that the Go
 listener directly supports HTTP/2.
 
 The proxy is part of the lifetime contract. D3/D6 must verify the effective
-configuration for every protected route, including `proxy_buffering`, any
-buffering-to-disk behavior, `proxy_read_timeout` and `send_timeout`. The
-supported transfer path must use backpressure-compatible settings (currently
-`proxy_buffering off` in the supported frontend transfer locations) or document
-that D protects only the Go-to-proxy hop. A slow-client test must run through
-the real nginx topology as well as directly against Go; a backend TCP test alone
+configuration for every protected route, including `proxy_buffering`, gzip or
+another response transformation, buffering-to-disk behavior,
+`proxy_read_timeout` and `send_timeout`. The supported transfer path must use
+backpressure-compatible settings (currently `proxy_buffering off` and
+`gzip off` in the supported frontend transfer locations) or document that D
+protects only the Go-to-proxy hop. D3's configuration regression and nginx
+syntax check protect that setting; D6 must run a slow-client test through the
+real nginx topology as well as directly against Go. A backend TCP test alone
 does not prove that the browser/client is controlling admission lifetime.
 
 ### 9. Write-Progress Lifetime
 
 The deadline contract is:
 
-> Install or refresh the idle-write deadline immediately before each write or
-> flush toward the underlying writer.
+> Before the first actual write or flush, install an idle-write deadline at
+> `now + idle_write_timeout`. Each successful output progress sets the next
+> absolute deadline at `progress time + idle_write_timeout`; a later write or
+> flush installs that same deadline rather than extending it.
 
-It must not be refreshed after a write that may already be blocked. On success,
-clear the deadline so a keep-alive connection does not inherit it. On timeout or
-write failure:
+Beginning a later write must not grant a second full idle period, and a deferred
+status assignment that has not committed headers must not start the idle timer.
+After successful output, clear the socket deadline while the progress timer owns
+the interval so a keep-alive connection does not inherit it. On timeout or write
+failure:
 
 - cancel the request/stream context;
 - stop prefetch and close storage readers;
@@ -622,7 +626,8 @@ Three deadlines are independent:
    canonical-reader construction and initial storage work, including inline
    text. Its context reaches Cassandra and S3.
 3. **Idle-write timeout:** maximum interval without successful response progress
-   once output starts.
+   once output starts. The maximum is measured from the last successful progress,
+   not from the start of a subsequent write.
 
 The preparation context is cancelled or replaced when streaming starts; it must
 not accidentally become a total download timeout. `readFileContentAsText` keeps
@@ -650,7 +655,16 @@ prevent an invalid production configuration from running; a refusal to start
 does.
 
 If the D writer cannot install the required deadline before headers, the contract
-is fail closed rather than a metric-only degradation.
+is fail closed rather than a metric-only degradation. D3 now supplies
+`httputil.IdleWriteWriter`, which probes reachability before headers, requires a
+non-nil cancellation callback, uses the last successful progress's absolute
+deadline before subsequent writes and flushes, rejects short writes, invalidates
+stale timer callbacks, cancels after an idle-progress timeout, and clears the
+deadline in `Finish()`. A plain
+`httptest.ResponseRecorder` cannot expose the connection deadline and is
+therefore intentionally rejected; D4 producer tests must use a connection-
+capable writer or a real server. D4 supplies the admission lease callbacks and
+installs this writer around each protected producer.
 
 ### 10. Block GET Refactor Contract
 
@@ -963,8 +977,8 @@ deployment for token issuance.
 |---|---|---|
 | D0 | Contract, inventory, identity and evidence record | None; docs only |
 | D1 | Neutral D coordinator, atomic dimensions, bounded state, config and metrics | Coordinator not yet connected to producers |
-| D2 | Stable `SourceID` for all public download-token mint paths | Implemented in this branch; new link tokens are strict; no legacy compatibility; coordinated greenfield rollout |
-| D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Writer safety exercised before broad admission activation |
+| D2 | Stable `SourceID` for all public download-token mint paths | Merged in `main`; new link tokens are strict; no legacy compatibility; coordinated greenfield rollout |
+| D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Implemented in this branch; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
 | D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | All listed storage-backed producers use D |
 | D5 | Stream sync block GET through existing canonical reader APIs | Block GET no longer materializes the block |
 | D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass |

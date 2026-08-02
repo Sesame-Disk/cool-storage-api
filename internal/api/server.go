@@ -77,11 +77,19 @@ func gzipExcludedPathsRegexs(metricsPath string) []string {
 		// unbounded, uncancellable admission is a availability defect, and a
 		// compressed response is a bandwidth optimisation.
 		"/seafhttp/repo/.*/check-blocks.*",
-		"/seafhttp/files/.*",     // file downloads
-		"/seafhttp/zip/.*",       // zip downloads
-		"/seafhttp/upload/.*",    // file uploads
-		"/api/v2.1/.*raw/.*",     // raw file serving (inline preview)
-		"/api/v2.1/.*history/.*", // historic file downloads
+		"/seafhttp/files/.*",  // file downloads
+		"/seafhttp/zip/.*",    // zip downloads
+		"/seafhttp/upload/.*", // file uploads
+		// File-view routes are registered at /repo, not /api/v2.1. Keep their
+		// writers reachable for the D idle-write deadline.
+		"^/repo/[^/]+/raw(?:/.*)?$",
+		"^/repo/[^/]+/history/(?:download|raw)/?$",
+		// /d serves only redirects, short errors and the public raw stream. A
+		// blanket exclusion is safe and avoids query-aware gzip selection.
+		"^/d/.*$",
+		// Inline bootstrap JSON can carry up to the public content limit and is
+		// therefore excluded explicitly rather than through the /d rule.
+		"^/api/v2\\.1/share-links/[^/]+/(?:files/)?bootstrap/?$",
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -424,6 +425,42 @@ func TestMetricsResponseIsCompressedOnlyOnce(t *testing.T) {
 	}
 	if !bytes.Contains(body, []byte("# HELP")) {
 		t.Fatalf("decompressed metrics body is not Prometheus text: %.80q", body)
+	}
+}
+
+func TestGzipExcludedPathsCoverDStorageWriters(t *testing.T) {
+	patterns := gzipExcludedPathsRegexs("/metrics")
+	compiled := make([]*regexp.Regexp, 0, len(patterns))
+	for _, pattern := range patterns {
+		if pattern == "/api/v2.1/.*raw/.*" || pattern == "/api/v2.1/.*history/.*" {
+			t.Fatalf("stale gzip exclusion returned: %q", pattern)
+		}
+		compiled = append(compiled, regexp.MustCompile(pattern))
+	}
+
+	cases := map[string]bool{
+		"/repo/repo-1/raw/docs/file.txt":                     true,
+		"/repo/repo-1/history/download":                      true,
+		"/repo/repo-1/history/raw/":                          true,
+		"/d/share-token?raw=1":                               true,
+		"/d/share-token/files/?raw=1":                        true,
+		"/api/v2.1/share-links/share-token/bootstrap":        true,
+		"/api/v2.1/share-links/share-token/files/bootstrap/": true,
+		"/repo/repo-1/history/view":                          false,
+		"/api/v2.1/share-links/share-token/dirents":          false,
+		"/api/v2.1/share-links/share-token/upload":           false,
+	}
+	for path, wantExcluded := range cases {
+		excluded := false
+		for _, pattern := range compiled {
+			if pattern.MatchString(strings.Split(path, "?")[0]) {
+				excluded = true
+				break
+			}
+		}
+		if excluded != wantExcluded {
+			t.Errorf("gzip exclusion for %q = %v, want %v", path, excluded, wantExcluded)
+		}
 	}
 }
 
