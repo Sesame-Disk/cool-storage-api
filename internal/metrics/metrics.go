@@ -816,7 +816,7 @@ var (
 	DownloadAdmissionWaitersByGate = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "download_admission_waiters_by_gate",
-			Help: "Current parked download requests counted by each full gate.",
+			Help: "Parked download requests counted by each full gate at their last coordinator reevaluation.",
 		},
 		[]string{"gate"},
 	)

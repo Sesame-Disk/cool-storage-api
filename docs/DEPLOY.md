@@ -123,12 +123,15 @@ When D6 selects positive values, the following startup rules still apply:
 - `server.write_timeout` must remain `0`; the coordinator owns the long-transfer idle-write deadline.
 - Public-link client attribution must use the trusted-proxy configuration above; do not derive a client IP from forwarded headers in application code.
 - D is process-local, so fleet capacity scales with the number of application nodes. It is not a cluster-global quota.
+- D4 must construct exactly one enabled coordinator during server bootstrap and share that pointer with every protected producer; D1 intentionally does not enforce a process-global singleton so package tests can create isolated coordinators.
 
 The coordinator updates `active_current`, `active_by_profile`, `entries_current`
 and `waiters_current` under one internal state transition, but Prometheus gathers
 independent gauges one at a time. Do not alert on strict equality from a single
 concurrent scrape; the occupancy invariants are guaranteed for coordinator state
 and stable snapshots, not for every mixed-time scrape.
+`waiters_by_gate` is the last reevaluated blocker observation, not a scrape-time
+scan of all parked requests.
 
 GC is a good example:
 

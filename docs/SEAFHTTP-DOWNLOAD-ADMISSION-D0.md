@@ -47,6 +47,15 @@ D6, not D1, is the first phase allowed to replace those placeholders with
 measured positive defaults. Enabling the section before D4 wiring would provide
 no producer protection and is therefore a configuration error.
 
+### D coordinator ownership
+
+D4 must create exactly one enabled `Coordinator` during server bootstrap and
+share that pointer with every protected producer, including `internal/api`,
+`internal/api/v2` and share-link handlers. `New` deliberately does not enforce a
+process-global singleton in D1 so unit tests can create isolated coordinators;
+multiple enabled instances in production would multiply the process-local node
+cap and make the global metrics meaningless.
+
 ## Why D Exists
 
 Subcontracts A1/A2, B and C now protect their respective write, block-PUT and
@@ -788,7 +797,7 @@ but in only some config files is a defect B and C both had to fix.
 | `download_admission_active_by_profile` | Gauge | `profile`, fixed exclusive enum |
 | `download_admission_entries_current` | Gauge | none — requests inside admission: active plus parked |
 | `download_admission_waiters_current` | Gauge | none — **unique** requests currently parked |
-| `download_admission_waiters_by_gate` | Gauge | `gate` — which gates those requests are blocked on |
+| `download_admission_waiters_by_gate` | Gauge | `gate` — which gates those requests were blocked on at their last coordinator reevaluation |
 | `download_admission_tracked_identities` | Gauge | `dimension` — identity gates currently materialised |
 | `download_admission_rejected_total` | Counter | `reason`, fixed set |
 | `download_admission_released_total` | Counter | `cause`, fixed set |
@@ -801,9 +810,12 @@ Waiters need two series for the same reason active does. A parked public request
 blocks on `link_source` and `client_link` at once, so a per-gate gauge cannot
 answer "how many requests are queued" — which is precisely what
 `max_waiters_per_node` bounds. `waiters_current` is that unlabelled count;
-`waiters_by_gate` shows which gates they are stuck behind, and its label set
-covers `node` and `profile` too, because a request can be parked on the node
-ceiling or a profile cap with every identity gate free. Summing
+`waiters_by_gate` shows which gates they were blocked behind at the latest
+reevaluation, and its label set covers `node` and `profile` too, because a
+request can be parked on the node ceiling or a profile cap with every identity
+gate free. The series is intentionally an observation of the coordinator's last
+reevaluation rather than a scrape-time scan of every waiter; this keeps metrics
+out of the O(waiters) admission hot path. Summing
 `waiters_by_gate` against `waiters_current` is the same double-count error as
 summing identity dimensions against the node total: one parked request can be
 blocked on several gates at once.

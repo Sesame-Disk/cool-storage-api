@@ -200,12 +200,15 @@ type waiter struct {
 type Coordinator struct {
 	cfg config.DownloadAdmissionConfig
 
+	// D4 must construct exactly one enabled Coordinator per process and share it
+	// across every producer. The map remains package-local/test-friendly rather
+	// than enforcing a global singleton in D1.
 	mu                sync.Mutex
 	active            int
 	activeByProfile   map[Profile]int
 	identities        map[DimensionKey]*identityState
 	trackedIdentities map[DimensionKind]int
-	waiters           []*waiter
+	waiters           map[*waiter]struct{}
 	waitersByGate     map[gateKind]int
 	notify            chan struct{}
 }
@@ -226,6 +229,7 @@ func New(cfg *config.DownloadAdmissionConfig) (*Coordinator, error) {
 		activeByProfile:   make(map[Profile]int),
 		identities:        make(map[DimensionKey]*identityState),
 		trackedIdentities: make(map[DimensionKind]int),
+		waiters:           make(map[*waiter]struct{}),
 		waitersByGate:     make(map[gateKind]int),
 		notify:            make(chan struct{}),
 	}, nil
@@ -349,26 +353,38 @@ func (l *Lease) RecordWriterUnreachable() {
 }
 
 func (c *Coordinator) waitForLease(ctx context.Context, request AdmissionRequest, w *waiter, notify chan struct{}, started time.Time) (*Lease, RejectReason) {
-	timer := time.NewTimer(c.cfg.AdmissionWait)
-	defer timer.Stop()
+	waitCtx, cancel := context.WithTimeout(ctx, c.cfg.AdmissionWait)
+	defer cancel()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-waitCtx.Done():
 			c.mu.Lock()
 			c.removeWaiterLocked(w)
 			c.mu.Unlock()
-			c.observeWait(started, "cancelled")
-			c.observeRejected(RejectClientGone)
-			return nil, RejectClientGone
-		case <-timer.C:
-			c.mu.Lock()
-			c.removeWaiterLocked(w)
-			c.mu.Unlock()
+			if ctx.Err() != nil {
+				c.observeWait(started, "cancelled")
+				c.observeRejected(RejectClientGone)
+				return nil, RejectClientGone
+			}
 			c.observeWait(started, "timeout")
 			c.observeRejected(RejectAdmissionTimeout)
 			return nil, RejectAdmissionTimeout
 		case <-notify:
 			c.mu.Lock()
+			if ctx.Err() != nil {
+				c.removeWaiterLocked(w)
+				c.mu.Unlock()
+				c.observeWait(started, "cancelled")
+				c.observeRejected(RejectClientGone)
+				return nil, RejectClientGone
+			}
+			if waitCtx.Err() != nil {
+				c.removeWaiterLocked(w)
+				c.mu.Unlock()
+				c.observeWait(started, "timeout")
+				c.observeRejected(RejectAdmissionTimeout)
+				return nil, RejectAdmissionTimeout
+			}
 			if granted, blocked := c.tryGrantLocked(request); granted {
 				lease := c.grantLocked(request)
 				c.removeWaiterLocked(w)
@@ -446,7 +462,7 @@ func (c *Coordinator) release(request AdmissionRequest, cause ReleaseCause) {
 }
 
 func (c *Coordinator) addWaiterLocked(w *waiter) {
-	c.waiters = append(c.waiters, w)
+	c.waiters[w] = struct{}{}
 	for _, dimension := range w.request.dimension {
 		state := c.identities[dimension]
 		if state == nil {
@@ -464,17 +480,10 @@ func (c *Coordinator) addWaiterLocked(w *waiter) {
 }
 
 func (c *Coordinator) removeWaiterLocked(w *waiter) {
-	index := -1
-	for i, candidate := range c.waiters {
-		if candidate == w {
-			index = i
-			break
-		}
-	}
-	if index < 0 {
+	if _, ok := c.waiters[w]; !ok {
 		return
 	}
-	c.waiters = append(c.waiters[:index], c.waiters[index+1:]...)
+	delete(c.waiters, w)
 	for _, dimension := range w.request.dimension {
 		state := c.identities[dimension]
 		if state == nil || state.waiters <= 0 {
@@ -671,6 +680,12 @@ func validateRequest(request AdmissionRequest) error {
 			return fmt.Errorf("invalid admission dimension")
 		}
 		seen[dimension.Kind] = true
+	}
+	if len(request.dimension) == 1 && !seen[DimensionAuthUser] {
+		return fmt.Errorf("authenticated admission request requires auth_user dimension")
+	}
+	if len(request.dimension) == 2 && (!seen[DimensionLinkSource] || !seen[DimensionClientLink]) {
+		return fmt.Errorf("public-link admission request requires link_source and client_link dimensions")
 	}
 	return nil
 }

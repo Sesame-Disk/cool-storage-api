@@ -55,6 +55,28 @@ func acquireOrFatal(t *testing.T, coordinator *Coordinator, request AdmissionReq
 	return lease
 }
 
+type acquireOutcome struct {
+	lease  *Lease
+	reason RejectReason
+}
+
+func awaitCancelledWaiter(t *testing.T, cancel context.CancelFunc, result <-chan acquireOutcome) {
+	t.Helper()
+	cancel()
+	select {
+	case outcome := <-result:
+		if outcome.lease != nil {
+			outcome.lease.Release(ReleaseClientDisconnect)
+			t.Fatalf("cancelled waiter was admitted with reason %q", outcome.reason)
+		}
+		if outcome.reason != RejectClientGone {
+			t.Fatalf("cancelled waiter reason = %q, want %q", outcome.reason, RejectClientGone)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled waiter did not return")
+	}
+}
+
 func waitForWaiters(t *testing.T, coordinator *Coordinator, want int) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -88,6 +110,19 @@ func assertAdmissionMetricInvariants(t *testing.T) {
 	if entries != active+waiters {
 		t.Fatalf("entries metric %.0f != active %.0f + waiters %.0f", entries, active, waiters)
 	}
+}
+
+func rejectedMetricTotal() float64 {
+	reasons := []RejectReason{
+		RejectNodeFull, RejectProfileFull, RejectAuthUserFull, RejectLinkSourceFull, RejectClientLinkFull,
+		RejectNodeQueueFull, RejectAuthUserQueueFull, RejectLinkSourceQueueFull, RejectClientLinkQueueFull,
+		RejectAdmissionTimeout, RejectClientGone, RejectInvalidRequest,
+	}
+	total := float64(0)
+	for _, reason := range reasons {
+		total += testutil.ToFloat64(metrics.DownloadAdmissionRejectedTotal.WithLabelValues(string(reason)))
+	}
+	return total
 }
 
 func TestAcquireIsAtomicAcrossNodeAndIdentity(t *testing.T) {
@@ -178,18 +213,12 @@ func TestWaiterIsAdmittedAfterAllGatesFree(t *testing.T) {
 
 	holder := acquireOrFatal(t, c, authenticatedRequest(t, "user-1"))
 	request := authenticatedRequest(t, "user-2")
-	result := make(chan struct {
-		lease  *Lease
-		reason RejectReason
-	}, 1)
+	result := make(chan acquireOutcome, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
 		lease, reason := c.Acquire(ctx, request)
-		result <- struct {
-			lease  *Lease
-			reason RejectReason
-		}{lease, reason}
+		result <- acquireOutcome{lease: lease, reason: reason}
 	}()
 	waitForWaiters(t, c, 1)
 	assertAdmissionMetricInvariants(t)
@@ -318,21 +347,25 @@ func TestCancelledWaiterIsRemoved(t *testing.T) {
 		t.Fatal(err)
 	}
 	holder := acquireOrFatal(t, c, authenticatedRequest(t, "user-1"))
-	defer holder.Release(ReleaseCompleted)
+	request := authenticatedRequest(t, "user-2")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan RejectReason, 1)
+	result := make(chan acquireOutcome, 1)
 	go func() {
-		_, reason := c.Acquire(ctx, authenticatedRequest(t, "user-2"))
-		result <- reason
+		lease, reason := c.Acquire(ctx, request)
+		result <- acquireOutcome{lease: lease, reason: reason}
 	}()
 	waitForWaiters(t, c, 1)
 	cancel()
-
+	holder.Release(ReleaseCompleted)
 	select {
-	case reason := <-result:
-		if reason != RejectClientGone {
-			t.Fatalf("cancelled waiter reason = %q, want %q", reason, RejectClientGone)
+	case outcome := <-result:
+		if outcome.lease != nil {
+			outcome.lease.Release(ReleaseClientDisconnect)
+			t.Fatal("cancelled waiter was admitted after holder release")
+		}
+		if outcome.reason != RejectClientGone {
+			t.Fatalf("cancelled waiter reason = %q, want %q", outcome.reason, RejectClientGone)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("cancelled waiter did not return")
@@ -340,8 +373,8 @@ func TestCancelledWaiterIsRemoved(t *testing.T) {
 	waitForWaiters(t, c, 0)
 
 	c.mu.Lock()
-	if len(c.identities) != 1 {
-		t.Fatalf("identity entries after cancellation = %d, want holder only", len(c.identities))
+	if len(c.identities) != 0 {
+		t.Fatalf("identity entries after cancellation and release = %d, want zero", len(c.identities))
 	}
 	c.mu.Unlock()
 }
@@ -356,14 +389,13 @@ func TestQueueCapsRejectBeforeCreatingAnotherWaiter(t *testing.T) {
 		t.Fatal(err)
 	}
 	holder := acquireOrFatal(t, c, authenticatedRequest(t, "user-1"))
-	defer holder.Release(ReleaseCompleted)
+	request := authenticatedRequest(t, "user-2")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	result := make(chan RejectReason, 1)
+	result := make(chan acquireOutcome, 1)
 	go func() {
-		_, reason := c.Acquire(ctx, authenticatedRequest(t, "user-2"))
-		result <- reason
+		lease, reason := c.Acquire(ctx, request)
+		result <- acquireOutcome{lease: lease, reason: reason}
 	}()
 	waitForWaiters(t, c, 1)
 
@@ -371,6 +403,8 @@ func TestQueueCapsRejectBeforeCreatingAnotherWaiter(t *testing.T) {
 	if reason != RejectNodeQueueFull {
 		t.Fatalf("node queue rejection = %q, want %q", reason, RejectNodeQueueFull)
 	}
+	awaitCancelledWaiter(t, cancel, result)
+	holder.Release(ReleaseCompleted)
 }
 
 func TestIdentityQueueCapRejectsWithoutPartialAdmission(t *testing.T) {
@@ -383,14 +417,13 @@ func TestIdentityQueueCapRejectsWithoutPartialAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	holder := acquireOrFatal(t, c, authenticatedRequest(t, "user-1"))
-	defer holder.Release(ReleaseCompleted)
+	request := authenticatedRequest(t, "user-1")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	result := make(chan RejectReason, 1)
+	result := make(chan acquireOutcome, 1)
 	go func() {
-		_, reason := c.Acquire(ctx, authenticatedRequest(t, "user-1"))
-		result <- reason
+		lease, reason := c.Acquire(ctx, request)
+		result <- acquireOutcome{lease: lease, reason: reason}
 	}()
 	waitForWaiters(t, c, 1)
 
@@ -403,6 +436,41 @@ func TestIdentityQueueCapRejectsWithoutPartialAdmission(t *testing.T) {
 	c.mu.Unlock()
 	if active != 1 || waiters != 1 {
 		t.Fatalf("state after queue rejection = active %d, waiters %d; want 1, 1", active, waiters)
+	}
+	awaitCancelledWaiter(t, cancel, result)
+	holder.Release(ReleaseCompleted)
+}
+
+func TestExpiredWaiterIsNotAdmittedAfterHolderRelease(t *testing.T) {
+	cfg := enabledTestConfig()
+	cfg.MaxActivePerNode = 1
+	cfg.AdmissionWait = 20 * time.Millisecond
+	c, err := New(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := acquireOrFatal(t, c, authenticatedRequest(t, "timeout-holder"))
+	request := authenticatedRequest(t, "timeout-waiter")
+	ctx := context.Background()
+	result := make(chan acquireOutcome, 1)
+	go func() {
+		lease, reason := c.Acquire(ctx, request)
+		result <- acquireOutcome{lease: lease, reason: reason}
+	}()
+	waitForWaiters(t, c, 1)
+	time.Sleep(cfg.AdmissionWait + 20*time.Millisecond)
+	holder.Release(ReleaseCompleted)
+	select {
+	case outcome := <-result:
+		if outcome.lease != nil {
+			outcome.lease.Release(ReleaseClientDisconnect)
+			t.Fatal("expired waiter was admitted after holder release")
+		}
+		if outcome.reason != RejectAdmissionTimeout {
+			t.Fatalf("expired waiter reason = %q, want %q", outcome.reason, RejectAdmissionTimeout)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expired waiter did not return")
 	}
 }
 
@@ -539,14 +607,14 @@ func TestInvalidRequestDoesNotCountAsCapacityRejection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := testutil.ToFloat64(metrics.DownloadAdmissionRejectedTotal.WithLabelValues(string(RejectAdmissionTimeout)))
+	before := rejectedMetricTotal()
 	lease, reason := c.Acquire(context.Background(), AdmissionRequest{})
 	if lease != nil || reason != RejectInvalidRequest {
 		t.Fatalf("invalid request outcome = (%v, %q), want nil, %q", lease, reason, RejectInvalidRequest)
 	}
-	after := testutil.ToFloat64(metrics.DownloadAdmissionRejectedTotal.WithLabelValues(string(RejectAdmissionTimeout)))
+	after := rejectedMetricTotal()
 	if after != before {
-		t.Fatalf("invalid request changed timeout rejection metric from %.0f to %.0f", before, after)
+		t.Fatalf("invalid request changed rejection metrics from %.0f to %.0f", before, after)
 	}
 }
 
@@ -570,5 +638,20 @@ func TestRequestConstructorsRejectMissingIdentity(t *testing.T) {
 	}
 	if _, err := NewAuthenticatedRequest(Profile("unknown"), "org", "user"); err == nil {
 		t.Fatal("unknown profile was accepted")
+	}
+	if err := validateRequest(AdmissionRequest{
+		profile:   ProfileFile,
+		dimension: []DimensionKey{{Kind: DimensionLinkSource, Scope: "public-link", ID: "source"}},
+	}); err == nil {
+		t.Fatal("link_source-only request was accepted")
+	}
+	if err := validateRequest(AdmissionRequest{
+		profile: ProfileFile,
+		dimension: []DimensionKey{
+			{Kind: DimensionAuthUser, Scope: "org", ID: "user"},
+			{Kind: DimensionClientLink, Scope: "198.51.100.1", ID: "source"},
+		},
+	}); err == nil {
+		t.Fatal("auth-user plus client-link request was accepted")
 	}
 }
