@@ -15,6 +15,7 @@ import (
 
 // Config holds all configuration for SesameFS
 type Config struct {
+	DownloadAdmission   DownloadAdmissionConfig       `yaml:"download_admission"`
 	Server              ServerConfig                  `yaml:"server"`
 	Database            DatabaseConfig                `yaml:"database"`
 	Storage             StorageConfig                 `yaml:"storage"`
@@ -518,6 +519,30 @@ type CORSConfig struct {
 	AllowedOrigins []string `yaml:"allowed_origins"`
 }
 
+// DownloadAdmissionConfig holds the process-local download admission contract.
+// D1 ships this disabled with zero values. Positive values are for measured
+// deployments after the later D phases, not defaults that claim safe capacity.
+type DownloadAdmissionConfig struct {
+	Enabled                bool          `yaml:"enabled"`
+	MaxActivePerNode       int           `yaml:"max_active_per_node"`
+	MaxActivePerAuthUser   int           `yaml:"max_active_per_auth_user"`
+	MaxActivePerLinkSource int           `yaml:"max_active_per_link_source"`
+	MaxActivePerClientLink int           `yaml:"max_active_per_client_link"`
+	MaxWaitersPerIdentity  int           `yaml:"max_waiters_per_identity"`
+	MaxWaitersPerNode      int           `yaml:"max_waiters_per_node"`
+	AdmissionWait          time.Duration `yaml:"admission_wait"`
+	PreparationDeadline    time.Duration `yaml:"preparation_deadline"`
+	IdleWriteTimeout       time.Duration `yaml:"idle_write_timeout"`
+	RetryAfter             time.Duration `yaml:"retry_after"`
+	MaxActiveBlock         int           `yaml:"max_active_block"`
+	MaxActiveFile          int           `yaml:"max_active_file"`
+	MaxActiveRaw           int           `yaml:"max_active_raw"`
+	MaxActiveHistory       int           `yaml:"max_active_history"`
+	MaxActiveLinkRaw       int           `yaml:"max_active_link_raw"`
+	MaxActiveZIP           int           `yaml:"max_active_zip"`
+	MaxActiveLinkInline    int           `yaml:"max_active_link_inline"`
+}
+
 // SeafHTTPConfig holds Seafile-compatible file transfer settings
 type SeafHTTPConfig struct {
 	TokenTTL               time.Duration `yaml:"token_ttl"`                 // How long upload/download tokens are valid
@@ -868,6 +893,19 @@ const (
 	// concurrency budgets.
 	MaxUploadLinkMaxInflightPerSource = 4096
 	MaxUploadLinkMaxInflightPerNode   = 65536
+)
+
+// Download admission validation ceilings are configuration sanity limits, not
+// measured operating defaults. D1 ships the feature disabled; D6 chooses positive
+// values from real transfer evidence.
+const (
+	MaxDownloadAdmissionActive             = 1024
+	MaxDownloadAdmissionWaitersPerNode     = 4096
+	MaxDownloadAdmissionWaitersPerIdentity = 1024
+	MaxDownloadAdmissionWait               = 5 * time.Minute
+	MaxDownloadAdmissionPreparation        = 1 * time.Hour
+	MaxDownloadAdmissionIdleWrite          = 15 * time.Minute
+	MaxDownloadAdmissionRetryAfter         = 1 * time.Hour
 )
 
 // validateCheckBlocksBounds checks the subcontract C knobs.
@@ -1398,6 +1436,7 @@ func DefaultConfig() *Config {
 			UploadLinkMaxInflightPerSource:  DefaultUploadLinkMaxInflightPerSource,
 			UploadLinkMaxInflightPerNode:    DefaultUploadLinkMaxInflightPerNode,
 		},
+		DownloadAdmission: DownloadAdmissionConfig{},
 		OnlyOffice: OnlyOfficeConfig{
 			Enabled:           false,
 			VerifyCertificate: true,
@@ -1456,6 +1495,63 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("DESKTOP_CUSTOM_LOGO"); v != "" {
 		c.Server.DesktopCustomLogo = strings.TrimSpace(v)
+	}
+
+	// Download admission (D1 schema; shipped disabled until D6 measurement)
+	if v := os.Getenv("DOWNLOAD_ADMISSION_ENABLED"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "1":
+			c.DownloadAdmission.Enabled = true
+		case "false", "0":
+			c.DownloadAdmission.Enabled = false
+		default:
+			c.addEnvOverrideError("DOWNLOAD_ADMISSION_ENABLED must be true, false, 1, or 0, got %q", v)
+		}
+	}
+	for _, override := range []struct {
+		env    string
+		target *int
+	}{
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE", &c.DownloadAdmission.MaxActivePerNode},
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER", &c.DownloadAdmission.MaxActivePerAuthUser},
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE", &c.DownloadAdmission.MaxActivePerLinkSource},
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_CLIENT_LINK", &c.DownloadAdmission.MaxActivePerClientLink},
+		{"DOWNLOAD_ADMISSION_MAX_WAITERS_PER_IDENTITY", &c.DownloadAdmission.MaxWaitersPerIdentity},
+		{"DOWNLOAD_ADMISSION_MAX_WAITERS_PER_NODE", &c.DownloadAdmission.MaxWaitersPerNode},
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_BLOCK", &c.DownloadAdmission.MaxActiveBlock},
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_FILE", &c.DownloadAdmission.MaxActiveFile},
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_RAW", &c.DownloadAdmission.MaxActiveRaw},
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_HISTORY", &c.DownloadAdmission.MaxActiveHistory},
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_LINK_RAW", &c.DownloadAdmission.MaxActiveLinkRaw},
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_ZIP", &c.DownloadAdmission.MaxActiveZIP},
+		{"DOWNLOAD_ADMISSION_MAX_ACTIVE_LINK_INLINE", &c.DownloadAdmission.MaxActiveLinkInline},
+	} {
+		if v := os.Getenv(override.env); v != "" {
+			i, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil {
+				c.addEnvOverrideError("%s is invalid: %v", override.env, err)
+			} else {
+				*override.target = i
+			}
+		}
+	}
+	for _, override := range []struct {
+		env    string
+		target *time.Duration
+	}{
+		{"DOWNLOAD_ADMISSION_ADMISSION_WAIT", &c.DownloadAdmission.AdmissionWait},
+		{"DOWNLOAD_ADMISSION_PREPARATION_DEADLINE", &c.DownloadAdmission.PreparationDeadline},
+		{"DOWNLOAD_ADMISSION_IDLE_WRITE_TIMEOUT", &c.DownloadAdmission.IdleWriteTimeout},
+		{"DOWNLOAD_ADMISSION_RETRY_AFTER", &c.DownloadAdmission.RetryAfter},
+	} {
+		if v := os.Getenv(override.env); v != "" {
+			d, err := time.ParseDuration(strings.TrimSpace(v))
+			if err != nil {
+				c.addEnvOverrideError("%s is invalid: %v", override.env, err)
+			} else {
+				*override.target = d
+			}
+		}
 	}
 
 	// CORS
@@ -2039,10 +2135,136 @@ func (c *Config) regionClassConfig(region string) (RegionClassConfig, bool) {
 	return RegionClassConfig{}, false
 }
 
+// ValidateDownloadAdmissionConfig validates the standalone D1 configuration.
+// Cross-config server checks remain in Config.Validate.
+func ValidateDownloadAdmissionConfig(d DownloadAdmissionConfig) error {
+	return validateDownloadAdmissionConfig(d, 0)
+}
+
+func (c *Config) validateDownloadAdmissionBounds() error {
+	return validateDownloadAdmissionConfig(c.DownloadAdmission, c.Server.WriteTimeout)
+}
+
+func validateDownloadAdmissionConfig(d DownloadAdmissionConfig, serverWriteTimeout time.Duration) error {
+	activeCaps := []struct {
+		name  string
+		value int
+	}{
+		{"max_active_per_node", d.MaxActivePerNode},
+		{"max_active_per_auth_user", d.MaxActivePerAuthUser},
+		{"max_active_per_link_source", d.MaxActivePerLinkSource},
+		{"max_active_per_client_link", d.MaxActivePerClientLink},
+		{"max_active_block", d.MaxActiveBlock},
+		{"max_active_file", d.MaxActiveFile},
+		{"max_active_raw", d.MaxActiveRaw},
+		{"max_active_history", d.MaxActiveHistory},
+		{"max_active_link_raw", d.MaxActiveLinkRaw},
+		{"max_active_zip", d.MaxActiveZIP},
+		{"max_active_link_inline", d.MaxActiveLinkInline},
+	}
+	for _, cap := range activeCaps {
+		if cap.value < 0 {
+			return fmt.Errorf("download_admission.%s must be greater than or equal to zero", cap.name)
+		}
+		if cap.value > MaxDownloadAdmissionActive {
+			return fmt.Errorf("download_admission.%s is %d, above the %d ceiling", cap.name, cap.value, MaxDownloadAdmissionActive)
+		}
+	}
+	if d.MaxWaitersPerIdentity < 0 {
+		return fmt.Errorf("download_admission.max_waiters_per_identity must be greater than or equal to zero")
+	}
+	if d.MaxWaitersPerNode < 0 {
+		return fmt.Errorf("download_admission.max_waiters_per_node must be greater than or equal to zero")
+	}
+	if d.MaxWaitersPerIdentity > MaxDownloadAdmissionWaitersPerIdentity {
+		return fmt.Errorf("download_admission.max_waiters_per_identity is %d, above the %d ceiling", d.MaxWaitersPerIdentity, MaxDownloadAdmissionWaitersPerIdentity)
+	}
+	if d.MaxWaitersPerNode > MaxDownloadAdmissionWaitersPerNode {
+		return fmt.Errorf("download_admission.max_waiters_per_node is %d, above the %d ceiling", d.MaxWaitersPerNode, MaxDownloadAdmissionWaitersPerNode)
+	}
+
+	durations := []struct {
+		name  string
+		value time.Duration
+		max   time.Duration
+	}{
+		{"admission_wait", d.AdmissionWait, MaxDownloadAdmissionWait},
+		{"preparation_deadline", d.PreparationDeadline, MaxDownloadAdmissionPreparation},
+		{"idle_write_timeout", d.IdleWriteTimeout, MaxDownloadAdmissionIdleWrite},
+		{"retry_after", d.RetryAfter, MaxDownloadAdmissionRetryAfter},
+	}
+	for _, duration := range durations {
+		if duration.value < 0 {
+			return fmt.Errorf("download_admission.%s must be greater than or equal to zero", duration.name)
+		}
+		if duration.value > duration.max {
+			return fmt.Errorf("download_admission.%s is %s, above the %s ceiling", duration.name, duration.value, duration.max)
+		}
+	}
+
+	if d.MaxActivePerAuthUser > d.MaxActivePerNode {
+		return fmt.Errorf("download_admission.max_active_per_auth_user must not exceed max_active_per_node")
+	}
+	if d.MaxActivePerLinkSource > d.MaxActivePerNode {
+		return fmt.Errorf("download_admission.max_active_per_link_source must not exceed max_active_per_node")
+	}
+	if d.MaxActivePerClientLink > d.MaxActivePerNode {
+		return fmt.Errorf("download_admission.max_active_per_client_link must not exceed max_active_per_node")
+	}
+	for _, cap := range activeCaps[4:] {
+		if cap.value > d.MaxActivePerNode {
+			return fmt.Errorf("download_admission.%s must not exceed max_active_per_node", cap.name)
+		}
+	}
+	if d.MaxActivePerClientLink > d.MaxActivePerLinkSource {
+		return fmt.Errorf("download_admission.max_active_per_client_link must not exceed max_active_per_link_source")
+	}
+	if d.MaxWaitersPerIdentity > d.MaxWaitersPerNode {
+		return fmt.Errorf("download_admission.max_waiters_per_identity must not exceed max_waiters_per_node")
+	}
+
+	if d.Enabled {
+		positiveCaps := []struct {
+			name  string
+			value int
+		}{
+			{"max_active_per_node", d.MaxActivePerNode},
+			{"max_active_per_auth_user", d.MaxActivePerAuthUser},
+			{"max_active_per_link_source", d.MaxActivePerLinkSource},
+			{"max_active_per_client_link", d.MaxActivePerClientLink},
+		}
+		for _, cap := range positiveCaps {
+			if cap.value <= 0 {
+				return fmt.Errorf("download_admission.%s must be greater than zero when enabled", cap.name)
+			}
+		}
+		positiveDurations := []struct {
+			name  string
+			value time.Duration
+		}{
+			{"preparation_deadline", d.PreparationDeadline},
+			{"idle_write_timeout", d.IdleWriteTimeout},
+			{"retry_after", d.RetryAfter},
+		}
+		for _, duration := range positiveDurations {
+			if duration.value <= 0 {
+				return fmt.Errorf("download_admission.%s must be greater than zero when enabled", duration.name)
+			}
+		}
+		if serverWriteTimeout != 0 {
+			return fmt.Errorf("server.write_timeout must be zero when download_admission.enabled is true")
+		}
+	}
+	return nil
+}
+
 // Validate checks if the configuration is valid
 func (c *Config) Validate() error {
 	if len(c.envOverrideErrors) > 0 {
 		return fmt.Errorf("invalid environment override: %s", strings.Join(c.envOverrideErrors, "; "))
+	}
+	if err := c.validateDownloadAdmissionBounds(); err != nil {
+		return err
 	}
 	if c.Server.Port == "" {
 		return fmt.Errorf("server port is required")

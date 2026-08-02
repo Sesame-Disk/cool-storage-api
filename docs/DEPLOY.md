@@ -107,6 +107,32 @@ Why this is the supported deploy model:
 
 If you use a different proxy chain and do not preserve the canonicalized client IP at the last nginx hop, adjust `SERVER_TRUSTED_PROXIES` for that topology instead.
 
+### Download admission (D1)
+
+D1 adds the process-local coordinator, bounded state, configuration schema and
+Prometheus series for storage-backed downloads. It does not wire any producer
+route yet, and it does not choose measured operating capacity. Every shipped
+YAML and env template therefore keeps `download_admission.enabled=false` and
+all D1 values at zero.
+
+Do not enable this section in production before D4 wiring and D6 measurement.
+When D6 selects positive values, the following startup rules still apply:
+
+- `max_active_per_node`, every identity cap, `preparation_deadline`, `idle_write_timeout` and `retry_after` must be positive.
+- `admission_wait` and both waiter caps may be zero; zero means refuse immediately rather than queue.
+- `server.write_timeout` must remain `0`; the coordinator owns the long-transfer idle-write deadline.
+- Public-link client attribution must use the trusted-proxy configuration above; do not derive a client IP from forwarded headers in application code.
+- D is process-local, so fleet capacity scales with the number of application nodes. It is not a cluster-global quota.
+- D4 must construct exactly one enabled coordinator during server bootstrap and share that pointer with every protected producer; D1 intentionally does not enforce a process-global singleton so package tests can create isolated coordinators.
+
+The coordinator updates `active_current`, `active_by_profile`, `entries_current`
+and `waiters_current` under one internal state transition, but Prometheus gathers
+independent gauges one at a time. Do not alert on strict equality from a single
+concurrent scrape; the occupancy invariants are guaranteed for coordinator state
+and stable snapshots, not for every mixed-time scrape.
+`waiters_by_gate` is the last reevaluated blocker observation, not a scrape-time
+scan of all parked requests.
+
 GC is a good example:
 
 - If `user_grace_days`, `org_grace_days`, `trash_retention_days`, or `audit_retention_days` are omitted from YAML, SesameFS keeps the built-in defaults from `DefaultConfig()`.
@@ -966,6 +992,18 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `SEAFHTTP_UPLOAD_LINK_SOURCE_WRITE_BURST` | `seafhttp.upload_link_source_write_burst` | Burst for the per-link bound. Default `24000`. Must be `> 0` while that rate is non-zero. |
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE` | `seafhttp.upload_link_max_inflight_per_source` | Non-blocking concurrent anonymous-write cap per stable public-link identity on one process. Default `16`; ceiling `4096`; `0` disables. Remints share the same source count. When both in-flight caps are enabled, this value must not exceed the per-node value. |
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE` | `seafhttp.upload_link_max_inflight_per_node` | Non-blocking concurrent anonymous-write cap across one process/node. Default `128`; ceiling `65536`; `0` disables. This is not cluster-global; aggregate fleet capacity scales with node count. |
+| `DOWNLOAD_ADMISSION_ENABLED` | `download_admission.enabled` | D1 schema only. Keep `false` until D4 wiring and D6 measurement are complete. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE` | `download_admission.max_active_per_node` | D6-selected process-local aggregate download cap. D1 template value is `0`; validation ceiling `1024`. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER` | `download_admission.max_active_per_auth_user` | Authenticated `(org, user)` cap. D1 template value is `0`; validation ceiling `1024`. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE` | `download_admission.max_active_per_link_source` | Stable public-link source cap. D1 template value is `0`; validation ceiling `1024`. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_CLIENT_LINK` | `download_admission.max_active_per_client_link` | Stable public-link plus trusted client-IP cap. D1 template value is `0`; validation ceiling `1024`. |
+| `DOWNLOAD_ADMISSION_MAX_WAITERS_PER_IDENTITY` | `download_admission.max_waiters_per_identity` | Parked requests per identity. `0` refuses immediately; validation ceiling `1024`. |
+| `DOWNLOAD_ADMISSION_MAX_WAITERS_PER_NODE` | `download_admission.max_waiters_per_node` | Parked requests per process. `0` refuses immediately; validation ceiling `4096`. |
+| `DOWNLOAD_ADMISSION_ADMISSION_WAIT` | `download_admission.admission_wait` | Queue duration before `503 + Retry-After`. D1 template value is `0s`; maximum `5m`. |
+| `DOWNLOAD_ADMISSION_PREPARATION_DEADLINE` | `download_admission.preparation_deadline` | Positive D6-selected preparation deadline; maximum `1h`. |
+| `DOWNLOAD_ADMISSION_IDLE_WRITE_TIMEOUT` | `download_admission.idle_write_timeout` | Positive D6-selected idle response-write deadline; maximum `15m`. |
+| `DOWNLOAD_ADMISSION_RETRY_AFTER` | `download_admission.retry_after` | Explicit retry hint for long-lived download slots; maximum `1h`. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_<PROFILE>` | `download_admission.max_active_<profile>` | Fixed profiles: `BLOCK`, `FILE`, `RAW`, `HISTORY`, `LINK_RAW`, `ZIP`, `LINK_INLINE`. `0` means no additional profile cap; validation ceiling `1024`. |
 | `METRICS_ENABLED` | `monitoring.metrics_enabled` | |
 | `DESKTOP_CUSTOM_BRAND` | — (server-info response) | Brand name shown in desktop client (default: `Sesame Disk`) |
 | `DESKTOP_CUSTOM_LOGO` | — (server-info response) | Full URL to logo image shown in desktop client (optional) |

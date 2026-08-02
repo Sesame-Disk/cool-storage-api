@@ -502,6 +502,27 @@ fileview:
 # Feature flags and numeric product-policy limits are keyed by quota_policy.
 # Quota numbers themselves still come from organizations.* or Accounts.
 # =============================================================================
+download_admission:
+  # D1 schema only. Keep disabled and zero until D6 measurements choose positive operating defaults.
+  enabled: false
+  max_active_per_node: 0
+  max_active_per_auth_user: 0
+  max_active_per_link_source: 0
+  max_active_per_client_link: 0
+  max_waiters_per_identity: 0
+  max_waiters_per_node: 0
+  admission_wait: 0s
+  preparation_deadline: 0s
+  idle_write_timeout: 0s
+  retry_after: 0s
+  max_active_block: 0
+  max_active_file: 0
+  max_active_raw: 0
+  max_active_history: 0
+  max_active_link_raw: 0
+  max_active_zip: 0
+  max_active_link_inline: 0
+
 enforcement_profiles:
   hard:
     features:

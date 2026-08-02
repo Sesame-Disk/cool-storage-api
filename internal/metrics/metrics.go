@@ -787,10 +787,123 @@ var (
 			Buckets: prometheus.ExponentialBuckets(1, 2, 13),
 		},
 	)
+
+	DownloadAdmissionActiveCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "download_admission_active_current",
+			Help: "Current download admissions active in this process.",
+		},
+	)
+	DownloadAdmissionActiveByProfile = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "download_admission_active_by_profile",
+			Help: "Current download admissions active by fixed D profile.",
+		},
+		[]string{"profile"},
+	)
+	DownloadAdmissionEntriesCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "download_admission_entries_current",
+			Help: "Current requests inside download admission: active plus parked.",
+		},
+	)
+	DownloadAdmissionWaitersCurrent = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "download_admission_waiters_current",
+			Help: "Current unique requests parked in download admission.",
+		},
+	)
+	DownloadAdmissionWaitersByGate = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "download_admission_waiters_by_gate",
+			Help: "Parked download requests counted by each full gate at their last coordinator reevaluation.",
+		},
+		[]string{"gate"},
+	)
+	DownloadAdmissionTrackedIdentities = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "download_admission_tracked_identities",
+			Help: "Current materialized download identity entries by dimension.",
+		},
+		[]string{"dimension"},
+	)
+	DownloadAdmissionRejectedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "download_admission_rejected_total",
+			Help: "Download admission refusals by fixed reason.",
+		},
+		[]string{"reason"},
+	)
+	DownloadAdmissionReleasedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "download_admission_released_total",
+			Help: "Download admissions released by fixed cause.",
+		},
+		[]string{"cause"},
+	)
+	DownloadAdmissionDeadlineExpiredTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "download_admission_deadline_expired_total",
+			Help: "Download admission deadlines that expired by phase.",
+		},
+		[]string{"phase"},
+	)
+	DownloadAdmissionWriterUnreachableTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "download_admission_writer_unreachable_total",
+			Help: "Download responses where the required connection deadline could not be installed.",
+		},
+	)
+	DownloadAdmissionWaitSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "download_admission_wait_seconds",
+			Help: "Time spent entering download admission by fixed outcome.",
+			// Same family as the sync admission series, extended to D's range:
+			// admission_wait is validated up to 5m, so DefBuckets would put every
+			// wait above 10s into +Inf and leave D6 without percentiles exactly
+			// where a long download queue matters. Top finite bucket is ~524s.
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 20),
+		},
+		[]string{"outcome"},
+	)
+	DownloadAdmissionOccupancy = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "download_admission_occupancy",
+			Help:    "Observed occupancy of a download identity dimension without identity labels.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 11),
+		},
+		[]string{"dimension"},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
 func Register() {
+	for _, profile := range []string{"block", "file", "raw", "history", "link_raw", "zip", "link_inline"} {
+		DownloadAdmissionActiveByProfile.WithLabelValues(profile).Set(0)
+	}
+	for _, gate := range []string{"node", "profile", "auth_user", "link_source", "client_link"} {
+		DownloadAdmissionWaitersByGate.WithLabelValues(gate).Set(0)
+	}
+	for _, dimension := range []string{"auth_user", "link_source", "client_link"} {
+		DownloadAdmissionTrackedIdentities.WithLabelValues(dimension).Set(0)
+		DownloadAdmissionOccupancy.WithLabelValues(dimension)
+	}
+	for _, reason := range []string{
+		"node_full", "profile_full", "auth_user_full", "link_source_full", "client_link_full",
+		"node_queue_full", "auth_user_queue_full", "link_source_queue_full", "client_link_queue_full",
+		"admission_timeout", "client_gone",
+	} {
+		DownloadAdmissionRejectedTotal.WithLabelValues(reason).Add(0)
+	}
+	for _, cause := range []string{"completed", "client_disconnect", "preparation_timeout", "idle_write_timeout", "storage_error", "response_error", "panic"} {
+		DownloadAdmissionReleasedTotal.WithLabelValues(cause).Add(0)
+	}
+	for _, phase := range []string{"preparation", "idle_write"} {
+		DownloadAdmissionDeadlineExpiredTotal.WithLabelValues(phase).Add(0)
+	}
+	for _, outcome := range []string{"admitted", "refused", "timeout", "cancelled"} {
+		DownloadAdmissionWaitSeconds.WithLabelValues(outcome)
+	}
 	prometheus.MustRegister(
 		CgroupMemoryCurrent,
 		HTTPRequestsTotal,
@@ -863,5 +976,17 @@ func Register() {
 		UploadLinkInflightRejectedTotal,
 		UploadLinkInflightCurrent,
 		UploadLinkSourceInflightOccupancy,
+		DownloadAdmissionActiveCurrent,
+		DownloadAdmissionActiveByProfile,
+		DownloadAdmissionEntriesCurrent,
+		DownloadAdmissionWaitersCurrent,
+		DownloadAdmissionWaitersByGate,
+		DownloadAdmissionTrackedIdentities,
+		DownloadAdmissionRejectedTotal,
+		DownloadAdmissionReleasedTotal,
+		DownloadAdmissionDeadlineExpiredTotal,
+		DownloadAdmissionWriterUnreachableTotal,
+		DownloadAdmissionWaitSeconds,
+		DownloadAdmissionOccupancy,
 	)
 }
