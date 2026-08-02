@@ -197,12 +197,14 @@ type waiter struct {
 // close-and-replace notification channel: a release wakes all bounded waiters,
 // which re-check their complete gate set and therefore cannot create unrelated
 // identity head-of-line blocking.
+//
+// D4 must construct exactly one enabled Coordinator per process and share that
+// pointer with every producer. New deliberately does not enforce a global
+// singleton, so tests can build isolated instances; two enabled coordinators in
+// one process would multiply the node cap and make the shared gauges meaningless.
 type Coordinator struct {
 	cfg config.DownloadAdmissionConfig
 
-	// D4 must construct exactly one enabled Coordinator per process and share it
-	// across every producer. The map remains package-local/test-friendly rather
-	// than enforcing a global singleton in D1.
 	mu                sync.Mutex
 	active            int
 	activeByProfile   map[Profile]int

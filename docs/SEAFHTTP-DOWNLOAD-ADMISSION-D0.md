@@ -707,8 +707,9 @@ shape is frozen here so `applyEnvOverrides()` has something to implement:
 ```yaml
 download_admission:
   # Shipped disabled with zero placeholders so this block is a valid
-  # configuration today. D1 measures the defaults and flips it on; with
-  # enabled: true these zeros would refuse to start, by the rule below.
+  # configuration today. D6 measures the defaults and is the phase allowed to
+  # flip it on; with enabled: true these zeros would refuse to start, by the
+  # rule below.
   enabled: false
   max_active_per_node: 0
   max_active_per_auth_user: 0
@@ -730,7 +731,8 @@ download_admission:
   max_active_link_inline: 0
 ```
 
-Values above are placeholders; D1 measures the real ones. The per-profile caps
+Values above are placeholders; D6 measures the real ones, because only D4 wires
+the producers whose behaviour the measurement depends on. The per-profile caps
 are **flat keys rather than a map** on purpose: the profile set is a fixed,
 closed enum, and a map cannot be overridden per entry by an environment variable
 without inventing JSON-in-env. Each maps to
