@@ -116,6 +116,13 @@ func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, us
 }
 
 func (tm *TokenManager) createToken(tokenType TokenType, orgID, repoID, path, userID, source, sourceID string, replace bool, ttl time.Duration) (*AccessToken, error) {
+	if source == "link" {
+		sourceID = strings.TrimSpace(sourceID)
+		if sourceID == "" {
+			return nil, errors.New("source ID is required for link tokens")
+		}
+	}
+
 	// Generate random token
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {

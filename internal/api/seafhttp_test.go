@@ -1262,6 +1262,13 @@ func TestTokenManagerCreateToken(t *testing.T) {
 	}
 }
 
+func TestTokenManagerCreateTokenRejectsGenericLinkWithoutSourceID(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	if _, err := tm.CreateToken(TokenTypeDownload, "org1", "repo1", "/file.txt", "user1", "link", time.Hour); err == nil {
+		t.Fatal("generic CreateToken accepted a link token without SourceID")
+	}
+}
+
 func TestTokenManagerCreateUploadToken(t *testing.T) {
 	tm := NewTokenManager(1 * time.Hour)
 
@@ -1339,6 +1346,21 @@ func TestTokenManagerCreateLinkDownloadTokenPreservesSourceID(t *testing.T) {
 		if token.Source != "link" || token.SourceID != sourceID {
 			t.Fatalf("%s token source = (%q, %q), want (link, %q)", label, token.Source, token.SourceID, sourceID)
 		}
+	}
+}
+
+func TestTokenManagerCreateLinkDownloadTokenTrimsSourceID(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenString, err := tm.CreateLinkDownloadToken("org1", "repo1", "/file.txt", "user1", " stable-download-link ")
+	if err != nil {
+		t.Fatalf("CreateLinkDownloadToken failed: %v", err)
+	}
+	token, ok := tm.GetToken(tokenString, TokenTypeDownload)
+	if !ok {
+		t.Fatal("trimmed link download token should be retrievable")
+	}
+	if token.SourceID != "stable-download-link" {
+		t.Fatalf("SourceID = %q, want trimmed value", token.SourceID)
 	}
 }
 

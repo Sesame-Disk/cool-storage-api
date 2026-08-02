@@ -40,7 +40,8 @@ type ShareLinkViewHandler struct {
 	tokenCreator       TokenCreator
 	serverURL          string
 	uploadLinkResolver func(string) (*uploadLinkData, error)
-	shareLinkResolver  func(string) (*shareLinkData, error)
+	// shareLinkResolver is a test seam; production construction leaves it nil.
+	shareLinkResolver func(string) (*shareLinkData, error)
 }
 
 type pageBootstrapResponse struct {

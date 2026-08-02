@@ -62,3 +62,10 @@ func TestTokenStoreCreateLinkDownloadTokenRejectsBlankSourceID(t *testing.T) {
 		}
 	}
 }
+
+func TestTokenStoreCreateTokenRejectsGenericLinkWithoutSourceID(t *testing.T) {
+	store := &TokenStore{}
+	if _, err := store.CreateToken(TokenTypeDownload, "org", "repo", "/file.txt", "user", "link"); err == nil {
+		t.Fatal("generic CreateToken accepted a link token without SourceID")
+	}
+}

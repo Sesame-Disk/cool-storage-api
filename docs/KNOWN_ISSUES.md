@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-01
+**Last Updated**: 2026-08-02
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -26,7 +26,7 @@ is right about why.
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`), and `LOCAL_QUORUM` references can be invisible across RF-1 DCs (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`). Keep destructive GC disabled until both close. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
-| Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
+| **Sync Protocol Permissions** | 🔴 Open — public-link token auth gap | Most sync endpoints enforce library permissions, but `syncAuthMiddleware` accepts public share-link download tokens as repository credentials. See ISSUE-SYNC-LINK-TOKEN-AUTH-01. |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
 | Secrets/Env Management | ✅ Complete (2026-02-11) | All docker-compose vars from `.env`; no hardcoded credentials; JWT secret externalized |
 | **Programmatic Auth (API keys)** | ✅ Fixed (2026-04-03) | User API keys now support desktop client, CLI, and automation auth in OIDC-only prod |
@@ -791,6 +791,68 @@ Some of those scenarios are already handler-covered, but they are not yet exerci
 
 - `docs/TECHNICAL-DEBT.md` §19.a — duplicated retry orchestration across sync, upload, and v2 mutation helpers.
 - `docs/IMPLEMENTATION_STATUS.md` — desktop sync status now reflects verified baseline proof plus remaining follow-up coverage debt.
+
+---
+
+### ISSUE-SYNC-LINK-TOKEN-AUTH-01: Sync Auth Accepts Public Share-Link Download Tokens
+
+**Status**: 🔴 **Open** — pre-existing authorization gap, not introduced by D2
+**Severity**: High — a public bearer can become a repository sync credential
+**Affected**: `syncAuthMiddleware` and the authenticated `/seafhttp/repo/:repo_id/*` routes
+**Source of record**: Code-verified 2026-08-02; report reviewed during D2 audit
+
+#### Problem
+
+`syncAuthMiddleware` accepts any valid `TokenTypeDownload` token from the
+`Seafile-Repo-Token` header, query parameter, form body or `Authorization`
+header. It sets `user_id`, `org_id` and `repo_id` from the token without
+rejecting `Source == "link"`, requiring the repository-root token shape, or
+binding the token's repository to the `:repo_id` route parameter.
+
+A public share-link download token has exactly that accepted type, carries
+`Source == "link"`, `RepoID` for the shared library, `Path` for the shared file,
+and `UserID` equal to the share-link creator. The public `dl=1` redirect exposes
+the temporary download bearer to the anonymous link visitor. Replaying that
+bearer as a sync credential reaches the repository sync surface as the creator;
+the downstream `checkSyncPermission` check evaluates the creator's library
+permissions rather than the share-link's narrower permission. Read and write
+sync handlers can therefore be reached when the creator has the corresponding
+library permission, and the token is not limited to the shared file path.
+
+The locked-files body path has a narrower, separate defense: its validator
+rejects path-scoped and `Source == "link"` download tokens before querying lock
+data. That defense does not protect the route-level sync middleware.
+
+This is not a D2 regression. D2 changes download-token `SourceID` wiring but
+does not change `syncAuthMiddleware`; the existing `Source` field was already
+available to reject this token class.
+
+#### Evidence
+
+- `internal/api/server.go` — `syncAuthMiddleware` accepts `TokenTypeDownload`
+  without a source, path or route-repository restriction.
+- `internal/api/sync.go` — `RegisterSyncRoutes` applies that middleware to the
+  repository sync group, while `checkSyncPermission` authorizes using the
+  identity installed by the middleware.
+- `internal/api/sync_locked_files_test.go` — existing tests explicitly reject
+  share-link tokens for locked-files enumeration, confirming that narrower
+  download grants must not widen into repository-wide sync permissions.
+
+#### Fix Direction
+
+Make route-level sync authentication accept only the repository-root sync token
+shape issued by `GetDownloadInfo`: reject `Source == "link"`, reject non-root
+download-token paths, and require the token `RepoID` to match the route's
+`:repo_id` before setting the sync identity. Add regression coverage proving
+that public share-link download tokens cannot authenticate any read or write
+sync route, while ordinary repository sync tokens continue to work.
+
+#### Related Docs
+
+- [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md)
+- `internal/api/server.go` (`syncAuthMiddleware`)
+- `internal/api/sync.go` (`RegisterSyncRoutes`, `checkSyncPermission`)
+- `internal/api/sync_locked_files_test.go` (narrow-token defense)
 
 ---
 

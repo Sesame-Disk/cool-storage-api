@@ -2,10 +2,10 @@
 
 **Date:** 2026-08-01  
 **Branch:** `feat/b4-subcontract-d2-download-source-id`
-**Status:** D0 contract; D1 coordinator/configuration and D2 stable public
-download-token `SourceID` implementation complete in this branch. Admission
-producer wiring remains deferred to D4, and positive operating values remain
-deferred to D6.
+**Status:** D0 contract; D1 coordinator/configuration is merged in `main`, and
+D2 stable public download-token `SourceID` implementation is complete in this
+branch. Admission producer wiring remains deferred to D4, and positive
+operating values remain deferred to D6.
 
 This document freezes the contract and inventory for subcontract D of
 `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`. It is the design record for the D1-D6
