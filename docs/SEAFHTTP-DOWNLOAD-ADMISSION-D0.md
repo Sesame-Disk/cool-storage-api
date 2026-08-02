@@ -603,12 +603,16 @@ does not prove that the browser/client is controlling admission lifetime.
 
 The deadline contract is:
 
-> Install or refresh the idle-write deadline immediately before each write or
-> flush toward the underlying writer.
+> Before the first actual write or flush, install an idle-write deadline at
+> `now + idle_write_timeout`. Each successful output progress sets the next
+> absolute deadline at `progress time + idle_write_timeout`; a later write or
+> flush installs that same deadline rather than extending it.
 
-It must not be refreshed after a write that may already be blocked. On success,
-clear the deadline so a keep-alive connection does not inherit it. On timeout or
-write failure:
+Beginning a later write must not grant a second full idle period, and a deferred
+status assignment that has not committed headers must not start the idle timer.
+After successful output, clear the socket deadline while the progress timer owns
+the interval so a keep-alive connection does not inherit it. On timeout or write
+failure:
 
 - cancel the request/stream context;
 - stop prefetch and close storage readers;
@@ -622,7 +626,8 @@ Three deadlines are independent:
    canonical-reader construction and initial storage work, including inline
    text. Its context reaches Cassandra and S3.
 3. **Idle-write timeout:** maximum interval without successful response progress
-   once output starts.
+   once output starts. The maximum is measured from the last successful progress,
+   not from the start of a subsequent write.
 
 The preparation context is cancelled or replaced when streaming starts; it must
 not accidentally become a total download timeout. `readFileContentAsText` keeps
@@ -652,9 +657,10 @@ does.
 If the D writer cannot install the required deadline before headers, the contract
 is fail closed rather than a metric-only degradation. D3 now supplies
 `httputil.IdleWriteWriter`, which probes reachability before headers, requires a
-non-nil cancellation callback, refreshes the socket deadline before writes and
-flushes, rejects short writes, invalidates stale timer callbacks, cancels after
-an idle-progress timeout, and clears the deadline in `Finish()`. A plain
+non-nil cancellation callback, uses the last successful progress's absolute
+deadline before subsequent writes and flushes, rejects short writes, invalidates
+stale timer callbacks, cancels after an idle-progress timeout, and clears the
+deadline in `Finish()`. A plain
 `httptest.ResponseRecorder` cannot expose the connection deadline and is
 therefore intentionally rejected; D4 producer tests must use a connection-
 capable writer or a real server. D4 supplies the admission lease callbacks and

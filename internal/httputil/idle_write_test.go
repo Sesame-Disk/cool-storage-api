@@ -107,6 +107,18 @@ func (w *IdleWriteWriter) testGeneration() uint64 {
 	return w.timerGeneration
 }
 
+func (w *IdleWriteWriter) testTimerRunning() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.timer != nil
+}
+
+func (w *IdleWriteWriter) testProgressDeadline() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.progressDeadline
+}
+
 func TestIdleWriteWriterTracksProgressAndClearsDeadline(t *testing.T) {
 	underlying := newIdleWriteTestWriter()
 	writer, err := NewIdleWriteWriter(underlying, idleWriteOptions(100*time.Millisecond))
@@ -412,15 +424,77 @@ func TestIdleWriteWriterFinishClearsDeadlineWithoutHoldingLifecycleLock(t *testi
 
 type deadlineGinWriter struct {
 	gin.ResponseWriter
+	deadlines []time.Time
 }
 
-func (deadlineGinWriter) SetWriteDeadline(time.Time) error { return nil }
+func (w *deadlineGinWriter) SetWriteDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
+}
 
-func TestIdleWriteWriterFlushCommitsGinStatus(t *testing.T) {
+func TestIdleWriteWriterWriteHeaderDoesNotStartTimeoutBeforeGinCommits(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	writer, err := NewIdleWriteWriter(deadlineGinWriter{ResponseWriter: c.Writer}, idleWriteOptions(time.Second))
+	underlying := &deadlineGinWriter{ResponseWriter: c.Writer}
+	cancelled := make(chan struct{})
+	writer, err := NewIdleWriteWriter(underlying, IdleWriteOptions{
+		Timeout: 30 * time.Millisecond,
+		Cancel:  func() { close(cancelled) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.WriteHeader(http.StatusOK)
+	if c.Writer.Written() {
+		t.Fatal("Gin committed headers after deferred WriteHeader")
+	}
+	if writer.testTimerRunning() {
+		t.Fatal("deferred Gin WriteHeader started an idle-progress timer")
+	}
+	if deadline := writer.testProgressDeadline(); !deadline.IsZero() {
+		t.Fatalf("progress deadline = %v, want zero before output", deadline)
+	}
+	if got := underlying.deadlines[len(underlying.deadlines)-1]; !got.IsZero() {
+		t.Fatalf("final deadline = %v, want cleared", got)
+	}
+	select {
+	case <-cancelled:
+		t.Fatal("deferred Gin WriteHeader cancelled before output")
+	case <-time.After(90 * time.Millisecond):
+	}
+	if err := writer.Finish(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIdleWriteWriterWriteHeaderStartsTimeoutAfterImmediateCommit(t *testing.T) {
+	underlying := newIdleWriteTestWriter()
+	writer, err := NewIdleWriteWriter(underlying, idleWriteOptions(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.WriteHeader(http.StatusCreated)
+	if !underlying.Written() {
+		t.Fatal("immediate WriteHeader did not commit output")
+	}
+	if !writer.testTimerRunning() {
+		t.Fatal("immediate WriteHeader did not start the idle-progress timer")
+	}
+	if deadline := writer.testProgressDeadline(); deadline.IsZero() {
+		t.Fatal("immediate WriteHeader did not set a progress deadline")
+	}
+	if err := writer.Finish(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIdleWriteWriterFlushPreservesDeferredGinStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	underlying := &deadlineGinWriter{ResponseWriter: c.Writer}
+	writer, err := NewIdleWriteWriter(underlying, idleWriteOptions(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,6 +513,85 @@ func TestIdleWriteWriterFlushCommitsGinStatus(t *testing.T) {
 	}
 	if err := writer.Finish(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestIdleWriteWriterUsesLastProgressDeadlineForNextWrite(t *testing.T) {
+	underlying := newIdleWriteTestWriter()
+	writer, err := NewIdleWriteWriter(underlying, idleWriteOptions(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	lastProgressDeadline := writer.testProgressDeadline()
+	if lastProgressDeadline.IsZero() {
+		t.Fatal("first write did not set a progress deadline")
+	}
+	deadlineCalls := len(underlying.deadlines)
+	if _, err := writer.Write([]byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	if got := underlying.deadlines[deadlineCalls]; !got.Equal(lastProgressDeadline) {
+		t.Fatalf("next write deadline = %v, want last progress deadline %v", got, lastProgressDeadline)
+	}
+	if err := writer.Finish(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIdleWriteWriterWriteHeaderNowAfterOutputDoesNotExtendDeadline(t *testing.T) {
+	underlying := newIdleWriteTestWriter()
+	writer, err := NewIdleWriteWriter(underlying, idleWriteOptions(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	progressDeadline := writer.testProgressDeadline()
+	deadlineCalls := len(underlying.deadlines)
+	writer.WriteHeaderNow()
+	if got := writer.testProgressDeadline(); !got.Equal(progressDeadline) {
+		t.Fatalf("progress deadline = %v, want unchanged %v", got, progressDeadline)
+	}
+	if got := len(underlying.deadlines); got != deadlineCalls {
+		t.Fatalf("deadline calls = %d, want %d after no-op WriteHeaderNow", got, deadlineCalls)
+	}
+	if err := writer.Finish(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIdleWriteWriterRejectsWriteAfterProgressDeadline(t *testing.T) {
+	underlying := newIdleWriteTestWriter()
+	cancelled := make(chan struct{})
+	writer, err := NewIdleWriteWriter(underlying, IdleWriteOptions{
+		Timeout: time.Second,
+		Cancel:  func() { close(cancelled) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	writer.mu.Lock()
+	writer.timer.Stop()
+	writer.timerGeneration++
+	writer.progressDeadline = time.Now().Add(-time.Millisecond)
+	writer.mu.Unlock()
+	if n, err := writer.Write([]byte("late")); n != 0 || !errors.Is(err, ErrIdleWriteTimeout) {
+		t.Fatalf("late Write = (%d, %v), want (0, idle timeout)", n, err)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("expired progress deadline did not cancel the request")
+	}
+	if err := writer.Finish(); !errors.Is(err, ErrIdleWriteTimeout) {
+		t.Fatalf("Finish = %v, want idle timeout", err)
 	}
 }
 

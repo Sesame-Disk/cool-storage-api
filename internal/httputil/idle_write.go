@@ -40,12 +40,13 @@ type IdleWriteWriter struct {
 	onTimeout  func()
 	onError    func(error)
 
-	mu              sync.Mutex
-	timer           *time.Timer
-	timerGeneration uint64
-	finished        bool
-	failed          bool
-	err             error
+	mu               sync.Mutex
+	timer            *time.Timer
+	timerGeneration  uint64
+	progressDeadline time.Time
+	finished         bool
+	failed           bool
+	err              error
 }
 
 var _ gin.ResponseWriter = (*IdleWriteWriter)(nil)
@@ -129,23 +130,38 @@ func (w *IdleWriteWriter) WriteString(s string) (int, error) {
 	return n, nil
 }
 
-// WriteHeader preserves Gin's deferred-header behavior while protecting custom
-// writers that commit a status immediately. The actual progress timer starts
-// here and is refreshed when a later Write or Flush makes more progress.
+// WriteHeader preserves Gin's deferred-header behavior. A custom writer may
+// commit headers here, while Gin merely records the status until output begins.
 func (w *IdleWriteWriter) WriteHeader(status int) {
+	if w.ResponseWriter.Written() {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
 	if err := w.beforeWrite(); err != nil {
 		return
 	}
 	w.ResponseWriter.WriteHeader(status)
-	_ = w.progress()
+	if w.ResponseWriter.Written() {
+		_ = w.progress()
+		return
+	}
+	_ = w.clearDeadlineWithoutProgress()
 }
 
 func (w *IdleWriteWriter) WriteHeaderNow() {
+	if w.ResponseWriter.Written() {
+		w.ResponseWriter.WriteHeaderNow()
+		return
+	}
 	if err := w.beforeWrite(); err != nil {
 		return
 	}
 	w.ResponseWriter.WriteHeaderNow()
-	_ = w.progress()
+	if w.ResponseWriter.Written() {
+		_ = w.progress()
+		return
+	}
+	_ = w.clearDeadlineWithoutProgress()
 }
 
 // FlushError is the error-returning form used by D4. Flush remains available
@@ -154,10 +170,6 @@ func (w *IdleWriteWriter) FlushError() error {
 	if err := w.beforeWrite(); err != nil {
 		return err
 	}
-	// ResponseController may unwrap past Gin and flush the underlying net/http
-	// writer directly. Commit Gin's pending status first so Written and Status
-	// remain truthful after a flush-before-first-body-write.
-	w.ResponseWriter.WriteHeaderNow()
 	if err := w.controller.Flush(); err != nil {
 		w.fail(err)
 		return err
@@ -180,6 +192,7 @@ func (w *IdleWriteWriter) Finish() error {
 	}
 	w.finished = true
 	w.timerGeneration++
+	w.progressDeadline = time.Time{}
 	if w.timer != nil {
 		w.timer.Stop()
 	}
@@ -222,13 +235,49 @@ func (w *IdleWriteWriter) beforeWrite() error {
 		return err
 	}
 	// A socket deadline, rather than the progress timer, bounds the write that
-	// is about to begin. Invalidating the prior timer avoids a stale callback
-	// cancelling a write that just made progress at its boundary.
+	// is about to begin. After progress, keep the original absolute deadline so
+	// beginning a write cannot grant another full idle timeout.
 	w.timerGeneration++
 	if w.timer != nil {
 		w.timer.Stop()
 	}
-	if err := w.SetWriteDeadline(time.Now().Add(w.timeout)); err != nil {
+	now := time.Now()
+	deadline := w.progressDeadline
+	if deadline.IsZero() {
+		deadline = now.Add(w.timeout)
+	} else if !deadline.After(now) {
+		cancel, onTimeout, onError := w.failLocked(ErrIdleWriteTimeout)
+		w.mu.Unlock()
+		w.notifyFailure(ErrIdleWriteTimeout, cancel, onTimeout, onError)
+		return ErrIdleWriteTimeout
+	}
+	if err := w.SetWriteDeadline(deadline); err != nil {
+		cancel, onTimeout, onError := w.failLocked(err)
+		w.mu.Unlock()
+		w.notifyFailure(err, cancel, onTimeout, onError)
+		return err
+	}
+	w.mu.Unlock()
+	return nil
+}
+
+func (w *IdleWriteWriter) clearDeadlineWithoutProgress() error {
+	w.mu.Lock()
+	if w.finished || w.failed {
+		err := w.err
+		if err == nil {
+			err = ErrIdleWriteTimeout
+		}
+		w.mu.Unlock()
+		return err
+	}
+	w.timerGeneration++
+	w.progressDeadline = time.Time{}
+	if w.timer != nil {
+		w.timer.Stop()
+		w.timer = nil
+	}
+	if err := w.SetWriteDeadline(time.Time{}); err != nil {
 		cancel, onTimeout, onError := w.failLocked(err)
 		w.mu.Unlock()
 		w.notifyFailure(err, cancel, onTimeout, onError)
@@ -250,6 +299,7 @@ func (w *IdleWriteWriter) progress() error {
 	}
 	w.timerGeneration++
 	generation := w.timerGeneration
+	w.progressDeadline = time.Now().Add(w.timeout)
 	if w.timer != nil {
 		w.timer.Stop()
 	}
@@ -259,7 +309,7 @@ func (w *IdleWriteWriter) progress() error {
 		w.notifyFailure(err, cancel, onTimeout, onError)
 		return err
 	}
-	w.timer = time.AfterFunc(w.timeout, func() { w.expire(generation) })
+	w.timer = time.AfterFunc(time.Until(w.progressDeadline), func() { w.expire(generation) })
 	w.mu.Unlock()
 	return nil
 }
@@ -292,6 +342,7 @@ func (w *IdleWriteWriter) failLocked(err error) (context.CancelFunc, func(), fun
 	w.failed = true
 	w.err = err
 	w.timerGeneration++
+	w.progressDeadline = time.Time{}
 	if w.timer == nil {
 		return w.cancel, w.onTimeout, w.onError
 	}
