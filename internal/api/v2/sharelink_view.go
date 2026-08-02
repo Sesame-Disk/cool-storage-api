@@ -974,7 +974,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 
 	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequestContext(ctx, c, h.db, h.config, h.storageManager, h.storage, sl.orgID, sl.libraryID)
 	if err != nil {
-		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		lifecycle.ReleasePreparationError(err)
 		slog.Error("Block store not available for share link raw", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
@@ -988,7 +988,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	if streaming.ContainsLegacySHA1(blockIDs) {
 		resolved, err := db.ResolveBlockRepresentationIDContext(ctx, h.db.Session(), sl.orgID, sl.libraryID)
 		if err != nil {
-			lifecycle.Release(downloadadmission.ReleaseStorageError)
+			lifecycle.ReleasePreparationError(err)
 			slog.Error("failed to resolve block representation for share link", "org", sl.orgID, "library", sl.libraryID, "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 			return
@@ -1001,14 +1001,14 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	// stale SHA-1 can never truncate the response mid-stream.
 	resolvedIDs, err := streaming.BatchResolveBlockIDsContext(ctx, h.db, sl.orgID, representationID, blockIDs)
 	if err != nil {
-		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		lifecycle.ReleasePreparationError(err)
 		slog.Error("block ID resolution failed for share link", "org", sl.orgID, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
 	}
 	canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, sl.orgID, resolvedIDs, blockStore, blockStoreClass)
 	if err != nil {
-		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		lifecycle.ReleasePreparationError(err)
 		slog.Error("canonical block reader construction failed for share link", "org", sl.orgID, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
@@ -1026,7 +1026,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	if isVideoFile(ext) || isAudioFile(ext) {
 		blockSizes, err := streaming.QueryBlockSizes(ctx, h.db, sl.orgID, canonicalReader, resolvedIDs)
 		if err != nil {
-			lifecycle.Release(downloadadmission.ReleaseStorageError)
+			lifecycle.ReleasePreparationError(err)
 			slog.Error("Failed to query block sizes for share link", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file metadata"})
 			return
@@ -1220,9 +1220,14 @@ func (h *ShareLinkViewHandler) readFileContentAsText(ctx context.Context, sl *sh
 func (h *ShareLinkViewHandler) emitShareFileBootstrap(c *gin.Context, sl *shareLinkData) {
 	var lifecycle *httputil.DownloadAdmission
 	defer func() {
-		if lifecycle != nil {
-			lifecycle.FinishHandler()
+		if lifecycle == nil {
+			return
 		}
+		if recovered := recover(); recovered != nil {
+			_ = lifecycle.Finish(downloadadmission.ReleasePanic)
+			panic(recovered)
+		}
+		_ = lifecycle.Finish(downloadadmission.ReleaseCompleted)
 	}()
 	acquireInline := func() (downloadadmission.RejectReason, error) {
 		var reason downloadadmission.RejectReason
@@ -1238,7 +1243,7 @@ func (h *ShareLinkViewHandler) emitShareFileBootstrap(c *gin.Context, sl *shareL
 	}
 	if err != nil {
 		if lifecycle != nil {
-			lifecycle.Release(downloadadmission.ReleaseStorageError)
+			lifecycle.ReleasePreparationError(err)
 		}
 		respondShareBootstrapError(c, sl, status, err)
 		return

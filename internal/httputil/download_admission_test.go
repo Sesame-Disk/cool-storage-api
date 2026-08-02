@@ -78,6 +78,12 @@ func waitForMetric(t *testing.T, metric func() float64, want float64) {
 	t.Fatalf("metric = %v, want %v", metric(), want)
 }
 
+type recoveryDeadlineResponseWriter struct {
+	gin.ResponseWriter
+}
+
+func (w *recoveryDeadlineResponseWriter) SetWriteDeadline(time.Time) error { return nil }
+
 func TestDownloadAdmissionDisabledIsTransparent(t *testing.T) {
 	parent := context.Background()
 	writer := newIdleWriteTestWriter()
@@ -185,6 +191,70 @@ func TestDownloadAdmissionPreparationTimeoutAndCancellation(t *testing.T) {
 	})
 }
 
+func TestDownloadAdmissionStartStreamingRejectsExpiredPreparation(t *testing.T) {
+	cfg := admissionLifecycleConfig()
+	coordinator := newAdmissionLifecycleCoordinator(t, cfg)
+	c, _ := newAdmissionLifecycleContext(context.Background(), newIdleWriteTestWriter())
+	lifecycle, reason, err := AcquireDownloadAdmission(c, coordinator, cfg, admissionLifecycleRequest(t, "expired-before-stream"))
+	if err != nil || reason != "" {
+		t.Fatalf("AcquireDownloadAdmission = (%q, %v)", reason, err)
+	}
+
+	// Stop the real callback and substitute an already-expired preparation context
+	// so StartStreaming races neither the timer nor a goroutine scheduler.
+	lifecycle.mu.Lock()
+	stopPreparation := lifecycle.stopPreparation
+	lifecycle.stopPreparation = nil
+	lifecycle.mu.Unlock()
+	if stopPreparation == nil || !stopPreparation() {
+		t.Fatal("failed to stop preparation callback")
+	}
+	lifecycle.mu.Lock()
+	preparation, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	lifecycle.preparation = preparation
+	lifecycle.prepareCancel = cancel
+	lifecycle.mu.Unlock()
+	defer cancel()
+
+	<-preparation.Done()
+	writerBefore := c.Writer
+	beforeDeadline := deadlineCount(downloadadmission.DeadlinePreparation)
+	beforeRelease := releaseCount(downloadadmission.ReleasePreparationTimeout)
+	if _, err := lifecycle.StartStreaming(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("StartStreaming error = %v, want context deadline exceeded", err)
+	}
+	if c.Writer != writerBefore {
+		t.Fatal("expired preparation installed a streaming writer")
+	}
+	waitForMetric(t, func() float64 { return deadlineCount(downloadadmission.DeadlinePreparation) }, beforeDeadline+1)
+	waitForMetric(t, func() float64 { return releaseCount(downloadadmission.ReleasePreparationTimeout) }, beforeRelease+1)
+}
+
+func TestDownloadAdmissionRestoresWriterForGinRecovery(t *testing.T) {
+	cfg := admissionLifecycleConfig()
+	coordinator := newAdmissionLifecycleCoordinator(t, cfg)
+	router := gin.New()
+	router.Use(gin.Recovery())
+	router.GET("/panic", func(c *gin.Context) {
+		c.Writer = &recoveryDeadlineResponseWriter{ResponseWriter: c.Writer}
+		lifecycle, reason, err := AcquireDownloadAdmission(c, coordinator, cfg, admissionLifecycleRequest(t, "recovery"))
+		if err != nil || reason != "" {
+			t.Fatalf("AcquireDownloadAdmission = (%q, %v)", reason, err)
+		}
+		defer lifecycle.FinishHandler()
+		if _, err := lifecycle.StartStreaming(); err != nil {
+			t.Fatalf("StartStreaming = %v", err)
+		}
+		panic("recovery panic")
+	})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/panic", nil))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("recovered status = %d, want %d; body=%q", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+}
+
 func TestDownloadAdmissionWriterUnreachableFailsClosed(t *testing.T) {
 	cfg := admissionLifecycleConfig()
 	coordinator := newAdmissionLifecycleCoordinator(t, cfg)
@@ -277,6 +347,42 @@ func TestDownloadAdmissionIdleWriteTimeoutReleasesLease(t *testing.T) {
 	if err := lifecycle.Finish(downloadadmission.ReleaseCompleted); !errors.Is(err, ErrIdleWriteTimeout) {
 		t.Fatalf("Finish = %v, want idle write timeout", err)
 	}
+}
+
+func TestDownloadAdmissionIdleTimeoutClaimsCauseBeforeCancellation(t *testing.T) {
+	cfg := admissionLifecycleConfig()
+	cfg.IdleWriteTimeout = 20 * time.Millisecond
+	coordinator := newAdmissionLifecycleCoordinator(t, cfg)
+	c, _ := newAdmissionLifecycleContext(context.Background(), newIdleWriteTestWriter())
+	lifecycle, reason, err := AcquireDownloadAdmission(c, coordinator, cfg, admissionLifecycleRequest(t, "idle-cause"))
+	if err != nil || reason != "" {
+		t.Fatalf("AcquireDownloadAdmission = (%q, %v)", reason, err)
+	}
+	streaming, err := lifecycle.StartStreaming()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeIdle := releaseCount(downloadadmission.ReleaseIdleWriteTimeout)
+	beforeStorage := releaseCount(downloadadmission.ReleaseStorageError)
+	workerDone := make(chan struct{})
+	go func() {
+		<-streaming.Done()
+		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		close(workerDone)
+	}()
+	if _, err := c.Writer.Write([]byte("progress")); err != nil {
+		t.Fatal(err)
+	}
+	waitForMetric(t, func() float64 { return releaseCount(downloadadmission.ReleaseIdleWriteTimeout) }, beforeIdle+1)
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not observe idle-timeout cancellation")
+	}
+	if got := releaseCount(downloadadmission.ReleaseStorageError); got != beforeStorage {
+		t.Fatalf("storage-error release count = %v, want %v; cancellation worker won the race", got, beforeStorage)
+	}
+	_ = lifecycle.Finish(downloadadmission.ReleaseCompleted)
 }
 
 func TestDownloadAdmissionReleaseUsesFirstCauseExactlyOnce(t *testing.T) {

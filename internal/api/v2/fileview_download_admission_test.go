@@ -188,12 +188,14 @@ func TestFileViewAdmissionProtectsReaderSetupAndHTTPFastPaths(t *testing.T) {
 	tests := []struct {
 		name          string
 		profile       string
+		startCount    int
 		mustFollow    []string
 		fastPathCalls []string
 	}{
 		{
 			name:       "ServeRawFile",
 			profile:    "ProfileRaw",
+			startCount: 3,
 			mustFollow: []string{"resolveLibraryBlockStoreForRequestContext", "NewCanonicalBlockReader", "BatchResolveBlockIDsContext", "QueryBlockSizes", "GetBlockReader", "NewBlockReadSeeker", "ServeContent", "StreamBlocks"},
 			fastPathCalls: []string{
 				"setCacheHeaders",
@@ -203,11 +205,13 @@ func TestFileViewAdmissionProtectsReaderSetupAndHTTPFastPaths(t *testing.T) {
 		{
 			name:       "DownloadHistoricFile",
 			profile:    "ProfileHistory",
+			startCount: 1,
 			mustFollow: []string{"resolveLibraryBlockStoreForRequestContext", "NewCanonicalBlockReader", "BatchResolveBlockIDsContext", "StreamBlocks"},
 		},
 		{
 			name:       "ServeHistoricFileRaw",
 			profile:    "ProfileHistory",
+			startCount: 1,
 			mustFollow: []string{"resolveLibraryBlockStoreForRequestContext", "NewCanonicalBlockReader", "BatchResolveBlockIDsContext", "StreamBlocks"},
 			fastPathCalls: []string{
 				"setCacheHeaders",
@@ -243,6 +247,9 @@ func TestFileViewAdmissionProtectsReaderSetupAndHTTPFastPaths(t *testing.T) {
 			if !streamStart.IsValid() {
 				t.Fatal("handler does not start the streaming writer")
 			}
+			if got := fileViewAdmissionCallCount(fn, "StartStreaming"); got != tt.startCount {
+				t.Fatalf("StartStreaming call count = %d, want %d; every producer branch must transition explicitly", got, tt.startCount)
+			}
 			for _, name := range []string{"Data", "ServeContent", "StreamBlocks"} {
 				if pos := fileViewAdmissionCallPos(fn, name); pos.IsValid() && streamStart > pos {
 					t.Fatalf("StartStreaming must precede %s", name)
@@ -254,6 +261,18 @@ func TestFileViewAdmissionProtectsReaderSetupAndHTTPFastPaths(t *testing.T) {
 	if pos := fileViewAdmissionCallPos(fileViewAdmissionFunction(t, fileNode, "ViewHistoricFile"), "acquireFileViewDownloadAdmission"); pos.IsValid() {
 		t.Fatal("ViewHistoricFile is a redirect-only endpoint and must not acquire admission")
 	}
+}
+
+func fileViewAdmissionCallCount(fn *ast.FuncDecl, name string) int {
+	count := 0
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if ok && fileViewAdmissionCallName(call) == name {
+			count++
+		}
+		return true
+	})
+	return count
 }
 
 func fileViewAdmissionFunction(t *testing.T, fileNode *ast.File, name string) *ast.FuncDecl {

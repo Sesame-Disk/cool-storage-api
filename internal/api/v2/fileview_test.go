@@ -3,6 +3,9 @@ package v2
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,8 +15,53 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type cancelDuringIWorkContext struct {
+	context.Context
+	checks   int
+	cancelAt int
+	done     chan struct{}
+	canceled bool
+}
+
+func (c *cancelDuringIWorkContext) Err() error {
+	c.checks++
+	if c.checks >= c.cancelAt {
+		if !c.canceled {
+			close(c.done)
+			c.canceled = true
+		}
+		return context.Canceled
+	}
+	return nil
+}
+
+func (c *cancelDuringIWorkContext) Done() <-chan struct{} { return c.done }
+
 func init() {
 	gin.SetMode(gin.TestMode)
+}
+
+func TestExtractIWorkPreviewPDFContextStopsAfterCancellation(t *testing.T) {
+	entries := make(map[string][]byte, 2000)
+	for i := 0; i < 2000; i++ {
+		entries[fmt.Sprintf("Index/%04d.iwa", i)] = []byte{0}
+	}
+	archive := createTestZIP(entries)
+	ctx := &cancelDuringIWorkContext{
+		Context:  context.Background(),
+		cancelAt: 8,
+		done:     make(chan struct{}),
+	}
+
+	_, err := extractIWorkPreviewPDFContext(ctx, archive, 10*1024*1024)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("extractIWorkPreviewPDFContext error = %v, want context canceled", err)
+	}
+	select {
+	case <-ctx.done:
+	default:
+		t.Fatal("test context was not canceled during archive traversal")
+	}
 }
 
 // mockTokenCreator implements TokenCreator interface for testing

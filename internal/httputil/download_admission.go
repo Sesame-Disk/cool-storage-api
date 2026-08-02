@@ -40,8 +40,17 @@ type DownloadAdmission struct {
 	streaming       context.Context
 	streamCancel    context.CancelFunc
 	writer          *IdleWriteWriter
+	originalWriter  gin.ResponseWriter
 	stopParent      func() bool
 	stopPreparation func() bool
+}
+
+type releaseState struct {
+	stopParent      func() bool
+	stopPreparation func() bool
+	prepareCancel   context.CancelFunc
+	streamCancel    context.CancelFunc
+	lease           *downloadadmission.Lease
 }
 
 // AcquireDownloadAdmission acquires request before protected preparation work
@@ -127,6 +136,28 @@ func (l *DownloadAdmission) StartStreaming() (context.Context, error) {
 		l.mu.Unlock()
 		return nil, ErrDownloadAdmissionStreaming
 	}
+	if err := l.parent.Err(); err != nil {
+		state, released := l.releaseLocked()
+		l.mu.Unlock()
+		if released {
+			l.finishRelease(state, downloadadmission.ReleaseClientDisconnect, "")
+		}
+		return nil, err
+	}
+	if err := l.preparation.Err(); err != nil {
+		cause := downloadadmission.ReleaseStorageError
+		phase := downloadadmission.DeadlinePhase("")
+		if errors.Is(err, context.DeadlineExceeded) {
+			cause = downloadadmission.ReleasePreparationTimeout
+			phase = downloadadmission.DeadlinePreparation
+		}
+		state, released := l.releaseLocked()
+		l.mu.Unlock()
+		if released {
+			l.finishRelease(state, cause, phase)
+		}
+		return nil, err
+	}
 	l.startingStream = true
 	l.mu.Unlock()
 
@@ -163,6 +194,7 @@ func (l *DownloadAdmission) StartStreaming() (context.Context, error) {
 	l.streaming = streaming
 	l.streamCancel = cancel
 	l.writer = writer
+	l.originalWriter = l.ginContext.Writer
 	l.preparing = false
 	stopPreparation := l.stopPreparation
 	l.stopPreparation = nil
@@ -192,6 +224,9 @@ func (l *DownloadAdmission) Finish(cause downloadadmission.ReleaseCause) error {
 	var err error
 	if writer != nil {
 		err = writer.Finish()
+		l.mu.Lock()
+		l.ginContext.Writer = l.originalWriter
+		l.mu.Unlock()
 	}
 	l.Release(cause)
 	return err
@@ -217,34 +252,53 @@ func (l *DownloadAdmission) Release(cause downloadadmission.ReleaseCause) {
 	}
 
 	l.mu.Lock()
-	if l.released {
+	state, released := l.releaseLocked()
+	l.mu.Unlock()
+	if !released {
+		return
+	}
+	l.finishRelease(state, cause, "")
+}
+
+// ReleasePreparationError attributes a preparation failure to the request's
+// cancellation or preparation deadline when either one caused the error. It
+// claims the lease under the same mutex as the deadline callback, so the
+// callback and a handler observing context.DeadlineExceeded cannot race to
+// produce different causes.
+func (l *DownloadAdmission) ReleasePreparationError(err error) {
+	if l == nil || !l.enabled {
+		return
+	}
+
+	l.mu.Lock()
+	if l.released || !l.preparing {
 		l.mu.Unlock()
 		return
 	}
-	l.released = true
-	l.preparing = false
-	stopParent := l.stopParent
-	l.stopParent = nil
-	stopPreparation := l.stopPreparation
-	l.stopPreparation = nil
-	prepareCancel := l.prepareCancel
-	streamCancel := l.streamCancel
-	lease := l.lease
+	cause := downloadadmission.ReleaseStorageError
+	phase := downloadadmission.DeadlinePhase("")
+	if l.parent.Err() != nil {
+		cause = downloadadmission.ReleaseClientDisconnect
+	} else if preparationDeadlineExpired(l.preparation, err) {
+		cause = downloadadmission.ReleasePreparationTimeout
+		phase = downloadadmission.DeadlinePreparation
+	}
+	state, released := l.releaseLocked()
 	l.mu.Unlock()
+	if released {
+		l.finishRelease(state, cause, phase)
+	}
+}
 
-	if stopParent != nil {
-		stopParent()
+func preparationDeadlineExpired(preparation context.Context, err error) bool {
+	if preparation == nil {
+		return false
 	}
-	if stopPreparation != nil {
-		stopPreparation()
+	if errors.Is(preparation.Err(), context.DeadlineExceeded) {
+		return true
 	}
-	if prepareCancel != nil {
-		prepareCancel()
-	}
-	if streamCancel != nil {
-		streamCancel()
-	}
-	lease.Release(cause)
+	deadline, hasDeadline := preparation.Deadline()
+	return hasDeadline && !time.Now().Before(deadline) && errors.Is(err, context.DeadlineExceeded)
 }
 
 // RenderDownloadAdmissionRefusal sends the shared retryable refusal response.
@@ -258,18 +312,47 @@ func RenderDownloadAdmissionRefusal(c *gin.Context, coordinator *downloadadmissi
 }
 
 func (l *DownloadAdmission) preparationDone() {
-	l.mu.Lock()
-	preparing := l.preparing && !l.released
-	l.mu.Unlock()
-	if !preparing {
+	l.ReleasePreparationError(l.PreparationContext().Err())
+}
+
+func (l *DownloadAdmission) releaseLocked() (releaseState, bool) {
+	if l.released {
+		return releaseState{}, false
+	}
+	l.released = true
+	l.preparing = false
+	state := releaseState{
+		stopParent:      l.stopParent,
+		stopPreparation: l.stopPreparation,
+		prepareCancel:   l.prepareCancel,
+		streamCancel:    l.streamCancel,
+		lease:           l.lease,
+	}
+	l.stopParent = nil
+	l.stopPreparation = nil
+	return state, true
+}
+
+func (l *DownloadAdmission) finishRelease(state releaseState, cause downloadadmission.ReleaseCause, phase downloadadmission.DeadlinePhase) {
+	if state.lease == nil {
 		return
 	}
-	if l.parent.Err() != nil {
-		l.Release(downloadadmission.ReleaseClientDisconnect)
-		return
+	if phase != "" {
+		state.lease.RecordDeadlineExpired(phase)
 	}
-	l.lease.RecordDeadlineExpired(downloadadmission.DeadlinePreparation)
-	l.Release(downloadadmission.ReleasePreparationTimeout)
+	if state.stopParent != nil {
+		state.stopParent()
+	}
+	if state.stopPreparation != nil {
+		state.stopPreparation()
+	}
+	if state.prepareCancel != nil {
+		state.prepareCancel()
+	}
+	if state.streamCancel != nil {
+		state.streamCancel()
+	}
+	state.lease.Release(cause)
 }
 
 func (l *DownloadAdmission) installParentStop(stop func() bool) {

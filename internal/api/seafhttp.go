@@ -3829,10 +3829,10 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	defer lifecycle.FinishHandler()
 
 	if err := h.streamFileFromBlocks(c, token, filename, downloadTrafficStatus.PeriodStartedAt, lifecycle); err != nil {
-		// StartStreaming records writer setup failures itself. All other errors at
-		// this point occurred during protected preparation and are storage failures.
+		// StartStreaming and StreamBlocks classify their own terminal failures;
+		// preparation errors are classified here with the request context state.
 		if !errors.Is(err, v2.ErrLibraryEncryptedNotUnlocked) {
-			lifecycle.Release(downloadadmission.ReleaseStorageError)
+			lifecycle.ReleasePreparationError(err)
 		}
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, err)
 		return
@@ -3901,11 +3901,14 @@ func releaseSeafHTTPDownloadStreamFailure(lifecycle *httputil.DownloadAdmission,
 	if lifecycle == nil {
 		return
 	}
+	lifecycle.Release(seafHTTPDownloadStreamCause(err))
+}
+
+func seafHTTPDownloadStreamCause(err error) downloadadmission.ReleaseCause {
 	if errors.Is(err, streaming.ErrStreamResponse) {
-		lifecycle.Release(downloadadmission.ReleaseResponseError)
-		return
+		return downloadadmission.ReleaseResponseError
 	}
-	lifecycle.Release(downloadadmission.ReleaseStorageError)
+	return downloadadmission.ReleaseStorageError
 }
 
 // resolveBlockID translates a client-facing block id to the internal SHA-256
@@ -4115,8 +4118,8 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 }
 
 // getFileFromBlocks retrieves a file by loading all blocks into memory.
-// DEPRECATED: Use streamFileFromBlocks for downloads. This is kept only for
-// upload metadata (commitUploadedFile) where the full content is already in memory.
+// Deprecated and intentionally unused: download producers must use
+// streamFileFromBlocks so D admission and bounded streaming cannot be bypassed.
 func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) ([]byte, error) {
 	blockIDs, _, fileKey, fileIV, blockStore, storageClass, err := seafHTTPLookupFileBlocksFn(c.Request.Context(), h, httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
 	if err != nil {
@@ -4438,7 +4441,9 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	if !ok {
 		return
 	}
-	defer lifecycle.FinishHandler()
+	var zipWriter *zip.Writer
+	zipCause := downloadadmission.ReleaseCompleted
+	defer finishSeafHTTPZipDownload(lifecycle, &zipWriter, &zipCause)
 	preparationCtx := lifecycle.PreparationContext()
 
 	// Encryption must be checked before any metadata walk or stream. Ignoring a
@@ -4446,7 +4451,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	// of ciphertext bytes treated as plaintext.
 	encrypted, err := seafHTTPLookupLibraryEncryptedFn(preparationCtx, h, token.OrgID, token.RepoID)
 	if err != nil {
-		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		lifecycle.ReleasePreparationError(err)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("failed to check library encryption: %w", err))
 		return
 	}
@@ -4468,7 +4473,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).WithContext(preparationCtx).Scan(&headCommit)
 	if err != nil {
-		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		lifecycle.ReleasePreparationError(err)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("library not found: %w", err))
 		return
 	}
@@ -4479,7 +4484,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		WHERE library_id = ? AND commit_id = ?
 	`, token.RepoID, headCommit).WithContext(preparationCtx).Scan(&rootFSID)
 	if err != nil {
-		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		lifecycle.ReleasePreparationError(err)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("commit not found: %w", err))
 		return
 	}
@@ -4523,12 +4528,12 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 				// Same contract as HandleDownload: only a validated listing that
 				// does not name the entry distinguishes local absence; HTTP still
 				// maps it to 503 because the snapshot may be stale across DCs.
-				lifecycle.Release(downloadadmission.ReleaseStorageError)
+				lifecycle.ReleasePreparationError(err)
 				respondSeafHTTPDownloadError(c, token.RepoID, part, err)
 				return
 			}
 			if !entry.isDir() {
-				lifecycle.Release(downloadadmission.ReleaseStorageError)
+				lifecycle.ReleasePreparationError(fmt.Errorf("path component %s is not a directory", part))
 				respondSeafHTTPDownloadError(c, token.RepoID, part, fmt.Errorf("path component %s is not a directory", part))
 				return
 			}
@@ -4546,7 +4551,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	blockStore, storageClass, err := h.resolveLibraryBlockStoreContext(preparationCtx, hostname, token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleZipDownload] Failed to resolve block store: %v", err)
-		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		lifecycle.ReleasePreparationError(err)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("block store not available: %w", err))
 		return
 	}
@@ -4559,7 +4564,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 			return
 		}
 		log.Printf("[HandleZipDownload] Failed to validate ZIP directory: %v", err)
-		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		lifecycle.ReleasePreparationError(err)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, err)
 		return
 	}
@@ -4570,7 +4575,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	canonicalReader, err := seafHTTPNewCanonicalBlockReaderFn(preparationCtx, h.db, h.storageManager, token.OrgID, allResolvedIDs, blockStore, storageClass)
 	if err != nil {
 		log.Printf("[HandleZipDownload] Failed to resolve canonical block locations: %v", err)
-		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		lifecycle.ReleasePreparationError(err)
 		respondSeafHTTPDownloadError(c, token.RepoID, token.Path, fmt.Errorf("resolve canonical block locations: %w", err))
 		return
 	}
@@ -4590,14 +4595,13 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, zipFilename))
 	c.Status(http.StatusOK)
 
-	zipWriter := zip.NewWriter(c.Writer)
-	defer finishSeafHTTPZipDownload(lifecycle, zipWriter)
+	zipWriter = zip.NewWriter(c.Writer)
 
 	// Snapshot writer size before streaming so we can calculate the delta afterward.
 	bytesBefore := int64(c.Writer.Size())
 
 	if err := h.addDirToZip(streamCtx, zipWriter, canonicalReader, preparedFiles, fileKey, fileIV); err != nil {
-		releaseSeafHTTPDownloadStreamFailure(lifecycle, err)
+		zipCause = seafHTTPDownloadStreamCause(err)
 		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", err)
 		return
 	}
@@ -4717,26 +4721,35 @@ func (h *SeafHTTPHandler) prepareZipDirectoryContext(ctx context.Context, repoID
 // finishSeafHTTPZipDownload closes the archive while its admission lease is
 // still active. It preserves a handler panic while also releasing the lease if
 // Close itself panics.
-func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter *zip.Writer) {
+func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter **zip.Writer, cause *downloadadmission.ReleaseCause) {
 	originalPanic := recover()
+	finalCause := downloadadmission.ReleaseCompleted
+	if cause != nil {
+		finalCause = *cause
+	}
 	if originalPanic != nil {
-		lifecycle.Release(downloadadmission.ReleasePanic)
+		finalCause = downloadadmission.ReleasePanic
 	}
 
 	var closeErr error
 	var closePanic any
-	func() {
-		defer func() { closePanic = recover() }()
-		closeErr = zipWriter.Close()
-	}()
+	if zipWriter != nil && *zipWriter != nil {
+		func() {
+			defer func() { closePanic = recover() }()
+			closeErr = (*zipWriter).Close()
+		}()
+	}
 	if closeErr != nil {
-		lifecycle.Release(downloadadmission.ReleaseResponseError)
+		if finalCause == downloadadmission.ReleaseCompleted {
+			finalCause = downloadadmission.ReleaseResponseError
+		}
 		log.Printf("[HandleZipDownload] ZIP close failed: %v", closeErr)
 	}
 	if closePanic != nil {
-		lifecycle.Release(downloadadmission.ReleasePanic)
+		finalCause = downloadadmission.ReleasePanic
 		log.Printf("[HandleZipDownload] ZIP close panicked: %v", closePanic)
 	}
+	_ = lifecycle.Finish(finalCause)
 	if originalPanic != nil {
 		panic(originalPanic)
 	}

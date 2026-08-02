@@ -175,21 +175,35 @@ func resolveBlockIDsContext(ctx context.Context, orgID string, blockIDs []string
 	results := make(chan lookupResult, len(toResolve))
 
 	launched := 0
+dispatch:
 	for _, idx := range toResolve {
+		if err := ctx.Err(); err != nil {
+			break
+		}
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
-			goto collect
+			break dispatch
+		}
+		// Both cases can be ready at once. Re-check after acquiring the
+		// semaphore so a cancellation that raced with the select cannot
+		// dispatch another lookup.
+		if err := ctx.Err(); err != nil {
+			<-sem
+			break
 		}
 		go func(idx int) {
 			defer func() { <-sem }()
+			if err := ctx.Err(); err != nil {
+				results <- lookupResult{idx: idx, err: err}
+				return
+			}
 			internalID, err := lookup(idx)
 			results <- lookupResult{idx: idx, internalID: internalID, err: err}
 		}(idx)
 		launched++
 	}
 
-collect:
 	var resolveErr error
 	queryFailures := 0
 	missingMappings := 0

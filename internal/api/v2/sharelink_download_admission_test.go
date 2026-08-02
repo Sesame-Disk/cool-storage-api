@@ -13,7 +13,9 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/downloadadmission"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func shareLinkAdmissionConfig() config.DownloadAdmissionConfig {
@@ -250,5 +252,33 @@ func TestShareFileBootstrapAdmissionRejectsBeforeInlineRead(t *testing.T) {
 	}
 	if readCalls != 0 {
 		t.Fatalf("inline reader called %d time(s) after admission refusal", readCalls)
+	}
+}
+
+func TestShareFileBootstrapAttributesPanicAsPanic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h, _ := newShareLinkAdmissionHandler(t, shareLinkAdmissionConfig())
+	c, _ := newShareLinkAdmissionContext(t, context.Background())
+
+	original := shareFileBootstrapFn
+	t.Cleanup(func() { shareFileBootstrapFn = original })
+	shareFileBootstrapFn = func(_ *ShareLinkViewHandler, _ *gin.Context, _ *shareLinkData, acquire func() (downloadadmission.RejectReason, error)) (pageBootstrapResponse, downloadadmission.RejectReason, int, error) {
+		if _, err := acquire(); err != nil {
+			t.Fatalf("inline admission acquire: %v", err)
+		}
+		panic("inline bootstrap panic")
+	}
+
+	before := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleasePanic)))
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		h.emitShareFileBootstrap(c, &shareLinkData{token: "share-token", filePath: "/notes.txt", targetEntry: &FSEntry{ID: "file-id", Size: 1}})
+	}()
+	if recovered != "inline bootstrap panic" {
+		t.Fatalf("recovered panic = %v, want inline bootstrap panic", recovered)
+	}
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleasePanic))); got != before+1 {
+		t.Fatalf("panic release count = %v, want %v", got, before+1)
 	}
 }

@@ -3,6 +3,7 @@ package v2
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -124,9 +125,9 @@ func respondFileViewDownloadAdmissionFailure(c *gin.Context, err error) {
 	}
 }
 
-func releaseFileViewDownloadPreparationFailure(lifecycle *httputil.DownloadAdmission) {
+func releaseFileViewDownloadPreparationFailure(lifecycle *httputil.DownloadAdmission, err error) {
 	if lifecycle != nil {
-		lifecycle.Release(downloadadmission.ReleaseStorageError)
+		lifecycle.ReleasePreparationError(err)
 	}
 }
 
@@ -654,7 +655,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	// Get block store
 	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequestContext(ctx, c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
-		releaseFileViewDownloadPreparationFailure(lifecycle)
+		releaseFileViewDownloadPreparationFailure(lifecycle, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
 	}
@@ -666,7 +667,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	if streaming.ContainsLegacySHA1(blockIDs) {
 		representationID, err = db.ResolveBlockRepresentationIDContext(ctx, h.db.Session(), orgID, repoID)
 		if err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle)
+			releaseFileViewDownloadPreparationFailure(lifecycle, err)
 			log.Printf("[ServeRawFile] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 			return
@@ -681,57 +682,90 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		var content bytes.Buffer
 		iworkResolvedIDs, err := streaming.BatchResolveBlockIDsContext(ctx, h.db, orgID, representationID, blockIDs)
 		if err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle)
+			releaseFileViewDownloadPreparationFailure(lifecycle, err)
 			log.Printf("[ServeRawFile] block ID resolution failed for org=%s: %v", orgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 			return
 		}
 		canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, orgID, iworkResolvedIDs, blockStore, blockStoreClass)
 		if err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle)
+			releaseFileViewDownloadPreparationFailure(lifecycle, err)
 			log.Printf("[ServeRawFile] canonical block reader construction failed for org=%s: %v", orgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 			return
 		}
-		for idx, _ := range blockIDs {
+		for idx := range blockIDs {
+			if err := ctx.Err(); err != nil {
+				releaseFileViewDownloadPreparationFailure(lifecycle, err)
+				return
+			}
 			internalID := iworkResolvedIDs[idx]
 			reader, err := canonicalReader.GetBlockReader(ctx, internalID)
 			if err != nil {
-				releaseFileViewDownloadPreparationFailure(lifecycle)
+				releaseFileViewDownloadPreparationFailure(lifecycle, err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 				return
 			}
 			if encrypted && fileKey != nil {
-				blockData, err := io.ReadAll(reader)
-				reader.Close()
+				blockData, err := readAllContext(ctx, reader)
+				closeErr := reader.Close()
 				if err != nil {
-					releaseFileViewDownloadPreparationFailure(lifecycle)
+					releaseFileViewDownloadPreparationFailure(lifecycle, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+					return
+				}
+				if closeErr != nil {
+					releaseFileViewDownloadPreparationFailure(lifecycle, closeErr)
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 					return
 				}
 				blockData, err = crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 				if err != nil {
-					releaseFileViewDownloadPreparationFailure(lifecycle)
+					releaseFileViewDownloadPreparationFailure(lifecycle, err)
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "decryption failed"})
+					return
+				}
+				if err := ctx.Err(); err != nil {
+					releaseFileViewDownloadPreparationFailure(lifecycle, err)
+					respondFileViewDownloadAdmissionFailure(c, fmt.Errorf("iWork preview preparation: %w", err))
 					return
 				}
 				content.Write(blockData)
 			} else {
-				_, err = io.Copy(&content, reader)
-				reader.Close()
+				_, err = copyContext(ctx, &content, reader)
+				closeErr := reader.Close()
 				if err != nil {
-					releaseFileViewDownloadPreparationFailure(lifecycle)
+					releaseFileViewDownloadPreparationFailure(lifecycle, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+					return
+				}
+				if closeErr != nil {
+					releaseFileViewDownloadPreparationFailure(lifecycle, closeErr)
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 					return
 				}
 			}
 		}
 
-		previewData, err := extractIWorkPreviewPDF(content.Bytes(), h.config.FileView.MaxIWorkPreviewBytes)
+		if err := ctx.Err(); err != nil {
+			releaseFileViewDownloadPreparationFailure(lifecycle, err)
+			respondFileViewDownloadAdmissionFailure(c, fmt.Errorf("iWork preview preparation: %w", err))
+			return
+		}
+		previewData, err := extractIWorkPreviewPDFContext(ctx, content.Bytes(), h.config.FileView.MaxIWorkPreviewBytes)
 		if err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle)
+			releaseFileViewDownloadPreparationFailure(lifecycle, err)
 			log.Printf("[ServeRawFile] Failed to extract iWork preview: %v", err)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				respondFileViewDownloadAdmissionFailure(c, fmt.Errorf("iWork preview preparation: %w", err))
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "no preview available for this file"})
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			releaseFileViewDownloadPreparationFailure(lifecycle, err)
+			respondFileViewDownloadAdmissionFailure(c, fmt.Errorf("iWork preview preparation: %w", err))
 			return
 		}
 		previewMIME := "application/pdf"
@@ -761,14 +795,14 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	// stale SHA-1 can never truncate the response mid-stream.
 	resolvedIDs, err := streaming.BatchResolveBlockIDsContext(ctx, h.db, orgID, representationID, blockIDs)
 	if err != nil {
-		releaseFileViewDownloadPreparationFailure(lifecycle)
+		releaseFileViewDownloadPreparationFailure(lifecycle, err)
 		log.Printf("[ServeRawFile] block ID resolution failed for org=%s: %v", orgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
 	}
 	canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, orgID, resolvedIDs, blockStore, blockStoreClass)
 	if err != nil {
-		releaseFileViewDownloadPreparationFailure(lifecycle)
+		releaseFileViewDownloadPreparationFailure(lifecycle, err)
 		log.Printf("[ServeRawFile] canonical block reader construction failed for org=%s: %v", orgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
@@ -786,7 +820,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	if isVideoFile(ext) || isAudioFile(ext) {
 		blockSizes, err := streaming.QueryBlockSizes(ctx, h.db, orgID, canonicalReader, resolvedIDs)
 		if err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle)
+			releaseFileViewDownloadPreparationFailure(lifecycle, err)
 			log.Printf("[ServeRawFile] Failed to query block sizes: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file metadata"})
 			return
@@ -933,9 +967,22 @@ func isAppleIWorkFile(ext string) bool {
 // iWork files (.pages, .numbers, .key) are ZIP archives containing preview images.
 // Older versions (pre-2013) use QuickLook/Preview.pdf, modern versions use preview.jpg.
 func extractIWorkPreviewPDF(data []byte, maxPreviewSize int64) ([]byte, error) {
+	return extractIWorkPreviewPDFContext(context.Background(), data, maxPreviewSize)
+}
+
+func extractIWorkPreviewPDFContext(ctx context.Context, data []byte, maxPreviewSize int64) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return nil, fmt.Errorf("not a valid zip archive: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Known preview file locations in order of preference (best quality first)
@@ -951,23 +998,35 @@ func extractIWorkPreviewPDF(data []byte, maxPreviewSize int64) ([]byte, error) {
 		"QuickLook/Thumbnail.png",
 	}
 	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		for _, f := range reader.File {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if strings.EqualFold(f.Name, candidate) {
-				return readZipEntry(f, maxPreviewSize)
+				return readZipEntryContext(ctx, f, maxPreviewSize)
 			}
 		}
 	}
 
 	// Fallback: find any PDF in the archive
 	for _, f := range reader.File {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if strings.HasSuffix(strings.ToLower(f.Name), ".pdf") {
-			return readZipEntry(f, maxPreviewSize)
+			return readZipEntryContext(ctx, f, maxPreviewSize)
 		}
 	}
 
 	// Log all files in the archive for debugging
 	var names []string
 	for _, f := range reader.File {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		names = append(names, f.Name)
 	}
 	return nil, fmt.Errorf("no preview found in iWork archive (files: %v)", names)
@@ -1009,6 +1068,16 @@ func isAudioFile(ext string) bool {
 }
 
 func readZipEntry(f *zip.File, maxSize int64) ([]byte, error) {
+	return readZipEntryContext(context.Background(), f, maxSize)
+}
+
+func readZipEntryContext(ctx context.Context, f *zip.File, maxSize int64) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.UncompressedSize64 > uint64(maxSize) {
 		return nil, fmt.Errorf("entry %s too large: %d bytes (max %d)", f.Name, f.UncompressedSize64, maxSize)
 	}
@@ -1017,14 +1086,66 @@ func readZipEntry(f *zip.File, maxSize int64) ([]byte, error) {
 		return nil, fmt.Errorf("failed to open %s: %w", f.Name, err)
 	}
 	defer rc.Close()
-	data, err := io.ReadAll(io.LimitReader(rc, maxSize+1))
+	var data bytes.Buffer
+	buf := make([]byte, 32*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		n, readErr := rc.Read(buf)
+		if n > 0 {
+			if int64(data.Len())+int64(n) > maxSize {
+				return nil, fmt.Errorf("entry %s exceeds max preview size", f.Name)
+			}
+			_, _ = data.Write(buf[:n])
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("failed to read %s: %w", f.Name, readErr)
+		}
+	}
+	return data.Bytes(), nil
+}
+
+func copyContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	buf := make([]byte, 32*1024)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			written, writeErr := dst.Write(buf[:n])
+			total += int64(written)
+			if writeErr != nil {
+				return total, writeErr
+			}
+			if written != n {
+				return total, io.ErrShortWrite
+			}
+		}
+		if readErr == io.EOF {
+			return total, nil
+		}
+		if readErr != nil {
+			return total, readErr
+		}
+	}
+}
+
+func readAllContext(ctx context.Context, src io.Reader) ([]byte, error) {
+	var data bytes.Buffer
+	_, err := copyContext(ctx, &data, src)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", f.Name, err)
+		return nil, err
 	}
-	if int64(len(data)) > maxSize {
-		return nil, fmt.Errorf("entry %s exceeds max preview size", f.Name)
-	}
-	return data, nil
+	return data.Bytes(), nil
 }
 
 // DownloadHistoricFile serves a file at a specific revision by its FS object ID.
@@ -1101,7 +1222,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 		SELECT block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, repoID, objID).WithContext(ctx).Scan(&blockIDs)
 	if err != nil {
-		releaseFileViewDownloadPreparationFailure(lifecycle)
+		releaseFileViewDownloadPreparationFailure(lifecycle, err)
 		log.Printf("[DownloadHistoricFile] FS object not found: repo=%s obj=%s err=%v", repoID, objID, err)
 		redirectToFrontendErrorPage(c, http.StatusNotFound, "Not Found", "The requested file revision could not be found.")
 		return
@@ -1109,7 +1230,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 
 	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequestContext(ctx, c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
-		releaseFileViewDownloadPreparationFailure(lifecycle)
+		releaseFileViewDownloadPreparationFailure(lifecycle, err)
 		log.Printf("[DownloadHistoricFile] Block store not available: %v", err)
 		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Block storage not available.")
 		return
@@ -1118,7 +1239,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	if streaming.ContainsLegacySHA1(blockIDs) {
 		representationID, err = db.ResolveBlockRepresentationIDContext(ctx, h.db.Session(), orgID, repoID)
 		if err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle)
+			releaseFileViewDownloadPreparationFailure(lifecycle, err)
 			log.Printf("[DownloadHistoricFile] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
 			redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Could not read the requested file revision.")
 			return
@@ -1129,14 +1250,14 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	// clean instead of truncating the stream mid-download.
 	resolvedIDs, err := streaming.BatchResolveBlockIDsContext(ctx, h.db, orgID, representationID, blockIDs)
 	if err != nil {
-		releaseFileViewDownloadPreparationFailure(lifecycle)
+		releaseFileViewDownloadPreparationFailure(lifecycle, err)
 		log.Printf("[DownloadHistoricFile] block ID resolution failed for org=%s: %v", orgID, err)
 		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Could not read the requested file revision.")
 		return
 	}
 	canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, orgID, resolvedIDs, blockStore, blockStoreClass)
 	if err != nil {
-		releaseFileViewDownloadPreparationFailure(lifecycle)
+		releaseFileViewDownloadPreparationFailure(lifecycle, err)
 		log.Printf("[DownloadHistoricFile] canonical block reader construction failed for org=%s: %v", orgID, err)
 		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Could not read the requested file revision.")
 		return
@@ -1314,7 +1435,7 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 
 	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequestContext(ctx, c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
-		releaseFileViewDownloadPreparationFailure(lifecycle)
+		releaseFileViewDownloadPreparationFailure(lifecycle, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
 	}
@@ -1325,7 +1446,7 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	if streaming.ContainsLegacySHA1(blockIDs) {
 		representationID, err = db.ResolveBlockRepresentationIDContext(ctx, h.db.Session(), orgID, repoID)
 		if err != nil {
-			releaseFileViewDownloadPreparationFailure(lifecycle)
+			releaseFileViewDownloadPreparationFailure(lifecycle, err)
 			log.Printf("[ServeHistoricFileRaw] failed to resolve block representation for org=%s repo=%s: %v", orgID, repoID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 			return
@@ -1336,14 +1457,14 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	// clean instead of truncating the stream mid-download.
 	resolvedIDs, err := streaming.BatchResolveBlockIDsContext(ctx, h.db, orgID, representationID, blockIDs)
 	if err != nil {
-		releaseFileViewDownloadPreparationFailure(lifecycle)
+		releaseFileViewDownloadPreparationFailure(lifecycle, err)
 		log.Printf("[ServeHistoricFileRaw] block ID resolution failed for org=%s: %v", orgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
 	}
 	canonicalReader, err := streaming.NewCanonicalBlockReader(ctx, h.db, h.storageManager, orgID, resolvedIDs, blockStore, blockStoreClass)
 	if err != nil {
-		releaseFileViewDownloadPreparationFailure(lifecycle)
+		releaseFileViewDownloadPreparationFailure(lifecycle, err)
 		log.Printf("[ServeHistoricFileRaw] canonical block reader construction failed for org=%s: %v", orgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
