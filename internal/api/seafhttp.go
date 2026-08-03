@@ -3785,21 +3785,6 @@ var recordSeafHTTPDownloadTrafficFn = func(status traffic.QuotaStatus, orgID, us
 	}
 }
 
-// responseBytesSince normalizes Gin's -1 sentinel for an unwritten response.
-func responseBytesSince(c *gin.Context, before int64) int64 {
-	if c == nil || c.Writer == nil {
-		return 0
-	}
-	if before < 0 {
-		before = 0
-	}
-	after := int64(c.Writer.Size())
-	if after < before {
-		return 0
-	}
-	return after - before
-}
-
 func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	tokenStr := c.Param("token")
 	requestedPath := c.Param("filepath")
@@ -4132,7 +4117,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	// after a partial response has already reached the client.
 	bytesBefore := int64(c.Writer.Size())
 	streamErr := streaming.StreamBlocks(c, streamCtx, canonicalReader, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks")
-	bytesWritten := responseBytesSince(c, bytesBefore)
+	bytesWritten := httputil.ResponseBytesSince(c.Writer, bytesBefore)
 	if bytesWritten > 0 {
 		tt := traffic.WebDownload
 		if token.Source == "link" {
@@ -4776,17 +4761,25 @@ func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter 
 		log.Printf("[HandleZipDownload] ZIP close panicked: %v", closePanic)
 	}
 	claimSeafHTTPZipCause(lifecycle, finalCause)
+	var accountingPanic any
 	if accounting != nil && accounting.active {
-		bytesWritten := responseBytesSince(accounting.context, accounting.bytesBefore)
+		bytesWritten := httputil.ResponseBytesSince(accounting.context.Writer, accounting.bytesBefore)
 		if bytesWritten > 0 {
-			recordSeafHTTPDownloadTrafficFn(
-				accounting.quotaStatus,
-				accounting.orgID,
-				accounting.userID,
-				accounting.trafficType,
-				bytesWritten,
-			)
+			func() {
+				defer func() { accountingPanic = recover() }()
+				recordSeafHTTPDownloadTrafficFn(
+					accounting.quotaStatus,
+					accounting.orgID,
+					accounting.userID,
+					accounting.trafficType,
+					bytesWritten,
+				)
+			}()
 		}
+	}
+	if accountingPanic != nil && finalCause == downloadadmission.ReleaseCompleted {
+		finalCause = downloadadmission.ReleasePanic
+		claimSeafHTTPZipCause(lifecycle, finalCause)
 	}
 	_ = lifecycle.Finish(finalCause)
 	if originalPanic != nil {
@@ -4794,6 +4787,9 @@ func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter 
 	}
 	if closePanic != nil {
 		panic(closePanic)
+	}
+	if accountingPanic != nil {
+		panic(accountingPanic)
 	}
 }
 

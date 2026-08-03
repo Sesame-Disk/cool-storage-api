@@ -30,7 +30,7 @@ func TestEncryptionGateRunsBeforeShortCircuitsAndWrites(t *testing.T) {
 		},
 		{
 			file: "sharelink_view.go", function: "handleShareLinkRaw",
-			gate: "libraryIsEncryptedContext", mustFollow: "setCacheHeaders",
+			gate: "libraryIsEncrypted", mustFollow: "setCacheHeaders",
 			why: "same ETag short circuit on the public share-link surface",
 		},
 		{

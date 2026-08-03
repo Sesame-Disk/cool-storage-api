@@ -548,7 +548,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	bytesBefore := int64(c.Writer.Size())
 	defer func() {
 		if rec := traffic.Get(); rec != nil {
-			sent := int64(c.Writer.Size()) - bytesBefore
+			sent := httputil.ResponseBytesSince(c.Writer, bytesBefore)
 			if sent > 0 {
 				traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, orgID, userID, traffic.WebDownload, sent)
 			}
@@ -1277,11 +1277,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 
 	// Record download traffic using actual bytes written.
 	if rec := traffic.Get(); rec != nil {
-		bytesAfter := int64(c.Writer.Size())
-		if bytesAfter < 0 {
-			bytesAfter = 0
-		}
-		if sent := bytesAfter - bytesBefore; sent > 0 {
+		if sent := httputil.ResponseBytesSince(c.Writer, bytesBefore); sent > 0 {
 			traffic.RecordCheckedTransfer(rec, historicDownloadStatus, orgID, userID, traffic.WebDownload, sent)
 		}
 	}
@@ -1356,7 +1352,7 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	bytesBefore := int64(c.Writer.Size())
 	defer func() {
 		if rec := traffic.Get(); rec != nil {
-			sent := int64(c.Writer.Size()) - bytesBefore
+			sent := httputil.ResponseBytesSince(c.Writer, bytesBefore)
 			if sent > 0 {
 				traffic.RecordCheckedTransfer(rec, rawDownloadStatus, orgID, userID, traffic.WebDownload, sent)
 			}

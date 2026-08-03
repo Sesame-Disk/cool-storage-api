@@ -195,6 +195,93 @@ func TestFinishSeafHTTPZipDownloadPreservesClosePanicCause(t *testing.T) {
 	}
 }
 
+func TestFinishSeafHTTPZipDownloadAccountingPanicReleasesLease(t *testing.T) {
+	lifecycle, coordinator, c := newZipAdmissionLifecycleWithWriter(t, nil)
+	oldRecord := recordSeafHTTPDownloadTrafficFn
+	recordSeafHTTPDownloadTrafficFn = func(traffic.QuotaStatus, string, string, string, int64) {
+		panic("traffic accounting panic")
+	}
+	t.Cleanup(func() { recordSeafHTTPDownloadTrafficFn = oldRecord })
+	accounting := &zipTrafficAccounting{
+		context:     c,
+		quotaStatus: traffic.QuotaStatus{PeriodStartedAt: time.Now()},
+		orgID:       "org-1",
+		userID:      "zip-user",
+		trafficType: traffic.WebDownload,
+		bytesBefore: int64(c.Writer.Size()),
+		active:      true,
+	}
+	zipWriter := zip.NewWriter(c.Writer)
+	cause := downloadadmission.ReleaseCompleted
+	beforePanic := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleasePanic)))
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		finishSeafHTTPZipDownload(lifecycle, &zipWriter, &cause, accounting)
+	}()
+	if recovered != "traffic accounting panic" {
+		t.Fatalf("recovered panic = %v, want traffic accounting panic", recovered)
+	}
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleasePanic))); got != beforePanic+1 {
+		t.Fatalf("panic release count = %v, want %v", got, beforePanic+1)
+	}
+
+	request, err := downloadadmission.NewAuthenticatedRequest(downloadadmission.ProfileFile, "org-1", "other-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	available, reason := coordinator.Acquire(context.Background(), request)
+	if available == nil || reason != "" {
+		t.Fatalf("acquire after accounting panic = (%v, %q), want admission", available, reason)
+	}
+	available.Release(downloadadmission.ReleaseCompleted)
+}
+
+func TestFinishSeafHTTPZipDownloadAccountingPanicPreservesBodyPanic(t *testing.T) {
+	lifecycle, coordinator, c := newZipAdmissionLifecycleWithWriter(t, nil)
+	oldRecord := recordSeafHTTPDownloadTrafficFn
+	recordSeafHTTPDownloadTrafficFn = func(traffic.QuotaStatus, string, string, string, int64) {
+		panic("traffic accounting panic")
+	}
+	t.Cleanup(func() { recordSeafHTTPDownloadTrafficFn = oldRecord })
+	accounting := &zipTrafficAccounting{
+		context:     c,
+		quotaStatus: traffic.QuotaStatus{PeriodStartedAt: time.Now()},
+		orgID:       "org-1",
+		userID:      "zip-user",
+		trafficType: traffic.WebDownload,
+		bytesBefore: int64(c.Writer.Size()),
+		active:      true,
+	}
+	zipWriter := zip.NewWriter(c.Writer)
+	cause := downloadadmission.ReleaseCompleted
+	beforePanic := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleasePanic)))
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		defer finishSeafHTTPZipDownload(lifecycle, &zipWriter, &cause, accounting)
+		panic("body panic")
+	}()
+	if recovered != "body panic" {
+		t.Fatalf("recovered panic = %v, want body panic", recovered)
+	}
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleasePanic))); got != beforePanic+1 {
+		t.Fatalf("panic release count = %v, want %v", got, beforePanic+1)
+	}
+
+	request, err := downloadadmission.NewAuthenticatedRequest(downloadadmission.ProfileFile, "org-1", "other-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	available, reason := coordinator.Acquire(context.Background(), request)
+	if available == nil || reason != "" {
+		t.Fatalf("acquire after body panic = (%v, %q), want admission", available, reason)
+	}
+	available.Release(downloadadmission.ReleaseCompleted)
+}
+
 type zipClosePanicWriter struct{}
 
 func (*zipClosePanicWriter) Write([]byte) (int, error) {

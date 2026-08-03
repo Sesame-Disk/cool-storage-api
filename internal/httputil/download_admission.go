@@ -277,7 +277,6 @@ func (l *DownloadAdmission) Finish(cause downloadadmission.ReleaseCause) error {
 // rather than the normal completed path.
 func (l *DownloadAdmission) FinishHandler() {
 	if recovered := recover(); recovered != nil {
-		l.Fail(downloadadmission.ReleasePanic)
 		_ = l.Finish(downloadadmission.ReleasePanic)
 		panic(recovered)
 	}
