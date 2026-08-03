@@ -2,13 +2,19 @@
 
 **Date:** 2026-08-01 (original contract freeze)  
 **Last updated:** 2026-08-03  
-**Branch:** `feat/b4-subcontract-d5-block-get-streaming`
-**Status:** D0-D5 are complete. D1 coordinator/configuration, D2 stable public
-download-token `SourceID` wiring, D3 writer lifetime/gzip-proxy reachability and
-D4 non-block producer wiring are merged in `main`; D5 streams
-`SyncHandler.GetBlock` through `CanonicalBlockReader` under `ProfileBlock` on
-the shared coordinator. Positive operating values and real-nginx evidence remain
-D6 work.
+**Branch:** `feat/b4-subcontract-d6-closure`
+**Status:** **D0-D6 are complete.** D1 supplied the coordinator, configuration
+and metrics; D2 the stable public download-token `SourceID`; D3 the writer
+lifetime and gzip/proxy reachability; D4 the non-block producers; D5 block GET
+streaming through `CanonicalBlockReader`. D6 measured the per-admission cost,
+selected and shipped the operating values, turned the section on, and produced
+the client, proxy and saturation evidence the closure criteria require. See
+**D6 Evidence** below for the measured figures and where each criterion is
+demonstrated.
+
+Two findings remain open and are explicitly **not** closed by D:
+`ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` (§13) and
+`ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01`, now quantified rather than deferred.
 
 This document freezes the contract and inventory for subcontract D of
 `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`. It is the design record for the D1-D6
@@ -45,13 +51,14 @@ unit/race-test coverage. It intentionally does not call the coordinator from a
 download producer, mint or propagate public-link source IDs, install response
 deadlines, or select positive capacity values. Those are D2-D6 deliverables.
 
-The repository templates remain safe during this staged rollout: every
-`download_admission` block is present with `enabled: false` and zero values.
-D6, not D1, is the first phase allowed to replace those placeholders with
-measured positive defaults. Enabling the section before producer wiring was an
-unsupported deployment configuration rather than a configuration error. D1-D5
-now connect every listed producer, including block GET; D6 still supplies the
-capacity evidence required before production enablement.
+The repository templates stayed safe during the staged rollout: every
+`download_admission` block shipped with `enabled: false` and zero values, and
+enabling the section before producer wiring was an unsupported deployment
+configuration rather than a configuration error. D6, as reserved here, is the
+phase that replaced those placeholders with measured defaults and turned the
+section on — see **D6 Evidence**. The zero-value templates are therefore history
+rather than current state; `TestShippedConfigs*` now enforce the opposite, since
+a bound that is never enabled protects nothing.
 
 ### D coordinator ownership
 
@@ -760,7 +767,24 @@ quota or organization-level quota.
 Existing paths differ in byte accounting: some record declared file size, some
 record writer deltas, and some omit partial failures. D6 must document these
 residuals and ensure tests do not claim exact delivered-byte accounting merely
-because admission was added. The exception is the block GET path: D5 must not
+because admission was added.
+
+**D6 residual survey.** Every streaming producer now records a writer delta
+rather than a declared size, so a partial transfer bills what reached the client:
+`streamFileFromBlocks` and the ZIP path through `recordSeafHTTPDownloadTrafficFn`,
+`SyncHandler.GetBlock` through `recordSyncBlockDownloadTrafficFn`, and the
+`FileView` raw/historic and share-raw paths through their own `sent` counters.
+One residual remains and is **not** closed by D:
+
+> `link_inline` is admitted but not billed. `readFileContentAsText` and the
+> bootstrap responses that carry its output do not call
+> `traffic.RecordCheckedTransfer`, so inline content — up to the 1 MB limit per
+> request — passes through admission without appearing in traffic accounting.
+
+That is a product decision about whether anonymous inline reads consume owner or
+organization quota, not a D correctness gap, and §11 reserves it: changing it
+requires its own explicit product and issue decision. It is recorded here so no
+one later reads "every D producer is admitted" as "every D producer is billed". The exception is the block GET path: D5 must not
 introduce a regression from its current exact completed-block accounting to
 nominal-size accounting. The broader `StreamBlocks` false-success and
 over-counting issue is already tracked as `ISSUE-STREAMBLOCKS-VOID-01`.
@@ -996,6 +1020,69 @@ the object-storage issue remains independently open. The overall production
 verdict stays no-go while the object-storage issue is open, and production
 readiness must not be described as enabled while that bypass is unresolved.
 
+## D6 Evidence
+
+### Measured per-admission cost
+
+The caps divide a stated **2 GiB per-node budget** by measured cost, not by
+estimate. Both benchmarks are in the tree so the figures can be re-derived.
+
+| Producer shape | Measured peak per admission | Benchmark |
+|---|---|---|
+| Plaintext streaming (`file`, `block`, `raw`, `history`, `link_raw`) | **4.0 MiB**, independent of file size | `BenchmarkDownloadStreamMemory/plaintext` |
+| Encrypted streaming | **36.0 MiB** at the 8 MiB system block size | `BenchmarkDownloadStreamMemory/encrypted` |
+| `raw` iWork preview, 32 MiB source cap | **~192 MiB** encrypted, ~128 MiB plaintext | `BenchmarkIWorkPreviewMemory` |
+
+Two results drove decisions rather than merely being recorded.
+
+Encrypted streaming does not stream inside the prefetch: `PrefetchBlock` calls
+`GetBlock` and `DecryptLibraryBlock`, so an admitted transfer holds the decrypted
+current block, the decrypted next block and their encrypted sources at once. At
+4.5× the block size it is nine times the plaintext cost, and it is what
+`max_active_per_node` actually divides into.
+
+The iWork preview is not a stream at all, and its peak is ~4× the source
+plaintext and ~6× encrypted — a 256 MiB document measured at 1.5 GiB. Against the
+general 1 GiB `max_preview_bytes`, one request could touch six. §6 anticipated
+this and named the cheaper lever, which is what was taken: a `FileView` iWork
+**source** cap of 32 MiB, which touches neither the frozen profile enum, the §12
+schema nor the metric label set. Sizing `max_active_raw` for iWork instead would
+have throttled ordinary raw streams — 4 MiB each — by two orders of magnitude.
+
+Worst case under the shipped caps: `6 × 192 MiB + 18 × 36 MiB ≈ 1.78 GiB`.
+
+### Where each criterion is demonstrated
+
+| # | Evidence |
+|---|---|
+| 1 | Producer inventory in §1; non-producers regressed in D4; `link_inline` billing residual recorded in §11 |
+| 2 | `internal/downloadadmission` atomicity tests (D1) |
+| 3 | `TestDownloadAdmissionSaturationHoldsOneNodeCeiling` — `raw` and `file` live simultaneously inside one aggregate |
+| 4 | `TestDownloadAdmissionFairnessIsolatesLinkAndOwner` — both directions, each gated on the other side genuinely refusing first |
+| 5 | Same saturation drill drains to zero; `TestDownloadAdmissionDrainsIdentityStateAfterChurn` over 200 transfers |
+| 6 | D4/D5 placement regressions, including ZIP held through `Close()` |
+| 7 | D3/D5 lifetime tests plus `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01`, which closed the last unbounded phase |
+| 8 | Saturation drill asserts `503` with a valid `Retry-After`; byte integrity in `TestDownloadAdmissionThroughProxyDeliversCompleteBytes` |
+| 9 | D5 canonical-reader streaming with authoritative size |
+| 10 | `TestDownloadAdmissionThroughProxyReleasesStalledClient` — a stalled client through the **real frontend nginx** holds its slot and is released at 1m0s, matching `idle_write_timeout` rather than nginx's 3600s `proxy_read_timeout` |
+| 11 | `scripts/fault-inject-download-admission.sh` — real `seaf-cli` refused 31 times, still reached `synchronized`, pulled every file, drained every slot |
+| 12 | Measurements above; egress measured at 356 MiB/s single and 1699 MiB/s aggregate six-way (**4.9×**), which is the byte-rate residual stated with a number |
+| 13 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` remains open and is not treated as closed by D |
+| 14 | `TestShippedConfigs*` load every shipped configuration through the real validator; invariants asserted on a busy node in the saturation drill |
+
+### What the measurements are not
+
+They come from a container stack on developer hardware. The **memory** figures
+are properties of the code — buffer sizes, block sizes and copy counts — so they
+transfer. The **throughput** figures do not: 356 MiB/s single-transfer is a
+loopback number, and production egress must be re-measured on the real network
+before the concurrency cap is read as an egress ceiling. The relationship the
+residual depends on — aggregate scaling with concurrency because nothing shapes
+byte rate — is what holds regardless of hardware.
+
+Capacities are also **process-local**. Fleet capacity is these numbers times the
+node count; none of this is a cluster-global quota.
+
 ## Closure Criteria
 
 D is not closed until all criteria below have evidence in code, focused tests
@@ -1034,7 +1121,7 @@ deployment for token issuance.
 | D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Merged in `main`; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
 | D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | Complete: one bootstrapped coordinator covers all listed non-block producers through preparation and response lifetime |
 | D5 | Stream sync block GET through existing canonical reader APIs | Complete: `SyncHandler.GetBlock` uses `GetBlockSize`/`GetBlockReader` under `ProfileBlock` on the shared coordinator; neither the canonical nor the legacy no-metadata path materializes the whole block; traffic uses bytes written |
-| D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass. Its prerequisite `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` closed 2026-08-03: the idle interval now opens at the streaming phase change, so no phase of an admitted download is unbounded |
+| D6 | Fault evidence, client recovery, measurements and final closure docs | **Complete.** Per-admission cost measured, capacities selected against a stated 2 GiB budget and shipped in every config, the section enabled, and the client/proxy/saturation evidence produced. See **D6 Evidence** above |
 
 The B/C `syncAdmissionLimiter` remains in `internal/api` during this series.
 Its white-box tests inspect unexported state, so extracting it to

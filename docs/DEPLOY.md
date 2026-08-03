@@ -107,33 +107,41 @@ Why this is the supported deploy model:
 
 If you use a different proxy chain and do not preserve the canonicalized client IP at the last nginx hop, adjust `SERVER_TRUSTED_PROXIES` for that topology instead.
 
-### Download admission (D1-D5)
+### Download admission (D0-D6, enabled)
 
-D1 adds the process-local coordinator, bounded state, configuration schema and
-Prometheus series for storage-backed downloads. D2 makes the public download-
-link token contract strict: every newly minted link token carries the stable
-source identity derived from the share-link token, and remints preserve it. D2
-does not wire any admission producer route yet, and it does not choose measured
-operating capacity. Every shipped YAML and env template therefore keeps
-`download_admission.enabled=false` and all D1 values at zero.
+Download admission is **on by default**. It bounds how many storage-backed
+transfers a node accepts at once across every producer — seafhttp file and ZIP,
+authenticated raw and history, public share raw, inline share text and sync block
+GET — through one process-local coordinator.
 
-D3 adds the reusable idle-write writer and makes the actual raw/history, share
-raw and public bootstrap paths bypass the Go gzip wrapper. The supported frontend
-nginx configuration disables both proxy buffering and gzip for all protected
-transfer locations, including `/seafhttp/`. D4 wires the single bootstrapped
-coordinator, preparation context and idle-write lifecycle into file, ZIP, raw,
-history, share-raw and inline-text producers. D5 streams authenticated
-`GET /seafhttp/repo/:repo_id/block/:block_id` through
-`CanonicalBlockReader.GetBlockSize`/`GetBlockReader` under `ProfileBlock` on that
-same coordinator. D6 must still measure positive capacities and prove end-to-end
-slow-client behavior through the deployed nginx topology.
-`ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` closed on 2026-08-03: the idle
-interval now opens when a request enters streaming rather than at its first byte,
-so a stalled first storage read is cancelled by `idle_write_timeout` instead of
-holding its slot until the client disconnects or the object-store SDK gives up.
+The shipped capacities are measured, not guessed. D6 benchmarked the heap a
+single admitted transfer holds and divided a stated **2 GiB per-node budget**:
 
-Do not enable this section in production before D6 measurement.
-When D6 selects positive values, the following startup rules still apply:
+| Transfer shape | Measured peak per admission |
+|---|---|
+| Plaintext stream (any size) | 4.0 MiB |
+| Encrypted stream | 36.0 MiB at the 8 MiB block size |
+| `raw` iWork preview, 32 MiB source cap | ~192 MiB |
+
+Encrypted transfers cost nine times a plaintext one because the prefetch reads
+and decrypts whole blocks rather than streaming them, so an admitted transfer
+holds the current and next decrypted block at once. The iWork preview buffers the
+entire source document, which is why `file_view.max_iwork_source_bytes` caps it
+at 32 MiB separately from the 1 GiB general preview limit — without that cap a
+single request could touch several gigabytes.
+
+Worst case under the shipped caps is `6 x 192 MiB + 18 x 36 MiB` = 1.78 GiB.
+**If you raise `max_active_per_node`, `max_active_raw` or
+`max_iwork_source_bytes`, redo that arithmetic against your own memory budget.**
+
+Refused transfers answer `503` with `Retry-After`; real `seaf-cli` was refused 31
+times in the closure drill and still completed its sync. A client that stops
+reading is released on `idle_write_timeout` — verified through the supported
+nginx, where `proxy_buffering off` and `gzip off` on the transfer locations are
+what let the application see a slow client at all rather than the proxy absorbing
+it.
+
+These startup rules apply:
 
 - `max_active_per_node`, every identity cap, `preparation_deadline`, `idle_write_timeout` and `retry_after` must be positive.
 - `admission_wait` and both waiter caps may be zero; zero means refuse immediately rather than queue.
@@ -1011,11 +1019,11 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `SEAFHTTP_UPLOAD_LINK_SOURCE_WRITE_BURST` | `seafhttp.upload_link_source_write_burst` | Burst for the per-link bound. Default `24000`. Must be `> 0` while that rate is non-zero. |
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE` | `seafhttp.upload_link_max_inflight_per_source` | Non-blocking concurrent anonymous-write cap per stable public-link identity on one process. Default `16`; ceiling `4096`; `0` disables. Remints share the same source count. When both in-flight caps are enabled, this value must not exceed the per-node value. |
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE` | `seafhttp.upload_link_max_inflight_per_node` | Non-blocking concurrent anonymous-write cap across one process/node. Default `128`; ceiling `65536`; `0` disables. This is not cluster-global; aggregate fleet capacity scales with node count. |
-| `DOWNLOAD_ADMISSION_ENABLED` | `download_admission.enabled` | D1 schema only. Keep `false` until D6 measurement is complete (D1-D5 producer wiring is present). |
-| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE` | `download_admission.max_active_per_node` | D6-selected process-local aggregate download cap. D1 template value is `0`; validation ceiling `1024`. |
-| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER` | `download_admission.max_active_per_auth_user` | Authenticated `(org, user)` cap. D1 template value is `0`; validation ceiling `1024`. |
-| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE` | `download_admission.max_active_per_link_source` | Stable public-link source cap. D1 template value is `0`; validation ceiling `1024`. |
-| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_CLIENT_LINK` | `download_admission.max_active_per_client_link` | Stable public-link plus trusted client-IP cap. D1 template value is `0`; validation ceiling `1024`. |
+| `DOWNLOAD_ADMISSION_ENABLED` | `download_admission.enabled` | Ships `true`. Disabling it removes the only aggregate bound on storage-backed downloads. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE` | `download_admission.max_active_per_node` | D6-selected process-local aggregate download cap. Shipped value is measured; validation ceiling `1024`. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER` | `download_admission.max_active_per_auth_user` | Authenticated `(org, user)` cap. Shipped value is measured; validation ceiling `1024`. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE` | `download_admission.max_active_per_link_source` | Stable public-link source cap. Shipped value is measured; validation ceiling `1024`. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_CLIENT_LINK` | `download_admission.max_active_per_client_link` | Stable public-link plus trusted client-IP cap. Shipped value is measured; validation ceiling `1024`. |
 | `DOWNLOAD_ADMISSION_MAX_WAITERS_PER_IDENTITY` | `download_admission.max_waiters_per_identity` | Parked requests per identity. `0` refuses immediately; validation ceiling `1024`. |
 | `DOWNLOAD_ADMISSION_MAX_WAITERS_PER_NODE` | `download_admission.max_waiters_per_node` | Parked requests per process. `0` refuses immediately; validation ceiling `4096`. |
 | `DOWNLOAD_ADMISSION_ADMISSION_WAIT` | `download_admission.admission_wait` | Queue duration before `503 + Retry-After`. D1 template value is `0s`; maximum `5m`. |
