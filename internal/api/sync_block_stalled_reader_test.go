@@ -167,10 +167,10 @@ func TestSyncBlockDownloadAdmissionIdleTimeoutBoundsStalledReaderOpen(t *testing
 		h.GetBlock(gc)
 	})
 
+	w := httptest.NewRecorder()
 	handlerReturned := make(chan struct{})
 	go func() {
 		defer close(handlerReturned)
-		w := httptest.NewRecorder()
 		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo/block/"+blockID, nil))
 	}()
 
@@ -206,5 +206,19 @@ func TestSyncBlockDownloadAdmissionIdleTimeoutBoundsStalledReaderOpen(t *testing
 	}
 	if got := testutil.ToFloat64(metrics.DownloadAdmissionDeadlineExpiredTotal.WithLabelValues(string(downloadadmission.DeadlineIdleWrite))); got != beforeExpired+1 {
 		t.Fatalf("idle_write deadline expiries = %v, want exactly one more than %v", got, beforeExpired)
+	}
+
+	// The failed writer rejects the producer's own error response, so without a
+	// pre-header failure path Gin commits its default 200 with an empty body —
+	// which seaf-cli cannot tell apart from a legitimately empty block that
+	// downloaded fine. A timeout has to stay retryable.
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; a timed-out block must not look like an empty success", w.Code)
+	}
+	if got := w.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("body = %q, want empty; nothing may be appended once the writer failed", w.Body.String())
 	}
 }

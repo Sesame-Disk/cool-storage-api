@@ -646,9 +646,12 @@ Three deadlines are independent:
 2. **Preparation deadline:** time allowed after admission for metadata, mappings,
    canonical-reader construction and initial storage work, including inline
    text. Its context reaches Cassandra and S3.
-3. **Idle-write timeout:** maximum interval without successful response progress
-   once output starts. The maximum is measured from the last successful progress,
-   not from the start of a subsequent write.
+3. **Idle-write timeout:** maximum interval without successful response
+   progress, opened when the request enters streaming rather than when output
+   starts, so the first storage read is covered too. After the first progress the
+   maximum is measured from the last successful progress, not from the start of a
+   subsequent write. A transfer that dies before committing any output answers
+   `503` with `Retry-After` instead of Gin's default `200`.
 
 The preparation context is cancelled or replaced when streaming starts; it must
 not accidentally become a total download timeout. `readFileContentAsText` keeps

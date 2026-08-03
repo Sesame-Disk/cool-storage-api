@@ -5932,6 +5932,32 @@ cancels `streamCtx`, but the lease is released only when the producer's deferred
 `Finish` runs. Freeing capacity from the timeout callback while the cancelled
 read is still executing would let the coordinator admit past its real ceiling.
 
+Bounding the phase exposed a terminal state that did not exist while it hung, and
+closing it is part of this fix. A failed writer rejects **every** later write,
+including the producer's own pre-header error, so `c.JSON(500)` on the D5 path
+and `respondSeafHTTPDownloadError` on the D4 path both wrote nothing and Gin
+committed its default `200` through the underlying writer — bypassing the
+wrapper. The client saw a timed-out download as an **empty file that transferred
+successfully**, and on block GET that is indistinguishable from a legitimately
+empty block, turning a retryable timeout into silent corruption. `Finish` now
+answers `503` with `Retry-After` when the transfer ends on a non-`completed`
+cause having committed no output. `503` rather than `500` because this is
+transient unavailability under the same retryable contract B and C proved against
+real `seaf-cli`; `completed`, `client_disconnect` and `panic` are excluded, the
+last so Gin's recovery keeps owning its `500`. Nothing is written once any output
+exists, so a failure after headers still stops the stream instead of appending to
+it.
+
+One classification race is closed with it. `expire()` commits the writer to
+failed under the writer's own mutex, releases it, and only then calls back to
+claim the terminal cause on the lifecycle. A handler finishing inside that
+handoff could claim `completed` first and record a killed transfer as a clean
+one. `finishCause` now consults the writer's terminal error before accepting
+`completed`. The lock order is safe in one direction only, and it holds: no
+writer path holds its own mutex while calling into the lifecycle — `expire`,
+`fail`, `beforeWrite`, `progress` and `Finish` all release it before notifying —
+so `l.mu` then `w.mu` never inverts.
+
 Coverage: writer-level regressions for arming without output, idempotent arming,
 deferred-header preservation before and after arming, first progress replacing
 the initial interval, `Finish` clearing both timer and deadline, and expiry with
@@ -5940,9 +5966,12 @@ and a blocked first prefetch (D4), each proving cancellation in bounded time, th
 lease still held while the cancelled work runs, exactly one `idle_write_timeout`
 release afterwards, nothing counted as `completed`, and `active_current == 0`;
 plus fast-failure cases proving a reader open that fails quickly still answers
-`404`/`500`, since arming must not commit headers. Removing either rule fails its
-regression, mutation-verified — and the D4 producer test fails on rule 2 alone,
-which is the evidence that arming by itself would not have closed the gap.
+`404`/`500`, since arming must not commit headers; both producer regressions also
+assert the `503` and its `Retry-After`, and lifecycle tests cover the committed-
+response case being left alone and `completed` losing to a failed writer.
+Removing any of the three behaviours fails its regression, mutation-verified —
+and the D4 producer test fails on rule 2 alone, which is the evidence that arming
+by itself would not have closed the gap.
 
 **Why this was not a merge blocker for D5**: D5 reproduced D4's shape rather than
 introducing a new gap, `download_admission.enabled` is `false` in every shipped

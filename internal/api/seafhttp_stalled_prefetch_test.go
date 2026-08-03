@@ -75,7 +75,7 @@ func TestStreamBlocksStalledFirstPrefetchIsBoundedByIdleInterval(t *testing.T) {
 
 	baseRecorder := httptest.NewRecorder()
 	baseContext, _ := gin.CreateTestContext(baseRecorder)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c := baseContext
 	c.Writer = &stalledPrefetchWriter{ResponseWriter: baseContext.Writer}
 	c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/files/token/name.bin", nil)
 
@@ -151,5 +151,18 @@ func TestStreamBlocksStalledFirstPrefetchIsBoundedByIdleInterval(t *testing.T) {
 	// Finish was asked for `completed`, but the timeout claimed first and wins.
 	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseCompleted))); got != beforeCompleted {
 		t.Fatalf("completed releases = %v, want unchanged %v; the first cause must win", got, beforeCompleted)
+	}
+
+	// D4 records the 200 before entering StreamBlocks, so without a pre-header
+	// failure path a timed-out file download would reach the client as a
+	// successful empty file rather than a retryable error.
+	if baseRecorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; a timed-out download must not look like an empty success", baseRecorder.Code)
+	}
+	if got := baseRecorder.Header().Get("Retry-After"); got == "" {
+		t.Fatal("timed-out download has no Retry-After")
+	}
+	if baseRecorder.Body.Len() != 0 {
+		t.Fatalf("body = %q, want empty", baseRecorder.Body.String())
 	}
 }

@@ -3,6 +3,7 @@ package httputil
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -30,6 +31,7 @@ type DownloadAdmission struct {
 	parent     context.Context
 	lease      *downloadadmission.Lease
 	idleWrite  time.Duration
+	retryAfter int
 
 	mu              sync.Mutex
 	terminal        bool
@@ -70,6 +72,7 @@ func AcquireDownloadAdmission(c *gin.Context, coordinator *downloadadmission.Coo
 		enabled:       cfg.Enabled,
 		parent:        parent,
 		idleWrite:     cfg.IdleWriteTimeout,
+		retryAfter:    retryAfterSeconds(cfg.RetryAfter),
 		preparation:   parent,
 		prepareCancel: func() {},
 	}
@@ -299,7 +302,60 @@ func (l *DownloadAdmission) Finish(cause downloadadmission.ReleaseCause) error {
 		l.finishCause(cause)
 	}
 	l.releaseLease()
+	l.writeUnstartedFailure()
 	return err
+}
+
+// writeUnstartedFailure answers a transfer that died before committing any
+// output. Once the writer has failed it rejects every subsequent write,
+// including the producer's own pre-header error, and Gin then commits its
+// default 200 through the underlying writer — so the client would read a
+// timed-out download as an empty file that transferred successfully. On block
+// GET that is indistinguishable from a legitimately empty block, which turns a
+// retryable timeout into silent corruption.
+//
+// 503 rather than 500: this is transient unavailability, and it is the same
+// retryable contract subcontracts B and C already proved against real seaf-cli.
+// Nothing is written once any output exists, so a failure after headers still
+// stops the stream rather than appending to it.
+func (l *DownloadAdmission) writeUnstartedFailure() {
+	l.mu.Lock()
+	cause := l.terminalCause
+	writer := l.originalWriter
+	retryAfter := l.retryAfter
+	l.mu.Unlock()
+
+	if writer == nil || writer.Written() {
+		return
+	}
+	switch cause {
+	case downloadadmission.ReleaseCompleted:
+		// Nothing failed; an empty body is the producer's own business.
+		return
+	case downloadadmission.ReleaseClientDisconnect:
+		// Nobody is listening.
+		return
+	case downloadadmission.ReleasePanic:
+		// Gin's recovery owns the response; overwriting it would turn a server
+		// bug into a retryable 503.
+		return
+	}
+
+	writer.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	writer.WriteHeader(http.StatusServiceUnavailable)
+	// Gin records the status and commits it later; a writer that already
+	// committed needs no second call, and forcing one would re-send a header.
+	if !writer.Written() {
+		writer.WriteHeaderNow()
+	}
+}
+
+func retryAfterSeconds(retryAfter time.Duration) int {
+	seconds := int(math.Ceil(retryAfter.Seconds()))
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 // FinishHandler is intended for defer immediately after successful admission.
@@ -355,6 +411,15 @@ func (l *DownloadAdmission) finishCause(cause downloadadmission.ReleaseCause) {
 			cause = downloadadmission.ReleaseClientDisconnect
 		} else if l.preparing && errors.Is(l.preparation.Err(), context.DeadlineExceeded) {
 			cause = downloadadmission.ReleasePreparationTimeout
+		} else if writerErr := l.writerErrLocked(); writerErr != nil {
+			// The writer commits to failed under its own mutex and only then
+			// calls back to claim the cause here. A handler finishing inside that
+			// window would otherwise record a killed transfer as completed.
+			if errors.Is(writerErr, ErrIdleWriteTimeout) {
+				cause = downloadadmission.ReleaseIdleWriteTimeout
+			} else {
+				cause = downloadadmission.ReleaseResponseError
+			}
 		}
 	}
 	state, failed := l.claimFailureLocked(cause)
@@ -423,6 +488,17 @@ func RenderDownloadAdmissionRefusal(c *gin.Context, coordinator *downloadadmissi
 
 func (l *DownloadAdmission) preparationDone() {
 	l.ReleasePreparationError(l.PreparationContext().Err())
+}
+
+// writerErrLocked reads the writer's terminal error while l.mu is held. The lock
+// order is safe in one direction only: no writer path holds its own mutex while
+// calling back into the lifecycle — expire, fail, beforeWrite, progress and
+// Finish all release it before notifying — so l.mu then w.mu never inverts.
+func (l *DownloadAdmission) writerErrLocked() error {
+	if l.writer == nil {
+		return nil
+	}
+	return l.writer.Err()
 }
 
 func (l *DownloadAdmission) claimFailureLocked(cause downloadadmission.ReleaseCause) (releaseState, bool) {
