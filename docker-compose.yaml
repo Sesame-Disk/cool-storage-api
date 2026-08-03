@@ -625,6 +625,43 @@ services:
     profiles:
       - test
 
+  # Fault injection for subcontract D: does real seaf-cli recover when download
+  # admission refuses its block GETs? B proved the 503 + Retry-After contract on
+  # the PUT side of the same route; criterion 11 needs it for the read side.
+  #
+  #   docker compose --profile test run --rm --build download-admission-fault-test
+  download-admission-fault-test:
+    build:
+      context: ./docker/seafile-cli
+      dockerfile: Dockerfile
+    entrypoint:
+      - /bin/bash
+      - -lc
+      # The repo is mounted from a Windows host in some setups, so the script is
+      # normalised before running rather than executed in place.
+      - >-
+        /workspace/scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs &&
+        sed 's/\r$//' /workspace/scripts/fault-inject-download-admission.sh > /tmp/fault-inject.sh &&
+        chmod +x /tmp/fault-inject.sh &&
+        /tmp/fault-inject.sh
+    environment:
+      - SESAMEFS_URL=http://sesamefs:8080
+      - SESAMEFS_URL_LOCAL=http://sesamefs:8080
+      - DEV_API_TOKEN=dev-token-admin
+      - DEV_PASSWORD=dev-token-123
+      - DEV_USER=00000000-0000-0000-0000-000000000001
+      - SYNC_DATA_DIR=/seafile-data
+      - SYNC_TEST_IN_CONTAINER=1
+      - HOLDER_COUNT=${DOWNLOAD_HOLDER_COUNT:-10}
+      - HOLDER_RATE=${DOWNLOAD_HOLDER_RATE:-2k}
+      - HOLDER_SECONDS=${DOWNLOAD_HOLDER_SECONDS:-45}
+    volumes:
+      - .:/workspace
+    depends_on:
+      - sesamefs
+    profiles:
+      - test
+
   # Fault injection for subcontract C / X11: same idea as the block drill above,
   # against the check-blocks route. It additionally reports the real client's
   # observed id cardinality, which is the evidence any future decision to lower
