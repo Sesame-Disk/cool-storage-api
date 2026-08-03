@@ -458,7 +458,12 @@ func TestExpiredWaiterIsNotAdmittedAfterHolderRelease(t *testing.T) {
 		result <- acquireOutcome{lease: lease, reason: reason}
 	}()
 	waitForWaiters(t, c, 1)
-	time.Sleep(cfg.AdmissionWait + 20*time.Millisecond)
+	// Wait for the waiter to actually leave the queue rather than sleeping past
+	// AdmissionWait. A context reports expiry only once its timer callback has
+	// run, so on a loaded machine the deadline can pass while waitCtx.Err() is
+	// still nil; the release would then legitimately grant the slot and this
+	// test would fail on a scheduling delay rather than on a real regression.
+	waitForWaiters(t, c, 0)
 	holder.Release(ReleaseCompleted)
 	select {
 	case outcome := <-result:

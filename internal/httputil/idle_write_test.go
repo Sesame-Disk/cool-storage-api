@@ -194,11 +194,15 @@ func TestIdleWriteWriterCancelsAfterIdlePeriod(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("idle timeout callback did not run")
 	}
+	if ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("idle timeout did not cancel the request context")
+		}
+	}
 	if !errors.Is(writer.Err(), ErrIdleWriteTimeout) {
 		t.Fatalf("writer error = %v, want idle timeout", writer.Err())
-	}
-	if ctx.Err() == nil {
-		t.Fatal("idle timeout did not cancel the request context")
 	}
 	if timeoutCalls.Load() != 1 {
 		t.Fatalf("timeout callback calls = %d, want 1", timeoutCalls.Load())

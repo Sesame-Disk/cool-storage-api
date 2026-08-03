@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -29,6 +30,16 @@ type LibraryState struct {
 // ReadLibraryState loads the canonical libraries row for a known org/library
 // pair, including deleted_at so callers can distinguish live vs soft-deleted.
 func ReadLibraryState(session *gocql.Session, orgID, libraryID string) (LibraryState, error) {
+	return ReadLibraryStateContext(context.Background(), session, orgID, libraryID)
+}
+
+// ReadLibraryStateContext is ReadLibraryState bound to ctx. Request-scoped
+// callers use it so metadata work stops when the client disconnects or its
+// preparation deadline expires.
+func ReadLibraryStateContext(ctx context.Context, session *gocql.Session, orgID, libraryID string) (LibraryState, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	state := LibraryState{
 		OrgID:     orgID,
 		LibraryID: libraryID,
@@ -39,7 +50,7 @@ func ReadLibraryState(session *gocql.Session, orgID, libraryID string) (LibraryS
 		SELECT owner_id, name, encrypted, block_representation_id, head_commit_id, storage_class, deleted_at
 		FROM libraries
 		WHERE org_id = ? AND library_id = ?
-	`, orgID, libraryID).Scan(
+	`, orgID, libraryID).WithContext(ctx).Scan(
 		&state.OwnerID,
 		&state.Name,
 		&state.Encrypted,
@@ -62,7 +73,12 @@ func ReadLibraryState(session *gocql.Session, orgID, libraryID string) (LibraryS
 // ReadLiveLibraryState returns the canonical library row only when the library
 // is still live. Soft-deleted libraries are reported via ErrLibraryDeleted.
 func ReadLiveLibraryState(session *gocql.Session, orgID, libraryID string) (LibraryState, error) {
-	state, err := ReadLibraryState(session, orgID, libraryID)
+	return ReadLiveLibraryStateContext(context.Background(), session, orgID, libraryID)
+}
+
+// ReadLiveLibraryStateContext is ReadLiveLibraryState bound to ctx.
+func ReadLiveLibraryStateContext(ctx context.Context, session *gocql.Session, orgID, libraryID string) (LibraryState, error) {
+	state, err := ReadLibraryStateContext(ctx, session, orgID, libraryID)
 	if err != nil {
 		return LibraryState{}, err
 	}

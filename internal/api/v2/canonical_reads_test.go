@@ -87,7 +87,7 @@ func assertCanonicalReadRouting(t *testing.T, fn *ast.FuncDecl, want canonicalRe
 
 		receiver, _ := selector.X.(*ast.Ident)
 		switch selector.Sel.Name {
-		case "BatchResolveBlockIDs":
+		case "BatchResolveBlockIDs", "BatchResolveBlockIDsContext":
 			if receiver != nil && receiver.Name == "streaming" {
 				got.batchResolutions++
 				lastBatchPosition = call.Pos()
@@ -98,7 +98,7 @@ func assertCanonicalReadRouting(t *testing.T, fn *ast.FuncDecl, want canonicalRe
 			}
 			got.constructors++
 			if lastBatchPosition == token.NoPos || lastBatchPosition > call.Pos() {
-				t.Errorf("NewCanonicalBlockReader must follow BatchResolveBlockIDs")
+				t.Errorf("NewCanonicalBlockReader must follow block ID resolution")
 			}
 			assertIdentifierArgument(t, call, 5, "blockStore")
 			assertIdentifierArgument(t, call, 6, "blockStoreClass")

@@ -65,6 +65,7 @@ func TestSchedulePublishedBlockReferenceRepairDeduplicatesInFlightRepair(t *test
 	if len(pending) != 2 {
 		t.Fatalf("scheduled repairs after completion = %d, want 2", len(pending))
 	}
+	pending[1]()
 }
 
 func TestQueuePendingPublishedFileRepairs_RollsBackPartialInsertFailure(t *testing.T) {

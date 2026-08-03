@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -135,7 +136,7 @@ func TestShareFileBootstrapChainClassifiesFailures(t *testing.T) {
 			original := shareInlineTextFn
 			t.Cleanup(func() { shareInlineTextFn = original })
 			called := false
-			shareInlineTextFn = func(*ShareLinkViewHandler, *shareLinkData) (string, error) {
+			shareInlineTextFn = func(*ShareLinkViewHandler, context.Context, *shareLinkData) (string, error) {
 				called = true
 				return "", tt.readErr
 			}

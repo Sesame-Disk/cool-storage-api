@@ -26,6 +26,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/time/rate"
@@ -1547,13 +1548,13 @@ func TestStreamFileFromBlocksResolvesCanonicalReaderBeforeSuccessResponse(t *tes
 		seafHTTPNewCanonicalBlockReaderFn = oldCanonical
 	})
 
-	seafHTTPLookupFileBlocksFn = func(*SeafHTTPHandler, string, *AccessToken) ([]string, int64, []byte, []byte, *storage.BlockStore, string, error) {
+	seafHTTPLookupFileBlocksFn = func(context.Context, *SeafHTTPHandler, string, *AccessToken) ([]string, int64, []byte, []byte, *storage.BlockStore, string, error) {
 		return []string{blockID, blockID}, 18, nil, nil, nil, "hot", nil
 	}
-	seafHTTPResolveBlockRepresentationIDFn = func(*SeafHTTPHandler, string, string) (string, error) {
+	seafHTTPResolveBlockRepresentationIDFn = func(context.Context, *SeafHTTPHandler, string, string) (string, error) {
 		return db.PlainBlockRepresentationID, nil
 	}
-	seafHTTPBatchResolveBlockIDsFn = func(_ *db.DB, _, _ string, blockIDs []string) ([]string, error) {
+	seafHTTPBatchResolveBlockIDsFn = func(_ context.Context, _ *db.DB, _, _ string, blockIDs []string) ([]string, error) {
 		return append([]string(nil), blockIDs...), nil
 	}
 
@@ -1576,7 +1577,7 @@ func TestStreamFileFromBlocksResolvesCanonicalReaderBeforeSuccessResponse(t *tes
 	}
 
 	h := &SeafHTTPHandler{db: &db.DB{}, storageManager: storage.NewManager()}
-	err := h.streamFileFromBlocks(c, &AccessToken{OrgID: "org", RepoID: "repo"}, "file.txt", time.Time{})
+	err := h.streamFileFromBlocks(c, &AccessToken{OrgID: "org", RepoID: "repo"}, "file.txt", time.Time{}, nil)
 	if err == nil || !strings.Contains(err.Error(), "canonical") {
 		t.Fatalf("streamFileFromBlocks error = %v, want canonical resolution error", err)
 	}
@@ -1588,6 +1589,88 @@ func TestStreamFileFromBlocksResolvesCanonicalReaderBeforeSuccessResponse(t *tes
 	}
 }
 
+type seafHTTPFailingResponseWriter struct {
+	gin.ResponseWriter
+	limit   int
+	written int
+	err     error
+}
+
+func (w *seafHTTPFailingResponseWriter) Write(p []byte) (int, error) {
+	remaining := w.limit - w.written
+	if remaining <= 0 {
+		return 0, w.err
+	}
+	n := len(p)
+	if n > remaining {
+		n = remaining
+	}
+	wrote, err := w.ResponseWriter.Write(p[:n])
+	w.written += wrote
+	if err != nil {
+		return wrote, err
+	}
+	if wrote != len(p) {
+		return wrote, w.err
+	}
+	return wrote, nil
+}
+
+func TestStreamFileFromBlocksRecordsPartialTransferOnStreamError(t *testing.T) {
+	oldLookup := seafHTTPLookupFileBlocksFn
+	oldRepresentation := seafHTTPResolveBlockRepresentationIDFn
+	oldBatch := seafHTTPBatchResolveBlockIDsFn
+	oldCanonical := seafHTTPNewCanonicalBlockReaderFn
+	oldRecord := recordSeafHTTPDownloadTrafficFn
+	t.Cleanup(func() {
+		seafHTTPLookupFileBlocksFn = oldLookup
+		seafHTTPResolveBlockRepresentationIDFn = oldRepresentation
+		seafHTTPBatchResolveBlockIDsFn = oldBatch
+		seafHTTPNewCanonicalBlockReaderFn = oldCanonical
+		recordSeafHTTPDownloadTrafficFn = oldRecord
+	})
+
+	blockID := strings.Repeat("e", 64)
+	seafHTTPLookupFileBlocksFn = func(context.Context, *SeafHTTPHandler, string, *AccessToken) ([]string, int64, []byte, []byte, *storage.BlockStore, string, error) {
+		return []string{blockID}, 10, nil, nil, nil, "hot", nil
+	}
+	seafHTTPResolveBlockRepresentationIDFn = func(context.Context, *SeafHTTPHandler, string, string) (string, error) {
+		return db.PlainBlockRepresentationID, nil
+	}
+	seafHTTPBatchResolveBlockIDsFn = func(_ context.Context, _ *db.DB, _, _ string, blockIDs []string) ([]string, error) {
+		return append([]string(nil), blockIDs...), nil
+	}
+	seafHTTPNewCanonicalBlockReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
+		return &syncCanonicalReaderStub{data: map[string][]byte{blockID: []byte("0123456789")}}, nil
+	}
+
+	recorded := make([]int64, 0, 1)
+	recordSeafHTTPDownloadTrafficFn = func(_ traffic.QuotaStatus, _, _, _ string, bytes int64) {
+		recorded = append(recorded, bytes)
+	}
+
+	underlying := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(underlying)
+	failing := &seafHTTPFailingResponseWriter{
+		ResponseWriter: c.Writer,
+		limit:          4,
+		err:            errors.New("client write failed"),
+	}
+	c.Writer = failing
+	c.Request = httptest.NewRequest(http.MethodGet, "/download", nil)
+	h := &SeafHTTPHandler{db: &db.DB{}, storageManager: storage.NewManager()}
+
+	err := h.streamFileFromBlocks(c, &AccessToken{OrgID: "org", RepoID: "repo"}, "file.txt", time.Time{}, nil)
+	if err == nil {
+		t.Fatal("streamFileFromBlocks succeeded after a response write failure")
+	}
+	if len(recorded) != 1 || recorded[0] != 4 {
+		t.Fatalf("partial traffic records = %v, want [4]", recorded)
+	}
+	if got := underlying.Body.Len(); got != 4 {
+		t.Fatalf("response bytes = %d, want 4", got)
+	}
+}
 func TestResolveLibraryBlockStoreUsesHostnameFallback(t *testing.T) {
 	manager := storage.NewManager()
 	manager.SetDefaultClass("hot-minio-local")

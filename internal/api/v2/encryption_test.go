@@ -2,6 +2,7 @@ package v2
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -850,6 +851,27 @@ func TestDecryptSessionManager_ResolverKeepsCurrentRepoSession(t *testing.T) {
 
 	if !m.IsUnlocked("user-1", "repo-1") {
 		t.Fatal("session should remain valid when library updated_at is unchanged")
+	}
+}
+
+func TestDecryptSessionManager_ContextResolverUsesRequestContext(t *testing.T) {
+	m := newTestSessionManager(time.Hour)
+	baseUpdatedAt := time.Now().Add(-time.Minute)
+	type contextKey struct{}
+	m.SetUpdatedAtResolverContext(func(ctx context.Context, orgID, repoID string) (time.Time, error) {
+		if orgID != "org-1" || repoID != "repo-1" {
+			t.Fatalf("unexpected resolver lookup %s/%s", orgID, repoID)
+		}
+		if got := ctx.Value(contextKey{}); got != "request-value" {
+			t.Fatalf("resolver context value = %v, want request value", got)
+		}
+		return baseUpdatedAt, nil
+	})
+	m.UnlockForLibrary("user-1", "org-1", "repo-1", baseUpdatedAt, []byte("key"), []byte("iv"))
+
+	key, iv := m.GetFileKeyAndIVContext(context.WithValue(context.Background(), contextKey{}, "request-value"), "user-1", "repo-1")
+	if string(key) != "key" || string(iv) != "iv" {
+		t.Fatalf("GetFileKeyAndIVContext = (%q, %q), want (key, iv)", key, iv)
 	}
 }
 

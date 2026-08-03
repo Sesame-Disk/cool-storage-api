@@ -1,12 +1,19 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	goast "go/ast"
+	goparser "go/parser"
+	gotoken "go/token"
+	"io/fs"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -22,6 +29,56 @@ const (
 	dirEntryIDA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	dirEntryIDB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
+
+func TestD4DownloadBypassHelpersRemainUnused(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve current file path")
+	}
+	root := filepath.Join(filepath.Dir(thisFile), "..", "..", "internal")
+	callCounts := map[string]int{
+		"getFileFromBlocks":       0,
+		"GetPresignedDownloadURL": 0,
+	}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
+			return nil
+		}
+		file, err := goparser.ParseFile(gotoken.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		goast.Inspect(file, func(node goast.Node) bool {
+			call, ok := node.(*goast.CallExpr)
+			if !ok {
+				return true
+			}
+			var name string
+			switch fun := call.Fun.(type) {
+			case *goast.Ident:
+				name = fun.Name
+			case *goast.SelectorExpr:
+				name = fun.Sel.Name
+			}
+			if _, tracked := callCounts[name]; tracked {
+				callCounts[name]++
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, count := range callCounts {
+		if count != 0 {
+			t.Fatalf("D4 bypass helper %s has %d call site(s); use bounded streaming instead", name, count)
+		}
+	}
+}
 
 // A validated listing may distinguish a missing entry internally, but HTTP still
 // maps that observation to 503 because LOCAL_QUORUM may have returned an older
@@ -412,7 +469,7 @@ func TestHandleZipDownloadEncryptionProbeFailsClosed(t *testing.T) {
 		h, tok := newZipHandler(t)
 		old := seafHTTPLookupLibraryEncryptedFn
 		t.Cleanup(func() { seafHTTPLookupLibraryEncryptedFn = old })
-		seafHTTPLookupLibraryEncryptedFn = func(*SeafHTTPHandler, string, string) (bool, error) {
+		seafHTTPLookupLibraryEncryptedFn = func(context.Context, *SeafHTTPHandler, string, string) (bool, error) {
 			return false, errors.New("cassandra timeout")
 		}
 
@@ -438,7 +495,7 @@ func TestHandleZipDownloadEncryptionProbeFailsClosed(t *testing.T) {
 		h, tok := newZipHandler(t)
 		old := seafHTTPLookupLibraryEncryptedFn
 		t.Cleanup(func() { seafHTTPLookupLibraryEncryptedFn = old })
-		seafHTTPLookupLibraryEncryptedFn = func(*SeafHTTPHandler, string, string) (bool, error) {
+		seafHTTPLookupLibraryEncryptedFn = func(context.Context, *SeafHTTPHandler, string, string) (bool, error) {
 			return true, nil
 		}
 

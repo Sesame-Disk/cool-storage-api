@@ -19,7 +19,7 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B, C, D2 and D3 are complete; download/block GET admission (D4-D6) remains open because no producer route is wired yet. D1's coordinator, D2's stable public-link token identity and D3's writer lifetime/reachability layer are implemented; the supported frontend disables gzip and proxy buffering for D transfer routes. D0 freezes the broader byte-producing download scope, atomic multidimensional admission and the D1-D6 PR sequence. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B, C and D1-D4 are complete. D4 wires admission through file, ZIP, raw, history, share-raw and inline-text response lifetimes; block GET (D5) and measured production capacities/real-nginx evidence (D6) remain open. The supported frontend disables gzip and proxy buffering for D transfer routes. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
 | **Anonymous object-storage downloads** | 🔴 Open — production posture blocker | Supported Compose storage policies currently grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
@@ -5110,7 +5110,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces and equivalent storage-backed read surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B, C, D2 and D3 are closed**; **D4-D6 remain open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, and D3 supplies the idle-write writer plus actual-route gzip/proxy reachability. No admission producer route is wired and no positive capacity has been measured. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C/D2/D3 does not close the B4 umbrella.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B, C and D1-D4 are closed**; **D5-D6 remain open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, D3 supplies the idle-write writer plus actual-route gzip/proxy reachability, and D4 wires one coordinator through the listed non-block producer lifetimes. Block GET remains unwired and no positive capacity has been measured. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C/D1-D4 does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`, `GET /seafhttp/zip/:token`, `GET /repo/:repo_id/raw/*filepath`, `GET /repo/:repo_id/history/download`, `GET /repo/:repo_id/history/raw`, share-link raw under `/d/:token`, and the share-file bootstrap inline-content read. D's authoritative producer inventory is the D0 contract, not this list
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5123,22 +5123,22 @@ not identical in scope — B4 covers the full seafhttp abuse surface; X10 focuse
 on authenticated block PUT concurrency / aggregate memory after PR-10's
 per-request body cap.
 
-Current guard state (2026-08-01; the other rows retain their original verification dates):
+Current guard state (2026-08-02; the other rows retain their original verification dates):
 
 | Surface | Limiter |
 |---|---|
 | `/seafhttp/upload-api/:token` | After a valid token resolves as link-origin, admission to permission/body/storage work has stable-source rate budgets and non-blocking per-source/per-node in-flight caps; token lookup and arbitrary invalid-token traffic are outside these guards |
-| `/seafhttp/files/:token/*filepath` | **none** |
+| `/seafhttp/files/:token/*filepath` | D4 `file` admission through protected preparation and response streaming |
 | `/seafhttp/repo/:repo_id/block/:block_id` PUT | per-(org, user) and per-node admitted lifetime before the request body, with bounded waiters and a real connection deadline (B, closed 2026-07-30) |
-| `/seafhttp/repo/:repo_id/block/:block_id` GET | **none** — D is open; the route is authenticated but has no download admission |
+| `/seafhttp/repo/:repo_id/block/:block_id` GET | **none** — D5 is open; the route is authenticated but has no download admission |
 | `/seafhttp/repo/:repo_id/check-blocks` | per-(org, user) and per-node admission before the body read, with bounded waiters, an admitted lifetime, and a bounded cancellable metadata fan-out (2026-07-31) |
-| `/seafhttp/zip/:token` | optional `zipRL`, passed in at registration |
+| `/seafhttp/zip/:token` | D4 `zip` admission through `zipWriter.Close()`; optional request-start `zipRL` remains separate |
 | `/api/v2/blocks/check` | per-IP limiter (`rate.Every(time.Second)`, burst 120 ≈ 60/min sustained) |
 | `/api/v2/blocks/upload` | per-user concurrency limiter (`MaxConcurrentBlockUploadsPerUser`, default 8) |
 | `/api/v2.1/share-links/*`, `/api/v2.1/upload-links/*`, `/d/:token` | per-IP `slRL` |
-| `/repo/:repo_id/raw/*filepath`, `/repo/:repo_id/history/*` | **none** — authentication/traffic checks exist, but no D admission |
-| `/d/:token` or `/d/:token/files[/]` with `raw=1` | per-IP `slRL` on route starts; no active-transfer admission |
-| `/api/v2.1/share-links/:token[/files]/bootstrap` (inline text) | per-IP `slRL` on the public route; storage read has no D admission, uses a background context, and its response is written from inside gzip |
+| `/repo/:repo_id/raw/*filepath`, `/repo/:repo_id/history/*` | D4 `raw` or `history` admission through Range/stream response lifetime |
+| `/d/:token` or `/d/:token/files[/]` with `raw=1` | D4 `link_raw` admission plus the existing per-IP `slRL` |
+| `/api/v2.1/share-links/:token[/files]/bootstrap` (inline text) | D4 `link_inline` admission through JSON response write; preparation uses the admitted context and the route bypasses gzip |
 
 So the original B4 wording — "no dedicated rate limit on upload / download /
 blocks / share-link paths" — is **partly stale**: the share-link and web-block
@@ -5164,7 +5164,7 @@ own fix + regression.
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
 | **B** | Authenticated block **PUT** concurrency (= registry **X10**) | ✅ **Closed 2026-07-30** | — | A pre-gate global ticket plus per-user/node admissions bound active, transitioning and parked requests before body reads; real-TCP deadlines cover stalled bodies; complete-lifetime memory trials support 24 slots at an 80 MiB design cost; real `seaf-cli` recovered from the shipped 10s wait and `Retry-After: 10` |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | ✅ **Closed 2026-07-31** | — | Own admission instance (separate capacity from B) before the body read, deduplicated lookups, configured fan-out and cancellation coverage for both canonical metadata phases, and an admitted lifetime that now reaches the socket. Cancellation stops new dispatch; already-issued Cassandra queries remain bounded by the driver's finite timeout. Id cap is configurable and capped at its inherited 100k; see "Subcontract C" below |
-| **D** | All storage-backed download/inline-content reads, including seafhttp download, block GET, ZIP, raw/history and share raw | 🔴 Open | One process-local, bounded and atomic download admission shared by all byte-producing paths; per-user or stable-link/client fairness; recoverable lifetime | The original row named seafhttp download/block GET. D0 expands closure by flow so raw/history/share/ZIP cannot bypass the same bandwidth/resource exhaustion control |
+| **D** | All storage-backed download/inline-content reads, including seafhttp download, block GET, ZIP, raw/history and share raw | 🔴 Open (D5-D6) | D4 covers the listed non-block producers with one process-local, bounded and atomic coordinator; D5 adds block GET and D6 supplies operating evidence | The original row named seafhttp download/block GET. D0 expands closure by flow so raw/history/share/ZIP cannot bypass the same bandwidth/resource exhaustion control |
 
 #### Subcontract A: stable-link request and concurrency admission (A1/A2 closed 2026-07-29)
 
@@ -5675,7 +5675,7 @@ here: fleet capacity scales with node count. Closing C did not close the
 umbrella; **D (download / block GET) remains open**, so B4 remains a production
 blocker.
 
-#### Subcontract D: download admission contract and inventory (D0/D1/D2/D3, 2026-08-02)
+#### Subcontract D: download admission contract and inventory (D0-D4, 2026-08-02)
 
 D0 was documentation only and froze the scope and criteria for the final open
 subcontract in [`docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md).
@@ -5685,8 +5685,10 @@ public-link `SourceID` through normal download, public OnlyOffice and public ZIP
 token minting, and rejects blank link identities in token writers and download
 consumers. D3 now supplies the reusable idle-write writer, fail-closed writer
 reachability checks, actual-route gzip exclusions and frontend proxy buffering
-for the public bootstrap routes. No admission producer route is wired, so D
-remains open and no application download is protected yet.
+for the public bootstrap routes. D4 now bootstraps one coordinator and wires file,
+ZIP, authenticated raw/history, public share raw and inline text/Markdown through
+admission, preparation and response cleanup. D5 still owns block GET and D6 owns
+measured capacities plus the real-nginx slow-client drill.
 
 The original D row named the seafhttp file download and authenticated block GET.
 The closure scope is intentionally defined by **storage-backed byte production**
@@ -5708,7 +5710,7 @@ resolved and before buffering — but an iWork file is neither video nor text, s
 that gate is the general `FileView.MaxPreviewBytes`, 1 GiB in every shipped
 config and twenty times the 50 MB `MaxIWorkPreviewBytes` that caps only the
 extracted preview. The path is bounded, by a general preview limit rather than
-an in-memory budget validated for a fully buffered producer. D4 must prove the
+an in-memory budget validated for a fully buffered producer. D4 proves the
 existing gate still precedes admission and buffering; D6 must measure the real
 per-request peak (buffer capacity, in-flight encrypted and decrypted block,
 extracted preview, ZIP overhead) so `max_active_raw` and `MaxPreviewBytes` can

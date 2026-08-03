@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"log"
@@ -37,10 +38,17 @@ var ErrLibraryEncryptedNotUnlocked = errors.New("library is encrypted and not un
 // It is a var so tests can drive the probe-failure branch directly; there is no
 // other way to make a real session fail on demand.
 var libraryIsEncrypted = func(database *db.DB, orgID, repoID string) (bool, error) {
+	return libraryIsEncryptedContext(context.Background(), database, orgID, repoID)
+}
+
+func libraryIsEncryptedContext(ctx context.Context, database *db.DB, orgID, repoID string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var encrypted bool
 	err := database.Session().Query(`
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&encrypted)
+	`, orgID, repoID).WithContext(ctx).Scan(&encrypted)
 	return encrypted, err
 }
 
@@ -67,6 +75,7 @@ type DecryptSession struct {
 }
 
 type libraryUpdatedAtResolver func(orgID, repoID string) (time.Time, error)
+type libraryUpdatedAtResolverContext func(context.Context, string, string) (time.Time, error)
 
 // resolverCheckInterval is the minimum time between DB lookups for a single
 // session. Prevents hammering Cassandra on encrypted-file downloads where
@@ -76,10 +85,11 @@ const resolverCheckInterval = 30 * time.Second
 // DecryptSessionManager manages library decrypt sessions
 // Libraries are unlocked for 1 hour after password verification
 type DecryptSessionManager struct {
-	mu                sync.RWMutex
-	sessions          map[string]*DecryptSession // key: "userID:repoID"
-	ttl               time.Duration
-	updatedAtResolver libraryUpdatedAtResolver
+	mu                       sync.RWMutex
+	sessions                 map[string]*DecryptSession // key: "userID:repoID"
+	ttl                      time.Duration
+	updatedAtResolver        libraryUpdatedAtResolver
+	updatedAtResolverContext libraryUpdatedAtResolverContext
 }
 
 // Global session manager
@@ -130,7 +140,14 @@ func (m *DecryptSessionManager) GetFileKey(userID, repoID string) []byte {
 // GetFileKeyAndIV returns both the file key and IV for an unlocked library
 // Returns nil, nil if library is not unlocked or session expired
 func (m *DecryptSessionManager) GetFileKeyAndIV(userID, repoID string) ([]byte, []byte) {
-	session, _, ok := m.getActiveSession(userID, repoID)
+	return m.GetFileKeyAndIVContext(context.Background(), userID, repoID)
+}
+
+// GetFileKeyAndIVContext is GetFileKeyAndIV bound to ctx for request-scoped
+// encrypted reads. The cross-replica invalidation lookup observes the same
+// preparation deadline as the rest of the request's metadata work.
+func (m *DecryptSessionManager) GetFileKeyAndIVContext(ctx context.Context, userID, repoID string) ([]byte, []byte) {
+	session, _, ok := m.getActiveSessionContext(ctx, userID, repoID)
 	if !ok {
 		return nil, nil
 	}
@@ -138,6 +155,13 @@ func (m *DecryptSessionManager) GetFileKeyAndIV(userID, repoID string) ([]byte, 
 }
 
 func (m *DecryptSessionManager) getActiveSession(userID, repoID string) (*DecryptSession, string, bool) {
+	return m.getActiveSessionContext(context.Background(), userID, repoID)
+}
+
+func (m *DecryptSessionManager) getActiveSessionContext(ctx context.Context, userID, repoID string) (*DecryptSession, string, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	key := userID + ":" + repoID
 
 	m.mu.RLock()
@@ -152,15 +176,22 @@ func (m *DecryptSessionManager) getActiveSession(userID, repoID string) (*Decryp
 		return nil, key, false
 	}
 	resolver := m.updatedAtResolver
+	resolverContext := m.updatedAtResolverContext
 	snapshot := *session
 	m.mu.RUnlock()
 
 	// Cross-replica invalidation: check whether the library's updated_at has
 	// advanced (meaning another replica changed the password). Rate-limited to
 	// avoid a Cassandra query on every block download.
-	if resolver != nil && snapshot.OrgID != "" && !snapshot.UpdatedAt.IsZero() &&
+	if (resolverContext != nil || resolver != nil) && snapshot.OrgID != "" && !snapshot.UpdatedAt.IsZero() &&
 		time.Since(snapshot.lastResolverCheck) > resolverCheckInterval {
-		currentUpdatedAt, err := resolver(snapshot.OrgID, snapshot.RepoID)
+		var currentUpdatedAt time.Time
+		var err error
+		if resolverContext != nil {
+			currentUpdatedAt, err = resolverContext(ctx, snapshot.OrgID, snapshot.RepoID)
+		} else {
+			currentUpdatedAt, err = resolver(snapshot.OrgID, snapshot.RepoID)
+		}
 		if err == nil && currentUpdatedAt.After(snapshot.UpdatedAt) {
 			// Password was rotated on another replica — evict.
 			m.Lock(userID, repoID)
@@ -213,6 +244,15 @@ func (m *DecryptSessionManager) SetUpdatedAtResolver(resolver libraryUpdatedAtRe
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.updatedAtResolver = resolver
+	m.updatedAtResolverContext = nil
+}
+
+// SetUpdatedAtResolverContext configures a cancellation-aware resolver for
+// request-scoped decrypt-session validation.
+func (m *DecryptSessionManager) SetUpdatedAtResolverContext(resolver libraryUpdatedAtResolverContext) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.updatedAtResolverContext = resolver
 }
 
 // GetDecryptSessions returns the global session manager
@@ -230,11 +270,11 @@ type EncryptionHandler struct {
 // NewEncryptionHandler creates a new encryption handler
 func NewEncryptionHandler(database *db.DB) *EncryptionHandler {
 	if database != nil {
-		decryptSessions.SetUpdatedAtResolver(func(orgID, repoID string) (time.Time, error) {
+		decryptSessions.SetUpdatedAtResolverContext(func(ctx context.Context, orgID, repoID string) (time.Time, error) {
 			var updatedAt time.Time
 			err := database.Session().Query(`
 				SELECT updated_at FROM libraries WHERE org_id = ? AND library_id = ?
-			`, orgID, repoID).Scan(&updatedAt)
+			`, orgID, repoID).WithContext(ctx).Scan(&updatedAt)
 			return updatedAt, err
 		})
 	}

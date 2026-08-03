@@ -107,7 +107,7 @@ Why this is the supported deploy model:
 
 If you use a different proxy chain and do not preserve the canonicalized client IP at the last nginx hop, adjust `SERVER_TRUSTED_PROXIES` for that topology instead.
 
-### Download admission (D1/D2/D3)
+### Download admission (D1-D4)
 
 D1 adds the process-local coordinator, bounded state, configuration schema and
 Prometheus series for storage-backed downloads. D2 makes the public download-
@@ -120,11 +120,13 @@ operating capacity. Every shipped YAML and env template therefore keeps
 D3 adds the reusable idle-write writer and makes the actual raw/history, share
 raw and public bootstrap paths bypass the Go gzip wrapper. The supported frontend
 nginx configuration disables both proxy buffering and gzip for all protected
-transfer locations, including `/seafhttp/`. D3 does not connect the writer or
-coordinator to a producer yet; that is the D4 boundary. D6 must still prove the
-end-to-end slow-client behavior through the deployed nginx topology.
+transfer locations, including `/seafhttp/`. D4 now wires the single bootstrapped
+coordinator, preparation context and idle-write lifecycle into file, ZIP, raw,
+history, share-raw and inline-text producers. D5 remains block GET work, and D6
+must still prove end-to-end slow-client behavior through the deployed nginx
+topology.
 
-Do not enable this section in production before D4 wiring and D6 measurement.
+Do not enable this section in production before D6 measurement.
 When D6 selects positive values, the following startup rules still apply:
 
 - `max_active_per_node`, every identity cap, `preparation_deadline`, `idle_write_timeout` and `retry_after` must be positive.
@@ -132,7 +134,7 @@ When D6 selects positive values, the following startup rules still apply:
 - `server.write_timeout` must remain `0`; the coordinator owns the long-transfer idle-write deadline.
 - Public-link client attribution must use the trusted-proxy configuration above; do not derive a client IP from forwarded headers in application code.
 - D is process-local, so fleet capacity scales with the number of application nodes. It is not a cluster-global quota.
-- D4 must construct exactly one enabled coordinator during server bootstrap and share that pointer with every protected producer; D1 intentionally does not enforce a process-global singleton so package tests can create isolated coordinators.
+- D4 constructs exactly one coordinator during server bootstrap and shares that pointer with every protected non-block producer; D1 intentionally does not enforce a process-global singleton so package tests can create isolated coordinators.
 
 The coordinator updates `active_current`, `active_by_profile`, `entries_current`
 and `waiters_current` under one internal state transition, but Prometheus gathers

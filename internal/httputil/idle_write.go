@@ -354,7 +354,10 @@ func (w *IdleWriteWriter) notifyFailure(err error, cancel context.CancelFunc, on
 	if cancel == nil {
 		return
 	}
-	cancel()
+	// Notify the owner before exposing cancellation to request workers. D4 uses
+	// these callbacks to claim the terminal admission cause; cancelling first
+	// lets a worker observe context.Canceled and win the lease as storage_error.
+	defer cancel()
 	if isTimeoutError(err) {
 		if onTimeout != nil {
 			onTimeout()

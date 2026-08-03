@@ -3,17 +3,108 @@ package v2
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/downloadadmission"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/gin-gonic/gin"
 )
 
+type cancelDuringIWorkContext struct {
+	context.Context
+	checks   int
+	cancelAt int
+	done     chan struct{}
+	canceled bool
+}
+
+func (c *cancelDuringIWorkContext) Err() error {
+	c.checks++
+	if c.checks >= c.cancelAt {
+		if !c.canceled {
+			close(c.done)
+			c.canceled = true
+		}
+		return context.Canceled
+	}
+	return nil
+}
+
+func (c *cancelDuringIWorkContext) Done() <-chan struct{} { return c.done }
+
 func init() {
 	gin.SetMode(gin.TestMode)
+}
+
+func TestExtractIWorkPreviewPDFContextStopsAfterCancellation(t *testing.T) {
+	entries := make(map[string][]byte, 2000)
+	for i := 0; i < 2000; i++ {
+		entries[fmt.Sprintf("Index/%04d.iwa", i)] = []byte{0}
+	}
+	archive := createTestZIP(entries)
+	ctx := &cancelDuringIWorkContext{
+		Context:  context.Background(),
+		cancelAt: 8,
+		done:     make(chan struct{}),
+	}
+
+	_, err := extractIWorkPreviewPDFContext(ctx, archive, 10*1024*1024)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("extractIWorkPreviewPDFContext error = %v, want context canceled", err)
+	}
+	select {
+	case <-ctx.done:
+	default:
+		t.Fatal("test context was not canceled during archive traversal")
+	}
+}
+
+func TestRespondIWorkPreparationFailureDeadlineReturns503(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/file", nil)
+	lifecycle, reason, err := httputil.AcquireDownloadAdmission(c, nil, config.DownloadAdmissionConfig{}, downloadadmission.AdmissionRequest{})
+	if err != nil || reason != "" || lifecycle == nil {
+		t.Fatalf("AcquireDownloadAdmission = (%v, %q, %v)", lifecycle, reason, err)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancel()
+
+	respondIWorkPreparationFailure(c, lifecycle, ctx, context.DeadlineExceeded, "failed to read file")
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if recorder.Body.Len() == 0 {
+		t.Fatal("deadline response body is empty")
+	}
+}
+
+func TestRespondIWorkPreparationFailureDisconnectDoesNotWrite(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/file", nil)
+	lifecycle, reason, err := httputil.AcquireDownloadAdmission(c, nil, config.DownloadAdmissionConfig{}, downloadadmission.AdmissionRequest{})
+	if err != nil || reason != "" || lifecycle == nil {
+		t.Fatalf("AcquireDownloadAdmission = (%v, %q, %v)", lifecycle, reason, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	respondIWorkPreparationFailure(c, lifecycle, ctx, context.Canceled, "failed to read file")
+	if c.Writer.Written() {
+		t.Fatal("disconnect wrote an HTTP response")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("disconnect response body = %q, want empty", recorder.Body.String())
+	}
 }
 
 // mockTokenCreator implements TokenCreator interface for testing
