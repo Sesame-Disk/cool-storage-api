@@ -1011,7 +1011,7 @@ deployment for token issuance.
 | D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Merged in `main`; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
 | D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | Complete: one bootstrapped coordinator covers all listed non-block producers through preparation and response lifetime |
 | D5 | Stream sync block GET through existing canonical reader APIs | Complete: `SyncHandler.GetBlock` uses `GetBlockSize`/`GetBlockReader` under `ProfileBlock` on the shared coordinator; neither the canonical nor the legacy no-metadata path materializes the whole block; traffic uses bytes written |
-| D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass |
+| D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass. **Prerequisite:** `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` must close first — an admitted request currently has no D-owned deadline between the end of preparation and its first response write, so enabling positive capacities before that fix would ship slots that can be held indefinitely |
 
 The B/C `syncAdmissionLimiter` remains in `internal/api` during this series.
 Its white-box tests inspect unexported state, so extracting it to
