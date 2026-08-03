@@ -19,7 +19,8 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B, C and D1-D4 are complete. D4 wires admission through file, ZIP, raw, history, share-raw and inline-text response lifetimes; block GET (D5) and measured production capacities/real-nginx evidence (D6) remain open. The supported frontend disables gzip and proxy buffering for D transfer routes. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B, C and D1-D5 are complete. D5 streams block GET through the canonical reader under `ProfileBlock`. D6 remains open, and it is not measurement alone: the shared pre-first-write admission gap (ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01) must close before positive capacities are enabled. The supported frontend disables gzip and proxy buffering for D transfer routes. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
+| **Download admission has no bound before the first write** | 🔴 Open — blocks D6 enablement | Between `StartStreaming()` and the first successful response write, the preparation deadline is over and the idle-write timer is not armed yet, so a stalled first storage read holds an admission slot with no D-owned bound. Shared by D4 and D5, not introduced by either. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
 | **Anonymous object-storage downloads** | 🔴 Open — production posture blocker | Supported Compose storage policies currently grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
@@ -5110,7 +5111,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces and equivalent storage-backed read surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B, C and D1-D4 are closed**; **D5-D6 remain open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, D3 supplies the idle-write writer plus actual-route gzip/proxy reachability, and D4 wires one coordinator through the listed non-block producer lifetimes. Block GET remains unwired and no positive capacity has been measured. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C/D1-D4 does not close the B4 umbrella.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B, C and D1-D5 are closed**; **D6 remains open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, D3 supplies the idle-write writer plus actual-route gzip/proxy reachability, D4 wires one coordinator through the listed non-block producer lifetimes, and D5 streams authenticated block GET through `CanonicalBlockReader` under `ProfileBlock` without full-block materialization. No positive capacity has been measured, and D6 is more than measurement: `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` — an admitted request has no D-owned deadline between the end of preparation and its first response write — is a hard prerequisite for enabling the section, and is shared by the D4 and D5 producers rather than introduced by either. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C/D1-D5 does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`, `GET /seafhttp/zip/:token`, `GET /repo/:repo_id/raw/*filepath`, `GET /repo/:repo_id/history/download`, `GET /repo/:repo_id/history/raw`, share-link raw under `/d/:token`, and the share-file bootstrap inline-content read. D's authoritative producer inventory is the D0 contract, not this list
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5123,14 +5124,14 @@ not identical in scope — B4 covers the full seafhttp abuse surface; X10 focuse
 on authenticated block PUT concurrency / aggregate memory after PR-10's
 per-request body cap.
 
-Current guard state (2026-08-02; the other rows retain their original verification dates):
+Current guard state (2026-08-03; the other rows retain their original verification dates):
 
 | Surface | Limiter |
 |---|---|
 | `/seafhttp/upload-api/:token` | After a valid token resolves as link-origin, admission to permission/body/storage work has stable-source rate budgets and non-blocking per-source/per-node in-flight caps; token lookup and arbitrary invalid-token traffic are outside these guards |
 | `/seafhttp/files/:token/*filepath` | D4 `file` admission through protected preparation and response streaming |
 | `/seafhttp/repo/:repo_id/block/:block_id` PUT | per-(org, user) and per-node admitted lifetime before the request body, with bounded waiters and a real connection deadline (B, closed 2026-07-30) |
-| `/seafhttp/repo/:repo_id/block/:block_id` GET | **none** — D5 is open; the route is authenticated but has no download admission |
+| `/seafhttp/repo/:repo_id/block/:block_id` GET | D5 `block` admission through size → stream response lifetime; neither the canonical nor the legacy no-metadata path materializes the whole block |
 | `/seafhttp/repo/:repo_id/check-blocks` | per-(org, user) and per-node admission before the body read, with bounded waiters, an admitted lifetime, and a bounded cancellable metadata fan-out (2026-07-31) |
 | `/seafhttp/zip/:token` | D4 `zip` admission through `zipWriter.Close()`; optional request-start `zipRL` remains separate |
 | `/api/v2/blocks/check` | per-IP limiter (`rate.Every(time.Second)`, burst 120 ≈ 60/min sustained) |
@@ -5164,7 +5165,7 @@ own fix + regression.
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
 | **B** | Authenticated block **PUT** concurrency (= registry **X10**) | ✅ **Closed 2026-07-30** | — | A pre-gate global ticket plus per-user/node admissions bound active, transitioning and parked requests before body reads; real-TCP deadlines cover stalled bodies; complete-lifetime memory trials support 24 slots at an 80 MiB design cost; real `seaf-cli` recovered from the shipped 10s wait and `Retry-After: 10` |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | ✅ **Closed 2026-07-31** | — | Own admission instance (separate capacity from B) before the body read, deduplicated lookups, configured fan-out and cancellation coverage for both canonical metadata phases, and an admitted lifetime that now reaches the socket. Cancellation stops new dispatch; already-issued Cassandra queries remain bounded by the driver's finite timeout. Id cap is configurable and capped at its inherited 100k; see "Subcontract C" below |
-| **D** | All storage-backed download/inline-content reads, including seafhttp download, block GET, ZIP, raw/history and share raw | 🔴 Open (D5-D6) | D4 covers the listed non-block producers with one process-local, bounded and atomic coordinator; D5 adds block GET and D6 supplies operating evidence | The original row named seafhttp download/block GET. D0 expands closure by flow so raw/history/share/ZIP cannot bypass the same bandwidth/resource exhaustion control |
+| **D** | All storage-backed download/inline-content reads, including seafhttp download, block GET, ZIP, raw/history and share raw | 🔴 Open (D6) | D1-D5 cover every listed producer with one process-local, bounded and atomic coordinator; D6 supplies operating evidence | The original row named seafhttp download/block GET. D0 expands closure by flow so raw/history/share/ZIP cannot bypass the same bandwidth/resource exhaustion control |
 
 #### Subcontract A: stable-link request and concurrency admission (A1/A2 closed 2026-07-29)
 
@@ -5672,10 +5673,10 @@ the C closure criteria.
 bound rather than a measured one — criterion 3 bounds the *work per id* and the
 *concurrent requests*, not the list length. Process-local, like every other guard
 here: fleet capacity scales with node count. Closing C did not close the
-umbrella; **D (download / block GET) remains open**, so B4 remains a production
+umbrella; **D6 (download admission operating evidence) remains open**, so B4 remains a production
 blocker.
 
-#### Subcontract D: download admission contract and inventory (D0-D4, 2026-08-02)
+#### Subcontract D: download admission contract and inventory (D0-D5, 2026-08-03)
 
 D0 was documentation only and froze the scope and criteria for the final open
 subcontract in [`docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md).
@@ -5687,8 +5688,28 @@ consumers. D3 now supplies the reusable idle-write writer, fail-closed writer
 reachability checks, actual-route gzip exclusions and frontend proxy buffering
 for the public bootstrap routes. D4 now bootstraps one coordinator and wires file,
 ZIP, authenticated raw/history, public share raw and inline text/Markdown through
-admission, preparation and response cleanup. D5 still owns block GET and D6 owns
+admission, preparation and response cleanup. D5 streams `SyncHandler.GetBlock`
+through `GetBlockSize`/`GetBlockReader` under `ProfileBlock` on that coordinator,
+preserves `last_accessed` after quota and before the body, and records traffic from
+bytes successfully written. The route's writer reachability is regressed over a
+real socket in both directions — the shipped gzip stack must leave the block GET
+writer unwrapped, and a middleware that hides the connection must fail closed
+rather than stream without an installable idle-write deadline — because that is
+the same defect subcontract C shipped on `check-blocks`. The quota pre-check and
+the `last_accessed` write both run on the preparation context, so neither holds a
+slot past the preparation deadline when Cassandra stalls, and a reader that
+reaches EOF early is released as `storage_error` rather than `completed`. D6 owns
 measured capacities plus the real-nginx slow-client drill.
+
+D5 classifies this route as authenticated traffic because the sync surface has no
+legitimate public flow. That is a **dependency** on `syncAuthMiddleware`, not a
+property D5 proves: while `ISSUE-SYNC-LINK-TOKEN-AUTH-01` is open, a public
+share-link bearer reaching this route is admitted as the link creator, so
+criterion 4 fairness is not end-to-end proven for block GET. It is not a D5
+regression and does not gate D5 — subcontracts B and C were closed keying their
+admissions on identities from that same middleware — but it must not be described
+as covered. Streaming and admission do **not** close
+`ISSUE-BLOCK-CROSS-LIBRARY-READ-01`.
 
 The original D row named the seafhttp file download and authenticated block GET.
 The closure scope is intentionally defined by **storage-backed byte production**
@@ -5790,13 +5811,16 @@ context cancellation and preserved response states. D5 preserves the current
 before the response body is sent. Redefining it as post-complete-delivery is
 outside D5 and requires its own issue and evidence. No current reader uses
 `blocks.last_accessed` for retention or deletion, but any future GC/cold-storage
-consumer must revisit that contract.
+consumer must revisit that contract. D5 is complete: the route acquires
+`ProfileBlock` on the shared coordinator, uses size for quota/`Content-Length`,
+streams via `GetBlockReader`, and records traffic from bytes successfully
+written rather than nominal size.
 
 `GetBlockSize` may be used for the preflight quota decision and
 `Content-Length`, but it must not become the recorded transfer amount. The
-current buffered implementation accounts `len(data)`, which is exact for the
-completed block. After streaming, D5 must count bytes successfully written and
-pass that actual count to `traffic.RecordCheckedTransfer`; a partial transfer
+previous buffered implementation accounted `len(data)`, which is exact for the
+completed block. After streaming, D5 counts bytes successfully written and
+passes that actual count to `traffic.RecordCheckedTransfer`; a partial transfer
 must not regress to nominal-size overbilling. The broader `StreamBlocks` false
 success/over-counting issue remains separately tracked as
 `ISSUE-STREAMBLOCKS-VOID-01`.
@@ -5822,6 +5846,78 @@ historical: B right-sized and bounded that path; it is not remaining D work.
 - `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md` (D0 contract, inventory and PR sequence)
 - `docs/SECURITY-ASSESSMENT-2026-04.md` **H-7** — the original 2026-04 filing. (The readiness report cited H-5 for this; H-5 is share-link token enumeration. H-7 is the rate-limit finding.)
 - `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` (subcontract C detail)
+- `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` (shared D3/D4/D5 phase-change gap; hard requirement before D6 enablement)
+
+---
+
+### ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01: Download admission has no deadline between preparation and the first response write
+
+**Status**: 🔴 **Open** — **blocks D6 enablement**. Not a regression from any single
+subcontract: the gap is in the shared D3 phase change and is reachable through
+both the D4 and D5 producers.
+**Severity**: High once `download_admission.enabled` is true; latent while it is
+false, which it is in every shipped configuration.
+**Affected**: `httputil.DownloadAdmission.StartStreaming` /
+`httputil.IdleWriteWriter`, reached by `SeafHTTPHandler.streamFileFromBlocks`
+(D4, `file`/`link_raw`/`zip`) and `SyncHandler.GetBlock` (D5, `block`), and by
+any future producer using the same lifecycle.
+**Source of record**: found reviewing PR #158 (D5)
+
+Each admitted request passes through three phases. Two are bounded and one is
+not:
+
+| Phase | Bound |
+|---|---|
+| Preparation — reader resolution, size, quota, `last_accessed` | `preparation_deadline` |
+| **First storage read — `GetBlockReader` / first prefetch** | **none** |
+| Response writes | `idle_write_timeout` |
+
+`StartStreaming` cancels the preparation context and returns
+`context.WithCancel(parent)` — a cancelable context with **no deadline**. The
+idle-write timer is armed only by `IdleWriteWriter.progress()`, which runs after
+a successful `Write`/`Flush`, or after `WriteHeader`/`WriteHeaderNow` **if the
+underlying writer became `Written()`**. Gin defers its status, so `c.Status(200)`
+records the code and leaves `Written()` false; `IdleWriteWriter.WriteHeader` then
+takes the `clearDeadlineWithoutProgress()` branch, which explicitly clears the
+socket deadline and arms nothing.
+
+So between the phase change and the first byte, a stalled first storage read
+holds its admission slot until the client disconnects or the object-store SDK's
+own timeout fires. Neither is the configured D bound, and that bound is the whole
+point of the subcontract: an accepted request whose expensive work is unbounded
+is the condition D exists to prevent.
+
+Both producers are reachable:
+
+- **D5** — `openReader(streamCtx)` in `SyncHandler.GetBlock`;
+- **D4** — `StreamBlocks` starts `PrefetchBlock` for block 0 before emitting any
+  byte, which the streaming code already documents as a blocking S3 request.
+
+Moving `c.Status(200)` ahead of the reader open does **not** fix it. D4 already
+has exactly that ordering and still has the gap, because the status is deferred.
+Committing headers with `WriteHeaderNow()` would arm the timer, but it forfeits
+the ability to answer `404`/`500` on a post-preflight race and would have to be
+repeated in every producer.
+
+The intended fix is in the shared lifecycle: `StartStreaming` should arm the idle
+deadline immediately, so "admitted but not yet producing output" is itself an
+idle interval. That closes both producers at once and preserves the pre-header
+error responses. It must demonstrate that the deadline is active from the end of
+preparation, that a stalled `GetBlockReader`/first prefetch cancels `streamCtx`,
+that the first real progress restarts the interval from that progress, that
+`Finish` clears timer and deadline, that stale timer callbacks cannot fire, that
+the terminal cause stays first-wins, and that the lease returns to zero. The two
+required regressions are a blocked `GetBlockReader` on the D5 path and a blocked
+first prefetch on the D4 path, each proving bounded time, a non-`completed`
+cause and `active_current == 0`.
+
+**Why this is not a merge blocker for D5**: D5 reproduces D4's shape rather than
+introducing a new gap, `download_admission.enabled` is `false` in every shipped
+configuration, and a D5-local workaround would duplicate logic while leaving D4
+exposed. **Why it is a hard requirement before D6**: D6 is the phase that selects
+positive capacities and enables the section, and enabling it with this gap open
+would ship an admission control whose slots can be held indefinitely. D6 is
+therefore not "measurements and nginx evidence" alone — this must close first.
 
 ---
 

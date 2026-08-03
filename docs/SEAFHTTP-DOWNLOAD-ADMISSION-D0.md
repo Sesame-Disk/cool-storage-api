@@ -1,12 +1,14 @@
 # B4 Subcontract D — Download Admission Contract
 
 **Date:** 2026-08-01 (original contract freeze)  
-**Last updated:** 2026-08-02  
-**Branch:** `feat/b4-subcontract-d4-download-admission`
-**Status:** D0-D4 are complete. D1 coordinator/configuration, D2 stable public
-download-token `SourceID` wiring and D3 writer lifetime/gzip-proxy reachability
-are merged in `main`; D4 connects the listed non-block producers in this branch.
-Block GET streaming remains D5 and positive operating values remain D6 work.
+**Last updated:** 2026-08-03  
+**Branch:** `feat/b4-subcontract-d5-block-get-streaming`
+**Status:** D0-D5 are complete. D1 coordinator/configuration, D2 stable public
+download-token `SourceID` wiring, D3 writer lifetime/gzip-proxy reachability and
+D4 non-block producer wiring are merged in `main`; D5 streams
+`SyncHandler.GetBlock` through `CanonicalBlockReader` under `ProfileBlock` on
+the shared coordinator. Positive operating values and real-nginx evidence remain
+D6 work.
 
 This document freezes the contract and inventory for subcontract D of
 `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`. It is the design record for the D1-D6
@@ -46,16 +48,16 @@ deadlines, or select positive capacity values. Those are D2-D6 deliverables.
 The repository templates remain safe during this staged rollout: every
 `download_admission` block is present with `enabled: false` and zero values.
 D6, not D1, is the first phase allowed to replace those placeholders with
-measured positive defaults. Enabling the section before D4 wiring was an
-unsupported deployment configuration rather than a configuration error. D4 now
-connects the listed non-block producers; D6 still supplies the capacity evidence
-required before production enablement.
+measured positive defaults. Enabling the section before producer wiring was an
+unsupported deployment configuration rather than a configuration error. D1-D5
+now connect every listed producer, including block GET; D6 still supplies the
+capacity evidence required before production enablement.
 
 ### D coordinator ownership
 
-D4 creates exactly one `Coordinator` during server bootstrap and shares that
-pointer with every protected producer, including `internal/api`, `internal/api/v2`
-and share-link handlers. `New` deliberately does not enforce a process-global
+Bootstrap creates exactly one `Coordinator` and shares that pointer with every
+protected producer, including `internal/api`, `internal/api/v2`,
+`SyncHandler.GetBlock` and the share-link handlers. `New` deliberately does not enforce a process-global
 singleton in D1 so unit tests can create isolated coordinators; multiple enabled
 instances in production would multiply the process-local node cap and make the
 global metrics meaningless.
@@ -96,7 +98,7 @@ The following producers are in scope:
 |---|---|---|---|
 | `SeafHTTPHandler.HandleDownload` / `streamFileFromBlocks` | `GET /seafhttp/files/:token/*filepath` | Token-authorized full-file stream | `file` |
 | `SeafHTTPHandler.HandleZipDownload` | `GET /seafhttp/zip/:token` | Token-authorized generated ZIP stream, behind an optional request-start `zipRL` (`rate.Every(15s)`, burst 3) that is not an active-transfer bound | `zip` |
-| `SyncHandler.GetBlock` | `GET /seafhttp/repo/:repo_id/block/:block_id` | Authenticated block GET currently buffers `[]byte` | `block` |
+| `SyncHandler.GetBlock` | `GET /seafhttp/repo/:repo_id/block/:block_id` | Authenticated block GET; streams through the canonical reader since D5 (it buffered `[]byte` when this inventory was frozen) | `block` |
 | `FileViewHandler.ServeRawFile` | `GET /repo/:repo_id/raw/*filepath` | Authenticated raw stream; AV media uses `http.ServeContent` and Range; the `preview=1` iWork branch fully buffers the source file (see §6) | `raw` |
 | `FileViewHandler.DownloadHistoricFile` | `GET /repo/:repo_id/history/download` | Authenticated historic full-file stream | `history` |
 | `FileViewHandler.ServeHistoricFileRaw` | `GET /repo/:repo_id/history/raw` | Authenticated historic raw stream | `history` |
@@ -299,8 +301,9 @@ metadata cost.
 
 The profiles are separate for measurement and fairness:
 
-- `block`: authenticated desktop block GET. It has no admission today, so there
-  is no behavior to preserve: it *adopts* the desktop-compatible
+- `block`: authenticated desktop block GET. It had no admission when this
+  contract was frozen, so there was no behavior to preserve: D5 *adopts* the
+  desktop-compatible
   `503 + Retry-After` contract already proven against real `seaf-cli` by
   subcontract B on the PUT side of the same route.
 - `file`: full-file and OnlyOffice file streams.
@@ -666,8 +669,8 @@ installs this writer around each protected producer.
 
 ### 10. Block GET Refactor Contract
 
-`CanonicalBlockReader.GetBlockSize` and `GetBlockReader` already exist. D5 will
-wire them into `SyncHandler.GetBlock` instead of inventing a new storage reader.
+`CanonicalBlockReader.GetBlockSize` and `GetBlockReader` already existed. D5
+wired them into `SyncHandler.GetBlock` instead of inventing a new storage reader.
 
 The refactor must:
 
@@ -689,12 +692,41 @@ The refactor must:
   use bytes successfully written. D5 must not regress the current exact
   `len(data)` accounting to nominal-size overbilling after replacing the buffer
   with a reader;
-- record partial outcomes when a post-header reader/write fails;
+- record partial outcomes when a post-header reader/write fails. A reader that
+  reaches EOF **early** is one of those outcomes even though `io.Copy` reports no
+  error: D5 compares the bytes copied against the authoritative size and releases
+  a short block as `storage_error` rather than `completed`. Content addressing
+  makes that divergence extraordinary, which is the reason to assert it rather
+  than assume it — an unasserted structural expectation is how a metadata/object
+  mismatch would reach a client as a silently truncated block;
 - release admission after the response operation ends, not after reader creation.
 
 The separate `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` cross-library block-read
 authorization finding remains separate. D must not claim that streaming or
 admission fixes BOLA.
+
+#### D5 depends on sync authentication, and does not fix it
+
+D5 builds its admission identity with `NewAuthenticatedRequest(ProfileBlock,
+orgID, userID)` because the sync surface has no legitimate public flow: every
+byte producer reachable under `/seafhttp/repo/:repo_id/*` is authenticated by
+design. That is a **dependency on `syncAuthMiddleware`, not a property D5
+proves**.
+
+`ISSUE-SYNC-LINK-TOKEN-AUTH-01` is open: the middleware accepts any valid
+`TokenTypeDownload` without rejecting `Source == "link"`, without requiring the
+repository-root token shape, and without binding the token's `RepoID` to the
+route's `:repo_id`. While it is open, a public share-link bearer that reaches
+this route is admitted as the link creator's authenticated identity, so criterion
+4's fairness invariant is **not** end-to-end proven for block GET.
+
+This is not a D5 regression and does not gate D5, because the same middleware
+already supplies the identities that subcontract B (block PUT) and subcontract C
+(check-blocks) key their admissions on, and both were closed on that same basis.
+Gating D5 alone on it would be inconsistent; the fix belongs in the middleware,
+where it repairs all three at once. What D must not do is present the
+authenticated-identity classification as verified end to end while that issue is
+open.
 
 ### 11. Traffic Accounting Boundary
 
@@ -977,9 +1009,9 @@ deployment for token issuance.
 | D1 | Neutral D coordinator, atomic dimensions, bounded state, config and metrics | Coordinator not yet connected to producers |
 | D2 | Stable `SourceID` for all public download-token mint paths | Merged in `main`; new link tokens are strict; no legacy compatibility; coordinated greenfield rollout |
 | D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Merged in `main`; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
-| D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | Complete: one bootstrapped coordinator covers all listed non-block producers through preparation and response lifetime; D5 remains block GET. |
-| D5 | Stream sync block GET through existing canonical reader APIs | Block GET no longer materializes the block |
-| D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass |
+| D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | Complete: one bootstrapped coordinator covers all listed non-block producers through preparation and response lifetime |
+| D5 | Stream sync block GET through existing canonical reader APIs | Complete: `SyncHandler.GetBlock` uses `GetBlockSize`/`GetBlockReader` under `ProfileBlock` on the shared coordinator; neither the canonical nor the legacy no-metadata path materializes the whole block; traffic uses bytes written |
+| D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass. **Prerequisite:** `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` must close first — an admitted request currently has no D-owned deadline between the end of preparation and its first response write, so enabling positive capacities before that fix would ship slots that can be held indefinitely |
 
 The B/C `syncAdmissionLimiter` remains in `internal/api` during this series.
 Its white-box tests inspect unexported state, so extracting it to

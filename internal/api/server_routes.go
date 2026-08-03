@@ -372,5 +372,6 @@ func (s *Server) registerCompatibilityRoutes(serverURL string) {
 	syncHandler := NewSyncHandler(s.db, s.storage, s.storageManager, s.config, s.permMiddleware)
 	syncHandler.SetTokenCreator(s.tokenStore)
 	syncHandler.SetAccountStatusChecker(s.checkAccountStatus)
+	syncHandler.SetDownloadAdmissionCoordinator(s.downloadAdmission)
 	syncHandler.RegisterSyncRoutes(s.router, s.syncAuthMiddleware())
 }
