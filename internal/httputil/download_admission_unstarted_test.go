@@ -31,6 +31,21 @@ func TestDownloadAdmissionFinishAnswers503WhenNothingWasWritten(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Everything a producer stages for the file before its first storage read.
+	// D4 does exactly this ahead of the block-0 prefetch.
+	base.Header().Set("Content-Length", "734003200")
+	base.Header().Set("Content-Range", "bytes 0-1023/734003200")
+	base.Header().Set("Content-Disposition", `attachment; filename="large.bin"`)
+	base.Header().Set("Content-Type", "application/octet-stream")
+	base.Header().Set("Content-Encoding", "gzip")
+	base.Header().Set("Accept-Ranges", "bytes")
+	base.Header().Set("ETag", `"file-version"`)
+	base.Header().Set("Last-Modified", "Mon, 03 Aug 2026 00:00:00 GMT")
+	base.Header().Set("Expires", "Tue, 04 Aug 2026 00:00:00 GMT")
+	base.Header().Set("Cache-Control", "public, max-age=3600")
+	// Not a representation header: this must survive.
+	base.Header().Set("X-Quota-Warning", "soft")
+
 	// No output at all: this is the stalled first storage read.
 	select {
 	case <-streaming.Done():
@@ -54,6 +69,38 @@ func TestDownloadAdmissionFinishAnswers503WhenNothingWasWritten(t *testing.T) {
 	}
 	if base.body.Len() != 0 {
 		t.Fatalf("body = %q, want empty", base.body.String())
+	}
+
+	// Swapping only the status would emit a 503 that still promises the whole
+	// file. net/http closes the connection when a declared length never arrives,
+	// so the client reads an unexpected EOF instead of the Retry-After contract
+	// this response exists to deliver.
+	if got := base.Header().Get("Content-Length"); got != "0" {
+		t.Fatalf("Content-Length = %q, want 0; the error must not inherit the file's length", got)
+	}
+	for _, name := range []string{
+		"Content-Range",
+		"Content-Disposition",
+		"Content-Type",
+		"Content-Encoding",
+		"Accept-Ranges",
+		"ETag",
+		"Last-Modified",
+		"Expires",
+	} {
+		if got := base.Header().Get(name); got != "" {
+			t.Fatalf("%s = %q on the error response; it describes a file that was never sent", name, got)
+		}
+	}
+	// The file's caching policy must not be inherited, or the failure could be
+	// stored and replayed as the resource.
+	if got := base.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	// Headers that are not representation metadata belong to the stack, not the
+	// entity, and a blanket reset would silently drop them.
+	if got := base.Header().Get("X-Quota-Warning"); got != "soft" {
+		t.Fatalf("X-Quota-Warning = %q, want it preserved", got)
 	}
 }
 

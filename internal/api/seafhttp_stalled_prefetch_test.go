@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,22 +22,28 @@ import (
 // cancelled, then holds the return so the test can inspect the window where the
 // prefetch is cancelled but still running.
 type stalledPrefetchReader struct {
+	startOnce            sync.Once
+	started              chan struct{}
 	cancellationObserved chan struct{}
 	allowReturn          chan struct{}
 }
 
-func (r *stalledPrefetchReader) GetBlock(ctx context.Context, _ string) ([]byte, error) {
+// stall is shared by both entry points because StreamBlocks may prefetch through
+// either one depending on whether the library is encrypted.
+func (r *stalledPrefetchReader) stall(ctx context.Context) error {
+	r.startOnce.Do(func() { close(r.started) })
 	<-ctx.Done()
 	close(r.cancellationObserved)
 	<-r.allowReturn
-	return nil, ctx.Err()
+	return ctx.Err()
+}
+
+func (r *stalledPrefetchReader) GetBlock(ctx context.Context, _ string) ([]byte, error) {
+	return nil, r.stall(ctx)
 }
 
 func (r *stalledPrefetchReader) GetBlockReader(ctx context.Context, _ string) (io.ReadCloser, error) {
-	<-ctx.Done()
-	close(r.cancellationObserved)
-	<-r.allowReturn
-	return nil, ctx.Err()
+	return nil, r.stall(ctx)
 }
 
 func (r *stalledPrefetchReader) GetBlockSize(context.Context, string) (int64, error) {
@@ -93,11 +100,16 @@ func TestStreamBlocksStalledFirstPrefetchIsBoundedByIdleInterval(t *testing.T) {
 		t.Fatalf("StartStreaming = %v", err)
 	}
 
-	// Exactly what streamFileFromBlocks does before entering StreamBlocks.
+	// Exactly what streamFileFromBlocks does before entering StreamBlocks: the
+	// file's representation headers, including a Content-Length for the whole
+	// file, are staged before the first storage read can fail.
+	c.Header("Content-Disposition", `attachment; filename="large.bin"`)
 	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Length", "734003200")
 	c.Status(http.StatusOK)
 
 	reader := &stalledPrefetchReader{
+		started:              make(chan struct{}),
 		cancellationObserved: make(chan struct{}),
 		allowReturn:          make(chan struct{}),
 	}
@@ -110,6 +122,12 @@ func TestStreamBlocksStalledFirstPrefetchIsBoundedByIdleInterval(t *testing.T) {
 		streamReturned <- streaming.StreamBlocks(c, streamCtx, reader, []string{"block-0"}, nil, nil, "stalled-prefetch-test")
 	}()
 
+	// Prove the prefetch actually started before asserting its cancellation.
+	select {
+	case <-reader.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StreamBlocks never reached the first prefetch")
+	}
 	select {
 	case <-reader.cancellationObserved:
 	case <-time.After(5 * time.Second):
@@ -164,5 +182,14 @@ func TestStreamBlocksStalledFirstPrefetchIsBoundedByIdleInterval(t *testing.T) {
 	}
 	if baseRecorder.Body.Len() != 0 {
 		t.Fatalf("body = %q, want empty", baseRecorder.Body.String())
+	}
+	// The 503 must not keep promising the file. A declared length that never
+	// arrives makes net/http drop the connection, so the client would read an
+	// unexpected EOF rather than the retry contract.
+	if got := baseRecorder.Header().Get("Content-Length"); got != "0" {
+		t.Fatalf("Content-Length = %q, want 0; the 503 inherited the file's length", got)
+	}
+	if got := baseRecorder.Header().Get("Content-Disposition"); got != "" {
+		t.Fatalf("Content-Disposition = %q; a browser would save the error as the file", got)
 	}
 }

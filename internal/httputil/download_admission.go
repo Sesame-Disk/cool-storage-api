@@ -301,8 +301,10 @@ func (l *DownloadAdmission) Finish(cause downloadadmission.ReleaseCause) error {
 	if cause == downloadadmission.ReleaseCompleted {
 		l.finishCause(cause)
 	}
-	l.releaseLease()
+	// The response lifetime is not over until the status is committed, so the
+	// error goes out before the slot is handed back.
 	l.writeUnstartedFailure()
+	l.releaseLease()
 	return err
 }
 
@@ -329,6 +331,9 @@ func (l *DownloadAdmission) writeUnstartedFailure() {
 		return
 	}
 	switch cause {
+	case "":
+		// No terminal cause was ever claimed, so nothing failed to report.
+		return
 	case downloadadmission.ReleaseCompleted:
 		// Nothing failed; an empty body is the producer's own business.
 		return
@@ -341,6 +346,7 @@ func (l *DownloadAdmission) writeUnstartedFailure() {
 		return
 	}
 
+	resetUnstartedDownloadHeaders(writer.Header())
 	writer.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	writer.WriteHeader(http.StatusServiceUnavailable)
 	// Gin records the status and commits it later; a writer that already
@@ -348,6 +354,38 @@ func (l *DownloadAdmission) writeUnstartedFailure() {
 	if !writer.Written() {
 		writer.WriteHeaderNow()
 	}
+}
+
+// resetUnstartedDownloadHeaders turns a response that was staged for a file into
+// a standalone error. Producers set representation headers before their first
+// storage read — D4 stages Content-Disposition, Content-Type and the file's
+// Content-Length ahead of the block-0 prefetch — and swapping only the status
+// would emit a 503 that still promises the whole file. Declaring a body length
+// that never arrives makes net/http close the connection, so the client reads an
+// unexpected EOF instead of the Retry-After contract this response exists to
+// deliver, and a stale Content-Disposition or ETag would misdescribe or let the
+// error be cached as the resource.
+//
+// Only headers describing the original entity are removed. Anything else the
+// stack added — CORS, security headers, quota warnings — is left alone, since a
+// blanket reset would silently drop those from every timed-out transfer.
+func resetUnstartedDownloadHeaders(header http.Header) {
+	for _, name := range []string{
+		"Content-Disposition",
+		"Content-Encoding",
+		"Content-Range",
+		"Content-Type",
+		"Accept-Ranges",
+		"ETag",
+		"Last-Modified",
+		"Expires",
+	} {
+		header.Del(name)
+	}
+	// The error must not inherit the file's caching policy, and an explicit zero
+	// length keeps the bodiless response unambiguous.
+	header.Set("Cache-Control", "no-store")
+	header.Set("Content-Length", "0")
 }
 
 func retryAfterSeconds(retryAfter time.Duration) int {

@@ -5948,6 +5948,23 @@ last so Gin's recovery keeps owning its `500`. Nothing is written once any outpu
 exists, so a failure after headers still stops the stream instead of appending to
 it.
 
+Swapping the status alone is not enough, because producers stage the file's
+representation headers **before** their first storage read: D4 sets
+`Content-Disposition`, `Content-Type` and the file's full `Content-Length` ahead
+of the block-0 prefetch. A `503` inheriting a `Content-Length` of the whole file
+declares a body that never arrives, so `net/http` closes the connection and the
+client reads an unexpected EOF instead of the `Retry-After` contract the response
+exists to deliver — the retry path would be broken by the very fix meant to
+enable it. A stale `Content-Disposition` would also make a browser save the error
+as the file, and a stale `ETag`/`Cache-Control` could let it be cached as the
+resource. `Finish` therefore drops the entity headers
+(`Content-Disposition`, `Content-Encoding`, `Content-Range`, `Content-Type`,
+`Accept-Ranges`, `ETag`, `Last-Modified`, `Expires`), sets `Cache-Control:
+no-store` and `Content-Length: 0`. The reset is deliberately a named list rather
+than a blanket clear: CORS, security and quota-warning headers belong to the
+stack rather than the entity, and wiping them from every timed-out transfer would
+be a silent second defect.
+
 One classification race is closed with it. `expire()` commits the writer to
 failed under the writer's own mutex, releases it, and only then calls back to
 claim the terminal cause on the lifecycle. A handler finishing inside that

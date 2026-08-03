@@ -25,6 +25,7 @@ import (
 // window where the operation has been cancelled but is still running.
 type syncStalledCanonicalReader struct {
 	size                 int64
+	started              chan struct{}
 	cancellationObserved chan struct{}
 	allowReturn          chan struct{}
 }
@@ -34,6 +35,7 @@ func (r *syncStalledCanonicalReader) GetBlock(context.Context, string) ([]byte, 
 }
 
 func (r *syncStalledCanonicalReader) GetBlockReader(ctx context.Context, _ string) (io.ReadCloser, error) {
+	close(r.started)
 	<-ctx.Done()
 	close(r.cancellationObserved)
 	<-r.allowReturn
@@ -142,6 +144,7 @@ func TestSyncBlockDownloadAdmissionIdleTimeoutBoundsStalledReaderOpen(t *testing
 	blockID := strings.Repeat("7", 64)
 	reader := &syncStalledCanonicalReader{
 		size:                 32,
+		started:              make(chan struct{}),
 		cancellationObserved: make(chan struct{}),
 		allowReturn:          make(chan struct{}),
 	}
@@ -174,6 +177,13 @@ func TestSyncBlockDownloadAdmissionIdleTimeoutBoundsStalledReaderOpen(t *testing
 		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo/block/"+blockID, nil))
 	}()
 
+	// Prove the read actually started before asserting anything about its
+	// cancellation, so the test cannot pass by never reaching the reader.
+	select {
+	case <-reader.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reader open was never reached")
+	}
 	select {
 	case <-reader.cancellationObserved:
 	case <-time.After(5 * time.Second):
