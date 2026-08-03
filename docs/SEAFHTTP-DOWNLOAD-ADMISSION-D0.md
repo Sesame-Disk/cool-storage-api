@@ -98,7 +98,7 @@ The following producers are in scope:
 |---|---|---|---|
 | `SeafHTTPHandler.HandleDownload` / `streamFileFromBlocks` | `GET /seafhttp/files/:token/*filepath` | Token-authorized full-file stream | `file` |
 | `SeafHTTPHandler.HandleZipDownload` | `GET /seafhttp/zip/:token` | Token-authorized generated ZIP stream, behind an optional request-start `zipRL` (`rate.Every(15s)`, burst 3) that is not an active-transfer bound | `zip` |
-| `SyncHandler.GetBlock` | `GET /seafhttp/repo/:repo_id/block/:block_id` | Authenticated block GET currently buffers `[]byte` | `block` |
+| `SyncHandler.GetBlock` | `GET /seafhttp/repo/:repo_id/block/:block_id` | Authenticated block GET; streams through the canonical reader since D5 (it buffered `[]byte` when this inventory was frozen) | `block` |
 | `FileViewHandler.ServeRawFile` | `GET /repo/:repo_id/raw/*filepath` | Authenticated raw stream; AV media uses `http.ServeContent` and Range; the `preview=1` iWork branch fully buffers the source file (see §6) | `raw` |
 | `FileViewHandler.DownloadHistoricFile` | `GET /repo/:repo_id/history/download` | Authenticated historic full-file stream | `history` |
 | `FileViewHandler.ServeHistoricFileRaw` | `GET /repo/:repo_id/history/raw` | Authenticated historic raw stream | `history` |
@@ -301,8 +301,9 @@ metadata cost.
 
 The profiles are separate for measurement and fairness:
 
-- `block`: authenticated desktop block GET. It has no admission today, so there
-  is no behavior to preserve: it *adopts* the desktop-compatible
+- `block`: authenticated desktop block GET. It had no admission when this
+  contract was frozen, so there was no behavior to preserve: D5 *adopts* the
+  desktop-compatible
   `503 + Retry-After` contract already proven against real `seaf-cli` by
   subcontract B on the PUT side of the same route.
 - `file`: full-file and OnlyOffice file streams.
@@ -668,8 +669,8 @@ installs this writer around each protected producer.
 
 ### 10. Block GET Refactor Contract
 
-`CanonicalBlockReader.GetBlockSize` and `GetBlockReader` already exist. D5 will
-wire them into `SyncHandler.GetBlock` instead of inventing a new storage reader.
+`CanonicalBlockReader.GetBlockSize` and `GetBlockReader` already existed. D5
+wired them into `SyncHandler.GetBlock` instead of inventing a new storage reader.
 
 The refactor must:
 
@@ -691,12 +692,41 @@ The refactor must:
   use bytes successfully written. D5 must not regress the current exact
   `len(data)` accounting to nominal-size overbilling after replacing the buffer
   with a reader;
-- record partial outcomes when a post-header reader/write fails;
+- record partial outcomes when a post-header reader/write fails. A reader that
+  reaches EOF **early** is one of those outcomes even though `io.Copy` reports no
+  error: D5 compares the bytes copied against the authoritative size and releases
+  a short block as `storage_error` rather than `completed`. Content addressing
+  makes that divergence extraordinary, which is the reason to assert it rather
+  than assume it — an unasserted structural expectation is how a metadata/object
+  mismatch would reach a client as a silently truncated block;
 - release admission after the response operation ends, not after reader creation.
 
 The separate `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` cross-library block-read
 authorization finding remains separate. D must not claim that streaming or
 admission fixes BOLA.
+
+#### D5 depends on sync authentication, and does not fix it
+
+D5 builds its admission identity with `NewAuthenticatedRequest(ProfileBlock,
+orgID, userID)` because the sync surface has no legitimate public flow: every
+byte producer reachable under `/seafhttp/repo/:repo_id/*` is authenticated by
+design. That is a **dependency on `syncAuthMiddleware`, not a property D5
+proves**.
+
+`ISSUE-SYNC-LINK-TOKEN-AUTH-01` is open: the middleware accepts any valid
+`TokenTypeDownload` without rejecting `Source == "link"`, without requiring the
+repository-root token shape, and without binding the token's `RepoID` to the
+route's `:repo_id`. While it is open, a public share-link bearer that reaches
+this route is admitted as the link creator's authenticated identity, so criterion
+4's fairness invariant is **not** end-to-end proven for block GET.
+
+This is not a D5 regression and does not gate D5, because the same middleware
+already supplies the identities that subcontract B (block PUT) and subcontract C
+(check-blocks) key their admissions on, and both were closed on that same basis.
+Gating D5 alone on it would be inconsistent; the fix belongs in the middleware,
+where it repairs all three at once. What D must not do is present the
+authenticated-identity classification as verified end to end while that issue is
+open.
 
 ### 11. Traffic Accounting Boundary
 

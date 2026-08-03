@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"go/ast"
@@ -22,6 +23,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gingzip "github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -58,6 +60,66 @@ func (w *syncBlockPartialResponseWriter) Write(p []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(p)
 	w.wrote += n
 	return n, err
+}
+
+// syncBlockTrafficCapture records what the block-GET producer actually billed.
+type syncBlockTrafficCapture struct {
+	mu        sync.Mutex
+	callCount int
+	total     int64
+}
+
+func (c *syncBlockTrafficCapture) calls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.callCount
+}
+
+func (c *syncBlockTrafficCapture) bytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.total
+}
+
+// captureSyncBlockDownloadTraffic replaces the recording seam. Without it the
+// assertion is vacuous: traffic.Get() is nil in unit tests, so the real call is
+// never reached and any billed amount would look identical.
+func captureSyncBlockDownloadTraffic(t *testing.T) *syncBlockTrafficCapture {
+	t.Helper()
+
+	capture := &syncBlockTrafficCapture{}
+	old := recordSyncBlockDownloadTrafficFn
+	t.Cleanup(func() { recordSyncBlockDownloadTrafficFn = old })
+	recordSyncBlockDownloadTrafficFn = func(_ traffic.QuotaStatus, _, _ string, bytes int64) {
+		capture.mu.Lock()
+		defer capture.mu.Unlock()
+		capture.callCount++
+		capture.total += bytes
+	}
+	return capture
+}
+
+// syncShortCanonicalReader announces one size and then delivers fewer bytes with
+// a clean EOF — the shape io.Copy reports as success.
+type syncShortCanonicalReader struct {
+	announced int64
+	payload   []byte
+}
+
+func (r *syncShortCanonicalReader) GetBlock(context.Context, string) ([]byte, error) {
+	return nil, errors.New("buffered GetBlock must not be used")
+}
+
+func (r *syncShortCanonicalReader) GetBlockReader(context.Context, string) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(r.payload)), nil
+}
+
+func (r *syncShortCanonicalReader) GetBlockSize(context.Context, string) (int64, error) {
+	return r.announced, nil
+}
+
+func (r *syncShortCanonicalReader) CheckBlocksExist(context.Context, []string, int) (map[string]bool, error) {
+	return map[string]bool{}, nil
 }
 
 func syncBlockAdmissionConfig() config.DownloadAdmissionConfig {
@@ -193,7 +255,7 @@ func TestSyncBlockDownloadAdmissionStreamsWithoutMaterializing(t *testing.T) {
 		syncNewCanonicalBlockReaderFn = oldReader
 		syncTouchBlockLastAccessFn = oldTouch
 	})
-	syncTouchBlockLastAccessFn = func(*db.DB, string, string, time.Time) {
+	syncTouchBlockLastAccessFn = func(context.Context, *db.DB, string, string, time.Time) {
 		touchSeen = true
 		touchAfterSize = sizeSeen && !readerSeen
 		record("touch")
@@ -261,10 +323,11 @@ func TestSyncBlockDownloadAdmissionPartialWriteUsesResponseBytes(t *testing.T) {
 		syncNewCanonicalBlockReaderFn = oldReader
 		syncTouchBlockLastAccessFn = oldTouch
 	})
-	syncTouchBlockLastAccessFn = func(*db.DB, string, string, time.Time) {}
+	syncTouchBlockLastAccessFn = func(context.Context, *db.DB, string, string, time.Time) {}
 	syncNewCanonicalBlockReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
 		return &syncCanonicalReaderStub{data: map[string][]byte{blockID: payload}}, nil
 	}
+	recorded := captureSyncBlockDownloadTraffic(t)
 
 	beforeResponse := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseResponseError)))
 	beforeStorage := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseStorageError)))
@@ -285,6 +348,17 @@ func TestSyncBlockDownloadAdmissionPartialWriteUsesResponseBytes(t *testing.T) {
 		t.Fatalf("partial body length = %d, want 4", got)
 	}
 
+	// The point of the D5 accounting contract: the recorded transfer is the
+	// bytes that actually reached the client, not the authoritative block size.
+	// Asserting only "some non-completed cause" would pass just as happily if the
+	// handler billed the full 16 bytes.
+	if got := recorded.calls(); got != 1 {
+		t.Fatalf("traffic recordings = %d, want exactly 1", got)
+	}
+	if got := recorded.bytes(); got != 4 {
+		t.Fatalf("recorded bytes = %d, want 4 (delivered), not %d (nominal)", got, len(payload))
+	}
+
 	releasedResponse := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseResponseError)))
 	releasedStorage := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseStorageError)))
 	releasedCompleted := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseCompleted)))
@@ -298,6 +372,63 @@ func TestSyncBlockDownloadAdmissionPartialWriteUsesResponseBytes(t *testing.T) {
 		t.Fatalf("active admissions after partial write = %v, want 0", got)
 	}
 	_ = coordinator
+}
+
+// TestSyncBlockDownloadAdmissionShortReadIsNotCompleted pins the case io.Copy
+// reports as success: a reader that reaches EOF after fewer bytes than the
+// authoritative size returns a nil error, so without an explicit comparison the
+// transfer would be released as `completed` while the client got a body shorter
+// than the Content-Length it was promised.
+func TestSyncBlockDownloadAdmissionShortReadIsNotCompleted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	blockID := strings.Repeat("9", 64)
+	h, _ := newSyncBlockAdmissionHandler(t, syncBlockAdmissionConfig())
+
+	oldReader := syncNewCanonicalBlockReaderFn
+	oldTouch := syncTouchBlockLastAccessFn
+	t.Cleanup(func() {
+		syncNewCanonicalBlockReaderFn = oldReader
+		syncTouchBlockLastAccessFn = oldTouch
+	})
+	syncTouchBlockLastAccessFn = func(context.Context, *db.DB, string, string, time.Time) {}
+	syncNewCanonicalBlockReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
+		return &syncShortCanonicalReader{announced: 16, payload: []byte("0123")}, nil
+	}
+	recorded := captureSyncBlockDownloadTraffic(t)
+
+	beforeStorage := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseStorageError)))
+	beforeCompleted := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseCompleted)))
+
+	r := setupSyncTestRouter()
+	r.GET("/seafhttp/repo/:repo_id/block/:block_id", func(gc *gin.Context) {
+		gc.Writer = &syncBlockDeadlineResponseWriter{ResponseWriter: gc.Writer}
+		h.GetBlock(gc)
+	})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo/block/"+blockID, nil))
+
+	// Headers were already committed, so the truncation cannot become a JSON
+	// error; it has to surface as a release cause and an accurate byte count.
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after headers committed", w.Code)
+	}
+	if got := w.Body.Len(); got != 4 {
+		t.Fatalf("body length = %d, want 4", got)
+	}
+	if got := recorded.bytes(); got != 4 {
+		t.Fatalf("recorded bytes = %d, want 4 (delivered), not 16 (announced)", got)
+	}
+
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseCompleted))); got != beforeCompleted {
+		t.Fatalf("completed releases = %v, want unchanged %v; a truncated block is not a completed transfer", got, beforeCompleted)
+	}
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseStorageError))); got != beforeStorage+1 {
+		t.Fatalf("storage_error releases = %v, want %v", got, beforeStorage+1)
+	}
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionActiveCurrent); got != 0 {
+		t.Fatalf("active admissions after short read = %v, want 0", got)
+	}
 }
 
 func TestSyncBlockDownloadAdmissionFinishHandlerReleasesPanic(t *testing.T) {
@@ -364,6 +495,30 @@ func TestSyncBlockGetBlockDefersFinishHandler(t *testing.T) {
 	if syncBufferedGetBlockOnReader(fn) {
 		t.Fatal("GetBlock must not materialize via reader.GetBlock on the streaming path")
 	}
+	// Recording through the seam is what keeps the byte count assertable. An
+	// inline traffic.RecordCheckedTransfer would silently make the accounting
+	// tests vacuous again, since traffic.Get() is nil under test.
+	if !syncCallsIdent(fn, "recordSyncBlockDownloadTrafficFn") {
+		t.Fatal("GetBlock must record traffic through recordSyncBlockDownloadTrafficFn so the amount stays assertable")
+	}
+	if !syncCallsSelector(fn, "CheckTrafficQuotaContext") {
+		t.Fatal("GetBlock must bound the quota pre-check with the preparation context")
+	}
+}
+
+func syncCallsIdent(fn *ast.FuncDecl, name string) bool {
+	found := false
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == name {
+			found = true
+		}
+		return true
+	})
+	return found
 }
 
 // startSyncBlockGETServer serves the real block GET route over a real socket so
@@ -402,7 +557,7 @@ func stubSyncBlockCanonicalPayload(t *testing.T, blockID string, payload []byte)
 		syncNewCanonicalBlockReaderFn = oldReader
 		syncTouchBlockLastAccessFn = oldTouch
 	})
-	syncTouchBlockLastAccessFn = func(*db.DB, string, string, time.Time) {}
+	syncTouchBlockLastAccessFn = func(context.Context, *db.DB, string, string, time.Time) {}
 	syncNewCanonicalBlockReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
 		return &syncCanonicalReaderStub{data: map[string][]byte{blockID: payload}}, nil
 	}

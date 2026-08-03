@@ -443,7 +443,7 @@ func TestGetBlockUsesCanonicalReaderAndMapsResolutionErrors(t *testing.T) {
 				syncNewCanonicalBlockReaderFn = old
 				syncTouchBlockLastAccessFn = oldTouch
 			})
-			syncTouchBlockLastAccessFn = func(*db.DB, string, string, time.Time) {}
+			syncTouchBlockLastAccessFn = func(context.Context, *db.DB, string, string, time.Time) {}
 			var stub *syncCanonicalReaderStub
 			calls := 0
 			syncNewCanonicalBlockReaderFn = func(_ context.Context, _ *db.DB, _ *storage.Manager, orgID string, blockIDs []string, fallback *storage.BlockStore, fallbackClass string) (streaming.CanonicalBlockReader, error) {

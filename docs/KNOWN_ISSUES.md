@@ -5694,8 +5694,20 @@ bytes successfully written. The route's writer reachability is regressed over a
 real socket in both directions — the shipped gzip stack must leave the block GET
 writer unwrapped, and a middleware that hides the connection must fail closed
 rather than stream without an installable idle-write deadline — because that is
-the same defect subcontract C shipped on `check-blocks`. D6 owns measured
-capacities plus the real-nginx slow-client drill. Streaming and admission do **not** close
+the same defect subcontract C shipped on `check-blocks`. The quota pre-check and
+the `last_accessed` write both run on the preparation context, so neither holds a
+slot past the preparation deadline when Cassandra stalls, and a reader that
+reaches EOF early is released as `storage_error` rather than `completed`. D6 owns
+measured capacities plus the real-nginx slow-client drill.
+
+D5 classifies this route as authenticated traffic because the sync surface has no
+legitimate public flow. That is a **dependency** on `syncAuthMiddleware`, not a
+property D5 proves: while `ISSUE-SYNC-LINK-TOKEN-AUTH-01` is open, a public
+share-link bearer reaching this route is admitted as the link creator, so
+criterion 4 fairness is not end-to-end proven for block GET. It is not a D5
+regression and does not gate D5 — subcontracts B and C were closed keying their
+admissions on identities from that same middleware — but it must not be described
+as covered. Streaming and admission do **not** close
 `ISSUE-BLOCK-CROSS-LIBRARY-READ-01`.
 
 The original D row named the seafhttp file download and authenticated block GET.

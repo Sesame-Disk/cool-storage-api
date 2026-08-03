@@ -425,10 +425,25 @@ var syncNewCanonicalBlockCheckReaderFn = streaming.NewCanonicalBlockCheckReaderW
 var syncGetBlockIDMappingFn = func(ctx context.Context, database *db.DB, orgID, representationID, externalID string) (string, bool, error) {
 	return database.GetBlockIDMappingContext(ctx, orgID, representationID, externalID)
 }
-var syncTouchBlockLastAccessFn = func(database *db.DB, orgID, blockID string, accessedAt time.Time) {
+// syncTouchBlockLastAccessFn runs inside the D5 admission slot, so it takes the
+// caller's context: without it a Cassandra stall would hold the slot for the
+// gocql driver timeout rather than the configured preparation deadline. The
+// write itself keeps its historical placement and best-effort semantics — the
+// error is still ignored, and a cancelled context simply skips a bookkeeping
+// update on a request that is no longer going to send a body.
+var syncTouchBlockLastAccessFn = func(ctx context.Context, database *db.DB, orgID, blockID string, accessedAt time.Time) {
 	_ = database.Session().Query(`
 		UPDATE blocks SET last_accessed = ? WHERE org_id = ? AND block_id = ?
-	`, accessedAt, orgID, blockID).Exec()
+	`, accessedAt, orgID, blockID).WithContext(ctx).Exec()
+}
+
+// recordSyncBlockDownloadTrafficFn is the seam that makes block-GET accounting
+// assertable. It is deliberately separate from the SeafHTTP download recorder so
+// a test can stub one producer without intercepting the other.
+var recordSyncBlockDownloadTrafficFn = func(status traffic.QuotaStatus, orgID, userID string, bytes int64) {
+	if rec := traffic.Get(); rec != nil {
+		traffic.RecordCheckedTransfer(rec, status, orgID, userID, traffic.SyncDownload, bytes)
+	}
 }
 
 func isSyncCanonicalBlockNotFound(err error) bool {
@@ -1318,7 +1333,10 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	// Quota pre-check: reject if download traffic quota exceeded.
 	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
-		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "download", blockSize)
+		// Bound to the preparation deadline: the quota lookup is Cassandra work
+		// done inside the slot, so it must not outlive the admitted preparation
+		// phase the way a context.Background() lookup would.
+		downloadTrafficStatus, _ = checker.CheckTrafficQuotaContext(preparationCtx, orgID, userID, "download", blockSize)
 		if !downloadTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, gin.H{"error": "download traffic quota exceeded"})
 			return
@@ -1327,7 +1345,7 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 
 	// Update last accessed time (if DB available) after quota and before the body.
 	if h.db != nil {
-		syncTouchBlockLastAccessFn(h.db, orgID, internalID, time.Now())
+		syncTouchBlockLastAccessFn(preparationCtx, h.db, orgID, internalID, time.Now())
 	}
 
 	streamCtx, err := lifecycle.StartStreaming()
@@ -1361,12 +1379,18 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	c.Status(http.StatusOK)
 
 	bytesBefore := int64(c.Writer.Size())
-	_, copyErr := io.Copy(c.Writer, blockReader)
+	copied, copyErr := io.Copy(c.Writer, blockReader)
 	bytesWritten := httputil.ResponseBytesSince(c.Writer, bytesBefore)
 	if bytesWritten > 0 {
-		if rec := traffic.Get(); rec != nil {
-			traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, orgID, userID, traffic.SyncDownload, bytesWritten)
-		}
+		recordSyncBlockDownloadTrafficFn(downloadTrafficStatus, orgID, userID, bytesWritten)
+	}
+	// A reader that reaches EOF early returns no error, so a short block would
+	// otherwise be released as `completed` while the client received fewer bytes
+	// than the Content-Length promised. Content addressing makes that divergence
+	// extraordinary; the check is what turns that structural expectation into a
+	// verified invariant instead of an assumption.
+	if copyErr == nil && copied != blockSize {
+		copyErr = fmt.Errorf("block size mismatch: streamed %d bytes, expected %d", copied, blockSize)
 	}
 	if copyErr != nil {
 		lifecycle.FailStreamError(syncBlockDownloadStreamCause(copyErr))
