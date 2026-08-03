@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/downloadadmission"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
@@ -111,6 +113,11 @@ type SyncHandler struct {
 	// other's budget. Nil when disabled by configuration, in which case
 	// check_blocks_max_ids is again only a per-request bound.
 	checkBlocksInflight *syncAdmissionLimiter
+
+	// downloadAdmission is the process-wide D coordinator shared with the other
+	// download producers. GetBlock uses ProfileBlock; PutBlock and CheckBlocks
+	// keep their separate B/C syncAdmissionLimiter budgets.
+	downloadAdmission *downloadadmission.Coordinator
 }
 
 // NewSyncHandler creates a new sync protocol handler
@@ -289,6 +296,13 @@ func (h *SyncHandler) SetTokenCreator(tc SyncTokenCreator) {
 // per-entry validation failure and silently omits that repo from the result.
 func (h *SyncHandler) SetAccountStatusChecker(checker SyncAccountStatusChecker) {
 	h.accountStatus = checker
+}
+
+// SetDownloadAdmissionCoordinator makes the process-wide coordinator available
+// for the D5 SyncHandler.GetBlock producer. PutBlock and CheckBlocks do not use
+// this coordinator.
+func (h *SyncHandler) SetDownloadAdmissionCoordinator(coordinator *downloadadmission.Coordinator) {
+	h.downloadAdmission = coordinator
 }
 
 func (h *SyncHandler) lookupLibraryStorageClass(orgID, repoID string) string {
@@ -1226,19 +1240,31 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 		internalID = classifiedID.normalized
 	}
 
-	var data []byte
+	lifecycle, ok := h.acquireSyncBlockDownloadAdmission(c, orgID, userID)
+	if !ok {
+		return
+	}
+	defer lifecycle.FinishHandler()
+	preparationCtx := lifecycle.PreparationContext()
+
+	var (
+		blockSize  int64
+		openReader func(context.Context) (io.ReadCloser, error)
+	)
 	if h.db != nil {
 		var fallbackStore *storage.BlockStore
 		var fallbackClass string
 		if h.storageManager == nil {
 			fallbackStore, fallbackClass, err = h.resolvePreferredBlockStore(c, orgID, repoID)
 			if err != nil || fallbackStore == nil {
+				lifecycle.ReleasePreparationError(err)
 				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 				return
 			}
 		}
-		reader, resolveErr := syncNewCanonicalBlockReaderFn(c.Request.Context(), h.db, h.storageManager, orgID, []string{internalID}, fallbackStore, fallbackClass)
+		reader, resolveErr := syncNewCanonicalBlockReaderFn(preparationCtx, h.db, h.storageManager, orgID, []string{internalID}, fallbackStore, fallbackClass)
 		if resolveErr != nil {
+			lifecycle.ReleasePreparationError(resolveErr)
 			if errors.Is(resolveErr, streaming.ErrCanonicalBlockMetadataNotFound) {
 				c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
 			} else {
@@ -1247,26 +1273,40 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 			}
 			return
 		}
-		data, err = reader.GetBlock(c.Request.Context(), internalID)
+		blockSize, err = reader.GetBlockSize(preparationCtx, internalID)
+		if err != nil {
+			lifecycle.ReleasePreparationError(err)
+			if isSyncCanonicalBlockNotFound(err) {
+				log.Printf("GetBlock: block %s (internal: %s) not found: %v\n", externalID, internalID, err)
+				c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
+			} else {
+				log.Printf("GetBlock: failed to size canonical block %s (internal: %s): %v\n", externalID, internalID, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read block storage"})
+			}
+			return
+		}
+		openReader = func(ctx context.Context) (io.ReadCloser, error) {
+			return reader.GetBlockReader(ctx, internalID)
+		}
 	} else {
 		// Preserve the legacy no-metadata routed fallback.
 		storageClass := h.resolveBlockLookupFallbackClass(c, orgID, repoID, "")
 		blockStore, _, resolveErr := h.resolveBlockStoreForLookup(c, orgID, repoID, storageClass)
 		if resolveErr != nil || blockStore == nil {
+			lifecycle.ReleasePreparationError(resolveErr)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 			return
 		}
-		data, err = blockStore.GetBlock(c.Request.Context(), internalID)
-	}
-	if err != nil {
-		if h.db != nil && !isSyncCanonicalBlockNotFound(err) {
-			log.Printf("GetBlock: failed to read canonical block %s (internal: %s): %v\n", externalID, internalID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read block storage"})
-		} else {
+		blockSize, err = blockStore.GetBlockSize(preparationCtx, internalID)
+		if err != nil {
+			lifecycle.ReleasePreparationError(err)
 			log.Printf("GetBlock: block %s (internal: %s) not found: %v\n", externalID, internalID, err)
 			c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
+			return
 		}
-		return
+		openReader = func(ctx context.Context) (io.ReadCloser, error) {
+			return blockStore.GetBlockReader(ctx, internalID)
+		}
 	}
 
 	// NOTE: For encrypted libraries, blocks are stored encrypted:
@@ -1278,24 +1318,105 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	// Quota pre-check: reject if download traffic quota exceeded.
 	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
-		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "download", int64(len(data)))
+		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "download", blockSize)
 		if !downloadTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, gin.H{"error": "download traffic quota exceeded"})
 			return
 		}
 	}
 
-	// Update last accessed time (if DB available)
+	// Update last accessed time (if DB available) after quota and before the body.
 	if h.db != nil {
 		syncTouchBlockLastAccessFn(h.db, orgID, internalID, time.Now())
 	}
 
-	c.Data(http.StatusOK, "application/octet-stream", data)
-
-	// Record sync download traffic — fire-and-forget.
-	if rec := traffic.Get(); rec != nil {
-		traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, orgID, userID, traffic.SyncDownload, int64(len(data)))
+	streamCtx, err := lifecycle.StartStreaming()
+	if err != nil {
+		if !c.Writer.Written() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block download temporarily unavailable"})
+		}
+		return
 	}
+
+	blockReader, err := openReader(streamCtx)
+	if err != nil {
+		lifecycle.FailStreamError(syncBlockDownloadStreamCause(err))
+		if !c.Writer.Written() {
+			if h.db != nil && !isSyncCanonicalBlockNotFound(err) {
+				log.Printf("GetBlock: failed to open canonical block %s (internal: %s): %v\n", externalID, internalID, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read block storage"})
+			} else {
+				log.Printf("GetBlock: block %s (internal: %s) not found: %v\n", externalID, internalID, err)
+				c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
+			}
+		}
+		return
+	}
+	defer blockReader.Close()
+
+	c.Header("Content-Type", "application/octet-stream")
+	if blockSize > 0 {
+		c.Header("Content-Length", strconv.FormatInt(blockSize, 10))
+	}
+	c.Status(http.StatusOK)
+
+	bytesBefore := int64(c.Writer.Size())
+	_, copyErr := io.Copy(c.Writer, blockReader)
+	bytesWritten := httputil.ResponseBytesSince(c.Writer, bytesBefore)
+	if bytesWritten > 0 {
+		if rec := traffic.Get(); rec != nil {
+			traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, orgID, userID, traffic.SyncDownload, bytesWritten)
+		}
+	}
+	if copyErr != nil {
+		lifecycle.FailStreamError(syncBlockDownloadStreamCause(copyErr))
+		log.Printf("GetBlock: stream failed for %s (internal: %s) after %d bytes: %v\n", externalID, internalID, bytesWritten, copyErr)
+	}
+}
+
+// acquireSyncBlockDownloadAdmission starts the shared D5 lifetime after the
+// endpoint's authentication, permission, and cheap mapping gates have passed.
+func (h *SyncHandler) acquireSyncBlockDownloadAdmission(c *gin.Context, orgID, userID string) (*httputil.DownloadAdmission, bool) {
+	cfg := config.DownloadAdmissionConfig{}
+	if h != nil && h.config != nil {
+		cfg = h.config.DownloadAdmission
+	}
+
+	request := downloadadmission.AdmissionRequest{}
+	if cfg.Enabled {
+		var err error
+		request, err = downloadadmission.NewAuthenticatedRequest(downloadadmission.ProfileBlock, orgID, userID)
+		if err != nil {
+			log.Printf("GetBlock: build download admission request: %v", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block download temporarily unavailable"})
+			return nil, false
+		}
+	}
+
+	lifecycle, reason, err := httputil.AcquireDownloadAdmission(c, h.downloadAdmission, cfg, request)
+	if err != nil {
+		log.Printf("GetBlock: acquire download admission: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block download temporarily unavailable"})
+		return nil, false
+	}
+	if reason != "" {
+		httputil.RenderDownloadAdmissionRefusal(c, h.downloadAdmission)
+		return nil, false
+	}
+	return lifecycle, true
+}
+
+func syncBlockDownloadStreamCause(err error) downloadadmission.ReleaseCause {
+	if err == nil {
+		return downloadadmission.ReleaseResponseError
+	}
+	if errors.Is(err, streaming.ErrStreamResponse) {
+		return downloadadmission.ReleaseResponseError
+	}
+	if errors.Is(err, context.Canceled) {
+		return downloadadmission.ReleaseClientDisconnect
+	}
+	return downloadadmission.ReleaseStorageError
 }
 
 // Body-size bounds for the legacy/sync seafhttp routes. Before these, PutBlock and

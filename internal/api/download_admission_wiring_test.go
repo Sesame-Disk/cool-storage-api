@@ -37,4 +37,10 @@ func TestServerInitializesAndWiresDownloadAdmissionCoordinator(t *testing.T) {
 	if seafHTTPHandler.downloadAdmission != s.downloadAdmission {
 		t.Fatal("SeafHTTP handler received a different download admission coordinator")
 	}
+
+	syncHandler := NewSyncHandler(nil, nil, nil, cfg, nil)
+	syncHandler.SetDownloadAdmissionCoordinator(s.downloadAdmission)
+	if syncHandler.downloadAdmission != s.downloadAdmission {
+		t.Fatal("Sync handler received a different download admission coordinator")
+	}
 }

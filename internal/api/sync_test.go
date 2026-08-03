@@ -21,12 +21,16 @@ import (
 )
 
 type syncCanonicalReaderStub struct {
-	data   map[string][]byte
-	exists map[string]bool
-	err    error
+	data          map[string][]byte
+	exists        map[string]bool
+	err           error
+	getBlockCalls int
+	readerCalls   int
+	sizeCalls     int
 }
 
 func (s *syncCanonicalReaderStub) GetBlock(_ context.Context, hash string) ([]byte, error) {
+	s.getBlockCalls++
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -34,16 +38,19 @@ func (s *syncCanonicalReaderStub) GetBlock(_ context.Context, hash string) ([]by
 }
 
 func (s *syncCanonicalReaderStub) GetBlockReader(ctx context.Context, hash string) (io.ReadCloser, error) {
-	data, err := s.GetBlock(ctx, hash)
-	if err != nil {
-		return nil, err
+	s.readerCalls++
+	if s.err != nil {
+		return nil, s.err
 	}
-	return io.NopCloser(bytes.NewReader(data)), nil
+	return io.NopCloser(bytes.NewReader(s.data[hash])), nil
 }
 
 func (s *syncCanonicalReaderStub) GetBlockSize(ctx context.Context, hash string) (int64, error) {
-	data, err := s.GetBlock(ctx, hash)
-	return int64(len(data)), err
+	s.sizeCalls++
+	if s.err != nil {
+		return 0, s.err
+	}
+	return int64(len(s.data[hash])), nil
 }
 
 func (s *syncCanonicalReaderStub) CheckBlocksExist(context.Context, []string, int) (map[string]bool, error) {
@@ -437,6 +444,7 @@ func TestGetBlockUsesCanonicalReaderAndMapsResolutionErrors(t *testing.T) {
 				syncTouchBlockLastAccessFn = oldTouch
 			})
 			syncTouchBlockLastAccessFn = func(*db.DB, string, string, time.Time) {}
+			var stub *syncCanonicalReaderStub
 			calls := 0
 			syncNewCanonicalBlockReaderFn = func(_ context.Context, _ *db.DB, _ *storage.Manager, orgID string, blockIDs []string, fallback *storage.BlockStore, fallbackClass string) (streaming.CanonicalBlockReader, error) {
 				calls++
@@ -449,10 +457,11 @@ func TestGetBlockUsesCanonicalReaderAndMapsResolutionErrors(t *testing.T) {
 				if tt.resolveErr != nil {
 					return nil, tt.resolveErr
 				}
-				return &syncCanonicalReaderStub{
+				stub = &syncCanonicalReaderStub{
 					data: map[string][]byte{blockID: []byte("canonical")},
 					err:  tt.readErr,
-				}, nil
+				}
+				return stub, nil
 			}
 
 			r := setupSyncTestRouter()
@@ -469,6 +478,20 @@ func TestGetBlockUsesCanonicalReaderAndMapsResolutionErrors(t *testing.T) {
 			}
 			if tt.wantBody != "" && w.Body.String() != tt.wantBody {
 				t.Fatalf("body = %q, want %q", w.Body.String(), tt.wantBody)
+			}
+			if tt.wantStatus == http.StatusOK {
+				if stub == nil {
+					t.Fatal("expected canonical reader stub")
+				}
+				if stub.getBlockCalls != 0 {
+					t.Fatalf("buffered GetBlock calls = %d, want 0", stub.getBlockCalls)
+				}
+				if stub.sizeCalls != 1 {
+					t.Fatalf("GetBlockSize calls = %d, want 1", stub.sizeCalls)
+				}
+				if stub.readerCalls != 1 {
+					t.Fatalf("GetBlockReader calls = %d, want 1", stub.readerCalls)
+				}
 			}
 		})
 	}

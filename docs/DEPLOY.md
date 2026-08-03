@@ -107,7 +107,7 @@ Why this is the supported deploy model:
 
 If you use a different proxy chain and do not preserve the canonicalized client IP at the last nginx hop, adjust `SERVER_TRUSTED_PROXIES` for that topology instead.
 
-### Download admission (D1-D4)
+### Download admission (D1-D5)
 
 D1 adds the process-local coordinator, bounded state, configuration schema and
 Prometheus series for storage-backed downloads. D2 makes the public download-
@@ -120,11 +120,13 @@ operating capacity. Every shipped YAML and env template therefore keeps
 D3 adds the reusable idle-write writer and makes the actual raw/history, share
 raw and public bootstrap paths bypass the Go gzip wrapper. The supported frontend
 nginx configuration disables both proxy buffering and gzip for all protected
-transfer locations, including `/seafhttp/`. D4 now wires the single bootstrapped
+transfer locations, including `/seafhttp/`. D4 wires the single bootstrapped
 coordinator, preparation context and idle-write lifecycle into file, ZIP, raw,
-history, share-raw and inline-text producers. D5 remains block GET work, and D6
-must still prove end-to-end slow-client behavior through the deployed nginx
-topology.
+history, share-raw and inline-text producers. D5 streams authenticated
+`GET /seafhttp/repo/:repo_id/block/:block_id` through
+`CanonicalBlockReader.GetBlockSize`/`GetBlockReader` under `ProfileBlock` on that
+same coordinator. D6 must still measure positive capacities and prove end-to-end
+slow-client behavior through the deployed nginx topology.
 
 Do not enable this section in production before D6 measurement.
 When D6 selects positive values, the following startup rules still apply:
@@ -134,7 +136,7 @@ When D6 selects positive values, the following startup rules still apply:
 - `server.write_timeout` must remain `0`; the coordinator owns the long-transfer idle-write deadline.
 - Public-link client attribution must use the trusted-proxy configuration above; do not derive a client IP from forwarded headers in application code.
 - D is process-local, so fleet capacity scales with the number of application nodes. It is not a cluster-global quota.
-- D4 constructs exactly one coordinator during server bootstrap and shares that pointer with every protected non-block producer; D1 intentionally does not enforce a process-global singleton so package tests can create isolated coordinators.
+- Bootstrap constructs exactly one coordinator and shares that pointer with every protected producer (including SyncHandler.GetBlock); D1 intentionally does not enforce a process-global singleton so package tests can create isolated coordinators.
 
 The coordinator updates `active_current`, `active_by_profile`, `entries_current`
 and `waiters_current` under one internal state transition, but Prometheus gathers
@@ -1005,7 +1007,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `SEAFHTTP_UPLOAD_LINK_SOURCE_WRITE_BURST` | `seafhttp.upload_link_source_write_burst` | Burst for the per-link bound. Default `24000`. Must be `> 0` while that rate is non-zero. |
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE` | `seafhttp.upload_link_max_inflight_per_source` | Non-blocking concurrent anonymous-write cap per stable public-link identity on one process. Default `16`; ceiling `4096`; `0` disables. Remints share the same source count. When both in-flight caps are enabled, this value must not exceed the per-node value. |
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE` | `seafhttp.upload_link_max_inflight_per_node` | Non-blocking concurrent anonymous-write cap across one process/node. Default `128`; ceiling `65536`; `0` disables. This is not cluster-global; aggregate fleet capacity scales with node count. |
-| `DOWNLOAD_ADMISSION_ENABLED` | `download_admission.enabled` | D1 schema only. Keep `false` until D4 wiring and D6 measurement are complete. |
+| `DOWNLOAD_ADMISSION_ENABLED` | `download_admission.enabled` | D1 schema only. Keep `false` until D6 measurement is complete (D1-D5 producer wiring is present). |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE` | `download_admission.max_active_per_node` | D6-selected process-local aggregate download cap. D1 template value is `0`; validation ceiling `1024`. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER` | `download_admission.max_active_per_auth_user` | Authenticated `(org, user)` cap. D1 template value is `0`; validation ceiling `1024`. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE` | `download_admission.max_active_per_link_source` | Stable public-link source cap. D1 template value is `0`; validation ceiling `1024`. |
