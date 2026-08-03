@@ -282,6 +282,67 @@ func TestFinishSeafHTTPZipDownloadAccountingPanicPreservesBodyPanic(t *testing.T
 	available.Release(downloadadmission.ReleaseCompleted)
 }
 
+// TestFinishSeafHTTPZipDownloadClosePanicWinsOverAccountingPanic pins the
+// re-panic priority when the archive close and the transfer accounting both
+// panic in the same deferred cleanup. Close runs first and describes the
+// response failure, so it is the panic the handler must see; the accounting
+// panic may not replace it, may not skip the transfer record that already
+// happened, and may not keep the lease.
+func TestFinishSeafHTTPZipDownloadClosePanicWinsOverAccountingPanic(t *testing.T) {
+	lifecycle, coordinator, c := newZipAdmissionLifecycleWithWriter(t, nil)
+	oldRecord := recordSeafHTTPDownloadTrafficFn
+	accountingCalls := 0
+	recordSeafHTTPDownloadTrafficFn = func(traffic.QuotaStatus, string, string, string, int64) {
+		accountingCalls++
+		panic("traffic accounting panic")
+	}
+	t.Cleanup(func() { recordSeafHTTPDownloadTrafficFn = oldRecord })
+
+	// The archive writes to a writer that panics, so the response bytes have to
+	// come from somewhere else for the accounting branch to be reachable.
+	bytesBefore := int64(c.Writer.Size())
+	if _, err := c.Writer.Write([]byte("zip payload")); err != nil {
+		t.Fatal(err)
+	}
+	accounting := &zipTrafficAccounting{
+		context:     c,
+		quotaStatus: traffic.QuotaStatus{PeriodStartedAt: time.Now()},
+		orgID:       "org-1",
+		userID:      "zip-user",
+		trafficType: traffic.WebDownload,
+		bytesBefore: bytesBefore,
+		active:      true,
+	}
+	cause := downloadadmission.ReleaseCompleted
+	beforePanic := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleasePanic)))
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		panicZip := zip.NewWriter(&zipClosePanicWriter{})
+		finishSeafHTTPZipDownload(lifecycle, &panicZip, &cause, accounting)
+	}()
+	if recovered != "ZIP close panic" {
+		t.Fatalf("recovered panic = %v, want ZIP close panic", recovered)
+	}
+	if accountingCalls != 1 {
+		t.Fatalf("accounting calls = %d, want 1; a close panic must not skip the transfer record", accountingCalls)
+	}
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleasePanic))); got != beforePanic+1 {
+		t.Fatalf("panic release count = %v, want %v", got, beforePanic+1)
+	}
+
+	request, err := downloadadmission.NewAuthenticatedRequest(downloadadmission.ProfileFile, "org-1", "other-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	available, reason := coordinator.Acquire(context.Background(), request)
+	if available == nil || reason != "" {
+		t.Fatalf("acquire after close+accounting panic = (%v, %q), want admission", available, reason)
+	}
+	available.Release(downloadadmission.ReleaseCompleted)
+}
+
 type zipClosePanicWriter struct{}
 
 func (*zipClosePanicWriter) Write([]byte) (int, error) {
