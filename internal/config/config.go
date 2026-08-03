@@ -438,6 +438,13 @@ type FileViewConfig struct {
 	MaxVideoBytes        int64    `yaml:"max_video_bytes"`         // Maximum file size for video preview (default: 10GB)
 	MaxTextBytes         int64    `yaml:"max_text_bytes"`          // Maximum file size for text preview (default: 50MB)
 	MaxIWorkPreviewBytes int64    `yaml:"max_iwork_preview_bytes"` // Maximum size for extracted iWork preview (default: 50MB)
+	// MaxIWorkSourceBytes caps the iWork *source* document, which the preview
+	// branch materialises whole. D6 measured the peak at ~4x the source for a
+	// plaintext library and ~6x when encrypted — a 256 MiB document costs 1.5 GiB
+	// — so the general 1 GiB preview limit is not an in-memory budget for this
+	// path. Sizing max_active_raw for it instead would throttle ordinary raw
+	// streams, which cost one block, by two orders of magnitude. Default 32 MiB.
+	MaxIWorkSourceBytes int64 `yaml:"max_iwork_source_bytes"`
 	PreviewExtensions    []string `yaml:"preview_extensions"`      // Extensions that should route to the frontend preview shell
 }
 
@@ -1461,6 +1468,7 @@ func DefaultConfig() *Config {
 			MaxVideoBytes:        10 * 1024 * 1024 * 1024, // 10 GB for videos (4K, long recordings)
 			MaxTextBytes:         50 * 1024 * 1024,        // 50 MB for text files (prevent browser freeze)
 			MaxIWorkPreviewBytes: 50 * 1024 * 1024,        // 50 MB for iWork previews
+			MaxIWorkSourceBytes:  32 * 1024 * 1024,        // 32 MiB source -> ~192 MiB measured peak when encrypted
 			PreviewExtensions:    defaultFileViewPreviewExtensions(),
 		},
 		EnforcementProfiles: map[string]EnforcementProfile{
@@ -2030,6 +2038,11 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("FILEVIEW_MAX_IWORK_PREVIEW_BYTES"); v != "" {
 		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.FileView.MaxIWorkPreviewBytes = i
+		}
+	}
+	if v := os.Getenv("FILEVIEW_MAX_IWORK_SOURCE_BYTES"); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.FileView.MaxIWorkSourceBytes = i
 		}
 	}
 	if v := os.Getenv("FILEVIEW_PREVIEW_EXTENSIONS"); v != "" {

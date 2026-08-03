@@ -1034,6 +1034,16 @@ func extractIWorkPreviewPDFContext(ctx context.Context, data []byte, maxPreviewS
 // Text files get a lower limit (50MB default) to prevent browser freezing.
 // Other files get the general preview limit (1GB default).
 func (h *FileViewHandler) getMaxFileSizeForPreview(ext string) int64 {
+	// iWork is the only preview that materialises the whole source in memory, so
+	// it gets its own source cap rather than the general preview limit. D6
+	// measured the peak at ~4x the source plaintext and ~6x encrypted, which
+	// makes the 1 GiB general limit a multi-gigabyte per-request budget on this
+	// one branch. Capping the source here is the cheap lever; the alternative —
+	// shrinking max_active_raw — would throttle ordinary raw streams that cost a
+	// single block.
+	if isAppleIWorkFile(ext) && h.config.FileView.MaxIWorkSourceBytes > 0 {
+		return h.config.FileView.MaxIWorkSourceBytes
+	}
 	// Videos need large limits (4K, long recordings)
 	if isVideoFile(ext) {
 		return h.config.FileView.MaxVideoBytes
