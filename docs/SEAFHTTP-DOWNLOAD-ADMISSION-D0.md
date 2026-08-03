@@ -604,10 +604,30 @@ does not prove that the browser/client is controlling admission lifetime.
 
 The deadline contract is:
 
-> Before the first actual write or flush, install an idle-write deadline at
+> The idle interval opens when the request **enters streaming**, not when it
+> first produces output: `StartStreaming` installs a deadline at
 > `now + idle_write_timeout`. Each successful output progress sets the next
 > absolute deadline at `progress time + idle_write_timeout`; a later write or
 > flush installs that same deadline rather than extending it.
+
+Opening the interval at the phase change rather than at the first byte is a
+correction to the original D3 wording, made after `SyncHandler.GetBlock` showed
+what "before the first actual write" left uncovered: preparation is already over
+at that point, so a first storage read that never returns had no deadline of any
+kind. See `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01`.
+
+Two consequences follow, and both are contract, not implementation detail:
+
+- **A deferred header preserves the interval.** Gin records a status without
+  committing it, so `c.Status(200)` reaches the writer with nothing written. That
+  is not progress and must not extend the interval, but it must not clear it
+  either — clearing is what would reopen the gap immediately after arming. Before
+  the interval is opened, a deferred header still leaves no timer.
+- **The total span may approach `2 × idle_write_timeout`** when the first byte
+  arrives just before the initial interval expires, because progress legitimately
+  restarts the interval from the progress instant. What is forbidden is the
+  initial callback surviving that progress, two intervals stacking, or a deferred
+  status resetting the clock.
 
 Beginning a later write must not grant a second full idle period, and a deferred
 status assignment that has not committed headers must not start the idle timer.
@@ -1011,7 +1031,7 @@ deployment for token issuance.
 | D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Merged in `main`; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
 | D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | Complete: one bootstrapped coordinator covers all listed non-block producers through preparation and response lifetime |
 | D5 | Stream sync block GET through existing canonical reader APIs | Complete: `SyncHandler.GetBlock` uses `GetBlockSize`/`GetBlockReader` under `ProfileBlock` on the shared coordinator; neither the canonical nor the legacy no-metadata path materializes the whole block; traffic uses bytes written |
-| D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass. **Prerequisite:** `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` must close first — an admitted request currently has no D-owned deadline between the end of preparation and its first response write, so enabling positive capacities before that fix would ship slots that can be held indefinitely |
+| D6 | Fault evidence, client recovery, measurements and final closure docs | Closure only after all criteria pass. Its prerequisite `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` closed 2026-08-03: the idle interval now opens at the streaming phase change, so no phase of an admitted download is unbounded |
 
 The B/C `syncAdmissionLimiter` remains in `internal/api` during this series.
 Its white-box tests inspect unexported state, so extracting it to

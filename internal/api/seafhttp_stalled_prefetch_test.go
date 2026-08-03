@@ -1,0 +1,155 @@
+package api
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/downloadadmission"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
+	"github.com/Sesame-Disk/sesamefs/internal/streaming"
+	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+)
+
+// stalledPrefetchReader blocks the very first block read until its context is
+// cancelled, then holds the return so the test can inspect the window where the
+// prefetch is cancelled but still running.
+type stalledPrefetchReader struct {
+	cancellationObserved chan struct{}
+	allowReturn          chan struct{}
+}
+
+func (r *stalledPrefetchReader) GetBlock(ctx context.Context, _ string) ([]byte, error) {
+	<-ctx.Done()
+	close(r.cancellationObserved)
+	<-r.allowReturn
+	return nil, ctx.Err()
+}
+
+func (r *stalledPrefetchReader) GetBlockReader(ctx context.Context, _ string) (io.ReadCloser, error) {
+	<-ctx.Done()
+	close(r.cancellationObserved)
+	<-r.allowReturn
+	return nil, ctx.Err()
+}
+
+func (r *stalledPrefetchReader) GetBlockSize(context.Context, string) (int64, error) {
+	return 0, nil
+}
+
+func stalledPrefetchAdmissionConfig() config.DownloadAdmissionConfig {
+	cfg := zipAdmissionConfig()
+	cfg.IdleWriteTimeout = 80 * time.Millisecond
+	return cfg
+}
+
+type stalledPrefetchWriter struct {
+	gin.ResponseWriter
+}
+
+func (w *stalledPrefetchWriter) SetWriteDeadline(time.Time) error { return nil }
+
+// TestStreamBlocksStalledFirstPrefetchIsBoundedByIdleInterval is the D4 half of
+// the pre-first-write gap. streamFileFromBlocks calls StartStreaming, sets
+// headers, calls c.Status(200) and only then enters StreamBlocks, which starts
+// prefetching block 0 before emitting any byte. Until the idle interval opened
+// at the phase change, that first storage read ran with no deadline of its own.
+//
+// The deferred c.Status(200) is part of the regression rather than incidental
+// setup: it is the call that used to clear the interval a moment after it began,
+// because Gin only records the status and leaves the writer uncommitted.
+func TestStreamBlocksStalledFirstPrefetchIsBoundedByIdleInterval(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := stalledPrefetchAdmissionConfig()
+	coordinator, err := downloadadmission.New(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseRecorder := httptest.NewRecorder()
+	baseContext, _ := gin.CreateTestContext(baseRecorder)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Writer = &stalledPrefetchWriter{ResponseWriter: baseContext.Writer}
+	c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/files/token/name.bin", nil)
+
+	request, err := downloadadmission.NewAuthenticatedRequest(downloadadmission.ProfileFile, "org-1", "file-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, reason, err := httputil.AcquireDownloadAdmission(c, coordinator, cfg, request)
+	if err != nil || reason != "" || lifecycle == nil {
+		t.Fatalf("AcquireDownloadAdmission = (%v, %q, %v)", lifecycle, reason, err)
+	}
+
+	streamCtx, err := lifecycle.StartStreaming()
+	if err != nil {
+		t.Fatalf("StartStreaming = %v", err)
+	}
+
+	// Exactly what streamFileFromBlocks does before entering StreamBlocks.
+	c.Header("Content-Type", "application/octet-stream")
+	c.Status(http.StatusOK)
+
+	reader := &stalledPrefetchReader{
+		cancellationObserved: make(chan struct{}),
+		allowReturn:          make(chan struct{}),
+	}
+
+	beforeIdle := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseIdleWriteTimeout)))
+	beforeCompleted := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseCompleted)))
+
+	streamReturned := make(chan error, 1)
+	go func() {
+		streamReturned <- streaming.StreamBlocks(c, streamCtx, reader, []string{"block-0"}, nil, nil, "stalled-prefetch-test")
+	}()
+
+	select {
+	case <-reader.cancellationObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stalled first prefetch was never cancelled; c.Status(200) or the missing interval left it unbounded")
+	}
+
+	if got := c.Writer.Size(); got > 0 {
+		t.Fatalf("wrote %d bytes before the prefetch blocked; this case must exercise the pre-first-write window", got)
+	}
+	// Cancelled but still running: the capacity is still in use.
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionActiveCurrent); got != 1 {
+		t.Fatalf("active admissions while the cancelled prefetch is still running = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseIdleWriteTimeout))); got != beforeIdle {
+		t.Fatalf("idle_write_timeout releases = %v, want unchanged %v until the producer finishes", got, beforeIdle)
+	}
+
+	close(reader.allowReturn)
+	select {
+	case streamErr := <-streamReturned:
+		if streamErr == nil {
+			t.Fatal("StreamBlocks returned nil after its first prefetch was cancelled")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StreamBlocks did not return after the cancelled prefetch unwound")
+	}
+
+	// The producer's deferred cleanup is what physically frees the slot.
+	if err := lifecycle.Finish(downloadadmission.ReleaseCompleted); err != nil && err != httputil.ErrIdleWriteTimeout {
+		t.Fatalf("finish: %v", err)
+	}
+
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionActiveCurrent); got != 0 {
+		t.Fatalf("active admissions after unwind = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseIdleWriteTimeout))); got != beforeIdle+1 {
+		t.Fatalf("idle_write_timeout releases = %v, want exactly one more than %v", got, beforeIdle)
+	}
+	// Finish was asked for `completed`, but the timeout claimed first and wins.
+	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(downloadadmission.ReleaseCompleted))); got != beforeCompleted {
+		t.Fatalf("completed releases = %v, want unchanged %v; the first cause must win", got, beforeCompleted)
+	}
+}

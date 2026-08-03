@@ -237,11 +237,41 @@ func (l *DownloadAdmission) StartStreaming() (context.Context, error) {
 	l.ginContext.Writer = writer
 	l.mu.Unlock()
 
+	// Open the idle interval before the preparation deadline is retired, so no
+	// externally reachable state has both deadlines off. Arming outside the mutex
+	// is deliberate: the timer callback claims the terminal cause and would
+	// deadlock against a lock held across the arm.
+	if err := writer.StartIdleInterval(); err != nil {
+		l.rollbackStreamingTransition(writer, cancel)
+		return nil, err
+	}
+
 	if stopPreparation != nil {
 		stopPreparation()
 	}
 	prepareCancel()
 	return streaming, nil
+}
+
+// rollbackStreamingTransition undoes a half-completed streaming transition when
+// the idle interval could not be armed. The producer has not touched storage
+// yet, so failing closed here costs nothing and leaves the connection in the
+// state it had before the transition.
+func (l *DownloadAdmission) rollbackStreamingTransition(writer *IdleWriteWriter, cancel context.CancelFunc) {
+	_ = writer.Finish()
+
+	l.mu.Lock()
+	if l.writer == writer {
+		l.ginContext.Writer = l.originalWriter
+		l.writer = nil
+	}
+	l.streaming = nil
+	l.streamCancel = nil
+	l.mu.Unlock()
+
+	cancel()
+	l.lease.RecordWriterUnreachable()
+	l.Fail(downloadadmission.ReleaseResponseError)
 }
 
 // Finish stops the idle-write writer, clears its connection deadline, restores

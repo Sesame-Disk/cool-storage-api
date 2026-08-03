@@ -81,6 +81,43 @@ func NewIdleWriteWriter(w gin.ResponseWriter, opts IdleWriteOptions) (*IdleWrite
 	return writer, nil
 }
 
+// StartIdleInterval opens the idle interval before any output exists, so the
+// span between admission's phase change and the first byte is bounded too.
+// Without it the timer is armed only by real progress, leaving a stalled first
+// storage read holding its slot with no deadline at all: the preparation
+// deadline is already over and no write has happened yet.
+//
+// It is deliberately separate from NewIdleWriteWriter, which owns only the
+// reachability probe. DownloadAdmission.StartStreaming is the single caller;
+// arming twice is a no-op rather than a second timer.
+func (w *IdleWriteWriter) StartIdleInterval() error {
+	w.mu.Lock()
+	if w.finished || w.failed {
+		err := w.err
+		if err == nil {
+			err = ErrIdleWriteTimeout
+		}
+		w.mu.Unlock()
+		return err
+	}
+	if !w.progressDeadline.IsZero() {
+		w.mu.Unlock()
+		return nil
+	}
+	w.timerGeneration++
+	generation := w.timerGeneration
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	// No socket deadline here: nothing is being written yet. beforeWrite installs
+	// one from this absolute deadline when a write actually begins, so the first
+	// write inherits the remaining interval instead of a fresh full one.
+	w.progressDeadline = time.Now().Add(w.timeout)
+	w.timer = time.AfterFunc(time.Until(w.progressDeadline), func() { w.expire(generation) })
+	w.mu.Unlock()
+	return nil
+}
+
 // SetWriteDeadline exposes the connection capability to ResponseController and
 // delegates through the original writer chain.
 func (w *IdleWriteWriter) SetWriteDeadline(deadline time.Time) error {
@@ -145,7 +182,7 @@ func (w *IdleWriteWriter) WriteHeader(status int) {
 		_ = w.progress()
 		return
 	}
-	_ = w.clearDeadlineWithoutProgress()
+	_ = w.restoreIdleIntervalWithoutProgress()
 }
 
 func (w *IdleWriteWriter) WriteHeaderNow() {
@@ -161,7 +198,7 @@ func (w *IdleWriteWriter) WriteHeaderNow() {
 		_ = w.progress()
 		return
 	}
-	_ = w.clearDeadlineWithoutProgress()
+	_ = w.restoreIdleIntervalWithoutProgress()
 }
 
 // FlushError is the error-returning form used by D4. Flush remains available
@@ -195,6 +232,7 @@ func (w *IdleWriteWriter) Finish() error {
 	w.progressDeadline = time.Time{}
 	if w.timer != nil {
 		w.timer.Stop()
+		w.timer = nil
 	}
 	err := w.err
 	onError := w.onError
@@ -261,7 +299,17 @@ func (w *IdleWriteWriter) beforeWrite() error {
 	return nil
 }
 
-func (w *IdleWriteWriter) clearDeadlineWithoutProgress() error {
+// restoreIdleIntervalWithoutProgress undoes the socket deadline beforeWrite
+// installed for a write that turned out not to commit any output, such as Gin
+// recording a deferred status.
+//
+// A deferred header is not progress, so it must not extend the interval — but it
+// must not erase it either. Clearing it outright is what would reopen the gap
+// StartIdleInterval exists to close: `c.Status(200)` right after the phase change
+// would cancel the only deadline covering the first storage read. The original
+// absolute deadline is therefore re-armed unchanged, and the pre-arming case
+// still ends with no timer at all.
+func (w *IdleWriteWriter) restoreIdleIntervalWithoutProgress() error {
 	w.mu.Lock()
 	if w.finished || w.failed {
 		err := w.err
@@ -272,7 +320,7 @@ func (w *IdleWriteWriter) clearDeadlineWithoutProgress() error {
 		return err
 	}
 	w.timerGeneration++
-	w.progressDeadline = time.Time{}
+	generation := w.timerGeneration
 	if w.timer != nil {
 		w.timer.Stop()
 		w.timer = nil
@@ -282,6 +330,9 @@ func (w *IdleWriteWriter) clearDeadlineWithoutProgress() error {
 		w.mu.Unlock()
 		w.notifyFailure(err, cancel, onTimeout, onError)
 		return err
+	}
+	if !w.progressDeadline.IsZero() {
+		w.timer = time.AfterFunc(time.Until(w.progressDeadline), func() { w.expire(generation) })
 	}
 	w.mu.Unlock()
 	return nil

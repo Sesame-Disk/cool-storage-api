@@ -19,8 +19,8 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B, C and D1-D5 are complete. D5 streams block GET through the canonical reader under `ProfileBlock`. D6 remains open, and it is not measurement alone: the shared pre-first-write admission gap (ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01) must close before positive capacities are enabled. The supported frontend disables gzip and proxy buffering for D transfer routes. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
-| **Download admission has no bound before the first write** | 🔴 Open — blocks D6 enablement | Between `StartStreaming()` and the first successful response write, the preparation deadline is over and the idle-write timer is not armed yet, so a stalled first storage read holds an admission slot with no D-owned bound. Shared by D4 and D5, not introduced by either. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
+| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B, C and D1-D5 are complete. D5 streams block GET through the canonical reader under `ProfileBlock`, and the shared pre-first-write admission gap (ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01) is fixed, so every phase of an admitted download is now bounded. D6 — measured production capacities and real-nginx evidence — remains open. The supported frontend disables gzip and proxy buffering for D transfer routes. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
+| **Download admission has no bound before the first write** | ✅ Fixed (2026-08-03) | The idle interval now opens at the streaming phase change instead of at the first byte, and a deferred Gin status preserves it rather than clearing it. A stalled first storage read is cancelled by `idle_write_timeout` on both the D4 and D5 producers. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
 | **Anonymous object-storage downloads** | 🔴 Open — production posture blocker | Supported Compose storage policies currently grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
@@ -5111,7 +5111,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces and equivalent storage-backed read surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B, C and D1-D5 are closed**; **D6 remains open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, D3 supplies the idle-write writer plus actual-route gzip/proxy reachability, D4 wires one coordinator through the listed non-block producer lifetimes, and D5 streams authenticated block GET through `CanonicalBlockReader` under `ProfileBlock` without full-block materialization. No positive capacity has been measured, and D6 is more than measurement: `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` — an admitted request has no D-owned deadline between the end of preparation and its first response write — is a hard prerequisite for enabling the section, and is shared by the D4 and D5 producers rather than introduced by either. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C/D1-D5 does not close the B4 umbrella.
+**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B, C and D1-D5 are closed**; **D6 remains open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, D3 supplies the idle-write writer plus actual-route gzip/proxy reachability, D4 wires one coordinator through the listed non-block producer lifetimes, and D5 streams authenticated block GET through `CanonicalBlockReader` under `ProfileBlock` without full-block materialization. No positive capacity has been measured. `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01`, which left an admitted request with no D-owned deadline between the end of preparation and its first response write, was fixed in the shared lifecycle on 2026-08-03 and no longer gates D6. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C/D1-D5 does not close the B4 umbrella.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`, `GET /seafhttp/zip/:token`, `GET /repo/:repo_id/raw/*filepath`, `GET /repo/:repo_id/history/download`, `GET /repo/:repo_id/history/raw`, share-link raw under `/d/:token`, and the share-file bootstrap inline-content read. D's authoritative producer inventory is the D0 contract, not this list
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5852,9 +5852,10 @@ historical: B right-sized and bounded that path; it is not remaining D work.
 
 ### ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01: Download admission has no deadline between preparation and the first response write
 
-**Status**: 🔴 **Open** — **blocks D6 enablement**. Not a regression from any single
-subcontract: the gap is in the shared D3 phase change and is reachable through
-both the D4 and D5 producers.
+**Status**: ✅ **Fixed 2026-08-03**. Was never a regression from any single
+subcontract: the gap was in the shared D3 phase change and was reachable through
+both the D4 and D5 producers, so the fix landed in the shared lifecycle rather
+than in either handler. No longer blocks D6.
 **Severity**: High once `download_admission.enabled` is true; latent while it is
 false, which it is in every shipped configuration.
 **Affected**: `httputil.DownloadAdmission.StartStreaming` /
@@ -5899,25 +5900,54 @@ Committing headers with `WriteHeaderNow()` would arm the timer, but it forfeits
 the ability to answer `404`/`500` on a post-preflight race and would have to be
 repeated in every producer.
 
-The intended fix is in the shared lifecycle: `StartStreaming` should arm the idle
-deadline immediately, so "admitted but not yet producing output" is itself an
-idle interval. That closes both producers at once and preserves the pre-header
-error responses. It must demonstrate that the deadline is active from the end of
-preparation, that a stalled `GetBlockReader`/first prefetch cancels `streamCtx`,
-that the first real progress restarts the interval from that progress, that
-`Finish` clears timer and deadline, that stale timer callbacks cannot fire, that
-the terminal cause stays first-wins, and that the lease returns to zero. The two
-required regressions are a blocked `GetBlockReader` on the D5 path and a blocked
-first prefetch on the D4 path, each proving bounded time, a non-`completed`
-cause and `active_current == 0`.
+**The fix** landed in the shared lifecycle, as **two** rules rather than one.
+Arming the interval at the phase change is necessary but **not sufficient**:
 
-**Why this is not a merge blocker for D5**: D5 reproduces D4's shape rather than
+1. `IdleWriteWriter.StartIdleInterval()` opens the interval before any output
+   exists, and `DownloadAdmission.StartStreaming` is its only caller. It is
+   separate from `NewIdleWriteWriter`, which keeps owning the reachability probe,
+   and arming twice is a no-op rather than a second timer. Arming happens after
+   the writer is installed but **before** the preparation deadline is retired, so
+   no externally reachable state has both deadlines off, and it runs outside the
+   lifecycle mutex because the timer callback claims the terminal cause. If it
+   fails, the transition rolls back completely: original writer restored, partial
+   deadline cleared, `streamCtx` cancelled, a non-`completed` cause claimed, and
+   an error returned before the producer touches storage.
+2. A **deferred header preserves the interval**. `WriteHeader`/`WriteHeaderNow`
+   previously took `clearDeadlineWithoutProgress()` when Gin recorded a status
+   without committing, which would have erased the new interval a moment after it
+   was armed — `c.Status(200)` sits exactly there in both producers. It now
+   restores the original absolute deadline instead: a deferred header is not
+   progress, so it must not extend the interval, but it must not delete it
+   either. Before arming, the pre-existing "no timer at all" behaviour is kept.
+
+Real progress still replaces the interval from the progress instant, so the total
+span since the phase change can approach `2 × idle_write_timeout` when the first
+byte arrives just before the initial interval ends. That is correct — there was
+progress. What must not happen, and is regressed, is the initial callback
+surviving, two intervals stacking, or a deferred status resetting the clock.
+
+Release ordering is unchanged and now pinned: the timeout claims the cause and
+cancels `streamCtx`, but the lease is released only when the producer's deferred
+`Finish` runs. Freeing capacity from the timeout callback while the cancelled
+read is still executing would let the coordinator admit past its real ceiling.
+
+Coverage: writer-level regressions for arming without output, idempotent arming,
+deferred-header preservation before and after arming, first progress replacing
+the initial interval, `Finish` clearing both timer and deadline, and expiry with
+no output at all; producer-level regressions for a blocked `GetBlockReader` (D5)
+and a blocked first prefetch (D4), each proving cancellation in bounded time, the
+lease still held while the cancelled work runs, exactly one `idle_write_timeout`
+release afterwards, nothing counted as `completed`, and `active_current == 0`;
+plus fast-failure cases proving a reader open that fails quickly still answers
+`404`/`500`, since arming must not commit headers. Removing either rule fails its
+regression, mutation-verified — and the D4 producer test fails on rule 2 alone,
+which is the evidence that arming by itself would not have closed the gap.
+
+**Why this was not a merge blocker for D5**: D5 reproduced D4's shape rather than
 introducing a new gap, `download_admission.enabled` is `false` in every shipped
-configuration, and a D5-local workaround would duplicate logic while leaving D4
-exposed. **Why it is a hard requirement before D6**: D6 is the phase that selects
-positive capacities and enables the section, and enabling it with this gap open
-would ship an admission control whose slots can be held indefinitely. D6 is
-therefore not "measurements and nginx evidence" alone — this must close first.
+configuration, and a D5-local workaround would have duplicated logic while
+leaving D4 exposed.
 
 ---
 

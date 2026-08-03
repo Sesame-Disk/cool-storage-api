@@ -126,15 +126,13 @@ history, share-raw and inline-text producers. D5 streams authenticated
 `GET /seafhttp/repo/:repo_id/block/:block_id` through
 `CanonicalBlockReader.GetBlockSize`/`GetBlockReader` under `ProfileBlock` on that
 same coordinator. D6 must still measure positive capacities and prove end-to-end
-slow-client behavior through the deployed nginx topology, and it must first close
-`ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01`: between the end of preparation
-and a request's first response write there is currently no D-owned deadline, so a
-stalled first storage read holds its slot until the client disconnects or the
-object-store SDK times out.
+slow-client behavior through the deployed nginx topology.
+`ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` closed on 2026-08-03: the idle
+interval now opens when a request enters streaming rather than at its first byte,
+so a stalled first storage read is cancelled by `idle_write_timeout` instead of
+holding its slot until the client disconnects or the object-store SDK gives up.
 
-Do not enable this section in production before D6 measurement, and not while the
-pre-first-write gap above is open — with it, a configured capacity is not an
-effective bound.
+Do not enable this section in production before D6 measurement.
 When D6 selects positive values, the following startup rules still apply:
 
 - `max_active_per_node`, every identity cap, `preparation_deadline`, `idle_write_timeout` and `retry_after` must be positive.
