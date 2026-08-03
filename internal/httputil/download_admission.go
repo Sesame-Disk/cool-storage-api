@@ -302,9 +302,13 @@ func (l *DownloadAdmission) Finish(cause downloadadmission.ReleaseCause) error {
 		l.finishCause(cause)
 	}
 	// The response lifetime is not over until the status is committed, so the
-	// error goes out before the slot is handed back.
+	// error goes out before the slot is handed back. The release is deferred
+	// rather than a plain statement after it for the same reason the ZIP producer
+	// registers its release before the close: a writer that panics while
+	// committing the status would otherwise strand the slot for the life of the
+	// process.
+	defer l.releaseLease()
 	l.writeUnstartedFailure()
-	l.releaseLease()
 	return err
 }
 

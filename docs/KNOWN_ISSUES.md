@@ -5931,6 +5931,12 @@ Release ordering is unchanged and now pinned: the timeout claims the cause and
 cancels `streamCtx`, but the lease is released only when the producer's deferred
 `Finish` runs. Freeing capacity from the timeout callback while the cancelled
 read is still executing would let the coordinator admit past its real ceiling.
+Within `Finish`, the failure response is committed before the slot is handed
+back — the response lifetime is not over while the status is uncommitted — and
+the release itself is deferred rather than a plain statement afterwards, for the
+same reason the ZIP producer registers its release before `zipWriter.Close`: a
+response writer that panics while committing would otherwise strand the slot for
+the life of the process.
 
 Bounding the phase exposed a terminal state that did not exist while it hung, and
 closing it is part of this fix. A failed writer rejects **every** later write,

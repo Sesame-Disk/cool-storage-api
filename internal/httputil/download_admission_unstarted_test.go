@@ -141,6 +141,67 @@ func TestDownloadAdmissionFinishLeavesCommittedResponseAlone(t *testing.T) {
 	}
 }
 
+// panicOnCommitWriter defers its header like Gin and then panics when the status
+// is finally committed.
+type panicOnCommitWriter struct {
+	*idleWriteTestWriter
+}
+
+func (w *panicOnCommitWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *panicOnCommitWriter) WriteHeaderNow() {
+	panic("response writer exploded while committing the status")
+}
+
+// TestDownloadAdmissionFinishReleasesLeaseWhenCommitPanics keeps the "the lease
+// is always released" property whole. Emitting the failure response is response
+// cleanup that runs before the release, so a plain statement afterwards would be
+// skipped by a panic and strand the slot for the life of the process — the same
+// reason the ZIP producer registers its release before zipWriter.Close.
+func TestDownloadAdmissionFinishReleasesLeaseWhenCommitPanics(t *testing.T) {
+	cfg := admissionLifecycleConfig()
+	cfg.IdleWriteTimeout = 25 * time.Millisecond
+	coordinator := newAdmissionLifecycleCoordinator(t, cfg)
+
+	base := &panicOnCommitWriter{idleWriteTestWriter: newIdleWriteTestWriter()}
+	c, _ := newAdmissionLifecycleContext(context.Background(), base)
+	lifecycle, reason, err := AcquireDownloadAdmission(c, coordinator, cfg, admissionLifecycleRequest(t, "commit-panic"))
+	if err != nil || reason != "" {
+		t.Fatalf("AcquireDownloadAdmission = (%q, %v)", reason, err)
+	}
+	streaming, err := lifecycle.StartStreaming()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-streaming.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle interval did not cancel without output")
+	}
+
+	beforeIdle := releaseCount(downloadadmission.ReleaseIdleWriteTimeout)
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("expected the writer panic to propagate")
+			}
+		}()
+		_ = lifecycle.Finish(downloadadmission.ReleaseCompleted)
+	}()
+
+	waitForMetric(t, func() float64 { return releaseCount(downloadadmission.ReleaseIdleWriteTimeout) }, beforeIdle+1)
+
+	// The slot must be usable again even though committing the error blew up.
+	next, reason := coordinator.Acquire(context.Background(), admissionLifecycleRequest(t, "after-panic"))
+	if next == nil {
+		t.Fatalf("acquire after a panicking commit = %q; the slot was stranded", reason)
+	}
+	next.Release(downloadadmission.ReleaseCompleted)
+}
+
 // TestDownloadAdmissionCompletedLosesToAFailedWriter pins the classification
 // race. The writer commits to failed under its own mutex and only afterwards
 // calls back to claim the cause here, so a handler finishing inside that window
