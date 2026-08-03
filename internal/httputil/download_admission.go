@@ -251,6 +251,9 @@ func (l *DownloadAdmission) Finish(cause downloadadmission.ReleaseCause) error {
 	if l == nil || !l.enabled {
 		return nil
 	}
+	if cause != downloadadmission.ReleaseCompleted {
+		l.finishCause(cause)
+	}
 	l.mu.Lock()
 	writer := l.writer
 	l.mu.Unlock()
@@ -262,7 +265,9 @@ func (l *DownloadAdmission) Finish(cause downloadadmission.ReleaseCause) error {
 		l.ginContext.Writer = l.originalWriter
 		l.mu.Unlock()
 	}
-	l.finishCause(cause)
+	if cause == downloadadmission.ReleaseCompleted {
+		l.finishCause(cause)
+	}
 	l.releaseLease()
 	return err
 }
@@ -272,6 +277,7 @@ func (l *DownloadAdmission) Finish(cause downloadadmission.ReleaseCause) error {
 // rather than the normal completed path.
 func (l *DownloadAdmission) FinishHandler() {
 	if recovered := recover(); recovered != nil {
+		l.Fail(downloadadmission.ReleasePanic)
 		_ = l.Finish(downloadadmission.ReleasePanic)
 		panic(recovered)
 	}

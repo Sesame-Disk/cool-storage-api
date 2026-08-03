@@ -13,6 +13,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/downloadadmission"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -27,7 +28,7 @@ type zipCloseGateResponseWriter struct {
 func (w *zipCloseGateResponseWriter) Write(p []byte) (int, error) {
 	w.once.Do(func() { close(w.started) })
 	<-w.allow
-	return len(p), nil
+	return w.ResponseWriter.Write(p)
 }
 
 func (*zipCloseGateResponseWriter) SetWriteDeadline(time.Time) error { return nil }
@@ -88,13 +89,28 @@ func TestFinishSeafHTTPZipDownloadHoldsLeaseThroughClose(t *testing.T) {
 	if _, err := lifecycle.StartStreaming(); err != nil {
 		t.Fatalf("StartStreaming = %v", err)
 	}
+	oldRecord := recordSeafHTTPDownloadTrafficFn
+	var recorded []int64
+	recordSeafHTTPDownloadTrafficFn = func(_ traffic.QuotaStatus, _, _, _ string, bytes int64) {
+		recorded = append(recorded, bytes)
+	}
+	t.Cleanup(func() { recordSeafHTTPDownloadTrafficFn = oldRecord })
+	accounting := &zipTrafficAccounting{
+		context:     c,
+		quotaStatus: traffic.QuotaStatus{PeriodStartedAt: time.Now()},
+		orgID:       "org-1",
+		userID:      "zip-user",
+		trafficType: traffic.WebDownload,
+		bytesBefore: int64(c.Writer.Size()),
+		active:      true,
+	}
 	zipWriter := zip.NewWriter(c.Writer)
 	cause := downloadadmission.ReleaseStorageError
 	beforeRelease := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(cause)))
 	lifecycle.FailStreamError(cause)
 	done := make(chan struct{})
 	go func() {
-		finishSeafHTTPZipDownload(lifecycle, &zipWriter, &cause)
+		finishSeafHTTPZipDownload(lifecycle, &zipWriter, &cause, accounting)
 		close(done)
 	}()
 
@@ -105,6 +121,9 @@ func TestFinishSeafHTTPZipDownloadHoldsLeaseThroughClose(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(cause))); got != beforeRelease {
 		t.Fatalf("release count during ZIP close = %v, want %v", got, beforeRelease)
+	}
+	if len(recorded) != 0 {
+		t.Fatalf("traffic records during ZIP close = %v, want none", recorded)
 	}
 	request, err := downloadadmission.NewAuthenticatedRequest(downloadadmission.ProfileFile, "org-1", "other-user")
 	if err != nil {
@@ -124,6 +143,9 @@ func TestFinishSeafHTTPZipDownloadHoldsLeaseThroughClose(t *testing.T) {
 	if got := testutil.ToFloat64(metrics.DownloadAdmissionReleasedTotal.WithLabelValues(string(cause))); got != beforeRelease+1 {
 		t.Fatalf("release count after ZIP close = %v, want %v", got, beforeRelease+1)
 	}
+	if len(recorded) != 1 || recorded[0] <= 0 {
+		t.Fatalf("traffic records after ZIP close = %v, want one positive delta", recorded)
+	}
 
 	available, reason := coordinator.Acquire(context.Background(), request)
 	if available == nil || reason != "" {
@@ -140,7 +162,7 @@ func TestFinishSeafHTTPZipDownloadPreservesBodyPanicCause(t *testing.T) {
 		defer func() { recovered = recover() }()
 		var zipWriter *zip.Writer
 		cause := downloadadmission.ReleaseStorageError
-		defer finishSeafHTTPZipDownload(lifecycle, &zipWriter, &cause)
+		defer finishSeafHTTPZipDownload(lifecycle, &zipWriter, &cause, nil)
 		panic("ZIP body panic")
 	}()
 	if recovered != "ZIP body panic" {
@@ -163,7 +185,7 @@ func TestFinishSeafHTTPZipDownloadPreservesClosePanicCause(t *testing.T) {
 		// panics during the central-directory write.
 		panicWriter := &zipClosePanicWriter{}
 		panicZip := zip.NewWriter(panicWriter)
-		finishSeafHTTPZipDownload(lifecycle, &panicZip, &cause)
+		finishSeafHTTPZipDownload(lifecycle, &panicZip, &cause, nil)
 	}()
 	if recovered != "ZIP close panic" {
 		t.Fatalf("recovered panic = %v, want ZIP close panic", recovered)

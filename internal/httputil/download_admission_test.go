@@ -576,3 +576,38 @@ func TestDownloadAdmissionFinishHandlerPreservesPanic(t *testing.T) {
 		t.Fatalf("panic release count = %v, want %v", got, before+1)
 	}
 }
+
+func TestDownloadAdmissionFinishHandlerClaimsPanicBeforeWriterCleanup(t *testing.T) {
+	cfg := admissionLifecycleConfig()
+	coordinator := newAdmissionLifecycleCoordinator(t, cfg)
+	underlying := newIdleWriteTestWriter()
+	c, _ := newAdmissionLifecycleContext(context.Background(), underlying)
+	lifecycle, reason, err := AcquireDownloadAdmission(c, coordinator, cfg, admissionLifecycleRequest(t, "panic-stream"))
+	if err != nil || reason != "" {
+		t.Fatalf("AcquireDownloadAdmission = (%q, %v)", reason, err)
+	}
+	if _, err := lifecycle.StartStreaming(); err != nil {
+		t.Fatalf("StartStreaming = %v", err)
+	}
+	underlying.deadlineHook = func(deadline time.Time) {
+		if deadline.IsZero() {
+			lifecycle.Fail(downloadadmission.ReleaseStorageError)
+		}
+	}
+
+	beforePanic := releaseCount(downloadadmission.ReleasePanic)
+	beforeStorage := releaseCount(downloadadmission.ReleaseStorageError)
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		defer lifecycle.FinishHandler()
+		panic("streaming handler panic")
+	}()
+	if recovered != "streaming handler panic" {
+		t.Fatalf("recovered panic = %v, want streaming handler panic", recovered)
+	}
+	waitForMetric(t, func() float64 { return releaseCount(downloadadmission.ReleasePanic) }, beforePanic+1)
+	if got := releaseCount(downloadadmission.ReleaseStorageError); got != beforeStorage {
+		t.Fatalf("storage-error release count = %v, want %v", got, beforeStorage)
+	}
+}

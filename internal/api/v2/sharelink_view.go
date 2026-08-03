@@ -73,7 +73,7 @@ func NewShareLinkViewHandler(database *db.DB, cfg *config.Config, s3Store *stora
 }
 
 // SetDownloadAdmissionCoordinator makes the process-wide coordinator available
-// for download producers added in later D phases.
+// for the D4 download producers owned by this handler.
 func (h *ShareLinkViewHandler) SetDownloadAdmissionCoordinator(coordinator *downloadadmission.Coordinator) {
 	h.downloadAdmission = coordinator
 }
@@ -922,42 +922,6 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	filename := filepath.Base(sl.filePath)
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(filename), "."))
 
-	// Get the file's block IDs and size from the fs_object
-	var blockIDs []string
-	var fileSize int64
-	err := h.db.Session().Query(`
-		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, sl.libraryID, sl.targetEntry.ID).Scan(&blockIDs, &fileSize)
-	if err != nil {
-		slog.Error("Failed to get file block IDs for share link raw", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get file metadata"})
-		return
-	}
-
-	// Check if library is encrypted. This is a public surface: failing open
-	// would serve ciphertext to an anonymous visitor as a 200.
-	encrypted, err := libraryIsEncrypted(h.db, sl.orgID, sl.libraryID)
-	if err != nil {
-		slog.Error("encryption probe failed for share link raw", "org", sl.orgID, "error", err)
-		respondEncryptionProbeUnavailable(c)
-		return
-	}
-
-	var fileKey []byte
-	var fileIV []byte
-	if encrypted {
-		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(sl.createdBy, sl.libraryID)
-		if fileKey == nil {
-			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted but not unlocked"})
-			return
-		}
-	}
-
-	// ETag-based cache validation: fs_id changes on every file update
-	if setCacheHeaders(c, sl.targetEntry.ID) {
-		return
-	}
-
 	lifecycle, reason, err := h.acquireShareLinkDownloadAdmission(c, sl, downloadadmission.ProfileLinkRaw)
 	if err != nil {
 		slog.Error("share-link raw admission setup failed", "error", err)
@@ -971,6 +935,48 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	}
 	defer lifecycle.FinishHandler()
 	ctx := lifecycle.PreparationContext()
+
+	// Get the file's block IDs and size from fs_objects under the preparation
+	// deadline so metadata setup cannot outlive the admitted request.
+	var blockIDs []string
+	var fileSize int64
+	err = h.db.Session().Query(`
+		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, sl.libraryID, sl.targetEntry.ID).WithContext(ctx).Scan(&blockIDs, &fileSize)
+	if err != nil {
+		lifecycle.ReleasePreparationError(err)
+		slog.Error("Failed to get file block IDs for share link raw", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get file metadata"})
+		return
+	}
+
+	// Check if library is encrypted under the preparation deadline. This is a
+	// public surface: failing open would serve ciphertext to an anonymous visitor
+	// as a 200, including through an ETag short circuit.
+	encrypted, err := libraryIsEncryptedContext(ctx, h.db, sl.orgID, sl.libraryID)
+	if err != nil {
+		lifecycle.ReleasePreparationError(err)
+		slog.Error("encryption probe failed for share link raw", "org", sl.orgID, "error", err)
+		respondEncryptionProbeUnavailable(c)
+		return
+	}
+
+	var fileKey []byte
+	var fileIV []byte
+	if encrypted {
+		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIVContext(ctx, sl.createdBy, sl.libraryID)
+		if fileKey == nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted but not unlocked"})
+			return
+		}
+	}
+
+	// ETag-based cache validation: fs_id changes on every file update. Keep it
+	// after the encryption gate so a cached plaintext is never re-authorized by a
+	// 304 after the decrypt session expires.
+	if setCacheHeaders(c, sl.targetEntry.ID) {
+		return
+	}
 
 	blockStore, blockStoreClass, err := resolveLibraryBlockStoreForRequestContext(ctx, c, h.db, h.config, h.storageManager, h.storage, sl.orgID, sl.libraryID)
 	if err != nil {
@@ -1224,6 +1230,7 @@ func (h *ShareLinkViewHandler) emitShareFileBootstrap(c *gin.Context, sl *shareL
 			return
 		}
 		if recovered := recover(); recovered != nil {
+			lifecycle.Fail(downloadadmission.ReleasePanic)
 			_ = lifecycle.Finish(downloadadmission.ReleasePanic)
 			panic(recovered)
 		}

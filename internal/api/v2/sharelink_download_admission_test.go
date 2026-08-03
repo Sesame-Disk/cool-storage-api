@@ -101,9 +101,9 @@ func TestShareLinkRawAdmissionFollowsCheapGates(t *testing.T) {
 	fn := findFunction(t, file, "handleShareLinkRaw")
 
 	orderedCalls := []string{
-		"libraryIsEncrypted",
-		"setCacheHeaders",
 		"acquireShareLinkDownloadAdmission",
+		"libraryIsEncryptedContext",
+		"setCacheHeaders",
 		"resolveLibraryBlockStoreForRequestContext",
 		"NewCanonicalBlockReader",
 	}

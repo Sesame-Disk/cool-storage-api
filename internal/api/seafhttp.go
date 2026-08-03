@@ -1486,6 +1486,16 @@ type zipPreparedFile struct {
 	sizeBytes   int64
 }
 
+type zipTrafficAccounting struct {
+	context     *gin.Context
+	quotaStatus traffic.QuotaStatus
+	orgID       string
+	userID      string
+	trafficType string
+	bytesBefore int64
+	active      bool
+}
+
 var seafHTTPNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
 var seafHTTPBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDsContext
 var seafHTTPLookupFileBlocksFn = func(ctx context.Context, h *SeafHTTPHandler, hostname string, token *AccessToken) ([]string, int64, []byte, []byte, *storage.BlockStore, string, error) {
@@ -1550,7 +1560,7 @@ func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manage
 }
 
 // SetDownloadAdmissionCoordinator makes the process-wide coordinator available
-// for download producers added in later D phases.
+// for the D4 download producers owned by this handler.
 func (h *SeafHTTPHandler) SetDownloadAdmissionCoordinator(coordinator *downloadadmission.Coordinator) {
 	h.downloadAdmission = coordinator
 }
@@ -3769,6 +3779,27 @@ func authorizeDownloadWithChecker(perms downloadPermissionChecker, c *gin.Contex
 
 var seafHTTPAuthorizeDownloadFn = authorizeSeafHTTPDownload
 
+var recordSeafHTTPDownloadTrafficFn = func(status traffic.QuotaStatus, orgID, userID, trafficType string, bytes int64) {
+	if rec := traffic.Get(); rec != nil {
+		traffic.RecordCheckedTransfer(rec, status, orgID, userID, trafficType, bytes)
+	}
+}
+
+// responseBytesSince normalizes Gin's -1 sentinel for an unwritten response.
+func responseBytesSince(c *gin.Context, before int64) int64 {
+	if c == nil || c.Writer == nil {
+		return 0
+	}
+	if before < 0 {
+		before = 0
+	}
+	after := int64(c.Writer.Size())
+	if after < before {
+		return 0
+	}
+	return after - before
+}
+
 func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	tokenStr := c.Param("token")
 	requestedPath := c.Param("filepath")
@@ -4097,22 +4128,24 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	}
 	c.Status(http.StatusOK)
 
-	// Stream with prefetching pipeline
-	if err := streaming.StreamBlocks(c, streamCtx, canonicalReader, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks"); err != nil {
-		releaseSeafHTTPDownloadStreamFailure(lifecycle, err)
-		return err
-	}
-
-	log.Printf("[streamFileFromBlocks] Streaming complete: %d blocks", len(blockIDs))
-
-	// Record traffic — fire-and-forget, never blocks the response.
-	if rec := traffic.Get(); rec != nil {
+	// Stream with prefetching pipeline. Count bytes even when the stream fails
+	// after a partial response has already reached the client.
+	bytesBefore := int64(c.Writer.Size())
+	streamErr := streaming.StreamBlocks(c, streamCtx, canonicalReader, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks")
+	bytesWritten := responseBytesSince(c, bytesBefore)
+	if bytesWritten > 0 {
 		tt := traffic.WebDownload
 		if token.Source == "link" {
 			tt = traffic.LinkDownload
 		}
-		traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, token.OrgID, token.UserID, tt, fileSize)
+		recordSeafHTTPDownloadTrafficFn(downloadTrafficStatus, token.OrgID, token.UserID, tt, bytesWritten)
 	}
+	if streamErr != nil {
+		releaseSeafHTTPDownloadStreamFailure(lifecycle, streamErr)
+		return streamErr
+	}
+
+	log.Printf("[streamFileFromBlocks] Streaming complete: %d blocks", len(blockIDs))
 
 	return nil
 }
@@ -4443,7 +4476,17 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	}
 	var zipWriter *zip.Writer
 	zipCause := downloadadmission.ReleaseCompleted
-	defer finishSeafHTTPZipDownload(lifecycle, &zipWriter, &zipCause)
+	zipAccounting := &zipTrafficAccounting{
+		context:     c,
+		quotaStatus: zipTrafficStatus,
+		orgID:       token.OrgID,
+		userID:      token.UserID,
+		trafficType: traffic.WebDownload,
+	}
+	if token.Source == "link" {
+		zipAccounting.trafficType = traffic.LinkDownload
+	}
+	defer finishSeafHTTPZipDownload(lifecycle, &zipWriter, &zipCause, zipAccounting)
 	preparationCtx := lifecycle.PreparationContext()
 
 	// Encryption must be checked before any metadata walk or stream. Ignoring a
@@ -4596,9 +4639,8 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	c.Status(http.StatusOK)
 
 	zipWriter = zip.NewWriter(c.Writer)
-
-	// Snapshot writer size before streaming so we can calculate the delta afterward.
-	bytesBefore := int64(c.Writer.Size())
+	zipAccounting.bytesBefore = int64(c.Writer.Size())
+	zipAccounting.active = true
 
 	if err := h.addDirToZip(streamCtx, zipWriter, canonicalReader, preparedFiles, fileKey, fileIV); err != nil {
 		zipCause = seafHTTPDownloadStreamCause(err)
@@ -4607,24 +4649,6 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		return
 	}
 
-	// Record traffic for the bytes actually sent (zip overhead included is fine for billing granularity).
-	if rec := traffic.Get(); rec != nil {
-		bytesAfter := int64(c.Writer.Size())
-		if bytesAfter < 0 {
-			bytesAfter = 0
-		}
-		sent := bytesAfter - bytesBefore
-		if sent < 0 {
-			sent = 0
-		}
-		if sent > 0 {
-			tt := traffic.WebDownload
-			if token.Source == "link" {
-				tt = traffic.LinkDownload
-			}
-			traffic.RecordCheckedTransfer(rec, zipTrafficStatus, token.OrgID, token.UserID, tt, sent)
-		}
-	}
 }
 
 func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix string, depth int, budget *zipTraversalBudget) ([]zipPreparedFile, error) {
@@ -4722,7 +4746,7 @@ func (h *SeafHTTPHandler) prepareZipDirectoryContext(ctx context.Context, repoID
 // finishSeafHTTPZipDownload closes the archive while its admission lease is
 // still active. It preserves a handler panic while also releasing the lease if
 // Close itself panics.
-func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter **zip.Writer, cause *downloadadmission.ReleaseCause) {
+func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter **zip.Writer, cause *downloadadmission.ReleaseCause, accounting *zipTrafficAccounting) {
 	originalPanic := recover()
 	finalCause := downloadadmission.ReleaseCompleted
 	if cause != nil {
@@ -4731,13 +4755,7 @@ func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter 
 	if originalPanic != nil {
 		finalCause = downloadadmission.ReleasePanic
 	}
-	if finalCause != downloadadmission.ReleaseCompleted {
-		if finalCause == downloadadmission.ReleasePanic {
-			lifecycle.Fail(finalCause)
-		} else {
-			lifecycle.FailStreamError(finalCause)
-		}
-	}
+	claimSeafHTTPZipCause(lifecycle, finalCause)
 
 	var closeErr error
 	var closePanic any
@@ -4757,6 +4775,19 @@ func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter 
 		finalCause = downloadadmission.ReleasePanic
 		log.Printf("[HandleZipDownload] ZIP close panicked: %v", closePanic)
 	}
+	claimSeafHTTPZipCause(lifecycle, finalCause)
+	if accounting != nil && accounting.active {
+		bytesWritten := responseBytesSince(accounting.context, accounting.bytesBefore)
+		if bytesWritten > 0 {
+			recordSeafHTTPDownloadTrafficFn(
+				accounting.quotaStatus,
+				accounting.orgID,
+				accounting.userID,
+				accounting.trafficType,
+				bytesWritten,
+			)
+		}
+	}
 	_ = lifecycle.Finish(finalCause)
 	if originalPanic != nil {
 		panic(originalPanic)
@@ -4764,6 +4795,17 @@ func finishSeafHTTPZipDownload(lifecycle *httputil.DownloadAdmission, zipWriter 
 	if closePanic != nil {
 		panic(closePanic)
 	}
+}
+
+func claimSeafHTTPZipCause(lifecycle *httputil.DownloadAdmission, cause downloadadmission.ReleaseCause) {
+	if cause == downloadadmission.ReleaseCompleted {
+		return
+	}
+	if cause == downloadadmission.ReleasePanic {
+		lifecycle.Fail(cause)
+		return
+	}
+	lifecycle.FailStreamError(cause)
 }
 
 func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, zw *zip.Writer, blockStore streaming.BlockReader, files []zipPreparedFile, fileKey []byte, fileIV []byte) error {

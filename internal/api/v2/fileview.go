@@ -83,7 +83,7 @@ func RegisterFileViewRoutes(router *gin.Engine, database *db.DB, cfg *config.Con
 }
 
 // SetDownloadAdmissionCoordinator makes the process-wide coordinator available
-// for download producers added in later D phases.
+// for the D4 download producers owned by this handler.
 func (h *FileViewHandler) SetDownloadAdmissionCoordinator(coordinator *downloadadmission.Coordinator) {
 	h.downloadAdmission = coordinator
 }
