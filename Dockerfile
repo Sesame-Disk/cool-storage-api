@@ -1,5 +1,5 @@
 # Go build stage
-FROM --platform=$BUILDPLATFORM golang:1.25-trixie AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25.12-trixie AS builder
 
 ARG TARGETOS TARGETARCH
 
