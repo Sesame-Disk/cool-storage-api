@@ -255,7 +255,13 @@ func TestSyncBlockDownloadAdmissionStreamsWithoutMaterializing(t *testing.T) {
 		syncNewCanonicalBlockReaderFn = oldReader
 		syncTouchBlockLastAccessFn = oldTouch
 	})
-	syncTouchBlockLastAccessFn = func(context.Context, *db.DB, string, string, time.Time) {
+	syncTouchBlockLastAccessFn = func(ctx context.Context, _ *db.DB, _, _ string, _ time.Time) {
+		// A deadline is what distinguishes preparationCtx from a background
+		// context: without it the write would outlive the admitted preparation
+		// phase and hold the slot for the driver timeout instead.
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("last_accessed must run on the preparation deadline context")
+		}
 		touchSeen = true
 		touchAfterSize = sizeSeen && !readerSeen
 		record("touch")
@@ -365,8 +371,15 @@ func TestSyncBlockDownloadAdmissionPartialWriteUsesResponseBytes(t *testing.T) {
 	if releasedCompleted != beforeCompleted {
 		t.Fatalf("completed releases = %v, want unchanged %v", releasedCompleted, beforeCompleted)
 	}
-	if releasedResponse == beforeResponse && releasedStorage == beforeStorage {
-		t.Fatal("expected a non-completed release cause after partial write failure")
+	// Pinned exactly rather than "either non-completed cause": a client write
+	// failure is claimed first by IdleWriteWriter's OnWriteError callback, so it
+	// must land as response_error. Accepting storage_error here would let a
+	// regression in the writer's classification pass unnoticed.
+	if releasedResponse != beforeResponse+1 {
+		t.Fatalf("response_error releases = %v, want %v; the writer callback must claim the cause first", releasedResponse, beforeResponse+1)
+	}
+	if releasedStorage != beforeStorage {
+		t.Fatalf("storage_error releases = %v, want unchanged %v; a client write failure is not a storage failure", releasedStorage, beforeStorage)
 	}
 	if got := testutil.ToFloat64(metrics.DownloadAdmissionActiveCurrent); got != 0 {
 		t.Fatalf("active admissions after partial write = %v, want 0", got)
@@ -501,9 +514,48 @@ func TestSyncBlockGetBlockDefersFinishHandler(t *testing.T) {
 	if !syncCallsIdent(fn, "recordSyncBlockDownloadTrafficFn") {
 		t.Fatal("GetBlock must record traffic through recordSyncBlockDownloadTrafficFn so the amount stays assertable")
 	}
-	if !syncCallsSelector(fn, "CheckTrafficQuotaContext") {
-		t.Fatal("GetBlock must bound the quota pre-check with the preparation context")
+	// Naming the call is not enough: passing it c.Request.Context() or a
+	// background context would compile, read fine and silently unbound the slot.
+	// Both Cassandra operations that run inside the admission must take
+	// preparationCtx by name.
+	if !syncCallFirstArgIs(fn, "CheckTrafficQuotaContext", "preparationCtx") {
+		t.Fatal("GetBlock must pass preparationCtx as the quota pre-check context")
 	}
+	if !syncCallFirstArgIs(fn, "syncTouchBlockLastAccessFn", "preparationCtx") {
+		t.Fatal("GetBlock must pass preparationCtx to the last_accessed write")
+	}
+}
+
+// syncCallFirstArgIs reports whether a call to name passes argName as its first
+// argument. It matches both `pkg.Name(...)` and bare `name(...)` call shapes.
+func syncCallFirstArgIs(fn *ast.FuncDecl, name, argName string) bool {
+	found := false
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch target := call.Fun.(type) {
+		case *ast.SelectorExpr:
+			if target.Sel.Name != name {
+				return true
+			}
+		case *ast.Ident:
+			if target.Name != name {
+				return true
+			}
+		default:
+			return true
+		}
+		if len(call.Args) == 0 {
+			return true
+		}
+		if ident, ok := call.Args[0].(*ast.Ident); ok && ident.Name == argName {
+			found = true
+		}
+		return true
+	})
+	return found
 }
 
 func syncCallsIdent(fn *ast.FuncDecl, name string) bool {
