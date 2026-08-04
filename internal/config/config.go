@@ -434,18 +434,18 @@ func addClampedMonth(t time.Time) time.Time {
 
 // FileViewConfig holds file preview and streaming settings
 type FileViewConfig struct {
-	MaxPreviewBytes      int64    `yaml:"max_preview_bytes"`       // Maximum file size for general inline preview (default: 1GB)
-	MaxVideoBytes        int64    `yaml:"max_video_bytes"`         // Maximum file size for video preview (default: 10GB)
-	MaxTextBytes         int64    `yaml:"max_text_bytes"`          // Maximum file size for text preview (default: 50MB)
-	MaxIWorkPreviewBytes int64    `yaml:"max_iwork_preview_bytes"` // Maximum size for extracted iWork preview (default: 50MB)
+	MaxPreviewBytes      int64 `yaml:"max_preview_bytes"`       // Maximum file size for general inline preview (default: 1GB)
+	MaxVideoBytes        int64 `yaml:"max_video_bytes"`         // Maximum file size for video preview (default: 10GB)
+	MaxTextBytes         int64 `yaml:"max_text_bytes"`          // Maximum file size for text preview (default: 50MB)
+	MaxIWorkPreviewBytes int64 `yaml:"max_iwork_preview_bytes"` // Maximum size for extracted iWork preview (default: 50MB)
 	// MaxIWorkSourceBytes caps the iWork *source* document, which the preview
 	// branch materialises whole. D6 measured the peak at ~4x the source for a
 	// plaintext library and ~6x when encrypted — a 256 MiB document costs 1.5 GiB
 	// — so the general 1 GiB preview limit is not an in-memory budget for this
 	// path. Sizing max_active_raw for it instead would throttle ordinary raw
 	// streams, which cost one block, by two orders of magnitude. Default 32 MiB.
-	MaxIWorkSourceBytes int64 `yaml:"max_iwork_source_bytes"`
-	PreviewExtensions    []string `yaml:"preview_extensions"`      // Extensions that should route to the frontend preview shell
+	MaxIWorkSourceBytes int64    `yaml:"max_iwork_source_bytes"`
+	PreviewExtensions   []string `yaml:"preview_extensions"` // Extensions that should route to the frontend preview shell
 }
 
 var supportedFileViewPreviewExtensions = []string{
@@ -768,6 +768,14 @@ type SeafHTTPConfig struct {
 const (
 	DefaultSyncBlockMaxBytes int64 = 16 * 1024 * 1024
 	MaxSyncBlockMaxBytes     int64 = 64 * 1024 * 1024
+
+	// Download admission sizes are derived from the D6 measurements. Encrypted
+	// prefetch keeps the current and next block plus the encrypted source, so the
+	// 4.5x block-size figure is the conservative design cost used for validation.
+	DefaultDownloadAdmissionMemoryBudgetBytes     int64 = 2 * 1024 * 1024 * 1024
+	DownloadAdmissionEncryptedPeakNumerator             = 9
+	DownloadAdmissionEncryptedPeakDenominator           = 2
+	DownloadAdmissionIWorkEncryptedPeakMultiplier       = 6
 
 	// Sync block in-flight admission (subcontract B / X10).
 	//
@@ -2155,7 +2163,45 @@ func ValidateDownloadAdmissionConfig(d DownloadAdmissionConfig) error {
 }
 
 func (c *Config) validateDownloadAdmissionBounds() error {
-	return validateDownloadAdmissionConfig(c.DownloadAdmission, c.Server.WriteTimeout)
+	if err := validateDownloadAdmissionConfig(c.DownloadAdmission, c.Server.WriteTimeout); err != nil {
+		return err
+	}
+	return c.validateDownloadAdmissionMemoryBudget()
+}
+
+func (c *Config) validateDownloadAdmissionMemoryBudget() error {
+	if c == nil || !c.DownloadAdmission.Enabled {
+		return nil
+	}
+
+	source := c.FileView.MaxIWorkSourceBytes
+	if source <= 0 {
+		return fmt.Errorf("fileview.max_iwork_source_bytes must be greater than zero when download_admission.enabled is true")
+	}
+	if source > c.FileView.MaxPreviewBytes {
+		return fmt.Errorf("fileview.max_iwork_source_bytes=%d must not exceed fileview.max_preview_bytes=%d", source, c.FileView.MaxPreviewBytes)
+	}
+	// SyncBlockMaxBytes has its own validation later in Config.Validate. Avoid
+	// masking that more precise error if it is invalid here.
+	if c.SeafHTTP.SyncBlockMaxBytes <= 0 {
+		return nil
+	}
+
+	rawSlots := int64(c.DownloadAdmission.MaxActivePerNode)
+	if rawCap := int64(c.DownloadAdmission.MaxActiveRaw); rawCap > 0 && rawCap < rawSlots {
+		rawSlots = rawCap
+	}
+	if source > DefaultDownloadAdmissionMemoryBudgetBytes/DownloadAdmissionIWorkEncryptedPeakMultiplier {
+		return fmt.Errorf("fileview.max_iwork_source_bytes=%d is too large for the %d-byte download admission budget", source, DefaultDownloadAdmissionMemoryBudgetBytes)
+	}
+	iworkCost := source * DownloadAdmissionIWorkEncryptedPeakMultiplier
+	encryptedCost := (c.SeafHTTP.SyncBlockMaxBytes*DownloadAdmissionEncryptedPeakNumerator + DownloadAdmissionEncryptedPeakDenominator - 1) / DownloadAdmissionEncryptedPeakDenominator
+	otherSlots := int64(c.DownloadAdmission.MaxActivePerNode) - rawSlots
+	total := rawSlots*iworkCost + otherSlots*encryptedCost
+	if total > DefaultDownloadAdmissionMemoryBudgetBytes {
+		return fmt.Errorf("download admission memory design is %d bytes with %d raw slots at %d bytes and %d other slots at %d bytes; budget is %d bytes", total, rawSlots, iworkCost, otherSlots, encryptedCost, DefaultDownloadAdmissionMemoryBudgetBytes)
+	}
+	return nil
 }
 
 func validateDownloadAdmissionConfig(d DownloadAdmissionConfig, serverWriteTimeout time.Duration) error {

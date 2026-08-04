@@ -455,12 +455,12 @@ onlyoffice:
 
 download_admission:
   # D6 measured operating values. Budget: 2 GiB per node.
-  #   plaintext stream  4.0 MiB/admission   encrypted stream 36.0 MiB/admission
+  #   plaintext stream  4.0 MiB/admission   encrypted stream 36 MiB @8 / 72 MiB @16
   #   raw iWork @32 MiB source ~192 MiB/admission (buffers the whole document)
-  # Worst case under these caps: 6*192 MiB + 18*36 MiB = 1.78 GiB.
+  # Worst case under these caps: 6*192 MiB + 12*72 MiB = 2016 MiB (~1.97 GiB).
   # Process-local: fleet capacity scales with node count, this is not a cluster quota.
   enabled: true
-  max_active_per_node: 24
+  max_active_per_node: 18
   max_active_per_auth_user: 6
   max_active_per_link_source: 6
   max_active_per_client_link: 3

@@ -649,8 +649,10 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		return
 	}
 
-	// Guard against loading very large files - use appropriate limit based on file type
-	maxSize := h.getMaxFileSizeForPreview(ext)
+	// Guard against loading very large files - use the iWork source cap only for
+	// the branch that actually materialises the document for ZIP extraction.
+	needsBuffer := c.Query("preview") == "1" && isAppleIWorkFile(ext)
+	maxSize := h.getMaxFileSizeForPreview(ext, needsBuffer)
 	if fileSize > maxSize {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
 			"error": fmt.Sprintf("file too large for inline preview (%d bytes, max %d)", fileSize, maxSize),
@@ -686,9 +688,6 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 			return
 		}
 	}
-
-	// For iWork preview, we need to buffer the content (requires random access for ZIP parsing)
-	needsBuffer := c.Query("preview") == "1" && isAppleIWorkFile(ext)
 
 	if needsBuffer {
 		// iWork preview: must buffer for ZIP extraction
@@ -1033,7 +1032,7 @@ func extractIWorkPreviewPDFContext(ctx context.Context, data []byte, maxPreviewS
 // Videos get a higher limit (10GB default) since 4K videos and long recordings are commonly >1GB.
 // Text files get a lower limit (50MB default) to prevent browser freezing.
 // Other files get the general preview limit (1GB default).
-func (h *FileViewHandler) getMaxFileSizeForPreview(ext string) int64 {
+func (h *FileViewHandler) getMaxFileSizeForPreview(ext string, iworkPreview bool) int64 {
 	// iWork is the only preview that materialises the whole source in memory, so
 	// it gets its own source cap rather than the general preview limit. D6
 	// measured the peak at ~4x the source plaintext and ~6x encrypted, which
@@ -1041,7 +1040,7 @@ func (h *FileViewHandler) getMaxFileSizeForPreview(ext string) int64 {
 	// one branch. Capping the source here is the cheap lever; the alternative —
 	// shrinking max_active_raw — would throttle ordinary raw streams that cost a
 	// single block.
-	if isAppleIWorkFile(ext) && h.config.FileView.MaxIWorkSourceBytes > 0 {
+	if iworkPreview && isAppleIWorkFile(ext) && h.config.FileView.MaxIWorkSourceBytes > 0 {
 		return h.config.FileView.MaxIWorkSourceBytes
 	}
 	// Videos need large limits (4K, long recordings)
@@ -1420,8 +1419,9 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 		return
 	}
 
-	// Guard against very large files for inline preview
-	maxSize := h.getMaxFileSizeForPreview(ext)
+	// Historic raw responses never enter the iWork preview branch, so the
+	// preview-only source cap must not reject an otherwise streamable file.
+	maxSize := h.getMaxFileSizeForPreview(ext, false)
 	if fileSize > maxSize {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
 			"error": fmt.Sprintf("file too large for inline preview (%d bytes, max %d)", fileSize, maxSize),

@@ -33,20 +33,21 @@ type DownloadAdmission struct {
 	idleWrite  time.Duration
 	retryAfter int
 
-	mu              sync.Mutex
-	terminal        bool
-	released        bool
-	terminalCause   downloadadmission.ReleaseCause
-	preparing       bool
-	startingStream  bool
-	preparation     context.Context
-	prepareCancel   context.CancelFunc
-	streaming       context.Context
-	streamCancel    context.CancelFunc
-	writer          *IdleWriteWriter
-	originalWriter  gin.ResponseWriter
-	stopParent      func() bool
-	stopPreparation func() bool
+	mu                   sync.Mutex
+	terminal             bool
+	released             bool
+	terminalCause        downloadadmission.ReleaseCause
+	idleDeadlineRecorded bool
+	preparing            bool
+	startingStream       bool
+	preparation          context.Context
+	prepareCancel        context.CancelFunc
+	streaming            context.Context
+	streamCancel         context.CancelFunc
+	writer               *IdleWriteWriter
+	originalWriter       gin.ResponseWriter
+	stopParent           func() bool
+	stopPreparation      func() bool
 }
 
 type releaseState struct {
@@ -97,7 +98,7 @@ func AcquireDownloadAdmission(c *gin.Context, coordinator *downloadadmission.Coo
 	lifecycle.preparation = preparation
 	lifecycle.prepareCancel = cancel
 	stopParent := context.AfterFunc(parent, func() {
-		lifecycle.Fail(downloadadmission.ReleaseClientDisconnect)
+		lifecycle.failRequestCancellation()
 	})
 	lifecycle.installParentStop(stopParent)
 	stopPreparation := context.AfterFunc(preparation, lifecycle.preparationDone)
@@ -174,8 +175,7 @@ func (l *DownloadAdmission) StartStreaming() (context.Context, error) {
 		Timeout: l.idleWrite,
 		Cancel:  cancel,
 		OnTimeout: func() {
-			l.lease.RecordDeadlineExpired(downloadadmission.DeadlineIdleWrite)
-			l.Fail(downloadadmission.ReleaseIdleWriteTimeout)
+			l.failIdleWriteTimeout()
 		},
 		OnWriteError: func(error) {
 			l.FailStreamError(downloadadmission.ReleaseResponseError)
@@ -430,7 +430,89 @@ func (l *DownloadAdmission) FailStreamError(cause downloadadmission.ReleaseCause
 	if l == nil || !l.enabled {
 		return
 	}
+
+	// The response writer can report the idle timer's terminal error to the
+	// streaming worker at the same time that the request context is canceled.
+	// Preserve the server-owned timeout classification instead of letting that
+	// cancellation race relabel a bounded server failure as client disconnect.
+	l.mu.Lock()
+	idleTimeout := l.writer != nil && isTimeoutError(l.writer.Err())
+	l.mu.Unlock()
+	if idleTimeout {
+		l.failIdleWriteTimeout()
+		return
+	}
 	l.failCause(cause, true)
+}
+
+// failIdleWriteTimeout gives the writer's explicit deadline event authority
+// over a request-context cancellation that net/http may deliver in the same
+// scheduling window. A real earlier failure remains authoritative; only a
+// provisional client-disconnect claim is replaced.
+func (l *DownloadAdmission) failIdleWriteTimeout() {
+	if l == nil || !l.enabled {
+		return
+	}
+
+	l.mu.Lock()
+	if l.released {
+		l.mu.Unlock()
+		return
+	}
+	if l.terminal {
+		if l.terminalCause == downloadadmission.ReleaseClientDisconnect {
+			l.terminalCause = downloadadmission.ReleaseIdleWriteTimeout
+		}
+		l.mu.Unlock()
+		l.recordIdleWriteDeadline()
+		return
+	}
+	state, failed := l.claimFailureLocked(downloadadmission.ReleaseIdleWriteTimeout)
+	l.mu.Unlock()
+	l.recordIdleWriteDeadline()
+	if failed {
+		l.finishFailure(state)
+	}
+}
+
+// failRequestCancellation preserves a server-owned idle-write timeout when the
+// net/http server cancels the request context immediately after a timed-out
+// socket write. That cancellation is otherwise indistinguishable from a client
+// leaving during the same scheduling window.
+func (l *DownloadAdmission) failRequestCancellation() {
+	if l == nil || !l.enabled {
+		return
+	}
+
+	l.mu.Lock()
+	writerTimedOut := false
+	if writerErr := l.writerErrLocked(); writerErr != nil {
+		writerTimedOut = isTimeoutError(writerErr)
+	}
+	if writerTimedOut {
+		l.mu.Unlock()
+		l.failIdleWriteTimeout()
+		return
+	}
+	state, failed := l.claimFailureLocked(downloadadmission.ReleaseClientDisconnect)
+	l.mu.Unlock()
+	if failed {
+		l.finishFailure(state)
+	}
+}
+
+func (l *DownloadAdmission) recordIdleWriteDeadline() {
+	l.mu.Lock()
+	if l.idleDeadlineRecorded {
+		l.mu.Unlock()
+		return
+	}
+	l.idleDeadlineRecorded = true
+	lease := l.lease
+	l.mu.Unlock()
+	if lease != nil {
+		lease.RecordDeadlineExpired(downloadadmission.DeadlineIdleWrite)
+	}
 }
 
 func (l *DownloadAdmission) failCause(cause downloadadmission.ReleaseCause, parentCancellationWins bool) {
@@ -449,15 +531,18 @@ func (l *DownloadAdmission) failCause(cause downloadadmission.ReleaseCause, pare
 func (l *DownloadAdmission) finishCause(cause downloadadmission.ReleaseCause) {
 	l.mu.Lock()
 	if cause == downloadadmission.ReleaseCompleted {
-		if l.parent.Err() != nil {
+		writerErr := l.writerErrLocked()
+		if writerErr != nil && isTimeoutError(writerErr) {
+			cause = downloadadmission.ReleaseIdleWriteTimeout
+		} else if l.parent.Err() != nil {
 			cause = downloadadmission.ReleaseClientDisconnect
 		} else if l.preparing && errors.Is(l.preparation.Err(), context.DeadlineExceeded) {
 			cause = downloadadmission.ReleasePreparationTimeout
-		} else if writerErr := l.writerErrLocked(); writerErr != nil {
+		} else if writerErr != nil {
 			// The writer commits to failed under its own mutex and only then
 			// calls back to claim the cause here. A handler finishing inside that
 			// window would otherwise record a killed transfer as completed.
-			if errors.Is(writerErr, ErrIdleWriteTimeout) {
+			if isTimeoutError(writerErr) {
 				cause = downloadadmission.ReleaseIdleWriteTimeout
 			} else {
 				cause = downloadadmission.ReleaseResponseError

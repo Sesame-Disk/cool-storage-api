@@ -47,7 +47,7 @@ func TestShippedConfigsPassDownloadAdmissionValidation(t *testing.T) {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			cfg := loadShippedConfig(t, path)
 
-			if err := validateDownloadAdmissionConfig(cfg.DownloadAdmission, cfg.Server.WriteTimeout); err != nil {
+			if err := cfg.validateDownloadAdmissionBounds(); err != nil {
 				t.Fatalf("shipped configuration would refuse to start: %v", err)
 			}
 		})
@@ -77,36 +77,17 @@ func TestShippedConfigsEnableDownloadAdmission(t *testing.T) {
 	}
 }
 
-// TestShippedConfigsCapIWorkPreviewSource guards the measured memory budget. The
-// preview branch materialises the whole source document, and D6 measured the
-// peak at roughly 4x the source plaintext and 6x encrypted. Left on the general
-// 1 GiB preview limit, one request can touch several gigabytes, and the only
-// remaining bound would be max_active_raw — which also governs ordinary raw
-// streams that cost a single block.
+// TestShippedConfigsCapIWorkPreviewSource guards the combined measured memory
+// budget. The preview branch materialises the whole source document, while
+// encrypted streaming scales with the maximum sync block admitted by the
+// server. Both terms must fit the stated process-local D6 budget together.
 func TestShippedConfigsCapIWorkPreviewSource(t *testing.T) {
-	const measuredEncryptedPeakRatio = 6
-	const budgetBytes = 2 << 30 // the stated per-node download budget
-
 	for _, path := range shippedConfigPaths(t) {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			cfg := loadShippedConfig(t, path)
 
-			source := cfg.FileView.MaxIWorkSourceBytes
-			if source <= 0 {
-				t.Fatal("max_iwork_source_bytes is unset; the preview branch would inherit the 1 GiB general limit")
-			}
-			if source > cfg.FileView.MaxPreviewBytes {
-				t.Fatalf("iWork source cap %d exceeds the general preview limit %d", source, cfg.FileView.MaxPreviewBytes)
-			}
-
-			raw := int64(cfg.DownloadAdmission.MaxActiveRaw)
-			if raw <= 0 {
-				t.Fatal("max_active_raw is unset, so the iWork peak has no concurrency bound")
-			}
-			worst := raw * source * measuredEncryptedPeakRatio
-			if worst > budgetBytes {
-				t.Fatalf("max_active_raw(%d) x source(%d B) x measured %dx peak = %d B, over the stated %d B budget",
-					raw, source, measuredEncryptedPeakRatio, worst, budgetBytes)
+			if err := cfg.validateDownloadAdmissionMemoryBudget(); err != nil {
+				t.Fatalf("shipped memory design is unsafe: %v", err)
 			}
 		})
 	}

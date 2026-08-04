@@ -7,9 +7,10 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math/rand"
 	"mime/multipart"
-	"os"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,42 +40,83 @@ import (
 //	      go test -tags integration -run TestDownloadAdmission -v -count=1 ./internal/integration/'
 func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 	client := requireDownloadProbe(t)
-	repoID := createDisposableTestLibrary(t, client, "inttest-d6-saturation")
+	clients := []*testClient{
+		client,
+		newTestClient(client.baseURL, "dev-token-user"),
+		newTestClient(client.baseURL, "dev-token-superadmin"),
+	}
+	for _, probeClient := range clients {
+		if err := verifyIntegrationAuth(probeClient.baseURL, probeClient.token); err != nil {
+			t.Fatalf("download probe auth for %q: %v", probeClient.token, err)
+		}
+	}
+	nodeCap := downloadProbeNodeCap(t)
+	if nodeCap <= 0 || nodeCap > len(clients)*6 {
+		t.Fatalf("download probe node cap %d cannot be filled by %d identities at six admissions each", nodeCap, len(clients))
+	}
+
 	fileName := "d6-saturation.bin"
-	uploadProbeFile(t, client, repoID, fileName, 6<<20)
+	repoIDs := make([]string, len(clients))
+	for i, probeClient := range clients {
+		repoIDs[i] = createDisposableTestLibrary(t, probeClient, fmt.Sprintf("inttest-d6-saturation-%d", i))
+		uploadProbeFile(t, probeClient, repoIDs[i], fileName, 24<<20)
+	}
 
 	// A seafhttp download token resolves to the `file` profile; the raw route is
 	// `raw`. Both are needed to show one shared ceiling rather than two budgets.
-	tokenResp := client.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
-	expectStatus(t, tokenResp, http.StatusOK)
-	fileStreamURL := strings.Trim(responseBody(t, tokenResp), "\" \n\r")
-	rawURL := client.baseURL + fmt.Sprintf("/repo/%s/raw/%s", repoID, fileName)
+	// The shipped raw profile cap is six, so fill the remaining node capacity with
+	// file-profile streams instead of accidentally proving only a seven-slot cap.
+	fileStreamURLs := make([]string, len(clients))
+	for i, probeClient := range clients {
+		tokenResp := probeClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoIDs[i], fileName))
+		expectStatus(t, tokenResp, http.StatusOK)
+		fileStreamURLs[i] = strings.Trim(responseBody(t, tokenResp), "\" \n\r")
+	}
+	rawURLs := make([]string, len(repoIDs))
+	for i, repoID := range repoIDs {
+		rawURLs[i] = client.baseURL + fmt.Sprintf("/repo/%s/raw/%s", repoID, fileName)
+	}
+	shareToken := createShareLinkForFairness(t, client, repoIDs[0], "/"+fileName)
+	linkRawURL := fmt.Sprintf("%s/d/%s/?raw=1", client.baseURL, shareToken)
 
 	if active := scrapeDownloadGaugeInt(t, client, "download_admission_active_current", true); active != 0 {
 		t.Fatalf("node already has %d active admissions; the probe needs an idle node", active)
 	}
 
-	// The binding constraint for one identity at the shipped values is
-	// max_active_per_auth_user, not the per-profile caps, so the holders are
-	// split evenly across two routes to fill it with both profiles live. Piling
-	// every holder onto one route would fill the same budget with one profile and
-	// prove nothing about a shared ceiling.
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	for i := 0; i < 6; i++ {
-		target := rawURL
-		if i%2 == 1 {
-			target = fileStreamURL
+	var stopOnce sync.Once
+	t.Cleanup(func() {
+		stopOnce.Do(func() { close(stop) })
+		wg.Wait()
+		waitForDownloadActive(t, client, 0, 30*time.Second)
+	})
+
+	rawSlots := 6
+	if rawSlots >= nodeCap {
+		rawSlots = nodeCap - 1
+	}
+	for i := 0; i < nodeCap; i++ {
+		probeClient := clients[i%len(clients)]
+		var target string
+		if i < rawSlots {
+			target = rawURLs[i%len(rawURLs)]
+		} else {
+			target = fileStreamURLs[(i-rawSlots)%len(fileStreamURLs)]
 		}
 		wg.Add(1)
-		go func(target string) {
+		go func(probeClient *testClient, target string) {
 			defer wg.Done()
-			holdDownloadSlot(client, target, stop)
-		}(target)
+			holdDownloadSlot(probeClient, target, stop)
+		}(probeClient, target)
 	}
 
+	waitForDownloadActive(t, client, nodeCap, 30*time.Second)
 	active := waitForLiveDownloadProfiles(t, client, 2, 30*time.Second)
-	t.Logf("observed %d concurrent admitted downloads across two profiles", active)
+	if active != nodeCap {
+		t.Fatalf("active downloads = %d, want the configured node ceiling %d", active, nodeCap)
+	}
+	t.Logf("observed the node ceiling of %d concurrent admitted downloads across two profiles", active)
 
 	// Criterion 14: the two identities the contract freezes, sampled while the
 	// node is genuinely busy rather than idle.
@@ -90,28 +132,37 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 
 	// Criterion 8: with the budget full, further readers are refused with a retry
 	// contract the desktop client understands rather than being queued forever.
-	refusals := 0
-	for i := 0; i < 8; i++ {
-		status, retryAfter := probeDownload(t, client, rawURL)
-		if status != http.StatusServiceUnavailable {
-			continue
-		}
-		refusals++
-		seconds, err := strconv.Atoi(strings.TrimSpace(retryAfter))
-		if err != nil || seconds < 1 {
-			t.Fatalf("refusal carried Retry-After %q; must be a positive integer number of seconds", retryAfter)
-		}
+	// The shipped admission_wait is non-zero, so a full-node request may be
+	// observed as node_full (immediate) or admission_timeout (bounded queue).
+	beforeNodeFull := scrapeDownloadMetric(t, client, "download_admission_rejected_total", `reason="node_full"`)
+	beforeAdmissionTimeout := scrapeDownloadMetric(t, client, "download_admission_rejected_total", `reason="admission_timeout"`)
+	status, retryAfter := probeAnonymousDownload(t, client, linkRawURL)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("reader at a full node = %d, want %d", status, http.StatusServiceUnavailable)
 	}
-	if refusals == 0 {
-		t.Fatal("no reader was refused while the budget was full; the drill did not test the refusal contract")
+	seconds, err := strconv.Atoi(strings.TrimSpace(retryAfter))
+	if err != nil || seconds < 1 {
+		t.Fatalf("refusal carried Retry-After %q; must be a positive integer number of seconds", retryAfter)
 	}
-	t.Logf("%d readers refused with a valid Retry-After", refusals)
+	afterNodeFull := scrapeDownloadMetric(t, client, "download_admission_rejected_total", `reason="node_full"`)
+	afterAdmissionTimeout := scrapeDownloadMetric(t, client, "download_admission_rejected_total", `reason="admission_timeout"`)
+	if afterNodeFull <= beforeNodeFull && afterAdmissionTimeout <= beforeAdmissionTimeout {
+		t.Fatalf("full-node refusal did not increase node_full or admission_timeout: node %.0f -> %.0f, timeout %.0f -> %.0f", beforeNodeFull, afterNodeFull, beforeAdmissionTimeout, afterAdmissionTimeout)
+	}
+	t.Logf("reader refused with bounded full-node backpressure (node_full %.0f -> %.0f, admission_timeout %.0f -> %.0f)", beforeNodeFull, afterNodeFull, beforeAdmissionTimeout, afterAdmissionTimeout)
+}
 
-	close(stop)
-	wg.Wait()
-
-	// Criterion 5: every slot returns after the load stops.
-	waitForDownloadActive(t, client, 0, 30*time.Second)
+func downloadProbeNodeCap(t *testing.T) int {
+	t.Helper()
+	value := strings.TrimSpace(os.Getenv("SESAMEFS_DOWNLOAD_NODE_CAP"))
+	if value == "" {
+		return 18
+	}
+	cap, err := strconv.Atoi(value)
+	if err != nil || cap <= 0 {
+		t.Fatalf("SESAMEFS_DOWNLOAD_NODE_CAP = %q, want a positive integer", value)
+	}
+	return cap
 }
 
 // holdDownloadSlot takes an admission and then stops reading, which is what a
@@ -154,10 +205,10 @@ func probeDownload(t *testing.T, c *testClient, target string) (int, string) {
 	return resp.StatusCode, resp.Header.Get("Retry-After")
 }
 
-// TestDownloadAdmissionDrainsIdentityStateAfterChurn covers the other half of
-// criterion 5: identity maps must not grow without bound across many distinct
-// short transfers, which is the shape ordinary traffic actually has.
-func TestDownloadAdmissionDrainsIdentityStateAfterChurn(t *testing.T) {
+// TestDownloadAdmissionDrainsStateAfterRepeatedTransfers proves the live
+// producer returns every slot after repeated short transfers. The coordinator's
+// 20,000-distinct-identity unit test owns the cardinality proof.
+func TestDownloadAdmissionDrainsStateAfterRepeatedTransfers(t *testing.T) {
 	client := requireDownloadProbe(t)
 	repoID := createDisposableTestLibrary(t, client, "inttest-d6-churn")
 	fileName := "d6-churn.bin"
@@ -220,13 +271,18 @@ func uploadProbeFile(t *testing.T, c *testClient, repoID, fileName string, size 
 	if err != nil {
 		t.Fatalf("CreateFormFile: %v", err)
 	}
-	// Incompressible-ish payload so gzip negotiation cannot collapse the stream
-	// and finish it before a slow reader has taken its slot.
+	// Deterministic pseudo-random payload so gzip negotiation cannot collapse the
+	// stream and finish it before a slow reader has taken its slot.
 	chunk := make([]byte, 64<<10)
-	for i := range chunk {
-		chunk[i] = byte(i * 31)
-	}
+	random := rand.New(rand.NewSource(0xD6A5EED))
 	for written := 0; written < size; written += len(chunk) {
+		remaining := size - written
+		if remaining < len(chunk) {
+			chunk = chunk[:remaining]
+		}
+		if _, err := random.Read(chunk); err != nil {
+			t.Fatalf("fill upload fixture: %v", err)
+		}
 		if _, err := part.Write(chunk); err != nil {
 			t.Fatalf("write upload body: %v", err)
 		}
@@ -373,6 +429,43 @@ func scrapeDownloadGaugeInt(t *testing.T, c *testClient, metric string, mustExis
 		t.Fatalf("metric %s is not exported; the series is the only visibility this guard has", metric)
 	}
 	return int(total)
+}
+
+func scrapeDownloadMetric(t *testing.T, c *testClient, metric, labelMatch string) float64 {
+	t.Helper()
+	body := scrapeMetricsBody(t, c)
+	var total float64
+	found := false
+	scanner := bufio.NewScanner(strings.NewReader(body))
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, metric) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := fields[0]
+		if labelMatch == "" {
+			if name != metric {
+				continue
+			}
+		} else if !strings.Contains(name, labelMatch) {
+			continue
+		}
+		value, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+		if err != nil {
+			continue
+		}
+		total += value
+		found = true
+	}
+	if !found {
+		t.Fatalf("metric %s{%s} is not exported", metric, labelMatch)
+	}
+	return total
 }
 
 func waitForDownloadActiveAtLeast(t *testing.T, c *testClient, want int, timeout time.Duration) int {

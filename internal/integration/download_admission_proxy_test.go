@@ -32,6 +32,10 @@ import (
 //	      go test -tags integration -run TestDownloadAdmissionThroughProxy -v -count=1 ./internal/integration/'
 func TestDownloadAdmissionThroughProxyReleasesStalledClient(t *testing.T) {
 	client := requireDownloadProbe(t)
+	// The application owns the 60s idle deadline. Keep the client deadline well
+	// beyond the drill so a broken server-side guard cannot pass by observing a
+	// client cancellation at requireDownloadProbe's old two-minute timeout.
+	client.http.Timeout = 5 * time.Minute
 	proxyURL := strings.TrimSpace(os.Getenv("SESAMEFS_PROXY_URL"))
 	if proxyURL == "" {
 		t.Skip("SESAMEFS_PROXY_URL is not set; the drill needs the supported frontend nginx")
@@ -47,6 +51,9 @@ func TestDownloadAdmissionThroughProxyReleasesStalledClient(t *testing.T) {
 	if active := scrapeDownloadGaugeInt(t, client, "download_admission_active_current", true); active != 0 {
 		t.Fatalf("node already has %d active admissions; the drill needs an idle node", active)
 	}
+	idleBefore := scrapeDownloadMetric(t, client, "download_admission_released_total", `cause="idle_write_timeout"`)
+	disconnectBefore := scrapeDownloadMetric(t, client, "download_admission_released_total", `cause="client_disconnect"`)
+	deadlineBefore := scrapeDownloadMetric(t, client, "download_admission_deadline_expired_total", `phase="idle_write"`)
 
 	proxyRawURL := fmt.Sprintf("%s/repo/%s/raw/%s", strings.TrimRight(proxyURL, "/"), repoID, fileName)
 
@@ -88,8 +95,36 @@ func TestDownloadAdmissionThroughProxyReleasesStalledClient(t *testing.T) {
 	// And it must be released without the client doing anything, on the
 	// application's own idle-write deadline rather than a proxy timeout.
 	before := time.Now()
-	waitForDownloadActive(t, client, 0, 3*time.Minute)
-	t.Logf("stalled proxied transfer released after %s without the client acting", time.Since(before).Round(time.Second))
+	waitForDownloadActive(t, client, 0, 2*time.Minute)
+	elapsed := time.Since(before)
+	idleAfter := waitForDownloadMetricIncrease(t, client, "download_admission_released_total", `cause="idle_write_timeout"`, idleBefore, 10*time.Second)
+	deadlineAfter := scrapeDownloadMetric(t, client, "download_admission_deadline_expired_total", `phase="idle_write"`)
+	disconnectAfter := scrapeDownloadMetric(t, client, "download_admission_released_total", `cause="client_disconnect"`)
+	if elapsed < 30*time.Second || elapsed > 2*time.Minute {
+		t.Fatalf("stalled proxied transfer released after %s; expected the configured idle deadline window", elapsed.Round(time.Second))
+	}
+	if deadlineAfter <= deadlineBefore {
+		t.Fatalf("idle-write deadline metric did not increase: %.0f -> %.0f", deadlineBefore, deadlineAfter)
+	}
+	if disconnectAfter > disconnectBefore {
+		t.Fatalf("proxy drill was classified as client_disconnect: %.0f -> %.0f", disconnectBefore, disconnectAfter)
+	}
+	t.Logf("stalled proxied transfer released after %s with idle_write_timeout (release counter %.0f)", elapsed.Round(time.Second), idleAfter)
+}
+
+func waitForDownloadMetricIncrease(t *testing.T, c *testClient, metric, labelMatch string, before float64, timeout time.Duration) float64 {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		after := scrapeDownloadMetric(t, c, metric, labelMatch)
+		if after > before {
+			return after
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	after := scrapeDownloadMetric(t, c, metric, labelMatch)
+	t.Fatalf("metric %s{%s} did not increase from %.0f within %s", metric, labelMatch, before, timeout)
+	return after
 }
 
 // TestDownloadAdmissionThroughProxyDeliversCompleteBytes is the other half of

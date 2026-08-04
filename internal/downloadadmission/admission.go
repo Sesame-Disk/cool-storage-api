@@ -253,7 +253,7 @@ func (c *Coordinator) Acquire(ctx context.Context, request AdmissionRequest) (*L
 		return nil, RejectInvalidRequest
 	}
 	if err := ctx.Err(); err != nil {
-		c.observeRejected(RejectClientGone)
+		c.observeRejected(request, RejectClientGone)
 		return nil, RejectClientGone
 	}
 	started := time.Now()
@@ -268,7 +268,7 @@ func (c *Coordinator) Acquire(ctx context.Context, request AdmissionRequest) (*L
 	if err := ctx.Err(); err != nil {
 		c.mu.Unlock()
 		c.observeWait(started, "cancelled")
-		c.observeRejected(RejectClientGone)
+		c.observeRejected(request, RejectClientGone)
 		return nil, RejectClientGone
 	}
 	if granted, blocked := c.tryGrantLocked(request); granted {
@@ -281,13 +281,13 @@ func (c *Coordinator) Acquire(ctx context.Context, request AdmissionRequest) (*L
 		if c.cfg.AdmissionWait <= 0 {
 			c.mu.Unlock()
 			c.observeWait(started, "refused")
-			c.observeRejected(reason)
+			c.observeRejected(request, reason)
 			return nil, reason
 		}
 		if queueReason := c.queueFullReasonLocked(request); queueReason != "" {
 			c.mu.Unlock()
 			c.observeWait(started, "refused")
-			c.observeRejected(queueReason)
+			c.observeRejected(request, queueReason)
 			return nil, queueReason
 		}
 		w := &waiter{request: request, blocked: blocked}
@@ -378,11 +378,11 @@ func (c *Coordinator) waitForLease(ctx context.Context, request AdmissionRequest
 			c.mu.Unlock()
 			if ctx.Err() != nil {
 				c.observeWait(started, "cancelled")
-				c.observeRejected(RejectClientGone)
+				c.observeRejected(request, RejectClientGone)
 				return nil, RejectClientGone
 			}
 			c.observeWait(started, "timeout")
-			c.observeRejected(RejectAdmissionTimeout)
+			c.observeRejected(request, RejectAdmissionTimeout)
 			return nil, RejectAdmissionTimeout
 		case <-notify:
 			c.mu.Lock()
@@ -390,14 +390,14 @@ func (c *Coordinator) waitForLease(ctx context.Context, request AdmissionRequest
 				c.removeWaiterLocked(w)
 				c.mu.Unlock()
 				c.observeWait(started, "cancelled")
-				c.observeRejected(RejectClientGone)
+				c.observeRejected(request, RejectClientGone)
 				return nil, RejectClientGone
 			}
 			if waitCtx.Err() != nil {
 				c.removeWaiterLocked(w)
 				c.mu.Unlock()
 				c.observeWait(started, "timeout")
-				c.observeRejected(RejectAdmissionTimeout)
+				c.observeRejected(request, RejectAdmissionTimeout)
 				return nil, RejectAdmissionTimeout
 			}
 			if granted, blocked := c.tryGrantLocked(request); granted {
@@ -562,8 +562,11 @@ func (c *Coordinator) signalLocked() {
 	c.notify = make(chan struct{})
 }
 
-func (c *Coordinator) observeRejected(reason RejectReason) {
+func (c *Coordinator) observeRejected(request AdmissionRequest, reason RejectReason) {
 	metrics.DownloadAdmissionRejectedTotal.WithLabelValues(string(reason)).Inc()
+	if validProfile(request.profile) {
+		metrics.DownloadAdmissionRejectedByProfileTotal.WithLabelValues(string(request.profile), string(reason)).Inc()
+	}
 }
 
 func (c *Coordinator) observeWait(started time.Time, outcome string) {

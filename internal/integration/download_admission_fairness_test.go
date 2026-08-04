@@ -5,6 +5,7 @@ package integration
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,7 +39,9 @@ func TestDownloadAdmissionFairnessIsolatesLinkAndOwner(t *testing.T) {
 
 	shareToken := createShareLinkForFairness(t, client, repoID, "/"+fileName)
 	linkRawURL := fmt.Sprintf("%s/d/%s/?raw=1", client.baseURL, shareToken)
-	ownerRawURL := client.baseURL + fmt.Sprintf("/repo/%s/raw/%s", repoID, fileName)
+	tokenResp := client.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+	expectStatus(t, tokenResp, http.StatusOK)
+	ownerFileURL := strings.Trim(responseBody(t, tokenResp), "\" \n\r")
 
 	if active := scrapeDownloadGaugeInt(t, client, "download_admission_active_current", true); active != 0 {
 		t.Fatalf("node already has %d active admissions; the drill needs an idle node", active)
@@ -70,7 +73,7 @@ func TestDownloadAdmissionFairnessIsolatesLinkAndOwner(t *testing.T) {
 
 		// The owner's authenticated budget is a different dimension, so their own
 		// download must still be admitted while the link is saturated.
-		status, _ := probeDownload(t, client, ownerRawURL)
+		status, _ := probeDownload(t, client, ownerFileURL)
 		if status != http.StatusOK {
 			t.Fatalf("owner download = %d while their public link was saturated; link traffic consumed the owner's budget", status)
 		}
@@ -81,13 +84,13 @@ func TestDownloadAdmissionFairnessIsolatesLinkAndOwner(t *testing.T) {
 	t.Run("a saturated owner does not take the public link down", func(t *testing.T) {
 		stop := make(chan struct{})
 		var wg sync.WaitGroup
-		// max_active_per_auth_user is the binding constraint for one identity, so
-		// this fills the owner's personal budget rather than the node ceiling.
+		// The file profile cap is 16 while max_active_per_auth_user is 6, so this
+		// fills the owner's identity budget rather than an ambiguous profile cap.
 		for i := 0; i < 8; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				holdDownloadSlot(client, ownerRawURL, stop)
+				holdDownloadSlot(client, ownerFileURL, stop)
 			}()
 		}
 		defer func() {
@@ -96,7 +99,7 @@ func TestDownloadAdmissionFairnessIsolatesLinkAndOwner(t *testing.T) {
 			waitForDownloadActive(t, client, 0, 30*time.Second)
 		}()
 
-		waitForRefusal(t, client, ownerRawURL, true, 30*time.Second,
+		waitForRefusal(t, client, ownerFileURL, true, 30*time.Second,
 			"the owner budget was never filled, so the isolation claim is untested")
 
 		status, _ := probeAnonymousDownload(t, client, linkRawURL)

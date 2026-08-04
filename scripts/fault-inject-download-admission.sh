@@ -40,9 +40,9 @@ FILE_MIB="${FILE_MIB:-8}"
 SYNC_TIMEOUT="${SYNC_TIMEOUT:-300}"
 # Holders occupy the budget for a bounded window and then let go, so the client
 # has to be refused and then recover rather than simply failing.
-HOLDER_COUNT="${HOLDER_COUNT:-10}"
+HOLDER_COUNT="${HOLDER_COUNT:-6}"
 HOLDER_RATE="${HOLDER_RATE:-2k}"
-HOLDER_SECONDS="${HOLDER_SECONDS:-45}"
+HOLDER_SECONDS="${HOLDER_SECONDS:-90}"
 
 LIBRARY_PREFIX="fault-inject-download-admission"
 
@@ -56,6 +56,23 @@ metric_sum() {
   body=$(curl -fsS -H 'Accept-Encoding: identity' "${SESAMEFS_URL}/metrics" 2>/dev/null) || return 1
   printf '%s\n' "${body}" \
     | awk -v p="$1" 'index($0, p) == 1 && $0 !~ /^#/ { s += $NF } END { printf "%.0f\n", s+0 }'
+}
+
+wait_for_active() {
+  local want="$1"
+  local timeout="$2"
+  local waited=0
+  local active=0
+  while [ "${waited}" -lt "${timeout}" ]; do
+    active=$(metric_sum 'download_admission_active_current') || fail "could not scrape active admissions"
+    if [ "${active}" -ge "${want}" ]; then
+      log "observed ${active} active admissions"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  fail "only ${active} active admissions after ${timeout}s; holders did not fill the intended identity budget"
 }
 
 delete_library() {
@@ -135,13 +152,18 @@ first_file=$(curl -s "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/dir/?p=/" \
   | sed -n 's/.*"name":"\([^"]*\.bin\)".*/\1/p' | head -1)
 [ -n "${first_file}" ] || fail "seeded library lists no file to hold slots against"
 
-rejected_before=$(metric_sum 'download_admission_rejected_total{') \
-  || fail "could not scrape ${SESAMEFS_URL}/metrics before the run"
-log "rejections before: ${rejected_before}"
+case "${HOLDER_COUNT}" in
+  6) ;;
+  *) fail "HOLDER_COUNT must stay 6: the shipped per-user download cap is 6, and extra holders would create false rejections" ;;
+esac
 
-# Saturate the budget for a bounded window. Rate-limited readers hold their
-# admissions the way a slow client does; --max-time bounds the window so the
-# client is refused and then allowed to recover.
+active_before=$(metric_sum 'download_admission_active_current') \
+  || fail "could not scrape active admissions before the holders"
+[ "${active_before}" -eq 0 ] \
+  || fail "download probe node is not idle before the holders: active_current=${active_before}"
+
+# Saturate exactly the per-user budget for a bounded window. Extra holders would
+# reject before seaf-cli starts and make the evidence impossible to attribute.
 log "holding ${HOLDER_COUNT} download slots at ${HOLDER_RATE} for ${HOLDER_SECONDS}s"
 for _ in $(seq 1 "${HOLDER_COUNT}"); do
   curl -s -o /dev/null \
@@ -150,6 +172,16 @@ for _ in $(seq 1 "${HOLDER_COUNT}"); do
     -H 'Accept-Encoding: identity' \
     "${SESAMEFS_URL_LOCAL}/repo/${repo_id}/raw/${first_file}" &
 done
+
+wait_for_active "${HOLDER_COUNT}" 30
+
+# Take the baseline only after the holders are admitted. Their requests never
+# retry, so every later profile=block rejection is attributable to seaf-cli.
+rejected_before=$(metric_sum 'download_admission_rejected_total{') \
+  || fail "could not scrape ${SESAMEFS_URL}/metrics after holders stabilized"
+block_rejected_before=$(metric_sum 'download_admission_rejected_by_profile_total{profile="block"') \
+  || fail "could not scrape block-profile rejection metric before the client"
+log "rejections after holder stabilization: ${rejected_before}; block-profile: ${block_rejected_before}"
 
 # Client state is part of the fixture: sharing sync-test's persistent volumes
 # made registration depend on stale entries whose libraries no longer existed.
@@ -212,6 +244,8 @@ log "client pulled ${downloaded} files"
 
 rejected_after=$(metric_sum 'download_admission_rejected_total{') \
   || fail "could not scrape ${SESAMEFS_URL}/metrics after the run"
+block_rejected_after=$(metric_sum 'download_admission_rejected_by_profile_total{profile="block"') \
+  || fail "could not scrape block-profile rejection metric after the client"
 log "rejections after: ${rejected_after}"
 
 # A run in which nothing was refused did not test anything. Reporting it as a
@@ -219,7 +253,10 @@ log "rejections after: ${rejected_after}"
 if [ "${rejected_after}" -le "${rejected_before}" ]; then
   fail "the client was never refused (${rejected_before} -> ${rejected_after}); the drill proved nothing"
 fi
-log "refusals during the run: $((rejected_after - rejected_before))"
+if [ "${block_rejected_after}" -le "${block_rejected_before}" ]; then
+  fail "the client produced no profile=block refusal (${block_rejected_before} -> ${block_rejected_after}); the drill did not reach sync download admission"
+fi
+log "refusals during the run: $((rejected_after - rejected_before)); block-profile refusals: $((block_rejected_after - block_rejected_before))"
 
 # And nothing may be stranded once the load stops.
 waited=0

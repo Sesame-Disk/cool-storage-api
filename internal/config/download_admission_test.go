@@ -122,6 +122,24 @@ func TestDownloadAdmissionValidation(t *testing.T) {
 			wantErr:    true,
 			wantString: "server.write_timeout",
 		},
+		{
+			name: "enabled admission requires a positive iWork source cap",
+			modify: func(c *Config) {
+				c.DownloadAdmission = valid
+				c.FileView.MaxIWorkSourceBytes = 0
+			},
+			wantErr:    true,
+			wantString: "max_iwork_source_bytes",
+		},
+		{
+			name: "iWork source cap cannot exceed general preview cap",
+			modify: func(c *Config) {
+				c.DownloadAdmission = valid
+				c.FileView.MaxIWorkSourceBytes = c.FileView.MaxPreviewBytes + 1
+			},
+			wantErr:    true,
+			wantString: "must not exceed",
+		},
 	}
 
 	for _, tc := range cases {
@@ -172,5 +190,43 @@ func TestDownloadAdmissionEnvironmentOverrideErrors(t *testing.T) {
 	cfg.applyEnvOverrides()
 	if len(cfg.envOverrideErrors) != 3 {
 		t.Fatalf("env override errors = %v, want three errors", cfg.envOverrideErrors)
+	}
+}
+
+func TestIWorkSourceEnvironmentOverrideKeepsTheD6GuardValidated(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "valid", value: "33554432"},
+		{name: "zero", value: "0", wantErr: true},
+		{name: "negative", value: "-1", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearLoadEnvOverrides(t)
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			cfg.DownloadAdmission = DownloadAdmissionConfig{
+				Enabled:                true,
+				MaxActivePerNode:       8,
+				MaxActivePerAuthUser:   2,
+				MaxActivePerLinkSource: 4,
+				MaxActivePerClientLink: 2,
+				AdmissionWait:          10 * time.Second,
+				PreparationDeadline:    time.Minute,
+				IdleWriteTimeout:       time.Minute,
+				RetryAfter:             time.Second,
+			}
+			t.Setenv("FILEVIEW_MAX_IWORK_SOURCE_BYTES", tc.value)
+			cfg.applyEnvOverrides()
+			err := cfg.Validate()
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "max_iwork_source_bytes") {
+				t.Fatalf("Validate() error = %v, want iWork source cap failure", err)
+			}
+		})
 	}
 }

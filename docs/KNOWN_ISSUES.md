@@ -890,24 +890,17 @@ The architecture claim "download handlers resolve before headers" is now true fo
 
 ### ISSUE-STREAMBLOCKS-VOID-01: `StreamBlocks` Returns Void → False-Success Log + Over-Counted Traffic
 
-**Status**: 🟡 Observability/billing accuracy gap (2026-05-27)
+**Status**: ✅ Fixed 2026-08-03
 **Severity**: Low–Medium — no client-visible corruption, but traffic can be over-recorded
 **Affected**: `streaming.StreamBlocks` and `streamFileFromBlocks` (`internal/api/seafhttp.go`)
 
 #### What Is True Today
 
-`StreamBlocks` ([`streaming.go`](../internal/streaming/streaming.go#L176)) returns `void`. If `GetBlock`/`GetBlockReader`/`Write`/`io.CopyBuffer` fails mid-stream it logs and returns — by then headers are sent, so it genuinely cannot signal the client. That part is unavoidable.
-
-The real gap is on the **caller** side. In `streamFileFromBlocks` the code after `StreamBlocks` runs unconditionally:
-
-- logs `Streaming complete: N blocks` even if the stream aborted early;
-- calls `traffic.RecordCheckedTransfer(..., fileSize)` with the **full** `fileSize`, over-counting traffic on a partial transfer.
-
-Not every caller has this: `DownloadHistoricFile` and `HandleZipDownload` already record the **actual** bytes written (`bytesAfter - bytesBefore`), so they are accurate. The defect is specific to the `fileSize`-based recording in `streamFileFromBlocks`.
-
-#### Fix (recommended, not yet done)
-
-Make `StreamBlocks` return `error` (or the bytes streamed), and in `streamFileFromBlocks` skip the success log + record only actual bytes on partial transfer. The client still can't get a new status once the body started, but observability and billing stop lying. Low blast radius (≈6 callers), worth doing soon because it touches billing.
+`StreamBlocks` ([`streaming.go`](../internal/streaming/streaming.go#L288)) returns an
+error, and `streamFileFromBlocks` records the writer delta rather than the nominal
+file size. The success log is emitted only after the stream returns without an
+error. A failure after headers are sent still cannot change the client status, but
+it no longer appears as a successful stream or over-counts billed bytes.
 
 ---
 
@@ -5165,7 +5158,7 @@ own fix + regression.
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
 | **B** | Authenticated block **PUT** concurrency (= registry **X10**) | ✅ **Closed 2026-07-30** | — | A pre-gate global ticket plus per-user/node admissions bound active, transitioning and parked requests before body reads; real-TCP deadlines cover stalled bodies; complete-lifetime memory trials support 24 slots at an 80 MiB design cost; real `seaf-cli` recovered from the shipped 10s wait and `Retry-After: 10` |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | ✅ **Closed 2026-07-31** | — | Own admission instance (separate capacity from B) before the body read, deduplicated lookups, configured fan-out and cancellation coverage for both canonical metadata phases, and an admitted lifetime that now reaches the socket. Cancellation stops new dispatch; already-issued Cassandra queries remain bounded by the driver's finite timeout. Id cap is configurable and capped at its inherited 100k; see "Subcontract C" below |
-| **D** | All storage-backed download/inline-content reads, including seafhttp download, block GET, ZIP, raw/history and share raw | ✅ **Closed 2026-08-03** | D1-D5 cover every listed producer with one process-local, bounded and atomic coordinator; D6 measured the per-admission cost (4.0 MiB plaintext, 36.0 MiB encrypted, ~192 MiB for a capped iWork preview), sized the caps against a stated 2 GiB budget, enabled the section, and produced the client, proxy and saturation evidence | The original row named seafhttp download/block GET. D0 expands closure by flow so raw/history/share/ZIP cannot bypass the same bandwidth/resource exhaustion control |
+| **D** | All storage-backed download/inline-content reads, including seafhttp download, block GET, ZIP, raw/history and share raw | ✅ **Closed 2026-08-03** | D1-D5 cover every listed producer with one process-local, bounded and atomic coordinator; D6 measured the per-admission cost (4.0 MiB plaintext, ~68 MiB at the accepted 16 MiB encrypted block, ~184.5 MiB for a capped iWork preview; 72/192 MiB design costs), sized the caps against a stated 2 GiB budget, enabled the section, and produced the client, proxy and saturation evidence | The original row named seafhttp download/block GET. D0 expands closure by flow so raw/history/share/ZIP cannot bypass the same bandwidth/resource exhaustion control |
 
 #### Subcontract A: stable-link request and concurrency admission (A1/A2 closed 2026-07-29)
 
@@ -5673,8 +5666,9 @@ the C closure criteria.
 bound rather than a measured one — criterion 3 bounds the *work per id* and the
 *concurrent requests*, not the list length. Process-local, like every other guard
 here: fleet capacity scales with node count. Closing C did not close the
-umbrella; **D6 (download admission operating evidence) remains open**, so B4 remains a production
-blocker.
+umbrella; at this D0-D5 snapshot **D6 (download admission operating evidence)
+remained open**, so B4 remained a production blocker until the closure recorded
+in the current rows above.
 
 #### Subcontract D: download admission contract and inventory (D0-D5, 2026-08-03)
 
@@ -5823,7 +5817,7 @@ completed block. After streaming, D5 counts bytes successfully written and
 passes that actual count to `traffic.RecordCheckedTransfer`; a partial transfer
 must not regress to nominal-size overbilling. The broader `StreamBlocks` false
 success/over-counting issue remains separately tracked as
-`ISSUE-STREAMBLOCKS-VOID-01`.
+`ISSUE-STREAMBLOCKS-VOID-01`, which was fixed on 2026-08-03.
 
 D0-D6 is the implementation order: contract/inventory, coordinator, public-link
 identity, writer lifetime/gzip, existing stream integration, block GET streaming,
@@ -5834,10 +5828,10 @@ direct bucket access is protected by application admission.
 
 #### Fix Direction
 
-Implement D through the D0-D6 sequence. Do not mark this issue closed until the
-criteria in the D0 contract are met with focused, real-middleware and integration
-evidence. B4 remains open until D closes. The old 257 MiB `PutBlock` cap note is
-historical: B right-sized and bounded that path; it is not remaining D work.
+Implement D through the D0-D6 sequence. The sequence is now complete with
+focused, real-middleware and integration evidence. The old 257 MiB `PutBlock`
+cap note is historical: B right-sized and bounded that path; it is not remaining
+D work. Direct object storage and byte-rate shaping remain separate findings.
 
 #### Related Docs
 

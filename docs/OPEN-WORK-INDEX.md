@@ -57,15 +57,14 @@ of them updated.
 
 ## Production blockers — must close before go-live
 
-**Readiness verdict is still no-go as-is.** NF-1 closed 2026-07-25; **B4 and the
-sync public-link token auth gap remain open single-node blockers** and anonymous
-object-storage downloads are a separate production-posture blocker;
+**Readiness verdict is still no-go as-is.** NF-1 closed 2026-07-25; **B4 is
+closed, while the sync public-link token auth gap remains an open single-node
+blocker** and anonymous object-storage downloads are a separate production-posture blocker;
 multi-instance adds B1 and B5. See
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | ✅ **Closed 2026-08-03** | Umbrella closed: **A1/A2 2026-07-29; B 07-30; C 07-31; D0-D6 08-03**. Download admission ships enabled with capacities measured against a stated 2 GiB per-node budget. **Not closed by it:** `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` and the quantified `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01`. | Readiness B4 ⊇ registry X10/X11; see [`SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md) |
 | `ISSUE-SYNC-LINK-TOKEN-AUTH-01` | HIGH | Public share-link download tokens are accepted by `syncAuthMiddleware` as repository credentials, so a bearer issued for a shared file can reach the repo sync surface as the link creator | Pre-existing authorization gap in `internal/api/server.go`; see `KNOWN_ISSUES.md` |
 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` | HIGH | Supported Compose policies grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known | Production posture — private buckets and effective endpoint policy must be verified before go-live; see `KNOWN_ISSUES.md` |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
@@ -83,6 +82,13 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
   Live integration covers both halves: both public endpoints for inline
   content, and a `.docx` fixture for the OnlyOffice credential (a `.md` fixture
   cannot reach that branch). Both mutation-verified against the cluster.
+- `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` — **Closed 2026-08-03** (B4 umbrella;
+  A1/A2, B, C and D0-D6 complete). Download admission is enabled in every
+  shipped configuration and its capacities are validated against the measured
+  2 GiB process-local budget. Object-storage anonymity and byte-rate shaping
+  remain separate findings.
+- `ISSUE-STREAMBLOCKS-VOID-01` — **Fixed 2026-08-03**; `StreamBlocks` now
+  returns errors and the seafhttp caller records delivered bytes only.
 
 ## Blockers that keep destructive GC disabled
 
@@ -99,7 +105,6 @@ on every replica in every DC until both close.
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01` | HIGH | `sesamefs_auth` is a replayable bearer in a JS-readable cookie → XSS = token theft | Readiness SEC-3 / NF-3 |
-| `ISSUE-STREAMBLOCKS-VOID-01` | HIGH | `StreamBlocks` returns void → false "complete" log and over-billed traffic | Readiness DL-1 |
 | `ISSUE-ZIP-STREAM-LATEFAIL-01` | HIGH | ZIP download can truncate after `200 OK` | Readiness DL-2 |
 | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | MEDIUM | Cross-library block read (BOLA), gated only by knowing the 256-bit hash | Readiness B2/SEC-1 |
 | `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` | MEDIUM | Download cap and `single_use` are race-bypassable | Readiness NF-2 / SH-5 |

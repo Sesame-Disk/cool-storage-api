@@ -120,22 +120,22 @@ single admitted transfer holds and divided a stated **2 GiB per-node budget**:
 | Transfer shape | Measured peak per admission |
 |---|---|
 | Plaintext stream (any size) | 4.0 MiB |
-| Encrypted stream | 36.0 MiB at the 8 MiB block size |
-| `raw` iWork preview, 32 MiB source cap | ~192 MiB |
+| Encrypted stream | 36.0 MiB at 8 MiB; 72 MiB design cost at the accepted 16 MiB block size |
+| `raw` iWork preview, 32 MiB source cap | ~184.5 MiB measured; 192 MiB design cost |
 
-Encrypted transfers cost nine times a plaintext one because the prefetch reads
-and decrypts whole blocks rather than streaming them, so an admitted transfer
-holds the current and next decrypted block at once. The iWork preview buffers the
-entire source document, which is why `file_view.max_iwork_source_bytes` caps it
-at 32 MiB separately from the 1 GiB general preview limit — without that cap a
-single request could touch several gigabytes.
+Encrypted prefetch reads and decrypts whole blocks rather than streaming them,
+so the design cost scales at 4.5x the accepted block size. The iWork preview
+buffers the entire source document, which is why `fileview.max_iwork_source_bytes`
+caps it at 32 MiB separately from the 1 GiB general preview limit — without that
+cap a single request could touch several gigabytes.
 
-Worst case under the shipped caps is `6 x 192 MiB + 18 x 36 MiB` = 1.78 GiB.
+Worst case under the shipped caps is `6 x 192 MiB + 12 x 72 MiB` = 2016 MiB
+(~1.97 GiB), below the 2 GiB process-local budget.
 **If you raise `max_active_per_node`, `max_active_raw` or
 `max_iwork_source_bytes`, redo that arithmetic against your own memory budget.**
 
-Refused transfers answer `503` with `Retry-After`; real `seaf-cli` was refused 31
-times in the closure drill and still completed its sync. A client that stops
+Refused transfers answer `503` with `Retry-After`; the real `seaf-cli` fault drill
+must record a profile=`block` refusal before claiming recovery. A client that stops
 reading is released on `idle_write_timeout` — verified through the supported
 nginx, where `proxy_buffering off` and `gzip off` on the transfer locations are
 what let the application see a slow client at all rather than the proxy absorbing
@@ -1026,11 +1026,12 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_CLIENT_LINK` | `download_admission.max_active_per_client_link` | Stable public-link plus trusted client-IP cap. Shipped value is measured; validation ceiling `1024`. |
 | `DOWNLOAD_ADMISSION_MAX_WAITERS_PER_IDENTITY` | `download_admission.max_waiters_per_identity` | Parked requests per identity. `0` refuses immediately; validation ceiling `1024`. |
 | `DOWNLOAD_ADMISSION_MAX_WAITERS_PER_NODE` | `download_admission.max_waiters_per_node` | Parked requests per process. `0` refuses immediately; validation ceiling `4096`. |
-| `DOWNLOAD_ADMISSION_ADMISSION_WAIT` | `download_admission.admission_wait` | Queue duration before `503 + Retry-After`. D1 template value is `0s`; maximum `5m`. |
+| `DOWNLOAD_ADMISSION_ADMISSION_WAIT` | `download_admission.admission_wait` | Queue duration before `503 + Retry-After`. Shipped value is `2s`; maximum `5m`. |
 | `DOWNLOAD_ADMISSION_PREPARATION_DEADLINE` | `download_admission.preparation_deadline` | Positive D6-selected preparation deadline; maximum `1h`. |
 | `DOWNLOAD_ADMISSION_IDLE_WRITE_TIMEOUT` | `download_admission.idle_write_timeout` | Positive D6-selected idle response-write deadline; maximum `15m`. |
 | `DOWNLOAD_ADMISSION_RETRY_AFTER` | `download_admission.retry_after` | Explicit retry hint for long-lived download slots; maximum `1h`. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_<PROFILE>` | `download_admission.max_active_<profile>` | Fixed profiles: `BLOCK`, `FILE`, `RAW`, `HISTORY`, `LINK_RAW`, `ZIP`, `LINK_INLINE`. `0` means no additional profile cap; validation ceiling `1024`. |
+| `FILEVIEW_MAX_IWORK_SOURCE_BYTES` | `fileview.max_iwork_source_bytes` | Source cap for the buffered iWork preview branch. Default `33554432` (32 MiB); must be positive and no greater than `fileview.max_preview_bytes` when download admission is enabled. Raw streams do not use this preview-only cap. |
 | `METRICS_ENABLED` | `monitoring.metrics_enabled` | |
 | `DESKTOP_CUSTOM_BRAND` | — (server-info response) | Brand name shown in desktop client (default: `Sesame Disk`) |
 | `DESKTOP_CUSTOM_LOGO` | — (server-info response) | Full URL to logo image shown in desktop client (optional) |

@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/gin-gonic/gin"
 )
@@ -30,6 +31,9 @@ import (
 //     transfer holds the *decrypted* current block and the *decrypted* next
 //     block at once, plus the encrypted source of the one being decrypted. That
 //     scales with block size and is the figure that sizes the node cap.
+//     The benchmark covers the common 8 MiB block and the 16 MiB maximum
+//     accepted by seafhttp.sync_block_max_bytes; capacity validation uses the
+//     latter.
 //
 // The peak is mid-stream, not at the end, so a reader pauses at a chosen block
 // and the heap is sampled there rather than after the response completes.
@@ -37,8 +41,6 @@ import (
 // Run:
 //
 //	go test -run '^$' -bench BenchmarkDownloadStreamMemory -benchmem ./internal/streaming/
-
-const downloadBenchBlockSize = 8 << 20 // the chunker's upper block size
 
 // pausingBlockReader serves synthetic blocks and blocks the stream at pauseAt so
 // the caller can sample the heap while an admitted transfer is at its peak.
@@ -78,23 +80,23 @@ func (r *pausingBlockReader) GetBlockSize(context.Context, string) (int64, error
 }
 
 func BenchmarkDownloadStreamMemory(b *testing.B) {
-	for _, tc := range []struct {
-		name      string
-		encrypted bool
-	}{
-		{"plaintext", false},
-		{"encrypted", true},
-	} {
-		b.Run(tc.name, func(b *testing.B) {
-			benchmarkDownloadStream(b, tc.encrypted)
-		})
+	for _, blockSize := range []int{8 << 20, int(config.DefaultSyncBlockMaxBytes)} {
+		for _, encrypted := range []bool{false, true} {
+			name := fmt.Sprintf("block=%dMiB/plaintext", blockSize>>20)
+			if encrypted {
+				name = fmt.Sprintf("block=%dMiB/encrypted", blockSize>>20)
+			}
+			b.Run(name, func(b *testing.B) {
+				benchmarkDownloadStream(b, blockSize, encrypted)
+			})
+		}
 	}
 }
 
-func benchmarkDownloadStream(b *testing.B, encrypted bool) {
+func benchmarkDownloadStream(b *testing.B, blockSize int, encrypted bool) {
 	gin.SetMode(gin.TestMode)
 
-	plain := bytes.Repeat([]byte{0xA5}, downloadBenchBlockSize)
+	plain := bytes.Repeat([]byte{0xA5}, blockSize)
 	var fileKey, fileIV, ciphertext []byte
 	if encrypted {
 		fileKey = bytes.Repeat([]byte{0x11}, crypto.FileKeySize)
@@ -109,7 +111,7 @@ func benchmarkDownloadStream(b *testing.B, encrypted bool) {
 	retained := measureStreamPeak(b, plain, ciphertext, fileKey, fileIV)
 
 	b.ReportAllocs()
-	b.SetBytes(int64(downloadBenchBlockSize) * 4)
+	b.SetBytes(int64(blockSize) * 4)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		runDownloadStream(b, plain, ciphertext, fileKey, fileIV, 0, nil, nil)
@@ -117,7 +119,7 @@ func benchmarkDownloadStream(b *testing.B, encrypted bool) {
 	b.StopTimer()
 
 	b.ReportMetric(float64(retained), "peak-B/admission")
-	b.ReportMetric(float64(retained)/float64(downloadBenchBlockSize), "peak/block")
+	b.ReportMetric(float64(retained)/float64(blockSize), "peak/block")
 }
 
 // measureStreamPeak samples the heap while one transfer is parked mid-stream,

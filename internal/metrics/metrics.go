@@ -834,6 +834,13 @@ var (
 		},
 		[]string{"reason"},
 	)
+	DownloadAdmissionRejectedByProfileTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "download_admission_rejected_by_profile_total",
+			Help: "Download admission refusals by fixed profile and reason.",
+		},
+		[]string{"profile", "reason"},
+	)
 	DownloadAdmissionReleasedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "download_admission_released_total",
@@ -894,6 +901,9 @@ func Register() {
 		"admission_timeout", "client_gone",
 	} {
 		DownloadAdmissionRejectedTotal.WithLabelValues(reason).Add(0)
+		for _, profile := range []string{"block", "file", "raw", "history", "link_raw", "zip", "link_inline"} {
+			DownloadAdmissionRejectedByProfileTotal.WithLabelValues(profile, reason).Add(0)
+		}
 	}
 	for _, cause := range []string{"completed", "client_disconnect", "preparation_timeout", "idle_write_timeout", "storage_error", "response_error", "panic"} {
 		DownloadAdmissionReleasedTotal.WithLabelValues(cause).Add(0)
@@ -983,6 +993,7 @@ func Register() {
 		DownloadAdmissionWaitersByGate,
 		DownloadAdmissionTrackedIdentities,
 		DownloadAdmissionRejectedTotal,
+		DownloadAdmissionRejectedByProfileTotal,
 		DownloadAdmissionReleasedTotal,
 		DownloadAdmissionDeadlineExpiredTotal,
 		DownloadAdmissionWriterUnreachableTotal,

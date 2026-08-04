@@ -20,10 +20,9 @@ import (
 // the library is encrypted, so decryption can run — and only then parses the
 // assembled document as a ZIP.
 //
-// The source size is gated, but by the general FileView.MaxPreviewBytes, which
-// ships at 1 GiB in every configuration. That is a preview limit, not an
-// in-memory budget, and it is what makes max_active_raw the only thing standing
-// between the node and multiple gigabytes of buffered previews:
+// The source size is gated by FileView.MaxIWorkSourceBytes (32 MiB in the
+// shipped configurations), because the general 1 GiB preview limit is not an
+// in-memory budget for this branch:
 //
 //	iWork node memory budget ≈ max_active_raw × measured_peak_iwork_request
 //
@@ -41,7 +40,7 @@ import (
 const iworkBenchBlockSize = 8 << 20 // the system block size
 
 func BenchmarkIWorkPreviewMemory(b *testing.B) {
-	for _, sourceMiB := range []int{16, 64, 256} {
+	for _, sourceMiB := range []int{16, 32, 64, 256} {
 		for _, encrypted := range []bool{false, true} {
 			name := fmt.Sprintf("source=%dMiB/plaintext", sourceMiB)
 			if encrypted {

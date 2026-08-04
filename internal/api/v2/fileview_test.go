@@ -1108,6 +1108,23 @@ func TestIsAppleIWorkFile(t *testing.T) {
 	}
 }
 
+func TestGetMaxFileSizeForPreviewOnlyCapsBufferedIWork(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.FileView.MaxPreviewBytes = 1 * 1024 * 1024 * 1024
+	cfg.FileView.MaxIWorkSourceBytes = 32 * 1024 * 1024
+	h := &FileViewHandler{config: cfg}
+
+	if got := h.getMaxFileSizeForPreview("pages", false); got != cfg.FileView.MaxPreviewBytes {
+		t.Fatalf("raw iWork limit = %d, want general preview limit %d", got, cfg.FileView.MaxPreviewBytes)
+	}
+	if got := h.getMaxFileSizeForPreview("pages", true); got != cfg.FileView.MaxIWorkSourceBytes {
+		t.Fatalf("buffered iWork limit = %d, want source cap %d", got, cfg.FileView.MaxIWorkSourceBytes)
+	}
+	if got := h.getMaxFileSizeForPreview("docx", true); got != cfg.FileView.MaxPreviewBytes {
+		t.Fatalf("non-iWork limit = %d, want general preview limit %d", got, cfg.FileView.MaxPreviewBytes)
+	}
+}
+
 // TestSanitizeFilename tests filename sanitization for Content-Disposition headers
 func TestSanitizeFilename(t *testing.T) {
 	tests := []struct {

@@ -784,10 +784,10 @@ One residual remains and is **not** closed by D:
 That is a product decision about whether anonymous inline reads consume owner or
 organization quota, not a D correctness gap, and §11 reserves it: changing it
 requires its own explicit product and issue decision. It is recorded here so no
-one later reads "every D producer is admitted" as "every D producer is billed". The exception is the block GET path: D5 must not
-introduce a regression from its current exact completed-block accounting to
-nominal-size accounting. The broader `StreamBlocks` false-success and
-over-counting issue is already tracked as `ISSUE-STREAMBLOCKS-VOID-01`.
+one later reads "every D producer is admitted" as "every D producer is billed".
+The block GET path is explicitly protected from regressions: D5 must not change
+its exact completed-block accounting to nominal-size accounting. The related
+`StreamBlocks` false-success and over-counting issue was fixed on 2026-08-03.
 A future traffic-accounting change beyond that D5 non-regression requires its
 own explicit product and issue decision.
 
@@ -900,6 +900,7 @@ but in only some config files is a defect B and C both had to fix.
 | `download_admission_waiters_by_gate` | Gauge | `gate` — which gates those requests were blocked on at their last coordinator reevaluation |
 | `download_admission_tracked_identities` | Gauge | `dimension` — identity gates currently materialised |
 | `download_admission_rejected_total` | Counter | `reason`, fixed set |
+| `download_admission_rejected_by_profile_total` | Counter | `profile`, `reason`, both fixed sets; attribution companion for drills and alerts |
 | `download_admission_released_total` | Counter | `cause`, fixed set |
 | `download_admission_deadline_expired_total` | Counter | `phase` = `preparation` or `idle_write` |
 | `download_admission_writer_unreachable_total` | Counter | none — deadline could not be installed |
@@ -1029,17 +1030,18 @@ estimate. Both benchmarks are in the tree so the figures can be re-derived.
 
 | Producer shape | Measured peak per admission | Benchmark |
 |---|---|---|
-| Plaintext streaming (`file`, `block`, `raw`, `history`, `link_raw`) | **4.0 MiB**, independent of file size | `BenchmarkDownloadStreamMemory/plaintext` |
-| Encrypted streaming | **36.0 MiB** at the 8 MiB system block size | `BenchmarkDownloadStreamMemory/encrypted` |
-| `raw` iWork preview, 32 MiB source cap | **~192 MiB** encrypted, ~128 MiB plaintext | `BenchmarkIWorkPreviewMemory` |
+| Plaintext streaming (`file`, `block`, `raw`, `history`, `link_raw`) | **4.0 MiB**, independent of file size | `BenchmarkDownloadStreamMemory/block=8MiB/plaintext` and `block=16MiB/plaintext` |
+| Encrypted streaming | **36.0 MiB** at 8 MiB; **~68 MiB measured / 72 MiB design** at 16 MiB | `BenchmarkDownloadStreamMemory/block=8MiB/encrypted` and `block=16MiB/encrypted` |
+| `raw` iWork preview, 32 MiB source cap | **~184.5 MiB** encrypted, ~120 MiB plaintext; 192 MiB design cost | `BenchmarkIWorkPreviewMemory/source=32MiB/*` |
 
 Two results drove decisions rather than merely being recorded.
 
 Encrypted streaming does not stream inside the prefetch: `PrefetchBlock` calls
 `GetBlock` and `DecryptLibraryBlock`, so an admitted transfer holds the decrypted
 current block, the decrypted next block and their encrypted sources at once. At
-4.5× the block size it is nine times the plaintext cost, and it is what
-`max_active_per_node` actually divides into.
+roughly 4.5x the block size it is what `max_active_per_node` actually divides
+into. The 16 MiB accepted sync block is therefore the sizing input, not only the
+8 MiB typical client block.
 
 The iWork preview is not a stream at all, and its peak is ~4× the source
 plaintext and ~6× encrypted — a 256 MiB document measured at 1.5 GiB. Against the
@@ -1049,7 +1051,8 @@ this and named the cheaper lever, which is what was taken: a `FileView` iWork
 schema nor the metric label set. Sizing `max_active_raw` for iWork instead would
 have throttled ordinary raw streams — 4 MiB each — by two orders of magnitude.
 
-Worst case under the shipped caps: `6 × 192 MiB + 18 × 36 MiB ≈ 1.78 GiB`.
+Worst case under the shipped caps: `6 x 192 MiB + 12 x 72 MiB = 2016 MiB`
+(`~1.97 GiB`), below the stated 2 GiB process-local budget.
 
 ### Where each criterion is demonstrated
 
@@ -1057,18 +1060,18 @@ Worst case under the shipped caps: `6 × 192 MiB + 18 × 36 MiB ≈ 1.78 GiB`.
 |---|---|
 | 1 | Producer inventory in §1; non-producers regressed in D4; `link_inline` billing residual recorded in §11 |
 | 2 | `internal/downloadadmission` atomicity tests (D1) |
-| 3 | `TestDownloadAdmissionSaturationHoldsOneNodeCeiling` — `raw` and `file` live simultaneously inside one aggregate |
+| 3 | `TestDownloadAdmissionSaturationHoldsOneNodeCeiling` — three identities fill the real node cap while `raw` and `file` live simultaneously inside one aggregate |
 | 4 | `TestDownloadAdmissionFairnessIsolatesLinkAndOwner` — both directions, each gated on the other side genuinely refusing first |
-| 5 | Same saturation drill drains to zero; `TestDownloadAdmissionDrainsIdentityStateAfterChurn` over 200 transfers |
+| 5 | Same saturation drill drains to zero; `TestIdentityEntriesDrainAfterSequentialChurn` covers 20,000 distinct identities and the live probe covers 200 repeated transfers |
 | 6 | D4/D5 placement regressions, including ZIP held through `Close()` |
 | 7 | D3/D5 lifetime tests plus `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01`, which closed the last unbounded phase |
 | 8 | Saturation drill asserts `503` with a valid `Retry-After`; byte integrity in `TestDownloadAdmissionThroughProxyDeliversCompleteBytes` |
 | 9 | D5 canonical-reader streaming with authoritative size |
-| 10 | `TestDownloadAdmissionThroughProxyReleasesStalledClient` — a stalled client through the **real frontend nginx** holds its slot and is released at 1m0s, matching `idle_write_timeout` rather than nginx's 3600s `proxy_read_timeout` |
-| 11 | `scripts/fault-inject-download-admission.sh` — real `seaf-cli` refused 31 times, still reached `synchronized`, pulled every file, drained every slot |
+| 10 | `TestDownloadAdmissionThroughProxyReleasesStalledClient` — a stalled client through the **real frontend nginx** holds its slot, is classified as `idle_write_timeout`, and is not released by client cancellation |
+| 11 | `scripts/fault-inject-download-admission.sh` — real `seaf-cli` produces an attributed `profile="block"` refusal, still reaches `synchronized`, pulls every file and drains every slot |
 | 12 | Measurements above; egress measured at 356 MiB/s single and 1699 MiB/s aggregate six-way (**4.9×**), which is the byte-rate residual stated with a number |
 | 13 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` remains open and is not treated as closed by D |
-| 14 | `TestShippedConfigs*` load every shipped configuration through the real validator; invariants asserted on a busy node in the saturation drill |
+| 14 | `TestShippedConfigs*` load every shipped configuration through the real validator, including the combined 2 GiB memory invariant; invariants are asserted on a busy node in the saturation drill |
 
 ### What the measurements are not
 
