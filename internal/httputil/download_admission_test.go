@@ -489,6 +489,47 @@ func TestDownloadAdmissionIdleTimeoutClaimsCauseBeforeCancellation(t *testing.T)
 	waitForMetric(t, func() float64 { return releaseCount(downloadadmission.ReleaseIdleWriteTimeout) }, beforeIdle+1)
 }
 
+func TestDownloadAdmissionRequestCancellationPreservesIdleWriteTimeout(t *testing.T) {
+	cfg := admissionLifecycleConfig()
+	cfg.IdleWriteTimeout = time.Minute
+	coordinator := newAdmissionLifecycleCoordinator(t, cfg)
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c, _ := newAdmissionLifecycleContext(parent, newIdleWriteTestWriter())
+	lifecycle, reason, err := AcquireDownloadAdmission(c, coordinator, cfg, admissionLifecycleRequest(t, "cancel-after-timeout"))
+	if err != nil || reason != "" {
+		t.Fatalf("AcquireDownloadAdmission = (%q, %v)", reason, err)
+	}
+	if _, err := lifecycle.StartStreaming(); err != nil {
+		t.Fatalf("StartStreaming = %v", err)
+	}
+
+	// Reproduce the ordering at the net/http boundary deterministically: the
+	// writer has already recorded its server-owned timeout, but the request
+	// cancellation callback has not claimed the lifecycle yet.
+	lifecycle.mu.Lock()
+	writer := lifecycle.writer
+	lifecycle.mu.Unlock()
+	writer.mu.Lock()
+	_, _, _ = writer.failLocked(ErrIdleWriteTimeout)
+	writer.mu.Unlock()
+
+	beforeIdle := deadlineCount(downloadadmission.DeadlineIdleWrite)
+	beforeTimeout := releaseCount(downloadadmission.ReleaseIdleWriteTimeout)
+	beforeClient := releaseCount(downloadadmission.ReleaseClientDisconnect)
+	cancel()
+	lifecycle.failRequestCancellation()
+
+	if err := lifecycle.Finish(downloadadmission.ReleaseCompleted); !errors.Is(err, ErrIdleWriteTimeout) {
+		t.Fatalf("Finish = %v, want idle write timeout", err)
+	}
+	waitForMetric(t, func() float64 { return deadlineCount(downloadadmission.DeadlineIdleWrite) }, beforeIdle+1)
+	waitForMetric(t, func() float64 { return releaseCount(downloadadmission.ReleaseIdleWriteTimeout) }, beforeTimeout+1)
+	if got := releaseCount(downloadadmission.ReleaseClientDisconnect); got != beforeClient {
+		t.Fatalf("client-disconnect releases = %v, want unchanged %v", got, beforeClient)
+	}
+}
+
 func TestDownloadAdmissionFailUsesFirstCauseExactlyOnce(t *testing.T) {
 	cfg := admissionLifecycleConfig()
 	coordinator := newAdmissionLifecycleCoordinator(t, cfg)

@@ -49,13 +49,48 @@ LIBRARY_PREFIX="fault-inject-download-admission"
 log()  { printf '[fault-inject] %s\n' "$*"; }
 fail() { printf '[fault-inject] FAIL: %s\n' "$*"; exit 1; }
 
-# Sum a metric family across all label sets. Rejections are labelled by reason,
-# and which identity dimension refused first is not what this drill asserts.
+# Sum an exact metric name, optionally restricted to exact profile/reason labels.
+# Rejections are labelled by reason, and the client-recovery assertion must not
+# count client_gone as a server-owned retryable refusal.
 metric_sum() {
   local body
   body=$(curl -fsS -H 'Accept-Encoding: identity' "${SESAMEFS_URL}/metrics" 2>/dev/null) || return 1
   printf '%s\n' "${body}" \
-    | awk -v p="$1" 'index($0, p) == 1 && $0 !~ /^#/ { s += $NF } END { printf "%.0f\n", s+0 }'
+    | awk -v wanted_metric="$1" -v wanted_profile="${2:-}" -v wanted_reason="${3:-}" '
+      function has_label(labels, name, value) {
+        return index(labels, name "=\"" value "\"") > 0
+      }
+      $0 !~ /^#/ {
+        metric = $1
+        open = index(metric, "{")
+        if (open > 0) {
+          metric_name = substr(metric, 1, open - 1)
+          labels = substr(metric, open + 1, length(metric) - open - 1)
+        } else {
+          metric_name = metric
+          labels = ""
+        }
+        if (metric_name != wanted_metric) {
+          next
+        }
+        if (wanted_profile != "" && !has_label(labels, "profile", wanted_profile)) {
+          next
+        }
+        if (wanted_reason != "" && !has_label(labels, "reason", wanted_reason)) {
+          next
+        }
+        s += $NF
+      }
+      END { printf "%.0f\n", s+0 }'
+}
+
+retryable_block_rejected() {
+  local reason value total=0
+  for reason in admission_timeout auth_user_full node_full profile_full; do
+    value=$(metric_sum 'download_admission_rejected_by_profile_total' block "${reason}") || return 1
+    total=$((total + value))
+  done
+  printf '%s\n' "${total}"
 }
 
 wait_for_active() {
@@ -175,13 +210,33 @@ done
 
 wait_for_active "${HOLDER_COUNT}" 30
 
-# Take the baseline only after the holders are admitted. Their requests never
-# retry, so every later profile=block rejection is attributable to seaf-cli.
-rejected_before=$(metric_sum 'download_admission_rejected_total{') \
+# Prove the HTTP refusal contract independently while the holders are admitted.
+# This probe is intentionally completed before the client baseline below, so its
+# refusal cannot be mistaken for seaf-cli evidence.
+contract_headers=$(mktemp)
+contract_status=$(curl -sS -D "${contract_headers}" -o /dev/null --max-time 10 -w '%{http_code}' \
+  -H "Authorization: Token ${DEV_API_TOKEN}" \
+  -H 'Accept-Encoding: identity' \
+  "${SESAMEFS_URL_LOCAL}/repo/${repo_id}/raw/${first_file}" || true)
+contract_retry_after=$(awk 'BEGIN { IGNORECASE=1 } tolower($1) == "retry-after:" { gsub("\r", "", $2); print $2; exit }' "${contract_headers}")
+rm -f "${contract_headers}"
+if [ "${contract_status}" != "503" ]; then
+  fail "saturated refusal returned HTTP ${contract_status:-unknown}, want 503"
+fi
+case "${contract_retry_after}" in
+  ''|*[!0-9]*) fail "saturated 503 carried invalid Retry-After ${contract_retry_after:-empty}" ;;
+  0) fail "saturated 503 carried non-positive Retry-After" ;;
+esac
+log "saturated refusal contract: HTTP ${contract_status} with Retry-After ${contract_retry_after}s"
+
+# Take the baseline only after the holders and the independent contract probe
+# are complete. Their requests never retry, so every later retryable block
+# refusal is attributable to seaf-cli.
+rejected_before=$(metric_sum 'download_admission_rejected_total') \
   || fail "could not scrape ${SESAMEFS_URL}/metrics after holders stabilized"
-block_rejected_before=$(metric_sum 'download_admission_rejected_by_profile_total{profile="block"') \
+retryable_block_rejected_before=$(retryable_block_rejected) \
   || fail "could not scrape block-profile rejection metric before the client"
-log "rejections after holder stabilization: ${rejected_before}; block-profile: ${block_rejected_before}"
+log "rejections after holder stabilization: ${rejected_before}; retryable block-profile: ${retryable_block_rejected_before}"
 
 # Client state is part of the fixture: sharing sync-test's persistent volumes
 # made registration depend on stale entries whose libraries no longer existed.
@@ -242,9 +297,9 @@ downloaded=$(find "${sync_dir}" -name '*.bin' -type f 2>/dev/null | wc -l)
   || fail "client reported synchronized but pulled ${downloaded}/${FILE_COUNT} files"
 log "client pulled ${downloaded} files"
 
-rejected_after=$(metric_sum 'download_admission_rejected_total{') \
+rejected_after=$(metric_sum 'download_admission_rejected_total') \
   || fail "could not scrape ${SESAMEFS_URL}/metrics after the run"
-block_rejected_after=$(metric_sum 'download_admission_rejected_by_profile_total{profile="block"') \
+retryable_block_rejected_after=$(retryable_block_rejected) \
   || fail "could not scrape block-profile rejection metric after the client"
 log "rejections after: ${rejected_after}"
 
@@ -253,10 +308,10 @@ log "rejections after: ${rejected_after}"
 if [ "${rejected_after}" -le "${rejected_before}" ]; then
   fail "the client was never refused (${rejected_before} -> ${rejected_after}); the drill proved nothing"
 fi
-if [ "${block_rejected_after}" -le "${block_rejected_before}" ]; then
-  fail "the client produced no profile=block refusal (${block_rejected_before} -> ${block_rejected_after}); the drill did not reach sync download admission"
+if [ "${retryable_block_rejected_after}" -le "${retryable_block_rejected_before}" ]; then
+  fail "the client produced no retryable profile=block refusal (${retryable_block_rejected_before} -> ${retryable_block_rejected_after}); client_gone and unrelated reasons are excluded"
 fi
-log "refusals during the run: $((rejected_after - rejected_before)); block-profile refusals: $((block_rejected_after - block_rejected_before))"
+log "refusals during the run: $((rejected_after - rejected_before)); retryable block-profile refusals: $((retryable_block_rejected_after - retryable_block_rejected_before))"
 
 # And nothing may be stranded once the load stops.
 waited=0

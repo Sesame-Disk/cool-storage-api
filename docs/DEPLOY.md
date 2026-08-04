@@ -130,9 +130,18 @@ caps it at 32 MiB separately from the 1 GiB general preview limit — without th
 cap a single request could touch several gigabytes.
 
 Worst case under the shipped caps is `6 x 192 MiB + 12 x 72 MiB` = 2016 MiB
-(~1.97 GiB), below the 2 GiB process-local budget.
-**If you raise `max_active_per_node`, `max_active_raw` or
-`max_iwork_source_bytes`, redo that arithmetic against your own memory budget.**
+(~1.97 GiB), below the 2 GiB process-local budget. This is a hard startup
+invariant, not advisory arithmetic: `Config.Validate()` rejects an enabled
+configuration whose computed design exceeds the budget, so changing
+`max_active_per_node`, `max_active_raw`, `max_iwork_source_bytes` or the sync
+block size can make the service refuse to boot until the complete combination
+fits again.
+
+`max_active_raw=0` means there is no additional raw profile sub-cap; it does not
+remove raw work from the memory calculation. The validator charges all node
+slots at the raw/iWork worst-case cost in that case. `max_active_block` remains a
+profile sub-cap and must not exceed `max_active_per_node`; the remaining node
+capacity is charged at the encrypted streaming cost.
 
 Refused transfers answer `503` with `Retry-After`; the real `seaf-cli` fault drill
 must record a profile=`block` refusal before claiming recovery. A client that stops

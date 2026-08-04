@@ -158,6 +158,101 @@ func TestDownloadAdmissionValidation(t *testing.T) {
 	}
 }
 
+func d6MemoryBudgetConfig() *Config {
+	cfg := DefaultConfig()
+	cfg.Server.WriteTimeout = 0
+	cfg.DownloadAdmission = DownloadAdmissionConfig{
+		Enabled:                true,
+		MaxActivePerNode:       18,
+		MaxActivePerAuthUser:   6,
+		MaxActivePerLinkSource: 6,
+		MaxActivePerClientLink: 3,
+		MaxWaitersPerIdentity:  4,
+		MaxWaitersPerNode:      24,
+		AdmissionWait:          2 * time.Second,
+		PreparationDeadline:    60 * time.Second,
+		IdleWriteTimeout:       60 * time.Second,
+		RetryAfter:             10 * time.Second,
+		MaxActiveBlock:         16,
+		MaxActiveFile:          16,
+		MaxActiveRaw:           6,
+		MaxActiveHistory:       6,
+		MaxActiveLinkRaw:       12,
+		MaxActiveZIP:           4,
+		MaxActiveLinkInline:    8,
+	}
+	cfg.SeafHTTP.SyncBlockMaxBytes = DefaultSyncBlockMaxBytes
+	cfg.FileView.MaxIWorkSourceBytes = 32 * 1024 * 1024
+	return cfg
+}
+
+func TestDownloadAdmissionMemoryBudgetBoundaries(t *testing.T) {
+	cases := []struct {
+		name       string
+		modify     func(*Config)
+		wantErr    bool
+		wantString string
+	}{
+		{name: "shipped 18 slots at 16 MiB", wantErr: false},
+		{
+			name: "node cap 19 exceeds budget",
+			modify: func(cfg *Config) {
+				cfg.DownloadAdmission.MaxActivePerNode = 19
+			},
+			wantErr:    true,
+			wantString: "memory design",
+		},
+		{
+			name: "32 MiB sync block exceeds budget",
+			modify: func(cfg *Config) {
+				cfg.SeafHTTP.SyncBlockMaxBytes = 32 * 1024 * 1024
+			},
+			wantErr:    true,
+			wantString: "memory design",
+		},
+		{
+			name: "zero iWork source cap",
+			modify: func(cfg *Config) {
+				cfg.FileView.MaxIWorkSourceBytes = 0
+			},
+			wantErr:    true,
+			wantString: "greater than zero",
+		},
+		{
+			name: "iWork source cap exceeds preview cap",
+			modify: func(cfg *Config) {
+				cfg.FileView.MaxIWorkSourceBytes = cfg.FileView.MaxPreviewBytes + 1
+			},
+			wantErr:    true,
+			wantString: "must not exceed",
+		},
+		{
+			name: "zero raw profile cap charges every node slot",
+			modify: func(cfg *Config) {
+				cfg.DownloadAdmission.MaxActiveRaw = 0
+			},
+			wantErr:    true,
+			wantString: "memory design",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := d6MemoryBudgetConfig()
+			if tc.modify != nil {
+				tc.modify(cfg)
+			}
+			err := cfg.validateDownloadAdmissionBounds()
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("validateDownloadAdmissionBounds() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), tc.wantString) {
+				t.Fatalf("validateDownloadAdmissionBounds() error = %q, want substring %q", err, tc.wantString)
+			}
+		})
+	}
+}
+
 func TestDownloadAdmissionEnvironmentOverrides(t *testing.T) {
 	clearLoadEnvOverrides(t)
 	cfg := DefaultConfig()

@@ -82,7 +82,7 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
   Live integration covers both halves: both public endpoints for inline
   content, and a `.docx` fixture for the OnlyOffice credential (a `.md` fixture
   cannot reach that branch). Both mutation-verified against the cluster.
-- `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` — **Closed 2026-08-03** (B4 umbrella;
+- `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` — **Closed 2026-08-04** (B4 umbrella;
   A1/A2, B, C and D0-D6 complete). Download admission is enabled in every
   shipped configuration and its capacities are validated against the measured
   2 GiB process-local budget. Object-storage anonymity and byte-rate shaping

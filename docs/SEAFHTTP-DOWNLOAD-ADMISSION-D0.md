@@ -1,7 +1,7 @@
 # B4 Subcontract D — Download Admission Contract
 
 **Date:** 2026-08-01 (original contract freeze)  
-**Last updated:** 2026-08-03  
+**Last updated:** 2026-08-04
 **Branch:** `feat/b4-subcontract-d6-closure`
 **Status:** **D0-D6 are complete.** D1 supplied the coordinator, configuration
 and metrics; D2 the stable public download-token `SourceID`; D3 the writer
@@ -1053,6 +1053,12 @@ have throttled ordinary raw streams — 4 MiB each — by two orders of magnitud
 
 Worst case under the shipped caps: `6 x 192 MiB + 12 x 72 MiB = 2016 MiB`
 (`~1.97 GiB`), below the stated 2 GiB process-local budget.
+This is a hard startup invariant enforced by `Config.Validate()`, not an
+operator advisory. Raising the node/profile/source/block values can therefore
+make an enabled deployment refuse to boot. A zero `max_active_raw` removes the
+extra raw profile sub-cap; it does not remove the raw/iWork term, so validation
+charges all node slots at that worst-case cost. `max_active_block` remains a
+profile sub-cap and cannot exceed the node cap.
 
 ### Where each criterion is demonstrated
 
@@ -1068,7 +1074,7 @@ Worst case under the shipped caps: `6 x 192 MiB + 12 x 72 MiB = 2016 MiB`
 | 8 | Saturation drill asserts `503` with a valid `Retry-After`; byte integrity in `TestDownloadAdmissionThroughProxyDeliversCompleteBytes` |
 | 9 | D5 canonical-reader streaming with authoritative size |
 | 10 | `TestDownloadAdmissionThroughProxyReleasesStalledClient` — a stalled client through the **real frontend nginx** holds its slot, is classified as `idle_write_timeout`, and is not released by client cancellation |
-| 11 | `scripts/fault-inject-download-admission.sh` — real `seaf-cli` produces an attributed `profile="block"` refusal, still reaches `synchronized`, pulls every file and drains every slot |
+| 11 | `scripts/fault-inject-download-admission.sh` — the follow-up drill records 33 retryable `profile="block"` refusals (`admission_timeout`, `auth_user_full`, `node_full` or `profile_full`), proves HTTP 503 with `Retry-After: 10`, and real `seaf-cli` reaches `synchronized`, pulls every file and drains every slot |
 | 12 | Measurements above; egress measured at 356 MiB/s single and 1699 MiB/s aggregate six-way (**4.9×**), which is the byte-rate residual stated with a number |
 | 13 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` remains open and is not treated as closed by D |
 | 14 | `TestShippedConfigs*` load every shipped configuration through the real validator, including the combined 2 GiB memory invariant; invariants are asserted on a busy node in the saturation drill |
@@ -1124,7 +1130,7 @@ deployment for token issuance.
 | D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Merged in `main`; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
 | D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | Complete: one bootstrapped coordinator covers all listed non-block producers through preparation and response lifetime |
 | D5 | Stream sync block GET through existing canonical reader APIs | Complete: `SyncHandler.GetBlock` uses `GetBlockSize`/`GetBlockReader` under `ProfileBlock` on the shared coordinator; neither the canonical nor the legacy no-metadata path materializes the whole block; traffic uses bytes written |
-| D6 | Fault evidence, client recovery, measurements and final closure docs | **Complete.** Per-admission cost measured, capacities selected against a stated 2 GiB budget and shipped in every config, the section enabled, and the client/proxy/saturation evidence produced. See **D6 Evidence** above |
+| D6 | Fault evidence, client recovery, measurements and final closure docs | **Complete (follow-up verified 2026-08-04).** Per-admission cost measured, capacities selected against a stated 2 GiB budget and shipped in every config, the section enabled, and the reason-filtered client/proxy/saturation evidence produced. See **D6 Evidence** above |
 
 The B/C `syncAdmissionLimiter` remains in `internal/api` during this series.
 Its white-box tests inspect unexported state, so extracting it to

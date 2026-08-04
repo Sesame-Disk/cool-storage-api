@@ -655,7 +655,7 @@ services:
       - SYNC_TEST_IN_CONTAINER=1
       - HOLDER_COUNT=${DOWNLOAD_HOLDER_COUNT:-6}
       - HOLDER_RATE=${DOWNLOAD_HOLDER_RATE:-2k}
-      - HOLDER_SECONDS=${DOWNLOAD_HOLDER_SECONDS:-45}
+      - HOLDER_SECONDS=${DOWNLOAD_HOLDER_SECONDS:-90}
     volumes:
       - .:/workspace
     depends_on:

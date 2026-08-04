@@ -46,6 +46,7 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 		newTestClient(client.baseURL, "dev-token-superadmin"),
 	}
 	for _, probeClient := range clients {
+		probeClient.http.Timeout = 2 * time.Minute
 		if err := verifyIntegrationAuth(probeClient.baseURL, probeClient.token); err != nil {
 			t.Fatalf("download probe auth for %q: %v", probeClient.token, err)
 		}

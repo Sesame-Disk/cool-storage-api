@@ -35,6 +35,42 @@ func TestFrontendNginxDisablesGzipForDWriterRoutes(t *testing.T) {
 	}
 }
 
+func TestSupportedNginxConfigsBoundDownstreamSendTimeout(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve current test file")
+	}
+	root := filepath.Join(filepath.Dir(thisFile), "..", "..")
+	configs := []string{
+		filepath.Join(root, "frontend", "nginx.conf"),
+		filepath.Join(root, "mobile-frontend", "nginx.conf"),
+		filepath.Join(root, "configs", "nginx-multiregion.conf"),
+	}
+
+	for _, configPath := range configs {
+		t.Run(filepath.Base(configPath), func(t *testing.T) {
+			config, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatalf("read %s: %v", configPath, err)
+			}
+			found := false
+			for _, line := range strings.Split(string(config), "\n") {
+				line = strings.TrimSpace(line)
+				if !strings.HasPrefix(line, "send_timeout ") {
+					continue
+				}
+				found = true
+				if normalized := strings.Join(strings.Fields(line), " "); normalized != "send_timeout 120s;" {
+					t.Fatalf("downstream send timeout = %q, want send_timeout 120s", line)
+				}
+			}
+			if !found {
+				t.Fatal("no direct send_timeout directive found")
+			}
+		})
+	}
+}
+
 func nginxLocationBody(config, header string) (string, bool) {
 	start := strings.Index(config, header)
 	if start < 0 {
