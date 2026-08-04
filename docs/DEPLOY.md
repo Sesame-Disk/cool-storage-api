@@ -150,6 +150,19 @@ nginx, where `proxy_buffering off` and `gzip off` on the transfer locations are
 what let the application see a slow client at all rather than the proxy absorbing
 it.
 
+`idle_write_timeout` bounds the interval **without progress**, not the transfer:
+a multi-hour download of a very large file is unaffected by the shipped 60s as
+long as bytes keep flowing. What it tolerates is a stalled peer, or a stalled
+object-store fetch between blocks under load.
+
+That only holds while the proxy does not fire first. The supported nginx configs
+therefore set `proxy_read_timeout` and `send_timeout` strictly above every
+deadline the application will accept — see `config.MinNginxProxyReadTimeout` and
+`config.MinNginxSendTimeout`, which derive from the validation ceilings. **If you
+run a different proxy, apply the same ordering**, or the application's guard
+stops being the one that ends a transfer and a raised `idle_write_timeout` will
+silently do nothing.
+
 These startup rules apply:
 
 - `max_active_per_node`, every identity cap, `preparation_deadline`, `idle_write_timeout` and `retry_after` must be positive.

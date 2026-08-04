@@ -599,7 +599,33 @@ listener directly supports HTTP/2.
 The proxy is part of the lifetime contract. D3/D6 must verify the effective
 configuration for every protected route, including `proxy_buffering`, gzip or
 another response transformation, buffering-to-disk behavior,
-`proxy_read_timeout` and `send_timeout`. The supported transfer path must use
+`proxy_read_timeout` and `send_timeout`.
+
+**The proxy's timers must strictly dominate every deadline the application will
+accept.** Disabling buffering is necessary but not sufficient: if nginx's own
+timers fire first, the transfer dies on nginx's clock, an operator's configured
+tolerance silently does nothing, and the release is misattributed to a client
+disconnect instead of the idle-write timeout. Two floors, because the phases are
+silent in opposite directions:
+
+```text
+proxy_read_timeout > max preparation_deadline      (backend produces nothing)
+send_timeout       > 2 x max idle_write_timeout    (nginx cannot write downstream)
+```
+
+The idle floor is doubled because progress restarts the interval, so the span
+from the streaming phase change to the first deadline can approach twice the
+configured value. `config.MinNginxProxyReadTimeout` and `config.MinNginxSendTimeout`
+derive both from the validation ceilings, and
+`TestSupportedNginxTimeoutsNeverPreemptDownloadAdmission` asserts the
+relationship rather than a literal — a literal is what previously froze a
+mismatch in place, with nginx cutting a stalled client at 120s while validation
+accepted `idle_write_timeout` up to 15m.
+
+Note that `idle_write_timeout` bounds the interval **without progress**, not the
+transfer. A multi-hour download of a very large file is unaffected by a 60s
+setting as long as bytes keep flowing; what the setting tolerates is a stalled
+peer or a stalled object-store fetch between blocks. The supported transfer path must use
 backpressure-compatible settings (currently `proxy_buffering off` and
 `gzip off` in the supported frontend transfer locations) or document that D
 protects only the Go-to-proxy hop. D3's configuration regression and nginx

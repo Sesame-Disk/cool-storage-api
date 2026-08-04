@@ -921,6 +921,25 @@ const (
 	MaxDownloadAdmissionPreparation        = 1 * time.Hour
 	MaxDownloadAdmissionIdleWrite          = 15 * time.Minute
 	MaxDownloadAdmissionRetryAfter         = 1 * time.Hour
+
+	// The supported nginx topology must never preempt these deadlines. D3/D9
+	// claim the application-owned deadline is the authoritative one, and that is
+	// only true while the proxy's own timers are strictly longer — otherwise a
+	// transfer dies on nginx's clock, the operator's configured tolerance
+	// silently does nothing, and the release is misattributed to a client
+	// disconnect instead of the idle-write timeout.
+	//
+	// Two separate floors, because the two phases are silent in different
+	// directions. During preparation the backend produces nothing, which is what
+	// proxy_read_timeout measures; while streaming to a stalled client nginx
+	// cannot write downstream, which is what send_timeout measures.
+	//
+	// The idle floor is twice the idle-write ceiling on purpose: progress
+	// restarts the interval, so the span from the streaming phase change to the
+	// first deadline can approach 2x that ceiling. At the shipped 60s the old
+	// 120s send_timeout left exactly zero margin in that case.
+	MinNginxProxyReadTimeout = MaxDownloadAdmissionPreparation + 10*time.Minute
+	MinNginxSendTimeout      = 2*MaxDownloadAdmissionIdleWrite + 10*time.Minute
 )
 
 // validateCheckBlocksBounds checks the subcontract C knobs.

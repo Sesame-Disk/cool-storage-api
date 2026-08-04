@@ -86,7 +86,7 @@ metric_sum() {
 
 retryable_block_rejected() {
   local reason value total=0
-  for reason in admission_timeout auth_user_full node_full profile_full; do
+  for reason in admission_timeout auth_user_full node_full profile_full auth_user_queue_full node_queue_full; do
     value=$(metric_sum 'download_admission_rejected_by_profile_total' block "${reason}") || return 1
     total=$((total + value))
   done
@@ -213,21 +213,25 @@ wait_for_active "${HOLDER_COUNT}" 30
 # Prove the HTTP refusal contract independently while the holders are admitted.
 # This probe is intentionally completed before the client baseline below, so its
 # refusal cannot be mistaken for seaf-cli evidence.
+# Probe the refusal contract on the route this drill is about. Admission is
+# acquired after the permission and block-id checks but BEFORE the block is
+# looked up, so a syntactically valid id that does not exist still exercises the
+# real block GET refusal: saturated answers 503, idle would answer 404. Using
+# the raw route here would have proven the shared responder, not this profile.
+absent_block_id=$(printf 'f%.0s' $(seq 1 64))
 contract_headers=$(mktemp)
-contract_status=$(curl -sS -D "${contract_headers}" -o /dev/null --max-time 10 -w '%{http_code}' \
-  -H "Authorization: Token ${DEV_API_TOKEN}" \
-  -H 'Accept-Encoding: identity' \
-  "${SESAMEFS_URL_LOCAL}/repo/${repo_id}/raw/${first_file}" || true)
+contract_status=$(curl -sS -D "${contract_headers}" -o /dev/null --max-time 10 -w '%{http_code}'   -H "Authorization: Token ${DEV_API_TOKEN}"   -H 'Accept-Encoding: identity'   "${SESAMEFS_URL_LOCAL}/seafhttp/repo/${repo_id}/block/${absent_block_id}" || true)
 contract_retry_after=$(awk 'BEGIN { IGNORECASE=1 } tolower($1) == "retry-after:" { gsub("\r", "", $2); print $2; exit }' "${contract_headers}")
 rm -f "${contract_headers}"
 if [ "${contract_status}" != "503" ]; then
-  fail "saturated refusal returned HTTP ${contract_status:-unknown}, want 503"
+  fail "saturated block GET returned HTTP ${contract_status:-unknown}, want 503"
 fi
-case "${contract_retry_after}" in
-  ''|*[!0-9]*) fail "saturated 503 carried invalid Retry-After ${contract_retry_after:-empty}" ;;
-  0) fail "saturated 503 carried non-positive Retry-After" ;;
-esac
-log "saturated refusal contract: HTTP ${contract_status} with Retry-After ${contract_retry_after}s"
+# Pinned, not merely positive: the closure documents Retry-After: 10, and a
+# claim of an exact value has to be the value the drill actually observed.
+if [ "${contract_retry_after}" != "10" ]; then
+  fail "saturated block GET carried Retry-After ${contract_retry_after:-empty}, want 10"
+fi
+log "saturated block GET refusal contract: HTTP ${contract_status} with Retry-After ${contract_retry_after}s"
 
 # Take the baseline only after the holders and the independent contract probe
 # are complete. Their requests never retry, so every later retryable block
