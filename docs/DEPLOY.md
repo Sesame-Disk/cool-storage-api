@@ -76,6 +76,11 @@ SesameFS resolves configuration in this order:
   In production compose, that is `configs/config.prod.yaml` mounted as `/app/config.yaml`.
 3. Environment variables are applied last via `applyEnvOverrides()`, so env always wins.
 
+Download admission is one of the safety defaults: `DefaultConfig()` carries the
+measured D6 values, so an older YAML file that predates the `download_admission`
+section still starts protected. Set `download_admission.enabled: false`
+explicitly to opt out; omission is not an implicit disable.
+
 That is why `configs/config.prod.yaml` can look thinner than `configs/config.docker.yaml` or a local test config:
 production only needs to pin the non-secret structural values that differ from the code defaults,
 while local/test often pins more knobs explicitly for reproducibility.

@@ -23,11 +23,10 @@ import (
 //
 // It deliberately asserts almost nothing about the value. Throughput on a
 // container stack on developer hardware is not a production number, and a
-// threshold here would either be meaningless or flaky. What it does assert is
-// the shape the residual depends on: that admitted transfers are *not* rate
-// limited, so aggregate egress scales with the concurrency cap. If that ever
-// stops being true — because byte-rate shaping was added — this test's premise
-// changes and the residual can be revisited.
+// threshold here would either be meaningless or flaky. The test records the
+// single-transfer and aggregate measurements; it does not claim to prove a
+// scaling law with a fragile timing assertion. If byte-rate shaping is added,
+// the recorded relationship and this residual must be re-evaluated.
 //
 // Run deliberately:
 //
@@ -81,8 +80,9 @@ func TestDownloadAdmissionEgressScalesWithConcurrency(t *testing.T) {
 	t.Logf("slowest concurrent transfer %s vs %s alone", slowest.Round(time.Millisecond), single.Round(time.Millisecond))
 
 	// The residual in one line: nothing here caps bytes per second, so the node's
-	// egress ceiling is the concurrency cap times whatever one transfer achieves.
-	// Recording the multiple is what makes that concrete for a capacity plan.
+	// egress can scale with the concurrency cap. Recording the multiple makes the
+	// observed result concrete for a capacity plan; this is measurement evidence,
+	// not a portable automated threshold.
 	t.Logf("egress residual: aggregate was %.1fx the single-transfer rate at a %d-way budget",
 		aggregate/mibPerSecond(size, single), concurrent)
 

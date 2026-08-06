@@ -58,7 +58,10 @@ configuration rather than a configuration error. D6, as reserved here, is the
 phase that replaced those placeholders with measured defaults and turned the
 section on — see **D6 Evidence**. The zero-value templates are therefore history
 rather than current state; `TestShippedConfigs*` now enforce the opposite, since
-a bound that is never enabled protects nothing.
+a bound that is never enabled protects nothing. The same measured values are
+also in `DefaultConfig()`, so an older YAML file that omits the section inherits
+protection during an upgrade. An explicit `download_admission.enabled: false`
+remains the only opt-out.
 
 ### D coordinator ownership
 
@@ -840,34 +843,32 @@ shape is frozen here so `applyEnvOverrides()` has something to implement:
 
 ```yaml
 download_admission:
-  # Shipped disabled with zero placeholders so this block is a valid
-  # configuration today. D6 measures the defaults and is the phase allowed to
-  # flip it on; with enabled: true these zeros would refuse to start, by the
-  # rule below.
-  enabled: false
-  max_active_per_node: 0
-  max_active_per_auth_user: 0
-  max_active_per_link_source: 0
-  max_active_per_client_link: 0
-  max_waiters_per_identity: 0
-  max_waiters_per_node: 0
-  admission_wait: 0s
-  preparation_deadline: 0s
-  idle_write_timeout: 0s
-  retry_after: 0s
+  # D6 measured operating defaults. These values also live in DefaultConfig so
+  # a legacy YAML file that omits this section remains protected on upgrade.
+  # Set enabled: false explicitly only when admission is intentionally disabled.
+  enabled: true
+  max_active_per_node: 18
+  max_active_per_auth_user: 6
+  max_active_per_link_source: 6
+  max_active_per_client_link: 3
+  max_waiters_per_identity: 4
+  max_waiters_per_node: 24
+  admission_wait: 2s
+  preparation_deadline: 60s
+  idle_write_timeout: 60s
+  retry_after: 10s
   # Per-profile caps are flat, explicit keys — not a YAML map.
-  max_active_block: 0
-  max_active_file: 0
-  max_active_raw: 0
-  max_active_history: 0
-  max_active_link_raw: 0
-  max_active_zip: 0
-  max_active_link_inline: 0
+  max_active_block: 16
+  max_active_file: 16
+  max_active_raw: 6
+  max_active_history: 6
+  max_active_link_raw: 12
+  max_active_zip: 4
+  max_active_link_inline: 8
 ```
 
-Values above are placeholders; D6 measures the real ones, because only D4 wires
-the producers whose behaviour the measurement depends on. The per-profile caps
-are **flat keys rather than a map** on purpose: the profile set is a fixed,
+Values above are the measured D6 values. The per-profile caps are **flat keys
+rather than a map** on purpose: the profile set is a fixed,
 closed enum, and a map cannot be overridden per entry by an environment variable
 without inventing JSON-in-env. Each maps to
 `DOWNLOAD_ADMISSION_MAX_ACTIVE_ZIP` and so on, one variable per key.
@@ -1094,7 +1095,11 @@ operator advisory. Raising the node/profile/source/block values can therefore
 make an enabled deployment refuse to boot. A zero `max_active_raw` removes the
 extra raw profile sub-cap; it does not remove the raw/iWork term, so validation
 charges all node slots at that worst-case cost. `max_active_block` remains a
-profile sub-cap and cannot exceed the node cap.
+profile sub-cap and cannot exceed the node cap. Overrides use the maximum of the
+ordinary plaintext/encrypted stream cost, the measured iWork source cost and
+the bounded preview-output cost (`stream + source + extracted preview`) for
+every raw slot, so reducing the source cap or sync block size cannot undercharge
+a raw stream.
 
 ### Where each criterion is demonstrated
 

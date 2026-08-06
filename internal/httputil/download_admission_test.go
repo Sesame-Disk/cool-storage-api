@@ -530,6 +530,43 @@ func TestDownloadAdmissionRequestCancellationPreservesIdleWriteTimeout(t *testin
 	}
 }
 
+func TestDownloadAdmissionLateIdleTimeoutCallbackStillRecordsDeadline(t *testing.T) {
+	cfg := admissionLifecycleConfig()
+	coordinator := newAdmissionLifecycleCoordinator(t, cfg)
+	c, _ := newAdmissionLifecycleContext(context.Background(), newIdleWriteTestWriter())
+	lifecycle, reason, err := AcquireDownloadAdmission(c, coordinator, cfg, admissionLifecycleRequest(t, "late-idle-callback"))
+	if err != nil || reason != "" {
+		t.Fatalf("AcquireDownloadAdmission = (%q, %v)", reason, err)
+	}
+	if _, err := lifecycle.StartStreaming(); err != nil {
+		t.Fatalf("StartStreaming = %v", err)
+	}
+
+	lifecycle.mu.Lock()
+	writer := lifecycle.writer
+	lifecycle.mu.Unlock()
+	writer.mu.Lock()
+	_, _, _ = writer.failLocked(ErrIdleWriteTimeout)
+	writer.mu.Unlock()
+
+	beforeDeadline := deadlineCount(downloadadmission.DeadlineIdleWrite)
+	beforeIdle := releaseCount(downloadadmission.ReleaseIdleWriteTimeout)
+	beforeClient := releaseCount(downloadadmission.ReleaseClientDisconnect)
+	if err := lifecycle.Finish(downloadadmission.ReleaseCompleted); !errors.Is(err, ErrIdleWriteTimeout) {
+		t.Fatalf("Finish = %v, want idle write timeout", err)
+	}
+
+	// The writer timeout callback can arrive after Finish released the lease.
+	lifecycle.failIdleWriteTimeout()
+	waitForMetric(t, func() float64 { return deadlineCount(downloadadmission.DeadlineIdleWrite) }, beforeDeadline+1)
+	if got := releaseCount(downloadadmission.ReleaseIdleWriteTimeout); got != beforeIdle+1 {
+		t.Fatalf("idle-timeout releases = %v, want %v", got, beforeIdle+1)
+	}
+	if got := releaseCount(downloadadmission.ReleaseClientDisconnect); got != beforeClient {
+		t.Fatalf("client-disconnect releases = %v, want unchanged %v", got, beforeClient)
+	}
+}
+
 func TestDownloadAdmissionFailUsesFirstCauseExactlyOnce(t *testing.T) {
 	cfg := admissionLifecycleConfig()
 	coordinator := newAdmissionLifecycleCoordinator(t, cfg)

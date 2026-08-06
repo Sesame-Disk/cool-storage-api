@@ -4,15 +4,29 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
-func TestDownloadAdmissionDefaultsAreDisabledAndZero(t *testing.T) {
+func TestDownloadAdmissionDefaultsUseMeasuredD6Values(t *testing.T) {
 	d := DefaultConfig().DownloadAdmission
-	if d.Enabled {
-		t.Fatal("download admission is enabled by default")
+	want := defaultDownloadAdmissionConfig()
+	if d != want {
+		t.Fatalf("download admission defaults = %#v, want %#v", d, want)
 	}
-	if d != (DownloadAdmissionConfig{}) {
-		t.Fatalf("download admission defaults = %#v, want zero values", d)
+}
+
+func TestLegacyConfigWithoutDownloadAdmissionInheritsD6Defaults(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	if err := yaml.Unmarshal([]byte("server:\n  write_timeout: 0s\n"), cfg); err != nil {
+		t.Fatalf("unmarshal legacy config: %v", err)
+	}
+	if got, want := cfg.DownloadAdmission, defaultDownloadAdmissionConfig(); got != want {
+		t.Fatalf("legacy config download admission = %#v, want D6 defaults %#v", got, want)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("legacy config with inherited D6 defaults failed validation: %v", err)
 	}
 }
 
@@ -233,6 +247,41 @@ func TestDownloadAdmissionMemoryBudgetBoundaries(t *testing.T) {
 			},
 			wantErr:    true,
 			wantString: "memory design",
+		},
+		{
+			name: "small iWork source cap cannot undercharge raw streams",
+			modify: func(cfg *Config) {
+				cfg.DownloadAdmission.MaxActivePerNode = 100
+				cfg.DownloadAdmission.MaxActiveRaw = 0
+				cfg.FileView.MaxIWorkSourceBytes = 1 * 1024 * 1024
+			},
+			wantErr:    true,
+			wantString: "memory design",
+		},
+		{
+			name: "preview output cap participates in raw cost",
+			modify: func(cfg *Config) {
+				cfg.FileView.MaxIWorkPreviewBytes = 100 * 1024 * 1024
+			},
+			wantErr:    true,
+			wantString: "memory design",
+		},
+		{
+			name: "preview output overflow cannot wrap the budget",
+			modify: func(cfg *Config) {
+				cfg.FileView.MaxIWorkPreviewBytes = int64(^uint64(0) >> 1)
+			},
+			wantErr:    true,
+			wantString: "raw-slot cost",
+		},
+		{
+			name: "plaintext stream floor applies when block is tiny",
+			modify: func(cfg *Config) {
+				cfg.DownloadAdmission.MaxActivePerNode = 500
+				cfg.SeafHTTP.SyncBlockMaxBytes = 1
+			},
+			wantErr:    true,
+			wantString: "other slots at 4194304",
 		},
 	}
 

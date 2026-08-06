@@ -453,6 +453,7 @@ func (l *DownloadAdmission) failIdleWriteTimeout() {
 	if l == nil || !l.enabled {
 		return
 	}
+	defer l.recordIdleWriteDeadline()
 
 	l.mu.Lock()
 	if l.released {
@@ -464,12 +465,10 @@ func (l *DownloadAdmission) failIdleWriteTimeout() {
 			l.terminalCause = downloadadmission.ReleaseIdleWriteTimeout
 		}
 		l.mu.Unlock()
-		l.recordIdleWriteDeadline()
 		return
 	}
 	state, failed := l.claimFailureLocked(downloadadmission.ReleaseIdleWriteTimeout)
 	l.mu.Unlock()
-	l.recordIdleWriteDeadline()
 	if failed {
 		l.finishFailure(state)
 	}

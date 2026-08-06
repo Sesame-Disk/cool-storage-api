@@ -527,8 +527,8 @@ type CORSConfig struct {
 }
 
 // DownloadAdmissionConfig holds the process-local download admission contract.
-// D1 ships this disabled with zero values. Positive values are for measured
-// deployments after the later D phases, not defaults that claim safe capacity.
+// The built-in values are the measured D6 operating defaults. Operators may
+// explicitly set enabled: false when a deployment is not ready to use them.
 type DownloadAdmissionConfig struct {
 	Enabled                bool          `yaml:"enabled"`
 	MaxActivePerNode       int           `yaml:"max_active_per_node"`
@@ -773,6 +773,7 @@ const (
 	// prefetch keeps the current and next block plus the encrypted source, so the
 	// 4.5x block-size figure is the conservative design cost used for validation.
 	DefaultDownloadAdmissionMemoryBudgetBytes     int64 = 2 * 1024 * 1024 * 1024
+	DownloadAdmissionPlaintextPeakBytes           int64 = 4 * 1024 * 1024
 	DownloadAdmissionEncryptedPeakNumerator             = 9
 	DownloadAdmissionEncryptedPeakDenominator           = 2
 	DownloadAdmissionIWorkEncryptedPeakMultiplier       = 6
@@ -1327,7 +1328,30 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// DefaultConfig returns sensible defaults
+func defaultDownloadAdmissionConfig() DownloadAdmissionConfig {
+	return DownloadAdmissionConfig{
+		Enabled:                true,
+		MaxActivePerNode:       18,
+		MaxActivePerAuthUser:   6,
+		MaxActivePerLinkSource: 6,
+		MaxActivePerClientLink: 3,
+		MaxWaitersPerIdentity:  4,
+		MaxWaitersPerNode:      24,
+		AdmissionWait:          2 * time.Second,
+		PreparationDeadline:    60 * time.Second,
+		IdleWriteTimeout:       60 * time.Second,
+		RetryAfter:             10 * time.Second,
+		MaxActiveBlock:         16,
+		MaxActiveFile:          16,
+		MaxActiveRaw:           6,
+		MaxActiveHistory:       6,
+		MaxActiveLinkRaw:       12,
+		MaxActiveZIP:           4,
+		MaxActiveLinkInline:    8,
+	}
+}
+
+// DefaultConfig returns sensible defaults.
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
@@ -1476,7 +1500,7 @@ func DefaultConfig() *Config {
 			UploadLinkMaxInflightPerSource:  DefaultUploadLinkMaxInflightPerSource,
 			UploadLinkMaxInflightPerNode:    DefaultUploadLinkMaxInflightPerNode,
 		},
-		DownloadAdmission: DownloadAdmissionConfig{},
+		DownloadAdmission: defaultDownloadAdmissionConfig(),
 		OnlyOffice: OnlyOfficeConfig{
 			Enabled:           false,
 			VerifyCertificate: true,
@@ -2206,9 +2230,12 @@ func (c *Config) validateDownloadAdmissionMemoryBudget() error {
 	if source > c.FileView.MaxPreviewBytes {
 		return fmt.Errorf("fileview.max_iwork_source_bytes=%d must not exceed fileview.max_preview_bytes=%d", source, c.FileView.MaxPreviewBytes)
 	}
+	if c.FileView.MaxIWorkPreviewBytes < 0 {
+		return fmt.Errorf("fileview.max_iwork_preview_bytes must not be negative")
+	}
 	// SyncBlockMaxBytes has its own validation later in Config.Validate. Avoid
 	// masking that more precise error if it is invalid here.
-	if c.SeafHTTP.SyncBlockMaxBytes <= 0 {
+	if c.SeafHTTP.SyncBlockMaxBytes <= 0 || c.SeafHTTP.SyncBlockMaxBytes > MaxSyncBlockMaxBytes {
 		return nil
 	}
 
@@ -2221,10 +2248,30 @@ func (c *Config) validateDownloadAdmissionMemoryBudget() error {
 	}
 	iworkCost := source * DownloadAdmissionIWorkEncryptedPeakMultiplier
 	encryptedCost := (c.SeafHTTP.SyncBlockMaxBytes*DownloadAdmissionEncryptedPeakNumerator + DownloadAdmissionEncryptedPeakDenominator - 1) / DownloadAdmissionEncryptedPeakDenominator
+	streamCost := encryptedCost
+	if DownloadAdmissionPlaintextPeakBytes > streamCost {
+		streamCost = DownloadAdmissionPlaintextPeakBytes
+	}
+	previewBase := streamCost + source
+	maxInt64Value := int64(^uint64(0) >> 1)
+	if c.FileView.MaxIWorkPreviewBytes > maxInt64Value-previewBase {
+		return fmt.Errorf("fileview.max_iwork_preview_bytes=%d overflows the download admission memory design", c.FileView.MaxIWorkPreviewBytes)
+	}
+	previewCost := previewBase + c.FileView.MaxIWorkPreviewBytes
+	rawCost := iworkCost
+	if streamCost > rawCost {
+		rawCost = streamCost
+	}
+	if previewCost > rawCost {
+		rawCost = previewCost
+	}
+	if rawCost > DefaultDownloadAdmissionMemoryBudgetBytes {
+		return fmt.Errorf("download admission memory design has a raw-slot cost of %d bytes, above the %d-byte budget", rawCost, DefaultDownloadAdmissionMemoryBudgetBytes)
+	}
 	otherSlots := int64(c.DownloadAdmission.MaxActivePerNode) - rawSlots
-	total := rawSlots*iworkCost + otherSlots*encryptedCost
+	total := rawSlots*rawCost + otherSlots*streamCost
 	if total > DefaultDownloadAdmissionMemoryBudgetBytes {
-		return fmt.Errorf("download admission memory design is %d bytes with %d raw slots at %d bytes and %d other slots at %d bytes; budget is %d bytes", total, rawSlots, iworkCost, otherSlots, encryptedCost, DefaultDownloadAdmissionMemoryBudgetBytes)
+		return fmt.Errorf("download admission memory design is %d bytes with %d raw slots at %d bytes and %d other slots at %d bytes; budget is %d bytes", total, rawSlots, rawCost, otherSlots, streamCost, DefaultDownloadAdmissionMemoryBudgetBytes)
 	}
 	return nil
 }
