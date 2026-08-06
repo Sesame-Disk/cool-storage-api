@@ -2333,6 +2333,20 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 		return nil
 	}
 
+	// Nothing is derived for a section that is switched off. Deriving anyway had
+	// two consequences, in opposite directions. It rewrote the caps before
+	// rejectIncompleteDisabledDownloadAdmission could look at them, so a
+	// half-written opt-out was repaired into a complete-looking one and the
+	// completeness rule inspected values the operator never wrote. And it made a
+	// deliberate opt-out fail to start on a small container — a 1 GiB limit
+	// cannot size one raw slot plus one stream slot, so the server refused to
+	// boot over the dimensions of a guard it was told not to run.
+	if !d.Enabled {
+		d.CapacityMode = mode
+		c.DownloadAdmission = d
+		return nil
+	}
+
 	if d.MemoryBudgetBytes > 0 {
 		c.downloadBudgetSource = "configured explicitly"
 	} else {
@@ -2389,9 +2403,15 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 	// Waiter caps are a queueing policy, not a memory quantity: parked requests
 	// hold no transfer. Zero means "refuse immediately" in the contract, so it
 	// must survive derivation rather than be floored to one.
+	//
+	// Only an exact zero is passed through as policy. A negative is left exactly
+	// as written so validateDownloadAdmissionConfig can name it: folding
+	// everything non-positive to zero turned an invalid value into a silently
+	// accepted no-queue policy, so the mistake started the server rather than
+	// stopping it.
 	capWaitersAt := func(policy, configured int) int {
 		if configured <= 0 {
-			return 0
+			return configured
 		}
 		if policy < configured {
 			return policy
@@ -2544,9 +2564,14 @@ func (c *Config) rejectIncompleteDisabledDownloadAdmission() error {
 		return fmt.Errorf("download_admission is disabled with a structurally incomplete configuration: "+
 			"remove the section to inherit the measured defaults, or keep enabled: false alongside complete structural values (%w)", err)
 	}
-	if err := validateDownloadAdmissionMemoryBudgetValue(candidate.MemoryBudgetBytes); err != nil {
-		return fmt.Errorf("download_admission is disabled with a structurally incomplete configuration: "+
-			"remove the section to inherit the measured defaults, or keep enabled: false alongside complete structural values (%w)", err)
+	// A zero budget is the *instruction to derive one* in auto mode, not a
+	// missing value, so it is only incomplete for a section that would have to
+	// carry its own number.
+	if !strings.EqualFold(strings.TrimSpace(candidate.CapacityMode), "auto") || candidate.MemoryBudgetBytes != 0 {
+		if err := validateDownloadAdmissionMemoryBudgetValue(candidate.MemoryBudgetBytes); err != nil {
+			return fmt.Errorf("download_admission is disabled with a structurally incomplete configuration: "+
+				"remove the section to inherit the measured defaults, or keep enabled: false alongside complete structural values (%w)", err)
+		}
 	}
 	return nil
 }

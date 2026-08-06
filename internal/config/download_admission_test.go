@@ -37,8 +37,6 @@ func TestConfigWithoutDownloadAdmissionInheritsD6Defaults(t *testing.T) {
 const zeroedDownloadAdmissionYAML = `
 download_admission:
   enabled: false
-  capacity_mode: manual
-  memory_budget_bytes: 0
   max_active_per_node: 0
   max_active_per_auth_user: 0
   max_active_per_link_source: 0
@@ -180,6 +178,82 @@ func TestDisabledDownloadAdmissionDoesNotConstrainOtherSubsystems(t *testing.T) 
 
 			if err := cfg.Validate(); err != nil {
 				t.Fatalf("Validate() = %v; a disabled download guard must not veto another subsystem's valid value", err)
+			}
+		})
+	}
+}
+
+// TestDisabledDownloadAdmissionDoesNotSizeItselfOnASmallContainer covers the
+// other half of "nothing is derived while the section is off". Auto derivation
+// used to run regardless, so a 1 GiB container could not fit one raw slot plus
+// one stream slot and the server refused to boot — over the dimensions of a
+// guard the operator had explicitly switched off.
+func TestDisabledDownloadAdmissionDoesNotSizeItselfOnASmallContainer(t *testing.T) {
+	withCgroupMemoryLimit(t, 1024*1024*1024, true)
+
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.Enabled = false
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v; a disabled section must not be sized against the container", err)
+	}
+}
+
+// TestAutoModeLeavesADisabledSectionAsWritten is the reason the completeness
+// rule can work at all: derivation rewrote the caps before the rule inspected
+// them, so it judged values the operator never wrote.
+func TestAutoModeLeavesADisabledSectionAsWritten(t *testing.T) {
+	withCgroupMemoryLimit(t, 0, false)
+
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.Enabled = false
+	// A complete but deliberately small section, so a rewrite is unmistakable:
+	// auto would derive 16/4 from the fallback budget.
+	d := &cfg.DownloadAdmission
+	d.MaxActivePerNode = 3
+	d.MaxActivePerAuthUser = 3
+	d.MaxActivePerLinkSource = 3
+	d.MaxActivePerClientLink = 2
+	d.MaxActiveRaw = 2
+	d.MaxActiveBlock = 3
+	d.MaxActiveFile = 3
+	d.MaxActiveHistory = 3
+	d.MaxActiveLinkRaw = 3
+	d.MaxActiveZIP = 3
+	d.MaxActiveLinkInline = 3
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v", err)
+	}
+	if cfg.DownloadAdmission.MaxActivePerNode != 3 || cfg.DownloadAdmission.MaxActiveRaw != 2 {
+		t.Fatalf("disabled section was rewritten to node %d/raw %d; auto capacity must not touch it",
+			cfg.DownloadAdmission.MaxActivePerNode, cfg.DownloadAdmission.MaxActiveRaw)
+	}
+}
+
+// TestNegativeWaiterCapIsReportedNotCoerced pins an invalid value being named.
+// Folding everything non-positive to "no queue" turned a typo into an accepted
+// policy, so the mistake started the server instead of stopping it.
+func TestNegativeWaiterCapIsReportedNotCoerced(t *testing.T) {
+	withCgroupMemoryLimit(t, 0, false)
+
+	for name, mutate := range map[string]func(*DownloadAdmissionConfig){
+		"per identity": func(d *DownloadAdmissionConfig) { d.MaxWaitersPerIdentity = -5 },
+		"per node":     func(d *DownloadAdmissionConfig) { d.MaxWaitersPerNode = -5 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			mutate(&cfg.DownloadAdmission)
+
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("a negative waiter cap validated; it was silently coerced instead of reported")
+			}
+			if !strings.Contains(err.Error(), "max_waiters_per_") {
+				t.Fatalf("Validate() = %q, want the offending setting named", err)
 			}
 		})
 	}

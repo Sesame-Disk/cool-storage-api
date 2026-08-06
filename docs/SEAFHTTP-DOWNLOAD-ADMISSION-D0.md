@@ -852,7 +852,7 @@ shape is frozen here so `applyEnvOverrides()` has something to implement:
 
 ```yaml
 download_admission:
-  # Auto-sized D6 defaults. The budget uses 25% of the cgroup limit when exposed;
+  # Auto-sized D6 defaults. The budget uses memory_budget_percent (25) of the cgroup limit when exposed;
   # the 2 GiB fallback is used when no container limit is available.
   # Set enabled: false explicitly only when admission is intentionally disabled.
   enabled: true
@@ -1087,8 +1087,10 @@ by estimate. The default 2 GiB fallback applies a 20% safety margin and derives
 ```
 
 Both component benchmarks are in the tree so the figures can be re-derived.
-`Load()` derives the budget from 25% of an exposed cgroup limit, uses the 2 GiB
-fallback otherwise, and rejects explicit budgets above 25% of the cgroup limit.
+`Load()` derives the budget from `memory_budget_percent` of an exposed cgroup
+limit — 25% by default, capped at 50% — uses the 2 GiB fallback otherwise, and
+rejects an explicit budget above that same share, so the guard and the setting
+cannot disagree.
 The budget is a design validator, not an OS memory reservation.
 
 | Producer shape | Measured peak per admission | Benchmark |

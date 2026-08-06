@@ -138,8 +138,10 @@ capacity fields; the same safety-adjusted memory validator still checks the
 complete combination. User, link, client, waiter and timeout values remain
 policy/fairness controls in either mode, with absolute validation ceilings.
 
-When an explicit byte budget exceeds 25% of an exposed cgroup limit, `Load()`
-rejects it. The process must run in a container sized for the configured budget;
+When an explicit byte budget exceeds `memory_budget_percent` of an exposed
+cgroup limit, `Load()` rejects it. That share defaults to 25% and is itself
+capped at 50%, so the guard and the setting can never disagree about what is
+allowed. The process must run in a container sized for the configured budget;
 host RAM is never used as the source of truth.
 
 A section that is present with `enabled: false` is an explicit opt-out, but its
@@ -1140,7 +1142,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `DOWNLOAD_ADMISSION_MEMORY_BUDGET_PERCENT` | `download_admission.memory_budget_percent` | Auto-mode percentage of the exposed cgroup limit, and the share an explicit `memory_budget_bytes` may claim of it. Default `25`, accepted range `1`-`50`; used with the 2 GiB fallback when no cgroup limit exists. |
 | `DOWNLOAD_ADMISSION_RAW_CAPACITY_PERCENT` | `download_admission.raw_capacity_percent` | Auto-mode target share of node slots assigned to the expensive raw/iWork profile. Default `33`, range `1`-`99`. The achieved share is allowed to fall to three quarters of the request so the integer split lands; a smaller share buys more stream slots, a larger one reserves more raw slots and lowers the node total. |
 | `DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT` | `download_admission.safety_margin_percent` | Memory headroom reserved outside the modeled download work, applied identically by auto derivation and by the final validation. Default `20`, range `0`-`99`; must leave at least one raw and one stream slot. |
-| `DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES` | `download_admission.memory_budget_bytes` | Process-local configured download-memory design budget, not an OS reservation. Auto fallback `2147483648` (2 GiB); explicit values override cgroup derivation. Must be `1` to `1099511627776`; values above 25% of an exposed cgroup limit are rejected. |
+| `DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES` | `download_admission.memory_budget_bytes` | Process-local configured download-memory design budget, not an OS reservation. Auto fallback `2147483648` (2 GiB); explicit values override cgroup derivation. Must be `1` to `1099511627776`, and must not exceed `memory_budget_percent` of an exposed cgroup limit — that share defaults to 25% and is capped at 50%. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE` | `download_admission.max_active_per_node` | Manual-mode process-local aggregate cap. Auto mode derives it from budget and costs, with an absolute 64-slot ceiling. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER` | `download_admission.max_active_per_auth_user` | Manual-mode authenticated `(org, user)` cap. Auto mode derives a bounded fairness cap from the node ceiling. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE` | `download_admission.max_active_per_link_source` | Manual-mode stable public-link source cap. Auto mode derives a bounded fairness cap from the node ceiling. |
