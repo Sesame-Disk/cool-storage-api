@@ -922,24 +922,30 @@ const (
 	MaxDownloadAdmissionIdleWrite          = 15 * time.Minute
 	MaxDownloadAdmissionRetryAfter         = 1 * time.Hour
 
-	// The supported nginx topology must never preempt these deadlines. D3/D9
-	// claim the application-owned deadline is the authoritative one, and that is
-	// only true while the proxy's own timers are strictly longer — otherwise a
-	// transfer dies on nginx's clock, the operator's configured tolerance
-	// silently does nothing, and the release is misattributed to a client
-	// disconnect instead of the idle-write timeout.
+	// The supported nginx topology must never preempt these deadlines. D3 and §9
+	// of the D0 contract claim the application-owned deadline is the
+	// authoritative one, and that is only true while the proxy's own timers are
+	// strictly longer — otherwise a transfer dies on nginx's clock, the
+	// operator's configured tolerance silently does nothing, and the release is
+	// misattributed to a client disconnect instead of the idle-write timeout.
 	//
 	// Two separate floors, because the two phases are silent in different
-	// directions. During preparation the backend produces nothing, which is what
-	// proxy_read_timeout measures; while streaming to a stalled client nginx
-	// cannot write downstream, which is what send_timeout measures.
+	// directions. proxy_read_timeout measures the interval between successive
+	// reads from the backend; send_timeout measures nginx being unable to write
+	// downstream.
 	//
-	// The idle floor is twice the idle-write ceiling on purpose: progress
-	// restarts the interval, so the span from the streaming phase change to the
-	// first deadline can approach 2x that ceiling. At the shipped 60s the old
-	// 120s send_timeout left exactly zero margin in that case.
-	MinNginxProxyReadTimeout = MaxDownloadAdmissionPreparation + 10*time.Minute
-	MinNginxSendTimeout      = 2*MaxDownloadAdmissionIdleWrite + 10*time.Minute
+	// The read floor spans preparation *plus* one idle interval. Nothing is sent
+	// upstream-to-nginx during preparation, and nothing is sent during the first
+	// storage read either — that read sits after StartStreaming and is bounded by
+	// the idle-write deadline, not the preparation one. Summing only preparation
+	// would leave the phase D6 added in the pre-first-write fix uncovered.
+	//
+	// The idle floor is twice the idle-write ceiling because progress restarts
+	// the interval, so the span from the streaming phase change to the first
+	// deadline can approach 2x that ceiling. At the shipped 60s the old 120s
+	// send_timeout left exactly zero margin in that case.
+	MinNginxProxyReadTimeout = MaxDownloadAdmissionPreparation + MaxDownloadAdmissionIdleWrite
+	MinNginxSendTimeout      = 2 * MaxDownloadAdmissionIdleWrite
 )
 
 // validateCheckBlocksBounds checks the subcontract C knobs.

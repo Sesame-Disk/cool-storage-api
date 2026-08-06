@@ -39,58 +39,76 @@ func TestFrontendNginxDisablesGzipForDWriterRoutes(t *testing.T) {
 }
 
 // TestSupportedNginxTimeoutsNeverPreemptDownloadAdmission is the operational
-// half of criterion 10. D3/D9 claim the application-owned deadline is the
-// authoritative one on the connection, and that claim is only true while the
-// supported proxy's own timers are strictly longer than every deadline the
-// application will accept.
+// half of criterion 10. D3 and §9 claim the application-owned deadline is the
+// authoritative one on the connection, and that is only true while the supported
+// proxy's own timers are strictly longer than every deadline validation accepts.
 //
-// It asserts the relationship rather than a literal, because a literal is what
-// froze the previous mismatch in place: nginx cut a stalled downstream at 120s
-// while validateDownloadAdmissionConfig happily accepted idle_write_timeout up
-// to 15m. Configurations passed validation and then died on nginx's clock, with
-// the operator's tolerance silently doing nothing and the release recorded as a
-// client disconnect rather than an idle-write timeout.
-//
-// The two directives cover phases that are silent in opposite directions:
-// proxy_read_timeout bounds a backend that is producing nothing, which is what
-// preparation looks like from nginx; send_timeout bounds nginx being unable to
-// write downstream, which is what a stalled client looks like.
+// It checks the *effective* value for each protected location — its own
+// directive, or what it inherits — rather than scanning the file for any
+// occurrence. A flat scan gives both false results: a long timeout on an
+// unrelated location would satisfy it while a D route still inherited a short
+// default, and it would reject the short default that non-D routes should keep.
+// Those defaults matter here: this PR closes an abuse finding, so raising every
+// route's connection-retention window to 45 minutes would trade one resource
+// vector for another.
 func TestSupportedNginxTimeoutsNeverPreemptDownloadAdmission(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("resolve current test file")
 	}
 	root := filepath.Join(filepath.Dir(thisFile), "..", "..")
-	configs := []string{
-		filepath.Join(root, "frontend", "nginx.conf"),
-		filepath.Join(root, "mobile-frontend", "nginx.conf"),
-		filepath.Join(root, "configs", "nginx-multiregion.conf"),
-	}
 
-	for _, configPath := range configs {
-		t.Run(filepath.Base(configPath), func(t *testing.T) {
-			raw, err := os.ReadFile(configPath)
+	for _, tc := range []struct {
+		path      string
+		locations []string
+	}{
+		{
+			filepath.Join(root, "frontend", "nginx.conf"),
+			[]string{
+				"location ~ ^/repo/[^/]+/raw/ {",
+				"location ~ ^/repo/[^/]+/history/(download|view|raw)/?$ {",
+				"location @share_link_backend {",
+				"location /d/ {",
+				"location ^~ /seafhttp/ {",
+			},
+		},
+		{
+			filepath.Join(root, "mobile-frontend", "nginx.conf"),
+			[]string{"location /seafhttp/ {"},
+		},
+		{
+			filepath.Join(root, "configs", "nginx-multiregion.conf"),
+			[]string{"location ~ ^/(seafhttp/|d/|repo/[^/]+/(raw|history)/|api/v2\\.1/share-links/[^/]+/(files/)?bootstrap) {"},
+		},
+	} {
+		t.Run(filepath.Base(tc.path), func(t *testing.T) {
+			raw, err := os.ReadFile(tc.path)
 			if err != nil {
-				t.Fatalf("read %s: %v", configPath, err)
+				t.Fatalf("read %s: %v", tc.path, err)
 			}
+			contents := string(raw)
 
-			for _, directive := range []struct {
-				name  string
-				floor time.Duration
-				why   string
-			}{
-				{"send_timeout", config.MinNginxSendTimeout,
-					"a stalled downstream client must be ended by the application's idle-write deadline"},
-				{"proxy_read_timeout", config.MinNginxProxyReadTimeout,
-					"a backend still in preparation produces nothing to read"},
-			} {
-				values := nginxDirectiveDurations(t, string(raw), directive.name)
-				if len(values) == 0 {
-					t.Fatalf("no %s directive found; the floor cannot be enforced by absence", directive.name)
+			for _, header := range tc.locations {
+				body, ok := nginxLocationBody(contents, header)
+				if !ok {
+					t.Fatalf("protected location %q not found; the guard cannot be enforced by absence", header)
 				}
-				for _, value := range values {
+				for _, directive := range []struct {
+					name  string
+					floor time.Duration
+					why   string
+				}{
+					{"send_timeout", config.MinNginxSendTimeout,
+						"a stalled downstream client must be ended by the application's idle-write deadline"},
+					{"proxy_read_timeout", config.MinNginxProxyReadTimeout,
+						"preparation and the first storage read are both silent upstream"},
+				} {
+					value, found := nginxDirectiveDuration(t, body, directive.name)
+					if !found {
+						t.Fatalf("%s: no %s inside the location, so it inherits the short default", header, directive.name)
+					}
 					if value <= directive.floor {
-						t.Fatalf("%s = %s, must exceed %s: %s", directive.name, value, directive.floor, directive.why)
+						t.Fatalf("%s: %s = %s, must exceed %s: %s", header, directive.name, value, directive.floor, directive.why)
 					}
 				}
 			}
@@ -98,13 +116,17 @@ func TestSupportedNginxTimeoutsNeverPreemptDownloadAdmission(t *testing.T) {
 	}
 }
 
-// nginxDirectiveDurations returns every value of a directive, so a single
-// permissive server-level setting cannot be undone by a stricter location.
-func nginxDirectiveDurations(t *testing.T, config, directive string) []time.Duration {
+// nginxDirectiveDuration reads a directive from one location body. Scoping the
+// read to the body is the point: an inherited or unrelated value must not count.
+func nginxDirectiveDuration(t *testing.T, body, directive string) (time.Duration, bool) {
 	t.Helper()
 
-	var out []time.Duration
-	for _, line := range strings.Split(config, "\n") {
+	// nginx applies the last directive in a block, so the helper must too;
+	// reading the first would let a superseded short value fail a correct file.
+	var last time.Duration
+	var found bool
+
+	for _, line := range strings.Split(body, "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
 		if len(fields) < 2 || fields[0] != directive {
 			continue
@@ -113,9 +135,9 @@ func nginxDirectiveDurations(t *testing.T, config, directive string) []time.Dura
 		if err != nil {
 			t.Fatalf("%s has unparseable value %q: %v", directive, fields[1], err)
 		}
-		out = append(out, value)
+		last, found = value, true
 	}
-	return out
+	return last, found
 }
 
 func nginxLocationBody(config, header string) (string, bool) {

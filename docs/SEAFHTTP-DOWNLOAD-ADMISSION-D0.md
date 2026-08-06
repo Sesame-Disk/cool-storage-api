@@ -609,13 +609,23 @@ disconnect instead of the idle-write timeout. Two floors, because the phases are
 silent in opposite directions:
 
 ```text
-proxy_read_timeout > max preparation_deadline      (backend produces nothing)
-send_timeout       > 2 x max idle_write_timeout    (nginx cannot write downstream)
+proxy_read_timeout > max preparation_deadline + max idle_write_timeout
+send_timeout       > 2 x max idle_write_timeout
 ```
+
+The read floor spans both silent phases, not just preparation: the first storage
+read sits *after* `StartStreaming` and is bounded by the idle-write deadline, so
+nothing reaches nginx during it either. Summing only preparation would leave the
+phase D6 added in the pre-first-write fix uncovered.
 
 The idle floor is doubled because progress restarts the interval, so the span
 from the streaming phase change to the first deadline can approach twice the
-configured value. `config.MinNginxProxyReadTimeout` and `config.MinNginxSendTimeout`
+configured value.
+
+Both apply **per protected location**, not at server level. Raising every route's
+connection-retention window would trade one abuse vector for another in the PR
+that closes B4, so non-D routes keep a short `send_timeout` and the D locations
+opt in. `config.MinNginxProxyReadTimeout` and `config.MinNginxSendTimeout`
 derive both from the validation ceilings, and
 `TestSupportedNginxTimeoutsNeverPreemptDownloadAdmission` asserts the
 relationship rather than a literal — a literal is what previously froze a
