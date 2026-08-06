@@ -43,7 +43,7 @@ func TestDownloadAdmissionMemoryUnderSaturation(t *testing.T) {
 		}
 	}
 
-	nodeCap := downloadProbeNodeCap(t)
+	nodeCap := effectiveCapacity(t, client, "max_active_per_node")
 	if nodeCap != 16 {
 		t.Fatalf("download memory probe expects the clean auto baseline node cap 16, got %d", nodeCap)
 	}

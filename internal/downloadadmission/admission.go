@@ -226,6 +226,7 @@ func New(cfg *config.DownloadAdmissionConfig) (*Coordinator, error) {
 	if err := config.ValidateDownloadAdmissionConfig(*cfg); err != nil {
 		return nil, err
 	}
+	publishCapacityMetrics(*cfg)
 	return &Coordinator{
 		cfg:               *cfg,
 		activeByProfile:   make(map[Profile]int),
@@ -706,4 +707,56 @@ func validateRequest(request AdmissionRequest) error {
 		return fmt.Errorf("public-link admission request requires link_source and client_link dimensions")
 	}
 	return nil
+}
+
+// publishCapacityMetrics exports the capacities this coordinator was built
+// with. In auto mode they are derived at startup from the detected memory
+// limit, so a deployment's real ceiling is not in its config file and an
+// operator — or a drill that has to saturate the node — otherwise has no way to
+// read it except by filling the node and watching the plateau.
+func publishCapacityMetrics(cfg config.DownloadAdmissionConfig) {
+	if !cfg.Enabled {
+		// Publish zeros rather than nothing: an absent series is
+		// indistinguishable from a scrape that arrived before startup, while a
+		// zero says plainly that nothing is bounded.
+		for _, setting := range capacityMetricSettings {
+			metrics.DownloadAdmissionCapacity.WithLabelValues(setting).Set(0)
+		}
+		metrics.DownloadAdmissionMemoryBudgetBytes.Set(0)
+		return
+	}
+	for setting, value := range map[string]int{
+		"max_active_per_node":        cfg.MaxActivePerNode,
+		"max_active_per_auth_user":   cfg.MaxActivePerAuthUser,
+		"max_active_per_link_source": cfg.MaxActivePerLinkSource,
+		"max_active_per_client_link": cfg.MaxActivePerClientLink,
+		"max_waiters_per_identity":   cfg.MaxWaitersPerIdentity,
+		"max_waiters_per_node":       cfg.MaxWaitersPerNode,
+		"max_active_block":           cfg.MaxActiveBlock,
+		"max_active_file":            cfg.MaxActiveFile,
+		"max_active_raw":             cfg.MaxActiveRaw,
+		"max_active_history":         cfg.MaxActiveHistory,
+		"max_active_link_raw":        cfg.MaxActiveLinkRaw,
+		"max_active_zip":             cfg.MaxActiveZIP,
+		"max_active_link_inline":     cfg.MaxActiveLinkInline,
+	} {
+		metrics.DownloadAdmissionCapacity.WithLabelValues(setting).Set(float64(value))
+	}
+	metrics.DownloadAdmissionMemoryBudgetBytes.Set(float64(cfg.MemoryBudgetBytes))
+}
+
+var capacityMetricSettings = []string{
+	"max_active_per_node",
+	"max_active_per_auth_user",
+	"max_active_per_link_source",
+	"max_active_per_client_link",
+	"max_waiters_per_identity",
+	"max_waiters_per_node",
+	"max_active_block",
+	"max_active_file",
+	"max_active_raw",
+	"max_active_history",
+	"max_active_link_raw",
+	"max_active_zip",
+	"max_active_link_inline",
 }

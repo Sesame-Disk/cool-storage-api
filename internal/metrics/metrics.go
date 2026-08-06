@@ -827,6 +827,26 @@ var (
 		},
 		[]string{"dimension"},
 	)
+	// DownloadAdmissionCapacity publishes the capacities the coordinator is
+	// actually running with. In auto mode these are derived at startup from the
+	// detected memory limit, so they are a property of the host and the config
+	// file's own numbers are only a reference. Without this the effective
+	// ceiling can be learned in exactly one way: saturate the node and watch
+	// active_current plateau — which is also the only way a test could have
+	// discovered what to assert.
+	DownloadAdmissionCapacity = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "download_admission_capacity",
+			Help: "Effective download admission capacity in slots, by setting.",
+		},
+		[]string{"setting"},
+	)
+	DownloadAdmissionMemoryBudgetBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "download_admission_memory_budget_bytes",
+			Help: "Configured or derived process-local memory design budget for admitted downloads.",
+		},
+	)
 	DownloadAdmissionRejectedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "download_admission_rejected_total",
@@ -992,6 +1012,8 @@ func Register() {
 		DownloadAdmissionWaitersCurrent,
 		DownloadAdmissionWaitersByGate,
 		DownloadAdmissionTrackedIdentities,
+		DownloadAdmissionCapacity,
+		DownloadAdmissionMemoryBudgetBytes,
 		DownloadAdmissionRejectedTotal,
 		DownloadAdmissionRejectedByProfileTotal,
 		DownloadAdmissionReleasedTotal,

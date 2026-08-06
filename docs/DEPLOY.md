@@ -103,7 +103,10 @@ download_admission:
 `memory_budget_bytes` is a process-local configured design budget, not an OS
 reservation and not an RSS limit. When it is omitted, `Load()` derives it from
 `memory_budget_percent` of the cgroup limit; if no cgroup limit is exposed, it
-uses the conservative 2 GiB fallback. An explicit byte value overrides that
+uses the 2 GiB reference fallback. That fallback is not a deduction about the
+machine — without a cgroup limit the process knows nothing about its memory — so
+a deployment smaller than the 8 GiB baseline should set an explicit budget or a
+container limit rather than inherit it. An explicit byte value overrides that
 derivation, and may claim up to `memory_budget_percent` of an exposed cgroup
 limit. The safety margin leaves `safety_margin_percent` of the configured design
 budget for HTTP structures, goroutines, SDK buffers, allocator fragmentation and
@@ -117,10 +120,18 @@ files are therefore a reference for the 2 GiB fallback, not a promise about any
 particular host.** The values a node actually runs with are printed at startup:
 
 ```text
-level=INFO msg="download admission capacity" mode=auto
-  budget_source="auto (cgroup limit)" memory_budget_bytes=2147483648
-  safety_margin_percent=20 max_active_per_node=16 max_active_raw=4 ...
+INFO download admission capacity mode=auto
+  budget_source="25% of the detected cgroup limit 8589934592"
+  memory_budget_bytes=2147483648 safety_margin_percent=20
+  max_active_per_node=16 max_active_raw=4 max_active_file=12 ...
 ```
+
+`budget_source` is one of `configured explicitly`, `N% of the detected cgroup
+limit X`, or `no cgroup limit detected, reference fallback` — so the line says
+not just what the node runs with but where the number came from. The same
+capacities are exported as `download_admission_capacity{setting="..."}` and
+`download_admission_memory_budget_bytes`, which is how the D6 drills discover
+the ceiling they have to saturate instead of assuming one.
 
 These YAML and `.env` values are clean-deployment baselines. A smaller
 container automatically derives fewer capacities when cgroup discovery is

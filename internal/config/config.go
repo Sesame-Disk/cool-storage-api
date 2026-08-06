@@ -2341,6 +2341,10 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 	// deliberate opt-out fail to start on a small container — a 1 GiB limit
 	// cannot size one raw slot plus one stream slot, so the server refused to
 	// boot over the dimensions of a guard it was told not to run.
+	//
+	// The fallback used when no limit is exposed is a reference for the 8 GiB
+	// baseline, not a deduction: without a cgroup the process knows nothing
+	// about the machine it is on.
 	if !d.Enabled {
 		d.CapacityMode = mode
 		c.DownloadAdmission = d
@@ -2359,7 +2363,7 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 			c.downloadBudgetSource = fmt.Sprintf("%d%% of the detected cgroup limit %d", d.MemoryBudgetPercent, limit)
 		} else {
 			d.MemoryBudgetBytes = DefaultDownloadAdmissionMemoryBudgetBytes
-			c.downloadBudgetSource = "no cgroup limit detected, conservative fallback"
+			c.downloadBudgetSource = "no cgroup limit detected, reference fallback"
 		}
 	}
 	if err := validateDownloadAdmissionMemoryBudgetValue(d.MemoryBudgetBytes); err != nil {
