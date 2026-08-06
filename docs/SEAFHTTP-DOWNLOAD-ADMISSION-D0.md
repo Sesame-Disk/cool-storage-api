@@ -68,9 +68,16 @@ config this project shipped for D1-D5. That placeholder is therefore refused at
 startup rather than migrated: it was never an operator decision — this section
 reserved it for D6 to replace — but rewriting an explicit `enabled: false`
 because the surrounding values happen to be zero would make the loader
-unpredictable in a worse way. Naming it leaves both intents one edit away, and
-the refusal runs after environment overrides so a deployment already repaired
-through `DOWNLOAD_ADMISSION_*` is unaffected.
+unpredictable in a worse way.
+
+The refusal keys on **completeness, not on the historical fingerprint**:
+`enabled: false` is supported only when the values behind it would validate if
+the section were switched on. An exact-shape test would stop matching after one
+`DOWNLOAD_ADMISSION_*` override against the old YAML while the deployment stayed
+just as unbounded, and completeness is the rule the refusal message already
+states. `server.write_timeout` is excluded, since it conflicts only with an
+active guard. The check runs after environment overrides, so a deployment
+already repaired through `DOWNLOAD_ADMISSION_*` is unaffected.
 
 ### D coordinator ownership
 
@@ -1125,7 +1132,7 @@ a raw stream.
 | 9 | D5 canonical-reader streaming with authoritative size |
 | 10 | `TestDownloadAdmissionThroughProxyReleasesStalledClient` — a stalled client through the **real frontend nginx** holds its slot, is classified as `idle_write_timeout`, and is not released by client cancellation |
 | 11 | `scripts/fault-inject-download-admission.sh` — the follow-up drill records 33 retryable `profile="block"` refusals, summing the six reasons a saturated node can answer with (`admission_timeout`, `auth_user_full`, `node_full`, `profile_full`, `auth_user_queue_full`, `node_queue_full`) and excluding `client_gone`; it proves HTTP 503 with `Retry-After: 10`, and real `seaf-cli` reaches `synchronized`, pulls every file and drains every slot |
-| 12 | Measurements above; egress measured at 356 MiB/s single and 1699 MiB/s aggregate six-way (**4.9×**), which is the byte-rate residual stated with a number |
+| 12 | Measurements above; egress measured at 356 MiB/s single and 1699 MiB/s aggregate six-way (**4.9×**), re-measured on a rebuilt stack at 350 and 1788 MiB/s (**5.1×**). The residual is the near-linear relationship, which reproduced; the absolute rates are per-run |
 | 13 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` remains open and is not treated as closed by D |
 | 14 | `TestShippedConfigs*` load every shipped configuration through the real validator, including the combined 2 GiB memory invariant; invariants are asserted on a busy node in the saturation drill |
 
@@ -1133,11 +1140,13 @@ a raw stream.
 
 They come from a container stack on developer hardware. The **memory** figures
 are properties of the code — buffer sizes, block sizes and copy counts — so they
-transfer. The **throughput** figures do not: 356 MiB/s single-transfer is a
+transfer. The **throughput** figures do not: ~350 MiB/s single-transfer is a
 loopback number, and production egress must be re-measured on the real network
-before the concurrency cap is read as an egress ceiling. The relationship the
-residual depends on — aggregate scaling with concurrency because nothing shapes
-byte rate — is what holds regardless of hardware.
+before the concurrency cap is read as an egress ceiling. Two runs on the same
+hardware differed by 5% on the single rate and moved the multiple from 4.9x to
+5.1x, which is the accuracy this measurement has. The relationship the residual
+depends on — aggregate scaling with concurrency because nothing shapes byte rate
+— is what reproduced across both.
 
 Capacities are also **process-local**. Fleet capacity is these numbers times the
 node count; none of this is a cluster-global quota.

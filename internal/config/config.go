@@ -2212,7 +2212,7 @@ func ValidateDownloadAdmissionConfig(d DownloadAdmissionConfig) error {
 }
 
 func (c *Config) validateDownloadAdmissionBounds() error {
-	if err := c.rejectLegacyDownloadAdmissionPlaceholder(); err != nil {
+	if err := c.rejectIncompleteDisabledDownloadAdmission(); err != nil {
 		return err
 	}
 	if err := validateDownloadAdmissionConfig(c.DownloadAdmission, c.Server.WriteTimeout); err != nil {
@@ -2221,29 +2221,39 @@ func (c *Config) validateDownloadAdmissionBounds() error {
 	return c.validateDownloadAdmissionMemoryBudget()
 }
 
-// rejectLegacyDownloadAdmissionPlaceholder refuses the fully zeroed section the
-// D1-D5 templates shipped.
+// rejectIncompleteDisabledDownloadAdmission holds `enabled: false` to one rule:
+// the values behind it must be ones the guard could actually run on.
 //
-// Carrying the measured defaults in DefaultConfig protects a YAML file that
-// omits the section, but not one that contains it: an operator upgrading with
-// the config this project shipped mid-series keeps `enabled: false` and every
-// cap at zero, and starts with no aggregate download bound at all while the
-// release notes say B4 is closed. That block was never an operator decision —
-// §D1 of the contract reserved it as a staging placeholder for D6 to replace.
+// Nothing validates a disabled section otherwise, so `enabled: false` with zero
+// or half-written caps is accepted today and only fails the day someone flips it
+// to true — during an incident, which is when the flip gets made. Failing when
+// the section is written moves that discovery to the edit that caused it.
 //
-// Rewriting it to the defaults would be worse than the gap. An explicit
-// `enabled: false` is the documented and only opt-out, and a config system that
-// quietly overrides an explicit value because it recognises the surrounding
-// numbers cannot be reasoned about. So the placeholder is named and refused,
-// which is unambiguous and leaves both intents one edit away. It runs after
-// applyEnvOverrides, so a deployment that repairs the section through the
+// It is a cheap guard rather than a load-bearing one: every shipped
+// configuration is enabled and complete, and a file that omits the section
+// inherits the measured defaults, so this fires only on a hand-written section.
+// It is also why the section is refused rather than repaired — an explicit
+// `enabled: false` is the documented opt-out, and a loader that overrides an
+// explicit value because it dislikes the surrounding numbers cannot be reasoned
+// about. Both intents stay one edit away.
+//
+// server.write_timeout is excluded deliberately: it conflicts only with an
+// active guard, so it is not part of what makes a disabled section complete.
+//
+// This runs after applyEnvOverrides, so a section completed through the
 // environment is unaffected.
-func (c *Config) rejectLegacyDownloadAdmissionPlaceholder() error {
-	if c == nil || c.DownloadAdmission != (DownloadAdmissionConfig{}) {
+func (c *Config) rejectIncompleteDisabledDownloadAdmission() error {
+	if c == nil || c.DownloadAdmission.Enabled {
 		return nil
 	}
-	return fmt.Errorf("download_admission is the zeroed D1-D5 staging placeholder, which is no longer a supported deployment: " +
-		"remove the section to inherit the measured defaults, or keep enabled: false alongside those values if the opt-out is deliberate")
+
+	candidate := c.DownloadAdmission
+	candidate.Enabled = true
+	if err := validateDownloadAdmissionConfig(candidate, 0); err != nil {
+		return fmt.Errorf("download_admission is disabled with a configuration that could not be enabled as written: "+
+			"remove the section to inherit the measured defaults, or keep enabled: false alongside a complete set of values (%w)", err)
+	}
+	return nil
 }
 
 func (c *Config) validateDownloadAdmissionMemoryBudget() error {

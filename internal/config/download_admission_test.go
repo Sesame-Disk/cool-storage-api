@@ -16,25 +16,24 @@ func TestDownloadAdmissionDefaultsUseMeasuredD6Values(t *testing.T) {
 	}
 }
 
-func TestLegacyConfigWithoutDownloadAdmissionInheritsD6Defaults(t *testing.T) {
+func TestConfigWithoutDownloadAdmissionInheritsD6Defaults(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Auth.DevMode = true
 	if err := yaml.Unmarshal([]byte("server:\n  write_timeout: 0s\n"), cfg); err != nil {
-		t.Fatalf("unmarshal legacy config: %v", err)
+		t.Fatalf("unmarshal config: %v", err)
 	}
 	if got, want := cfg.DownloadAdmission, defaultDownloadAdmissionConfig(); got != want {
-		t.Fatalf("legacy config download admission = %#v, want D6 defaults %#v", got, want)
+		t.Fatalf("config that omits the section = %#v, want the D6 defaults %#v", got, want)
 	}
 	if err := cfg.Validate(); err != nil {
-		t.Fatalf("legacy config with inherited D6 defaults failed validation: %v", err)
+		t.Fatalf("config with inherited D6 defaults failed validation: %v", err)
 	}
 }
 
-// legacyD1PlaceholderYAML is the section the D1-D5 templates actually shipped,
-// copied from configs/config.docker.yaml at aa083805c~1. Inheriting defaults
-// cannot reach a file that contains it, which is the upgrade the test below
-// exists for.
-const legacyD1PlaceholderYAML = `
+// zeroedDownloadAdmissionYAML is a disabled section written out with every value
+// at zero — the shape a hand-written opt-out most plausibly takes, and the one
+// the D1-D5 templates carried before D6 measured the values.
+const zeroedDownloadAdmissionYAML = `
 download_admission:
   enabled: false
   max_active_per_node: 0
@@ -56,22 +55,57 @@ download_admission:
   max_active_link_inline: 0
 `
 
-func TestLegacyD1PlaceholderIsRefusedRatherThanSilentlyUnprotected(t *testing.T) {
+func TestZeroedDisabledDownloadAdmissionIsRefused(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Auth.DevMode = true
-	if err := yaml.Unmarshal([]byte(legacyD1PlaceholderYAML), cfg); err != nil {
-		t.Fatalf("unmarshal legacy placeholder: %v", err)
-	}
-	if cfg.DownloadAdmission != (DownloadAdmissionConfig{}) {
-		t.Fatalf("fixture no longer reproduces the shipped placeholder: %#v", cfg.DownloadAdmission)
+	if err := yaml.Unmarshal([]byte(zeroedDownloadAdmissionYAML), cfg); err != nil {
+		t.Fatalf("unmarshal zeroed section: %v", err)
 	}
 
 	err := cfg.Validate()
 	if err == nil {
-		t.Fatal("the D1-D5 placeholder validated; that deployment starts with no aggregate download bound")
+		t.Fatal("a zeroed disabled section validated; flipping enabled: true would not start")
 	}
-	if !strings.Contains(err.Error(), "staging placeholder") {
-		t.Fatalf("Validate() error = %q, want the placeholder to be named so the operator knows which edit to make", err)
+	if !strings.Contains(err.Error(), "could not be enabled as written") {
+		t.Fatalf("Validate() error = %q, want the incomplete-opt-out explanation", err)
+	}
+}
+
+// TestPartiallyFilledDisabledDownloadAdmissionIsRefused is why the rule is
+// completeness rather than a fingerprint of any particular shape. A single
+// changed field — one DOWNLOAD_ADMISSION_* override is enough — would defeat an
+// exact-match check while leaving the section just as unusable.
+func TestPartiallyFilledDisabledDownloadAdmissionIsRefused(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	if err := yaml.Unmarshal([]byte(zeroedDownloadAdmissionYAML), cfg); err != nil {
+		t.Fatalf("unmarshal zeroed section: %v", err)
+	}
+	cfg.DownloadAdmission.RetryAfter = 10 * time.Second
+	if cfg.DownloadAdmission == (DownloadAdmissionConfig{}) {
+		t.Fatal("fixture still equals the zero struct; it no longer tests the partial case")
+	}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("a partially filled disabled section validated")
+	}
+	if !strings.Contains(err.Error(), "could not be enabled as written") {
+		t.Fatalf("Validate() error = %q, want the incomplete-opt-out explanation", err)
+	}
+}
+
+// TestDisabledDownloadAdmissionMissingOneCapIsRefused states the rule as a
+// property: any disabled section that could not be switched on as written is
+// refused, whichever single value is missing.
+func TestDisabledDownloadAdmissionMissingOneCapIsRefused(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.Enabled = false
+	cfg.DownloadAdmission.MaxActivePerNode = 0
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a disabled section with no node cap validated; flipping enabled would not start")
 	}
 }
 
@@ -93,16 +127,16 @@ func TestExplicitDownloadAdmissionOptOutStillValidates(t *testing.T) {
 	}
 }
 
-// TestLegacyD1PlaceholderRepairedByEnvValidates pins the ordering. The check
-// belongs after applyEnvOverrides: a deployment that carries the old YAML but
-// supplies real values through the environment is already protected, and
+// TestZeroedDownloadAdmissionCompletedByEnvValidates pins the ordering. The
+// check belongs after applyEnvOverrides: a deployment whose YAML zeroes the
+// section but supplies real values through the environment is protected, and
 // refusing it would reject a correct configuration.
-func TestLegacyD1PlaceholderRepairedByEnvValidates(t *testing.T) {
+func TestZeroedDownloadAdmissionCompletedByEnvValidates(t *testing.T) {
 	clearLoadEnvOverrides(t)
 	cfg := DefaultConfig()
 	cfg.Auth.DevMode = true
-	if err := yaml.Unmarshal([]byte(legacyD1PlaceholderYAML), cfg); err != nil {
-		t.Fatalf("unmarshal legacy placeholder: %v", err)
+	if err := yaml.Unmarshal([]byte(zeroedDownloadAdmissionYAML), cfg); err != nil {
+		t.Fatalf("unmarshal zeroed section: %v", err)
 	}
 
 	t.Setenv("DOWNLOAD_ADMISSION_ENABLED", "true")
@@ -116,7 +150,7 @@ func TestLegacyD1PlaceholderRepairedByEnvValidates(t *testing.T) {
 	cfg.applyEnvOverrides()
 
 	if err := cfg.Validate(); err != nil {
-		t.Fatalf("placeholder repaired through the environment failed validation: %v", err)
+		t.Fatalf("zeroed section completed through the environment failed validation: %v", err)
 	}
 }
 

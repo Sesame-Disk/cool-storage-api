@@ -82,9 +82,12 @@ section still starts protected. Set `download_admission.enabled: false`
 explicitly to opt out; omission is not an implicit disable.
 
 Inheriting defaults cannot reach a file that already **contains** the section,
-so the one shape that would silently downgrade an upgrade is refused by name:
-the fully zeroed `enabled: false` block the D1-D5 templates shipped as a staging
-placeholder. A server started on it exits with
+so a disabled section is held to one rule: **`enabled: false` is a supported
+opt-out only when the values behind it would work if it were switched on.** That
+covers the zeroed block the D1-D5 templates shipped as a staging placeholder,
+and it keeps covering it after a single `DOWNLOAD_ADMISSION_*` override stops it
+from matching that exact shape. A server started on the shipped placeholder
+exits with
 
 ```text
 download_admission is the zeroed D1-D5 staging placeholder, which is no longer a
@@ -95,9 +98,11 @@ keep enabled: false alongside those values if the opt-out is deliberate
 Deleting the block is the upgrade path. The placeholder is not rewritten for you
 — an explicit `enabled: false` is the documented opt-out, and a configuration
 loader that overrides an explicit value because it recognises the surrounding
-numbers cannot be reasoned about. The check runs after environment overrides, so
-a deployment that supplies real values through `DOWNLOAD_ADMISSION_*` is
-unaffected.
+numbers cannot be reasoned about. A disabled section that is merely incomplete
+gets the same refusal with a message naming the missing value instead. The check
+runs after environment overrides, so a deployment that supplies real values
+through `DOWNLOAD_ADMISSION_*` is unaffected, and `server.write_timeout` is not
+part of the test because it conflicts only with an active guard.
 
 That is why `configs/config.prod.yaml` can look thinner than `configs/config.docker.yaml` or a local test config:
 production only needs to pin the non-secret structural values that differ from the code defaults,
