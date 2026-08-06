@@ -449,14 +449,17 @@ onlyoffice:
     - xlsx
 
 download_admission:
-  # D6 measured operating values. Budget: 2 GiB per node.
+  # Auto-sized D6 baseline. The budget comes from 25% of the cgroup limit when available.
   #   plaintext stream  4.0 MiB/admission   encrypted stream 36 MiB @8 / 72 MiB @16
   #   raw iWork @32 MiB source ~192 MiB/admission (buffers the whole document)
-  # Worst case under these caps: 6*192 MiB + 12*72 MiB = 2016 MiB (~1.97 GiB).
+  # With the 20% safety margin, the 2 GiB fallback derives 4 raw + 12 stream slots.
   # Process-local: fleet capacity scales with node count, this is not a cluster quota.
   enabled: true
-  memory_budget_bytes: 2147483648 # 2 GiB; set to about 25% of this container's memory limit
-  max_active_per_node: 18
+  capacity_mode: auto
+  memory_budget_percent: 25
+  raw_capacity_percent: 33
+  safety_margin_percent: 20
+  max_active_per_node: 16
   max_active_per_auth_user: 6
   max_active_per_link_source: 6
   max_active_per_client_link: 3
@@ -466,9 +469,9 @@ download_admission:
   preparation_deadline: 60s
   idle_write_timeout: 60s
   retry_after: 10s
-  max_active_block: 16
-  max_active_file: 16
-  max_active_raw: 6
+  max_active_block: 12
+  max_active_file: 12
+  max_active_raw: 4
   max_active_history: 6
   max_active_link_raw: 12
   max_active_zip: 4

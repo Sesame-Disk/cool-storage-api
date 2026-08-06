@@ -472,7 +472,7 @@ services:
       - SESAMEFS_URL=http://sesamefs:8080
       - SESAMEFS_URL_2=http://sesamefs-node-2:8080
       - SESAMEFS_URL_3=http://sesamefs-node-3:8080
-      - SESAMEFS_DOWNLOAD_NODE_CAP=${DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE:-18}
+      - SESAMEFS_DOWNLOAD_NODE_CAP=${DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE:-16}
       # The supported frontend nginx, so the D6 slow-client drill runs through
       # the real proxy rather than straight at Go. A backend-only test cannot
       # show that the client is the one controlling admission lifetime.

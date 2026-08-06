@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +37,8 @@ func TestConfigWithoutDownloadAdmissionInheritsD6Defaults(t *testing.T) {
 const zeroedDownloadAdmissionYAML = `
 download_admission:
   enabled: false
+  capacity_mode: manual
+  memory_budget_bytes: 0
   max_active_per_node: 0
   max_active_per_auth_user: 0
   max_active_per_link_source: 0
@@ -101,6 +104,8 @@ func TestPartiallyFilledDisabledDownloadAdmissionIsRefused(t *testing.T) {
 func TestDisabledDownloadAdmissionMissingOneCapIsRefused(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.CapacityMode = "manual"
+	cfg.DownloadAdmission.MemoryBudgetBytes = DefaultDownloadAdmissionMemoryBudgetBytes
 	cfg.DownloadAdmission.Enabled = false
 	cfg.DownloadAdmission.MaxActivePerNode = 0
 
@@ -112,6 +117,8 @@ func TestDisabledDownloadAdmissionMissingOneCapIsRefused(t *testing.T) {
 func TestDisabledDownloadAdmissionDefersMemoryBudgetUntilEnabled(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.CapacityMode = "manual"
+	cfg.DownloadAdmission.MemoryBudgetBytes = DefaultDownloadAdmissionMemoryBudgetBytes
 	cfg.DownloadAdmission.Enabled = false
 	cfg.DownloadAdmission.MaxActivePerNode = 19
 
@@ -122,6 +129,19 @@ func TestDisabledDownloadAdmissionDefersMemoryBudgetUntilEnabled(t *testing.T) {
 	cfg.DownloadAdmission.Enabled = true
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "memory design") {
 		t.Fatalf("enabled admission did not enforce memory budget: %v", err)
+	}
+}
+
+func TestDisabledDownloadAdmissionWithZeroMemoryBudgetIsRefused(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.CapacityMode = "manual"
+	cfg.DownloadAdmission.Enabled = false
+	cfg.DownloadAdmission.MemoryBudgetBytes = 0
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "memory_budget_bytes") {
+		t.Fatalf("zero disabled memory budget error = %v, want structural memory budget error", err)
 	}
 }
 
@@ -153,6 +173,8 @@ func TestDisabledDownloadAdmissionDoesNotConstrainOtherSubsystems(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := DefaultConfig()
 			cfg.Auth.DevMode = true
+			cfg.DownloadAdmission.CapacityMode = "manual"
+			cfg.DownloadAdmission.MemoryBudgetBytes = DefaultDownloadAdmissionMemoryBudgetBytes
 			cfg.DownloadAdmission.Enabled = false
 			tc.modify(cfg)
 
@@ -194,10 +216,12 @@ func TestZeroedDownloadAdmissionCompletedByEnvValidates(t *testing.T) {
 	}
 
 	t.Setenv("DOWNLOAD_ADMISSION_ENABLED", "true")
+	t.Setenv("DOWNLOAD_ADMISSION_CAPACITY_MODE", "manual")
 	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE", "6")
 	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER", "6")
 	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE", "6")
 	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_CLIENT_LINK", "3")
+	t.Setenv("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES", "2147483648")
 	t.Setenv("DOWNLOAD_ADMISSION_PREPARATION_DEADLINE", "60s")
 	t.Setenv("DOWNLOAD_ADMISSION_IDLE_WRITE_TIMEOUT", "60s")
 	t.Setenv("DOWNLOAD_ADMISSION_RETRY_AFTER", "10s")
@@ -211,6 +235,10 @@ func TestZeroedDownloadAdmissionCompletedByEnvValidates(t *testing.T) {
 func TestDownloadAdmissionValidation(t *testing.T) {
 	valid := DownloadAdmissionConfig{
 		Enabled:                true,
+		CapacityMode:           "manual",
+		MemoryBudgetPercent:    DefaultDownloadAdmissionMemoryBudgetPercent,
+		RawCapacityPercent:     DefaultDownloadAdmissionRawCapacityPercent,
+		SafetyMarginPercent:    DefaultDownloadAdmissionSafetyMarginPercent,
 		MaxActivePerNode:       8,
 		MaxActivePerAuthUser:   2,
 		MaxActivePerLinkSource: 4,
@@ -271,8 +299,13 @@ func TestDownloadAdmissionValidation(t *testing.T) {
 			modify: func(c *Config) {
 				c.DownloadAdmission = DownloadAdmissionConfig{
 					Enabled:              true,
+					CapacityMode:         "manual",
+					MemoryBudgetPercent:  DefaultDownloadAdmissionMemoryBudgetPercent,
+					RawCapacityPercent:   DefaultDownloadAdmissionRawCapacityPercent,
+					SafetyMarginPercent:  DefaultDownloadAdmissionSafetyMarginPercent,
 					MaxActivePerNode:     1,
 					MaxActivePerAuthUser: 1,
+					MemoryBudgetBytes:    DefaultDownloadAdmissionMemoryBudgetBytes,
 				}
 			},
 			wantErr:    true,
@@ -356,7 +389,11 @@ func d6MemoryBudgetConfig() *Config {
 	cfg.Server.WriteTimeout = 0
 	cfg.DownloadAdmission = DownloadAdmissionConfig{
 		Enabled:                true,
-		MaxActivePerNode:       18,
+		CapacityMode:           "manual",
+		MemoryBudgetPercent:    DefaultDownloadAdmissionMemoryBudgetPercent,
+		RawCapacityPercent:     DefaultDownloadAdmissionRawCapacityPercent,
+		SafetyMarginPercent:    DefaultDownloadAdmissionSafetyMarginPercent,
+		MaxActivePerNode:       16,
 		MaxActivePerAuthUser:   6,
 		MaxActivePerLinkSource: 6,
 		MaxActivePerClientLink: 3,
@@ -368,7 +405,7 @@ func d6MemoryBudgetConfig() *Config {
 		RetryAfter:             10 * time.Second,
 		MaxActiveBlock:         16,
 		MaxActiveFile:          16,
-		MaxActiveRaw:           6,
+		MaxActiveRaw:           4,
 		MaxActiveHistory:       6,
 		MaxActiveLinkRaw:       12,
 		MaxActiveZIP:           4,
@@ -380,6 +417,46 @@ func d6MemoryBudgetConfig() *Config {
 	return cfg
 }
 
+func TestDownloadAdmissionAutoCapacityDerivesFromBudget(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("auto capacity validation failed: %v", err)
+	}
+	if cfg.DownloadAdmission.MemoryBudgetBytes != DefaultDownloadAdmissionMemoryBudgetBytes {
+		t.Fatalf("auto memory budget = %d, want fallback %d", cfg.DownloadAdmission.MemoryBudgetBytes, DefaultDownloadAdmissionMemoryBudgetBytes)
+	}
+	if cfg.DownloadAdmission.MaxActivePerNode != 16 || cfg.DownloadAdmission.MaxActiveRaw != 4 {
+		t.Fatalf("auto capacities = node %d/raw %d, want 16/4", cfg.DownloadAdmission.MaxActivePerNode, cfg.DownloadAdmission.MaxActiveRaw)
+	}
+	if cfg.DownloadAdmission.MaxActivePerAuthUser != 6 || cfg.DownloadAdmission.MaxActivePerClientLink != 3 {
+		t.Fatalf("auto fairness caps = user %d/client-link %d, want 6/3", cfg.DownloadAdmission.MaxActivePerAuthUser, cfg.DownloadAdmission.MaxActivePerClientLink)
+	}
+}
+
+func TestDownloadAdmissionAutoCapacityProfiles(t *testing.T) {
+	const mib = int64(1024 * 1024)
+	for _, tc := range []struct {
+		budget    int64
+		wantRaw   int
+		wantOther int
+		wantNode  int
+	}{
+		{budget: 512 * mib, wantRaw: 1, wantOther: 3, wantNode: 4},
+		{budget: 1 * 1024 * mib, wantRaw: 2, wantOther: 6, wantNode: 8},
+		{budget: 2 * 1024 * mib, wantRaw: 4, wantOther: 12, wantNode: 16},
+		{budget: 4 * 1024 * mib, wantRaw: 8, wantOther: 24, wantNode: 32},
+	} {
+		t.Run(fmt.Sprintf("%dMiB", tc.budget/mib), func(t *testing.T) {
+			effective := tc.budget * DownloadAdmissionMemorySafetyNumerator / DownloadAdmissionMemorySafetyDenominator
+			raw, other, node, ok := deriveDownloadAdmissionSlots(effective, 192*mib, 72*mib, 33)
+			if !ok || raw != tc.wantRaw || other != tc.wantOther || node != tc.wantNode {
+				t.Fatalf("derived slots = (%d raw, %d other, %d node, %t), want (%d, %d, %d, true)", raw, other, node, ok, tc.wantRaw, tc.wantOther, tc.wantNode)
+			}
+		})
+	}
+}
+
 func TestDownloadAdmissionMemoryBudgetBoundaries(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -387,11 +464,11 @@ func TestDownloadAdmissionMemoryBudgetBoundaries(t *testing.T) {
 		wantErr    bool
 		wantString string
 	}{
-		{name: "shipped 18 slots at 16 MiB", wantErr: false},
+		{name: "shipped 16 slots at 16 MiB", wantErr: false},
 		{
-			name: "node cap 19 exceeds budget",
+			name: "node cap 17 exceeds budget",
 			modify: func(cfg *Config) {
-				cfg.DownloadAdmission.MaxActivePerNode = 19
+				cfg.DownloadAdmission.MaxActivePerNode = 17
 			},
 			wantErr:    true,
 			wantString: "memory design",
@@ -399,10 +476,26 @@ func TestDownloadAdmissionMemoryBudgetBoundaries(t *testing.T) {
 		{
 			name: "deployment budget can be raised explicitly",
 			modify: func(cfg *Config) {
-				cfg.DownloadAdmission.MaxActivePerNode = 19
+				cfg.DownloadAdmission.MaxActivePerNode = 17
 				cfg.DownloadAdmission.MemoryBudgetBytes = 3 * 1024 * 1024 * 1024
 			},
 			wantErr: false,
+		},
+		{
+			name: "zero deployment budget",
+			modify: func(cfg *Config) {
+				cfg.DownloadAdmission.MemoryBudgetBytes = 0
+			},
+			wantErr:    true,
+			wantString: "memory_budget_bytes must be between 1",
+		},
+		{
+			name: "deployment budget above operator ceiling",
+			modify: func(cfg *Config) {
+				cfg.DownloadAdmission.MemoryBudgetBytes = MaxDownloadAdmissionMemoryBudgetBytes + 1
+			},
+			wantErr:    true,
+			wantString: "memory_budget_bytes must be between 1",
 		},
 		{
 			name: "32 MiB sync block exceeds budget",
@@ -494,10 +587,23 @@ func TestDownloadAdmissionMemoryBudgetBoundaries(t *testing.T) {
 	}
 }
 
+func TestDownloadAdmissionMemoryArithmeticRejectsOverflow(t *testing.T) {
+	if got, ok := checkedNonNegativeMultiply(1<<62, 4); ok || got != 0 {
+		t.Fatalf("overflowing multiplication = (%d, %t), want (0, false)", got, ok)
+	}
+	if got, ok := checkedNonNegativeAdd((1<<63)-1, 1); ok || got != 0 {
+		t.Fatalf("overflowing addition = (%d, %t), want (0, false)", got, ok)
+	}
+}
+
 func TestDownloadAdmissionEnvironmentOverrides(t *testing.T) {
 	clearLoadEnvOverrides(t)
 	cfg := DefaultConfig()
 	t.Setenv("DOWNLOAD_ADMISSION_ENABLED", "true")
+	t.Setenv("DOWNLOAD_ADMISSION_CAPACITY_MODE", "manual")
+	t.Setenv("DOWNLOAD_ADMISSION_MEMORY_BUDGET_PERCENT", "30")
+	t.Setenv("DOWNLOAD_ADMISSION_RAW_CAPACITY_PERCENT", "35")
+	t.Setenv("DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT", "15")
 	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE", "8")
 	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER", "2")
 	t.Setenv("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES", "1073741824")
@@ -512,6 +618,9 @@ func TestDownloadAdmissionEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.DownloadAdmission.MemoryBudgetBytes != 1*1024*1024*1024 {
 		t.Fatalf("memory budget env override = %d, want 1 GiB", cfg.DownloadAdmission.MemoryBudgetBytes)
+	}
+	if cfg.DownloadAdmission.MemoryBudgetPercent != 30 || cfg.DownloadAdmission.RawCapacityPercent != 35 || cfg.DownloadAdmission.SafetyMarginPercent != 15 {
+		t.Fatalf("capacity percentage env overrides = %#v", cfg.DownloadAdmission)
 	}
 	if cfg.DownloadAdmission.AdmissionWait != 1500*time.Millisecond || cfg.DownloadAdmission.PreparationDeadline != 10*time.Minute || cfg.DownloadAdmission.IdleWriteTimeout != 5*time.Minute || cfg.DownloadAdmission.RetryAfter != time.Minute {
 		t.Fatalf("duration env overrides = %#v", cfg.DownloadAdmission)
@@ -528,9 +637,10 @@ func TestDownloadAdmissionEnvironmentOverrideErrors(t *testing.T) {
 	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE", "not-an-int")
 	t.Setenv("DOWNLOAD_ADMISSION_RETRY_AFTER", "not-a-duration")
 	t.Setenv("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES", "not-an-int")
+	t.Setenv("DOWNLOAD_ADMISSION_MEMORY_BUDGET_PERCENT", "not-an-int")
 	cfg.applyEnvOverrides()
-	if len(cfg.envOverrideErrors) != 4 {
-		t.Fatalf("env override errors = %v, want four errors", cfg.envOverrideErrors)
+	if len(cfg.envOverrideErrors) != 5 {
+		t.Fatalf("env override errors = %v, want five errors", cfg.envOverrideErrors)
 	}
 }
 
@@ -550,6 +660,10 @@ func TestIWorkSourceEnvironmentOverrideKeepsTheD6GuardValidated(t *testing.T) {
 			cfg.Auth.DevMode = true
 			cfg.DownloadAdmission = DownloadAdmissionConfig{
 				Enabled:                true,
+				CapacityMode:           "manual",
+				MemoryBudgetPercent:    DefaultDownloadAdmissionMemoryBudgetPercent,
+				RawCapacityPercent:     DefaultDownloadAdmissionRawCapacityPercent,
+				SafetyMarginPercent:    DefaultDownloadAdmissionSafetyMarginPercent,
 				MaxActivePerNode:       8,
 				MaxActivePerAuthUser:   2,
 				MaxActivePerLinkSource: 4,

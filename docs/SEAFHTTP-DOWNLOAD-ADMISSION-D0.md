@@ -51,34 +51,23 @@ unit/race-test coverage. It intentionally does not call the coordinator from a
 download producer, mint or propagate public-link source IDs, install response
 deadlines, or select positive capacity values. Those are D2-D6 deliverables.
 
-The repository templates stayed safe during the staged rollout: every
-`download_admission` block shipped with `enabled: false` and zero values, and
-enabling the section before producer wiring was an unsupported deployment
-configuration rather than a configuration error. D6, as reserved here, is the
-phase that replaced those placeholders with measured defaults and turned the
-section on — see **D6 Evidence**. The zero-value templates are therefore history
-rather than current state; `TestShippedConfigs*` now enforce the opposite, since
-a bound that is never enabled protects nothing. The same measured values are
-also in `DefaultConfig()`, so an older YAML file that omits the section inherits
-protection during an upgrade. An explicit `download_admission.enabled: false`
-remains the only opt-out.
+The shipped YAML and `.env` examples are clean-deployment baselines: the
+measured values are enabled in every shipped configuration and also live in
+`DefaultConfig()`. A file that omits the section therefore inherits protection;
+an explicit `download_admission.enabled: false` remains the only opt-out.
 
 `Load()` overlays YAML on `DefaultConfig()` field by field, including when the
 section is present. Omitted keys inside `download_admission` therefore retain
-the D6 defaults. The config this project shipped for D1-D5 is different: that
-placeholder explicitly pinned every field to zero, so it is refused at startup
-rather than migrated. It was never an operator decision — this section reserved
-it for D6 to replace — but rewriting an explicit `enabled: false` because the
-surrounding values happen to be zero would make the loader unpredictable in a
-worse way.
+the D6 defaults. A present disabled section is checked for positive structural
+values, including its configured memory budget, but its combined memory design
+is evaluated only when enabled because it includes sync and preview settings
+owned by other subsystems.
 
-The refusal keys on **completeness, not on the historical fingerprint**:
-`enabled: false` is supported when the effective values pass the section's
-structural rules if the guard were switched on. The combined memory budget is
-deliberately checked only while enabled because it includes values owned by the
-sync and preview subsystems. An exact-shape test would stop matching after one
-`DOWNLOAD_ADMISSION_*` override against the old YAML while the deployment stayed
-just as unbounded, and completeness is the rule the refusal message states.
+The refusal keys on **completeness**, not on a fixed shape: `enabled: false` is
+supported when the effective values pass the section's structural rules if the
+guard were switched on. An exact-shape test would stop matching after one
+`DOWNLOAD_ADMISSION_*` override, and completeness is the rule the refusal
+message states.
 `server.write_timeout` is excluded, since it conflicts only with an active guard.
 The check runs after environment overrides, so a deployment already repaired
 through `DOWNLOAD_ADMISSION_*` is unaffected.
@@ -863,15 +852,19 @@ shape is frozen here so `applyEnvOverrides()` has something to implement:
 
 ```yaml
 download_admission:
-  # D6 measured operating defaults. These values also live in DefaultConfig so
-  # a legacy YAML file that omits this section remains protected on upgrade.
+  # Auto-sized D6 defaults. The budget uses 25% of the cgroup limit when exposed;
+  # the 2 GiB fallback is used when no container limit is available.
   # Set enabled: false explicitly only when admission is intentionally disabled.
   enabled: true
-  memory_budget_bytes: 2147483648 # 2 GiB; about 25% of an 8 GiB container limit
-  max_active_per_node: 18
-  max_active_per_auth_user: 6
-  max_active_per_link_source: 6
-  max_active_per_client_link: 3
+  capacity_mode: auto
+  memory_budget_percent: 25
+  raw_capacity_percent: 33
+  safety_margin_percent: 20
+  # memory_budget_bytes: 2147483648 # optional fallback/override
+  max_active_per_node: 16 # derived; 4 raw + 12 stream slots at the 2 GiB fallback
+  max_active_per_auth_user: 6 # derived fairness cap
+  max_active_per_link_source: 6 # derived fairness cap
+  max_active_per_client_link: 3 # derived fairness cap
   max_waiters_per_identity: 4
   max_waiters_per_node: 24
   admission_wait: 2s
@@ -879,16 +872,18 @@ download_admission:
   idle_write_timeout: 60s
   retry_after: 10s
   # Per-profile caps are flat, explicit keys — not a YAML map.
-  max_active_block: 16
-  max_active_file: 16
-  max_active_raw: 6
+  max_active_block: 12
+  max_active_file: 12
+  max_active_raw: 4
   max_active_history: 6
   max_active_link_raw: 12
   max_active_zip: 4
   max_active_link_inline: 8
 ```
 
-Values above are the measured D6 values. The per-profile caps are **flat keys
+Values above are the measured D6 values for the clean 8 GiB-container baseline.
+The budget and caps must be resized together for smaller containers. The
+per-profile caps are **flat keys
 rather than a map** on purpose: the profile set is a fixed,
 closed enum, and a map cannot be overridden per entry by an environment variable
 without inventing JSON-in-env. Each maps to
@@ -1083,8 +1078,18 @@ readiness must not be described as enabled while that bypass is unresolved.
 
 ### Measured per-admission cost
 
-The caps divide a stated **2 GiB per-node budget** by measured cost, not by
-estimate. Both benchmarks are in the tree so the figures can be re-derived.
+Auto mode divides the effective process-local design budget by measured cost, not
+by estimate. The default 2 GiB fallback applies a 20% safety margin and derives
+4 raw slots plus 12 other stream slots:
+
+```text
+4 x 192 MiB + 12 x 72 MiB = 1632 MiB (~1.59 GiB)
+```
+
+Both component benchmarks are in the tree so the figures can be re-derived.
+`Load()` derives the budget from 25% of an exposed cgroup limit, uses the 2 GiB
+fallback otherwise, and rejects explicit budgets above 25% of the cgroup limit.
+The budget is a design validator, not an OS memory reservation.
 
 | Producer shape | Measured peak per admission | Benchmark |
 |---|---|---|
@@ -1109,13 +1114,12 @@ this and named the cheaper lever, which is what was taken: a `FileView` iWork
 schema nor the metric label set. Sizing `max_active_raw` for iWork instead would
 have throttled ordinary raw streams — 4 MiB each — by two orders of magnitude.
 
-Worst case under the shipped caps: `6 x 192 MiB + 12 x 72 MiB = 2016 MiB`
-(`~1.97 GiB`), below the default 2 GiB process-local budget. The budget is
-configurable per deployment through `memory_budget_bytes` or
-`DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES`; the 2 GiB value is a reference
-default, approximately 25% of an 8 GiB container limit, not a universal machine
-capacity.
-This is a hard startup invariant enforced by `Config.Validate()`, not an
+Worst case under the shipped auto caps: `4 x 192 MiB + 12 x 72 MiB = 1632 MiB`
+(`~1.59 GiB`), below the safety-adjusted 1.6 GiB design budget. The budget is
+configurable per deployment through `memory_budget_bytes`,
+`memory_budget_percent` or `DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES`; the 2 GiB
+value is a fallback reference, not a universal machine capacity.
+This is a hard startup invariant enforced by the configuration validator, not an
 operator advisory. Raising the node/profile/source/block values or lowering
 the deployment budget can therefore make an enabled deployment refuse to boot.
 A zero `max_active_raw` removes the
@@ -1144,13 +1148,14 @@ a raw stream.
 | 11 | `scripts/fault-inject-download-admission.sh` — the follow-up drill records 33 retryable `profile="block"` refusals, summing the six reasons a saturated node can answer with (`admission_timeout`, `auth_user_full`, `node_full`, `profile_full`, `auth_user_queue_full`, `node_queue_full`) and excluding `client_gone`; it proves HTTP 503 with `Retry-After: 10`, and real `seaf-cli` reaches `synchronized`, pulls every file and drains every slot |
 | 12 | Measurements above; egress measured at 356 MiB/s single and 1699 MiB/s aggregate six-way (**4.9×**), re-measured on a rebuilt stack at 350 and 1788 MiB/s (**5.1×**). The residual is the near-linear relationship, which reproduced; the absolute rates are per-run |
 | 13 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` remains open and is not treated as closed by D |
-| 14 | `TestShippedConfigs*` load every shipped configuration through the real validator, including the combined 2 GiB memory invariant; invariants are asserted on a busy node in the saturation drill |
+| 14 | `TestShippedConfigs*` load every shipped configuration through the real validator, including auto-derived capacities and the safety-adjusted memory invariant; `TestDownloadAdmissionMemoryUnderSaturation` is the opt-in real-node RSS/heap/cgroup probe |
 
 ### What the measurements are not
 
-They come from a container stack on developer hardware. The **memory** figures
-are properties of the code — buffer sizes, block sizes and copy counts — so they
-transfer. The **throughput** figures do not: ~350 MiB/s single-transfer is a
+They come from a container stack on developer hardware. The component **memory**
+figures are properties of the code — buffer sizes, block sizes and copy counts —
+so they transfer; the aggregate probe additionally measures the running process
+with real storage and middleware. The **throughput** figures do not: ~350 MiB/s single-transfer is a
 loopback number, and production egress must be re-measured on the real network
 before the concurrency cap is read as an egress ceiling. Two runs on the same
 hardware differed by 5% on the single rate and moved the multiple from 4.9x to
@@ -1199,7 +1204,7 @@ deployment for token issuance.
 | D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Merged in `main`; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
 | D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | Complete: one bootstrapped coordinator covers all listed non-block producers through preparation and response lifetime |
 | D5 | Stream sync block GET through existing canonical reader APIs | Complete: `SyncHandler.GetBlock` uses `GetBlockSize`/`GetBlockReader` under `ProfileBlock` on the shared coordinator; neither the canonical nor the legacy no-metadata path materializes the whole block; traffic uses bytes written |
-| D6 | Fault evidence, client recovery, measurements and final closure docs | **Complete (follow-up verified 2026-08-04).** Per-admission cost measured, capacities selected against a stated 2 GiB budget and shipped in every config, the section enabled, and the reason-filtered client/proxy/saturation evidence produced. See **D6 Evidence** above |
+| D6 | Fault evidence, client recovery, measurements and final closure docs | **Complete (follow-up verified 2026-08-04).** Per-admission cost measured, auto capacities derived from the effective budget with 20% safety headroom, shipped configs enabled, and the reason-filtered client/proxy/saturation evidence produced. The opt-in full-lifetime memory probe covers the real process RSS/heap/cgroup delta. See **D6 Evidence** above |
 
 The B/C `syncAdmissionLimiter` remains in `internal/api` during this series.
 Its white-box tests inspect unexported state, so extracting it to
@@ -1219,6 +1224,9 @@ docker compose --profile test run --rm --build \
   gotest go test -race -count=1 \
   ./internal/api/... ./internal/api/v2/... ./internal/streaming/... ./internal/config/...
 docker compose --profile test run --rm --build go-integration-test
+docker compose --profile test run --rm --build --entrypoint sh go-integration-test \
+  -c 'export PATH=$PATH:/usr/local/go/bin && SESAMEFS_DOWNLOAD_MEMORY_PROBE=1 \
+      go test -tags integration -run TestDownloadAdmissionMemoryUnderSaturation -v -count=1 ./internal/integration/'
 docker compose --profile test run --rm --build sync-test
 docker compose --profile test run --rm --build go-all-test
 ```

@@ -93,7 +93,7 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 		waitForDownloadActive(t, client, 0, 30*time.Second)
 	})
 
-	rawSlots := 6
+	rawSlots := 4
 	if rawSlots >= nodeCap {
 		rawSlots = nodeCap - 1
 	}
@@ -157,7 +157,7 @@ func downloadProbeNodeCap(t *testing.T) int {
 	t.Helper()
 	value := strings.TrimSpace(os.Getenv("SESAMEFS_DOWNLOAD_NODE_CAP"))
 	if value == "" {
-		return 18
+		return 16
 	}
 	cap, err := strconv.Atoi(value)
 	if err != nil || cap <= 0 {

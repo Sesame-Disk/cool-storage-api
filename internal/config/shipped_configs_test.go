@@ -8,7 +8,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// D6 ships the first positive download-admission values, which turns a whole
+// D6 ships the first positive download-admission values and auto-capacity
+// policy, which turns a whole
 // class of configuration defect from latent into fatal: with enabled: true the
 // validator refuses zero caps and a non-zero server.write_timeout, so a single
 // shipped file that missed a key now stops that deployment from starting.
@@ -47,6 +48,9 @@ func TestShippedConfigsPassDownloadAdmissionValidation(t *testing.T) {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			cfg := loadShippedConfig(t, path)
 
+			if err := cfg.resolveDownloadAdmissionCapacity(); err != nil {
+				t.Fatalf("shipped capacity derivation failed: %v", err)
+			}
 			if err := cfg.validateDownloadAdmissionBounds(); err != nil {
 				t.Fatalf("shipped configuration would refuse to start: %v", err)
 			}
@@ -98,13 +102,17 @@ func TestShippedConfigsMatchTheCodeDefaults(t *testing.T) {
 }
 
 // TestShippedConfigsCapIWorkPreviewSource guards the combined measured memory
-// budget. The preview branch materialises the whole source document, while
-// encrypted streaming scales with the maximum sync block admitted by the
-// server. Both terms must fit the stated process-local D6 budget together.
+// budget after auto capacity derivation. The preview branch materialises the
+// whole source document, while encrypted streaming scales with the maximum sync
+// block admitted by the server. Both terms must fit the safety-adjusted
+// process-local D6 budget together.
 func TestShippedConfigsCapIWorkPreviewSource(t *testing.T) {
 	for _, path := range shippedConfigPaths(t) {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			cfg := loadShippedConfig(t, path)
+			if err := cfg.resolveDownloadAdmissionCapacity(); err != nil {
+				t.Fatalf("shipped capacity derivation failed: %v", err)
+			}
 
 			if err := cfg.validateDownloadAdmissionMemoryBudget(); err != nil {
 				t.Fatalf("shipped memory design is unsafe: %v", err)
