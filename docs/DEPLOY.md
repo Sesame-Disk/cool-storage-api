@@ -77,23 +77,31 @@ SesameFS resolves configuration in this order:
 3. Environment variables are applied last via `applyEnvOverrides()`, so env always wins.
 
 Download admission is one of the safety defaults: `DefaultConfig()` carries the
-measured D6 values, so an older YAML file that predates the `download_admission`
+measured D6 values, so a config file that does not pin the `download_admission`
 section still starts protected. Set `download_admission.enabled: false`
 explicitly to opt out; omission is not an implicit disable.
 
-Inheriting defaults cannot reach a file that already **contains** the section,
-so a disabled section is held to one rule: **`enabled: false` is a supported
-opt-out only when the values behind it would work if it were switched on.** That
-covers the zeroed block the D1-D5 templates shipped as a staging placeholder,
-and it keeps covering it after a single `DOWNLOAD_ADMISSION_*` override stops it
-from matching that exact shape. A server started on the shipped placeholder
-exits with
+A section that **is** present gets no such inheritance, so a disabled one is held
+to a rule: **`enabled: false` is a supported opt-out only when the values behind
+it would work if it were switched on.** Nothing else validates a disabled
+section, so without this a half-written one is accepted now and fails the day
+someone flips it to `true` — which is usually during an incident. The rule is
+completeness rather than any fixed shape, since one `DOWNLOAD_ADMISSION_*`
+override is enough to defeat a fixed-shape check while leaving the section just
+as unusable. A server started on such a section exits with
 
 ```text
-download_admission is the zeroed D1-D5 staging placeholder, which is no longer a
-supported deployment: remove the section to inherit the measured defaults, or
-keep enabled: false alongside those values if the opt-out is deliberate
+download_admission is disabled with a configuration that could not be enabled as
+written: remove the section to inherit the measured defaults, or keep
+enabled: false alongside a complete set of values (<what is missing>)
 ```
+
+The rule covers the section's own values only. The 2 GiB memory design is not
+charged against a disabled section, because it multiplies these caps by
+`seafhttp.sync_block_max_bytes` and the `fileview` limits, which other
+subsystems own and set for their own reasons — a disabled download guard must
+not stop a deployment from booting over an upload-side value. A design that
+overshoots the budget is refused when the section is enabled.
 
 Deleting the block is the upgrade path. The placeholder is not rewritten for you
 — an explicit `enabled: false` is the documented opt-out, and a configuration

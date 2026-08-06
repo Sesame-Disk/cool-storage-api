@@ -2237,8 +2237,22 @@ func (c *Config) validateDownloadAdmissionBounds() error {
 // explicit value because it dislikes the surrounding numbers cannot be reasoned
 // about. Both intents stay one edit away.
 //
-// server.write_timeout is excluded deliberately: it conflicts only with an
-// active guard, so it is not part of what makes a disabled section complete.
+// The scope is the section's own structural rules. The 2 GiB memory design is
+// deliberately **not** checked here, even though an enabled section must pass
+// it, because it multiplies the caps by values other subsystems own:
+// seafhttp.sync_block_max_bytes is subcontract B's PUT body cap, and the
+// fileview limits are the preview subsystem's. Charging a disabled download
+// guard against them refuses configurations that are correct on their own terms
+// — raising sync_block_max_bytes to its sanctioned 64 MiB ceiling would stop a
+// deployment from booting for a reason about downloads it is not admitting —
+// and it preempts those subsystems' more precise errors. With the section off
+// there is no slot count for a budget to apply to.
+//
+// So this catches an unusable *section*, not an unusable *design*. A cap that
+// is structurally fine but overshoots the budget is still refused, at the flip.
+//
+// server.write_timeout is excluded for the same shape of reason: it conflicts
+// only with an active guard.
 //
 // This runs after applyEnvOverrides, so a section completed through the
 // environment is unaffected.

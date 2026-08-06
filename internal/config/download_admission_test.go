@@ -109,6 +109,44 @@ func TestDisabledDownloadAdmissionMissingOneCapIsRefused(t *testing.T) {
 	}
 }
 
+// TestDisabledDownloadAdmissionDoesNotConstrainOtherSubsystems pins the scope of
+// the completeness rule against the obvious extension of it: also charging the
+// disabled section against the 2 GiB memory design. That design multiplies the
+// caps by values other subsystems own, so the extension refuses configurations
+// that are correct on their own terms — the sanctioned 64 MiB sync block ceiling
+// below stops the server from booting for a reason about downloads it is not
+// admitting, and the refusal lands before subcontract B's own, more precise
+// error. An unusable section is this rule's business; an unusable design is
+// caught at the flip.
+func TestDisabledDownloadAdmissionDoesNotConstrainOtherSubsystems(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		modify func(*Config)
+	}{
+		{"sync block at its sanctioned ceiling", func(cfg *Config) {
+			// Sized the way subcontract B's own validator requires at that
+			// ceiling, so the only thing left that could reject it is D.
+			cfg.SeafHTTP.SyncBlockMaxBytes = MaxSyncBlockMaxBytes
+			cfg.SeafHTTP.SyncBlockMaxInflightPerNode = 6
+			cfg.SeafHTTP.SyncBlockMaxInflightPerUser = 6
+		}},
+		{"no iWork source cap", func(cfg *Config) {
+			cfg.FileView.MaxIWorkSourceBytes = 0
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			cfg.DownloadAdmission.Enabled = false
+			tc.modify(cfg)
+
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v; a disabled download guard must not veto another subsystem's valid value", err)
+			}
+		})
+	}
+}
+
 // TestExplicitDownloadAdmissionOptOutStillValidates is the other half: refusing
 // the placeholder must not turn `enabled: false` into an unsupported state. An
 // operator who deliberately opts out keeps the measured values beside it, and
