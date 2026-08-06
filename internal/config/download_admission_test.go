@@ -418,6 +418,12 @@ func d6MemoryBudgetConfig() *Config {
 }
 
 func TestDownloadAdmissionAutoCapacityDerivesFromBudget(t *testing.T) {
+	// Pin the seam. Auto capacity is a function of the host's memory limit, so
+	// without this the assertions below pass on a laptop and fail on any CI
+	// agent with a cgroup limit other than 8 GiB — a failure that says nothing
+	// about the change under test.
+	withCgroupMemoryLimit(t, 0, false)
+
 	cfg := DefaultConfig()
 	cfg.Auth.DevMode = true
 	if err := cfg.Validate(); err != nil {
@@ -448,12 +454,116 @@ func TestDownloadAdmissionAutoCapacityProfiles(t *testing.T) {
 		{budget: 4 * 1024 * mib, wantRaw: 8, wantOther: 24, wantNode: 32},
 	} {
 		t.Run(fmt.Sprintf("%dMiB", tc.budget/mib), func(t *testing.T) {
-			effective := tc.budget * DownloadAdmissionMemorySafetyNumerator / DownloadAdmissionMemorySafetyDenominator
+			effective, err := downloadAdmissionEffectiveBudget(tc.budget, DefaultDownloadAdmissionSafetyMarginPercent)
+			if err != nil {
+				t.Fatalf("effective budget: %v", err)
+			}
 			raw, other, node, ok := deriveDownloadAdmissionSlots(effective, 192*mib, 72*mib, 33)
 			if !ok || raw != tc.wantRaw || other != tc.wantOther || node != tc.wantNode {
 				t.Fatalf("derived slots = (%d raw, %d other, %d node, %t), want (%d, %d, %d, true)", raw, other, node, ok, tc.wantRaw, tc.wantOther, tc.wantNode)
 			}
 		})
+	}
+}
+
+// TestDownloadAdmissionSafetyMarginGovernsBothPhases is the regression for a
+// knob that meant two different things. Derivation scaled the budget by the
+// configured margin while the final validation scaled it by a hardcoded 4/5, so
+// every margin below 20 derived a design the validator then refused: the server
+// would not start on capacities it had computed itself.
+func TestDownloadAdmissionSafetyMarginGovernsBothPhases(t *testing.T) {
+	withCgroupMemoryLimit(t, 0, false)
+	for _, margin := range []int{0, 5, 10, 20, 50} {
+		t.Run(fmt.Sprintf("margin%d", margin), func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			cfg.DownloadAdmission.SafetyMarginPercent = margin
+
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("safety_margin_percent=%d derived a design its own validator refused: %v", margin, err)
+			}
+			if cfg.DownloadAdmission.MaxActivePerNode < 2 {
+				t.Fatalf("margin %d derived only %d slots", margin, cfg.DownloadAdmission.MaxActivePerNode)
+			}
+		})
+	}
+}
+
+// TestDownloadAdmissionBudgetPercentAgreesWithTheCgroupGuard covers the same
+// shape on the other percentage: the guard enforced a fixed 25% while the
+// setting accepted up to 100, so anything larger derived a budget the guard
+// rejected on any host that exposes a limit.
+func TestDownloadAdmissionBudgetPercentAgreesWithTheCgroupGuard(t *testing.T) {
+	const limit = int64(8 * 1024 * 1024 * 1024)
+	for _, percent := range []int{10, 25, 40, MaxDownloadAdmissionMemoryBudgetPercent} {
+		t.Run(fmt.Sprintf("percent%d", percent), func(t *testing.T) {
+			withCgroupMemoryLimit(t, limit, true)
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			cfg.DownloadAdmission.MemoryBudgetPercent = percent
+
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("memory_budget_percent=%d derived a budget its own guard refused: %v", percent, err)
+			}
+		})
+	}
+
+	t.Run("above the ceiling is refused by the range, not at startup", func(t *testing.T) {
+		withCgroupMemoryLimit(t, limit, true)
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		cfg.DownloadAdmission.MemoryBudgetPercent = MaxDownloadAdmissionMemoryBudgetPercent + 1
+
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "memory_budget_percent") {
+			t.Fatalf("Validate() = %v, want the range to name the setting", err)
+		}
+	})
+}
+
+// TestDownloadAdmissionRawCapacityPercentIsMonotonic pins the knob against the
+// fixed nodeSlots/4 floor it used to carry, which made a smaller requested raw
+// share collapse the node total (1% gave 7 slots where 33% gave 16) and made
+// every share at or above 25% derive the same split.
+func TestDownloadAdmissionRawCapacityPercentIsMonotonic(t *testing.T) {
+	withCgroupMemoryLimit(t, 0, false)
+	type derived struct{ node, raw int }
+	got := map[int]derived{}
+	for _, percent := range []int{10, 25, 50, 99} {
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		cfg.DownloadAdmission.RawCapacityPercent = percent
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("raw_capacity_percent=%d: %v", percent, err)
+		}
+		got[percent] = derived{cfg.DownloadAdmission.MaxActivePerNode, cfg.DownloadAdmission.MaxActiveRaw}
+	}
+
+	if got[10].node <= got[50].node {
+		t.Fatalf("a smaller raw share must buy more slots: 10%% gave %d, 50%% gave %d", got[10].node, got[50].node)
+	}
+	if got[99].raw <= got[25].raw {
+		t.Fatalf("a larger raw share must reserve more raw slots: 99%% gave %d, 25%% gave %d", got[99].raw, got[25].raw)
+	}
+}
+
+// TestDownloadAdmissionAutoModeKeepsZeroWaiters protects the documented
+// queueing contract. Zero means refuse immediately; auto mode floored it to one
+// and discarded the configured node value entirely, quietly turning "no queue"
+// into a queue.
+func TestDownloadAdmissionAutoModeKeepsZeroWaiters(t *testing.T) {
+	withCgroupMemoryLimit(t, 0, false)
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.MaxWaitersPerIdentity = 0
+	cfg.DownloadAdmission.MaxWaitersPerNode = 0
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("zero waiters: %v", err)
+	}
+	if cfg.DownloadAdmission.MaxWaitersPerIdentity != 0 || cfg.DownloadAdmission.MaxWaitersPerNode != 0 {
+		t.Fatalf("waiters = %d/%d, want the configured 0/0 to survive derivation",
+			cfg.DownloadAdmission.MaxWaitersPerIdentity, cfg.DownloadAdmission.MaxWaitersPerNode)
 	}
 }
 

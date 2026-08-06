@@ -104,14 +104,23 @@ download_admission:
 reservation and not an RSS limit. When it is omitted, `Load()` derives it from
 `memory_budget_percent` of the cgroup limit; if no cgroup limit is exposed, it
 uses the conservative 2 GiB fallback. An explicit byte value overrides that
-derivation. The safety margin leaves 20% of the configured design budget for
-HTTP structures, goroutines, SDK buffers, allocator fragmentation and measured
-variation. Auto mode also caps derived node capacity at 64 slots and raw
-capacity at 32 slots.
+derivation, and may claim up to `memory_budget_percent` of an exposed cgroup
+limit. The safety margin leaves `safety_margin_percent` of the configured design
+budget for HTTP structures, goroutines, SDK buffers, allocator fragmentation and
+measured variation; derivation and the final validation apply the same value.
+Auto mode also caps derived node capacity at 64 slots and raw capacity at 32.
 
 The `max_active_*` fields are generated outputs in auto mode. To hand-author
 those values, set `capacity_mode: manual`; otherwise the next validation derives
-them again from the budget and measured costs.
+them again from the budget and measured costs. **The numbers in the shipped
+files are therefore a reference for the 2 GiB fallback, not a promise about any
+particular host.** The values a node actually runs with are printed at startup:
+
+```text
+level=INFO msg="download admission capacity" mode=auto
+  budget_source="auto (cgroup limit)" memory_budget_bytes=2147483648
+  safety_margin_percent=20 max_active_per_node=16 max_active_raw=4 ...
+```
 
 These YAML and `.env` values are clean-deployment baselines. A smaller
 container automatically derives fewer capacities when cgroup discovery is
@@ -1128,9 +1137,9 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE` | `seafhttp.upload_link_max_inflight_per_node` | Non-blocking concurrent anonymous-write cap across one process/node. Default `128`; ceiling `65536`; `0` disables. This is not cluster-global; aggregate fleet capacity scales with node count. |
 | `DOWNLOAD_ADMISSION_ENABLED` | `download_admission.enabled` | Ships `true`. Disabling it removes the only aggregate bound on storage-backed downloads. |
 | `DOWNLOAD_ADMISSION_CAPACITY_MODE` | `download_admission.capacity_mode` | `auto` derives node/profile capacities from the memory budget. `manual` uses the explicit capacity fields and still validates their combined design. |
-| `DOWNLOAD_ADMISSION_MEMORY_BUDGET_PERCENT` | `download_admission.memory_budget_percent` | Auto-mode percentage of the exposed cgroup limit. Default `25`; used with the 2 GiB fallback when no cgroup limit exists. |
-| `DOWNLOAD_ADMISSION_RAW_CAPACITY_PERCENT` | `download_admission.raw_capacity_percent` | Auto-mode target share of node slots assigned to the expensive raw/iWork profile before the memory check. Default `33`; actual raw slots may be reduced to fit. |
-| `DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT` | `download_admission.safety_margin_percent` | Auto/manual memory headroom reserved outside the modeled download work. Default `20`; must leave at least one raw and one stream slot. |
+| `DOWNLOAD_ADMISSION_MEMORY_BUDGET_PERCENT` | `download_admission.memory_budget_percent` | Auto-mode percentage of the exposed cgroup limit, and the share an explicit `memory_budget_bytes` may claim of it. Default `25`, accepted range `1`-`50`; used with the 2 GiB fallback when no cgroup limit exists. |
+| `DOWNLOAD_ADMISSION_RAW_CAPACITY_PERCENT` | `download_admission.raw_capacity_percent` | Auto-mode target share of node slots assigned to the expensive raw/iWork profile. Default `33`, range `1`-`99`. The achieved share is allowed to fall to three quarters of the request so the integer split lands; a smaller share buys more stream slots, a larger one reserves more raw slots and lowers the node total. |
+| `DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT` | `download_admission.safety_margin_percent` | Memory headroom reserved outside the modeled download work, applied identically by auto derivation and by the final validation. Default `20`, range `0`-`99`; must leave at least one raw and one stream slot. |
 | `DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES` | `download_admission.memory_budget_bytes` | Process-local configured download-memory design budget, not an OS reservation. Auto fallback `2147483648` (2 GiB); explicit values override cgroup derivation. Must be `1` to `1099511627776`; values above 25% of an exposed cgroup limit are rejected. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE` | `download_admission.max_active_per_node` | Manual-mode process-local aggregate cap. Auto mode derives it from budget and costs, with an absolute 64-slot ceiling. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER` | `download_admission.max_active_per_auth_user` | Manual-mode authenticated `(org, user)` cap. Auto mode derives a bounded fairness cap from the node ceiling. |

@@ -24,7 +24,7 @@ import (
 // Run deliberately:
 //
 //	docker compose --profile test run --rm --build --entrypoint sh go-integration-test \
-//	  -c 'export PATH=$PATH:/usr/local/go/bin && SESAMEFS_DOWNLOAD_MEMORY_PROBE=1 \
+//	  -c 'export PATH=$PATH:/usr/local/go/bin && SESAMEFS_DOWNLOAD_PROBE=1 SESAMEFS_DOWNLOAD_MEMORY_PROBE=1 \
 //	      go test -tags integration -run TestDownloadAdmissionMemoryUnderSaturation -v -count=1 ./internal/integration/'
 func TestDownloadAdmissionMemoryUnderSaturation(t *testing.T) {
 	if os.Getenv("SESAMEFS_DOWNLOAD_MEMORY_PROBE") != "1" {
@@ -123,7 +123,18 @@ func TestDownloadAdmissionMemoryUnderSaturation(t *testing.T) {
 		}
 		budget = parsed
 	}
-	limit := budget * config.DownloadAdmissionMemorySafetyNumerator / config.DownloadAdmissionMemorySafetyDenominator
+	// Same margin the server applied when it derived these capacities; the
+	// constants that used to hardcode it here are gone precisely because two
+	// copies of one margin disagreed.
+	margin := config.DefaultDownloadAdmissionSafetyMarginPercent
+	if value := strings.TrimSpace(os.Getenv("DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT")); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 || parsed >= 100 {
+			t.Fatalf("DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT = %q: %v", value, err)
+		}
+		margin = parsed
+	}
+	limit := budget / 100 * int64(100-margin)
 	t.Logf("download memory probe: active=%d rss_delta=%d heap_delta=%d cgroup_delta=%d cgroup_available=%t safety_adjusted_budget=%d", nodeCap, peakRSS, peakHeap, peakCgroup, samples[len(samples)-1].cgroupAvailable, limit)
 	if peakRSS > limit || peakHeap > limit || (peakCgroup > 0 && peakCgroup > limit) {
 		t.Fatalf("real download memory peak exceeded safety-adjusted budget %d: rss=%d heap=%d cgroup=%d", limit, peakRSS, peakHeap, peakCgroup)

@@ -2,6 +2,54 @@ package config
 
 import "testing"
 
+// withCgroupMemoryLimit pins the detected limit for one test. Anything that
+// exercises auto capacity is otherwise a function of the runner's own cgroup.
+func withCgroupMemoryLimit(t *testing.T, limit int64, ok bool) {
+	t.Helper()
+	previous := cgroupMemoryLimit
+	cgroupMemoryLimit = func() (int64, bool) { return limit, ok }
+	t.Cleanup(func() { cgroupMemoryLimit = previous })
+}
+
+func TestAutoCapacityUsesTheDetectedCgroupLimit(t *testing.T) {
+	withCgroupMemoryLimit(t, 8*1024*1024*1024, true)
+
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("auto capacity under an 8 GiB limit: %v", err)
+	}
+	// 25% of 8 GiB is the same 2 GiB the fallback uses, so the shipped baseline
+	// is what a detected limit of that size derives too.
+	if got := cfg.DownloadAdmission.MemoryBudgetBytes; got != 2*1024*1024*1024 {
+		t.Fatalf("derived budget = %d, want 25%% of the 8 GiB limit", got)
+	}
+	if cfg.DownloadAdmission.MaxActivePerNode != 16 || cfg.DownloadAdmission.MaxActiveRaw != 4 {
+		t.Fatalf("derived capacities = node %d/raw %d, want 16/4",
+			cfg.DownloadAdmission.MaxActivePerNode, cfg.DownloadAdmission.MaxActiveRaw)
+	}
+}
+
+// TestAutoCapacityScalesWithTheDetectedLimit is the property the whole feature
+// exists for, and the reason the shipped YAML numbers are a reference rather
+// than the truth: a bigger container derives a bigger ceiling.
+func TestAutoCapacityScalesWithTheDetectedLimit(t *testing.T) {
+	var previous int
+	for _, limit := range []int64{4, 8, 16} {
+		withCgroupMemoryLimit(t, limit*1024*1024*1024, true)
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("%d GiB limit: %v", limit, err)
+		}
+		got := cfg.DownloadAdmission.MaxActivePerNode
+		if got <= previous {
+			t.Fatalf("%d GiB limit derived node cap %d, not more than the smaller container's %d", limit, got, previous)
+		}
+		previous = got
+	}
+}
+
 func TestParseCgroupMemoryLimit(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

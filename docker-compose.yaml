@@ -18,6 +18,10 @@ services:
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
       - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      # Pin the download-admission budget so the derived node ceiling is the
+      # same on every machine. Auto mode would otherwise size it from this
+      # host's cgroup limit, and the D6 drills assert an exact ceiling.
+      - DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES=${DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES:-2147483648}
       - OIDC_ENABLED=${OIDC_ENABLED:-false}
       - OIDC_ISSUER=${OIDC_ISSUER}
       - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
@@ -72,6 +76,10 @@ services:
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
       - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      # Pin the download-admission budget so the derived node ceiling is the
+      # same on every machine. Auto mode would otherwise size it from this
+      # host's cgroup limit, and the D6 drills assert an exact ceiling.
+      - DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES=${DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES:-2147483648}
       - OIDC_ENABLED=${OIDC_ENABLED:-false}
       - OIDC_ISSUER=${OIDC_ISSUER}
       - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
@@ -128,6 +136,10 @@ services:
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
       - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      # Pin the download-admission budget so the derived node ceiling is the
+      # same on every machine. Auto mode would otherwise size it from this
+      # host's cgroup limit, and the D6 drills assert an exact ceiling.
+      - DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES=${DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES:-2147483648}
       - OIDC_ENABLED=${OIDC_ENABLED:-false}
       - OIDC_ISSUER=${OIDC_ISSUER}
       - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}

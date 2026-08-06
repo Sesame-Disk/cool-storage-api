@@ -189,13 +189,26 @@ first_file=$(curl -s "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/dir/?p=/" \
 
 case "${HOLDER_COUNT}" in
   6) ;;
-  *) fail "HOLDER_COUNT must stay 6: the shipped per-user download cap is 6, and extra holders would create false rejections" ;;
+  *) fail "HOLDER_COUNT must stay 6: it fills max_active_per_auth_user exactly, and extra holders would create false rejections" ;;
 esac
 
 active_before=$(metric_sum 'download_admission_active_current') \
   || fail "could not scrape active admissions before the holders"
 [ "${active_before}" -eq 0 ] \
   || fail "download probe node is not idle before the holders: active_current=${active_before}"
+
+# The holders take the `file` profile, not `raw`. Auto capacity sizes raw for the
+# iWork preview cost, so the raw profile cap is a small fraction of the node
+# ceiling — 4 at the shipped baseline — and six holders on /repo/<id>/raw/ would
+# have two refused by profile_full and never reach six active. The identity gate
+# is what this drill needs saturated, so the holders use a download token, whose
+# profile cap is comfortably above six.
+download_link=$(curl -s "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/file/?p=/${first_file}" \
+  -H "Authorization: Token ${DEV_API_TOKEN}" | tr -d '"')
+case "${download_link}" in
+  http*) ;;
+  *) fail "could not obtain a download link for ${first_file}: ${download_link}" ;;
+esac
 
 # Saturate exactly the per-user budget for a bounded window. Extra holders would
 # reject before seaf-cli starts and make the evidence impossible to attribute.
@@ -205,7 +218,7 @@ for _ in $(seq 1 "${HOLDER_COUNT}"); do
     --limit-rate "${HOLDER_RATE}" --max-time "${HOLDER_SECONDS}" \
     -H "Authorization: Token ${DEV_API_TOKEN}" \
     -H 'Accept-Encoding: identity' \
-    "${SESAMEFS_URL_LOCAL}/repo/${repo_id}/raw/${first_file}" &
+    "${download_link}" &
 done
 
 wait_for_active "${HOLDER_COUNT}" 30

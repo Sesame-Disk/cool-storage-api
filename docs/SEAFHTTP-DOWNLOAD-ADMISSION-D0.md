@@ -1148,7 +1148,7 @@ a raw stream.
 | 11 | `scripts/fault-inject-download-admission.sh` — the follow-up drill records 33 retryable `profile="block"` refusals, summing the six reasons a saturated node can answer with (`admission_timeout`, `auth_user_full`, `node_full`, `profile_full`, `auth_user_queue_full`, `node_queue_full`) and excluding `client_gone`; it proves HTTP 503 with `Retry-After: 10`, and real `seaf-cli` reaches `synchronized`, pulls every file and drains every slot |
 | 12 | Measurements above; egress measured at 356 MiB/s single and 1699 MiB/s aggregate six-way (**4.9×**), re-measured on a rebuilt stack at 350 and 1788 MiB/s (**5.1×**). The residual is the near-linear relationship, which reproduced; the absolute rates are per-run |
 | 13 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` remains open and is not treated as closed by D |
-| 14 | `TestShippedConfigs*` load every shipped configuration through the real validator, including auto-derived capacities and the safety-adjusted memory invariant; `TestDownloadAdmissionMemoryUnderSaturation` is the opt-in real-node RSS/heap/cgroup probe |
+| 14 | `TestShippedConfigs*` load every shipped configuration through the real validator, including auto-derived capacities and the safety-adjusted memory invariant; `TestDownloadAdmissionMemoryUnderSaturation` is an opt-in real-node RSS/heap/cgroup probe. It holds ordinary raw streams rather than buffered iWork previews, so it does **not** reproduce the modelled worst case; the per-admission benchmarks remain the source for that, and no figure from this probe is recorded here yet |
 
 ### What the measurements are not
 
@@ -1204,7 +1204,7 @@ deployment for token issuance.
 | D3 | Writer lifetime, idle-write deadline and gzip/writer reachability strategy | Merged in `main`; lifecycle and frontend-config regressions exercise writer safety before broad admission activation. D6 owns the real nginx slow-client drill. |
 | D4 | Integrate file, ZIP, raw, history, share raw and inline text producers | Complete: one bootstrapped coordinator covers all listed non-block producers through preparation and response lifetime |
 | D5 | Stream sync block GET through existing canonical reader APIs | Complete: `SyncHandler.GetBlock` uses `GetBlockSize`/`GetBlockReader` under `ProfileBlock` on the shared coordinator; neither the canonical nor the legacy no-metadata path materializes the whole block; traffic uses bytes written |
-| D6 | Fault evidence, client recovery, measurements and final closure docs | **Complete (follow-up verified 2026-08-04).** Per-admission cost measured, auto capacities derived from the effective budget with 20% safety headroom, shipped configs enabled, and the reason-filtered client/proxy/saturation evidence produced. The opt-in full-lifetime memory probe covers the real process RSS/heap/cgroup delta. See **D6 Evidence** above |
+| D6 | Fault evidence, client recovery, measurements and final closure docs | **Complete (follow-up verified 2026-08-04).** Per-admission cost measured, auto capacities derived from the effective budget with 20% safety headroom, shipped configs enabled, and the reason-filtered client/proxy/saturation evidence produced. An opt-in probe measures the real process RSS/heap/cgroup delta under saturation; it exercises ordinary raw streams, not the iWork worst case, and its output is not yet recorded as a closure figure. See **D6 Evidence** above |
 
 The B/C `syncAdmissionLimiter` remains in `internal/api` during this series.
 Its white-box tests inspect unexported state, so extracting it to
@@ -1225,7 +1225,7 @@ docker compose --profile test run --rm --build \
   ./internal/api/... ./internal/api/v2/... ./internal/streaming/... ./internal/config/...
 docker compose --profile test run --rm --build go-integration-test
 docker compose --profile test run --rm --build --entrypoint sh go-integration-test \
-  -c 'export PATH=$PATH:/usr/local/go/bin && SESAMEFS_DOWNLOAD_MEMORY_PROBE=1 \
+  -c 'export PATH=$PATH:/usr/local/go/bin && SESAMEFS_DOWNLOAD_PROBE=1 SESAMEFS_DOWNLOAD_MEMORY_PROBE=1 \
       go test -tags integration -run TestDownloadAdmissionMemoryUnderSaturation -v -count=1 ./internal/integration/'
 docker compose --profile test run --rm --build sync-test
 docker compose --profile test run --rm --build go-all-test
