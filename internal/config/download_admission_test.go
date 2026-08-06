@@ -267,12 +267,16 @@ func TestDownloadAdmissionMemoryBudgetBoundaries(t *testing.T) {
 			wantString: "memory design",
 		},
 		{
+			// The guard names the offending key rather than letting the sum wrap
+			// and reporting a raw-slot cost that looks affordable. Without it the
+			// addition overflows negative, the preview term loses to the iWork
+			// term, and the whole design passes at the shipped values.
 			name: "preview output overflow cannot wrap the budget",
 			modify: func(cfg *Config) {
 				cfg.FileView.MaxIWorkPreviewBytes = int64(^uint64(0) >> 1)
 			},
 			wantErr:    true,
-			wantString: "raw-slot cost",
+			wantString: "max_iwork_preview_bytes=9223372036854775807 overflows",
 		},
 		{
 			name: "plaintext stream floor applies when block is tiny",
