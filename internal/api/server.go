@@ -307,6 +307,15 @@ func (s *Server) initializeDownloadAdmissionCoordinator() {
 	if err != nil {
 		panic(fmt.Errorf("initialize download admission coordinator: %w", err))
 	}
+	// The coordinator only receives the section, so the provenance of the budget
+	// it was sized from is published here, where the whole config is in hand.
+	for _, source := range []string{"configured", "cgroup", "fallback"} {
+		value := 0.0
+		if source == s.config.DownloadBudgetSource() {
+			value = 1
+		}
+		metrics.DownloadAdmissionBudgetSource.WithLabelValues(source).Set(value)
+	}
 	s.downloadAdmission = coordinator
 }
 

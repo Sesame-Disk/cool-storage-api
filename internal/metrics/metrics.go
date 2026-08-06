@@ -841,10 +841,34 @@ var (
 		},
 		[]string{"setting"},
 	)
+	// DownloadAdmissionBudgetSource says where the active budget came from:
+	// "configured", "cgroup" or "fallback". The capacities alone cannot tell
+	// those apart — an explicit budget the size of the derived one produces
+	// identical numbers — so a check that the container limit was actually read
+	// has to read this.
+	DownloadAdmissionBudgetSource = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "download_admission_budget_source",
+			Help: "Provenance of the active download memory budget; 1 for the source in effect.",
+		},
+		[]string{"source"},
+	)
 	DownloadAdmissionMemoryBudgetBytes = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "download_admission_memory_budget_bytes",
 			Help: "Configured or derived process-local memory design budget for admitted downloads.",
+		},
+	)
+	// DownloadAdmissionMemoryBudgetEffectiveBytes is the budget after the safety
+	// margin — the figure the capacities were actually sized against, and the one
+	// a real-memory probe has to compare its peak with. Exported rather than left
+	// to the reader to recompute, because reconstructing it means knowing both
+	// the budget and the margin, and a probe that guesses either measures against
+	// the wrong ceiling.
+	DownloadAdmissionMemoryBudgetEffectiveBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "download_admission_memory_budget_effective_bytes",
+			Help: "Download memory design budget after the configured safety margin.",
 		},
 	)
 	DownloadAdmissionRejectedTotal = prometheus.NewCounterVec(
@@ -1013,7 +1037,9 @@ func Register() {
 		DownloadAdmissionWaitersByGate,
 		DownloadAdmissionTrackedIdentities,
 		DownloadAdmissionCapacity,
+		DownloadAdmissionBudgetSource,
 		DownloadAdmissionMemoryBudgetBytes,
+		DownloadAdmissionMemoryBudgetEffectiveBytes,
 		DownloadAdmissionRejectedTotal,
 		DownloadAdmissionRejectedByProfileTotal,
 		DownloadAdmissionReleasedTotal,

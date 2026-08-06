@@ -723,9 +723,24 @@ func publishCapacityMetrics(cfg config.DownloadAdmissionConfig) {
 			metrics.DownloadAdmissionCapacity.WithLabelValues(setting).Set(0)
 		}
 		metrics.DownloadAdmissionMemoryBudgetBytes.Set(0)
+		metrics.DownloadAdmissionMemoryBudgetEffectiveBytes.Set(0)
 		return
 	}
-	for setting, value := range map[string]int{
+	for setting, value := range publishedCapacitySettings(cfg) {
+		metrics.DownloadAdmissionCapacity.WithLabelValues(setting).Set(float64(value))
+	}
+	metrics.DownloadAdmissionMemoryBudgetBytes.Set(float64(cfg.MemoryBudgetBytes))
+	margin := cfg.SafetyMarginPercent
+	if margin < 0 || margin >= 100 {
+		margin = 0
+	}
+	metrics.DownloadAdmissionMemoryBudgetEffectiveBytes.Set(float64(cfg.MemoryBudgetBytes / 100 * int64(100-margin)))
+}
+
+// publishedCapacitySettings is the single description of which capacities are
+// exported, so the live and zeroing paths cannot drift apart.
+func publishedCapacitySettings(cfg config.DownloadAdmissionConfig) map[string]int {
+	return map[string]int{
 		"max_active_per_node":        cfg.MaxActivePerNode,
 		"max_active_per_auth_user":   cfg.MaxActivePerAuthUser,
 		"max_active_per_link_source": cfg.MaxActivePerLinkSource,
@@ -739,10 +754,7 @@ func publishCapacityMetrics(cfg config.DownloadAdmissionConfig) {
 		"max_active_link_raw":        cfg.MaxActiveLinkRaw,
 		"max_active_zip":             cfg.MaxActiveZIP,
 		"max_active_link_inline":     cfg.MaxActiveLinkInline,
-	} {
-		metrics.DownloadAdmissionCapacity.WithLabelValues(setting).Set(float64(value))
 	}
-	metrics.DownloadAdmissionMemoryBudgetBytes.Set(float64(cfg.MemoryBudgetBytes))
 }
 
 var capacityMetricSettings = []string{

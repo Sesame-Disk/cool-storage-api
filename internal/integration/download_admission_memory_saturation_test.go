@@ -5,13 +5,10 @@ package integration
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/Sesame-Disk/sesamefs/internal/config"
 )
 
 // TestDownloadAdmissionMemoryUnderSaturation is an opt-in full-lifetime probe.
@@ -43,9 +40,18 @@ func TestDownloadAdmissionMemoryUnderSaturation(t *testing.T) {
 		}
 	}
 
+	// Everything the probe needs comes from the node. Pinning the baseline here
+	// defeated the point of discovering the capacity: on a host that derives a
+	// different ceiling this either refused to run or measured the real peak
+	// against a budget the node never used.
 	nodeCap := effectiveCapacity(t, client, "max_active_per_node")
-	if nodeCap != 16 {
-		t.Fatalf("download memory probe expects the clean auto baseline node cap 16, got %d", nodeCap)
+	perIdentity := effectiveCapacity(t, client, "max_active_per_auth_user")
+	if nodeCap <= 0 || perIdentity <= 0 {
+		t.Fatalf("node reported capacity node=%d per-identity=%d", nodeCap, perIdentity)
+	}
+	if fillable := len(clients) * perIdentity; fillable < nodeCap {
+		t.Skipf("this fixture can hold %d admissions but the node derived a ceiling of %d; "+
+			"the probe measures a full node or nothing", fillable, nodeCap)
 	}
 	runID := fmt.Sprintf("%d", time.Now().UTC().UnixNano())
 	repoIDs := make([]string, len(clients))
@@ -73,7 +79,7 @@ func TestDownloadAdmissionMemoryUnderSaturation(t *testing.T) {
 
 	sampler := startMemoryProbeSampler(client, 0)
 	t.Cleanup(func() { _, _ = sampler.stop() })
-	rawSlots := 4
+	rawSlots := effectiveCapacity(t, client, "max_active_raw")
 	for i := 0; i < nodeCap; i++ {
 		probeClient := clients[i%len(clients)]
 		target := fileURLs[i%len(fileURLs)]
@@ -115,26 +121,14 @@ func TestDownloadAdmissionMemoryUnderSaturation(t *testing.T) {
 		}
 	}
 
-	budget := int64(config.DefaultDownloadAdmissionMemoryBudgetBytes)
-	if value := strings.TrimSpace(os.Getenv("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES")); value != "" {
-		parsed, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || parsed <= 0 {
-			t.Fatalf("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES = %q: %v", value, err)
-		}
-		budget = parsed
+	// The safety-adjusted budget the node actually sized itself against, read
+	// from the node. Reconstructing it from a constant and an env var meant
+	// guessing both the budget and the margin, and either guess measures the
+	// real peak against a ceiling the process never used.
+	limit := int64(scrapeDownloadMetric(t, client, "download_admission_memory_budget_effective_bytes", ""))
+	if limit <= 0 {
+		t.Fatalf("node reported an effective memory budget of %d", limit)
 	}
-	// Same margin the server applied when it derived these capacities; the
-	// constants that used to hardcode it here are gone precisely because two
-	// copies of one margin disagreed.
-	margin := config.DefaultDownloadAdmissionSafetyMarginPercent
-	if value := strings.TrimSpace(os.Getenv("DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT")); value != "" {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 0 || parsed >= 100 {
-			t.Fatalf("DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT = %q: %v", value, err)
-		}
-		margin = parsed
-	}
-	limit := budget / 100 * int64(100-margin)
 	t.Logf("download memory probe: active=%d rss_delta=%d heap_delta=%d cgroup_delta=%d cgroup_available=%t safety_adjusted_budget=%d", nodeCap, peakRSS, peakHeap, peakCgroup, samples[len(samples)-1].cgroupAvailable, limit)
 	if peakRSS > limit || peakHeap > limit || (peakCgroup > 0 && peakCgroup > limit) {
 		t.Fatalf("real download memory peak exceeded safety-adjusted budget %d: rss=%d heap=%d cgroup=%d", limit, peakRSS, peakHeap, peakCgroup)

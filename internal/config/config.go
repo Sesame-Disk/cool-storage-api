@@ -38,6 +38,11 @@ type Config struct {
 	// downloadBudgetSource records where the active budget came from, so the
 	// startup line can say whether a number was configured or derived.
 	downloadBudgetSource string
+	// downloadBudgetSourceKind is the same fact as a fixed enum, for the metric
+	// and for tests. A drill that claims the cgroup limit was read cannot prove
+	// it from the resulting numbers: an explicit budget of the same size is
+	// indistinguishable. This is what makes that claim checkable.
+	downloadBudgetSourceKind string
 }
 
 // WebUploadsConfig holds browser upload behavior exposed to the web frontend.
@@ -2302,6 +2307,15 @@ func (c *Config) logDownloadAdmissionCapacity() {
 	)
 }
 
+// DownloadBudgetSource reports where the active download memory budget came
+// from: "configured", "cgroup" or "fallback". Empty before Validate() resolves.
+func (c *Config) DownloadBudgetSource() string {
+	if c == nil {
+		return ""
+	}
+	return c.downloadBudgetSourceKind
+}
+
 func (c *Config) resolveDownloadAdmissionCapacity() error {
 	if c == nil {
 		return nil
@@ -2353,6 +2367,7 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 
 	if d.MemoryBudgetBytes > 0 {
 		c.downloadBudgetSource = "configured explicitly"
+		c.downloadBudgetSourceKind = "configured"
 	} else {
 		if limit, ok := cgroupMemoryLimit(); ok {
 			budget, ok := checkedNonNegativeMultiply(limit, int64(d.MemoryBudgetPercent))
@@ -2361,9 +2376,11 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 			}
 			d.MemoryBudgetBytes = budget / 100
 			c.downloadBudgetSource = fmt.Sprintf("%d%% of the detected cgroup limit %d", d.MemoryBudgetPercent, limit)
+			c.downloadBudgetSourceKind = "cgroup"
 		} else {
 			d.MemoryBudgetBytes = DefaultDownloadAdmissionMemoryBudgetBytes
 			c.downloadBudgetSource = "no cgroup limit detected, reference fallback"
+			c.downloadBudgetSourceKind = "fallback"
 		}
 	}
 	if err := validateDownloadAdmissionMemoryBudgetValue(d.MemoryBudgetBytes); err != nil {

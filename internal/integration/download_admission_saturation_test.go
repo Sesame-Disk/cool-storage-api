@@ -165,11 +165,13 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 	// The shipped admission_wait is non-zero, so a full-node request may be
 	// observed as node_full (immediate) or admission_timeout (bounded queue).
 	//
-	// Only meaningful once the node is genuinely full: below the ceiling the
-	// probe would simply be admitted, so asserting a refusal there would be
-	// asserting the wrong thing rather than a weaker version of the right one.
+	// The contract is the same whichever gate closes, so it stays covered even
+	// when the fixture cannot reach the node ceiling: every identity is at its
+	// own cap, so one more request from one of them is refused. Skipping here
+	// instead would have left a 32- or 64-slot node with no 503 + Retry-After
+	// evidence at all.
 	if !ceilingReachable {
-		t.Log("skipping the full-node refusal contract: this fixture cannot fill the derived ceiling")
+		assertSaturatedIdentityIsRefused(t, clients[0], rawURLs[0])
 		return
 	}
 	beforeNodeFull := scrapeDownloadMetric(t, client, "download_admission_rejected_total", `reason="node_full"`)
@@ -199,6 +201,36 @@ func effectiveCapacity(t *testing.T, c *testClient, setting string) int {
 	t.Helper()
 	value := scrapeDownloadMetric(t, c, "download_admission_capacity", fmt.Sprintf("setting=%q", setting))
 	return int(value)
+}
+
+// assertSaturatedIdentityIsRefused covers criterion 8 from the identity gate
+// rather than the node gate. It is the same refusal contract — 503 with a
+// usable Retry-After — reached by the only gate a fixed set of identities can
+// always fill.
+func assertSaturatedIdentityIsRefused(t *testing.T, c *testClient, target string) {
+	t.Helper()
+
+	before := scrapeDownloadMetric(t, c, "download_admission_rejected_total", `reason="auth_user_full"`)
+	beforeQueue := scrapeDownloadMetric(t, c, "download_admission_rejected_total", `reason="auth_user_queue_full"`)
+	beforeTimeout := scrapeDownloadMetric(t, c, "download_admission_rejected_total", `reason="admission_timeout"`)
+
+	status, retryAfter := probeDownload(t, c, target)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("reader at a saturated identity = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+	seconds, err := strconv.Atoi(strings.TrimSpace(retryAfter))
+	if err != nil || seconds < 1 {
+		t.Fatalf("refusal carried Retry-After %q; must be a positive integer number of seconds", retryAfter)
+	}
+
+	after := scrapeDownloadMetric(t, c, "download_admission_rejected_total", `reason="auth_user_full"`)
+	afterQueue := scrapeDownloadMetric(t, c, "download_admission_rejected_total", `reason="auth_user_queue_full"`)
+	afterTimeout := scrapeDownloadMetric(t, c, "download_admission_rejected_total", `reason="admission_timeout"`)
+	if after <= before && afterQueue <= beforeQueue && afterTimeout <= beforeTimeout {
+		t.Fatalf("refusal was not attributed to the saturated identity: full %.0f->%.0f queue %.0f->%.0f timeout %.0f->%.0f",
+			before, after, beforeQueue, afterQueue, beforeTimeout, afterTimeout)
+	}
+	t.Logf("saturated identity refused with 503 and Retry-After %ss", retryAfter)
 }
 
 // holdDownloadSlot takes an admission and then stops reading, which is what a

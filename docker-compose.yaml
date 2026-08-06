@@ -214,7 +214,27 @@ services:
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
       - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      # Pinned, not inherited. env_file could otherwise hand this node an
+      # explicit budget, and a derived budget is indistinguishable from a
+      # configured one of the same size -- the assertion would pass while the
+      # cgroup branch never ran. memory_budget_bytes=0 is what forces the
+      # derivation; the rest fix every input the expected numbers depend on.
+      - DOWNLOAD_ADMISSION_ENABLED=true
+      - DOWNLOAD_ADMISSION_CAPACITY_MODE=auto
+      - DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES=0
+      - DOWNLOAD_ADMISSION_MEMORY_BUDGET_PERCENT=25
+      - DOWNLOAD_ADMISSION_RAW_CAPACITY_PERCENT=33
+      - DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT=20
+      - SEAFHTTP_SYNC_BLOCK_MAX_BYTES=16777216
+      - FILEVIEW_MAX_IWORK_SOURCE_BYTES=33554432
+      - FILEVIEW_MAX_IWORK_PREVIEW_BYTES=52428800
     mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 10s
     depends_on:
       cassandra:
         condition: service_healthy
@@ -510,10 +530,11 @@ services:
       # the real proxy rather than straight at Go. A backend-only test cannot
       # show that the client is the one controlling admission lifetime.
       - SESAMEFS_PROXY_URL=http://frontend:80
-      # Optional: the cgroup-limited node, so the auto-capacity derivation can
-      # be checked against a real container limit. Start it with
-      # `--profile test up -d sesamefs-cgroup-probe`; the test skips without it.
-      - SESAMEFS_CGROUP_PROBE_URL=${SESAMEFS_CGROUP_PROBE_URL:-http://sesamefs-cgroup-probe:8080}
+      # Empty by default so the cgroup test really is optional: with a default
+      # here it would never skip, and a broad -run TestDownloadAdmission would
+      # fail on connection refused whenever the probe service is not running.
+      # The documented command passes it explicitly.
+      - SESAMEFS_CGROUP_PROBE_URL=${SESAMEFS_CGROUP_PROBE_URL:-}
     depends_on:
       - sesamefs
       - sesamefs-node-2
