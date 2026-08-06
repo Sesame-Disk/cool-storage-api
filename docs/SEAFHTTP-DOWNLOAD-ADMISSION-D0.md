@@ -1,7 +1,7 @@
 # B4 Subcontract D — Download Admission Contract
 
 **Date:** 2026-08-01 (original contract freeze)  
-**Last updated:** 2026-08-04
+**Last updated:** 2026-08-06
 **Branch:** `feat/b4-subcontract-d6-closure`
 **Status:** **D0-D6 are complete.** D1 supplied the coordinator, configuration
 and metrics; D2 the stable public download-token `SourceID`; D3 the writer
@@ -63,21 +63,25 @@ also in `DefaultConfig()`, so an older YAML file that omits the section inherits
 protection during an upgrade. An explicit `download_admission.enabled: false`
 remains the only opt-out.
 
-Inheritance does not reach a file that already carries the section, which is the
-config this project shipped for D1-D5. That placeholder is therefore refused at
-startup rather than migrated: it was never an operator decision — this section
-reserved it for D6 to replace — but rewriting an explicit `enabled: false`
-because the surrounding values happen to be zero would make the loader
-unpredictable in a worse way.
+`Load()` overlays YAML on `DefaultConfig()` field by field, including when the
+section is present. Omitted keys inside `download_admission` therefore retain
+the D6 defaults. The config this project shipped for D1-D5 is different: that
+placeholder explicitly pinned every field to zero, so it is refused at startup
+rather than migrated. It was never an operator decision — this section reserved
+it for D6 to replace — but rewriting an explicit `enabled: false` because the
+surrounding values happen to be zero would make the loader unpredictable in a
+worse way.
 
 The refusal keys on **completeness, not on the historical fingerprint**:
-`enabled: false` is supported only when the values behind it would validate if
-the section were switched on. An exact-shape test would stop matching after one
+`enabled: false` is supported when the effective values pass the section's
+structural rules if the guard were switched on. The combined memory budget is
+deliberately checked only while enabled because it includes values owned by the
+sync and preview subsystems. An exact-shape test would stop matching after one
 `DOWNLOAD_ADMISSION_*` override against the old YAML while the deployment stayed
-just as unbounded, and completeness is the rule the refusal message already
-states. `server.write_timeout` is excluded, since it conflicts only with an
-active guard. The check runs after environment overrides, so a deployment
-already repaired through `DOWNLOAD_ADMISSION_*` is unaffected.
+just as unbounded, and completeness is the rule the refusal message states.
+`server.write_timeout` is excluded, since it conflicts only with an active guard.
+The check runs after environment overrides, so a deployment already repaired
+through `DOWNLOAD_ADMISSION_*` is unaffected.
 
 ### D coordinator ownership
 
@@ -863,6 +867,7 @@ download_admission:
   # a legacy YAML file that omits this section remains protected on upgrade.
   # Set enabled: false explicitly only when admission is intentionally disabled.
   enabled: true
+  memory_budget_bytes: 2147483648 # 2 GiB; about 25% of an 8 GiB container limit
   max_active_per_node: 18
   max_active_per_auth_user: 6
   max_active_per_link_source: 6
@@ -1105,10 +1110,15 @@ schema nor the metric label set. Sizing `max_active_raw` for iWork instead would
 have throttled ordinary raw streams — 4 MiB each — by two orders of magnitude.
 
 Worst case under the shipped caps: `6 x 192 MiB + 12 x 72 MiB = 2016 MiB`
-(`~1.97 GiB`), below the stated 2 GiB process-local budget.
+(`~1.97 GiB`), below the default 2 GiB process-local budget. The budget is
+configurable per deployment through `memory_budget_bytes` or
+`DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES`; the 2 GiB value is a reference
+default, approximately 25% of an 8 GiB container limit, not a universal machine
+capacity.
 This is a hard startup invariant enforced by `Config.Validate()`, not an
-operator advisory. Raising the node/profile/source/block values can therefore
-make an enabled deployment refuse to boot. A zero `max_active_raw` removes the
+operator advisory. Raising the node/profile/source/block values or lowering
+the deployment budget can therefore make an enabled deployment refuse to boot.
+A zero `max_active_raw` removes the
 extra raw profile sub-cap; it does not remove the raw/iWork term, so validation
 charges all node slots at that worst-case cost. `max_active_block` remains a
 profile sub-cap and cannot exceed the node cap. Overrides use the maximum of the

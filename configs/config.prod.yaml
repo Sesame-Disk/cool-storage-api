@@ -510,6 +510,7 @@ download_admission:
   # Worst case under these caps: 6*192 MiB + 12*72 MiB = 2016 MiB (~1.97 GiB).
   # Process-local: fleet capacity scales with node count, this is not a cluster quota.
   enabled: true
+  memory_budget_bytes: 2147483648 # 2 GiB; set to about 25% of this container's memory limit
   max_active_per_node: 18
   max_active_per_auth_user: 6
   max_active_per_link_source: 6

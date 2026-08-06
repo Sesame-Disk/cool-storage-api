@@ -548,6 +548,7 @@ type DownloadAdmissionConfig struct {
 	MaxActiveLinkRaw       int           `yaml:"max_active_link_raw"`
 	MaxActiveZIP           int           `yaml:"max_active_zip"`
 	MaxActiveLinkInline    int           `yaml:"max_active_link_inline"`
+	MemoryBudgetBytes      int64         `yaml:"memory_budget_bytes"`
 }
 
 // SeafHTTPConfig holds Seafile-compatible file transfer settings
@@ -1348,6 +1349,7 @@ func defaultDownloadAdmissionConfig() DownloadAdmissionConfig {
 		MaxActiveLinkRaw:       12,
 		MaxActiveZIP:           4,
 		MaxActiveLinkInline:    8,
+		MemoryBudgetBytes:      DefaultDownloadAdmissionMemoryBudgetBytes,
 	}
 }
 
@@ -1562,7 +1564,7 @@ func (c *Config) applyEnvOverrides() {
 		c.Server.DesktopCustomLogo = strings.TrimSpace(v)
 	}
 
-	// Download admission (D1 schema; shipped disabled until D6 measurement)
+	// Download admission
 	if v := os.Getenv("DOWNLOAD_ADMISSION_ENABLED"); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "true", "1":
@@ -1616,6 +1618,14 @@ func (c *Config) applyEnvOverrides() {
 			} else {
 				*override.target = d
 			}
+		}
+	}
+	if v := os.Getenv("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES"); v != "" {
+		budget, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			c.addEnvOverrideError("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES is invalid: %v", err)
+		} else {
+			c.DownloadAdmission.MemoryBudgetBytes = budget
 		}
 	}
 
@@ -2221,13 +2231,15 @@ func (c *Config) validateDownloadAdmissionBounds() error {
 	return c.validateDownloadAdmissionMemoryBudget()
 }
 
-// rejectIncompleteDisabledDownloadAdmission holds `enabled: false` to one rule:
-// the values behind it must be ones the guard could actually run on.
+// rejectIncompleteDisabledDownloadAdmission holds `enabled: false` to the
+// section's structural rules. The effective values must satisfy the checks that
+// do not depend on the active download memory budget.
 //
 // Nothing validates a disabled section otherwise, so `enabled: false` with zero
 // or half-written caps is accepted today and only fails the day someone flips it
 // to true — during an incident, which is when the flip gets made. Failing when
-// the section is written moves that discovery to the edit that caused it.
+// the section is written moves that structural discovery to the edit that caused
+// it.
 //
 // It is a cheap guard rather than a load-bearing one: every shipped
 // configuration is enabled and complete, and a file that omits the section
@@ -2248,8 +2260,9 @@ func (c *Config) validateDownloadAdmissionBounds() error {
 // and it preempts those subsystems' more precise errors. With the section off
 // there is no slot count for a budget to apply to.
 //
-// So this catches an unusable *section*, not an unusable *design*. A cap that
-// is structurally fine but overshoots the budget is still refused, at the flip.
+// So this catches an incomplete *section*, not an unsafe *design*. A section
+// that is structurally complete but overshoots the combined memory budget is
+// accepted while disabled and refused when enabled.
 //
 // server.write_timeout is excluded for the same shape of reason: it conflicts
 // only with an active guard.
@@ -2264,8 +2277,8 @@ func (c *Config) rejectIncompleteDisabledDownloadAdmission() error {
 	candidate := c.DownloadAdmission
 	candidate.Enabled = true
 	if err := validateDownloadAdmissionConfig(candidate, 0); err != nil {
-		return fmt.Errorf("download_admission is disabled with a configuration that could not be enabled as written: "+
-			"remove the section to inherit the measured defaults, or keep enabled: false alongside a complete set of values (%w)", err)
+		return fmt.Errorf("download_admission is disabled with a structurally incomplete configuration: "+
+			"remove the section to inherit the measured defaults, or keep enabled: false alongside complete structural values (%w)", err)
 	}
 	return nil
 }
@@ -2285,6 +2298,10 @@ func (c *Config) validateDownloadAdmissionMemoryBudget() error {
 	if c.FileView.MaxIWorkPreviewBytes < 0 {
 		return fmt.Errorf("fileview.max_iwork_preview_bytes must not be negative")
 	}
+	budget := c.DownloadAdmission.MemoryBudgetBytes
+	if budget <= 0 {
+		return fmt.Errorf("download_admission.memory_budget_bytes must be greater than zero when download_admission.enabled is true")
+	}
 	// SyncBlockMaxBytes has its own validation later in Config.Validate. Avoid
 	// masking that more precise error if it is invalid here.
 	if c.SeafHTTP.SyncBlockMaxBytes <= 0 || c.SeafHTTP.SyncBlockMaxBytes > MaxSyncBlockMaxBytes {
@@ -2295,8 +2312,8 @@ func (c *Config) validateDownloadAdmissionMemoryBudget() error {
 	if rawCap := int64(c.DownloadAdmission.MaxActiveRaw); rawCap > 0 && rawCap < rawSlots {
 		rawSlots = rawCap
 	}
-	if source > DefaultDownloadAdmissionMemoryBudgetBytes/DownloadAdmissionIWorkEncryptedPeakMultiplier {
-		return fmt.Errorf("fileview.max_iwork_source_bytes=%d is too large for the %d-byte download admission budget", source, DefaultDownloadAdmissionMemoryBudgetBytes)
+	if source > budget/DownloadAdmissionIWorkEncryptedPeakMultiplier {
+		return fmt.Errorf("fileview.max_iwork_source_bytes=%d is too large for the %d-byte download admission budget", source, budget)
 	}
 	iworkCost := source * DownloadAdmissionIWorkEncryptedPeakMultiplier
 	encryptedCost := (c.SeafHTTP.SyncBlockMaxBytes*DownloadAdmissionEncryptedPeakNumerator + DownloadAdmissionEncryptedPeakDenominator - 1) / DownloadAdmissionEncryptedPeakDenominator
@@ -2317,13 +2334,13 @@ func (c *Config) validateDownloadAdmissionMemoryBudget() error {
 	if previewCost > rawCost {
 		rawCost = previewCost
 	}
-	if rawCost > DefaultDownloadAdmissionMemoryBudgetBytes {
-		return fmt.Errorf("download admission memory design has a raw-slot cost of %d bytes, above the %d-byte budget", rawCost, DefaultDownloadAdmissionMemoryBudgetBytes)
+	if rawCost > budget {
+		return fmt.Errorf("download admission memory design has a raw-slot cost of %d bytes, above the %d-byte budget", rawCost, budget)
 	}
 	otherSlots := int64(c.DownloadAdmission.MaxActivePerNode) - rawSlots
 	total := rawSlots*rawCost + otherSlots*streamCost
-	if total > DefaultDownloadAdmissionMemoryBudgetBytes {
-		return fmt.Errorf("download admission memory design is %d bytes with %d raw slots at %d bytes and %d other slots at %d bytes; budget is %d bytes", total, rawSlots, rawCost, otherSlots, streamCost, DefaultDownloadAdmissionMemoryBudgetBytes)
+	if total > budget {
+		return fmt.Errorf("download admission memory design is %d bytes with %d raw slots at %d bytes and %d other slots at %d bytes; budget is %d bytes", total, rawSlots, rawCost, otherSlots, streamCost, budget)
 	}
 	return nil
 }

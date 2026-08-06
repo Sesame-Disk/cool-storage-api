@@ -78,22 +78,33 @@ SesameFS resolves configuration in this order:
 
 Download admission is one of the safety defaults: `DefaultConfig()` carries the
 measured D6 values, so a config file that does not pin the `download_admission`
-section still starts protected. Set `download_admission.enabled: false`
-explicitly to opt out; omission is not an implicit disable.
+section still starts protected. YAML overlays `DefaultConfig()` field by field:
+keys omitted from a present section retain those defaults. Set
+`download_admission.enabled: false` explicitly to opt out; omission is not an
+implicit disable.
 
-A section that **is** present gets no such inheritance, so a disabled one is held
-to a rule: **`enabled: false` is a supported opt-out only when the values behind
-it would work if it were switched on.** Nothing else validates a disabled
-section, so without this a half-written one is accepted now and fails the day
-someone flips it to `true` — which is usually during an incident. The rule is
-completeness rather than any fixed shape, since one `DOWNLOAD_ADMISSION_*`
-override is enough to defeat a fixed-shape check while leaving the section just
-as unusable. A server started on such a section exits with
+`download_admission.memory_budget_bytes` is the process-local memory reserve for
+admitted downloads. It is explicit rather than autodetected: set it to about
+25% of the container memory limit, leaving the other 75% for the application,
+runtime, Cassandra/S3 clients and GC. Reference values are 1 GiB for a 4 GiB
+container, 2 GiB for 8 GiB, and 4 GiB for 16 GiB. The equivalent environment
+override is `DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES`.
+
+The historical D1-D5 placeholder is different because it explicitly pins every
+field to zero. A disabled section is therefore held to a narrower rule:
+**its effective values must satisfy the section's structural validation if the
+guard were enabled.** This catches a zeroed or half-written section without
+charging it against the active 2 GiB memory design. A structurally complete
+section can still exceed that combined budget and is rejected only when enabled.
+The rule is completeness rather than any fixed shape, since one
+`DOWNLOAD_ADMISSION_*` override is enough to defeat a fixed-shape check while
+leaving the section just as unusable. A server started on such a section exits
+with
 
 ```text
-download_admission is disabled with a configuration that could not be enabled as
-written: remove the section to inherit the measured defaults, or keep
-enabled: false alongside a complete set of values (<what is missing>)
+download_admission is disabled with a structurally incomplete configuration:
+remove the section to inherit the measured defaults, or keep enabled: false
+alongside complete structural values (<what is missing>)
 ```
 
 The rule covers the section's own values only. The 2 GiB memory design is not
@@ -103,14 +114,15 @@ subsystems own and set for their own reasons — a disabled download guard must
 not stop a deployment from booting over an upload-side value. A design that
 overshoots the budget is refused when the section is enabled.
 
-Deleting the block is the upgrade path. The placeholder is not rewritten for you
-— an explicit `enabled: false` is the documented opt-out, and a configuration
-loader that overrides an explicit value because it recognises the surrounding
-numbers cannot be reasoned about. A disabled section that is merely incomplete
-gets the same refusal with a message naming the missing value instead. The check
-runs after environment overrides, so a deployment that supplies real values
-through `DOWNLOAD_ADMISSION_*` is unaffected, and `server.write_timeout` is not
-part of the test because it conflicts only with an active guard.
+Deleting the block is the upgrade path for the historical placeholder. It is not
+rewritten for you — an explicit `enabled: false` is the documented opt-out, and
+a configuration loader that overrides an explicit value because it recognises
+the surrounding numbers cannot be reasoned about. A disabled section that is
+merely incomplete gets the same refusal with a message naming the missing
+structural value instead. The check runs after environment overrides, so a
+deployment that supplies real values through `DOWNLOAD_ADMISSION_*` is
+unaffected, and `server.write_timeout` is not part of the structural test
+because it conflicts only with an active guard.
 
 That is why `configs/config.prod.yaml` can look thinner than `configs/config.docker.yaml` or a local test config:
 production only needs to pin the non-secret structural values that differ from the code defaults,
@@ -151,7 +163,10 @@ authenticated raw and history, public share raw, inline share text and sync bloc
 GET — through one process-local coordinator.
 
 The shipped capacities are measured, not guessed. D6 benchmarked the heap a
-single admitted transfer holds and divided a stated **2 GiB per-node budget**:
+single admitted transfer holds and divided the default **2 GiB per-node budget**.
+That budget is configurable per deployment with
+`download_admission.memory_budget_bytes` or
+`DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES`:
 
 | Transfer shape | Measured peak per admission |
 |---|---|
@@ -166,12 +181,12 @@ caps it at 32 MiB separately from the 1 GiB general preview limit — without th
 cap a single request could touch several gigabytes.
 
 Worst case under the shipped caps is `6 x 192 MiB + 12 x 72 MiB` = 2016 MiB
-(~1.97 GiB), below the 2 GiB process-local budget. This is a hard startup
-invariant, not advisory arithmetic: `Config.Validate()` rejects an enabled
-configuration whose computed design exceeds the budget, so changing
-`max_active_per_node`, `max_active_raw`, `max_iwork_source_bytes` or the sync
-block size can make the service refuse to boot until the complete combination
-fits again.
+(~1.97 GiB), below the default 2 GiB process-local budget. This is a hard
+startup invariant, not advisory arithmetic: `Config.Validate()` rejects an
+enabled configuration whose computed design exceeds the configured budget, so
+changing `memory_budget_bytes`, `max_active_per_node`, `max_active_raw`,
+`max_iwork_source_bytes` or the sync block size can make the service refuse to
+boot until the complete combination fits again.
 
 `max_active_raw=0` means there is no additional raw profile sub-cap; it does not
 remove raw work from the memory calculation. The validator charges all node
@@ -1078,6 +1093,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE` | `seafhttp.upload_link_max_inflight_per_source` | Non-blocking concurrent anonymous-write cap per stable public-link identity on one process. Default `16`; ceiling `4096`; `0` disables. Remints share the same source count. When both in-flight caps are enabled, this value must not exceed the per-node value. |
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE` | `seafhttp.upload_link_max_inflight_per_node` | Non-blocking concurrent anonymous-write cap across one process/node. Default `128`; ceiling `65536`; `0` disables. This is not cluster-global; aggregate fleet capacity scales with node count. |
 | `DOWNLOAD_ADMISSION_ENABLED` | `download_admission.enabled` | Ships `true`. Disabling it removes the only aggregate bound on storage-backed downloads. |
+| `DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES` | `download_admission.memory_budget_bytes` | Process-local memory reserve used by the active D6 design validator. Shipped reference `2147483648` (2 GiB, about 25% of an 8 GiB container); set per deployment. Must be positive when admission is enabled. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE` | `download_admission.max_active_per_node` | D6-selected process-local aggregate download cap. Shipped value is measured; validation ceiling `1024`. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER` | `download_admission.max_active_per_auth_user` | Authenticated `(org, user)` cap. Shipped value is measured; validation ceiling `1024`. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE` | `download_admission.max_active_per_link_source` | Stable public-link source cap. Shipped value is measured; validation ceiling `1024`. |

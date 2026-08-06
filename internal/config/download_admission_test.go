@@ -66,7 +66,7 @@ func TestZeroedDisabledDownloadAdmissionIsRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("a zeroed disabled section validated; flipping enabled: true would not start")
 	}
-	if !strings.Contains(err.Error(), "could not be enabled as written") {
+	if !strings.Contains(err.Error(), "structurally incomplete configuration") {
 		t.Fatalf("Validate() error = %q, want the incomplete-opt-out explanation", err)
 	}
 }
@@ -90,7 +90,7 @@ func TestPartiallyFilledDisabledDownloadAdmissionIsRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("a partially filled disabled section validated")
 	}
-	if !strings.Contains(err.Error(), "could not be enabled as written") {
+	if !strings.Contains(err.Error(), "structurally incomplete configuration") {
 		t.Fatalf("Validate() error = %q, want the incomplete-opt-out explanation", err)
 	}
 }
@@ -106,6 +106,22 @@ func TestDisabledDownloadAdmissionMissingOneCapIsRefused(t *testing.T) {
 
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("a disabled section with no node cap validated; flipping enabled would not start")
+	}
+}
+
+func TestDisabledDownloadAdmissionDefersMemoryBudgetUntilEnabled(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.Enabled = false
+	cfg.DownloadAdmission.MaxActivePerNode = 19
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("disabled admission unexpectedly enforced memory budget: %v", err)
+	}
+
+	cfg.DownloadAdmission.Enabled = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "memory design") {
+		t.Fatalf("enabled admission did not enforce memory budget: %v", err)
 	}
 }
 
@@ -205,6 +221,7 @@ func TestDownloadAdmissionValidation(t *testing.T) {
 		PreparationDeadline:    10 * time.Minute,
 		IdleWriteTimeout:       5 * time.Minute,
 		RetryAfter:             time.Minute,
+		MemoryBudgetBytes:      DefaultDownloadAdmissionMemoryBudgetBytes,
 	}
 	cases := []struct {
 		name       string
@@ -356,6 +373,7 @@ func d6MemoryBudgetConfig() *Config {
 		MaxActiveLinkRaw:       12,
 		MaxActiveZIP:           4,
 		MaxActiveLinkInline:    8,
+		MemoryBudgetBytes:      DefaultDownloadAdmissionMemoryBudgetBytes,
 	}
 	cfg.SeafHTTP.SyncBlockMaxBytes = DefaultSyncBlockMaxBytes
 	cfg.FileView.MaxIWorkSourceBytes = 32 * 1024 * 1024
@@ -377,6 +395,14 @@ func TestDownloadAdmissionMemoryBudgetBoundaries(t *testing.T) {
 			},
 			wantErr:    true,
 			wantString: "memory design",
+		},
+		{
+			name: "deployment budget can be raised explicitly",
+			modify: func(cfg *Config) {
+				cfg.DownloadAdmission.MaxActivePerNode = 19
+				cfg.DownloadAdmission.MemoryBudgetBytes = 3 * 1024 * 1024 * 1024
+			},
+			wantErr: false,
 		},
 		{
 			name: "32 MiB sync block exceeds budget",
@@ -474,6 +500,7 @@ func TestDownloadAdmissionEnvironmentOverrides(t *testing.T) {
 	t.Setenv("DOWNLOAD_ADMISSION_ENABLED", "true")
 	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE", "8")
 	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER", "2")
+	t.Setenv("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES", "1073741824")
 	t.Setenv("DOWNLOAD_ADMISSION_ADMISSION_WAIT", "1500ms")
 	t.Setenv("DOWNLOAD_ADMISSION_PREPARATION_DEADLINE", "10m")
 	t.Setenv("DOWNLOAD_ADMISSION_IDLE_WRITE_TIMEOUT", "5m")
@@ -482,6 +509,9 @@ func TestDownloadAdmissionEnvironmentOverrides(t *testing.T) {
 
 	if !cfg.DownloadAdmission.Enabled || cfg.DownloadAdmission.MaxActivePerNode != 8 || cfg.DownloadAdmission.MaxActivePerAuthUser != 2 {
 		t.Fatalf("active env overrides = %#v", cfg.DownloadAdmission)
+	}
+	if cfg.DownloadAdmission.MemoryBudgetBytes != 1*1024*1024*1024 {
+		t.Fatalf("memory budget env override = %d, want 1 GiB", cfg.DownloadAdmission.MemoryBudgetBytes)
 	}
 	if cfg.DownloadAdmission.AdmissionWait != 1500*time.Millisecond || cfg.DownloadAdmission.PreparationDeadline != 10*time.Minute || cfg.DownloadAdmission.IdleWriteTimeout != 5*time.Minute || cfg.DownloadAdmission.RetryAfter != time.Minute {
 		t.Fatalf("duration env overrides = %#v", cfg.DownloadAdmission)
@@ -497,9 +527,10 @@ func TestDownloadAdmissionEnvironmentOverrideErrors(t *testing.T) {
 	t.Setenv("DOWNLOAD_ADMISSION_ENABLED", "maybe")
 	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE", "not-an-int")
 	t.Setenv("DOWNLOAD_ADMISSION_RETRY_AFTER", "not-a-duration")
+	t.Setenv("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES", "not-an-int")
 	cfg.applyEnvOverrides()
-	if len(cfg.envOverrideErrors) != 3 {
-		t.Fatalf("env override errors = %v, want three errors", cfg.envOverrideErrors)
+	if len(cfg.envOverrideErrors) != 4 {
+		t.Fatalf("env override errors = %v, want four errors", cfg.envOverrideErrors)
 	}
 }
 
@@ -527,6 +558,7 @@ func TestIWorkSourceEnvironmentOverrideKeepsTheD6GuardValidated(t *testing.T) {
 				PreparationDeadline:    time.Minute,
 				IdleWriteTimeout:       time.Minute,
 				RetryAfter:             time.Second,
+				MemoryBudgetBytes:      DefaultDownloadAdmissionMemoryBudgetBytes,
 			}
 			t.Setenv("FILEVIEW_MAX_IWORK_SOURCE_BYTES", tc.value)
 			cfg.applyEnvOverrides()
