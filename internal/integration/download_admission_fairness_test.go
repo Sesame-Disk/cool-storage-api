@@ -50,8 +50,13 @@ func TestDownloadAdmissionFairnessIsolatesLinkAndOwner(t *testing.T) {
 	t.Run("a saturated public link does not lock out the owner", func(t *testing.T) {
 		stop := make(chan struct{})
 		var wg sync.WaitGroup
-		// Enough anonymous readers to fill the link-source budget several times
-		// over, so any leakage into the owner's gate would be unmistakable.
+		// Enough anonymous readers to fill the public-link identity budget several
+		// times over, so any leakage into the owner's gate would be unmistakable.
+		// Which of the two public gates closes first is not the claim here: every
+		// reader shares one client address, so max_active_per_client_link is
+		// reached before max_active_per_link_source. The isolation being tested is
+		// public versus authenticated, and waitForRefusal below gates on the
+		// public side genuinely refusing rather than on which cap did it.
 		for i := 0; i < 12; i++ {
 			wg.Add(1)
 			go func() {

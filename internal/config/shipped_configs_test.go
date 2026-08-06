@@ -77,6 +77,26 @@ func TestShippedConfigsEnableDownloadAdmission(t *testing.T) {
 	}
 }
 
+// TestShippedConfigsMatchTheCodeDefaults keeps the two places the D6 capacities
+// live from drifting apart. Validation alone would not notice: a YAML file and
+// DefaultConfig can both stay individually valid while describing different
+// designs, and then "the measured values" means two things depending on whether
+// a deployment pins the section. If a deployment ever needs different
+// capacities, this test is where that decision gets recorded rather than
+// happening silently.
+func TestShippedConfigsMatchTheCodeDefaults(t *testing.T) {
+	want := defaultDownloadAdmissionConfig()
+	for _, path := range shippedConfigPaths(t) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg := loadShippedConfig(t, path)
+
+			if cfg.DownloadAdmission != want {
+				t.Fatalf("shipped download admission = %#v, want the code defaults %#v", cfg.DownloadAdmission, want)
+			}
+		})
+	}
+}
+
 // TestShippedConfigsCapIWorkPreviewSource guards the combined measured memory
 // budget. The preview branch materialises the whole source document, while
 // encrypted streaming scales with the maximum sync block admitted by the

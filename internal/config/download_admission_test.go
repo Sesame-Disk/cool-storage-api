@@ -30,6 +30,96 @@ func TestLegacyConfigWithoutDownloadAdmissionInheritsD6Defaults(t *testing.T) {
 	}
 }
 
+// legacyD1PlaceholderYAML is the section the D1-D5 templates actually shipped,
+// copied from configs/config.docker.yaml at aa083805c~1. Inheriting defaults
+// cannot reach a file that contains it, which is the upgrade the test below
+// exists for.
+const legacyD1PlaceholderYAML = `
+download_admission:
+  enabled: false
+  max_active_per_node: 0
+  max_active_per_auth_user: 0
+  max_active_per_link_source: 0
+  max_active_per_client_link: 0
+  max_waiters_per_identity: 0
+  max_waiters_per_node: 0
+  admission_wait: 0s
+  preparation_deadline: 0s
+  idle_write_timeout: 0s
+  retry_after: 0s
+  max_active_block: 0
+  max_active_file: 0
+  max_active_raw: 0
+  max_active_history: 0
+  max_active_link_raw: 0
+  max_active_zip: 0
+  max_active_link_inline: 0
+`
+
+func TestLegacyD1PlaceholderIsRefusedRatherThanSilentlyUnprotected(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	if err := yaml.Unmarshal([]byte(legacyD1PlaceholderYAML), cfg); err != nil {
+		t.Fatalf("unmarshal legacy placeholder: %v", err)
+	}
+	if cfg.DownloadAdmission != (DownloadAdmissionConfig{}) {
+		t.Fatalf("fixture no longer reproduces the shipped placeholder: %#v", cfg.DownloadAdmission)
+	}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("the D1-D5 placeholder validated; that deployment starts with no aggregate download bound")
+	}
+	if !strings.Contains(err.Error(), "staging placeholder") {
+		t.Fatalf("Validate() error = %q, want the placeholder to be named so the operator knows which edit to make", err)
+	}
+}
+
+// TestExplicitDownloadAdmissionOptOutStillValidates is the other half: refusing
+// the placeholder must not turn `enabled: false` into an unsupported state. An
+// operator who deliberately opts out keeps the measured values beside it, and
+// that is a configuration the server must still start on.
+func TestExplicitDownloadAdmissionOptOutStillValidates(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	if err := yaml.Unmarshal([]byte("download_admission:\n  enabled: false\n"), cfg); err != nil {
+		t.Fatalf("unmarshal opt-out: %v", err)
+	}
+	if cfg.DownloadAdmission.Enabled {
+		t.Fatal("explicit enabled: false was overridden; it is the documented opt-out")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit opt-out failed validation: %v", err)
+	}
+}
+
+// TestLegacyD1PlaceholderRepairedByEnvValidates pins the ordering. The check
+// belongs after applyEnvOverrides: a deployment that carries the old YAML but
+// supplies real values through the environment is already protected, and
+// refusing it would reject a correct configuration.
+func TestLegacyD1PlaceholderRepairedByEnvValidates(t *testing.T) {
+	clearLoadEnvOverrides(t)
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	if err := yaml.Unmarshal([]byte(legacyD1PlaceholderYAML), cfg); err != nil {
+		t.Fatalf("unmarshal legacy placeholder: %v", err)
+	}
+
+	t.Setenv("DOWNLOAD_ADMISSION_ENABLED", "true")
+	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE", "6")
+	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER", "6")
+	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE", "6")
+	t.Setenv("DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_CLIENT_LINK", "3")
+	t.Setenv("DOWNLOAD_ADMISSION_PREPARATION_DEADLINE", "60s")
+	t.Setenv("DOWNLOAD_ADMISSION_IDLE_WRITE_TIMEOUT", "60s")
+	t.Setenv("DOWNLOAD_ADMISSION_RETRY_AFTER", "10s")
+	cfg.applyEnvOverrides()
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("placeholder repaired through the environment failed validation: %v", err)
+	}
+}
+
 func TestDownloadAdmissionValidation(t *testing.T) {
 	valid := DownloadAdmissionConfig{
 		Enabled:                true,

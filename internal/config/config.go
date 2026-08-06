@@ -2212,10 +2212,38 @@ func ValidateDownloadAdmissionConfig(d DownloadAdmissionConfig) error {
 }
 
 func (c *Config) validateDownloadAdmissionBounds() error {
+	if err := c.rejectLegacyDownloadAdmissionPlaceholder(); err != nil {
+		return err
+	}
 	if err := validateDownloadAdmissionConfig(c.DownloadAdmission, c.Server.WriteTimeout); err != nil {
 		return err
 	}
 	return c.validateDownloadAdmissionMemoryBudget()
+}
+
+// rejectLegacyDownloadAdmissionPlaceholder refuses the fully zeroed section the
+// D1-D5 templates shipped.
+//
+// Carrying the measured defaults in DefaultConfig protects a YAML file that
+// omits the section, but not one that contains it: an operator upgrading with
+// the config this project shipped mid-series keeps `enabled: false` and every
+// cap at zero, and starts with no aggregate download bound at all while the
+// release notes say B4 is closed. That block was never an operator decision —
+// §D1 of the contract reserved it as a staging placeholder for D6 to replace.
+//
+// Rewriting it to the defaults would be worse than the gap. An explicit
+// `enabled: false` is the documented and only opt-out, and a config system that
+// quietly overrides an explicit value because it recognises the surrounding
+// numbers cannot be reasoned about. So the placeholder is named and refused,
+// which is unambiguous and leaves both intents one edit away. It runs after
+// applyEnvOverrides, so a deployment that repairs the section through the
+// environment is unaffected.
+func (c *Config) rejectLegacyDownloadAdmissionPlaceholder() error {
+	if c == nil || c.DownloadAdmission != (DownloadAdmissionConfig{}) {
+		return nil
+	}
+	return fmt.Errorf("download_admission is the zeroed D1-D5 staging placeholder, which is no longer a supported deployment: " +
+		"remove the section to inherit the measured defaults, or keep enabled: false alongside those values if the opt-out is deliberate")
 }
 
 func (c *Config) validateDownloadAdmissionMemoryBudget() error {
