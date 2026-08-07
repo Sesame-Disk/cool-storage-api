@@ -64,9 +64,10 @@ func TestIsRepositorySyncToken(t *testing.T) {
 		},
 		{
 			name:        "repository id differing only in case",
-			token:       &AccessToken{Source: "", Path: "/", RepoID: "11111111-2222-3333-4444-555555555555"},
-			routeRepoID: "11111111-2222-3333-4444-555555555555",
+			token:       &AccessToken{Source: "", Path: "/", RepoID: "abcdef01-2345-6789-abcd-ef0123456789"},
+			routeRepoID: "ABCDEF01-2345-6789-ABCD-EF0123456789",
 			want:        true,
+			why:         "the same UUID arrives from a URL segment and from storage; casing must not decide authorization",
 		},
 		{
 			name:        "empty route repository",

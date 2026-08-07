@@ -57,9 +57,14 @@ of them updated.
 
 ## Production blockers — must close before go-live
 
-**No single-node blockers remain open.** NF-1 closed 2026-07-25; B4 closed
+**No single-node go-live blockers remain under the current production posture,
+which keeps destructive GC disabled.** NF-1 closed 2026-07-25; B4 closed
 2026-08-04; the object-storage posture issue and the sync public-link token auth
-gap both closed 2026-08-07. Multi-instance still adds B1 and B5. See
+gap both closed 2026-08-07. This is not the same as "nothing is left": X1
+(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) and X2
+(`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) remain open and still block
+*enabling* destructive GC — see the GC section below. Multi-instance adds B1 and
+B5. See
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
 
 | Issue | Sev | One line | Detail |

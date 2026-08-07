@@ -326,7 +326,9 @@ conditions.
 >
 > **Superseded 2026-08-07.** All three have since closed: B4 on 2026-08-04, and
 > the sync token auth gap plus the object-storage posture issue on 2026-08-07.
-> No single-node blocker remains open. B1 and B5 still gate multi-instance.
+> No single-node **go-live** blocker remains under the current production
+> posture, which keeps destructive GC disabled. X1 and X2 stay open and still
+> block *enabling* destructive GC; B1 and B5 still gate multi-instance.
 
 **A taxonomy wrinkle worth naming rather than silently fixing.** The summary
 table lists SH-1 under *High* for Sharing while listing B4 as a *blocker* under

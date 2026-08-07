@@ -67,7 +67,13 @@ type AccessToken struct {
 	Path      string // File path for downloads, parent dir for uploads
 	Replace   bool   // Default overwrite behavior for upload tokens
 	UserID    string
-	Source    string // "" or "web" = regular user; "link" = share/upload link
+	// Source is "" for a regular user token and "link" for a share/upload link.
+	// Those are the only two values ever written. Do not add a third without
+	// checking isRepositorySyncToken: sync authentication allowlists Source ==
+	// "" exactly, so a new value is refused there until it is admitted on
+	// purpose. (An earlier version of this comment listed "web" as an
+	// equivalent regular-user value; nothing has ever minted it.)
+	Source    string
 	SourceID  string // Stable non-secret identity for the originating public link
 	AuthToken string // User's auth token (for one-time login tokens)
 	ExpiresAt time.Time
