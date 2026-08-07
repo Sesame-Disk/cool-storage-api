@@ -196,26 +196,75 @@ func TestBudgetSourceSurvivesRevalidation(t *testing.T) {
 // TestSmallContainerFailureNamesTheLevers pins the message an operator meets
 // when a container is too small for the shipped design. It is the one refusal
 // reachable without misconfiguring anything, so "too small" on its own leaves
-// them stuck.
+// them stuck — and advice that names a setting which cannot resolve the case
+// is worse, because following it produces a second refusal.
 func TestSmallContainerFailureNamesTheLevers(t *testing.T) {
-	withCgroupMemoryLimit(t, 1<<30, true) // 1 GiB derives a 256 MiB budget
+	t.Run("derived from a small container", func(t *testing.T) {
+		withCgroupMemoryLimit(t, 1<<30, true) // 1 GiB derives a 256 MiB budget
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
 
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("a 1 GiB container validated; the derivation cannot fit one raw slot plus one stream slot")
+		}
+		// The percentage is the lever that works here; an explicit budget is
+		// held to the same share, so it must be described as bounded rather than
+		// offered as an alternative.
+		for _, want := range []string{
+			"memory_budget_percent",
+			"held to that same share",
+			"fileview.max_iwork_source_bytes",
+			"enabled: false",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("failure does not mention %q: %v", want, err)
+			}
+		}
+		// max_iwork_preview_bytes does not bind at the shipped values, so naming
+		// it would send the operator to a setting that changes nothing.
+		if strings.Contains(err.Error(), "max_iwork_preview_bytes") {
+			t.Errorf("failure names a lever that does not move this floor: %v", err)
+		}
+	})
+
+	t.Run("configured explicitly", func(t *testing.T) {
+		withCgroupMemoryLimit(t, 0, false)
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		cfg.DownloadAdmission.MemoryBudgetBytes = 200 * 1024 * 1024
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("a 200 MiB budget validated")
+		}
+		if !strings.Contains(err.Error(), "memory_budget_percent does not change it") {
+			t.Errorf("failure should say the percentage is inert for an explicit budget: %v", err)
+		}
+	})
+}
+
+// TestSmallContainerAdviceResolvesTheCase is the check the message itself
+// cannot make: that the lever it names actually starts the node.
+func TestSmallContainerAdviceResolvesTheCase(t *testing.T) {
+	withCgroupMemoryLimit(t, 1<<30, true)
 	cfg := DefaultConfig()
 	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.MemoryBudgetPercent = 33
 
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("a 1 GiB container validated; the derivation cannot fit one raw slot plus one stream slot")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("raising memory_budget_percent to 33 on a 1 GiB container: %v", err)
 	}
-	for _, lever := range []string{
-		"memory_budget_percent",
-		"memory_budget_bytes",
-		"max_iwork_source_bytes",
-		"sync_block_max_bytes",
-		"enabled: false",
-	} {
-		if !strings.Contains(err.Error(), lever) {
-			t.Errorf("failure does not mention %q: %v", lever, err)
-		}
+	if cfg.DownloadAdmission.MaxActivePerNode < 2 {
+		t.Fatalf("derived %d slots", cfg.DownloadAdmission.MaxActivePerNode)
+	}
+
+	// And the alternative the message no longer offers really is a dead end.
+	withCgroupMemoryLimit(t, 1<<30, true)
+	blocked := DefaultConfig()
+	blocked.Auth.DevMode = true
+	blocked.DownloadAdmission.MemoryBudgetBytes = 330 * 1024 * 1024
+	if err := blocked.Validate(); err == nil {
+		t.Fatal("an explicit budget above the container share validated; the advice could have offered it")
 	}
 }

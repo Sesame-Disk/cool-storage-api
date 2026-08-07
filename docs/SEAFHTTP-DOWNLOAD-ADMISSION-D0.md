@@ -860,7 +860,7 @@ download_admission:
   memory_budget_percent: 25
   raw_capacity_percent: 33
   safety_margin_percent: 20
-  # memory_budget_bytes: 2147483648 # optional fallback/override
+  # memory_budget_bytes: 2147483648 # optional; setting it switches the derivation off
   max_active_per_node: 16 # derived; 4 raw + 12 stream slots at the 2 GiB fallback
   max_active_per_auth_user: 6 # derived fairness cap
   max_active_per_link_source: 6 # derived fairness cap

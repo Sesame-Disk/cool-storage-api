@@ -729,20 +729,25 @@ func publishCapacityMetrics(cfg config.DownloadAdmissionConfig) {
 	for setting, value := range publishedCapacitySettings(cfg) {
 		metrics.DownloadAdmissionCapacity.WithLabelValues(setting).Set(float64(value))
 	}
-	metrics.DownloadAdmissionMemoryBudgetBytes.Set(float64(cfg.MemoryBudgetBytes))
 	// New is exported, and ValidateDownloadAdmissionConfig does not cover the
 	// budget or the margin — those belong to Config.Validate. A caller outside
-	// Load() can therefore reach here with values that would overflow the
-	// product or invert the margin, and a metric that publishes a negative
-	// "effective budget" is worse than one that publishes nothing.
-	margin := cfg.SafetyMarginPercent
-	if margin < 0 || margin >= 100 {
-		margin = 0
-	}
-	if cfg.MemoryBudgetBytes < 0 || cfg.MemoryBudgetBytes > math.MaxInt64/int64(100-margin) {
+	// Load() can therefore reach here with values outside the D6 contract, and
+	// publishing part of them is worse than publishing none: a node reporting
+	// "budget -1, effective 0" contradicts itself exactly the way a disabled
+	// section claiming a budget source did. Both gauges are refused together.
+	//
+	// An out-of-range margin is refused rather than clamped, because clamping it
+	// to zero publishes "effective == budget", which reads as a node running
+	// with no safety headroom at all.
+	if cfg.MemoryBudgetBytes <= 0 ||
+		cfg.MemoryBudgetBytes > config.MaxDownloadAdmissionMemoryBudgetBytes ||
+		cfg.SafetyMarginPercent < 0 || cfg.SafetyMarginPercent >= 100 {
+		metrics.DownloadAdmissionMemoryBudgetBytes.Set(0)
 		metrics.DownloadAdmissionMemoryBudgetEffectiveBytes.Set(0)
 		return
 	}
+	margin := cfg.SafetyMarginPercent
+	metrics.DownloadAdmissionMemoryBudgetBytes.Set(float64(cfg.MemoryBudgetBytes))
 	// Same order as the validator: multiply first. Dividing first published a
 	// figure 38 bytes below the budget the node was actually sized against, and
 	// this metric claims to be that budget, not an approximation of it. The

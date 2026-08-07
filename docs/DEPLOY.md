@@ -151,15 +151,38 @@ margin. At the default 25% share that means a container limit of about
 **1.3 GiB**; below roughly 660 MiB no share within the 50% ceiling is enough.
 Measured: a 330 MiB budget derives 2 slots and starts, 329 MiB does not.
 
-A node that small has four ways forward, and the startup error names all of
-them: raise `memory_budget_percent`, set `memory_budget_bytes` explicitly, lower
-the values that make a raw slot expensive (`fileview.max_iwork_source_bytes`,
-`fileview.max_iwork_preview_bytes`, `seafhttp.sync_block_max_bytes`), or set
-`download_admission.enabled: false` and accept that the node has no aggregate
-download bound. The guard is deliberately not degraded to "whatever fits": a
-design that silently exceeds its stated budget is what this validator exists to
-prevent.
+There are three ways forward, and the startup error names the ones that apply to
+your case rather than listing all of them:
 
+1. **Give admission a larger share of the container** — raise
+   `memory_budget_percent`, up to its 50% ceiling. An explicit
+   `memory_budget_bytes` is *not* a separate escape: a detected container limit
+   caps it at that same share, so setting it alone on a small node is rejected
+   on the next check. It selects a budget *within* the allowed share.
+2. **Make a slot cheaper** — the raw slot cost is
+   `max(6 × max_iwork_source_bytes, stream, stream + source + max_iwork_preview_bytes)`
+   and the stream cost is `4.5 × sync_block_max_bytes`. Only the term that
+   currently dominates is worth lowering, which is why the error names that one.
+3. **Turn the guard off** — `download_admission.enabled: false`, accepting that
+   the node has no aggregate download bound.
+
+The guard is deliberately not degraded to "whatever fits": a design that
+silently exceeds its stated budget is what this validator exists to prevent.
+
+The first lever's cost, measured against the 2 GiB fallback, since raising the
+iWork source cap is the usual reason to want more:
+
+| `max_iwork_source_bytes` | raw slot cost | node slots | raw | stream |
+|---:|---:|---:|---:|---:|
+| 16 MiB | 138 MiB | 18 | 5 | 13 |
+| **32 MiB (shipped)** | **192 MiB** | **16** | **4** | **12** |
+| 48 MiB | 288 MiB | 12 | 3 | 9 |
+| 64 MiB | 384 MiB | 9 | 2 | 7 |
+| 128 MiB | 768 MiB | 6 | 1 | 5 |
+| 256 MiB | 1536 MiB | 2 | 1 | 1 |
+
+Raising the cap to 64 MiB — enough for most Keynote decks with images — costs
+roughly half the node's concurrent downloads at the same budget.
 
 Manual mode is available for special deployments. It requires
 `memory_budget_bytes`, `max_active_per_node`, `max_active_raw` and the other

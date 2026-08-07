@@ -2432,12 +2432,10 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 		// than roughly 1.3 GiB derives a budget below the floor — and a message
 		// that only says "too small" leaves them with a server that will not
 		// start and no idea which of five settings to reach for.
-		return fmt.Errorf("download admission cannot size one raw slot (%d bytes) plus one stream slot (%d bytes) "+
-			"from the %d-byte budget, which is %d bytes after the %d%% safety margin. "+
-			"Raise download_admission.memory_budget_percent or set download_admission.memory_budget_bytes; "+
-			"lower fileview.max_iwork_source_bytes, fileview.max_iwork_preview_bytes or seafhttp.sync_block_max_bytes, "+
-			"which are what make a raw slot expensive; or set download_admission.enabled: false on a node this small",
-			rawCost, streamCost, d.MemoryBudgetBytes, effectiveBudget, d.SafetyMarginPercent)
+		return fmt.Errorf("download admission cannot size one raw slot (%d bytes) plus one stream slot (%d bytes) = %d bytes "+
+			"from the %d-byte budget, which is %d bytes after the %d%% safety margin. %s",
+			rawCost, streamCost, rawCost+streamCost, d.MemoryBudgetBytes, effectiveBudget, d.SafetyMarginPercent,
+			downloadAdmissionFloorAdvice(c, rawCost, streamCost))
 	}
 	capAt := func(policy, capacity int) int {
 		if capacity < 1 {
@@ -2506,6 +2504,45 @@ func downloadAdmissionEffectiveBudget(budget int64, safetyMarginPercent int) (in
 		return 0, fmt.Errorf("download admission effective memory budget overflows")
 	}
 	return effective / 100, nil
+}
+
+// downloadAdmissionFloorAdvice names the levers that actually move this
+// deployment's floor.
+//
+// Generic advice was worse than none. An explicit budget is not an escape from a
+// small container — validateDownloadAdmissionCgroupBudget caps it at the same
+// share the percentage would have derived — so telling an operator on a 1 GiB
+// node to "set memory_budget_bytes" sends them to a setting that is rejected on
+// the next line. And raising the percentage does nothing when the budget was
+// configured rather than derived. Likewise fileview.max_iwork_preview_bytes only
+// matters while the preview term is the one that dominates a raw slot; at the
+// shipped values the iWork source term wins and lowering it changes nothing.
+func downloadAdmissionFloorAdvice(c *Config, rawCost, streamCost int64) string {
+	costLever := "seafhttp.sync_block_max_bytes"
+	source := c.FileView.MaxIWorkSourceBytes
+	if iwork, ok := checkedNonNegativeMultiply(source, DownloadAdmissionIWorkEncryptedPeakMultiplier); ok && iwork == rawCost {
+		costLever = "fileview.max_iwork_source_bytes"
+	} else if preview, ok := checkedNonNegativeAdd(streamCost+source, c.FileView.MaxIWorkPreviewBytes); ok && preview == rawCost {
+		costLever = "fileview.max_iwork_preview_bytes or fileview.max_iwork_source_bytes"
+	}
+
+	switch c.downloadBudgetSourceKind {
+	case "cgroup":
+		return fmt.Sprintf("The budget is %d%% of the detected container limit, and an explicit "+
+			"download_admission.memory_budget_bytes is held to that same share, so it is not a way around this. "+
+			"Raise download_admission.memory_budget_percent (up to %d), lower %s, or set "+
+			"download_admission.enabled: false on a node this small.",
+			c.DownloadAdmission.MemoryBudgetPercent, MaxDownloadAdmissionMemoryBudgetPercent, costLever)
+	case "configured":
+		return fmt.Sprintf("The budget is configured explicitly, so download_admission.memory_budget_percent "+
+			"does not change it. Raise download_admission.memory_budget_bytes (a detected container limit still "+
+			"caps it at memory_budget_percent of that limit), lower %s, or set download_admission.enabled: false.",
+			costLever)
+	default:
+		return fmt.Sprintf("No container limit was detected, so the budget is the reference fallback. "+
+			"Set download_admission.memory_budget_bytes for this deployment, lower %s, or set "+
+			"download_admission.enabled: false.", costLever)
+	}
 }
 
 func deriveDownloadAdmissionSlots(effectiveBudget, rawCost, streamCost int64, rawPercent int) (int, int, int, bool) {
