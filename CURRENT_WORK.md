@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-07-21
-**Session**: Upload-fence / GC safety PR series
+**Last Updated**: 2026-08-07
+**Session**: X1/X2 generational GC fence ADR (documentation only)
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -31,6 +31,7 @@
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
 5. **Current risk shape**: destructive GC has two confirmed live-data safety blockers (X1/X2) and must remain disabled fleet-wide. The upload-fence PR series addresses separate writer/GC races but does not close those activation gates.
+6. **X1/X2 design record**: the proposed greenfield protocol is documented in [`docs/GC-X1-X2-GENERATION-FENCE-ADR.md`](docs/GC-X1-X2-GENERATION-FENCE-ADR.md); implementation has not started and `GC_ENABLED=false` remains mandatory.
 
 ### Inter-session Update (2026-05-21)
 

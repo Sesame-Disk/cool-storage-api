@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-07 - X1/X2 generational GC fence ADR (proposed)
+
+- Added `docs/GC-X1-X2-GENERATION-FENCE-ADR.md`, the normative design record for
+  closing physical-delete ABA (X1) and cross-DC reference visibility (X2).
+- Recorded the greenfield `MATERIALIZING -> ACTIVE -> RETIRING -> RETIRED ->
+  DELETING -> DELETED` lifecycle, local writer pins, global destructive checks,
+  generation-bound references, exact-key recovery, claim takeover, crash matrix,
+  implementation phases, and acceptance criteria.
+- X1/X2 remain open and destructive GC remains disabled; no runtime code changed.
+
+---
+
 ## 2026-07-16 - GC physical deletion is org-scoped end to end (P10 PR-3)
 
 - Normal block deletion and S3 orphan recovery now resolve `BlockStore` by

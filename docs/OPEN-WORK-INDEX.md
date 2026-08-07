@@ -115,8 +115,8 @@ on every replica in every DC until both close.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA: an authorized S3 delete can land after a byte-identical re-upload | Registry X1 |
-| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | Blocker (multi-DC) | `LOCAL_QUORUM` references can be invisible to GC in another DC | Registry X2 |
+| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA: an authorized S3 delete can land after a byte-identical re-upload | [Registry X1](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [proposed ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) |
+| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | Blocker (multi-DC) | `LOCAL_QUORUM` references can be invisible to GC in another DC | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [proposed ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) |
 
 ## High / Medium — open (audit follow-ups)
 
@@ -280,6 +280,8 @@ runbook; invite/create via Accounts is DONE operationally).
   fourteen `F` findings closed. See
   [GC-UPLOAD-FENCE-PR-PLAN.md](./GC-UPLOAD-FENCE-PR-PLAN.md) for PR merge progress
   and [UPLOAD-FENCE-FINDINGS-REGISTRY.md](./UPLOAD-FENCE-FINDINGS-REGISTRY.md)
-  for the findings themselves. **Defect status lives in `KNOWN_ISSUES.md`.**
+  for the findings themselves. The proposed greenfield X1/X2 contract is in
+  [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md).
+  **Defect status lives in `KNOWN_ISSUES.md`.**
 - **Org-scoped block deletion (P10)**, PR-1..PR-3 (#134–#136): block keys are
   org-scoped end to end; cross-org delete isolation closed.

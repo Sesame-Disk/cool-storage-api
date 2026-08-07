@@ -754,6 +754,22 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 
 ---
 
+## Proposed Decisions
+
+### Generational GC Fence For X1/X2
+
+**Status:** Proposed; implementation not started
+
+**Decision record:** [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md)
+
+The proposed greenfield design keeps writer pins and ordinary references at
+`LOCAL_QUORUM`, uses `SERIAL` plus `EACH_QUORUM` only for destructive GC fences and
+final checks, and prevents physical-delete ABA with UUID generations and immutable
+storage keys. X1 and X2 remain open, and destructive GC remains disabled until the
+ADR acceptance criteria are implemented and verified.
+
+---
+
 ## Future Decisions (To Be Made)
 
 ### Multi-Region Replication Strategy

@@ -2037,7 +2037,8 @@ physical-delete ABA. Cassandra authorization generations or claim generations al
 cannot revoke an S3 DELETE already in flight. X1 closes only when new bytes use
 never-reused generational physical keys, so a stale delete can target only the old
 key. Keep destructive GC disabled until that physical-key invariant is implemented.
-Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1.
+Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Proposed closure
+contract: [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md).
 
 ---
 
@@ -2054,7 +2055,8 @@ DC, the write quorum in one DC and read quorum in another need not intersect. Th
 one-hour grace period mitigates normal lag but is not a correctness bound. The local
 multi-region test profiles use `LOCAL_SERIAL` and do not reproduce production's
 `SERIAL` contract; they are not production configuration. Design evidence:
-`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2.
+`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2. Proposed closure contract:
+[GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md).
 
 ---
 

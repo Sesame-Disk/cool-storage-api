@@ -603,7 +603,8 @@ KNOWN_ISSUES.md `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period is a mitigatio
 for ordinary cross-DC lag, not a correctness bound: with RF 1 per DC,
 `LOCAL_QUORUM` reference writes and reads need not intersect. Destructive GC remains
 disabled pending `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` and the physical-delete
-ABA blocker.
+ABA blocker. The proposed greenfield closure protocol is recorded in
+[GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md).
 
 #### Reverse Lookup Table — DROPPED (PR7, migration 006)
 
