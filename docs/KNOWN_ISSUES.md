@@ -6690,6 +6690,72 @@ hot-path readiness.
 
 ---
 
+### ISSUE-IWORK-PREVIEW-413-NO-MESSAGE-01: An oversized iWork preview shows raw JSON in the viewer
+
+**Status**: 🟡 **Open — user-visible, frontend only**
+**Severity**: Low — no data or capacity impact; a bad error experience on one preview branch
+**Affected**: `frontend/src/components/dialog/file-preview-dialog.js`, the `preview=1` branch of `GET /repo/:repo_id/raw/*filepath`
+
+#### What Is True Today
+
+D6 capped the iWork *source* document at `fileview.max_iwork_source_bytes`
+(32 MiB shipped), because that preview branch buffers the whole document and
+costs ~6x its size when the library is encrypted. A `.key`, `.pages` or
+`.numbers` above the cap now answers `413` with a JSON body where it previously
+rendered a preview. The cap itself is deliberate and bounded — it applies only
+to the buffering branch, so downloading the same file still works, and
+`ServeHistoricFileRaw` passes `false` explicitly.
+
+The frontend has no branch for that response. `file-preview-dialog.js` renders
+`<img src={previewURL}>`; the `413` fails the image load, `onError` sets
+`iworkPreviewType: 'pdf'`, and the re-render puts the *same URL* in an
+`<iframe>`. So the request is made twice and the viewer ends up displaying the
+raw JSON error body — untranslated, inside the modal:
+
+```json
+{"error":"file too large for inline preview (… bytes, max 33554432)"}
+```
+
+The image→PDF fallback exists for older iWork documents that carry a QuickLook
+PDF instead of a JPEG. A `413` is not that case, so the fallback fires for a
+reason it was not written for.
+
+#### Why It Is Contained
+
+The `413` is emitted *before* `acquireFileViewDownloadAdmission`
+(`internal/api/v2/fileview.go`), so neither request consumes a download
+admission slot. The doubled request costs a round trip, not capacity.
+
+#### Fix Direction
+
+Frontend only, and small: check for `413` before falling back, and render a
+translated message naming the limit and pointing at download — something like
+"this document is too large to preview (max 32 MiB); download it to open it".
+The backend already returns the limit in the body, so no API change is needed.
+
+Two adjacent decisions are worth taking at the same time, and both are product
+calls rather than defects:
+
+- **Raise the cap.** `docs/DEPLOY.md` carries the measured trade-off; at the
+  2 GiB reference budget, moving the source cap from 32 MiB to 64 MiB takes a
+  node from 16 concurrent downloads to 9.
+- **Give the preview its own admission profile.** A raw *stream* costs 4 MiB
+  while a raw *slot* is charged ~192 MiB for a branch only `preview=1` on three
+  extensions can reach — 47% of the design budget. A separate profile with one
+  or two slots would return raw slots to their real cost and allow larger
+  previews. It is not free: §12 of `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`
+  freezes the profile enum, its metric label set and the config schema, so this
+  needs an explicit amendment to that contract rather than an implementation
+  change.
+
+A third option avoids the memory cost entirely: buffer the source to a temporary
+file and read the ZIP through `io.ReaderAt`. The archive needs random access,
+not residency. More invasive, and it moves the cost to disk.
+
+**Source of record**: D6 closure, `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`
+
+---
+
 ### ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01: Download concurrency does not cap byte rate
 
 **Status**: 🟡 **Open — quantified by D6, not closed by it**

@@ -104,6 +104,7 @@ on every replica in every DC until both close.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
+| `ISSUE-IWORK-PREVIEW-413-NO-MESSAGE-01` | LOW | An iWork document above the D6 source cap renders the raw JSON error inside the preview modal, and the image→PDF fallback re-requests it | Frontend only; see `KNOWN_ISSUES.md`. Carries the two product decisions D6 left open: raising the cap, or giving the preview its own admission profile (needs a §12 amendment) |
 | `ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01` | HIGH | `sesamefs_auth` is a replayable bearer in a JS-readable cookie → XSS = token theft | Readiness SEC-3 / NF-3 |
 | `ISSUE-ZIP-STREAM-LATEFAIL-01` | HIGH | ZIP download can truncate after `200 OK` | Readiness DL-2 |
 | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | MEDIUM | Cross-library block read (BOLA), gated only by knowing the 256-bit hash | Readiness B2/SEC-1 |

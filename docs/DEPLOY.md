@@ -181,8 +181,10 @@ iWork source cap is the usual reason to want more:
 | 128 MiB | 768 MiB | 6 | 1 | 5 |
 | 256 MiB | 1536 MiB | 2 | 1 | 1 |
 
-Raising the cap to 64 MiB — enough for most Keynote decks with images — costs
-roughly half the node's concurrent downloads at the same budget.
+Raising the cap from 32 MiB to 64 MiB reduces the same-budget node ceiling from
+16 to 9 concurrent downloads. Documents above the cap answer `413` on the
+inline-preview branch only; downloading them is unaffected. See
+`ISSUE-IWORK-PREVIEW-413-NO-MESSAGE-01` for what the viewer currently shows.
 
 Manual mode is available for special deployments. It requires
 `memory_budget_bytes`, `max_active_per_node`, `max_active_raw` and the other

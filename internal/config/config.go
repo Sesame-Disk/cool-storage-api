@@ -2427,15 +2427,20 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 
 	rawSlots, streamSlots, nodeSlots, ok := deriveDownloadAdmissionSlots(effectiveBudget, rawCost, streamCost, d.RawCapacityPercent)
 	if !ok {
-		// Name the arithmetic and every lever that moves it. This is the one
-		// failure an operator meets by doing nothing wrong — a container smaller
-		// than roughly 1.3 GiB derives a budget below the floor — and a message
-		// that only says "too small" leaves them with a server that will not
-		// start and no idea which of five settings to reach for.
+		// Name the arithmetic and the levers that can actually clear it. This is
+		// the one failure an operator meets by doing nothing wrong — a container
+		// smaller than roughly 1.3 GiB derives a budget below the floor — and a
+		// message that only says "too small" leaves them with a server that will
+		// not start and nothing to reach for. Which levers apply depends on how
+		// the budget was arrived at, so the advice is assembled rather than listed.
+		needed, ok := checkedNonNegativeAdd(rawCost, streamCost)
+		if !ok {
+			return fmt.Errorf("download admission slot costs overflow: raw %d bytes plus stream %d bytes", rawCost, streamCost)
+		}
 		return fmt.Errorf("download admission cannot size one raw slot (%d bytes) plus one stream slot (%d bytes) = %d bytes "+
 			"from the %d-byte budget, which is %d bytes after the %d%% safety margin. %s",
-			rawCost, streamCost, rawCost+streamCost, d.MemoryBudgetBytes, effectiveBudget, d.SafetyMarginPercent,
-			downloadAdmissionFloorAdvice(c, rawCost, streamCost))
+			rawCost, streamCost, needed, d.MemoryBudgetBytes, effectiveBudget, d.SafetyMarginPercent,
+			downloadAdmissionFloorAdvice(c, d, rawCost, streamCost))
 	}
 	capAt := func(policy, capacity int) int {
 		if capacity < 1 {
@@ -2506,43 +2511,94 @@ func downloadAdmissionEffectiveBudget(budget int64, safetyMarginPercent int) (in
 	return effective / 100, nil
 }
 
-// downloadAdmissionFloorAdvice names the levers that actually move this
-// deployment's floor.
+// downloadAdmissionFloorAdvice names the levers that can actually clear this
+// deployment's floor, and only those.
 //
-// Generic advice was worse than none. An explicit budget is not an escape from a
-// small container — validateDownloadAdmissionCgroupBudget caps it at the same
-// share the percentage would have derived — so telling an operator on a 1 GiB
-// node to "set memory_budget_bytes" sends them to a setting that is rejected on
-// the next line. And raising the percentage does nothing when the budget was
-// configured rather than derived. Likewise fileview.max_iwork_preview_bytes only
-// matters while the preview term is the one that dominates a raw slot; at the
-// shipped values the iWork source term wins and lowering it changes nothing.
-func downloadAdmissionFloorAdvice(c *Config, rawCost, streamCost int64) string {
-	costLever := "seafhttp.sync_block_max_bytes"
-	source := c.FileView.MaxIWorkSourceBytes
-	if iwork, ok := checkedNonNegativeMultiply(source, DownloadAdmissionIWorkEncryptedPeakMultiplier); ok && iwork == rawCost {
-		costLever = "fileview.max_iwork_source_bytes"
-	} else if preview, ok := checkedNonNegativeAdd(streamCost+source, c.FileView.MaxIWorkPreviewBytes); ok && preview == rawCost {
-		costLever = "fileview.max_iwork_preview_bytes or fileview.max_iwork_source_bytes"
+// Generic advice was worse than none, in three ways this function exists to
+// avoid. An explicit budget is not an escape from a small container —
+// validateDownloadAdmissionCgroupBudget caps it at the same share the
+// percentage would have derived. Raising the percentage does nothing when the
+// budget was configured rather than derived, and nothing at all once the
+// container is small enough that even the maximum share falls short. And
+// fileview.max_iwork_preview_bytes only matters while the preview term is the
+// one that dominates a raw slot; at the shipped values the iWork source term
+// wins, so naming it sends the operator to a setting that changes nothing.
+//
+// The cost levers are always both named. The stream cost is a term of the sum
+// that failed no matter which raw term dominates, so seafhttp.sync_block_max_bytes
+// is always worth offering — it used to be an initial value that no input could
+// reach, because previewCost is streamCost plus a positive source and therefore
+// always exceeds streamCost.
+// d is the section as resolved so far, not c.DownloadAdmission: the derived
+// budget lives in the local copy until the function returns successfully, so
+// reading it from c here would see the pre-derivation value — zero in auto mode,
+// which made every container look too small for any share.
+func downloadAdmissionFloorAdvice(c *Config, d DownloadAdmissionConfig, rawCost, streamCost int64) string {
+	rawLever := "fileview.max_iwork_preview_bytes or fileview.max_iwork_source_bytes"
+	if iwork, ok := checkedNonNegativeMultiply(c.FileView.MaxIWorkSourceBytes, DownloadAdmissionIWorkEncryptedPeakMultiplier); ok && iwork == rawCost {
+		rawLever = "fileview.max_iwork_source_bytes"
 	}
+	costAdvice := fmt.Sprintf("lower %s, which sets the raw slot cost, or seafhttp.sync_block_max_bytes, which sets the stream slot cost",
+		rawLever)
 
 	switch c.downloadBudgetSourceKind {
 	case "cgroup":
-		return fmt.Sprintf("The budget is %d%% of the detected container limit, and an explicit "+
-			"download_admission.memory_budget_bytes is held to that same share, so it is not a way around this. "+
-			"Raise download_admission.memory_budget_percent (up to %d), lower %s, or set "+
+		if downloadAdmissionPercentCanClearFloor(d, rawCost, streamCost) {
+			return fmt.Sprintf("The budget is %d%% of the detected container limit, and an explicit "+
+				"download_admission.memory_budget_bytes is held to that same share, so it is not a way around this. "+
+				"Raise download_admission.memory_budget_percent (up to %d), %s, or set "+
+				"download_admission.enabled: false on a node this small.",
+				d.MemoryBudgetPercent, MaxDownloadAdmissionMemoryBudgetPercent, costAdvice)
+		}
+		// Recommending the percentage here would send the operator into either no
+		// change at all or the range error, which is the failure mode this whole
+		// function exists to stop producing.
+		return fmt.Sprintf("The budget is %d%% of the detected container limit, and even the maximum %d%% share "+
+			"of this container cannot reach the floor, so neither download_admission.memory_budget_percent nor an "+
+			"explicit download_admission.memory_budget_bytes can resolve it. Either %s, or set "+
 			"download_admission.enabled: false on a node this small.",
-			c.DownloadAdmission.MemoryBudgetPercent, MaxDownloadAdmissionMemoryBudgetPercent, costLever)
+			d.MemoryBudgetPercent, MaxDownloadAdmissionMemoryBudgetPercent, costAdvice)
 	case "configured":
 		return fmt.Sprintf("The budget is configured explicitly, so download_admission.memory_budget_percent "+
-			"does not change it. Raise download_admission.memory_budget_bytes (a detected container limit still "+
-			"caps it at memory_budget_percent of that limit), lower %s, or set download_admission.enabled: false.",
-			costLever)
+			"does not change it. Raise download_admission.memory_budget_bytes — a detected container limit still "+
+			"caps it at memory_budget_percent of that limit, so raise that share too if one is in force — %s, "+
+			"or set download_admission.enabled: false.", costAdvice)
 	default:
 		return fmt.Sprintf("No container limit was detected, so the budget is the reference fallback. "+
-			"Set download_admission.memory_budget_bytes for this deployment, lower %s, or set "+
-			"download_admission.enabled: false.", costLever)
+			"Set download_admission.memory_budget_bytes for this deployment, %s, or set "+
+			"download_admission.enabled: false.", costAdvice)
 	}
+}
+
+// downloadAdmissionPercentCanClearFloor asks whether the largest share this
+// container may give download admission would fit one raw slot plus one stream
+// slot. Below roughly 660 MiB nothing does, and the operator needs to be told
+// that rather than sent to a setting they may already be at.
+func downloadAdmissionPercentCanClearFloor(d DownloadAdmissionConfig, rawCost, streamCost int64) bool {
+	percent := d.MemoryBudgetPercent
+	if percent <= 0 {
+		return false
+	}
+	limit, ok := checkedNonNegativeMultiply(d.MemoryBudgetBytes, 100)
+	if !ok {
+		return false
+	}
+	limit /= int64(percent)
+
+	best, ok := checkedNonNegativeMultiply(limit, int64(MaxDownloadAdmissionMemoryBudgetPercent))
+	if !ok {
+		return false
+	}
+	best /= 100
+	usable, err := downloadAdmissionEffectiveBudget(best, d.SafetyMarginPercent)
+	if err != nil {
+		return false
+	}
+	needed, ok := checkedNonNegativeAdd(rawCost, streamCost)
+	if !ok {
+		return false
+	}
+	return usable >= needed
 }
 
 func deriveDownloadAdmissionSlots(effectiveBudget, rawCost, streamCost int64, rawPercent int) (int, int, int, bool) {

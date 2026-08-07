@@ -268,3 +268,67 @@ func TestSmallContainerAdviceResolvesTheCase(t *testing.T) {
 		t.Fatal("an explicit budget above the container share validated; the advice could have offered it")
 	}
 }
+
+// TestSmallContainerAdviceStopsOfferingAnExhaustedLever covers the band where
+// no share of the container is enough. Offering the percentage there is the
+// same defect as offering an explicit budget on a 1 GiB node: following the
+// advice produces either no change or a second refusal, this time about the
+// setting's own range.
+func TestSmallContainerAdviceStopsOfferingAnExhaustedLever(t *testing.T) {
+	t.Run("no share can clear the floor", func(t *testing.T) {
+		withCgroupMemoryLimit(t, 512*1024*1024, true)
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("a 512 MiB container validated")
+		}
+		if strings.Contains(err.Error(), "Raise download_admission.memory_budget_percent") {
+			t.Errorf("advice offers a lever that cannot clear this floor at any share: %v", err)
+		}
+		if !strings.Contains(err.Error(), "even the maximum") {
+			t.Errorf("advice does not say the share is exhausted: %v", err)
+		}
+	})
+
+	t.Run("a larger share can still clear it", func(t *testing.T) {
+		withCgroupMemoryLimit(t, 1<<30, true)
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("a 1 GiB container validated at the default share")
+		}
+		if !strings.Contains(err.Error(), "Raise download_admission.memory_budget_percent") {
+			t.Errorf("advice withholds the lever that does clear this floor: %v", err)
+		}
+	})
+}
+
+// TestFloorAdviceAlwaysNamesTheStreamCostLever pins a lever that used to be
+// unreachable. seafhttp.sync_block_max_bytes was the initial value of the cost
+// hint, but previewCost is streamCost plus a positive source and therefore
+// always exceeds streamCost, so no input could make the raw cost equal the
+// stream cost — the setting was never named despite being a term of the sum
+// that failed, and lowering it from 16 to 8 MiB moves a 2 GiB node from 16 to
+// 20 slots.
+func TestFloorAdviceAlwaysNamesTheStreamCostLever(t *testing.T) {
+	for _, source := range []int64{1, 8, 32, 128} {
+		for _, preview := range []int64{0, 50, 200, 900} {
+			cfg := DefaultConfig()
+			cfg.FileView.MaxIWorkSourceBytes = source * 1024 * 1024
+			cfg.FileView.MaxIWorkPreviewBytes = preview * 1024 * 1024
+
+			streamCost, rawCost, err := downloadAdmissionMemoryCosts(cfg)
+			if err != nil {
+				t.Fatalf("source=%d preview=%d: %v", source, preview, err)
+			}
+			advice := downloadAdmissionFloorAdvice(cfg, cfg.DownloadAdmission, rawCost, streamCost)
+			if !strings.Contains(advice, "seafhttp.sync_block_max_bytes") {
+				t.Errorf("source=%d preview=%d: advice omits the stream cost lever: %s", source, preview, advice)
+			}
+		}
+	}
+}
