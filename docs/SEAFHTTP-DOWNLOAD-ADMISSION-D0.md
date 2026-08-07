@@ -636,9 +636,11 @@ configured value.
 
 Both apply **per protected location**, not at server level. Raising every route's
 connection-retention window would trade one abuse vector for another in the PR
-that closes B4, so non-D routes keep a short `send_timeout` and the D locations
-opt in. `config.MinNginxProxyReadTimeout` and `config.MinNginxSendTimeout`
-derive both from the validation ceilings, and
+that closes B4. Locations outside the protected prefixes keep a short
+`send_timeout`; non-D siblings inside the broad `/seafhttp/` prefix inherit the
+long timers and depend on their own applicable application-level admission and
+deadline controls. `config.MinNginxProxyReadTimeout` and
+`config.MinNginxSendTimeout` derive both from the validation ceilings, and
 `TestSupportedNginxTimeoutsNeverPreemptDownloadAdmission` asserts the
 relationship rather than a literal — a literal is what previously froze a
 mismatch in place, with nginx cutting a stalled client at 120s while validation

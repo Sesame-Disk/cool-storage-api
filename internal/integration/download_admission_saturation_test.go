@@ -406,24 +406,41 @@ func assertDownloadAdmissionInvariants(t *testing.T, c *testClient) {
 	)
 	for {
 		samples = scrapeDownloadAdmissionSeries(t, c)
-		active = samples.single["download_admission_active_current"]
-		entries = samples.single["download_admission_entries_current"]
-		waiters = samples.single["download_admission_waiters_current"]
-		profil = 0
-		for _, v := range samples.byProfile {
-			profil += v
+		missing := make([]string, 0, 4)
+		for _, name := range []string{
+			"download_admission_active_current",
+			"download_admission_entries_current",
+			"download_admission_waiters_current",
+		} {
+			if _, ok := samples.single[name]; !ok {
+				missing = append(missing, name)
+			}
 		}
+		if len(samples.byProfile) == 0 {
+			missing = append(missing, "download_admission_active_by_profile{...}")
+		}
+		if len(missing) > 0 {
+			mismatch = fmt.Sprintf("required metrics are not exported: %s", strings.Join(missing, ", "))
+		} else {
+			active = samples.single["download_admission_active_current"]
+			entries = samples.single["download_admission_entries_current"]
+			waiters = samples.single["download_admission_waiters_current"]
+			profil = 0
+			for _, v := range samples.byProfile {
+				profil += v
+			}
 
-		switch {
-		case active != profil:
-			mismatch = fmt.Sprintf("active_current=%v but sum(active_by_profile)=%v (%v); a profile is miscounted",
-				active, profil, samples.byProfile)
-		case entries != active+waiters:
-			mismatch = fmt.Sprintf("entries_current=%v but active_current+waiters_current=%v (active=%v waiters=%v)",
-				entries, active+waiters, active, waiters)
-		default:
-			t.Logf("invariants held exactly: active=%v profiles=%v entries=%v waiters=%v", active, profil, entries, waiters)
-			return
+			switch {
+			case active != profil:
+				mismatch = fmt.Sprintf("active_current=%v but sum(active_by_profile)=%v (%v); a profile is miscounted",
+					active, profil, samples.byProfile)
+			case entries != active+waiters:
+				mismatch = fmt.Sprintf("entries_current=%v but active_current+waiters_current=%v (active=%v waiters=%v)",
+					entries, active+waiters, active, waiters)
+			default:
+				t.Logf("invariants held exactly: active=%v profiles=%v entries=%v waiters=%v", active, profil, entries, waiters)
+				return
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("the frozen identities never held exactly on a settled node: %s", mismatch)

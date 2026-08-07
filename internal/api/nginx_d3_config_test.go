@@ -63,10 +63,10 @@ type protectedNginxLocation struct {
 // whole prefix, so its sync siblings — block PUT, check-blocks, the upload
 // routes — inherit these timers as well; several are the same URI under a
 // different method and cannot be separated by location at all. Each is bounded
-// by its own subcontract B/C admission and deadlines, so the proxy is not what
-// was holding them. What this test asserts is that no *listed* location falls
-// back to the short default; it does not assert that every other route in the
-// file still has it.
+// by its applicable application-level admission and deadline controls, so the
+// proxy is not what was holding them. What this test asserts is that no *listed*
+// location falls back to the short default; it does not assert that every other
+// route in the file still has it.
 func TestSupportedNginxTimeoutsNeverPreemptDownloadAdmission(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
