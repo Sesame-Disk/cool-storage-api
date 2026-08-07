@@ -942,7 +942,8 @@ func TestConfigValidate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := DefaultConfig()
-			cfg.Auth.DevMode = true // default to dev so test cases only assert the dimension they care about
+			cfg.Auth.DevMode = true               // default to dev so test cases only assert the dimension they care about
+			cfg.DownloadAdmission.Enabled = false // D6 has focused validation tests; isolate legacy config assertions here
 			tt.modify(cfg)
 
 			err := cfg.Validate()
@@ -1018,6 +1019,7 @@ func TestEnvOverrideSyncBlockMaxBytes(t *testing.T) {
 	t.Run("valid value overrides the default", func(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Auth.DevMode = true
+		cfg.DownloadAdmission.Enabled = false
 		t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_BYTES", "33554432")
 		t.Setenv("SEAFHTTP_SYNC_BLOCK_MEMORY_BUDGET_BYTES", "4294967296")
 
@@ -1033,6 +1035,7 @@ func TestEnvOverrideSyncBlockMaxBytes(t *testing.T) {
 	t.Run("malformed value is reported, not dropped", func(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Auth.DevMode = true
+		cfg.DownloadAdmission.Enabled = false
 		t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_BYTES", "16MiB")
 
 		cfg.applyEnvOverrides()
@@ -1055,6 +1058,7 @@ func TestEnvOverrideSyncBlockMaxBytes(t *testing.T) {
 		t.Run("rejects "+tc.name, func(t *testing.T) {
 			cfg := DefaultConfig()
 			cfg.Auth.DevMode = true
+			cfg.DownloadAdmission.Enabled = false
 			t.Setenv("SEAFHTTP_SYNC_BLOCK_MAX_BYTES", tc.value)
 
 			cfg.applyEnvOverrides()

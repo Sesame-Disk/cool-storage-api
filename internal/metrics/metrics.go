@@ -827,12 +827,63 @@ var (
 		},
 		[]string{"dimension"},
 	)
+	// DownloadAdmissionCapacity publishes the capacities the coordinator is
+	// actually running with. In auto mode these are derived at startup from the
+	// detected memory limit, so they are a property of the host and the config
+	// file's own numbers are only a reference. Without this the effective
+	// ceiling can be learned in exactly one way: saturate the node and watch
+	// active_current plateau — which is also the only way a test could have
+	// discovered what to assert.
+	DownloadAdmissionCapacity = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "download_admission_capacity",
+			Help: "Effective download admission capacity in slots, by setting.",
+		},
+		[]string{"setting"},
+	)
+	// DownloadAdmissionBudgetSource says where the active budget came from:
+	// "configured", "cgroup" or "fallback". The capacities alone cannot tell
+	// those apart — an explicit budget the size of the derived one produces
+	// identical numbers — so a check that the container limit was actually read
+	// has to read this.
+	DownloadAdmissionBudgetSource = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "download_admission_budget_source",
+			Help: "Provenance of the active download memory budget; 1 for the source in effect.",
+		},
+		[]string{"source"},
+	)
+	DownloadAdmissionMemoryBudgetBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "download_admission_memory_budget_bytes",
+			Help: "Configured or derived process-local memory design budget for admitted downloads.",
+		},
+	)
+	// DownloadAdmissionMemoryBudgetEffectiveBytes is the budget after the safety
+	// margin — the figure the capacities were actually sized against, and the one
+	// a real-memory probe has to compare its peak with. Exported rather than left
+	// to the reader to recompute, because reconstructing it means knowing both
+	// the budget and the margin, and a probe that guesses either measures against
+	// the wrong ceiling.
+	DownloadAdmissionMemoryBudgetEffectiveBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "download_admission_memory_budget_effective_bytes",
+			Help: "Download memory design budget after the configured safety margin.",
+		},
+	)
 	DownloadAdmissionRejectedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "download_admission_rejected_total",
 			Help: "Download admission refusals by fixed reason.",
 		},
 		[]string{"reason"},
+	)
+	DownloadAdmissionRejectedByProfileTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "download_admission_rejected_by_profile_total",
+			Help: "Download admission refusals by fixed profile and reason.",
+		},
+		[]string{"profile", "reason"},
 	)
 	DownloadAdmissionReleasedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -894,6 +945,9 @@ func Register() {
 		"admission_timeout", "client_gone",
 	} {
 		DownloadAdmissionRejectedTotal.WithLabelValues(reason).Add(0)
+		for _, profile := range []string{"block", "file", "raw", "history", "link_raw", "zip", "link_inline"} {
+			DownloadAdmissionRejectedByProfileTotal.WithLabelValues(profile, reason).Add(0)
+		}
 	}
 	for _, cause := range []string{"completed", "client_disconnect", "preparation_timeout", "idle_write_timeout", "storage_error", "response_error", "panic"} {
 		DownloadAdmissionReleasedTotal.WithLabelValues(cause).Add(0)
@@ -982,7 +1036,12 @@ func Register() {
 		DownloadAdmissionWaitersCurrent,
 		DownloadAdmissionWaitersByGate,
 		DownloadAdmissionTrackedIdentities,
+		DownloadAdmissionCapacity,
+		DownloadAdmissionBudgetSource,
+		DownloadAdmissionMemoryBudgetBytes,
+		DownloadAdmissionMemoryBudgetEffectiveBytes,
 		DownloadAdmissionRejectedTotal,
+		DownloadAdmissionRejectedByProfileTotal,
 		DownloadAdmissionReleasedTotal,
 		DownloadAdmissionDeadlineExpiredTotal,
 		DownloadAdmissionWriterUnreachableTotal,

@@ -35,6 +35,19 @@ type Config struct {
 	FileView            FileViewConfig                `yaml:"fileview"`
 	EnforcementProfiles map[string]EnforcementProfile `yaml:"enforcement_profiles"`
 	envOverrideErrors   []string
+	// downloadBudgetSource records where the active budget came from, so the
+	// startup line can say whether a number was configured or derived.
+	downloadBudgetSource string
+	// downloadBudgetSourceKind is the same fact as a fixed enum, for the metric
+	// and for tests. A drill that claims the cgroup limit was read cannot prove
+	// it from the resulting numbers: an explicit budget of the same size is
+	// indistinguishable. This is what makes that claim checkable.
+	downloadBudgetSourceKind string
+	// downloadCgroupLimit is the container memory limit this validation pass
+	// observed, or 0 when none is exposed. The derivation, the floor advice and
+	// the cgroup budget guard all read it, and a value that describes one machine
+	// must not be sampled once per consumer.
+	downloadCgroupLimit int64
 }
 
 // WebUploadsConfig holds browser upload behavior exposed to the web frontend.
@@ -434,11 +447,18 @@ func addClampedMonth(t time.Time) time.Time {
 
 // FileViewConfig holds file preview and streaming settings
 type FileViewConfig struct {
-	MaxPreviewBytes      int64    `yaml:"max_preview_bytes"`       // Maximum file size for general inline preview (default: 1GB)
-	MaxVideoBytes        int64    `yaml:"max_video_bytes"`         // Maximum file size for video preview (default: 10GB)
-	MaxTextBytes         int64    `yaml:"max_text_bytes"`          // Maximum file size for text preview (default: 50MB)
-	MaxIWorkPreviewBytes int64    `yaml:"max_iwork_preview_bytes"` // Maximum size for extracted iWork preview (default: 50MB)
-	PreviewExtensions    []string `yaml:"preview_extensions"`      // Extensions that should route to the frontend preview shell
+	MaxPreviewBytes      int64 `yaml:"max_preview_bytes"`       // Maximum file size for general inline preview (default: 1GB)
+	MaxVideoBytes        int64 `yaml:"max_video_bytes"`         // Maximum file size for video preview (default: 10GB)
+	MaxTextBytes         int64 `yaml:"max_text_bytes"`          // Maximum file size for text preview (default: 50MB)
+	MaxIWorkPreviewBytes int64 `yaml:"max_iwork_preview_bytes"` // Maximum size for extracted iWork preview (default: 50MB)
+	// MaxIWorkSourceBytes caps the iWork *source* document, which the preview
+	// branch materialises whole. D6 measured the peak at ~4x the source for a
+	// plaintext library and ~6x when encrypted — a 256 MiB document costs 1.5 GiB
+	// — so the general 1 GiB preview limit is not an in-memory budget for this
+	// path. Sizing max_active_raw for it instead would throttle ordinary raw
+	// streams, which cost one block, by two orders of magnitude. Default 32 MiB.
+	MaxIWorkSourceBytes int64    `yaml:"max_iwork_source_bytes"`
+	PreviewExtensions   []string `yaml:"preview_extensions"` // Extensions that should route to the frontend preview shell
 }
 
 var supportedFileViewPreviewExtensions = []string{
@@ -520,10 +540,14 @@ type CORSConfig struct {
 }
 
 // DownloadAdmissionConfig holds the process-local download admission contract.
-// D1 ships this disabled with zero values. Positive values are for measured
-// deployments after the later D phases, not defaults that claim safe capacity.
+// Auto mode derives memory-sensitive capacities from the deployment budget;
+// manual mode accepts explicit capacities and validates the same design.
 type DownloadAdmissionConfig struct {
 	Enabled                bool          `yaml:"enabled"`
+	CapacityMode           string        `yaml:"capacity_mode"`
+	MemoryBudgetPercent    int           `yaml:"memory_budget_percent"`
+	RawCapacityPercent     int           `yaml:"raw_capacity_percent"`
+	SafetyMarginPercent    int           `yaml:"safety_margin_percent"`
 	MaxActivePerNode       int           `yaml:"max_active_per_node"`
 	MaxActivePerAuthUser   int           `yaml:"max_active_per_auth_user"`
 	MaxActivePerLinkSource int           `yaml:"max_active_per_link_source"`
@@ -541,6 +565,7 @@ type DownloadAdmissionConfig struct {
 	MaxActiveLinkRaw       int           `yaml:"max_active_link_raw"`
 	MaxActiveZIP           int           `yaml:"max_active_zip"`
 	MaxActiveLinkInline    int           `yaml:"max_active_link_inline"`
+	MemoryBudgetBytes      int64         `yaml:"memory_budget_bytes"`
 }
 
 // SeafHTTPConfig holds Seafile-compatible file transfer settings
@@ -762,6 +787,25 @@ const (
 	DefaultSyncBlockMaxBytes int64 = 16 * 1024 * 1024
 	MaxSyncBlockMaxBytes     int64 = 64 * 1024 * 1024
 
+	// Download admission sizes are derived from the D6 measurements. Encrypted
+	// prefetch keeps the current and next block plus the encrypted source, so the
+	// 4.5x block-size figure is the conservative design cost used for validation.
+	DefaultDownloadAdmissionMemoryBudgetBytes   int64 = 2 * 1024 * 1024 * 1024
+	MaxDownloadAdmissionMemoryBudgetBytes       int64 = 1 << 40 // 1 TiB operator ceiling
+	DefaultDownloadAdmissionMemoryBudgetPercent       = 25
+	// The cgroup guard and the accepted range share this ceiling, so the setting
+	// cannot promise a share the guard will refuse. It also stops a deployment
+	// handing most of the container to one subsystem.
+	MaxDownloadAdmissionMemoryBudgetPercent             = 50
+	DefaultDownloadAdmissionRawCapacityPercent          = 33
+	DefaultDownloadAdmissionSafetyMarginPercent         = 20
+	MaxDownloadAdmissionAutoNodeSlots                   = 64
+	MaxDownloadAdmissionAutoRawSlots                    = 32
+	DownloadAdmissionPlaintextPeakBytes           int64 = 4 * 1024 * 1024
+	DownloadAdmissionEncryptedPeakNumerator             = 9
+	DownloadAdmissionEncryptedPeakDenominator           = 2
+	DownloadAdmissionIWorkEncryptedPeakMultiplier       = 6
+
 	// Sync block in-flight admission (subcontract B / X10).
 	//
 	// The ceilings are not the safety mechanism — the measured default is. They
@@ -906,6 +950,31 @@ const (
 	MaxDownloadAdmissionPreparation        = 1 * time.Hour
 	MaxDownloadAdmissionIdleWrite          = 15 * time.Minute
 	MaxDownloadAdmissionRetryAfter         = 1 * time.Hour
+
+	// The supported nginx topology must never preempt these deadlines. D3 and §9
+	// of the D0 contract claim the application-owned deadline is the
+	// authoritative one, and that is only true while the proxy's own timers are
+	// strictly longer — otherwise a transfer dies on nginx's clock, the
+	// operator's configured tolerance silently does nothing, and the release is
+	// misattributed to a client disconnect instead of the idle-write timeout.
+	//
+	// Two separate floors, because the two phases are silent in different
+	// directions. proxy_read_timeout measures the interval between successive
+	// reads from the backend; send_timeout measures nginx being unable to write
+	// downstream.
+	//
+	// The read floor spans preparation *plus* one idle interval. Nothing is sent
+	// upstream-to-nginx during preparation, and nothing is sent during the first
+	// storage read either — that read sits after StartStreaming and is bounded by
+	// the idle-write deadline, not the preparation one. Summing only preparation
+	// would leave the phase D6 added in the pre-first-write fix uncovered.
+	//
+	// The idle floor is twice the idle-write ceiling because progress restarts
+	// the interval, so the span from the streaming phase change to the first
+	// deadline can approach 2x that ceiling. At the shipped 60s the old 120s
+	// send_timeout left exactly zero margin in that case.
+	MinNginxProxyReadTimeout = MaxDownloadAdmissionPreparation + MaxDownloadAdmissionIdleWrite
+	MinNginxSendTimeout      = 2 * MaxDownloadAdmissionIdleWrite
 )
 
 // validateCheckBlocksBounds checks the subcontract C knobs.
@@ -1261,6 +1330,8 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
+	cfg.logDownloadAdmissionCapacity()
+
 	// The per-session staging ceiling is effectively the maximum web-block file
 	// size. When the block flow is enabled, the max file size is unlimited, and the
 	// ceiling is left to derive (0), it falls back to a fixed operational default —
@@ -1287,7 +1358,35 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// DefaultConfig returns sensible defaults
+func defaultDownloadAdmissionConfig() DownloadAdmissionConfig {
+	return DownloadAdmissionConfig{
+		Enabled:                true,
+		CapacityMode:           "auto",
+		MemoryBudgetPercent:    DefaultDownloadAdmissionMemoryBudgetPercent,
+		RawCapacityPercent:     DefaultDownloadAdmissionRawCapacityPercent,
+		SafetyMarginPercent:    DefaultDownloadAdmissionSafetyMarginPercent,
+		MaxActivePerNode:       16,
+		MaxActivePerAuthUser:   6,
+		MaxActivePerLinkSource: 6,
+		MaxActivePerClientLink: 3,
+		MaxWaitersPerIdentity:  4,
+		MaxWaitersPerNode:      24,
+		AdmissionWait:          2 * time.Second,
+		PreparationDeadline:    60 * time.Second,
+		IdleWriteTimeout:       60 * time.Second,
+		RetryAfter:             10 * time.Second,
+		MaxActiveBlock:         12,
+		MaxActiveFile:          12,
+		MaxActiveRaw:           4,
+		MaxActiveHistory:       6,
+		MaxActiveLinkRaw:       12,
+		MaxActiveZIP:           4,
+		MaxActiveLinkInline:    8,
+		MemoryBudgetBytes:      0,
+	}
+}
+
+// DefaultConfig returns sensible defaults.
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
@@ -1436,7 +1535,7 @@ func DefaultConfig() *Config {
 			UploadLinkMaxInflightPerSource:  DefaultUploadLinkMaxInflightPerSource,
 			UploadLinkMaxInflightPerNode:    DefaultUploadLinkMaxInflightPerNode,
 		},
-		DownloadAdmission: DownloadAdmissionConfig{},
+		DownloadAdmission: defaultDownloadAdmissionConfig(),
 		OnlyOffice: OnlyOfficeConfig{
 			Enabled:           false,
 			VerifyCertificate: true,
@@ -1461,6 +1560,7 @@ func DefaultConfig() *Config {
 			MaxVideoBytes:        10 * 1024 * 1024 * 1024, // 10 GB for videos (4K, long recordings)
 			MaxTextBytes:         50 * 1024 * 1024,        // 50 MB for text files (prevent browser freeze)
 			MaxIWorkPreviewBytes: 50 * 1024 * 1024,        // 50 MB for iWork previews
+			MaxIWorkSourceBytes:  32 * 1024 * 1024,        // 32 MiB source -> ~192 MiB measured peak when encrypted
 			PreviewExtensions:    defaultFileViewPreviewExtensions(),
 		},
 		EnforcementProfiles: map[string]EnforcementProfile{
@@ -1497,7 +1597,7 @@ func (c *Config) applyEnvOverrides() {
 		c.Server.DesktopCustomLogo = strings.TrimSpace(v)
 	}
 
-	// Download admission (D1 schema; shipped disabled until D6 measurement)
+	// Download admission
 	if v := os.Getenv("DOWNLOAD_ADMISSION_ENABLED"); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "true", "1":
@@ -1506,6 +1606,26 @@ func (c *Config) applyEnvOverrides() {
 			c.DownloadAdmission.Enabled = false
 		default:
 			c.addEnvOverrideError("DOWNLOAD_ADMISSION_ENABLED must be true, false, 1, or 0, got %q", v)
+		}
+	}
+	if v := os.Getenv("DOWNLOAD_ADMISSION_CAPACITY_MODE"); v != "" {
+		c.DownloadAdmission.CapacityMode = strings.ToLower(strings.TrimSpace(v))
+	}
+	for _, override := range []struct {
+		env    string
+		target *int
+	}{
+		{"DOWNLOAD_ADMISSION_MEMORY_BUDGET_PERCENT", &c.DownloadAdmission.MemoryBudgetPercent},
+		{"DOWNLOAD_ADMISSION_RAW_CAPACITY_PERCENT", &c.DownloadAdmission.RawCapacityPercent},
+		{"DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT", &c.DownloadAdmission.SafetyMarginPercent},
+	} {
+		if v := os.Getenv(override.env); v != "" {
+			i, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil {
+				c.addEnvOverrideError("%s is invalid: %v", override.env, err)
+			} else {
+				*override.target = i
+			}
 		}
 	}
 	for _, override := range []struct {
@@ -1551,6 +1671,14 @@ func (c *Config) applyEnvOverrides() {
 			} else {
 				*override.target = d
 			}
+		}
+	}
+	if v := os.Getenv("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES"); v != "" {
+		budget, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			c.addEnvOverrideError("DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES is invalid: %v", err)
+		} else {
+			c.DownloadAdmission.MemoryBudgetBytes = budget
 		}
 	}
 
@@ -2032,6 +2160,17 @@ func (c *Config) applyEnvOverrides() {
 			c.FileView.MaxIWorkPreviewBytes = i
 		}
 	}
+	if v := os.Getenv("FILEVIEW_MAX_IWORK_SOURCE_BYTES"); v != "" {
+		// Reported rather than dropped. This knob is part of the D6 memory
+		// design now, so a malformed value silently leaving the default in place
+		// means the deployment is sized against something the operator did not
+		// ask for.
+		if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {
+			c.addEnvOverrideError("FILEVIEW_MAX_IWORK_SOURCE_BYTES is invalid: %v", err)
+		} else {
+			c.FileView.MaxIWorkSourceBytes = i
+		}
+	}
 	if v := os.Getenv("FILEVIEW_PREVIEW_EXTENSIONS"); v != "" {
 		c.FileView.PreviewExtensions = strings.Split(v, ",")
 	}
@@ -2141,8 +2280,614 @@ func ValidateDownloadAdmissionConfig(d DownloadAdmissionConfig) error {
 	return validateDownloadAdmissionConfig(d, 0)
 }
 
+// logDownloadAdmissionCapacity states the capacities the node will actually
+// run with.
+//
+// In auto mode these are derived at startup from the detected memory limit, so
+// they are a property of the host rather than of the config file — and the file
+// still carries the shipped reference values, which auto mode overwrites.
+// Without this line the only way to learn a node's real ceiling is to saturate
+// it and watch the gauge plateau, which is not something an operator should
+// have to do to answer "how many concurrent downloads does this node accept".
+func (c *Config) logDownloadAdmissionCapacity() {
+	if c == nil {
+		return
+	}
+	d := c.DownloadAdmission
+	if !d.Enabled {
+		slog.Info("download admission is disabled; storage-backed downloads have no aggregate bound on this node")
+		return
+	}
+	source := c.downloadBudgetSource
+	if source == "" {
+		source = "configured explicitly"
+	}
+	slog.Info("download admission capacity",
+		"mode", d.CapacityMode,
+		"budget_source", source,
+		"memory_budget_bytes", d.MemoryBudgetBytes,
+		"safety_margin_percent", d.SafetyMarginPercent,
+		"max_active_per_node", d.MaxActivePerNode,
+		"max_active_raw", d.MaxActiveRaw,
+		"max_active_file", d.MaxActiveFile,
+		"max_active_block", d.MaxActiveBlock,
+		"max_active_per_auth_user", d.MaxActivePerAuthUser,
+		"max_active_per_link_source", d.MaxActivePerLinkSource,
+		"max_waiters_per_identity", d.MaxWaitersPerIdentity,
+		"max_waiters_per_node", d.MaxWaitersPerNode,
+	)
+}
+
+// DownloadBudgetSource reports where the active download memory budget came
+// from: "configured", "cgroup" or "fallback". Empty before Validate() resolves.
+func (c *Config) DownloadBudgetSource() string {
+	if c == nil {
+		return ""
+	}
+	return c.downloadBudgetSourceKind
+}
+
+func (c *Config) resolveDownloadAdmissionCapacity() error {
+	if c == nil {
+		return nil
+	}
+	d := c.DownloadAdmission
+	mode := strings.ToLower(strings.TrimSpace(d.CapacityMode))
+	if mode == "" {
+		mode = "manual"
+	}
+	if mode != "auto" && mode != "manual" {
+		return fmt.Errorf("download_admission.capacity_mode must be auto or manual")
+	}
+	// The range stops at the same place the cgroup guard does. Accepting 1-100
+	// while the guard refused anything over 25 made most of the advertised range
+	// a configuration that parses, derives, and then cannot start.
+	if d.MemoryBudgetPercent <= 0 || d.MemoryBudgetPercent > MaxDownloadAdmissionMemoryBudgetPercent {
+		return fmt.Errorf("download_admission.memory_budget_percent must be between 1 and %d", MaxDownloadAdmissionMemoryBudgetPercent)
+	}
+	if d.RawCapacityPercent <= 0 || d.RawCapacityPercent >= 100 {
+		return fmt.Errorf("download_admission.raw_capacity_percent must be between 1 and 99")
+	}
+	if d.SafetyMarginPercent < 0 || d.SafetyMarginPercent >= 100 {
+		return fmt.Errorf("download_admission.safety_margin_percent must be between 0 and 99")
+	}
+
+	// Read the container limit once per validation, above every early return, and
+	// keep it on the Config. Three things need it and they must not disagree:
+	// the auto derivation, the floor advice, and the cgroup guard that runs after
+	// this function returns.
+	//
+	// The advice used to recover it by inverting the derivation
+	// (budget * 100 / percent). That inversion undoes a truncating division, so
+	// it can under-report the container by up to 100/percent bytes — enough, at
+	// the exact threshold, to tell an operator no share can clear the floor when
+	// the real limit says one can. The guard read it a second time, which left a
+	// validation pass holding two snapshots of a value that is supposed to
+	// describe one machine.
+	//
+	// It has to be above the manual and disabled returns, not next to the
+	// derivation that uses it: the guard still applies in manual mode, and taking
+	// the snapshot only on the auto path would hand it a zero and switch it off.
+	c.downloadCgroupLimit, _ = cgroupMemoryLimit()
+	if c.downloadCgroupLimit < 0 {
+		c.downloadCgroupLimit = 0
+	}
+	detectedLimit := c.downloadCgroupLimit
+
+	if mode == "manual" {
+		// Manual carries its own number, so record that before returning:
+		// leaving the provenance unset published every source as zero and broke
+		// the contract that exactly one is in effect.
+		d.CapacityMode = mode
+		c.downloadBudgetSource = "configured explicitly"
+		c.downloadBudgetSourceKind = "configured"
+		c.DownloadAdmission = d
+		return nil
+	}
+
+	// Nothing is derived for a section that is switched off. Deriving anyway had
+	// two consequences, in opposite directions. It rewrote the caps before
+	// rejectIncompleteDisabledDownloadAdmission could look at them, so a
+	// half-written opt-out was repaired into a complete-looking one and the
+	// completeness rule inspected values the operator never wrote. And it made a
+	// deliberate opt-out fail to start on a small container — a 1 GiB limit
+	// cannot size one raw slot plus one stream slot, so the server refused to
+	// boot over the dimensions of a guard it was told not to run.
+	//
+	// The fallback used when no limit is exposed is a reference for the 8 GiB
+	// baseline, not a deduction: without a cgroup the process knows nothing
+	// about the machine it is on.
+	if !d.Enabled {
+		d.CapacityMode = mode
+		c.DownloadAdmission = d
+		return nil
+	}
+
+	// A positive budget here is either the operator's or one this function
+	// materialised on an earlier pass, and the two are not distinguished. The
+	// consequence, stated rather than discovered: re-validating the same Config
+	// after the container grew keeps the budget derived from the smaller one,
+	// because a derived budget looks configured on the way back in. Shrinking is
+	// caught either way — the cgroup guard charges the retained budget against
+	// the new limit and refuses it.
+	//
+	// Load() validates once, so this is not a startup path. Making Validate()
+	// genuinely reactive would mean recording which of the two a positive budget
+	// is instead of inferring it from being positive.
+	if d.MemoryBudgetBytes > 0 {
+		// Only classify once. A second Validate() sees the budget this pass
+		// materialised and would relabel a derived budget as configured — the
+		// metric exists precisely to distinguish those, so it must not change
+		// its answer because it was asked twice.
+		if c.downloadBudgetSourceKind == "" {
+			c.downloadBudgetSource = "configured explicitly"
+			c.downloadBudgetSourceKind = "configured"
+		}
+	} else {
+		if detectedLimit > 0 {
+			budget, ok := checkedNonNegativeMultiply(detectedLimit, int64(d.MemoryBudgetPercent))
+			if !ok {
+				return fmt.Errorf("download admission cgroup memory budget overflows")
+			}
+			d.MemoryBudgetBytes = budget / 100
+			c.downloadBudgetSource = fmt.Sprintf("%d%% of the detected cgroup limit %d", d.MemoryBudgetPercent, detectedLimit)
+			c.downloadBudgetSourceKind = "cgroup"
+		} else {
+			d.MemoryBudgetBytes = DefaultDownloadAdmissionMemoryBudgetBytes
+			c.downloadBudgetSource = "no cgroup limit detected, reference fallback"
+			c.downloadBudgetSourceKind = "fallback"
+		}
+	}
+	if err := validateDownloadAdmissionMemoryBudgetValue(d.MemoryBudgetBytes); err != nil {
+		return err
+	}
+
+	// Invalid cross-subsystem values are left for their owning validators to
+	// report with the more precise error. Auto-capacity derivation only runs on
+	// the complete input shape it can size safely.
+	if c.FileView.MaxIWorkSourceBytes <= 0 ||
+		c.FileView.MaxIWorkSourceBytes > c.FileView.MaxPreviewBytes ||
+		c.FileView.MaxIWorkPreviewBytes < 0 ||
+		c.SeafHTTP.SyncBlockMaxBytes <= 0 ||
+		c.SeafHTTP.SyncBlockMaxBytes > MaxSyncBlockMaxBytes {
+		d.CapacityMode = mode
+		c.DownloadAdmission = d
+		return nil
+	}
+	streamCost, rawCost, err := downloadAdmissionMemoryCosts(c)
+	if err != nil {
+		return err
+	}
+	effectiveBudget, err := downloadAdmissionEffectiveBudget(d.MemoryBudgetBytes, d.SafetyMarginPercent)
+	if err != nil {
+		return err
+	}
+
+	rawSlots, streamSlots, nodeSlots, ok := deriveDownloadAdmissionSlots(effectiveBudget, rawCost, streamCost, d.RawCapacityPercent)
+	if !ok {
+		// Name the arithmetic and the levers that can actually clear it. This is
+		// the one failure an operator meets by doing nothing wrong — a container
+		// smaller than roughly 1.3 GiB derives a budget below the floor — and a
+		// message that only says "too small" leaves them with a server that will
+		// not start and nothing to reach for. Which levers apply depends on how
+		// the budget was arrived at, so the advice is assembled rather than listed.
+		needed, ok := checkedNonNegativeAdd(rawCost, streamCost)
+		if !ok {
+			return fmt.Errorf("download admission slot costs overflow: raw %d bytes plus stream %d bytes", rawCost, streamCost)
+		}
+		return fmt.Errorf("download admission cannot size one raw slot (%d bytes) plus one stream slot (%d bytes) = %d bytes "+
+			"from the %d-byte budget, which is %d bytes after the %d%% safety margin. %s",
+			rawCost, streamCost, needed, d.MemoryBudgetBytes, effectiveBudget, d.SafetyMarginPercent,
+			downloadAdmissionFloorAdvice(c, d, rawCost, streamCost, detectedLimit))
+	}
+	capAt := func(policy, capacity int) int {
+		if capacity < 1 {
+			return 1
+		}
+		if policy < capacity {
+			return policy
+		}
+		return capacity
+	}
+	// Waiter caps are a queueing policy, not a memory quantity: parked requests
+	// hold no transfer. Zero means "refuse immediately" in the contract, so it
+	// must survive derivation rather than be floored to one.
+	//
+	// Only an exact zero is passed through as policy. A negative is left exactly
+	// as written so validateDownloadAdmissionConfig can name it: folding
+	// everything non-positive to zero turned an invalid value into a silently
+	// accepted no-queue policy, so the mistake started the server rather than
+	// stopping it.
+	capWaitersAt := func(policy, configured int) int {
+		if configured <= 0 {
+			return configured
+		}
+		if policy < configured {
+			return policy
+		}
+		return configured
+	}
+	perIdentity := (nodeSlots + 2) / 3
+	if perIdentity < 1 {
+		perIdentity = 1
+	}
+	linkClient := (perIdentity + 1) / 2
+	if linkClient < 1 {
+		linkClient = 1
+	}
+	d.CapacityMode = mode
+	d.MaxActivePerNode = nodeSlots
+	d.MaxActivePerAuthUser = capAt(6, perIdentity)
+	d.MaxActivePerLinkSource = capAt(6, perIdentity)
+	d.MaxActivePerClientLink = capAt(3, linkClient)
+	d.MaxWaitersPerIdentity = capWaitersAt(4, d.MaxWaitersPerIdentity)
+	d.MaxWaitersPerNode = capWaitersAt(nodeSlots*2, d.MaxWaitersPerNode)
+	d.MaxActiveBlock = capAt(16, streamSlots)
+	d.MaxActiveFile = capAt(16, streamSlots)
+	d.MaxActiveRaw = capAt(MaxDownloadAdmissionAutoRawSlots, rawSlots)
+	d.MaxActiveHistory = capAt(6, streamSlots)
+	d.MaxActiveLinkRaw = capAt(12, streamSlots)
+	d.MaxActiveZIP = capAt(4, streamSlots)
+	d.MaxActiveLinkInline = capAt(8, streamSlots)
+	c.DownloadAdmission = d
+	return nil
+}
+
+// downloadAdmissionEffectiveBudget applies the configured safety margin. Both
+// the derivation and the final validation go through here: when they each held
+// their own notion of the margin — one configurable, one a hardcoded 4/5 — any
+// margin below 20 derived a design that the validator then refused, so the
+// server would not start on capacities it had just computed for itself.
+func downloadAdmissionEffectiveBudget(budget int64, safetyMarginPercent int) (int64, error) {
+	if safetyMarginPercent < 0 || safetyMarginPercent >= 100 {
+		return 0, fmt.Errorf("download_admission.safety_margin_percent must be between 0 and 99")
+	}
+	effective, ok := checkedNonNegativeMultiply(budget, int64(100-safetyMarginPercent))
+	if !ok {
+		return 0, fmt.Errorf("download admission effective memory budget overflows")
+	}
+	return effective / 100, nil
+}
+
+// downloadAdmissionFloorAdvice names the levers that can actually clear this
+// deployment's floor, and only those.
+//
+// Generic advice was worse than none, in three ways this function exists to
+// avoid. An explicit budget is not an escape from a small container —
+// validateDownloadAdmissionCgroupBudget caps it at the same share the
+// percentage would have derived. Raising the percentage does nothing when the
+// budget was configured rather than derived, and nothing at all once the
+// container is small enough that even the maximum share falls short. And
+// fileview.max_iwork_preview_bytes only matters while the preview term is the
+// one that dominates a raw slot; at the shipped values the iWork source term
+// wins, so naming it sends the operator to a setting that changes nothing.
+//
+// The raw lever is whichever term currently dominates rawCost. The stream lever
+// is offered alongside it because the stream cost is the *other* term of the sum
+// that failed, whichever raw term wins — but only while lowering it would move
+// anything: streamCost is max(plaintext peak, 4.5x the block size), so below
+// roughly 0.89 MiB of block size the plaintext floor is what is being charged
+// and seafhttp.sync_block_max_bytes has stopped being a lever. Validation only
+// requires that setting to be positive, so that band is reachable.
+//
+// detectedLimit is the container limit in bytes, or 0 when none is exposed. It
+// is passed in rather than recovered by inverting the derivation, and it decides
+// whether the share is worth recommending at all in *both* budget provenances: an
+// explicit budget is capped at a share of the same limit, so on a container too
+// small for the maximum share, "raise memory_budget_bytes" is the same dead end
+// as "raise memory_budget_percent".
+//
+// d is the section as resolved so far, not c.DownloadAdmission: the derived
+// budget lives in the local copy until the function returns successfully, so
+// reading it from c here would see the pre-derivation value — zero in auto mode,
+// which made every container look too small for any share.
+func downloadAdmissionFloorAdvice(c *Config, d DownloadAdmissionConfig, rawCost, streamCost, detectedLimit int64) string {
+	rawLever := "fileview.max_iwork_preview_bytes or fileview.max_iwork_source_bytes"
+	if iwork, ok := checkedNonNegativeMultiply(c.FileView.MaxIWorkSourceBytes, DownloadAdmissionIWorkEncryptedPeakMultiplier); ok && iwork == rawCost {
+		rawLever = "fileview.max_iwork_source_bytes"
+	}
+	costAdvice := fmt.Sprintf("lower %s, which sets the raw slot cost", rawLever)
+	if streamCost > DownloadAdmissionPlaintextPeakBytes {
+		costAdvice += ", or seafhttp.sync_block_max_bytes, which sets the stream slot cost"
+	}
+
+	// Recommending a share the container cannot give sends the operator into
+	// either no change at all or the setting's own range error, which is the
+	// failure mode this whole function exists to stop producing.
+	shareExhausted := detectedLimit > 0 && !downloadAdmissionMaxShareClearsFloor(detectedLimit, d, rawCost, streamCost)
+
+	switch c.downloadBudgetSourceKind {
+	case "cgroup":
+		if shareExhausted {
+			return fmt.Sprintf("The budget is %d%% of the detected container limit, and even the maximum %d%% share "+
+				"of this container cannot reach the floor, so neither download_admission.memory_budget_percent nor an "+
+				"explicit download_admission.memory_budget_bytes can resolve it. Either %s, or set "+
+				"download_admission.enabled: false on a node this small.",
+				d.MemoryBudgetPercent, MaxDownloadAdmissionMemoryBudgetPercent, costAdvice)
+		}
+		return fmt.Sprintf("The budget is %d%% of the detected container limit, and an explicit "+
+			"download_admission.memory_budget_bytes is held to that same share, so it is not a way around this. "+
+			"Raise download_admission.memory_budget_percent (up to %d), %s, or set "+
+			"download_admission.enabled: false on a node this small.",
+			d.MemoryBudgetPercent, MaxDownloadAdmissionMemoryBudgetPercent, costAdvice)
+	case "configured":
+		if shareExhausted {
+			return fmt.Sprintf("The budget is configured explicitly, so download_admission.memory_budget_percent "+
+				"does not change it — and a detected container limit caps it at that share, of which even the "+
+				"maximum %d%% cannot reach the floor, so raising download_admission.memory_budget_bytes cannot "+
+				"resolve it either. Either %s, or set download_admission.enabled: false on a node this small.",
+				MaxDownloadAdmissionMemoryBudgetPercent, costAdvice)
+		}
+		return fmt.Sprintf("The budget is configured explicitly, so download_admission.memory_budget_percent "+
+			"does not change it. Raise download_admission.memory_budget_bytes instead — a detected container limit "+
+			"still caps it at memory_budget_percent of that limit, so raise that share too if one is in force. "+
+			"Alternatively %s, or set download_admission.enabled: false.", costAdvice)
+	default:
+		return fmt.Sprintf("No container limit was detected, so the budget is the reference fallback. "+
+			"Set download_admission.memory_budget_bytes for this deployment, %s, or set "+
+			"download_admission.enabled: false.", costAdvice)
+	}
+}
+
+// downloadAdmissionMaxShareClearsFloor asks whether the largest share this
+// container may give download admission would fit one raw slot plus one stream
+// slot. Below roughly 660 MiB at the shipped costs nothing does, and the operator
+// needs to be told that rather than sent to a setting they may already be at.
+func downloadAdmissionMaxShareClearsFloor(limit int64, d DownloadAdmissionConfig, rawCost, streamCost int64) bool {
+	if limit <= 0 {
+		return false
+	}
+	best, ok := checkedNonNegativeMultiply(limit, int64(MaxDownloadAdmissionMemoryBudgetPercent))
+	if !ok {
+		return false
+	}
+	best /= 100
+	usable, err := downloadAdmissionEffectiveBudget(best, d.SafetyMarginPercent)
+	if err != nil {
+		return false
+	}
+	needed, ok := checkedNonNegativeAdd(rawCost, streamCost)
+	if !ok {
+		return false
+	}
+	return usable >= needed
+}
+
+func deriveDownloadAdmissionSlots(effectiveBudget, rawCost, streamCost int64, rawPercent int) (int, int, int, bool) {
+	for nodeSlots := MaxDownloadAdmissionAutoNodeSlots; nodeSlots >= 2; nodeSlots-- {
+		rawTarget := nodeSlots * rawPercent / 100
+		if rawTarget < 1 {
+			rawTarget = 1
+		}
+		if rawTarget > MaxDownloadAdmissionAutoRawSlots {
+			rawTarget = MaxDownloadAdmissionAutoRawSlots
+		}
+		// The floor is the *achieved share* the request tolerates — three
+		// quarters of it — not a fixed quarter of the node total. A fixed
+		// nodeSlots/4 floor made the knob non-monotonic in both directions:
+		// below 25% the inner range came out empty at large node counts, so the
+		// search fell through to a much smaller total (1% yielded 7 slots where
+		// 33% yielded 16), and at or above 25% every value collapsed onto the
+		// same split. Expressing it as a share keeps the outer loop from buying
+		// a larger node total by starving raw, while leaving enough slack that
+		// the integer split still lands.
+		rawFloor := (nodeSlots*rawPercent*3 + 399) / 400
+		if rawFloor < 1 {
+			rawFloor = 1
+		}
+		if rawFloor > rawTarget {
+			rawFloor = rawTarget
+		}
+		for rawSlots := rawTarget; rawSlots >= rawFloor; rawSlots-- {
+			streamSlots := nodeSlots - rawSlots
+			if streamSlots < 1 {
+				continue
+			}
+			rawTotal, ok := checkedNonNegativeMultiply(int64(rawSlots), rawCost)
+			if !ok {
+				continue
+			}
+			streamTotal, ok := checkedNonNegativeMultiply(int64(streamSlots), streamCost)
+			if !ok {
+				continue
+			}
+			total, ok := checkedNonNegativeAdd(rawTotal, streamTotal)
+			if ok && total <= effectiveBudget {
+				return rawSlots, streamSlots, nodeSlots, true
+			}
+		}
+	}
+	return 0, 0, 0, false
+}
+
 func (c *Config) validateDownloadAdmissionBounds() error {
-	return validateDownloadAdmissionConfig(c.DownloadAdmission, c.Server.WriteTimeout)
+	if err := c.rejectIncompleteDisabledDownloadAdmission(); err != nil {
+		return err
+	}
+	if err := validateDownloadAdmissionConfig(c.DownloadAdmission, c.Server.WriteTimeout); err != nil {
+		return err
+	}
+	return c.validateDownloadAdmissionMemoryBudget()
+}
+
+// rejectIncompleteDisabledDownloadAdmission holds `enabled: false` to the
+// section's structural rules. The effective values must satisfy the checks that
+// do not depend on the active download memory budget.
+//
+// A disabled section still needs positive structural values, because a later
+// enable must not discover a malformed section during an incident. The combined
+// memory arithmetic remains deferred until the guard is active.
+//
+// It is a cheap guard rather than a load-bearing one: every shipped
+// configuration is enabled and complete, and a file that omits the section
+// inherits the measured defaults, so this fires only on a hand-written section.
+// It is also why the section is refused rather than repaired — an explicit
+// `enabled: false` is the documented opt-out, and a loader that overrides an
+// explicit value because it dislikes the surrounding numbers cannot be reasoned
+// about. Both intents stay one edit away.
+//
+// The scope is the section's own structural rules. The configured memory design is
+// deliberately **not** checked here, even though an enabled section must pass
+// it, because it multiplies the caps by values other subsystems own:
+// seafhttp.sync_block_max_bytes is subcontract B's PUT body cap, and the
+// fileview limits are the preview subsystem's. Charging a disabled download
+// guard against them refuses configurations that are correct on their own terms
+// — raising sync_block_max_bytes to its sanctioned 64 MiB ceiling would stop a
+// deployment from booting for a reason about downloads it is not admitting —
+// and it preempts those subsystems' more precise errors. With the section off
+// there is no slot count for a budget to apply to.
+//
+// So this catches an incomplete *section*, not an unsafe *design*. A section
+// that is structurally complete but overshoots the combined memory budget is
+// accepted while disabled and refused when enabled.
+//
+// server.write_timeout is excluded for the same shape of reason: it conflicts
+// only with an active guard.
+//
+// This runs after applyEnvOverrides, so a section completed through the
+// environment is unaffected.
+func (c *Config) rejectIncompleteDisabledDownloadAdmission() error {
+	if c == nil || c.DownloadAdmission.Enabled {
+		return nil
+	}
+
+	candidate := c.DownloadAdmission
+	candidate.Enabled = true
+	if err := validateDownloadAdmissionConfig(candidate, 0); err != nil {
+		return fmt.Errorf("download_admission is disabled with a structurally incomplete configuration: "+
+			"remove the section to inherit the measured defaults, or keep enabled: false alongside complete structural values (%w)", err)
+	}
+	// A zero budget is the *instruction to derive one* in auto mode, not a
+	// missing value, so it is only incomplete for a section that would have to
+	// carry its own number.
+	if !strings.EqualFold(strings.TrimSpace(candidate.CapacityMode), "auto") || candidate.MemoryBudgetBytes != 0 {
+		if err := validateDownloadAdmissionMemoryBudgetValue(candidate.MemoryBudgetBytes); err != nil {
+			return fmt.Errorf("download_admission is disabled with a structurally incomplete configuration: "+
+				"remove the section to inherit the measured defaults, or keep enabled: false alongside complete structural values (%w)", err)
+		}
+	}
+	return nil
+}
+
+func validateDownloadAdmissionMemoryBudgetValue(budget int64) error {
+	if budget <= 0 || budget > MaxDownloadAdmissionMemoryBudgetBytes {
+		return fmt.Errorf("download_admission.memory_budget_bytes must be between 1 and %d", MaxDownloadAdmissionMemoryBudgetBytes)
+	}
+	return nil
+}
+
+func checkedNonNegativeAdd(a, b int64) (int64, bool) {
+	maxInt64Value := int64(^uint64(0) >> 1)
+	if a < 0 || b < 0 || a > maxInt64Value-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+func checkedNonNegativeMultiply(a, b int64) (int64, bool) {
+	maxInt64Value := int64(^uint64(0) >> 1)
+	if a < 0 || b < 0 || (a != 0 && b > maxInt64Value/a) {
+		return 0, false
+	}
+	return a * b, true
+}
+
+func downloadAdmissionMemoryCosts(c *Config) (int64, int64, error) {
+	source := c.FileView.MaxIWorkSourceBytes
+	iworkCost, ok := checkedNonNegativeMultiply(source, DownloadAdmissionIWorkEncryptedPeakMultiplier)
+	if !ok {
+		return 0, 0, fmt.Errorf("download admission memory design overflows while calculating iWork cost")
+	}
+	encryptedNumerator, ok := checkedNonNegativeMultiply(c.SeafHTTP.SyncBlockMaxBytes, DownloadAdmissionEncryptedPeakNumerator)
+	if !ok {
+		return 0, 0, fmt.Errorf("download admission memory design overflows while calculating encrypted stream cost")
+	}
+	encryptedNumerator, ok = checkedNonNegativeAdd(encryptedNumerator, DownloadAdmissionEncryptedPeakDenominator-1)
+	if !ok {
+		return 0, 0, fmt.Errorf("download admission memory design overflows while rounding encrypted stream cost")
+	}
+	streamCost := encryptedNumerator / DownloadAdmissionEncryptedPeakDenominator
+	if DownloadAdmissionPlaintextPeakBytes > streamCost {
+		streamCost = DownloadAdmissionPlaintextPeakBytes
+	}
+	previewBase, ok := checkedNonNegativeAdd(streamCost, source)
+	if !ok {
+		return 0, 0, fmt.Errorf("download admission memory design overflows while calculating preview base")
+	}
+	previewCost, ok := checkedNonNegativeAdd(previewBase, c.FileView.MaxIWorkPreviewBytes)
+	if !ok {
+		return 0, 0, fmt.Errorf("fileview.max_iwork_preview_bytes=%d overflows the download admission memory design", c.FileView.MaxIWorkPreviewBytes)
+	}
+	rawCost := iworkCost
+	if streamCost > rawCost {
+		rawCost = streamCost
+	}
+	if previewCost > rawCost {
+		rawCost = previewCost
+	}
+	return streamCost, rawCost, nil
+}
+
+func (c *Config) validateDownloadAdmissionMemoryBudget() error {
+	if c == nil || !c.DownloadAdmission.Enabled {
+		return nil
+	}
+
+	source := c.FileView.MaxIWorkSourceBytes
+	if source <= 0 {
+		return fmt.Errorf("fileview.max_iwork_source_bytes must be greater than zero when download_admission.enabled is true")
+	}
+	if source > c.FileView.MaxPreviewBytes {
+		return fmt.Errorf("fileview.max_iwork_source_bytes=%d must not exceed fileview.max_preview_bytes=%d", source, c.FileView.MaxPreviewBytes)
+	}
+	if c.FileView.MaxIWorkPreviewBytes < 0 {
+		return fmt.Errorf("fileview.max_iwork_preview_bytes must not be negative")
+	}
+	budget := c.DownloadAdmission.MemoryBudgetBytes
+	if err := validateDownloadAdmissionMemoryBudgetValue(budget); err != nil {
+		return err
+	}
+	designBudget, err := downloadAdmissionEffectiveBudget(budget, c.DownloadAdmission.SafetyMarginPercent)
+	if err != nil {
+		return err
+	}
+	// SyncBlockMaxBytes has its own validation later in Config.Validate. Avoid
+	// masking that more precise error if it is invalid here.
+	if c.SeafHTTP.SyncBlockMaxBytes <= 0 || c.SeafHTTP.SyncBlockMaxBytes > MaxSyncBlockMaxBytes {
+		return nil
+	}
+
+	rawSlots := int64(c.DownloadAdmission.MaxActivePerNode)
+	if rawCap := int64(c.DownloadAdmission.MaxActiveRaw); rawCap > 0 && rawCap < rawSlots {
+		rawSlots = rawCap
+	}
+	if source > designBudget/DownloadAdmissionIWorkEncryptedPeakMultiplier {
+		return fmt.Errorf("fileview.max_iwork_source_bytes=%d is too large for the %d-byte safety-adjusted download admission budget", source, designBudget)
+	}
+	streamCost, rawCost, err := downloadAdmissionMemoryCosts(c)
+	if err != nil {
+		return err
+	}
+	if rawCost > designBudget {
+		return fmt.Errorf("download admission memory design has a raw-slot cost of %d bytes, above the %d-byte safety-adjusted budget", rawCost, designBudget)
+	}
+	otherSlots := int64(c.DownloadAdmission.MaxActivePerNode) - rawSlots
+	rawTotal, ok := checkedNonNegativeMultiply(rawSlots, rawCost)
+	if !ok {
+		return fmt.Errorf("download admission memory design overflows while calculating %d raw slots at %d bytes", rawSlots, rawCost)
+	}
+	otherTotal, ok := checkedNonNegativeMultiply(otherSlots, streamCost)
+	if !ok {
+		return fmt.Errorf("download admission memory design overflows while calculating %d other slots at %d bytes", otherSlots, streamCost)
+	}
+	total, ok := checkedNonNegativeAdd(rawTotal, otherTotal)
+	if !ok {
+		return fmt.Errorf("download admission memory design overflows while summing slot costs")
+	}
+	if total > designBudget {
+		return fmt.Errorf("download admission memory design is %d bytes with %d raw slots at %d bytes and %d other slots at %d bytes; safety-adjusted budget is %d bytes", total, rawSlots, rawCost, otherSlots, streamCost, designBudget)
+	}
+	return nil
 }
 
 func validateDownloadAdmissionConfig(d DownloadAdmissionConfig, serverWriteTimeout time.Duration) error {
@@ -2263,7 +3008,13 @@ func (c *Config) Validate() error {
 	if len(c.envOverrideErrors) > 0 {
 		return fmt.Errorf("invalid environment override: %s", strings.Join(c.envOverrideErrors, "; "))
 	}
+	if err := c.resolveDownloadAdmissionCapacity(); err != nil {
+		return err
+	}
 	if err := c.validateDownloadAdmissionBounds(); err != nil {
+		return err
+	}
+	if err := c.validateDownloadAdmissionCgroupBudget(); err != nil {
 		return err
 	}
 	if c.Server.Port == "" {

@@ -57,15 +57,14 @@ of them updated.
 
 ## Production blockers — must close before go-live
 
-**Readiness verdict is still no-go as-is.** NF-1 closed 2026-07-25; **B4 and the
-sync public-link token auth gap remain open single-node blockers** and anonymous
-object-storage downloads are a separate production-posture blocker;
+**Readiness verdict is still no-go as-is.** NF-1 closed 2026-07-25; **B4 is
+closed, while the sync public-link token auth gap remains an open single-node
+blocker** and anonymous object-storage downloads are a separate production-posture blocker;
 multi-instance adds B1 and B5. See
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` | HIGH | Umbrella: **A1/A2 closed 2026-07-29; B closed 2026-07-30; C closed 2026-07-31; D1-D5 closed 2026-08-03** — D5 streams block GET through the canonical reader under `ProfileBlock` on the shared coordinator. The shared pre-first-write admission gap (`ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01`) was fixed 2026-08-03, so every phase of an admitted download is bounded. **D6 remains open:** capacities/real-nginx slow-client evidence are not yet measured. | Readiness B4 ⊇ registry X10/X11 — **still the single-node blocker until D closes**; see [`SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`](./SEAFHTTP-DOWNLOAD-ADMISSION-D0.md) |
 | `ISSUE-SYNC-LINK-TOKEN-AUTH-01` | HIGH | Public share-link download tokens are accepted by `syncAuthMiddleware` as repository credentials, so a bearer issued for a shared file can reach the repo sync surface as the link creator | Pre-existing authorization gap in `internal/api/server.go`; see `KNOWN_ISSUES.md` |
 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` | HIGH | Supported Compose policies grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known | Production posture — private buckets and effective endpoint policy must be verified before go-live; see `KNOWN_ISSUES.md` |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
@@ -83,6 +82,13 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
   Live integration covers both halves: both public endpoints for inline
   content, and a `.docx` fixture for the OnlyOffice credential (a `.md` fixture
   cannot reach that branch). Both mutation-verified against the cluster.
+- `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` — **Closed 2026-08-04** (B4 umbrella;
+  A1/A2, B, C and D0-D6 complete). Download admission is enabled in every
+  shipped configuration and its capacities are validated against the measured
+  2 GiB process-local budget. Object-storage anonymity and byte-rate shaping
+  remain separate findings.
+- `ISSUE-STREAMBLOCKS-VOID-01` — **Fixed 2026-08-03**; `StreamBlocks` now
+  returns errors and the seafhttp caller records delivered bytes only.
 
 ## Blockers that keep destructive GC disabled
 
@@ -99,7 +105,6 @@ on every replica in every DC until both close.
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01` | HIGH | `sesamefs_auth` is a replayable bearer in a JS-readable cookie → XSS = token theft | Readiness SEC-3 / NF-3 |
-| `ISSUE-STREAMBLOCKS-VOID-01` | HIGH | `StreamBlocks` returns void → false "complete" log and over-billed traffic | Readiness DL-1 |
 | `ISSUE-ZIP-STREAM-LATEFAIL-01` | HIGH | ZIP download can truncate after `200 OK` | Readiness DL-2 |
 | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | MEDIUM | Cross-library block read (BOLA), gated only by knowing the 256-bit hash | Readiness B2/SEC-1 |
 | `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` | MEDIUM | Download cap and `single_use` are race-bypassable | Readiness NF-2 / SH-5 |
@@ -119,6 +124,7 @@ on every replica in every DC until both close.
 
 | Issue | Sev | One line |
 |---|---|---|
+| `ISSUE-IWORK-PREVIEW-413-NO-MESSAGE-01` | LOW (UX) | An iWork document above the D6 source cap renders the raw JSON error inside the preview modal, and the image→PDF fallback re-requests it. Frontend only; carries the two product decisions D6 left open — raising the cap, or a separate admission profile (needs a §12 amendment) |
 | `ISSUE-ORG-SCOPE-CHECK-PER-HANDLER-01` | LOW (latent) | Cross-tenant gate is copy-pasted into ~50 handlers, not middleware. No current gap. |
 | `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01` | LOW–MED | `handleAutoLogin` hardcodes cookie `Secure=false` |
 | `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01` | LOW (config) | Both chunked-upload size guards can be disabled together; staging guard is `0` in **every** shipped config |

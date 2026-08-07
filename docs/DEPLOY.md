@@ -76,6 +76,169 @@ SesameFS resolves configuration in this order:
   In production compose, that is `configs/config.prod.yaml` mounted as `/app/config.yaml`.
 3. Environment variables are applied last via `applyEnvOverrides()`, so env always wins.
 
+Download admission is one of the safety defaults: `DefaultConfig()` carries the
+measured D6 values, so a config file that does not pin the `download_admission`
+section still starts protected. YAML overlays `DefaultConfig()` field by field:
+keys omitted from a present section retain those defaults. Set
+`download_admission.enabled: false` explicitly to opt out; omission is not an
+implicit disable.
+
+Auto mode is the clean-deployment default. It derives the process-local
+download-memory design budget and the node/profile capacities from the effective
+container memory, rather than distributing a fixed slot combination to every
+machine:
+
+```yaml
+download_admission:
+  enabled: true
+  capacity_mode: auto
+  memory_budget_percent: 25
+  raw_capacity_percent: 33
+  safety_margin_percent: 20
+  # Optional, and commented out on purpose: setting it turns the derivation off.
+  # Uncomment only where cgroup discovery is unavailable or the detected
+  # percentage is deliberately overridden.
+  # memory_budget_bytes: 2147483648
+```
+
+`memory_budget_bytes` is a process-local configured design budget, not an OS
+reservation and not an RSS limit. When it is omitted, `Load()` derives it from
+`memory_budget_percent` of the cgroup limit; if no cgroup limit is exposed, it
+uses the 2 GiB reference fallback. That fallback is not a deduction about the
+machine — without a cgroup limit the process knows nothing about its memory — so
+a deployment smaller than the 8 GiB baseline should set an explicit budget or a
+container limit rather than inherit it. An explicit byte value overrides that
+derivation, and may claim up to `memory_budget_percent` of an exposed cgroup
+limit. The safety margin leaves `safety_margin_percent` of the configured design
+budget for HTTP structures, goroutines, SDK buffers, allocator fragmentation and
+measured variation; derivation and the final validation apply the same value.
+Auto mode also caps derived node capacity at 64 slots and raw capacity at 32.
+
+The `max_active_*` fields are generated outputs in auto mode. To hand-author
+those values, set `capacity_mode: manual`; otherwise the next validation derives
+them again from the budget and measured costs. **The numbers in the shipped
+files are therefore a reference for the 2 GiB fallback, not a promise about any
+particular host.** The values a node actually runs with are printed at startup:
+
+```text
+INFO download admission capacity mode=auto
+  budget_source="25% of the detected cgroup limit 8589934592"
+  memory_budget_bytes=2147483648 safety_margin_percent=20
+  max_active_per_node=16 max_active_raw=4 max_active_file=12 ...
+```
+
+`budget_source` is one of `configured explicitly`, `N% of the detected cgroup
+limit X`, or `no cgroup limit detected, reference fallback` — so the line says
+not just what the node runs with but where the number came from. The same
+capacities are exported as `download_admission_capacity{setting="..."}` and
+`download_admission_memory_budget_bytes`, which is how the D6 drills discover
+the ceiling they have to saturate instead of assuming one.
+
+These YAML and `.env` values are clean-deployment baselines. A smaller
+container automatically derives fewer capacities when cgroup discovery is
+available:
+
+| Container limit | Download design budget | Required configuration |
+|---|---:|---|
+| 4 GiB | 1 GiB | Auto derives a smaller node/profile combination. |
+| 8 GiB | 2 GiB | Auto derives the clean baseline of 16 active slots, 4 raw and 12 other streams. |
+| 16 GiB | 4 GiB | Auto scales within the absolute policy ceilings; fairness caps remain bounded. |
+
+**There is a floor, and a container below it will not start.** Auto mode has to
+fit at least one raw slot and one stream slot, and at the shipped costs that is
+`192 MiB + 72 MiB = 264 MiB` of usable budget — `330 MiB` before the 20% safety
+margin. At the default 25% share that means a container limit of about
+**1.3 GiB**; below roughly 660 MiB no share within the 50% ceiling is enough.
+Measured: a 330 MiB budget derives 2 slots and starts, 329 MiB does not.
+
+There are three ways forward, and the startup error names the ones that apply to
+your case rather than listing all of them:
+
+1. **Give admission a larger share of the container** — raise
+   `memory_budget_percent`, up to its 50% ceiling. An explicit
+   `memory_budget_bytes` is *not* a separate escape: a detected container limit
+   caps it at that same share, so setting it alone on a small node is rejected
+   on the next check. It selects a budget *within* the allowed share. Below
+   roughly 660 MiB even the 50% ceiling falls short, and the error says so
+   instead of offering either setting.
+2. **Make a slot cheaper** — the floor is one raw slot plus one stream slot:
+
+   ```text
+   stream = max(4 MiB, 4.5 × seafhttp.sync_block_max_bytes)
+   raw    = max(6 × max_iwork_source_bytes,
+                stream,
+                stream + max_iwork_source_bytes + max_iwork_preview_bytes)
+   ```
+
+   Both terms are in the failing sum, so the error names the raw term that
+   currently dominates *and* the stream lever. It withholds
+   `sync_block_max_bytes` once the stream cost has bottomed out on its 4 MiB
+   plaintext floor — below about `0.89 MiB` of block size — because lowering it
+   further changes nothing. Validation only requires that setting to be
+   positive, so that band is reachable.
+3. **Turn the guard off** — `download_admission.enabled: false`, accepting that
+   the node has no aggregate download bound.
+
+The guard is deliberately not degraded to "whatever fits": a design that
+silently exceeds its stated budget is what this validator exists to prevent.
+
+The first lever's cost, measured against the 2 GiB fallback, since raising the
+iWork source cap is the usual reason to want more:
+
+| `max_iwork_source_bytes` | raw slot cost | node slots | raw | stream |
+|---:|---:|---:|---:|---:|
+| 16 MiB | 138 MiB | 18 | 5 | 13 |
+| **32 MiB (shipped)** | **192 MiB** | **16** | **4** | **12** |
+| 48 MiB | 288 MiB | 12 | 3 | 9 |
+| 64 MiB | 384 MiB | 9 | 2 | 7 |
+| 128 MiB | 768 MiB | 6 | 1 | 5 |
+| 256 MiB | 1536 MiB | 2 | 1 | 1 |
+
+Raising the cap from 32 MiB to 64 MiB reduces the same-budget node ceiling from
+16 to 9 concurrent downloads. Documents above the cap answer `413` on the
+inline-preview branch only; downloading them is unaffected. See
+`ISSUE-IWORK-PREVIEW-413-NO-MESSAGE-01` for what the viewer currently shows.
+
+Manual mode is available for special deployments. It requires
+`memory_budget_bytes`, `max_active_per_node`, `max_active_raw` and the other
+capacity fields; the same safety-adjusted memory validator still checks the
+complete combination. User, link, client, waiter and timeout values remain
+policy/fairness controls in either mode, with absolute validation ceilings.
+
+When an explicit byte budget exceeds `memory_budget_percent` of an exposed
+cgroup limit, `Load()` rejects it. That share defaults to 25% and is itself
+capped at 50%, so the guard and the setting can never disagree about what is
+allowed. The process must run in a container sized for the configured budget;
+host RAM is never used as the source of truth.
+
+A section that is present with `enabled: false` is an explicit opt-out, but its
+effective values must satisfy the section's structural validation if the guard
+were enabled. This catches a zeroed or half-written section without charging it
+against the configured memory design. A structurally complete section can still
+exceed that combined budget and is rejected only when enabled.
+The rule is completeness rather than any fixed shape, since one
+`DOWNLOAD_ADMISSION_*` override is enough to defeat a fixed-shape check while
+leaving the section just as unusable. A server started on such a section exits
+with
+
+```text
+download_admission is disabled with a structurally incomplete configuration:
+remove the section to inherit the measured defaults, or keep enabled: false
+alongside complete structural values (<what is missing>)
+```
+
+The rule covers the section's own values only. The configured memory design is not
+charged against a disabled section, because it multiplies these caps by
+`seafhttp.sync_block_max_bytes` and the `fileview` limits, which other
+subsystems own and set for their own reasons — a disabled download guard must
+not stop a deployment from booting over an upload-side value. A design that
+overshoots the budget is refused when the section is enabled.
+
+The check runs after environment overrides, so a clean deployment that supplies
+real values through `DOWNLOAD_ADMISSION_*` is validated as one effective
+configuration. `server.write_timeout` is not part of the structural test because
+it conflicts only with an active guard.
+
 That is why `configs/config.prod.yaml` can look thinner than `configs/config.docker.yaml` or a local test config:
 production only needs to pin the non-secret structural values that differ from the code defaults,
 while local/test often pins more knobs explicitly for reproducibility.
@@ -107,33 +270,63 @@ Why this is the supported deploy model:
 
 If you use a different proxy chain and do not preserve the canonicalized client IP at the last nginx hop, adjust `SERVER_TRUSTED_PROXIES` for that topology instead.
 
-### Download admission (D1-D5)
+### Download admission (D0-D6, enabled)
 
-D1 adds the process-local coordinator, bounded state, configuration schema and
-Prometheus series for storage-backed downloads. D2 makes the public download-
-link token contract strict: every newly minted link token carries the stable
-source identity derived from the share-link token, and remints preserve it. D2
-does not wire any admission producer route yet, and it does not choose measured
-operating capacity. Every shipped YAML and env template therefore keeps
-`download_admission.enabled=false` and all D1 values at zero.
+Download admission is **on by default**. It bounds how many storage-backed
+transfers a node accepts at once across every producer — seafhttp file and ZIP,
+authenticated raw and history, public share raw, inline share text and sync block
+GET — through one process-local coordinator.
 
-D3 adds the reusable idle-write writer and makes the actual raw/history, share
-raw and public bootstrap paths bypass the Go gzip wrapper. The supported frontend
-nginx configuration disables both proxy buffering and gzip for all protected
-transfer locations, including `/seafhttp/`. D4 wires the single bootstrapped
-coordinator, preparation context and idle-write lifecycle into file, ZIP, raw,
-history, share-raw and inline-text producers. D5 streams authenticated
-`GET /seafhttp/repo/:repo_id/block/:block_id` through
-`CanonicalBlockReader.GetBlockSize`/`GetBlockReader` under `ProfileBlock` on that
-same coordinator. D6 must still measure positive capacities and prove end-to-end
-slow-client behavior through the deployed nginx topology.
-`ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` closed on 2026-08-03: the idle
-interval now opens when a request enters streaming rather than at its first byte,
-so a stalled first storage read is cancelled by `idle_write_timeout` instead of
-holding its slot until the client disconnects or the object-store SDK gives up.
+The capacities are measured, not guessed. D6 benchmarked the heap a single
+admitted transfer holds, and auto mode divides the effective budget between the
+expensive raw/iWork profile and ordinary streams:
 
-Do not enable this section in production before D6 measurement.
-When D6 selects positive values, the following startup rules still apply:
+| Transfer shape | Measured peak per admission |
+|---|---|
+| Plaintext stream (any size) | 4.0 MiB |
+| Encrypted stream | 36.0 MiB at 8 MiB; 72 MiB design cost at the accepted 16 MiB block size |
+| `raw` iWork preview, 32 MiB source cap | ~184.5 MiB measured; 192 MiB design cost |
+
+Encrypted prefetch reads and decrypts whole blocks rather than streaming them,
+so the design cost scales at 4.5x the accepted block size. The iWork preview
+buffers the entire source document, which is why `fileview.max_iwork_source_bytes`
+caps it at 32 MiB separately from the 1 GiB general preview limit — without that
+cap a single request could touch several gigabytes.
+
+With the shipped 2 GiB fallback and 20% safety margin, auto mode derives
+`4 x 192 MiB + 12 x 72 MiB = 1632 MiB` (~1.59 GiB). This is a hard startup
+invariant, not advisory arithmetic: the validator rejects an enabled
+configuration whose safety-adjusted design exceeds the configured budget, so
+changing the budget, percentages, source/block sizes or manual caps can make
+the service refuse to boot until the complete combination fits again.
+
+`max_active_raw=0` means there is no additional raw profile sub-cap; it does not
+remove raw work from the memory calculation. The validator charges all node
+slots at the raw/iWork worst-case cost in that case. `max_active_block` remains a
+profile sub-cap and must not exceed `max_active_per_node`; the remaining node
+capacity is charged at the encrypted streaming cost.
+
+Refused transfers answer `503` with `Retry-After`; the real `seaf-cli` fault drill
+must record a profile=`block` refusal before claiming recovery. A client that stops
+reading is released on `idle_write_timeout` — verified through the supported
+nginx, where `proxy_buffering off` and `gzip off` on the transfer locations are
+what let the application see a slow client at all rather than the proxy absorbing
+it.
+
+`idle_write_timeout` bounds the interval **without progress**, not the transfer:
+a multi-hour download of a very large file is unaffected by the shipped 60s as
+long as bytes keep flowing. What it tolerates is a stalled peer, or a stalled
+object-store fetch between blocks under load.
+
+That only holds while the proxy does not fire first. The supported nginx configs
+therefore set `proxy_read_timeout` and `send_timeout` strictly above every
+deadline the application will accept — see `config.MinNginxProxyReadTimeout` and
+`config.MinNginxSendTimeout`, which derive from the validation ceilings. **If you
+run a different proxy, apply the same ordering**, or the application's guard
+stops being the one that ends a transfer and a raised `idle_write_timeout` will
+silently do nothing.
+
+These startup rules apply:
 
 - `max_active_per_node`, every identity cap, `preparation_deadline`, `idle_write_timeout` and `retry_after` must be positive.
 - `admission_wait` and both waiter caps may be zero; zero means refuse immediately rather than queue.
@@ -1011,18 +1204,24 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `SEAFHTTP_UPLOAD_LINK_SOURCE_WRITE_BURST` | `seafhttp.upload_link_source_write_burst` | Burst for the per-link bound. Default `24000`. Must be `> 0` while that rate is non-zero. |
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_SOURCE` | `seafhttp.upload_link_max_inflight_per_source` | Non-blocking concurrent anonymous-write cap per stable public-link identity on one process. Default `16`; ceiling `4096`; `0` disables. Remints share the same source count. When both in-flight caps are enabled, this value must not exceed the per-node value. |
 | `SEAFHTTP_UPLOAD_LINK_MAX_INFLIGHT_PER_NODE` | `seafhttp.upload_link_max_inflight_per_node` | Non-blocking concurrent anonymous-write cap across one process/node. Default `128`; ceiling `65536`; `0` disables. This is not cluster-global; aggregate fleet capacity scales with node count. |
-| `DOWNLOAD_ADMISSION_ENABLED` | `download_admission.enabled` | D1 schema only. Keep `false` until D6 measurement is complete (D1-D5 producer wiring is present). |
-| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE` | `download_admission.max_active_per_node` | D6-selected process-local aggregate download cap. D1 template value is `0`; validation ceiling `1024`. |
-| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER` | `download_admission.max_active_per_auth_user` | Authenticated `(org, user)` cap. D1 template value is `0`; validation ceiling `1024`. |
-| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE` | `download_admission.max_active_per_link_source` | Stable public-link source cap. D1 template value is `0`; validation ceiling `1024`. |
-| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_CLIENT_LINK` | `download_admission.max_active_per_client_link` | Stable public-link plus trusted client-IP cap. D1 template value is `0`; validation ceiling `1024`. |
+| `DOWNLOAD_ADMISSION_ENABLED` | `download_admission.enabled` | Ships `true`. Disabling it removes the only aggregate bound on storage-backed downloads. |
+| `DOWNLOAD_ADMISSION_CAPACITY_MODE` | `download_admission.capacity_mode` | `auto` derives node/profile capacities from the memory budget. `manual` uses the explicit capacity fields and still validates their combined design. |
+| `DOWNLOAD_ADMISSION_MEMORY_BUDGET_PERCENT` | `download_admission.memory_budget_percent` | Auto-mode percentage of the **exposed cgroup limit**, and the share an explicit `memory_budget_bytes` may claim of it. Default `25`, accepted range `1`-`50`. It does **not** scale the fallback: with no limit exposed, auto mode uses the fixed 2 GiB reference budget whatever this is set to, and `memory_budget_bytes` is the way to change that. |
+| `DOWNLOAD_ADMISSION_RAW_CAPACITY_PERCENT` | `download_admission.raw_capacity_percent` | Auto-mode target share of node slots assigned to the expensive raw/iWork profile. Default `33`, range `1`-`99`. The achieved share is allowed to fall to three quarters of the request so the integer split lands; a smaller share buys more stream slots, a larger one reserves more raw slots and lowers the node total. |
+| `DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT` | `download_admission.safety_margin_percent` | Memory headroom reserved outside the modeled download work, applied identically by auto derivation and by the final validation. Default `20`, range `0`-`99`; must leave at least one raw and one stream slot. |
+| `DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES` | `download_admission.memory_budget_bytes` | Process-local configured download-memory design budget, not an OS reservation. **In auto mode `0` is the instruction to derive** — from the cgroup limit, or from the 2 GiB reference fallback when none is exposed — and is what the `sesamefs-cgroup-probe` service sets to force that path. A positive value is an explicit budget and switches derivation off; it must be `1` to `1099511627776` and must not exceed `memory_budget_percent` of an exposed cgroup limit, a share that defaults to 25% and is capped at 50%. **Manual mode has no derivation, so it requires a positive value.** |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_NODE` | `download_admission.max_active_per_node` | Manual-mode process-local aggregate cap. Auto mode derives it from budget and costs, with an absolute 64-slot ceiling. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_AUTH_USER` | `download_admission.max_active_per_auth_user` | Manual-mode authenticated `(org, user)` cap. Auto mode derives a bounded fairness cap from the node ceiling. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_LINK_SOURCE` | `download_admission.max_active_per_link_source` | Manual-mode stable public-link source cap. Auto mode derives a bounded fairness cap from the node ceiling. |
+| `DOWNLOAD_ADMISSION_MAX_ACTIVE_PER_CLIENT_LINK` | `download_admission.max_active_per_client_link` | Manual-mode stable public-link plus trusted client-IP cap. Auto mode derives a bounded fairness cap from the node ceiling. |
 | `DOWNLOAD_ADMISSION_MAX_WAITERS_PER_IDENTITY` | `download_admission.max_waiters_per_identity` | Parked requests per identity. `0` refuses immediately; validation ceiling `1024`. |
 | `DOWNLOAD_ADMISSION_MAX_WAITERS_PER_NODE` | `download_admission.max_waiters_per_node` | Parked requests per process. `0` refuses immediately; validation ceiling `4096`. |
-| `DOWNLOAD_ADMISSION_ADMISSION_WAIT` | `download_admission.admission_wait` | Queue duration before `503 + Retry-After`. D1 template value is `0s`; maximum `5m`. |
+| `DOWNLOAD_ADMISSION_ADMISSION_WAIT` | `download_admission.admission_wait` | Queue duration before `503 + Retry-After`. Shipped value is `2s`; maximum `5m`. |
 | `DOWNLOAD_ADMISSION_PREPARATION_DEADLINE` | `download_admission.preparation_deadline` | Positive D6-selected preparation deadline; maximum `1h`. |
 | `DOWNLOAD_ADMISSION_IDLE_WRITE_TIMEOUT` | `download_admission.idle_write_timeout` | Positive D6-selected idle response-write deadline; maximum `15m`. |
 | `DOWNLOAD_ADMISSION_RETRY_AFTER` | `download_admission.retry_after` | Explicit retry hint for long-lived download slots; maximum `1h`. |
 | `DOWNLOAD_ADMISSION_MAX_ACTIVE_<PROFILE>` | `download_admission.max_active_<profile>` | Fixed profiles: `BLOCK`, `FILE`, `RAW`, `HISTORY`, `LINK_RAW`, `ZIP`, `LINK_INLINE`. `0` means no additional profile cap; validation ceiling `1024`. |
+| `FILEVIEW_MAX_IWORK_SOURCE_BYTES` | `fileview.max_iwork_source_bytes` | Source cap for the buffered iWork preview branch. Default `33554432` (32 MiB); must be positive and no greater than `fileview.max_preview_bytes` when download admission is enabled. Raw streams do not use this preview-only cap. |
 | `METRICS_ENABLED` | `monitoring.metrics_enabled` | |
 | `DESKTOP_CUSTOM_BRAND` | — (server-info response) | Brand name shown in desktop client (default: `Sesame Disk`) |
 | `DESKTOP_CUSTOM_LOGO` | — (server-info response) | Full URL to logo image shown in desktop client (optional) |

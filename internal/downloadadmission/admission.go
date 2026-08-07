@@ -226,6 +226,7 @@ func New(cfg *config.DownloadAdmissionConfig) (*Coordinator, error) {
 	if err := config.ValidateDownloadAdmissionConfig(*cfg); err != nil {
 		return nil, err
 	}
+	publishCapacityMetrics(*cfg)
 	return &Coordinator{
 		cfg:               *cfg,
 		activeByProfile:   make(map[Profile]int),
@@ -253,7 +254,7 @@ func (c *Coordinator) Acquire(ctx context.Context, request AdmissionRequest) (*L
 		return nil, RejectInvalidRequest
 	}
 	if err := ctx.Err(); err != nil {
-		c.observeRejected(RejectClientGone)
+		c.observeRejected(request, RejectClientGone)
 		return nil, RejectClientGone
 	}
 	started := time.Now()
@@ -268,7 +269,7 @@ func (c *Coordinator) Acquire(ctx context.Context, request AdmissionRequest) (*L
 	if err := ctx.Err(); err != nil {
 		c.mu.Unlock()
 		c.observeWait(started, "cancelled")
-		c.observeRejected(RejectClientGone)
+		c.observeRejected(request, RejectClientGone)
 		return nil, RejectClientGone
 	}
 	if granted, blocked := c.tryGrantLocked(request); granted {
@@ -281,13 +282,13 @@ func (c *Coordinator) Acquire(ctx context.Context, request AdmissionRequest) (*L
 		if c.cfg.AdmissionWait <= 0 {
 			c.mu.Unlock()
 			c.observeWait(started, "refused")
-			c.observeRejected(reason)
+			c.observeRejected(request, reason)
 			return nil, reason
 		}
 		if queueReason := c.queueFullReasonLocked(request); queueReason != "" {
 			c.mu.Unlock()
 			c.observeWait(started, "refused")
-			c.observeRejected(queueReason)
+			c.observeRejected(request, queueReason)
 			return nil, queueReason
 		}
 		w := &waiter{request: request, blocked: blocked}
@@ -378,11 +379,11 @@ func (c *Coordinator) waitForLease(ctx context.Context, request AdmissionRequest
 			c.mu.Unlock()
 			if ctx.Err() != nil {
 				c.observeWait(started, "cancelled")
-				c.observeRejected(RejectClientGone)
+				c.observeRejected(request, RejectClientGone)
 				return nil, RejectClientGone
 			}
 			c.observeWait(started, "timeout")
-			c.observeRejected(RejectAdmissionTimeout)
+			c.observeRejected(request, RejectAdmissionTimeout)
 			return nil, RejectAdmissionTimeout
 		case <-notify:
 			c.mu.Lock()
@@ -390,14 +391,14 @@ func (c *Coordinator) waitForLease(ctx context.Context, request AdmissionRequest
 				c.removeWaiterLocked(w)
 				c.mu.Unlock()
 				c.observeWait(started, "cancelled")
-				c.observeRejected(RejectClientGone)
+				c.observeRejected(request, RejectClientGone)
 				return nil, RejectClientGone
 			}
 			if waitCtx.Err() != nil {
 				c.removeWaiterLocked(w)
 				c.mu.Unlock()
 				c.observeWait(started, "timeout")
-				c.observeRejected(RejectAdmissionTimeout)
+				c.observeRejected(request, RejectAdmissionTimeout)
 				return nil, RejectAdmissionTimeout
 			}
 			if granted, blocked := c.tryGrantLocked(request); granted {
@@ -562,8 +563,11 @@ func (c *Coordinator) signalLocked() {
 	c.notify = make(chan struct{})
 }
 
-func (c *Coordinator) observeRejected(reason RejectReason) {
+func (c *Coordinator) observeRejected(request AdmissionRequest, reason RejectReason) {
 	metrics.DownloadAdmissionRejectedTotal.WithLabelValues(string(reason)).Inc()
+	if validProfile(request.profile) {
+		metrics.DownloadAdmissionRejectedByProfileTotal.WithLabelValues(string(request.profile), string(reason)).Inc()
+	}
 }
 
 func (c *Coordinator) observeWait(started time.Time, outcome string) {
@@ -703,4 +707,86 @@ func validateRequest(request AdmissionRequest) error {
 		return fmt.Errorf("public-link admission request requires link_source and client_link dimensions")
 	}
 	return nil
+}
+
+// publishCapacityMetrics exports the capacities this coordinator was built
+// with. In auto mode they are derived at startup from the detected memory
+// limit, so a deployment's real ceiling is not in its config file and an
+// operator — or a drill that has to saturate the node — otherwise has no way to
+// read it except by filling the node and watching the plateau.
+func publishCapacityMetrics(cfg config.DownloadAdmissionConfig) {
+	if !cfg.Enabled {
+		// Publish zeros rather than nothing: an absent series is
+		// indistinguishable from a scrape that arrived before startup, while a
+		// zero says plainly that nothing is bounded.
+		for _, setting := range capacityMetricSettings {
+			metrics.DownloadAdmissionCapacity.WithLabelValues(setting).Set(0)
+		}
+		metrics.DownloadAdmissionMemoryBudgetBytes.Set(0)
+		metrics.DownloadAdmissionMemoryBudgetEffectiveBytes.Set(0)
+		return
+	}
+	for setting, value := range publishedCapacitySettings(cfg) {
+		metrics.DownloadAdmissionCapacity.WithLabelValues(setting).Set(float64(value))
+	}
+	// New is exported, and ValidateDownloadAdmissionConfig does not cover the
+	// budget or the margin — those belong to Config.Validate. A caller outside
+	// Load() can therefore reach here with values outside the D6 contract, and
+	// publishing part of them is worse than publishing none: a node reporting
+	// "budget -1, effective 0" contradicts itself exactly the way a disabled
+	// section claiming a budget source did. Both gauges are refused together.
+	//
+	// An out-of-range margin is refused rather than clamped, because clamping it
+	// to zero publishes "effective == budget", which reads as a node running
+	// with no safety headroom at all.
+	if cfg.MemoryBudgetBytes <= 0 ||
+		cfg.MemoryBudgetBytes > config.MaxDownloadAdmissionMemoryBudgetBytes ||
+		cfg.SafetyMarginPercent < 0 || cfg.SafetyMarginPercent >= 100 {
+		metrics.DownloadAdmissionMemoryBudgetBytes.Set(0)
+		metrics.DownloadAdmissionMemoryBudgetEffectiveBytes.Set(0)
+		return
+	}
+	margin := cfg.SafetyMarginPercent
+	metrics.DownloadAdmissionMemoryBudgetBytes.Set(float64(cfg.MemoryBudgetBytes))
+	// Same order as the validator: multiply first. Dividing first published a
+	// figure 38 bytes below the budget the node was actually sized against, and
+	// this metric claims to be that budget, not an approximation of it. The
+	// 1 TiB ceiling keeps the product well inside int64.
+	metrics.DownloadAdmissionMemoryBudgetEffectiveBytes.Set(float64(cfg.MemoryBudgetBytes * int64(100-margin) / 100))
+}
+
+// publishedCapacitySettings is the single description of which capacities are
+// exported, so the live and zeroing paths cannot drift apart.
+func publishedCapacitySettings(cfg config.DownloadAdmissionConfig) map[string]int {
+	return map[string]int{
+		"max_active_per_node":        cfg.MaxActivePerNode,
+		"max_active_per_auth_user":   cfg.MaxActivePerAuthUser,
+		"max_active_per_link_source": cfg.MaxActivePerLinkSource,
+		"max_active_per_client_link": cfg.MaxActivePerClientLink,
+		"max_waiters_per_identity":   cfg.MaxWaitersPerIdentity,
+		"max_waiters_per_node":       cfg.MaxWaitersPerNode,
+		"max_active_block":           cfg.MaxActiveBlock,
+		"max_active_file":            cfg.MaxActiveFile,
+		"max_active_raw":             cfg.MaxActiveRaw,
+		"max_active_history":         cfg.MaxActiveHistory,
+		"max_active_link_raw":        cfg.MaxActiveLinkRaw,
+		"max_active_zip":             cfg.MaxActiveZIP,
+		"max_active_link_inline":     cfg.MaxActiveLinkInline,
+	}
+}
+
+var capacityMetricSettings = []string{
+	"max_active_per_node",
+	"max_active_per_auth_user",
+	"max_active_per_link_source",
+	"max_active_per_client_link",
+	"max_waiters_per_identity",
+	"max_waiters_per_node",
+	"max_active_block",
+	"max_active_file",
+	"max_active_raw",
+	"max_active_history",
+	"max_active_link_raw",
+	"max_active_zip",
+	"max_active_link_inline",
 }

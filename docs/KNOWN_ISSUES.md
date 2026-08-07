@@ -19,7 +19,7 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | 🔴 Open | B4 umbrella remains open: A1/A2, B, C and D1-D5 are complete. D5 streams block GET through the canonical reader under `ProfileBlock`, and the shared pre-first-write admission gap (ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01) is fixed, so every phase of an admitted download is now bounded. D6 — measured production capacities and real-nginx evidence — remains open. The supported frontend disables gzip and proxy buffering for D transfer routes. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
+| **Rate limiting on upload/download/blocks** | ✅ Fixed (2026-08-04) | B4 umbrella closed: A1/A2, B, C and D0-D6 are complete. Download admission ships enabled with auto-derived process-local capacities: the effective cgroup budget is 25% when exposed, the 2 GiB fallback uses a 20% design margin, and the clean baseline derives 16 active slots with 4 raw and 12 other streams. Closure evidence includes 33 retryable `profile=block` refusals, HTTP 503 with `Retry-After: 10`, real `seaf-cli` recovery, a stalled client released through the real nginx on the application's own deadline, and cross-route saturation. An opt-in real-process memory probe exists but its output is not recorded as a closure figure. Two findings are **not** closed by it: ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01 and the now-quantified ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
 | **Download admission has no bound before the first write** | ✅ Fixed (2026-08-03) | The idle interval now opens at the streaming phase change instead of at the first byte, and a deferred Gin status preserves it rather than clearing it. A stalled first storage read is cancelled by `idle_write_timeout` on both the D4 and D5 producers. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
 | **Anonymous object-storage downloads** | 🔴 Open — production posture blocker | Supported Compose storage policies currently grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
@@ -890,24 +890,17 @@ The architecture claim "download handlers resolve before headers" is now true fo
 
 ### ISSUE-STREAMBLOCKS-VOID-01: `StreamBlocks` Returns Void → False-Success Log + Over-Counted Traffic
 
-**Status**: 🟡 Observability/billing accuracy gap (2026-05-27)
+**Status**: ✅ Fixed 2026-08-03
 **Severity**: Low–Medium — no client-visible corruption, but traffic can be over-recorded
 **Affected**: `streaming.StreamBlocks` and `streamFileFromBlocks` (`internal/api/seafhttp.go`)
 
 #### What Is True Today
 
-`StreamBlocks` ([`streaming.go`](../internal/streaming/streaming.go#L176)) returns `void`. If `GetBlock`/`GetBlockReader`/`Write`/`io.CopyBuffer` fails mid-stream it logs and returns — by then headers are sent, so it genuinely cannot signal the client. That part is unavoidable.
-
-The real gap is on the **caller** side. In `streamFileFromBlocks` the code after `StreamBlocks` runs unconditionally:
-
-- logs `Streaming complete: N blocks` even if the stream aborted early;
-- calls `traffic.RecordCheckedTransfer(..., fileSize)` with the **full** `fileSize`, over-counting traffic on a partial transfer.
-
-Not every caller has this: `DownloadHistoricFile` and `HandleZipDownload` already record the **actual** bytes written (`bytesAfter - bytesBefore`), so they are accurate. The defect is specific to the `fileSize`-based recording in `streamFileFromBlocks`.
-
-#### Fix (recommended, not yet done)
-
-Make `StreamBlocks` return `error` (or the bytes streamed), and in `streamFileFromBlocks` skip the success log + record only actual bytes on partial transfer. The client still can't get a new status once the body started, but observability and billing stop lying. Low blast radius (≈6 callers), worth doing soon because it touches billing.
+`StreamBlocks` ([`streaming.go`](../internal/streaming/streaming.go#L288)) returns an
+error, and `streamFileFromBlocks` records the writer delta rather than the nominal
+file size. The success log is emitted only after the stream returns without an
+error. A failure after headers are sent still cannot change the client status, but
+it no longer appears as a successful stream or over-counts billed bytes.
 
 ---
 
@@ -5111,7 +5104,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces and equivalent storage-backed read surfaces
 
-**Status**: 🔴 **Open** — production blocker (B4 umbrella). **A1/A2, B, C and D1-D5 are closed**; **D6 remains open**. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, D3 supplies the idle-write writer plus actual-route gzip/proxy reachability, D4 wires one coordinator through the listed non-block producer lifetimes, and D5 streams authenticated block GET through `CanonicalBlockReader` under `ProfileBlock` without full-block materialization. No positive capacity has been measured. `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01`, which left an admitted request with no D-owned deadline between the end of preparation and its first response write, was fixed in the shared lifecycle on 2026-08-03 and no longer gates D6. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable. Closing A/B/C/D1-D5 does not close the B4 umbrella.
+**Status**: ✅ **Closed 2026-08-04** — **A1/A2, B, C and D0-D6 are all closed.** Closing this umbrella does **not** clear the production verdict: `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` lets a caller who knows a bucket/key bypass every control described here, and §13 of the D0 contract requires that it be tracked separately rather than absorbed. `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` also stays open, now with a measured figure instead of a deferral. Historical detail follows. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, D3 supplies the idle-write writer plus actual-route gzip/proxy reachability, D4 wires one coordinator through the listed non-block producer lifetimes, and D5 streams authenticated block GET through `CanonicalBlockReader` under `ProfileBlock` without full-block materialization, and D6 now derives clean-deployment capacities from the effective memory budget with a safety margin. Auto mode is the code default; only an explicit `enabled: false` opts out. The 2026-08-04 follow-up corrected the fault-drill proof to count only retryable `profile=block` reasons and to require HTTP 503 with `Retry-After`; it recorded 33 such refusals before real `seaf-cli` recovered. `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01`, which left an admitted request with no D-owned deadline between the end of preparation and its first response write, was fixed in the shared lifecycle on 2026-08-03 and was the last prerequisite for D6. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`, `GET /seafhttp/zip/:token`, `GET /repo/:repo_id/raw/*filepath`, `GET /repo/:repo_id/history/download`, `GET /repo/:repo_id/history/raw`, share-link raw under `/d/:token`, and the share-file bootstrap inline-content read. D's authoritative producer inventory is the D0 contract, not this list
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5124,14 +5117,14 @@ not identical in scope — B4 covers the full seafhttp abuse surface; X10 focuse
 on authenticated block PUT concurrency / aggregate memory after PR-10's
 per-request body cap.
 
-Current guard state (2026-08-03; the other rows retain their original verification dates):
+Current guard state (2026-08-04; the other rows retain their original verification dates):
 
 | Surface | Limiter |
 |---|---|
 | `/seafhttp/upload-api/:token` | After a valid token resolves as link-origin, admission to permission/body/storage work has stable-source rate budgets and non-blocking per-source/per-node in-flight caps; token lookup and arbitrary invalid-token traffic are outside these guards |
 | `/seafhttp/files/:token/*filepath` | D4 `file` admission through protected preparation and response streaming |
 | `/seafhttp/repo/:repo_id/block/:block_id` PUT | per-(org, user) and per-node admitted lifetime before the request body, with bounded waiters and a real connection deadline (B, closed 2026-07-30) |
-| `/seafhttp/repo/:repo_id/block/:block_id` GET | D5 `block` admission through size → stream response lifetime; neither the canonical nor the legacy no-metadata path materializes the whole block |
+| `/seafhttp/repo/:repo_id/block/:block_id` GET | D5 `block` admission through size → stream response lifetime; neither the canonical nor the legacy no-metadata path materializes the whole block. The follow-up D6 drill recorded 33 retryable refusals (`admission_timeout`, `auth_user_full`, `node_full`, `profile_full`, `auth_user_queue_full` or `node_queue_full` — the set the drill sums), confirmed HTTP 503 with `Retry-After: 10`, and recovered (2026-08-04) |
 | `/seafhttp/repo/:repo_id/check-blocks` | per-(org, user) and per-node admission before the body read, with bounded waiters, an admitted lifetime, and a bounded cancellable metadata fan-out (2026-07-31) |
 | `/seafhttp/zip/:token` | D4 `zip` admission through `zipWriter.Close()`; optional request-start `zipRL` remains separate |
 | `/api/v2/blocks/check` | per-IP limiter (`rate.Every(time.Second)`, burst 120 ≈ 60/min sustained) |
@@ -5165,7 +5158,7 @@ own fix + regression.
 | **A2** | Anonymous upload **in-flight concurrency** | ✅ **Closed 2026-07-29** | — | Non-blocking process-local caps are acquired before permission, multipart/body, staging, or storage work; defaults are `16` per stable source and `128` per node |
 | **B** | Authenticated block **PUT** concurrency (= registry **X10**) | ✅ **Closed 2026-07-30** | — | A pre-gate global ticket plus per-user/node admissions bound active, transitioning and parked requests before body reads; real-TCP deadlines cover stalled bodies; complete-lifetime memory trials support 24 slots at an 80 MiB design cost; real `seaf-cli` recovered from the shipped 10s wait and `Retry-After: 10` |
 | **C** | `check-blocks` request-rate **and** work amplification (= **X11** companion) | ✅ **Closed 2026-07-31** | — | Own admission instance (separate capacity from B) before the body read, deduplicated lookups, configured fan-out and cancellation coverage for both canonical metadata phases, and an admitted lifetime that now reaches the socket. Cancellation stops new dispatch; already-issued Cassandra queries remain bounded by the driver's finite timeout. Id cap is configurable and capped at its inherited 100k; see "Subcontract C" below |
-| **D** | All storage-backed download/inline-content reads, including seafhttp download, block GET, ZIP, raw/history and share raw | 🔴 Open (D6) | D1-D5 cover every listed producer with one process-local, bounded and atomic coordinator; D6 supplies operating evidence | The original row named seafhttp download/block GET. D0 expands closure by flow so raw/history/share/ZIP cannot bypass the same bandwidth/resource exhaustion control |
+| **D** | All storage-backed download/inline-content reads, including seafhttp download, block GET, ZIP, raw/history and share raw | ✅ **Closed 2026-08-04** | D1-D5 cover every listed producer with one process-local, bounded and atomic coordinator; D6 measured the per-admission cost (4.0 MiB plaintext, ~68 MiB at the accepted 16 MiB encrypted block, ~184.5 MiB for a capped iWork preview; 72/192 MiB design costs), derives capacities from the effective budget with 20% safety headroom, enables the section and provides client, proxy, saturation and opt-in process-memory evidence | The original row named seafhttp download/block GET. D0 expands closure by flow so raw/history/share/ZIP cannot bypass the same bandwidth/resource exhaustion control |
 
 #### Subcontract A: stable-link request and concurrency admission (A1/A2 closed 2026-07-29)
 
@@ -5673,8 +5666,9 @@ the C closure criteria.
 bound rather than a measured one — criterion 3 bounds the *work per id* and the
 *concurrent requests*, not the list length. Process-local, like every other guard
 here: fleet capacity scales with node count. Closing C did not close the
-umbrella; **D6 (download admission operating evidence) remains open**, so B4 remains a production
-blocker.
+umbrella; at this D0-D5 snapshot **D6 (download admission operating evidence)
+remained open**, so B4 remained a production blocker until the closure recorded
+in the current rows above.
 
 #### Subcontract D: download admission contract and inventory (D0-D5, 2026-08-03)
 
@@ -5823,7 +5817,7 @@ completed block. After streaming, D5 counts bytes successfully written and
 passes that actual count to `traffic.RecordCheckedTransfer`; a partial transfer
 must not regress to nominal-size overbilling. The broader `StreamBlocks` false
 success/over-counting issue remains separately tracked as
-`ISSUE-STREAMBLOCKS-VOID-01`.
+`ISSUE-STREAMBLOCKS-VOID-01`, which was fixed on 2026-08-03.
 
 D0-D6 is the implementation order: contract/inventory, coordinator, public-link
 identity, writer lifetime/gzip, existing stream integration, block GET streaming,
@@ -5834,10 +5828,10 @@ direct bucket access is protected by application admission.
 
 #### Fix Direction
 
-Implement D through the D0-D6 sequence. Do not mark this issue closed until the
-criteria in the D0 contract are met with focused, real-middleware and integration
-evidence. B4 remains open until D closes. The old 257 MiB `PutBlock` cap note is
-historical: B right-sized and bounded that path; it is not remaining D work.
+Implement D through the D0-D6 sequence. The sequence is now complete with
+focused, real-middleware and integration evidence. The old 257 MiB `PutBlock`
+cap note is historical: B right-sized and bounded that path; it is not remaining
+D work. Direct object storage and byte-rate shaping remain separate findings.
 
 #### Related Docs
 
@@ -5846,7 +5840,7 @@ historical: B right-sized and bounded that path; it is not remaining D work.
 - `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md` (D0 contract, inventory and PR sequence)
 - `docs/SECURITY-ASSESSMENT-2026-04.md` **H-7** — the original 2026-04 filing. (The readiness report cited H-5 for this; H-5 is share-link token enumeration. H-7 is the rate-limit finding.)
 - `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` (subcontract C detail)
-- `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` (shared D3/D4/D5 phase-change gap; hard requirement before D6 enablement)
+- `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01` (shared D3/D4/D5 phase-change gap; was the last prerequisite for D6, fixed 2026-08-03)
 
 ---
 
@@ -6696,10 +6690,114 @@ hot-path readiness.
 
 ---
 
+### ISSUE-IWORK-PREVIEW-413-NO-MESSAGE-01: An oversized iWork preview shows raw JSON in the viewer
+
+**Status**: 🟡 **Open — user-visible, frontend only**
+**Severity**: Low — no data or capacity impact; a bad error experience on one preview branch
+**Affected**: `frontend/src/components/dialog/file-preview-dialog.js`, the `preview=1` branch of `GET /repo/:repo_id/raw/*filepath`
+
+#### What Is True Today
+
+D6 capped the iWork *source* document at `fileview.max_iwork_source_bytes`
+(32 MiB shipped), because that preview branch buffers the whole document and
+costs ~6x its size when the library is encrypted. A `.key`, `.pages` or
+`.numbers` above the cap now answers `413` with a JSON body where it previously
+rendered a preview. The cap itself is deliberate and bounded — it applies only
+to the buffering branch, so downloading the same file still works, and
+`ServeHistoricFileRaw` passes `false` explicitly.
+
+The frontend has no branch for that response. `file-preview-dialog.js` renders
+`<img src={previewURL}>`; the `413` fails the image load, `onError` sets
+`iworkPreviewType: 'pdf'`, and the re-render puts the *same URL* in an
+`<iframe>`. So the request is made twice and the viewer ends up displaying the
+raw JSON error body — untranslated, inside the modal:
+
+```json
+{"error":"file too large for inline preview (… bytes, max 33554432)"}
+```
+
+The image→PDF fallback exists for older iWork documents that carry a QuickLook
+PDF instead of a JPEG. A `413` is not that case, so the fallback fires for a
+reason it was not written for.
+
+#### Why It Is Contained
+
+The `413` is emitted *before* `acquireFileViewDownloadAdmission`
+(`internal/api/v2/fileview.go`), so neither request consumes a download
+admission slot. The doubled request costs a round trip, not capacity.
+
+#### Fix Direction
+
+Frontend only. It needs a small restructure rather than a guard on the existing
+path: `<img onError>` reports *that* the load failed, never the HTTP status, so
+there is no way to tell a `413` from a missing QuickLook preview from inside the
+current fallback. The preview has to be fetched explicitly.
+
+Request the preview URL once with `fetch`, then branch on `res.status`: on `413`
+render a translated message naming the limit and pointing at download — something
+like "this document is too large to preview (max 32 MiB); download it to open
+it". The backend already returns the limit in the JSON body, so no API change is
+needed.
+
+**The image→PDF fallback must survive the change.** A `200` does not by itself
+say whether the payload is a QuickLook JPEG or a QuickLook PDF, which is the
+distinction that fallback exists to make, so removing it would break older iWork
+documents. Keep it and feed it the response already in hand:
+
+```text
+fetch(previewURL) once
+  ├─ 413 → translated "too large to preview" message
+  └─ 200 → url = URL.createObjectURL(blob)
+             ├─ <img src={url}>
+             └─ onError → <iframe src={url}>   // same object URL, no refetch
+```
+
+Branching on the response's `Content-Type` instead would remove the second
+render entirely, but only if the backend is verified to label both payloads
+correctly on this route — worth checking before relying on it, and the object-URL
+form above is correct either way. Both shapes keep the request count at one,
+which the current code does not: today the fallback is *how* a failure is
+discovered, so every oversized document is fetched twice.
+
+Two adjacent decisions are worth taking at the same time, and both are product
+calls rather than defects:
+
+- **Raise the cap.** `docs/DEPLOY.md` carries the measured trade-off; at the
+  2 GiB reference budget, moving the source cap from 32 MiB to 64 MiB takes a
+  node from 16 concurrent downloads to 9.
+- **Give the preview its own admission profile.** Ordinary raw streaming costs
+  ~4 MiB plaintext, or up to 72 MiB under the encrypted design at the accepted
+  16 MiB block size, while *each* shipped raw slot is budgeted at 192 MiB for
+  the iWork preview worst case — a branch only `preview=1` on three extensions
+  can reach. The four raw slots therefore account for 768 MiB, about 47% of the
+  1632 MiB modeled baseline. A separate profile with one or two slots would
+  return raw slots to their real cost and allow larger previews. It is not free:
+  §12 of `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md` freezes the profile enum, its
+  metric label set and the config schema, so this needs an explicit amendment to
+  that contract rather than an implementation change.
+
+A third option avoids the memory cost entirely: buffer the source to a temporary
+file and read the ZIP through `io.ReaderAt`. The archive needs random access,
+not residency. More invasive, and it moves the cost to disk.
+
+**Source of record**: D6 closure, `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`
+
+---
+
 ### ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01: Download concurrency does not cap byte rate
 
-**Status**: 🟡 **Open — deferred pending D6 measurement**
+**Status**: 🟡 **Open — quantified by D6, not closed by it**
 **Severity**: Medium (capacity hardening), not a D correctness blocker by itself
+
+**D6 measurement (2026-08-03).** `TestDownloadAdmissionEgressScalesWithConcurrency`
+measured one transfer at 356 MiB/s and six concurrent at 1699 MiB/s aggregate —
+**4.8× the single-transfer rate at a six-way budget**. Near-linear scaling is the
+residual demonstrated rather than asserted: admission bounds how many transfers
+run, nothing bounds how fast each one runs, so a node's egress ceiling is
+`max_active_per_node × per-transfer throughput`. Those absolute figures are
+loopback numbers from a container stack and must be re-measured on production
+hardware before the concurrency cap is read as an egress budget; the scaling
+relationship is what holds regardless of hardware.
 **Affected**: process/node egress for file, raw, history, ZIP, share and block
 downloads
 **Source of record**: D0 contract in

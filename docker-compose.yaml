@@ -192,6 +192,68 @@ services:
     profiles:
       - test
 
+  # Exercises the auto-capacity cgroup path, which nothing else does: the other
+  # nodes run without a memory limit, so their container reports "max" and the
+  # derivation always takes the reference fallback. This one declares a known
+  # limit, so a drill can prove the limit was read rather than assumed --
+  # 25% of 4 GiB is a 1 GiB budget, which derives a smaller ceiling than the
+  # fallback's. Deliberately not part of the default stack: pinning a container
+  # size in the base compose would make every deployment derive capacity for a
+  # machine it may not have, which is the adaptation this feature exists for.
+  #
+  #   docker compose --profile test up -d sesamefs-cgroup-probe
+  sesamefs-cgroup-probe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${ENV_FILE:-.env}
+    environment:
+      - PORT=8080
+      - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}
+      - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
+      - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
+      - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      # Pinned, not inherited. env_file could otherwise hand this node an
+      # explicit budget, and a derived budget is indistinguishable from a
+      # configured one of the same size -- the assertion would pass while the
+      # cgroup branch never ran. memory_budget_bytes=0 is what forces the
+      # derivation; the rest fix every input the expected numbers depend on.
+      - DOWNLOAD_ADMISSION_ENABLED=true
+      - DOWNLOAD_ADMISSION_CAPACITY_MODE=auto
+      - DOWNLOAD_ADMISSION_MEMORY_BUDGET_BYTES=0
+      - DOWNLOAD_ADMISSION_MEMORY_BUDGET_PERCENT=25
+      - DOWNLOAD_ADMISSION_RAW_CAPACITY_PERCENT=33
+      - DOWNLOAD_ADMISSION_SAFETY_MARGIN_PERCENT=20
+      - SEAFHTTP_SYNC_BLOCK_MAX_BYTES=16777216
+      - FILEVIEW_MAX_IWORK_SOURCE_BYTES=33554432
+      - FILEVIEW_MAX_IWORK_PREVIEW_BYTES=52428800
+      # Also pinned because env_file could otherwise stop this node from
+      # starting or from being observable: a non-zero write timeout is
+      # incompatible with download admission, a preview limit under the iWork
+      # source cap fails validation, and without metrics there is nothing to
+      # assert against.
+      - SERVER_WRITE_TIMEOUT=0s
+      - FILEVIEW_MAX_PREVIEW_BYTES=1073741824
+      - METRICS_ENABLED=true
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 10s
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      cassandra-bootstrap:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    restart: "no"
+    profiles:
+      - test
+
   cassandra:
     image: cassandra:5.0
     ports:
@@ -472,10 +534,20 @@ services:
       - SESAMEFS_URL=http://sesamefs:8080
       - SESAMEFS_URL_2=http://sesamefs-node-2:8080
       - SESAMEFS_URL_3=http://sesamefs-node-3:8080
+      # The supported frontend nginx, so the D6 slow-client drill runs through
+      # the real proxy rather than straight at Go. A backend-only test cannot
+      # show that the client is the one controlling admission lifetime.
+      - SESAMEFS_PROXY_URL=http://frontend:80
+      # Empty by default so the cgroup test really is optional: with a default
+      # here it would never skip, and a broad -run TestDownloadAdmission would
+      # fail on connection refused whenever the probe service is not running.
+      # The documented command passes it explicitly.
+      - SESAMEFS_CGROUP_PROBE_URL=${SESAMEFS_CGROUP_PROBE_URL:-}
     depends_on:
       - sesamefs
       - sesamefs-node-2
       - sesamefs-node-3
+      - frontend
     profiles:
       - test
 
@@ -617,6 +689,43 @@ services:
       - .:/workspace
     depends_on:
       - sesamefs-node-3
+    profiles:
+      - test
+
+  # Fault injection for subcontract D: does real seaf-cli recover when download
+  # admission refuses its block GETs? B proved the 503 + Retry-After contract on
+  # the PUT side of the same route; criterion 11 needs it for the read side.
+  #
+  #   docker compose --profile test run --rm --build download-admission-fault-test
+  download-admission-fault-test:
+    build:
+      context: ./docker/seafile-cli
+      dockerfile: Dockerfile
+    entrypoint:
+      - /bin/bash
+      - -lc
+      # The repo is mounted from a Windows host in some setups, so the script is
+      # normalised before running rather than executed in place.
+      - >-
+        /workspace/scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs &&
+        sed 's/\r$//' /workspace/scripts/fault-inject-download-admission.sh > /tmp/fault-inject.sh &&
+        chmod +x /tmp/fault-inject.sh &&
+        /tmp/fault-inject.sh
+    environment:
+      - SESAMEFS_URL=http://sesamefs:8080
+      - SESAMEFS_URL_LOCAL=http://sesamefs:8080
+      - DEV_API_TOKEN=dev-token-admin
+      - DEV_PASSWORD=dev-token-123
+      - DEV_USER=00000000-0000-0000-0000-000000000001
+      - SYNC_DATA_DIR=/seafile-data
+      - SYNC_TEST_IN_CONTAINER=1
+      - HOLDER_COUNT=${DOWNLOAD_HOLDER_COUNT:-6}
+      - HOLDER_RATE=${DOWNLOAD_HOLDER_RATE:-2k}
+      - HOLDER_SECONDS=${DOWNLOAD_HOLDER_SECONDS:-90}
+    volumes:
+      - .:/workspace
+    depends_on:
+      - sesamefs
     profiles:
       - test
 
