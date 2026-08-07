@@ -1873,6 +1873,21 @@ func (m *MockTokenStore) CreateDownloadToken(orgID, repoID, path, userID string)
 	return token.Token, nil
 }
 
+func (m *MockTokenStore) CreateSyncToken(orgID, repoID, userID string) (string, error) {
+	token := &AccessToken{
+		Token:     "mock-sync-token",
+		Type:      TokenTypeSync,
+		OrgID:     orgID,
+		RepoID:    repoID,
+		Path:      "/",
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+		CreatedAt: time.Now(),
+	}
+	m.tokens[token.Token] = token
+	return token.Token, nil
+}
+
 func (m *MockTokenStore) GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool) {
 	token, ok := m.tokens[tokenStr]
 	if !ok || token.Type != expectedType {

@@ -1097,31 +1097,34 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 	}
 }
 
-// isRepositorySyncToken states, as an allowlist, what a download token must
-// look like to authenticate the repository sync surface. It is deliberately
-// positive: a denylist of the abuse we happen to know about ("reject
-// Source==\"link\"") would silently readmit any future source value that
-// nobody remembered to add.
+// isRepositorySyncToken states, as an allowlist, what a token must look like to
+// authenticate the repository sync surface.
 //
-// A repository sync credential is the token `GetDownloadInfo` and the other
-// three sync-token mint sites issue, and nothing else:
+// TokenTypeSync carries most of the weight now: only CreateSyncToken mints it,
+// that constructor takes no path, and GetToken compares the stored type
+// exactly, so a download bearer cannot reach here at all. The remaining clauses
+// are not ceremony:
 //
-//   - Source is empty. Only "" and "link" are ever written. Requiring exactly
-//     "" means a new source value has to be admitted here on purpose rather
-//     than arriving accepted by default.
-//   - Path is the repository root. A token minted to read one file — the
-//     ordinary authenticated file download, and the share-link bearer alike —
-//     carries that file's path and is not a repository credential.
-//   - RepoID matches the repository in the route. Every sync handler reads
-//     c.Param("repo_id"), so without this the token names one library while the
-//     request operates on another.
+//   - Type. Checked here as well as at the store so the predicate is true on
+//     its own terms. A caller that fetched a token with a different expected
+//     type cannot hand it in and have it pass.
+//   - Source is empty, and Path is the repository root. Both are invariants of
+//     CreateSyncToken rather than caller-supplied values, so these are
+//     assertions that the mint path was not widened — cheap, and they fail
+//     closed if someone later adds a sync-token constructor that takes
+//     arguments.
+//   - RepoID matches the repository in the route. This one is the live
+//     authorization decision, not an assertion: every sync handler reads
+//     c.Param("repo_id"), so without it a token names one library while the
+//     request operates on another. A dedicated token type does nothing to
+//     prevent that.
 //
-// All three are required. Each one alone leaves a usable path in: the source
-// check alone still lets a file-scoped token through, the path check alone
-// still lets a root token reach a different library, and the binding alone
-// still lets a link token reach the library it was minted for.
+// See ISSUE-SYNC-LINK-TOKEN-AUTH-01 for what each clause was pinned against.
 func isRepositorySyncToken(token *AccessToken, routeRepoID string) bool {
 	if token == nil {
+		return false
+	}
+	if token.Type != TokenTypeSync {
 		return false
 	}
 	if token.Source != "" {
@@ -1182,7 +1185,7 @@ func (s *Server) syncAuthMiddleware() gin.HandlerFunc {
 		}
 
 		// Check if it's a valid repo token (from download-info)
-		if accessToken, valid := s.tokenStore.GetToken(token, TokenTypeDownload); valid {
+		if accessToken, valid := s.tokenStore.GetToken(token, TokenTypeSync); valid {
 			// Validate the token's whole scope before turning the bearer into a
 			// user identity. Everything below this point runs as accessToken's
 			// owner, so a token that is merely *valid* is not enough — it has to
@@ -2028,7 +2031,7 @@ func (s *Server) handleRepoTokens(c *gin.Context) {
 		}
 
 		// Generate a sync token for this repo
-		token, err := s.tokenStore.CreateDownloadToken(orgID, repoID, "/", userID)
+		token, err := s.tokenStore.CreateSyncToken(orgID, repoID, userID)
 		if err != nil {
 			continue
 		}

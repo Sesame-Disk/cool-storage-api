@@ -58,10 +58,10 @@ func postLockedFiles(r *gin.Engine, body string) *httptest.ResponseRecorder {
 	return w
 }
 
-// downloadTokenFor models the repo-level sync token download-info issues:
-// TokenTypeDownload with root path and non-link source.
-func downloadTokenFor(repoID, userID string) *AccessToken {
-	return &AccessToken{Type: TokenTypeDownload, RepoID: repoID, UserID: userID, Path: "/"}
+// syncTokenFor models the repo-level credential download-info issues:
+// TokenTypeSync, rooted, non-link.
+func syncTokenFor(repoID, userID string) *AccessToken {
+	return &AccessToken{Type: TokenTypeSync, RepoID: repoID, UserID: userID, Path: "/"}
 }
 
 // GetFolderPerm's wire format was confirmed live against a genuine Seafile Pro
@@ -140,7 +140,7 @@ func TestGetLockedFiles_NoValidatorFailsClosed(t *testing.T) {
 func TestGetLockedFiles_InvalidTokenOmitsRepoWithoutQuerying(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-other-repo": downloadTokenFor("repo-OTHER", "user-1"),
+		"tok-other-repo": syncTokenFor("repo-OTHER", "user-1"),
 	}}
 	locksQueried := false
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
@@ -165,23 +165,26 @@ func TestGetLockedFiles_InvalidTokenOmitsRepoWithoutQuerying(t *testing.T) {
 	}
 }
 
-// TokenTypeDownload is shared with narrower grants: path-scoped file-download
-// tokens and share-link tokens (Source=="link"). Neither may widen into
-// repo-wide lock enumeration — only the root-path sync token from
-// download-info, with an empty source, qualifies.
+// Only the repository sync credential from download-info may enumerate a repo's
+// locks. Each entry below pins one clause of isRepositorySyncToken, so a
+// weakening of any single one fails here:
 //
-// The third entry is the one that pins the shared predicate. This route used to
-// spell its own source clause as a denylist, "not a link", which a future
-// source value with the right path and repository would have satisfied. It now
-// goes through isRepositorySyncToken, whose allowlist refuses anything that is
-// not exactly "". Without this case the endpoint could be reverted to the old
-// denylist and the suite would stay green.
+//   - tok-file-scoped and tok-share-link are download tokens with narrower
+//     grants — one path-scoped, one from a public share link.
+//   - tok-rooted-download is a download token with the *perfect* sync shape:
+//     rooted path, empty source, right repository. Only TokenTypeSync refuses
+//     it, which is what makes the dedicated type load-bearing rather than
+//     decorative.
+//   - tok-future-source is the right type with an unknown source. This route
+//     used to spell its source clause as a denylist, "not a link", which such a
+//     value would have satisfied; the allowlist refuses anything but "".
 func TestGetLockedFiles_RejectsNarrowerDownloadTokens(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-file-scoped":  {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/docs/report.docx"},
-		"tok-share-link":   {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/", Source: "link"},
-		"tok-future-source": {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/", Source: "onlyoffice"},
+		"tok-file-scoped":   {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/docs/report.docx"},
+		"tok-share-link":    {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/", Source: "link"},
+		"tok-future-source": {Type: TokenTypeSync, RepoID: "repo-1", UserID: "user-1", Path: "/", Source: "onlyoffice"},
+		"tok-rooted-download": {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/"},
 	}}
 	locksQueried := false
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
@@ -192,7 +195,8 @@ func TestGetLockedFiles_RejectsNarrowerDownloadTokens(t *testing.T) {
 	body := `[
 		{"repo_id":"repo-1","token":"tok-file-scoped","ts":0},
 		{"repo_id":"repo-1","token":"tok-share-link","ts":0},
-		{"repo_id":"repo-1","token":"tok-future-source","ts":0}
+		{"repo_id":"repo-1","token":"tok-future-source","ts":0},
+		{"repo_id":"repo-1","token":"tok-rooted-download","ts":0}
 	]`
 	w := postLockedFiles(newLockedFilesRouter(handler), body)
 	if w.Code != http.StatusOK {
@@ -226,7 +230,7 @@ func TestGetLockedFiles_OversizedBodyReturns413(t *testing.T) {
 func TestGetLockedFiles_LockBackendErrorFailsClosed(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-1": downloadTokenFor("repo-1", "user-1"),
+		"tok-1": syncTokenFor("repo-1", "user-1"),
 	}}
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
 		return nil, db.ErrFileLockStatusUnavailable
@@ -246,7 +250,7 @@ func TestGetLockedFiles_LockBackendErrorFailsClosed(t *testing.T) {
 func TestGetLockedFiles_InvalidDuplicateDoesNotShadowValidEntry(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-valid": downloadTokenFor("repo-1", "user-1"),
+		"tok-valid": syncTokenFor("repo-1", "user-1"),
 	}}
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
 		return []db.RepoLockedFile{{Path: "/a.txt", LockedBy: "user-1"}}, nil
@@ -271,7 +275,7 @@ func TestGetLockedFiles_InvalidDuplicateDoesNotShadowValidEntry(t *testing.T) {
 func TestGetLockedFiles_OmitsAuthorizedReposWithNoLocks(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-1": downloadTokenFor("repo-1", "user-1"),
+		"tok-1": syncTokenFor("repo-1", "user-1"),
 	}}
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
 		return nil, nil
@@ -289,7 +293,7 @@ func TestGetLockedFiles_OmitsAuthorizedReposWithNoLocks(t *testing.T) {
 func TestGetLockedFiles_ByMeReflectsTokenUser(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-1": downloadTokenFor("repo-1", "user-1"),
+		"tok-1": syncTokenFor("repo-1", "user-1"),
 	}}
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
 		return []db.RepoLockedFile{
@@ -331,7 +335,7 @@ func TestGetLockedFiles_ByMeReflectsTokenUser(t *testing.T) {
 func TestGetLockedFiles_DeduplicatesRepoEntries(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-1": downloadTokenFor("repo-1", "user-1"),
+		"tok-1": syncTokenFor("repo-1", "user-1"),
 	}}
 	queryCount := 0
 	accountChecks := 0
@@ -367,8 +371,8 @@ func TestGetLockedFiles_DeduplicatesRepoEntries(t *testing.T) {
 func TestGetLockedFiles_AccountStatusRejectedDuplicateDoesNotShadowLaterValidEntry(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-disabled": downloadTokenFor("repo-1", "user-disabled"),
-		"tok-valid":    downloadTokenFor("repo-1", "user-valid"),
+		"tok-disabled": syncTokenFor("repo-1", "user-disabled"),
+		"tok-valid":    syncTokenFor("repo-1", "user-valid"),
 	}}
 	accountChecks := 0
 	withAccountStatusStub(handler, func(userID, orgID string) error {
@@ -404,8 +408,8 @@ func TestGetLockedFiles_AccountStatusRejectedDuplicateDoesNotShadowLaterValidEnt
 func TestGetLockedFiles_ZeroLockRepoIsOnlyQueriedOnceAcrossValidUsers(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-user-1": downloadTokenFor("repo-1", "user-1"),
-		"tok-user-2": downloadTokenFor("repo-1", "user-2"),
+		"tok-user-1": syncTokenFor("repo-1", "user-1"),
+		"tok-user-2": syncTokenFor("repo-1", "user-2"),
 	}}
 	accountChecks := 0
 	queryCount := 0
@@ -440,8 +444,8 @@ func TestGetLockedFiles_ZeroLockRepoIsOnlyQueriedOnceAcrossValidUsers(t *testing
 func TestGetLockedFiles_AccountStatusRejectsOneEntryButKeepsValidRepos(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-disabled": downloadTokenFor("repo-disabled", "user-1"),
-		"tok-valid":    downloadTokenFor("repo-valid", "user-2"),
+		"tok-disabled": syncTokenFor("repo-disabled", "user-1"),
+		"tok-valid":    syncTokenFor("repo-valid", "user-2"),
 	}}
 	queriedRepos := make([]string, 0, 1)
 	withAccountStatusStub(handler, func(userID, orgID string) error {
@@ -477,8 +481,8 @@ func TestGetLockedFiles_AccountStatusRejectsOneEntryButKeepsValidRepos(t *testin
 func TestGetLockedFiles_AllEntriesRejectedByAccountStatusReturnsEmptyArray(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-1": downloadTokenFor("repo-1", "user-1"),
-		"tok-2": downloadTokenFor("repo-2", "user-2"),
+		"tok-1": syncTokenFor("repo-1", "user-1"),
+		"tok-2": syncTokenFor("repo-2", "user-2"),
 	}}
 	withAccountStatusStub(handler, func(userID, orgID string) error {
 		return errors.New("account deactivated")
@@ -508,8 +512,8 @@ func TestGetLockedFiles_AllEntriesRejectedByAccountStatusReturnsEmptyArray(t *te
 func TestGetLockedFiles_LockBackendErrorInMixedBatchFailsWholeRequest(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-1": downloadTokenFor("repo-1", "user-1"),
-		"tok-2": downloadTokenFor("repo-2", "user-2"),
+		"tok-1": syncTokenFor("repo-1", "user-1"),
+		"tok-2": syncTokenFor("repo-2", "user-2"),
 	}}
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
 		if repoID == "repo-2" {
@@ -542,9 +546,9 @@ func TestSetTokenCreator_WiresValidatorWhenAvailable(t *testing.T) {
 		t.Fatal("SetTokenCreator did not wire the token validator from a full TokenStore")
 	}
 
-	tokenStr, err := store.CreateDownloadToken("org1", "repo-1", "/", "user-1")
+	tokenStr, err := store.CreateSyncToken("org1", "repo-1", "user-1")
 	if err != nil {
-		t.Fatalf("CreateDownloadToken() error = %v", err)
+		t.Fatalf("CreateSyncToken() error = %v", err)
 	}
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
 		return []db.RepoLockedFile{{Path: "/a.txt", LockedBy: "user-1"}}, nil

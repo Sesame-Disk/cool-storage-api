@@ -23,6 +23,7 @@ import (
 // LibraryTokenCreator is an interface for creating sync tokens
 type LibraryTokenCreator interface {
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateSyncToken(orgID, repoID, userID string) (string, error)
 }
 
 // apiPermission converts internal permission levels to Seafile-compatible API values.
@@ -687,7 +688,7 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	// Generate sync token if token creator is available
 	syncToken := ""
 	if h.tokenCreator != nil {
-		token, err := h.tokenCreator.CreateDownloadToken(orgID, newLibID.String(), "/", userID)
+		token, err := h.tokenCreator.CreateSyncToken(orgID, newLibID.String(), userID)
 		if err == nil {
 			syncToken = token
 		}

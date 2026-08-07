@@ -27,7 +27,7 @@ is right about why.
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`), and `LOCAL_QUORUM` references can be invisible across RF-1 DCs (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`). Keep destructive GC disabled until both close. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
-| **Sync Protocol Permissions** | ✅ Fixed (2026-08-07) | `syncAuthMiddleware` accepted public share-link download tokens as repository credentials. Reproduced live as an effective cross-library write by an anonymous visitor, plus an escalation through `/download-info` into a full repository sync token. `isRepositorySyncToken` now validates the whole scope — `Source == ""`, `Path == "/"`, `RepoID` bound to the route — before the bearer becomes an identity; all three clauses are mutation-verified. See ISSUE-SYNC-LINK-TOKEN-AUTH-01. |
+| **Sync Protocol Permissions** | ✅ Fixed (2026-08-07) | `syncAuthMiddleware` accepted public share-link download tokens as repository credentials. Reproduced live as an effective cross-library write by an anonymous visitor, plus an escalation through `/download-info` into a full repository sync token. `isRepositorySyncToken` now validates the whole scope — `Source == ""`, `Path == "/"`, `RepoID` bound to the route — before the bearer becomes an identity; all three clauses are mutation-verified. A follow-up split `TokenTypeSync` out of `TokenTypeDownload`, so a download bearer is now refused at the store rather than by shape. See ISSUE-SYNC-LINK-TOKEN-AUTH-01. |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
 | Secrets/Env Management | ✅ Complete (2026-02-11) | All docker-compose vars from `.env`; no hardcoded credentials; JWT secret externalized |
 | **Programmatic Auth (API keys)** | ✅ Fixed (2026-04-03) | User API keys now support desktop client, CLI, and automation auth in OIDC-only prod |
@@ -929,10 +929,51 @@ the contract.
   `TestCheckBlocks*`, `TestWebBlockUpload*` and `TestGC_*` pass in 163.8s; the
   full `-short` unit suite passes.
 
+#### Follow-up: `TokenTypeSync` (2026-08-07)
+
+The audit noted that the fix above rested on a structural shape rather than a
+distinct credential: `TokenTypeDownload` served both downloads and sync, so a
+future `CreateDownloadToken(..., "/", ...)` with an empty source would have been
+accepted by sync authentication. That was tracked as debt and closed separately
+in the same session.
+
+`TokenTypeSync` now exists as its own type. `CreateSyncToken(orgID, repoID,
+userID)` is the only constructor that mints it and it **takes no path**, so the
+repository-root shape is no longer a value a caller supplies — it is a property
+of the constructor. `GetToken` compares the stored type exactly, so a download
+bearer is refused at the store before any shape logic runs. `token_type` is a
+free `TEXT` column, so no schema migration was involved.
+
+The four sync-token mint sites (`handleRepoTokens`, `GetDownloadInfo`, the v2
+repo-download-info handler and library creation) switched to it; the two
+validators (`syncAuthMiddleware`, `GetLockedFiles`) now ask for
+`TokenTypeSync`. `HandleDownload` and `HandleZipDownload` keep
+`TokenTypeDownload`. The `SyncTokenCreator` and `LibraryTokenCreator`
+interfaces no longer expose download-token minting where the only use was a
+sync token.
+
+`isRepositorySyncToken` keeps all its clauses and gains a type check. The
+repository binding is still the live authorization decision — a dedicated type
+does nothing to stop a sync token for one library being replayed against
+another. `Source` and `Path` become assertions that the mint path was not
+widened rather than caller-supplied values, which is why they stay.
+
+Two tests pin the type clause specifically: a download token and an upload token
+carrying the *perfect* sync shape — rooted path, empty source, right repository
+— which only the type refuses. Both are unit-level by necessity: after this
+change no API can mint a root-path download token at all, which is the point.
+Mutation-verified — removing the type clause fails exactly those two cases.
+
+`TestSyncAndDownloadTokensDoNotCrossSurfaces` pins the separation in both
+directions: a sync token cannot fetch bytes from `/seafhttp/files/`, and an
+ordinary download still returns its exact content. That second half is the
+regression a type split is most likely to cause.
+
 #### Related Docs
 
 - [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md)
 - `internal/api/server.go` (`isRepositorySyncToken`, `syncAuthMiddleware`)
+- `internal/db/tokens.go`, `internal/api/seafhttp.go` (`TokenTypeSync`, `CreateSyncToken`)
 - `internal/api/sync.go` (`RegisterSyncRoutes`, `checkSyncPermission`)
 - `internal/api/sync_locked_files_test.go` (narrow-token defense)
 

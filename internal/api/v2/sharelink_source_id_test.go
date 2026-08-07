@@ -46,6 +46,9 @@ func (m *sourceIDTokenCreator) CreateUpdateToken(string, string, string, string)
 func (m *sourceIDTokenCreator) CreateDownloadToken(string, string, string, string) (string, error) {
 	return "download-token", nil
 }
+func (m *sourceIDTokenCreator) CreateSyncToken(string, string, string) (string, error) {
+	return "sync-token", nil
+}
 func (m *sourceIDTokenCreator) CreateLinkUploadToken(_, _, _, _, sourceID string) (string, error) {
 	m.sourceIDs = append(m.sourceIDs, sourceID)
 	return "minted-upload-token", nil
