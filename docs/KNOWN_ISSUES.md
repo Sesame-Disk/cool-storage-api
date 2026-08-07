@@ -6728,10 +6728,18 @@ admission slot. The doubled request costs a round trip, not capacity.
 
 #### Fix Direction
 
-Frontend only, and small: check for `413` before falling back, and render a
-translated message naming the limit and pointing at download — something like
-"this document is too large to preview (max 32 MiB); download it to open it".
-The backend already returns the limit in the body, so no API change is needed.
+Frontend only. It needs a small restructure rather than a guard on the existing
+path: `<img onError>` reports *that* the load failed, never the HTTP status, so
+there is no way to tell a `413` from a missing QuickLook preview from inside the
+current fallback. The preview has to be fetched explicitly.
+
+Request the preview URL once with `fetch`, then branch on `res.status`: on `200`
+hand the blob to the `<img>`/`<iframe>` through `URL.createObjectURL`, and on
+`413` render a translated message naming the limit and pointing at download —
+something like "this document is too large to preview (max 32 MiB); download it
+to open it". The backend already returns the limit in the JSON body, so no API
+change is needed. Fetching once also removes the duplicate request, since the
+image→PDF fallback stops being how a failure is discovered.
 
 Two adjacent decisions are worth taking at the same time, and both are product
 calls rather than defects:
@@ -6739,14 +6747,16 @@ calls rather than defects:
 - **Raise the cap.** `docs/DEPLOY.md` carries the measured trade-off; at the
   2 GiB reference budget, moving the source cap from 32 MiB to 64 MiB takes a
   node from 16 concurrent downloads to 9.
-- **Give the preview its own admission profile.** A raw *stream* costs 4 MiB
-  while a raw *slot* is charged ~192 MiB for a branch only `preview=1` on three
-  extensions can reach — 47% of the design budget. A separate profile with one
-  or two slots would return raw slots to their real cost and allow larger
-  previews. It is not free: §12 of `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`
-  freezes the profile enum, its metric label set and the config schema, so this
-  needs an explicit amendment to that contract rather than an implementation
-  change.
+- **Give the preview its own admission profile.** Ordinary raw streaming costs
+  ~4 MiB plaintext, or up to 72 MiB under the encrypted design at the accepted
+  16 MiB block size, while *each* shipped raw slot is budgeted at 192 MiB for
+  the iWork preview worst case — a branch only `preview=1` on three extensions
+  can reach. The four raw slots therefore account for 768 MiB, about 47% of the
+  1632 MiB modeled baseline. A separate profile with one or two slots would
+  return raw slots to their real cost and allow larger previews. It is not free:
+  §12 of `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md` freezes the profile enum, its
+  metric label set and the config schema, so this needs an explicit amendment to
+  that contract rather than an implementation change.
 
 A third option avoids the memory cost entirely: buffer the source to a temporary
 file and read the ZIP through `io.ReaderAt`. The archive needs random access,

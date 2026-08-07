@@ -307,28 +307,133 @@ func TestSmallContainerAdviceStopsOfferingAnExhaustedLever(t *testing.T) {
 	})
 }
 
-// TestFloorAdviceAlwaysNamesTheStreamCostLever pins a lever that used to be
-// unreachable. seafhttp.sync_block_max_bytes was the initial value of the cost
-// hint, but previewCost is streamCost plus a positive source and therefore
-// always exceeds streamCost, so no input could make the raw cost equal the
-// stream cost — the setting was never named despite being a term of the sum
-// that failed, and lowering it from 16 to 8 MiB moves a 2 GiB node from 16 to
-// 20 slots.
-func TestFloorAdviceAlwaysNamesTheStreamCostLever(t *testing.T) {
-	for _, source := range []int64{1, 8, 32, 128} {
-		for _, preview := range []int64{0, 50, 200, 900} {
-			cfg := DefaultConfig()
-			cfg.FileView.MaxIWorkSourceBytes = source * 1024 * 1024
-			cfg.FileView.MaxIWorkPreviewBytes = preview * 1024 * 1024
+// TestFloorAdviceNamesStreamLeverOnlyWhileTheBlockCostDominates covers both
+// halves of a lever that was first unreachable and then unconditional.
+//
+// seafhttp.sync_block_max_bytes started as the initial value of the cost hint,
+// which no input could reach: previewCost is streamCost plus a positive source
+// and therefore always exceeds streamCost, so the raw cost could never equal the
+// stream cost. Naming it always was the overcorrection — streamCost is
+// max(plaintext peak, 4.5x block), so once the block size is below roughly
+// 0.89 MiB the plaintext floor is what is charged and lowering the setting moves
+// nothing. Validation only requires it to be positive, so that band is a
+// configuration an operator can actually be in.
+func TestFloorAdviceNamesStreamLeverOnlyWhileTheBlockCostDominates(t *testing.T) {
+	adviceFor := func(t *testing.T, cfg *Config) string {
+		t.Helper()
+		streamCost, rawCost, err := downloadAdmissionMemoryCosts(cfg)
+		if err != nil {
+			t.Fatalf("costs: %v", err)
+		}
+		return downloadAdmissionFloorAdvice(cfg, cfg.DownloadAdmission, rawCost, streamCost, 0)
+	}
 
-			streamCost, rawCost, err := downloadAdmissionMemoryCosts(cfg)
-			if err != nil {
-				t.Fatalf("source=%d preview=%d: %v", source, preview, err)
-			}
-			advice := downloadAdmissionFloorAdvice(cfg, cfg.DownloadAdmission, rawCost, streamCost)
-			if !strings.Contains(advice, "seafhttp.sync_block_max_bytes") {
-				t.Errorf("source=%d preview=%d: advice omits the stream cost lever: %s", source, preview, advice)
+	t.Run("named while the block cost is above the plaintext floor", func(t *testing.T) {
+		for _, source := range []int64{1, 8, 32, 128} {
+			for _, preview := range []int64{0, 50, 200, 900} {
+				cfg := DefaultConfig()
+				cfg.FileView.MaxIWorkSourceBytes = source * 1024 * 1024
+				cfg.FileView.MaxIWorkPreviewBytes = preview * 1024 * 1024
+
+				if advice := adviceFor(t, cfg); !strings.Contains(advice, "seafhttp.sync_block_max_bytes") {
+					t.Errorf("source=%d preview=%d: advice omits the stream cost lever: %s", source, preview, advice)
+				}
 			}
 		}
+	})
+
+	// 4 MiB / 4.5 is the exact block size at which the plaintext floor takes
+	// over, so these two neighbours sit on either side of the transition.
+	t.Run("withheld once the plaintext floor is what is charged", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			block int64
+			want  bool
+		}{
+			{"one byte above the transition", 932068, true},
+			{"one byte below the transition", 932067, false},
+			{"512 KiB", 512 * 1024, false},
+			{"the smallest accepted block", 1, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := DefaultConfig()
+				cfg.SeafHTTP.SyncBlockMaxBytes = tc.block
+
+				streamCost, _, err := downloadAdmissionMemoryCosts(cfg)
+				if err != nil {
+					t.Fatalf("costs: %v", err)
+				}
+				if got := streamCost > DownloadAdmissionPlaintextPeakBytes; got != tc.want {
+					t.Fatalf("stream cost %d dominates=%v, want %v; the fixture no longer sits where it claims",
+						streamCost, got, tc.want)
+				}
+				advice := adviceFor(t, cfg)
+				if got := strings.Contains(advice, "seafhttp.sync_block_max_bytes"); got != tc.want {
+					t.Errorf("block=%d: advice names the stream lever=%v, want %v: %s", tc.block, got, tc.want, advice)
+				}
+			})
+		}
+	})
+
+	// The same withholding through the real startup path, so the assertion is
+	// about the error an operator reads rather than about a helper's return.
+	t.Run("withheld in the startup failure itself", func(t *testing.T) {
+		withCgroupMemoryLimit(t, 512*1024*1024, true)
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		cfg.SeafHTTP.SyncBlockMaxBytes = 512 * 1024
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("a 512 MiB container validated")
+		}
+		if !strings.Contains(err.Error(), "one stream slot (4194304 bytes)") {
+			t.Fatalf("stream cost is not on its plaintext floor; the fixture no longer sits where it claims: %v", err)
+		}
+		if strings.Contains(err.Error(), "sync_block_max_bytes") {
+			t.Errorf("advice offers a lever that cannot move a floored stream cost: %v", err)
+		}
+	})
+}
+
+// TestFloorAdviceWithholdsAnExhaustedShareForAnExplicitBudget is the configured
+// counterpart of the cgroup case. An explicit budget is held to the same share
+// of a detected container limit, so on a container too small for the maximum
+// share, "raise memory_budget_bytes" is exactly as dead an end as raising the
+// percentage — and it is the branch an operator reaches by pinning a budget on a
+// small node, which is the likeliest way to arrive here.
+func TestFloorAdviceWithholdsAnExhaustedShareForAnExplicitBudget(t *testing.T) {
+	withCgroupMemoryLimit(t, 512*1024*1024, true)
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.MemoryBudgetBytes = 100 * 1024 * 1024
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("an explicit 100 MiB budget on a 512 MiB container validated")
+	}
+	if cfg.DownloadBudgetSource() != "configured" {
+		t.Fatalf("budget source = %q; this test must exercise the configured branch", cfg.DownloadBudgetSource())
+	}
+	if strings.Contains(err.Error(), "Raise download_admission.memory_budget_bytes") {
+		t.Errorf("advice offers a budget no share of this container can hold: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cannot reach the floor") {
+		t.Errorf("advice does not say the share is exhausted: %v", err)
+	}
+
+	// The same branch on a container that can hold a larger budget must keep
+	// offering it, or the gate has simply silenced the advice everywhere.
+	withCgroupMemoryLimit(t, 8<<30, true)
+	roomy := DefaultConfig()
+	roomy.Auth.DevMode = true
+	roomy.FileView.MaxIWorkSourceBytes = 512 * 1024 * 1024
+	roomy.DownloadAdmission.MemoryBudgetBytes = 100 * 1024 * 1024
+	err = roomy.Validate()
+	if err == nil {
+		t.Fatal("a 100 MiB budget against a 512 MiB iWork source validated")
+	}
+	if !strings.Contains(err.Error(), "Raise download_admission.memory_budget_bytes") {
+		t.Errorf("advice withholds the lever that does clear this floor: %v", err)
 	}
 }

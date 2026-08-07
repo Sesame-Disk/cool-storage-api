@@ -158,11 +158,24 @@ your case rather than listing all of them:
    `memory_budget_percent`, up to its 50% ceiling. An explicit
    `memory_budget_bytes` is *not* a separate escape: a detected container limit
    caps it at that same share, so setting it alone on a small node is rejected
-   on the next check. It selects a budget *within* the allowed share.
-2. **Make a slot cheaper** — the raw slot cost is
-   `max(6 × max_iwork_source_bytes, stream, stream + source + max_iwork_preview_bytes)`
-   and the stream cost is `4.5 × sync_block_max_bytes`. Only the term that
-   currently dominates is worth lowering, which is why the error names that one.
+   on the next check. It selects a budget *within* the allowed share. Below
+   roughly 660 MiB even the 50% ceiling falls short, and the error says so
+   instead of offering either setting.
+2. **Make a slot cheaper** — the floor is one raw slot plus one stream slot:
+
+   ```text
+   stream = max(4 MiB, 4.5 × seafhttp.sync_block_max_bytes)
+   raw    = max(6 × max_iwork_source_bytes,
+                stream,
+                stream + max_iwork_source_bytes + max_iwork_preview_bytes)
+   ```
+
+   Both terms are in the failing sum, so the error names the raw term that
+   currently dominates *and* the stream lever. It withholds
+   `sync_block_max_bytes` once the stream cost has bottomed out on its 4 MiB
+   plaintext floor — below about `0.89 MiB` of block size — because lowering it
+   further changes nothing. Validation only requires that setting to be
+   positive, so that band is reachable.
 3. **Turn the guard off** — `download_admission.enabled: false`, accepting that
    the node has no aggregate download bound.
 

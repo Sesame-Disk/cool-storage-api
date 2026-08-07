@@ -2376,6 +2376,18 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 		return nil
 	}
 
+	// Read the limit once and keep it. Both the derivation and the floor advice
+	// need it, and the advice used to recover it by inverting the derivation
+	// (budget * 100 / percent). That inversion undoes a truncating division, so
+	// it can under-report the container by up to 100/percent bytes — enough, at
+	// the exact threshold, to tell an operator no share can clear the floor when
+	// the real limit says one can. An explicit budget takes the same read,
+	// because validateDownloadAdmissionCgroupBudget will hold it to a share of
+	// this limit and the advice has to know that.
+	detectedLimit, hasDetectedLimit := cgroupMemoryLimit()
+	if !hasDetectedLimit {
+		detectedLimit = 0
+	}
 	if d.MemoryBudgetBytes > 0 {
 		// Only classify once. A second Validate() sees the budget this pass
 		// materialised and would relabel a derived budget as configured — the
@@ -2386,13 +2398,13 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 			c.downloadBudgetSourceKind = "configured"
 		}
 	} else {
-		if limit, ok := cgroupMemoryLimit(); ok {
-			budget, ok := checkedNonNegativeMultiply(limit, int64(d.MemoryBudgetPercent))
+		if hasDetectedLimit {
+			budget, ok := checkedNonNegativeMultiply(detectedLimit, int64(d.MemoryBudgetPercent))
 			if !ok {
 				return fmt.Errorf("download admission cgroup memory budget overflows")
 			}
 			d.MemoryBudgetBytes = budget / 100
-			c.downloadBudgetSource = fmt.Sprintf("%d%% of the detected cgroup limit %d", d.MemoryBudgetPercent, limit)
+			c.downloadBudgetSource = fmt.Sprintf("%d%% of the detected cgroup limit %d", d.MemoryBudgetPercent, detectedLimit)
 			c.downloadBudgetSourceKind = "cgroup"
 		} else {
 			d.MemoryBudgetBytes = DefaultDownloadAdmissionMemoryBudgetBytes
@@ -2440,7 +2452,7 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 		return fmt.Errorf("download admission cannot size one raw slot (%d bytes) plus one stream slot (%d bytes) = %d bytes "+
 			"from the %d-byte budget, which is %d bytes after the %d%% safety margin. %s",
 			rawCost, streamCost, needed, d.MemoryBudgetBytes, effectiveBudget, d.SafetyMarginPercent,
-			downloadAdmissionFloorAdvice(c, d, rawCost, streamCost))
+			downloadAdmissionFloorAdvice(c, d, rawCost, streamCost, detectedLimit))
 	}
 	capAt := func(policy, capacity int) int {
 		if capacity < 1 {
@@ -2524,45 +2536,66 @@ func downloadAdmissionEffectiveBudget(budget int64, safetyMarginPercent int) (in
 // one that dominates a raw slot; at the shipped values the iWork source term
 // wins, so naming it sends the operator to a setting that changes nothing.
 //
-// The cost levers are always both named. The stream cost is a term of the sum
-// that failed no matter which raw term dominates, so seafhttp.sync_block_max_bytes
-// is always worth offering — it used to be an initial value that no input could
-// reach, because previewCost is streamCost plus a positive source and therefore
-// always exceeds streamCost.
+// The raw lever is whichever term currently dominates rawCost. The stream lever
+// is offered alongside it because the stream cost is the *other* term of the sum
+// that failed, whichever raw term wins — but only while lowering it would move
+// anything: streamCost is max(plaintext peak, 4.5x the block size), so below
+// roughly 0.89 MiB of block size the plaintext floor is what is being charged
+// and seafhttp.sync_block_max_bytes has stopped being a lever. Validation only
+// requires that setting to be positive, so that band is reachable.
+//
+// detectedLimit is the container limit in bytes, or 0 when none is exposed. It
+// is passed in rather than recovered by inverting the derivation, and it decides
+// whether the share is worth recommending at all in *both* budget provenances: an
+// explicit budget is capped at a share of the same limit, so on a container too
+// small for the maximum share, "raise memory_budget_bytes" is the same dead end
+// as "raise memory_budget_percent".
+//
 // d is the section as resolved so far, not c.DownloadAdmission: the derived
 // budget lives in the local copy until the function returns successfully, so
 // reading it from c here would see the pre-derivation value — zero in auto mode,
 // which made every container look too small for any share.
-func downloadAdmissionFloorAdvice(c *Config, d DownloadAdmissionConfig, rawCost, streamCost int64) string {
+func downloadAdmissionFloorAdvice(c *Config, d DownloadAdmissionConfig, rawCost, streamCost, detectedLimit int64) string {
 	rawLever := "fileview.max_iwork_preview_bytes or fileview.max_iwork_source_bytes"
 	if iwork, ok := checkedNonNegativeMultiply(c.FileView.MaxIWorkSourceBytes, DownloadAdmissionIWorkEncryptedPeakMultiplier); ok && iwork == rawCost {
 		rawLever = "fileview.max_iwork_source_bytes"
 	}
-	costAdvice := fmt.Sprintf("lower %s, which sets the raw slot cost, or seafhttp.sync_block_max_bytes, which sets the stream slot cost",
-		rawLever)
+	costAdvice := fmt.Sprintf("lower %s, which sets the raw slot cost", rawLever)
+	if streamCost > DownloadAdmissionPlaintextPeakBytes {
+		costAdvice += ", or seafhttp.sync_block_max_bytes, which sets the stream slot cost"
+	}
+
+	// Recommending a share the container cannot give sends the operator into
+	// either no change at all or the setting's own range error, which is the
+	// failure mode this whole function exists to stop producing.
+	shareExhausted := detectedLimit > 0 && !downloadAdmissionMaxShareClearsFloor(detectedLimit, d, rawCost, streamCost)
 
 	switch c.downloadBudgetSourceKind {
 	case "cgroup":
-		if downloadAdmissionPercentCanClearFloor(d, rawCost, streamCost) {
-			return fmt.Sprintf("The budget is %d%% of the detected container limit, and an explicit "+
-				"download_admission.memory_budget_bytes is held to that same share, so it is not a way around this. "+
-				"Raise download_admission.memory_budget_percent (up to %d), %s, or set "+
+		if shareExhausted {
+			return fmt.Sprintf("The budget is %d%% of the detected container limit, and even the maximum %d%% share "+
+				"of this container cannot reach the floor, so neither download_admission.memory_budget_percent nor an "+
+				"explicit download_admission.memory_budget_bytes can resolve it. Either %s, or set "+
 				"download_admission.enabled: false on a node this small.",
 				d.MemoryBudgetPercent, MaxDownloadAdmissionMemoryBudgetPercent, costAdvice)
 		}
-		// Recommending the percentage here would send the operator into either no
-		// change at all or the range error, which is the failure mode this whole
-		// function exists to stop producing.
-		return fmt.Sprintf("The budget is %d%% of the detected container limit, and even the maximum %d%% share "+
-			"of this container cannot reach the floor, so neither download_admission.memory_budget_percent nor an "+
-			"explicit download_admission.memory_budget_bytes can resolve it. Either %s, or set "+
+		return fmt.Sprintf("The budget is %d%% of the detected container limit, and an explicit "+
+			"download_admission.memory_budget_bytes is held to that same share, so it is not a way around this. "+
+			"Raise download_admission.memory_budget_percent (up to %d), %s, or set "+
 			"download_admission.enabled: false on a node this small.",
 			d.MemoryBudgetPercent, MaxDownloadAdmissionMemoryBudgetPercent, costAdvice)
 	case "configured":
+		if shareExhausted {
+			return fmt.Sprintf("The budget is configured explicitly, so download_admission.memory_budget_percent "+
+				"does not change it — and a detected container limit caps it at that share, of which even the "+
+				"maximum %d%% cannot reach the floor, so raising download_admission.memory_budget_bytes cannot "+
+				"resolve it either. Either %s, or set download_admission.enabled: false on a node this small.",
+				MaxDownloadAdmissionMemoryBudgetPercent, costAdvice)
+		}
 		return fmt.Sprintf("The budget is configured explicitly, so download_admission.memory_budget_percent "+
-			"does not change it. Raise download_admission.memory_budget_bytes — a detected container limit still "+
-			"caps it at memory_budget_percent of that limit, so raise that share too if one is in force — %s, "+
-			"or set download_admission.enabled: false.", costAdvice)
+			"does not change it. Raise download_admission.memory_budget_bytes instead — a detected container limit "+
+			"still caps it at memory_budget_percent of that limit, so raise that share too if one is in force. "+
+			"Alternatively %s, or set download_admission.enabled: false.", costAdvice)
 	default:
 		return fmt.Sprintf("No container limit was detected, so the budget is the reference fallback. "+
 			"Set download_admission.memory_budget_bytes for this deployment, %s, or set "+
@@ -2570,21 +2603,14 @@ func downloadAdmissionFloorAdvice(c *Config, d DownloadAdmissionConfig, rawCost,
 	}
 }
 
-// downloadAdmissionPercentCanClearFloor asks whether the largest share this
+// downloadAdmissionMaxShareClearsFloor asks whether the largest share this
 // container may give download admission would fit one raw slot plus one stream
-// slot. Below roughly 660 MiB nothing does, and the operator needs to be told
-// that rather than sent to a setting they may already be at.
-func downloadAdmissionPercentCanClearFloor(d DownloadAdmissionConfig, rawCost, streamCost int64) bool {
-	percent := d.MemoryBudgetPercent
-	if percent <= 0 {
+// slot. Below roughly 660 MiB at the shipped costs nothing does, and the operator
+// needs to be told that rather than sent to a setting they may already be at.
+func downloadAdmissionMaxShareClearsFloor(limit int64, d DownloadAdmissionConfig, rawCost, streamCost int64) bool {
+	if limit <= 0 {
 		return false
 	}
-	limit, ok := checkedNonNegativeMultiply(d.MemoryBudgetBytes, 100)
-	if !ok {
-		return false
-	}
-	limit /= int64(percent)
-
 	best, ok := checkedNonNegativeMultiply(limit, int64(MaxDownloadAdmissionMemoryBudgetPercent))
 	if !ok {
 		return false
