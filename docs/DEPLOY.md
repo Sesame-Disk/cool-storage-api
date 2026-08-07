@@ -144,6 +144,23 @@ available:
 | 8 GiB | 2 GiB | Auto derives the clean baseline of 16 active slots, 4 raw and 12 other streams. |
 | 16 GiB | 4 GiB | Auto scales within the absolute policy ceilings; fairness caps remain bounded. |
 
+**There is a floor, and a container below it will not start.** Auto mode has to
+fit at least one raw slot and one stream slot, and at the shipped costs that is
+`192 MiB + 72 MiB = 264 MiB` of usable budget — `330 MiB` before the 20% safety
+margin. At the default 25% share that means a container limit of about
+**1.3 GiB**; below roughly 660 MiB no share within the 50% ceiling is enough.
+Measured: a 330 MiB budget derives 2 slots and starts, 329 MiB does not.
+
+A node that small has four ways forward, and the startup error names all of
+them: raise `memory_budget_percent`, set `memory_budget_bytes` explicitly, lower
+the values that make a raw slot expensive (`fileview.max_iwork_source_bytes`,
+`fileview.max_iwork_preview_bytes`, `seafhttp.sync_block_max_bytes`), or set
+`download_admission.enabled: false` and accept that the node has no aggregate
+download bound. The guard is deliberately not degraded to "whatever fits": a
+design that silently exceeds its stated budget is what this validator exists to
+prevent.
+
+
 Manual mode is available for special deployments. It requires
 `memory_budget_bytes`, `max_active_per_node`, `max_active_raw` and the other
 capacity fields; the same safety-adjusted memory validator still checks the

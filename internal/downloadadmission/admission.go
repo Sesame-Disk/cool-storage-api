@@ -730,9 +730,18 @@ func publishCapacityMetrics(cfg config.DownloadAdmissionConfig) {
 		metrics.DownloadAdmissionCapacity.WithLabelValues(setting).Set(float64(value))
 	}
 	metrics.DownloadAdmissionMemoryBudgetBytes.Set(float64(cfg.MemoryBudgetBytes))
+	// New is exported, and ValidateDownloadAdmissionConfig does not cover the
+	// budget or the margin — those belong to Config.Validate. A caller outside
+	// Load() can therefore reach here with values that would overflow the
+	// product or invert the margin, and a metric that publishes a negative
+	// "effective budget" is worse than one that publishes nothing.
 	margin := cfg.SafetyMarginPercent
 	if margin < 0 || margin >= 100 {
 		margin = 0
+	}
+	if cfg.MemoryBudgetBytes < 0 || cfg.MemoryBudgetBytes > math.MaxInt64/int64(100-margin) {
+		metrics.DownloadAdmissionMemoryBudgetEffectiveBytes.Set(0)
+		return
 	}
 	// Same order as the validator: multiply first. Dividing first published a
 	// figure 38 bytes below the budget the node was actually sized against, and

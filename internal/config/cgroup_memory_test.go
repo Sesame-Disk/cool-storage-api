@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -153,5 +154,68 @@ func TestBudgetSourceIsAlwaysAttributed(t *testing.T) {
 				t.Fatalf("budget source = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestBudgetSourceSurvivesRevalidation covers the metric's whole reason for
+// existing. Auto mode materialises the derived budget into the config, so a
+// second Validate() sees a positive number and would call it "configured" —
+// relabelling a derived budget as an explicit one is exactly the confusion this
+// metric was added to prevent.
+func TestBudgetSourceSurvivesRevalidation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		limit   int64
+		haveCap bool
+		want    string
+	}{
+		{name: "derived from cgroup", limit: 8 << 30, haveCap: true, want: "cgroup"},
+		{name: "reference fallback", want: "fallback"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withCgroupMemoryLimit(t, tc.limit, tc.haveCap)
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("first Validate() = %v", err)
+			}
+			if got := cfg.DownloadBudgetSource(); got != tc.want {
+				t.Fatalf("budget source = %q, want %q", got, tc.want)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("second Validate() = %v", err)
+			}
+			if got := cfg.DownloadBudgetSource(); got != tc.want {
+				t.Fatalf("budget source after revalidation = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSmallContainerFailureNamesTheLevers pins the message an operator meets
+// when a container is too small for the shipped design. It is the one refusal
+// reachable without misconfiguring anything, so "too small" on its own leaves
+// them stuck.
+func TestSmallContainerFailureNamesTheLevers(t *testing.T) {
+	withCgroupMemoryLimit(t, 1<<30, true) // 1 GiB derives a 256 MiB budget
+
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("a 1 GiB container validated; the derivation cannot fit one raw slot plus one stream slot")
+	}
+	for _, lever := range []string{
+		"memory_budget_percent",
+		"memory_budget_bytes",
+		"max_iwork_source_bytes",
+		"sync_block_max_bytes",
+		"enabled: false",
+	} {
+		if !strings.Contains(err.Error(), lever) {
+			t.Errorf("failure does not mention %q: %v", lever, err)
+		}
 	}
 }

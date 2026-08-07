@@ -309,9 +309,17 @@ func (s *Server) initializeDownloadAdmissionCoordinator() {
 	}
 	// The coordinator only receives the section, so the provenance of the budget
 	// it was sized from is published here, where the whole config is in hand.
+	//
+	// A disabled section has no active budget, and publishCapacityMetrics already
+	// publishes zeros for every capacity: claiming a source there would have the
+	// node report "budget 0, source configured" at the same time.
+	active := ""
+	if s.config.DownloadAdmission.Enabled {
+		active = s.config.DownloadBudgetSource()
+	}
 	for _, source := range []string{"configured", "cgroup", "fallback"} {
 		value := 0.0
-		if source == s.config.DownloadBudgetSource() {
+		if source == active {
 			value = 1
 		}
 		metrics.DownloadAdmissionBudgetSource.WithLabelValues(source).Set(value)

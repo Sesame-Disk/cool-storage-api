@@ -2377,8 +2377,14 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 	}
 
 	if d.MemoryBudgetBytes > 0 {
-		c.downloadBudgetSource = "configured explicitly"
-		c.downloadBudgetSourceKind = "configured"
+		// Only classify once. A second Validate() sees the budget this pass
+		// materialised and would relabel a derived budget as configured — the
+		// metric exists precisely to distinguish those, so it must not change
+		// its answer because it was asked twice.
+		if c.downloadBudgetSourceKind == "" {
+			c.downloadBudgetSource = "configured explicitly"
+			c.downloadBudgetSourceKind = "configured"
+		}
 	} else {
 		if limit, ok := cgroupMemoryLimit(); ok {
 			budget, ok := checkedNonNegativeMultiply(limit, int64(d.MemoryBudgetPercent))
@@ -2421,7 +2427,17 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 
 	rawSlots, streamSlots, nodeSlots, ok := deriveDownloadAdmissionSlots(effectiveBudget, rawCost, streamCost, d.RawCapacityPercent)
 	if !ok {
-		return fmt.Errorf("download admission memory budget is too small for one raw slot and one stream slot after the safety margin")
+		// Name the arithmetic and every lever that moves it. This is the one
+		// failure an operator meets by doing nothing wrong — a container smaller
+		// than roughly 1.3 GiB derives a budget below the floor — and a message
+		// that only says "too small" leaves them with a server that will not
+		// start and no idea which of five settings to reach for.
+		return fmt.Errorf("download admission cannot size one raw slot (%d bytes) plus one stream slot (%d bytes) "+
+			"from the %d-byte budget, which is %d bytes after the %d%% safety margin. "+
+			"Raise download_admission.memory_budget_percent or set download_admission.memory_budget_bytes; "+
+			"lower fileview.max_iwork_source_bytes, fileview.max_iwork_preview_bytes or seafhttp.sync_block_max_bytes, "+
+			"which are what make a raw slot expensive; or set download_admission.enabled: false on a node this small",
+			rawCost, streamCost, d.MemoryBudgetBytes, effectiveBudget, d.SafetyMarginPercent)
 	}
 	capAt := func(policy, capacity int) int {
 		if capacity < 1 {

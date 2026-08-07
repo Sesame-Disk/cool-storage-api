@@ -60,17 +60,13 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 		t.Fatalf("node reported capacity node=%d per-identity=%d; the guard cannot be exercised", nodeCap, perIdentity)
 	}
 
-	// The fixture holds slots as three authenticated identities, so it can fill
-	// at most three times the per-identity cap — and that cap is policy-limited,
-	// it does not grow with the node. A host that derives more than this cannot
-	// be saturated by this fixture; the drill then verifies the plateau it can
-	// reach and says so, instead of quietly proving a smaller ceiling.
 	// This fixture holds slots as a fixed set of authenticated identities, and
 	// the per-identity cap is policy-limited — it does not grow with the node.
 	// A host deriving more than these identities can hold cannot be saturated
 	// here, and a test named for holding the ceiling must not pass without
 	// having held it. The plateau, the invariants and the refusal contract are
-	// covered at any size by the two tests below.
+	// covered at any size by TestDownloadAdmissionMixedProfilesMaintainInvariants
+	// and TestDownloadAdmissionSaturatedIdentityReturnsRetryAfter.
 	if fillable := len(clients) * perIdentity; fillable < nodeCap {
 		t.Skipf("node derived a ceiling of %d but %d identities cap out at %d admissions; "+
 			"filling the aggregate ceiling needs more identities than this fixture creates",
