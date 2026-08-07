@@ -50,7 +50,7 @@ var errSeafileBlockIDsUnavailable = errors.New("seafile sha1 block ids unavailab
 
 // SyncTokenCreator interface for creating sync tokens
 type SyncTokenCreator interface {
-	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateSyncToken(orgID, repoID, userID string) (string, error)
 }
 
 // SyncTokenValidator resolves a sync token string to its access metadata. The
@@ -704,7 +704,7 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 		// surface and miss the other; this check previously spelled its source
 		// clause as "not a link", which would have admitted any future source
 		// value that the middleware's allowlist refuses.
-		accessToken, valid := h.tokenValidator.GetToken(req.Token, TokenTypeDownload)
+		accessToken, valid := h.tokenValidator.GetToken(req.Token, TokenTypeSync)
 		if !valid || !isRepositorySyncToken(accessToken, req.RepoID) {
 			continue
 		}
@@ -3179,7 +3179,7 @@ func (h *SyncHandler) GetDownloadInfo(c *gin.Context) {
 	// Generate a sync token if we have a token creator
 	token := ""
 	if h.tokenCreator != nil {
-		token, _ = h.tokenCreator.CreateDownloadToken(orgID, repoID, "/", userID)
+		token, _ = h.tokenCreator.CreateSyncToken(orgID, repoID, userID)
 	}
 
 	// Format repo size in Seafile's human-readable format

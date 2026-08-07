@@ -36,6 +36,7 @@ type TokenCreator interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateSyncToken(orgID, repoID, userID string) (string, error)
 	CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 	CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 }
@@ -3878,7 +3879,7 @@ func (h *FileHandler) GetDownloadInfo(c *gin.Context) {
 	}
 
 	// Generate a sync token for this repo
-	token, err := h.tokenCreator.CreateDownloadToken(orgID, repoID, "/", userID)
+	token, err := h.tokenCreator.CreateSyncToken(orgID, repoID, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate sync token"})
 		return

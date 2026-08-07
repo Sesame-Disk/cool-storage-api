@@ -16,6 +16,13 @@ type TokenType string
 const (
 	TokenTypeUpload   TokenType = "upload"
 	TokenTypeDownload TokenType = "download"
+	// TokenTypeSync is the repository sync credential the desktop client gets
+	// from download-info. It is a distinct type rather than a download token of
+	// a particular shape so that a download bearer cannot authenticate the sync
+	// surface by construction — see ISSUE-SYNC-LINK-TOKEN-AUTH-01, where a
+	// public share-link download token did exactly that. GetToken compares the
+	// stored type exactly, so the separation is enforced at the store.
+	TokenTypeSync TokenType = "sync"
 )
 
 // AccessToken represents a temporary access token for file operations
@@ -56,8 +63,18 @@ func NewTokenStore(db *DB, ttl time.Duration) *TokenStore {
 	}
 }
 
-// CreateToken creates a new access token and stores it in Cassandra
+// CreateToken creates a new access token and stores it in Cassandra.
+//
+// It refuses TokenTypeSync. The generic constructor takes a path, and a sync
+// credential's root path is meant to be a property of its constructor rather
+// than a value a caller supplies — see CreateSyncToken. Without this guard
+// "CreateSyncToken is the only way to mint one" would be a convention rather
+// than a fact, and the whole point of the separate type is that it cannot be
+// produced by accident.
 func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, userID, source string) (*AccessToken, error) {
+	if tokenType == TokenTypeSync {
+		return nil, fmt.Errorf("sync tokens must be created through CreateSyncToken")
+	}
 	return ts.createToken(tokenType, orgID, repoID, path, userID, source, "", false)
 }
 
@@ -178,6 +195,21 @@ func (ts *TokenStore) CreateDownloadToken(orgID, repoID, path, userID string) (s
 	return token.Token, nil
 }
 
+// CreateSyncToken creates the repository sync credential.
+//
+// It takes no path: a sync token is always scoped to the repository root, and
+// leaving the caller unable to pass anything else is the point. The previous
+// design minted these through CreateDownloadToken with a literal "/" argument,
+// which meant a file-scoped download token and a sync credential differed only
+// by the value one caller happened to pass.
+func (ts *TokenStore) CreateSyncToken(orgID, repoID, userID string) (string, error) {
+	token, err := ts.createToken(TokenTypeSync, orgID, repoID, "/", userID, "", "", false)
+	if err != nil {
+		return "", err
+	}
+	return token.Token, nil
+}
+
 // CreateLinkDownloadToken creates a download token for a share link — tagged as source="link".
 func (ts *TokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
 	if strings.TrimSpace(sourceID) == "" {
@@ -263,6 +295,7 @@ type TokenCreator interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateSyncToken(orgID, repoID, userID string) (string, error)
 	CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 	CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 }

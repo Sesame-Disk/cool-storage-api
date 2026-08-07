@@ -41,6 +41,11 @@ func (a *CassandraTokenAdapter) CreateLinkDownloadToken(orgID, repoID, path, use
 	return a.store.CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID)
 }
 
+// CreateSyncToken creates the repository sync credential.
+func (a *CassandraTokenAdapter) CreateSyncToken(orgID, repoID, userID string) (string, error) {
+	return a.store.CreateSyncToken(orgID, repoID, userID)
+}
+
 // GetToken retrieves and validates a token
 func (a *CassandraTokenAdapter) GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool) {
 	// Convert api.TokenType to db.TokenType

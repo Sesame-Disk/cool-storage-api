@@ -56,6 +56,13 @@ const (
 	TokenTypeUpload       TokenType = "upload"
 	TokenTypeDownload     TokenType = "download"
 	TokenTypeOneTimeLogin TokenType = "onetime_login"
+	// TokenTypeSync is the repository sync credential the desktop client gets
+	// from download-info. It is a distinct type rather than a download token of
+	// a particular shape so that a download bearer cannot authenticate the sync
+	// surface by construction — see ISSUE-SYNC-LINK-TOKEN-AUTH-01, where a
+	// public share-link download token did exactly that. GetToken compares the
+	// stored type exactly, so the separation is enforced at the store.
+	TokenTypeSync TokenType = "sync"
 )
 
 // AccessToken represents a temporary access token for file operations
@@ -85,6 +92,7 @@ type TokenStore interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateSyncToken(orgID, repoID, userID string) (string, error)
 	CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 	CreateLinkDownloadToken(orgID, repoID, path, userID, sourceID string) (string, error)
 	GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool)
@@ -117,8 +125,18 @@ func NewTokenManager(tokenTTL time.Duration) *TokenManager {
 // DefaultTokenTTL is the default time-to-live for tokens
 const DefaultTokenTTL = 1 * time.Hour
 
-// CreateToken creates a new access token
+// CreateToken creates a new access token.
+//
+// It refuses TokenTypeSync. The generic constructor takes a path, and a sync
+// credential's root path is meant to be a property of its constructor rather
+// than a value a caller supplies — see CreateSyncToken. Without this guard
+// "CreateSyncToken is the only way to mint one" would be a convention rather
+// than a fact, and the whole point of the separate type is that it cannot be
+// produced by accident.
 func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, userID, source string, ttl time.Duration) (*AccessToken, error) {
+	if tokenType == TokenTypeSync {
+		return nil, errors.New("sync tokens must be created through CreateSyncToken")
+	}
 	return tm.createToken(tokenType, orgID, repoID, path, userID, source, "", false, ttl)
 }
 
@@ -186,6 +204,21 @@ func (tm *TokenManager) CreateUpdateToken(orgID, repoID, path, userID string) (s
 // CreateDownloadToken creates a download token (implements TokenCreator interface)
 func (tm *TokenManager) CreateDownloadToken(orgID, repoID, path, userID string) (string, error) {
 	token, err := tm.CreateToken(TokenTypeDownload, orgID, repoID, path, userID, "", tm.tokenTTL)
+	if err != nil {
+		return "", err
+	}
+	return token.Token, nil
+}
+
+// CreateSyncToken creates the repository sync credential.
+//
+// It takes no path: a sync token is always scoped to the repository root, and
+// leaving the caller unable to pass anything else is the point. The previous
+// design minted these through CreateDownloadToken with a literal "/" argument,
+// which meant a file-scoped download token and a sync credential differed only
+// by the value one caller happened to pass.
+func (tm *TokenManager) CreateSyncToken(orgID, repoID, userID string) (string, error) {
+	token, err := tm.createToken(TokenTypeSync, orgID, repoID, "/", userID, "", "", false, tm.tokenTTL)
 	if err != nil {
 		return "", err
 	}

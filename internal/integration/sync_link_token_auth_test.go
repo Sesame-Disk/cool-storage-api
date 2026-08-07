@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -158,8 +159,17 @@ func TestSyncAuthLegitimateTokenIsBoundToItsRepository(t *testing.T) {
 	}
 }
 
-// Isolates the source check, and covers the one link-token shape the other two
-// conditions cannot refuse.
+// Covers the one link-token shape neither the path rule nor the repository
+// binding can refuse.
+//
+// This test isolated the *source* clause when the fix landed. It no longer
+// does: TokenTypeSync now refuses this bearer at the store, before the
+// predicate runs, so removing the source clause leaves this green. The source
+// clause is still load-bearing and is now pinned at unit level instead — see
+// TestIsRepositorySyncToken/unknown_future_source_with_the_right_shape and
+// TestGetLockedFiles_RejectsNarrowerDownloadTokens, both of which carry the
+// correct type. This case stays because it is the real-world exploit shape, and
+// a live end-to-end refusal is worth keeping whichever clause does the work.
 //
 // A file share link mints a bearer carrying that file's path, so the Path=="/"
 // rule alone would catch it. A link that shares the *library root* is different:
@@ -188,7 +198,7 @@ func TestSyncAuthRejectsRootDirectoryShareLinkToken(t *testing.T) {
 	status := replaySyncToken(t, client, http.MethodGet, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD", repoID), zipToken)
 	if status != http.StatusUnauthorized && status != http.StatusForbidden {
 		t.Fatalf("commit/HEAD with a root-directory share-link bearer = %d; want 401 or 403. "+
-			"This token has Path==\"/\" and the right RepoID, so only the source check can refuse it.", status)
+			"This token has Path==\"/\" and the right RepoID, so before TokenTypeSync existed only the source check refused it; now the type does.", status)
 	}
 }
 
@@ -269,6 +279,55 @@ func TestSyncAuthLinkTokenCannotWriteToAnotherLibrary(t *testing.T) {
 	}
 	if putStatus != http.StatusUnauthorized && putStatus != http.StatusForbidden {
 		t.Errorf("PutBlock into an unshared library with a share-link token = %d; want 401 or 403", putStatus)
+	}
+}
+
+// The two credentials must not cross surfaces in either direction.
+//
+// Splitting TokenTypeSync out of TokenTypeDownload is only worth having if the
+// separation holds both ways: a sync credential must not fetch file bytes, and
+// a file bearer must not reach sync. The second direction is covered above;
+// this pins the first, and pins that ordinary downloads did not break in the
+// process — which is the regression a type split is most likely to cause.
+func TestSyncAndDownloadTokensDoNotCrossSurfaces(t *testing.T) {
+	requireCassandra(t)
+
+	client := adminClient
+	repoID := createTestLibrary(t, client, syncLinkTestName("cross-surface"))
+	const fileName = "crossing.txt"
+	uploadTestFile(t, client, repoID, "/", fileName, "crossing body")
+
+	syncToken := mintRepositorySyncToken(t, client, repoID)
+
+	// Assert the exact refusal rather than "not 200". A 500 would satisfy
+	// "did not serve bytes" while actually meaning the type mismatch crashed
+	// something, which is not the contract being claimed here. HandleDownload
+	// answers 401 when GetToken rejects the type.
+	resp := client.DoAnonymous(t, http.MethodGet, "/seafhttp/files/"+syncToken+"/"+fileName)
+	status := resp.StatusCode
+	resp.Body.Close()
+	if status != http.StatusUnauthorized {
+		t.Errorf("a repository sync token at /seafhttp/files/ = %d, want 401; "+
+			"the download surface must refuse a sync credential cleanly, not merely fail to serve it", status)
+	}
+
+	// And the ordinary download path still works, with its own token.
+	fileResp := client.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+	expectStatus(t, fileResp, http.StatusOK)
+	fileURL := strings.Trim(responseBody(t, fileResp), "\" \n\r")
+	downloadToken := tokenFromSeafhttpFilesURL(t, fileURL)
+
+	dl := client.DoAnonymous(t, http.MethodGet, "/seafhttp/files/"+downloadToken+"/"+fileName)
+	defer dl.Body.Close()
+	if dl.StatusCode != http.StatusOK {
+		t.Fatalf("ordinary file download = %d, want 200; the token split broke downloads", dl.StatusCode)
+	}
+	body, err := io.ReadAll(dl.Body)
+	if err != nil {
+		t.Fatalf("reading download body: %v", err)
+	}
+	if string(body) != "crossing body" {
+		t.Errorf("download body = %q, want %q", string(body), "crossing body")
 	}
 }
 

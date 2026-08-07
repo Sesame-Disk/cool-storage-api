@@ -1,6 +1,35 @@
 package api
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+// The generic constructor must refuse TokenTypeSync, or "CreateSyncToken is the
+// only way to mint one" is a convention someone can break by accident rather
+// than a property of the code. The generic path takes a path argument, which is
+// exactly what a sync credential must not let a caller choose.
+func TestGenericCreateTokenRefusesSyncType(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+
+	if _, err := tm.CreateToken(TokenTypeSync, "org1", "repo1", "/", "user1", "", time.Hour); err == nil {
+		t.Error("CreateToken(TokenTypeSync, ...) succeeded; the generic constructor must refuse it")
+	}
+
+	// A path other than the root is the case that would matter most, since it
+	// would produce a sync credential the predicate then rejects — a token that
+	// exists but can never be used.
+	if _, err := tm.CreateToken(TokenTypeSync, "org1", "repo1", "/some/file.txt", "user1", "", time.Hour); err == nil {
+		t.Error("CreateToken(TokenTypeSync, ...) with a file path succeeded; the generic constructor must refuse it")
+	}
+
+	// The types it does serve still work.
+	for _, tt := range []TokenType{TokenTypeUpload, TokenTypeDownload} {
+		if _, err := tm.CreateToken(tt, "org1", "repo1", "/file.txt", "user1", "", time.Hour); err != nil {
+			t.Errorf("CreateToken(%q, ...) = %v; the guard must not touch the other types", tt, err)
+		}
+	}
+}
 
 // The route-level contract for ISSUE-SYNC-LINK-TOKEN-AUTH-01, pinned without a
 // server. The integration suite proves the middleware enforces it end to end;
@@ -11,7 +40,7 @@ func TestIsRepositorySyncToken(t *testing.T) {
 	const otherRepo = "99999999-8888-7777-6666-555555555555"
 
 	valid := func() *AccessToken {
-		return &AccessToken{Source: "", Path: "/", RepoID: repo}
+		return &AccessToken{Type: TokenTypeSync, Source: "", Path: "/", RepoID: repo}
 	}
 
 	tests := []struct {
@@ -30,20 +59,20 @@ func TestIsRepositorySyncToken(t *testing.T) {
 		},
 		{
 			name:        "share-link token for one file",
-			token:       &AccessToken{Source: "link", Path: "/shared.txt", RepoID: repo},
+			token:       &AccessToken{Type: TokenTypeDownload, Source: "link", Path: "/shared.txt", RepoID: repo},
 			routeRepoID: repo,
 			want:        false,
 		},
 		{
 			name:        "share-link token for the library root",
-			token:       &AccessToken{Source: "link", Path: "/", RepoID: repo},
+			token:       &AccessToken{Type: TokenTypeDownload, Source: "link", Path: "/", RepoID: repo},
 			routeRepoID: repo,
 			want:        false,
-			why:         "only the source clause can refuse this one: the path and the repository both match",
+			why:         "path and repository both match, so the type is what refuses it; before TokenTypeSync existed this case belonged to the source clause",
 		},
 		{
 			name:        "authenticated file-scoped download token",
-			token:       &AccessToken{Source: "", Path: "/report.pdf", RepoID: repo},
+			token:       &AccessToken{Type: TokenTypeDownload, Source: "", Path: "/report.pdf", RepoID: repo},
 			routeRepoID: repo,
 			want:        false,
 			why:         "a token issued to read one file is not a repository credential",
@@ -57,14 +86,14 @@ func TestIsRepositorySyncToken(t *testing.T) {
 		},
 		{
 			name:        "unknown future source with the right shape",
-			token:       &AccessToken{Source: "onlyoffice", Path: "/", RepoID: repo},
+			token:       &AccessToken{Type: TokenTypeSync, Source: "onlyoffice", Path: "/", RepoID: repo},
 			routeRepoID: repo,
 			want:        false,
 			why:         "the allowlist is the point: a new source must be admitted deliberately, not by default",
 		},
 		{
 			name:        "repository id differing only in case",
-			token:       &AccessToken{Source: "", Path: "/", RepoID: "abcdef01-2345-6789-abcd-ef0123456789"},
+			token:       &AccessToken{Type: TokenTypeSync, Source: "", Path: "/", RepoID: "abcdef01-2345-6789-abcd-ef0123456789"},
 			routeRepoID: "ABCDEF01-2345-6789-ABCD-EF0123456789",
 			want:        true,
 			why:         "the same UUID arrives from a URL segment and from storage; casing must not decide authorization",
@@ -81,6 +110,20 @@ func TestIsRepositorySyncToken(t *testing.T) {
 			token:       nil,
 			routeRepoID: repo,
 			want:        false,
+		},
+		{
+			name:        "download token with the perfect sync shape",
+			token:       &AccessToken{Type: TokenTypeDownload, Source: "", Path: "/", RepoID: repo},
+			routeRepoID: repo,
+			want:        false,
+			why:         "rooted path, empty source, right repository — only the token type refuses it, which is what makes a dedicated type worth having",
+		},
+		{
+			name:        "upload token with the sync shape",
+			token:       &AccessToken{Type: TokenTypeUpload, Source: "", Path: "/", RepoID: repo},
+			routeRepoID: repo,
+			want:        false,
+			why:         "an upload credential is not a sync credential either",
 		},
 	}
 

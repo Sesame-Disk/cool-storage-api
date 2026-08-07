@@ -122,6 +122,10 @@ func (m *mockTokenCreator) CreateDownloadToken(orgID, repoID, path, userID strin
 	return "mock-download-token-" + repoID, nil
 }
 
+func (m *mockTokenCreator) CreateSyncToken(orgID, repoID, userID string) (string, error) {
+	return "mock-sync-token-" + repoID, nil
+}
+
 func (m *mockTokenCreator) CreateLinkUploadToken(orgID, repoID, path, userID, sourceID string) (string, error) {
 	return "mock-link-upload-token-" + repoID, nil
 }
