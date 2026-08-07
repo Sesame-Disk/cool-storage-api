@@ -159,8 +159,17 @@ func TestSyncAuthLegitimateTokenIsBoundToItsRepository(t *testing.T) {
 	}
 }
 
-// Isolates the source check, and covers the one link-token shape the other two
-// conditions cannot refuse.
+// Covers the one link-token shape neither the path rule nor the repository
+// binding can refuse.
+//
+// This test isolated the *source* clause when the fix landed. It no longer
+// does: TokenTypeSync now refuses this bearer at the store, before the
+// predicate runs, so removing the source clause leaves this green. The source
+// clause is still load-bearing and is now pinned at unit level instead — see
+// TestIsRepositorySyncToken/unknown_future_source_with_the_right_shape and
+// TestGetLockedFiles_RejectsNarrowerDownloadTokens, both of which carry the
+// correct type. This case stays because it is the real-world exploit shape, and
+// a live end-to-end refusal is worth keeping whichever clause does the work.
 //
 // A file share link mints a bearer carrying that file's path, so the Path=="/"
 // rule alone would catch it. A link that shares the *library root* is different:
@@ -189,7 +198,7 @@ func TestSyncAuthRejectsRootDirectoryShareLinkToken(t *testing.T) {
 	status := replaySyncToken(t, client, http.MethodGet, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD", repoID), zipToken)
 	if status != http.StatusUnauthorized && status != http.StatusForbidden {
 		t.Fatalf("commit/HEAD with a root-directory share-link bearer = %d; want 401 or 403. "+
-			"This token has Path==\"/\" and the right RepoID, so only the source check can refuse it.", status)
+			"This token has Path==\"/\" and the right RepoID, so before TokenTypeSync existed only the source check refused it; now the type does.", status)
 	}
 }
 

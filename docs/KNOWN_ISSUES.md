@@ -905,6 +905,13 @@ server — each removal fails exactly one test and no other:
 | `Path == "/"` | `TestSyncAuthRejectsFileScopedDownloadToken` |
 | `RepoID` binding | `TestSyncAuthLegitimateTokenIsBoundToItsRepository` |
 
+> **Superseded by the `TokenTypeSync` follow-up below.** The `Source` row no
+> longer holds: that bearer is a download token, so the type check refuses it at
+> the store before the predicate runs, and removing the source clause now leaves
+> the whole integration suite green. Re-measured 2026-08-07. The source clause is
+> still load-bearing and still mutation-verified, but at unit level — see the
+> follow-up section.
+
 The source clause is not redundant with the path clause, which is why the
 root-directory case is pinned separately. A share link on the **library root**
 mints a zip bearer with `Path == "/"` and the shared library's own `RepoID`, so
@@ -963,6 +970,23 @@ carrying the *perfect* sync shape — rooted path, empty source, right repositor
 — which only the type refuses. Both are unit-level by necessity: after this
 change no API can mint a root-path download token at all, which is the point.
 Mutation-verified — removing the type clause fails exactly those two cases.
+
+Adding the type moved where the other clauses are pinned, and the mutation
+evidence was re-measured rather than assumed to carry over:
+
+| Clause removed | Before the type split | After |
+|---|---|---|
+| `Source == ""` | `TestSyncAuthRejectsRootDirectoryShareLinkToken` (integration) | `TestIsRepositorySyncToken/unknown_future_source_with_the_right_shape` and `TestGetLockedFiles_RejectsNarrowerDownloadTokens` (unit) — **the full integration suite now passes without it** |
+| `Path == "/"` | `TestSyncAuthRejectsFileScopedDownloadToken` | unchanged |
+| `RepoID` binding | `TestSyncAuthLegitimateTokenIsBoundToItsRepository` | unchanged |
+
+The `Source` row moved because the root-directory share-link bearer is a
+download token: the type check refuses it at the store before the predicate
+runs. The clause still matters — a *sync* token with an unknown source is
+exactly what it refuses — but only the unit cases, which carry the correct
+type, can reach it. The integration test stays anyway: it is the real-world
+exploit shape, and a live end-to-end refusal is worth keeping whichever clause
+does the work.
 
 `TestSyncAndDownloadTokensDoNotCrossSurfaces` pins the separation in both
 directions: a sync token cannot fetch bytes from `/seafhttp/files/`, and an

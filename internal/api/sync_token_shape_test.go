@@ -39,7 +39,7 @@ func TestIsRepositorySyncToken(t *testing.T) {
 			token:       &AccessToken{Type: TokenTypeDownload, Source: "link", Path: "/", RepoID: repo},
 			routeRepoID: repo,
 			want:        false,
-			why:         "only the source clause can refuse this one: the path and the repository both match",
+			why:         "path and repository both match, so the type is what refuses it; before TokenTypeSync existed this case belonged to the source clause",
 		},
 		{
 			name:        "authenticated file-scoped download token",
