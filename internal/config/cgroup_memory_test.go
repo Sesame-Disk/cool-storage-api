@@ -1,6 +1,27 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
+
+// TestMain pins the detected container limit for the whole package.
+//
+// Auto capacity derives from the host, so any test that reaches Validate()
+// with the section enabled is otherwise a function of the runner's own
+// cgroup: green on a laptop, and on a sufficiently small agent failing
+// outright because the budget cannot fit one raw slot plus one stream slot.
+// Pinning here rather than per test means a test added later cannot
+// reintroduce the dependency by forgetting to opt out; the real detection is
+// covered by TestParseCgroupMemoryLimit and by the integration probe against
+// a container that actually has a limit.
+func TestMain(m *testing.M) {
+	previous := cgroupMemoryLimit
+	cgroupMemoryLimit = func() (int64, bool) { return 0, false }
+	code := m.Run()
+	cgroupMemoryLimit = previous
+	os.Exit(code)
+}
 
 // withCgroupMemoryLimit pins the detected limit for one test. Anything that
 // exercises auto capacity is otherwise a function of the runner's own cgroup.
@@ -86,5 +107,51 @@ func TestValidateDownloadAdmissionCgroupBudget(t *testing.T) {
 	d.MemoryBudgetBytes = 1 * 1024 * 1024 * 1024
 	if err := validateDownloadAdmissionCgroupBudgetForLimit(d, 4*1024*1024*1024); err != nil {
 		t.Fatalf("1 GiB budget under 4 GiB limit: %v", err)
+	}
+}
+
+// TestBudgetSourceIsAlwaysAttributed pins the contract the provenance metric
+// rests on: exactly one source is in effect, in every mode. Manual returned
+// before recording anything, so a perfectly valid explicit budget published all
+// three sources as zero and an operator reading the metric could not tell why.
+func TestBudgetSourceIsAlwaysAttributed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		limit   int64
+		haveCap bool
+		modify  func(*Config)
+		want    string
+	}{
+		{name: "auto from cgroup", limit: 8 << 30, haveCap: true, want: "cgroup"},
+		{name: "auto without a limit", want: "fallback"},
+		{
+			name:   "auto with an explicit budget",
+			modify: func(cfg *Config) { cfg.DownloadAdmission.MemoryBudgetBytes = 2 << 30 },
+			want:   "configured",
+		},
+		{
+			name: "manual",
+			modify: func(cfg *Config) {
+				cfg.DownloadAdmission.CapacityMode = "manual"
+				cfg.DownloadAdmission.MemoryBudgetBytes = 2 << 30
+			},
+			want: "configured",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withCgroupMemoryLimit(t, tc.limit, tc.haveCap)
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			if tc.modify != nil {
+				tc.modify(cfg)
+			}
+
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v", err)
+			}
+			if got := cfg.DownloadBudgetSource(); got != tc.want {
+				t.Fatalf("budget source = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

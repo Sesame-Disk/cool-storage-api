@@ -194,7 +194,7 @@ services:
 
   # Exercises the auto-capacity cgroup path, which nothing else does: the other
   # nodes run without a memory limit, so their container reports "max" and the
-  # derivation always takes the conservative fallback. This one declares a known
+  # derivation always takes the reference fallback. This one declares a known
   # limit, so a drill can prove the limit was read rather than assumed --
   # 25% of 4 GiB is a 1 GiB budget, which derives a smaller ceiling than the
   # fallback's. Deliberately not part of the default stack: pinning a container
@@ -228,6 +228,14 @@ services:
       - SEAFHTTP_SYNC_BLOCK_MAX_BYTES=16777216
       - FILEVIEW_MAX_IWORK_SOURCE_BYTES=33554432
       - FILEVIEW_MAX_IWORK_PREVIEW_BYTES=52428800
+      # Also pinned because env_file could otherwise stop this node from
+      # starting or from being observable: a non-zero write timeout is
+      # incompatible with download admission, a preview limit under the iWork
+      # source cap fails validation, and without metrics there is nothing to
+      # assert against.
+      - SERVER_WRITE_TIMEOUT=0s
+      - FILEVIEW_MAX_PREVIEW_BYTES=1073741824
+      - METRICS_ENABLED=true
     mem_limit: 4g
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]

@@ -65,14 +65,15 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 	// it does not grow with the node. A host that derives more than this cannot
 	// be saturated by this fixture; the drill then verifies the plateau it can
 	// reach and says so, instead of quietly proving a smaller ceiling.
-	fillable := len(clients) * perIdentity
-	target := nodeCap
-	ceilingReachable := true
-	if fillable < nodeCap {
-		target = fillable
-		ceilingReachable = false
-		t.Logf("node derived a ceiling of %d but %d identities cap out at %d admissions; "+
-			"verifying the reachable plateau and the invariants, not the exact ceiling",
+	// This fixture holds slots as a fixed set of authenticated identities, and
+	// the per-identity cap is policy-limited — it does not grow with the node.
+	// A host deriving more than these identities can hold cannot be saturated
+	// here, and a test named for holding the ceiling must not pass without
+	// having held it. The plateau, the invariants and the refusal contract are
+	// covered at any size by the two tests below.
+	if fillable := len(clients) * perIdentity; fillable < nodeCap {
+		t.Skipf("node derived a ceiling of %d but %d identities cap out at %d admissions; "+
+			"filling the aggregate ceiling needs more identities than this fixture creates",
 			nodeCap, len(clients), fillable)
 	}
 
@@ -85,8 +86,10 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 
 	// A seafhttp download token resolves to the `file` profile; the raw route is
 	// `raw`. Both are needed to show one shared ceiling rather than two budgets.
-	// The shipped raw profile cap is six, so fill the remaining node capacity with
-	// file-profile streams instead of accidentally proving only a seven-slot cap.
+	// The raw profile cap is a small fraction of the node ceiling — four at the
+	// shipped baseline, since raw slots are sized for the buffered iWork cost — so
+	// the rest of the node is filled with file-profile streams instead of
+	// accidentally proving only a raw-sized cap.
 	fileStreamURLs := make([]string, len(clients))
 	for i, probeClient := range clients {
 		tokenResp := probeClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoIDs[i], fileName))
@@ -115,6 +118,7 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 
 	// The raw profile cap is also derived, so take it from the node too: filling
 	// past it would be refused by profile_full and never reach the ceiling.
+	target := nodeCap
 	rawSlots := effectiveCapacity(t, client, "max_active_raw")
 	if rawSlots >= target {
 		rawSlots = target - 1
@@ -123,12 +127,19 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 		rawSlots = 1
 	}
 	for i := 0; i < target; i++ {
-		probeClient := clients[i%len(clients)]
+		// Client, repository and token all come from the same index. A `file`
+		// admission is attributed to the *token's* owner, not to the request's
+		// Authorization header, so picking the token with a different index than
+		// the client silently charges one identity for another's slot: at a raw
+		// cap that is not a multiple of the identity count the split lands 7/6/5
+		// against a per-identity cap of 6, and the fill can never complete.
+		identity := i % len(clients)
+		probeClient := clients[identity]
 		var url string
 		if i < rawSlots {
-			url = rawURLs[i%len(rawURLs)]
+			url = rawURLs[identity]
 		} else {
-			url = fileStreamURLs[(i-rawSlots)%len(fileStreamURLs)]
+			url = fileStreamURLs[identity]
 		}
 		wg.Add(1)
 		go func(probeClient *testClient, url string) {
@@ -142,11 +153,7 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 	if active != target {
 		t.Fatalf("active downloads = %d, want %d", active, target)
 	}
-	if ceilingReachable {
-		t.Logf("observed the node ceiling of %d concurrent admitted downloads across two profiles", active)
-	} else {
-		t.Logf("observed %d concurrent admitted downloads across two profiles (reachable plateau, node ceiling is %d)", active, nodeCap)
-	}
+	t.Logf("observed the node ceiling of %d concurrent admitted downloads across two profiles", active)
 
 	// Criterion 14: the two identities the contract freezes, sampled while the
 	// node is genuinely busy rather than idle.
@@ -165,15 +172,6 @@ func TestDownloadAdmissionSaturationHoldsOneNodeCeiling(t *testing.T) {
 	// The shipped admission_wait is non-zero, so a full-node request may be
 	// observed as node_full (immediate) or admission_timeout (bounded queue).
 	//
-	// The contract is the same whichever gate closes, so it stays covered even
-	// when the fixture cannot reach the node ceiling: every identity is at its
-	// own cap, so one more request from one of them is refused. Skipping here
-	// instead would have left a 32- or 64-slot node with no 503 + Retry-After
-	// evidence at all.
-	if !ceilingReachable {
-		assertSaturatedIdentityIsRefused(t, clients[0], rawURLs[0])
-		return
-	}
 	beforeNodeFull := scrapeDownloadMetric(t, client, "download_admission_rejected_total", `reason="node_full"`)
 	beforeAdmissionTimeout := scrapeDownloadMetric(t, client, "download_admission_rejected_total", `reason="admission_timeout"`)
 	status, retryAfter := probeAnonymousDownload(t, client, linkRawURL)
@@ -227,8 +225,13 @@ func assertSaturatedIdentityIsRefused(t *testing.T, c *testClient, target string
 	afterQueue := scrapeDownloadMetric(t, c, "download_admission_rejected_total", `reason="auth_user_queue_full"`)
 	afterTimeout := scrapeDownloadMetric(t, c, "download_admission_rejected_total", `reason="admission_timeout"`)
 	if after <= before && afterQueue <= beforeQueue && afterTimeout <= beforeTimeout {
-		t.Fatalf("refusal was not attributed to the saturated identity: full %.0f->%.0f queue %.0f->%.0f timeout %.0f->%.0f",
-			before, after, beforeQueue, afterQueue, beforeTimeout, afterTimeout)
+		// Naming profile_full explicitly: if the caller saturated a profile
+		// whose cap sits below the identity cap, the 503 is real but says
+		// something else, and the fixture — not the guard — is what needs fixing.
+		profileFull := scrapeDownloadMetric(t, c, "download_admission_rejected_total", `reason="profile_full"`)
+		t.Fatalf("refusal was not attributed to the saturated identity: full %.0f->%.0f queue %.0f->%.0f timeout %.0f->%.0f (profile_full now %.0f; "+
+			"holding a profile whose cap is below the identity cap would close that gate first)",
+			before, after, beforeQueue, afterQueue, beforeTimeout, afterTimeout, profileFull)
 	}
 	t.Logf("saturated identity refused with 503 and Retry-After %ss", retryAfter)
 }
@@ -592,4 +595,137 @@ func waitForLiveDownloadProfiles(t *testing.T, c *testClient, want int, timeout 
 	}
 	t.Fatalf("only %d profile(s) ever became live (active=%d); the drill did not exercise a shared ceiling across routes", lastLive, lastActive)
 	return lastActive
+}
+
+// TestDownloadAdmissionMixedProfilesMaintainInvariants is the half of the
+// saturation evidence that survives a node this fixture cannot fill. It loads
+// the node to whatever these identities can reach and checks the two identities
+// §12 freezes plus two live profiles — claims that hold at a plateau as well as
+// at a ceiling, which is why they are asserted here rather than folded into a
+// test named for the ceiling.
+func TestDownloadAdmissionMixedProfilesMaintainInvariants(t *testing.T) {
+	client := requireDownloadProbe(t)
+	clients := []*testClient{
+		client,
+		newTestClient(client.baseURL, "dev-token-user"),
+		newTestClient(client.baseURL, "dev-token-superadmin"),
+	}
+	for _, probeClient := range clients {
+		probeClient.http.Timeout = 2 * time.Minute
+		if err := verifyIntegrationAuth(probeClient.baseURL, probeClient.token); err != nil {
+			t.Fatalf("download probe auth for %q: %v", probeClient.token, err)
+		}
+	}
+
+	nodeCap := effectiveCapacity(t, client, "max_active_per_node")
+	perIdentity := effectiveCapacity(t, client, "max_active_per_auth_user")
+	rawCap := effectiveCapacity(t, client, "max_active_raw")
+	if nodeCap <= 0 || perIdentity <= 0 || rawCap <= 0 {
+		t.Fatalf("node reported capacity node=%d identity=%d raw=%d", nodeCap, perIdentity, rawCap)
+	}
+	target := len(clients) * perIdentity
+	if nodeCap < target {
+		target = nodeCap
+	}
+
+	fileName := "d6-invariants.bin"
+	repoIDs := make([]string, len(clients))
+	rawURLs := make([]string, len(clients))
+	fileStreamURLs := make([]string, len(clients))
+	for i, probeClient := range clients {
+		repoIDs[i] = createDisposableTestLibrary(t, probeClient, fmt.Sprintf("inttest-d6-invariants-%d", i))
+		uploadProbeFile(t, probeClient, repoIDs[i], fileName, 24<<20)
+		rawURLs[i] = client.baseURL + fmt.Sprintf("/repo/%s/raw/%s", repoIDs[i], fileName)
+		tokenResp := probeClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoIDs[i], fileName))
+		expectStatus(t, tokenResp, http.StatusOK)
+		fileStreamURLs[i] = strings.Trim(responseBody(t, tokenResp), "\" \n\r")
+	}
+
+	if active := scrapeDownloadGaugeInt(t, client, "download_admission_active_current", true); active != 0 {
+		t.Fatalf("node already has %d active admissions; the probe needs an idle node", active)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var stopOnce sync.Once
+	t.Cleanup(func() {
+		stopOnce.Do(func() { close(stop) })
+		wg.Wait()
+		waitForDownloadActive(t, client, 0, 30*time.Second)
+	})
+
+	rawSlots := rawCap
+	if rawSlots >= target {
+		rawSlots = target - 1
+	}
+	if rawSlots < 1 {
+		rawSlots = 1
+	}
+	for i := 0; i < target; i++ {
+		identity := i % len(clients)
+		url := fileStreamURLs[identity]
+		if i < rawSlots {
+			url = rawURLs[identity]
+		}
+		wg.Add(1)
+		go func(probeClient *testClient, url string) {
+			defer wg.Done()
+			holdDownloadSlot(probeClient, url, stop)
+		}(clients[identity], url)
+	}
+
+	waitForDownloadActive(t, client, target, 30*time.Second)
+	if live := waitForLiveDownloadProfiles(t, client, 2, 30*time.Second); live != target {
+		t.Fatalf("active downloads = %d, want %d", live, target)
+	}
+	assertDownloadAdmissionInvariants(t, client)
+	t.Logf("invariants hold at %d of the node's %d slots across two profiles", target, nodeCap)
+}
+
+// TestDownloadAdmissionSaturatedIdentityReturnsRetryAfter covers the refusal
+// contract at any node size. The identity gate is the only one a fixed set of
+// identities can always close, and the contract — 503 with a usable
+// Retry-After — is the same whichever gate closes it. The holders use the
+// `file` profile deliberately: its cap is comfortably above the per-identity
+// cap, so the refusal is attributable to the identity rather than to a profile
+// that filled first.
+func TestDownloadAdmissionSaturatedIdentityReturnsRetryAfter(t *testing.T) {
+	client := requireDownloadProbe(t)
+	client.http.Timeout = 2 * time.Minute
+
+	perIdentity := effectiveCapacity(t, client, "max_active_per_auth_user")
+	fileCap := effectiveCapacity(t, client, "max_active_file")
+	if perIdentity <= 0 || fileCap <= perIdentity {
+		t.Skipf("per-identity cap %d and file cap %d leave no room to close the identity gate first", perIdentity, fileCap)
+	}
+
+	fileName := "d6-identity.bin"
+	repoID := createDisposableTestLibrary(t, client, "inttest-d6-identity")
+	uploadProbeFile(t, client, repoID, fileName, 24<<20)
+	tokenResp := client.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+	expectStatus(t, tokenResp, http.StatusOK)
+	fileStreamURL := strings.Trim(responseBody(t, tokenResp), "\" \n\r")
+
+	if active := scrapeDownloadGaugeInt(t, client, "download_admission_active_current", true); active != 0 {
+		t.Fatalf("node already has %d active admissions; the probe needs an idle node", active)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var stopOnce sync.Once
+	t.Cleanup(func() {
+		stopOnce.Do(func() { close(stop) })
+		wg.Wait()
+		waitForDownloadActive(t, client, 0, 30*time.Second)
+	})
+	for i := 0; i < perIdentity; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			holdDownloadSlot(client, fileStreamURL, stop)
+		}()
+	}
+	waitForDownloadActive(t, client, perIdentity, 30*time.Second)
+
+	assertSaturatedIdentityIsRefused(t, client, fileStreamURL)
 }

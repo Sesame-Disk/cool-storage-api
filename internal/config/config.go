@@ -2156,7 +2156,13 @@ func (c *Config) applyEnvOverrides() {
 		}
 	}
 	if v := os.Getenv("FILEVIEW_MAX_IWORK_SOURCE_BYTES"); v != "" {
-		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+		// Reported rather than dropped. This knob is part of the D6 memory
+		// design now, so a malformed value silently leaving the default in place
+		// means the deployment is sized against something the operator did not
+		// ask for.
+		if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {
+			c.addEnvOverrideError("FILEVIEW_MAX_IWORK_SOURCE_BYTES is invalid: %v", err)
+		} else {
 			c.FileView.MaxIWorkSourceBytes = i
 		}
 	}
@@ -2342,7 +2348,12 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 	}
 
 	if mode == "manual" {
+		// Manual carries its own number, so record that before returning:
+		// leaving the provenance unset published every source as zero and broke
+		// the contract that exactly one is in effect.
 		d.CapacityMode = mode
+		c.downloadBudgetSource = "configured explicitly"
+		c.downloadBudgetSourceKind = "configured"
 		c.DownloadAdmission = d
 		return nil
 	}

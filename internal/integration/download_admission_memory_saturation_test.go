@@ -49,9 +49,17 @@ func TestDownloadAdmissionMemoryUnderSaturation(t *testing.T) {
 	if nodeCap <= 0 || perIdentity <= 0 {
 		t.Fatalf("node reported capacity node=%d per-identity=%d", nodeCap, perIdentity)
 	}
+	// A partial fill still says something: the assertion is "the real process
+	// stays under its design budget", and that has to hold at any load. It just
+	// says less — a plateau under budget does not prove a full node would be —
+	// so the shortfall is stated rather than turned into a skip that leaves a
+	// larger node with no memory evidence at all.
+	target := nodeCap
 	if fillable := len(clients) * perIdentity; fillable < nodeCap {
-		t.Skipf("this fixture can hold %d admissions but the node derived a ceiling of %d; "+
-			"the probe measures a full node or nothing", fillable, nodeCap)
+		target = fillable
+		t.Logf("this fixture can hold %d admissions against a derived ceiling of %d; "+
+			"measuring the reachable plateau, which bounds the budget from below rather than proving the full node",
+			fillable, nodeCap)
 	}
 	runID := fmt.Sprintf("%d", time.Now().UTC().UnixNano())
 	repoIDs := make([]string, len(clients))
@@ -80,20 +88,23 @@ func TestDownloadAdmissionMemoryUnderSaturation(t *testing.T) {
 	sampler := startMemoryProbeSampler(client, 0)
 	t.Cleanup(func() { _, _ = sampler.stop() })
 	rawSlots := effectiveCapacity(t, client, "max_active_raw")
-	for i := 0; i < nodeCap; i++ {
-		probeClient := clients[i%len(clients)]
-		target := fileURLs[i%len(fileURLs)]
+	for i := 0; i < target; i++ {
+		// Client, repository and token share one index: a `file` admission is
+		// attributed to the token's owner, not to the request's Authorization
+		// header, so mismatched indices charge one identity for another's slot.
+		identity := i % len(clients)
+		url := fileURLs[identity]
 		if i < rawSlots {
-			target = rawURLs[i%len(rawURLs)]
+			url = rawURLs[identity]
 		}
 		wg.Add(1)
-		go func(probeClient *testClient, target string) {
+		go func(probeClient *testClient, url string) {
 			defer wg.Done()
-			holdDownloadSlot(probeClient, target, stop)
-		}(probeClient, target)
+			holdDownloadSlot(probeClient, url, stop)
+		}(clients[identity], url)
 	}
 
-	waitForDownloadActive(t, client, nodeCap, 30*time.Second)
+	waitForDownloadActive(t, client, target, 30*time.Second)
 	time.Sleep(2 * memoryProbeSamplePeriod)
 	samples, sampleErrors := sampler.stop()
 	if len(sampleErrors) > 0 {
@@ -129,7 +140,7 @@ func TestDownloadAdmissionMemoryUnderSaturation(t *testing.T) {
 	if limit <= 0 {
 		t.Fatalf("node reported an effective memory budget of %d", limit)
 	}
-	t.Logf("download memory probe: active=%d rss_delta=%d heap_delta=%d cgroup_delta=%d cgroup_available=%t safety_adjusted_budget=%d", nodeCap, peakRSS, peakHeap, peakCgroup, samples[len(samples)-1].cgroupAvailable, limit)
+	t.Logf("download memory probe: active=%d of node cap %d rss_delta=%d heap_delta=%d cgroup_delta=%d cgroup_available=%t safety_adjusted_budget=%d", target, nodeCap, peakRSS, peakHeap, peakCgroup, samples[len(samples)-1].cgroupAvailable, limit)
 	if peakRSS > limit || peakHeap > limit || (peakCgroup > 0 && peakCgroup > limit) {
 		t.Fatalf("real download memory peak exceeded safety-adjusted budget %d: rss=%d heap=%d cgroup=%d", limit, peakRSS, peakHeap, peakCgroup)
 	}

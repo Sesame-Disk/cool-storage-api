@@ -95,9 +95,10 @@ download_admission:
   memory_budget_percent: 25
   raw_capacity_percent: 33
   safety_margin_percent: 20
-  # Optional explicit budget when cgroup discovery is unavailable or a deployment
-  # deliberately overrides the detected percentage.
-  memory_budget_bytes: 2147483648
+  # Optional, and commented out on purpose: setting it turns the derivation off.
+  # Uncomment only where cgroup discovery is unavailable or the detected
+  # percentage is deliberately overridden.
+  # memory_budget_bytes: 2147483648
 ```
 
 `memory_budget_bytes` is a process-local configured design budget, not an OS

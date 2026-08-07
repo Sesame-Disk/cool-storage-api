@@ -35,9 +35,12 @@ func parseCgroupMemoryLimit(value string) (int64, bool) {
 //
 // It does not walk /proc/self/cgroup to find a limit imposed by an ancestor, so
 // a systemd unit in a nested slice, or a v1 host without a namespace, reads as
-// unlimited and falls back to the conservative default rather than to a wrong
-// number. That is the safe direction to be incomplete in, but it does mean this
-// is container-limit detection and not a general effective-limit resolver.
+// unlimited and falls back to the reference default rather than to a wrong
+// number. That is not automatically the safe direction: on a host smaller than
+// the 8 GiB baseline the fallback budget is larger than the machine warrants,
+// which is why a deployment that cannot expose a limit should set the budget
+// explicitly. This is container-limit detection, not a general effective-limit
+// resolver.
 func cgroupMemoryLimitBytes() (int64, bool) {
 	for _, path := range cgroupMemoryLimitPaths {
 		body, err := os.ReadFile(path)

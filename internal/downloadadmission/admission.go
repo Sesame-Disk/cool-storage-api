@@ -734,7 +734,11 @@ func publishCapacityMetrics(cfg config.DownloadAdmissionConfig) {
 	if margin < 0 || margin >= 100 {
 		margin = 0
 	}
-	metrics.DownloadAdmissionMemoryBudgetEffectiveBytes.Set(float64(cfg.MemoryBudgetBytes / 100 * int64(100-margin)))
+	// Same order as the validator: multiply first. Dividing first published a
+	// figure 38 bytes below the budget the node was actually sized against, and
+	// this metric claims to be that budget, not an approximation of it. The
+	// 1 TiB ceiling keeps the product well inside int64.
+	metrics.DownloadAdmissionMemoryBudgetEffectiveBytes.Set(float64(cfg.MemoryBudgetBytes * int64(100-margin) / 100))
 }
 
 // publishedCapacitySettings is the single description of which capacities are

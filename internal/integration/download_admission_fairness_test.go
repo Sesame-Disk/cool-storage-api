@@ -89,8 +89,9 @@ func TestDownloadAdmissionFairnessIsolatesLinkAndOwner(t *testing.T) {
 	t.Run("a saturated owner does not take the public link down", func(t *testing.T) {
 		stop := make(chan struct{})
 		var wg sync.WaitGroup
-		// The file profile cap is 16 while max_active_per_auth_user is 6, so this
-		// fills the owner's identity budget rather than an ambiguous profile cap.
+		// The file profile cap sits above max_active_per_auth_user — 12 against 6
+		// at the auto baseline — so this fills the owner's identity budget rather
+		// than an ambiguous profile cap.
 		for i := 0; i < 8; i++ {
 			wg.Add(1)
 			go func() {
