@@ -157,6 +157,75 @@ func TestBudgetSourceIsAlwaysAttributed(t *testing.T) {
 	}
 }
 
+// TestValidateReadsTheContainerLimitOnce pins the snapshot. The derivation, the
+// floor advice and the cgroup budget guard all need the container limit, and the
+// value can be rewritten while a process starts — so a pass that sampled it per
+// consumer could derive capacities for one container size and then admit or
+// refuse them against another. Neither answer is wrong alone; the pair is what
+// has no meaning.
+func TestValidateReadsTheContainerLimitOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"auto derives the budget", func(*Config) {}},
+		{"auto with an explicit budget", func(c *Config) {
+			c.DownloadAdmission.MemoryBudgetBytes = 1 << 30
+		}},
+		// Manual keeps the shipped caps rather than deriving smaller ones, so its
+		// budget has to be the one those caps were measured against.
+		{"manual", func(c *Config) {
+			c.DownloadAdmission.CapacityMode = "manual"
+			c.DownloadAdmission.MemoryBudgetBytes = DefaultDownloadAdmissionMemoryBudgetBytes
+		}},
+		{"disabled", func(c *Config) { c.DownloadAdmission.Enabled = false }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reads := 0
+			previous := cgroupMemoryLimit
+			cgroupMemoryLimit = func() (int64, bool) {
+				reads++
+				return 8 << 30, true
+			}
+			t.Cleanup(func() { cgroupMemoryLimit = previous })
+
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			tc.mutate(cfg)
+
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v", err)
+			}
+			if reads != 1 {
+				t.Fatalf("read the container limit %d times; one validation must observe one machine", reads)
+			}
+		})
+	}
+}
+
+// TestCgroupBudgetGuardStillAppliesInManualMode guards the way that snapshot can
+// silently switch the guard off. The limit has to be read above the manual and
+// disabled early returns, not beside the auto derivation that consumes it:
+// moving it down would hand this path a zero, and a zero reads as "no container
+// limit", which is how the guard declines. Manual mode is exactly where an
+// operator writes their own budget, so it is the path that most needs charging
+// against the container.
+func TestCgroupBudgetGuardStillAppliesInManualMode(t *testing.T) {
+	withCgroupMemoryLimit(t, 4<<30, true) // the default 25% share is 1 GiB
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.DownloadAdmission.CapacityMode = "manual"
+	cfg.DownloadAdmission.MemoryBudgetBytes = 2 << 30 // half the container
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("a manual budget at 50% of the container validated against a 25% share")
+	}
+	if !strings.Contains(err.Error(), "of the detected cgroup memory limit") {
+		t.Fatalf("refused for some other reason, so this does not prove the guard ran: %v", err)
+	}
+}
+
 // TestBudgetSourceSurvivesRevalidation covers the metric's whole reason for
 // existing. Auto mode materialises the derived budget into the config, so a
 // second Validate() sees a positive number and would call it "configured" —
@@ -422,8 +491,15 @@ func TestFloorAdviceWithholdsAnExhaustedShareForAnExplicitBudget(t *testing.T) {
 		t.Errorf("advice does not say the share is exhausted: %v", err)
 	}
 
-	// The same branch on a container that can hold a larger budget must keep
-	// offering it, or the gate has simply silenced the advice everywhere.
+	// The same branch on a container with headroom must keep offering the budget
+	// lever, or the gate has simply silenced the advice everywhere.
+	//
+	// A 512 MiB iWork source makes a raw slot 3072 MiB, so the floor is beyond
+	// the default 25% of this container and reachable only within the 50%
+	// ceiling. That is precisely the case the message describes: raise the
+	// budget, "and raise that share too if one is in force". So the assertion is
+	// not that the budget alone is sufficient — it is not — but that the advice
+	// it gives is followable, which the second half proves by following it.
 	withCgroupMemoryLimit(t, 8<<30, true)
 	roomy := DefaultConfig()
 	roomy.Auth.DevMode = true
@@ -434,6 +510,22 @@ func TestFloorAdviceWithholdsAnExhaustedShareForAnExplicitBudget(t *testing.T) {
 		t.Fatal("a 100 MiB budget against a 512 MiB iWork source validated")
 	}
 	if !strings.Contains(err.Error(), "Raise download_admission.memory_budget_bytes") {
-		t.Errorf("advice withholds the lever that does clear this floor: %v", err)
+		t.Errorf("advice withholds a budget lever this container can still satisfy: %v", err)
+	}
+	if strings.Contains(err.Error(), "cannot reach the floor") {
+		t.Errorf("advice calls the share exhausted on a container that can clear the floor: %v", err)
+	}
+
+	withCgroupMemoryLimit(t, 8<<30, true)
+	followed := DefaultConfig()
+	followed.Auth.DevMode = true
+	followed.FileView.MaxIWorkSourceBytes = 512 * 1024 * 1024
+	followed.DownloadAdmission.MemoryBudgetPercent = MaxDownloadAdmissionMemoryBudgetPercent
+	followed.DownloadAdmission.MemoryBudgetBytes = 4000 * 1024 * 1024
+	if err := followed.Validate(); err != nil {
+		t.Fatalf("following the advice — raise the budget and the share together — still refuses: %v", err)
+	}
+	if followed.DownloadAdmission.MaxActivePerNode < 2 {
+		t.Fatalf("derived %d slots", followed.DownloadAdmission.MaxActivePerNode)
 	}
 }

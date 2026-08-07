@@ -6733,13 +6733,31 @@ path: `<img onError>` reports *that* the load failed, never the HTTP status, so
 there is no way to tell a `413` from a missing QuickLook preview from inside the
 current fallback. The preview has to be fetched explicitly.
 
-Request the preview URL once with `fetch`, then branch on `res.status`: on `200`
-hand the blob to the `<img>`/`<iframe>` through `URL.createObjectURL`, and on
-`413` render a translated message naming the limit and pointing at download —
-something like "this document is too large to preview (max 32 MiB); download it
-to open it". The backend already returns the limit in the JSON body, so no API
-change is needed. Fetching once also removes the duplicate request, since the
-image→PDF fallback stops being how a failure is discovered.
+Request the preview URL once with `fetch`, then branch on `res.status`: on `413`
+render a translated message naming the limit and pointing at download — something
+like "this document is too large to preview (max 32 MiB); download it to open
+it". The backend already returns the limit in the JSON body, so no API change is
+needed.
+
+**The image→PDF fallback must survive the change.** A `200` does not by itself
+say whether the payload is a QuickLook JPEG or a QuickLook PDF, which is the
+distinction that fallback exists to make, so removing it would break older iWork
+documents. Keep it and feed it the response already in hand:
+
+```text
+fetch(previewURL) once
+  ├─ 413 → translated "too large to preview" message
+  └─ 200 → url = URL.createObjectURL(blob)
+             ├─ <img src={url}>
+             └─ onError → <iframe src={url}>   // same object URL, no refetch
+```
+
+Branching on the response's `Content-Type` instead would remove the second
+render entirely, but only if the backend is verified to label both payloads
+correctly on this route — worth checking before relying on it, and the object-URL
+form above is correct either way. Both shapes keep the request count at one,
+which the current code does not: today the fallback is *how* a failure is
+discovered, so every oversized document is fetched twice.
 
 Two adjacent decisions are worth taking at the same time, and both are product
 calls rather than defects:

@@ -54,15 +54,21 @@ func cgroupMemoryLimitBytes() (int64, bool) {
 	return 0, false
 }
 
-func validateDownloadAdmissionCgroupBudget(d DownloadAdmissionConfig) error {
-	if !d.Enabled {
+// validateDownloadAdmissionCgroupBudget charges the budget against the limit
+// resolveDownloadAdmissionCapacity already observed, rather than taking a second
+// reading of its own.
+//
+// Two reads inside one Validate() could disagree — the value can be rewritten
+// while the process starts — and then a node would derive its capacities from
+// one container size and be admitted or refused against another. Neither answer
+// would be wrong on its own; the pair is what has no meaning. That snapshot is
+// taken above every early return in the resolver precisely so this guard, which
+// applies in manual mode too, always has it.
+func (c *Config) validateDownloadAdmissionCgroupBudget() error {
+	if c == nil || !c.DownloadAdmission.Enabled || c.downloadCgroupLimit <= 0 {
 		return nil
 	}
-	limit, ok := cgroupMemoryLimit()
-	if !ok {
-		return nil
-	}
-	return validateDownloadAdmissionCgroupBudgetForLimit(d, limit)
+	return validateDownloadAdmissionCgroupBudgetForLimit(c.DownloadAdmission, c.downloadCgroupLimit)
 }
 
 // validateDownloadAdmissionCgroupBudgetForLimit keeps an explicit byte budget

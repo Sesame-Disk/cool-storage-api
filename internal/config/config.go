@@ -43,6 +43,11 @@ type Config struct {
 	// it from the resulting numbers: an explicit budget of the same size is
 	// indistinguishable. This is what makes that claim checkable.
 	downloadBudgetSourceKind string
+	// downloadCgroupLimit is the container memory limit this validation pass
+	// observed, or 0 when none is exposed. The derivation, the floor advice and
+	// the cgroup budget guard all read it, and a value that describes one machine
+	// must not be sampled once per consumer.
+	downloadCgroupLimit int64
 }
 
 // WebUploadsConfig holds browser upload behavior exposed to the web frontend.
@@ -2347,6 +2352,28 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 		return fmt.Errorf("download_admission.safety_margin_percent must be between 0 and 99")
 	}
 
+	// Read the container limit once per validation, above every early return, and
+	// keep it on the Config. Three things need it and they must not disagree:
+	// the auto derivation, the floor advice, and the cgroup guard that runs after
+	// this function returns.
+	//
+	// The advice used to recover it by inverting the derivation
+	// (budget * 100 / percent). That inversion undoes a truncating division, so
+	// it can under-report the container by up to 100/percent bytes — enough, at
+	// the exact threshold, to tell an operator no share can clear the floor when
+	// the real limit says one can. The guard read it a second time, which left a
+	// validation pass holding two snapshots of a value that is supposed to
+	// describe one machine.
+	//
+	// It has to be above the manual and disabled returns, not next to the
+	// derivation that uses it: the guard still applies in manual mode, and taking
+	// the snapshot only on the auto path would hand it a zero and switch it off.
+	c.downloadCgroupLimit, _ = cgroupMemoryLimit()
+	if c.downloadCgroupLimit < 0 {
+		c.downloadCgroupLimit = 0
+	}
+	detectedLimit := c.downloadCgroupLimit
+
 	if mode == "manual" {
 		// Manual carries its own number, so record that before returning:
 		// leaving the provenance unset published every source as zero and broke
@@ -2376,18 +2403,6 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 		return nil
 	}
 
-	// Read the limit once and keep it. Both the derivation and the floor advice
-	// need it, and the advice used to recover it by inverting the derivation
-	// (budget * 100 / percent). That inversion undoes a truncating division, so
-	// it can under-report the container by up to 100/percent bytes — enough, at
-	// the exact threshold, to tell an operator no share can clear the floor when
-	// the real limit says one can. An explicit budget takes the same read,
-	// because validateDownloadAdmissionCgroupBudget will hold it to a share of
-	// this limit and the advice has to know that.
-	detectedLimit, hasDetectedLimit := cgroupMemoryLimit()
-	if !hasDetectedLimit {
-		detectedLimit = 0
-	}
 	if d.MemoryBudgetBytes > 0 {
 		// Only classify once. A second Validate() sees the budget this pass
 		// materialised and would relabel a derived budget as configured — the
@@ -2398,7 +2413,7 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 			c.downloadBudgetSourceKind = "configured"
 		}
 	} else {
-		if hasDetectedLimit {
+		if detectedLimit > 0 {
 			budget, ok := checkedNonNegativeMultiply(detectedLimit, int64(d.MemoryBudgetPercent))
 			if !ok {
 				return fmt.Errorf("download admission cgroup memory budget overflows")
@@ -2988,7 +3003,7 @@ func (c *Config) Validate() error {
 	if err := c.validateDownloadAdmissionBounds(); err != nil {
 		return err
 	}
-	if err := validateDownloadAdmissionCgroupBudget(c.DownloadAdmission); err != nil {
+	if err := c.validateDownloadAdmissionCgroupBudget(); err != nil {
 		return err
 	}
 	if c.Server.Port == "" {
