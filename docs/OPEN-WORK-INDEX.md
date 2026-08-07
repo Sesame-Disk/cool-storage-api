@@ -57,14 +57,18 @@ of them updated.
 
 ## Production blockers — must close before go-live
 
-**Readiness verdict is still no-go as-is.** NF-1 closed 2026-07-25; **B4 is
-closed, while the sync public-link token auth gap remains an open single-node
-blocker**; multi-instance adds B1 and B5. See
+**No single-node go-live blockers remain under the current production posture,
+which keeps destructive GC disabled.** NF-1 closed 2026-07-25; B4 closed
+2026-08-04; the object-storage posture issue and the sync public-link token auth
+gap both closed 2026-08-07. This is not the same as "nothing is left": X1
+(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) and X2
+(`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) remain open and still block
+*enabling* destructive GC — see the GC section below. Multi-instance adds B1 and
+B5. See
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-SYNC-LINK-TOKEN-AUTH-01` | HIGH | Public share-link download tokens are accepted by `syncAuthMiddleware` as repository credentials, so a bearer issued for a shared file can reach the repo sync surface as the link creator | Pre-existing authorization gap in `internal/api/server.go`; see `KNOWN_ISSUES.md` |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
 
@@ -85,6 +89,15 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
   shipped configuration and its capacities are validated against the measured
   2 GiB process-local budget. Byte-rate shaping remains a separate finding;
   object-storage anonymity was closed separately on 2026-08-07.
+- `ISSUE-SYNC-LINK-TOKEN-AUTH-01` — **Fixed 2026-08-07.** `syncAuthMiddleware`
+  accepted any valid download token as a repository credential. Reproduced live
+  as an unauthorized cross-library block write by an anonymous share-link
+  visitor, plus an escalation through `/download-info` into a full repository
+  sync token, and a total absence of token-to-route repository binding.
+  `isRepositorySyncToken`
+  now validates `Source == ""`, `Path == "/"` and a route-bound `RepoID` before
+  the bearer becomes an identity. All three clauses mutation-verified against
+  the live server; ordinary sync tokens unaffected.
 - `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` — **Closed 2026-08-07. Never
   affected production.** The `mc anonymous set download` lines existed only in
   the four development/test Compose files, not in `docker-compose.prod.yml`,

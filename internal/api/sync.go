@@ -691,15 +691,21 @@ func (h *SyncHandler) GetLockedFiles(c *gin.Context) {
 			continue
 		}
 
-		// Only a repo-level sync token (issued by download-info: root path,
-		// non-link source) may enumerate a repo's locks. TokenTypeDownload is
-		// shared with path-scoped file-download tokens and share-link tokens
-		// (Source=="link"), and neither of those narrower grants should widen
+		// Only a repo-level sync token may enumerate a repo's locks.
+		// TokenTypeDownload is shared with path-scoped file-download tokens and
+		// share-link tokens, and neither of those narrower grants should widen
 		// into repo-wide lock visibility.
+		//
+		// This route has no :repo_id, so the binding is against the repository
+		// named in this body entry rather than a route parameter — but the
+		// accepted shape is the same one the route-level middleware enforces,
+		// so both go through isRepositorySyncToken. Keeping one predicate means
+		// a change to what counts as a sync credential cannot apply to one
+		// surface and miss the other; this check previously spelled its source
+		// clause as "not a link", which would have admitted any future source
+		// value that the middleware's allowlist refuses.
 		accessToken, valid := h.tokenValidator.GetToken(req.Token, TokenTypeDownload)
-		if !valid || accessToken == nil ||
-			!strings.EqualFold(accessToken.RepoID, req.RepoID) ||
-			accessToken.Path != "/" || strings.EqualFold(accessToken.Source, "link") {
+		if !valid || !isRepositorySyncToken(accessToken, req.RepoID) {
 			continue
 		}
 		// Dedupe repeated work for the same authenticated repo/user/org tuple

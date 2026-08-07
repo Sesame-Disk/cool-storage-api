@@ -796,12 +796,19 @@ byte producer reachable under `/seafhttp/repo/:repo_id/*` is authenticated by
 design. That is a **dependency on `syncAuthMiddleware`, not a property D5
 proves**.
 
-`ISSUE-SYNC-LINK-TOKEN-AUTH-01` is open: the middleware accepts any valid
-`TokenTypeDownload` without rejecting `Source == "link"`, without requiring the
-repository-root token shape, and without binding the token's `RepoID` to the
-route's `:repo_id`. While it is open, a public share-link bearer that reaches
-this route is admitted as the link creator's authenticated identity, so criterion
-4's fairness invariant is **not** end-to-end proven for block GET.
+`ISSUE-SYNC-LINK-TOKEN-AUTH-01` was open when this contract was written: the
+middleware accepted any valid `TokenTypeDownload` without rejecting
+`Source == "link"`, without requiring the repository-root token shape, and
+without binding the token's `RepoID` to the route's `:repo_id`. While it was
+open, a public share-link bearer that reached this route was admitted as the
+link creator's authenticated identity, so criterion 4's fairness invariant was
+**not** end-to-end proven for block GET.
+
+It was fixed on 2026-08-07: `isRepositorySyncToken` now requires all three of
+`Source == ""`, `Path == "/"` and a route-bound `RepoID` before the bearer
+becomes an identity, each clause mutation-verified. The dependency is satisfied,
+though it is still a dependency — D5 relies on the middleware rather than
+proving the property itself.
 
 This is not a D5 regression and does not gate D5, because the same middleware
 already supplies the identities that subcontract B (block PUT) and subcontract C

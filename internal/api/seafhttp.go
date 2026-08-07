@@ -67,7 +67,13 @@ type AccessToken struct {
 	Path      string // File path for downloads, parent dir for uploads
 	Replace   bool   // Default overwrite behavior for upload tokens
 	UserID    string
-	Source    string // "" or "web" = regular user; "link" = share/upload link
+	// Source is "" for a regular user token and "link" for a share/upload link.
+	// Those are the only two values ever written. Do not add a third without
+	// checking isRepositorySyncToken: sync authentication allowlists Source ==
+	// "" exactly, so a new value is refused there until it is admitted on
+	// purpose. (An earlier version of this comment listed "web" as an
+	// equivalent regular-user value; nothing has ever minted it.)
+	Source    string
 	SourceID  string // Stable non-secret identity for the originating public link
 	AuthToken string // User's auth token (for one-time login tokens)
 	ExpiresAt time.Time
@@ -1398,7 +1404,7 @@ type uploadLinkWriteLimits struct {
 // surface (subcontract A). A limiter installed as route middleware would have
 // throttled the authenticated path too, which is traffic this bound has no
 // business touching. AccessToken.Source is what separates them: "link" is a
-// share/upload link, "" and "web" are regular users.
+// share/upload link, "" is a regular user.
 //
 // It admits the request whenever the limiter is disabled or the token is not a
 // link token, so the only requests it can ever refuse are anonymous link writes.
@@ -2029,7 +2035,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// Source is what the decision keys on, and before the permission lookup, the
 	// body read and any storage work. It does NOT save the token lookup above:
 	// that read has already happened by the time we can tell a link token from a
-	// web one. It can only refuse Source=="link" tokens; authenticated web
+	// regular one. It can only refuse Source=="link" tokens; authenticated web
 	// uploads on this same route are unaffected.
 	if !h.allowUploadLinkWrite(c, token) {
 		return
