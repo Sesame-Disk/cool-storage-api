@@ -384,29 +384,52 @@ func uploadProbeFile(t *testing.T, c *testClient, repoID, fileName string, size 
 func assertDownloadAdmissionInvariants(t *testing.T, c *testClient) {
 	t.Helper()
 
-	samples := scrapeDownloadAdmissionSeries(t, c)
+	// These are the identities §12 freezes, and this is the evidence criterion 14
+	// rests on, so they are checked exactly.
+	//
+	// A tolerance of ±2 used to stand here for gauge skew. It admitted precisely
+	// the accounting defect the criterion exists to catch: one profile never
+	// counted, or one counted twice, is a difference of one — inside the window,
+	// and reported as "invariants held". Both callers reach a plateau first, with
+	// waitForDownloadActive and waitForLiveDownloadProfiles confirming the exact
+	// target, so nothing is being admitted or released while this runs and there
+	// is no skew left to excuse.
+	//
+	// The retry is for a genuine transition, not for a margin of error: a holder
+	// that dies mid-run is a real event, and a run that never lands on an exact
+	// sample fails with the last one it saw.
+	deadline := time.Now().Add(10 * time.Second)
+	var (
+		samples                          downloadAdmissionSeries
+		active, entries, waiters, profil float64
+		mismatch                         string
+	)
+	for {
+		samples = scrapeDownloadAdmissionSeries(t, c)
+		active = samples.single["download_admission_active_current"]
+		entries = samples.single["download_admission_entries_current"]
+		waiters = samples.single["download_admission_waiters_current"]
+		profil = 0
+		for _, v := range samples.byProfile {
+			profil += v
+		}
 
-	active := samples.single["download_admission_active_current"]
-	entries := samples.single["download_admission_entries_current"]
-	waiters := samples.single["download_admission_waiters_current"]
-
-	var profileSum float64
-	for _, v := range samples.byProfile {
-		profileSum += v
+		switch {
+		case active != profil:
+			mismatch = fmt.Sprintf("active_current=%v but sum(active_by_profile)=%v (%v); a profile is miscounted",
+				active, profil, samples.byProfile)
+		case entries != active+waiters:
+			mismatch = fmt.Sprintf("entries_current=%v but active_current+waiters_current=%v (active=%v waiters=%v)",
+				entries, active+waiters, active, waiters)
+		default:
+			t.Logf("invariants held exactly: active=%v profiles=%v entries=%v waiters=%v", active, profil, entries, waiters)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the frozen identities never held exactly on a settled node: %s", mismatch)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-
-	// Independent gauges are gathered one at a time, so a small skew is expected
-	// on a live node; the contract says not to alert on strict equality. A
-	// systematic break — a profile never counted, or double counting — is much
-	// larger than this tolerance.
-	const tolerance = 2.0
-	if diff := active - profileSum; diff > tolerance || diff < -tolerance {
-		t.Fatalf("active_current=%v but sum(active_by_profile)=%v (%v); a profile is miscounted", active, profileSum, samples.byProfile)
-	}
-	if diff := entries - (active + waiters); diff > tolerance || diff < -tolerance {
-		t.Fatalf("entries_current=%v but active_current+waiters_current=%v", entries, active+waiters)
-	}
-	t.Logf("invariants held: active=%v profiles=%v entries=%v waiters=%v", active, profileSum, entries, waiters)
 }
 
 type downloadAdmissionSeries struct {

@@ -6791,7 +6791,7 @@ not residency. More invasive, and it moves the cost to disk.
 
 **D6 measurement (2026-08-03).** `TestDownloadAdmissionEgressScalesWithConcurrency`
 measured one transfer at 356 MiB/s and six concurrent at 1699 MiB/s aggregate —
-**4.9× the single-transfer rate at a six-way budget**. Near-linear scaling is the
+**4.8× the single-transfer rate at a six-way budget**. Near-linear scaling is the
 residual demonstrated rather than asserted: admission bounds how many transfers
 run, nothing bounds how fast each one runs, so a node's egress ceiling is
 `max_active_per_node × per-transfer throughput`. Those absolute figures are

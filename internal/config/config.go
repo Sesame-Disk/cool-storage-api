@@ -2403,6 +2403,17 @@ func (c *Config) resolveDownloadAdmissionCapacity() error {
 		return nil
 	}
 
+	// A positive budget here is either the operator's or one this function
+	// materialised on an earlier pass, and the two are not distinguished. The
+	// consequence, stated rather than discovered: re-validating the same Config
+	// after the container grew keeps the budget derived from the smaller one,
+	// because a derived budget looks configured on the way back in. Shrinking is
+	// caught either way — the cgroup guard charges the retained budget against
+	// the new limit and refuses it.
+	//
+	// Load() validates once, so this is not a startup path. Making Validate()
+	// genuinely reactive would mean recording which of the two a positive budget
+	// is instead of inferring it from being positive.
 	if d.MemoryBudgetBytes > 0 {
 		// Only classify once. A second Validate() sees the budget this pass
 		// materialised and would relabel a derived budget as configured — the

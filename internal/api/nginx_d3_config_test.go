@@ -54,12 +54,19 @@ type protectedNginxLocation struct {
 // proxy's own timers are strictly longer than every deadline validation accepts.
 //
 // Every protected location must carry an *explicit* override: inheriting the
-// server default is a failure, because that default is deliberately short. Non-D
-// routes keep it — this PR closes an abuse finding, so raising every route's
-// connection-retention window to 45 minutes would trade one resource vector for
-// another — which is why the check is per location rather than a file scan. A
-// scan is wrong in both directions: a long timeout on an unrelated location
+// server default is a failure, because that default is deliberately short. The
+// check is per location rather than a file scan for that reason, and a scan
+// would be wrong in both directions: a long timeout on an unrelated location
 // would satisfy it while a D route still inherited the short default.
+//
+// "Protected location" is not the same as "download route". /seafhttp/ is a
+// whole prefix, so its sync siblings — block PUT, check-blocks, the upload
+// routes — inherit these timers as well; several are the same URI under a
+// different method and cannot be separated by location at all. Each is bounded
+// by its own subcontract B/C admission and deadlines, so the proxy is not what
+// was holding them. What this test asserts is that no *listed* location falls
+// back to the short default; it does not assert that every other route in the
+// file still has it.
 func TestSupportedNginxTimeoutsNeverPreemptDownloadAdmission(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
