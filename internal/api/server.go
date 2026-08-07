@@ -1097,6 +1097,44 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 	}
 }
 
+// isRepositorySyncToken states, as an allowlist, what a download token must
+// look like to authenticate the repository sync surface. It is deliberately
+// positive: a denylist of the abuse we happen to know about ("reject
+// Source==\"link\"") would silently readmit any future source value that
+// nobody remembered to add.
+//
+// A repository sync credential is the token `GetDownloadInfo` and the other
+// three sync-token mint sites issue, and nothing else:
+//
+//   - Source is empty. Only "" and "link" are ever written today; the "web"
+//     mentioned in the AccessToken comment is not produced anywhere. Requiring
+//     exactly "" means a new source has to be added here on purpose.
+//   - Path is the repository root. A token minted to read one file — the
+//     ordinary authenticated file download, and the share-link bearer alike —
+//     carries that file's path and is not a repository credential.
+//   - RepoID matches the repository in the route. Every sync handler reads
+//     c.Param("repo_id"), so without this the token names one library while the
+//     request operates on another.
+//
+// All three are required. Each one alone leaves a usable path in: the source
+// check alone still lets a file-scoped token through, the path check alone
+// still lets a root token reach a different library, and the binding alone
+// still lets a link token reach the library it was minted for.
+func isRepositorySyncToken(token *AccessToken, routeRepoID string) bool {
+	if token == nil {
+		return false
+	}
+	if token.Source != "" {
+		return false
+	}
+	if token.Path != "/" {
+		return false
+	}
+	// Library IDs are UUIDs that reach us from a URL segment on one side and
+	// from storage on the other, so compare without case sensitivity.
+	return routeRepoID != "" && strings.EqualFold(token.RepoID, routeRepoID)
+}
+
 // syncAuthMiddleware validates authentication for sync protocol endpoints
 // It accepts multiple auth methods:
 // 1. Seafile-Repo-Token header (repo-specific token from download-info)
@@ -1145,6 +1183,15 @@ func (s *Server) syncAuthMiddleware() gin.HandlerFunc {
 
 		// Check if it's a valid repo token (from download-info)
 		if accessToken, valid := s.tokenStore.GetToken(token, TokenTypeDownload); valid {
+			// Validate the token's whole scope before turning the bearer into a
+			// user identity. Everything below this point runs as accessToken's
+			// owner, so a token that is merely *valid* is not enough — it has to
+			// be the repository sync credential this route expects.
+			if !isRepositorySyncToken(accessToken, c.Param("repo_id")) {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+				c.Abort()
+				return
+			}
 			// Repo tokens are long-lived — verify the account hasn't been
 			// deactivated or deleted since the token was issued.
 			if err := s.enforceAccountStatus(c, accessToken.UserID, accessToken.OrgID); err != nil {
@@ -1152,7 +1199,6 @@ func (s *Server) syncAuthMiddleware() gin.HandlerFunc {
 			}
 			c.Set("user_id", accessToken.UserID)
 			c.Set("org_id", accessToken.OrgID)
-			c.Set("repo_id", accessToken.RepoID)
 			c.Next()
 			return
 		}
