@@ -90,6 +90,37 @@ func TestTokenStoreCreateTokenRejectsGenericLinkWithoutSourceID(t *testing.T) {
 	requireSourceIDRejection(t, "generic CreateToken with source=link", err)
 }
 
+// Mirror of TestGenericCreateTokenRefusesSyncType in internal/api. Both stores
+// carry the same guard, so both need the regression: "only CreateSyncToken
+// mints a sync credential" is an architectural invariant, and an invariant with
+// one of its two enforcement points untested is one accidental deletion away
+// from being false again.
+//
+// The guard runs before the session is touched, so a zero-value store is enough
+// and no Cassandra is required.
+//
+// Matching the message is what makes this test mean anything, for the same
+// reason requireSourceIDRejection does it: these placeholder ids fail the UUID
+// parse further down, so "returned an error" would hold with the guard deleted.
+// Asserting only that would be a test that can never fail.
+func TestTokenStoreCreateTokenRefusesSyncType(t *testing.T) {
+	store := &TokenStore{}
+
+	// A non-root path is the case that matters most: it would mint a sync
+	// credential that isRepositorySyncToken then rejects — a token that exists
+	// but can never be used.
+	for _, path := range []string{"/", "/some/file.txt"} {
+		_, err := store.CreateToken(TokenTypeSync, "org", "repo", path, "user", "")
+		if err == nil {
+			t.Errorf("CreateToken(TokenTypeSync, path=%q) succeeded; the generic constructor must refuse it", path)
+			continue
+		}
+		if !strings.Contains(err.Error(), "must be created through CreateSyncToken") {
+			t.Errorf("CreateToken(TokenTypeSync, path=%q) failed with %v, want the sync-type guard to reject it", path, err)
+		}
+	}
+}
+
 // A non-canonical source would be a link token to the one EqualFold reader and
 // a regular web token to every exact-comparison reader, so it would slip past
 // the source-ID requirement below and past the link-only guards downstream.

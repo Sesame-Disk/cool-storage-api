@@ -945,11 +945,15 @@ accepted by sync authentication. That was tracked as debt and closed separately
 in the same session.
 
 `TokenTypeSync` now exists as its own type. `CreateSyncToken(orgID, repoID,
-userID)` is the only constructor that mints it and it **takes no path**, so the
-repository-root shape is no longer a value a caller supplies — it is a property
-of the constructor. The generic `CreateToken` on both the in-memory manager and
-the Cassandra store refuses `TokenTypeSync` outright, so that is enforced rather
-than merely conventional. `GetToken` compares the stored type exactly, so a
+userID)` is the only **exported** constructor that mints it and it **takes no
+path**, so the repository-root shape is no longer a value a caller supplies — it
+is a property of the constructor. The generic `CreateToken` on both the
+in-memory manager and the Cassandra store refuses `TokenTypeSync` outright, and
+both guards carry their own regression, so that is enforced rather than merely
+conventional. The unexported `createToken` helper still accepts any type,
+because `CreateSyncToken` is built on it; Go offers no way to hide it from the
+rest of its own package, so the guarantee is precisely "no supported constructor
+outside this package can mint one", not "the value is unreachable". `GetToken` compares the stored type exactly, so a
 download bearer is refused at the store before any shape logic runs.
 
 > **Rollout: this change is not backward compatible, and that is only safe
@@ -989,9 +993,21 @@ widened rather than caller-supplied values, which is why they stay.
 
 Two tests pin the type clause specifically: a download token and an upload token
 carrying the *perfect* sync shape — rooted path, empty source, right repository
-— which only the type refuses. Both are unit-level by necessity: after this
-change no API can mint a root-path download token at all, which is the point.
-Mutation-verified — removing the type clause fails exactly those two cases.
+— which only the type refuses. Mutation-verified: removing the type clause fails
+exactly those two cases.
+
+Both are unit-level by necessity, and the reason needs stating carefully.
+Root-path download tokens **do** still exist: a share link on a library root
+mints its zip bearer with `Path == "/"`, which is precisely why
+`TestSyncAuthRejectsRootDirectoryShareLinkToken` exists. What no mint site can
+produce is a root-path download token with an **empty source** — the zip bearer
+carries `Source == "link"`. So the exact fixture those two unit cases need
+cannot be created through any API, which is the point rather than a gap in
+coverage.
+
+The distinction that actually changed is this: `Path == "/"` no longer implies
+"sync credential". A `TokenTypeDownload` with a root path may legitimately
+exist; its type is what stops it authenticating sync.
 
 Adding the type moved where the other clauses are pinned, and the mutation
 evidence was re-measured rather than assumed to carry over:
