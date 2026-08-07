@@ -947,9 +947,31 @@ in the same session.
 `TokenTypeSync` now exists as its own type. `CreateSyncToken(orgID, repoID,
 userID)` is the only constructor that mints it and it **takes no path**, so the
 repository-root shape is no longer a value a caller supplies — it is a property
-of the constructor. `GetToken` compares the stored type exactly, so a download
-bearer is refused at the store before any shape logic runs. `token_type` is a
-free `TEXT` column, so no schema migration was involved.
+of the constructor. The generic `CreateToken` on both the in-memory manager and
+the Cassandra store refuses `TokenTypeSync` outright, so that is enforced rather
+than merely conventional. `GetToken` compares the stored type exactly, so a
+download bearer is refused at the store before any shape logic runs.
+
+> **Rollout: this change is not backward compatible, and that is only safe
+> because nothing is deployed.**
+>
+> No *schema* migration was involved — `token_type` is a free `TEXT` column —
+> but that is not the same as being rollout-safe, and the two should not be
+> confused. Every sync credential minted before this change is stored as
+> `token_type = "download"`, so after the change both validators reject it. The
+> incompatibility runs in both directions: an old node mints `download` that a
+> new node refuses, a new node mints `sync` that an old node refuses, and a
+> rollback strands every client that has already re-minted.
+>
+> SesameFS has no deployed instance and no live tokens, so this cost is zero
+> here. It would **not** be zero on an instance already serving clients. Do not
+> cherry-pick this onto one without either proving that the desktop client
+> re-acquires through `download-info` on rejection, or staging it: first teach
+> every node to accept both shapes while still minting the old one, then switch
+> minting once no old node remains, then drop the compatibility branch after one
+> full token TTL. A bulk CQL rewrite of `download` → `sync` keyed on
+> `Path == "/"` is not a substitute, since it would also convert any legitimate
+> root-path download token that happened to exist.
 
 The four sync-token mint sites (`handleRepoTokens`, `GetDownloadInfo`, the v2
 repo-download-info handler and library creation) switched to it; the two

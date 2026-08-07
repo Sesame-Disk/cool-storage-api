@@ -299,12 +299,16 @@ func TestSyncAndDownloadTokensDoNotCrossSurfaces(t *testing.T) {
 
 	syncToken := mintRepositorySyncToken(t, client, repoID)
 
+	// Assert the exact refusal rather than "not 200". A 500 would satisfy
+	// "did not serve bytes" while actually meaning the type mismatch crashed
+	// something, which is not the contract being claimed here. HandleDownload
+	// answers 401 when GetToken rejects the type.
 	resp := client.DoAnonymous(t, http.MethodGet, "/seafhttp/files/"+syncToken+"/"+fileName)
 	status := resp.StatusCode
 	resp.Body.Close()
-	if status == http.StatusOK {
-		t.Errorf("a repository sync token fetched file bytes from /seafhttp/files/ (status 200); "+
-			"the download surface must not accept a sync credential")
+	if status != http.StatusUnauthorized {
+		t.Errorf("a repository sync token at /seafhttp/files/ = %d, want 401; "+
+			"the download surface must refuse a sync credential cleanly, not merely fail to serve it", status)
 	}
 
 	// And the ordinary download path still works, with its own token.

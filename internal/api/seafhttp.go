@@ -125,8 +125,18 @@ func NewTokenManager(tokenTTL time.Duration) *TokenManager {
 // DefaultTokenTTL is the default time-to-live for tokens
 const DefaultTokenTTL = 1 * time.Hour
 
-// CreateToken creates a new access token
+// CreateToken creates a new access token.
+//
+// It refuses TokenTypeSync. The generic constructor takes a path, and a sync
+// credential's root path is meant to be a property of its constructor rather
+// than a value a caller supplies — see CreateSyncToken. Without this guard
+// "CreateSyncToken is the only way to mint one" would be a convention rather
+// than a fact, and the whole point of the separate type is that it cannot be
+// produced by accident.
 func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, userID, source string, ttl time.Duration) (*AccessToken, error) {
+	if tokenType == TokenTypeSync {
+		return nil, errors.New("sync tokens must be created through CreateSyncToken")
+	}
 	return tm.createToken(tokenType, orgID, repoID, path, userID, source, "", false, ttl)
 }
 

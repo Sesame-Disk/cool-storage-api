@@ -20,7 +20,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// LibraryTokenCreator is an interface for creating sync tokens
+// LibraryTokenCreator mints the credentials the library surface needs. It
+// carries both constructors because it serves two callers: library creation
+// wants a sync token, and the v2 share-link zip task wants a path-scoped
+// download token (see zipTokenCreator in files.go). Narrowing this to
+// CreateSyncToken alone would break the zip task.
 type LibraryTokenCreator interface {
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
 	CreateSyncToken(orgID, repoID, userID string) (string, error)

@@ -63,8 +63,18 @@ func NewTokenStore(db *DB, ttl time.Duration) *TokenStore {
 	}
 }
 
-// CreateToken creates a new access token and stores it in Cassandra
+// CreateToken creates a new access token and stores it in Cassandra.
+//
+// It refuses TokenTypeSync. The generic constructor takes a path, and a sync
+// credential's root path is meant to be a property of its constructor rather
+// than a value a caller supplies — see CreateSyncToken. Without this guard
+// "CreateSyncToken is the only way to mint one" would be a convention rather
+// than a fact, and the whole point of the separate type is that it cannot be
+// produced by accident.
 func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, userID, source string) (*AccessToken, error) {
+	if tokenType == TokenTypeSync {
+		return nil, fmt.Errorf("sync tokens must be created through CreateSyncToken")
+	}
 	return ts.createToken(tokenType, orgID, repoID, path, userID, source, "", false)
 }
 

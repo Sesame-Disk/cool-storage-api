@@ -1,6 +1,35 @@
 package api
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+// The generic constructor must refuse TokenTypeSync, or "CreateSyncToken is the
+// only way to mint one" is a convention someone can break by accident rather
+// than a property of the code. The generic path takes a path argument, which is
+// exactly what a sync credential must not let a caller choose.
+func TestGenericCreateTokenRefusesSyncType(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+
+	if _, err := tm.CreateToken(TokenTypeSync, "org1", "repo1", "/", "user1", "", time.Hour); err == nil {
+		t.Error("CreateToken(TokenTypeSync, ...) succeeded; the generic constructor must refuse it")
+	}
+
+	// A path other than the root is the case that would matter most, since it
+	// would produce a sync credential the predicate then rejects — a token that
+	// exists but can never be used.
+	if _, err := tm.CreateToken(TokenTypeSync, "org1", "repo1", "/some/file.txt", "user1", "", time.Hour); err == nil {
+		t.Error("CreateToken(TokenTypeSync, ...) with a file path succeeded; the generic constructor must refuse it")
+	}
+
+	// The types it does serve still work.
+	for _, tt := range []TokenType{TokenTypeUpload, TokenTypeDownload} {
+		if _, err := tm.CreateToken(tt, "org1", "repo1", "/file.txt", "user1", "", time.Hour); err != nil {
+			t.Errorf("CreateToken(%q, ...) = %v; the guard must not touch the other types", tt, err)
+		}
+	}
+}
 
 // The route-level contract for ISSUE-SYNC-LINK-TOKEN-AUTH-01, pinned without a
 // server. The integration suite proves the middleware enforces it end to end;
