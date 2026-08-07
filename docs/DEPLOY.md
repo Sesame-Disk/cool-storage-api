@@ -390,6 +390,19 @@ If you prefer to terminate TLS inside the SesameFS stack, uncomment the optional
 1. Create a bucket in your S3-compatible provider (AWS S3, Cloudflare R2, MinIO, etc.)
 2. Create an API/IAM user with `s3:*` permission on that bucket
 3. Save the `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`
+4. **Keep the bucket private.** SesameFS reads blocks with its own credentials
+   and never needs anonymous access. A bucket that grants public read lets
+   anyone who can reach the storage endpoint enumerate keys and download block
+   content directly, bypassing SesameFS authentication, authorization, quota
+   checks, traffic recording and download admission. AWS S3 and Cloudflare R2
+   are private by default, so the standard deployment is fine as-is; a
+   self-hosted MinIO is only private if you leave it that way.
+
+   If you want to confirm it, an unauthenticated request must be refused:
+
+   ```bash
+   curl -s -o /dev/null -w '%{http_code}\n' "$S3_ENDPOINT/$S3_BUCKET/?list-type=2"   # expect 403
+   ```
 
 ### 0.2 Register an OIDC client
 

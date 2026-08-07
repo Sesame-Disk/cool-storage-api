@@ -470,10 +470,6 @@ services:
       mc mb myminio/sesamefs-eu --ignore-existing;
       mc mb myminio/sesamefs-china --ignore-existing;
       mc mb myminio/sesamefs-archive --ignore-existing;
-      mc anonymous set download myminio/sesamefs-blocks;
-      mc anonymous set download myminio/sesamefs-usa;
-      mc anonymous set download myminio/sesamefs-eu;
-      mc anonymous set download myminio/sesamefs-china;
       echo 'Buckets created:';
       mc ls myminio;
       exit 0;
