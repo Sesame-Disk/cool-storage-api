@@ -167,13 +167,21 @@ func TestGetLockedFiles_InvalidTokenOmitsRepoWithoutQuerying(t *testing.T) {
 
 // TokenTypeDownload is shared with narrower grants: path-scoped file-download
 // tokens and share-link tokens (Source=="link"). Neither may widen into
-// repo-wide lock enumeration — only the root-path, non-link sync token from
-// download-info qualifies.
+// repo-wide lock enumeration — only the root-path sync token from
+// download-info, with an empty source, qualifies.
+//
+// The third entry is the one that pins the shared predicate. This route used to
+// spell its own source clause as a denylist, "not a link", which a future
+// source value with the right path and repository would have satisfied. It now
+// goes through isRepositorySyncToken, whose allowlist refuses anything that is
+// not exactly "". Without this case the endpoint could be reverted to the old
+// denylist and the suite would stay green.
 func TestGetLockedFiles_RejectsNarrowerDownloadTokens(t *testing.T) {
 	handler := newTestSyncHandler()
 	handler.tokenValidator = &stubTokenValidator{tokens: map[string]*AccessToken{
-		"tok-file-scoped": {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/docs/report.docx"},
-		"tok-share-link":  {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/", Source: "link"},
+		"tok-file-scoped":  {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/docs/report.docx"},
+		"tok-share-link":   {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/", Source: "link"},
+		"tok-future-source": {Type: TokenTypeDownload, RepoID: "repo-1", UserID: "user-1", Path: "/", Source: "onlyoffice"},
 	}}
 	locksQueried := false
 	withListRepoLocksStub(t, func(h *SyncHandler, repoID string) ([]db.RepoLockedFile, error) {
@@ -183,7 +191,8 @@ func TestGetLockedFiles_RejectsNarrowerDownloadTokens(t *testing.T) {
 
 	body := `[
 		{"repo_id":"repo-1","token":"tok-file-scoped","ts":0},
-		{"repo_id":"repo-1","token":"tok-share-link","ts":0}
+		{"repo_id":"repo-1","token":"tok-share-link","ts":0},
+		{"repo_id":"repo-1","token":"tok-future-source","ts":0}
 	]`
 	w := postLockedFiles(newLockedFilesRouter(handler), body)
 	if w.Code != http.StatusOK {
@@ -193,7 +202,7 @@ func TestGetLockedFiles_RejectsNarrowerDownloadTokens(t *testing.T) {
 		t.Fatalf("body = %q, want %q (narrow tokens must not enumerate locks)", got, "[]")
 	}
 	if locksQueried {
-		t.Fatal("lock data must not be queried for path-scoped or share-link tokens")
+		t.Fatal("lock data must not be queried for path-scoped, share-link or unknown-source tokens")
 	}
 }
 

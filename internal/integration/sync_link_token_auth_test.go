@@ -265,7 +265,7 @@ func TestSyncAuthLinkTokenCannotWriteToAnotherLibrary(t *testing.T) {
 	if landed {
 		t.Errorf("a public share-link visitor wrote block %s into a library that was never shared "+
 			"(PutBlock=%d, and the owner's check-blocks no longer reports it as needed). "+
-			"This is an effective write, not just an authorization bypass.", blockID, putStatus)
+			"This is an unauthorized block write into the victim library, not just an authorization bypass.", blockID, putStatus)
 	}
 	if putStatus != http.StatusUnauthorized && putStatus != http.StatusForbidden {
 		t.Errorf("PutBlock into an unshared library with a share-link token = %d; want 401 or 403", putStatus)

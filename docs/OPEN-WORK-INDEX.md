@@ -91,9 +91,10 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
   object-storage anonymity was closed separately on 2026-08-07.
 - `ISSUE-SYNC-LINK-TOKEN-AUTH-01` — **Fixed 2026-08-07.** `syncAuthMiddleware`
   accepted any valid download token as a repository credential. Reproduced live
-  as an effective cross-library write by an anonymous share-link visitor, plus
-  an escalation through `/download-info` into a full repository sync token, and
-  a total absence of token-to-route repository binding. `isRepositorySyncToken`
+  as an unauthorized cross-library block write by an anonymous share-link
+  visitor, plus an escalation through `/download-info` into a full repository
+  sync token, and a total absence of token-to-route repository binding.
+  `isRepositorySyncToken`
   now validates `Source == ""`, `Path == "/"` and a route-bound `RepoID` before
   the bearer becomes an identity. All three clauses mutation-verified against
   the live server; ordinary sync tokens unaffected.

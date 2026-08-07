@@ -799,8 +799,8 @@ Some of those scenarios are already handler-covered, but they are not yet exerci
 
 **Status**: ✅ **Fixed 2026-08-07** — was a pre-existing authorization gap, not
 introduced by D2
-**Severity**: Was Critical — reproduced as an effective cross-library write by
-an anonymous public-link visitor, not only as a read bypass
+**Severity**: Was Critical — reproduced as an unauthorized cross-library block
+write by an anonymous public-link visitor, not only as a read bypass
 **Affected**: `syncAuthMiddleware` and the authenticated `/seafhttp/repo/:repo_id/*` routes
 **Source of record**: Code-verified 2026-08-02; report reviewed during D2 audit;
 live exploit and fix 2026-08-07
@@ -860,13 +860,23 @@ The `400`s were not refusals: `checkSyncPermission` runs before body parsing on
 those handlers, so authentication and authorization had both passed and only the
 probe payload was rejected.
 
-Write access was then confirmed as an **effective mutation**, not inferred from
-the `400`s: `PUT /seafhttp/repo/<victim>/block/<sha256>` with a share-link
-bearer returned `200` against a library that was never shared, and the owner's
-own authenticated `check-blocks` stopped reporting the block as needed —
-the object had landed. `/download-info` returned a real repository sync token.
-A token minted for one library returned `200` on another library's
-`commit/HEAD`.
+Write access was then confirmed as an **unauthorized cross-library block
+write**, not inferred from the `400`s: `PUT /seafhttp/repo/<victim>/block/<sha256>`
+with a share-link bearer returned `200` against a library that was never shared,
+and the owner's own authenticated `check-blocks` stopped reporting the block as
+needed — the object had landed in storage under the victim repository's
+authority.
+
+Stated precisely, because the distinction matters: `PutBlock` materializes the
+block, it does not by itself attach it to the library's file tree. Block
+materialization and the logical reference are separate steps in SesameFS, so
+this is an unauthorized write into the victim's block storage rather than a
+directly visible change to its files. The write routes that *would* complete
+that second step — `recv-fs`, `update-branch` — were reached and authorized in
+the same run, and answered `400` only on the probe payload.
+
+`/download-info` returned a real repository sync token. A token minted for one
+library returned `200` on another library's `commit/HEAD`.
 
 #### Resolution
 
@@ -912,7 +922,7 @@ the contract.
   `isRepositorySyncToken`, including the unknown-future-source case.
 - `internal/integration/sync_link_token_auth_test.go` — eight live tests:
   the full replay table, `/download-info` escalation, cross-library read,
-  cross-library effective write, root-directory link, file-scoped token,
+  cross-library block write, root-directory link, file-scoped token,
   legitimate-token binding, and a positive test proving ordinary repository
   sync tokens still work.
 - Regression: `TestSync*`, `TestSeafhttp*`, `TestLockedFiles*`,

@@ -1106,9 +1106,9 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 // A repository sync credential is the token `GetDownloadInfo` and the other
 // three sync-token mint sites issue, and nothing else:
 //
-//   - Source is empty. Only "" and "link" are ever written today; the "web"
-//     mentioned in the AccessToken comment is not produced anywhere. Requiring
-//     exactly "" means a new source has to be added here on purpose.
+//   - Source is empty. Only "" and "link" are ever written. Requiring exactly
+//     "" means a new source value has to be admitted here on purpose rather
+//     than arriving accepted by default.
 //   - Path is the repository root. A token minted to read one file — the
 //     ordinary authenticated file download, and the share-link bearer alike —
 //     carries that file's path and is not a repository credential.
