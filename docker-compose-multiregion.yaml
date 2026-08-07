@@ -153,10 +153,6 @@ services:
       mc mb myminio/sesamefs-eu --ignore-existing;
       mc mb myminio/sesamefs-blocks --ignore-existing;
       mc mb myminio/sesamefs-archive --ignore-existing;
-      echo 'Setting bucket policies...';
-      mc anonymous set download myminio/sesamefs-usa;
-      mc anonymous set download myminio/sesamefs-eu;
-      mc anonymous set download myminio/sesamefs-blocks;
       echo 'Buckets created:';
       mc ls myminio;
       echo 'MinIO initialization complete!';

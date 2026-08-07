@@ -182,9 +182,6 @@ services:
             mc mb $${site}/$${bucket} --ignore-existing
             mc version enable $${site}/$${bucket}
           done
-          mc anonymous set download $${site}/sesamefs-usa
-          mc anonymous set download $${site}/sesamefs-eu
-          mc anonymous set download $${site}/sesamefs-blocks
         done
         echo "Buckets + versioning ready on both regions."
         mc ls usa; mc ls eu

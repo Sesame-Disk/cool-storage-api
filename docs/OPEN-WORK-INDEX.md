@@ -59,14 +59,12 @@ of them updated.
 
 **Readiness verdict is still no-go as-is.** NF-1 closed 2026-07-25; **B4 is
 closed, while the sync public-link token auth gap remains an open single-node
-blocker** and anonymous object-storage downloads are a separate production-posture blocker;
-multi-instance adds B1 and B5. See
+blocker**; multi-instance adds B1 and B5. See
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-SYNC-LINK-TOKEN-AUTH-01` | HIGH | Public share-link download tokens are accepted by `syncAuthMiddleware` as repository credentials, so a bearer issued for a shared file can reach the repo sync surface as the link creator | Pre-existing authorization gap in `internal/api/server.go`; see `KNOWN_ISSUES.md` |
-| `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` | HIGH | Supported Compose policies grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known | Production posture — private buckets and effective endpoint policy must be verified before go-live; see `KNOWN_ISSUES.md` |
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
 
@@ -85,8 +83,15 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 - `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` — **Closed 2026-08-04** (B4 umbrella;
   A1/A2, B, C and D0-D6 complete). Download admission is enabled in every
   shipped configuration and its capacities are validated against the measured
-  2 GiB process-local budget. Object-storage anonymity and byte-rate shaping
-  remain separate findings.
+  2 GiB process-local budget. Byte-rate shaping remains a separate finding;
+  object-storage anonymity was closed separately on 2026-08-07.
+- `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` — **Closed 2026-08-07. Never
+  affected production.** The `mc anonymous set download` lines existed only in
+  the four development/test Compose files, not in `docker-compose.prod.yml`,
+  which ships no MinIO and targets provider-native S3 that is private by
+  default. The lines are removed; nothing depended on them, since every MinIO
+  consumer in the repository authenticates. The old entry overstated the
+  finding by not separating the dev Compose files from the production one.
 - `ISSUE-STREAMBLOCKS-VOID-01` — **Fixed 2026-08-03**; `StreamBlocks` now
   returns errors and the seafhttp caller records delivered bytes only.
 

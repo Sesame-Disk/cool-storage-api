@@ -12,9 +12,12 @@ the client, proxy and saturation evidence the closure criteria require. See
 **D6 Evidence** below for the measured figures and where each criterion is
 demonstrated.
 
-Two findings remain open and are explicitly **not** closed by D:
-`ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` (§13) and
-`ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01`, now quantified rather than deferred.
+Two findings were explicitly **not** closed by D.
+`ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` remains open, now quantified rather than
+deferred. `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` (§13) was closed
+separately on 2026-08-07 — it turned out to be dev-only Compose configuration
+and never a production exposure — but §13's architectural point stands
+regardless of that issue's status.
 
 This document freezes the contract and inventory for subcontract D of
 `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`. It is the design record for the D1-D6
@@ -1067,16 +1070,19 @@ rather than only in tests.
 
 ### 13. Direct Object Storage Is Separate
 
-The Compose files currently execute `mc anonymous set download` for storage
-buckets. A caller who knows a bucket/key can bypass application authentication,
-quota checks, traffic recording and D admission.
+D admits and bounds requests that arrive at the application. It has no reach
+into the object store. A caller who can read a bucket directly bypasses
+application authentication, quota checks, traffic recording and D admission
+entirely, and no amount of D work changes that. Whoever operates a deployment
+owns the bucket policy; D must never be described as protecting direct object
+access.
 
-This is `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01`, a separate object-storage
-exposure finding, not an undocumented part of D implementation. Once D closes,
-`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` and its B4 umbrella may be marked closed;
-the object-storage issue remains independently open. The overall production
-verdict stays no-go while the object-storage issue is open, and production
-readiness must not be described as enabled while that bypass is unresolved.
+That boundary is permanent. The specific finding attached to it,
+`ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01`, was closed on 2026-08-07: the
+`mc anonymous set download` commands existed only in the development and test
+Compose files, never in the production path, and have been removed. It was
+tracked separately from D rather than absorbed into it, which was correct, but
+it never gated the readiness verdict.
 
 ## D6 Evidence
 
@@ -1153,7 +1159,7 @@ a raw stream.
 | 10 | `TestDownloadAdmissionThroughProxyReleasesStalledClient` — a stalled client through the **real frontend nginx** holds its slot, is classified as `idle_write_timeout`, and is not released by client cancellation |
 | 11 | `scripts/fault-inject-download-admission.sh` — the follow-up drill records 33 retryable `profile="block"` refusals, summing the six reasons a saturated node can answer with (`admission_timeout`, `auth_user_full`, `node_full`, `profile_full`, `auth_user_queue_full`, `node_queue_full`) and excluding `client_gone`; it proves HTTP 503 with `Retry-After: 10`, and real `seaf-cli` reaches `synchronized`, pulls every file and drains every slot |
 | 12 | Measurements above; egress measured at 356 MiB/s single and 1699 MiB/s aggregate six-way (**4.8×**), re-measured on a rebuilt stack at 350 and 1788 MiB/s (**5.1×**). The residual is the near-linear relationship, which reproduced; the absolute rates are per-run |
-| 13 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` remains open and is not treated as closed by D |
+| 13 | `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` was tracked separately and never treated as closed by D; it was closed on its own terms on 2026-08-07 as dev-only Compose configuration. The §13 boundary — D does not protect direct object access — holds independently |
 | 14 | `TestShippedConfigs*` load every shipped configuration through the real validator, including auto-derived capacities and the safety-adjusted memory invariant; `TestDownloadAdmissionDerivesCapacityFromTheCgroupLimit` covers the auto path against a real container limit via the `sesamefs-cgroup-probe` service — the only node in the stack that declares one, since the rest report `max` and always take the reference fallback — asserting the budget *source* as well as the numbers, because a derived budget and an explicit one of the same size are otherwise indistinguishable; `TestDownloadAdmissionMemoryUnderSaturation` is an opt-in real-node RSS/heap/cgroup probe, which sizes itself from the node's published capacity and safety-adjusted budget. Measured at the 16-slot baseline: **+38 to +52 MiB cgroup delta across runs, against a 1.6 GiB safety-adjusted budget**, with RSS and heap deltas at zero — the pages were already resident. It holds ordinary raw and file streams rather than buffered iWork previews, so it does **not** reproduce the modelled worst case; the per-admission benchmarks remain the source for that |
 
 ### What the measurements are not

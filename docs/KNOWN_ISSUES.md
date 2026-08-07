@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-02
+**Last Updated**: 2026-08-07
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -19,9 +19,9 @@ is right about why.
 | Issue | Status | See |
 |-------|--------|-----|
 | **Share-link password bypass** | ✅ Fixed (2026-07-25) | Password-protected share links served file content, and an OnlyOffice download token, to anonymous callers through the public bootstrap endpoints. The gate now runs before either branch does protected work, and the bundle builder drops content it is handed while `needPassword` holds. See ISSUE-SHARELINK-PASSWORD-BYPASS-01 and `docs/PROD-SECURITY-READINESS-20260724.md` NF-1. |
-| **Rate limiting on upload/download/blocks** | ✅ Fixed (2026-08-04) | B4 umbrella closed: A1/A2, B, C and D0-D6 are complete. Download admission ships enabled with auto-derived process-local capacities: the effective cgroup budget is 25% when exposed, the 2 GiB fallback uses a 20% design margin, and the clean baseline derives 16 active slots with 4 raw and 12 other streams. Closure evidence includes 33 retryable `profile=block` refusals, HTTP 503 with `Retry-After: 10`, real `seaf-cli` recovery, a stalled client released through the real nginx on the application's own deadline, and cross-route saturation. An opt-in real-process memory probe exists but its output is not recorded as a closure figure. Two findings are **not** closed by it: ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01 and the now-quantified ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
+| **Rate limiting on upload/download/blocks** | ✅ Fixed (2026-08-04) | B4 umbrella closed: A1/A2, B, C and D0-D6 are complete. Download admission ships enabled with auto-derived process-local capacities: the effective cgroup budget is 25% when exposed, the 2 GiB fallback uses a 20% design margin, and the clean baseline derives 16 active slots with 4 raw and 12 other streams. Closure evidence includes 33 retryable `profile=block` refusals, HTTP 503 with `Retry-After: 10`, real `seaf-cli` recovery, a stalled client released through the real nginx on the application's own deadline, and cross-route saturation. An opt-in real-process memory probe exists but its output is not recorded as a closure figure. Two findings were **not** closed by it: ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01, since closed separately on 2026-08-07, and the now-quantified ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01, still open. See ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01 and `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`. |
 | **Download admission has no bound before the first write** | ✅ Fixed (2026-08-03) | The idle interval now opens at the streaming phase change instead of at the first byte, and a deferred Gin status preserves it rather than clearing it. A stalled first storage read is cancelled by `idle_write_timeout` on both the D4 and D5 producers. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
-| **Anonymous object-storage downloads** | 🔴 Open — production posture blocker | Supported Compose storage policies currently grant anonymous bucket downloads, bypassing application auth, quotas, traffic recording and D admission when a bucket/key is known. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
+| **Anonymous object-storage downloads** | ✅ Closed (2026-08-07) — never affected production | The `mc anonymous set download` lines existed only in the four development/test Compose files. Production deploys from `docker-compose.prod.yml`, which ships no MinIO, against provider-native S3 that is private by default. The lines are now removed; nothing depended on them, since every MinIO consumer authenticates. The original entry overstated the finding by not separating the dev Compose files from the production one. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
@@ -5104,7 +5104,7 @@ narrows the window without closing it.
 
 ### ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01: Incomplete abuse controls on the seafhttp upload/download/block surfaces and equivalent storage-backed read surfaces
 
-**Status**: ✅ **Closed 2026-08-04** — **A1/A2, B, C and D0-D6 are all closed.** Closing this umbrella does **not** clear the production verdict: `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` lets a caller who knows a bucket/key bypass every control described here, and §13 of the D0 contract requires that it be tracked separately rather than absorbed. `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` also stays open, now with a measured figure instead of a deferral. Historical detail follows. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, D3 supplies the idle-write writer plus actual-route gzip/proxy reachability, D4 wires one coordinator through the listed non-block producer lifetimes, and D5 streams authenticated block GET through `CanonicalBlockReader` under `ProfileBlock` without full-block materialization, and D6 now derives clean-deployment capacities from the effective memory budget with a safety margin. Auto mode is the code default; only an explicit `enabled: false` opts out. The 2026-08-04 follow-up corrected the fault-drill proof to count only retryable `profile=block` reasons and to require HTTP 503 with `Retry-After`; it recorded 33 such refusals before real `seaf-cli` recovered. `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01`, which left an admitted request with no D-owned deadline between the end of preparation and its first response write, was fixed in the shared lifecycle on 2026-08-03 and was the last prerequisite for D6. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable.
+**Status**: ✅ **Closed 2026-08-04** — **A1/A2, B, C and D0-D6 are all closed.** Closing this umbrella did **not** by itself clear the production verdict. `ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01` let a caller who knows a bucket/key bypass every control described here, and §13 of the D0 contract required that it be tracked separately rather than absorbed; it was closed on its own terms on 2026-08-07. `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` stays open, now with a measured figure instead of a deferral. Historical detail follows. D0 freezes the contract and inventory in `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; D1 adds the isolated coordinator, schema and metrics, D2 gives every public download-token mint flow a stable `SourceID`, D3 supplies the idle-write writer plus actual-route gzip/proxy reachability, D4 wires one coordinator through the listed non-block producer lifetimes, and D5 streams authenticated block GET through `CanonicalBlockReader` under `ProfileBlock` without full-block materialization, and D6 now derives clean-deployment capacities from the effective memory budget with a safety margin. Auto mode is the code default; only an explicit `enabled: false` opts out. The 2026-08-04 follow-up corrected the fault-drill proof to count only retryable `profile=block` reasons and to require HTTP 503 with `Retry-After`; it recorded 33 such refusals before real `seaf-cli` recovered. `ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01`, which left an admitted request with no D-owned deadline between the end of preparation and its first response write, was fixed in the shared lifecycle on 2026-08-03 and was the last prerequisite for D6. C bounds check-blocks admission on its own capacity, deduplicates lookups, bounds and cancels the metadata fan-out, and closed the gzip hole that would have made its admitted lifetime unenforceable.
 **Severity**: High — abuse/DoS control gap on the highest-cost endpoints
 **Affected**: `POST /seafhttp/upload-api/:token`, `GET /seafhttp/files/:token/*filepath`, `PUT/GET /seafhttp/repo/:repo_id/block/:block_id`, `POST /seafhttp/repo/:repo_id/check-blocks`, `GET /seafhttp/zip/:token`, `GET /repo/:repo_id/raw/*filepath`, `GET /repo/:repo_id/history/download`, `GET /repo/:repo_id/history/raw`, share-link raw under `/d/:token`, and the share-file bootstrap inline-content read. D's authoritative producer inventory is the D0 contract, not this list
 **Source of record**: B4 / SEC-2 / SH-1 in `docs/PROD-SECURITY-READINESS-20260724.md`; **X10** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` is **subcontract B** of this umbrella (not the whole surface)
@@ -5997,59 +5997,72 @@ leaving D4 exposed.
 
 ---
 
-### ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01: Supported storage policies bypass application download controls
+### ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01: Anonymous bucket policy in the development Compose stacks
 
-**Status**: 🔴 **Open** — production posture blocker
-**Severity**: Blocker for any production deployment where the configured object
-storage endpoint is publicly reachable with anonymous read access
-**Affected**: Compose storage initialization and any deployed bucket policy
-that grants anonymous `download` access
+**Status**: ✅ **Closed 2026-08-07 — never affected production; dev-only
+configuration, now removed**
+**Severity**: Downgraded from blocker. It was scoped to the development and
+test Compose stacks, which is not a production posture at all.
+**Affected**: Development/test Compose storage initialization only
 **Source of record**: D0 contract in
 `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md`; production posture follow-up to
 `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`
 
-#### Problem
+#### What the finding actually was
 
-The supported Compose definitions currently execute `mc anonymous set download`
-for application storage buckets. The commands are present in:
+Four Compose files ran `mc anonymous set download` on their MinIO buckets:
+`docker-compose.yaml`, `docker-compose.mr.yaml`, `docker-compose.mr-cluster.yaml`
+and `docker-compose-multiregion.yaml`. The policy was real — measured against
+the development stack on 2026-08-07, `GET /sesamefs-blocks/?list-type=2`
+returned HTTP 200 with full `blocks/<org_id>/<xx>/<yy>/<sha256>` keys and a
+subsequent object GET returned block content in the clear, because MinIO's
+`download` policy grants `s3:ListBucket` alongside `s3:GetObject`. Writes were
+refused (`PUT`/`DELETE` → 403).
 
-- `docker-compose.yaml`;
-- `docker-compose.mr.yaml`;
-- `docker-compose.mr-cluster.yaml`;
-- `docker-compose-multiregion.yaml`.
+**None of those four files is a production deployment path.** All four are
+development and test stacks; the `mr` and `mr-cluster` ones exist to exercise
+cross-region replication behind a Playwright suite. Production deploys from
+`docker-compose.prod.yml`, which has no MinIO service and no `mc` init
+container — `DEPLOY.md` describes it as "no MinIO, no dev tools" — against
+provider-native S3 configured in `configs/config.prod.yaml`, where AWS and
+Cloudflare R2 buckets are private by default.
 
-An actor who knows or obtains a bucket/key can fetch the object directly from
-MinIO or the object-storage endpoint without traversing SesameFS
-authentication, authorization, traffic quota checks, traffic recording,
-admission limits or application metrics. This is an independent bypass of
-application-layer D. A public share token is not required for the direct read.
+So the original registry entry overstated the finding by describing "supported
+Compose storage policies" without distinguishing the development files from the
+production one. There was never a production exposure to fix, and no deployed
+data was ever anonymously readable.
 
-This issue is not evidence that every production deployment currently exposes
-the endpoint. It is a defect in the supported posture unless deployment proves
-the buckets are private and the object-storage network endpoint is not directly
-reachable by untrusted clients.
+#### Resolution
 
-#### Greenfield Fix Direction
+The `mc anonymous set download` invocations were removed from all four Compose
+files. Nothing depended on them: every MinIO consumer in the repository
+authenticates. The Go integration suites build `S3Config` with explicit
+credentials, the multi-region Playwright spec verifies replication by
+downloading through the application API as an authenticated user rather than
+from the bucket, and the only unauthenticated request to port 9000 anywhere is
+`scripts/test.sh` probing `/minio/health/live`, a MinIO server endpoint
+independent of bucket policy. The commands dated to the initial scaffolding
+commit `896c647df` and had simply been copied forward into each new Compose
+file since.
 
-The clean production deployment must:
+`DEPLOY.md` step 0.1 now states the obvious requirement explicitly — keep the
+bucket private, SesameFS reads with its own credentials and never needs
+anonymous access — with a one-line `curl` for anyone who wants to confirm it.
 
-1. remove anonymous-read initialization from production-supported Compose paths;
-2. use private buckets and application-owned credentials for all storage reads;
-3. verify that an unauthenticated object GET receives `403` (or the provider's
-   equivalent private-bucket response);
-4. verify application downloads continue to work through the canonical reader;
-5. inspect all storage endpoints and signed-URL paths for another direct public
-   bypass;
-6. document any deliberately local-only anonymous policy in a test-only Compose
-   profile rather than in the production deployment path.
+Verified on the development stack: with all buckets switched to private, the
+S3-touching integration tests (`TestGC_*`, `TestWebBlockUpload*`,
+`TestNeedsPutUsesCanonicalMinIOBucket`, `TestProvisionalRollback*`,
+`TestNoSessionBlockEndpointsRejected`) pass in 122.9s, matching the green
+baseline recorded before the policy was changed. Re-running the edited
+`minio-init` leaves every bucket private.
 
-No legacy object migration or data backfill is needed for the clean deployment.
-The issue remains open until the effective production policy is tested, not only
-until the YAML commands are edited.
+No legacy object migration or data backfill was needed. This issue does not
+gate the readiness verdict and never should have.
 
 #### Related Docs
 
 - `docs/SEAFHTTP-DOWNLOAD-ADMISSION-D0.md` (D boundary and separate blocker)
+- `docs/DEPLOY.md` step 0.1 (bucket creation and verification)
 - `docs/OPEN-WORK-INDEX.md` (production blocker row)
 - `docs/PROD-SECURITY-READINESS-20260724.md` (dated posture note)
 
