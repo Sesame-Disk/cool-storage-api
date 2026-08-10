@@ -8,23 +8,35 @@ Session-by-session development history for SesameFS.
 
 ---
 
-## 2026-08-10 - X1/X2 fence: materializer authority and inline activation
+## 2026-08-10 - X1/X2 fence ADR: materializer authority, crash and ambiguity protocols
 
-- Closed a live-data hole: the `MATERIALIZING` intent is now also an `AUTHORIZED`
-  generation use, held from before the PUT until the reference is published. A
-  freshly activated generation is `ACTIVE` with zero references, so without a use
-  row the GC could retire and delete `K` under a successful upload.
-- Reverted the rule forcing G2 activation into a background allocator. The
-  rematerialization CAS may run inline in the materializing request; deferring it
-  left a completed PUT unable to finish and invited duplicate losing generations.
-- Fixed the GC decision order to errors, then references, then uses. A generation
-  with both a reference and a live writer no longer strands in `RETIRING`.
-- Corrected the false "exactly one upload-path LWT" claim. The upload path already
-  contains unrelated LWTs (stub repair, identity backfills, session slots, head
-  promotion, file locks); the constraint is scoped to Paxos the fence itself adds.
-- Added a physical key parsing inventory, full authority-tuple confirmation for
-  ambiguous authorization, and an explanation for the 5m/10m integration timeout.
-- X1/X2 remain open and destructive GC remains disabled; no runtime code changed.
+Design-document changes only. Nothing described here is implemented, no runtime
+code changed, X1/X2 remain open, and destructive GC remains disabled fleet-wide.
+
+- Specified that the `MATERIALIZING` intent is also an `AUTHORIZED` generation use,
+  held from before the PUT until the reference is published. The design previously
+  left the materializer invisible to the GC drain, so a freshly activated
+  generation was `ACTIVE` with zero references and zero uses — the shape of a GC
+  candidate.
+- Specified a retirement handoff: G1 retirement must be durable in
+  `block_generations` before G2 may overwrite the active pointer, with a
+  reconciliation table that quarantines rather than deletes when the evidence is
+  unreconstructable.
+- Specified reconciliation for ambiguous lifecycle LWTs, including the activation
+  CAS. A timeout does not mean "not applied".
+- Separated the confirmation contracts for an ambiguous `PENDING` insert, an
+  ambiguous authorization, and an ambiguous materializer use.
+- Restated `RETIRED` as a statement about authority rather than row absence, since
+  a late `PENDING` use can always appear after the final global read.
+- Removed the rule forcing G2 activation into a background allocator; the
+  rematerialization CAS may run inline in the materializing request.
+- Fixed the GC decision order to errors, then references, then uses.
+- Corrected the false "exactly one upload-path LWT" claim and expanded the existing
+  LWT inventory, including the `gc_leases` finalize leases in `seafhttp`.
+- Corrected a false claim that `Dockerfile.gotest` bakes `-timeout 5m`; the 5m is
+  in `scripts/test.sh` and the compose service already uses 10m.
+- Added a physical key parsing inventory and a `proposed_epoch` rule for
+  materializer uses.
 
 ---
 

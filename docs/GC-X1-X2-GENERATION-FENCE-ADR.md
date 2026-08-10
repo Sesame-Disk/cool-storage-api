@@ -2,7 +2,7 @@
 
 **Status:** Proposed design; implementation not started
 
-**Date:** 2026-08-07
+**Date:** 2026-08-07 · **Last updated:** 2026-08-10
 
 **Audit baseline:** `main` at `186d7800d`
 
@@ -343,10 +343,29 @@ remove the row and create a fresh candidate.
 
 ### `RETIRED`
 
-`RETIRED` means the GC has globally confirmed zero pin rows and zero generation-bound
-references, including provisional and permanent references. G2 may now be
+`RETIRED` means the GC has globally confirmed, at `EACH_QUORUM`, zero
+generation-bound references and zero use rows of any kind, including writer pins in
+both `PENDING` and `AUTHORIZED` state and materializer uses. G2 may now be
 materialized. G1 remains addressable by its own identity until its delete is
 complete.
+
+The guarantee is about authority, not about row absence. The protocol cannot
+prevent a use row from appearing after the final read: a writer may have observed
+`ACTIVE` before the fence and insert its `PENDING` row afterwards. That is safe and
+does not invalidate `RETIRED`, because the writer's revalidation is ordered after
+its own insert and will observe `RETIRING` or later, so the row can never be
+promoted to `AUTHORIZED`.
+
+The correct statement is therefore:
+
+```text
+RETIRED means no use row observed at the final global read could ever
+acquire authority, and no reference existed.
+```
+
+An implementation must not read `RETIRED` as "no use row can exist from now on" and
+must not build a drain loop that waits for that property. It is unachievable
+without an admission LWT, which this design deliberately does not add.
 
 ### `DELETING`
 
@@ -503,16 +522,20 @@ AND active_state = RETIRED
 AND active_epoch = E1
 ```
 
-This CAS may run inline in the request that materialized G2. It is one cold-path
-lifecycle transition per rematerialization, not a new LWT per reference, reuse, or
-dedup hit, so it does not violate the hot-path constraint.
+This CAS may run inline in the request that materialized G2. Each materializing
+request makes at most one activation attempt, and exactly one attempt wins.
+Concurrent rematerializers of the same retired block each issue an attempt, so the
+attempt count is bounded by concurrent writers of that one block, not by request
+volume. It is not a new LWT per reference, reuse, or dedup hit.
 
 Inline activation is preferred over deferring to a background worker. Deferring
 would leave a request that has already completed a correct PUT unable to finish:
 it would return a retryable error and wait for a periodic worker, and a client
 retry in the meantime would materialize further losing generations and objects.
-The cost of avoiding that is one Paxos round on a path that only executes when a
-previously retired SHA comes back to life.
+Deferring does not remove the WAN dependency either — during a DC outage the upload
+cannot complete under either design, because it cannot publish a reference to a
+generation that is not active. It only moves where the failure surfaces and adds a
+worker interval to it.
 
 Losing the CAS is an ordinary outcome and needs no coordination:
 
@@ -533,18 +556,42 @@ A background allocator may still exist to repair generations whose materializer
 crashed between a verified PUT and activation. That is recovery work, not the
 normal path.
 
+### Ambiguous Activation Outcome
+
+A timeout or driver-level error on the activation CAS does not mean the CAS was
+not applied. The request must not assume it won or lost. It retains `G2`, `K2`, and
+its materializer use, then reconciles against the authoritative `blocks` row:
+
+| Observed authoritative state | Action |
+|---|---|
+| `active_generation_id = G2` and `active_epoch = E2` | The CAS applied; publish the reference and release the use |
+| A different generation is active | Lost the race; make `K2` an exact orphan and release the use |
+| Still `G1` / `RETIRED` / `E1` | Not applied; the same attempt may be retried idempotently |
+| Read uncertain or a DC is unavailable | Retain `G2`, `K2`, and the use; retry later. Never orphan and never delete on an uncertain read |
+
+This generalizes to every destructive or lifecycle LWT in this design: an ambiguous
+result is reconciled against authoritative state, never guessed. Treating a timeout
+as "not applied" is the failure mode that produces both double activation and
+premature orphan cleanup.
+
 ### Ambiguous Pin Creation
 
-If pin creation or authorization returns a timeout or ambiguous Cassandra error:
+Pin creation and pin authorization are two different writes with two different
+ambiguity contracts. Conflating them is itself a bug: requiring `AUTHORIZED` to
+confirm an ambiguous `PENDING` insert would abort a pin that landed correctly.
 
-- the writer has no authority;
-- it must confirm the exact `use_id` with `LOCAL_QUORUM`;
-- it may retry the idempotent insert with the same identity;
-- it must abort if confirmation still fails;
-- it must not perform an S3 operation based on an assumption that the pin exists.
+**Ambiguous `PENDING` insert.** The writer confirms that the row exists with the
+expected identity:
 
-Confirmation must read the full authority tuple, not merely the existence of the
-row:
+```text
+use_id + generation_id + epoch + state in {PENDING, AUTHORIZED}
+```
+
+It may retry the idempotent insert with the same `use_id`. Success here grants no
+authority; the writer still has to revalidate and authorize. It must not perform
+any S3 operation yet.
+
+**Ambiguous authorization.** The writer confirms the full authority tuple:
 
 ```text
 use_id + generation_id + epoch + state=AUTHORIZED + authority_deadline
@@ -553,6 +600,17 @@ use_id + generation_id + epoch + state=AUTHORIZED + authority_deadline
 A row that exists in `PENDING` is not authority. Treating "the `use_id` row is
 present" as success would let an ambiguous authorization be read as a granted one,
 which is exactly the failure the `PENDING`/`AUTHORIZED` split exists to prevent.
+
+**Ambiguous materializer use.** The materializer's intent and its `AUTHORIZED` use
+are persisted together in step 3, before the PUT. If that write is ambiguous the
+materializer has no authority and must confirm the use with `LOCAL_QUORUM` before
+proceeding. It must not PUT, and must not activate, on the assumption that the use
+landed. A materializer that PUTs and activates without a confirmed use recreates
+the exact hole this design closes: a generation that is `ACTIVE` with no reference
+and no use is indistinguishable from garbage, and the GC will delete `K`.
+
+In every case: abort if confirmation still fails, and never perform an S3 operation
+based on an assumption that a use row exists.
 
 ### Pin Authority
 
@@ -597,6 +655,7 @@ for a generation transition:
 | `DELETING` | fail/retry; never repair or reuse that generation |
 | `DELETED` | re-probe the logical block and allocate a new generation if needed |
 | Cassandra state uncertainty | fail closed with a bounded retry budget |
+| A DC is unavailable and the block needs rematerialization | retryable failure; the activation CAS cannot reach global agreement, so the upload cannot complete. Deduplication against an already-`ACTIVE` generation is unaffected and stays regional |
 
 The exact HTTP/status mapping is an implementation decision for PR-4, but every
 funnel must expose the same retryable error contract. A provisional reference with
@@ -646,16 +705,59 @@ which generation is active. `block_generations.state=MATERIALIZING` is never
 sufficient to authorize deletion. Recovery always consults the `blocks` pointer
 first and repairs the mirror if the pointer already selects G.
 
+### Retirement Handoff
+
+The `blocks` row is the linearization point only while G is the active generation.
+Once G2 overwrites `active_generation_id`, that row no longer records anything
+about G1 — including the fact that G1 ever reached `RETIRED`. A delete of `K1` is
+authorized by that fact, so the evidence must outlive the pointer.
+
+The required order is therefore:
+
+```text
+1. global zero check for G1                       EACH_QUORUM
+2. persist G1 RETIRED + recovery state
+   in block_generations(G1)                       EACH_QUORUM
+3. CAS blocks RETIRING -> RETIRED                 SERIAL + EACH_QUORUM
+4. only now may a G2 activation CAS be accepted
+```
+
+Without step 2 before step 4 there is a losing interleaving: the global check
+passes, `blocks` says `G1 RETIRED`, the worker crashes, G2 activates and
+overwrites the pointer, and `block_generations(G1)` still says `RETIRING`. The
+only durable proof that G1 was legitimately retired is gone, and no worker can
+safely authorize deleting `K1` afterwards.
+
+This needs no cross-table transaction. It needs an ordering rule and a
+reconciliation rule:
+
+| `blocks` view of G1 | `block_generations(G1)` | Recovery action |
+|---|---|---|
+| Pointer still selects G1, state `RETIRED` | `RETIRED` | Consistent; proceed to `DELETING` |
+| Pointer still selects G1, state `RETIRED` | `RETIRING` | Step 2 was lost; re-run the global zero check before persisting `RETIRED` |
+| Pointer selects G2 | `RETIRED` | Consistent; G1 may proceed to `DELETING` |
+| Pointer selects G2 | `RETIRING` or earlier | Fail closed. Never delete `K1`; the retirement evidence is unreconstructable and G1 must be quarantined for operator review |
+| Either read uncertain | any | Preserve and retry |
+
+The fail-closed row is the point of the rule: a generation whose retirement cannot
+be proven is retained forever rather than deleted on inference.
+
 Crash rules:
 
 | Situation | Recovery action |
 |---|---|
 | Intent before PUT | Expire intent after its deadline; no object exists to delete |
-| PUT before activation CAS | Consult active pointer; if not selected, clean exact K as orphan |
+| Use write ambiguous before PUT | No authority; confirm the use before any S3 operation |
+| PUT before activation CAS | Consult active pointer; if not selected, clean exact K as orphan only after confirming no references and no live uses |
+| Activation CAS ambiguous | Reconcile per Ambiguous Activation Outcome; never orphan or delete on an uncertain read |
 | Active pointer selects G but generation mirror says MATERIALIZING | Complete/repair `ACTIVE`; never delete K |
-| Active pointer selects another G | G lost the activation race; clean K only after confirming no references/pins |
-| No active pointer and intent expired | Clean exact K after fail-closed confirmation |
+| Active pointer selects another G | G lost the activation race; clean K only after confirming no references and no live uses |
+| No active pointer and intent expired | Clean exact K after fail-closed confirmation, including use absence |
 | Any uncertain read | Preserve G/K and retry |
+
+Every cleanup branch requires confirming the absence of **use rows**, not only of
+references. A materializer holds a use and no reference for its entire dangerous
+window, so a recovery worker that checks references alone will delete a live key.
 
 The physical PUT must be verifiable before activation. A reader must never infer
 that a generation is active merely because a materialization intent exists.
@@ -731,9 +833,20 @@ until the writer's authority window and write margin have ended.
 Recovery must scan `block_generations` for:
 
 - expired `MATERIALIZING` intents;
+- generations whose materializer use expired without a published reference;
+- generations that are `ACTIVE` with no reference and no live use, which indicates
+  a materializer that died after activation and must be re-examined rather than
+  assumed garbage;
+- `RETIRED` in `blocks` without `RETIRED` persisted in `block_generations`, per the
+  retirement handoff reconciliation table;
 - `DELETING` generations with no orphan row;
 - `DELETING` generations with an orphan row in `pending_s3`;
 - generations whose S3 delete completed but metadata cleanup did not.
+
+No recovery branch may release a use row and clean its key in the same pass
+without first confirming, at `EACH_QUORUM`, that the use is genuinely expired and
+that no reference was published. Releasing a use and deleting its key on the basis
+of a single local read is the recovery-side form of the materializer hole.
 
 The exact recovery identity is always:
 
@@ -821,6 +934,7 @@ block_generation_uses
     use_id
     state                 -- PENDING or AUTHORIZED
     kind                  -- WRITER or MATERIALIZER
+    epoch                 -- observed epoch (WRITER) or proposed epoch (MATERIALIZER)
     authority_deadline
     retention_expires_at
     operation_id
@@ -831,6 +945,14 @@ A materializer use is created in `AUTHORIZED` state together with the
 promoted to `AUTHORIZED` only after the active pointer is revalidated. Both kinds
 are drained identically by the GC; the distinction exists for recovery, which must
 know whether an abandoned use also implies an abandoned materialization.
+
+The `epoch` column carries different meanings by kind, and an implementation must
+not validate them the same way. A writer use records the epoch it *observed* on the
+active pointer, so validation compares it against the current pointer. A
+materializer use is `AUTHORIZED` before the pointer carries its epoch at all, so it
+records the epoch it *proposes* to install; it becomes comparable to the pointer
+only after its activation CAS wins. Validating a materializer use against the
+current pointer epoch before activation would reject every materializer.
 
 ```text
 block_generation_references
@@ -874,8 +996,11 @@ The following current paths must be addressed by implementation PRs:
   be written as "exactly one LWT per upload". The existing baseline includes
   `internal/db/block_references.go:203-231,235-245` (released-stub repair claim and
   deletes), `:252-268` (`sha1` and `representation_id` backfill CAS),
-  `:1086` (GC claim transition), `internal/db/block_upload_sessions.go:157,180,243`
-  (session slot acquire/release/commit), `internal/api/sync.go:3346` and
+  `:1082-1088` (`ReleaseBlockDeleteClaim`, a GC claim release),
+  `internal/db/block_upload_sessions.go:157,180,243` (session slot
+  acquire/release/commit), `internal/api/seafhttp.go:1890-1910` (three `gc_leases`
+  LWTs acquiring, renewing, and releasing the upload-metadata finalize lease, which
+  is squarely on the upload path), `internal/api/sync.go:3346` and
   `internal/api/v2/fs_helpers.go:647` (head-commit promotion), and
   `internal/db/file_locks.go`. These are outside this ADR's scope; the fence must
   simply not add to them on the per-block hot path.
@@ -1032,6 +1157,18 @@ Required cases include:
   documented retryable result;
 - ambiguous authorization confirmed only by `use_id` existence is rejected; the
   full tuple including `state=AUTHORIZED` and epoch is required;
+- an ambiguous `PENDING` insert is confirmed by identity and is *not* rejected for
+  lacking `AUTHORIZED`;
+- an ambiguous materializer use aborts before PUT rather than proceeding;
+- an ambiguous activation CAS reconciles against the authoritative `blocks` row and
+  never orphans or deletes on an uncertain read;
+- a lost step-2 retirement persist is detected and the global zero check re-runs;
+- a generation whose retirement evidence is unreconstructable is quarantined, never
+  deleted;
+- a late `PENDING` use inserted after the final global read can never reach
+  `AUTHORIZED`;
+- a materializer use is not rejected for carrying a proposed epoch the active
+  pointer does not yet hold;
 - a materializer holds an `AUTHORIZED` use across PUT, activation, and publication;
 - a generation that is `ACTIVE` with zero references but a live materializer use is
   never retired to deletion;
@@ -1071,6 +1208,12 @@ Required scenarios:
   it can retire G2;
 - two concurrent rematerializers in different DCs produce exactly one winner and
   one exact orphan;
+- an activation CAS that times out but applied is reconciled as a win, not retried
+  into a second generation;
+- a crash between the G1 retirement persist and the pointer CAS is recovered by
+  re-running the global zero check;
+- a crash between the pointer CAS and the retirement persist, followed by G2
+  activation, quarantines G1 instead of deleting `K1`;
 - an authorized writer publishes after `ACTIVE -> RETIRING` without requiring an
   atomic state/reference transaction;
 - a provisional `up:`/`pub:` reference causes `RETIRING -> ACTIVE` rather than a
@@ -1108,11 +1251,13 @@ docker compose --profile test run --rm go-integration-test go test -tags integra
 ./scripts/run-mr-cluster.sh status
 ```
 
-`Dockerfile.gotest` currently bakes `-timeout 5m` into the integration `CMD`. The
-explicit `-timeout 10m` above overrides it deliberately: use drains, claim-deadline
-takeover, and DC-outage scenarios are wall-clock bound and do not fit the current
-default. PR-8 must either raise the baked default or keep passing the flag
-explicitly, and must not leave the divergence unexplained.
+The integration timeout is not uniform today. `Dockerfile.gotest` sets no timeout
+at all (`CMD ["go", "test", "./..."]`); the `go-integration-test` service in
+`docker-compose.yaml` already passes `-timeout 10m`; and `scripts/test.sh:802,821`
+uses `-timeout 5m` on its local path. Use drains, claim-deadline takeover, and
+DC-outage scenarios are wall-clock bound and do not fit a 5-minute budget, so PR-8
+must raise the `scripts/test.sh` path to match the compose service rather than let
+the same suite time out differently depending on how it is invoked.
 
 The multi-DC harness must run with the generation-fence test profile and
 `CASSANDRA_SERIAL_CONSISTENCY=SERIAL`, pinned to Cassandra `5.0.6`; the existing
@@ -1191,8 +1336,16 @@ X2 is closed only when:
 - every materializer persists a durable materialization lease and an `AUTHORIZED`
   materializer use before PUT, and holds it until its reference is published;
 - no generation can be used by any in-flight operation without a visible use row;
-- ambiguous pin writes grant no authority, and confirmation checks the full
-  authority tuple rather than row existence;
+- ambiguous pin writes grant no authority, and confirmation checks the contract
+  appropriate to the write: identity for a `PENDING` insert, the full authority
+  tuple for an authorization, and confirmed existence for a materializer use;
+- every ambiguous lifecycle LWT reconciles against authoritative state rather than
+  assuming it was not applied;
+- G1 retirement is durably persisted in `block_generations` before any G2
+  activation may be accepted, and an unprovable retirement quarantines rather than
+  deletes;
+- every recovery cleanup branch confirms the absence of use rows, not only of
+  references;
 - expired authority cannot publish;
 - pins and ordinary references remain `LOCAL_QUORUM`;
 - retire, drain, final refs, and deleting use the required global levels;
@@ -1291,6 +1444,28 @@ reintroduce rejected designs:
 26. The headline "writers are regional" applies to the operations this fence adds.
     A first upload of new content already pays global Paxos because production sets
     `serial_consistency: SERIAL`.
+27. An ambiguous LWT outcome is reconciled against authoritative state, never
+    guessed. A timeout does not mean "not applied". This applies to the activation
+    CAS and to every lifecycle transition.
+28. G1 retirement must be durably persisted in `block_generations` before G2 may
+    overwrite the active pointer. Once G2 owns the pointer, `blocks` no longer
+    holds any evidence that G1 was retired, and a delete of `K1` rests on that
+    evidence. An unprovable retirement quarantines; it never deletes.
+29. `RETIRED` is a statement about authority, not about row absence. A late
+    `PENDING` use may appear after the final global read; it is harmless because
+    its own revalidation is ordered after its insert and will observe the fence.
+    Do not write a drain loop that waits for "no use row can exist".
+30. Ambiguous `PENDING` insert and ambiguous authorization have different
+    confirmation contracts. Requiring `state=AUTHORIZED` to confirm a `PENDING`
+    insert would abort a pin that landed correctly.
+31. Recovery cleanup must confirm the absence of use rows, not only references. A
+    materializer holds a use and no reference for its whole dangerous window.
+32. Activation is "at most one attempt per materializing request, exactly one
+    winner", not "exactly one CAS per rematerialization"; concurrent
+    rematerializers each attempt once.
+33. A `MATERIALIZER` use carries a *proposed* epoch, not an observed one, because
+    it is `AUTHORIZED` before the pointer holds that epoch. Validating it like a
+    `WRITER` use would reject every materializer.
 
 ## Related Documents
 
