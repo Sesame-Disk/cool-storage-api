@@ -8,6 +8,56 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-10 - X1/X2 fence ADR: topology gate, publication frontier, retirement evidence
+
+Design-document changes only. Nothing described here is implemented, no runtime
+code changed, X1/X2 remain open, and destructive GC remains disabled fleet-wide.
+
+Second audit pass against the code and against the Cassandra 5.0.6 source. Every
+file:line citation in the ADR was re-verified and none needed correcting; the
+findings below are design and specification gaps, not bad evidence.
+
+- Made `NetworkTopologyStrategy` a verified startup requirement rather than an
+  assumption. Under any other strategy an `EACH_QUORUM` **read** degrades silently
+  to an ordinary quorum (`ReplicaPlans.contactForRead` only routes to
+  `contactForEachQuorumRead` for NTS), which is exactly the guarantee X2 rejects,
+  while the LWT commit fails loudly. `docker-compose.prod.yml:174,182` still
+  supports `SimpleStrategy`, so the silent half was reachable.
+- Specified that the global zero check reads uses **before** references, and why:
+  with references read first, a writer holding an `AUTHORIZED` use can publish and
+  release between the two reads and both return zero. The decision order is
+  deliberately the opposite and must not be used to justify reordering the reads.
+- Named the publication frontier as an invariant — zero uses then zero references
+  proves no operation can still acquire authority to publish — so PR-6 neither
+  inserts a redundant global check between the retirement persist and the pointer
+  CAS nor relaxes the publish/release ordering that makes it true.
+- Stopped `RETIRING` from being a parking state. A single abandoned pin previously
+  made a block unwritable for its whole `retention_expires_at` window, the same
+  availability failure the ADR already rejects for provisional references. A
+  generation whose remaining uses have all expired their authority now returns to
+  `ACTIVE`.
+- Added the missing `pointer=RETIRING` + `generation=RETIRE_PREPARED` reconciliation
+  rows, and the invariant that the generation row alone never authorizes
+  `DELETING`. Introduced `RETIRE_PREPARED` so the two tables never simultaneously
+  assert semantically different things.
+- Made retirement evidence epoch-scoped. A generation can travel
+  `RETIRING -> ACTIVE -> RETIRING`, so bare evidence may be from a cycle that was
+  later reactivated; it now carries the claim id and epoch that produced it.
+- Documented that a `blocks` row can exist without ever having been activated:
+  `ClaimBlockDelete`'s `IF gc_state != 'deleting'` applies against a missing row and
+  creates a released stub. "Row exists implies active pointer" is false, and a
+  materializer reading a non-applied first-writer LWT as a lost race would loop.
+- Specified epoch allocation, which states live on the pointer versus the
+  generation row, why confirming the pin is not a redundant round trip, the
+  provisional-reference TTL as an upload-to-commit bound, the removal rather than
+  coexistence of `block_references`, `(expiry_day, bucket)` partitioning for the
+  expiry projection, and the no-unconditional-writes rule for pointer columns.
+- Corrected all eight sites still saying "exactly one CAS per rematerialization",
+  including the X2 acceptance criterion, which a correct implementation with two
+  concurrent rematerializers could not satisfy.
+
+---
+
 ## 2026-08-10 - X1/X2 fence ADR: materializer authority, crash and ambiguity protocols
 
 Design-document changes only. Nothing described here is implemented, no runtime
