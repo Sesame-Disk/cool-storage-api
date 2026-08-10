@@ -6,13 +6,16 @@
 
 **Audit baseline:** `main` at `186d7800d`
 
-**Target engine:** Cassandra 5.0.x, including the `cassandra:5.0` Compose images
+**Target engine:** Cassandra 5.0.6. A floating `cassandra:5.0` image is not
+sufficient evidence for the acceptance test.
 
 **Deployment model:** greenfield; no legacy block rows, objects, or production data
 
 **Scope:** close `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1) and
-`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` (X2) without adding Paxos to ordinary
-references or normal deduplication.
+`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` (X2) without adding Paxos to the
+writer hot path. The one existing terminal first-writer LWT per upload remains
+the only upload-path Paxos; pins, revalidation, references, reuse, and dedup add
+no LWT.
 
 **Operational gate:** keep `GC_ENABLED=false` on every replica in every DC until the
 acceptance criteria in this document are implemented and verified.
@@ -39,8 +42,9 @@ closed until code and verification satisfy this ADR.
 
 Use two independent safety mechanisms:
 
-1. **X2:** keep writers regional and fast with `LOCAL_QUORUM`; move global
-   coordination into the cold destructive-GC path using `EACH_QUORUM`.
+1. **X2:** keep writers regional and fast with `LOCAL_QUORUM`; retain only the
+   existing terminal first-writer LWT and move new global coordination into the
+   background destructive-GC path using `EACH_QUORUM`.
 2. **X1:** give every new physical lifecycle a never-reused UUID generation and
    immutable physical `storage_key`, so a delayed delete can target only the old
    generation.
@@ -49,6 +53,7 @@ The core protocol is:
 
 ```text
 writer: read G -> pin G -> confirm/revalidate G -> use K -> publish ref -> remove pin
+        (no new LWT; one existing terminal first-writer LWT only when registering)
 
 GC: candidate -> RETIRING -> drain pins -> global refs check
     -> ACTIVE or RETIRED -> DELETING -> persist recovery -> DELETE exact K
@@ -58,33 +63,44 @@ The following statements are part of the contract:
 
 - A pin is not a permanent liveness reference.
 - Finding a pin during `RETIRING` does not justify `RETIRING -> ACTIVE`.
-- Only a confirmed permanent reference justifies returning to `ACTIVE`.
+- Any confirmed generation-bound reference, permanent or provisional, justifies
+  returning to `ACTIVE`; a pin alone does not.
 - A provisional `up:` or `pub:` reference prevents deletion but does not by itself
-  justify `RETIRING -> ACTIVE`; the generation remains fenced until the owning
-  operation resolves or expires safely.
+  represent writer authority; it is nevertheless sufficient to return the
+  generation to `ACTIVE` because reactivation is retention-safe and prevents a
+  dead publish attempt from parking a hot logical block for its full TTL.
 - A writer with an ambiguous pin write has no authority to use the generation.
 - A writer whose authority deadline has passed cannot publish a reference.
 - A generation cannot become `ACTIVE` until its physical object has been stored and verified.
 - `DELETING` is recoverable from the generation record even if the orphan projection was not written.
 - G2 is forbidden while G1 is `RETIRING` and is allowed only after G1 is `RETIRED`.
+- The upload path has no new Paxos operation beyond its existing terminal
+  first-writer LWT.
 
 ## Problem Statements
 
 ### X1: Physical-delete ABA
 
 The current physical key is derived from the logical content hash. A GC worker can
-authorize and start deleting `blocks/<org>/<hash>`, then a writer can rematerialize
-byte-identical content at the same key. The old delete can complete after the new
-write and remove live bytes.
+authorize and start deleting `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`, then a writer
+can rematerialize byte-identical content at the same key. The old delete can
+complete after the new write and remove live bytes.
 
 Cassandra claim state cannot revoke an S3 delete already in flight. ETag comparison
 does not distinguish the old and new lifecycle when the bytes are identical.
 
-X1 closes only when new lifecycles use keys that are never reused:
+The current layout is sharded by the first four hash characters:
 
 ```text
-G1 -> blocks/<org>/<hash>/<generation-1>
-G2 -> blocks/<org>/<hash>/<generation-2>
+blocks/<org_id>/<h0:2>/<h2:4>/<hash>
+```
+
+X1 closes only when new lifecycles preserve that layout and add a never-reused
+generation suffix:
+
+```text
+G1 -> blocks/<org_id>/<h0:2>/<h2:4>/<hash>.<generation-1>
+G2 -> blocks/<org_id>/<h0:2>/<h2:4>/<hash>.<generation-2>
 ```
 
 ### X2: Cross-DC reference visibility
@@ -101,14 +117,16 @@ The one-hour grace period is mitigation, not a correctness proof.
 - Cassandra uses `NetworkTopologyStrategy`.
 - Every writer connects to its local DC through a DC-aware driver policy.
 - Each configured DC has the expected replication factor.
-- The target engine is Cassandra 5.0.x. Cassandra 5.0.6 contains
+- The target engine is Cassandra 5.0.6. Cassandra 5.0.6 contains
   `eachQuorumForRead()` and permits `EACH_QUORUM` reads.
 - The current multi-region Compose cluster has two DCs, `usa` and `eu`, with RF 1
   per DC. Production reasoning must also work with higher RF per DC.
 - The deployment is greenfield. New objects do not need legacy deterministic-key
   compatibility or backfill.
 - Only designated replicas in one DC will run destructive GC after X1/X2 close.
-- The existing first-writer metadata LWT remains available for first materialization.
+- The existing terminal first-writer metadata LWT remains available for first
+  materialization and may initialize the first active pointer in that same LWT.
+  A separate activation LWT is forbidden in the writer path.
 
 The Cassandra 5.0.6 source used to resolve the read-level question is:
 
@@ -123,22 +141,25 @@ version must still be asserted by integration tests.
 | Operation | Required consistency |
 |---|---|
 | Initial writer generation read | `LOCAL_QUORUM` |
+| `MATERIALIZING` intent insert | `LOCAL_QUORUM` |
 | Pin insert | `LOCAL_QUORUM` |
 | Pin confirmation | `LOCAL_QUORUM` |
 | Generation revalidation | `LOCAL_QUORUM` |
 | Reuse, dedup, and normal metadata reads | `LOCAL_QUORUM` |
 | Provisional/permanent reference insert/delete | `LOCAL_QUORUM` |
 | GC discovery and candidate reads | `LOCAL_QUORUM` |
-| `ACTIVE -> RETIRING` | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` |
-| Pin drain | `EACH_QUORUM` |
+| Existing terminal first-writer metadata LWT (initial pointer only) | One existing upload-path LWT: `SERIAL` phase with the existing `LOCAL_QUORUM` writer commit level; no separate activation LWT |
+| Rematerialization `G1 RETIRED -> G2 ACTIVE` CAS (background allocator) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
+| `ACTIVE -> RETIRING` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
+| Pin-row drain, including `PENDING` and `AUTHORIZED` | `EACH_QUORUM` |
 | Final generation-reference check | `EACH_QUORUM` |
-| `RETIRING -> ACTIVE` | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` |
-| `RETIRING -> RETIRED` | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` |
-| `RETIRED -> DELETING` | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` |
-| `DELETING -> DELETED` | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` |
+| `RETIRING -> ACTIVE` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
+| `RETIRING -> RETIRED` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
+| `RETIRED -> DELETING` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the G1 generation row |
+| `DELETING -> DELETED` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the G1 generation row |
 
-The session default remains `LOCAL_QUORUM`. Critical LWT queries must explicitly
-set both levels rather than relying only on the driver default:
+The session default remains `LOCAL_QUORUM`. New critical background LWT queries
+must explicitly set both levels rather than relying only on the driver default:
 
 ```go
 query.Consistency(gocql.EachQuorum).
@@ -150,6 +171,16 @@ The current `internal/db/db.go:94-95` does explicitly assign
 `LOCAL_SERIAL` in the multi-region profiles, so the final X1/X2 test profile must
 use `SERIAL`. The global session configuration must not be changed to
 `EACH_QUORUM`.
+
+The existing terminal first-writer LWT retains its current writer-path consistency;
+the generation fence must not add a second LWT around it.
+
+The hot writer path must not add an `IF` mutation for pins, revalidation,
+references, reuse, deduplication, or activation. The existing terminal
+first-writer metadata LWT is the sole upload-path Paxos and may initialize the
+first active pointer in that same operation. G2 activation and all retirement or
+delete LWTs belong to the background GC/materialization allocator, never to a
+request handler.
 
 ### Why Local Writers And Global GC Are Safe
 
@@ -170,7 +201,10 @@ Since `W + R > RF`, the sets intersect in EU. With RF 1 per DC, both values are
 one and the intersection is the single EU replica. The global destructive read
 therefore sees a locally confirmed pin/reference from every DC that accepted one.
 
-This is why the protocol does not put WAN traffic or Paxos into each upload.
+This is why the protocol adds no WAN traffic or Paxos to pins, references, reuse,
+or deduplication. The one existing terminal first-writer LWT remains the accepted
+upload-path Paxos; all new global Paxos is confined to background GC/materialization
+work.
 
 ### `EACH_QUORUM` Versus `ALL`
 
@@ -208,11 +242,9 @@ separate immutable binding must record which generation was actually referenced.
 MATERIALIZING -> ACTIVE -> RETIRING
                               | \
                               |  \
-                              |   +-- permanent references found -> ACTIVE
+                              |   +-- generation-bound reference found -> ACTIVE
                               |
-                              +------ provisional references found -> RETIRING, resolve
-                              |
-                              +------ valid pins found -> RETIRING, drain
+                              +------ pin rows found -> RETIRING, drain
                               |
                               +------ error/DC unavailable -> RETIRING, retry
                               |
@@ -248,16 +280,21 @@ Required fields include:
 ### `RETIRING`
 
 `RETIRING` is a temporary GC fence. New writers cannot use G1 and cannot create G2.
-Existing writers with valid pins are allowed to finish or lose authority, but they
-must not be treated as proof that G1 is permanently live. A provisional `up:` or
-`pub:` row similarly blocks deletion, but the GC waits for its owner/expiry path
-instead of treating it as a permanent reference that reactivates G1.
+An existing writer whose pin was already authorized for G1 may finish and publish
+while G1 is `RETIRING`; the GC sees the pin and waits. A writer with a `PENDING`
+pin cannot publish until it revalidates while G1 is `ACTIVE`.
+
+A generation-bound `up:`, `pub:`, or `fs:` row found by the final global check
+returns G1 to `ACTIVE`. This is safe even when a provisional row is stale: the
+result is temporary retention, not deletion. The owner/expiry path can later
+remove the row and create a fresh candidate.
 
 ### `RETIRED`
 
-`RETIRED` means the GC has globally confirmed zero pins and zero permanent
-references. G2 may now be materialized. G1 remains addressable by its own identity
-until its delete is complete.
+`RETIRED` means the GC has globally confirmed zero pin rows and zero generation-bound
+references, including provisional and permanent references. G2 may now be
+materialized. G1 remains addressable by its own identity until its delete is
+complete.
 
 ### `DELETING`
 
@@ -282,6 +319,9 @@ its conditional transition.
 
 The same ownership rule applies to `DELETING`. The physical delete must be tied to
 the generation and claim that authorized it, not merely to a logical block ID.
+The claim epoch/lease can prevent stale Cassandra transitions; it cannot revoke an
+S3 `DELETE K` request that has already left the process. That is intentional and is
+safe only because K is never reused: a late delete of K1 cannot affect K2.
 
 ## Writer Protocol
 
@@ -311,50 +351,79 @@ than hiding the writer lifetime behind `context.Background()`.
 ### Existing Active Generation
 
 ```text
-1. Read active G                                  LOCAL_QUORUM
-2. Insert pin(G)                                  LOCAL_QUORUM
-3. Confirm pin(G) using the same use_id             LOCAL_QUORUM
-4. Re-read G and its state                         LOCAL_QUORUM
-5. Require state=ACTIVE and a valid authority deadline
+1. Read active G and epoch                         LOCAL_QUORUM
+2. Insert pin(G, epoch, PENDING)                  LOCAL_QUORUM
+3. Confirm pin(G) using the same use_id            LOCAL_QUORUM
+4. Re-read the active pointer                     LOCAL_QUORUM
+5. If G/epoch is still ACTIVE, authorize the pin
 6. Reuse K or PUT/repair K
-7. Revalidate pin, deadline, state, and exact G
-8. Publish the generation-bound reference        LOCAL_QUORUM
+7. Validate AUTHORIZED pin, deadline, and epoch
+8. Publish the generation-bound reference         LOCAL_QUORUM
 9. Confirm an ambiguous reference result
-10. Remove pin(G)                                 LOCAL_QUORUM
+10. Remove pin(G, use_id)                          LOCAL_QUORUM
 ```
 
-No physical operation is permitted before step 5.
+The pin becomes `AUTHORIZED` only after step 5. A writer that observes
+`RETIRING`, `RETIRED`, `DELETING`, or a different generation at revalidation has no
+authority and must not perform a physical operation.
+
+After authorization, the writer may finish while the pointer state changes from
+`ACTIVE` to `RETIRING`. The publish helper must therefore validate the authorized
+pin's generation and epoch, deadline, and existence; it must not reject solely
+because the current pointer state is now `RETIRING`. It must reject `RETIRED`,
+`DELETING`, `DELETED`, a different active generation, or a missing/expired pin.
+
+No physical operation is permitted before pin authorization.
+
+Reuse or repair of K is permitted only while its generation is `ACTIVE` or
+`RETIRING` and the writer holds an authorized pin. A generation that has reached
+`RETIRED` or `DELETING` is never repaired or reused; any new materialization gets a
+new UUID and a new key.
 
 ### First Materialization Or Rematerialization
 
 ```text
 1. Observe no usable active generation
 2. Generate UUID G and exact K
-3. Persist MATERIALIZING intent/pin                LOCAL_QUORUM
+3. Persist MATERIALIZING intent/lease              LOCAL_QUORUM
 4. PUT K
 5. Verify K exists and has the expected metadata
-6. Activate through the first-writer/activation CAS
-7. If the CAS wins, mark/complete ACTIVE
-8. If the CAS loses, do not publish a reference
+6. Complete the existing terminal first-writer LWT once
+7. If it initializes the pointer, mark/complete ACTIVE
+8. If another writer won, do not publish a reference
 9. Preserve losing K as an orphan for exact cleanup
 ```
 
-For the first logical life, the activation is equivalent to the existing
-`INSERT ... IF NOT EXISTS`. For rematerialization, the row already exists and the
-activation is an update conditional on the old generation:
+For the first logical life, the existing terminal `INSERT ... IF NOT EXISTS` is
+the one allowed upload-path LWT. It occurs only after the verified PUT and must set
+the initial active pointer in that same operation; implementation must not add a
+second activation LWT. For rematerialization, the logical row already exists and
+the background materialization allocator performs an update conditional on the old
+generation:
 
 ```text
-UPDATE active_generation = G2
-WHERE logical_block_id = L
-IF active_generation = G1
-AND generation_state = RETIRED
+UPDATE blocks
+SET active_generation_id = G2,
+    active_storage_key = K2,
+    active_storage_class = C2,
+    active_state = ACTIVE,
+    active_epoch = E2
+WHERE org_id = O
+AND block_id = L
+IF active_generation_id = G1
+AND active_state = RETIRED
+AND active_epoch = E1
 ```
 
-This remains one activation LWT, not a new LWT per reference or dedup hit.
+The rematerialization CAS is background work, not a request-handler operation. It
+is one cold-path state transition and is not a new LWT per reference, reuse, or
+dedup hit. A writer that observes `RETIRED` may create the materialization intent
+and exact object through ordinary local operations, but it must hand activation to
+the background allocator rather than issue this CAS itself.
 
 ### Ambiguous Pin Creation
 
-If pin creation returns a timeout or ambiguous Cassandra error:
+If pin creation or authorization returns a timeout or ambiguous Cassandra error:
 
 - the writer has no authority;
 - it must confirm the exact `use_id` with `LOCAL_QUORUM`;
@@ -383,27 +452,73 @@ The central publish helper must reject a writer when:
 - the pin is absent or belongs to another operation;
 - the generation ID does not match;
 - the authority deadline has passed;
-- the generation is no longer `ACTIVE`;
+- the generation is `RETIRED`, `DELETING`, or `DELETED`;
+- the active generation/epoch no longer matches the authorized pin;
+- the pin is not `AUTHORIZED`;
 - the request context has expired;
 - the reference result cannot be safely classified.
 
 The helper may remove a pin only after successful reference confirmation. An
 ambiguous reference result leaves the pin for retry/recovery.
 
+### Writer Behavior For Non-Active States
+
+Every writer path needs a bounded retry contract; it must never wait indefinitely
+for a generation transition:
+
+| Observed state | Writer behavior |
+|---|---|
+| `MATERIALIZING` owned by another operation | bounded poll/backoff, then retryable failure |
+| `RETIRING` | bounded poll/backoff; no G2 allocation; retryable failure with `Retry-After` when the budget ends |
+| `RETIRED` | allocate a new UUID generation and begin materialization; hand activation to the background allocator, never issue the G2 CAS in the request |
+| `DELETING` | fail/retry; never repair or reuse that generation |
+| `DELETED` | re-probe the logical block and allocate a new generation if needed |
+| Cassandra state uncertainty | fail closed with a bounded retry budget |
+
+The exact HTTP/status mapping is an implementation decision for PR-4, but every
+funnel must expose the same retryable error contract. A provisional reference with
+a long TTL must not create a long writer stall: the GC reactivates the generation
+when it sees that reference. Pin retention is independently bounded by the writer
+authority lifetime.
+
 ## First Materialization And Active-Pointer Authority
 
 The design must not have two independent sources that can disagree about which
-generation won.
+generation won. Cassandra cannot perform a conditional update atomically across
+`blocks` and `block_generations`.
 
-Recommended authority split:
+The single linearization point is the logical `blocks` row. It contains:
 
-- The logical `blocks` active pointer is authoritative for which generation is
-  currently active.
-- `block_generations` is authoritative for immutable generation identity, exact
-  key, lifecycle state, and recovery data.
-- `block_generations.state=MATERIALIZING` is never sufficient to authorize deletion.
-- Recovery must always consult the active pointer before cleaning a materializing
-  generation.
+```text
+active_generation_id
+active_storage_key
+active_storage_class
+active_state
+active_epoch
+retire_claim_id
+retire_claim_epoch
+retire_claim_deadline
+```
+
+All conditional active-pointer transitions occur through LWTs on that same row
+in the background allocator:
+
+```text
+ACTIVE -> RETIRING
+RETIRING -> ACTIVE
+RETIRING -> RETIRED
+RETIRED G1 -> ACTIVE G2
+```
+
+The sole exception is initial pointer creation: the existing terminal
+first-writer metadata LWT may initialize it in the same operation that registers
+the new block. No separate writer-path activation LWT is permitted.
+
+`block_generations` stores immutable physical identity, historical lifecycle,
+claim/recovery data, and mirror state. It is not a second authority for deciding
+which generation is active. `block_generations.state=MATERIALIZING` is never
+sufficient to authorize deletion. Recovery always consults the `blocks` pointer
+first and repairs the mirror if the pointer already selects G.
 
 Crash rules:
 
@@ -453,11 +568,12 @@ Generation identity must flow through:
 ```text
 1. Discover candidate                              LOCAL_QUORUM
 2. ACTIVE G1 -> RETIRING                           SERIAL + EACH_QUORUM
-3. Drain valid pins for G1                        EACH_QUORUM
+3. Drain all pin rows for G1                      EACH_QUORUM
 4. Read all refs bound to G1                      EACH_QUORUM
 5. If pins remain, keep RETIRING and retry
-6. If permanent refs exist, RETIRING -> ACTIVE   SERIAL + EACH_QUORUM
-7. If provisional refs exist, remain RETIRING and resolve/await expiry
+6. If any generation-bound ref exists, RETIRING -> ACTIVE
+                                                   SERIAL + EACH_QUORUM
+7. If no ref exists but pin rows remain, remain RETIRING and drain
 8. If any read/error/DC failure, keep RETIRING and retry
 9. If pins=0 and refs=0 globally, G1 -> RETIRED  SERIAL + EACH_QUORUM
 10. Allow G2 only after G1 is RETIRED
@@ -468,7 +584,10 @@ Generation identity must flow through:
 ```
 
 The GC must not reactivate a generation merely because a pin exists. A pin can be
-an operation that was fenced during revalidation and will never publish.
+an operation that was fenced during revalidation and will never publish. The GC
+must drain every pin row, not only rows whose local deadline calculation currently
+labels them valid. The pin retention contract guarantees that the row remains
+visible until the writer's authority window and write margin have ended.
 
 ## Recovery Protocol
 
@@ -506,8 +625,16 @@ record supplies the recovery evidence.
 
 ## Proposed Schema
 
-Because the deployment is greenfield, the final generation-aware shape can be the
-baseline schema without legacy dual-read code.
+Greenfield means there is no data backfill or legacy dual-read requirement. It does
+not mean migration history can be rewritten. `internal/db/migrator.go:20-40,303-315`
+records checksums and refuses to boot when an applied migration changes.
+
+Therefore `001_initial_schema.cql` must remain immutable. The final shape must be
+introduced through one or more new numbered migrations after the current `013_`
+series, for example `014_gc_generation_fence.cql`. Incompatible primary keys must
+use new generation-aware tables; an `ALTER TABLE` cannot change an existing
+Cassandra primary key. A clean deployment runs all migrations from `001` through
+the new version, but no data backfill is required.
 
 ### Logical Active Pointer
 
@@ -521,6 +648,10 @@ active_generation_id
 active_storage_key
 active_storage_class
 active_state
+active_epoch
+retire_claim_id
+retire_claim_epoch
+retire_claim_deadline
 ```
 
 ### Generation History
@@ -530,7 +661,7 @@ block_generations
     org_id
     block_id
     generation_id
-    state
+    state                 -- mirror/history; not the active-pointer authority
     storage_key
     storage_class
     size_bytes
@@ -553,36 +684,50 @@ block_generation_uses
     block_id
     generation_id
     use_id
+    state                 -- PENDING or AUTHORIZED
     authority_deadline
     retention_expires_at
     operation_id
 ```
 
 ```text
-block_references
+block_generation_references
     org_id
     block_id
     generation_id
     referrer
+    expires_at            -- null for permanent references
     library_id
     created_at
 ```
 
 The primary key must partition by logical block and generation so the destructive
-check can read one generation globally without mixing G1 and G2.
+check can read one generation globally without mixing G1 and G2. The existing
+`block_references` primary key cannot be altered by migration; the new table is the
+generation-aware source for the greenfield implementation, with a reverse
+projection by referrer for cleanup.
+
+Every expiring `up:` and `pub:` reference also needs a durable expiry projection
+keyed by `(org_id, expiry_day, block_id, generation_id, referrer)`. The projection
+must cover `pub:` as well as `up:`; its scanner confirms the exact reference row's
+expiry before cleanup and candidate creation. A writer-owner callback is not a
+correctness requirement.
 
 ### GC State
 
 Candidates, provisional-expiry rows, queue items, failed items, and orphan rows all
 need `generation_id`. Orphans additionally need the immutable `storage_key`.
 
-The baseline schema must ensure that G1 and G2 cannot collide on a candidate,
-queue, orphan, or reference row.
+The `014+` schema must ensure that G1 and G2 cannot collide on a candidate, queue,
+orphan, or reference row.
 
 ## Current Code Evidence
 
 The following current paths must be addressed by implementation PRs:
 
+- `internal/db/block_references.go:159-171,546-560` contains the existing
+  terminal first-writer `INSERT ... IF NOT EXISTS`; it is the sole tolerated
+  upload-path Paxos and must not be duplicated by the generation fence.
 - `internal/db/block_references.go:814-935` implements `ProbeBlockReuse` without
   generation state and currently validates the content-addressed lifecycle.
 - `internal/db/block_references.go:941-977` implements ordinary reference writes and
@@ -606,8 +751,10 @@ The following current paths must be addressed by implementation PRs:
   reference checks, both through the local inherited consistency.
 - `internal/storage/blocks.go:75-171` writes by derived hash keys, although explicit
   key methods already exist for some operations.
-- `internal/streaming/canonical_block_reader.go:29-54,180-247` reads persisted
-  canonical locations but must stop assuming the key is always hash-derived.
+- `internal/streaming/canonical_block_reader.go:29-54,180-247` resolves persisted
+  canonical locations, while the current validation still rejects a persisted key
+  that differs from the hash-derived key; generation keys require replacing that
+  invariant with exact-key validation.
 - `internal/gc/worker.go:403-606` implements the current local claim-then-verify
   delete flow.
 - `internal/gc/worker.go:547-594` persists current orphan state before finalizing the
@@ -622,18 +769,26 @@ The following current paths must be addressed by implementation PRs:
   reference, candidate, and provisional tables whose keys omit generation.
 - `internal/db/migrations/001_initial_schema.cql:1113-1207` defines queue, DLQ, and
   pending-work identities that must distinguish G1 from G2.
-- `internal/db/migrations/001_initial_schema.cql:1239-1263` defines orphan tables
-  that currently do not preserve generation or exact storage key.
+- `internal/db/migrations/001_initial_schema.cql:1239-1263`,
+  `internal/db/migrations/007_gc_s3_orphan_mapping_recovery.cql`, and
+  `internal/db/migrations/009_block_representation_mappings.cql` define the current
+  orphan shape. Later migrations add `external_sha1`, `recovery_phase`, and
+  `representation_id`; none adds `generation_id` or an exact `storage_key`.
 - `docker-compose.mr-cluster.yaml:245-248,285-288` currently sets `LOCAL_SERIAL`
   and therefore is not final evidence for global LWT behavior.
+- `internal/db/migrator.go:20-40,303-315` makes migration files append-only after
+  application; the implementation must add `014+` migrations rather than editing
+  `001_initial_schema.cql`.
 
 Adjacent findings remain separate unless implementation deliberately closes them:
 
 - X3 (`ISSUE-UPLOAD-PUT-BEFORE-INTENT-01`) is a storage-leak/discovery issue. The
   durable `MATERIALIZING` intent proposed here can close it for covered writers,
   but the ADR does not claim X3 closed until every writer is verified.
-- X4 (per-block first-writer Paxos cost) remains a measurement/performance concern.
-  This design retains the existing first-writer LWT and does not add reference LWTs.
+- X4 (the existing terminal first-writer Paxos cost) remains a deferred finding
+  outside this ADR's scope and is tolerated as the current baseline. This design
+  retains that one upload-path LWT and adds no other writer-path Paxos; all new
+  lifecycle LWTs run in background GC/materialization workers.
 - X5, X6, X9, X10, and X11 remain separate audit work and are not activation proof
   for X1/X2.
 
@@ -668,8 +823,10 @@ context propagation and fail-closed behavior for all global reads/LWTs.
 ### PR-3: Generation Allocation And Materialization
 
 Generate UUID keys before PUT, persist durable `MATERIALIZING` intent, verify the
-object, activate through first-writer/activation CAS, and record losing objects for
-exact orphan cleanup.
+object, reuse the existing terminal first-writer LWT once for initial pointer
+creation, and record losing objects for exact orphan cleanup. Rematerialization
+activation is delegated to the background allocator; no additional writer-path
+LWT is allowed.
 
 ### PR-4: Writer Pin Integration
 
@@ -684,7 +841,7 @@ generation-aware without changing the logical `fs_object` content identity.
 ### PR-6: Retiring GC And Claim Leases
 
 Implement `RETIRING`, pin drain, global reference checks, claim epoch/deadline
-takeover, `RETIRED`, `DELETING`, and exact-key deletion.
+takeover, `RETIRED`, background G2 activation, `DELETING`, and exact-key deletion.
 
 ### PR-7: Recovery And Readers
 
@@ -703,22 +860,34 @@ tests. Keep `GC_ENABLED=false` until all acceptance checks pass.
 Required cases include:
 
 - ambiguous `BeginPin` never permits S3 use;
-- pin confirmation and revalidation race with `RETIRING`;
-- valid pin keeps a generation in `RETIRING` but does not reactivate it;
-- permanent reference reactivates a generation;
+- `PENDING` pin confirmation and revalidation race with `RETIRING`;
+- an `AUTHORIZED` pin can finish and publish while the pointer is `RETIRING`;
+- a `PENDING` pin cannot publish after observing `RETIRING`;
+- any generation-bound reference reactivates a generation;
+- pins alone never reactivate a generation;
+- provisional references do not create a full-retention-TTL availability stall;
 - deadline expiry rejects publication;
+- writers observing `RETIRING` stop after a bounded retry budget and return a
+  documented retryable result;
 - materializing generation whose active pointer is itself is completed, never deleted;
 - materializing generation that lost the CAS becomes an exact orphan;
 - `DELETING` with no orphan row is recovered from the generation record;
 - stale retire worker cannot transition after claim takeover;
 - G1 cleanup cannot remove G2 references, mappings, or objects;
 - no physical delete path accepts only logical `blockID`;
-- any global read error prevents deletion.
+- any global read error prevents deletion;
+- activation CAS cannot be satisfied by a condition spanning two Cassandra tables;
+- writer-path tracing shows exactly the existing terminal first-writer LWT and no
+  additional Paxos for pins, revalidation, references, reuse, or deduplication;
+- all pin rows, including rows whose authority expired but whose retention has not,
+  are drained.
 
 ### Cassandra Multi-DC Tests
 
-Use Cassandra 5.0 with `NetworkTopologyStrategy`, RF 1 per DC initially, and a
-test profile configured with `SERIAL`, not `LOCAL_SERIAL`.
+Use the pinned Cassandra `5.0.6` image with `NetworkTopologyStrategy`, RF 1 per DC
+initially, and a test profile configured with `SERIAL`, not `LOCAL_SERIAL`. The
+harness must query `SELECT release_version FROM system.local` and fail unless the
+expected engine version is present.
 
 Required scenarios:
 
@@ -726,7 +895,14 @@ Required scenarios:
   `EACH_QUORUM`;
 - same test in the reverse direction;
 - pin written in one DC and drained globally;
+- `PENDING` and `AUTHORIZED` pins are both included in the global drain;
 - `RETIRE` visibility through a later local writer read;
+- G2 activation LWT runs only in the background allocator, never in the request
+  handler;
+- an authorized writer publishes after `ACTIVE -> RETIRING` without requiring an
+  atomic state/reference transaction;
+- a provisional `up:`/`pub:` reference causes `RETIRING -> ACTIVE` rather than a
+  retention-length availability stall;
 - DC outage during retire, drain, final reference check, and deleting claim;
 - no physical delete after any global operation fails;
 - claim takeover after `retire_claim_deadline`;
@@ -746,19 +922,23 @@ For this docs-only branch:
 git diff --check
 ```
 
-For the later implementation and integration phases, the repository's Docker-first
-verification includes commands equivalent to:
+For the later implementation and integration phases, unit and integration tests
+must not be conflated. `-short` is for the fast unit path; it is not evidence for
+the real Cassandra tests. The repository's Docker-first verification includes:
 
 ```text
+./scripts/test.sh go
+./scripts/test.sh go-integration
 docker compose --profile test run --rm gotest go test ./internal/db ./internal/gc ./internal/api/v2 ./internal/streaming ./internal/storage -short
 docker compose --profile test run --rm gotest go test -race ./internal/db ./internal/gc ./internal/api/v2 ./internal/streaming ./internal/storage -short
+docker compose --profile test run --rm go-integration-test go test -tags integration -v -count=1 -timeout 10m ./internal/integration/...
 ./scripts/run-mr-cluster.sh up
 ./scripts/run-mr-cluster.sh status
 ```
 
 The multi-DC harness must run with the generation-fence test profile and
-`CASSANDRA_SERIAL_CONSISTENCY=SERIAL`; the existing replication script alone is
-not sufficient evidence.
+`CASSANDRA_SERIAL_CONSISTENCY=SERIAL`, pinned to Cassandra `5.0.6`; the existing
+replication script alone is not sufficient evidence.
 
 Also verify that:
 
@@ -795,19 +975,24 @@ is approximately:
 |---|---:|
 | ADR and complete writer audit | 2-3 engineer-days |
 | Schema, models, and consistency helpers | 4-7 engineer-days |
-| Materialization and first-writer/activation CAS | 5-8 engineer-days |
+| Materialization, existing first-writer integration, and background activation CAS | 5-8 engineer-days |
 | Pins, deadlines, and all writer funnels | 6-9 engineer-days |
 | Generation references and publish repair | 4-7 engineer-days |
 | Retiring GC, claims, and exact deletes | 6-9 engineer-days |
 | Recovery and readers | 4-7 engineer-days |
-| Tests, multi-DC drills, and rollout | 7-10 engineer-days |
+| Tests, multi-DC drills, and rollout | 8-12 engineer-days |
 
-Expected total: **38-60 engineer-days**, with the actual range refined after the
+Expected total: **40-65 engineer-days**, with the actual range refined after the
 writer inventory and first schema prototype.
 
-Hot-path cost is expected to be one local pin write, one local confirmation/read,
-and one local pin removal per block, with no new WAN round trip and no new Paxos per
-reference or ordinary dedup hit.
+The complete successful writer protocol has approximately five to six local
+Cassandra interactions per block when pin confirmation, active-pointer
+revalidation, authority validation, reference publication, and pin removal are
+counted. Existing probe/reference work may be reused or coalesced where the same
+query already supplies the observation, so the incremental cost must be measured
+against the current path; it must not be budgeted as only three round trips. The
+only upload-path Paxos is the existing terminal first-writer LWT; there is no new
+LWT for pins, revalidation, references, reuse, or ordinary deduplication.
 
 Cold-path cost is several global reads/LWTs per candidate and intentional dependence
 on the slowest participating DC. A DC outage causes retention rather than deletion.
@@ -821,14 +1006,23 @@ Temporary G1/G2 coexistence consumes additional storage only after G1 reaches
 
 X2 is closed only when:
 
-- every writer pins and revalidates before using a generation;
+- every writer using an existing generation pins and revalidates before using it;
+- every first materializer persists a durable materialization lease before PUT;
 - ambiguous pin writes grant no authority;
 - expired authority cannot publish;
 - pins and ordinary references remain `LOCAL_QUORUM`;
 - retire, drain, final refs, and deleting use the required global levels;
 - pins do not reactivate a generation;
-- permanent references can reactivate a generation;
+- any generation-bound reference can reactivate a generation;
 - failed global operations retain `RETIRING` and do not delete;
+- a provisional reference cannot park a hot generation in `RETIRING` for its full
+  retention TTL;
+- writers observing `RETIRING` have a bounded retry/backoff and never hang
+  indefinitely;
+- the upload path retains exactly its existing terminal first-writer LWT and no
+  second writer-path Paxos is introduced;
+- G2 activation and all retirement/delete LWTs run only in background workers;
+- the integration harness asserts Cassandra `release_version=5.0.6`;
 - multi-DC and DC-outage tests pass;
 - no new reference/dedup Paxos exists.
 
@@ -843,6 +1037,8 @@ X1 is closed only when:
 - readers use the persisted exact key;
 - recovery uses generation and key, never logical hash resolution;
 - `DELETING` recovery works without an orphan projection;
+- active-pointer transitions use one `blocks` row, while terminal generation
+  transitions use the generation row; no cross-table CAS is assumed;
 - a delayed G1 delete cannot affect G2.
 
 Until both lists pass, destructive GC remains disabled.
@@ -859,11 +1055,12 @@ reintroduce rejected designs:
 3. `SERIAL` is the Paxos phase; `EACH_QUORUM` is the regular LWT commit/read level.
 4. `internal/db/db.go` explicitly configures `cluster.SerialConsistency` in the
    audited branch; critical LWTs should still set it per query.
-5. The correct performance requirement is no new Paxos per reference, permanent
-   reference, or normal dedup hit, not zero Paxos in all uploads.
+5. The upload path retains exactly one existing terminal first-writer Paxos; no
+   additional writer-path Paxos is allowed, especially not for pins, references,
+   reuse, or ordinary deduplication.
 6. A TTL is retention, not writer authority.
-7. `pin -> ACTIVE` is invalid; only a permanent reference can reactivate during
-   `RETIRING`.
+7. `pin -> ACTIVE` is invalid; any generation-bound reference can reactivate during
+   `RETIRING`, while an authorized pin can finish publishing without reactivation.
 8. G2 is forbidden during `RETIRING` and begins only after `RETIRED`.
 9. New greenfield objects use UUID keys from their first materialization; no G0
    deterministic-key compatibility path is required.
@@ -876,6 +1073,18 @@ reintroduce rejected designs:
 14. `DELETING` generations must be recoverable after a crash before orphan creation.
 15. Retire ownership requires ID plus epoch/deadline so stale workers cannot finish
     after takeover.
+16. An authorized pin may finish publishing while the pointer is `RETIRING`; a
+    `PENDING` pin cannot.
+17. Provisional references reactivate a retiring generation for availability-safe
+    retention; pins alone do not.
+18. `001_initial_schema.cql` remains immutable; greenfield removes backfill, not
+    migration checksum/history requirements.
+19. The real physical key preserves the existing two-level hash sharding before
+    adding the generation suffix.
+20. The acceptance harness must use a pinned Cassandra `5.0.6` image and must not
+    treat `-short` tests as integration evidence.
+21. G2 activation is background work; the request path must not issue a second
+    activation Paxos after the existing terminal first-writer LWT.
 
 ## Related Documents
 
