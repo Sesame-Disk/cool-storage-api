@@ -191,7 +191,9 @@ version must still be asserted by integration tests.
 | Operation | Required consistency |
 |---|---|
 | Initial writer generation read | `LOCAL_QUORUM` |
-| `MATERIALIZING` intent/use insert | `LOCAL_QUORUM` |
+| `MATERIALIZING` intent insert (step 3a) | `LOCAL_QUORUM`, confirmed on its own before the use |
+| `AUTHORIZED` materializer use insert (step 3b) | `LOCAL_QUORUM`, confirmed on its own before the discovery row |
+| Materialization discovery projection (step 3c) | `LOCAL_QUORUM`, confirmed before the PUT; an unconfirmed write means no PUT |
 | Materializer use release | `LOCAL_QUORUM` |
 | Pin insert | `LOCAL_QUORUM` |
 | Pin confirmation | `LOCAL_QUORUM` |
@@ -227,7 +229,7 @@ The current `internal/db/db.go:94-95` does explicitly assign
 `cluster.SerialConsistency`. The current configuration and tests still include
 `LOCAL_SERIAL` in the multi-region profiles, so the final X1/X2 profile must use
 `SERIAL` for every LWT that can touch `blocks`; a startup gate must reject
-`LOCAL_SERIAL` when generation-aware GC is enabled. The global session
+`LOCAL_SERIAL` under the generation-fence writer-mode gate. The global session
 configuration must not be changed to `EACH_QUORUM`; regular global operations set
 that level per query.
 
@@ -420,8 +422,8 @@ The implementation must:
   participant sets, which is the very condition the gate exists to prevent. The
   rollout sequence below deliberately activates GC several steps after writers go
   live, so tying the gate to `gc.enabled` would leave exactly that window open;
-- treat that check as part of the destructive-GC activation gate, not as an
-  operational note.
+- treat those checks as the generation-fence writer-mode gate, which is a
+  prerequisite of the destructive-GC activation gate — not as an operational note.
 
 ### `EACH_QUORUM` Versus `ALL`
 
@@ -491,11 +493,14 @@ Required fields include:
 - `materialization_state` and timestamps;
 - `gc_state` and claim fields when physical cleanup begins.
 
-The materialization intent is also a generation-use row. Creating it writes a use
-row for `(G, use_id)` in the `AUTHORIZED` state, because the materializer owns `G`
-by construction: no other operation can be using a generation that does not exist
-yet. That use row is what makes the materializer visible to the GC drain, and it is
-held across the PUT, the activation CAS, and the reference publication.
+The materialization intent is **accompanied by** a generation-use row, not identical
+to it. Step 3b writes a separate row for `(G, use_id)` in the `AUTHORIZED` state —
+`AUTHORIZED` from creation because the materializer owns `G` by construction: no
+other operation can be using a generation that does not exist yet. The two live in
+different tables and different partitions and are written and confirmed
+independently; see First Materialization Or Rematerialization. That use row is what
+makes the materializer visible to the GC drain, and it is held across the PUT, the
+activation CAS, and the reference publication.
 
 Without it there is a live-data hole. A materializer that wins activation creates a
 generation that is `ACTIVE` with zero references, which is exactly the shape of a GC
@@ -1328,18 +1333,24 @@ A row that exists in `PENDING` is not authority. Treating "the `use_id` row is
 present" as success would let an ambiguous authorization be read as a granted one,
 which is exactly the failure the `PENDING`/`AUTHORIZED` split exists to prevent.
 
-**Ambiguous materialization intent, and ambiguous materializer use.** These are two
-separate writes to two separate partitions, in steps 3a and 3b of First
-Materialization Or Rematerialization — not the step 3 of the writer sequence — and
-each has its own confirmation:
+**Ambiguous materialization intent, use, or discovery.** These are three separate
+writes to three separate partitions, in steps 3a, 3b and 3c of First Materialization
+Or Rematerialization — not the step 3 of the writer sequence — and each has its own
+confirmation:
 
 - an ambiguous **intent** write is confirmed by reading back the exact
   `(org, block, generation)` row and matching `storage_key`, storage class,
   predecessor tuple, and operation identity. Without it there is no durable record
-  of `K` and no lineage, so the materializer must not proceed to the use, the PUT,
-  or the activation;
+  of `K` and no lineage, so the materializer must not proceed to the use, the
+  discovery row, the PUT, or the activation;
 - an ambiguous **use** write is confirmed by reading back
-  `use_id + generation_id + kind=MATERIALIZER + state=AUTHORIZED + deadlines`.
+  `use_id + generation_id + kind=MATERIALIZER + state=AUTHORIZED + deadlines`;
+- an ambiguous **discovery** write is confirmed by reading back the exact
+  `gc_generation_intents_by_day` row for `(due_day, bucket, due_at, org, block,
+  generation)`. **If it cannot be confirmed, there is no PUT.** Step 3c is
+  safety-critical in the same way as the other two: after the PUT an object exists
+  physically, and if no work row is durable, nothing schedules its inspection and no
+  scan is permitted to find it.
 
 If either confirmation fails the materializer has no authority. It must not PUT and
 must not activate on the assumption that either row landed. A materializer that PUTs
@@ -1955,13 +1966,27 @@ block_generation_retire_evidence
     org_id
     block_id
     generation_id
-    retire_claim_epoch      -- clustering key; one row per retire cycle
+    retire_claim_epoch      -- part of the partition key; one row per retire cycle
     retire_claim_id
     checked_at
     uses_read_at
     refs_read_at
-    PRIMARY KEY ((org_id, block_id, generation_id), retire_claim_epoch)
+    PRIMARY KEY ((org_id, block_id, generation_id, retire_claim_epoch))
 ```
+
+**One evidence event, one partition.** Folding `retire_claim_epoch` into the
+partition key rather than clustering under the generation matters for the same reason
+it did for `block_generations`: a generation can travel
+`RETIRING -> ACTIVE -> RETIRING` without limit, and this design retains evidence
+forever, so the clustered form would accumulate every retire cycle of a hot
+generation in one partition. Nothing needs the co-location — every consumer looks up
+an exact `(G, N)` decided by the retirement-authorizing claim, never a range — and the
+split also stops concurrent cycles of one generation contending on a single
+partition's Paxos state.
+
+Uses and references are the deliberate contrast: those *are* clustered under the
+generation, because the destructive proof reads each of them as one complete
+partition. Evidence is never read that way.
 
 The write is the equivalent of:
 
@@ -1976,9 +2001,20 @@ payload is a protocol violation and fails closed.
 
 Each worker writes its own row with an immutable `INSERT ... IF NOT EXISTS` and can
 never overwrite another's payload. This conditional write is intentionally on the
-GC cold path, not the writer hot path. Consumers read the row whose
-`retire_claim_epoch` equals the live claim on the
-`blocks` row; any other row is history.
+GC cold path, not the writer hot path. Consumers read the row for the
+**retirement-authorizing claim of the generation they are deciding about**, which is
+not always the pointer's current claim:
+
+```text
+retirement-authorizing claim for G:
+    if the pointer reads G / RETIRED   -> the claim on the blocks row
+    otherwise                          -> the claim recorded in the successor
+                                          lineage link for G
+```
+
+Any other row is history. Reading "the live claim on the `blocks` row"
+unconditionally is correct only in the first case and fails every delete of a
+superseded generation; see correction 103.
 
 An ambiguous evidence append is reconciled by re-issuing the same immutable
 `INSERT ... IF NOT EXISTS` in the `SERIAL` Paxos domain. An exact-row
@@ -1996,7 +2032,7 @@ and a reconciliation rule:
 |---|---|---|
 | Pointer selects G1, state `RETIRING` | absent | Normal in-progress retirement; continue the drain from step 1 |
 | Pointer selects G1, state `RETIRING` | present | Crash between steps 2 and 3. **Never `DELETING`, never G2.** Revalidate the claim, re-run the global zero check, then complete step 3 — or return to `ACTIVE` if a reference has appeared |
-| Pointer selects G1, state `RETIRING` | only rows for older epochs | History from earlier retire cycles; ignore them and continue the drain from step 1 |
+| Pointer selects G1, state `RETIRING` | absent at the authorizing epoch, though earlier cycles left rows | Identical to the row above: the lookup is a point read at the exact `(G1, N)`, so earlier cycles are simply not found. They are history and are never enumerated |
 | Pointer selects G1, state `RETIRED` | present | Consistent; conditionally set G1 `gc_state=DELETING`, then proceed with exact-key cleanup |
 | Pointer selects G1, state `RETIRED` | absent | Step 2 was lost; re-run the global zero check and append evidence before proceeding |
 | Pointer selects G2 | evidence for the exact `N1`, and G2 predecessor is `(G1, E1, C1, N1)` | The zero check passed and G2 could only activate through a CAS requiring the matching pointer tuple; proceed to `DELETING` for G1 |
@@ -2072,8 +2108,10 @@ inferred from it:
 > after two rematerializations.
 
 > Retirement evidence is valid only when **both** `retire_claim_epoch` and
-> `retire_claim_id` match the live claim on the `blocks` pointer. The epoch is the
-> clustering key used to find the row; the claim ID is part of the immutable proof
+> `retire_claim_id` match the retirement-authorizing claim for that generation — the
+> claim on the `blocks` row when the pointer still reads `G / RETIRED`, otherwise the
+> claim recorded in the successor lineage link. The epoch identifies the row; the
+> claim ID is part of the immutable proof
 > payload. A worker that cannot match the epoch treats the evidence as absent; a row
 > whose epoch matches but whose claim ID does not is a **protocol violation** and
 > fails closed, never "close enough".
@@ -2191,6 +2229,8 @@ provisional TTL costs retention, not availability.
       unexpired authority_deadline
           -> keep RETIRING, drain
       refs == 0 and uses > 0 and every remaining use has expired authority
+          -> publish + confirm the delayed candidate
+             and its discovery projection            LOCAL_QUORUM
           -> RETIRING -> ACTIVE                     SERIAL + EACH_QUORUM
      refs == 0 and uses == 0
          -> G1 -> RETIRED                          SERIAL + EACH_QUORUM
@@ -2566,6 +2606,30 @@ before the predecessor is retired:
 | `RETIRING -> ACTIVE` (escape) | the delayed candidate, published **before** the CAS | after the CAS commits |
 | `RETIRING -> RETIRED` | `gc_generation_handoff_by_day`, published **before** the pointer CAS | after `gc_generation_deletes_by_day` is confirmed |
 | `gc_state = null -> DELETING` | `gc_generation_deletes_by_day`, published **before** the CAS | after `DELETED` |
+
+The materializer side needs the same table, and it was the half that stayed
+implicit:
+
+| Stage | Work identity that must be durable | Retired only after |
+|---|---|---|
+| step 3c → PUT → activation → publication | `gc_generation_intents_by_day`, published and confirmed at 3c | one of: a generation-bound reference exists; `gc_generation_zero_ref_by_day` is durable; or delete/orphan work is durable for a losing generation |
+| materializer use held across PUT and activation | `gc_generation_uses_by_day`, published with the use at 3b | the use is released, or the generation has been handed to another work row. It must outlive the canonical use row's TTL |
+
+The seam that closes is the one where a materializer wins activation and then dies:
+
+```text
+intent work exists -> PUT -> VERIFIED -> activation wins
+    -> intent scanner sees "no longer MATERIALIZING" and retires its row   <-- FORBIDDEN
+    -> request dies before publishing the reference
+    -> canonical materializer use TTL-expires
+    => ACTIVE with refs = 0 and no work row naming it
+```
+
+The scanner may not retire on "no longer `MATERIALIZING`". It must first observe a
+generation-bound reference, or publish `gc_generation_zero_ref_by_day` itself. That
+projection has exactly one publisher — whichever worker retires the intent work
+without finding a reference — and it is published before that retirement, never
+after.
 
 The rule that ties them together, and the one an implementer must not optimize away:
 
@@ -3218,9 +3282,9 @@ Required cases include:
   block unwritable for its full `retention_expires_at` window;
 - zero uses follows the retirement branch rather than the expired-use reactivation
   branch; the "every use expired" predicate must not match an empty set;
-- a reactivation on expired-authority uses writes a delayed candidate and its
-  discovery projection; recovery re-examines the generation only as a backstop if
-  that enqueue is lost;
+- a reactivation on expired-authority uses writes and confirms its delayed candidate
+  and discovery projection **before** the CAS; an unconfirmed enqueue keeps the
+  generation `RETIRING` and performs no CAS at all;
 - the GC reads uses **before** references, and a test asserts the unsafe ordering
   fails: with refs read first, a writer holding an `AUTHORIZED` use that publishes
   and releases between the two reads must be caught, not silently accepted;
@@ -3243,8 +3307,10 @@ Required cases include:
 - `RETIRING -> ACTIVE` on abandoned uses writes a delayed candidate and its
   discovery projection row, and the generation is re-examined without any
   `block_generations` scan;
-- a crash or ambiguous candidate/projection enqueue after reactivation is repaired
-  by recovery, and a future-dated candidate is not processed before `candidate_at`;
+- once the reactivation CAS commits, the discovery row exists **by construction**, so
+  a crash immediately after it leaves at most a stale candidate that the scanner
+  revalidates and discards; a future-dated candidate is not processed before
+  `candidate_at`;
 - writers observing `RETIRING` stop after a bounded retry budget and return a
   documented retryable result;
 - ambiguous authorization confirmed only by `use_id` existence is rejected; the
@@ -3389,6 +3455,17 @@ Required cases include:
   one generation sharing a `due_at`, each produce two distinct projection rows;
 - the topology, DC/RF, `SERIAL`, and `paxos_variant` assertions all fail startup in
   generation-fence writer mode, with `gc.enabled=false`;
+- an unconfirmed step-3c discovery write aborts before the PUT, exactly as an
+  unconfirmed intent or use does;
+- a materializer that wins activation and dies before publishing its reference is
+  still discovered: the intent work row is not retired until either a
+  generation-bound reference exists or `gc_generation_zero_ref_by_day` is durable,
+  and a test injects the crash in that exact window;
+- a materializer use projection outlives the canonical use row's TTL, so an
+  abandoned materializer is discoverable after the canonical row expires;
+- a generation that retires, reactivates, and retires again writes its evidence rows
+  to distinct partitions, and every consumer reaches them by point lookup on the
+  authorizing `(G, N)` rather than by enumerating a generation's cycles;
 - a generation whose `materialization_state` lags behind an activation committed in
   another DC is repaired rather than quarantined, while a writer observing the same
   lag fails closed and retries;
@@ -3450,7 +3527,7 @@ Required cases include:
 - the provisional reference TTL is greater than the measured upload-to-commit
   window, and a commit whose provisional reference expired fails closed with a
   documented error rather than publishing a reference to a dead generation;
-- with `gc.enabled=true` and a non-`NetworkTopologyStrategy` keyspace, startup
+- under generation-fence writer mode and a non-`NetworkTopologyStrategy` keyspace, startup
   fails; the process must not run destructive GC where `EACH_QUORUM` reads degrade
   to an ordinary quorum.
 - startup also fails when the keyspace DC set differs from the configured
@@ -4146,7 +4223,9 @@ reintroduce rejected designs:
     said it could be, while the reconciliation table simultaneously required that
     same evidence to authorize deleting the predecessor's key. Evidence and
     predecessor tuples are released only together with the generations they
-    describe, once every one of those is `DELETED`.
+    describe. **Superseded by correction 99**: X1/X2 releases them at no point
+    whatsoever, and "once every one of those is `DELETED`" is not a release
+    condition either — logical-history compaction is `PURGING_LOGICAL` work.
 75. **The claim-column lifecycle is specified for every transition**, not only for
     `RETIRING -> RETIRED`. `retire_claim_epoch` is a monotonic counter that is never
     cleared; `retire_claim_id` and `retire_claim_deadline` are live only during
@@ -4266,13 +4345,16 @@ reintroduce rejected designs:
     `gocql/gocql` v1 it was a separate type usable only on a conditional statement's
     serial phase, which is why this looks unavailable to anyone reasoning from that
     driver. Calling `.SerialConsistency()` on a plain `SELECT` is a silent no-op and
-    proves nothing. A harmless settlement LWT on the same partition is the recorded
-    fallback and needs no linearizable-read guarantee.
+    proves nothing. **Amended by correction 98**: the harmless settlement LWT is a
+    *rejected alternative*, not a supported fallback — the serial `SELECT` is the
+    single normative mechanism and the `paxos_variant` gate is unconditional.
 92. **The recovery projections are schema, not prose.** Every other table in this
     design has its primary key frozen here; leaving the recovery branches as named
     concepts is what pushes an implementer back toward the enumeration the protocol
-    forbids. All five carry
-    `((due_day, bucket), due_at, org_id, block_id, generation_id)`, and
+    forbids. **Refined by correction 104**: the base key
+    `((due_day, bucket), due_at, org_id, block_id, generation_id)` is carried by
+    three of the five, while `gc_generation_uses_by_day` adds `use_id` and
+    `gc_generation_handoff_by_day` adds `retire_claim_epoch`. Also
     `gc_generation_deletes_by_day` doubles as the discovery record required before
     the `DELETING` CAS — deliberately the same table, because a second row that must
     be written in the same window would only add another crash gap. The reverse
@@ -4375,6 +4457,29 @@ reintroduce rejected designs:
     between deploying generation-aware writers and switching GC on — precisely the
     window in which the first crashed activations occur.
 
+106. **Work continuity applies to the materializer, not only to GC.** The handoff rule
+    was frozen for the GC cycle while the materialization side kept three
+    incompatible models: `MATERIALIZING` still called the intent "also a
+    generation-use row", the ambiguity contract covered 3a and 3b but not 3c, and no
+    text said who publishes the materialization-side projections or when ownership
+    passes between them. The seam that leaks is a materializer that wins activation
+    and then dies: an intent scanner that retires its row on "no longer
+    `MATERIALIZING`" leaves an `ACTIVE` generation with zero references and no work
+    row. It must observe a reference or publish `gc_generation_zero_ref_by_day`
+    first. Step 3c also needs its own ambiguity contract — unconfirmed means no PUT.
+107. **One evidence event, one partition.** `block_generation_retire_evidence` keyed
+    `((org, block, generation), retire_claim_epoch)` accumulates every retire cycle
+    of a generation in one partition, and this design retains evidence forever while
+    allowing `RETIRING -> ACTIVE -> RETIRING` without limit. Every consumer looks up
+    an exact `(G, N)`, never a range, so the epoch belongs in the partition key. Uses
+    and references are the deliberate contrast: the destructive proof reads each of
+    those as one complete partition, so they stay clustered under the generation.
+108. **Every normative pseudocode carries the ordering it depends on.** The
+    `RETIRING -> ACTIVE` escape was corrected in its own section while the main GC
+    protocol still showed the bare CAS, and two verification cases still described
+    repairing a lost enqueue — which the contract now makes impossible, since an
+    unconfirmed enqueue means no CAS. This is correction 88 recurring; the practical
+    remedy is to grep for the old formulation before committing a new rule.
 ## Related Documents
 
 - [Known issues](./KNOWN_ISSUES.md), X1 and X2 remain open.
