@@ -9,11 +9,17 @@
 **Target engine:** Cassandra 5.0.6. A floating `cassandra:5.0` image is not
 sufficient evidence for the acceptance test.
 
+**Paxos variant policy:** Cassandra 5.0.6's semantically acceptable variants for
+this ADR are `{v1, v2}`. That set is not a deployment policy: every
+generation-fence writer deployment selects exactly one
+`generation_fence_paxos_variant` from that set, and every eligible coordinator node
+must report the selected target.
+
 **Deployment model:** greenfield; no legacy block rows, objects, or production data
 
 **Scope:** close `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1) and
-`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` (X2) without adding Paxos to the
-writer hot path. The generation fence adds no LWT to pins, revalidation,
+`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` (X2) without adding a new Paxos
+operation to the writer hot path. The generation fence adds no LWT to pins, revalidation,
 references, reuse, repair authorization, or deduplication hits. It adds one logical
 activation CAS per materializing request, on the cold path where a retired logical
 block comes back to life, with exactly one successful activation per
@@ -51,11 +57,15 @@ closed until code and verification satisfy this ADR.
 
 Use two independent safety mechanisms:
 
-1. **X2:** keep the normal generation-fence writer path regional with
-   `LOCAL_QUORUM`, and confine new global coordination to the destructive-GC path
-   and the rare rematerialization activation path. That path performs the
-   retirement-evidence `EACH_QUORUM` read followed by the `SERIAL + EACH_QUORUM`
-   activation CAS.
+1. **X2:** keep fence-added ordinary writer operations — pins, references,
+   revalidation, reuse, repair authorization, and deduplication — at
+   `LOCAL_QUORUM` and add no LWT to them. Generation-fence writer mode nevertheless
+   requires every existing `blocks`-partition LWT to use the global `SERIAL` domain,
+   which can promote an existing multi-DC LWT from `LOCAL_SERIAL`. New global
+   operations introduced by the fence are confined to lifecycle/ambiguity recovery,
+   the rare rematerialization activation path, and the destructive-GC cold path. The
+   rematerialization path performs the retirement-evidence `EACH_QUORUM` read
+   followed by the `SERIAL + EACH_QUORUM` activation CAS.
 2. **X1:** give every new physical lifecycle a never-reused UUID generation and
    immutable physical `storage_key`, so a delayed delete can target only the old
    generation.
@@ -291,7 +301,7 @@ implementation detail:
 
 | Enforced by | What it covers |
 |---|---|
-| Startup gate | topology, DC set and RF, `paxos_variant`, and the configured session serial level being the one the chosen option requires |
+| Startup/eligibility gate | topology, DC set and RF, every eligible node's selected `generation_fence_paxos_variant`, and the configured session serial level being the one the chosen option requires |
 | A single helper | every LWT on the `blocks` partition goes through one constructor that sets the serial level; no `blocks` LWT is issued through a raw `Session().Query` |
 | Tests and writer-path tracing | the inventory in Current Code Evidence is enumerated by test, and each statement's effective level asserted |
 
@@ -430,10 +440,12 @@ This intersection holds for RF greater than one per DC because a Cassandra
 against a per-DC requirement map. A plain global `QUORUM` would not give this
 property.
 
-This is why the protocol adds no WAN traffic or Paxos to pins, references, reuse,
-or deduplication. New global Paxos is confined to GC lifecycle transitions and the
-activation CAS a materializing request makes when it rematerializes a retired
-block.
+This is why the generation fence adds no new LWT or global coordination to pins,
+references, reuse, or deduplication. It does **not** mean every existing
+`blocks`-partition LWT remains regional: writer mode requires those statements to
+use the global `SERIAL` domain. New global operations introduced by the fence are
+confined to lifecycle/ambiguity recovery, the activation CAS a materializing request
+makes when it rematerializes a retired block, and the GC cold path.
 
 ### `NetworkTopologyStrategy` Is Load-Bearing
 
@@ -462,13 +474,31 @@ generation-fence writer mode enabled       (rollout step 2: writers deployed)
     startup: NetworkTopologyStrategy verified
     startup: DC set and per-DC RF verified
     startup: session serial default matches the chosen option
-    startup: every eligible coordinator reports an allowlisted paxos_variant
+    startup/eligibility: every eligible coordinator reports the selected
+                         generation_fence_paxos_variant target
     code + tests: every blocks LWT has effective SERIAL
 
 destructive GC enabled                     (rollout step 7)
     requires the writer gate above, plus
     all X1/X2 acceptance criteria verified
 ```
+
+### Node Eligibility Is Continuous
+
+The writer-mode gate is not only a startup photograph. A Cassandra node is eligible
+to coordinate a generation-fence statement only after that exact node has been
+verified for all of the following:
+
+- the pinned release and image/artifact identity;
+- the selected `generation_fence_paxos_variant` target;
+- the expected DC and topology membership.
+
+A newly discovered or rejoined node starts **ineligible**. It must be verified locally
+before the driver or routing layer may send it a generation-fence statement. An
+unavailable or unverifiable node remains ineligible, and a node whose local
+configuration or membership no longer matches loses eligibility immediately. The
+implementation may choose the orchestration and inspection API, but it must not
+silently treat a previously verified node as verified forever.
 
 Every assertion in the first block binds from the **first generation-aware write**,
 not from `gc.enabled=true`. The reason is concrete: a materializer can crash between
@@ -499,21 +529,20 @@ The implementation must:
   rollout sequence below deliberately activates GC several steps after writers go
   live, so tying the gate to `gc.enabled` would leave exactly that window open;
 - verify that **every Cassandra node eligible to coordinate generation-fence
-  queries** reports a `paxos_variant` on the positive allowlist of known-good values
-  that retain linearizable reads — not merely that one observed coordinator avoids
-  `*_without_linearizable_reads*`. A single-node observation is not sufficient
-  evidence for this gate: a request may be coordinated by any eligible node. A
-  deny-list admits every variant the engine has not shipped yet, which is the wrong
-  default for a property that fails silently: an unrecognised value must fail closed
-  and force an explicit review, exactly as generation validity is a positive
-  predicate rather than "not `QUARANTINED`" (correction 72). For the pinned
-  Cassandra 5.0.6 deployment, PR-0 must verify the exact build and freeze the
-  expected allowlist as `{v1, v2}`; any other observed value remains a fail-closed
-  configuration error until explicitly reviewed. This is the fourth check, and it
-  is listed here rather than only in How To Issue The Settlement Read because
-  leaving it out of this enumeration is how it ends up implemented as a GC-time
-  assertion — the failure it prevents is a crashed activation on day one of the
-  writer rollout;
+  queries** reports the selected `generation_fence_paxos_variant` target — not merely
+  that one observed coordinator avoids `*_without_linearizable_reads*`. A single-node
+  observation is not sufficient evidence for this gate: a request may be coordinated
+  by any eligible node. For Cassandra 5.0.6, `{v1, v2}` is the semantic allowlist, but
+  PR-0 must select exactly one target and the gate must reject any eligible node that
+  reports the other value, an unrecognised value, or a value without linearizable
+  reads. A deny-list admits every variant the engine has not shipped yet, which is
+  the wrong default for a property that fails silently: an unrecognised value must
+  fail closed and force an explicit review, exactly as generation validity is a
+  positive predicate rather than "not `QUARANTINED`" (correction 72). This is the
+  fourth check, and it is listed here rather than only in How To Issue The Settlement
+  Read because leaving it out of this enumeration is how it ends up implemented as a
+  GC-time assertion — the failure it prevents is a crashed activation on day one of
+  the writer rollout;
 - treat those four checks as the generation-fence writer-mode gate, which is a
   prerequisite of the destructive-GC activation gate — not as an operational note.
 
@@ -1385,12 +1414,12 @@ validated before it reaches the setter, not at the call site.
 
 **The serial `SELECT` is the normative mechanism.** There is exactly one settlement
 form in this design, and the startup gate is unconditional: every Cassandra node
-eligible to coordinate generation-fence queries must report a `paxos_variant` that
-retains linearizable reads. PR-0 records the exact accepted set for the deployed
-engine as a positive allowlist; for the pinned Cassandra 5.0.6 build the expected set
-is `{v1, v2}`, subject to exact-build verification. PR-2's gate rejects anything
-outside that set — an unrecognised variant or a single disallowed node fails closed
-rather than being assumed safe. Inspecting one coordinator is not sufficient.
+eligible to coordinate generation-fence queries must report the selected
+`generation_fence_paxos_variant` target. For the pinned Cassandra 5.0.6 build,
+`{v1, v2}` is the semantic allowlist, but PR-0 selects exactly one target and PR-2's
+gate rejects any eligible node outside it — an unrecognised variant, a disallowed
+variant, or a single node on the other allowlisted variant fails closed rather than
+being assumed safe. Inspecting one coordinator is not sufficient.
 This is a third axis alongside `NetworkTopologyStrategy` and `SERIAL`, and it fails
 the same way: silently.
 
@@ -2525,10 +2554,10 @@ stage + CONFIRM pub: references (generation-bound)
 
 `pub:` rows are therefore not a convenience: they are the liveness holder for the
 publish race, which is why Reference Identity requires generation identity to flow
-through them and why the expiry projection must cover them as well as `up:`. Neither
-release is allowed after an ambiguous write: an uncertain `pub:` stage preserves the
-publish attempt for retry, and an uncertain `fs:` promotion preserves `pub:` until
-the exact generation-bound reference is confirmed.
+through them and why the expiry projection must cover them as well as `up:`. No
+liveness holder is released after an ambiguous publication write: an uncertain
+`pub:` stage preserves the publish attempt for retry, and an uncertain `fs:` promotion
+preserves `pub:` until the exact generation-bound reference is confirmed.
 
 The provisional reference TTL is therefore a correctness parameter of the same kind
 as the authority deadline, not a cleanup convenience:
@@ -3616,10 +3645,11 @@ Adjacent findings remain separate unless implementation deliberately closes them
   but the ADR does not claim X3 closed until every writer is verified.
 - X4 (the existing terminal first-writer Paxos cost) remains a deferred finding
   outside this ADR's scope and is tolerated as the current baseline. This design
-  reuses that LWT rather than adding a parallel one, adds no Paxos to pins,
-  references, reuse, repair authorization, or dedup, and adds one logical
-  rematerialization activation operation. Retirement and delete LWTs run in the GC
-  worker.
+  reuses that LWT rather than adding a parallel one, adds no **new** Paxos operation
+  to pins, references, reuse, repair authorization, or dedup, and adds one logical
+  rematerialization activation operation. Writer mode still moves every existing
+  `blocks`-partition LWT into the selected global `SERIAL` domain. Retirement and
+  delete LWTs run in the GC worker.
 - X5, X6, X9, X10, and X11 remain separate audit work and are not activation proof
   for X1/X2.
 
@@ -3641,7 +3671,8 @@ measurements are separate, and merging the document does not close the second:
 
 ```text
 ADR frozen        the protocol is settled; no further design changes expected
-Phase 0 complete  paxos_variant, activation critical path, writer lifetime,
+Phase 0 complete  one selected paxos_variant target, every eligible node's
+                  build/variant identity, activation critical path, writer lifetime,
                   upload-to-commit window and GC throughput are MEASURED
 ```
 
@@ -3671,6 +3702,12 @@ measure GC candidate throughput under bounded concurrency and the queue age targ
 Those numbers justify the inline decision and the worker capacity; without them the
 inline-versus-background and serial-versus-concurrency questions can only be
 asserted.
+
+PR-0 must select one `generation_fence_paxos_variant` target from the Cassandra 5.0.6
+semantic set `{v1, v2}`, record the image digest or artifact checksum for the exact
+audited build, and verify that every node eligible to coordinate reports both that
+build identity and that selected target. A release-version check alone is not enough,
+and a mixed `{v1, v2}` deployment is not an accepted writer-mode state.
 
 ### PR-1: Final Greenfield Schema And Models
 
@@ -3733,8 +3770,9 @@ one of them cannot do the others' job:
 Startup assertion (configuration and cluster state):
     NetworkTopologyStrategy
     exact configured DC set, and positive RF per DC
-    every eligible coordinator node reports a paxos_variant on the
-    linearizable-read allowlist (expected `{v1, v2}` for the pinned 5.0.6 build)
+    every eligible coordinator node reports the selected
+    generation_fence_paxos_variant target (chosen from `{v1, v2}` for the pinned
+    5.0.6 build)
     session serial default matches the option chosen below
 
 Code invariant (one helper, no raw statements):
@@ -3752,10 +3790,11 @@ Test and inventory (what startup cannot see):
 on the same pointer partition is not an accepted generation-fence profile; and a
 variant without linearizable reads removes the serial read that Recovering A Crashed
 Activation depends on. These properties fail silently, so none is left as an
-operational note. Topology/DC/RF, the cluster-wide `paxos_variant` allowlist, and the
-configured session default are checkable at startup. The effective serial level of
-every Go statement is not; that statement-level invariant is carried by the helper
-and inventory tests. See correction 122.
+operational note. Topology/DC/RF, the selected `paxos_variant` on every currently
+eligible node, and the configured session default are checkable at startup and through
+continuous node eligibility. The effective serial level of every Go statement is not;
+that statement-level invariant is carried by the helper and inventory tests. See
+correction 122 and Node Eligibility Is Continuous.
 
 PR-2 also owns the decision in Which Serial Level Is The Session Default. There is no
 per-query serial level in the repository today, so "unrelated LWTs keep their
@@ -4166,16 +4205,22 @@ Required cases include:
   participating DC set or any expected DC has an RF different from its configured
   positive value.
 - the writer-mode gate inspects every Cassandra node eligible to coordinate
-  generation-fence queries and fails if any reports a `paxos_variant` outside the
-  verified allowlist; an allowlisted bootstrap coordinator cannot mask a disallowed
-  peer.
+  generation-fence queries and fails if any reports a `paxos_variant` different from
+  the selected `generation_fence_paxos_variant` target; a target-matching bootstrap
+  coordinator cannot mask a disallowed peer;
+- a newly discovered or rejoined node remains ineligible until that exact node's
+  release/build identity, selected `paxos_variant`, and DC/topology membership are
+  verified locally; an unavailable or unverifiable node cannot receive a
+  generation-fence statement.
 
 ### Cassandra Multi-DC Tests
 
 Use the pinned Cassandra `5.0.6` image with `NetworkTopologyStrategy`, RF 1 per DC
 initially, and a test profile configured with `SERIAL`, not `LOCAL_SERIAL`. The
-harness must query `SELECT release_version FROM system.local` and fail unless the
-expected engine version is present.
+harness must query `SELECT release_version FROM system.local` and fail unless
+`release_version=5.0.6`; it must also verify that the image digest or Cassandra
+artifact checksum matches the Phase-0 pinned build identity. Release version alone is
+not evidence of the exact audited build.
 
 Required scenarios:
 
@@ -4318,12 +4363,14 @@ counted. Existing probe/reference work may be reused or coalesced where the same
 query already supplies the observation, so the incremental cost must be measured
 against the current path; it must not be budgeted as only three round trips.
 
-The fence adds no Paxos to those per-block request operations. It creates one
-logical activation operation per materializing request only when a previously
-retired SHA comes back to life. Concurrent operations for the same block
+The fence adds no **new Paxos operation** to those per-block request operations. It
+creates one logical activation operation per materializing request only when a
+previously retired SHA comes back to life. Concurrent operations for the same block
 may retry physical CAS executions when results are ambiguous, but every retry uses
 the same generation, epoch, and predecessor tuple. The pre-existing upload LWTs
-listed in Current Code Evidence are unchanged.
+remain the same operations, but writer mode changes the effective serial domain of
+those that touch `blocks` to the selected global `SERIAL` target; this can change
+their multi-DC coordination cost without adding another LWT.
 
 Cold-path cost is several global reads/LWTs per candidate and intentional dependence
 on the slowest participating DC. A DC outage causes retention rather than deletion.
@@ -4447,12 +4494,12 @@ X2 is closed only when:
   rejected is any `blocks`-partition LWT whose effective level is `LOCAL_SERIAL`. It
   is enforced by routing those statements through one helper and asserted over the
   inventory by test, because startup cannot enumerate them;
-- every Cassandra node eligible to coordinate generation-fence queries reports a
-  `paxos_variant` on the positive allowlist of variants that retain linearizable
-  reads. For the pinned Cassandra 5.0.6 build the expected allowlist is `{v1, v2}`
-  after Phase-0 exact-build verification; generation-fence writer-mode startup
-  rejects any disallowed node or value, including one the engine has not shipped,
-  since crashed-activation settlement depends on the serial `SELECT`;
+- every Cassandra node eligible to coordinate generation-fence queries reports the
+  selected `generation_fence_paxos_variant` target. For the pinned Cassandra 5.0.6
+  build the semantic candidates are `{v1, v2}`, but PR-0 selects exactly one target;
+  startup and continuous eligibility reject any node on the other candidate or on an
+  unrecognised/disallowed value, since crashed-activation settlement depends on the
+  serial `SELECT`;
 - the global zero check reads uses before references, and the ordering is asserted
   by a test rather than left to reviewer discipline;
 - the publication frontier is stated as an invariant and no second global reference
@@ -4510,7 +4557,8 @@ X2 is closed only when:
 - physical generation cleanup never deletes the logical `blocks` row, never resets
   `active_epoch`, and never removes a `block_id_mappings` row at all — mappings are
   logical identity and are not part of generation collection under any condition;
-- the integration harness asserts Cassandra `release_version=5.0.6`;
+- the integration harness asserts Cassandra `release_version=5.0.6` and the image
+  digest or artifact checksum matches the Phase-0 pinned build identity;
 - multi-DC and DC-outage tests pass.
 
 ### X1 Closure
@@ -4585,8 +4633,10 @@ reintroduce rejected designs:
     migration checksum/history requirements.
 19. The real physical key preserves the existing two-level hash sharding before
     adding the generation suffix.
-20. The acceptance harness must use a pinned Cassandra `5.0.6` image and must not
-    treat `-short` tests as integration evidence.
+20. The acceptance harness must use a pinned Cassandra `5.0.6` image whose digest or
+    artifact checksum matches the Phase-0 pinned build identity, and must not treat
+    `-short` tests as integration evidence. `release_version=5.0.6` alone is not an
+    exact-build proof.
 21. G2 activation runs inline in the materializing request. Deferring it to a
     background allocator has now been proposed, adopted, and reverted once. The
     reversion reasons are recorded under Background Activation, Evaluated And
@@ -5347,6 +5397,27 @@ reintroduce rejected designs:
      the operator is alerted. Operator remediation may help, but only confirmed
      exact-key absence permits `DELETING -> DELETED`; neither the DLQ nor remediation
      changes ownership or state by itself.
+133. **A semantic allowlist is not a mixed-deployment policy.** `{v1, v2}` identifies
+     the Cassandra 5.0.6 variants that retain the required read semantics, but a
+     generation-fence deployment selects exactly one
+     `generation_fence_paxos_variant`; every eligible coordinator must match it.
+     Changing that target is an explicit rolling operational procedure, not an
+     implicit consequence of two values being semantically acceptable.
+134. **Node verification is continuous, not a T0 snapshot.** A node that joins or
+     rejoins after startup is ineligible until its local release/build identity,
+     selected Paxos variant, and DC/topology membership are verified. An unavailable
+     or unverifiable node cannot coordinate generation-fence statements.
+135. **The Executive Decision must distinguish new from repurposed coordination.**
+     The fence adds no new LWT to ordinary writer operations, but its writer-mode gate
+     intentionally moves every existing `blocks`-partition LWT into the `SERIAL`
+     domain. New global operations are limited to lifecycle/ambiguity recovery,
+     rematerialization, and the GC cold path.
+136. **Release version is not exact-build identity.** The Cassandra 5.0.6 acceptance
+     harness must assert both `release_version=5.0.6` and a pinned image digest or
+     artifact checksum. The version query alone cannot prove the audited build.
+137. **The publication wording names one holder, not two releases.** The `pub:` to
+     `fs:` handoff says no liveness holder is released after an ambiguous publication
+     write; the holder remains until the exact generation-bound reference is confirmed.
 
 ## Related Documents
 

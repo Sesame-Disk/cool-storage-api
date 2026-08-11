@@ -770,7 +770,9 @@ the request, and performs the retirement-evidence `EACH_QUORUM` read followed by
 `SERIAL + EACH_QUORUM` activation CAS outside the GC worker. It prevents
 physical-delete ABA with UUID generations and immutable storage keys. X1 and X2
 remain open, and destructive GC remains disabled until the ADR acceptance criteria
-are implemented and verified.
+are implemented and verified. Generation-fence writer mode selects one
+`generation_fence_paxos_variant` target per deployment; every eligible Cassandra
+coordinator must match it continuously.
 
 ---
 
