@@ -8,6 +8,80 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-11 - X1/X2 fence ADR: lineage, conditional quarantine, and the empty-set predicate
+
+Design-document changes only. Nothing described here is implemented, no runtime
+code changed, X1/X2 remain open, and destructive GC remains disabled fleet-wide.
+
+Fourth audit pass. It proposed moving the rematerialization activation CAS into a
+background worker; that part was adopted, reviewed, and reverted in the same pass,
+so this entry records the corrections that survived plus why the move did not.
+
+The critical fix is the expired-use predicate. "Every remaining use has expired its
+authority" is vacuously true for an empty set, so the previous decision order would
+have matched the reactivation branch on zero uses and no generation would ever have
+reached `RETIRED`. GC would have retained everything forever. The predicate now
+requires `uses > 0`.
+
+Kept from the pass:
+
+- G2 carries an immutable predecessor tuple `(G1, E1, C1, N1)` and the activation
+  CAS matches the old pointer claim. This closes a hole `active_epoch` could not:
+  the epoch deliberately does not change across GC cycles, so a materializer that
+  read the pointer during retire cycle N1 could otherwise activate during cycle N2.
+- Late mirror finalize is conditional on `state=RETIRING` and the live retire claim,
+  so a duplicate or delayed finalize cannot regress `DELETING` or `DELETED` back to
+  `RETIRED`.
+- Quarantine is a conditional generation-row LWT with fixed state-specific
+  statements. A stale worker can no longer quarantine a newer same-state lifecycle
+  or overwrite a terminal state.
+- The topology gate verifies the keyspace DC set and exactly the configured positive
+  RF per DC, not only the replication strategy name. `NetworkTopologyStrategy` with
+  a wrong DC set degrades the `EACH_QUORUM` intersection just as another strategy
+  would.
+- Ambiguous retirement-evidence append is reconciled by reading the exact
+  `(G1, claim_epoch)` row; a timeout never implies failure.
+- A recovery worker repairing a crashed materializer must re-verify the exact object
+  before activating, because it did not perform the PUT itself.
+- Activation requires margin against all three of the materializer's own deadlines,
+  not only the materialization deadline. Activating with expired authority would
+  produce an `ACTIVE` generation nobody may publish to.
+
+Reverted, and recorded as evaluated-and-rejected rather than deleted:
+
+- Background activation. It was adopted for WAN latency and does not deliver it:
+  relocating a CAS does not remove a Paxos round, so first-response latency drops
+  while end-to-end latency and total work rise. It also optimizes a rare path, since
+  rematerialization only happens when a fully collected SHA comes back. And the
+  request-to-worker trust boundary introduced six distributed-protocol problems that
+  inline does not have — unverified objects at activation, non-converging concurrent
+  retries behind a fingerprint that only detects the conflict, an operation identity
+  needing two properties no funnel has today, the materializer use written in one DC
+  and read in another (X2's own shape, inside the new layer), a normal path to
+  `ACTIVE` with zero references that turns the crash-recovery scan into a scheduler,
+  and a use that stops being request-scoped. The decision is conditional: revisit
+  against measured activation latency, not against the assumption that background
+  means cheaper.
+
+Added while reviewing it:
+
+- An LWT taxonomy with four groups — existing hot path, new hot path (empty), rare
+  rematerialization, GC cold path — so "the generation fence uses Paxos" cannot be
+  read as licence to write `pin IF ...` or `reference IF ...`.
+- The counterweight to that taxonomy: the normal upload path is not Paxos-free
+  today. `UpsertBlockMetadataWithSHA1` runs `INSERT ... IF NOT EXISTS`
+  unconditionally with no pre-read, and an `IF NOT EXISTS` pays the full Paxos round
+  whether or not it applies, so every block of every upload — including pure dedup
+  hits — pays one global round in production. That is X4, it is the only Paxos whose
+  count scales with block volume, and a probe fast path is the cheap lever because
+  the probe has already read the row.
+- Two PR-0 measurements that any future inline-versus-background argument depends
+  on: the deployed `paxos_variant`, which nothing in this repository sets, and
+  activation-CAS latency at `SERIAL + EACH_QUORUM` between every pair of
+  participating DCs.
+
+---
+
 ## 2026-08-10 - X1/X2 fence ADR: append-only retirement evidence, authorization deadline, quarantine state
 
 Design-document changes only. Nothing described here is implemented, no runtime
@@ -33,7 +107,8 @@ Third audit pass. Two of these are regressions introduced by the previous pass.
   mutable form could be overwritten by a stalled worker holding an older claim,
   potentially regressing the generation row out of `RETIRED` or `DELETING` and
   destroying the delete authorization this ADR designates a recovery source. The
-  append-only form fixes it with no additional Paxos.
+  append-only form uses an idempotent cold-path conditional insert and adds no Paxos
+  to the writer hot path.
 - Pin authority is now checked at authorization and again immediately before the
   physical operation, not only at publish. The `RETIRING -> ACTIVE` escape makes it
   reachable for a stalled writer to revalidate after its own deadline passed and

@@ -53,7 +53,7 @@ Use two independent safety mechanisms:
 
 1. **X2:** keep the normal generation-fence writer path regional with
    `LOCAL_QUORUM`, and confine new global coordination to the destructive-GC path
-   and the rematerialization CAS using `EACH_QUORUM`.
+   and the rematerialization activation CAS using `EACH_QUORUM`.
 2. **X1:** give every new physical lifecycle a never-reused UUID generation and
    immutable physical `storage_key`, so a delayed delete can target only the old
    generation.
@@ -78,9 +78,9 @@ The following statements are part of the contract:
 
 - A pin is not a permanent liveness reference.
 - Finding a pin with live authority during `RETIRING` does not justify
-  `RETIRING -> ACTIVE`; it justifies waiting. A generation whose only remaining uses
-  have all expired their authority does return to `ACTIVE`, to release the writer
-  fence rather than to assert liveness.
+  `RETIRING -> ACTIVE`; it justifies waiting. A generation with one or more
+  remaining uses, all of which have expired their authority, does return to `ACTIVE`,
+  to release the writer fence rather than to assert liveness.
 - Any confirmed generation-bound reference, permanent or provisional, justifies
   returning to `ACTIVE`; a pin holding live authority does not.
 - A provisional `up:` or `pub:` reference prevents deletion but does not by itself
@@ -145,7 +145,9 @@ The one-hour grace period is mitigation, not a correctness proof.
 - Cassandra uses `NetworkTopologyStrategy`. This is a hard requirement, not a
   preference; see "`NetworkTopologyStrategy` Is Load-Bearing" below.
 - Every writer connects to its local DC through a DC-aware driver policy.
-- Each configured DC has the expected replication factor.
+- The expected DC set is explicitly configured, exactly matches the keyspace DC set,
+  and every participating DC has exactly its configured RF, which must be greater
+  than zero.
 - The target engine is Cassandra 5.0.6. Cassandra 5.0.6 contains
   `eachQuorumForRead()` and permits `EACH_QUORUM` reads.
 - The current multi-region Compose cluster has two DCs, `usa` and `eu`, with RF 1
@@ -156,9 +158,10 @@ The one-hour grace period is mitigation, not a correctness proof.
 - The existing terminal first-writer metadata LWT remains available for first
   materialization and may initialize the first active pointer in that same LWT,
   so a first physical lifecycle needs no additional activation Paxos.
-- Rematerialization of a `RETIRED` logical block performs one activation CAS
-  attempt per materializing request. It may run inline in the request that
-  materialized the new generation.
+- Rematerialization of a `RETIRED` logical block performs one logical activation
+  operation per materializing request. It runs inline in the request that
+  materialized the new generation; ambiguity retries reuse its same generation and
+  epoch.
 
 The Cassandra 5.0.6 source used to resolve the read-level question is:
 
@@ -178,19 +181,22 @@ version must still be asserted by integration tests.
 | Pin insert | `LOCAL_QUORUM` |
 | Pin confirmation | `LOCAL_QUORUM` |
 | Generation revalidation | `LOCAL_QUORUM` |
+| Generation lifecycle-state revalidation, including `QUARANTINED` | `LOCAL_QUORUM` |
 | Reuse, dedup, and normal metadata reads | `LOCAL_QUORUM` |
 | Provisional/permanent reference insert/delete | `LOCAL_QUORUM` |
 | GC discovery and candidate reads | `LOCAL_QUORUM` |
 | Existing terminal first-writer metadata LWT (initial pointer only) | Unchanged from today: `SERIAL` phase with the existing writer commit level. The fence adds no second LWT here |
-| Rematerialization `G1 RETIRED -> G2 ACTIVE` CAS | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks`; may run inline in the materializing request |
+| Rematerialization `G1 RETIRED -> G2 ACTIVE` activation operation | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks`; runs inline in the materializing request; physical CAS executions may retry the same logical operation |
 | `ACTIVE -> RETIRING` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
 | Use-row drain, including `PENDING`, `AUTHORIZED`, and materializer uses | `EACH_QUORUM` |
 | Final generation-reference check | `EACH_QUORUM` |
 | `RETIRING -> ACTIVE` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
-| Retirement evidence append (one row per `(generation, claim_epoch)`) | `EACH_QUORUM`; append-only, never overwritten, ordered before the pointer CAS |
+| Retirement evidence append (one row per `(generation, claim_epoch)`) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM`; `INSERT ... IF NOT EXISTS`, immutable and ordered before the pointer CAS |
 | `RETIRING -> RETIRED` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
+| G1 mirror finalize `RETIRING -> RETIRED` | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the generation row, conditional on the live claim and `state=RETIRING` |
 | `RETIRED -> DELETING` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the G1 generation row |
 | `DELETING -> DELETED` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the G1 generation row |
+| Transition to `QUARANTINED` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the generation row, conditional on the expected current state |
 
 The session default remains `LOCAL_QUORUM`. New critical background LWT queries
 must explicitly set both levels rather than relying only on the driver default:
@@ -219,10 +225,89 @@ request volume:
 
 - **First materialization** reuses the existing block-metadata first-writer LWT and
   initializes the active pointer in that same operation.
-- **Rematerialization** performs one activation CAS attempt when a `RETIRED` logical
-  block comes back to life. It may run inline in the materializing request.
+- **Rematerialization** performs one logical activation operation when a `RETIRED`
+  logical block comes back to life. It runs inline in the materializing request;
+  ambiguity retries reuse the same generation and epoch.
 
 Retirement and delete LWTs belong to the GC worker and never to a request handler.
+
+### LWT Taxonomy
+
+Every LWT in this system belongs to exactly one of four groups. An implementer must
+be able to name the group before adding one, because "the generation fence uses
+Paxos" is not licence to write `pin IF ...`, `reference IF ...`, or `reuse IF ...`:
+
+| Group | Members | Frequency | Owner |
+|---|---|---|---|
+| **Existing hot path** | Block-metadata first-writer `INSERT ... IF NOT EXISTS`, released-stub repair claims, `sha1`/`representation_id` backfills, block-upload session slots, `gc_leases` finalize lease, head-commit promotion, file locks | Per block or per request | Unchanged baseline (X4) |
+| **New hot path** | **None** | — | — |
+| **Rare rematerialization** | `G1 RETIRED -> G2 ACTIVE` activation | Only when a retired SHA comes back to life | Materializing request, inline |
+| **GC cold path** | `ACTIVE -> RETIRING`, retirement evidence `INSERT ... IF NOT EXISTS`, `RETIRING -> ACTIVE`, `RETIRING -> RETIRED`, mirror finalize, `RETIRED -> DELETING`, `DELETING -> DELETED`, quarantine | Per collected generation | GC worker |
+
+The rule this taxonomy exists to protect:
+
+> Zero new Paxos for any operation that happens once per normal block. One global
+> Paxos only when a new generation is born after `RETIRED`.
+
+The GC cold path can reach five or six LWTs per collected generation. That is
+accepted deliberately: it is off the upload path, its cost buys "when in doubt, do
+not delete", and GC concurrency can be capped so those rounds do not load Cassandra
+alongside user traffic. A DC outage stalls collection rather than deletion
+correctness.
+
+Note that the existing hot-path group is not zero-cost today, and this ADR does not
+make it so. See The Existing Per-Block Paxos Is The Real Latency Cost.
+
+### The Existing Per-Block Paxos Is The Real Latency Cost
+
+It is tempting to read the taxonomy as "the normal upload path is Paxos-free". It
+is not, and the difference matters when choosing where to spend effort on latency.
+
+`UpsertBlockMetadataWithSHA1` (`internal/db/block_references.go:592-598`) runs the
+first-writer LWT unconditionally, with no pre-read:
+
+```go
+for attempt := 0; attempt < 2; attempt++ {
+    applied, err := insert()   // INSERT ... IF NOT EXISTS
+```
+
+An `INSERT ... IF NOT EXISTS` pays the full Paxos round **whether or not it
+applies**. The upload cycle in `retryUploadedBlockMaterialization` is
+`store() -> materialize() -> store()`, where `store()` runs `ProbeBlockReuse` (an
+ordinary `SELECT` on `blocks`) and `materialize()` runs `RegisterUploadedBlock`,
+which calls the LWT. Both the `Reusable` and `NeedsPut` probe outcomes go through
+`materialize()`. Therefore:
+
+> Every block of every upload pays one global Paxos round in production today,
+> including pure deduplication hits where the row already exists and the LWT
+> provably cannot apply.
+
+It is global because `configs/config.prod.yaml:52` sets
+`serial_consistency: SERIAL`. This is finding X4, and it is the only Paxos in the
+system whose count scales with block volume.
+
+Two measurements belong in PR-0 before any latency decision is made:
+
+- **`paxos_variant`.** Nothing in this repository sets it, so the engine default
+  applies. The variant materially changes the round-trip count of every LWT above,
+  and therefore changes the WAN cost of both the existing hot path and the GC cold
+  path. Measure the deployed value and the effect of changing it, rather than
+  assuming either.
+- **Activation CAS latency**, `SERIAL + EACH_QUORUM`, p50/p95/p99 from each
+  participating DC to each other. The inline-versus-background question is a
+  question about this number, and it should not be answered by assumption.
+
+A probe fast path is the obvious lever and is compatible with this design: the
+probe has already read the row, so a `Reusable` outcome with complete metadata can
+skip the LWT entirely. The asymmetry makes it safe — a false negative (a
+`LOCAL_QUORUM` probe not seeing a row written in another DC) falls through to the
+LWT and is correct, while a false positive is impossible because a row that was
+never written cannot be read. Placement columns are first-writer-wins and
+immutable, so a complete row has no race left to resolve.
+
+That work is X4, not this ADR. It is recorded here because a reader who concludes
+from the taxonomy that per-block Paxos is already solved will optimize the wrong
+path, exactly as an earlier revision of this document did.
 
 ### Why Local Writers And Global GC Are Safe
 
@@ -251,8 +336,8 @@ property.
 
 This is why the protocol adds no WAN traffic or Paxos to pins, references, reuse,
 or deduplication. New global Paxos is confined to GC lifecycle transitions and the
-activation CAS attempt a materializing request makes when it rematerializes a
-retired block.
+activation CAS a materializing request makes when it rematerializes a retired
+block.
 
 ### `NetworkTopologyStrategy` Is Load-Bearing
 
@@ -275,6 +360,8 @@ The implementation must:
 
 - verify the keyspace replication strategy at startup, and refuse to boot when
   `gc.enabled=true` and the strategy is not `NetworkTopologyStrategy`;
+- verify that the keyspace DC set exactly matches the configured participating DC
+  set and that every participating DC has exactly its configured RF, with RF > 0;
 - treat that check as part of the destructive-GC activation gate, not as an
   operational note.
 
@@ -322,8 +409,8 @@ MATERIALIZING -> ACTIVE -> RETIRING
                               +-- refs = 0, a use holds live
                               |   authority                 -> RETIRING, drain
                               |
-                              +-- refs = 0, all remaining
-                              |   uses expired authority    -> ACTIVE
+                              +-- refs = 0, uses > 0, all
+                              |   remaining uses expired    -> ACTIVE
                               |
                               +-- refs = 0 and uses = 0     -> RETIRED
                                                                   |
@@ -382,9 +469,9 @@ result is temporary retention, not deletion. The owner/expiry path can later
 remove the row and create a fresh candidate.
 
 `RETIRING` is a fence on writers, so it must not become a parking state. It ends on
-any of three outcomes: a reference is found, every remaining use has expired its
-authority, or the drain reaches zero. Never on "some row still exists". See
-Escaping `RETIRING` On Abandoned Uses.
+any of three outcomes: a reference is found, at least one use exists and every
+remaining use has expired its authority, or the drain reaches zero. Never on "some
+row still exists". See Escaping `RETIRING` On Abandoned Uses.
 
 ### Retirement Evidence
 
@@ -396,9 +483,9 @@ authorizes deletion by itself; the authoritative pointer must also have left
 
 ### `RETIRED`
 
-`RETIRED` means the GC has globally confirmed, at `EACH_QUORUM`, zero
-generation-bound references and zero use rows of any kind, including writer pins in
-both `PENDING` and `AUTHORIZED` state and materializer uses. G2 may now be
+`RETIRED` means the GC has established the publication frontier at `EACH_QUORUM`:
+it observed zero use rows first, then zero generation-bound references, so no
+operation capable of legally publishing a reference remains. G2 may now be
 materialized. G1 remains addressable by its own identity until its delete is
 complete.
 
@@ -409,11 +496,11 @@ does not invalidate `RETIRED`, because the writer's revalidation is ordered afte
 its own insert and will observe `RETIRING` or later, so the row can never be
 promoted to `AUTHORIZED`.
 
-The correct statement is therefore:
+The normative authority statement is therefore:
 
 ```text
-RETIRED means no use row observed at the final global read could ever
-acquire authority, and no reference existed.
+RETIRED means no use row observed at the first global read could acquire
+authority, and no reference existed at the second global read.
 ```
 
 An implementation must not read `RETIRED` as "no use row can exist from now on" and
@@ -469,9 +556,14 @@ transition it no longer owns. The deadline itself is not in the `IF` clause —
 Cassandra cannot compare against "now" — so it is enforced by the takeover LWT that
 bumps `retire_claim_epoch`, which is what invalidates the stale worker's condition.
 
-The activation CAS deliberately does **not** carry the claim, because it is executed
-by a materializing request that holds no GC claim. Its safety comes from
-`active_state = RETIRED`, which only a claim-holding worker could have installed.
+The activation CAS carries the predecessor claim ID and epoch even though the
+materializing request holds no GC claim. Its safety comes from the complete
+`G1 / E1 / RETIRED / C1 / N1` condition, which only the claim-holding retire worker
+could have installed, plus the immutable predecessor record and matching evidence
+check. Conditioning on the claim tuple rather than on `active_state = RETIRED`
+alone matters because `active_epoch` deliberately does not change across GC cycles:
+without it, a materializer that observed the pointer during retire cycle N1 could
+activate during cycle N2.
 
 The same ownership rule applies to `DELETING`. The physical delete must be tied to
 the generation and claim that authorized it, not merely to a logical block ID.
@@ -549,12 +641,13 @@ parser yields exactly:
 2. Insert pin(G, epoch, PENDING)                  LOCAL_QUORUM
 3. If step 2 was ambiguous, confirm pin(G)         LOCAL_QUORUM
    using the same use_id; on success, skip
-4. Re-read the active pointer                     LOCAL_QUORUM
-5. Authorize only if G/epoch is still ACTIVE
+4. Re-read the active pointer and generation row  LOCAL_QUORUM
+5. Authorize only if G/epoch is still ACTIVE,
+   the generation row is not QUARANTINED,
    AND this pin's own authority_deadline
    has not passed
-6. Re-check the authority deadline, then
-   reuse K or PUT/repair K
+6. Re-check lifecycle state and authority
+   deadline, then reuse K or PUT/repair K
 7. Validate AUTHORIZED pin, deadline, and epoch
 8. Publish the generation-bound reference         LOCAL_QUORUM
 9. Confirm an ambiguous reference result
@@ -562,9 +655,9 @@ parser yields exactly:
 ```
 
 The pin becomes `AUTHORIZED` only after step 5. A writer that observes
-`RETIRING`, `RETIRED`, or a different generation at revalidation has no authority
-and must not perform a physical operation. (`DELETING` and `DELETED` are not
-pointer states; see Which States Live Where.)
+`RETIRING`, `RETIRED`, a different generation, or `QUARANTINED` in the generation
+row at revalidation has no authority and must not perform a physical operation.
+(`DELETING` and `DELETED` are not pointer states; see Which States Live Where.)
 
 #### Why Step 3 Is Conditional
 
@@ -644,27 +737,63 @@ new UUID and a new key.
 1. Observe no usable active generation
 2. Generate UUID G and exact K
 3. Persist MATERIALIZING intent + AUTHORIZED use     LOCAL_QUORUM
-4. PUT K
+4. Re-check materialization deadline/margin; PUT K
 5. Verify K exists and has the expected metadata
 6. Activate: first life via the existing first-writer LWT,
    rematerialization via the activation CAS below
 7. If activation wins, mark/complete ACTIVE
-8. If another writer won, do not publish a reference
+8. If another generation won, do not publish a reference
 9. Publish the generation-bound reference            LOCAL_QUORUM
 10. Release the materializer use                     LOCAL_QUORUM
 11. Preserve losing K as an orphan for exact cleanup
 ```
 
 The use row from step 3 is held until step 10. It survives activation: the window
-between winning at step 6 and publishing at step 9 is precisely when the generation
+between winning at step 7 and publishing at step 9 is precisely when the generation
 is `ACTIVE` with zero references, so the GC must be able to see that the generation
 is in use. A materializer that loses at step 8 releases its use and lets exact
 orphan cleanup remove `K`.
 
+Steps 4 and 5 are ordered before step 6 for a reason that survives every crash
+variant: **no path may activate a generation whose object has not been verified.**
+The request satisfies this by construction, because the same execution performs the
+PUT, the verification, and the CAS. A recovery worker repairing a materializer that
+died between step 3 and step 6 does not have that guarantee and must therefore
+re-verify `K` — exact key, expected size, expected storage metadata — immediately
+before any activation attempt. A missing or uncertain object means no activation:
+preserve the intent, the use, and the key, then retry or expire.
+
+This is the property that makes deferring activation expensive. Once the CAS runs
+in a different process from the PUT, every activation crosses that trust boundary
+and every activation has to re-establish it.
+
 For the first logical life, the existing terminal `INSERT ... IF NOT EXISTS` sets
 the initial active pointer in that same operation, so no additional activation
-Paxos is introduced. For rematerialization, the logical row already exists and
-activation is an update conditional on the old generation:
+Paxos is introduced. For rematerialization, the logical row already exists. The
+materializer first persists G2's exact predecessor tuple from the retired pointer:
+
+```text
+G2.predecessor_generation_id       = G1
+G2.predecessor_active_epoch        = E1
+G2.predecessor_retire_claim_id     = C1
+G2.predecessor_retire_claim_epoch  = N1
+```
+
+That record must be durable before the activation is attempted. Before issuing the
+CAS, the materializer must also read the exact retirement-evidence row for
+`(G1, N1)` at `EACH_QUORUM` and confirm that G1's generation row is not
+`QUARANTINED`. A missing or mismatched row is a fail-closed case: do not activate
+G2, retain its use and key, and quarantine the unprovable generation state with the
+conditional transition below.
+
+The materializer must additionally hold more than the configured activation and
+clock-skew margin before all three of its own deadlines — its use's
+`authority_deadline`, its `materialization_deadline`, and the use's retention
+boundary — otherwise it abandons activation and lets exact-key recovery handle the
+intent. Activating with expired authority would produce a generation that is
+`ACTIVE` while nobody holds the authority to publish a reference to it.
+
+The activation is an update conditional on the complete old-generation identity:
 
 ```text
 UPDATE blocks
@@ -678,9 +807,11 @@ AND block_id = L
 IF active_generation_id = G1
 AND active_state = RETIRED
 AND active_epoch = E1
+AND retire_claim_id = C1
+AND retire_claim_epoch = N1
 ```
 
-This CAS may run inline in the request that materialized G2. Each materializing
+This CAS runs inline in the request that materialized G2. Each materializing
 request performs **one logical activation operation**, and exactly one such
 operation across all concurrent rematerializers can succeed.
 
@@ -695,21 +826,68 @@ bounded:     successful activations per rematerialization         = 1
 NOT bounded: CAS executions, when results are ambiguous
 ```
 
-A retry that reuses the same generation and epoch is idempotent — the condition
-`IF active_generation_id = G1 AND active_state = RETIRED AND active_epoch = E1` can
-only be satisfied once — so retrying cannot produce a second generation. Concurrent
-rematerializers of the same retired block each run one logical operation, so the
-cost is bounded by concurrent writers of that one block, not by request volume. It
-is not a new LWT per reference, reuse, or dedup hit.
+A retry that reuses the same generation, predecessor tuple, and epoch is idempotent
+— the complete condition can only be satisfied once — so retrying cannot produce a
+second generation. Concurrent rematerializers of the same retired block each run one
+logical operation, so the cost is bounded by concurrent materializers of that one
+block, not by request volume. It is not a new LWT per reference, reuse, or dedup hit.
 
 Inline activation is preferred over deferring to a background worker. Deferring
-would leave a request that has already completed a correct PUT unable to finish:
-it would return a retryable error and wait for a periodic worker, and a client
-retry in the meantime would materialize further losing generations and objects.
-Deferring does not remove the WAN dependency either — during a DC outage the upload
-cannot complete under either design, because it cannot publish a reference to a
-generation that is not active. It only moves where the failure surfaces and adds a
-worker interval to it.
+would leave a request that has already completed a correct PUT unable to finish: it
+would return a retryable error and wait for a periodic worker, and a client retry in
+the meantime would materialize further losing generations and objects unless a whole
+operation-identity layer is added to prevent it. Deferring does not remove the WAN
+dependency either — the same `SERIAL + EACH_QUORUM` round still runs, just later and
+by someone else — so it reduces first-response latency while increasing end-to-end
+latency and total work. See Background Activation, Evaluated And Rejected.
+
+#### Background Activation, Evaluated And Rejected
+
+A revision of this ADR moved the activation CAS out of the request handler into a
+background materialization worker, with a durable operation projection so a retry
+could reuse the same generation instead of allocating another. It is recorded here
+because the reasoning is worth keeping, not because the design is available.
+
+It was rejected on two grounds.
+
+**It does not do what it was adopted for.** The stated motivation was WAN latency.
+Moving a CAS to a worker does not remove a Paxos round; it relocates it. The same
+`SERIAL + EACH_QUORUM` operation still runs, so first-response latency drops while
+end-to-end latency and total work rise:
+
+```text
+inline      T = T_local + T_S3 + T_paxos + T_publish
+
+background  T_first_response = T_local + T_S3 + T_handoff
+            T_complete       = T_local + T_S3 + T_handoff
+                               + T_queue + T_preflight + T_paxos
+                               + T_publish/retry
+```
+
+And it optimizes a rare path. Rematerialization happens only when a SHA whose
+generation was fully collected comes back; the Paxos that scales with block volume
+is the existing first-writer LWT, which the move leaves untouched.
+
+**The trust boundary it creates costs more than the CAS.** Once the CAS runs in a
+different process from the PUT, six problems appear that inline does not have:
+
+| Problem | Why inline does not have it |
+|---|---|
+| The worker can activate a generation whose object was never PUT | The same execution does the PUT, the verification, and the CAS |
+| Concurrent retries of one operation allocate different generations; a fingerprinted projection detects the conflict but nothing makes them converge | No projection, no handoff |
+| Operation IDs must be both stable per attempt and never reused across attempts; `sync:<repo>:<block>` is stable but repeats across physical lifecycles | No operation identity is needed |
+| The materializer use is written `LOCAL_QUORUM` in one DC and read by a worker in another — X2's own failure shape, reappearing inside the new layer | Same process, same DC |
+| A client that never retries leaves `ACTIVE` with zero references, making the crash-recovery scan a scheduler for a normal outcome | The request publishes its own reference |
+| The materializer use stops being request-scoped and becomes an operation-scoped capability, so its deadlines must be redefined | One request, one lifetime |
+
+Every one of those is solvable. Together they are a distributed protocol added to
+avoid one cold-path Paxos round.
+
+The decision is therefore conditional, not permanent: if measured
+`SERIAL + EACH_QUORUM` activation latency turns out to violate a real request SLA,
+revisit it — with the six problems above as the known cost, and after checking
+whether the engine's Paxos variant and a probe fast path on the existing
+first-writer LWT close the gap more cheaply.
 
 Losing the CAS is an ordinary outcome and needs no coordination:
 
@@ -727,8 +905,9 @@ A: key-A becomes an exact orphan
 ```
 
 A background allocator may still exist to repair generations whose materializer
-crashed between a verified PUT and activation. That is recovery work, not the
-normal path.
+crashed between a verified PUT and activation. That is recovery work, not the normal
+path, and it must re-verify the exact object before activating because it did not
+perform the PUT itself.
 
 ### Ambiguous Activation Outcome
 
@@ -738,9 +917,10 @@ its materializer use, then reconciles against the authoritative `blocks` row:
 
 | Observed authoritative state | Action |
 |---|---|
-| `active_generation_id = G2` and `active_epoch = E2` | The CAS applied; publish the reference and release the use |
+| `active_generation_id = G2` and `active_epoch = E2`, G2's predecessor tuple matches `(G1, E1, C1, N1)` with retirement evidence for `(G1, N1)`, and G2 is not `QUARANTINED` | The CAS applied; publish the reference and release the use |
+| `active_generation_id = G2` and `active_epoch = E2`, but G2's predecessor tuple/evidence is absent or mismatched, or G2 is `QUARANTINED` | Preserve G1/K1 and G2/K2; quarantine the unprovable generation state, never publish or delete on inference |
 | A different generation is active | Lost the race; make `K2` an exact orphan and release the use |
-| Still `G1` / `RETIRED` / `E1` | Not applied; the same attempt may be retried idempotently |
+| Still `G1` / `RETIRED` / `E1` with matching claim tuple | Not applied; the same logical operation may be retried idempotently |
 | Read uncertain or a DC is unavailable | Retain `G2`, `K2`, and the use; retry later. Never orphan and never delete on an uncertain read |
 
 This generalizes to every destructive or lifecycle LWT in this design: an ambiguous
@@ -806,6 +986,13 @@ The retention expiry must be strictly later than the authority deadline plus:
 - cancellation and retry margin;
 - an operational safety margin.
 
+Authorization and the final pre-operation check must also require a remaining
+authority budget greater than the configured clock-skew, Cassandra latency, retry,
+cancellation, and physical-operation margins. A deadline that is technically in
+the future but cannot cover that bound is treated as expired for starting new
+physical work. This prevents a writer from passing a wall-clock comparison and
+then crossing the authority boundary before its PUT or repair begins.
+
 The central publish helper must reject a writer when:
 
 - the pin is absent or belongs to another operation;
@@ -814,6 +1001,8 @@ The central publish helper must reject a writer when:
 - the pointer says the pinned generation is `RETIRED`, or the pinned generation's
   own row says `DELETING` or `DELETED` — the last two are read from
   `block_generations`, not from `active_state` (see Which States Live Where);
+- the pinned generation's own row says `QUARANTINED`; quarantine is fail-closed even
+  if a stale pointer still names that generation;
 - the active generation/epoch no longer matches the authorized pin;
 - the pin is not `AUTHORIZED`;
 - the request context has expired;
@@ -832,6 +1021,7 @@ for a generation transition:
 | `RETIRING` | pointer | bounded poll/backoff; no G2 allocation; retryable failure with `Retry-After` when the budget ends. The wait is bounded by live-authority drain, not by any retention TTL — see Escaping `RETIRING` On Abandoned Uses |
 | `RETIRED` | pointer | allocate a new UUID generation, materialize it, and complete the activation CAS inline; on CAS loss, orphan the losing key and reuse the winner |
 | `MATERIALIZING` owned by another operation | generation row, reached through a pinned generation ID | bounded poll/backoff, then retryable failure. Not reachable from the pointer, so it is not a state a first materializer can poll to avoid racing |
+| `QUARANTINED` | generation row, including the row selected by a pointer under investigation | fail closed; no new use, physical operation, candidate, or delete; require operator reconciliation |
 | `DELETING` | generation row | fail/retry; never repair or reuse that generation |
 | `DELETED` | generation row | re-probe the logical block and allocate a new generation if needed |
 | Cassandra state uncertainty | either | fail closed with a bounded retry budget |
@@ -847,11 +1037,11 @@ short. Neither is optional, because each closes a stall the other does not:
   the generation when it sees any generation-bound reference, so a long
   provisional TTL costs retention rather than availability.
 - An abandoned pin must not create a long writer stall either: the GC reactivates
-  when every remaining use has expired its authority, so the wait is bounded by the
-  authority deadline rather than by `retention_expires_at`.
+  when one or more uses remain and every such use has expired its authority, so the
+  wait is bounded by the authority deadline rather than by `retention_expires_at`.
 
-`RETIRED` does not stall: the writer proceeds immediately to materialize and
-activate a new generation rather than waiting for a state transition.
+`RETIRED` does not stall on a state transition: the writer proceeds immediately to
+materialize and activate a new generation.
 
 "Does not stall" is a statement about waiting, not about availability. A
 rematerializing writer still depends on the activation CAS reaching global
@@ -984,6 +1174,56 @@ row** reached through the writer's own pinned generation ID, not against
 `active_state`. For the common case the pointer check "the active generation no
 longer matches my authorized pin" already covers it.
 
+### Conditional Quarantine Transition
+
+Quarantine is a generation-row transition, not an unconditional diagnostic write
+and not a cross-table CAS. The worker supplies the state it observed when it
+decided that the lifecycle is unprovable:
+
+```text
+UPDATE block_generations
+SET state = QUARANTINED,
+    quarantined_at = now,
+    quarantine_reason = R
+WHERE org_id = O
+  AND block_id = L
+  AND generation_id = G
+IF state = RETIRING
+AND active_epoch = E
+AND retire_claim_id = C
+AND retire_claim_epoch = N
+```
+
+The statement uses `SERIAL` for the conditional phase and `EACH_QUORUM` for the
+regular commit. The example is the `RETIRING` form. The implementation must use
+fixed state-specific statements, never accept an arbitrary state value: the
+`MATERIALIZING` form matches its operation ID, the `ACTIVE` form matches its active
+epoch and operation/predecessor identity, and the `RETIRING`/`RETIRED` forms match
+active epoch plus retire claim ID and epoch. There is no automated form for
+`DELETING` or `DELETED`. Those conditions prevent a stale worker from quarantining a
+newer same-state lifecycle or overwriting a terminal state.
+
+An ambiguous quarantine result is reconciled by reading the generation row at
+`EACH_QUORUM`: an observed `QUARANTINED` is success, the same expected state is
+retryable, `DELETING`/`DELETED` is preserved, and an uncertain read retains the
+generation and physical key. A quarantined generation is excluded from discovery,
+queues, re-enqueue, and every delete path. It can leave quarantine only through an
+explicit operator workflow with its own audited conditional transition.
+
+The generation row and the active-pointer row cannot be guarded by one Cassandra
+condition, so quarantine is a fail-closed marker, not an atomic activation lock. The
+materializer performs a final authoritative reconciliation after its pointer CAS:
+
+- If G2 is selected, its predecessor tuple and exact evidence match, and G2's own
+  row is not `QUARANTINED`, the activation is valid. A stale quarantine marker on
+  proven G1 is retained for operator review and never authorizes deleting K1.
+- If G2's row is `QUARANTINED`, or its lineage/evidence is missing or mismatched,
+  the worker does not publish the reference and quarantines/retains the affected
+  generation rows.
+- If quarantine wins before activation, the pre-CAS read aborts. If the two rows
+  race after that read, the same post-CAS reconciliation decides; no cross-table
+  inference authorizes a publish or delete.
+
 ### Epoch Allocation
 
 `active_epoch` and `retire_claim_epoch` appear in CAS conditions, in use rows, and
@@ -1009,6 +1249,11 @@ A `WRITER` use records the `active_epoch` it observed; a `MATERIALIZER` use reco
 the `active_epoch` it proposes. See Uses And References for why the two must not be
 validated the same way.
 
+The successful `RETIRING -> RETIRED` pointer transition retains the live
+`retire_claim_id` and `retire_claim_epoch` until G2 activation replaces the pointer.
+Clearing or changing those columns before a later activation would destroy
+the exact predecessor condition and is forbidden.
+
 ### Retirement Handoff
 
 The `blocks` row is the linearization point only while G is the active generation.
@@ -1022,26 +1267,26 @@ The required order is therefore:
 1. global zero check for G1                       EACH_QUORUM
    (uses first, then refs — see Read Order Is Not Decision Order)
 2. append retirement evidence for (G1, claim_epoch)
-   in the append-only evidence table              EACH_QUORUM
+   in the append-only evidence table              SERIAL + EACH_QUORUM
 3. CAS blocks RETIRING -> RETIRED                 SERIAL + EACH_QUORUM
    <-- G2 may activate from this point on
 4. finalize the mirror: generation G1 -> RETIRED   EACH_QUORUM, best effort
 ```
 
-**Step 3 is the gate, not step 4.** The G2 activation CAS conditions on
-`blocks` alone, so the instant the pointer reads `G1 / RETIRED / E1` a
-rematerializing request can win it. Nothing can hold G2 back until a later write
-to a different table lands, and an implementer who tries to enforce that will reach
-for a cross-table condition Cassandra cannot express — which this ADR forbids
-elsewhere as an acceptance criterion.
+**Step 3 is the gate, not step 4.** The G2 activation CAS conditions on the
+`blocks` row alone, so a rematerializing request can win it once the pointer reads
+`G1 / RETIRED / E1` with the matching claim tuple. Nothing can hold G2 back until a
+later write to a different table lands, and an implementer who tries to enforce
+that will reach for a cross-table condition Cassandra cannot express — which this
+ADR forbids elsewhere as an acceptance criterion.
 
 Step 4 is therefore a best-effort mirror finalize, not a precondition. The durable
 proof of retirement is:
 
 > a matching-epoch evidence row for G1, **plus** the authoritative pointer having
 > left `RETIRING` — either because it reads `G1 / RETIRED`, or because it has
-> already been replaced by G2, which could only have happened through a CAS that
-> required `G1 / RETIRED`.
+> already been replaced by G2, whose durable predecessor tuple and activation CAS
+> required the exact `G1 / E1 / C1 / N1` retirement claim.
 
 The reconciliation table below already encodes exactly this, including the row for
 `pointer = G2` with the mirror not yet finalized. The step list previously
@@ -1098,47 +1343,90 @@ block_generation_retire_evidence
     PRIMARY KEY ((org_id, block_id, generation_id), retire_claim_epoch)
 ```
 
-Each worker writes its own row and can never overwrite another's. No CAS is needed,
-so the cold path gains a durable ordering guarantee without a third global LWT.
-Consumers read the row whose `retire_claim_epoch` equals the live claim on the
+The write is the equivalent of:
+
+```text
+INSERT INTO block_generation_retire_evidence (...) VALUES (...)
+IF NOT EXISTS
+```
+
+The retry must use the same claim ID, read timestamps, and generation identity. A
+matching existing row is success; a row with the same key but different immutable
+payload is a protocol violation and fails closed.
+
+Each worker writes its own row with an immutable `INSERT ... IF NOT EXISTS` and can
+never overwrite another's payload. This conditional write is intentionally on the
+GC cold path, not the writer hot path. Consumers read the row whose
+`retire_claim_epoch` equals the live claim on the
 `blocks` row; any other row is history.
+
+An ambiguous evidence append is reconciled by reading the exact
+`(G1, retire_claim_epoch)` row at `EACH_QUORUM`. A matching immutable row means the
+append succeeded and the pointer CAS may proceed; an absent row is retryable and
+the pointer must remain `RETIRING`; an uncertain read preserves the claim and
+blocks every retirement, G2 activation, and delete decision. The worker must never
+infer append failure from a timeout.
 
 This also removes the need for any intermediate "retire prepared" generation state.
 The generation row keeps `RETIRING` until the pointer crosses, then finalizes to
-`RETIRED`. The two tables never simultaneously assert different things, because
-only one of them makes a claim about retirement at all.
+`RETIRED`. The mirror may briefly lag the pointer, but it is not an authority for
+retirement; no safety decision relies on two independently mutable assertions.
+
+The late mirror finalize is itself conditional and monotonic:
+
+```text
+UPDATE block_generations
+SET state = RETIRED,
+    updated_at = now
+WHERE org_id = O
+  AND block_id = L
+  AND generation_id = G1
+IF state = RETIRING
+AND retire_claim_id = C1
+AND retire_claim_epoch = N1
+```
+
+It uses `SERIAL` plus `EACH_QUORUM`. A finalize that races with
+`RETIRED -> DELETING` or `DELETING -> DELETED` becomes a no-op after reconciliation;
+it can never regress either terminal state to `RETIRED`.
 
 This needs no cross-table transaction. It needs an ordering rule, an epoch rule,
 and a reconciliation rule:
 
-| `blocks` view of G1 | Evidence row for the live claim epoch | Recovery action |
+| `blocks` view of G1/G2 | Evidence row and durable predecessor lineage | Recovery action |
 |---|---|---|
 | Pointer selects G1, state `RETIRING` | absent | Normal in-progress retirement; continue the drain from step 1 |
 | Pointer selects G1, state `RETIRING` | present | Crash between steps 2 and 3. **Never `DELETING`, never G2.** Revalidate the claim, re-run the global zero check, then complete step 3 — or return to `ACTIVE` if a reference has appeared |
 | Pointer selects G1, state `RETIRING` | only rows for older epochs | History from earlier retire cycles; ignore them and continue the drain from step 1 |
 | Pointer selects G1, state `RETIRED` | present | Consistent; finalize the mirror if needed, then proceed to `DELETING` |
 | Pointer selects G1, state `RETIRED` | absent | Step 2 was lost; re-run the global zero check and append evidence before proceeding |
-| Pointer selects G2 | present for the epoch that retired G1 | The zero check passed and G2 could only activate through a CAS requiring `G1 / RETIRED`; finalize the mirror and proceed to `DELETING` |
-| Pointer selects G2 | no evidence row for any epoch | Fail closed. Never delete `K1`; the retirement is unprovable and G1 must be quarantined |
+| Pointer selects G2 | evidence for the exact `N1`, and G2 predecessor is `(G1, E1, C1, N1)` | The zero check passed and G2 could only activate through a CAS requiring the matching pointer tuple; finalize the mirror and proceed to `DELETING` for G1 |
+| Pointer selects G2 | missing/mismatched evidence or G2 predecessor lineage | Fail closed. Never delete `K1`; quarantine G1, and quarantine G2 as well when its own lineage is mismatched, using conditional transitions |
 | Either read uncertain | any | Preserve and retry |
 
 Note that the `pointer selects G2` rows do not require the mirror finalize to have
 happened. That is the point of moving the gate to step 3: G2 legitimately activates
 in that window, and the evidence row plus the pointer having moved is the complete
-proof.
+proof only when G2's durable predecessor tuple matches that evidence and the
+activation claim.
 
 Three invariants govern the table, and all must be asserted in code rather than
 inferred from it:
 
 > `block_generations(G1).state` alone never authorizes `RETIRED -> DELETING`. The
 > worker must additionally hold an evidence row for the live claim epoch, and the
-> authoritative pointer must either read `G1 / RETIRED` or already select G2.
+> authoritative pointer must either read `G1 / RETIRED` or already select G2 with
+> a matching durable predecessor tuple.
 
 > Retirement evidence is valid only under the claim epoch that produced it. A
 > worker that cannot match the epoch treats the evidence as absent.
 
 > No retirement evidence is ever overwritten or deleted by a worker. Rows age out
 > by TTL only, well after the generation itself is gone.
+
+> A G2 record is valid only when its immutable predecessor tuple matches the
+> evidence row and the old pointer claim used by the activation CAS. The latest
+> evidence row for G1 is not a substitute for that exact tuple.
 
 The fail-closed row is the point of the rule: a generation whose retirement cannot
 be proven is retained forever rather than deleted on inference.
@@ -1239,7 +1527,7 @@ provisional TTL costs retention, not availability.
          -> RETIRING -> ACTIVE                     SERIAL + EACH_QUORUM
      refs == 0 and some use still holds unexpired authority
          -> keep RETIRING, drain
-     refs == 0 and every remaining use has expired authority
+     refs == 0 and uses > 0 and every remaining use has expired authority
          -> RETIRING -> ACTIVE                     SERIAL + EACH_QUORUM
      refs == 0 and uses == 0
          -> G1 -> RETIRED                          SERIAL + EACH_QUORUM
@@ -1342,7 +1630,7 @@ So the drain distinguishes two cases that the retention contract keeps separate:
 | Remaining use rows | Action |
 |---|---|
 | At least one use whose `authority_deadline` has not passed | Keep `RETIRING` and drain; that writer may still legitimately publish |
-| Every remaining use has an expired `authority_deadline` but unexpired `retention_expires_at` | `RETIRING -> ACTIVE` |
+| Uses > 0 and every remaining use has an expired `authority_deadline` but unexpired `retention_expires_at` | `RETIRING -> ACTIVE` |
 
 Reactivating on expired-authority uses is retention-safe by construction: `K1` was
 never deleted, and the publish helper independently rejects a writer whose authority
@@ -1373,6 +1661,13 @@ RETIRING -> ACTIVE (abandoned uses)
 `drain_grace` should exceed the longest remaining `retention_expires_at` among the
 uses that caused the escape, so the next cycle finds the rows gone rather than
 repeating the same reactivation.
+
+The pointer reactivation and delayed-candidate enqueue are deliberately not one
+transaction. If the process crashes after `RETIRING -> ACTIVE` and before the
+candidate write, the consequence is retention and delayed reclamation, never data
+loss; recovery scans `ACTIVE` generations with no reference and no live use as the
+backstop. The candidate write must therefore be retryable and fail closed, but it
+must never be used as a reason to roll back or weaken the pointer transition.
 
 Delegating this to the Recovery Protocol's `ACTIVE` with no reference and no live
 use branch would be wrong on Cassandra: that branch is a scan over
@@ -1470,7 +1765,12 @@ block_generations
     org_id
     block_id
     generation_id
+    predecessor_generation_id
+    predecessor_active_epoch
+    predecessor_retire_claim_id
+    predecessor_retire_claim_epoch
     state                 -- mirror/history; not the active-pointer authority
+    active_epoch
     storage_key
     storage_class
     size_bytes
@@ -1490,6 +1790,11 @@ block_generations
 `state` here ranges over `MATERIALIZING`, `ACTIVE`, `RETIRING`, `RETIRED`,
 `DELETING`, `DELETED`, `QUARANTINED`. Retirement evidence does **not** live on this
 row; see Retirement Evidence Is Append-Only And Epoch-Keyed.
+
+The predecessor fields are null only for the first generation. For every
+rematerialized generation they are immutable and must identify the exact retired
+predecessor and retirement claim that authorized its activation; they are not
+reconstructed from the latest evidence row.
 
 `QUARANTINED` is a durable terminal state, not an operator note. The fail-closed
 branch of the reconciliation table is reachable after any crash, so "quarantine G1"
@@ -1637,6 +1942,12 @@ The following current paths must be addressed by implementation PRs:
   The activation gate needs a startup assertion, not an assumption.
 - `internal/storage/s3.go:703` exposes `List` but has no caller in `internal/` or
   `cmd/`. There is no S3-side prefix enumeration to migrate today.
+- Operation IDs are not uniformly stable across client retries.
+  `internal/api/sync.go:3758-3760` derives one deterministically from repo and
+  block; `internal/api/seafhttp.go:1869-1876` embeds a fresh `uuid.NewString()` and
+  memoizes it only for the lifetime of one `ChunkUpload` (`:1167-1171`). Inline
+  activation does not depend on either property, but any future request-to-worker
+  handoff would need both; see correction 58.
 - `internal/db/block_references.go:814-935` implements `ProbeBlockReuse` without
   generation state and currently validates the content-addressed lifecycle.
 - `internal/db/block_references.go:941-977` implements ordinary reference writes and
@@ -1697,9 +2008,9 @@ Adjacent findings remain separate unless implementation deliberately closes them
 - X4 (the existing terminal first-writer Paxos cost) remains a deferred finding
   outside this ADR's scope and is tolerated as the current baseline. This design
   reuses that LWT rather than adding a parallel one, adds no Paxos to pins,
-  references, reuse, repair authorization, or dedup, and adds at most one
-  activation CAS attempt per materializing request. Retirement and delete LWTs run
-  in the GC worker.
+  references, reuse, repair authorization, or dedup, and hands one logical
+  adds one logical rematerialization activation operation. Retirement and delete
+  LWTs run in the GC worker.
 - X5, X6, X9, X10, and X11 remain separate audit work and are not activation proof
   for X1/X2.
 
@@ -1730,6 +2041,12 @@ collapse them into one number:
 All safety margins are parameters derived from that inventory, not guessed
 constants.
 
+PR-0 must also measure the two Paxos numbers in The Existing Per-Block Paxos Is The
+Real Latency Cost: the deployed `paxos_variant`, and activation-CAS latency at
+`SERIAL + EACH_QUORUM` between every pair of participating DCs. Those two numbers
+are what would justify revisiting inline activation; without them the
+inline-versus-background question cannot be argued, only asserted.
+
 ### PR-1: Final Greenfield Schema And Models
 
 Add generation, materialization, pin, reference binding, candidate, queue, orphan,
@@ -1753,9 +2070,9 @@ without it.
 
 Generate UUID keys before PUT, persist the durable `MATERIALIZING` intent together
 with its `AUTHORIZED` materializer use, verify the object, reuse the existing
-terminal first-writer LWT for initial pointer creation, perform the inline
-rematerialization activation CAS, hold the materializer use until the reference is
-published, and record losing objects for exact orphan cleanup.
+terminal first-writer LWT for initial pointer creation, persist rematerialization
+the inline rematerialization activation CAS, hold the materializer use until the
+reference is published, and record losing objects for exact orphan cleanup.
 
 Also replace every hash-derived key assumption per the physical key parsing
 inventory, including the `canonical_block_reader` validation that currently
@@ -1814,9 +2131,11 @@ Required cases include:
 - a `PENDING` pin cannot publish after observing `RETIRING`;
 - any generation-bound reference reactivates a generation;
 - a use holding live authority never reactivates a generation; it extends the drain;
-- a generation whose only remaining uses have all expired their authority is
-  reactivated rather than parked, so an abandoned pin cannot make a block
-  unwritable for its full `retention_expires_at` window;
+- a generation with one or more remaining uses, all of which have expired their
+  authority, is reactivated rather than parked, so an abandoned pin cannot make a
+  block unwritable for its full `retention_expires_at` window;
+- zero uses follows the retirement branch rather than the expired-use reactivation
+  branch; the "every use expired" predicate must not match an empty set;
 - a reactivation on expired-authority uses is followed by the recovery scan that
   re-examines `ACTIVE` generations with no reference and no live use;
 - the GC reads uses **before** references, and a test asserts the unsafe ordering
@@ -1833,9 +2152,16 @@ Required cases include:
 - a writer whose deadline expires between authorization and the physical operation
   performs no PUT or repair, so no untracked object is created at a key whose
   generation has moved on;
+- a writer whose deadline has less than the configured clock-skew and operation
+  margin is rejected before starting physical work, even when the deadline has not
+  literally passed;
+- a materializer whose operation deadline lacks the configured margin performs no
+  PUT and leaves only an exact recovery record;
 - `RETIRING -> ACTIVE` on abandoned uses writes a delayed candidate and its
   discovery projection row, and the generation is re-examined without any
   `block_generations` scan;
+- a crash or ambiguous candidate/projection enqueue after reactivation is repaired
+  by recovery, and a future-dated candidate is not processed before `candidate_at`;
 - writers observing `RETIRING` stop after a bounded retry budget and return a
   documented retryable result;
 - ambiguous authorization confirmed only by `use_id` existence is rejected; the
@@ -1848,6 +2174,27 @@ Required cases include:
 - an ambiguous materializer use aborts before PUT rather than proceeding;
 - an ambiguous activation CAS reconciles against the authoritative `blocks` row and
   never orphans or deletes on an uncertain read;
+- a rematerialization persists G2's predecessor tuple before activation, and the
+  activation CAS requires `G1`, `E1`, the retire claim ID, and the retire claim
+  epoch from that tuple;
+- a missing retirement-evidence row or quarantined G1 prevents the CAS from
+  activating G2;
+- a recovery worker repairing a crashed materializer re-verifies the exact object
+  before activating, and refuses to activate a generation whose key is missing or
+  whose existence is uncertain;
+- a crash after the MATERIALIZING intent but before the PUT never results in an
+  activation: the recovery worker verifies the exact object first and refuses;
+- an expired materialization deadline cleans only the exact key after the
+  use/retention checks, and never allocates a replacement generation;
+- a materializer refuses activation when its use `authority_deadline`, its
+  `materialization_deadline`, or the use retention boundary lacks the configured
+  margin, and an already-applied activation discovered after expiry cannot publish
+  a reference;
+- a G2 whose predecessor tuple does not match the retirement evidence is quarantined
+  and never publishes or deletes either physical key;
+- a quarantine/activation race is reconciled after the pointer CAS; a proven G2 may
+  proceed without deleting quarantined G1, while a quarantined or unprovable G2
+  cannot publish;
 - a lost step-2 retirement persist is detected and the global zero check re-runs;
 - `pointer=RETIRING` plus a matching-epoch evidence row **never reaches
   `DELETING`**: assert no `DELETING` transition, no `DeleteObject`, no G2
@@ -1860,9 +2207,22 @@ Required cases include:
 - a stale worker that appends evidence under an old claim epoch cannot destroy or
   regress a newer worker's evidence, and cannot regress the generation row out of
   `RETIRED` or `DELETING`;
+- two writes for the same `(generation, claim_epoch)` cannot change the first
+  evidence payload; the conditional insert treats an identical retry as success
+  and a conflicting payload as a protocol violation;
 - G2 activation is accepted as soon as the pointer CAS commits, without waiting for
   the mirror finalize; the resulting `pointer=G2` with an un-finalized mirror is
   reconciled, not quarantined;
+- a late mirror finalize cannot change `DELETING` or `DELETED` back to `RETIRED`;
+- a stale quarantine worker cannot overwrite `DELETING` or `DELETED`, because the
+  transition is conditional on the expected generation state;
+- a stale quarantine worker with an old active epoch, operation ID, or retire claim
+  cannot quarantine a newer same-state lifecycle;
+- a pointer-selected generation whose mirror is `QUARANTINED` rejects new uses and
+  physical operations rather than relying on the pointer state alone;
+- a generation quarantined between pin insertion and authorization is rejected
+  before authorization, and one quarantined between authorization and the physical
+  operation is rejected by the final lifecycle-state check;
 - a quarantined generation survives a process restart as `QUARANTINED`, is skipped
   by candidate discovery and every delete path, and is never automatically
   transitioned out;
@@ -1894,10 +2254,11 @@ Required cases include:
 - any global read error prevents deletion;
 - activation CAS cannot be satisfied by a condition spanning two Cassandra tables;
 - writer-path tracing shows no fence-added Paxos for pins, revalidation,
-  references, reuse, repair authorization, or deduplication, and at most one
-  activation CAS attempt per materializing request;
-- two concurrent rematerializers issue two activation CAS attempts and exactly one
-  succeeds; the acceptance criterion is not "one CAS per rematerialization";
+  references, reuse, repair authorization, or deduplication, and the new activation
+  CAS is absent from the request handler;
+- two concurrent rematerializers perform two logical activation operations
+  and exactly one succeeds; ambiguous retries reuse the same generation and do not
+  allocate another one;
 - a storage key carrying a generation suffix round-trips through every parser in
   the physical key inventory;
 - all use rows, including rows whose authority expired but whose retention has not,
@@ -1909,6 +2270,9 @@ Required cases include:
 - with `gc.enabled=true` and a non-`NetworkTopologyStrategy` keyspace, startup
   fails; the process must not run destructive GC where `EACH_QUORUM` reads degrade
   to an ordinary quorum.
+- startup also fails when the keyspace DC set differs from the configured
+  participating DC set or any expected DC has an RF different from its configured
+  positive value.
 
 ### Cassandra Multi-DC Tests
 
@@ -1949,6 +2313,8 @@ Required scenarios:
 - the same harness run against a `SimpleStrategy` keyspace demonstrates that the
   `EACH_QUORUM` reference read no longer intersects per DC, so the startup
   assertion is proven necessary rather than assumed;
+- a `NetworkTopologyStrategy` keyspace with a positive but incorrect RF or an
+  unexpected DC is rejected by the same startup gate;
 - DC outage during retire, drain, final reference check, and deleting claim;
 - no physical delete after any global operation fails;
 - claim takeover after `retire_claim_deadline`;
@@ -2040,6 +2406,10 @@ is approximately:
 Expected total: **40-65 engineer-days**, with the actual range refined after the
 writer inventory and first schema prototype.
 
+The low end of the total remains optimistic. It assumes the writer inventory finds
+no funnel that resists the pin protocol, which the Sync no-DB fallback already
+contradicts.
+
 The complete successful writer protocol has approximately five to six local
 Cassandra interactions per block when pin confirmation, active-pointer
 revalidation, authority validation, reference publication, and pin removal are
@@ -2047,12 +2417,12 @@ counted. Existing probe/reference work may be reused or coalesced where the same
 query already supplies the observation, so the incremental cost must be measured
 against the current path; it must not be budgeted as only three round trips.
 
-The fence adds no Paxos to those per-block operations. It adds at most one
-activation CAS attempt per materializing request, which executes only when a
-previously retired SHA comes back to life and therefore does not scale with request
-volume. Concurrent rematerializers of the same block each attempt once, so the
-attempt count is bounded by concurrent writers of that one block. The pre-existing
-upload LWTs listed in Current Code Evidence are unchanged.
+The fence adds no Paxos to those per-block request operations. It creates one
+logical activation operation per materializing request only when a previously
+retired SHA comes back to life. Concurrent operations for the same block
+may retry physical CAS executions when results are ambiguous, but every retry uses
+the same generation, epoch, and predecessor tuple. The pre-existing upload LWTs
+listed in Current Code Evidence are unchanged.
 
 Cold-path cost is several global reads/LWTs per candidate and intentional dependence
 on the slowest participating DC. A DC outage causes retention rather than deletion.
@@ -2077,6 +2447,8 @@ X2 is closed only when:
   assuming it was not applied;
 - the keyspace uses `NetworkTopologyStrategy` and the process refuses to start
   destructive GC otherwise, since `EACH_QUORUM` reads degrade silently without it;
+- the keyspace DC set exactly matches the configured participating DC set and every
+  expected DC has exactly its configured positive RF;
 - the global zero check reads uses before references, and the ordering is asserted
   by a test rather than left to reviewer discipline;
 - the publication frontier is stated as an invariant and no second global reference
@@ -2089,9 +2461,9 @@ X2 is closed only when:
   requires a condition spanning two Cassandra tables;
 - pin authority is enforced at authorization and again immediately before any
   physical operation, not only at publish;
-- `RETIRING` is never a parking state: it ends on a reference, on all remaining
-  uses having expired their authority, or on a zero drain, and an abandoned pin
-  cannot make a block unwritable for its full retention window;
+- `RETIRING` is never a parking state: it ends on a reference, on one or more
+  remaining uses all having expired their authority, or on a zero drain, and an
+  abandoned pin cannot make a block unwritable for its full retention window;
 - every recovery cleanup branch confirms the absence of use rows, not only of
   references;
 - expired authority cannot publish;
@@ -2160,8 +2532,9 @@ reintroduce rejected designs:
 7. `pin -> ACTIVE` is invalid for a pin that still holds live authority; any
    generation-bound reference can reactivate during `RETIRING`, while an authorized
    pin can finish publishing without reactivation. Refined by correction 37: a
-   generation whose remaining uses have *all* expired their authority does return
-   to `ACTIVE`, to release the writer fence rather than to assert liveness.
+   generation with one or more remaining uses, all of which have expired their
+   authority, does return to `ACTIVE`, to release the writer fence rather than to
+   assert liveness.
 8. G2 is forbidden during `RETIRING` and begins only after `RETIRED`.
 9. New greenfield objects use UUID keys from their first materialization; no G0
    deterministic-key compatibility path is required.
@@ -2185,22 +2558,14 @@ reintroduce rejected designs:
     adding the generation suffix.
 20. The acceptance harness must use a pinned Cassandra `5.0.6` image and must not
     treat `-short` tests as integration evidence.
-21. G2 activation may run inline in the materializing request. Forcing it into a
-    background allocator was a rejected over-correction: it would leave a request
-    that completed a correct PUT unable to finish, returning a retryable error
-    while waiting on a periodic worker and inviting duplicate losing generations.
-    One CAS on a cold path is the cheaper trade.
-
-    This has been re-raised in review as "inline Paxos in the request path
-    violates the rule that only the pre-existing upload Paxos may be in a
-    request". No such rule exists in this document, and the opposite is recorded
-    in the Executive Decision and in correction 5: the upload path already carries
-    several LWTs today, and the fence's constraint is that it adds none to pins,
-    revalidation, references, reuse, repair authorization, or deduplication — the
-    operations whose cost multiplies with request volume. Rematerialization is not
-    one of them. Deferring it does not remove the WAN dependency either, since the
-    upload cannot publish a reference to a generation that is not active; it only
-    moves where the failure surfaces and adds a worker interval to it.
+21. G2 activation runs inline in the materializing request. Deferring it to a
+    background allocator has now been proposed, adopted, and reverted once. The
+    reversion reasons are recorded under Background Activation, Evaluated And
+    Rejected: relocating a CAS does not remove a Paxos round, the round it relocates
+    is on a rare path while the per-block Paxos is elsewhere, and the request-to-
+    worker trust boundary introduces six distributed-protocol problems that inline
+    does not have. Revisit only against measured activation latency, never on the
+    assumption that "background" means "cheaper".
 22. The materialization intent is also an `AUTHORIZED` use, held from before the
     PUT until the reference is published. Without it a freshly activated
     generation is `ACTIVE` with zero references and zero uses, which is exactly a
@@ -2219,10 +2584,12 @@ reintroduce rejected designs:
 27. An ambiguous LWT outcome is reconciled against authoritative state, never
     guessed. A timeout does not mean "not applied". This applies to the activation
     CAS and to every lifecycle transition.
-28. G1 retirement must be durably persisted in `block_generations` before G2 may
-    overwrite the active pointer. Once G2 owns the pointer, `blocks` no longer
-    holds any evidence that G1 was retired, and a delete of `K1` rests on that
-    evidence. An unprovable retirement quarantines; it never deletes.
+28. G1 retirement must be durably appended in the epoch-keyed retirement-evidence
+    table before G2 may overwrite the active pointer. `block_generations` is only
+    the lifecycle mirror; once G2 owns the pointer, `blocks` no longer holds any
+    evidence that G1 was retired. G2 must also persist the exact predecessor tuple
+    `(G1, E1, C1, N1)` and its activation CAS must match the old pointer claim. An
+    unprovable retirement quarantines; it never deletes.
 29. `RETIRED` is a statement about authority, not about row absence. A late
     `PENDING` use may appear after the final global read; it is harmless because
     its own revalidation is ordered after its insert and will observe the fence.
@@ -2232,9 +2599,10 @@ reintroduce rejected designs:
     insert would abort a pin that landed correctly.
 31. Recovery cleanup must confirm the absence of use rows, not only references. A
     materializer holds a use and no reference for its whole dangerous window.
-32. Activation is "at most one attempt per materializing request, exactly one
-    winner", not "exactly one CAS per rematerialization"; concurrent
-    rematerializers each attempt once.
+32. Activation is one logical operation per materializing request, not
+    "exactly one CAS per rematerialization". Ambiguous outcomes may cause repeated
+    physical CAS executions against the same `(G, K, E)` and predecessor tuple;
+    exactly one operation wins and no retry allocates another generation.
 33. A `MATERIALIZER` use carries a *proposed* epoch, not an observed one, because
     it is `AUTHORIZED` before the pointer holds that epoch. Validating it like a
     `WRITER` use would reject every materializer.
@@ -2256,9 +2624,9 @@ reintroduce rejected designs:
 37. `RETIRING` must not be a parking state. A single abandoned pin would otherwise
     make a block unwritable for its whole `retention_expires_at` window — the same
     availability failure the ADR rejects for long-lived provisional references. A
-    generation whose remaining uses have all expired their authority returns to
-    `ACTIVE`; this is retention-safe and is not the rejected `pin -> ACTIVE` rule,
-    which concerns uses that still hold live authority.
+    generation with one or more remaining uses, all of which have expired their
+    authority, returns to `ACTIVE`; this is retention-safe and is not the rejected
+    `pin -> ACTIVE` rule, which concerns uses that still hold live authority.
 38. Retirement evidence is epoch-scoped **and append-only**. A generation can travel
     `RETIRING -> ACTIVE -> RETIRING`, so evidence that does not name its cycle is
     meaningless. A mutable state on the generation row fails twice: it is not
@@ -2266,18 +2634,21 @@ reintroduce rejected designs:
     worker's evidence — potentially regressing the row out of `RETIRED` or
     `DELETING` and destroying the delete authorization this ADR designates a
     recovery source. One immutable row per `(generation, claim_epoch)` removes both
-    failures with no additional Paxos.
+    failures; its `INSERT ... IF NOT EXISTS` is an intentional cold-path Paxos
+    operation and never runs in a writer request.
 39. `pointer=RETIRING` with a matching-epoch evidence row is a normal, expected
     crash state and was missing from the reconciliation table. It authorizes
     nothing: no `DELETING`, no G2, no S3 delete. Evidence alone never authorizes
     deletion; the authoritative pointer must also have left `RETIRING`.
 40. The gate for G2 is the **pointer CAS**, not the mirror finalize. The activation
-    CAS conditions on `blocks` alone, so G2 can win the instant the pointer reads
-    `G1 / RETIRED`; no later write to another table can hold it back. An earlier
-    revision of this ADR ordered the mirror finalize before "G2 may activate",
-    which is unenforceable and invites the cross-table condition this design
-    forbids. Durable proof of retirement is the evidence row plus the pointer
-    having left `RETIRING` — including the case where it already selects G2.
+    CAS conditions on the `blocks` row alone, including `G1 / RETIRED / E1` and its
+    retire claim ID/epoch, so a rematerializing request can win once that exact
+    tuple is present; no later write to another table can hold it back. An earlier revision
+    of this ADR ordered the mirror finalize before "G2 may activate", which is
+    unenforceable and invites the cross-table condition this design forbids. Durable
+    proof of retirement is the evidence row, the matching G2 predecessor tuple, and
+    the pointer having left `RETIRING` — including the case where it already selects
+    G2.
 41. A `blocks` row can exist without ever having been activated. Cassandra applies
     `UPDATE ... IF col != v` to a missing row, so the existing GC claim can create a
     released stub; the codebase already repairs that state. "Row exists implies
@@ -2291,9 +2662,11 @@ reintroduce rejected designs:
     behaviour and publish-helper checks for those states read the generation row,
     not `active_state`. The state machine describes two machines and they must be
     kept distinct.
-44. Confirming the pin is not redundant ambiguity handling. It orders the insert
-    before the revalidation read, which is what makes both the `RETIRED` guarantee
-    and the publication frontier true.
+44. Pin confirmation is required only when the insert result is ambiguous. An
+    acknowledged `LOCAL_QUORUM` insert already establishes the row and program
+    order places it before revalidation; an ambiguous insert needs an identity
+    read-back before proceeding. Confirmation must not be made unconditional on the
+    writer hot path.
 45. The provisional reference TTL is a correctness parameter bounding the
     upload-to-commit window, measured separately from the single-request writer
     lifetime. A commit publisher holds block IDs, not bytes, and cannot
@@ -2334,6 +2707,44 @@ reintroduce rejected designs:
     persistent marker a restarted worker cannot distinguish a quarantined
     generation from an ordinary `RETIRING` — which is exactly the inference the
     fail-closed rule forbids.
+53. G2 must carry the exact predecessor tuple `(G1, E1, retire_claim_id,
+    retire_claim_epoch)` that authorized its activation. The activation CAS checks
+    that tuple on the authoritative `blocks` row; the latest evidence row alone is
+    not durable lineage. It also closes a hole `active_epoch` cannot: the epoch does
+    not change across GC cycles, so without the claim tuple a materializer that read
+    the pointer during retire cycle N1 could activate during cycle N2.
+54. Quarantine transitions are conditional global LWTs on the generation row. They
+    require the expected current state and cannot overwrite `DELETING` or `DELETED`;
+    ambiguous results are reconciled before any delete or publish action.
+55. The expired-use reactivation predicate requires `uses > 0`; universal
+    quantification over an empty use set must not prevent `RETIRING -> RETIRED`.
+56. A late mirror finalize is conditional on `state=RETIRING` and the live retire
+    claim, so it cannot regress `DELETING` or `DELETED` to `RETIRED`.
+57. The topology gate verifies the configured DC set and exactly the configured
+    positive RF for every participating DC, not only the replication strategy name.
+    Authority checks also reserve clock-skew and physical-operation margin before
+    starting work.
+58. Any design that hands work from a request to another actor needs an operation
+    identity with two properties, not one: identical across every retry of one
+    logical attempt, **and** never reused between distinct attempts. Today's IDs
+    have at most one each — `internal/api/sync.go:3758-3760` is deterministic and
+    therefore repeats across physical lifecycles, while
+    `internal/api/seafhttp.go:1869-1876` embeds a fresh UUID and therefore does not
+    survive a retry. Inline activation needs neither property, which is part of why
+    it is cheaper. Record this before anyone proposes a handoff again.
+59. Every LWT belongs to one of four groups — existing hot path, new hot path
+    (empty), rare rematerialization, GC cold path. State the group before adding
+    one. "The generation fence uses Paxos" is not licence to write `pin IF ...`,
+    `reference IF ...`, or `reuse IF ...`; those are the per-block operations whose
+    cost multiplies.
+60. The normal upload path is **not** Paxos-free today, and the taxonomy must not be
+    read as saying so. `UpsertBlockMetadataWithSHA1` runs `INSERT ... IF NOT EXISTS`
+    unconditionally with no pre-read, and an `IF NOT EXISTS` pays the full Paxos
+    round whether or not it applies — so every block of every upload, including pure
+    dedup hits, pays one global round in production. That is X4, it is the only
+    Paxos whose count scales with block volume, and a probe fast path is the cheap
+    lever because the probe has already read the row. Optimizing the fence's cold
+    path while leaving this untouched is the mistake an earlier revision made.
 
 ## Related Documents
 
