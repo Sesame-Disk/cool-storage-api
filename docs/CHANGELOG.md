@@ -8,6 +8,59 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-10 - X1/X2 fence ADR: append-only retirement evidence, authorization deadline, quarantine state
+
+Design-document changes only. Nothing described here is implemented, no runtime
+code changed, X1/X2 remain open, and destructive GC remains disabled fleet-wide.
+
+Third audit pass. Two of these are regressions introduced by the previous pass.
+
+- **Fixed a regression:** the retirement handoff had been renumbered so that "only
+  now may a G2 activation CAS be accepted" attached to the mirror finalize instead
+  of to the pointer CAS. The activation CAS conditions on `blocks` alone, so G2 can
+  win the instant the pointer reads `G1 / RETIRED`; the step list asserted an
+  ordering the system cannot impose and invited the cross-table condition this ADR
+  forbids elsewhere. The gate is now the pointer CAS, with the mirror finalize as
+  best-effort.
+- **Fixed a regression:** the previous pass made the pin read-back unconditional and
+  justified it with the happens-before argument. A successful `LOCAL_QUORUM` write
+  already establishes the row at the requested consistency level, and program order
+  puts it before the revalidation read, so both branches of that argument hold
+  without a read-back. Confirmation is now required only for ambiguous inserts,
+  removing a round trip from the writer hot path.
+- Retirement evidence is now append-only, one immutable row per
+  `(generation, claim_epoch)`, replacing the mutable `RETIRE_PREPARED` state. The
+  mutable form could be overwritten by a stalled worker holding an older claim,
+  potentially regressing the generation row out of `RETIRED` or `DELETING` and
+  destroying the delete authorization this ADR designates a recovery source. The
+  append-only form fixes it with no additional Paxos.
+- Pin authority is now checked at authorization and again immediately before the
+  physical operation, not only at publish. The `RETIRING -> ACTIVE` escape makes it
+  reachable for a stalled writer to revalidate after its own deadline passed and
+  still find the pointer `ACTIVE` with the generation and epoch it first observed.
+  Bumping `active_epoch` on reactivation would close it but would reject an
+  already-authorized writer entitled to finish publishing across
+  `ACTIVE -> RETIRING`.
+- Added `QUARANTINED` as a durable generation state with a reason and GC exclusion.
+  The fail-closed branch is reachable after a crash, so without a persistent marker
+  a restarted worker cannot tell a quarantined generation from an ordinary
+  `RETIRING`.
+- `RETIRING -> ACTIVE` on abandoned uses now writes a delayed candidate rather than
+  delegating re-examination to the `block_generations` recovery scan, which is a
+  crash sweep, not a scheduler.
+- Replaced "at most one activation CAS attempt", which contradicted the documented
+  idempotent retry of an ambiguous CAS. The bound is one logical activation
+  operation and one generation per request; CAS executions are not bounded when
+  results are ambiguous.
+- Wrote out the explicit `IF` clauses for the GC-owned pointer transitions, so
+  "every transition must match the current claim id and epoch" is a verifiable
+  condition rather than prose.
+- Recorded why inline activation is not a scope violation, since it has now been
+  raised twice: no rule restricting the request path to pre-existing upload Paxos
+  exists in this ADR, and correction 5 says the opposite.
+
+---
+
 ## 2026-08-10 - X1/X2 fence ADR: topology gate, publication frontier, retirement evidence
 
 Design-document changes only. Nothing described here is implemented, no runtime
