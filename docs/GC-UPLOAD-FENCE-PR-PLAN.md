@@ -4,7 +4,7 @@
 **Research branch:** `docs/gc-upload-fence-rematerialization` — **not for merge**
 
 **Successor design:** [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md)
-defines the proposed greenfield X1/X2 contract. This historical PR plan does not
+defines the accepted greenfield X1/X2 contract. This historical PR plan does not
 claim that contract is implemented.
 
 **Status: PR-1 through PR-10 have all merged. The code series is complete and

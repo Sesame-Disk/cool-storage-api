@@ -754,20 +754,21 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 
 ---
 
-## Proposed Decisions
+## Accepted Designs Pending Implementation
 
 ### Generational GC Fence For X1/X2
 
-**Status:** Proposed; implementation not started
+**Status:** Accepted and frozen; implementation not started
 
 **Decision record:** [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md)
 
-The proposed greenfield design keeps writer pins and ordinary references at
+The accepted greenfield design keeps writer pins and ordinary references at
 `LOCAL_QUORUM`, reuses the existing first-writer LWT for initial activation, and uses
-`SERIAL` plus `EACH_QUORUM` for the destructive GC lifecycle and its final checks
-**and** for the rematerialization activation path — which is writer-side, inline in
-the request, and performs the retirement-evidence `EACH_QUORUM` read followed by the
-`SERIAL + EACH_QUORUM` activation CAS outside the GC worker. It prevents
+`EACH_QUORUM` for destructive liveness reads and `SERIAL + ALL` for the
+`ACTIVE -> RETIRING` writer-visibility fence. The rematerialization activation path
+is writer-side and inline in the request; it performs the retirement-evidence
+`EACH_QUORUM` read followed by a `SERIAL + EACH_QUORUM` activation CAS. No safety
+proof treats that Paxos v2 commit as per-DC visibility. The design prevents
 physical-delete ABA with UUID generations and immutable storage keys. X1 and X2
 remain open, and destructive GC remains disabled until the ADR acceptance criteria
 are implemented and verified. Generation-fence writer mode selects one

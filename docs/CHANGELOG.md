@@ -405,6 +405,49 @@ their evidence. All four are closed here; none of them reopened X2.
   worse failure in all of them — but E1 has stopped being a corner case and is now the
   block path's default failure mode under a degraded cluster. Whoever builds the
   postpone bound should size it for that.
+## 2026-08-11 - X1/X2 fence ADR accepted after final three-DC audit
+
+Design-document changes only. No runtime code changed, X1/X2 remain open, and
+destructive GC remains disabled fleet-wide. The ADR is now accepted and frozen as an
+implementation contract; that status does not claim the protocol is implemented.
+
+- Replaced the unsafe assumption that serial settlement makes `RETIRING` visible in
+  every DC. Normal `ACTIVE -> RETIRING` claims now commit at `SERIAL + ALL`; an
+  ambiguous claim settles with a serial `SELECT` and then performs an acknowledged
+  exact-tuple `SERIAL + ALL` reaffirmation before any drain.
+- Required serial settlement before classifying any ambiguous first-life or
+  rematerialization activation. Ordinary `EACH_QUORUM` pointer reads may inspect
+  lineage afterwards but cannot prove that no Paxos proposal remains pending.
+- Added transitive predecessor/evidence walks so a generation that won historically
+  and was later superseded is not misclassified as a losing orphan.
+- Split writer-originated projection writes (`LOCAL_QUORUM`) from their designated
+  scanner reads (`EACH_QUORUM`) and made an unavailable source DC hold the cursor.
+  Classified `gc_generation_zero_ref_by_day` separately as GC-owned because only the
+  designated intent scanner publishes it.
+- Made `PENDING -> AUTHORIZED` an explicit `LOCAL_QUORUM` write in both the main
+  protocol and consistency table.
+- Corrected the Paxos v1/v2 transition policy: Cassandra permits selecting either
+  variant without a full-repair prerequisite; the full repair before restoring writer
+  mode after `v1 -> v2` is explicitly conservative SesameFS policy. Also recorded the
+  Cassandra 5.0.6 Paxos v2 implementation fact that requested `EACH_QUORUM` is reduced
+  to an aggregate commit count, unlike the ordinary per-DC write handler. RF1 masks
+  this distinction; RF3 does not.
+- Added enforceable clock-health, authoritative cross-region storage, and
+  legacy-writer exclusion gates.
+- Replaced the two-DC acceptance model with exact `dc-na`/`dc-eu`/`dc-asia` RF1 and
+  RF3 tests under both uniform Paxos targets, including an omitted-DC majority.
+- Changed liveness-read errors from a permanent `RETIRING` fence to a
+  delayed-candidate `RETIRING -> ACTIVE` attempt that retains bytes and writes no
+  retirement evidence.
+- Removed the late generation-row mirror finalize entirely; the authoritative pointer
+  CAS is the activation gate and terminal generation states are monotonic.
+- Closed the remaining implementation choices before freezing: session default
+  `SERIAL` (safe option A), positive claims that cannot create stubs, dedicated named
+  recovery projections, and the existing logged batch for provisional reference plus
+  expiry work. Because Cassandra batches are atomic but not isolated, the scanner's
+  not-yet-due guard and exact-reference recheck remain mandatory.
+
+---
 
 ---
 
@@ -555,15 +598,15 @@ have matched the reactivation branch on zero uses and no generation would ever h
 reached `RETIRED`. GC would have retained everything forever. The predicate now
 requires `uses > 0`.
 
-Kept from the pass:
+Resolved during the pass and final audit:
 
 - G2 carries an immutable predecessor tuple `(G1, E1, C1, N1)` and the activation
   CAS matches the old pointer claim. This closes a hole `active_epoch` could not:
   the epoch deliberately does not change across GC cycles, so a materializer that
   read the pointer during retire cycle N1 could otherwise activate during cycle N2.
-- Late mirror finalize is conditional on `state=RETIRING` and the live retire claim,
-  so a duplicate or delayed finalize cannot regress `DELETING` or `DELETED` back to
-  `RETIRED`.
+- The pass temporarily made late mirror finalize conditional on `state=RETIRING` and
+  the live retire claim. The final audit removed that mirror write entirely because
+  the pointer CAS is authoritative and the generation lifecycle is monotonic.
 - Quarantine is a conditional generation-row LWT with fixed state-specific
   statements. A stale worker can no longer quarantine a newer same-state lifecycle
   or overwrite a terminal state.

@@ -31,7 +31,7 @@
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
 5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X2 is closed (fix proven on a real three-DC cluster, regression mutation-verified) and X1 remains open — so the activation gate now genuinely rests on X1 alone. The upload-fence PR series addresses separate writer/GC races and does not close it.
-6. **X1 design record**: the proposed greenfield protocol is documented in [`docs/GC-X1-X2-GENERATION-FENCE-ADR.md`](docs/GC-X1-X2-GENERATION-FENCE-ADR.md); implementation has not started and `GC_ENABLED=false` remains mandatory.
+6. **X1 design record**: the accepted/frozen greenfield protocol is documented in [`docs/GC-X1-X2-GENERATION-FENCE-ADR.md`](docs/GC-X1-X2-GENERATION-FENCE-ADR.md); implementation has not started and `GC_ENABLED=false` remains mandatory.
 
 ### Inter-session Update (2026-05-21)
 
@@ -58,24 +58,24 @@
 
 ## Current Branch Summary ✅
 
-**Date**: 2026-05-21
-**Focus**: Desktop Sync Conflict Hardening + Docker-first Validation + PR61 Closeout
+**Date**: 2026-08-11
+**Focus**: X1/X2 Generational GC Fence ADR Closeout (Documentation Only)
 
 ### Completed In This Branch Slice
 
-- Hardened sync HEAD publish behavior to distinguish safe same-tree retries from unsafe divergent conflicts.
-- Added integration proof for both handler entry points: `PUT /seafhttp/repo/:repo_id/commit/HEAD` and `POST /seafhttp/repo/:repo_id/update-branch`.
-- Added multi-instance convergence coverage for parent-promotion races during retry.
-- Added a real-client active-active harness with safe auto-merge and unsafe `503` scenarios.
-- Folded the active-active harness into `./scripts/test.sh sync` and made the wrapper fail-fast by default.
-- Fixed `--keep-going`, active-active `--keep`, and sync test cleanup/capacity drift.
-- Realigned the docs so status and testing guidance no longer contradict the code and current validation surface.
+- Accepted and froze the implementation contract in `docs/GC-X1-X2-GENERATION-FENCE-ADR.md` after a final three-DC audit.
+- Added the `SERIAL + ALL` `ACTIVE -> RETIRING` visibility fence and ambiguity reaffirmation required for Paxos v2 at RF3.
+- Made serial settlement mandatory before activation classification and added transitive lineage handling for historical winners.
+- Specified cross-DC projection discovery, explicit pin authorization, clock-health, authoritative storage, and coordinated rollout gates.
+- Added exact `dc-na`/`dc-eu`/`dc-asia` RF1/RF3 acceptance requirements for Paxos v1 and v2.
+- Kept X1/X2 open: this branch changes documentation only and does not permit destructive GC.
+- Files: `CURRENT_WORK.md`, `docs/ARCHITECTURE.md`, `docs/CHANGELOG.md`, `docs/DATABASE-GUIDE.md`, `docs/DECISIONS.md`, `docs/GC-UPLOAD-FENCE-PR-PLAN.md`, `docs/GC-X1-X2-GENERATION-FENCE-ADR.md`, `docs/KNOWN_ISSUES.md`, `docs/OPEN-WORK-INDEX.md`, `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`.
 
 ### Remaining Follow-up Debt
 
-- Extend desktop sync coverage into deeper-tree active-active branches and quota rejection during auto-merge.
-- Add broader multi-node quota-race coverage beyond the current per-user concurrent upload test.
-- Keep `CURRENT_WORK.md` and related status docs synced whenever the branch focus shifts; this file had drifted badly enough to become misleading.
+- Implement PR-0 through PR-8 from the frozen ADR, including the pinned Cassandra 5.0.6 three-DC harness.
+- Keep `GC_ENABLED=false` on every replica/DC until both X1 and X2 acceptance lists pass.
+- Close the canonical issues only after code, crash tests, clock/storage gates, and RF1/RF3 multi-DC evidence exist.
 
 ## Historical Session Summary ✅
 
