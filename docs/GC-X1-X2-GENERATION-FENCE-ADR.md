@@ -53,7 +53,9 @@ Use two independent safety mechanisms:
 
 1. **X2:** keep the normal generation-fence writer path regional with
    `LOCAL_QUORUM`, and confine new global coordination to the destructive-GC path
-   and the rematerialization activation CAS using `EACH_QUORUM`.
+   and the rare rematerialization activation path. That path performs the
+   retirement-evidence `EACH_QUORUM` read followed by the `SERIAL + EACH_QUORUM`
+   activation CAS.
 2. **X1:** give every new physical lifecycle a never-reused UUID generation and
    immutable physical `storage_key`, so a delayed delete can target only the old
    generation.
@@ -457,10 +459,11 @@ conflating them leaves the earlier one unenforced during the window it exists fo
 
 ```text
 generation-fence writer mode enabled       (rollout step 2: writers deployed)
-    NetworkTopologyStrategy verified
-    DC set and per-DC RF verified
-    SERIAL domain verified for every LWT touching blocks
-    paxos_variant retains linearizable reads
+    startup: NetworkTopologyStrategy verified
+    startup: DC set and per-DC RF verified
+    startup: session serial default matches the chosen option
+    startup: every eligible coordinator reports an allowlisted paxos_variant
+    code + tests: every blocks LWT has effective SERIAL
 
 destructive GC enabled                     (rollout step 7)
     requires the writer gate above, plus
@@ -495,17 +498,22 @@ The implementation must:
   participant sets, which is the very condition the gate exists to prevent. The
   rollout sequence below deliberately activates GC several steps after writers go
   live, so tying the gate to `gc.enabled` would leave exactly that window open;
-- verify that the deployed `paxos_variant` retains linearizable reads, as a
-  **positive allowlist of known-good values** — not as a pattern match against
-  `*_without_linearizable_reads*`. A deny-list admits every variant the engine has
-  not shipped yet, which is the wrong default for a property that fails silently: an
-  unrecognised value must fail closed and force an explicit review, exactly as
-  generation validity is a positive predicate rather than "not `QUARANTINED`"
-  (correction 72). PR-0 records the accepted set for the deployed engine. This is the
-  fourth check, and it is listed here rather than only in How To Issue The Settlement
-  Read because leaving it out of this enumeration is how it ends up implemented as a
-  GC-time assertion — the failure it prevents is a crashed activation on day one of
-  the writer rollout;
+- verify that **every Cassandra node eligible to coordinate generation-fence
+  queries** reports a `paxos_variant` on the positive allowlist of known-good values
+  that retain linearizable reads — not merely that one observed coordinator avoids
+  `*_without_linearizable_reads*`. A single-node observation is not sufficient
+  evidence for this gate: a request may be coordinated by any eligible node. A
+  deny-list admits every variant the engine has not shipped yet, which is the wrong
+  default for a property that fails silently: an unrecognised value must fail closed
+  and force an explicit review, exactly as generation validity is a positive
+  predicate rather than "not `QUARANTINED`" (correction 72). For the pinned
+  Cassandra 5.0.6 deployment, PR-0 must verify the exact build and freeze the
+  expected allowlist as `{v1, v2}`; any other observed value remains a fail-closed
+  configuration error until explicitly reviewed. This is the fourth check, and it
+  is listed here rather than only in How To Issue The Settlement Read because
+  leaving it out of this enumeration is how it ends up implemented as a GC-time
+  assertion — the failure it prevents is a crashed activation on day one of the
+  writer rollout;
 - treat those four checks as the generation-fence writer-mode gate, which is a
   prerequisite of the destructive-GC activation gate — not as an operational note.
 
@@ -1376,10 +1384,13 @@ One implementation note that belongs with the serial-domain decision above:
 validated before it reaches the setter, not at the call site.
 
 **The serial `SELECT` is the normative mechanism.** There is exactly one settlement
-form in this design, and the startup gate is unconditional: `paxos_variant` must
-retain linearizable reads. PR-0 records the exact accepted set for the deployed
-engine as a positive allowlist, and PR-2's startup gate rejects anything outside it —
-an unrecognised variant fails closed rather than being assumed safe.
+form in this design, and the startup gate is unconditional: every Cassandra node
+eligible to coordinate generation-fence queries must report a `paxos_variant` that
+retains linearizable reads. PR-0 records the exact accepted set for the deployed
+engine as a positive allowlist; for the pinned Cassandra 5.0.6 build the expected set
+is `{v1, v2}`, subject to exact-build verification. PR-2's gate rejects anything
+outside that set — an unrecognised variant or a single disallowed node fails closed
+rather than being assumed safe. Inspecting one coordinator is not sufficient.
 This is a third axis alongside `NetworkTopologyStrategy` and `SERIAL`, and it fails
 the same way: silently.
 
@@ -1900,14 +1911,16 @@ otherwise stops at "retry".
 The rule for a permanently failing `DELETE K`:
 
 ```text
-delete fails            -> bounded backoff, retry; the delete work row is NEVER
-                           retired, and gc_state stays DELETING
-budget exhausted        -> ADD a DLQ record, a metric, and an audit event
-                        -> stamp escalated_at and push next_attempt_at forward
-                        -> gc_state stays DELETING, the delete work row stays
-                           durable, the generation stays out of every other path
-operator resolves       -> the only exit; it ends at DELETED once the object is
-                           confirmed absent by a re-verification
+delete fails           -> bounded backoff, retry; the delete work row is NEVER
+                          retired, and gc_state stays DELETING
+budget exhausted       -> ADD a DLQ record, a metric, and an audit event
+                       -> stamp escalated_at and push next_attempt_at forward
+                       -> gc_state stays DELETING, the delete work row stays
+                          durable, the generation stays out of every other path
+after escalation       -> continue low-frequency, idempotent automatic retries
+                          and alert the operator; operator remediation may make
+                          a retry succeed sooner
+verified exact absence -> the only state exit; end at DELETED after re-verification
 ```
 
 `next_attempt_at` and `escalated_at` are not tidiness. Without them the work row is
@@ -1931,6 +1944,12 @@ shortcuts an implementer reaches for when a queue will not drain — retiring th
 row, regressing `gc_state`, or quarantining the generation. Each one strands an
 authorized delete with no owner, which is the ownerless-fence failure of correction
 100 in its physical form.
+
+Escalation does not suspend recovery. `next_attempt_at` schedules low-frequency
+automatic retries while the additive DLQ record alerts the operator. Operator
+remediation may change the outcome, but neither remediation nor the DLQ record is a
+state transition: only a retry that confirms exact-key absence can advance
+`DELETING -> DELETED`.
 
 What is **not** known in this state is whether `K1` is still there. A `DELETE` that
 returned a timeout or a transport error may well have reached the object store, so
@@ -2498,13 +2517,18 @@ references staged before the promote step — and the generation-aware design mu
 that ordering explicit:
 
 ```text
-stage pub: references (generation-bound)  ->  persist fs_object
-    ->  promote to fs: references (generation-bound)  ->  release pub:
+stage + CONFIRM pub: references (generation-bound)
+    ->  persist fs_object
+    ->  write + CONFIRM fs: references (generation-bound)
+    ->  release pub:
 ```
 
 `pub:` rows are therefore not a convenience: they are the liveness holder for the
 publish race, which is why Reference Identity requires generation identity to flow
-through them and why the expiry projection must cover them as well as `up:`.
+through them and why the expiry projection must cover them as well as `up:`. Neither
+release is allowed after an ambiguous write: an uncertain `pub:` stage preserves the
+publish attempt for retry, and an uncertain `fs:` promotion preserves `pub:` until
+the exact generation-bound reference is confirmed.
 
 The provisional reference TTL is therefore a correctness parameter of the same kind
 as the authority deadline, not a cleanup convenience:
@@ -3709,7 +3733,8 @@ one of them cannot do the others' job:
 Startup assertion (configuration and cluster state):
     NetworkTopologyStrategy
     exact configured DC set, and positive RF per DC
-    paxos_variant on the linearizable-read allowlist
+    every eligible coordinator node reports a paxos_variant on the
+    linearizable-read allowlist (expected `{v1, v2}` for the pinned 5.0.6 build)
     session serial default matches the option chosen below
 
 Code invariant (one helper, no raw statements):
@@ -3726,10 +3751,11 @@ Test and inventory (what startup cannot see):
 `EACH_QUORUM` reads degrade silently without NTS; mixing `LOCAL_SERIAL` and `SERIAL`
 on the same pointer partition is not an accepted generation-fence profile; and a
 variant without linearizable reads removes the serial read that Recovering A Crashed
-Activation depends on. All three fail silently, which is why none of them is left as
-an operational note — but only the first is checkable at boot. See correction 122: a
-statement-level invariant cannot be a startup assertion, and phrasing it as one
-leaves it satisfied by the config-string check it was meant to replace.
+Activation depends on. These properties fail silently, so none is left as an
+operational note. Topology/DC/RF, the cluster-wide `paxos_variant` allowlist, and the
+configured session default are checkable at startup. The effective serial level of
+every Go statement is not; that statement-level invariant is carried by the helper
+and inventory tests. See correction 122.
 
 PR-2 also owns the decision in Which Serial Level Is The Session Default. There is no
 per-query serial level in the repository today, so "unrelated LWTs keep their
@@ -3794,7 +3820,10 @@ target; a serial queue is not an adequate capacity plan for the global cold path
 It owns the terminal failure path too. `DELETING` has no exit but `DELETED`, so a
 permanently failing physical delete **adds** a DLQ record, a metric and an audit
 event while keeping its delete work row; it never dequeues the row into the DLQ,
-regresses `gc_state`, or quarantines. See When The Physical Delete Keeps Failing.
+regresses `gc_state`, or quarantines. The row remains eligible for low-frequency,
+idempotent automatic retries through `next_attempt_at` while the DLQ alerts the
+operator; only confirmed exact-key absence permits `DELETED`. See When The Physical
+Delete Keeps Failing.
 
 ### PR-7: Recovery And Readers
 
@@ -4000,8 +4029,10 @@ Required cases include:
 - two retire cycles of one generation sharing a `due_at` produce two distinct
   `gc_generation_handoff_by_day` rows, because `retire_claim_epoch` is part of the
   clustering key;
-- the topology, DC/RF, `SERIAL`, and `paxos_variant` assertions all fail startup in
-  generation-fence writer mode, with `gc.enabled=false`;
+- the topology, DC/RF, cluster-wide `paxos_variant`, and chosen session-default
+  assertions all fail startup in generation-fence writer mode, with `gc.enabled=false`;
+  a separate inventory test rejects any `blocks`-partition statement whose effective
+  serial level is not `SERIAL`;
 - an unconfirmed step-3c discovery write aborts before the PUT, exactly as an
   unconfirmed intent or use does;
 - a materializer that wins activation and dies before publishing its reference is
@@ -4083,6 +4114,10 @@ Required cases include:
 - the provisional reference TTL is greater than the measured upload-to-commit
   window, and a commit whose provisional reference expired fails closed with a
   documented error rather than publishing a reference to a dead generation;
+- the publish sequence writes and confirms generation-bound `pub:` references before
+  persisting the visible `fs_object`, then writes and confirms every generation-bound
+  `fs:` reference before releasing `pub:`; an ambiguous `pub:` or `fs:` result keeps
+  the liveness holder instead of releasing it;
 - a provisional reference is never durable before its expiry projection: a test
   writes the reference with the projection suppressed and asserts the funnel fails
   closed rather than publishing, then asserts the F10 shape — reference TTL-expires,
@@ -4130,6 +4165,10 @@ Required cases include:
 - startup also fails when the keyspace DC set differs from the configured
   participating DC set or any expected DC has an RF different from its configured
   positive value.
+- the writer-mode gate inspects every Cassandra node eligible to coordinate
+  generation-fence queries and fails if any reports a `paxos_variant` outside the
+  verified allowlist; an allowlisted bootstrap coordinator cannot mask a disallowed
+  peer.
 
 ### Cassandra Multi-DC Tests
 
@@ -4408,10 +4447,12 @@ X2 is closed only when:
   rejected is any `blocks`-partition LWT whose effective level is `LOCAL_SERIAL`. It
   is enforced by routing those statements through one helper and asserted over the
   inventory by test, because startup cannot enumerate them;
-- the deployed `paxos_variant` is on a positive allowlist of variants that retain
-  linearizable reads, and generation-fence writer-mode startup rejects anything
-  outside it — including a value the engine has not shipped yet — since
-  crashed-activation settlement depends on the serial `SELECT`;
+- every Cassandra node eligible to coordinate generation-fence queries reports a
+  `paxos_variant` on the positive allowlist of variants that retain linearizable
+  reads. For the pinned Cassandra 5.0.6 build the expected allowlist is `{v1, v2}`
+  after Phase-0 exact-build verification; generation-fence writer-mode startup
+  rejects any disallowed node or value, including one the engine has not shipped,
+  since crashed-activation settlement depends on the serial `SELECT`;
 - the global zero check reads uses before references, and the ordering is asserted
   by a test rather than left to reviewer discipline;
 - the publication frontier is stated as an invariant and no second global reference
@@ -5143,12 +5184,15 @@ reintroduce rejected designs:
     and the object may already be partly removed. But the document stopped at "retry",
     leaving PR-6 to invent something for a delete that fails forever. The rule is
     bounded backoff, an **additive** DLQ record with a metric and an audit event, the
-    delete work row kept, `gc_state` kept at `DELETING`, and an operator as the only
-    exit. Retrying is always safe because `DELETE K` is idempotent and `K` is never
-    reused; dequeuing the work into the DLQ, regressing the state, or quarantining are
-    the three shortcuts that strand an authorized delete with no owner. "Escalate to
-    the DLQ" normally means "move it", which is why the additive part is stated rather
-    than implied. Two details were wrong in the first draft of this rule: `K1` is not
+    delete work row kept and `gc_state` kept at `DELETING`; low-frequency automatic
+    retries continue while the operator is alerted. Retrying is always safe because
+    `DELETE K` is idempotent and `K` is never reused; dequeuing the work into the DLQ,
+    regressing the state, or quarantining are the three shortcuts that strand an
+    authorized delete with no owner. "Escalate to the DLQ" normally means "move it",
+    which is why the additive part is stated rather than implied. The only state exit
+    remains `DELETED`, earned by confirmed exact-key absence; operator remediation can
+    make that retry succeed but is not itself a state transition. Two details were
+    wrong in the first draft of this rule: `K1` is not
     "retained" while the delete is unresolved — an ambiguous `DELETE` may well have
     reached the object store, so its presence is **unknown until re-verified**, and
     `DELETED` is earned by confirming absence rather than by assuming the last attempt
@@ -5273,12 +5317,36 @@ reintroduce rejected designs:
     in the identity list without stating the ordering that makes it load-bearing.
     Stage `pub:` → persist `fs_object` → promote `fs:` → release `pub:`.
 127. **`retire_claim_deadline` is takeover eligibility, not a hard expiry.** "Every
-    GC-owned transition must be within the valid ownership deadline" reads as a fourth
-    `IF` condition, which Cassandra cannot express and which correction 93 already
-    resolved for the activation CAS. An expired-but-uncontested claim is still valid
-    and its owner's transitions still apply; what invalidates a stale worker is the
-    takeover LWT bumping `retire_claim_epoch`. The rule survived in the body of Retire
-    Ownership even after its own section explained why it could not exist.
+     GC-owned transition must be within the valid ownership deadline" reads as a fourth
+     `IF` condition, which Cassandra cannot express and which correction 93 already
+     resolved for the activation CAS. An expired-but-uncontested claim is still valid
+     and its owner's transitions still apply; what invalidates a stale worker is the
+     takeover LWT bumping `retire_claim_epoch`. The rule survived in the body of Retire
+     Ownership even after its own section explained why it could not exist.
+128. **Startup can check the gate's cluster facts, but not every Go statement.** The
+     Implementation Split said "only the first is checkable at boot" after listing
+     topology, DC/RF, `paxos_variant`, and the session default. The first three
+     cluster facts plus the configured default are startup-checkable; only the
+     effective serial level of every `blocks`-partition statement requires the helper
+     and inventory tests. The distinction must remain explicit in the normative split.
+129. **`paxos_variant` is node-local, so its allowlist is cluster-wide.** A positive
+     allowlist is not enough if startup inspects only its bootstrap coordinator. Every
+     Cassandra node eligible to coordinate generation-fence queries must report an
+     allowlisted value. For the pinned 5.0.6 build, PR-0 verifies and freezes the
+     expected `{v1, v2}` set; one disallowed node fails the writer-mode gate.
+130. **A liveness handoff needs confirmation on both sides.** The `pub:` ordering
+     closes the visible `fs_object` window, but ambiguous writes must not be treated as
+     success: confirm `pub:` before persisting `fs_object`, confirm generation-bound
+     `fs:` before releasing `pub:`, and preserve the holder on either uncertainty.
+131. **The rematerialization summary must describe operations, not Paxos round count.**
+     The writer-side path performs the retirement-evidence `EACH_QUORUM` read followed
+     by the `SERIAL + EACH_QUORUM` activation CAS. Calling this "one global round"
+     obscures both the read and the implementation-dependent Paxos round trips.
+132. **An additive DLQ does not make the operator the only recovery actor.** After
+     escalation, `next_attempt_at` continues low-frequency idempotent retries while
+     the operator is alerted. Operator remediation may help, but only confirmed
+     exact-key absence permits `DELETING -> DELETED`; neither the DLQ nor remediation
+     changes ownership or state by itself.
 
 ## Related Documents
 
