@@ -763,10 +763,13 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 **Decision record:** [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md)
 
 The proposed greenfield design keeps writer pins and ordinary references at
-`LOCAL_QUORUM`, uses `SERIAL` plus `EACH_QUORUM` only for destructive GC fences and
-final checks, and prevents physical-delete ABA with UUID generations and immutable
-storage keys. X1 and X2 remain open, and destructive GC remains disabled until the
-ADR acceptance criteria are implemented and verified.
+`LOCAL_QUORUM`, reuses the existing first-writer LWT for initial activation, and uses
+`SERIAL` plus `EACH_QUORUM` for the destructive GC lifecycle and its final checks
+**and** for the rematerialization activation CAS — which is writer-side, inline in
+the request, and the one global round the fence adds outside the GC worker. It
+prevents physical-delete ABA with UUID generations and immutable storage keys. X1 and
+X2 remain open, and destructive GC remains disabled until the ADR acceptance criteria
+are implemented and verified.
 
 ---
 

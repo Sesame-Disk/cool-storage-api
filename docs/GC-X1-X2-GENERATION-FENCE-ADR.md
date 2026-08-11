@@ -71,7 +71,8 @@ writer: read G -> pin G -> confirm/revalidate G -> use K -> publish ref -> remov
         (generation fence adds no LWT on this path)
 
 GC: candidate -> blocks RETIRING -> drain uses -> global refs check
-    -> blocks ACTIVE                                (reference, or all uses expired)
+    -> blocks ACTIVE          (a reference, or uses > 0 and ALL of them expired;
+                               the empty set is not "all expired" -- correction 55)
     OR
     -> append retirement evidence (G1, claim_epoch)
     -> publish handoff work
@@ -494,12 +495,17 @@ The implementation must:
   participant sets, which is the very condition the gate exists to prevent. The
   rollout sequence below deliberately activates GC several steps after writers go
   live, so tying the gate to `gc.enabled` would leave exactly that window open;
-- verify that the deployed `paxos_variant` retains linearizable reads, and refuse to
-  boot on any `*_without_linearizable_reads*` value. This is the fourth check, and
-  it is listed here rather than only in How To Issue The Settlement Read because
-  leaving it out of this enumeration is how it ends up implemented as a GC-time
-  assertion — the failure it prevents is a crashed activation on day one of the
-  writer rollout;
+- verify that the deployed `paxos_variant` retains linearizable reads, as a
+  **positive allowlist of known-good values** — not as a pattern match against
+  `*_without_linearizable_reads*`. A deny-list admits every variant the engine has
+  not shipped yet, which is the wrong default for a property that fails silently: an
+  unrecognised value must fail closed and force an explicit review, exactly as
+  generation validity is a positive predicate rather than "not `QUARANTINED`"
+  (correction 72). PR-0 records the accepted set for the deployed engine. This is the
+  fourth check, and it is listed here rather than only in How To Issue The Settlement
+  Read because leaving it out of this enumeration is how it ends up implemented as a
+  GC-time assertion — the failure it prevents is a crashed activation on day one of
+  the writer rollout;
 - treat those four checks as the generation-fence writer-mode gate, which is a
   prerequisite of the destructive-GC activation gate — not as an operational note.
 
@@ -566,7 +572,8 @@ Required fields include:
 - generation ID;
 - exact storage key;
 - storage class;
-- operation/owner ID;
+- operation/owner ID, recorded as `materialization_owner` and equal to the
+  `operation_id` on the materializer's use row;
 - materialization deadline;
 - `materialization_state` and timestamps;
 - `gc_state` and claim fields when physical cleanup begins.
@@ -680,8 +687,16 @@ retire_claim_deadline
 
 Every **GC-owned reversible** pointer transition — `ACTIVE -> RETIRING`,
 `RETIRING -> ACTIVE`, `RETIRING -> RETIRED` — must match the current claim ID and
-epoch and must be within the valid ownership deadline. Generation-row transitions do
-not, and cannot; see Conditional Generation-Lifecycle Transitions.
+epoch. Generation-row transitions do not, and cannot; see Conditional
+Generation-Lifecycle Transitions.
+
+The deadline is **not** a fourth condition on those transitions. Cassandra cannot
+compare against "now", so `retire_claim_deadline` is not a hard expiry that
+invalidates a worker at the instant it passes: it is the point at which the claim
+becomes **eligible for takeover**, and what actually invalidates the stale worker is
+the takeover LWT bumping `retire_claim_epoch`. An expired-but-uncontested claim is
+still a valid claim, and its owner's transitions still apply. Stating it as "must be
+within the deadline" reads as a check an implementer would then go looking for.
 
 The activation CAS is deliberately **not** subject to the deadline rule. It is
 issued by a materializing request that holds no GC claim at all, and its safety comes
@@ -1363,7 +1378,8 @@ validated before it reaches the setter, not at the call site.
 **The serial `SELECT` is the normative mechanism.** There is exactly one settlement
 form in this design, and the startup gate is unconditional: `paxos_variant` must
 retain linearizable reads. PR-0 records the exact accepted set for the deployed
-engine, and PR-2's startup gate rejects any `*_without_linearizable_reads*` variant.
+engine as a positive allowlist, and PR-2's startup gate rejects anything outside it —
+an unrecognised variant fails closed rather than being assumed safe.
 This is a third axis alongside `NetworkTopologyStrategy` and `SERIAL`, and it fails
 the same way: silently.
 
@@ -1517,7 +1533,7 @@ for a generation transition:
 | `DELETING` | generation row | fail/retry; never repair or reuse that generation |
 | `DELETED` | generation row | re-probe the logical block and allocate a new generation if needed |
 | Cassandra state uncertainty | either | fail closed with a bounded retry budget |
-| A DC is unavailable | either | rematerialization always fails retryably: its activation CAS commits at `EACH_QUORUM`. First materialization and ordinary deduplication also reach an LWT on the `blocks` partition, so they fail too whenever the outage breaks the global Paxos majority — which it does in the current two-DC profiles. Neither is "regional"; see below for the topology split |
+| A DC is unavailable | either | rematerialization always fails retryably: its activation CAS commits at `EACH_QUORUM`. First materialization and ordinary deduplication also reach an LWT on the `blocks` partition, so they fail too whenever the outage breaks the global Paxos majority — which it does on the current two-DC RF 1 topology once the fence forces those LWTs to `SERIAL`. Neither is "regional"; see below for the topology split |
 
 The exact HTTP/status mapping is an implementation decision for PR-4, but every
 funnel must expose the same retryable error contract.
@@ -1541,9 +1557,14 @@ DCs a global Paxos quorum is both replicas. Losing one DC therefore fails every
 upload of that block — dedup hit, first materialization, and rematerialization
 alike — not only the rematerializing case.
 
-This is a property of the **existing** baseline, not something the generation fence
-introduces; the fence inherits it and the `SERIAL` gate makes it mandatory rather
-than configurable.
+Two things must be kept apart here, and the first draft ran them together. The
+**existing baseline** is that every materialization and dedup path reaches this LWT
+at all; that is unchanged by the fence. Whether that LWT's Paxos domain is global or
+local is a property of the **deployed serial-consistency profile**, and today the
+multi-DC profiles are on `LOCAL_SERIAL`. Generation-fence writer mode is what makes
+the global domain mandatory for `blocks` rather than configurable — so the outage
+exposure described here is a consequence of enabling the fence on the current
+topology, not a description of what those profiles do now.
 
 The generalization stops there, though, and the reason is that `SERIAL` and
 `EACH_QUORUM` do not have the same availability envelope. Conflating them produces a
@@ -1577,8 +1598,11 @@ So the correct statements are split by mechanism, and only one of them is univer
   is `EACH_QUORUM`. This holds in every supported topology and is not negotiable;
 - the availability of the **first-writer LWT** — and therefore of dedup and first
   materialization — follows the global Paxos majority over the configured replica
-  set. In the current two-DC profiles that means a whole-DC outage blocks them; with
-  three or more DCs it need not. It must not be written as "every DC" in general.
+  set. On the current two-DC RF 1 topology, **once generation-fence writer mode
+  forces the `blocks` LWT to `SERIAL`**, a whole-DC outage blocks them; with three or
+  more DCs it need not. It must not be written as "every DC" in general, and the
+  qualifier about the profile is not optional either — those profiles run
+  `LOCAL_SERIAL` today.
 
 Two consequences belong in PR-0 rather than in an incident:
 
@@ -2465,6 +2489,23 @@ IDs, not block bytes. If the provisional reference expires before the commit run
 the generation legitimately retires and the commit has no recovery path — it can
 only fail and force the client to re-upload.
 
+The commit itself has an interior window that must not be left to inference: the
+`fs_object` row is persisted **before** its permanent `fs:` references exist
+(`internal/api/v2/fs_helpers.go:1022-1031`), so for that interval an fs_object is
+visible while nothing permanent holds its blocks alive. The current code already
+names the answer — liveness is carried by the provisional publish-attempt `pub:`
+references staged before the promote step — and the generation-aware design must keep
+that ordering explicit:
+
+```text
+stage pub: references (generation-bound)  ->  persist fs_object
+    ->  promote to fs: references (generation-bound)  ->  release pub:
+```
+
+`pub:` rows are therefore not a convenience: they are the liveness holder for the
+publish race, which is why Reference Identity requires generation identity to flow
+through them and why the expiry projection must cover them as well as `up:`.
+
 The provisional reference TTL is therefore a correctness parameter of the same kind
 as the authority deadline, not a cleanup convenience:
 
@@ -3136,7 +3177,9 @@ block_generations
     size_bytes
     sha1
     representation_id
-    materialization_owner
+    materialization_owner -- the operation_id of the materializing request; the
+                             same value its materializer use row carries, so the
+                             two rows are joinable without a second identifier
     materialization_deadline
     delete_claim_id       -- recorded by the DELETING transition; never a precondition
     delete_claim_epoch    -- recorded by the DELETING transition; never a precondition
@@ -3569,6 +3612,20 @@ with destructive GC disabled.
 Documentation only. This document records the design and current evidence. It must
 not claim any runtime behavior that has not been implemented.
 
+**Two milestones, not one.** Freezing this ADR and completing the Phase-0
+measurements are separate, and merging the document does not close the second:
+
+```text
+ADR frozen        the protocol is settled; no further design changes expected
+Phase 0 complete  paxos_variant, activation critical path, writer lifetime,
+                  upload-to-commit window and GC throughput are MEASURED
+```
+
+Every margin, deadline and TTL in this document is a parameter derived from those
+measurements. A merge that freezes the design must say so explicitly rather than
+letting "PR-0 merged" be read as "Phase 0 done"; PR-1 may begin on the frozen schema
+decisions, but no numeric parameter is fixed until the measurements exist.
+
 Before implementation, PR-0/Fase 0 must measure two different windows and must not
 collapse them into one number:
 
@@ -3628,11 +3685,13 @@ already been got wrong once:
   a capacity note. Logical-history compaction is out of scope and must not be
   reintroduced as a TTL;
 - `block_generation_references` gets its own compaction strategy, `gc_grace_seconds`,
-  and repair SLA, sized for a partition read whole at `EACH_QUORUM` at the exact
-  moment it holds one tombstone per reference the generation ever had. This is a
-  separate exercise from the use table's policy and has a different failure mode: a
-  read that trips `tombstone_failure_threshold` is a generation that can never be
-  collected;
+  and repair SLA, sized for a whole-partition `EACH_QUORUM` read taken when the live
+  references are gone while tombstones for removals not yet reclaimed by compaction
+  remain — worst-case pressure proportional to churn between successful purges, not
+  a fixed count. This is a separate exercise from the use table's policy and has a
+  different failure mode: a read that trips `tombstone_failure_threshold` is a
+  generation that can never be collected **and** a writer fence that never lifts,
+  because the read-error branch precedes both `RETIRING -> ACTIVE` escapes;
 - `gc_provisional_generation_refs_by_day` carries **no TTL** and is retired by its
   scanner, matching the predecessor it replaces.
 
@@ -3643,24 +3702,42 @@ context propagation and fail-closed behavior for all global reads/LWTs. Add seri
 domain selection for every LWT that can touch a generation-managed `blocks` row;
 ordinary writer operations remain `LOCAL_QUORUM`.
 
-Includes startup assertions for `NetworkTopologyStrategy`, the exact configured DC
-set and positive RF per DC, `SERIAL` for all LWTs that can touch a
-generation-managed `blocks` partition, and a `paxos_variant` that retains
-linearizable reads. `EACH_QUORUM` reads degrade silently without NTS; mixing
-`LOCAL_SERIAL` and `SERIAL` on the same pointer partition is not an accepted
-generation-fence profile; and a `*_without_linearizable_reads*` variant removes the
-serial read that Recovering A Crashed Activation depends on. All three fail
-silently, which is why all three are startup assertions rather than operational
-notes.
+The enforcement is split across three mechanisms, and the split is normative because
+one of them cannot do the others' job:
+
+```text
+Startup assertion (configuration and cluster state):
+    NetworkTopologyStrategy
+    exact configured DC set, and positive RF per DC
+    paxos_variant on the linearizable-read allowlist
+    session serial default matches the option chosen below
+
+Code invariant (one helper, no raw statements):
+    every blocks-partition LWT is issued through one constructor
+    that sets the serial level explicitly
+
+Test and inventory (what startup cannot see):
+    every LWT in the Current Code Evidence inventory has an effective
+    serial level of SERIAL
+    a blocks-partition LWT issued through a raw Session().Query fails
+    the inventory test
+```
+
+`EACH_QUORUM` reads degrade silently without NTS; mixing `LOCAL_SERIAL` and `SERIAL`
+on the same pointer partition is not an accepted generation-fence profile; and a
+variant without linearizable reads removes the serial read that Recovering A Crashed
+Activation depends on. All three fail silently, which is why none of them is left as
+an operational note — but only the first is checkable at boot. See correction 122: a
+statement-level invariant cannot be a startup assertion, and phrasing it as one
+leaves it satisfied by the config-string check it was meant to replace.
 
 PR-2 also owns the decision in Which Serial Level Is The Session Default. There is no
 per-query serial level in the repository today, so "unrelated LWTs keep their
 consistency" is not a state the code can currently be in. Pick option A or B
-explicitly, record which, and make the gate assert the effective per-statement level
-for the whole `blocks`-partition inventory rather than the config string. Under
-option A, the promotion of head-commit promotion, file locks, upload-session slots
-and the `gc_leases` finalize lease to global Paxos is a deliberate, measured choice
-or it is a regression discovered in production.
+explicitly and record which. Under option A, promoting head-commit promotion, file
+locks, upload-session slots and the `gc_leases` finalize lease to cross-DC Paxos in
+the multi-DC profiles is a deliberate, measured choice or it is a regression
+discovered in production.
 
 ### PR-3: Generation Allocation And Materialization
 
@@ -4331,8 +4408,9 @@ X2 is closed only when:
   rejected is any `blocks`-partition LWT whose effective level is `LOCAL_SERIAL`. It
   is enforced by routing those statements through one helper and asserted over the
   inventory by test, because startup cannot enumerate them;
-- the deployed `paxos_variant` retains linearizable reads, and generation-fence
-  writer-mode startup rejects every `*_without_linearizable_reads*` variant, since
+- the deployed `paxos_variant` is on a positive allowlist of variants that retain
+  linearizable reads, and generation-fence writer-mode startup rejects anything
+  outside it — including a value the engine has not shipped yet — since
   crashed-activation settlement depends on the serial `SELECT`;
 - the global zero check reads uses before references, and the ordering is asserted
   by a test rather than left to reviewer discipline;
@@ -5168,6 +5246,39 @@ reintroduce rejected designs:
     tracing assert the inventory. This is the technique the org-scoped-key series used
     when it deleted the global block APIs: make the compiler and the helper hold the
     invariant so a reviewer does not have to.
+123. **The Implementation Split is read instead of the body, so a rule fixed in the
+    body is not fixed.** PR-2 still demanded the impossible startup check that
+    correction 122 had just removed, and PR-1 still carried the "one tombstone per
+    reference the generation ever had" wording that correction 117 had just replaced.
+    Both were written before the corrections and neither was revisited, which is
+    correction 88's rule applied to a section that had not been treated as normative
+    prose. It is: an implementer opens the PR list first and rarely reads back up.
+124. **A profile is not a topology.** "In the current two-DC profiles a whole-DC
+    outage blocks the first-writer LWT" was false as written, because those profiles
+    run `LOCAL_SERIAL` today — the exposure appears only once generation-fence writer
+    mode forces `SERIAL` on the `blocks` partition. Availability claims have to name
+    both the replica topology **and** the consistency profile; naming one and implying
+    the other is how the previous over-generalization got in.
+125. **A gate against a silent failure is an allowlist, not a deny-list.** The
+    `paxos_variant` check was written as "reject `*_without_linearizable_reads*`",
+    which admits every variant the engine has not shipped yet — and the property it
+    guards fails silently, so an unrecognised value would be assumed safe. It becomes
+    a positive allowlist recorded by PR-0, for the same reason generation validity is
+    a positive predicate rather than "not `QUARANTINED`" (correction 72).
+126. **The `pub:` reference is the liveness holder for the publish race, not
+    bookkeeping.** The commit persists the `fs_object` row before its permanent `fs:`
+    references exist (`internal/api/v2/fs_helpers.go:1022-1031`), so for that interval
+    an fs_object is visible while nothing permanent holds its blocks. The current code
+    already answers this with staged publish-attempt references; the ADR named `pub:`
+    in the identity list without stating the ordering that makes it load-bearing.
+    Stage `pub:` → persist `fs_object` → promote `fs:` → release `pub:`.
+127. **`retire_claim_deadline` is takeover eligibility, not a hard expiry.** "Every
+    GC-owned transition must be within the valid ownership deadline" reads as a fourth
+    `IF` condition, which Cassandra cannot express and which correction 93 already
+    resolved for the activation CAS. An expired-but-uncontested claim is still valid
+    and its owner's transitions still apply; what invalidates a stale worker is the
+    takeover LWT bumping `retire_claim_epoch`. The rule survived in the body of Retire
+    Ownership even after its own section explained why it could not exist.
 
 ## Related Documents
 
