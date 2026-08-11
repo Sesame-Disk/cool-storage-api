@@ -71,14 +71,21 @@ writer: read G -> pin G -> confirm/revalidate G -> use K -> publish ref -> remov
         (generation fence adds no LWT on this path)
 
 GC: candidate -> blocks RETIRING -> drain uses -> global refs check
-    -> blocks ACTIVE or RETIRED
+    -> blocks ACTIVE                                (reference, or all uses expired)
+    OR
+    -> append retirement evidence (G1, claim_epoch)
+    -> publish handoff work
+    -> blocks RETIRED
     -> persist delete-recovery discovery work
     -> generation gc_state=DELETING -> DELETE exact K
     -> generation gc_state=DELETED -> retire discovery work
 ```
 
 Discovery always precedes the irreversible step, never follows it; see
-Discoverability Before Irreversibility.
+Discoverability Before Irreversibility. The evidence and handoff steps are part of
+the summary rather than a detail of the full sequence: the path to `RETIRED` cannot
+be written without them, because both are ordered before the pointer CAS and
+neither can be reconstructed afterwards.
 
 The following statements are part of the contract:
 
@@ -233,8 +240,33 @@ The current `internal/db/db.go:94-95` does explicitly assign
 configuration must not be changed to `EACH_QUORUM`; regular global operations set
 that level per query.
 
-The existing terminal first-writer LWT retains its current writer-path consistency;
-the generation fence must not add a second LWT around it.
+### Which Serial Level Is The Session Default
+
+"Unrelated LWTs may keep their existing consistency" and "the gate rejects
+`LOCAL_SERIAL`" cannot both be satisfied by accident, because **no per-query serial
+level exists anywhere in this repository today**. `internal/db/db.go:95` assigns
+`cluster.SerialConsistency` from one config value and not a single statement
+overrides it. PR-2 must therefore choose explicitly:
+
+| Option | Session default | What must be written per query | Cost |
+|---|---|---|---|
+| **A** | `SERIAL` | an explicit `LOCAL_SERIAL` on every LWT that is to stay regional | promotes head-commit promotion, file locks, block-upload session slots, and the `gc_leases` finalize lease to global Paxos unless each is individually opted out |
+| **B** | `LOCAL_SERIAL` | an explicit `SERIAL` on every LWT in the `blocks`-partition inventory | nothing is promoted by accident, but a statement added later without the override silently joins the wrong domain |
+
+The gate must assert **the effective per-statement level for the inventory**, not
+the config string. A config-string check is wrong in both options: under B it
+rejects a correct deployment, and under A it passes while any statement left on the
+default silently violates the one-domain rule that correction 64 exists to enforce.
+
+Option A is not free and must not be adopted by omission. Three of the four LWTs it
+would promote sit on the upload path, so PR-0 measures their latency under `SERIAL`
+before PR-2 picks an option — the same discipline this document already applies to
+the activation CAS.
+
+The existing terminal first-writer LWT retains its current writer-path regular
+consistency; the generation fence must not add a second LWT around it. Its **serial**
+phase is not exempt: it competes on the `blocks` partition and is named in the
+inventory above.
 
 The hot writer path must not add an `IF` mutation for pins, revalidation,
 references, reuse, repair authorization, or deduplication. Those are the
@@ -422,7 +454,13 @@ The implementation must:
   participant sets, which is the very condition the gate exists to prevent. The
   rollout sequence below deliberately activates GC several steps after writers go
   live, so tying the gate to `gc.enabled` would leave exactly that window open;
-- treat those checks as the generation-fence writer-mode gate, which is a
+- verify that the deployed `paxos_variant` retains linearizable reads, and refuse to
+  boot on any `*_without_linearizable_reads*` value. This is the fourth check, and
+  it is listed here rather than only in How To Issue The Settlement Read because
+  leaving it out of this enumeration is how it ends up implemented as a GC-time
+  assertion — the failure it prevents is a crashed activation on day one of the
+  writer rollout;
+- treat those four checks as the generation-fence writer-mode gate, which is a
   prerequisite of the destructive-GC activation gate — not as an operational note.
 
 ### `EACH_QUORUM` Versus `ALL`
@@ -1251,10 +1289,22 @@ expressible:
 
 ```go
 // Serial is a first-class Consistency value (0x08) in this driver.
-// `SerialConsistency` is a deprecated alias of `Consistency`.
+// The deprecated SerialConsistency *type* aliases Consistency in v2.
+// Query.SerialConsistency(...) is a different API and is NOT deprecated:
+// it sets only the serial phase of a conditional statement and must not
+// be used here.
 session.Query(`SELECT ... FROM blocks WHERE org_id = ? AND block_id = ?`, o, b).
     Consistency(gocql.Serial)
 ```
+
+Keeping the type and the method apart matters, because only one of them is
+deprecated and the two are one keystroke apart:
+
+| Symbol | Status in v2 | Role |
+|---|---|---|
+| `type SerialConsistency = Consistency` | deprecated alias | historical type, kept for source compatibility |
+| `Query.SerialConsistency(cons)` | current API, not deprecated | serial phase of a **conditional** statement only |
+| `Query.Consistency(cons)` | current API | the statement's consistency, and the only way to ask for a serial read |
 
 The distinction matters because it is the opposite of the older `gocql/gocql` v1
 driver, where `SerialConsistency` was a *separate type* and could only be attached
@@ -1264,6 +1314,11 @@ validation and the level is sent as the statement's read consistency. Do **not**
 write `.SerialConsistency(gocql.Serial)` on a plain `SELECT`: that setter is for the
 conditional phase of an LWT and is ignored by a non-conditional statement — it is
 exactly the silent no-op this section exists to prevent.
+
+One implementation note that belongs with the serial-domain decision above:
+`Query.SerialConsistency` **panics** when handed anything other than `SERIAL` or
+`LOCAL_SERIAL`. A per-query serial level driven by configuration must therefore be
+validated before it reaches the setter, not at the call site.
 
 **The serial `SELECT` is the normative mechanism.** There is exactly one settlement
 form in this design, and the startup gate is unconditional: `paxos_variant` must
@@ -1422,10 +1477,40 @@ for a generation transition:
 | `DELETING` | generation row | fail/retry; never repair or reuse that generation |
 | `DELETED` | generation row | re-probe the logical block and allocate a new generation if needed |
 | Cassandra state uncertainty | either | fail closed with a bounded retry budget |
-| A DC is unavailable and the block needs rematerialization | either | retryable failure; the activation CAS cannot reach global agreement, so the upload cannot complete. Deduplication against an already-`ACTIVE` generation is unaffected and stays regional |
+| A DC is unavailable | either | retryable failure for **every** upload that must run an LWT on the `blocks` partition: rematerialization through the activation CAS, first materialization through the first-writer LWT, and ordinary deduplication, which reaches that same LWT today. Only a path that skips it stays regional, and none exists yet — see below |
 
 The exact HTTP/status mapping is an implementation decision for PR-4, but every
 funnel must expose the same retryable error contract.
+
+#### A DC Outage Is Not Confined To Rematerialization
+
+An earlier revision limited the DC-outage row to rematerialization and stated that
+deduplication "is unaffected and stays regional". That is false against the audited
+checkout, and it contradicts this document's own X4 analysis:
+
+```text
+retryUploadedBlockMaterialization:  store() -> materialize() -> store()
+materialize() -> RegisterUploadedBlock  (internal/api/v2/fs_helpers.go:985)
+                 -> UpsertBlockMetadataWithSHA1 -> INSERT ... IF NOT EXISTS
+```
+
+`materialize()` runs on **both** probe outcomes, so a pure deduplication hit already
+pays the first-writer LWT. With `configs/config.prod.yaml:52` at
+`serial_consistency: SERIAL` that LWT is global Paxos, and at RF 1 per DC across two
+DCs a global Paxos quorum is both replicas. Losing one DC therefore fails every
+upload of that block — dedup hit, first materialization, and rematerialization
+alike — not only the rematerializing case.
+
+This is a property of the **existing** baseline, not something the generation fence
+introduces; the fence inherits it and the `SERIAL` gate makes it mandatory rather
+than configurable. Two consequences follow, and both belong in PR-0 rather than in
+an incident:
+
+- the availability envelope of the whole upload path, not just of
+  rematerialization, is "every participating DC reachable";
+- the X4 probe fast path is the only change that would make the dedup half of that
+  sentence untrue, which is a second reason to measure it early. Until it lands, no
+  writer path is regional in the sense a reader of the taxonomy might assume.
 
 Only `RETIRING` requires a writer to wait, and two separate rules keep that wait
 short. Neither is optional, because each closes a stall the other does not:
@@ -1443,9 +1528,11 @@ materialize and activate a new generation.
 "Does not stall" is a statement about waiting, not about availability. A
 rematerializing writer still depends on the activation CAS reaching global
 agreement, so during a DC outage it fails fast with a retryable error instead of
-waiting — the row above says exactly this. The two statements describe different
-things: `RETIRING` makes a writer wait for someone else's work to finish;
-`RETIRED` never does, though its own work can fail.
+waiting — the row above says exactly this, and A DC Outage Is Not Confined To
+Rematerialization says that first materialization and deduplication fail the same
+way for a different LWT. The two statements describe different things: `RETIRING`
+makes a writer wait for someone else's work to finish; `RETIRED` never does, though
+its own work can fail.
 
 ## First Materialization And Active-Pointer Authority
 
@@ -1699,6 +1786,48 @@ unconditional write is introduced, and they are never read back as a preconditio
 
 `DELETING -> DELETED` is the same shape with `IF gc_state = DELETING`, which is
 itself a non-null comparison and therefore already satisfies the missing-row rule.
+
+#### When The Physical Delete Keeps Failing
+
+`gc_state` has no path out of `DELETING` other than `DELETED`. Quarantine conditions
+on `gc_state = null` and therefore cannot be reached from `DELETING`, and that is
+correct rather than an oversight: the authorization is irrevocable, the object may
+already be partially removed, and there is no state that means "we changed our mind
+about a delete that may have happened". But a delete can still fail forever —
+credentials, a bucket policy, a decommissioned storage class — and the document
+otherwise stops at "retry".
+
+The rule for a permanently failing `DELETE K`:
+
+```text
+delete fails            -> bounded backoff, retry; the delete work row is NEVER
+                           retired, and gc_state stays DELETING
+budget exhausted        -> ADD a DLQ record, a metric, and an audit event
+                        -> gc_state stays DELETING, the delete work row stays
+                           durable, the generation stays out of every other path
+operator resolves       -> the only exit; it ends at DELETED once the object is
+                           provably gone
+```
+
+The escalation is **additive**, and the word is chosen against the usual meaning of
+"move it to the DLQ". A DLQ record here is a signal to an operator, not a change of
+custody: `gc_generation_deletes_by_day` still names the generation, because the
+handoff rule of correction 100 has no exception for an item that is failing. An
+implementation that dequeues the work into a DLQ has retired the only row naming an
+authorized, incomplete delete — the exact seam that rule exists to close.
+
+Retrying indefinitely is always safe here for the same reason recovery may retry the
+delete after a crash: `DELETE K` is idempotent and `K` is never reused, so a late
+success cannot touch a live object. What is **not** safe is any of the three
+shortcuts an implementer reaches for when a queue will not drain — retiring the work
+row, regressing `gc_state`, or quarantining the generation. Each one strands an
+authorized delete with no owner, which is the ownerless-fence failure of correction
+100 in its physical form.
+
+`K1` remains present until an operator resolves it. That is retention, the safe
+direction, and it is why this escalates loudly rather than failing closed silently:
+the object is leaked, not lost, and the only thing that can go wrong from here is
+nobody noticing.
 
 #### Generation Validity Is A Positive Predicate
 
@@ -2185,7 +2314,7 @@ Crash rules:
 | Activation CAS ambiguous | Reconcile per Ambiguous Activation Outcome; never orphan or delete on an uncertain read |
 | Active pointer selects G but generation row remains `MATERIALIZING` | Complete/repair `materialization_state=VERIFIED`; never delete K |
 | Active pointer selects another G | G lost the activation race; clean K only after confirming no references and no live uses |
-| No active pointer and intent expired | Clean exact K after fail-closed confirmation, including use absence |
+| No active pointer and intent expired | **Settle the pointer partition serially first** — "no row" and "a released stub" are both compatible with an accepted-but-unlearned first-writer proposal. Only then clean exact K, after fail-closed confirmation including use absence. See First Materialization Has The Same Hazard |
 | Any uncertain read | Preserve G/K and retry |
 
 Every cleanup branch requires confirming the absence of **use rows**, not only of
@@ -2492,11 +2621,32 @@ The required projections and their branches are:
 
 | Projection | Branch it recovers |
 |---|---|
-| expired materialization intents | `materialization_state=MATERIALIZING` past its deadline |
-| expired materializer uses | a materializer use that expired with no published reference |
-| zero-reference active generations | the pointer selects G, no reference and no live use exist — a materializer that died after activation, or a generation reactivated out of `RETIRING` on expired-authority uses. This is a **backstop**; the `RETIRING -> ACTIVE` escape schedules its own delayed candidate and that remains the normal path |
+| expired materialization intents | two branches, not one: `materialization_state=MATERIALIZING` past its deadline, **and** a materializer use that expired with no published reference. Both are reached from the same row, because the intent owns the generation until a reference, zero-ref work, or orphan work takes over |
+| zero-reference active generations | the pointer selects G, no reference and no live use exist, because a materializer died after activation. Its only publisher is the worker that retires the materialization intent without finding a reference. It does **not** cover the `RETIRING -> ACTIVE` escape — see below |
 | retirement handoff | evidence exists for the authorizing claim while `blocks.active_state` is still `RETIRING` — the crash between the evidence append and the pointer CAS. A `RETIRED` pointer with no such evidence is **not** a recovery branch: it is a protocol violation routed to quarantine |
 | pending physical delete | `gc_state=DELETING` with no orphan row, or with an orphan row in `pending_s3`, or whose S3 delete completed but metadata cleanup did not |
+
+The table has **four** rows because the schema below defines four tables. An earlier
+revision listed "expired materializer uses" as a fifth projection, which correction
+109 removed as redundant without removing its row — leaving a table that promised one
+more projection than the design has. Its branch is real and is recovered through the
+intent row; only the separate projection is gone.
+
+An earlier revision also listed the `RETIRING -> ACTIVE` escape under the
+zero-reference projection, calling it a backstop behind the delayed candidate. It
+was not one. That projection has exactly one publisher — the worker that retires the
+materialization intent without finding a reference — and that worker never runs on
+the escape path, so the "backstop" was an empty table. Naming a second owner that
+does not exist is worse than naming none, because it invites an implementer to treat
+the delayed candidate as best-effort.
+
+The escape needs no backstop, and this is a property of the contract rather than an
+accident: correction 97 orders the delayed candidate and its projection **before**
+the reactivation CAS and makes an unconfirmed enqueue forbid the CAS entirely. A
+committed reactivation therefore always has its discovery row, so the branch is
+owned outright, once, by the candidate. This is correction 110 applied to a table
+instead of to prose — where the ordering makes a crash state unreachable, nothing
+should advertise a repair for it.
 
 A full enumeration of `block_generations` remains available as an exceptional
 offline reconciliation tool. It is not the recovery protocol, and no automated path
@@ -2573,16 +2723,71 @@ The invariant is one-directional and stated per family:
 > A projection may transiently outlive its branch. It may never lag behind it.
 
 ```text
-materialization      confirm intent -> confirm use -> confirm discovery -> PUT
-RETIRING -> ACTIVE   confirm delayed candidate + projection -> CAS
-retirement handoff   confirm handoff projection -> pointer CAS
-physical delete      confirm delete projection -> DELETING CAS
+materialization        confirm intent -> confirm use -> confirm discovery -> PUT
+RETIRING -> ACTIVE     confirm delayed candidate + projection -> CAS
+retirement handoff     confirm handoff projection -> pointer CAS
+physical delete        confirm delete projection -> DELETING CAS
+provisional reference  confirm expiry projection -> confirm reference row
 ```
 
 A scanner that finds a projection row whose canonical state no longer matches deletes
 only the projection row. That is what makes "publish early, retire late" free: the
 cost of a stale row is one wasted revalidation, and the cost of a missing row is the
 recovery guarantee.
+
+### The Reference Family Is Not Optional, And Was Closed Once Already
+
+The provisional-reference row is the fifth family, and it is the one that had to be
+recovered rather than derived: replacing the universal "same logged batch as the
+canonical row" phrasing with a per-family list dropped it, because the four families
+that got written down are the four the generation fence introduces. This one is
+inherited, and it is already a **closed finding** on `main`:
+
+> F10 — "Provisional reference and its expiry were written separately, so a failure
+> between them left an undiscoverable reference." Closed by PR-8
+> ([#144](https://github.com/Sesame-Disk/sesamefs/pull/144)), which writes the
+> TTL-bound reference, the longer-lived tracker and the durable by-day projection in
+> one logged batch.
+
+The failure it closed is exactly the one the generation design would reopen, and it
+is worth stating in the new vocabulary because the mechanism is not obvious:
+
+```text
+write reference row (TTL from expires_at)
+    -> CRASH
+    -> expiry projection row never written
+
+the reference row TTL-expires on its own
+    -> references reach zero with no event and no scanner row
+    -> nothing ever creates a candidate for that generation
+    => ACTIVE, zero references, invisible to every automated path
+```
+
+Nothing is lost — this is retention, not deletion — but the generation is
+uncollectable and the scan that used to catch it is gone. The current code's own
+comment says it plainly: an unprojected reference "pins the block forever with
+nothing able to find it"
+(`internal/db/provisional_block_ref_expiry.go:56-61`).
+
+Either shape satisfies the invariant, and the choice is PR-5's:
+
+- confirm `gc_provisional_generation_refs_by_day`, then write the reference row; an
+  unconfirmed projection means **no reference**, exactly as an unconfirmed step 3c
+  means no PUT. A projection with no reference is retracted by the scanner on
+  revalidation at the cost of one wasted read;
+- or write both in one logged batch, which is what the current implementation does
+  (`internal/api/v2/fs_helpers.go:989-994`) and what
+  `TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically` asserts.
+
+The logged batch remains an implementation convenience rather than part of the
+safety proof, per the rule above. What is not optional is that the projection may
+never lag the reference — for the generation-bound reference exactly as for the
+logical one it replaces. The same rule covers `pub:` rows, which the projection must
+also carry.
+
+`block_generation_references_by_referrer` is deliberately **not** in this list. It is
+a cleanup convenience, not a discovery record: losing it costs an un-removable
+reference row, which is retention, and no path infers liveness from its absence.
 
 ### Discoverability Before Irreversibility
 
@@ -2964,6 +3169,28 @@ queries at `EACH_QUORUM`. They must not use a secondary index, `ALLOW FILTERING`
 table scan, or a cross-generation partition. The exact primary keys are part of the
 X2 proof, not an implementation detail.
 
+That read shape gives `block_generation_references` a tombstone problem the use
+table does not have, and PR-1 must specify its compaction strategy,
+`gc_grace_seconds`, and repair SLA for a reason of its own. A generation becomes a
+candidate precisely when its references reach zero, so the destructive proof reads
+that partition at the moment it holds **one tombstone per reference it ever had**,
+and it must read the partition whole — the single-partition rule above forbids
+every workaround. A block whose referrers churned heavily therefore arrives at the
+drain with a tombstone-dominated partition, and crossing `tombstone_failure_threshold`
+turns the read into an error rather than a slow answer:
+
+```text
+read error -> keep RETIRING, retry  (the fail-closed rule)
+           -> the same read fails again for the same reason
+           => the generation is never collected, and the fence never lifts
+```
+
+A tombstone-heavy reference partition is not a performance note; it is a generation
+that can neither be collected nor released, and the writers of that block stay
+fenced behind `RETIRING` until the drain-escape rules time them out. The parameters
+that keep the partition readable are part of the X2 proof in the same way the
+primary key is.
+
 `block_references` must become **dead**, not co-live. Greenfield means no backfill,
 but it does not mean the old table can be left written or read: two liveness sources
 for the same block is precisely the condition under which a GC worker concludes
@@ -2982,13 +3209,25 @@ gc_provisional_generation_refs_by_day
                  generation_id, referrer, reference_instance_id)
 ```
 
-This mirrors `gc_block_candidates_by_day`, `gc_s3_orphans_by_day`, and
-`gc_failed_items_by_expiry` (`internal/db/migrations/001_initial_schema.cql:317-329,1180-1190,1254-1263`),
+This is the generation-aware successor of the existing
+`gc_provisional_block_refs_by_day` (`internal/db/migrations/001_initial_schema.cql:342-354`)
+and mirrors `gc_block_candidates_by_day`, `gc_failed_items_by_expiry`, and
+`gc_s3_orphans_by_day` (`internal/db/migrations/001_initial_schema.cql:317-329,1180-1190,1254-1263`),
 which all partition by `(day, bucket)` so the scanner can walk a day in parallel.
 Partitioning by `org_id` would concentrate every expiring reference of the largest
 tenant into one partition. The projection must cover `pub:` as well as `up:`; its
 scanner confirms the exact reference row's expiry before cleanup and candidate
-creation. The expiry scanner never deletes a reference based only on a stale
+creation.
+
+It is published under the ordering rule of The Reference Family Is Not Optional, And
+Was Closed Once Already: never after the reference row it describes. It also keeps
+the property its predecessor has for a stated reason — **no TTL of its own**
+(`internal/db/provisional_block_ref_expiry.go:46-48`) — because it is the recovery
+anchor that has to outlive the canonical row's self-expiry, including when scanning
+is delayed past the tracker margin. It is retired by its scanner after the branch is
+resolved, never by expiry.
+
+The expiry scanner never deletes a reference based only on a stale
 `(generation_id, referrer, reference_instance_id)` observation: canonical expiry
 is by TTL, and only the matching `(expiry_day, bucket, expires_at, generation_id,
 referrer, reference_instance_id)` projection row may be removed. Any explicit
@@ -3239,7 +3478,15 @@ already been got wrong once:
   ordering it enforces is not optional;
 - retention of the pointer/generation/evidence triple is accepted as unbounded, with
   a capacity note. Logical-history compaction is out of scope and must not be
-  reintroduced as a TTL.
+  reintroduced as a TTL;
+- `block_generation_references` gets its own compaction strategy, `gc_grace_seconds`,
+  and repair SLA, sized for a partition read whole at `EACH_QUORUM` at the exact
+  moment it holds one tombstone per reference the generation ever had. This is a
+  separate exercise from the use table's policy and has a different failure mode: a
+  read that trips `tombstone_failure_threshold` is a generation that can never be
+  collected;
+- `gc_provisional_generation_refs_by_day` carries **no TTL** and is retired by its
+  scanner, matching the predecessor it replaces.
 
 ### PR-2: Explicit Consistency Helpers
 
@@ -3257,6 +3504,15 @@ generation-fence profile; and a `*_without_linearizable_reads*` variant removes 
 serial read that Recovering A Crashed Activation depends on. All three fail
 silently, which is why all three are startup assertions rather than operational
 notes.
+
+PR-2 also owns the decision in Which Serial Level Is The Session Default. There is no
+per-query serial level in the repository today, so "unrelated LWTs keep their
+consistency" is not a state the code can currently be in. Pick option A or B
+explicitly, record which, and make the gate assert the effective per-statement level
+for the whole `blocks`-partition inventory rather than the config string. Under
+option A, the promotion of head-commit promotion, file locks, upload-session slots
+and the `gc_leases` finalize lease to global Paxos is a deliberate, measured choice
+or it is a regression discovered in production.
 
 ### PR-3: Generation Allocation And Materialization
 
@@ -3290,6 +3546,12 @@ generation-aware without changing the logical `fs_object` content identity.
 The same change must remove every read and write of `block_references`, so the
 compiler prevents two liveness sources from coexisting.
 
+It also carries the provisional-reference publication rule. F10 is a closed finding
+on `main`, and the generation-aware rewrite is the one place it can be reopened: the
+expiry projection is confirmed before the reference row, or both go in one logged
+batch as they do today. PR-5 picks the shape and keeps the existing atomicity test's
+intent, generation-bound.
+
 ### PR-6: Retiring GC And Claim Leases
 
 Implement `RETIRING`, use drain, global reference checks in the specified decision
@@ -3303,6 +3565,11 @@ Paxos domain before the drain. The retirement handoff writes epoch-stamped evide
 before the pointer CAS and never authorizes `DELETING` from the generation row alone.
 PR-6 must also implement bounded worker concurrency and a measured queue-throughput
 target; a serial queue is not an adequate capacity plan for the global cold path.
+
+It owns the terminal failure path too. `DELETING` has no exit but `DELETED`, so a
+permanently failing physical delete **adds** a DLQ record, a metric and an audit
+event while keeping its delete work row; it never dequeues the row into the DLQ,
+regresses `gc_state`, or quarantines. See When The Physical Delete Keeps Failing.
 
 ### PR-7: Recovery And Readers
 
@@ -3399,7 +3666,9 @@ Required cases include:
 - a quarantine/activation race is reconciled after the pointer CAS; a proven G2 may
   proceed without deleting quarantined G1, while a quarantined or unprovable G2
   cannot publish;
-- a lost step-2 retirement persist is detected and the global zero check re-runs;
+- a lost step-2 retirement persist **under a `RETIRING` pointer** is detected and the
+  global zero check re-runs; the scope is load-bearing, because the same absence
+  under a `RETIRED` pointer must never re-run it — see the quarantine cases below;
 - `pointer=RETIRING` plus a matching claim evidence row **never reaches
   `DELETING`**: assert no `DELETING` transition, no `DeleteObject`, no G2
   activation, and that the global zero check re-runs before the pointer CAS
@@ -3503,8 +3772,9 @@ Required cases include:
 - with `pointer = G3`, G1's delete is authorized by evidence matching the claim in
   the lineage link, and a worker that compares it against the pointer's current
   claim fails the test rather than the delete;
-- two expired uses of one generation sharing a `due_at`, and two retire cycles of
-  one generation sharing a `due_at`, each produce two distinct projection rows;
+- two retire cycles of one generation sharing a `due_at` produce two distinct
+  `gc_generation_handoff_by_day` rows, because `retire_claim_epoch` is part of the
+  clustering key;
 - the topology, DC/RF, `SERIAL`, and `paxos_variant` assertions all fail startup in
   generation-fence writer mode, with `gc.enabled=false`;
 - an unconfirmed step-3c discovery write aborts before the PUT, exactly as an
@@ -3513,8 +3783,9 @@ Required cases include:
   still discovered: the intent work row is not retired until either a
   generation-bound reference exists or `gc_generation_zero_ref_by_day` is durable,
   and a test injects the crash in that exact window;
-- a materializer use projection outlives the canonical use row's TTL, so an
-  abandoned materializer is discoverable after the canonical row expires;
+- `gc_generation_intents_by_day` stays durable after the canonical materializer use
+  row's TTL expires, so an abandoned materialization is still discoverable with no
+  separate use projection;
 - a generation that retires, reactivates, and retires again writes its evidence rows
   to distinct partitions, and every consumer reaches them by point lookup on the
   authorizing `(G, N)` rather than by enumerating a generation's cycles;
@@ -3587,6 +3858,31 @@ Required cases include:
 - the provisional reference TTL is greater than the measured upload-to-commit
   window, and a commit whose provisional reference expired fails closed with a
   documented error rather than publishing a reference to a dead generation;
+- a provisional reference is never durable before its expiry projection: a test
+  writes the reference with the projection suppressed and asserts the funnel fails
+  closed rather than publishing, then asserts the F10 shape — reference TTL-expires,
+  references reach zero, no candidate is ever created — is unreachable;
+- the `RETIRING -> ACTIVE` escape is recovered by its delayed candidate alone; a test
+  asserts that no path publishes `gc_generation_zero_ref_by_day` for that branch and
+  that the branch is still recovered without one;
+- a `DELETE K` that fails permanently never retires its delete work row, never
+  regresses `gc_state` out of `DELETING`, never quarantines the generation, and adds
+  a DLQ record, a metric and an audit event once its attempt budget is exhausted; a
+  test asserts all four, including that the DLQ record is **additive** and
+  `gc_generation_deletes_by_day` still names the generation afterwards;
+- the serial-domain gate asserts the **effective per-statement** serial level for
+  every LWT in the `blocks`-partition inventory: a test leaves one statement on the
+  session default under the opposite option and asserts startup fails, so a
+  config-string check alone cannot pass the gate;
+- a DC outage fails a deduplication hit and a first materialization with the same
+  retryable contract as a rematerialization, because all three reach an LWT on the
+  `blocks` partition; a test asserts the dedup case specifically, since it is the one
+  an earlier revision documented as unaffected;
+- a `block_generation_references` partition carrying one tombstone per removed
+  reference is still readable as one `EACH_QUORUM` partition under the configured
+  compaction and `gc_grace_seconds`; a test asserts the destructive read is never
+  degraded to `ALLOW FILTERING`, a partial read, or a per-referrer read to work
+  around it;
 - under generation-fence writer mode and a non-`NetworkTopologyStrategy` keyspace, startup
   fails; the process must not run destructive GC where `EACH_QUORUM` reads degrade
   to an ordinary quorum.
@@ -3857,8 +4153,12 @@ X2 is closed only when:
 - an ambiguous `ACTIVE -> RETIRING` pointer LWT is settled in the `SERIAL` Paxos
   domain before any use/reference drain; an ordinary `EACH_QUORUM` read returning
   `ACTIVE` is not treated as proof that an accepted proposal was never committed;
-- the keyspace uses `NetworkTopologyStrategy` and the process refuses to start
-  destructive GC otherwise, since `EACH_QUORUM` reads degrade silently without it;
+- the keyspace uses `NetworkTopologyStrategy` and the process refuses to start **in
+  generation-fence writer mode** otherwise — not merely to start destructive GC —
+  since `EACH_QUORUM` reads degrade silently without it and crashed-activation
+  recovery needs the topology from the first generation-aware write. Topology, DC/RF,
+  `SERIAL` and `paxos_variant` are one gate and it binds at the same moment; see Two
+  Gates, Not One;
 - the keyspace DC set exactly matches the configured participating DC set and every
   expected DC has exactly its configured positive RF;
 - all LWTs that can touch a generation-managed `blocks` partition use `SERIAL`, and
@@ -4560,6 +4860,97 @@ reintroduce rejected designs:
     for "generations whose enqueue itself was lost" reopens by narration the window
     the ordering closed. Where a rule makes a crash state impossible, the prose must
     stop offering to repair it.
+111. **The Executive Decision sketch is normative too.** It still summarised the path
+    to `RETIRED` as "global refs check -> blocks ACTIVE or RETIRED", skipping the
+    retirement-evidence append that correction 28 orders before the pointer CAS and
+    the handoff publication that correction 100 adds ahead of it. This is correction
+    88 recurring, in the one place a hurried reader stops. Neither step is a detail of
+    the full sequence: both are ordered before the CAS and neither can be
+    reconstructed afterwards, so a summary without them describes a protocol that
+    cannot delete safely.
+112. **The provisional reference is the fifth projection family, and dropping it
+    reopens a closed finding.** Correction 101 replaced the universal "same logged
+    batch as the canonical row" rule with a per-family list — and the list contained
+    only the four families this fence invents, so the inherited one fell out
+    silently. Its failure is F10, closed on `main` by PR-8
+    ([#144](https://github.com/Sesame-Disk/sesamefs/pull/144)): a reference written
+    without its expiry projection TTL-expires on its own, references reach zero with
+    no event and no scanner row, and nothing ever creates a candidate. The generation
+    is `ACTIVE`, unreferenced and invisible — and the scan that used to catch it is
+    exactly what this design removed. Either ordering (projection confirmed first) or
+    one logged batch satisfies the invariant; having no rule at all does not.
+113. **A backstop with no publisher is worse than no backstop.**
+    `gc_generation_zero_ref_by_day` was listed as covering both a materializer that
+    died after activation *and* a generation reactivated out of `RETIRING` on expired
+    authority, while the ownership rules gave it exactly one publisher — the worker
+    that retires the materialization intent — which never runs on the escape path.
+    The escape needs no backstop: correction 97 orders its delayed candidate before
+    the CAS and forbids the CAS without it, so the branch is owned outright. Naming a
+    second owner that does not exist invites an implementer to treat the first one as
+    best-effort.
+114. **`DELETING` needs a terminal failure path, not just a retry.** There is no exit
+    from `DELETING` except `DELETED` — quarantine conditions on `gc_state = null` and
+    cannot be reached — and that is correct, because the authorization is irrevocable
+    and the object may already be partly removed. But the document stopped at "retry",
+    leaving PR-6 to invent something for a delete that fails forever. The rule is
+    bounded backoff, an **additive** DLQ record with a metric and an audit event, the
+    delete work row kept, `gc_state` kept at `DELETING`, and an operator as the only
+    exit. Retrying is always safe because `DELETE K` is idempotent and `K` is never
+    reused; dequeuing the work into the DLQ, regressing the state, or quarantining are
+    the three shortcuts that strand an authorized delete with no owner. "Escalate to
+    the DLQ" normally means "move it", which is why the additive part is stated rather
+    than implied.
+115. **"Unrelated LWTs keep their consistency" is not a state the code can be in.**
+    No per-query serial level exists anywhere in this repository:
+    `internal/db/db.go:95` sets `cluster.SerialConsistency` from one config value and
+    nothing overrides it. So that allowance and the gate that "rejects `LOCAL_SERIAL`"
+    could not both hold, and the gate as phrased is wrong in both directions — a
+    config-string check rejects a correct per-query deployment, and passes a
+    deployment where a statement left on the default silently joins the wrong Paxos
+    domain. PR-2 picks the session default explicitly and the gate asserts the
+    effective per-statement level for the whole inventory. Option A promotes four
+    unrelated LWTs, three of them on the upload path, to global Paxos; that is a
+    measured decision or it is a regression.
+116. **A DC outage is not confined to rematerialization.** The writer table said
+    deduplication "is unaffected and stays regional", contradicting this document's
+    own X4 section: `retryUploadedBlockMaterialization` calls `materialize()` on both
+    probe outcomes, so a pure dedup hit already reaches the first-writer LWT, which
+    production runs at `SERIAL`. At RF 1 per DC across two DCs a global Paxos quorum
+    is both replicas, so losing one fails dedup hits, first materializations and
+    rematerializations alike. The availability envelope of the whole upload path —
+    not of one rare branch — is "every participating DC reachable", and the X4 probe
+    fast path is the only thing that would change the dedup half of that sentence.
+117. **The reference partition needs a tombstone policy, for a different reason than
+    the use table.** PR-1 was told to specify compaction and `gc_grace_seconds` for
+    `block_generation_uses` and nothing for `block_generation_references`, although
+    the destructive proof reads the reference partition **whole** at `EACH_QUORUM`,
+    and does so precisely when it holds one tombstone per reference the generation
+    ever had. A read that trips `tombstone_failure_threshold` is not slow, it is an
+    error; the fail-closed rule turns that into "keep `RETIRING` and retry", which
+    repeats forever. The result is a generation that can never be collected and
+    writers fenced behind it — and the single-partition rule deliberately forbids
+    every workaround.
+118. **The deprecated symbol is the type, not the method.** In
+    `apache/cassandra-gocql-driver/v2` the deprecation applies to
+    `type SerialConsistency = Consistency`; `Query.SerialConsistency(...)` is current
+    API that configures only a conditional statement's serial phase. The earlier
+    wording was literally correct and one word away from being read as "the setter is
+    obsolete", in a section whose whole purpose is to stop someone from using that
+    setter on a `SELECT`. It also panics on a non-serial value, which matters once a
+    serial level comes from configuration.
+119. **The acceptance criteria must not re-narrow a gate the design already widened.**
+    The X2 list still tied `NetworkTopologyStrategy` to "refuses to start destructive
+    GC", five rollout steps after correction 105 established that the four
+    topology/serial assertions bind from the first generation-aware write. A criteria
+    list is what an implementer checks against, so a gate stated narrowly there
+    survives however carefully the body states it broadly. `paxos_variant` was missing
+    from the enumerated "implementation must" list for the same reason. Correction 109
+    left the same kind of residue in three places: two verification cases and a row in
+    the recovery-projection table still named the materializer-use projection it had
+    removed, so the table promised five projections where the schema defines four. A
+    removal is not complete until every enumeration that counted the removed thing is
+    recounted.
+
 ## Related Documents
 
 - [Known issues](./KNOWN_ISSUES.md), X1 and X2 remain open.
