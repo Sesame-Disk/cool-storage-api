@@ -540,7 +540,225 @@ question about the write path; a body cap neither helps nor hurts it.)
   `TestLogout` to assert `HttpOnly` on the real end-to-end clear response.
 - Updated `docs/OIDC.md` and `docs/diagrams/auth-layer.md` to match; the stale "embedded
   WebView" justification is gone.
+## 2026-08-11 - X1/X2 fence ADR: lineage, conditional quarantine, and the empty-set predicate
 
+Design-document changes only. Nothing described here is implemented, no runtime
+code changed, X1/X2 remain open, and destructive GC remains disabled fleet-wide.
+
+Fourth audit pass. It proposed moving the rematerialization activation CAS into a
+background worker; that part was adopted, reviewed, and reverted in the same pass,
+so this entry records the corrections that survived plus why the move did not.
+
+The critical fix is the expired-use predicate. "Every remaining use has expired its
+authority" is vacuously true for an empty set, so the previous decision order would
+have matched the reactivation branch on zero uses and no generation would ever have
+reached `RETIRED`. GC would have retained everything forever. The predicate now
+requires `uses > 0`.
+
+Kept from the pass:
+
+- G2 carries an immutable predecessor tuple `(G1, E1, C1, N1)` and the activation
+  CAS matches the old pointer claim. This closes a hole `active_epoch` could not:
+  the epoch deliberately does not change across GC cycles, so a materializer that
+  read the pointer during retire cycle N1 could otherwise activate during cycle N2.
+- Late mirror finalize is conditional on `state=RETIRING` and the live retire claim,
+  so a duplicate or delayed finalize cannot regress `DELETING` or `DELETED` back to
+  `RETIRED`.
+- Quarantine is a conditional generation-row LWT with fixed state-specific
+  statements. A stale worker can no longer quarantine a newer same-state lifecycle
+  or overwrite a terminal state.
+- The topology gate verifies the keyspace DC set and exactly the configured positive
+  RF per DC, not only the replication strategy name. `NetworkTopologyStrategy` with
+  a wrong DC set degrades the `EACH_QUORUM` intersection just as another strategy
+  would.
+- Ambiguous retirement-evidence append is reconciled by reading the exact
+  `(G1, claim_epoch)` row; a timeout never implies failure.
+- A recovery worker repairing a crashed materializer must re-verify the exact object
+  before activating, because it did not perform the PUT itself.
+- Activation requires margin against all three of the materializer's own deadlines,
+  not only the materialization deadline. Activating with expired authority would
+  produce an `ACTIVE` generation nobody may publish to.
+
+Reverted, and recorded as evaluated-and-rejected rather than deleted:
+
+- Background activation. It was adopted for WAN latency and does not deliver it:
+  relocating a CAS does not remove a Paxos round, so first-response latency drops
+  while end-to-end latency and total work rise. It also optimizes a rare path, since
+  rematerialization only happens when a fully collected SHA comes back. And the
+  request-to-worker trust boundary introduced six distributed-protocol problems that
+  inline does not have — unverified objects at activation, non-converging concurrent
+  retries behind a fingerprint that only detects the conflict, an operation identity
+  needing two properties no funnel has today, the materializer use written in one DC
+  and read in another (X2's own shape, inside the new layer), a normal path to
+  `ACTIVE` with zero references that turns the crash-recovery scan into a scheduler,
+  and a use that stops being request-scoped. The decision is conditional: revisit
+  against measured activation latency, not against the assumption that background
+  means cheaper.
+
+Added while reviewing it:
+
+- An LWT taxonomy with four groups — existing hot path, new hot path (empty), rare
+  rematerialization, GC cold path — so "the generation fence uses Paxos" cannot be
+  read as licence to write `pin IF ...` or `reference IF ...`.
+- The counterweight to that taxonomy: the normal upload path is not Paxos-free
+  today. `UpsertBlockMetadataWithSHA1` runs `INSERT ... IF NOT EXISTS`
+  unconditionally with no pre-read, and an `IF NOT EXISTS` pays the full Paxos round
+  whether or not it applies, so every block of every upload — including pure dedup
+  hits — pays one global round in production. That is X4, it is the only Paxos whose
+  count scales with block volume, and a probe fast path is the cheap lever because
+  the probe has already read the row.
+- Two PR-0 measurements that any future inline-versus-background argument depends
+  on: the deployed `paxos_variant`, which nothing in this repository sets, and
+  activation-CAS latency at `SERIAL + EACH_QUORUM` between every pair of
+  participating DCs.
+
+---
+
+## 2026-08-10 - X1/X2 fence ADR: append-only retirement evidence, authorization deadline, quarantine state
+
+Design-document changes only. Nothing described here is implemented, no runtime
+code changed, X1/X2 remain open, and destructive GC remains disabled fleet-wide.
+
+Third audit pass. Two of these are regressions introduced by the previous pass.
+
+- **Fixed a regression:** the retirement handoff had been renumbered so that "only
+  now may a G2 activation CAS be accepted" attached to the mirror finalize instead
+  of to the pointer CAS. The activation CAS conditions on `blocks` alone, so G2 can
+  win the instant the pointer reads `G1 / RETIRED`; the step list asserted an
+  ordering the system cannot impose and invited the cross-table condition this ADR
+  forbids elsewhere. The gate is now the pointer CAS, with the mirror finalize as
+  best-effort.
+- **Fixed a regression:** the previous pass made the pin read-back unconditional and
+  justified it with the happens-before argument. A successful `LOCAL_QUORUM` write
+  already establishes the row at the requested consistency level, and program order
+  puts it before the revalidation read, so both branches of that argument hold
+  without a read-back. Confirmation is now required only for ambiguous inserts,
+  removing a round trip from the writer hot path.
+- Retirement evidence is now append-only, one immutable row per
+  `(generation, claim_epoch)`, replacing the mutable `RETIRE_PREPARED` state. The
+  mutable form could be overwritten by a stalled worker holding an older claim,
+  potentially regressing the generation row out of `RETIRED` or `DELETING` and
+  destroying the delete authorization this ADR designates a recovery source. The
+  append-only form uses an idempotent cold-path conditional insert and adds no Paxos
+  to the writer hot path.
+- Pin authority is now checked at authorization and again immediately before the
+  physical operation, not only at publish. The `RETIRING -> ACTIVE` escape makes it
+  reachable for a stalled writer to revalidate after its own deadline passed and
+  still find the pointer `ACTIVE` with the generation and epoch it first observed.
+  Bumping `active_epoch` on reactivation would close it but would reject an
+  already-authorized writer entitled to finish publishing across
+  `ACTIVE -> RETIRING`.
+- Added `QUARANTINED` as a durable generation state with a reason and GC exclusion.
+  The fail-closed branch is reachable after a crash, so without a persistent marker
+  a restarted worker cannot tell a quarantined generation from an ordinary
+  `RETIRING`.
+- `RETIRING -> ACTIVE` on abandoned uses now writes a delayed candidate rather than
+  delegating re-examination to the `block_generations` recovery scan, which is a
+  crash sweep, not a scheduler.
+- Replaced "at most one activation CAS attempt", which contradicted the documented
+  idempotent retry of an ambiguous CAS. The bound is one logical activation
+  operation and one generation per request; CAS executions are not bounded when
+  results are ambiguous.
+- Wrote out the explicit `IF` clauses for the GC-owned pointer transitions, so
+  "every transition must match the current claim id and epoch" is a verifiable
+  condition rather than prose.
+- Recorded why inline activation is not a scope violation, since it has now been
+  raised twice: no rule restricting the request path to pre-existing upload Paxos
+  exists in this ADR, and correction 5 says the opposite.
+
+---
+
+## 2026-08-10 - X1/X2 fence ADR: topology gate, publication frontier, retirement evidence
+
+Design-document changes only. Nothing described here is implemented, no runtime
+code changed, X1/X2 remain open, and destructive GC remains disabled fleet-wide.
+
+Second audit pass against the code and against the Cassandra 5.0.6 source. Every
+file:line citation in the ADR was re-verified and none needed correcting; the
+findings below are design and specification gaps, not bad evidence.
+
+- Made `NetworkTopologyStrategy` a verified startup requirement rather than an
+  assumption. Under any other strategy an `EACH_QUORUM` **read** degrades silently
+  to an ordinary quorum (`ReplicaPlans.contactForRead` only routes to
+  `contactForEachQuorumRead` for NTS), which is exactly the guarantee X2 rejects,
+  while the LWT commit fails loudly. `docker-compose.prod.yml:174,182` still
+  supports `SimpleStrategy`, so the silent half was reachable.
+- Specified that the global zero check reads uses **before** references, and why:
+  with references read first, a writer holding an `AUTHORIZED` use can publish and
+  release between the two reads and both return zero. The decision order is
+  deliberately the opposite and must not be used to justify reordering the reads.
+- Named the publication frontier as an invariant — zero uses then zero references
+  proves no operation can still acquire authority to publish — so PR-6 neither
+  inserts a redundant global check between the retirement persist and the pointer
+  CAS nor relaxes the publish/release ordering that makes it true.
+- Stopped `RETIRING` from being a parking state. A single abandoned pin previously
+  made a block unwritable for its whole `retention_expires_at` window, the same
+  availability failure the ADR already rejects for provisional references. A
+  generation whose remaining uses have all expired their authority now returns to
+  `ACTIVE`.
+- Added the missing `pointer=RETIRING` + `generation=RETIRE_PREPARED` reconciliation
+  rows, and the invariant that the generation row alone never authorizes
+  `DELETING`. Introduced `RETIRE_PREPARED` so the two tables never simultaneously
+  assert semantically different things.
+- Made retirement evidence epoch-scoped. A generation can travel
+  `RETIRING -> ACTIVE -> RETIRING`, so bare evidence may be from a cycle that was
+  later reactivated; it now carries the claim id and epoch that produced it.
+- Documented that a `blocks` row can exist without ever having been activated:
+  `ClaimBlockDelete`'s `IF gc_state != 'deleting'` applies against a missing row and
+  creates a released stub. "Row exists implies active pointer" is false, and a
+  materializer reading a non-applied first-writer LWT as a lost race would loop.
+- Specified epoch allocation, which states live on the pointer versus the
+  generation row, why confirming the pin is not a redundant round trip, the
+  provisional-reference TTL as an upload-to-commit bound, the removal rather than
+  coexistence of `block_references`, `(expiry_day, bucket)` partitioning for the
+  expiry projection, and the no-unconditional-writes rule for pointer columns.
+- Corrected all eight sites still saying "exactly one CAS per rematerialization",
+  including the X2 acceptance criterion, which a correct implementation with two
+  concurrent rematerializers could not satisfy.
+
+---
+
+## 2026-08-10 - X1/X2 fence ADR: materializer authority, crash and ambiguity protocols
+
+Design-document changes only. Nothing described here is implemented, no runtime
+code changed, X1/X2 remain open, and destructive GC remains disabled fleet-wide.
+
+- Specified that the `MATERIALIZING` intent is also an `AUTHORIZED` generation use,
+  held from before the PUT until the reference is published. The design previously
+  left the materializer invisible to the GC drain, so a freshly activated
+  generation was `ACTIVE` with zero references and zero uses — the shape of a GC
+  candidate.
+- Specified a retirement handoff: G1 retirement must be durable in
+  `block_generations` before G2 may overwrite the active pointer, with a
+  reconciliation table that quarantines rather than deletes when the evidence is
+  unreconstructable.
+- Specified reconciliation for ambiguous lifecycle LWTs, including the activation
+  CAS. A timeout does not mean "not applied".
+- Separated the confirmation contracts for an ambiguous `PENDING` insert, an
+  ambiguous authorization, and an ambiguous materializer use.
+- Restated `RETIRED` as a statement about authority rather than row absence, since
+  a late `PENDING` use can always appear after the final global read.
+- Removed the rule forcing G2 activation into a background allocator; the
+  rematerialization CAS may run inline in the materializing request.
+- Fixed the GC decision order to errors, then references, then uses.
+- Corrected the false "exactly one upload-path LWT" claim and expanded the existing
+  LWT inventory, including the `gc_leases` finalize leases in `seafhttp`.
+- Corrected a false claim that `Dockerfile.gotest` bakes `-timeout 5m`; the 5m is
+  in `scripts/test.sh` and the compose service already uses 10m.
+- Added a physical key parsing inventory and a `proposed_epoch` rule for
+  materializer uses.
+
+---
+
+## 2026-08-07 - X1/X2 generational GC fence ADR (proposed)
+
+- Added `docs/GC-X1-X2-GENERATION-FENCE-ADR.md`, the normative design record for
+  closing physical-delete ABA (X1) and cross-DC reference visibility (X2).
+- Recorded the greenfield `MATERIALIZING -> ACTIVE -> RETIRING -> RETIRED ->
+  DELETING -> DELETED` lifecycle, local writer pins, global destructive checks,
+  generation-bound references, exact-key recovery, claim takeover, crash matrix,
+  implementation phases, and acceptance criteria.
+- X1/X2 remain open and destructive GC remains disabled; no runtime code changed.
 ---
 
 ## 2026-07-16 - GC physical deletion is org-scoped end to end (P10 PR-3)

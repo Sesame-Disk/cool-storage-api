@@ -539,6 +539,11 @@ enumerate orphaned blocks.
 > `blocks` no longer carries a mutable `ref_count`. Block liveness lives in
 > `block_references` (one row per `(block, referrer)`); a block is alive iff a
 > reference row exists. See ARCHITECTURE.md "Block Liveness — Row-Per-Reference Model".
+>
+> **Proposed future design:** the greenfield generation-aware schema, pins,
+> materialization state, exact-key recovery, and generation-bound references are
+> specified in [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md).
+> This ADR is not implemented by the current schema described above.
 
 **Deduplication Example:**
 ```

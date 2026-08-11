@@ -754,6 +754,29 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 
 ---
 
+## Proposed Decisions
+
+### Generational GC Fence For X1/X2
+
+**Status:** Proposed; implementation not started
+
+**Decision record:** [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md)
+
+The proposed greenfield design keeps writer pins and ordinary references at
+`LOCAL_QUORUM`, reuses the existing first-writer LWT for initial activation, and uses
+`SERIAL` plus `EACH_QUORUM` for the destructive GC lifecycle and its final checks
+**and** for the rematerialization activation path — which is writer-side, inline in
+the request, and performs the retirement-evidence `EACH_QUORUM` read followed by the
+`SERIAL + EACH_QUORUM` activation CAS outside the GC worker. It prevents
+physical-delete ABA with UUID generations and immutable storage keys. X1 and X2
+remain open, and destructive GC remains disabled until the ADR acceptance criteria
+are implemented and verified. Generation-fence writer mode selects one
+`generation_fence_paxos_variant` target per deployment; every generation-fence
+participant node must match it continuously, and a mixed target state pauses writer
+mode until the Cassandra transition procedure and complete re-verification finish.
+
+---
+
 ## Future Decisions (To Be Made)
 
 ### Multi-Region Replication Strategy
