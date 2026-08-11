@@ -379,10 +379,35 @@ global quorum that need not read from any particular DC.
 
 This repository still supports `SimpleStrategy` as a legacy fallback
 (`docker-compose.prod.yml:174,182`), so the assumption cannot be left implicit.
+### Two Gates, Not One
+
+The startup assertions in this document belong to **two different gates**, and
+conflating them leaves the earlier one unenforced during the window it exists for:
+
+```text
+generation-fence writer mode enabled       (rollout step 2: writers deployed)
+    NetworkTopologyStrategy verified
+    DC set and per-DC RF verified
+    SERIAL domain verified for every LWT touching blocks
+    paxos_variant retains linearizable reads
+
+destructive GC enabled                     (rollout step 7)
+    requires the writer gate above, plus
+    all X1/X2 acceptance criteria verified
+```
+
+Every assertion in the first block binds from the **first generation-aware write**,
+not from `gc.enabled=true`. The reason is concrete: a materializer can crash between
+its PUT and its activation LWT on day one of the writer rollout, and the recovery
+that follows needs the serial round and the correct topology — five rollout steps
+before destructive GC is switched on. Wherever this document says "when
+`gc.enabled=true`" for one of those four checks, it means the writer gate.
+
 The implementation must:
 
 - verify the keyspace replication strategy at startup, and refuse to boot when
-  `gc.enabled=true` and the strategy is not `NetworkTopologyStrategy`;
+  generation-fence writer mode is enabled and the strategy is not
+  `NetworkTopologyStrategy`;
 - verify that the keyspace DC set exactly matches the configured participating DC
   set and that every participating DC has exactly its configured RF, with RF > 0;
 - verify that the generation-fence consistency profile uses `SERIAL` for every
@@ -937,7 +962,7 @@ first also matches the rule that G2's predecessor tuple must be durable before
 activation is attempted.
 
 A logged batch across the three partitions would also be correct, but it is more
-expensive and harder to reason about than two ordered confirmations, and this design
+expensive and harder to reason about than three ordered confirmations, and this design
 prefers the sequential form. Neither variant needs Paxos.
 
 The use row from step 3b is held until step 10. It survives activation: the window
@@ -1355,11 +1380,15 @@ The central publish helper must reject a writer when:
 - the pin is absent or belongs to another operation;
 - the generation ID does not match;
 - the authority deadline has passed;
-- the pointer says the pinned generation is `RETIRED`, or the pinned generation's
-  own row says `DELETING` or `DELETED` — the last two are read from
-  `block_generations`, not from `active_state` (see Which States Live Where);
-- the pinned generation's own row says `QUARANTINED`; quarantine is fail-closed even
-  if a stale pointer still names that generation;
+- the pointer says the pinned generation is `RETIRED`;
+- the pinned generation's own row fails the positive usability predicate
+  `gc_state = null AND materialization_state = VERIFIED`, read from
+  `block_generations` and not from `active_state` (see Which States Live Where).
+  Stating it positively is deliberate: an enumeration of `DELETING`, `DELETED`, and
+  `QUARANTINED` silently accepts a generation that is merely not yet `VERIFIED`, and
+  a funnel that reaches publication only through this helper would then publish a
+  reference on a regional `MATERIALIZING` lag. Quarantine remains fail-closed even
+  if a stale pointer still names that generation; it is simply not the whole test;
 - the active generation/epoch no longer matches the authorized pin;
 - the pin is not `AUTHORIZED`;
 - the request context has expired;
@@ -1480,7 +1509,14 @@ The generation-aware implementation must therefore:
   inspected, exactly as the Ambiguous Activation Outcome rule requires elsewhere. A
   row carrying an `active_generation_id` means a real loss; a stub row does not;
 - reuse the existing stub-repair claim to convert a stub into a full activation for
-  the materializer's own generation, rather than treating the stub as a winner;
+  the materializer's own generation, rather than treating the stub as a winner.
+  **This path establishes a first active pointer and must initialize the pointer
+  exactly as the first-writer LWT does**, in the same conditional operation:
+  `active_epoch = 1`, `retire_claim_epoch = 0`, and null claim ID and deadline.
+  Otherwise a repaired stub yields a live pointer whose `retire_claim_epoch` is
+  null, and the first `ACTIVE -> RETIRING` — which conditions on
+  `retire_claim_epoch = Nprev` — would need a null special case, reintroducing
+  exactly the exception correction 90 removed;
 - keep the stub-repair contention signal retryable, since a contended repair is a
   race with another materializer, not a fenced generation;
 - assert, as a schema invariant, that no row may carry `active_state` without
@@ -1600,10 +1636,29 @@ reached `VERIFIED` has no confirmed object to delete and belongs to the
 materialization-expiry path, not to this one.
 
 The authorization comes from the proof required *before* the statement is issued: an
-evidence row matching the live claim's epoch **and** ID, plus an authoritative
-pointer that either reads `G1 / RETIRED` or selects a successor reachable from G1 by
-an unbroken lineage chain. That proof is irrevocable once obtained, which is
-precisely why it does not need to be re-asserted in the `IF` clause:
+evidence row for G1 whose epoch **and** claim ID match, plus an authoritative pointer
+that either reads `G1 / RETIRED` or selects a successor reachable from G1 by an
+unbroken lineage chain.
+
+Which claim the evidence must match depends on where the pointer is, and conflating
+the two cases is a live trap:
+
+```text
+pointer = G1 / RETIRED     evidence(G1, N1) must match the LIVE pointer claim,
+                           because the live claim is C1 / N1
+
+pointer = G2 or later      the live pointer claim belongs to a later cycle, or is
+                           null. evidence(G1, N1) must match the claim recorded in
+                           the lineage link -- G2's predecessor tuple (G1, E1, C1,
+                           N1) -- NOT the pointer's current claim
+```
+
+Reading "the live claim" as the pointer's current claim in the successor case would
+fail every legitimate delete of a superseded generation. The claim to match is always
+the one that authorized *that* retirement, and the lineage link is what records it.
+
+That proof is irrevocable once obtained, which is precisely why it does not need to
+be re-asserted in the `IF` clause:
 
 ```text
 the pointer has no RETIRED -> ACTIVE transition
@@ -2006,7 +2061,10 @@ Four invariants govern the table, and all must be asserted in code rather than
 inferred from it:
 
 > `block_generations(G1).gc_state` alone never authorizes `DELETING`. The worker
-> must additionally hold an evidence row for the live claim epoch, and the
+> must additionally hold an evidence row whose epoch and claim ID match the claim
+> that authorized *that* generation's retirement — the live pointer claim when the
+> pointer still reads `G1 / RETIRED`, otherwise the claim recorded in the lineage
+> link that supersedes it — and the
 > authoritative pointer must either read `G1 / RETIRED`, or select a later
 > generation reachable from G1 by an unbroken lineage chain — the immediate
 > successor G2 being only its shortest case. See The Lineage Chain Is Transitive;
@@ -2365,14 +2423,28 @@ concrete shapes here, all in the `(day, bucket)` pattern established by
 gc_generation_intents_by_day        -- expired MATERIALIZING intents
 gc_generation_uses_by_day           -- materializer uses past their retention
 gc_generation_zero_ref_by_day       -- ACTIVE with no reference and no live use
-gc_generation_handoff_by_day        -- evidence/pointer retirement mismatches
+gc_generation_handoff_by_day        -- retirement handoff in progress
 gc_generation_deletes_by_day        -- pending physical delete work
 
-each with:
+base key, for the three whose subject is the generation itself:
     PRIMARY KEY ((due_day, bucket), due_at, org_id, block_id, generation_id)
     WITH CLUSTERING ORDER BY (due_at ASC, org_id ASC, block_id ASC,
                               generation_id ASC)
+
+gc_generation_uses_by_day adds use_id:
+    PRIMARY KEY ((due_day, bucket), due_at, org_id, block_id, generation_id,
+                 use_id)
+
+gc_generation_handoff_by_day adds retire_claim_epoch:
+    PRIMARY KEY ((due_day, bucket), due_at, org_id, block_id, generation_id,
+                 retire_claim_epoch)
 ```
+
+The two extra clustering columns are not decoration. A generation can hold several
+concurrent uses, and it can travel `RETIRING -> ACTIVE -> RETIRING` many times, so
+without `use_id` and `retire_claim_epoch` two distinct events with the same `due_at`
+collide on one row and one of them is silently lost — a work item dropped in a
+design that has just forbidden the scan that used to catch it.
 
 `due_at` is the time the branch becomes eligible, which lets a forward-dated row
 land in a future day partition exactly as the delayed candidate does. Each row
@@ -2397,12 +2469,28 @@ It partitions by referrer so a commit or publish-attempt cleanup can remove exac
 its own rows without resolving any logical block to its current generation. The
 instance ID is in the key for the same reason it is in the forward table.
 
-The publication rule for all of them is the one the schema already uses elsewhere:
-the projection row is written in the same logged batch as its canonical row where
-one exists, and is otherwise written first and retired last, so a projection may
-transiently outlive its branch but never lag behind it. A scanner that finds a
-projection row whose canonical state no longer matches deletes only the projection
-row.
+The publication rule is **not** "same logged batch as the canonical row". That
+phrasing would contradict the sequential 3a/3b/3c protocol, and for retirement
+evidence — a conditional `INSERT ... IF NOT EXISTS` whose projection lives in another
+partition — it would demand a conditional cross-partition batch, which Cassandra
+cannot express. A logged batch may be used where it happens to fit; it is never part
+of the safety proof.
+
+The invariant is one-directional and stated per family:
+
+> A projection may transiently outlive its branch. It may never lag behind it.
+
+```text
+materialization      confirm intent -> confirm use -> confirm discovery -> PUT
+RETIRING -> ACTIVE   confirm delayed candidate + projection -> CAS
+retirement handoff   confirm handoff projection -> pointer CAS
+physical delete      confirm delete projection -> DELETING CAS
+```
+
+A scanner that finds a projection row whose canonical state no longer matches deletes
+only the projection row. That is what makes "publish early, retire late" free: the
+cost of a stale row is one wasted revalidation, and the cost of a missing row is the
+recovery guarantee.
 
 ### Discoverability Before Irreversibility
 
@@ -2413,7 +2501,18 @@ scan-driven design did not:
 > Before any irreversible or externally-visible step, a durable discovery record
 > for that exact generation must already exist.
 
-Two places need it, and both are crash windows that are otherwise unreachable:
+And, because a generation passes through several owners, the stronger form that
+actually closes the protocol:
+
+> **There must never be a window in which neither of two durable work identities
+> exists.** Ownership is handed over, never dropped and re-acquired.
+
+The first rule alone is not enough. It makes each step discoverable at the moment it
+runs, but says nothing about the seam between one work record being retired and the
+next being published — and with scans forbidden, a crash in that seam loses the
+generation exactly as thoroughly as never publishing at all.
+
+Three windows need the first rule, and all are otherwise unreachable:
 
 ```text
 gc_state = null
@@ -2429,12 +2528,25 @@ persist MATERIALIZING intent
     -> CRASH                            with nothing scheduling its cleanup
 ```
 
-Neither loses data — `K` is retained in both — but both contradict the recovery
-guarantee, and the first directly contradicts "`DELETING` is recoverable from the
-generation record even if the orphan projection was not written", which silently
-assumed a scan.
+```text
+GC completes RETIRING -> RETIRED
+    -> retire the candidate/queue work that discovered G1
+    -> CRASH                        <-- blocks = G1/RETIRED, evidence valid,
+    -> write gc_generation_deletes_by_day   K1 still present, and no work row
+                                            names G1 any more
+```
 
-The required order is:
+None of the three loses data — `K` is retained in all of them — but all three
+contradict the recovery guarantee, and the first directly contradicts "`DELETING` is
+recoverable from the generation record even if the orphan projection was not
+written", which silently assumed a scan.
+
+The third is the one the handoff rule exists for, and it has a worse sibling. If the
+candidate/queue work is retired at `ACTIVE -> RETIRING` instead, a crash leaves the
+block **permanently `RETIRING`** — a writer fence with no owner, which is an
+availability failure rather than mere retention.
+
+The required order within one step is:
 
 ```text
 1. durable recovery/queue work row for (org, block, generation)
@@ -2443,9 +2555,32 @@ The required order is:
 4. only then retire the work row
 ```
 
-This needs **no additional Paxos**. The existing candidate/queue row can carry the
-role; PR-1 decides whether to extend it or add a dedicated projection, but the
-ordering itself is not optional.
+And the required order **across** steps — the handoff rule — is that every GC-owned
+transition names the work identity that covers it, with the successor published
+before the predecessor is retired:
+
+| Transition | Work identity that must be durable | Retired only after |
+|---|---|---|
+| candidate discovered → `ACTIVE -> RETIRING` | the candidate/queue row | never during `RETIRING`; it owns the fence |
+| entire `RETIRING` drain | the same candidate/queue row | see below |
+| `RETIRING -> ACTIVE` (escape) | the delayed candidate, published **before** the CAS | after the CAS commits |
+| `RETIRING -> RETIRED` | `gc_generation_handoff_by_day`, published **before** the pointer CAS | after `gc_generation_deletes_by_day` is confirmed |
+| `gc_state = null -> DELETING` | `gc_generation_deletes_by_day`, published **before** the CAS | after `DELETED` |
+
+The rule that ties them together, and the one an implementer must not optimize away:
+
+> A worker retires its inbound work row only after the outbound work row for the
+> next stage is durable. At every instant, at least one row names the generation.
+
+`gc_generation_handoff_by_day` is what makes the `RETIRING -> RETIRED` seam
+survivable: it is published before the pointer CAS, so the crash window in which
+`blocks` reads `G1 / RETIRED` with valid evidence and no delete work yet is covered
+by a row that already exists. Its scanner revalidates canonical state, so publishing
+it for a retirement that then reactivates instead costs one wasted revalidation.
+
+This needs **no additional Paxos**. The existing candidate/queue row carries the role
+for the first two stages; PR-1 decides whether to extend it or add a dedicated
+projection, but neither the intra-step ordering nor the handoff is optional.
 
 No recovery branch may release a use row and clean its key in the same pass
 without first confirming, at `EACH_QUORUM`, that the use is genuinely expired and
@@ -3238,6 +3373,22 @@ Required cases include:
 - no code path deletes or expires a `blocks` row, a generation row, a predecessor
   tuple, retirement evidence, or a `block_id_mappings` row; a test asserts the
   absence of any TTL on those tables;
+- at every instant of a GC cycle at least one durable work row names the generation:
+  a crash injected immediately after `RETIRING -> RETIRED` and before the delete
+  work is published is still recovered, and a crash after `ACTIVE -> RETIRING`
+  never leaves an ownerless `RETIRING` fence;
+- a repaired released stub yields `active_epoch = 1`, `retire_claim_epoch = 0`, and
+  null claim ID/deadline, so the first `ACTIVE -> RETIRING` needs no null special
+  case;
+- the central publish helper rejects a generation that is merely not `VERIFIED`, not
+  only one that is `DELETING`, `DELETED`, or `QUARANTINED`;
+- with `pointer = G3`, G1's delete is authorized by evidence matching the claim in
+  the lineage link, and a worker that compares it against the pointer's current
+  claim fails the test rather than the delete;
+- two expired uses of one generation sharing a `due_at`, and two retire cycles of
+  one generation sharing a `due_at`, each produce two distinct projection rows;
+- the topology, DC/RF, `SERIAL`, and `paxos_variant` assertions all fail startup in
+  generation-fence writer mode, with `gc.enabled=false`;
 - a generation whose `materialization_state` lags behind an activation committed in
   another DC is repaired rather than quarantined, while a writer observing the same
   lag fails closed and retries;
@@ -4177,6 +4328,52 @@ reintroduce rejected designs:
     `blocks` rows, generation rows, predecessor lineage, retirement evidence, and
     `block_id_mappings` are retained unconditionally; releasing them is
     `PURGING_LOGICAL` work with its own fence.
+
+100. **Durable GC work is handed over, never dropped and re-acquired.**
+    Discoverability Before Irreversibility made each step discoverable but said
+    nothing about the seam between one work record retiring and the next publishing.
+    With scans forbidden, a crash in that seam loses the generation as thoroughly as
+    never publishing at all: a worker that finishes `RETIRING -> RETIRED` and retires
+    its candidate before writing the delete work leaves `blocks` at `G1 / RETIRED`
+    with valid evidence, `K1` present, and nothing naming G1. Retiring the candidate
+    at `ACTIVE -> RETIRING` is worse — the block stays `RETIRING` forever, an
+    ownerless writer fence. The rule is that the outbound work row is durable before
+    the inbound one is retired, and `gc_generation_handoff_by_day` is published
+    before the pointer CAS so the `RETIRED` seam is covered.
+101. **Projection publication is per family, never "same logged batch as the
+    canonical row".** That universal phrasing contradicted the deliberately
+    sequential 3a/3b/3c protocol, and for retirement evidence — a conditional insert
+    whose projection lives in another partition — it demanded a conditional
+    cross-partition batch Cassandra cannot express. The invariant is one-directional:
+    a projection may transiently outlive its branch, never lag behind it. Logged
+    batches are an implementation convenience, not part of the safety proof.
+102. **Released-stub repair establishes a first active pointer and must initialize
+    the claim counter.** It is the second path that can create one, and it was left
+    out when the first-writer LWT was given `active_epoch = 1`,
+    `retire_claim_epoch = 0`, and null claim ID and deadline. Without it a repaired
+    stub yields a pointer whose `retire_claim_epoch` is null, and the first
+    `ACTIVE -> RETIRING` — conditioned on `retire_claim_epoch = Nprev` — needs a null
+    special case, reintroducing exactly the exception correction 90 removed.
+103. **Which claim the evidence must match depends on where the pointer is.** When
+    the pointer still reads `G1 / RETIRED` the live pointer claim *is* `C1 / N1`, so
+    "match the live claim" is right. Once a successor owns the pointer the live claim
+    belongs to a later cycle or is null, and the evidence must match the claim
+    recorded in the lineage link instead. Reading "live claim" literally in the
+    successor case fails every legitimate delete of a superseded generation — the
+    transitive-lineage rule and the evidence rule have to be read together.
+104. **Recovery projection keys must distinguish every event they schedule.** A
+    generation can hold several concurrent uses and can travel
+    `RETIRING -> ACTIVE -> RETIRING` repeatedly, so `gc_generation_uses_by_day` needs
+    `use_id` and `gc_generation_handoff_by_day` needs `retire_claim_epoch` in the
+    clustering key. Without them two events sharing a `due_at` collide on one row and
+    one is silently dropped — a lost work item in a design that just removed the scan
+    that used to catch it.
+105. **The startup assertions form two gates, not one.** Topology, DC/RF, `SERIAL`
+    domain, and `paxos_variant` bind from the first generation-aware write;
+    destructive GC requires that gate plus the full acceptance criteria. Tying the
+    first four to `gc.enabled=true` leaves them unenforced for the five rollout steps
+    between deploying generation-aware writers and switching GC on — precisely the
+    window in which the first crashed activations occur.
 
 ## Related Documents
 
