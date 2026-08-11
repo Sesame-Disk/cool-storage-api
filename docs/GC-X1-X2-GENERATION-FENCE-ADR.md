@@ -72,9 +72,13 @@ writer: read G -> pin G -> confirm/revalidate G -> use K -> publish ref -> remov
 
 GC: candidate -> blocks RETIRING -> drain uses -> global refs check
     -> blocks ACTIVE or RETIRED
-    -> generation gc_state=DELETING -> persist recovery -> DELETE exact K
-    -> generation gc_state=DELETED
+    -> persist delete-recovery discovery work
+    -> generation gc_state=DELETING -> DELETE exact K
+    -> generation gc_state=DELETED -> retire discovery work
 ```
+
+Discovery always precedes the irreversible step, never follows it; see
+Discoverability Before Irreversibility.
 
 The following statements are part of the contract:
 
@@ -604,12 +608,19 @@ C:  ACTIVE -> RETIRING (epoch 2) -> ... -> RETIRING -> ACTIVE
 A wakes. G1 ✓ ACTIVE ✓ E1 ✓  -> A's CAS applies and installs epoch 1 again
 ```
 
-That is not merely a regressed counter. Evidence rows for `(G1, 1)` already exist
-from B's completed cycle, so a worker holding claim epoch 1 can find "evidence for
-my live claim epoch" that it never earned and proceed toward `RETIRED` and
-`DELETING` without performing its own global zero check. Conditioning on `Nprev`
-makes the counter strictly monotonic and makes A's late CAS fail, which is what the
-invariant elsewhere in this document already asserts.
+The damage is to epoch uniqueness, which the evidence table depends on. `A` now
+holds claim `C_A` at epoch 1 while B's completed cycle already wrote
+`evidence(G1, 1)` under claim `C_B`. Two things then go wrong at once: A's own
+evidence append for `(G1, 1)` is an `INSERT ... IF NOT EXISTS` that will not apply
+and whose payload conflicts, so A fails closed permanently; and A's next cycle would
+collide with C's `evidence(G1, 2)`. The block becomes unretirable.
+
+What prevents A from *deleting* on B's evidence is a separate rule — evidence is
+valid only when the claim ID matches too, so A reads `C_B` where it expects `C_A`
+and treats the row as a protocol violation. Both defences are required and neither
+substitutes for the other: the epoch CAS keeps the counter a total monotonic
+sequence, and the claim-ID match binds each evidence row to the worker that earned
+it.
 
 The first-writer LWT must therefore initialize the claim columns explicitly
 alongside the initial pointer:
@@ -620,8 +631,12 @@ retire_claim_id       = null
 retire_claim_deadline = null
 ```
 
-A null `retire_claim_epoch` would make the first acquisition's `IF` clause a null
-comparison, which is the missing-row hazard of correction 71 in a different place.
+This is not the missing-row hazard of correction 71 — the same `IF` clause also
+matches `active_generation_id`, `active_state`, and `active_epoch`, none of which
+can hold against an absent partition. The reasons are simpler: the first
+acquisition needs no special case, `Nprev + 1` works from the first cycle, the
+counter is total rather than sparse, and `null` never has to mean both "not
+initialized" and "no retirement yet" at the same time.
 
 A worker whose claim was taken over fails these conditions and cannot complete a
 transition it no longer owns. The deadline itself is not in the `IF` clause —
@@ -854,6 +869,7 @@ new UUID and a new key.
 2. Generate UUID G and exact K
 3a. Persist + confirm MATERIALIZING intent            LOCAL_QUORUM
 3b. Persist + confirm AUTHORIZED materializer use     LOCAL_QUORUM
+3c. Persist + confirm recovery discovery work for G/K LOCAL_QUORUM
 4. Re-check materialization deadline/margin; PUT K
 5. Verify K exists; set materialization_state=VERIFIED
 6. Activate: first life via the existing first-writer LWT,
@@ -866,17 +882,24 @@ new UUID and a new key.
 11. Preserve losing K as an orphan for exact cleanup
 ```
 
-Steps 3a and 3b are two writes to two different tables, therefore two different
-partitions, therefore **not atomic**. The earlier single-line "intent + use" phrasing
-hid that, and the ambiguity contract that follows from it named only the use. Both
-must be durable before the PUT, and each is confirmed on its own terms:
+Steps 3a, 3b and 3c are three writes to three different tables, therefore three
+different partitions, therefore **not atomic**. The earlier single-line "intent +
+use" phrasing hid that, and the ambiguity contract that followed from it named only
+the use. All three must be durable before the PUT, and each is confirmed on its own
+terms:
 
 ```text
 3a  MATERIALIZING intent durable:  G + K + storage class + predecessor tuple
                                    + operation identity + deadlines
 3b  AUTHORIZED materializer use durable:  G + use_id + authority + deadlines
+3c  recovery discovery work durable:  (org, block, generation) reachable from a
+                                      bounded projection
 only then:  PUT
 ```
+
+Step 3c is the materialization side of Discoverability Before Irreversibility: after
+the PUT a physical object exists, and if nothing already schedules its inspection,
+a crash leaves bytes that no projection references and no scan is permitted to find.
 
 The order is not interchangeable. If only the use were confirmed and the intent
 write was silently lost, the materializer would PUT and activate with no durable
@@ -1122,12 +1145,53 @@ expired or crashed VERIFIED materialization
 5. anything uncertain         retain G2 and K2; retry later
 ```
 
-This makes the recovery path depend on a linearizable serial read, which constrains
-the engine configuration: `paxos_variant` settings that drop linearizable reads
-cannot serve this proof. PR-0 records the exact accepted set for the deployed
-engine, and PR-2's startup gate rejects any `*_without_linearizable_reads*` variant
-whenever generation-aware GC is enabled. This is a third axis alongside
-`NetworkTopologyStrategy` and `SERIAL`, and it fails the same way: silently.
+##### How To Issue The Settlement Read
+
+"Settle serially" is a driver-level question, and getting it wrong produces a
+statement that compiles, runs, and proves nothing. The repository uses
+`github.com/apache/cassandra-gocql-driver/v2 v2.0.0`, where this is directly
+expressible:
+
+```go
+// Serial is a first-class Consistency value (0x08) in this driver.
+// `SerialConsistency` is a deprecated alias of `Consistency`.
+session.Query(`SELECT ... FROM blocks WHERE org_id = ? AND block_id = ?`, o, b).
+    Consistency(gocql.Serial)
+```
+
+The distinction matters because it is the opposite of the older `gocql/gocql` v1
+driver, where `SerialConsistency` was a *separate type* and could only be attached
+to a conditional statement's serial phase, so a serial `SELECT` was not expressible
+through the normal API. Under v2, `Query.Consistency` accepts `Serial` without
+validation and the level is sent as the statement's read consistency. Do **not**
+write `.SerialConsistency(gocql.Serial)` on a plain `SELECT`: that setter is for the
+conditional phase of an LWT and is ignored by a non-conditional statement — it is
+exactly the silent no-op this section exists to prevent.
+
+If a future driver or engine constraint makes the serial read unavailable, there is
+a supported fallback that needs no new guarantee: issue a **harmless settlement
+LWT** on the same `blocks` partition, then read normally.
+
+```text
+UPDATE blocks SET paxos_settle_token = <uuid>
+WHERE org_id = O AND block_id = L
+IF EXISTS                                  -- SERIAL + EACH_QUORUM
+```
+
+Any LWT on the partition runs a Paxos prepare phase, which finishes any in-progress
+accepted proposal before it proceeds, so a statement that touches only a dedicated
+token column settles the activation without being able to install one. `IF EXISTS`
+keeps it compliant with correction 71. The cost is a full LWT instead of a serial
+read, paid only in crash recovery, never per block.
+
+Whichever form is used, the recovery path depends on a linearizable serial round,
+which constrains the engine configuration: `paxos_variant` settings that drop
+linearizable reads cannot serve the serial-read form. PR-0 records the exact
+accepted set for the deployed engine, and PR-2's startup gate rejects any
+`*_without_linearizable_reads*` variant whenever generation-aware GC is enabled —
+unless the implementation adopts the settlement-LWT form, which does not rely on
+that property. This is a third axis alongside `NetworkTopologyStrategy` and
+`SERIAL`, and it fails the same way: silently.
 
 This generalizes to every destructive or lifecycle LWT in this design: an ambiguous
 result is reconciled against authoritative state, never guessed. Pointer LWTs have
@@ -1866,8 +1930,12 @@ inferred from it:
 > an implementation that hard-codes "G1 or G2" strands every generation collected
 > after two rematerializations.
 
-> Retirement evidence is valid only under the claim epoch that produced it. A
-> worker that cannot match the epoch treats the evidence as absent.
+> Retirement evidence is valid only when **both** `retire_claim_epoch` and
+> `retire_claim_id` match the live claim on the `blocks` pointer. The epoch is the
+> clustering key used to find the row; the claim ID is part of the immutable proof
+> payload. A worker that cannot match the epoch treats the evidence as absent; a row
+> whose epoch matches but whose claim ID does not is a **protocol violation** and
+> fails closed, never "close enough".
 
 > No retirement evidence is ever overwritten or deleted by a worker. A row may age
 > out only when every generation it could still prove has reached `DELETED` **and**
@@ -1985,12 +2053,19 @@ provisional TTL costs retention, not availability.
      refs == 0 and uses == 0
          -> G1 -> RETIRED                          SERIAL + EACH_QUORUM
 6. Allow G2 only after G1 is RETIRED
-7. G1 generation `gc_state=null -> DELETING`      SERIAL + EACH_QUORUM
-8. Persist/reconstruct recovery for G1 + K
-9. DELETE exact K
-10. Mark G1 `gc_state=DELETED`; clean only G1-scoped
+7. Persist + confirm delete-recovery discovery work
+    for the exact (G1, K1)                         LOCAL_QUORUM
+8. G1 generation `gc_state=null -> DELETING`      SERIAL + EACH_QUORUM
+9. Persist/reconstruct the orphan projection for G1 + K1
+10. DELETE exact K1
+11. Mark G1 `gc_state=DELETED`; clean only G1-scoped
     physical/recovery metadata and retain the logical `blocks` pointer
+12. Retire the discovery work row
 ```
+
+Step 7 precedes step 8 deliberately. The orphan projection at step 9 is a retry
+aid, not the discovery record: a crash between 8 and 9 would otherwise leave a
+`DELETING` generation that no projection references and no scan may find.
 
 The drain classifies a use by its `authority_deadline`, never by `PENDING` versus
 `AUTHORIZED`. An unexpired `PENDING` row counts exactly like an unexpired
@@ -2777,8 +2852,10 @@ notes.
 
 ### PR-3: Generation Allocation And Materialization
 
-Generate UUID keys before PUT, persist the durable `MATERIALIZING` intent together
-with its `AUTHORIZED` materializer use, verify the object, reuse the existing
+Generate UUID keys before PUT, persist and confirm the durable `MATERIALIZING`
+intent, then its `AUTHORIZED` materializer use, then its recovery discovery work —
+three separate partitions in that order, never as one conflated step — verify the
+object, reuse the existing
 terminal first-writer LWT for initial pointer creation, perform the inline
 rematerialization activation CAS, hold the materializer use until the reference is
 published, and record losing objects for exact orphan cleanup.
@@ -2978,6 +3055,15 @@ Required cases include:
   GC is enabled;
 - a crash between the `DELETING` CAS and the orphan projection, and a crash between
   the intent and the PUT, are both discovered without any table enumeration;
+- every normative sequence orders the discovery write before the irreversible step;
+  a test asserts no `DELETING` CAS and no PUT occurs while the discovery record for
+  that exact generation is absent;
+- an evidence row whose `retire_claim_epoch` matches the live pointer claim but
+  whose `retire_claim_id` does not is rejected as a protocol violation, not consumed
+  as proof;
+- the settlement read is issued as `Consistency(Serial)` on a `SELECT`, and a test
+  asserts that the `SerialConsistency` setter on a non-conditional statement does
+  not produce a serial round — the silent no-op form must fail the test;
 - a generation whose `materialization_state` lags behind an activation committed in
   another DC is repaired rather than quarantined, while a writer observing the same
   lag fails closed and retries;
@@ -3819,6 +3905,37 @@ reintroduce rejected designs:
     required "successor-aware" cleanup; not deleting them at all is simpler and
     removes the class of bug instead of specifying how to avoid it. Their removal
     belongs to the out-of-scope `PURGING_LOGICAL` work.
+88. **Discovery precedes the irreversible step in every sequence, not just in the
+    section that states the rule.** When Discoverability Before Irreversibility was
+    added, three normative sequences still showed the opposite order — the protocol
+    sketch, the GC protocol, and the materialization steps — and PR-3 still called
+    the intent and the use one write. A principle stated in one section and
+    contradicted in three is worse than no principle, because two implementers can
+    each cite the document. Whenever an ordering rule is introduced, every sequence
+    that expresses that ordering is part of the change.
+89. **Retirement evidence is bound by claim ID *and* claim epoch.** The epoch is the
+    clustering key that finds the row; the claim ID is immutable payload that proves
+    which worker earned it. Validating on epoch alone would let a worker that
+    somehow acquired a reused epoch consume another worker's proof. An epoch match
+    with a claim-ID mismatch is a protocol violation, not a near miss. This is a
+    separate defence from correction 81's monotonic acquisition CAS, and neither
+    substitutes for the other.
+90. **Initializing `retire_claim_epoch = 0` is not about missing rows.** An earlier
+    revision justified it by correction 71, which does not apply: the acquisition's
+    `IF` clause also matches `active_generation_id`, `active_state`, and
+    `active_epoch`, and none of those holds against an absent partition. The real
+    reasons are that the first acquisition needs no special case, `Nprev + 1` works
+    from the first cycle, the counter stays total rather than sparse, and `null`
+    never means both "not initialized" and "no retirement yet".
+91. **The serial settlement read is driver-specific and must be written the right
+    way.** Under `apache/cassandra-gocql-driver/v2`, `Serial` is a first-class
+    `Consistency` value and `SerialConsistency` is a deprecated alias, so
+    `.Consistency(gocql.Serial)` on a `SELECT` is the correct form. Under the older
+    `gocql/gocql` v1 it was a separate type usable only on a conditional statement's
+    serial phase, which is why this looks unavailable to anyone reasoning from that
+    driver. Calling `.SerialConsistency()` on a plain `SELECT` is a silent no-op and
+    proves nothing. A harmless settlement LWT on the same partition is the recorded
+    fallback and needs no linearizable-read guarantee.
 
 ## Related Documents
 
