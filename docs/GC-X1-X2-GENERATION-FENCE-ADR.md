@@ -235,8 +235,11 @@ query.Consistency(gocql.EachQuorum).
 The current `internal/db/db.go:94-95` does explicitly assign
 `cluster.SerialConsistency`. The current configuration and tests still include
 `LOCAL_SERIAL` in the multi-region profiles, so the final X1/X2 profile must use
-`SERIAL` for every LWT that can touch `blocks`; a startup gate must reject
-`LOCAL_SERIAL` under the generation-fence writer-mode gate. The global session
+`SERIAL` for every LWT that can touch `blocks`; no such statement may run with an
+effective serial level of `LOCAL_SERIAL` under the generation-fence writer-mode gate.
+Read that as a rule about statements rather than about the session default — the
+split between what startup can check and what only a helper and a test can is in
+Which Serial Level Is The Session Default. The global session
 configuration must not be changed to `EACH_QUORUM`; regular global operations set
 that level per query.
 
@@ -248,20 +251,53 @@ level exists anywhere in this repository today**. `internal/db/db.go:95` assigns
 `cluster.SerialConsistency` from one config value and not a single statement
 overrides it. PR-2 must therefore choose explicitly:
 
-| Option | Session default | What must be written per query | Cost |
+| Option | Session default | What must be written per query | Consequence |
 |---|---|---|---|
-| **A** | `SERIAL` | an explicit `LOCAL_SERIAL` on every LWT that is to stay regional | promotes head-commit promotion, file locks, block-upload session slots, and the `gc_leases` finalize lease to global Paxos unless each is individually opted out |
-| **B** | `LOCAL_SERIAL` | an explicit `SERIAL` on every LWT in the `blocks`-partition inventory | nothing is promoted by accident, but a statement added later without the override silently joins the wrong domain |
+| **A** | `SERIAL` | an explicit `LOCAL_SERIAL` on every LWT that is to stay regional | a forgotten `blocks` LWT is still correct; unrelated LWTs are globally serialized until each is individually localized |
+| **B** | `LOCAL_SERIAL` | an explicit `SERIAL` on every LWT in the `blocks`-partition inventory | unrelated LWTs stay regional; a forgotten `blocks` LWT is a **correctness defect**, silently in the wrong Paxos domain |
 
-The gate must assert **the effective per-statement level for the inventory**, not
-the config string. A config-string check is wrong in both options: under B it
-rejects a correct deployment, and under A it passes while any statement left on the
-default silently violates the one-domain rule that correction 64 exists to enforce.
+The asymmetry is the whole decision: A fails safe and costs latency, B fails unsafe
+and costs nothing. Neither is chosen by default.
 
-Option A is not free and must not be adopted by omission. Three of the four LWTs it
-would promote sit on the upload path, so PR-0 measures their latency under `SERIAL`
-before PR-2 picks an option — the same discipline this document already applies to
-the activation CAS.
+Which profiles actually change is not obvious from `config.prod.yaml` alone, and
+getting it backwards misprices A:
+
+```text
+already SERIAL   config.prod.yaml:52, config-usa.yaml:23, config-eu.yaml:23,
+                 config.docker.yaml:21, config.example.yaml:26
+                 -- but every one of these declares a SINGLE DC, where SERIAL
+                    and LOCAL_SERIAL coincide and A costs nothing
+
+still LOCAL_SERIAL   config-usa.cluster.yaml:27, config-eu.cluster.yaml:27,
+                     docker-compose.mr-cluster.yaml:245-248,285-288
+                     -- the genuinely multi-DC profiles, which is exactly where
+                        X1/X2 lives and where A is a real cross-DC cost
+```
+
+So option A does not "promote" anything in the single-DC profiles; it changes
+nothing there. It promotes head-commit promotion, file locks, block-upload session
+slots and the `gc_leases` finalize lease to cross-DC Paxos **in the multi-DC
+profiles**, three of them on the upload path. PR-0 measures those four under `SERIAL`
+in a multi-DC topology before PR-2 picks an option — the same discipline this
+document already applies to the activation CAS.
+
+The one-domain rule is a **statement-level** invariant, and a startup gate cannot
+check it: nothing at boot can enumerate the consistency level of every LWT written in
+Go. Splitting the enforcement is therefore part of the decision, not an
+implementation detail:
+
+| Enforced by | What it covers |
+|---|---|
+| Startup gate | topology, DC set and RF, `paxos_variant`, and the configured session serial level being the one the chosen option requires |
+| A single helper | every LWT on the `blocks` partition goes through one constructor that sets the serial level; no `blocks` LWT is issued through a raw `Session().Query` |
+| Tests and writer-path tracing | the inventory in Current Code Evidence is enumerated by test, and each statement's effective level asserted |
+
+This is the technique the org-scoped-key series already used: make the compiler and
+the helper carry the invariant so a reviewer does not have to. An assertion phrased
+as "the gate asserts the effective per-statement level" is not implementable at
+startup and would have been satisfied by a config-string check that is wrong under
+both options — rejecting a correct deployment under B, and passing a statement left
+on the default under A.
 
 The existing terminal first-writer LWT retains its current writer-path regular
 consistency; the generation fence must not add a second LWT around it. Its **serial**
@@ -444,10 +480,14 @@ The implementation must:
   `NetworkTopologyStrategy`;
 - verify that the keyspace DC set exactly matches the configured participating DC
   set and that every participating DC has exactly its configured RF, with RF > 0;
-- verify that the generation-fence consistency profile uses `SERIAL` for every
-  conditional write that can touch the `blocks` pointer partition. `LOCAL_SERIAL`
+- verify that the configured session serial level is the one the chosen option in
+  Which Serial Level Is The Session Default requires. Startup can check the
+  configuration; it cannot enumerate the serial level of every LWT written in Go, so
+  "every conditional write that can touch the `blocks` pointer partition runs at
+  `SERIAL`" is carried by one helper plus a test over the inventory, not by this
+  gate. `LOCAL_SERIAL`
   may remain available for unrelated partitions, but mixing serial domains on the
-  same pointer partition is not accepted. **This gate binds from the first
+  same pointer partition is not accepted. **This requirement binds from the first
   generation-aware write, not from `gc.enabled=true`**: a deployment that writes
   generations under `LOCAL_SERIAL` and only switches to `SERIAL` when GC is enabled
   leaves each `blocks` partition with Paxos history produced under two different
@@ -1477,7 +1517,7 @@ for a generation transition:
 | `DELETING` | generation row | fail/retry; never repair or reuse that generation |
 | `DELETED` | generation row | re-probe the logical block and allocate a new generation if needed |
 | Cassandra state uncertainty | either | fail closed with a bounded retry budget |
-| A DC is unavailable | either | retryable failure for **every** upload that must run an LWT on the `blocks` partition: rematerialization through the activation CAS, first materialization through the first-writer LWT, and ordinary deduplication, which reaches that same LWT today. Only a path that skips it stays regional, and none exists yet — see below |
+| A DC is unavailable | either | rematerialization always fails retryably: its activation CAS commits at `EACH_QUORUM`. First materialization and ordinary deduplication also reach an LWT on the `blocks` partition, so they fail too whenever the outage breaks the global Paxos majority — which it does in the current two-DC profiles. Neither is "regional"; see below for the topology split |
 
 The exact HTTP/status mapping is an implementation decision for PR-4, but every
 funnel must expose the same retryable error contract.
@@ -1503,14 +1543,50 @@ alike — not only the rematerializing case.
 
 This is a property of the **existing** baseline, not something the generation fence
 introduces; the fence inherits it and the `SERIAL` gate makes it mandatory rather
-than configurable. Two consequences follow, and both belong in PR-0 rather than in
-an incident:
+than configurable.
 
-- the availability envelope of the whole upload path, not just of
-  rematerialization, is "every participating DC reachable";
-- the X4 probe fast path is the only change that would make the dedup half of that
-  sentence untrue, which is a second reason to measure it early. Until it lands, no
-  writer path is regional in the sense a reader of the taxonomy might assume.
+The generalization stops there, though, and the reason is that `SERIAL` and
+`EACH_QUORUM` do not have the same availability envelope. Conflating them produces a
+statement that happens to be true for the test topology and false for a production
+one:
+
+| Operation | What it needs | Survives a whole-DC outage? |
+|---|---|---|
+| Rematerialization activation CAS | `SERIAL` phase **plus** an `EACH_QUORUM` regular commit | **Never.** `EACH_QUORUM` requires a quorum in every DC, in every topology |
+| First-writer LWT (first materialization, and dedup today) | `SERIAL` phase, regular commit at the writer's own level | **Topology-dependent.** `SERIAL` needs a majority of *all* replicas, not one per DC |
+| Destructive drain and final refs check | `EACH_QUORUM` reads | **Never**, by construction — this is the X2 property |
+
+Worked through:
+
+```text
+2 DCs x RF1   global replicas = 2, Paxos majority = 2
+              losing one DC blocks the first-writer LWT too
+              -> dedup, first materialization and rematerialization all fail
+
+2 DCs x RF3   global replicas = 6, majority = 4, one DC holds 3
+              losing one DC still blocks it
+
+3 DCs x RF1   global replicas = 3, majority = 2
+              losing one DC leaves 2 -> the first-writer LWT still commits,
+              while rematerialization still fails on EACH_QUORUM
+```
+
+So the correct statements are split by mechanism, and only one of them is universal:
+
+- **rematerialization requires every participating DC**, because its regular commit
+  is `EACH_QUORUM`. This holds in every supported topology and is not negotiable;
+- the availability of the **first-writer LWT** — and therefore of dedup and first
+  materialization — follows the global Paxos majority over the configured replica
+  set. In the current two-DC profiles that means a whole-DC outage blocks them; with
+  three or more DCs it need not. It must not be written as "every DC" in general.
+
+Two consequences belong in PR-0 rather than in an incident:
+
+- the DC-outage error contract is measured against the **deployed** topology, not
+  assumed from the two-DC test profile;
+- the X4 probe fast path is the only change that would take dedup off the LWT
+  entirely. Until it lands, no writer path is regional in the sense a reader of the
+  taxonomy might assume.
 
 Only `RETIRING` requires a writer to wait, and two separate rules keep that wait
 short. Neither is optional, because each closes a stall the other does not:
@@ -1803,11 +1879,19 @@ The rule for a permanently failing `DELETE K`:
 delete fails            -> bounded backoff, retry; the delete work row is NEVER
                            retired, and gc_state stays DELETING
 budget exhausted        -> ADD a DLQ record, a metric, and an audit event
+                        -> stamp escalated_at and push next_attempt_at forward
                         -> gc_state stays DELETING, the delete work row stays
                            durable, the generation stays out of every other path
 operator resolves       -> the only exit; it ends at DELETED once the object is
-                           provably gone
+                           confirmed absent by a re-verification
 ```
+
+`next_attempt_at` and `escalated_at` are not tidiness. Without them the work row is
+immediately eligible again, so the scanner re-reads it every tick, re-fails, and
+re-emits the DLQ record, the metric and the audit event — a hot loop that buries the
+one signal it exists to raise. The DLQ identity must also be idempotent per
+`(generation, escalation)` so a repeated escalation updates one record instead of
+appending forever.
 
 The escalation is **additive**, and the word is chosen against the usual meaning of
 "move it to the DLQ". A DLQ record here is a signal to an operator, not a change of
@@ -1824,10 +1908,24 @@ row, regressing `gc_state`, or quarantining the generation. Each one strands an
 authorized delete with no owner, which is the ownerless-fence failure of correction
 100 in its physical form.
 
-`K1` remains present until an operator resolves it. That is retention, the safe
-direction, and it is why this escalates loudly rather than failing closed silently:
-the object is leaked, not lost, and the only thing that can go wrong from here is
-nobody noticing.
+What is **not** known in this state is whether `K1` is still there. A `DELETE` that
+returned a timeout or a transport error may well have reached the object store, so
+"the object is retained" is exactly the kind of inference this document forbids
+elsewhere:
+
+```text
+gc_state = DELETING, delete unresolved
+    -> the physical presence of K1 is UNKNOWN until re-verified
+    -> it is not "retained", and it is not "gone"
+```
+
+The remedy is unchanged, which is why the distinction is cheap to honour: keep
+`DELETING`, keep the work row, retry the exact key, escalate additively. Retrying is
+safe under either truth because `DELETE K` is idempotent and `K` is never reused, and
+the terminal `DELETED` transition is earned by re-verifying absence rather than by
+assuming the last attempt failed. What the operator is being told is not "an object is
+leaking" but "an authorized delete has not been proven complete" — and the only thing
+that can go wrong from here is nobody reading it.
 
 #### Generation Validity Is A Positive Predicate
 
@@ -2769,21 +2867,58 @@ comment says it plainly: an unprojected reference "pins the block forever with
 nothing able to find it"
 (`internal/db/provisional_block_ref_expiry.go:56-61`).
 
-Either shape satisfies the invariant, and the choice is PR-5's:
+Two shapes can satisfy the invariant, but they are **not** equivalent by default, and
+the difference is a race the other four families do not have. Their projections are
+consumed by a scanner that revalidates canonical state and deletes a projection whose
+branch no longer matches — which is exactly the wrong behaviour here:
 
-- confirm `gc_provisional_generation_refs_by_day`, then write the reference row; an
-  unconfirmed projection means **no reference**, exactly as an unconfirmed step 3c
-  means no PUT. A projection with no reference is retracted by the scanner on
-  revalidation at the cost of one wasted read;
-- or write both in one logged batch, which is what the current implementation does
+```text
+W: confirms the expiry projection
+S: reads the projection, finds no reference row yet,
+   concludes the branch is gone and deletes the projection      <-- F10 again
+W: writes the reference row
+```
+
+What saves the ordering variant is that this projection is **scheduled**, not
+immediate: it is keyed by `expires_at`, which a fresh admission sets a full
+provisional TTL into the future, and the scanner skips a row that is not yet due
+(`internal/gc/scanner.go:265-268`, `if expiry.ExpiresAt.After(now) { continue }`).
+The current implementation relies on exactly this and says so — a projection just
+written "points ~48h into the future, so nothing acts on it until long after every
+statement has landed" (`internal/db/provisional_block_ref_expiry.go:68-71`).
+
+That is a precondition, not a property of ordering, so it has to be written down as
+one:
+
+```text
+the scanner processes a projection row only when expires_at <= now
+and
+a writer publishes the reference only while a full TTL margin remains
+```
+
+The current scanner adds a second defence worth carrying forward: it re-checks the
+exact reference before classifying either outcome, precisely because "a logged batch
+is atomic but not isolated, and sweeping a projection while its live reference is
+visible can erase the upload's only durable retry anchor"
+(`internal/gc/scanner.go:279-284`). The generation-aware scanner needs the same
+re-check against `(generation_id, referrer, reference_instance_id)`.
+
+So the choice for PR-5 is:
+
+- **default: one logged batch**, which is what the current implementation does
   (`internal/api/v2/fs_helpers.go:989-994`) and what
-  `TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically` asserts.
+  `TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically` asserts. It needs no
+  precondition, adds no Paxos, and has the smallest surface;
+- or confirm `gc_provisional_generation_refs_by_day` and then write the reference
+  row, with the eligibility rule above asserted by test. An unconfirmed projection
+  then means **no reference**, exactly as an unconfirmed step 3c means no PUT.
 
 The logged batch remains an implementation convenience rather than part of the
-safety proof, per the rule above. What is not optional is that the projection may
-never lag the reference — for the generation-bound reference exactly as for the
-logical one it replaces. The same rule covers `pub:` rows, which the projection must
-also carry.
+safety proof, per the rule above — it is preferred here because it makes the
+precondition unnecessary, not because a batch is ever a proof. What is not optional
+is that the projection may never lag the reference, for the generation-bound
+reference exactly as for the logical one it replaces. The same rule covers `pub:`
+rows, which the projection must also carry.
 
 `block_generation_references_by_referrer` is deliberately **not** in this list. It is
 a cleanup convenience, not a discovery record: losing it costs an un-removable
@@ -3173,23 +3308,36 @@ That read shape gives `block_generation_references` a tombstone problem the use
 table does not have, and PR-1 must specify its compaction strategy,
 `gc_grace_seconds`, and repair SLA for a reason of its own. A generation becomes a
 candidate precisely when its references reach zero, so the destructive proof reads
-that partition at the moment it holds **one tombstone per reference it ever had**,
-and it must read the partition whole — the single-partition rule above forbids
-every workaround. A block whose referrers churned heavily therefore arrives at the
-drain with a tombstone-dominated partition, and crossing `tombstone_failure_threshold`
-turns the read into an error rather than a slow answer:
+that partition at the moment its live rows are gone and its removals are not: the
+partition can hold **a tombstone for every reference removal not yet purged**, which
+is `O(reference churn between successful purges)` rather than a fixed count —
+compaction may already have reclaimed earlier ones, and `gc_grace_seconds` bounds
+how soon it may. The read must take the partition whole; the single-partition rule
+above forbids every workaround. A block whose referrers churned heavily therefore
+arrives at the drain with a tombstone-dominated partition, and crossing
+`tombstone_failure_threshold` turns the read into an error rather than a slow answer.
+
+The consequence is worse than a stalled collection, because of where the read error
+lands in the decision order:
 
 ```text
-read error -> keep RETIRING, retry  (the fail-closed rule)
-           -> the same read fails again for the same reason
-           => the generation is never collected, and the fence never lifts
+step 5, first branch:  any read error / DC unavailable -> keep RETIRING, retry
+
+so a failing refs read never reaches
+    refs > 0                            -> RETIRING -> ACTIVE
+    refs == 0 and all uses expired      -> RETIRING -> ACTIVE
 ```
 
-A tombstone-heavy reference partition is not a performance note; it is a generation
-that can neither be collected nor released, and the writers of that block stay
-fenced behind `RETIRING` until the drain-escape rules time them out. The parameters
-that keep the partition readable are part of the X2 proof in the same way the
-primary key is.
+Both escapes from `RETIRING` are evaluated **after** the error branch, so neither can
+fire while the read keeps failing. The generation is not merely uncollectable: the
+writer fence never lifts, and every writer of that logical block stays in bounded
+retry indefinitely. This is an availability failure, not the retention trade this
+document accepts everywhere else, and it is reached without any bug — only with a
+partition whose tombstones outgrew the read.
+
+The parameters that keep the partition readable are therefore part of the X2 proof in
+the same way the primary key is, and PR-6 should surface a tombstone-count metric on
+this read rather than discovering the threshold in an incident.
 
 `block_references` must become **dead**, not co-live. Greenfield means no backfill,
 but it does not mean the old table can be left written or read: two liveness sources
@@ -3862,6 +4010,10 @@ Required cases include:
   writes the reference with the projection suppressed and asserts the funnel fails
   closed rather than publishing, then asserts the F10 shape — reference TTL-expires,
   references reach zero, no candidate is ever created — is unreachable;
+- if PR-5 takes the ordering variant rather than the logged batch, a test asserts the
+  precondition that makes it safe: a scanner run between the confirmed projection and
+  the reference write must **skip** the not-yet-due row, and a test that forces the
+  scanner to treat it as due must fail rather than delete the projection;
 - the `RETIRING -> ACTIVE` escape is recovered by its delayed candidate alone; a test
   asserts that no path publishes `gc_generation_zero_ref_by_day` for that branch and
   that the branch is still recovered without one;
@@ -3870,14 +4022,26 @@ Required cases include:
   a DLQ record, a metric and an audit event once its attempt budget is exhausted; a
   test asserts all four, including that the DLQ record is **additive** and
   `gc_generation_deletes_by_day` still names the generation afterwards;
-- the serial-domain gate asserts the **effective per-statement** serial level for
-  every LWT in the `blocks`-partition inventory: a test leaves one statement on the
-  session default under the opposite option and asserts startup fails, so a
-  config-string check alone cannot pass the gate;
-- a DC outage fails a deduplication hit and a first materialization with the same
-  retryable contract as a rematerialization, because all three reach an LWT on the
-  `blocks` partition; a test asserts the dedup case specifically, since it is the one
-  an earlier revision documented as unaffected;
+- an escalated delete does not hot-loop: a test asserts `next_attempt_at` moves
+  forward and that repeated escalation updates one idempotent DLQ record rather than
+  appending one per scanner tick;
+- `DELETED` is reached only after re-verifying that the exact object is absent; a
+  test injects an ambiguous `DELETE` whose request actually landed and asserts the
+  worker re-verifies rather than assuming either outcome;
+- the serial-domain invariant is enforced where it can be: startup rejects a session
+  serial level that does not match the chosen option, and a **separate test** walks
+  the `blocks`-partition inventory and asserts every statement's effective serial
+  level is `SERIAL`. A test adds an LWT on `blocks` issued through a raw
+  `Session().Query` and asserts the inventory test fails — the invariant must not be
+  expressible as a startup check alone;
+- **on the two-DC, RF 1 harness**, a DC outage fails a deduplication hit and a first
+  materialization with the same retryable contract as a rematerialization, because
+  all three reach an LWT on the `blocks` partition and the global Paxos majority is
+  both replicas; a test asserts the dedup case specifically, since it is the one an
+  earlier revision documented as unaffected. The assertion is scoped to that
+  topology: rematerialization fails in every topology because it commits at
+  `EACH_QUORUM`, while the first-writer LWT's availability follows the global
+  majority and a three-DC deployment would survive;
 - a `block_generation_references` partition carrying one tombstone per removed
   reference is still readable as one `EACH_QUORUM` partition under the configured
   compaction and `gc_grace_seconds`; a test asserts the destructive read is never
@@ -4161,8 +4325,15 @@ X2 is closed only when:
   Gates, Not One;
 - the keyspace DC set exactly matches the configured participating DC set and every
   expected DC has exactly its configured positive RF;
-- all LWTs that can touch a generation-managed `blocks` partition use `SERIAL`, and
-  the activation gate rejects `LOCAL_SERIAL` for that profile;
+- every LWT that can touch a generation-managed `blocks` partition has an **effective
+  serial level** of `SERIAL`. The criterion is about the statements, not the session:
+  option B legitimately leaves the session default at `LOCAL_SERIAL`, so what must be
+  rejected is any `blocks`-partition LWT whose effective level is `LOCAL_SERIAL`. It
+  is enforced by routing those statements through one helper and asserted over the
+  inventory by test, because startup cannot enumerate them;
+- the deployed `paxos_variant` retains linearizable reads, and generation-fence
+  writer-mode startup rejects every `*_without_linearizable_reads*` variant, since
+  crashed-activation settlement depends on the serial `SELECT`;
 - the global zero check reads uses before references, and the ordering is asserted
   by a test rather than left to reviewer discipline;
 - the publication frontier is stated as an invariant and no second global reference
@@ -4877,8 +5048,8 @@ reintroduce rejected designs:
     without its expiry projection TTL-expires on its own, references reach zero with
     no event and no scanner row, and nothing ever creates a candidate. The generation
     is `ACTIVE`, unreferenced and invisible — and the scan that used to catch it is
-    exactly what this design removed. Either ordering (projection confirmed first) or
-    one logged batch satisfies the invariant; having no rule at all does not.
+    exactly what this design removed. The logged batch is PR-5's default because it
+    needs no precondition; the ordering variant needs the one in correction 121.
 113. **A backstop with no publisher is worse than no backstop.**
     `gc_generation_zero_ref_by_day` was listed as covering both a materializer that
     died after activation *and* a generation reactivated out of `RETIRING` on expired
@@ -4899,37 +5070,52 @@ reintroduce rejected designs:
     reused; dequeuing the work into the DLQ, regressing the state, or quarantining are
     the three shortcuts that strand an authorized delete with no owner. "Escalate to
     the DLQ" normally means "move it", which is why the additive part is stated rather
-    than implied.
+    than implied. Two details were wrong in the first draft of this rule: `K1` is not
+    "retained" while the delete is unresolved — an ambiguous `DELETE` may well have
+    reached the object store, so its presence is **unknown until re-verified**, and
+    `DELETED` is earned by confirming absence rather than by assuming the last attempt
+    failed. And the escalation must stamp `next_attempt_at`/`escalated_at` with an
+    idempotent DLQ identity, or the row stays immediately eligible and the scanner
+    re-emits the alert every tick, burying the signal it exists to raise.
 115. **"Unrelated LWTs keep their consistency" is not a state the code can be in.**
     No per-query serial level exists anywhere in this repository:
     `internal/db/db.go:95` sets `cluster.SerialConsistency` from one config value and
     nothing overrides it. So that allowance and the gate that "rejects `LOCAL_SERIAL`"
-    could not both hold, and the gate as phrased is wrong in both directions — a
-    config-string check rejects a correct per-query deployment, and passes a
-    deployment where a statement left on the default silently joins the wrong Paxos
-    domain. PR-2 picks the session default explicitly and the gate asserts the
-    effective per-statement level for the whole inventory. Option A promotes four
-    unrelated LWTs, three of them on the upload path, to global Paxos; that is a
-    measured decision or it is a regression.
+    could not both hold. PR-2 picks the session default explicitly, and the two
+    options are asymmetric in a way that decides nothing by default: A fails safe and
+    costs latency, B fails unsafe and costs nothing. Which profiles A actually changes
+    must be read from the configs and not assumed: every single-DC profile is already
+    `SERIAL`, where `SERIAL` and `LOCAL_SERIAL` coincide and A costs nothing, while
+    the genuinely multi-DC `*.cluster.yaml` profiles are on `LOCAL_SERIAL` — those are
+    the ones A promotes to cross-DC Paxos, and they are the topology X1/X2 lives in.
+    Describing A as "promoting production" gets that backwards.
 116. **A DC outage is not confined to rematerialization.** The writer table said
     deduplication "is unaffected and stays regional", contradicting this document's
     own X4 section: `retryUploadedBlockMaterialization` calls `materialize()` on both
     probe outcomes, so a pure dedup hit already reaches the first-writer LWT, which
     production runs at `SERIAL`. At RF 1 per DC across two DCs a global Paxos quorum
     is both replicas, so losing one fails dedup hits, first materializations and
-    rematerializations alike. The availability envelope of the whole upload path —
-    not of one rare branch — is "every participating DC reachable", and the X4 probe
-    fast path is the only thing that would change the dedup half of that sentence.
+    rematerializations alike, and the X4 probe fast path is the only thing that would
+    take dedup off that LWT. But the first draft of this correction then over-reached
+    into "the availability envelope of the whole upload path is every participating DC
+    reachable", which is only true for the two-DC topology it was derived from. See
+    correction 120: `SERIAL` and `EACH_QUORUM` do not fail together.
 117. **The reference partition needs a tombstone policy, for a different reason than
     the use table.** PR-1 was told to specify compaction and `gc_grace_seconds` for
     `block_generation_uses` and nothing for `block_generation_references`, although
     the destructive proof reads the reference partition **whole** at `EACH_QUORUM`,
-    and does so precisely when it holds one tombstone per reference the generation
-    ever had. A read that trips `tombstone_failure_threshold` is not slow, it is an
-    error; the fail-closed rule turns that into "keep `RETIRING` and retry", which
-    repeats forever. The result is a generation that can never be collected and
-    writers fenced behind it — and the single-partition rule deliberately forbids
-    every workaround.
+    and does so precisely when its live rows are gone and its removals are not. The
+    count is `O(reference churn between successful purges)`, not "one per reference
+    the generation ever had" — compaction may already have reclaimed earlier ones and
+    `gc_grace_seconds` bounds how soon it may; the first draft over-claimed. A read
+    that trips `tombstone_failure_threshold` is not slow, it is an error, and the
+    fail-closed rule turns that into "keep `RETIRING` and retry" forever. Note where
+    that lands in the decision order: the read-error branch is evaluated **before**
+    both `RETIRING -> ACTIVE` escapes, so neither can fire while the read keeps
+    failing. This is not a stalled collection with a drain-escape safety valve — it is
+    a writer fence that never lifts, an availability failure rather than the retention
+    trade this document accepts elsewhere. The single-partition rule deliberately
+    forbids every workaround.
 118. **The deprecated symbol is the type, not the method.** In
     `apache/cassandra-gocql-driver/v2` the deprecation applies to
     `type SerialConsistency = Consistency`; `Query.SerialConsistency(...)` is current
@@ -4950,6 +5136,38 @@ reintroduce rejected designs:
     removed, so the table promised five projections where the schema defines four. A
     removal is not complete until every enumeration that counted the removed thing is
     recounted.
+120. **`SERIAL` and `EACH_QUORUM` do not have the same availability envelope, and one
+    of them is topology-dependent.** `EACH_QUORUM` requires a quorum in **every** DC,
+    so any operation committing at that level fails during a whole-DC outage in every
+    supported topology — that is the rematerialization activation CAS, and it is
+    universal. `SERIAL` requires a majority of **all** replicas, which one lost DC may
+    or may not break: at 2 DCs it always does, at 3 DCs × RF1 it does not. So the
+    first-writer LWT — and therefore first materialization and today's dedup — has a
+    topology-dependent envelope that must not be stated as "every DC". A property
+    derived from the two-DC test profile and frozen as a general one is exactly the
+    class of error this document keeps catching in the other direction; the assumptions
+    already say production reasoning must work at higher RF, and it must work at more
+    DCs too.
+121. **Ordering does not substitute for a logged batch unless the consumer cannot yet
+    act.** "Confirm the projection, then write the canonical row" reads like a
+    universal replacement for atomicity, and for the four GC families it is, because
+    nothing consumes those projections until the branch is due. The provisional
+    reference is different: its scanner deletes a projection whose canonical row is
+    absent, so a scanner that could run between the two writes would delete the
+    projection and reopen F10. What saves it is that the row is scheduled a full TTL
+    ahead and the scanner skips rows that are not due
+    (`internal/gc/scanner.go:265-268`) — a precondition, not a property of ordering.
+    Any future family that adopts the ordering shape has to state the same thing or
+    use a batch.
+122. **A statement-level invariant cannot be a startup assertion.** "The gate asserts
+    the effective per-statement serial level for the inventory" is not implementable:
+    nothing at boot can enumerate the consistency level of every LWT written in Go, so
+    the phrasing would have been satisfied by the config-string check it was written
+    to replace. Split it — startup checks configuration and topology, one helper
+    carries the level for every `blocks`-partition LWT, and tests plus writer-path
+    tracing assert the inventory. This is the technique the org-scoped-key series used
+    when it deleted the global block APIs: make the compiler and the helper hold the
+    invariant so a reviewer does not have to.
 
 ## Related Documents
 
