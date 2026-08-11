@@ -209,7 +209,7 @@ version must still be asserted by integration tests.
 | `RETIRING -> ACTIVE` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
 | Retirement evidence append (one row per `(generation, claim_epoch)`) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM`; `INSERT ... IF NOT EXISTS`, immutable and ordered before the pointer CAS |
 | `RETIRING -> RETIRED` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
-| Crashed-activation settlement read | `SELECT` on the `blocks` partition at read consistency `SERIAL`; or, as the recorded fallback, a harmless `IF EXISTS` LWT on that partition at `SERIAL` + `EACH_QUORUM`. An ordinary read at any level does not settle a pending proposal |
+| Crashed-activation settlement read | `SELECT` on the `blocks` partition at read consistency `SERIAL`. This is the single normative form; an ordinary read at any level does not settle a pending proposal |
 | `gc_state = null -> DELETING` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the G1 generation row; `IF gc_state = null AND materialization_state = VERIFIED AND storage_key = K1`, issued after the authoritative pointer/evidence proof and recording the authorizing claim |
 | `DELETING -> DELETED` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the G1 generation row; `IF gc_state = DELETING` |
 | Transition to `gc_state = QUARANTINED` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the generation row; `IF gc_state = null AND storage_key = K`, plus the `materialization_state`/operation-ID identity in the `MATERIALIZING` form |
@@ -936,7 +936,7 @@ machine, and the predecessor chain for every later generation. Confirming the in
 first also matches the rule that G2's predecessor tuple must be durable before
 activation is attempted.
 
-A logged batch across the two partitions would also be correct, but it is more
+A logged batch across the three partitions would also be correct, but it is more
 expensive and harder to reason about than two ordered confirmations, and this design
 prefers the sequential form. Neither variant needs Paxos.
 
@@ -1172,6 +1172,46 @@ expired or crashed VERIFIED materialization
 5. anything uncertain         retain G2 and K2; retry later
 ```
 
+##### First Materialization Has The Same Hazard
+
+The sequence above is written in rematerialization vocabulary, but **the hazard is
+not specific to rematerialization**. The first-writer `INSERT ... IF NOT EXISTS` is
+also a Paxos operation on the same `blocks` partition, in the same `SERIAL` domain,
+and it fails the same way:
+
+```text
+materializer PUTs K1
+first-writer LWT proposal accepted; coordinator dies before the commit is learned
+recovery: ordinary read of blocks -> no row (or a released stub)
+recovery: "never activated, authority expired" -> orphan and DELETE K1
+later:    any LWT on that partition replays the pending proposal
+          -> blocks now points at K1, which no longer exists
+```
+
+That is live-data loss on the *first* upload of new content, reachable from day one
+of the writer rollout and long before any rematerialization exists. An implementation
+that applies the settlement rule only where this document says "G2" leaves it open.
+
+The rule is therefore stated over materializations, not over successors:
+
+> Any materializer whose activation LWT may have been issued — first life or
+> rematerialization — must settle the `blocks` partition serially before any orphan
+> or delete decision about its own key.
+
+For a first life the settled outcomes are the same shape:
+
+| Settled pointer | Action |
+|---|---|
+| selects this generation | The LWT applied. Never orphan `K`. Do not publish with expired authority; hand off to the zero-reference `ACTIVE` branch |
+| selects a different generation | This materializer lost the first-writer race; `K` becomes an exact orphan |
+| absent, or a released stub, with no proposal outstanding | The LWT did not apply. If authority has expired, do **not** activate; `K` becomes an exact orphan |
+| uncertain | Retain the generation and `K`; retry later |
+
+The stub row deserves its own mention: "no `active_generation_id`" is not "no
+activation was ever proposed". Only the settled read distinguishes them, which is
+why Released Stubs Break "Row Exists Implies Active Pointer" and this section have to
+be read together.
+
 ##### How To Issue The Settlement Read
 
 "Settle serially" is a driver-level question, and getting it wrong produces a
@@ -1195,30 +1235,28 @@ write `.SerialConsistency(gocql.Serial)` on a plain `SELECT`: that setter is for
 conditional phase of an LWT and is ignored by a non-conditional statement — it is
 exactly the silent no-op this section exists to prevent.
 
-If a future driver or engine constraint makes the serial read unavailable, there is
-a supported fallback that needs no new guarantee: issue a **harmless settlement
-LWT** on the same `blocks` partition, then read normally.
+**The serial `SELECT` is the normative mechanism.** There is exactly one settlement
+form in this design, and the startup gate is unconditional: `paxos_variant` must
+retain linearizable reads. PR-0 records the exact accepted set for the deployed
+engine, and PR-2's startup gate rejects any `*_without_linearizable_reads*` variant.
+This is a third axis alongside `NetworkTopologyStrategy` and `SERIAL`, and it fails
+the same way: silently.
 
-```text
-UPDATE blocks SET paxos_settle_token = <uuid>
-WHERE org_id = O AND block_id = L
-IF EXISTS                                  -- SERIAL + EACH_QUORUM
-```
+Offering two mechanisms would not have been free. A conditional gate is a gate that
+is wrong in one of its branches whenever the branches drift, and the alternative
+below also needs a schema column that Proposed Schema does not define. One
+mechanism, one gate, one column set.
 
-Any LWT on the partition runs a Paxos prepare phase, which finishes any in-progress
-accepted proposal before it proceeds, so a statement that touches only a dedicated
-token column settles the activation without being able to install one. `IF EXISTS`
-keeps it compliant with correction 71. The cost is a full LWT instead of a serial
-read, paid only in crash recovery, never per block.
-
-Whichever form is used, the recovery path depends on a linearizable serial round,
-which constrains the engine configuration: `paxos_variant` settings that drop
-linearizable reads cannot serve the serial-read form. PR-0 records the exact
-accepted set for the deployed engine, and PR-2's startup gate rejects any
-`*_without_linearizable_reads*` variant — unless the implementation adopts the
-settlement-LWT form, which does not rely on that property. This is a third axis
-alongside `NetworkTopologyStrategy` and `SERIAL`, and it fails the same way:
-silently.
+The alternative is recorded only so it is not rediscovered as new: a **harmless
+settlement LWT** on the same `blocks` partition — for example an
+`UPDATE ... SET <token column> ... IF EXISTS` at `SERIAL` + `EACH_QUORUM` — would
+also settle a pending proposal, because any LWT runs a prepare phase that finishes
+in-progress rounds before proceeding, and a statement touching only a dedicated
+column cannot install a pointer. It needs no linearizable-read guarantee. It is
+**not** part of this contract: it costs a full LWT instead of a serial read, and
+adopting it would require PR-1 to add the token column and PR-2 to make the
+`paxos_variant` gate conditional. Revisit it only if a future driver or engine
+removes the serial read.
 
 **This gate binds from the first generation-aware write, not from `gc.enabled`**,
 for the same reason the `SERIAL` gate does — and here the reason is sharper. A
@@ -1562,10 +1600,10 @@ reached `VERIFIED` has no confirmed object to delete and belongs to the
 materialization-expiry path, not to this one.
 
 The authorization comes from the proof required *before* the statement is issued: an
-evidence row for the live claim epoch, plus an authoritative pointer that either
-reads `G1 / RETIRED` or already selects G2 with a matching predecessor tuple. That
-proof is irrevocable once obtained, which is precisely why it does not need to be
-re-asserted in the `IF` clause:
+evidence row matching the live claim's epoch **and** ID, plus an authoritative
+pointer that either reads `G1 / RETIRED` or selects a successor reachable from G1 by
+an unbroken lineage chain. That proof is irrevocable once obtained, which is
+precisely why it does not need to be re-asserted in the `IF` clause:
 
 ```text
 the pointer has no RETIRED -> ACTIVE transition
@@ -1806,10 +1844,12 @@ ADR forbids elsewhere as an acceptance criterion.
 
 There is no mutable generation-row mirror finalize. The durable proof of retirement is:
 
-> a matching-epoch evidence row for G1, **plus** the authoritative pointer having
-> left `RETIRING` — either because it reads `G1 / RETIRED`, or because it has
-> already been replaced by G2, whose durable predecessor tuple and activation CAS
-> required the exact `G1 / E1 / C1 / N1` retirement claim.
+> an evidence row for G1 matching the live claim's **epoch and ID**, **plus** the
+> authoritative pointer having left `RETIRING` — either because it reads
+> `G1 / RETIRED`, or because it has already been replaced by a successor whose
+> durable predecessor tuple and activation CAS required the exact
+> `G1 / E1 / C1 / N1` retirement claim. Where that successor is not the current
+> pointer, the same proof is reached by walking the lineage chain.
 
 Once that proof exists, the worker may conditionally set G1's `gc_state` to
 `DELETING` on the generation row. This is physical cleanup, not a second active
@@ -1952,7 +1992,7 @@ evidence(G2, N2)                        G2 held the pointer and was retired
 pointer = G3
 ```
 
-Each link pairs one predecessor tuple with the matching-epoch evidence row for that
+Each link pairs one predecessor tuple with the matching claim evidence row for that
 predecessor. Every link must match exactly; a single missing or mismatched link
 fails the whole chain closed. This adds **no new table, no new write, and no new
 Paxos** — every row involved is already required elsewhere in this document. What
@@ -1980,12 +2020,13 @@ inferred from it:
 > whose epoch matches but whose claim ID does not is a **protocol violation** and
 > fails closed, never "close enough".
 
-> No retirement evidence is ever overwritten or deleted by a worker. A row may age
-> out only when every generation it could still prove has reached `DELETED` **and**
-> no surviving lineage chain needs it as a link. "A successor pointer exists" is
-> **not** sufficient: the `pointer selects G2` and `pointer selects G3 or later`
-> rows both consume that evidence, so ageing it on successor activation would send
-> the cleanup worker straight into fail-closed and strand `K1` permanently.
+> No retirement evidence is ever overwritten, deleted, or expired by any path in
+> this design. Under X1/X2 it is retained unconditionally; ageing it out at all
+> belongs to the out-of-scope `PURGING_LOGICAL` protocol. In particular "a successor
+> pointer exists" is **not** a release condition: the `pointer selects G2` and
+> `pointer selects G3 or later` rows both consume that evidence, so ageing it on
+> successor activation would send the cleanup worker straight into fail-closed and
+> strand `K1` permanently.
 
 > A G2 record is valid only when its immutable predecessor tuple matches the
 > evidence row and the old pointer claim used by the activation CAS. The latest
@@ -2243,11 +2284,34 @@ uses that caused the escape, so the next cycle finds the rows gone rather than
 repeating the same reactivation.
 
 The pointer reactivation and delayed-candidate enqueue are deliberately not one
-transaction. If the process crashes after `RETIRING -> ACTIVE` and before the
-candidate write, the consequence is retention and delayed reclamation, never data
-loss; recovery scans `ACTIVE` generations with no reference and no live use as the
-backstop. The candidate write must therefore be retryable and fail closed, but it
-must never be used as a reason to roll back or weaken the pointer transition.
+transaction, so the ordering between them matters. **The candidate must be written
+before the CAS, not after it.**
+
+An earlier revision wrote it afterwards and justified the crash window by saying
+recovery scans `ACTIVE` generations with no reference and no live use as the
+backstop. That backstop no longer exists: recovery is projection-driven, and
+`gc_generation_zero_ref_by_day` only helps if a row was already published. A crash
+between the CAS and the candidate write would leave a generation that is `ACTIVE`
+with zero references, invisible to every automated path, retained forever.
+
+This is Discoverability Before Irreversibility applied to a transition that is not
+destructive but is still state-changing:
+
+```text
+1. write the delayed candidate (candidate_at = now + drain_grace)
+   and its discovery projection row
+2. CAS RETIRING -> ACTIVE
+```
+
+Writing it first is safe in the direction that matters. If the CAS then fails —
+because a reference appeared, or another worker got there — the candidate is merely
+stale, and the scanner revalidates canonical state before acting and deletes the row
+if it no longer applies. A stale candidate costs one wasted revalidation. An
+invisible `ACTIVE` generation costs the guarantee.
+
+The candidate write must be retryable and fail closed, and a failure to publish it
+is a reason not to proceed to the CAS — never a reason to roll back or weaken the
+pointer transition once the CAS has committed.
 
 Delegating this to the Recovery Protocol would be wrong on Cassandra: recovery is a
 crash sweep, not a scheduler. Using it for ordinary scheduling turns a routine
@@ -2456,8 +2520,11 @@ the retained pointer can name that predecessor, **and** while any lineage chain 
 needs them as a link. A successor taking the pointer does not release them: the
 cleanup worker consumes exactly those rows to prove that a delayed `K1` may be
 deleted, and The Lineage Chain Is Transitive walks them across arbitrarily many
-generations. Evidence and predecessor tuples may only be released together with the
-generations they describe, once every one of those generations is `DELETED`.
+generations. Under X1/X2 they are never released at all: no path in this design
+deletes or expires a `blocks` row, a generation row, a predecessor tuple, or a
+retirement evidence row as logical-history compaction. That is the whole content of
+the retention decision recorded in Cost And Operational Impact, and it is what makes
+the lineage walk safe at any depth and any age.
 
 ### Generation History
 
@@ -2567,8 +2634,10 @@ block_generation_uses
     PRIMARY KEY ((org_id, block_id, generation_id), use_id)
 ```
 
-A materializer use is created in `AUTHORIZED` state together with the
-`MATERIALIZING` intent, before the PUT. A writer use is created `PENDING` and is
+A materializer use is created in `AUTHORIZED` state as its own confirmed write in
+step 3b, after the `MATERIALIZING` intent of step 3a and before the PUT — the two
+are separate partitions and are never written as one operation. A writer use is
+created `PENDING` and is
 promoted to `AUTHORIZED` only after the active pointer is revalidated. Both kinds
 are drained identically by the GC; the distinction exists for recovery, which must
 know whether an abandoned use also implies an abandoned materialization.
@@ -2793,7 +2862,9 @@ The following current paths must be addressed by implementation PRs:
 - `internal/gc/worker.go:403-606` implements the current local claim-then-verify
   delete flow.
 - `internal/gc/worker.go:547-594` persists current orphan state before finalizing the
-  logical block row, but future recovery must additionally scan `DELETING` generations.
+  logical block row, but future recovery must additionally reach `DELETING`
+  generations through `gc_generation_deletes_by_day`, published before the
+  transition rather than discovered by a scan.
 - `internal/gc/worker.go:233` (`cleanupBlockMapping`) and
   `internal/gc/store_cassandra.go:2137` (`DeleteBlockMappingExact`) remove
   `block_id_mappings` rows keyed by logical `(representation_id, external_id)`, not
@@ -3076,7 +3147,7 @@ Required cases include:
   proceed without deleting quarantined G1, while a quarantined or unprovable G2
   cannot publish;
 - a lost step-2 retirement persist is detected and the global zero check re-runs;
-- `pointer=RETIRING` plus a matching-epoch evidence row **never reaches
+- `pointer=RETIRING` plus a matching claim evidence row **never reaches
   `DELETING`**: assert no `DELETING` transition, no `DeleteObject`, no G2
   activation, and that the global zero check re-runs before the pointer CAS
   completes;
@@ -3153,6 +3224,20 @@ Required cases include:
 - the settlement read is issued as `Consistency(Serial)` on a `SELECT`, and a test
   asserts that the `SerialConsistency` setter on a non-conditional statement does
   not produce a serial round — the silent no-op form must fail the test;
+- a **first** materialization whose first-writer LWT proposal was accepted but not
+  learned is settled serially before any orphan decision; a test crashes the
+  coordinator in that window and asserts `K1` is not deleted when a later LWT
+  replays the proposal and the pointer becomes that generation;
+- a released stub observed by a crashed first materializer is not treated as proof
+  that no activation was proposed;
+- a crash between the delayed-candidate write and the `RETIRING -> ACTIVE` CAS
+  leaves only a stale candidate, which the scanner revalidates and discards; a crash
+  in the reverse order — which the contract forbids — is asserted to be
+  unreachable, since no `ACTIVE` generation may exist without a published
+  discovery row;
+- no code path deletes or expires a `blocks` row, a generation row, a predecessor
+  tuple, retirement evidence, or a `block_id_mappings` row; a test asserts the
+  absence of any TTL on those tables;
 - a generation whose `materialization_state` lags behind an activation committed in
   another DC is repaired rather than quarantined, while a writer observing the same
   lag fails closed and retries;
@@ -3244,7 +3329,7 @@ Required scenarios:
   into a second generation;
 - a crash between the G1 retirement persist and the pointer CAS is recovered by
   re-running the global zero check, and the intermediate state
-  `pointer=RETIRING` with a matching-epoch evidence row never produces a
+  `pointer=RETIRING` with a matching claim evidence row never produces a
   `DELETING` transition, an S3 delete, or a G2 activation;
 - an injected inconsistent state that looks like a pointer CAS occurred without
   matching retirement evidence refuses G2 activation and quarantines/retains G1
@@ -3544,9 +3629,9 @@ X2 is closed only when:
 - GC worker concurrency is bounded and has a measured throughput/queue-age target;
 - the generation row uses monotonic materialization/physical markers rather than a
   second mutable `ACTIVE/RETIRING/RETIRED` authority;
-- physical generation cleanup never deletes the logical `blocks` row, resets
-  `active_epoch`, or removes a logical `block_id_mappings` row still needed by a
-  successor generation;
+- physical generation cleanup never deletes the logical `blocks` row, never resets
+  `active_epoch`, and never removes a `block_id_mappings` row at all — mappings are
+  logical identity and are not part of generation collection under any condition;
 - the integration harness asserts Cassandra `release_version=5.0.6`;
 - multi-DC and DC-outage tests pass.
 
@@ -3567,9 +3652,10 @@ X1 is closed only when:
 - the logical `blocks` row remains available as a retired predecessor after G1's
   physical `gc_state` reaches `DELETED`, with the required evidence/lineage retained
   for a future G2 activation;
-- the retention cost of that retained pointer/generation/evidence triple is either
-  accepted with an explicit capacity note or bounded by a horizon that collects all
-  three **as one unit**; no path collects any one of them alone;
+- the retained pointer/generation/evidence triple is kept **unconditionally**, with
+  an explicit capacity note. No X1/X2 path collects, expires, TTLs, or horizons any
+  of the three, together or alone; logical-history compaction is `PURGING_LOGICAL`
+  work and is out of scope;
 - a `blocks` row that exists without an `active_generation_id` is recognised as a
   released stub and never mistaken for a lost activation race;
 - a delayed G1 delete cannot affect G2.
@@ -3701,7 +3787,7 @@ reintroduce rejected designs:
     recovery source. One immutable row per `(generation, claim_epoch)` removes both
     failures; its `INSERT ... IF NOT EXISTS` is an intentional cold-path Paxos
     operation and never runs in a writer request.
-39. `pointer=RETIRING` with a matching-epoch evidence row is a normal, expected
+39. `pointer=RETIRING` with a matching claim evidence row is a normal, expected
     crash state and was missing from the reconciliation table. It authorizes
     nothing: no `DELETING`, no G2, no S3 delete. Evidence alone never authorizes
     deletion; the authoritative pointer must also have left `RETIRING`.
@@ -3916,11 +4002,13 @@ reintroduce rejected designs:
     `RETIRING` and `RETIRED` and are cleared by the same statement that reactivates
     or replaces the pointer. Clearing the epoch would let a stale cycle-N worker
     match a future cycle.
-76. **The materialization intent and the materializer use are two writes to two
-    partitions.** "Persist intent + use" as one line hid that they are not atomic and
-    produced an ambiguity contract naming only the use. Confirm the intent first,
-    then the use, then PUT. An activation with an unconfirmed intent leaves the
-    pointer naming a generation that has no row at all.
+76. **The materialization intent and the materializer use are separate writes to
+    separate partitions.** "Persist intent + use" as one line hid that they are not
+    atomic and produced an ambiguity contract naming only the use. Confirm the intent
+    first, then the use, then PUT. An activation with an unconfirmed intent leaves the
+    pointer naming a generation that has no row at all. **Superseded in count by
+    correction 88**: a third write, the recovery discovery record, was later inserted
+    before the PUT, so the sequence is 3a/3b/3c and any text saying "two" is stale.
 77. **Recovery is projection-driven, not scan-driven, and carries no pointer states.**
     The branch "scan `block_generations` for generations that are `ACTIVE`" survived
     the mirror removal and can never match, because `ACTIVE` exists only on `blocks`.
@@ -3948,11 +4036,14 @@ reintroduce rejected designs:
     `ACTIVE -> RETIRING` was the one GC-owned transition a stale worker could still
     win, because `active_epoch` deliberately does not change across GC cycles: a
     worker that observed `ACTIVE` before two completed retire cycles could wake and
-    reinstall an old epoch. That is not just a regressed counter — evidence rows for
-    that epoch already exist from the earlier cycle, so the stale worker could find
-    "evidence for my live claim epoch" it never earned and proceed toward `DELETING`
-    without its own zero check. The first-writer LWT initializes the epoch to 0 so
-    the first acquisition is not a null comparison.
+    reinstall an old epoch. The damage is to **epoch uniqueness**, which the evidence
+    table depends on: the stale worker's own evidence append for that epoch is an
+    `INSERT ... IF NOT EXISTS` that will not apply and whose payload conflicts, so it
+    fails closed permanently and the block becomes unretirable. What separately stops
+    it from *deleting* on the earlier cycle's evidence is correction 89's claim-ID
+    match, not this CAS; both defences are required and neither substitutes for the
+    other. The first-writer LWT initializes the epoch to 0, for the reasons in
+    correction 90 — not because of any missing-row hazard.
 82. **`expires_at` is immutable per `reference_instance_id`.** The instance ID does
     not close the expiry ABA on its own: if a retry may renew the same instance in
     place, the stale row the scanner read and the renewed row it deletes are the same
@@ -4054,6 +4145,38 @@ reintroduce rejected designs:
     activation CAS on day one of the writer rollout, and the recovery that follows is
     exactly the path that needs the serial round — so the assertion would have been
     unenforced during the window in which the first crashed activations occur.
+96. **The accepted-but-not-learned hazard is not specific to rematerialization.** The
+    first-writer `INSERT ... IF NOT EXISTS` is a Paxos operation on the same `blocks`
+    partition in the same `SERIAL` domain, so a first materialization can PUT `K1`,
+    have its proposal accepted, lose its coordinator, and then be read by recovery as
+    "no row, never activated" — after which orphaning `K1` loses live data the moment
+    a later LWT replays the proposal. This is reachable on the first upload of new
+    content, before any rematerialization exists. The settlement rule is stated over
+    *materializations*, not over successors, and a released stub is not proof that no
+    activation was proposed.
+97. **`RETIRING -> ACTIVE` writes its delayed candidate before the CAS, not after.**
+    The original order was justified by a recovery scan over `ACTIVE` generations,
+    and that scan no longer exists. A crash in the window would leave a generation
+    that is `ACTIVE` with zero references and no projection row — invisible to every
+    automated path. A stale candidate costs one wasted revalidation; an invisible
+    `ACTIVE` generation costs the guarantee. This is Discoverability Before
+    Irreversibility applied to a transition that is state-changing without being
+    destructive.
+98. **One settlement mechanism, one gate.** An earlier revision made the serial
+    `SELECT` and a harmless settlement LWT both normative while keeping the
+    `paxos_variant` gate unconditional — two policies that cannot both hold, and the
+    LWT form additionally used a column Proposed Schema never defined. The serial
+    `SELECT` is the contract; the LWT is recorded as a rejected alternative with its
+    costs, so it is not rediscovered as new. A conditional gate is a gate that is
+    wrong in one branch as soon as the branches drift.
+99. **X1/X2 never deletes logical history — no exceptions, no horizons.** The
+    retention decision was recorded in the cost section while three other places
+    still described conditions under which evidence, predecessor tuples, or the
+    triple as a whole "may age out" or be "bounded by a horizon". Any of those is an
+    implementation licence for exactly the purge race declared out of scope.
+    `blocks` rows, generation rows, predecessor lineage, retirement evidence, and
+    `block_id_mappings` are retained unconditionally; releasing them is
+    `PURGING_LOGICAL` work with its own fence.
 
 ## Related Documents
 
