@@ -280,7 +280,8 @@ version must still be asserted by integration tests.
 | Use-row drain, including `PENDING`, `AUTHORIZED`, and materializer uses | `EACH_QUORUM` |
 | Quarantine use drain | `EACH_QUORUM` until zero after an acknowledged `RETIRING/QUARANTINE` pointer fence; no retirement evidence, reactivation, or delete |
 | Quarantine work `OPEN -> RESOLVING` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM` on `gc_generation_quarantines_by_day`; matches the full quarantine operation/evidence identity, fixes the prospective `(Cr, Nr)`, and is confirmed **before** any `gc_state` or pointer mutation. This is not a `blocks` partition, so a later inventoried optimization may localize its serial phase; the one-serial-domain rule does not bind it |
-| Quarantine work `OPEN -> REJECTED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`; permitted only from `OPEN`. There is no `RESOLVING -> REJECTED` form |
+| Quarantine work `OPEN -> REJECTED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`; the ordinary rejection path |
+| Quarantine work `RESOLVING -> REJECTED` (abort) | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`, permitted only after canonical state shows the generation is still `QUARANTINED` and the pointer still fenced — restoring `gc_state = QUARANTINED` at `SERIAL + ALL` first when the generation step already ran. Never permitted once the pointer step committed; see Resolution Needs Its Own Durable State |
 | `RETIRING/QUARANTINE -> ACTIVE` (operator resolution) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the retained quarantine claim; requires a confirmed delayed candidate and its discovery projection first |
 | `RETIRED/QUARANTINE -> RETIRED/GC_RETIRE` (operator recertification) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the retained quarantine claim, installs the next `retire_claim_epoch`, and requires a fresh global zero check plus confirmed fresh evidence for that epoch first. There is no `RETIRED -> ACTIVE` form |
 | Final generation-reference check | `EACH_QUORUM` |
@@ -2943,9 +2944,11 @@ The proof that does exist is retirement evidence, because of where it can be wri
 Operator recertification is the one place where the second sentence does not hold: its
 evidence is appended for a *prospective* claim, before the CAS that installs it. The
 first sentence is unaffected — a recertified generation reached `RETIRED` through the
-ordinary path, so it did hold the pointer — and the lineage walk is unaffected too,
-because an orphaned prospective row is reachable by no pointer and no lineage link.
-See Recertification Evidence Is Prospective.
+ordinary path, so it did hold the pointer. The lineage walk is unaffected for a
+different reason: a prospective row is discoverable through its handoff projection and
+its `RESOLVING` work row, but it becomes retirement authority only once the pointer or
+a successor lineage proves that exact claim was installed. See Recertification Evidence
+Is Prospective.
 
 So a losing generation can never accumulate evidence of its own, and the chain is
 decidable by walking backwards from the live pointer:
@@ -3446,13 +3449,33 @@ holds the claim:
 > authoritative if and only if the subsequent CAS atomically installs exactly that
 > `(Cr, Nr)` as `RETIRED/GC_RETIRE`.
 
-An orphaned prospective evidence row is inert, and this is what makes preparing it
-early safe. Every consumer reaches evidence by an exact `(G, N)` taken from the live
-pointer claim or from a lineage link. If the CAS never applies, the live claim is
-still `(Cq, Nq)` and no lineage link names `(Cr, Nr)`, so nothing can find the row.
-It is historical data that authorizes nothing — which is the standing rule that
-evidence alone never authorizes deletion, applied to a row that never acquired a
-claim at all.
+**Discoverable is not authoritative.** Prospective evidence is *not* unreachable, and
+saying so would be wrong in a way that matters: the recertification publishes its
+handoff projection before the CAS, and the `RESOLVING` work row carries
+`prospective_claim_epoch` too, so a scanner has two ways to find
+`evidence(G1, Nr, Cr)` while the pointer still reads `G1 / RETIRED / Cq / Nq /
+QUARANTINE`. That discoverability is required rather than incidental — it is what
+recovers a crash between the append and the CAS.
+
+What the row lacks is authority, and the two properties must be kept apart:
+
+```text
+discovered before the CAS
+    -> may ONLY settle or retry the exact (Cq, Nq) -> (Cr, Nr) recertification
+    -> may NOT authorize DELETING, publish delete work, or permit G2 activation
+
+CAS proven applied (live pointer, or transitive successor lineage naming Cr/Nr)
+    -> evidence(G1, Nr, Cr) is the retirement-authorizing evidence
+
+CAS proven never applied and no longer applicable
+    -> stale historical/recovery state; authorizes nothing, ever
+```
+
+No delete or activation path may treat `(Cr, Nr)` as retirement authority until the
+live pointer or its transitive successor lineage proves that exact prospective claim
+was installed. This is the standing rule that evidence alone never authorizes
+deletion, applied to a row whose claim may not exist yet — the authoritative pointer
+must also have installed it.
 
 **The order cannot be inverted.** Doing the CAS first and the check and append
 afterwards looks tidier and is wrong: from the instant the pointer reads
@@ -3557,15 +3580,86 @@ RESOLVED     -> terminal; never reopen
 REJECTED     -> terminal; the pointer stays fenced
 ```
 
-**`REJECTED` is reachable only from `OPEN`.** Once a resolution is `RESOLVING` it has
-already cleared `gc_state`, so a bare `RESOLVING -> REJECTED` would leave an
-unquarantined generation under a still-fenced pointer — a state the recovery table
-does not describe and that no scanner could act on. An operator who changes their mind
-mid-resolution completes the authorized resolution and then raises a **new** quarantine
-through the ordinary path, which re-establishes the generation state and the pointer
-fence together. Allowing the shortcut and requiring it to first restore
-`gc_state=QUARANTINED` and the fence would work, but it duplicates the quarantine path
-for no gain; one entry point is the cleaner freeze.
+**A bare `RESOLVING -> REJECTED` is forbidden**, but not because `RESOLVING` implies
+`gc_state` was already cleared — it does not. `RESOLVING` is confirmed *before* any
+mutation, so it spans three distinct situations:
+
+```text
+RESOLVING, gc_state = QUARANTINED, pointer fenced    nothing has been undone
+RESOLVING, gc_state = null,        pointer fenced    generation step done
+RESOLVING, pointer step committed                    resolution effectively complete
+```
+
+That is precisely why the state exists, and it is why a bare rejection cannot define
+rollback: the same work state means three different amounts of undo.
+
+**Aborting therefore reads the canonical state and is always fail-closed:**
+
+```text
+gc_state still QUARANTINED, pointer still fenced
+    -> RESOLVING -> REJECTED directly; nothing to undo
+
+gc_state already null, pointer still fenced
+    -> conditionally restore gc_state = QUARANTINED at SERIAL + ALL,
+       matching the same generation/key identity
+    -> then RESOLVING -> REJECTED
+
+pointer step already committed
+    -> there is nothing left to abort; finish to RESOLVED, then raise a NEW
+       quarantine through the ordinary ACTIVE -> RETIRING/QUARANTINE path
+```
+
+An earlier revision of this section said instead that an operator who changes their
+mind should "complete the authorized resolution and then raise a new quarantine". As a
+general rule that is a fail-closed violation: for the first two situations it would
+clear `gc_state` and return a generation whose contradiction has *just been confirmed*
+to `ACTIVE`, opening a window in which a writer can pin it, authorize, and publish
+before the second quarantine lands. It is correct only in the third situation, where
+the pointer is already live and there is genuinely nothing to undo.
+
+If new evidence appears mid-resolution and the abort cannot complete — an unavailable
+DC, an ambiguous restore — the work stays `RESOLVING` and fenced. Fail-closed
+indefinitely is the correct outcome; advancing a resolution known to be wrong is not.
+
+#### A `RESOLVING` Recertification Is Settled By Lineage, Not By The Live Pointer
+
+The last crash point needs the transitive walk, and reading it naively inverts the
+answer. Once the recertification CAS commits, the pointer reads
+`G1 / RETIRED/GC_RETIRE / Cr / Nr` and a rematerializer may activate G2 **immediately**.
+If the coordinator then dies before marking the work `RESOLVED`, recovery wakes to:
+
+```text
+work    = RESOLVING
+pointer = G2 ACTIVE       (or G3, after another cycle)
+```
+
+"G1 is no longer on the pointer" must not be read as "the recertification failed".
+That is the same mistake correction 140 closes for a crashed materializer, in the
+vocabulary of an operator resolution:
+
+```text
+pointer = G1 / RETIRED/GC_RETIRE with exactly Cr / Nr
+    -> the CAS committed; mark the work RESOLVED
+
+pointer = a successor
+    -> walk the predecessor/evidence lineage backwards
+    -> a link naming exactly (G1, E1, Cr, Nr) proves the CAS committed
+    -> mark the work RESOLVED
+
+pointer = G1 / RETIRED/QUARANTINE with the old Cq / Nq
+    -> the CAS did not commit; retry the same recertification with the same
+       prospective (Cr, Nr)
+
+lineage broken, or any read uncertain
+    -> retain RESOLVING and retry; never infer failure, and never re-allocate a
+       second prospective claim
+```
+
+The prospective evidence row is what makes the successor case decidable: it was
+appended before the CAS, it is never deleted, and only a committed CAS can put `(Cr,
+Nr)` into a lineage link. This is the same property that makes the ordinary lineage
+walk sound, so the recertification adds no new proof obligation — only the requirement
+that its recovery use the walk instead of the live pointer alone.
 
 This is Discoverability Before Irreversibility applied to an administrative decision:
 the record that a decision was made outlives the process that made it, and the scanner
@@ -4184,8 +4278,11 @@ state and either loops or, worse, resolves it differently. A quarantined generat
   `RESOLVED` with a conditional update matching the full identity. If a coordinator
   dies before that final marker, the work remains `RESOLVING` and the scanner resumes
   that exact authorized resolution; it must not retire the work while pointer cleanup
-  is pending. If the contradiction is confirmed, mark the work `REJECTED` and retain
-  `QUARANTINED`. If any identity or condition does not match, retain quarantine and
+  is pending. If the contradiction is confirmed **while the work is still `OPEN`**,
+  transition `OPEN -> REJECTED` and retain `QUARANTINED`; if it is confirmed after the
+  work reached `RESOLVING`, follow the state-aware abort contract in Resolution Needs
+  Its Own Durable State rather than completing the false-positive resolution. If any
+  identity or condition does not match, retain quarantine and
   require a new audited resolution; no operator action may authorize deletion
   implicitly. The scanner must see a terminal work state before retiring the work
   record or accepting any retry.
@@ -5270,9 +5367,27 @@ Required cases include:
   moved to `RETIRED/GC_RETIRE` first, a G2 activation or delete authorization attempted
   before the append finds no `evidence(G1, Nr)` and drives G1 into permanent
   fail-closed quarantine;
-- a recertification whose pointer CAS never applies leaves `evidence(G1, Nr, Cr)` inert:
-  a test asserts no pointer and no lineage link can reach it, and that it authorizes no
-  deletion and no activation;
+- a crash after the prospective evidence and handoff but **before** the recertification
+  CAS is recovered through the handoff: a test asserts the scanner discovers
+  `evidence(G1, Nr, Cr)`, may retry the exact same `(Cq, Nq) -> (Cr, Nr)` CAS, and may
+  **not** publish delete work, authorize `DELETING`, or permit G2 activation while the
+  pointer still reads `RETIRED/QUARANTINE`. Discoverability is required; authority is
+  not granted until the CAS is proven applied;
+- a recertification whose pointer CAS is proven never to have applied leaves
+  `evidence(G1, Nr, Cr)` as stale historical state: a test asserts it authorizes no
+  deletion and no activation, ever;
+- a recertification CAS that commits and is followed immediately by a G2 activation, with
+  the coordinator dying before `RESOLVED`, is settled through the predecessor/evidence
+  lineage: a test asserts recovery finds the link naming exactly `(G1, E1, Cr, Nr)`,
+  marks the work `RESOLVED`, and does **not** read "G1 is no longer on the pointer" as a
+  failed recertification or allocate a second prospective claim;
+- aborting a `RESOLVING` resolution is state-aware: a test covers all three situations —
+  nothing undone (`RESOLVING -> REJECTED` directly), generation step done (restore
+  `gc_state = QUARANTINED` at `SERIAL + ALL`, then `REJECTED`), pointer step committed
+  (no abort; finish and raise a new quarantine). A test asserts that the general
+  "complete the resolution then re-quarantine" shortcut is rejected for the first two,
+  because it returns a known-suspect generation to `ACTIVE` and a writer can pin,
+  authorize and publish in that window;
 - a retry of an ambiguous recertification evidence append reuses the `(Cr, Nr)` fixed by
   the `RESOLVING` record; a test allocates a fresh claim ID on retry and asserts the
   conditional insert fails closed on the conflicting payload, proving the determinism
@@ -5841,8 +5956,15 @@ X2 is closed only when:
   is reachable only from `OPEN`;
 - recertification evidence is prepared under the existing `RETIRED/QUARANTINE` fence
   and becomes authoritative only if the pointer CAS installs exactly its prospective
-  claim; an orphaned prospective row authorizes nothing, and the check/append are never
-  reordered after the CAS;
+  claim. It is discoverable before then — through its handoff projection and the
+  `RESOLVING` work row — but discovery may only settle or retry that exact
+  recertification, never authorize a delete or an activation. The check and append are
+  never reordered after the CAS, and a `RESOLVING` recertification is settled through
+  the predecessor/evidence lineage rather than the live pointer alone;
+- aborting a resolution is state-aware and never returns a known-suspect generation to
+  `ACTIVE`: rejection is direct when nothing has been undone, restores
+  `gc_state = QUARANTINED` first when the generation step already ran, and is not
+  available once the pointer step committed;
 - every transition that returns a pointer to `ACTIVE` — the abandoned-use escape, the
   liveness-read-error escape, and the `RETIRING/QUARANTINE` resolution — publishes and
   confirms its delayed candidate and discovery projection **before** the CAS, and an
@@ -6975,21 +7097,47 @@ reintroduce rejected designs:
      correction 109 forbids. So the semantics change instead of the order: the **old**
      `RETIRED/QUARANTINE` fence protects the check, `(Cr, Nr)` is prospective and fixed
      by the `RESOLVING` record, and the evidence becomes authoritative only if the CAS
-     installs exactly that pair. An orphaned prospective row is inert, because every
-     consumer reaches evidence by an exact `(G, N)` taken from a live claim or a lineage
-     link and neither can name `(Cr, Nr)`. `(Cr, Nr)` must also be deterministic across
+     installs exactly that pair. A prospective row is **discoverable but not
+     authoritative**: the recertification publishes its handoff projection before the
+     CAS and the `RESOLVING` work row carries the prospective epoch, so a scanner can and
+     must be able to find it — that is what recovers a crash between the append and the
+     CAS. Before the CAS is proven applied, that discovery may only settle or retry the
+     exact recertification; it may never authorize `DELETING`, publish delete work, or
+     permit activation. Calling the row "inert" or "unreachable" was wrong and would have
+     sent an implementer looking for a discovery path that must exist. `(Cr, Nr)` must
+     also be deterministic across
      retries: the append is `INSERT ... IF NOT EXISTS` on `(…, retire_claim_epoch)`, so a
      retry that allocated a fresh claim ID would collide with its own first attempt and
      fail closed forever. Finally, recertification does not revoke a delete
      authorization already obtained under an earlier claim — requiring a re-match would
      reintroduce the revocability correction 162 removed.
-166. **`REJECTED` is reachable only from `OPEN`.** A `RESOLVING` resolution has already
-     cleared `gc_state`, so rejecting from there would leave an unquarantined generation
-     under a still-fenced pointer — a state no recovery branch describes. An operator who
-     changes their mind completes the authorized resolution and raises a new quarantine
-     through the ordinary path, which restores generation state and pointer fence
-     together. One entry point beats duplicating the quarantine path inside the
-     resolution workflow.
+166. **Aborting a resolution is state-aware, and "finish it then re-quarantine" is a
+     fail-closed violation.** The first draft of this rule justified forbidding
+     `RESOLVING -> REJECTED` by claiming `RESOLVING` implies `gc_state` was already
+     cleared. That contradicts the definition one paragraph earlier: `RESOLVING` is
+     confirmed *before* any mutation, and it spans three situations — nothing undone,
+     generation step done, pointer step committed. The conclusion was also wrong. Telling
+     an operator who has just confirmed the contradiction to "complete the authorized
+     resolution and then raise a new quarantine" would clear `gc_state` and return a
+     known-suspect generation to `ACTIVE`, opening a window for a writer to pin,
+     authorize and publish before the second quarantine lands — fail-open in the one
+     workflow that exists because the protocol could not prove something safe. The abort
+     therefore reads canonical state: reject directly when nothing has been undone,
+     restore `gc_state = QUARANTINED` at `SERIAL + ALL` first when the generation step
+     already ran, and only when the pointer step has already committed is there nothing
+     left to abort — then the resolution finishes and a **new** quarantine is raised
+     through the ordinary fenced path. If the abort cannot complete, the work stays
+     `RESOLVING` and fenced.
+167. **A `RESOLVING` recertification is settled by lineage, not by the live pointer.**
+     G2 may activate the instant the recertification CAS commits, so a coordinator that
+     dies before marking `RESOLVED` leaves recovery looking at `G2` or `G3` rather than
+     `G1 / RETIRED/GC_RETIRE`. Reading "G1 is no longer on the pointer" as "the
+     recertification failed" would retry a CAS that already applied and, worse, invite a
+     second prospective claim. The walk decides it: a predecessor/evidence link naming
+     exactly `(G1, E1, Cr, Nr)` proves the CAS committed, because only a committed CAS
+     can put that pair into a lineage link. This is correction 140 in operator-resolution
+     vocabulary, and it adds no new proof obligation — only the requirement to use the
+     walk.
 
 ## Related Documents
 

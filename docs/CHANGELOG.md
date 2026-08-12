@@ -525,8 +525,27 @@ implementation contract; that status does not claim the protocol is implemented.
   lineage link can name it, and `(Cr, Nr)` must be deterministic across retries or an
   ambiguous append collides with its own retry and fails closed forever. Recertification
   does not revoke a delete authorization already obtained.
-- Froze `REJECTED` as reachable only from `OPEN` (correction 166); a `RESOLVING`
-  rejection would leave an unquarantined generation under a fenced pointer.
+- Corrected the prospective-evidence claim: the row is **discoverable but not
+  authoritative**, not "inert". The recertification publishes its handoff before the CAS
+  and the `RESOLVING` work row carries the prospective epoch, so a scanner can find the
+  evidence while the pointer still reads `RETIRED/QUARANTINE` — and must, since that is
+  how a crash between the append and the CAS is recovered. Discovery may only settle or
+  retry that exact recertification; it never authorizes `DELETING`, delete work, or
+  activation until the pointer or a successor lineage proves the claim was installed.
+- Replaced the `REJECTED` rule with a state-aware abort contract (correction 166). The
+  previous version justified itself by claiming `RESOLVING` implies `gc_state` was
+  already cleared, which contradicts the definition — `RESOLVING` is confirmed before
+  any mutation and spans three situations. Worse, it told an operator who had just
+  confirmed the contradiction to complete the false-positive resolution and re-quarantine
+  afterwards, which returns a known-suspect generation to `ACTIVE` and lets a writer pin,
+  authorize and publish in that window. Aborting now reads canonical state: reject
+  directly, or restore `gc_state = QUARANTINED` at `SERIAL + ALL` first, or — once the
+  pointer step has committed — finish and raise a new quarantine through the ordinary
+  fenced path.
+- Tied `RESOLVING` recovery to the transitive lineage walk (correction 167). G2 can
+  activate the instant the recertification CAS commits, so a crash before `RESOLVED`
+  leaves recovery looking at G2 or G3; "G1 is no longer on the pointer" must not be read
+  as a failed recertification.
 - Gave `OPEN -> RESOLVING` and `OPEN -> REJECTED` explicit serial and regular
   consistency levels, and added `RESOLVING`, the resolution identity and the
   prospective claim columns to the `gc_generation_quarantines_by_day` DDL, which
