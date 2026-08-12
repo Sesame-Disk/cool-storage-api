@@ -405,6 +405,26 @@ their evidence. All four are closed here; none of them reopened X2.
   worse failure in all of them — but E1 has stopped being a corner case and is now the
   block path's default failure mode under a degraded cluster. Whoever builds the
   postpone bound should size it for that.
+## 2026-08-12 - X1/X2 fence ADR r3: abort intent + successor cancel
+
+The r3 protocol delta in this slice is documentation-only. The branch also retains
+the Compose/configuration changes introduced earlier in this series. No runtime GC
+protocol code changed; X1/X2 remain open; `GC_ENABLED=false` stays mandatory; r3 is
+**not** frozen.
+
+An eighth review after corrections 184–186 closed the remaining freeze gaps:
+
+- **Correction 187.** Durable non-authoritative `pending_abort_*` intent is confirmed
+  on the still-`RESOLVING` work row before the pointer fence, preserving actor/reason/
+  `(Cf,Nf)` across the crash between `QUARANTINE_ABORT` and `ABORTING`. Intent alone
+  is not authority; only `QUARANTINE_ABORT` linearizes revocation.
+- **Correction 188.** `OPEN + SUCCESSOR_AFTER_DELETE -> REJECTED` terminates a declined
+  successor request without completing quarantine; pointer stays `QUARANTINE_ABORT`.
+- Also explicit: owner-DC unavailability fails closed (no caller-DC fallback), and
+  `work_kind` immutability / creation idempotence are acceptance-tested.
+
+---
+
 ## 2026-08-12 - X1/X2 fence ADR r3: ownership, work_kind, no ABORTING->RESOLVED
 
 The r3 protocol delta in this slice is documentation-only. The branch also retains
