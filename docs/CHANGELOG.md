@@ -405,6 +405,25 @@ their evidence. All four are closed here; none of them reopened X2.
   worse failure in all of them — but E1 has stopped being a corner case and is now the
   block path's default failure mode under a degraded cluster. Whoever builds the
   postpone bound should size it for that.
+## 2026-08-12 - X1/X2 fence ADR r3: abort intent single-assignment (corr 189)
+
+The r3 protocol delta in this slice is documentation-only. The branch also retains
+the Compose/configuration changes introduced earlier in this series. No runtime GC
+protocol code changed; X1/X2 remain open; `GC_ENABLED=false` stays mandatory; r3 is
+**not** frozen.
+
+A ninth review after corrections 187–188 found freeze blockers in the abort-intent
+contract:
+
+- **Correction 189.** Abort intent is single-assignment under
+  `IF pending_abort_id = null` with SERIAL settlement and exact-retry of
+  `(A,F,Cf,Nf,Df)`. Logical abort `A` is immutable; fence attempts may revise only
+  after a proven still-`QUARANTINE` / successor still-`QUARANTINE_ABORT` claim
+  supersession. Exact retry includes `Df`. Successor cancel after `RESOLVING` is a
+  pointer-only abort re-taking `QUARANTINE_ABORT`, not `OPEN -> REJECTED`.
+
+---
+
 ## 2026-08-12 - X1/X2 fence ADR r3: abort intent + successor cancel
 
 The r3 protocol delta in this slice is documentation-only. The branch also retains
@@ -412,12 +431,13 @@ the Compose/configuration changes introduced earlier in this series. No runtime 
 protocol code changed; X1/X2 remain open; `GC_ENABLED=false` stays mandatory; r3 is
 **not** frozen.
 
-An eighth review after corrections 184–186 closed the remaining freeze gaps:
+An eighth review after corrections 184–186 closed two recovery gaps and left the
+abort-intent LWT still under-specified (see correction 189):
 
 - **Correction 187.** Durable non-authoritative `pending_abort_*` intent is confirmed
   on the still-`RESOLVING` work row before the pointer fence, preserving actor/reason/
-  `(Cf,Nf)` across the crash between `QUARANTINE_ABORT` and `ABORTING`. Intent alone
-  is not authority; only `QUARANTINE_ABORT` linearizes revocation.
+  fence-attempt identity across the crash between `QUARANTINE_ABORT` and `ABORTING`.
+  Intent alone is not authority; only `QUARANTINE_ABORT` linearizes revocation.
 - **Correction 188.** `OPEN + SUCCESSOR_AFTER_DELETE -> REJECTED` terminates a declined
   successor request without completing quarantine; pointer stays `QUARANTINE_ABORT`.
 - Also explicit: owner-DC unavailability fails closed (no caller-DC fallback), and
