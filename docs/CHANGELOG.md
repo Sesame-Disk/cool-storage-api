@@ -426,12 +426,12 @@ implementation contract; that status does not claim the protocol is implemented.
   designated intent scanner publishes it.
 - Made `PENDING -> AUTHORIZED` an explicit `LOCAL_QUORUM` write in both the main
   protocol and consistency table.
-- Corrected the Paxos v1/v2 transition policy: Cassandra permits selecting either
-  variant without a full-repair prerequisite; the full repair before restoring writer
-  mode after `v1 -> v2` is explicitly conservative SesameFS policy. Also recorded the
-  Cassandra 5.0.6 Paxos v2 implementation fact that requested `EACH_QUORUM` is reduced
-  to an aggregate commit count, unlike the ordinary per-DC write handler. RF1 masks
-  this distinction; RF3 does not.
+- Corrected the Paxos v1/v2 transition policy against versioned upstream evidence:
+  Cassandra 5.0.9 `NEWS.txt` permits selecting v2 without a one-time full repair;
+  CASSANDRA-21316 added repair-first guidance to 5.0.9/current 5.0 docs. SesameFS uses
+  the stricter sequence whenever v1 LWT history exists and selects the target before
+  the first LWT on greenfield. Also recorded the Cassandra 5.0.9 Paxos v2 aggregate
+  commit count; RF1 masks its difference from per-DC handling, RF3 does not.
 - Added enforceable clock-health, authoritative cross-region storage, and
   legacy-writer exclusion gates.
 - Replaced the two-DC acceptance model with exact `dc-na`/`dc-eu`/`dc-asia` RF1 and
@@ -446,6 +446,45 @@ implementation contract; that status does not claim the protocol is implemented.
   recovery projections, and the existing logged batch for provisional reference plus
   expiry work. Because Cassandra batches are atomic but not isolated, the scanner's
   not-yet-due guard and exact-reference recheck remain mandatory.
+- Extended `SERIAL + ALL` to quarantine that can invalidate a pointer-selected
+  generation, including serial settlement plus exact identity reaffirmation after an
+  ambiguous result. `DELETING/DELETED` remain `EACH_QUORUM` because the earlier
+  pointer fence already made them unacquirable.
+- Made node/token/DC/rack/strategy/RF changes drained maintenance operations and
+  replaced the supposed atomic fleet cutover with a verified admission barrier after
+  in-flight and durable legacy work is drained, migrated, or cancelled.
+- Split Phase 0 into measurements and an explicit go/no-go before PR-1 merges. Added
+  foreground global-`SERIAL` SLO/QPS/concurrency, tombstone and GC-capacity gates;
+  retired 40-65 and 55-75 engineer-day figures as historical, unapproved estimates.
+- Documented safe RF3/v2 stale `RETIRING -> ACTIVE` convergence, prohibited LWT commit
+  consistency `ANY`, recorded the conditional `paxos_state_purging` obligations, and
+  rejected S3 version IDs and longer temporal fences as portable X1 proofs.
+- Closed the second-round review corrections: quarantine claims now revoke the
+  immediately-before-operation checkpoint, preserve operation/evidence identity,
+  coalesce concurrent quarantine work, and require explicit audited operator
+  resolution; topology maintenance now has a durable marker and restricts topology
+  changes to a uniform v2 target; first-writer `blocks` LWTs use regular `QUORUM`.
+- Clarified that Cassandra v1 is accepted only for stable-layout operation; topology,
+  RF, DC, rack, strategy, and token changes require a uniform v2 target. Updated the
+  version inventory and Compose tags to the ADR's 5.0.9 target while leaving
+  image/digest pinning and 5.0.9 semantic revalidation as pre-acceptance work.
+- Closed the third-round audit findings on the quarantine claim kind (corrections 160
+  and 161). Operator quarantine resolution is a pointer return, so correction 97's
+  ordering rule now binds it: both `RETIRING/QUARANTINE -> ACTIVE` and
+  `RETIRED/QUARANTINE -> ACTIVE` publish and confirm a delayed candidate and its
+  discovery projection before the CAS, and an unconfirmed enqueue forbids the CAS.
+  Without it, resolution produced an `ACTIVE` generation whose references were already
+  zero before it first became a candidate — unreferenced, named by no work row, and
+  unreachable by a recovery protocol that forbids scans.
+- Removed a contradiction about how quarantine ends: one passage said resolution
+  "restores the `GC_RETIRE` claim", while the claim lifecycle and the operator workflow
+  both return the pointer to `ACTIVE` with a null kind. A `RETIRED/QUARANTINE` pointer
+  never rematerializes, and a `REJECTED` resolution leaves it fenced permanently.
+- Added a protocol revision line (r2). The claim kind, the two quarantine pointer
+  states, the `QUORUM` first-writer commit, and the 5.0.9 move are protocol changes
+  made after the first freeze, so an implementation written against r1 is not
+  compliant. Fixed six Markdown indentation defects, one of which broke the
+  writer-mode gate enumeration out of its list.
 
 ---
 
@@ -646,10 +685,11 @@ Added while reviewing it:
 - The counterweight to that taxonomy: the normal upload path is not Paxos-free
   today. `UpsertBlockMetadataWithSHA1` runs `INSERT ... IF NOT EXISTS`
   unconditionally with no pre-read, and an `IF NOT EXISTS` pays the full Paxos round
-  whether or not it applies, so every block of every upload — including pure dedup
-  hits — pays one global round in production. That is X4, it is the only Paxos whose
-  count scales with block volume, and a probe fast path is the cheap lever because
-  the probe has already read the row.
+  whether or not it applies, so every block invocation reaching metadata
+  materialization pays one round, including a reusable-row outcome. Browser/sync
+  preflight may bypass that sequence; the probe fast path helps an existing complete
+  row but not first content. That is X4, whose count scales with
+  metadata-materializing block volume.
 - Two PR-0 measurements that any future inline-versus-background argument depends
   on: the deployed `paxos_variant`, which nothing in this repository sets, and
   activation-CAS latency at `SERIAL + EACH_QUORUM` between every pair of
@@ -689,8 +729,8 @@ Third audit pass. Two of these are regressions introduced by the previous pass.
   reachable for a stalled writer to revalidate after its own deadline passed and
   still find the pointer `ACTIVE` with the generation and epoch it first observed.
   Bumping `active_epoch` on reactivation would close it but would reject an
-  already-authorized writer entitled to finish publishing across
-  `ACTIVE -> RETIRING`.
+  already-authorized writer entitled to finish publishing across a normal
+  `ACTIVE -> RETIRING/GC_RETIRE` transition.
 - Added `QUARANTINED` as a durable generation state with a reason and GC exclusion.
   The fail-closed branch is reachable after a crash, so without a persistent marker
   a restarted worker cannot tell a quarantined generation from an ordinary
@@ -716,7 +756,7 @@ Third audit pass. Two of these are regressions introduced by the previous pass.
 Design-document changes only. Nothing described here is implemented, no runtime
 code changed, X1/X2 remain open, and destructive GC remains disabled fleet-wide.
 
-Second audit pass against the code and against the Cassandra 5.0.6 source. Every
+Second audit pass against the code and against the Cassandra 5.0.9 source. Every
 file:line citation in the ADR was re-verified and none needed correcting; the
 findings below are design and specification gaps, not bad evidence.
 

@@ -2,14 +2,24 @@
 
 **Status:** Accepted and frozen design; implementation not started
 
-**Date:** 2026-08-07 · **Last updated:** 2026-08-11
+**Date:** 2026-08-07 · **Last updated:** 2026-08-12
+
+**Protocol revision:** r2 (2026-08-12). r1 (2026-08-11) was the first freeze. r2
+changes the protocol and is not a documentation-only edit: it adds the
+`retire_claim_kind` column with the `RETIRING/QUARANTINE` and `RETIRED/QUARANTINE`
+pointer states, raises the quarantine transition and the first-writer `blocks` commit
+to `SERIAL + ALL` and `QUORUM` respectively, moves the target engine to 5.0.9, makes
+Cassandra topology changes a gated maintenance operation, and binds operator
+quarantine resolution to the delayed-candidate ordering rule. An implementation
+written against r1 is not compliant with r2.
 
 **Audit baseline:** `main` at `186d7800d`
 
-**Target engine:** Cassandra 5.0.6. A floating `cassandra:5.0` image is not
-sufficient evidence for the acceptance test.
+**Target engine:** Cassandra 5.0.9. The ADR's Cassandra semantics and acceptance
+tests must be revalidated against 5.0.9; the repository Compose files use the exact
+5.0.9 tag, while Phase 0 must still pin and verify the image digest.
 
-**Paxos variant policy:** Cassandra 5.0.6's semantically acceptable variants for
+**Paxos variant policy:** Cassandra 5.0.9's semantically acceptable variants for
 this ADR are `{v1, v2}`. That set is not a deployment policy: every
 generation-fence writer deployment selects exactly one
 `generation_fence_paxos_variant` from that set, and every generation-fence
@@ -29,8 +39,9 @@ SesameFS already contains unrelated coordination LWTs in and around upload
 funnels — block metadata first-writer registration, released-stub repair claims,
 `sha1`/`representation_id` backfills, block-upload session slots, head-commit
 promotion, and file locks. Those are the existing baseline and are outside this
-ADR's scope. This document constrains only the Paxos that the generation fence
-itself introduces.
+ADR's scope as operation counts. This document also strengthens every existing LWT
+that can touch a generation-managed `blocks` partition to global `SERIAL` with regular
+commit at least `QUORUM`; it adds no second first-writer LWT.
 
 **Operational gate:** keep `GC_ENABLED=false` on every replica in every DC until the
 acceptance criteria in this document are implemented and verified.
@@ -71,10 +82,11 @@ Use two independent safety mechanisms:
    generation.
 
 This is not a claim that every upload is purely regional. A first upload of new
-content still pays the existing block-metadata first-writer LWT, and
-`configs/config.prod.yaml` sets `serial_consistency: SERIAL`, so that LWT is
-already global Paxos in production. That cost is the current baseline (finding
-X4) and is unchanged by this ADR.
+content still pays the existing block-metadata first-writer LWT. The target production
+profile already selects global `SERIAL`, but this ADR also raises that LWT's regular
+commit from the ordinary session `LOCAL_QUORUM` to `QUORUM` so v2 safety does not
+depend on `paxos_state_purging=repaired`. X4 is the existing operation; its final
+three-DC latency is a Phase-0 go/no-go input, not an unchanged-cost assumption.
 
 The core protocol is:
 
@@ -92,6 +104,11 @@ GC: candidate -> blocks RETIRING -> drain uses -> global refs check
     -> persist delete-recovery discovery work
     -> generation gc_state=DELETING -> DELETE exact K
     -> generation gc_state=DELETED -> retire discovery work
+ OR quarantine contradiction:
+     -> publish + confirm quarantine work
+     -> pointer RETIRING/QUARANTINE, or retained RETIRED/QUARANTINE
+     -> drain uses -> generation gc_state=QUARANTINED
+     -> no retirement evidence, G2 activation, delete, or automatic pointer exit
 ```
 
 Discovery always precedes the irreversible step, never follows it; see
@@ -103,16 +120,18 @@ neither can be reconstructed afterwards.
 The following statements are part of the contract:
 
 - A pin is not a permanent liveness reference.
-- Finding a pin with live authority during `RETIRING` does not justify
+- Finding a pin with live authority during `RETIRING/GC_RETIRE` does not justify
   `RETIRING -> ACTIVE`; it justifies waiting. A generation with one or more
-  remaining uses, all of which have expired their authority, does return to `ACTIVE`,
-  to release the writer fence rather than to assert liveness.
+  remaining uses, all of which have expired their authority, does return to `ACTIVE`
+  only for `GC_RETIRE`, to release the writer fence rather than to assert liveness.
 - Any confirmed generation-bound reference, permanent or provisional, justifies
-  returning to `ACTIVE`; a pin holding live authority does not.
+  returning a `GC_RETIRE` claim to `ACTIVE`; a pin holding live authority does not.
+  A `QUARANTINE` claim never reactivates automatically.
 - A provisional `up:` or `pub:` reference prevents deletion but does not by itself
-  represent writer authority; it is nevertheless sufficient to return the
-  generation to `ACTIVE` because reactivation is retention-safe and prevents a
-  dead publish attempt from parking a hot logical block for its full TTL.
+  represent writer authority; it is nevertheless sufficient to return a
+  `GC_RETIRE` claim to `ACTIVE` because reactivation is retention-safe and prevents a
+  dead publish attempt from parking a hot logical block for its full TTL. It cannot
+  clear a `QUARANTINE` claim.
 - A writer with an ambiguous pin write has no authority to use the generation.
 - A writer whose authority deadline has passed cannot publish a reference.
 - A generation cannot become `ACTIVE` until its physical object has been stored and verified.
@@ -127,13 +146,18 @@ The following statements are part of the contract:
   use row. There is no writer, including the materializer, that is invisible to the
   GC drain.
 - `DELETING` is discoverable from a durable work row written before the transition, and the generation record supplies the exact key once found, even if the orphan projection was never written.
-- G2 is forbidden while G1 is `RETIRING` and is allowed only after G1 is `RETIRED`.
+- G2 is forbidden while G1 is `RETIRING` and is allowed only after G1 is
+  `RETIRED/GC_RETIRE`; a `RETIRED/QUARANTINE` pointer remains fenced until operator
+  resolution.
 - The generation fence adds no LWT to pins, revalidation, references, reuse, repair
   authorization, or deduplication. It adds one logical activation CAS per
   materializing request; ambiguity retries reuse the same generation and epoch and
   cannot create a second generation.
 - A global check that observes zero uses and then zero references closes the
   publication frontier for that generation. The read order is part of the proof.
+- A quarantine that can make a pointer-selected generation unusable is writer-visible
+  only after an acknowledged `SERIAL + ALL` transition. Serial settlement alone, or
+  a Paxos v2 aggregate `EACH_QUORUM` commit, is not a per-DC quarantine fence.
 
 ## Problem Statements
 
@@ -161,6 +185,20 @@ G1 -> blocks/<org_id>/<h0:2>/<h2:4>/<hash>.<generation-1>
 G2 -> blocks/<org_id>/<h0:2>/<h2:4>/<hash>.<generation-2>
 ```
 
+Two tempting X1 alternatives are rejected:
+
+- **S3 version IDs.** Exact version-aware PUT/HEAD/GET/DELETE could separate two
+  lifecycles only if every supported object backend enabled compatible versioning,
+  returned and persisted the version ID through every metadata/recovery path, and
+  never fell back to key-only delete semantics. The current storage interface carries
+  only a key, and provider version/delete-marker behavior is not uniform. UUID keys
+  provide backend-independent physical identity instead.
+- **A longer temporal fence or grace period.** No finite delay bounds execution of an
+  already accepted object-store delete, coordinator timeout, retry, outage, or
+  cross-DC propagation lag. More time reduces probability but cannot prove that an old
+  delete finished before a byte-identical key is reused. It remains mitigation, never
+  an X1 closure mechanism.
+
 ### X2: Cross-DC reference visibility
 
 The current `block_references` writes and GC liveness reads inherit the session's
@@ -178,10 +216,11 @@ The one-hour grace period is mitigation, not a correctness proof.
 - The expected DC set is explicitly configured, exactly matches the keyspace DC set,
   and every participating DC has exactly its configured RF, which must be greater
   than zero.
-- The target engine is Cassandra 5.0.6. Cassandra 5.0.6 contains
+- The target engine is Cassandra 5.0.9. Cassandra 5.0.9 contains
   `eachQuorumForRead()` and permits `EACH_QUORUM` reads.
 - The current multi-region Compose cluster has two DCs, `usa` and `eu`, with RF 1
-  per DC. Production reasoning must also work with higher RF per DC.
+  per DC. It is only regression coverage; acceptance requires the three-DC
+  `dc-na`/`dc-eu`/`dc-asia` RF1/RF3 harness.
 - The deployment is greenfield. New objects do not need legacy deterministic-key
   compatibility or backfill.
 - Only designated replicas in one DC will run destructive GC after X1/X2 close.
@@ -193,14 +232,14 @@ The one-hour grace period is mitigation, not a correctness proof.
   includes the existing first-writer/materialization LWT and the new pointer CASs;
   `LOCAL_SERIAL` is not a valid setting for that partition in the generation-fence
   profile. Unrelated LWTs on other partitions may keep their existing consistency.
-- Rematerialization of a `RETIRED` logical block performs one logical activation
+- Rematerialization of a `RETIRED/GC_RETIRE` logical block performs one logical activation
   operation per materializing request. It runs inline in the request that
   materialized the new generation; ambiguity retries reuse its same generation and
   epoch.
 
-The Cassandra 5.0.6 source used to resolve the read-level question is:
+The Cassandra 5.0.9 source used to resolve the read-level question is:
 
-`https://raw.githubusercontent.com/apache/cassandra/cassandra-5.0.6/src/java/org/apache/cassandra/db/ConsistencyLevel.java`
+`https://raw.githubusercontent.com/apache/cassandra/cassandra-5.0.9/src/java/org/apache/cassandra/db/ConsistencyLevel.java`
 
 Older Cassandra 3.0 documentation says `EACH_QUORUM` is not supported for reads.
 That documentation is not the target contract for this repository; the engine
@@ -224,29 +263,39 @@ version must still be asserted by integration tests.
 | Provisional/permanent reference insert/delete | `LOCAL_QUORUM` |
 | Writer-originated recovery/expiry projection scans | `EACH_QUORUM`; projection writes remain `LOCAL_QUORUM`, so the scan must intersect the writer DC. A failed or unavailable DC holds the cursor and performs no cleanup |
 | GC-owned candidate, handoff, and delete-work reads in the designated GC DC | `LOCAL_QUORUM`; these rows are produced and consumed under the single-DC GC ownership contract |
-| Existing terminal first-writer metadata LWT (initial pointer only) | Existing LWT, but `SERIAL` phase is mandatory when it can touch a generation-managed `blocks` partition; its regular commit level remains the existing writer level. The fence adds no second LWT here |
-| Rematerialization `G1 RETIRED -> G2 ACTIVE` activation operation | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks`; runs inline in the materializing request; physical CAS executions may retry the same logical operation |
-| `ACTIVE -> RETIRING` (active pointer, claim acquisition) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; the `IF` clause must also match the observed `retire_claim_epoch` so the counter stays strictly monotonic. `ALL` is the per-DC writer-visibility fence for both Paxos v1 and v2 |
-| Ambiguous `ACTIVE -> RETIRING` visibility reaffirmation | After `SERIAL` settlement identifies the exact `RETIRING/G/E/C/N` tuple, a second idempotent conditional write reasserts that tuple with serial phase `SERIAL` and regular commit `ALL`. No drain starts until it applies and is acknowledged unambiguously |
+| Existing terminal first-writer metadata LWT (initial pointer only) | Existing LWT operation, with serial phase `SERIAL` and regular commit `QUORUM` when it can touch a generation-managed `blocks` partition. The fence adds no second LWT here; `QUORUM` avoids making `paxos_state_purging=repaired` a prerequisite for a v2 `LOCAL_QUORUM` commit |
+| Rematerialization `G1 RETIRED/GC_RETIRE -> G2 ACTIVE` activation operation | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks`; runs inline in the materializing request; physical CAS executions may retry the same logical operation |
+| Quarantine discovery work | `LOCAL_QUORUM` in the originating writer/request path, then handed off and confirmed in the designated GC DC before any pointer/generation mutation; exact operation and contradiction identity |
+| `ACTIVE -> RETIRING` (active pointer, `GC_RETIRE` or `QUARANTINE` claim acquisition) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; the `IF` clause must also match the observed `retire_claim_epoch` so the counter stays strictly monotonic, and the new claim kind is immutable for that epoch. `ALL` is the per-DC writer-visibility fence for both Paxos v1 and v2 |
+| `RETIRED/GC_RETIRE -> RETIRED/QUARANTINE` (retained pointer fence) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the exact retained `G1/E1/C1/N1/GC_RETIRE` claim, increments `retire_claim_epoch` to a new quarantine epoch, and changes only claim owner/deadline/kind plus that monotonic epoch, so no later G2 activation can satisfy its `GC_RETIRE` predecessor condition |
+| Ambiguous `ACTIVE -> RETIRING` visibility reaffirmation | After `SERIAL` settlement identifies the exact `RETIRING/G/E/C/N/KIND` tuple, a second idempotent conditional write reasserts that tuple with serial phase `SERIAL` and regular commit `ALL`. No kind-specific drain starts until it applies and is acknowledged unambiguously |
 | Claim takeover after `retire_claim_deadline` | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks`; same epoch-matching shape, replaces the owner without changing `active_state` |
 | Use-row drain, including `PENDING`, `AUTHORIZED`, and materializer uses | `EACH_QUORUM` |
+| Quarantine use drain | `EACH_QUORUM` until zero after an acknowledged `RETIRING/QUARANTINE` pointer fence; no retirement evidence, reactivation, or delete |
 | Final generation-reference check | `EACH_QUORUM` |
-| `RETIRING -> ACTIVE` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
+| `RETIRING/GC_RETIRE -> ACTIVE` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
 | Retirement evidence append (one row per `(generation, claim_epoch)`) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM`; `INSERT ... IF NOT EXISTS`, immutable and ordered before the pointer CAS |
-| `RETIRING -> RETIRED` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
+| `RETIRING/GC_RETIRE -> RETIRED` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
 | Crashed-activation settlement read | `SELECT` on the `blocks` partition at read consistency `SERIAL`. This is the single normative form; an ordinary read at any level does not settle a pending proposal |
 | `gc_state = null -> DELETING` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the G1 generation row; `IF gc_state = null AND materialization_state = VERIFIED AND storage_key = K1`, issued after the authoritative pointer/evidence proof and recording the authorizing claim |
 | `DELETING -> DELETED` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the G1 generation row; `IF gc_state = DELETING` |
-| Transition to `gc_state = QUARANTINED` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on the generation row; `IF gc_state = null AND storage_key = K`, plus the `materialization_state`/operation-ID identity in the `MATERIALIZING` form |
-| Ambiguous generation-lifecycle LWT reconciliation | Re-issue the same idempotent LWT with serial phase `SERIAL` and regular commit `EACH_QUORUM`; an ordinary read is not sufficient to settle a pending proposal |
+| Transition to `gc_state = QUARANTINED` (generation lifecycle) | LWT serial phase `SERIAL`, regular commit `ALL` on the generation row; `IF gc_state = null AND storage_key = K`, plus the `materialization_state`/operation-ID identity in the `MATERIALIZING` form. It records the operation ID and evidence digest. `ALL` makes the unusable state visible to every later local writer read |
+| Ambiguous quarantine visibility reaffirmation | `SELECT` the exact generation partition at read consistency `SERIAL`. If the settled row is the exact `QUARANTINED/G/K/R/T/D` tuple, conditionally reassert that same tuple at `SERIAL + ALL`; if it remains the expected unquarantined tuple, retry the original quarantine at `SERIAL + ALL`. Uncertain, unavailable, non-applied, or different-terminal outcomes preserve data and grant no globally established quarantine conclusion |
+| Ambiguous non-quarantine generation-lifecycle LWT reconciliation | Settle the exact generation row with `SELECT ... CONSISTENCY SERIAL`; a matching applied `DELETING`/`DELETED` identity is accepted only with its recorded generation/key and delete-claim identity, while a conflicting terminal state fails closed. A matching `DELETED` row retires work only after exact-key absence is confirmed. An ordinary read is not sufficient to settle a pending proposal |
 
-The session default remains `LOCAL_QUORUM`. New critical lifecycle LWT queries
-must explicitly set both levels rather than relying only on the driver default:
+The ordinary-query session default remains `LOCAL_QUORUM`. Every generation-fence LWT
+sets both levels explicitly rather than inheriting that regular default. The
+non-quarantine global lifecycle form is:
 
 ```go
 query.Consistency(gocql.EachQuorum).
     SerialConsistency(gocql.Serial)
 ```
+
+The first-writer and other otherwise-local `blocks` LWTs use regular `QUORUM`; the
+retiring and quarantine visibility fences use regular `ALL`. No generation-fence LWT
+uses regular `LOCAL_QUORUM` or `ANY`. Ordinary non-LWT pins, references, and writer
+reads/writes remain `LOCAL_QUORUM`.
 
 The current `internal/db/db.go:94-95` does explicitly assign
 `cluster.SerialConsistency`. The current configuration and tests still include
@@ -319,8 +368,9 @@ startup and would have been satisfied by a config-string check that proves only 
 selected safe default, not that a future explicit per-query override stayed outside
 the `blocks` inventory.
 
-The existing terminal first-writer LWT retains its current writer-path regular
-consistency; the generation fence must not add a second LWT around it. Its **serial**
+The existing terminal first-writer LWT retains its logical operation; when it can
+touch a generation-managed `blocks` partition, its regular commit is strengthened to
+`QUORUM`. The generation fence must not add a second LWT around it. Its **serial**
 phase is not exempt: it competes on the `blocks` partition and is named in the
 inventory above.
 
@@ -348,10 +398,10 @@ Paxos" is not licence to write `pin IF ...`, `reference IF ...`, or `reuse IF ..
 
 | Group | Members | Frequency | Owner |
 |---|---|---|---|
-| **Existing hot path** | Block-metadata first-writer `INSERT ... IF NOT EXISTS`, released-stub repair claims, `sha1`/`representation_id` backfills, block-upload session slots, `gc_leases` finalize lease, head-commit promotion, file locks | Per block or per request | Unchanged baseline (X4) |
+| **Existing hot path** | Block-metadata first-writer `INSERT ... IF NOT EXISTS` (X4), released-stub repair claims, `sha1`/`representation_id` backfills, block-upload session slots, `gc_leases` finalize lease, head-commit promotion, file locks | Per block or per request | Existing operations; generation-managed `blocks` LWT consistency is strengthened, while X4 names only the first-writer cost |
 | **New hot path** | **None** | — | — |
-| **Rare rematerialization** | `G1 RETIRED -> G2 ACTIVE` activation | Only when a retired SHA comes back to life | Materializing request, inline |
-| **GC cold path** | `ACTIVE -> RETIRING`, retirement evidence `INSERT ... IF NOT EXISTS`, `RETIRING -> ACTIVE`, `RETIRING -> RETIRED`, `gc_state = null -> DELETING`, `DELETING -> DELETED`, quarantine | Per collected generation | GC worker |
+| **Rare rematerialization** | `G1 RETIRED/GC_RETIRE -> G2 ACTIVE` activation | Only when a retired SHA comes back to life | Materializing request, inline |
+| **GC cold path** | `ACTIVE -> RETIRING`, retirement evidence `INSERT ... IF NOT EXISTS`, `RETIRING/GC_RETIRE -> ACTIVE`, `RETIRING/GC_RETIRE -> RETIRED`, `gc_state = null -> DELETING`, `DELETING -> DELETED`, quarantine | Per collected generation | GC worker |
 
 The rule this taxonomy exists to protect:
 
@@ -387,17 +437,21 @@ applies**. The upload cycle in `retryUploadedBlockMaterialization` is
 `store() -> materialize() -> store()`, where `store()` runs `ProbeBlockReuse` (an
 ordinary `SELECT` on `blocks`) and `materialize()` runs `RegisterUploadedBlock`,
 which calls the LWT. Both the `Reusable` and `NeedsPut` probe outcomes go through
-`materialize()`. Therefore:
+`materialize()`. Therefore, for funnels and retries that reach this sequence:
 
-> Every block of every upload pays one global Paxos round in production today,
-> including pure deduplication hits where the row already exists and the LWT
-> provably cannot apply.
+> Every block invocation that reaches `RegisterUploadedBlock` pays one first-writer
+> Paxos round, including a reusable-row outcome where the LWT cannot apply. Browser
+> and sync preflight may reject a fully deduplicated block before this sequence, so
+> “every block of every upload” is too broad.
 
-It is global because `configs/config.prod.yaml:52` sets
-`serial_consistency: SERIAL`. This is finding X4, and it is the only Paxos in the
-system whose count scales with block volume.
+It is global in the target production profile because `configs/config.prod.yaml:52`
+and `.env.prod.example` select `SERIAL`, and this ADR's option A requires that domain
+from the first generation-aware write. Deployments currently on `LOCAL_SERIAL` are
+promoted; already-`SERIAL` deployments do not acquire a new round. This is finding X4,
+and it is the only Paxos in the system whose count scales with metadata-materializing
+block volume.
 
-Two measurements belong in PR-0 before any latency decision is made:
+Three measurements belong in Phase 0 before any latency decision is made:
 
 - **`paxos_variant`.** Nothing in this repository sets it, so the engine default
   applies. The variant materially changes the round-trip count of every LWT above,
@@ -409,6 +463,11 @@ Two measurements belong in PR-0 before any latency decision is made:
   participating DC to each other. The inline-versus-background question is a
   question about this complete path, not the CAS alone, and it must not be answered
   by assumption.
+- **Foreground first-writer path**, including p50/p95/p99/error rate from each region,
+  a representative new-content 1 GiB upload at each funnel's real block concurrency,
+  unrelated option-A LWTs, and Cassandra QPS/tombstone pressure before and after the
+  proposed use/reference protocol. Phase 0b is NO-GO if predeclared endpoint SLOs or
+  capacity headroom do not hold.
 
 A probe fast path is the obvious lever and is compatible with this design: the
 probe has already read the row, so a `Reusable` outcome with complete metadata can
@@ -417,6 +476,10 @@ skip the LWT entirely. The asymmetry makes it safe — a false negative (a
 LWT and is correct, while a false positive is impossible because a row that was
 never written cannot be read. Placement columns are first-writer-wins and
 immutable, so a complete row has no race left to resolve.
+
+That optimization does not help first upload of new content, a first-writer race, or
+rematerialization; each still needs its own linearization decision. It is not the
+viability answer for the expensive case it cannot cover.
 
 That work is X4, not this ADR. It is recorded here because a reader who concludes
 from the taxonomy that per-block Paxos is already solved will optimize the wrong
@@ -457,7 +520,7 @@ makes when it rematerializes a retired block, and the GC cold path.
 ### `NetworkTopologyStrategy` Is Load-Bearing
 
 The entire X2 argument rests on `EACH_QUORUM` contacting a quorum in every DC. In
-Cassandra 5.0.6 that behaviour is conditional on the keyspace using
+Cassandra 5.0.9 that behaviour is conditional on the keyspace using
 `NetworkTopologyStrategy`, and the two failure modes are not symmetric:
 
 | Path | Behaviour under a non-NTS keyspace |
@@ -477,7 +540,7 @@ The startup assertions in this document belong to **two different gates**, and
 conflating them leaves the earlier one unenforced during the window it exists for:
 
 ```text
-generation-fence writer mode enabled       (rollout step 4: coordinated enable)
+generation-fence writer mode enabled       (rollout step 5: verified admission barrier)
     startup: NetworkTopologyStrategy verified
     startup: DC set and per-DC RF verified
     startup: session serial default is SERIAL
@@ -488,7 +551,7 @@ generation-fence writer mode enabled       (rollout step 4: coordinated enable)
     deployment gate: every writer is generation-capable; no legacy writer remains
     code + tests: every blocks LWT has effective SERIAL
 
-destructive GC enabled                     (rollout step 7)
+destructive GC enabled                     (rollout step 8)
     requires the writer gate above, plus
     all X1/X2 acceptance criteria verified
 ```
@@ -508,37 +571,103 @@ verified for all of the following:
 - the selected `generation_fence_paxos_variant` target;
 - the expected DC and topology membership.
 
-A newly discovered or rejoined node starts **unverified**. It must be verified locally
-before it may coordinate or own a replica for generation-fence statements. An
-unavailable or unverifiable participant makes generation-fence writer mode
-unavailable until that node is verified or removed from the ring/replica topology by
-the corresponding Cassandra operational procedure. It is not sufficient to exclude
-that node from application host selection. A participant whose local configuration or
-membership no longer matches loses eligibility immediately. The implementation may
-choose the orchestration and inspection API, but it must not silently treat a
-previously verified node as verified forever.
+A rejoined node starts **unverified** and cannot restore writer eligibility until its
+local facts are checked. A genuinely new or replacement node is different: Cassandra
+may assign pending ranges and replica ownership during bootstrap before SesameFS can
+verify it, so adding it while writer mode is live is forbidden by the maintenance
+procedure below. An unavailable or unverifiable participant makes generation-fence
+writer mode unavailable until that node is verified or removed from the ring/replica
+topology by the corresponding Cassandra operational procedure. It is not sufficient
+to exclude that node from application host selection. A participant whose local
+configuration or membership no longer matches loses eligibility immediately. The
+implementation may choose the orchestration and inspection API, but it must not
+silently treat a previously verified node as verified forever.
 
-The selected Paxos target is fixed before the first generation-aware write. Changing
-from `v1` to `v2`, or from `v2` to `v1`, requires this explicit procedure:
+### Cassandra Topology Changes Are Maintenance Operations
+
+The local-write/global-read intersection is proven against one stable replica layout.
+SesameFS does not attempt to prove it through Cassandra's intermediate pending-range,
+streaming, or RF-transition states. The following operations are forbidden while
+generation-fence writer mode or destructive GC is live: add/bootstrap, replace,
+remove/decommission or move a node; change tokens, DC, rack, snitch placement,
+replication strategy, per-DC RF, or the participating DC set.
+
+Every such operation uses this maintenance sequence:
+
+1. Acquire the durable cluster-wide topology-maintenance lease/marker before any
+   Cassandra topology or `ALTER KEYSPACE` command. The marker is owned by the
+   maintenance controller, has an owner ID and expiry, is confirmed at
+   `EACH_QUORUM`, and makes writer mode and destructive GC ineligible; stale-marker
+   takeover is allowed only after an audited health/ownership check.
+2. Quiesce block-write admission, drain or cancel in-flight generation-aware work,
+   pause generation-fence writer mode, and pause destructive GC. No operator may
+   begin the Cassandra mutation until this marker and drain state are confirmed.
+3. Record the expected post-change node IDs, tokens, DC/rack placement, replication
+   strategy, participating DC set, and per-DC RF.
+4. Run the Cassandra-supported topology procedure. Complete bootstrap/streaming or
+   decommission/removal, then run every full repair required to populate the affected
+   generation-fence ranges after an RF, DC, or ownership change. This operation is
+    **not permitted while the selected Paxos target is v1**: Cassandra 5.0.9's
+   topology-change linearizability guarantee is v2-only, and a manual v1
+   `--paxos-only` repair is not accepted as a substitute safety proof. Migrate to a
+   uniform v2 target using the repair-first transition procedure before changing
+   ownership, RF, DC, rack, strategy, or tokens. Verify `paxos_repair_enabled`,
+   `skip_paxos_repair_on_topology_change`, per-keyspace skip lists, and the selected
+   topology-repair quorum settings before proceeding.
+5. Prove there are no pending ranges, joining/leaving/moving nodes, incomplete streams,
+   or required repairs outstanding.
+6. Reverify the complete participant set: release and artifact identity, node IDs and
+   tokens, DC/rack placement, keyspace strategy and RF, selected `paxos_variant`, clock
+   health, and authoritative storage eligibility.
+7. Restore writer mode only after every eligible writer and Cassandra participant
+   passes. Run dry-run reconciliation before separately restoring destructive GC.
+8. Release the maintenance marker only after the post-change gates pass; a failed
+   operation leaves the marker held and writer mode unavailable until recovery is
+   audited.
+
+A config rollout before or after `ALTER KEYSPACE` is not this proof. The gates stay
+closed for the entire interval in which configured and actual replica layouts differ.
+
+The selected Paxos target is fixed before the first generation-aware write. Greenfield
+writer mode may select either semantic target for steady-state lifecycle operations,
+but any topology/RF/DC/rack/strategy/token mutation requires a uniform v2 target;
+v1 is a stable-layout-only target. Changing from `v1` to `v2`, or from `v2` to `v1`,
+requires this explicit procedure:
 
 1. Pause generation-fence writer mode and fail closed for generation-aware writes.
 2. Execute the SesameFS generation-fence variant-transition procedure. For
-   `v1 -> v2`, SesameFS conservatively requires `nodetool repair --full -pr` on each
-   required participant before re-enabling writer mode. Cassandra itself says v2 may
-   be enabled at any time; the full-repair prerequisite is SesameFS policy, not an
-   engine requirement. For `v2 -> v1`, Cassandra permits setting v1 again and
-   SesameFS does not require that full repair; writer mode still remains paused until
-   every participant is uniform and re-verified.
-3. Bring every participant node to the new selected target; a mixed target state is
+   a greenfield cluster, set the selected target uniformly before its first LWT. If
+   any LWT has run under v1, `v1 -> v2` follows the later, stricter Apache procedure:
+   all nodes on one supported Cassandra version, then successful
+   `nodetool repair --full -pr` on **every joined Cassandra cluster node**, including
+   nodes outside the generation-fence keyspace's participating DC set, before the
+   variant change and rolling restart. Cassandra 5.0.9's bundled `NEWS.txt` says v2
+   may be enabled at any time and omits that one-time repair, while CASSANDRA-21316
+   added the stricter instruction to 5.0.9/current 5.0 documentation. SesameFS resolves
+   the upstream conflict conservatively; it does not misstate either source as the
+   unqualified 5.0.9 binary contract. For `v2 -> v1`, the later procedure permits a
+   rolling rollback without that repair; writer mode still remains paused until every
+   participant is uniform and re-verified.
+3. Bring every joined cluster node to the new selected target; a mixed target state is
    not an accepted writer-mode deployment.
-4. Re-verify build identity, selected variant, and DC/topology membership for the
-   complete participant set.
+4. Re-verify build identity and selected variant for every joined cluster node, plus
+   DC/topology membership for the complete generation-fence participant set.
 5. Re-enable generation-fence writer mode only after the complete verification passes.
+
+Generation-fence LWTs never use commit consistency `ANY` or `LOCAL_QUORUM`; the
+consistency helper and inventory test reject both, using `QUORUM`, `EACH_QUORUM`, or
+`ALL` as specified. `paxos_state_purging=repaired` is therefore not a prerequisite for
+this ADR: upstream ties it to recurring Paxos repair and to permitting optimized
+`ANY`/`LOCAL_QUORUM` commit behavior, not to selecting v2 itself. Phase 0 records the
+value on every joined Cassandra node. Once a cluster moves from `legacy` to either
+`gc_grace` or `repaired`, returning to `legacy` is forbidden. If operators choose
+`repaired`, recurring Paxos repair is mandatory even after a `v2 -> v1` rollback;
+use the upstream `gc_grace` fallback instead if repaired purging must be disabled.
 
 Every assertion in the first block binds from the **first generation-aware write**,
 not from `gc.enabled=true`. The reason is concrete: a materializer can crash between
 its PUT and its activation LWT on day one of the writer rollout, and the recovery
-that follows needs the serial round and the correct topology — five rollout steps
+that follows needs the serial round and the correct topology — multiple rollout steps
 before destructive GC is switched on. Wherever this document says "when
 `gc.enabled=true`" for one of these writer-mode checks, it means the writer gate.
 
@@ -563,13 +692,25 @@ The implementation must:
   participant sets, which is the very condition the gate exists to prevent. The
   rollout sequence below deliberately activates GC several steps after writers go
   live, so tying the gate to `gc.enabled` would leave exactly that window open;
+- require the durable cluster-wide topology-maintenance marker to be absent before
+  writer mode is eligible, and require its acquisition before any topology or RF
+  mutation. The marker owner, expiry, takeover, and release are audited by the
+  maintenance controller; polling Cassandra pending ranges alone is not a start
+  interlock;
+- reject commit consistency `ANY` and `LOCAL_QUORUM` in the generation-fence LWT
+  helper and inventory tests. Record `paxos_state_purging` on every joined cluster
+  node; once any node moves from `legacy` to `gc_grace` or `repaired`, prohibit a
+  return to `legacy`. If any node uses `repaired`, require and monitor recurring Paxos
+  repair, including under v1, but do not require `repaired` for LWTs that commit at
+  `QUORUM` or stronger;
 - verify that **every generation-fence participant node** reports the selected
   `generation_fence_paxos_variant` target — not merely that one observed coordinator
   avoids `*_without_linearizable_reads*`. A single-node observation is not sufficient
   evidence for this gate: a non-coordinator can still own a replica for the keyspace.
-  For Cassandra 5.0.6, `{v1, v2}` is the semantic allowlist, but PR-0 must select
+  For Cassandra 5.0.9, `{v1, v2}` is the semantic allowlist, but PR-0 must select
   exactly one target and the gate must reject any participant that reports the other
-  value, an unrecognised value, or a value without linearizable reads. A deny-list
+  value, an unrecognised value, or a value without linearizable reads. A topology
+  maintenance gate additionally rejects v1, because v1 is stable-layout-only. A deny-list
   admits every variant the engine has not shipped yet, which is the wrong default for
   a property that fails silently: an unrecognised value must fail closed and force an
   explicit review, exactly as generation validity is a positive predicate rather than
@@ -587,7 +728,7 @@ The implementation must:
   is generation-capable and that no deterministic-key or legacy-reference writer can
   receive traffic. This is an orchestration assertion, not something Cassandra
   startup can infer;
-- treat these seven checks as the generation-fence writer-mode gate, which is a
+- treat this complete set of checks as the generation-fence writer-mode gate, which is a
   prerequisite of the destructive-GC activation gate — not as an operational note.
 
 ### `EACH_QUORUM` Versus `ALL`
@@ -600,15 +741,24 @@ tolerating one replica failure per DC. A plain global `QUORUM` is not an equival
 substitute because it can satisfy the total quorum without reading from one
 particular DC.
 
-`ACTIVE -> RETIRING` is the deliberate exception and commits at `ALL`. The
+`ACTIVE -> RETIRING` is the first deliberate exception and commits at `ALL`. The
 publication-frontier proof needs the pointer fence visible to every later
-`LOCAL_QUORUM` writer revalidation, and Cassandra 5.0.6 Paxos v2 does not retain
+`LOCAL_QUORUM` writer revalidation, and Cassandra 5.0.9 Paxos v2 does not retain
 ordinary `EACH_QUORUM`'s per-DC response accounting in its LWT commit callback at RF
 greater than one. `ALL` is cold-path cost paid once per candidate; it is not applied
 to pins, references, or normal writer operations.
 
+`gc_state = null -> QUARANTINED` is the second exception. It may invalidate the
+generation still selected by an `ACTIVE` pointer, while writers inspect that
+generation row at `LOCAL_QUORUM`. A Paxos v2 aggregate commit that omits one DC would
+let that DC continue to authorize a physically or logically contradicted generation.
+The quarantine transition and its ambiguity-only identity reaffirmation therefore use
+`ALL`. `DELETING` and `DELETED` remain at `EACH_QUORUM`: they are reached only after
+the pointer's acknowledged `ALL` retirement fence has already made the generation
+unacquirable, so stale state there is restrictive rather than permissive.
+
 This is an implementation fact, not an inference from the public consistency-level
-description. In Cassandra 5.0.6, `Paxos.Participants.requiredFor()` converts the
+description. In Cassandra 5.0.9, `Paxos.Participants.requiredFor()` converts the
 requested regular level to one `blockForWrite` integer, and `PaxosCommit` completes
 from one aggregate response counter; the class explicitly notes that it does not
 support `EACH_QUORUM` distribution because there is no `EACH_SERIAL`. The ordinary
@@ -643,9 +793,11 @@ separate immutable binding must record which generation was actually referenced.
 blocks pointer:
     ACTIVE -> RETIRING -> RETIRED
                  |           |
-                 |           +-- G2 may activate through the pointer CAS
+                 |           +-- GC_RETIRE -> G2 may activate through the pointer CAS
+                 |           +-- GC_RETIRE -> QUARANTINE claim (retained pointer)
                  |
-                 +-- error, reference, or expired uses -> ACTIVE
+                 +-- error, reference, or expired uses -> ACTIVE (GC_RETIRE only)
+                 +-- QUARANTINE -> generation QUARANTINED; no automatic pointer exit
 
 generation row:
     materialization_state: MATERIALIZING -> VERIFIED
@@ -729,19 +881,25 @@ readability.
 
 ### `RETIRING`
 
-`RETIRING` is a temporary GC fence. New writers cannot use G1 and cannot create G2.
-An existing writer whose pin was already authorized for G1 may finish and publish
-while G1 is `RETIRING`; the GC sees the pin and waits. A writer with a `PENDING`
+`RETIRING` is a temporary writer fence with an immutable claim kind. New writers
+cannot use G1 and cannot create G2. Under `retire_claim_kind=GC_RETIRE`, an existing
+writer whose pin was already authorized for G1 may finish and publish while G1 is
+`RETIRING`; the GC sees the pin and waits. Under `retire_claim_kind=QUARANTINE`, no
+new physical operation or publication is permitted after observing the fence and the
+worker drains all pre-fence uses before establishing quarantine. A writer with a `PENDING`
 pin cannot publish until it revalidates while G1 is `ACTIVE`, but an unexpired
 `PENDING` row still blocks retirement because it may have been revalidated before
 the committed fence.
 
 A generation-bound `up:`, `pub:`, or `fs:` row found by the final global check
-returns G1 to `ACTIVE`. This is safe even when a provisional row is stale: the
-result is temporary retention, not deletion. The owner/expiry path can later
-remove the row and create a fresh candidate.
+returns G1 to `ACTIVE` only for a `GC_RETIRE` claim. This is safe even when a
+provisional row is stale: the result is temporary retention, not deletion. The
+owner/expiry path can later remove the row and create a fresh candidate. A
+`QUARANTINE` claim never reactivates automatically, regardless of references or
+expired uses.
 
-`RETIRING` is a fence on writers, so it must not become a parking state. It ends on
+`RETIRING` is a fence on writers, so a `GC_RETIRE` claim must not become a parking
+state. It ends on
 any of four outcomes: a reference is found; at least one use exists and every
 remaining use has expired its authority; the drain reaches zero; or a liveness read
 fails and, after the delayed candidate is durable, the worker conservatively returns
@@ -758,13 +916,18 @@ authorizes deletion by itself; the authoritative pointer must also have left
 
 ### `RETIRED`
 
-`RETIRED` is an authoritative `blocks.active_state` value. It means the GC has
-established the publication frontier at `EACH_QUORUM`:
+`RETIRED` is an authoritative `blocks.active_state` value. For a
+`RETIRED/GC_RETIRE` pointer, it means the GC has established the publication frontier
+at `EACH_QUORUM`:
 it observed zero use rows first, then zero generation-bound references, so no
 operation capable of legally publishing a reference remains. G2 may now be
-materialized. G1 remains addressable by its own identity until its delete is
-complete; after physical deletion, the logical pointer may still retain G1 as a
-historical retired predecessor until G2 replaces it.
+materialized. A `RETIRED/QUARANTINE` pointer is the exception: it is writer-fenced
+and cannot begin G2 materialization until the explicit operator resolution workflow
+clears the quarantine claim. The conversion from `RETIRED/GC_RETIRE` increments
+`retire_claim_epoch`, so an activation CAS carrying the old `GC_RETIRE` predecessor
+tuple fails. G1 remains addressable by its own identity until its delete is complete;
+after physical deletion, the logical pointer may still retain G1 as a historical
+retired predecessor until G2 replaces it.
 
 The guarantee is about authority, not about row absence. The protocol cannot
 prevent a use row from appearing after the final read: a writer may have observed
@@ -807,11 +970,13 @@ place a live retirement claim is ever stored — also needs:
 retire_claim_id
 retire_claim_epoch
 retire_claim_deadline
+retire_claim_kind       -- GC_RETIRE or QUARANTINE; immutable for one claim epoch
 ```
 
-Every **GC-owned reversible** pointer transition — `ACTIVE -> RETIRING`,
-`RETIRING -> ACTIVE`, `RETIRING -> RETIRED` — must match the current claim ID and
-epoch. Generation-row transitions do not, and cannot; see Conditional
+Every worker-owned pointer transition must match the current claim ID, epoch, and
+kind. `RETIRING -> ACTIVE` and `RETIRING -> RETIRED` additionally require
+`retire_claim_kind=GC_RETIRE`; no automated pointer exit exists for a quarantine-kind
+claim. Generation-row transitions do not condition across tables; see Conditional
 Generation-Lifecycle Transitions.
 
 The deadline is **not** a fourth condition on those transitions. Cassandra cannot
@@ -839,10 +1004,13 @@ acquisition, conditioned on the epoch it observed:
 takeover
     IF active_generation_id = G1
     AND active_state       = RETIRING
+    AND retire_claim_id    = Cold
     AND retire_claim_epoch = Nobserved
+    AND retire_claim_kind  = existing kind
     SET retire_claim_id       = Cnew
         retire_claim_epoch    = Nobserved + 1
         retire_claim_deadline = Dnew
+        retire_claim_kind     = existing kind
 ```
 
 It does not change `active_state`; it only replaces the owner. A stale worker that
@@ -862,6 +1030,7 @@ ACTIVE -> RETIRING
         retire_claim_id       = Cnew
         retire_claim_epoch    = Nprev + 1
         retire_claim_deadline = Dnew
+        retire_claim_kind     = GC_RETIRE or QUARANTINE
 
 RETIRING -> ACTIVE                RETIRING -> RETIRED
     IF active_generation_id = G1      IF active_generation_id = G1
@@ -869,6 +1038,7 @@ RETIRING -> ACTIVE                RETIRING -> RETIRED
     AND active_epoch    = E1          AND active_epoch       = E1
     AND retire_claim_id    = C        AND retire_claim_id    = C
     AND retire_claim_epoch = N        AND retire_claim_epoch = N
+    AND retire_claim_kind = GC_RETIRE       AND retire_claim_kind = GC_RETIRE
 ```
 
 **Claim acquisition must condition on the previous `retire_claim_epoch`.** Without
@@ -903,6 +1073,7 @@ alongside the initial pointer:
 retire_claim_epoch    = 0
 retire_claim_id       = null
 retire_claim_deadline = null
+retire_claim_kind     = null
 ```
 
 This is not the missing-row hazard of correction 71 — the same `IF` clause also
@@ -919,7 +1090,7 @@ bumps `retire_claim_epoch`, which is what invalidates the stale worker's conditi
 
 The activation CAS carries the predecessor claim ID and epoch even though the
 materializing request holds no GC claim. Its safety comes from the complete
-`G1 / E1 / RETIRED / C1 / N1` condition, which only the claim-holding retire worker
+`G1 / E1 / RETIRED/GC_RETIRE / C1 / N1` condition, which only the claim-holding retire worker
 could have installed, plus the immutable predecessor record and matching evidence
 check. Conditioning on the claim tuple rather than on `active_state = RETIRED`
 alone matters because `active_epoch` deliberately does not change across GC cycles:
@@ -958,9 +1129,9 @@ The ambiguity path therefore has two separate gates:
 ```text
 ambiguous ACTIVE -> RETIRING result
     -> SERIAL SELECT settles the blocks partition
-    -> matching RETIRING/G/E/C/N:
+    -> matching RETIRING/G/E/C/N/KIND:
          conditionally reassert that exact tuple at SERIAL + ALL
-         preserve the original claim deadline; do not extend it
+         preserve the original claim deadline and kind; do not extend/change either
          acknowledged applied result: visibility fence complete; begin the drain
          ambiguous/not-applied/unavailable: do not drain; reconcile and retry
     -> ACTIVE: re-issue the same claim LWT at SERIAL + ALL; do not drain yet
@@ -970,12 +1141,12 @@ ambiguous ACTIVE -> RETIRING result
 
 The reaffirmation is an identity write, not a new claim and not a lease renewal. Its
 `IF` clause matches `active_generation_id`, `active_epoch`, `active_state`,
-`retire_claim_id`, and `retire_claim_epoch`; its `SET` clause writes those same
-values and the same `retire_claim_deadline`. A non-applied result does not provide a
-visibility barrier, even if a following ordinary read happens to return
-`RETIRING`.
+`retire_claim_id`, `retire_claim_epoch`, and `retire_claim_kind`; its `SET` clause
+writes those same values and the same `retire_claim_deadline`. A non-applied result
+does not provide a visibility barrier, even if a following ordinary read happens to
+return `RETIRING`.
 
-`ALL` is deliberate. In Cassandra 5.0.6 Paxos v2, the LWT commit path reduces
+`ALL` is deliberate. In Cassandra 5.0.9 Paxos v2, the LWT commit path reduces
 `EACH_QUORUM.blockForWrite()` to a total response count and does not retain the
 ordinary write path's per-DC response accounting. At RF 1 in each of the three
 production DCs, `ALL` and `EACH_QUORUM` both require all three replicas. At higher
@@ -1069,8 +1240,14 @@ parser yields exactly:
 6. Promote PENDING -> AUTHORIZED                   LOCAL_QUORUM
    preserving the original deadline and remaining TTL;
    if ambiguous, confirm the full authority tuple
-7. Re-check the positive predicate and authority
-   deadline, then reuse K or PUT/repair K
+7. Immediately before physical work, perform one fresh authoritative read of the
+   pointer, the pinned generation row, and the pin row, and require the complete
+   predicate: `active_generation_id=G`, `active_epoch=E`, pin identity/state
+   `AUTHORIZED`, pointer state `ACTIVE` with null claim kind or
+   `RETIRING/GC_RETIRE`, generation `gc_state=null AND materialization_state=VERIFIED`,
+   and a deadline/margin that covers the operation. A `RETIRING/QUARANTINE`
+   observation revokes this operation and permits no PUT, repair, reuse, or
+   publication. Then reuse K or PUT/repair K only for the allowed pointer states.
 8. Validate AUTHORIZED pin, deadline, and epoch
 9. Publish the generation-bound reference         LOCAL_QUORUM
 10. Confirm an ambiguous reference result
@@ -1078,7 +1255,7 @@ parser yields exactly:
 ```
 
 The pin becomes `AUTHORIZED` only after step 6. A writer that observes `RETIRING`,
-`RETIRED`, or a different generation on the pointer, or whose generation row fails
+`RETIRED` (including `RETIRED/QUARANTINE`), or a different generation on the pointer, or whose generation row fails
 the positive predicate for any reason — `QUARANTINED`, `DELETING`, `DELETED`, or not
 yet `VERIFIED` — has no authority and must not perform a physical operation.
 (`DELETING` and `DELETED` are not pointer states; see Which States Live Where.)
@@ -1132,11 +1309,11 @@ revalidation *after* its own deadline has passed and still find the pointer
 W reads G/E1/ACTIVE, inserts PENDING
 GC retires: G/E1/RETIRING
 W stalls; its authority_deadline passes
-GC drains, finds only expired-authority uses -> RETIRING -> ACTIVE
+GC drains, finds only expired-authority uses -> RETIRING/GC_RETIRE -> ACTIVE
 W finally revalidates: G/E1/ACTIVE, exactly what it first observed
 ```
 
-The `RETIRING -> ACTIVE` escape makes this reachable by design, and the epoch does
+The `RETIRING/GC_RETIRE -> ACTIVE` escape makes this reachable by design, and the epoch does
 not distinguish it because `active_epoch` deliberately does not change across GC
 cycles. Bumping the epoch on reactivation would close this case but break a
 different guarantee — an already-`AUTHORIZED` writer is entitled to finish
@@ -1151,16 +1328,19 @@ untracked object at `K1` that no reference and no orphan row accounts for. Nothi
 is lost, but a leak that the recovery scan cannot attribute is exactly the class of
 state this design is trying to eliminate.
 
-After authorization, the writer may finish while the pointer state changes from
-`ACTIVE` to `RETIRING`. The publish helper must therefore validate the authorized
-pin's generation and epoch, deadline, and existence; it must not reject solely
-because the current pointer state is now `RETIRING`. It must reject `RETIRED`,
-`DELETING`, `DELETED`, a different active generation, or a missing/expired pin.
+After authorization, the writer may finish while a normal `GC_RETIRE` pointer fence
+changes from `ACTIVE` to `RETIRING`. The publish helper must therefore validate the
+authorized pin's generation and epoch, deadline, and existence; it must not reject
+solely because the current pointer state is now `RETIRING/GC_RETIRE`. It must reject
+`RETIRING/QUARANTINE`, `RETIRED`, `DELETING`, `DELETED`, a different active
+generation, or a missing/expired pin. The `retire_claim_kind` comparison is a state
+allowlist (`ACTIVE/null` or `RETIRING/GC_RETIRE`), not equality with a kind stored on
+the earlier pin.
 
 No physical operation is permitted before pin authorization.
 
 Reuse or repair of K is permitted only while its generation is `ACTIVE` or
-`RETIRING` and the writer holds an authorized pin. A generation that has reached
+`RETIRING/GC_RETIRE` and the writer holds an authorized pin. A generation that has reached
 `RETIRED` or `DELETING` is never repaired or reused; any new materialization gets a
 new UUID and a new key.
 
@@ -1271,6 +1451,7 @@ SET active_generation_id = G2,
     active_epoch = E2,
     retire_claim_id = null,
     retire_claim_deadline = null,
+    retire_claim_kind = null,
     retire_claim_epoch = N1
 WHERE org_id = O
 AND block_id = L
@@ -1279,6 +1460,7 @@ AND active_state = RETIRED
 AND active_epoch = E1
 AND retire_claim_id = C1
 AND retire_claim_epoch = N1
+AND retire_claim_kind = GC_RETIRE
 ```
 
 The `SET` clause is part of the contract, not illustrative shorthand. G2's activation
@@ -1405,7 +1587,7 @@ the activation did not apply:
 | The same G2 lineage is valid but G2's `materialization_state` still reads `MATERIALIZING` | Not a contradiction. Confirm the materializer's own `VERIFIED` write, or re-verify `K2`, and repair the marker; do not quarantine on marker lag alone. See `VERIFIED` Lag Is Not A Contradiction |
 | A different generation is active and an exact `EACH_QUORUM` lineage/evidence walk from the settled pointer is complete | If the chain contains G2, G2 was a historical winner that was later retired and superseded: never orphan K2; hand it to its existing `RETIRED`/`DELETING`/`DELETED` lifecycle. Only if the complete chain does not contain G2 did this materializer lose; then make K2 an exact orphan and release the use |
 | A different generation is active but the lineage/evidence walk is missing, mismatched, or uncertain | Preserve G2/K2 and the use; retry or quarantine the unprovable lineage. Never turn an incomplete chain into a losing-orphan decision |
-| Still `G1` / `RETIRED` / `E1` with matching claim tuple | Not applied; the same logical operation may be retried idempotently |
+| Still `G1` / `RETIRED/GC_RETIRE` / `E1` with matching claim tuple | Not applied; the same logical operation may be retried idempotently |
 | Read uncertain or a DC is unavailable | Retain `G2`, `K2`, and the use; retry later. Never orphan and never delete on an uncertain read |
 
 #### Recovering A Crashed Activation
@@ -1419,7 +1601,7 @@ G2 VERIFIED, K2 exists, materializer use AUTHORIZED
 activation CAS proposal accepted; coordinator dies before the commit is learned
 authority later expires
 
-recovery: ordinary EACH_QUORUM read of blocks -> "G1 / RETIRED"
+recovery: ordinary EACH_QUORUM read of blocks -> "G1 / RETIRED/GC_RETIRE"
 recovery: "not selected, authority expired" -> orphan and delete K2
 later:    a subsequent LWT replays the pending proposal -> pointer becomes G2
 ```
@@ -1442,7 +1624,7 @@ expired or crashed VERIFIED materialization
                               Never orphan K2. Do not publish with expired
                               authority. Hand off to the zero-reference
                               ACTIVE recovery branch
-3. settled pointer = G1/RETIRED with no proposal outstanding
+3. settled pointer = G1/RETIRED/GC_RETIRE with no proposal outstanding
                               activation did not happen. If authority has
                               expired, do NOT activate; K2 becomes an exact
                               orphan
@@ -1540,7 +1722,7 @@ validated before it reaches the setter, not at the call site.
 **The serial `SELECT` is the normative mechanism.** There is exactly one settlement
 form in this design, and the startup gate is unconditional: every generation-fence
 participant node must report the selected `generation_fence_paxos_variant` target.
-For the pinned Cassandra 5.0.6 build, `{v1, v2}` is the semantic allowlist, but PR-0
+For the pinned Cassandra 5.0.9 build, `{v1, v2}` is the semantic allowlist, but PR-0
 selects exactly one target and PR-2's gate rejects any participant outside it — an
 unrecognised variant, a disallowed variant, or a single node on the other allowlisted
 variant fails closed rather than being assumed safe. Inspecting one coordinator is
@@ -1690,6 +1872,8 @@ The central publish helper must reject a writer when:
 - the generation ID does not match;
 - the authority deadline has passed;
 - the pointer says the pinned generation is `RETIRED`;
+- the pointer says the pinned generation is `RETIRING` under
+   `retire_claim_kind=QUARANTINE`;
 - the pinned generation's own row fails the positive usability predicate
   `gc_state = null AND materialization_state = VERIFIED`, read from
   `block_generations` and not from `active_state` (see Which States Live Where).
@@ -1698,7 +1882,12 @@ The central publish helper must reject a writer when:
   a funnel that reaches publication only through this helper would then publish a
   reference on a regional `MATERIALIZING` lag. Quarantine remains fail-closed even
   if a stale pointer still names that generation; it is simply not the whole test;
-- the active generation/epoch no longer matches the authorized pin;
+- the active generation/epoch or claim kind no longer matches the authorized pin;
+- the immediately-before-operation pointer tuple does not equal
+   `active_generation_id=G` and `active_epoch=E`, or its state is not `ACTIVE` or
+   `RETIRING/GC_RETIRE`; the `ACTIVE` form requires a null claim kind, while the
+   `RETIRING` form requires the live pointer claim to be `GC_RETIRE` and does not
+   compare that newly-created claim to the pin created under `ACTIVE`;
 - the pin is not `AUTHORIZED`;
 - the request context has expired;
 - the reference result cannot be safely classified.
@@ -1714,7 +1903,8 @@ for a generation transition:
 | Observed state | Where observed | Writer behavior |
 |---|---|---|
 | `RETIRING` | pointer | bounded poll/backoff; no G2 allocation; retryable failure with `Retry-After` when the budget ends. The wait is bounded by live-authority drain, not by any retention TTL — see Escaping `RETIRING` On Abandoned Uses |
-| `RETIRED` | pointer | allocate a new UUID generation, materialize it, and complete the activation CAS inline; on CAS loss, orphan the losing key and reuse the winner |
+| `RETIRED/GC_RETIRE` | pointer | allocate a new UUID generation, materialize it, and complete the activation CAS inline; on CAS loss, orphan the losing key and reuse the winner |
+| `RETIRED/QUARANTINE` | pointer | fail closed; allocate no G2, perform no physical operation, and require the explicit quarantine resolution workflow |
 | `MATERIALIZING` owned by another operation | generation row, reached through a pinned generation ID | bounded poll/backoff, then retryable failure. Not reachable from the pointer, so it is not a state a first materializer can poll to avoid racing |
 | `QUARANTINED` | generation row, including the row selected by a pointer under investigation | fail closed; no new use, physical operation, candidate, or delete; require operator reconciliation |
 | `DELETING` | generation row | fail/retry; never repair or reuse that generation |
@@ -1737,16 +1927,19 @@ materialize() -> RegisterUploadedBlock  (internal/api/v2/fs_helpers.go:985)
                  -> UpsertBlockMetadataWithSHA1 -> INSERT ... IF NOT EXISTS
 ```
 
-`materialize()` runs on **both** probe outcomes, so a pure deduplication hit already
-pays the first-writer LWT. With `configs/config.prod.yaml:52` at
+Within this metadata-materialization funnel, `materialize()` runs on **both** probe
+outcomes, so a reusable-row deduplication result still pays the first-writer LWT.
+Preflight that rejects a fully deduplicated block before this funnel pays none. With
+`configs/config.prod.yaml:52` at
 `serial_consistency: SERIAL` that LWT is global Paxos, and at RF 1 per DC across two
 DCs a global Paxos quorum is both replicas. Losing one DC therefore fails every
-upload of that block — dedup hit, first materialization, and rematerialization
-alike — not only the rematerializing case.
+invocation reaching that funnel — reusable-row result, first materialization, and
+rematerialization alike — not only the rematerializing case.
 
 Two things must be kept apart here, and the first draft ran them together. The
-**existing baseline** is that every materialization and dedup path reaches this LWT
-at all; that is unchanged by the fence. Whether that LWT's Paxos domain is global or
+**existing baseline** is that every invocation reaching this materialization helper
+reaches the LWT; preflight may bypass the helper entirely. That is unchanged by the
+fence. Whether that LWT's Paxos domain is global or
 local is a property of the **deployed serial-consistency profile**, and today the
 multi-DC profiles are on `LOCAL_SERIAL`. Generation-fence writer mode is what makes
 the global domain mandatory for `blocks` rather than configurable — so the outage
@@ -1760,8 +1953,8 @@ one:
 
 | Operation | What it needs | Survives a whole-DC outage? |
 |---|---|---|
-| Rematerialization activation CAS | `SERIAL` phase plus an `EACH_QUORUM` regular commit | **Variant-dependent at RF > 1.** v1 uses the ordinary per-DC commit handler; Cassandra 5.0.6 v2 uses an aggregate Paxos commit count. At RF1, both still require every replica |
-| First-writer LWT (first materialization, and dedup today) | `SERIAL` phase, regular commit at the writer's own level | **Topology-dependent.** `SERIAL` needs a majority of *all* replicas, not one per DC |
+| Rematerialization activation CAS | `SERIAL` phase plus an `EACH_QUORUM` regular commit | **Variant-dependent at RF > 1.** v1 uses the ordinary per-DC commit handler; Cassandra 5.0.9 v2 uses an aggregate Paxos commit count. At RF1, both still require every replica. The predecessor must be `RETIRED/GC_RETIRE`; `RETIRED/QUARANTINE` is not activatable |
+| First-writer LWT (first materialization, and reusable-row results that reach metadata materialization) | `SERIAL` phase plus `QUORUM` regular commit | **Topology-dependent.** Both require a global majority, not one quorum per DC |
 | `ACTIVE -> RETIRING` writer fence | `SERIAL` phase plus `ALL` regular commit | **Never.** This is intentionally stricter because the publication frontier requires writer visibility, not only consensus |
 | Destructive drain and final refs check | `EACH_QUORUM` reads | **Never**, by construction — this is the X2 property |
 
@@ -1770,7 +1963,7 @@ Worked through:
 ```text
 2 DCs x RF1   global replicas = 2, Paxos majority = 2
               losing one DC blocks the first-writer LWT too
-              -> dedup, first materialization and rematerialization all fail
+               -> metadata-materializing dedup, first materialization and rematerialization fail
 
 2 DCs x RF3   global replicas = 6, majority = 4, one DC holds 3
               losing one DC still blocks it
@@ -1780,7 +1973,7 @@ Worked through:
               while activation and the retiring fence still require all 3
 
 3 DCs x RF3   global replicas = 9, majority = 5
-              Cassandra 5.0.6 Paxos v2 can satisfy its aggregate activation
+               Cassandra 5.0.9 Paxos v2 can satisfy its aggregate activation
               commit count from the 6 surviving replicas; v1's per-DC handler cannot
               -> no X2 proof may depend on activation being visible in the lost DC
               -> ACTIVE -> RETIRING still fails because it uses ALL
@@ -1793,8 +1986,9 @@ So the correct statements are split by mechanism:
   the actual target behavior rather than importing ordinary-write semantics;
 - destructive reads and the `ACTIVE -> RETIRING` writer fence always require every
   participating DC, with the fence stricter still at `ALL`;
-- the availability of the **first-writer LWT** — and therefore of dedup and first
-  materialization — follows the global Paxos majority over the configured replica
+- the availability of the **first-writer LWT** — and therefore of first
+  materialization and dedup that reaches metadata materialization — follows the global
+  Paxos majority over the configured replica
   set. On the current two-DC RF 1 topology, **once generation-fence writer mode
   forces the `blocks` LWT to `SERIAL`**, a whole-DC outage blocks them; with three or
   more DCs it need not. It must not be written as "every DC" in general, and the
@@ -1805,22 +1999,26 @@ Two consequences belong in PR-0 rather than in an incident:
 
 - the DC-outage error contract is measured against the **deployed** topology, not
   assumed from the two-DC test profile;
-- the X4 probe fast path is the only change that would take dedup off the LWT
-  entirely. Until it lands, no writer path is regional in the sense a reader of the
-  taxonomy might assume.
+- the X4 probe fast path removes the LWT only from reusable-row outcomes that already
+  reached metadata materialization. Browser/sync preflight can bypass that helper
+  today, while first content and rematerialization still need coordination. No path
+  that actually runs the generation-managed first-writer LWT is regional.
 
 Only `RETIRING` requires a writer to wait, and two separate rules keep that wait
 short. Neither is optional, because each closes a stall the other does not:
 
-- A provisional reference must not create a long writer stall: the GC reactivates
-  the generation when it sees any generation-bound reference, so a long
-  provisional TTL costs retention rather than availability.
-- An abandoned pin must not create a long writer stall either: the GC reactivates
-  when one or more uses remain and every such use has expired its authority, so the
-  wait is bounded by the authority deadline rather than by `retention_expires_at`.
+- A provisional reference must not create a long writer stall: the GC reactivates a
+  `GC_RETIRE` generation when it sees any generation-bound reference, so a long
+  provisional TTL costs retention rather than availability. A `QUARANTINE` claim
+  remains fenced.
+- An abandoned pin must not create a long writer stall either: the GC reactivates a
+  `GC_RETIRE` claim when one or more uses remain and every such use has expired its
+  authority, so the wait is bounded by the authority deadline rather than by
+  `retention_expires_at`. A `QUARANTINE` claim remains fenced.
 
-`RETIRED` does not stall on a state transition: the writer proceeds immediately to
-materialize and activate a new generation.
+`RETIRED/GC_RETIRE` does not stall on a state transition: the writer proceeds
+immediately to materialize and activate a new generation. `RETIRED/QUARANTINE` is
+the deliberate exception and fails closed until operator resolution.
 
 "Does not stall" is a statement about waiting, not about availability. A
 rematerializing writer still depends on the activation CAS reaching global
@@ -1848,6 +2046,7 @@ active_epoch
 retire_claim_id
 retire_claim_epoch
 retire_claim_deadline
+retire_claim_kind
 ```
 
 All conditional active-pointer transitions occur through LWTs on that same row:
@@ -1856,7 +2055,8 @@ All conditional active-pointer transitions occur through LWTs on that same row:
 ACTIVE -> RETIRING        GC worker
 RETIRING -> ACTIVE        GC worker
 RETIRING -> RETIRED       GC worker
-RETIRED G1 -> ACTIVE G2   materializing request (inline) or recovery worker
+RETIRED/GC_RETIRE G1 -> ACTIVE G2   materializing request (inline) or recovery worker
+RETIRED/QUARANTINE -> ACTIVE        operator resolution only
 ```
 
 Because those columns are Paxos-managed, the following must hold and must be
@@ -1948,8 +2148,15 @@ The split is:
 
 The pointer never holds `MATERIALIZING`. A first life creates the row already
 `ACTIVE` through the first-writer LWT; a rematerialization moves it directly from
-`RETIRED` (G1) to `ACTIVE` (G2). Two concurrent first materializers of the same new
-content therefore both PUT and both attempt the LWT, one loses and orphans its key.
+`RETIRED/GC_RETIRE` (G1) to `ACTIVE` (G2). A `RETIRED/QUARANTINE` pointer never
+rematerializes: there is no transition that restores a `GC_RETIRE` claim, so the only
+exit is the operator workflow, which returns the pointer to `ACTIVE` on the **same**
+generation with a null claim kind after clearing that generation's `QUARANTINED`
+state. A resolution that instead confirms the contradiction marks the work `REJECTED`
+and leaves the pointer fenced permanently; that block accepts no further writes until
+a new audited resolution. Two concurrent
+first materializers of the same new content therefore both PUT and both attempt the
+LWT, one loses and orphans its key.
 That is the current behaviour and it is safe; there is no pointer state a writer
 could poll to avoid it.
 
@@ -2034,15 +2241,16 @@ materialization-expiry path, not to this one.
 
 The authorization comes from the proof required *before* the statement is issued: an
 evidence row for G1 whose epoch **and** claim ID match, plus an authoritative pointer
-that either reads `G1 / RETIRED` or selects a successor reachable from G1 by an
+that either reads `G1 / RETIRED/GC_RETIRE` or selects a successor reachable from G1 by an
 unbroken lineage chain.
 
 Which claim the evidence must match depends on where the pointer is, and conflating
 the two cases is a live trap:
 
 ```text
-pointer = G1 / RETIRED     evidence(G1, N1) must match the LIVE pointer claim,
-                           because the live claim is C1 / N1
+pointer = G1 / RETIRED/GC_RETIRE
+                            evidence(G1, N1) must match the LIVE pointer claim,
+                            because the live claim is C1 / N1
 
 pointer = G2 or later      the live pointer claim belongs to a later cycle, or is
                            null. evidence(G1, N1) must match the claim recorded in
@@ -2055,11 +2263,13 @@ fail every legitimate delete of a superseded generation. The claim to match is a
 the one that authorized *that* retirement, and the lineage link is what records it.
 
 That proof is irrevocable once obtained, which is precisely why it does not need to
-be re-asserted in the `IF` clause:
+be re-asserted in the `IF` clause. A `RETIRED/QUARANTINE` pointer is not an ordinary
+retirement proof: it is a fail-closed retained pointer that cannot authorize
+`DELETING` or G2 activation until its explicit resolution workflow completes:
 
 ```text
-the pointer has no RETIRED -> ACTIVE transition
-    -> once G1 reads RETIRED, no writer can ever acquire authority on G1 again
+the pointer has no RETIRED/GC_RETIRE -> ACTIVE transition
+    -> once G1 reads RETIRED/GC_RETIRE, no writer can ever acquire authority on G1 again
     -> the pointer can only move forward to a successor, and the first such
        successor's activation CAS required the exact (G1, E1, C1, N1) tuple that
        is this worker's own proof
@@ -2085,6 +2295,12 @@ unconditional write is introduced, and they are never read back as a preconditio
 
 `DELETING -> DELETED` is the same shape with `IF gc_state = DELETING`, which is
 itself a non-null comparison and therefore already satisfies the missing-row rule.
+If either lifecycle LWT is ambiguous, settlement must classify the exact generation
+identity rather than treating a non-applied result as failure: matching `DELETING`
+must retain the recorded generation/key and delete-claim ID/epoch; matching
+`DELETED` may retire delete work only after exact-key absence is reverified; a
+conflicting terminal state, missing identity, or uncertain read retains the work and
+fails closed.
 
 #### When The Physical Delete Keeps Failing
 
@@ -2212,14 +2428,58 @@ writer's permission.
 
 #### Quarantine
 
-Quarantine is a generation-row transition, not an unconditional diagnostic write
-and not a cross-table CAS:
+Quarantine is a durable workflow, not an unconditional diagnostic write and not a
+cross-table CAS. Every proven contradiction first publishes and confirms
+`gc_generation_quarantines_by_day` with the exact generation/key, contradiction
+identity/evidence digest, reason, timestamp, and operation ID. An unconfirmed work row
+means no pointer or generation mutation.
+
+If the pointer currently selects G as `ACTIVE`, the worker must first acquire the same
+writer-visible pointer fence at `SERIAL + ALL`, but with
+`retire_claim_kind=QUARANTINE`. Ambiguity uses the normal serial settlement plus exact
+`SERIAL + ALL` pointer reaffirmation. The kind is immutable for the claim epoch,
+takeover preserves it, normal GC retirement/evidence/reactivation branches require
+`GC_RETIRE`, and a quarantine claim can never append retirement evidence or authorize
+delete. Publish/revalidation treats `RETIRING/QUARANTINE` as revocation: unlike a
+normal GC drain, an already-authorized writer may not start another physical operation
+or publish after observing it.
+
+After the fence is acknowledged, the quarantine worker reads the complete use
+partition at `EACH_QUORUM` until no use remains. A physical or reference write already
+issued before the fence cannot be revoked; its use stays durable until the exact
+reference is confirmed or the operation is abandoned. The worker preserves any such
+key/reference, performs no delete, and does not quarantine the generation until this
+use drain reaches zero. The use-before-reference publication ordering therefore
+closes the same late-writer seam without claiming cancellation of an external request.
+
+If G is not the pointer-selected `ACTIVE` generation, the worker must first settle
+the pointer at `SERIAL` and classify any pending activation or existing claim. If G
+could still be selected by a legal activation, the worker must first acquire a
+`RETIRING/QUARANTINE` fence on the currently selected `ACTIVE` generation (or
+ coalesce with its existing quarantine claim). If the pointer is `RETIRED/GC_RETIRE`,
+it must instead convert the retained pointer claim from `GC_RETIRE` to `QUARANTINE`
+with an exact `SERIAL + ALL` conditional write that leaves `active_state=RETIRED`
+and increments `retire_claim_epoch`; this blocks the activation CAS, whose
+predecessor condition requires the old `retire_claim_kind=GC_RETIRE` and epoch. A
+`RETIRED/QUARANTINE` pointer is already fenced and is coalesced by exact
+operation/evidence identity. Drain the relevant pointer/materializer uses and
+retain the quarantine work until the activation is serially settled. This broader
+fence is intentional: a generation not currently selected has no row-local lock that
+can guard a future pointer CAS. The activation path must re-confirm an unexpired
+materializer use immediately before its CAS and cannot issue that CAS after the use
+is terminally released. An existing `RETIRING/GC_RETIRE` claim is not overwritten by
+quarantine until its claim owner is safely settled. The quarantine worker does not
+write `QUARANTINED` until these checks and the pointer fence prove that no legal
+activation remains. Durable quarantine work still precedes the generation-row
+transition. In both cases, the terminal generation mutation is:
 
 ```text
 UPDATE block_generations
 SET gc_state = QUARANTINED,
     quarantined_at = now,
-    quarantine_reason = R
+    quarantine_reason = R,
+    quarantine_operation_id = T,
+    quarantine_evidence_digest = D
 WHERE org_id = O
   AND block_id = L
   AND generation_id = G
@@ -2227,8 +2487,8 @@ IF gc_state = null
 AND storage_key = K
 ```
 
-The statement uses `SERIAL` for the conditional phase and `EACH_QUORUM` for the
-regular commit. The pointer state is supplied by the worker's prior authoritative
+The statement uses `SERIAL` for the conditional phase and `ALL` for the regular
+commit. The pointer state is supplied by the worker's prior authoritative
 read, but is not copied into the generation row. `storage_key` is the non-null
 identity guard required above; quarantine cannot use `materialization_state` for
 that role because a `MATERIALIZING` generation is one of the things worth
@@ -2239,17 +2499,31 @@ its operation ID and `materialization_state`. There is no automated form for
 terminal state.
 
 Quarantine needs no claim condition for a second, independent reason: it is
-fail-closed in the safe direction. A stale worker that quarantines a healthy
-generation costs retention and an operator ticket, never data. Two concurrent
-quarantiners converge, because the second simply does not apply.
+fail-closed in the safe direction once globally visible. A stale worker that
+quarantines a healthy generation costs retention and an operator ticket, never data.
+Two concurrent quarantiners converge, because the second simply does not apply. That
+does not make commit visibility optional: a writer in a DC omitted by a Paxos v2
+aggregate commit could otherwise continue to read `gc_state=null` and use the
+contradicted generation.
 
-An ambiguous quarantine result is reconciled by re-issuing the same conditional LWT
-in the `SERIAL` Paxos domain, followed by an `EACH_QUORUM` inspection if needed: an
-observed `gc_state=QUARANTINED` is success, the same expected unquarantined state is
-retryable, `DELETING`/`DELETED` is preserved, and an uncertain inspection retains the
-generation and physical key. A quarantined generation is excluded from discovery,
-queues, re-enqueue, and every delete path. It can leave quarantine only through an
-explicit operator workflow with its own audited conditional transition.
+An ambiguous quarantine result has separate decision and visibility gates. First,
+`SELECT ... CONSISTENCY SERIAL` on the exact generation partition settles any pending
+proposal. If it returns the exact `QUARANTINED/G/K/R/T/D` identity, the worker
+conditionally reasserts those same values at `SERIAL + ALL`; it does not replace the
+reason or timestamp. If it returns the expected `gc_state=null` identity, the worker
+retries the original quarantine at `SERIAL + ALL`. `DELETING`/`DELETED` is preserved.
+An uncertain serial read, unavailable replica, non-applied reaffirmation, or ambiguous
+result retains the generation, physical key, pointer fence, and quarantine work row.
+The scanner resumes the same operation after worker/coordinator death; no generation
+mutation is attempted before an active pointer is durably fenced. No writer-facing
+path may rely on quarantine until the `ALL` barrier is acknowledged. A quarantined
+generation is then excluded from ordinary discovery, re-enqueue, and every delete
+path; only its quarantine workflow remains until the pointer/generation state is
+confirmed. The work row remains as a terminal-resolution tombstone until operator
+resolution completes; it is never retired merely because `QUARANTINED` is visible.
+It can leave quarantine only through the
+explicit operator workflow above, with its own audited conditional transitions and
+no delete authority.
 
 The generation row and the active-pointer row cannot be guarded by one Cassandra
 condition, so quarantine is a fail-closed marker, not an atomic activation lock. The
@@ -2269,6 +2543,18 @@ materializer performs a final authoritative reconciliation after its pointer CAS
 - If quarantine wins before activation, the pre-CAS read aborts. If the two rows
   race after that read, the same post-CAS reconciliation decides; no cross-table
   inference authorizes a publish or delete.
+- If quarantine wins after a materializer's pre-CAS read but before its activation
+  CAS, the materializer's CAS is rejected by the settled quarantine workflow before
+  pointer installation; if the CAS nevertheless selects G2 first, reconciliation
+  immediately installs durable quarantine work/fencing for the selected generation,
+  prevents publication, and does not leave G2 as an accepted active generation.
+- A quarantine request never concludes from an ordinary `ACTIVE` read alone. If the
+  settled pointer names another generation but its serial settlement leaves a
+  possible `G` activation proposal, the request retains durable work and retries;
+  it does not mutate G or retire the work row. If an existing pointer claim is
+  `RETIRING/QUARANTINE`, the request coalesces by operation/evidence identity and
+  waits for that claim's drain; if it is `RETIRING/GC_RETIRE`, the request does not
+  overwrite the live claim and waits for explicit claim settlement.
 
 ### Epoch Allocation
 
@@ -2295,7 +2581,7 @@ A `WRITER` use records the `active_epoch` it observed; a `MATERIALIZER` use reco
 the `active_epoch` it proposes. See Uses And References for why the two must not be
 validated the same way.
 
-The successful `RETIRING -> RETIRED` pointer transition retains the live
+The successful `RETIRING/GC_RETIRE -> RETIRED` pointer transition retains the live
 `retire_claim_id` and `retire_claim_epoch` until G2 activation replaces the pointer.
 Clearing or changing those columns before a later activation would destroy
 the exact predecessor condition and is forbidden.
@@ -2310,32 +2596,66 @@ which must be frozen in PR-1:
 ACTIVE (steady state)
     retire_claim_id       = null
     retire_claim_deadline = null
+    retire_claim_kind     = null
     retire_claim_epoch    = last allocated value        <-- retained, never cleared
 
 ACTIVE -> RETIRING
     retire_claim_epoch    = previous + 1
     retire_claim_id       = C
     retire_claim_deadline = new deadline
+    retire_claim_kind     = GC_RETIRE or QUARANTINE
 
-RETIRING -> ACTIVE          (reference found, or all uses expired)
+RETIRING/GC_RETIRE -> ACTIVE          (reference found, or all uses expired)
     retire_claim_id       = null
     retire_claim_deadline = null
+    retire_claim_kind     = null
     retire_claim_epoch    = retained
 
-RETIRING -> RETIRED
-    retire_claim_id / epoch / deadline all retained
+RETIRING/GC_RETIRE -> RETIRED
+    retire_claim_id / epoch / deadline / kind all retained
     (this is the predecessor proof the activation CAS matches)
+
+RETIRED/GC_RETIRE -> RETIRED/QUARANTINE
+    IF active_generation_id = G1
+    AND active_state       = RETIRED
+    AND active_epoch       = E1
+    AND retire_claim_id    = C1
+    AND retire_claim_epoch = N1
+    AND retire_claim_kind  = GC_RETIRE
+    SET retire_claim_id       = Cq
+        retire_claim_epoch    = N1 + 1
+        retire_claim_deadline = Dq
+        retire_claim_kind     = QUARANTINE
+
+RETIRING/QUARANTINE -> generation QUARANTINED
+    pointer claim id / epoch / deadline / kind retained
+    quarantine operation/evidence identity retained
+    no automated pointer transition; operator workflow owns resolution
+
+RETIRED/QUARANTINE -> ACTIVE       (operator resolution only)
+    generation gc_state QUARANTINED -> null confirmed first
+    delayed candidate + discovery projection confirmed BEFORE this CAS
+    IF active_state       = RETIRED
+    AND retire_claim_kind  = QUARANTINE
+    AND retire_claim_id / epoch match the retained quarantine claim
+    SET retire_claim_id       = null
+        retire_claim_deadline = null
+        retire_claim_kind     = null
+        retire_claim_epoch    = retained quarantine epoch
+        active_state          = ACTIVE
 
 G1 RETIRED -> G2 ACTIVE     (activation CAS)
     G2.predecessor_* records C1 / N1 durably first
     retire_claim_id       = null
     retire_claim_deadline = null
+    retire_claim_kind     = null
     retire_claim_epoch    = N1 retained as the counter
 ```
 
 The single property that makes this safe is that `retire_claim_epoch` is a
 **monotonic counter that is never cleared**, while `retire_claim_id` and
-`retire_claim_deadline` are live only during `RETIRING` and `RETIRED`. Clearing the
+`retire_claim_deadline`/`retire_claim_kind` are live only during `RETIRING` and
+`RETIRED`. Clearing the
 epoch on reactivation or on activation would let a stale worker from cycle N match a
 future cycle — the hole correction 53 exists to close — and clearing the id or
 deadline while `RETIRED` would destroy the predecessor condition.
@@ -2359,21 +2679,21 @@ The required order is therefore:
 2. append + confirm retirement evidence for
    (G1, claim_epoch)                              SERIAL + EACH_QUORUM
 3. publish + confirm gc_generation_handoff_by_day LOCAL_QUORUM
-4. CAS blocks RETIRING -> RETIRED                 SERIAL + EACH_QUORUM
-   <-- G2 may activate from this point on
+4. CAS blocks RETIRING -> RETIRED/GC_RETIRE        SERIAL + EACH_QUORUM
+    <-- G2 may activate from this point on, unless a quarantine claim is installed
    <-- the candidate/queue work may now retire
 5. publish + confirm gc_generation_deletes_by_day LOCAL_QUORUM
    <-- the handoff work may now retire
 ```
 
 Steps 3 and 5 are the work-continuity handoff, not bookkeeping. Without step 3 the
-seam after the pointer CAS has no owner: `blocks` reads `G1 / RETIRED` with valid
+seam after the pointer CAS has no owner: `blocks` reads `G1 / RETIRED/GC_RETIRE` with valid
 evidence and `K1` present, while the candidate that discovered G1 is gone and the
 delete work does not exist yet. See Discoverability Before Irreversibility.
 
 **Step 4 is the gate.** The G2 activation CAS conditions on the
 `blocks` row alone, so a rematerializing request can win it once the pointer reads
-`G1 / RETIRED / E1` with the matching claim tuple. Nothing can hold G2 back until a
+`G1 / RETIRED/GC_RETIRE / E1` with the matching claim tuple. Nothing can hold G2 back until a
 later write to a different table lands, and an implementer who tries to enforce
 that will reach for a cross-table condition Cassandra cannot express — which this
 ADR forbids elsewhere as an acceptance criterion.
@@ -2383,7 +2703,7 @@ There is no mutable generation-row mirror finalize. The durable proof of retirem
 > an evidence row for G1 matching the **retirement-authorizing claim's epoch and
 > ID**, **plus** the
 > authoritative pointer having left `RETIRING` — either because it reads
-> `G1 / RETIRED`, or because it has already been replaced by a successor whose
+> `G1 / RETIRED/GC_RETIRE`, or because it has already been replaced by a successor whose
 > durable predecessor tuple and activation CAS required the exact
 > `G1 / E1 / C1 / N1` retirement claim. Where that successor is not the current
 > pointer, the same proof is reached by walking the lineage chain.
@@ -2478,7 +2798,7 @@ not always the pointer's current claim:
 
 ```text
 retirement-authorizing claim for G:
-    if the pointer reads G / RETIRED   -> the claim on the blocks row
+    if the pointer reads G / RETIRED/GC_RETIRE -> the claim on the blocks row
     otherwise                          -> the claim recorded in the successor
                                           lineage link for G
 ```
@@ -2504,8 +2824,9 @@ and a reconciliation rule:
 | Pointer selects G1, state `RETIRING` | absent | Normal in-progress retirement; continue the drain from step 1 |
 | Pointer selects G1, state `RETIRING` | present | Crash between the evidence append and the pointer CAS. **Never `DELETING`, never G2.** Revalidate the claim, re-run the global zero check, then complete steps 3 and 4 — or return to `ACTIVE` if a reference has appeared |
 | Pointer selects G1, state `RETIRING` | absent at the authorizing epoch, though earlier cycles left rows | Identical to the row above: the lookup is a point read at the exact `(G1, N)`, so earlier cycles are simply not found. They are history and are never enumerated |
-| Pointer selects G1, state `RETIRED` | present | Consistent; conditionally set G1 `gc_state=DELETING`, then proceed with exact-key cleanup |
-| Pointer selects G1, state `RETIRED` | absent at the authorizing claim | **Protocol violation. Fail closed.** Quarantine G1; no `DELETING`, no G2, no S3 delete, and above all **no reconstruction of the missing evidence**. See Evidence Cannot Be Reconstructed After The Fact |
+| Pointer selects G1, state `RETIRED/GC_RETIRE` | present | Consistent; conditionally set G1 `gc_state=DELETING`, then proceed with exact-key cleanup |
+| Pointer selects G1, state `RETIRED/QUARANTINE` | any | Quarantine fence remains authoritative; no `DELETING`, no G2, and no physical delete until explicit operator resolution |
+| Pointer selects G1, state `RETIRED/GC_RETIRE` | absent at the authorizing claim | **Protocol violation. Fail closed.** Quarantine G1; no `DELETING`, no G2, no S3 delete, and above all **no reconstruction of the missing evidence**. See Evidence Cannot Be Reconstructed After The Fact |
 | Pointer selects G2 | evidence for the exact `N1`, and G2 predecessor is `(G1, E1, C1, N1)` | The zero check passed and G2 could only activate through a CAS requiring the matching pointer tuple; proceed to `DELETING` for G1 |
 | Pointer selects G2 | missing/mismatched evidence or G2 predecessor lineage | Fail closed. Never delete `K1`; quarantine G1, and quarantine G2 as well when its own lineage is mismatched, using conditional transitions |
 | Pointer selects G3 or later | an unbroken evidence/predecessor chain back to G1 | The chain proves G1 was superseded; proceed to `DELETING` for G1. See The Lineage Chain Is Transitive |
@@ -2578,7 +2899,7 @@ the pointer CAS, is never deleted, never expires, and is read by exact `(G, N)`.
 pointer = RETIRING, evidence absent   -> normal, incomplete retirement
                                          re-run the zero check, append evidence
 
-pointer = RETIRED,  evidence absent   -> the ordering was violated
+pointer = RETIRED/GC_RETIRE, evidence absent -> the ordering was violated
                                          fail closed, quarantine
                                          no DELETING, no G2, no delete
                                          and no synthetic evidence
@@ -2601,9 +2922,9 @@ inferred from it:
 > `block_generations(G1).gc_state` alone never authorizes `DELETING`. The worker
 > must additionally hold an evidence row whose epoch and claim ID match the claim
 > that authorized *that* generation's retirement — the live pointer claim when the
-> pointer still reads `G1 / RETIRED`, otherwise the claim recorded in the lineage
+> pointer still reads `G1 / RETIRED/GC_RETIRE`, otherwise the claim recorded in the lineage
 > link that supersedes it — and the
-> authoritative pointer must either read `G1 / RETIRED`, or select a later
+> authoritative pointer must either read `G1 / RETIRED/GC_RETIRE`, or select a later
 > generation reachable from G1 by an unbroken lineage chain — the immediate
 > successor G2 being only its shortest case. See The Lineage Chain Is Transitive;
 > an implementation that hard-codes "G1 or G2" strands every generation collected
@@ -2611,7 +2932,7 @@ inferred from it:
 
 > Retirement evidence is valid only when **both** `retire_claim_epoch` and
 > `retire_claim_id` match the retirement-authorizing claim for that generation — the
-> claim on the `blocks` row when the pointer still reads `G / RETIRED`, otherwise the
+> claim on the `blocks` row when the pointer still reads `G / RETIRED/GC_RETIRE`, otherwise the
 > claim recorded in the successor lineage link. The epoch identifies the row; the
 > claim ID is part of the immutable proof
 > payload. A worker that cannot match the epoch treats the evidence as absent; a row
@@ -2723,49 +3044,55 @@ as the authority deadline, not a cleanup convenience:
 
 ```text
 provisional_reference_ttl
-    > maximum observed upload-to-commit window
-    + client retry and resume budget
+    > enforced upload-session + upload-to-commit + retry/resume bound
+    + maximum clock/operation skew
     + operational safety margin
 ```
 
-PR-0's writer-lifetime inventory must measure this window explicitly, separately
-from the single-request writer lifetime that sets the authority deadline. A
+Phase 0 must define and fault-test this hard window explicitly, separately from the
+single-operation writer bound that sets the authority deadline. Measurements validate
+normal SLO/headroom but do not establish the bound. A
 provisional TTL sized only for a single request will produce commit failures that
 look like GC bugs.
 
 Sizing it upward is cheap here precisely because a provisional reference no longer
-parks a generation: the GC reactivates on any generation-bound reference, so a long
-provisional TTL costs retention, not availability.
+parks a `GC_RETIRE` generation: the GC reactivates on any generation-bound reference
+under that claim kind, so a long provisional TTL costs retention, not availability.
+A `QUARANTINE` claim remains fenced regardless of references.
 
 ## GC Protocol
 
 ```text
 1. Discover candidate                              LOCAL_QUORUM
-2. ACTIVE G1 -> RETIRING                           SERIAL + ALL
+2. ACTIVE G1 -> RETIRING / kind=GC_RETIRE          SERIAL + ALL
 3. Read all use rows for G1                       EACH_QUORUM
 4. Read all refs bound to G1                      EACH_QUORUM
 5. Decide, in this order:
-     any read error / DC unavailable
+     any read error / DC unavailable (GC_RETIRE only)
          -> publish + confirm a delayed candidate
             and its discovery projection            LOCAL_QUORUM
-         -> attempt RETIRING -> ACTIVE             SERIAL + EACH_QUORUM
+          -> attempt RETIRING/GC_RETIRE -> ACTIVE    SERIAL + EACH_QUORUM
          -> if the global CAS is unavailable/ambiguous, keep RETIRING
             only until it can be reconciled; never append evidence or delete
-     refs > 0
-         -> RETIRING -> ACTIVE                     SERIAL + EACH_QUORUM
+      refs > 0 (GC_RETIRE only)
+          -> RETIRING/GC_RETIRE -> ACTIVE            SERIAL + EACH_QUORUM
       refs == 0 and any use (PENDING or AUTHORIZED) has an
       unexpired authority_deadline
           -> keep RETIRING, drain
-      refs == 0 and uses > 0 and every remaining use has expired authority
+       refs == 0 and uses > 0 and every remaining use has expired authority
+       (GC_RETIRE only)
           -> publish + confirm the delayed candidate
              and its discovery projection            LOCAL_QUORUM
-          -> RETIRING -> ACTIVE                     SERIAL + EACH_QUORUM
-     refs == 0 and uses == 0
-         -> append + confirm retirement evidence   SERIAL + EACH_QUORUM
-         -> publish + confirm handoff work         LOCAL_QUORUM
-         -> G1 -> RETIRED                          SERIAL + EACH_QUORUM
-         -> the candidate/queue work may now retire
-6. Allow G2 only after G1 is RETIRED
+           -> RETIRING/GC_RETIRE -> ACTIVE            SERIAL + EACH_QUORUM
+       refs == 0 and uses == 0 and retire_claim_kind = GC_RETIRE
+           -> append + confirm retirement evidence   SERIAL + EACH_QUORUM
+           -> publish + confirm handoff work         LOCAL_QUORUM
+           -> G1 -> RETIRED                          SERIAL + EACH_QUORUM
+           -> the candidate/queue work may now retire
+       refs == 0 and uses == 0 and retire_claim_kind = QUARANTINE
+           -> retain the quarantine work and pointer fence; no evidence, RETIRED,
+              delete, or automatic pointer exit
+6. Allow G2 only after G1 is RETIRED/GC_RETIRE
 7. Persist + confirm delete-recovery discovery work
     for the exact (G1, K1)                         LOCAL_QUORUM
     <-- the handoff work may now retire
@@ -2794,13 +3121,24 @@ uses first would leave a generation that has both a reference and an in-flight
 writer parked in `RETIRING` instead of reactivating it, which contradicts the
 contract even though it is not itself unsafe.
 
-The error branch is a fail-closed **writer-fence escape**, not delete progress.
+The error branch for a `GC_RETIRE` claim is a fail-closed **writer-fence escape**,
+not delete progress.
 Unknown liveness can never produce retirement evidence, but retaining `K1` and
 returning the pointer to `ACTIVE` is safe under every possible read result. The
 delayed candidate is confirmed before the CAS exactly as in the abandoned-use branch.
 If a whole DC is unavailable, the reactivation CAS may also be unavailable; the
 pointer then remains `RETIRING` only until global coordination returns, not forever
 because the same tombstone-heavy liveness read is retried as the only exit.
+
+At RF3 under Paxos v2, requested `EACH_QUORUM` may instead acknowledge
+`RETIRING -> ACTIVE` from six aggregate responses while one DC learns nothing. That
+is safe and intentionally not promoted to `ALL`: the omitted DC can only remain stale
+at restrictive `RETIRING`, so it rejects writer authorization until hinted delivery,
+repair, or a later pointer LWT converges the row. Each request fails within its bounded
+retry budget, but the regional stale interval itself has no protocol-intrinsic bound.
+Phase 0 sets a convergence/repair SLO and operational trigger. Acceptance tests cover
+reference-found, expired-use, and read-error reactivation through both natural
+convergence and forced repair.
 
 The GC must not reactivate a generation merely because a use with live authority
 exists. Such a use can be an operation that was fenced during revalidation and will
@@ -2893,7 +3231,7 @@ So the drain distinguishes two cases that the retention contract keeps separate:
 |---|---|
 | At least one `AUTHORIZED` use whose `authority_deadline` has not passed | Keep `RETIRING` and drain; that writer may still legitimately publish |
 | At least one `PENDING` use whose `authority_deadline` has not passed | Keep `RETIRING` and drain; it may have revalidated before the committed fence, but it cannot perform physical work until authorization |
-| Uses > 0 and every remaining use has an expired `authority_deadline` but unexpired `retention_expires_at` | `RETIRING -> ACTIVE` |
+| Uses > 0 and every remaining use has an expired `authority_deadline` but unexpired `retention_expires_at` | `RETIRING/GC_RETIRE -> ACTIVE`; a `QUARANTINE` claim remains fenced |
 
 Reactivating on expired-authority uses is retention-safe by construction: `K1` was
 never deleted, and the publish helper independently rejects a writer whose authority
@@ -2903,8 +3241,8 @@ everywhere else.
 
 This does not reintroduce `pin -> ACTIVE`. A use with live authority still never
 justifies reactivation; it justifies waiting. Only a use that can no longer produce
-a reference — and therefore can no longer be drained into a decision — releases the
-fence.
+a reference — and therefore can no longer be drained into a decision — releases a
+`GC_RETIRE` fence. A `QUARANTINE` fence never uses this escape.
 
 After such a reactivation the generation is `ACTIVE` with zero references, and no
 reference-removal event will ever re-create its candidate — the references were
@@ -2962,6 +3300,52 @@ work. Recovery stays as the safety net for stale or inconsistent work rows — n
 a missing post-CAS enqueue, which correction 97 makes unreachable: an unconfirmed
 enqueue forbids the CAS, so a committed reactivation always has its discovery row.
 
+### Operator Reactivation Needs The Same Delayed Candidate
+
+`RETIRING/GC_RETIRE -> ACTIVE` is not the only transition that returns a pointer to
+`ACTIVE` without a reference-removal event behind it. Quarantine resolution does the
+same thing, and the rule above applies to it unchanged.
+
+The reachable state is precise rather than hypothetical. A generation reaches
+`RETIRED` only through the zero drain, so at that moment `refs == 0` and `uses == 0`.
+Nothing can add a reference while the pointer is `RETIRING` or `RETIRED`, because
+publishing requires an `AUTHORIZED` use and authorization requires revalidating
+against an `ACTIVE` pointer. So when the operator returns a `RETIRED/QUARANTINE`
+pointer to `ACTIVE`, the generation is `ACTIVE` with zero references — and its
+references were already zero before it was ever a candidate, so no future
+reference-removal event will create one:
+
+```text
+operator clears gc_state QUARANTINED -> null
+operator CAS RETIRED/QUARANTINE -> ACTIVE
+    => ACTIVE, refs = 0, no candidate, no work row naming the generation
+    => invisible to every automated path, retained forever
+```
+
+That is exactly the state correction 97 exists to make unreachable, arriving through
+a path correction 97 did not name. The `RETIRING/QUARANTINE -> ACTIVE` form needs the
+same treatment even though its drain may not have completed: quarantine can be raised
+on a generation whose references already reached zero, so the same hole is reachable
+there.
+
+The requirement is therefore identical to the abandoned-use escape, and deliberately
+unconditional rather than predicated on observing `refs == 0`:
+
+```text
+1. write + confirm the delayed candidate (candidate_at = now + drain_grace)
+   and its (day, bucket) discovery projection row
+2. CAS the pointer back to ACTIVE
+```
+
+An unconfirmed enqueue forbids the CAS. Making it unconditional costs one wasted
+revalidation when references do exist — the scanner revalidates canonical state and
+deletes a candidate that no longer applies — and buys the guarantee in the case that
+matters. Conditioning it on a reference count read would reintroduce a decision the
+operator path has no reason to make.
+
+This adds no Paxos, no table, and no new work identity: it reuses
+`gc_block_candidate` and the discovery projection the escape path already writes.
+
 ## Recovery Protocol
 
 `gc_s3_orphans` is a retry/discovery projection, not the only source of truth.
@@ -2999,9 +3383,12 @@ materializer in any application DC. `gc_generation_zero_ref_by_day` is different
 sole publisher is that designated scanner when it hands off an intent that won
 activation but published no reference. It is therefore GC-owned, along with
 candidate, retirement-handoff, and delete-work projections; those families are
-created and consumed in the designated GC DC and remain `LOCAL_QUORUM`. A projection
-family may not be moved from one ownership class to the other without changing its
-read consistency and its acceptance tests.
+created and consumed in the designated GC DC and remain `LOCAL_QUORUM`. Quarantine
+work is the exception: any application/request path may discover it, so the durable
+row is handed off to and confirmed in the designated GC DC before pointer or
+generation mutation, and the scanner then owns it locally. A projection family may
+not be moved from one ownership class to the other without changing its read
+consistency and acceptance tests.
 
 The required projections and their branches are:
 
@@ -3009,14 +3396,16 @@ The required projections and their branches are:
 |---|---|
 | expired materialization intents | two branches, not one: `materialization_state=MATERIALIZING` past its deadline, **and** a materializer use that expired with no published reference. Both are reached from the same row, because the intent owns the generation until a reference, zero-ref work, or orphan work takes over |
 | zero-reference active generations | the pointer selects G, no reference and no live use exist, because a materializer died after activation. Its only publisher is the worker that retires the materialization intent without finding a reference. It does **not** cover the `RETIRING -> ACTIVE` escape — see below |
-| retirement handoff | evidence exists for the authorizing claim while `blocks.active_state` is still `RETIRING` — the crash between the evidence append and the pointer CAS. A `RETIRED` pointer with no such evidence is **not** a recovery branch: it is a protocol violation routed to quarantine |
+| retirement handoff | evidence exists for the authorizing claim while `blocks.active_state` is still `RETIRING` — the crash between the evidence append and the pointer CAS. A `RETIRED/GC_RETIRE` pointer with no such evidence is **not** a recovery branch: it is a protocol violation routed to quarantine |
 | pending physical delete | `gc_state=DELETING` with no orphan row, or with an orphan row in `pending_s3`, or whose S3 delete completed but metadata cleanup did not |
+| pending quarantine | a proven contradiction has durable work but its active-pointer quarantine fence, use drain, generation-row `SERIAL + ALL` transition, or exact visibility reaffirmation has not completed |
 
-The table has **four** rows because the schema below defines four tables. An earlier
-revision listed "expired materializer uses" as a fifth projection, which correction
-109 removed as redundant without removing its row — leaving a table that promised one
-more projection than the design has. Its branch is real and is recovered through the
-intent row; only the separate projection is gone.
+The table has **five** rows because the schema below defines five recovery tables. The
+reverse-reference table is a separate liveness projection, making six named projection
+families overall. The fifth recovery table is now quarantine work, not the removed
+materializer-use projection. An earlier revision
+listed "expired materializer uses" as a fifth projection; correction 109 removed it as
+redundant because its branch is recovered through the intent row.
 
 An earlier revision also listed the `RETIRING -> ACTIVE` escape under the
 zero-reference projection, calling it a backstop behind the delayed candidate. It
@@ -3050,8 +3439,10 @@ gc_generation_intents_by_day        -- materialization in flight, from before th
 gc_generation_zero_ref_by_day       -- ACTIVE with no reference and no live use
 gc_generation_handoff_by_day        -- retirement handoff in progress
 gc_generation_deletes_by_day        -- pending physical delete work
+    gc_generation_quarantines_by_day    -- proven contradiction awaiting handoff,
+                                        writer fence, use drain, or globally visible quarantine
 
-base key, for the three whose subject is the generation itself:
+base key, for the four whose subject is the generation itself:
     PRIMARY KEY ((due_day, bucket), due_at, org_id, block_id, generation_id)
     WITH CLUSTERING ORDER BY (due_at ASC, org_id ASC, block_id ASC,
                               generation_id ASC)
@@ -3059,6 +3450,14 @@ base key, for the three whose subject is the generation itself:
 gc_generation_handoff_by_day adds retire_claim_epoch:
     PRIMARY KEY ((due_day, bucket), due_at, org_id, block_id, generation_id,
                  retire_claim_epoch)
+
+gc_generation_quarantines_by_day adds quarantine_operation_id and carries
+resolution_state/resolution identity:
+    PRIMARY KEY ((due_day, bucket), due_at, org_id, block_id, generation_id,
+                 quarantine_operation_id)
+    resolution_state       -- OPEN, RESOLVED, or REJECTED; never implicit
+    resolved_by
+    resolved_at
 ```
 
 The extra clustering column is not decoration. A generation can travel
@@ -3078,6 +3477,17 @@ The canonical use row's TTL is then free to expire without hiding anything.
 land in a future day partition exactly as the delayed candidate does. Each row
 carries the exact `storage_key` and `storage_class` so the worker can act without
 re-deriving anything from the logical ID.
+
+Quarantine work additionally carries the immutable contradiction identity and
+evidence digest, `quarantine_reason`, observation timestamp, and operation ID. It is
+published and confirmed before any pointer or generation mutation. Its scanner
+settles/retries the same logical operation after coordinator death. The row is not
+physically retired merely because the generation is globally `QUARANTINED` and any
+pointer that selected it is durably `RETIRING` under a quarantine-kind claim; it
+remains as a terminal-resolution tombstone until an operator marks it `RESOLVED` or
+`REJECTED` and any pointer cleanup is complete. An operator resolution first
+sets `resolution_state` conditionally against the full operation/evidence identity;
+the scanner observes `RESOLVED` or `REJECTED` and never reopens that row.
 
 `gc_generation_deletes_by_day` is also the durable discovery record required by
 Discoverability Before Irreversibility: it is written and confirmed before the
@@ -3123,11 +3533,11 @@ recovery guarantee.
 
 ### The Reference Family Is Not Optional, And Was Closed Once Already
 
-The provisional-reference row is the fifth family, and it is the one that had to be
-recovered rather than derived: replacing the universal "same logged batch as the
-canonical row" phrasing with a per-family list dropped it, because the four families
-that got written down are the four the generation fence introduces. This one is
-inherited, and it is already a **closed finding** on `main`:
+The provisional-reference row is the inherited reference family, and it is the one
+that had to be recovered rather than derived: replacing the universal "same logged
+batch as the canonical row" phrasing with a per-family list dropped it, because the
+recovery families that got written down were only those the generation fence
+introduced. It is already a **closed finding** on `main`:
 
 > F10 — "Provisional reference and its expiry were written separately, so a failure
 > between them left an undiscoverable reference." Closed by PR-8
@@ -3157,7 +3567,7 @@ nothing able to find it"
 
 Two shapes can satisfy the invariant in principle, but this contract selects the
 existing logged-batch shape. The rejected ordering-only alternative has a race the
-other four families do not have. Their projections are
+other GC/recovery families do not have. Their projections are
 consumed by a scanner that revalidates canonical state and deletes a projection whose
 branch no longer matches — which is exactly the wrong behaviour here:
 
@@ -3290,6 +3700,7 @@ before the predecessor is retired:
 | `RETIRING -> ACTIVE` (escape) | the delayed candidate, published **before** the CAS | after the CAS commits |
 | `RETIRING -> RETIRED` | `gc_generation_handoff_by_day`, published **before** the pointer CAS | after `gc_generation_deletes_by_day` is confirmed |
 | `gc_state = null -> DELETING` | `gc_generation_deletes_by_day`, published **before** the CAS | after `DELETED` |
+| `RETIRING/QUARANTINE -> ACTIVE` and `RETIRED/QUARANTINE -> ACTIVE` (operator resolution) | the quarantine work row throughout, **plus** a delayed candidate and its discovery projection published **before** the pointer CAS | the quarantine work row is retired only after the pointer CAS is confirmed and the work is marked `RESOLVED` |
 
 The materializer side needs the same table, and it was the half that stayed
 implicit:
@@ -3322,7 +3733,7 @@ The rule that ties them together, and the one an implementer must not optimize a
 
 `gc_generation_handoff_by_day` is what makes the `RETIRING -> RETIRED` seam
 survivable: it is published before the pointer CAS, so the crash window in which
-`blocks` reads `G1 / RETIRED` with valid evidence and no delete work yet is covered
+`blocks` reads `G1 / RETIRED/GC_RETIRE` with valid evidence and no delete work yet is covered
 by a row that already exists. Its scanner revalidates canonical state, so publishing
 it for a retirement that then reactivates instead costs one wasted revalidation.
 
@@ -3388,6 +3799,7 @@ active_epoch
 retire_claim_id
 retire_claim_epoch
 retire_claim_deadline
+retire_claim_kind
 ```
 
 The logical `blocks` row is not deleted when one physical generation is collected.
@@ -3438,6 +3850,8 @@ block_generations
     delete_authorized_at
     quarantined_at
     quarantine_reason
+    quarantine_operation_id
+    quarantine_evidence_digest
     created_at
     updated_at
     PRIMARY KEY ((org_id, block_id, generation_id))
@@ -3492,8 +3906,35 @@ state and either loops or, worse, resolves it differently. A quarantined generat
 
 - is excluded from candidate discovery, from the queue, and from every delete path;
 - keeps its `storage_key` and `storage_class` so an operator can inspect the object;
+- keeps `quarantine_operation_id` and `quarantine_evidence_digest` so operator
+  resolution is tied to the exact contradiction that caused the terminal state;
+- its quarantine work row has a terminal `resolution_state` of `OPEN`, `RESOLVED`,
+  or `REJECTED`, with the resolving operation, actor, and timestamp. Scanners must
+  confirm this state before retrying and must never reopen `RESOLVED` or `REJECTED`
+  work;
 - is never transitioned out of `QUARANTINED` by any automated path, only by explicit
-  operator action;
+  operator action. Resolution is an audited workflow. If the operator proves the
+  exact `(G, K, operation_id, evidence_digest)` contradiction was false, first clear
+  `gc_state` with a conditional `QUARANTINED -> null` update at `SERIAL + ALL` that
+  requires `materialization_state=VERIFIED` and fresh exact-object verification. If
+  the pointer still carries the matching `RETIRING/QUARANTINE` claim, then clear its
+  claim columns and return it to `ACTIVE` with a conditional `SERIAL + ALL` LWT. If
+  the pointer is `RETIRED/QUARANTINE`, return it to `ACTIVE` with a conditional
+  `SERIAL + ALL` LWT matching the retained quarantine claim and retaining its
+  incremented claim epoch. The generation-row step precedes the pointer step, so no
+  writer can observe an active pointer to a still-quarantined generation. **Both
+  pointer-return forms must publish and confirm a delayed candidate and its discovery
+  projection before their CAS, and an unconfirmed enqueue forbids the CAS**; see
+  Operator Reactivation Needs The Same Delayed Candidate. Only after
+  those required pointer steps are confirmed does the operator mark the work
+  `RESOLVED` with a conditional update matching the full identity. If a coordinator
+  dies before that final marker, the work remains `OPEN` and the scanner resumes the
+  same exact operation; it must not retire the work while pointer cleanup is pending.
+  If the contradiction is confirmed, mark the work `REJECTED` and retain
+  `QUARANTINED`. If any identity or condition does not match, retain quarantine and
+  require a new audited resolution; no operator action may authorize deletion
+  implicitly. The scanner must see a terminal work state before retiring the work
+  record or accepting any retry.
 - is surfaced by a metric and an audit event, because a quarantine means the
   protocol hit a state it could not prove safe.
 
@@ -3615,10 +4056,10 @@ arrives at the drain with a tombstone-dominated partition, and crossing
 Without an explicit escape, the consequence would be worse than a stalled collection:
 
 ```text
-step 5, first branch:  any read error / DC unavailable
+step 5, first branch:  any read error / DC unavailable (GC_RETIRE)
     -> no evidence, no delete
     -> confirm delayed candidate
-    -> RETIRING -> ACTIVE when the pointer LWT is available
+    -> RETIRING/GC_RETIRE -> ACTIVE when the pointer LWT is available
 ```
 
 The error branch deliberately does not need to know whether references or uses exist:
@@ -3870,29 +4311,53 @@ measurements are separate, and merging the document does not close the second:
 
 ```text
 ADR frozen        the protocol is settled; no further design changes expected
-Phase 0 complete  one selected paxos_variant target, every eligible node's
-                  build/variant identity, activation critical path, writer lifetime,
-                  upload-to-commit window and GC throughput are MEASURED
+Phase 0 complete  0a measurements complete; 0b records an explicit GO decision for
+                  one selected paxos_variant target, every eligible node's
+                  build/variant identity, foreground SLOs, writer lifetime,
+                  upload-to-commit window, tombstone envelope and GC throughput
 ```
 
-Every margin, deadline and TTL in this document is a parameter derived from those
-measurements. A merge that freezes the design must say so explicitly rather than
-letting "PR-0 merged" be read as "Phase 0 done"; PR-1 may begin on the frozen schema
-decisions, but no numeric parameter is fixed until the measurements exist.
+Every safety deadline and TTL in this document is derived from **enforced protocol
+bounds**, not an observed maximum: request/server operation deadlines, S3/Cassandra
+timeouts, retry-count and cumulative-backoff ceilings, upload-session expiry,
+publish/repair deadlines, cancellation behavior, clock skew, and an explicit margin.
+Measurements validate SLOs and choose headroom inside those hard bounds; a load test
+cannot prove a maximum. A merge that freezes the design must say so explicitly rather than
+letting "PR-0 merged" be read as "Phase 0 done". PR-1 may prototype against the
+frozen schema decisions, but it must not merge until Phase 0b records GO; no numeric
+parameter is fixed until the measurements exist.
 
-Before implementation, PR-0/Phase 0 must measure two different windows and must not
-collapse them into one number:
+Phase 0 has two explicit products:
 
-- the maximum real **single-request** writer lifetime for every funnel, including S3
-  upload, metadata, reference publication, retry, publish repair, and client
-  cancellation. This sets the authority deadline and, through it,
-  `retention_expires_at`;
-- the maximum real **upload-to-commit** window, which sets the provisional
-  reference TTL. See Provisional Reference Lifetime Bounds The Upload-To-Commit
-  Window.
+- **0a, prototype and measurements:** a disposable generation schema/query/load
+  harness, exact engine semantics and identity, per-funnel writer/LWT inventory,
+  three-DC foreground latency and throughput, validation of every enforced lifetime/
+  TTL bound, storage and clock gates, use/reference churn, tombstone behavior, and GC
+  capacity. The disposable prototype is required to measure the proposed “after”
+  query plan before PR-1 merges; it is not a production migration;
+- **0b, go/no-go:** compare those measurements to predeclared endpoint SLOs, timeout
+  headroom, Cassandra QPS/capacity, repair/compaction limits, and the delivery budget.
+  A semantic mismatch, unbounded writer funnel, unreadable qualification-envelope
+  partition, or
+  foreground SLO failure is NO-GO for merging PR-1. The response is to change the
+  deployment target, capacity/concurrency plan, or schedule and remeasure, never to
+  weaken `SERIAL`, `ALL`, `EACH_QUORUM`, or the positive usability predicate.
 
-All safety margins are parameters derived from that inventory, not guessed
-constants.
+Before implementation, PR-0/Phase 0 must define, enforce in the disposable prototype,
+and fault-test two different bounds; it must not infer either from the largest sample
+or collapse them into one number:
+
+- the enforced **single-operation writer bound** for every funnel, including S3
+  upload, metadata, reference publication, retry/backoff, server-side cancellation,
+  and any separately authorized publish repair. This sets the authority deadline and,
+  through it, `retention_expires_at`;
+- the enforced **upload-to-commit bound**, including upload-session expiry and every
+  permitted client/server commit retry. This sets the provisional reference TTL. See
+  Provisional Reference Lifetime Bounds The Upload-To-Commit Window.
+
+Fault injection must prove operations cannot continue after those bounds. All safety
+margins are computed from that enforced inventory plus clock/operation headroom, not
+guessed constants or observed maxima.
 
 PR-0 must also measure the deployed `paxos_variant`, the complete activation critical
 path (retirement-evidence `EACH_QUORUM` read plus activation `SERIAL + EACH_QUORUM`
@@ -3902,19 +4367,54 @@ Those numbers justify the inline decision and the worker capacity; without them 
 inline-versus-background and serial-versus-concurrency questions can only be
 asserted.
 
-Phase 0 also records the authoritative time service, maximum observed application and
+The foreground side is equally mandatory. From every application region, Phase 0
+measures the existing first-writer `blocks` LWT and every unrelated option-A LWT at
+p50/p95/p99/error rate under forecast concurrency. It runs representative new-content
+and deduplicated uploads, including a 1 GiB payload at the block size and concurrency
+used by each supported funnel. The result records two different costs:
+
+- CQL statement amplification per block before/after, and aggregate Cassandra QPS at
+  each declared workload/concurrency point, including use-row
+  insert/authorization/delete and projection/reference work;
+- serial critical-path stages after safe parallelism, read reuse, and coalescing.
+
+The probe fast path can remove a non-applying metadata LWT only when a complete
+existing row is observed. It cannot remove consensus for first upload of new content,
+a first-writer race, or rematerialization. Existing browser, sync, and resumable
+concurrency is measured and bounded first; PR-3 adds a shared materialization admission
+budget only if traces show driver saturation, timeout amplification, or SLO failure
+that existing per-funnel limits cannot control. It must never serialize unrelated
+block partitions fleet-wide merely to hide WAN latency.
+
+Phase 0 also declares a finite qualification envelope before testing: maximum live
+references and renewals per generation, use/reference write rate, partition age and
+size, maximum enforced repair outage, compaction backlog, and safety headroom. It then
+load-tests that envelope through the selected compaction, `gc_grace_seconds`, repair
+cadence, and whole-partition `EACH_QUORUM` reads. If production cannot enforce or
+capacity-plan that envelope, the schema must gain bounded rollover/another proof
+before GO. The criterion is not merely that errors retain data: reads stay below
+declared tombstone warning/failure thresholds with repair and capacity headroom.
+
+Phase 0 also records `paxos_state_purging` on every joined cluster node, confirms that
+no generation-fence LWT uses commit consistency `ANY` or `LOCAL_QUORUM`, and records
+any recurring Paxos repair obligation and irreversible non-legacy transition. It
+records the authoritative time service, maximum observed application and
 Cassandra clock offset/drift, the selected `generation_fence_max_clock_skew`, and the
 attestation freshness limit. It verifies authoritative storage-class resolution and
 connectivity from `dc-na`, `dc-eu`, and `dc-asia`. Finally, it pins source-level
-evidence for Cassandra 5.0.6 Paxos v2's aggregate LWT commit callback and measures the
+  evidence for Cassandra 5.0.9 Paxos v2's aggregate LWT commit callback and measures the
 `SERIAL + ALL` retirement fence separately from the `SERIAL + EACH_QUORUM`
 activation path.
 
-PR-0 must select one `generation_fence_paxos_variant` target from the Cassandra 5.0.6
+  PR-0 must select one `generation_fence_paxos_variant` target from the Cassandra 5.0.9
 semantic set `{v1, v2}`, record the image digest or artifact checksum for the exact
 audited build, and verify that every generation-fence participant node reports both
 that build identity and that selected target. A release-version check alone is not
 enough, and a mixed `{v1, v2}` deployment is not an accepted writer-mode state.
+Phase 0b also replaces the uncalibrated delivery reserve below with a line-item
+estimate for remaining schema, implementation, integration, operations, rollout,
+review/rework, and contingency. No implementation schedule is approved before that
+rebaseline.
 
 ### PR-1: Final Greenfield Schema And Models
 
@@ -3928,7 +4428,8 @@ Includes the append-only retirement-evidence table, the `QUARANTINED` state, the
 `(expiry_day, bucket)` partitioning for the provisional-expiry projection, and
 positive-predicate generation-aware claims that cannot create stub rows. The
 migration must include
-bounded recovery projections for `MATERIALIZING` and `gc_state=DELETING`, and an
+bounded recovery projections for `MATERIALIZING`, pending quarantine, and
+`gc_state=DELETING`, the immutable pointer `retire_claim_kind`, and an
 explicit tombstone/compaction policy for the high-churn use table.
 
 Several schema decisions must be settled here rather than deferred, because each has
@@ -3959,7 +4460,7 @@ already been got wrong once:
   a fixed count. This is a separate exercise from the use table's policy and has a
   different failure mode: a read that trips `tombstone_failure_threshold` blocks
   collection, publishes no evidence, and takes the delayed-candidate
-  `RETIRING -> ACTIVE` escape. Compaction remains required for reclamation capacity,
+  `RETIRING/GC_RETIRE -> ACTIVE` escape. Compaction remains required for reclamation capacity,
   but unreadability cannot be the only exit from the writer fence;
 - `gc_provisional_generation_refs_by_day` carries **no TTL** and is retired by its
   scanner, matching the predecessor it replaces.
@@ -3978,21 +4479,25 @@ one of them cannot do the others' job:
 Startup assertion (configuration and cluster state):
     NetworkTopologyStrategy
     exact configured DC set, and positive RF per DC
+    no pending Cassandra topology/range/RF mutation
     every generation-fence participant node reports the selected
     generation_fence_paxos_variant target (chosen from `{v1, v2}` for the pinned
-    5.0.6 build)
-    session serial default matches the option chosen below
+    5.0.9 build)
+    session serial default is SERIAL
     fresh in-bound clock-health attestations
     authoritative storage targets reachable from every application region
 
 Deployment assertion (orchestration state):
     every block writer is generation-capable
     no deterministic-key or legacy-reference writer can receive traffic
+    no in-flight or durable legacy operation can resume an old-schema write
 
 Code invariant (one helper, no raw statements):
     every blocks-partition LWT is issued through one constructor
     that sets the serial level explicitly
     ACTIVE -> RETIRING and its ambiguity reaffirmation commit at ALL
+    null -> QUARANTINED and its ambiguity reaffirmation commit at ALL
+    no generation-fence LWT commit uses ANY or LOCAL_QUORUM
 
 Test and inventory (what startup cannot see):
     every LWT in the Current Code Evidence inventory has an effective
@@ -4022,8 +4527,17 @@ generation-managed `blocks` statement.
 
 PR-2 additionally owns the split projection helpers: writer-originated recovery and
 expiry scans are explicit `EACH_QUORUM` reads, while GC-owned projections remain
-local to the designated GC DC. A generic projection reader that silently inherits the
-session's `LOCAL_QUORUM` is not acceptable for the writer-originated families.
+local to the designated GC DC. Quarantine work is handed off to that DC and
+confirmed there before mutation, because its discovery may originate in any writer
+DC. A generic projection reader that silently inherits the session's `LOCAL_QUORUM`
+is not acceptable for the writer-originated families.
+
+PR-2 also implements the maintenance interlock: a durable cluster-wide
+topology-maintenance marker is acquired before any Cassandra topology mutation and
+confirmed before admission is drained. Pending ranges, joining/leaving/moving nodes,
+configured-versus-actual token/DC/rack/RF drift, or that active marker make writer
+mode and destructive GC ineligible. The operational runbook owns the Cassandra
+command sequence; application code owns refusing to serve through the transition.
 
 ### PR-3: Generation Allocation And Materialization
 
@@ -4061,8 +4575,8 @@ compiler prevents two liveness sources from coexisting.
 It also carries the provisional-reference publication rule. F10 is a closed finding
 on `main`, and the generation-aware rewrite is the one place it can be reopened: the
 expiry projection is confirmed before the reference row, or both go in one logged
-  batch as they do today. PR-5 keeps that selected shape and the existing atomicity
-  test's intent, generation-bound.
+batch as they do today. PR-5 keeps that selected shape and the existing atomicity
+test's intent, generation-bound.
 
 ### PR-6: Retiring GC And Claim Leases
 
@@ -4071,14 +4585,22 @@ order, claim epoch/deadline takeover, append-only retirement evidence, `RETIRED`
 generation `gc_state=DELETING/DELETED`, `QUARANTINED`, and exact-key deletion.
 
 The drain reads uses before references — see Read Order Is Not Decision Order — and
-implements the `RETIRING -> ACTIVE` escape on expired-authority uses. Unexpired
-`PENDING` uses keep the fence. Ambiguous pointer LWTs are settled in the serial
+implements the `RETIRING/GC_RETIRE -> ACTIVE` escape on expired-authority uses.
+Unexpired `PENDING` uses keep the fence. A `RETIRING/QUARANTINE` claim has no
+reactivation escape. Ambiguous pointer LWTs are settled in the serial
 Paxos domain and then complete the exact `SERIAL + ALL` visibility reaffirmation
 before the drain. A normal claim also commits at `ALL`. Read errors publish a delayed
-candidate and attempt the retention-safe `RETIRING -> ACTIVE` escape; they never
+candidate and attempt the retention-safe `RETIRING/GC_RETIRE -> ACTIVE` escape; they never
 append evidence and never remain the only path out of the writer fence. The
 retirement handoff writes epoch-stamped evidence before the pointer CAS and never
 authorizes `DELETING` from the generation row alone.
+Every quarantine first publishes its durable work. If the generation is
+pointer-selected `ACTIVE`, PR-6 acquires `RETIRING/QUARANTINE` at `SERIAL + ALL`,
+drains uses at `EACH_QUORUM` without permitting publication or delete, and only then
+transitions the generation at `SERIAL + ALL`. An ambiguous quarantine settles the
+exact generation partition serially and then completes its exact identity
+reaffirmation at `SERIAL + ALL`; the durable work and pointer fence make every crash
+window recoverable.
 PR-6 must also implement bounded worker concurrency and a measured queue-throughput
 target; a serial queue is not an adequate capacity plan for the global cold path.
 
@@ -4107,7 +4629,8 @@ a losing orphan. Ordinary `EACH_QUORUM` pointer reads never classify activation.
 ### PR-8: Verification And Activation Gate
 
 Add unit, race, exact three-DC RF1/RF3, DC outage, clock fault, storage readability,
-crash, delayed-delete, and coordinated greenfield rollout tests. Keep
+quarantine visibility, topology-maintenance interlock, legacy-work drain, crash,
+delayed-delete, and coordinated greenfield rollout tests. Keep
 `GC_ENABLED=false` until all acceptance checks pass.
 
 ## Verification Plan
@@ -4118,28 +4641,32 @@ Required cases include:
 
 - ambiguous `BeginPin` never permits S3 use;
 - `PENDING` pin confirmation and revalidation race with `RETIRING`;
-- an `AUTHORIZED` pin can finish and publish while the pointer is `RETIRING`;
+- an `AUTHORIZED` pin can finish and publish across a normal `GC_RETIRE` pointer
+  fence, while a `QUARANTINE` fence revokes publication and drains the use;
 - a `PENDING` pin cannot publish after observing `RETIRING`;
-- any generation-bound reference reactivates a generation;
-- a use holding live authority never reactivates a generation; it extends the drain;
-- a generation with one or more remaining uses, all of which have expired their
-  authority, is reactivated rather than parked, so an abandoned pin cannot make a
-  block unwritable for its full `retention_expires_at` window;
+- any generation-bound reference reactivates a `GC_RETIRE` generation;
+  a `QUARANTINE` claim never reactivates automatically;
+- a use holding live authority never reactivates a `GC_RETIRE` generation; it extends
+  the drain, and neither live nor expired uses reactivate a `QUARANTINE` claim;
+- a `GC_RETIRE` generation with one or more remaining uses, all of which have expired
+  their authority, is reactivated rather than parked, so an abandoned pin cannot make
+  a block unwritable for its full `retention_expires_at` window;
 - zero uses follows the retirement branch rather than the expired-use reactivation
   branch; the "every use expired" predicate must not match an empty set;
 - a reactivation on expired-authority uses writes and confirms its delayed candidate
   and discovery projection **before** the CAS; an unconfirmed enqueue keeps the
   generation `RETIRING` and performs no CAS at all;
 - a use/reference read error, including `tombstone_failure_threshold`, writes and
-  confirms the same delayed candidate before attempting `RETIRING -> ACTIVE`; it
-  creates no retirement evidence, and once pointer LWTs are available the block is
-  writable even if the reference partition remains unreadable;
+  confirms the same delayed candidate before attempting `RETIRING/GC_RETIRE -> ACTIVE`;
+  it creates no retirement evidence, and once pointer LWTs are available the block is
+  writable even if the reference partition remains unreadable; a quarantine claim
+  remains fenced;
 - the GC reads uses **before** references, and a test asserts the unsafe ordering
   fails: with refs read first, a writer holding an `AUTHORIZED` use that publishes
   and releases between the two reads must be caught, not silently accepted;
 - provisional references do not create a full-retention-TTL availability stall;
-- with both a reference and a live use present, the generation reactivates rather
-  than parking in `RETIRING`;
+- with both a reference and a live use present, a `GC_RETIRE` generation reactivates
+  rather than parking in `RETIRING`; a quarantine claim remains fenced;
 - deadline expiry rejects publication;
 - a writer whose `authority_deadline` passed while it was stalled cannot authorize
   its `PENDING` pin, even when the pointer reads `ACTIVE` with the same generation
@@ -4160,6 +4687,11 @@ Required cases include:
   a crash immediately after it leaves at most a stale candidate that the scanner
   revalidates and discards; a future-dated candidate is not processed before
   `candidate_at`;
+- under RF3/Paxos v2, `GC_RETIRE` reference-found, expired-use, and read-error
+  `RETIRING -> ACTIVE` transitions may acknowledge from six aggregate responses while
+  one DC remains stale at `RETIRING`; that DC rejects authorization until hints,
+  repair, or a later pointer LWT converges it, and no branch treats the stale state as
+  delete authority;
 - writers observing `RETIRING` stop after a bounded retry budget and return a
   documented retryable result;
 - ambiguous authorization confirmed only by `use_id` existence is rejected; the
@@ -4177,12 +4709,37 @@ Required cases include:
   result is injected after the ambiguous retry and is rejected as a classifier until
   `SELECT ... CONSISTENCY SERIAL` settles the partition;
 - an ambiguous `ACTIVE -> RETIRING` LWT is settled in the `SERIAL` Paxos domain
-  and then reasserts the exact `RETIRING/G/E/C/N` tuple at `SERIAL + ALL` before any
+  and then reasserts the exact `RETIRING/G/E/C/N/KIND` tuple at `SERIAL + ALL` before any
   use/reference drain; an ordinary `EACH_QUORUM` read returning `ACTIVE`, or an
   ambiguous/non-applied reaffirmation, never opens the drain;
 - a normal acknowledged `ACTIVE -> RETIRING` also commits at `ALL`; under Paxos v2
   and RF3 the test withholds one DC and proves an aggregate `EACH_QUORUM` response
   would be insufficient while `ALL` fails closed;
+- a pointer-selected `ACTIVE` generation cannot become globally established
+  `QUARANTINED` at requested `EACH_QUORUM`: under Paxos v2/RF3 the test withholds one
+  DC, proves six aggregate acknowledgements would leave its `LOCAL_QUORUM` writer
+  permissive, and verifies the durable quarantine work remains while the required
+  `RETIRING/QUARANTINE` pointer fence at `SERIAL + ALL` fails closed;
+- an ambiguous quarantine is classified only by `SELECT ... CONSISTENCY SERIAL` on
+  the exact generation partition and then reaffirms the exact `QUARANTINED/G/K/R/T/D`
+  tuple at `SERIAL + ALL`; unavailable, non-applied, or ambiguous reaffirmation keeps
+  the pointer fence and durable work for retry;
+- an ambiguous `DELETING` result settles to the exact generation/key and recorded
+  delete claim before retry or work retirement; a matching `DELETED` result requires
+  exact-key absence, and a conflicting terminal state never advances;
+- coordinator death after quarantine-work publication but before the pointer fence,
+  after the fence but during the use drain, and after the generation mutation but
+  before work retirement all resume the same operation without scan or delete;
+- a second quarantine request encountering an existing `RETIRING/QUARANTINE` claim
+  coalesces on the exact operation/evidence identity and does not install a second
+  claim; a request encountering `RETIRING/GC_RETIRE` settles that claim and never
+  overwrites it while its owner is live;
+- a pending activation that could select the generation under quarantine is settled
+  serially before the generation mutation; the materializer use is re-confirmed at
+  the activation CAS boundary, the currently selected `ACTIVE` pointer is fenced or
+  a retained `RETIRED/GC_RETIRE` pointer is converted to a matching `QUARANTINE` claim, and an
+  uncertain or non-applied settlement retains the quarantine work and performs no
+  mutation;
 - a rematerialization persists G2's predecessor tuple before activation, and the
   activation CAS requires `G1`, `E1`, the retire claim ID, and the retire claim
   epoch from that tuple;
@@ -4206,7 +4763,7 @@ Required cases include:
   cannot publish;
 - a lost step-2 retirement persist **under a `RETIRING` pointer** is detected and the
   global zero check re-runs; the scope is load-bearing, because the same absence
-  under a `RETIRED` pointer must never re-run it — see the quarantine cases below;
+  under a `RETIRED/GC_RETIRE` pointer must never re-run it — see the quarantine cases below;
 - `pointer=RETIRING` plus a matching claim evidence row **never reaches
   `DELETING`**: assert no `DELETING` transition, no `DeleteObject`, no G2
   activation, and that the global zero check re-runs before the pointer CAS
@@ -4255,7 +4812,9 @@ Required cases include:
   that ageing it at that moment would strand `K1` in fail-closed;
 - the claim-column lifecycle holds across `RETIRING -> ACTIVE` and the activation
   CAS: `retire_claim_epoch` never decreases or resets, while `retire_claim_id` and
-  `retire_claim_deadline` are null whenever the pointer reads `ACTIVE`;
+  `retire_claim_deadline`/`retire_claim_kind` are null whenever the pointer reads
+  `ACTIVE`; takeover preserves the existing kind and normal reactivation/retirement
+  requires `GC_RETIRE`; quarantine retains its operation/evidence identity;
 - a materializer whose intent write is ambiguous confirms the intent before writing
   its use, and never PUTs or activates with an unconfirmed intent;
 - no recovery branch queries a pointer state on `block_generations`, and every
@@ -4278,7 +4837,7 @@ Required cases include:
   serially before any orphan decision, and a test asserts `K2` is not deleted when
   the replayed proposal later makes G2 the pointer;
 - recovery never activates a generation whose materializer authority has expired,
-  even when the settled pointer still reads `G1 / RETIRED`;
+  even when the settled pointer still reads `G1 / RETIRED/GC_RETIRE`;
 - startup fails when `paxos_variant` drops linearizable reads under generation-fence
   writer mode, including with `gc.enabled=false`;
 - a crash between the `DELETING` CAS and the orphan projection, and a crash between
@@ -4341,7 +4900,7 @@ Required cases include:
 - a generation that retires, reactivates, and retires again writes its evidence rows
   to distinct partitions, and every consumer reaches them by point lookup on the
   authorizing `(G, N)` rather than by enumerating a generation's cycles;
-- a `RETIRED` pointer whose authorizing evidence is absent is quarantined, and a test
+- a `RETIRED/GC_RETIRE` pointer whose authorizing evidence is absent is quarantined, and a test
   asserts that no path re-runs the zero check and appends evidence for it: the
   synthetic-proof route must fail the test, not merely be undocumented;
 - the same absence under a `RETIRING` pointer is the ordinary in-progress case and
@@ -4358,14 +4917,27 @@ Required cases include:
   statement still deletes correctly, because `RETIRED` has no transition back to
   `ACTIVE` and the pointer can only have moved to a G2 whose activation required
   that worker's own predecessor tuple;
-- a pointer-selected generation whose `gc_state` is `QUARANTINED` rejects new uses
-  and physical operations rather than relying on the pointer state alone;
+- a pointer-selected generation reaches `QUARANTINED` only after durable work, an
+  acknowledged `RETIRING/QUARANTINE` pointer fence, and a zero-use global drain; new
+  uses and physical operations are rejected by both pointer kind and generation state;
+  quarantine work is handed off and confirmed in the designated GC DC before either
+  mutation;
 - a generation quarantined between pin insertion and authorization is rejected
-  before authorization, and one quarantined between authorization and the physical
-  operation is rejected by the final lifecycle-state check;
+  before authorization. If the quarantine pointer fence lands after a prior
+  revalidation, the immediately-before-operation checkpoint detects
+  `RETIRING/QUARANTINE` and starts no PUT/repair; an operation already issued before
+  that checkpoint may finish but cannot be published after the fence and its use is
+  drained. If an exact reference write was already issued after its publish check,
+  the worker preserves that reference/key and performs no delete before globally
+  establishing quarantine;
 - a quarantined generation survives a process restart as `QUARANTINED`, is skipped
   by candidate discovery and every delete path, and is never automatically
-  transitioned out;
+  transitioned out; its resolution matches the persisted quarantine operation ID and
+  evidence digest through an audited operator transition;
+- an operator cannot clear `QUARANTINED` with a reason-only update: the full
+  generation/key/operation/evidence identity is required, the generation-row
+  conditional clears before any matching pointer claim is reactivated, and a
+  confirmed contradiction has no automated or operator shortcut to deletion;
 - a generation whose retirement evidence is unreconstructable is quarantined, never
   deleted;
 - the retirement handoff performs no second global reference check between the
@@ -4395,7 +4967,8 @@ Required cases include:
 - G1 cleanup cannot remove G2 references, mappings, or objects;
 - no physical delete path accepts only logical `blockID`;
 - any global read error prevents deletion and, after publishing a delayed candidate,
-  attempts the retention-safe reactivation escape;
+  attempts the retention-safe `GC_RETIRE` reactivation escape; a quarantine claim
+  remains fenced;
 - activation CAS cannot be satisfied by a condition spanning two Cassandra tables;
 - writer-path tracing shows no fence-added Paxos for pins, revalidation,
   references, reuse, repair authorization, or normal deduplication; the activation
@@ -4409,7 +4982,7 @@ Required cases include:
 - all use rows, including rows whose authority expired but whose retention has not,
   are visible to the drain and are classified by authority rather than ignored;
 - no unconditional statement writes any active-pointer or `retire_claim_*` column;
-- the provisional reference TTL is greater than the measured upload-to-commit
+- the provisional reference TTL is greater than the enforced upload-to-commit
   window, and a commit whose provisional reference expired fails closed with a
   documented error rather than publishing a reference to a dead generation;
 - the publish sequence writes and confirms generation-bound `pub:` references before
@@ -4424,7 +4997,21 @@ Required cases include:
   projection; separate regression tests reject an ordering-only implementation,
   prove the scanner never deletes a not-yet-due row, and inject partial concurrent
   batch visibility so the exact-reference recheck preserves the projection;
-- the `RETIRING -> ACTIVE` escape is recovered by its delayed candidate alone; a test
+- operator quarantine resolution clears `gc_state` **before** the pointer returns to
+  `ACTIVE`, and a test asserts that the reverse order — an `ACTIVE` pointer selecting a
+  still-`QUARANTINED` generation — is never produced by the workflow;
+- both operator pointer-return forms publish and confirm a delayed candidate and its
+  discovery projection **before** the CAS; a test suppresses that enqueue and asserts
+  no CAS occurs, then asserts that a committed operator reactivation is always
+  re-examined without any `block_generations` enumeration. The F10-shaped end state —
+  `ACTIVE`, zero references, no candidate, invisible forever — must be unreachable
+  through the operator path exactly as it is through the abandoned-use escape;
+- a crash injected between the operator's `gc_state` clear and its pointer CAS leaves
+  the quarantine work `OPEN`, and the scanner resumes the same exact operation instead
+  of retiring it or reopening a `RESOLVED`/`REJECTED` row;
+- a `REJECTED` resolution retains `QUARANTINED` and leaves the pointer fenced; a test
+  asserts no automated path later returns that pointer to `ACTIVE`;
+- the `RETIRING/GC_RETIRE -> ACTIVE` escape is recovered by its delayed candidate alone; a test
   asserts that no path publishes `gc_generation_zero_ref_by_day` for that branch and
   that the branch is still recovered without one;
 - a `DELETE K` that fails permanently never retires its delete work row, never
@@ -4445,8 +5032,9 @@ Required cases include:
   `Session().Query` and asserts the inventory test fails — the invariant must not be
   expressible as a startup check alone;
 - the two-DC RF1 regression harness still proves that a whole-DC outage fails a
-  deduplication hit, first materialization, and rematerialization because the Paxos
-  majority is both replicas. The production acceptance matrix does not generalize
+  reusable-row result that reaches metadata materialization, first materialization,
+  and rematerialization because the Paxos majority is both replicas. The production
+  acceptance matrix does not generalize
   that result: at three-DC RF1, losing one DC leaves the global majority for the
   first-writer LWT but not the activation commit; at RF3, Paxos v2 may satisfy its
   aggregate activation commit count from the surviving DCs while v1 cannot. The
@@ -4458,8 +5046,9 @@ Required cases include:
   degraded to `ALLOW FILTERING`, a partial read, or a per-referrer read to work
   around it;
 - forcing that read over `tombstone_failure_threshold` creates no evidence and no
-  delete, and successfully returns the pointer to `ACTIVE` once pointer LWTs are
-  available, even while the reference partition continues to fail;
+  delete, and successfully returns a `GC_RETIRE` pointer to `ACTIVE` once pointer
+  LWTs are available, even while the reference partition continues to fail; a
+  `QUARANTINE` pointer remains fenced;
 - under generation-fence writer mode and a non-`NetworkTopologyStrategy` keyspace, startup
   fails; the process must not run destructive GC where `EACH_QUORUM` reads degrade
   to an ordinary quorum.
@@ -4470,20 +5059,26 @@ Required cases include:
   any reports a `paxos_variant` different from the selected
   `generation_fence_paxos_variant` target; a target-matching bootstrap coordinator
   cannot mask a disallowed replica participant;
-- a newly discovered or rejoined node remains unverified until that exact node's
-  release/build identity, selected `paxos_variant`, and DC/topology membership are
-  verified locally; an unavailable or unverifiable participant makes writer mode
-  unavailable rather than merely removing the node from coordinator selection;
+- the LWT inventory rejects commit consistency `ANY` and `LOCAL_QUORUM`;
+  `legacy`/`gc_grace` purging with the specified `QUORUM`-or-stronger commit levels
+  remains eligible, while `repaired` with a
+  missing or stale recurring Paxos-repair attestation fails its separate operational
+  obligation. A test rejects return to `legacy` after either non-legacy mode;
+- a rejoined node remains unverified until that exact node's release/build identity,
+  selected `paxos_variant`, and DC/topology membership are verified locally; a new or
+  replacement node cannot bootstrap while writer mode is live and follows the full
+  topology-maintenance procedure instead;
 - changing the selected target from `v1` to `v2`, or from `v2` to `v1`, pauses writer
   mode for the recorded SesameFS transition procedure and re-enables it only after
-  every participant node matches the new target; the test/runbook labels the
-  `v1 -> v2` full repair as conservative SesameFS policy and does not require it for
-  the reverse direction. Cassandra 5.0 permits selecting either variant without that
-  prerequisite.
+  every joined Cassandra cluster node matches the new target; the test/runbook records the
+   conflict between the pinned release notes and CASSANDRA-21316/current 5.0 guidance and uses
+   the later full-repair-first procedure whenever v1 LWT history exists. The reverse
+   direction does not require that repair, but topology changes remain prohibited until
+   the selected target is uniform v2.
 
 ### Cassandra Multi-DC Tests
 
-Use the pinned Cassandra `5.0.6` image with `NetworkTopologyStrategy` and **exactly
+Use the pinned Cassandra `5.0.9` image with `NetworkTopologyStrategy` and **exactly
 three DCs** named `dc-na`, `dc-eu`, and `dc-asia`. Run the safety matrix first at RF 1
 per DC and then at RF 3 per DC, with `SERIAL`, not `LOCAL_SERIAL`. Run the protocol
 matrix under both semantically accepted Paxos targets, one uniform target per run;
@@ -4496,7 +5091,7 @@ case. For every row, run with each of `{dc-na, dc-eu, dc-asia}` withheld in turn
 coordinate from each surviving DC. Also run the no-outage success baseline from all
 three coordinator DCs:
 
-| RF per DC | Uniform Paxos target | `SERIAL` phase with one DC withheld | Existing first-writer LWT at `LOCAL_QUORUM` regular commit | Activation requested at `EACH_QUORUM` | Retiring fence requested at `ALL` | Destructive `EACH_QUORUM` reads |
+| RF per DC | Uniform Paxos target | `SERIAL` phase with one DC withheld | Existing first-writer LWT at `QUORUM` regular commit | Activation requested at `EACH_QUORUM` | Retiring fence requested at `ALL` | Destructive `EACH_QUORUM` reads |
 |---:|---|---|---|---|---|---|
 | 1 | v1 | succeeds: 2/3 is a majority | succeeds when coordinated in a surviving DC | fails: commit needs all 3 replicas | fails: commit needs all 3 replicas | fail: one DC quorum is absent |
 | 1 | v2 | succeeds: 2/3 is a majority | succeeds when coordinated in a surviving DC | fails: aggregate commit count is 3 | fails: aggregate commit count is 3 | fail: one DC quorum is absent |
@@ -4509,7 +5104,7 @@ state at `LOCAL_QUORUM`. The RF3/v2 activation-success cell must not be rewritte
 guaranteed failure merely because ordinary `EACH_QUORUM` writes are per-DC.
 
 The harness must query `SELECT release_version FROM system.local` on every Cassandra
-participant and fail unless `release_version=5.0.6`; it must also verify that every
+participant and fail unless `release_version=5.0.9`; it must also verify that every
 image digest or Cassandra artifact checksum matches the Phase-0 pinned build identity.
 Release version alone is not evidence of the exact audited build.
 
@@ -4527,6 +5122,11 @@ Required scenarios:
 - at RF3 under Paxos v2, withhold all responses from one DC and prove that the
   `SERIAL + ALL` fence cannot succeed even though an aggregate threshold shaped like
   `EACH_QUORUM.blockForWrite()` could be met by the other replicas;
+- repeat the omitted-DC shape for a pointer-selected generation's quarantine: an
+  aggregate `EACH_QUORUM` commit is demonstrated insufficient, quarantine work stays
+  durable while the `RETIRING/QUARANTINE` `SERIAL + ALL` pointer fence fails with the
+  DC absent, and restoration allows the fence, use drain, and exact quarantine
+  reaffirmation to complete without delete;
 - inline G2 activation in each DC is visible to GC, and the exact authoritative
   object is immediately readable from all three application regions without waiting
   for asynchronous bucket replication;
@@ -4556,8 +5156,9 @@ Required scenarios:
   evidence is appended before the pointer CAS;
 - retirement evidence from a cycle that was subsequently reactivated is rejected on
   epoch mismatch in a later cycle;
-- an authorized writer publishes after `ACTIVE -> RETIRING` without requiring an
-  atomic state/reference transaction;
+- an authorized writer publishes after a normal `ACTIVE -> RETIRING/GC_RETIRE`
+  transition without requiring an atomic state/reference transaction; the same test
+  proves `RETIRING/QUARANTINE` rejects publication;
 - a provisional `up:`/`pub:` reference causes `RETIRING -> ACTIVE` rather than a
   retention-length availability stall;
 - a writer that crashes holding an `AUTHORIZED` pin causes `RETIRING -> ACTIVE`
@@ -4579,6 +5180,13 @@ Required scenarios:
   authoritative fallback is rejected by writer-mode eligibility;
 - a mixed deployment containing one deterministic-key/legacy-reference writer cannot
   enable writer mode or receive block-write traffic;
+- a cutover with an admitted legacy request or a durable legacy publish/repair job
+  cannot enable writer mode; after those operations are drained, migrated, or
+  cancelled, every eligible node is enabled and verified before traffic reopens;
+- add/bootstrap, replace, move, decommission, RF/DC/rack, and token-layout changes are
+  rejected while writer mode or destructive GC is live; the maintenance rehearsal
+  resumes only after pending ranges/streams clear, required repair completes, and the
+  full post-change participant inventory is reverified;
 - DC outage during retire, drain, final reference check, and deleting claim;
 - no physical delete after any global operation fails;
 - claim takeover after `retire_claim_deadline`;
@@ -4621,7 +5229,7 @@ must raise the `scripts/test.sh` path to match the compose service rather than l
 the same suite time out differently depending on how it is invoked.
 
 The multi-DC harness must run with the generation-fence test profile and
-`CASSANDRA_SERIAL_CONSISTENCY=SERIAL`, pinned to Cassandra `5.0.6`; the existing
+`CASSANDRA_SERIAL_CONSISTENCY=SERIAL`, pinned to Cassandra `5.0.9`; the existing
 replication script alone is not sufficient evidence.
 
 Also verify that:
@@ -4640,22 +5248,32 @@ The greenfield rollout is a coordinated cutover, not a mixed-version rolling wri
 1. Bootstrap the final generation-aware schema on a `NetworkTopologyStrategy`
    keyspace. `SimpleStrategy` is not a supported topology for writer mode or
    destructive GC.
-2. Quiesce external writes. Deploy generation-capable readers and writers everywhere
-   with generation-fence writer mode **off**; they may read the empty greenfield
-   schema but may not create either deterministic or generation-aware blocks yet.
-3. Verify every application writer node, upload funnel, build identity, Cassandra
+2. Close external block-write admission. Drain to completion or cancel every in-flight
+   deterministic-key block PUT, materialization, publish, reuse, and repair operation.
+   Drain, migrate, or explicitly cancel every durable legacy repair, owner, pending,
+   resumable-upload, and publish-work family that could replay a deterministic-key or
+   `block_references` write after restart. Keep traffic quiesced throughout cutover.
+3. Deploy generation-capable readers and writers everywhere with generation-fence
+   writer mode **off**; they may read the empty greenfield schema but may not create
+   either deterministic or generation-aware blocks yet.
+4. Verify every application writer node, upload funnel, build identity, Cassandra
    participant, authoritative storage target, clock-health attestation, serial domain,
    and selected Paxos target. Prove that no deterministic-key or legacy-reference
-   writer remains before any generation-aware write is admitted.
-4. Atomically enable generation-fence writer mode fleet-wide, then reopen writes.
-   A node that missed the cutover remains ineligible and receives no write traffic.
-5. Run dry-run GC with no physical deletion and verify all writer-originated
+   writer remains and that no legacy durable operation can resume. For the greenfield
+   deployment, assert zero deterministic physical block keys, zero legacy liveness
+   rows, and zero replayable legacy upload/materialization jobs.
+5. While writes remain quiesced, enable generation-fence writer mode on every eligible
+   writer and verify that each reports enabled. Remove any missing or failed node from
+   write routing. This is an admission barrier, not an atomic distributed flag
+   transaction. Reopen external writes only after the complete eligible writer set is
+   verified.
+6. Run dry-run GC with no physical deletion and verify all writer-originated
    projections through their `EACH_QUORUM` scanner path.
-6. Run crash, three-DC visibility, RF 1/RF 3, clock-fault, storage-readability, and
+7. Run crash, three-DC visibility, RF 1/RF 3, clock-fault, storage-readability, and
    multi-DC outage tests.
-7. Close X1/X2 only after every acceptance criterion passes, then activate GC only on
+8. Close X1/X2 only after every acceptance criterion passes, then activate GC only on
    designated replicas in one DC.
-8. Keep all other replicas/DCs at `GC_ENABLED=false`.
+9. Keep all other replicas/DCs at `GC_ENABLED=false`.
 
 There is no rollback to a pre-generation writer after UUID keys are in use. Rollback
 must be forward-only: disable destructive GC, deploy a compatible writer, and
@@ -4663,8 +5281,8 @@ preserve generation records and exact keys.
 
 ## Cost And Operational Impact
 
-The greenfield scope removes legacy backfill and dual-read work. The planning range
-is approximately:
+The greenfield scope removes legacy backfill and dual-read work. The table below is
+the **original pre-audit rough breakdown**, retained only for provenance:
 
 | Work area | Estimate |
 |---|---:|
@@ -4677,22 +5295,25 @@ is approximately:
 | Recovery and readers | 4-7 engineer-days |
 | Tests, multi-DC drills, and rollout | 8-12 engineer-days |
 
-Expected total in the original split: **40-65 engineer-days**. With the now-required
-serial-domain gate, ambiguity reconciliation, exact recovery keys, tombstone policy,
-concrete recovery projections, and measured GC concurrency, use **55-75
-engineer-days as the planning reserve** until PR-1 and the first multi-DC prototype
-refine it. This is a planning range, not a measured delivery commitment.
+The previously quoted **40-65 engineer-day** rough range (the table's literal line-item
+sum is 39-62) and the later **55-75 day** reserve are not accepted
+remaining-delivery estimates. They omit separate Phase-0 environment/evidence work,
+continuous participant/topology tooling, writer-load and tombstone qualification,
+the complete RF1/RF3 fault matrix, operational dashboards/runbooks, rollout rehearsal,
+review/rework, and contingency; they also include ADR work already completed. Phase
+0b replaces them with a line-item estimate before PR-1 may merge. Until then there is
+no approved schedule, and neither historical number may be used for staffing or a
+delivery commitment.
 
-The low end of the total remains optimistic. It assumes the writer inventory finds
-no funnel that resists the pin protocol, which the Sync no-DB fallback already
-contradicts.
-
-The complete successful writer protocol has approximately five to six local
-Cassandra interactions per block when pin confirmation, active-pointer
-revalidation, authority validation, reference publication, and pin removal are
-counted. Existing probe/reference work may be reused or coalesced where the same
-query already supplies the observation, so the incremental cost must be measured
-against the current path; it must not be budgeted as only three round trips.
+“Five to six interactions” is also not a defensible total. The existing-active
+sequence alone names at least an initial pointer read, `PENDING` insert, pointer and
+generation revalidation, authorization update, positive-predicate/authority check,
+generation-bound reference publication, and use release; first materialization adds
+three separately confirmed pre-PUT writes, verification, and the first-writer LWT.
+Some observations may be reused or safely parallelized, but they remain Cassandra
+requests. Phase 0 separately records statement amplification per block, aggregate QPS
+at a specified workload/concurrency, and serial critical-path stages per funnel; PR-3
+through PR-5 freeze the final query plan.
 
 The fence adds no **new Paxos operation** to those per-block request operations. It
 creates one logical activation operation per materializing request only when a
@@ -4700,8 +5321,9 @@ previously retired SHA comes back to life. Concurrent operations for the same bl
 may retry physical CAS executions when results are ambiguous, but every retry uses
 the same generation, epoch, and predecessor tuple. The pre-existing upload LWTs
 remain the same operations, but writer mode changes the effective serial domain of
-those that touch `blocks` to the selected global `SERIAL` target; this can change
-their multi-DC coordination cost without adding another LWT.
+those that touch `blocks` to the selected global `SERIAL` target and requires regular
+commit at least `QUORUM`; this changes their multi-DC coordination cost without adding
+another LWT.
 
 Cold-path cost is several global reads/LWTs per candidate and intentional dependence
 on the slowest participating DC. A DC outage causes retention rather than deletion.
@@ -4709,34 +5331,44 @@ The worker must provision bounded concurrency against a measured target; serial
 processing is not an acceptable implicit capacity plan once the per-generation WAN
 rounds are introduced.
 
-That statement needs an order of magnitude, or PR-6 will satisfy it with an
-arbitrary small number. A classic Cassandra LWT is **four** round trips —
-prepare/promise, read of current values, propose/accept, commit — which is exactly
-the count Paxos v2 halves. `paxos_variant` defaults to v1, and nothing in this
-repository sets it. At a 90 ms inter-DC RTT:
+That statement needs an order of magnitude, or PR-6 will satisfy it with an arbitrary
+small number. A classic Cassandra LWT is **four** round trips — prepare/promise, read
+of current values, propose/accept, commit — which is exactly the count Paxos v2
+halves. `paxos_variant` defaults to v1, and nothing in this repository sets it. A
+single WAN RTT cannot model the path: `SERIAL` waits for the required global response
+order statistic, ordinary `EACH_QUORUM` waits for a local quorum in every DC, and
+`ALL` waits for the slowest replica. The following deliberately applies one scalar to
+every phase only as two synthetic sensitivity scenarios for the normal successful
+retirement/delete branch (five LWTs and two reads), not as lower/upper bounds:
 
 ```text
-v1: 5 LWTs x (4 x 90 ms) + 2 EACH_QUORUM reads x 90 ms ~= 2.0 s per generation
-v2: 5 LWTs x (2 x 90 ms) + 2 EACH_QUORUM reads x 90 ms ~= 1.1 s per generation
+90 ms sensitivity:
+    v1: 5 LWTs x (4 x 90 ms) + 2 reads x 90 ms ~= 2.0 s/generation
+    v2: 5 LWTs x (2 x 90 ms) + 2 reads x 90 ms ~= 1.1 s/generation
+
+200-250 ms all-phases synthetic sensitivity for the same simple model:
+    v1 ~= 4.4-5.5 s/generation
+    actual SERIAL phases may complete from a nearer majority, but ALL and ordinary
+    EACH_QUORUM stages still include the slowest required DC/replica
 
 today: gc.batch_size = 100, gc.worker_interval = 30s, and the queue loop in
        internal/gc/worker.go:262 is strictly serial
 
-      100 x 2.0 s = ~200 s per batch against a 30 s tick
+      100 x 2.0 s = ~200 s per synthetic batch
+      100 x 4.4-5.5 s = ~440-550 s per synthetic batch against a 30 s tick
 ```
 
 Real Cassandra traffic does not reduce perfectly to RTT x rounds, so these are
-illustrative bounds rather than predictions — which is precisely why PR-0 measures
+illustrative scenarios rather than predictions or bounds — which is precisely why Phase 0 measures
 `paxos_variant` and the real per-DC latencies instead of reasoning from this table.
 
-So the current worker shape cannot drain its own batch, and the backlog grows
-monotonically rather than degrading gracefully. Sustained throughput falls from the
-present ~3.3 items/s ceiling to under 1 item/s. Purging a 1 TB library at 4 MB
-blocks is ~262k generations: days at serial, hours at 32-way concurrency. PR-0
-measures the real numbers and PR-8 asserts the target; the arithmetic here exists so
-the requirement cannot be read as a nicety. `paxos_variant` is the single lever that
-moves both this figure and the X4 per-block cost, which is why PR-0 measures it
-first.
+So the current worker shape cannot be assumed to drain its own batch. Purging a 1 TB
+library at 4 MB blocks is ~262k generations, but no completion time or concurrency of
+32 is accepted from this scalar model. Phase 0 measures the real service rate and
+selects a supported concurrency while foreground SLOs hold; PR-8 asserts that target.
+The arithmetic exists so capacity cannot be treated as a nicety. Paxos variant is one
+lever, alongside coordinator placement, bounded concurrency, replica health, and
+topology latency.
 
 Metadata retention is the other unpriced consequence of retaining the logical
 pointer row. A fully collected block permanently keeps a `blocks` row, a
@@ -4763,7 +5395,7 @@ or use remains" carries the same admission race this ADR exists to close:
 
 ```text
 cleanup: global check sees zero uses
-                          writer: reads pointer = G1 / RETIRED
+                           writer: reads pointer = G1 / RETIRED/GC_RETIRE
 cleanup: global check sees zero refs
                           writer: persists G2 intent, PUTs K2
 cleanup: deletes blocks + generations + evidence
@@ -4784,7 +5416,8 @@ ageing evidence out while a pointer or a lineage chain can still name it — is 
 and must never be offered as a partial optimization.
 
 Temporary G1/G2 coexistence consumes additional storage only after G1 reaches
-`RETIRED`; G2 is forbidden during `RETIRING`.
+`RETIRED/GC_RETIRE`; G2 is forbidden during `RETIRING` and while the retained pointer
+claim is `QUARANTINE`.
 
 Rematerialization cannot reuse K1 after retirement: it must PUT the complete payload
 under K2, which is an intentional X1 trade but a real S3 bandwidth and active-active
@@ -4815,6 +5448,12 @@ X2 is closed only when:
 - every normal `ACTIVE -> RETIRING` claim also commits at `ALL`, so the publication
   frontier does not depend on Paxos v2 preserving per-DC `EACH_QUORUM` response
   distribution at RF greater than one;
+- every quarantine has durable discovery before mutation. If G is pointer-selected
+  `ACTIVE`, an acknowledged `RETIRING/QUARANTINE` `SERIAL + ALL` fence and zero-use
+  `EACH_QUORUM` drain precede `gc_state=null -> QUARANTINED` at `SERIAL + ALL`; an
+  ambiguous generation result settles serially and completes an exact-identity
+  `SERIAL + ALL` reaffirmation. Every crash resumes from the work/pointer state and
+  no quarantine branch writes retirement evidence or deletes;
 - the keyspace uses `NetworkTopologyStrategy` and the process refuses to start **in
   generation-fence writer mode** otherwise — not merely to start destructive GC —
   since `EACH_QUORUM` reads degrade silently without it and crashed-activation
@@ -4823,6 +5462,13 @@ X2 is closed only when:
   Gates, Not One;
 - the keyspace DC set exactly matches the configured participating DC set and every
   expected DC has exactly its configured positive RF;
+- no node/token/DC/rack/strategy/RF mutation occurs while writer mode or destructive
+  GC is live; maintenance drains operations, completes Cassandra streaming and
+  required repair, proves no pending ranges, and reverifies the complete post-change
+  participant layout before either gate returns;
+- topology/RF/DC/rack/strategy/token mutation is permitted only under a uniform v2
+  Paxos target; v1 steady-state writer mode is stable-layout-only because Cassandra's
+  5.0.9 topology-change linearizability guarantee is v2-only;
 - every LWT that can touch a generation-managed `blocks` partition has an **effective
   serial level** of `SERIAL`. The session default is also `SERIAL`, but the criterion
   remains statement-level so a later explicit override cannot silently move one
@@ -4830,12 +5476,17 @@ X2 is closed only when:
   through one helper and asserted over the inventory by test, because startup cannot
   enumerate them;
 - every generation-fence participant node reports the selected
-  `generation_fence_paxos_variant` target. For the pinned Cassandra 5.0.6 build the
+  `generation_fence_paxos_variant` target. For the pinned Cassandra 5.0.9 build the
   semantic candidates are `{v1, v2}`, but PR-0 selects exactly one target; startup
   and continuous participant eligibility reject any node on the other candidate or
   on an unrecognised/disallowed value, since crashed-activation settlement depends on
   the serial `SELECT`. A participant that cannot be verified must be removed from the
   ring/replica topology or keep generation-fence writer mode unavailable;
+- no generation-fence LWT commits at `ANY` or `LOCAL_QUORUM`; first-writer and
+  otherwise-local `blocks` LWTs commit at least at `QUORUM`. Phase 0 records
+  `paxos_state_purging`; selecting either non-legacy mode irreversibly forbids return
+  to `legacy`, and `repaired` creates a monitored recurring-Paxos-repair obligation
+  even under v1. `repaired` is not itself required by this protocol;
 - every application and Cassandra participant has a fresh clock-health attestation
   within `generation_fence_max_clock_skew`; exceeding the bound or losing attestation
   pauses writer mode and destructive GC;
@@ -4844,7 +5495,8 @@ X2 is closed only when:
   authoritative fallback is not an accepted `ACTIVE` read path;
 - deployment inventory proves that every block writer is generation-capable and no
   deterministic-key or legacy-reference writer can receive traffic before writer mode
-  is enabled;
+  is enabled; every admitted legacy request and durable legacy repair/publish job is
+  drained, migrated, or cancelled before the verified admission barrier reopens;
 - writer-originated recovery/expiry projections are written at `LOCAL_QUORUM` and
   scanned at `EACH_QUORUM`, so the designated scanner intersects the writer DC; an
   unavailable DC holds the cursor and retires no work;
@@ -4872,10 +5524,19 @@ X2 is closed only when:
   and retention boundary;
 - pin authority is enforced at authorization and again immediately before any
   physical operation, not only at publish;
-- `RETIRING` is never a parking state: it ends on a reference, on one or more
-  remaining uses all having expired their authority, on a zero drain, or through the
-  retention-safe delayed-candidate reactivation after any liveness-read error; an
-  abandoned pin or tombstone-heavy partition cannot make a block unwritable forever;
+- `RETIRING/GC_RETIRE` is never a parking state: it ends on a reference, on one or
+  more remaining uses all having expired their authority, on a zero drain, or through
+  the retention-safe delayed-candidate reactivation after any liveness-read error
+  for `GC_RETIRE`; a `RETIRING/QUARANTINE` claim never uses these exits and remains
+  fenced;
+- every transition that returns a pointer to `ACTIVE` — the abandoned-use escape, the
+  liveness-read-error escape, and both operator quarantine resolutions — publishes and
+  confirms its delayed candidate and discovery projection **before** the CAS, and an
+  unconfirmed enqueue forbids the CAS. No path produces an `ACTIVE` generation with
+  zero references that no durable work row names;
+- an RF3/Paxos-v2 `RETIRING/GC_RETIRE -> ACTIVE` commit may leave an omitted DC safely stale at
+  `RETIRING`; writers there return the bounded retryable response until hints, repair,
+  or a later LWT converges it, and the stale state never authorizes deletion;
 - every recovery cleanup branch confirms the absence of use rows, not only of
   references;
 - expired authority cannot publish;
@@ -4885,20 +5546,24 @@ X2 is closed only when:
 - the GC decision order evaluates errors, then references, then uses;
 - an unexpired `PENDING` use keeps `RETIRING` just like an unexpired `AUTHORIZED`
   use for drain purposes, while it still cannot perform physical work;
-- a use holding live authority does not reactivate a generation;
-- any generation-bound reference can reactivate a generation;
+- a use holding live authority does not reactivate a `GC_RETIRE` generation and never
+  clears a `QUARANTINE` claim;
+- any generation-bound reference can reactivate a `GC_RETIRE` generation, never a
+  `QUARANTINE` claim;
 - exactly one liveness source exists: `block_references` is neither read nor
   written after PR-5;
 - no unconditional write touches an active-pointer or `retire_claim_*` column;
-- the provisional reference TTL exceeds the measured upload-to-commit window, and a
+- the provisional reference TTL exceeds the enforced upload-to-commit bound, and a
   commit that lost its provisional reference fails closed;
 - failed global liveness reads never delete or append evidence and attempt the
-  delayed-candidate reactivation escape; if the pointer CAS is unavailable they
-  retain `RETIRING` only until that CAS can be reconciled;
+  delayed-candidate reactivation escape only for `GC_RETIRE`; if the pointer CAS is
+  unavailable they retain `RETIRING` only until that CAS can be reconciled, while a
+  `QUARANTINE` claim remains fenced;
 - a provisional reference cannot park a hot generation in `RETIRING` for its full
   retention TTL;
 - writers observing `RETIRING` have a bounded retry/backoff and never hang
-  indefinitely, and `RETIRED` does not stall a writer at all;
+  indefinitely, `RETIRED/GC_RETIRE` does not stall a writer, and
+  `RETIRED/QUARANTINE` fails closed without allocating G2;
 - the fence adds no Paxos to pins, revalidation, references, reuse, repair
   authorization, or deduplication, measured by writer-path tracing against the
   pre-existing LWT baseline;
@@ -4907,12 +5572,12 @@ X2 is closed only when:
   executions its ambiguity retries require, with exactly one successful activation
   per rematerialization, and retirement/delete LWTs run only in the GC worker;
 - GC worker concurrency is bounded and has a measured throughput/queue-age target;
-- the generation row uses monotonic materialization/physical markers rather than a
+ - the generation row uses monotonic materialization/physical markers rather than a
   second mutable `ACTIVE/RETIRING/RETIRED` authority;
 - physical generation cleanup never deletes the logical `blocks` row, never resets
   `active_epoch`, and never removes a `block_id_mappings` row at all — mappings are
   logical identity and are not part of generation collection under any condition;
-- the integration harness asserts Cassandra `release_version=5.0.6` and the image
+- the integration harness asserts Cassandra `release_version=5.0.9` and the image
   digest or artifact checksum matches the Phase-0 pinned build identity on every
   participant;
 - exact `dc-na`/`dc-eu`/`dc-asia` RF1 and RF3 tests pass under each semantically
@@ -4926,7 +5591,8 @@ X1 is closed only when:
 
 - every new physical lifecycle uses a UUID generation key;
 - no key is reused;
-- G2 cannot exist before G1 is `RETIRED`;
+- G2 cannot exist before G1 is `RETIRED/GC_RETIRE`; a `RETIRED/QUARANTINE` pointer
+  remains fenced until explicit operator resolution;
 - G1 and G2 can coexist safely after that point;
 - readers use the persisted exact key;
 - recovery uses generation and key, never logical hash resolution;
@@ -4956,14 +5622,15 @@ Until both lists pass, destructive GC remains disabled.
 The following corrections are intentionally preserved so future work does not
 reintroduce rejected designs:
 
-1. Cassandra 5.0.6 supports `EACH_QUORUM` reads; old Cassandra 3.0 documentation
+1. Cassandra 5.0.9 supports `EACH_QUORUM` reads; old Cassandra 3.0 documentation
    is not the target engine contract.
 2. `EACH_QUORUM` belongs in the destructive GC path, not pins, references, or normal
    writer reads.
 3. `SERIAL` is the Paxos phase; ordinary `EACH_QUORUM` reads are the per-DC
    destructive-check level. Most lifecycle LWTs use `EACH_QUORUM` as their requested
-   regular commit, but `ACTIVE -> RETIRING` uses `ALL` because its writer-visibility
-   guarantee must hold under both Paxos v1 and v2.
+   regular commit, while first-writer generation-managed LWTs use at least `QUORUM`.
+   `ACTIVE -> RETIRING` and pointer-selected quarantine use `ALL` because their
+   writer-visibility guarantees must hold under both Paxos v1 and v2.
 4. `internal/db/db.go` explicitly configures `cluster.SerialConsistency` in the
    audited branch; critical LWTs should still set it per query.
 5. The constraint is scoped to the fence, not to all of SesameFS. The upload path
@@ -4973,12 +5640,13 @@ reintroduce rejected designs:
    reuse, repair authorization, or ordinary deduplication.
 6. A TTL is retention, not writer authority.
 7. `pin -> ACTIVE` is invalid for a pin that still holds live authority; any
-   generation-bound reference can reactivate during `RETIRING`, while an authorized
-   pin can finish publishing without reactivation. Refined by correction 37: a
+   generation-bound reference can reactivate during `RETIRING/GC_RETIRE`, while an
+   authorized pin can finish publishing without reactivation. A quarantine-kind
+   claim is the exception and revokes publication. Refined by correction 37: a
    generation with one or more remaining uses, all of which have expired their
    authority, does return to `ACTIVE`, to release the writer fence rather than to
    assert liveness.
-8. G2 is forbidden during `RETIRING` and begins only after `RETIRED`.
+8. G2 is forbidden during `RETIRING` and begins only after `RETIRED/GC_RETIRE`.
 9. New greenfield objects use UUID keys from their first materialization; no G0
    deterministic-key compatibility path is required.
 10. A generation cannot become active before its physical key is PUT and verified.
@@ -4990,18 +5658,19 @@ reintroduce rejected designs:
 14. `DELETING` generations must be recoverable after a crash before orphan creation.
 15. Retire ownership requires ID plus epoch/deadline so stale workers cannot finish
     after takeover.
-16. An authorized pin may finish publishing while the pointer is `RETIRING`; a
-    `PENDING` pin cannot.
-17. Provisional references reactivate a retiring generation for availability-safe
-    retention; a pin with live authority does not. See correction 37 for the
-    expired-authority case.
+16. An authorized pin may finish publishing while the pointer is
+    `RETIRING/GC_RETIRE`; a `RETIRING/QUARANTINE` claim revokes publication and
+    drains the use. A `PENDING` pin cannot publish under either kind.
+17. Provisional references reactivate a `GC_RETIRE` generation for availability-safe
+    retention; a pin with live authority does not. A `QUARANTINE` claim never
+    reactivates automatically. See correction 37 for the expired-authority case.
 18. `001_initial_schema.cql` remains immutable; greenfield removes backfill, not
     migration checksum/history requirements.
 19. The real physical key preserves the existing two-level hash sharding before
     adding the generation suffix.
-20. The acceptance harness must use a pinned Cassandra `5.0.6` image whose digest or
+20. The acceptance harness must use a pinned Cassandra `5.0.9` image whose digest or
     artifact checksum matches the Phase-0 pinned build identity, and must not treat
-    `-short` tests as integration evidence. `release_version=5.0.6` alone is not an
+    `-short` tests as integration evidence. `release_version=5.0.9` alone is not an
     exact-build proof.
 21. G2 activation runs inline in the materializing request. Deferring it to a
     background allocator has now been proposed, adopted, and reverted once. The
@@ -5086,7 +5755,7 @@ reintroduce rejected designs:
     nothing: no `DELETING`, no G2, no S3 delete. Evidence alone never authorizes
     deletion; the authoritative pointer must also have left `RETIRING`.
 40. The gate for G2 is the **pointer CAS**. The activation CAS conditions on the
-    `blocks` row alone, including `G1 / RETIRED / E1` and its retire claim ID/epoch,
+`blocks` row alone, including `G1 / RETIRED/GC_RETIRE / E1` and its retire claim ID/epoch,
     so a rematerializing request can win once that exact tuple is present; no later
     write to another table can hold it back. The generation row has no mutable
     ACTIVE/RETIRING/RETIRED mirror. Durable proof of retirement is the evidence row,
@@ -5129,7 +5798,8 @@ reintroduce rejected designs:
     revalidate after its own deadline passed and still find the pointer `ACTIVE`
     with the generation and epoch it first observed. Bumping `active_epoch` on
     reactivation would close that case but would reject an already-`AUTHORIZED`
-    writer entitled to finish publishing across `ACTIVE -> RETIRING`, so the check
+    writer entitled to finish publishing across a normal
+    `ACTIVE -> RETIRING/GC_RETIRE`, so the check
     belongs on the deadline. It is re-checked immediately before the physical
     operation, so an expired writer cannot recreate an untracked object at a key
     whose generation has moved on.
@@ -5185,11 +5855,13 @@ reintroduce rejected designs:
 60. The normal upload path is **not** Paxos-free today, and the taxonomy must not be
     read as saying so. `UpsertBlockMetadataWithSHA1` runs `INSERT ... IF NOT EXISTS`
     unconditionally with no pre-read, and an `IF NOT EXISTS` pays the full Paxos
-    round whether or not it applies — so every block of every upload, including pure
-    dedup hits, pays one global round in production. That is X4, it is the only
-    Paxos whose count scales with block volume, and a probe fast path is the cheap
-    lever because the probe has already read the row. Optimizing the fence's cold
-    path while leaving this untouched is the mistake an earlier revision made.
+    round whether or not it applies — so every block invocation that reaches metadata
+    materialization pays one round, including a reusable-row outcome. Browser/sync
+    preflight can bypass the sequence entirely, and the probe fast path helps only an
+    existing complete row, never first content. That is X4, the Paxos whose count
+    scales with metadata-materializing block volume. Optimizing the fence's cold path
+    while leaving its foreground cost unmeasured is the mistake an earlier revision
+    made.
 61. The generation row has **no mutable `ACTIVE`/`RETIRING`/`RETIRED` mirror**. An
     earlier revision kept one "for history" and then had to defend it with a
     best-effort finalize, an ordering rule the system could not impose, and a
@@ -5299,10 +5971,10 @@ reintroduce rejected designs:
     condition either — logical-history compaction is `PURGING_LOGICAL` work.
 75. **The claim-column lifecycle is specified for every transition**, not only for
     `RETIRING -> RETIRED`. `retire_claim_epoch` is a monotonic counter that is never
-    cleared; `retire_claim_id` and `retire_claim_deadline` are live only during
-    `RETIRING` and `RETIRED` and are cleared by the same statement that reactivates
-    or replaces the pointer. Clearing the epoch would let a stale cycle-N worker
-    match a future cycle.
+    cleared; `retire_claim_id`, `retire_claim_deadline`, and `retire_claim_kind` are
+    live only during `RETIRING` and `RETIRED` and are cleared by the same statement
+    that reactivates or replaces the pointer. Clearing the epoch would let a stale
+    cycle-N worker match a future cycle.
 76. **The materialization intent and the materializer use are separate writes to
     separate partitions.** "Persist intent + use" as one line hid that they are not
     atomic and produced an ambiguity contract naming only the use. Confirm the intent
@@ -5314,8 +5986,10 @@ reintroduce rejected designs:
     The branch "scan `block_generations` for generations that are `ACTIVE`" survived
     the mirror removal and can never match, because `ACTIVE` exists only on `blocks`.
     Recovery discovers through bounded `(day, bucket)` projections and then reads
-    exact keys; the zero-reference branch is a backstop behind the delayed candidate,
-    never "the only path". A full enumeration of `block_generations` is an offline
+    exact keys. `gc_generation_zero_ref_by_day` is the intent scanner's handoff for a
+    materializer that activated but published no reference; it is **not** a backstop
+    for `RETIRING -> ACTIVE`, which is owned solely by its delayed candidate made
+    durable before the CAS. A full enumeration of `block_generations` is an offline
     tool, not a protocol.
 78. **Logical-history compaction is out of scope for X1/X2.** Collecting the retained
     pointer, generations and evidence has the same admission race as X2 — a writer
@@ -5331,8 +6005,11 @@ reintroduce rejected designs:
 80. **A classic Cassandra LWT is four round trips**, not three — prepare/promise,
     read, propose/accept, commit — which is what Paxos v2 halves. An earlier revision
     of the cost model used three and understated the GC cold path by 25%. The
-    corrected figures are ~2.0 s per generation at v1 and ~1.1 s at v2 for a 90 ms
-    inter-DC RTT, which strengthens rather than weakens the concurrency requirement.
+    90 ms sensitivity is ~2.0 s per generation at v1 and ~1.1 s at v2, but that is
+    not a topology-independent prediction: `SERIAL` waits for a global response order
+    statistic, `EACH_QUORUM` for every DC quorum, and `ALL` for every replica. A
+    200-250 ms slow-DC sensitivity raises the simple v1 model to ~4.4-5.5 s, which
+    strengthens rather than weakens the concurrency and measurement requirement.
 81. **Claim acquisition conditions on the previous `retire_claim_epoch`.**
     `ACTIVE -> RETIRING` was the one GC-owned transition a stale worker could still
     win, because `active_epoch` deliberately does not change across GC cycles: a
@@ -5488,7 +6165,7 @@ reintroduce rejected designs:
     nothing about the seam between one work record retiring and the next publishing.
     With scans forbidden, a crash in that seam loses the generation as thoroughly as
     never publishing at all: a worker that finishes `RETIRING -> RETIRED` and retires
-    its candidate before writing the delete work leaves `blocks` at `G1 / RETIRED`
+     its candidate before writing the delete work leaves `blocks` at `G1 / RETIRED/GC_RETIRE`
     with valid evidence, `K1` present, and nothing naming G1. Retiring the candidate
     at `ACTIVE -> RETIRING` is worse — the block stays `RETIRING` forever, an
     ownerless writer fence. The rule is that the outbound work row is durable before
@@ -5509,7 +6186,7 @@ reintroduce rejected designs:
     `ACTIVE -> RETIRING` — conditioned on `retire_claim_epoch = Nprev` — needs a null
     special case, reintroducing exactly the exception correction 90 removed.
 103. **Which claim the evidence must match depends on where the pointer is.** When
-    the pointer still reads `G1 / RETIRED` the live pointer claim *is* `C1 / N1`, so
+     the pointer still reads `G1 / RETIRED/GC_RETIRE` the live pointer claim *is* `C1 / N1`, so
     "match the live claim" is right. Once a successor owns the pointer the live claim
     belongs to a later cycle or is null, and the evidence must match the claim
     recorded in the lineage link instead. Reading "live claim" literally in the
@@ -5525,7 +6202,7 @@ reintroduce rejected designs:
 105. **The startup assertions form two gates, not one.** Topology, DC/RF, `SERIAL`
     domain, and `paxos_variant` bind from the first generation-aware write;
     destructive GC requires that gate plus the full acceptance criteria. Tying the
-    first four to `gc.enabled=true` leaves them unenforced for the five rollout steps
+    first four to `gc.enabled=true` leaves them unenforced for the multiple rollout steps
     between deploying generation-aware writers and switching GC on — precisely the
     window in which the first crashed activations occur.
 
@@ -5554,8 +6231,9 @@ reintroduce rejected designs:
     remedy is to grep for the old formulation before committing a new rule.
 109. **Retirement evidence is never reconstructed after the fact.** `RETIRING` with
     no evidence and `RETIRED` with no evidence are opposite situations, and an
-    earlier revision gave both the same remedy — "step 2 was lost, re-run the zero
-    check and append evidence". For a `RETIRED` pointer that is a safety hole: the
+     earlier revision gave both the same remedy — "step 2 was lost, re-run the zero
+     check and append evidence". For a `RETIRED/GC_RETIRE` pointer that is a safety
+     hole: the
     protocol confirms evidence *before* the pointer CAS and never deletes or expires
     it, so its absence means the ordering was violated. Re-running the check now and
     appending would manufacture a row indistinguishable from a legitimate one, which
@@ -5582,7 +6260,7 @@ reintroduce rejected designs:
 112. **The provisional reference is the fifth projection family, and dropping it
     reopens a closed finding.** Correction 101 replaced the universal "same logged
     batch as the canonical row" rule with a per-family list — and the list contained
-    only the four families this fence invents, so the inherited one fell out
+    only the then-four recovery families this fence invented, so the inherited one fell out
     silently. Its failure is F10, closed on `main` by PR-8
     ([#144](https://github.com/Sesame-Disk/sesamefs/pull/144)): a reference written
     without its expiry projection TTL-expires on its own, references reach zero with
@@ -5637,11 +6315,12 @@ reintroduce rejected designs:
 116. **A DC outage is not confined to rematerialization.** The writer table said
     deduplication "is unaffected and stays regional", contradicting this document's
     own X4 section: `retryUploadedBlockMaterialization` calls `materialize()` on both
-    probe outcomes, so a pure dedup hit already reaches the first-writer LWT, which
-    production runs at `SERIAL`. At RF 1 per DC across two DCs a global Paxos quorum
-    is both replicas, so losing one fails dedup hits, first materializations and
-    rematerializations alike, and the X4 probe fast path is the only thing that would
-    take dedup off that LWT. But the first draft of this correction then over-reached
+    probe outcomes, so a reusable-row result that reaches that helper still reaches
+    the first-writer LWT, which the target profile runs at `SERIAL`; preflight may
+    bypass the helper entirely. At RF 1 per DC across two DCs a global Paxos quorum is
+    both replicas, so losing one fails those metadata-materializing results, first
+    materializations and rematerializations alike. But the first draft of this
+    correction then over-reached
     into "the availability envelope of the whole upload path is every participating DC
     reachable", which is only true for the two-DC topology it was derived from. See
     correction 120: `SERIAL` and `EACH_QUORUM` do not fail together.
@@ -5669,20 +6348,21 @@ reintroduce rejected designs:
     serial level comes from configuration.
 119. **The acceptance criteria must not re-narrow a gate the design already widened.**
     The X2 list still tied `NetworkTopologyStrategy` to "refuses to start destructive
-    GC", five rollout steps after correction 105 established that the four
+    GC", multiple rollout steps after correction 105 established that the four
     topology/serial assertions bind from the first generation-aware write. A criteria
     list is what an implementer checks against, so a gate stated narrowly there
     survives however carefully the body states it broadly. `paxos_variant` was missing
     from the enumerated "implementation must" list for the same reason. Correction 109
     left the same kind of residue in three places: two verification cases and a row in
     the recovery-projection table still named the materializer-use projection it had
-    removed, so the table promised five projections where the schema defines four. A
-    removal is not complete until every enumeration that counted the removed thing is
-    recounted.
+    removed, so the table then promised five projections where the schema defined
+    four. The later fifth `gc_generation_quarantines_by_day` is a different, durable
+    workflow required before pointer/generation quarantine mutations. A removal or
+    addition is not complete until every enumeration is recounted.
 120. **`SERIAL`, ordinary `EACH_QUORUM`, and Paxos v2's requested commit level do not
     have one availability envelope.** An ordinary `EACH_QUORUM` read requires a
-    quorum in every DC. Cassandra 5.0.6 Paxos v1 uses the ordinary per-DC commit
-    handler, but Paxos v2 reduces the requested commit level to an aggregate response
+    quorum in every DC. Cassandra 5.0.9 Paxos v1 uses the ordinary per-DC commit
+     handler, but Paxos v2 reduces the requested commit level to an aggregate response
     count, so an RF3 activation may succeed with one DC absent. `SERIAL` itself
     requires a majority of **all** replicas, which one lost DC may
     or may not break: at 2 DCs it always does, at 3 DCs × RF1 it does not. So the
@@ -5696,7 +6376,7 @@ reintroduce rejected designs:
     `ACTIVE -> RETIRING`, commits at `ALL`.
 121. **Ordering does not substitute for a logged batch unless the consumer cannot yet
     act.** "Confirm the projection, then write the canonical row" reads like a
-    universal replacement for atomicity, and for the four GC families it is, because
+    universal replacement for atomicity, and for the GC-owned workflow families it is, because
     nothing consumes those projections until the branch is due. The provisional
     reference is different: its scanner deletes a projection whose canonical row is
     absent, so a scanner that could run between the two writes would delete the
@@ -5760,7 +6440,7 @@ reintroduce rejected designs:
      allowlist is not enough if startup inspects only its bootstrap coordinator. Every
      Cassandra node that can coordinate a generation-fence statement or own a replica
      for the generation-fence keyspace must report the one selected target. For the
-     pinned 5.0.6 build, PR-0 selects from `{v1, v2}`; one disallowed participant fails
+     pinned 5.0.9 build, PR-0 selects from `{v1, v2}`; one disallowed participant fails
      the writer-mode gate.
 130. **A liveness handoff needs confirmation on both sides.** The `pub:` ordering
      closes the visible `fs_object` window, but ambiguous writes must not be treated as
@@ -5776,24 +6456,25 @@ reintroduce rejected designs:
      exact-key absence permits `DELETING -> DELETED`; neither the DLQ nor remediation
      changes ownership or state by itself.
 133. **A semantic allowlist is not a mixed-deployment policy.** `{v1, v2}` identifies
-     the Cassandra 5.0.6 variants that retain the required read semantics, but a
+     the Cassandra 5.0.9 variants that retain the required read semantics, but a
      generation-fence deployment selects exactly one
      `generation_fence_paxos_variant`; every participant node — coordinator or
      replica — must match it. Changing that target is an explicit rolling operational
      procedure, not an implicit consequence of two values being semantically
      acceptable, and writer mode is paused during the mixed state.
-134. **Node verification is continuous, not a T0 snapshot.** A node that joins or
-     rejoins after startup is unverified until its local release/build identity,
-     selected Paxos variant, and DC/topology membership are verified. If it can own a
-     generation-fence replica, an unavailable or unverifiable node makes writer mode
-     unavailable; excluding it only from coordinator selection is insufficient.
+134. **Node verification is continuous, not a T0 snapshot.** A rejoined node is
+     unverified until its local release/build identity, selected Paxos variant, and
+     DC/topology membership are verified. A genuinely new/replacement node cannot be
+     made safe by checking it after Cassandra assigns pending ranges; joining is a
+     drained topology-maintenance operation. If a node can own a generation-fence
+     replica, excluding it only from coordinator selection is insufficient.
 135. **The Executive Decision must distinguish new from repurposed coordination.**
      The fence adds no new LWT to ordinary writer operations, but its writer-mode gate
      intentionally moves every existing `blocks`-partition LWT into the `SERIAL`
      domain. New global operations are limited to lifecycle/ambiguity recovery,
      rematerialization, and the GC cold path.
-136. **Release version is not exact-build identity.** The Cassandra 5.0.6 acceptance
-     harness must assert both `release_version=5.0.6` and a pinned image digest or
+136. **Release version is not exact-build identity.** The Cassandra 5.0.9 acceptance
+      harness must assert both `release_version=5.0.9` and a pinned image digest or
      artifact checksum. The version query alone cannot prove the audited build.
 137. **The publication wording names one holder, not two releases.** The `pub:` to
      `fs:` handoff says no liveness holder is released after an ambiguous publication
@@ -5823,14 +6504,16 @@ reintroduce rejected designs:
      sequence and consistency table explicitly include `PENDING -> AUTHORIZED` at
      `LOCAL_QUORUM`, preserving the original deadline and remaining TTL and confirming
      an ambiguous result by the full authority tuple.
-143. **Variant-transition policy distinguishes Cassandra requirements from SesameFS
-     conservatism.** Cassandra 5.0 says v2 may be enabled at any time and disabled by
-     selecting v1. SesameFS nevertheless requires a full primary-range repair for
-     `v1 -> v2` before writer mode returns; that asymmetric prerequisite is local
-     policy, not an engine requirement, and is not imposed on `v2 -> v1`.
+143. **Variant-transition policy is version-pinned because upstream guidance
+     changed.** Cassandra 5.0.9 `NEWS.txt` says v2 may be enabled at any time and its
+     sequence omits a one-time repair. CASSANDRA-21316 added a full primary-range
+     repair before `v1 -> v2` to 5.0.9/current 5.0 configuration guidance. SesameFS
+     follows the later stricter sequence whenever v1 has carried LWT history, while a
+     greenfield cluster selects its target before the first LWT. The reverse rolling
+     change does not require the same repair.
 144. **Clock skew is an eligibility fact.** Deadline and TTL proofs are valid only
      while every application/Cassandra participant has a fresh attestation inside the
-     measured maximum offset/drift. Missing or out-of-bound evidence pauses writer mode
+     enforced maximum offset/drift selected and validated by Phase 0. Missing or out-of-bound evidence pauses writer mode
      and destructive GC; “NTP required” without enforcement is not a contract.
 145. **`ACTIVE` names an authoritative globally addressable target, not completion of
      asynchronous S3 replication.** Every application region resolves the persisted
@@ -5846,7 +6529,7 @@ reintroduce rejected designs:
      exactly `dc-na`, `dc-eu`, and `dc-asia` at RF1 and RF3 and forces a majority that
      excludes one region.
 148. **Paxos v2 requested `EACH_QUORUM` is not the ordinary per-DC write handler.** In
-     Cassandra 5.0.6, `PaxosCommit` uses one aggregate required/accepted count, unlike
+     Cassandra 5.0.9, `PaxosCommit` uses one aggregate required/accepted count, unlike
      `DatacenterSyncWriteResponseHandler`. RF1 masks the difference because the summed
      threshold equals `ALL`; RF3 does not. The cold writer fence therefore uses `ALL`
      while ordinary destructive reads remain `EACH_QUORUM`.
@@ -5865,15 +6548,70 @@ reintroduce rejected designs:
      reads at `EACH_QUORUM`. Only the designated intent scanner publishes
      `gc_generation_zero_ref_by_day`; that outbound family is created and consumed at
      `LOCAL_QUORUM` in the GC DC.
-152. **The upstream Paxos variant switch does not require a full repair.** Cassandra
-     5.0 states that v2 may be enabled at any time and disabled by selecting v1.
-     SesameFS still requires a full primary-range repair before restoring writer mode
-     after `v1 -> v2`, but labels that asymmetric step as its own conservative policy.
+152. **Neither side of conflicting upstream Paxos guidance may be stated as
+     universal.** The pinned 5.0.9 release notes permit enabling v2 at any time;
+     5.0.9/current 5.0 docs prescribe full repair first. The production contract takes
+     the conservative intersection: if v1 LWT history exists, repair every primary
+     range on every node before v2; if the cluster is greenfield, select the uniform
+     target before its first LWT. `paxos_state_purging=repaired` is a separate choice
+     tied to recurring Paxos repair and weaker commit optimization, not a prerequisite
+     for this `QUORUM`-or-stronger LWT protocol.
 153. **Acceptance is a four-cell matrix, not the phrase “under both variants.”** RF1
      and RF3 run under uniform v1 and v2, every DC is omitted in turn, and every
      surviving DC coordinates. RF3/v2 must demonstrate that activation at requested
      `EACH_QUORUM` succeeds from six aggregate responses while the `ALL` retiring
      fence and ordinary destructive `EACH_QUORUM` reads fail.
+154. **Quarantine is a writer fence when the pointer still selects the generation.**
+     Paxos v2 can acknowledge requested `EACH_QUORUM` from two RF3 DCs while writers
+     in the third still read `gc_state=null`. `null -> QUARANTINED` therefore commits
+     at `SERIAL + ALL`; ambiguity settles the generation partition serially and then
+     reaffirms the exact quarantine identity at `SERIAL + ALL`. `DELETING/DELETED`
+     remain `EACH_QUORUM` because the pointer's earlier `ALL` fence already made them
+     unacquirable.
+155. **Replica topology is stable protocol input, not live background churn.** Adding,
+     replacing, moving, or removing nodes and changing tokens, DC/rack, strategy, or
+     RF are maintenance operations. Writers and GC pause and drain before Cassandra
+     enters pending-range/streaming states; required repair and complete post-change
+     participant verification finish before either gate returns.
+156. **Quiescing new traffic does not drain old work.** Cutover separately waits for
+     or cancels admitted legacy requests and drains, migrates, or cancels every durable
+     legacy repair/publish/upload job that could replay old-schema writes. Writer mode
+     is enabled and verified on all eligible nodes while traffic remains closed; no
+     atomic distributed flag transaction is assumed.
+157. **A stale reactivation is restrictive.** At RF3/Paxos v2,
+     `RETIRING -> ACTIVE` may commit from six aggregate responses while one DC still
+     reads `RETIRING`. That DC rejects writes until hints, repair, or another LWT
+     converges it. This is documented availability loss, not a reason to put `ALL` on
+     a transition whose stale direction is safe.
+158. **A correct protocol still needs a feasibility decision.** Phase 0 is split into
+     measurements and an explicit go/no-go before PR-1 merges. It budgets foreground
+     first-writer/global-`SERIAL` latency, per-funnel CQL QPS and concurrency,
+     tombstones, GC service rate, and a new delivery estimate. The old 40-65 and 55-75
+     engineer-day figures are provenance, not approved plans.
+159. **S3 version IDs and longer waiting are not portable identity proofs.** Version
+     IDs would require uniform backend versioning plus persisted version-aware
+     operations everywhere; no finite delay bounds an already accepted delete or
+     outage. Never-reused UUID keys close X1 independently of both assumptions.
+160. **Operator reactivation is a pointer return, so correction 97 binds it too.**
+     Adding the quarantine claim kind created a second and a third path back to
+     `ACTIVE` — `RETIRING/QUARANTINE -> ACTIVE` and `RETIRED/QUARANTINE -> ACTIVE` —
+     and only the abandoned-use escape carried the delayed-candidate rule. A
+     generation reaches `RETIRED` with `refs == 0`, and nothing can publish while the
+     pointer is `RETIRING` or `RETIRED`, so operator resolution returns an `ACTIVE`
+     generation whose references were already zero before it first became a candidate.
+     No future reference-removal event will ever create one: the result is `ACTIVE`,
+     unreferenced, named by no work row, and invisible to a recovery protocol that has
+     forbidden scans — the exact state correction 97 exists to make unreachable,
+     reached through a path correction 97 did not name. Both forms now publish and
+     confirm the delayed candidate and its projection before the CAS, unconditionally
+     rather than after reading a reference count. This is correction 88's rule applied
+     to a state machine change: when a transition is added, every ordering invariant
+     stated over the transitions it resembles is part of that change.
+161. **A frozen ADR that changes protocol needs a revision line.** The claim kind, the
+     two quarantine pointer states, and the `QUORUM` first-writer commit are protocol
+     changes made after the document was first labelled frozen. "Last updated" does not
+     tell an implementer which contract they read. Freeze is a statement about the
+     protocol, so a protocol change re-dates it explicitly.
 
 ## Related Documents
 

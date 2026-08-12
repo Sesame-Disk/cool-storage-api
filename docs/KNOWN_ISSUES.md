@@ -7540,8 +7540,11 @@ Decide SoT (IdP wins / admin wins / last-write-wins with audit) in
 
 #### Problem
 
-Each block pays one global Paxos round under multi-DC `SERIAL` (~128
-cross-region rounds per GB at 8 MB). Shared cost of governed upload paths.
+Each block invocation that reaches metadata registration pays one global Paxos round
+under multi-DC `SERIAL`. New content/full registration is ~128 cross-region rounds
+per GiB at 8 MiB blocks; browser/sync preflight may bypass fully deduplicated blocks.
+This is a shared cost of governed upload paths when they reach registration, not a
+universal per-file cost.
 
 #### Fix Direction
 

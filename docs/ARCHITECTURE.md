@@ -622,7 +622,7 @@ be reconsidered.
 |-----------|---------|-------|
 | **Go** | 1.25.5 | Latest stable |
 | **Debian** | Trixie 13 slim | `debian:trixie-slim` |
-| **Cassandra** | 5.0.6 | Latest |
+| **Cassandra** | 5.0.9 | Latest |
 | **gocql driver** | v2.0.0 | Apache official driver |
 | **aws-sdk-go-v2** | v1.41.0 | Latest |
 | **Gin** | v1.10.0 | HTTP framework |

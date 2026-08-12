@@ -65,15 +65,16 @@
 
 - Accepted and froze the implementation contract in `docs/GC-X1-X2-GENERATION-FENCE-ADR.md` after a final three-DC audit.
 - Added the `SERIAL + ALL` `ACTIVE -> RETIRING` visibility fence and ambiguity reaffirmation required for Paxos v2 at RF3.
+- Added the same per-DC visibility rule to pointer-selected quarantine, plus topology-maintenance and drained-cutover gates.
 - Made serial settlement mandatory before activation classification and added transitive lineage handling for historical winners.
 - Specified cross-DC projection discovery, explicit pin authorization, clock-health, authoritative storage, and coordinated rollout gates.
 - Added exact `dc-na`/`dc-eu`/`dc-asia` RF1/RF3 acceptance requirements for Paxos v1 and v2.
 - Kept X1/X2 open: this branch changes documentation only and does not permit destructive GC.
-- Files: `CURRENT_WORK.md`, `docs/ARCHITECTURE.md`, `docs/CHANGELOG.md`, `docs/DATABASE-GUIDE.md`, `docs/DECISIONS.md`, `docs/GC-UPLOAD-FENCE-PR-PLAN.md`, `docs/GC-X1-X2-GENERATION-FENCE-ADR.md`, `docs/KNOWN_ISSUES.md`, `docs/OPEN-WORK-INDEX.md`, `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`.
+- Files: `CURRENT_WORK.md`, `docs/CHANGELOG.md`, `docs/DECISIONS.md`, `docs/GC-UPLOAD-FENCE-PR-PLAN.md`, `docs/GC-X1-X2-GENERATION-FENCE-ADR.md`, `docs/KNOWN_ISSUES.md`, `docs/OPEN-WORK-INDEX.md`, `docs/PROD-SECURITY-READINESS-20260724.md`, `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`, `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`, `docs/VERSIONS.md`.
 
 ### Remaining Follow-up Debt
 
-- Implement PR-0 through PR-8 from the frozen ADR, including the pinned Cassandra 5.0.6 three-DC harness.
+- Complete Phase-0 measurements and the explicit go/no-go, pin the Cassandra 5.0.9 image/digest, and build the three-DC RF1/RF3 harness; then implement PR-1 through PR-8.
 - Keep `GC_ENABLED=false` on every replica/DC until both X1 and X2 acceptance lists pass.
 - Close the canonical issues only after code, crash tests, clock/storage gates, and RF1/RF3 multi-DC evidence exist.
 
@@ -287,12 +288,12 @@ Detail sidebar now has Info | History tabs for files. Full-page history also wor
 
 ## Strategic Roadmap
 
-### Phase 1: Production Blockers 🔴 — ALL COMPLETE ✅
+### Phase 1: Production Blockers 🔴 — Platform Foundations Complete; Destructive GC Blocked
 
 | Item | Status | Notes |
 |------|--------|-------|
 | **OIDC Authentication** | ✅ DONE | Phase 1 complete |
-| **Garbage Collection** | ✅ DONE | Queue worker + scanner + admin API |
+| **Garbage Collection** | 🟡 FOUNDATIONS DONE / ACTIVATION BLOCKED | Queue worker + scanner + admin API exist; destructive generation-aware GC remains disabled until X1/X2 acceptance |
 | **Health Checks/Monitoring** | ✅ DONE | `/health`, `/ready`, `/metrics`, slog logging |
 
 ### Phase 2: Core Feature Completion

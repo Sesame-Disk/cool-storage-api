@@ -45,7 +45,7 @@ This document tracks the versions of all major dependencies and frameworks used 
 - **Echo**: (check go.mod for version)
 
 ### Database
-- **Cassandra**: `4.1` (Docker image: cassandra:4.1)
+- **Cassandra**: `5.0.9` (target; Compose files still require exact image/digest pinning before acceptance)
 - **gocql driver**: (check go.mod)
 
 ### Storage
@@ -62,7 +62,7 @@ This document tracks the versions of all major dependencies and frameworks used 
 ### Base Images
 - **Frontend**: `node:18-alpine` → `nginx:alpine` (multi-stage build)
 - **Backend**: `golang:1.21-alpine` → `alpine:latest` (multi-stage build)
-- **Cassandra**: `cassandra:4.1`
+- **Cassandra**: `cassandra:5.0.9` (pin the exact digest for production/acceptance)
 - **MinIO**: (check docker-compose.yaml)
 
 ## Common Version Mismatch Issues

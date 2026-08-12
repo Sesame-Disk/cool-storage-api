@@ -942,6 +942,12 @@ metadata-registering upload surface. F8's no-session branch was the exception be
 it skipped metadata registration — but PR-7 removed that branch, so every remaining
 upload path registers metadata and pays this cost.
 
+**Scope correction (2026-08-11):** supported surfaces can still bypass metadata
+registration for individual blocks through browser/sync dedup preflight. X4 is one LWT
+per block invocation that reaches `RegisterUploadedBlock`; ~128/1 GiB describes new
+content/full registration at 8 MiB blocks, not every upload. The probe fast path helps
+an existing complete row but not first content or rematerialization.
+
 **Do not start this before measuring.** There is no per-statement latency metric for
 that INSERT yet; add it, get the production number, then decide. Full analysis: P-4
 in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`.

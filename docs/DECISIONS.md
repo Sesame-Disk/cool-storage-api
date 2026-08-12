@@ -763,9 +763,11 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 **Decision record:** [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md)
 
 The accepted greenfield design keeps writer pins and ordinary references at
-`LOCAL_QUORUM`, reuses the existing first-writer LWT for initial activation, and uses
+`LOCAL_QUORUM`, reuses the existing first-writer LWT for initial activation with
+regular commit at least `QUORUM` on generation-managed `blocks`, and uses
 `EACH_QUORUM` for destructive liveness reads and `SERIAL + ALL` for the
-`ACTIVE -> RETIRING` writer-visibility fence. The rematerialization activation path
+`ACTIVE -> RETIRING` writer-visibility fence and for quarantine that can invalidate a
+pointer-selected generation. The rematerialization activation path
 is writer-side and inline in the request; it performs the retirement-evidence
 `EACH_QUORUM` read followed by a `SERIAL + EACH_QUORUM` activation CAS. No safety
 proof treats that Paxos v2 commit as per-DC visibility. The design prevents
@@ -775,6 +777,12 @@ are implemented and verified. Generation-fence writer mode selects one
 `generation_fence_paxos_variant` target per deployment; every generation-fence
 participant node must match it continuously, and a mixed target state pauses writer
 mode until the Cassandra transition procedure and complete re-verification finish.
+Topology/RF/DC/rack mutations are drained maintenance operations guarded by a durable
+cluster-wide maintenance marker, not live rolling changes. Cassandra v1 is accepted
+only for stable-layout operation; topology changes require a uniform v2 target and
+the v1-to-v2 transition procedure. Phase-0 measurements and an explicit go/no-go must
+pass before PR-1 merges;
+ADR acceptance alone is not implementation or viability evidence.
 
 ---
 

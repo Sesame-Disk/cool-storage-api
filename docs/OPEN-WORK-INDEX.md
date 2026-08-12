@@ -185,7 +185,7 @@ incarnation is created. Closure criteria are in Registry X1.
 
 | Item | Sev | One line |
 |---|---|---|
-| `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One global Paxos round per block. **PR-11, not started** — need a per-statement latency metric first. |
+| `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One global Paxos round per block invocation reaching metadata materialization; preflight may bypass fully deduplicated blocks, but first content cannot. **PR-11, not started** — Phase 0 needs per-funnel latency/QPS and a go/no-go first. |
 | `ISSUE-CANONICAL-READ-FANOUT-01` (= X5) | MEDIUM | Canonical read fan-out never validated against a real cluster |
 | `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` | MEDIUM (deferred) | D bounds aggregate accepted work, not bytes per second; measure node egress at D6 before choosing shaping |
 | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (= X6) | MEDIUM | Read-after-write across DCs; 3×25 ms retry covers local lag only |
@@ -199,9 +199,12 @@ Not findings — things nobody has proven either way.
   `scripts/x2-multidc-validation.sh` reproduce cross-DC consistency behaviour at the
   wire level, and X2 is closed on that evidence — divergent-state visibility,
   fail-closed with a DC down, reference-DC-down with the `QUORUM` mutation, both
-  topology-gate halves, and both consistency mutations. **X6 and the remaining cross-DC assumptions are still derived
-  from the production consistency contract and have never been reproduced**, even
-  though the instrument to do it is now checked in.
+  topology-gate halves, and both consistency mutations. **X6 and the remaining
+  cross-DC assumptions are still derived from the production consistency contract and
+  have never been reproduced**, even though the instrument to do it is now checked in.
+  The r3 generation fence needs more than that instrument: its acceptance list calls
+  for the `dc-na`/`dc-eu`/`dc-asia` **RF1 *and* RF3** matrix, and the checked-in
+  fixture is RF 1 only.
 - **No production latency measurement** for the per-block LWT (X4 / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`).
 - **The six older upload funnels** have never been driven individually under a
   live fence; coverage proves the three retry wrapper mechanisms instead.

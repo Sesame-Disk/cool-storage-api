@@ -234,6 +234,15 @@ to resumable — neither is cheaper. It is a general per-block cost on every upl
 surface that registers metadata, and removing it improves all of them at once, which
 strengthens rather than weakens the case for doing it.
 
+**Scope correction (2026-08-11).** “Every upload surface registers metadata” does not
+mean every logical block reaches registration on every request. Browser and sync
+preflight can classify complete deduplicated blocks before `RegisterUploadedBlock`;
+those bypassed blocks pay no metadata LWT. New content and every block invocation that
+does reach metadata materialization still pay it. Thus ~128 LWTs/1 GiB is a
+new-content/full-registration sensitivity at 8 MiB blocks, not a universal per-file
+charge. The X4 probe fast path can remove a non-applying LWT for an existing complete
+row, but cannot help first content, a first-writer race, or rematerialization.
+
 The LWT is scoped to the `(org_id, block_id)` partition, so writers of *different*
 blocks never contend. The cost is latency per block, not lock contention.
 
@@ -405,7 +414,7 @@ file-sharing protocols.
 | P-1 | Permit serialized S3 PUT                       | ✅ Confirmed   | CRITICAL   | **RESOLVED** |
 | P-2 | Double S3 RTT per block (Exists + PUT)         | ✅ Confirmed   | HIGH→MEDIUM| **RESOLVED** |
 | P-3 | Benchmarks 44–48 MB/s, no scaling              | ❓ Plausible   | —          | External     |
-| P-4 | 1 global Paxos/block on every governed production upload surface (F8 no-session exception removed in PR-7). (The pre-store and post-reference `blocks` reads are required observation points, and PR-5 adds a required post-materialization confirmation; none is part of the Paxos optimization.) | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
+| P-4 | 1 global Paxos/block on every metadata-registering governed upload invocation (F8 no-session exception removed in PR-7). Browser/sync dedup preflight may bypass registration for an individual block. (The pre-store and post-reference `blocks` reads are required observation points, and PR-5 adds a required post-materialization confirmation; none is part of the Paxos optimization.) | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
 | S-1 | Chunk state node-local (multi-node blocker)    | ✅ Confirmed   | HIGH       | Pending      |
 | S-2 | max_upload_mb not enforced on chunked uploads  | ✅ Fixed       | MEDIUM     | Complete     |
 | S-3 | Full /tmp staging, no disk admission limit     | ✅ Mitigated   | MEDIUM     | Guard added; config still required |
@@ -425,4 +434,4 @@ without a database connection.
 | 3 | S-1 | Sticky sessions at LB (immediate) or distributed chunk state (complete) | Required for multi-node topology |
 | 4 | S-2/S-3 | Roll out a real `chunked_staging_max_bytes` value per node | Operational hardening follow-through |
 | 5 | S-4 | Atomic quota reservation at upload start | Closes the concurrent over-quota window |
-| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT. **Preserve the fresh post-reference fence read** — do not merge it with the pre-PUT probe. | Removes one global Paxos round per block. Both governed upload modes pay it equally, so the win applies to every governed production upload surface (the F8 no-session exception was removed in PR-7). Measure first. |
+| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT. **Preserve the fresh post-reference fence read** — do not merge it with the pre-PUT probe. | Removes one global Paxos round per metadata-registering block invocation. Both governed upload modes pay it when they reach registration; preflight-bypassed dedup blocks do not. Measure first. |
