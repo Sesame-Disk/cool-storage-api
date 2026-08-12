@@ -512,6 +512,26 @@ implementation contract; that status does not claim the protocol is implemented.
   pin `GC_ENABLED` — it is the single local node allowed to run GC so the suites can
   exercise it, while the fleet-wide rule is enforced in the production Compose and
   `.env.prod.example`.
+- Named recertification evidence as **prospective** (correction 165). The
+  `RETIRED/QUARANTINE -> RETIRED/GC_RETIRE` sequence added in the previous commit ran
+  its zero check and evidence append before the CAS that installs the claim they name,
+  which inverts the rule holding everywhere else and made "under the new claim" false:
+  the live claim is still the quarantine one. The order is nevertheless correct and
+  cannot be flipped — once the pointer reads `RETIRED/GC_RETIRE`, activation and delete
+  authorization both look for the new evidence, and its absence drives G1 into
+  permanent fail-closed quarantine. So the semantics are fixed instead: the old
+  quarantine fence protects the check, `(Cr, Nr)` is prospective and fixed by the
+  `RESOLVING` record, an orphaned prospective row is inert because no live claim or
+  lineage link can name it, and `(Cr, Nr)` must be deterministic across retries or an
+  ambiguous append collides with its own retry and fails closed forever. Recertification
+  does not revoke a delete authorization already obtained.
+- Froze `REJECTED` as reachable only from `OPEN` (correction 166); a `RESOLVING`
+  rejection would leave an unquarantined generation under a fenced pointer.
+- Gave `OPEN -> RESOLVING` and `OPEN -> REJECTED` explicit serial and regular
+  consistency levels, and added `RESOLVING`, the resolution identity and the
+  prospective claim columns to the `gc_generation_quarantines_by_day` DDL, which
+  previously listed only `OPEN | RESOLVED | REJECTED` and so could not recover an
+  interrupted resolution unambiguously.
 
 ---
 

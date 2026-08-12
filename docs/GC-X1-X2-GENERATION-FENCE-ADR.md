@@ -279,7 +279,8 @@ version must still be asserted by integration tests.
 | Claim takeover after `retire_claim_deadline` | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks`; same epoch-matching shape, replaces the owner without changing `active_state` |
 | Use-row drain, including `PENDING`, `AUTHORIZED`, and materializer uses | `EACH_QUORUM` |
 | Quarantine use drain | `EACH_QUORUM` until zero after an acknowledged `RETIRING/QUARANTINE` pointer fence; no retirement evidence, reactivation, or delete |
-| Quarantine work `OPEN -> RESOLVING` | `LOCAL_QUORUM` conditional in the designated GC DC, matching the full quarantine operation/evidence identity; confirmed **before** any `gc_state` or pointer mutation |
+| Quarantine work `OPEN -> RESOLVING` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM` on `gc_generation_quarantines_by_day`; matches the full quarantine operation/evidence identity, fixes the prospective `(Cr, Nr)`, and is confirmed **before** any `gc_state` or pointer mutation. This is not a `blocks` partition, so a later inventoried optimization may localize its serial phase; the one-serial-domain rule does not bind it |
+| Quarantine work `OPEN -> REJECTED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`; permitted only from `OPEN`. There is no `RESOLVING -> REJECTED` form |
 | `RETIRING/QUARANTINE -> ACTIVE` (operator resolution) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the retained quarantine claim; requires a confirmed delayed candidate and its discovery projection first |
 | `RETIRED/QUARANTINE -> RETIRED/GC_RETIRE` (operator recertification) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the retained quarantine claim, installs the next `retire_claim_epoch`, and requires a fresh global zero check plus confirmed fresh evidence for that epoch first. There is no `RETIRED -> ACTIVE` form |
 | Final generation-reference check | `EACH_QUORUM` |
@@ -2704,19 +2705,23 @@ RETIRING/QUARANTINE -> ACTIVE      (operator resolution only; never reached RETI
         active_state          = ACTIVE
 
 RETIRED/QUARANTINE -> RETIRED/GC_RETIRE   (operator resolution only)
-    work RESOLVING confirmed first
+    work RESOLVING confirmed first; it fixes the PROSPECTIVE claim (Cr, Nr = Nq + 1)
     generation gc_state QUARANTINED -> null confirmed next
-    fresh global zero check (uses then refs, EACH_QUORUM) under the NEW claim
-    fresh evidence(G1, Nq + 1) appended + confirmed BEFORE this CAS
+    global zero check (uses then refs, EACH_QUORUM) while the pointer still reads
+        G1 / RETIRED / Cq / Nq / QUARANTINE -- the OLD fence protects this check;
+        Cr/Nr are not installed yet and protect nothing
+    prospective evidence(G1, Nr) with claim_id = Cr appended + confirmed BEFORE this CAS
     IF active_generation_id = G1
     AND active_state       = RETIRED
     AND active_epoch       = E1
     AND retire_claim_kind  = QUARANTINE
-    AND retire_claim_id / epoch match the retained quarantine claim
+    AND retire_claim_id    = Cq
+    AND retire_claim_epoch = Nq
     SET retire_claim_id       = Cr
         retire_claim_deadline = Dr
         retire_claim_kind     = GC_RETIRE
-        retire_claim_epoch    = Nq + 1
+        retire_claim_epoch    = Nr
+    -- this CAS is what makes evidence(G1, Nr, Cr) authoritative
     -- G1 stays RETIRED. There is no path from RETIRED back to ACTIVE.
 
 G1 RETIRED -> G2 ACTIVE     (activation CAS)
@@ -2934,6 +2939,13 @@ The proof that does exist is retirement evidence, because of where it can be wri
 > Retirement evidence for `(Gn, Nn)` can only exist if Gn was the pointer's active
 > generation. The `ACTIVE -> RETIRING` CAS conditions on
 > `active_generation_id = Gn`, and the evidence append is ordered after it.
+
+Operator recertification is the one place where the second sentence does not hold: its
+evidence is appended for a *prospective* claim, before the CAS that installs it. The
+first sentence is unaffected — a recertified generation reached `RETIRED` through the
+ordinary path, so it did hold the pointer — and the lineage walk is unaffected too,
+because an orphaned prospective row is reachable by no pointer and no lineage link.
+See Recertification Evidence Is Prospective.
 
 So a losing generation can never accumulate evidence of its own, and the chain is
 decidable by walking backwards from the live pointer:
@@ -3400,14 +3412,71 @@ RETIRED/QUARANTINE    a delete authorization may already be held
 ```
 
 A `RETIRED/QUARANTINE` resolution is therefore a *recertification*, not a revival. It
-allocates the next `retire_claim_epoch`, re-runs the global zero check under that new
-claim, and appends fresh evidence for it before the pointer CAS. The re-check is cheap
-and provable: no writer can acquire authority while the pointer is `RETIRED` or
-`RETIRING`, so the frontier cannot have reopened, and the fresh row is a genuine
-attestation of a check that just happened rather than the synthetic proof correction
-109 forbids. Reusing the pre-quarantine evidence instead would force the
-evidence-matching rule to accept a superseded cycle, weakening a rule that exists to
-stop exactly that.
+allocates the next `retire_claim_epoch`, re-runs the global zero check, and appends
+fresh evidence before the pointer CAS. The re-check is cheap and provable: no writer
+can acquire authority while the pointer is `RETIRED` or `RETIRING`, so the frontier
+cannot have reopened, and the fresh row is a genuine attestation of a check that just
+happened rather than the synthetic proof correction 109 forbids. Reusing the
+pre-quarantine evidence instead would force the evidence-matching rule to accept a
+superseded cycle, weakening a rule that exists to stop exactly that.
+
+#### Recertification Evidence Is Prospective
+
+This is the **single exception** in this design to the rule that evidence is appended
+by the worker that already holds the claim it names, and it has to be stated as one or
+it will be "simplified" back into a defect.
+
+Everywhere else, a claim is acquired first and its holder then earns the evidence:
+`ACTIVE -> RETIRING` installs `(C, N)` and the append is ordered after it, which is
+what makes "evidence for `(Gn, Nn)` can only exist if Gn held the pointer" true.
+Recertification inverts that order, because the pointer transition it protects is the
+very one that installs the claim:
+
+```text
+live claim while the check and the append run:   Cq / Nq / QUARANTINE
+claim the evidence names:                        Cr / Nr   (not installed yet)
+```
+
+The safety argument is therefore about which fence protects the check, not about who
+holds the claim:
+
+> The zero check is protected by the **existing** `RETIRED/QUARANTINE` fence. `Cr/Nr`
+> is a *prospective* claim that protects nothing while the check runs, and it is fixed
+> by the `RESOLVING` record before any of this begins. The prospective evidence becomes
+> authoritative if and only if the subsequent CAS atomically installs exactly that
+> `(Cr, Nr)` as `RETIRED/GC_RETIRE`.
+
+An orphaned prospective evidence row is inert, and this is what makes preparing it
+early safe. Every consumer reaches evidence by an exact `(G, N)` taken from the live
+pointer claim or from a lineage link. If the CAS never applies, the live claim is
+still `(Cq, Nq)` and no lineage link names `(Cr, Nr)`, so nothing can find the row.
+It is historical data that authorizes nothing — which is the standing rule that
+evidence alone never authorizes deletion, applied to a row that never acquired a
+claim at all.
+
+**The order cannot be inverted.** Doing the CAS first and the check and append
+afterwards looks tidier and is wrong: from the instant the pointer reads
+`RETIRED/GC_RETIRE` with `(Cr, Nr)`, a materializer may attempt G2 activation and a
+delete worker may seek authorization, and both look for `evidence(G1, Nr)`. Finding it
+absent, the delete path takes the `RETIRED` pointer with no authorizing evidence
+branch — a protocol violation that quarantines G1 permanently, with the synthetic
+reconstruction correction 109 forbids as the only other way out. Evidence before the
+pointer transition that enables activation is the same ordering the normal retirement
+path uses; recertification changes who holds the claim at that moment, not the order.
+
+**`(Cr, Nr)` must be deterministic across retries.** The append is
+`INSERT ... IF NOT EXISTS` keyed by `(org, block, generation, retire_claim_epoch)`, and
+a row with the same key but a different immutable payload is a protocol violation. If a
+retry after an ambiguous append allocated a fresh `Cr'`, it would collide with its own
+first attempt at `Nr` and fail closed permanently. The `RESOLVING` record therefore
+fixes `(Cr, Nr)` before the first append, and every retry of that resolution reuses
+them — the same idempotence rule the activation CAS already has for `(G2, K2, E2)`.
+
+A recertification does **not** invalidate a delete authorization obtained under an
+earlier claim. A worker holding a proof from `(C1, N1)` may still complete its
+`DELETING` CAS afterwards, because G1 never returned to `ACTIVE` and its bytes are
+still dead. Requiring such a worker to re-match the live claim would reintroduce
+exactly the revocability that correction 162 removed.
 
 After recertification the block is in the ordinary retired state: `K1` may be deleted
 under the new claim, and a future G2 activates against `(G1, E1, Cr, Nq + 1)`. What
@@ -3470,10 +3539,12 @@ fail-closed rule exists to forbid.
 So authorization is itself durable, and it is written first:
 
 ```text
-OPEN -> RESOLVING            conditional; records resolution_id, decision,
-                             actor, verification_digest, started_at
+OPEN -> RESOLVING            conditional; records resolution_id, decision, actor,
+                             verification_digest, started_at, and the prospective
+                             (Cr, Nr) for a RETIRED recertification
      -> RESOLVED             only after the pointer step is confirmed
-     -> REJECTED             contradiction confirmed; quarantine retained
+
+OPEN -> REJECTED             contradiction confirmed; quarantine retained
 ```
 
 The transition to `RESOLVING` is confirmed **before** any `gc_state` or pointer
@@ -3485,6 +3556,16 @@ RESOLVING    -> continue exactly the recorded authorized resolution
 RESOLVED     -> terminal; never reopen
 REJECTED     -> terminal; the pointer stays fenced
 ```
+
+**`REJECTED` is reachable only from `OPEN`.** Once a resolution is `RESOLVING` it has
+already cleared `gc_state`, so a bare `RESOLVING -> REJECTED` would leave an
+unquarantined generation under a still-fenced pointer — a state the recovery table
+does not describe and that no scanner could act on. An operator who changes their mind
+mid-resolution completes the authorized resolution and then raises a **new** quarantine
+through the ordinary path, which re-establishes the generation state and the pointer
+fence together. Allowing the shortcut and requiring it to first restore
+`gc_state=QUARANTINED` and the fence would work, but it duplicates the quarantine path
+for no gain; one entry point is the cleaner freeze.
 
 This is Discoverability Before Irreversibility applied to an administrative decision:
 the record that a decision was made outlives the process that made it, and the scanner
@@ -3599,7 +3680,14 @@ gc_generation_quarantines_by_day adds quarantine_operation_id and carries
 resolution_state/resolution identity:
     PRIMARY KEY ((due_day, bucket), due_at, org_id, block_id, generation_id,
                  quarantine_operation_id)
-    resolution_state       -- OPEN, RESOLVED, or REJECTED; never implicit
+    resolution_state       -- OPEN, RESOLVING, RESOLVED, or REJECTED; never implicit
+    resolution_id          -- set with RESOLVING; identifies one authorized attempt
+    decision               -- FALSE_POSITIVE; set with RESOLVING
+    resolution_actor       -- the authorizing operator
+    verification_digest    -- the evidence the operator verified
+    resolution_started_at
+    prospective_claim_id    -- Cr, fixed at RESOLVING; null unless the pointer is
+    prospective_claim_epoch -- Nr, fixed at RESOLVING; RETIRED/QUARANTINE
     resolved_by
     resolved_at
 ```
@@ -3608,6 +3696,16 @@ The extra clustering column is not decoration. A generation can travel
 `RETIRING -> ACTIVE -> RETIRING` many times, so without `retire_claim_epoch` two
 retire cycles sharing a `due_at` collide on one row and one is silently lost — a work
 item dropped in a design that has just forbidden the scan that used to catch it.
+
+`resolution_state` is likewise not bookkeeping: it is the column that tells the
+scanner which of two opposite actions to take from identical `gc_state`/pointer rows.
+An `OPEN` row means no resolution was authorized, so the scanner completes the
+**quarantine**; a `RESOLVING` row means the scanner resumes exactly the recorded
+authorized resolution, reusing `resolution_id` and — for a `RETIRED` recertification —
+the `prospective_claim_id`/`prospective_claim_epoch` fixed at that moment. A DDL that
+omits `RESOLVING` and the resolution identity cannot recover an interrupted resolution
+unambiguously, whatever the prose says. See Resolution Needs Its Own Durable State and
+Recertification Evidence Is Prospective.
 
 There is deliberately **no** separate materializer-use projection. An earlier revision
 added one and left it half-normative: a fourth write outside the 3a/3b/3c sequence,
@@ -4072,12 +4170,15 @@ state and either loops or, worse, resolves it differently. A quarantined generat
   matching `RETIRING/QUARANTINE` claim, publish and confirm a delayed candidate and its
   discovery projection, then clear the claim columns and return it to `ACTIVE` with a
   conditional `SERIAL + ALL` LWT. If the pointer is `RETIRED/QUARANTINE`, it is
-  **recertified rather than reactivated**: allocate the next `retire_claim_epoch`,
-  re-run the global zero check under that new claim, append and confirm fresh evidence
-  for it, then move the pointer to `RETIRED/GC_RETIRE` with a conditional
-  `SERIAL + ALL` LWT. **No resolution returns a `RETIRED` pointer to `ACTIVE`**, and an
-  unconfirmed candidate or evidence append forbids its CAS; see Resolving A Quarantine
-  Without Breaking Irrevocability. The generation-row step precedes the pointer step,
+  **recertified rather than reactivated**: using the prospective `(Cr, Nr)` fixed by the
+  `RESOLVING` record, re-run the global zero check **while the pointer still reads
+  `RETIRED/QUARANTINE`** — that existing fence is what protects the check, since
+  `(Cr, Nr)` is not installed yet — append and confirm the prospective evidence for
+  `Nr`, then move the pointer to `RETIRED/GC_RETIRE` with a conditional `SERIAL + ALL`
+  LWT that installs exactly that pair. **No resolution returns a `RETIRED` pointer to
+  `ACTIVE`**, and an unconfirmed candidate or evidence append forbids its CAS; see
+  Resolving A Quarantine Without Breaking Irrevocability and Recertification Evidence
+  Is Prospective. The generation-row step precedes the pointer step,
   so no writer can observe an active pointer to a still-quarantined generation. Only
   after the required pointer step is confirmed does the operator mark the work
   `RESOLVED` with a conditional update matching the full identity. If a coordinator
@@ -5164,6 +5265,27 @@ Required cases include:
   confirms fresh evidence for that epoch before the pointer CAS. A test asserts the
   pre-quarantine evidence row is not reused, and that a later G2 activates against the
   recertified claim tuple;
+- the recertification zero check and evidence append run while the pointer still reads
+  `RETIRED/QUARANTINE`, and a test asserts the inverted order fails: with the pointer
+  moved to `RETIRED/GC_RETIRE` first, a G2 activation or delete authorization attempted
+  before the append finds no `evidence(G1, Nr)` and drives G1 into permanent
+  fail-closed quarantine;
+- a recertification whose pointer CAS never applies leaves `evidence(G1, Nr, Cr)` inert:
+  a test asserts no pointer and no lineage link can reach it, and that it authorizes no
+  deletion and no activation;
+- a retry of an ambiguous recertification evidence append reuses the `(Cr, Nr)` fixed by
+  the `RESOLVING` record; a test allocates a fresh claim ID on retry and asserts the
+  conditional insert fails closed on the conflicting payload, proving the determinism
+  requirement is load-bearing;
+- a delete worker holding a proof from a pre-quarantine claim still completes its
+  `DELETING` CAS after a recertification, since G1 never returned to `ACTIVE`; a test
+  asserts recertification does not revoke an authorization already obtained;
+- `REJECTED` is reachable only from `OPEN`; a test asserts a `RESOLVING -> REJECTED`
+  attempt does not apply, so no path leaves an unquarantined generation under a fenced
+  pointer;
+- the quarantine projection DDL carries `RESOLVING` and the full resolution identity;
+  a test drives an interrupted resolution through a schema without them and asserts the
+  recovery is ambiguous, so the columns cannot be dropped as cosmetic;
 - operator quarantine resolution clears `gc_state` **before** any pointer step, and a
   test asserts that the reverse order — an `ACTIVE` pointer selecting a
   still-`QUARANTINED` generation — is never produced by the workflow;
@@ -5376,7 +5498,9 @@ dedicated integration harness is required.
 
 ### Documentation Verification
 
-For this docs-only branch:
+This branch changes no Go code, but it is not docs-only: it pins the Cassandra image
+across the Compose files and sets `GC_ENABLED=false` in the production Compose. For
+the documentation half:
 
 ```text
 git diff --check
@@ -5712,7 +5836,13 @@ X2 is closed only when:
   evidence, never back to `ACTIVE`;
 - quarantine resolution records its authorization durably as `RESOLVING` before
   mutating `gc_state` or the pointer, so a crash is classifiable and an unexplained
-  `gc_state = null` is never read as an administrative decision;
+  `gc_state = null` is never read as an administrative decision. `RESOLVING` also fixes
+  the prospective `(Cr, Nr)` so recertification retries are idempotent, and `REJECTED`
+  is reachable only from `OPEN`;
+- recertification evidence is prepared under the existing `RETIRED/QUARANTINE` fence
+  and becomes authoritative only if the pointer CAS installs exactly its prospective
+  claim; an orphaned prospective row authorizes nothing, and the check/append are never
+  reordered after the CAS;
 - every transition that returns a pointer to `ACTIVE` — the abandoned-use escape, the
   liveness-read-error escape, and the `RETIRING/QUARANTINE` resolution — publishes and
   confirms its delayed candidate and discovery projection **before** the CAS, and an
@@ -6832,6 +6962,34 @@ reintroduce rejected designs:
      next reviewer from repeating the check against stale mirror data — and does not
      weaken the standing requirement that Phase 0 pin and verify a digest, since a
      version tag is still mutable.
+165. **Recertification evidence is prospective, and that is an exception that must be
+     named.** Correction 162 introduced `RETIRED/QUARANTINE -> RETIRED/GC_RETIRE` with
+     its zero check and evidence append ordered before the CAS. That inverts the rule
+     holding everywhere else — claim first, then the holder earns its evidence — because
+     here the CAS *is* what installs the claim. Describing the check as running "under
+     the new claim" was simply false: the live claim is still the quarantine one, and
+     `(Cr, Nr)` protects nothing until the CAS applies. The order cannot be fixed by
+     inverting it: once the pointer reads `RETIRED/GC_RETIRE`, activation and delete
+     authorization both look for `evidence(G1, Nr)`, and its absence drives G1 into the
+     permanent fail-closed branch whose only other exit is the synthetic evidence
+     correction 109 forbids. So the semantics change instead of the order: the **old**
+     `RETIRED/QUARANTINE` fence protects the check, `(Cr, Nr)` is prospective and fixed
+     by the `RESOLVING` record, and the evidence becomes authoritative only if the CAS
+     installs exactly that pair. An orphaned prospective row is inert, because every
+     consumer reaches evidence by an exact `(G, N)` taken from a live claim or a lineage
+     link and neither can name `(Cr, Nr)`. `(Cr, Nr)` must also be deterministic across
+     retries: the append is `INSERT ... IF NOT EXISTS` on `(…, retire_claim_epoch)`, so a
+     retry that allocated a fresh claim ID would collide with its own first attempt and
+     fail closed forever. Finally, recertification does not revoke a delete
+     authorization already obtained under an earlier claim — requiring a re-match would
+     reintroduce the revocability correction 162 removed.
+166. **`REJECTED` is reachable only from `OPEN`.** A `RESOLVING` resolution has already
+     cleared `gc_state`, so rejecting from there would leave an unquarantined generation
+     under a still-fenced pointer — a state no recovery branch describes. An operator who
+     changes their mind completes the authorized resolution and raises a new quarantine
+     through the ordinary path, which restores generation state and pointer fence
+     together. One entry point beats duplicating the quarantine path inside the
+     resolution workflow.
 
 ## Related Documents
 
