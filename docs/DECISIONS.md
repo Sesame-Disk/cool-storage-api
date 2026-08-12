@@ -758,7 +758,7 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 
 ### Generational GC Fence For X1/X2
 
-**Status:** Accepted and frozen; implementation not started
+**Status:** Accepted for review; r3 not frozen; implementation not started
 
 **Decision record:** [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md)
 

@@ -4,7 +4,7 @@
 **Origin:** eight successive audits of the GC upload-fence work, 2026-07-20/21.
 **Companion:** [GC-UPLOAD-FENCE-PR-PLAN.md](./GC-UPLOAD-FENCE-PR-PLAN.md) — which PR closes what.
 **Index:** [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — scoped open-work screen + migration table (not the entire backlog).
-**Accepted design:** [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md) — frozen normative X1/X2 contract; implementation not started.
+**Accepted design:** [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md) — accepted-for-review X1/X2 protocol (r3 not frozen); implementation not started.
 **Status of record:** [KNOWN_ISSUES.md](./KNOWN_ISSUES.md). This file owns reasoning and evidence; Open/Closed tables below are a **dated snapshot of the upload-fence series**, not a second live status tracker. When status changes, update `KNOWN_ISSUES.md` and add a dated note here if needed.
 **Series progress: the code series is complete.** PR-1 merged as
 [#137](https://github.com/Sesame-Disk/sesamefs/pull/137);

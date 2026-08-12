@@ -2037,8 +2037,8 @@ physical-delete ABA. Cassandra authorization generations or claim generations al
 cannot revoke an S3 DELETE already in flight. X1 closes only when new bytes use
 never-reused generational physical keys, so a stale delete can target only the old
 key. Keep destructive GC disabled until that physical-key invariant is implemented.
-Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted/frozen closure
-contract, not yet implemented:
+Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted-for-review closure
+design (r3 not frozen), not yet implemented:
 [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md).
 
 ---

@@ -405,6 +405,28 @@ their evidence. All four are closed here; none of them reopened X2.
   worse failure in all of them — but E1 has stopped being a corner case and is now the
   block path's default failure mode under a degraded cluster. Whoever builds the
   postpone bound should size it for that.
+## 2026-08-12 - X1/X2 fence ADR r3: revisable recertification attempts (corr 191)
+
+The r3 protocol delta in this slice is documentation-only. The branch also retains
+the Compose/configuration changes introduced earlier in this series. No runtime GC
+protocol code changed; X1/X2 remain open; `GC_ENABLED=false` stays mandatory; r3 is
+**not** frozen.
+
+Two reviews after correction 190 approved the abort-scope split and then required a
+small freeze cleanup plus one remaining protocol hole:
+
+- **Correction 191 (documentary).** Ordinary takeover preserves `retire_abort_id`;
+  an authorized abort fence replaces it (`A0 -> A1`); successful
+  `QUARANTINE_ABORT -> GC_RETIRE` clears it. No other mutation may write the column.
+- **Correction 191 (protocol).** `resolution_id=R` is stable; the prospective
+  pointer-step attempt `P` is revisable after a proven pre-linearization source-claim
+  supersession (`Nr2 = max(live_source_epoch, current_P.Nr) + 1`). Exact retry reuses
+  `P`. Pointer or lineage proving `P`'s target installed means `P` won. Do not skip
+  takeover by reading `work=RESOLVING`. Applies to both recertifications and to
+  `RETIRING/QUARANTINE -> ACTIVE` (retarget source, reuse delayed candidate).
+
+---
+
 ## 2026-08-12 - X1/X2 fence ADR r3: abort scopes + full fence-source identity (corr 190)
 
 The r3 protocol delta in this slice is documentation-only. The branch also retains
