@@ -405,6 +405,24 @@ their evidence. All four are closed here; none of them reopened X2.
   worse failure in all of them — but E1 has stopped being a corner case and is now the
   block path's default failure mode under a degraded cluster. Whoever builds the
   postpone bound should size it for that.
+## 2026-08-12 - X1/X2 fence ADR r3: recertification win-proof after takeover (corr 192)
+
+The r3 protocol delta in this slice is documentation-only. No runtime GC protocol
+code changed; X1/X2 remain open; `GC_ENABLED=false` stays mandatory; r3 is **not**
+frozen.
+
+The freeze pass over the takeover×CAS matrix after correction 191 found one remaining
+classifier hole:
+
+- **Correction 192.** After a recertification CAS wins, ordinary `GC_RETIRE`
+  takeover may move the live claim off `P.target`. Linearization proof is installed
+  kind/state (`GC_RETIRE` or `ACTIVE`) and successor lineage, not live `(Cr, Nr)`.
+  `RETIRING/QUARANTINE -> ACTIVE` must reconfirm or republish the delayed candidate
+  before every CAS.
+
+---
+
+
 ## 2026-08-12 - X1/X2 fence ADR r3: revisable recertification attempts (corr 191)
 
 The r3 protocol delta in this slice is documentation-only. The branch also retains
