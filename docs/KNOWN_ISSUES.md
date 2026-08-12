@@ -6335,12 +6335,21 @@ write and the auth resolution order
 
 #### What Is True Today
 
-All four writers of `sesamefs_auth` (login and logout, in both `internal/api/server.go` and
-`internal/api/v2/auth.go`) now set `httpOnly=true`, funneled through one `setAuthCookie`
-helper per package so the flag can't drift between login and logout again. `Secure` is
+All four previously non-`HttpOnly` writers of `sesamefs_auth` — the OIDC login and logout
+pair in each of `internal/api/server.go` and `internal/api/v2/auth.go` — now set
+`httpOnly=true`, funneled through one `setAuthCookie` helper per package so the flag can't
+drift between login and logout again. `handleAutoLogin` is a fifth writer of this cookie and
+is untouched: it already set `httpOnly=true`, so it was never part of this defect. `Secure` is
 unchanged (still derived from `c.Request.TLS`; the separate `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01`
 covers the one site — `handleAutoLogin` — that hardcodes it, and the broader TLS-terminating-
 proxy gap tracked in `TECHNICAL-DEBT.md` #21).
+
+One knock-on, dev-only: seeding the session from the browser console
+(`document.cookie = "sesamefs_auth=..."`, the SSO-less dev login in `README.md`) is now
+ignored by the browser whenever a real `HttpOnly` cookie of that name already exists — per
+RFC 6265 a script may not overwrite one. It still works from a clean profile, and the README
+records the caveat. Playwright's `context.addCookies` is unaffected because it writes to the
+browser's cookie jar directly, not through JS, so `mobile-frontend/e2e-sesamefs/` keeps working.
 
 What was verified before closing: a repository-wide search (including `mobile-frontend/`)
 found no JS code anywhere in this repository that reads this cookie's value — the only
@@ -6576,16 +6585,78 @@ degenerate input — it is not a new limit on large libraries.
 against a 96 MB ceiling.
 
 **Scope of the fix, precisely:** this closes the **unbounded body per request**
-and the id-list amplification within it. It does not bound aggregate memory under
-concurrency — N concurrent `RecvFS` requests near the 128 MiB cap can still sum to
-N × the cap. That is a distinct admission/concurrency problem, now tracked
-separately as `ISSUE-SYNC-METADATA-CONCURRENCY-01` rather than left implicit here.
+and the id-list amplification within it. Two things it does **not** do, both now
+tracked rather than left implicit:
+
+- It does not bound aggregate memory under concurrency — N concurrent `RecvFS`
+  requests near the 128 MiB cap can still sum to N × the cap
+  (`ISSUE-SYNC-METADATA-CONCURRENCY-01`).
+- **It does not make `RecvFS` a bounded-memory handler.** The body cap bounds the
+  *compressed* bytes; `RecvFS` then inflates each packed object with an unbounded
+  `io.ReadAll(zlibReader)`, and DEFLATE's best case is ~1029:1 (measured), so a
+  128 MiB body can inflate to ~126 GiB. The buffered body is not this handler's
+  largest allocation, and reading this entry as "recv-fs memory is now bounded"
+  would be wrong (`ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`).
 
 #### Related Docs
 
 - `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X9, and X10/X11 for what a cap is not)
 - `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-10 scope)
 - `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate bound this fix does not provide)
+
+---
+
+### ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01: `recv-fs` inflates each packed object unbounded
+
+**Status**: 🟡 Open — found 2026-08-12 while auditing the X9 caps
+**Severity**: High — one authenticated request can exhaust process memory; the body cap does not bound it
+**Affected**: `RecvFS` in `internal/api/sync.go` (the `io.ReadAll(zlibReader)` inside the per-object loop)
+**Source of record**: opened 2026-08-12; pre-existing, **not** introduced by `ISSUE-SYNC-UNBOUNDED-BODIES-01`
+
+#### Problem
+
+`recv-fs` carries packed objects as `40-byte id + 4-byte size + zlib-compressed JSON`.
+The X9 cap (`seafhttp.recv_fs_max_bytes`, default 128 MiB) bounds the **compressed**
+body. The handler then decompresses each object with an unbounded `io.ReadAll` over
+a `zlib.Reader`, so the largest allocation the handler makes is not the one that was
+capped.
+
+Measured, not estimated — `compress/zlib` at `BestCompression` over a run of
+identical bytes:
+
+| plaintext | compressed | ratio |
+|---|---|---|
+| 1 MiB | 1,043 B | 1005:1 |
+| 16 MiB | 16,320 B | 1028:1 |
+| 128 MiB | 130,466 B | 1029:1 |
+
+So a **128 KiB** request inflates to ~128 MiB, and a request at the 128 MiB body cap
+inflates to ~126 GiB. The `objSize` header is attacker-controlled and only checked
+against the remaining body length, so a single object may span the whole body.
+
+This is why closing X9 must not be read as "recv-fs memory is bounded": it bounds the
+buffered body, which is not the dominant term.
+
+#### Fix Direction
+
+Bound the decompressed side, not just the compressed one — `io.LimitReader` around
+the `zlib.Reader` (plus a total across the batch, since the loop runs per object),
+rejecting rather than truncating, because a truncated fs object would be silently
+stored with a body that no longer hashes to its `fs_id`.
+
+The cap value should **not** be guessed the way `recv_fs_max_bytes` had to be. Here
+there is something to measure: an fs object is either a directory's `dirents` or a
+file's `block_ids`, and both have computable worst cases from this deployment's own
+data (largest directory entry count; largest file ÷ block size). Measure those, then
+set a per-object cap with real headroom. Until then, note that the compressed body
+cap does bound *how much work* an attacker gets per request — it just does not bound
+the memory that work allocates.
+
+#### Related Docs
+
+- `ISSUE-SYNC-UNBOUNDED-BODIES-01` (the body cap this sits behind)
+- `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate term; N concurrent inflates)
+- `docs/SEAFILE-SYNC-PROTOCOL-RFC.md` §5.6.1 (the packed-object wire format)
 
 ---
 

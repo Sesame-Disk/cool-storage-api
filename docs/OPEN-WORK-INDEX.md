@@ -86,8 +86,9 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 - `ISSUE-SYNC-UNBOUNDED-BODIES-01` — **Fixed 2026-08-12** (registry X9). All four
   remaining sync handlers read through `readLimitedRequestBody`; `pack-fs` and
   `check-fs` also gained the id-count cap that stops a body under the byte cap from
-  expanding ~17x. Bounds one request, not N — the aggregate half is now
-  `ISSUE-SYNC-METADATA-CONCURRENCY-01` above.
+  expanding ~17x. It bounds one **compressed** body, and nothing more: the aggregate
+  term is `ISSUE-SYNC-METADATA-CONCURRENCY-01` and the inflate is
+  `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`, both above.
 - `ISSUE-BATCH-MOVE-FALSE-SUCCESS-01` — **Fixed 2026-08-12.** Legacy same-repo batch
   move via `POST /file/move` returned `{"success":true,"moved":N}` without touching
   the FS tree; it now returns 501 pointing at `sync-batch-move-item/`. Still
@@ -136,6 +137,7 @@ on every replica in every DC until both close.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
+| `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` | HIGH | `recv-fs` inflates each object unbounded; 128 MiB body → ~126 GiB at DEFLATE's measured 1029:1 | Found auditing X9; the body cap does not bound this |
 | `ISSUE-ZIP-STREAM-LATEFAIL-01` | HIGH | ZIP download can truncate after `200 OK` | Readiness DL-2 |
 | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | MEDIUM | Cross-library block read (BOLA), gated only by knowing the 256-bit hash | Readiness B2/SEC-1 |
 | `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` | MEDIUM | Download cap and `single_use` are race-bypassable | Readiness NF-2 / SH-5 |

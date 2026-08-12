@@ -310,10 +310,14 @@ func TestParseCheckBlockIDsRejectsBeforeMaterializing(t *testing.T) {
 	}
 }
 
-// TestIDListSpec413BodiesAreStable pins the client-visible 413 payloads across the
-// generalization of parseCheckBlockIDs into parseBoundedIDList. check-blocks' body
-// predates that refactor and must survive it byte for byte; the two fs routes name
-// fs ids because their 413 is new, and naming them "block ids" would be a lie a
+// TestIDListSpec413BodiesAreStable pins the client-visible 413 *schema* across the
+// generalization of parseCheckBlockIDs into parseBoundedIDList — the error text, the
+// cap field's name, and the cap's value. Not byte equality: key order in a gin.H is
+// not a contract anyone should depend on, and pinning it would fail on an unrelated
+// field being added rather than on the shape actually changing.
+//
+// check-blocks' schema predates the refactor and must survive it. The two fs routes
+// name fs ids because their 413 is new; calling them "block ids" would be a lie a
 // future reader would have to debug.
 func TestIDListSpec413BodiesAreStable(t *testing.T) {
 	for _, tc := range []struct {
@@ -346,8 +350,11 @@ func TestIDListSpec413BodiesAreStable(t *testing.T) {
 			if got["error"] != tc.wantError {
 				t.Errorf("error = %v, want %q", got["error"], tc.wantError)
 			}
-			if _, ok := got[tc.wantField]; !ok {
-				t.Errorf("413 body = %v, want it to carry %q", got, tc.wantField)
+			// The field must carry the cap that actually fired, not merely exist:
+			// a 413 that reports the wrong number is worse than one that reports
+			// none, since an operator would tune against it.
+			if got[tc.wantField] != float64(tc.spec.maxIDs) {
+				t.Errorf("413 body[%q] = %v, want the cap %d that fired (body=%v)", tc.wantField, got[tc.wantField], tc.spec.maxIDs, got)
 			}
 		})
 	}

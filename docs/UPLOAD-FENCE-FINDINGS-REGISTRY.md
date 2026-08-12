@@ -150,7 +150,15 @@ X11's sibling fix had already removed from `check-blocks`. Both now share that
 parser (`parseBoundedIDList`), with id caps derived from their byte caps so they
 are unreachable for well-formed input and fire only on degenerate bodies.
 
-What X9 does **not** close is the aggregate: a per-request cap bounds one request,
+Choosing the `recv-fs` cap also surfaced something the row does not contemplate at
+all: the cap bounds the **compressed** body, and `RecvFS` then inflates each packed
+object with an unbounded `io.ReadAll` over a `zlib.Reader`. DEFLATE's measured best
+case here is 1029:1, so 128 MiB of body inflates to ~126 GiB — the buffered body is
+not this handler's dominant allocation. Pre-existing, not caused by X9's fix, and
+filed as `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`. X9 stays closed on its own
+terms (unbounded body reads), but no one should read it as "recv-fs is bounded".
+
+What X9 also does **not** close is the aggregate: a per-request cap bounds one request,
 and `RecvFS` at 128 MiB × N concurrent is the same shape X10 described for the
 block routes. X10's fix is scoped to `PutBlock` and does not cover these routes, so
 that layer is now `ISSUE-SYNC-METADATA-CONCURRENCY-01` rather than an unowned
