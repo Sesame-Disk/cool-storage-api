@@ -40,6 +40,7 @@ func clearLoadEnvOverrides(t *testing.T) {
 		"WEB_UPLOADS_MAX_STAGED_BYTES_PER_SESSION_MB",
 		"SEAFHTTP_TOKEN_TTL", "SEAFHTTP_ZIP_MAX_ENTRIES",
 		"SEAFHTTP_ZIP_MAX_DEPTH", "SEAFHTTP_ZIP_MAX_BYTES",
+		"SEAFHTTP_RECV_FS_MAX_BYTES",
 		"SEAFHTTP_SYNC_BLOCK_MAX_BYTES", "SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_NODE",
 		"SEAFHTTP_SYNC_BLOCK_MAX_INFLIGHT_PER_USER", "SEAFHTTP_SYNC_BLOCK_ADMISSION_WAIT",
 		"SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_NODE", "SEAFHTTP_SYNC_BLOCK_MAX_WAITERS_PER_USER",
@@ -1071,6 +1072,94 @@ func TestEnvOverrideSyncBlockMaxBytes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEnvOverrideRecvFSMaxBytes mirrors TestEnvOverrideSyncBlockMaxBytes for the
+// recv-fs body cap. The two knobs differ in one respect only — recv-fs has no
+// validation ceiling, deliberately, because no measured client batch size makes a
+// large value self-evidently a mistake — so "above the ceiling" has no analogue
+// here. Everything else must behave identically: a malformed value is reported
+// rather than silently dropped back to the default, and zero is not "unlimited".
+func TestEnvOverrideRecvFSMaxBytes(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
+	newCfg := func() *Config {
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		cfg.DownloadAdmission.Enabled = false
+		return cfg
+	}
+
+	t.Run("default is used when nothing overrides it", func(t *testing.T) {
+		cfg := newCfg()
+		cfg.applyEnvOverrides()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() error = %v", err)
+		}
+		if cfg.SeafHTTP.RecvFSMaxBytes != DefaultRecvFSMaxBytes {
+			t.Fatalf("RecvFSMaxBytes = %d, want the %d default", cfg.SeafHTTP.RecvFSMaxBytes, DefaultRecvFSMaxBytes)
+		}
+	})
+
+	t.Run("valid value overrides the default", func(t *testing.T) {
+		cfg := newCfg()
+		t.Setenv("SEAFHTTP_RECV_FS_MAX_BYTES", "268435456")
+
+		cfg.applyEnvOverrides()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() error = %v", err)
+		}
+		// Raising it well past the default must pass: there is no ceiling on this
+		// knob on purpose, and a test that only ever lowered it would not show that.
+		if cfg.SeafHTTP.RecvFSMaxBytes != 256*1024*1024 {
+			t.Fatalf("RecvFSMaxBytes = %d, want %d", cfg.SeafHTTP.RecvFSMaxBytes, 256*1024*1024)
+		}
+	})
+
+	t.Run("malformed value is reported, not dropped", func(t *testing.T) {
+		cfg := newCfg()
+		t.Setenv("SEAFHTTP_RECV_FS_MAX_BYTES", "128MiB")
+
+		cfg.applyEnvOverrides()
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() = nil; a malformed override must not fall back to the default silently")
+		}
+		if !strings.Contains(err.Error(), "SEAFHTTP_RECV_FS_MAX_BYTES") {
+			t.Fatalf("Validate() error = %v, want it to name SEAFHTTP_RECV_FS_MAX_BYTES", err)
+		}
+	})
+
+	// Zero is rejected rather than read as "unlimited": an unbounded recv-fs body
+	// is the defect the cap exists to close, so no configuration may restore it.
+	for _, tc := range []struct{ name, value string }{
+		{"zero", "0"},
+		{"negative", "-1"},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			cfg := newCfg()
+			t.Setenv("SEAFHTTP_RECV_FS_MAX_BYTES", tc.value)
+
+			cfg.applyEnvOverrides()
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("Validate() = nil for %s; the env lever must obey the same bounds as the YAML knob", tc.value)
+			}
+			if !strings.Contains(err.Error(), "seafhttp.recv_fs_max_bytes") {
+				t.Fatalf("Validate() error = %v, want it to name seafhttp.recv_fs_max_bytes", err)
+			}
+		})
+	}
+
+	// The YAML knob is the same field, so a config file that sets it to zero must
+	// fail for the same reason the env lever does.
+	t.Run("rejects zero from YAML", func(t *testing.T) {
+		cfg := newCfg()
+		cfg.SeafHTTP.RecvFSMaxBytes = 0
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() = nil for recv_fs_max_bytes: 0, want it rejected")
+		}
+	})
 }
 
 // TestEnvOverrideUploadLinkWriteLimits pins the four operator levers for the

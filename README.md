@@ -277,6 +277,11 @@ shared MinIO. Same verbs via `./scripts/run-playwright.sh up | test | down`.
 > dev). Seed the dev cookie in the browser console, then reload:
 > `document.cookie = "sesamefs_auth=admin@sesamefs.local@dev-token-admin; path=/"; location.href="/dashboard/"`
 > Swap `admin`/`dev-token-admin` for `user`/`dev-token-user`, etc.
+>
+> If nothing happens, you already have a real session cookie: the server sets
+> `sesamefs_auth` with `HttpOnly` (`ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01`), and a browser
+> silently ignores a script writing over an `HttpOnly` cookie. Clear the site's cookies (or
+> use a fresh/incognito profile) and run the snippet again.
 
 See [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) for detailed scenarios,
 and [docs/BUG-FILE-DETAIL-MODIFIER-20260618.md](docs/BUG-FILE-DETAIL-MODIFIER-20260618.md)

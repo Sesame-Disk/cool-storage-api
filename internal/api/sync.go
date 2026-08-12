@@ -1174,9 +1174,8 @@ func (h *SyncHandler) PutCommit(c *gin.Context) {
 	}
 
 	// Read commit data from body
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+	body, ok := readLimitedRequestBody(c, maxPutCommitBodyBytes)
+	if !ok {
 		return
 	}
 
@@ -1194,7 +1193,7 @@ func (h *SyncHandler) PutCommit(c *gin.Context) {
 
 	// Store commit in database
 	now := time.Now()
-	err = h.db.Session().Query(`
+	err := h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, repoID, commitID, commit.ParentID, commit.RootID, userID, commit.Description, now).Exec()
@@ -1456,6 +1455,32 @@ func syncBlockDownloadStreamCause(err error) downloadadmission.ReleaseCause {
 // from it; the block cap is now configuration, see syncBlockMaxBytes below.
 const (
 	maxCheckBlocksBodyBytes = 16 * 1024 * 1024 // 16 MiB
+
+	// PutCommit, PackFS and CheckFS were the other three handlers still reading
+	// an unbounded body (ISSUE-SYNC-UNBOUNDED-BODIES-01 / X9) — the same defect
+	// F12 fixed for PutBlock/CheckBlocks. Plain consts, not configuration: a
+	// commit object and an id list (PackFS/CheckFS request the same 40-char hex
+	// fs-id shape check-blocks does) are small, protocol-shaped payloads, not a
+	// variable-sized bulk payload like recv-fs below.
+	maxPutCommitBodyBytes = 1 * 1024 * 1024  // 1 MiB
+	maxPackFSBodyBytes    = 16 * 1024 * 1024 // 16 MiB, same shape as check-blocks
+	maxCheckFSBodyBytes   = 16 * 1024 * 1024 // 16 MiB, same shape as check-blocks
+
+	// minFSIDWireBytes is the smallest on-the-wire cost of one well-formed 40-hex
+	// fs id, which the newline format sets: 40 characters plus one delimiter. JSON
+	// is strictly less dense — each id is also quoted, so ~43 bytes — and therefore
+	// cannot bind first; TestFSIDCapsCannotCutWellFormedBodies asserts both.
+	//
+	// Deriving the id caps below from the byte caps above makes them unreachable for
+	// any well-formed body — 16 MiB cannot carry more ids than this — so they only
+	// ever fire on degenerate input, which is precisely the amplification they exist
+	// to stop and not a new limit on real clients.
+	//
+	// Without them, a body *under* the byte cap still expands ~17x: 16 MiB of bare
+	// newlines becomes ~16.7M string headers (~268 MB). See parseBoundedIDList.
+	minFSIDWireBytes = 41
+	maxPackFSIDs     = maxPackFSBodyBytes / minFSIDWireBytes
+	maxCheckFSIDs    = maxCheckFSBodyBytes / minFSIDWireBytes
 )
 
 // checkBlocksMaxIDs resolves the accepted id-count cap.
@@ -1498,6 +1523,26 @@ func (h *SyncHandler) syncBlockMaxBytes() int64 {
 		return config.DefaultSyncBlockMaxBytes
 	}
 	return h.config.SeafHTTP.SyncBlockMaxBytes
+}
+
+// syncRecvFSMaxBytes resolves the per-request body cap for RecvFS.
+//
+// Unlike maxPutCommitBodyBytes/maxPackFSBodyBytes/maxCheckFSBodyBytes above,
+// this is configuration rather than a const: recv-fs carries a real batch of
+// packed FS objects, not a small id list, and there is no measured client
+// batch size or protocol-documented ceiling to anchor a fixed number on. The
+// default is deliberately generous so it is unlikely to cut a legitimate large
+// commit; an operator can raise it further without a code change.
+//
+// The nil-config fallback is the package default rather than something
+// permissive, for the same reason as syncBlockMaxBytes: a handler without
+// config is a wiring bug, and failing open here would restore the unbounded
+// read this cap exists to prevent.
+func (h *SyncHandler) syncRecvFSMaxBytes() int64 {
+	if h == nil || h.config == nil || h.config.SeafHTTP.RecvFSMaxBytes <= 0 {
+		return config.DefaultRecvFSMaxBytes
+	}
+	return h.config.SeafHTTP.RecvFSMaxBytes
 }
 
 func (h *SyncHandler) syncBlockAdmittedLifetime() time.Duration {
@@ -2036,23 +2081,59 @@ type CheckBlocksRequest struct {
 	BlockIDs []string `json:"block_ids"`
 }
 
-// parseCheckBlockIDs parses a check-blocks body into block ids, bounding the id
-// count *before* the list is materialized. Checking the count after the parse
-// would allocate exactly what the cap exists to bound: within the 16 MiB body cap
-// a caller can still reach ~16.7M ids via one-byte entries ("a\n\n\n…\na", which
-// TrimSpace cannot collapse because both ends are non-space), and strings.Split
-// pre-sizes the slice in a single make — ~272 MB of string headers. The JSON path
-// is the same class (~5.6M empty strings, ~198 MB) because json.Unmarshal grows
-// the slice to completion first.
+// idListSpec describes one route's id-list parse: how many ids it accepts and how
+// it names them when it refuses. The naming is per-route rather than generic
+// because check-blocks' 413 body — {"error":"too many block ids","max_block_ids":N}
+// — is an existing client-visible shape, and generalizing this parser must not
+// silently change it.
+type idListSpec struct {
+	route      string // log prefix on a malformed body, e.g. "check-blocks"
+	maxIDs     int
+	tooManyMsg string // 413 "error" text, e.g. "too many block ids"
+	maxField   string // 413 field carrying the cap, e.g. "max_block_ids"
+}
+
+// checkBlocksIDListSpec preserves check-blocks' pre-existing 413 body verbatim
+// ({"error":"too many block ids","max_block_ids":N}); the cap stays configuration.
+func checkBlocksIDListSpec(maxIDs int) idListSpec {
+	return idListSpec{route: "check-blocks", maxIDs: maxIDs, tooManyMsg: "too many block ids", maxField: "max_block_ids"}
+}
+
+// packFSIDListSpec and checkFSIDListSpec name the id-list parse for the two fs
+// routes. Their 413 shape is new (neither route bounded id count before), so it is
+// named for fs ids rather than borrowing check-blocks' block-id wording, and their
+// caps are derived consts rather than configuration — see minFSIDWireBytes.
+func packFSIDListSpec() idListSpec {
+	return idListSpec{route: "pack-fs", maxIDs: maxPackFSIDs, tooManyMsg: "too many fs ids", maxField: "max_fs_ids"}
+}
+
+func checkFSIDListSpec() idListSpec {
+	return idListSpec{route: "check-fs", maxIDs: maxCheckFSIDs, tooManyMsg: "too many fs ids", maxField: "max_fs_ids"}
+}
+
+// parseBoundedIDList parses a newline-separated or JSON-array id body into ids,
+// bounding the id count *before* the list is materialized. Checking the count
+// after the parse would allocate exactly what the cap exists to bound: within a
+// 16 MiB body cap a caller can still reach ~16.7M ids via one-byte entries
+// ("a\n\n\n…\na", which TrimSpace cannot collapse because both ends are
+// non-space), and strings.Split pre-sizes the slice in a single make — ~272 MB of
+// string headers. The JSON path is the same class (~5.6M empty strings, ~198 MB)
+// because json.Unmarshal grows the slice to completion first.
+//
+// A byte cap alone does not close this: readLimitedRequestBody bounds the body,
+// this bounds what the body can expand into. check-fs and pack-fs carry the same
+// 40-hex id shape as check-blocks and reached this parser late (their byte caps
+// landed first, in ISSUE-SYNC-UNBOUNDED-BODIES-01 / X9), which is why the parser
+// is shared rather than reimplemented per route.
 //
 // Returns ok=false after writing the response; the caller must return immediately.
-func parseCheckBlockIDs(c *gin.Context, body []byte, maxCheckBlockIDs int) ([]string, bool) {
+func parseBoundedIDList(c *gin.Context, body []byte, spec idListSpec) ([]string, bool) {
 	tooMany := func() ([]string, bool) {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "too many block ids", "max_block_ids": maxCheckBlockIDs})
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": spec.tooManyMsg, spec.maxField: spec.maxIDs})
 		return nil, false
 	}
 	invalid := func(err error) ([]string, bool) {
-		log.Printf("check-blocks: failed to parse JSON array: %v", err)
+		log.Printf("%s: failed to parse JSON array: %v", spec.route, err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON array"})
 		return nil, false
 	}
@@ -2062,7 +2143,7 @@ func parseCheckBlockIDs(c *gin.Context, body []byte, maxCheckBlockIDs int) ([]st
 	// Newline-separated format: count the delimiters first, since strings.Split
 	// allocates one slice entry per id up front.
 	if !strings.HasPrefix(bodyStr, "[") {
-		if strings.Count(bodyStr, "\n")+1 > maxCheckBlockIDs {
+		if strings.Count(bodyStr, "\n")+1 > spec.maxIDs {
 			return tooMany()
 		}
 		return strings.Split(bodyStr, "\n"), true
@@ -2076,7 +2157,7 @@ func parseCheckBlockIDs(c *gin.Context, body []byte, maxCheckBlockIDs int) ([]st
 	}
 	externalIDs := make([]string, 0, 64)
 	for dec.More() {
-		if len(externalIDs) >= maxCheckBlockIDs {
+		if len(externalIDs) >= spec.maxIDs {
 			return tooMany()
 		}
 		var id string
@@ -2266,7 +2347,7 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 		return
 	}
 	// Parse the body - can be JSON array or newline-separated
-	externalIDs, ok := parseCheckBlockIDs(c, body, h.checkBlocksMaxIDs())
+	externalIDs, ok := parseBoundedIDList(c, body, checkBlocksIDListSpec(h.checkBlocksMaxIDs()))
 	if !ok {
 		return
 	}
@@ -2634,25 +2715,15 @@ func (h *SyncHandler) PackFS(c *gin.Context) {
 	}
 
 	// Read FS IDs from body
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+	body, ok := readLimitedRequestBody(c, maxPackFSBodyBytes)
+	if !ok {
 		return
 	}
 
 	// Parse the body - can be JSON array or newline-separated
-	var requestedFSIDs []string
-	bodyStr := strings.TrimSpace(string(body))
-	if strings.HasPrefix(bodyStr, "[") {
-		// JSON array format
-		if err := json.Unmarshal(body, &requestedFSIDs); err != nil {
-			log.Printf("pack-fs: failed to parse JSON array: %v", err)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON array"})
-			return
-		}
-	} else {
-		// Newline-separated format
-		requestedFSIDs = strings.Split(bodyStr, "\n")
+	requestedFSIDs, ok := parseBoundedIDList(c, body, packFSIDListSpec())
+	if !ok {
+		return
 	}
 
 	// Build binary response
@@ -2750,9 +2821,8 @@ func (h *SyncHandler) RecvFS(c *gin.Context) {
 	}
 
 	// Read FS objects from body
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+	body, ok := readLimitedRequestBody(c, h.syncRecvFSMaxBytes())
+	if !ok {
 		return
 	}
 
@@ -2886,25 +2956,15 @@ func (h *SyncHandler) CheckFS(c *gin.Context) {
 	}
 
 	// Read FS IDs from body
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+	body, ok := readLimitedRequestBody(c, maxCheckFSBodyBytes)
+	if !ok {
 		return
 	}
 
 	// Parse the body - can be JSON array or newline-separated
-	var fsIDs []string
-	bodyStr := strings.TrimSpace(string(body))
-	if strings.HasPrefix(bodyStr, "[") {
-		// JSON array format
-		if err := json.Unmarshal(body, &fsIDs); err != nil {
-			log.Printf("check-fs: failed to parse JSON array: %v", err)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON array"})
-			return
-		}
-	} else {
-		// Newline-separated format
-		fsIDs = strings.Split(bodyStr, "\n")
+	fsIDs, ok := parseBoundedIDList(c, body, checkFSIDListSpec())
+	if !ok {
+		return
 	}
 
 	// CRITICAL: Client sends COMPUTED fs_ids (SHA-1 of corrected JSON),
@@ -2913,7 +2973,7 @@ func (h *SyncHandler) CheckFS(c *gin.Context) {
 
 	// Get HEAD commit's root_fs_id to build the mapping
 	var headCommitID string
-	err = h.db.Session().Query(`
+	err := h.db.Session().Query(`
 		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).Scan(&headCommitID)
 	if err != nil {

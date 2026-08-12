@@ -14,7 +14,10 @@
 
 ## Token Creation
 
-**Key issue:** The `sesamefs_auth` cookie is set with `httpOnly=false`, meaning JavaScript (and any XSS) can read it.
+**Fixed (`ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01`):** The `sesamefs_auth` cookie is now set with
+`httpOnly=true`, so JavaScript (and any XSS) can no longer read it. No code in this repository
+was found reading its value from JS; the desktop-client SSO flow gets its token via polling,
+not by reading this cookie.
 
 ```mermaid
 flowchart TD
@@ -22,10 +25,10 @@ flowchart TD
     Login --> GenToken["Generate crypto/rand token"]
     GenToken --> HashToken["SHA-256 hash"]
     HashToken --> StoreDB["Store hash in Cassandra<br/>user_id, org_id, expiry"]
-    StoreDB --> SetCookie["Set cookie<br/>sesamefs_auth = email@token<br/>httpOnly = false"]
+    StoreDB --> SetCookie["Set cookie<br/>sesamefs_auth = email@token<br/>httpOnly = true"]
     SetCookie --> Done["Return token to client"]
 
-    style SetCookie fill:#ffc107,color:#000
+    style SetCookie fill:#28a745,color:#fff
 ```
 
 ---

@@ -78,6 +78,23 @@ Kept briefly so a reader who arrives with the old blocker list can see it moved
 rather than vanished. Drop rows once they stop being recent; status of record
 stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
+- `ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01` — **Fixed 2026-08-12** (readiness SEC-3 /
+  NF-3). The `sesamefs_auth` cookie is `httpOnly=true` on every OIDC login and
+  logout writer, funneled through one `setAuthCookie` helper per package. Verified
+  first that nothing in this repository reads it from JS. `Secure` is untouched —
+  that is `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01`, still open.
+- `ISSUE-SYNC-UNBOUNDED-BODIES-01` — **Fixed 2026-08-12** (registry X9). All four
+  remaining sync handlers read through `readLimitedRequestBody`; `pack-fs` and
+  `check-fs` also gained the id-count cap that stops a body under the byte cap from
+  expanding ~17x. It bounds one request body at a time and nothing more — and for
+  `RecvFS`, only the **compressed** body at that. The three residuals are all above:
+  the aggregate term is `ISSUE-SYNC-METADATA-CONCURRENCY-01`,
+  the inflate is `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`, and the work an
+  accepted id list triggers is `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`.
+- `ISSUE-BATCH-MOVE-FALSE-SUCCESS-01` — **Fixed 2026-08-12.** Legacy same-repo batch
+  move via `POST /file/move` returned `{"success":true,"moved":N}` without touching
+  the FS tree; it now returns 501 pointing at `sync-batch-move-item/`. Still
+  unimplemented, no longer lying about it. The UI never used this path.
 - `ISSUE-SHARELINK-PASSWORD-BYPASS-01` — **Fixed 2026-07-25** (readiness NF-1 /
   SH-6). Gate runs before the inline read and the OnlyOffice token mint; the
   bundle builder drops protected content; the OnlyOffice helper fails closed.
@@ -122,16 +139,17 @@ on every replica in every DC until both close.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01` | HIGH | `sesamefs_auth` is a replayable bearer in a JS-readable cookie → XSS = token theft | Readiness SEC-3 / NF-3 |
+| `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` | HIGH | `recv-fs` inflates each object unbounded; 128 MiB body → ~126 GiB at DEFLATE's measured 1029:1 | Found auditing X9; the body cap does not bound this |
+| `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` | HIGH | `pack-fs` materializes the whole response: ~409k repeats of one valid id, `PermissionR` only. `check-fs` shares the fan-out | Found auditing X9; the fs-id equivalent of the closed X11 |
+| `ISSUE-RECVFS-FSID-UNVERIFIED-01` | ? | `recv-fs` never checks the client's fs_id hashes the content it stores — but the stored-vs-computed mapping may make that by design | Open **question**; settle the contract before "fixing" |
 | `ISSUE-ZIP-STREAM-LATEFAIL-01` | HIGH | ZIP download can truncate after `200 OK` | Readiness DL-2 |
 | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | MEDIUM | Cross-library block read (BOLA), gated only by knowing the 256-bit hash | Readiness B2/SEC-1 |
 | `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` | MEDIUM | Download cap and `single_use` are race-bypassable | Readiness NF-2 / SH-5 |
-| `ISSUE-SYNC-UNBOUNDED-BODIES-01` | MEDIUM | Four sync handlers still read the body unbounded | Registry X9 |
+| `ISSUE-SYNC-METADATA-CONCURRENCY-01` | MEDIUM | Sync metadata routes bound one body, not N — 16 concurrent `recv-fs` ≈ 2 GiB | Successor to X9; X10's equivalent for the block routes is closed |
 | `ISSUE-AUDIT-TRAIL-INCOMPLETE-01` | MEDIUM | `audit_log` records deletions but never grants | Readiness NF-6 / RB-3 |
 | `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` | MEDIUM | S3 PUT precedes durable intent; a crash leaves an undiscoverable object | Registry X3 |
 | `ISSUE-QUOTA-RESERVATION-01` | MEDIUM | TOCTOU between quota pre-check and publish | Readiness UP-3 |
 | `ISSUE-DOWNLOAD-NO-404-01` | MEDIUM | Deleted file answers 503 forever; layers disagree | Registry X8 — **accepted cost of PR-6** |
-| `ISSUE-BATCH-MOVE-FALSE-SUCCESS-01` | MEDIUM | Legacy `moveBatchFiles` returns `success:true` without moving | API footgun; UI uses `SyncBatchMove` |
 | `ISSUE-ACCOUNTS-M2M-PATH-01` | MEDIUM | Admin API key channel works; M2M lacks `source=accounts` + idempotency | Code-verified 2026-07-25 |
 | `ISSUE-MID-OPERATION-REVOCATION-01` | MEDIUM | Revoke mid chunked-upload / mid-stream / ZIP does not abort in flight | UP-5 / DL-5 / RB-4 |
 | `ISSUE-SHARELINK-NO-ORG-SCOPE-01` | MEDIUM | No org-internal share-link scope (token-only, anonymous) | SH-2 — product / BY DESIGN option |

@@ -6328,35 +6328,46 @@ than hardened.
 
 ### ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01: `sesamefs_auth` is a replayable bearer token in a JS-readable cookie
 
-**Status**: 🟡 Open — "by design" (seahub compatibility), flagged for reassessment
+**Status**: ✅ Fixed 2026-08-12
 **Severity**: High — an XSS yields full session-token theft, not merely a read surface
-**Affected**: `internal/api/server.go` — the OIDC callback cookie write and the auth resolution order
-**Source of record**: SEC-3 / NF-3 in `docs/PROD-SECURITY-READINESS-20260724.md`
+**Affected**: `internal/api/server.go`, `internal/api/v2/auth.go` — the OIDC callback cookie
+write and the auth resolution order
 
-#### Problem
+#### What Is True Today
 
-The OIDC callback sets `sesamefs_auth` with `httpOnly=false` to match the seahub
-convention. That cookie's value is not a display artifact: the auth middleware
-accepts it as a credential (it sits in the resolution order between dev tokens
-and the `Authorization` header), so it is a live, replayable session/API bearer.
-Sync-client sessions can carry a TTL up to 180 days.
+All four previously non-`HttpOnly` writers of `sesamefs_auth` — the OIDC login and logout
+pair in each of `internal/api/server.go` and `internal/api/v2/auth.go` — now set
+`httpOnly=true`, funneled through one `setAuthCookie` helper per package so the flag can't
+drift between login and logout again. `handleAutoLogin` is a fifth writer of this cookie and
+is untouched: it already set `httpOnly=true`, so it was never part of this defect. `Secure` is
+unchanged (still derived from `c.Request.TLS`; the separate `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01`
+covers the one site — `handleAutoLogin` — that hardcodes it, and the broader TLS-terminating-
+proxy gap tracked in `TECHNICAL-DEBT.md` #21).
 
-Consequence: any XSS anywhere on the origin reads `document.cookie` and walks
-away with a long-lived credential. The original SEC-3 rating of Medium
-understated this by treating the cookie as an information leak rather than as
-the credential it is.
+One knock-on, dev-only: seeding the session from the browser console
+(`document.cookie = "sesamefs_auth=..."`, the SSO-less dev login in `README.md`) is now
+ignored by the browser whenever a real `HttpOnly` cookie of that name already exists — per
+RFC 6265 a script may not overwrite one. It still works from a clean profile, and the README
+records the caveat. Playwright's `context.addCookies` is unaffected because it writes to the
+browser's cookie jar directly, not through JS, so `mobile-frontend/e2e-sesamefs/` keeps working.
 
-#### Fix Direction
-
-Either stop accepting the cookie as a credential (make it a non-authoritative
-hint and require the `Authorization` header), or set `httpOnly=true` and give
-the frontend whatever non-secret signal it actually needs. Establish first what
-reads it client-side — if nothing does, this is a one-line change.
+What was verified before closing: a repository-wide search (including `mobile-frontend/`)
+found no JS code anywhere in this repository that reads this cookie's value — the only
+`document.cookie` touching it was a best-effort clear in `frontend/src/utils/auth-state.js`,
+and the server already clears it authoritatively on logout regardless. The desktop-client SSO
+flow gets its token via `clientSSOStore` polling (`docs/OIDC.md`), not by reading this cookie
+from an embedded WebView, contradicting the comment that used to justify `httpOnly=false`. The
+project owner confirmed no client outside this repository depends on reading it either.
+`internal/api/server_test.go` (`TestServerSetAuthCookie`) and `internal/api/v2/auth_test.go`
+(`TestAuthHandlerSetAuthCookie`, and the extended `TestLogout`) pin `HttpOnly` on both helpers,
+covering login and logout without needing to mock a real OIDC exchange.
 
 #### Related Docs
 
-- `docs/PROD-SECURITY-READINESS-20260724.md` (SEC-3, NF-3, checklist item 6)
-- `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01` (the same cookie, set inconsistently elsewhere)
+- `docs/PROD-SECURITY-READINESS-20260724.md` (SEC-3, NF-3, checklist item 6) — dated snapshot,
+  not retro-edited; this entry is the live status.
+- `docs/OIDC.md`, `docs/diagrams/auth-layer.md` — updated to match.
+- `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01` (the same cookie's `Secure` flag, still open, separate fix)
 
 ---
 
@@ -6531,60 +6542,363 @@ reuse the sysadmin retention messaging helpers on the org-admin frontend shell
 
 ### ISSUE-SYNC-UNBOUNDED-BODIES-01: Four sync handlers still read the request body unbounded
 
-**Status**: 🟡 Open — PR-10 closed the two block routes, not the class
+**Status**: ✅ Fixed 2026-08-12
 **Severity**: Medium — authenticated memory-pressure DoS
 **Affected**: `PutCommit`, `PackFS`, `RecvFS`, `CheckFS` in `internal/api/sync.go`
 **Source of record**: **X9** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`
 
-#### Problem
+#### What Is True Today
 
-PR-10 (#146) bounded `PutBlock` and `check-blocks` behind the shared
-`readLimitedRequestBody` helper, closing F12. Four sibling handlers on the same
-`SyncHandler` keep the identical unbounded `io.ReadAll(c.Request.Body)` — verified
-present 2026-07-25. F12 was scoped to the two block routes, so an authenticated
-client can drive the same memory-pressure DoS through any of the four.
+All four handlers now read through the shared `readLimitedRequestBody` helper (the
+same one PR-10 wired into `PutBlock`/`check-blocks` for F12), each with a cap
+derived from its own payload profile rather than one shared constant:
 
-This entry exists because X9 previously named an issue ID that had never been
-created, leaving the registry with a dangling reference.
+- `PutCommit`, `PackFS`, `CheckFS` — plain consts (`maxPutCommitBodyBytes` = 1 MiB;
+  `maxPackFSBodyBytes`, `maxCheckFSBodyBytes` = 16 MiB, matching `check-blocks`'s
+  existing const, since both carry the same small id-list shape).
+- `RecvFS` — **configuration**, not a const (`config.SeafHTTP.RecvFSMaxBytes`,
+  default 128 MiB via `config.DefaultRecvFSMaxBytes`, resolved by
+  `syncRecvFSMaxBytes()`). Unlike the other three, RecvFS carries a real batch of
+  packed FS objects with no measured client batch size or protocol-documented
+  ceiling to anchor a fixed number on (`docs/SEAFILE-SYNC-PROTOCOL-RFC.md` does
+  not specify one) — the default is deliberately generous, and an operator can
+  raise it via `SEAFHTTP_RECV_FS_MAX_BYTES` or `recv_fs_max_bytes` without a code
+  change if a real large commit needs more headroom. Zero and negative values are
+  rejected at boot, and a malformed env value is reported rather than silently
+  dropped back to the default: an unbounded body is the defect the cap closes, so
+  no configuration may restore it.
 
-#### Fix Direction
+**A byte cap alone was not enough on the two id-list routes.** `pack-fs` and
+`check-fs` parsed their id list the naive way — `strings.Split` on the whole body,
+or `json.Unmarshal` into a `[]string` — so a body *under* the 16 MiB cap still
+expanded ~17x: 16 MiB of bare newlines becomes ~16.7M string headers (~268 MB).
+That is the cardinality half of the same defect, already solved for `check-blocks`
+by a parser that refuses during the parse instead of after the list is
+materialized. Both routes now share it (`parseBoundedIDList`, generalized from
+`parseCheckBlockIDs`), with id caps **derived from their byte caps**
+(`maxPackFSIDs`, `maxCheckFSIDs` = byte cap / `minFSIDWireBytes`). Deriving them
+matters: the densest well-formed body the byte cap admits carries exactly the cap
+in ids, so the id cap is unreachable for real traffic and can only fire on
+degenerate input — it is not a new limit on large libraries.
+`TestFSIDCapsCannotCutWellFormedBodies` pins that invariant arithmetically;
+`TestFSIDCountCapsCutAmplification` asserts the 413 through the handler and,
+separately, measures the parse at 16.0 MB — just its `string(body)` — against the
+same 96 MB ceiling the `check-blocks` canary uses. The two are separate on purpose:
+an allocation canary wrapped around a whole round trip also measures
+`readLimitedRequestBody`'s 16 MiB read, which the ceiling was never derived for and
+which varies enough by platform to make a shared threshold meaningless (50.6 MB on
+go1.26/windows, 113.9 MB on go1.25/linux, same code).
 
-Each handler needs a cap derived from its own payload profile — a commit object,
-a packed FS batch, a received FS batch and an FS existence query have nothing in
-common, so a single shared constant would be wrong. Once each cap is chosen the
-change is one line per handler through `readLimitedRequestBody`. Note the same
-caveat as X10/X11: a per-request cap bounds one request, not the aggregate, and
-does not bound the work an accepted request triggers downstream.
+**Scope of the fix, precisely:** this closes the **unbounded body per request**
+and the id-list amplification within it. Three things it does **not** do, all now
+tracked rather than left implicit:
+
+- It does not bound aggregate memory under concurrency — N concurrent `RecvFS`
+  requests near the 128 MiB cap can still sum to N × the cap
+  (`ISSUE-SYNC-METADATA-CONCURRENCY-01`).
+- **It does not make `RecvFS` a bounded-memory handler.** The body cap bounds the
+  *compressed* bytes; `RecvFS` then inflates each packed object with an unbounded
+  `io.ReadAll(zlibReader)`, and DEFLATE's best case is ~1029:1 (measured), so a
+  128 MiB body can inflate to ~126 GiB. The buffered body is not this handler's
+  largest allocation, and reading this entry as "recv-fs memory is now bounded"
+  would be wrong (`ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`).
+- **The derived id caps are not a work bound.** They were derived against one axis
+  only — never reject a well-formed body — and are silent on what an accepted list
+  costs. Nothing deduplicates it, so ~409,000 repeats of one valid id are a
+  well-formed request; `pack-fs` materializes the whole response for it. No id cap
+  is a work bound on its own — `check-blocks`' 100,000 is a parse bound too, and
+  what closed X11 there was dedup, context, fan-out and admission, not the number.
+  Tracked as `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`.
 
 #### Related Docs
 
 - `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X9, and X10/X11 for what a cap is not)
 - `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-10 scope)
+- `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate bound this fix does not provide)
+
+---
+
+### ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01: `pack-fs`/`check-fs` bound the parse, not the work it triggers
+
+**Status**: 🟡 Open — found 2026-08-12 auditing the X9 caps
+**Severity**: High for `pack-fs` (one request can materialize a multi-GiB response), Medium for `check-fs`
+**Affected**: `PackFS`, `CheckFS` in `internal/api/sync.go`
+**Source of record**: opened 2026-08-12; the fs-id equivalent of `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` (X11)
+
+#### Problem
+
+`maxPackFSIDs`/`maxCheckFSIDs` (409,200) are derived from the 16 MiB byte caps so
+they can never cut a well-formed body — see `ISSUE-SYNC-UNBOUNDED-BODIES-01`. That
+derivation was chosen against exactly one axis, *do not reject real traffic*, and is
+silent on a second: **the work an accepted list triggers**. Nothing deduplicates the
+list, so a well-formed request may repeat one valid fs id ~409,000 times.
+
+`PackFS` is the severe half. Per requested id it issues one sequential Cassandra
+point read, marshals and zlib-compresses the object, and appends it to a single
+`bytes.Buffer`, which is only handed to `c.Data` once the whole loop finishes — so
+the entire response is materialized in memory. With a repeated id, response size is
+`409,200 × (that object's compressed size)`: ~80 MiB for a small file object, and
+multiple GiB if the repeat target is a large directory. It requires only
+`PermissionR`.
+
+`CheckFS` shares the fan-out but not the buffer: the per-id check is a Cassandra
+query, **not** a lookup in the `computedToStored` map (the map only translates the
+id), so an accepted list is ~409,000 sequential point reads holding the handler.
+`buildFSIDMapping` is per-request, not per-id, so it is not the amplifying term.
+
+**X11 already met this exact shape on `check-blocks`, and its dated note describes
+it almost word for word:** "identical ids were resolved once per occurrence rather
+than once. So the cheapest possible request — one id repeated, then abandoned — was
+also among the most expensive to serve." It also names a second term this entry
+would otherwise miss: that route's mapping read "took no `context` at all, so a
+client disconnect could not stop the loop". `PackFS` and `CheckFS` have the same
+gap — both call `h.db.Session().Query(...)` with no context, so abandoning the
+request does not stop the work it started.
+
+Note what the 100,000 cap on `check-blocks` is and is not. The registry is explicit
+that it "was chosen as a safe parse bound rather than validated against Cassandra,
+the S3 pool, response size or client cancellation" — it is **not** a work bound and
+is not what closed X11. So "these routes allow 4x check-blocks' cap" is the wrong
+comparison to draw; the right one is that `check-blocks` grew the controls below and
+these two routes have none of them.
+
+None of this is new in the X9 fix — before it, both routes had no body cap and
+therefore no id bound whatsoever, so the current state is strictly better. It is
+filed because the X9 caps should not be mistaken for a work bound.
+
+#### Fix Direction
+
+X11's resolution is the template, and it is worth following closely because it
+already answered the question this entry would otherwise re-litigate. On
+`check-blocks` the route now deduplicates ids **before any lookup**, resolves them
+through a context-carrying DB call at a configured fan-out, and takes an admission
+from its **own** limiter instance — separate capacity, so one route storming cannot
+spend the other's slots. The same four moves apply here.
+
+Two route-specific additions:
+
+- `PackFS` also needs its **response** bounded, not just its lookups: dedup fixes
+  the DB fan-out but a repeated id still emits one record per occurrence into a
+  single `bytes.Buffer`. Prefer streaming records to `c.Writer` over accumulating
+  them. Whoever does this must decide what happens when a cap is reached *after*
+  headers are on the wire — at that point a clean 413 is no longer available, which
+  is the same late-failure class as `ISSUE-ZIP-STREAM-LATEFAIL-01`.
+- Confirm the client contract before deduplicating the **response** (as opposed to
+  the work): the response is a stream of `(id, size, data)` records and a client
+  indexing by id should not care, but that must be verified, not assumed. Resolving
+  each distinct id once while still emitting one record per requested id needs no
+  such confirmation and is the safe half.
+
+**Do not lower the id caps as part of this.** X11 considered exactly that and
+deliberately declined: it kept 100k as the default and turned it into a validation
+ceiling, on the grounds that "lowering it on a guess would trade a bounded
+amplification for an unbounded risk of 413-ing a legitimate initial sync." It added
+`sync_check_blocks_ids_per_request` as the evidence a future reduction would need.
+The equivalent metric for these two routes is the prerequisite here too — the caps
+are derived to be unreachable by well-formed bodies precisely so they never do the
+413-ing X11 warns about.
+
+#### Related Docs
+
+- `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` / registry X11 and its 2026-07-31 dated note (the same defect on the block route; closed by dedup-before-lookup, a context-carrying resolve at a configured fan-out, and its own admission capacity — **not** by lowering the id cap, which it deliberately kept)
+- `ISSUE-SYNC-UNBOUNDED-BODIES-01` (where the 409,200 caps come from, and why they are derived that way)
+- `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate term; this issue is per-request)
+
+---
+
+### ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01: `recv-fs` inflates each packed object unbounded
+
+**Status**: 🟡 Open — found 2026-08-12 while auditing the X9 caps
+**Severity**: High — one authenticated request can exhaust process memory; the body cap does not bound it
+**Affected**: `RecvFS` in `internal/api/sync.go` (the `io.ReadAll(zlibReader)` inside the per-object loop)
+**Source of record**: opened 2026-08-12; pre-existing, **not** introduced by `ISSUE-SYNC-UNBOUNDED-BODIES-01`
+
+#### Problem
+
+`recv-fs` carries packed objects as `40-byte id + 4-byte size + zlib-compressed JSON`.
+The X9 cap (`seafhttp.recv_fs_max_bytes`, default 128 MiB) bounds the **compressed**
+body. The handler then decompresses each object with an unbounded `io.ReadAll` over
+a `zlib.Reader`, so the largest allocation the handler makes is not the one that was
+capped.
+
+Measured, not estimated — `compress/zlib` at `BestCompression` over a run of
+identical bytes:
+
+| plaintext | compressed | ratio |
+|---|---|---|
+| 1 MiB | 1,043 B | 1005:1 |
+| 16 MiB | 16,320 B | 1028:1 |
+| 128 MiB | 130,466 B | 1029:1 |
+
+So a **128 KiB** request inflates to ~128 MiB, and a request at the 128 MiB body cap
+inflates to ~126 GiB. The `objSize` header is attacker-controlled and only checked
+against the remaining body length, so a single object may span the whole body.
+
+This is why closing X9 must not be read as "recv-fs memory is bounded": it bounds the
+buffered body, which is not the dominant term.
+
+#### Fix Direction
+
+Bound the decompressed side, not just the compressed one — `io.LimitReader` around
+the `zlib.Reader` (plus a total across the batch, since the loop runs per object),
+rejecting rather than truncating, because a truncated fs object would be silently
+stored with a body that no longer hashes to its `fs_id`.
+
+The cap value should **not** be guessed the way `recv_fs_max_bytes` had to be. Here
+there is something to measure: an fs object is either a directory's `dirents` or a
+file's `block_ids`, and both have computable worst cases from this deployment's own
+data (largest directory entry count; largest file ÷ block size). Measure those, then
+set a per-object cap with real headroom. Until then, note that the compressed body
+cap does bound *how much work* an attacker gets per request — it just does not bound
+the memory that work allocates.
+
+When it is implemented, `io.LimitReader(zlibReader, max)` alone is not the fix:
+reading `max` and accepting what came back silently truncates. Read `max+1` (or
+check for a trailing byte) and **reject the object** — a partial decompressed object
+must not be parsed or persisted as if the complete packed object had arrived. Note
+that the reason is *not* "the stored body would no longer hash to its `fs_id`":
+whether that equality holds at all is exactly what
+`ISSUE-RECVFS-FSID-UNVERIFIED-01` leaves open, so this fix must not be justified by
+an invariant this repository has not established.
+
+#### Related Docs
+
+- `ISSUE-SYNC-UNBOUNDED-BODIES-01` (the body cap this sits behind)
+- `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate term; N concurrent inflates)
+- `ISSUE-RECVFS-FSID-UNVERIFIED-01` (the same handler trusts the id it stores)
+- `docs/SEAFILE-SYNC-PROTOCOL-RFC.md` §5.6.1 (the packed-object wire format)
+
+---
+
+### ISSUE-RECVFS-FSID-UNVERIFIED-01: `recv-fs` stores the client's fs_id without checking it addresses the content
+
+**Status**: 🟡 Open — **question, not a diagnosed defect**; establish the Seafile contract before anyone "fixes" it
+**Severity**: Unrated pending that answer — either content-addressing integrity, or by design
+**Affected**: `RecvFS` in `internal/api/sync.go`
+**Source of record**: opened 2026-08-12 during the X9 audit
+
+#### Problem
+
+`RecvFS` takes the 40 bytes the client supplies, decompresses the object body, and
+inserts `fs_objects(library_id=repoID, fs_id=<client-supplied>, …)`. It never
+recomputes `SHA-1(jsonData)` to confirm the id addresses the content it is filed
+under. The handler's own comment asserts the invariant it does not check: *"the
+fs_id is the SHA1 hash of the exact JSON content"*.
+
+Not for want of the machinery. `computeCorrectedObject` in this same file hashes an
+object's JSON to derive its `ComputedFSID`, which is how the computed↔stored mapping
+is built at all — so the write path declines a check the read path depends on. And
+on the read side the id *is* treated as content-addressed:
+`internal/integration/sync_protocol_regression_test.go` records that the served JSON
+"must re-hash to the requested fs_id (otherwise the desktop client rejects the
+object)".
+
+#### Fix Direction
+
+Not "add a hash check". The obvious fix — recompute and reject on mismatch — is very
+likely **wrong here**, and that is the point of filing this as a question.
+
+SesameFS deliberately maintains a *stored* fs id that differs from the *computed*
+one. `CheckFS` says so directly ("Client sends COMPUTED fs_ids (SHA-1 of corrected
+JSON), but we store objects with their ORIGINAL (stored) fs_ids"), and
+`buildFSIDMapping`/`collectCorrectedObjects` — built on the `computeCorrectedObject`
+hashing above — exist precisely to translate between them. A strict
+`fs_id == SHA-1(body)` check in `RecvFS` would reject writes this design intends to
+accept. The existence of that mapping layer is the whole reason this is a question:
+the divergence is known and compensated for, so what is undetermined is whether the
+write path is *allowed* to introduce a new one.
+
+So the real question is which of these is true, and the answer decides everything:
+
+- the id is genuinely content-addressed and the mapping layer compensates for a
+  historical divergence — in which case verification belongs here, and its absence
+  means a client can file arbitrary content under an id another client will later
+  fetch by hash; or
+- the id is a client-chosen key that this deployment never treated as a hash — in
+  which case the comments asserting otherwise are the bug, and they should be
+  corrected before someone adds a check that breaks sync.
+
+Answer that from the Seafile protocol contract and the mapping layer's history
+first. Do not add a hash check on the strength of this entry alone.
+
+#### Related Docs
+
+- `docs/SEAFILE-SYNC-PROTOCOL-RFC.md` §5.6.1 (the wire format and its id definition)
+- `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` (same handler, unrelated cause)
+
+---
+
+### ISSUE-SYNC-METADATA-CONCURRENCY-01: The sync metadata routes have no aggregate memory bound
+
+**Status**: 🟡 Open — successor to X9's per-request cap
+**Severity**: Medium — authenticated memory-pressure DoS, aggregate rather than per-request
+**Affected**: `RecvFS`, `PackFS`, `CheckFS`, `PutCommit` in `internal/api/sync.go`
+**Source of record**: opened 2026-08-12 when `ISSUE-SYNC-UNBOUNDED-BODIES-01` closed
+
+#### Problem
+
+`ISSUE-SYNC-UNBOUNDED-BODIES-01` bounds **one** request on each of these routes.
+It does not bound N of them. `RecvFS` is the one that matters: its default cap is
+128 MiB and its body is fully buffered before parsing, so 8 concurrent uploads
+cost ~1 GiB of body buffers, 16 cost ~2 GiB, before anything else the process is
+doing. The route group carries only `syncAuthMiddleware` — no concurrency gate, no
+rate limit, no memory budget.
+
+This is the same shape as **X10** on the block routes, and X10 is the reason this
+entry exists as its own issue: X10 was closed by work scoped explicitly to
+`PutBlock` (`sync_block_max_inflight_per_node`, `sync_block_memory_budget_bytes`,
+the admission limiter and its 503 + `Retry-After` semantics). None of that machinery
+covers the metadata routes, so closing X9 without opening this would have retired
+the narrow finding and lost the layer underneath it.
+
+#### Fix Direction
+
+The block-route admission work is the template, not a new design: a bound on
+in-flight metadata readers acquired **before** the buffering read, answering
+**503 + `Retry-After`** after a bounded wait — never 429, which the official client
+does not classify as retryable. Two details differ from the block path and should be
+settled first:
+
+- `RecvFS`'s 128 MiB default is generous precisely because no client batch size was
+  ever measured. Measuring what the official client actually sends per `recv-fs`
+  (upstream batches packed objects rather than sending a whole commit at once) would
+  likely allow a far smaller cap, which is cheaper than an admission gate and should
+  be evaluated before building one.
+- The metadata routes should not draw from the block routes' capacity: one storming
+  must not spend the other's slots, the same separation X10's dated note records.
+
+#### Related Docs
+
+- `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X10 — the closed block-route equivalent,
+  and its dated note on capacity separation)
+- `ISSUE-SYNC-UNBOUNDED-BODIES-01` (the per-request cap this sits on top of)
+- `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` (the umbrella X10 was subcontract B of)
 
 ---
 
 ### ISSUE-BATCH-MOVE-FALSE-SUCCESS-01: Legacy `moveBatchFiles` returns success without moving
 
-**Status**: 🟡 Open — API footgun; primary UI path is safe
+**Status**: ✅ Fixed 2026-08-12 — false success fixed; legacy same-repo batch move via
+`POST /file/move` remains unsupported and now returns 501 instead of a fabricated 200
 **Severity**: Medium — false-success on a still-reachable handler
 **Affected**: `FileHandler.moveBatchFiles` in `internal/api/v2/files.go` (reached when `MoveFile` gets `len(srcPaths) > 1`)
 **Source of record**: PENDING-ISSUES-AUDIT-2026-05-14 item 4; code-verified 2026-07-25
 
-#### Problem
+#### What Is True Today
 
-`moveBatchFiles` still contains `// TODO: Implement actual batch move logic`
-and returns `{"success": true, "moved": N}` for same-repo multi-file moves
-without updating the FS tree. Cross-repo batch move correctly returns 501.
+`moveBatchFiles` previously contained `// TODO: Implement actual batch move logic`
+and returned `{"success": true, "moved": N}` for same-repo multi-file moves
+without updating the FS tree; cross-repo batch move already correctly returned 501.
+It now returns `501 Not Implemented` for the same-repo case too, with an error
+pointing at the real endpoint. This is a bug fix, not new functionality: legacy
+same-repo batch move via this endpoint is still not implemented, it just no
+longer lies about having succeeded.
 
-The **UI** path does not use this: `seafileAPI.moveDirWithPolicy` goes through
-`SyncBatchMove` / `AsyncBatchMove` → `processSingleItem` in
-`batch_operations.go` (integration-tested). The defect is an API client that
-posts multiple `src` paths to the legacy `MoveFile` endpoint.
-
-#### Fix Direction
-
-Return `501 Not Implemented` (or wire to `processSingleItem`) until the batch
-path is real. Do not leave a success response on a no-op.
+The **UI** path never used this and is unaffected: `seafileAPI.moveDirWithPolicy`
+goes through `POST /api/v2.1/repos/sync-batch-move-item/` /
+`async-batch-move-item/` → `SyncBatchMove`/`AsyncBatchMove` → `processSingleItem`
+in `batch_operations.go` (integration-tested). The defect was reachable only by an
+API client posting multiple `src` paths to the legacy `MoveFile` endpoint.
 
 #### Related Docs
 

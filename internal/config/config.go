@@ -596,6 +596,24 @@ type SeafHTTPConfig struct {
 	// route is the defect (F12), so there is no configuration that restores it.
 	SyncBlockMaxBytes int64 `yaml:"sync_block_max_bytes"`
 
+	// RecvFSMaxBytes bounds one POST /seafhttp/repo/:repo_id/recv-fs body: a
+	// batch of packed FS objects (40-byte id + 4-byte size + zlib-compressed
+	// JSON per entry) the desktop client uploads at the end of a commit.
+	// RecvFS buffers the whole body before parsing (ISSUE-SYNC-UNBOUNDED-BODIES-01
+	// / X9), so this is the per-request buffered-body bound.
+	//
+	// Unlike sync_block_max_bytes, there is no measured client batch size or
+	// protocol-documented ceiling to anchor this on: the RFC in
+	// docs/SEAFILE-SYNC-PROTOCOL-RFC.md does not specify one, and this route
+	// carries a genuinely variable-sized payload (a real object batch, not a
+	// small id list like check-fs/pack-fs). The default is therefore
+	// deliberately generous rather than measured, so an operator can raise it
+	// without a code change if a real large commit needs more headroom.
+	//
+	// Zero is rejected the same way as sync_block_max_bytes: an unbounded body
+	// on this route is the defect this field exists to close.
+	RecvFSMaxBytes int64 `yaml:"recv_fs_max_bytes"`
+
 	// SyncBlockMaxInflightPerNode caps concurrent block uploads that have been
 	// admitted past the gate on this process, and is therefore the term that
 	// turns SyncBlockMaxBytes into an actual memory bound:
@@ -786,6 +804,13 @@ type SeafHTTPConfig struct {
 const (
 	DefaultSyncBlockMaxBytes int64 = 16 * 1024 * 1024
 	MaxSyncBlockMaxBytes     int64 = 64 * 1024 * 1024
+
+	// RecvFS has no measured client batch size to anchor a default on (see the
+	// field doc on RecvFSMaxBytes), so this default is deliberately generous
+	// rather than tight, with no validation ceiling — an operator raising it is
+	// making an informed deployment choice, not restoring a mistake the way an
+	// oversized SyncBlockMaxBytes usually is.
+	DefaultRecvFSMaxBytes int64 = 128 * 1024 * 1024
 
 	// Download admission sizes are derived from the D6 measurements. Encrypted
 	// prefetch keeps the current and next block plus the encrypted source, so the
@@ -1510,6 +1535,7 @@ func DefaultConfig() *Config {
 			ZipMaxBytes:            10 * 1024 * 1024 * 1024,
 			ChunkedStagingMaxBytes: 0,
 			SyncBlockMaxBytes:      DefaultSyncBlockMaxBytes,
+			RecvFSMaxBytes:         DefaultRecvFSMaxBytes,
 
 			SyncBlockMaxInflightPerNode: DefaultSyncBlockMaxInflightPerNode,
 			SyncBlockMemoryBudgetBytes:  DefaultSyncBlockMemoryBudgetBytes,
@@ -1909,7 +1935,18 @@ func (c *Config) applyEnvOverrides() {
 			c.SeafHTTP.ZipMaxBytes = i
 		}
 	}
-	// Unlike the neighbours above, a malformed value is reported rather than
+	// Reported rather than silently dropped, for the same reason as the sync
+	// block cap below: falling back to the default would leave an operator who
+	// deliberately raised the recv-fs cap running the lower one with no signal.
+	if v := os.Getenv("SEAFHTTP_RECV_FS_MAX_BYTES"); v != "" {
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			c.addEnvOverrideError("SEAFHTTP_RECV_FS_MAX_BYTES is invalid: %v", err)
+		} else {
+			c.SeafHTTP.RecvFSMaxBytes = i
+		}
+	}
+	// Unlike the zip neighbours above, a malformed value is reported rather than
 	// silently dropped: falling back to the default would leave an operator who
 	// deliberately raised the cap running the lower one with no signal.
 	if v := os.Getenv("SEAFHTTP_SYNC_BLOCK_MAX_BYTES"); v != "" {
@@ -3212,6 +3249,13 @@ func (c *Config) Validate() error {
 	if c.SeafHTTP.SyncBlockMaxBytes > MaxSyncBlockMaxBytes {
 		return fmt.Errorf("seafhttp.sync_block_max_bytes is %d, above the %d ceiling; the official client CDC maximum is 4 MiB and SesameFS's related server-side split is 8 MiB, so a larger value is likely derived from the unrelated web uploader ceiling",
 			c.SeafHTTP.SyncBlockMaxBytes, MaxSyncBlockMaxBytes)
+	}
+	// Same rule as sync_block_max_bytes, same reason: an unbounded recv-fs body is
+	// the defect this cap exists for. There is deliberately no ceiling to match —
+	// unlike the block cap, no measured client batch size makes a large value
+	// self-evidently a mistake, so raising it is an informed operator choice.
+	if c.SeafHTTP.RecvFSMaxBytes <= 0 {
+		return fmt.Errorf("seafhttp.recv_fs_max_bytes must be greater than zero (an unbounded recv-fs body is not a supported configuration)")
 	}
 	// The in-flight caps are what make sync_block_max_bytes an aggregate bound.
 	// Zero is accepted here — unlike the body cap — because disabling the

@@ -160,6 +160,15 @@ seafhttp:
   # Override: SEAFHTTP_SYNC_BLOCK_MAX_BYTES
   # NOT an aggregate bound: N concurrent uploads still cost N x this value.
   sync_block_max_bytes: 16777216 # 16 MiB
+  # Bounds one recv-fs body (a batch of packed FS objects the desktop client
+  # uploads at the end of a commit). Unlike sync_block_max_bytes, there is no
+  # measured client batch size to anchor this on, so the default is deliberately
+  # generous — raise it if a real large commit needs more headroom.
+  # Override: SEAFHTTP_RECV_FS_MAX_BYTES
+  # No ceiling, unlike sync_block_max_bytes: raising this is an informed operator
+  # choice, not a value that is self-evidently a mistake. Zero and negative are
+  # rejected at boot — an unbounded body is the defect this cap exists to close.
+  recv_fs_max_bytes: 134217728 # 128 MiB
   # Aggregate bound on concurrent block uploads (subcontract B / X10). Without
   # these, sync_block_max_bytes above bounds ONE request while N concurrent
   # uploads still cost N x the cap.

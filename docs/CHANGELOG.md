@@ -8,6 +8,141 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-12 - Three sync findings opened while auditing the X9 caps (no code change)
+
+Auditing the caps above surfaced three follow-up findings on the same handlers: **two
+confirmed defects and one protocol-contract question**. All three are **pre-existing**
+— the X9 work did not introduce any of them, and for the two memory defects it
+narrowed the surface rather than widening it — so they are documented here and left
+for their own changes rather than folded into this branch. (The third is a semantic
+question about the write path; a body cap neither helps nor hurts it.)
+
+- `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` (**HIGH**) — `recv_fs_max_bytes` bounds the
+  *compressed* body; `RecvFS` then inflates each packed object with an unbounded
+  `io.ReadAll(zlibReader)`. Measured `compress/zlib` at `BestCompression` over a run of
+  identical bytes: 1005:1 at 1 MiB, 1028:1 at 16 MiB, 1029:1 at 128 MiB. So a 128 KiB request
+  inflates to ~128 MiB and one at the body cap to ~126 GiB. The buffered body is not this
+  handler's dominant allocation.
+- `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` (**HIGH**) — the derived id caps
+  (`maxPackFSIDs`/`maxCheckFSIDs`, 409,200) were derived against one axis, *never reject a
+  well-formed body*, and are silent on what an accepted list costs. Nothing deduplicates it,
+  so ~409k repeats of one valid id is a well-formed request: `PackFS` issues a sequential,
+  context-less Cassandra read per id and materializes every record in one `bytes.Buffer`
+  before writing, on `PermissionR` alone. `CheckFS` shares the per-id read (its map only
+  translates ids) but not the buffer. X11 met this exact shape on `check-blocks` — "one id
+  repeated, then abandoned" — and closed it by deduplicating before lookup, resolving through
+  a context-carrying call at a configured fan-out, and taking its own admission capacity;
+  notably **not** by lowering the id cap, which it kept deliberately. That resolution is the
+  template.
+- `ISSUE-RECVFS-FSID-UNVERIFIED-01` (**unrated, open question**) — `RecvFS` stores the
+  client-supplied `fs_id` without checking it hashes the content, while the download path is
+  integration-tested to require exactly that. Filed as a question rather than a defect
+  because SesameFS deliberately maintains a stored-vs-computed id mapping, so a naive
+  `fs_id == SHA-1(body)` check would reject writes the design intends to accept. The contract
+  has to be settled before anyone adds the check.
+
+---
+
+## 2026-08-12 - Legacy batch move returns 501 instead of a false success (ISSUE-BATCH-MOVE-FALSE-SUCCESS-01)
+
+- `FileHandler.moveBatchFiles` in `internal/api/v2/files.go` (reached when the legacy
+  `POST /file/move` endpoint gets more than one `src` path in the same repo) previously
+  returned `{"success": true, "moved": N}` without ever touching the FS tree — a fabricated
+  success on a still-reachable handler. It now returns `501 Not Implemented`, pointing callers
+  at `POST /api/v2.1/repos/sync-batch-move-item/`, the real batch-move endpoint the UI already
+  uses (`seafileAPI.moveDirWithPolicy` → `SyncBatchMove`/`AsyncBatchMove` →
+  `processSingleItem`, integration-tested, unaffected by this change).
+- This is a bug fix, not new functionality: legacy same-repo batch move via this endpoint is
+  still unimplemented, it just no longer lies about having succeeded. Cross-repo batch move was
+  already correctly 501 and is unchanged.
+- Updated `TestBatchMoveFiles_FilenameArray` in `internal/api/v2/files_batch_test.go` (the
+  same-repo case now expects 501, not 200).
+
+---
+
+## 2026-08-12 - Bound the four remaining unbounded sync request bodies (ISSUE-SYNC-UNBOUNDED-BODIES-01)
+
+- `PutCommit`, `PackFS`, `RecvFS`, `CheckFS` in `internal/api/sync.go` now read through the
+  shared `readLimitedRequestBody` helper (the same one PR-10 wired into `PutBlock`/
+  `check-blocks` for F12), closing X9. Previously all four buffered the entire request body
+  with an unbounded `io.ReadAll`, so an authenticated client could drive memory pressure
+  arbitrarily high through any of them.
+- `PutCommit`/`PackFS`/`CheckFS` use plain byte-size consts (1 MiB / 16 MiB / 16 MiB), matching
+  the existing `check-blocks` const since they carry the same small id-list-or-metadata shape.
+- `RecvFS` gets a new **configuration** knob instead — `config.SeafHTTP.RecvFSMaxBytes`
+  (`recv_fs_max_bytes` in YAML, `SEAFHTTP_RECV_FS_MAX_BYTES` env override, default 128 MiB) —
+  because it carries a real batch of packed FS objects with no measured client size or
+  protocol-documented ceiling to anchor a fixed number on; the generous default can be raised
+  by an operator without a code change. Added to all seven shipped configs. `Validate()`
+  rejects zero and negative values (an unbounded body is the defect the cap closes, so no
+  configuration may restore it), and a malformed `SEAFHTTP_RECV_FS_MAX_BYTES` is reported via
+  `addEnvOverrideError` rather than silently dropped back to the default — matching its
+  neighbour `SEAFHTTP_SYNC_BLOCK_MAX_BYTES`. There is deliberately **no** ceiling: unlike the
+  block cap, no measured client batch size makes a large value self-evidently a mistake.
+- **A byte cap alone was not enough on `pack-fs`/`check-fs`.** Both parsed their id list with
+  `strings.Split`/`json.Unmarshal` over the whole body, so a body *under* the 16 MiB cap still
+  expanded ~17x — 16 MiB of bare newlines becomes ~16.7M string headers (~268 MB). That is the
+  cardinality half of the same defect, already solved for `check-blocks`. `parseCheckBlockIDs`
+  is generalized to `parseBoundedIDList` (+ per-route `idListSpec`, which preserves
+  `check-blocks`' existing client-visible 413 body verbatim) and both routes now use it, with
+  id caps **derived** from their byte caps (`byte cap / minFSIDWireBytes`). The derivation is
+  the point: the densest well-formed body the byte cap admits carries exactly the id cap, so
+  the cap is unreachable for real traffic and fires only on degenerate input — it is not a new
+  limit on large libraries.
+- Scope, precisely: this bounds **one request**, not aggregate memory under concurrency — N
+  concurrent `RecvFS` requests near the cap can still sum to N × the cap. That half is now
+  tracked as `ISSUE-SYNC-METADATA-CONCURRENCY-01` instead of being left as a remark.
+- Added `TestPutCommitBoundsBodySize`, `TestPackFSBoundsBodySize`,
+  `TestPackFSBoundsChunkedBody`, `TestCheckFSBoundsBodySize`, `TestRecvFSBoundsBodySize` to
+  `internal/api/sync_body_limits_test.go`, pinning the rejection boundary (`cap+1` → 413) for
+  all four; deliberately not pinning any "positive path" body shape for `PackFS`/`RecvFS` that
+  would depend on incidental parser behavior rather than the size gate itself. Plus
+  `TestFSIDCapsCannotCutWellFormedBodies` (the derivation invariant, asserted arithmetically)
+  and `TestFSIDCountCapsCutAmplification` (the degenerate body is refused, and the parse costs
+  16.0 MB — just its `string(body)` — against the same 96 MB ceiling the `check-blocks` canary
+  uses), and `TestEnvOverrideRecvFSMaxBytes` in `internal/config/config_test.go` for the config
+  contract.
+- That canary measures the **parser**, not a round trip, and the 413 is asserted separately
+  through the handler with no allocation measurement. The first version wrapped
+  `r.ServeHTTP` and reused the 96 MB ceiling anyway, which silently included
+  `readLimitedRequestBody`'s own 16 MiB read (~32 MiB cumulative as `io.ReadAll` doubles) —
+  a cost the ceiling was never derived for. It fit on go1.26/windows at 50.6 MB and failed
+  in the `gotest` container on go1.25/linux at 113.9 MB. Two claims, two windows.
+- `TestRecvFSBoundsBodySize` no longer pushes a 128 MiB body through HTTP to prove the default
+  cap. That cost ~404 MB of allocation (~128 MiB body + ~269 MB of `io.ReadAll` growth), four
+  times the 96 MB ceiling this same file treats as a failure condition elsewhere, and proved
+  nothing the small configured cap does not. The two properties are now pinned separately: the
+  resolver returns the default under a nil config, and the handler enforces whatever the
+  resolver returns (including the chunked, no-declared-length shape).
+
+---
+
+## 2026-08-12 - `sesamefs_auth` cookie is httpOnly (ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01)
+
+- All four previously non-`HttpOnly` writers of `sesamefs_auth` (login and logout, in both
+  `internal/api/server.go` and `internal/api/v2/auth.go`) now set `httpOnly=true`, funneled
+  through one `setAuthCookie` helper per package so the flag can't drift between login and
+  logout again. (`handleAutoLogin` is a fifth writer of this cookie; it already set
+  `httpOnly=true` and is left alone here because it hardcodes `Secure=false`, which is the
+  separate `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01`.) Previously the
+  cookie was JS-readable, and the auth middleware accepts it as a live, replayable session
+  bearer with a TTL up to 180 days for sync clients — any XSS on the origin could walk away
+  with a long-lived credential.
+- Verified before closing: a repository-wide search (including `mobile-frontend/`) found no JS
+  code reading this cookie's value anywhere in this repository; the desktop-client SSO flow
+  gets its token via `clientSSOStore` polling, not by reading the cookie, contradicting the
+  stale "embedded WebView" comment that used to justify `httpOnly=false`. Confirmed with the
+  project owner that no client outside this repository depends on reading it either.
+- `Secure` is unchanged (still derived from `c.Request.TLS`) — that's the separate, still-open
+  `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01`.
+- Added `TestServerSetAuthCookie` and `TestAuthHandlerSetAuthCookie`, testing each helper
+  directly so both login and logout are pinned without mocking a real OIDC exchange; extended
+  `TestLogout` to assert `HttpOnly` on the real end-to-end clear response.
+- Updated `docs/OIDC.md` and `docs/diagrams/auth-layer.md` to match; the stale "embedded
+  WebView" justification is gone.
+
+---
+
 ## 2026-07-16 - GC physical deletion is org-scoped end to end (P10 PR-3)
 
 - Normal block deletion and S3 orphan recovery now resolve `BlockStore` by

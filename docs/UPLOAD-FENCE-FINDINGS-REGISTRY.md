@@ -134,6 +134,44 @@ below the table.
 | X11 | Medium | **`maxCheckBlockIDs` (100k) bounds the parser, not the work an accepted request triggers.** PR-10's cap is a memory bound on parsing and is correct as such. Downstream, an accepted list still drives one `GetBlockIDMapping` Cassandra point read **per legacy SHA-1 id, sequentially** in the `CheckBlocks` loop, then `CheckBlocksExist` at fan-out 10 — so a single accepted 100k-id request can issue ~100k serial reads while holding the handler. That is a request-amplification and latency concern, not a memory one, and the 100k figure was chosen as a safe parse bound rather than validated against Cassandra, the S3 pool, response size or client cancellation. Related to X5, which flags the same unvalidated fan-out on the canonical read path. | `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01`; also subcontract C of `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` |
 | X6 | Medium | **Read-after-write across DCs.** Canonical lookups retry a missing row 3×25 ms, which covers local lag but not cross-DC. Safe (fails closed) but an availability dependency: transient 404/503 after a remote upload, `check-blocks` reporting a block missing, needless re-uploads. | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (related to X2) |
 
+### Dated note — X9, 2026-08-12
+
+X9 is **closed**. All four handlers read through `readLimitedRequestBody`:
+`PutCommit` at 1 MiB, `PackFS`/`CheckFS` at 16 MiB (plain consts — the same
+id-list shape as `check-blocks`), `RecvFS` at a configurable 128 MiB default
+(`seafhttp.recv_fs_max_bytes`, no ceiling on purpose, zero rejected at boot),
+since it carries a real object batch with no measured client size to anchor a
+fixed number on.
+
+Choosing the caps surfaced a second half the row does not describe. `pack-fs` and
+`check-fs` parsed their id list with `strings.Split`/`json.Unmarshal` over the
+whole body, so a body *under* the byte cap still expanded ~17x — the amplification
+PR-10 had already removed from `check-blocks` when it closed F12 by rejecting an
+oversized id list *during* the parse. Both now share that parser
+(`parseBoundedIDList`), with id caps derived from their byte caps so they are
+unreachable for well-formed input and fire only on degenerate bodies.
+
+Deriving those caps that way bounds what a body can expand into and nothing else.
+It says nothing about what an accepted list costs — X11's territory, not F12's —
+and these two routes have none of the controls X11 grew: no dedup before lookup,
+no context on the per-id read, no fan-out bound, no admission capacity. Filed as
+`ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`.
+
+Choosing the `recv-fs` cap also surfaced something the row does not contemplate at
+all: the cap bounds the **compressed** body, and `RecvFS` then inflates each packed
+object with an unbounded `io.ReadAll` over a `zlib.Reader`. DEFLATE's measured best
+case here is 1029:1, so 128 MiB of body inflates to ~126 GiB — the buffered body is
+not this handler's dominant allocation. Pre-existing, not caused by X9's fix, and
+filed as `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`. X9 stays closed on its own
+terms (unbounded body reads), but no one should read it as "recv-fs is bounded".
+
+What X9 also does **not** close is the aggregate: a per-request cap bounds one request,
+and `RecvFS` at 128 MiB × N concurrent is the same shape X10 described for the
+block routes. X10's fix is scoped to `PutBlock` and does not cover these routes, so
+that layer is now `ISSUE-SYNC-METADATA-CONCURRENCY-01` rather than an unowned
+caveat. Its first step should be measuring what the official client actually sends
+per `recv-fs`: a measured cap may be cheaper than an admission gate.
+
 ### Dated note — X10, 2026-07-30
 
 The aggregate bound and its post-implementation hardening are complete; X10 is

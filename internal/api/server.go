@@ -2277,12 +2277,10 @@ func (s *Server) handleOAuthCallback(c *gin.Context) {
 	}
 
 	// Set sesamefs_auth cookie (email@token) — matches seahub convention.
-	// httpOnly=false is intentional: the embedded WebView needs to read this via JS.
 	// Cookie TTL matches session TTL so both expire at the same time.
 	seahubAuth := result.Email + "@" + result.SessionToken
-	isSecure := c.Request.TLS != nil
 	cookieMaxAge := int(s.config.Auth.OIDC.SessionTTL.Seconds())
-	c.SetCookie("sesamefs_auth", seahubAuth, cookieMaxAge, "/", "", isSecure, false)
+	s.setAuthCookie(c, seahubAuth, cookieMaxAge)
 
 	// If this was a desktop client SSO login (returnURL starts with seafile://),
 	// show a confirmation page instead of redirecting to the web app home page.
@@ -2315,11 +2313,30 @@ func (s *Server) handleLogout(c *gin.Context) {
 	}
 
 	// Clear the auth cookie server-side (maxAge=-1 expires immediately)
-	isSecure := c.Request.TLS != nil
-	c.SetCookie("sesamefs_auth", "", -1, "/", "", isSecure, false)
+	s.setAuthCookie(c, "", -1)
 
 	// Redirect to home — the SPA will detect the missing session and show the login page
 	c.Redirect(http.StatusFound, "/")
+}
+
+// setAuthCookie is the shared writer for sesamefs_auth issuance and clearing on
+// the OIDC path in this package, used by both handleOAuthCallback (login) and
+// handleLogout (clear) so the flags cannot drift between the two.
+//
+// httpOnly is always true: ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01 found no code in
+// this repository — including mobile-frontend — that reads this cookie's value
+// from JS; the desktop-client SSO flow already gets its token via clientSSOStore
+// polling, not by reading this cookie from an embedded WebView as an older
+// comment here used to claim. Secure is still derived per-request from
+// c.Request.TLS.
+//
+// Not every writer in the package: handleAutoLogin writes this cookie directly
+// because it hardcodes Secure=false, which is the separate, still-open
+// ISSUE-AUTOLOGIN-COOKIE-INSECURE-01. It already sets httpOnly=true, so it is
+// consistent on this flag; folding it in here is that issue's work, not this one's.
+func (s *Server) setAuthCookie(c *gin.Context, value string, maxAge int) {
+	isSecure := c.Request.TLS != nil
+	c.SetCookie("sesamefs_auth", value, maxAge, "/", "", isSecure, true)
 }
 
 // handleCreateRepoTag returns a stub response for tag creation

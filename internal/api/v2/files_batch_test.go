@@ -432,7 +432,9 @@ func TestBatchMoveFiles_FilenameArray(t *testing.T) {
 				"dst_dir":  "/destination",
 				"filename": []string{"file1.txt", "file2.txt", "file3.txt"},
 			},
-			wantStatus: http.StatusOK, // Batch handler returns OK with summary
+			// Legacy same-repo batch move is unimplemented (ISSUE-BATCH-MOVE-FALSE-SUCCESS-01):
+			// it used to fabricate {"success":true} without touching the FS tree.
+			wantStatus: http.StatusNotImplemented,
 		},
 		{
 			name: "batch move with array - cross repo not implemented",

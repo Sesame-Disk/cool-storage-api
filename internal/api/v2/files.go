@@ -2846,25 +2846,13 @@ func (h *FileHandler) moveBatchFiles(c *gin.Context, srcPaths []string, srcRepoI
 		return
 	}
 
-	// For same-repo batch moves, move files sequentially
-	// In production, this should be done as a background job for large batches
-	var movedFiles []string
-	var failedFiles []map[string]string
-
-	for _, srcPath := range srcPaths {
-		fileName := path.Base(srcPath)
-		// Create a mock gin.Context for the single file move
-		// For now, return a simplified response
-		movedFiles = append(movedFiles, fileName)
-	}
-
-	// TODO: Implement actual batch move logic with FS tree updates
-	// For now, return success for same-repo moves
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"moved":   len(movedFiles),
-		"failed":  len(failedFiles),
-	})
+	// Same-repo batch move via this legacy endpoint is not implemented: it used to
+	// report {"success":true,"moved":N} without touching the FS tree at all
+	// (ISSUE-BATCH-MOVE-FALSE-SUCCESS-01). Real batch moves go through
+	// seafileAPI.moveDirWithPolicy -> POST /api/v2.1/repos/sync-batch-move-item/
+	// (SyncBatchMove/AsyncBatchMove -> processSingleItem), which is
+	// integration-tested and correct.
+	c.JSON(http.StatusNotImplemented, gin.H{"error": "batch move via this legacy endpoint is not implemented; use POST /api/v2.1/repos/sync-batch-move-item/"})
 }
 
 // CopyFileRequest represents the request for copying a file

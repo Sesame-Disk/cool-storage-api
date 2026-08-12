@@ -623,7 +623,7 @@ mechanism (matches seahub's `ClientSSOToken` design). The server advertises supp
 9.  Server (handleOAuthCallback):
     - Exchanges code for tokens, creates session (API_TOKEN)
     - Extracts pending token T from state, marks it as success with API_TOKEN
-    - Sets sesamefs_auth cookie = "email@API_TOKEN" (7 days, httpOnly=false)
+    - Sets sesamefs_auth cookie = "email@API_TOKEN" (7 days, httpOnly=true)
     - Redirects browser to / (home page, matches seahub behavior)
 10. Client polling GET /api2/client-sso-link/T/ receives:
     {"status": "success", "username": "user@example.com", "apiToken": "API_TOKEN"}
@@ -640,7 +640,7 @@ mechanism (matches seahub's `ClientSSOToken` design). The server advertises supp
 **Security notes:**
 - The pending token is 160-bit random (crypto/rand) — not guessable
 - It expires after 15 minutes regardless of authentication outcome
-- The `sesamefs_auth` cookie is set with `httpOnly=false` intentionally (embedded WebView needs JS access)
+- The `sesamefs_auth` cookie is `httpOnly=true` (`ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01`, fixed). The desktop client never reads this cookie — it gets its token via the polling flow above (step 10), same as any other client. An older comment here claimed an "embedded WebView" needed JS access to it; no such reader was ever found in this repository.
 - In a **multi-instance** deployment behind a load balancer, the in-memory `ssoStore` is not shared across instances — a request to the polling endpoint may reach a different instance than the one that processed the callback, causing the client to never receive the token. For multi-instance deployments, the pending token store should be moved to the shared database (Cassandra sessions table).
 
 ### Integration Tests
