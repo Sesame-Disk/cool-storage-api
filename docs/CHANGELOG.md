@@ -8,6 +8,23 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-12 - Legacy batch move returns 501 instead of a false success (ISSUE-BATCH-MOVE-FALSE-SUCCESS-01)
+
+- `FileHandler.moveBatchFiles` in `internal/api/v2/files.go` (reached when the legacy
+  `POST /file/move` endpoint gets more than one `src` path in the same repo) previously
+  returned `{"success": true, "moved": N}` without ever touching the FS tree — a fabricated
+  success on a still-reachable handler. It now returns `501 Not Implemented`, pointing callers
+  at `POST /api/v2.1/repos/sync-batch-move-item/`, the real batch-move endpoint the UI already
+  uses (`seafileAPI.moveDirWithPolicy` → `SyncBatchMove`/`AsyncBatchMove` →
+  `processSingleItem`, integration-tested, unaffected by this change).
+- This is a bug fix, not new functionality: legacy same-repo batch move via this endpoint is
+  still unimplemented, it just no longer lies about having succeeded. Cross-repo batch move was
+  already correctly 501 and is unchanged.
+- Updated `TestBatchMoveFiles_FilenameArray` in `internal/api/v2/files_batch_test.go` (the
+  same-repo case now expects 501, not 200).
+
+---
+
 ## 2026-08-12 - Bound the four remaining unbounded sync request bodies (ISSUE-SYNC-UNBOUNDED-BODIES-01)
 
 - `PutCommit`, `PackFS`, `RecvFS`, `CheckFS` in `internal/api/sync.go` now read through the

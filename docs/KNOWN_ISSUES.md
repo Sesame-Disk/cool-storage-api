@@ -6571,26 +6571,27 @@ admission work, which has no write-side equivalent yet) and is not reopened here
 
 ### ISSUE-BATCH-MOVE-FALSE-SUCCESS-01: Legacy `moveBatchFiles` returns success without moving
 
-**Status**: 🟡 Open — API footgun; primary UI path is safe
+**Status**: ✅ Fixed 2026-08-12 — false success fixed; legacy same-repo batch move via
+`POST /file/move` remains unsupported and now returns 501 instead of a fabricated 200
 **Severity**: Medium — false-success on a still-reachable handler
 **Affected**: `FileHandler.moveBatchFiles` in `internal/api/v2/files.go` (reached when `MoveFile` gets `len(srcPaths) > 1`)
 **Source of record**: PENDING-ISSUES-AUDIT-2026-05-14 item 4; code-verified 2026-07-25
 
-#### Problem
+#### What Is True Today
 
-`moveBatchFiles` still contains `// TODO: Implement actual batch move logic`
-and returns `{"success": true, "moved": N}` for same-repo multi-file moves
-without updating the FS tree. Cross-repo batch move correctly returns 501.
+`moveBatchFiles` previously contained `// TODO: Implement actual batch move logic`
+and returned `{"success": true, "moved": N}` for same-repo multi-file moves
+without updating the FS tree; cross-repo batch move already correctly returned 501.
+It now returns `501 Not Implemented` for the same-repo case too, with an error
+pointing at the real endpoint. This is a bug fix, not new functionality: legacy
+same-repo batch move via this endpoint is still not implemented, it just no
+longer lies about having succeeded.
 
-The **UI** path does not use this: `seafileAPI.moveDirWithPolicy` goes through
-`SyncBatchMove` / `AsyncBatchMove` → `processSingleItem` in
-`batch_operations.go` (integration-tested). The defect is an API client that
-posts multiple `src` paths to the legacy `MoveFile` endpoint.
-
-#### Fix Direction
-
-Return `501 Not Implemented` (or wire to `processSingleItem`) until the batch
-path is real. Do not leave a success response on a no-op.
+The **UI** path never used this and is unaffected: `seafileAPI.moveDirWithPolicy`
+goes through `POST /api/v2.1/repos/sync-batch-move-item/` /
+`async-batch-move-item/` → `SyncBatchMove`/`AsyncBatchMove` → `processSingleItem`
+in `batch_operations.go` (integration-tested). The defect was reachable only by an
+API client posting multiple `src` paths to the legacy `MoveFile` endpoint.
 
 #### Related Docs
 

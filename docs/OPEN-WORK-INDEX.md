@@ -129,7 +129,6 @@ on every replica in every DC until both close.
 | `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` | MEDIUM | S3 PUT precedes durable intent; a crash leaves an undiscoverable object | Registry X3 |
 | `ISSUE-QUOTA-RESERVATION-01` | MEDIUM | TOCTOU between quota pre-check and publish | Readiness UP-3 |
 | `ISSUE-DOWNLOAD-NO-404-01` | MEDIUM | Deleted file answers 503 forever; layers disagree | Registry X8 — **accepted cost of PR-6** |
-| `ISSUE-BATCH-MOVE-FALSE-SUCCESS-01` | MEDIUM | Legacy `moveBatchFiles` returns `success:true` without moving | API footgun; UI uses `SyncBatchMove` |
 | `ISSUE-ACCOUNTS-M2M-PATH-01` | MEDIUM | Admin API key channel works; M2M lacks `source=accounts` + idempotency | Code-verified 2026-07-25 |
 | `ISSUE-MID-OPERATION-REVOCATION-01` | MEDIUM | Revoke mid chunked-upload / mid-stream / ZIP does not abort in flight | UP-5 / DL-5 / RB-4 |
 | `ISSUE-SHARELINK-NO-ORG-SCOPE-01` | MEDIUM | No org-internal share-link scope (token-only, anonymous) | SH-2 — product / BY DESIGN option |
