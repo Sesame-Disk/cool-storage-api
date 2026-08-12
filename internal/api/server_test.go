@@ -1121,9 +1121,9 @@ func TestAuthTokenErrorFormat(t *testing.T) {
 	}
 }
 
-// TestServerSetAuthCookie pins ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01 at the single
-// writer both handleSSOCallback (login) and handleLogout (clear) share, rather than
-// at a full HTTP round trip through either — HandleOIDCCallback's success path
+// TestServerSetAuthCookie pins ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01 at the shared
+// writer both handleOAuthCallback (login) and handleLogout (clear) use, rather than
+// at a full HTTP round trip through either — the callback's success path
 // requires a real OIDC code exchange this test suite does not mock, so testing the
 // helper directly is what actually reaches the login-side write.
 func TestServerSetAuthCookie(t *testing.T) {

@@ -6554,18 +6554,86 @@ derived from its own payload profile rather than one shared constant:
   ceiling to anchor a fixed number on (`docs/SEAFILE-SYNC-PROTOCOL-RFC.md` does
   not specify one) — the default is deliberately generous, and an operator can
   raise it via `SEAFHTTP_RECV_FS_MAX_BYTES` or `recv_fs_max_bytes` without a code
-  change if a real large commit needs more headroom.
+  change if a real large commit needs more headroom. Zero and negative values are
+  rejected at boot, and a malformed env value is reported rather than silently
+  dropped back to the default: an unbounded body is the defect the cap closes, so
+  no configuration may restore it.
 
-**Scope of the fix, precisely:** this closes the **unbounded body per request**.
-It does not bound aggregate memory under concurrency — N concurrent `RecvFS`
-requests near the cap can still sum to N × the cap. That is a distinct
-admission/concurrency problem (conceptually adjacent to the download-side D0-D6
-admission work, which has no write-side equivalent yet) and is not reopened here.
+**A byte cap alone was not enough on the two id-list routes.** `pack-fs` and
+`check-fs` parsed their id list the naive way — `strings.Split` on the whole body,
+or `json.Unmarshal` into a `[]string` — so a body *under* the 16 MiB cap still
+expanded ~17x: 16 MiB of bare newlines becomes ~16.7M string headers (~268 MB).
+That is the cardinality half of the same defect, already solved for `check-blocks`
+by a parser that refuses during the parse instead of after the list is
+materialized. Both routes now share it (`parseBoundedIDList`, generalized from
+`parseCheckBlockIDs`), with id caps **derived from their byte caps**
+(`maxPackFSIDs`, `maxCheckFSIDs` = byte cap / `minFSIDWireBytes`). Deriving them
+matters: the densest well-formed body the byte cap admits carries exactly the cap
+in ids, so the id cap is unreachable for real traffic and can only fire on
+degenerate input — it is not a new limit on large libraries.
+`TestFSIDCapsCannotCutWellFormedBodies` pins that invariant arithmetically;
+`TestFSIDCountCapsCutAmplification` measures the rejected path at 50.6 MB
+against a 96 MB ceiling.
+
+**Scope of the fix, precisely:** this closes the **unbounded body per request**
+and the id-list amplification within it. It does not bound aggregate memory under
+concurrency — N concurrent `RecvFS` requests near the 128 MiB cap can still sum to
+N × the cap. That is a distinct admission/concurrency problem, now tracked
+separately as `ISSUE-SYNC-METADATA-CONCURRENCY-01` rather than left implicit here.
 
 #### Related Docs
 
 - `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X9, and X10/X11 for what a cap is not)
 - `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-10 scope)
+- `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate bound this fix does not provide)
+
+---
+
+### ISSUE-SYNC-METADATA-CONCURRENCY-01: The sync metadata routes have no aggregate memory bound
+
+**Status**: 🟡 Open — successor to X9's per-request cap
+**Severity**: Medium — authenticated memory-pressure DoS, aggregate rather than per-request
+**Affected**: `RecvFS`, `PackFS`, `CheckFS`, `PutCommit` in `internal/api/sync.go`
+**Source of record**: opened 2026-08-12 when `ISSUE-SYNC-UNBOUNDED-BODIES-01` closed
+
+#### Problem
+
+`ISSUE-SYNC-UNBOUNDED-BODIES-01` bounds **one** request on each of these routes.
+It does not bound N of them. `RecvFS` is the one that matters: its default cap is
+128 MiB and its body is fully buffered before parsing, so 8 concurrent uploads
+cost ~1 GiB of body buffers, 16 cost ~2 GiB, before anything else the process is
+doing. The route group carries only `syncAuthMiddleware` — no concurrency gate, no
+rate limit, no memory budget.
+
+This is the same shape as **X10** on the block routes, and X10 is the reason this
+entry exists as its own issue: X10 was closed by work scoped explicitly to
+`PutBlock` (`sync_block_max_inflight_per_node`, `sync_block_memory_budget_bytes`,
+the admission limiter and its 503 + `Retry-After` semantics). None of that machinery
+covers the metadata routes, so closing X9 without opening this would have retired
+the narrow finding and lost the layer underneath it.
+
+#### Fix Direction
+
+The block-route admission work is the template, not a new design: a bound on
+in-flight metadata readers acquired **before** the buffering read, answering
+**503 + `Retry-After`** after a bounded wait — never 429, which the official client
+does not classify as retryable. Two details differ from the block path and should be
+settled first:
+
+- `RecvFS`'s 128 MiB default is generous precisely because no client batch size was
+  ever measured. Measuring what the official client actually sends per `recv-fs`
+  (upstream batches packed objects rather than sending a whole commit at once) would
+  likely allow a far smaller cap, which is cheaper than an admission gate and should
+  be evaluated before building one.
+- The metadata routes should not draw from the block routes' capacity: one storming
+  must not spend the other's slots, the same separation X10's dated note records.
+
+#### Related Docs
+
+- `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X10 — the closed block-route equivalent,
+  and its dated note on capacity separation)
+- `ISSUE-SYNC-UNBOUNDED-BODIES-01` (the per-request cap this sits on top of)
+- `ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01` (the umbrella X10 was subcontract B of)
 
 ---
 

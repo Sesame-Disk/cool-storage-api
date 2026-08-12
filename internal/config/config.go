@@ -1935,12 +1935,18 @@ func (c *Config) applyEnvOverrides() {
 			c.SeafHTTP.ZipMaxBytes = i
 		}
 	}
+	// Reported rather than silently dropped, for the same reason as the sync
+	// block cap below: falling back to the default would leave an operator who
+	// deliberately raised the recv-fs cap running the lower one with no signal.
 	if v := os.Getenv("SEAFHTTP_RECV_FS_MAX_BYTES"); v != "" {
-		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			c.addEnvOverrideError("SEAFHTTP_RECV_FS_MAX_BYTES is invalid: %v", err)
+		} else {
 			c.SeafHTTP.RecvFSMaxBytes = i
 		}
 	}
-	// Unlike the neighbours above, a malformed value is reported rather than
+	// Unlike the zip neighbours above, a malformed value is reported rather than
 	// silently dropped: falling back to the default would leave an operator who
 	// deliberately raised the cap running the lower one with no signal.
 	if v := os.Getenv("SEAFHTTP_SYNC_BLOCK_MAX_BYTES"); v != "" {
@@ -3243,6 +3249,13 @@ func (c *Config) Validate() error {
 	if c.SeafHTTP.SyncBlockMaxBytes > MaxSyncBlockMaxBytes {
 		return fmt.Errorf("seafhttp.sync_block_max_bytes is %d, above the %d ceiling; the official client CDC maximum is 4 MiB and SesameFS's related server-side split is 8 MiB, so a larger value is likely derived from the unrelated web uploader ceiling",
 			c.SeafHTTP.SyncBlockMaxBytes, MaxSyncBlockMaxBytes)
+	}
+	// Same rule as sync_block_max_bytes, same reason: an unbounded recv-fs body is
+	// the defect this cap exists for. There is deliberately no ceiling to match —
+	// unlike the block cap, no measured client batch size makes a large value
+	// self-evidently a mistake, so raising it is an informed operator choice.
+	if c.SeafHTTP.RecvFSMaxBytes <= 0 {
+		return fmt.Errorf("seafhttp.recv_fs_max_bytes must be greater than zero (an unbounded recv-fs body is not a supported configuration)")
 	}
 	// The in-flight caps are what make sync_block_max_bytes an aggregate bound.
 	// Zero is accepted here — unlike the body cap — because disabling the

@@ -460,7 +460,7 @@ func TestNewAuthHandler(t *testing.T) {
 }
 
 // TestAuthHandlerSetAuthCookie pins ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01 at the
-// single writer HandleOIDCCallback (login) and Logout (clear) share, rather than
+// shared writer HandleOIDCCallback (login) and Logout (clear) use, rather than
 // at a full HTTP round trip through HandleOIDCCallback — its success path requires
 // a real OIDC code exchange this test suite does not mock, so testing the helper
 // directly is what actually reaches the login-side write.

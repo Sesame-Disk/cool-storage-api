@@ -342,15 +342,17 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	})
 }
 
-// setAuthCookie is the single writer for the sesamefs_auth session cookie in this
-// package, used by both HandleOIDCCallback (login) and Logout (clear). httpOnly is
-// always true: ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01 found no code in this
-// repository — including mobile-frontend — that reads this cookie's value from JS;
-// the desktop-client SSO flow gets its token via clientSSOStore polling, not by
+// setAuthCookie is the shared writer for sesamefs_auth issuance and clearing in
+// this package, used by both HandleOIDCCallback (login) and Logout (clear) so the
+// flags cannot drift between the two.
+//
+// httpOnly is always true: ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01 found no code in
+// this repository — including mobile-frontend — that reads this cookie's value from
+// JS; the desktop-client SSO flow gets its token via clientSSOStore polling, not by
 // reading this cookie as an older comment here used to claim. Secure is still
-// derived per-request from c.Request.TLS, matching every other writer of this
-// cookie (the separate ISSUE-AUTOLOGIN-COOKIE-INSECURE-01 covers the one site
-// that hardcodes it).
+// derived per-request from c.Request.TLS; the one site that hardcodes it lives in
+// package api (handleAutoLogin) and is the separate, still-open
+// ISSUE-AUTOLOGIN-COOKIE-INSECURE-01.
 func (h *AuthHandler) setAuthCookie(c *gin.Context, value string, maxAge int) {
 	isSecure := c.Request.TLS != nil
 	c.SetCookie("sesamefs_auth", value, maxAge, "/", "", isSecure, true)

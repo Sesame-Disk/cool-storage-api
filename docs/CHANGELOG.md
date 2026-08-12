@@ -38,22 +38,51 @@ Session-by-session development history for SesameFS.
   (`recv_fs_max_bytes` in YAML, `SEAFHTTP_RECV_FS_MAX_BYTES` env override, default 128 MiB) —
   because it carries a real batch of packed FS objects with no measured client size or
   protocol-documented ceiling to anchor a fixed number on; the generous default can be raised
-  by an operator without a code change. Added to all seven shipped configs.
-- Scope, precisely: this bounds the body of **one request**, not aggregate memory under
-  concurrency — N concurrent `RecvFS` requests near the cap can still sum to N × the cap.
+  by an operator without a code change. Added to all seven shipped configs. `Validate()`
+  rejects zero and negative values (an unbounded body is the defect the cap closes, so no
+  configuration may restore it), and a malformed `SEAFHTTP_RECV_FS_MAX_BYTES` is reported via
+  `addEnvOverrideError` rather than silently dropped back to the default — matching its
+  neighbour `SEAFHTTP_SYNC_BLOCK_MAX_BYTES`. There is deliberately **no** ceiling: unlike the
+  block cap, no measured client batch size makes a large value self-evidently a mistake.
+- **A byte cap alone was not enough on `pack-fs`/`check-fs`.** Both parsed their id list with
+  `strings.Split`/`json.Unmarshal` over the whole body, so a body *under* the 16 MiB cap still
+  expanded ~17x — 16 MiB of bare newlines becomes ~16.7M string headers (~268 MB). That is the
+  cardinality half of the same defect, already solved for `check-blocks`. `parseCheckBlockIDs`
+  is generalized to `parseBoundedIDList` (+ per-route `idListSpec`, which preserves
+  `check-blocks`' existing client-visible 413 body verbatim) and both routes now use it, with
+  id caps **derived** from their byte caps (`byte cap / minFSIDWireBytes`). The derivation is
+  the point: the densest well-formed body the byte cap admits carries exactly the id cap, so
+  the cap is unreachable for real traffic and fires only on degenerate input — it is not a new
+  limit on large libraries.
+- Scope, precisely: this bounds **one request**, not aggregate memory under concurrency — N
+  concurrent `RecvFS` requests near the cap can still sum to N × the cap. That half is now
+  tracked as `ISSUE-SYNC-METADATA-CONCURRENCY-01` instead of being left as a remark.
 - Added `TestPutCommitBoundsBodySize`, `TestPackFSBoundsBodySize`,
   `TestPackFSBoundsChunkedBody`, `TestCheckFSBoundsBodySize`, `TestRecvFSBoundsBodySize` to
   `internal/api/sync_body_limits_test.go`, pinning the rejection boundary (`cap+1` → 413) for
   all four; deliberately not pinning any "positive path" body shape for `PackFS`/`RecvFS` that
-  would depend on incidental parser behavior rather than the size gate itself.
+  would depend on incidental parser behavior rather than the size gate itself. Plus
+  `TestFSIDCapsCannotCutWellFormedBodies` (the derivation invariant, asserted arithmetically)
+  and `TestFSIDCountCapsCutAmplification` (the degenerate body is refused at 50.6 MB against
+  the same 96 MB ceiling the `check-blocks` canary uses), and `TestEnvOverrideRecvFSMaxBytes`
+  in `internal/config/config_test.go` for the config contract.
+- `TestRecvFSBoundsBodySize` no longer pushes a 128 MiB body through HTTP to prove the default
+  cap. That cost ~404 MB of allocation (~128 MiB body + ~269 MB of `io.ReadAll` growth), four
+  times the 96 MB ceiling this same file treats as a failure condition elsewhere, and proved
+  nothing the small configured cap does not. The two properties are now pinned separately: the
+  resolver returns the default under a nil config, and the handler enforces whatever the
+  resolver returns (including the chunked, no-declared-length shape).
 
 ---
 
 ## 2026-08-12 - `sesamefs_auth` cookie is httpOnly (ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01)
 
-- All four writers of `sesamefs_auth` (login and logout, in both `internal/api/server.go` and
-  `internal/api/v2/auth.go`) now set `httpOnly=true`, funneled through one `setAuthCookie`
-  helper per package so the flag can't drift between login and logout again. Previously the
+- All four previously non-`HttpOnly` writers of `sesamefs_auth` (login and logout, in both
+  `internal/api/server.go` and `internal/api/v2/auth.go`) now set `httpOnly=true`, funneled
+  through one `setAuthCookie` helper per package so the flag can't drift between login and
+  logout again. (`handleAutoLogin` is a fifth writer of this cookie; it already set
+  `httpOnly=true` and is left alone here because it hardcodes `Secure=false`, which is the
+  separate `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01`.) Previously the
   cookie was JS-readable, and the auth middleware accepts it as a live, replayable session
   bearer with a TTL up to 180 days for sync clients — any XSS on the origin could walk away
   with a long-lived credential.

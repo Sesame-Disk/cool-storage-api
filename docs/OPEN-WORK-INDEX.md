@@ -78,6 +78,20 @@ Kept briefly so a reader who arrives with the old blocker list can see it moved
 rather than vanished. Drop rows once they stop being recent; status of record
 stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
+- `ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01` — **Fixed 2026-08-12** (readiness SEC-3 /
+  NF-3). The `sesamefs_auth` cookie is `httpOnly=true` on every OIDC login and
+  logout writer, funneled through one `setAuthCookie` helper per package. Verified
+  first that nothing in this repository reads it from JS. `Secure` is untouched —
+  that is `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01`, still open.
+- `ISSUE-SYNC-UNBOUNDED-BODIES-01` — **Fixed 2026-08-12** (registry X9). All four
+  remaining sync handlers read through `readLimitedRequestBody`; `pack-fs` and
+  `check-fs` also gained the id-count cap that stops a body under the byte cap from
+  expanding ~17x. Bounds one request, not N — the aggregate half is now
+  `ISSUE-SYNC-METADATA-CONCURRENCY-01` above.
+- `ISSUE-BATCH-MOVE-FALSE-SUCCESS-01` — **Fixed 2026-08-12.** Legacy same-repo batch
+  move via `POST /file/move` returned `{"success":true,"moved":N}` without touching
+  the FS tree; it now returns 501 pointing at `sync-batch-move-item/`. Still
+  unimplemented, no longer lying about it. The UI never used this path.
 - `ISSUE-SHARELINK-PASSWORD-BYPASS-01` — **Fixed 2026-07-25** (readiness NF-1 /
   SH-6). Gate runs before the inline read and the OnlyOffice token mint; the
   bundle builder drops protected content; the OnlyOffice helper fails closed.
@@ -125,6 +139,7 @@ on every replica in every DC until both close.
 | `ISSUE-ZIP-STREAM-LATEFAIL-01` | HIGH | ZIP download can truncate after `200 OK` | Readiness DL-2 |
 | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | MEDIUM | Cross-library block read (BOLA), gated only by knowing the 256-bit hash | Readiness B2/SEC-1 |
 | `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` | MEDIUM | Download cap and `single_use` are race-bypassable | Readiness NF-2 / SH-5 |
+| `ISSUE-SYNC-METADATA-CONCURRENCY-01` | MEDIUM | Sync metadata routes bound one body, not N — 16 concurrent `recv-fs` ≈ 2 GiB | Successor to X9; X10's equivalent for the block routes is closed |
 | `ISSUE-AUDIT-TRAIL-INCOMPLETE-01` | MEDIUM | `audit_log` records deletions but never grants | Readiness NF-6 / RB-3 |
 | `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` | MEDIUM | S3 PUT precedes durable intent; a crash leaves an undiscoverable object | Registry X3 |
 | `ISSUE-QUOTA-RESERVATION-01` | MEDIUM | TOCTOU between quota pre-check and publish | Readiness UP-3 |
