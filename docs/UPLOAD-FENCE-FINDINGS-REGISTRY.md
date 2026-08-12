@@ -1,6 +1,6 @@
 # Upload-Fence Audit — Findings Registry
 
-**Date:** 2026-07-21 · **Last updated:** 2026-08-11
+**Date:** 2026-07-21 · **Last updated:** 2026-08-12
 **Origin:** eight successive audits of the GC upload-fence work, 2026-07-20/21.
 **Companion:** [GC-UPLOAD-FENCE-PR-PLAN.md](./GC-UPLOAD-FENCE-PR-PLAN.md) — which PR closes what.
 **Index:** [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — scoped open-work screen + migration table (not the entire backlog).

@@ -483,8 +483,35 @@ implementation contract; that status does not claim the protocol is implemented.
 - Added a protocol revision line (r2). The claim kind, the two quarantine pointer
   states, the `QUORUM` first-writer commit, and the 5.0.9 move are protocol changes
   made after the first freeze, so an implementation written against r1 is not
-  compliant. Fixed six Markdown indentation defects, one of which broke the
+  compliant. Fixed seven Markdown indentation defects, one of which broke the
   writer-mode gate enumeration out of its list.
+- **Closed a critical regression introduced by the quarantine claim kind itself
+  (correction 162).** The first draft of r2 added `RETIRED/QUARANTINE -> ACTIVE` as an
+  administrative escape, which falsified the terminality of `RETIRED` that the
+  `DELETING` CAS depends on — that statement deliberately does not re-read the pointer.
+  The escape was two hops, `RETIRED/GC_RETIRE -> RETIRED/QUARANTINE -> ACTIVE`, so no
+  single transition looked wrong. A delete worker holding a valid proof and stalling
+  would delete `K1` under a reference published after the reactivation: live-data loss,
+  the exact class X1 exists to close. A pointer re-read before the `DELETING` CAS does
+  not fix it, since the two statements are on different tables. `RETIRED/QUARANTINE`
+  now resolves **forward** to `RETIRED/GC_RETIRE` — a recertification with a new claim
+  epoch, a fresh global zero check and fresh evidence — and never back to `ACTIVE`.
+  Only `RETIRING/QUARANTINE`, for which no delete authorization can exist, resolves to
+  `ACTIVE`.
+- Added the durable `RESOLVING` quarantine-work state (correction 163). With states
+  `OPEN | RESOLVED | REJECTED`, a resolution that cleared `gc_state` and crashed left a
+  state byte-for-byte identical to an ordinary in-progress quarantine, and the two
+  demand opposite recovery actions. Authorization is now recorded and confirmed before
+  any `gc_state` or pointer mutation.
+- Recorded that the official `cassandra:5.0.9` image is published, verified 2026-08-12
+  (correction 164), after a review reported it missing. The digest-pinning requirement
+  is unchanged, since a version tag is mutable.
+- Corrected the branch's self-description: it is not docs-only. It pins the Cassandra
+  image across five Compose files and sets `GC_ENABLED=false` in the production
+  Compose. Documented why the primary local `sesamefs` service deliberately does not
+  pin `GC_ENABLED` — it is the single local node allowed to run GC so the suites can
+  exercise it, while the fleet-wide rule is enforced in the production Compose and
+  `.env.prod.example`.
 
 ---
 

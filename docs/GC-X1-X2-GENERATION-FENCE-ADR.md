@@ -4,20 +4,24 @@
 
 **Date:** 2026-08-07 · **Last updated:** 2026-08-12
 
-**Protocol revision:** r2 (2026-08-12). r1 (2026-08-11) was the first freeze. r2
-changes the protocol and is not a documentation-only edit: it adds the
+**Protocol revision:** r2 (2026-08-12). r1 (2026-08-11) was the first freeze. r2 is
+not merely an editorial change — it alters the protocol contract: it adds the
 `retire_claim_kind` column with the `RETIRING/QUARANTINE` and `RETIRED/QUARANTINE`
-pointer states, raises the quarantine transition and the first-writer `blocks` commit
-to `SERIAL + ALL` and `QUORUM` respectively, moves the target engine to 5.0.9, makes
-Cassandra topology changes a gated maintenance operation, and binds operator
-quarantine resolution to the delayed-candidate ordering rule. An implementation
-written against r1 is not compliant with r2.
+pointer states and their `RESOLVING` resolution workflow, raises the quarantine
+transition and the first-writer `blocks` commit to `SERIAL + ALL` and `QUORUM`
+respectively, moves the target engine to 5.0.9, makes Cassandra topology changes a
+gated maintenance operation, and binds quarantine resolution to the terminality of
+`RETIRED` and the delayed-candidate ordering rule. An implementation written against
+r1 is not compliant with r2. Nothing here is implemented; the change is to the
+specification, not to running code.
 
 **Audit baseline:** `main` at `186d7800d`
 
 **Target engine:** Cassandra 5.0.9. The ADR's Cassandra semantics and acceptance
 tests must be revalidated against 5.0.9; the repository Compose files use the exact
-5.0.9 tag, while Phase 0 must still pin and verify the image digest.
+5.0.9 tag, while Phase 0 must still pin and verify the image digest. The official
+image publishes `5.0.9`, `5.0.9-bookworm` and `5.0.9-trixie` (verified 2026-08-12); a
+version tag is nevertheless mutable, which is why the digest requirement stands.
 
 **Paxos variant policy:** Cassandra 5.0.9's semantically acceptable variants for
 this ADR are `{v1, v2}`. That set is not a deployment policy: every
@@ -109,6 +113,9 @@ GC: candidate -> blocks RETIRING -> drain uses -> global refs check
      -> pointer RETIRING/QUARANTINE, or retained RETIRED/QUARANTINE
      -> drain uses -> generation gc_state=QUARANTINED
      -> no retirement evidence, G2 activation, delete, or automatic pointer exit
+     -> operator only: work OPEN -> RESOLVING, then clear gc_state, then
+        RETIRING/QUARANTINE -> ACTIVE, or RETIRED/QUARANTINE -> RETIRED/GC_RETIRE.
+        A RETIRED pointer never returns to ACTIVE on the same generation.
 ```
 
 Discovery always precedes the irreversible step, never follows it; see
@@ -272,6 +279,9 @@ version must still be asserted by integration tests.
 | Claim takeover after `retire_claim_deadline` | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks`; same epoch-matching shape, replaces the owner without changing `active_state` |
 | Use-row drain, including `PENDING`, `AUTHORIZED`, and materializer uses | `EACH_QUORUM` |
 | Quarantine use drain | `EACH_QUORUM` until zero after an acknowledged `RETIRING/QUARANTINE` pointer fence; no retirement evidence, reactivation, or delete |
+| Quarantine work `OPEN -> RESOLVING` | `LOCAL_QUORUM` conditional in the designated GC DC, matching the full quarantine operation/evidence identity; confirmed **before** any `gc_state` or pointer mutation |
+| `RETIRING/QUARANTINE -> ACTIVE` (operator resolution) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the retained quarantine claim; requires a confirmed delayed candidate and its discovery projection first |
+| `RETIRED/QUARANTINE -> RETIRED/GC_RETIRE` (operator recertification) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the retained quarantine claim, installs the next `retire_claim_epoch`, and requires a fresh global zero check plus confirmed fresh evidence for that epoch first. There is no `RETIRED -> ACTIVE` form |
 | Final generation-reference check | `EACH_QUORUM` |
 | `RETIRING/GC_RETIRE -> ACTIVE` (active pointer) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks` |
 | Retirement evidence append (one row per `(generation, claim_epoch)`) | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM`; `INSERT ... IF NOT EXISTS`, immutable and ordered before the pointer CAS |
@@ -795,9 +805,15 @@ blocks pointer:
                  |           |
                  |           +-- GC_RETIRE -> G2 may activate through the pointer CAS
                  |           +-- GC_RETIRE -> QUARANTINE claim (retained pointer)
+                 |           +-- QUARANTINE -> GC_RETIRE (operator recertification:
+                 |                             new epoch + fresh evidence)
+                 |
+                 |           RETIRED never returns to ACTIVE on the same generation.
                  |
                  +-- error, reference, or expired uses -> ACTIVE (GC_RETIRE only)
                  +-- QUARANTINE -> generation QUARANTINED; no automatic pointer exit
+                 +-- QUARANTINE -> ACTIVE (operator resolution; RETIRING only,
+                                   never reached RETIRED, delayed candidate first)
 
 generation row:
     materialization_state: MATERIALIZING -> VERIFIED
@@ -923,9 +939,17 @@ it observed zero use rows first, then zero generation-bound references, so no
 operation capable of legally publishing a reference remains. G2 may now be
 materialized. A `RETIRED/QUARANTINE` pointer is the exception: it is writer-fenced
 and cannot begin G2 materialization until the explicit operator resolution workflow
-clears the quarantine claim. The conversion from `RETIRED/GC_RETIRE` increments
-`retire_claim_epoch`, so an activation CAS carrying the old `GC_RETIRE` predecessor
-tuple fails. G1 remains addressable by its own identity until its delete is complete;
+recertifies it to `RETIRED/GC_RETIRE`. The conversion from `RETIRED/GC_RETIRE`
+increments `retire_claim_epoch`, so an activation CAS carrying the old `GC_RETIRE`
+predecessor tuple fails.
+
+`RETIRED` is terminal for its generation under both claim kinds. Neither the
+quarantine conversion nor its resolution ever returns the pointer to `ACTIVE` on G1;
+the only exit from `RETIRED` is a successor generation. That terminality is what makes
+a `DELETING` authorization irrevocable once obtained, so it is a safety invariant
+rather than a stylistic choice — see Authorizing `DELETING`.
+
+G1 remains addressable by its own identity until its delete is complete;
 after physical deletion, the logical pointer may still retain G1 as a historical
 retired predecessor until G2 replaces it.
 
@@ -1902,9 +1926,10 @@ for a generation transition:
 
 | Observed state | Where observed | Writer behavior |
 |---|---|---|
-| `RETIRING` | pointer | bounded poll/backoff; no G2 allocation; retryable failure with `Retry-After` when the budget ends. The wait is bounded by live-authority drain, not by any retention TTL — see Escaping `RETIRING` On Abandoned Uses |
+| `RETIRING/GC_RETIRE` | pointer | bounded poll/backoff; no G2 allocation; retryable failure with `Retry-After` when the budget ends. The wait is bounded by live-authority drain, not by any retention TTL — see Escaping `RETIRING` On Abandoned Uses |
+| `RETIRING/QUARANTINE` | pointer | fail closed immediately; this observation **revokes** an already-authorized operation. No PUT, repair, reuse, or publication, no G2 allocation, and no bounded poll — the exit is the operator resolution workflow, not a drain the writer can wait out |
 | `RETIRED/GC_RETIRE` | pointer | allocate a new UUID generation, materialize it, and complete the activation CAS inline; on CAS loss, orphan the losing key and reuse the winner |
-| `RETIRED/QUARANTINE` | pointer | fail closed; allocate no G2, perform no physical operation, and require the explicit quarantine resolution workflow |
+| `RETIRED/QUARANTINE` | pointer | fail closed; allocate no G2, perform no physical operation, and require the explicit quarantine resolution workflow. Resolution recertifies the pointer to `RETIRED/GC_RETIRE`; it never returns G1 to `ACTIVE` |
 | `MATERIALIZING` owned by another operation | generation row, reached through a pinned generation ID | bounded poll/backoff, then retryable failure. Not reachable from the pointer, so it is not a state a first materializer can poll to avoid racing |
 | `QUARANTINED` | generation row, including the row selected by a pointer under investigation | fail closed; no new use, physical operation, candidate, or delete; require operator reconciliation |
 | `DELETING` | generation row | fail/retry; never repair or reuse that generation |
@@ -2052,11 +2077,15 @@ retire_claim_kind
 All conditional active-pointer transitions occur through LWTs on that same row:
 
 ```text
-ACTIVE -> RETIRING        GC worker
-RETIRING -> ACTIVE        GC worker
-RETIRING -> RETIRED       GC worker
-RETIRED/GC_RETIRE G1 -> ACTIVE G2   materializing request (inline) or recovery worker
-RETIRED/QUARANTINE -> ACTIVE        operator resolution only
+ACTIVE -> RETIRING              GC worker
+RETIRING/GC_RETIRE -> ACTIVE    GC worker
+RETIRING -> RETIRED             GC worker
+RETIRED/GC_RETIRE G1 -> ACTIVE G2       materializing request (inline) or recovery
+RETIRING/QUARANTINE -> ACTIVE           operator resolution only
+RETIRED/QUARANTINE -> RETIRED/GC_RETIRE operator resolution only
+
+No transition returns a RETIRED pointer to ACTIVE on the same generation.
+The only exit from RETIRED is a successor generation.
 ```
 
 Because those columns are Paxos-managed, the following must hold and must be
@@ -2148,13 +2177,13 @@ The split is:
 
 The pointer never holds `MATERIALIZING`. A first life creates the row already
 `ACTIVE` through the first-writer LWT; a rematerialization moves it directly from
-`RETIRED/GC_RETIRE` (G1) to `ACTIVE` (G2). A `RETIRED/QUARANTINE` pointer never
-rematerializes: there is no transition that restores a `GC_RETIRE` claim, so the only
-exit is the operator workflow, which returns the pointer to `ACTIVE` on the **same**
-generation with a null claim kind after clearing that generation's `QUARANTINED`
-state. A resolution that instead confirms the contradiction marks the work `REJECTED`
-and leaves the pointer fenced permanently; that block accepts no further writes until
-a new audited resolution. Two concurrent
+`RETIRED/GC_RETIRE` (G1) to `ACTIVE` (G2). A `RETIRED/QUARANTINE` pointer cannot
+rematerialize while it is fenced, and it never returns to `ACTIVE` on G1: the operator
+workflow recertifies it forward to `RETIRED/GC_RETIRE` under a new claim epoch with
+fresh evidence, after which the ordinary successor path applies. A resolution that
+instead confirms the contradiction marks the work `REJECTED` and leaves the pointer
+fenced permanently; that block accepts no further writes until a new audited
+resolution. Two concurrent
 first materializers of the same new content therefore both PUT and both attempt the
 LWT, one loses and orphans its key.
 That is the current behaviour and it is safe; there is no pointer state a writer
@@ -2268,14 +2297,41 @@ retirement proof: it is a fail-closed retained pointer that cannot authorize
 `DELETING` or G2 activation until its explicit resolution workflow completes:
 
 ```text
-the pointer has no RETIRED/GC_RETIRE -> ACTIVE transition
-    -> once G1 reads RETIRED/GC_RETIRE, no writer can ever acquire authority on G1 again
+RETIRED is terminal for the generation: no transition of any kind, automated or
+administrative, returns a pointer from RETIRED to ACTIVE on the same generation
+    -> once G1 reads RETIRED, no writer can ever acquire authority on G1 again
     -> the pointer can only move forward to a successor, and the first such
        successor's activation CAS required the exact (G1, E1, C1, N1) tuple that
        is this worker's own proof
     -> any later generation is reachable from that one by the same rule, so the
        proof survives arbitrarily many rematerializations
 ```
+
+**This invariant is load-bearing for the `DELETING` CAS and must be stated over
+`RETIRED`, not over `RETIRED/GC_RETIRE`.** The `DELETING` statement deliberately does
+not re-read the pointer, so its safety rests entirely on the claim that authority can
+never be reacquired on G1. Scoping the invariant to one claim kind leaves a two-hop
+escape — `RETIRED/GC_RETIRE -> RETIRED/QUARANTINE -> ACTIVE` — that no single
+transition violates and that reintroduces deletion of live bytes:
+
+```text
+D reads pointer G1/RETIRED/GC_RETIRE + evidence(G1, C1, N1); proof obtained
+D stalls before its DELETING CAS
+Q converts the pointer to RETIRED/QUARANTINE
+operator resolves the quarantine as a false positive and returns G1 to ACTIVE
+a writer pins G1, authorizes, uses K1, and publishes ref(G1)
+D wakes: IF gc_state = null AND materialization_state = VERIFIED
+         AND storage_key = K1   -- all three still hold
+D sets DELETING and deletes K1 under a live reference
+```
+
+Adding a pointer re-read before the `DELETING` CAS does not close it: the two
+statements are on different tables, so a reactivation can land between them. The
+invariant itself is the mechanism, which is why quarantine resolution is defined to
+preserve it. A `RETIRING/QUARANTINE` pointer never reached `RETIRED`, so no delete
+authorization can exist for it and returning it to `ACTIVE` is safe; a
+`RETIRED/QUARANTINE` pointer resolves forward to `RETIRED/GC_RETIRE` and never back to
+`ACTIVE`. See Resolving A Quarantine Without Breaking Irrevocability.
 
 The successor is written as "the next generation" rather than "G2" on purpose. By
 the time a delayed worker runs its statement the pointer may already read G3 or
@@ -2632,10 +2688,13 @@ RETIRING/QUARANTINE -> generation QUARANTINED
     quarantine operation/evidence identity retained
     no automated pointer transition; operator workflow owns resolution
 
-RETIRED/QUARANTINE -> ACTIVE       (operator resolution only)
-    generation gc_state QUARANTINED -> null confirmed first
+RETIRING/QUARANTINE -> ACTIVE      (operator resolution only; never reached RETIRED)
+    work RESOLVING confirmed first
+    generation gc_state QUARANTINED -> null confirmed next
     delayed candidate + discovery projection confirmed BEFORE this CAS
-    IF active_state       = RETIRED
+    IF active_generation_id = G1
+    AND active_state       = RETIRING
+    AND active_epoch       = E1
     AND retire_claim_kind  = QUARANTINE
     AND retire_claim_id / epoch match the retained quarantine claim
     SET retire_claim_id       = null
@@ -2643,6 +2702,22 @@ RETIRED/QUARANTINE -> ACTIVE       (operator resolution only)
         retire_claim_kind     = null
         retire_claim_epoch    = retained quarantine epoch
         active_state          = ACTIVE
+
+RETIRED/QUARANTINE -> RETIRED/GC_RETIRE   (operator resolution only)
+    work RESOLVING confirmed first
+    generation gc_state QUARANTINED -> null confirmed next
+    fresh global zero check (uses then refs, EACH_QUORUM) under the NEW claim
+    fresh evidence(G1, Nq + 1) appended + confirmed BEFORE this CAS
+    IF active_generation_id = G1
+    AND active_state       = RETIRED
+    AND active_epoch       = E1
+    AND retire_claim_kind  = QUARANTINE
+    AND retire_claim_id / epoch match the retained quarantine claim
+    SET retire_claim_id       = Cr
+        retire_claim_deadline = Dr
+        retire_claim_kind     = GC_RETIRE
+        retire_claim_epoch    = Nq + 1
+    -- G1 stays RETIRED. There is no path from RETIRED back to ACTIVE.
 
 G1 RETIRED -> G2 ACTIVE     (activation CAS)
     G2.predecessor_* records C1 / N1 durably first
@@ -3300,35 +3375,58 @@ work. Recovery stays as the safety net for stale or inconsistent work rows — n
 a missing post-CAS enqueue, which correction 97 makes unreachable: an unconfirmed
 enqueue forbids the CAS, so a committed reactivation always has its discovery row.
 
-### Operator Reactivation Needs The Same Delayed Candidate
+### Resolving A Quarantine Without Breaking Irrevocability
 
-`RETIRING/GC_RETIRE -> ACTIVE` is not the only transition that returns a pointer to
-`ACTIVE` without a reference-removal event behind it. Quarantine resolution does the
-same thing, and the rule above applies to it unchanged.
+Quarantine resolution returns a fenced pointer to service, so it has to satisfy two
+rules that the rest of the protocol already relies on. The two quarantine pointer
+states satisfy them differently, and collapsing them into one "return it to `ACTIVE`"
+step is what reopens deletion of live data.
 
-The reachable state is precise rather than hypothetical. A generation reaches
-`RETIRED` only through the zero drain, so at that moment `refs == 0` and `uses == 0`.
-Nothing can add a reference while the pointer is `RETIRING` or `RETIRED`, because
-publishing requires an `AUTHORIZED` use and authorization requires revalidating
-against an `ACTIVE` pointer. So when the operator returns a `RETIRED/QUARANTINE`
-pointer to `ACTIVE`, the generation is `ACTIVE` with zero references — and its
-references were already zero before it was ever a candidate, so no future
-reference-removal event will create one:
+**A `RETIRED` generation never returns to `ACTIVE`.** The `DELETING` CAS does not
+re-read the pointer; its entire safety argument is that authority on G1 can never be
+reacquired once G1 reads `RETIRED`. A resolution that reactivates the same generation
+falsifies that, and a stale delete worker holding a valid earlier proof will then
+delete bytes under a live reference — see Authorizing `DELETING`. So the two states
+resolve to different targets:
 
 ```text
-operator clears gc_state QUARANTINED -> null
-operator CAS RETIRED/QUARANTINE -> ACTIVE
-    => ACTIVE, refs = 0, no candidate, no work row naming the generation
+RETIRING/QUARANTINE   never reached RETIRED
+                      no delete authorization can exist for it
+                      -> resolves to ACTIVE on the same generation
+
+RETIRED/QUARANTINE    a delete authorization may already be held
+                      -> resolves forward to RETIRED/GC_RETIRE
+                      -> never to ACTIVE
+```
+
+A `RETIRED/QUARANTINE` resolution is therefore a *recertification*, not a revival. It
+allocates the next `retire_claim_epoch`, re-runs the global zero check under that new
+claim, and appends fresh evidence for it before the pointer CAS. The re-check is cheap
+and provable: no writer can acquire authority while the pointer is `RETIRED` or
+`RETIRING`, so the frontier cannot have reopened, and the fresh row is a genuine
+attestation of a check that just happened rather than the synthetic proof correction
+109 forbids. Reusing the pre-quarantine evidence instead would force the
+evidence-matching rule to accept a superseded cycle, weakening a rule that exists to
+stop exactly that.
+
+After recertification the block is in the ordinary retired state: `K1` may be deleted
+under the new claim, and a future G2 activates against `(G1, E1, Cr, Nq + 1)`. What
+never happens is G1 becoming usable again. If the operator wants the *content* back,
+that is a rematerialization into a new generation, which is the normal path.
+
+**A pointer returned to `ACTIVE` needs a delayed candidate.** This is correction 97
+applied to the one resolution that does reach `ACTIVE`. A generation can be
+quarantined after its references already reached zero, so the reactivated generation
+may be `ACTIVE` with `refs == 0` and no pending reference-removal event to ever
+re-create its candidate:
+
+```text
+operator CAS RETIRING/QUARANTINE -> ACTIVE
+    => ACTIVE, refs possibly 0, no candidate, no work row naming the generation
     => invisible to every automated path, retained forever
 ```
 
-That is exactly the state correction 97 exists to make unreachable, arriving through
-a path correction 97 did not name. The `RETIRING/QUARANTINE -> ACTIVE` form needs the
-same treatment even though its drain may not have completed: quarantine can be raised
-on a generation whose references already reached zero, so the same hole is reachable
-there.
-
-The requirement is therefore identical to the abandoned-use escape, and deliberately
+The requirement is identical to the abandoned-use escape, and deliberately
 unconditional rather than predicated on observing `refs == 0`:
 
 ```text
@@ -3340,11 +3438,57 @@ unconditional rather than predicated on observing `refs == 0`:
 An unconfirmed enqueue forbids the CAS. Making it unconditional costs one wasted
 revalidation when references do exist — the scanner revalidates canonical state and
 deletes a candidate that no longer applies — and buys the guarantee in the case that
-matters. Conditioning it on a reference count read would reintroduce a decision the
-operator path has no reason to make.
+matters.
 
-This adds no Paxos, no table, and no new work identity: it reuses
-`gc_block_candidate` and the discovery projection the escape path already writes.
+Neither form adds a table or a new work identity: the `ACTIVE` form reuses
+`gc_block_candidate` and its discovery projection, and the recertification form reuses
+the retirement-evidence append and the handoff projection the normal cycle already
+writes.
+
+### Resolution Needs Its Own Durable State
+
+Both resolution forms mutate `gc_state` before they mutate the pointer, and both take
+several confirmed steps. A crash in the middle must be classifiable, and `OPEN` plus
+the observed rows cannot classify it.
+
+The ambiguity is exact rather than theoretical. An authorized false-positive
+resolution that dies after clearing `gc_state` leaves:
+
+```text
+work            = OPEN
+generation      = gc_state null
+pointer         = .../QUARANTINE
+```
+
+which is byte-for-byte the state of an ordinary quarantine that has fenced the pointer
+and not yet written `gc_state = QUARANTINED`. One demands "finish the authorized
+resolution", the other demands "finish quarantining the generation", and they are
+opposite actions. A scanner that infers authorization from `gc_state = null` would
+promote an unexplained mutation into an administrative decision — the inference the
+fail-closed rule exists to forbid.
+
+So authorization is itself durable, and it is written first:
+
+```text
+OPEN -> RESOLVING            conditional; records resolution_id, decision,
+                             actor, verification_digest, started_at
+     -> RESOLVED             only after the pointer step is confirmed
+     -> REJECTED             contradiction confirmed; quarantine retained
+```
+
+The transition to `RESOLVING` is confirmed **before** any `gc_state` or pointer
+mutation, which makes every crash point decidable:
+
+```text
+OPEN         -> no resolution was authorized: continue/complete the quarantine
+RESOLVING    -> continue exactly the recorded authorized resolution
+RESOLVED     -> terminal; never reopen
+REJECTED     -> terminal; the pointer stays fenced
+```
+
+This is Discoverability Before Irreversibility applied to an administrative decision:
+the record that a decision was made outlives the process that made it, and the scanner
+never has to reconstruct intent from state it did not write.
 
 ## Recovery Protocol
 
@@ -3700,7 +3844,8 @@ before the predecessor is retired:
 | `RETIRING -> ACTIVE` (escape) | the delayed candidate, published **before** the CAS | after the CAS commits |
 | `RETIRING -> RETIRED` | `gc_generation_handoff_by_day`, published **before** the pointer CAS | after `gc_generation_deletes_by_day` is confirmed |
 | `gc_state = null -> DELETING` | `gc_generation_deletes_by_day`, published **before** the CAS | after `DELETED` |
-| `RETIRING/QUARANTINE -> ACTIVE` and `RETIRED/QUARANTINE -> ACTIVE` (operator resolution) | the quarantine work row throughout, **plus** a delayed candidate and its discovery projection published **before** the pointer CAS | the quarantine work row is retired only after the pointer CAS is confirmed and the work is marked `RESOLVED` |
+| `RETIRING/QUARANTINE -> ACTIVE` (operator resolution) | the quarantine work at `RESOLVING`, **plus** a delayed candidate and its discovery projection published **before** the pointer CAS | the work is retired only after the pointer CAS is confirmed and it is marked `RESOLVED` |
+| `RETIRED/QUARANTINE -> RETIRED/GC_RETIRE` (operator recertification) | the quarantine work at `RESOLVING`, **plus** fresh retirement evidence for the new claim epoch and the handoff projection, all published **before** the pointer CAS | the work is retired only after the pointer CAS is confirmed and it is marked `RESOLVED` |
 
 The materializer side needs the same table, and it was the half that stayed
 implicit:
@@ -3908,29 +4053,37 @@ state and either loops or, worse, resolves it differently. A quarantined generat
 - keeps its `storage_key` and `storage_class` so an operator can inspect the object;
 - keeps `quarantine_operation_id` and `quarantine_evidence_digest` so operator
   resolution is tied to the exact contradiction that caused the terminal state;
-- its quarantine work row has a terminal `resolution_state` of `OPEN`, `RESOLVED`,
-  or `REJECTED`, with the resolving operation, actor, and timestamp. Scanners must
-  confirm this state before retrying and must never reopen `RESOLVED` or `REJECTED`
-  work;
+- its quarantine work row has a `resolution_state` of `OPEN`, `RESOLVING`, `RESOLVED`,
+  or `REJECTED`, with the resolving operation, actor, and timestamp. `RESOLVING`
+  additionally carries `resolution_id`, `decision`, `verification_digest`, and
+  `started_at`. Scanners must confirm this state before retrying and must never reopen
+  `RESOLVED` or `REJECTED` work;
 - is never transitioned out of `QUARANTINED` by any automated path, only by explicit
-  operator action. Resolution is an audited workflow. If the operator proves the
-  exact `(G, K, operation_id, evidence_digest)` contradiction was false, first clear
-  `gc_state` with a conditional `QUARANTINED -> null` update at `SERIAL + ALL` that
-  requires `materialization_state=VERIFIED` and fresh exact-object verification. If
-  the pointer still carries the matching `RETIRING/QUARANTINE` claim, then clear its
-  claim columns and return it to `ACTIVE` with a conditional `SERIAL + ALL` LWT. If
-  the pointer is `RETIRED/QUARANTINE`, return it to `ACTIVE` with a conditional
-  `SERIAL + ALL` LWT matching the retained quarantine claim and retaining its
-  incremented claim epoch. The generation-row step precedes the pointer step, so no
-  writer can observe an active pointer to a still-quarantined generation. **Both
-  pointer-return forms must publish and confirm a delayed candidate and its discovery
-  projection before their CAS, and an unconfirmed enqueue forbids the CAS**; see
-  Operator Reactivation Needs The Same Delayed Candidate. Only after
-  those required pointer steps are confirmed does the operator mark the work
+  operator action. Resolution is an audited workflow whose **first durable step is the
+  authorization itself**. The operator conditionally moves the quarantine work from
+  `OPEN` to `RESOLVING`, recording `resolution_id`, `decision=FALSE_POSITIVE`, the
+  actor, the verification digest, and `started_at`, and confirms it **before touching
+  `gc_state` or the pointer**. Without that record the two mutations are
+  indistinguishable from an in-progress quarantine after a crash; see Resolution Needs
+  Its Own Durable State. Then, for a false positive: clear `gc_state` with a
+  conditional `QUARANTINED -> null` update at `SERIAL + ALL` that requires
+  `materialization_state=VERIFIED` and fresh exact-object verification; then complete
+  the pointer step for the state the pointer is actually in. If the pointer carries a
+  matching `RETIRING/QUARANTINE` claim, publish and confirm a delayed candidate and its
+  discovery projection, then clear the claim columns and return it to `ACTIVE` with a
+  conditional `SERIAL + ALL` LWT. If the pointer is `RETIRED/QUARANTINE`, it is
+  **recertified rather than reactivated**: allocate the next `retire_claim_epoch`,
+  re-run the global zero check under that new claim, append and confirm fresh evidence
+  for it, then move the pointer to `RETIRED/GC_RETIRE` with a conditional
+  `SERIAL + ALL` LWT. **No resolution returns a `RETIRED` pointer to `ACTIVE`**, and an
+  unconfirmed candidate or evidence append forbids its CAS; see Resolving A Quarantine
+  Without Breaking Irrevocability. The generation-row step precedes the pointer step,
+  so no writer can observe an active pointer to a still-quarantined generation. Only
+  after the required pointer step is confirmed does the operator mark the work
   `RESOLVED` with a conditional update matching the full identity. If a coordinator
-  dies before that final marker, the work remains `OPEN` and the scanner resumes the
-  same exact operation; it must not retire the work while pointer cleanup is pending.
-  If the contradiction is confirmed, mark the work `REJECTED` and retain
+  dies before that final marker, the work remains `RESOLVING` and the scanner resumes
+  that exact authorized resolution; it must not retire the work while pointer cleanup
+  is pending. If the contradiction is confirmed, mark the work `REJECTED` and retain
   `QUARANTINED`. If any identity or condition does not match, retain quarantine and
   require a new audited resolution; no operator action may authorize deletion
   implicitly. The scanner must see a terminal work state before retiring the work
@@ -4997,20 +5150,43 @@ Required cases include:
   projection; separate regression tests reject an ordering-only implementation,
   prove the scanner never deletes a not-yet-due row, and inject partial concurrent
   batch visibility so the exact-reference recheck preserves the projection;
-- operator quarantine resolution clears `gc_state` **before** the pointer returns to
-  `ACTIVE`, and a test asserts that the reverse order — an `ACTIVE` pointer selecting a
+- **no transition returns a `RETIRED` pointer to `ACTIVE` on the same generation.** The
+  decisive test is the stale-delete interleaving: a delete worker obtains its
+  pointer/evidence proof for `G1 / RETIRED/GC_RETIRE` and stalls; the pointer is
+  quarantined and then resolved as a false positive; a writer then pins, authorizes and
+  publishes against G1; the stalled worker issues its `DELETING` CAS. The test asserts
+  that `K1` is never deleted under a live reference, and that an implementation which
+  resolves `RETIRED/QUARANTINE` to `ACTIVE` fails it. A pointer re-read added before
+  the `DELETING` CAS must not make the test pass, since the two statements are on
+  different tables;
+- a `RETIRED/QUARANTINE` resolution recertifies to `RETIRED/GC_RETIRE`: it allocates
+  the next `retire_claim_epoch`, re-runs the global zero check, and appends and
+  confirms fresh evidence for that epoch before the pointer CAS. A test asserts the
+  pre-quarantine evidence row is not reused, and that a later G2 activates against the
+  recertified claim tuple;
+- operator quarantine resolution clears `gc_state` **before** any pointer step, and a
+  test asserts that the reverse order — an `ACTIVE` pointer selecting a
   still-`QUARANTINED` generation — is never produced by the workflow;
-- both operator pointer-return forms publish and confirm a delayed candidate and its
-  discovery projection **before** the CAS; a test suppresses that enqueue and asserts
-  no CAS occurs, then asserts that a committed operator reactivation is always
+- the `RETIRING/QUARANTINE -> ACTIVE` resolution publishes and confirms a delayed
+  candidate and its discovery projection **before** the CAS; a test suppresses that
+  enqueue and asserts no CAS occurs, then asserts the reactivated generation is always
   re-examined without any `block_generations` enumeration. The F10-shaped end state —
   `ACTIVE`, zero references, no candidate, invisible forever — must be unreachable
   through the operator path exactly as it is through the abandoned-use escape;
-- a crash injected between the operator's `gc_state` clear and its pointer CAS leaves
-  the quarantine work `OPEN`, and the scanner resumes the same exact operation instead
-  of retiring it or reopening a `RESOLVED`/`REJECTED` row;
+- resolution authorization is durable before it acts: the work moves `OPEN ->
+  RESOLVING` with its `resolution_id`, decision, actor and verification digest, and a
+  test asserts no `gc_state` or pointer mutation occurs while the work still reads
+  `OPEN`;
+- a crash injected between the operator's `gc_state` clear and its pointer step leaves
+  the work at `RESOLVING`, and the scanner resumes that exact authorized resolution. A
+  test injects the same crash with the work left at `OPEN` and asserts the scanner
+  completes the **quarantine** instead — the two states must drive opposite actions
+  from identical `gc_state`/pointer rows;
 - a `REJECTED` resolution retains `QUARANTINED` and leaves the pointer fenced; a test
-  asserts no automated path later returns that pointer to `ACTIVE`;
+  asserts no automated path later returns that pointer to `ACTIVE` or to
+  `RETIRED/GC_RETIRE`;
+- a writer that observes `RETIRING/QUARANTINE` after its own authorization performs no
+  PUT, repair, reuse, or publication, and does not enter a bounded poll;
 - the `RETIRING/GC_RETIRE -> ACTIVE` escape is recovered by its delayed candidate alone; a test
   asserts that no path publishes `gc_generation_zero_ref_by_day` for that branch and
   that the branch is still recovered without one;
@@ -5529,8 +5705,16 @@ X2 is closed only when:
   the retention-safe delayed-candidate reactivation after any liveness-read error
   for `GC_RETIRE`; a `RETIRING/QUARANTINE` claim never uses these exits and remains
   fenced;
+- `RETIRED` is terminal for its generation: no transition, automated or
+  administrative, returns a `RETIRED` pointer to `ACTIVE` on the same generation, so
+  the `DELETING` authorization stays irrevocable once obtained. A `RETIRED/QUARANTINE`
+  pointer resolves forward to `RETIRED/GC_RETIRE` under a new claim epoch with fresh
+  evidence, never back to `ACTIVE`;
+- quarantine resolution records its authorization durably as `RESOLVING` before
+  mutating `gc_state` or the pointer, so a crash is classifiable and an unexplained
+  `gc_state = null` is never read as an administrative decision;
 - every transition that returns a pointer to `ACTIVE` — the abandoned-use escape, the
-  liveness-read-error escape, and both operator quarantine resolutions — publishes and
+  liveness-read-error escape, and the `RETIRING/QUARANTINE` resolution — publishes and
   confirms its delayed candidate and discovery projection **before** the CAS, and an
   unconfirmed enqueue forbids the CAS. No path produces an `ACTIVE` generation with
   zero references that no durable work row names;
@@ -5572,7 +5756,7 @@ X2 is closed only when:
   executions its ambiguity retries require, with exactly one successful activation
   per rematerialization, and retirement/delete LWTs run only in the GC worker;
 - GC worker concurrency is bounded and has a measured throughput/queue-age target;
- - the generation row uses monotonic materialization/physical markers rather than a
+- the generation row uses monotonic materialization/physical markers rather than a
   second mutable `ACTIVE/RETIRING/RETIRED` authority;
 - physical generation cleanup never deletes the logical `blocks` row, never resets
   `active_epoch`, and never removes a `block_id_mappings` row at all — mappings are
@@ -6593,25 +6777,61 @@ reintroduce rejected designs:
      operations everywhere; no finite delay bounds an already accepted delete or
      outage. Never-reused UUID keys close X1 independently of both assumptions.
 160. **Operator reactivation is a pointer return, so correction 97 binds it too.**
-     Adding the quarantine claim kind created a second and a third path back to
-     `ACTIVE` — `RETIRING/QUARANTINE -> ACTIVE` and `RETIRED/QUARANTINE -> ACTIVE` —
-     and only the abandoned-use escape carried the delayed-candidate rule. A
-     generation reaches `RETIRED` with `refs == 0`, and nothing can publish while the
-     pointer is `RETIRING` or `RETIRED`, so operator resolution returns an `ACTIVE`
-     generation whose references were already zero before it first became a candidate.
-     No future reference-removal event will ever create one: the result is `ACTIVE`,
-     unreferenced, named by no work row, and invisible to a recovery protocol that has
-     forbidden scans — the exact state correction 97 exists to make unreachable,
-     reached through a path correction 97 did not name. Both forms now publish and
-     confirm the delayed candidate and its projection before the CAS, unconditionally
-     rather than after reading a reference count. This is correction 88's rule applied
-     to a state machine change: when a transition is added, every ordering invariant
-     stated over the transitions it resembles is part of that change.
+     Adding the quarantine claim kind created a new path back to `ACTIVE` that did not
+     carry the delayed-candidate rule. A generation can be quarantined after its
+     references already reached zero, so the resolution returns an `ACTIVE` generation
+     with `refs == 0` and no pending reference-removal event to ever re-create its
+     candidate: `ACTIVE`, unreferenced, named by no work row, invisible to a recovery
+     protocol that has forbidden scans — the exact state correction 97 exists to make
+     unreachable, reached through a path correction 97 did not name. The
+     `RETIRING/QUARANTINE -> ACTIVE` resolution now publishes and confirms the delayed
+     candidate and its projection before the CAS, unconditionally rather than after
+     reading a reference count. This is correction 88's rule applied to a state machine
+     change: when a transition is added, every ordering invariant stated over the
+     transitions it resembles is part of that change.
 161. **A frozen ADR that changes protocol needs a revision line.** The claim kind, the
      two quarantine pointer states, and the `QUORUM` first-writer commit are protocol
      changes made after the document was first labelled frozen. "Last updated" does not
      tell an implementer which contract they read. Freeze is a statement about the
      protocol, so a protocol change re-dates it explicitly.
+162. **`RETIRED` is terminal, and the invariant must be stated over `RETIRED`, not over
+     `RETIRED/GC_RETIRE`.** The first draft of the quarantine claim kind added
+     `RETIRED/QUARANTINE -> ACTIVE` as an administrative escape, which falsified the
+     one property the `DELETING` CAS depends on. That CAS deliberately does not re-read
+     the pointer; its whole safety argument is that authority can never be reacquired
+     on a generation that reached `RETIRED`. The escape was two hops —
+     `RETIRED/GC_RETIRE -> RETIRED/QUARANTINE -> ACTIVE` — so no single transition
+     looked wrong, and the irrevocability paragraph, scoped to one claim kind, still
+     read as true. A delete worker that obtained a valid proof and stalled would then
+     delete `K1` under a live reference published after the reactivation: live-data
+     loss, and the exact failure class X1 exists to close, reintroduced by an
+     administrative convenience. Adding a pointer re-read before the `DELETING` CAS
+     does not fix it, because the pointer and the generation row are different tables
+     and the reactivation can land between the two statements. The invariant is the
+     mechanism. `RETIRED/QUARANTINE` therefore resolves *forward* to
+     `RETIRED/GC_RETIRE` — a recertification with a new claim epoch, a fresh global
+     zero check, and fresh evidence — and never back to `ACTIVE`. Only
+     `RETIRING/QUARANTINE`, which never reached `RETIRED` and for which no delete
+     authorization can exist, resolves to `ACTIVE`. When an escape hatch is added to a
+     terminal state, the proofs that depend on its terminality are part of the change.
+163. **An authorized resolution must be durable before it acts.** With work states
+     `OPEN | RESOLVED | REJECTED`, a false-positive resolution that cleared `gc_state`
+     and then crashed left `work=OPEN`, `gc_state=null`, `pointer=.../QUARANTINE` —
+     byte-for-byte identical to an ordinary quarantine that has fenced the pointer and
+     not yet written `QUARANTINED`. The two demand opposite actions, and no scanner can
+     tell them apart without inferring administrative authorization from an unexplained
+     mutation, which the fail-closed rule forbids. `OPEN -> RESOLVING` is confirmed
+     before any `gc_state` or pointer mutation and records `resolution_id`, decision,
+     actor, verification digest and `started_at`, making every crash point decidable.
+     This is Discoverability Before Irreversibility applied to a decision rather than
+     to a row: the record that a decision was made outlives the process that made it.
+164. **A published tag is checkable; assert it rather than inferring from a release
+     page.** A review of r2 reported that `cassandra:5.0.9` did not exist and that the
+     Compose pin was broken. The official image publishes `5.0.9`, `5.0.9-bookworm` and
+     `5.0.9-trixie`, verified 2026-08-12. Recording the verification date here keeps the
+     next reviewer from repeating the check against stale mirror data — and does not
+     weaken the standing requirement that Phase 0 pin and verify a digest, since a
+     version tag is still mutable.
 
 ## Related Documents
 

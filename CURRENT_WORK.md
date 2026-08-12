@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
 **Last Updated**: 2026-08-14
-**Session**: X1/X2 generational GC fence ADR (documentation only)
+**Session**: X1/X2 generational GC fence ADR — protocol revision r2 (no code changes; Compose image pin and prod `GC_ENABLED=false` included)
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -58,8 +58,8 @@
 
 ## Current Branch Summary ✅
 
-**Date**: 2026-08-11
-**Focus**: X1/X2 Generational GC Fence ADR Closeout (Documentation Only)
+**Date**: 2026-08-12
+**Focus**: X1/X2 Generational GC Fence ADR — protocol revision r2
 
 ### Completed In This Branch Slice
 
@@ -69,8 +69,10 @@
 - Made serial settlement mandatory before activation classification and added transitive lineage handling for historical winners.
 - Specified cross-DC projection discovery, explicit pin authorization, clock-health, authoritative storage, and coordinated rollout gates.
 - Added exact `dc-na`/`dc-eu`/`dc-asia` RF1/RF3 acceptance requirements for Paxos v1 and v2.
-- Kept X1/X2 open: this branch changes documentation only and does not permit destructive GC.
-- Files: `CURRENT_WORK.md`, `docs/CHANGELOG.md`, `docs/DECISIONS.md`, `docs/GC-UPLOAD-FENCE-PR-PLAN.md`, `docs/GC-X1-X2-GENERATION-FENCE-ADR.md`, `docs/KNOWN_ISSUES.md`, `docs/OPEN-WORK-INDEX.md`, `docs/PROD-SECURITY-READINESS-20260724.md`, `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`, `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`, `docs/VERSIONS.md`.
+- Closed a critical r2 regression: `RETIRED/QUARANTINE -> ACTIVE` falsified the terminality of `RETIRED` that the `DELETING` authorization depends on, letting a stalled delete worker remove bytes under a live reference. Resolution now recertifies forward to `RETIRED/GC_RETIRE`; a `RETIRED` pointer never returns to `ACTIVE`.
+- Added the durable `RESOLVING` work state so an authorized quarantine resolution is distinguishable from an in-progress quarantine after a crash.
+- Kept X1/X2 open. No code changes and destructive GC stays disabled, but this is **not** a docs-only branch: it also pins the Cassandra image to 5.0.9 across the Compose files and sets `GC_ENABLED=false` explicitly in the production Compose.
+- Files: `CURRENT_WORK.md`, `README.md`, `docker-compose.yaml`, `docker-compose.mr.yaml`, `docker-compose.mr-cluster.yaml`, `docker-compose-multiregion.yaml`, `docker-compose.prod.yml`, `docs/ARCHITECTURE.md`, `docs/CHANGELOG.md`, `docs/DECISIONS.md`, `docs/GC-UPLOAD-FENCE-PR-PLAN.md`, `docs/GC-X1-X2-GENERATION-FENCE-ADR.md`, `docs/KNOWN_ISSUES.md`, `docs/OPEN-WORK-INDEX.md`, `docs/PROD-SECURITY-READINESS-20260724.md`, `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`, `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`, `docs/VERSIONS.md`.
 
 ### Remaining Follow-up Debt
 
